@@ -1,0 +1,2 @@
+{"id":"7d512fc2-fa39-4da5-8f11-cdcc3891ebeb","ts":"2026-07-15T14:46:04.710Z","path":"/Users/nickm/git/scratchy/crates/targets/metal/src/quantized.rs","version":"1.0.0","taskID":"70211a17-15e3-4779-849a-1748e4842975"}
+{"id":"3c0073cb-a31d-4653-93ab-be40ad23b06e","ts":"2026-07-15T14:48:47.337Z","path":"/Users/nickm/git/scratchy/crates/targets/metal/shaders/quantized_qmm.metal","version":"1.0.0","taskID":"70211a17-15e3-4779-849a-1748e4842975"}
