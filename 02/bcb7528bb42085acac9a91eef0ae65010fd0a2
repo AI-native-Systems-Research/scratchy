@@ -1,0 +1,4 @@
+{"id":"c7d5a7a7-c886-45bd-a188-66f003aca896","ts":"2026-08-18T13:24:37.119Z","path":"/Users/nickm/git/scratchy/Dockerfile.spyre","version":"1.0.0","taskID":"32e4cc71-c80a-4a99-bbdb-a65b678cd445"}
+{"id":"a3b9f1fa-d72f-43b4-8616-620c53527b74","ts":"2026-08-18T13:25:32.845Z","path":"/Users/nickm/git/scratchy/Dockerfile.spyre","version":"1.0.0","taskID":"32e4cc71-c80a-4a99-bbdb-a65b678cd445"}
+{"id":"ff57a331-f286-4eeb-a4c0-70a299b46987","ts":"2026-08-18T13:29:24.078Z","path":"/Users/nickm/git/scratchy/Dockerfile.spyre","version":"1.0.0","taskID":"32e4cc71-c80a-4a99-bbdb-a65b678cd445"}
+{"id":"4cf2c175-8238-41f7-b044-02e2868c2751","ts":"2026-08-18T13:30:58.591Z","path":"/Users/nickm/git/scratchy/scripts/build-spyre-image.sh","version":"1.0.0","taskID":"32e4cc71-c80a-4a99-bbdb-a65b678cd445"}
