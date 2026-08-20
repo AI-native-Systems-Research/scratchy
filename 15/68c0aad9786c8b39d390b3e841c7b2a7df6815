@@ -1,0 +1,2 @@
+{"id":"1cf3988e-21ec-4cee-b57d-6d076a74246d","ts":"2026-08-18T13:42:55.950Z","path":"/Users/nickm/git/scratchy/scripts/build-spyre-image.sh","version":"1.0.0","taskID":"32e4cc71-c80a-4a99-bbdb-a65b678cd445"}
+{"id":"92ea6a09-7b53-4294-8a24-a6dbd84fb48c","ts":"2026-08-18T13:43:16.706Z","path":"/Users/nickm/git/scratchy/Dockerfile.spyre","version":"1.0.0","taskID":"32e4cc71-c80a-4a99-bbdb-a65b678cd445"}
