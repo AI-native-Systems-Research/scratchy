@@ -13,3 +13,11 @@ flamegraph.svg.gz
 
 # Baked SuperDSC bundles: build output, tens of thousands of files.
 .audit-cache/
+
+# editor and IDE paraphernalia
+.idea
+.vscode
+*.swp
+*.swo
+*~
+.DS_Store
