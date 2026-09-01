@@ -2696,6 +2696,7 @@ impl Drop for ResidencyPanicGuard {
 /// sides they were measured on, and is a POLICY knob, not a law.
 const TQ_MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
 
+#[cfg(feature = "metal")]
 impl Worker for MetalWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
         let device = scratchy_target_metal::detect_device()

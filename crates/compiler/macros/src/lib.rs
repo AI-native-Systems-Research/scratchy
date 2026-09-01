@@ -55,7 +55,6 @@ pub use config::{total_models_emitted, unmatched_build_filter_tags};
 #[cfg(feature = "metal")]
 use scratchy_target_metal::fuse_pass;
 mod assignment;
-#[cfg(feature = "metal")]
 #[cfg(feature = "cuda")]
 mod cost;
 mod emit;

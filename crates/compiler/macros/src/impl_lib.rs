@@ -2075,6 +2075,7 @@ pub fn starter_library() -> ImplementationLibrary {
             //
             // Every one of these Impls has a `CutlassFused…` peer registered
             // unconditionally below.
+            let cublas_enabled = std::env::var_os("SCRATCHY_DISABLE_CUBLAS_GEMM").is_none();
             lib.push(Box::new(GemmRefImpl));
             lib.push(Box::new(FusedCublasGemmAddImpl));
             lib.push(Box::new(AttentionViaCacheImpl));

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scratchy-cuda-build
+  namespace: <YOUR_NAMESPACE>
+spec:
+  restartPolicy: Never
+  containers:
+    - name: builder
+      image: nvidia/cuda:12.9.1-devel-ubuntu22.04
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      env:
+        - name: CUDA_COMPUTE_CAP
+          value: "90"   # H100 = sm90
