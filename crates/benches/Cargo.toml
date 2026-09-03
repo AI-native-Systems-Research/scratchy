@@ -1,0 +1,38 @@
+[package]
+name = "scratchy-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmarking tools for vLLM Rust inference engine"
+
+[features]
+default = []
+cuda = ["scratchy-serving-api/cuda"]
+metal = ["scratchy-serving-api/metal"]
+# Parquet-backed RAG accuracy datasets (hotpotqa / multihop / msmarco).
+# Off by default so the ~18-crate arrow/parquet columnar subtree only
+# compiles when those three `scr bench` subcommands are needed.
+datasets = ["dep:arrow", "dep:parquet"]
+
+[dependencies]
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+scratchy-serving-api = { workspace = true }
+scratchy-serving-engine = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+indicatif = { workspace = true }
+# ureq, not reqwest: see src/http.rs. Same door the Hub downloader uses.
+ureq = { workspace = true }
+tokenizers = { workspace = true }
+rand = { workspace = true }
+# 0.5 is the line that pairs with rand 0.9; 0.4 would pin a second rand.
+rand_distr = "0.5"
+serde = { workspace = true }
+shell-words = "1"
+csv = "1"
+dirs = { workspace = true }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"], optional = true }
+arrow = { version = "59", default-features = false, features = ["json"], optional = true }

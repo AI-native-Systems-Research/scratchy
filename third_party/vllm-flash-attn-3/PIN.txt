@@ -1,0 +1,21 @@
+FA3 Hopper kernels vendored from
+  github.com/vllm-project/flash-attention
+  commit f5bc33cfc02c744d24a2e9d50e6db656de40611c
+  (matches vllm/cmake/external_projects/vllm_flash_attn.cmake:44 at vllm 0.21.x)
+
+Subset vendored:
+  hopper/ — forward-only headers + the four .cu files we compile for paged
+            decode (combine, prepare_scheduler, hdim128_bf16_paged_sm90,
+            hdim128_bf16_paged_split_sm90)
+
+Backward, fp16, fp8, hdim64/96/192/256, sparse, append-KV, local attention
+all excluded by the FLASHATTENTION_DISABLE_* nvcc flags driven from
+crates/targets/cuda/builder/build.rs.
+
+The host-side flash_api.cpp is NOT vendored — it pulls in PyTorch
+(at::Tensor, torch::*). We reproduce its set_params_fprop logic with raw
+GPU pointers in third_party/flash-attn-3-shim/ffi_shim.cu.
+
+Cutlass dependency is shared with the rest of the project (pinned at
+62750a2b75c802660e4894434dc55e839f322277 — see
+crates/targets/cuda/builder/Cargo.toml).

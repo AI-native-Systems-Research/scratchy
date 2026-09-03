@@ -1,0 +1,77 @@
+[package]
+name = "scratchy-subtile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+
+[features]
+default = []
+# `spyre` (IBM Spyre target): gates the spyre-only lowerings
+# (`lower_subtile_tape_to_ktir` + `lower_subtile_tape_to_sengraph`). Pure-Rust
+# emission, no extra deps — so a cuda/metal-only build never compiles them.
+# Consumers forward their own `spyre` into `scratchy-subtile/spyre`.
+spyre = []
+# SuperDSC (SDSC) perf path — the tile-level work-divided dxp bundle. Gates the sdsc
+# modules (lower_subtile_tape_to_superdsc / sdsc_abstract / superdsc_{error,opspec} +
+# subtile_tape reroll). Independent of `spyre` (ktir) — an sdsc build compiles ZERO
+# sengraph and only the ktir MANIFEST builder (lower_subtile_tape_to_ktir, shared).
+superdsc = ["dep:scratchy-spyre-bundle"]
+
+[dependencies]
+# ⭐ THE BAKED-BUNDLE TYPE FAMILY, which the `superdsc` lowering CONSTRUCTS and hands to the
+# `#[forward]` macro — see that crate's header. A leaf below both ends of the Spyre pipeline, so this
+# edge does not make the generic scheduling layer depend on the Spyre target. OPTIONAL and gated on
+# `superdsc` for the same reason every other Spyre-only piece here is: a cuda/metal build compiles
+# none of it.
+scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
+# Emit the IBM Spyre sendnn op-graph as JSON (the `--device sdsc` path) — a
+# pure-Rust serde model serialized to the graph schema `compile_graph` consumes.
+# No SDK linkage: the graph is plain JSON; the SDK compiles it downstream.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# f16 encoding for embedded `ConstInput` tensors in the sendnn graph (e.g. the
+# RMSNorm mean-reduction `ones/h` vector + the eps scalar).
+half = { workspace = true }
+
+[build-dependencies]
+# The build script reads every model `config.json` in the workspace and writes the head geometries
+# they declare out as literal tokens (see `build.rs::emit_config_geometry`). Same parser the macro's
+# config loader uses, one compilation earlier — which is the only place a const generic for a
+# model's geometry can be monomorphised, since the lowering runs inside the macro's expansion.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# `cpu_golden` is the host calculator the VALIDATION tests compute with
+# (test-only — no non-test code references scratchy-forward-compiler). It
+# lives in dev-dependencies so this crate's normal graph has NO edge to
+# scratchy-forward-compiler: that lets `scratchy-forward-compiler` depend on
+# this crate (the GPU subtile Executor lives in its metal interpreter and
+# consumes `metal_tape`) without a cycle. Cargo permits the dev-only
+# back-edge. scratchy-forward-compiler builds backend-agnostic here (no
+# cuda/metal feature), so the tests stay host-runnable on any platform.
+scratchy-forward-compiler = { path = ".." }
+# `half::bf16` for the dev-side bf16 round-trip in the
+# `*_kernel_matches_cpu_golden` validation tests — the kernel reads
+# bf16 from HBM, so the host reference must apply the same lossy
+# conversion to compare on equal terms.
+half = { workspace = true }
+
+# ⛔⛔⛔ RUNNING THIS CRATE'S KANI PROOFS REQUIRES `--features superdsc`. EVERY HARNESS IN
+# `sdsc_abstract.rs` LIVES BEHIND `#[cfg(feature = "superdsc")] pub mod sdsc_abstract;`, and `default = []`,
+# so `cargo kani -p scratchy-subtile <harness>` compiles the crate, finds ZERO harnesses, and reports
+#     error: no harnesses matched the harness filter: `<name>`
+# — which reads like a typo in the name, not like "this file was never compiled". MEASURED 2026-08-14: a
+# harness resident in that file for weeks reported no-match without the flag and verified 27 checks with it.
+# So:  KANI_PKG=scratchy-subtile ~/.claude/bin/kani-safe.sh <harness> --features superdsc
+# This is the THIRD time proofs in this repo have been silently vacuous (see the note below, and
+# `kani-proofs-died-silently-in-the-rebuild`). A proof that does not run is worse than no proof, because it
+# is quoted in commit messages as if it did.
+#
+# The proof harnesses here compile only under the model checker, so `cfg(kani)` is a real name a normal
+# build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the proofs
+# hold" turned out to be vacuous — a normal build skipped the module and said nothing — and declaring it
+# keeps a typo in the name an error while stopping the lint complaining about the name itself.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

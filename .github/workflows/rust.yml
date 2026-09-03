@@ -1,0 +1,236 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# cancel any prior runs for this workflow and this PR (or branch)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux / amd64 — CUDA backend.
+  #
+  # The workspace can't build featureless (the layer `load(&mut GpuWeights)`
+  # methods consume a backend allocator), and `vllm-cuda` hard-depends on
+  # `cudarc` (nvcc), so a GPU backend feature is required. We install only the
+  # nvcc + cudart sub-packages via the network installer and cache them.
+  #
+  # Compile + lint only: the hosted runner has no GPU, so kernel tests can't
+  # run. linux-arm64 is intentionally absent — GitHub's free ARM runners are
+  # public-repo only, and this repo is private.
+  # ---------------------------------------------------------------------------
+  linux-cuda:
+    name: linux-amd64 (cuda)
+    runs-on: ubuntu-latest
+    # The runner has no GPU, so codegen can't probe `nvidia-smi` for the
+    # target SM. Pin it explicitly (H100 = SM90): SCRATCHY_GPU for
+    # codegen, CUDA_COMPUTE_CAP for the cuda build script.
+    #
+    # SCRATCHY_SKIP_CUDA_KERNELS skips scratchy-builder-cuda's nvcc compile
+    # (cutlass + FlashAttention-3 + flashinfer) — tens of minutes and several
+    # GB of RAM that OOM the runner. check/clippy don't link the kernels, so
+    # the full Rust surface still type-checks. The kernels can't run here
+    # anyway (no GPU); they're validated on real hardware.
+    env:
+      SCRATCHY_GPU: h100
+      CUDA_COMPUTE_CAP: "90"
+      SCRATCHY_SKIP_CUDA_KERNELS: "1"
+      # Same idea for the spyre side: `--workspace` also builds
+      # scratchy-target-spyre (and its flex-rs path dep), whose build scripts
+      # compile C++ against the IBM Spyre SDK headers. The runner has no SDK,
+      # so skip the C++ shim compile — check/clippy don't link it. This is the
+      # escape hatch both build scripts document for exactly this case.
+      SCRATCHY_SKIP_SENDNN_CXX: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache CUDA toolkit
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/cuda-12.6
+          key: ${{ runner.os }}-cuda-12.6
+
+      # Gate the install on whether nvcc actually exists on disk, not on the
+      # cache-hit flag: a partial/empty cache entry (common under `act`) reports
+      # a hit but leaves no toolkit, so a flag-based skip would never install it.
+      - name: Probe CUDA toolkit
+        id: cuda
+        run: |
+          if [ -x /usr/local/cuda-12.6/bin/nvcc ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install CUDA toolkit
+        if: steps.cuda.outputs.present != 'true'
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: "12.6.0"
+          method: "network"
+          sub-packages: '["nvcc", "cudart"]'
+
+      # The cuda-toolkit action only puts nvcc on PATH and sets CUDA_PATH when
+      # it actually runs; when the install is skipped the env is left unset.
+      # Export them explicitly so `cudarc`'s build script (`nvcc --version`)
+      # finds the toolkit on every run.
+      - name: Export CUDA toolkit env
+        run: |
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cuda
+
+      # Clippy is a superset of `cargo check`, so we run only clippy. The
+      # metal crates depend unconditionally on `objc2` (Apple-only) and can't
+      # compile on Linux — exclude them.
+      #
+      # BOTH of them: every consumer's edge to metal is already `optional` and
+      # gated on a `metal` feature, so `-Fcuda` pulls in neither via the
+      # dependency graph. `--workspace` is what reaches them — it builds every
+      # MEMBER as its own root, before features are ever consulted. Listing
+      # only `scratchy-target-metal` left `scratchy-target-metal-compiler` (a
+      # separate member since it was split out) building as a root, and it
+      # depends unconditionally on `scratchy-target-metal`, so `objc2` came
+      # back in through the side door.
+      #
+      # `scratchy-sdsc` is the same shape, for spyre: `cargo tree -e features -i
+      # scratchy-sdsc` under `-Fcuda` also reports `feature "default"
+      # (command-line)` with no parent. It is the SDSC/spyre lowering tower —
+      # its own deps hard-enable `scratchy-subtile/spyre,superdsc` — so it
+      # compiles AS SPYRE even in a cuda build, and nothing in the cuda graph
+      # references it. Linting a spyre crate is the spyre gate's job.
+      - name: Clippy
+        run: cargo clippy --workspace --features cuda,scratchy-models/all
+          --exclude scratchy-target-metal
+          --exclude scratchy-target-metal-compiler
+          --exclude scratchy-sdsc
+          -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # macOS / arm64 — Metal backend.
+  #
+  # `scratchy-models` (built here with `all-arches`) is the umbrella that
+  # compiles the whole Metal inference stack plus every per-arch model crate. The full
+  # `--workspace` is not buildable here because cuda-only crates (vllm-cuda)
+  # require nvcc. The runner has a real Apple GPU, so kernel tests run.
+  #
+  # macos-26 (Tahoe) is required: the metal kernels target Metal 4 and the
+  # `scratchy-target-metal` build script compiles shaders against the
+  # MetalPerformancePrimitives framework, which ships only in the Xcode 26 /
+  # macOS 26 SDK (absent on macos-14/15).
+  # ---------------------------------------------------------------------------
+  macos-metal:
+    name: macos-arm64 (metal)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-metal
+
+      # Clippy is a superset of `cargo check`, so we run only clippy + test.
+      - name: Clippy
+        run: cargo clippy -p scratchy-models --features metal,all -- -D warnings
+
+      # `cargo test -p scratchy-models` runs ZERO tests — that crate is a pure
+      # re-export umbrella with no test targets, and a dependency's integration
+      # tests don't run transitively. Test the crate that actually holds the
+      # GPU kernel suite (~155 tests: qmm/qmv/softmax/attention/rope/moe vs CPU
+      # reference). The macos-26 runner has a real Apple GPU, so these execute.
+      - name: Kernel tests
+        run: cargo test -p scratchy-target-metal
+
+      # Tool-call parser logic (Hermes / Llama / Kimi / Mistral / Jamba /
+      # Granite / Gemma-4). Pure-logic unit tests with no GPU dependency —
+      # don't need a real model at runtime, but scratchy-models has no
+      # default model scope (build-time panic otherwise), so name the same
+      # tiny one the SmolLM e2e steps below use, to reuse that build.
+      - name: Tool parser unit tests
+        run: cargo test -p scratchy-serving-api -p scratchy-models
+          --features metal,scratchy-models/smollm2-135m --lib tool_parser
+
+      # Real-model e2e smoke: boot the server on Metal against SmolLM-135M and
+      # generate. This exercises the full load → prefill → decode → HTTP path
+      # that kernel unit tests can't reach. The e2e tests are `#[ignore]` by
+      # default, so we opt in with `--ignored` and filter to the SmolLM tier.
+      # The model (~100 MB) is cached across runs keyed on its id.
+      - name: Cache HF models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          # Covers SmolLM-135M (~100 MB) AND gemma-4-12B-it-4bit (~6.3 GB, used by the
+          # continuation regression guard below).
+          key: hf-models-smollm-gemma4-12b-llama1b-v1
+      # `--test-threads=1`: each test boots an in-process server with its own
+      # Metal worker pool; running them concurrently contends on GPU command
+      # buffers (MTLCommandBufferStatusError). Serialize them.
+      - name: E2E smoke (metal, SmolLM-135M)
+        timeout-minutes: 15
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/smollm2-135m
+          --test e1_basic_serving test_t1_smollm -- --ignored --test-threads=1
+
+      # Gemma-4 tool-call parser server wiring: boot the server with the `gemma4`
+      # parser configured and confirm chat/stream (with and without tools) stay
+      # well-formed. SmolLM won't emit Gemma-format calls, so this covers the
+      # server wiring; the parse logic itself is unit-tested above. Kept next to
+      # the SmolLM smoke (shares the tiny model) and before the 6.3 GB gemma-12b
+      # guard below.
+      - name: E2E Gemma-4 tool parser (metal, SmolLM-135M)
+        timeout-minutes: 15
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/smollm2-135m
+          --test e5_gemma4_tool_parser -- --ignored --test-threads=1
+
+      # REGRESSION GUARD — gemma-4 hd512 unfused attention on a chunked-prefill
+      # CONTINUATION (> 2048-token prompt → chunk 2 has lq != kv_len). This is the ONLY
+      # test that catches the NAX-gemm K-tail / padding-row class of bug: a short prompt
+      # (single chunk, fresh scratch) and isolated kernel tests do NOT reproduce it — it
+      # needs a real 2nd chunk that reuses the dense scratch. Do not remove or shorten.
+      - name: E2E gemma-4 continuation guard (hd512 unfused)
+        timeout-minutes: 30
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/gemma-4-12b-it
+          --test e1_basic_serving test_metal_gemma4_continuation_recall -- --ignored --test-threads=1
+
+      # REGRESSION GUARD — long-context coherence. Historically CI ran ZERO
+      # long-context tests, so the "chunked/reused sequence past the
+      # 2048-tok/128-block bucket boundary diverges from a single fresh prefill"
+      # class regressed repeatedly (TurboQuant garbage, rope-once scratch OOB,
+      # un-wired residency, hd512 K-tail) and was only ever caught by MANUAL GPU
+      # runs. This test (llama-1b, needle-recall, chunked == single prefill)
+      # already existed but this job never invoked it. Run it in isolation (its
+      # own step) — the sibling long-prompt tests contend on GPU residency when
+      # batched. Do not remove or shorten.
+      - name: E2E long-context coherence guard (chunked == single prefill)
+        timeout-minutes: 20
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/llama-3.2-1b
+          --test e_long_prompt_metal long_prompt_metal_chunked_matches_single_prefill -- --test-threads=1
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check

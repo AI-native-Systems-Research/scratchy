@@ -1,0 +1,11 @@
+[package]
+name = "scratchy-core-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Configuration types and parsing for vLLM Rust port"
+
+[dependencies]
+scratchy-core-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,92 @@
+[package]
+name = "scratchy-serving-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
+
+[features]
+default = []
+# Live observability seams for the TUI — forwarded down the engine stack.
+# `live-stats` also gates this crate's own additions (the per-token ITL ring +
+# the live-stats/decode_token accessors). A plain engine build has none of it.
+forward-telemetry = ["scratchy-serving-worker/forward-telemetry", "scratchy-core-common/forward-telemetry"]
+sampler-telemetry = ["scratchy-serving-worker/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
+live-stats = []
+# The OpenAI/Anthropic HTTP server (axum) that serves remote requests. The
+# in-process engine — `llm`/`init`/`engine` + the sync span-query path used by
+# `LLM::chat_stream` — compiles WITHOUT this, so a local-inference client
+# (`scr chat`) never pulls axum/tower/axum-server.
+serve = ["dep:axum", "dep:tower-http"]
+otel = ["scratchy-core-common/otel"]
+cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda", "scratchy-target-cuda/cuda"]
+nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
+metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
+spyre = ["scratchy-serving-worker/spyre"]
+sendnn = ["scratchy-serving-worker/sendnn"]
+superdsc = ["scratchy-serving-worker/superdsc"]
+guided-decoding = ["scratchy-serving-worker/guided-decoding"]
+multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-serving-worker/vision"]
+# axum-server is the TLS listener ONLY — the plain-HTTP path binds a
+# tokio TcpListener and runs `axum::serve`. Keeping it here (not in `serve`)
+# means a non-TLS server build never pulls tokio-rustls/arc-swap/fs-err.
+tls = ["serve", "dep:axum-server", "rustls", "rustls-pemfile"]
+metrics = ["prometheus"]
+multiproc = ["scratchy-serving-engine/multiproc"]
+rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:ureq"]
+
+[dependencies]
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+scratchy-serving-scheduler = { workspace = true }
+scratchy-serving-engine = { workspace = true }
+scratchy-serving-worker = { workspace = true }
+scratchy-core-model = { workspace = true }
+scratchy-quantizations = { workspace = true }
+scratchy-vision = { workspace = true, optional = true }
+scratchy-forward-compiler = { workspace = true }
+# The cross-arch MM registry (`resolve_mm_metadata`) relocated below the
+# neutral `ScratchyWeights` trait into `scratchy-target-cuda`; multimodal.rs
+# resolves arch metadata through it. Optional + backend-gated like the rest.
+scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+anyhow = { workspace = true }
+inventory = { workspace = true }
+axum = { workspace = true, optional = true }
+axum-server = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }
+uuid = { version = "1", features = ["v4"] }
+rand = { workspace = true }
+http = "1"
+tokenizers = { workspace = true }
+rayon = { workspace = true }
+bincode = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+prometheus = { workspace = true, optional = true }
+indicatif = { workspace = true }
+spnl-core = { workspace = true }
+leann-core = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+# ureq, not reqwest: one blocking POST to an embedding endpoint.
+ureq = { workspace = true, optional = true }
+itertools = "0.14"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+# `tower::ServiceExt::oneshot` drives the router in unit tests; the server
+# itself only ever goes through axum, which vendors its own tower internals.
+tower = { workspace = true }
+http-body-util = "0.1"
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+scratchy-serving-transport = { workspace = true }

@@ -1,0 +1,56 @@
+[package]
+name = "scratchy-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end tests for vLLM Rust inference engine"
+
+[features]
+default = ["guided-decoding", "metrics", "multimodal", "tls"]
+e2e = []
+otel = ["scratchy-serving-api/otel", "scratchy-core-common/otel"]
+cuda = ["scratchy-serving-api/cuda"]
+nccl = ["cuda"]
+metal = ["scratchy-serving-api/metal", "dep:scratchy-target-metal"]
+rag = ["scratchy-serving-api/rag", "dep:spnl-core"]
+guided-decoding = ["scratchy-serving-api/guided-decoding"]
+multimodal = ["scratchy-serving-api/multimodal"]
+tls = ["scratchy-serving-api/tls"]
+metrics = ["scratchy-serving-api/metrics"]
+multiproc = ["scratchy-serving-api/multiproc"]
+
+[dependencies]
+# HTTP client
+reqwest = { workspace = true }
+rustls = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization (reuse protocol types from scratchy-serving-api)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# UUID generation (for batch IDs in tests)
+uuid = { version = "1", features = ["v4"] }
+
+# Logging
+tracing = { workspace = true }
+
+# Server stack (in-process startup)
+scratchy-core-common = { workspace = true }
+scratchy-serving-api = { workspace = true }
+# Metal backend — used only to probe Metal 4 availability so GPU-only e2e tests
+# skip on hosted CI runners (paravirtual GPU without Metal 4).
+scratchy-target-metal = { path = "../targets/metal", optional = true }
+spnl-core = { workspace = true, optional = true, features = ["rag"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+safetensors = { workspace = true }
+half = { workspace = true }
+tempfile = { workspace = true }
+base64 = "0.22"

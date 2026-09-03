@@ -1,0 +1,11 @@
+{
+  "quantization_config": {
+    "bits": 4,
+    "group_size": 64,
+    "quant_embed": true,
+    "bits_overrides": {
+      "mlp.gate": 8,
+      "mlp.shared_expert_gate": 8
+    }
+  }
+}

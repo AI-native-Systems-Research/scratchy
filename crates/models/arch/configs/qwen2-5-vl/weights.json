@@ -1,0 +1,29 @@
+{
+  "__packed_splits__": {
+    "attn.qkv": ["attn.q", "attn.k", "attn.v"]
+  },
+
+  "__pad_to_mult8__": [
+    {"weight": "mlp.gate_proj", "dim": 0},
+    {"weight": "mlp.up_proj", "dim": 0},
+    {"weight": "mlp.down_proj", "dim": 1}
+  ],
+
+  "patch_embed.proj": ["vision_in_features", "vision_embed_dim"],
+
+  "norm1": ["vision_embed_dim"],
+  "norm2": ["vision_embed_dim"],
+
+  "attn.q": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.k": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.v": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.proj": ["vision_embed_dim", "vision_embed_dim"],
+
+  "mlp.gate_proj": ["vision_embed_dim", "vision_intermediate_size_padded"],
+  "mlp.up_proj": ["vision_embed_dim", "vision_intermediate_size_padded"],
+  "mlp.down_proj": ["vision_intermediate_size_padded", "vision_embed_dim"],
+
+  "merger.ln_q": ["vision_embed_dim"],
+  "merger.mlp_0": ["vision_merge_hidden", "vision_merge_hidden"],
+  "merger.mlp_2": ["vision_merge_hidden", "d_model"]
+}

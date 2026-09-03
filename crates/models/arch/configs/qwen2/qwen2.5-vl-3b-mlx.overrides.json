@@ -1,0 +1,5 @@
+{
+  "_comment": "mlx_vlm.convert repack of Qwen/Qwen2.5-VL-3B-Instruct: text under language_model.*, BF16 gains/scales.",
+  "decoder_safetensors_prefix": "language_model",
+  "scale_dtype": "bf16"
+}

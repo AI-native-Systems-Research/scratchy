@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "scratchy-builder-spyre"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-graph placeholder. The SuperDSC dxp compile moved into the #[forward] emit, which submits the compiled device code to scratchy-forward-compiler::superdsc_registry; nothing is compiled or baked here."
+
+[features]
+default = []
+# Kept so the feature wiring that names `scratchy-builder-spyre/sendnn` keeps resolving. It no longer
+# turns anything on: the dxp compile happens inside the `#[forward]` emit
+# (`scratchy_subtile::superdsc_bake`) and its output goes into the binary via inventory.
+sendnn = []
+
+# ⛔ NO BUILD-DEPENDENCY ON `scratchy-models`. It used to live here as an ORDERING LEVER — a
+# build-dependency is the only edge cargo fully builds before a build script runs, so depending on the
+# model crate here guaranteed the `#[forward]` emit had filled the bundle cache before this crate's
+# build.rs walked it. That cache is gone (the emit compiles its own groups and embeds the result), so
+# the lever has nothing left to order — and it was expensive: a build-dependency compiles for the
+# HOST while the worker's normal edge compiles for the TARGET, which meant TWO cargo units each
+# running the full model emission, in parallel, both writing the same ~13 GB.

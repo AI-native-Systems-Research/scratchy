@@ -1,0 +1,67 @@
+#[forward]
+mod qwen3_5_moe {
+    /// Checkpoints ship BF16 RMSNorm gains (Qwen3-family
+    /// convention) — the metal gain-reader symbols must match.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
+    // Qwen3.5 `*RMSNorm` stores zero-centered gains (`x * (1 + w)`);
+    // scratchy keeps the on-disk form and offsets in-kernel. The
+    // sparse-MoE router renormalizes top-k weights — newer configs
+    // omit `norm_topk_prob` and the modeling code defaults it TRUE.
+    const BOUND_DEFAULTS: &[(&str, u64)] = &[("rms_norm_zero_centered", 1), ("norm_topk_prob", 1)];
+    // `Qwen3_5MoeForConditionalGeneration` nests the text decoder
+    // under `language_model.*` on disk.
+    const DECODER_PREFIX: &str = "language_model";
+
+    fn forward() {
+        hidden_states = embed(input_ids, embed_tokens);
+        for layer in 0..num_hidden_layers {
+            normed = rmsnorm(hidden_states, input_layernorm[layer]);
+
+            // Token mixer: GDN linear attention for `l % interval != 3`,
+            // full attention (with output gate) for the periodic `l % interval == 3`.
+            if layer % full_attention_interval != 3 {
+                // ── Gated-DeltaNet linear attention ─────────────────────
+                qkv = gemm(normed, linear_attn.in_proj_qkv[layer]);
+                z = gemm(normed, linear_attn.in_proj_z[layer]);
+                a = gemm(normed, linear_attn.in_proj_a[layer]);
+                b = gemm(normed, linear_attn.in_proj_b[layer]);
+                core = gated_delta_net(qkv, z, a, b, linear_attn[layer]);
+                mixer_out = gemm(core, linear_attn.out_proj[layer]);
+            } else {
+                // ── Full attention with sigmoid output gate ─────────────
+                // q_proj is doubled; gate_split deinterleaves per-head
+                // [query | gate]. q/k get per-head RMSNorm; partial RoPE.
+                qg = gemm(normed, self_attn.q_proj[layer]);
+                (q, gate) = gate_split(qg);
+                q = rmsnorm(q, self_attn.q_norm[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                k = rmsnorm(k, self_attn.k_norm[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                attn = attention(q, k, v, kv_cache[layer], block_table);
+                // Sigmoid output gate: attn * sigmoid(gate), fused (bare `*` /
+                // `sigmoid` aren't DSL-callable — Silu/Mul are synthesis-only).
+                attn = gate_apply(attn, gate);
+                mixer_out = gemm(attn, self_attn.o_proj[layer]);
+            }
+            hidden_states = add(mixer_out, hidden_states);
+
+            // Sparse MoE MLP: routed experts (softmax → top-8 → renorm →
+            // SwitchGLU → weighted sum, all inside moe_block) + the always-on
+            // shared expert — a quantized SwiGLU MLP scaled by the per-token
+            // sigmoid gate ([T, 1], row-broadcast inside gate_scale).
+            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            routed = moe_block(normed2, mlp[layer]);
+            shared_y = gemm(
+                silu(gemm(normed2, mlp.shared_expert.gate_proj[layer]))
+                    * gemm(normed2, mlp.shared_expert.up_proj[layer]),
+                mlp.shared_expert.down_proj[layer],
+            );
+            g = gemm(normed2, mlp.shared_expert_gate[layer]);
+            mlp_out = gate_scale(routed, shared_y, g);
+            hidden_states = add(mlp_out, hidden_states);
+        }
+        normed = rmsnorm(hidden_states, norm);
+        logits = gemm(normed, lm_head);
+    }
+}

@@ -1,0 +1,16 @@
+# 🛑 METAL 4 ONLY — FOR ALL TIME.
+#
+# Classic-MTL3 command buffers are banned in the metal backend. The hard,
+# build-failing enforcement lives in `crates/targets/metal/build.rs`
+# (`guard_no_classic_mtl3` scans for `.commandBuffer()` and panics the build on
+# EVERY host). This clippy ban is the semantic / editor-surfaced twin: it flags
+# the classic `MTLCommandQueue::commandBuffer` call site directly, and CI runs
+# clippy with `-D warnings` (.github/workflows/rust.yml) so it fails there too.
+#
+# Dispatch through `scratchy_target_metal::mtl4_dispatch` (tests/benches/
+# cost-sweep) or `interpreter::metal::run_bucket_mtl4` (production). MTL4 builds
+# command buffers via `device.newCommandBuffer()` +
+# `beginCommandBufferWithAllocator`, never `queue.commandBuffer()`.
+disallowed-methods = [
+    { path = "objc2_metal::MTLCommandQueue::commandBuffer", reason = "classic MTL3 is banned — the metal backend is Metal 4 only; dispatch via mtl4_dispatch / run_bucket_mtl4" },
+]

@@ -1,0 +1,17 @@
+{
+  "_comment": "mlx_vlm.convert layout drift: vision under vision_tower.* (HF original: visual.*), conv weight stored channels-last 5D.",
+  "vision_safetensors_layout": {
+    "default_root": "vision_tower",
+    "layered_subpath": "blocks",
+    "subtrees": {}
+  },
+  "vision_d_model_fingerprint": {
+    "key": "vision_tower.merger.mlp.2.weight",
+    "dim": 0
+  },
+  "vision_patch_embed_flatten": {
+    "key": "vision_tower.patch_embed.proj.weight",
+    "leading_dim": 0,
+    "channels_last": true
+  }
+}

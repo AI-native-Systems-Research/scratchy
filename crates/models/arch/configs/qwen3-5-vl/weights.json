@@ -1,0 +1,22 @@
+{
+  "__packed_splits__": {
+    "attn.qkv": ["attn.q", "attn.k", "attn.v"]
+  },
+
+  "patch_embed.proj": ["vision_in_features", "vision_embed_dim"],
+
+  "norm1": ["vision_embed_dim"],
+  "norm2": ["vision_embed_dim"],
+
+  "attn.q": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.k": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.v": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.proj": ["vision_embed_dim", "vision_embed_dim"],
+
+  "mlp.linear_fc1": ["vision_embed_dim", "vision_mlp_hidden"],
+  "mlp.linear_fc2": ["vision_mlp_hidden", "vision_embed_dim"],
+
+  "merger.norm": ["vision_embed_dim"],
+  "merger.linear_fc1": ["vision_merge_hidden", "vision_merge_hidden"],
+  "merger.linear_fc2": ["vision_merge_hidden", "d_model"]
+}

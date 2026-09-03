@@ -1,0 +1,76 @@
+[package]
+name = "scratchy-target-spyre"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR target. No GPU toolchain."
+
+[features]
+# Links the `ktir_emulator` crate for actually executing a bundle (the `runner`
+# module). OFF by default so emit-only / weight-loading builds — and the
+# `#[forward]` macro's compile, which only needs the f32 `eval_dag` reference —
+# never depend on ktir-emulator (a separately-developed sibling repo).
+runner = ["dep:ktir-emulator"]
+# `--target sendnn`: link the IBM Spyre sendnn runtime (build.rs cc-compiles
+# `csrc/sdsc_shim.cpp` + links libsendnn_*/flex) so `sdsc_runner` compiles a
+# sengraph in-process and runs it on the AIU via `GraphLoader::Predict`. No GPU
+# toolchain; the SDK is only present/linked on a Spyre host. Pulls in
+# `scratchy-subtile` because the session setters take its `sdsc_abstract` law
+# types (mask stride / fold pages / mask blocks / int stride) rather than u64s.
+# Also owns the `flex-rs` dependency (the SuperDSC on-silicon path — `sendnn` is
+# synonymous with `superdsc` today): flex-rs's build.rs cc-compiles its senlib
+# shim, which only exists on a Spyre host, so flex-rs must NOT be pulled into a
+# cuda/metal/emit-only build. `fxa_rust_abi`, the only module that touches
+# flex-rs, is gated on this same feature.
+sendnn = ["dep:flex-rs"]
+
+[dependencies]
+# ⭐ THE BAKED BUNDLE ITSELF — re-exported from this crate's root as `bundle_code`, which is the path
+# the `#[forward]` macro's `inventory::submit!` tokens name. UNCONDITIONAL and feature-free on
+# purpose: those tokens land in the arch crate under `spyre`/`superdsc`, which do NOT turn on this
+# crate's `sendnn`, so a gate here would make them fail to resolve in a build that has the target but
+# not the runtime.
+scratchy-spyre-bundle = { path = "bundle" }
+scratchy-tensors = { path = "../../tensors" }
+# Neutral leaf crate (NOT a `targets/` crate) — holds the shared `GpuWeights`
+# container the spyre `__gpu` facade re-exports for the macro's load path.
+scratchy-layers = { path = "../../layers" }
+# Neutral leaf — the affine/nvfp4 quant layer TYPES the macro's `Weights` struct
+# names (`AffineQuantEmbedding`, `AffineQuantLinear`, `Nvfp4Linear`).
+scratchy-quantizations = { path = "../../models/quantization" }
+half = { workspace = true }
+# Native Rust port of flex. In-tree crate; the ONLY fxa_* implementation
+# (see fxa_rust_abi.rs) — pure Rust so it compiles on any host regardless
+# of `sendnn`; its own cxx-shim only compiles/links when built on a real
+# Spyre host (gated by FLEX_RS_BUILD_CXX_SHIM, not a Cargo feature).
+flex-rs = { path = "flex-rs", optional = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The KTIR emulator (RFC 0682) — Spyre's hardware-free execution path, only
+# pulled when `runner` is enabled. (Repo is still named `ktir-cpu`; the crate it
+# publishes was renamed `ktir-cpu` -> `ktir-emulator`.)
+ktir-emulator = { git = "https://github.com/starpit/ktir-cpu", branch = "rust", optional = true, features = ["metal"] }
+# The sdsc session laws (`sdsc_abstract`): `PrefixMaskShape` / `FoldPages` /
+# `MaskBlocks` / `FoldRowRegime` — the only mints for the values the sendnn
+# session setters accept. Optional: only the `sendnn` run path binds a session.
+scratchy-subtile = { path = "../../compiler/subtile", features = ["superdsc"] }
+
+# Compiles the `-Fsendnn` C++ launcher shim (csrc/sdsc_shim.cpp). Unconditional
+# build-dep (tiny); build.rs only invokes it under the `sendnn` feature.
+[build-dependencies]
+cc = "1"
+
+# `fold_plan`'s fixtures mint the law-governed `SessionKv` fields (the mask /
+# intermediate rep strides) through the same `sdsc_abstract` laws production
+# uses, so a fixture cannot encode a relationship production can't.
+[dev-dependencies]
+scratchy-subtile = { path = "../../compiler/subtile", features = ["superdsc"] }
+
+# The proof harnesses in this crate compile only under the model checker, so `cfg(kani)` is a real name a
+# normal build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the
+# proofs hold" turned out to be vacuous (a normal build skipped the module and said nothing), and declaring
+# it keeps a typo in the cfg name an error while stopping the lint complaining about the name itself.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

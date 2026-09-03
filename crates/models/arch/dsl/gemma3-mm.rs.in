@@ -1,0 +1,163 @@
+#[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
+mod gemma3_mm {
+    /// Gemma3-MM SigLIP vision tower params schema — field name = the
+    /// bound name the DSL / weights.json reference; `#[from]` paths index
+    /// the VERBATIM HF `Gemma3ForConditionalGeneration` config.json
+    /// (configs/ carries it byte-for-byte). SigLIP uses a learned
+    /// absolute pos-embed and no rope at all → `vision_rope_half_dim = 0`.
+    /// Reproduces the old `VisionFamily::Gemma3` derivation (keys
+    /// hidden_size/num_hidden_layers/num_attention_heads/num_channels;
+    /// temporal/merge absent → default 1; pool chain off image_size /
+    /// mm_tokens_per_image; d_model = text_config.hidden_size).
+    struct Params {
+        #[from = "vision_config.hidden_size"]
+        vision_embed_dim: u64,
+        #[from = "vision_config.num_hidden_layers"]
+        vision_depth: u64,
+        #[from = "vision_config.num_attention_heads"]
+        vision_num_heads: u64,
+        #[from = "vision_config.num_channels"]
+        vision_in_chans: u64,
+        #[from = "vision_config.patch_size"]
+        vision_patch_size: u64,
+        #[from("vision_config.temporal_patch_size", default = 1)]
+        vision_temporal_patch_size: u64,
+        #[from("vision_config.spatial_merge_size", default = 1)]
+        vision_spatial_merge_size: u64,
+        #[expr = "vision_embed_dim / vision_num_heads"]
+        vision_head_dim: u64,
+        #[expr = "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size"]
+        vision_in_features: u64,
+        #[expr = "vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_factor: u64,
+        #[expr = "vision_embed_dim * vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_hidden: u64,
+        #[value = 0]
+        vision_rope_half_dim: u64,
+        #[from = "vision_config.intermediate_size"]
+        vision_mlp_hidden: u64,
+        #[from = "vision_config.image_size"]
+        vision_image_size: u64,
+        #[expr = "vision_image_size / vision_patch_size"]
+        vision_patch_grid_side: u64,
+        #[expr = "vision_patch_grid_side * vision_patch_grid_side"]
+        vision_num_positions: u64,
+        #[from = "mm_tokens_per_image"]
+        vision_pooled_tokens: u64,
+        #[expr = "vision_num_positions / vision_pooled_tokens"]
+        vision_pool_factor: u64,
+        #[expr = "sqrt(vision_pool_factor)"]
+        vision_pool_kernel: u64,
+        #[from = "text_config.hidden_size"]
+        d_model: u64,
+    }
+
+    /// SigLIP block norms read `vision_config.layer_norm_eps`, which is
+    /// 1e-6 for every gemma3 checkpoint — the parse default (1e-6)
+    /// already matches, so no NORM_EPS const is declared.
+    /// The MM projector's `mm_soft_emb_norm` (rmsnorm(x, w+1.0) →
+    /// ScalarOffsetRmsNorm) ships a BF16 gain in the mlx repacks; the
+    /// `_s_<dtype>_` symbol must read it as bf16 (f16 default mis-decodes
+    /// → garbled projection). The SigLIP block LayerNorms use the
+    /// separate layer_norm_bias kernel (gain read as activation dtype),
+    /// so this only governs the projector's RmsNorm.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
+    const SAFETENSORS: Layout = Layout {
+        root: "vision_tower.vision_model",
+        blocks: "encoder.layers",
+        subtrees: &[("mm", "multi_modal_projector")],
+    };
+    /// The SigLIP→text projector matrix is `[vision_embed_dim, d_model]`,
+    /// so d_model is dim 1.
+    const FINGERPRINT: Fingerprint = Fingerprint {
+        key: "multi_modal_projector.mm_input_projection_weight",
+        dim: 1,
+    };
+    /// SigLIP patch_embedding conv. mlx_vlm-converted checkpoints store
+    /// it CHANNELS-LAST `[E, kh, kw, C]` (verified shape `[1152,14,14,3]`),
+    /// while the pixel packing is channels-FIRST `(C, kh, kw)` (verified:
+    /// scratchy pixels == mlx pixels at cos 1.0 in (c,kh,kw) order). The
+    /// weight must be permuted to channels-first to match — `channels_last:
+    /// true` does the `[E,kh,kw,C] -> [E,C,kh,kw]` permute. (HF-native
+    /// Conv2d weights are already `[E,C,kh,kw]` → would need `false`; metal
+    /// serves the mlx repacks.)
+    const PATCH_EMBED_FLATTEN: Flatten = Flatten {
+        key: "vision_tower.vision_model.embeddings.patch_embedding.weight",
+        leading_dim: 0,
+        channels_last: true,
+    };
+
+    fn forward() {
+        // Patch embed: Conv2d(in=3, out=1152, k=14, s=14) flattened at
+        // load time to a [1152, 588] linear. With bias.
+        hidden_states = gemm(pixels, embeddings.patch_embedding);
+        hidden_states = bias_add(hidden_states, embeddings.patch_embedding.bias);
+
+        // Learned positional embedding lookup. `position_ids` is a vision-
+        // prelude extern of `[num_tokens]` u32 the wrapper builds as
+        // `[0..vision_num_positions, ...]` per image; the table is the
+        // 2D `[vision_num_positions, vision_embed_dim]` learned weight.
+        pos_emb = pos_embed(position_ids, embeddings.position_embedding);
+        hidden_states = add(hidden_states, pos_emb);
+
+        for layer in 0..vision_depth {
+            // Pre-norm self-attention. PyTorch `nn.LayerNorm` (γ+β)
+            // decomposes as `(mean, sub, rmsnorm, bias_add)`; the
+            // `MeanSubRmsNormBiasAddImpl` matcher claims the 4-tile chain
+            // and lowers to one `kernels::layer_norm_bias` call.
+            m1 = mean(hidden_states);
+            c1 = sub(hidden_states, m1);
+            n1 = rmsnorm(c1, layer_norm1[layer]);
+            normed = bias_add(n1, layer_norm1.bias[layer]);
+
+            q = gemm(normed, self_attn.q_proj[layer]);
+            q = bias_add(q, self_attn.q_proj.bias[layer]);
+            k = gemm(normed, self_attn.k_proj[layer]);
+            k = bias_add(k, self_attn.k_proj.bias[layer]);
+            v = gemm(normed, self_attn.v_proj[layer]);
+            v = bias_add(v, self_attn.v_proj.bias[layer]);
+
+            // SigLIP runs full attention per-image. Single cu_seqlens
+            // segments the batched-flat tensor at image boundaries (one
+            // segment per image, max_seqlen = vision_num_positions).
+            attn_out = varlen_attention(q, k, v, cu_seqlens, max_seqlen);
+
+            oproj = gemm(attn_out, self_attn.out_proj[layer]);
+            oproj = bias_add(oproj, self_attn.out_proj.bias[layer]);
+            hidden_states = add(oproj, hidden_states);
+
+            // Pre-norm MLP (GELU-tanh, biases on both fc1 / fc2).
+            m2 = mean(hidden_states);
+            c2 = sub(hidden_states, m2);
+            n2 = rmsnorm(c2, layer_norm2[layer]);
+            normed2 = bias_add(n2, layer_norm2.bias[layer]);
+
+            fc1 = gemm(normed2, mlp.fc1[layer]);
+            fc1 = bias_add(fc1, mlp.fc1.bias[layer]);
+            fc1 = gelu(fc1);
+            fc2 = gemm(fc1, mlp.fc2[layer]);
+            fc2 = bias_add(fc2, mlp.fc2.bias[layer]);
+            hidden_states = add(fc2, hidden_states);
+        }
+
+        // Post-encoder LayerNorm (γ+β) — same 4-tile decomposition.
+        mp = mean(hidden_states);
+        cp = sub(hidden_states, mp);
+        np = rmsnorm(cp, post_layernorm);
+        hidden_states = bias_add(np, post_layernorm.bias);
+
+        // MM projector: AvgPool2d(k=4) collapses the 64×64 patch grid to
+        // 16×16 = 256 tokens, RMSNorm (no bias) on the pooled features,
+        // matmul-only `nn.Parameter` projection to text d_model.
+        //
+        // Gemma3RMSNorm uses `output * (1.0 + weight)`, NOT `output * weight`
+        // (so zero-init weights are identity-equivalent). Same `+ 1.0` as
+        // every RMSNorm site in the text-decoder body (the `gemma3` arch).
+        // Without this, garbled output: the projector RMSNorm scales the
+        // post-pool features by ~zero (initial weights are tiny floats), the
+        // projection collapses, and the decoder receives near-noise embeds.
+        pooled = avg_pool_2d(hidden_states);
+        normed_pool = rmsnorm(pooled, mm.mm_soft_emb_norm + 1.0);
+        out = gemm(normed_pool, mm.mm_input_projection_weight);
+    }
+}

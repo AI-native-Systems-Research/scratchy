@@ -1,0 +1,5 @@
+{
+  "vocab_size": 32003,
+  "pad_token_id": 0,
+  "torch_dtype": "float16"
+}

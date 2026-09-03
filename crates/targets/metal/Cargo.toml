@@ -1,0 +1,85 @@
+[package]
+name = "scratchy-target-metal"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Observability hooks in the encode loop / sampler — gated per-seam so a plain
+# engine build carries none of it. `sampler-telemetry` also drives a shader
+# `-D` define (see build.rs) so the kernel's telemetry params vanish too.
+forward-telemetry = ["scratchy-core-common/forward-telemetry"]
+sampler-telemetry = ["scratchy-core-common/sampler-telemetry"]
+# Multimodal capability: the `MultimodalForward`/`PixelInput` device-runtime
+# surface + the generic `VisionWrapper` glue, and the `scratchy-vision`/`image`
+# decode stack they require. Off by default — a text-only build never
+# compiles the image-decode crates. Forwarded from `scr`'s `multimodal`
+# feature via scratchy-serving-api -> scratchy-serving-worker.
+vision = ["scratchy-forward-compiler/vision", "dep:scratchy-vision"]
+
+[dependencies]
+scratchy-tensors = { path = "../../tensors" }
+scratchy-core-common = { path = "../../core/common" }
+scratchy-layers = { path = "../../layers" }
+scratchy-quantizations = { path = "../../models/quantization" }
+scratchy-ir = { path = "../../compiler/ir", features = ["metal"] }
+# The SHARED front end. Metal lowers the same `SubtileTape` spyre lowers — see
+# `src/from_tape.rs`. Target-specific lowering lives in the TARGET crate, which is why
+# this edge exists rather than a `metal_*` module inside the compiler.
+scratchy-subtile = { path = "../../compiler/subtile" }
+# The cfg-free contracts the relocated `forward_ctx` / `vision_arch` modules
+# name: `EmbedPatch` / `PixelInput` / `MultimodalForward` (the last gated on the
+# compiler's `metal` feature). Acyclic — the compiler no longer depends on this
+# crate (the interpreter re-export was severed), so this is the inverted edge
+# mirroring the cuda target's compiler dependency.
+scratchy-forward-compiler = { path = "../../compiler", features = ["metal"] }
+# Pure-CPU vision host glue (VisionConfig / cu_seqlens / patch permute / window
+# dispatch) consumed by the relocated `vision_arch` module. Clean leaf.
+# Optional: gated by the `vision` feature above, not compiled into a
+# text-only build.
+scratchy-vision = { path = "../../models/vision", optional = true }
+anyhow = "1"
+tracing = "0.1"
+memmap2 = "0.9"
+rayon = { workspace = true }
+rand = { workspace = true }
+libc = "0.2"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "dispatch2",
+    # MTL4 surfaces for the migration off MTLCommandBuffer + ICB.
+    # Runtime-probed via
+    # `device.newMTL4CommandQueue()`; absent on macOS 14, so kept as
+    # a side-by-side path.
+    "MTL4ArgumentTable",
+    "MTL4BufferRange",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+] }
+objc2-foundation = "0.3"
+dispatch2 = "0.3"
+half = "2.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+criterion = "0.8"
+# RMSNorm gain-dtype regression test (rmsnorm_scale_dtype_test): builds a tiny
+# bf16 safetensors fixture and loads it through the real metal loader.
+half = { workspace = true }
+safetensors = { workspace = true }
+
+# build.rs uses only `xcrun` via std::process::Command — no crate
+# dependencies needed.
+
+[[bench]]
+name = "attention_benchmark"
+harness = false
+
+[[bench]]
+name = "fused_kernels_benchmark"
+harness = false

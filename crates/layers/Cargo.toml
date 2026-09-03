@@ -1,0 +1,18 @@
+[package]
+name = "scratchy-layers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-neutral neural-network layer types (LinearLayer, norms, embeddings) for scratchy. Type defs + pure accessors only — no CUDA, no Metal; backend-runtime methods (kernel-calling forward, GpuWeights-bound load) live in the target crates via extension traits."
+
+[dependencies]
+scratchy-tensors = { path = "../tensors" }
+scratchy-quantizations = { path = "../models/quantization" }   # LinearLayer/MoE hold GgmlStorage + AffineQuant/Nvfp4 payloads
+scratchy-core-model = { path = "../core/model" }               # GpuWeights LoRA merge uses LoraAdapterConfig
+serde_json = { workspace = true }                              # safetensors index.json parsing
+anyhow = { workspace = true }
+half = "2.3"
+tracing = { workspace = true }
+safetensors = { workspace = true }   # GpuWeights mmap-loads safetensors shards
+memmap2 = { workspace = true }
+rayon = { workspace = true }

@@ -1,0 +1,18 @@
+{
+  "embed_tokens": ["vocab_size", "hidden_size"],
+  "input_layernorm": ["hidden_size"],
+  "lm_head": ["hidden_size", "vocab_size"],
+  "mlp.down_proj": ["intermediate_size", "hidden_size"],
+  "mlp.gate_proj": ["hidden_size", "intermediate_size"],
+  "mlp.up_proj": ["hidden_size", "intermediate_size"],
+  "moe": ["hidden_size"],
+  "norm": ["hidden_size"],
+  "post_attention_layernorm": ["hidden_size"],
+  "self_attn.kv_a_layernorm": ["kv_lora_rank"],
+  "self_attn.kv_a_proj_with_mqa": ["hidden_size", "kv_a_proj_out"],
+  "self_attn.kv_b_proj": ["kv_lora_rank", "kv_lora_out"],
+  "self_attn.o_proj": ["attn_out", "hidden_size"],
+  "self_attn.q_a_proj": ["hidden_size", "q_lora_rank"],
+  "self_attn.q_a_layernorm": ["q_lora_rank"],
+  "self_attn.q_b_proj": ["q_lora_rank", "q_proj_out"]
+}

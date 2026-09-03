@@ -1,0 +1,25 @@
+# cargo-deny configuration — guards the dependency tree against regressions.
+# Run locally / in CI with:  cargo deny check bans
+#
+# The dep-diet pass (2026-07) collapsed a batch of duplicate crate versions
+# (dirs, indicatif, console, the russh crypto stack) and unified TLS on
+# rustls+ring. This config keeps those wins from silently creeping back.
+
+[graph]
+# Evaluate the tree for the platforms we actually ship. Skips the windows-*
+# duplicate churn, which never compiles on macOS/Linux and is pure noise.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+[bans]
+# Warn (not deny yet) when a crate resolves to multiple versions. Flip to
+# "deny" in CI once the remaining upstream-pinned dups below are resolved.
+multiple-versions = "warn"
+wildcards = "allow"
+
+# Crates we deliberately removed from the default/serving build.
+skip = [
+    # tokenizers 0.21: pulled only by toktrie_hf_tokenizers (upstream-pinned).
+]

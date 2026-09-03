@@ -1,0 +1,48 @@
+# Build artifacts
+target/
+*.o
+*.so
+*.a
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large directories (but keep third_party - needed for build)
+.claude/
+deeptools/
+
+# Test data
+testdata/
+*.onnx
+*.safetensors
+*.bin
+
+# Temporary files
+.tmp_*
+*.tmp

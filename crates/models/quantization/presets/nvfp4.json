@@ -1,0 +1,8 @@
+{
+  "quantization_config": {
+    "quant_method": "modelopt",
+    "quant_algo": "NVFP4",
+    "group_size": 16,
+    "ignore": ["lm_head"]
+  }
+}

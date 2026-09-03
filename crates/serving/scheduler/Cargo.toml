@@ -1,0 +1,14 @@
+[package]
+name = "scratchy-serving-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scheduler, KV cache management, and block allocation for vLLM Rust port"
+
+[dependencies]
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+tracing = { workspace = true }
+hashbrown = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }

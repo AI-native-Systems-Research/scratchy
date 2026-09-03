@@ -1,0 +1,5 @@
+{
+  "_comment": "nvidia/LocateAnything-3B text decoder (stock Qwen2.5-3B): the VL wrapper nests it under language_model.* on disk, and the checkpoint ships BF16 RMSNorm gains (unlike the f16-gain mlx-community qwen2 repacks this crate's other variants use).",
+  "decoder_safetensors_prefix": "language_model",
+  "scale_dtype": "bf16"
+}

@@ -1,0 +1,57 @@
+{
+  "__packed_splits__": {
+    "attn.Wqkv": [
+      "attn.q_proj",
+      "attn.k_proj",
+      "attn.v_proj"
+    ],
+    "mlp.Wi": [
+      "mlp.gate_proj",
+      "mlp.up_proj"
+    ]
+  },
+  "embeddings.tok_embeddings": [
+    "vocab_size",
+    "hidden_size"
+  ],
+  "embeddings.norm": [
+    "hidden_size"
+  ],
+  "attn_norm": [
+    "hidden_size"
+  ],
+  "attn.q_proj": [
+    "hidden_size",
+    "head_dim * num_attention_heads"
+  ],
+  "attn.k_proj": [
+    "hidden_size",
+    "head_dim * num_key_value_heads"
+  ],
+  "attn.v_proj": [
+    "hidden_size",
+    "head_dim * num_key_value_heads"
+  ],
+  "attn.Wo": [
+    "head_dim * num_attention_heads",
+    "hidden_size"
+  ],
+  "mlp_norm": [
+    "hidden_size"
+  ],
+  "mlp.gate_proj": [
+    "hidden_size",
+    "intermediate_size"
+  ],
+  "mlp.up_proj": [
+    "hidden_size",
+    "intermediate_size"
+  ],
+  "mlp.Wo": [
+    "intermediate_size",
+    "hidden_size"
+  ],
+  "final_norm": [
+    "hidden_size"
+  ]
+}

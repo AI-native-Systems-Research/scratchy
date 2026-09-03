@@ -1,0 +1,26 @@
+{
+  "quantization_config": {
+    "quant_method": "compressed-tensors",
+    "format": "float-quantized",
+    "ignore": ["lm_head"],
+    "config_groups": {
+      "group_0": {
+        "targets": ["Linear"],
+        "weights": {
+          "num_bits": 8,
+          "type": "float",
+          "strategy": "channel",
+          "symmetric": true,
+          "dynamic": false
+        },
+        "input_activations": {
+          "num_bits": 8,
+          "type": "float",
+          "strategy": "token",
+          "symmetric": true,
+          "dynamic": true
+        }
+      }
+    }
+  }
+}

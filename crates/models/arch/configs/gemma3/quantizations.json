@@ -1,0 +1,16 @@
+{
+  "quantizations": [
+    "fp8-dynamic-per-tensor",
+    "fp8-static-per-tensor",
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
+    {"ggml": {
+      "norm_weight_offset": 1.0,
+      "tensor_renames": {
+        "ffn_norm.weight": "pre_feedforward_layernorm.weight",
+        "post_attention_norm.weight": "post_attention_layernorm.weight",
+        "post_ffw_norm.weight": "post_feedforward_layernorm.weight"
+      }
+    }}
+  ]
+}

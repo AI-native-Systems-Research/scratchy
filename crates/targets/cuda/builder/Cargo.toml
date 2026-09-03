@@ -1,0 +1,21 @@
+[package]
+name = "scratchy-builder-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compiles all CUDA kernels (.cu -> .a) for the scratchy inference framework"
+
+[features]
+default = []
+cuda = ["cudaforge", "scratchy-models/cuda"]
+
+[dependencies]
+# Dep on scratchy-models ensures forward!() runs first (generates .cu files)
+# before this crate's build.rs compiles them.
+scratchy-models = { path = "../../../models/arch" }
+
+[build-dependencies]
+cudaforge = { version = "0.1.6", optional = true }
+dirs = { workspace = true }
+# FlashInfer per-tuple shim is rendered at build time from `templates/`.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }

@@ -1,0 +1,12 @@
+{
+  "quantization_config": {
+    "quant_method": "bitsandbytes",
+    "load_in_4bit": true,
+    "load_in_8bit": false,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_quant_storage": "uint8",
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_use_double_quant": true,
+    "llm_int8_skip_modules": ["lm_head"]
+  }
+}

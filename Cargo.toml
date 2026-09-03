@@ -1,0 +1,251 @@
+[workspace]
+resolver = "2"
+default-members = ["crates/cli/scr"]
+members = [
+    "crates/core/common",
+    "crates/core/config",
+    "crates/serving/scheduler",
+    "crates/serving/engine",
+    "crates/serving/api",
+    "crates/serving/worker",
+    "crates/core/model",
+    "crates/core/hf-hub-downloader",
+    "crates/serving/transport",
+    "crates/benches",
+    "crates/cli/scr",
+    "crates/e2e",
+    "crates/tensors",
+    "crates/layers",
+    "crates/compiler/ir",
+    "crates/compiler/sdsc",
+    "crates/targets/cuda",
+    "crates/targets/cuda/builder",
+    "crates/targets/spyre",
+    "crates/targets/spyre/bundle",
+    "crates/targets/spyre/builder",
+    "crates/models/arch",
+    "crates/models/vision",
+    "crates/models/quantization",
+    "crates/compiler",
+    "crates/compiler/macros",
+    "crates/compiler/subtile",
+    "crates/targets/cuda/cost-sweep",
+    "crates/targets/metal",
+    "crates/targets/metal/compiler",
+]
+# scratchy-tui pulls goose from git (not published to crates.io) and stands
+# entirely on its own as the `scr-tui` binary — excluded so its resolution
+# (and goose's git fetch) never touches this workspace's Cargo.lock, and a
+# plain `cargo build`/`cargo update` here never needs network access to the
+# goose fork. Build/run it via `cargo run -p scratchy-tui` from
+# crates/cli/tui, which has its own Cargo.lock.
+exclude = ["crates/cli/tui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/vllm-project/vllm"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+bincode = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/gRPC
+axum = "0.8"
+# tls-rustls-no-provider (not tls-rustls) so axum-server does NOT force
+# rustls/aws-lc-rs — server.rs supplies its own ServerConfig built with the
+# ring provider. Keeps the whole TLS build on ring (no aws-lc-sys C toolchain).
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tower = "0.5"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
+# OpenTelemetry (optional, behind "otel" feature)
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.33"
+
+# Metrics
+prometheus = "0.14"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+
+# Distributed slice registration — used by the macro-emitted
+# `#[forward]` registrations so `scratchy_forward_compiler::try_load`
+# auto-discovers every compiled arch without a central list.
+inventory = "0.3"
+
+# System info
+libc = "0.2"
+core-foundation = "0.10"
+fs2 = "0.4"
+dirs = "6"
+
+# Parallelism
+rayon = "1"
+
+# Collections / utilities
+indexmap = { version = "2", features = ["serde"] }
+hashbrown = "0.17"
+smallvec = "1"
+bytes = "1"
+rand = "0.9"
+
+# ZeroMQ
+zeromq = "0.6"
+
+# Tokenizer. default-features=false drops the `progressbar` default feature —
+# tokenizer-training progress bars, and we only ever infer. onig + esaxx_fast
+# are kept to preserve exact tokenization behavior.
+tokenizers = { version = "0.23", default-features = false, features = ["onig", "esaxx_fast"] }
+
+# Template engine (for HuggingFace chat templates)
+minijinja = { version = "2", features = ["builtins", "json", "loader"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+# Structured output / constrained decoding
+llguidance = { version = "1.6" }
+toktrie = { version = "1.6" }
+toktrie_hf_tokenizers = { version = "1.6" }
+
+# Binary format parsing
+byteorder = "1"
+
+# Tensor ops
+# CUDA (NVIDIA GPU)
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "f16"] }
+safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
+half = "2.7"
+memmap2 = "0.9"
+
+# Span query language
+spnl-core = { version = "0.22", default-features = false }
+
+# RAG / vector search
+leann-core = { version = "0.2", default-features = false }
+ndarray = "0.17"
+
+# Progress bars
+indicatif = "0.18"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Streaming
+tokio-stream = "0.1"
+
+# Testing
+tempfile = "3"
+rcgen = "0.14"
+
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# HTTP client. rustls instead of the default native-tls so the whole tree shares
+# one TLS stack (rustls+ring), with no native-tls/tokio-native-tls/hyper-tls.
+#
+# reqwest is TEST-ONLY: scratchy-e2e, and scratchy-serving-api's
+# dev-dependencies. Nothing shipped links it — the CLI, the benchmarks and the
+# rag embedding client all talk HTTP through `ureq` above.
+#
+# rustls-no-provider for the same reason axum-server gets tls-rustls-no-provider
+# above: reqwest's plain `rustls` feature hard-wires `rustls?/aws-lc-rs`, adding
+# aws-lc-rs + aws-lc-sys (a bindgen'd BoringSSL fork needing a C/asm toolchain)
+# on top of the ring build we already have. `ureq` takes this same door — its
+# `rustls` feature resolves to `_ring, rustls-no-provider`.
+#
+# The provider reqwest then declines to pick is installed by each test entry
+# point that builds a client: scratchy-e2e's `Client::new` and `server.rs`, and
+# the serving-api TLS tests. Being test-only, it needs no install in scr's
+# `main()`.
+reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "stream", "rustls-no-provider"] }
+
+# Internal workspace crates
+scratchy-core-common = { path = "crates/core/common" }
+scratchy-core-config = { path = "crates/core/config" }
+scratchy-serving-scheduler = { path = "crates/serving/scheduler" }
+scratchy-serving-engine = { path = "crates/serving/engine" }
+scratchy-serving-api = { path = "crates/serving/api" }
+scratchy-serving-worker = { path = "crates/serving/worker" }
+scratchy-core-model = { path = "crates/core/model" }
+# We own Hub downloads (that crate's manifest says why). Do not reach for the
+# `hf-hub` crate to avoid it: 1.0 depends on hf-xet non-optionally — no
+# feature, builder method or env var disables it — costing 111 crates and a C
+# cryptography toolchain, and it has no download resume (huggingface/hf-hub#196).
+hf-hub-downloader = { path = "crates/core/hf-hub-downloader" }
+scratchy-quantizations = { path = "crates/models/quantization" }
+scratchy-vision = { path = "crates/models/vision" }
+scratchy-forward-compiler = { path = "crates/compiler" }
+scratchy-serving-transport = { path = "crates/serving/transport" }
+scratchy-bench = { path = "crates/benches" }
+scratchy-cli = { path = "crates/cli/scr" }
+scratchy-e2e = { path = "crates/e2e" }
+
+[profile.release]
+
+# `scratchy-models` is the proc-macro fan-out site: `#[forward]`
+# expands each arch DSL into 10-20 dense-size specializations plus
+# shim variants per quant overlay. Cross-variant forward-fn +
+# load-body dedup collapses most bodies to one canonical per
+# equivalence class (same Impl-family, same bounds, same SFUF), but
+# debug info for the remaining per-variant code (tie-breaking
+# wrappers + fingerprint fns + type aliases) still pushes rustc
+# past 60GB RSS on a full rebuild. `debug = 0` here halves the RSS
+# without affecting optimization or the crate's debuggability at
+# the forward-fn / kernel boundary — gdb backtraces still resolve
+# in `scratchy-target-cuda` where the actual kernel calls live.
+[profile.dev.package.scratchy-models]
+debug = 0
+
+# Proc-macros (and their dependencies) execute AT COMPILE TIME. The wavefront
+# codegen pipeline (solver, region tiling, per-model×variant emit) runs on
+# EVERY build. At the default dev opt-level that pipeline is the DOMINANT
+# rustc cost (minutes of `rustc` on scratchy-model-* with nothing else going
+# on). Optimize the host/proc-macro build so it runs at native speed — a
+# one-time proc-macro compile cost amortized across every model build.
+# Applies to all build scripts + proc-macros + their deps (incl.
+# scratchy-subtile).
+[profile.dev.build-override]
+opt-level = 3
+
+# Same reasoning for release: the codegen pipeline runs in the build script AT
+# BUILD TIME. cargo's default build-override is opt-level = 0, which would run
+# the whole pipeline (solver, region tiling, per-model×variant emit)
+# UNOPTIMIZED — the dominant cost of a release build. Optimize the build script
+# + its deps so the pipeline runs at native speed.
+[profile.release.build-override]
+opt-level = 3
+
+[profile.release.package.scratchy-models]
+debug = 0
+# The emitted forward code is dispatch glue — the real compute is in the metal /
+# cuda kernels, compiled separately. At -O3 the sheer volume (models × quant
+# variants) makes LLVM the dominant `cargo build --release` cost. opt-level = 1
+# still inlines the hot dispatch but slashes LLVM time. `release-dist` (below)
+# overrides back to -O3 + fat LTO for the shipping build.
+opt-level = 1
+
+[profile.release-dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+
+# Keep the model code fully optimized in the shipping build (release inherits
+# opt-level = 1 above; undo it here).
+[profile.release-dist.package.scratchy-models]
+opt-level = 3

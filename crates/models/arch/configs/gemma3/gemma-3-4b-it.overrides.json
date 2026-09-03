@@ -1,0 +1,5 @@
+{
+  "decoder_safetensors_prefix": "language_model",
+  "scale_dtype": "bf16",
+  "_comment": "gemma-3-4b-it CondGen (MM): text decoder nested under language_model.* with BF16 RMSNorm gains (mlx bf16 repack). scale_dtype bf16 is the TEXT decoder gain dtype (the SigLIP vision tower uses layer_norm_bias, which must NOT set it)."
+}

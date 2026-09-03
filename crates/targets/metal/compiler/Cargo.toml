@@ -1,0 +1,35 @@
+[package]
+name = "scratchy-target-metal-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Metal's compile-time lowering: SubtileTape -> metal instruction stream + static tape"
+
+# ⭐ WHY THIS CRATE EXISTS.
+#
+# Metal's lowering (`metal_from_subtile.rs`, `metal_static_tape.rs`) lived in
+# `crates/compiler/macros/` — target codegen inside the shared compiler crate. It could not
+# simply move next to the rest of metal (`crates/targets/metal/`) because
+# `scratchy-forward-compiler-macro` DEPENDS ON `scratchy-target-metal`, so the target side could
+# not name the compiler's handoff types without a cycle.
+#
+# The fix is a crate on the target's side of that edge:
+#
+#   scratchy-subtile          (handoff types + the shared SubtileIR/SubtileTape)
+#        |                 \
+#   scratchy-target-metal    scratchy-target-metal-compiler   <- metal's codegen lives HERE
+#        |                  /
+#   scratchy-forward-compiler-macro
+#
+# `syn`/`quote` are fine here: this is a COMPILE-TIME crate, never linked into the runtime. That
+# is exactly why `WeightSlot` (whose `base` is a `syn::Ident`) could not go into
+# `scratchy-subtile`, which the metal runtime does link.
+[dependencies]
+scratchy-subtile = { path = "../../../compiler/subtile" }
+scratchy-target-metal = { path = ".." }
+scratchy-ir = { path = "../../../compiler/ir", features = ["metal"] }
+
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+serde = { version = "1", features = ["derive"] }

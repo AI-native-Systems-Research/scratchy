@@ -1,0 +1,74 @@
+
+# Standalone workspace: this crate lives inside the scratchy repo tree but is
+# excluded from the root `[workspace]` (see root Cargo.toml) specifically so
+# that goose — a git dependency, not published to crates.io — never has to be
+# resolved/fetched to build or lock the main scratchy workspace. Build/run
+# with `cargo run -p scratchy-tui` (or `cargo build --release`) from this
+# directory; it has its own Cargo.lock.
+[workspace]
+
+[package]
+name = "scratchy-tui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Standalone `scr-tui` binary: terminal UI driving goose's core Agent with scratchy as an in-process provider."
+
+[features]
+# Backend is chosen at build time — the TUI itself is backend-agnostic.
+metal = ["scratchy-serving-api/metal"]
+cuda = ["scratchy-serving-api/cuda"]
+
+[[bin]]
+name = "scr-tui"
+path = "src/main.rs"
+
+[dependencies]
+# goose consumed as a normal upstream dependency (core Agent + the Provider
+# trait), fetched from the goose repo. goose does NOT depend on scratchy — the
+# provider impl lives HERE. Pinned to a commit for reproducible builds.
+goose = { git = "https://github.com/aaif-goose/goose.git", rev = "f9c7aaccde4834810dfd13d5efa8f0d39ba28a20", default-features = false }
+goose-provider-types = { git = "https://github.com/aaif-goose/goose.git", rev = "f9c7aaccde4834810dfd13d5efa8f0d39ba28a20", default-features = false }
+# scratchy's engine, reached by path across the workspace boundary — this
+# crate gets its own Cargo.lock entry for it, independent of the root
+# workspace's lock. No backend feature here: the consumer selects
+# metal/cuda (see [features]). The telemetry features light up the
+# observability hooks throughout the engine.
+scratchy-serving-api = { path = "../../serving/api", features = [
+    "forward-telemetry",
+    "sampler-telemetry",
+    "live-stats",
+] }
+# Shared low-level types — the telemetry seams the TUI reads directly.
+scratchy-core-common = { path = "../../core/common", features = [
+    "forward-telemetry",
+    "sampler-telemetry",
+] }
+# `scr-tui` is its own top-level binary now (not linked into `scr`), so —
+# same as scratchy-cli — it must name its own model build scope. `model`
+# is a local rename of the scratchy-models dependency edge, so
+# `--features metal,model/smollm2-135m` reaches straight into scratchy-models'
+# own arch-*/<stem>/<arch>/all features. No default scope: naming zero models
+# is a build-time panic there, not a silently empty binary.
+model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
+clap = { version = "4", features = ["derive"] }
+rmcp = "3"
+anyhow = "1"
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+futures = "0.3"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio-util = "0.7.18"
+pulldown-cmark = { version = "0.13", default-features = false }
+# Syntax highlighting for fenced code blocks. `default-fancy` = pure-Rust regex
+# (fancy-regex, no onig C dep) + bundled syntaxes/themes.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+libc = "0.2"
+
+# Quant-preset build scope (see scratchy-cli's build-dependencies for the
+# full rationale) — unifies with scratchy-models' own build-dependency edge to
+# the same crate so `--features quant/mlx-affine-b4-g32` reaches it.
+[build-dependencies]
+quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }

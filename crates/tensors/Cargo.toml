@@ -1,0 +1,19 @@
+[package]
+name = "scratchy-tensors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-neutral GPU tensor core for scratchy: GpuTensor descriptor, DType, the DeviceAllocator transfer trait, and GGML quant metadata. No CUDA or Metal — every backend sits on top of this."
+
+[features]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+anyhow = { workspace = true }
+# For DeviceAllocator::register_mmap's signature (the metal zero-copy alias path
+# registers the safetensors mmap; cuda's default impl ignores it). Pure-CPU, no backend.
+memmap2 = { workspace = true }
+# Must match every other cudarc consumer (targets/cuda uses `dynamic-linking` +
+# `cuda-version-from-build-system`); Cargo unifies features across the graph, and
+# `dynamic-loading` + `dynamic-linking` together make cudarc's build script panic.
+cudarc = { workspace = true, optional = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }

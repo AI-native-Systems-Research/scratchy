@@ -1,0 +1,5 @@
+{
+  "quantization_config": {
+    "quant_method": "ggml"
+  }
+}

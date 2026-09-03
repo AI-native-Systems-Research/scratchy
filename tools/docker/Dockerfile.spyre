@@ -1,0 +1,120 @@
+# syntax=docker/dockerfile:1.7
+
+ARG SPYRE_IMAGE_TAG=dev-2026_08_14-010054
+# Model scope is Cargo features: `model/<stem>` (scratchy-models, arch-<name>
+# implied) and `quant/<preset>` (scratchy-quantizations — a separate crate
+# from scratchy-models, since Cargo forbids aliasing one crate under two
+# names and `model`/`quant` need distinct aliases; no `quant-` prefix on the
+# feature itself, same reasoning as `<stem>` having no `model-` prefix).
+# Default covers exactly granite-3.1-2b-instruct + granite-3.1-8b-instruct,
+# both fp8-dynamic-per-channel.
+ARG SCRATCHY_MODEL_FEATURES=model/granite-3.1-2b-instruct,model/granite-3.1-8b-instruct,quant/fp8-dynamic-per-channel
+
+# =============================================================================
+# Stage 1: Builder base — full CUDA toolkit, no GPU needed at build time
+# =============================================================================
+FROM icr.io/ibmaiu_internal/2.0/x86_64/spyre:${SPYRE_IMAGE_TAG} AS builder
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/home/senuser/.cargo/bin:${PATH}"
+
+RUN cargo install cargo-chef --locked
+
+# =============================================================================
+# Stage 2: Planner - generate dependency recipe
+# =============================================================================
+FROM builder AS planner
+WORKDIR /build
+USER root
+RUN chown -R senuser:senuser /build
+USER senuser
+COPY --chown=senuser:senuser Cargo.toml Cargo.toml
+COPY --chown=senuser:senuser Cargo.lock Cargo.lock
+COPY --chown=senuser:senuser build.rs build.rs
+COPY --chown=senuser:senuser crates crates
+COPY --chown=senuser:senuser third_party/ third_party/
+RUN cargo chef prepare --recipe-path recipe.json
+
+# =============================================================================
+# Stage 3: Dependency builder - cache dependencies
+# =============================================================================
+FROM builder AS dependencies
+ARG SCRATCHY_MODEL_FEATURES
+WORKDIR /build
+USER root
+RUN chown -R senuser:senuser /build
+USER senuser
+COPY --from=planner /build/recipe.json recipe.json
+COPY --chown=senuser:senuser third_party/ third_party/
+RUN cargo chef cook --profile release-dist --bin scr \
+    --features "superdsc,serve,${SCRATCHY_MODEL_FEATURES}" --recipe-path recipe.json
+
+# =============================================================================
+# Stage 4: Binary compilation - reuse cached dependencies
+# =============================================================================
+FROM builder as compiler
+ARG SCRATCHY_MODEL_FEATURES
+WORKDIR /build
+USER root
+RUN chown -R senuser:senuser /build
+USER senuser
+COPY --chown=senuser:senuser Cargo.toml Cargo.toml
+COPY --chown=senuser:senuser Cargo.lock Cargo.lock
+COPY --chown=senuser:senuser build.rs build.rs
+COPY --chown=senuser:senuser crates crates
+COPY --chown=senuser:senuser third_party/ third_party/
+COPY --from=dependencies /build/target target
+COPY --from=dependencies /home/senuser/.cargo /home/senuser/.cargo
+
+# Exclude tui crate to skip ktir-cpu/goose git dependency updates (saves 3-5 min)
+RUN sed -i "/crates\/tui/d" Cargo.toml
+ENV LD_LIBRARY_PATH=/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/senlib/lib:/usr/lib64
+ENV DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share
+RUN cargo build --bin scr --features "superdsc,serve,bench,${SCRATCHY_MODEL_FEATURES}" --profile release-dist
+
+# Copy only Spyre libraries (system libs installed via microdnf)
+RUN cp -r /opt/ibm/spyre /tmp/spyre
+
+# Extract shared library dependencies
+
+# =============================================================================
+# Stage 5: Runtime image — RHEL 10 minimal to match builder glibc
+# =============================================================================
+FROM registry.redhat.io/ubi10/ubi-minimal:latest
+
+# Copy all runtime dependencies (Spyre + system libraries)
+
+# Update library cache
+
+# Install only Python runtime (boost comes from Spyre directory)
+# Lines 85-95 fixed version
+RUN microdnf install -y python3.12-libs libicu && microdnf clean all
+COPY --from=compiler /build/target/release-dist/scr /usr/local/bin/scr
+
+# Copy glibc libraries from builder
+COPY --from=compiler /usr/lib64/libutil.so.1 /usr/lib64/libutil.so.1
+RUN ln -s /usr/lib64/libutil.so.1 /usr/lib64/libutil.so
+
+# Copy OpenMP libraries from builder
+COPY --from=compiler /usr/lib64/libgomp.so.1.0.0 /usr/lib64/libgomp.so.1.0.0
+COPY --from=compiler /usr/lib64/libgomp.so.1 /usr/lib64/libgomp.so.1
+
+# Copy all boost 1.83.0 libraries from builder
+COPY --from=compiler /usr/lib64/libboost*.so.1.83.0 /usr/lib64/
+
+# Copy Spyre libraries from compiler stage
+COPY --from=compiler /tmp/spyre /opt/ibm/spyre
+
+# Set library path for Spyre libraries
+ENV LD_LIBRARY_PATH=/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/senlib/lib:/usr/lib64
+ENV DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share
+
+EXPOSE 8000
+
+LABEL org.opencontainers.image.source="https://github.com/starpit/scratchy"
+LABEL org.opencontainers.image.description="Scratchy vLLM with Spyre backend"
+LABEL org.opencontainers.image.vendor="IBM"
+
+ENV MODEL=RedHatAI/granite-3.1-2b-instruct-FP8-dynamic
+CMD ["/bin/sh", "-c", "scr serve $MODEL"]

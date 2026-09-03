@@ -1,0 +1,8 @@
+{
+  "quantizations": [
+    {"ggml": {
+      "gguf_arch": "deepseek2",
+      "register_spec": false
+    }}
+  ]
+}

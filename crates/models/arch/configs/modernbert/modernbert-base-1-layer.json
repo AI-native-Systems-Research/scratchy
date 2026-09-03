@@ -1,0 +1,26 @@
+{
+  "_name_or_path": "answerdotai/ModernBERT-base (1-layer test variant)",
+  "architectures": [
+    "ModernBertModel",
+    "ModernBertForMaskedLM"
+  ],
+  "attention_bias": false,
+  "global_attn_every_n_layers": 3,
+  "global_attn_remainder": 0,
+  "hidden_activation": "gelu",
+  "hidden_size": 768,
+  "intermediate_size": 1152,
+  "layer_norm_eps": 1e-5,
+  "local_attention": 128,
+  "max_position_embeddings": 8192,
+  "mlp_bias": false,
+  "model_type": "modernbert",
+  "norm_bias": false,
+  "num_attention_heads": 12,
+  "num_hidden_layers": 1,
+  "rope_local_base_freq": 10000.0,
+  "rope_theta": 160000.0,
+  "tie_word_embeddings": true,
+  "torch_dtype": "bfloat16",
+  "vocab_size": 50368
+}

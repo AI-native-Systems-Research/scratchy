@@ -1,0 +1,79 @@
+[package]
+name = "scratchy-quantizations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared quantization preset definitions + GGUF (llama.cpp) format support. Presets live in `presets/`; GGUF format-level code in the `gguf` module."
+
+[features]
+# Compile-time build scope for quant-preset variant synthesis (which quant
+# variants of a selected model get emitted by `#[forward]`). Lives here —
+# not on scratchy-models — so `crates/cli/scr/Cargo.toml` can alias this
+# crate `quant` (a name distinct from `model`, which aliases scratchy-models)
+# and reach `--features quant/<preset>` from the CLI build line. Cargo
+# forbids aliasing the SAME crate under two different local names in one
+# Cargo.toml, which is exactly why `model`/`quant` need to be two different
+# crates, not two names for scratchy-models. No `quant-` text prefix on the
+# feature names below, same reasoning as `<stem>` having no `model-` prefix
+# on scratchy-models — the `quant` alias already carries that meaning;
+# `quant/quant-fp8-dynamic-per-channel` would just stutter.
+#
+# scratchy-models depends on this crate as BOTH a regular dependency
+# (runtime preset loading) and a build-dependency (`scratchy-forwards.rs`
+# calls `enabled_presets()` below to compute which variants to synthesize,
+# instead of reading its own now-nonexistent `CARGO_FEATURE_QUANT_*`).
+# Cargo unifies a package-owned feature reference like `metal =
+# ["scratchy-quantizations/mlx-affine-b4-g32"]` across BOTH edges
+# regardless of dependency kind — verified empirically, not assumed.
+awq-gemm = []
+bnb-nf4-dq = []
+ct-int4-sym = []
+fp8-block-128x128 = []
+fp8-dynamic-per-channel = []
+fp8-dynamic-per-tensor = []
+fp8-static-per-tensor = []
+gemma4-moe-ct-int4-sym = []
+ggml = []
+gptq-sym = []
+gptq-sym-desc_act = []
+mlx-affine-b4-g128 = []
+mlx-affine-b4-g128-qembed = []
+mlx-affine-b4-g32 = []
+mlx-affine-b4-g64 = []
+mlx-affine-b4-g64-gate8-qembed = []
+mlx-affine-b4-g64-mlp8-router8 = []
+mlx-affine-b4-g64-qembed = []
+nvfp4 = []
+
+# Shorthand for "every MLX affine (int4) preset" — the dominant (in
+# practice, only) quant use case on metal, but still opt-in (`quant/mlx`),
+# not a metal default: a selected quant preset REPLACES a model's dense/bf16
+# emission rather than adding to it (see `arch_has_active_quant` in
+# crates/compiler/macros/src/config.rs), so defaulting any preset on would
+# silently kill dense on every metal build. NOT nvfp4: despite config.rs's
+# quant filter allowing it through on metal, it panics codegen today
+# (`UnsupportedWeight`, "non-affine int4/ggml weight not yet lowered on the
+# SDSC/wavefront path") — not ready to bundle in.
+mlx = [
+    "mlx-affine-b4-g32",
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
+    "mlx-affine-b4-g64-gate8-qembed",
+    "mlx-affine-b4-g64-mlp8-router8",
+    "mlx-affine-b4-g128",
+    "mlx-affine-b4-g128-qembed",
+]
+
+[dependencies]
+scratchy-core-model = { path = "../../core/model" }
+scratchy-tensors = { path = "../../tensors" }
+anyhow = { workspace = true }
+half = { workspace = true }
+byteorder = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokenizers = { workspace = true }
+inventory = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

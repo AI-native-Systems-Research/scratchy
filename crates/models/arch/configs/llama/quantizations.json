@@ -1,0 +1,18 @@
+{
+  "quantizations": [
+    "awq-gemm",
+    "bnb-nf4-dq",
+    "gptq-sym",
+    "gptq-sym-desc_act",
+    "ct-int4-sym",
+    "fp8-dynamic-per-tensor",
+    "fp8-static-per-tensor",
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
+    "nvfp4",
+    {"ggml": {
+      "qk_permute": true,
+      "llama3_rope_scaling_inference": true
+    }}
+  ]
+}

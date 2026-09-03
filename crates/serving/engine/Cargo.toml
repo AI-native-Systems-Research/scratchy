@@ -1,0 +1,28 @@
+[package]
+name = "scratchy-serving-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Engine core loop and request lifecycle for vLLM Rust port"
+
+[features]
+default = []
+multiproc = ["scratchy-serving-transport/multiproc"]
+
+[dependencies]
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+scratchy-core-model = { workspace = true }
+scratchy-serving-scheduler = { workspace = true }
+scratchy-serving-transport = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+hf-hub-downloader = { workspace = true }
+inventory = { workspace = true }
+anyhow = { workspace = true }
+indicatif = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

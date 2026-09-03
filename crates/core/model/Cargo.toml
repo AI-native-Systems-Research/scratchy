@@ -1,0 +1,26 @@
+[package]
+name = "scratchy-core-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model loading, weight management, and tensor abstractions for vLLM Rust port"
+
+[features]
+default = []
+multimodal = []
+guided-decoding = ["llguidance", "toktrie", "toktrie_hf_tokenizers"]
+
+[dependencies]
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+fs2 = { workspace = true }
+llguidance = { workspace = true, optional = true }
+toktrie = { workspace = true, optional = true }
+toktrie_hf_tokenizers = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+safetensors = { workspace = true }

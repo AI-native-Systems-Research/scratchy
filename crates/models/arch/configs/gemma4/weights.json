@@ -1,0 +1,27 @@
+{
+  "embed_tokens": ["vocab_size", "hidden_size"],
+  "lm_head": ["hidden_size", "vocab_size"],
+  "norm": ["hidden_size"],
+  "input_layernorm": ["hidden_size"],
+  "post_attention_layernorm": ["hidden_size"],
+  "pre_feedforward_layernorm": ["hidden_size"],
+  "post_feedforward_layernorm": ["hidden_size"],
+  "layer_scalar": ["1"],
+
+  "self_attn.q_proj": ["hidden_size", "attn_q_dim"],
+  "self_attn.k_proj": ["hidden_size", "kv_dim"],
+  "self_attn.v_proj": ["hidden_size", "kv_dim"],
+  "self_attn.o_proj": ["attn_q_dim", "hidden_size"],
+  "self_attn.q_norm": ["head_dim"],
+  "self_attn.k_norm": ["head_dim"],
+
+  "self_attn.q_proj_global": ["hidden_size", "q_global_dim"],
+  "self_attn.k_proj_global": ["hidden_size", "k_global_dim"],
+  "self_attn.o_proj_global": ["q_global_dim", "hidden_size"],
+  "self_attn.q_norm_global": ["global_head_dim"],
+  "self_attn.k_norm_global": ["global_head_dim"],
+
+  "mlp.gate_proj": ["hidden_size", "intermediate_size"],
+  "mlp.up_proj": ["hidden_size", "intermediate_size"],
+  "mlp.down_proj": ["intermediate_size", "hidden_size"]
+}

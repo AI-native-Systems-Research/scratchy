@@ -1,0 +1,5 @@
+{
+  "_comment": "mlx_vlm.convert repack of Qwen/Qwen2-VL-2B-Instruct: text decoder nested under language_model.*, BF16 norm gains/scales (vs the f16-gain legacy mlx repacks).",
+  "decoder_safetensors_prefix": "language_model",
+  "scale_dtype": "bf16"
+}

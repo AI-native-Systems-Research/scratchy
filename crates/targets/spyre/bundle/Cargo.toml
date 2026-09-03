@@ -1,0 +1,30 @@
+[package]
+name = "scratchy-spyre-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The baked SuperDSC bundle, as Rust structs — the one artifact type the Spyre emitter produces and the Spyre runtime consumes."
+
+[lib]
+
+# ⛔ A LEAF, AND DELIBERATELY SO. This crate is named by BOTH ends of the Spyre pipeline: the emitter
+# (`scratchy-subtile`'s `superdsc` lowering, which builds these values), the `#[forward]` macro (which
+# bakes them into the binary), and `scratchy-target-spyre` (which reads them back). It can therefore
+# depend on nothing either end owns.
+#
+# It also has NO features. The artifact types must be reachable from every crate in that chain
+# regardless of which backend features are on, because the macro emits `inventory::submit!` tokens
+# naming them — a feature-gated type would make those tokens fail to resolve in a build that has the
+# target but not the gate.
+[dependencies]
+# The registry: one `inventory::submit!` per emitted bundle from the arch crate, looked up by
+# fingerprint at load. `collect!` implements a trait FOR the type, so it lives with the type.
+inventory = { workspace = true }
+# dxp's `spyrecode.json` is the ONE input to this crate that is not ours — it is the DeepTools
+# compiler's output, parsed here ONCE at build time so nothing downstream ever sees JSON.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

@@ -1,0 +1,130 @@
+[package]
+name = "scratchy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "`scr`: the scratchy inference engine CLI"
+
+[features]
+# `multimodal` now actually gates the image-decode stack (scratchy-vision /
+# image / png / zune-jpeg / ...) — it used to be a no-op default because
+# vision was unconditionally compiled anyway. Off by default so a plain
+# `-Fmetal` build is genuinely chat-only-sized; pass `--features
+# chat,multimodal` (or `--features metal,multimodal`) explicitly for vision.
+default = ["chat"]
+
+# The in-process ENGINE (local model inference), no HTTP server: `scr chat`
+# running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
+# feature, so no axum) + -worker.
+chat = ["dep:scratchy-serving-api", "dep:scratchy-serving-worker"]
+# The OpenAI/Anthropic HTTP server ON TOP of the engine: `scr serve` (and the
+# offline `batch` command). Adds axum/tower via scratchy-serving-api/serve.
+# Pulls `guided-decoding` too: OpenAI's `response_format: json_schema` /
+# grammar constraints are a server-side request field — `scr chat` never
+# exposes a grammar flag, so plain `chat` builds skip the llguidance stack
+# (17 crates incl. a duplicate `tokenizers` pulled by toktrie_hf_tokenizers,
+# which is pinned to tokenizers 0.21 upstream while we're on 0.23).
+serve = ["dep:scratchy-serving-api", "dep:scratchy-serving-worker", "scratchy-serving-api/serve", "guided-decoding"]
+# `scr launch claude` spawns `<this binary> serve` as a child, so it needs the
+# server compiled in.
+claude = ["serve"]
+
+otel = ["scratchy-serving-api?/otel"]
+bench = ["scratchy-bench"]
+cuda = ["scratchy-serving-api/cuda", "scratchy-serving-worker/cuda", "scratchy-bench?/cuda", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda"]
+nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-api/nccl", "scratchy-serving-worker/nccl"]
+profiling = ["cuda"]
+# `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
+# `BackboneDumpRegistration` + `Instruction::normalize` so
+# `scr model info` works on metal builds the same way it does on
+# cuda. `scratchy-target-cuda`'s target profiles stay cuda-only — the
+# `--cublas-analysis` flag is gated on the `cuda` feature inside
+# `commands/model_info.rs`. Backends enable the ENGINE (via scratchy-serving-api/
+# <backend>), not the HTTP server — a backend is only meaningful with local
+# inference.
+metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+# IBM Spyre / KTIR host emulator backend (no GPU toolchain). `ktir` is an alias.
+spyre = ["scratchy-serving-api/spyre", "scratchy-serving-worker/spyre"]
+ktir = ["spyre"]
+sendnn = ["scratchy-serving-api/sendnn", "scratchy-serving-worker/sendnn"]
+# SuperDSC on-silicon path (`scr chat --device sendnn` built `--features superdsc`):
+# the full sendnn runtime + the SuperDSC work-divided emit. Cargo feature, NO env var.
+superdsc = ["scratchy-serving-api/superdsc", "scratchy-serving-worker/superdsc"]
+# Server-side modifiers: no-op without `serve` (`?/` only forwards when
+# scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
+# above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
+# build grammar support into a non-`serve` binary.
+guided-decoding = ["scratchy-serving-api?/guided-decoding"]
+# Gates the real image-decode stack: scratchy-serving-api/multimodal makes
+# its `scratchy-vision`/`image` deps optional-and-on, forwards
+# `scratchy-forward-compiler/vision` + `scratchy-serving-worker/vision`
+# (which enables it on whichever backend target is active), so a plain
+# `chat` build (no `multimodal`) never compiles image/png/zune-jpeg/etc.
+multimodal = ["scratchy-serving-api?/multimodal"]
+tls = ["scratchy-serving-api?/tls"]
+metrics = ["scratchy-serving-api?/metrics"]
+multiproc = ["scratchy-serving-api?/multiproc"]
+rag = ["scratchy-serving-api?/rag"]
+
+# Model scope (which archs/configs compile into scratchy-models) is NOT
+# re-declared here. `model` above is a local rename of the scratchy-models
+# dependency edge (`package = "scratchy-models"`), and Cargo's `pkg/feature`
+# CLI syntax resolves against that local name and activates the (optional)
+# dependency itself — no passthrough feature needed. So `-p scratchy-cli
+# --features model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel`
+# works directly, reaching straight into scratchy-models' own
+# arch-<name>/<stem>/<arch> (bare, e.g. `granite`)/all features — no
+# `model-` text prefix on `<stem>`, the `model` alias already says that
+# (`model/granite` is shorthand for "all granite models"). Quant presets are
+# a SEPARATE crate, scratchy-quantizations, aliased `quant` below (Cargo
+# forbids aliasing one crate under two names, so `model`/`quant` can't both
+# point at scratchy-models). scratchy-models has no default model scope
+# (`default-features = false` below) — naming zero is a build-time panic,
+# not a silently empty binary.
+
+[[bin]]
+name = "scr"
+path = "src/main.rs"
+
+[dependencies]
+scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+scratchy-serving-api = { workspace = true, optional = true }
+scratchy-serving-worker = { workspace = true, optional = true }
+scratchy-core-model = { workspace = true }
+scratchy-forward-compiler = { path = "../../compiler", optional = true }
+model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
+scratchy-bench = { workspace = true, optional = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+hf-hub-downloader = { workspace = true }
+indicatif = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+libc = { workspace = true }
+core-foundation = { workspace = true }
+# ureq, not reqwest: see src/http.rs. Not optional — `scr chat --url`
+# and `scr complete` are always built, and ureq is already in the tree via
+# hf-hub-downloader, so they cost no additional crates.
+ureq = { workspace = true }
+
+# Purely for CLI feature-reachability — nothing here calls into
+# scratchy-quantizations directly. Quant-preset build scope (no `quant-`
+# text prefix on the feature names — the alias already says that) lives on
+# that crate, not on `model` (scratchy-models), because Cargo forbids
+# aliasing one crate under two different names — `model` and `quant` have
+# to be two different crates. scratchy-models already depends on this same
+# crate as BOTH a regular dependency (runtime preset loading) and a
+# build-dependency (its own build script reads compile-time quant scope
+# from it); this build-dependency edge unifies with that one so
+# `--features quant/mlx-affine-b4-g32` reaches the same instance.
+[build-dependencies]
+quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,11 @@
+{
+  "quantization_config": {
+    "bits": 4,
+    "group_size": 64,
+    "bits_overrides": {
+      "mlp.gate_proj": 8,
+      "mlp.up_proj": 8,
+      "mlp.down_proj": 8
+    }
+  }
+}

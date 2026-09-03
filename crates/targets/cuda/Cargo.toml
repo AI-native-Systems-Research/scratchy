@@ -1,0 +1,74 @@
+[package]
+name = "scratchy-target-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA GPU runtime for the scratchy inference framework: core tensor/device types, kernel FFI wrappers, layer types, and GPU target profiles"
+
+[features]
+default = []
+# `cuda` pulls in the cudarc dep (whose build script requires `nvcc`).
+# Without it, the crate compiles the core tensor types + layer struct
+# *types* (RmsNorm, LinearLayer, …) but no kernel wrappers — sufficient
+# for backends that consume `Instruction<W>` (e.g. metal) on machines
+# without a CUDA toolkit.
+# Each backend feature forwards into `scratchy-forward-compiler` so the
+# compiler's matching `Instruction` variants / `ForwardCtx` fields /
+# `ScratchyWeights` device-runtime methods are gated identically to the code in
+# `arch_registry` / `loaders` / the forward impls that consume them.
+cuda = ["dep:cudarc", "scratchy-tensors/cuda", "scratchy-ir/cuda", "scratchy-vision/cuda", "scratchy-forward-compiler/cuda", "dep:hf-hub-downloader", "dep:tokenizers", "dep:rand"]
+nccl = ["cuda", "cudarc/nccl", "scratchy-ir/nccl", "scratchy-vision/nccl", "scratchy-forward-compiler/nccl"]
+# Constrained / structured decoding (llguidance grammars) in the CUDA worker.
+# Enabled via scratchy-serving-worker's matching feature (the cli/e2e default chain).
+guided-decoding = ["scratchy-core-model/guided-decoding"]
+
+[dependencies]
+scratchy-tensors = { path = "../../tensors" }
+scratchy-layers = { path = "../../layers" }
+# The cfg-free `ScratchyWeights` / `HfFingerprint` contracts + neutral string
+# helpers (`layer_weight_path_with_root`, …) + the `Instruction` IR live in the
+# compiler; this crate's `arch_registry` / `loaders` / forward impls name them.
+# This is the inverted edge: the target deps UP on the compiler (not the
+# reverse), so the compiler stays cfg-free of cuda/metal.
+scratchy-forward-compiler = { path = "../../compiler" }
+# Pure-CPU vision host glue (VisionConfig / MmMetadata / cu_seqlens /
+# patch permute) consumed by the relocated `vision_arch` module. Its
+# own `scratchy-target-cuda` dep is optional + cuda-gated, so this
+# back-reference does not form a build cycle.
+scratchy-vision = { path = "../../models/vision" }
+scratchy-ir = { path = "../../compiler/ir" }
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+half = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+scratchy-core-model = { path = "../../core/model" }
+scratchy-quantizations = { path = "../../models/quantization" }
+inventory = { workspace = true }
+# Worker-runtime deps absorbed from the dissolved `scratchy-serving-cuda`:
+# the relocated `cuda_worker` / `tcp_store` / `logits_processor` modules name
+# the neutral `Worker` / scheduler / config / sampling contracts. These crates
+# sit below the target in the dep graph (engine -> scheduler -> core-*), so
+# naming them here forms no cycle.
+scratchy-core-common = { path = "../../core/common" }
+scratchy-core-config = { path = "../../core/config" }
+scratchy-serving-engine = { workspace = true }
+scratchy-serving-scheduler = { workspace = true }
+serde = { workspace = true }
+hf-hub-downloader = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[build-dependencies]
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[example]]
+name = "q5_0_dequant_check"
+path = "examples/q5_0_dequant_check.rs"
+required-features = ["cuda"]

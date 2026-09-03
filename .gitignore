@@ -1,0 +1,15 @@
+*~
+
+/target/
+# crates/cli/tui is its own standalone workspace (excluded from the root one,
+# see root Cargo.toml) — its build output lands here, not under /target/.
+/crates/cli/tui/target/
+**/*.rs.bk
+/bench_results/
+
+DRAFT_SPEC_DECODE_PLAN.md
+SPEC_DECODE_REFACTOR_PLAN.md
+flamegraph.svg.gz
+
+# Baked SuperDSC bundles: build output, tens of thousands of files.
+.audit-cache/

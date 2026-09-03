@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "hf-hub-downloader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal HuggingFace Hub downloader: parallel ranged fetch into the standard HF cache layout"
+
+# Every dependency here is one we already compile, every one is on a
+# maintained release line, and there are no dev-dependencies at all. That is
+# the point of the crate: `hf-hub` 0.4.3 is
+# the last of its branch and will never be updated, so staying on it pins us
+# to `ureq 2` and `indicatif 0.17` forever with nobody to unstick them. We
+# need eight calls out of that library; owning them costs four dependencies
+# we control the upgrade cadence of.
+[dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+sha2 = "0.11"
+sha1 = "0.11"
+hex = "0.4"
+rayon = { workspace = true }
+dirs = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,26 @@
+{
+  "quantization_config": {
+    "config_groups": {
+      "group_0": {
+        "format": "pack-quantized",
+        "targets": ["Linear"],
+        "weights": {
+          "group_size": 32,
+          "num_bits": 4,
+          "strategy": "group",
+          "symmetric": true,
+          "type": "int"
+        }
+      }
+    },
+    "format": "pack-quantized",
+    "ignore": [
+      "lm_head",
+      "mlp.gate_proj",
+      "mlp.up_proj",
+      "mlp.down_proj",
+      "router"
+    ],
+    "quant_method": "compressed-tensors"
+  }
+}

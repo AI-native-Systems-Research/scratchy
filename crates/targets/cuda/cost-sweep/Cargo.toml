@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "scratchy-cost-sweep-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Calibration sweep that emits kernel,M,N,K,cost_us rows for the scratchy solver's TargetProfile"
+
+# Single binary, no library surface. Cost-sweep is a one-off calibration
+# tool run per (GPU × kernel library) — nothing else depends on it.
+#
+# `cuda` is required: the binary links `libvllm_kernels.a` +
+# `libcutlass_standalone_gemm.a` + `libvllm_flash_attn.a` +
+# `libflashinfer_attn.a` produced by `scratchy-builder-cuda`.
+[[bin]]
+name = "gpu_cost_sweep"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["scratchy-target-cuda/cuda", "scratchy-builder-cuda/cuda"]
+
+[dependencies]
+scratchy-target-cuda = { path = "../" }
+# scratchy-builder-cuda is a build-only trigger: depending on it from a
+# binary ensures the static .a libs exist in the cudaforge cache before
+# the linker runs. No code is imported from it.
+scratchy-builder-cuda = { path = "../builder" }
+cudarc = { workspace = true, features = ["cublas", "dynamic-linking", "cuda-version-from-build-system"] }
+
+[build-dependencies]
+# `dirs::cache_dir()` resolves the cudaforge cache path the kernel
+# builder populates. Same pattern as scratchy-serving-cuda/build.rs.
+dirs = { workspace = true }

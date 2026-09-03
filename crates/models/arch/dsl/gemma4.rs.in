@@ -1,0 +1,96 @@
+#[forward()]
+mod gemma4 {
+    /// Checkpoints ship BF16 RMSNorm gains — the metal
+    /// gain-reader symbols must match.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
+
+    /// Text weights live under `language_model.model.*`.
+    const DECODER_PREFIX: &str = "language_model";
+
+    /// Block-table sizing for serving: the family is long-context
+    /// (≥128k positions), so size the KV block table for 32k tokens
+    /// (2048 × block_size 16) rather than the 128-block (~2k) default
+    /// that would silently truncate. A deployment constant, not a
+    /// checkpoint field — kept off the verbatim config.
+    const BOUND_DEFAULTS: &[(&str, u64)] = &[("max_blocks_per_seq", 2048)];
+
+    /// The two attention classes share their on-disk projection/norm
+    /// leaves — the `*_global` DSL names (the global class's wider
+    /// head) map back to the same disk tensors as the sliding class.
+    const WEIGHT_LEAF_RENAMES: &[(&str, &str)] = &[
+        ("self_attn.k_norm_global", "self_attn.k_norm"),
+        ("self_attn.k_proj_global", "self_attn.k_proj"),
+        ("self_attn.o_proj_global", "self_attn.o_proj"),
+        ("self_attn.q_norm_global", "self_attn.q_norm"),
+        ("self_attn.q_proj_global", "self_attn.q_proj"),
+    ];
+
+    /// mlx sets `scale = 1.0` unconditionally for BOTH attention
+    /// classes (no config field carries it — the Granite path reads
+    /// `attention_multiplier`). Checkpoints omit it; default to 1.0.
+    const SCALAR_DEFAULTS: &[(&str, f64)] = &[("attention_multiplier", 1.0)];
+
+    /// Rope scalars are nested per attention class under
+    /// `rope_parameters` in the verbatim config (newer transformers
+    /// serialization); alias them to the flat names the rope codegen
+    /// reads. `sliding_window_pattern` is derived from `layer_types`.
+    const CONFIG_ALIASES: &[(&str, &str)] = &[
+        (
+            "global_partial_rotary_factor",
+            "rope_parameters.full_attention.partial_rotary_factor",
+        ),
+        (
+            "rope_local_base_freq",
+            "rope_parameters.sliding_attention.rope_theta",
+        ),
+        ("rope_theta", "rope_parameters.full_attention.rope_theta"),
+    ];
+
+    fn forward() {
+        hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size);
+        for layer in 0..num_hidden_layers {
+            pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer]);
+
+            // Branch-local variable names are deliberately DISTINCT per
+            // class — the if/else merge unifies same-named assignments
+            // across branches, and the two classes' q/k/v widths differ
+            // (sliding 16×256 vs global 16×512). The branches converge at
+            // `oproj`, which is [.., hidden_size] in both.
+            if layer % sliding_window_pattern == sliding_window_global_remainder {
+                // ── GLOBAL class: head_dim 512, 1 kv head, k_eq_v ──
+                qg = gemm(pre_attn_normed, self_attn.q_proj_global[layer]);
+                qg = rmsnorm(qg, self_attn.q_norm_global[layer]);
+                kvg = gemm(pre_attn_normed, self_attn.k_proj_global[layer]);
+                kg = rmsnorm(kvg, self_attn.k_norm_global[layer]);
+                vg = rmsnorm_unit(kvg);
+                (qg, kg, vg) = rope_append(qg, kg, vg, positions, rotary, kv_cache[layer]);
+                attng = attention(qg, kg, vg, kv_cache[layer], block_table);
+                oproj = gemm(attng, self_attn.o_proj_global[layer]);
+            } else {
+                // ── SLIDING class: head_dim 256, 8 kv heads, window 1024 ──
+                qs = gemm(pre_attn_normed, self_attn.q_proj[layer]);
+                qs = rmsnorm(qs, self_attn.q_norm[layer]);
+                ks = gemm(pre_attn_normed, self_attn.k_proj[layer]);
+                ks = rmsnorm(ks, self_attn.k_norm[layer]);
+                vs = rmsnorm_unit(gemm(pre_attn_normed, self_attn.v_proj[layer]));
+                (qs, ks, vs) = rope_append(qs, ks, vs, positions, rotary_local, kv_cache[layer]);
+                attns = sliding_attention(qs, ks, vs, kv_cache[layer], block_table);
+                oproj = gemm(attns, self_attn.o_proj[layer]);
+            }
+
+            post_attn_normed = rmsnorm(oproj, post_attention_layernorm[layer]);
+            hidden_states = add(post_attn_normed, hidden_states);
+
+            pre_ffwd_normed = rmsnorm(hidden_states, pre_feedforward_layernorm[layer]);
+            gate = gelu(gemm(pre_ffwd_normed, mlp.gate_proj[layer]));
+            up = gemm(pre_ffwd_normed, mlp.up_proj[layer]);
+            down = gemm(gate * up, mlp.down_proj[layer]);
+            post_ffwd_normed = rmsnorm(down, post_feedforward_layernorm[layer]);
+            hidden_states = add(post_ffwd_normed, hidden_states);
+
+            hidden_states = scalar_weight_mul(hidden_states, layer_scalar[layer]);
+        }
+        normed = rmsnorm(hidden_states, norm);
+        logits = tanh_softcap(gemm(normed, lm_head));
+    }
+}

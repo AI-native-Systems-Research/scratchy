@@ -1,0 +1,23 @@
+[package]
+name = "scratchy-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scratchy vision-tower host glue (rope tables, varlen cu_seqlens, patch flatten, K-pad, trace dump)."
+
+[features]
+# Backend-dep-free: this crate is pure-CPU vision host glue (rope tables,
+# cu_seqlens, patch flatten, VisionConfig, MmMetadata). The CUDA device
+# helpers it used to carry (k_pad / TraceDump) now live in
+# `scratchy-target-cuda::vision_device`, so this crate no longer depends on
+# any backend target and the `cuda`/`metal`/`nccl` features are pure source
+# toggles (currently no-ops; reserved for symmetry with sibling crates).
+default = []
+cuda = []
+metal = []
+nccl = ["cuda"]
+
+[dependencies]
+scratchy-core-common = { path = "../../core/common" }
+half = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

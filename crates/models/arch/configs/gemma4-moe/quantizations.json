@@ -1,0 +1,7 @@
+{
+  "quantizations": [
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-mlp8-router8",
+    "gemma4-moe-ct-int4-sym"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "embeddings.patch_embedding": ["vision_in_features", "vision_embed_dim"],
+  "embeddings.position_embedding": ["vision_num_positions", "vision_embed_dim"],
+
+  "layer_norm1": ["vision_embed_dim"],
+  "layer_norm2": ["vision_embed_dim"],
+
+  "self_attn.q_proj": ["vision_embed_dim", "vision_embed_dim"],
+  "self_attn.k_proj": ["vision_embed_dim", "vision_embed_dim"],
+  "self_attn.v_proj": ["vision_embed_dim", "vision_embed_dim"],
+  "self_attn.out_proj": ["vision_embed_dim", "vision_embed_dim"],
+
+  "mlp.fc1": ["vision_embed_dim", "vision_mlp_hidden"],
+  "mlp.fc2": ["vision_mlp_hidden", "vision_embed_dim"],
+
+  "post_layernorm": ["vision_embed_dim"],
+
+  "mm.mm_soft_emb_norm": ["vision_embed_dim"],
+
+  "mm.mm_input_projection_weight": {
+    "shape": ["vision_embed_dim", "d_model"],
+    "kind": "raw_linear"
+  }
+}

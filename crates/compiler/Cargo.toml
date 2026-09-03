@@ -1,0 +1,143 @@
+[package]
+name = "scratchy-forward-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Pulls in scratchy-target-cuda so the emitted
+# code's type references resolve. Without this feature, only the
+# numeric pipeline observations (NUM_TILES etc) are available;
+# the emitted runtime types stay gated out.
+cuda = ["scratchy-ir/cuda", "vision"]
+# Multimodal/vision capability: pulls `scratchy-vision` and surfaces the MM
+# arch registry (`ScratchyMmRegistration` / `try_load_mm` / `resolve_mm_metadata`)
+# + `MultimodalForward`. A CAPABILITY gate, not a target one — cuda/metal enable
+# it today; spyre opts in the same way when it grows a vision path.
+vision = ["dep:scratchy-vision"]
+# Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
+# `ForwardCtx::tp_group` field). Pure source-level cfg toggle — does
+# NOT activate cuda or any kernel/vision dep. Runtime consumers (per-
+# arch crates, scratchy-serving-worker) independently activate
+# `scratchy-target-cuda/nccl`,
+# `scratchy-vision/nccl`. Keeping scratchy-forward-compiler's nccl feature
+# transitive-free is critical for `scratchy-forward-compiler-macro/nccl` —
+# the proc-macro pulls scratchy-forward-compiler via this feature to gate the
+# `Instruction::AllReduce` variant, but must not drag the runtime's
+# CUDA C ABI symbols (cast_from_f32_*, launch_dequantize_*, …) into
+# its host-side .so or rustc will refuse to dlopen the macro at
+# build time.
+nccl = ["scratchy-ir/nccl"]
+# Metal backend on Apple Silicon. Surfaces the `Instruction` enum +
+# `CanonicalParams` trait so the Metal interpreter
+# (`interpreter::metal`) can lower a per-bucket tape into
+# `LoweredMetalTape` for ICB recording. Phase 5.A's lowering pass is
+# pure CPU — but Phase 5.B's `pipelines.rs` (specialized pipeline
+# cache) and the upcoming worker/pool pieces (5.C/5.D/5.E) wrap
+# metal-rs types. This crate no longer depends on `scratchy-target-metal`
+# (the interpreter re-export was severed so the metal target can depend UP on
+# this compiler); the `objc2*` deps stay because `dispatcher.rs` names
+# `objc2`/`objc2_metal` types directly in the `MetalForwardFollowup` /
+# `ChainStepHandle` / `MetalChainBody` surface. `MetalDtype` is named from
+# `scratchy-tensors`; `RuntimeBindings` is erased behind `MetalRuntimeHandle`.
+metal = ["scratchy-ir/metal", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+# Spyre (KTIR): host-pure KTIR emit via scratchy-subtile + the ir spyre gate.
+# Deliberately does NOT pull `scratchy-target-cuda/spyre` — the compiler is
+# decoupled from every target crate; spyre rides the compiler-owned arch
+# registry + scratchy-layers `GpuWeights`, and the host `SpyreAllocator` comes
+# from `scratchy-target-spyre` at the worker, never through target-cuda.
+spyre = ["scratchy-ir/spyre", "dep:scratchy-subtile", "scratchy-subtile/spyre"]
+# SuperDSC perf path (rides on spyre). Cargo feature, not an env var.
+superdsc = ["spyre", "scratchy-subtile/superdsc"]
+# Pulls in the Hub downloader, `safetensors`, `clap` etc for the
+# `probe-weights` binary — these are only needed when somebody
+# runs the prober, so they're gated off by default to keep the
+# ordinary library build fast.
+probe = ["dep:hf-hub-downloader", "dep:clap", "dep:ureq", "dep:serde"]
+
+[dependencies]
+# Backend-neutral tensor core — names `MAX_DIMS` directly (PR-0
+# repoint off the `scratchy_target_cuda::tensor` re-export) for the
+# `Instruction::Reshape` shape arithmetic in the cuda eval body.
+scratchy-tensors = { path = "../tensors" }
+# The cfg-free `Instruction` enum + `WeightAccessors` trait live here so
+# the proc-macro and both backends share one neutral definition. Feature
+# toggles (cuda/metal/nccl) gate the same variants/methods this crate
+# gates, kept in sync via the passthroughs above.
+scratchy-ir = { path = "ir" }
+# Backend-neutral weight-store container (`weights::GpuWeights<A>`) named by the
+# cross-arch load registry (`arch_registry`). The registry's generic `try_load`
+# is monomorphized over the concrete `GpuWeights<A>` at the worker call site;
+# the fn-pointers themselves stay allocator-erased via
+# `scratchy_tensors::GpuWeightsHandle`. Acyclic — scratchy-layers deps only
+# tensors + quantizations + core-model, none of which dep this crate.
+scratchy-layers = { path = "../layers" }
+# Note: NO dependency on scratchy-forward-compiler-macro here. The reverse
+# direction (macro → scratchy-forward-compiler) is what's needed so that
+# `Implementation::fan_out` can return `Vec<Instruction>` typed
+# at proc-macro time.
+# Consumers of the proc-macro import it directly:
+#   `use scratchy_forward_compiler_macro::{forward, vision_forward};`
+# rather than going through scratchy-forward-compiler.
+# scratchy-target-cuda is optional so scratchy-forward-compiler can compile without
+# any backend feature (which the proc-macro needs — it depends on
+# scratchy-forward-compiler purely for the `Instruction` enum). Both the cuda
+# and metal features pull it in via `dep:scratchy-target-cuda`.
+# Single source of truth for the reactive (chunked) KV pool
+# granularity (`BLOCKS_PER_CHUNK`). The metal lowering reads it to set
+# the chunk-table `[[function_constant]]` on the hand-written KV
+# kernels so they agree with the macro-generated `SynthPreAttn`, which
+# bakes the same const via this crate. Metal-only (see `metal` feature).
+# `scratchy-vision` (backend-neutral vision host glue) supplies
+# `MmMetadata` for the dispatcher's `ScratchyMmRegistration`. Optional and
+# pulled in under either backend feature; the crate itself is now
+# backend-dep-free (its CUDA device helpers moved to
+# `scratchy-target-cuda::vision_device`).
+scratchy-vision = { path = "../models/vision", optional = true }
+# NOTE: no `scratchy-target-metal` dependency. The metal interpreter lives in
+# that crate, but this compiler names none of its types — `MetalDtype` comes
+# from `scratchy-tensors` and `RuntimeBindings` is erased behind
+# `scratchy_tensors::MetalRuntimeHandle`. Dropping the edge lets the metal
+# target depend UP on this crate (mirroring the cuda target).
+# The subtile IR (SubtileIR + tape lowering): host-pure, no backend deps.
+# Optional, pulled in by `spyre` (KTIR emit).
+scratchy-subtile = { path = "subtile", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true, features = [
+    # MTL4 surfaces for the in-progress migration off the
+    # MTLCommandBuffer + Serial-encoder + ICB pattern. Probed at
+    # runtime via `device.newMTL4CommandQueue()`; falls back to MTL3
+    # on macOS 14 or absent driver support.
+    "MTL4ArgumentTable",
+    "MTL4BufferRange",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+    "MTL4CommitFeedback",
+    "block2",
+] }
+objc2-foundation = { version = "0.3", optional = true }
+anyhow = { workspace = true }
+inventory = { workspace = true }
+# Optional deps used only by the `probe-weights` bin under the
+# `probe` feature. `ureq` is a blocking HTTP client we use for
+# Range-request header-only reads of safetensors (avoiding the
+# multi-GB full-shard downloads a plain `get` would do).
+hf-hub-downloader = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+ureq = { version = "3", optional = true, features = ["rustls"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+# `half::f16` / `half::bf16` are part of the `cpu_golden::affine_dequantize_b4_*`
+# public surface (Metal int4 reference path); also used by metal interpreter
+# tests for f32 ↔ f16 conversion when allocating + reading back Metal buffers
+# in numerical-correctness checks.
+
+[[bin]]
+name = "probe-weights"
+path = "src/bin/probe_weights.rs"
+required-features = ["probe"]

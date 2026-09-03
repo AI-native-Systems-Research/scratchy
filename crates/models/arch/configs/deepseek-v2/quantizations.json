@@ -1,0 +1,13 @@
+{
+  "quantizations": [
+    {"ggml": {
+      "gguf_arch": "deepseek2",
+      "metadata_defaults": {
+        "rope_scaling.mscale": 0.707,
+        "rope_scaling.mscale_all_dim": 0.707,
+        "rope_scaling.beta_fast": 32.0,
+        "rope_scaling.beta_slow": 1.0
+      }
+    }}
+  ]
+}

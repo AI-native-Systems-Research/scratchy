@@ -1,0 +1,12 @@
+{
+  "quantizations": [
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
+    {"ggml": {
+      "tensor_renames": {
+        "attn_qkv.weight": "self_attn.qkv_proj.weight",
+        "ffn_up.weight": "mlp.gate_up_proj.weight"
+      }
+    }}
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "quantizations": [
+    "bnb-nf4-dq",
+    "fp8-dynamic-per-tensor",
+    "fp8-static-per-tensor",
+    "fp8-block-128x128",
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
+    "mlx-affine-b4-g128",
+    "mlx-affine-b4-g128-qembed",
+    "ggml"
+  ]
+}

@@ -1,0 +1,115 @@
+# syntax=docker/dockerfile:1.7
+#
+# Builds a vllm-rs CUDA runtime image on top of vllm-rs-base.
+# No GPU required on the build machine — nvcc compiles device code ahead of time.
+#
+# Prerequisites:
+#   docker build -t quay.io/starpit/vllmrs:base-cuda12.9.1 -f tools/docker/Dockerfile.cuda-base .
+#
+# Build (from the repo root):
+#   docker build -t quay.io/starpit/vllmrs:cuda12.9.1-sm89 --build-arg CUDA_COMPUTE_CAP=89 -f tools/docker/Dockerfile.cuda .
+#   docker build -t quay.io/starpit/vllmrs:cuda12.6.3-sm80 --build-arg CUDA_VERSION=12.6.3 --build-arg CUDA_COMPUTE_CAP=80 -f tools/docker/Dockerfile.cuda .
+#
+# The binary layer is ~262MB on top of the shared base (~1.4GB).
+# Different SM builds share the same base layer in the registry.
+
+ARG REGISTRY=quay.io
+ARG ORG=starpit
+ARG REPO=vllmrs
+ARG CUDA_VERSION=12.9.1
+
+# =============================================================================
+# Stage 1: Builder base — full CUDA toolkit, no GPU needed at build time
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# cublas headers + shared libs are already present in the -devel image
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN cargo install cargo-chef --locked
+
+# =============================================================================
+# Stage 2: Dependency plan — reruns only when Cargo.toml / Cargo.lock changes
+# =============================================================================
+FROM builder AS planner
+WORKDIR /build
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json --bin scr
+
+# =============================================================================
+# Stage 3: Dependency compilation — cached layer
+# =============================================================================
+FROM builder AS cooker
+WORKDIR /build
+COPY --from=planner /build/recipe.json recipe.json
+COPY third_party/ third_party/
+RUN cargo chef cook --release --features cuda,nccl,bench --recipe-path recipe.json --bin scr
+
+# =============================================================================
+# Stage 4: CUDA kernel compilation
+# Only invalidates when .cu sources, third_party/, or build.rs change.
+# Independent of all Rust source changes.
+# =============================================================================
+FROM builder AS kernel-builder
+WORKDIR /build
+COPY crates/vllm-kernels-cuda/ crates/vllm-kernels-cuda/
+COPY crates/vllm-cuda/csrc/ crates/vllm-cuda/csrc/
+COPY third_party/ third_party/
+# Synthetic workspace root — just enough for cargo to build vllm-kernels-cuda standalone.
+RUN printf '[workspace]\nmembers = ["crates/vllm-kernels-cuda"]\nresolver = "2"\n\n[workspace.package]\nversion = "0.1.0"\nedition = "2021"\nlicense = "Apache-2.0"\n' > Cargo.toml
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+RUN cargo build -p vllm-kernels-cuda --features cuda --release
+
+# =============================================================================
+# Stage 5: Binary compilation
+# =============================================================================
+FROM builder AS compiler
+WORKDIR /build
+
+COPY . .
+
+# Reuse pre-built deps from cooker and pre-compiled kernels from kernel-builder
+COPY --from=cooker /build/target target
+COPY --from=cooker /root/.cargo /root/.cargo
+COPY --from=kernel-builder /root/.cache/cudaforge /root/.cache/cudaforge
+
+# Target a specific GPU architecture to avoid compiling kernels for every SM.
+# Common values: 80 (A100), 86 (A10/A30), 89 (L40S/RTX 4090), 90 (H100).
+# Defaults to the current machine's GPU if unset (may not work in CI — set explicitly).
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+RUN cargo build --release --features cuda,nccl,bench -p scratchy-cli
+
+# Sanity check: libcudart must NOT appear (statically linked).
+# libcublas/libcublasLt are expected dynamic deps.
+RUN echo "=== Dynamic deps ===" && ldd target/release/scr && \
+    ldd target/release/scr | grep "libcudart" \
+    && echo "FAIL: libcudart is dynamic — static link broke" && exit 1 || true
+
+# =============================================================================
+# Stage 6: Runtime image — thin layer on top of shared base
+# =============================================================================
+ARG REGISTRY=quay.io
+ARG ORG=starpit
+ARG REPO=vllmrs
+ARG CUDA_VERSION=12.9.1
+FROM ${REGISTRY}/${ORG}/${REPO}:base-cuda${CUDA_VERSION}
+
+COPY --from=compiler /build/target/release/scr /usr/local/bin/scr
+
+EXPOSE 8000
+
+ENTRYPOINT ["/usr/local/bin/scr"]
+CMD ["serve", "--help"]

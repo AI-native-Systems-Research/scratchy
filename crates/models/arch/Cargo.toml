@@ -1,0 +1,622 @@
+[package]
+name = "scratchy-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model architectures — one crate; scratchy-forwards.rs drives the #[forward] pipeline per arch"
+# Named build script (not build.rs) so the process shows as
+# `build-script-scratchy-forwards` instead of the opaque `build-script-build`.
+build = "scratchy-forwards.rs"
+
+[features]
+# Deliberately empty. Every model + quant preset is fully opt-in — no
+# default scope to accidentally widen or need `--no-default-features` to
+# narrow. `scratchy-forwards.rs` panics at build time if zero model features
+# end up selected (see `total_models_emitted` in
+# crates/compiler/macros/src/config.rs), so a build naming no models fails
+# loudly instead of silently linking a binary with none. Name at least one,
+# e.g. `--features metal,llama-3.2-3b`, or a wider `--features metal,llama`
+# (bare arch name = every config in that arch) / `--features metal,all`.
+default = []
+
+# Per-arch gates. `arch-<name>` compiles that arch's `pub mod <name>` and tells
+# the build script to emit it. Vision arches also pull their shared text decoder + the
+# vision host crate. (The build script scans dsl/*.rs.in.)
+arch-commandr = []
+arch-deepseek-v2 = []
+arch-deepseek-v3 = []
+arch-deepseek-v3-flat = []
+arch-gemma2 = []
+arch-gemma3 = []
+arch-gemma3-mm = ["arch-gemma3", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-gemma4 = []
+arch-gemma4-moe = []
+arch-granite = []
+arch-llama = []
+arch-locateanything = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-mistral = []
+arch-mixtral = []
+arch-modernbert = []
+arch-phi3 = []
+arch-qwen2 = []
+arch-qwen2-5-vl = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-moe = []
+arch-qwen2-vl = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen3 = []
+arch-qwen3-5 = []
+arch-qwen3-5-moe = []
+arch-qwen3-5-vl = ["arch-qwen3-5", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen3-moe = []
+
+all-arches = [
+    "arch-commandr",
+    "arch-deepseek-v2",
+    "arch-deepseek-v3",
+    "arch-deepseek-v3-flat",
+    "arch-gemma2",
+    "arch-gemma3",
+    "arch-gemma3-mm",
+    "arch-gemma4",
+    "arch-gemma4-moe",
+    "arch-granite",
+    "arch-llama",
+    "arch-locateanything",
+    "arch-mistral",
+    "arch-mixtral",
+    "arch-modernbert",
+    "arch-phi3",
+    "arch-qwen2",
+    "arch-qwen2-5-vl",
+    "arch-qwen2-moe",
+    "arch-qwen2-vl",
+    "arch-qwen3",
+    "arch-qwen3-5",
+    "arch-qwen3-5-moe",
+    "arch-qwen3-5-vl",
+    "arch-qwen3-moe",
+]
+
+# Per-model gates. Every checked-in `configs/<arch>/<stem>.json` gets its
+# own feature named `<stem>` — no `model-` text prefix: `crates/cli/scr/
+# Cargo.toml` depends on this crate under the local rename `model = {
+# package = "scratchy-models", ... }`, so Cargo's `pkg/feature` CLI syntax
+# already reads as `--features model/granite-3.1-2b-instruct` — the alias
+# carries the "this is a model" meaning, a redundant text prefix on the
+# feature name itself would just be typed twice.
+#
+# A HANDFUL of stems are byte-identical files checked into two arch dirs at
+# once — the same checkpoint, loadable via a vision arch (pulls
+# `dep:scratchy-vision`) or via its non-vision base arch (doesn't). Verified
+# per pair, not a naming convention: the vision arch keeps the bare stem,
+# the base arch's copy is suffixed `-text-only` (established codebase
+# vocabulary — see e.g. crates/serving/api/src/multimodal.rs). Prefixing
+# with the arch name instead (`<arch>-<stem>`) reads badly whenever the stem
+# already starts with the vision arch's own name, e.g. a naive
+# `qwen2-qwen2-vl-2b-mlx` for qwen2's copy of qwen2-vl's `qwen2-vl-2b-mlx`.
+# Any FUTURE stem collision not already verified this way falls back to the
+# plain `<arch>-<stem>` prefix (see feature_name() in the generator).
+#
+# The build script (via crates/compiler/macros/src/config.rs) reads the
+# file, parses it, AND forward-expands it ONLY when this feature is on — an
+# unselected model's JSON is never even opened. Each entry implies its
+# `arch-<name>` gate, so enabling one model is enough to compile that arch's
+# module.
+# commandr (2 configs)
+"c4ai-command-r-v01" = ["arch-commandr"]
+"command-r-1-layer" = ["arch-commandr"]
+
+# deepseek-v2 (1 configs)
+"deepseek-v2-lite" = ["arch-deepseek-v2"]
+
+# deepseek-v3 (4 configs)
+"deepseek-v3-academic-9b-fp8-block" = ["arch-deepseek-v3"]
+"deepseek-v3-academic-9b" = ["arch-deepseek-v3"]
+"deepseek-v3-tiny" = ["arch-deepseek-v3"]
+"kimi-k2-tiny" = ["arch-deepseek-v3"]
+
+# deepseek-v3-flat (2 configs)
+"moonlight-16b-a3b-instruct-fp8-block" = ["arch-deepseek-v3-flat"]
+"moonlight-16b-a3b-instruct" = ["arch-deepseek-v3-flat"]
+
+# gemma2 (3 configs)
+"gemma2-27b" = ["arch-gemma2"]
+"gemma2-2b" = ["arch-gemma2"]
+"gemma2-9b" = ["arch-gemma2"]
+
+# gemma3 (4 configs)
+"gemma-3-12b-it-text-only" = ["arch-gemma3"]
+"gemma-3-1b-it" = ["arch-gemma3"]
+"gemma-3-27b-it-text-only" = ["arch-gemma3"]
+"gemma-3-4b-it-text-only" = ["arch-gemma3"]
+
+# gemma3-mm (3 configs)
+"gemma-3-12b-it" = ["arch-gemma3-mm"]
+"gemma-3-27b-it" = ["arch-gemma3-mm"]
+"gemma-3-4b-it" = ["arch-gemma3-mm"]
+
+# gemma4 (2 configs)
+"gemma-4-12b-it" = ["arch-gemma4"]
+"gemma-4-31b-it" = ["arch-gemma4"]
+
+# gemma4-moe (2 configs)
+"gemma-4-26b-a4b-it-optiq" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it" = ["arch-gemma4-moe"]
+
+# granite (21 configs)
+"granite-3.0-2b-base" = ["arch-granite"]
+"granite-3.0-2b-instruct" = ["arch-granite"]
+"granite-3.0-8b-base" = ["arch-granite"]
+"granite-3.0-8b-instruct" = ["arch-granite"]
+"granite-3.1-2b-base" = ["arch-granite"]
+"granite-3.1-2b-instruct" = ["arch-granite"]
+"granite-3.1-8b-base" = ["arch-granite"]
+"granite-3.1-8b-instruct" = ["arch-granite"]
+"granite-3.2-2b-instruct" = ["arch-granite"]
+"granite-3.2-8b-instruct" = ["arch-granite"]
+"granite-3.3-2b-base" = ["arch-granite"]
+"granite-3.3-2b-instruct" = ["arch-granite"]
+"granite-3.3-8b-base" = ["arch-granite"]
+"granite-3.3-8b-instruct" = ["arch-granite"]
+"granite-4.1-30b-base" = ["arch-granite"]
+"granite-4.1-30b" = ["arch-granite"]
+"granite-4.1-3b-base" = ["arch-granite"]
+"granite-4.1-3b" = ["arch-granite"]
+"granite-4.1-8b-base" = ["arch-granite"]
+"granite-4.1-8b" = ["arch-granite"]
+"micro-g3.3-8b-instruct-1b" = ["arch-granite"]
+
+# llama (12 configs)
+"llama-2-13b" = ["arch-llama"]
+"llama-2-70b" = ["arch-llama"]
+"llama-2-7b" = ["arch-llama"]
+"llama-3-70b" = ["arch-llama"]
+"llama-3-8b" = ["arch-llama"]
+"llama-3.1-70b" = ["arch-llama"]
+"llama-3.1-8b" = ["arch-llama"]
+"llama-3.2-1b" = ["arch-llama"]
+"llama-3.2-3b" = ["arch-llama"]
+"smollm2-135m" = ["arch-llama"]
+"smollm2-360m" = ["arch-llama"]
+"tinyllama-1.1b" = ["arch-llama"]
+
+# locateanything (1 configs)
+"locateanything-3b" = ["arch-locateanything"]
+
+# mistral (3 configs)
+"mistral-7b-instruct-v0.3" = ["arch-mistral"]
+"mistral-7b-v0.2" = ["arch-mistral"]
+"mistral-nemo-instruct-2407" = ["arch-mistral"]
+
+# mixtral (2 configs)
+"mixtral-1-layer" = ["arch-mixtral"]
+"mixtral-8x7b-instruct-v0.1" = ["arch-mixtral"]
+
+# modernbert (2 configs)
+"modernbert-base-1-layer" = ["arch-modernbert"]
+"modernbert-base" = ["arch-modernbert"]
+
+# phi3 (10 configs)
+"phi-3-5-mini-instruct" = ["arch-phi3"]
+"phi-3-medium-128k-instruct" = ["arch-phi3"]
+"phi-3-medium-4k-instruct" = ["arch-phi3"]
+"phi-3-mini-128k-instruct" = ["arch-phi3"]
+"phi-3-mini-4k-instruct" = ["arch-phi3"]
+"phi-4-mini-instruct" = ["arch-phi3"]
+"phi-4-mini-reasoning" = ["arch-phi3"]
+"phi-4-reasoning-plus" = ["arch-phi3"]
+"phi-4-reasoning" = ["arch-phi3"]
+"phi-4" = ["arch-phi3"]
+
+# qwen2 (16 configs)
+"locateanything-3b-text-only" = ["arch-qwen2"]
+"qwen2-0.5b" = ["arch-qwen2"]
+"qwen2-1.5b" = ["arch-qwen2"]
+"qwen2-72b" = ["arch-qwen2"]
+"qwen2-7b" = ["arch-qwen2"]
+"qwen2-vl-2b-mlx-text-only" = ["arch-qwen2"]
+"qwen2-vl-2b" = ["arch-qwen2"]
+"qwen2.5-0.5b" = ["arch-qwen2"]
+"qwen2.5-1.5b" = ["arch-qwen2"]
+"qwen2.5-14b" = ["arch-qwen2"]
+"qwen2.5-32b" = ["arch-qwen2"]
+"qwen2.5-3b" = ["arch-qwen2"]
+"qwen2.5-72b" = ["arch-qwen2"]
+"qwen2.5-7b" = ["arch-qwen2"]
+"qwen2.5-vl-3b-mlx-text-only" = ["arch-qwen2"]
+"qwen2.5-vl-3b" = ["arch-qwen2"]
+
+# qwen2-5-vl (4 configs)
+"qwen2.5-vl-3b-instruct" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-3b-mlx" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-72b-instruct" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-7b-instruct" = ["arch-qwen2-5-vl"]
+
+# qwen2-moe (1 configs)
+"slimed-qwen-3" = ["arch-qwen2-moe"]
+
+# qwen2-vl (4 configs)
+"qwen2-vl-2b-instruct" = ["arch-qwen2-vl"]
+"qwen2-vl-2b-mlx" = ["arch-qwen2-vl"]
+"qwen2-vl-72b-instruct" = ["arch-qwen2-vl"]
+"qwen2-vl-7b-instruct" = ["arch-qwen2-vl"]
+
+# qwen3 (5 configs)
+"qwen3-0.6b-bnb-4bit" = ["arch-qwen3"]
+"qwen3-0.6b" = ["arch-qwen3"]
+"qwen3-1.7b" = ["arch-qwen3"]
+"qwen3-4b" = ["arch-qwen3"]
+"qwen3-8b" = ["arch-qwen3"]
+
+# qwen3-5 (2 configs)
+"qwen3.5-0.8b" = ["arch-qwen3-5"]
+"qwen3.5-9b-text-only" = ["arch-qwen3-5"]
+
+# qwen3-5-moe (2 configs)
+"qwen3.5-35b-a3b-optiq" = ["arch-qwen3-5-moe"]
+"qwen3.5-35b-a3b" = ["arch-qwen3-5-moe"]
+
+# qwen3-5-vl (1 configs)
+"qwen3.5-9b" = ["arch-qwen3-5-vl"]
+
+# qwen3-moe (2 configs)
+"qwen3-30b-a3b-instruct-2507" = ["arch-qwen3-moe"]
+"qwen3-moe-1-layer" = ["arch-qwen3-moe"]
+
+# `<arch>` (bare arch name) — every checked-in config for that one arch,
+# i.e. `model/granite` is shorthand for "all granite models".
+"commandr" = [
+    "c4ai-command-r-v01",
+    "command-r-1-layer",
+]
+"deepseek-v2" = [
+    "deepseek-v2-lite",
+]
+"deepseek-v3" = [
+    "deepseek-v3-academic-9b-fp8-block",
+    "deepseek-v3-academic-9b",
+    "deepseek-v3-tiny",
+    "kimi-k2-tiny",
+]
+"deepseek-v3-flat" = [
+    "moonlight-16b-a3b-instruct-fp8-block",
+    "moonlight-16b-a3b-instruct",
+]
+"gemma2" = [
+    "gemma2-27b",
+    "gemma2-2b",
+    "gemma2-9b",
+]
+"gemma3" = [
+    "gemma-3-12b-it-text-only",
+    "gemma-3-1b-it",
+    "gemma-3-27b-it-text-only",
+    "gemma-3-4b-it-text-only",
+]
+"gemma3-mm" = [
+    "gemma-3-12b-it",
+    "gemma-3-27b-it",
+    "gemma-3-4b-it",
+]
+"gemma4" = [
+    "gemma-4-12b-it",
+    "gemma-4-31b-it",
+]
+"gemma4-moe" = [
+    "gemma-4-26b-a4b-it-optiq",
+    "gemma-4-26b-a4b-it",
+]
+"granite" = [
+    "granite-3.0-2b-base",
+    "granite-3.0-2b-instruct",
+    "granite-3.0-8b-base",
+    "granite-3.0-8b-instruct",
+    "granite-3.1-2b-base",
+    "granite-3.1-2b-instruct",
+    "granite-3.1-8b-base",
+    "granite-3.1-8b-instruct",
+    "granite-3.2-2b-instruct",
+    "granite-3.2-8b-instruct",
+    "granite-3.3-2b-base",
+    "granite-3.3-2b-instruct",
+    "granite-3.3-8b-base",
+    "granite-3.3-8b-instruct",
+    "granite-4.1-30b-base",
+    "granite-4.1-30b",
+    "granite-4.1-3b-base",
+    "granite-4.1-3b",
+    "granite-4.1-8b-base",
+    "granite-4.1-8b",
+    "micro-g3.3-8b-instruct-1b",
+]
+"llama" = [
+    "llama-2-13b",
+    "llama-2-70b",
+    "llama-2-7b",
+    "llama-3-70b",
+    "llama-3-8b",
+    "llama-3.1-70b",
+    "llama-3.1-8b",
+    "llama-3.2-1b",
+    "llama-3.2-3b",
+    "smollm2-135m",
+    "smollm2-360m",
+    "tinyllama-1.1b",
+]
+"locateanything" = [
+    "locateanything-3b",
+]
+"mistral" = [
+    "mistral-7b-instruct-v0.3",
+    "mistral-7b-v0.2",
+    "mistral-nemo-instruct-2407",
+]
+"mixtral" = [
+    "mixtral-1-layer",
+    "mixtral-8x7b-instruct-v0.1",
+]
+"modernbert" = [
+    "modernbert-base-1-layer",
+    "modernbert-base",
+]
+"phi3" = [
+    "phi-3-5-mini-instruct",
+    "phi-3-medium-128k-instruct",
+    "phi-3-medium-4k-instruct",
+    "phi-3-mini-128k-instruct",
+    "phi-3-mini-4k-instruct",
+    "phi-4-mini-instruct",
+    "phi-4-mini-reasoning",
+    "phi-4-reasoning-plus",
+    "phi-4-reasoning",
+    "phi-4",
+]
+"qwen2" = [
+    "locateanything-3b-text-only",
+    "qwen2-0.5b",
+    "qwen2-1.5b",
+    "qwen2-72b",
+    "qwen2-7b",
+    "qwen2-vl-2b-mlx-text-only",
+    "qwen2-vl-2b",
+    "qwen2.5-0.5b",
+    "qwen2.5-1.5b",
+    "qwen2.5-14b",
+    "qwen2.5-32b",
+    "qwen2.5-3b",
+    "qwen2.5-72b",
+    "qwen2.5-7b",
+    "qwen2.5-vl-3b-mlx-text-only",
+    "qwen2.5-vl-3b",
+]
+"qwen2-5-vl" = [
+    "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-mlx",
+    "qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-7b-instruct",
+]
+"qwen2-moe" = [
+    "slimed-qwen-3",
+]
+"qwen2-vl" = [
+    "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-mlx",
+    "qwen2-vl-72b-instruct",
+    "qwen2-vl-7b-instruct",
+]
+"qwen3" = [
+    "qwen3-0.6b-bnb-4bit",
+    "qwen3-0.6b",
+    "qwen3-1.7b",
+    "qwen3-4b",
+    "qwen3-8b",
+]
+"qwen3-5" = [
+    "qwen3.5-0.8b",
+    "qwen3.5-9b-text-only",
+]
+"qwen3-5-moe" = [
+    "qwen3.5-35b-a3b-optiq",
+    "qwen3.5-35b-a3b",
+]
+"qwen3-5-vl" = [
+    "qwen3.5-9b",
+]
+"qwen3-moe" = [
+    "qwen3-30b-a3b-instruct-2507",
+    "qwen3-moe-1-layer",
+]
+# `all` — every checked-in config, every arch (CI's full-scope build);
+# reached as `model/all` from scratchy-cli.
+all = [
+    "c4ai-command-r-v01",
+    "command-r-1-layer",
+    "deepseek-v2-lite",
+    "deepseek-v3-academic-9b-fp8-block",
+    "deepseek-v3-academic-9b",
+    "deepseek-v3-tiny",
+    "kimi-k2-tiny",
+    "moonlight-16b-a3b-instruct-fp8-block",
+    "moonlight-16b-a3b-instruct",
+    "gemma2-27b",
+    "gemma2-2b",
+    "gemma2-9b",
+    "gemma-3-12b-it-text-only",
+    "gemma-3-1b-it",
+    "gemma-3-27b-it-text-only",
+    "gemma-3-4b-it-text-only",
+    "gemma-3-12b-it",
+    "gemma-3-27b-it",
+    "gemma-3-4b-it",
+    "gemma-4-12b-it",
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it-optiq",
+    "gemma-4-26b-a4b-it",
+    "granite-3.0-2b-base",
+    "granite-3.0-2b-instruct",
+    "granite-3.0-8b-base",
+    "granite-3.0-8b-instruct",
+    "granite-3.1-2b-base",
+    "granite-3.1-2b-instruct",
+    "granite-3.1-8b-base",
+    "granite-3.1-8b-instruct",
+    "granite-3.2-2b-instruct",
+    "granite-3.2-8b-instruct",
+    "granite-3.3-2b-base",
+    "granite-3.3-2b-instruct",
+    "granite-3.3-8b-base",
+    "granite-3.3-8b-instruct",
+    "granite-4.1-30b-base",
+    "granite-4.1-30b",
+    "granite-4.1-3b-base",
+    "granite-4.1-3b",
+    "granite-4.1-8b-base",
+    "granite-4.1-8b",
+    "micro-g3.3-8b-instruct-1b",
+    "llama-2-13b",
+    "llama-2-70b",
+    "llama-2-7b",
+    "llama-3-70b",
+    "llama-3-8b",
+    "llama-3.1-70b",
+    "llama-3.1-8b",
+    "llama-3.2-1b",
+    "llama-3.2-3b",
+    "smollm2-135m",
+    "smollm2-360m",
+    "tinyllama-1.1b",
+    "locateanything-3b",
+    "mistral-7b-instruct-v0.3",
+    "mistral-7b-v0.2",
+    "mistral-nemo-instruct-2407",
+    "mixtral-1-layer",
+    "mixtral-8x7b-instruct-v0.1",
+    "modernbert-base-1-layer",
+    "modernbert-base",
+    "phi-3-5-mini-instruct",
+    "phi-3-medium-128k-instruct",
+    "phi-3-medium-4k-instruct",
+    "phi-3-mini-128k-instruct",
+    "phi-3-mini-4k-instruct",
+    "phi-4-mini-instruct",
+    "phi-4-mini-reasoning",
+    "phi-4-reasoning-plus",
+    "phi-4-reasoning",
+    "phi-4",
+    "locateanything-3b-text-only",
+    "qwen2-0.5b",
+    "qwen2-1.5b",
+    "qwen2-72b",
+    "qwen2-7b",
+    "qwen2-vl-2b-mlx-text-only",
+    "qwen2-vl-2b",
+    "qwen2.5-0.5b",
+    "qwen2.5-1.5b",
+    "qwen2.5-14b",
+    "qwen2.5-32b",
+    "qwen2.5-3b",
+    "qwen2.5-72b",
+    "qwen2.5-7b",
+    "qwen2.5-vl-3b-mlx-text-only",
+    "qwen2.5-vl-3b",
+    "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-mlx",
+    "qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-7b-instruct",
+    "slimed-qwen-3",
+    "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-mlx",
+    "qwen2-vl-72b-instruct",
+    "qwen2-vl-7b-instruct",
+    "qwen3-0.6b-bnb-4bit",
+    "qwen3-0.6b",
+    "qwen3-1.7b",
+    "qwen3-4b",
+    "qwen3-8b",
+    "qwen3.5-0.8b",
+    "qwen3.5-9b-text-only",
+    "qwen3.5-35b-a3b-optiq",
+    "qwen3.5-35b-a3b",
+    "qwen3.5-9b",
+    "qwen3-30b-a3b-instruct-2507",
+    "qwen3-moe-1-layer",
+]
+
+# Quant presets are NOT declared on this crate — they live on
+# scratchy-quantizations (crates/models/quantization/Cargo.toml), so
+# `crates/cli/scr/Cargo.toml` can alias that crate `quant` (distinct from
+# this crate's `model` alias — Cargo forbids aliasing the SAME crate under
+# two names, which is exactly why quant scope needed its own crate).
+# `scratchy-forwards.rs` (this crate's build script) calls
+# `scratchy_quantizations::enabled_presets()` — via the [build-dependencies]
+# edge below — to compute SCRATCHY_QUANTS, intersected per-arch against that
+# arch's own quantizations.json (an arch that doesn't declare a preset just
+# ignores it).
+
+# Backends — ONE definition each (this is what kills the per-arch duplication).
+# The build-dep pipeline lib gets the backend so its emit matches; the runtime
+# compiler + target crates get it so the emitted code compiles; quant defaults
+# ride the backend.
+cuda = [
+    "scratchy-forward-compiler-macro/cuda",
+    "scratchy-forward-compiler/cuda",
+    "scratchy-target-cuda/cuda",
+    "scratchy-vision?/cuda",
+]
+metal = [
+    "scratchy-forward-compiler-macro/metal",
+    "scratchy-forward-compiler/metal",
+    "dep:scratchy-target-metal",
+    "scratchy-vision?/metal",
+]
+nccl = [
+    "cuda",
+    "scratchy-forward-compiler-macro/nccl",
+    "scratchy-forward-compiler/nccl",
+    "scratchy-target-cuda/nccl",
+    "scratchy-vision?/nccl",
+]
+spyre = [
+    "scratchy-forward-compiler-macro/spyre",
+    "scratchy-forward-compiler/spyre",
+    "dep:scratchy-target-spyre",
+]
+# SuperDSC emit path — the bundle that owns the 32-core split instead of the
+# sengraph. A cargo feature, NOT an env var: `cfg!(feature="superdsc")` in codegen.
+superdsc = [
+    "spyre",
+    "scratchy-forward-compiler-macro/superdsc",
+    "scratchy-forward-compiler/superdsc",
+]
+[dependencies]
+scratchy-layers = { path = "../../layers" }
+scratchy-quantizations = { path = "../quantization" }
+scratchy-forward-compiler = { path = "../../compiler" }
+scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
+scratchy-target-metal = { path = "../../targets/metal", optional = true }
+scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
+scratchy-vision = { path = "../vision", optional = true }
+half = { workspace = true, optional = true }
+anyhow = { workspace = true }
+
+# scratchy-forwards.rs drives the #[forward] pipeline for every enabled arch (no attribute
+# macro). The backend feature is forwarded onto this build-dep above.
+[build-dependencies]
+scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
+# Same crate as the regular dependency above, ALSO as a build-dependency:
+# scratchy-forwards.rs calls `scratchy_quantizations::enabled_presets()` to
+# read quant scope (see the `[features]` comment near the removed
+# `quant-<preset>` block above — quant scope moved off this crate so it can
+# get its own `quant` CLI alias, distinct from `model`).
+scratchy-quantizations = { path = "../quantization" }
+# `syn` parses the DSL carrier (`dsl/<arch>.rs.in`). It is NOT used to render
+# the emit — `render_lines` walks the token stream directly, so the emitted file
+# never round-trips through an AST (see scratchy-forwards.rs for the numbers).
+syn = { version = "2", features = ["full", "parsing"] }
+proc-macro2 = "1"
+serde_json = { workspace = true }
+# Emit arches in parallel (scratchy-forwards.rs), nested with the pipeline's own
+# per-model rayon fan-out.
+rayon = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-metal = { version = "0.3", features = ["MTLDevice"] }

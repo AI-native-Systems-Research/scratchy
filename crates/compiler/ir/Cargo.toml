@@ -1,0 +1,19 @@
+[package]
+name = "scratchy-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-neutral universal interpreter instruction set for scratchy: the closed `Instruction` enum + the per-arch `WeightAccessors` dispatch trait. No CUDA, no Metal — names only the neutral tensor/layer type defs the accessors return."
+
+[features]
+cuda = []
+metal = []
+# Spyre (KTIR): gates the same `WeightAccessors` trait on so the host-neutral
+# KTIR backend can name it (return types are the cfg-free `scratchy_layers::*`).
+spyre = []
+nccl = []
+
+[dependencies]
+scratchy-tensors = { path = "../../tensors" }
+scratchy-layers = { path = "../../layers" }
+scratchy-quantizations = { path = "../../models/quantization" }   # AffineQuantEmbedding in WeightAccessors::affine_quant_embedding_at

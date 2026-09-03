@@ -1,0 +1,44 @@
+[package]
+name = "scratchy-core-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types, errors, logging, and metrics for vLLM Rust port"
+
+[features]
+default = []
+# Live observability seams — granular, per-seam, so a consumer pulls in only the
+# ones it renders. Composed by scratchy-tui; a plain engine build has none.
+forward-telemetry = []
+sampler-telemetry = []
+otel = [
+    "opentelemetry",
+    "opentelemetry_sdk",
+    "opentelemetry-otlp",
+    "tracing-opentelemetry",
+]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# OpenTelemetry (optional)
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+# ⛔ THE KV ARITHMETIC PROOFS IN `kv.rs` LIVE BEHIND `cfg(kani)` AND NEED NO FEATURE FLAG — unlike
+# scratchy-subtile's, which are invisible without `--features superdsc` (see that crate's manifest, and
+# `kani-proofs-died-silently-in-the-rebuild`). Run them with:
+#     KANI_PKG=scratchy-core-common ~/.claude/bin/kani-safe.sh <harness>
+# Check the HARNESS COUNT and the UNDETERMINED COUNT, never just the verdict: `cargo check` does not compile
+# `cfg(kani)` code, so these rot silently through ordinary refactors of the functions they guard.
+# DECLARED rather than silenced so a typo in the name stays an error.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

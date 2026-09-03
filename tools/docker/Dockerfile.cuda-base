@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+#
+# Base runtime image for vllm-rs CUDA builds.
+# Contains the large, rarely-changing CUDA runtime libraries.
+# Rebuild only when upgrading CUDA or NCCL versions.
+#
+# Build (from the repo root):
+#   docker build -t quay.io/starpit/vllmrs:base-cuda12.9.1 -f tools/docker/Dockerfile.cuda-base .
+#   docker build -t quay.io/starpit/vllmrs:base-cuda12.6.3 --build-arg CUDA_VERSION=12.6.3 -f tools/docker/Dockerfile.cuda-base .
+#
+# Contents:
+#   libcublas.so.12 + libcublasLt.so.12  (~1.2GB)
+#   libnccl.so.2                          (~120MB)
+#   libcuda.so.1  — NOT included; injected at runtime by nvidia-container-toolkit
+
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS extract
+
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=extract /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/
+COPY --from=extract /usr/local/cuda/lib64/libcublasLt.so.12 /usr/local/cuda/lib64/
+COPY --from=extract /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/lib/x86_64-linux-gnu/
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility

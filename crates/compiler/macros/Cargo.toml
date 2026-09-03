@@ -1,0 +1,95 @@
+[package]
+name = "scratchy-forward-compiler-macro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A normal lib (not a proc-macro): the `#[forward]` pipeline
+# (`compile_in_dir`/`compile_common`/`parse_carrier`) is driven directly from
+# the consolidated `scratchy-models` build.rs — there is no attribute macro.
+[features]
+# No default backend. Consumer must opt into exactly one of `cuda`
+# or `metal` via their own feature graph (see `scratchy-forward-compiler`'s
+# Cargo.toml — its `cuda` and `metal` features explicitly enable the
+# matching macro feature). Picking a default here was previously
+# convenient but made it impossible to build the macro under a pure
+# `--features metal` graph: cargo would unify `default` ∪ `metal`,
+# and the macro's `compile_error!` rejected having both at once.
+default = []
+# Backend selection: exactly one must be enabled
+cuda = ["dep:scratchy-target-cuda"]
+# Forwards into `scratchy-forward-compiler/metal` so the metal-only
+# `Instruction` variants (`SynthGateUpSiluMul`, `AffineEmbed`) are
+# visible to the macro's match arms — they're gated
+# `#[cfg(feature = "metal")]` in `scratchy-forward-compiler::instr`.
+metal = ["dep:scratchy-ir", "scratchy-ir/metal", 
+    "dep:scratchy-target-metal",
+    "dep:scratchy-target-metal-compiler",
+    "scratchy-forward-compiler/metal",
+]
+# Spyre (IBM AIU / KTIR): no GPU dispatch codegen — under this feature the
+# macro emits the real model's KTIR (via scratchy-subtile, a non-optional dep)
+# at build time and the spyre worker runs it. Forwards into the compiler's
+# `spyre` gate (registry + IR); NEVER target-cuda — spyre rides the
+# compiler-owned registry, not the cuda crate.
+spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre"]
+# SuperDSC perf path: the macro walks the SubtileIR straight to a work-divided
+# SuperDSC bundle (`lower_graph_to_superdsc`) that owns the 32-core split instead
+# of the sengraph. A cargo feature (NOT an env var) — `cfg!(feature="superdsc")`
+# in codegen selects the emit; rides on `spyre`.
+superdsc = ["spyre", "scratchy-subtile/superdsc"]
+# Tensor-parallel fanout. When any consumer crate forwards its `nccl`
+# feature into `scratchy-forward-compiler-macro/nccl` (every per-arch crate
+# does — see their `nccl = [..., "scratchy-forward-compiler-macro/nccl"]`),
+# `compile()` fans out the outer loop over the compile-time set
+# `{1, 2, 4, 8}` and emits per-(variant, tp) modules. Without this
+# feature the macro emits tp=1 only — byte-identical to single-rank
+# builds. Cargo recompiles the macro per-feature-set, so consumers
+# without nccl still get the fast tp=1-only macro and consumers with
+# it get the full fanout — no cross-talk.
+nccl = ["scratchy-forward-compiler/nccl"]
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+scratchy-ir = { path = "../ir", optional = true }
+scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
+# PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
+# scheduler + host tape player live in this normal (Mac-testable) lib
+# crate. `to_wavefront.rs` here translates the solved FUF + `Assignment`
+# into a `scratchy_subtile::LoweringInput` and calls `lower()`. The
+# proc-macro crate can't export the IR types, so they live in a normal
+# crate it calls.
+scratchy-subtile = { path = "../subtile" }
+# NOTE: the `scratchy-sdsc` Kani-verified tower is NOT a build dep of codegen — the proven pieces it
+# verifies (`CoreSplit`, `dev_off`, `bump_sticks_to_splittable`) are CANONICAL in `scratchy-subtile` and
+# used by the emitter directly; the tower re-exports + Kani-proves them (`cargo kani -p scratchy-sdsc`).
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+serde = { version = "1" }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+# `Implementation::fan_out` returns
+# `Vec<Instruction>` typed at proc-macro time, killing the
+# `OpInstance::field_values: Vec<TokenStream>` round-trip. The
+# proc-macro needs the `Instruction` enum in scope to construct
+# values. scratchy-forward-compiler defines `Instruction` (cross-backend
+# already in this branch); we depend on it here so the enum is in
+# scope. scratchy-forward-compiler must NOT depend on scratchy-forward-compiler-macro
+# back (the re-export of the proc-macro was dropped to break the cycle).
+scratchy-forward-compiler = { path = ".." }
+
+# Backend-specific dependencies (enabled by features)
+scratchy-target-metal = { path = "../../targets/metal", optional = true }
+# Metal's own compile-time lowering, on the TARGET side of the dependency edge — this
+# crate depends on it, never the reverse, which is what let the lowering leave
+# `compiler/macros` at all.
+scratchy-target-metal-compiler = { path = "../../targets/metal/compiler", optional = true }
+# KTIR emission lives in the SPYRE target crate (M3): target-specific
+# emission belongs to its target, and the macro bakes the bundle at
+# expansion, so it consumes the emitter from there.
+scratchy-target-spyre = { path = "../../targets/spyre", default-features = false, optional = true }
+
+[dev-dependencies]
+trybuild = "1"

@@ -1,0 +1,13 @@
+{
+  "quantizations": [
+    "awq-gemm",
+    "bnb-nf4-dq",
+    "ct-int4-sym",
+    "gptq-sym",
+    "fp8-dynamic-per-tensor",
+    "fp8-static-per-tensor",
+    "mlx-affine-b4-g64",
+    "ggml",
+    "mlx-affine-b4-g64-qembed"
+  ]
+}

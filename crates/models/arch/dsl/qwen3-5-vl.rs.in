@@ -1,0 +1,119 @@
+#[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
+mod qwen3_5_vl {
+    /// Qwen3.5-VL vision tower params schema — field name = the bound
+    /// name the DSL / weights.json reference; `#[from]` paths index the
+    /// VERBATIM HF `Qwen3_5ForConditionalGeneration` config.json
+    /// (configs/ carries it byte-for-byte). Rotary tower: `rope_half_dim
+    /// = head_dim / 2`. Reproduces the old `VisionFamily::Qwen3_5Vl`
+    /// derivation (keys hidden_size/depth/num_heads/in_channels;
+    /// temporal/merge default to 1 only when absent — both present here).
+    struct Params {
+        #[from = "vision_config.hidden_size"]
+        vision_embed_dim: u64,
+        #[from = "vision_config.depth"]
+        vision_depth: u64,
+        #[from = "vision_config.num_heads"]
+        vision_num_heads: u64,
+        #[from = "vision_config.in_channels"]
+        vision_in_chans: u64,
+        #[from = "vision_config.patch_size"]
+        vision_patch_size: u64,
+        #[from("vision_config.temporal_patch_size", default = 1)]
+        vision_temporal_patch_size: u64,
+        #[from("vision_config.spatial_merge_size", default = 1)]
+        vision_spatial_merge_size: u64,
+        #[expr = "vision_embed_dim / vision_num_heads"]
+        vision_head_dim: u64,
+        #[expr = "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size"]
+        vision_in_features: u64,
+        #[expr = "vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_factor: u64,
+        #[expr = "vision_embed_dim * vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_hidden: u64,
+        #[expr = "vision_head_dim / 2"]
+        vision_rope_half_dim: u64,
+        #[from = "vision_config.intermediate_size"]
+        vision_mlp_hidden: u64,
+        #[from = "vision_config.out_hidden_size"]
+        d_model: u64,
+    }
+
+    /// Qwen3.5 vision blocks hardcode 1e-6 in the modeling code
+    /// (transformers / mlx-vlm); the old `VisionFamily::Qwen3_5Vl` spec
+    /// carried `norm_eps_key: None` → 1e-6 default, which the parse
+    /// default already supplies, so no NORM_EPS const is declared.
+    const SAFETENSORS: Layout = Layout {
+        root: "vision_tower",
+        blocks: "blocks",
+        subtrees: &[],
+    };
+    const FINGERPRINT: Fingerprint = Fingerprint {
+        key: "vision_tower.merger.linear_fc2.weight",
+        dim: 0,
+    };
+    /// MLX-converted checkpoints ship the 5D conv weight channels-LAST;
+    /// `try_load_mm` sniffs the actual layout at load, so this flag only
+    /// marks "may need the permute".
+    const PATCH_EMBED_FLATTEN: Flatten = Flatten {
+        key: "vision_tower.patch_embed.proj.weight",
+        leading_dim: 0,
+        channels_last: true,
+    };
+    /// Learned pos-embed table interpolated host-side per forward
+    /// (`fast_pos_embed_interpolate`, bilinear default — no
+    /// POS_EMB_INTERP const).
+    const POS_EMBED_KEY: &str = "vision_tower.pos_embed.weight";
+
+    fn forward() {
+        hidden_states = gemm(pixels, patch_embed.proj);
+        hidden_states = bias_add(hidden_states, patch_embed.proj.bias);
+        // Learned positional embedding (`fast_pos_embed_interpolate`,
+        // host-side; carried as the `pos_embeds` extern). `add(delta,
+        // residual)` keeps the residual stream in `hidden_states`.
+        hidden_states = add(pos_embeds, hidden_states);
+
+        for layer in 0..vision_depth {
+            // LayerNorm-with-bias as the (mean, sub, rmsnorm, bias_add) 4-tile chain.
+            m1 = mean(hidden_states);
+            c1 = sub(hidden_states, m1);
+            n1 = rmsnorm(c1, norm1[layer]);
+            normed = bias_add(n1, norm1.bias[layer]);
+            q = gemm(normed, attn.q[layer]);
+            q = bias_add(q, attn.q.bias[layer]);
+            k = gemm(normed, attn.k[layer]);
+            k = bias_add(k, attn.k.bias[layer]);
+            v = gemm(normed, attn.v[layer]);
+            v = bias_add(v, attn.v.bias[layer]);
+            (q, k) = vision_rope(q, k, cos, sin);
+            attn_out = varlen_attention(q, k, v, cu_seqlens, max_seqlen);
+            oproj = gemm(attn_out, attn.proj[layer]);
+            oproj = bias_add(oproj, attn.proj.bias[layer]);
+            hidden_states = add(oproj, hidden_states);
+
+            m2 = mean(hidden_states);
+            c2 = sub(hidden_states, m2);
+            n2 = rmsnorm(c2, norm2[layer]);
+            normed2 = bias_add(n2, norm2.bias[layer]);
+            fc1 = gemm(normed2, mlp.linear_fc1[layer]);
+            fc1 = bias_add(fc1, mlp.linear_fc1.bias[layer]);
+            fc1 = gelu(fc1);
+            fc2 = gemm(fc1, mlp.linear_fc2[layer]);
+            fc2 = bias_add(fc2, mlp.linear_fc2.bias[layer]);
+            hidden_states = add(fc2, hidden_states);
+        }
+
+        mq = mean(hidden_states);
+        cq = sub(hidden_states, mq);
+        nq = rmsnorm(cq, merger.norm);
+        merged = bias_add(nq, merger.norm.bias);
+        merged = reshape(
+            merged,
+            [num_tokens / vision_merge_factor, vision_merge_hidden],
+        );
+        mlp0 = gemm(merged, merger.linear_fc1);
+        mlp0 = bias_add(mlp0, merger.linear_fc1.bias);
+        mlp0 = gelu(mlp0);
+        out = gemm(mlp0, merger.linear_fc2);
+        out = bias_add(out, merger.linear_fc2.bias);
+    }
+}
