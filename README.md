@@ -1,8 +1,9 @@
-# scratchy: A Hyper-specialized Inference Stack
+# Scratchy: A Hyper-specializing Inference Stack Compiler
 
 This repository is an experiment in leveraging the awesomeness of Rust
-to build a **full-stack compiler**. Scratchy is that compiler for
-building systems from scratch. Scratchy takes as input a triple:
+to build a **full-stack compiler**. **Scratchy** is such a compiler,
+one that builds inference runtimes *from scratch* --- or as close to
+that as is possible. Scratchy takes as input a triple:
 
 - a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for the
 entire forward of a model architecture; e.g. [**gemma4-moe**](crates/models/arch/dsl/gemma4-moe.rs.in#L58)
