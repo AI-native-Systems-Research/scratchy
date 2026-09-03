@@ -1,28 +1,34 @@
-# scratchy
+# scratchy: A Hyper-specialized Inference Stack
 
-A Rust LLM inference stack built around the **scratchy whole-forward
-[DSL](https://en.wikipedia.org/wiki/Domain-specific_language)
-compiler** — a procedural-macro compiler that turns a model's forward
-pass, written as ~50 lines of [declarative
-pseudocode](crates/models/arch/dsl), into specialized, fused,
-workload-aware GPU dispatch code for NVIDIA CUDA, Apple Metal, and
-[IBM Spyre AIU](https://research.ibm.com/blog/spyre-for-z). In
-scratchy, everything is a constant. This turns complex analysis into
-arithmetic, greatly simplifying our code. It also can enable more
-constant-prop optimizations, reducing register pressure in key
-kernels.
+This repository is an experiment in leveraging the awesomeness of Rust
+to build a **full-stack compiler**. Scratchy is that compiler for
+building systems from scratch. Scratchy takes as input a triple:
 
-The repository contains three ecosystems under `crates/`:
+- a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for the
+entire forward of a model architecture; e.g. [**gemma4-moe**](crates/models/arch/dsl/gemma4-moe.rs.in#L58)
+- the config.json for a given instance of that architecture; e.g. [**gemma4-moe-26b-a4b-it**](crates/models/arch/configs/gemma4-moe/gemma-4-26b-a4b-it.json)
+- the JSON config for a given quantization; e.g. [**fp8-dynamic-per-channel**](crates/models/quantization/presets/fp8-dynamic-per-channel.json)
 
-- **Whole-forward DSLs** for [many modern
-    architectures](crates/models/arch/dsl).
-- **A [whole-forward DSL compiler](docs/COMPILER.md)** that
-    macro-expands a DSL into a target-specific instruction tape and
-    target-specific weight loaders.
-- **An [inference serving stack](crates/serving)** — engine,
-  scheduler, executor, OpenAI-compatible server, etc.
+Given that triple input, Scratchy generates an inference server
+specialized for that input.  Scratchy extensively utilizes Rust's
+Turing complete procedural-macros to avoid much of the complexity of
+writing a compiler, to allow for rapid integration of new
+architectures, and to generate faster specialized code.  In scratchy,
+everything is a constant. This turns complex analysis into arithmetic,
+greatly simplifying our code. It also can enable more constant-prop
+optimizations, reducing register pressure in key kernels.
 
-## Building
+Scratchy's initial design point is [IBM Spyre
+AIU](https://research.ibm.com/blog/spyre-for-z), but also supports
+NVIDIA CUDA and Apple Silicon.
+
+## Key Numbers
+
+- Very small AoT binaries, e.g. 30Mi for Metal, 100Mi for Spyre, 250Mi for Cuda.
+- Very small docker images, e.g. 330Mi for Spyre.
+- Fast startup time, e.g. 300ms warm startup on Apple Silicon *independent of model size*; 12s for 8B on Spyre.
+
+## Getting Started
 
 Install a recent [Rust toolchain](https://rustup.rs/). Then, pick your
 target via [feature
@@ -46,74 +52,10 @@ Note the convention for selecting models and quants:
 - `quant/<preset>` — compiles that quantization instead of dense/bf16
   (e.g. `quant/mlx` for every MLX affine int4 preset at once).
 
-See [`docs/BUILD.md`](docs/BUILD.md) for the full feature-scoping
+### Deep Dives
+
+- See [`docs/BUILD.md`](docs/BUILD.md) for the full feature-scoping
 mechanics.
-
-## Repository layout
-
-```
-crates/
-  # ── whole-forward DSL compiler ──────────────────────────────
-  compiler/                scratchy-forward-compiler: shared #[forward]/
-                            #[vision_forward] pipeline (op tape, reroll,
-                            layer classes, codegen) — target-neutral
-  compiler/macros/         scratchy-forward-compiler-macro: the pipeline
-                            driver scratchy-models' build script calls per arch
-  compiler/ir/             scratchy-ir: backend-neutral Instruction enum +
-                            WeightAccessors dispatch trait
-  compiler/subtile/        scratchy-subtile: SubtileIR — the shared substrate
-                            metal and spyre both lower from
-  compiler/sdsc/           scratchy-sdsc: SuperDSC (Spyre work-divided)
-                            lowering support
-  layers/                  scratchy-layers: layer types (RmsNorm,
-                            LinearLayer, …), GpuWeights
-  tensors/                 scratchy-tensors: GpuTensor/OwnedTensor, dtypes,
-                            device handles
-
-  models/arch/             scratchy-models: ONE crate holding every model
-                            architecture (llama, qwen2/3, gemma2/3/4,
-                            mistral, mixtral, phi3, granite, commandr,
-                            deepseek-v2/v3, …), gated by arch-<name> Cargo
-                            features; each config gated by its own <stem>
-  models/vision/           scratchy-vision: vision-tower host glue (RoPE
-                            tables, cu_seqlens, patch flatten)
-  models/quantization/     scratchy-quantizations: shared quantization
-                            preset definitions, each gated by its own
-                            <preset> Cargo feature
-
-  targets/cuda/            scratchy-target-cuda: CUDA GPU runtime, kernel
-                            FFI wrappers, layer impls, empirical cost tables
-  targets/cuda/builder/    scratchy-builder-cuda: build-time .cu generation
-                            + nvcc compilation
-  targets/cuda/cost-sweep/ scratchy-cost-sweep-cuda: empirical CUDA
-                            cost-table generation
-  targets/metal/           scratchy-target-metal: Metal kernels, impl lib,
-                            target profiles for Apple M1-M4
-  targets/spyre/           scratchy-target-spyre: IBM Spyre/KTIR host runtime
-  targets/spyre/builder/   scratchy-builder-spyre: build-time SuperDSC/
-                            sendnn bake
-  targets/spyre/bundle/    scratchy-spyre-bundle: the baked-bundle type
-                            family (SuperDSC/KTIR)
-
-  # ── Rust vLLM serving stack ─────────────────────────────────
-  serving/scheduler/       scratchy-serving-scheduler
-  serving/engine/          scratchy-serving-engine
-  serving/worker/          scratchy-serving-worker: the GPU worker
-                            (metal/cuda/spyre)
-  serving/api/             scratchy-serving-api: OpenAI/Anthropic HTTP
-                            (axum) server + the in-process engine
-  serving/transport/       scratchy-serving-transport
-
-  # ── CLI ─────────────────────────────────
-  cli/scr/                 scratchy-cli: the `scr` binary
-  cli/tui/                 scratchy-tui: `scr-tui`, a standalone interactive
-                            terminal UI binary (own workspace — pulls goose
-                            from git; not part of the root workspace build)
-
-  # ── Common ─────────────────────────────────
-  core/common/ core/config/ core/model/    shared types, config parsing,
-                            weight/config plumbing
-  core/hf-hub-downloader/  hf-hub-downloader: HF Hub model download/cache
-  e2e/                     scratchy-e2e: correctness goldens vs. Python vLLM
-  benches/                 benchmarking tools
-```
+- See [`docs/COMPILER.md`](docs/COMPILER.md) for more information on the procmacro approach.
+- See [`docs/MODELS.md`](docs/MODELS.md) if you are interested in adding support for a new model architecture.
+- See [`docs/spyre/KUBERNETES.md`](docs/spyre/KUBERNETES.md) for help with building 
