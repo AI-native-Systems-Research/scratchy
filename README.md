@@ -2,13 +2,16 @@
 
 This repository is an experiment in leveraging the awesomeness of Rust
 to build a **full-stack compiler**. **Scratchy** is such a compiler,
-one that builds inference runtimes *from scratch* --- or as close to
+one that builds inference runtimes *from scratch* — or as close to
 that as is possible. Scratchy takes as input a triple:
 
-- a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for the
-entire forward of a model architecture; e.g. [**gemma4-moe**](crates/models/arch/dsl/gemma4-moe.rs.in#L58)
-- the config.json for a given instance of that architecture; e.g. [**gemma4-moe-26b-a4b-it**](crates/models/arch/configs/gemma4-moe/gemma-4-26b-a4b-it.json)
-- the JSON config for a given quantization; e.g. [**fp8-dynamic-per-channel**](crates/models/quantization/presets/fp8-dynamic-per-channel.json)
+- a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for
+  the entire forward of a model architecture;
+  e.g. [**gemma4-moe**](crates/models/arch/dsl/gemma4-moe.rs.in#L58)
+- the config.json for a given instance of that architecture;
+  e.g. [**gemma4-moe-26b-a4b-it**](crates/models/arch/configs/gemma4-moe/gemma-4-26b-a4b-it.json)
+- the JSON config for a given quantization;
+  e.g. [**fp8-dynamic-per-channel**](crates/models/quantization/presets/fp8-dynamic-per-channel.json)
 
 Given that triple input, Scratchy generates an inference server
 specialized for that input.  Scratchy extensively utilizes Rust's
@@ -43,9 +46,13 @@ MLX 4-bit quant:
 cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
 ```
 
-This builds a binary in `target/release/scr`. By default, only the
-simple `scr chat` CLI command is compiled in. Provide `-Fserve` or
-`-Fbench` to bring more features into the binary.
+By default, only the simple `scr chat` CLI command is compiled
+in. Provide `-Fserve` or `-Fbench` to bring more features into the
+binary. To run a quick test of the build:
+
+```bash
+./target/release/scr chat mlx-community/Llama-3.2-3b-Instruct-4bit -q "why is the sky blue?"
+```
 
 Note the convention for selecting models and quants:
 - `model/<stem>` — one checked-in model config, e.g. `model/qwen2.5-7b`
@@ -59,4 +66,4 @@ Note the convention for selecting models and quants:
 mechanics.
 - See [`docs/COMPILER.md`](docs/COMPILER.md) for more information on the procmacro approach.
 - See [`docs/MODELS.md`](docs/MODELS.md) if you are interested in adding support for a new model architecture.
-- See [`docs/spyre/KUBERNETES.md`](docs/spyre/KUBERNETES.md) for help with building 
+- See [`docs/spyre/KUBERNETES.md`](docs/spyre/KUBERNETES.md) for help using OpenShift to build an image for Spyre.
