@@ -95,3 +95,7 @@ The macOS metal CI job runs locally via `scripts/act-local.sh` when present.
 
 See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 [`docs/MODELS.md`](docs/MODELS.md) for detail.
+
+## Commits & PR titles
+Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for
+both, scoped to the crate or area touched (`fix(metal): ...`).
