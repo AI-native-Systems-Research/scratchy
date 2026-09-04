@@ -67,3 +67,8 @@ mechanics.
 - See [`docs/COMPILER.md`](docs/COMPILER.md) for more information on the procmacro approach.
 - See [`docs/MODELS.md`](docs/MODELS.md) if you are interested in adding support for a new model architecture.
 - See [`docs/spyre/KUBERNETES.md`](docs/spyre/KUBERNETES.md) for help using OpenShift to build an image for Spyre.
+- See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the PR workflow, CI gates, and architecture invariants.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
