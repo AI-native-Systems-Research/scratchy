@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Building & feature scoping
+    url: https://github.com/AI-native-Systems-Research/scratchy/blob/main/docs/BUILD.md
+    about: How model/quant/backend features scope a build — read before filing a build issue.
+  - name: Contributing workflow
+    url: https://github.com/AI-native-Systems-Research/scratchy/blob/main/CONTRIBUTING.md
+    about: Worktree, spec-driven planning, CI gates, and the architecture invariants.
+  - name: AI-native Systems Research
+    url: https://ai-native-systems-research.github.io/ai-native-systems-research/
+    about: The wider research programme — hyper-specialization, spec-driven development, governed autonomy.
