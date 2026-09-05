@@ -61,6 +61,10 @@ fn emit_config_geometry() {
 
     let mut stems: Vec<String> = Vec::new();
     let mut geometries: Vec<Geometry> = Vec::new();
+    /// Every checked-in config as a WHOLE model — the seven constants a lowering specialises on:
+    /// `(nqh, nkvh, hd, hidden, layers, ffn, vocab)`.
+    type WholeModel = (u64, u64, u64, u64, u64, u64, u64);
+    let mut models: Vec<WholeModel> = Vec::new();
     let mut head_dims: Vec<u64> = Vec::new();
     for dir in &config_dirs {
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
@@ -104,6 +108,34 @@ fn emit_config_geometry() {
                     used = true;
                 }
             }
+            // ⭐⭐ THE WHOLE MODEL, not just its attention geometry. A lowering specialises on the
+            // FFN width and the hidden size as much as on the head counts — whether a row fits the
+            // scratchpad, whether it is a whole number of sticks — so those have to arrive as
+            // constants too, or the flags derived from them fold to nothing.
+            //
+            // ⛔ ALL SEVEN OR NONE. A model missing any one of them yields no arm at all, so the
+            // door refuses it BY NAME rather than instantiating a lowering against a default that
+            // was never in anyone's config.
+            if let (Some(&nqh), Some(&nkvh), Some(&hd), Some(&hidden), Some(&layers), Some(&ffn), Some(&vocab)) = (
+                bounds.get("num_attention_heads"),
+                bounds.get("num_key_value_heads"),
+                bounds.get("head_dim"),
+                bounds.get("hidden_size"),
+                bounds.get("num_hidden_layers"),
+                bounds.get("intermediate_size"),
+                bounds.get("vocab_size"),
+            ) && nqh > 0
+                && nkvh > 0
+                && hd > 0
+                && hidden > 0
+                && layers > 0
+                && ffn > 0
+                && vocab > 0
+                && nqh % nkvh == 0
+            {
+                models.push((nqh, nkvh, hd, hidden, layers, ffn, vocab));
+                used = true;
+            }
             // Every head dim a rotary op of this model can carry. `head_dim` is the decoder's;
             // `global_head_dim` is the second head dim of a per-layer-class model (Gemma-4's global
             // layers), and `qk_rope_head_dim` is MLA's rope width.
@@ -120,6 +152,8 @@ fn emit_config_geometry() {
             }
         }
     }
+    models.sort_unstable();
+    models.dedup();
     geometries.sort_unstable();
     geometries.dedup();
     head_dims.sort_unstable();
@@ -147,6 +181,17 @@ fn emit_config_geometry() {
         out.push_str("    ($emit:ident) => {\n        $emit! {\n");
         for (nqh, nkvh, hd) in &geometries {
             out.push_str(&format!("            ({nqh}, {nkvh}, {hd}),\n"));
+        }
+        out.push_str("        }\n    };\n}\n\n");
+
+        // The WHOLE-model door, same mechanism and the same gate. Its consumer specialises on the
+        // FFN width and the hidden size as well as the head counts, so it takes all seven.
+        out.push_str("macro_rules! for_each_config_model {\n");
+        out.push_str("    ($emit:ident) => {\n        $emit! {\n");
+        for (nqh, nkvh, hd, hidden, layers, ffn, vocab) in &models {
+            out.push_str(&format!(
+                "            ({nqh}, {nkvh}, {hd}, {hidden}, {layers}, {ffn}, {vocab}),\n"
+            ));
         }
         out.push_str("        }\n    };\n}\n\n");
     }

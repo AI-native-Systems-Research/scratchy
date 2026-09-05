@@ -11,6 +11,9 @@
 /// One node of the tape, in a vocabulary this crate can name.
 pub mod node;
 
+/// The template's schedule, walked.
+pub mod schedule;
+
 /// The whole forward tape, compiled.
 pub mod tape;
 
