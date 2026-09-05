@@ -353,17 +353,36 @@ impl DboTool {
         // reported the abort and threw away the diagnosis — which is what hid
         // `L3DlOpsScheduler.cpp:1375 There must be at least one valid candidate` behind a useless
         // "terminate called" for a whole build.
+        //
+        // ⛔⛔ AND AN MLIR DIAGNOSTIC IS A THIRD SHAPE. `<file>:<line>:<col>: error: <msg>` is
+        // followed by the offending source line and a `^` caret, so `lines().last()` — the fallback
+        // — reports the CARET: literally the character `^`, which names nothing. That is what a
+        // whole run of refusals looked like before this arm existed. The message is matched ahead of
+        // the fallback, and the two lines under it come with it, because a column pointer is
+        // useless without the text it points into.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let dt = stderr
-            .lines()
-            .find(|l| l.contains("what():"))
-            .or_else(|| stderr.lines().find(|l| l.contains("DtException")))
-            .unwrap_or_else(|| stderr.lines().last().unwrap_or("(no stderr)"));
+        let lines: Vec<&str> = stderr.lines().collect();
+        let at = |p: fn(&str) -> bool| lines.iter().position(|l| p(l));
+        let dt = if let Some(i) =
+            at(|l| l.contains("what():")).or_else(|| at(|l| l.contains("DtException")))
+        {
+            lines[i].trim().to_string()
+        } else if let Some(i) = at(|l| l.contains(": error: ")) {
+            lines[i..lines.len().min(i + 3)]
+                .iter()
+                .map(|l| l.trim_end())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        } else {
+            lines
+                .last()
+                .map_or_else(|| "(no stderr)".to_string(), |l| l.trim().to_string())
+        };
         Err(format!(
             "dbo-opt refused {} (status {:?}): {}",
             group.display(),
             out.status.code(),
-            dt.trim()
+            dt
         ))
     }
 }
