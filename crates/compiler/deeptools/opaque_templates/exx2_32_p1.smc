@@ -1,0 +1,12 @@
+///instr_count:7
+LOGICAL mask=255 src0=in0 imm=1 src2=0.0 tgtrf=p0_0 unrlfldtgt=1 unroll=x1
+// R0[63:0]->R1(32-bit)
+FCVT mask=255 src0=p0_0 imm=0 src2=0.0 tgtrf=p1_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// R0[127:64]->R2(32-bit)
+FCVT mask=255 src0=p0_0 imm=1 src2=0.0 tgtrf=p2_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// R5: 32bit e[x2] (R0[63:0]^2 + R0[127:64]^2)
+FMA mask=255 src0=p1_0 src1=p1_0 src2=x2 tgtrf=x2 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+FMA mask=255 src0=p2_0 src1=p2_0 src2=x2 tgtrf=x2 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// R6: 32bit e[x] (R0[63:0] + R0[127:64])
+FMA mask=255 src0=p1_0 src1=1.0 src2=x1 tgtrf=x1 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+FMA mask=255 src0=p2_0 src1=1.0 src2=x1 tgtrf=x1 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1

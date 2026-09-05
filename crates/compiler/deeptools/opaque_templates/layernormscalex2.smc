@@ -1,0 +1,28 @@
+/// instr_count:21
+
+FMA mask=255 src0=in0 src1=in0 src2=0.0 tgtrf=no mode=prec
+FNMS mask=255 src0=reuse src1=reuse src2=in0 tgtrf=t0_0 mode=prec
+FMA mask=255 src0=in0 src1=in0 src2=0.0 tgtrf=no mode=prec
+FNMS mask=255 src0=reuse src1=reuse src2=in0 tgtrf=t0_1 mode=prec
+FMA mask=255 src0=t0_0 src1=1.0 src2=c1 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x2 mode=prec
+EE mask=255 src0=t0_0 imm=0 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x2 mode=prec
+IME mask=255 src0=c2 imm=0 src2=t0_0 tgtrf=t3_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=x2 mode=prec
+SHR mask=255 src0=t2_0 imm=1 src2=0.0 tgtrf=t6_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x2 mode=prec
+
+LOGICAL mask=255 src0=t2_0 imm=0 src2=c3 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x2
+FEST mask=255 src0=t0_0 imm=5 src2=0.0 tgtrf=t4_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x2 mode=prec
+IME  mask=255 src0=t2_0 imm=2 src2=t3_0 tgtrf=t3_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x2 mode=prec
+
+MVLOOPCNT imm=6
+FMUL mask=255 src0=t4_0 src1=t4_0 src2=0.0 tgtrf=t5_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x2 mode=prec
+FNMS mask=255 src0=t3_0 src1=t5_0 src2=3.0 tgtrf=t5_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x2 mode=prec
+FMUL mask=255 src0=t4_0 src1=t5_0 src2=muldiv2 tgtrf=t4_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x2 be=be mode=prec
+
+IME mask=255 src0=t2_0 imm=2 src2=t4_0 tgtrf=t4_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x2 mode=prec
+IME mask=255 src0=t6_0 imm=2 src2=t4_0 tgtrf=t6_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x2 mode=prec
+
+FCMP mask=255 src0=t0_0 imm=0x7 src2=0.0 mode=prec
+SELECT mask=255 src0=t6_0 imm=0x0 src2=c4 tgtencoding=lx fwdencoding=out0 mode=prec
+
+FCMP mask=255 src0=t0_1 imm=0x7 src2=0.0 mode=prec
+SELECT mask=255 src0=t6_1 imm=0x0 src2=c4 tgtencoding=lx fwdencoding=out0 mode=prec

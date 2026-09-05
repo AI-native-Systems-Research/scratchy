@@ -1,0 +1,8 @@
+/// instr_count:7
+SETMASK be=0 imm=0  // c0-ptrow0_0-ptcompute-0
+MVLOOPCNT be=0 dyn_loop=0 imm=l0 src0=0  // c0-ptrow0_0-ptcompute-0
+FMA be=0 fma8ctrlsrc0=0 fma8ctrlsrc2=0 src0=0.0 src1=w-link src2=1.0 tgte=src1 tgtrf=0 tgts=0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=yes unroll=u0  // c0-ptrow0_0-ptcompute-0
+INCRMASK be=1  // c0-ptrow0_0-ptcompute-0
+SETMASK be=0 imm=0  // c0-ptrow0_0-ptcompute-0 reset mask
+NOP 
+NOP

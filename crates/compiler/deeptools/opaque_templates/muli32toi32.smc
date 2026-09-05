@@ -1,0 +1,184 @@
+/// instr_count:56
+// TO DO: registers and other headers
+// 0x0FF      : lsbgate
+// 0x3B800000 : carrydiv_8
+// 0x43800000 : carrymul_8
+
+// Step 1: Split 32-bit numbers into four 8-bit parts
+// Where A[i] and B[i] are 8-bit values (bytes 0-3, from LSB to MSB)
+
+// A = A[3] * 2^24 + A[2] * 2^16 + A[1] * 2^8 + A[0]
+
+// Store input1 from FIFO into a register for reading multiple times
+LOGICAL mask=255 src0=in0_0 imm=0 src2=in0_0 tgtrf=t_curr_0 unrlfldsrc0=0 unrlfldtgt=1 unroll=unroll
+
+// extract byte 0 (LSB) of A (result a0_0)
+LOGICAL mask=255 src0=t_curr_0 imm=0 src2=lsbgate tgtrf=a0_0 unrlfldsrc0=0 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result a0_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=a0_0 tgtrf=a0_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// extract byte 1 of A (result a1_0)
+SHR mask=255 src0=t_curr_0 imm=8 src2=0.0 tgtrf=a1_0 unrlfldsrc0=0 unrlfldtgt=1 unroll=unroll mode=fp32
+LOGICAL mask=255 src0=a1_0 imm=0 src2=lsbgate tgtrf=a1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result a1_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=a1_0 tgtrf=a1_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// extract byte 2 of A (result a2_0)
+SHR mask=255 src0=t_curr_0 imm=16 src2=0.0 tgtrf=a2_0 unrlfldsrc0=0 unrlfldtgt=1 unroll=unroll mode=fp32
+LOGICAL mask=255 src0=a2_0 imm=0 src2=lsbgate tgtrf=a2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result a2_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=a2_0 tgtrf=a2_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// extract byte 3 (MSB) of A (result a3_0)
+SHR mask=255 src0=t_curr_0 imm=24 src2=0.0 tgtrf=a3_0 unrlfldsrc0=0 unrlfldtgt=1 unroll=unroll mode=fp32
+LOGICAL mask=255 src0=a3_0 imm=0 src2=lsbgate tgtrf=a3_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result a3_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=a3_0 tgtrf=a3_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+
+
+// B = B[3] * 2^24 + B[2] * 2^16 + B[1] * 2^8 + B[0]
+
+// extract byte 0 (LSB) of B (result b0_0)
+LOGICAL mask=255 src0=in1_0 imm=0 src2=lsbgate tgtrf=b0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result b0_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=b0_0 tgtrf=b0_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// extract byte 1 of B (result b1_0)
+SHR mask=255 src0=in1_0 imm=8 src2=0.0 tgtrf=b1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+LOGICAL mask=255 src0=b1_0 imm=0 src2=lsbgate tgtrf=b1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result b1_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=b1_0 tgtrf=b1_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// extract byte 2 of B (result b2_0)
+SHR mask=255 src0=in1_0 imm=16 src2=0.0 tgtrf=b2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+LOGICAL mask=255 src0=b2_0 imm=0 src2=lsbgate tgtrf=b2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result b2_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=b2_0 tgtrf=b2_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// extract byte 3 (MSB) of B (result b3_0)
+SHR mask=255 src0=in1_0 imm=24 src2=0.0 tgtrf=b3_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+LOGICAL mask=255 src0=b3_0 imm=0 src2=lsbgate tgtrf=b3_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// convert to fp32 (result b3_0)
+ICVT mask=255 src0=icvtconst imm=0xa src2=b3_0 tgtrf=b3_0 unrlfldtgt=1 unroll=unroll mode=fp32
+
+
+// P[i][j] = A[i] * B[j]  (for i,j = 0 to 3)
+
+// --- P[0][0] contributes to bits [0:15]
+FMUL mask=255 src0=a0_0 src1=b0_0 src2=0.0 tgtrf=t_result_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// Find carry = P[0][0] / 256.0
+FMUL mask=255 src0=t_result_0 src1=carrydiv_8 src2=0.0 tgtrf=carry_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// ICVT - R2I (fp32): round carry to integer (floor)
+ICVT mask=255 src0=icvtconst imm=0x9 src2=carry_0 tgtrf=carry_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// Remove carry: P[0][0] = P[0][0] - carry * 256.0
+FNMS mask=255 src0=carry_0 src1=carrymul_8 src2=t_result_0 tgtrf=t_result_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// convert byte 0 from fp32 to int32
+ICVT mask=255 src0=icvtconst imm=0x8 src2=t_result_0 tgtrf=t_result_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// result[0-15]: t_result_0 = 16-bit value holding only the lower 8-bits of P[0][0], upper 8-bits are cleared
+// carry_0 = upper 8-bits of P[0][0]
+
+
+// --- P[0][1], P[1][0] contribute to bits [8:23]
+
+// t_curr_0 = a0 * b1 + carry_0 
+FMA mask=255 src0=a0_0 src1=b1_0 src2=carry_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// t_curr_0 = a1 * b0 + (a0 * b1 + carry_0)
+FMA mask=255 src0=a1_0 src1=b0_0 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// result[8 - 23]: (P[0][1] + P[0][0] + previous_carry)  
+// Find carry = (P[0][1] + P[0][0] + previous_carry) / 256.0
+FMUL mask=255 src0=t_curr_0 src1=carrydiv_8 src2=0.0 tgtrf=carry_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// ICVT - R2I (fp32): round carry to integer (floor)
+ICVT mask=255 src0=icvtconst imm=0x9 src2=carry_0 tgtrf=carry_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// Remove carry: result[8 - 23] = result[8 - 23] - carry * 256.0
+FNMS mask=255 src0=carry_0 src1=carrymul_8 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// convert byte 1 from fp32 to int32
+ICVT mask=255 src0=icvtconst imm=0x8 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// left shift to align byte 1
+SHR mask=255 src0=t_curr_0 imm=-8 src2=0.0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+LOGICAL mask=255 src0=t_result_0 imm=1 src2=t_curr_0 tgtrf=t_result_0 unrlfldsrc0=1 unrlfldsrc2=1 unroll=unroll
+
+// carry_0       : Upper 8-bits of (P[0][1] + P[1][0] + upper 8-bit of P[0][0])
+// result[8 - 23]: lower 8-bits of (P[0][1] + P[1][0] + upper 8-bit of P[0][0]), upper 8-bits are cleared
+// result[0 - 15]: lower 8-bits of                                     P[0][0] 
+
+
+// --- P[0][2], P[1][1], P[2][0] contribute to bits [16:31]
+
+// t_curr_0 = a0 * b2 + carry_0 
+FMA mask=255 src0=a0_0 src1=b2_0 src2=carry_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// t_curr_0 = a1 * b1 + (a0 * b2 + carry_0)
+FMA mask=255 src0=a1_0 src1=b1_0 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// t_curr_0 = a2 * b0 + a1 * b1 + (a0 * b2 + carry_0)
+FMA mask=255 src0=a2_0 src1=b0_0 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// result[16 - 31]: (P[0][2] + P[1][1] + P[2][0] + previous_carry)  
+// Find carry = (P[0][2] + P[1][1] + P[2][0] + previous_carry) / 256.0
+FMUL mask=255 src0=t_curr_0 src1=carrydiv_8 src2=0.0 tgtrf=carry_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// ICVT - R2I (fp32): round carry to integer (floor)
+ICVT mask=255 src0=icvtconst imm=0x9 src2=carry_0 tgtrf=carry_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// Remove carry: result[16 - 31] = result[16 - 31] - carry * 256.0
+FNMS mask=255 src0=carry_0 src1=carrymul_8 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// convert byte 2 from fp32 to int32
+ICVT mask=255 src0=icvtconst imm=0x8 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// left shift to align byte 2
+SHR mask=255 src0=t_curr_0 imm=-16 src2=0.0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+LOGICAL mask=255 src0=t_result_0 imm=1 src2=t_curr_0 tgtrf=t_result_0 unrlfldsrc0=1 unrlfldsrc2=1 unroll=unroll
+
+// carry_0       : Upper 8-bits of (P[0][2] + P[1][1] + P[2][0] + previous_carry)
+// result[16 - 23]: lower 8-bits of (P[0][2] + P[1][1] + P[2][0] + previous_carry)
+// result[ 8 - 15]: lower 8-bits of (P[0][1] + P[1][0] + upper 8-bit of P[0][0])
+// result[ 0 -  7]: lower 8-bits of                                     P[0][0]
+
+
+// --- P[0][3], P[1][2], P[2][1], P[3][0] contribute to bits [24:39]
+
+// t_curr_0 = a0 * b3 + carry_0 
+FMA mask=255 src0=a0_0 src1=b3_0 src2=carry_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// t_curr_0 = a1 * b2 + (a0 * b3 + carry_0)
+FMA mask=255 src0=a1_0 src1=b2_0 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// t_curr_0 = a2 * b1 + a1 * b2 + (a0 * b3 + carry_0)
+FMA mask=255 src0=a2_0 src1=b1_0 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// t_curr_0 = a3 * b0 + a2 * b1 + a1 * b2 + (a0 * b3 + carry_0)
+FMA mask=255 src0=a3_0 src1=b0_0 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// result[24 - 39]: (P[0][3] + P[1][2] + P[2][1] + P[3][0] + previous_carry)  
+// skip carry calculations for the last column
+
+// convert byte 3 from fp32 to int32
+ICVT mask=255 src0=icvtconst imm=0x8 src2=t_curr_0 tgtrf=t_curr_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+// left shift to align byte 3
+SHR mask=255 src0=t_curr_0 imm=-24 src2=0.0 tgtrf=t_curr_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=fp32
+
+LOGICAL mask=255 src0=t_result_0 imm=1 src2=t_curr_0 tgtencoding=lx fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc2=1 unroll=unroll
+
+// carry_0       : Upper 8-bits of (P[0][3] + P[1][2] + P[2][1] + P[3][0] + previous_carry)
+// result[24 - 39]: t_curr_0 = lower 8-bits of (P[0][3] + P[1][2] + P[2][1] + P[3][0] + previous_carry), upper 8-bits are cleared
+// result[16 - 23]: t_curr_0 = lower 8-bits of (P[0][2] + P[1][1] + P[2][0] + previous_carry), upper 8-bits are cleared
+// result[ 8 - 15]: t_curr_0 = lower 8-bits of (P[0][1] + P[1][0] + upper 8-bit of P[0][0]), upper 8-bits are cleared
+// result[ 0 -  7]: t_result_0 = lower 8-bits of                                     P[0][0] , upper 8-bits are cleared
+
+

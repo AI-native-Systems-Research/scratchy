@@ -1,0 +1,30 @@
+///instr_count:22
+// @RegInit:R1:"0x46e246e246e246e246e246e246e246e2": c1
+// R2:"0x34c534c534c534c534c534c534c534c5": c2
+// R3:"0x21212121212121212121212121212121": c3
+// R5:"0x3e003e003e003e003e003e003e003e00": c4
+// R6:"0x46dc46dc46dc46dc46dc46dc46dc46dc" c0
+// R0:"0x00000000000000000000000000000000": c5
+
+FMINMAX mask=255 src0=in0 imm=7 src2=c0 tgtrf=t0_0 unrlfldtgt=1 unroll=unroll mode=prec
+FNMS mask=255 src0=t0_0 src1=1.0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL mask=255 src0=t0_0 src1=c1 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+ICVT mask=255 src0=icvtconst imm=1 src2=t1_0 tgtrf=t2_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+ICVT mask=255 src0=icvtconst imm=0 src2=t1_0 tgtrf=t1_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FNMS mask=255 src0=t2_0 src1=c2 src2=t0_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+SHR imm=4 mask=255 src0=t1_0 src2=0.0 tgtrf=p0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FNMS mask=255 src0=t2_0 src1=c3 src2=t0_0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FEST imm=0 mask=255 src0=t1_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FEST imm=1 mask=255 src0=t1_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMA mask=255 src0=t2_0 src1=1.0 src2=c4 tgtrf=p1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL mask=255 src0=t0_0 src1=t1_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+IME mask=255 src0=p0_0 imm=1 src2=t1_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL mask=255 src0=p1_0 src1=t0_0 src2=0.0 tgtrf=p1_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMA mask=255 src0=p1_0 src1=1.0 src2=c4 tgtrf=p1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+EE mask=255 src0=p1_0 imm=0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+IME mask=255 src0=c5 imm=0 src2=p1_0 tgtrf=p0_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FEST imm=2 mask=255 src0=p0_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+MVLOOPCNT imm=2
+FNMS mask=255 src0=p0_0 src1=t0_0 src2=2.0 tgtrf=p1_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL be=be mask=255 src0=p1_0 src1=t0_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+IME mask=255 src0=t1_0 imm=2 src2=t0_0 tgtrf=t1_0 tgtencoding=lx fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec

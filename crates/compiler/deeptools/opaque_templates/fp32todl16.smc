@@ -1,0 +1,3 @@
+///instr_count:2
+LOGICAL mask=255 imm=0 src0=in0 src2=0.0
+FCVT mask=255 imm=2 src0=reuse src2=in0 tgtencoding=lx fwdencoding=out0 mode=1

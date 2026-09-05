@@ -1,0 +1,23 @@
+///instr_count:13
+/// @RegInit:c0:"0x46dc46dc46dc46dc46dc46dc46dc46dc":
+// c3:"0x1212121212121212121212121212121":
+// c1:"0x46e246e246e246e246e246e246e246e2":
+// c2:"0x34c534c534c534c534c534c534c534c5"
+//c4:"0x3e003e003e003e003e003e003e003e00"
+
+// THIS IMPLEMENTATION IS FP32 SPECIFIC (ICVT changes imm)
+
+FMINMAX mask=255 src0=lxlu imm=7 src2=c0 tgtrf=t0_0 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL mask=255 src0=t0_0 src1=c1 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+ICVT mask=255 src0=icvtconst imm=9 src2=t1_0 tgtrf=t2_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+ICVT mask=255 src0=icvtconst imm=8 src2=t1_0 tgtrf=t3_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FNMS mask=255 src0=t2_0 src1=c2 src2=t0_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FNMS be=0 mask=255 src0=t2_0 src1=c3 src2=t0_0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FEST imm=0 mask=255 src0=t3_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FEST imm=1 mask=255 src0=t3_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL mask=255 src0=t0_0 src1=t1_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+SHR imm=4 mask=255 src0=t3_0 src2=0.0 tgtrf=t3_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+IME mask=255 src0=t3_0 imm=1 src2=t1_0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMA  mask=255 src0=t2_0 src1=1.0 src2=c4 tgtrf=t3_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL be=0 mask=255 src0=t3_0 src1=t1_0 src2=0.0 tgtrf=t3_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMA  mask=255 src0=t3_0 src1=1.0 src2=c5 tgtencoding=lx fwdencoding=result unrlfldsrc0=1 unroll=unroll mode=prec

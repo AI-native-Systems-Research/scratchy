@@ -1,0 +1,13 @@
+///instr_count:7
+/// @RegInit:c0:"0x3e003e003e003e003e003e003e003e00"
+
+// THIS IMPLEMENTATION IS FP16 SPECIFIC (ICVT changes imm)
+
+LOGICAL mask=255 be=0 src0=in0 imm=1 src2=0.0 tgtrf=t2_0 unrlfldtgt=1 unroll=unroll
+FEST imm=0 mask=255 src0=t2_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+FEST imm=1 mask=255 src0=t2_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+FMUL mask=255 src0=t0_0 src1=t1_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll
+IME mask=255 src0=in0 imm=1 src2=t1_0 tgtrf=t1_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+FMA  mask=255 src0=in0 src1=1.0 src2=c0 tgtrf=t2_0 unrlfldtgt=1 unroll=unroll
+FMUL be=0 mask=255 src0=t2_0 src1=t1_0 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll
+FMA  mask=255 src0=t2_0 src1=1.0 src2=c1 tgtencoding=lx fwdencoding=result unrlfldsrc0=1 unroll=unroll
