@@ -37,7 +37,7 @@
 //!
 //! ## No dxp
 //!
-//! On a cardless host (a Mac, a plain `cargo check`) [`DxpTool::resolve`] yields `None`, [`global`] is
+//! On a cardless host (a Mac, a plain `cargo check`) [`DboTool::resolve`] yields `None`, [`global`] is
 //! `None`, and the emitter stages nothing and writes no file at all — the bundle's metadata is still
 //! baked, and `bundle::have_device_code()` reports the absence of the programs. That is a CAPABILITY
 //! probe, not a behaviour flag: there is one code path and it is taken whenever the tool exists.
@@ -61,7 +61,15 @@ use scratchy_spyre_bundle::correction;
 /// writes it (it already holds the rendered json), so the reservation is exact, not an estimate.
 pub const MAX_STAGED_BYTES: usize = 512 * 1024 * 1024;
 
-/// ⭐ THE CPU BOUND: concurrent `dxp_standalone` processes.
+/// ⭐⭐ THE ONE FILE A GROUP STAGES — its whole DataflowIR module.
+///
+/// `dbo-opt` takes a FILE, not a directory, and a group is one module holding one program per op.
+/// That is the shape the declaration module already has: one `func.func` calling each program in
+/// trip order. So a group is one file, and the ~470,000-file problem the json path had does not
+/// arise — the count is one per GROUP rather than one per device op.
+pub const PROGRAM_FILE: &str = "group.mlir";
+
+/// ⭐ THE CPU BOUND: concurrent `dbo-opt` processes.
 ///
 /// dxp is single-threaded per group, so this is the compile width. Capped rather than unbounded so a
 /// 192-core host does not fork 900 compilers at once; the disk bound above is what stops the emitter
@@ -285,49 +293,52 @@ impl SealedGroup {
     }
 }
 
-/// The dxp compiler, RESOLVED. Constructible only when both the binary and the SDK share dir it
-/// needs are present, so "can this build compile a bundle?" is a `Option<DxpTool>` rather than a
+/// The device compiler, RESOLVED. Constructible only when both the binary and the SDK share dir it
+/// needs are present, so "can this build compile a bundle?" is an `Option<DboTool>` rather than a
 /// pair of strings someone checks at the call site.
 #[derive(Clone, Debug)]
-pub struct DxpTool {
+pub struct DboTool {
     bin: PathBuf,
     deeptools: PathBuf,
 }
 
-impl DxpTool {
-    /// `$DXP_STANDALONE`, else the `bin` sibling of `$DEEPTOOLS_PATH`'s `share` dir, else the
-    /// on-pod default — the SAME resolution order `scratchy-builder-spyre`'s `build.rs` uses, so
-    /// the two cannot disagree about which compiler ran. `None` when either piece is missing, which
-    /// is every cardless build.
-    pub fn resolve() -> Option<DxpTool> {
+impl DboTool {
+    /// `$DBO_OPT`, else the `bin` sibling of `$DEEPTOOLS_PATH`'s share dir, else the on-pod
+    /// default. `None` when either piece is missing, which is every cardless build.
+    pub fn resolve() -> Option<DboTool> {
         let deeptools = PathBuf::from(std::env::var("DEEPTOOLS_PATH").ok()?);
         if !deeptools.exists() {
             return None;
         }
-        let bin = match std::env::var("DXP_STANDALONE") {
+        let bin = match std::env::var("DBO_OPT") {
             Ok(p) => PathBuf::from(p),
             Err(_) => deeptools
                 .parent()
-                .map(|sdk| sdk.join("bin").join("dxp_standalone"))
-                .unwrap_or_else(|| PathBuf::from("/opt/ibm/spyre/deeptools/bin/dxp_standalone")),
+                .map(|sdk| sdk.join("bin").join("dbo-opt"))
+                .unwrap_or_else(|| PathBuf::from("/opt/ibm/spyre/deeptools/bin/dbo-opt")),
         };
-        bin.exists().then_some(DxpTool { bin, deeptools })
+        bin.exists().then_some(DboTool { bin, deeptools })
     }
 
     /// Compile ONE group dir in place. `Ok(())` leaves `spyreCodeDir/{init_binary.bin,
     /// spyrecode.json}` beside the json; `Err` carries dxp's own message, which is the only useful
     /// thing about a scheduler refusal.
     fn compile(&self, group: &Path) -> Result<(), String> {
-        // DUMP_SPYRE_CODE=1 is what makes dxp emit `spyreCodeDir/` — the artifact the runtime reads
-        // and the marker `build.rs` skips on. Mirrors build.rs's invocation exactly.
+        // ⭐⭐ `--export-dir` IS WHAT WRITES THE BYTES, and its absence is silent. `-kEmitSpyreCode`
+        // runs the whole pipeline and reduces each program to an `init.bin` op carrying its size —
+        // and then writes NOTHING: "Directory to write spyreCodeDir into. Nothing is written when
+        // empty." Run without it, the tool exits 0, reports a program of N bytes, and leaves an
+        // empty directory, which reads exactly like success.
+        //
+        // ⭐ THE ARTIFACT IS THE SAME ONE, which is what makes this a drop-in: `spyreCodeDir/`
+        // holding `init_binary.bin` and `spyrecode.json`, the same names and the same JobExecPlan
+        // the runtime already reads. Nothing downstream of here changes.
         let out = std::process::Command::new(&self.bin)
-            .arg("--bundle")
-            .arg("-d")
-            .arg(group)
-            .arg("-b")
-            .arg("sentient")
+            .arg("--from-dfir")
+            .arg("-kEmitSpyreCode")
+            .arg(format!("--export-dir={}", group.display()))
+            .arg(group.join(PROGRAM_FILE))
             .env("DEEPTOOLS_PATH", &self.deeptools)
-            .env("DUMP_SPYRE_CODE", "1")
             .output()
             .map_err(|e| format!("spawn {}: {e}", self.bin.display()))?;
         let marker = group.join("spyreCodeDir").join("spyrecode.json");
@@ -348,7 +359,7 @@ impl DxpTool {
             .or_else(|| stderr.lines().find(|l| l.contains("DtException")))
             .unwrap_or_else(|| stderr.lines().last().unwrap_or("(no stderr)"));
         Err(format!(
-            "dxp refused {} (status {:?}): {}",
+            "dbo-opt refused {} (status {:?}): {}",
             group.display(),
             out.status.code(),
             dt.trim()
@@ -437,7 +448,7 @@ impl<const N: usize> BakeQueue<N> {
     /// and leaves it for `build.rs`, exactly as before.
     pub fn start() -> Option<Bake> {
         let () = Self::_BOUNDED;
-        let tool = DxpTool::resolve()?;
+        let tool = DboTool::resolve()?;
         // A SyncSender IS the bound: `send` blocks while `N` items are unclaimed.
         let (tx, rx) = std::sync::mpsc::sync_channel::<SealedGroup>(N);
         let rx = Arc::new(Mutex::new(rx));
@@ -687,7 +698,7 @@ impl<const N: usize> BakeQueue<N> {
 ///
 /// The queue used to be created and drained per BUNDLE, which put a join barrier at every bundle
 /// boundary: the compile width could never exceed one bundle's group count, and each boundary wound
-/// down to a single running `dxp_standalone` before the next wound up. Across a 27-bundle ladder that
+/// down to a single running compiler before the next wound up. Across a 27-bundle ladder that
 /// is 27 serialisation points, and it shows up exactly as "sometimes 8, sometimes 3, sometimes 1".
 ///
 /// Process-wide, so group N of bundle 3 compiles while bundle 4 is being written. `None` on a
@@ -696,14 +707,14 @@ pub fn global() -> Option<&'static Bake> {
     static Q: std::sync::OnceLock<Option<Bake>> = std::sync::OnceLock::new();
     let q = Q.get_or_init(Bake::start).as_ref();
     if q.is_none() {
-        no_dxp_or_die();
+        no_compiler_or_die();
     }
     q
 }
 
 /// ⛔⛔⛔ A PLAN-ONLY BAKE IS NOT A BUILD — IT IS A BINARY THAT CANNOT COMPUTE, AND IT USED TO EXIT 0.
 ///
-/// `DxpTool::resolve()` yields `None` on any host without the deeptools compiler, and the emit then wrote
+/// `DboTool::resolve()` yields `None` on any host without the deeptools compiler, and the emit then wrote
 /// a bundle's memory PLAN with NO device programs. Nothing failed: the plan is pure Rust, so the crate
 /// compiled, the binary linked, and it SERVED — every session reported itself ready off the plan, no launch
 /// ever happened, forwards returned in microseconds, the logits buffer stayed zero, argmax landed on a
@@ -718,19 +729,20 @@ pub fn global() -> Option<&'static Bake> {
 /// So: FAIL, naming the variable and the stage. A host that genuinely has no card must say so on purpose
 /// via `SCRATCHY_PLAN_ONLY_BAKE=1` — which is a claim about the machine, not a fallback the build picks by
 /// itself. Type-checking without a card stays possible; shipping a model that cannot compute does not.
-fn no_dxp_or_die() {
+fn no_compiler_or_die() {
     if std::env::var_os("SCRATCHY_PLAN_ONLY_BAKE").is_some() {
         return;
     }
     panic!(
-        "SuperDSC bake: no device compiler — `DEEPTOOLS_PATH` is unset or `dxp_standalone` is missing, \
-         so this bundle would be emitted as a memory PLAN WITH NO DEVICE PROGRAMS. That binary links and \
-         serves: every session reports ready, nothing is ever launched, and every completion comes back \
-         EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere. Refusing to build it.\n\
+        "bake: no device compiler — `DBO_OPT` and `DEEPTOOLS_PATH` are both unset, or `dbo-opt` is \
+         missing, so this bundle would be emitted as a memory PLAN WITH NO DEVICE PROGRAMS. That binary \
+         links and serves: every session reports ready, nothing is ever launched, and every completion \
+         comes back EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere. Refusing \
+         to build it.\n\
          \n\
-         • Set `DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share` (and the deeptools `LD_LIBRARY_PATH`) in \
-         the stage that runs `cargo build` — in a Dockerfile that is the BUILD stage, not the runtime \
-         stage. Setting it only at runtime is exactly this failure.\n\
+         • Point `DBO_OPT` at the `dbo-opt` binary, or set `DEEPTOOLS_PATH` so `../bin/dbo-opt` \
+         resolves, in the stage that runs `cargo build` — in a Dockerfile that is the BUILD stage, not \
+         the runtime stage. Setting it only at runtime is exactly this failure.\n\
          • Or, on a machine that truly has no card and only needs a type-check, state it: \
          `SCRATCHY_PLAN_ONLY_BAKE=1`."
     );

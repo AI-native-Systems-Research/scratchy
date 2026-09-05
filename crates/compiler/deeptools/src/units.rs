@@ -445,6 +445,80 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
     }
 }
 
+/// WHERE A UNIT LIVES ON THIS MACHINE — the residency it must be bound with.
+///
+/// ⭐ READ, NOT ASSIGNED BY CATEGORY. Three sources, and each covers a different part of the
+/// vocabulary:
+///
+/// * the device description, for everything from the DDR down to the SFP. `%dram` is the ROOT of
+///   the memory tree and `%lx` its only depth-1 child, so the first is global and the second is a
+///   per-core scratchpad (`spyre_dd2_basic.mlir:70,75`). `%l3lu`/`%l3su` are declared in the
+///   `group { kind = "core" }` and `%sfp`/`%lxlu`/`%lxsu` in the `group { kind = "corelet" }`
+///   (`:78-79` against `:90-98`), which is exactly the core-wide/per-corelet split.
+/// * IBM's own emitted DataflowIR, which agrees: `C0-l3lu` carries `corelet = 0` while `C0-lx`
+///   carries none (`/tmp/ktir_ref/export/debug/dfir.mlir:45,62`).
+/// * the vendored `dcc/test/PT/xrfbmm_int8_fwd.mlir` for everything BELOW the SFP, which the device
+///   description does not yet cover — it binds the L0, the L0 movers and every PT row with
+///   `core = 0, corelet = 0`, so they are per-corelet.
+///
+/// ⛔ THE L0 IS PER-CORELET, NOT A SCRATCHPAD. It looks like the LX — a memory a view is taken over
+/// — but the golden binds it with a corelet, and a memory bound without one takes a different
+/// branch in `ExtendUnitNameToCorelet`.
+#[must_use]
+pub fn residency_of(unit: DfirUnit, core: Core, corelet: Corelet) -> Residency {
+    match unit {
+        // The root of the memory tree: one for the device, neither attribute.
+        DfirUnit::Hbm => Residency::Global,
+        // Depth one: one per core, `core` and no `corelet`.
+        DfirUnit::Lx => Residency::Scratchpad { core },
+        // Declared in the core group, so shared across its corelets: `corelet = 0`.
+        DfirUnit::L3lu | DfirUnit::L3su => Residency::CoreWide { core },
+        // Everything else is declared per corelet.
+        DfirUnit::Sfp
+        | DfirUnit::Pe
+        | DfirUnit::PtRow(_)
+        | DfirUnit::Lxlu
+        | DfirUnit::Lxsu
+        | DfirUnit::L0
+        | DfirUnit::L0lu
+        | DfirUnit::L0su
+        | DfirUnit::Constant
+        | DfirUnit::SfpState
+        | DfirUnit::PeState
+        | DfirUnit::SfpRing => Residency::Corelet { core, corelet },
+    }
+}
+
+/// WHAT A TEMPLATE'S `unit=` IS, AS THE UNITS DATAFLOWIR BINDS.
+///
+/// ⛔⛔ ONE `unit=` CAN BE SEVERAL. `ptrow1-7` is a span of SEVEN instruction streams, not a unit:
+/// `generatePTInitPacket` runs per row (`dip.cpp:2124-2142`), so collapsing the span to one unit
+/// emits a program for one row where the template asked for seven and leaves the other six empty.
+/// [`rows_of`] is what expands it, and it is bounded by this arch's own row count.
+///
+/// ⛔ `Ptnorth` AND `Ptsouth` ARE DIRECTIONS, NOT UNITS. They name the wire a PT row reads from or
+/// passes to, which is [`PtRow::north`]/[`PtRow::south`]' job and depends on WHICH row is asking —
+/// so they resolve to nothing here rather than to a wrong row.
+#[must_use]
+pub fn dfir_units(of: Unit) -> Vec<DfirUnit> {
+    match of {
+        Unit::Sfp => vec![DfirUnit::Sfp],
+        Unit::Pe => vec![DfirUnit::Pe],
+        Unit::Lxlu => vec![DfirUnit::Lxlu],
+        Unit::Lxsu => vec![DfirUnit::Lxsu],
+        Unit::L0lu => vec![DfirUnit::L0lu],
+        Unit::L0su => vec![DfirUnit::L0su],
+        Unit::Constant => vec![DfirUnit::Constant],
+        Unit::Sfpring => vec![DfirUnit::SfpRing],
+        // The spans, and the singletons that are still written as one.
+        Unit::Pt | Unit::Ptrow0 | Unit::Ptrow3 | Unit::Ptrow7 | Unit::Ptrow1To3 | Unit::Ptrow1To7 => {
+            rows_of(of).into_iter().map(DfirUnit::PtRow).collect()
+        }
+        // A direction, resolved by the row that asks. See above.
+        Unit::Ptnorth | Unit::Ptsouth => Vec::new(),
+    }
+}
+
 /// A PT row by index, or `fallback` where this arch has no such row.
 fn row_or(index: u32, fallback: DfirUnit) -> DfirUnit {
     Row::checked(index).map_or(fallback, DfirUnit::PtRow)

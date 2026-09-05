@@ -4,7 +4,7 @@
 //! alone — an inline test would silently never run.
 
 use scratchy_target_spyre::superdsc_bake::{
-    Bake, COMPILE_WIDTH, DxpTool, IN_FLIGHT, MAX_STAGED_BYTES, StageRoot,
+    Bake, COMPILE_WIDTH, DboTool, IN_FLIGHT, MAX_STAGED_BYTES, StageRoot,
 };
 
 /// ⭐ THE DISK BOUND AND THE COMPILE WIDTH ARE SEPARATE NUMBERS.
@@ -84,7 +84,7 @@ fn default_staging_is_the_temp_dir() {
 #[test]
 fn without_the_tool_there_is_no_queue() {
     if std::env::var_os("DEEPTOOLS_PATH").is_none() {
-        assert!(DxpTool::resolve().is_none(), "no SDK ⇒ no tool");
+        assert!(DboTool::resolve().is_none(), "no SDK ⇒ no tool");
         assert!(Bake::start().is_none(), "no tool ⇒ no queue");
     }
 }

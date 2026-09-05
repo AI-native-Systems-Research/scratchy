@@ -191,6 +191,65 @@ pub fn with_config_attn_geometry<C: OnAttnGeometry>(
     for_each_config_attn_geometry!(geometry_arms)
 }
 
+/// What a WHOLE-MODEL lowering runs once every one of its seven numbers is a const — the consumer
+/// side of [`with_config_model`].
+///
+/// ⭐⭐ SEVEN, NOT THREE, BECAUSE A LOWERING SPECIALISES ON MORE THAN ATTENTION. Whether a row fits
+/// the scratchpad is `hidden * rows * 2` against the LX capacity; whether it needs a lane mask is
+/// `hidden % elements-per-stick`. Both decide which OPS are emitted, so both have to be constants —
+/// a `const fn` reading a runtime hidden size folds to nothing.
+#[cfg(feature = "superdsc")]
+pub trait OnModel {
+    /// What the dispatch produces.
+    type Out;
+    /// The arm's body, at the numbers one config declared.
+    fn on_model<
+        const NQH: u32,
+        const NKVH: u32,
+        const HD: u32,
+        const HIDDEN: u32,
+        const LAYERS: u32,
+        const FFN: u32,
+        const VOCAB: u32,
+    >(
+        self,
+    ) -> Self::Out;
+}
+
+/// ⭐ THE VALUE→CONST DOOR FOR A WHOLE MODEL. The arms are what the build script parsed out of
+/// `crates/models/arch/*/configs/*.json`, one per distinct seven-tuple.
+///
+/// `None` is a model no config in this workspace declares, and the caller must refuse the bake
+/// naming it. The fix is a `config.json`, never an edit here — there is no list in this file to
+/// grow, which is the same discipline [`with_config_attn_geometry`] follows.
+///
+/// ⛔ A MODEL MISSING ANY ONE OF THE SEVEN YIELDS NO ARM. The build script requires all of them
+/// present and non-zero, so a config without an `intermediate_size` is refused BY NAME here rather
+/// than instantiated against a default nobody wrote down.
+#[cfg(feature = "superdsc")]
+pub fn with_config_model<C: OnModel>(
+    nqh: u32,
+    nkvh: u32,
+    hd: u32,
+    hidden: u32,
+    layers: u32,
+    ffn: u32,
+    vocab: u32,
+    consumer: C,
+) -> Option<C::Out> {
+    macro_rules! model_arms {
+        ($(($nqh:literal, $nkvh:literal, $hd:literal, $hidden:literal, $layers:literal, $ffn:literal, $vocab:literal)),* $(,)?) => {
+            match (nqh, nkvh, hd, hidden, layers, ffn, vocab) {
+                $(($nqh, $nkvh, $hd, $hidden, $layers, $ffn, $vocab) => Some(
+                    consumer.on_model::<$nqh, $nkvh, $hd, $hidden, $layers, $ffn, $vocab>(),
+                ),)*
+                _ => None,
+            }
+        };
+    }
+    for_each_config_model!(model_arms)
+}
+
 /// What a head-dim-parameterised lowering runs once its head dim is a const — the consumer side of
 /// [`with_config_head_dim`], and the same discipline as [`OnAttnGeometry`].
 pub trait OnHeadDim {

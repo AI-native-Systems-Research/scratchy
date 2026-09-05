@@ -31,6 +31,9 @@ sendnn = ["dep:flex-rs"]
 # crate's `sendnn`, so a gate here would make them fail to resolve in a build that has the target but
 # not the runtime.
 scratchy-spyre-bundle = { path = "bundle" }
+# ⛔ THE DEEPTOOLS IRs AND BRIDGES. One-way: `deeptools` never depends on scratchy, so the half of
+# bridge 1 that speaks `SubOp` and `TensorRegion` lives HERE and hands it extents and tokens.
+deeptools = { path = "../../compiler/deeptools" }
 scratchy-tensors = { path = "../../tensors" }
 # Neutral leaf crate (NOT a `targets/` crate) — holds the shared `GpuWeights`
 # container the spyre `__gpu` facade re-exports for the macro's load path.

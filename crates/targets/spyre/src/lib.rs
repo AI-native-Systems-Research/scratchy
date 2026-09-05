@@ -32,6 +32,12 @@ pub mod ir;
 /// emission belongs in the target crate; the shared crate keeps only
 /// the SubtileIR substrate both backends consume.
 pub mod lower_subtile_tape_to_ktir;
+/// Bridge 1's scratchy side: the tape in a vocabulary `deeptools` can name.
+///
+/// Not feature-gated: this crate already depends on `scratchy-subtile` with `superdsc` on, which is
+/// what the `with_config_model` door needs, and `lower_subtile_tape_to_superdsc` imports the sibling
+/// geometry door unconditionally for the same reason.
+pub mod lower_subtile_tape_to_dataflow_ir;
 pub mod lower_subtile_tape_to_superdsc;
 mod op_abi;
 pub mod superdsc_bake;

@@ -11,6 +11,7 @@
 
 use crate::arch::Arch;
 use crate::bridges::subtile_to_dataflow_ir::node::{Node, Residence};
+use crate::bridges::subtile_to_dataflow_ir::schedule;
 use crate::bridges::subtile_to_dataflow_ir::transfer::{self, Lanes};
 use crate::islands::dataflow_ir::op::{CompositeTransfer, Index, Op, Val};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
@@ -98,11 +99,20 @@ fn node_program<A: Arch, M: Model, W: Workload>(
     let mut vals = Vals(0);
     let mut body = Vec::new();
 
-    // The units this program binds. The HBM is global — one for the device, no core and no corelet;
-    // the scratchpad and the movers are this core's.
+    // ⭐⭐ THE SCHEDULE IS READ HERE. Which units take part is the TEMPLATE's to say — it is the
+    // same for every op of this op-func and knows no extents — so it comes from the vendored
+    // `ddl.unit` statements rather than from a list written here. A hand-written unit set is a
+    // schedule invented to look plausible.
+    //
+    // ⛔ AND THE FORMAT IS PART OF THE QUESTION. A template serves an op-func AT A PRECISION;
+    // resolving without it hands an fp16 op the fp32 kernel.
+    let schedule = node.op_func.program(A::GEN, node.format);
+
     let core = Core::checked(0).expect("every arch has a core 0");
     let corelet = Corelet::checked(0).expect("every arch has a corelet 0");
 
+    // The two memories a view is taken over. Neither is named by a `ddl.unit` — the template says
+    // `memory="lx"` on an allocation instead — so they are bound from the residences, not the walk.
     let hbm = vals.mint();
     body.push(Op::GetUnit {
         result: hbm,
@@ -115,19 +125,14 @@ fn node_program<A: Arch, M: Model, W: Workload>(
         residency: Residency::Scratchpad { core },
         unit: DfirUnit::Lx,
     });
-    for unit in [DfirUnit::L3lu, DfirUnit::L3su] {
+
+    // Then every unit the schedule itself names, in the order it names them, each with the
+    // residency the machine gives it.
+    for unit in schedule::units_of(schedule) {
         let val = vals.mint();
         body.push(Op::GetUnit {
             result: val,
-            residency: Residency::CoreWide { core },
-            unit,
-        });
-    }
-    for unit in [DfirUnit::Lxlu, DfirUnit::Sfp, DfirUnit::Lxsu] {
-        let val = vals.mint();
-        body.push(Op::GetUnit {
-            result: val,
-            residency: Residency::Corelet { core, corelet },
+            residency: crate::units::residency_of(unit, core, corelet),
             unit,
         });
     }
