@@ -9297,6 +9297,61 @@ fn dump_wavefront_mega(
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
                             let tape_rolled = reroll_subtile_tape(&tape_unrolled, &krg);
+                            // ⭐⭐ BRIDGE 1: THE SAME TAPE, STRAIGHT TO DATAFLOWIR. Not from the
+                            // SuperDSC below and not from its `EmittedOp`s — from `krg`, the graph
+                            // both readings start at. The seven model numbers come out of the
+                            // config the macro already parsed (`head_dim` among them: absent from
+                            // granite's json and derived by `derive_implicit_bounds`, which is why
+                            // this reads `bounds` rather than the file).
+                            {
+                                // ⛔ NO SILENT ZERO. `unwrap_or(0)` here would hand the door a
+                                // head dim of nought and turn a missing field into "no config
+                                // declares this model", which names the wrong problem. A field
+                                // that is absent says so, by name.
+                                const NEEDED: [&str; 7] = [
+                                    "num_attention_heads",
+                                    "num_key_value_heads",
+                                    "head_dim",
+                                    "hidden_size",
+                                    "num_hidden_layers",
+                                    "intermediate_size",
+                                    "vocab_size",
+                                ];
+                                let mut numbers = [0u32; 7];
+                                let mut missing: Option<&str> = None;
+                                for (slot, key) in numbers.iter_mut().zip(NEEDED) {
+                                    match model.bounds.get(key).copied() {
+                                        Some(v) if v > 0 => {
+                                            *slot = u32::try_from(v).unwrap_or(u32::MAX);
+                                        }
+                                        _ => missing = missing.or(Some(key)),
+                                    }
+                                }
+                                if let Some(key) = missing {
+                                    eprintln!(
+                                        "[spyre-dfir] {base}: config declares no `{key}` — every \
+                                         one of the seven is a constant the lowering specialises \
+                                         on, and `head_dim` is derived by `derive_implicit_bounds` \
+                                         when the json omits it, so an absence here is a real gap"
+                                    );
+                                }
+                                match scratchy_target_spyre::lower_subtile_tape_to_dataflow_ir::lower_subtile_tape_to_dataflow_ir(
+                                    &krg,
+                                    &weight_ids,
+                                    !is_prefill && decode_rows > 1,
+                                    decode_rows,
+                                    active_cap.get(),
+                                    numbers,
+                                    0,
+                                ) {
+                                    Ok(mlir) => eprintln!(
+                                        "[spyre-dfir] {base}: tape -> DataflowIR OK ({} bytes, {} nodes)",
+                                        mlir.len(),
+                                        krg.nodes.len()
+                                    ),
+                                    Err(e) => eprintln!("[spyre-dfir] {base}: {e}"),
+                                }
+                            }
                             match superdsc::lower_subtile_tape_to_superdsc(
                                 &tape_rolled,
                                 &krg,

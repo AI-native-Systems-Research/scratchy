@@ -68,10 +68,98 @@ pub fn compile<A: Arch, M: Model, W: Workload>(
     M::check();
     let () = W::WELL_FORMED;
 
+    // ⭐⭐ THE FIVE STRUCTURAL DECISIONS, AND ONLY THOSE, BECOME THE EMITTER'S CONST GENERICS.
+    //
+    // ⛔ THIS IS THE EXPRESS/EXPLOIT LINE DRAWN EXACTLY. A flag decides which OPS EXIST, so it is a
+    // const generic and the compiler folds the branch away. A count — a loop bound, a lane width —
+    // only APPEARS IN an op that exists either way, so it travels as a value. Making the counts
+    // const generics too would put the model and the rung in the emitter's signature and
+    // monomorphise it once per (model, rows, cap): 63 x 27 x 6 is ten thousand copies of the same
+    // code, which is what a three-and-a-half-minute single-threaded rustc looks like.
+    //
+    // ⭐ THE FLAGS ARE STILL DECIDED BY THE COMPILER. They are read off `Exploit<A, M, W>`, whose
+    // consts are const-evaluated per arm; the dispatch below turns them into literal const-generic
+    // arguments. `emit` is instantiated at most 2^5 times no matter how many models or rungs exist.
+    let counts = Counts {
+        rows: W::ROWS,
+        kv_vectors: Exploit::<A, M, W>::KV_VECTORS,
+        sticks_per_row: Exploit::<A, M, W>::STICKS_PER_ROW,
+        act_per_stick: Exploit::<A, M, W>::ACT_PER_STICK,
+        ragged_lanes: M::HIDDEN % Exploit::<A, M, W>::ACT_PER_STICK,
+    };
+    dispatch::<A, M, W>(tape, group, counts)
+}
+
+/// THE NUMBERS THAT APPEAR IN THE OUTPUT rather than deciding its shape.
+///
+/// ⛔ EVERY ONE OF THESE WAS COMPUTED FROM CONSTANTS. They are values here because a bound is a
+/// value; the DECISIONS that turn ops on and off are the const generics on [`emit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    /// The rung's row count.
+    pub rows: u32,
+    /// How many hardware vectors this rung's cache span covers.
+    pub kv_vectors: u32,
+    /// How many sticks one row occupies, rounded up.
+    pub sticks_per_row: u32,
+    /// How many activation elements fill one stick.
+    pub act_per_stick: u32,
+    /// How many lanes of the final stick are live.
+    pub ragged_lanes: u32,
+}
+
+/// TURN THE FIVE DECIDED FLAGS INTO CONST-GENERIC ARGUMENTS.
+///
+/// ⛔ FIVE NESTED TWO-WAY BRANCHES RATHER THAN A THIRTY-TWO-ARM MATCH, because each level is one
+/// line and the reader can see that every flag reaches [`emit`] as a literal. `generic_const_exprs`
+/// would let `emit::<{Exploit::<A,M,W>::IS_DECODE}, ..>` be written directly; it is unstable, so
+/// the branch is written out.
+fn dispatch<A: Arch, M: Model, W: Workload>(
+    tape: &[Node],
+    group: GroupId,
+    counts: Counts,
+) -> Result<Run<A>, TapeError> {
+    macro_rules! cache { ($d:literal, $f:literal, $s:literal, $k:literal) => {
+        if Exploit::<A, M, W>::CACHE_FITS_LX { emit::<A, $d, $f, $s, $k, true>(tape, group, counts) }
+        else { emit::<A, $d, $f, $s, $k, false>(tape, group, counts) }
+    }; }
+    macro_rules! kv { ($d:literal, $f:literal, $s:literal) => {
+        if Exploit::<A, M, W>::KV_SINGLE_VECTOR { cache!($d, $f, $s, true) }
+        else { cache!($d, $f, $s, false) }
+    }; }
+    macro_rules! stick { ($d:literal, $f:literal) => {
+        if Exploit::<A, M, W>::STICK_ALIGNED { kv!($d, $f, true) } else { kv!($d, $f, false) }
+    }; }
+    macro_rules! lx { ($d:literal) => {
+        if Exploit::<A, M, W>::FITS_LX { stick!($d, true) } else { stick!($d, false) }
+    }; }
+    if Exploit::<A, M, W>::IS_DECODE { lx!(true) } else { lx!(false) }
+}
+
+/// THE EMITTER, at one combination of the five decisions.
+fn emit<
+    A: Arch,
+    const IS_DECODE: bool,
+    const FITS_LX: bool,
+    const STICK_ALIGNED: bool,
+    const KV_SINGLE_VECTOR: bool,
+    const CACHE_FITS_LX: bool,
+>(
+    tape: &[Node],
+    group: GroupId,
+    counts: Counts,
+) -> Result<Run<A>, TapeError> {
     let mut programs = Vec::with_capacity(tape.len());
     for (at, node) in tape.iter().enumerate() {
         let index = OpIndex(u32::try_from(at).expect("a tape index fits a u32"));
-        programs.push(node_program::<A, M, W>(node, group, index)?);
+        programs.push(node_program::<
+            A,
+            IS_DECODE,
+            FITS_LX,
+            STICK_ALIGNED,
+            KV_SINGLE_VECTOR,
+            CACHE_FITS_LX,
+        >(node, group, index, counts)?);
     }
 
     // ⛔ EVERY NODE, OR NONE. A tape of N nodes becomes N programs; anything less is a forward that
@@ -91,10 +179,18 @@ pub fn compile<A: Arch, M: Model, W: Workload>(
 }
 
 /// ONE NODE'S PROGRAM.
-fn node_program<A: Arch, M: Model, W: Workload>(
+fn node_program<
+    A: Arch,
+    const IS_DECODE: bool,
+    const FITS_LX: bool,
+    const STICK_ALIGNED: bool,
+    const KV_SINGLE_VECTOR: bool,
+    const CACHE_FITS_LX: bool,
+>(
     node: &Node,
     group: GroupId,
     index: OpIndex,
+    counts: Counts,
 ) -> Result<Program<A>, TapeError> {
     let mut vals = Vals(0);
     let mut body = Vec::new();
@@ -236,7 +332,9 @@ fn node_program<A: Arch, M: Model, W: Workload>(
             func: node.op_func,
         },
         grid: Grid::single(),
-        body: nest::<A, M, W>(body, &mut vals, &staged, node),
+        body: nest::<IS_DECODE, FITS_LX, KV_SINGLE_VECTOR, CACHE_FITS_LX, STICK_ALIGNED>(
+            body, &mut vals, &staged, node, counts,
+        ),
         arch: core::marker::PhantomData,
     })
 }
@@ -246,15 +344,22 @@ fn node_program<A: Arch, M: Model, W: Workload>(
 /// ⛔⛔ THESE ARE REMOVALS, NOT BOUNDS. A row loop that runs once is still a region, still a
 /// barrier, and still an induction variable every enclosed access is strided by — so `IS_DECODE`
 /// does not set the bound to one, it emits no loop at all. Same for `FITS_LX` and the tiling loop.
-fn nest<A: Arch, M: Model, W: Workload>(
+fn nest<
+    const IS_DECODE: bool,
+    const FITS_LX: bool,
+    const KV_SINGLE_VECTOR: bool,
+    const CACHE_FITS_LX: bool,
+    const STICK_ALIGNED: bool,
+>(
     mut body: Vec<Op>,
     vals: &mut Vals,
     staged: &[(Val, u64, u64)],
     node: &Node,
+    counts: Counts,
 ) -> Vec<Op> {
     use crate::islands::dataflow_ir::op::Bound;
 
-    let inner = compute::<A, M, W>(vals, staged, node);
+    let inner = compute::<STICK_ALIGNED>(vals, staged, node, counts);
 
     // ⭐ THE CACHE WALK, WHICH ONLY AN ATTENTION NODE HAS AND ONLY A WIDE BUCKET NEEDS.
     //
@@ -262,11 +367,11 @@ fn nest<A: Arch, M: Model, W: Workload>(
     // walk exists at all; `CACHE_FITS_LX` decides whether the span was staged before it or has to
     // be streamed inside it — and a streamed step carries its own transfer, so the two rungs emit
     // different bodies rather than the same body with a different trip count.
-    let walked = if reads_cache(node.op_func) && !Exploit::<A, M, W>::KV_SINGLE_VECTOR {
+    let walked = if reads_cache(node.op_func) && !KV_SINGLE_VECTOR {
         let iv = vals.mint();
-        let steps = i64::from(Exploit::<A, M, W>::KV_VECTORS);
+        let steps = i64::from(counts.kv_vectors);
         let mut step_body = Vec::new();
-        if !Exploit::<A, M, W>::CACHE_FITS_LX {
+        if !CACHE_FITS_LX {
             // ⭐ THE SPAN DID NOT FIT, so each step brings its own slice of the cache across and
             // has to wait for it. The reference does exactly this inside its own walks: a
             // `sync_send` to the mover and a blocking `sync_recv` before the data is read
@@ -302,11 +407,11 @@ fn nest<A: Arch, M: Model, W: Workload>(
     let inner = walked;
 
     // ⭐ THE TILING LOOP, PRESENT ONLY WHERE THE ROW DOES NOT FIT.
-    let tiled = if Exploit::<A, M, W>::FITS_LX {
+    let tiled = if FITS_LX {
         inner
     } else {
         let iv = vals.mint();
-        let tiles = i64::from(Exploit::<A, M, W>::STICKS_PER_ROW);
+        let tiles = i64::from(counts.sticks_per_row);
         vec![Op::For {
             iv,
             lo: Bound::Const(0),
@@ -316,14 +421,14 @@ fn nest<A: Arch, M: Model, W: Workload>(
     };
 
     // ⭐ THE ROW NEST, ABSENT ENTIRELY AT DECODE.
-    let rows = if Exploit::<A, M, W>::IS_DECODE {
+    let rows = if IS_DECODE {
         tiled
     } else {
         let iv = vals.mint();
         vec![Op::For {
             iv,
             lo: Bound::Const(0),
-            hi: Bound::Const(i64::from(W::ROWS)),
+            hi: Bound::Const(i64::from(counts.rows)),
             body: tiled,
         }]
     };
@@ -341,14 +446,15 @@ fn nest<A: Arch, M: Model, W: Workload>(
 ///
 /// ⛔ NOT "A MASK OF ALL ONES". That is the same ops with a different constant, which is the exact
 /// shape of expressing a constant without exploiting it.
-fn compute<A: Arch, M: Model, W: Workload>(
+fn compute<const STICK_ALIGNED: bool>(
     vals: &mut Vals,
     staged: &[(Val, u64, u64)],
     node: &Node,
+    counts: Counts,
 ) -> Vec<Op> {
     let mut ops = Vec::new();
     let width = staged.first().map_or(1, |(_, _, cols)| *cols);
-    let lanes = width.min(u64::from(Exploit::<A, M, W>::ACT_PER_STICK));
+    let lanes = width.min(u64::from(counts.act_per_stick));
     let ty = Vector {
         len: lanes,
         elem: ElemType::F16,
@@ -396,8 +502,8 @@ fn compute<A: Arch, M: Model, W: Workload>(
     };
 
     // ⭐ AND ONLY NOW, THE TAIL — if there is one.
-    if !Exploit::<A, M, W>::STICK_ALIGNED {
-        let live = u64::from(M::HIDDEN % Exploit::<A, M, W>::ACT_PER_STICK);
+    if !STICK_ALIGNED {
+        let live = u64::from(counts.ragged_lanes);
         let predicate = vals.mint();
         ops.push(Op::CreateAffineMask {
             result: predicate,
