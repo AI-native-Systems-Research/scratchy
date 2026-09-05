@@ -26,6 +26,7 @@ members = [
     "crates/models/vision",
     "crates/models/quantization",
     "crates/compiler",
+    "crates/compiler/deeptools",
     "crates/compiler/macros",
     "crates/compiler/subtile",
     "crates/targets/cuda/cost-sweep",

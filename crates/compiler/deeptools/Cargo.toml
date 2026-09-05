@@ -1,0 +1,15 @@
+[package]
+name = "deeptools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ⛔⛔ NO SCRATCHY DEPENDENCY, EVER.
+#
+# This crate holds the deeptools IRs and the bridges between them. It knows nothing about
+# scratchy's tape: anything that speaks `TensorRegion` or `SubtileNode` belongs on the scratchy
+# side of bridge 1, not here. A dependency edge back into scratchy is what turns a bridge into a
+# recovery — build a lowering, throw the shape away, then try to read it back out.
+[dependencies]
+
+[lib]
