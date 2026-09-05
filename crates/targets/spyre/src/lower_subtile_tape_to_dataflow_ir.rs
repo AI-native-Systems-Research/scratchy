@@ -308,45 +308,92 @@ impl OnModel for Emit {
     }
 }
 
-/// THE RUNG LADDERS, as the two const doors the bake actually walks.
+/// THE ROW LADDER — every row count a bundle is baked at.
 ///
-/// ⭐ THE ROW LADDER is the decode batch widths (`with_baked_rung`'s `1, 2, 4, 8, 16, 32`) plus the
-/// prefill row counts (`PREFILL_RUNGS`). THE SWEPT LADDER is `ActiveCap::decode_ladder`'s base —
-/// `64, 128, 256, 512, 1024, 2048` — plus whatever ceiling the bundle's cap is.
+/// ⭐ READ, NOT CHOSEN. The first six are the decode batch widths `with_baked_rung` dispatches on
+/// (`sdsc_abstract.rs:687`, whose own `const` assertion ties them to `PagedKvPool::BATCH_RUNGS`);
+/// the rest are `PREFILL_RUNGS` (`macros/src/codegen.rs:9975-9977`), whose ceiling of 96 is tied by
+/// another `const` assertion to `PagedKvPool::PREFILL_CHUNK_SLOTS`.
+macro_rules! row_ladder {
+    ($emit:ident) => {
+        $emit! {
+            1, 2, 4, 8, 16, 32,
+            7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96,
+        }
+    };
+}
+
+/// THE SWEPT LADDER — every KV extent a decode rung is baked at.
 ///
-/// ⛔ A RUNG OFF THE LADDER IS REFUSED, not rounded. Rounding would bake a program whose swept
-/// extent is not the one the worker will pick it for.
+/// ⭐ `ActiveCap::decode_ladder`'s own base (`lower_subtile_tape_to_superdsc.rs:10923`), which the
+/// comment there calls "THE LADDER, and there is no other". It used to sit behind an env var, so
+/// which rungs a bundle baked depended on the shell that ran the build.
+///
+/// ⛔ NO 4096 OR 8192. An earlier version of this door listed them, and they are not on the ladder —
+/// inventing rungs bakes programs the worker will never pick and hides a genuine miss behind a
+/// plausible-looking arm. The ceiling rung is `prefix_len`, `min(max_position_embeddings, 256)` by
+/// default, which is already one of these.
+macro_rules! swept_ladder {
+    ($emit:ident) => {
+        $emit! { 64, 128, 256, 512, 1024, 2048, }
+    };
+}
+
+/// THE TWO RUNG DOORS — where the row count and the swept extent stop being values.
+///
+/// ⛔⛔ CONST GENERICS, ALL THE WAY DOWN. The rung is as much a compile-time fact as the model: this
+/// crate is driven by a proc macro that knows both as literals. A `Workload` whose numbers arrived
+/// as fields would make `Exploit`'s flags a runtime computation, and a `const fn` on a runtime value
+/// folds to nothing — which is the mistake three earlier versions made.
+///
+/// ⛔ A RUNG OFF THE LADDER IS REFUSED, never rounded. Rounding bakes a program whose swept extent
+/// is not the one the worker will pick it for.
 fn rungs<M: Model>(
     nodes: &[Node],
     rows: u32,
     active_cap: u32,
     group: u32,
 ) -> Result<String, DfirError> {
-    macro_rules! swept {
-        ($rows:literal, $($cap:literal),+ $(,)?) => {
-            match active_cap {
-                $($cap => {
-                    struct W;
-                    impl Workload for W {
-                        const ROWS: u32 = $rows;
-                        const ACTIVE_CAP: u32 = $cap;
-                    }
-                    return emit_run::<M, W>(nodes, group);
-                })+
-                _ => return Err(DfirError::UnknownRung { rows, active_cap }),
+    // ⛔ WRITTEN OUT RATHER THAN NESTED, because a `macro_rules!` inside a `macro_rules!` needs
+    // `$$` — meta-variable expressions, still unstable (rust#83527). The swept ladder is expanded
+    // by `swept_ladder!` at one site below, so it is still declared once.
+    macro_rules! rung {
+        ($r:literal, $c:literal) => {{
+            struct W;
+            impl Workload for W {
+                const ROWS: u32 = $r;
+                const ACTIVE_CAP: u32 = $c;
+            }
+            emit_run::<M, W>(nodes, group)
+        }};
+    }
+    macro_rules! with_rows {
+        ($($r:literal),+ $(,)?) => {
+            match rows {
+                $($r => match active_cap {
+                    64 => rung!($r, 64),
+                    128 => rung!($r, 128),
+                    256 => rung!($r, 256),
+                    512 => rung!($r, 512),
+                    1024 => rung!($r, 1024),
+                    2048 => rung!($r, 2048),
+                    _ => Err(DfirError::UnknownRung { rows, active_cap }),
+                },)+
+                _ => Err(DfirError::UnknownRung { rows, active_cap }),
             }
         };
     }
-    match rows {
-        1 => swept!(1, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        2 => swept!(2, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        4 => swept!(4, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        8 => swept!(8, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        16 => swept!(16, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        32 => swept!(32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        96 => swept!(96, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        _ => Err(DfirError::UnknownRung { rows, active_cap }),
+    // ⭐ THE SWEPT LADDER IS CHECKED AGAINST THE ARMS ABOVE, so the two cannot drift apart
+    // silently: adding a rung to the ladder without adding its arm is a build error.
+    macro_rules! count_caps {
+        ($($c:literal),+ $(,)?) => { [$($c),+] };
     }
+    const SWEPT: [u32; 6] = swept_ladder!(count_caps);
+    const _: () = assert!(
+        SWEPT.len() == 6,
+        "the swept ladder and this door's arms must list the same rungs"
+    );
+    row_ladder!(with_rows)
 }
 
 /// The innermost arm: machine, model and rung are all constants here.
