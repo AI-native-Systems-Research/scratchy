@@ -200,6 +200,73 @@ impl AffineExpr {
     }
 }
 
+/// ONE CONSTRAINT OF AN `affine_set` — an expression that is either zero or non-negative.
+///
+/// ⛔ THE FLAG IS THE WHOLE DIFFERENCE BETWEEN A POINT AND A SPAN. MLIR's `IntegerSet` carries a
+/// parallel `eqFlags` array rather than two expression kinds, and reading a `>= 0` as an `== 0`
+/// turns "these sixty-four lanes" into "lane zero".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Constraint {
+    /// The expression constrained.
+    pub expr: AffineExpr,
+    /// `true` for `expr == 0`, `false` for `expr >= 0`.
+    pub is_equality: bool,
+}
+
+/// An `affine_set<(d0, ..) : (..)>` — which indices of a walk are live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegerSet {
+    /// How many dimensions it constrains.
+    pub dims: u32,
+    /// The constraints, in order.
+    pub constraints: Vec<Constraint>,
+}
+
+impl IntegerSet {
+    /// THE SET A RECTANGLE OF `sizes` OCCUPIES — `buildIntegerSetFromSizes`
+    /// (`DataTransferLowering.cpp:40-69`).
+    ///
+    /// A size of one pins its dimension to zero; any larger size spans `0 ..= n-1`, written as the
+    /// PAIR `dk >= 0` and `n-1 - dk >= 0` because an `IntegerSet` has no two-sided constraint.
+    ///
+    /// ⭐ VERIFIED AGAINST IBM'S OWN SETS. Sizes `[1, 1, 64]` give
+    /// `affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>`, which is `#set` of
+    /// `/tmp/ktir_ref/export/debug/dfir.mlir`; `[1]` gives `#set2`, `affine_set<(d0) : (d0 == 0)>`,
+    /// the single pinned time step of a transfer that fits in one vector.
+    ///
+    /// ⛔ AN EMPTY `sizes` IS THE EMPTY SET, NOT AN UNCONSTRAINED ONE. The C++ returns
+    /// `IntegerSet::getEmptySet(0, 0, ..)` (`:42-44`); a set with no dimensions and no constraints
+    /// would instead admit everything.
+    #[must_use]
+    pub fn from_sizes(sizes: &[u64]) -> IntegerSet {
+        let mut constraints = Vec::new();
+        for (i, size) in sizes.iter().enumerate() {
+            let dim = AffineExpr::dim(u32::try_from(i).expect("a rank fits a u32"));
+            if *size == 1 {
+                constraints.push(Constraint {
+                    expr: dim,
+                    is_equality: true,
+                });
+            } else {
+                constraints.push(Constraint {
+                    expr: dim.clone(),
+                    is_equality: false,
+                });
+                // `n - 1 - dk >= 0`, which prints as `-dk + (n-1) >= 0`.
+                let bound = i64::try_from(*size).expect("an extent fits an i64") - 1;
+                constraints.push(Constraint {
+                    expr: dim.times(-1).plus(AffineExpr::Const(bound)),
+                    is_equality: false,
+                });
+            }
+        }
+        IntegerSet {
+            dims: u32::try_from(sizes.len()).expect("a rank fits a u32"),
+            constraints,
+        }
+    }
+}
+
 /// An `affine_map<(d0, ..) -> (..)>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AffineMap {
@@ -216,6 +283,34 @@ impl AffineMap {
         AffineMap {
             dims: 1,
             results: vec![expr],
+        }
+    }
+
+    /// `(d0, .., dn) -> (d0, .., dn)` — the `load_order`/`store_order` of an access.
+    ///
+    /// ⭐ ORDER SAYS WHICH AXIS MOVES FASTEST, and the scheduler writes the identity for every
+    /// access in its own output (`#map2` over three dims, `#map4` over five). Row-major order is
+    /// what the view's `layout_map` already states, so ordering it again differently would be two
+    /// answers to one question.
+    #[must_use]
+    pub fn identity(rank: u32) -> AffineMap {
+        AffineMap {
+            dims: rank,
+            results: (0..rank).map(AffineExpr::dim).collect(),
+        }
+    }
+
+    /// `(d0, .., dm) -> (r0, .., rn)` where every result is a literal — the `*_time_addr_map` of a
+    /// transfer that walks nothing.
+    ///
+    /// ⭐ THE ARITIES DIFFER, WHICH IS THE POINT: it takes one dimension per TIME step and produces
+    /// one offset per MEMREF dimension. `#map3 = affine_map<(d0) -> (0, 0, 0)>` is a one-step walk
+    /// over a rank-three source; `#map5` is the same step over the rank-five destination.
+    #[must_use]
+    pub fn constants(dims: u32, results: &[i64]) -> AffineMap {
+        AffineMap {
+            dims,
+            results: results.iter().copied().map(AffineExpr::Const).collect(),
         }
     }
 
