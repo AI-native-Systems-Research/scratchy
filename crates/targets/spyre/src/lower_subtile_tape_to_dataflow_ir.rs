@@ -38,7 +38,8 @@ use deeptools::islands::dataflow_ir::{GroupId, print};
 use deeptools::model::Model;
 use deeptools::workload::Workload;
 
-use crate::lower_subtile_tape_to_superdsc::{BundleLayout, compute_bundle_layout};
+use crate::lower_subtile_tape_to_superdsc::{ActiveCap, BundleLayout, SegRole, compute_bundle_layout};
+use scratchy_spyre_bundle as bundle;
 
 /// WHY A TAPE COULD NOT BECOME DATAFLOWIR.
 ///
@@ -112,9 +113,11 @@ impl std::fmt::Display for DfirError {
 /// here rather than a node that silently lowers as something else. The arms that return
 /// [`DfirError::NoOpFunc`] are work not yet done, stated as such.
 ///
-/// ⭐ THE TAPE HAS ALREADY DECOMPOSED THE FUSED OPS. `RmsNorm` arrives as its reduce and apply
-/// halves, rope as its rotate and append — that is what `decompose_rmsnorm` and `head_tile_rope`
-/// are for — so this map is mostly one-to-one rather than a fusion table.
+/// ⛔ AND THE TAPE DOES NOT ALWAYS ARRIVE DECOMPOSED. This said the opposite — that `decompose_rmsnorm`
+/// had already split `RmsNorm` into its reduce and apply halves, so the map was "mostly one to one".
+/// The acceptance build falsified it: a raw `SubOp::RmsNorm` reached this function and stopped the
+/// whole tape. Nodes that are several op-funcs are handled by [`expand`], which returns a sequence;
+/// this function answers only for the ones that are exactly one.
 fn op_func_of<F: RopeForm>(op: &SubOp<F>) -> Result<OpFunc, DfirError> {
     Ok(match op {
         SubOp::MatmulTile { .. } => OpFunc::Matmul,
@@ -172,7 +175,28 @@ fn operand_of<F: RopeForm>(
         .ok_or(DfirError::Unplaced { tid })?;
     let shape = ir.tensors[tid as usize];
     let rows = tr.region.rows.len;
-    let cols = tr.region.cols.len;
+
+    // ⭐⭐ THE DEVICE WIDTH, NOT THE LOGICAL ONE — for a region that spans the whole tensor.
+    //
+    // ⛔ A TENSOR IS STORED PADDED. `compute_bundle_layout` reserves the DEVICE footprint, padding
+    // the innermost stick dim up to a whole stick, so granite's `[1, 49155]` logits occupy 49216
+    // elements. Addressing them at 49155 is not merely a different number: 49155 is not a whole
+    // number of 64-lane vectors, so the AGEN transfer cannot be split at all and the tape stops with
+    // `InnermostNotWhole { src_innermost: 49155, lanes: 64 }` — which is exactly how this was found.
+    //
+    // ⭐ `for_pointwise` IS THE SHARED AUTHORITY. It is documented to EQUAL `for_output(m, n, k)`
+    // for any producer whose macs reach 2^20 — every real producer of a padded tensor
+    // (lm_head/o_proj/down_proj) — with a Kani proof (`devwidth_pointwise_matches_matmul`). So a
+    // consumer addressed through it reads the layout its producer wrote.
+    //
+    // ⛔ ONLY FOR A FULL-WIDTH REGION. A slice inside a row is a genuine sub-extent; widening it to
+    // the padded width would read past the slice the tape asked for.
+    let spans_full_width = tr.region.cols.start == 0 && tr.region.cols.len == shape.cols;
+    let cols = if spans_full_width {
+        crate::lower_subtile_tape_to_superdsc::DeviceWidth::for_pointwise(shape.cols).get()
+    } else {
+        tr.region.cols.len
+    };
 
     // Two bytes an element: the activation stream is fp16 whatever the weights are quantised to.
     let within = u64::from(tr.region.rows.start) * u64::from(shape.cols) * 2
@@ -189,6 +213,110 @@ fn operand_of<F: RopeForm>(
     })
 }
 
+/// A SYNTHETIC INTERMEDIATE, DECLARED AND THEN ADDRESSED.
+///
+/// ⛔⛔ DECLARING IS NOT OPTIONAL AND NOT LAZY. `resolve_seg_base` PANICS the build on a synthetic
+/// that reaches its first access undeclared, and the comment there says why: the bump did not
+/// advance, so every undeclared synthetic received THE SAME ADDRESS with a zero-byte placement that
+/// hid the collision from every guard downstream — on granite that put three of rope's four
+/// intermediates on one buffer. So the declaration happens here, at the site that mints the name,
+/// with the tensor's FULL footprint.
+///
+/// ⭐ AND THE ALLOCATOR IS THE LAYOUT'S OWN, so a synthetic this bridge invents lands where the
+/// same synthetic would land on the other path — the two cannot disagree about an address.
+fn synth_operand(
+    layout: &BundleLayout,
+    of: u32,
+    role: bundle::SynthRole,
+    rows: u32,
+    cols: u32,
+) -> Result<Operand, DfirError> {
+    let id = bundle::PlaceId::Synth { of, role };
+    layout.synth(id, &[rows, cols]);
+    let offset = *layout
+        .synth
+        .borrow()
+        .map
+        .get(&id.to_string())
+        .ok_or(DfirError::Unplaced { tid: of })?;
+    Ok(Operand {
+        rows: Rows(rows),
+        cols: Cols(cols),
+        format: DataType::Sen169Fp16,
+        at: Residence::Hbm {
+            segment: Segment(
+                u32::try_from(SegRole::Intermediate.segment()).expect("a segment index fits a u32"),
+            ),
+            offset: Bytes(offset),
+        },
+    })
+}
+
+/// ONE TAPE NODE AS THE PROGRAMS IT BECOMES.
+///
+/// ⛔⛔ A NODE IS NOT ALWAYS ONE PROGRAM. `SubOp::RmsNorm` is six op-funcs over five intermediates,
+/// and an earlier version of this bridge returned a single `OpFunc` per node — which cannot express
+/// it at all, and stopped the whole tape with "no op-func for `SubOp::RmsNorm`". The decomposition
+/// below is `assemble_rmsnorm`'s, read rather than derived
+/// (`ir/bridge/tiled_op_sdsc_op/rmsnorm.rs:103-172`).
+fn expand<F: RopeForm>(
+    node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    layout: &BundleLayout,
+) -> Result<Vec<Node>, DfirError> {
+    use bundle::SynthRole as R;
+
+    let one = |op_func: OpFunc, inputs: Vec<Operand>, output: Operand| Node {
+        op_func,
+        format: DataType::Sen169Fp16,
+        inputs,
+        output,
+    };
+
+    if let SubOp::RmsNorm { .. } = node.op {
+        // `mean = mean(x*x)` -> `+ eps` -> `rsqrt` -> `x * rinv` -> `* gamma`. The reduce's output
+        // is one stick wide, not one column: the device reduces into a stick.
+        let [x, gamma] = node.inputs.as_slice() else {
+            return Err(DfirError::NoOpFunc("RmsNorm without exactly (x, gamma)"));
+        };
+        let of = node.output.tensor.index() as u32;
+        let rows = node.output.region.rows.len;
+        let cols = node.output.region.cols.len;
+        // ⛔ ONE STICK, NOT ONE COLUMN. The reduce writes a stick-wide row; declaring it `[rows, 1]`
+        // under-reserves it by a whole stick and the next synthetic starts inside it.
+        let stick = 64;
+
+        let xo = operand_of(x, ir, layout)?;
+        let go = operand_of(gamma, ir, layout)?;
+        let sq = synth_operand(layout, of, R::Sq16, rows, cols)?;
+        let mean = synth_operand(layout, of, R::Mean, rows, stick)?;
+        let meps = synth_operand(layout, of, R::Meps, rows, stick)?;
+        let rinv = synth_operand(layout, of, R::Rinv, rows, stick)?;
+        let xn = synth_operand(layout, of, R::Xn, rows, cols)?;
+        let out = operand_of(&node.output, ir, layout)?;
+
+        return Ok(vec![
+            one(OpFunc::Mul, vec![xo, xo], sq),
+            one(OpFunc::Mean, vec![sq], mean),
+            one(OpFunc::Add, vec![mean], meps),
+            one(OpFunc::Rsqrt, vec![meps], rinv),
+            one(OpFunc::Mul, vec![xo, rinv], xn),
+            one(OpFunc::Mul, vec![xn, go], out),
+        ]);
+    }
+
+    let op_func = op_func_of(&node.op)?;
+    let mut inputs = Vec::with_capacity(node.inputs.len());
+    for input in &node.inputs {
+        inputs.push(operand_of(input, ir, layout)?);
+    }
+    Ok(vec![one(
+        op_func,
+        inputs,
+        operand_of(&node.output, ir, layout)?,
+    )])
+}
+
 /// THE WHOLE TAPE, AS DATAFLOWIR TEXT.
 ///
 /// ⭐ EVERY NODE. The result is one program per node of `ir.nodes`, in evaluation order, and
@@ -203,36 +331,39 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
     weight_ids: &HashSet<u32>,
     rows_are_requests: bool,
     rows: u32,
-    active_cap: u32,
+    active_cap: ActiveCap,
+    cap: u32,
     model: [u32; 7],
     group: u32,
 ) -> Result<String, DfirError> {
+    // ⛔ RESOLVED HERE, ONCE. `ActiveCap::resolve` is documented as THE ONLY place a rung becomes a
+    // tile extent: NONE -> 0 (sweep no resident prefix), FULL or any out-of-range request -> the
+    // bundle's whole `cap`, otherwise the request itself.
+    let active_cap = active_cap.resolve(cap, scratchy_subtile::sdsc_abstract::POOL_STICK);
     // ⭐ THE SAME PLAN THE WORKER STAGES AGAINST, derived from this same graph.
     let layout = compute_bundle_layout(ir, weight_ids, rows_are_requests)
         .map_err(|e| DfirError::Layout(e.to_string()))?;
 
+    // ⛔ EVERY NODE, AND A NODE MAY BE SEVERAL PROGRAMS. The count below is per NODE, not per
+    // program: `SubOp::RmsNorm` becomes six. A node that mapped to nothing is a forward silently
+    // skipping work, and the emitter downstream could not tell.
     let mut nodes = Vec::with_capacity(ir.nodes.len());
+    let mut mapped = 0usize;
     for node in &ir.nodes {
-        let op_func = op_func_of(&node.op)?;
-        let mut inputs = Vec::with_capacity(node.inputs.len());
-        for input in &node.inputs {
-            inputs.push(operand_of(input, ir, &layout)?);
+        let programs = expand(node, ir, &layout)?;
+        if programs.is_empty() {
+            return Err(DfirError::Tape(format!(
+                "node {} expanded to no programs at all",
+                node.output.tensor.index()
+            )));
         }
-        nodes.push(Node {
-            op_func,
-            format: DataType::Sen169Fp16,
-            inputs,
-            output: operand_of(&node.output, ir, &layout)?,
-        });
+        mapped += 1;
+        nodes.extend(programs);
     }
-
-    // ⛔ EVERY NODE OF THE TAPE IS PRESENT before anything is emitted. A short list here would be a
-    // forward that silently skips work, and the emitter could not tell.
-    if nodes.len() != ir.nodes.len() {
+    if mapped != ir.nodes.len() {
         return Err(DfirError::Tape(format!(
-            "the graph has {} nodes but {} were mapped",
-            ir.nodes.len(),
-            nodes.len()
+            "the graph has {} nodes but {mapped} were mapped",
+            ir.nodes.len()
         )));
     }
 
@@ -371,6 +502,11 @@ fn rungs<M: Model>(
         ($($r:literal),+ $(,)?) => {
             match rows {
                 $($r => match active_cap {
+                    // ⭐ ZERO IS A RUNG, not a missing value: `ActiveCap::NONE` RESOLVED. A prefill
+                    // chunk whose `start == 0` has no resident prefix to attend, so it sweeps
+                    // nothing — and the emitter must then leave the cache walk out entirely rather
+                    // than emit one of zero trips.
+                    0 => rung!($r, 0),
                     64 => rung!($r, 64),
                     128 => rung!($r, 128),
                     256 => rung!($r, 256),

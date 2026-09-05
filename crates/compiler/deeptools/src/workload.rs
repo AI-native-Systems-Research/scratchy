@@ -29,19 +29,28 @@ pub trait Workload {
     /// One of `PREFILL_RUNGS` for a prefill rung; the batch width `mq` for a decode one.
     const ROWS: u32;
 
-    /// `sk_bucket` / `active_cap` — how far back into the KV cache this rung reads.
+    /// `sk_bucket` / `active_cap` — how far back into the KV cache this rung reads, RESOLVED.
     ///
     /// ⛔ THE SWEEP EXTENT, NOT THE BATCH WIDTH. `sk_bucket_rungs` is keyed by `active_cap`, and
     /// the two were confused once already (`sdsc_abstract.rs:4879` says so in as many words).
+    ///
+    /// ⛔⛔ AND RESOLVED, NOT THE SENTINEL. `ActiveCap` is a sentinel type: `FULL` is 0 ("sweep
+    /// everything", meaning the bundle's whole cap) and `NONE` is `u32::MAX` ("sweep nothing").
+    /// `ActiveCap::resolve(cap, stick)` is documented as THE ONLY place a rung becomes a tile
+    /// extent, and passing `.get()` here instead handed this door a sentinel where an extent
+    /// belongs — which the acceptance build reported as `rung (rows 1, active_cap 0)` and
+    /// `active_cap 4294967295`.
+    ///
+    /// ⭐ ZERO IS LEGITIMATE and means the bundle sweeps NO resident prefix — a prefill chunk whose
+    /// `start == 0` has none to attend. It is the resolved value of `NONE`, not a missing one.
     const ACTIVE_CAP: u32;
 
     /// ⭐⭐ THE RUNG'S OWN INVARIANTS, evaluated per rung at build time.
     const WELL_FORMED: () = {
         assert!(Self::ROWS > 0, "a rung that processes no rows");
-        assert!(
-            Self::ACTIVE_CAP > 0,
-            "a rung that reads no cache at all: even decode's first step reads one position"
-        );
+        // ⛔ NO ASSERTION ON `ACTIVE_CAP` BEING NON-ZERO. An earlier version refused zero as "a rung
+        // that reads no cache at all", which is a real and common bundle: a prefill chunk with
+        // `start == 0` sweeps no resident prefix, and that is `ActiveCap::NONE` resolved.
     };
 }
 
@@ -140,12 +149,16 @@ impl<A: Arch, M: Model, W: Workload> Exploit<A, M, W> {
         W::ACTIVE_CAP.div_ceil(Self::ACT_PER_STICK)
     };
 
-    /// THE WHOLE CACHE SPAN IS ONE VECTOR.
+    /// THERE IS NOTHING TO WALK.
     ///
-    /// ⭐ WHAT IT REMOVES: the cache walk. At a bucket no wider than a stick there is nothing to
+    /// ⭐ WHAT IT REMOVES: the cache walk. At a span no wider than one vector there is nothing to
     /// step over, so the loop is not emitted — and with it goes the induction variable every cache
     /// address inside it was strided by.
-    pub const KV_SINGLE_VECTOR: bool = Self::KV_VECTORS == 1;
+    ///
+    /// ⛔ `<= 1`, NOT `== 1`. Zero vectors is a bundle that sweeps no resident prefix at all
+    /// (`ActiveCap::NONE`), and `== 1` left it emitting a walk of ZERO trips — a loop that runs
+    /// never, which is the shape `audit_op_work` refuses elsewhere for exactly this reason.
+    pub const NO_CACHE_WALK: bool = Self::KV_VECTORS <= 1;
 
     /// HOW MANY STICKS ONE ROW OF THE HIDDEN STATE OCCUPIES, rounded up.
     ///

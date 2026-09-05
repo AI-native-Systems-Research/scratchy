@@ -71,6 +71,16 @@ impl Workload for WideCache {
     const ACTIVE_CAP: u32 = 8192;
 }
 
+/// A rung that sweeps NO resident prefix — `ActiveCap::NONE` resolved to zero.
+///
+/// ⭐ A REAL BUNDLE, NOT A DEGENERATE ONE: every single-chunk prompt is one, because a chunk whose
+/// `start == 0` has no resident prefix to attend. It is also the common TTFT case.
+struct NoSweep;
+impl Workload for NoSweep {
+    const ROWS: u32 = 96;
+    const ACTIVE_CAP: u32 = 0;
+}
+
 /// A two-node tape: one op reading a weight from the HBM, one reading an activation already staged.
 fn tape_of(op_func: OpFunc) -> Vec<Node> {
     let hbm = Operand {
@@ -232,6 +242,33 @@ fn the_sk_bucket_changes_the_cache_walk() {
         count(&wide, IS_SYNC),
         2,
         "a streamed cache waits once per node's walk"
+    );
+}
+
+/// ⭐⭐ A RUNG THAT SWEEPS NOTHING EMITS NO WALK — not a walk of zero trips.
+///
+/// ⛔ THIS WAS A REAL BUG, FOUND BY THE ACCEPTANCE BUILD. `ActiveCap` is a sentinel type whose
+/// `FULL` is 0 and `NONE` is `u32::MAX`, and the call site passed `.get()` — the sentinel — where a
+/// resolved extent belongs, so the door saw `active_cap 0` and `active_cap 4294967295` and refused
+/// every rung. Resolving it surfaced the second half: `NO_CACHE_WALK` was `KV_VECTORS == 1`, which
+/// is FALSE at zero vectors, so a bundle sweeping no resident prefix would have emitted a loop that
+/// runs never — the exact shape `audit_op_work` refuses elsewhere.
+#[test]
+fn a_rung_that_sweeps_nothing_emits_no_walk() {
+    let tape = tape_of(OpFunc::Batchmatmul);
+    let none = tape::compile::<Dd2, Aligned, NoSweep>(&tape, GroupId(0)).expect("lowers");
+
+    // ⛔ CARRY THE VALUE. 96 rows is a prefill rung, so the ROW nest is present — one per node —
+    // and the cache walk is absent. Counting only "fewer loops" would pass on losing the wrong one.
+    assert_eq!(
+        count(&none, IS_FOR),
+        2,
+        "the row nest survives at 96 rows; only the cache walk goes"
+    );
+    assert_eq!(
+        count(&none, IS_SYNC),
+        0,
+        "and with no walk there is no per-step wait"
     );
 }
 
