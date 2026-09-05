@@ -39,6 +39,9 @@ pub mod bridges;
 /// AN IR AND NOTHING ELSE — one module per IR.
 pub mod islands;
 
+/// HOW WIDE ONE ELEMENT OF EACH FORMAT IS — IBM's own bit-width table.
+pub mod formats;
+
 /// THE NETWORK, AS CONSTANTS — the shape facts a lowering is specialised on.
 pub mod model;
 
@@ -52,6 +55,9 @@ pub mod generated {
 
 /// THE UNITS A PROGRAM DECLARES, and what each one is next to.
 pub mod units;
+
+/// THE WORKLOAD POINT, AS CONSTANTS — which rung of the ladder a program is baked for.
+pub mod workload;
 
 /// THE WALKED DATAFLOW FOR ONE OP-FUNC ON THE ARCH BEING BUILT FOR.
 ///
