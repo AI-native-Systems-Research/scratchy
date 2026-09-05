@@ -124,7 +124,7 @@ fn dispatch<A: Arch, M: Model, W: Workload>(
         else { emit::<A, $d, $f, $s, $k, false>(tape, group, counts) }
     }; }
     macro_rules! kv { ($d:literal, $f:literal, $s:literal) => {
-        if Exploit::<A, M, W>::KV_SINGLE_VECTOR { cache!($d, $f, $s, true) }
+        if Exploit::<A, M, W>::NO_CACHE_WALK { cache!($d, $f, $s, true) }
         else { cache!($d, $f, $s, false) }
     }; }
     macro_rules! stick { ($d:literal, $f:literal) => {
@@ -142,7 +142,7 @@ fn emit<
     const IS_DECODE: bool,
     const FITS_LX: bool,
     const STICK_ALIGNED: bool,
-    const KV_SINGLE_VECTOR: bool,
+    const NO_CACHE_WALK: bool,
     const CACHE_FITS_LX: bool,
 >(
     tape: &[Node],
@@ -157,7 +157,7 @@ fn emit<
             IS_DECODE,
             FITS_LX,
             STICK_ALIGNED,
-            KV_SINGLE_VECTOR,
+            NO_CACHE_WALK,
             CACHE_FITS_LX,
         >(node, group, index, counts)?);
     }
@@ -184,7 +184,7 @@ fn node_program<
     const IS_DECODE: bool,
     const FITS_LX: bool,
     const STICK_ALIGNED: bool,
-    const KV_SINGLE_VECTOR: bool,
+    const NO_CACHE_WALK: bool,
     const CACHE_FITS_LX: bool,
 >(
     node: &Node,
@@ -332,7 +332,7 @@ fn node_program<
             func: node.op_func,
         },
         grid: Grid::single(),
-        body: nest::<IS_DECODE, FITS_LX, KV_SINGLE_VECTOR, CACHE_FITS_LX, STICK_ALIGNED>(
+        body: nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX, STICK_ALIGNED>(
             body, &mut vals, &staged, node, counts,
         ),
         arch: core::marker::PhantomData,
@@ -347,7 +347,7 @@ fn node_program<
 fn nest<
     const IS_DECODE: bool,
     const FITS_LX: bool,
-    const KV_SINGLE_VECTOR: bool,
+    const NO_CACHE_WALK: bool,
     const CACHE_FITS_LX: bool,
     const STICK_ALIGNED: bool,
 >(
@@ -363,11 +363,11 @@ fn nest<
 
     // ⭐ THE CACHE WALK, WHICH ONLY AN ATTENTION NODE HAS AND ONLY A WIDE BUCKET NEEDS.
     //
-    // ⛔ THE SK BUCKET IS EXPLOITED IN TWO PLACES, NOT ONE. `KV_SINGLE_VECTOR` decides whether the
+    // ⛔ THE SK BUCKET IS EXPLOITED IN TWO PLACES, NOT ONE. `NO_CACHE_WALK` decides whether the
     // walk exists at all; `CACHE_FITS_LX` decides whether the span was staged before it or has to
     // be streamed inside it — and a streamed step carries its own transfer, so the two rungs emit
     // different bodies rather than the same body with a different trip count.
-    let walked = if reads_cache(node.op_func) && !KV_SINGLE_VECTOR {
+    let walked = if reads_cache(node.op_func) && !NO_CACHE_WALK {
         let iv = vals.mint();
         let steps = i64::from(counts.kv_vectors);
         let mut step_body = Vec::new();

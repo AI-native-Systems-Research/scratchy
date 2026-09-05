@@ -9340,7 +9340,15 @@ fn dump_wavefront_mega(
                                     &weight_ids,
                                     !is_prefill && decode_rows > 1,
                                     decode_rows,
-                                    active_cap.get(),
+                                    // ⛔ THE SENTINEL AND ITS CAP, RESOLVED BY THE BRIDGE. `ActiveCap`
+                                    // is a sentinel type — FULL is 0 ("sweep everything") and NONE
+                                    // is u32::MAX ("sweep nothing") — so handing the rung door
+                                    // `.get()` passes a sentinel where an extent belongs, which is
+                                    // what "rung (rows 1, active_cap 0)" and "active_cap 4294967295"
+                                    // were. `ActiveCap::resolve` is THE ONLY place a rung becomes a
+                                    // tile extent, and it lives beside the bridge rather than here.
+                                    active_cap,
+                                    cap,
                                     numbers,
                                     0,
                                 ) {
