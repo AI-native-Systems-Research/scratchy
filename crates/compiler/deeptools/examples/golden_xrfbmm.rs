@@ -41,7 +41,7 @@ use deeptools::arch::Dd2;
 use deeptools::islands::dataflow_ir::op::{Bound, Index, LocalUnit, Op, Precision, Val};
 use deeptools::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
 use deeptools::islands::dataflow_ir::{Grid, KernelName, Program, ProgramName, Run, Values, print};
-use deeptools::units::{DfirUnit, Row};
+use deeptools::units::{Core, Corelet, DfirUnit, Residency, Row};
 
 /// 🎯 THE RECONSTRUCTION MATCHES IBM'S PROGRAM, OP FOR OP — run by `cargo test`, not only by hand.
 #[test]
@@ -286,38 +286,50 @@ fn main() {
         // so dropping the ones it does not send to is a different program.
         Op::GetUnit {
             result: sfp,
-            core: 0,
-            corelet: Some(0),
+            residency: Residency::Corelet {
+                core: Core::checked(0).expect("every arch has core 0"),
+                corelet: Corelet::checked(0).expect("every arch has corelet 0"),
+            },
             unit: DfirUnit::Sfp,
         },
         Op::GetUnit {
             result: l0_lu,
-            core: 0,
-            corelet: Some(0),
+            residency: Residency::Corelet {
+                core: Core::checked(0).expect("every arch has core 0"),
+                corelet: Corelet::checked(0).expect("every arch has corelet 0"),
+            },
             unit: DfirUnit::L0lu,
         },
         Op::GetUnit {
             result: pt_0,
-            core: 0,
-            corelet: Some(0),
+            residency: Residency::Corelet {
+                core: Core::checked(0).expect("every arch has core 0"),
+                corelet: Corelet::checked(0).expect("every arch has corelet 0"),
+            },
             unit: DfirUnit::PtRow(Row::checked(0).expect("every arch has row 0")),
         },
         Op::GetUnit {
             result: pt_1,
-            core: 0,
-            corelet: Some(0),
+            residency: Residency::Corelet {
+                core: Core::checked(0).expect("every arch has core 0"),
+                corelet: Corelet::checked(0).expect("every arch has corelet 0"),
+            },
             unit: DfirUnit::PtRow(Row::checked(1).expect("every arch has row 1")),
         },
         Op::GetUnit {
             result: pt_2,
-            core: 0,
-            corelet: Some(0),
+            residency: Residency::Corelet {
+                core: Core::checked(0).expect("every arch has core 0"),
+                corelet: Corelet::checked(0).expect("every arch has corelet 0"),
+            },
             unit: DfirUnit::PtRow(Row::checked(2).expect("DD2 has eight PT rows")),
         },
         Op::GetUnit {
             result: l0_unit,
-            core: 0,
-            corelet: Some(0),
+            residency: Residency::Corelet {
+                core: Core::checked(0).expect("every arch has core 0"),
+                corelet: Corelet::checked(0).expect("every arch has corelet 0"),
+            },
             unit: DfirUnit::L0,
         },
         // L0 as a flat 1024-byte view — the module-level memory the LU streams out of.

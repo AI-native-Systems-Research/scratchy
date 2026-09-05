@@ -151,21 +151,39 @@ fn emit(out: &mut String, op: &Op, depth: usize) {
         }
         Op::GetUnit {
             result,
-            core,
-            corelet,
+            residency,
             unit,
         } => {
+            use crate::units::Residency;
+
             // Attributes are written in MLIR's own key order, which is alphabetical: core, corelet,
-            // name, type. A `corelet` is absent for an L3 unit rather than written as -1.
-            let corelet = match corelet {
-                Some(id) => format!("corelet = {id} : i32, "),
-                None => String::new(),
-            };
+            // name, type. Which of `core`/`corelet` appear is the residency's, and a missing
+            // `corelet` is a fact rather than a hole — `ExtendUnitNameToCorelet` errors on one that
+            // is absent where it needs it, and reads `0` as the name suffix `"0"`
+            // (`DataflowToSentient.cpp:104-117`).
             let spelling = unit.spelling();
+            let (attrs, name) = match residency {
+                Residency::Global => (String::new(), spelling.to_owned()),
+                Residency::Scratchpad { core } => (
+                    format!("core = {} : i32, ", core.get()),
+                    format!("C{}-{spelling}", core.get()),
+                ),
+                Residency::CoreWide { core } => (
+                    format!("core = {} : i32, corelet = 0 : i32, ", core.get()),
+                    format!("C{}-{spelling}", core.get()),
+                ),
+                Residency::Corelet { core, corelet } => (
+                    format!(
+                        "core = {} : i32, corelet = {} : i32, ",
+                        core.get(),
+                        corelet.get()
+                    ),
+                    format!("C{}-{spelling}-CL{}", core.get(), corelet.get()),
+                ),
+            };
             let _ = writeln!(
                 out,
-                "{} = dataflow.get_unit {{core = {core} : i32, {corelet}\
-                 name = \"{spelling}\", type = \"{spelling}\"}} : index",
+                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", type = \"{spelling}\"}} : index",
                 val(*result),
             );
         }
@@ -864,5 +882,113 @@ fn affine_expr(expr: &AffineExpr, parent: u8, parent_is_divlike: bool) -> String
         format!("({text})")
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Op, Val, emit};
+    use crate::units::{Core, Corelet, DfirUnit, Residency};
+
+    /// A core this build's arch has.
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("cores 0 and 1 exist on every arch this crate builds for")
+    }
+
+    /// A corelet this build's arch has.
+    fn corelet(index: u32) -> Corelet {
+        Corelet::checked(index).expect("corelets 0 and 1 exist on every arch this crate builds for")
+    }
+
+    /// ⭐⭐ IBM'S OWN UNIT BLOCK, REPRODUCED — all four residency classes, carried as TEXT rather
+    /// than as a shape.
+    ///
+    /// The nineteen lines are `/tmp/ktir_ref/export/debug/dfir.mlir:45-63`, the DataflowIR the
+    /// stock KTIR pathway produced on a two-core two-corelet run. They are the whole point of
+    /// [`Residency`]: `C0-l3lu` carries `corelet = 0`, `C0-lx` carries NO corelet, and `hbm`
+    /// carries NEITHER attribute — three distinct attribute shapes, of which the previous
+    /// `core: u32, corelet: Option<u32>` pair could spell two.
+    ///
+    /// ⛔ AN ASSERTION ON THE SHAPE WOULD NOT HAVE CAUGHT THE BUG THIS REPLACES. "The HBM line has
+    /// no `core`" passes just as well on an emitter that also drops `core` from the LX. This
+    /// compares IBM's bytes in IBM's order, so a wrong attribute set on any one of the four classes
+    /// is a diff rather than a silent agreement.
+    #[test]
+    fn reproduces_ibms_unit_block() {
+        let mut ops = Vec::new();
+        let mut next = 0u32;
+        let mut unit = |residency, unit| {
+            let op = Op::GetUnit {
+                result: Val(next),
+                residency,
+                unit,
+            };
+            next += 1;
+            ops.push(op);
+        };
+
+        // Non-parallel compute, declared in the core group: `core` AND `corelet = 0`.
+        for which in [DfirUnit::L3lu, DfirUnit::L3su] {
+            for c in 0..2 {
+                unit(Residency::CoreWide { core: core(c) }, which);
+            }
+        }
+        // Parallel compute, declared in the corelet group. Corelet-major, as IBM emits it.
+        for which in [DfirUnit::Lxlu, DfirUnit::Sfp, DfirUnit::Lxsu] {
+            for cl in 0..2 {
+                for c in 0..2 {
+                    unit(
+                        Residency::Corelet {
+                            core: core(c),
+                            corelet: corelet(cl),
+                        },
+                        which,
+                    );
+                }
+            }
+        }
+        // Then the memories: the global root first, then one scratchpad per core.
+        unit(Residency::Global, DfirUnit::Hbm);
+        for c in 0..2 {
+            unit(Residency::Scratchpad { core: core(c) }, DfirUnit::Lx);
+        }
+
+        let mut got = String::new();
+        for op in &ops {
+            emit(&mut got, op, 0);
+        }
+
+        let want = r#"%0 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l3lu", type = "l3lu"} : index
+%1 = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-l3lu", type = "l3lu"} : index
+%2 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l3su", type = "l3su"} : index
+%3 = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-l3su", type = "l3su"} : index
+%4 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-lxlu-CL0", type = "lxlu"} : index
+%5 = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-lxlu-CL0", type = "lxlu"} : index
+%6 = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-lxlu-CL1", type = "lxlu"} : index
+%7 = dataflow.get_unit {core = 1 : i32, corelet = 1 : i32, name = "C1-lxlu-CL1", type = "lxlu"} : index
+%8 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-sfp-CL0", type = "sfp"} : index
+%9 = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-sfp-CL0", type = "sfp"} : index
+%10 = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-sfp-CL1", type = "sfp"} : index
+%11 = dataflow.get_unit {core = 1 : i32, corelet = 1 : i32, name = "C1-sfp-CL1", type = "sfp"} : index
+%12 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-lxsu-CL0", type = "lxsu"} : index
+%13 = dataflow.get_unit {core = 1 : i32, corelet = 0 : i32, name = "C1-lxsu-CL0", type = "lxsu"} : index
+%14 = dataflow.get_unit {core = 0 : i32, corelet = 1 : i32, name = "C0-lxsu-CL1", type = "lxsu"} : index
+%15 = dataflow.get_unit {core = 1 : i32, corelet = 1 : i32, name = "C1-lxsu-CL1", type = "lxsu"} : index
+%16 = dataflow.get_unit {name = "hbm", type = "hbm"} : index
+%17 = dataflow.get_unit {core = 0 : i32, name = "C0-lx", type = "lx"} : index
+%18 = dataflow.get_unit {core = 1 : i32, name = "C1-lx", type = "lx"} : index
+"#;
+
+        for (at, (want_line, got_line)) in want.lines().zip(got.lines()).enumerate() {
+            assert_eq!(
+                want_line, got_line,
+                "unit line {at} diverges from IBM's own DataflowIR"
+            );
+        }
+        assert_eq!(
+            want.lines().count(),
+            got.lines().count(),
+            "emitted a different number of unit lines than IBM's block has"
+        );
     }
 }
