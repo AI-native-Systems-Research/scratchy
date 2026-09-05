@@ -39,7 +39,8 @@ use deeptools::model::Model;
 use deeptools::workload::Workload;
 
 use crate::lower_subtile_tape_to_superdsc::{
-    ActiveCap, BundleLayout, SegRole, compute_bundle_layout,
+    ActiveCap, BundleLayout, GroupKind, SegRole, Trip, TripRequest, compute_bundle_layout,
+    group_ranges, group_size,
 };
 use scratchy_spyre_bundle as bundle;
 
@@ -336,8 +337,7 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
     active_cap: ActiveCap,
     cap: u32,
     model: [u32; 7],
-    group: u32,
-) -> Result<String, DfirError> {
+) -> Result<Vec<String>, DfirError> {
     // ⛔ RESOLVED HERE, ONCE. `ActiveCap::resolve` is documented as THE ONLY place a rung becomes a
     // tile extent: NONE -> 0 (sweep no resident prefix), FULL or any out-of-range request -> the
     // bundle's whole `cap`, otherwise the request itself.
@@ -349,7 +349,12 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
     // ⛔ EVERY NODE, AND A NODE MAY BE SEVERAL PROGRAMS. The count below is per NODE, not per
     // program: `SubOp::RmsNorm` becomes six. A node that mapped to nothing is a forward silently
     // skipping work, and the emitter downstream could not tell.
+    //
+    // ⭐⭐ AND EVERY PROGRAM GETS ITS TRIP, in the same order, because the grouping below is over
+    // PROGRAMS. `trip_kinds_and_owner` classifies the SuperDSC path's emitted ops for exactly this
+    // reason: one tape node explodes into many, and the kinds distinguish AMONG them.
     let mut nodes = Vec::with_capacity(ir.nodes.len());
+    let mut trips: Vec<Trip> = Vec::with_capacity(ir.nodes.len());
     let mut mapped = 0usize;
     for node in &ir.nodes {
         let programs = expand(node, ir, &layout)?;
@@ -359,6 +364,8 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
                 node.output.tensor.index()
             )));
         }
+        let trip = trip_of(&node.op);
+        trips.extend(std::iter::repeat_n(trip, programs.len()));
         mapped += 1;
         nodes.extend(programs);
     }
@@ -368,17 +375,61 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
             ir.nodes.len()
         )));
     }
+    debug_assert_eq!(trips.len(), nodes.len(), "one trip per emitted program");
 
-    let emit = Emit {
-        nodes,
-        rows,
-        active_cap,
-        group,
+    // ⭐⭐ THE EXISTING GROUPING, CALLED — NOT A PARTITION OF OUR OWN. `group_ranges` and
+    // `group_size` are `pub` and take no `EmittedOp`; only `trip_kinds_and_owner` is that path's
+    // adapter. Its fusion rules are correctness-bearing (a distinct-slot copy must not fuse into a
+    // uniform-shift `Slot` group; `Slab`'s 8192-byte stride cannot share a group with a cachewr's
+    // 128), so they are called rather than restated.
+    //
+    // ⛔ AN EARLIER VERSION OF THIS FILE SPLIT THE ROLLED TAPE ON `OpenLoop`/`CloseLoop` INSTEAD.
+    // That is the REROLL STRUCTURE — prefix, one layer, suffix — and it is not the launch partition:
+    // it produced 3 groups for a bundle `launch_index` grouped into 1.
+    let ranges = group_ranges(&trips, group_size());
+    let mut out = Vec::with_capacity(ranges.len());
+    for (gi, range) in ranges.iter().enumerate() {
+        let emit = Emit {
+            nodes: nodes[range.clone()].to_vec(),
+            rows,
+            active_cap,
+            group: u32::try_from(gi).unwrap_or(0),
+        };
+        out.push(
+            with_config_model(
+                model[0], model[1], model[2], model[3], model[4], model[5], model[6], emit,
+            )
+            .ok_or(DfirError::UnknownModel { numbers: model })??,
+        );
+    }
+    Ok(out)
+}
+
+/// WHAT KIND OF TRIP A TAPE NODE'S PROGRAMS ARE, for [`group_ranges`].
+///
+/// ⭐ THE KINDS ARE THE SHIM'S, not a taxonomy invented here: a `Slot` trip is a cache write the
+/// runtime shifts by `slot_pos·stride` once per group, `PageFold` folds one page of resident prefix
+/// and is re-launched per page, `Slab` is the incremental Kᵀ restickify at a different stride, and
+/// `Pure` is everything the shim launches without per-entry handling.
+///
+/// ⛔ TWO OF THE SIX INPUTS THE OTHER PATH CLASSIFIES ON ARE DEAD: `host_kv_write` and
+/// `slot_no_fuse` are declared, read, and set NOWHERE (`:6100` calls the first "the host_kv_write
+/// nuke"), so `HostKv` and `SlotSolo` cannot arise there either.
+///
+/// ⛔ AND WHAT IS NOT YET DISTINGUISHED IS SAID, NOT GUESSED. Our emission does not yet produce the
+/// attention's per-page fold blocks or the slab restickify as separate programs, so no node maps to
+/// `PageFold` or `Slab`. When it does, they must be classified here — a fold block swept into a
+/// `Pure` group would be re-launched per page along with whatever it fused with.
+fn trip_of<F: RopeForm>(op: &SubOp<F>) -> Trip {
+    let kind = match op {
+        // The cache write. `RopeAppend` is what puts this step's K/V into the pool.
+        SubOp::RopeAppend { .. } => GroupKind::Slot { req: 0 },
+        _ => GroupKind::Pure,
     };
-    with_config_model(
-        model[0], model[1], model[2], model[3], model[4], model[5], model[6], emit,
-    )
-    .ok_or(DfirError::UnknownModel { numbers: model })?
+    Trip {
+        kind,
+        req: TripRequest(0),
+    }
 }
 
 /// The whole-model arm: inside it the seven numbers are literals.

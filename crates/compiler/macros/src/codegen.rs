@@ -9335,7 +9335,13 @@ fn dump_wavefront_mega(
                                          when the json omits it, so an absence here is a real gap"
                                     );
                                 }
-                                match scratchy_target_spyre::lower_subtile_tape_to_dataflow_ir::lower_subtile_tape_to_dataflow_ir(
+                                use scratchy_target_spyre::lower_subtile_tape_to_dataflow_ir as dfir;
+                                use scratchy_target_spyre::superdsc_bake as bake_q;
+
+                                // ⭐ ONE MODULE PER LAUNCH GROUP, and the groups are `group_ranges`'
+                                // — the SAME fusion walk the other path uses, not a partition
+                                // invented here.
+                                match dfir::lower_subtile_tape_to_dataflow_ir(
                                     &krg,
                                     &weight_ids,
                                     !is_prefill && decode_rows > 1,
@@ -9350,13 +9356,59 @@ fn dump_wavefront_mega(
                                     active_cap,
                                     cap,
                                     numbers,
-                                    0,
                                 ) {
-                                    Ok(mlir) => eprintln!(
-                                        "[spyre-dfir] {base}: tape -> DataflowIR OK ({} bytes, {} nodes)",
-                                        mlir.len(),
-                                        krg.nodes.len()
-                                    ),
+                                    Ok(groups) => {
+                                        eprintln!(
+                                            "[spyre-dfir] {base}: {} nodes -> {} launch group(s)",
+                                            krg.nodes.len(),
+                                            groups.len()
+                                        );
+                                        for (gi, mlir) in groups.iter().enumerate() {
+                                            // ⛔⛔ THROUGH THE BAKE, NEVER A PLAIN WRITE. The queue
+                                            // owns the BLOCKING disk bound (`reserve` waits at
+                                            // MAX_STAGED_BYTES), the compile queue (COMPILE_WIDTH),
+                                            // memoization on the content key, and deletion of the
+                                            // staging dir once compiled. A direct write bypasses all
+                                            // four and leaves megabytes on disk, never compiled,
+                                            // reading exactly like progress.
+                                            let Some(q) = bake_q::global() else { break };
+                                            let key = {
+                                                use std::hash::{Hash as _, Hasher as _};
+                                                let mut h =
+                                                    std::collections::hash_map::DefaultHasher::new(
+                                                    );
+                                                mlir.as_bytes().hash(&mut h);
+                                                h.finish()
+                                            };
+                                            let gdir = q.stage().group_dir(&base, gi);
+                                            q.reserve(mlir.len());
+                                            let staged =
+                                                std::fs::create_dir_all(&gdir).and_then(|()| {
+                                                    std::fs::write(
+                                                        gdir.join(bake_q::PROGRAM_FILE),
+                                                        mlir,
+                                                    )
+                                                });
+                                            if let Err(e) = staged {
+                                                eprintln!("[spyre-dfir] {base} g{gi}: stage: {e}");
+                                                break;
+                                            }
+                                            if let Err(e) = q.submit(bake_q::SealedGroup::sealed(
+                                                gdir,
+                                                bake_q::GroupId {
+                                                    fp: base.clone(),
+                                                    group: u32::try_from(gi).unwrap_or(0),
+                                                },
+                                                mlir.len(),
+                                                key,
+                                            )) {
+                                                eprintln!(
+                                                    "[spyre-dfir] {base} g{gi}: dbo-opt: {e}"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
                                     Err(e) => eprintln!("[spyre-dfir] {base}: {e}"),
                                 }
                             }
