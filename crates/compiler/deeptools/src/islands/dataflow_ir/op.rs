@@ -339,10 +339,23 @@ pub enum Op {
 
     /// `dataflow.get_unit {core, corelet, name, type} : index`.
     ///
-    /// ⛔ `name` AND `type` ARE THE SAME STRING, so there is one field. `createGetUnitOp` passes
-    /// `senComponentsToString.at(comp)` as both (`DSC2ToDataflowIRUtils.hpp:69-73`), which is what
-    /// `dcc/test/Conversion/DataflowToSentient/opaque.mlir` shows: `{name = "pe", type = "pe"}`. The
-    /// `C0-CL0-PT-0` names in the hand-written PT tests are not what the translator emits.
+    /// ⛔⛔ `type` IS LOAD-BEARING AND `name` IS NOT — THEY ARE NOT THE SAME STRING. Only
+    /// `StrAttr:$name` and `StrAttr:$type` are declared arguments (`Dataflow.td`, `get_unit`);
+    /// `core` and `corelet` ride through as discardable attributes on `attr-dict`. Downstream
+    /// identity is taken from `getType()`, the `type` attribute
+    /// (`DataflowToSentient.cpp:119-130`), and that string is then fed to
+    /// `symbolizeSentientLoadConsumer(..).value()` — which **aborts** on a spelling outside the
+    /// sixteen-member `SentientLoadConsumer` set (`SentientTypes.td:556-593`). So `type` is a
+    /// censused token, never free text.
+    ///
+    /// ⭐ THE `name` FOLLOWS THE SCHEDULER'S CONVENTION, `C{core}-{tag}[-CL{corelet}]`, which is
+    /// what IBM's own DataflowIR carries (`/tmp/ktir_ref/export/debug/dfir.mlir:45-63`) and what
+    /// `UnitMaterializer.cpp:53-159` writes. The ddc translator instead passes
+    /// `senComponentsToString.at(comp)` as BOTH name and type
+    /// (`DSC2ToDataflowIRUtils.hpp:69-73`, and `dcc/test/Conversion/DataflowToSentient/opaque.mlir`
+    /// shows `{name = "pe", type = "pe"}`) — two producers, two conventions. No consumer reading
+    /// `name` was found, so this matches the producer whose output the entry point we entered by
+    /// was built to accept.
     ///
     /// ⛔ AND THE UNIT IS A [`DfirUnit`], NOT A TEMPLATE [`Unit`]. DataflowIR binds units the `.ddl`
     /// vocabulary has no `unit=` spelling for — `lx`, `l3lu`, `l3su` — and names each PT ROW rather
@@ -350,12 +363,13 @@ pub enum Op {
     GetUnit {
         /// The handle it binds.
         result: Val,
-        /// `core=`.
-        core: u32,
-        /// `corelet=`, absent for an L3 unit, which is shared across a core's corelets
-        /// (`DSC2ToDataflowIRUtils.hpp:79-80`).
-        corelet: Option<u32>,
-        /// `name=` and `type=`.
+        /// WHERE THE UNIT LIVES, which decides both attributes and the name.
+        ///
+        /// ⛔ THIS WAS `core: u32` PLUS `corelet: Option<u32>` AND THAT PAIR COULD NOT SPELL A
+        /// GLOBAL UNIT — `core` was mandatory, so the HBM, which carries neither attribute, had no
+        /// representation. See [`crate::units::Residency`].
+        residency: crate::units::Residency,
+        /// `type=`.
         unit: crate::units::DfirUnit,
     },
 

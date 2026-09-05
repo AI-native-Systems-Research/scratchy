@@ -78,6 +78,68 @@ impl<const CORELETS: u32> CoreletId<CORELETS> {
     }
 }
 
+/// WHERE A UNIT LIVES — and therefore how many of it exist, what it is called, and which of the
+/// `core`/`corelet` attributes it carries.
+///
+/// ⛔⛔ FOUR CASES, NOT A CORE PLUS AN OPTIONAL CORELET. This was `core: u32, corelet: Option<u32>`,
+/// which can spell three of the four and **cannot spell the first at all** — a global memory has
+/// neither attribute, and `core` was not optional. That is not a cosmetic gap: it is why every
+/// operand ended up addressed into an LX that nothing fills. A unit vocabulary that cannot name the
+/// HBM cannot put a weight there.
+///
+/// ⛔ AND THE FOURTH IS NOT THE THIRD. `C0-lx` carries `core` and NO `corelet`, while `C0-l3lu`
+/// carries `core` AND `corelet = 0` (`/tmp/ktir_ref/export/debug/dfir.mlir:45-63`, and
+/// `UnitMaterializer.cpp:62-80` against `:142-152`). The distinction is load-bearing downstream:
+/// `ExtendUnitNameToCorelet` treats a MISSING `corelet` as a hard error and turns `corelet = 0` into
+/// the name suffix `"0"` — so `type = "lxlu"` with `corelet = 1` is what becomes
+/// `SentientLoadConsumer::lxlu1` (`DataflowToSentient.cpp:104-117`). Emitting `corelet = 0` for a
+/// scratchpad would take a different branch in the consumer.
+///
+/// ⭐ THE CLASSIFICATION IS POSITIONAL IN THE MEMORY TREE, NOT A NAME TEST: global is a ROOT node,
+/// per-core scratchpad is a node at DEPTH 1 (`MemoryTree.cpp:492-544`). For Spyre DD2 the root is
+/// `%dram = memory #HBM` (16 GiB) and depth 1 is `%lx = memory #LX` (2 MiB)
+/// (`sys-arch-spec/KTDFArchGraphDevice/spyre_dd2_basic.mlir:5-13,69-76`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// A ROOT of the memory tree: ONE for the whole device, named by its tag alone, carrying
+    /// NEITHER attribute (`UnitMaterializer.cpp:136-141`, keyed `{space, -1}`).
+    Global,
+    /// A memory at depth 1: one per core, `C{core}-{tag}`, `core` and no `corelet`
+    /// (`UnitMaterializer.cpp:142-152`).
+    Scratchpad {
+        /// Which core's scratchpad.
+        core: Core,
+    },
+    /// A compute unit declared in the `group { kind = "core" }` and so shared across that core's
+    /// corelets — `C{core}-{tag}` with `core` AND `corelet = 0`
+    /// (`UnitMaterializer.cpp:62-80`). The L3 halves are the case.
+    CoreWide {
+        /// Which core.
+        core: Core,
+    },
+    /// A compute unit declared in the `group { kind = "corelet" }`: one per corelet per core,
+    /// `C{core}-{tag}-CL{corelet}` (`UnitMaterializer.cpp:82-115`).
+    Corelet {
+        /// Which core.
+        core: Core,
+        /// Which of that core's corelets.
+        corelet: Corelet,
+    },
+}
+
+impl Residency {
+    /// WHICH CORE, or `None` for a unit the whole device shares.
+    #[must_use]
+    pub const fn core(self) -> Option<Core> {
+        match self {
+            Self::Global => None,
+            Self::Scratchpad { core } | Self::CoreWide { core } | Self::Corelet { core, .. } => {
+                Some(core)
+            }
+        }
+    }
+}
+
 /// HOW MANY FOLDS a `dataflow.get_unit` produces results for.
 ///
 /// ⛔ IT IS THE OP'S RESULT COUNT, NOT DECORATION. `get_unit` is `Variadic<Index>` with "each return
@@ -222,6 +284,19 @@ pub enum DfirUnit {
     Lxsu,
     /// `lx` — the LX memory itself, which a view is taken over.
     Lx,
+    /// `hbm` — the device's global memory, which a view is taken over.
+    ///
+    /// ⛔⛔ THIS WAS MISSING AND ITS ABSENCE WAS THE WHOLE DEFECT. The subset below was censused
+    /// from what `buildNeighborUnits` binds, and the HBM is never a *neighbour* — nothing sends to
+    /// it directly; the L3 halves move data across the `%dram <-> %l3lu` / `%l3su <-> %dram`
+    /// datapaths (`spyre_dd2_basic.mlir:82-85`). It belongs here for the same reason [`Self::Lx`]
+    /// does: it is a memory a view is TAKEN OVER. With no variant for it the emitter could not put
+    /// a weight anywhere but the LX, so every operand got an LX address nothing ever filled.
+    ///
+    /// `SenComponents::HBM` spells `"hbm"` (`sys-arch-spec/arch_enums.cpp:14`), which is what IBM's
+    /// own DataflowIR carries: `{name = "hbm", type = "hbm"}` with no `core` and no `corelet`
+    /// (`/tmp/ktir_ref/export/debug/dfir.mlir:61`).
+    Hbm,
     /// `l0lu`.
     L0lu,
     /// `l0su`.
@@ -250,13 +325,16 @@ impl DfirUnit {
         matches!(self, Self::PtRow(_))
     }
 
-    /// The `type=`/`name=` this unit is bound with — `senComponentsToString`
+    /// The `type=` this unit is bound with — `senComponentsToString`
     /// (`sys-arch-spec/arch_enums.cpp:11-120`).
     ///
-    /// ⛔ `name` AND `type` ARE THE SAME STRING. `createGetUnitOp` passes
-    /// `senComponentsToString.at(comp)` as both (`DSC2ToDataflowIRUtils.hpp:69-73`), which is what
-    /// `dcc/test/Conversion/DataflowToSentient/opaque.mlir` shows: `{name = "pe", type = "pe"}`. The
-    /// `C0-CL0-PT-0` names in the hand-written PT tests are not what the translator emits.
+    /// ⛔ LOWERCASE, ALWAYS. `unitTypeTag` lowercases every tag because "DFIR code generation
+    /// requires lowercase" (`UnitMaterializer.cpp:34-51`). The `type = "L1LU"` in `Dataflow.td`'s
+    /// illustrative example is not what any emitter writes.
+    ///
+    /// ⛔ AND THIS IS THE `type`, NOT THE `name`. The `name` carries the residency prefix
+    /// (`C0-sfp-CL1`); this is the bare tag the consumer matches on. See [`super::islands`]'
+    /// `Op::GetUnit` for why only one of the two is load-bearing.
     #[must_use]
     pub const fn spelling(self) -> &'static str {
         match self {
@@ -275,6 +353,7 @@ impl DfirUnit {
             Self::Lxlu => "lxlu",
             Self::Lxsu => "lxsu",
             Self::Lx => "lx",
+            Self::Hbm => "hbm",
             Self::L0lu => "l0lu",
             Self::L0su => "l0su",
             Self::L0 => "l0",
@@ -354,7 +433,8 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
             units
         }
         // Memories and sources, not units that run a program of their own.
-        DfirUnit::Lx
+        DfirUnit::Hbm
+        | DfirUnit::Lx
         | DfirUnit::L0
         | DfirUnit::L3lu
         | DfirUnit::L3su
