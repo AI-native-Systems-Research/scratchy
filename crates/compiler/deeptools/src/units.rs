@@ -511,9 +511,12 @@ pub fn dfir_units(of: Unit) -> Vec<DfirUnit> {
         Unit::Constant => vec![DfirUnit::Constant],
         Unit::Sfpring => vec![DfirUnit::SfpRing],
         // The spans, and the singletons that are still written as one.
-        Unit::Pt | Unit::Ptrow0 | Unit::Ptrow3 | Unit::Ptrow7 | Unit::Ptrow1To3 | Unit::Ptrow1To7 => {
-            rows_of(of).into_iter().map(DfirUnit::PtRow).collect()
-        }
+        Unit::Pt
+        | Unit::Ptrow0
+        | Unit::Ptrow3
+        | Unit::Ptrow7
+        | Unit::Ptrow1To3
+        | Unit::Ptrow1To7 => rows_of(of).into_iter().map(DfirUnit::PtRow).collect(),
         // A direction, resolved by the row that asks. See above.
         Unit::Ptnorth | Unit::Ptsouth => Vec::new(),
     }

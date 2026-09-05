@@ -293,31 +293,33 @@ impl SealedGroup {
     }
 }
 
-/// The device compiler, RESOLVED. Constructible only when both the binary and the SDK share dir it
-/// needs are present, so "can this build compile a bundle?" is an `Option<DboTool>` rather than a
-/// pair of strings someone checks at the call site.
+/// The device compiler, RESOLVED. Constructible only when the binary is present, so "can this build
+/// compile a bundle?" is an `Option<DboTool>` rather than a string someone checks at the call site.
 #[derive(Clone, Debug)]
 pub struct DboTool {
     bin: PathBuf,
-    deeptools: PathBuf,
 }
 
 impl DboTool {
-    /// `$DBO_OPT`, else the `bin` sibling of `$DEEPTOOLS_PATH`'s share dir, else the on-pod
-    /// default. `None` when either piece is missing, which is every cardless build.
+    /// `$DBO_OPT`, else the on-pod default. `None` when it is missing, which is every cardless build.
+    ///
+    /// ⛔⛔ NO `DEEPTOOLS_PATH`, AND THAT IS NOT A SHORTCUT. This used to require it — the SDK's data
+    /// root — and refuse to resolve without it, which made the DataflowIR path depend on a
+    /// deeptools SOURCE/SHARE tree being installed. It is not needed: `DEEPTOOLS_PATH` has exactly
+    /// one reader, `defaultDeviceFile()` (`dbo/src/Pipeline/Pipeline.cpp:31-41`), and that is
+    /// consulted solely by `EnsureDeviceDeclaration`, which sits INSIDE the `if (from_ktir)` branch
+    /// (`Pipeline.cpp:136-155`). The `--from-dfir` pathway never reaches it.
+    ///
+    /// ⭐ VERIFIED, NOT INFERRED: `env -u DEEPTOOLS_PATH dbo-opt --from-dfir -kEmitSpyreCode
+    /// --export-dir=<g> <g>/group.mlir` exits 0 and writes `init_binary.bin` + `spyrecode.json`.
+    /// (That run's INPUT was IBM's own reference DataflowIR, so it establishes what the TOOL needs
+    /// and nothing about what we emit.)
     pub fn resolve() -> Option<DboTool> {
-        let deeptools = PathBuf::from(std::env::var("DEEPTOOLS_PATH").ok()?);
-        if !deeptools.exists() {
-            return None;
-        }
         let bin = match std::env::var("DBO_OPT") {
             Ok(p) => PathBuf::from(p),
-            Err(_) => deeptools
-                .parent()
-                .map(|sdk| sdk.join("bin").join("dbo-opt"))
-                .unwrap_or_else(|| PathBuf::from("/opt/ibm/spyre/deeptools/bin/dbo-opt")),
+            Err(_) => PathBuf::from("/opt/ibm/spyre/deeptools/bin/dbo-opt"),
         };
-        bin.exists().then_some(DboTool { bin, deeptools })
+        bin.exists().then_some(DboTool { bin })
     }
 
     /// Compile ONE group dir in place. `Ok(())` leaves `spyreCodeDir/{init_binary.bin,
@@ -338,7 +340,6 @@ impl DboTool {
             .arg("-kEmitSpyreCode")
             .arg(format!("--export-dir={}", group.display()))
             .arg(group.join(PROGRAM_FILE))
-            .env("DEEPTOOLS_PATH", &self.deeptools)
             .output()
             .map_err(|e| format!("spawn {}: {e}", self.bin.display()))?;
         let marker = group.join("spyreCodeDir").join("spyrecode.json");
@@ -723,8 +724,8 @@ pub fn global() -> Option<&'static Bake> {
 ///
 /// 🛑 WHY IT WAS SILENT, TWICE OVER. The `None` arm was DESIGNED for the cardless laptop (`cargo check`),
 /// so it is the default rather than a stated intent; and a build script's stderr is swallowed by cargo, so
-/// even a warning would not have reached the build log. The image build then set `DEEPTOOLS_PATH` in its
-/// RUNTIME stage but not in the stage that runs `cargo build`, and there was nothing anywhere to say so.
+/// even a warning would not have reached the build log. The image build then set the compiler's location in
+/// its RUNTIME stage but not in the stage that runs `cargo build`, and there was nothing anywhere to say so.
 ///
 /// So: FAIL, naming the variable and the stage. A host that genuinely has no card must say so on purpose
 /// via `SCRATCHY_PLAN_ONLY_BAKE=1` — which is a claim about the machine, not a fallback the build picks by
@@ -734,15 +735,15 @@ fn no_compiler_or_die() {
         return;
     }
     panic!(
-        "bake: no device compiler — `DBO_OPT` and `DEEPTOOLS_PATH` are both unset, or `dbo-opt` is \
+        "bake: no device compiler — `DBO_OPT` is unset and `/opt/ibm/spyre/deeptools/bin/dbo-opt` is \
          missing, so this bundle would be emitted as a memory PLAN WITH NO DEVICE PROGRAMS. That binary \
          links and serves: every session reports ready, nothing is ever launched, and every completion \
          comes back EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere. Refusing \
          to build it.\n\
          \n\
-         • Point `DBO_OPT` at the `dbo-opt` binary, or set `DEEPTOOLS_PATH` so `../bin/dbo-opt` \
-         resolves, in the stage that runs `cargo build` — in a Dockerfile that is the BUILD stage, not \
-         the runtime stage. Setting it only at runtime is exactly this failure.\n\
+         • Point `DBO_OPT` at the `dbo-opt` binary in the stage that runs `cargo build` — in a \
+         Dockerfile that is the BUILD stage, not the runtime stage. Setting it only at runtime is \
+         exactly this failure.\n\
          • Or, on a machine that truly has no card and only needs a type-check, state it: \
          `SCRATCHY_PLAN_ONLY_BAKE=1`."
     );

@@ -119,21 +119,47 @@ fn dispatch<A: Arch, M: Model, W: Workload>(
     group: GroupId,
     counts: Counts,
 ) -> Result<Run<A>, TapeError> {
-    macro_rules! cache { ($d:literal, $f:literal, $s:literal, $k:literal) => {
-        if Exploit::<A, M, W>::CACHE_FITS_LX { emit::<A, $d, $f, $s, $k, true>(tape, group, counts) }
-        else { emit::<A, $d, $f, $s, $k, false>(tape, group, counts) }
-    }; }
-    macro_rules! kv { ($d:literal, $f:literal, $s:literal) => {
-        if Exploit::<A, M, W>::NO_CACHE_WALK { cache!($d, $f, $s, true) }
-        else { cache!($d, $f, $s, false) }
-    }; }
-    macro_rules! stick { ($d:literal, $f:literal) => {
-        if Exploit::<A, M, W>::STICK_ALIGNED { kv!($d, $f, true) } else { kv!($d, $f, false) }
-    }; }
-    macro_rules! lx { ($d:literal) => {
-        if Exploit::<A, M, W>::FITS_LX { stick!($d, true) } else { stick!($d, false) }
-    }; }
-    if Exploit::<A, M, W>::IS_DECODE { lx!(true) } else { lx!(false) }
+    macro_rules! cache {
+        ($d:literal, $f:literal, $s:literal, $k:literal) => {
+            if Exploit::<A, M, W>::CACHE_FITS_LX {
+                emit::<A, $d, $f, $s, $k, true>(tape, group, counts)
+            } else {
+                emit::<A, $d, $f, $s, $k, false>(tape, group, counts)
+            }
+        };
+    }
+    macro_rules! kv {
+        ($d:literal, $f:literal, $s:literal) => {
+            if Exploit::<A, M, W>::NO_CACHE_WALK {
+                cache!($d, $f, $s, true)
+            } else {
+                cache!($d, $f, $s, false)
+            }
+        };
+    }
+    macro_rules! stick {
+        ($d:literal, $f:literal) => {
+            if Exploit::<A, M, W>::STICK_ALIGNED {
+                kv!($d, $f, true)
+            } else {
+                kv!($d, $f, false)
+            }
+        };
+    }
+    macro_rules! lx {
+        ($d:literal) => {
+            if Exploit::<A, M, W>::FITS_LX {
+                stick!($d, true)
+            } else {
+                stick!($d, false)
+            }
+        };
+    }
+    if Exploit::<A, M, W>::IS_DECODE {
+        lx!(true)
+    } else {
+        lx!(false)
+    }
 }
 
 /// THE EMITTER, at one combination of the five decisions.
