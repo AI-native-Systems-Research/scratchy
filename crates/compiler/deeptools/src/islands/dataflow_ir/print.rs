@@ -7,8 +7,10 @@
 use std::fmt::Write as _;
 
 use crate::generated::{ParamKey, ParamValue, RegName};
-use crate::islands::dataflow_ir::op::{Bound, Index, LogicKind, Op, Precision, RegAddr, Val};
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
+use crate::islands::dataflow_ir::op::{
+    Bound, CompositeTransfer, Index, LogicKind, Op, Precision, RegAddr, Val,
+};
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, IntegerSet, MemRef, Vector};
 use crate::islands::dataflow_ir::{Grid, Program, Run};
 
 /// A WHOLE RUN AS ONE MLIR MODULE — the shape `dbo-adapt-scheduler-dfir` consumes.
@@ -363,6 +365,68 @@ fn emit(out: &mut String, op: &Op, depth: usize) {
                 memref(view_ty),
                 vector(*ty)
             );
+        }
+        Op::CompositeLoadAndStore(transfer) => {
+            let CompositeTransfer {
+                src,
+                src_indices,
+                src_ty,
+                dst,
+                dst_indices,
+                dst_ty,
+                load_iv,
+                load_iv_ty,
+                load_set,
+                load_order,
+                store_set,
+                store_order,
+                time_set,
+                time_order,
+                load_time_addr_map,
+                store_time_addr_map,
+                body,
+            } = transfer.as_ref();
+            // Three lines, as the scheduler writes it: the two accesses, then the induction
+            // variable, then the attributes — alphabetical, which puts the load trio first.
+            let _ = writeln!(
+                out,
+                "agen.composite_load_and_store src:{}[{}] dst:{}[{}]",
+                val(*src),
+                index_list(src_indices),
+                val(*dst),
+                index_list(dst_indices),
+            );
+            indent(out, depth);
+            let _ = writeln!(
+                out,
+                " time_symbols(), load_iv({}:{})",
+                val(*load_iv),
+                vector(*load_iv_ty)
+            );
+            indent(out, depth);
+            let _ = writeln!(
+                out,
+                " {{load_order = {}, load_set = {}, load_time_addr_map = {}, store_order = {}, \
+                 store_set = {}, store_time_addr_map = {}, time_order = {}, time_set = {}}}",
+                affine_map(load_order),
+                integer_set(load_set),
+                affine_map(load_time_addr_map),
+                affine_map(store_order),
+                integer_set(store_set),
+                affine_map(store_time_addr_map),
+                affine_map(time_order),
+                integer_set(time_set),
+            );
+            indent(out, depth);
+            out.push_str("{\n");
+            for inner in body {
+                emit(out, inner, depth + 1);
+            }
+            indent(out, depth);
+            let _ = writeln!(out, "}} : {}, {}", memref(src_ty), memref(dst_ty));
+        }
+        Op::AgenYield => {
+            out.push_str("agen.yield\n");
         }
         Op::AgenVectorStore {
             value,
@@ -813,7 +877,7 @@ fn elem(ty: ElemType) -> String {
     }
 }
 
-fn affine_map(map: &AffineMap) -> String {
+pub(crate) fn affine_map(map: &AffineMap) -> String {
     let dims = (0..map.dims)
         .map(|d| format!("d{d}"))
         .collect::<Vec<_>>()
@@ -825,6 +889,24 @@ fn affine_map(map: &AffineMap) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("affine_map<({dims}) -> ({results})>")
+}
+
+/// `affine_set<(d0, ..) : (c, ..)>` — the constraints in the order they were built.
+pub(crate) fn integer_set(set: &IntegerSet) -> String {
+    let dims = (0..set.dims)
+        .map(|d| format!("d{d}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let constraints = set
+        .constraints
+        .iter()
+        .map(|c| {
+            let relation = if c.is_equality { "== 0" } else { ">= 0" };
+            format!("{} {relation}", affine_expr(&c.expr, 0, false))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("affine_set<({dims}) : ({constraints})>")
 }
 
 /// BINDING POWER, so the printed map is the one MLIR would print.
@@ -861,6 +943,13 @@ fn affine_expr(expr: &AffineExpr, parent: u8, parent_is_divlike: bool) -> String
             affine_expr(a, own, false),
             affine_expr(b, own, false)
         ),
+        // ⛔ TIMES MINUS ONE IS A NEGATION, NOT A PRODUCT. MLIR prints `-d2 + 63`, never
+        // `d2 * -1 + 63`, and the upper half of every spanning constraint an `affine_set` carries
+        // is exactly that shape (`#set`, `#set1`, `#set3` of the reference DataflowIR). Printing
+        // the product makes every one of them a spurious diff against a vendored file.
+        AffineExpr::Mul(a, b) if matches!(**b, AffineExpr::Const(-1)) => {
+            format!("-{}", affine_expr(a, 2, false))
+        }
         AffineExpr::Mul(a, b) => format!(
             "{} * {}",
             affine_expr(a, own, false),
@@ -898,6 +987,87 @@ mod tests {
     /// A corelet this build's arch has.
     fn corelet(index: u32) -> Corelet {
         Corelet::checked(index).expect("corelets 0 and 1 exist on every arch this crate builds for")
+    }
+
+    /// ⭐⭐ THE HBM-TO-LX TRANSFER, AS THE REFERENCE WRITES IT.
+    ///
+    /// `/tmp/ktir_ref/export/debug/dfir.mlir:78-84` moves a `memref<12x64x64xf16>` view of the HBM
+    /// into a `memref<2x2x1x1x64xf16>` view of the LX, one 64-lane vector per time step. This is
+    /// the op whose ABSENCE was the defect: without it a program holds an LX address and nothing
+    /// ever puts a weight behind it.
+    ///
+    /// ⛔ THE ATTRIBUTES ARE INLINED, NOT ALIASED. The reference writes `load_order = #map2` and
+    /// declares `#map2` in a preamble; MLIR accepts either, and this printer has no alias table. So
+    /// the comparison below is against the reference's attributes SPELLED OUT — same maps, same
+    /// sets, same order — rather than against its `#map` names.
+    #[test]
+    fn prints_the_hbm_to_lx_transfer() {
+        use crate::bridges::subtile_to_dataflow_ir::transfer::{Lanes, plan};
+        use crate::islands::dataflow_ir::op::{CompositeTransfer, Index};
+        use crate::islands::dataflow_ir::ty::{ElemType, MemRef, Vector};
+
+        let planned = plan(&[1, 1, 64], &[1, 1, 1, 1, 64], 64, Lanes::F16)
+            .expect("one 64-lane vector is the unsplit case");
+
+        let op = Op::CompositeLoadAndStore(Box::new(CompositeTransfer {
+            src: Val(21),
+            src_indices: vec![Index::Val(Val(1)), Index::Val(Val(4)), Index::Const(0)],
+            src_ty: MemRef {
+                shape: vec![12, 64, 64],
+                elem: ElemType::F16,
+            },
+            dst: Val(27),
+            dst_indices: vec![
+                Index::Const(0),
+                Index::Const(0),
+                Index::Const(0),
+                Index::Const(0),
+                Index::Const(0),
+            ],
+            dst_ty: MemRef {
+                shape: vec![2, 2, 1, 1, 64],
+                elem: ElemType::F16,
+            },
+            load_iv: Val(9),
+            load_iv_ty: Vector {
+                len: planned.vector_lanes,
+                elem: ElemType::F16,
+            },
+            load_set: planned.load_set,
+            load_order: planned.load_order,
+            store_set: planned.store_set,
+            store_order: planned.store_order,
+            time_set: planned.time_set,
+            time_order: planned.time_order,
+            load_time_addr_map: planned.load_time_addr_map,
+            store_time_addr_map: planned.store_time_addr_map,
+            body: vec![Op::AgenYield],
+        }));
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        let want = "\
+agen.composite_load_and_store src:%21[%1, %4, 0] dst:%27[0, 0, 0, 0, 0]
+ time_symbols(), load_iv(%9:vector<64xf16>)
+ {load_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, \
+load_set = affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>, \
+load_time_addr_map = affine_map<(d0) -> (0, 0, 0)>, \
+store_order = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>, \
+store_set = affine_set<(d0, d1, d2, d3, d4) : (d0 == 0, d1 == 0, d2 == 0, d3 == 0, d4 >= 0, \
+-d4 + 63 >= 0)>, \
+store_time_addr_map = affine_map<(d0) -> (0, 0, 0, 0, 0)>, \
+time_order = affine_map<(d0) -> (d0)>, \
+time_set = affine_set<(d0) : (d0 == 0)>}
+{
+  agen.yield
+} : memref<12x64x64xf16>, memref<2x2x1x1x64xf16>
+";
+
+        for (at, (want_line, got_line)) in want.lines().zip(got.lines()).enumerate() {
+            assert_eq!(want_line, got_line, "transfer line {at} diverges");
+        }
+        assert_eq!(want.lines().count(), got.lines().count());
     }
 
     /// ⭐⭐ IBM'S OWN UNIT BLOCK, REPRODUCED — all four residency classes, carried as TEXT rather

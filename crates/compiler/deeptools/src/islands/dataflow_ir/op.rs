@@ -9,7 +9,7 @@
 //! ladder from where this crate stands.
 
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName, SyncSignal};
-use crate::islands::dataflow_ir::ty::{AffineMap, MemRef, Vector};
+use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet, MemRef, Vector};
 
 /// WHERE ONE OF AN OPAQUE'S REGISTERS LIVES — the value its name binds to.
 ///
@@ -113,6 +113,48 @@ impl Precision {
             Self::Fp32 => "fp32",
         }
     }
+}
+
+/// A `composite_load_and_store`'s operands and attributes.
+///
+/// See [`Op::CompositeLoadAndStore`] for what the op means and why it is the thing that gets a
+/// weight out of the HBM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeTransfer {
+    /// The view read from.
+    pub src: Val,
+    /// Its subscript.
+    pub src_indices: Vec<Index>,
+    /// Its type.
+    pub src_ty: MemRef,
+    /// The view written to.
+    pub dst: Val,
+    /// Its subscript.
+    pub dst_indices: Vec<Index>,
+    /// Its type.
+    pub dst_ty: MemRef,
+    /// The block argument carrying the vector loaded at each time step.
+    pub load_iv: Val,
+    /// That vector's type — ONE hardware vector, never the whole transfer.
+    pub load_iv_ty: Vector,
+    /// Which elements form each loaded vector.
+    pub load_set: IntegerSet,
+    /// How those elements are packed.
+    pub load_order: AffineMap,
+    /// Which elements form each stored vector.
+    pub store_set: IntegerSet,
+    /// How those are packed.
+    pub store_order: AffineMap,
+    /// The time steps the transfer takes — a single pinned step when it fits in one vector.
+    pub time_set: IntegerSet,
+    /// The order among them.
+    pub time_order: AffineMap,
+    /// The source offset at each time step, one result per source dimension.
+    pub load_time_addr_map: AffineMap,
+    /// The destination offset at each time step, one result per destination dimension.
+    pub store_time_addr_map: AffineMap,
+    /// The region, entered once per time step.
+    pub body: Vec<Op>,
 }
 
 /// ONE INDEX OF A LOAD OR STORE: an induction variable, an applied map, or a literal.
@@ -556,6 +598,32 @@ pub enum Op {
         /// The vector's type.
         ty: Vector,
     },
+
+    /// `agen.composite_load_and_store src:%s[..] dst:%d[..] time_symbols(), load_iv(%v:vector<..>)
+    /// {..} { .. } : memref<..>, memref<..>`.
+    ///
+    /// ⭐⭐ THIS IS HOW A WEIGHT LEAVES THE HBM. A view is only an address; nothing crosses a
+    /// datapath until a transfer says so. The device declares the route explicitly —
+    /// `datapath %dram to %l3lu` then `datapath #L3LU_LX %l3lu to %lx`
+    /// (`spyre_dd2_basic.mlir:82-83`) — and this op is what runs it. Emitting the compute against
+    /// an LX view with no transfer into it is a program that reads memory nothing ever filled.
+    ///
+    /// ⛔⛔ AT MOST ONE HARDWARE VECTOR PER TIME STEP. "An AGEN composite transfer moves at most one
+    /// hardware vector per time step, so a transfer wider than that has to walk the remaining
+    /// elements over AGEN time dimensions instead of widening `load_iv`"
+    /// (`DataTransferLowering.cpp:306-310`). The walk is what [`time_set`](Self::CompositeLoadAndStore::time_set)
+    /// and the two `*_time_addr_map`s describe; see
+    /// [`crate::bridges::subtile_to_dataflow_ir::transfer`], which computes them.
+    ///
+    /// ⛔ THE REGION IS ENTERED ONCE PER TIME STEP and its block argument carries the vector loaded
+    /// at that step. A plain memory-to-memory move yields immediately; a transfer that also sends
+    /// the value onward puts that in the body.
+    /// ⛔ BOXED, because it carries four affine maps, four integer sets and two subscripts, and an
+    /// enum is as large as its largest variant. Every other op in this IR is a handful of words.
+    CompositeLoadAndStore(Box<CompositeTransfer>),
+
+    /// `agen.yield` — the terminator of a composite transfer's region.
+    AgenYield,
 
     /// `agen.vector_store %value, %view[..] {store_order, store_set} : memref<..>, vector<..>`.
     ///
