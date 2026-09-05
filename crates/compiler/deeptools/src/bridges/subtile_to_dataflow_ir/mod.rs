@@ -8,5 +8,11 @@
 //! extents and a vector width, so it can be checked against IBM's own DataflowIR without a tape.
 //! The tape-facing half comes next.
 
+/// One node of the tape, in a vocabulary this crate can name.
+pub mod node;
+
+/// The whole forward tape, compiled.
+pub mod tape;
+
 /// How a transfer is walked over the AGEN time axis.
 pub mod transfer;
