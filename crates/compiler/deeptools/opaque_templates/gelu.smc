@@ -1,0 +1,16 @@
+/// instr_count:10
+LOGICAL  mask=255 src0=in0 imm=1 src2=0.0 tgtrf=p0_0 unrlfldtgt=1 unroll=unroll
+// x^3
+FMUL     mask=255 src0=p0_0 src1=p0_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL     mask=255 src0=p0_0 src1=t0_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMUL     mask=255 src0=p0_0 src1=c1 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+// A1*x + A2*x^3
+FMA      mask=255 src0=t0_0 src1=c2 src2=t1_0  tgtrf=p0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+// tanh (A1*x + A2*x^3)
+FEST mask=255 src0=p0_0 imm=8 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FEST mask=255 src0=p0_0 imm=9 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mode=prec
+FMA  mask=255 src0=p0_0 src1=t0_0 src2=t1_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mode=prec
+// 0.5x
+FMUL     mask=255 src0=in0 src1=1.0 src2=muldiv2 tgtrf=t1_0 unrlfldtgt=1 unroll=unroll
+// 0.5x + 0.5x * tanh(A1*x + A2*x^3)
+FMA mask=255 src0=t0_0 src1=t1_0 src2=t1_0 tgtencoding=lx fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldsrc2=1 unroll=unroll mode=prec

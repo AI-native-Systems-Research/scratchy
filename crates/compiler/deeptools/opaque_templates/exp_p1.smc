@@ -1,0 +1,15 @@
+///instr_count:7
+/// @RegInit:c0:"0x46dc46dc46dc46dc46dc46dc46dc46dc":
+// c3:"0unroll1212121212121212121212121212121":
+// c1:"0x46e246e246e246e246e246e246e246e2":
+// c2:"0x34c534c534c534c534c534c534c534c5"
+
+// THIS IMPLEMENTATION IS FP16 SPECIFIC (ICVT changes imm)
+
+FMINMAX mask=255 src0=lxlu imm=7 src2=c0 tgtrf=t0_0 unrlfldtgt=1 unroll=unroll
+FMUL mask=255 src0=t0_0 src1=c1 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+ICVT mask=255 src0=icvtconst imm=1 src2=t1_0 tgtrf=t2_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+ICVT mask=255 src0=icvtconst imm=0 src2=t1_0 tgtencoding=sfp fwdencoding=out0 tgtrf=t1_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+FNMS mask=255 src0=t2_0 src1=c2 src2=t0_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+SHR imm=4 mask=255 src0=t1_0 src2=0.0 tgtencoding=sfp fwdencoding=out0 unrlfldsrc0=1 unroll=unroll
+FNMS be=0 mask=255 src0=t2_0 src1=c3 src2=t0_0 tgtencoding=sfp fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc2=1 unroll=unroll

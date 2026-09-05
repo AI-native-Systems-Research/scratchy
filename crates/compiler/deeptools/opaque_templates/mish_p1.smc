@@ -1,0 +1,20 @@
+/// instr_count:8
+// @RegInit:c0:"0x00000000000000000000000000000000":
+// c5:"0x3e003e003e003e003e003e003e003e00":
+// c6:"0xbe00be00be00be00be00be00be00be00":
+// c7:"0x54E354E354E354E354E354E354E354E3"
+
+//  fast exp LX->t0_0->t0_0
+FMUL mask=255 be=0 src0=in0 src1=c7 src2=0.0 tgtrf=t0_0 unrlfldtgt=1 unroll=unroll
+ICVT mask=255 be=0 src0=icvtconst imm=0x7 src2=t0_0   tgtrf=t0_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+//  1+exp(x)	
+FMA  mask=255 be=0 src0=t0_0   src1=1.0 src2=c5 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// implement SNT ln(x) function	
+//	logrest(x) = fr1
+FEST mask=255 be=0 src0=t0_0 imm=2 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// insertex(fx, 0.0), get mantissa	= fm1
+IME mask=255 be=0 src0=c0 imm=0x0 src2=t0_0 tgtrf=t2_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+// fm2 = fr1*fm1 - 1
+FMA mask=255 be=0 src0=t1_0 src1=t2_0 src2=c6 tgtencoding=sfp fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc1=1 unroll=unroll
+FMA  mask=255 be=0 src0=t0_0   src1=1.0 src2=c0 tgtencoding=sfp fwdencoding=out0 unrlfldsrc0=1  unroll=unroll
+FMA  mask=255 be=0 src0=c0   src1=1.0 src2=c5 tgtencoding=sfp fwdencoding=out0  unroll=unroll

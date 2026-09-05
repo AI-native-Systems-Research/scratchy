@@ -1,0 +1,3 @@
+///instr_count:2
+FMA mask=255 src0=c0 src1=1.0 src2=0.0 tgtrf=x1 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1
+FMA mask=255 src0=c0 src1=1.0 src2=0.0 tgtrf=x2 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1

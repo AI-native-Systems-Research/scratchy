@@ -1,0 +1,37 @@
+/// instr_count:21
+LOGICAL mask=255 src0=in0 imm=1 src2=0.0 tgtrf=t0_0 unrlfldtgt=1 unroll=x1
+// FMA mask=255 src0=in0 src1=in0 src2=0.0 tgtrf=no mode=1
+// e[x]->t0(32bit) low
+FCVT mask=255 src0=t0_0 imm=0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// -e[x]^2 + e[x2] (32bit)
+FNMS mask=255 src0=t0_0 src1=t0_0 src2=in0 tgtrf=t0_0 mode=1
+// FNMS mask=255 src0=reuse src1=reuse src2=in0 tgtrf=t0_0 mode=1
+// c1->t1(32bit) low
+FCVT mask=255 src0=c1 imm=0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// varx + eps (32bit)
+FMA mask=255 src0=t0_0 src1=1.0 src2=t1_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mode=1
+EE mask=255 src0=t0_0 imm=0 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mode=1
+IME mask=255 src0=c2 imm=0 src2=t0_0 tgtrf=t3_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mode=1
+SHR mask=255 src0=t2_0 imm=1 src2=0.0 tgtrf=t6_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mode=1
+
+// c3->t1(32bit) low
+// FCVT mask=255 src0=c3 imm=0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// 0x00010001 -> 0x00000001 (generate mask for 32bit)
+SHR mask=255 src0=c3 imm=16 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mode=1
+LOGICAL mask=255 src0=t2_0 imm=0 src2=t1_0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+FEST mask=255 src0=t0_0 imm=5 src2=0.0 tgtrf=t4_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mode=1
+IME  mask=255 src0=t2_0 imm=2 src2=t3_0 tgtrf=t3_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mode=1
+
+MVLOOPCNT imm=4
+FMUL mask=255 src0=t4_0 src1=t4_0 src2=0.0 tgtrf=t5_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1 mode=1
+FNMS mask=255 src0=t3_0 src1=t5_0 src2=3.0 tgtrf=t5_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1 mode=1
+FMUL mask=255 src0=t4_0 src1=t5_0 src2=muldiv2 tgtrf=t4_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1 be=be mode=1
+
+IME mask=255 src0=t2_0 imm=2 src2=t4_0 tgtrf=t4_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mode=1
+IME mask=255 src0=t6_0 imm=2 src2=t4_0 tgtrf=t6_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mode=1
+
+// t6_0 (32bit) -> [t6_0, t6_0] (16bit)
+FCVT mask=255 src0=t6_0 imm=2 src2=t6_0 tgtrf=t6_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=0 unroll=x1 mode=1
+
+FCMP mask=255 src0=t0_0 imm=0x7 src2=0.0 mode=1
+SELECT mask=255 src0=t6_0 imm=0x0 src2=c4 tgtencoding=lx fwdencoding=out0

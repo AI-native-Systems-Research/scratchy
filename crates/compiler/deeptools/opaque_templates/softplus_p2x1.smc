@@ -1,0 +1,44 @@
+/// instr_count:20
+
+// from PE (x)
+LOGICAL mask=255 src0=in1_0 imm=1 src2=0.0 tgtrf=t0_0 unrlfldtgt=1 unroll=x1
+// from PE (fm2)
+LOGICAL mask=255 src0=in1_0 imm=1 src2=0.0 tgtrf=t1_0 unrlfldtgt=1 unroll=x1
+
+//  fpl = fm2*logfco0 + logfco1 = fm2*0.25 + 0.33349
+FMA  mask=255 be=0 src0=t1_0 src1=c1 src2=c2 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+//  fpl = fm2 * fpl + logfco2 = fm2 * fp0 - 0.5
+FMA  mask=255 be=0 src0=t1_0 src1=t2_0 src2=c3 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1
+//  fpl = fm2 * fpl + logfco3 = fm2 * fpl + 1.0
+FMA  mask=255 be=0 src0=t1_0 src1=t2_0 src2=c5 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1
+// log(x) = fm2*fpl
+FMA mask=255 be=0 src0=t1_0 src1=t2_0 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1
+// mask
+FCMP mask=255 be=0 src0=t0_0 imm=7 src2=0xa tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+// log(x) = fm2*fpl + flrexp
+FMA mask=255 be=0 src0=t2_0 src1=1.0 src2=t1_0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+// extract loglest(x) = flr
+FEST mask=255 be=0 src0=t0_0   imm=3 src2=0xa tgtrf=t2_0  unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+//  flrn = flr + mask
+FMA mask=255 be=0 src0=t2_0 src1=1.0 src2=t1_0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+// extract exponent     = iexp
+EE  mask=255 be=0 src0=t0_0 imm=0x0 src2=0xa tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+// fexp - convert INT16 to FP16
+ICVT mask=255 be=0 src0=0xf  imm=2 src2=t1_0 tgtrf=t1_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+// flrexp = fexp*ln2+flrn
+FMA mask=255 be=0 src0=t1_0 src1=c4 src2=t2_0 tgtrf=t3_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+
+// in1 -> b
+FMA mask=255 src0=in1_0 src1=1.0 src2=0.0 tgtrf=t2_0 unrlfldtgt=1 unroll=x1
+// b * x
+FMA mask=255 src0=in0 src1=t2_0 src2=0.0 tgtrf=t1_0 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1
+
+// x * 1.0 -> t2_0
+FMA mask=255 src0=reuse src1=1.0 src2=0.0 tgtrf=t2_0 unrlfldtgt=1 unroll=x1
+// bx > 0 ? bx : 0
+FMINMAX mask=255 src0=t1_0 imm=0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+// log(...) + relu(b*x)
+FMA mask=255 src0=t3_0 src1=1.0 src2=t0_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+// bx >= threshold ? x : log(...) + relu(b*x)
+FCMP mask=255 src0=t1_0 imm=0x7 src2=c9
+SELECT mask=255 src0=t2_0 imm=0x0 src2=t0_0 tgtencoding=lx fwdencoding=result

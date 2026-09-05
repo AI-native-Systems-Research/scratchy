@@ -12,4 +12,27 @@ license.workspace = true
 # recovery — build a lowering, throw the shape away, then try to read it back out.
 [dependencies]
 
+# ⛔ THE `.ddl` TEXT IS PARSED HERE AND NOWHERE ELSE. `build.rs` turns `ddl_templates/*.ddl` into
+# const tables, because parsing text is the one thing in this crate that cannot be a constant. The
+# parser lives in `ddl/`, OUTSIDE `src/`, so its `String`s cannot reach the emitter.
+[build-dependencies]
+
+[features]
+# ⛔ THE TARGET ARCH IS A FEATURE, NOT AN ENV VAR, AND NOT A RUNTIME VALUE. Which `.ddl` template
+# serves an op-func depends on the ISA (`opFuncToDdlTemplate` tags `bmm.ddl` RCUDD1A and
+# `bmm_sen1p5.ddl` SEN1P5), and so do the PT row count, the L0 capacity and the HBM segment count.
+# For a crate that runs inside a proc macro that is a COMPILE-TIME fact, and a feature is the
+# mechanism cargo already has for it: `Target` resolves to one arch, so `Target::PT_ROWS` is a
+# literal the compiler folds rather than a field anything reads.
+#
+# ⛔ EXACTLY ONE, ENFORCED. Naming both or neither is a build failure in `arch.rs`, not a silent
+# precedence rule — two arches at once is a compiler built for one machine against the tables of
+# another.
+default = ["arch-rcudd1a"]
+# `RCUDD1A_ISA`, IBM's own `DEFAULT_ISA` (`isa.hpp:30`). 8 PT rows, a 64-stick L0, 8 HBM segments.
+arch-rcudd1a = []
+# `SEN1P5_ISA`. 4 PT rows, a 128-stick L0 with a 16-stick scale region, 32 HBM segments, cores
+# tethered in pairs.
+arch-sen1p5 = []
+
 [lib]

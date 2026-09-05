@@ -1,0 +1,17 @@
+///instr_count:16
+LOGICAL src0=in0 imm=0x1 src2=c1 tgtrf=p0_0 unrlfldtgt=1 unroll=x1 mask=255
+FCMP src0=c1 imm=7 src2=p0_0 mask=255 mode=prec
+SELECT src0=c3 imm=0 src2=c4 tgtrf=t0_0 mask=255 mode=prec
+FMINMAX src0=p0_0 imm=2 src2=p0_0 tgtrf=p0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mask=255 mode=prec
+
+FCMP src0=c1 imm=0x6 src2=p0_0 mask=255 mode=prec
+SELECT src0=c2 imm=0x0 src2=p0_0 tgtrf=p0_0 mask=255 mode=prec
+
+EE src0=p0_0 imm=0x0 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mask=255 mode=prec
+IME src0=c1 imm=0x0 src2=p0_0 tgtrf=p0_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mask=255 mode=prec
+FEST src0=p0_0 imm=0x2 src2=0.0 tgtrf=t4_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1 mask=255 mode=prec
+MVLOOPCNT imm=6
+FNMS src0=p0_0 src1=t4_0 src2=2.0 tgtrf=t6_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1 mask=255 mode=prec
+FMUL src0=t4_0 src1=t6_0 src2=0.0 tgtrf=t4_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=x1 mask=255 be=be mode=prec
+IME src0=t2_0 imm=0x2 src2=t4_0 tgtrf=t6_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1 mask=255 mode=prec
+FMUL src0=t6_0 src1=t0_0 src2=0.0 tgtencoding=lx fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc1=1 unroll=x1 mask=255 mode=prec

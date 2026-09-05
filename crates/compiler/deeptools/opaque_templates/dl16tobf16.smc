@@ -1,0 +1,2 @@
+/// instr_count:1
+GCVT mask=255 src0=in0 imm=0x10 src2=0.0 tgtencoding=lx fwdencoding=out0

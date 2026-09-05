@@ -1,0 +1,21 @@
+/// instr_count:14
+FMA mask=255 src0=8 src1=1.0 src2=x1 tgtrf=x1 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+FMA mask=255 src0=8 src1=1.0 src2=x2 tgtrf=x2 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+FMA mask=255 src0=x1 src1=1.0 src2=8 tgtrf=x1 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+FMA mask=255 src0=x2 src1=1.0 src2=8 tgtrf=x2 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+SPLAT imm=1 mask=255 src0=x1 src2=10 tgtrf=x1 unrlfldtgt=0 unroll=x1 mode=1
+SPLAT imm=1 mask=255 src0=x2 src2=10 tgtrf=x2 unrlfldtgt=0 unroll=x1 mode=1
+REDUCE rsm_src0=x2 rsm_src1=1 rsm_tgtrf=x2 rsm_unroll=x1 mode=1
+REDUCE rsm_src0=x1 rsm_src1=1 rsm_tgtrf=x1 rsm_unroll=x1 mode=1
+FCVT mask=255 src0=x1 imm=2 src2=c0 tgtrf=x1 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=0 unroll=x1 mode=1
+// FCVT mask=255 src0=x2 imm=2 src2=c0 tgtrf=x2 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=0 unroll=x1 mode=1
+SPLAT imm=1 mask=255 src0=x1 src2=10 tgtrf=x1 unrlfldtgt=0 unroll=x1
+SPLAT imm=1 mask=255 src0=x2 src2=10 tgtrf=x2 unrlfldtgt=0 unroll=x1 mode=1
+// 16-bit transfer of e[x]
+FMUL mask=1 src0=x1 src1=c1 src2=10 tgtencoding=lx fwdencoding=out0 tgtrf=no unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=0 unroll=x1
+// c1[63:0]->t1_0(32-bit)
+FCVT mask=255 src0=c1 imm=0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=0 unrlfldsrc1=0 unrlfldsrc2=0 unrlfldtgt=0 unroll=x1 mode=1
+// // 32-bit transfer of e[x]
+// FMUL mask=1 src0=x1 src1=t1_0 src2=10 tgtencoding=lx fwdencoding=out0 tgtrf=no unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=0 unroll=x1 mode=1
+// 32-bit transfer of e[x2]
+FMUL mask=1 src0=x2 src1=t1_0 src2=10 tgtencoding=lx fwdencoding=out0 tgtrf=no unrlfldsrc0=0 unrlfldsrc1=0 unrlfldtgt=0 unroll=x1 mode=1

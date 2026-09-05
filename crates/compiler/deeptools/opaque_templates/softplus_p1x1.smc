@@ -1,0 +1,28 @@
+///instr_count:12
+
+// bx
+FMA mask=255 src0=in0 src1=c4 src2=0.0 tgtrf=t2_0 unrlfldtgt=1 unroll=x1
+// -bx
+FNMS mask=255 src0=t2_0 src1=1.0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+// abs(bx)
+FMINMAX mask=255 src0=t2_0 imm=4 src2=t1_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+
+FMUL mask=255 src0=t0_0 src1=c0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+ICVT mask=255 src0=15 imm=7 src2=t1_0 tgtrf=t0_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+
+// exp(-abs(b * x)) + 1
+FMA be=0 mask=255 src0=t0_0 src1=1.0 src2=c1 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+
+FCMP src0=c3 imm=0x6 src2=t0_0 mask=255
+SELECT src0=c2 imm=0x0 src2=t0_0 tgtencoding=sfp fwdencoding=out0 mask=255
+
+// implement SNT ln(x) function
+//      logrest(x) = fr1
+FEST mask=255 be=0 src0=t0_0 imm=2 src2=0xa tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+// insertex(fx, 0.0), get mantissa      = fm1
+IME mask=255 be=0 src0=c3 imm=0x0 src2=t0_0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+// fm2 = fr1*fm1 - 1 -> sfp
+FMA mask=255 be=0 src0=t1_0 src1=t2_0 src2=c5 tgtencoding=sfp fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc1=1 unroll=x1
+
+// b -> out
+FMA mask=255 src0=c4 src1=1.0 src2=0.0 tgtencoding=sfp fwdencoding=out0 unroll=x1

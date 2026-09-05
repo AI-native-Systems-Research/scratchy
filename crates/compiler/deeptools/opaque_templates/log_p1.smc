@@ -1,0 +1,16 @@
+/// instr_count:6
+// @RegInit:c0:"0x00000000000000000000000000000000":
+// c6:"0xbe00be00be00be00be00be00be00be00":
+// c8:"ffff"
+
+LOGICAL  mask=255 be=0 src0=in0 imm=1 src2=0.0 tgtrf=t0_0 unrlfldtgt=1 unroll=x1
+FCMP src0=c0 imm=0x6 src2=t0_0 mask=255
+SELECT src0=c8 imm=0x0 src2=t0_0 tgtrf=t0_0 tgtencoding=sfp fwdencoding=out0 mask=255
+
+// implement SNT ln(x) function	
+//	logrest(x) = fr1
+FEST mask=255 be=0 src0=t0_0 imm=2 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=x1
+// insertex(fx, 0.0), get mantissa	= fm1
+IME mask=255 be=0 src0=c0 imm=0x0 src2=t0_0 tgtrf=t2_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=x1
+// fm2 = fr1*fm1 - 1 -> sfp
+FMA mask=255 be=0 src0=t1_0 src1=t2_0 src2=c6 tgtencoding=sfp fwdencoding=out0 unrlfldsrc0=1 unrlfldsrc1=1 unroll=x1

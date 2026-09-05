@@ -1,0 +1,36 @@
+/// instr_count:17
+// @RegInit:c2:"0x3aab3aab3aab3aab3aab3aab3aab3aab":
+// c1:"0x3a003a003a003a003a003a003a003a00":
+// c3:"0xbf00bf00bf00bf00bf00bf00bf00bf00":
+// c4:"0x3cc63cc63cc63cc63cc63cc63cc63cc6":
+
+LOGICAL mask=255 src0=in1 imm=1 src2=0.0 tgtrf=t1_0 unrlfldtgt=1 unroll=unroll
+LOGICAL mask=255 src0=in1 imm=1 src2=0.0 tgtrf=t0_0 unrlfldtgt=1 unroll=unroll
+//  fpl = fm2*logfco0 + logfco1 = fm2*0.25 + 0.33349 
+FMA  mask=255 be=0 src0=t1_0 src1=c1 src2=c2 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+//  fpl = fm2 * fpl + logfco2 = fm2 * fp1 - 0.5
+FMA  mask=255 be=0 src0=t1_0 src1=t2_0 src2=c3 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll
+//  fpl = fm2 * fpl + logfco3 = fm2 * fpl + 1.0
+FMA  mask=255 be=0 src0=t1_0 src1=t2_0 src2=in1 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll
+// log(1 + exp(x)) = fm2*fpl
+FMA mask=255 be=0 src0=t1_0 src1=t2_0 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll
+// mask - we probably don't need as we only need 1+exp(x) upto 12
+FCMP mask=255 be=0 src0=t0_0 imm=7 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// log(1 + exp(x)) = fm2*fpl + flrexp 
+FMA mask=255 be=0 src0=t2_0 src1=1.0 src2=t1_0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+// extract loglest(x) = flr
+FEST mask=255 be=0 src0=t0_0   imm=3 src2=0.0 tgtrf=t2_0  unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+//  flrn = flr + mask
+FMA mask=255 be=0 src0=t2_0 src1=1.0 src2=t1_0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+// extract exponent	= iexp
+EE  mask=255 be=0 src0=t0_0 imm=0x0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+// fexp - convert INT16 to FP16
+ICVT mask=255 be=0 src0=icvtconst imm=2 src2=t1_0 tgtrf=t1_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+// flrexp = fexp*ln2+flrn 
+FMA mask=255 be=0 src0=t1_0 src1=c4 src2=t2_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+// Tanh(log(1 + exp(x))) 
+FEST mask=255 be=0 src0=t0_0 imm=8 src2=0.0 tgtrf=t1_0  unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+FEST mask=255 be=0 src0=t0_0 imm=9 src2=0.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll
+FMA  mask=255 be=0 src0=t1_0 src1=t0_0 src2=t2_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll
+// x*tanh()
+FMA  mask=255 be=0 src0=t0_0 src1=in0 src2=0.0 tgtencoding=lx fwdencoding=result unrlfldsrc0=1 unroll=unroll

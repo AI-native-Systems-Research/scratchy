@@ -1,0 +1,26 @@
+/// instr_count:14
+// recieve delta to p0
+LOGICAL src0=in0 imm=1 src2=0.0 tgtrf=p0_0 unrlfldtgt=1 unroll=unroll mask=255
+// reciprocal of delta (assume > 0)
+EE      src0=p0_0 imm=0x0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mask=255
+IME     src0=czero imm=0x0 src2=p0_0 tgtrf=p0_0 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mask=255
+FEST    src0=p0_0 imm=0x2 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mask=255
+MVLOOPCNT imm=2
+FNMS    src0=p0_0 src1=t1_0 src2=2.0 tgtrf=t2_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mask=255
+FMUL    src0=t1_0 src1=t2_0 src2=0.0 tgtrf=t1_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mask=255 be=be
+IME     src0=t0_0 imm=0x2 src2=t1_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mask=255
+// c1(2)/delta
+FMUL    src0=t0_0 src1=c7 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mask=255
+// (2/delta)^2
+FMUL    src0=t0_0 src1=t0_0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc1=1 unrlfldtgt=1 unroll=unroll mask=255
+// beta * (2/delta)^2
+FMUL    src0=t0_0 src1=in0 src2=0.0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldtgt=1 unroll=unroll mask=255
+
+// calc gamma
+// c6(0.5)*tanh(alph)+c6(0.5) --> SFP
+FMA     mask=255 src0=in0 src1=c6 src2=c6 tgtrf=t1_0 unrlfldtgt=1 unroll=unroll
+
+// gamma(0.5*tanh(alph)+0.5) + beta * (2/delta)^2
+FMA     src0=t1_0 src1=1.0 src2=t0_0 tgtrf=t0_0 unrlfldsrc0=1 unrlfldsrc2=1 unrlfldtgt=1 unroll=unroll mask=255 
+// gelu'(x)*grad -> lxsu
+FMUL    src0=in1 src1=t0_0 src2=0.0 tgtencoding=lx fwdencoding=out0 unrlfldsrc1=1 unroll=unroll mask=255 
