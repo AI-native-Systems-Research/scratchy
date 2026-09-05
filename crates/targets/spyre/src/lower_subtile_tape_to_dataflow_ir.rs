@@ -38,7 +38,9 @@ use deeptools::islands::dataflow_ir::{GroupId, print};
 use deeptools::model::Model;
 use deeptools::workload::Workload;
 
-use crate::lower_subtile_tape_to_superdsc::{ActiveCap, BundleLayout, SegRole, compute_bundle_layout};
+use crate::lower_subtile_tape_to_superdsc::{
+    ActiveCap, BundleLayout, SegRole, compute_bundle_layout,
+};
 use scratchy_spyre_bundle as bundle;
 
 /// WHY A TAPE COULD NOT BECOME DATAFLOWIR.

@@ -11,7 +11,9 @@
 //! it.
 
 use deeptools::arch::{Arch, Dd2};
-use deeptools::bridges::subtile_to_dataflow_ir::node::{Cols, Node, Operand, Residence, Rows, Segment};
+use deeptools::bridges::subtile_to_dataflow_ir::node::{
+    Cols, Node, Operand, Residence, Rows, Segment,
+};
 use deeptools::bridges::subtile_to_dataflow_ir::tape;
 use deeptools::generated::{DataType, OpFunc};
 use deeptools::islands::dataflow_ir::GroupId;

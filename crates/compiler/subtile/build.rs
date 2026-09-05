@@ -116,7 +116,15 @@ fn emit_config_geometry() {
             // ⛔ ALL SEVEN OR NONE. A model missing any one of them yields no arm at all, so the
             // door refuses it BY NAME rather than instantiating a lowering against a default that
             // was never in anyone's config.
-            if let (Some(&nqh), Some(&nkvh), Some(&hd), Some(&hidden), Some(&layers), Some(&ffn), Some(&vocab)) = (
+            if let (
+                Some(&nqh),
+                Some(&nkvh),
+                Some(&hd),
+                Some(&hidden),
+                Some(&layers),
+                Some(&ffn),
+                Some(&vocab),
+            ) = (
                 bounds.get("num_attention_heads"),
                 bounds.get("num_key_value_heads"),
                 bounds.get("head_dim"),

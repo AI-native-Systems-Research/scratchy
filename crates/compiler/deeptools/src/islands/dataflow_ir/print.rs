@@ -10,7 +10,9 @@ use crate::generated::{ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::op::{
     Bound, CompositeTransfer, Index, LogicKind, Op, Precision, RegAddr, Val,
 };
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, IntegerSet, MemRef, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, ElemType, IntegerSet, MemRef, Vector,
+};
 use crate::islands::dataflow_ir::{Grid, Program, Run};
 
 /// A WHOLE RUN AS ONE MLIR MODULE — the shape `dbo-adapt-scheduler-dfir` consumes.

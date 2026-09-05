@@ -90,10 +90,7 @@ fn build(stmts: &'static [Stmt], depth: usize) -> Vec<Level> {
 const fn same(a: &Enclosing, b: &Enclosing) -> bool {
     match (a, b) {
         (Enclosing::Loop { stmt: x }, Enclosing::Loop { stmt: y }) => *x == *y,
-        (
-            Enclosing::Arm { then_arm: x, .. },
-            Enclosing::Arm { then_arm: y, .. },
-        ) => *x == *y,
+        (Enclosing::Arm { then_arm: x, .. }, Enclosing::Arm { then_arm: y, .. }) => *x == *y,
         _ => false,
     }
 }

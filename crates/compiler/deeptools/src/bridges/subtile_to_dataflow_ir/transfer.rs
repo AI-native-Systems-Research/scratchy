@@ -257,9 +257,7 @@ pub fn plan(
     Ok(TransferPlan {
         vector_lanes,
         load_set: IntegerSet::from_sizes(&load_sizes),
-        load_order: AffineMap::identity(
-            u32::try_from(src_sizes.len()).expect("a rank fits a u32"),
-        ),
+        load_order: AffineMap::identity(u32::try_from(src_sizes.len()).expect("a rank fits a u32")),
         store_set: IntegerSet::from_sizes(&store_sizes),
         store_order: AffineMap::identity(
             u32::try_from(dst_sizes.len()).expect("a rank fits a u32"),
@@ -335,7 +333,10 @@ mod tests {
         let got = plan(&[1, 1, 64], &[1, 1, 1, 1, 64], 64, Lanes::F16)
             .expect("64 elements at 64 lanes is a single unsplit vector");
 
-        assert_eq!(got.vector_lanes, 64, "one hardware vector, not the transfer");
+        assert_eq!(
+            got.vector_lanes, 64,
+            "one hardware vector, not the transfer"
+        );
 
         use crate::islands::dataflow_ir::print::{affine_map as mapped, integer_set as printed};
 
