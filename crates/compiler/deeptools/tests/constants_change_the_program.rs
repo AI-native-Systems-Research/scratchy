@@ -442,9 +442,13 @@ fn every_op_func_declares_its_input_arity() {
     // mismatch is not confined to the ropes that `op_func_of` folds into `OpFunc::Mul`; it is every
     // fp8 matmul as well, and the third operand — the weight scale — is not a `Role::Input` of any
     // vendored bind. Where it does ride is not yet established.
+    // ⛔ SCOPED TO `OpFunc::ALL`, WHICH IS A SUBSET OF THE BINDS. The templates contain binds with
+    // more inputs that scratchy's enum does not name — `csqint8ch` takes five
+    // (`quantization_double_pad.ddl:54`, including `%dummy_tensor_scale`). This measures the
+    // op-funcs the bridge can actually emit, which is what the arity lock has to cover.
     assert_eq!(
         arities,
         vec![1, 2],
-        "the vendored templates declare these input arities"
+        "every op-func scratchy names takes one or two inputs"
     );
 }
