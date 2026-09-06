@@ -7,5 +7,3 @@
 /// The subtile tape becoming DataflowIR.
 pub mod subtile_to_dataflow_ir;
 
-/// `DataflowIR -> SentientIR` — the D1-D28 span.
-pub mod dataflow_ir_to_sentient;
