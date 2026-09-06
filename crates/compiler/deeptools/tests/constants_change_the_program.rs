@@ -386,3 +386,65 @@ fn an_hbm_operand_is_transferred_and_a_staged_one_is_not() {
         "a global unit carries neither core nor corelet"
     );
 }
+
+/// ⭐⭐ EVERY OP-FUNC'S SCHEDULE DECLARES ITS ARITY, AND HERE THEY ARE.
+///
+/// ⛔⛔ THIS IS THE MEASUREMENT, NOT A GUESS. `Role::Input(i)` is stated per vendored
+/// `ddl.operation_bind` and `build.rs:1413` says scratchy fills its own operands IN THAT ORDER, so
+/// the count is declared by the template rather than chosen by the emitter. Nothing read it: a
+/// `mul` arrived carrying six operands because `op_func_of` maps nine `SubOp`s onto `OpFunc::Mul`
+/// and `lower_subtile_tape_to_dataflow_ir.rs:311-319` copies every SubtileNode input through
+/// unchanged.
+///
+/// ⛔ CARRYING THE VALUES, NOT A RANGE. "every arity is small" would pass on a template that
+/// declared none at all.
+#[test]
+fn every_op_func_declares_its_input_arity() {
+    use deeptools::arch::{Arch, Dd2};
+    use deeptools::generated::OpFunc;
+
+    // ⛔ EVERY CANDIDATE, NOT ONE FORMAT. `OpFunc::program` PANICS for a format no candidate admits
+    // — a build failure by design, since it runs inside `#[forward]` — so probing one dtype would
+    // measure only the op-funcs that happen to serve it. `candidates` is the whole table.
+    let mut seen: Vec<(OpFunc, u16)> = Vec::new();
+    for op_func in OpFunc::ALL {
+        for (_admits, program) in op_func.candidates(Dd2::GEN) {
+            seen.push((op_func, program.input_arity()));
+        }
+    }
+    assert!(
+        !seen.is_empty(),
+        "the vendored templates bind at least one program"
+    );
+
+    // ⛔ NO OP-FUNC TAKES ZERO INPUTS. A zero here means the bind named no `Role::Input`, which
+    // would make the arity lock vacuous for that op-func.
+    let zero: Vec<OpFunc> = seen
+        .iter()
+        .filter(|(_, arity)| *arity == 0)
+        .map(|(op_func, _)| *op_func)
+        .collect();
+    assert!(
+        zero.is_empty(),
+        "these op-funcs declare no `Role::Input` at all: {zero:?}"
+    );
+
+    // ⛔ AND THE SET OF ARITIES IS SMALL AND KNOWN — the shape any positional operand type must
+    // cover. If this changes, a new template arrived and the lock has to grow an arm.
+    let mut arities: Vec<u16> = seen.iter().map(|(_, arity)| *arity).collect();
+    arities.sort_unstable();
+    arities.dedup();
+    // ⭐⭐ ONE AND TWO. NOTHING TAKES THREE.
+    //
+    // ⛔⛔ AND THE TAPE DISAGREES. The build log's own census reads
+    // `[MM] out=t729 arity=3 m=1 k=2048 n=2048 act=t728 W=t2 wscale=t3` — every quantised matmul in
+    // granite carries THREE operands, and the template that serves it declares two. So the arity
+    // mismatch is not confined to the ropes that `op_func_of` folds into `OpFunc::Mul`; it is every
+    // fp8 matmul as well, and the third operand — the weight scale — is not a `Role::Input` of any
+    // vendored bind. Where it does ride is not yet established.
+    assert_eq!(
+        arities,
+        vec![1, 2],
+        "the vendored templates declare these input arities"
+    );
+}
