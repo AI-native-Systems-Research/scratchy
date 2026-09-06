@@ -30,10 +30,17 @@ function pointers or `std::function`; the 38 dropped ambiguous calls are real ed
 guess at; and cycles are broken at the first back edge. A level is a **starting order, not a proof**:
 if a port needs something from a higher level, the graph missed an edge.
 
-⛔ **AND IT SAYS NOTHING ABOUT WHAT IS WORTH PORTING.** Between 26% and 83% of these lines are MLIR
-construction — `OpBuilder`, SSA iterators, memoisers, the nested `(core, corelet, component)` lookup
-maps — which exists because the C++ builds an IR at run time. We emit from a resolved tape. **Port the
-rule, never the plumbing.**
+⛔ **A LINE COUNT IS NOT A WORK ESTIMATE.** Between 26% and 83% of these lines are MLIR *mechanics* —
+`OpBuilder` calls, SSA iterators, memoisers, the nested `(core, corelet, component)` lookup maps —
+which exist because the C++ builds an IR at run time while we emit from a resolved tape. So a
+196-line function may be 40 lines of Rust.
+
+⛔⛔ **THIS IS NOT A LICENCE TO SKIP THE EMISSION, AND IT WAS READ AS ONE.** An earlier draft of this
+paragraph ended *"port the rule, never the plumbing"*, and that sentence is exactly how levels 0-2
+came to be 490 predicates with no output: `setldtype`'s "rule" became a `LoadType` enum and the
+`sentient.load_and_send` it exists to attribute was never built. **The op the function emits IS the
+function.** What may be dropped is the mechanism for *getting at* the operands — walking uses,
+memoising by component, positioning a builder — not what gets emitted or with which attributes.
 
 ## ⛔ THE RULES OF EXECUTION — the plan was approved, the EXECUTION was reward-hacked
 
@@ -67,7 +74,7 @@ typed `dataflow_ir::Run` exists. There is no MLIR text on the input side.
 
 ## Progress
 
-`1/490 ported; 0/490 audited` — keep in step with the task list's counter.
+`5/490 ported; 0/490 audited` — keep in step with the task list's counter.
 
 ⭐ Entry 233 is `AffineYieldOpLowering::matchAndRewrite`, ported as `lower_affine_yield`: the island
 gained `affine::Op::Yield`, `scf::Op::Yield` and `scf::Op::Parallel` so the function HAD an input, the
@@ -344,13 +351,13 @@ function wide.
 
 ### Conversion/AgenToSentient — 82 defs, 319 lines
 
-- [ ] **PORT 130** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
+- [x] **PORT 130** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
 - [ ] **AUDIT 130** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, line by line against the C++
-- [ ] **PORT 131** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
+- [x] **PORT 131** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
 - [ ] **AUDIT 131** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, line by line against the C++
 - [ ] **PORT 132** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, 42 lines
 - [ ] **AUDIT 132** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, line by line against the C++
-- [ ] **PORT 133** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
+- [x] **PORT 133** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
 - [ ] **AUDIT 133** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, line by line against the C++
 - [ ] **PORT 134** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, 20 lines
 - [ ] **AUDIT 134** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, line by line against the C++
@@ -753,7 +760,7 @@ function wide.
 - [ ] **AUDIT 314** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, line by line against the C++
 - [ ] **PORT 315** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, 46 lines
 - [ ] **AUDIT 315** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, line by line against the C++
-- [ ] **PORT 316** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
+- [x] **PORT 316** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
 - [ ] **AUDIT 316** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
 - [ ] **PORT 317** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, 38 lines
 - [ ] **AUDIT 317** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, line by line against the C++

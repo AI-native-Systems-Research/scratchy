@@ -33,6 +33,9 @@
 //!    `load_and_send`, a receive and its store one `receive_and_store`, and one
 //!    `vectorchain.binary` becomes **TWO** sentient computes.
 
+/// `AgenToSentientLoweringPass`, function by function.
+pub mod agen_to_sentient;
+
 use crate::arch::{Arch, Bytes, Elements};
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::{self as dfir, Values};
