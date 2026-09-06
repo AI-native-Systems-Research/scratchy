@@ -11,6 +11,19 @@
 //! operand. Those are `sentient.*`"*
 //! ([`crate::islands::dataflow_ir::dialects`]). Every one of those five now has a type here.
 //!
+//! # 🛑 THE WIRE'S TWO ENDS ARE THE RUNG BELOW'S, AND THAT IS DELIBERATE
+//!
+//! ⛔⛔ A LOCKDOWN THAT DOES NOT SURVIVE ITS LOWERING IS WORSE THAN NONE. The DataflowIR island mints
+//! a [`crate::islands::dataflow_ir::link::Link`] once and hands out its two ends once, so a
+//! `dataflow.send`'s destination and the matching `dataflow.receive`'s source are the same wire *by
+//! construction*. The first version of this file then took `consumer: Val` and `producer: Val` —
+//! two bare handles — so the guarantee evaporated at exactly the rung where an instruction finally
+//! names a unit, and `Link<Lxlu, Sfp>` became two unrelated integers.
+//!
+//! ⭐ SO THESE OPS TAKE [`SendEnd`] AND [`RecvEnd`] THEMSELVES. Same types, same wire, one lowering
+//! further down: a send here cannot be handed a receive's end, and neither can be conjured from a
+//! unit handle, because only `Link::ends` mints them and it consumes the link to do it.
+//!
 //! ⛔ WHAT IS STILL NOT HERE: a register INDEX inside a file, an instruction encoding, a program
 //! counter. `regIndex` appears on these ops as a *hint* an allocator fills in
 //! (`DefaultValuedAttr<I32Attr, "-1">` — minus one means unassigned), and the passes that decide it
@@ -22,6 +35,7 @@ use std::fmt::Write as _;
 use crate::arch::{Bounded, Bytes, Elements};
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
+use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::sentient::dialects::Val;
 use crate::islands::sentient::print;
 
@@ -1499,8 +1513,8 @@ pub enum Op {
         immutable_addr: Val,
         /// `$increment`.
         increment: Val,
-        /// `$consumer` — who receives it.
-        consumer: Val,
+        /// `$consumer` — ⛔ THE WIRE'S SEND END, not a unit handle. See the module note.
+        consumer: SendEnd,
         /// The value it binds.
         result: Val,
         /// The extents.
@@ -1530,8 +1544,8 @@ pub enum Op {
         immutable_addr: Val,
         /// `$increment`.
         increment: Val,
-        /// `$producer` — who sent it.
-        producer: Val,
+        /// `$producer` — ⛔ THE WIRE'S RECEIVE END, paired with the send by construction.
+        producer: RecvEnd,
         /// The value it binds.
         result: Val,
         /// `$dst`.
@@ -1621,8 +1635,8 @@ pub enum Op {
         element_index: Val,
         /// `$scale_index`.
         scale_index: Val,
-        /// `$consumer`.
-        consumer: Val,
+        /// `$consumer` — ⛔ the wire's send end.
+        consumer: SendEnd,
         /// The value it binds.
         result: Val,
         /// `$src_total_elements`.
@@ -1654,8 +1668,8 @@ pub enum Op {
         immutable_addr: Val,
         /// `$increment`.
         increment: Val,
-        /// `$consumer`.
-        consumer: Val,
+        /// `$consumer` — ⛔ the wire's send end.
+        consumer: SendEnd,
         /// `$addr` — the address it binds.
         addr_result: Val,
         /// `$data` — the datum it binds.
@@ -1675,8 +1689,8 @@ pub enum Op {
     /// `sentient.receive_and_extract_scalar` — take one datum off the wire into a register
     /// (`SentientOps.td:675`).
     ReceiveAndExtractScalar {
-        /// `$unit` — who to receive from.
-        unit: Val,
+        /// `$unit` — ⛔ THE WIRE'S RECEIVE END; this op drains a wire like any other receive.
+        unit: RecvEnd,
         /// `$position` — which object to extract.
         position: Val,
         /// The value it binds.
@@ -1793,9 +1807,12 @@ pub enum Op {
 
     /// `sentient.set_send_dst` — ⭐ WHAT `SetSendDestinationRE` (D33) WRITES
     /// (`SentientOps.td:904`).
+    ///
+    /// ⛔ ITS OPERAND IS A SEND END TOO. The op exists to say where subsequent sends go, so it names
+    /// a consumer and is subject to the same pairing as the sends themselves.
     SetSendDst {
         /// `$units`.
-        units: Val,
+        units: SendEnd,
     },
 
     /// `sentient.logical_port` — binds a port name as a value (`SentientOps.td:920`).
@@ -1921,7 +1938,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             let _ = writeln!(
                 out,
                 "sentient.set_send_dst({})",
-                print::val(*units)
+                print::val(units.val())
             );
         }
         Op::LogicalPort { port_name, result } => {
