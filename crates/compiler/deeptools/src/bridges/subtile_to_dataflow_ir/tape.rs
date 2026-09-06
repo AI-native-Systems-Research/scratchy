@@ -13,9 +13,11 @@ use crate::arch::Arch;
 use crate::bridges::subtile_to_dataflow_ir::node::{Node, Residence};
 use crate::bridges::subtile_to_dataflow_ir::schedule;
 use crate::bridges::subtile_to_dataflow_ir::transfer::{self, Lanes};
-use crate::islands::dataflow_ir::op::{CompositeTransfer, Index, Op, Val};
+use crate::islands::dataflow_ir::op::{CompositeTransfer, Index, LaneMask, Op, Precision, Val};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
-use crate::islands::dataflow_ir::{Grid, GroupId, KernelName, OpIndex, Program, ProgramName, Run};
+use crate::islands::dataflow_ir::{
+    Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
+};
 use crate::model::Model;
 use crate::units::{Core, Corelet, DfirUnit, Residency};
 use crate::workload::{Exploit, Workload};
@@ -199,7 +201,7 @@ fn emit<
     );
 
     Ok(Run {
-        kernel: KernelName::Group(group),
+        kernel: KernelName(group),
         programs,
     })
 }
@@ -250,14 +252,31 @@ fn node_program<
 
     // Then every unit the schedule itself names, in the order it names them, each with the
     // residency the machine gives it.
+    // ⭐⭐ AND THE HANDLES ARE KEPT, BY ROLE. The walk used to bind each unit and throw the `Val`
+    // away, so nothing downstream could say WHICH unit a program unit runs on — and a
+    // `dataflow.program_unit` is exactly "these units run this".
+    let mut movers = Vec::new();
+    let mut computers = Vec::new();
     for unit in schedule::units_of(schedule) {
         let val = vals.mint();
+        // ⛔ THE ROLE IS THE UNIT'S KIND, read from the schedule rather than assumed: `lxlu`/`lxsu`
+        // move data, `sfp`/`pe`/`ptrow` compute. A unit that is neither still gets bound — the
+        // template named it — but names no program unit of ours.
+        match unit {
+            DfirUnit::Lxlu | DfirUnit::Lxsu => movers.push(val),
+            DfirUnit::Sfp | DfirUnit::Pe => computers.push(val),
+            _ => {}
+        }
         body.push(Op::GetUnit {
             result: val,
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
         });
     }
+
+    // ⛔ WHERE THE UNIT BINDINGS END. Everything pushed from here on is work, and work belongs
+    // inside a `dataflow.program_unit`.
+    let units_end = body.len();
 
     // ⭐ THE LANE WIDTH IS THE FORMAT'S, and it is the one the device declares. See `Lanes`: an
     // unlisted format is ONE lane by the stock arithmetic, not a stick's worth.
@@ -351,15 +370,54 @@ fn node_program<
         staged.push((dst, rows, cols));
     }
 
+    // ⛔⛔ THE UNITS ARE BOUND OUTSIDE, THE WORK INSIDE. IBM's own emitted DataflowIR puts only
+    // `dataflow.get_unit` and the constants at function scope, and every view, transfer and loop
+    // inside a `dataflow.program_unit` (`/tmp/ktir_ref/export/debug/dfir.mlir:44-78`) — five of
+    // them in one function, each naming the units it runs on.
+    let computes = nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX, STICK_ALIGNED>(
+        &mut vals, &staged, node, counts,
+    );
+
+    // ⭐ THE SPLIT IS WHERE THE UNIT WALK ENDED. Everything up to `units_end` binds units — that is
+    // function scope in IBM's own output, which puts only `dataflow.get_unit` and constants outside
+    // a program unit (`/tmp/ktir_ref/export/debug/dfir.mlir:44-63`). Everything after it is the
+    // views this node takes and the transfers it runs, which is the MOVER's work.
+    let mut preamble = body;
+    let moves = preamble.split_off(units_end);
+
     Ok(Program {
-        name: ProgramName::Emitted {
+        name: ProgramName {
             group,
             index,
             func: node.op_func,
         },
         grid: Grid::single(),
-        body: nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX, STICK_ALIGNED>(
-            body, &mut vals, &staged, node, counts,
+        preamble,
+        // ⭐ TWO UNITS, AND THE PRECISION IS ON THE ONE THAT COMPUTES. R182 `Unknown parent op for
+        // precision calculation` is the refusal for putting it on a unit that does not.
+        units: ProgramUnits::of(
+            ProgramUnit {
+                on: movers,
+                precision: None,
+                body: moves,
+                arch: core::marker::PhantomData,
+            },
+            vec![ProgramUnit {
+                on: computers,
+                // ⛔⛔ THE PRECISION IS THE COMPUTE'S OPCODE, NOT THE TENSOR'S DTYPE.
+                // `stringifyComputePrecision` takes a `ComputeOpType` and maps `FMA16 -> "fp16"`,
+                // `FMA8 -> "fp8"`, `IMA4 -> "int4"` (`DSC2ToDataflowIR.hpp:54-71`) — "used to
+                // identify the MAC op code used in the units". A `DataType -> Precision` map would
+                // be answering a different question.
+                //
+                // ⭐ AND THIS EMITTER'S COMPUTES ARE fp16, because the activation stream is fp16
+                // whatever the weights are quantised to — every `Vector` it builds is `F16`. When a
+                // compute runs at another width this becomes that compute's opcode, read from the
+                // op it emits rather than from the node.
+                precision: Some(Precision::Fp16),
+                body: computes,
+                arch: core::marker::PhantomData,
+            }],
         ),
         arch: core::marker::PhantomData,
     })
@@ -377,7 +435,6 @@ fn nest<
     const CACHE_FITS_LX: bool,
     const STICK_ALIGNED: bool,
 >(
-    mut body: Vec<Op>,
     vals: &mut Vals,
     staged: &[(Val, u64, u64)],
     node: &Node,
@@ -459,8 +516,12 @@ fn nest<
         }]
     };
 
-    body.extend(rows);
-    body
+    // ⛔⛔ ONLY THE COMPUTE'S NEST. This used to `body.extend(rows)` — folding the loader's views
+    // and transfers together with the compute into one flat sequence, which is how a program with
+    // no `dataflow.program_unit` at all came to be emitted. The two run on DIFFERENT units (a
+    // compute has no read port to the scratchpad — `VectorOperands.cpp:187-206`), so the caller
+    // puts them in different program units.
+    rows
 }
 
 /// THE COMPUTE ITSELF.
@@ -507,8 +568,14 @@ fn compute<const STICK_ALIGNED: bool>(
     let Some((&op1, rest)) = loaded.split_first() else {
         return ops;
     };
-    let mask = vals.mint();
-    ops.push(Op::True { result: mask });
+    // ⛔⛔ NO MASK ON AN UNMASKED BINARY. This minted an `arith.constant true` and handed it to
+    // every binary as a stand-in for "no mask" — an `i1` where the use site printed
+    // `vector<64xi1>`, which is exactly what dbo-opt refused on granite-2b's `group_7`:
+    // "use of value '%42' expects different type than prior uses: 'vector<64xi1>' vs 'i1'".
+    //
+    // ⛔ AND AN ALL-ONES MASK WOULD NOT BE THE FIX. That is the same op with a wider constant — a
+    // mask that masks nothing. `$mask` is `Optional` in the dialect, so an unmasked binary omits
+    // the operand entirely.
     let combined = match rest.first() {
         Some(&op2) => {
             let result = vals.mint();
@@ -516,7 +583,7 @@ fn compute<const STICK_ALIGNED: bool>(
                 result,
                 op1,
                 op2,
-                mask,
+                mask: None,
                 binary_op: binary_for(node.op_func),
                 op_specific_map: AffineMap::identity(1),
                 operand_ty: ty,
@@ -529,27 +596,31 @@ fn compute<const STICK_ALIGNED: bool>(
 
     // ⭐ AND ONLY NOW, THE TAIL — if there is one.
     if !STICK_ALIGNED {
-        let live = u64::from(counts.ragged_lanes);
-        let predicate = vals.mint();
-        ops.push(Op::CreateAffineMask {
-            result: predicate,
-            lanes: live,
-            ty: Vector {
+        // ⭐ ONE `LaneMask`, AND EVERY MENTION OF ITS TYPE COMES FROM IT. The definition below and
+        // the condition's type at the use are the same `Vector` value, so they cannot drift.
+        let prefix = LaneMask::prefix_of(
+            u64::from(counts.ragged_lanes),
+            Vector {
                 len: lanes,
                 elem: ElemType::Int(1),
             },
+        );
+        let bound = vals.mint();
+        ops.push(Op::CreateAffineMask {
+            result: bound,
+            mask: prefix,
         });
         let selected = vals.mint();
         ops.push(Op::ElementWiseSelection {
             result: selected,
-            cond: predicate,
+            // ⭐ THE PREDICATE IS THE CONDITION, carrying the type it was bound at.
+            cond: prefix.binds(bound),
             lhs: combined,
             rhs: op1,
-            mask,
-            cond_ty: Vector {
-                len: lanes,
-                elem: ElemType::Int(1),
-            },
+            // ⛔ AND NO MASK. The condition and the mask are SEPARATE operands
+            // (`VectorChain.td:401-402`); reusing the predicate as both would be one value doing
+            // two jobs, and the dialect makes the mask optional precisely so it can be absent.
+            mask: None,
             ty,
         });
     }

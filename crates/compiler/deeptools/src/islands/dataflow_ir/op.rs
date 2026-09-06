@@ -368,6 +368,77 @@ pub enum Bound {
     Val(Val),
 }
 
+/// A LANE MASK'S DEFINITION — how many lanes are live, and the i1 vector it is stated over.
+///
+/// ⭐ THE TWO TRAVEL TOGETHER because a prefix means nothing without the width it is a prefix OF.
+/// This is what `vectorchain.create_affine_mask` carries, and [`LaneMask::binds`] is the ONLY way
+/// to obtain a [`Predicate`] — so a mask's type at its USE is the same value that was written at
+/// its DEFINITION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneMask {
+    lanes: u64,
+    ty: Vector,
+}
+
+impl LaneMask {
+    /// A continuous live prefix of `lanes`, over an i1 vector of type `ty`.
+    #[must_use]
+    pub const fn prefix_of(lanes: u64, ty: Vector) -> Self {
+        Self { lanes, ty }
+    }
+
+    /// How many lanes are live.
+    #[must_use]
+    pub const fn live(self) -> u64 {
+        self.lanes
+    }
+
+    /// The i1 vector type this mask is stated over.
+    #[must_use]
+    pub const fn ty(self) -> Vector {
+        self.ty
+    }
+
+    /// THE VALUE A `create_affine_mask` BOUND, CARRYING THIS MASK'S OWN TYPE.
+    #[must_use]
+    pub const fn binds(self, result: Val) -> Predicate {
+        Predicate {
+            val: result,
+            ty: self.ty,
+        }
+    }
+}
+
+/// A MASK VALUE AND THE TYPE IT WAS DEFINED AT.
+///
+/// ⛔⛔ THE TYPE TRAVELS WITH THE VALUE, AND THAT IS THE WHOLE POINT. dbo-opt refused granite-2b's
+/// `group_7`: *"use of value '%42' expects different type than prior uses: 'vector<64xi1>' vs
+/// 'i1'"*. `%42` was minted by `arith.constant true` — an `i1` — while the use site printed its
+/// type by RECOMPUTING `vector<{lanes}xi1>` from the operands' lane count. Two records of one
+/// fact, and they disagreed.
+///
+/// ⭐ THE FIELDS ARE PRIVATE AND THERE IS NO PUBLIC CONSTRUCTOR. A `Predicate` comes only from
+/// [`LaneMask::binds`], so it cannot be built around a value whose definition says something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Predicate {
+    val: Val,
+    ty: Vector,
+}
+
+impl Predicate {
+    /// The masked value.
+    #[must_use]
+    pub const fn val(self) -> Val {
+        self.val
+    }
+
+    /// The type it was DEFINED at — never recomputed at the use.
+    #[must_use]
+    pub const fn ty(self) -> Vector {
+        self.ty
+    }
+}
+
 /// ONE DATAFLOWIR OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -643,9 +714,7 @@ pub enum Op {
 
     /// `affine.vector_load %view[..] : memref<..>, vector<..>`.
     ///
-    /// ⛔ THE `dcc-opt` FORM, kept because `examples/golden_xrfbmm` reproduces
-    /// `dcc/test/PT/xrfbmm_int8_fwd.mlir` byte-for-byte and that file is written in it. The BRIDGE
-    /// emits [`Op::AgenVectorLoad`]; see there.
+    /// ⛔ THE `dcc-opt` FORM. The BRIDGE emits [`Op::AgenVectorLoad`]; see there.
     VectorLoad {
         /// The vector it binds.
         result: Val,
@@ -806,8 +875,9 @@ pub enum Op {
         op1: Val,
         /// Right operand.
         op2: Val,
-        /// The lane mask.
-        mask: Val,
+        /// The lane mask, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
+        /// (`VectorChain.td`), so `None` prints no bracket at all.
+        mask: Option<Predicate>,
         /// Which comparison.
         compare_op: CompareOp,
         /// The operands' type.
@@ -820,16 +890,18 @@ pub enum Op {
     ElementWiseSelection {
         /// The vector it binds.
         result: Val,
-        /// The i1 vector chosen by.
-        cond: Val,
+        /// The i1 vector chosen by, CARRYING ITS OWN TYPE.
+        ///
+        /// ⛔ THIS USED TO BE A `Val` BESIDE A `cond_ty: Vector` THE EMITTER FILLED IN — the same
+        /// two-records shape that made the mask disagree with itself. A `Predicate` states it once.
+        cond: Predicate,
         /// Taken where the condition holds.
         lhs: Val,
         /// Taken otherwise.
         rhs: Val,
-        /// The lane mask.
-        mask: Val,
-        /// The condition's type.
-        cond_ty: Vector,
+        /// The lane mask, IF THIS OP CARRIES ONE. `Optional` in the dialect
+        /// (`VectorChain.td:402`), and the condition is a SEPARATE operand from it.
+        mask: Option<Predicate>,
         /// The operands' and result's type.
         ty: Vector,
     },
@@ -842,8 +914,14 @@ pub enum Op {
         op1: Val,
         /// Right operand.
         op2: Val,
-        /// The lane mask.
-        mask: Val,
+        /// The lane mask, IF THIS OP CARRIES ONE.
+        ///
+        /// ⛔⛔ `None` MEANS NO BRACKET, NOT AN ALL-TRUE CONSTANT. Every binary used to be handed
+        /// an `arith.constant true` as a stand-in for "unmasked", which is both an `i1` where a
+        /// `vector<Nxi1>` was printed (the granite-2b `group_7` refusal) and a mask that masks
+        /// nothing. `Optional<AnyVectorOfAnyRank>:$mask` (`VectorChain.td:139`) — an unmasked
+        /// binary simply omits the operand.
+        mask: Option<Predicate>,
         /// Which operation.
         binary_op: BinaryOp,
         /// `op_specific_map=` — REQUIRED, and dbo-opt says so: "'vectorchain.binary' op requires
@@ -930,9 +1008,12 @@ pub enum Op {
     CreateAffineMask {
         /// The i1 vector it binds.
         result: Val,
-        /// How many lanes are live, as a continuous prefix.
-        lanes: u64,
-        /// The mask's type.
-        ty: Vector,
+        /// THE MASK ITSELF — its live prefix AND the type it is stated over, as one value.
+        ///
+        /// ⛔⛔ `lanes: u64` AND `ty: Vector` AS SEPARATE FIELDS WERE TWO RECORDS OF ONE FACT. The
+        /// definition printed from `ty` while every USE recomputed `vector<{len}xi1>` from the
+        /// operands — which is how `%42` came to be defined as `i1` and used as `vector<64xi1>`.
+        /// [`LaneMask::binds`] hands the SAME `Vector` to the use site, so they cannot differ.
+        mask: LaneMask,
     },
 }
