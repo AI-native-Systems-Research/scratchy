@@ -22,3 +22,5 @@
 //! ABSENCE is fine — a precision no operand supplies is absent, not an error.
 
 pub mod precision;
+/// What a load's value reaches, and which unit consumes it.
+pub mod load_chain;
