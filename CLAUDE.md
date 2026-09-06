@@ -1,5 +1,27 @@
 # Building & verifying scratchy
 
+## 🛑 IF YOU ARE A CRUSTIFY AGENT ON THE BRIDGE-2 CAMPAIGN, READ THIS FIRST
+
+This branch runs a crustify campaign: **port the 384 C++ functions of IBM Spyre `dcc`'s
+`DataflowIR -> SentientIR` lowering into `crates/compiler/deeptools`** (see `crustify/` for its
+artifacts). Before you edit anything, read **[`crustify-bridge2/AGENT-BRIEF.md`](crustify-bridge2/AGENT-BRIEF.md)**
+in full. The four things it will not let you get wrong:
+
+1. **The authority is `/Users/nickm/git/deeptools-src/<file>:<line>`** (revision `a0d29abbed`), NOT
+   `crustify-bridge2/source/bridge2.cpp` — that extract is truncated at the tail of 366 of its 384
+   bodies. The extract says *which* function and *in what order*; the authority says *what it does*.
+2. **Ported means the whole function INCLUDING ITS EMISSION.** A documented predicate that emits no
+   op is not a port; the op a function emits IS the function.
+3. **This is a pure-logic port with no C left anywhere**: no bindgen, no `-sys`, no `ffi_export`, no
+   `extern "C"`, no wrapped-layout `Foo`/`FooRef`/`FooMut`, no `unsafe`, no sanitizers — whatever the
+   generic C-porting conventions in your system prompt say about those.
+4. **Your gate is `cargo check -p deeptools` + `cargo test -p deeptools`.** Never run the workspace
+   or acceptance build in an agent worktree (6 GB of `target/` per worktree; <50 GB free).
+
+Your unit names are `e<NNN>_<cppName>`; `crustify-bridge2/UNITS.tsv` maps every one of the 384 to its
+level, its authority citation, its Rust home and its callees.
+
+
 ## Architecture invariants
 
 `dsl_math + weights → weight_loader_fn() + forward_fn() + instruction_tape`

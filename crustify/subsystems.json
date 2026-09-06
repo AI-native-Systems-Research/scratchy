@@ -1,0 +1,261 @@
+{
+ "_comment": [
+  "Subsystem decomposition of bridge 2's 384 functions. The LINK UNIT is the existing Rust crate the",
+  "port lands in (`deeptools`); the five subsystems are the dcc directory groups, which is also how",
+  "crates.json homes them.",
+  "",
+  "\u26d4 THE SUBSYSTEM GRAPH IS NOT THIS CAMPAIGN'S SCHEDULING ORDER, and cannot be: all 384 functions",
+  "come from ONE translation unit and the groups call each other in both directions (see depends_on",
+  "below \u2014 the graph has cycles at group granularity, which is a fact about the reference, not a",
+  "decomposition defect). What IS acyclic, and what the sub-campaigns are therefore built on, is the",
+  "per-function DEPENDENCY LEVEL that bridge2.cpp itself is emitted in: level 0 calls nothing else in",
+  "the span, level N only levels below it. The four sub-campaigns under crustify/campaigns/ partition",
+  "those 11 levels in order and each wave is one level behind a full barrier.",
+  "",
+  "Every subsystem is `targeted`: this is a complete port with no C interoperability boundary, no",
+  "-sys surface and no wrapped C left behind. There is no imported producer closure \u2014 the names the",
+  "bodies call that are NOT in the span are MLIR/LLVM/dcc infrastructure that scratchy replaces with",
+  "typed values at macro-expansion time, never wraps."
+ ],
+ "build_version": 1,
+ "oracle_config": "crustify/wavefront/wavefront-config.json",
+ "link_units": [
+  {
+   "name": "deeptools",
+   "kind": "library",
+   "linkage": "rlib",
+   "target": "crates/compiler/deeptools",
+   "subsystems": [
+    {
+     "name": "agen_to_sentient",
+     "scope": "targeted",
+     "_comment": "Conversion/AgenToSentient \u2014 the transfer statements: load_and_send, receive_and_store, load_and_store, addressing, ldtype, bursts, interleave.",
+     "implementation_files": [
+      "dcc/src/Conversion/AgenToSentient/AccessDetails.cpp",
+      "dcc/src/Conversion/AgenToSentient/AccessDetails.hpp",
+      "dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp",
+      "dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp",
+      "dcc/src/Conversion/AgenToSentient/Helper.cpp"
+     ],
+     "loc": 4582,
+     "nr_types": 0,
+     "nr_symbols": 105,
+     "levels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+     ],
+     "depends_on": [
+      {
+       "link_unit": "deeptools",
+       "subsystem": "standard_and_scf",
+       "nr_edges": 11
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "transform",
+       "nr_edges": 2
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "vectorchain",
+       "nr_edges": 36
+      }
+     ]
+    },
+    {
+     "name": "dataflow_to_sentient",
+     "scope": "targeted",
+     "_comment": "Conversion/DataflowToSentient \u2014 unit and group lowering, the sync statements, corelet-N neighbour naming.",
+     "implementation_files": [
+      "dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp"
+     ],
+     "loc": 1857,
+     "nr_types": 0,
+     "nr_symbols": 21,
+     "levels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+     ],
+     "depends_on": [
+      {
+       "link_unit": "deeptools",
+       "subsystem": "agen_to_sentient",
+       "nr_edges": 13
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "standard_and_scf",
+       "nr_edges": 1
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "vectorchain",
+       "nr_edges": 8
+      }
+     ]
+    },
+    {
+     "name": "vectorchain",
+     "scope": "targeted",
+     "_comment": "Conversion/VectorChainLowering \u2014 the computes: mac, binary, unary, splat, merge/pack, the gcvt/fcvt table, masks, PT and PE/SFP lowering.",
+     "implementation_files": [
+      "dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp",
+      "dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp",
+      "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp",
+      "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp",
+      "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp",
+      "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp",
+      "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp"
+     ],
+     "loc": 4188,
+     "nr_types": 0,
+     "nr_symbols": 97,
+     "levels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+     ],
+     "depends_on": [
+      {
+       "link_unit": "deeptools",
+       "subsystem": "agen_to_sentient",
+       "nr_edges": 31
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "standard_and_scf",
+       "nr_edges": 8
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "transform",
+       "nr_edges": 9
+      }
+     ]
+    },
+    {
+     "name": "transform",
+     "scope": "targeted",
+     "_comment": "Transform/Dataflow \u2014 the in-place DataflowIR rewrites: program-unit reduction, mutable start-addr shifting, paged memory views, flattening, toggle canonicalisation.",
+     "implementation_files": [
+      "dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp",
+      "dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp",
+      "dcc/src/Transform/Dataflow/CFGSimplificationDataflowLevel.cpp",
+      "dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp",
+      "dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp",
+      "dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp",
+      "dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp",
+      "dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp",
+      "dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp",
+      "dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp",
+      "dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp",
+      "dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp",
+      "dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp",
+      "dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp",
+      "dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp",
+      "dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp",
+      "dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp",
+      "dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp",
+      "dcc/src/Transform/Dataflow/UnitFiltering.cpp",
+      "dcc/src/Transform/Dataflow/Utils.cpp"
+     ],
+     "loc": 4728,
+     "nr_types": 0,
+     "nr_symbols": 141,
+     "levels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+     ],
+     "depends_on": [
+      {
+       "link_unit": "deeptools",
+       "subsystem": "agen_to_sentient",
+       "nr_edges": 57
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "standard_and_scf",
+       "nr_edges": 30
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "vectorchain",
+       "nr_edges": 55
+      }
+     ]
+    },
+    {
+     "name": "standard_and_scf",
+     "scope": "targeted",
+     "_comment": "Conversion/{StandardToSentient,SCFToSentient,AffineToStandard,SymbolToSentient} \u2014 scalar ops, constants, branches, terminators.",
+     "implementation_files": [
+      "dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp",
+      "dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp",
+      "dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp",
+      "dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp"
+     ],
+     "loc": 576,
+     "nr_types": 0,
+     "nr_symbols": 20,
+     "levels": [
+      0,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8
+     ],
+     "depends_on": [
+      {
+       "link_unit": "deeptools",
+       "subsystem": "agen_to_sentient",
+       "nr_edges": 7
+      },
+      {
+       "link_unit": "deeptools",
+       "subsystem": "vectorchain",
+       "nr_edges": 2
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

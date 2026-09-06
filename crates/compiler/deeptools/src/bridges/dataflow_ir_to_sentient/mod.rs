@@ -36,6 +36,48 @@
 /// `AgenToSentientLoweringPass`, function by function.
 pub mod agen_to_sentient;
 
+/// ⭐ THE PORTED SPAN — one module per original dcc translation unit; unit names and their
+/// authority citations are in `crustify-bridge2/UNITS.tsv` and `crustify/crates.json`.
+///
+/// `agen_to_sentient` above is the PREVIOUS partial attempt (decision predicates with no
+/// emission, called by nothing); nothing in it counts as a ported unit.
+pub mod agen_access_details;
+pub mod agen_agen_to_sentient;
+pub mod agen_helper;
+pub mod dfs_dataflow_to_sentient;
+pub mod std_affine_to_standard;
+pub mod std_scf_to_sentient;
+pub mod std_standard_to_sentient;
+pub mod std_symbol_to_sentient;
+pub mod tf_canonicalize_toggle;
+pub mod tf_cfg_simplification_dataflow_level;
+pub mod tf_cfgs_dataflow_conditional_tree;
+pub mod tf_duplicate_reused_toggle;
+pub mod tf_enumerate_collection_unit;
+pub mod tf_flattening_local_regions;
+pub mod tf_loop_unroll_for_shuffle_op;
+pub mod tf_loop_unrolling_for_ptlrf_regs;
+pub mod tf_mutable_addr_splitting;
+pub mod tf_mutable_start_addr_shifting;
+pub mod tf_program_units_reduction;
+pub mod tf_transform_loop_to_legalize_for_sentient_lowering;
+pub mod tf_transform_paged_mem_view;
+pub mod tf_transform_paged_mem_view_impl;
+pub mod tf_transform_paged_mem_view_manager;
+pub mod tf_uniform_query_maps_canonicalization;
+pub mod tf_unit_filtering;
+pub mod tf_utils;
+pub mod vc_helper;
+pub mod vc_loop_mask_tree;
+pub mod vc_lowering_pt_masks;
+pub mod vc_lowering_xrf;
+pub mod vc_operand_reuse;
+pub mod vc_splat;
+pub mod vc_vector_chain_helper;
+pub mod vc_vector_chain_to_sentient_pesfp;
+pub mod vc_vector_chain_to_sentient_pt;
+pub mod vc_vector_operands;
+
 use crate::arch::{Arch, Bytes, Elements};
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::{self as dfir, Values};

@@ -1,0 +1,3154 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/campaigns/levels1-2-transfer-and-compute/wavefront-config.json",
+  "sha256": "f016725bd0dd7fa2d64b9d122013811680b88ef72904a9238daa22c154e1f060"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 50,
+  "max_loc": 1000,
+  "max_types": 5,
+  "min_fields": 20
+ },
+ "summary": {
+  "unit_count": 122,
+  "layer_count": 2,
+  "batch_count": 6,
+  "file_count": 1
+ },
+ "waves": [
+  {
+   "unit_count": 63,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge2/source/bridge2.cpp",
+     "items": [
+      {
+       "name": "e143_constructExtentAndTotalElements",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 64,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e006_setLayoutCoeffs",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e011_setExtents",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e012_setTotalElements",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e144_constructLdOrStType",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e145_initializeMemViewInfo",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 16,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e004_setMemViewStartAddr",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e007_setMemViewLayoutMap",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e146_constructIndices",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 50,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e003_setIndices",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e017_setSubscriptsMap",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e147_constructIteratorCoefficients",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e018_setIndicesCoeffDict",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e148_computeBurstAndGroup",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 36,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e024_setInterleaveGroupIndex",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e149_insert",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 7,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e150_get",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e151_checkCompositeRegion",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 89,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e152_checkStoreOpFromExtractPattern",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 27,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e153_isLoadAndExtractScalarPattern",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 27,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e154_isReceiveAndExtractScalarPattern",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 17,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e155_updateSymbolicAccessDetails",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 35,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e003_setIndices",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e004_setMemViewStartAddr",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e025_setStrides",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e156_getStoreProducer",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 159,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e157_constructSetActiveMaskValueOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 161,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e158_createUniformizeRegionsOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 57,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e159_getUnitNameFromAListOfGetUnitOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e160_areCoreletsDifferent",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 6,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e161_separateBasedOnDestinationUnits",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 18,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e162_insertIfNotExists",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e163_getMaskValueConstantForNonPT",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 40,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e164_checkValidityOfPackAndShuffleLowering",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 45,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e165_getMergeTypeFromIndices",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 109,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge2/source/bridge2.cpp",
+     "items": [
+      {
+       "name": "e166_getOperandFromConstantOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 26,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e073_constValToField",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e167_getOperandFromConstantBitstreamOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e073_constValToField",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e168_getOperandFromNegOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e169_getName",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 11,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e170_getLayoutMapAndIndices",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 40,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e171_isMaskEquivalentToNode",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e081_getParentNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e086_MaskNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e102_getParentNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e172_areXrfAccessesLegal",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 28,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e173_insertConstAndAddOps",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e174_isXrfRelated",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 31,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e175_updateYieldArgs",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e176_opHasSideEffect",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 13,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e177_mergeShallow",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 60,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e096_createDummyYieldInElseReg",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e097_getNewDbgNameFromList",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e178_runOnOperation",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 42,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e001_matchAndRewrite",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e179_clear",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 15,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e079_OperationNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e088_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e101_OperationNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e107_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e180_traverseRegion",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 17,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e181_inRegionEmpty",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 6,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e083_getNextSibling",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e104_getNextSibling",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e182_cloneOpsForRegions",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 60,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e082_getFirstChild",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e083_getNextSibling",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e103_getFirstChild",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e104_getNextSibling",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e183_expandAffineApplyOps",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 53,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e184_getLoopTripCount",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 56,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e185_hasMutableAddrOverflow",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 14,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e186_calculatePartitionSizes",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 97,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e187_constructConditionals",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 59,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e188_calculateSubscriptsCoefficients",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 11,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e189_synthesizeTimeInfo",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 22,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e190_createExplicitTimeLoops",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 57,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e191_calculateFullShift",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 25,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e019_AccessDetailsAffine",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e192_calculateDimWeights",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 26,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e019_AccessDetailsAffine",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e193_matchUnits",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 77,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge2/source/bridge2.cpp",
+     "items": [
+      {
+       "name": "e194_analyzeLoop",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 127,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e195_transformLoop",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 38,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e196_runOnOperation",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 23,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e197_calculateIndicesRanges",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 25,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e198_createConditionsForHyperRectSubscripts",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 48,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e120_createEqualityCondition",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e121_createInequalityCondition",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e199_createConditionsForNonHyperRectSubscripts",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 35,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e120_createEqualityCondition",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e121_createInequalityCondition",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e200_updateTPMVInfo",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 17,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e201_setLoopIteratorOrder",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 13,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e202_initialize",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 13,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e203_removeCoresCoreletsFoldsFromDefImmutMap",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 37,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e204_cleanup",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 49,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e205_isDataTransferToKeep",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e141_isDataTransfer",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 59,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge2/source/bridge2.cpp",
+     "items": [
+      {
+       "name": "e206_constructChunkAndShuffleInfo",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 167,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e008_setShuffleMode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e009_setRotationPosition",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e207_initialize",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 57,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e003_setIndices",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e010_setExpectedTotalElements",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e013_setElementWidth",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e014_setTransferSet",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e015_setTransferOrder",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e017_setSubscriptsMap",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e208_emplace_insert",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e209_getFirst",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 7,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e210_checkBasicConditions",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 133,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e211_processInterleaveOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 80,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e212_gatherAffineLoadStoreDetails",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 74,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e030_getLoopNestLevel",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e213_constructImmutableAddress",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 16,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e214_setImmutableAddrAndIncrements",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 43,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e215_setsttype",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 50,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e216_constructReceiveAndExtractScalarOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 91,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e217_lowerVectorLoadHelper",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 46,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e027_constructLoadAndSendStmt",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e218_lowerSetTransferMaskStateOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 9,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e157_constructSetActiveMaskValueOp",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e219_cloneStartAddrOutsideLoop",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 79,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e158_createUniformizeRegionsOp",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e220_cleanupTriviallyRedundantSetSendDestination",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 38,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e221_pushBackTheUnitToListIfDoesnotExist",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e222_createUniformRegionsWithTwoRegionsNoResult",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 18,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e223_lowerL3SyncOperationForAUnit",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 57,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e041_ExtendUnitNameToCorelet",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e159_getUnitNameFromAListOfGetUnitOp",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge2/source/bridge2.cpp",
+     "items": [
+      {
+       "name": "e224_lowerL3SyncOperationForAGroupOfUnits",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 61,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e041_ExtendUnitNameToCorelet",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e159_getUnitNameFromAListOfGetUnitOp",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e225_matchAndRewrite",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 69,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e226_createIfOpFromMapping",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 61,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e227_OperandReuse",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 0,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e228_validateLoweringAndSetMissingParameters",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 49,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e229_getMaskValueForNonPT",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 9,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e230_convertStringToType",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 24,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e231_convertTypeToString",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 22,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e232_getOperandFromLoadOrStoreOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 94,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e233_eraseOperands",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 46,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e234_setValue",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 3,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e235_createSentientConstants",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 31,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e236_addMaskNode",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 16,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e078_findNodeFromOp",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e080_LoopMaskNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e082_getFirstChild",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e086_MaskNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e088_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e103_getFirstChild",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e107_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e237_updateNode",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e238_computeLoops",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 18,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e080_LoopMaskNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e087_LMTLoopNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e088_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e107_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e239_insertPTMaskOps",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 164,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e079_OperationNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e080_LoopMaskNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e081_getParentNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e082_getFirstChild",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e083_getNextSibling",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e086_MaskNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e088_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e101_OperationNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e102_getParentNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e103_getFirstChild",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e104_getNextSibling",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e107_getRoot",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e240_getLayoutExpr",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 67,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e241_createForOpWithReturnValue",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 56,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e242_createIfOpWithReturnValue",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 56,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e243_insertDummyMacOp",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 15,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e244_isHoistable",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 9,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e245_enumerateCollectionUnit",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 57,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e246_FlatteningLocalRegionsTree",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 0,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e247_compute",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 15,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge2/source/bridge2.cpp",
+     "items": [
+      {
+       "name": "e248_runOnOperation",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 68,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e249_processComputeUnit",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 91,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e250_initMASData",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 31,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e019_AccessDetailsAffine",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e251_setupForPartitioning",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 6,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e252_fillPartitions",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 117,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e081_getParentNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e102_getParentNode",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e188_calculateSubscriptsCoefficients",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e253_adjustForEvenImmutableAddr",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 47,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e016_AccessDetailsBase",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e019_AccessDetailsAffine",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e254_offsetShifts",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 22,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e016_AccessDetailsBase",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e019_AccessDetailsAffine",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e255_applyShifts",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 27,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e019_AccessDetailsAffine",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e256_runOnOperation",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 76,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e257_analyzeAndTransform",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 3,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e194_analyzeLoop",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e258_addConstraintsForIVRanges",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 22,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e259_createNewSubscriptsFromStartElements",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e260_gatherPageDependentDimsForPage",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 32,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e052_If",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e261_runOnOperation",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 41,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e026_has",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e262_removeCoresCoreletsFoldsFromUniformizeRegion",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 98,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e064_size",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e149_insert",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e150_get",
+          "defined_in": "crustify-bridge2/source/bridge2.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e263_removeAncestors",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 18,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e264_createForOpWithAdditionalReturnValue",
+       "defined_in": "crustify-bridge2/source/bridge2.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 2,
+       "loc": 66,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
