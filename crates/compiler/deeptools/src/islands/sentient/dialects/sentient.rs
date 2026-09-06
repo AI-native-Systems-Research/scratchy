@@ -215,54 +215,152 @@ pub enum Port {
     CrossPtNorthLink,
 }
 
-/// WHICH `lrf<n>` — ⛔ AN INDEX THE INSTRUCTION FIELD CAN ACTUALLY NAME.
+/// WHICH `lrf<n>` — ⛔ ONE VARIANT PER CASE THE `.td` DECLARES, and no way to write another.
 ///
-/// ⛔⛔ THIS WAS A BARE `u8` GUARDED BY A RUNTIME `assert!` INSIDE `Port::encoding`, WHICH IS THE
-/// FAILURE MODE THIS REPO REFUSES ON PRINCIPLE: `Port::Lrf(200)` was constructible, travelled through
-/// every lowering, and aborted at print time — the furthest possible point from the mistake. A
-/// checked constructor makes it unrepresentable instead, which is the same shape as
-/// [`crate::units::CoreId::checked`].
+/// ⛔⛔ THIS WAS A CHECKED CONSTRUCTOR OVER `Bounded<32>`, AND A CHECKED CONSTRUCTOR IS STILL A
+/// RUNTIME REFUSAL — `LrfIndex::checked(200)` handed back `None` at run time and left every caller
+/// with an `Option` to mishandle. Before that it was a bare `u8` behind an `assert!`. Both are gone:
+/// the set is thirty-two cases, so it is thirty-two variants.
 ///
-/// ⛔ THIRTY-TWO IS WHAT THE ISA FIELD ENCODES, NOT A REGISTER FILE'S DEPTH. The SFP/PE LRF holds
-/// sixteen on this target and the state file one, and those vary by arch where this number does not.
+/// ⭐ AND THIS IS WHAT THE VENDOR DOES. `SentientTypes.td:108-160` writes thirty-two separate
+/// `def SentientLRF<n> : I32EnumAttrCase<"lrf<n>", …>` lines. Enumerating them is transcription, not
+/// verbosity.
+///
+/// ⛔ THE WIRE VALUES ARE **SPLIT** AND THE GAP IS OCCUPIED: 0..15 encode as `12 + n`, 16..31 as
+/// `48 + (n - 16)`, and `latch` is 28 — exactly where a naive `12 + n` puts `lrf16`.
+/// [`Port::encoding`] is the only place that arithmetic happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LrfIndex(Bounded<32>);
+pub enum LrfIndex {
+    /// `lrf0`.
+    L0,
+    /// `lrf1`.
+    L1,
+    /// `lrf2`.
+    L2,
+    /// `lrf3`.
+    L3,
+    /// `lrf4`.
+    L4,
+    /// `lrf5`.
+    L5,
+    /// `lrf6`.
+    L6,
+    /// `lrf7`.
+    L7,
+    /// `lrf8`.
+    L8,
+    /// `lrf9`.
+    L9,
+    /// `lrf10`.
+    L10,
+    /// `lrf11`.
+    L11,
+    /// `lrf12`.
+    L12,
+    /// `lrf13`.
+    L13,
+    /// `lrf14`.
+    L14,
+    /// `lrf15`.
+    L15,
+    /// `lrf16`.
+    L16,
+    /// `lrf17`.
+    L17,
+    /// `lrf18`.
+    L18,
+    /// `lrf19`.
+    L19,
+    /// `lrf20`.
+    L20,
+    /// `lrf21`.
+    L21,
+    /// `lrf22`.
+    L22,
+    /// `lrf23`.
+    L23,
+    /// `lrf24`.
+    L24,
+    /// `lrf25`.
+    L25,
+    /// `lrf26`.
+    L26,
+    /// `lrf27`.
+    L27,
+    /// `lrf28`.
+    L28,
+    /// `lrf29`.
+    L29,
+    /// `lrf30`.
+    L30,
+    /// `lrf31`.
+    L31,
+}
 
 impl LrfIndex {
-    /// An index, or `None` where the instruction field could not name it.
+    /// The number this case spells.
     #[must_use]
-    pub const fn checked(index: u32) -> Option<LrfIndex> {
-        match Bounded::checked(index) {
-            Some(bounded) => Some(LrfIndex(bounded)),
-            None => None,
+    pub const fn get(self) -> u8 {
+        match self {
+            Self::L0 => 0,
+            Self::L1 => 1,
+            Self::L2 => 2,
+            Self::L3 => 3,
+            Self::L4 => 4,
+            Self::L5 => 5,
+            Self::L6 => 6,
+            Self::L7 => 7,
+            Self::L8 => 8,
+            Self::L9 => 9,
+            Self::L10 => 10,
+            Self::L11 => 11,
+            Self::L12 => 12,
+            Self::L13 => 13,
+            Self::L14 => 14,
+            Self::L15 => 15,
+            Self::L16 => 16,
+            Self::L17 => 17,
+            Self::L18 => 18,
+            Self::L19 => 19,
+            Self::L20 => 20,
+            Self::L21 => 21,
+            Self::L22 => 22,
+            Self::L23 => 23,
+            Self::L24 => 24,
+            Self::L25 => 25,
+            Self::L26 => 26,
+            Self::L27 => 27,
+            Self::L28 => 28,
+            Self::L29 => 29,
+            Self::L30 => 30,
+            Self::L31 => 31,
         }
-    }
-
-    /// The index.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0.get()
     }
 }
 
-/// WHICH `istate<n>` — four exist (`SentientTypes.td:143-146`).
+/// WHICH `istate<n>` — ⛔ FOUR EXIST (`SentientTypes.td:143-146`), so four variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IStateIndex(Bounded<4>);
+pub enum IStateIndex {
+    /// `istate0`.
+    S0,
+    /// `istate1`.
+    S1,
+    /// `istate2`.
+    S2,
+    /// `istate3`.
+    S3,
+}
 
 impl IStateIndex {
-    /// An index, or `None` where there is no such state register.
+    /// The number this case spells.
     #[must_use]
-    pub const fn checked(index: u32) -> Option<IStateIndex> {
-        match Bounded::checked(index) {
-            Some(bounded) => Some(IStateIndex(bounded)),
-            None => None,
+    pub const fn get(self) -> u8 {
+        match self {
+            Self::S0 => 0,
+            Self::S1 => 1,
+            Self::S2 => 2,
+            Self::S3 => 3,
         }
-    }
-
-    /// The index.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0.get()
     }
 }
 
@@ -334,10 +432,12 @@ impl Port {
             Self::Irf0 => 10,
             Self::Irf1 => 11,
             Self::Lrf(n) => {
+                // ⛔ THE SPLIT LIVES HERE AND NOWHERE ELSE. `latch` is 28, which is where a naive
+                // `12 + n` puts `lrf16`.
                 if n.get() < 16 {
-                    12 + n.get()
+                    12 + n.get() as u32
                 } else {
-                    48 + (n.get() - 16)
+                    48 + (n.get() as u32 - 16)
                 }
             }
             Self::Latch => 28,
@@ -354,7 +454,7 @@ impl Port {
             Self::Nfwd0 => 40,
             Self::Nfwd2 => 41,
             Self::NbrSlice => 42,
-            Self::IState(n) => 43 + n.get(),
+            Self::IState(n) => 43 + n.get() as u32,
             Self::CrossPtNorthLink => 47,
         }
     }
@@ -491,79 +591,159 @@ impl FoldMode {
     }
 }
 
-/// A `gcvt_imm<n>` A **BINARY** MAY TAKE — ⛔ 0, 4, 24, 28 AND NOTHING ELSE
-/// (`SentientTypes.td:345-348`).
+/// A `gcvt_imm<n>` A **BINARY** MAY TAKE — ⛔ FOUR CASES, so four variants.
 ///
-/// ⛔⛔ THIS WAS A BARE `u8` WITH THE LEGAL SET IN A `const` ARRAY BESIDE IT, which documents the
-/// rule without enforcing it: `GcvtImm(3)` was constructible and printed `gcvt_imm3`, an attribute
-/// the parser does not know. A closed vendor set gets a total constructor.
+/// ⛔⛔ NO CONSTRUCTOR, BECAUSE A CHECKED CONSTRUCTOR IS STILL A RUNTIME REFUSAL. This was first a
+/// bare `u8` with the legal set in a `const` array beside it (a comment), then a
+/// `checked(u8) -> Option` (a refusal). `gcvt_imm3` is now unwritable rather than rejected.
 ///
-/// ⛔ AND IT IS **DISJOINT** FROM [`UnaryGcvt`]'s. Same spelling, no shared value — which is why they
-/// are two types rather than one with a wider set.
+/// ⛔ AND **DISJOINT** FROM [`UnaryGcvt`]'s — same spelling, no shared value, which is why they are two
+/// types and not one wider set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BinaryGcvt(u8);
+pub enum BinaryGcvt {
+    /// `gcvt_imm0`.
+    Imm0,
+    /// `gcvt_imm4`.
+    Imm4,
+    /// `gcvt_imm24`.
+    Imm24,
+    /// `gcvt_imm28`.
+    Imm28,
+}
 
 impl BinaryGcvt {
-    /// The immediate, or `None` where the enum defines no such case.
-    #[must_use]
-    pub const fn checked(imm: u8) -> Option<BinaryGcvt> {
-        match imm {
-            0 | 4 | 24 | 28 => Some(BinaryGcvt(imm)),
-            _ => None,
-        }
-    }
-
-    /// The immediate.
+    /// The number this case spells.
     #[must_use]
     pub const fn get(self) -> u8 {
-        self.0
+        match self {
+            Self::Imm0 => 0,
+            Self::Imm4 => 4,
+            Self::Imm24 => 24,
+            Self::Imm28 => 28,
+        }
     }
 }
 
-/// AN `fcvt_imm<n>` A **BINARY** MAY TAKE — ⛔ 2, 3, 4, 7 only (`SentientTypes.td:349-352`).
-/// Disjoint from [`UnaryFcvt`]'s.
+/// AN `fcvt_imm<n>` A **BINARY** MAY TAKE — ⛔ four cases (`SentientTypes.td:349-352`), disjoint from
+/// [`UnaryFcvt`]'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BinaryFcvt(u8);
+pub enum BinaryFcvt {
+    /// `fcvt_imm2`.
+    Imm2,
+    /// `fcvt_imm3`.
+    Imm3,
+    /// `fcvt_imm4`.
+    Imm4,
+    /// `fcvt_imm7`.
+    Imm7,
+}
 
 impl BinaryFcvt {
-    /// The immediate, or `None` where the enum defines no such case.
-    #[must_use]
-    pub const fn checked(imm: u8) -> Option<BinaryFcvt> {
-        match imm {
-            2 | 3 | 4 | 7 => Some(BinaryFcvt(imm)),
-            _ => None,
-        }
-    }
-
-    /// The immediate.
+    /// The number this case spells.
     #[must_use]
     pub const fn get(self) -> u8 {
-        self.0
+        match self {
+            Self::Imm2 => 2,
+            Self::Imm3 => 3,
+            Self::Imm4 => 4,
+            Self::Imm7 => 7,
+        }
     }
 }
 
 /// WHICH `pack<n>` — ⛔⛔ **TEN AND ELEVEN DO NOT EXIST**.
 ///
-/// The enum runs 0..9 and then 12..27 (`SentientTypes.td:368-388`). A bare `u8` made `Pack(10)` and
-/// `Pack(11)` constructible, and they print attributes the parser rejects — a gap in the middle of a
-/// range being exactly the shape a reader completes by hand without noticing.
+/// The enum runs 0..9 and then 12..27 (`SentientTypes.td:368-388`), and a gap in the middle of a range
+/// is exactly the shape a reader completes by hand without noticing. Twenty-six cases, twenty-six
+/// variants, and no way to name the two that are absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PackIndex(u8);
+pub enum PackIndex {
+    /// `pack0`.
+    P0,
+    /// `pack1`.
+    P1,
+    /// `pack2`.
+    P2,
+    /// `pack3`.
+    P3,
+    /// `pack4`.
+    P4,
+    /// `pack5`.
+    P5,
+    /// `pack6`.
+    P6,
+    /// `pack7`.
+    P7,
+    /// `pack8`.
+    P8,
+    /// `pack9`.
+    P9,
+    /// `pack12`.
+    P12,
+    /// `pack13`.
+    P13,
+    /// `pack14`.
+    P14,
+    /// `pack15`.
+    P15,
+    /// `pack16`.
+    P16,
+    /// `pack17`.
+    P17,
+    /// `pack18`.
+    P18,
+    /// `pack19`.
+    P19,
+    /// `pack20`.
+    P20,
+    /// `pack21`.
+    P21,
+    /// `pack22`.
+    P22,
+    /// `pack23`.
+    P23,
+    /// `pack24`.
+    P24,
+    /// `pack25`.
+    P25,
+    /// `pack26`.
+    P26,
+    /// `pack27`.
+    P27,
+}
 
 impl PackIndex {
-    /// The index, or `None` for the two the enum skips and anything past its end.
-    #[must_use]
-    pub const fn checked(index: u8) -> Option<PackIndex> {
-        match index {
-            0..=9 | 12..=27 => Some(PackIndex(index)),
-            _ => None,
-        }
-    }
-
-    /// The index.
+    /// The number this case spells.
     #[must_use]
     pub const fn get(self) -> u8 {
-        self.0
+        match self {
+            Self::P0 => 0,
+            Self::P1 => 1,
+            Self::P2 => 2,
+            Self::P3 => 3,
+            Self::P4 => 4,
+            Self::P5 => 5,
+            Self::P6 => 6,
+            Self::P7 => 7,
+            Self::P8 => 8,
+            Self::P9 => 9,
+            Self::P12 => 12,
+            Self::P13 => 13,
+            Self::P14 => 14,
+            Self::P15 => 15,
+            Self::P16 => 16,
+            Self::P17 => 17,
+            Self::P18 => 18,
+            Self::P19 => 19,
+            Self::P20 => 20,
+            Self::P21 => 21,
+            Self::P22 => 22,
+            Self::P23 => 23,
+            Self::P24 => 24,
+            Self::P25 => 25,
+            Self::P26 => 26,
+            Self::P27 => 27,
+        }
     }
 }
 
@@ -593,46 +773,68 @@ impl MergeWidth {
     }
 }
 
-/// A `gcvt_imm<n>` A **UNARY** MAY TAKE — ⛔ 1, 2, 5, 6, 8, 16, 17 (`SentientTypes.td:630-636`).
-/// Disjoint from [`BinaryGcvt`]'s.
+/// A `gcvt_imm<n>` A **UNARY** MAY TAKE — ⛔ seven cases (`SentientTypes.td:630-636`).
+///
+/// ⛔⛔ DISJOINT FROM [`BinaryGcvt`]'s: binary takes 0/4/24/28, unary takes 1/2/5/6/8/16/17. Two types
+/// sharing a spelling and no value, so neither can be handed the other's case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UnaryGcvt(u8);
+pub enum UnaryGcvt {
+    /// `gcvt_imm1`.
+    Imm1,
+    /// `gcvt_imm2`.
+    Imm2,
+    /// `gcvt_imm5`.
+    Imm5,
+    /// `gcvt_imm6`.
+    Imm6,
+    /// `gcvt_imm8`.
+    Imm8,
+    /// `gcvt_imm16`.
+    Imm16,
+    /// `gcvt_imm17`.
+    Imm17,
+}
 
 impl UnaryGcvt {
-    /// The immediate, or `None` where the enum defines no such case.
-    #[must_use]
-    pub const fn checked(imm: u8) -> Option<UnaryGcvt> {
-        match imm {
-            1 | 2 | 5 | 6 | 8 | 16 | 17 => Some(UnaryGcvt(imm)),
-            _ => None,
-        }
-    }
-
-    /// The immediate.
+    /// The number this case spells.
     #[must_use]
     pub const fn get(self) -> u8 {
-        self.0
+        match self {
+            Self::Imm1 => 1,
+            Self::Imm2 => 2,
+            Self::Imm5 => 5,
+            Self::Imm6 => 6,
+            Self::Imm8 => 8,
+            Self::Imm16 => 16,
+            Self::Imm17 => 17,
+        }
     }
 }
 
-/// AN `fcvt_imm<n>` A **UNARY** MAY TAKE — ⛔ 0, 1, 5, 6 (`SentientTypes.td:637-640`).
+/// AN `fcvt_imm<n>` A **UNARY** MAY TAKE — ⛔ four cases (`SentientTypes.td:637-640`), disjoint from
+/// [`BinaryFcvt`]'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UnaryFcvt(u8);
+pub enum UnaryFcvt {
+    /// `fcvt_imm0`.
+    Imm0,
+    /// `fcvt_imm1`.
+    Imm1,
+    /// `fcvt_imm5`.
+    Imm5,
+    /// `fcvt_imm6`.
+    Imm6,
+}
 
 impl UnaryFcvt {
-    /// The immediate, or `None` where the enum defines no such case.
-    #[must_use]
-    pub const fn checked(imm: u8) -> Option<UnaryFcvt> {
-        match imm {
-            0 | 1 | 5 | 6 => Some(UnaryFcvt(imm)),
-            _ => None,
-        }
-    }
-
-    /// The immediate.
+    /// The number this case spells.
     #[must_use]
     pub const fn get(self) -> u8 {
-        self.0
+        match self {
+            Self::Imm0 => 0,
+            Self::Imm1 => 1,
+            Self::Imm5 => 5,
+            Self::Imm6 => 6,
+        }
     }
 }
 
@@ -1176,13 +1378,21 @@ impl RoutingDirection {
 pub struct RegIndex(Bounded<128>);
 
 impl RegIndex {
-    /// An index, or `None` where no register file is that deep.
+    /// A REGISTER INDEX, CHECKED WHERE IT IS WRITTEN.
+    ///
+    /// ⛔⛔ THE ONLY CONSTRUCTOR, AND IT TAKES THE INDEX AS A CONST GENERIC. `Bounded::at` asserts in
+    /// a `const { }` block, so `RegIndex::at::<200>()` is a **build error** — not a `None` a caller
+    /// might unwrap, and not a panic at print time. A `checked(u32) -> Option` stood here and was
+    /// removed: a refusal at run time is still a run-time failure, just a politer one.
+    ///
+    /// ⚠️ SO AN INDEX MUST BE A LITERAL AT ITS CONSTRUCTION SITE. That is consistent with this crate —
+    /// everything is a compile-time constant, and a register chosen at expansion is a literal by the
+    /// time it is written down. A genuinely computed index has no constructor here on purpose: if one
+    /// is ever needed, the bound belongs to the file's own depth (an arch fact, tighter than this
+    /// ceiling) and that is a design decision, not something to paper over with an `Option`.
     #[must_use]
-    pub const fn checked(index: u32) -> Option<RegIndex> {
-        match Bounded::checked(index) {
-            Some(bounded) => Some(RegIndex(bounded)),
-            None => None,
-        }
+    pub const fn at<const I: u32>() -> RegIndex {
+        RegIndex(Bounded::at::<I>())
     }
 
     /// The index.
@@ -1349,7 +1559,12 @@ pub enum Op {
         /// `$dbgName`.
         dbg_name: Option<String>,
         /// The body.
-        body: Vec<Op>,
+        ///
+        /// ⛔ THE UNION TYPE, NOT THIS DIALECT'S. A region on this rung holds ops of whatever dialects
+        /// have reached it — the module is mixed all the way down — so typing it `Vec<sentient::Op>`
+        /// would make a surviving `agen.composite_load_and_store` inside a `sentient.for`
+        /// inexpressible, which is a shape a real granite program actually has.
+        body: Vec<super::Op>,
     },
 
     /// `sentient.if` — a two-operand comparison and its region (`SentientOps.td:159`).
@@ -1368,10 +1583,11 @@ pub enum Op {
         reg_indices: Vec<Option<RegIndex>>,
         /// `$dbgName`.
         dbg_name: Option<String>,
-        /// The `then` body.
-        then_body: Vec<Op>,
-        /// The `else` body, where there is one.
-        else_body: Vec<Op>,
+        /// The `then` body — ⛔ the union type; see [`Op::For`]'s body.
+        then_body: Vec<super::Op>,
+        /// The `else` body, where there is one. ⭐ EMPTY MEANS NO `else` REGION AT ALL, which is what
+        /// `printRegion` is skipped for (`SentientOps.cpp:1310-1315`).
+        else_body: Vec<super::Op>,
     },
 
     /// `sentient.yield` — what a region hands back (`SentientOps.td:32`).
@@ -1639,14 +1855,15 @@ pub enum Op {
         consumer: SendEnd,
         /// The value it binds.
         result: Val,
-        /// `$src_total_elements`.
-        src_total_elements: u32,
-        /// `$dst_total_elements`.
-        dst_total_elements: u32,
-        /// `$src_element_size`.
-        src_element_size: u32,
-        /// `$dst_element_size`.
-        dst_element_size: u32,
+        /// `$src_total_elements` — ⛔ A COUNT.
+        src_total_elements: Elements,
+        /// `$dst_total_elements` — ⛔ SEPARATE FROM THE SOURCE'S, because the compute may change the
+        /// width.
+        dst_total_elements: Elements,
+        /// `$src_element_size` — ⛔ A WIDTH IN BYTES, not a count.
+        src_element_size: Bytes,
+        /// `$dst_element_size` — ⛔ a width in bytes.
+        dst_element_size: Bytes,
         /// `$dir`.
         dir: Option<RoutingDirection>,
         /// `$shuffle_mode`.
@@ -1674,10 +1891,10 @@ pub enum Op {
         addr_result: Val,
         /// `$data` — the datum it binds.
         data_result: Val,
-        /// `$total_elements`.
-        total_elements: u32,
-        /// `$element_size`.
-        element_size: u32,
+        /// `$total_elements` — ⛔ A COUNT.
+        total_elements: Elements,
+        /// `$element_size` — ⛔ A WIDTH IN BYTES.
+        element_size: Bytes,
         /// `$regLocales`.
         reg_locales: Vec<RegType>,
         /// `$regIndices`.
@@ -1908,19 +2125,40 @@ pub enum Op {
     },
 }
 
+/// THE ATTRIBUTES EVERY COMPUTE SHARES — the tail of each one's dictionary.
+///
+/// ⭐ A STRUCT SO [`compute_attrs`] TAKES THREE ARGUMENTS RATHER THAN SEVEN, which is the difference
+/// between a total function and one needing an `#[allow(clippy::too_many_arguments)]` this crate does
+/// not permit.
+struct ComputeShared<'a> {
+    /// Where the result goes.
+    result: &'a ResultPorts,
+    /// `$ComputePrecision` — ⛔ DISTINCT FROM EVERY OPERAND'S AND FROM THE RESULT'S.
+    compute_precision: Precision,
+    /// `$fold_mode`.
+    fold_mode: Option<FoldMode>,
+    /// `$unrollFactor`.
+    unroll_factor: UnrollFactor,
+    /// `$dbgName`.
+    dbg_name: &'a Option<String>,
+}
+
 /// ONE `sentient` OP AS TEXT. The caller has already indented.
 ///
-/// ⛔⛔ THE ATTRIBUTE DICTIONARY IS **ALPHABETICAL**, because MLIR's `printOptionalAttrDict` sorts
-/// it and every one of the nineteen custom printers delegates to that
-/// (e.g. `BinaryOp::print`, `SentientOps.cpp:2219-2229`). Writing attributes in declaration order
-/// produces text that parses but never matches a reference dump byte for byte, which is the only
-/// oracle this rung has.
+/// ⛔⛔ THE ATTRIBUTE DICTIONARY IS **ALPHABETICAL**, because MLIR's `printOptionalAttrDict` sorts it
+/// and every one of the nineteen custom printers delegates to that (`SentientOps.cpp:2219-2229`, and
+/// the same three lines for ternary and unary). Writing attributes in declaration order produces text
+/// that parses but never matches a reference dump byte for byte, which is the only oracle this rung
+/// has.
 ///
-/// ⛔ AND THE FOUR COMPUTE OPS PRINT ONLY THEIR MASK. `sentient.vector_binary mask(%m) {…} : index`
-/// — every port, precision, forwarding list and unroll flag is in the dictionary, not the operand
-/// list (`SentientOps.cpp:2219-2229`, and the same three lines for ternary and unary).
-pub(crate) fn emit(out: &mut String, op: &Op) {
+/// ⛔ AND THE FOUR COMPUTE OPS PRINT ONLY THEIR MASK — every port, precision, forwarding list and
+/// unroll flag is in the dictionary, not the operand list.
+///
+/// ⭐ TOTAL: every one of the twenty-nine variants is written here, so there is no
+/// `unimplemented!()` and no arm that can be reached without a printer.
+pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
     match op {
+        // ───────────────────────── control flow ─────────────────────────
         Op::Yield { results } => {
             if results.is_empty() {
                 let _ = writeln!(out, "sentient.yield");
@@ -1928,42 +2166,593 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 let _ = writeln!(out, "sentient.yield {}", print::vals(results));
             }
         }
-        Op::Nop { dbg_name } => {
-            let _ = writeln!(out, "sentient.nop{}", dict(&[dbg(dbg_name)]));
-        }
-        Op::IncrMask { dbg_name } => {
-            let _ = writeln!(out, "sentient.incrmask{}", dict(&[dbg(dbg_name)]));
-        }
-        Op::SetSendDst { units } => {
+        // `p << " " << inductionVar << " = " << bound`, then the iter-operand types, the dict, and
+        // the region (`SentientOps.cpp:998-1010`).
+        Op::For {
+            bound,
+            init_args,
+            results,
+            reg_locales,
+            reg_indices,
+            program_header,
+            dbg_name,
+            body,
+        } => {
+            let carried = if init_args.is_empty() {
+                String::new()
+            } else {
+                let tys: Vec<&str> = init_args.iter().map(|_| "index").collect();
+                format!(" -> ({})", tys.join(", "))
+            };
+            let mut attrs = vec![
+                attr("regLocales", &locale_array(reg_locales)),
+                attr("regIndices", &index_array(reg_indices)),
+            ];
+            if program_header.iter().any(|flag| *flag) {
+                attrs.push(attr("programHeader", &bool_array(program_header)));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let bound_val = print::val(*bound);
             let _ = writeln!(
                 out,
-                "sentient.set_send_dst({})",
-                print::val(units.val())
+                "{} = sentient.for {bound_val}{carried} {} {{",
+                print::vals(results),
+                dict(&attrs)
+            );
+            for inner in body {
+                crate::islands::sentient::print::emit(out, inner, depth + 1);
+            }
+            indent(out, depth);
+            let _ = writeln!(out, "}}");
+        }
+        // `p << " " << predicate << ", " << lhs << ", " << rhs << " : " << lhsType`, the result types,
+        // the dict with `predicate` ELIDED, then the regions (`SentientOps.cpp:1288-1305`).
+        Op::If {
+            predicate,
+            lhs,
+            rhs,
+            results,
+            reg_locales,
+            reg_indices,
+            dbg_name,
+            then_body,
+            else_body,
+        } => {
+            let produced = if results.is_empty() {
+                String::new()
+            } else {
+                let tys: Vec<&str> = results.iter().map(|_| "index").collect();
+                format!(" -> ({})", tys.join(", "))
+            };
+            let mut attrs = vec![
+                attr("regLocales", &locale_array(reg_locales)),
+                attr("regIndices", &index_array(reg_indices)),
+            ];
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            // ⛔ `predicate` IS ELIDED FROM THE DICTIONARY because it is already printed as syntax
+            // (`p.printOptionalAttrDict(op->getAttrs(), {"predicate"})`, `SentientOps.cpp:1300`).
+            // Emitting it twice is a parse error, not a cosmetic difference.
+            let _ = writeln!(
+                out,
+                "sentient.if {}, {}, {} : index{produced} {} {{",
+                predicate.spelling(),
+                print::val(*lhs),
+                print::val(*rhs),
+                dict(&attrs)
+            );
+            for inner in then_body {
+                crate::islands::sentient::print::emit(out, inner, depth + 1);
+            }
+            if else_body.is_empty() {
+                indent(out, depth);
+            let _ = writeln!(out, "}}");
+            } else {
+                indent(out, depth);
+                let _ = writeln!(out, "}} else {{");
+                for inner in else_body {
+                    crate::islands::sentient::print::emit(out, inner, depth + 1);
+                }
+                indent(out, depth);
+            let _ = writeln!(out, "}}");
+            }
+        }
+
+        // ───────────────────────── compute ─────────────────────────
+        Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            results,
+            op_a,
+            op_b,
+            op_c,
+            result,
+            mode,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            xrf_read_incr,
+            xrf_write_incr,
+            dbg_name,
+        } => {
+            let mut specific = vec![attr("mode", &quoted(mode.spelling()))];
+            if *xrf_read_incr != 0 {
+                specific.push(attr("xrfReadIncr", &format!("{xrf_read_incr} : i32")));
+            }
+            if *xrf_write_incr != 0 {
+                specific.push(attr("xrfWriteIncr", &format!("{xrf_write_incr} : i32")));
+            }
+            // ⛔ WRITE POINTER FIRST, THEN READ — the `.td` states the order in a comment because the
+            // operand list cannot (`SentientOps.td:234`). Swapping them reads the block being written.
+            let mut pointers: Vec<Val> = Vec::new();
+            if let Some(write) = xrf_write_ptr {
+                pointers.push(*write);
+            }
+            if let Some(read) = xrf_read_ptr {
+                pointers.push(*read);
+            }
+            let attrs = compute_attrs(
+                &[('A', op_a), ('B', op_b), ('C', op_c)],
+                specific,
+                ComputeShared {
+                    result,
+                    compute_precision: *compute_precision,
+                    fold_mode: *fold_mode,
+                    unroll_factor: *unroll_factor,
+                    dbg_name,
+                },
+            );
+            let bound = if results.is_empty() {
+                String::new()
+            } else {
+                format!("{} = ", print::vals(results))
+            };
+            let ptrs = if pointers.is_empty() {
+                String::new()
+            } else {
+                format!(" pointers({})", print::vals(&pointers))
+            };
+            let _ = writeln!(
+                out,
+                "{bound}sentient.vector_mac {}{ptrs} {} : index",
+                masked(*mask),
+                dict(&attrs)
             );
         }
-        Op::LogicalPort { port_name, result } => {
+        Op::VectorBinary {
+            mask,
+            op_a,
+            op_b,
+            binary_op,
+            result,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            dbg_name,
+        } => {
+            let mut specific = vec![attr("binaryOp", &quoted(&binary_op.op().spelling()))];
+            // ⭐ NO CHECK NEEDED: only the forwarding arm carries a port, and only the seven legal
+            // operators can be named in it.
+            if let Binary::Forwarding { to, unroll_incr, .. } = binary_op {
+                specific.push(attr("LogicalResultForwarding", &quoted(&to.spelling())));
+                if *unroll_incr {
+                    specific.push(attr("unrollIncrLogicalResult", "true"));
+                }
+            }
+            let attrs = compute_attrs(
+                &[('A', op_a), ('B', op_b)],
+                specific,
+                ComputeShared {
+                    result,
+                    compute_precision: *compute_precision,
+                    fold_mode: *fold_mode,
+                    unroll_factor: *unroll_factor,
+                    dbg_name,
+                },
+            );
             let _ = writeln!(
                 out,
-                "{} = sentient.logical_port {} : index",
+                "sentient.vector_binary mask({}) {} : index",
+                print::val(*mask),
+                dict(&attrs)
+            );
+        }
+        Op::VectorUnary {
+            mask,
+            op_a,
+            unary_op,
+            result,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            dbg_name,
+        } => {
+            let attrs = compute_attrs(
+                &[('A', op_a)],
+                vec![attr("unary_op", &quoted(&unary_op.spelling()))],
+                ComputeShared {
+                    result,
+                    compute_precision: *compute_precision,
+                    fold_mode: *fold_mode,
+                    unroll_factor: *unroll_factor,
+                    dbg_name,
+                },
+            );
+            let _ = writeln!(
+                out,
+                "sentient.vector_unary mask({}) {} : index",
+                print::val(*mask),
+                dict(&attrs)
+            );
+        }
+        Op::VectorTernary {
+            mask,
+            op_a,
+            op_b,
+            op_c,
+            ternary_op,
+            result,
+            compute_precision,
+            fold_mode,
+            unroll_factor,
+            unroll_incr_logical_result,
+            dbg_name,
+        } => {
+            let mut specific = vec![attr("ternaryOp", &quoted(ternary_op.spelling()))];
+            if *unroll_incr_logical_result {
+                specific.push(attr("unrollIncrLogicalResult", "true"));
+            }
+            let attrs = compute_attrs(
+                &[('A', op_a), ('B', op_b), ('C', op_c)],
+                specific,
+                ComputeShared {
+                    result,
+                    compute_precision: *compute_precision,
+                    fold_mode: *fold_mode,
+                    unroll_factor: *unroll_factor,
+                    dbg_name,
+                },
+            );
+            let _ = writeln!(
+                out,
+                "sentient.vector_ternary {} {} : index",
+                masked(*mask),
+                dict(&attrs)
+            );
+        }
+
+        // ───────────────────────── transfers ─────────────────────────
+        Op::Load {
+            src,
+            extent,
+            shuffle_mode,
+        } => {
+            let mut attrs = extent_attrs(extent);
+            attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
+            attrs.sort();
+            let _ = writeln!(out, "sentient.load {} {}", print::val(*src), dict(&attrs));
+        }
+        // `SentientOps.cpp:313-327`.
+        Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            consumer,
+            result,
+            extent,
+            interleaved_group,
+            rotate_val,
+            dir,
+            shuffle_mode,
+            reg_locale,
+            reg_index,
+            dbg_name,
+        } => {
+            let mut attrs = extent_attrs(extent);
+            attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
+            attrs.push(attr("reg_locale", &quoted(reg_locale.spelling())));
+            if *interleaved_group != 0 {
+                attrs.push(attr(
+                    "interleaved_group",
+                    &format!("{interleaved_group} : i32"),
+                ));
+            }
+            if let Some(rotate) = rotate_val {
+                attrs.push(attr("rotate_val", &format!("{rotate} : i32")));
+            }
+            if let Some(direction) = dir {
+                attrs.push(attr("dir", &quoted(direction.spelling())));
+            }
+            if let Some(index) = reg_index {
+                attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let _ = writeln!(
+                out,
+                "{} = sentient.load_and_send mutable_addr({}), immutable_addr({}), increment({}), consumer({}) {} : index, index, index, index : index",
                 print::val(*result),
-                dict(&[attr("portName", &quoted(&port_name.spelling()))])
+                print::val(*mutable_addr),
+                print::val(*immutable_addr),
+                print::val(*increment),
+                print::val(consumer.val()),
+                dict(&attrs)
             );
         }
-        Op::ScalarConstant {
-            value,
+        // `SentientOps.cpp:470-492`. ⛔ THE OPTIONAL OPERANDS ARE PRINTED CONDITIONALLY AND THEIR TYPES
+        // TOO, so the type list's length tracks which of them are present.
+        Op::ReceiveAndStore {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            producer,
+            result,
+            dst,
+            drop_first,
+            multicast_info,
+            extent,
+            interleaved_group,
+            coalesce,
+            subword_length,
+            stride,
+            permute,
+            shuffle_mode,
+            reg_locale,
+            reg_index,
+            dbg_name,
+        } => {
+            let mut attrs = extent_attrs(extent);
+            attrs.push(attr("reg_locale", &quoted(reg_locale.spelling())));
+            if let Some(mode) = shuffle_mode {
+                attrs.push(attr("shuffle_mode", &quoted(mode.spelling())));
+            }
+            if *interleaved_group != 0 {
+                attrs.push(attr(
+                    "interleaved_group",
+                    &format!("{interleaved_group} : i32"),
+                ));
+            }
+            if *coalesce {
+                attrs.push(attr("coalesce", "true"));
+            }
+            if *permute {
+                attrs.push(attr("permute", "true"));
+            }
+            if *subword_length != 1 {
+                attrs.push(attr("subword_length", &format!("{subword_length} : i32")));
+            }
+            if *stride != 1 {
+                attrs.push(attr("stride", &format!("{stride} : i32")));
+            }
+            if let Some(index) = reg_index {
+                attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let mut operands = format!(
+                " mutable_addr({}), immutable_addr({}), increment({}), producer({})",
+                print::val(*mutable_addr),
+                print::val(*immutable_addr),
+                print::val(*increment),
+                print::val(producer.val())
+            );
+            let mut types = String::from("index, index, index, index");
+            if let Some(value) = dst {
+                operands.push_str(&format!(", dst({})", print::val(*value)));
+                types.push_str(", index");
+            }
+            if let Some(value) = drop_first {
+                operands.push_str(&format!(", drop_first({})", print::val(*value)));
+                types.push_str(", index");
+            }
+            if let Some(value) = multicast_info {
+                operands.push_str(&format!(", multicast_info({})", print::val(*value)));
+                types.push_str(", index");
+            }
+            let _ = writeln!(
+                out,
+                "{} = sentient.receive_and_store{operands} {} : {types} : index",
+                print::val(*result),
+                dict(&attrs)
+            );
+        }
+        // `SentientOps.cpp:775-800`.
+        Op::LoadAndStore {
+            src,
+            dst,
+            src_mutable_addr,
+            src_immutable_addr,
+            src_inc,
+            dst_mutable_addr,
+            dst_immutable_addr,
+            dst_inc,
+            multicast_info,
+            results,
+            extent,
+            stride,
+            rotate_val,
+            shuffle_mode,
+            reg_locales,
+            reg_indices,
+            dir,
+            dbg_name,
+        } => {
+            let mut attrs = extent_attrs(extent);
+            attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
+            attrs.push(attr("regLocales", &locale_array(reg_locales)));
+            attrs.push(attr("regIndices", &index_array(reg_indices)));
+            if *stride != 1 {
+                attrs.push(attr("stride", &format!("{stride} : i32")));
+            }
+            if let Some(rotate) = rotate_val {
+                attrs.push(attr("rotate_val", &format!("{rotate} : i32")));
+            }
+            if let Some(direction) = dir {
+                attrs.push(attr("dir", &quoted(direction.spelling())));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let mut operands = format!(
+                " src({}), dst({}), src_mutable_addr({}), src_immutable_addr({}), src_inc({}), \
+                 dst_mutable_addr({}), dst_immutable_addr({}), dst_inc({})",
+                print::val(*src),
+                print::val(*dst),
+                print::val(*src_mutable_addr),
+                print::val(*src_immutable_addr),
+                print::val(*src_inc),
+                print::val(*dst_mutable_addr),
+                print::val(*dst_immutable_addr),
+                print::val(*dst_inc)
+            );
+            let mut types =
+                String::from("index, index, index, index, index, index, index, index");
+            if let Some(value) = multicast_info {
+                operands.push_str(&format!(", multicast_info({})", print::val(*value)));
+                types.push_str(", index");
+            }
+            let (src_res, dst_res) = results;
+            let _ = writeln!(
+                out,
+                "{}, {} = sentient.load_and_store{operands} {} : {types} : index, index",
+                print::val(*src_res),
+                print::val(*dst_res),
+                dict(&attrs)
+            );
+        }
+        // `SentientOps.cpp:206-222`.
+        Op::LoadComputeAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            element_index,
+            scale_index,
+            consumer,
+            result,
+            src_total_elements,
+            dst_total_elements,
+            src_element_size,
+            dst_element_size,
+            dir,
+            shuffle_mode,
+            reg_locale,
+            reg_index,
+            dbg_name,
+        } => {
+            // ⛔ SOURCE AND DESTINATION EXTENTS ARE SEPARATE, because the compute in the middle may
+            // change the width.
+            let mut attrs = vec![
+                attr(
+                    "src_total_elements",
+                    &format!("{} : i32", src_total_elements.0),
+                ),
+                attr(
+                    "dst_total_elements",
+                    &format!("{} : i32", dst_total_elements.0),
+                ),
+                attr("src_element_size", &format!("{} : i32", src_element_size.0)),
+                attr("dst_element_size", &format!("{} : i32", dst_element_size.0)),
+                attr("shuffle_mode", &quoted(shuffle_mode.spelling())),
+                attr("reg_locale", &quoted(reg_locale.spelling())),
+            ];
+            if let Some(direction) = dir {
+                attrs.push(attr("dir", &quoted(direction.spelling())));
+            }
+            if let Some(index) = reg_index {
+                attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let _ = writeln!(
+                out,
+                "{} = sentient.load_compute_and_send mutable_addr({}), immutable_addr({}), increment({}), element_index({}), scale_index({}), consumer({}) {} : index, index, index, index, index, index : index",
+                print::val(*result),
+                print::val(*mutable_addr),
+                print::val(*immutable_addr),
+                print::val(*increment),
+                print::val(*element_index),
+                print::val(*scale_index),
+                print::val(consumer.val()),
+                dict(&attrs)
+            );
+        }
+        // `SentientOps.cpp:580-592`. ⭐ BINDS TWO VALUES: the address and the datum.
+        Op::LoadAndExtractScalar {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            consumer,
+            addr_result,
+            data_result,
+            total_elements,
+            element_size,
+            reg_locales,
+            reg_indices,
+            dbg_name,
+        } => {
+            let mut attrs = vec![
+                attr("total_elements", &format!("{} : i32", total_elements.0)),
+                attr("element_size", &format!("{} : i32", element_size.0)),
+                attr("regLocales", &locale_array(reg_locales)),
+                attr("regIndices", &index_array(reg_indices)),
+            ];
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let _ = writeln!(
+                out,
+                "{}, {} = sentient.load_and_extract_scalar mutable_addr({}), immutable_addr({}), increment({}), consumer({}) {} : index, index, index, index : index, index",
+                print::val(*addr_result),
+                print::val(*data_result),
+                print::val(*mutable_addr),
+                print::val(*immutable_addr),
+                print::val(*increment),
+                print::val(consumer.val()),
+                dict(&attrs)
+            );
+        }
+        // `SentientOps.cpp:665-672`.
+        Op::ReceiveAndExtractScalar {
+            unit,
+            position,
             result,
             reg_locale,
+            reg_index,
+            dbg_name,
         } => {
+            let mut attrs = vec![attr("reg_locale", &quoted(reg_locale.spelling()))];
+            if let Some(index) = reg_index {
+                attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
             let _ = writeln!(
                 out,
-                "{} = sentient.scalar_constant {} : index",
+                "{} = sentient.receive_and_extract_scalar unit({}), position({}) {} : index, index : index",
                 print::val(*result),
-                dict(&[
-                    attr("reg_locale", &quoted(reg_locale.spelling())),
-                    attr("value", &format!("{value} : si64")),
-                ])
+                print::val(unit.val()),
+                print::val(*position),
+                dict(&attrs)
             );
         }
+
+        // ───────────────────────── scalars ─────────────────────────
         Op::ScalarAdd {
             lhs,
             rhs,
@@ -2004,7 +2793,8 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             reg_locale,
         } => {
-            // ⛔ NO `regIndex` — see [`Op::ScalarMul`].
+            // ⛔ NO `regIndex` ON THIS ONE — the asymmetry is the reference's
+            // (`SentientOps.td:816-829`).
             let _ = writeln!(
                 out,
                 "{} = sentient.scalar_mul {}, {} {} : index, index",
@@ -2037,6 +2827,21 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 dict(&attrs)
             );
         }
+        Op::ScalarConstant {
+            value,
+            result,
+            reg_locale,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = sentient.scalar_constant {} : index",
+                print::val(*result),
+                dict(&[
+                    attr("reg_locale", &quoted(reg_locale.spelling())),
+                    attr("value", &format!("{value} : si64")),
+                ])
+            );
+        }
         Op::VectorConstant { value, result } => {
             let elems: Vec<String> = value.iter().map(|v| format!("{v} : si64")).collect();
             let _ = writeln!(
@@ -2046,6 +2851,8 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 dict(&[attr("value", &format!("[{}]", elems.join(", ")))])
             );
         }
+
+        // ───────────────────────── masks, sync, ports ─────────────────────────
         Op::Sync {
             mode,
             units,
@@ -2073,97 +2880,155 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             attrs.sort();
             let _ = writeln!(out, "sentient.sync{}", dict(&attrs));
         }
+        Op::Nop { dbg_name } => {
+            let _ = writeln!(out, "sentient.nop{}", dict(&[dbg(dbg_name)]));
+        }
+        Op::IncrMask { dbg_name } => {
+            // `SentientOps.cpp:2455` — the dictionary and nothing else.
+            let _ = writeln!(out, "sentient.incrmask{}", dict(&[dbg(dbg_name)]));
+        }
+        Op::SetSendDst { units } => {
+            let _ = writeln!(
+                out,
+                "sentient.set_send_dst({})",
+                print::val(units.val())
+            );
+        }
+        Op::LogicalPort { port_name, result } => {
+            let _ = writeln!(
+                out,
+                "{} = sentient.logical_port {} : index",
+                print::val(*result),
+                dict(&[attr("portName", &quoted(&port_name.spelling()))])
+            );
+        }
+        // `SentientOps.cpp:2433-2440`.
         Op::SetMask {
             mask_value,
             dbg_name,
         } => {
             let _ = writeln!(
                 out,
-                "sentient.set_mask {}{}",
+                "sentient.set_mask mask_value({}){} : index",
                 print::val(*mask_value),
                 dict(&[dbg(dbg_name)])
             );
         }
-        Op::Load {
-            src,
-            extent,
-            shuffle_mode,
+        // `SentientOps.cpp:2368-2375`.
+        Op::Samv {
+            mask_value,
+            mask_all,
+            num_valid_entry,
+            slice_id_xsl,
+            xsl_inner,
+            wsl_len,
+            precision,
+            dbg_name,
         } => {
-            let mut attrs = extent_attrs(extent);
-            attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
+            let mut attrs = vec![
+                attr("maskall", if *mask_all { "true" } else { "false" }),
+                attr("numvalidentry", &format!("{} : i32", num_valid_entry.0)),
+                attr("sliceid_xsl", &format!("{} : i32", slice_id_xsl.0)),
+                attr("xslinner", if *xsl_inner { "true" } else { "false" }),
+                attr("wsllen", &format!("{} : i32", wsl_len.0)),
+                // ⛔ A RAW ISA FIELD, never the Precision enum's spelling.
+                attr("precision", &format!("{} : i32", precision.0)),
+            ];
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
             attrs.sort();
             let _ = writeln!(
                 out,
-                "sentient.load {} {}",
-                print::val(*src),
+                "sentient.samv mask_value({}) {} : index",
+                print::val(*mask_value),
                 dict(&attrs)
             );
         }
-        // ⭐ THE COMPUTE OPS ALL PRINT THE SAME SHAPE: the mask, the dictionary, the mask's type.
-        Op::VectorBinary { mask, .. } => {
+        // `SentientOps.cpp:2182-2196` — the input carries its own type inside the parentheses.
+        Op::Splat {
+            input,
+            output,
+            mask,
+            pad,
+            precision,
+            program_header,
+            unroll_factor,
+            unroll_incr_result,
+            dbg_name,
+        } => {
+            let mut attrs = vec![
+                attr("pad", &quoted(pad.spelling())),
+                attr("precision", &quoted(precision.spelling())),
+                attr("unrollFactor", &quoted(unroll_factor.spelling())),
+            ];
+            if *program_header {
+                attrs.push(attr("programHeader", "true"));
+            }
+            if *unroll_incr_result {
+                attrs.push(attr("unrollIncrResult", "true"));
+            }
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
             let _ = writeln!(
                 out,
-                "sentient.vector_binary mask({}) {} : index",
+                "sentient.splat input({} : index) output({}) mask({}) {}",
+                print::val(*input),
+                print::val(*output),
                 print::val(*mask),
-                dict(&compute_attrs(op))
+                dict(&attrs)
             );
         }
-        Op::VectorUnary { mask, .. } => {
-            let _ = writeln!(
-                out,
-                "sentient.vector_unary mask({}) {} : index",
-                print::val(*mask),
-                dict(&compute_attrs(op))
-            );
-        }
-        Op::VectorTernary { mask, .. } => {
-            let rendered = mask.map_or_else(|| "mask()".to_owned(), |m| format!("mask({})", print::val(m)));
-            let _ = writeln!(
-                out,
-                "sentient.vector_ternary {} {} : index",
-                rendered,
-                dict(&compute_attrs(op))
-            );
-        }
-        Op::VectorMac { mask, .. } => {
-            let rendered = mask.map_or_else(|| "mask()".to_owned(), |m| format!("mask({})", print::val(m)));
-            let _ = writeln!(
-                out,
-                "sentient.vector_mac {} {} : index",
-                rendered,
-                dict(&compute_attrs(op))
-            );
-        }
-        // The remaining ops carry syntax this island does not yet write. See the module note.
-        Op::For { .. }
-        | Op::If { .. }
-        | Op::LoadAndSend { .. }
-        | Op::ReceiveAndStore { .. }
-        | Op::LoadAndStore { .. }
-        | Op::LoadComputeAndSend { .. }
-        | Op::LoadAndExtractScalar { .. }
-        | Op::ReceiveAndExtractScalar { .. }
-        | Op::Splat { .. }
-        | Op::Samv { .. }
-        | Op::Opaque { .. } => {
-            unimplemented!(
-                "syntax not yet read from SentientOps.cpp's custom printer for this op; \
-                 see islands/sentient/dialects/sentient.rs's module note"
-            )
+        // `SentientOps.cpp:2205-2210` — the dictionary is the whole syntax.
+        Op::Opaque {
+            func,
+            read_write,
+            read_only,
+            params,
+            dbg_name,
+        } => {
+            let mut attrs = vec![
+                attr("func_name", &quoted(func.spelling())),
+                attr(
+                    "read_write_register_dictionary",
+                    &reg_dict(read_write),
+                ),
+                attr("read_only_register_dictionary", &reg_dict(read_only)),
+                attr("parameter_dictionary", &param_dict(params)),
+            ];
+            if let Some(name) = dbg_name {
+                attrs.push(attr("dbgName", &quoted(name)));
+            }
+            attrs.sort();
+            let _ = writeln!(out, "sentient.opaque{}", dict(&attrs));
         }
     }
 }
 
-/// `regLocale` PLUS `regIndex` — ⭐ THE `.td` DECLARES THEM AS A PAIR, on every op that has them
-/// (`scalar_add`, `scalar_sub`, `scalar_copy`, `load_and_send`, `receive_and_store`,
-/// `load_compute_and_send`, `receive_and_extract_scalar`). Carrying them together is what the
-/// reference's own declaration says they are, and it keeps this helper under the argument count that
-/// would otherwise need an `#[allow]` — which this crate does not permit.
+/// Two spaces per level — a region's closing brace lines up with the op that opened it.
+fn indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+/// `mask(%v)`, or `mask()` where the op declares it optional and it is absent.
+fn masked(mask: Option<Val>) -> String {
+    mask.map_or_else(
+        || "mask()".to_owned(),
+        |m| format!("mask({})", print::val(m)),
+    )
+}
+
+/// `regLocale` PLUS `regIndex` — ⭐ THE `.td` DECLARES THEM AS A PAIR, on every op that has them.
+/// Carrying them together is what the reference's declaration says they are.
 #[derive(Debug, Clone, Copy)]
 struct ScalarReg {
     /// `regLocale`.
     locale: RegType,
-    /// `regIndex` — ⛔ `None` is the `.td`'s `-1`, unassigned.
+    /// `regIndex` — ⛔ `None` is the `.td`'s `-1`, unassigned. An ABSENCE, not a refusal.
     index: Option<RegIndex>,
 }
 
@@ -2186,135 +3051,62 @@ fn scalar_binary(out: &mut String, mnemonic: &str, result: Val, lhs: Val, rhs: V
 
 /// THE ATTRIBUTE DICTIONARY OF ONE COMPUTE OP, sorted.
 ///
+/// ⛔⛔ IT TAKES THE COMPUTE'S PIECES, NOT AN `Op`. The first version took `&Op` and ended in
+/// `_ => unreachable!("compute_attrs called on an op that is not one of the four computes")` — a
+/// runtime assertion that a caller passed the right variant, which is precisely the class of guard
+/// this island is not allowed to use. A function that may only be called with a compute takes a
+/// compute's parts, and the wrong call is then a type error.
+///
 /// ⛔ SORTED, NOT DECLARATION-ORDERED — see [`emit`]'s note.
-fn compute_attrs(op: &Op) -> Vec<String> {
-    let mut attrs = Vec::new();
-    let mut operand = |tag: &str, o: &Operand| {
-        attrs.push(attr(&format!("op{tag}"), &quoted(&o.port.spelling())));
+fn compute_attrs(
+    operands: &[(char, &Operand)],
+    specific: Vec<String>,
+    shared: ComputeShared<'_>,
+) -> Vec<String> {
+    let mut attrs = specific;
+    for (tag, operand) in operands {
+        attrs.push(attr(&format!("op{tag}"), &quoted(&operand.port.spelling())));
         attrs.push(attr(
             &format!("op{tag}Forwarding"),
-            &port_array(&o.forwarding),
+            &port_array(&operand.forwarding),
         ));
         attrs.push(attr(
             &format!("op{tag}Precision"),
-            &quoted(o.precision.spelling()),
+            &quoted(operand.precision.spelling()),
         ));
-        if let Some(id) = o.data_id {
+        if let Some(id) = operand.data_id {
             attrs.push(attr(&format!("op{tag}DataID"), &format!("{id} : si32")));
         }
-        if let Some(id) = o.port_id {
+        if let Some(id) = operand.port_id {
             attrs.push(attr(&format!("op{tag}PortID"), &format!("{id} : si32")));
         }
-        if o.unroll_incr {
+        if operand.unroll_incr {
             attrs.push(attr(&format!("unrollIncrOp{tag}"), "true"));
         }
-    };
-    let (result, compute_precision, fold_mode, unroll_factor, dbg_name) = match op {
-        Op::VectorMac {
-            op_a,
-            op_b,
-            op_c,
-            result,
-            mode,
-            compute_precision,
-            fold_mode,
-            unroll_factor,
-            xrf_read_incr,
-            xrf_write_incr,
-            dbg_name,
-            ..
-        } => {
-            operand("A", op_a);
-            operand("B", op_b);
-            operand("C", op_c);
-            attrs.push(attr("mode", &quoted(mode.spelling())));
-            if *xrf_read_incr != 0 {
-                attrs.push(attr("xrfReadIncr", &format!("{xrf_read_incr} : i32")));
-            }
-            if *xrf_write_incr != 0 {
-                attrs.push(attr("xrfWriteIncr", &format!("{xrf_write_incr} : i32")));
-            }
-            (result, compute_precision, fold_mode, unroll_factor, dbg_name)
-        }
-        Op::VectorBinary {
-            op_a,
-            op_b,
-            binary_op,
-            result,
-            compute_precision,
-            fold_mode,
-            unroll_factor,
-            dbg_name,
-            ..
-        } => {
-            operand("A", op_a);
-            operand("B", op_b);
-            attrs.push(attr("binaryOp", &quoted(&binary_op.op().spelling())));
-            // ⭐ NO CHECK NEEDED: only the forwarding arm carries a port, and only the seven legal
-            // operators can be named in it.
-            if let Binary::Forwarding { to, unroll_incr, .. } = binary_op {
-                attrs.push(attr("LogicalResultForwarding", &quoted(&to.spelling())));
-                if *unroll_incr {
-                    attrs.push(attr("unrollIncrLogicalResult", "true"));
-                }
-            }
-            (result, compute_precision, fold_mode, unroll_factor, dbg_name)
-        }
-        Op::VectorUnary {
-            op_a,
-            unary_op,
-            result,
-            compute_precision,
-            fold_mode,
-            unroll_factor,
-            dbg_name,
-            ..
-        } => {
-            operand("A", op_a);
-            attrs.push(attr("unary_op", &quoted(&unary_op.spelling())));
-            (result, compute_precision, fold_mode, unroll_factor, dbg_name)
-        }
-        Op::VectorTernary {
-            op_a,
-            op_b,
-            op_c,
-            ternary_op,
-            result,
-            compute_precision,
-            fold_mode,
-            unroll_factor,
-            unroll_incr_logical_result,
-            dbg_name,
-            ..
-        } => {
-            operand("A", op_a);
-            operand("B", op_b);
-            operand("C", op_c);
-            attrs.push(attr("ternaryOp", &quoted(ternary_op.spelling())));
-            if *unroll_incr_logical_result {
-                attrs.push(attr("unrollIncrLogicalResult", "true"));
-            }
-            (result, compute_precision, fold_mode, unroll_factor, dbg_name)
-        }
-        _ => unreachable!("compute_attrs called on an op that is not one of the four computes"),
-    };
-    attrs.push(attr("ResultForwarding", &port_array(&result.forwarding)));
+    }
+    attrs.push(attr(
+        "ResultForwarding",
+        &port_array(&shared.result.forwarding),
+    ));
     attrs.push(attr(
         "ResultPrecision",
-        &quoted(result.precision.spelling()),
+        &quoted(shared.result.precision.spelling()),
     ));
-    if result.unroll_incr {
+    if shared.result.unroll_incr {
         attrs.push(attr("unrollIncrResult", "true"));
     }
     attrs.push(attr(
         "ComputePrecision",
-        &quoted(compute_precision.spelling()),
+        &quoted(shared.compute_precision.spelling()),
     ));
-    if let Some(mode) = fold_mode {
+    if let Some(mode) = shared.fold_mode {
         attrs.push(attr("fold_mode", &quoted(mode.spelling())));
     }
-    attrs.push(attr("unrollFactor", &quoted(unroll_factor.spelling())));
-    if let Some(name) = dbg_name {
+    attrs.push(attr(
+        "unrollFactor",
+        &quoted(shared.unroll_factor.spelling()),
+    ));
+    if let Some(name) = shared.dbg_name {
         attrs.push(attr("dbgName", &quoted(name)));
     }
     attrs.sort();
@@ -2347,6 +3139,50 @@ fn extent_attrs(extent: &Extent) -> Vec<String> {
     attrs
 }
 
+/// A `SentientRegTypeArrayAttr` — one locale per carried value.
+fn locale_array(locales: &[RegType]) -> String {
+    let spelled: Vec<String> = locales.iter().map(|l| quoted(l.spelling())).collect();
+    format!("[{}]", spelled.join(", "))
+}
+
+/// An `I32ArrayAttr` of register indices — ⛔ AN ABSENT ONE PRINTS AS THE `.td`'S `-1`, which is how
+/// the reference spells unassigned. That is the one place the sentinel is written, and it is written
+/// from an `Option` rather than stored as an integer.
+fn index_array(indices: &[Option<RegIndex>]) -> String {
+    let rendered: Vec<String> = indices
+        .iter()
+        .map(|index| index.map_or_else(|| "-1".to_owned(), |i| i.get().to_string()))
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// A `BoolArrayAttr`.
+fn bool_array(flags: &[bool]) -> String {
+    let rendered: Vec<&str> = flags
+        .iter()
+        .map(|flag| if *flag { "true" } else { "false" })
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// An opaque's register dictionary — symbol to the address its allocation starts at.
+fn reg_dict(entries: &[(RegName, RegAddr)]) -> String {
+    let rendered: Vec<String> = entries
+        .iter()
+        .map(|(name, addr)| format!("{} = \"{}\"", name.spelling(), addr.0))
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
+/// An opaque's parameter dictionary.
+fn param_dict(entries: &[(ParamKey, ParamValue)]) -> String {
+    let rendered: Vec<String> = entries
+        .iter()
+        .map(|(key, value)| format!("{} = \"{}\"", key.spelling(), value.spelling()))
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
 /// `name = value`.
 fn attr(name: &str, value: &str) -> String {
     format!("{name} = {value}")
@@ -2359,7 +3195,8 @@ fn quoted(text: &str) -> String {
 
 /// `$dbgName`, which every op declares and most leave unset.
 fn dbg(name: &Option<String>) -> String {
-    name.as_ref().map_or_else(String::new, |n| attr("dbgName", &quoted(n)))
+    name.as_ref()
+        .map_or_else(String::new, |n| attr("dbgName", &quoted(n)))
 }
 
 /// A `SentientComputePortArrayAttr` — ⭐ EMPTY IS `[]`, not an absent attribute.
