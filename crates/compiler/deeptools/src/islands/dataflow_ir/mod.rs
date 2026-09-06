@@ -12,6 +12,7 @@
 //! inner module, and a `dataflow::ProgramUnitOp` inside it.
 
 pub mod dialects;
+pub mod link;
 pub mod print;
 pub mod ty;
 

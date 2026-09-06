@@ -171,6 +171,53 @@ impl EstimateVersion {
     }
 }
 
+/// A VALUE A COMPUTE PRODUCED — and it must go somewhere.
+///
+/// # 🛑 A COMPUTE WHOSE RESULT NOTHING CONSUMES IS NEVER LOWERED
+///
+/// ⛔⛔ `BinaryOpLowering::matchAndRewrite` resolves the result's DESTINATION in `fillOpInfo`
+/// before doing anything else (`VectorChainToSentientPESFP.cpp:332-335`), and returns `failure()`
+/// when there is none — which is BEFORE `setReuseInformation` at `:338`. So the binary is never
+/// lowered and its operands are never entered in `data_origins_`.
+///
+/// ⛔ AND THE FAILURE SURFACES SOMEWHERE ELSE ENTIRELY. `runOnOperation` DISCARDS
+/// `fuseComputeOps`'s result (`:1405`), so the walk continues to
+/// `lowerDanglingNonComputeOpsPESFP`, which finds a receive with no `data_origins_` entry
+/// (`OperandReuse.cpp:73-78`) and reports *"Dangling non-compute op has no use"* naming THE
+/// RECEIVE. The emitter read that as "too many operands arrive" and it means "the compute's result
+/// goes nowhere". A lockdown on operand arity would have fixed none of it.
+///
+/// ⭐ IBM'S `sfp` UNIT ENDS IN A SEND EVERY TIME — `dataflow.send %27, %25`
+/// (`/tmp/ktir_ref/export/debug/dfir.mlir:151`).
+///
+/// ⛔ AND THE TAPE ALREADY SAID WHERE IT GOES. `Node::output` is a placement the compute never
+/// read — a fact carried and not exploited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Computed {
+    val: Val,
+    ty: Vector,
+}
+
+impl Computed {
+    /// ⛔ MINTED ONLY BY A COMPUTE. The op that binds it is pushed here, so the handle and the
+    /// operation cannot disagree about the value or its type.
+    pub fn of(result: Val, ty: Vector) -> Computed {
+        Computed { val: result, ty }
+    }
+
+    /// The value it binds.
+    #[must_use]
+    pub const fn val(self) -> Val {
+        self.val
+    }
+
+    /// Its type.
+    #[must_use]
+    pub const fn ty(self) -> Vector {
+        self.ty
+    }
+}
+
 /// A LANE MASK'S DEFINITION — how many lanes are live, and the i1 vector it is stated over.
 ///
 /// ⭐ THE TWO TRAVEL TOGETHER because a prefix means nothing without the width it is a prefix OF.

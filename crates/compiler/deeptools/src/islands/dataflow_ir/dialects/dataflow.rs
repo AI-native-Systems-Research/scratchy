@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName, SyncSignal};
 use crate::islands::dataflow_ir::dialects::Val;
+use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::print;
 use crate::islands::dataflow_ir::ty::{AffineMap, MemRef, Vector};
 
@@ -106,7 +107,7 @@ impl Received {
     /// ⛔ THE ONLY CONSTRUCTOR, and it PUSHES the op rather than taking one to inspect. A
     /// `Received` therefore cannot exist without the receive that produces it, and the two cannot
     /// disagree about the value or its type. Nothing here can fail, so there is no arm to refuse in.
-    pub fn receive(into: &mut Vec<super::Op>, result: Val, from: Val, ty: Vector) -> Received {
+    pub fn receive(into: &mut Vec<super::Op>, result: Val, from: RecvEnd, ty: Vector) -> Received {
         into.push(super::Op::Dataflow(Op::Receive { result, from, ty }));
         Received { val: result, ty }
     }
@@ -242,8 +243,8 @@ pub enum Op {
     /// `to_unit = dst.via_.empty() ? dst.loc_.unit_ : dst.via_.front()`
     /// (`SNTransferLowering.cpp:2731-2732`).
     Send {
-        /// The unit sent to.
-        to: Val,
+        /// The unit sent to — ONE END OF A [`crate::islands::dataflow_ir::link::Link`], not a unit handle a caller chose.
+        to: SendEnd,
         /// The data.
         data: Val,
         /// Its type.
@@ -254,8 +255,8 @@ pub enum Op {
     Receive {
         /// The vector it binds.
         result: Val,
-        /// The unit received from.
-        from: Val,
+        /// The unit received from — THE OTHER END OF THE SAME [`crate::islands::dataflow_ir::link::Link`] the send spent.
+        from: RecvEnd,
         /// Its type.
         ty: Vector,
     },
@@ -398,7 +399,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             let _ = writeln!(
                 out,
                 "dataflow.send {}, {} : {}",
-                print::val(*to),
+                print::val(to.val()),
                 print::val(*data),
                 print::vector(*ty)
             );
@@ -408,7 +409,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 out,
                 "{} = dataflow.receive {} : {}",
                 print::val(*result),
-                print::val(*from),
+                print::val(from.val()),
                 print::vector(*ty)
             );
         }

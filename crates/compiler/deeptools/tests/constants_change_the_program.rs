@@ -170,6 +170,7 @@ const IS_SYNC: fn(&Op) -> bool = |op| matches!(op, Op::Dataflow(dataflow::Op::Sy
 const IS_SEND: fn(&Op) -> bool = |op| matches!(op, Op::Dataflow(dataflow::Op::Send { .. }));
 const IS_RECEIVE: fn(&Op) -> bool = |op| matches!(op, Op::Dataflow(dataflow::Op::Receive { .. }));
 const IS_LOAD: fn(&Op) -> bool = |op| matches!(op, Op::Agen(agen::Op::VectorLoad { .. }));
+const IS_STORE: fn(&Op) -> bool = |op| matches!(op, Op::Agen(agen::Op::VectorStore { .. }));
 
 /// ⭐⭐ EVERY OPERAND CROSSES THE WIRE, AND THE TWO ENDS AGREE ON HOW MANY.
 ///
@@ -185,24 +186,42 @@ fn every_operand_reaches_the_compute_on_a_wire() {
     let tape = tape_of(OpFunc::Add);
     let run = tape::compile::<Dd2, Aligned, Decode>(&tape, GroupId(0)).expect("lowers");
 
-    // Two nodes, two inputs each: four operands, so four of each.
+    // Two nodes, two inputs each: four operands. And each node's RESULT crosses a second wire.
     let operands: usize = tape.iter().map(|node| node.inputs.len()).sum();
     assert_eq!(operands, 4, "the fixture tape has two nodes of two inputs");
+    let results = tape.len();
 
+    // ⭐⭐ TWO WIRES PER NODE, AND EVERY END IS SPENT. The loader sends one vector per operand to
+    // the compute; the compute sends one result to the store. A `Link` hands out its two ends once,
+    // so a send with no matching receive is not a program that can be built — but a program with
+    // NO wires at all would still satisfy that, which is why the counts are against the node's own
+    // arity and the tape's own length rather than against each other.
     assert_eq!(
         count(&run, IS_SEND),
-        operands,
-        "the mover puts every one of the {operands} operands on the wire"
+        operands + results,
+        "{operands} operand sends from the loader, plus {results} result sends from the compute"
     );
     assert_eq!(
         count(&run, IS_RECEIVE),
-        operands,
-        "and the compute takes every one of them off it"
+        operands + results,
+        "and every one of them is taken off the wire at the other end"
     );
+
+    // ⛔ THE LOADS MOVED, THEY DID NOT MULTIPLY. One `agen.vector_load` per operand, in the loader;
+    // a compute that still loaded for itself would show more loads than operands.
     assert_eq!(
         count(&run, IS_LOAD),
         operands,
-        "one load per operand, in the mover — a compute that still loaded would show more"
+        "one load per operand, in the loader"
+    );
+
+    // ⛔ AND EVERY RESULT IS WRITTEN. A compute whose result is never stored is never lowered at
+    // all — see `Computed`; the failure surfaced as "Dangling non-compute op has no use" naming a
+    // RECEIVE, three passes away from the cause.
+    assert_eq!(
+        count(&run, IS_STORE),
+        results,
+        "one `agen.vector_store` per node, in the store unit"
     );
 }
 
@@ -239,14 +258,15 @@ fn is_decode_removes_the_row_nest() {
 
     // ⛔ CARRY THE VALUE. Two nodes, one row loop each PER UNIT at prefill, none at decode.
     //
-    // ⭐⭐ TWICE TWO, AND THE FACTOR IS THE UNIT COUNT. The mover and the compute walk ONE iteration
-    // space from opposite ends — the mover loads and sends inside its nest, the compute receives and
-    // computes inside its own — so a node with a row loop has one in each. A count of 2 here would
-    // mean one of the two units was walking a different space from the other.
+    // ⭐⭐ THE FACTOR IS THE UNIT COUNT, AND IT IS THREE. The loader, the compute and the store walk
+    // ONE iteration space from three points along it — the loader reads and sends, the compute
+    // receives and computes and sends on, the store receives and writes — so a node with a row loop
+    // has one in each. A count of 4 here would mean a unit was missing its nest; a count of 2, that
+    // two units were sharing one.
     assert_eq!(at_decode, 0, "a decode rung must emit NO row loop at all");
     assert_eq!(
-        at_prefill, 4,
-        "a prefill rung emits one row loop per node per unit: 2 nodes x 2 units"
+        at_prefill, 6,
+        "a prefill rung emits one row loop per node per unit: 2 nodes x 3 units"
     );
 }
 
@@ -293,8 +313,8 @@ fn the_sk_bucket_changes_the_cache_walk() {
     );
     assert_eq!(
         count(&wide, IS_FOR),
-        4,
-        "a 128-vector span emits one walk per attention node per unit: 2 nodes x 2 units"
+        6,
+        "a 128-vector span emits one walk per attention node per unit: 2 nodes x 3 units"
     );
 
     // And the wide rung's cache does not fit the scratchpad, so each step waits for its own slice.
@@ -305,8 +325,8 @@ fn the_sk_bucket_changes_the_cache_walk() {
     );
     assert_eq!(
         count(&wide, IS_SYNC),
-        4,
-        "a streamed cache waits once per node's walk, in each unit that walks it"
+        6,
+        "a streamed cache waits once per node's walk, in each of the three units that walk it"
     );
 }
 
@@ -328,8 +348,8 @@ fn a_rung_that_sweeps_nothing_emits_no_walk() {
     // on losing the wrong one.
     assert_eq!(
         count(&none, IS_FOR),
-        4,
-        "the row nest survives at 96 rows in both units; only the cache walk goes"
+        6,
+        "the row nest survives at 96 rows in all three units; only the cache walk goes"
     );
     assert_eq!(
         count(&none, IS_SYNC),
