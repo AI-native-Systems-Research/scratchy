@@ -103,9 +103,13 @@ fn the_corpus_is_completely_paired() {
 fn the_goldens_came_from_the_reference() {
     for (name, _, golden) in pairs() {
         let text = std::fs::read_to_string(&golden).expect("golden");
+        // ⛔ THE BANNER, NOT THE COMMENT MARKER. `mkgolden.py` slices the reference's output from
+        // `index("IR Dump After DataflowToSentient")`, so the leading `// -----// ` is cut. Asserting
+        // the marker instead of the banner failed on every golden — and that failure is the reason
+        // this test is worth keeping: the artifact, not my memory of it, is the authority.
         assert!(
-            text.starts_with("// -----// IR Dump After DataflowToSentient"),
-            "{name}: golden does not open with the reference's dump banner — it may not be \
+            text.starts_with("IR Dump After DataflowToSentientLoweringPass (dcc-dataflow-to-sentient)"),
+            "{name}: golden does not open with the reference's own dump banner — it may not be \
              reference output"
         );
     }
