@@ -25,8 +25,8 @@ pub mod ty;
 
 use crate::arch::Arch;
 use crate::model::Model;
-use crate::units::DfirUnit;
 use crate::workload::Workload;
+use sys_arch_spec::regfile::{Component, max_ibuff_entries};
 use crate::islands::sentient::dialects::sentient::RegIndex;
 use ty::{Invalid, OperandValue, RegType};
 
@@ -61,26 +61,21 @@ pub type UnitRegState = Vec<RegInit>;
 
 /// ONE INSTRUCTION'S OPCODE — `InstrInfo::instn_`, an `OpCodeT` (`progir.h:280`).
 ///
-/// ⛔ A NUMBER, NOT A MNEMONIC, because that is what the reference holds: `OpCodeT` is an enum whose
-/// last case is `NumOpCodes`, and `InstrInfo` stores one of its values. The printed text
-/// (`PTOP_IMA8`, `PTOP_XRFACCESS`, `PTOP_MVLOOPCNT`, `PTOP_RETURN`) is produced by looking the number
-/// up in that unit's ISA.
+/// ⛔⛔ THIS WAS `OpCode(pub u16)` — AN UNBOUNDED PUBLIC FIELD admitting any number as an opcode. It is
+/// now the vendored enum's 91 variants, so an opcode no unit has cannot be written down. The `TODO`
+/// that stood here was wrong about the work: the table was not owed, it was already ported.
 ///
-/// ⚠️ **TODO(isa):** the mnemonic lookup wants the per-unit ISA table, which this crate does not carry
-/// yet — the reference threads it as `isa_per_unit` (`std::map<SenComponents, Isa>`) through every
-/// print and validate call. Until it is here, a `ProgIR` program can be built and checked for size but
-/// not rendered as senprog. Deliberately left owed: a hand-written opcode enum would be a second
-/// opinion about a table the vendor already ships, and the crate's rule is that every closed set is a
-/// *generated* enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OpCode(pub u16);
+/// ⭐ THE ENUM IS THE AUTHORITY FOR WHAT IS AN OPCODE, and `deeptools`' own `build.rs` already relies
+/// on that — it emits `InstOpCode::FMA` for the mnemonics the `.ddl`/`.smc` templates name, so a
+/// template naming a non-opcode fails to compile.
+pub use sys_arch_spec::InstOpCode as OpCode;
 
 /// WHICH FIELD OF AN INSTRUCTION — the key of `InstrInfo::instFields_` (`progir.h:283`), an
 /// `OperandT`.
 ///
-/// ⚠️ **TODO(isa):** same as [`OpCode`] — the field set is per-opcode and comes from the ISA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OperandField(pub u16);
+/// ⛔⛔ ALSO WAS AN UNBOUNDED `pub u16`. Now the vendored 89-operand enum — the one whose two copies
+/// drifting is the reason `sys-arch-spec` is a crate at all.
+pub use sys_arch_spec::operand::Operand as OperandField;
 
 /// ONE INSTRUCTION — `InstrInfo` (`progir.h:274-357`).
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +178,24 @@ impl UnitProgram {
     }
 }
 
+/// A UNIT WHOSE PROGRAM DOES NOT FIT ITS INSTRUCTION BUFFER.
+///
+/// ⛔ A NAMED STRUCT, NOT A TRIPLE. `(Component, usize, u16)` puts a count and a bound side by side as
+/// two bare integers — the transposition this crate's newtype rule exists to prevent, and the reader
+/// has nothing but position to tell which is which.
+///
+/// ⭐ IT CARRIES THE BOUND IT BROKE, because "the PT program is 200 instructions" is not actionable
+/// without "and the PT holds 128" — and the bound differs per component and per arch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    /// Which unit.
+    pub unit: Component,
+    /// How many instructions its program holds.
+    pub instructions: usize,
+    /// How many that unit's buffer takes — `max_ibuff_entries(unit)`.
+    pub bound: u16,
+}
+
 /// ONE PROGRAM — `ProgramAndStateInfo` (`progir.h:505-556`).
 ///
 /// # 🛑 THE CONST-GENERIC TRAITS RIDE ALL THE WAY DOWN
@@ -200,10 +213,15 @@ pub struct Program<A: Arch, M: Model, W: Workload> {
     /// ⛔ KEYED BY UNIT, AND THE HALVES STAY SEPARATE. An `l3lu` and an `l3su` are two entries;
     /// merging a load unit's and a store unit's instructions into one program is exactly the mistake
     /// `Component` keeping `Lxlu`/`Lxsu`/`L0lu`/`L0su` apart prevents one rung up.
-    pub per_unit: Vec<(DfirUnit, UnitProgram)>,
+    ///
+    /// ⛔⛔ AND THE KEY IS AN **EXECUTING** UNIT, NOT ANY UNIT. This was `DfirUnit`, which also names
+    /// `Lx` and `Hbm` — memories, which hold no instructions and have no instruction buffer. So a
+    /// program could be filed against a memory, and no bound could be looked up for it.
+    /// [`Component`] is the nine units that execute, which makes [`max_ibuff_entries`] total.
+    pub per_unit: Vec<(Component, UnitProgram)>,
     /// `regState_` — a `RegStateInfo`, which is `map<SenComponents, ProgIrRegGraph>`
     /// (`progir.h:502`): per unit, what its registers start as.
-    pub reg_state: Vec<(DfirUnit, UnitRegState)>,
+    pub reg_state: Vec<(Component, UnitRegState)>,
     /// `variableDefinitions_` — a `ProgIrVarGraph` (`progir.h:306`).
     pub variable_definitions: Vec<(String, String)>,
     /// The arch, model and rung this was compiled for.
@@ -211,13 +229,18 @@ pub struct Program<A: Arch, M: Model, W: Workload> {
 }
 
 impl<A: Arch, M: Model, W: Workload> Program<A, M, W> {
-    /// THE INSTRUCTION BUFFER'S DEPTH — `kMaxCompIBuff`, *"Maximum number of instructions on any
-    /// unit"* (`progir.h:506-507`).
+    /// THE WORST CASE ACROSS EVERY UNIT — `kMaxCompIBuff` (`progir.h:506-507`), whose own comment is
+    /// *"Maximum number of instructions on any unit"*.
     ///
-    /// ⭐⭐ THE CEILING THE WHOLE LADDER AIMS AT. Two hundred and fifty-six per unit is what
-    /// seventy-six passes exist to fit a program into, and it is why the loop-rerolling suite
-    /// (D40-D63) is not cosmetic on a large program even though it changes little on a small one.
-    pub const MAX_INSTRUCTIONS: usize = 256;
+    /// ⛔⛔ **A MAXIMUM OVER UNITS IS NOT ANY UNIT'S LIMIT**, AND USING IT AS ONE WAS A REAL DEFECT.
+    /// This constant was the only bound [`Self::overflowing`] applied, so a 200-instruction PT program
+    /// passed — while `max_ibuff_entries(Component::Pt)` is **128**. `sysdef.cpp:451-500` gives 256 to
+    /// the L3 halves, 128 to PT/PE/SFP/L0/LXSU, and to LXLU 256 on SEN1P5 but 128 otherwise. So the
+    /// real bound is per component AND per arch, and only the L3 halves ever reach this number.
+    ///
+    /// ⭐ KEPT BECAUSE IT IS THE `std::bitset` WIDTH THE REFERENCE ALLOCATES, which is a real fact about
+    /// the array — just not about a unit.
+    pub const WORST_CASE_INSTRUCTIONS: usize = 256;
 
     /// HOW MANY REGISTERS ANY UNIT MAY USE — `kMaxCompRegs` (`progir.h:508-509`).
     ///
@@ -235,12 +258,18 @@ impl<A: Arch, M: Model, W: Workload> Program<A, M, W> {
     /// ⛔ RETURNS THE OFFENDERS, NOT A BOOL. "Some unit overflowed" is not a diagnosis anyone can act
     /// on; which unit, and by how much, is.
     #[must_use]
-    pub fn overflowing(&self) -> Vec<(DfirUnit, usize)> {
+    pub fn overflowing(&self) -> Vec<Overflow> {
         self.per_unit
             .iter()
             .filter_map(|(unit, program)| {
-                let count = program.instructions();
-                (count > Self::MAX_INSTRUCTIONS).then_some((*unit, count))
+                // ⛔ THE UNIT'S OWN BOUND, NOT THE WORST CASE. See [`Self::WORST_CASE_INSTRUCTIONS`].
+                let bound = max_ibuff_entries(*unit);
+                let instructions = program.instructions();
+                (instructions > bound as usize).then_some(Overflow {
+                    unit: *unit,
+                    instructions,
+                    bound,
+                })
             })
             .collect()
     }
@@ -255,7 +284,7 @@ impl<A: Arch, M: Model, W: Workload> Program<A, M, W> {
     ///
     /// ⛔ A PARTIAL CHECK REPORTED AS A FULL ONE IS THE FAILURE MODE THIS CRATE HAS ALREADY PAID FOR
     /// TWICE, so the return names the single law it tested rather than "valid".
-    pub fn size_verdict(&self) -> Result<(), (Invalid, Vec<(DfirUnit, usize)>)> {
+    pub fn size_verdict(&self) -> Result<(), (Invalid, Vec<Overflow>)> {
         let over = self.overflowing();
         if over.is_empty() {
             Ok(())

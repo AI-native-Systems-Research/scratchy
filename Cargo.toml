@@ -2,6 +2,7 @@
 resolver = "2"
 default-members = ["crates/cli/scr"]
 members = [
+    "crates/compiler/deeptools/sys-arch-spec",
     "crates/core/common",
     "crates/core/config",
     "crates/serving/scheduler",

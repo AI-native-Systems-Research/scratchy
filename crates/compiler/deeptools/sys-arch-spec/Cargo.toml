@@ -1,0 +1,24 @@
+[package]
+name = "sys-arch-spec"
+version = "0.1.0"
+edition.workspace = true
+
+# ⛔ NO DEPENDENCIES, AND THAT IS THE POINT.
+#
+# `sys-arch-spec/` is the architecture SPEC: the ISA (`isa/isa.cpp`, `isa/isa.hpp`, `isa/isaSystemc.h`), the
+# machine's register and memory sizes (`sysdef.cpp`), the unit enumerators (`arch_enums.cpp`) and the program
+# IR's register view (`progir/regvisitor.cpp`). Both the COMPILER and the MODEL include those headers, which is
+# why this is a library of its own rather than a module of either: a fact about the machine that two crates
+# each held a copy of is a fact that can disagree with itself, and the ISA was held twice before this crate
+# existed — `Isa::InstOperand` as 89 enumerators here and 89 there, alignment provable only by an assertion
+# written by hand.
+[dependencies]
+
+[features]
+# ⛔ THE TARGET ISA IS A FEATURE, NOT AN ENV VAR — the same fact `deeptools` gates on, and it is stated here
+# because the field table this crate holds is what differs between them.
+default = ["arch-rcudd1a"]
+# `RCUDD1A_ISA`, IBM's own `DEFAULT_ISA` (`isa.hpp:30`).
+arch-rcudd1a = []
+# `SEN1P5_ISA`.
+arch-sen1p5 = []
