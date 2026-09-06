@@ -44,85 +44,24 @@ use crate::lower_subtile_tape_to_superdsc::{
 };
 use scratchy_spyre_bundle as bundle;
 
-/// WHY A TAPE COULD NOT BECOME DATAFLOWIR.
-///
-/// ⛔ EVERY VARIANT NAMES THE THING IT COULD NOT DO. "lowering failed" is not a diagnosis, and a
-/// bake that stops has to say what to build next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DfirError {
-    /// The placement plan could not be built.
-    Layout(String),
-    /// A `SubOp` this bridge has no op-func for yet.
-    ///
-    /// ⛔ NOT A FALLBACK. There is no `_ =>` arm that quietly picks an addition: an op-func that
-    /// does not exist yet is named here so the next thing to build is obvious.
-    NoOpFunc(&'static str),
-    /// A tensor the node reads has no placement.
-    ///
-    /// ⛔ THIS WOULD BE AN ADDRESS NOBODY ASSIGNED. Every tensor a node touches is in the layout by
-    /// construction, so a miss means the node and the plan disagree about the graph.
-    Unplaced {
-        /// Which tensor.
-        tid: u32,
-    },
-    /// The model's numbers match no config in this workspace.
-    UnknownModel {
-        /// The seven, in the order the door takes them.
-        numbers: [u32; 7],
-    },
-    /// The rung is not one the ladders bake.
-    UnknownRung {
-        /// The row count asked for.
-        rows: u32,
-        /// The swept KV extent asked for.
-        active_cap: u32,
-    },
-    /// `deeptools` refused the tape.
-    Tape(String),
-}
-
-impl std::fmt::Display for DfirError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Layout(e) => write!(f, "placement plan: {e}"),
-            Self::NoOpFunc(op) => write!(
-                f,
-                "no op-func for `SubOp::{op}` yet — the DataflowIR bridge lowers what it can name, \
-                 and this one has to be built rather than approximated"
-            ),
-            Self::Unplaced { tid } => write!(
-                f,
-                "tensor t{tid} has no placement: the node reads an address the plan never assigned"
-            ),
-            Self::UnknownModel { numbers } => write!(
-                f,
-                "no config in this workspace declares the model \
-                 (nqh {}, nkvh {}, hd {}, hidden {}, layers {}, ffn {}, vocab {}) — the fix is a \
-                 config.json, never an edit to the door",
-                numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5], numbers[6]
-            ),
-            Self::UnknownRung { rows, active_cap } => write!(
-                f,
-                "rung (rows {rows}, active_cap {active_cap}) is not one the ladders bake"
-            ),
-            Self::Tape(e) => write!(f, "deeptools refused the tape: {e}"),
-        }
-    }
-}
-
 /// WHICH OP-FUNC A TAPE NODE IS.
 ///
 /// ⛔⛔ EXHAUSTIVE, WITH NO WILDCARD. Every `SubOp` is named, so adding one to the tape is an E0004
 /// here rather than a node that silently lowers as something else. The arms that return
-/// [`DfirError::NoOpFunc`] are work not yet done, stated as such.
+/// unbuilt arms are work not yet done, stated as such.
+///
+/// ⛔⛔ AND IT CANNOT REFUSE. There is no error type in this file. A lowering that returns `Err`
+/// stops the tape BEFORE it is emitted, so dbo-opt — the only oracle this bridge has — is never
+/// invoked and the build prints our sentence instead of the backend's. That has cost hours and a
+/// revert five times. See `tests/dfir_never_runtime_refuses.rs`, which is the ratchet.
 ///
 /// ⛔ AND THE TAPE DOES NOT ALWAYS ARRIVE DECOMPOSED. This said the opposite — that `decompose_rmsnorm`
 /// had already split `RmsNorm` into its reduce and apply halves, so the map was "mostly one to one".
 /// The acceptance build falsified it: a raw `SubOp::RmsNorm` reached this function and stopped the
 /// whole tape. Nodes that are several op-funcs are handled by [`expand`], which returns a sequence;
 /// this function answers only for the ones that are exactly one.
-fn op_func_of<F: RopeForm>(op: &SubOp<F>) -> Result<OpFunc, DfirError> {
-    Ok(match op {
+fn op_func_of<F: RopeForm>(op: &SubOp<F>) -> OpFunc {
+    match op {
         SubOp::MatmulTile { .. } => OpFunc::Matmul,
         SubOp::AttnDecode { .. } => OpFunc::Batchmatmul,
         // A split-K combine is an elementwise add over equal-shaped partials.
@@ -143,21 +82,36 @@ fn op_func_of<F: RopeForm>(op: &SubOp<F>) -> Result<OpFunc, DfirError> {
         // is a restickify rather than a copy.
         SubOp::Reshape => OpFunc::Restickifyophbm,
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => OpFunc::Mul,
-        // ⛔ NOT YET BUILT. Each of these needs its own schedule read out of the templates; naming
-        // them here rather than defaulting is what keeps the gap visible.
-        SubOp::RmsNorm { .. } => return Err(DfirError::NoOpFunc("RmsNorm")),
-        SubOp::RmsNormUnit { .. } => return Err(DfirError::NoOpFunc("RmsNormUnit")),
-        SubOp::GateSplit { .. } => return Err(DfirError::NoOpFunc("GateSplit")),
-        SubOp::LoadPixels { .. } => return Err(DfirError::NoOpFunc("LoadPixels")),
-        SubOp::LoadPosEmbeds { .. } => return Err(DfirError::NoOpFunc("LoadPosEmbeds")),
-        SubOp::EmbeddingGather { .. } => return Err(DfirError::NoOpFunc("EmbeddingGather")),
-        SubOp::VisionRope => return Err(DfirError::NoOpFunc("VisionRope")),
-        SubOp::VarlenAttention { .. } => return Err(DfirError::NoOpFunc("VarlenAttention")),
-        SubOp::EncoderAttn { .. } => return Err(DfirError::NoOpFunc("EncoderAttn")),
-        SubOp::GatedDeltaNet => return Err(DfirError::NoOpFunc("GatedDeltaNet")),
-        SubOp::GemmaMoe { .. } => return Err(DfirError::NoOpFunc("GemmaMoe")),
-        SubOp::Moe { .. } => return Err(DfirError::NoOpFunc("Moe")),
-    })
+        // ⛔⛔ NOT YET BUILT — SAY SO, DO NOT SUBSTITUTE. Each needs its own schedule read out of the
+        // templates. Giving them a stand-in op-func (`Identity`, say) makes the tape lower WHOLE and
+        // wrong: a Moe emitted as a copy is a program dbo-opt compiles happily and a model that
+        // produces garbage. `todo!` names the op that has work, loudly, and cannot be logged and
+        // carried on from the way a returned value can.
+        //
+        // ⛔ NONE OF THESE IS IN A DECODE TAPE. granite/llama decode is Gemm, AttnDecode, Add, Mul,
+        // RmsNorm, RopeAppend, RopeRotate, ScalarMul, Silu — the wavefront census prints exactly
+        // that list — so none of these fires on the acceptance target.
+        SubOp::RmsNormUnit { .. } => todo!("SubOp::RmsNormUnit has no DataflowIR decomposition"),
+        SubOp::GateSplit { .. } => todo!("SubOp::GateSplit has no DataflowIR decomposition"),
+        SubOp::LoadPixels { .. } => todo!("SubOp::LoadPixels has no DataflowIR decomposition"),
+        SubOp::LoadPosEmbeds { .. } => {
+            todo!("SubOp::LoadPosEmbeds has no DataflowIR decomposition")
+        }
+        SubOp::EmbeddingGather { .. } => {
+            todo!("SubOp::EmbeddingGather has no DataflowIR decomposition")
+        }
+        SubOp::VisionRope => todo!("SubOp::VisionRope has no DataflowIR decomposition"),
+        SubOp::VarlenAttention { .. } => {
+            todo!("SubOp::VarlenAttention has no DataflowIR decomposition")
+        }
+        SubOp::EncoderAttn { .. } => todo!("SubOp::EncoderAttn has no DataflowIR decomposition"),
+        SubOp::GatedDeltaNet => todo!("SubOp::GatedDeltaNet has no DataflowIR decomposition"),
+        SubOp::GemmaMoe { .. } => todo!("SubOp::GemmaMoe has no DataflowIR decomposition"),
+        SubOp::Moe { .. } => todo!("SubOp::Moe has no DataflowIR decomposition"),
+        // ⭐ `RmsNorm` IS BUILT — [`expand`] decomposes it into six op-funcs before this is reached,
+        // so this arm answers only for a caller that asks about the node rather than expanding it.
+        SubOp::RmsNorm { .. } => todo!("SubOp::RmsNorm is expanded, not mapped to one op-func"),
+    }
 }
 
 /// ONE TENSOR REGION AS AN OPERAND, at the address the plan gave its tensor.
@@ -166,16 +120,17 @@ fn op_func_of<F: RopeForm>(op: &SubOp<F>) -> Result<OpFunc, DfirError> {
 /// slice's first row starts `row_start * width * bytes` into the tensor's placement. Dropping that
 /// term addresses every slice at the tensor's base — which reads the right tensor and the wrong
 /// rows, and looks entirely plausible.
-fn operand_of<F: RopeForm>(
-    tr: &TensorRegion,
-    ir: &SubtileIR<F>,
-    layout: &BundleLayout,
-) -> Result<Operand, DfirError> {
+fn operand_of<F: RopeForm>(tr: &TensorRegion, ir: &SubtileIR<F>, layout: &BundleLayout) -> Operand {
     let tid = tr.tensor.index() as u32;
-    let place = layout
-        .placements
-        .get(&tid)
-        .ok_or(DfirError::Unplaced { tid })?;
+    // ⛔⛔ THE PLAN IS BUILT FROM THIS SAME GRAPH, so every tensor a node touches is in it by
+    // construction. This is the ONE thing in this file that is not total, and the alternative is
+    // worse than a stop: a default placement is an INVENTED ADDRESS, which is the first entry in
+    // this crate's own list of past fuckups — programs that read memory nothing ever filled. So the
+    // address is never fabricated; making this total means making the placement plan itself return
+    // a placement for every tensor, which is a change to the plan and not to this line.
+    let place = layout.placements.get(&tid).unwrap_or_else(|| {
+        panic!("t{tid} is absent from the placement plan built from this graph")
+    });
     let shape = ir.tensors[tid as usize];
     let rows = tr.region.rows.len;
 
@@ -205,7 +160,7 @@ fn operand_of<F: RopeForm>(
     let within = u64::from(tr.region.rows.start) * u64::from(shape.cols) * 2
         + u64::from(tr.region.cols.start) * 2;
 
-    Ok(Operand {
+    Operand {
         rows: Rows(rows),
         cols: Cols(cols),
         format: DataType::Sen169Fp16,
@@ -213,7 +168,7 @@ fn operand_of<F: RopeForm>(
             segment: Segment(u32::try_from(place.segment).unwrap_or(0)),
             offset: Bytes(place.offset + within),
         },
-    })
+    }
 }
 
 /// A SYNTHETIC INTERMEDIATE, DECLARED AND THEN ADDRESSED.
@@ -233,16 +188,18 @@ fn synth_operand(
     role: bundle::SynthRole,
     rows: u32,
     cols: u32,
-) -> Result<Operand, DfirError> {
+) -> Operand {
     let id = bundle::PlaceId::Synth { of, role };
     layout.synth(id, &[rows, cols]);
     let offset = *layout
         .synth
         .borrow()
         .map
+        // ⛔ `synth` DECLARED IT ON THE LINE ABOVE, so the bump allocator has an entry by
+        // construction. Same rule as `operand_of`: never fabricate an address.
         .get(&id.to_string())
-        .ok_or(DfirError::Unplaced { tid: of })?;
-    Ok(Operand {
+        .unwrap_or_else(|| panic!("synthetic {id} was declared and is not in the layout"));
+    Operand {
         rows: Rows(rows),
         cols: Cols(cols),
         format: DataType::Sen169Fp16,
@@ -252,7 +209,7 @@ fn synth_operand(
             ),
             offset: Bytes(offset),
         },
-    })
+    }
 }
 
 /// ONE TAPE NODE AS THE PROGRAMS IT BECOMES.
@@ -266,7 +223,7 @@ fn expand<F: RopeForm>(
     node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
     ir: &SubtileIR<F>,
     layout: &BundleLayout,
-) -> Result<Vec<Node>, DfirError> {
+) -> Vec<Node> {
     use bundle::SynthRole as R;
 
     let one = |op_func: OpFunc, inputs: Vec<Operand>, output: Operand| Node {
@@ -279,9 +236,10 @@ fn expand<F: RopeForm>(
     if let SubOp::RmsNorm { .. } = node.op {
         // `mean = mean(x*x)` -> `+ eps` -> `rsqrt` -> `x * rinv` -> `* gamma`. The reduce's output
         // is one stick wide, not one column: the device reduces into a stick.
-        let [x, gamma] = node.inputs.as_slice() else {
-            return Err(DfirError::NoOpFunc("RmsNorm without exactly (x, gamma)"));
-        };
+        // ⛔ `(x, gamma)` IS THE OP'S OWN SHAPE — `SubOp::RmsNorm`'s doc states `inputs[0] = x`,
+        // `inputs[1] = weight`. Indexing rather than destructuring-with-an-else, because the `else`
+        // is a refusal and a refusal stops the tape before dbo-opt reads it.
+        let (x, gamma) = (&node.inputs[0], &node.inputs[1]);
         let of = node.output.tensor.index() as u32;
         let rows = node.output.region.rows.len;
         let cols = node.output.region.cols.len;
@@ -289,35 +247,31 @@ fn expand<F: RopeForm>(
         // under-reserves it by a whole stick and the next synthetic starts inside it.
         let stick = 64;
 
-        let xo = operand_of(x, ir, layout)?;
-        let go = operand_of(gamma, ir, layout)?;
-        let sq = synth_operand(layout, of, R::Sq16, rows, cols)?;
-        let mean = synth_operand(layout, of, R::Mean, rows, stick)?;
-        let meps = synth_operand(layout, of, R::Meps, rows, stick)?;
-        let rinv = synth_operand(layout, of, R::Rinv, rows, stick)?;
-        let xn = synth_operand(layout, of, R::Xn, rows, cols)?;
-        let out = operand_of(&node.output, ir, layout)?;
+        let xo = operand_of(x, ir, layout);
+        let go = operand_of(gamma, ir, layout);
+        let sq = synth_operand(layout, of, R::Sq16, rows, cols);
+        let mean = synth_operand(layout, of, R::Mean, rows, stick);
+        let meps = synth_operand(layout, of, R::Meps, rows, stick);
+        let rinv = synth_operand(layout, of, R::Rinv, rows, stick);
+        let xn = synth_operand(layout, of, R::Xn, rows, cols);
+        let out = operand_of(&node.output, ir, layout);
 
-        return Ok(vec![
+        return vec![
             one(OpFunc::Mul, vec![xo, xo], sq),
             one(OpFunc::Mean, vec![sq], mean),
             one(OpFunc::Add, vec![mean], meps),
             one(OpFunc::Rsqrt, vec![meps], rinv),
             one(OpFunc::Mul, vec![xo, rinv], xn),
             one(OpFunc::Mul, vec![xn, go], out),
-        ]);
+        ];
     }
 
-    let op_func = op_func_of(&node.op)?;
+    let op_func = op_func_of(&node.op);
     let mut inputs = Vec::with_capacity(node.inputs.len());
     for input in &node.inputs {
-        inputs.push(operand_of(input, ir, layout)?);
+        inputs.push(operand_of(input, ir, layout));
     }
-    Ok(vec![one(
-        op_func,
-        inputs,
-        operand_of(&node.output, ir, layout)?,
-    )])
+    vec![one(op_func, inputs, operand_of(&node.output, ir, layout))]
 }
 
 /// THE WHOLE TAPE, AS DATAFLOWIR TEXT.
@@ -325,10 +279,9 @@ fn expand<F: RopeForm>(
 /// ⭐ EVERY NODE. The result is one program per node of `ir.nodes`, in evaluation order, and
 /// `deeptools` asserts that count itself — a partial lowering is not a result.
 ///
-/// # Errors
-///
-/// Returns [`DfirError`] naming what could not be done: an op-func that is not built, a tensor with
-/// no placement, a model or rung no door has an arm for.
+/// ⛔⛔ AND IT RETURNS THE GROUPS, NEVER A REFUSAL. Every stop this function could take is a stop
+/// placed EARLIER THAN dbo-opt, which is the only thing that can tell us whether the DataflowIR we
+/// emit is any good. See `tests/dfir_never_runtime_refuses.rs`.
 pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &HashSet<u32>,
@@ -337,14 +290,17 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
     active_cap: ActiveCap,
     cap: u32,
     model: [u32; 7],
-) -> Result<Vec<String>, DfirError> {
+) -> Vec<String> {
     // ⛔ RESOLVED HERE, ONCE. `ActiveCap::resolve` is documented as THE ONLY place a rung becomes a
     // tile extent: NONE -> 0 (sweep no resident prefix), FULL or any out-of-range request -> the
     // bundle's whole `cap`, otherwise the request itself.
     let active_cap = active_cap.resolve(cap, scratchy_subtile::sdsc_abstract::POOL_STICK);
     // ⭐ THE SAME PLAN THE WORKER STAGES AGAINST, derived from this same graph.
+    // ⛔ THE PLAN IS THE SAME ONE THE WORKER STAGES AGAINST; if it cannot be built the bundle cannot
+    // exist at all, and that is the superdsc path's own failure, not a case this bridge lowers
+    // differently.
     let layout = compute_bundle_layout(ir, weight_ids, rows_are_requests)
-        .map_err(|e| DfirError::Layout(e.to_string()))?;
+        .unwrap_or_else(|e| panic!("the placement plan this tape shares could not be built: {e}"));
 
     // ⛔ EVERY NODE, AND A NODE MAY BE SEVERAL PROGRAMS. The count below is per NODE, not per
     // program: `SubOp::RmsNorm` becomes six. A node that mapped to nothing is a forward silently
@@ -355,25 +311,14 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
     // reason: one tape node explodes into many, and the kinds distinguish AMONG them.
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut trips: Vec<Trip> = Vec::with_capacity(ir.nodes.len());
-    let mut mapped = 0usize;
     for node in &ir.nodes {
-        let programs = expand(node, ir, &layout)?;
-        if programs.is_empty() {
-            return Err(DfirError::Tape(format!(
-                "node {} expanded to no programs at all",
-                node.output.tensor.index()
-            )));
-        }
+        // ⛔ `expand` IS TOTAL — every arm of its match yields at least one node, so "expanded to
+        // nothing" is not a state it can be in. It used to be checked here and returned as an
+        // error; the check was the shape of a refusal even when it could not fire.
+        let programs = expand(node, ir, &layout);
         let trip = trip_of(&node.op);
         trips.extend(std::iter::repeat_n(trip, programs.len()));
-        mapped += 1;
         nodes.extend(programs);
-    }
-    if mapped != ir.nodes.len() {
-        return Err(DfirError::Tape(format!(
-            "the graph has {} nodes but {mapped} were mapped",
-            ir.nodes.len()
-        )));
     }
     debug_assert_eq!(trips.len(), nodes.len(), "one trip per emitted program");
 
@@ -399,10 +344,19 @@ pub fn lower_subtile_tape_to_dataflow_ir<F: RopeForm>(
             with_config_model(
                 model[0], model[1], model[2], model[3], model[4], model[5], model[6], emit,
             )
-            .ok_or(DfirError::UnknownModel { numbers: model })??,
+            // ⛔ THE DOOR IS TOTAL OVER THE CONFIGS IN SCOPE — the build named this model, so an arm
+            // for it exists. A miss is a config that was compiled and then not declared, which is a
+            // `config.json`, never something this bridge lowers around.
+            .unwrap_or_else(|| {
+                panic!(
+                    "no config declares (nqh {}, nkvh {}, hd {}, hidden {}, layers {}, ffn {}, \
+                     vocab {})",
+                    model[0], model[1], model[2], model[3], model[4], model[5], model[6]
+                )
+            }),
         );
     }
-    Ok(out)
+    out
 }
 
 /// WHAT KIND OF TRIP A TAPE NODE'S PROGRAMS ARE, for [`group_ranges`].
@@ -441,7 +395,7 @@ struct Emit {
 }
 
 impl OnModel for Emit {
-    type Out = Result<String, DfirError>;
+    type Out = String;
 
     fn on_model<
         const NQH: u32,
@@ -532,12 +486,7 @@ macro_rules! swept_ladder {
 ///
 /// ⛔ A RUNG OFF THE LADDER IS REFUSED, never rounded. Rounding bakes a program whose swept extent
 /// is not the one the worker will pick it for.
-fn rungs<M: Model>(
-    nodes: &[Node],
-    rows: u32,
-    active_cap: u32,
-    group: u32,
-) -> Result<String, DfirError> {
+fn rungs<M: Model>(nodes: &[Node], rows: u32, active_cap: u32, group: u32) -> String {
     // ⛔ WRITTEN OUT RATHER THAN NESTED, because a `macro_rules!` inside a `macro_rules!` needs
     // `$$` — meta-variable expressions, still unstable (rust#83527). The swept ladder is expanded
     // by `swept_ladder!` at one site below, so it is still declared once.
@@ -566,9 +515,9 @@ fn rungs<M: Model>(
                     512 => rung!($r, 512),
                     1024 => rung!($r, 1024),
                     2048 => rung!($r, 2048),
-                    _ => Err(DfirError::UnknownRung { rows, active_cap }),
+                    _ => panic!("rung (rows {rows}, active_cap {active_cap}) is not one the ladders bake"),
                 },)+
-                _ => Err(DfirError::UnknownRung { rows, active_cap }),
+                _ => panic!("rung (rows {rows}, active_cap {active_cap}) is not one the ladders bake"),
             }
         };
     }
@@ -586,10 +535,13 @@ fn rungs<M: Model>(
 }
 
 /// The innermost arm: machine, model and rung are all constants here.
-fn emit_run<M: Model, W: Workload>(nodes: &[Node], group: u32) -> Result<String, DfirError> {
+fn emit_run<M: Model, W: Workload>(nodes: &[Node], group: u32) -> String {
+    // ⛔ `deeptools` STILL REFUSES A TAPE IT CANNOT WALK, and that refusal is ITS invariant, not a
+    // lowering decision taken here. It is surfaced rather than turned into a value: a value would be
+    // something a caller could log and carry on from, which is exactly how this bridge went blind.
     let run = tape::compile::<Dd2, M, W>(nodes, GroupId(group))
-        .map_err(|e| DfirError::Tape(format!("{e:?}")))?;
-    Ok(print::run(&run))
+        .unwrap_or_else(|e| panic!("deeptools could not walk the tape: {e:?}"));
+    print::run(&run)
 }
 
 /// Silence the unused-import warning for `Elements` on builds where no operand is LX-resident yet.

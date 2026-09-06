@@ -9341,23 +9341,30 @@ fn dump_wavefront_mega(
                                 // ⭐ ONE MODULE PER LAUNCH GROUP, and the groups are `group_ranges`'
                                 // — the SAME fusion walk the other path uses, not a partition
                                 // invented here.
-                                match dfir::lower_subtile_tape_to_dataflow_ir(
-                                    &krg,
-                                    &weight_ids,
-                                    !is_prefill && decode_rows > 1,
-                                    decode_rows,
-                                    // ⛔ THE SENTINEL AND ITS CAP, RESOLVED BY THE BRIDGE. `ActiveCap`
-                                    // is a sentinel type — FULL is 0 ("sweep everything") and NONE
-                                    // is u32::MAX ("sweep nothing") — so handing the rung door
-                                    // `.get()` passes a sentinel where an extent belongs, which is
-                                    // what "rung (rows 1, active_cap 0)" and "active_cap 4294967295"
-                                    // were. `ActiveCap::resolve` is THE ONLY place a rung becomes a
-                                    // tile extent, and it lives beside the bridge rather than here.
-                                    active_cap,
-                                    cap,
-                                    numbers,
-                                ) {
-                                    Ok(groups) => {
+                                // ⛔⛔ NO `match` ON A `Result` HERE, BECAUSE THERE IS NO `Result`.
+                                // The DataflowIR lowering is TOTAL: it returns the groups. Its
+                                // error type was deleted after a refusal added to it stopped the
+                                // tape before dbo-opt was ever invoked — and this arm LOGGED that
+                                // refusal and carried on, so the build printed our sentence, exited
+                                // on something else entirely, and the loop went blind.
+                                {
+                                    let groups = dfir::lower_subtile_tape_to_dataflow_ir(
+                                        &krg,
+                                        &weight_ids,
+                                        !is_prefill && decode_rows > 1,
+                                        decode_rows,
+                                        // ⛔ THE SENTINEL AND ITS CAP, RESOLVED BY THE BRIDGE. `ActiveCap`
+                                        // is a sentinel type — FULL is 0 ("sweep everything") and NONE
+                                        // is u32::MAX ("sweep nothing") — so handing the rung door
+                                        // `.get()` passes a sentinel where an extent belongs, which is
+                                        // what "rung (rows 1, active_cap 0)" and "active_cap 4294967295"
+                                        // were. `ActiveCap::resolve` is THE ONLY place a rung becomes a
+                                        // tile extent, and it lives beside the bridge rather than here.
+                                        active_cap,
+                                        cap,
+                                        numbers,
+                                    );
+                                    {
                                         eprintln!(
                                             "[spyre-dfir] {base}: {} nodes -> {} launch group(s)",
                                             krg.nodes.len(),
@@ -9409,7 +9416,6 @@ fn dump_wavefront_mega(
                                             }
                                         }
                                     }
-                                    Err(e) => eprintln!("[spyre-dfir] {base}: {e}"),
                                 }
                             }
                             match superdsc::lower_subtile_tape_to_superdsc(
