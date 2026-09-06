@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 use crate::generated::{ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::op::{
-    Bound, CompositeTransfer, Index, LogicKind, Op, Precision, RegAddr, Val,
+    Bound, CompositeTransfer, Index, LogicKind, Op, Precision, Predicate, RegAddr, Val,
 };
 use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, ElemType, IntegerSet, MemRef, Vector,
@@ -69,8 +69,29 @@ fn program_module<A: crate::arch::Arch>(out: &mut String, program: &Program<A>) 
         program.name,
         grid_attr(program.grid.extents())
     );
-    for op in &program.body {
+    // The preamble binds the units and views; the program units then run on them.
+    for op in &program.preamble {
         emit(out, op, 3);
+    }
+    // ⭐⭐ AT LEAST ONE `dataflow.program_unit`, BY THE TYPE. `AdaptSchedulerDfir.cpp:63-78` walks
+    // each child module for a `func.func` holding one and fails the compile with "found no program
+    // to compile" when none does — which is exactly what a flat body produced.
+    for unit in program.units.iter() {
+        let precision = match unit.precision {
+            Some(p) => format!(" {{precision = \"{}\"}}", Precision::spelling(p)),
+            None => String::new(),
+        };
+        indent(out, 3);
+        let _ = writeln!(
+            out,
+            "dataflow.program_unit {}{precision} : {{",
+            vals(&unit.on)
+        );
+        for op in &unit.body {
+            emit(out, op, 4);
+        }
+        indent(out, 3);
+        out.push_str("}\n");
     }
     out.push_str("      return\n    }\n  }\n");
 }
@@ -646,12 +667,11 @@ fn emit(out: &mut String, op: &Op, depth: usize) {
         } => {
             let _ = writeln!(
                 out,
-                "{} = vectorchain.element_wise_compare {}, {}[{} : {}] {{compare_op = #vectorchain<element_wise_compare_operator {}>}} : {}, {}, {}",
+                "{} = vectorchain.element_wise_compare {}, {}{} {{compare_op = #vectorchain<element_wise_compare_operator {}>}} : {}, {}, {}",
                 val(*result),
                 val(*op1),
                 val(*op2),
-                val(*mask),
-                vector(*ty),
+                mask_bracket(*mask),
                 compare_op.spelling(),
                 vector(*operand_ty),
                 vector(*operand_ty),
@@ -664,19 +684,19 @@ fn emit(out: &mut String, op: &Op, depth: usize) {
             lhs,
             rhs,
             mask,
-            cond_ty,
             ty,
         } => {
+            // ⭐ THE CONDITION'S TYPE IS THE CONDITION'S OWN — it was `cond_ty`, a field the
+            // emitter filled in beside the value, which is the same two-records shape.
             let _ = writeln!(
                 out,
-                "{} = vectorchain.element_wise_selection {} ? {} : {} [{} : {}] : {}, {}, {}, {}",
+                "{} = vectorchain.element_wise_selection {} ? {} : {} {} : {}, {}, {}, {}",
                 val(*result),
-                val(*cond),
+                val(cond.val()),
                 val(*lhs),
                 val(*rhs),
-                val(*mask),
-                vector(*cond_ty),
-                vector(*cond_ty),
+                mask_bracket(*mask),
+                vector(cond.ty()),
                 vector(*ty),
                 vector(*ty),
                 vector(*ty)
@@ -694,12 +714,11 @@ fn emit(out: &mut String, op: &Op, depth: usize) {
         } => {
             let _ = writeln!(
                 out,
-                "{} = vectorchain.binary {}, {}[{} : {}] {{binary_op = #vectorchain<binary_operator {}>, op_specific_map = {}}} : {}, {}, {}",
+                "{} = vectorchain.binary {}, {}{} {{binary_op = #vectorchain<binary_operator {}>, op_specific_map = {}}} : {}, {}, {}",
                 val(*result),
                 val(*op1),
                 val(*op2),
-                val(*mask),
-                mask_ty(*ty),
+                mask_bracket(*mask),
                 binary_op.spelling(),
                 affine_map(op_specific_map),
                 vector(*operand_ty),
@@ -773,14 +792,17 @@ fn emit(out: &mut String, op: &Op, depth: usize) {
                 vector(*ty)
             );
         }
-        Op::CreateAffineMask { result, lanes, ty } => {
+        Op::CreateAffineMask { result, mask } => {
             // A continuous prefix of live lanes, as `getStaticContinuousMaskValue` builds.
+            //
+            // ⭐ THE TYPE PRINTED HERE IS THE ONE EVERY USE PRINTS, because both read it off the
+            // same `LaneMask`. That is what makes the definition and the use unable to disagree.
             let _ = writeln!(
                 out,
                 "{} = vectorchain.create_affine_mask {{mask_set = affine_set<(d0) : (d0 >= 0, -d0 + {} >= 0)>}} : {}",
                 val(*result),
-                lanes.saturating_sub(1),
-                vector(*ty)
+                mask.live().saturating_sub(1),
+                vector(mask.ty())
             );
         }
     }
@@ -857,9 +879,21 @@ fn memref(ty: &MemRef) -> String {
     format!("memref<{shape}{}>", elem(ty.elem))
 }
 
-/// The i1 mask type that matches a vector's lane count.
-fn mask_ty(ty: Vector) -> String {
-    format!("vector<{}xi1>", ty.len)
+/// THE `[%mask : t]` BRACKET, OR NOTHING AT ALL.
+///
+/// ⛔⛔ THE TYPE COMES FROM THE PREDICATE, NEVER FROM THE OPERANDS. `fn mask_ty(ty: Vector)` used to
+/// build `vector<{ty.len}xi1>` here at the USE — a second record of a type the DEFINITION had
+/// already stated — and dbo-opt refused granite-2b's `group_7` with *"use of value '%42' expects
+/// different type than prior uses: 'vector<64xi1>' vs 'i1'"*.
+///
+/// ⭐ AND `None` PRINTS NOTHING. Every masked op's `$mask` is `Optional` in the dialect, and the
+/// assembly format wraps the bracket in `(...)?` — so an unmasked op omits the operand rather than
+/// carrying an all-true constant that masks nothing.
+fn mask_bracket(mask: Option<Predicate>) -> String {
+    match mask {
+        Some(p) => format!("[{} : {}]", val(p.val()), vector(p.ty())),
+        None => String::new(),
+    }
 }
 
 fn vector(ty: Vector) -> String {

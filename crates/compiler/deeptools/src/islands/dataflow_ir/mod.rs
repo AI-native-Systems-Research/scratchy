@@ -43,6 +43,50 @@ impl Values {
     }
 }
 
+/// ONE `dataflow.program_unit` — the units it runs on, and what they run.
+///
+/// ⛔⛔ ONE NODE IS THREE OF THESE, because the datapath has three ends. A compute has NO READ PORT
+/// TO THE SCRATCHPAD — `VectorOperands.cpp:187-206` resolves a compute operand's view to a register
+/// file and an `lx` view is `Unknown memory type` — so the loader reads memory and sends, the
+/// compute drains the wire and sends on, and the store unit receives and writes.
+///
+/// ⛔ WHICH IS WHY WRAPPING THE WHOLE BODY IN ONE UNIT WOULD NOT BE THE FIX. It satisfies the pass
+/// and describes a compute reading the LX directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramUnit<A: Arch> {
+    /// The units this runs on, in the order the schedule names them.
+    pub on: Vec<op::Val>,
+    /// `precision =`, present only where the unit computes.
+    pub precision: Option<op::Precision>,
+    /// What it runs.
+    pub body: Vec<Op>,
+    /// The arch it was lowered for.
+    pub arch: core::marker::PhantomData<A>,
+}
+
+/// A PROGRAM'S UNITS — NON-EMPTY BY CONSTRUCTION.
+///
+/// ⭐ THE HEAD IS A FIELD, NOT AN INDEX. `units.is_empty()` is not a question that can be asked,
+/// which is what makes "found no program to compile" unreachable from our side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramUnits<A: Arch> {
+    head: ProgramUnit<A>,
+    rest: Vec<ProgramUnit<A>>,
+}
+
+impl<A: Arch> ProgramUnits<A> {
+    /// A program's units, the first one being what makes it a program at all.
+    #[must_use]
+    pub fn of(head: ProgramUnit<A>, rest: Vec<ProgramUnit<A>>) -> Self {
+        Self { head, rest }
+    }
+
+    /// Every unit, head first.
+    pub fn iter(&self) -> impl Iterator<Item = &ProgramUnit<A>> {
+        core::iter::once(&self.head).chain(self.rest.iter())
+    }
+}
+
 /// ONE PROGRAM: a named module holding the DataflowIR one schedule runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program<A: Arch> {
@@ -50,8 +94,21 @@ pub struct Program<A: Arch> {
     pub name: ProgramName,
     /// `attributes {grid = [N]}` on the function — the grid the schedule was split for.
     pub grid: Grid,
-    /// The body: the units it declares and the programs it runs on them.
-    pub body: Vec<Op>,
+    /// The preamble: the units and views the program declares, before any unit runs.
+    pub preamble: Vec<Op>,
+    /// THE PROGRAM UNITS — AT LEAST ONE, AND `Vec<Op>` CANNOT SPELL THAT.
+    ///
+    /// ⛔⛔ dbo-opt: *"dbo-adapt-scheduler-dfir found no program to compile"*. The predicate is
+    /// `AdaptSchedulerDfir.cpp:63-78` — it walks each child module for a `func.func` containing a
+    /// `dataflow::ProgramUnitOp` and fails when none has one. `body: Vec<Op>` accepted any op
+    /// sequence, so a program with no `program_unit` at all was constructible — and `Op::ProgramUnit`
+    /// had exactly ONE mention in the whole crate, the printer arm that would have rendered it.
+    /// A variant that compiles, prints, and is never built.
+    ///
+    /// ⭐ A NON-EMPTY LIST, so "a program with no units" is not a state that exists. The units are
+    /// the STRUCTURE of a program, not ops among ops, which is why they are their own field rather
+    /// than something the emitter may or may not push.
+    pub units: ProgramUnits<A>,
     /// The arch this program was lowered for.
     ///
     /// ⭐⭐ NOT DECORATION. `Dd2` and `Sen1p5` both exist in every build — only [`crate::arch::Target`]
@@ -77,35 +134,60 @@ pub struct Program<A: Arch> {
 /// target does not have. VERIFIED RED:
 ///
 /// ```compile_fail
-/// use deeptools::arch::{Dd2, Sen1p5};
-/// use deeptools::islands::dataflow_ir::{Grid, GroupId, KernelName, Program, ProgramName, Run};
-/// let dd2: Program<Dd2> = Program {
-///     name: ProgramName::Golden("a"),
-///     grid: Grid::single(),
-///     body: Vec::new(),
-///     arch: core::marker::PhantomData,
+/// use deeptools::arch::{Arch, Dd2, Sen1p5};
+/// use deeptools::generated::OpFunc;
+/// use deeptools::islands::dataflow_ir::{
+///     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
 /// };
-/// let sen: Program<Sen1p5> = Program {
-///     name: ProgramName::Golden("b"),
-///     grid: Grid::single(),
-///     body: Vec::new(),
-///     arch: core::marker::PhantomData,
-/// };
-/// let _ = Run { kernel: KernelName::Group(GroupId(0)), programs: vec![dd2, sen] };
+/// fn one<A: Arch>(index: u32) -> Program<A> {
+///     Program {
+///         name: ProgramName { group: GroupId(0), index: OpIndex(index), func: OpFunc::Add },
+///         grid: Grid::single(),
+///         preamble: Vec::new(),
+///         units: ProgramUnits::of(
+///             ProgramUnit {
+///                 on: Vec::new(),
+///                 precision: None,
+///                 body: Vec::new(),
+///                 arch: core::marker::PhantomData,
+///             },
+///             Vec::new(),
+///         ),
+///         arch: core::marker::PhantomData,
+///     }
+/// }
+/// let dd2: Program<Dd2> = one(0);
+/// let sen: Program<Sen1p5> = one(1);
+/// let _ = Run { kernel: KernelName(GroupId(0)), programs: vec![dd2, sen] };
 /// ```
 ///
 /// while one arch alone is fine:
 ///
 /// ```
-/// use deeptools::arch::Dd2;
-/// use deeptools::islands::dataflow_ir::{Grid, GroupId, KernelName, Program, ProgramName, Run};
-/// let dd2: Program<Dd2> = Program {
-///     name: ProgramName::Golden("a"),
-///     grid: Grid::single(),
-///     body: Vec::new(),
-///     arch: core::marker::PhantomData,
+/// use deeptools::arch::{Arch, Dd2};
+/// use deeptools::generated::OpFunc;
+/// use deeptools::islands::dataflow_ir::{
+///     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
 /// };
-/// let _ = Run { kernel: KernelName::Group(GroupId(0)), programs: vec![dd2] };
+/// fn one<A: Arch>(index: u32) -> Program<A> {
+///     Program {
+///         name: ProgramName { group: GroupId(0), index: OpIndex(index), func: OpFunc::Add },
+///         grid: Grid::single(),
+///         preamble: Vec::new(),
+///         units: ProgramUnits::of(
+///             ProgramUnit {
+///                 on: Vec::new(),
+///                 precision: None,
+///                 body: Vec::new(),
+///                 arch: core::marker::PhantomData,
+///             },
+///             Vec::new(),
+///         ),
+///         arch: core::marker::PhantomData,
+///     }
+/// }
+/// let dd2: Program<Dd2> = one(0);
+/// let _ = Run { kernel: KernelName(GroupId(0)), programs: vec![dd2] };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run<A: Arch> {
@@ -129,56 +211,41 @@ pub struct OpIndex(pub u32);
 ///
 /// ⭐⭐ THE PARTS, NOT THE TEXT. This was a `String` built at the call site with `format!`, which
 /// made the symbol's shape a convention rather than a fact: nothing stopped two programs taking the
-/// same name, and nothing could read the group back out of one. Rendering is
-/// [`ProgramName::spelling`]'s job and happens once, in the printer.
+/// same name, and nothing could read the group back out of one. Rendering happens once, in
+/// [`core::fmt::Display`].
+///
+/// ⛔ NO `&'static str` ARM. There was one, carrying a reference file's own symbol so a byte-exact
+/// comparison could reproduce it. Nothing this crate lowers has a name it did not compute, so the
+/// only thing that arm bought was a way back to stringly-typed symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProgramName {
-    /// One this crate emits: which group, where in it, and which op-func.
-    Emitted {
-        /// Which group it belongs to.
-        group: GroupId,
-        /// Where it sits in that group.
-        index: OpIndex,
-        /// Which op-func it lowers — carried so the symbol says what it is.
-        func: OpFunc,
-    },
-    /// 🛑 A REFERENCE FILE'S OWN SYMBOL, and the only reason this is an enum.
-    ///
-    /// IBM's golden DataflowIR names its modules whatever it names them (`dataflowProgram`), and the
-    /// golden test compares BYTES — so reproducing their text means carrying their symbol.
-    ///
-    /// ⛔ `&'static str`, NOT `String`. A golden's name is a literal in a test; it cannot be built at
-    /// runtime from anything a caller computed, which is what keeps this from being a way back to
-    /// stringly-typed names. No lowering constructs it.
-    Golden(&'static str),
+pub struct ProgramName {
+    /// Which group it belongs to.
+    pub group: GroupId,
+    /// Where it sits in that group.
+    pub index: OpIndex,
+    /// Which op-func it lowers — carried so the symbol says what it is.
+    pub func: OpFunc,
 }
 
 impl core::fmt::Display for ProgramName {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ProgramName::Emitted { group, index, func } => {
-                write!(f, "g{}_{}_{}", group.0, index.0, func.spelling())
-            }
-            ProgramName::Golden(symbol) => f.write_str(symbol),
-        }
+        write!(
+            f,
+            "g{}_{}_{}",
+            self.group.0,
+            self.index.0,
+            self.func.spelling()
+        )
     }
 }
 
-/// THE SYMBOL OF A RUN'S KERNEL. See [`ProgramName`] for why the golden arm exists.
+/// THE SYMBOL OF A RUN'S KERNEL — the group it compiles. See [`ProgramName`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum KernelName {
-    /// The group this run compiles.
-    Group(GroupId),
-    /// A reference file's own kernel symbol.
-    Golden(&'static str),
-}
+pub struct KernelName(pub GroupId);
 
 impl core::fmt::Display for KernelName {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            KernelName::Group(group) => write!(f, "group_{}", group.0),
-            KernelName::Golden(symbol) => f.write_str(symbol),
-        }
+        write!(f, "group_{}", self.0.0)
     }
 }
 

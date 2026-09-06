@@ -140,7 +140,12 @@ fn count(run: &deeptools::islands::dataflow_ir::Run<Dd2>, want: fn(&Op) -> bool)
     }
     let mut n = 0;
     for program in &run.programs {
-        walk(&program.body, want, &mut n);
+        // ⭐ THE PREAMBLE AND EVERY PROGRAM UNIT. A count that read only one of them would miss the
+        // ops the other holds — and the split between them is exactly what these tests measure.
+        walk(&program.preamble, want, &mut n);
+        for unit in program.units.iter() {
+            walk(&unit.body, want, &mut n);
+        }
     }
     n
 }
@@ -165,11 +170,10 @@ fn every_node_of_the_tape_becomes_a_program() {
     );
     // And each names the node it came from, so the run's order is the tape's order.
     for (at, program) in run.programs.iter().enumerate() {
-        let deeptools::islands::dataflow_ir::ProgramName::Emitted { index, .. } = program.name
-        else {
-            panic!("a tape node's program must be named for its node");
-        };
-        assert_eq!(index.0 as usize, at, "programs must be in tape order");
+        assert_eq!(
+            program.name.index.0 as usize, at,
+            "programs must be in tape order"
+        );
     }
 }
 
