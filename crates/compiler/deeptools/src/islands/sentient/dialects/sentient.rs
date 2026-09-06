@@ -1439,7 +1439,7 @@ impl RoutingDirection {
 /// and the state file one. This is the ISA's ceiling, not permission to use 127 of a sixteen-deep
 /// file; that question belongs to whatever assigns the register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RegIndex(Bounded<128>);
+pub struct RegIndex(Bounded<{ sys_arch_spec::progir::MAX_REGISTERS_PER_UNIT as u32 }>);
 
 impl RegIndex {
     /// A REGISTER INDEX, CHECKED WHERE IT IS WRITTEN.
