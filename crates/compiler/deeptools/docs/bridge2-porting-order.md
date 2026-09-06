@@ -74,7 +74,7 @@ typed `dataflow_ir::Run` exists. There is no MLIR text on the input side.
 
 ## Progress
 
-`5/490 ported; 0/490 audited` — keep in step with the task list's counter.
+`2/490 ported; 2/490 audited` — keep in step with the task list's counter.
 
 ⭐ Entry 233 is `AffineYieldOpLowering::matchAndRewrite`, ported as `lower_affine_yield`: the island
 gained `affine::Op::Yield`, `scf::Op::Yield` and `scf::Op::Parallel` so the function HAD an input, the
@@ -351,13 +351,13 @@ function wide.
 
 ### Conversion/AgenToSentient — 82 defs, 319 lines
 
-- [x] **PORT 130** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
+- [ ] **PORT 130** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
 - [ ] **AUDIT 130** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, line by line against the C++
-- [x] **PORT 131** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
+- [ ] **PORT 131** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
 - [ ] **AUDIT 131** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, line by line against the C++
 - [ ] **PORT 132** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, 42 lines
 - [ ] **AUDIT 132** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, line by line against the C++
-- [x] **PORT 133** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
+- [ ] **PORT 133** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
 - [ ] **AUDIT 133** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, line by line against the C++
 - [ ] **PORT 134** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, 20 lines
 - [ ] **AUDIT 134** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, line by line against the C++
@@ -570,7 +570,7 @@ function wide.
 ### Conversion/AffineToStandard — 4 defs, 24 lines
 
 - [x] **PORT 233** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
-- [ ] **AUDIT 233** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, line by line against the C++
+- [x] **AUDIT 233** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, line by line against the C++
 - [ ] **PORT 234** `populateAffineToStdConversionPatterns` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:198`, 8 lines
 - [ ] **AUDIT 234** `populateAffineToStdConversionPatterns` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:198`, line by line against the C++
 - [ ] **PORT 235** `populateAffineToVectorConversionPatterns` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:208`, 6 lines
@@ -761,7 +761,7 @@ function wide.
 - [ ] **PORT 315** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, 46 lines
 - [ ] **AUDIT 315** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, line by line against the C++
 - [x] **PORT 316** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
-- [ ] **AUDIT 316** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
+- [x] **AUDIT 316** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
 - [ ] **PORT 317** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, 38 lines
 - [ ] **AUDIT 317** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, line by line against the C++
 - [ ] **PORT 318** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, 16 lines
@@ -1234,3 +1234,58 @@ function wide.
 
 - [ ] **PORT 490** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, 81 lines
 - [ ] **AUDIT 490** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, line by line against the C++
+
+## AUDIT LOG
+
+⛔ **AN AUDIT THAT PASSES EVERYTHING IS NOT AN AUDIT.** Three of the first five failed, all the same
+way, and the PORT boxes for 130, 131 and 133 have been UNTICKED.
+
+### ✅ AUDIT 233 `AffineYieldOpLowering::matchAndRewrite` — `AffineToStandard.cpp:41`
+| C++ | ours | verdict |
+|---|---|---|
+| `isa<scf::ParallelOp>(op->getParentOp())` | `Parent::ScfParallel` | ✅ the only question asked of the parent |
+| `return failure()` | `YieldRewrite::Declined` | ✅ and not modelled as an error — a declining pattern leaves the module untouched |
+| `replaceOpWithNewOp<scf::YieldOp>(op, op.getOperands())` | `scf::Op::Yield { operands }` | ✅ operand list unchanged; `replaceOpWithNewOp` also ERASES the original, and the call site consumes the `affine.yield` rather than emitting it |
+| `return success()` | `YieldRewrite::Yielded` | ✅ |
+
+⚠️ **NOTE 1 — the call site passes a CONSTANT.** `statement()` hardcodes `Parent::Other`, so the
+`ScfParallel` arm is unreachable from the bridge today. The rule is ported and right; its discriminator
+is not yet fed a real value. Becomes live when a caller walks a parallel's body.
+
+⚠️ **NOTE 2 — the C++ pattern reaches NESTED yields and our walk does not.** `OpRewritePattern` is
+applied by a driver to every `affine.yield` in the module, including inside `affine.for` bodies;
+`statement()` walks only the top level of a unit's body and `affine.for` is still a `todo!`. The loop
+entry must recurse and pass its own parent. Bound to that entry, not a defect in 233.
+
+### ✅ AUDIT 316 `setImmutableAddrAndIncrements` — `Helper.cpp:1581`
+All four cases match the C++, including the non-L3 burst arm setting **both** fields to `stride_size`
+(`:1606-1612`) and the L3's immutable address being assigned above both branches (`:1586-1589`).
+
+⚠️ **NOTE — the C++ creates TWO `ConstantOp`s where we mint ONE.** Each arm builds a separate constant
+per field even when the values are equal; we mint one per distinct value into a pool. The reference's
+own dumped output has them folded to a single `%1`, so the TEXT agrees — but if a golden ever shows two
+distinct SSA values carrying the same constant, the pool is wrong and this is where it comes from.
+
+### ❌ AUDIT 130 `setldtype` — `Helper.cpp:1647` — **FAILED, PORT UNTICKED**
+Two of the reference's conditions exist only as PROSE in the doc comment, not as code:
+1. **The LX-only gate is missing.** `:1653` returns immediately unless the component is `LXLU`/`LXSU`.
+   Nothing in our port asks. An L0 or L3 load would be handed a mode it must never carry.
+2. **The explicit zero-pad's stick check is missing.** `:1655-1663` rejects a `zpad16b` whose SHUFFLE
+   RESULT is not a whole stick — *"LX loads involving explicit padding should be at stick
+   granularity"*. `Explicit::ZeroPad16BOnce` is constructible with no such check.
+
+### ❌ AUDIT 131 `generateSetSendDestinationStmts` — `Helper.cpp:2731` — **FAILED, PORT UNTICKED**
+⛔ **THE PORT IS THE GUARD AND NOTHING ELSE.** 49 lines of C++ became a one-line
+`sets_send_destination(unit) -> bool`. Absent: collecting the consumer's components from either a
+`get_unit` (one) or a `uniform.QueryMapOp` via `getAllQueriedValues` (several, with
+*"vector_loadOp's consumer is not a getUnitOp"* for anything else); the destination test
+`any of {PT, SFP, L0SU, CROSSPTNLINK}`; the emission of `sentient.set_send_dst(consumer->getResult(0))`;
+and the arch split — at `>= RCUDD1A` it emits, below that a consumer in {PT, L0SU, CROSSPTNLINK} is the
+error *"requires generating SETDSTMASK instruction which is not supported at the current arch level"*.
+
+### ❌ AUDIT 133 `getLoadConsumer` — `Helper.cpp:1242` — **FAILED, PORT UNTICKED**
+⛔ **A DATA HOLDER, NOT THE FUNCTION.** `load_consumer(to_unit, via)` packages two values the caller
+must already have. The C++ FINDS them: it picks the root to follow (the result for a `vector_load`,
+indirect or symbolic load; the **load induction variable** for a composite load), requires
+`hasOneUse()`, then matches the user against three shapes and reads the send's `getToUnit()`. None of
+that is ported.
