@@ -17,7 +17,7 @@ use deeptools::bridges::subtile_to_dataflow_ir::node::{
 use deeptools::bridges::subtile_to_dataflow_ir::tape;
 use deeptools::generated::{DataType, OpFunc};
 use deeptools::islands::dataflow_ir::GroupId;
-use deeptools::islands::dataflow_ir::op::Op;
+use deeptools::islands::dataflow_ir::dialects::{Op, affine, agen, dataflow, scf, vectorchain};
 use deeptools::model::Model;
 use deeptools::workload::Workload;
 
@@ -126,14 +126,15 @@ fn count(run: &deeptools::islands::dataflow_ir::Run<Dd2>, want: fn(&Op) -> bool)
                 *n += 1;
             }
             match op {
-                Op::For { body, .. } | Op::ProgramUnit { body, .. } => walk(body, want, n),
-                Op::If {
+                Op::Affine(affine::Op::For { body, .. })
+                | Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => walk(body, want, n),
+                Op::Scf(scf::Op::If {
                     body, else_body, ..
-                } => {
+                }) => {
                     walk(body, want, n);
                     walk(else_body, want, n);
                 }
-                Op::CompositeLoadAndStore(t) => walk(&t.body, want, n),
+                Op::Agen(agen::Op::CompositeLoadAndStore(t)) => walk(&t.body, want, n),
                 _ => {}
             }
         }
@@ -150,14 +151,25 @@ fn count(run: &deeptools::islands::dataflow_ir::Run<Dd2>, want: fn(&Op) -> bool)
     n
 }
 
-const IS_FOR: fn(&Op) -> bool = |op| matches!(op, Op::For { .. });
-const IS_MASK: fn(&Op) -> bool = |op| matches!(op, Op::CreateAffineMask { .. });
-const IS_SELECT: fn(&Op) -> bool = |op| matches!(op, Op::ElementWiseSelection { .. });
-const IS_TRANSFER: fn(&Op) -> bool = |op| matches!(op, Op::CompositeLoadAndStore(_));
-const IS_SYNC: fn(&Op) -> bool = |op| matches!(op, Op::SyncRecv { .. });
-const IS_SEND: fn(&Op) -> bool = |op| matches!(op, Op::Send { .. });
-const IS_RECEIVE: fn(&Op) -> bool = |op| matches!(op, Op::Receive { .. });
-const IS_LOAD: fn(&Op) -> bool = |op| matches!(op, Op::AgenVectorLoad { .. });
+const IS_FOR: fn(&Op) -> bool = |op| matches!(op, Op::Affine(affine::Op::For { .. }));
+const IS_MASK: fn(&Op) -> bool = |op| {
+    matches!(
+        op,
+        Op::VectorChain(vectorchain::Op::CreateAffineMask { .. })
+    )
+};
+const IS_SELECT: fn(&Op) -> bool = |op| {
+    matches!(
+        op,
+        Op::VectorChain(vectorchain::Op::ElementWiseSelection { .. })
+    )
+};
+const IS_TRANSFER: fn(&Op) -> bool =
+    |op| matches!(op, Op::Agen(agen::Op::CompositeLoadAndStore(_)));
+const IS_SYNC: fn(&Op) -> bool = |op| matches!(op, Op::Dataflow(dataflow::Op::SyncRecv { .. }));
+const IS_SEND: fn(&Op) -> bool = |op| matches!(op, Op::Dataflow(dataflow::Op::Send { .. }));
+const IS_RECEIVE: fn(&Op) -> bool = |op| matches!(op, Op::Dataflow(dataflow::Op::Receive { .. }));
+const IS_LOAD: fn(&Op) -> bool = |op| matches!(op, Op::Agen(agen::Op::VectorLoad { .. }));
 
 /// ⭐⭐ EVERY OPERAND CROSSES THE WIRE, AND THE TWO ENDS AGREE ON HOW MANY.
 ///

@@ -1,0 +1,734 @@
+//! `VectorChain.td` — EVERYTHING THE PE AND THE SFP COMPUTE.
+//!
+//! The dialect declares twenty-three operations; the twelve here are the ones an emitted program
+//! contains. The attribute enumerations they carry are `VectorChainEnums.td`'s, and each records
+//! which of the two — the enum's own name, or the operand's — is the mnemonic MLIR parses.
+
+use std::fmt::Write as _;
+
+use crate::islands::dataflow_ir::dialects::Val;
+use crate::islands::dataflow_ir::print;
+use crate::islands::dataflow_ir::ty::{AffineMap, Vector};
+
+/// WHICH COMPARISON — `VectorChainElementWiseCompareOperator` (`VectorChainEnums.td`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    /// `compare_eq`.
+    Eq,
+    /// `compare_neq`.
+    Neq,
+    /// `compare_lt`.
+    Lt,
+    /// `compare_le`.
+    Le,
+    /// `compare_gt`.
+    Gt,
+    /// `compare_ge`.
+    Ge,
+}
+
+impl CompareOp {
+    /// THE ENUMERATOR'S VALUE, which is what the attribute carries.
+    ///
+    /// ⛔⛔ THE MNEMONIC IS THE ENUM'S NAME, NOT THE ATTRIBUTE'S, and both wrong guesses were caught
+    /// by dbo-opt rather than by reading. `#vectorchain<compare_op compare_gt>` gives "unknown
+    /// attribute `compare_op` in dialect `vectorchain`"; a plain `4 : i32` gives "failed to satisfy
+    /// constraint". IBM's own IR writes
+    /// `#vectorchain<element_wise_compare_operator compare_gt>` — the mnemonic comes from
+    /// `VectorChainElementWiseCompareOperator`, while `compare_op` is only the operand's name.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Eq => "compare_eq",
+            Self::Neq => "compare_neq",
+            Self::Lt => "compare_lt",
+            Self::Le => "compare_le",
+            Self::Gt => "compare_gt",
+            Self::Ge => "compare_ge",
+        }
+    }
+}
+
+/// WHICH BINARY OPERATION — `VectorChainBinaryOperator` (`VectorChainEnums.td`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// `add`.
+    Add,
+    /// `sub`.
+    Sub,
+    /// `mul`.
+    Mul,
+    /// `mul_div2`.
+    MulDiv2,
+    /// `min`.
+    Min,
+    /// `max`.
+    Max,
+    /// `abs_min`.
+    AbsMin,
+    /// `abs_max`.
+    AbsMax,
+    /// `and0`.
+    And,
+    /// `or0`.
+    Or,
+    /// `xnor`.
+    Xnor,
+    /// `and_not`.
+    AndNot,
+}
+
+impl BinaryOp {
+    /// The enumerator's spelling, written as `#vectorchain<binary_operator add>` — the mnemonic is
+    /// the enum's name, as it is for [`CompareOp::spelling`].
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::And => "and0",
+            Self::Or => "or0",
+            Self::Xnor => "xnor",
+            Self::AndNot => "and_not",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::AbsMin => "abs_min",
+            Self::AbsMax => "abs_max",
+            Self::Add => "add",
+            Self::Mul => "mul",
+            Self::Sub => "sub",
+            Self::MulDiv2 => "mul_div2",
+        }
+    }
+}
+
+/// WHICH TRANSCENDENTAL ESTIMATE — one `vectorchain` op each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimateKind {
+    /// `exp_estimate`.
+    Exp,
+    /// `rec_estimate`.
+    Rec,
+    /// `ln_estimate`.
+    Ln,
+    /// `rsqrt_estimate`.
+    Rsqrt,
+    /// `sigmoid_estimate`.
+    Sigmoid,
+    /// `tanh_estimate`.
+    Tanh,
+}
+
+impl EstimateKind {
+    /// The op's mnemonic.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Exp => "exp_estimate",
+            Self::Rec => "rec_estimate",
+            Self::Ln => "ln_estimate",
+            Self::Rsqrt => "rsqrt_estimate",
+            Self::Sigmoid => "sigmoid_estimate",
+            Self::Tanh => "tanh_estimate",
+        }
+    }
+
+    /// The attribute mnemonic its `version` is written under, where it takes one.
+    ///
+    /// ⛔ THE EXPONENTIAL HAS ITS OWN ENUM. IBM's IR writes `#vectorchain<exp_estimate a>` for exp
+    /// and `#vectorchain<estimate_versions slope>` for the rest — `VectorChainExpEstimate` and
+    /// `VectorChainEstimateVersions` are two enums, so one mnemonic would be wrong for one of them.
+    #[must_use]
+    pub const fn version_mnemonic(self) -> &'static str {
+        match self {
+            Self::Exp => "exp_estimate",
+            Self::Rec | Self::Ln | Self::Rsqrt | Self::Sigmoid | Self::Tanh => "estimate_versions",
+        }
+    }
+}
+
+/// WHICH VERSION OF AN ESTIMATE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimateVersion {
+    /// `a` — the exponential's first form.
+    A,
+    /// `b` — its second.
+    B,
+    /// `slope`.
+    Slope,
+    /// `offset`.
+    Offset,
+}
+
+impl EstimateVersion {
+    /// The enumerator's spelling.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+            Self::Slope => "slope",
+            Self::Offset => "offset",
+        }
+    }
+}
+
+/// A LANE MASK'S DEFINITION — how many lanes are live, and the i1 vector it is stated over.
+///
+/// ⭐ THE TWO TRAVEL TOGETHER because a prefix means nothing without the width it is a prefix OF.
+/// This is what `vectorchain.create_affine_mask` carries, and [`LaneMask::binds`] is the ONLY way
+/// to obtain a [`Predicate`] — so a mask's type at its USE is the same value that was written at
+/// its DEFINITION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneMask {
+    lanes: u64,
+    ty: Vector,
+}
+
+impl LaneMask {
+    /// A continuous live prefix of `lanes`, over an i1 vector of type `ty`.
+    #[must_use]
+    pub const fn prefix_of(lanes: u64, ty: Vector) -> Self {
+        Self { lanes, ty }
+    }
+
+    /// How many lanes are live.
+    #[must_use]
+    pub const fn live(self) -> u64 {
+        self.lanes
+    }
+
+    /// The i1 vector type this mask is stated over.
+    #[must_use]
+    pub const fn ty(self) -> Vector {
+        self.ty
+    }
+
+    /// THE VALUE A `create_affine_mask` BOUND, CARRYING THIS MASK'S OWN TYPE.
+    #[must_use]
+    pub const fn binds(self, result: Val) -> Predicate {
+        Predicate {
+            val: result,
+            ty: self.ty,
+        }
+    }
+}
+
+/// A MASK VALUE AND THE TYPE IT WAS DEFINED AT.
+///
+/// ⛔⛔ THE TYPE TRAVELS WITH THE VALUE, AND THAT IS THE WHOLE POINT. dbo-opt refused granite-2b's
+/// `group_7`: *"use of value '%42' expects different type than prior uses: 'vector<64xi1>' vs
+/// 'i1'"*. `%42` was minted by `arith.constant true` — an `i1` — while the use site printed its
+/// type by RECOMPUTING `vector<{lanes}xi1>` from the operands' lane count. Two records of one
+/// fact, and they disagreed.
+///
+/// ⭐ THE FIELDS ARE PRIVATE AND THERE IS NO PUBLIC CONSTRUCTOR. A `Predicate` comes only from
+/// [`LaneMask::binds`], so it cannot be built around a value whose definition says something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Predicate {
+    val: Val,
+    ty: Vector,
+}
+
+impl Predicate {
+    /// The masked value.
+    #[must_use]
+    pub const fn val(self) -> Val {
+        self.val
+    }
+
+    /// The type it was DEFINED at — never recomputed at the use.
+    #[must_use]
+    pub const fn ty(self) -> Vector {
+        self.ty
+    }
+}
+
+/// ONE `vectorchain` OPERATION.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    /// `vectorchain.<kind>_estimate %in {version} : tin, tout` — the SFP's transcendental estimates.
+    ///
+    /// ⛔ WHICH ONE IS THE COMPUTE'S `mode=`, NOT ITS COMPUTETYPE. A `FEST` dispatches on mode 0-9
+    /// into exp(a), exp(b), rec, ln, rsqrt, sigmoid(slope|offset) and tanh(slope|offset)
+    /// (`SNComputeLowering.cpp:1316-1372`).
+    Estimate {
+        /// The vector it binds.
+        result: Val,
+        /// What is estimated.
+        input: Val,
+        /// Which estimate.
+        kind: EstimateKind,
+        /// Which version, where the op takes one. `rec` and `ln` do not.
+        version: Option<EstimateVersion>,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.scan_with_gap %in {reduction_op, gap, eval_order} : tin, tout` — a reduction.
+    ///
+    /// ⛔ WHICH REDUCTION IS THE COMPUTE'S `mode=`: 1 add, 8 max, 10 abs_max, 12 min, 14 abs_min
+    /// (`SNComputeLowering.cpp:1453-1467`). The gap is 8 and the order left-to-right, both fixed
+    /// there (`:1468-1470`).
+    ScanWithGap {
+        /// The vector it binds.
+        result: Val,
+        /// What is reduced.
+        input: Val,
+        /// Which reduction.
+        reduction_op: BinaryOp,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.select %in {selection_map} : vector<..>, vector<..>` — a lane permutation.
+    Select {
+        /// The vector it binds.
+        result: Val,
+        /// The input.
+        input: Val,
+        /// Which lane each output lane reads.
+        selection_map: AffineMap,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.multiply %a, %b {reduction_map} : ..` — a product with a reduction.
+    Multiply {
+        /// The vector it binds.
+        result: Val,
+        /// The left operand.
+        a: Val,
+        /// The right operand.
+        b: Val,
+        /// Which product lanes fold into which result lane. Arch- and precision-dependent:
+        /// `IMA8` on RCUDD1A is `(d0 mod 128) floordiv 2`, on SEN1P5 `d0 floordiv 16`
+        /// (`SNComputeLowering.cpp:157-172`).
+        reduction_map: AffineMap,
+        /// The operands' type.
+        operand_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.multiply_and_accumulate %a, %b, %acc {reduction_map} : ..`.
+    MultiplyAccumulate {
+        /// The vector it binds.
+        result: Val,
+        /// The left operand.
+        a: Val,
+        /// The right operand.
+        b: Val,
+        /// The accumulator read in.
+        acc: Val,
+        /// As [`Op::Multiply`].
+        reduction_map: AffineMap,
+        /// The operands' type.
+        operand_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.element_wise_compare %op1, %op2 [%mask : t] {compare_op} : t1, t2, tres`.
+    ///
+    /// (E) A FMAX IS NOT ONE OP. `constructFMINorFMAXOperation` (`SNComputeLowering.cpp:1189-1272`)
+    /// emits a COMPARE (`compare_gt` for FMAX, `compare_le` for FMIN) and then a SELECTION over its
+    /// i1 result. An earlier `vectorchain.fmax` was rejected outright by dbo-opt: "custom op
+    /// 'vectorchain.fmax' is unknown". The 23 real ops are in `VectorChain.td`.
+    ElementWiseCompare {
+        /// The i1 vector it binds.
+        result: Val,
+        /// Left operand.
+        op1: Val,
+        /// Right operand.
+        op2: Val,
+        /// The lane mask, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
+        /// (`VectorChain.td`), so `None` prints no bracket at all.
+        mask: Option<Predicate>,
+        /// Which comparison.
+        compare_op: CompareOp,
+        /// The operands' type.
+        operand_ty: Vector,
+        /// The i1 result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.element_wise_selection %cond ? %lhs : %rhs [%mask : t] : tc, tl, tr, tres`.
+    ElementWiseSelection {
+        /// The vector it binds.
+        result: Val,
+        /// The i1 vector chosen by, CARRYING ITS OWN TYPE.
+        ///
+        /// ⛔ THIS USED TO BE A `Val` BESIDE A `cond_ty: Vector` THE EMITTER FILLED IN — the same
+        /// two-records shape that made the mask disagree with itself. A `Predicate` states it once.
+        cond: Predicate,
+        /// Taken where the condition holds.
+        lhs: Val,
+        /// Taken otherwise.
+        rhs: Val,
+        /// The lane mask, IF THIS OP CARRIES ONE. `Optional` in the dialect
+        /// (`VectorChain.td:402`), and the condition is a SEPARATE operand from it.
+        mask: Option<Predicate>,
+        /// The operands' and result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.binary %op1, %op2 [%mask : t] {binary_op} : t1, t2, tres` — the elementwise family.
+    Binary {
+        /// The vector it binds.
+        result: Val,
+        /// Left operand.
+        op1: Val,
+        /// Right operand.
+        op2: Val,
+        /// The lane mask, IF THIS OP CARRIES ONE.
+        ///
+        /// ⛔⛔ `None` MEANS NO BRACKET, NOT AN ALL-TRUE CONSTANT. Every binary used to be handed
+        /// an `arith.constant true` as a stand-in for "unmasked", which is both an `i1` where a
+        /// `vector<Nxi1>` was printed (the granite-2b `group_7` refusal) and a mask that masks
+        /// nothing. `Optional<AnyVectorOfAnyRank>:$mask` (`VectorChain.td:139`) — an unmasked
+        /// binary simply omits the operand.
+        mask: Option<Predicate>,
+        /// Which operation.
+        binary_op: BinaryOp,
+        /// `op_specific_map=` — REQUIRED, and dbo-opt says so: "'vectorchain.binary' op requires
+        /// attribute 'op_specific_map'". IBM's own IR writes the identity, `affine_map<(d0) -> (d0)>`,
+        /// which is lane `i` of each operand into lane `i` of the result.
+        op_specific_map: AffineMap,
+        /// The operands' type.
+        operand_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.constant_bitstream {value = [0x0, 0x1]} : vector<Nxt>` — a literal, as wide as
+    /// the constant the template declares.
+    ///
+    /// ⭐ THE VALUES ARE ELEMENT BIT PATTERNS, which is what `ddl.define_constant`'s `value=[0xFFFF]`
+    /// already holds — the two forms line up exactly.
+    ConstantBitstream {
+        /// The vector it binds.
+        result: Val,
+        /// The element bit patterns.
+        value: Vec<i64>,
+        /// Its type — as many elements as `value` has.
+        ty: Vector,
+    },
+
+    /// `vectorchain.shuffle input(%c) {indices = [..], repetition = N} : tin, tout` — the splat that
+    /// widens a constant bitstream to the width its consumer reads.
+    ///
+    /// ⛔ `repetition` IS A QUOTIENT, NOT A COUNT SOMEONE PICKS:
+    /// `getNumElements(result_type) / getNumElements(bitstream_vector_type)`
+    /// (`SNTransferLowering.cpp:2505-2506`).
+    Shuffle {
+        /// The vector it binds.
+        result: Val,
+        /// What is widened.
+        input: Val,
+        /// One index per element of the input.
+        indices: Vec<i32>,
+        /// How many times the pattern repeats to fill the result.
+        repetition: u32,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.cast %v : tin, tout` — a precision conversion.
+    ///
+    /// ⛔ THE C++ EMITS ONE WHERE THE SOURCE AND DESTINATION FORMATS DIFFER: "Convert data if src
+    /// precision and dst precision don't match" (`SNTransferLowering.cpp:2305-2323`), applied to the
+    /// data AFTER the load or shuffle — which is why a shuffle's element type is the SOURCE's, and
+    /// why `vectorchain.shuffle` refuses to change it: "input element type does not match output
+    /// element type".
+    Cast {
+        /// The vector it binds.
+        result: Val,
+        /// What is converted.
+        input: Val,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.create_affine_mask {mask_set} : vector<Nxi1>` — the lane mask every elementwise
+    /// op takes, from `getStaticContinuousMaskValue`.
+    CreateAffineMask {
+        /// The i1 vector it binds.
+        result: Val,
+        /// THE MASK ITSELF — its live prefix AND the type it is stated over, as one value.
+        ///
+        /// ⛔⛔ `lanes: u64` AND `ty: Vector` AS SEPARATE FIELDS WERE TWO RECORDS OF ONE FACT. The
+        /// definition printed from `ty` while every USE recomputed `vector<{len}xi1>` from the
+        /// operands — which is how `%42` came to be defined as `i1` and used as `vector<64xi1>`.
+        /// [`LaneMask::binds`] hands the SAME `Vector` to the use site, so they cannot differ.
+        mask: LaneMask,
+    },
+}
+
+/// ONE `vectorchain` OP AS TEXT. The caller has already indented.
+pub(crate) fn emit(out: &mut String, op: &Op) {
+    match op {
+        Op::Estimate {
+            result,
+            input,
+            kind,
+            version,
+            input_ty,
+            ty,
+        } => {
+            let version = match version {
+                Some(v) => format!(
+                    " {{version = #vectorchain<{} {}>}}",
+                    kind.version_mnemonic(),
+                    v.spelling()
+                ),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.{} {}{version} : {}, {}",
+                print::val(*result),
+                kind.spelling(),
+                print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::ScanWithGap {
+            result,
+            input,
+            reduction_op,
+            input_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.scan_with_gap {} {{reduction_op = #vectorchain<binary_operator {}>, \
+                 gap = 8 : index, eval_order = #vectorchain<eval_order left_to_right>}} : {}, {}",
+                print::val(*result),
+                print::val(*input),
+                reduction_op.spelling(),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::Select {
+            result,
+            input,
+            selection_map,
+            input_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.select {} {{selection_map = {}}} : {}, {}",
+                print::val(*result),
+                print::val(*input),
+                print::affine_map(selection_map),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::Multiply {
+            result,
+            a,
+            b,
+            reduction_map,
+            operand_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.multiply {}, {} {{reduction_map = {}}} : {}, {}, {}",
+                print::val(*result),
+                print::val(*a),
+                print::val(*b),
+                print::affine_map(reduction_map),
+                print::vector(*operand_ty),
+                print::vector(*operand_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::MultiplyAccumulate {
+            result,
+            a,
+            b,
+            acc,
+            reduction_map,
+            operand_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.multiply_and_accumulate {}, {}, {} {{reduction_map = {}}} : {}, {}, {}, {}",
+                print::val(*result),
+                print::val(*a),
+                print::val(*b),
+                print::val(*acc),
+                print::affine_map(reduction_map),
+                print::vector(*operand_ty),
+                print::vector(*operand_ty),
+                print::vector(*ty),
+                print::vector(*ty)
+            );
+        }
+        Op::ElementWiseCompare {
+            result,
+            op1,
+            op2,
+            mask,
+            compare_op,
+            operand_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.element_wise_compare {}, {}{} {{compare_op = #vectorchain<element_wise_compare_operator {}>}} : {}, {}, {}",
+                print::val(*result),
+                print::val(*op1),
+                print::val(*op2),
+                mask_bracket(*mask),
+                compare_op.spelling(),
+                print::vector(*operand_ty),
+                print::vector(*operand_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::ElementWiseSelection {
+            result,
+            cond,
+            lhs,
+            rhs,
+            mask,
+            ty,
+        } => {
+            // ⭐ THE CONDITION'S TYPE IS THE CONDITION'S OWN — it was `cond_ty`, a field the
+            // emitter filled in beside the value, which is the same two-records shape.
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.element_wise_selection {} ? {} : {} {} : {}, {}, {}, {}",
+                print::val(*result),
+                print::val(cond.val()),
+                print::val(*lhs),
+                print::val(*rhs),
+                mask_bracket(*mask),
+                print::vector(cond.ty()),
+                print::vector(*ty),
+                print::vector(*ty),
+                print::vector(*ty)
+            );
+        }
+        Op::Binary {
+            result,
+            op1,
+            op2,
+            mask,
+            binary_op,
+            op_specific_map,
+            operand_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.binary {}, {}{} {{binary_op = #vectorchain<binary_operator {}>, op_specific_map = {}}} : {}, {}, {}",
+                print::val(*result),
+                print::val(*op1),
+                print::val(*op2),
+                mask_bracket(*mask),
+                binary_op.spelling(),
+                print::affine_map(op_specific_map),
+                print::vector(*operand_ty),
+                print::vector(*operand_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::ConstantBitstream { result, value, ty } => {
+            let values = value
+                .iter()
+                .map(|bits| format!("{bits:#x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.constant_bitstream {{value = [{values}]}} : {}",
+                print::val(*result),
+                print::vector(*ty)
+            );
+        }
+        Op::Shuffle {
+            result,
+            input,
+            indices,
+            repetition,
+            input_ty,
+            ty,
+        } => {
+            let indices = indices
+                .iter()
+                .map(|index| format!("{index} : i32"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.shuffle input({}) {{indices = [{indices}], repetition = {repetition} : i32}} : {}, {}",
+                print::val(*result),
+                print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::Cast {
+            result,
+            input,
+            input_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.cast {} : {}, {}",
+                print::val(*result),
+                print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::CreateAffineMask { result, mask } => {
+            // A continuous prefix of live lanes, as `getStaticContinuousMaskValue` builds.
+            //
+            // ⭐ THE TYPE PRINTED HERE IS THE ONE EVERY USE PRINTS, because both read it off the
+            // same `LaneMask`. That is what makes the definition and the use unable to disagree.
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.create_affine_mask {{mask_set = affine_set<(d0) : (d0 >= 0, -d0 + {} >= 0)>}} : {}",
+                print::val(*result),
+                mask.live().saturating_sub(1),
+                print::vector(mask.ty())
+            );
+        }
+    }
+}
+
+/// THE `[%mask : t]` BRACKET, OR NOTHING AT ALL.
+///
+/// ⛔⛔ THE TYPE COMES FROM THE PREDICATE, NEVER FROM THE OPERANDS. `fn mask_ty(ty: Vector)` used to
+/// build `vector<{ty.len}xi1>` here at the USE — a second record of a type the DEFINITION had
+/// already stated — and dbo-opt refused granite-2b's `group_7` with *"use of value '%42' expects
+/// different type than prior uses: 'vector<64xi1>' vs 'i1'"*.
+///
+/// ⭐ AND `None` PRINTS NOTHING. Every masked op's `$mask` is `Optional` in the dialect, and the
+/// assembly format wraps the bracket in `(...)?` — so an unmasked op omits the operand rather than
+/// carrying an all-true constant that masks nothing.
+fn mask_bracket(mask: Option<Predicate>) -> String {
+    match mask {
+        Some(p) => format!("[{} : {}]", print::val(p.val()), print::vector(p.ty())),
+        None => String::new(),
+    }
+}

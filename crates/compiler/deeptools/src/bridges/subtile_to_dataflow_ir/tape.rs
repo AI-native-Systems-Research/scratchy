@@ -13,8 +13,11 @@ use crate::arch::Arch;
 use crate::bridges::subtile_to_dataflow_ir::node::{Node, Residence};
 use crate::bridges::subtile_to_dataflow_ir::schedule;
 use crate::bridges::subtile_to_dataflow_ir::transfer::{self, Lanes};
-use crate::islands::dataflow_ir::op::{
-    CompositeTransfer, Index, LaneMask, Op, Precision, Received, Val,
+use crate::islands::dataflow_ir::dialects::agen::CompositeTransfer;
+use crate::islands::dataflow_ir::dialects::dataflow::{Precision, Received};
+use crate::islands::dataflow_ir::dialects::vectorchain::LaneMask;
+use crate::islands::dataflow_ir::dialects::{
+    Index, Op, Val, affine, agen, arith, dataflow, vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
 use crate::islands::dataflow_ir::{
@@ -240,17 +243,17 @@ fn node_program<
     // The two memories a view is taken over. Neither is named by a `ddl.unit` — the template says
     // `memory="lx"` on an allocation instead — so they are bound from the residences, not the walk.
     let hbm = vals.mint();
-    body.push(Op::GetUnit {
+    body.push(Op::Dataflow(dataflow::Op::GetUnit {
         result: hbm,
         residency: Residency::Global,
         unit: DfirUnit::Hbm,
-    });
+    }));
     let lx = vals.mint();
-    body.push(Op::GetUnit {
+    body.push(Op::Dataflow(dataflow::Op::GetUnit {
         result: lx,
         residency: Residency::Scratchpad { core },
         unit: DfirUnit::Lx,
-    });
+    }));
 
     // Then every unit the schedule itself names, in the order it names them, each with the
     // residency the machine gives it.
@@ -266,11 +269,11 @@ fn node_program<
     let mut bind = |vals: &mut Vals, body: &mut Vec<Op>, unit: DfirUnit| {
         let val = vals.mint();
         bound.push((unit, val));
-        body.push(Op::GetUnit {
+        body.push(Op::Dataflow(dataflow::Op::GetUnit {
             result: val,
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
-        });
+        }));
         val
     };
     for unit in schedule::units_of(schedule) {
@@ -308,17 +311,17 @@ fn node_program<
         let cols = u64::from(input.cols.0);
 
         let start = vals.mint();
-        body.push(Op::Constant {
+        body.push(Op::Arith(arith::Op::Constant {
             result: start,
             value: i64::try_from(input.start().0).expect("an element offset fits an i64"),
-        });
+        }));
 
         let from = match input.at {
             Residence::Hbm { .. } => hbm,
             Residence::Lx { .. } => lx,
         };
         let view = vals.mint();
-        body.push(Op::GetLogicalMemoryView {
+        body.push(Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
             result: view,
             from,
             start,
@@ -329,7 +332,7 @@ fn node_program<
                 shape: vec![rows, cols],
                 elem: ElemType::F16,
             },
-        });
+        }));
 
         // An operand already in the scratchpad needs no transfer; one in the HBM does.
         if matches!(input.at, Residence::Lx { .. }) {
@@ -342,12 +345,12 @@ fn node_program<
         }
 
         let dst_start = vals.mint();
-        body.push(Op::Constant {
+        body.push(Op::Arith(arith::Op::Constant {
             result: dst_start,
             value: 0,
-        });
+        }));
         let dst = vals.mint();
-        body.push(Op::GetLogicalMemoryView {
+        body.push(Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
             result: dst,
             from: lx,
             start: dst_start,
@@ -356,39 +359,41 @@ fn node_program<
                 shape: vec![rows, cols],
                 elem: ElemType::F16,
             },
-        });
+        }));
 
         let plan = transfer::plan(&[1, cols], &[1, cols], cols, lanes)
             .map_err(|why| TapeError::Transfer { at: index, why })?;
         let load_iv = vals.mint();
-        body.push(Op::CompositeLoadAndStore(Box::new(CompositeTransfer {
-            src: view,
-            src_indices: vec![Index::Const(0), Index::Const(0)],
-            src_ty: MemRef {
-                shape: vec![rows, cols],
-                elem: ElemType::F16,
+        body.push(Op::Agen(agen::Op::CompositeLoadAndStore(Box::new(
+            CompositeTransfer {
+                src: view,
+                src_indices: vec![Index::Const(0), Index::Const(0)],
+                src_ty: MemRef {
+                    shape: vec![rows, cols],
+                    elem: ElemType::F16,
+                },
+                dst,
+                dst_indices: vec![Index::Const(0), Index::Const(0)],
+                dst_ty: MemRef {
+                    shape: vec![rows, cols],
+                    elem: ElemType::F16,
+                },
+                load_iv,
+                load_iv_ty: Vector {
+                    len: plan.vector_lanes,
+                    elem: ElemType::F16,
+                },
+                load_set: plan.load_set,
+                load_order: plan.load_order,
+                store_set: plan.store_set,
+                store_order: plan.store_order,
+                time_set: plan.time_set,
+                time_order: plan.time_order,
+                load_time_addr_map: plan.load_time_addr_map,
+                store_time_addr_map: plan.store_time_addr_map,
+                body: vec![Op::Agen(agen::Op::Yield)],
             },
-            dst,
-            dst_indices: vec![Index::Const(0), Index::Const(0)],
-            dst_ty: MemRef {
-                shape: vec![rows, cols],
-                elem: ElemType::F16,
-            },
-            load_iv,
-            load_iv_ty: Vector {
-                len: plan.vector_lanes,
-                elem: ElemType::F16,
-            },
-            load_set: plan.load_set,
-            load_order: plan.load_order,
-            store_set: plan.store_set,
-            store_order: plan.store_order,
-            time_set: plan.time_set,
-            time_order: plan.time_order,
-            load_time_addr_map: plan.load_time_addr_map,
-            store_time_addr_map: plan.store_time_addr_map,
-            body: vec![Op::AgenYield],
-        })));
+        ))));
         // ⛔⛔ THE PLACEMENT, NOT THE VIEW HANDLE. `dst` is bound inside the L3 unit's region and is
         // gone at its `}` — see [`Received`]. The unit that reads this operand takes its own view of
         // the same LX address, which is exactly what IBM's `lxlu` does (`dfir.mlir:112-116`) rather
@@ -432,12 +437,12 @@ fn node_program<
         .iter()
         .map(|operand| {
             let start = vals.mint();
-            loads.push(Op::Constant {
+            loads.push(Op::Arith(arith::Op::Constant {
                 result: start,
                 value: operand.start,
-            });
+            }));
             let view = vals.mint();
-            loads.push(Op::GetLogicalMemoryView {
+            loads.push(Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: view,
                 from: lx,
                 start,
@@ -449,7 +454,7 @@ fn node_program<
                     shape: vec![operand.rows, operand.cols],
                     elem: ElemType::F16,
                 },
-            });
+            }));
             view
         })
         .collect();
@@ -575,7 +580,7 @@ fn nest<
     counts: Counts,
     innermost: impl FnOnce(&mut Vals) -> Vec<Op>,
 ) -> Vec<Op> {
-    use crate::islands::dataflow_ir::op::Bound;
+    use crate::islands::dataflow_ir::dialects::affine::Bound;
 
     let inner = innermost(vals);
 
@@ -595,30 +600,30 @@ fn nest<
             // `sync_send` to the mover and a blocking `sync_recv` before the data is read
             // (`/tmp/ktir_ref/export/debug/dfir.mlir:95-98`).
             let mover = vals.mint();
-            step_body.push(Op::GetUnit {
+            step_body.push(Op::Dataflow(dataflow::Op::GetUnit {
                 result: mover,
                 residency: Residency::Corelet {
                     core: Core::checked(0).expect("every arch has a core 0"),
                     corelet: Corelet::checked(0).expect("every arch has a corelet 0"),
                 },
                 unit: DfirUnit::Lxlu,
-            });
-            step_body.push(Op::SyncSend {
+            }));
+            step_body.push(Op::Dataflow(dataflow::Op::SyncSend {
                 to: mover,
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
-            });
-            step_body.push(Op::SyncRecv {
+            }));
+            step_body.push(Op::Dataflow(dataflow::Op::SyncRecv {
                 from: mover,
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
-            });
+            }));
         }
         step_body.extend(inner);
-        vec![Op::For {
+        vec![Op::Affine(affine::Op::For {
             iv,
             lo: Bound::Const(0),
             hi: Bound::Const(steps),
             body: step_body,
-        }]
+        })]
     } else {
         inner
     };
@@ -630,12 +635,12 @@ fn nest<
     } else {
         let iv = vals.mint();
         let tiles = i64::from(counts.sticks_per_row);
-        vec![Op::For {
+        vec![Op::Affine(affine::Op::For {
             iv,
             lo: Bound::Const(0),
             hi: Bound::Const(tiles),
             body: inner,
-        }]
+        })]
     };
 
     // ⭐ THE ROW NEST, ABSENT ENTIRELY AT DECODE.
@@ -643,12 +648,12 @@ fn nest<
         tiled
     } else {
         let iv = vals.mint();
-        vec![Op::For {
+        vec![Op::Affine(affine::Op::For {
             iv,
             lo: Bound::Const(0),
             hi: Bound::Const(i64::from(counts.rows)),
             body: tiled,
-        }]
+        })]
     };
 
     // ⛔⛔ ONE UNIT'S NEST. This used to `body.extend(rows)` — folding the loader's views and
@@ -674,7 +679,7 @@ fn load_and_send(
     let mut ops = Vec::with_capacity(staged.len() * 2);
     for (operand, view) in staged.iter().zip(views) {
         let loaded = vals.mint();
-        ops.push(Op::AgenVectorLoad {
+        ops.push(Op::Agen(agen::Op::VectorLoad {
             result: loaded,
             view: *view,
             indices: vec![Index::Const(0), Index::Const(0)],
@@ -683,12 +688,12 @@ fn load_and_send(
                 elem: ElemType::F16,
             },
             ty,
-        });
-        ops.push(Op::Send {
+        }));
+        ops.push(Op::Dataflow(dataflow::Op::Send {
             to,
             data: loaded,
             ty,
-        });
+        }));
     }
     ops
 }
@@ -744,7 +749,7 @@ fn compute<const STICK_ALIGNED: bool>(
     let combined = match rest.first() {
         Some(&op2) => {
             let result = vals.mint();
-            ops.push(Op::Binary {
+            ops.push(Op::VectorChain(vectorchain::Op::Binary {
                 result,
                 op1,
                 op2,
@@ -753,7 +758,7 @@ fn compute<const STICK_ALIGNED: bool>(
                 op_specific_map: AffineMap::identity(1),
                 operand_ty: ty,
                 ty,
-            });
+            }));
             result
         }
         None => op1,
@@ -771,12 +776,12 @@ fn compute<const STICK_ALIGNED: bool>(
             },
         );
         let bound = vals.mint();
-        ops.push(Op::CreateAffineMask {
+        ops.push(Op::VectorChain(vectorchain::Op::CreateAffineMask {
             result: bound,
             mask: prefix,
-        });
+        }));
         let selected = vals.mint();
-        ops.push(Op::ElementWiseSelection {
+        ops.push(Op::VectorChain(vectorchain::Op::ElementWiseSelection {
             result: selected,
             // ⭐ THE PREDICATE IS THE CONDITION, carrying the type it was bound at.
             cond: prefix.binds(bound),
@@ -787,7 +792,7 @@ fn compute<const STICK_ALIGNED: bool>(
             // two jobs, and the dialect makes the mask optional precisely so it can be absent.
             mask: None,
             ty,
-        });
+        }));
     }
     ops
 }
@@ -814,9 +819,11 @@ const fn reads_cache(op_func: crate::generated::OpFunc) -> bool {
 /// ⛔ EXHAUSTIVE, NO WILDCARD. A `_ => Add` arm means a new op-func silently becomes an addition —
 /// fluent wrong output rather than a compile error. Every op-func that is not a binary combine says
 /// so by naming itself here.
-fn binary_for(op_func: crate::generated::OpFunc) -> crate::islands::dataflow_ir::op::BinaryOp {
+fn binary_for(
+    op_func: crate::generated::OpFunc,
+) -> crate::islands::dataflow_ir::dialects::vectorchain::BinaryOp {
     use crate::generated::OpFunc;
-    use crate::islands::dataflow_ir::op::BinaryOp;
+    use crate::islands::dataflow_ir::dialects::vectorchain::BinaryOp;
     match op_func {
         OpFunc::Sub => BinaryOp::Sub,
         OpFunc::Mul

@@ -11,14 +11,14 @@
 //! it, and `dbo/src/Pipeline/RunProgramPipelines.cpp:199-211` is what the stage below looks for: the
 //! inner module, and a `dataflow::ProgramUnitOp` inside it.
 
-pub mod op;
+pub mod dialects;
 pub mod print;
 pub mod ty;
 
 use crate::arch::Arch;
 use crate::generated::OpFunc;
 use crate::units;
-use op::{Op, Val};
+use dialects::{Op, Val};
 
 /// MINTS SSA VALUES, so a program's numbering is the builder's and never a caller's.
 ///
@@ -58,7 +58,7 @@ pub struct ProgramUnit<A: Arch> {
     /// The units this runs on, in the order the schedule names them — ALL OF ONE KIND.
     pub on: Units,
     /// `precision =`, present only where the unit computes.
-    pub precision: Option<op::Precision>,
+    pub precision: Option<dialects::dataflow::Precision>,
     /// What it runs.
     pub body: Vec<Op>,
     /// The arch it was lowered for.
@@ -87,8 +87,8 @@ pub struct ProgramUnit<A: Arch> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Units {
     kind: units::DfirUnit,
-    head: op::Val,
-    rest: Vec<op::Val>,
+    head: dialects::Val,
+    rest: Vec<dialects::Val>,
 }
 
 impl Units {
@@ -103,7 +103,7 @@ impl Units {
     /// has no program unit of this kind — the same shape as `IS_DECODE` removing the row nest. The
     /// caller emits one fewer unit; it does not emit an empty one and it does not stop.
     #[must_use]
-    pub fn of(kind: units::DfirUnit, bound: &[(units::DfirUnit, op::Val)]) -> Option<Units> {
+    pub fn of(kind: units::DfirUnit, bound: &[(units::DfirUnit, dialects::Val)]) -> Option<Units> {
         let mut vals = bound.iter().filter(|(k, _)| *k == kind).map(|(_, v)| *v);
         let head = vals.next()?;
         Some(Units {
@@ -120,7 +120,7 @@ impl Units {
     /// topology is already known to exist, and saying so here is what keeps the caller from having
     /// an `expect` for a case that cannot arise.
     #[must_use]
-    pub fn one(kind: units::DfirUnit, val: op::Val) -> Units {
+    pub fn one(kind: units::DfirUnit, val: dialects::Val) -> Units {
         Units {
             kind,
             head: val,
@@ -136,13 +136,13 @@ impl Units {
 
     /// The unit the backend reads the kind from — `getUnits()[0]`, which always exists.
     #[must_use]
-    pub fn first(&self) -> op::Val {
+    pub fn first(&self) -> dialects::Val {
         self.head
     }
 
     /// The bound units, in schedule order.
     #[must_use]
-    pub fn vals(&self) -> Vec<op::Val> {
+    pub fn vals(&self) -> Vec<dialects::Val> {
         core::iter::once(self.head)
             .chain(self.rest.iter().copied())
             .collect()
@@ -258,7 +258,7 @@ pub struct Program<A: Arch> {
 /// use deeptools::arch::{Arch, Dd2, Sen1p5};
 /// use deeptools::generated::OpFunc;
 /// use deeptools::units::DfirUnit;
-/// use deeptools::islands::dataflow_ir::op::Val;
+/// use deeptools::islands::dataflow_ir::dialects::Val;
 /// use deeptools::islands::dataflow_ir::{
 ///     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
 ///     Units,
@@ -291,7 +291,7 @@ pub struct Program<A: Arch> {
 /// use deeptools::arch::{Arch, Dd2};
 /// use deeptools::generated::OpFunc;
 /// use deeptools::units::DfirUnit;
-/// use deeptools::islands::dataflow_ir::op::Val;
+/// use deeptools::islands::dataflow_ir::dialects::Val;
 /// use deeptools::islands::dataflow_ir::{
 ///     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
 ///     Units,
