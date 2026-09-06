@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "One translation unit, no dependencies. Compiles with a bare C++17 compiler:",
+    "  clang++ -std=c++17 -fsyntax-only source/bridge2.cpp",
+    "source/prelude.inc is #included by it and declares every name the bodies use."
+  ],
+  "build_system": "make",
+  "compiler": { "cxx": "clang++", "cxx_standard": "17", "cxx_flags": ["-std=c++17", "-fsyntax-only"] },
+  "include_paths": ["source"],
+  "defines": [],
+  "libraries": [],
+  "features": { "all": [] },
+  "targets": [
+    { "name": "bridge2", "type": "object", "sources": ["source/bridge2.cpp"], "exclude": [] }
+  ],
+  "_comment_status": [
+    "⚠️ THE UNIT DOES NOT YET COMPILE CLEANLY: ~500 name-resolution errors remain in prelude.inc",
+    "(names needing to be declared as namespace vs struct vs template vs free function, and the",
+    "collisions between those). The FUNCTION BODIES are verbatim and complete; the residue is",
+    "entirely in the generated stand-ins."
+  ]
+}
