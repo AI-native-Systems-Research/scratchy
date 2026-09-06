@@ -47,6 +47,27 @@
 //! ⭐ AND `dataflow.get_unit` (2,502) AND `dataflow.program_unit` (1,668) SURVIVE INTO THE GOLDENS,
 //! which is the mixed-rung claim confirmed on real output rather than inferred: SentientIR is not the
 //! DataflowIR ops replaced.
+//!
+//! # 🛑 THIS IS NOT THE ACCEPTANCE ORACLE, AND MUST NOT BE MISTAKEN FOR ONE
+//!
+//! ⛔⛔ `CLAUDE.md` SAYS IT PLAINLY: **dbo-opt is the only oracle.** Every defect this bridge has
+//! fixed was named by a dbo-opt refusal on our own emitted MLIR — `vector<64xi1>` against `i1`,
+//! "found no program to compile", "Unable to generate loops", "Dangling non-compute op has no use".
+//! Acceptance is the bake, on granite **2b and 8b, both or neither**, because 8b's hd=128/4096/12800
+//! against 2b's 64/2048/8192 is a different door arm and tile geometry.
+//!
+//! ⭐ WHAT THIS FILE IS: an EARLIER and NARROWER signal. It answers "does our lowering agree with the
+//! reference's, op for op, on real input" without waiting for a full bake, which is worth having
+//! because the alternative during a 418-function port is no feedback until the end. It is a
+//! development gate, not evidence the port is correct.
+//!
+//! ⛔⛔ AND THE END-TO-END STORY FOR THIS RUNG IS UNRESOLVED. To verify bridge 2 the way bridge 1 is
+//! verified, our SentientIR would have to re-enter the reference pipeline at D29 so the remaining
+//! passes and dip could produce an `init_binary` to compare. **There is no flag for that**: of the
+//! seven conversions in D1-D28, none has a `-disable` option, and `dbo/docs/pass_pipeline.md` says
+//! why — *"The ones without a flag are the ones nothing below them survives."* Feeding an
+//! already-lowered module in and letting the conversions idle over it is plausible and UNTESTED.
+//! Until it is tested, a green run here means our text matches a dump, not that a program runs.
 
 use std::path::{Path, PathBuf};
 
@@ -116,6 +137,12 @@ fn the_goldens_came_from_the_reference() {
 }
 
 /// 🎯 OUR BRIDGE REPRODUCES THE REFERENCE'S SENTIENTIR.
+///
+/// ⛔ THE `unimplemented!` IS DELIBERATE AND THIS CRATE CAPS PANICS, so it is worth saying why it is
+/// allowed to stand: it sits in `tests/`, not in the bridge, so
+/// `spyre/tests/dfir_never_runtime_refuses.rs` — which ratchets `panic!`/`todo!` in
+/// `lower_subtile_tape_to_dataflow_ir.rs` — does not count it. And an `#[ignore]`d test with a no-op
+/// body would PASS when un-ignored, which is worse than loud: the marker has to fail until wired.
 ///
 /// ⛔⛔ IGNORED UNTIL THE BRIDGE EXISTS, AND DELIBERATELY PRESENT ANYWAY. The gate is written before
 /// the port so that "does it work?" has an answer that predates the work — the same discipline the ISA
