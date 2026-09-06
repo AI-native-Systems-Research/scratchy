@@ -24,3 +24,9 @@
 pub mod precision;
 /// What a load's value reaches, and which unit consumes it.
 pub mod load_chain;
+/// Which sentient op an upstream arith or scf op becomes.
+pub mod scalar_ops;
+/// How an LX load arranges a sub-stick transfer.
+pub mod ldtype;
+/// Unit classification and naming, as the lowering asks it.
+pub mod units;
