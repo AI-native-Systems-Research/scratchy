@@ -69,7 +69,13 @@ impl<const N: u32> Bounded<N> {
     #[must_use]
     pub const fn at<const I: u32>() -> Self {
         const { assert!(N > 0, "a bound of zero admits no index at all") }
-        assert!(I < N, "index is out of bounds for this arch");
+        // ⛔⛔ `const { }`, NOT A BARE `assert!`. Both operands are const generics, so the comparison
+        // is const-evaluable either way — but a bare `assert!` inside a `const fn` is only evaluated
+        // at compile time when the CALL is in a const context. At a runtime call site it compiled to
+        // a runtime panic, which is the one thing this constructor exists to rule out. Wrapping it
+        // forces the evaluation regardless of where it is called from, so an out-of-range index is a
+        // build error in every context.
+        const { assert!(I < N, "index is out of bounds for this arch") }
         Bounded(I)
     }
 

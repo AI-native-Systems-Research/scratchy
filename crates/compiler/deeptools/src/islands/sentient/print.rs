@@ -87,7 +87,7 @@ fn indent(out: &mut String, depth: usize) {
 pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
     indent(out, depth);
     match op {
-        Op::Sentient(op) => sentient::emit(out, op),
+        Op::Sentient(op) => sentient::emit(out, op, depth),
         Op::Arith(op) => arith::emit(out, op),
         Op::Scf(op) => scf::emit(out, op, depth),
         Op::Affine(op) => affine::emit(out, op, depth),
