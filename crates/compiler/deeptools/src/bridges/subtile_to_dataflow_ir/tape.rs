@@ -19,7 +19,7 @@ use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, LaneMask};
 use crate::islands::dataflow_ir::dialects::{
     Index, Op, Val, affine, agen, arith, dataflow, vectorchain,
 };
-use crate::islands::dataflow_ir::link::{self, Link, SendEnd};
+use crate::islands::dataflow_ir::link::{self, Link, Placed, SendEnd};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
 use crate::islands::dataflow_ir::{
     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run, Units,
@@ -306,7 +306,12 @@ fn node_program<
 
     // Each input that lives in the HBM is viewed there and moved into the scratchpad. THIS is what
     // makes the weights present: a view alone is an address nothing fills.
-    let mut staged = Vec::with_capacity(node.inputs.len());
+    //
+    // ⛔ AND EACH LANDS SOMEWHERE OF ITS OWN. The watermark is where the next staged operand goes,
+    // in ELEMENTS; it was the literal `0` for all of them, so every staged tensor aliased the
+    // first. See [`Placed`].
+    let mut staged: Vec<Placed> = Vec::with_capacity(node.inputs.len());
+    let mut lx_watermark: i64 = 0;
     for input in &node.inputs {
         let rows = u64::from(input.rows.0);
         let cols = u64::from(input.cols.0);
@@ -335,20 +340,29 @@ fn node_program<
             },
         }));
 
-        // An operand already in the scratchpad needs no transfer; one in the HBM does.
+        // An operand already in the scratchpad needs no transfer; one in the HBM does. Either way
+        // the PLACEMENT is what the reader gets — see [`Placed`].
         if matches!(input.at, Residence::Lx { .. }) {
-            staged.push(Staged {
-                start: i64::try_from(input.start().0).expect("an element offset fits an i64"),
+            staged.push(Placed::written_at(
+                i64::try_from(input.start().0).expect("an element offset fits an i64"),
                 rows,
                 cols,
-            });
+            ));
             continue;
         }
 
+        // ⛔⛔ AND THE STAGED OPERANDS DO NOT ALL LAND AT ZERO. `dst_start` was the literal `0` for
+        // every operand, so in `g6_1_matmul` the activation's `memref<1x2048xf16>` and the weight's
+        // `memref<2048x2048xf16>` were BOTH views of LX element 0 — the weight written over the
+        // activation. dbo-opt compiles one program unit at a time and has no cross-unit alias
+        // analysis, so nothing refused it; it would have been wrong numbers on hardware.
+        //
+        // ⭐ EACH OPERAND FOLLOWS THE LAST, IN ELEMENTS, which is the unit `start` is stated in
+        // (`Dataflow.td:250`).
         let dst_start = vals.mint();
         body.push(Op::Arith(arith::Op::Constant {
             result: dst_start,
-            value: 0,
+            value: lx_watermark,
         }));
         let dst = vals.mint();
         body.push(Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
@@ -399,11 +413,12 @@ fn node_program<
         // gone at its `}` — see [`Received`]. The unit that reads this operand takes its own view of
         // the same LX address, which is exactly what IBM's `lxlu` does (`dfir.mlir:112-116`) rather
         // than reuse the `l3lu`'s handle from `:73-74`.
-        staged.push(Staged {
-            start: 0,
-            rows,
-            cols,
-        });
+        //
+        // ⭐⭐ AND THE WRITER SAYS WHERE. `Placed::written_at` is minted HERE, by the unit that puts
+        // the bytes there, and every reader spends this value rather than recomputing an address of
+        // its own. See [`Placed`].
+        staged.push(Placed::written_at(lx_watermark, rows, cols));
+        lx_watermark += i64::try_from(rows * cols).expect("an LX extent fits an i64");
     }
 
     // ⛔⛔ THE UNITS ARE BOUND OUTSIDE, THE WORK INSIDE. IBM's own emitted DataflowIR puts only
@@ -454,7 +469,7 @@ fn node_program<
             let start = vals.mint();
             loads.push(Op::Arith(arith::Op::Constant {
                 result: start,
-                value: operand.start,
+                value: operand.start(),
             }));
             let view = vals.mint();
             loads.push(Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
@@ -462,11 +477,11 @@ fn node_program<
                 from: lx,
                 start,
                 layout: AffineMap::linear(&[
-                    i64::try_from(operand.cols).expect("a width fits an i64"),
+                    i64::try_from(operand.cols()).expect("a width fits an i64"),
                     1,
                 ]),
                 ty: MemRef {
-                    shape: vec![operand.rows, operand.cols],
+                    shape: vec![operand.rows(), operand.cols()],
                     elem: ElemType::F16,
                 },
             }));
@@ -614,22 +629,6 @@ fn node_program<
     })
 }
 
-/// WHERE ONE OPERAND SITS IN THE SCRATCHPAD, once the transfer has put it there.
-///
-/// ⛔⛔ A PLACEMENT, NOT A VIEW HANDLE. This was the `Val` the L3 unit's
-/// `get_logical_memory_view` bound — a name that is gone at that region's `}`
-/// (`Parser.cpp:2273-2276`). Every unit that reads this operand takes its own view of the address,
-/// which is what IBM's `lxlu` does at `dfir.mlir:112-116` rather than reuse `:73-74`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Staged {
-    /// Its LX start, in ELEMENTS.
-    start: i64,
-    /// Its rows.
-    rows: u64,
-    /// Its columns.
-    cols: u64,
-}
-
 /// THE LOOP NEST, WHICH IS WHERE THE CONSTANTS EARN THEIR KEEP.
 ///
 /// ⛔⛔ THESE ARE REMOVALS, NOT BOUNDS. A row loop that runs once is still a region, still a
@@ -742,7 +741,7 @@ fn nest<
 /// their `sfp` unit holds nothing but receives, the compute, and a send on (`:144-151`).
 fn load_and_send(
     vals: &mut Vals,
-    staged: &[Staged],
+    staged: &[Placed],
     views: &[Val],
     to: SendEnd,
     ty: Vector,
@@ -755,7 +754,7 @@ fn load_and_send(
             view: *view,
             indices: vec![Index::Const(0), Index::Const(0)],
             view_ty: MemRef {
-                shape: vec![operand.rows, operand.cols],
+                shape: vec![operand.rows(), operand.cols()],
                 elem: ElemType::F16,
             },
             ty,
@@ -771,8 +770,8 @@ fn load_and_send(
 
 /// THE WIDTH ONE OPERAND ARRIVES AT — the wire's, which is a stick or the row if the row is
 /// narrower.
-fn wire(staged: &[Staged], counts: Counts) -> Vector {
-    let width = staged.first().map_or(1, |operand| operand.cols);
+fn wire(staged: &[Placed], counts: Counts) -> Vector {
+    let width = staged.first().map_or(1, |operand| operand.cols());
     Vector {
         len: width.min(u64::from(counts.act_per_stick)),
         elem: ElemType::F16,

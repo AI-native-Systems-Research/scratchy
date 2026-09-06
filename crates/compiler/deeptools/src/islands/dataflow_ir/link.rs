@@ -157,3 +157,127 @@ impl<From: UnitKind, To: UnitKind> Link<From, To> {
         (From::KIND, To::KIND)
     }
 }
+
+/// ONE SIDE OF A RENDEZVOUS — the peer this unit signals, then waits on.
+///
+/// ⛔ THE PAIR IS EMITTED TOGETHER. `dataflow.sync_recv` is BLOCKING — *"it does not return until
+/// the matching signal has been received"* (`Dataflow.td:209-212`) — so a `sync_send` whose peer
+/// never signals back is a unit that waits forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Half<Peer: UnitKind> {
+    peer: Val,
+    of: core::marker::PhantomData<Peer>,
+}
+
+impl<Peer: UnitKind> Half<Peer> {
+    /// The peer to signal and then wait on.
+    #[must_use]
+    pub const fn peer(self) -> Val {
+        self.peer
+    }
+}
+
+/// A RENDEZVOUS BETWEEN TWO UNITS.
+///
+/// # 🛑 BOTH SIDES, OR NEITHER
+///
+/// ⭐⭐ IBM EMITS IT SYMMETRICALLY. Their `l3lu` unit does `sync_send %30`, `sync_send %32`,
+/// `sync_recv %30`, `sync_recv %32` (`/tmp/ktir_ref/export/debug/dfir.mlir:95-98`) and the `lxlu`
+/// unit it is synchronising with does the mirror, `sync_send %32` then `sync_recv %32`
+/// (`:119-120`). The `lxsu` and `l3su` units do the same at `:173-174` and `:193-196`. Signal, then
+/// wait — on BOTH sides.
+///
+/// ⛔ THE EMITTER WROTE ONE SIDE. The cache walk put `sync_send` and `sync_recv` in the COMPUTE's
+/// body naming a mover it minted inline, and the mover's own body had no mirror at all. Two
+/// independent statements again, and this time the missing one is a deadlock rather than a
+/// diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rendezvous<A: UnitKind, B: UnitKind> {
+    a: Val,
+    b: Val,
+    between: core::marker::PhantomData<(A, B)>,
+}
+
+impl<A: UnitKind, B: UnitKind> Rendezvous<A, B> {
+    /// A rendezvous between two BOUND units.
+    #[must_use]
+    pub fn between(a: Val, b: Val) -> Rendezvous<A, B> {
+        Rendezvous {
+            a,
+            b,
+            between: core::marker::PhantomData,
+        }
+    }
+
+    /// THE TWO SIDES, ONCE.
+    ///
+    /// ⛔ CONSUMES THE RENDEZVOUS, so `A`'s side and `B`'s side come from one value. `A` is handed
+    /// the peer it signals — which is `B` — and vice versa; getting that backwards is not
+    /// expressible because the halves are typed by whose side they are.
+    #[must_use]
+    pub fn halves(self) -> (Half<B>, Half<A>) {
+        (
+            Half {
+                peer: self.b,
+                of: core::marker::PhantomData,
+            },
+            Half {
+                peer: self.a,
+                of: core::marker::PhantomData,
+            },
+        )
+    }
+}
+
+/// WHERE ONE TENSOR SITS IN THE SCRATCHPAD — written by one unit, read by another.
+///
+/// # 🛑 NOTHING DOWNSTREAM CHECKS THIS ONE
+///
+/// ⛔⛔ dbo-opt COMPILES ONE PROGRAM UNIT AT A TIME AND HAS NO CROSS-UNIT ALIAS ANALYSIS. The L3
+/// half writes an LX range and the LX loader views the same range; that they name the same bytes is
+/// an obligation on US, not something a pass will refuse. So this pairing has no refusal to drive
+/// it and would surface as wrong numerics on hardware.
+///
+/// ⛔ AND IT IS ALREADY WRONG. The staging loop wrote `dst_start = 0` for EVERY operand, so in
+/// `g6_1_matmul` the activation view (`memref<1x2048xf16>` at element 0) and the weight view
+/// (`memref<2048x2048xf16>` at element 0) name the same address — the weight lands on top of the
+/// activation. That is the "invented addresses" failure this crate's own CLAUDE.md records.
+///
+/// ⭐ THE ADDRESS IS IN ELEMENTS, which is what `dataflow.get_logical_memory_view`'s `start`
+/// carries (`Dataflow.td:250`) — not bytes, and not sticks.
+///
+/// ⛔ MINTED BY THE WRITER, SPENT BY EACH READER. A reader cannot build a view out of a loose
+/// address and shape it computed for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    start: i64,
+    rows: u64,
+    cols: u64,
+}
+
+impl Placed {
+    /// ⛔ THE ONLY CONSTRUCTOR, AND IT IS THE WRITER'S. Whoever puts the bytes there says where
+    /// they went; every reader takes this value rather than recomputing one.
+    #[must_use]
+    pub const fn written_at(start: i64, rows: u64, cols: u64) -> Placed {
+        Placed { start, rows, cols }
+    }
+
+    /// Its start, in ELEMENTS.
+    #[must_use]
+    pub const fn start(self) -> i64 {
+        self.start
+    }
+
+    /// Its rows.
+    #[must_use]
+    pub const fn rows(self) -> u64 {
+        self.rows
+    }
+
+    /// Its columns.
+    #[must_use]
+    pub const fn cols(self) -> u64 {
+        self.cols
+    }
+}
