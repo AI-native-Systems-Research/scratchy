@@ -85,7 +85,7 @@ fn program_module<A: crate::arch::Arch>(out: &mut String, program: &Program<A>) 
         let _ = writeln!(
             out,
             "dataflow.program_unit {}{precision} : {{",
-            vals(&unit.on)
+            vals(&unit.on.vals())
         );
         for op in &unit.body {
             emit(out, op, 4);

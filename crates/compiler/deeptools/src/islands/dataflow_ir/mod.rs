@@ -17,6 +17,7 @@ pub mod ty;
 
 use crate::arch::Arch;
 use crate::generated::OpFunc;
+use crate::units;
 use op::{Op, Val};
 
 /// MINTS SSA VALUES, so a program's numbering is the builder's and never a caller's.
@@ -54,14 +55,134 @@ impl Values {
 /// and describes a compute reading the LX directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramUnit<A: Arch> {
-    /// The units this runs on, in the order the schedule names them.
-    pub on: Vec<op::Val>,
+    /// The units this runs on, in the order the schedule names them — ALL OF ONE KIND.
+    pub on: Units,
     /// `precision =`, present only where the unit computes.
     pub precision: Option<op::Precision>,
     /// What it runs.
     pub body: Vec<Op>,
     /// The arch it was lowered for.
     pub arch: core::marker::PhantomData<A>,
+}
+
+/// THE UNITS ONE `dataflow.program_unit` RUNS ON — ALL OF ONE KIND.
+///
+/// # 🛑 THE KIND IS NOT A LABEL, IT IS WHAT THE LOWERING READS
+///
+/// ⛔⛔ `Helper.cpp:2173-2176` takes the unit kind from `getUnits()[0]` alone, under the comment
+/// *"It is guaranteed from the upstream passes that all units of a unit operation will have same
+/// types."* A list mixing an `lxlu` with an `lxsu` makes that comment false, and every downstream
+/// question about "the unit" is then answered from whichever happened to be first. R126
+/// `Src unit types has to be the same.` and R163 `Unit type is inconsistent.` are the same fact
+/// checked elsewhere.
+///
+/// ⛔ THIS WAS A `Vec<Val>`, and the emitter built it by pushing `Lxlu` and `Lxsu` into one bag —
+/// the kind was known at the binding and thrown away one line later.
+/// ⛔⛔ NON-EMPTY, AND THAT IS A CRASH NOT A DIAGNOSTIC. `ProgramUnitsReduction.cpp:175` is
+/// `dcc::getUnitType(unit.getUnits()[0].getDefiningOp())` — an unguarded `[0]` on a `ValueRange`.
+/// `Dataflow.td:107` declares `Variadic<Index>:$units`, so zero units PARSES and VERIFIES; the pass
+/// then aborts the whole compiler with
+/// *"Assertion failed: (Index < size() && \"invalid index for value range\")"* and no diagnostic at
+/// all. `head` is a field so `vals().is_empty()` is not a question that can be asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Units {
+    kind: units::DfirUnit,
+    head: op::Val,
+    rest: Vec<op::Val>,
+}
+
+impl Units {
+    /// Every bound unit OF THIS KIND, in the order the schedule named them — or `None` where the
+    /// schedule names none.
+    ///
+    /// ⛔ THE ONLY CONSTRUCTOR, AND THE KIND IS THE FILTER. A caller cannot hand over a list that
+    /// mixes kinds, because it does not hand over a list at all — it names a kind and gets the
+    /// units that are of it.
+    ///
+    /// ⛔⛔ `None` IS NOT A REFUSAL, IT IS AN ABSENCE. A schedule that names no unit of this kind
+    /// has no program unit of this kind — the same shape as `IS_DECODE` removing the row nest. The
+    /// caller emits one fewer unit; it does not emit an empty one and it does not stop.
+    #[must_use]
+    pub fn of(kind: units::DfirUnit, bound: &[(units::DfirUnit, op::Val)]) -> Option<Units> {
+        let mut vals = bound.iter().filter(|(k, _)| *k == kind).map(|(_, v)| *v);
+        let head = vals.next()?;
+        Some(Units {
+            kind,
+            head,
+            rest: vals.collect(),
+        })
+    }
+
+    /// ONE bound unit of a kind — total, and no `Option`.
+    ///
+    /// ⭐ FOR A UNIT THE ARCH PROVIDES rather than the schedule names. [`Self::of`] filters a list
+    /// the template wrote and so may find none; a unit bound unconditionally from the machine's own
+    /// topology is already known to exist, and saying so here is what keeps the caller from having
+    /// an `expect` for a case that cannot arise.
+    #[must_use]
+    pub fn one(kind: units::DfirUnit, val: op::Val) -> Units {
+        Units {
+            kind,
+            head: val,
+            rest: Vec::new(),
+        }
+    }
+
+    /// Which kind these are.
+    #[must_use]
+    pub fn kind(&self) -> units::DfirUnit {
+        self.kind
+    }
+
+    /// The unit the backend reads the kind from — `getUnits()[0]`, which always exists.
+    #[must_use]
+    pub fn first(&self) -> op::Val {
+        self.head
+    }
+
+    /// The bound units, in schedule order.
+    #[must_use]
+    pub fn vals(&self) -> Vec<op::Val> {
+        core::iter::once(self.head)
+            .chain(self.rest.iter().copied())
+            .collect()
+    }
+
+    /// WHETHER AN `agen.composite_load_and_store` MAY RUN ON THIS KIND.
+    ///
+    /// ⛔⛔ ONLY THE L3 HALVES, AND THE REFUSAL IS SILENT. `Helper.cpp:2177-2179` is
+    /// `if (!is_any_of(comp, L3LU, L3SU)) return LogicalResult::failure();` — a bare failure with no
+    /// message, so all dbo-opt prints is the caller's wrapper, *"Unable to generate loops and
+    /// sentient statements for the composite vector operations"* (`:2965-2967`). The emitter put the
+    /// HBM→LX transfer on an `lxlu` and read that text as being about the transfer's shape.
+    ///
+    /// ⭐ IBM AGREES: their `l3lu` unit holds the `composite_load_and_store`s
+    /// (`/tmp/ktir_ref/export/debug/dfir.mlir:64` on `%0,%1`, transfers at `:82,:90`) while their
+    /// `lxlu` unit holds `agen.vector_load` + `dataflow.send` and no transfer at all (`:104-129`).
+    ///
+    /// ⛔ EXHAUSTIVE, NO WILDCARD. A new unit kind must say whether it is an L3 half rather than
+    /// silently inherit `false`.
+    #[must_use]
+    pub const fn moves_memory(&self) -> bool {
+        use units::DfirUnit;
+        match self.kind {
+            DfirUnit::L3lu | DfirUnit::L3su => true,
+            DfirUnit::Sfp
+            | DfirUnit::Pe
+            | DfirUnit::PtRow(_)
+            | DfirUnit::Lxlu
+            | DfirUnit::Lxsu
+            | DfirUnit::Lx
+            | DfirUnit::Hbm
+            | DfirUnit::L0lu
+            | DfirUnit::L0su
+            | DfirUnit::L0
+            | DfirUnit::Constant
+            | DfirUnit::SfpState
+            | DfirUnit::PeState
+            | DfirUnit::SfpRing => false,
+        }
+    }
 }
 
 /// A PROGRAM'S UNITS — NON-EMPTY BY CONSTRUCTION.
@@ -136,8 +257,11 @@ pub struct Program<A: Arch> {
 /// ```compile_fail
 /// use deeptools::arch::{Arch, Dd2, Sen1p5};
 /// use deeptools::generated::OpFunc;
+/// use deeptools::units::DfirUnit;
+/// use deeptools::islands::dataflow_ir::op::Val;
 /// use deeptools::islands::dataflow_ir::{
 ///     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
+///     Units,
 /// };
 /// fn one<A: Arch>(index: u32) -> Program<A> {
 ///     Program {
@@ -146,7 +270,7 @@ pub struct Program<A: Arch> {
 ///         preamble: Vec::new(),
 ///         units: ProgramUnits::of(
 ///             ProgramUnit {
-///                 on: Vec::new(),
+///                 on: Units::one(DfirUnit::Sfp, Val(0)),
 ///                 precision: None,
 ///                 body: Vec::new(),
 ///                 arch: core::marker::PhantomData,
@@ -166,8 +290,11 @@ pub struct Program<A: Arch> {
 /// ```
 /// use deeptools::arch::{Arch, Dd2};
 /// use deeptools::generated::OpFunc;
+/// use deeptools::units::DfirUnit;
+/// use deeptools::islands::dataflow_ir::op::Val;
 /// use deeptools::islands::dataflow_ir::{
 ///     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
+///     Units,
 /// };
 /// fn one<A: Arch>(index: u32) -> Program<A> {
 ///     Program {
@@ -176,7 +303,7 @@ pub struct Program<A: Arch> {
 ///         preamble: Vec::new(),
 ///         units: ProgramUnits::of(
 ///             ProgramUnit {
-///                 on: Vec::new(),
+///                 on: Units::one(DfirUnit::Sfp, Val(0)),
 ///                 precision: None,
 ///                 body: Vec::new(),
 ///                 arch: core::marker::PhantomData,

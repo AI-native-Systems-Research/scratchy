@@ -13,10 +13,12 @@ use crate::arch::Arch;
 use crate::bridges::subtile_to_dataflow_ir::node::{Node, Residence};
 use crate::bridges::subtile_to_dataflow_ir::schedule;
 use crate::bridges::subtile_to_dataflow_ir::transfer::{self, Lanes};
-use crate::islands::dataflow_ir::op::{CompositeTransfer, Index, LaneMask, Op, Precision, Val};
+use crate::islands::dataflow_ir::op::{
+    CompositeTransfer, Index, LaneMask, Op, Precision, Received, Val,
+};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
 use crate::islands::dataflow_ir::{
-    Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run,
+    Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run, Units,
 };
 use crate::model::Model;
 use crate::units::{Core, Corelet, DfirUnit, Residency};
@@ -252,27 +254,43 @@ fn node_program<
 
     // Then every unit the schedule itself names, in the order it names them, each with the
     // residency the machine gives it.
-    // ⭐⭐ AND THE HANDLES ARE KEPT, BY ROLE. The walk used to bind each unit and throw the `Val`
+    //
+    // ⭐⭐ AND THE HANDLE IS KEPT WITH ITS KIND. The walk used to bind each unit and throw the `Val`
     // away, so nothing downstream could say WHICH unit a program unit runs on — and a
     // `dataflow.program_unit` is exactly "these units run this".
-    let mut movers = Vec::new();
-    let mut computers = Vec::new();
-    for unit in schedule::units_of(schedule) {
+    //
+    // ⛔⛔ KIND, NOT ROLE. This sorted into `movers` and `computers`, which put an `lxlu` and an
+    // `lxsu` in ONE list — and the kind was known here and discarded one line later. See [`Units`]:
+    // the backend reads the kind off `getUnits()[0]` alone.
+    let mut bound: Vec<(DfirUnit, Val)> = Vec::new();
+    let mut bind = |vals: &mut Vals, body: &mut Vec<Op>, unit: DfirUnit| {
         let val = vals.mint();
-        // ⛔ THE ROLE IS THE UNIT'S KIND, read from the schedule rather than assumed: `lxlu`/`lxsu`
-        // move data, `sfp`/`pe`/`ptrow` compute. A unit that is neither still gets bound — the
-        // template named it — but names no program unit of ours.
-        match unit {
-            DfirUnit::Lxlu | DfirUnit::Lxsu => movers.push(val),
-            DfirUnit::Sfp | DfirUnit::Pe => computers.push(val),
-            _ => {}
-        }
+        bound.push((unit, val));
         body.push(Op::GetUnit {
             result: val,
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
         });
+        val
+    };
+    for unit in schedule::units_of(schedule) {
+        bind(&mut vals, &mut body, unit);
     }
+
+    // ⛔⛔ THE L3 HALF IS THE MACHINE'S, NOT THE TEMPLATE'S, AND ITS ABSENCE IS NOT A CHOICE.
+    // `getDataTransferType(src_is_fifo, dst_is_fifo)` is total over three cases
+    // (`DataTransferLowering.cpp:165-172`): memref→memref lowers to
+    // `agen.composite_load_and_store` (`:255, :311`), memref→FIFO to `agen.vector_load` +
+    // `dataflow.send` (`:274, :424`), FIFO→memref to `dataflow.receive` + `agen.vector_store`
+    // (`:293, :495`). An HBM→LX move has a memref at both ends, so it IS a composite transfer, and
+    // `Helper.cpp:2177-2179` then requires an L3 half — memory-to-memory needs a unit with two
+    // memory ports.
+    //
+    // ⭐ AND NO `ddl.unit` NAMES ONE, in any of the 32 templates. That is consistent, not a
+    // contradiction: a template describes what the OP does, which is scratchpad↔wire — memref↔FIFO,
+    // on `lxlu`/`lxsu`. Staging a weight out of the HBM is not part of any op's schedule. So the
+    // unit that performs it is bound from the ARCH's topology, exactly as `hbm` and `lx` above are.
+    let l3lu = bind(&mut vals, &mut body, DfirUnit::L3lu);
 
     // ⛔ WHERE THE UNIT BINDINGS END. Everything pushed from here on is work, and work belongs
     // inside a `dataflow.program_unit`.
@@ -315,7 +333,11 @@ fn node_program<
 
         // An operand already in the scratchpad needs no transfer; one in the HBM does.
         if matches!(input.at, Residence::Lx { .. }) {
-            staged.push((view, rows, cols));
+            staged.push(Staged {
+                start: i64::try_from(input.start().0).expect("an element offset fits an i64"),
+                rows,
+                cols,
+            });
             continue;
         }
 
@@ -367,21 +389,97 @@ fn node_program<
             store_time_addr_map: plan.store_time_addr_map,
             body: vec![Op::AgenYield],
         })));
-        staged.push((dst, rows, cols));
+        // ⛔⛔ THE PLACEMENT, NOT THE VIEW HANDLE. `dst` is bound inside the L3 unit's region and is
+        // gone at its `}` — see [`Received`]. The unit that reads this operand takes its own view of
+        // the same LX address, which is exactly what IBM's `lxlu` does (`dfir.mlir:112-116`) rather
+        // than reuse the `l3lu`'s handle from `:73-74`.
+        staged.push(Staged {
+            start: 0,
+            rows,
+            cols,
+        });
     }
 
     // ⛔⛔ THE UNITS ARE BOUND OUTSIDE, THE WORK INSIDE. IBM's own emitted DataflowIR puts only
     // `dataflow.get_unit` and the constants at function scope, and every view, transfer and loop
     // inside a `dataflow.program_unit` (`/tmp/ktir_ref/export/debug/dfir.mlir:44-78`) — five of
     // them in one function, each naming the units it runs on.
-    let computes = nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX, STICK_ALIGNED>(
-        &mut vals, &staged, node, counts,
-    );
+    //
+    // ⭐⭐ ONE WIRE WIDTH, READ ONCE. The type the mover sends at and the type the compute receives
+    // at are the same value, so the two ends of the wire cannot disagree.
+    let wire_ty = wire(&staged, counts);
+
+    // ⭐⭐ THREE UNITS, ONE KIND EACH. The L3 half moves HBM to LX, the LX loader reads the
+    // scratchpad and sends, the SFP receives and computes.
+    //
+    // ⛔ A KIND THE SCHEDULE DOES NOT NAME IS AN ABSENCE, NOT A REFUSAL. `Units::of` yields `None`
+    // and the program has one fewer unit — the same shape as `IS_DECODE` removing the row nest.
+    // What it must never be is an EMPTY unit list: `ProgramUnitsReduction.cpp:175` indexes
+    // `getUnits()[0]` unguarded and aborts the whole compiler on an LLVM assertion with no
+    // diagnostic at all.
+    let transfers = Units::one(DfirUnit::L3lu, l3lu);
+    let loaders = Units::of(DfirUnit::Lxlu, &bound);
+    let computers = Units::of(DfirUnit::Sfp, &bound);
+
+    // `to`/`from` are the FIRST HOP, so each names the unit at the other end of the wire.
+    let to = computers.as_ref().map_or(lx, Units::first);
+    let from = loaders.as_ref().map_or(lx, Units::first);
+
+    // ⭐ THE LOADER'S BODY: its OWN view of each staged operand, then the nest that reads and sends.
+    // The view is retaken rather than inherited — `transfers`' handles died at its region's `}`.
+    let mut loads = Vec::new();
+    let views: Vec<Val> = staged
+        .iter()
+        .map(|operand| {
+            let start = vals.mint();
+            loads.push(Op::Constant {
+                result: start,
+                value: operand.start,
+            });
+            let view = vals.mint();
+            loads.push(Op::GetLogicalMemoryView {
+                result: view,
+                from: lx,
+                start,
+                layout: AffineMap::linear(&[
+                    i64::try_from(operand.cols).expect("a width fits an i64"),
+                    1,
+                ]),
+                ty: MemRef {
+                    shape: vec![operand.rows, operand.cols],
+                    elem: ElemType::F16,
+                },
+            });
+            view
+        })
+        .collect();
+    loads.extend(nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX>(
+        &mut vals,
+        node,
+        counts,
+        |vals| load_and_send(vals, &staged, &views, to, wire_ty),
+    ));
+
+    // ⭐ THE COMPUTE'S NEST: the same nest, one `dataflow.receive` per operand, then the compute.
+    let computes =
+        nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX>(&mut vals, node, counts, |vals| {
+            let mut ops = Vec::new();
+            let operands: Vec<Received> = (0..staged.len())
+                .map(|_| {
+                    let result = vals.mint();
+                    Received::receive(&mut ops, result, from, wire_ty)
+                })
+                .collect();
+            ops.extend(compute::<STICK_ALIGNED>(
+                vals, &operands, node, counts, wire_ty,
+            ));
+            ops
+        });
 
     // ⭐ THE SPLIT IS WHERE THE UNIT WALK ENDED. Everything up to `units_end` binds units — that is
     // function scope in IBM's own output, which puts only `dataflow.get_unit` and constants outside
     // a program unit (`/tmp/ktir_ref/export/debug/dfir.mlir:44-63`). Everything after it is the
-    // views this node takes and the transfers it runs, which is the MOVER's work.
+    // views the HBM operands take and the transfers that fill them, which is the L3 HALF's work.
     let mut preamble = body;
     let moves = preamble.split_off(units_end);
 
@@ -393,34 +491,67 @@ fn node_program<
         },
         grid: Grid::single(),
         preamble,
-        // ⭐ TWO UNITS, AND THE PRECISION IS ON THE ONE THAT COMPUTES. R182 `Unknown parent op for
+        // ⭐ THREE UNITS, AND THE PRECISION IS ON THE ONE THAT COMPUTES. R182 `Unknown parent op for
         // precision calculation` is the refusal for putting it on a unit that does not.
         units: ProgramUnits::of(
+            // ⛔⛔ THE TRANSFER RUNS ON THE L3 HALF. `Helper.cpp:2177-2179` returns a bare
+            // `failure()` for any other kind — see [`Units::moves_memory`].
+            //
+            // ⭐ AND IT IS THE HEAD, so a program always has at least one unit whatever the
+            // template named. `Units::one` is total because the L3 half was bound above from the
+            // arch rather than looked for in the schedule.
             ProgramUnit {
-                on: movers,
+                on: transfers,
                 precision: None,
                 body: moves,
                 arch: core::marker::PhantomData,
             },
-            vec![ProgramUnit {
-                on: computers,
-                // ⛔⛔ THE PRECISION IS THE COMPUTE'S OPCODE, NOT THE TENSOR'S DTYPE.
-                // `stringifyComputePrecision` takes a `ComputeOpType` and maps `FMA16 -> "fp16"`,
-                // `FMA8 -> "fp8"`, `IMA4 -> "int4"` (`DSC2ToDataflowIR.hpp:54-71`) — "used to
-                // identify the MAC op code used in the units". A `DataType -> Precision` map would
-                // be answering a different question.
-                //
-                // ⭐ AND THIS EMITTER'S COMPUTES ARE fp16, because the activation stream is fp16
-                // whatever the weights are quantised to — every `Vector` it builds is `F16`. When a
-                // compute runs at another width this becomes that compute's opcode, read from the
-                // op it emits rather than from the node.
-                precision: Some(Precision::Fp16),
-                body: computes,
-                arch: core::marker::PhantomData,
-            }],
+            [
+                loaders.map(|on| ProgramUnit {
+                    on,
+                    precision: None,
+                    body: loads,
+                    arch: core::marker::PhantomData,
+                }),
+                computers.map(|on| ProgramUnit {
+                    on,
+                    // ⛔⛔ THE PRECISION IS THE COMPUTE'S OPCODE, NOT THE TENSOR'S DTYPE.
+                    // `stringifyComputePrecision` takes a `ComputeOpType` and maps `FMA16 -> "fp16"`,
+                    // `FMA8 -> "fp8"`, `IMA4 -> "int4"` (`DSC2ToDataflowIR.hpp:54-71`) — "used to
+                    // identify the MAC op code used in the units". A `DataType -> Precision` map would
+                    // be answering a different question.
+                    //
+                    // ⭐ AND THIS EMITTER'S COMPUTES ARE fp16, because the activation stream is fp16
+                    // whatever the weights are quantised to — every `Vector` it builds is `F16`. When a
+                    // compute runs at another width this becomes that compute's opcode, read from the
+                    // op it emits rather than from the node.
+                    precision: Some(Precision::Fp16),
+                    body: computes,
+                    arch: core::marker::PhantomData,
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         ),
         arch: core::marker::PhantomData,
     })
+}
+
+/// WHERE ONE OPERAND SITS IN THE SCRATCHPAD, once the transfer has put it there.
+///
+/// ⛔⛔ A PLACEMENT, NOT A VIEW HANDLE. This was the `Val` the L3 unit's
+/// `get_logical_memory_view` bound — a name that is gone at that region's `}`
+/// (`Parser.cpp:2273-2276`). Every unit that reads this operand takes its own view of the address,
+/// which is what IBM's `lxlu` does at `dfir.mlir:112-116` rather than reuse `:73-74`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Staged {
+    /// Its LX start, in ELEMENTS.
+    start: i64,
+    /// Its rows.
+    rows: u64,
+    /// Its columns.
+    cols: u64,
 }
 
 /// THE LOOP NEST, WHICH IS WHERE THE CONSTANTS EARN THEIR KEEP.
@@ -428,21 +559,25 @@ fn node_program<
 /// ⛔⛔ THESE ARE REMOVALS, NOT BOUNDS. A row loop that runs once is still a region, still a
 /// barrier, and still an induction variable every enclosed access is strided by — so `IS_DECODE`
 /// does not set the bound to one, it emits no loop at all. Same for `FITS_LX` and the tiling loop.
+///
+/// ⭐⭐ THE INNERMOST BODY IS THE CALLER'S, because the SAME nest is built for TWO units. The mover
+/// loads and sends inside it; the compute receives and computes inside it. Both walk one iteration
+/// space, so both must lose exactly the same loops — building the nest twice from one function is
+/// what makes that a fact rather than a coincidence between two copies.
 fn nest<
     const IS_DECODE: bool,
     const FITS_LX: bool,
     const NO_CACHE_WALK: bool,
     const CACHE_FITS_LX: bool,
-    const STICK_ALIGNED: bool,
 >(
     vals: &mut Vals,
-    staged: &[(Val, u64, u64)],
     node: &Node,
     counts: Counts,
+    innermost: impl FnOnce(&mut Vals) -> Vec<Op>,
 ) -> Vec<Op> {
     use crate::islands::dataflow_ir::op::Bound;
 
-    let inner = compute::<STICK_ALIGNED>(vals, staged, node, counts);
+    let inner = innermost(vals);
 
     // ⭐ THE CACHE WALK, WHICH ONLY AN ATTENTION NODE HAS AND ONLY A WIDE BUCKET NEEDS.
     //
@@ -516,12 +651,56 @@ fn nest<
         }]
     };
 
-    // ⛔⛔ ONLY THE COMPUTE'S NEST. This used to `body.extend(rows)` — folding the loader's views
-    // and transfers together with the compute into one flat sequence, which is how a program with
-    // no `dataflow.program_unit` at all came to be emitted. The two run on DIFFERENT units (a
-    // compute has no read port to the scratchpad — `VectorOperands.cpp:187-206`), so the caller
-    // puts them in different program units.
+    // ⛔⛔ ONE UNIT'S NEST. This used to `body.extend(rows)` — folding the loader's views and
+    // transfers together with the compute into one flat sequence, which is how a program with no
+    // `dataflow.program_unit` at all came to be emitted. The two run on DIFFERENT units (a compute
+    // has no read port to the scratchpad — `VectorOperands.cpp:187-206`), so the caller puts them
+    // in different program units and calls this once for each.
     rows
+}
+
+/// THE MOVER'S INNERMOST BODY: read each staged view, and put it on the wire.
+///
+/// ⭐⭐ THE LOAD BELONGS HERE, NOT IN THE COMPUTE. IBM's `lxlu` unit is exactly this —
+/// `agen.vector_load` then `dataflow.send` (`/tmp/ktir_ref/export/debug/dfir.mlir:122-129`) — and
+/// their `sfp` unit holds nothing but receives, the compute, and a send on (`:144-151`).
+fn load_and_send(
+    vals: &mut Vals,
+    staged: &[Staged],
+    views: &[Val],
+    to: Val,
+    ty: Vector,
+) -> Vec<Op> {
+    let mut ops = Vec::with_capacity(staged.len() * 2);
+    for (operand, view) in staged.iter().zip(views) {
+        let loaded = vals.mint();
+        ops.push(Op::AgenVectorLoad {
+            result: loaded,
+            view: *view,
+            indices: vec![Index::Const(0), Index::Const(0)],
+            view_ty: MemRef {
+                shape: vec![operand.rows, operand.cols],
+                elem: ElemType::F16,
+            },
+            ty,
+        });
+        ops.push(Op::Send {
+            to,
+            data: loaded,
+            ty,
+        });
+    }
+    ops
+}
+
+/// THE WIDTH ONE OPERAND ARRIVES AT — the wire's, which is a stick or the row if the row is
+/// narrower.
+fn wire(staged: &[Staged], counts: Counts) -> Vector {
+    let width = staged.first().map_or(1, |operand| operand.cols);
+    Vector {
+        len: width.min(u64::from(counts.act_per_stick)),
+        elem: ElemType::F16,
+    }
 }
 
 /// THE COMPUTE ITSELF.
@@ -535,35 +714,21 @@ fn nest<
 /// shape of expressing a constant without exploiting it.
 fn compute<const STICK_ALIGNED: bool>(
     vals: &mut Vals,
-    staged: &[(Val, u64, u64)],
+    operands: &[Received],
     node: &Node,
     counts: Counts,
+    ty: Vector,
 ) -> Vec<Op> {
     let mut ops = Vec::new();
-    let width = staged.first().map_or(1, |(_, _, cols)| *cols);
-    let lanes = width.min(u64::from(counts.act_per_stick));
-    let ty = Vector {
-        len: lanes,
-        elem: ElemType::F16,
-    };
+    let lanes = ty.len;
 
-    let mut loaded = Vec::with_capacity(staged.len());
-    for (view, rows, cols) in staged {
-        let result = vals.mint();
-        ops.push(Op::AgenVectorLoad {
-            result,
-            view: *view,
-            indices: vec![Index::Const(0), Index::Const(0)],
-            view_ty: MemRef {
-                shape: vec![*rows, *cols],
-                elem: ElemType::F16,
-            },
-            ty,
-        });
-        loaded.push(result);
-    }
+    // ⛔⛔ THE OPERANDS ARRIVED ON THE WIRE. They used to be `agen.vector_load`s of the views the
+    // MOVER took, which is an SSA name that does not exist here: MLIR pushes a definitions scope
+    // per region (`Parser.cpp:2273-2276`), so a value a sibling `dataflow.program_unit` bound is
+    // gone at its `}`. See [`Received`] for the two faces that one defect wore.
+    let loaded: Vec<Val> = operands.iter().map(|r| r.val()).collect();
 
-    // The op-func's own arity decides how the loaded vectors combine. A unary reads one, a binary
+    // The op-func's own arity decides how the received vectors combine. A unary reads one, a binary
     // two; the tape decomposed everything richer into those before it got here.
     let Some((&op1, rest)) = loaded.split_first() else {
         return ops;
