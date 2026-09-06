@@ -42,6 +42,41 @@ deeptools compiler ladder.
      and 7 `vectorchain.binary`. So `AgenToSentient` and the memory-view
      handling dominate; `VectorChainLowering` is comparatively thin here.
 
+     🛑 **WHAT MAY AND MAY NOT BE DROPPED FROM THIS SPAN — read before excluding anything.**
+
+     ⛔⛔ **"OUR RUST CANNOT EXPRESS THAT OP YET" IS NOT A REASON TO SKIP A PASS.** It is a
+     statement about how far the emitter has got, not about what the machine needs. Two passes
+     were excluded on exactly that reasoning and both exclusions were wrong and dangerous:
+
+     * `TransformPagedMemView` (D9, 2,025 lines) matches
+       `dataflow.GetPagedLogicalMemoryViewOp`, which the DataflowIR island does not declare — so
+       it looked droppable. **Paged KV is central to this target**, and this pass is how a paged
+       view becomes addresses. Dropping it would silently block paged KV on spyre.
+     * `SymbolToSentient` (D27) matches only `symbol.*` ops, and the island has no `symbol`
+       dialect. But symbols are how runtime-corrected addresses travel — `init.bin`'s
+       `symbol_ids`, `dbo-correct-at-runtime` — so that absence is a gap to fill, not a fact.
+
+     ⭐ **THE ONLY SAFE EXCLUSIONS ARE THE ONES SCRATCHY'S STRUCTURE MAKES IMPOSSIBLE**, not the
+     ones it has not reached yet. Concretely, two:
+
+     1. **The MLIR construction machinery inside every file** — `OpBuilder`, `mlir::Value`
+        iterators, the `getOrCreate…` memoisers, the `std::map<int, std::map<int,
+        std::map<SenComponents, mlir::Value>>>` lookup tables. Every one exists because the C++
+        builds an IR at run time and must look SSA values back up later. `#[forward]` resolves the
+        whole tape at expansion and emits `static` tables, so there is nothing to look up and
+        nothing to memoise. **This is the real saving, and it is inside files rather than whole
+        passes** — one measurement put ~79% of a single file here.
+     2. **The generic MLIR cleanup passes** — `SCCP`, `SymbolDCE`, `Canonicalizer`,
+        `AffineToStandard`. They exist to tidy after pattern rewriting; an emitter writes the tidy
+        form directly. They are upstream MLIR in any case.
+
+     ⛔ EVERYTHING ELSE IN THE EIGHT SUBSYSTEMS ABOVE IS IN SCOPE, including D9 and D27. Do not
+     narrow this list by reasoning about which ops the current islands happen to declare, and do
+     not narrow it by which passes fire on a particular model — `Model` is a const-generic trait
+     precisely so that 164 configs across 25 architectures share one op vocabulary, and a pass
+     that no-ops on the model you sampled will fire for some `(Arch, Model, Workload)` that has
+     not been compiled yet.
+
      ⛔ **OUT OF SCOPE — do not schedule these.** They are the next rungs and
      pulling them in loses the seam that makes this verifiable:
      `dcc/src/Transform/Sentient` (D29–D75, 48,432 lines, Sentient→Sentient),
