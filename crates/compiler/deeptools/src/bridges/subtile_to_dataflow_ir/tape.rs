@@ -19,7 +19,7 @@ use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, LaneMask};
 use crate::islands::dataflow_ir::dialects::{
     Index, Op, Val, affine, agen, arith, dataflow, vectorchain,
 };
-use crate::islands::dataflow_ir::link::{self, Link, Placed, SendEnd};
+use crate::islands::dataflow_ir::link::{self, Link, Placed, RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
 use crate::islands::dataflow_ir::{
     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run, Units,
@@ -499,15 +499,38 @@ fn node_program<
     let computes =
         nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX>(&mut vals, node, counts, |vals| {
             let mut ops = Vec::new();
-            let operands: Vec<Received> = (0..staged.len())
-                .map(|_| {
-                    let result = vals.mint();
-                    Received::receive(&mut ops, result, from_loader, wire_ty)
-                })
-                .collect();
-            ops.extend(compute::<STICK_ALIGNED>(
-                vals, &operands, node, counts, wire_ty, to_storer,
-            ));
+            // ⛔⛔⛔ THE COUNT IS THE TEMPLATE'S, NOT `staged.len()`. This minted one edge per
+            // STAGED OPERAND and handed them all to a binary compute, which spent two and dropped
+            // the rest — dbo-opt: "Dangling non-compute op has no use | no OperandReuse entry:
+            // never an operand of a lowered compute", naming a `dataflow.receive`
+            // (`VectorChainToSentientPESFP.cpp:1343`). `Program::input_arity` reads the count off
+            // the vendored `ddl.operation_bind` that this node's op-func and format resolved to,
+            // and the array head it selects is the only way to mint them — so the number received
+            // and the number consumed are one fact with one source.
+            match schedule.input_arity() {
+                1 => {
+                    let operands = edges::<1>(vals, &mut ops, from_loader, wire_ty);
+                    ops.extend(compute_unary::<STICK_ALIGNED>(
+                        vals, operands, counts, wire_ty, to_storer,
+                    ));
+                }
+                2 => {
+                    let operands = edges::<2>(vals, &mut ops, from_loader, wire_ty);
+                    ops.extend(compute::<STICK_ALIGNED>(
+                        vals, operands, node, counts, wire_ty, to_storer,
+                    ));
+                }
+                // ⭐ AND A WIDER BIND IS WORK, NOT A CASE TO ABSORB. `rope.ddl:26-27` binds
+                // `rope64p1` and `rope64p2` with three inputs each, chained through `%iatensor` —
+                // two `vectorchain` computes, not one. Emitting the first two operands and dropping
+                // the third is precisely the defect above wearing a different arity.
+                wider => todo!(
+                    "{:?} at {:?} binds {wider} inputs; only the 1- and 2-operand heads are \
+                     written, so this node has no decomposition yet",
+                    node.op_func,
+                    node.format
+                ),
+            }
             ops
         });
 
@@ -547,15 +570,18 @@ fn node_program<
             let mut ops = Vec::new();
             let arrived = vals.mint();
             let received = Received::receive(&mut ops, arrived, from_compute, wire_ty);
+            // ⭐ THE STORE IS A CONSUMER TOO, and it spends its one edge. Read the width BEFORE
+            // spending, because `operand` takes `self`.
+            let stored_ty = received.ty();
             ops.push(Op::Agen(agen::Op::VectorStore {
-                value: received.val(),
+                value: received.operand(),
                 view: out_view,
                 indices: vec![Index::Const(0), Index::Const(0)],
                 view_ty: MemRef {
                     shape: vec![out_rows, out_cols],
                     elem: ElemType::F16,
                 },
-                ty: received.ty(),
+                ty: stored_ty,
             }));
             ops
         },
@@ -796,26 +822,34 @@ fn wire(staged: &[Placed], counts: Counts) -> Vector {
 /// makes "produce a value and place it nowhere" something no call site can express.
 fn compute<const STICK_ALIGNED: bool>(
     vals: &mut Vals,
-    operands: &[Received],
+    // ⛔⛔⛔ AN ARRAY, BECAUSE THAT IS WHERE RUST'S LINEARITY IS. A `&[Received]` let this unit read
+    // two of six; a `Vec<Received>` by value let it DROP four, and neither move-only nor
+    // `#[must_use]` caught that — measured, the same dbo-opt refusal came back byte for byte. An
+    // array destructured as `let [a, b] = operands` binds EVERY element or does not compile, so
+    // "minted and not consumed" stops being a program that can be written. The LENGTH is the
+    // `.ddl`'s: `Program::input_arity` picks which of these heads the emission site may call.
+    operands: [Received; 2],
     node: &Node,
     counts: Counts,
     ty: Vector,
     to: SendEnd,
 ) -> Vec<Op> {
     let mut ops = Vec::new();
-    let lanes = ty.len;
 
     // ⛔⛔ THE OPERANDS ARRIVED ON THE WIRE. They used to be `agen.vector_load`s of the views the
     // MOVER took, which is an SSA name that does not exist here: MLIR pushes a definitions scope
     // per region (`Parser.cpp:2273-2276`), so a value a sibling `dataflow.program_unit` bound is
     // gone at its `}`. See [`Received`] for the two faces that one defect wore.
-    let loaded: Vec<Val> = operands.iter().map(|r| r.val()).collect();
-
-    // The op-func's own arity decides how the received vectors combine. A unary reads one, a binary
-    // two; the tape decomposed everything richer into those before it got here.
-    let Some((&op1, rest)) = loaded.split_first() else {
-        return ops;
-    };
+    // ⛔⛔ SPENT, NOT BORROWED. This was `operands.iter().map(|r| r.val())` — it borrowed ALL N
+    // received vectors and then took two, and the rest were dropped on the floor. On granite that
+    // was six received and two consumed, and dbo-opt refused the four: "Dangling non-compute op has
+    // no use | no OperandReuse entry: never an operand of a lowered compute". `Received::operand`
+    // takes `self`, so the borrow is not expressible and every edge this unit receives must be
+    // spent into the compute that consumes it.
+    let [first, second] = operands;
+    let op1 = first.operand();
+    let op2 = second.operand();
+    let result = vals.mint();
     // ⛔⛔ NO MASK ON AN UNMASKED BINARY. This minted an `arith.constant true` and handed it to
     // every binary as a stand-in for "no mask" — an `i1` where the use site printed
     // `vector<64xi1>`, which is exactly what dbo-opt refused on granite-2b's `group_7`:
@@ -824,23 +858,79 @@ fn compute<const STICK_ALIGNED: bool>(
     // ⛔ AND AN ALL-ONES MASK WOULD NOT BE THE FIX. That is the same op with a wider constant — a
     // mask that masks nothing. `$mask` is `Optional` in the dialect, so an unmasked binary omits
     // the operand entirely.
-    let mut produced = match rest.first() {
-        Some(&op2) => {
-            let result = vals.mint();
-            ops.push(Op::VectorChain(vectorchain::Op::Binary {
-                result,
-                op1,
-                op2,
-                mask: None,
-                binary_op: binary_for(node.op_func),
-                op_specific_map: AffineMap::identity(1),
-                operand_ty: ty,
-                ty,
-            }));
-            Computed::of(result, ty)
-        }
-        None => Computed::of(op1, ty),
-    };
+    ops.push(Op::VectorChain(vectorchain::Op::Binary {
+        result,
+        op1,
+        op2,
+        mask: None,
+        binary_op: binary_for(node.op_func),
+        op_specific_map: AffineMap::identity(1),
+        operand_ty: ty,
+        ty,
+    }));
+    ops.extend(tail::<STICK_ALIGNED>(
+        vals,
+        Computed::of(result, ty),
+        op1,
+        counts,
+        ty,
+        to,
+    ));
+    ops
+}
+
+/// MINT EXACTLY `N` REUSE EDGES — one `dataflow.receive` each, at the wire's type.
+///
+/// ⛔⛔ `N` IS INFERRED FROM THE HEAD IT FEEDS, which is the whole point. The call site writes
+/// `edges::<2>(..)` and passes the result to a head taking `[Received; 2]`; there is no length to
+/// get wrong independently, because the two are the same `N`. A `Vec` here is what let the compute
+/// unit receive six and consume two.
+fn edges<const N: usize>(
+    vals: &mut Vals,
+    into: &mut Vec<Op>,
+    from: RecvEnd,
+    ty: Vector,
+) -> [Received; N] {
+    core::array::from_fn(|_| {
+        let result = vals.mint();
+        Received::receive(into, result, from, ty)
+    })
+}
+
+/// THE ONE-OPERAND HEAD — the same unit, for an op-func whose `ddl.operation_bind` names one input.
+///
+/// ⭐ A SEPARATE FUNCTION BECAUSE THE ARITY IS A SEPARATE TYPE. `[Received; 1]` and `[Received; 2]`
+/// are different types, so the emission site cannot hand a unary node's single edge to the binary
+/// head or vice versa, and neither head can be reached with the wrong number of edges minted.
+fn compute_unary<const STICK_ALIGNED: bool>(
+    vals: &mut Vals,
+    operands: [Received; 1],
+    counts: Counts,
+    ty: Vector,
+    to: SendEnd,
+) -> Vec<Op> {
+    let [only] = operands;
+    let op1 = only.operand();
+    tail::<STICK_ALIGNED>(vals, Computed::of(op1, ty), op1, counts, ty, to)
+}
+
+/// THE RAGGED TAIL AND THE SEND — shared by every arity, because neither depends on the operand
+/// count.
+///
+/// ⭐ `fallback` IS THE VALUE THE RAGGED LANES KEEP: the first operand, which is the one the mask
+/// selects against for the lanes past `counts.ragged_lanes`.
+fn tail<const STICK_ALIGNED: bool>(
+    vals: &mut Vals,
+    computed: Computed,
+    fallback: Val,
+    counts: Counts,
+    ty: Vector,
+    to: SendEnd,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let lanes = ty.len;
+    let mut produced = computed;
+    let op1 = fallback;
 
     // ⭐ AND ONLY NOW, THE TAIL — if there is one.
     if !STICK_ALIGNED {
