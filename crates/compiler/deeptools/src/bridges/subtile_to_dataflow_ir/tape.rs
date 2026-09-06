@@ -15,10 +15,11 @@ use crate::bridges::subtile_to_dataflow_ir::schedule;
 use crate::bridges::subtile_to_dataflow_ir::transfer::{self, Lanes};
 use crate::islands::dataflow_ir::dialects::agen::CompositeTransfer;
 use crate::islands::dataflow_ir::dialects::dataflow::{Precision, Received};
-use crate::islands::dataflow_ir::dialects::vectorchain::LaneMask;
+use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, LaneMask};
 use crate::islands::dataflow_ir::dialects::{
     Index, Op, Val, affine, agen, arith, dataflow, vectorchain,
 };
+use crate::islands::dataflow_ir::link::{self, Link, SendEnd};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, Vector};
 use crate::islands::dataflow_ir::{
     Grid, GroupId, KernelName, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Run, Units,
@@ -425,10 +426,24 @@ fn node_program<
     let transfers = Units::one(DfirUnit::L3lu, l3lu);
     let loaders = Units::of(DfirUnit::Lxlu, &bound);
     let computers = Units::of(DfirUnit::Sfp, &bound);
+    let storers = Units::of(DfirUnit::Lxsu, &bound);
 
-    // `to`/`from` are the FIRST HOP, so each names the unit at the other end of the wire.
-    let to = computers.as_ref().map_or(lx, Units::first);
-    let from = loaders.as_ref().map_or(lx, Units::first);
+    // ⭐⭐ ONE WIRE, TWO ENDS, SPENT ONCE EACH. The mover's `to` and the compute's `from` used to be
+    // two independent `Units::first` lookups that nothing tied together — and if a schedule named
+    // neither kind, both fell back to `lx` and the program described a wire from a memory to
+    // itself. See [`Link`]: the ends come out of ONE value, so they name one wire by construction.
+    let load_wire: Link<link::Lxlu, link::Sfp> = Link::between(
+        loaders.as_ref().map_or(lx, Units::first),
+        computers.as_ref().map_or(lx, Units::first),
+    );
+    let (to_compute, from_loader) = load_wire.ends();
+
+    // ⭐ AND THE SECOND WIRE: the compute's result to the unit that stores it.
+    let store_wire: Link<link::Sfp, link::Lxsu> = Link::between(
+        computers.as_ref().map_or(lx, Units::first),
+        storers.as_ref().map_or(lx, Units::first),
+    );
+    let (to_storer, from_compute) = store_wire.ends();
 
     // ⭐ THE LOADER'S BODY: its OWN view of each staged operand, then the nest that reads and sends.
     // The view is retaken rather than inherited — `transfers`' handles died at its region's `}`.
@@ -462,7 +477,7 @@ fn node_program<
         &mut vals,
         node,
         counts,
-        |vals| load_and_send(vals, &staged, &views, to, wire_ty),
+        |vals| load_and_send(vals, &staged, &views, to_compute, wire_ty),
     ));
 
     // ⭐ THE COMPUTE'S NEST: the same nest, one `dataflow.receive` per operand, then the compute.
@@ -472,14 +487,64 @@ fn node_program<
             let operands: Vec<Received> = (0..staged.len())
                 .map(|_| {
                     let result = vals.mint();
-                    Received::receive(&mut ops, result, from, wire_ty)
+                    Received::receive(&mut ops, result, from_loader, wire_ty)
                 })
                 .collect();
             ops.extend(compute::<STICK_ALIGNED>(
-                vals, &operands, node, counts, wire_ty,
+                vals, &operands, node, counts, wire_ty, to_storer,
             ));
             ops
         });
+
+    // ⭐⭐ THE STORE UNIT SPENDS THE OTHER END. A compute whose result nothing consumes is never
+    // lowered at all — `BinaryOpLowering` resolves the destination in `fillOpInfo` and fails before
+    // `setReuseInformation` (`VectorChainToSentientPESFP.cpp:332-338`), and the failure resurfaces
+    // as "Dangling non-compute op has no use" naming a RECEIVE. This is `kReceiveAndStore`:
+    // FIFO to memref, which is `dataflow.receive` + `agen.vector_store` on the LX store unit
+    // (`DataTransferLowering.cpp:293, :495`).
+    //
+    // ⛔ AND THE VIEW IS THIS UNIT'S OWN. `node.output`'s placement is retaken here rather than
+    // inherited — a view bound in a sibling region is gone at its `}` (see [`Received`]).
+    let out_rows = u64::from(node.output.rows.0);
+    let out_cols = u64::from(node.output.cols.0);
+    let mut stores = Vec::new();
+    let out_start = vals.mint();
+    stores.push(Op::Arith(arith::Op::Constant {
+        result: out_start,
+        value: i64::try_from(node.output.start().0).expect("an element offset fits an i64"),
+    }));
+    let out_view = vals.mint();
+    stores.push(Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
+        result: out_view,
+        from: lx,
+        start: out_start,
+        layout: AffineMap::linear(&[i64::try_from(out_cols).expect("a width fits an i64"), 1]),
+        ty: MemRef {
+            shape: vec![out_rows, out_cols],
+            elem: ElemType::F16,
+        },
+    }));
+    stores.extend(nest::<IS_DECODE, FITS_LX, NO_CACHE_WALK, CACHE_FITS_LX>(
+        &mut vals,
+        node,
+        counts,
+        |vals| {
+            let mut ops = Vec::new();
+            let arrived = vals.mint();
+            let received = Received::receive(&mut ops, arrived, from_compute, wire_ty);
+            ops.push(Op::Agen(agen::Op::VectorStore {
+                value: received.val(),
+                view: out_view,
+                indices: vec![Index::Const(0), Index::Const(0)],
+                view_ty: MemRef {
+                    shape: vec![out_rows, out_cols],
+                    elem: ElemType::F16,
+                },
+                ty: received.ty(),
+            }));
+            ops
+        },
+    ));
 
     // ⭐ THE SPLIT IS WHERE THE UNIT WALK ENDED. Everything up to `units_end` binds units — that is
     // function scope in IBM's own output, which puts only `dataflow.get_unit` and constants outside
@@ -532,6 +597,12 @@ fn node_program<
                     // op it emits rather than from the node.
                     precision: Some(Precision::Fp16),
                     body: computes,
+                    arch: core::marker::PhantomData,
+                }),
+                storers.map(|on| ProgramUnit {
+                    on,
+                    precision: None,
+                    body: stores,
                     arch: core::marker::PhantomData,
                 }),
             ]
@@ -673,7 +744,7 @@ fn load_and_send(
     vals: &mut Vals,
     staged: &[Staged],
     views: &[Val],
-    to: Val,
+    to: SendEnd,
     ty: Vector,
 ) -> Vec<Op> {
     let mut ops = Vec::with_capacity(staged.len() * 2);
@@ -717,12 +788,20 @@ fn wire(staged: &[Staged], counts: Counts) -> Vector {
 ///
 /// ⛔ NOT "A MASK OF ALL ONES". That is the same ops with a different constant, which is the exact
 /// shape of expressing a constant without exploiting it.
+///
+/// ⛔⛔ AND `to` IS NOT OPTIONAL. A compute whose result nothing consumes is never lowered at all:
+/// `BinaryOpLowering::matchAndRewrite` resolves the destination in `fillOpInfo`
+/// (`VectorChainToSentientPESFP.cpp:332-335`) and fails before `setReuseInformation` (`:338`), so
+/// the operands are never registered and the failure reappears far away as "Dangling non-compute
+/// op has no use" naming a RECEIVE. See [`Computed`]. Taking the destination as a parameter is what
+/// makes "produce a value and place it nowhere" something no call site can express.
 fn compute<const STICK_ALIGNED: bool>(
     vals: &mut Vals,
     operands: &[Received],
     node: &Node,
     counts: Counts,
     ty: Vector,
+    to: SendEnd,
 ) -> Vec<Op> {
     let mut ops = Vec::new();
     let lanes = ty.len;
@@ -746,7 +825,7 @@ fn compute<const STICK_ALIGNED: bool>(
     // ⛔ AND AN ALL-ONES MASK WOULD NOT BE THE FIX. That is the same op with a wider constant — a
     // mask that masks nothing. `$mask` is `Optional` in the dialect, so an unmasked binary omits
     // the operand entirely.
-    let combined = match rest.first() {
+    let mut produced = match rest.first() {
         Some(&op2) => {
             let result = vals.mint();
             ops.push(Op::VectorChain(vectorchain::Op::Binary {
@@ -759,9 +838,9 @@ fn compute<const STICK_ALIGNED: bool>(
                 operand_ty: ty,
                 ty,
             }));
-            result
+            Computed::of(result, ty)
         }
-        None => op1,
+        None => Computed::of(op1, ty),
     };
 
     // ⭐ AND ONLY NOW, THE TAIL — if there is one.
@@ -785,7 +864,7 @@ fn compute<const STICK_ALIGNED: bool>(
             result: selected,
             // ⭐ THE PREDICATE IS THE CONDITION, carrying the type it was bound at.
             cond: prefix.binds(bound),
-            lhs: combined,
+            lhs: produced.val(),
             rhs: op1,
             // ⛔ AND NO MASK. The condition and the mask are SEPARATE operands
             // (`VectorChain.td:401-402`); reusing the predicate as both would be one value doing
@@ -793,7 +872,16 @@ fn compute<const STICK_ALIGNED: bool>(
             mask: None,
             ty,
         }));
+        produced = Computed::of(selected, ty);
     }
+
+    // ⛔⛔ AND IT GOES SOMEWHERE. A `Computed` that is never sent is a compute the backend never
+    // lowers — see [`Computed`]. `to` is the first hop, so it names the unit that stores it.
+    ops.push(Op::Dataflow(dataflow::Op::Send {
+        to,
+        data: produced.val(),
+        ty: produced.ty(),
+    }));
     ops
 }
 
