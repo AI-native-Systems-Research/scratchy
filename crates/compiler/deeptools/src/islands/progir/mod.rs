@@ -26,6 +26,7 @@ pub mod ty;
 use crate::arch::Arch;
 use crate::model::Model;
 use crate::workload::Workload;
+use sys_arch_spec::progir::{MAX_INSTRUCTIONS_PER_UNIT, MAX_REGISTERS_PER_UNIT};
 use sys_arch_spec::regfile::{Component, max_ibuff_entries};
 use crate::islands::sentient::dialects::sentient::RegIndex;
 use ty::{Invalid, OperandValue, RegType};
@@ -240,13 +241,21 @@ impl<A: Arch, M: Model, W: Workload> Program<A, M, W> {
     ///
     /// ⭐ KEPT BECAUSE IT IS THE `std::bitset` WIDTH THE REFERENCE ALLOCATES, which is a real fact about
     /// the array — just not about a unit.
-    pub const WORST_CASE_INSTRUCTIONS: usize = 256;
+    ///
+    /// ⛔⛔ AND IT IS RE-EXPORTED, NOT RESTATED. `sys_arch_spec::progir` holds this number for exactly
+    /// this reason, and its own doc says the bound *"was written out twice, verbatim — 256 and 128 in
+    /// the compiler's island 4 and again in the model's `prog_ir_graph`"*, whose symptom is a compiler
+    /// emitting programs the model silently truncates. Writing `256` here made it a third copy, inside
+    /// the crate that exists to prevent the second.
+    pub const WORST_CASE_INSTRUCTIONS: usize = MAX_INSTRUCTIONS_PER_UNIT;
 
     /// HOW MANY REGISTERS ANY UNIT MAY USE — `kMaxCompRegs` (`progir.h:508-509`).
     ///
     /// ⛔ THE WIDTH OF A `std::bitset<kMaxCompRegs>` IN `RegDefs` (`progir.h:302-304`), so it is a
     /// hard bound on the allocator rather than a suggestion.
-    pub const MAX_REGISTERS: usize = 128;
+    ///
+    /// ⛔ RE-EXPORTED, NOT RESTATED — see [`Self::WORST_CASE_INSTRUCTIONS`].
+    pub const MAX_REGISTERS: usize = MAX_REGISTERS_PER_UNIT;
 
     /// EVERY UNIT WHOSE PROGRAM OVERFLOWS THE INSTRUCTION BUFFER.
     ///
