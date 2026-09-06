@@ -10,7 +10,15 @@
 //! [`crate::bridges`]' job, and keeping the two apart is what stops a lowering decision from being
 //! made inside a data type where no test would find it.
 //!
-//! Only DataflowIR is built. `SenProg` is already ported elsewhere in the tree; the three between
-//! are the remaining rungs.
+//! ⭐⭐ THE LADDER'S RUNGS, MEASURED RATHER THAN NAMED. `dbo/docs/pass_pipeline.md` on the pod is the
+//! authority: `buildDSCToSentientIRPipeline` (D1-D28) reaches [`sentient`], D29-D75 rewrite it in
+//! place, and D76 `SentientToProgIR` reaches [`progir`].
+//!
+//! ⛔ AND `SenProg` IS NOT A RUNG. It is one of three *print formats* of ProgIR, selected inside
+//! `SentientToProgIR.cpp:703-737`'s `if (dumpProgIR.getValue())`; what dip consumes is the ProgIR
+//! structure itself (`GenerateInitPacket.cpp:48`). So the ladder is three islands, not four, and
+//! senprog is an oracle to diff against — see [`progir::print`].
 
 pub mod dataflow_ir;
+pub mod progir;
+pub mod sentient;
