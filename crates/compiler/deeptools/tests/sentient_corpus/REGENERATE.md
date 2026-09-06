@@ -68,3 +68,33 @@ When tiling lands the DataflowIR changes shape — nests appear, transfers becom
 and `Exploit::FITS_LX` begins deciding whether a tiling loop exists — and every golden here becomes
 wrong while still being *comparable*, which is the failure mode that matters. Re-run steps 1-3 and
 replace the whole set; do not merge new pairs into the old ones.
+
+## The end-to-end gate — D29 re-entry, measured
+
+`reentry.py` beside this file is what established that bridge 2 can be verified end to end rather
+than only against a text dump.
+
+For each pair it strips the golden's dump banner to leave a clean module, then runs **both** the
+original DataflowIR and its post-D28 SentientIR through:
+
+```
+dcc_standalone <in>.mlir "-kEmitProgIR=progir-format=senprog dump-progir=true"
+```
+
+and diffs the senprog. Result: **144 byte-identical, 0 differences, 0 re-entry failures.**
+
+⭐ SO THE D1-D28 CONVERSIONS IDLE OVER AN ALREADY-LOWERED MODULE. There is no `-disable` flag for
+any of them — `dbo/docs/pass_pipeline.md` says *"the ones without a flag are the ones nothing below
+them survives"* — but they are pattern-driven, so a module holding only `sentient.*` gives them
+nothing to match. That was plausible and untested; it is now measured.
+
+⛔ THE OUTPUT WAS CHECKED FOR CONTENT, NOT JUST EQUALITY. Two empty outputs are also identical. The
+smallest program emits 1,998 bytes of real instructions — `L3_LDMU`, `LX_LDSTI`, `L3_RETURN` — plus a
+`reg_initial.txt` block per unit.
+
+⛔ IT COVERS 144 OF 417, NOT ALL. The other 273 fail *before* bridge 2 is involved, in D29-D76, all
+with one error: `Register initialization out of boundary` on `lxsu0:LRF0` (165) or `l3lu:LBR2` (108),
+with byte addresses like `0x4020`, `0x10020`, `0x40020`, `0x64f000` written into registers whose
+fields cannot encode them. That is the emitter's address arithmetic, not this bridge's — but it means
+the end-to-end gate is available for a third of the corpus until it is fixed. The SentientIR text
+diff still covers all 417.
