@@ -95,7 +95,22 @@ impl LocalUnit {
 ///
 /// ⛔ THE `Val` IS PRIVATE. A public field would be a way to launder the brand off at any call site
 /// that happened to want a `Val`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ⛔⛔⛔ AND IT IS ONE END OF A REUSE EDGE, SO IT IS SPENT ONCE — NOT `Copy`. The receive is the
+/// PRODUCER and the compute that reads it is the CONSUMER, and that pairing is a fact the backend
+/// checks: `OperandReuse::setReuseInformation` records `data_origins_` entries per USER
+/// (`OperandReuse.cpp:17-38`), so a `dataflow.receive` earns an entry ONLY by being an operand of a
+/// lowered compute, and `VectorChainToSentientPESFP.cpp:1343` then refuses any op that has none.
+///
+/// ⛔⛔ IT WAS `Copy`, AND THE TWO ENDS WERE TWO INDEPENDENT COUNTS. The receives were emitted one
+/// per node operand; the compute was built over `split_first()` and `rest.first()`. On granite that
+/// was SIX received and TWO consumed, and dbo-opt refused the four with "Dangling non-compute op
+/// has no use | no OperandReuse entry: never an operand of a lowered compute". Spending the edge —
+/// [`Received::operand`] takes `self` — makes a received vector nothing consumed a value still held
+/// at the call site, which `#[must_use]` names at the line that made it.
+#[must_use = "a received vector that no compute consumes is a `dataflow.receive` with no \
+              OperandReuse entry — dbo-opt refuses it as a dangling non-compute op"]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Received {
     val: Val,
     ty: Vector,
@@ -112,17 +127,25 @@ impl Received {
         Received { val: result, ty }
     }
 
-    /// The value it binds.
+    /// THE COMPUTE'S OPERAND, ONCE — CONSUMES THE EDGE.
+    ///
+    /// ⛔⛔ AND `#[must_use]` ALONE DOES NOT ENFORCE THAT. Rust has no linear types: a move-only
+    /// value dropped out of a `Vec` triggers neither `must_use` nor any error, so a unit could mint
+    /// six edges, spend two and drop four — measured, and dbo-opt refused it exactly as before.
+    /// LINEARITY COMES FROM THE ARRAY: a `[Received; N]` destructured as `let [a, b] = edges` binds
+    /// EVERY element or does not compile, so "minted and not consumed" is a pattern that cannot be
+    /// written. That is why the edges travel as an array and never as a `Vec`.
     #[must_use]
-    pub const fn val(self) -> Val {
+    pub fn operand(self) -> Val {
         self.val
     }
 
     /// Its type — the wire's width, which the compute's operands are all at.
     #[must_use]
-    pub const fn ty(self) -> Vector {
+    pub const fn ty(&self) -> Vector {
         self.ty
     }
+
 }
 
 /// THE NUMERIC PRECISION OF A UNIT'S PROGRAM — `dataflow.program_unit`'s `precision` attribute.
