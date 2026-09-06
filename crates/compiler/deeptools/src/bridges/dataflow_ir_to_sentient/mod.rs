@@ -30,3 +30,7 @@ pub mod scalar_ops;
 pub mod ldtype;
 /// Unit classification and naming, as the lowering asks it.
 pub mod units;
+/// The shapes the lowering accepts.
+pub mod legality;
+/// Which program units collapse, and how destinations split.
+pub mod grouping;
