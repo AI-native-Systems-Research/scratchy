@@ -27,6 +27,7 @@ use crate::arch::Arch;
 use crate::model::Model;
 use crate::units::DfirUnit;
 use crate::workload::Workload;
+use crate::islands::sentient::dialects::sentient::RegIndex;
 use ty::{Invalid, OperandValue, RegType};
 
 /// ONE REGISTER'S INITIAL CONTENT — one entry of a unit's register state.
@@ -39,8 +40,14 @@ use ty::{Invalid, OperandValue, RegType};
 pub struct RegInit {
     /// Which file.
     pub file: RegType,
-    /// Which register within it — ⛔ bounded by [`Program::MAX_REGISTERS`].
-    pub index: u32,
+    /// Which register within it.
+    ///
+    /// ⛔⛔ BOUNDED BY THE TYPE, NOT BY A COMMENT. `kMaxCompRegs` is the width of the
+    /// `std::bitset<kMaxCompRegs>` that records which registers are defined (`progir.h:302-304`), so
+    /// an index past it cannot even be *recorded* as initialised — it would silently fall outside the
+    /// bitset. [`RegIndex`] is the Sentient rung's type, reused here because it is the same field with
+    /// the same cap, one rung further down.
+    pub index: RegIndex,
     /// What it starts as.
     pub value: OperandValue,
 }
