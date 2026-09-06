@@ -219,6 +219,33 @@ sub-campaign may carry its own narrow `wavefront-config.json`; use one here, and
 if the scheduled unit list at question 13 contains anything from the table above,
 that is a scoping bug to fix before translation starts, not a batch to run.
 
+## 🛑 TWO SETUP-PHASE ADAPTATIONS — decide these before Phase 1, not during it
+
+The playbook's setup phase assumes a C library being migrated into a fresh `rust/`
+tree of crates. This campaign is a subsystem of a C++ compiler being ported into an
+**existing** crate. Placement is called orchestrator judgment in the playbook, so it
+is decided here:
+
+1. ⛔⛔ **NO `-sys` CRATES AND NO BINDGEN. THERE IS NO FFI BOUNDARY.** The playbook
+   says to create a `<lib>-sys` placeholder per target and imported library, with a
+   bindgen pipeline translators populate lazily. That exists so a partly-migrated
+   tree can still call the C for symbols not yet ported. **This campaign has nothing
+   to call.** `deeptools` links no C++ at all — the current path shells out to the
+   `dbo-opt` *binary* as a subprocess, and the object of the ratchet is to stop doing
+   that. An FFI shim here would be a dependency edge back into the thing being
+   removed. Zero `unsafe`, zero `extern "C"`, zero bindgen.
+
+2. ⛔ **THE TARGET IS AN EXISTING CRATE, NOT A NEW `rust/` TREE.** Everything lands in
+   `crates/compiler/deeptools/src/bridges/dataflow_ir_to_sentient/` inside the
+   workspace at the repo root. Do not author a `rust/` subtree, do not create a crate
+   per `link_unit`, and do not add workspace members. `crates.json` should place every
+   ported unit in the one existing crate `deeptools`.
+
+   ⭐ The reason is not tidiness: both ends of this bridge are hand-designed Rust that
+   already exists in that crate (`islands::dataflow_ir` and `islands::sentient`), and
+   the port's whole job is to connect them. A separate crate could not see them without
+   an inversion of the dependency the repo forbids.
+
 ## House rules the translated code must satisfy
 
 These are not style preferences; each is load-bearing and each has cost real
