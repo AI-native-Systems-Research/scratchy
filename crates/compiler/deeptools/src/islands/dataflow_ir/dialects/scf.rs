@@ -34,6 +34,26 @@ pub enum Op {
         /// The `else` region. Empty prints no `else` at all, which is the one-armed branch.
         else_body: Vec<super::Op>,
     },
+
+    /// `scf.yield %operands` — what an `affine.yield` becomes (`AffineToStandard.cpp:48`).
+    Yield {
+        /// The carried values, which are the `affine.yield`'s own.
+        operands: Vec<Val>,
+    },
+
+    /// `scf.parallel` — ⛔ PRESENT BECAUSE ONE REWRITE ASKS ABOUT IT, not because this crate emits it.
+    ///
+    /// ⛔⛔ `AffineYieldOpLowering` DECLINES WHEN ITS PARENT IS THIS OP (`AffineToStandard.cpp:42-46`),
+    /// under the comment *"Terminator is rewritten as part of the 'affine.parallel' lowering
+    /// pattern."* So the parent's kind is an INPUT to that rewrite, and without this variant the
+    /// question cannot be asked and the rewrite would fire where the reference stands back — producing
+    /// two rewrites of one terminator.
+    Parallel {
+        /// The induction variables, one per parallel dimension.
+        ivs: Vec<Val>,
+        /// The body.
+        body: Vec<super::Op>,
+    },
 }
 
 /// ONE `scf` OP AS TEXT. The caller has already indented the opening line.
@@ -59,6 +79,21 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::indent(out, depth);
                 out.push_str("}\n");
             }
+        }
+        Op::Yield { operands } => {
+            if operands.is_empty() {
+                out.push_str("scf.yield\n");
+            } else {
+                let _ = writeln!(out, "scf.yield {}", print::vals(operands));
+            }
+        }
+        Op::Parallel { ivs, body } => {
+            let _ = writeln!(out, "scf.parallel ({}) {{", print::vals(ivs));
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            out.push_str("}\n");
         }
     }
 }
