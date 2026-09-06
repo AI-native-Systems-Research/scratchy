@@ -32,6 +32,23 @@
 //! regenerate with `tests/sentient_corpus/REGENERATE.md`. Only 18 are committed because 417 is 6.3 MB.
 //! A green run here is evidence over six program shapes, not over the corpus.
 //!
+//! # 🛑 THE CORPUS IS PRE-TILING, AND THAT IS ITS LARGEST BLIND SPOT
+//!
+//! ⛔⛔ THE EMITTER DOES NOT TILE YET. Across all 417 programs there are **45** `affine.for`; in the
+//! 18 committed there are **9**, all of them inside the three `batchmatmul` programs. Every `mul`,
+//! `matmul`, `add`, `rsqrt` and `mean` in the corpus is **loop-free** — a matmul with no tiling loop is
+//! one whole-tensor operation.
+//!
+//! ⛔⛔ SO THIS CORPUS CANNOT EXERCISE THE LOOP MACHINERY, WHICH IS A LARGE PART OF THE SPAN:
+//! `TransformLoopToLegalizeForSentientLowering` (D7, the pass that fully unrolls), `MutableAddrSplitting`
+//! (D11, 1,358 lines, matches `affine.for`), `LoopUnrollForShuffleOp` (D14), and every loop-bound and
+//! address-stride path inside `AgenToSentient`. A green run here says nothing about any of them.
+//!
+//! ⭐ AND TILING IS THE NEXT THING THE EMITTER GAINS, so these goldens go stale by design: loop nests
+//! appear, transfers become chunked and strided, and `Exploit::FITS_LX` starts deciding whether a
+//! tiling loop exists at all. **Regenerate the corpus when tiling lands** — `REGENERATE.md` is written
+//! for exactly that, and a stale golden that still passes is worse than no golden.
+//!
 //! ⛔⛔ AND IT IS ONE MODEL. `granite-3.1-2b-instruct` at one quant preset. `Model` is a const-generic
 //! trait precisely because there are 164 configs across 25 architectures, and a lowering that matches
 //! here can still be wrong for a different head dim or a decode rung. Widen the corpus before trusting

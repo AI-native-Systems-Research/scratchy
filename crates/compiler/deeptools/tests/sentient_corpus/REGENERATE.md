@@ -52,3 +52,19 @@ test in `tests/the_bridge_matches_the_reference.rs` exists because of it.
   (`stable-2026_07_24-142907-715-ga0d29abbed`).
 * Emitter: this worktree, `granite-3.1-2b-instruct` + `quant/fp8-dynamic-per-channel`.
 * One model at one preset — see the header of the test file for why that is not coverage.
+
+## ⛔ REGENERATE WHEN TILING LANDS — the committed set is a pre-tiling snapshot
+
+The emitter did not tile when these were captured. Across all 417 programs: **45** `affine.for`; in
+the 18 committed: **9**, all inside the three `batchmatmul` programs. Every `mul`, `matmul`, `add`,
+`rsqrt` and `mean` here has **no loop at all**.
+
+So the corpus exercises transfers, computes, sends, receives and program units in volume, and the loop
+machinery **not at all** — `TransformLoopToLegalizeForSentientLowering` (D7), `MutableAddrSplitting`
+(D11, 1,358 lines), `LoopUnrollForShuffleOp` (D14), and the loop-bound and stride paths of
+`AgenToSentient`.
+
+When tiling lands the DataflowIR changes shape — nests appear, transfers become chunked and strided,
+and `Exploit::FITS_LX` begins deciding whether a tiling loop exists — and every golden here becomes
+wrong while still being *comparable*, which is the failure mode that matters. Re-run steps 1-3 and
+replace the whole set; do not merge new pairs into the old ones.
