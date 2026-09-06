@@ -34,3 +34,5 @@ pub mod units;
 pub mod legality;
 /// Which program units collapse, and how destinations split.
 pub mod grouping;
+/// The two addresses a transfer carries, its increment, and the store-side arrangement.
+pub mod transfers;
