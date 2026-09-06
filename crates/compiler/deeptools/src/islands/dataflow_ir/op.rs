@@ -79,6 +79,60 @@ impl LocalUnit {
     }
 }
 
+/// A VALUE THAT ARRIVED ON THE WIRE — what a `dataflow.receive` binds.
+///
+/// # 🛑 A VALUE DEFINED INSIDE A PROGRAM UNIT DOES NOT LEAVE IT
+///
+/// ⛔⛔ MLIR's parser pushes a fresh DEFINITIONS scope for EVERY region, isolated or not:
+/// `parseRegionBody` calls `pushSSANameScope(isIsolatedNameScope)` and that always runs
+/// `isolatedNameScopes.back().pushSSANameScope()` (`Parser.cpp:2273-2276`, `:944-951`).
+/// `IsolatedFromAbove` decides only whether the region can still SEE outward — it never makes the
+/// region's own definitions escape. So a view a `dataflow.program_unit` takes is gone at its `}`,
+/// and IBM's `lxlu` unit takes the LX view AGAIN rather than reuse the `l3lu`'s
+/// (`/tmp/ktir_ref/export/debug/dfir.mlir:73-74` vs `:112-116`).
+///
+/// ⛔ THE EMITTER HANDED THE MOVER'S VIEWS STRAIGHT TO THE COMPUTE, and dbo-opt refused it twice
+/// wearing two faces. First as *"use of undeclared SSA value name"* on `agen.vector_load %9`. Then,
+/// once the leaked forward reference survived to the next program, as *"definition of SSA value
+/// '%24#0' has type 'memref<2048x2048xf16>'"* — `Parser.cpp:1005-1011`, which fires only when the
+/// name was already a forward-reference placeholder, here typed `memref<255x512xf16>` from the
+/// PREVIOUS program's compute. One defect, two messages.
+///
+/// ⭐⭐ SO THE COMPUTE'S OPERANDS ARE WIRES, NOT VIEWS. Only [`Op::Receive`] mints one of these, so
+/// a `Val` naming a view cannot reach a compute: the mover loads and sends, the compute receives.
+///
+/// ⛔ THE `Val` IS PRIVATE. A public field would be a way to launder the brand off at any call site
+/// that happened to want a `Val`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received {
+    val: Val,
+    ty: Vector,
+}
+
+impl Received {
+    /// EMIT THE `dataflow.receive`, AND BIND WHAT IT CARRIES.
+    ///
+    /// ⛔ THE ONLY CONSTRUCTOR, and it PUSHES the op rather than taking one to inspect. A
+    /// `Received` therefore cannot exist without the receive that produces it, and the two cannot
+    /// disagree about the value or its type. Nothing here can fail, so there is no arm to refuse in.
+    pub fn receive(into: &mut Vec<Op>, result: Val, from: Val, ty: Vector) -> Received {
+        into.push(Op::Receive { result, from, ty });
+        Received { val: result, ty }
+    }
+
+    /// The value it binds.
+    #[must_use]
+    pub const fn val(self) -> Val {
+        self.val
+    }
+
+    /// Its type — the wire's width, which the compute's operands are all at.
+    #[must_use]
+    pub const fn ty(self) -> Vector {
+        self.ty
+    }
+}
+
 /// THE NUMERIC PRECISION OF A UNIT'S PROGRAM — `dataflow.program_unit`'s `precision` attribute.
 ///
 /// ⛔ IT SELECTS THE MAC OPCODE. "This precision attribute is used to identify the MAC op code used
@@ -757,6 +811,8 @@ pub enum Op {
     },
 
     /// `dataflow.receive %from : vector<..>`.
+    ///
+    /// ⭐ IT BINDS A [`Received`], WHICH IS THE POINT. See there.
     Receive {
         /// The vector it binds.
         result: Val,

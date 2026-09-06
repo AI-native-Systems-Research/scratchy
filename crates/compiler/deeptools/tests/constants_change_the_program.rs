@@ -155,6 +155,44 @@ const IS_MASK: fn(&Op) -> bool = |op| matches!(op, Op::CreateAffineMask { .. });
 const IS_SELECT: fn(&Op) -> bool = |op| matches!(op, Op::ElementWiseSelection { .. });
 const IS_TRANSFER: fn(&Op) -> bool = |op| matches!(op, Op::CompositeLoadAndStore(_));
 const IS_SYNC: fn(&Op) -> bool = |op| matches!(op, Op::SyncRecv { .. });
+const IS_SEND: fn(&Op) -> bool = |op| matches!(op, Op::Send { .. });
+const IS_RECEIVE: fn(&Op) -> bool = |op| matches!(op, Op::Receive { .. });
+const IS_LOAD: fn(&Op) -> bool = |op| matches!(op, Op::AgenVectorLoad { .. });
+
+/// ⭐⭐ EVERY OPERAND CROSSES THE WIRE, AND THE TWO ENDS AGREE ON HOW MANY.
+///
+/// ⛔⛔ THIS IS THE TEST THE TYPE CANNOT BE. `Received` stops the compute reading the MOVER's views,
+/// which is what dbo-opt refused — but it is equally satisfied by a mover that sends into the void
+/// and a compute that receives nothing and computes on an empty operand list. Only counting catches
+/// that, and only counting AGAINST THE NODE'S OWN ARITY: "sends == receives" passes at zero.
+///
+/// ⛔ AND THE LOADS MOVED, THEY DID NOT MULTIPLY. One `agen.vector_load` per operand, in the mover;
+/// a compute that still loaded would show more loads than sends.
+#[test]
+fn every_operand_reaches_the_compute_on_a_wire() {
+    let tape = tape_of(OpFunc::Add);
+    let run = tape::compile::<Dd2, Aligned, Decode>(&tape, GroupId(0)).expect("lowers");
+
+    // Two nodes, two inputs each: four operands, so four of each.
+    let operands: usize = tape.iter().map(|node| node.inputs.len()).sum();
+    assert_eq!(operands, 4, "the fixture tape has two nodes of two inputs");
+
+    assert_eq!(
+        count(&run, IS_SEND),
+        operands,
+        "the mover puts every one of the {operands} operands on the wire"
+    );
+    assert_eq!(
+        count(&run, IS_RECEIVE),
+        operands,
+        "and the compute takes every one of them off it"
+    );
+    assert_eq!(
+        count(&run, IS_LOAD),
+        operands,
+        "one load per operand, in the mover — a compute that still loaded would show more"
+    );
+}
 
 /// ⭐ EVERY NODE OF THE TAPE BECOMES A PROGRAM. The tape is the deliverable; a lowering that
 /// emitted fewer programs than the tape has nodes has silently skipped work.
@@ -187,9 +225,17 @@ fn is_decode_removes_the_row_nest() {
     let at_decode = count(&decode, IS_FOR);
     let at_prefill = count(&prefill, IS_FOR);
 
-    // ⛔ CARRY THE VALUE. Two nodes, one row loop each at prefill, none at decode.
+    // ⛔ CARRY THE VALUE. Two nodes, one row loop each PER UNIT at prefill, none at decode.
+    //
+    // ⭐⭐ TWICE TWO, AND THE FACTOR IS THE UNIT COUNT. The mover and the compute walk ONE iteration
+    // space from opposite ends — the mover loads and sends inside its nest, the compute receives and
+    // computes inside its own — so a node with a row loop has one in each. A count of 2 here would
+    // mean one of the two units was walking a different space from the other.
     assert_eq!(at_decode, 0, "a decode rung must emit NO row loop at all");
-    assert_eq!(at_prefill, 2, "a prefill rung emits one row loop per node");
+    assert_eq!(
+        at_prefill, 4,
+        "a prefill rung emits one row loop per node per unit: 2 nodes x 2 units"
+    );
 }
 
 /// ⭐ STICK_ALIGNED REMOVES THE MASK AND EVERYTHING THAT CONSUMES IT.
@@ -226,7 +272,8 @@ fn the_sk_bucket_changes_the_cache_walk() {
     let wide = tape::compile::<Dd2, Aligned, WideCache>(&tape, GroupId(0)).expect("lowers");
 
     // ⛔ CARRY THE VALUE. active_cap=64 is exactly one stick of 64, so KV_VECTORS is 1 and there is
-    // nothing to step over: no walk at all. active_cap=8192 is 128 sticks, so each node gets one.
+    // nothing to step over: no walk at all. active_cap=8192 is 128 sticks, so each node gets one —
+    // in EACH of its two units, which walk the same space from opposite ends.
     assert_eq!(
         count(&narrow, IS_FOR),
         0,
@@ -234,8 +281,8 @@ fn the_sk_bucket_changes_the_cache_walk() {
     );
     assert_eq!(
         count(&wide, IS_FOR),
-        2,
-        "a 128-vector span emits one walk per attention node"
+        4,
+        "a 128-vector span emits one walk per attention node per unit: 2 nodes x 2 units"
     );
 
     // And the wide rung's cache does not fit the scratchpad, so each step waits for its own slice.
@@ -246,8 +293,8 @@ fn the_sk_bucket_changes_the_cache_walk() {
     );
     assert_eq!(
         count(&wide, IS_SYNC),
-        2,
-        "a streamed cache waits once per node's walk"
+        4,
+        "a streamed cache waits once per node's walk, in each unit that walks it"
     );
 }
 
@@ -264,12 +311,13 @@ fn a_rung_that_sweeps_nothing_emits_no_walk() {
     let tape = tape_of(OpFunc::Batchmatmul);
     let none = tape::compile::<Dd2, Aligned, NoSweep>(&tape, GroupId(0)).expect("lowers");
 
-    // ⛔ CARRY THE VALUE. 96 rows is a prefill rung, so the ROW nest is present — one per node —
-    // and the cache walk is absent. Counting only "fewer loops" would pass on losing the wrong one.
+    // ⛔ CARRY THE VALUE. 96 rows is a prefill rung, so the ROW nest is present — one per node, in
+    // each of its two units — and the cache walk is absent. Counting only "fewer loops" would pass
+    // on losing the wrong one.
     assert_eq!(
         count(&none, IS_FOR),
-        2,
-        "the row nest survives at 96 rows; only the cache walk goes"
+        4,
+        "the row nest survives at 96 rows in both units; only the cache walk goes"
     );
     assert_eq!(
         count(&none, IS_SYNC),

@@ -1541,6 +1541,37 @@ impl Program {
         })
     }
 
+    /// HOW MANY INPUTS THIS OP-FUNC'S SCHEDULE NAMES.
+    ///
+    /// # 🛑 THE ARITY IS DECLARED, NOT ASSUMED
+    ///
+    /// ⛔⛔ `lower_subtile_tape_to_dataflow_ir.rs:311-319` chose an `OpFunc` from the `SubOp` and
+    /// then copied EVERY SubtileNode input through unchanged, and `op_func_of` maps nine different
+    /// `SubOp`s onto `OpFunc::Mul` — `RopeRotate` and `RopeAppend` among them (`:132-145`). So a
+    /// rope arrived at the emitter wearing a multiply's label and carrying rope's six operands. The
+    /// emitter combined the first two and dropped four, and dbo-opt refused the four as
+    /// *"Dangling non-compute op has no use"* (`VectorChainToSentientPESFP.cpp:1343-1344`) — a
+    /// chain whose end nothing absorbs.
+    ///
+    /// ⭐⭐ AND THE TEMPLATE ALREADY SAID SO. Each vendored bind states `Role::Input(i)` per tensor,
+    /// and scratchy fills its own operands IN THAT ORDER (see [`Role`]). The count was sitting in
+    /// the schedule the whole time; nothing compared it to the node's.
+    ///
+    /// ⛔ THE HIGHEST INDEX PLUS ONE, NOT THE COUNT OF ROLES. `role_of` resolves aliases, so one
+    /// input position can be reachable under several names; counting names would over-count a
+    /// matmul's kernel, which `ddl.alias_one_tensor_of` lists once per dtype (`bmm.ddl:106`).
+    #[must_use]
+    pub fn input_arity(&self) -> u16 {
+        self.roles
+            .iter()
+            .filter_map(|(_, role)| match role {
+                Role::Input(index) => Some(index + 1),
+                Role::Output(_) | Role::Internal(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// WHETHER A NAME BINDS A DATASTAGE rather than a tensor or an axis.
     ///
     /// ⭐ A `ddl.loop` LISTS ITS TWO DATASTAGES FIRST AND ITS AXES AFTER (`bmm.ddl:163`), and this
