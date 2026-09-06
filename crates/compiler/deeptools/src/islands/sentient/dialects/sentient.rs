@@ -1246,6 +1246,70 @@ impl SyncMode {
     }
 }
 
+/// A UNIT THAT MAY BE NAMED IN A SYNC — the bridge between the wire's [`UnitKind`] vocabulary and
+/// this dialect's [`Consumer`] one.
+///
+/// ⭐⭐ TOTAL BY CONSTRUCTION, WHICH IS WHY IT IS A TRAIT AND NOT A FUNCTION. `DfirUnit` has members
+/// with no `Consumer` counterpart at all (`hbm`, `lx`, the state files, the SFP ring), so a
+/// `DfirUnit -> Consumer` function would have to return an `Option` — a refusal. `UnitKind` is sealed
+/// to the four kinds that terminate a wire (`L3lu`, `Lxlu`, `Sfp`, `Lxsu`), and every one of those has
+/// a `Consumer`, so stating the mapping per type makes it total with nothing to refuse.
+pub trait SyncPeer: crate::islands::dataflow_ir::link::UnitKind {
+    /// How this unit is named in a `sentient.sync`'s `units` attribute.
+    const CONSUMER: Consumer;
+}
+
+impl SyncPeer for crate::islands::dataflow_ir::link::L3lu {
+    const CONSUMER: Consumer = Consumer::L3lu;
+}
+impl SyncPeer for crate::islands::dataflow_ir::link::Lxlu {
+    const CONSUMER: Consumer = Consumer::Lxlu;
+}
+impl SyncPeer for crate::islands::dataflow_ir::link::Sfp {
+    const CONSUMER: Consumer = Consumer::Sfp;
+}
+impl SyncPeer for crate::islands::dataflow_ir::link::Lxsu {
+    const CONSUMER: Consumer = Consumer::Lxsu;
+}
+
+/// ONE SIDE OF A SYNC RENDEZVOUS — the peer this unit signals and waits on.
+///
+/// # 🛑 BOTH SIDES, OR NEITHER
+///
+/// ⛔⛔ THE INNER `Consumer` IS PRIVATE AND ONLY [`rendezvous`] MINTS ONE, so a `sentient.sync` cannot
+/// be written naming a peer that is not the other half of a real rendezvous. This is the same
+/// discipline as the wire's [`SendEnd`]/[`RecvEnd`], applied to the sync — and it is needed here for the
+/// same reason: `dataflow.sync_recv` is BLOCKING (*"it does not return until the matching signal has
+/// been received"*, `Dataflow.td:209-212`), so a half whose peer never signals back is a unit that
+/// waits forever.
+///
+/// ⛔ AND A SYNC OP HAS **NO OPERANDS** — its peers are an attribute (`SentientOps.td:876`) — which is
+/// why this could not be locked down until the island held per-unit programs. With a flat `Vec<Op>`
+/// there was no second program to put the other half in.
+///
+/// ⛔ THE ORDER WAS ALSO WRONG ONCE, AND IT WROTE ZEROS: both store-side syncs came out inverted
+/// against dxp's on an otherwise byte-matching op. A pairing minted from one value cannot invert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncHalf(Consumer);
+
+impl SyncHalf {
+    /// The peer this side names.
+    #[must_use]
+    pub const fn peer(self) -> Consumer {
+        self.0
+    }
+}
+
+/// THE TWO SIDES OF ONE SYNC, ONCE.
+///
+/// ⛔ RETURNS BOTH OR NEITHER: `A`'s half names `B` and `B`'s half names `A`, from one call, so
+/// getting them backwards is not expressible — the halves are typed by whose side they are only in
+/// the sense that each carries the OTHER's consumer, which is what the op must state.
+#[must_use]
+pub fn rendezvous<A: SyncPeer, B: SyncPeer>() -> (SyncHalf, SyncHalf) {
+    (SyncHalf(B::CONSUMER), SyncHalf(A::CONSUMER))
+}
+
 /// WHICH UNIT CONSUMES A LOAD, OR PARTICIPATES IN A SYNC — `SentientConsumerAttr`
 /// (`SentientTypes.td:556-596`), whose C++ name is `SentientLoadConsumer`.
 ///
@@ -1423,6 +1487,58 @@ pub struct WslLen(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawPrecision(pub u32);
 
+/// WHERE ONE SCALAR LIVES — `regLocale` PLUS `regIndex`.
+///
+/// ⭐⭐ THE `.td` DECLARES THEM AS A PAIR, on every op that has them (`scalar_add`, `scalar_sub`,
+/// `scalar_copy`, `load_and_send`, `receive_and_store`, `load_compute_and_send`,
+/// `receive_and_extract_scalar`), and as PARALLEL ARRAYS on the ops that have several
+/// (`SentientRegTypeArrayAttr:$regLocales` beside `I32ArrayAttr:$regIndices`). Carrying them together
+/// is what the declaration says they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reg {
+    /// `regLocale`.
+    pub locale: RegType,
+    /// `regIndex` — ⛔ `None` is the `.td`'s `-1`, unassigned. An ABSENCE, not a refusal.
+    pub index: Option<RegIndex>,
+}
+
+/// ONE VALUE A LOOP CARRIES — its initial value, the value it yields, and where it lives.
+///
+/// # 🛑 FIVE PARALLEL VECTORS WERE FIVE FACTS TRUSTED TO LINE UP
+///
+/// ⛔⛔ `Op::For` HELD `init_args`, `results`, `reg_locales`, `reg_indices` AND `program_header` AS
+/// FIVE INDEPENDENT `Vec`s. Each is one entry per carried value, and nothing said they were the same
+/// length — a loop carrying two values with three locales and one index was constructible, and the
+/// printed `regLocales`/`regIndices` arrays would then disagree with the iter-operand list about how
+/// many values the loop even has.
+///
+/// ⭐ THIS IS THE PRODUCER-CONSUMER LOCKDOWN GENERALISED. `link.rs`'s point is that *a pairing is not
+/// two facts that agree*; a carried value is five facts that agree, and the fix is the same one — make
+/// it a single value, so there is nothing to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carried {
+    /// One of `$initArgs` — what enters the loop.
+    pub init: Val,
+    /// The matching result — what leaves it.
+    pub result: Val,
+    /// Where it lives, from `$regLocales` and `$regIndices` at this position.
+    pub reg: Reg,
+    /// This position's `$programHeader` flag.
+    pub program_header: bool,
+}
+
+/// ONE VALUE A `sentient.if` REGION YIELDS.
+///
+/// ⛔ THE SAME DEFECT AS [`Carried`], one field smaller: an `if` has results and register arrays but
+/// no initial values, and those three were three parallel `Vec`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Yielded {
+    /// The value the region yields.
+    pub result: Val,
+    /// Where it lives.
+    pub reg: Reg,
+}
+
 /// ONE COMPUTE OPERAND'S WHOLE DESCRIPTION — the six attributes that repeat per operand.
 ///
 /// ⭐⭐ A STRUCT BECAUSE THE `.td` REPEATS IT VERBATIM, NOT BECAUSE IT READS TIDIER. `vector_mac`
@@ -1546,16 +1662,9 @@ pub enum Op {
     For {
         /// `$bound` — the trip count.
         bound: Val,
-        /// `$initArgs` — the values carried into the loop.
-        init_args: Vec<Val>,
-        /// The values the loop yields.
-        results: Vec<Val>,
-        /// `$regLocales` — one per carried value.
-        reg_locales: Vec<RegType>,
-        /// `$regIndices` — one per carried value; ⛔ `None` is the `.td`'s `-1`.
-        reg_indices: Vec<Option<RegIndex>>,
-        /// `$programHeader` — one flag per carried value.
-        program_header: Vec<bool>,
+        /// THE VALUES THE LOOP CARRIES — ⛔ ONE ENTRY EACH, so the iter-operand list and the register
+        /// arrays cannot disagree about how many there are. See [`Carried`].
+        carried: Vec<Carried>,
         /// `$dbgName`.
         dbg_name: Option<String>,
         /// The body.
@@ -1575,12 +1684,8 @@ pub enum Op {
         lhs: Val,
         /// `$rhs`.
         rhs: Val,
-        /// The values the region yields.
-        results: Vec<Val>,
-        /// `$regLocales`.
-        reg_locales: Vec<RegType>,
-        /// `$regIndices`.
-        reg_indices: Vec<Option<RegIndex>>,
+        /// THE VALUES THE REGION YIELDS — ⛔ ONE ENTRY EACH. See [`Yielded`].
+        yielded: Vec<Yielded>,
         /// `$dbgName`.
         dbg_name: Option<String>,
         /// The `then` body — ⛔ the union type; see [`Op::For`]'s body.
@@ -1743,10 +1848,8 @@ pub enum Op {
         dir: Option<RoutingDirection>,
         /// `$shuffle_mode`.
         shuffle_mode: ShuffleMode,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex` — ⛔ `None` is `-1`, unassigned.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1784,10 +1887,8 @@ pub enum Op {
         permute: bool,
         /// `$shuffle_mode` — ⛔ DOUBLY OPTIONAL in the `.td`.
         shuffle_mode: Option<ShuffleMode>,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex`.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1825,10 +1926,12 @@ pub enum Op {
         rotate_val: Option<u32>,
         /// `$shuffle_mode`.
         shuffle_mode: ShuffleMode,
-        /// `$regLocales`.
-        reg_locales: Vec<RegType>,
-        /// `$regIndices`.
-        reg_indices: Vec<Option<RegIndex>>,
+        /// The SOURCE end's register — ⛔ TWO NAMED FIELDS, NOT TWO PARALLEL ARRAYS. This op has
+        /// exactly two ends, so a `Vec` of locales beside a `Vec` of indices admitted a length
+        /// mismatch and admitted no way to say which entry was the source's.
+        src_reg: Reg,
+        /// The DESTINATION end's register.
+        dst_reg: Reg,
         /// `$dir`.
         dir: Option<RoutingDirection>,
         /// `$dbgName`.
@@ -1868,10 +1971,8 @@ pub enum Op {
         dir: Option<RoutingDirection>,
         /// `$shuffle_mode`.
         shuffle_mode: ShuffleMode,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex`.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1895,10 +1996,10 @@ pub enum Op {
         total_elements: Elements,
         /// `$element_size` — ⛔ A WIDTH IN BYTES.
         element_size: Bytes,
-        /// `$regLocales`.
-        reg_locales: Vec<RegType>,
-        /// `$regIndices`.
-        reg_indices: Vec<Option<RegIndex>>,
+        /// The register the ADDRESS lands in — ⛔ named, not an array position.
+        addr_reg: Reg,
+        /// The register the DATUM lands in.
+        data_reg: Reg,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1912,10 +2013,8 @@ pub enum Op {
         position: Val,
         /// The value it binds.
         result: Val,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex`.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1929,10 +2028,8 @@ pub enum Op {
         rhs: Val,
         /// `$out`.
         result: Val,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex`.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
     },
 
     /// `sentient.scalar_sub` (`SentientOps.td:801`).
@@ -1943,10 +2040,8 @@ pub enum Op {
         rhs: Val,
         /// `$out`.
         result: Val,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex`.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
     },
 
     /// `sentient.scalar_mul` (`SentientOps.td:816`).
@@ -1971,10 +2066,8 @@ pub enum Op {
         input: Val,
         /// `$out`.
         result: Val,
-        /// `$regLocale`.
-        reg_locale: RegType,
-        /// `$regIndex`.
-        reg_index: Option<RegIndex>,
+        /// Where the scalar lives.
+        reg: Reg,
         /// `$programHeader`.
         program_header: bool,
     },
@@ -2006,8 +2099,9 @@ pub enum Op {
     Sync {
         /// `$mode`.
         mode: SyncMode,
-        /// `$units`.
-        units: Vec<Consumer>,
+        /// `$units` — ⛔ HALVES OF RENDEZVOUS, NOT BARE CONSUMERS. See [`SyncHalf`]: a peer can only
+        /// be named here if the matching half exists, so a signal with nobody waiting is unwritable.
+        peers: Vec<SyncHalf>,
         /// `$soft`.
         soft: bool,
         /// `$implicit_sync_memory_boundary` — ⛔ `None` is the `.td`'s `-1`.
@@ -2170,36 +2264,44 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         // the region (`SentientOps.cpp:998-1010`).
         Op::For {
             bound,
-            init_args,
-            results,
-            reg_locales,
-            reg_indices,
-            program_header,
+            carried,
             dbg_name,
             body,
         } => {
-            let carried = if init_args.is_empty() {
+            // ⭐ ONE WALK OVER `carried` PRODUCES ALL FOUR RENDERINGS, so the iter-operand list, the
+            // result list and the two register arrays are the same length by construction.
+            let iter_types = if carried.is_empty() {
                 String::new()
             } else {
-                let tys: Vec<&str> = init_args.iter().map(|_| "index").collect();
+                let tys: Vec<&str> = carried.iter().map(|_| "index").collect();
                 format!(" -> ({})", tys.join(", "))
             };
+            let results: Vec<Val> = carried.iter().map(|c| c.result).collect();
             let mut attrs = vec![
-                attr("regLocales", &locale_array(reg_locales)),
-                attr("regIndices", &index_array(reg_indices)),
+                attr("regLocales", &locale_array(carried.iter().map(|c| c.reg))),
+                attr("regIndices", &index_array(carried.iter().map(|c| c.reg))),
             ];
-            if program_header.iter().any(|flag| *flag) {
-                attrs.push(attr("programHeader", &bool_array(program_header)));
+            if carried.iter().any(|c| c.program_header) {
+                attrs.push(attr(
+                    "programHeader",
+                    &bool_array(carried.iter().map(|c| c.program_header)),
+                ));
             }
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
             }
             attrs.sort();
             let bound_val = print::val(*bound);
+            let inits = if carried.is_empty() {
+                String::new()
+            } else {
+                let args: Vec<Val> = carried.iter().map(|c| c.init).collect();
+                format!(" ({})", print::vals(&args))
+            };
             let _ = writeln!(
                 out,
-                "{} = sentient.for {bound_val}{carried} {} {{",
-                print::vals(results),
+                "{} = sentient.for {bound_val}{inits}{iter_types} {} {{",
+                print::vals(&results),
                 dict(&attrs)
             );
             for inner in body {
@@ -2214,22 +2316,20 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             predicate,
             lhs,
             rhs,
-            results,
-            reg_locales,
-            reg_indices,
+            yielded,
             dbg_name,
             then_body,
             else_body,
         } => {
-            let produced = if results.is_empty() {
+            let produced = if yielded.is_empty() {
                 String::new()
             } else {
-                let tys: Vec<&str> = results.iter().map(|_| "index").collect();
+                let tys: Vec<&str> = yielded.iter().map(|_| "index").collect();
                 format!(" -> ({})", tys.join(", "))
             };
             let mut attrs = vec![
-                attr("regLocales", &locale_array(reg_locales)),
-                attr("regIndices", &index_array(reg_indices)),
+                attr("regLocales", &locale_array(yielded.iter().map(|y| y.reg))),
+                attr("regIndices", &index_array(yielded.iter().map(|y| y.reg))),
             ];
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
@@ -2450,13 +2550,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             rotate_val,
             dir,
             shuffle_mode,
-            reg_locale,
-            reg_index,
+            reg,
             dbg_name,
         } => {
             let mut attrs = extent_attrs(extent);
             attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
-            attrs.push(attr("reg_locale", &quoted(reg_locale.spelling())));
+            attrs.push(attr("reg_locale", &quoted(reg.locale.spelling())));
             if *interleaved_group != 0 {
                 attrs.push(attr(
                     "interleaved_group",
@@ -2469,7 +2568,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             if let Some(direction) = dir {
                 attrs.push(attr("dir", &quoted(direction.spelling())));
             }
-            if let Some(index) = reg_index {
+            if let Some(index) = reg.index {
                 attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
             }
             if let Some(name) = dbg_name {
@@ -2505,12 +2604,11 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             stride,
             permute,
             shuffle_mode,
-            reg_locale,
-            reg_index,
+            reg,
             dbg_name,
         } => {
             let mut attrs = extent_attrs(extent);
-            attrs.push(attr("reg_locale", &quoted(reg_locale.spelling())));
+            attrs.push(attr("reg_locale", &quoted(reg.locale.spelling())));
             if let Some(mode) = shuffle_mode {
                 attrs.push(attr("shuffle_mode", &quoted(mode.spelling())));
             }
@@ -2532,7 +2630,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             if *stride != 1 {
                 attrs.push(attr("stride", &format!("{stride} : i32")));
             }
-            if let Some(index) = reg_index {
+            if let Some(index) = reg.index {
                 attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
             }
             if let Some(name) = dbg_name {
@@ -2582,15 +2680,18 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             stride,
             rotate_val,
             shuffle_mode,
-            reg_locales,
-            reg_indices,
+            src_reg,
+            dst_reg,
             dir,
             dbg_name,
         } => {
             let mut attrs = extent_attrs(extent);
             attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
-            attrs.push(attr("regLocales", &locale_array(reg_locales)));
-            attrs.push(attr("regIndices", &index_array(reg_indices)));
+            // ⭐ THE ARRAY IS BUILT FROM THE TWO NAMED ENDS, SOURCE FIRST, so its length is two by
+            // construction and the order is stated rather than remembered.
+            let ends = [*src_reg, *dst_reg];
+            attrs.push(attr("regLocales", &locale_array(ends.into_iter())));
+            attrs.push(attr("regIndices", &index_array(ends.into_iter())));
             if *stride != 1 {
                 attrs.push(attr("stride", &format!("{stride} : i32")));
             }
@@ -2646,8 +2747,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             dst_element_size,
             dir,
             shuffle_mode,
-            reg_locale,
-            reg_index,
+            reg,
             dbg_name,
         } => {
             // ⛔ SOURCE AND DESTINATION EXTENTS ARE SEPARATE, because the compute in the middle may
@@ -2664,12 +2764,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 attr("src_element_size", &format!("{} : i32", src_element_size.0)),
                 attr("dst_element_size", &format!("{} : i32", dst_element_size.0)),
                 attr("shuffle_mode", &quoted(shuffle_mode.spelling())),
-                attr("reg_locale", &quoted(reg_locale.spelling())),
+                attr("reg_locale", &quoted(reg.locale.spelling())),
             ];
             if let Some(direction) = dir {
                 attrs.push(attr("dir", &quoted(direction.spelling())));
             }
-            if let Some(index) = reg_index {
+            if let Some(index) = reg.index {
                 attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
             }
             if let Some(name) = dbg_name {
@@ -2699,15 +2799,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             data_result,
             total_elements,
             element_size,
-            reg_locales,
-            reg_indices,
+            addr_reg,
+            data_reg,
             dbg_name,
         } => {
             let mut attrs = vec![
                 attr("total_elements", &format!("{} : i32", total_elements.0)),
                 attr("element_size", &format!("{} : i32", element_size.0)),
-                attr("regLocales", &locale_array(reg_locales)),
-                attr("regIndices", &index_array(reg_indices)),
+                attr("regLocales", &locale_array([*addr_reg, *data_reg].into_iter())),
+                attr("regIndices", &index_array([*addr_reg, *data_reg].into_iter())),
             ];
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
@@ -2730,12 +2830,11 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             unit,
             position,
             result,
-            reg_locale,
-            reg_index,
+            reg,
             dbg_name,
         } => {
-            let mut attrs = vec![attr("reg_locale", &quoted(reg_locale.spelling()))];
-            if let Some(index) = reg_index {
+            let mut attrs = vec![attr("reg_locale", &quoted(reg.locale.spelling()))];
+            if let Some(index) = reg.index {
                 attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
             }
             if let Some(name) = dbg_name {
@@ -2757,35 +2856,27 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             lhs,
             rhs,
             result,
-            reg_locale,
-            reg_index,
+            reg,
         } => scalar_binary(
             out,
             "scalar_add",
             *result,
             *lhs,
             *rhs,
-            ScalarReg {
-                locale: *reg_locale,
-                index: *reg_index,
-            },
+            *reg,
         ),
         Op::ScalarSub {
             lhs,
             rhs,
             result,
-            reg_locale,
-            reg_index,
+            reg,
         } => scalar_binary(
             out,
             "scalar_sub",
             *result,
             *lhs,
             *rhs,
-            ScalarReg {
-                locale: *reg_locale,
-                index: *reg_index,
-            },
+            *reg,
         ),
         Op::ScalarMul {
             lhs,
@@ -2807,12 +2898,11 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::ScalarCopy {
             input,
             result,
-            reg_locale,
-            reg_index,
+            reg,
             program_header,
         } => {
-            let mut attrs = vec![attr("reg_locale", &quoted(reg_locale.spelling()))];
-            if let Some(index) = reg_index {
+            let mut attrs = vec![attr("reg_locale", &quoted(reg.locale.spelling()))];
+            if let Some(index) = reg.index {
                 attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
             }
             if *program_header {
@@ -2855,12 +2945,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         // ───────────────────────── masks, sync, ports ─────────────────────────
         Op::Sync {
             mode,
-            units,
+            peers,
             soft,
             implicit_sync_memory_boundary,
             dbg_name,
         } => {
-            let spelled: Vec<String> = units.iter().map(|u| quoted(u.spelling())).collect();
+            let spelled: Vec<String> = peers
+                .iter()
+                .map(|p| quoted(p.peer().spelling()))
+                .collect();
             let mut attrs = vec![
                 attr("mode", &quoted(mode.spelling())),
                 attr("units", &format!("[{}]", spelled.join(", "))),
@@ -3022,18 +3115,8 @@ fn masked(mask: Option<Val>) -> String {
     )
 }
 
-/// `regLocale` PLUS `regIndex` — ⭐ THE `.td` DECLARES THEM AS A PAIR, on every op that has them.
-/// Carrying them together is what the reference's declaration says they are.
-#[derive(Debug, Clone, Copy)]
-struct ScalarReg {
-    /// `regLocale`.
-    locale: RegType,
-    /// `regIndex` — ⛔ `None` is the `.td`'s `-1`, unassigned. An ABSENCE, not a refusal.
-    index: Option<RegIndex>,
-}
-
 /// `scalar_add` and `scalar_sub`, whose printed shape the `.td` declares identically.
-fn scalar_binary(out: &mut String, mnemonic: &str, result: Val, lhs: Val, rhs: Val, reg: ScalarReg) {
+fn scalar_binary(out: &mut String, mnemonic: &str, result: Val, lhs: Val, rhs: Val, reg: Reg) {
     let mut attrs = vec![attr("reg_locale", &quoted(reg.locale.spelling()))];
     if let Some(index) = reg.index {
         attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
@@ -3140,28 +3223,24 @@ fn extent_attrs(extent: &Extent) -> Vec<String> {
 }
 
 /// A `SentientRegTypeArrayAttr` — one locale per carried value.
-fn locale_array(locales: &[RegType]) -> String {
-    let spelled: Vec<String> = locales.iter().map(|l| quoted(l.spelling())).collect();
+fn locale_array(regs: impl Iterator<Item = Reg>) -> String {
+    let spelled: Vec<String> = regs.map(|r| quoted(r.locale.spelling())).collect();
     format!("[{}]", spelled.join(", "))
 }
 
 /// An `I32ArrayAttr` of register indices — ⛔ AN ABSENT ONE PRINTS AS THE `.td`'S `-1`, which is how
 /// the reference spells unassigned. That is the one place the sentinel is written, and it is written
 /// from an `Option` rather than stored as an integer.
-fn index_array(indices: &[Option<RegIndex>]) -> String {
-    let rendered: Vec<String> = indices
-        .iter()
-        .map(|index| index.map_or_else(|| "-1".to_owned(), |i| i.get().to_string()))
+fn index_array(regs: impl Iterator<Item = Reg>) -> String {
+    let rendered: Vec<String> = regs
+        .map(|r| r.index.map_or_else(|| "-1".to_owned(), |i| i.get().to_string()))
         .collect();
     format!("[{}]", rendered.join(", "))
 }
 
 /// A `BoolArrayAttr`.
-fn bool_array(flags: &[bool]) -> String {
-    let rendered: Vec<&str> = flags
-        .iter()
-        .map(|flag| if *flag { "true" } else { "false" })
-        .collect();
+fn bool_array(flags: impl Iterator<Item = bool>) -> String {
+    let rendered: Vec<&str> = flags.map(|flag| if flag { "true" } else { "false" }).collect();
     format!("[{}]", rendered.join(", "))
 }
 

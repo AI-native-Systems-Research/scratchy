@@ -64,8 +64,25 @@ where
 {
     let _ = writeln!(out, "  module @{} {{", program.name);
     let _ = writeln!(out, "    func.func private @{}() {{", program.name);
-    for op in &program.body {
+    // The preamble binds the units and views; the program units then run on them.
+    for op in &program.preamble {
         emit(out, op, 3);
+    }
+    // ⭐ ONE `dataflow.program_unit` PER UNIT, which is the shape 657 of IBM's 668 SentientIR
+    // expectations carry — see [`crate::islands::sentient::ProgramUnit`].
+    for unit in program.units.iter() {
+        let precision = unit.precision.map_or_else(String::new, |p| {
+            format!(" {{precision = \"{}\"}}", p.spelling())
+        });
+        let _ = writeln!(
+            out,
+            "      dataflow.program_unit {}{precision} : {{",
+            vals(&unit.on.vals())
+        );
+        for op in &unit.body {
+            emit(out, op, 4);
+        }
+        out.push_str("      }\n");
     }
     out.push_str("      return\n    }\n  }\n");
 }
