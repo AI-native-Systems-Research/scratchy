@@ -3,102 +3,22 @@
 //!
 //! Authority: `sys-arch-spec/progir/progir.h` and `sys-arch-spec/arch_enums.h` on the pod.
 
-/// WHICH REGISTER FILE — `RegType` (`sys-arch-spec/arch_enums.h:319-337`).
+/// WHICH REGISTER FILE — ⭐ THE VENDORED ENUM, re-exported.
 ///
-/// ⛔⛔ A **DIFFERENT SET** FROM [`crate::islands::sentient::dialects::sentient::RegType`], AND THE
-/// TWO MUST NOT BE CONFLATED. They share eight names (`LRF`, `LAR`, `LBR`, `EAR`, `EBR`, `GTR`,
-/// `JCR`, `MVR`) and then diverge in both directions:
+/// ⛔⛔ THIS WAS HAND-TRANSCRIBED HERE AND IS NOW DELETED. `sys-arch-spec` ports `arch_enums.h`'s own
+/// `RegType`, and holding a second copy is precisely what that crate exists to prevent — its manifest
+/// says so: *"a fact about the machine that two crates each held a copy of is a fact that can disagree
+/// with itself"*.
 ///
-/// * ProgIR adds `ERAT`, `XRF`, `SPR`, `ARF`, `IRF`, `STATE`, `SCALE` — real files that only exist
-///   once registers are real.
-/// * Sentient adds `unknown`, `imm`, `lccr`, `xrfrdptr`, `xrfwrptr`, `unrelated` — placeholders and
-///   pointer roles that belong to the rung where nothing is assigned yet. `unknown` in particular has
-///   no meaning here: a ProgIR register is assigned by definition.
+/// ⭐ AND IT ALREADY ENCODES THE TRAP I RE-DERIVED. `arch_enums.rs` carries
+/// `MAX_VALUE_IS_NOT_THE_MAXIMUM` — the header's `MAX_VALUE = STATE` names the second-to-last
+/// enumerator, so a C++ loop bounded by it skips `SCALE`. Two independent readings agreeing is worth
+/// more than either, and the vendored one is the copy to keep.
 ///
-/// ⛔⛔ AND `MAX_VALUE = STATE` IS A TRAP IN THE HEADER ITSELF. `STATE` is the fourteenth case and
-/// `SCALE` the fifteenth, so `MAX_VALUE` names the *second-to-last* enumerator — any C++ loop written
-/// `for (r = LRF; r <= MAX_VALUE; ++r)` silently skips `SCALE`. [`Self::ALL`] is the complete list,
-/// and it is the only thing to iterate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RegType {
-    /// `LRF` — the local register file.
-    Lrf,
-    /// `LAR`.
-    Lar,
-    /// `LBR` — ⭐ HOLDS AN INDEX, NOT AN ADDRESS, on the store side.
-    Lbr,
-    /// `EAR`.
-    Ear,
-    /// `EBR`.
-    Ebr,
-    /// `GTR`.
-    Gtr,
-    /// `JCR` — the jump-condition register.
-    Jcr,
-    /// `ERAT` — ⛔ NO SENTIENT COUNTERPART.
-    Erat,
-    /// `MVR` — what `MVLOOPCNT` writes.
-    Mvr,
-    /// `XRF` — the transposed register file. ⛔ Sentient names its read and write POINTERS, not the
-    /// file itself.
-    Xrf,
-    /// `SPR`.
-    Spr,
-    /// `ARF` — the accumulator register file.
-    Arf,
-    /// `IRF`.
-    Irf,
-    /// `STATE` — ⛔ WHAT THE HEADER'S `MAX_VALUE` POINTS AT, which is not the last case.
-    State,
-    /// `SCALE` — ⛔ PAST `MAX_VALUE`; see the type's note.
-    Scale,
-}
-
-impl RegType {
-    /// EVERY CASE, in the header's own order.
-    ///
-    /// ⛔ THE ONLY THING TO ITERATE — `MAX_VALUE` excludes [`Self::Scale`].
-    pub const ALL: [RegType; 15] = [
-        RegType::Lrf,
-        RegType::Lar,
-        RegType::Lbr,
-        RegType::Ear,
-        RegType::Ebr,
-        RegType::Gtr,
-        RegType::Jcr,
-        RegType::Erat,
-        RegType::Mvr,
-        RegType::Xrf,
-        RegType::Spr,
-        RegType::Arf,
-        RegType::Irf,
-        RegType::State,
-        RegType::Scale,
-    ];
-
-    /// The spelling the printed program uses — `regTypeToString`
-    /// (`progir.h:307`, populated in `progir.cpp`).
-    #[must_use]
-    pub const fn spelling(self) -> &'static str {
-        match self {
-            Self::Lrf => "LRF",
-            Self::Lar => "LAR",
-            Self::Lbr => "LBR",
-            Self::Ear => "EAR",
-            Self::Ebr => "EBR",
-            Self::Gtr => "GTR",
-            Self::Jcr => "JCR",
-            Self::Erat => "ERAT",
-            Self::Mvr => "MVR",
-            Self::Xrf => "XRF",
-            Self::Spr => "SPR",
-            Self::Arf => "ARF",
-            Self::Irf => "IRF",
-            Self::State => "STATE",
-            Self::Scale => "SCALE",
-        }
-    }
-}
+/// ⛔ NOT TO BE CONFUSED WITH [`crate::islands::sentient::dialects::sentient::RegType`], which is the
+/// SENTIENT dialect's own set — it adds `unknown`/`imm`/`lccr` and the XRF pointers and lacks
+/// `ERAT`/`XRF`/`SPR`/`ARF`/`IRF`/`STATE`/`SCALE`. Different rung, different vocabulary.
+pub use sys_arch_spec::arch_enums::RegType;
 
 /// ONE OPERAND FIELD'S VALUE — `OperandAttr` (`progir.h:44-57`).
 ///

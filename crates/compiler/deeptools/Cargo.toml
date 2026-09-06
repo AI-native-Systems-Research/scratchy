@@ -12,6 +12,19 @@ license.workspace = true
 # recovery — build a lowering, throw the shape away, then try to read it back out.
 [dependencies]
 
+# THE ARCHITECTURE SPEC — the ISA field/opcode tables, the register-file depths, the unit enumerators.
+#
+# ⭐ ITS OWN CRATE BECAUSE BOTH SIDES INCLUDE IT. In the C++ the compiler and the senulator each
+# `#include` `sys-arch-spec/`'s headers; in Rust that has to be a crate or each side keeps a copy and
+# the copies drift. They did: `Isa::InstOperand` was 89 enumerators in each, and that they were in the
+# SAME ORDER was provable only by a hand-written assertion.
+#
+# ⛔⛔ `default-features = false`, AND IT IS LOAD-BEARING. `sys-arch-spec`'s `default` turns on
+# `arch-rcudd1a`, and cargo UNIONS features across a graph — so one edge that takes the default pins
+# the whole build to the RCUDD1A field tables and `--features arch-sen1p5` becomes a flag that changes
+# nothing. Each edge must forward the choice instead of making it.
+sys-arch-spec = { path = "sys-arch-spec", default-features = false }
+
 # ⛔ THE `.ddl` TEXT IS PARSED HERE AND NOWHERE ELSE. `build.rs` turns `ddl_templates/*.ddl` into
 # const tables, because parsing text is the one thing in this crate that cannot be a constant. The
 # parser lives in `ddl/`, OUTSIDE `src/`, so its `String`s cannot reach the emitter.
@@ -30,9 +43,12 @@ license.workspace = true
 # another.
 default = ["arch-rcudd1a"]
 # `RCUDD1A_ISA`, IBM's own `DEFAULT_ISA` (`isa.hpp:30`). 8 PT rows, a 64-stick L0, 8 HBM segments.
-arch-rcudd1a = []
+# ⛔ SELECTING AN ISA HERE SELECTS THE SAME ONE IN THE SPEC. The field tables and register-file depths
+# are `sys-arch-spec`'s and are cfg'd on this feature, so a build that turned it on for only one of
+# the two crates would compile a compiler for one machine against the tables of another.
+arch-rcudd1a = ["sys-arch-spec/arch-rcudd1a"]
 # `SEN1P5_ISA`. 4 PT rows, a 128-stick L0 with a 16-stick scale region, 32 HBM segments, cores
 # tethered in pairs.
-arch-sen1p5 = []
+arch-sen1p5 = ["sys-arch-spec/arch-sen1p5"]
 
 [lib]

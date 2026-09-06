@@ -1090,6 +1090,9 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "deeptools"
 version = "0.1.0"
+dependencies = [
+ "sys-arch-spec",
+]
 
 [[package]]
 name = "der-parser"
@@ -4282,6 +4285,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "sys-arch-spec"
+version = "0.1.0"
 
 [[package]]
 name = "target-triple"

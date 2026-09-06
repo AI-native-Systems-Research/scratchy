@@ -1,0 +1,768 @@
+arch = Sen1p5
+
+=== Pt: 17 opcodes, 41 fields
+op DefOpcode { op: "FMA", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "FMA4", ty: T20, min_arch: Sen1p5 }
+op DefOpcode { op: "FMA8", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "IMA8", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "IMA4", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T12, min_arch: Mpw3 }
+op DefOpcode { op: "JCMP", ty: T13, min_arch: Mpw3 }
+op DefOpcode { op: "JCRSWAP", ty: T14, min_arch: Mpw4 }
+op DefOpcode { op: "JIMMCOPY", ty: T12, min_arch: Mpw3 }
+op DefOpcode { op: "JSUB", ty: T12, min_arch: Mpw3 }
+op DefOpcode { op: "MVLOOPCNT", ty: T10, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T13, min_arch: Mpw4 }
+op DefOpcode { op: "XRFACCESS", ty: T15, min_arch: Mpw4 }
+op DefOpcode { op: "INCRMASK", ty: T16, min_arch: Mpw3 }
+op DefOpcode { op: "SETMASK", ty: T17, min_arch: Mpw3 }
+fd DefField { ty: T10, name: Either(Imm, PcTarget), bit: WordBit(6), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T10, name: One(Src0), bit: WordBit(22), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T10, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T10, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T12, name: One(Src0), bit: WordBit(22), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T12, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T12, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Src1), bit: WordBit(6), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T13, name: One(PcTarget), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T13, name: One(Src0), bit: WordBit(22), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T13, name: One(Isimm), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T13, name: One(Mode), bit: WordBit(27), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T13, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T14, name: One(Src1), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Src0), bit: WordBit(22), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T15, name: One(RdptrImm), bit: WordBit(6), imm: Imm { bits: ImmWidth(7), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T15, name: One(RdptrUpd), bit: WordBit(13), imm: NotAnImm, encode: [Lit("no", 0), Lit("set", 1), Lit("incr", 2)] }
+fd DefField { ty: T15, name: One(WrptrImm), bit: WordBit(15), imm: Imm { bits: ImmWidth(7), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T15, name: One(WrptrUpd), bit: WordBit(22), imm: NotAnImm, encode: [Lit("no", 0), Lit("set", 1), Lit("incr", 2)] }
+fd DefField { ty: T15, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T16, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T17, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(3), sign: Unsigned }, encode: [] }
+fd DefField { ty: T17, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Lit("xrf", 14), Lit("0.0", 15)] }
+fd DefField { ty: T20, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0)), Lit("n-link", 13), Lit("w-link", 14), Lit("0.0", 15)] }
+fd DefField { ty: T20, name: One(Src2), bit: WordBit(14), imm: NotAnImm, encode: [Lit("w-link", 2), Lit("1.0", 3)] }
+fd DefField { ty: T20, name: One(IfifoConv), bit: WordBit(16), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T20, name: One(Tgts), bit: WordBit(18), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 3)] }
+fd DefField { ty: T20, name: One(Tgtrf), bit: WordBit(20), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0)), Lit("irf0", 12), Lit("IRF0", 12), Lit("irf1", 13), Lit("IRF1", 13), Lit("xrf", 14), Lit("no", 15)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc0), bit: WordBit(24), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc1), bit: WordBit(25), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldtgt), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unroll), bit: WordBit(27), imm: NotAnImm, encode: [Lit("x1", 0), Lit("x2", 1), Lit("x4", 2), Lit("x8", 3)] }
+fd DefField { ty: T20, name: One(Fma8ctrlsrc0), bit: WordBit(29), imm: NotAnImm, encode: [Lit("<1,4,3>", 0), Lit("<1,5,2>", 1), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Fma8ctrlsrc2), bit: WordBit(30), imm: NotAnImm, encode: [Lit("<1,4,3>", 0), Lit("<1,5,2>", 1)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+
+=== Pe: 30 opcodes, 67 fields
+op DefOpcode { op: "EE", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FCMP", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FEST", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FMA", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "FMINMAX", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FMUL", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "FNMS", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "GCVT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FCVT", ty: T30, min_arch: Sen1p5 }
+op DefOpcode { op: "ICVT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "IME", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "IMMCOPY", ty: T13, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T41, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T43, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T41, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T41, min_arch: Mpw2 }
+op DefOpcode { op: "LOGICAL", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "MERGE", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "PACK", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "PERMUTE", ty: T30, min_arch: Sen1p5 }
+op DefOpcode { op: "REDUCE", ty: T118, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SELECT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "SHR", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T43, min_arch: Mpw4 }
+op DefOpcode { op: "SPLAT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "LOAD_LFSR", ty: T30, min_arch: Sen1p5 }
+op DefOpcode { op: "COPY_LFSR", ty: T30, min_arch: Sen1p5 }
+fd DefField { ty: T11, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T11, name: Either(Imm, PcTarget), bit: WordBit(12), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T11, name: One(DynLoop), bit: WordBit(29), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(21), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T13, name: One(Replica), bit: WordBit(31), imm: NotAnImm, encode: [] }
+fd DefField { ty: T13, name: One(Tgtrf), bit: WordBit(36), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("no", 15)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Mask), bit: WordBit(42), imm: NotAnImm, encode: [] }
+fd DefField { ty: T13, name: One(Mode), bit: WordBit(34), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T118, name: One(RsmSrc0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, Fixed(16), RegBase(0))] }
+fd DefField { ty: T118, name: One(RsmSrc1), bit: WordBit(11), imm: NotAnImm, encode: [] }
+fd DefField { ty: T118, name: One(RsmUnroll), bit: WordBit(16), imm: NotAnImm, encode: [Lit("x1", 1), Lit("x2", 2), Lit("x3", 3), Lit("x4", 4)] }
+fd DefField { ty: T118, name: One(RsmTgtrf), bit: WordBit(19), imm: NotAnImm, encode: [Family(Regs, Fixed(16), RegBase(0))] }
+fd DefField { ty: T118, name: One(RsmStateReg), bit: WordBit(24), imm: NotAnImm, encode: [] }
+fd DefField { ty: T118, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T118, name: One(Mode), bit: WordBit(44), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T118, name: One(Foldctrl), bit: WordBit(62), imm: NotAnImm, encode: [Lit("folda", 0), Lit("foldb", 1), Lit("2fold2instr", 2), Lit("2fold1instr", 3)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("sfp", 8), Lit("sfpfp16tofp32l", 9), Lit("sfpfp16tofp32h", 10), Lit("sfpfp16tofp32fold", 11), Lit("ptint24tofp32fold", 12), Lit("ptfp24tofp32fold", 13), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("nfwd", 24), Lit("reuse", 25)] }
+fd DefField { ty: T20, name: One(Src1), bit: WordBit(12), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("sfp", 8), Lit("sfpfp16tofp32l", 9), Lit("sfpfp16tofp32h", 10), Lit("sfpfp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("reuse", 25)] }
+fd DefField { ty: T20, name: One(Src2), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("sfp", 8), Lit("sfpfp16tofp32l", 9), Lit("sfpfp16tofp32h", 10), Lit("sfpfp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("muldiv2", 17), Lit("1.0", 18), Lit("2.0", 19), Lit("3.0", 20), Lit("nfwd", 24), Lit("reuse", 25)] }
+fd DefField { ty: T20, name: One(Tgtpe), bit: WordBit(27), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 1)] }
+fd DefField { ty: T20, name: One(Fwdencoding), bit: WordBit(28), imm: NotAnImm, encode: [Lit("no", 0), Lit("src0", 1), Lit("src2", 2), Lit("result", 3)] }
+fd DefField { ty: T20, name: One(Tgtencoding), bit: WordBit(30), imm: NotAnImm, encode: [Lit("lx", 1), Lit("sfp", 2)] }
+fd DefField { ty: T20, name: One(Mode), bit: WordBit(34), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Tgtrf), bit: WordBit(36), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Mask), bit: WordBit(42), imm: NotAnImm, encode: [] }
+fd DefField { ty: T20, name: One(Unroll), bit: WordBit(50), imm: NotAnImm, encode: [Lit("x1", 0), Lit("x2", 1), Lit("x4", 2), Lit("x8", 3)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc0), bit: WordBit(52), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc1), bit: WordBit(53), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc2), bit: WordBit(54), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldtgt), bit: WordBit(55), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Fpuop), bit: WordBit(56), imm: NotAnImm, encode: [Lit("no", 0), Lit("int8", 1), Lit("int4", 2), Lit("dlfp16", 4), Lit("bf16", 5)] }
+fd DefField { ty: T20, name: One(Reluop), bit: WordBit(59), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T20, name: One(Foldctrl), bit: WordBit(62), imm: NotAnImm, encode: [Lit("folda", 0), Lit("foldb", 1), Lit("2fold2instr", 2), Lit("2fold1instr", 3)] }
+fd DefField { ty: T30, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("sfp", 8), Lit("sfpfp16tofp32l", 9), Lit("sfpfp16tofp32h", 10), Lit("sfpfp16tofp32fold", 11), Lit("ptint24tofp32fold", 12), Lit("ptfp24tofp32fold", 13), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("nfwd", 24), Lit("reuse", 25), Lit("icvtconst", 26)] }
+fd DefField { ty: T30, name: One(Imm), bit: WordBit(12), imm: Imm { bits: ImmWidth(6), sign: Unsigned }, encode: [] }
+fd DefField { ty: T30, name: One(Src2), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("sfp", 8), Lit("sfpfp16tofp32l", 9), Lit("sfpfp16tofp32h", 10), Lit("sfpfp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("2.0", 19), Lit("3.0", 20), Lit("nfwd", 24), Lit("reuse", 25)] }
+fd DefField { ty: T30, name: One(Tgtpe), bit: WordBit(27), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 1)] }
+fd DefField { ty: T30, name: One(Fwdencoding), bit: WordBit(28), imm: NotAnImm, encode: [Lit("no", 0), Lit("src0", 1), Lit("src2", 2), Lit("result", 3)] }
+fd DefField { ty: T30, name: One(Tgtencoding), bit: WordBit(30), imm: NotAnImm, encode: [Lit("lx", 1), Lit("sfp", 2)] }
+fd DefField { ty: T30, name: One(Mode), bit: WordBit(34), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T30, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T30, name: One(Tgtrf), bit: WordBit(36), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Mask), bit: WordBit(42), imm: NotAnImm, encode: [] }
+fd DefField { ty: T30, name: One(Unroll), bit: WordBit(50), imm: NotAnImm, encode: [Lit("x1", 0), Lit("x2", 1), Lit("x4", 2), Lit("x8", 3)] }
+fd DefField { ty: T30, name: One(Unrlfldsrc0), bit: WordBit(52), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Unrlfldsrc1), bit: WordBit(53), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Unrlfldsrc2), bit: WordBit(54), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Unrlfldtgt), bit: WordBit(55), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Fpuop), bit: WordBit(56), imm: NotAnImm, encode: [Lit("no", 0), Lit("int8", 1), Lit("int4", 2), Lit("dlfp16", 4), Lit("bf16", 5)] }
+fd DefField { ty: T30, name: One(Reluop), bit: WordBit(59), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T30, name: One(Foldctrl), bit: WordBit(62), imm: NotAnImm, encode: [Lit("folda", 0), Lit("foldb", 1), Lit("2fold2instr", 2), Lit("2fold1instr", 3)] }
+fd DefField { ty: T41, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T41, name: One(Imm), bit: WordBit(12), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T41, name: One(JcrSelect), bit: WordBit(34), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T41, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T41, name: One(JcrTarget), bit: WordBit(36), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T43, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T43, name: One(Src1), bit: WordBit(12), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T43, name: One(Mode), bit: WordBit(20), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T43, name: One(Isimm), bit: WordBit(28), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T43, name: One(Usejcr), bit: WordBit(35), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T43, name: One(PcTarget), bit: WordBit(36), imm: NotAnImm, encode: [] }
+
+=== Sfp: 31 opcodes, 69 fields
+op DefOpcode { op: "EE", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FCMP", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FEST", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FMA", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "FMINMAX", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FMUL", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "FNMS", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "GCVT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "FCVT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "ICVT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "IME", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "IMMCOPY", ty: T13, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T41, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T43, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T41, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T41, min_arch: Mpw2 }
+op DefOpcode { op: "LOGICAL", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "MERGE", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "PACK", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "PERMUTE", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "REDUCE", ty: T118, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SELECT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "SHR", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T43, min_arch: Mpw4 }
+op DefOpcode { op: "SPLAT", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "SETDEST", ty: T14, min_arch: Rcudd1a }
+op DefOpcode { op: "LOAD_LFSR", ty: T30, min_arch: Mpw4 }
+op DefOpcode { op: "COPY_LFSR", ty: T30, min_arch: Mpw4 }
+fd DefField { ty: T11, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T11, name: Either(Imm, PcTarget), bit: WordBit(12), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T11, name: One(DynLoop), bit: WordBit(29), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(21), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T13, name: One(Replica), bit: WordBit(31), imm: NotAnImm, encode: [] }
+fd DefField { ty: T13, name: One(Tgtrf), bit: WordBit(36), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("no", 0)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Mask), bit: WordBit(42), imm: NotAnImm, encode: [] }
+fd DefField { ty: T13, name: One(Mode), bit: WordBit(34), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T14, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(32), sign: Unsigned }, encode: [] }
+fd DefField { ty: T118, name: One(RsmSrc0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, Fixed(16), RegBase(0))] }
+fd DefField { ty: T118, name: One(RsmSrc1), bit: WordBit(11), imm: NotAnImm, encode: [] }
+fd DefField { ty: T118, name: One(RsmUnroll), bit: WordBit(16), imm: NotAnImm, encode: [Lit("x1", 1), Lit("x2", 2), Lit("x3", 3), Lit("x4", 4)] }
+fd DefField { ty: T118, name: One(RsmTgtrf), bit: WordBit(19), imm: NotAnImm, encode: [Family(Regs, Fixed(16), RegBase(0))] }
+fd DefField { ty: T118, name: One(RsmStateReg), bit: WordBit(24), imm: NotAnImm, encode: [] }
+fd DefField { ty: T118, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T118, name: One(Mode), bit: WordBit(44), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T118, name: One(Foldctrl), bit: WordBit(62), imm: NotAnImm, encode: [Lit("folda", 0), Lit("foldb", 1), Lit("2fold2instr", 2), Lit("2fold1instr", 3)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("datafifo", 0), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("pe", 8), Lit("pefp16tofp32l", 9), Lit("pefp16tofp32h", 10), Lit("pefp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("nfwd", 24), Lit("reuse", 25)] }
+fd DefField { ty: T20, name: One(Src1), bit: WordBit(12), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("datafifo", 0), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("pe", 8), Lit("pefp16tofp32l", 9), Lit("pefp16tofp32h", 10), Lit("pefp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("reuse", 25)] }
+fd DefField { ty: T20, name: One(Src2), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("datafifo", 0), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("pe", 8), Lit("pefp16tofp32l", 9), Lit("pefp16tofp32h", 10), Lit("pefp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("muldiv2", 17), Lit("1.0", 18), Lit("2.0", 19), Lit("3.0", 20), Lit("nfwd", 24), Lit("reuse", 25)] }
+fd DefField { ty: T20, name: One(Tgtsfp), bit: WordBit(27), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 1)] }
+fd DefField { ty: T20, name: One(Fwdencoding), bit: WordBit(28), imm: NotAnImm, encode: [Lit("no", 0), Lit("src0", 1), Lit("src2", 2), Lit("result", 3)] }
+fd DefField { ty: T20, name: One(Tgtencoding), bit: WordBit(30), imm: NotAnImm, encode: [Lit("l0", 0), Lit("lx", 1), Lit("pe", 2), Lit("pt", 3)] }
+fd DefField { ty: T20, name: One(Mode), bit: WordBit(34), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Tgtrf), bit: WordBit(36), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Mask), bit: WordBit(42), imm: NotAnImm, encode: [] }
+fd DefField { ty: T20, name: One(Unroll), bit: WordBit(50), imm: NotAnImm, encode: [Lit("x1", 0), Lit("x2", 1), Lit("x4", 2), Lit("x8", 3)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc0), bit: WordBit(52), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc1), bit: WordBit(53), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldsrc2), bit: WordBit(54), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Unrlfldtgt), bit: WordBit(55), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Fpuop), bit: WordBit(56), imm: NotAnImm, encode: [Lit("no", 0), Lit("int8", 1), Lit("int4", 2), Lit("dlfp16", 4), Lit("bf16", 5)] }
+fd DefField { ty: T20, name: One(Reluop), bit: WordBit(59), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T20, name: One(Tgtdatafifo), bit: WordBit(61), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 1)] }
+fd DefField { ty: T20, name: One(Foldctrl), bit: WordBit(62), imm: NotAnImm, encode: [Lit("folda", 0), Lit("foldb", 1), Lit("2fold2instr", 2), Lit("2fold1instr", 3)] }
+fd DefField { ty: T30, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("datafifo", 0), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("pe", 8), Lit("pefp16tofp32l", 9), Lit("pefp16tofp32h", 10), Lit("pefp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("nfwd", 24), Lit("reuse", 25), Lit("icvtconst", 26)] }
+fd DefField { ty: T30, name: One(Imm), bit: WordBit(12), imm: Imm { bits: ImmWidth(6), sign: Unsigned }, encode: [] }
+fd DefField { ty: T30, name: One(Src2), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("datafifo", 0), Lit("lxlu", 1), Lit("lxlufp16tofp32l", 2), Lit("lxlufp16tofp32h", 3), Lit("lxlufp16tofp32fold", 4), Lit("pe", 8), Lit("pefp16tofp32l", 9), Lit("pefp16tofp32h", 10), Lit("pefp16tofp32fold", 11), Lit("nbrslice", 15), Lit("0.0", 16), Lit("1.0", 18), Lit("2.0", 19), Lit("3.0", 20), Lit("nfwd", 24), Lit("reuse", 25)] }
+fd DefField { ty: T30, name: One(Tgtsfp), bit: WordBit(27), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 1)] }
+fd DefField { ty: T30, name: One(Fwdencoding), bit: WordBit(28), imm: NotAnImm, encode: [Lit("no", 0), Lit("src0", 1), Lit("src2", 2), Lit("result", 3)] }
+fd DefField { ty: T30, name: One(Tgtencoding), bit: WordBit(30), imm: NotAnImm, encode: [Lit("l0", 0), Lit("lx", 1), Lit("pe", 2), Lit("pt", 3)] }
+fd DefField { ty: T30, name: One(Mode), bit: WordBit(34), imm: NotAnImm, encode: [Lit("fp16", 0), Lit("fp32", 1)] }
+fd DefField { ty: T30, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T30, name: One(Tgtrf), bit: WordBit(36), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(32)), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Mask), bit: WordBit(42), imm: NotAnImm, encode: [] }
+fd DefField { ty: T30, name: One(Unroll), bit: WordBit(50), imm: NotAnImm, encode: [Lit("x1", 0), Lit("x2", 1), Lit("x4", 2), Lit("x8", 3)] }
+fd DefField { ty: T30, name: One(Unrlfldsrc0), bit: WordBit(52), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Unrlfldsrc1), bit: WordBit(53), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Unrlfldsrc2), bit: WordBit(54), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Unrlfldtgt), bit: WordBit(55), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Reluop), bit: WordBit(59), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T30, name: One(Tgtdatafifo), bit: WordBit(61), imm: NotAnImm, encode: [Lit("no", 0), Lit("result", 1)] }
+fd DefField { ty: T30, name: One(Foldctrl), bit: WordBit(62), imm: NotAnImm, encode: [Lit("folda", 0), Lit("foldb", 1), Lit("2fold2instr", 2), Lit("2fold1instr", 3)] }
+fd DefField { ty: T41, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T41, name: One(Imm), bit: WordBit(12), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T41, name: One(JcrSelect), bit: WordBit(34), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T41, name: One(Be), bit: WordBit(35), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T41, name: One(JcrTarget), bit: WordBit(36), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T43, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T43, name: One(Src1), bit: WordBit(12), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T43, name: One(Mode), bit: WordBit(20), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T43, name: One(Isimm), bit: WordBit(28), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T43, name: One(Usejcr), bit: WordBit(35), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T43, name: One(PcTarget), bit: WordBit(36), imm: NotAnImm, encode: [] }
+
+=== L0lu: 18 opcodes, 43 fields
+op DefOpcode { op: "IMMCOPY", ty: T16, min_arch: Mpw2 }
+op DefOpcode { op: "LDST", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTI", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTIU", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTU", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LRFREGCOPY", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFREG", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFIMM", ty: T16, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T10, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T30, min_arch: Mpw4 }
+op DefOpcode { op: "SYNC", ty: T13, min_arch: Mpw2 }
+op DefOpcode { op: "TILEADV", ty: T12, min_arch: Sen1p5 }
+fd DefField { ty: T10, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T10, name: Either(Imm, PcTarget), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T10, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T10, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T11, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T11, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(12), sign: Signed }, encode: [] }
+fd DefField { ty: T11, name: One(Ldtype), bit: WordBit(26), imm: NotAnImm, encode: [Lit("64b", 0), Lit("32b", 1), Lit("16b", 2)] }
+fd DefField { ty: T11, name: One(Splat), bit: WordBit(28), imm: NotAnImm, encode: [Lit("splat", 1)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T13, name: One(Synctag), bit: WordBit(10), imm: NotAnImm, encode: [Lit("send", 1), Lit("recv", 2), Lit("sendrecv", 3)] }
+fd DefField { ty: T13, name: One(Implicit), bit: WordBit(7), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T13, name: One(Tilesize), bit: WordBit(22), imm: Imm { bits: ImmWidth(7), sign: Unsigned }, encode: [] }
+fd DefField { ty: T13, name: One(Syncdest), bit: WordBit(12), imm: NotAnImm, encode: [Lit("self", 1), Lit("neighbor", 2), Lit("both", 3)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T14, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T14, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T14, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T16, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T16, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(12), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T16, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Group), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T20, name: One(Burst), bit: WordBit(16), imm: NotAnImm, encode: [Lit("burst", 1)] }
+fd DefField { ty: T20, name: One(Burstsize), bit: WordBit(17), imm: Imm { bits: ImmWidth(6), sign: Unsigned }, encode: [] }
+fd DefField { ty: T20, name: One(Chunkstride), bit: WordBit(23), imm: NotAnImm, encode: [Lit("8b", 0), Lit("16b", 1), Lit("32b", 2), Lit("64b", 3), Lit("96b", 4), Lit("128b", 5), Lit("192b", 6), Lit("256b", 7)] }
+fd DefField { ty: T20, name: One(Ldtype), bit: WordBit(26), imm: NotAnImm, encode: [Lit("64b", 0), Lit("32b", 1), Lit("16b", 2)] }
+fd DefField { ty: T20, name: One(Chunksize), bit: WordBit(29), imm: NotAnImm, encode: [Lit("8b", 1), Lit("16b", 2), Lit("32b", 3)] }
+fd DefField { ty: T20, name: One(Splat), bit: WordBit(28), imm: NotAnImm, encode: [Lit("splat", 1)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T21, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T30, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T30, name: One(Src1), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T30, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T30, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T30, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+
+=== L0su: 18 opcodes, 39 fields
+op DefOpcode { op: "IMMCOPY", ty: T16, min_arch: Mpw2 }
+op DefOpcode { op: "LDST", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTI", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTIU", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTU", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LRFREGCOPY", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFREG", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T30, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFIMM", ty: T16, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T10, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T30, min_arch: Mpw4 }
+op DefOpcode { op: "SYNC", ty: T13, min_arch: Mpw2 }
+op DefOpcode { op: "TILEADV", ty: T12, min_arch: Sen1p5 }
+fd DefField { ty: T10, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T10, name: Either(Imm, PcTarget), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T10, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T10, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T11, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T11, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(12), sign: Signed }, encode: [] }
+fd DefField { ty: T11, name: One(ScaleArray), bit: WordBit(23), imm: NotAnImm, encode: [Lit("scale", 1), Lit("data", 0)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T13, name: One(Synctag), bit: WordBit(10), imm: NotAnImm, encode: [Lit("send", 1), Lit("recv", 2), Lit("sendrecv", 3)] }
+fd DefField { ty: T13, name: One(Implicit), bit: WordBit(7), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T13, name: One(Tilesize), bit: WordBit(22), imm: Imm { bits: ImmWidth(7), sign: Unsigned }, encode: [] }
+fd DefField { ty: T13, name: One(Syncdest), bit: WordBit(12), imm: NotAnImm, encode: [Lit("self", 1), Lit("neighbor", 2), Lit("both", 3)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T14, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T14, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T14, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T16, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T16, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(12), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T16, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Group), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T20, name: One(Burst), bit: WordBit(16), imm: NotAnImm, encode: [Lit("burst", 1)] }
+fd DefField { ty: T20, name: One(Burstsize), bit: WordBit(17), imm: Imm { bits: ImmWidth(6), sign: Unsigned }, encode: [] }
+fd DefField { ty: T20, name: One(ScaleArray), bit: WordBit(23), imm: NotAnImm, encode: [Lit("scale", 1), Lit("data", 0)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T21, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T30, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T30, name: One(Src1), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T30, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T30, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T30, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T30, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+
+=== Lxlu: 23 opcodes, 63 fields
+op DefOpcode { op: "IMMCOPY", ty: T111, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T40, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "LDST", ty: T32, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTI", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTIU", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTU", ty: T32, min_arch: Mpw2 }
+op DefOpcode { op: "LDCVTI", ty: T21, min_arch: Sen1p5 }
+op DefOpcode { op: "LDCVTIU", ty: T21, min_arch: Sen1p5 }
+op DefOpcode { op: "SAMV", ty: T50, min_arch: Mpw3 }
+op DefOpcode { op: "SETDSTMASK", ty: T15, min_arch: Rcudd1a }
+op DefOpcode { op: "SPMV", ty: T60, min_arch: Rcudd1a }
+op DefOpcode { op: "LRFREGCOPY", ty: T31, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFIMM", ty: T111, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFREG", ty: T31, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T40, min_arch: Mpw4 }
+op DefOpcode { op: "SUBLRFIMM", ty: T111, min_arch: Mpw2 }
+op DefOpcode { op: "SYNC", ty: T13, min_arch: Mpw2 }
+fd DefField { ty: T11, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T11, name: Either(Imm, PcTarget), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T11, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T13, name: One(Synctag), bit: WordBit(10), imm: NotAnImm, encode: [Lit("sendl3lu", 5), Lit("sendl3su", 9), Lit("recvl3lu", 6), Lit("recvlxsu", 34), Lit("recvlxsuboth", 162), Lit("sendrecvall", 167)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T14, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T14, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T14, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T15, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("sfp", 0), Lit("l0su", 1), Lit("pt", 2)] }
+fd DefField { ty: T15, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T111, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T111, name: One(Lrfimm), bit: WordBit(10), imm: Imm { bits: ImmWidth(21), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T111, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(14), sign: Signed }, encode: [] }
+fd DefField { ty: T20, name: One(Rottype), bit: WordBit(24), imm: NotAnImm, encode: [Lit("no", 0), Lit("16b", 1), Lit("32b", 2), Lit("48b", 3), Lit("64b", 4), Lit("80b", 5), Lit("96b", 6), Lit("112b", 7)] }
+fd DefField { ty: T20, name: One(Ldtype), bit: WordBit(27), imm: NotAnImm, encode: [Lit("128b", 0), Lit("2bsplat", 1), Lit("16bzpad", 2), Lit("16bsplat", 3)] }
+fd DefField { ty: T20, name: One(Consumertag), bit: WordBit(29), imm: NotAnImm, encode: [Lit("self", 0), Lit("sfp", 1), Lit("lxsu", 2), Lit("pe", 3)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T21, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(14), sign: Signed }, encode: [] }
+fd DefField { ty: T21, name: One(Elemidx), bit: WordBit(24), imm: NotAnImm, encode: [] }
+fd DefField { ty: T21, name: One(Scaleidx), bit: WordBit(26), imm: NotAnImm, encode: [] }
+fd DefField { ty: T21, name: One(Ldtype), bit: WordBit(27), imm: NotAnImm, encode: [Lit("128b", 0), Lit("2bsplat", 1), Lit("4bsplat", 2), Lit("16bsplat", 3)] }
+fd DefField { ty: T21, name: One(Consumertag), bit: WordBit(29), imm: NotAnImm, encode: [Lit("self", 0), Lit("sfp", 1), Lit("lxsu", 2), Lit("pe", 3)] }
+fd DefField { ty: T21, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T31, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T31, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T31, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T32, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T32, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T32, name: One(Group), bit: WordBit(14), imm: NotAnImm, encode: [Lit("no", 0), Lit("x1", 1), Lit("x2", 2), Lit("x4", 3)] }
+fd DefField { ty: T32, name: One(Burst), bit: WordBit(16), imm: NotAnImm, encode: [Lit("burst", 1)] }
+fd DefField { ty: T32, name: One(Burstsize), bit: WordBit(17), imm: Imm { bits: ImmWidth(6), sign: Unsigned }, encode: [] }
+fd DefField { ty: T32, name: One(Rottype), bit: WordBit(24), imm: NotAnImm, encode: [Lit("no", 0), Lit("16b", 1), Lit("32b", 2), Lit("48b", 3), Lit("64b", 4), Lit("80b", 5), Lit("96b", 6), Lit("112b", 7)] }
+fd DefField { ty: T32, name: One(Ldtype), bit: WordBit(27), imm: NotAnImm, encode: [Lit("128b", 0), Lit("2bsplat", 1), Lit("16bzpad", 2), Lit("16bsplat", 3)] }
+fd DefField { ty: T32, name: One(Consumertag), bit: WordBit(29), imm: NotAnImm, encode: [Lit("self", 0), Lit("sfp", 1), Lit("lxsu", 2), Lit("pe", 3)] }
+fd DefField { ty: T32, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T40, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T40, name: One(Src1), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T40, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T40, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T40, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T40, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T50, name: One(Maskall), bit: WordBit(10), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T50, name: One(Sliceidxsl), bit: WordBit(11), imm: NotAnImm, encode: [] }
+fd DefField { ty: T50, name: One(Numvalidentry), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T50, name: One(Mvridx), bit: WordBit(21), imm: NotAnImm, encode: [Family(Mvrs, NumMvrs, RegBase(0))] }
+fd DefField { ty: T50, name: One(Precision), bit: WordBit(24), imm: NotAnImm, encode: [Lit("16b", 0), Lit("8b", 1), Lit("4b", 2), Lit("2b", 3)] }
+fd DefField { ty: T50, name: One(Xslinner), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T50, name: One(Wsllen), bit: WordBit(27), imm: NotAnImm, encode: [Lit("64b", 6), Lit("32b", 5), Lit("16b", 4), Lit("8b", 3), Lit("4b", 2), Lit("2b", 1), Lit("1b", 0)] }
+fd DefField { ty: T50, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T60, name: One(Mvridx), bit: WordBit(6), imm: NotAnImm, encode: [Family(Mvrs, NumMvrs, RegBase(0))] }
+fd DefField { ty: T60, name: One(Subslicesize), bit: WordBit(9), imm: NotAnImm, encode: [Lit("1b", 0), Lit("2b", 1), Lit("4b", 2), Lit("8b", 3), Lit("16b", 4), Lit("32b", 5), Lit("64b", 6), Lit("128b", 7)] }
+fd DefField { ty: T60, name: One(Startbit), bit: WordBit(12), imm: NotAnImm, encode: [] }
+fd DefField { ty: T60, name: One(Endbit), bit: WordBit(20), imm: NotAnImm, encode: [] }
+fd DefField { ty: T60, name: One(Byteshift), bit: WordBit(28), imm: NotAnImm, encode: [Lit("no", 0), Lit("2b", 1), Lit("4b", 2), Lit("6b", 3)] }
+fd DefField { ty: T60, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+
+=== Lxsu: 19 opcodes, 62 fields
+op DefOpcode { op: "IMMCOPY", ty: T111, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T40, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T14, min_arch: Mpw2 }
+op DefOpcode { op: "LDST", ty: T32, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTI", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTIU", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LDSTU", ty: T32, min_arch: Mpw2 }
+op DefOpcode { op: "LRFCOPY", ty: T20, min_arch: Mpw2 }
+op DefOpcode { op: "LRFREGCOPY", ty: T31, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFIMM", ty: T111, min_arch: Mpw2 }
+op DefOpcode { op: "MODLRFREG", ty: T31, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T11, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T40, min_arch: Mpw4 }
+op DefOpcode { op: "SUBLRFIMM", ty: T111, min_arch: Mpw2 }
+op DefOpcode { op: "SYNC", ty: T13, min_arch: Mpw2 }
+fd DefField { ty: T11, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T11, name: Either(Imm, PcTarget), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T11, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T11, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T13, name: One(Synctag), bit: WordBit(10), imm: NotAnImm, encode: [Lit("sendl3lu", 5), Lit("sendl3su", 9), Lit("recvl3su", 10), Lit("sendlxlu", 17), Lit("sendlxluboth", 81), Lit("sendrecvall", 91)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T14, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T14, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T14, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T14, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T15, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("sfp", 0), Lit("l0su", 1), Lit("pt", 2)] }
+fd DefField { ty: T15, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T111, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T111, name: One(Lrfimm), bit: WordBit(10), imm: Imm { bits: ImmWidth(21), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T111, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T20, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T20, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(14), sign: Signed }, encode: [] }
+fd DefField { ty: T20, name: One(Hwsel), bit: WordBit(24), imm: NotAnImm, encode: [Lit("no", 0)] }
+fd DefField { ty: T20, name: One(Sttype), bit: WordBit(27), imm: NotAnImm, encode: [Lit("128b", 0), Lit("16b", 1), Lit("2b", 2)] }
+fd DefField { ty: T20, name: One(Producertag), bit: WordBit(29), imm: NotAnImm, encode: [Lit("zero", 0), Lit("sfp", 1), Lit("pe", 2), Lit("lxlu", 3)] }
+fd DefField { ty: T20, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T21, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(14), sign: Signed }, encode: [] }
+fd DefField { ty: T21, name: One(Elemidx), bit: WordBit(24), imm: NotAnImm, encode: [] }
+fd DefField { ty: T21, name: One(Scaleidx), bit: WordBit(26), imm: NotAnImm, encode: [] }
+fd DefField { ty: T21, name: One(Ldtype), bit: WordBit(27), imm: NotAnImm, encode: [Lit("128b", 0), Lit("2bsplat", 1), Lit("4bsplat", 2), Lit("16bsplat", 3)] }
+fd DefField { ty: T21, name: One(Consumertag), bit: WordBit(29), imm: NotAnImm, encode: [Lit("self", 0), Lit("sfp", 1), Lit("lxsu", 2), Lit("pe", 3)] }
+fd DefField { ty: T21, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T31, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T31, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T31, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T32, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T32, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T32, name: One(Group), bit: WordBit(14), imm: NotAnImm, encode: [Lit("no", 0), Lit("x1", 1), Lit("x2", 2), Lit("x4", 3)] }
+fd DefField { ty: T32, name: One(Burst), bit: WordBit(16), imm: NotAnImm, encode: [Lit("burst", 1)] }
+fd DefField { ty: T32, name: One(Burstsize), bit: WordBit(17), imm: Imm { bits: ImmWidth(6), sign: Unsigned }, encode: [] }
+fd DefField { ty: T32, name: One(Sttype), bit: WordBit(27), imm: NotAnImm, encode: [Lit("128b", 0), Lit("16b", 1), Lit("2b", 2)] }
+fd DefField { ty: T32, name: One(Producertag), bit: WordBit(29), imm: NotAnImm, encode: [Lit("zero", 0), Lit("sfp", 1), Lit("pe", 2), Lit("lxlu", 3)] }
+fd DefField { ty: T32, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T40, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T40, name: One(Src1), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T40, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T40, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T40, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T40, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T50, name: One(Maskall), bit: WordBit(10), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T50, name: One(Sliceidxsl), bit: WordBit(11), imm: NotAnImm, encode: [] }
+fd DefField { ty: T50, name: One(Numvalidentry), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T50, name: One(Mvridx), bit: WordBit(21), imm: NotAnImm, encode: [Family(Mvrs, NumMvrs, RegBase(0))] }
+fd DefField { ty: T50, name: One(Precision), bit: WordBit(24), imm: NotAnImm, encode: [Lit("16b", 0), Lit("8b", 1), Lit("4b", 2), Lit("2b", 3)] }
+fd DefField { ty: T50, name: One(Xslinner), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T50, name: One(Wsllen), bit: WordBit(27), imm: NotAnImm, encode: [Lit("64b", 6), Lit("32b", 5), Lit("16b", 4), Lit("8b", 3), Lit("4b", 2), Lit("2b", 1), Lit("1b", 0)] }
+fd DefField { ty: T50, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T60, name: One(Mvridx), bit: WordBit(6), imm: NotAnImm, encode: [Family(Mvrs, NumMvrs, RegBase(0))] }
+fd DefField { ty: T60, name: One(Subslicesize), bit: WordBit(9), imm: NotAnImm, encode: [Lit("1b", 0), Lit("2b", 1), Lit("4b", 2), Lit("8b", 3), Lit("16b", 4), Lit("32b", 5), Lit("64b", 6), Lit("128b", 7)] }
+fd DefField { ty: T60, name: One(Startbit), bit: WordBit(12), imm: NotAnImm, encode: [] }
+fd DefField { ty: T60, name: One(Endbit), bit: WordBit(20), imm: NotAnImm, encode: [] }
+fd DefField { ty: T60, name: One(Byteshift), bit: WordBit(28), imm: NotAnImm, encode: [Lit("no", 0), Lit("2b", 1), Lit("4b", 2), Lit("6b", 3)] }
+fd DefField { ty: T60, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+
+=== L3lu: 35 opcodes, 73 fields
+op DefOpcode { op: "ADDEARIMM", ty: T1110, min_arch: Mpw2 }
+op DefOpcode { op: "ADDLARIMM", ty: T1100, min_arch: Mpw2 }
+op DefOpcode { op: "EARIMM", ty: T1112, min_arch: Mpw2 }
+op DefOpcode { op: "EARREGCOPY", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "GTRIMM", ty: T1120, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T1020, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T1030, min_arch: Mpw2 }
+op DefOpcode { op: "JCMPI", ty: T1040, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T1020, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T1020, min_arch: Mpw2 }
+op DefOpcode { op: "LARIMM", ty: T1100, min_arch: Mpw2 }
+op DefOpcode { op: "LARREGCOPY", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "MODLARREG", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "MODEARREG", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T1010, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T1000, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T1030, min_arch: Mpw4 }
+op DefOpcode { op: "SUBLARIMM", ty: T1100, min_arch: Mpw2 }
+op DefOpcode { op: "SYNC", ty: T13, min_arch: Mpw2 }
+op DefOpcode { op: "LD", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "LDG", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "LDGM", ty: T22, min_arch: Mpw2 }
+op DefOpcode { op: "LDGMU", ty: T22, min_arch: Mpw2 }
+op DefOpcode { op: "LDGU", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "LDIGM", ty: T22, min_arch: Mpw4 }
+op DefOpcode { op: "LDIGMU", ty: T22, min_arch: Mpw4 }
+op DefOpcode { op: "LDIM", ty: T22, min_arch: Mpw4 }
+op DefOpcode { op: "LDIMU", ty: T22, min_arch: Mpw4 }
+op DefOpcode { op: "LDM", ty: T22, min_arch: Mpw2 }
+op DefOpcode { op: "LDMU", ty: T22, min_arch: Mpw2 }
+op DefOpcode { op: "LDU", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "LDZ", ty: T2300, min_arch: Mpw2 }
+op DefOpcode { op: "LDZimm16", ty: T2310, min_arch: Mpw2 }
+op DefOpcode { op: "LDZU", ty: T2300, min_arch: Mpw2 }
+fd DefField { ty: T1000, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1010, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1010, name: Either(Imm, PcTarget), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1010, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1010, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1020, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1020, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T1020, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T1020, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1020, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1030, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1030, name: One(Src1), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1030, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T1030, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T1030, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1030, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1040, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1040, name: One(CmpImm), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1040, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T1040, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T1040, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1040, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1100, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1100, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(15), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T1100, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1110, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1110, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(21), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T1110, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1112, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1112, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(21), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1112, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1120, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Gtrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1120, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(14), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1120, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T12, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Soft), bit: WordBit(8), imm: NotAnImm, encode: [Lit("no", 0), Lit("yes", 1)] }
+fd DefField { ty: T13, name: One(Synctag), bit: WordBit(10), imm: NotAnImm, encode: [Lit("sendlxlu0", 17), Lit("sendlxlu1", 65), Lit("sendlxsu0", 33), Lit("sendlxsu1", 129), Lit("sendlxluboth", 81), Lit("sendlxsuboth", 161), Lit("sendl3lu", 5), Lit("sendl3su", 9), Lit("recvlxlu0", 18), Lit("recvlxlu1", 66), Lit("recvlxsu0", 34), Lit("recvlxsu1", 130), Lit("recvlxluboth", 82), Lit("recvlxsuboth", 162), Lit("recvl3lu", 6), Lit("recvl3su", 10)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T21, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Drm), bit: WordBit(10), imm: NotAnImm, encode: [Lit("no", 0), Lit("ccw", 1), Lit("cw", 2), Lit("both", 3)] }
+fd DefField { ty: T21, name: One(Node), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T21, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T21, name: One(Group), bit: WordBit(27), imm: NotAnImm, encode: [Family(Gtrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T22, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Drm), bit: WordBit(10), imm: NotAnImm, encode: [Lit("no", 0), Lit("ccw", 1), Lit("cw", 2), Lit("both", 3)] }
+fd DefField { ty: T22, name: One(Src2), bit: WordBit(14), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Src3), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T22, name: One(Group), bit: WordBit(27), imm: NotAnImm, encode: [Family(Gtrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Readibr), bit: WordBit(30), imm: NotAnImm, encode: [Lit("read", 1), Lit("write", 0)] }
+fd DefField { ty: T22, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T2210, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2210, name: One(Drm), bit: WordBit(10), imm: NotAnImm, encode: [Lit("no", 0), Lit("ccw", 1), Lit("cw", 2), Lit("both", 3)] }
+fd DefField { ty: T2210, name: One(Src2), bit: WordBit(14), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2210, name: One(Src3), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2210, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T2210, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T2300, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2300, name: One(Imm), bit: WordBit(14), imm: Imm { bits: ImmWidth(8), sign: Unsigned }, encode: [] }
+fd DefField { ty: T2300, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T2300, name: One(Mode), bit: WordBit(27), imm: NotAnImm, encode: [Lit("zero2lx", 0), Lit("imm2lx", 1), Lit("zr2lx", 3)] }
+fd DefField { ty: T2300, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T2300, name: One(DatatypeVirtual), bit: WordBit(100), imm: NotAnImm, encode: [] }
+fd DefField { ty: T2310, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T2310, name: One(Mode), bit: WordBit(27), imm: NotAnImm, encode: [Lit("imm2zr", 2)] }
+fd DefField { ty: T2310, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T24, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T24, name: One(Ibr), bit: WordBit(30), imm: NotAnImm, encode: [Lit("write", 1), Lit("none", 0)] }
+fd DefField { ty: T24, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+
+=== L3su: 29 opcodes, 72 fields
+op DefOpcode { op: "ADDEARIMM", ty: T1110, min_arch: Mpw2 }
+op DefOpcode { op: "ADDLARIMM", ty: T1100, min_arch: Mpw2 }
+op DefOpcode { op: "EARIMM", ty: T1112, min_arch: Mpw2 }
+op DefOpcode { op: "EARREGCOPY", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "GTRIMM", ty: T1120, min_arch: Mpw2 }
+op DefOpcode { op: "JADD", ty: T1020, min_arch: Mpw2 }
+op DefOpcode { op: "JCMP", ty: T1030, min_arch: Mpw2 }
+op DefOpcode { op: "JCMPI", ty: T1040, min_arch: Mpw2 }
+op DefOpcode { op: "JIMMCOPY", ty: T1020, min_arch: Mpw2 }
+op DefOpcode { op: "JSUB", ty: T1020, min_arch: Mpw2 }
+op DefOpcode { op: "LARIMM", ty: T1100, min_arch: Mpw2 }
+op DefOpcode { op: "LARREGCOPY", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "MODLARREG", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "MODEARREG", ty: T12, min_arch: Mpw2 }
+op DefOpcode { op: "MVLOOPCNT", ty: T1010, min_arch: Mpw2 }
+op DefOpcode { op: "NOP", ty: T1000, min_arch: Mpw2 }
+op DefOpcode { op: "RETURN", ty: T18, min_arch: Mpw2 }
+op DefOpcode { op: "SJCMP", ty: T1030, min_arch: Mpw4 }
+op DefOpcode { op: "SUBLARIMM", ty: T1100, min_arch: Mpw2 }
+op DefOpcode { op: "SYNC", ty: T13, min_arch: Mpw2 }
+op DefOpcode { op: "ST", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "STG", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "STGU", ty: T21, min_arch: Mpw2 }
+op DefOpcode { op: "STIM", ty: T2210, min_arch: Mpw4 }
+op DefOpcode { op: "STIMU", ty: T2210, min_arch: Mpw4 }
+op DefOpcode { op: "STZ", ty: T24, min_arch: Mpw4 }
+op DefOpcode { op: "STM", ty: T22, min_arch: Mpw2 }
+op DefOpcode { op: "STMU", ty: T22, min_arch: Mpw2 }
+op DefOpcode { op: "STU", ty: T21, min_arch: Mpw2 }
+fd DefField { ty: T1000, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T18, name: One(Subroutine), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1010, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Jcrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1010, name: Either(Imm, PcTarget), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1010, name: One(DynLoop), bit: WordBit(26), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1010, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1020, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1020, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(16), sign: Signed }, encode: [] }
+fd DefField { ty: T1020, name: One(JcrSelect), bit: WordBit(26), imm: NotAnImm, encode: [Lit("usejcr", 1), Lit("uselccr", 0)] }
+fd DefField { ty: T1020, name: One(JcrTarget), bit: WordBit(27), imm: NotAnImm, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1020, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1030, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1030, name: One(Src1), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: ModuloUnsigned }, encode: [Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1030, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T1030, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T1030, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1030, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1040, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Lccrs, NumLccrs, RegBase(0)), Family(Jcrs, NumJcrs, RegBase(0))] }
+fd DefField { ty: T1040, name: One(CmpImm), bit: WordBit(10), imm: Imm { bits: ImmWidth(8), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1040, name: One(Mode), bit: WordBit(19), imm: NotAnImm, encode: [Lit("always", 0), Lit("lt", 1), Lit("eq", 2), Lit("le", 3), Lit("gt", 4), Lit("ne", 5), Lit("ge", 6), Lit("never", 7)] }
+fd DefField { ty: T1040, name: One(PcTarget), bit: WordBit(22), imm: NotAnImm, encode: [] }
+fd DefField { ty: T1040, name: One(Isimm), bit: WordBit(30), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1040, name: One(Usejcr), bit: WordBit(31), imm: NotAnImm, encode: [Lit("yes", 1), Lit("no", 0)] }
+fd DefField { ty: T1100, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1100, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(15), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T1100, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1110, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1110, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(21), sign: ModuloUnsigned }, encode: [] }
+fd DefField { ty: T1110, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1112, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1112, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(21), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1112, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T1120, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Gtrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T1120, name: One(Imm), bit: WordBit(10), imm: Imm { bits: ImmWidth(14), sign: Unsigned }, encode: [] }
+fd DefField { ty: T1120, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T12, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T12, name: One(Src1), bit: WordBit(10), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T12, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T13, name: One(Synctag), bit: WordBit(10), imm: NotAnImm, encode: [Lit("sendlxlu0", 17), Lit("sendlxlu1", 65), Lit("sendlxsu0", 33), Lit("sendlxsu1", 129), Lit("sendlxluboth", 81), Lit("sendlxsuboth", 161), Lit("sendl3lu", 5), Lit("sendl3su", 9), Lit("recvlxlu0", 18), Lit("recvlxlu1", 66), Lit("recvlxsu0", 34), Lit("recvlxsu1", 130), Lit("recvlxluboth", 82), Lit("recvlxsuboth", 162), Lit("recvl3lu", 6), Lit("recvl3su", 10)] }
+fd DefField { ty: T13, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T21, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Drm), bit: WordBit(10), imm: NotAnImm, encode: [Lit("no", 0), Lit("ccw", 1), Lit("cw", 2), Lit("both", 3)] }
+fd DefField { ty: T21, name: One(Node), bit: WordBit(14), imm: NotAnImm, encode: [] }
+fd DefField { ty: T21, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T21, name: One(Group), bit: WordBit(27), imm: NotAnImm, encode: [Family(Gtrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T21, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T22, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Drm), bit: WordBit(10), imm: NotAnImm, encode: [Lit("no", 0), Lit("ccw", 1), Lit("cw", 2), Lit("both", 3)] }
+fd DefField { ty: T22, name: One(Src2), bit: WordBit(14), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Src3), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T22, name: One(Group), bit: WordBit(27), imm: NotAnImm, encode: [Family(Gtrs, NumRegs, RegBase(0))] }
+fd DefField { ty: T22, name: One(Readibr), bit: WordBit(30), imm: NotAnImm, encode: [Lit("read", 1), Lit("write", 0)] }
+fd DefField { ty: T22, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T2210, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2210, name: One(Drm), bit: WordBit(10), imm: NotAnImm, encode: [Lit("no", 0), Lit("ccw", 1), Lit("cw", 2), Lit("both", 3)] }
+fd DefField { ty: T2210, name: One(Src2), bit: WordBit(14), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2210, name: One(Src3), bit: WordBit(18), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2210, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T2210, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T2300, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T2300, name: One(Imm), bit: WordBit(14), imm: Imm { bits: ImmWidth(8), sign: Unsigned }, encode: [] }
+fd DefField { ty: T2300, name: One(Burst), bit: WordBit(22), imm: NotAnImm, encode: [Family(BurstLen, Fixed(32), RegBase(0))] }
+fd DefField { ty: T2300, name: One(Mode), bit: WordBit(27), imm: NotAnImm, encode: [Lit("zero2lx", 0), Lit("imm2lx", 1), Lit("zr2lx", 3)] }
+fd DefField { ty: T2300, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T2300, name: One(DatatypeVirtual), bit: WordBit(100), imm: NotAnImm, encode: [] }
+fd DefField { ty: T2310, name: One(Imm), bit: WordBit(6), imm: Imm { bits: ImmWidth(16), sign: Unsigned }, encode: [] }
+fd DefField { ty: T2310, name: One(Mode), bit: WordBit(27), imm: NotAnImm, encode: [Lit("imm2zr", 2)] }
+fd DefField { ty: T2310, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
+fd DefField { ty: T24, name: One(Src0), bit: WordBit(6), imm: NotAnImm, encode: [Family(Regs, NumRegs, RegBase(0))] }
+fd DefField { ty: T24, name: One(Ibr), bit: WordBit(30), imm: NotAnImm, encode: [Lit("write", 1), Lit("none", 0)] }
+fd DefField { ty: T24, name: One(Be), bit: WordBit(31), imm: NotAnImm, encode: [Lit("be", 1)] }
