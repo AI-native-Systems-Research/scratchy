@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "PORT campaign: bridge 2 of IBM Spyre deeptools — DataflowIR -> SentientIR, the D1-D28 span.",
+    "The scope is ONE self-contained translation unit, source/bridge2.cpp, holding the 384 function",
+    "bodies to port, extracted verbatim from dcc/src/{Transform/Dataflow,Conversion/*} and each",
+    "preceded by a banner giving its entry number and its ORIGINAL dcc/src/<file>:<line>.",
+    "",
+    "There is no MLIR, LLVM or dcc header anywhere in this campaign. source/prelude.inc declares",
+    "plain-C++ stand-ins for every name the bodies call, so the unit stands alone. The stand-ins",
+    "carry names and shapes only — the behaviour to port lives in the bodies."
+  ],
+  "campaign_objective": "port",
+  "impl_files": ["source/bridge2.cpp"],
+  "api_headers": [],
+  "_comment_excluded": [
+    "106 of the span's 490 definitions are NOT in bridge2.cpp, listed with a reason each in",
+    "../crates/compiler/deeptools/docs/bridge2-porting-order.md. The criterion is what scratchy's",
+    "architecture will never need, NOT what is unfinished:",
+    "  81  C++ field accessors and data members — a struct field in Rust, not a function",
+    "  19  MLIR pass machinery — createXPass, populateXConversionPatterns, getDependentDialects, the",
+    "      pass context, pattern-driver configuration. scratchy's #[forward] runs the whole pipeline",
+    "      at macro expansion: no pass manager, no pattern driver, no rewriter exists at run time",
+    "   5  printing, parsing and verification — this crate emits and never reads MLIR back",
+    "   1  a pass driver whose whole body is pipeline plumbing",
+    "",
+    "Nothing is excluded for being hard or unfinished. 50 loop-sensitive functions remain IN scope."
+  ],
+  "out_of_scope": { "paths": [], "features": [] }
+}

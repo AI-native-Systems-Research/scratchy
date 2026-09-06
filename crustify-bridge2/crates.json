@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "The port lands in the existing scratchy crate, not a new one:",
+    "crates/compiler/deeptools/src/bridges/dataflow_ir_to_sentient/.",
+    "",
+    "It is called from emit_run in crates/targets/spyre/src/lower_subtile_tape_to_dataflow_ir.rs —",
+    "the only place the typed dataflow_ir::Run exists. There is no MLIR text on the input side and",
+    "no parser in this crate: the input is a typed value and the output is typed sentient ops.",
+    "",
+    "No -sys crate: this is a complete port with no C interop boundary."
+  ],
+  "crates": {
+    "deeptools": {
+      "path": "../crates/compiler/deeptools",
+      "kind": "lib",
+      "_comment_target_module": "All ported code goes under src/bridges/dataflow_ir_to_sentient/.",
+      "modules": {
+        "agen_to_sentient": {
+          "_comment": "The transfer statements: load_and_send, receive_and_store, load_and_store, addressing, ldtype, bursts, interleave.",
+          "symbols": ["Conversion/AgenToSentient/Helper.cpp", "Conversion/AgenToSentient/AccessDetails.cpp", "Conversion/AgenToSentient/AgenToSentient.cpp"]
+        },
+        "dataflow_to_sentient": {
+          "_comment": "Unit and group lowering, the sync statements, the corelet-N neighbour naming.",
+          "symbols": ["Conversion/DataflowToSentient/DataflowToSentient.cpp"]
+        },
+        "vectorchain": {
+          "_comment": "The computes: mac, binary, unary, splat, merge/pack, the gcvt/fcvt table, masks, PT and PE/SFP lowering.",
+          "symbols": ["Conversion/VectorChainLowering/"]
+        },
+        "transform": {
+          "_comment": "The in-place DataflowIR rewrites: program-unit reduction, mutable start-addr shifting, paged memory views, flattening, toggle canonicalisation.",
+          "symbols": ["Transform/Dataflow/"]
+        },
+        "standard_and_scf": {
+          "_comment": "arith/scf/affine to sentient: scalar ops, constants, branches, terminators.",
+          "symbols": ["Conversion/StandardToSentient/", "Conversion/SCFToSentient/", "Conversion/AffineToStandard/", "Conversion/SymbolToSentient/"]
+        }
+      }
+    }
+  }
+}
