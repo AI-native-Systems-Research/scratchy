@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Bridge-2 campaign build manifest. The campaign ports C++ into an EXISTING Rust crate",
+    "(crates/compiler/deeptools); there is no C build to configure, no shim to compile and no",
+    "FFI boundary, so `configure` is a no-op and the C-side gates in the translator playbook",
+    "do not apply.",
+    "",
+    "⛔ TRANSLATOR GATE — run EXACTLY these two, from the repo root:",
+    "     cargo check -p deeptools",
+    "     cargo test  -p deeptools",
+    "   Both are seconds-to-a-minute: `deeptools` has one path dependency (sys-arch-spec) and no",
+    "   registry deps. DO NOT run the workspace-wide or acceptance build in an agent worktree —",
+    "   its target/ is ~6 GB and there is under 50 GB free on this host; the orchestrator owns",
+    "   that gate and runs it once per landed sub-campaign.",
+    "",
+    "⛔ THE SPECIFIED ACCEPTANCE COMMAND DOES NOT BUILD ON THIS HOST:",
+    "     cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel",
+    "   `superdsc` on the CLI turns on scratchy-serving-worker/sendnn -> flex-rs, whose build.rs",
+    "   cc-compiles a senlib shim against /opt/ibm/spyre/senlib/include — Spyre-host-only headers",
+    "   that do not exist on this Mac (measured: fatal error: 'senlib/1p0/senpci.hpp' file not",
+    "   found). The `pipeline` command below is the largest runnable prefix that still expands",
+    "   #[forward] and therefore still runs this bridge over every staged program."
+  ],
+  "version": 1,
+  "build_commands": {
+    "configure": "true",
+    "build": "cargo check -p deeptools",
+    "test": "cargo test -p deeptools",
+    "pipeline": "cargo build -p scratchy-models --features superdsc,granite-3.1-2b-instruct,scratchy-quantizations/fp8-dynamic-per-channel",
+    "acceptance_on_a_spyre_host": "cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel"
+  }
+}

@@ -1,0 +1,19 @@
+# PLACEHOLDER, deliberately empty.
+#
+# This campaign is a complete port with NO C interop boundary: no bindgen, no raw ABI gateway, no
+# `-sys` surface (see ../../crates.json). `crustify translate` nevertheless requires an
+# orchestrator-authored `<crate>-sys/Cargo.toml` for every crate a wave links
+# (crustify/src/crustify/translate.py::_check_ffi_crates), so this shell exists to satisfy that
+# gate and nothing else. Nothing depends on it and nothing should.
+#
+# `[workspace]` detaches it from the scratchy workspace above it.
+[package]
+name = "deeptools-sys"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

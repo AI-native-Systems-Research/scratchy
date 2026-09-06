@@ -1,0 +1,25 @@
+# Example <repo>/crustify/.gitignore.
+
+.providers
+tmp
+.worktrees
+rust/target
+rust.bak
+
+# Oracle extraction and deterministic caches. Target configs and ownership
+# findings remain tracked.
+wavefront/codeql
+wavefront/.cache
+
+# Campaign plans are tracked; execution logs are not.
+campaigns/**/logs
+
+# Deterministic safety scan output.
+audit/unsafe.json
+
+# Machine-local dependency and binary paths.
+cli-config.json
+
+bak
+stats.md
+evaluation/**/manifests/

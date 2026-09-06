@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Campaign-wide inventory for bridge 2 (DataflowIR -> SentientIR, the D1-D28 span).",
+    "",
+    "⛔ THERE IS NO CODEQL DATABASE AND NO WAVEFRONT EXTRACTION FOR THIS CAMPAIGN, and that is a",
+    "decision, not an omission:",
+    "  1. The campaign's C++ surface is ONE self-contained translation unit",
+    "     crustify-bridge2/source/bridge2.cpp, whose 384 function bodies call names that exist only",
+    "     as SEMANTICALLY EMPTY stand-ins in source/prelude.inc. A CodeQL call graph over stand-ins",
+    "     yields edges through a stub type, so it cannot order this work.",
+    "  2. The dependency order is already AUTHORITATIVE and machine-readable: bridge2.cpp is emitted",
+    "     in dependency order with LEVEL banners (level 0 calls nothing else in the span, level N",
+    "     only levels below), and every entry carries its original dcc/src/<file>:<line> citation.",
+    "     crates/compiler/deeptools/docs/bridge2-porting-order.md lists all 384 in that order.",
+    "  3. prelude.inc does not compile cleanly (523 clang -fsyntax-only errors, all name-resolution",
+    "     in the generated stand-ins), so a database built from it would drop bodies anyway.",
+    "The wave plans under crustify/campaigns/*/ are therefore authored from those level banners; the",
+    "batch caps recorded in each schedule are wavefront's own documented defaults (translation) and",
+    "3x them (review).",
+    "",
+    "This file is the provenance the schedules record and hash. Keep it byte-stable while a wave is",
+    "in flight: `crustify translate` rejects a schedule whose oracle config changed since planning."
+  ],
+  "campaign_objective": "port",
+  "impl_files": ["crustify-bridge2/source/bridge2.cpp"],
+  "api_headers": [],
+  "out_of_scope": { "paths": ["crustify-bridge2/source/prelude.inc"], "features": [] },
+  "_comment_authority": [
+    "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
+    "  /Users/nickm/git/deeptools-src   (repo_info.txt: deeptools|master|a0d29abbedfa2dd44ec7255e59440b06a429118c)",
+    "which is exactly the revision the banners cite. ⛔ MEASURED: the extract in bridge2.cpp is",
+    "TRUNCATED AT THE TAIL OF EVERY BODY — 366 of 384 bodies end in a blank line followed by bare",
+    "closing braces, and a 48-entry sample against the authority found 21 with real trailing",
+    "statements dropped (`return success();`, `return rhs;`, a whole `} else { ... }` branch in",
+    "e217_lowerVectorLoadHelper, `initMASData(...)` in e289_initialize). PORT FROM THE AUTHORITY FILE",
+    "AT THE CITED LINE; use bridge2.cpp only to know WHICH function and in WHAT ORDER.",
+    "⛔ /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+  ]
+}

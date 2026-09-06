@@ -1,0 +1,34 @@
+{
+ "_comment": [
+  "Narrow inventory for sub-campaign `levels8-10-pass-drivers`: bridge2.cpp LEVEL(S) [8, 9, 10] \u2014 11 of the span's 384 functions, entries 374-381 (L8), 382-383 (L9), 384-384 (L10).",
+  "impl_files is the same single translation unit as the campaign-wide config (the campaign has exactly one); the NARROWING is the level range above, which is what the schedules beside this file select. Every producer level lands before this one starts.",
+  "Read crustify/wavefront/wavefront-config.json for why this campaign has no CodeQL oracle and where the authoritative C++ lives."
+ ],
+ "campaign_objective": "port",
+ "impl_files": [
+  "crustify-bridge2/source/bridge2.cpp"
+ ],
+ "api_headers": [],
+ "out_of_scope": {
+  "paths": [
+   "crustify-bridge2/source/prelude.inc"
+  ],
+  "features": []
+ },
+ "_comment_authority": [
+  "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
+  "  /Users/nickm/git/deeptools-src   (repo_info.txt: deeptools|master|a0d29abbedfa2dd44ec7255e59440b06a429118c)",
+  "which is exactly the revision the banners cite. \u26d4 MEASURED: the extract in bridge2.cpp is",
+  "TRUNCATED AT THE TAIL OF EVERY BODY \u2014 366 of 384 bodies end in a blank line followed by bare",
+  "closing braces, and a 48-entry sample against the authority found 21 with real trailing",
+  "statements dropped (`return success();`, `return rhs;`, a whole `} else { ... }` branch in",
+  "e217_lowerVectorLoadHelper, `initMASData(...)` in e289_initialize). PORT FROM THE AUTHORITY FILE",
+  "AT THE CITED LINE; use bridge2.cpp only to know WHICH function and in WHAT ORDER.",
+  "\u26d4 /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+ ],
+ "_comment_levels": [
+  8,
+  9,
+  10
+ ]
+}
