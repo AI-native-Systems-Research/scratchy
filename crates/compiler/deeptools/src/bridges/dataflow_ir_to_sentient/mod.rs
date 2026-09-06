@@ -309,6 +309,28 @@ fn statement<A: Arch>(
             1
         }
 
+        // ── the `affine` ops ─────────────────────────────────────────────────────────────────────
+        // ⛔ NO WILDCARD: a fifth `affine` op must be a build error, not an inherited default.
+        [DfirOp::Affine(op), ..] => {
+            match op {
+                dfir_op::affine::Op::Yield { operands } => {
+                    // ⭐ 001/490. The parent is the op whose body we are walking; `body` is only ever
+                    // called on a `dataflow.program_unit`'s statement list, so at this call site the
+                    // parent is never an `scf.parallel` — `lower_affine_yield` is still the one place
+                    // the rule lives, and the loop lowering passes its own parent when it walks a body.
+                    match lower_affine_yield(Parent::Other, operands) {
+                        YieldRewrite::Yielded(op) => out.push(SenOp::Scf(op)),
+                        YieldRewrite::Declined => {}
+                    }
+                }
+                dfir_op::affine::Op::For { .. } => todo!("affine.for -> the loop lowering"),
+                dfir_op::affine::Op::Apply { .. } => todo!("affine.apply"),
+                dfir_op::affine::Op::VectorLoad { .. } => todo!("affine.vector_load"),
+                dfir_op::affine::Op::VectorStore { .. } => todo!("affine.vector_store"),
+            }
+            1
+        }
+
         _ => todo!(
             "lower a statement this bridge has not met, on {:?}: {:?}",
             unit.on.kind(),
@@ -442,4 +464,109 @@ fn rectangle(set: &crate::islands::dataflow_ir::ty::IntegerSet) -> Vec<u64> {
         }
     }
     widths
+}
+
+/// WHAT ENCLOSES A TERMINATOR — the one input `AffineYieldOpLowering` reads besides the op itself.
+///
+/// ⛔ THE KIND, NOT THE OP. The reference asks exactly one question of the parent —
+/// `isa<scf::ParallelOp>(op->getParentOp())` — so carrying the whole parent would offer callers a
+/// dozen other questions the rule does not ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parent {
+    /// An `scf.parallel`. ⛔ THE ONE CASE THAT DECLINES.
+    ScfParallel,
+    /// Anything else — an `affine.for`, an `scf.if`, a `dataflow.program_unit`.
+    Other,
+}
+
+/// THE RESULT OF THE REWRITE — ⛔ DECLINING IS NOT FAILING.
+///
+/// ⛔⛔ THE REFERENCE RETURNS `LogicalResult::failure()` AND THAT IS NOT AN ERROR. In MLIR a pattern
+/// returning failure means *this pattern does not apply here*; the driver tries others and the module
+/// is untouched. `AffineParallelLowering` rewrites the terminator instead
+/// (`AffineToStandard.cpp:42-46`: *"Terminator is rewritten as part of the 'affine.parallel' lowering
+/// pattern."*). Modelling it as an error would stop a lowering that the reference completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum YieldRewrite {
+    /// The `scf.yield` that replaces the `affine.yield`.
+    Yielded(dfir_op::scf::Op),
+    /// This pattern does not apply — the parallel lowering owns this terminator.
+    Declined,
+}
+
+/// **001/490** `AffineYieldOpLowering::matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41` (8L).
+///
+/// ```cpp
+/// LogicalResult matchAndRewrite(AffineYieldOp op, PatternRewriter &rewriter) const override {
+///   if (isa<scf::ParallelOp>(op->getParentOp())) {
+///     // Terminator is rewritten as part of the "affine.parallel" lowering pattern.
+///     return failure();
+///   }
+///   rewriter.replaceOpWithNewOp<scf::YieldOp>(op, op.getOperands());
+///   return success();
+/// }
+/// ```
+///
+/// ⛔ THE OPERANDS CARRY THROUGH UNCHANGED. `replaceOpWithNewOp<scf::YieldOp>(op, op.getOperands())`
+/// passes the yield's own operand list to the new op, so a loop carrying two values yields two. An
+/// empty list is a terminator of a loop that carries nothing, not a missing list.
+pub fn lower_affine_yield(parent: Parent, operands: &[Val]) -> YieldRewrite {
+    match parent {
+        Parent::ScfParallel => YieldRewrite::Declined,
+        Parent::Other => YieldRewrite::Yielded(dfir_op::scf::Op::Yield {
+            operands: operands.to_vec(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🎯 001/490 — AN `affine.yield` BECOMES AN `scf.yield` CARRYING THE SAME OPERANDS.
+    #[test]
+    fn an_affine_yield_becomes_an_scf_yield() {
+        let carried = [Val(7), Val(9)];
+        assert_eq!(
+            lower_affine_yield(Parent::Other, &carried),
+            YieldRewrite::Yielded(dfir_op::scf::Op::Yield {
+                operands: vec![Val(7), Val(9)],
+            }),
+            "the operand list passes through unchanged"
+        );
+    }
+
+    /// 🎯 001/490 — AND A LOOP CARRYING NOTHING STILL YIELDS.
+    ///
+    /// ⛔ AN EMPTY OPERAND LIST IS A TERMINATOR, not an absent one. The reference has no arm for it:
+    /// `getOperands()` on a bare `affine.yield` is empty and the rewrite runs anyway.
+    #[test]
+    fn a_yield_with_no_carried_values_still_rewrites() {
+        assert_eq!(
+            lower_affine_yield(Parent::Other, &[]),
+            YieldRewrite::Yielded(dfir_op::scf::Op::Yield { operands: Vec::new() })
+        );
+    }
+
+    /// 🎯 001/490 — UNDER AN `scf.parallel` THE PATTERN DECLINES.
+    ///
+    /// ⛔ AND DECLINING MUST NOT EMIT. The parallel lowering rewrites this terminator itself; a
+    /// rewrite here as well would produce two `scf.yield`s for one `affine.yield`.
+    #[test]
+    fn under_a_parallel_parent_the_pattern_declines() {
+        assert_eq!(lower_affine_yield(Parent::ScfParallel, &[Val(1)]), YieldRewrite::Declined);
+    }
+
+    /// 🎯 001/490 — AND THE TWO TERMINATORS PRINT AS THE REFERENCE WRITES THEM.
+    #[test]
+    fn the_terminators_print() {
+        use crate::islands::dataflow_ir::print;
+        let mut out = String::new();
+        print::emit(&mut out, &DfirOp::Scf(dfir_op::scf::Op::Yield { operands: vec![Val(3)] }), 0);
+        assert_eq!(out.trim(), "scf.yield %3");
+        out.clear();
+        print::emit(&mut out, &DfirOp::Affine(dfir_op::affine::Op::Yield { operands: Vec::new() }), 0);
+        assert_eq!(out.trim(), "affine.yield");
+    }
 }

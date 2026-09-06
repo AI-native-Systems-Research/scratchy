@@ -44,6 +44,17 @@ pub enum Op {
         args: Vec<Val>,
     },
 
+    /// `affine.yield %operands` — a loop's terminator, carrying its loop-carried values.
+    ///
+    /// ⛔ THE OPERANDS ARE THE CARRIED VALUES, which is why the terminator is an op with a list and
+    /// not a bare keyword: `AffineYieldOpLowering` rewrites it to an `scf.yield` carrying THE SAME
+    /// operands (`AffineToStandard.cpp:48`), so an empty list and a two-value list are different
+    /// terminators, not the same one written differently.
+    Yield {
+        /// The values the loop carries out of this iteration.
+        operands: Vec<Val>,
+    },
+
     /// `affine.vector_load %view[..] : memref<..>, vector<..>`.
     ///
     /// ⛔ THE `dcc-opt` FORM. The BRIDGE emits [`super::agen::Op::VectorLoad`]; see there.
@@ -100,6 +111,13 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::affine_map(map),
                 print::vals(args)
             );
+        }
+        Op::Yield { operands } => {
+            if operands.is_empty() {
+                out.push_str("affine.yield\n");
+            } else {
+                let _ = writeln!(out, "affine.yield {}", print::vals(operands));
+            }
         }
         Op::VectorLoad {
             result,
