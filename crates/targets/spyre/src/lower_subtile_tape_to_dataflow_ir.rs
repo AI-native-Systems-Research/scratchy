@@ -541,6 +541,27 @@ fn emit_run<M: Model, W: Workload>(nodes: &[Node], group: u32) -> String {
     // something a caller could log and carry on from, which is exactly how this bridge went blind.
     let run = tape::compile::<Dd2, M, W>(nodes, GroupId(group))
         .unwrap_or_else(|e| panic!("deeptools could not walk the tape: {e:?}"));
+
+    // ⛔⛔ BRIDGE 2 RUNS HERE, ON THE TYPED VALUE, AND NOWHERE ELSE IS POSSIBLE. This is the only
+    // point in the build where a `dataflow_ir::Run` exists: `print::run` below turns it into
+    // characters because `dbo-opt` consumes characters, and nothing in `deeptools` parses MLIR back.
+    // A bridge validated against text fixtures would need its input transcribed by hand; called from
+    // here it runs over every program the bake stages, and a `todo!` inside it stops this build and
+    // names the op it could not lower.
+    //
+    // ⭐ THE DATAFLOWIR IS STILL WHAT GETS STAGED. Bridge 2 does not yet produce a program dbo-opt
+    // could compile, so switching the staged artifact now would break the one path that works. What
+    // this call buys today is COVERAGE: build through = the lowering met every op in all 417
+    // programs. Correctness comes next, from the reference's own SentientIR.
+    let sentient = deeptools::bridges::dataflow_ir_to_sentient::lower::<Dd2, M, W>(&run);
+    let text = deeptools::islands::sentient::print::run(&sentient);
+    eprintln!(
+        "[spyre-sentient] {}: {} program(s) -> {} bytes of SentientIR",
+        run.kernel,
+        sentient.programs.len(),
+        text.len()
+    );
+
     print::run(&run)
 }
 

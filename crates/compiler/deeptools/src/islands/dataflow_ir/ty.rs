@@ -85,6 +85,26 @@ pub enum ElemType {
 }
 
 impl ElemType {
+    /// HOW MANY **BITS** ONE ELEMENT OCCUPIES.
+    ///
+    /// ⛔⛔ BITS, BECAUSE THAT IS WHAT CONSUMES IT. Every `element_size` attribute in
+    /// `SentientOps.td` is a bit width — its own example walks *"64 16 bit elements"* at
+    /// `element_size = 16` and reinterprets them as *"four 4 bit elements"* at `element_size = 4`
+    /// (`SentientOps.td:443-456`) — so a byte width here would be eight times too small at every
+    /// use while still printing plausibly for f16.
+    ///
+    /// ⛔ TOTAL OVER THE ENUM, NO WILDCARD: a new element type must state its width.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        match self {
+            ElemType::Int(bits) | ElemType::MxFloat(bits) => bits,
+            ElemType::F16 | ElemType::Bf16 => 16,
+            ElemType::F32 => 32,
+            ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu => 8,
+            ElemType::F4E2M1Fn => 4,
+        }
+    }
+
     /// THE ELEMENT TYPE ONE FORMAT HAS, on this component, in this category.
     ///
     /// A transcription of `SNComputeLowering::constructTypeFromFormat`
