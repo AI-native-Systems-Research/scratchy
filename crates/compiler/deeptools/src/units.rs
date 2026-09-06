@@ -242,8 +242,8 @@ impl<const ROWS: u32> PtRow<ROWS> {
 /// (`DSC2ToDataflowIRUtils.hpp:180-183`), which matches the arch having no scale region before then
 /// ([`Arch::L0_SCALE_CAPACITY`] is zero on RCUDD1A).
 #[must_use]
-pub fn local_units(of: Unit) -> Vec<crate::islands::dataflow_ir::op::LocalUnit> {
-    use crate::islands::dataflow_ir::op::LocalUnit;
+pub fn local_units(of: Unit) -> Vec<crate::islands::dataflow_ir::dialects::dataflow::LocalUnit> {
+    use crate::islands::dataflow_ir::dialects::dataflow::LocalUnit;
     use crate::islands::dataflow_ir::ty::GenericComp;
 
     let mut files = match of.generic() {
