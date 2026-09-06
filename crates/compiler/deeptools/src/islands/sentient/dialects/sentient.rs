@@ -19,7 +19,7 @@
 
 use std::fmt::Write as _;
 
-use crate::arch::{Bytes, Elements};
+use crate::arch::{Bounded, Bytes, Elements};
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
 use crate::islands::sentient::dialects::Val;
@@ -164,8 +164,8 @@ pub enum Port {
     Irf0,
     /// `irf1`.
     Irf1,
-    /// `lrf<n>` — ⛔ `n < 32`, and the encoding is split; see the type's note.
-    Lrf(u8),
+    /// `lrf<n>` — ⛔ THE INDEX IS BOUNDED BY THE TYPE; see [`LrfIndex`].
+    Lrf(LrfIndex),
     /// `latch`.
     Latch,
     /// `opA` — ⭐ CAMEL-CASED IN THE IR, unlike every other case.
@@ -194,20 +194,65 @@ pub enum Port {
     Nfwd2,
     /// `nbrslice`.
     NbrSlice,
-    /// `istate<n>` — ⛔ `n < 4`. The internal state registers a compare may forward to.
-    IState(u8),
+    /// `istate<n>` — the internal state registers a compare may forward to. ⛔ Bounded; see
+    /// [`IStateIndex`].
+    IState(IStateIndex),
     /// `crossptnlink`.
     CrossPtNorthLink,
 }
 
-impl Port {
-    /// HOW MANY `lrf<n>` THE INSTRUCTION FIELD CAN NAME — thirty-two (`SentientTypes.td:108-160`).
-    ///
-    /// ⛔ NOT A REGISTER-FILE DEPTH. See the type's own note.
-    pub const LRF_COUNT: u8 = 32;
+/// WHICH `lrf<n>` — ⛔ AN INDEX THE INSTRUCTION FIELD CAN ACTUALLY NAME.
+///
+/// ⛔⛔ THIS WAS A BARE `u8` GUARDED BY A RUNTIME `assert!` INSIDE `Port::encoding`, WHICH IS THE
+/// FAILURE MODE THIS REPO REFUSES ON PRINCIPLE: `Port::Lrf(200)` was constructible, travelled through
+/// every lowering, and aborted at print time — the furthest possible point from the mistake. A
+/// checked constructor makes it unrepresentable instead, which is the same shape as
+/// [`crate::units::CoreId::checked`].
+///
+/// ⛔ THIRTY-TWO IS WHAT THE ISA FIELD ENCODES, NOT A REGISTER FILE'S DEPTH. The SFP/PE LRF holds
+/// sixteen on this target and the state file one, and those vary by arch where this number does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LrfIndex(Bounded<32>);
 
-    /// How many `istate<n>` exist — four (`SentientTypes.td:143-146`).
-    pub const ISTATE_COUNT: u8 = 4;
+impl LrfIndex {
+    /// An index, or `None` where the instruction field could not name it.
+    #[must_use]
+    pub const fn checked(index: u32) -> Option<LrfIndex> {
+        match Bounded::checked(index) {
+            Some(bounded) => Some(LrfIndex(bounded)),
+            None => None,
+        }
+    }
+
+    /// The index.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// WHICH `istate<n>` — four exist (`SentientTypes.td:143-146`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IStateIndex(Bounded<4>);
+
+impl IStateIndex {
+    /// An index, or `None` where there is no such state register.
+    #[must_use]
+    pub const fn checked(index: u32) -> Option<IStateIndex> {
+        match Bounded::checked(index) {
+            Some(bounded) => Some(IStateIndex(bounded)),
+            None => None,
+        }
+    }
+
+    /// The index.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl Port {
 
     /// The spelling the attribute carries.
     ///
@@ -228,7 +273,7 @@ impl Port {
             Self::Xrf => "xrf".to_owned(),
             Self::Irf0 => "irf0".to_owned(),
             Self::Irf1 => "irf1".to_owned(),
-            Self::Lrf(n) => format!("lrf{n}"),
+            Self::Lrf(n) => format!("lrf{}", n.get()),
             Self::Latch => "latch".to_owned(),
             Self::OpA => "opA".to_owned(),
             Self::OpB => "opB".to_owned(),
@@ -243,7 +288,7 @@ impl Port {
             Self::Nfwd0 => "nfwd0".to_owned(),
             Self::Nfwd2 => "nfwd2".to_owned(),
             Self::NbrSlice => "nbrslice".to_owned(),
-            Self::IState(n) => format!("istate{n}"),
+            Self::IState(n) => format!("istate{}", n.get()),
             Self::CrossPtNorthLink => "crossptnlink".to_owned(),
         }
     }
@@ -257,9 +302,8 @@ impl Port {
     /// (`SentientTypes.td:131-132`) — a contiguous run would put `pe` on a value the enum does not
     /// define.
     ///
-    /// # Panics
-    /// If `Lrf(n)` has `n >= 32` or `IState(n)` has `n >= 4` — an index the instruction field
-    /// cannot encode.
+    /// ⭐ AND IT IS TOTAL — no assertion and no panic, because [`LrfIndex`] and [`IStateIndex`]
+    /// admit no index this could not encode.
     #[must_use]
     pub const fn encoding(self) -> u32 {
         match self {
@@ -276,11 +320,10 @@ impl Port {
             Self::Irf0 => 10,
             Self::Irf1 => 11,
             Self::Lrf(n) => {
-                assert!(n < Self::LRF_COUNT, "lrf index past what the field encodes");
-                if n < 16 {
-                    12 + n as u32
+                if n.get() < 16 {
+                    12 + n.get()
                 } else {
-                    48 + (n as u32 - 16)
+                    48 + (n.get() - 16)
                 }
             }
             Self::Latch => 28,
@@ -297,10 +340,7 @@ impl Port {
             Self::Nfwd0 => 40,
             Self::Nfwd2 => 41,
             Self::NbrSlice => 42,
-            Self::IState(n) => {
-                assert!(n < Self::ISTATE_COUNT, "istate index past what exists");
-                43 + n as u32
-            }
+            Self::IState(n) => 43 + n.get(),
             Self::CrossPtNorthLink => 47,
         }
     }
@@ -437,6 +477,151 @@ impl FoldMode {
     }
 }
 
+/// A `gcvt_imm<n>` A **BINARY** MAY TAKE — ⛔ 0, 4, 24, 28 AND NOTHING ELSE
+/// (`SentientTypes.td:345-348`).
+///
+/// ⛔⛔ THIS WAS A BARE `u8` WITH THE LEGAL SET IN A `const` ARRAY BESIDE IT, which documents the
+/// rule without enforcing it: `GcvtImm(3)` was constructible and printed `gcvt_imm3`, an attribute
+/// the parser does not know. A closed vendor set gets a total constructor.
+///
+/// ⛔ AND IT IS **DISJOINT** FROM [`UnaryGcvt`]'s. Same spelling, no shared value — which is why they
+/// are two types rather than one with a wider set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BinaryGcvt(u8);
+
+impl BinaryGcvt {
+    /// The immediate, or `None` where the enum defines no such case.
+    #[must_use]
+    pub const fn checked(imm: u8) -> Option<BinaryGcvt> {
+        match imm {
+            0 | 4 | 24 | 28 => Some(BinaryGcvt(imm)),
+            _ => None,
+        }
+    }
+
+    /// The immediate.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// AN `fcvt_imm<n>` A **BINARY** MAY TAKE — ⛔ 2, 3, 4, 7 only (`SentientTypes.td:349-352`).
+/// Disjoint from [`UnaryFcvt`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BinaryFcvt(u8);
+
+impl BinaryFcvt {
+    /// The immediate, or `None` where the enum defines no such case.
+    #[must_use]
+    pub const fn checked(imm: u8) -> Option<BinaryFcvt> {
+        match imm {
+            2 | 3 | 4 | 7 => Some(BinaryFcvt(imm)),
+            _ => None,
+        }
+    }
+
+    /// The immediate.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// WHICH `pack<n>` — ⛔⛔ **TEN AND ELEVEN DO NOT EXIST**.
+///
+/// The enum runs 0..9 and then 12..27 (`SentientTypes.td:368-388`). A bare `u8` made `Pack(10)` and
+/// `Pack(11)` constructible, and they print attributes the parser rejects — a gap in the middle of a
+/// range being exactly the shape a reader completes by hand without noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PackIndex(u8);
+
+impl PackIndex {
+    /// The index, or `None` for the two the enum skips and anything past its end.
+    #[must_use]
+    pub const fn checked(index: u8) -> Option<PackIndex> {
+        match index {
+            0..=9 | 12..=27 => Some(PackIndex(index)),
+            _ => None,
+        }
+    }
+
+    /// The index.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// HOW WIDE A `merge` MERGES — ⛔ FOUR WIDTHS, not any integer (`SentientTypes.td:353-360`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MergeWidth {
+    /// `merge8l` / `merge8h`.
+    W8,
+    /// `merge16l` / `merge16h`.
+    W16,
+    /// `merge32l` / `merge32h`.
+    W32,
+    /// `merge64l` / `merge64h`.
+    W64,
+}
+
+impl MergeWidth {
+    /// The width as it is spelled in the mnemonic.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::W8 => 8,
+            Self::W16 => 16,
+            Self::W32 => 32,
+            Self::W64 => 64,
+        }
+    }
+}
+
+/// A `gcvt_imm<n>` A **UNARY** MAY TAKE — ⛔ 1, 2, 5, 6, 8, 16, 17 (`SentientTypes.td:630-636`).
+/// Disjoint from [`BinaryGcvt`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnaryGcvt(u8);
+
+impl UnaryGcvt {
+    /// The immediate, or `None` where the enum defines no such case.
+    #[must_use]
+    pub const fn checked(imm: u8) -> Option<UnaryGcvt> {
+        match imm {
+            1 | 2 | 5 | 6 | 8 | 16 | 17 => Some(UnaryGcvt(imm)),
+            _ => None,
+        }
+    }
+
+    /// The immediate.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// AN `fcvt_imm<n>` A **UNARY** MAY TAKE — ⛔ 0, 1, 5, 6 (`SentientTypes.td:637-640`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnaryFcvt(u8);
+
+impl UnaryFcvt {
+    /// The immediate, or `None` where the enum defines no such case.
+    #[must_use]
+    pub const fn checked(imm: u8) -> Option<UnaryFcvt> {
+        match imm {
+            0 | 1 | 5 | 6 => Some(UnaryFcvt(imm)),
+            _ => None,
+        }
+    }
+
+    /// The immediate.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
 /// WHAT A `vector_binary` COMPUTES — `SentientBinaryOperatorAttr`, spelled `binaryOp`.
 ///
 /// Fifty-eight cases (`SentientTypes.td:333-458`) in four families whose wire values are NOT one
@@ -472,19 +657,19 @@ pub enum BinaryOp {
     Sub,
     /// `mul_div2`.
     MulDiv2,
-    /// `gcvt_imm<n>` — a general convert with an immediate. ⛔ Only 0, 4, 24, 28 exist here.
-    GcvtImm(u8),
-    /// `fcvt_imm<n>` — a float convert with an immediate. ⛔ Only 2, 3, 4, 7 exist here.
-    FcvtImm(u8),
-    /// `merge<w><half>` — ⛔ `w` in 8/16/32/64, `half` low or high.
+    /// `gcvt_imm<n>` — a general convert with an immediate.
+    GcvtImm(BinaryGcvt),
+    /// `fcvt_imm<n>` — a float convert with an immediate.
+    FcvtImm(BinaryFcvt),
+    /// `merge<w><half>`.
     Merge {
-        /// The element width in bits.
-        width: u8,
+        /// The element width.
+        width: MergeWidth,
         /// Whether it is the high half rather than the low.
         high: bool,
     },
-    /// `pack<n>` — ⛔ NOT A CONTIGUOUS RANGE: 0..9 then 12..27 (`SentientTypes.td:368-388`).
-    Pack(u8),
+    /// `pack<n>` — ⛔ 10 AND 11 DO NOT EXIST; see [`PackIndex`].
+    Pack(PackIndex),
     /// `fcmp_neq`.
     CompareNeq,
     /// `fcmp_eq`.
@@ -496,16 +681,6 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
-    /// The `gcvt_imm<n>` immediates the enum defines (`SentientTypes.td:345-348`).
-    pub const GCVT_IMMS: [u8; 4] = [0, 4, 24, 28];
-    /// The `fcvt_imm<n>` immediates the enum defines (`SentientTypes.td:349-352`).
-    pub const FCVT_IMMS: [u8; 4] = [2, 3, 4, 7];
-    /// The `pack<n>` indices the enum defines — ⛔ 10 AND 11 ARE ABSENT.
-    pub const PACKS: [u8; 26] = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27,
-    ];
-
     /// The spelling the attribute carries.
     #[must_use]
     pub fn spelling(self) -> String {
@@ -522,12 +697,12 @@ impl BinaryOp {
             Self::Mul => "mul".to_owned(),
             Self::Sub => "sub".to_owned(),
             Self::MulDiv2 => "mul_div2".to_owned(),
-            Self::GcvtImm(n) => format!("gcvt_imm{n}"),
-            Self::FcvtImm(n) => format!("fcvt_imm{n}"),
+            Self::GcvtImm(n) => format!("gcvt_imm{}", n.get()),
+            Self::FcvtImm(n) => format!("fcvt_imm{}", n.get()),
             Self::Merge { width, high } => {
-                format!("merge{width}{}", if high { "h" } else { "l" })
+                format!("merge{}{}", width.bits(), if high { "h" } else { "l" })
             }
-            Self::Pack(n) => format!("pack{n}"),
+            Self::Pack(n) => format!("pack{}", n.get()),
             Self::CompareNeq => "fcmp_neq".to_owned(),
             Self::CompareEq => "fcmp_eq".to_owned(),
             Self::CompareLt => "fcmp_lt".to_owned(),
@@ -535,27 +710,85 @@ impl BinaryOp {
         }
     }
 
-    /// WHETHER THIS OPERATOR MAY CARRY `LogicalResultForwarding`.
-    ///
-    /// ⛔⛔ THE VERIFIER REFUSES ANY OTHER, AND WITH A BARE `failure()`. `BinaryOp::verify`
-    /// (`SentientOps.cpp:2251-2262`) checks `logical_result_forwarding` against exactly
-    /// `fcmp_eq | fcmp_neq | fcmp_le | fcmp_lt | min | max | abs_max` and returns failure with no
-    /// message, so a wrong pairing surfaces as an unexplained refusal rather than a diagnostic.
-    ///
-    /// ⛔ `abs_min` IS ABSENT while `abs_max` is present — the asymmetry is the reference's, and a
-    /// reader completing the pair by hand would write a program the verifier rejects.
+}
+
+/// THE SEVEN OPERATORS THAT MAY FORWARD A LOGICAL RESULT — and there is no eighth.
+///
+/// ⛔⛔ THE VERIFIER REFUSES ANY OTHER WITH A BARE `failure()`. `BinaryOp::verify`
+/// (`SentientOps.cpp:2251-2262`) checks `logical_result_forwarding` against exactly
+/// `fcmp_eq | fcmp_neq | fcmp_le | fcmp_lt | min | max | abs_max` and returns failure with **no
+/// message**, so a wrong pairing surfaces as an unexplained refusal rather than a diagnostic.
+///
+/// ⛔⛔ AND A `debug_assert!` IN THE PRINTER WAS THE WRONG GUARD, WHICH IS WHAT THIS TYPE REPLACES.
+/// It fired in a debug build and **vanished in release** — so the one configuration that reaches the
+/// backend was the one with no check at all, and its punishment is a silent refusal. The pairing is
+/// now the value: only [`Binary::Forwarding`] carries a forward, and only these seven can be named in
+/// it.
+///
+/// ⛔ `abs_min` IS ABSENT WHILE `abs_max` IS PRESENT. The asymmetry is the reference's; a reader
+/// completing the pair by hand writes a program the verifier rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ForwardingOp {
+    /// `fcmp_eq`.
+    CompareEq,
+    /// `fcmp_neq`.
+    CompareNeq,
+    /// `fcmp_le`.
+    CompareLe,
+    /// `fcmp_lt`.
+    CompareLt,
+    /// `min`.
+    Min,
+    /// `max`.
+    Max,
+    /// `abs_max` — ⛔ AND NOT `abs_min`; see the type's note.
+    AbsMax,
+}
+
+impl ForwardingOp {
+    /// The same operator as a [`BinaryOp`], which is what the attribute spells.
     #[must_use]
-    pub const fn may_forward_logical_result(self) -> bool {
-        matches!(
-            self,
-            Self::CompareEq
-                | Self::CompareNeq
-                | Self::CompareLe
-                | Self::CompareLt
-                | Self::Min
-                | Self::Max
-                | Self::AbsMax
-        )
+    pub const fn as_binary(self) -> BinaryOp {
+        match self {
+            Self::CompareEq => BinaryOp::CompareEq,
+            Self::CompareNeq => BinaryOp::CompareNeq,
+            Self::CompareLe => BinaryOp::CompareLe,
+            Self::CompareLt => BinaryOp::CompareLt,
+            Self::Min => BinaryOp::Min,
+            Self::Max => BinaryOp::Max,
+            Self::AbsMax => BinaryOp::AbsMax,
+        }
+    }
+}
+
+/// WHAT A `vector_binary` COMPUTES, AND WHETHER IT FORWARDS A LOGICAL RESULT.
+///
+/// ⭐⭐ ONE VALUE, BECAUSE THE TWO FACTS ARE NOT INDEPENDENT. Holding the operator and an
+/// `Option<Port>` side by side let the pairing be wrong; holding them together means an illegal one
+/// cannot be written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binary {
+    /// Any operator, forwarding no logical result — the common case.
+    Plain(BinaryOp),
+    /// One of the seven, forwarding its logical result to a port.
+    Forwarding {
+        /// Which of the seven.
+        op: ForwardingOp,
+        /// `$LogicalResultForwarding`.
+        to: Port,
+        /// `$unrollIncrLogicalResult`.
+        unroll_incr: bool,
+    },
+}
+
+impl Binary {
+    /// Which operator this is, whichever arm it took.
+    #[must_use]
+    pub const fn op(self) -> BinaryOp {
+        match self {
+            Self::Plain(op) => op,
+            Self::Forwarding { op, .. } => op.as_binary(),
+        }
     }
 }
 
@@ -617,22 +850,13 @@ pub enum UnaryOp {
     ReductionAbsMax,
     /// `fast_exp`.
     FastExp,
-    /// `gcvt_imm<n>` — ⛔ only 1, 2, 5, 6, 8, 16, 17 exist HERE, and they are a DIFFERENT set from
-    /// [`BinaryOp::GcvtImm`]'s.
-    GcvtImm(u8),
-    /// `fcvt_imm<n>` — ⛔ only 0, 1, 5, 6 exist here, again disjoint from the binary set.
-    FcvtImm(u8),
+    /// `gcvt_imm<n>` — ⛔ A DIFFERENT SET FROM THE BINARY ONE'S; see [`UnaryGcvt`].
+    GcvtImm(UnaryGcvt),
+    /// `fcvt_imm<n>` — ⛔ disjoint from the binary set again; see [`UnaryFcvt`].
+    FcvtImm(UnaryFcvt),
 }
 
 impl UnaryOp {
-    /// The `gcvt_imm<n>` immediates a UNARY may take (`SentientTypes.td:630-636`).
-    ///
-    /// ⛔ DISJOINT FROM [`BinaryOp::GCVT_IMMS`]. The two enums share a spelling and share no values:
-    /// binary has 0/4/24/28, unary has 1/2/5/6/8/16/17.
-    pub const GCVT_IMMS: [u8; 7] = [1, 2, 5, 6, 8, 16, 17];
-    /// The `fcvt_imm<n>` immediates a UNARY may take (`SentientTypes.td:637-640`) — disjoint again.
-    pub const FCVT_IMMS: [u8; 4] = [0, 1, 5, 6];
-
     /// The spelling the attribute carries.
     #[must_use]
     pub fn spelling(self) -> String {
@@ -653,8 +877,8 @@ impl UnaryOp {
             Self::ReductionAbsMin => "reduction_abs_min".to_owned(),
             Self::ReductionAbsMax => "reduction_abs_max".to_owned(),
             Self::FastExp => "fast_exp".to_owned(),
-            Self::GcvtImm(n) => format!("gcvt_imm{n}"),
-            Self::FcvtImm(n) => format!("fcvt_imm{n}"),
+            Self::GcvtImm(n) => format!("gcvt_imm{}", n.get()),
+            Self::FcvtImm(n) => format!("fcvt_imm{}", n.get()),
         }
     }
 }
@@ -920,6 +1144,61 @@ impl RoutingDirection {
     }
 }
 
+/// WHICH REGISTER WITHIN ITS FILE — `regIndex`.
+///
+/// ⛔⛔ THIS WAS `Option<i32>`, WHICH ADMITTED `Some(-5)` AND `Some(9999)`. The `.td` writes the
+/// unassigned case as `-1` (`DefaultValuedAttr<I32Attr, "-1">`), so a signed field is how the
+/// *reference* spells absence — but carrying that spelling into Rust makes every negative expressible
+/// while only one of them means anything. `Option<RegIndex>` says the same thing with nothing else
+/// sayable.
+///
+/// ⛔ BOUNDED BY `kMaxCompRegs` = 128 (`progir.h:508-509`), the width of the
+/// `std::bitset<kMaxCompRegs>` in `RegDefs` and therefore a hard cap rather than a convention.
+///
+/// ⚠️ THE PER-FILE DEPTH IS TIGHTER AND IS AN ARCH FACT — the SFP/PE LRF holds sixteen on this target
+/// and the state file one. This is the ISA's ceiling, not permission to use 127 of a sixteen-deep
+/// file; that question belongs to whatever assigns the register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegIndex(Bounded<128>);
+
+impl RegIndex {
+    /// An index, or `None` where no register file is that deep.
+    #[must_use]
+    pub const fn checked(index: u32) -> Option<RegIndex> {
+        match Bounded::checked(index) {
+            Some(bounded) => Some(RegIndex(bounded)),
+            None => None,
+        }
+    }
+
+    /// The index.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// HOW MANY ENTRIES OF A MASK ARE VALID — `samv`'s `numvalidentry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValidEntries(pub u32);
+
+/// WHICH CROSS-SLICE SLICE — `samv`'s `sliceid_xsl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SliceId(pub u32);
+
+/// THE WITHIN-SLICE LENGTH — `samv`'s `wsllen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WslLen(pub u32);
+
+/// `samv`'s `precision` — ⛔⛔ A **RAW ISA FIELD**, NOT A [`Precision`].
+///
+/// `SentientOps.td:991` declares it `I32Attr`, the one place in the dialect where a precision is an
+/// untyped integer rather than the enum. A newtype keeps it from being handed the enum's encoding, and
+/// keeps it from being swapped with [`ValidEntries`], [`SliceId`] or [`WslLen`] — four adjacent
+/// integers on one op, which is exactly the transposition the crate's newtype rule exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RawPrecision(pub u32);
+
 /// ONE COMPUTE OPERAND'S WHOLE DESCRIPTION — the six attributes that repeat per operand.
 ///
 /// ⭐⭐ A STRUCT BECAUSE THE `.td` REPEATS IT VERBATIM, NOT BECAUSE IT READS TIDIER. `vector_mac`
@@ -1049,8 +1328,8 @@ pub enum Op {
         results: Vec<Val>,
         /// `$regLocales` — one per carried value.
         reg_locales: Vec<RegType>,
-        /// `$regIndices` — one per carried value; ⛔ `-1` means unassigned.
-        reg_indices: Vec<i32>,
+        /// `$regIndices` — one per carried value; ⛔ `None` is the `.td`'s `-1`.
+        reg_indices: Vec<Option<RegIndex>>,
         /// `$programHeader` — one flag per carried value.
         program_header: Vec<bool>,
         /// `$dbgName`.
@@ -1072,7 +1351,7 @@ pub enum Op {
         /// `$regLocales`.
         reg_locales: Vec<RegType>,
         /// `$regIndices`.
-        reg_indices: Vec<i32>,
+        reg_indices: Vec<Option<RegIndex>>,
         /// `$dbgName`.
         dbg_name: Option<String>,
         /// The `then` body.
@@ -1135,15 +1414,10 @@ pub enum Op {
         op_a: Operand,
         /// Operand B.
         op_b: Operand,
-        /// `$binaryOp`.
-        binary_op: BinaryOp,
+        /// `$binaryOp`, and its logical forward where it has one — ⛔ ONE VALUE; see [`Binary`].
+        binary_op: Binary,
         /// Where the result goes.
         result: ResultPorts,
-        /// `$LogicalResultForwarding` — ⛔ ONLY LEGAL FOR THE OPERATORS
-        /// [`BinaryOp::may_forward_logical_result`] admits; the verifier refuses the rest silently.
-        logical_result_forwarding: Option<Port>,
-        /// `$unrollIncrLogicalResult`.
-        unroll_incr_logical_result: bool,
         /// `$ComputePrecision`.
         compute_precision: Precision,
         /// `$fold_mode`.
@@ -1242,7 +1516,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex` — ⛔ `None` is `-1`, unassigned.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1283,7 +1557,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex`.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1324,7 +1598,7 @@ pub enum Op {
         /// `$regLocales`.
         reg_locales: Vec<RegType>,
         /// `$regIndices`.
-        reg_indices: Vec<i32>,
+        reg_indices: Vec<Option<RegIndex>>,
         /// `$dir`.
         dir: Option<RoutingDirection>,
         /// `$dbgName`.
@@ -1366,7 +1640,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex`.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1393,7 +1667,7 @@ pub enum Op {
         /// `$regLocales`.
         reg_locales: Vec<RegType>,
         /// `$regIndices`.
-        reg_indices: Vec<i32>,
+        reg_indices: Vec<Option<RegIndex>>,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1410,7 +1684,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex`.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1427,7 +1701,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex`.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
     },
 
     /// `sentient.scalar_sub` (`SentientOps.td:801`).
@@ -1441,7 +1715,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex`.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
     },
 
     /// `sentient.scalar_mul` (`SentientOps.td:816`).
@@ -1469,7 +1743,7 @@ pub enum Op {
         /// `$regLocale`.
         reg_locale: RegType,
         /// `$regIndex`.
-        reg_index: Option<i32>,
+        reg_index: Option<RegIndex>,
         /// `$programHeader`.
         program_header: bool,
     },
@@ -1565,15 +1839,15 @@ pub enum Op {
         /// `$maskall`.
         mask_all: bool,
         /// `$numvalidentry`.
-        num_valid_entry: u32,
+        num_valid_entry: ValidEntries,
         /// `$sliceid_xsl`.
-        slice_id_xsl: u32,
+        slice_id_xsl: SliceId,
         /// `$xslinner`.
         xsl_inner: bool,
         /// `$wsllen`.
-        wsl_len: u32,
-        /// `$precision` — ⛔ A RAW INTEGER, see the variant's note.
-        precision: u32,
+        wsl_len: WslLen,
+        /// `$precision` — ⛔ A RAW ISA FIELD; see [`RawPrecision`].
+        precision: RawPrecision,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -1732,7 +2006,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         } => {
             let mut attrs = vec![attr("reg_locale", &quoted(reg_locale.spelling()))];
             if let Some(index) = reg_index {
-                attrs.push(attr("reg_index", &format!("{index} : i32")));
+                attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
             }
             if *program_header {
                 attrs.push(attr("programHeader", "true"));
@@ -1873,14 +2147,14 @@ struct ScalarReg {
     /// `regLocale`.
     locale: RegType,
     /// `regIndex` — ⛔ `None` is the `.td`'s `-1`, unassigned.
-    index: Option<i32>,
+    index: Option<RegIndex>,
 }
 
 /// `scalar_add` and `scalar_sub`, whose printed shape the `.td` declares identically.
 fn scalar_binary(out: &mut String, mnemonic: &str, result: Val, lhs: Val, rhs: Val, reg: ScalarReg) {
     let mut attrs = vec![attr("reg_locale", &quoted(reg.locale.spelling()))];
     if let Some(index) = reg.index {
-        attrs.push(attr("reg_index", &format!("{index} : i32")));
+        attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
     }
     attrs.sort();
     let _ = writeln!(
@@ -1950,8 +2224,6 @@ fn compute_attrs(op: &Op) -> Vec<String> {
             op_b,
             binary_op,
             result,
-            logical_result_forwarding,
-            unroll_incr_logical_result,
             compute_precision,
             fold_mode,
             unroll_factor,
@@ -1960,17 +2232,14 @@ fn compute_attrs(op: &Op) -> Vec<String> {
         } => {
             operand("A", op_a);
             operand("B", op_b);
-            attrs.push(attr("binaryOp", &quoted(&binary_op.spelling())));
-            if let Some(port) = logical_result_forwarding {
-                // ⛔ THE VERIFIER REFUSES THIS PAIRING FOR MOST OPERATORS, SILENTLY.
-                debug_assert!(
-                    binary_op.may_forward_logical_result(),
-                    "LogicalResultForwarding on an operator BinaryOp::verify refuses"
-                );
-                attrs.push(attr("LogicalResultForwarding", &quoted(&port.spelling())));
-            }
-            if *unroll_incr_logical_result {
-                attrs.push(attr("unrollIncrLogicalResult", "true"));
+            attrs.push(attr("binaryOp", &quoted(&binary_op.op().spelling())));
+            // ⭐ NO CHECK NEEDED: only the forwarding arm carries a port, and only the seven legal
+            // operators can be named in it.
+            if let Binary::Forwarding { to, unroll_incr, .. } = binary_op {
+                attrs.push(attr("LogicalResultForwarding", &quoted(&to.spelling())));
+                if *unroll_incr {
+                    attrs.push(attr("unrollIncrLogicalResult", "true"));
+                }
             }
             (result, compute_precision, fold_mode, unroll_factor, dbg_name)
         }

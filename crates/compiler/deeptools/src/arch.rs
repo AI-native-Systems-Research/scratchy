@@ -61,7 +61,7 @@ pub struct Elements(pub u64);
 /// ⭐ THE CONSTRUCTOR IS THE PROOF. [`Bounded::at`] takes the index as a const generic and asserts it
 /// against `N` at monomorphisation, so an out-of-range core id is a COMPILE error. [`Bounded::checked`]
 /// is for an index that is genuinely computed, and it hands back `None` rather than a wrong answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bounded<const N: u32>(u32);
 
 impl<const N: u32> Bounded<N> {
