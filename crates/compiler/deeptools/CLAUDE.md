@@ -21,9 +21,35 @@ Note: We have patched dbo-opt to accept DataflowIr output via `--from-dfir`. We 
   `GroupId`, `OpIndex`): transposing two extents must be E0308.
 - NO STRINGS from the ddl/smc parsers — every closed set is a generated enum.
 - An unread associated const NEVER EVALUATES; doctests do NOT run in `tests/*.rs`.
+## 🛑🛑 NEVER RUNTIME REFUSE. ANYWHERE. THIS IS THE PRE-EMINENT RULE OF THIS CRATE.
+**dbo-opt IS THE ONLY ORACLE.** The pipeline is `SubtileTape → DataflowIR → dbo-opt → init_binary`, and
+every defect this bridge has ever fixed was named by a dbo-opt refusal on OUR emitted MLIR —
+`vector<64xi1>` vs `i1`, "found no program to compile", the SSA-scoping pair, "Unable to generate
+loops", the `ProgramUnitsReduction` assertion, "Dangling non-compute op has no use". A lowering that
+returns `Err` stops **before the tape is emitted**: dbo-opt is never invoked, the sentence we needed is
+never produced, and the build prints our message instead of the backend's.
+
+**THIS HAS COST HOURS AND A REVERT FIVE TIMES.** The last one added ONE variant to an error type that
+already existed — two lines, indistinguishable from the variants beside it — and the loop went blind
+until the raw `-vv` stream was read line by line. Prose did not prevent any of the five.
+
+- **There is no error type in the DataflowIR bridge.** `Err(`, `.ok_or` and `Result<` are frozen at
+  **ZERO** by `crates/targets/spyre/tests/dfir_never_runtime_refuses.rs`. A `Result` is a VALUE — the
+  caller can log it and carry on, and `codegen.rs` did exactly that. Bringing one back means adding a
+  whole `enum` to a diff.
+- **`panic!`/`todo!` are tolerated and capped**, ratcheted DOWN only. Loud and unswallowable, so nobody
+  mistakes one for a lowering that ran — but still a stop before the oracle. The goal is zero.
+- **NEVER substitute to dodge a panic.** An unbuilt op lowered as `Identity` "to keep the tape whole"
+  is a program dbo-opt compiles happily and a model that emits garbage. `todo!` naming the op is right;
+  a stand-in op-func is not.
+- **The fact you are reaching for belongs in a TYPE.** An arity is an array length. A pairing is a
+  witness consumed once. An op set is a const the door proved. If the lowering genuinely cannot produce
+  a program yet, that is a decomposition to WRITE.
+
 ## Already fucked up here — do not repeat
 - **Invented addresses** (everything into LX; programs read memory nothing fills). Addresses come from the
-  placement authority derived from `&SubtileIR` — the same plan the worker H2Ds.
+  placement authority derived from `&SubtileIR` — the same plan the worker H2Ds. Note this outranks the
+  panic rule: a fabricated placement to avoid a stop is worse than the stop.
 - **Read `EmittedOp`/`Dsc`** chasing `emit_bundle`. Opening `lower_subtile_tape_to_superdsc.rs` to thread
   something through means STOP. DEBT: retire that path; its tape-derived address authority is target-neutral
   and must not live in a target-named file.
