@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`81/384 ported; 81/384 audited`
+`89/384 ported; 89/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -226,6 +226,83 @@ is 63 — and it is the all-lanes-off mask of twenty `create_affine_mask` ops in
 `sen::Precision` has no `Fp80`, so the remap collapses into the type. `dlfp16` is dead in the
 reference too — `getPrecisionInString` can only produce `int<n>`, `bf16`, `mxfp<n>` or `fp<n>`.
 
+⭐ AND ENTRIES 129-136 — `TransformPagedMemView`'s de-paging base class and its use chains, all in
+`src/bridges/dataflow_ir_to_sentient/tf_transform_paged_mem_view_impl.rs` (the file's first code):
+`TPMVBase`'s three virtuals (`getUseChain`, `cloneUseChain`, `eraseMemOpAndUseChain`),
+`TPMVVector`'s constructor, `TPMVVectorLoad`'s `eraseMemOpAndUseChain` override, and three
+`TPMVComposite`/`TPMVVectorLoadStore` members — `getStoreOp`, `addTimeDimIndicesRanges`,
+`identifyTimeDimForExplicitLoops`. 13 unit tests, built from the vendor's own
+`dcc/test/Transform/TransformPagedMemView/paged_mem_view_{loads,load_and_store}.mlir` inputs. No
+equivalence tests: there is no C to call.
+
+⭐⭐ THE HEADER'S USE-CHAIN DIRECTION CONTRACT IS WRONG, AND THE TYPE FIXES IT. `TPMVBase::getUseChain`
+documents *"If `mem_op` is the first element of the returned vector, it is in order. If `mem_op` is
+the last element, it is in reverse order"* (`TransformPagedMemViewImpl.hpp:321-327`) — but BOTH dialect
+implementations put `mem_op` first, and `VectorStoreOp::cloneUseChainToNewOp` says the opposite about
+its own input two files away (*"The use chain is stored in reverse order"*, `Agen.cpp:229-230`).
+Measured: `VectorLoadOp::getUseChain` walks consumer-ward (`:115-136`) and `VectorStoreOp::getUseChain`
+walks producer-ward (`:207-222`), which is why their two `eraseOpAndUseChain` loops run in opposite
+directions (`:176-177` reversed, `:257` as-is) to compute the SAME thing — teardown consumer-first.
+`UseChain` carries the direction and `consumer_first()` is that one rule.
+
+⭐ AND THE REFERENCE'S DEAD BRANCH BECAME THE LIVE ONE. `eraseOpAndUseChain` opens
+`if (use_chain.empty()) { op->erase(); }` (`Agen.cpp:173-175`), unreachable in C++ because
+`getUseChain` asserts on a non-linear chain first. Those three asserts are one question — is the
+chain linear — and the header's own *"Empty if there isn't a use chain"* is its answer, so entry 129
+answers `UseChain::None` where the reference aborts and then that branch is exactly right: erase the
+load, leave what reads it alone.
+
+⛔ 131 AND 132 JOIN THROUGH A SYMBOL NUMBERING, AND IT IS NOW CHECKED BY A TEST.
+`addTimeDimIndicesRanges` APPENDS after `calculateIndicesRanges` on the same vector
+(`TransformPagedMemViewImpl.cpp:1010-1017`), so time dim `i` lands in slot `i + num_non_time_dims`,
+which is exactly the symbol `identifyTimeDimForExplicitLoops` looks up (`:967`) and the index
+`addConstraintsForIVRanges` reads (`:94-102`). `NonTimeDims::sym_for` holds that arithmetic once.
+⛔ The call site has TWO adjacent `int` dimension counts — `time_set_.getNumDims()` and
+`subscripts_map_.getNumDims()` (`:966`, `:1024-1025`) — so the time count arrives as the `IntegerSet`
+it is read off and the two cannot be exchanged.
+
+⛔ 131'S `DT_CHECK_MSG(b - 1 >= 0, "no special time bound values should exist")` IS A TYPE. `TimeSteps`
+is a `NonZeroU32` behind an `of(TimeBound)` door, so `kInvalid`, `kCoalesced` and the reachable
+`Steps(0)` cannot reach the subtraction and `last_index()` is total. `IvRange` widens the reference's
+`std::pair<int, int>` to `i64`: `calculateIndicesRanges` narrows an `int64_t`
+`getSingleConstantResult()` into it (`:73-75`), and the constraints these become take
+`AffineExpr::Const(i64)`.
+
+⚠️ 132'S `auto it` IS A `bool`. `if (auto it = page_dependent_time_syms_.find(...) != ...end())`
+binds the comparison, not the iterator, because `=` is looser than `!=`. The behaviour is the
+intended one; only the name misleads. Nothing was ported around it.
+
+⛔ **`TPMVBase`'S CONSTRUCTOR IS MISCLASSIFIED IN THE EXCLUSIONS.** It is binned as `comp_`
+(`…/TransformPagedMemViewImpl.hpp:30`) under *"a one-line C++ field accessor; in Rust the field
+itself"*. It is not an accessor: it is a member-initialising constructor that also seeds `mem_ops_`
+with a one-element list — and `initialize()` asserts `mem_ops_.size() == 1` in all six concrete
+classes (`:659`, `:707`, `:756`, `:1081`, `:1134`, `:1187`), so the singleton is an invariant that
+constructor establishes. Entry 136 delegates to it, so `TpmvBase::new` exists and carries NO anchor;
+the exclusion is reported rather than overruled.
+
+⛔ **AND THE EXTRACTOR KEPT ONLY TWO DEFINITIONS PER OVERRIDDEN NAME, so ten `TPMV*` overrides are in
+neither the 384 nor the 106 exclusions.** Counted in the authority: this file defines
+`eraseMemOpAndUseChain` five times (`hpp:364`, `cpp:698`, `cpp:747`, `cpp:817`, `cpp:1266`) and the
+campaign scheduled two (135 and 129); `getUseChain` three times (`hpp:328`, `cpp:673`, `cpp:721`) and
+scheduled two (133 and 126); `cloneUseChain` three times (`hpp:341`, `cpp:678`, `cpp:726`) and
+scheduled two (134 and 127); `createNewMemOp` six times over one pure virtual (`hpp:357` `= 0`, then
+`cpp:684`, `:732`, `:779`, `:1120`, `:1173`, `:1242`) and scheduled one (128). Unscheduled and
+unexcluded:
+`TPMVVectorStore::{getUseChain, cloneUseChain, eraseMemOpAndUseChain}` (`cpp:721`, `:726`, `:747`),
+`TPMVVectorLoadStore::{createNewMemOp, eraseMemOpAndUseChain}` (`cpp:779`, `:817`),
+`TPMVVectorStore::createNewMemOp` (`cpp:732`) and the three composite `createNewMemOp` overrides
+(`cpp:1120`, `:1173`, `:1242`) plus `TPMVCompositeLoadStore::eraseMemOpAndUseChain` (`cpp:1266`).
+Reported, not filled — a `Replaces:` anchor on an entry nothing scheduled would count as coverage no
+worklist asked for.
+
+⚠️ AND FOUR OF THE SIX CONCRETE CLASSES INHERIT 133/134/135 UNCHANGED, which makes the empty bodies
+live behaviour rather than fallbacks. Only `TPMVVectorLoad` and `TPMVVectorStore` override
+`getUseChain`/`cloneUseChain`; `TPMVVectorLoadStore` and every composite genuinely have no linear
+chain — a composite transfer's consumers live inside its own region, and a load-and-store pattern's
+store is reached through entry 130 instead. ⚠️ There is no trait to dispatch through yet: entries 137
+and 138 are the derived constructors, so the three virtuals are inherent methods on `TpmvBase` today
+and `erase_vector_load_and_use_chain` is `TPMVVectorLoad`'s override standing beside them as a free
+function.
 
 ## Level 0
 
@@ -485,22 +562,22 @@ reference too — `getPrecisionInString` can only produce `int<n>`, `bf16`, `mxf
 - [ ] **AUDIT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, line by line against the C++
 - [ ] **PORT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, 9 lines
 - [ ] **AUDIT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, line by line against the C++
-- [ ] **PORT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, 3 lines
-- [ ] **AUDIT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, line by line against the C++
-- [ ] **PORT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, 6 lines
-- [ ] **AUDIT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, line by line against the C++
-- [ ] **PORT 131/384** `addTimeDimIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:876`, 5 lines
-- [ ] **AUDIT 131/384** `addTimeDimIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:876`, line by line against the C++
-- [ ] **PORT 132/384** `identifyTimeDimForExplicitLoops` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:963`, 10 lines
-- [ ] **AUDIT 132/384** `identifyTimeDimForExplicitLoops` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:963`, line by line against the C++
-- [ ] **PORT 133/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:328`, 2 lines
-- [ ] **AUDIT 133/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:328`, line by line against the C++
-- [ ] **PORT 134/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:341`, 0 lines
-- [ ] **AUDIT 134/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:341`, line by line against the C++
-- [ ] **PORT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, 0 lines
-- [ ] **AUDIT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, line by line against the C++
-- [ ] **PORT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, 0 lines
-- [ ] **AUDIT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, line by line against the C++
+- [x] **PORT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, 3 lines
+- [x] **AUDIT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, line by line against the C++
+- [x] **PORT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, 6 lines
+- [x] **AUDIT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, line by line against the C++
+- [x] **PORT 131/384** `addTimeDimIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:876`, 5 lines
+- [x] **AUDIT 131/384** `addTimeDimIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:876`, line by line against the C++
+- [x] **PORT 132/384** `identifyTimeDimForExplicitLoops` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:963`, 10 lines
+- [x] **AUDIT 132/384** `identifyTimeDimForExplicitLoops` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:963`, line by line against the C++
+- [x] **PORT 133/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:328`, 2 lines
+- [x] **AUDIT 133/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:328`, line by line against the C++
+- [x] **PORT 134/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:341`, 0 lines
+- [x] **AUDIT 134/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:341`, line by line against the C++
+- [x] **PORT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, 0 lines
+- [x] **AUDIT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, line by line against the C++
+- [x] **PORT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, 0 lines
+- [x] **AUDIT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, line by line against the C++
 - [ ] **PORT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, 0 lines
 - [ ] **AUDIT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, line by line against the C++
 - [ ] **PORT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, 0 lines
