@@ -102,11 +102,14 @@
 use crate::arch::Elements;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, scf,
+    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, scf, uses,
+    vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, FlatConstraints, IntegerSet};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
+
+use super::vc_vector_operands::access_map;
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // THE VOCABULARY `AccessDetails` IS WRITTEN IN.
@@ -567,6 +570,90 @@ pub enum TransferExtents {
     MemoryViewUnresolved,
 }
 
+/// THE OUTCOME OF [`AccessDetailsBase::construct_chunk_and_shuffle_info`] (`AccessDetails.cpp:98`).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkAndShuffleInfo {
+    /// `success()` (`:265`) — chunk size, chunk stride and any shuffle or rotation are set.
+    Chunked,
+
+    /// `failure()` with NO message (`:126-130`): the coefficients are not one longer than the extents,
+    /// or the innermost stride is not 1.
+    ///
+    /// ⛔ IT SUBSUMES `DT_CHECK(layout_coeffs.size() >= extents.size())` (`:110`) and it is where an
+    /// EMPTY extent list lands — the reference indexes `[extents.size() - 1]` on it (`:111`, `:128`).
+    LayoutDoesNotMatchExtents,
+
+    /// *"Extent in load/store set is larger than from the layout"* — the SAME message from both loops
+    /// (`:154-156`, `:177-179`), so the dimension names which.
+    ExtentLargerThanLayout {
+        /// Row-major dimension index, innermost first.
+        dim: usize,
+    },
+
+    /// *"Chunk starting offset from load/store set are not supported in lowering"* (`:194-197`).
+    ChunkStartingOffsetUnsupported,
+
+    /// *"Variable chunk strides cannot be lowered"* (`:200-203`) — a second, outer chunk stride.
+    VariableChunkStride {
+        /// Row-major dimension index carrying it.
+        dim: usize,
+    },
+
+    /// *"Abort due to invalid select map"* (`:239`), after one
+    /// *"Non-supported select map for VectorLoadOp!"* (`:234`) per offending expression.
+    InvalidSelectMap,
+
+    /// `DT_CHECK_MSG(getRotationPosition() <= getTotalElements(), …)` (`:250-253`).
+    RotationPositionOverTotalElements,
+
+    /// `DT_CHECK_MSG(rotate_op.getRightShift(), …)` (`:256-257`).
+    LeftRotationUnsupported,
+
+    /// A negative rotation constant — the reference's `getRotationPosition() >= 0` (`:254-255`), which
+    /// only an `int` field could ever fail; ⛔ A COUNT CANNOT HOLD IT, so it is refused on the way in.
+    RotationPositionNegative,
+
+    /// `DT_ERROR("index position to rotation op has to be a constant")` (`:259-260`).
+    RotationPositionNotConstant,
+}
+
+impl ChunkAndShuffleInfo {
+    /// `success()` only for [`Self::Chunked`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, ChunkAndShuffleInfo::Chunked)
+    }
+
+    /// The diagnostic the C++ emits, verbatim (`AccessDetails.cpp:126-260`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            ChunkAndShuffleInfo::Chunked | ChunkAndShuffleInfo::LayoutDoesNotMatchExtents => None,
+            ChunkAndShuffleInfo::ExtentLargerThanLayout { .. } => {
+                Some("Extent in load/store set is larger than from the layout")
+            }
+            ChunkAndShuffleInfo::ChunkStartingOffsetUnsupported => {
+                Some("Chunk starting offset from load/store set are not supported in lowering")
+            }
+            ChunkAndShuffleInfo::VariableChunkStride { .. } => {
+                Some("Variable chunk strides cannot be lowered")
+            }
+            ChunkAndShuffleInfo::InvalidSelectMap => Some("Abort due to invalid select map"),
+            ChunkAndShuffleInfo::RotationPositionOverTotalElements => {
+                Some("Rotation position has to be less than or equal to total elements")
+            }
+            ChunkAndShuffleInfo::LeftRotationUnsupported => Some("only right rotation supported"),
+            ChunkAndShuffleInfo::RotationPositionNegative => {
+                Some("right rotation amount has to be non-negative")
+            }
+            ChunkAndShuffleInfo::RotationPositionNotConstant => {
+                Some("index position to rotation op has to be a constant")
+            }
+        }
+    }
+}
+
 /// WHAT ONE MEMORY OPERAND'S LOWERING KNOWS ABOUT ITS ACCESS — `AccessDetailsBase`
 /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:43-212`).
 ///
@@ -600,7 +687,7 @@ pub enum TransferExtents {
 /// `shuffle_mode_` and `indices_`, and entries 009-015 brought `rotation_position_`,
 /// `expected_total_elements_`, `extents_`, `total_elements_`, `element_width_`, `transfer_set_` and
 /// `transfer_order_`; entries 143-148 brought `memory_`, `chunk_size_` and `ld_or_st_size_`, and
-/// `mem_ref_` and `chunk_stride_` still arrive with the `construct*` entries that write them. The
+/// entry 206 brought `chunk_stride_`, and `mem_ref_` still arrives with the entry that writes it. The
 /// order below is the C++'s own declaration order
 /// (`hpp:150-210`), so each wave inserts rather than reorders.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,15 +770,27 @@ pub struct AccessDetailsBase<'a> {
     /// (`hpp:174-175`), in elements. Setter `setChunkSize` (`hpp:102`), **protected** and excluded
     /// from the port as a field.
     ///
-    /// ⛔ THE FIELD IS DECLARED HERE BECAUSE ENTRY 144 READS IT: `constructLdOrStType` copies it into
-    /// `ld_or_st_size_` for an L0 component (`AccessDetails.cpp:267-272`). Its WRITER is
-    /// `constructChunkAndShuffleInfo` (`:97-265`), a later entry, so on an object this batch can
-    /// build it is still the declared `0`.
+    /// ⛔ TWO ENTRIES SHARE IT: `constructLdOrStType` copies it into `ld_or_st_size_` for an L0
+    /// component (`AccessDetails.cpp:267-272`), and its writer is
+    /// [`AccessDetailsBase::construct_chunk_and_shuffle_info`] (`:97-265`).
     ///
     /// ⭐ `int chunk_size_ = 0` (`hpp:175`), and zero is the "not computed yet" value rather than an
     /// empty chunk: `constructChunkAndShuffleInfo` assigns it unconditionally before anything reads
     /// it.
     pub chunk_size: Elements,
+
+    /// `chunk_stride_` — *"Difference between consecutive chunks"* (`hpp:177-178`), in elements.
+    /// Setter `setChunkStride` (`hpp:103`), **protected** and excluded from the port as a field.
+    ///
+    /// ⛔ THE STRIDE IS BETWEEN CHUNK **STARTS**, NOT THE GAP BETWEEN THEM. It is the layout's
+    /// running extent product taken at the first non-unit extent ABOVE the chunk dimension
+    /// (`AccessDetails.cpp:169-192`) — the distance one chunk index moves the address.
+    ///
+    /// ⭐ `int chunk_stride_ = 0` (`hpp:178`), and ZERO IS A MEANINGFUL ANSWER HERE, unlike
+    /// [`Self::chunk_size`]: *no* dimension above the chunk has a non-unit extent, i.e. the transfer
+    /// is one chunk. The legality test reads exactly that — `chunk_stride != 0` beside a chunk
+    /// dimension whose layout coefficient is 1 (`:194-197`).
+    pub chunk_stride: Elements,
 
     /// `shuffle_mode_` — *"Shuffle mode on the data"* (`:180`). Setter e008, **protected**.
     ///
@@ -795,6 +894,8 @@ impl<'a> AccessDetailsBase<'a> {
             mem_view_layout_map: None,
             // `int chunk_size_ = 0;` (`hpp:175`).
             chunk_size: Elements(0),
+            // `int chunk_stride_ = 0;` (`hpp:178`).
+            chunk_stride: Elements(0),
             // `std::string shuffle_mode_ = "noshuffle";` (`hpp:181`) — NOT the zero value.
             shuffle_mode: sen::ShuffleMode::NoShuffle,
             // `SmallVector<Value> indices_;` (`hpp:199`).
@@ -1319,6 +1420,195 @@ impl<'a> AccessDetailsBase<'a> {
         TransferExtents::Rectangular
     }
 
+    /// Replaces: e206_constructChunkAndShuffleInfo
+    ///
+    /// **206/384** `AccessDetailsBase::constructChunkAndShuffleInfo` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98` (167L). The contiguous run the
+    /// hardware issues per instruction, the distance between two such runs, and — for a load whose
+    /// result feeds a `vectorchain` reshuffle — the shuffle mode and rotation amount.
+    ///
+    /// ⛔ IT WORKS ON A ROW-MAJOR **COPY**: a column-major layout is reversed all but its trailing
+    /// constant term, and the extents with it (`:111-123`); the members keep their own order.
+    /// ⛔ THE TWO `dim_idx` CURSORS START AT `-1` AND THE REFERENCE THEN INDEXES WITH ONE (`:191`) —
+    /// [`None`] here, and the legality test it guards is skipped, which is observably the same because
+    /// `chunk_stride` is 0 in exactly that case and the `&&` fails.
+    /// ⛔ `dim == 0`'S MULTIPLIER IS `INT32_MAX`, VERBATIM (`:147-149`): the outermost dimension has no
+    /// stride above it, so nothing can match and the loop always breaks there. Its `*=` overflows an
+    /// `int` in the reference and is unobservable, because no later loop reads the product.
+    /// ⛔ A ZERO STRIDE IS A DIVISION BY ZERO THERE; with no ratio there is no multiplier for the
+    /// extent to fit under, so [`ChunkAndShuffleInfo::ExtentLargerThanLayout`] refuses it.
+    /// ⛔ ONLY `agen.vector_load` REACHES THE SHUFFLE HALF: the reference's `isa<>` (`:205-206`) lists
+    /// the two vector loads and the two composite LOADS, and of those four the island has one —
+    /// `CompositeLoadAndStore` is deliberately NOT in that list.
+    pub fn construct_chunk_and_shuffle_info(&mut self, scope: &[DfirOp]) -> ChunkAndShuffleInfo {
+        // `layout_coeffs[extents.size() - 1] > layout_coeffs[0]` (`:111`) — the innermost stride
+        // moving furthest is column major. Through `Option` because both indices are the reference's
+        // own out-of-bounds reads on an empty list.
+        let innermost = self
+            .extents
+            .len()
+            .checked_sub(1)
+            .and_then(|last| self.layout_coeffs.get(last));
+        let is_column_major = match (innermost, self.layout_coeffs.first()) {
+            (Some(inner), Some(outer)) => inner > outer,
+            _ => false,
+        };
+        let (tmp_layout_coeffs, tmp_extents): (Vec<LayoutCoeff>, Vec<Elements>) = if is_column_major
+        {
+            // `:112-122` — the strides reversed with the constant term put back on the end.
+            let mut coeffs: Vec<LayoutCoeff> = Vec::new();
+            if let Some((constant, strides)) = self.layout_coeffs.split_last() {
+                coeffs.extend(strides.iter().rev().copied());
+                coeffs.push(*constant);
+            }
+            (coeffs, self.extents.iter().rev().copied().collect())
+        } else {
+            (self.layout_coeffs.clone(), self.extents.clone())
+        };
+
+        // `:127-130` — the layout carries one extra dimension of constant, and the innermost stride of
+        // a row-major layout is 1.
+        let innermost_stride = tmp_extents
+            .len()
+            .checked_sub(1)
+            .and_then(|last| tmp_layout_coeffs.get(last));
+        if tmp_layout_coeffs.len() != tmp_extents.len() + 1
+            || innermost_stride != Some(&LayoutCoeff(1))
+        {
+            return ChunkAndShuffleInfo::LayoutDoesNotMatchExtents;
+        }
+
+        // `int multiplier = dim == 0 ? INT32_MAX : coeffs[dim - 1] / coeffs[dim];` (`:147-149`, `:173-175`)
+        let multiplier = |dim: usize| {
+            if dim == 0 {
+                Some(i64::from(i32::MAX))
+            } else {
+                ratio(
+                    tmp_layout_coeffs.get(dim - 1).map(|coeff| coeff.0),
+                    tmp_layout_coeffs.get(dim).map(|coeff| coeff.0),
+                )
+            }
+        };
+        let extent_at = |dim: usize| tmp_extents.get(dim).copied().unwrap_or(Elements(0));
+
+        // `:138-165` — the contiguous run, innermost dimension outward.
+        let mut chunk_dim_idx: Option<usize> = None;
+        let mut layout_extent_multiplier = Elements(1);
+        let mut chunk_size = Elements(0);
+        for dim in (0..tmp_extents.len()).rev() {
+            let extent = extent_at(dim);
+            let Some(multiplier) = multiplier(dim).filter(|found| *found >= 0) else {
+                return ChunkAndShuffleInfo::ExtentLargerThanLayout { dim };
+            };
+            let multiplier = Elements(multiplier.unsigned_abs());
+            if multiplier < extent {
+                return ChunkAndShuffleInfo::ExtentLargerThanLayout { dim };
+            }
+            if multiplier != extent {
+                chunk_dim_idx = Some(dim);
+                chunk_size = Elements(layout_extent_multiplier.0.saturating_mul(extent.0));
+                layout_extent_multiplier =
+                    Elements(layout_extent_multiplier.0.saturating_mul(multiplier.0));
+                break;
+            }
+            layout_extent_multiplier =
+                Elements(layout_extent_multiplier.0.saturating_mul(multiplier.0));
+        }
+        self.chunk_size = chunk_size;
+
+        // `:169-188` — the chunk stride is the running extent product at the first non-unit extent
+        // ABOVE the chunk dimension.
+        let mut chunk_stride = Elements(0);
+        let mut chunk_stride_dim_idx: Option<usize> = None;
+        for dim in (0..chunk_dim_idx.unwrap_or(0)).rev() {
+            let extent = extent_at(dim);
+            let Some(multiplier) = multiplier(dim).filter(|found| *found >= 0) else {
+                return ChunkAndShuffleInfo::ExtentLargerThanLayout { dim };
+            };
+            let multiplier = Elements(multiplier.unsigned_abs());
+            if multiplier < extent {
+                return ChunkAndShuffleInfo::ExtentLargerThanLayout { dim };
+            }
+            if extent != Elements(1) {
+                chunk_stride = layout_extent_multiplier;
+                chunk_stride_dim_idx = Some(dim);
+                break;
+            }
+            layout_extent_multiplier =
+                Elements(layout_extent_multiplier.0.saturating_mul(multiplier.0));
+        }
+        self.chunk_stride = chunk_stride;
+
+        // `:191-197` — a chunk that sits at the innermost stride and yet is one of several.
+        if let Some(chunk_dim) = chunk_dim_idx
+            && tmp_layout_coeffs.get(chunk_dim) == Some(&LayoutCoeff(1))
+            && chunk_stride != Elements(0)
+        {
+            return ChunkAndShuffleInfo::ChunkStartingOffsetUnsupported;
+        }
+
+        // `:200-203` — a second, outer chunk stride.
+        for dim in (0..chunk_stride_dim_idx.unwrap_or(0)).rev() {
+            if extent_at(dim) != Elements(1) {
+                return ChunkAndShuffleInfo::VariableChunkStride { dim };
+            }
+        }
+
+        // `:207-218` — the users of the loaded vector.
+        let users = match self.op {
+            agen::Op::VectorLoad { result, .. } => uses(*result, scope),
+            agen::Op::VectorStore { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield => {
+                Vec::new()
+            }
+        };
+        for user in users {
+            match user {
+                // `:220-241` — the selection map decides the shuffle mode.
+                DfirOp::VectorChain(vectorchain::Op::Select { selection_map, .. }) => {
+                    let mut splat = false;
+                    let mut valid_select_map = true;
+                    selection_map.walk_exprs(&mut |expr| match expr {
+                        AffineExpr::Mod(..) => splat = true,
+                        // The constant arm's `DT_CHECK(input_size == modulo)` is commented out
+                        // (`:232`), and a bare `d<n>` is the map's own identity.
+                        AffineExpr::Const(_) | AffineExpr::Dim(_) => {}
+                        _ => valid_select_map = false,
+                    });
+                    if splat {
+                        self.set_shuffle_mode(sen::ShuffleMode::Splat);
+                    }
+                    if !valid_select_map {
+                        return ChunkAndShuffleInfo::InvalidSelectMap;
+                    }
+                }
+                // `:242-261` — the rotation amount has to be a constant, forward, and in range.
+                DfirOp::VectorChain(vectorchain::Op::Rotate {
+                    position,
+                    right_shift,
+                    ..
+                }) => {
+                    let Some(DfirOp::Arith(arith::Op::Constant { value, .. })) =
+                        defining_op(*position, scope)
+                    else {
+                        return ChunkAndShuffleInfo::RotationPositionNotConstant;
+                    };
+                    if *value < 0 {
+                        return ChunkAndShuffleInfo::RotationPositionNegative;
+                    }
+                    self.set_rotation_position(Elements(value.unsigned_abs()));
+                    if self.rotation_position > self.total_elements {
+                        return ChunkAndShuffleInfo::RotationPositionOverTotalElements;
+                    }
+                    if !right_shift {
+                        return ChunkAndShuffleInfo::LeftRotationUnsupported;
+                    }
+                }
+                _ => {}
+            }
+        }
+        ChunkAndShuffleInfo::Chunked
+    }
+
     /// Replaces: e144_constructLdOrStType
     ///
     /// **144/384** `AccessDetailsBase::constructLdOrStType` —
@@ -1425,6 +1715,44 @@ pub struct AccessDetailsAffine<'a> {
     pub indices_coeff_dict: IndicesCoeffDict,
 }
 
+/// THE OUTCOME OF [`AccessDetailsAffine::initialize`] — initialized, or WHY the op said nothing.
+///
+/// ⛔ NONE OF THE THREE IS A DIAGNOSTIC. The reference's `initialize()` returns `void` and reaches
+/// `DT_ERROR("unsupported operation")` (`AccessDetails.cpp:346`) — an ABORT — on an op outside its
+/// chain, and reads `getMemoryIndex()` with the memory index already set by `insert`'s caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum AffineInitialize {
+    /// Every field is set and the memory view is resolved (`:349`).
+    Initialized,
+    /// `memory_index_` was never set, so the record does not know which operand it is.
+    MemoryIndexUnset,
+    /// `DT_ERROR("unsupported operation")` (`:346`) — a composite, a yield, or one of the two
+    /// `indirect_` twins the island has no op for.
+    UnsupportedOperation,
+    /// `mem_ref_` does not trace back to a `dataflow.get_*_memory_view` in this scope.
+    MemoryViewUnresolved,
+}
+
+impl AffineInitialize {
+    /// Initialized only for [`Self::Initialized`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, AffineInitialize::Initialized)
+    }
+
+    /// The reference's abort message, verbatim (`AccessDetails.cpp:346`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            AffineInitialize::Initialized
+            | AffineInitialize::MemoryIndexUnset
+            | AffineInitialize::MemoryViewUnresolved => None,
+            AffineInitialize::UnsupportedOperation => Some("unsupported operation"),
+        }
+    }
+}
+
 impl<'a> AccessDetailsAffine<'a> {
     /// Replaces: e016_AccessDetailsBase
     ///
@@ -1499,6 +1827,64 @@ impl<'a> AccessDetailsAffine<'a> {
     /// so a second call cannot leave a coefficient from the first behind.
     pub fn set_indices_coeff_dict(&mut self, indices_coeff_dict: IndicesCoeffDict) {
         self.indices_coeff_dict = indices_coeff_dict;
+    }
+
+    /// Replaces: e207_initialize
+    ///
+    /// **207/384** `AccessDetailsAffine::initialize` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295` (57L). Everything one affine load or
+    /// store says about itself, read off the op and into the record, then the memory view.
+    ///
+    /// ⛔ FOUR ARMS, TWO ISLAND OPS. The reference's `dyn_cast` chain (`:301-344`) takes
+    /// `agen.vector_load`/`agen.vector_store` and their `indirect_` twins; the indirect pair differs
+    /// only in reading `getDirectMemref()`/`getDirectAffineMapAttr()` and has no island op yet, so it
+    /// lands on [`AffineInitialize::UnsupportedOperation`] with the composite and the yield.
+    /// ⛔ THE WIDTH AND THE COUNT COME FROM THE **VECTOR** OPERAND, not from the memref: the loaded
+    /// result on a load, the stored value on a store (`:305-310`, `:316-321`).
+    /// ⛔ AND `getMapIndices()`/`getMapOperands()` ARE THE MAP'S OPERANDS, so [`access_map`] hands back
+    /// both the subscripts map and the index list in one pass — one `d<i>` per DISTINCT operand.
+    pub fn initialize(&mut self, scope: &[DfirOp]) -> AffineInitialize {
+        if self.base.memory_index.is_none() {
+            return AffineInitialize::MemoryIndexUnset;
+        }
+
+        let (view, view_ty, indices, vector_ty) = match self.base.op {
+            agen::Op::VectorLoad {
+                view,
+                view_ty,
+                indices,
+                ty,
+                ..
+            }
+            | agen::Op::VectorStore {
+                view,
+                view_ty,
+                indices,
+                ty,
+                ..
+            } => (view, view_ty, indices, ty),
+            agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield => {
+                return AffineInitialize::UnsupportedOperation;
+            }
+        };
+        let (subscripts_map, map_indices) = access_map(indices);
+        self.base.mem_ref = Some(*view);
+        self.base
+            .set_transfer_set(agen::access_set(view_ty, vector_ty.len));
+        self.base
+            .set_transfer_order(agen::access_order(view_ty.shape.len()));
+        self.set_subscripts_map(subscripts_map);
+        self.base.set_element_width(Bits(vector_ty.elem.bits()));
+        self.base
+            .set_expected_total_elements(Elements(vector_ty.len));
+        self.base.set_indices(&map_indices);
+
+        // `initializeMemViewInfo()` (`:349`) reads `mem_ref_` back; entry 145 takes the resolved view.
+        let Some(source) = MemViewSource::of(*view, scope) else {
+            return AffineInitialize::MemoryViewUnresolved;
+        };
+        self.base.initialize_mem_view_info(source);
+        AffineInitialize::Initialized
     }
 
     /// Replaces: e146_constructIndices
@@ -2367,6 +2753,22 @@ impl<T> AccessContainer<T> {
     pub fn get(&self, moi: MemoryOperandIndex) -> Option<&T> {
         self.entries.get(self.slots[moi.slot()]?)
     }
+
+    /// Replaces: e209_getFirst
+    ///
+    /// **209/384** `AccessContainer::getFirst` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411` (7L). The SOURCE operand if the
+    /// container has one, else the DESTINATION operand.
+    ///
+    /// ⛔ ONLY THE **DIRECT** PAIR IS CONSULTED (`:412-415`): a container holding `kIndSrc` alone —
+    /// which `composite_indirect_load_and_store` may build (`:34-35`) — reaches the
+    /// `llvm_unreachable("expected at least one of kDirSrc or kDirDst operands")` (`:417`), and that
+    /// is [`None`] here.
+    #[must_use]
+    pub fn get_first(&self) -> Option<&T> {
+        self.get(MemoryOperandIndex::DirSrc)
+            .or_else(|| self.get(MemoryOperandIndex::DirDst))
+    }
 }
 
 /// PROOF THAT ONE MEMORY OPERAND'S SLOT IS EMPTY, AND THE RIGHT TO FILL IT ONCE.
@@ -2386,7 +2788,7 @@ pub struct VacantSlot<'a, T> {
     moi: MemoryOperandIndex,
 }
 
-impl<T> VacantSlot<'_, T> {
+impl<'a, T> VacantSlot<'a, T> {
     /// Replaces: e149_insert
     ///
     /// **149/384** `AccessContainer::insert` —
@@ -2420,21 +2822,42 @@ impl<T> VacantSlot<'_, T> {
         self.container.slots[self.moi.slot()] = Some(self.container.entries.len());
         self.container.entries.push(access);
     }
+
+    /// Replaces: e208_emplace_insert
+    ///
+    /// **208/384** `AccessContainer::emplace_insert` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378` (8L). [`Self::fill`] plus the
+    /// reference's closing `return get(moi);` (`:385`) — the entry, ready to be written into.
+    ///
+    /// ⛔ THE VARIADIC HALF DOES NOT SURVIVE. `template <class... Args>` forwarding into
+    /// `emplace_back` is C++'s way to build the entry in place; the caller builds it here and moves
+    /// it, which is what a `T` by value already is.
+    ///
+    /// ⛔ AND THE RETURN IS **EXCLUSIVE**, unlike [`AccessContainer::get`]: `gatherAffineLoadStoreDetails`
+    /// keeps writing through it (`Helper.cpp:566`), so this is the one place the non-const lookup is
+    /// needed and the [`VacantSlot`] hands out its own borrow rather than a second one.
+    pub fn emplace_insert(self, access: T) -> &'a mut T {
+        let at = self.container.entries.len();
+        self.container.slots[self.moi.slot()] = Some(at);
+        self.container.entries.push(access);
+        &mut self.container.entries[at]
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase,
-        AccessDetailsSymbolic, ConstructedIndices, IndicesCoeffDict, LayoutCoeff, MemViewSource,
-        MemoryOperandIndex, SubscriptOperand, TimeBound, TimeDim, TimeOffsets, TransferDim,
-        TransferExtents, sen, set_coalesced_bound_values,
+        AccessDetailsSymbolic, AffineInitialize, ChunkAndShuffleInfo, ConstructedIndices,
+        IndicesCoeffDict, LayoutCoeff, MemViewSource, MemoryOperandIndex, SubscriptOperand,
+        TimeBound, TimeDim, TimeOffsets, TransferDim, TransferExtents, sen,
+        set_coalesced_bound_values,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::dialects::agen;
     use crate::islands::dataflow_ir::dialects::{
-        Index, Op as DfirOp, Val, affine, arith, dataflow, scf,
+        Index, Op as DfirOp, Val, affine, arith, dataflow, scf, vectorchain,
     };
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef, ScalarTy, Vector,
@@ -4443,5 +4866,138 @@ mod unit_tests {
             let value = Val(u32::try_from(i).expect("four operands fit a u32"));
             assert_eq!(container.get(moi), Some(&value));
         }
+    }
+
+    /// 🎯 206/384 — TWO ROWS, ONE CHUNK EACH, 512 ELEMENTS APART, AND A ROTATION ON THE WAY OUT.
+    ///
+    /// ⭐ A `memref<4x8x64xf16>` walked as `[2][1][64]`: the innermost extent fills its layout ratio
+    /// (64 == 64) so the chunk grows to a whole row, the middle dimension stops it (8 != 1) and the
+    /// outer non-unit extent seats the stride at the running product 512. The chunk dimension's own
+    /// stride is 64 and not 1, which is what keeps
+    /// [`ChunkAndShuffleInfo::ChunkStartingOffsetUnsupported`] off it (`:191-197`).
+    #[test]
+    fn the_chunk_is_the_contiguous_row_and_the_stride_is_the_plane_below_it() {
+        let op = agen::Op::VectorLoad {
+            result: Val(2),
+            view: Val(1),
+            indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
+            view_ty: MemRef {
+                shape: vec![4, 8, 64],
+                elem: ElemType::F16,
+            },
+            ty: LOADED,
+        };
+        // `vectorchain.rotate %loaded, %c8 : vector<64xf16>` — a right rotation by a constant.
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(3),
+                value: 8,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Rotate {
+                result: Val(4),
+                input: Val(2),
+                position: Val(3),
+                right_shift: true,
+                input_ty: LOADED,
+                ty: LOADED,
+            }),
+        ];
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::L0lu);
+        // `affine_map<(d0, d1, d2) -> (d0 * 512 + d1 * 64 + d2)>`, flattened.
+        ad.set_layout_coeffs(&[
+            LayoutCoeff(512),
+            LayoutCoeff(64),
+            LayoutCoeff(1),
+            LayoutCoeff(0),
+        ]);
+        ad.set_extents(&[Elements(2), Elements(1), Elements(64)]);
+        ad.set_total_elements(Elements(128));
+
+        assert_eq!(
+            ad.construct_chunk_and_shuffle_info(&scope),
+            ChunkAndShuffleInfo::Chunked
+        );
+        assert_eq!(ad.chunk_size, Elements(64));
+        assert_eq!(ad.chunk_stride, Elements(512));
+        // The rotation is read off the constant, and no `vectorchain.select` means no splat.
+        assert_eq!(ad.rotation_position, Elements(8));
+        assert_eq!(ad.shuffle_mode, sen::ShuffleMode::NoShuffle);
+    }
+
+    /// 🎯 207/384 — THE LOAD FILLS EIGHT MEMBERS, AND THE LAST TWO COME FROM THE VIEW.
+    ///
+    /// ⛔ THE WIDTH AND THE COUNT ARE THE **VECTOR**'S, not the memref's: `vector<64xf16>` gives 16
+    /// bits and 64 elements where `memref<8x64xf16>` would give 512.
+    #[test]
+    fn the_load_names_its_own_memref_width_and_count_and_then_resolves_the_view() {
+        let op = vector_load();
+        let scope = vec![logical_view()];
+        let mut ad = AccessDetailsAffine::new(&op, DfirUnit::Lxlu);
+        ad.base.set_memory_index(MemoryOperandIndex::DirSrc);
+
+        assert_eq!(ad.initialize(&scope), AffineInitialize::Initialized);
+        assert_eq!(ad.base.mem_ref, Some(Val(1)));
+        assert_eq!(ad.base.element_width, Bits(16));
+        assert_eq!(ad.base.expected_total_elements, Elements(64));
+        assert_eq!(ad.base.transfer_order, AffineMap::identity(2));
+        let view_ty = MemRef {
+            shape: vec![8, 64],
+            elem: ElemType::F16,
+        };
+        assert_eq!(ad.base.transfer_set, agen::access_set(&view_ty, 64));
+        // Both subscripts are literals, so the map takes no operand and the index list stays empty.
+        assert_eq!(ad.subscripts_map, Some(AffineMap::constants(0, &[0, 0])));
+        assert_eq!(ad.base.indices, Vec::new());
+        assert_eq!(ad.base.mem_view_layout_map, Some(row_major_8x64()));
+        assert_eq!(ad.base.mem_view_start_addr, Some(Val(21)));
+    }
+
+    /// 🎯 208/384 — THE RETURNED ENTRY IS THE ONE IN THE CONTAINER, AND IT IS WRITABLE.
+    ///
+    /// ⭐ `return get(moi)` (`:385`) IS WHAT THE CALLER USES: `gatherAffineLoadStoreDetails` inserts a
+    /// record and then keeps writing into it, so a copy would drop every later write.
+    #[test]
+    fn the_inserted_entry_is_handed_back_for_writing_at_the_slot_it_took() {
+        let mut container = AccessContainer::<Val>::default();
+        container
+            .vacancy(MemoryOperandIndex::DirDst)
+            .expect("empty")
+            .fill(Val(7));
+
+        let entry = container
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("still empty")
+            .emplace_insert(Val(0));
+        *entry = Val(9);
+
+        assert_eq!(container.get(MemoryOperandIndex::DirSrc), Some(&Val(9)));
+        assert_eq!(container.get(MemoryOperandIndex::DirDst), Some(&Val(7)));
+        assert_eq!(container.entries(), [Val(7), Val(9)]);
+    }
+
+    /// 🎯 209/384 — THE SOURCE FIRST, THEN THE DESTINATION, AND NOTHING ELSE COUNTS.
+    ///
+    /// ⛔ AN INDIRECT-ONLY CONTAINER IS THE `llvm_unreachable` (`:417`), which is [`None`] here.
+    #[test]
+    fn the_first_operand_is_the_direct_source_or_else_the_direct_destination() {
+        let mut only_dst = AccessContainer::<Val>::default();
+        only_dst
+            .vacancy(MemoryOperandIndex::DirDst)
+            .expect("empty")
+            .fill(Val(5));
+        assert_eq!(only_dst.get_first(), Some(&Val(5)));
+
+        let mut both = only_dst;
+        both.vacancy(MemoryOperandIndex::DirSrc)
+            .expect("still empty")
+            .fill(Val(4));
+        assert_eq!(both.get_first(), Some(&Val(4)));
+
+        let mut only_indirect = AccessContainer::<Val>::default();
+        only_indirect
+            .vacancy(MemoryOperandIndex::IndSrc)
+            .expect("empty")
+            .fill(Val(6));
+        assert_eq!(only_indirect.get_first(), None);
     }
 }

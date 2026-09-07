@@ -351,6 +351,22 @@ impl AffineExpr {
         AffineExpr::FloorDiv(Box::new(self), Box::new(AffineExpr::Const(k)))
     }
 
+    /// `AffineExpr::walk(callback)` — this node and everything under it, CHILDREN FIRST
+    /// (`llvm-project/mlir/lib/IR/AffineExpr.cpp`, `AffineExprVisitor::walkPostOrder`).
+    pub fn walk(&self, callback: &mut impl FnMut(&AffineExpr)) {
+        match self {
+            AffineExpr::Dim(_) | AffineExpr::Sym(_) | AffineExpr::Const(_) => {}
+            AffineExpr::Add(lhs, rhs)
+            | AffineExpr::Mul(lhs, rhs)
+            | AffineExpr::Mod(lhs, rhs)
+            | AffineExpr::FloorDiv(lhs, rhs) => {
+                lhs.walk(callback);
+                rhs.walk(callback);
+            }
+        }
+        callback(self);
+    }
+
     /// `AffineExpr::isFunctionOfDim(unsigned position)` — DOES THIS EXPRESSION MENTION `d<dim>`?
     ///
     /// ```cpp
@@ -1434,6 +1450,62 @@ impl AffineMap {
             _ => None,
         }
     }
+
+    /// `AffineMap::walkExprs(callback)` — EVERY SUBEXPRESSION OF EVERY RESULT, POST-ORDER
+    /// (`llvm-project/mlir/lib/IR/AffineMap.cpp:475-477`, `AffineExpr::walk`).
+    ///
+    /// ⭐ `constructChunkAndShuffleInfo` READS A SELECT MAP THROUGH IT (`AccessDetails.cpp:227-236`):
+    /// any `Mod` anywhere makes the load a splat, and any node that is neither `Mod`, a constant nor a
+    /// bare `d<n>` refuses the map — which is why the walk has to reach INSIDE each result and not
+    /// just visit its root.
+    pub fn walk_exprs(&self, callback: &mut impl FnMut(&AffineExpr)) {
+        for result in &self.results {
+            result.walk(callback);
+        }
+    }
+
+    /// THE INVERSE OF A PERMUTATION MAP, or [`None`] when the map is not one —
+    /// `mlir::inversePermutation` (`llvm-project/mlir/lib/IR/AffineMap.cpp:784-806`).
+    ///
+    /// ⭐⭐ ONLY ITS EXISTENCE IS EVER READ. `checkBasicConditions` writes
+    /// `if (!inversePermutation(data_order))` and refuses the access (`Helper.cpp:143-152`); the
+    /// inverse itself is dropped.
+    ///
+    /// ⛔ A NON-`Dim` RESULT IS **SKIPPED**, NOT REFUSED, and the count at the end is what catches it:
+    /// every input must have been named exactly once, so `(d0, d1) -> (d0, d0)` and
+    /// `(d0, d1) -> (d0 + 1, d1)` both leave an input unnamed and answer [`None`].
+    /// ⛔ THE EMPTY MAP IS ITS OWN INVERSE (`:785-786`), so `affine_map<() -> ()>` passes the test.
+    /// ⛔ SYMBOLS ARE AN `assert` THERE (`:787`); a declared symbol is an input no result can name, so
+    /// the count refuses the map here instead of aborting.
+    #[must_use]
+    pub fn inverse_permutation(&self) -> Option<AffineMap> {
+        // `map.isEmpty()` — `() -> ()` (`:785`).
+        if self.dims == 0 && self.syms == 0 && self.results.is_empty() {
+            return Some(self.clone());
+        }
+        let mut exprs: Vec<Option<AffineExpr>> = vec![None; self.dims as usize];
+        for (at, result) in self.results.iter().enumerate() {
+            // `:791-796` — the first result naming a position wins; a later one is skipped.
+            if let AffineExpr::Dim(position) = result
+                && let Some(slot) = exprs.get_mut(*position as usize)
+                && slot.is_none()
+            {
+                *slot = Some(AffineExpr::dim(
+                    u32::try_from(at).expect("a rank fits a u32"),
+                ));
+            }
+        }
+        let seen: Vec<AffineExpr> = exprs.into_iter().flatten().collect();
+        // `:803-804` — `seenExprs.size() != map.getNumInputs()`, and inputs are dims PLUS symbols.
+        if seen.len() != self.dims as usize + self.syms as usize {
+            return None;
+        }
+        Some(AffineMap {
+            dims: u32::try_from(self.results.len()).expect("a rank fits a u32"),
+            syms: 0,
+            results: seen,
+        })
+    }
 }
 
 /// AN INTEGER SET AS A COEFFICIENT MATRIX — `mlir::affine::FlatAffineValueConstraints`.
@@ -1830,6 +1902,28 @@ impl FlatConstraints {
             (Some(min_value), Some(max_value)) => Some(max_value - min_value + 1),
             _ => None,
         }
+    }
+
+    /// IS EVERY CONSTRAINT ONE-DIMENSIONAL OVER COLUMNS `pos .. pos + num`? —
+    /// `IntegerRelation::isHyperRectangular`
+    /// (`llvm-project/mlir/lib/Analysis/Presburger/IntegerRelation.cpp:1885-1907`), the reference's
+    /// own *"simple (naive and conservative) check"*.
+    ///
+    /// ⭐ `checkBasicConditions` ASKS IT OVER EVERY VARIABLE — `isHyperRectangular(0, getNumCols() - 1)`
+    /// (`Helper.cpp:155-157`) — so one row naming two of them is what refuses a load set.
+    /// ⛔ THE CONSTANT COLUMN IS OUTSIDE THE RANGE, which is why a rectangle at a nonzero offset
+    /// passes; and `>= 0` rows are scanned exactly like `== 0` rows.
+    #[must_use]
+    pub fn is_hyper_rectangular(&self, pos: usize, num: usize) -> bool {
+        self.inequalities
+            .iter()
+            .chain(self.equalities.iter())
+            .all(|row| {
+                (pos..pos.saturating_add(num))
+                    .filter(|column| row.get(*column).is_some_and(|value| *value != 0))
+                    .count()
+                    <= 1
+            })
     }
 }
 

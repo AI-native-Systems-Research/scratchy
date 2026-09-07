@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`186/384 ported; 186/384 audited`
+`194/384 ported; 194/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -885,6 +885,43 @@ reference's message; neither is given a substitute op. 158'S `"active"` ATTRIBUT
 set, searched for backwards from the loop and removed by the last region, all within the pass, so it
 is a field on the returned record instead of an attribute on the emitted op.
 
+⭐ AND ENTRIES 206-213 — the chunking and shuffle info, the affine record's own initialization, the
+container's two accessors, and the four `Helper.cpp` gatekeepers: `constructChunkAndShuffleInfo`,
+`initialize`, `emplace_insert`, `getFirst` (all in `agen_access_details.rs`),
+`checkBasicConditions`, `processInterleaveOp`, `gatherAffineLoadStoreDetails` and
+`constructImmutableAddress` (all in `agen_helper.rs`).
+
+⛔⛔ 206 WORKS ON A ROW-MAJOR **COPY** AND ITS TWO CURSORS START AT `-1`. A column-major layout is
+reversed all but its trailing constant term, and the extents with it (`AccessDetails.cpp:111-123`),
+while the members keep their own order. The `chunk_dim_idx`/`chunk_stride_dim_idx` pair is
+`Option<usize>` here, and the legality test the reference indexes with one (`:191`) is skipped when
+there is none — observably the same, because `chunk_stride` is 0 in exactly that case and its `&&`
+fails. `dim == 0`'s multiplier is `INT32_MAX` verbatim (`:147-149`); a zero stride divides by zero
+there, and with no ratio the extent has nothing to fit under, so it lands on the reference's own
+*"Extent in load/store set is larger than from the layout"*.
+
+⛔ 212 PUTS THE SAME START ADDRESS IN **TWO** CONTAINERS (`Helper.cpp:570-573`) — `mutable_addrs`,
+which entry 357 rewrites, and a local copy entry 213 then reads as `updated_mem_view_start_addrs` —
+and 213'S TWO ARMS DO NOT READ THE SAME WAY: the L3 arm reads the record, the other indexes
+`updated_mem_view_start_addrs[i]` BY POSITION (`:1229`), which is in range only because of the size
+test above it and means the same thing only because 212 filled both containers from one walk. 212's
+coefficient rows are zero-filled as each iterator is first seen and written at column `i`, so a
+column means "record `i`" even for an iterator the earlier records never mentioned.
+
+⛔ ONE `todo!` IS ADDED, AND IT IS GATED ON THE ONE INPUT ENTRY 357 PROVABLY LEAVES ALONE: with no
+access details, `generateAffineAddressManipulationStmts`' own `DT_CHECK` holds trivially, both of its
+loops (`Helper.cpp:698`, `:771`) run zero times and it returns `success()`. Every other input reaches
+statements this port does not have, and no stand-in op is substituted for them.
+
+⛔ NINE OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES AND `agen.composite_memory_interleave` HAVE
+NO ISLAND OP. 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
+`sentient.receive_and_store` whose only readable state is the mark) and 211 a `MemoryInterleave` (the
+`granularity` attribute and the region's ops), on the precedent of `IndirectMemView` and
+`UniformizeSource`; both matches are total and neither invents an op. 211'S IDENTITY TEST IS THE OP
+**NAME** (`:361`, `:380-381`), not the attributes, so a region holding a `load_and_send` beside a
+`receive_and_store` with matching burst and count is still refused — and its granularity default is
+the maximum and is never checked, so `l3BurstSize` itself is legal and 0 is not.
+
 
 ## Level 0
 
@@ -1304,22 +1341,22 @@ is a field on the returned record instead of an attribute on the emitted op.
 
 ## Level 2
 
-- [ ] **PORT 206/384** `constructChunkAndShuffleInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98`, 167 lines
-- [ ] **AUDIT 206/384** `constructChunkAndShuffleInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98`, line by line against the C++
-- [ ] **PORT 207/384** `initialize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295`, 57 lines
-- [ ] **AUDIT 207/384** `initialize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295`, line by line against the C++
-- [ ] **PORT 208/384** `emplace_insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378`, 8 lines
-- [ ] **AUDIT 208/384** `emplace_insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378`, line by line against the C++
-- [ ] **PORT 209/384** `getFirst` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411`, 7 lines
-- [ ] **AUDIT 209/384** `getFirst` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411`, line by line against the C++
-- [ ] **PORT 210/384** `checkBasicConditions` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:58`, 133 lines
-- [ ] **AUDIT 210/384** `checkBasicConditions` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:58`, line by line against the C++
-- [ ] **PORT 211/384** `processInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:305`, 80 lines
-- [ ] **AUDIT 211/384** `processInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:305`, line by line against the C++
-- [ ] **PORT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, 74 lines
-- [ ] **AUDIT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, line by line against the C++
-- [ ] **PORT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, 16 lines
-- [ ] **AUDIT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, line by line against the C++
+- [x] **PORT 206/384** `constructChunkAndShuffleInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98`, 167 lines
+- [x] **AUDIT 206/384** `constructChunkAndShuffleInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98`, line by line against the C++
+- [x] **PORT 207/384** `initialize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295`, 57 lines
+- [x] **AUDIT 207/384** `initialize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295`, line by line against the C++
+- [x] **PORT 208/384** `emplace_insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378`, 8 lines
+- [x] **AUDIT 208/384** `emplace_insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378`, line by line against the C++
+- [x] **PORT 209/384** `getFirst` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411`, 7 lines
+- [x] **AUDIT 209/384** `getFirst` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411`, line by line against the C++
+- [x] **PORT 210/384** `checkBasicConditions` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:58`, 133 lines
+- [x] **AUDIT 210/384** `checkBasicConditions` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:58`, line by line against the C++
+- [x] **PORT 211/384** `processInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:305`, 80 lines
+- [x] **AUDIT 211/384** `processInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:305`, line by line against the C++
+- [x] **PORT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, 74 lines
+- [x] **AUDIT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, line by line against the C++
+- [x] **PORT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, 16 lines
+- [x] **AUDIT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, line by line against the C++
 - [x] **PORT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
 - [x] **AUDIT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
 - [ ] **PORT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, 50 lines
