@@ -61,9 +61,6 @@ scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # proc-macro crate can't export the IR types, so they live in a normal
 # crate it calls.
 scratchy-subtile = { path = "../subtile" }
-# NOTE: the `scratchy-sdsc` Kani-verified tower is NOT a build dep of codegen — the proven pieces it
-# verifies (`CoreSplit`, `dev_off`, `bump_sticks_to_splittable`) are CANONICAL in `scratchy-subtile` and
-# used by the emitter directly; the tower re-exports + Kani-proves them (`cargo kani -p scratchy-sdsc`).
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

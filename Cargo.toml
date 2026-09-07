@@ -17,7 +17,6 @@ members = [
     "crates/tensors",
     "crates/layers",
     "crates/compiler/ir",
-    "crates/compiler/sdsc",
     "crates/targets/cuda",
     "crates/targets/cuda/builder",
     "crates/targets/spyre",
