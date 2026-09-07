@@ -63,7 +63,7 @@
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, affine, agen, dataflow, scf};
+use crate::islands::dataflow_ir::dialects::{self as dfir_dialects, Op as DfirOp, scf};
 use crate::islands::dataflow_ir::{self as dfir};
 use crate::islands::sentient::dialects::sentient as sen;
 
@@ -293,32 +293,20 @@ pub const fn pattern_for(op: &scf::Op) -> Option<Pattern> {
 /// nested regions included, which is why an `scf.yield` inside an `scf.for` inside a
 /// `dataflow.program_unit` is reached. This is the one mechanism the campaign's ports may simplify:
 /// MLIR nests through `Region`/`Block`, this island nests through `Vec`s.
+///
+/// ⛔⛔ THE DESCENT IS [`dfir_dialects::regions`] AND NOT A SECOND MATCH OF ITS OWN. This function
+/// once spelled the region-bearing ops out again, and drifted: it lacked the
+/// [`dfir_dialects::affine::Op::If`] arm, so an `scf` op in either branch of an `affine.if` was
+/// never visited and
+/// this pass reported success on a module still holding an op it had declared illegal. `regions`
+/// carries the island's own audit note demanding every reader descend through it; the whole point of
+/// there being one such function is that a region-bearing op added to the island cannot become
+/// invisible to a walk.
 fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
     for op in ops {
         visit(op);
-        match op {
-            DfirOp::Affine(affine::Op::For { body, .. })
-            | DfirOp::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. })
-            | DfirOp::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => {
-                walk_preorder(body, visit);
-            }
-            DfirOp::Scf(scf::Op::If {
-                body, else_body, ..
-            }) => {
-                walk_preorder(body, visit);
-                walk_preorder(else_body, visit);
-            }
-            DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
-                walk_preorder(&transfer.body, visit);
-            }
-            // no region.
-            DfirOp::Arith(_)
-            | DfirOp::Affine(_)
-            | DfirOp::Scf(_)
-            | DfirOp::Dataflow(_)
-            | DfirOp::Agen(_)
-            | DfirOp::VectorChain(_)
-            | DfirOp::Symbol(_) => {}
+        for region in dfir_dialects::regions(op) {
+            walk_preorder(region, visit);
         }
     }
 }
@@ -442,7 +430,8 @@ mod unit_tests {
     use super::*;
     use crate::arch::Target;
     use crate::generated::{OpFunc, SyncSignal};
-    use crate::islands::dataflow_ir::dialects::{Val, arith};
+    use crate::islands::dataflow_ir::dialects::{Val, affine, arith, dataflow};
+    use crate::islands::dataflow_ir::ty::IntegerSet;
     use crate::islands::dataflow_ir::{
         Grid, GroupId, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Units,
     };
@@ -680,6 +669,62 @@ mod unit_tests {
                 body: vec![DfirOp::Scf(scf::Op::Yield {
                     operands: Vec::new(),
                 })],
+            })],
+        ));
+    }
+
+    /// A program whose one unit holds an `affine.if` with `body` and `else_body`.
+    ///
+    /// ⭐ THE SET AND ITS OPERAND ARE ARBITRARY. This pass reads neither — the point is only that the
+    /// op OWNS TWO REGIONS, and `affine_set<(d0) : (d0 == 0)>` is the smallest well-formed one.
+    fn program_with_affine_if(body: Vec<DfirOp>, else_body: Vec<DfirOp>) -> Program<Target> {
+        program_of(
+            Vec::new(),
+            vec![DfirOp::Affine(affine::Op::If {
+                set: IntegerSet::from_sizes(&[1]),
+                args: vec![Val(0)],
+                symbol_args: Vec::new(),
+                results: Vec::new(),
+                body,
+                else_body,
+            })],
+        )
+    }
+
+    /// 🎯 047/384 — AND IT REACHES THE `then` BRANCH OF AN `affine.if`.
+    ///
+    /// ⛔⛔ THIS PINS THE DEFECT THIS REVIEW FOUND. [`walk_preorder`] once matched the region-bearing
+    /// ops out again for itself and had drifted: it carried arms for `affine.for`, `scf.for`,
+    /// `scf.if`, `scf.parallel`, `dataflow.program_unit` and the composite transfer, and NO arm for
+    /// [`affine::Op::If`](crate::islands::dataflow_ir::dialects::affine::Op::If) — whose two
+    /// regions are the DataflowIR rung's own conditional
+    /// (`dcc/test/PT/issue-236.mlir:59-65`). An `scf` op in either branch was never visited, so this
+    /// pass reported success on a module still holding an op it had declared illegal.
+    #[test]
+    #[should_panic(expected = "YieldOpLowering")]
+    fn the_walk_descends_into_the_then_branch_of_an_affine_if() {
+        run_on_operation(&program_with_affine_if(
+            vec![DfirOp::Scf(scf::Op::Yield {
+                operands: Vec::new(),
+            })],
+            Vec::new(),
+        ));
+    }
+
+    /// 🎯 047/384 — AND THE `else` BRANCH, WHICH IS THE SECOND REGION AND THE EASIER ONE TO LOSE.
+    ///
+    /// ⛔ A WALK THAT DESCENDS ONLY THE FIRST REGION PASSES THE `then` TEST ABOVE AND STILL MISSES
+    /// HALF OF EVERY CONDITIONAL. [`crate::islands::dataflow_ir::dialects::regions`] yields both,
+    /// and that is the only reason both are covered here by the same three lines.
+    #[test]
+    #[should_panic(expected = "IfOpLowering")]
+    fn the_walk_descends_into_the_else_branch_of_an_affine_if() {
+        run_on_operation(&program_with_affine_if(
+            Vec::new(),
+            vec![DfirOp::Scf(scf::Op::If {
+                cond: Val(0),
+                body: Vec::new(),
+                else_body: Vec::new(),
             })],
         ));
     }
