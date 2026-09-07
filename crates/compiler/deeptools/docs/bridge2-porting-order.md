@@ -39,13 +39,17 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`10/384 ported; 10/384 audited`
+`18/384 ported; 18/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`) and
 `setImmutableAddrAndIncrements`; entries 009-016, the `AccessDetailsBase` state setters
 (`setRotationPosition`, `setExpectedTotalElements`, `setExtents`, `setTotalElements`,
 `setElementWidth`, `setTransferSet`, `setTransferOrder`) and the `AccessDetailsAffine` constructor,
-in `src/bridges/dataflow_ir_to_sentient/agen_access_details.rs`. Unticked by their own audits and
+and entries 017-024, `AccessDetailsAffine`'s two setters (`setSubscriptsMap`,
+`setIndicesCoeffDict`) and `AccessDetailsAffineComposite`'s constructor plus its time setters
+(`setTimeAddrMap`, `setTimeSymbols`, `setTimeBounds`, `setTimeOffsets`,
+`setInterleaveGroupIndex`), all in
+`src/bridges/dataflow_ir_to_sentient/agen_access_details.rs`. Unticked by their own audits and
 awaiting re-port with their emission: `setldtype`, `generateSetSendDestinationStmts`,
 `getLoadConsumer`.
 
@@ -84,22 +88,22 @@ awaiting re-port with their emission: `setldtype`, `generateSetSendDestinationSt
 - [x] **AUDIT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, line by line against the C++
 - [x] **PORT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, 0 lines
 - [x] **AUDIT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, line by line against the C++
-- [ ] **PORT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, 2 lines
-- [ ] **AUDIT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, line by line against the C++
-- [ ] **PORT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, 2 lines
-- [ ] **AUDIT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, line by line against the C++
-- [ ] **PORT 019/384** `AccessDetailsAffine` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:259`, 0 lines
-- [ ] **AUDIT 019/384** `AccessDetailsAffine` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:259`, line by line against the C++
-- [ ] **PORT 020/384** `setTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286`, 2 lines
-- [ ] **AUDIT 020/384** `setTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286`, line by line against the C++
-- [ ] **PORT 021/384** `setTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289`, 2 lines
-- [ ] **AUDIT 021/384** `setTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289`, line by line against the C++
-- [ ] **PORT 022/384** `setTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292`, 2 lines
-- [ ] **AUDIT 022/384** `setTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292`, line by line against the C++
-- [ ] **PORT 023/384** `setTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295`, 2 lines
-- [ ] **AUDIT 023/384** `setTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295`, line by line against the C++
-- [ ] **PORT 024/384** `setInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299`, 2 lines
-- [ ] **AUDIT 024/384** `setInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299`, line by line against the C++
+- [x] **PORT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, 2 lines
+- [x] **AUDIT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, line by line against the C++
+- [x] **PORT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, 2 lines
+- [x] **AUDIT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, line by line against the C++
+- [x] **PORT 019/384** `AccessDetailsAffine` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:259`, 0 lines
+- [x] **AUDIT 019/384** `AccessDetailsAffine` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:259`, line by line against the C++
+- [x] **PORT 020/384** `setTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286`, 2 lines
+- [x] **AUDIT 020/384** `setTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286`, line by line against the C++
+- [x] **PORT 021/384** `setTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289`, 2 lines
+- [x] **AUDIT 021/384** `setTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289`, line by line against the C++
+- [x] **PORT 022/384** `setTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292`, 2 lines
+- [x] **AUDIT 022/384** `setTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292`, line by line against the C++
+- [x] **PORT 023/384** `setTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295`, 2 lines
+- [x] **AUDIT 023/384** `setTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295`, line by line against the C++
+- [x] **PORT 024/384** `setInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299`, 2 lines
+- [x] **AUDIT 024/384** `setInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299`, line by line against the C++
 - [ ] **PORT 025/384** `setStrides` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:355`, 2 lines
 - [ ] **AUDIT 025/384** `setStrides` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:355`, line by line against the C++
 - [ ] **PORT 026/384** `has` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:397`, 2 lines
