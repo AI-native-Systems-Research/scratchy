@@ -181,7 +181,10 @@ impl Units {
             | DfirUnit::Constant
             | DfirUnit::SfpState
             | DfirUnit::PeState
-            | DfirUnit::SfpRing => false,
+            | DfirUnit::SfpRing
+            // ⛔ A VIEWED MEMORY, NOT A MOVER. The virtual IBR is what an indirect access INDEXES
+            // THROUGH (`Helper.cpp:388-431`); the L3 halves still do the moving.
+            | DfirUnit::LxVirtualIbr => false,
         }
     }
 }

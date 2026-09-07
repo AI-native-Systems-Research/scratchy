@@ -112,6 +112,15 @@ pub enum Op {
     },
 
     /// `arith.addi` — ⛔ THE OPERANDS, NOT AN ATTRIBUTE DICTIONARY. See [`IntBinary`].
+    ///
+    /// ⛔⛔ AND IT IS THE ONLY WAY A MUTABLE ADDRESS MOVES. `insertCopyAndAddStmtsHelper`
+    /// (`AgenToSentient.hpp:502-520`) closes every address-carrying loop with
+    /// `arith.addi %iter_arg, %c<coeff>` and yields the sum, once per loop level, so the address a
+    /// transfer reads at iteration `(i, j, ..)` is the base plus each level's own coefficient. A
+    /// loop carrying an address with no `addi` in it re-reads the same elements every iteration. The
+    /// reference passes `iter_arg.getType()` as the result type there and the carried addresses are
+    /// all `index`, so [`IntBinary::ty`] is [`ScalarTy::Index`] at that site — see
+    /// [`super::affine::Carried`].
     AddI(IntBinary),
 
     /// `arith.subi`.

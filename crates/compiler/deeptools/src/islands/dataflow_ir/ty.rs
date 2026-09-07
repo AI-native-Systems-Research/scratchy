@@ -357,6 +357,24 @@ impl AffineMap {
         }
     }
 
+    /// IS THIS THE IDENTITY? `(d0, .., dn) -> (d0, .., dn)` and nothing else.
+    ///
+    /// ⛔ MLIR'S OWN PREDICATE, TRANSCRIBED. `AffineMap::isIdentity()` requires as many results as
+    /// dimensions and result `i` to be exactly `d<i>` — so `(d0, d1) -> (d0)` is NOT the identity
+    /// even though it drops nothing but a dimension, and `(d0) -> (d0 * 1)` is not one either
+    /// because the expression is a `Mul`. `checkIndirectMemViewForExtractOp`
+    /// (`Helper.cpp:428-431`) pairs it with `getNumDims() != 1` to insist an indirect memory view is
+    /// a FLAT, UNPERMUTED window: `expecting 1D identity map for layout_map`.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        usize::try_from(self.dims).is_ok_and(|dims| dims == self.results.len())
+            && self
+                .results
+                .iter()
+                .enumerate()
+                .all(|(i, r)| u32::try_from(i).is_ok_and(|i| *r == AffineExpr::Dim(i)))
+    }
+
     /// `(d0, .., dm) -> (r0, .., rn)` where every result is a literal — the `*_time_addr_map` of a
     /// transfer that walks nothing.
     ///
