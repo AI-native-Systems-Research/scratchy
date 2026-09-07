@@ -539,7 +539,17 @@ fn check_affine_set_constraints(mask_set: &IntegerSet, lanes: PtLanes) -> bool {
 ///
 /// `comp == PT` is [`PtUnit`]; `op->getNumResults() == 1` and `dyn_cast<VectorType>` of both results
 /// are the [`Vector`] parameters, which cannot be absent or of another kind; `op_num_elems %
-/// numSlicesPerStick == 0` is [`PtLanes`].
+/// numSlicesPerStick == 0` is [`PtLanes`] — ⚠️ and that last one is discharged in the TYPE, which
+/// makes the reference's abort a DECLINE at the one place a `PtLanes` is minted
+/// (`PtLanes::of::<A>(masked)?`). A row whose lanes do not divide into slices is not a mask this
+/// lowering can read either way, and the crate's never-runtime-refuse rule leaves no third answer.
+///
+/// # ⛔ ONE DELIBERATE DIVERGENCE — THE STATIC ARM'S RANGE IS CLOSED AT BOTH ENDS HERE
+///
+/// The reference tests `num_masked_elems < 0` and its divisibility and never tests the other end, so
+/// a lower bound below zero yields MORE masked columns than a slice has lanes and it emits that
+/// constant. This port declines such a set; the check carries the arithmetic and the evidence. ⭐ No
+/// set any fixture writes is affected — 48 of 64 still answers two columns, 64 of 64 still zero.
 #[must_use]
 pub fn get_mask_value_for_pt<A: Arch>(
     _unit: PtUnit,
@@ -660,16 +670,29 @@ pub fn get_mask_value_for_pt<A: Arch>(
                  the reference calls `std::optional::value()` on it (Helper.cpp:101-103)"
             )
         };
-        let num_masked_elems = i64::from(lanes.elems()) - lower_bound;
-        let slices = i64::from(A::SLICES_PER_STICK);
-        // `if (num_masked_elems < 0 || num_masked_elems % sys_def.numSlicesPerStick != 0)`
-        if num_masked_elems < 0 || num_masked_elems % slices != 0 {
+        // `auto num_masked_elems = op_num_elems - lower_bound;` and
+        // `if (num_masked_elems < 0 || num_masked_elems % sys_def.numSlicesPerStick != 0)`, READ IN THE
+        // LANE DOMAIN so that a column count is a `u32` by construction rather than by a conversion
+        // that could fail.
+        //
+        // ⛔⛔ AND IT CLOSES **BOTH** ENDS OF THE RANGE, WHERE THE REFERENCE CLOSES ONE — a
+        // deliberate, documented divergence. `num_masked_elems < 0` catches a lower bound ABOVE the
+        // row (`lower_bound > op_num_elems`) and nothing catches one BELOW zero: over
+        // `vector<64xf16>`, `affine_set<(d0) : (d0 + 8 >= 0, -d0 + 63 >= 0)>` gives
+        // `num_masked_elems = 72`, passes both of the reference's tests, and emits
+        // `sentient.scalar_constant {value = 9}` — nine masked columns on a row whose slice holds
+        // eight (`num_lanes_in_slice`, `Helper.cpp:56`), which is not a mask any `set_mask` can mean.
+        // A lower bound is a LANE INDEX, so it is a `u32` here, and a set naming a lane before the
+        // row's first declines exactly as one naming a lane past its last already does.
+        let first_masked_lane = u32::try_from(lower_bound).ok()?;
+        let num_masked_elems = lanes.elems().checked_sub(first_masked_lane)?;
+        if num_masked_elems % A::SLICES_PER_STICK != 0 {
             return None;
         }
-        // ⭐ IN RANGE BY THE TWO CHECKS ABOVE: `0 <= num_masked_elems <= op_num_elems`, and the row
-        // width is a `u32`.
-        let masked_columns = u32::try_from(num_masked_elems / slices)
-            .expect("a masked-column count of a PT row fits a u32");
+        // ⭐ AT MOST `num_lanes_in_slice` BY CONSTRUCTION, which is what the two reads above buy:
+        // `num_masked_elems <= op_num_elems`, and `op_num_elems / numSlicesPerStick` IS that width
+        // ([`PtLanes::lanes_in_slice`]).
+        let masked_columns = num_masked_elems / A::SLICES_PER_STICK;
 
         // `OpBuilder builder(op); return sentient::ConstantOp::create(builder, op->getLoc(),
         //                                                            builder.getIndexType(),
@@ -869,6 +892,33 @@ mod unit_tests {
             unreachable!("the empty set is a legal mask")
         };
         assert_eq!(columns, MaskedColumns(0));
+    }
+
+    /// 🎯 089/384 — A LOWER BOUND BELOW THE ROW IS DECLINED, NOT EMITTED (deliberate divergence).
+    ///
+    /// `affine_set<(d0) : (d0 + 8 >= 0, -d0 + 63 >= 0)>` over `vector<64xf16>` passes both of the
+    /// reference's static-arm tests — `num_masked_elems = 64 - (-8) = 72` is positive and divisible by
+    /// eight — and makes it emit `sentient.scalar_constant {value = 9}`: nine masked columns on a row
+    /// whose slice holds eight (`Helper.cpp:56`, `:105-113`). ⛔ THE COLUMN COUNT IS A COLUMN INDEX,
+    /// so there is no such mask; a set that names a lane before the row's first is declined exactly as
+    /// one naming a lane past its last is.
+    #[test]
+    fn a_lower_bound_below_the_row_is_declined() {
+        let mut values = Values::default();
+        let mask = mask_op(constant_set(-8, 64), None);
+
+        assert_eq!(
+            get_mask_value_for_pt::<Dd2>(
+                PtUnit,
+                ROW,
+                &mask,
+                Definitions::from_innermost(&[]),
+                &[],
+                &mut values,
+            ),
+            None,
+            "nine masked columns of an eight-column slice is not a mask"
+        );
     }
 
     /// 🎯 089/384 — THE ISLAND'S PREFIX FORM IS THE SAME OP AND STATES THE SAME SET.
