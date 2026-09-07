@@ -80,3 +80,359 @@
 //! | `e322_transformCompIndLoadAndStore` | 322/384 | 124 | `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546` |
 //! | `e351_runOnOperation` | 351/384 | 70 | `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226` |
 
+use crate::arch::{Arch, Bounded, Elements, Sticks};
+use crate::generated::DataType;
+use crate::units::DfirUnit;
+
+/// WHICH HALF OF THE L3 — the `DT_CHECK(is_any_of(comp, L3LU, L3SU))` both range queries open with.
+///
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:674` and `:685`.
+///
+/// ⛔⛔ A TYPE, NOT A CHECK. `DT_CHECK` aborts the compiler; the fact it is asserting is that these
+/// two queries are only ever asked about an external memory unit, and an external address register is
+/// something only the L3 halves have. Making that the parameter means the abort has no caller left to
+/// have — a `SenComponents` argument can be `PE`, an [`L3Half`] cannot.
+///
+/// ⭐⭐ AND THE HALF DOES NOT CHANGE THE ANSWER, WHICH IS WORTH KNOWING. `regInfoPerUnit` declares
+/// `L3LU`'s and `L3SU`'s registers in two separate blocks, and for `EAR` and `EBR` the two blocks are
+/// identical: `{16, 21, 32, UNSIGNED, true}` at `sysdef.cpp:313-314` and `:336-337`, and the same
+/// arch-split `EBR` at `:321-322`/`:331-332` and `:344-345`/`:354-355`. So the component selects a
+/// table row whose contents are the same either way, and its ONLY function in these two functions is
+/// the `DT_CHECK`. The parameter stays because the caller must still prove which unit it is asking
+/// about — see [`max_mutable_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L3Half {
+    /// `SenComponents::L3LU` — the load half.
+    Load,
+    /// `SenComponents::L3SU` — the store half.
+    Store,
+}
+
+impl L3Half {
+    /// WHICH HALF A UNIT KIND IS, OR NONE FOR A COMPONENT THE `DT_CHECK` WOULD ABORT ON.
+    ///
+    /// ⛔ EXHAUSTIVE, NO WILDCARD, for the same reason
+    /// [`moves_memory`](crate::islands::dataflow_ir::Units::moves_memory) is: a new unit
+    /// kind must state whether it is an L3 half rather than silently inherit "no" and take a
+    /// splitting decision meant for external memory.
+    #[must_use]
+    pub const fn of(unit: DfirUnit) -> Option<Self> {
+        match unit {
+            DfirUnit::L3lu => Some(L3Half::Load),
+            DfirUnit::L3su => Some(L3Half::Store),
+            DfirUnit::Sfp
+            | DfirUnit::Pe
+            | DfirUnit::PtRow(_)
+            | DfirUnit::Lxlu
+            | DfirUnit::Lxsu
+            | DfirUnit::Lx
+            | DfirUnit::Hbm
+            | DfirUnit::L0lu
+            | DfirUnit::L0su
+            | DfirUnit::L0
+            | DfirUnit::Constant
+            | DfirUnit::SfpState
+            | DfirUnit::PeState
+            | DfirUnit::SfpRing
+            | DfirUnit::LxVirtualIbr
+            | DfirUnit::CrossPtnLink => None,
+        }
+    }
+}
+
+/// AN EXTERNAL ADDRESS RANGE, IN BITS.
+///
+/// ⛔⛔ BITS, BECAUSE THAT IS THE UNIT BOTH OVERRIDES ARE DOCUMENTED IN AND THE ONE THE CALLERS
+/// DIVIDE. The two `cl::opt`s say *"Measured in bits"* (`MutableAddrSplitting.cpp:56-68`) and every
+/// consumer immediately does `range / elem_size_in_bits` to get an element count
+/// (`:804`, `:874-876`, `:927`). A range held in sticks or bytes would put that conversion at each of
+/// those three sites instead of one — see [`AddrRange::elements`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AddrRange(u64);
+
+impl AddrRange {
+    /// THE RANGE A `bits`-WIDE ADDRESS REGISTER SPANS — `pow(2, bitSize) * bytesPerStick * 8`.
+    ///
+    /// ⭐ ONE REGISTER VALUE PER STICK. The register counts sticks, so its span in bits is
+    /// `2^bitSize` sticks times the stick's bytes times eight — the arithmetic both range queries
+    /// share (`:676-679` and `:687-690`).
+    ///
+    /// ⛔ THE REFERENCE COMPUTES THIS IN FLOATING POINT AND GETS AN EXACT ANSWER. `pow(2, 21)` is a
+    /// `double`; every value it can return here is a power of two, which a `double` represents
+    /// exactly, so the `int64_t` the function returns is not rounded. Shifting instead is the same
+    /// number without the round trip — and it cannot overflow because [`Arch::L3_EAR_BITS`] is a
+    /// [`Bounded<53>`], whose bound is the reference's own return type.
+    #[must_use]
+    pub fn of_register<A: Arch>(bits: Bounded<53>) -> Self {
+        let sticks = Sticks(1u64 << bits.get());
+        Self(A::sticks_to_bytes(sticks).0 * 8)
+    }
+
+    /// AN OVERRIDE GIVEN ON THE COMMAND LINE, WHICH IS ALREADY IN BITS.
+    #[must_use]
+    pub const fn of_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// THE RANGE ITSELF, in bits.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// HOW MANY ELEMENTS OF ONE FORMAT FIT IN IT — `getMaxMutableRange(comp) / elem_size_in_bits`.
+    ///
+    /// ⭐ THE DIVISION ALL THREE CONSUMERS DO (`:804`, `:876`, `:927`), once. DataflowIR addresses are
+    /// in element granularity (`Dataflow.td:250`), so a range in bits is not comparable with an
+    /// address until it has crossed this.
+    ///
+    /// ⛔ THE FORMAT, NOT ITS WIDTH, SO THE DIVISOR CANNOT BE ZERO. `elem_size_in_bits` is a bare
+    /// `int` in the reference and a zero-width element would divide by it; every
+    /// [`DataType`] answers at least four bits ([`DataType::bits`]), which makes that unrepresentable
+    /// rather than unlikely.
+    #[must_use]
+    pub fn elements(self, elem: DataType) -> Elements {
+        Elements(self.0 / u64::from(elem.bits().0))
+    }
+}
+
+/// `-dcc-mutable-addr-splitting-max-mutable-size`, `cl::init(-1)` — `MutableAddrSplitting.cpp:56-61`.
+///
+/// ⛔⛔ `-1` IS `None`, NOT A NEGATIVE SIZE. The reference stores the flag as an `int64_t` and reads
+/// the sentinel back as `MaxMutableSize < 0` (`:676`), so "unset" and "set to a size" share one
+/// variable and every reader has to know which comparison means which. An `Option` says it once.
+///
+/// ⭐ AND IT IS A CONST BECAUSE IT IS NOT A RUNTIME VALUE HERE. Nothing in this crate parses
+/// `dcc-opt`'s command line; the flag exists so a person can override the register table by hand
+/// while debugging, and its default is the whole of its behaviour in a compiled pipeline. Changing it
+/// is a code change, which is the visibility this crate wants for a value that decides how a program
+/// is split.
+pub const MAX_MUTABLE_SIZE: Option<AddrRange> = None;
+
+/// `-dcc-mutable-addr-splitting-max-immutable-size`, `cl::init(-1)` — `MutableAddrSplitting.cpp:63-68`.
+///
+/// See [`MAX_MUTABLE_SIZE`].
+pub const MAX_IMMUTABLE_SIZE: Option<AddrRange> = None;
+
+/// Replaces: e111_getMaxMutableRange
+///
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673-681`:
+///
+/// ```text
+/// DT_CHECK(is_any_of(comp, SenComponents::L3LU, SenComponents::L3SU));
+/// auto &sys_def = dcc_ext_ctx_.dsc_global_->sysDef;
+/// return MaxMutableSize < 0
+///            ? pow(2, sys_def.regInfoPerUnit.at(comp).at(RegType::EAR).bitSize) *
+///                  sys_def.bytesPerStick * 8
+///            : MaxMutableSize;
+/// ```
+///
+/// ⭐ THE **MUTABLE** HALF IS THE `EAR`. An external address is an immutable base plus a mutable
+/// offset; the offset lives in the External Address Register, so how far a transfer's address may
+/// travel before the pass must split it is exactly what that register can hold
+/// ([`Arch::L3_EAR_BITS`], 21 bits on every arch).
+///
+/// ⛔ THE OVERRIDE WINS WHEN IT IS SET, AND IT IS TAKEN AS GIVEN. `MaxMutableSize` is already in bits
+/// and bypasses the register table entirely — including the arch — which is why it exists: it is the
+/// hand-hold for a machine whose table is wrong. See [`MAX_MUTABLE_SIZE`].
+///
+/// # Arguments
+///
+/// * `_half` — which L3 half is asking. Unread, because the two table rows it selects between are
+///   identical; present because the caller must still prove it is asking about one of them. See
+///   [`L3Half`].
+#[must_use]
+pub fn max_mutable_range<A: Arch>(_half: L3Half) -> AddrRange {
+    match MAX_MUTABLE_SIZE {
+        Some(given) => given,
+        None => AddrRange::of_register::<A>(A::L3_EAR_BITS),
+    }
+}
+
+/// Replaces: e112_getMaxImmutableRange
+///
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683-692` — the same function over the other
+/// register:
+///
+/// ```text
+/// DT_CHECK(is_any_of(comp, SenComponents::L3LU, SenComponents::L3SU));
+/// auto &sys_def = dcc_ext_ctx_.dsc_global_->sysDef;
+/// return MaxImmutableSize < 0
+///            ? pow(2, sys_def.regInfoPerUnit.at(comp).at(RegType::EBR).bitSize) *
+///                  sys_def.bytesPerStick * 8
+///            : MaxImmutableSize;
+/// ```
+///
+/// ⛔⛔ TWO FUNCTIONS BECAUSE THE REGISTER IS DIFFERENT, AND THE DIFFERENCE IS NOT A CONSTANT FACTOR.
+/// The mutable range reads the `EAR` (21 bits, every arch) and the immutable range reads the `EBR`
+/// (30 bits on RCUDD1A, **32** from SEN1P5 — `sysdef.cpp:321-332`). So the immutable space is 512×
+/// the mutable one on DD2 and 2048× on SEN1P5, and a port that shared one query between the two
+/// callers would silently pick one arch's ratio for both.
+///
+/// ⭐ WHAT THE CALLER DOES WITH IT: `immutable_space = (getMaxImmutableRange(comp) /
+/// elem_size_in_bits) - max_immutable`, checked against the mutable it wants to shift (`:925-930`) —
+/// the reason the immutable range matters at all is that splitting moves address out of the mutable
+/// half into the immutable one, and this is the room left there.
+///
+/// # Arguments
+///
+/// * `_half` — see [`max_mutable_range`].
+#[must_use]
+pub fn max_immutable_range<A: Arch>(_half: L3Half) -> AddrRange {
+    match MAX_IMMUTABLE_SIZE {
+        Some(given) => given,
+        None => AddrRange::of_register::<A>(A::L3_EBR_BITS),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{AddrRange, L3Half, max_immutable_range, max_mutable_range};
+    use crate::arch::{Dd2, Elements, Sen1p5};
+    use crate::generated::DataType;
+    use crate::units::{DfirUnit, Row};
+
+    /// 🎯 111/384 — THE MUTABLE RANGE IS THE EAR'S 21 BITS OF STICKS, IN BITS.
+    ///
+    /// `pow(2, 21) * 128 * 8` = 2^31 (`MutableAddrSplitting.cpp:676-679` over `sysdef.cpp:313`,
+    /// `:206`). ⭐ AND IT IS THE SAME ON BOTH ARCHES, because the `EAR` row is outside the
+    /// `coreArch <= RCUDD1A_ISA` branch — the one L3 register that is.
+    #[test]
+    fn the_mutable_range_is_two_to_the_thirty_first_bits_on_every_arch() {
+        assert_eq!(
+            max_mutable_range::<Dd2>(L3Half::Load).bits(),
+            2_147_483_648,
+            "2^21 sticks x 128 bytes x 8"
+        );
+        assert_eq!(
+            max_mutable_range::<Sen1p5>(L3Half::Load).bits(),
+            max_mutable_range::<Dd2>(L3Half::Load).bits(),
+            "the EAR is 21 bits on both arches"
+        );
+    }
+
+    /// 🎯 112/384 — AND THE IMMUTABLE RANGE IS THE EBR'S, WHICH IS NOT.
+    ///
+    /// ⛔⛔ 2^40 ON DD2 AND 2^42 FROM SEN1P5. The `EBR` row sits INSIDE the arch branch — 30 bits at
+    /// `sysdef.cpp:321-322`, 32 at `:331-332` — so the immutable space a program may occupy is four
+    /// times larger on SEN1P5. Reading one arch's number on the other is how a splitting decision
+    /// comes out wrong while every line of the pass looks right.
+    #[test]
+    fn the_immutable_range_is_four_times_larger_from_sen1p5() {
+        assert_eq!(
+            max_immutable_range::<Dd2>(L3Half::Load).bits(),
+            1_099_511_627_776,
+            "2^30 sticks x 128 bytes x 8 = 2^40"
+        );
+        assert_eq!(
+            max_immutable_range::<Sen1p5>(L3Half::Load).bits(),
+            4_398_046_511_104,
+            "2^32 sticks x 128 bytes x 8 = 2^42"
+        );
+        assert_eq!(
+            max_immutable_range::<Sen1p5>(L3Half::Load).bits()
+                / max_immutable_range::<Dd2>(L3Half::Load).bits(),
+            4
+        );
+    }
+
+    /// 🎯 112/384 — AND THE IMMUTABLE RANGE DOES NOT FIT IN 32 BITS, WHILE THE MUTABLE ONE JUST DOES.
+    ///
+    /// ⛔⛔ THE REASON THE RANGE IS A `u64` AND NOT [`crate::formats::Bits`], WHICH IS A `u32`. The
+    /// mutable range is 2^31 — half of `u32::MAX`, so a 32-bit range type would pass every test
+    /// written against the `EAR` and then truncate the `EBR`'s 2^40 to zero on the SAME arch. A
+    /// maximum of zero makes every address an overflow, and the only test that would have caught it
+    /// is the one that asks the immutable question.
+    #[test]
+    fn the_immutable_range_does_not_fit_in_a_thirty_two_bit_width() {
+        assert!(
+            max_mutable_range::<Dd2>(L3Half::Load).bits() < u64::from(u32::MAX),
+            "2^31 fits, with one bit to spare"
+        );
+        assert!(max_immutable_range::<Dd2>(L3Half::Load).bits() > u64::from(u32::MAX));
+        assert!(max_immutable_range::<Sen1p5>(L3Half::Load).bits() > u64::from(u32::MAX));
+    }
+
+    /// 🎯 111/384 + 112/384 — THE HALF NEVER CHANGES THE ANSWER.
+    ///
+    /// ⭐ THE FINDING BEHIND [`L3Half`]'s NOTE. `regInfoPerUnit` declares the two halves in separate
+    /// blocks (`sysdef.cpp:313` vs `:336`, `:321` vs `:344`, `:331` vs `:354`) with identical `EAR`
+    /// and `EBR` rows, so the component argument's only function in these two queries is the
+    /// `DT_CHECK` — which is why it is a type here and not a value to test against.
+    #[test]
+    fn the_two_l3_halves_declare_the_same_registers() {
+        for half in [L3Half::Load, L3Half::Store] {
+            assert_eq!(
+                max_mutable_range::<Sen1p5>(half),
+                max_mutable_range::<Sen1p5>(L3Half::Load),
+                "{half:?}"
+            );
+            assert_eq!(
+                max_immutable_range::<Sen1p5>(half),
+                max_immutable_range::<Sen1p5>(L3Half::Load),
+                "{half:?}"
+            );
+        }
+    }
+
+    /// 🎯 111/384 — AND ONLY AN L3 HALF CAN ASK.
+    ///
+    /// ⛔ THIS IS WHERE `DT_CHECK(is_any_of(comp, L3LU, L3SU))` WENT (`:674`, `:685`). The reference
+    /// aborts the compiler for a `PE` or an `LXLU`; here such a unit cannot produce the argument, so
+    /// there is no abort left to reach.
+    #[test]
+    fn only_the_l3_halves_have_an_external_address_register() {
+        assert_eq!(L3Half::of(DfirUnit::L3lu), Some(L3Half::Load));
+        assert_eq!(L3Half::of(DfirUnit::L3su), Some(L3Half::Store));
+        for not_l3 in [
+            DfirUnit::Pe,
+            DfirUnit::Sfp,
+            DfirUnit::PtRow(Row::checked(0).expect("every PT has a row 0")),
+            DfirUnit::Lxlu,
+            DfirUnit::Lxsu,
+            DfirUnit::Lx,
+            DfirUnit::Hbm,
+            DfirUnit::L0lu,
+            DfirUnit::L0su,
+            DfirUnit::L0,
+            DfirUnit::Constant,
+            DfirUnit::SfpState,
+            DfirUnit::PeState,
+            DfirUnit::SfpRing,
+            DfirUnit::LxVirtualIbr,
+            DfirUnit::CrossPtnLink,
+        ] {
+            assert_eq!(L3Half::of(not_l3), None, "{not_l3:?} has no EAR");
+        }
+    }
+
+    /// 🎯 111/384 — AND THE RANGE BECOMES AN ELEMENT COUNT BY THE ELEMENT'S WIDTH.
+    ///
+    /// `getMaxMutableRange(comp) / elem_size_in_bits` (`:804`, `:876`, `:927`) — so the SAME machine
+    /// admits half as many fp16 addresses as int8 ones, which is the whole reason the range is kept
+    /// in bits.
+    #[test]
+    fn the_range_divides_by_the_element_width() {
+        let mutable = max_mutable_range::<Dd2>(L3Half::Load);
+        assert_eq!(mutable.elements(DataType::Senint8), Elements(268_435_456));
+        assert_eq!(mutable.elements(DataType::Sen169Fp16), Elements(134_217_728));
+        assert_eq!(
+            mutable.elements(DataType::Senint4),
+            Elements(536_870_912),
+            "a sub-byte format gets more of them, not fewer"
+        );
+    }
+
+    /// 🎯 111/384 — AN OVERRIDE IS TAKEN AS GIVEN, TABLE AND ARCH BYPASSED.
+    ///
+    /// ⛔ `MaxMutableSize < 0 ? computed : MaxMutableSize` (`:676-680`) — the flag is already in bits
+    /// and nothing scales it. This exercises the branch the constant selects, since
+    /// [`super::MAX_MUTABLE_SIZE`] is `None` in a compiled pipeline.
+    #[test]
+    fn an_override_replaces_the_computed_range_entirely() {
+        let given = AddrRange::of_bits(4096);
+        assert_eq!(given.bits(), 4096);
+        assert_ne!(given, max_mutable_range::<Dd2>(L3Half::Load));
+        assert_eq!(given.elements(DataType::Senint8), Elements(512));
+    }
+}

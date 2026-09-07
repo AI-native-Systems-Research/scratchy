@@ -54,6 +54,38 @@ pub enum Op {
         /// The body.
         body: Vec<super::Op>,
     },
+
+    /// `scf.for %iv = %lo to %hi step %step { .. }` — the UNSTRUCTURED-BOUND counted loop.
+    ///
+    /// ⛔ PRESENT BECAUSE ONE PASS MUST CLASSIFY ITS INPUT, not because this crate emits it. Every
+    /// loop the bridge builds is an [`super::affine::Op::For`]; this variant exists because
+    /// `performFullUnroll` dispatches over exactly two loop kinds
+    /// (`LoopUnrollForShuffleOp.cpp:141-149`) and a candidate it cannot hold is a candidate the
+    /// dispatch cannot be written total over — see
+    /// [`crate::bridges::dataflow_ir_to_sentient::tf_loop_unroll_for_shuffle_op::Loop`].
+    ///
+    /// ⛔⛔ THE BOUNDS ARE VALUES, AND THAT IS THE WHOLE DIFFERENCE BETWEEN THE TWO OVERLOADS.
+    /// `affine.for`'s bounds are affine maps, so affine's own analysis derives the trip count from
+    /// the map and the reference just asks for a full unroll (`:162-165`). An `scf.for`'s bounds are
+    /// three SSA operands, so the trip count has to be reconstructed by asking each of them for its
+    /// defining constant (`:167-182`) — which is why one overload is one line and the other needs a
+    /// helper. Holding them as [`Val`] is what makes that reconstruction expressible.
+    ///
+    /// ⛔ NO `iter_args`, for the same reason [`results`](super::results) gives no `scf` op a result:
+    /// nothing in this pipeline binds one. A carrying loop is an `affine.for` with
+    /// [`super::affine::Carried`].
+    For {
+        /// The induction variable its region binds.
+        iv: Val,
+        /// The lower bound — `getLowerBound()`.
+        lo: Val,
+        /// The upper bound, exclusive — `getUpperBound()`.
+        hi: Val,
+        /// The step — `getStep()`.
+        step: Val,
+        /// The body.
+        body: Vec<super::Op>,
+    },
 }
 
 /// ONE `scf` OP AS TEXT. The caller has already indented the opening line.
@@ -89,6 +121,27 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         }
         Op::Parallel { ivs, body } => {
             let _ = writeln!(out, "scf.parallel ({}) {{", print::vals(ivs));
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            out.push_str("}\n");
+        }
+        Op::For {
+            iv,
+            lo,
+            hi,
+            step,
+            body,
+        } => {
+            let _ = writeln!(
+                out,
+                "scf.for {} = {} to {} step {} {{",
+                print::val(*iv),
+                print::val(*lo),
+                print::val(*hi),
+                print::val(*step)
+            );
             for inner in body {
                 print::emit(out, inner, depth + 1);
             }

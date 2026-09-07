@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`97/384 ported; 97/384 audited`
+`105/384 ported; 105/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -63,7 +63,8 @@ and `AccessDetailsAffineComposite`'s constructor plus its time setters (`setTime
 `src/bridges/dataflow_ir_to_sentient/vc_loop_mask_tree.rs` — where the intrusive tree became an
 arena, so the unchecked `static_cast` to the derived node is minting a `LoopMaskNodeId`, and
 `mlir::OperationNode`'s own storage and walks sit beside them unanchored, awaiting entries
-079/080/281 and 101-107.
+079/080/281 — and entries 106-107 have since taken it up, so the arena now carries both derived
+families.
 
 ⭐ AND ENTRIES 049-056 — the six `StandardToSentient` scalar lowerings (`LowerAddIOpToSentient`,
 `LowerSubIOpToSentient`, `LowerMulIOpToSentient`, the `If` shape law, `LowerConstantIndexToSentient`,
@@ -114,6 +115,57 @@ only on ops marked ILLEGAL, and `dataflow`/`affine`/`agen` are named by neither 
 `CFGSDataflowConditionalTree`'s constructor in `tf_cfgs_dataflow_conditional_tree.rs`, and
 `LocalOpNode`'s constructor with its three link reads (`getParentNode`, `getFirstChild`,
 `getNextSibling`) in `tf_flattening_local_regions.rs`.
+
+⭐ AND ENTRIES 105-108 — `LocalOpNode::getPrevSibling`, `FlatteningLocalRegionsTree`'s constructor
+and its `getRoot`, and `partitionUnits`, in `tf_flattening_local_regions.rs`. ⛔⛔ THE FAMILY MOVED
+ONTO THE SHARED ARENA HERE, which is the reconciliation entries 101-104 could not make: entry 106 is
+the `: OperationTreeBase()` the C++ names, so the tree it constructs is
+`OperationTreeBase<LocalOpNode>` from `vc_loop_mask_tree.rs` — as that layer's own banner instructs —
+instead of a second set of links, a second `getPrevSibling` walk and, at entry 180, a second
+`insertChildNode`. Entries 102-104 therefore moved from `LocalOpNode` onto the tree as one-line
+delegations, exactly as 081-083 read on `LoopMaskTree`, and `LocalOpNode` is now the payload the
+derived class adds (`units`, `is_in_region_num`). ⭐ ENTRY 107'S `DT_CHECK` SPLIT THREE WAYS: two
+conjuncts hold by construction, and `root_ != nullptr` stays an `Option` because `flatten` really does
+observe a rootless tree (`FlatteningLocalRegions.cpp:385-387`). ⛔ AND 108'S EQUALITY IS POINTER
+IDENTITY — `std::vector<Operation *>::operator==` — which is what keeps the vendor's `@diff_groups`
+four structurally identical bodies in four separate regions, in `MapVector` key order (`%0, %2, %1,
+%3`).
+
+⭐ AND ENTRIES 109-112, THE TWO RANGE PAIRS. `performFullUnroll` + `getConstantTripCount` in
+`tf_loop_unroll_for_shuffle_op.rs`, and `getMaxMutableRange` + `getMaxImmutableRange` in
+`tf_mutable_addr_splitting.rs`. ⛔⛔ 109 IS THE DECISION AND NOT THE DUPLICATION, AND THAT IS THE
+REFERENCE'S OWN SHAPE: neither overload clones a loop body — the scf one reconstructs a trip count and
+calls `loopUnrollByFactor(for_op, *trip_count)`, the affine one is the single line
+`return loopUnrollFull(for_op)` (`LoopUnrollForShuffleOp.cpp:151-165`). Those two utilities are
+upstream MLIR (`mlir/Dialect/{SCF,Affine}/Utils`), not among these 384, so `Unroll::ByFactor` /
+`Unroll::Fully` name the request the function issues and `Unroll::failed()` answers the caller's one
+question (`:135`). ⭐ THE THREE C++ FUNCTIONS COLLAPSED INTO ONE because an overload set over two loop
+kinds IS a match on a closed set — and `llvm_unreachable("unsupported loop type")` (`:148`) moved into
+`Loop::of`, where "not a loop" is an answer rather than undefined behaviour. ⛔ THE ISLAND GAINED
+`scf::Op::For` FOR EXACTLY THAT REASON (its input was inexpressible: `scf.for`'s bounds are three SSA
+VALUES where `affine.for`'s are maps, which is the whole reason one overload needs a helper and the
+other does not), wired through `operands`/`block_args`/`regions` and the printer. ⭐ AND THE NEW
+VARIANT MADE ENTRY 046's `Pattern::ForOpLowering` REACHABLE: `std_scf_to_sentient.rs`'s `pattern_for`
+was total over an `scf` that had no `scf.for` in it, so it now answers `ForOpLowering` for the op the
+pattern is registered under, and `walk_preorder` descends its region like every other. ⛔ AND 110 CARRIES
+TWO REFERENCE DEFECTS, ONE REPRODUCED AND ONE NOT: the truncating `(ub - lb) / step` under-counts when
+the step does not divide the span, and is reproduced because the factor is what the utility is asked
+for; the unguarded zero or negative trip count reaches a `uint64_t` factor behind
+`assert(unrollFactor > 0)`, and is refused instead (`TripCount` cannot hold one, and
+`Unroll::EmptyOrReversedRange` keeps the divergence visible). ⭐ 110 ALSO REFUSES EVERY ORDINARY
+`scf.for`: `arith::ConstantIntOp::classof` wants a SIGNLESS INTEGER, so `index`-typed bounds are not
+constants to it — which the island already splits as `ConstantInt` vs `Constant`, and which is
+consistent with the vendor's only test for this pass being affine throughout
+(`dcc/test/Transform/LoopUnrolForShuffleOp/ldcvti_pattern.mlir`). ⭐⭐ 111 AND 112 ARE THE SAME
+FUNCTION OVER TWO REGISTERS, AND THE REGISTERS DIVERGE BY ARCH: `EAR` is 21 bits everywhere
+(`sysdef.cpp:313`, `:336`) but `EBR` is 30 on RCUDD1A and **32** from SEN1P5 (`:321-332`, `:344-355`),
+so the immutable range is 2^40 on DD2 and 2^42 on SEN1P5 while the mutable range is 2^31 on both.
+`Arch` gained `L3_EAR_BITS`/`L3_EBR_BITS` as `Bounded<53>` — the bound is the reference's own `int64_t`
+return type, so `2^bits * bytesPerStick * 8` cannot overflow and needs no check. ⛔ THE `DT_CHECK(
+is_any_of(comp, L3LU, L3SU))` BECAME `L3Half`, and the finding that justifies it is that the two halves
+declare IDENTICAL `EAR` and `EBR` rows: the component's only function in these two queries is the
+abort, so the type is the whole of it. ⛔ AND `cl::init(-1)` IS AN `Option`, not a negative size —
+`MaxMutableSize < 0` is a sentinel test on the same variable that carries the value.
 
 ⭐ 097'S CITATION IS A CALL SITE, NOT A FUNCTION. `CFGSDataflowConditionalTree.cpp:456` is inside
 `mergeConditionalBranchesInSubtree`; the function itself is `dataflow::utils::getNewDbgNameFromList`
@@ -576,22 +628,22 @@ REGIONS; both callers are region-free chain ops (`Agen.cpp:114-134`).
 - [x] **AUDIT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, line by line against the C++
 - [x] **PORT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, 2 lines
 - [x] **AUDIT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, line by line against the C++
-- [ ] **PORT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, 2 lines
-- [ ] **AUDIT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, line by line against the C++
-- [ ] **PORT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, 0 lines
-- [ ] **AUDIT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, line by line against the C++
-- [ ] **PORT 107/384** `getRoot` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:81`, 2 lines
-- [ ] **AUDIT 107/384** `getRoot` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:81`, line by line against the C++
-- [ ] **PORT 108/384** `partitionUnits` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:168`, 17 lines
-- [ ] **AUDIT 108/384** `partitionUnits` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:168`, line by line against the C++
-- [ ] **PORT 109/384** `performFullUnroll` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:141`, 7 lines
-- [ ] **AUDIT 109/384** `performFullUnroll` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:141`, line by line against the C++
-- [ ] **PORT 110/384** `getConstantTripCount` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:167`, 14 lines
-- [ ] **AUDIT 110/384** `getConstantTripCount` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:167`, line by line against the C++
-- [ ] **PORT 111/384** `getMaxMutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673`, 8 lines
-- [ ] **AUDIT 111/384** `getMaxMutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673`, line by line against the C++
-- [ ] **PORT 112/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683`, 8 lines
-- [ ] **AUDIT 112/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683`, line by line against the C++
+- [x] **PORT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, 2 lines
+- [x] **AUDIT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, line by line against the C++
+- [x] **PORT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, 0 lines
+- [x] **AUDIT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, line by line against the C++
+- [x] **PORT 107/384** `getRoot` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:81`, 2 lines
+- [x] **AUDIT 107/384** `getRoot` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:81`, line by line against the C++
+- [x] **PORT 108/384** `partitionUnits` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:168`, 17 lines
+- [x] **AUDIT 108/384** `partitionUnits` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:168`, line by line against the C++
+- [x] **PORT 109/384** `performFullUnroll` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:141`, 7 lines
+- [x] **AUDIT 109/384** `performFullUnroll` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:141`, line by line against the C++
+- [x] **PORT 110/384** `getConstantTripCount` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:167`, 14 lines
+- [x] **AUDIT 110/384** `getConstantTripCount` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:167`, line by line against the C++
+- [x] **PORT 111/384** `getMaxMutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673`, 8 lines
+- [x] **AUDIT 111/384** `getMaxMutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673`, line by line against the C++
+- [x] **PORT 112/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683`, 8 lines
+- [x] **AUDIT 112/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683`, line by line against the C++
 - [ ] **PORT 113/384** `isEligibleForSplitting` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:832`, 20 lines
 - [ ] **AUDIT 113/384** `isEligibleForSplitting` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:832`, line by line against the C++
 - [ ] **PORT 114/384** `sortDataBasedOnWeight` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:855`, 4 lines

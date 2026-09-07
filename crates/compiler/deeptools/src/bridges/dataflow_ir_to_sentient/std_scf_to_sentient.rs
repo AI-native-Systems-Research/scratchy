@@ -276,6 +276,7 @@ pub const fn legality(op: &DfirOp) -> Legality {
 #[must_use]
 pub const fn pattern_for(op: &scf::Op) -> Option<Pattern> {
     match op {
+        scf::Op::For { .. } => Some(Pattern::ForOpLowering),
         scf::Op::If { .. } => Some(Pattern::IfOpLowering),
         scf::Op::Yield { .. } => Some(Pattern::YieldOpLowering),
         // ⛔ NO PATTERN. `scf.parallel` is illegal and unmatched; see this function's own note.
@@ -294,7 +295,7 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
         visit(op);
         match op {
             DfirOp::Affine(affine::Op::For { body, .. })
-            | DfirOp::Scf(scf::Op::Parallel { body, .. })
+            | DfirOp::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. })
             | DfirOp::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => {
                 walk_preorder(body, visit);
             }
