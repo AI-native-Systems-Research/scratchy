@@ -572,6 +572,7 @@ impl<'a> AccessDetailsBase<'a> {
             // `AffineMap transfer_order_;` (`hpp:205`).
             transfer_order: AffineMap {
                 dims: 0,
+                syms: 0,
                 results: Vec::new(),
             },
         }
@@ -2097,6 +2098,7 @@ mod unit_tests {
         // `affine_map<(d0, d1) -> (d0 * 128 + d1)>` — a row-major 2-D view, 128 elements to a row.
         let layout = AffineMap {
             dims: 2,
+            syms: 0,
             results: vec![AffineExpr::dim(0).times(128).plus(AffineExpr::dim(1))],
         };
         ad.set_mem_view_start_addr(Val(21));

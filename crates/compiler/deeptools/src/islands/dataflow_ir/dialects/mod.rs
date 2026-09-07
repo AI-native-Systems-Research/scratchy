@@ -123,13 +123,23 @@ pub fn operands(op: &Op) -> Vec<Val> {
             // SSA values it reads, which is exactly why the trip count has to be reconstructed from
             // their defining constants (`LoopUnrollForShuffleOp.cpp:168-170`). The `iv` is the
             // region's argument, not an operand, same as `scf.parallel`'s.
+            //
+            // ⭐⭐ AND IT IS THE REASON `TransformLoopToLegalizeForSentientLowering` EXISTS:
+            // `scf.for %i = %c0 to %10 step %c1` reads `%10`, and when `%10` is an `arith.select` the
+            // loop's trip count is not affine. A census that skipped them would report the select as
+            // unused and let a rewrite erase the value the loop counts to.
             scf::Op::For {
                 iv: _,
                 lo,
                 hi,
                 step,
+                carried,
                 body: _,
-            } => reads.extend([*lo, *hi, *step]),
+                dbg_name: _,
+            } => {
+                reads.extend([*lo, *hi, *step]);
+                reads.extend(carried.iter().map(|carried| carried.init));
+            }
             scf::Op::If { cond, .. } => reads.push(*cond),
             scf::Op::Yield { operands } => reads.extend(operands.iter().copied()),
         },
@@ -142,6 +152,7 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 hi,
                 carried,
                 body: _,
+                dbg_name: _,
             } => {
                 for bound in [lo, hi] {
                     if let affine::Bound::Val(val) = bound {
@@ -274,10 +285,19 @@ pub fn results(op: &Op) -> Vec<Val> {
             | arith::Op::DenseConstant { result, .. } => vec![*result],
             arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => vec![bin.result],
         },
-        // ⛔ NONE OF THE FOUR BINDS A RESULT IN THIS ISLAND. `scf.if`'s and `scf.parallel`'s
-        // results would be the values their yields carry, `scf.for`'s would be its `iter_args`, and
-        // nothing this crate emits reads one — see [`scf::Op::For`].
-        Op::Scf(_) => Vec::new(),
+        Op::Scf(op) => match op {
+            // ⭐ A CARRYING `scf.for` BINDS RESULTS, one per `iter_args` entry — the reference's own
+            // input to `TransformLoopToLegalizeForSentientLowering` is
+            // `%11 = scf.for %arg4 = %c0 to %10 step %c1 iter_args(%arg5 = %arg3) -> (index)`
+            // (`scf_loop_with_result.mlir:32`), and `transformSCFToAffineLoop` branches on
+            // `scf_for.getNumResults() > 0` to decide whether to write a yield at all (`:129`). A
+            // census that answered "none" would make that branch unreachable.
+            scf::Op::For { carried, .. } => carried.iter().map(|carried| carried.result).collect(),
+            // ⛔ AND NEITHER OF THE OTHER TWO BINDS ONE IN THIS ISLAND. `scf.if`'s and
+            // `scf.parallel`'s results would be the values their yields carry, and nothing this
+            // crate emits reads one.
+            scf::Op::If { .. } | scf::Op::Yield { .. } | scf::Op::Parallel { .. } => Vec::new(),
+        },
         Op::Affine(op) => match op {
             // ⭐ A CARRYING LOOP DOES BIND RESULTS — one per `iter_args` entry, which is how the
             // address a nest computes leaves it (`AgenToSentient.hpp:502-520`). A plain counted
@@ -377,8 +397,13 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 lo,
                 hi,
                 step,
+                carried,
                 body: _,
-            } => places.extend([lo, hi, step]),
+                dbg_name: _,
+            } => {
+                places.extend([lo, hi, step]);
+                places.extend(carried.iter_mut().map(|carried| &mut carried.init));
+            }
             scf::Op::If { cond, .. } => places.push(cond),
             scf::Op::Yield { operands } => places.extend(operands.iter_mut()),
         },
@@ -389,6 +414,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 hi,
                 carried,
                 body: _,
+                dbg_name: _,
             } => {
                 for bound in [lo, hi] {
                     if let affine::Bound::Val(val) = bound {
@@ -596,11 +622,14 @@ pub fn block_args(op: &Op) -> Vec<Val> {
             args
         }
         Op::Scf(scf::Op::Parallel { ivs, .. }) => ivs.clone(),
-        // ⭐ AND `scf.for` BINDS ITS INDUCTION VARIABLE THE SAME WAY. `runOnOperation` reaches this
-        // loop by asking whether a shuffle's variable IS this argument
-        // (`LoopUnrollForShuffleOp.cpp:97`), so a walk that did not report it would never find a
-        // candidate.
-        Op::Scf(scf::Op::For { iv, .. }) => vec![*iv],
+        // ⭐ SAME ORDER AS `affine.for`: the induction variable first, then one argument per carried
+        // value. `transformSCFToAffineLoop` maps them positionally
+        // (`TransformLoopToLegalizeForSentientLowering.cpp:115-119`), so the two orders must agree.
+        Op::Scf(scf::Op::For { iv, carried, .. }) => {
+            let mut args = vec![*iv];
+            args.extend(carried.iter().map(|carried| carried.arg));
+            args
+        }
         // ⭐ THE COMPOSITE TRANSFER'S `load_iv` IS ITS REGION'S ARGUMENT — the loaded vector the
         // body reads. `getLoadInductionVar()` is what `getLoadConsumer` roots a composite load's
         // consumer chain at (`Helper.cpp:1250`).
@@ -648,7 +677,8 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
 #[must_use]
 pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
     match op {
-        Op::Affine(affine::Op::For { body, .. }) | Op::Scf(scf::Op::Parallel { body, .. }) => {
+        Op::Affine(affine::Op::For { body, .. })
+        | Op::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. }) => {
             vec![body]
         }
         Op::Scf(scf::Op::If {
@@ -664,6 +694,311 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         | Op::VectorChain(_) => Vec::new(),
     }
 }
+
+// ───────────────────────── THE SAME POSITIONS, MUTABLY ──────────────────────────
+
+/// EVERY `Val` POSITION OF ONE OP, MUTABLY, GROUPED BY WHAT THE POSITION IS.
+///
+/// # ⭐⭐ THIS IS WHAT `IRMapping` + `OpBuilder::clone` NEEDS AND NOTHING ELSE
+///
+/// `transformSCFToAffineLoop` clones a loop body under a value mapping
+/// (`TransformLoopToLegalizeForSentientLowering.cpp:120-127`), and a clone has to do three different
+/// things to three different kinds of value: REWRITE what the op reads, MINT what it defines, and
+/// MINT what its regions bind. A single `Vec<&mut Val>` could not tell them apart, so the groups are
+/// the type.
+///
+/// ⛔ AUDIT IT AGAINST [`operands`], [`block_args`], [`results`] AND [`regions`] — arm for arm, in
+/// the same order. It names exactly the positions those four read; a position this misses is a value
+/// a clone leaves pointing into the ORIGINAL op, which is an SSA graph with two definitions of one
+/// name and no diagnostic saying so.
+pub struct OpPartsMut<'a> {
+    /// What the op READS — see [`operands`].
+    pub operands: Vec<&'a mut Val>,
+    /// What the op's REGIONS BIND — see [`block_args`].
+    pub block_args: Vec<&'a mut Val>,
+    /// What the op DEFINES — see [`results`].
+    pub results: Vec<&'a mut Val>,
+    /// The op's REGIONS — see [`regions`].
+    pub regions: Vec<&'a mut Vec<Op>>,
+}
+
+/// EVERY `Val` POSITION OF ONE OP, MUTABLY. See [`OpPartsMut`].
+#[must_use]
+pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
+    let mut operands: Vec<&mut Val> = Vec::new();
+    let mut block_args: Vec<&mut Val> = Vec::new();
+    let mut results: Vec<&mut Val> = Vec::new();
+    let mut regions: Vec<&mut Vec<Op>> = Vec::new();
+    match op {
+        Op::Arith(op) => match op {
+            arith::Op::Constant { result, .. }
+            | arith::Op::ConstantInt { result, .. }
+            | arith::Op::DenseConstant { result, .. } => results.push(result),
+            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+                operands.extend([&mut bin.lhs, &mut bin.rhs]);
+                results.push(&mut bin.result);
+            }
+            arith::Op::Compare {
+                result, lhs, rhs, ..
+            } => {
+                operands.extend([lhs, rhs]);
+                results.push(result);
+            }
+            arith::Op::Logic {
+                result,
+                operands: reads,
+                ..
+            } => {
+                operands.extend(reads.iter_mut());
+                results.push(result);
+            }
+        },
+        Op::Scf(op) => match op {
+            scf::Op::Parallel { ivs, body } => {
+                block_args.extend(ivs.iter_mut());
+                regions.push(body);
+            }
+            scf::Op::For {
+                iv,
+                lo,
+                hi,
+                step,
+                carried,
+                body,
+                // ⛔ NOT A VALUE. `dbgName` is a string attribute the pass COPIES verbatim
+                // (`:110-111`), so a clone leaves it exactly as it found it.
+                dbg_name: _,
+            } => {
+                operands.extend([lo, hi, step]);
+                block_args.push(iv);
+                for carried in carried.iter_mut() {
+                    operands.push(&mut carried.init);
+                    block_args.push(&mut carried.arg);
+                    results.push(&mut carried.result);
+                }
+                regions.push(body);
+            }
+            scf::Op::If {
+                cond,
+                body,
+                else_body,
+            } => {
+                operands.push(cond);
+                regions.extend([body, else_body]);
+            }
+            scf::Op::Yield { operands: reads } => operands.extend(reads.iter_mut()),
+        },
+        Op::Affine(op) => match op {
+            affine::Op::For {
+                iv,
+                lo,
+                hi,
+                carried,
+                body,
+                dbg_name: _,
+            } => {
+                for bound in [lo, hi] {
+                    if let affine::Bound::Val(val) = bound {
+                        operands.push(val);
+                    }
+                }
+                block_args.push(iv);
+                for carried in carried.iter_mut() {
+                    operands.push(&mut carried.init);
+                    block_args.push(&mut carried.arg);
+                    results.push(&mut carried.result);
+                }
+                regions.push(body);
+            }
+            affine::Op::Apply { result, args, .. } => {
+                operands.extend(args.iter_mut());
+                results.push(result);
+            }
+            affine::Op::Yield { operands: reads } => operands.extend(reads.iter_mut()),
+            affine::Op::VectorLoad {
+                result,
+                view,
+                indices,
+                ..
+            } => {
+                operands.push(view);
+                index_operands_mut(indices, &mut operands);
+                results.push(result);
+            }
+            affine::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                operands.extend([value, view]);
+                index_operands_mut(indices, &mut operands);
+            }
+        },
+        Op::Dataflow(op) => match op {
+            dataflow::Op::GetUnit { result, .. } => results.push(result),
+            dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetLocalUnit { result, of, .. } => {
+                operands.push(of);
+                results.push(result);
+            }
+            dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                ..
+            } => {
+                operands.extend([from, start]);
+                results.push(result);
+            }
+            // ⭐ THE PAGE START ADDRESSES ARE OPERANDS, the extents beside them attributes — see
+            // [`operands`].
+            dataflow::Op::GetPagedLogicalMemoryView(view) => {
+                operands.extend([&mut view.unit, &mut view.start_addr]);
+                operands.extend(view.pages.iter_mut().map(|page| &mut page.start_addr));
+                results.push(&mut view.result);
+            }
+            dataflow::Op::ProgramUnit { units, body, .. } => {
+                operands.extend(units.iter_mut());
+                regions.push(body);
+            }
+            dataflow::Op::Send { to, data, .. } => operands.extend([to.val_mut(), data]),
+            dataflow::Op::Receive { result, from, .. } => {
+                operands.push(from.val_mut());
+                results.push(result);
+            }
+            dataflow::Op::SyncSend { to, .. } => operands.push(to),
+            dataflow::Op::SyncRecv { from, .. } => operands.push(from),
+            dataflow::Op::ImplicitSync {
+                view, dst, size, ..
+            } => operands.extend([view, dst, size]),
+        },
+        Op::Agen(op) => match op {
+            agen::Op::Yield => {}
+            agen::Op::VectorLoad {
+                result,
+                view,
+                indices,
+                ..
+            } => {
+                operands.push(view);
+                index_operands_mut(indices, &mut operands);
+                results.push(result);
+            }
+            agen::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                operands.extend([value, view]);
+                index_operands_mut(indices, &mut operands);
+            }
+            agen::Op::CompositeLoadAndStore(transfer) => {
+                let transfer = transfer.as_mut();
+                operands.push(&mut transfer.src);
+                index_operands_mut(&mut transfer.src_indices, &mut operands);
+                operands.push(&mut transfer.dst);
+                index_operands_mut(&mut transfer.dst_indices, &mut operands);
+                block_args.push(&mut transfer.load_iv);
+                regions.push(&mut transfer.body);
+            }
+        },
+        Op::VectorChain(op) => match op {
+            vectorchain::Op::ConstantBitstream { result, .. }
+            | vectorchain::Op::CreateAffineMask { result, .. } => results.push(result),
+            vectorchain::Op::Estimate { result, input, .. }
+            | vectorchain::Op::FastExp { result, input, .. }
+            | vectorchain::Op::Floor { result, input, .. }
+            | vectorchain::Op::ScanWithGap { result, input, .. }
+            | vectorchain::Op::Select { result, input, .. }
+            | vectorchain::Op::Shuffle { result, input, .. }
+            | vectorchain::Op::Cast { result, input, .. } => {
+                operands.push(input);
+                results.push(result);
+            }
+            vectorchain::Op::Rotate {
+                result,
+                input,
+                position,
+                ..
+            } => {
+                operands.extend([input, position]);
+                results.push(result);
+            }
+            vectorchain::Op::Multiply { result, a, b, .. } => {
+                operands.extend([a, b]);
+                results.push(result);
+            }
+            vectorchain::Op::MultiplyAccumulate {
+                result, a, b, acc, ..
+            } => {
+                operands.extend([a, b, acc]);
+                results.push(result);
+            }
+            vectorchain::Op::ElementWiseCompare {
+                result,
+                op1,
+                op2,
+                mask,
+                ..
+            } => {
+                operands.extend([op1, op2]);
+                if let Some(mask) = mask {
+                    operands.push(mask.val_mut());
+                }
+                results.push(result);
+            }
+            vectorchain::Op::ElementWiseSelection {
+                result,
+                cond,
+                lhs,
+                rhs,
+                mask,
+                ..
+            } => {
+                operands.extend([cond.val_mut(), lhs, rhs]);
+                if let Some(mask) = mask {
+                    operands.push(mask.val_mut());
+                }
+                results.push(result);
+            }
+            vectorchain::Op::Binary {
+                result,
+                op1,
+                op2,
+                mask,
+                ..
+            }
+            | vectorchain::Op::Pack {
+                result,
+                op1,
+                op2,
+                mask,
+                ..
+            } => {
+                operands.extend([op1, op2]);
+                if let Some(mask) = mask {
+                    operands.push(mask.val_mut());
+                }
+                results.push(result);
+            }
+            vectorchain::Op::Merge {
+                result, op1, op2, ..
+            } => {
+                operands.extend([op1, op2]);
+                results.push(result);
+            }
+        },
+    }
+    OpPartsMut {
+        operands,
+        block_args,
+        results,
+        regions,
+    }
+}
+
 
 /// EVERY **USE** OF ONE VALUE IN `scope`, INNERMOST OPS INCLUDED — one entry per use.
 ///
@@ -713,6 +1048,16 @@ pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
 ///
 /// ⛔ A STRIDED SUM READS EVERY VARIABLE IN IT. `%arg9 + %arg8 * 8` is two uses, not one — see
 /// [`Index::Strided`].
+fn index_operands(indices: &[Index], into: &mut Vec<Val>) {
+    for index in indices {
+        match index {
+            Index::Val(val) => into.push(*val),
+            Index::Const(_) => {}
+            Index::Strided(terms, _) => into.extend(terms.iter().map(|(val, _)| *val)),
+        }
+    }
+}
+
 /// THE SSA VALUES ONE INDEX LIST READS, AS PLACES — the mirror of [`index_operands`].
 fn index_operands_mut<'o>(indices: &'o mut [Index], into: &mut Vec<&'o mut Val>) {
     for index in indices {
@@ -720,16 +1065,6 @@ fn index_operands_mut<'o>(indices: &'o mut [Index], into: &mut Vec<&'o mut Val>)
             Index::Val(val) => into.push(val),
             Index::Const(_) => {}
             Index::Strided(terms, _) => into.extend(terms.iter_mut().map(|(val, _)| val)),
-        }
-    }
-}
-
-fn index_operands(indices: &[Index], into: &mut Vec<Val>) {
-    for index in indices {
-        match index {
-            Index::Val(val) => into.push(*val),
-            Index::Const(_) => {}
-            Index::Strided(terms, _) => into.extend(terms.iter().map(|(val, _)| *val)),
         }
     }
 }

@@ -383,7 +383,9 @@ mod unit_tests {
             lo: Val(1),
             hi: Val(2),
             step: Val(3),
+            carried: Vec::new(),
             body: Vec::new(),
+            dbg_name: None,
         })
     }
 
@@ -396,6 +398,7 @@ mod unit_tests {
             hi: affine::Bound::Const(2),
             carried: Vec::new(),
             body: Vec::new(),
+            dbg_name: None,
         })
     }
 
@@ -525,6 +528,7 @@ mod unit_tests {
             hi: affine::Bound::Const(4),
             carried: Vec::new(),
             body: vec![an_i32(1, 0), an_i32(2, 4), an_i32(3, 2), an_scf_loop()],
+            dbg_name: None,
         })];
         assert_eq!(
             perform_full_unroll(Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) }, &scope),
@@ -631,11 +635,13 @@ mod unit_tests {
             lo: Val(1),
             hi: Val(2),
             step: Val(3),
+            carried: Vec::new(),
             body: vec![an_i32(4, 1)],
+            dbg_name: None,
         });
         assert_eq!(operands(&loop_op), vec![Val(1), Val(2), Val(3)]);
         assert_eq!(block_args(&loop_op), vec![Val(0)], "the iv is not an operand");
-        assert_eq!(results(&loop_op), Vec::new(), "no iter_args in this island");
+        assert_eq!(results(&loop_op), Vec::new(), "this loop carries nothing");
         assert_eq!(regions(&loop_op).len(), 1);
         assert_eq!(regions(&loop_op)[0].len(), 1);
     }

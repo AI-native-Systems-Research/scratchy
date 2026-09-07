@@ -887,6 +887,7 @@ mod tests {
         // `#map = affine_map<(d0, d1, d2) -> (d2 * 64 + d1 * 64 + d0)>`.
         let layout = AffineMap {
             dims: 3,
+            syms: 0,
             results: vec![
                 AffineExpr::dim(2)
                     .times(64)

@@ -1018,6 +1018,7 @@ mod transfer_tests {
                 iv: Val(31),
                 lo: Bound::Const(0),
                 hi: Bound::Const(32),
+                dbg_name: None,
                 carried,
                 body,
             }),

@@ -584,6 +584,7 @@ mod unit_tests {
             hi: affine::Bound::Const(8),
             carried: Vec::new(),
             body,
+            dbg_name: None,
         })
     }
 

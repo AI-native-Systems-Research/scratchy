@@ -720,6 +720,7 @@ fn nest<
             hi: Bound::Const(steps),
             carried: Vec::new(),
             body: step_body,
+            dbg_name: None,
         })]
     } else {
         inner
@@ -738,6 +739,7 @@ fn nest<
             hi: Bound::Const(tiles),
             carried: Vec::new(),
             body: inner,
+            dbg_name: None,
         })]
     };
 
@@ -752,6 +754,7 @@ fn nest<
             hi: Bound::Const(i64::from(counts.rows)),
             carried: Vec::new(),
             body: tiled,
+            dbg_name: None,
         })]
     };
 

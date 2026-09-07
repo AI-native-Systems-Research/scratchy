@@ -45,6 +45,118 @@ impl Values {
     }
 }
 
+/// ONE VALUE STANDING FOR ANOTHER — MLIR's `IRMapping`, restricted to values.
+///
+/// ⭐ WHAT A CLONE READS ITS OPERANDS THROUGH. `transformSCFToAffineLoop` builds one of these before
+/// it copies a loop body, mapping the `scf.for`'s induction variable and region arguments to the
+/// `affine.for`'s (`TransformLoopToLegalizeForSentientLowering.cpp:113-119`), and then every operand
+/// of every cloned op is looked up in it.
+///
+/// ⛔ A MISS IS NOT A REFUSAL — it is a value defined OUTSIDE what is being cloned, and it comes
+/// through unchanged. That is `IRMapping::lookupOrDefault`, and it is why a body reading a constant
+/// hoisted above the loop still reads that same constant after the clone.
+#[derive(Debug, Default, Clone)]
+pub struct ValueMapping {
+    pairs: Vec<(Val, Val)>,
+}
+
+impl ValueMapping {
+    /// An empty mapping: everything stands for itself.
+    #[must_use]
+    pub fn new() -> ValueMapping {
+        ValueMapping { pairs: Vec::new() }
+    }
+
+    /// `from` now stands for `to`.
+    ///
+    /// ⭐ A LATER ENTRY SHADOWS AN EARLIER ONE, as assigning to a `DenseMap` slot does. See
+    /// [`ValueMapping::lookup_or_default`].
+    pub fn map(&mut self, from: Val, to: Val) {
+        self.pairs.push((from, to));
+    }
+
+    /// What `val` stands for — ITSELF where nothing was mapped.
+    ///
+    /// ⛔ THE SEARCH IS FROM THE BACK, so the newest entry for a value wins. Cloning one body twice
+    /// maps the same source value twice, and the second clone must not read the first clone's names.
+    #[must_use]
+    pub fn lookup_or_default(&self, val: Val) -> Val {
+        self.pairs
+            .iter()
+            .rev()
+            .find(|(from, _)| *from == val)
+            .map_or(val, |(_, to)| *to)
+    }
+}
+
+impl Values {
+    /// CLONES `ops`, MINTING A FRESH VALUE FOR EVERYTHING THEY DEFINE — `OpBuilder::clone`.
+    ///
+    /// # ⭐⭐ THE ONE MECHANISM `transformSCFToAffineLoop` IS BUILT ON
+    ///
+    /// `builder.clone(op, bv_map)` over a loop body's non-terminator ops
+    /// (`TransformLoopToLegalizeForSentientLowering.cpp:120-127`) does three things at once, and all
+    /// three are here:
+    ///
+    /// 1. every OPERAND is read through `mapping` — so the copy reads the new loop's induction
+    ///    variable where the original read the old one, and reads values defined outside the body
+    ///    unchanged;
+    /// 2. every value the op DEFINES — its results and whatever its regions bind — gets a FRESH
+    ///    name from this counter, recorded in `mapping` so later ops of the same body pick it up;
+    /// 3. regions are cloned the same way, recursively, so a nested loop inside the body comes out
+    ///    with its own induction variable rather than sharing the original's.
+    ///
+    /// ⛔⛔ FRESH NAMES ARE THE WHOLE POINT, NOT A DETAIL. The caller clones ONE `scf.for` body
+    /// TWICE — once into each arm of the `scf.if` that selects between the two static trip counts
+    /// (`scf_loop_with_result.mlir:52-77`) — and two copies binding the same SSA names is not a
+    /// program. MLIR would say *"redefinition of value"*; a typed island has nothing to say at all,
+    /// it just prints a module whose second definition silently wins.
+    ///
+    /// ⛔ AND THE ORDER WITHIN ONE OP IS MLIR'S: OPERANDS, RESULTS, BLOCK ARGUMENTS, REGIONS. Two
+    /// separate facts hold it in place:
+    ///
+    /// * operands come FIRST because an op cannot read what it defines — registering its results
+    ///   before rewriting its operands would let a self-referential name through;
+    /// * results come before the region's arguments, and those before the region's body, because
+    ///   that is the order MLIR's own printer NUMBERS values in, and the numbering is the output.
+    ///   `%23 = affine.for %24 = 0 to 16 iter_args(%25 = %20)` followed by `%26 = affine.for %27`
+    ///   (`scf_loop_with_result.mlir:56-57`) is result, induction variable, carried argument, then
+    ///   the nested loop — so a clone that minted its body's names before its own result would emit
+    ///   a correct program that no vendored expectation matches.
+    ///
+    /// ⭐ THE TERMINATOR IS THE CALLER'S BUSINESS. `without_terminator()` is at the call site
+    /// (`:126`) because the yield an `affine.for` needs is an `affine.yield`, built from the
+    /// `scf.yield`'s operands looked up through the same mapping (`:129-136`) — not a clone of it.
+    pub fn clone_ops(&mut self, ops: &[Op], mapping: &mut ValueMapping) -> Vec<Op> {
+        let mut cloned = Vec::with_capacity(ops.len());
+        for op in ops {
+            let mut copy = op.clone();
+            let parts = dialects::parts_mut(&mut copy);
+            for operand in parts.operands {
+                *operand = mapping.lookup_or_default(*operand);
+            }
+            for result in parts.results {
+                let fresh = self.mint();
+                mapping.map(*result, fresh);
+                *result = fresh;
+            }
+            for arg in parts.block_args {
+                let fresh = self.mint();
+                mapping.map(*arg, fresh);
+                *arg = fresh;
+            }
+            for region in parts.regions {
+                // ⭐ TAKEN, NOT COPIED AGAIN. `op.clone()` above already deep-copied the body; this
+                // renumbers that copy in place rather than making a third one.
+                let source = core::mem::take(region);
+                *region = self.clone_ops(&source, mapping);
+            }
+            cloned.push(copy);
+        }
+        cloned
+    }
+}
+
 /// ONE `dataflow.program_unit` — the units it runs on, and what they run.
 ///
 /// ⛔⛔ ONE NODE IS THREE OF THESE, because the datapath has three ends. A compute has NO READ PORT

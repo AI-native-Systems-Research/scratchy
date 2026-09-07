@@ -106,7 +106,7 @@ use crate::islands::dataflow_ir::dialects::dataflow::{Page, PageRect, PagedMemVi
 use crate::islands::dataflow_ir::dialects::{
     self, Index, Op as DfirOp, Val, agen, arith, dataflow, results, scf, uses,
 };
-use crate::islands::dataflow_ir::ty::{IntegerSet, MemRef, ScalarTy, Vector};
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, IntegerSet, MemRef, ScalarTy, Vector};
 use crate::units::DfirUnit;
 use core::num::NonZeroU32;
 use std::collections::BTreeSet;
@@ -1638,6 +1638,233 @@ impl<'p> TpmvVector<'p> {
     }
 }
 
+
+/// WHETHER EVERY VALUE ASKED FOR WAS THERE — the `DT_CHECK_MSG` of [`remove_values_from_indices`].
+///
+/// ⛔ NOT AN ERROR TYPE. The reference aborts the compiler with *"could not find value to delete in
+/// indices vector"*; this names the value it aborted on, and the caller
+/// (`createConditionsForHyperRectSubscripts`) can only ever produce [`IndexRemoval::Removed`] because
+/// it builds its delete list out of `indices[dim]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexRemoval {
+    /// Every requested value was found and erased.
+    Removed,
+    /// This value was not among the indices — `std::find` returned `end()`.
+    ///
+    /// ⚠️ THE REQUESTS BEFORE IT ARE ALREADY GONE, which is the state the reference aborts in too.
+    NotAnIndex(Val),
+}
+
+/// Replaces: e118_removeValuesFromIndices
+///
+/// **118/384** `TPMVBase::removeValuesFromIndices` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:36` (7L).
+///
+/// ```cpp
+/// void TPMVBase::removeValuesFromIndices(
+///     SmallVectorImpl<Value> &indices,
+///     SmallVectorImpl<Value> &indices_to_delete) {
+///   for (auto &index : indices_to_delete) {
+///     auto it = std::find(indices.begin(), indices.end(), index);
+///     DT_CHECK_MSG(it != indices.end(),
+///                  "could not find value to delete in indices vector");
+///     indices.erase(it);
+///   }
+/// }
+/// ```
+///
+/// # ⭐⭐ WHY AN INDEX GETS DELETED AT ALL
+///
+/// `createConditionsForHyperRectSubscripts` (`:288-339`) walks the subscript map's dimensions and asks
+/// the page-selection constraints for each one's constant bounds. Where `lb == ub` that dimension
+/// takes exactly one value inside the page being selected, so the pass emits ONE equality condition
+/// for it ([`create_equality_condition`]) and replaces the dimension in the subscript map with that
+/// constant — *"If LB == UB, the loop iterator can be replaced by a constant in the subscripts."*
+/// (`:315-316`). The loop iterator is then no longer an operand of the access, and this is what takes
+/// it out of the operand list so the shortened list still matches the shortened map.
+///
+/// # ⛔ THE FIRST OCCURRENCE, NOT THE POSITION — AND HERE THEY COINCIDE
+///
+/// `std::find` + `erase(it)` removes the FIRST element equal to the value, not `indices[dim]`. The
+/// two agree because the indices are the enclosing loops' induction variables, one distinct block
+/// argument per dimension. The port keeps the reference's rule rather than the coincidence: a
+/// duplicated index would make positional removal drop a different entry.
+///
+/// # ⛔ AND THE ORDER OF THE SURVIVORS IS PRESERVED
+///
+/// `Vec::remove`, like `SmallVector::erase`, shifts the tail down. The subscript map is rebuilt against
+/// this list by position (`subscripts_map.replaceDimsAndSymbols({new_dim_exprs}, {}, num_dim_vars, 0)`
+/// at `:336`), so a `swap_remove` would silently permute the access.
+pub fn remove_values_from_indices(
+    indices: &mut Vec<Val>,
+    indices_to_delete: &[Val],
+) -> IndexRemoval {
+    for index in indices_to_delete {
+        // `std::find(indices.begin(), indices.end(), index)`.
+        let Some(at) = indices.iter().position(|held| held == index) else {
+            // `DT_CHECK_MSG(it != indices.end(), ..)`.
+            return IndexRemoval::NotAnIndex(*index);
+        };
+        indices.remove(at);
+    }
+    IndexRemoval::Removed
+}
+
+/// Replaces: e119_replaceDimsInMapWithSyms
+///
+/// **119/384** `TPMVBase::replaceDimsInMapWithSyms` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:47` (7L).
+///
+/// ```cpp
+/// AffineMap TPMVBase::replaceDimsInMapWithSyms(AffineMap &map) {
+///   SmallVector<AffineExpr, 16> sym_exprs;
+///   int num_args = 0;
+///   for (int dim = 0; dim < map.getNumDims(); ++dim)
+///     sym_exprs.emplace_back(getAffineSymbolExpr(num_args++, context_));
+///
+///   return map.replaceDimsAndSymbols(sym_exprs, {}, 0, num_args);
+/// }
+/// ```
+///
+/// # ⭐⭐ `d0 -> s0`, POSITION FOR POSITION, AND THAT IS THE WHOLE FUNCTION
+///
+/// `num_args` counts up in lockstep with `dim`, so dimension `i` becomes symbol `i`. The result map
+/// has NO dimensions and as many symbols as the input had dimensions — `(d0, d1) -> (d0 * 8 + d1)`
+/// becomes `()[s0, s1] -> (s0 * 8 + s1)`.
+///
+/// # ⭐⭐ WHY A CONSTRAINT SYSTEM NEEDS THE SYMBOL FORM
+///
+/// Both callers say so in a comment: *"Create a copy of the subscripts_map that represents loop
+/// iterators as symbols. This is used to form the constraints to determine which pages are valid for
+/// mem_ops_."* (`:603-605`, `:1002-1004`). In MLIR's presburger machinery a DIMENSION is a variable
+/// the system solves for and a SYMBOL is a parameter it treats as fixed-but-unknown, so a subscript
+/// whose loop iterators are dimensions asks "which iterations hit this page" while the same subscript
+/// with them as symbols asks "which pages can these iterators reach" — which is the question
+/// `analyzeAndConstructValidPages` puts to it.
+///
+/// # ⛔ THE SYMBOL FORM IS NEVER PRINTED, AND THE INPUT MAP IS NOT REPLACED
+///
+/// Both callers bind the result to a fresh `subscripts_map_sym` and leave the original alone; the
+/// access keeps its dimension form. So `syms` reaching
+/// [`crate::islands::dataflow_ir::print::affine_map`] is a constraint-building map that escaped.
+///
+/// # ⚠️ SYMBOLS IN THE INPUT WOULD BE DROPPED, AND THE REFERENCE DROPS THEM TOO
+///
+/// `replaceDimsAndSymbols(sym_exprs, {}, 0, num_args)` passes an EMPTY symbol replacement list, which
+/// MLIR reads as "no symbols to replace"; a map that had symbols would keep them, unrenumbered, and
+/// collide with the new ones. No subscript map in this pipeline has any — every one is built by
+/// `AffineMap::get(num_dims, 0, ..)` — so the case does not arise, and this port would carry an input
+/// symbol through unchanged exactly as the reference does.
+#[must_use]
+pub fn replace_dims_in_map_with_syms(map: &AffineMap) -> AffineMap {
+    AffineMap {
+        // `replaceDimsAndSymbols(.., .., /*numResultDims=*/0, /*numResultSyms=*/num_args)`.
+        dims: 0,
+        syms: map.dims,
+        results: map.results.iter().map(dims_as_syms).collect(),
+    }
+}
+
+/// ONE EXPRESSION WITH EVERY `dN` REWRITTEN AS `sN` — the substitution `replaceDimsAndSymbols`
+/// performs, which is structural and reaches every leaf.
+fn dims_as_syms(expr: &AffineExpr) -> AffineExpr {
+    match expr {
+        // `getAffineSymbolExpr(num_args++, ..)` at the position `dim` counted up to.
+        AffineExpr::Dim(dim) => AffineExpr::Sym(*dim),
+        // ⛔ A SYMBOL IS LEFT ALONE — the replacement list for symbols is empty. See the note on
+        // [`replace_dims_in_map_with_syms`].
+        AffineExpr::Sym(sym) => AffineExpr::Sym(*sym),
+        AffineExpr::Const(value) => AffineExpr::Const(*value),
+        AffineExpr::Add(lhs, rhs) => {
+            AffineExpr::Add(Box::new(dims_as_syms(lhs)), Box::new(dims_as_syms(rhs)))
+        }
+        AffineExpr::Mul(lhs, rhs) => {
+            AffineExpr::Mul(Box::new(dims_as_syms(lhs)), Box::new(dims_as_syms(rhs)))
+        }
+        AffineExpr::Mod(lhs, rhs) => {
+            AffineExpr::Mod(Box::new(dims_as_syms(lhs)), Box::new(dims_as_syms(rhs)))
+        }
+        AffineExpr::FloorDiv(lhs, rhs) => {
+            AffineExpr::FloorDiv(Box::new(dims_as_syms(lhs)), Box::new(dims_as_syms(rhs)))
+        }
+    }
+}
+
+/// Replaces: e120_createEqualityCondition
+///
+/// **120/384** `TPMVBase::createEqualityCondition` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:253` (7L).
+///
+/// ```cpp
+/// Operation *TPMVBase::createEqualityCondition(OpBuilder &builder, Value &lhs,
+///                                              int64_t rhs) {
+///   auto rhs_const =
+///       mlir::arith::ConstantIndexOp::create(builder, lhs.getLoc(), rhs);
+///   auto cond = mlir::arith::CmpIOp::create(
+///       builder, lhs.getLoc(), mlir::arith::CmpIPredicate::eq, lhs, rhs_const);
+///   return mlir::scf::IfOp::create(builder, lhs.getLoc(), cond.getResult(),
+///                                  false);
+/// }
+/// ```
+///
+/// # ⭐⭐ WHAT THE CONDITION GUARDS
+///
+/// A PAGED memory view is one HBM region described as a list of pages, and a transfer reading it
+/// cannot name a page with an affine subscript. The pass replaces the access with one copy per
+/// candidate page, each inside a nest of conditions that hold exactly when the loop iterators are in
+/// that page's range. Where a dimension's page-selection bounds collapse to a point (`lb == ub`) that
+/// range is a single value, so one `arith.cmpi eq` decides it — *"If LB == UB, we only need one
+/// equality condition."* (`:310`.) `createInequalityCondition` — entry 121, `:263`, not ported here — is
+/// the two-sided form for a dimension that spans a sub-range: an `sge` branch with an `sle` branch
+/// nested in its `then` region.
+///
+/// # ⛔ `withElseRegion = false`, AND NO RESULTS
+///
+/// The trailing `false` is `scf::IfOp::create`'s `withElseRegion`: the `then` region only, and the
+/// three-argument form takes no result types, so the branch yields nothing. An `else` arm here would
+/// be *"and if this dimension is not on this page"*, which is the NEXT page's copy, emitted by the
+/// next turn of the caller's loop — not a second arm of this one. `else_body: Vec::new()` is that,
+/// and [`scf::Op::If`]'s printer omits the `else` entirely.
+///
+/// # ⛔ `lhs.getLoc()` THREE TIMES IS PROVENANCE, NOT BEHAVIOUR
+///
+/// Every op is given the location of the index it tests, so a diagnostic points at the loop iterator
+/// rather than at the pass. This island carries no locations.
+///
+/// # ⚠️ THE BODY IS EMPTY WHEN IT COMES BACK
+///
+/// The reference returns an `scf.if` with an empty `then` block, which the caller then builds into
+/// ([`set_builder_to_insert_ref`], `:280-286`). Filling it is entry 122's and the caller's business —
+/// [`Condition::wrap`] is where the guarded statements go.
+///
+/// # ⭐⭐ ONE GUARD OF THE SAME [`Condition`] THE TWO-SIDED FORM RETURNS
+///
+/// A [`Condition`] is a list of [`BoundGuard`]s, outermost first, because
+/// [`create_inequality_condition`] leaves the caller's builder inside the nest it built. This form
+/// builds ONE guard rather than two, and the difference between the two functions is exactly that
+/// plus the predicate — a separate record would be two spellings of one nest, and
+/// `createConditionsForHyperRectSubscripts` stores whichever it got in the same `insert_refs` slot
+/// (`:310-315`).
+#[must_use]
+pub fn create_equality_condition(vals: &mut Values, lhs: Val, rhs: i64) -> Condition {
+    // `arith::ConstantIndexOp::create(builder, lhs.getLoc(), rhs)`.
+    let rhs_const = vals.mint();
+    // `arith::CmpIOp::create(builder, .., CmpIPredicate::eq, lhs, rhs_const)`, and the
+    // `scf::IfOp::create(builder, .., cond.getResult(), /*withElseRegion=*/false)` it branches on —
+    // emitted by [`Condition::wrap`].
+    let cond = vals.mint();
+    Condition {
+        guards: vec![BoundGuard {
+            lhs,
+            predicate: CmpIPredicate::Eq,
+            bound: rhs,
+            constant: rhs_const,
+            cond,
+        }],
+    }
+}
+
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1645,9 +1872,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::dialects::{Index, dataflow, vectorchain};
     use crate::islands::dataflow_ir::link::{Link, Lxlu as LxluUnit, Sfp as SfpUnit};
     use crate::islands::dataflow_ir::print;
-    use crate::islands::dataflow_ir::ty::{
-        AffineExpr, AffineMap, BoundType, ElemType, MemRef, Vector,
-    };
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, BoundType, ElemType, MemRef, Vector};
 
     /// The ops as MLIR text, at the top level.
     fn text(ops: &[DfirOp]) -> String {
@@ -1672,6 +1897,7 @@ mod unit_tests {
     fn layout() -> AffineMap {
         AffineMap {
             dims: 3,
+            syms: 0,
             results: vec![
                 AffineExpr::dim(2)
                     .times(64)
@@ -2565,5 +2791,192 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
 
         // ⭐ AND IT ADDS NO STATE OF ITS OWN: the base is all of it.
         assert_eq!(tpmv.base, TpmvBase::new(&program[0], DfirUnit::Lxlu));
+    }
+    /// 🎯 118/384 — THE COLLAPSED DIMENSIONS COME OUT AND THE SURVIVORS KEEP THEIR ORDER.
+    ///
+    /// The delete list is built as `indices_to_delete.push_back(indices[dim])` in ascending `dim`
+    /// (`:317`), so it is a subsequence of the indices — here dimensions 1 and 3 of four.
+    #[test]
+    fn the_requested_indices_are_removed_in_order() {
+        let mut indices = vec![Val(10), Val(11), Val(12), Val(13)];
+        assert_eq!(
+            remove_values_from_indices(&mut indices, &[Val(11), Val(13)]),
+            IndexRemoval::Removed
+        );
+        assert_eq!(indices, vec![Val(10), Val(12)]);
+    }
+
+    /// 🎯 118/384 — EVERY DIMENSION COLLAPSING LEAVES NO INDICES AT ALL.
+    ///
+    /// A subscript whose every page-selection bound is a point is one fixed address, which is exactly
+    /// the case the pass turns into a constant map with no operands.
+    #[test]
+    fn deleting_every_index_empties_the_list() {
+        let mut indices = vec![Val(4), Val(5)];
+        assert_eq!(
+            remove_values_from_indices(&mut indices, &[Val(4), Val(5)]),
+            IndexRemoval::Removed
+        );
+        assert!(indices.is_empty());
+
+        // ⭐ AND AN EMPTY REQUEST IS THE `if (!indices_to_delete.empty())` GUARD AT `:338` — the
+        // reference does not even call this, and calling it changes nothing.
+        let mut untouched = vec![Val(4), Val(5)];
+        assert_eq!(
+            remove_values_from_indices(&mut untouched, &[]),
+            IndexRemoval::Removed
+        );
+        assert_eq!(untouched, vec![Val(4), Val(5)]);
+    }
+
+    /// 🎯 118/384 — A VALUE THAT IS NOT AN INDEX IS THE `DT_CHECK_MSG`, NAMED.
+    ///
+    /// *"could not find value to delete in indices vector"*, and the requests before it are already
+    /// gone — the state the reference aborts in.
+    #[test]
+    fn a_value_that_is_not_an_index_is_reported() {
+        let mut indices = vec![Val(1), Val(2), Val(3)];
+        assert_eq!(
+            remove_values_from_indices(&mut indices, &[Val(2), Val(99), Val(3)]),
+            IndexRemoval::NotAnIndex(Val(99))
+        );
+        assert_eq!(indices, vec![Val(1), Val(3)]);
+    }
+
+    /// 🎯 118/384 — A DUPLICATED INDEX LOSES ITS FIRST COPY, WHICH IS `std::find` + `erase(it)`.
+    #[test]
+    fn a_duplicated_index_loses_its_first_occurrence() {
+        let mut indices = vec![Val(7), Val(8), Val(7)];
+        assert_eq!(
+            remove_values_from_indices(&mut indices, &[Val(7)]),
+            IndexRemoval::Removed
+        );
+        assert_eq!(indices, vec![Val(8), Val(7)]);
+    }
+
+    /// 🎯 119/384 — `(d0, d1) -> (d0 * 8 + d1)` BECOMES `()[s0, s1] -> (s0 * 8 + s1)`.
+    ///
+    /// The shape of a real subscript map: one linearised result over two loop iterators.
+    #[test]
+    fn every_dimension_becomes_the_symbol_at_its_position() {
+        let map = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(0).times(8).plus(AffineExpr::dim(1))],
+        };
+        let syms = replace_dims_in_map_with_syms(&map);
+
+        assert_eq!(syms.dims, 0);
+        assert_eq!(syms.syms, 2);
+        assert_eq!(
+            print::affine_map(&syms),
+            "affine_map<()[s0, s1] -> (s0 * 8 + s1)>"
+        );
+        // ⛔ AND THE INPUT IS UNTOUCHED — both callers keep the dimension form for the access itself.
+        assert_eq!(print::affine_map(&map), "affine_map<(d0, d1) -> (d0 * 8 + d1)>");
+    }
+
+    /// 🎯 119/384 — THE SUBSTITUTION REACHES EVERY LEAF, INCLUDING UNDER `mod` AND `floordiv`.
+    ///
+    /// `replaceDimsAndSymbols` walks the expression tree; a shallow rewrite would leave the dimensions
+    /// nested inside a `(d0 mod 128) floordiv 2` — the int8 reduction map's shape — behind, and the
+    /// constraint system would then solve for variables the map no longer mentions.
+    #[test]
+    fn the_substitution_is_structural() {
+        let map = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::FloorDiv(
+                    Box::new(AffineExpr::Mod(
+                        Box::new(AffineExpr::dim(0)),
+                        Box::new(AffineExpr::Const(128)),
+                    )),
+                    Box::new(AffineExpr::Const(2)),
+                ),
+                AffineExpr::dim(2).times(4).plus(AffineExpr::dim(1)),
+                AffineExpr::Const(7),
+            ],
+        };
+        assert_eq!(
+            print::affine_map(&replace_dims_in_map_with_syms(&map)),
+            "affine_map<()[s0, s1, s2] -> ((s0 mod 128) floordiv 2, s2 * 4 + s1, 7)>"
+        );
+    }
+
+    /// 🎯 119/384 — A MAP WITH NO DIMENSIONS IS ALREADY ITS OWN SYMBOL FORM.
+    ///
+    /// The `for` runs zero times, `num_args` stays 0, and `replaceDimsAndSymbols({}, {}, 0, 0)` is the
+    /// identity on a constant map. This is what a fully collapsed subscript looks like after
+    /// [`remove_values_from_indices`] has taken all its operands away.
+    #[test]
+    fn a_constant_map_is_unchanged() {
+        let map = AffineMap::constants(0, &[0, 64]);
+        let syms = replace_dims_in_map_with_syms(&map);
+        assert_eq!(syms, map);
+        assert_eq!(print::affine_map(&syms), "affine_map<() -> (0, 64)>");
+    }
+
+    /// 🎯 120/384 — THE VENDOR'S OWN THREE OPS, IN ORDER.
+    ///
+    /// `dcc-opt --dcc-transform-paged-mem-view paged_mem_view_loads.mlir` produces
+    ///
+    /// ```text
+    /// %[[VAL_17]] = arith.constant 0 : index
+    /// %[[VAL_18]] = arith.cmpi eq, %[[VAL_15]], %[[VAL_17]] : index
+    /// scf.if %[[VAL_18]] {
+    /// ```
+    ///
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:45-47`, `CHECK-SENT-IR`
+    /// lines), where `%[[VAL_15]]` is the outer `affine.for`'s induction variable and the page-selection
+    /// bounds for that dimension collapsed to 0. ⭐ NO `else`, NO RESULT LIST, AND AN EMPTY `then` — the
+    /// caller is what fills it.
+    #[test]
+    fn the_vendors_equality_condition_is_three_ops() {
+        let mut vals = Values::default();
+        let iv = vals.mint();
+        let condition = create_equality_condition(&mut vals, iv, 0);
+
+        let mut out = String::new();
+        for op in &condition.wrap(Vec::new()) {
+            print::emit(&mut out, op, 0);
+        }
+        assert_eq!(
+            out,
+            "%1 = arith.constant 0 : index\n%2 = arith.cmpi eq, %0, %1 : index\nscf.if %2 {\n}\n"
+        );
+
+        // ⛔ ONE GUARD, `eq`, AND WHAT IT GUARDS IS WHERE THE NEXT CONDITION GOES.
+        assert_eq!(
+            condition.guards,
+            vec![BoundGuard {
+                lhs: iv,
+                predicate: CmpIPredicate::Eq,
+                bound: 0,
+                constant: Val(1),
+                cond: Val(2),
+            }]
+        );
+    }
+
+    /// 🎯 120/384 — THE VENDOR'S SECOND AND THIRD PAGES, WITH THEIR OWN CONSTANTS.
+    ///
+    /// `:79-81` tests the same induction variable against 1, and `:131-132` tests a different one
+    /// against 0 — one condition per page candidate, each minting its own constant rather than sharing
+    /// one. The reference builds `ConstantIndexOp` unconditionally, and the vendor's output shows the
+    /// duplicates (`%17`, `%27`, `%37`, `%47` are all `arith.constant 0`/`1`).
+    #[test]
+    fn each_condition_mints_its_own_constant() {
+        let mut vals = Values::default();
+        let iv = vals.mint();
+        let first = create_equality_condition(&mut vals, iv, 0);
+        let second = create_equality_condition(&mut vals, iv, 1);
+
+        assert_eq!(first.guards[0].constant, Val(1));
+        assert_eq!(first.guards[0].bound, 0);
+        assert_eq!(second.guards[0].constant, Val(3));
+        assert_eq!(second.guards[0].bound, 1);
+        assert_ne!(first.guards[0].cond, second.guards[0].cond);
+        assert_ne!(first.wrap(Vec::new()), second.wrap(Vec::new()));
     }
 }
