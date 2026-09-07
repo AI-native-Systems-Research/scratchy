@@ -77,6 +77,10 @@
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp`
 
 
+use crate::islands::dataflow_ir::dialects::arith;
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, operands, regions, regions_mut, results, uses,
+};
 use crate::islands::sentient::dialects::sentient as sen;
 
 /// AN OPERATION'S IDENTITY — the stand-in for `mlir::Operation *`.
@@ -115,6 +119,28 @@ impl OpId {
     #[must_use]
     pub fn path(&self) -> &[u32] {
         &self.path
+    }
+
+    /// THE BLOCK IT SITS IN — `Operation::getBlock()`.
+    ///
+    /// ⭐⭐ A BLOCK IS A PATH PREFIX. A position is its enclosing block's position followed by the
+    /// op's own ordinal, so dropping the last ordinal names the block, and two ops are in the same
+    /// block exactly when their prefixes are equal. Every top-level op of a program unit's body has
+    /// the EMPTY prefix, which is that body's single block — the answer `sameBlock`
+    /// (`VectorOperands.cpp:652`) needs for the common case of a compute and its operands sitting
+    /// side by side.
+    ///
+    /// ⛔ IT IS THE PARENT BLOCK, NOT THE PARENT OP. `[3, 1]`'s block is `[3]`, which is the
+    /// position of the op OWNING that block; the reference's `getBlock()` returns the block and
+    /// `getParentOp()` the op, and this crate's positions cannot tell one from the other. Nothing
+    /// here needs to — the only use is the equality above.
+    ///
+    /// ⛔ A MULTI-REGION OP'S TWO BLOCKS ARE ONE PREFIX HERE, which is why [`op_at`] flattens
+    /// regions: `scf.if`'s `then` and `else` bodies would both answer `[3]`. Nothing this compiler
+    /// emits constructs an `scf.if`, so the conflation is unobservable today.
+    #[must_use]
+    pub fn block(&self) -> &[u32] {
+        &self.path[..self.path.len().saturating_sub(1)]
     }
 }
 
@@ -180,4 +206,588 @@ pub struct VectorOperand {
     /// equal to [`Self::orig_precision`] (`VectorOperands.cpp:399-400`) and only differs where a
     /// `vectorchain.cast` folded into the operand.
     pub on_the_fly_conv_precision: Option<sen::Precision>,
+}
+
+/// THE VALUE A SPLATTED CONSTANT OPERAND CARRIES — the domain `constValToField` accepts.
+///
+/// ⛔⛔ FOUR CASES BECAUSE THE FIFTH THROWS. The reference takes a `double` and ends its
+/// comparison chain with `DT_ERROR("Only 0, 1, 2, or 3 are supported values")`
+/// (`VectorOperands.cpp:260`), which is an unconditional `throw` — so the `return ""` on the next
+/// line is dead, and so are both callers' `if (value == "")` arms (`:286-289`). The accepted domain
+/// is exactly these four, and naming them makes the invariant a TYPE rather than a runtime refusal,
+/// the way entry 048 handled `getSentientCmpIPredicate`'s six predicates.
+///
+/// ⭐ AND THE HARDWARE AGREES THAT FOUR IS THE SET. `zero`, `one`, `two` and `three` are four
+/// PSEUDO-UNITS of the compute port attribute (`SentientTypes.td:100-106`), not four numbers —
+/// there is no `four` port for a fifth case to name.
+///
+/// ⛔ NOT A FLOAT, AND NOT A NUMBER AT ALL HERE. The reference's parameter is a `double` only
+/// because its two callers pass either `IntegerAttr::getInt()` or `FloatAttr::getValueAsDouble()`
+/// (`:277-281`); what the chain of `const_val == N` tests actually decides is WHICH OF FOUR PORTS
+/// the splat is read from. Keeping the double would put a `clippy::float_cmp` equality on the one
+/// decision in this file that has a closed set for an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstantOperandValue {
+    /// A splat of 0 — `zero`.
+    Zero,
+    /// A splat of 1 — `one`.
+    One,
+    /// A splat of 2 — `two`.
+    Two,
+    /// A splat of 3 — `three`.
+    Three,
+}
+
+/// Replaces: e073_constValToField
+///
+/// THE COMPUTE PORT A SPLATTED CONSTANT OPERAND IS READ FROM — `constValToField`
+/// (`VectorOperands.cpp:250`).
+///
+/// ⭐ THE RESULT IS A PORT, NOT A NAME. The reference's `std::string` goes straight into
+/// `VectorOperand::values_` and comes back out through `symbolizeSentientComputePort`
+/// (`VectorChainToSentientPESFP.cpp:722-726`) — the string round-trips into this very enumeration,
+/// so the port is what the function computes and the spelling is [`sen::Port`]'s business.
+///
+/// ⭐ TOTAL, so there is nothing for a caller to check. `getOperandFromConstantOp` (entry 166) and
+/// `getOperandFromConstantBitstreamOp` (entry 167) each test the returned string against `""`
+/// before using it; with the domain named, both tests are statically false and both branches go.
+#[must_use]
+pub const fn const_val_to_field(const_val: ConstantOperandValue) -> sen::Port {
+    match const_val {
+        ConstantOperandValue::Zero => sen::Port::Zero,
+        ConstantOperandValue::One => sen::Port::One,
+        ConstantOperandValue::Two => sen::Port::Two,
+        ConstantOperandValue::Three => sen::Port::Three,
+    }
+}
+
+/// THE OP AT A POSITION, or `None` where the path names nothing in `scope`.
+///
+/// ⭐ ONE ORDINAL PER LEVEL, AND A MULTI-REGION OP'S REGIONS ARE CONCATENATED in [`regions`]
+/// order. [`OpId`]'s ordinals are per LEVEL, not per region, so an op with two regions needs a rule;
+/// this is it, and [`remove_at`] flattens the same way through [`regions_mut`]. `scf.if` is the only
+/// op in this island with two regions and nothing this compiler emits constructs one — a fact
+/// `tf_cfg_simplification_dataflow_level.rs` records against its own conditional walk — so the
+/// flattening is unobservable today.
+#[must_use]
+fn op_at<'a>(id: &OpId, scope: &'a [DfirOp]) -> Option<&'a DfirOp> {
+    let (first, rest) = id.path().split_first()?;
+    let mut op = scope.get(*first as usize)?;
+    for ordinal in rest {
+        op = regions(op).into_iter().flatten().nth(*ordinal as usize)?;
+    }
+    Some(op)
+}
+
+/// WHETHER A POSITION HOLDS AN `arith.constant` — `isa<mlir::arith::ConstantOp>(op)`.
+///
+/// ⛔⛔ NOT `kind == VectorOperandType::Constant`, WHICH IS A DIFFERENT QUESTION, and the two
+/// disagree in BOTH directions. `getOperandFromConstantBitstreamOp` builds a `Constant`-kinded
+/// operand over a `vectorchain.constant_bitstream` (`VectorOperands.cpp:305`) — kind `Constant`,
+/// not an `arith.constant`; and the trivial-shuffle path re-tags an operand built over its parent as
+/// `NFWD` or `ConstantBitstream` after the fact (`:317-336`) — so an operand whose op IS an
+/// `arith.constant` can carry any of three kinds. The reference asks the OP, and so does this.
+///
+/// ⛔ ALL THREE OF THIS ISLAND'S CONSTANT VARIANTS ARE THE ONE C++ OP CLASS. `arith::ConstantOp`
+/// covers the index, integer and dense-vector forms; [`arith::Op::Constant`],
+/// [`arith::Op::ConstantInt`] and [`arith::Op::DenseConstant`] are split here because they PRINT
+/// differently (see `ConstantInt`'s note), so the `isa<>` is a match on all three.
+///
+/// ⭐ A PATH THAT RESOLVES TO NOTHING IS NOT A CONSTANT, and [`same_block`] then falls through to
+/// its block comparison. An `Operation *` cannot dangle in the reference; a position can name an op
+/// in a scope it was not given, and the total answer to "is that a constant" is no.
+fn is_arith_constant(op: &OpId, scope: &[DfirOp]) -> bool {
+    matches!(
+        op_at(op, scope),
+        Some(DfirOp::Arith(
+            arith::Op::Constant { .. }
+                | arith::Op::ConstantInt { .. }
+                | arith::Op::DenseConstant { .. }
+        ))
+    )
+}
+
+/// Replaces: e074_sameBlock
+///
+/// WHETHER AN OPERAND IS DEFINED IN THE SAME BLOCK AS THE OP USING IT, THE CONSTANT EXCEPTED —
+/// `VectorOperand::sameBlock` (`VectorOperands.cpp:652`), the single-operand overload.
+///
+/// ```text
+///   if (operand.has_value()) {
+///     if (!isa<mlir::arith::ConstantOp>(operand.value().op_) &&
+///         operand.value().op_->getBlock() != this_op->getBlock()) {
+///       return LogicalResult::failure();
+///     }
+///     return LogicalResult::success();
+///   } else {
+///     return LogicalResult::failure();
+///   }
+/// ```
+///
+/// ⛔⛔ AN ABSENT OPERAND IS A FAILURE, NOT A SUCCESS. `false` here is `LogicalResult::failure()`,
+/// and the sole caller — `OperandReuse::setReuseInformation` (`OperandReuse.cpp:31`) — turns a
+/// failure into `operand_i.setValue("latch")`, i.e. "re-read it, do not reuse the register". Getting
+/// the empty case backwards would have an unknown operand claim reuse.
+///
+/// ⛔ WHY THE CONSTANT IS EXEMPT: MLIR canonicalisation hoists `arith.constant` out of the block
+/// that uses it, so a constant operand is *expected* to be defined elsewhere and that is not a
+/// reason to latch. ⭐ THE EXEMPTION IS UNREACHABLE FROM THE ONE CALLER, which guards the call with
+/// `if (operand_i.type_ != Constant)` — but "unreachable at today's only call site" is not the same
+/// claim as "not part of the function", and the second overload (see the scope note below) is called
+/// from two more places.
+///
+/// ⭐ `scope` IS HOW A POSITION ANSWERS `isa<>`. `Operation *` carries its class; [`OpId`] carries
+/// only its place, and the ops it is a place in are the rest of the answer. `agen_helper.rs`'s
+/// entry 038 takes the same `scope: &[DfirOp]` for the same reason.
+#[must_use]
+pub fn same_block(this_op: &OpId, operand: Option<&VectorOperand>, scope: &[DfirOp]) -> bool {
+    // `if (operand.has_value())` … `} else { return LogicalResult::failure(); }`
+    let Some(operand) = operand else {
+        return false;
+    };
+
+    // `if (!isa<mlir::arith::ConstantOp>(operand.value().op_) &&
+    //      operand.value().op_->getBlock() != this_op->getBlock()) return failure();`
+    if !is_arith_constant(&operand.op, scope) && operand.op.block() != this_op.block() {
+        return false;
+    }
+
+    // `return LogicalResult::success();`
+    true
+}
+
+/// WHETHER NOTHING IN `scope` READS ANY RESULT OF THE OP AT A POSITION — `user->getUses().empty()`.
+///
+/// ⛔ `false` FOR A POSITION THAT NAMES NO OP, which is the reference's `user &&` guard
+/// (`VectorOperands.cpp:810`). A null user is not erasable there and leaves `all_uses_deleted`
+/// false; an unresolvable position gets the same answer here, so an op whose users cannot all be
+/// accounted for is never erased.
+fn has_no_uses(id: &OpId, scope: &[DfirOp]) -> bool {
+    match op_at(id, scope) {
+        Some(op) => results(op)
+            .into_iter()
+            .all(|result| uses(result, scope).is_empty()),
+        None => false,
+    }
+}
+
+/// EVERY USE OF THE RESULTS OF THE OP AT `of`, AS POSITIONS — `op->getUses()` with the owner of
+/// each use resolved.
+///
+/// ⛔ ONE ENTRY PER **USE**, NOT PER USER, matching [`uses`] and `Value::use_begin()`: an op that
+/// reads the same result twice appears twice, and that is what makes the reference's
+/// `all_uses_deleted` loop count iterations the way MLIR does.
+///
+/// ⛔ AND IT DESCENDS INTO REGIONS, because [`uses`] does. A result read by an op inside an
+/// `affine.for` body has a user, and a walk that stopped at the top level would erase the definition
+/// out from under it.
+fn use_positions(of: &OpId, scope: &[DfirOp]) -> Vec<OpId> {
+    let Some(op) = op_at(of, scope) else {
+        return Vec::new();
+    };
+    let produced = results(op);
+    let mut found: Vec<OpId> = Vec::new();
+    collect_use_positions(&produced, scope, &[], 0, &mut found);
+    found
+}
+
+/// [`use_positions`]'s recursion.
+///
+/// `prefix` is the position of the op OWNING the block `scope` is, and `base` is where that block
+/// starts in the owner's flattened region sequence — the numbering [`op_at`] reads back. The
+/// top-level call passes the empty prefix and zero, which is the program unit body's own block.
+fn collect_use_positions(
+    of: &[Val],
+    scope: &[DfirOp],
+    prefix: &[u32],
+    base: u32,
+    found: &mut Vec<OpId>,
+) {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path: Vec<u32> = prefix.to_vec();
+        path.push(base + ordinal as u32);
+
+        for read in operands(op) {
+            if of.contains(&read) {
+                found.push(OpId::at(&path));
+            }
+        }
+
+        let mut child = 0u32;
+        for region in regions(op) {
+            collect_use_positions(of, region, &path, child, found);
+            child += region.len() as u32;
+        }
+    }
+}
+
+/// REMOVE THE OP AT A POSITION — `Operation::erase()`.
+///
+/// ⭐ IT DESCENDS WITH [`regions_mut`], ARM FOR ARM WITH [`op_at`]'s [`regions`] and with the same
+/// flattening of a multi-region op, so a position read one way is removed the other.
+///
+/// ⛔ A PATH THAT NAMES NOTHING REMOVES NOTHING. There is no other total answer, and the reference
+/// cannot reach the case — `Operation::erase()` takes a live pointer.
+fn remove_at(path: &[u32], scope: &mut Vec<DfirOp>) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    let first = *first as usize;
+
+    if rest.is_empty() {
+        if first < scope.len() {
+            scope.remove(first);
+        }
+        return;
+    }
+
+    let Some(op) = scope.get_mut(first) else {
+        return;
+    };
+
+    // Descend one level, re-basing the next ordinal onto the region that actually holds it.
+    let mut wanted = rest[0] as usize;
+    for region in regions_mut(op) {
+        if wanted < region.len() {
+            let mut rebased: Vec<u32> = vec![wanted as u32];
+            rebased.extend_from_slice(&rest[1..]);
+            remove_at(&rebased, region);
+            return;
+        }
+        wanted -= region.len();
+    }
+}
+
+/// Replaces: e075_eraseOp
+///
+/// ERASE AN OP AND THE USERS THAT NOTHING ELSE READS — `VectorOperand::eraseOp`
+/// (`VectorOperands.cpp:806`), the one-argument overload.
+///
+/// ```text
+///   bool all_uses_deleted = true;
+///   std::vector<mlir::Operation *> to_be_erased;
+///   for (auto &use : op->getUses()) {
+///     Operation *user = use.getOwner();
+///     if (user && user->getUses().empty()) {
+///       to_be_erased.push_back(user);
+///     } else {
+///       all_uses_deleted = false;
+///     }
+///   }
+///   for (auto e : to_be_erased) e->erase();
+///   if (all_uses_deleted) op->erase();
+/// ```
+///
+/// ⛔⛔ ONE LEVEL OF USERS, NOT A TRANSITIVE SWEEP. A user is erased only when NOTHING reads it, and
+/// the users of *that* user are never examined — the reference walks exactly one edge. A recursive
+/// version would delete a chain whose head this pass has not decided to lower, which is why
+/// `eraseOperands` (entry 233) exists separately with its own `intermediate_ops` list.
+///
+/// ⛔⛔ AND `op` GOES ONLY IF **EVERY** USE WAS ERASABLE. One surviving reader keeps the definition,
+/// so the two loops are not independent: a partially-erased use list leaves `op` in place, still
+/// feeding whatever survived.
+///
+/// ⛔ THE ERASURE ORDER IS DESCENDING, AND THAT IS THIS PORT'S OBLIGATION, NOT THE REFERENCE'S. An
+/// `Operation *` stays valid while its siblings are erased; a POSITION does not — removing `[3]`
+/// renumbers `[4]` to `[3]`. Every position invalidated by removing `p` (`p`'s later siblings, and
+/// everything under them) is lexicographically GREATER than `p`, so removing in descending
+/// lexicographic order removes each op before anything that could renumber it.
+///
+/// ⭐ AND `op`'s OWN POSITION SURVIVES THAT LOOP BY DOMINANCE. A user of a result comes after the
+/// op that defines it, so every position in `to_be_erased` is lexicographically greater than `op`'s
+/// and none of them renumbers it.
+///
+/// ⛔ THE REFERENCE CAN PUSH ONE USER TWICE — an op reading the same result twice appears twice in
+/// `getUses()`, and `to_be_erased` is not deduplicated, so `e->erase()` runs twice on it. That is a
+/// double free there; here it would remove a *different, innocent* op at the same ordinal, so this
+/// port deduplicates. The behaviour the reference intends is a single erase per op.
+pub fn erase_op(op: &OpId, scope: &mut Vec<DfirOp>) {
+    let mut all_uses_deleted = true;
+    let mut to_be_erased: Vec<OpId> = Vec::new();
+
+    // `for (auto &use : op->getUses()) { Operation *user = use.getOwner(); … }`
+    for user in use_positions(op, scope) {
+        // `if (user && user->getUses().empty())`
+        if has_no_uses(&user, scope) {
+            if !to_be_erased.contains(&user) {
+                to_be_erased.push(user);
+            }
+        } else {
+            all_uses_deleted = false;
+        }
+    }
+
+    // `for (auto e : to_be_erased) e->erase();` — ⛔ descending, see the note above.
+    to_be_erased.sort_unstable();
+    for position in to_be_erased.iter().rev() {
+        remove_at(position.path(), scope);
+    }
+
+    // `if (all_uses_deleted) op->erase();`
+    if all_uses_deleted {
+        remove_at(op.path(), scope);
+    }
+}
+
+
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{ConstantOperandValue, OpId, VectorOperand, VectorOperandType};
+    use super::{const_val_to_field, erase_op, same_block};
+    use crate::islands::dataflow_ir::dialects::vectorchain as vc;
+    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, Vector};
+    use crate::islands::sentient::dialects::sentient as sen;
+
+    /// The vector every op in these fixtures is typed at — 128 lanes of bf16, the width
+    /// `dcc/test/PESFP/*.mlir` computes at.
+    const V: Vector = Vector {
+        len: 128,
+        elem: ElemType::Bf16,
+    };
+
+    /// `arith.constant dense<0> : vector<128xbf16>` binding `result`.
+    fn dense(result: Val) -> DfirOp {
+        DfirOp::Arith(arith::Op::DenseConstant {
+            result,
+            one: false,
+            ty: V,
+        })
+    }
+
+    /// `vectorchain.fast_exp %input : vector<128xbf16>` binding `result`.
+    fn fast_exp(result: Val, input: Val) -> DfirOp {
+        DfirOp::VectorChain(vc::Op::FastExp {
+            result,
+            input,
+            input_ty: V,
+            ty: V,
+        })
+    }
+
+    /// `vectorchain.floor %input` binding `result`.
+    fn floor(result: Val, input: Val) -> DfirOp {
+        DfirOp::VectorChain(vc::Op::Floor {
+            result,
+            input,
+            input_ty: V,
+            ty: V,
+        })
+    }
+
+    /// `affine.for %iv = 0 to 8 { body }`, carrying nothing.
+    fn for_loop(iv: Val, body: Vec<DfirOp>) -> DfirOp {
+        DfirOp::Affine(affine::Op::For {
+            iv,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(8),
+            carried: Vec::new(),
+            body,
+        })
+    }
+
+    /// An operand of `kind` defined at `path`, with both precisions unset.
+    fn operand(kind: VectorOperandType, path: &[u32]) -> VectorOperand {
+        VectorOperand {
+            kind,
+            op: OpId::at(path),
+            orig_precision: None,
+            on_the_fly_conv_precision: None,
+        }
+    }
+
+    // ── e073_constValToField ──────────────────────────────────────────────────────────────────
+
+    /// ⭐ THE VENDOR CASE IS THE PORT NAME ITSELF. `dcc/test` reaches this only through whole-program
+    /// `CHECK-SENT-IR` lines, where its answer appears as the operand field of a compute —
+    /// `dcc/test/PESFP/exp_bf16.mlir` checks `operand_b = #sentient<compute_port zero>` for a
+    /// `dense<0.0>` splat. That mapping is what this asserts.
+    #[test]
+    fn the_four_splat_values_name_the_four_pseudo_unit_ports() {
+        assert_eq!(
+            const_val_to_field(ConstantOperandValue::Zero),
+            sen::Port::Zero
+        );
+        assert_eq!(const_val_to_field(ConstantOperandValue::One), sen::Port::One);
+        assert_eq!(const_val_to_field(ConstantOperandValue::Two), sen::Port::Two);
+        assert_eq!(
+            const_val_to_field(ConstantOperandValue::Three),
+            sen::Port::Three
+        );
+    }
+
+    /// ⛔ FOUR DISTINCT PORTS, not four names for one. A mapping that collapsed two would make two
+    /// different splats read the same pseudo-unit.
+    #[test]
+    fn the_four_ports_are_distinct() {
+        let ports = [
+            const_val_to_field(ConstantOperandValue::Zero),
+            const_val_to_field(ConstantOperandValue::One),
+            const_val_to_field(ConstantOperandValue::Two),
+            const_val_to_field(ConstantOperandValue::Three),
+        ];
+        for (i, a) in ports.iter().enumerate() {
+            for b in &ports[i + 1..] {
+                assert_ne!(a, b, "{ports:?}");
+            }
+        }
+    }
+
+    // ── OpId::block ───────────────────────────────────────────────────────────────────────────
+
+    /// ⭐ A BLOCK IS THE PATH WITHOUT THE LAST ORDINAL, and the top level's block is the empty one.
+    #[test]
+    fn a_block_is_the_position_without_the_op_s_own_ordinal() {
+        assert_eq!(OpId::at(&[3]).block(), &[] as &[u32]);
+        assert_eq!(OpId::at(&[4]).block(), &[] as &[u32]);
+        assert_eq!(OpId::at(&[3, 1]).block(), &[3]);
+        assert_eq!(OpId::at(&[3, 1, 2]).block(), &[3, 1]);
+    }
+
+    // ── e074_sameBlock ────────────────────────────────────────────────────────────────────────
+
+    /// ⛔⛔ AN ABSENT OPERAND FAILS. `OperandReuse.cpp:31` reads the failure as "latch it"; a `true`
+    /// here would let an operand nobody could resolve claim register reuse.
+    #[test]
+    fn an_absent_operand_is_not_in_the_same_block() {
+        let scope = vec![dense(Val(0)), fast_exp(Val(1), Val(0))];
+        assert!(!same_block(&OpId::at(&[1]), None, &scope));
+    }
+
+    /// The ordinary case: a compute and the op feeding it, side by side at the top level.
+    #[test]
+    fn a_top_level_operand_shares_the_top_level_block() {
+        let scope = vec![
+            dense(Val(0)),
+            fast_exp(Val(1), Val(0)),
+            floor(Val(2), Val(1)),
+        ];
+        let from_a_link = operand(VectorOperandType::Link, &[1]);
+        assert!(same_block(&OpId::at(&[2]), Some(&from_a_link), &scope));
+    }
+
+    /// ⛔ A NON-CONSTANT OPERAND FROM ANOTHER BLOCK FAILS — the whole point of the function.
+    #[test]
+    fn an_operand_from_a_loop_body_is_a_different_block() {
+        let scope = vec![
+            dense(Val(0)),
+            for_loop(Val(9), vec![fast_exp(Val(1), Val(0))]),
+            floor(Val(2), Val(1)),
+        ];
+        // `[1, 0]` is the `fast_exp` inside the loop; its block is `[1]`, the user's is `[]`.
+        let inside_the_loop = operand(VectorOperandType::Link, &[1, 0]);
+        assert!(!same_block(&OpId::at(&[2]), Some(&inside_the_loop), &scope));
+    }
+
+    /// ⛔⛔ THE EXEMPTION IS ON THE OP'S CLASS, NOT ON THE OPERAND'S KIND. The same position, the
+    /// same blocks, and the answer flips because the defining op is an `arith.constant` — and note
+    /// the kind here is `Link`, so a port that had tested `kind == Constant` would answer `false`.
+    #[test]
+    fn a_constant_from_another_block_is_exempt() {
+        let scope = vec![
+            fast_exp(Val(1), Val(0)),
+            for_loop(Val(9), vec![dense(Val(0))]),
+            floor(Val(2), Val(1)),
+        ];
+        let hoisted_constant = operand(VectorOperandType::Link, &[1, 0]);
+        assert!(same_block(&OpId::at(&[2]), Some(&hoisted_constant), &scope));
+    }
+
+    // ── e075_eraseOp ──────────────────────────────────────────────────────────────────────────
+
+    /// An op with no uses at all: `all_uses_deleted` never falsifies, so it goes.
+    #[test]
+    fn an_unused_op_is_erased_on_its_own() {
+        let mut scope = vec![dense(Val(0)), fast_exp(Val(1), Val(7))];
+        erase_op(&OpId::at(&[0]), &mut scope);
+        assert_eq!(scope, vec![fast_exp(Val(1), Val(7))]);
+    }
+
+    /// ⭐ THE ONE USER GOES TOO, because nothing reads it — the reference's single edge.
+    #[test]
+    fn the_op_and_its_only_dead_user_both_go() {
+        let mut scope = vec![dense(Val(0)), fast_exp(Val(1), Val(0))];
+        erase_op(&OpId::at(&[0]), &mut scope);
+        assert!(scope.is_empty(), "{scope:?}");
+    }
+
+    /// ⛔⛔ ONE LIVE READER KEEPS EVERYTHING. `fast_exp` is read by `floor`, so it is not erasable,
+    /// `all_uses_deleted` is false, and the constant survives feeding it.
+    #[test]
+    fn a_user_that_is_itself_read_keeps_the_definition() {
+        let before = vec![
+            dense(Val(0)),
+            fast_exp(Val(1), Val(0)),
+            floor(Val(2), Val(1)),
+        ];
+        let mut scope = before.clone();
+        erase_op(&OpId::at(&[0]), &mut scope);
+        assert_eq!(scope, before);
+    }
+
+    /// ⛔ ONE LEVEL, NOT TRANSITIVE. Erasing the head of the chain above from its middle takes
+    /// `floor` (nothing reads it) and `fast_exp`, and leaves the constant — a transitive sweep would
+    /// have taken all three.
+    #[test]
+    fn the_walk_stops_after_one_edge() {
+        let mut scope = vec![
+            dense(Val(0)),
+            fast_exp(Val(1), Val(0)),
+            floor(Val(2), Val(1)),
+        ];
+        erase_op(&OpId::at(&[1]), &mut scope);
+        assert_eq!(scope, vec![dense(Val(0))]);
+    }
+
+    /// ⛔ A USER INSIDE A REGION IS STILL A USER, and it is removed from that region rather than
+    /// from the top level.
+    #[test]
+    fn a_user_nested_in_a_loop_is_erased_in_place() {
+        let mut scope = vec![
+            dense(Val(0)),
+            for_loop(Val(9), vec![fast_exp(Val(1), Val(0))]),
+        ];
+        erase_op(&OpId::at(&[0]), &mut scope);
+        assert_eq!(scope, vec![for_loop(Val(9), Vec::new())]);
+    }
+
+    /// ⛔⛔ DESCENDING ORDER, WHICH IS THIS PORT'S OBLIGATION. Three dead users at `[1]`, `[2]` and
+    /// `[3]`: removing them front-first would renumber the survivors and delete the wrong ops. Only
+    /// the trailing `floor`, which reads nothing of `%0`, is left.
+    #[test]
+    fn several_dead_users_are_removed_without_renumbering_each_other() {
+        let mut scope = vec![
+            dense(Val(0)),
+            fast_exp(Val(1), Val(0)),
+            fast_exp(Val(2), Val(0)),
+            fast_exp(Val(3), Val(0)),
+            floor(Val(4), Val(8)),
+        ];
+        erase_op(&OpId::at(&[0]), &mut scope);
+        assert_eq!(scope, vec![floor(Val(4), Val(8))]);
+    }
+
+    /// ⛔ ONE ERASE PER OP EVEN WHEN ONE OP READS THE VALUE TWICE. `getUses()` yields two uses for
+    /// this `binary`, and the reference would push it into `to_be_erased` twice and erase it twice;
+    /// here a second removal at the same ordinal would take an innocent op instead.
+    #[test]
+    fn an_op_reading_the_value_twice_is_erased_once() {
+        let mut scope = vec![
+            dense(Val(0)),
+            DfirOp::VectorChain(vc::Op::Binary {
+                result: Val(1),
+                op1: Val(0),
+                op2: Val(0),
+                mask: None,
+                binary_op: vc::BinaryOp::Add,
+                op_specific_map: AffineMap::unary(AffineExpr::Dim(0)),
+                operand_ty: V,
+                ty: V,
+            }),
+            floor(Val(2), Val(8)),
+        ];
+        erase_op(&OpId::at(&[0]), &mut scope);
+        assert_eq!(scope, vec![floor(Val(2), Val(8))]);
+    }
 }

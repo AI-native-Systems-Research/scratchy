@@ -369,11 +369,15 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             | dfir_op::affine::Op::Apply { .. }
             | dfir_op::affine::Op::Yield { .. },
         ) => None,
-        // The `vectorchain` ops both reference lists name, and the estimate family — `FastExpOp`,
-        // `ExpEstimateOp`, `RecEstimateOp`, `LnEstimateOp`, `RsqrtEstimateOp`, `FloorOp`,
-        // `SigmoidEstimateOp` and `TanhEstimateOp` — which [`vc::Op::Estimate`] holds as one op.
+        // The `vectorchain` ops both reference lists name, including the estimate family:
+        // `ExpEstimateOp` (`Utils.cpp:598`), `RecEstimateOp`, `LnEstimateOp`, `RsqrtEstimateOp`,
+        // `SigmoidEstimateOp` and `TanhEstimateOp`, which [`vc::Op::Estimate`] holds as one op, plus
+        // `FastExpOp` (`:594`) and `FloorOp` (`:615`), which are their own ops in that dialect and
+        // now their own variants here — see [`vc::Op::FastExp`].
         DfirOp::VectorChain(
             vc::Op::Estimate { ty, .. }
+            | vc::Op::FastExp { ty, .. }
+            | vc::Op::Floor { ty, .. }
             | vc::Op::ScanWithGap { ty, .. }
             | vc::Op::Multiply { ty, .. }
             | vc::Op::MultiplyAccumulate { ty, .. }
