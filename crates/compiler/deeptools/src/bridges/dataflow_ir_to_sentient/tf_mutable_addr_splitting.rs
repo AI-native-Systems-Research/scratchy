@@ -1479,7 +1479,7 @@ mod unit_tests {
 
     /// 🎯 185/384 — AN ADDRESS INSIDE THE `EAR`'S RANGE IS NOT AN OVERFLOW, AND NOTHING ELSE IS ASKED.
     ///
-    /// `if (max_mutable > (getMaxMutableRange(comp) / elem_size_in_bits))` (`:803`) — below the limit
+    /// `if (max_mutable > (getMaxMutableRange(comp) / elem_size_in_bits))` (`:804`) — below the limit
     /// the function returns `false` before it ever looks at the correction flag or at `mas_data`, which
     /// is why an empty `mas_data` is fine here.
     #[test]
@@ -1536,7 +1536,7 @@ mod unit_tests {
     /// 🎯 185/384 — ⛔⛔ AND WITHOUT THE OVERRIDE THAT SAME PROGRAM STOPS THE COMPILER.
     ///
     /// `if (!dcc_ext_ctx_.dsc_global_->dcc_correct_ear_overflow) DT_CHECK_MSG(false, "EAR overflow
-    /// detected");` (`:806-808`). [`CORRECT_EAR_OVERFLOW`] is [`EarOverflowCorrection::Forbidden`], so
+    /// detected");` (`:807-808`). [`CORRECT_EAR_OVERFLOW`] is [`EarOverflowCorrection::Forbidden`], so
     /// this — not [`MutableAddrOverflow::Overflow`] — is what a shipped `dcc` answers, and the four
     /// vendor tests only reach the split because every one of their `RUN` lines says
     /// `DT_OPT=correctearoverflow=1`.
@@ -1561,7 +1561,7 @@ mod unit_tests {
     /// 🎯 185/384 — AN OVERFLOW WITH NO ITERATORS HAS NOTHING TO PARTITION.
     ///
     /// `DT_CHECK_MSG(!mas_data.empty(), …)` (`:810-813`) — `initMASData` returns early on
-    /// `indices.size() == 0` (`:709`), so a transfer whose subscripts name no loop reaches here with an
+    /// `indices.size() == 0` (`:713`), so a transfer whose subscripts name no loop reaches here with an
     /// empty list and its overflow is a constant offset no cut can reduce.
     #[test]
     fn an_overflow_with_no_iterators_cannot_be_split() {
@@ -2383,7 +2383,7 @@ mod unit_tests {
 
     /// 🎯 186/384 — ⛔ A DIMENSION WITH NO COEFFICIENT IS NOT DIVIDED BY.
     ///
-    /// `int64_t extra_iters = mutable_overflow / mas_data[i].composed_coeff_;` (`:906`) — a division by
+    /// `int64_t extra_iters = mutable_overflow / mas_data[i].composed_coeff_;` (`:905`) — a division by
     /// a field nothing in the reference constrains. See
     /// [`Partitioning::DimensionHasNoCoefficient`] for why it is unreachable from the pass and guarded
     /// anyway.
@@ -2773,7 +2773,7 @@ mod unit_tests {
 
     /// 🎯 187/384 — ⛔ NO PARTITION SIZES, NO TREE.
     ///
-    /// `DT_CHECK(!partition_sizes.empty())` in the caller (`createPartitions`, `:987`) — and this
+    /// `DT_CHECK(!partition_sizes.empty())` in the caller (`createPartitions`, `:989`) — and this
     /// function would take `prev_partitions.front()` of a chain it never built.
     #[test]
     fn no_partition_sizes_builds_no_tree() {
@@ -2792,7 +2792,7 @@ mod unit_tests {
 
     /// 🎯 187/384 — ⛔⛔ A PARTITIONED DIMENSION WITH NO ITERATOR HAS NOTHING TO COMPARE.
     ///
-    /// `DT_CHECK(mas_data[partition_dim].iter_arg_ != nullptr)` (`:1013`) — the reference's own guard,
+    /// `DT_CHECK(mas_data[partition_dim].iter_arg_ != nullptr)` (`:1015`) — the reference's own guard,
     /// which is [`MasData::iter_arg`] being `None`. It is a real shape: a time dimension carries no
     /// induction variable until [`create_explicit_time_loops`] has written its loop.
     #[test]
@@ -2905,7 +2905,7 @@ mod unit_tests {
 
     /// 🎯 187/384 — ⛔ AND MORE SIZES THAN ITERATORS IS NOT INDEXED.
     ///
-    /// `mas_data[partition_dim]` indexed by a `partition_sizes` position (`:1005`).
+    /// `mas_data[partition_dim]` indexed by a `partition_sizes` position (`:1010-1011`).
     #[test]
     fn more_partition_sizes_than_iterators_is_not_indexed() {
         let mut vals = Values::default();
@@ -3447,7 +3447,7 @@ mod unit_tests {
     ///
     /// `time_bounds` and `time_offsets` are what `constructTimeStepsInfo` leaves behind, and BOTH are
     /// indexed by `time_order` RESULT POSITION — outermost first
-    /// (`dialect_utils/Agen/Utils.cpp:104-140`):
+    /// (`dialect_utils/Agen/Utils.cpp:115`, `:254`):
     ///
     /// | `time_order` result | time dim | trip count, from `time_set` | offset, from `layout ∘ store_time_addr_map` |
     /// |---|---|---|---|
@@ -3479,8 +3479,8 @@ mod unit_tests {
         ad
     }
 
-    /// THE `dst` SUBSCRIPTS AND THE TIME SET, AS `splitMutableAddr` READS THEM OFF THE DETAILS
-    /// (`:487-489`).
+    /// THE `dst` SUBSCRIPTS AND THE TIME SET, AS `transformCompLoadAndStore` READS THEM OFF THE DETAILS
+    /// (`:488-490`).
     ///
     /// `dst:%dst_mem_view[0, %arg1 * 16, %arg3 * 8]` is the map `(d0, d1) -> (0, d0 * 16, d1 * 8)` over
     /// the indices `[%arg1, %arg3]`.
@@ -4035,7 +4035,7 @@ mod unit_tests {
     /// 🎯 190/384 — ⛔ A `time_order` RESULT THAT IS NOT A BARE DIMENSION IS THE UNCHECKED `cast`.
     ///
     /// `time_order.getDimPosition(dim)` is `cast<AffineDimExpr>(getResult(dim)).getPosition()`
-    /// (`Agen/Utils.cpp:496`) — not `dyn_cast`, so a non-permutation aborts rather than answering.
+    /// (`Agen/Utils.cpp:497`) — not `dyn_cast`, so a non-permutation aborts rather than answering.
     #[test]
     fn a_time_order_that_is_not_a_permutation_is_reported() {
         let op = time_dims_transfer();
@@ -4240,12 +4240,12 @@ impl LoopTripCount {
 
 /// Replaces: e184_getLoopTripCount
 ///
-/// **184/384** `MutableAddrSplittingPass::getLoopLoopTripCount` —
-/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:742` (57L).
+/// **184/384** `MutableAddrSplittingPass::getLoopTripCount` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:743` (57L).
 ///
 /// ```cpp
 /// // TODO: Remove the DT_CHECK safely and make this a broader utility.
-/// int64_t MutableAddrSplittingPass::getLoopLoopTripCount(Operation *op) const {
+/// int64_t MutableAddrSplittingPass::getLoopTripCount(Operation *op) const {
 ///   DT_CHECK(op);
 ///   int step = 1;
 ///   int64_t lb = 0, ub = 0;
@@ -4446,11 +4446,11 @@ pub fn get_loop_trip_count(loop_op: &DfirOp, scope: &[DfirOp]) -> LoopTripCount 
 ///
 /// # ⛔⛔ SIGNED, WHERE [`Elements`] IS NOT, AND THAT IS NOT A CHOICE
 ///
-/// `max_mutable` is a SUM OF WEIGHTS (`:737`, `:1278`) and a weight is
+/// `max_mutable` is a SUM OF WEIGHTS (`:738`, `:1278`) and a weight is
 /// `(num_iters - 2) * composed_coeff` over a coefficient the layout map supplies. It starts at the
-/// subscript map's constant offset (`iter_coeff_dict[nullptr]`, `:718`), and
+/// subscript map's constant offset (`iter_coeff_dict[nullptr]`, `:724`), and
 /// `calculatePartitionSizes` immediately subtracts a limit from it and requires the difference to be
-/// `<= 0` (`:874`, `:906`) — so both the value and its difference live in the negative half. An
+/// `<= 0` (`:875-876`, `:920`) — so both the value and its difference live in the negative half. An
 /// [`Elements`] would make the reference's own `int64_t` unrepresentable.
 ///
 /// ⭐ SO THE NEWTYPE IS WHAT KEEPS IT FROM MIXING WITH THE LIMIT IT IS COMPARED AGAINST. The limit is
@@ -4461,7 +4461,7 @@ pub fn get_loop_trip_count(loop_op: &DfirOp, scope: &[DfirOp]) -> LoopTripCount 
 pub struct MutableAddr(pub i64);
 
 impl MutableAddr {
-    /// `max_mutable > (getMaxMutableRange(comp) / elem_size_in_bits)` (`:803`).
+    /// `max_mutable > (getMaxMutableRange(comp) / elem_size_in_bits)` (`:804`).
     ///
     /// ⭐ A NEGATIVE SPAN EXCEEDS NOTHING, which is what the reference's signed comparison against a
     /// non-negative quotient says too — written out because the widths differ here.
@@ -4470,7 +4470,7 @@ impl MutableAddr {
         self.0 > 0 && self.0.unsigned_abs() > limit.0
     }
 
-    /// `max_mutable - (max_mutable_range / elem_size_in_bits)` (`:874`) — how far past the limit it
+    /// `max_mutable - (max_mutable_range / elem_size_in_bits)` (`:875-876`) — how far past the limit it
     /// reaches, negative when it is inside.
     ///
     /// ⛔ SATURATING, BECAUSE THE LIMIT IS UNSIGNED AND THE DIFFERENCE IS NOT. A limit larger than
@@ -4502,7 +4502,7 @@ impl MutableAddr {
 /// EAR overflow if encountered"* (`sys-arch-spec/dscglobal/dscglobal.h:92-93`), set from
 /// `DT_OPT=correctearoverflow=1` (`dscglobal.cpp:280-281`). With it clear,
 /// [`has_mutable_addr_overflow`] does not decline the split — it stops the compiler:
-/// `DT_CHECK_MSG(false, "EAR overflow detected")` (`:806-808`), under *"Currently preventing
+/// `DT_CHECK_MSG(false, "EAR overflow detected")` (`:807-808`), under *"Currently preventing
 /// transformation of any EAR overflow cases and addressing them upstream unless manual override
 /// specified."*
 ///
@@ -4548,7 +4548,7 @@ pub enum MutableAddrOverflow {
     ///
     /// ⭐ SPLITTING MEANS PARTITIONING AN ITERATION SPACE, so a transfer with no iterators has no
     /// space to partition — the address it overflows by is a constant offset and there is nothing to
-    /// cut. `initMASData` returns early on `indices.size() == 0` (`:709`), which is exactly how an
+    /// cut. `initMASData` returns early on `indices.size() == 0` (`:713`), which is exactly how an
     /// empty `mas_data` reaches here.
     NoLoopsToSplit,
 }
@@ -4569,7 +4569,7 @@ impl MutableAddrOverflow {
 /// Replaces: e185_hasMutableAddrOverflow
 ///
 /// **185/384** `MutableAddrSplittingPass::hasMutableAddrOverflow` —
-/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:800` (17L).
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:801` (17L).
 ///
 /// ```cpp
 /// bool MutableAddrSplittingPass::hasMutableAddrOverflow(
@@ -4774,7 +4774,7 @@ pub enum Partitioning {
     ///
     /// # ⛔⛔ A NARROWING OF UNDEFINED BEHAVIOUR, NOT OF THE REFERENCE
     ///
-    /// `extra_iters = mutable_overflow / mas_data[i].composed_coeff_` (`:906`) divides by a field
+    /// `extra_iters = mutable_overflow / mas_data[i].composed_coeff_` (`:905`) divides by a field
     /// nothing has constrained. It cannot be zero on the path the pass actually takes — the `else`
     /// branch is reached only when `weight_ > mutable_overflow >= 0`, and
     /// `weight_ = (num_iters - 2) * composed_coeff_`, so a zero coefficient gives a zero weight that
@@ -5114,14 +5114,14 @@ pub enum ConditionalTree {
     /// IS the tree and there is nothing to hand back beside it.
     Built(Vec<DfirOp>),
 
-    /// `DT_CHECK(!partition_sizes.empty())` — `createPartitions`, `:987`.
+    /// `DT_CHECK(!partition_sizes.empty())` — `createPartitions`, `:989`.
     NoPartitionsToBuild,
 
-    /// `DT_CHECK(mas_data[partition_dim].iter_arg_ != nullptr)` (`:1013`).
+    /// `DT_CHECK(mas_data[partition_dim].iter_arg_ != nullptr)` (`:1015`).
     ///
     /// ⭐⭐ AND THIS IS WHY [`create_explicit_time_loops`] RUNS FIRST. A time dimension has no
     /// induction variable to compare against until that function has written the `affine.for` that
-    /// carries it (`:491` runs before `:494`'s `createPartitions`); an entry still holding `None` here
+    /// carries it (`:491` runs before `:533`'s `createPartitions`); an entry still holding `None` here
     /// is a partitioned time dimension whose loop was never made explicit.
     DimensionHasNoIterator {
         /// `mas_data[i].dim_`.
@@ -5134,7 +5134,7 @@ pub enum ConditionalTree {
     /// # ⛔⛔ TWO READS PAST THE END OF AN EMPTY `SmallVector`
     ///
     /// `prev_partitions.front()` takes the root from the FIRST dimension's chain (`:1039`) and
-    /// `prev_partitions.back()` takes the lineage that continues (`:1051`) — both undefined on an
+    /// `prev_partitions.back()` takes the lineage that continues (`:1052`) — both undefined on an
     /// empty one. ⭐ Only the INNERMOST dimension may have an empty chain safely, and only because
     /// nothing looks at it afterwards; that shape is [`ConditionalTree::Built`], with one fewer level
     /// than there are entries in `partition_sizes`.
@@ -5165,7 +5165,7 @@ pub enum ConditionalTree {
 
     /// MORE PARTITION SIZES THAN ITERATORS.
     ///
-    /// ⛔ `mas_data[partition_dim]` INDEXED BY A `partition_sizes` POSITION (`:1005`), where the
+    /// ⛔ `mas_data[partition_dim]` INDEXED BY A `partition_sizes` POSITION (`:1010-1011`), where the
     /// reference's own construction keeps the two aligned: [`calculate_partition_sizes`] pushes one
     /// size per `mas_data` entry it walks and stops. A caller that pairs the wrong two lists reads a
     /// neighbouring iterator in C++ and gets this instead.
@@ -5236,7 +5236,7 @@ struct Cond {
 /// from `dcc` for inputs neither of them is tested on.
 ///
 /// ⛔ AND `fillPartitions` AGREES WITH THE DEFECT, WHICH IS WHY IT CANNOT BE FIXED HERE ALONE. Its
-/// walk from a leaf takes exactly `partition_sizes.size()` steps up the tree (`:1104-1139`), two
+/// walk from a leaf takes exactly `partition_sizes.size()` steps up the tree (`:1119-1167`), two
 /// `getParentNode()` calls per partitioned dimension — so it reads one conditional per dimension in
 /// the order it expects to find them. Appending here would deepen the branches it walks and the two
 /// would disagree about which dimension a conditional belongs to.
@@ -5258,7 +5258,7 @@ struct Level {
 /// Replaces: e187_constructConditionals
 ///
 /// **187/384** `MutableAddrSplittingPass::constructConditionals` —
-/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:999` (62L).
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1000` (62L).
 ///
 /// ```cpp
 /// SmallVector<scf::IfOp, 32> previous_leaves;
@@ -5360,7 +5360,7 @@ struct Level {
 /// is that leaf.
 ///
 /// ⚠️ `dcc::ConditionalTree` IS MECHANISM. The `CondNode` graph `createPartitions` computes over the
-/// built region (`:989-990`) is how a caller finds those leaves through an MLIR region's parent and
+/// built region (`:993-994`) is how a caller finds those leaves through an MLIR region's parent and
 /// child pointers; a [`scf::Op::If`] holds its regions by value, so a consumer reaches a leaf by
 /// matching the tree it was handed.
 ///
@@ -5409,7 +5409,7 @@ pub fn construct_conditionals(
             .collect();
         let is_innermost = index + 1 == partition_sizes.len();
         if bounds.is_empty() && (index == 0 || !is_innermost) {
-            // `prev_partitions.front()` (`:1039`) and `.back()` (`:1051`) on an empty vector.
+            // `prev_partitions.front()` (`:1039`) and `.back()` (`:1052`) on an empty vector.
             return ConditionalTree::DimensionNeedsNoConditional { dim: dim.dim };
         }
 
@@ -5580,7 +5580,7 @@ impl SubscriptsCoefficients {
 /// Replaces: e188_calculateSubscriptsCoefficients
 ///
 /// **188/384** `MutableAddrSplittingPass::calculateSubscriptsCoefficients` —
-/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1186` (11L).
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1188` (11L).
 ///
 /// ```cpp
 /// SmallVector<SmallVector<int64_t>> subscripts_coeffs;
@@ -5598,10 +5598,11 @@ impl SubscriptsCoefficients {
 ///
 /// A partition is the same transfer with its start address shifted forward and its subscripts shifted
 /// BACK, so that partition `n`'s first iteration reads what iteration `n * partition_size` of the
-/// original read. `fillPartitions` does the second half with these coefficients (`:1136`):
+/// original read. `fillPartitions` does the second half with these coefficients (`:1151-1157`):
 ///
 /// ```cpp
-/// new_exprs[r] = new_exprs[r] - (subscripts_coeffs[p][r] * prev_iters);
+/// auto coeffs = subscripts_coeffs[p];
+/// new_exprs[r] = new_exprs[r] - (coeffs[r] * prev_iters);
 /// ```
 ///
 /// ⭐⭐ AND IBM'S OWN KEYS SHOW THE ARITHMETIC. `constant_start_addr_1` loads at
@@ -5811,7 +5812,7 @@ fn first_scaling_of_dim<'a>(expr: &'a AffineExpr, dim: u32) -> Option<&'a Affine
 ///
 /// `ad.getMemViewLayoutMap()` is the reference's first line and nothing in the body mentions it —
 /// the layout is already folded into `time_offsets` by `calculateTimeOffsets`, which flattens
-/// `mem_view_layout_map.compose(time_addr_map)` (`dialect_utils/Agen/Utils.cpp:112-116`). Reading it
+/// `mem_view_layout_map.compose(time_addr_map)` (`dialect_utils/Agen/Utils.cpp:103-109`). Reading it
 /// again here would be the second answer to a question already answered.
 ///
 /// # ⛔ A SENTINEL BOUND IS TRANSCRIBED, NOT REFUSED — AND IT WEIGHS ZERO
@@ -5852,7 +5853,7 @@ pub fn synthesize_time_info(
             num_iters.saturating_sub(2).saturating_mul(offset)
         };
         mas_data.push(MasData {
-            // The four-argument constructor (`:118-125`) — an IMPLICIT loop, so no `iter_arg`.
+            // The four-argument constructor (`:112-116`) — an IMPLICIT loop, so no `iter_arg`.
             iter_arg: None,
             dim: u32::try_from(num_non_time_dims.saturating_add(i)).unwrap_or(u32::MAX),
             composed_coeff: offset,
@@ -5886,10 +5887,10 @@ fn time_bound_as_num_iters(bound: TimeBound) -> i64 {
 
 /// A TRANSFER'S ACCESS TRIPLE, AS THIS PASS REWRITES IT — the reference's three in-out parameters.
 ///
-/// ⭐ THREE `&`-PARAMETERS THAT ARE ALWAYS PASSED TOGETHER. `splitMutableAddr` reads them off the
-/// access details into locals (`:487-489`), hands all three to
+/// ⭐ THREE `&`-PARAMETERS THAT ARE ALWAYS PASSED TOGETHER. `transformCompLoadAndStore` reads them off the
+/// access details into locals (`:488-490`), hands all three to
 /// [`create_explicit_time_loops`] to be rewritten, and then hands
-/// the SAME three to `cloneWithNewAccessInfo` for every partition (`:514-515`, `:529-530`) — they are
+/// the SAME three to `cloneWithNewAccessInfo` for every partition (`:512-515`, `:526-529`) — they are
 /// one value with one lifetime, so they are one struct here.
 ///
 /// ⛔⛔ AND ONE OF THE THREE IS WRITTEN AND NEVER READ, DELIBERATELY. See
@@ -5922,7 +5923,7 @@ pub struct TimeLoopNest {
     ///
     /// ⭐ THE LIST IS `time_dim_idx + 1` LONG, and it is indexed by the RAW time-dimension index: the
     /// reference's own two readers are `for_ops[i - num_orig_dims]` (`Agen/Utils.cpp:472`) and
-    /// `for_ops[actual_time_dim]` (`:1339`). ⛔ Which is not the same index as the position within
+    /// `for_ops[actual_time_dim]` (`:1341`). ⛔ Which is not the same index as the position within
     /// `time_order` — see [`create_explicit_time_loops`].
     pub ivs: Vec<Val>,
 
@@ -5931,7 +5932,7 @@ pub struct TimeLoopNest {
     /// # ⛔⛔ `subscripts_map` IS COMPUTED, RETURNED, AND READ BY NOBODY
     ///
     /// The reference rewrites its `subscripts_map` out-parameter to a map over the explicit loops
-    /// (`Agen/Utils.cpp:477-478`) — and then `splitMutableAddr` calls
+    /// (`Agen/Utils.cpp:476-477`) — and then `transformCompLoadAndStore` calls
     /// `createPartitions(mas_data, partition_sizes, op, ad.getSubscriptsMap(), createOps)` (`:533`),
     /// passing the ORIGINAL map off the access details, and it is that one every partition's
     /// `new_subscripts_map` descends from. The local the pass just had rewritten is dead.
@@ -5939,7 +5940,7 @@ pub struct TimeLoopNest {
     /// ⭐ WHICH IS EXACTLY WHAT THE VENDOR'S OWN ANSWER KEY SHOWS. The partitioned transfer prints
     /// `dst:%[[VAL_16]][0, %[[VAL_9]] * 16, %[[VAL_10]] * 8]` — the two-dimensional map it started
     /// with — while `indices` has grown a third entry, the new loop's induction variable
-    /// (`dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_time_dims.mlir:40`). The extra
+    /// (`dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_time_dims.mlir:39`). The extra
     /// operand is invisible because `printAffineMapOfSSAIds` prints only `numDims + numSymbols` of
     /// them and `AgenOps.cpp`'s verifier does not count them either.
     ///
@@ -6036,11 +6037,11 @@ pub enum ExplicitTimeLoops {
     },
 
     /// `ad.getTimeOrder()` IS NULL — `updateTimeSetForExplicitDims` calls `getResult` and
-    /// `getDimPosition` on it (`Agen/Utils.cpp:487`, `:496`).
+    /// `getDimPosition` on it (`Agen/Utils.cpp:489`, `:497`).
     TimeOrderIsAbsent,
 
     /// `time_order.getResult(dim)` PAST THE END, for a `dim` in `0..=time_dim`
-    /// (`Agen/Utils.cpp:487`).
+    /// (`Agen/Utils.cpp:489`).
     TimeOrderHasNoDimension {
         /// `time_dim`.
         time_dim: usize,
@@ -6049,7 +6050,7 @@ pub enum ExplicitTimeLoops {
     },
 
     /// `time_order.getDimPosition(dim)` ON A RESULT THAT IS NOT A BARE DIMENSION
-    /// (`Agen/Utils.cpp:496`).
+    /// (`Agen/Utils.cpp:497`).
     ///
     /// ⛔ `cast<AffineDimExpr>` — not `dyn_cast`, so this is an abort and not a `nullptr`. A
     /// `time_order` is a permutation of the transfer's time dimensions by construction
@@ -6060,7 +6061,7 @@ pub enum ExplicitTimeLoops {
     },
 
     /// FEWER INDICES THAN THE SUBSCRIPTS MAP HAS DIMENSIONS — `indices[i]` for
-    /// `i < subscripts_map.getNumDims()` (`Agen/Utils.cpp:453`).
+    /// `i < subscripts_map.getNumDims()` (`Agen/Utils.cpp:454`).
     ///
     /// ⛔ THE TWO ARE ONE VALUE IN THE ACCESS DETAILS and disagreeing is a program neither
     /// `constructDetails` nor this pass can produce; it is stated because [`SubscriptsAndTime`] holds
@@ -6074,7 +6075,7 @@ pub enum ExplicitTimeLoops {
 
     /// A TIME DIMENSION USED BY THE SUBSCRIPTS WITH NO LOOP CREATED FOR IT.
     ///
-    /// ⛔ `DT_CHECK((i - num_orig_dims) < for_ops.size())` (`Agen/Utils.cpp:471`).
+    /// ⛔ `DT_CHECK((i - num_orig_dims) < for_ops.size())` (`Agen/Utils.cpp:470`).
     ///
     /// ⭐ STRUCTURALLY UNREACHABLE WHEN THE TWO ARE PAIRED AS THE REFERENCE PAIRS THEM: the branch
     /// that indexes `for_ops` is guarded by `i <= actual_preserve_dim`, i.e.
@@ -6161,7 +6162,7 @@ impl ExplicitTimeLoops {
 /// `time_set` describes and the hardware performs inside one op. So this function writes the
 /// `affine.for` that binds it, from the OUTERMOST time dimension down to the one being split, moves
 /// the transfer inside, and fills in the induction variables [`construct_conditionals`] will compare
-/// (`:491` runs before `:494`'s `createPartitions`). ⛔ Without it, that function's
+/// (`:491` runs before `:533`'s `createPartitions`). ⛔ Without it, that function's
 /// [`ConditionalTree::DimensionHasNoIterator`] is the only possible answer.
 ///
 /// ⭐ ONLY DOWN TO THE SPLIT DIMENSION, under the reference's own note: *"Time loops are created
@@ -6173,7 +6174,7 @@ impl ExplicitTimeLoops {
 ///
 /// `time_bounds` and `time_offsets` are ordered by `time_order` RESULT POSITION — outermost first —
 /// because `calculateTimeOffsets` and `calculateTimeBounds` walk `time_order.getResults()`
-/// (`dialect_utils/Agen/Utils.cpp:104-140`). `constructExplicitTimeLoops` therefore builds
+/// (`dialect_utils/Agen/Utils.cpp:115`, `:254`). `constructExplicitTimeLoops` therefore builds
 /// `for_ops[dim]` with `time_bounds[dim]`, i.e. in that same outermost-first order. ⛔ But
 /// `updateSubscriptsAndIndicesForExplicitTimeLoops` reaches for `for_ops[i - num_orig_dims]`
 /// (`Agen/Utils.cpp:472`) where `i` is a dimension of the TIME ADDRESS MAP — the transfer's own

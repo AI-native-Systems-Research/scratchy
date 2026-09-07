@@ -906,7 +906,7 @@ pub enum ExpandAffineApplyOps {
         applies: usize,
     },
     /// `apply_op.emitError("Failed to expand affine.apply operation"); signalPassFailure(); return;`
-    /// (`LoopUnrollForShuffleOp.cpp:203-207`) — `expandAffineMap` answered `std::nullopt`.
+    /// (`LoopUnrollForShuffleOp.cpp:201-203`) — `expandAffineMap` answered `std::nullopt`.
     ///
     /// ⭐ THE CAUSE IS CARRIED, WHICH THE REFERENCE'S ONE MESSAGE DOES NOT DO — see [`Expansion`].
     FailedToExpand {
@@ -916,7 +916,7 @@ pub enum ExpandAffineApplyOps {
         cause: FailedToExpand,
     },
     /// `apply_op.emitOpError("Expanded affine.apply operation does not resolve to a constant");
-    /// signalPassFailure(); return;` (`:225-230`).
+    /// signalPassFailure(); return;` (`:227-230`).
     ///
     /// ⛔⛔ THE PASS'S REAL ASSERTION, AND THE ONE THAT FIRES. An `affine.apply` survives to here only
     /// if the loop it indexed was fully unrolled, so every operand should be an `arith.constant` and
@@ -945,7 +945,7 @@ impl ExpandAffineApplyOps {
 ///
 /// # ⛔⛔ THIS IS AN ASSERTION DRESSED AS A REWRITE
 ///
-/// It runs last in `LoopUnrollForShuffleOp` (`:130`), after every loop feeding a
+/// It runs last in `LoopUnrollForShuffleOp` (`:136`), after every loop feeding a
 /// `vectorchain.shuffle` has been fully unrolled. At that point every `affine.apply` left in the unit
 /// indexes a *known* iteration, so expanding it must land on a literal — and this function stops the
 /// compile when it does not. The rewrite is real (the ops are built, the uses re-pointed, the apply
