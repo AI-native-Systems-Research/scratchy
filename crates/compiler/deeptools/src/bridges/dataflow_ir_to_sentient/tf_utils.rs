@@ -62,6 +62,7 @@
 use crate::islands::dataflow_ir::dialects::{
     Op as DfirOp, Val, affine, arith, block_args, defining_op, regions, scf,
 };
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 
 /// A CONSTANT LOOP BOUND — `getConstantLowerBound()` / `getConstantUpperBound()`.
 ///
@@ -861,5 +862,311 @@ mod unit_tests {
                 .iterations
                 .get()
         );
+    }
+
+    /// 🎯 264/384 — ONE MORE ITER_ARG ON AN `scf.for`, AND THE FILL THAT MAKES IT A ONE.
+    /// `arith::ConstantIndexOp::create(builder, loc, 1)` is the scf arm's init (`Utils.cpp:65`, where
+    /// the affine arm writes 0 at `:44`); `copyLoopBody` gives the added arg a yield of ITSELF
+    /// (`dcc/src/Utils/Utils.cpp:374-381`) and the old result is replaced positionally (`:81-83`).
+    #[test]
+    fn an_scf_loop_gains_an_iter_arg_initialised_to_one() {
+        let source = DfirOp::Scf(scf::Op::For {
+            iv: Val(110),
+            lo: Val(101),
+            hi: Val(102),
+            step: Val(103),
+            carried: vec![affine::Carried {
+                init: Val(104),
+                arg: Val(111),
+                result: Val(112),
+            }],
+            body: vec![DfirOp::Scf(scf::Op::Yield {
+                operands: vec![Val(111)],
+            })],
+            dbg_name: Some("mb-chunk/5".to_owned()),
+        });
+        let mut vals = Values::default();
+
+        let grown = create_for_op_with_additional_return_value(
+            &mut vals,
+            &CountedLoop::of(&source).expect("an scf.for is one of the two arms"),
+            1,
+            false,
+        );
+
+        assert_eq!(
+            vec![DfirOp::Arith(arith::Op::Constant {
+                result: Val(0),
+                value: 1,
+            })],
+            grown.consts
+        );
+        assert_eq!(vec![(Val(112), Val(1))], grown.replacements);
+        assert_eq!(
+            DfirOp::Scf(scf::Op::For {
+                iv: Val(3),
+                lo: Val(101),
+                hi: Val(102),
+                step: Val(103),
+                carried: vec![
+                    affine::Carried {
+                        init: Val(104),
+                        arg: Val(4),
+                        result: Val(1),
+                    },
+                    affine::Carried {
+                        init: Val(0),
+                        arg: Val(5),
+                        result: Val(2),
+                    },
+                ],
+                body: vec![DfirOp::Scf(scf::Op::Yield {
+                    operands: vec![Val(4), Val(5)],
+                })],
+                dbg_name: Some("mb-chunk/5".to_owned()),
+            }),
+            grown.op
+        );
+        // ⛔ AND THE MAPPING IS READABLE BECAUSE `delete_op` WAS FALSE (`Utils.hpp:41-44`).
+        assert_eq!(
+            Some(Val(3)),
+            grown
+                .ir_map
+                .expect("delete_op was false")
+                .lookup(Val(110))
+        );
+    }
+}
+
+/// WHICH BOUNDS THE LOOP HAS — the two `dyn_cast`s of `Utils.cpp:36` and `:58`, and the one place the
+/// two arms of entry 264 differ apart from the fill constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountedBounds {
+    /// `affine::AffineForOp`: `getLowerBoundOperands()`/`getLowerBoundMap()` and the upper pair,
+    /// passed through unchanged.
+    Affine { lo: affine::Bound, hi: affine::Bound },
+    /// `scf::ForOp`: `getLowerBound()`, `getUpperBound()`, `getStep()`, passed through unchanged.
+    Scf { lo: Val, hi: Val, step: Val },
+}
+
+/// THE LOOP `createForOpWithAdditionalReturnValue` ADMITS.
+///
+/// ⚠️ THIS TYPE IS WHAT `DT_CHECK(ret_op != nullptr)` (`:88`) GUARDS THERE. A `loop_op` that is
+/// neither `affine.for` nor `scf.for` leaves `ret_op` null and the reference dereferences it a line
+/// EARLIER (`ret_op->getResult(i)`, `:82`); here [`CountedLoop::of`] declines instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountedLoop<'a> {
+    /// Which dialect's `for` it is, with its bounds.
+    pub bounds: CountedBounds,
+    /// `getInductionVar()` — the body's first block argument.
+    pub iv: Val,
+    /// `getInits()` with the region iter args and results they bind.
+    pub carried: &'a [affine::Carried],
+    /// `getBody()->getOperations()`, terminator included.
+    pub body: &'a [DfirOp],
+    /// `dataflow::getDbgNameAttr(loop_op)`.
+    pub dbg_name: Option<&'a str>,
+}
+
+impl<'a> CountedLoop<'a> {
+    /// `dyn_cast<affine::AffineForOp>(loop_op)`, then `dyn_cast<scf::ForOp>(loop_op)`.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<CountedLoop<'a>> {
+        match op {
+            DfirOp::Affine(affine::Op::For {
+                iv,
+                lo,
+                hi,
+                carried,
+                body,
+                dbg_name,
+            }) => Some(CountedLoop {
+                bounds: CountedBounds::Affine { lo: *lo, hi: *hi },
+                iv: *iv,
+                carried,
+                body,
+                dbg_name: dbg_name.as_deref(),
+            }),
+            DfirOp::Scf(scf::Op::For {
+                iv,
+                lo,
+                hi,
+                step,
+                carried,
+                body,
+                dbg_name,
+            }) => Some(CountedLoop {
+                bounds: CountedBounds::Scf {
+                    lo: *lo,
+                    hi: *hi,
+                    step: *step,
+                },
+                iv: *iv,
+                carried,
+                body,
+                dbg_name: dbg_name.as_deref(),
+            }),
+            // ⭐ NO WILDCARD: a tenth region-carrying op is not a counted loop until this says so.
+            DfirOp::Affine(_)
+            | DfirOp::Scf(_)
+            | DfirOp::Arith(_)
+            | DfirOp::Dataflow(_)
+            | DfirOp::Agen(_)
+            | DfirOp::Vector(_)
+            | DfirOp::VectorChain(_)
+            | DfirOp::Uniform(_)
+            | DfirOp::Symbol(_) => None,
+        }
+    }
+}
+
+/// THE LOOP ENTRY 264 PUTS IN PLACE OF ITS INPUT, with what the caller has to do around it.
+///
+/// ⚠️ NOT [`PartialEq`]: [`ValueMapping`] deliberately is not, because two mappings with the same
+/// answers hold different pairs once one has shadowed an entry.
+#[derive(Debug, Clone)]
+pub struct ForOpWithExtraResults {
+    /// The `arith::ConstantIndexOp`s that initialise the added iter_args, in creation order — they go
+    /// BEFORE the loop, where `OpBuilder builder(loop_op)` puts them (`:33`, `:43-46`).
+    pub consts: Vec<DfirOp>,
+    /// The new `affine.for` or `scf.for`, `n_values` results and iter_args wider than the old one.
+    pub op: DfirOp,
+    /// `loop_op->getResult(i).replaceAllUsesWith(ret_op->getResult(i))`, old → new, positionally over
+    /// the OLD result count (`:81-83`).
+    pub replacements: Vec<(Val, Val)>,
+    /// `IRMapping& ir_map` over the old body's values.
+    ///
+    /// ⛔ [`None`] WHERE THE REFERENCE ERASED THE OLD LOOP — *"Only valid for use if delete_op was
+    /// false"* (`Utils.hpp:41-44`), and two of the four callers pass `false` precisely to read it
+    /// (`TransformPagedMemViewImpl.cpp:452-453`, `AgenToSentient/Helper.cpp:1067-1068`).
+    pub ir_map: Option<ValueMapping>,
+}
+
+/// Replaces: e264_createForOpWithAdditionalReturnValue
+///
+/// **264/384** `createForOpWithAdditionalReturnValue` —
+/// `dcc/src/Transform/Dataflow/Utils.cpp:28` (66L).
+///
+/// ⛔ THE FILL IS 0 IN THE AFFINE ARM AND 1 IN THE SCF ARM (`:44` against `:65`) — one function, two
+/// constants. ⚠️ `getStepAsInt()` is passed through and this island's `affine.for` carries no step
+/// ([`affine::Op::For`]), which makes that pass-through the identity.
+#[must_use]
+pub fn create_for_op_with_additional_return_value(
+    vals: &mut Values,
+    loop_op: &CountedLoop<'_>,
+    n_values: usize,
+    delete_op: bool,
+) -> ForOpWithExtraResults {
+    // `arith::ConstantIndexOp::create(builder, loop_op->getLoc(), 0)` in the affine arm, `.., 1)` in
+    // the scf arm — ⛔ THE ONE VALUE THAT IS NOT THE SAME IN THE TWO OTHERWISE IDENTICAL BRANCHES.
+    let fill = match loop_op.bounds {
+        CountedBounds::Affine { .. } => 0,
+        CountedBounds::Scf { .. } => 1,
+    };
+
+    // `for (auto operand : getInits()) iter_args.push_back(operand);` then the new constants, which
+    // are created BEFORE the loop and so take their values first.
+    let mut consts: Vec<DfirOp> = Vec::with_capacity(n_values);
+    let mut inits: Vec<Val> = loop_op.carried.iter().map(|source| source.init).collect();
+    for _ in 0..n_values {
+        let result = vals.mint();
+        consts.push(DfirOp::Arith(arith::Op::Constant {
+            result,
+            value: fill,
+        }));
+        inits.push(result);
+    }
+
+    // `AffineForOp::create(..)` / `ForOp::create(..)`: the results first, then the induction variable,
+    // then the region's iter args — the order MLIR defines and prints them in.
+    let results: Vec<Val> = inits.iter().map(|_| vals.mint()).collect();
+    let iv = vals.mint();
+    let carried: Vec<affine::Carried> = inits
+        .iter()
+        .zip(&results)
+        .map(|(init, result)| affine::Carried {
+            init: *init,
+            arg: vals.mint(),
+            result: *result,
+        })
+        .collect();
+
+    // `ir_map = copyLoopBody(from, new_loop, builder, n_values)` — `dcc/src/Utils/Utils.cpp:358`, a
+    // template that is not a campaign unit, so it is inlined here.
+    //
+    // `bv_map.map(getBody()->getArguments(), to_loop.getBody()->getArguments())` — ⭐ THE ZIP
+    // TRUNCATES: the new body has `n_values` MORE arguments and `llvm::zip` stops at the shorter
+    // range, so the added ones are deliberately left unmapped.
+    let mut ir_map = ValueMapping::new();
+    ir_map.map(loop_op.iv, iv);
+    for (source, new) in loop_op.carried.iter().zip(&carried) {
+        ir_map.map(source.arg, new.arg);
+    }
+
+    // `for (auto &it : from_loop.getBody()->getOperations()) builder.clone(it, bv_map);` — the
+    // terminator with them, which is how the new loop gets one at all.
+    let mut body = vals.clone_ops(loop_op.body, &mut ir_map);
+
+    // `for (int i = n_values; i > 0; i--) yield_args.push_back(getRegionIterArgs()[n_reg_iter - i]);`
+    // — the LAST `n_values` iter args, ascending: each added value yields ITSELF, so the loop carries
+    // the constant through untouched until a caller rewrites the yield.
+    let added: Vec<Val> = carried[carried.len() - n_values..]
+        .iter()
+        .map(|new| new.arg)
+        .collect();
+
+    // `yield_op->setOperands(yield_args)` over `to_loop.getBody()->getTerminator()`.
+    match body.last_mut() {
+        Some(
+            DfirOp::Affine(affine::Op::Yield { operands })
+            | DfirOp::Scf(scf::Op::Yield { operands }),
+        ) => operands.extend(added),
+        // ⚠️ `getTerminator()` IS A NULL DEREFERENCE THERE FOR A BODY THAT HAS NONE, which this
+        // island can hold. The terminator MLIR's verifier requires is emitted instead of a stop, as
+        // `transform_scf_to_affine_loop` does for the same case.
+        _ => body.push(match loop_op.bounds {
+            CountedBounds::Affine { .. } => DfirOp::Affine(affine::Op::Yield { operands: added }),
+            CountedBounds::Scf { .. } => DfirOp::Scf(scf::Op::Yield { operands: added }),
+        }),
+    }
+
+    // `if (auto dbg_name_attr = getDbgNameAttr(loop_op)) setDbgNameAttr(new_loop, dbg_name_attr);`,
+    // and with it the `for (auto attr : loop_op->getAttrs())` loop at `:85-90`: `dbgName` is the only
+    // attribute an island `for` carries, and `operandSegmentSizes` — the one that loop excludes — is
+    // MLIR's own operand bookkeeping, which a typed field cannot have.
+    let dbg_name = loop_op.dbg_name.map(str::to_owned);
+    let op = match loop_op.bounds {
+        CountedBounds::Affine { lo, hi } => DfirOp::Affine(affine::Op::For {
+            iv,
+            lo,
+            hi,
+            carried,
+            body,
+            dbg_name,
+        }),
+        CountedBounds::Scf { lo, hi, step } => DfirOp::Scf(scf::Op::For {
+            iv,
+            lo,
+            hi,
+            step,
+            carried,
+            body,
+            dbg_name,
+        }),
+    };
+
+    ForOpWithExtraResults {
+        consts,
+        op,
+        // `for (int i = 0; i < loop_op->getNumResults(); i++)` — the OLD count, so the zip ends there.
+        replacements: loop_op
+            .carried
+            .iter()
+            .map(|source| source.result)
+            .zip(results)
+            .collect(),
+        // `if (delete_op) loop_op->erase();` — the erasure is the caller's, and it is what invalidates
+        // the mapping.
+        ir_map: if delete_op { None } else { Some(ir_map) },
     }
 }

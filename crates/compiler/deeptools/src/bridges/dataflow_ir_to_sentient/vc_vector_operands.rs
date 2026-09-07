@@ -709,7 +709,7 @@ pub const fn const_val_to_field(const_val: ConstantOperandValue) -> sen::Port {
 /// `tf_cfg_simplification_dataflow_level.rs` records against its own conditional walk — so the
 /// flattening is unobservable today.
 #[must_use]
-fn op_at<'a>(id: &OpId, scope: &'a [DfirOp]) -> Option<&'a DfirOp> {
+pub(super) fn op_at<'a>(id: &OpId, scope: &'a [DfirOp]) -> Option<&'a DfirOp> {
     let (first, rest) = id.path().split_first()?;
     let mut op = scope.get(*first as usize)?;
     for ordinal in rest {
@@ -820,7 +820,7 @@ fn has_no_uses(id: &OpId, scope: &[DfirOp]) -> bool {
 /// ⛔ AND IT DESCENDS INTO REGIONS, because [`uses`] does. A result read by an op inside an
 /// `affine.for` body has a user, and a walk that stopped at the top level would erase the definition
 /// out from under it.
-fn use_positions(of: &OpId, scope: &[DfirOp]) -> Vec<OpId> {
+pub(super) fn use_positions(of: &OpId, scope: &[DfirOp]) -> Vec<OpId> {
     let Some(op) = op_at(of, scope) else {
         return Vec::new();
     };
@@ -867,7 +867,7 @@ fn collect_use_positions(
 ///
 /// ⛔ A PATH THAT NAMES NOTHING REMOVES NOTHING. There is no other total answer, and the reference
 /// cannot reach the case — `Operation::erase()` takes a live pointer.
-fn remove_at(path: &[u32], scope: &mut Vec<DfirOp>) {
+pub(super) fn remove_at(path: &[u32], scope: &mut Vec<DfirOp>) {
     let Some((first, rest)) = path.split_first() else {
         return;
     };
@@ -1437,7 +1437,7 @@ fn dim_of(val: Val, operands: &mut Vec<Val>) -> u32 {
 ///
 /// ⛔ A BLOCK ARGUMENT HAS NO DEFINING OP AND ANSWERS `None`, exactly as MLIR's own accessor does —
 /// `getDefiningOp()` returns null for one. A loop induction variable is the case that reaches this.
-fn defining_position(val: Val, scope: &[DfirOp]) -> Option<OpId> {
+pub(super) fn defining_position(val: Val, scope: &[DfirOp]) -> Option<OpId> {
     find_defining_position(val, scope, &[], 0)
 }
 
