@@ -6,7 +6,9 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::{Index, Val};
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet, MemRef, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, Constraint, IntegerSet, MemRef, Vector,
+};
 
 /// A `composite_load_and_store`'s operands and attributes.
 ///
@@ -137,8 +139,8 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::val(*result),
                 print::val(*view),
                 print::index_list(indices),
-                identity_map(view_ty.shape.len()),
-                lane_set(view_ty, ty.len),
+                print::affine_map(&access_order(view_ty.shape.len())),
+                print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
                 print::vector(*ty)
             );
@@ -223,8 +225,8 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::val(*value),
                 print::val(*view),
                 print::index_list(indices),
-                identity_map(view_ty.shape.len()),
-                lane_set(view_ty, ty.len),
+                print::affine_map(&access_order(view_ty.shape.len())),
+                print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
                 print::vector(*ty)
             );
@@ -232,15 +234,20 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
     }
 }
 
-/// `affine_map<(d0, .., dn) -> (d0, .., dn)>` — the identity over `rank` dims.
+/// `affine_map<(d0, .., dn) -> (d0, .., dn)>` — the `load_order`/`store_order` of a vector access.
 ///
 /// ⭐ `load_order`/`store_order` SAY WHICH AXIS MOVES FASTEST, and the scheduler writes the identity
 /// for every access in its own output (`#map4`, `#map8`). Row-major order is what the view's own
 /// `layout_map` already states, so ordering it again differently would be two answers to one
 /// question.
-fn identity_map(rank: usize) -> String {
-    let dims: Vec<String> = (0..rank).map(|d| format!("d{d}")).collect();
-    format!("affine_map<({}) -> ({})>", dims.join(", "), dims.join(", "))
+///
+/// ⛔ TYPED RATHER THAN PRINTED, BECAUSE THE LOWERING READS IT. `AccessDetailsAffine::initialize`
+/// takes `load_op.getLoadOrder()` into `transfer_order_` (`AccessDetails.cpp:299`) and
+/// `checkBasicConditions` asks it for an inverse permutation (`Helper.cpp:143`); a `String` answers
+/// neither. [`emit`] prints what this returns, so the two cannot drift.
+#[must_use]
+pub fn access_order(rank: usize) -> AffineMap {
+    AffineMap::identity(u32::try_from(rank).expect("a rank fits a u32"))
 }
 
 /// `affine_set<(d0, .., dn) : (d0 == 0, .., dn >= 0, -dn + LANES-1 >= 0)>` — which lanes are live.
@@ -255,18 +262,35 @@ fn identity_map(rank: usize) -> String {
 /// load — the single activation the PT's west port takes — is `vector<1xf16>` out of a
 /// `memref<8x2x64xf16>`, and the backend refuses the mismatch outright: "Number of elements in
 /// return type not matching with load_set/store_set elements".
-fn lane_set(ty: &MemRef, lanes: u64) -> String {
-    let rank = ty.shape.len();
-    let dims: Vec<String> = (0..rank).map(|d| format!("d{d}")).collect();
-    let last = rank.saturating_sub(1);
-    let mut constraints: Vec<String> = (0..last).map(|d| format!("d{d} == 0")).collect();
-    constraints.push(format!("d{last} >= 0"));
-    constraints.push(format!("-d{last} + {} >= 0", lanes.saturating_sub(1)));
-    format!(
-        "affine_set<({}) : ({})>",
-        dims.join(", "),
-        constraints.join(", ")
-    )
+///
+/// ⛔ THE LANE AXIS SPANS EVEN FOR ONE LANE — `d{last} >= 0, -d{last} + 0 >= 0`, the pair, and not
+/// the `d{last} == 0` [`IntegerSet::from_sizes`] would write. The two are the same set; this is the
+/// spelling the printed form has always carried, so it is the spelling the typed form states.
+#[must_use]
+pub fn access_set(view_ty: &MemRef, lanes: u64) -> IntegerSet {
+    let rank = view_ty.shape.len();
+    let last = u32::try_from(rank.saturating_sub(1)).expect("a rank fits a u32");
+    let mut constraints: Vec<Constraint> = (0..last)
+        .map(|d| Constraint {
+            expr: AffineExpr::dim(d),
+            is_equality: true,
+        })
+        .collect();
+    constraints.push(Constraint {
+        expr: AffineExpr::dim(last),
+        is_equality: false,
+    });
+    constraints.push(Constraint {
+        expr: AffineExpr::dim(last).times(-1).plus(AffineExpr::Const(
+            i64::try_from(lanes.saturating_sub(1)).unwrap_or(i64::MAX),
+        )),
+        is_equality: false,
+    });
+    IntegerSet {
+        dims: u32::try_from(rank).expect("a rank fits a u32"),
+        symbols: 0,
+        constraints,
+    }
 }
 
 #[cfg(test)]

@@ -117,13 +117,18 @@
 //! | `e374_lowerSymbolicVectorLoadOp` | 374/384 | 26 | `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380` |
 //! | `e375_lowerSymbolicVectorStoreOp` | 375/384 | 30 | `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410` |
 
-use super::agen_access_details::{AccessContainer, AccessDetailsSymbolic};
+use super::agen_access_details::{
+    AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsSymbolic,
+    IndicesCoeffDict, MemoryOperandIndex,
+};
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::islands::dataflow_ir::dialects::{
     self as dfir_op, Index, Op as DfirOp, Val, arith, dataflow, defining_op, results, uses,
 };
 use crate::islands::dataflow_ir::link::SendEnd;
-use crate::islands::dataflow_ir::ty::{AffineMap, GenericComp, MemRef, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineMap, FlatConstraints, GenericComp, IntegerSet, MemRef, Vector,
+};
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
 use crate::units::DfirUnit;
@@ -1366,6 +1371,14 @@ impl Marked {
     #[must_use]
     pub fn holds(&self, position: usize) -> bool {
         self.0.contains(&position)
+    }
+
+    /// `op->setAttr("marked", builder.getI8IntegerAttr(1))` — the mark
+    /// `gatherAffineLoadStoreDetails` leaves so the op can be found again (`Helper.cpp:545-547`).
+    ///
+    /// ⛔ THE VALUE IS NEVER READ, only the attribute's presence, which is why this takes none.
+    pub fn mark(&mut self, position: usize) {
+        self.0.insert(position);
     }
 }
 
@@ -3206,6 +3219,245 @@ mod unit_tests {
             CreatedUniformize::NoActiveOp
         );
     }
+
+    // ─────────────────────────────── 210/384 ───────────────────────────────
+
+    /// The vendor's own unsplit 64-lane composite (`lx_indirect_loads_stores_composite.mlir`), whose
+    /// sets and orders the transfer planner derives.
+    fn composite_transfer() -> agen::Op {
+        use crate::bridges::subtile_to_dataflow_ir::transfer::{Lanes, plan};
+
+        let planned = plan(&[1, 1, 64], &[1, 1, 1, 1, 64], 64, Lanes::F16)
+            .expect("one 64-lane vector is the unsplit case");
+        agen::Op::CompositeLoadAndStore(Box::new(agen::CompositeTransfer {
+            src: Val(21),
+            src_indices: vec![Index::Val(Val(1)), Index::Val(Val(4)), Index::Const(0)],
+            src_ty: MemRef {
+                shape: vec![12, 64, 64],
+                elem: ElemType::F16,
+            },
+            dst: Val(27),
+            dst_indices: vec![Index::Const(0); 5],
+            dst_ty: MemRef {
+                shape: vec![2, 2, 1, 1, 64],
+                elem: ElemType::F16,
+            },
+            load_iv: Val(9),
+            load_iv_ty: Vector {
+                len: planned.vector_lanes,
+                elem: ElemType::F16,
+            },
+            load_set: planned.load_set,
+            load_order: planned.load_order,
+            store_set: planned.store_set,
+            store_order: planned.store_order,
+            time_set: planned.time_set,
+            time_order: planned.time_order,
+            load_time_addr_map: planned.load_time_addr_map,
+            store_time_addr_map: planned.store_time_addr_map,
+            body: vec![DfirOp::Agen(agen::Op::Yield)],
+        }))
+    }
+
+    /// ⛔ A COMPOSITE IS ASKED ABOUT ITS TIME ORDER TOO, and a constant result names no dimension —
+    /// `inversePermutation` returns null and the transfer is refused.
+    #[test]
+    fn the_composites_orders_are_permutations_and_a_constant_time_order_is_not() {
+        let op = DfirOp::Agen(composite_transfer());
+        assert_eq!(
+            check_basic_conditions(CheckedOp::Dfir(&op)),
+            BasicConditions::Admissible
+        );
+
+        let mut bent = composite_transfer();
+        if let agen::Op::CompositeLoadAndStore(transfer) = &mut bent {
+            transfer.time_order.results = vec![AffineExpr::Const(0)];
+        }
+        let bent = DfirOp::Agen(bent);
+        assert_eq!(
+            check_basic_conditions(CheckedOp::Dfir(&bent)),
+            BasicConditions::TimeOrderNotAPermutation
+        );
+
+        // `:139-142` — an already-lowered store answers on the mark alone.
+        assert_eq!(
+            check_basic_conditions(CheckedOp::ReceiveAndStore { marked: false }),
+            BasicConditions::NotMarked
+        );
+    }
+
+    // ─────────────────────────────── 211/384 ───────────────────────────────
+
+    /// One `sentient.load_and_send` of `extent`, which is all the interleave check reads off it.
+    fn sent_load_and_send(extent: sen::Extent) -> SenOp {
+        SenOp::Sentient(sen::Op::LoadAndSend {
+            mutable_addr: Val(1),
+            immutable_addr: Val(2),
+            increment: Val(3),
+            consumer: Link::<LxluUnit, L0suUnit>::between(Val(4), Val(5)).ends().0,
+            result: Val(6),
+            extent,
+            interleaved_group: 0,
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: sen::ShuffleMode::NoShuffle,
+            reg: sen::Reg {
+                locale: sen::RegType::Unknown,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// ⛔ THE REGION MUST AGREE ON THE BURST, so two sends of the same extent pass and one raised
+    /// burst refuses the whole interleave.
+    #[test]
+    fn an_interleaved_region_agrees_on_the_burst_or_is_refused() {
+        let mut extent = sen::Extent::of(Elements(64), Bytes(2));
+        extent.burst_size = Elements(8);
+        let region = [
+            sent_load_and_send(extent),
+            sent_load_and_send(extent),
+            SenOp::Agen(agen::Op::Yield),
+        ];
+        let interleave = MemoryInterleave {
+            granularity: Some(Elements(8)),
+            region: &region,
+        };
+        assert_eq!(
+            process_interleave_op::<Dd2>(DfirUnit::L3lu, &interleave),
+            InterleaveCheck::Admissible
+        );
+
+        // ⛔ AN L3 UNIT IS THE FIRST GATE, before the granularity or the region.
+        assert_eq!(
+            process_interleave_op::<Dd2>(DfirUnit::Lxlu, &interleave),
+            InterleaveCheck::NotAnL3Unit
+        );
+
+        let mut louder = extent;
+        louder.burst_size = Elements(16);
+        let region = [
+            sent_load_and_send(extent),
+            sent_load_and_send(louder),
+            SenOp::Agen(agen::Op::Yield),
+        ];
+        assert_eq!(
+            process_interleave_op::<Dd2>(
+                DfirUnit::L3lu,
+                &MemoryInterleave {
+                    granularity: None,
+                    region: &region,
+                }
+            ),
+            InterleaveCheck::DifferentBurst
+        );
+    }
+
+    // ────────────────────────── 212/384 and 213/384 ──────────────────────────
+
+    /// An access record as entries 212 and 213 read one. ⛔ THE TRAIT'S TWO REAL INSTANTIATIONS ARE
+    /// BUILT BY UNITS THIS BATCH DOES NOT OWN, so the test states the three fields directly.
+    struct Record {
+        moi: MemoryOperandIndex,
+        start_addr: Option<Val>,
+        dict: IndicesCoeffDict,
+    }
+
+    impl AccessRecord for Record {
+        fn memory_index(&self) -> Option<MemoryOperandIndex> {
+            Some(self.moi)
+        }
+        fn mem_view_start_addr(&self) -> Option<Val> {
+            self.start_addr
+        }
+        fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
+            &self.dict
+        }
+    }
+
+    /// A record owning `moi`, whose view starts at `start_addr`.
+    fn record(moi: MemoryOperandIndex, start_addr: u32) -> Record {
+        Record {
+            moi,
+            start_addr: Some(Val(start_addr)),
+            dict: IndicesCoeffDict::default(),
+        }
+    }
+
+    /// ⛔ NO ACCESS DETAILS IS THE ONE INPUT ENTRY 357 PROVABLY LEAVES ALONE — the gather still marks
+    /// the op and still runs the immutable addresses, which have nothing to place.
+    #[test]
+    fn the_empty_gather_marks_the_op_and_places_no_address() {
+        let mut marked = Marked::at([]);
+        let details = AccessContainer::<Record>::default();
+        let mut mutable_addrs = AccessContainer::<Val>::default();
+        let mut immutable_addrs = AccessContainer::<Val>::default();
+
+        assert_eq!(
+            gather_affine_load_store_details(
+                7,
+                &mut marked,
+                DfirUnit::Lxlu,
+                &details,
+                &mut mutable_addrs,
+                &mut immutable_addrs
+            ),
+            GatheredDetails::Gathered
+        );
+        assert!(marked.holds(7), "`:545-547` sets the attribute");
+        assert!(immutable_addrs.entries().is_empty());
+        assert!(mutable_addrs.entries().is_empty());
+    }
+
+    /// ⛔⛔ THE L3 ARM READS THE RECORD AND THE OTHER ARM READS BY POSITION, so the same two records
+    /// give the view's own start addresses on an L3 half and the updated ones anywhere else.
+    #[test]
+    fn the_l3_immutable_address_is_the_views_own_and_elsewhere_it_is_the_updated_one() {
+        let mut details = AccessContainer::<Record>::default();
+        for (moi, addr) in [
+            (MemoryOperandIndex::DirSrc, 11),
+            (MemoryOperandIndex::DirDst, 12),
+        ] {
+            if let Some(slot) = details.vacancy(moi) {
+                slot.fill(record(moi, addr));
+            }
+        }
+        let mut updated = AccessContainer::<Val>::default();
+        for (moi, addr) in [
+            (MemoryOperandIndex::DirSrc, 101),
+            (MemoryOperandIndex::DirDst, 102),
+        ] {
+            if let Some(slot) = updated.vacancy(moi) {
+                slot.fill(Val(addr));
+            }
+        }
+
+        let mut elsewhere = AccessContainer::<Val>::default();
+        assert_eq!(
+            construct_immutable_address(DfirUnit::Lxlu, &details, &updated, &mut elsewhere),
+            ImmutableAddresses::Constructed
+        );
+        assert_eq!(elsewhere.entries(), &[Val(101), Val(102)]);
+
+        let mut on_l3 = AccessContainer::<Val>::default();
+        assert_eq!(
+            construct_immutable_address(DfirUnit::L3lu, &details, &updated, &mut on_l3),
+            ImmutableAddresses::Constructed
+        );
+        assert_eq!(on_l3.entries(), &[Val(11), Val(12)]);
+
+        // `:1221` — the bare `failure()` when the two containers disagree.
+        assert_eq!(
+            construct_immutable_address(
+                DfirUnit::L3lu,
+                &details,
+                &AccessContainer::<Val>::default(),
+                &mut AccessContainer::<Val>::default()
+            ),
+            ImmutableAddresses::SizeMismatch
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -4323,4 +4575,577 @@ pub fn create_uniformize_regions_op(
         // `:3923-3925`.
         active: num_of_regions > 1,
     }))
+}
+
+/// WHAT `checkBasicConditions` IS HANDED — any DataflowIR op, or the one SentientIR op its
+/// `dyn_cast` chain also accepts.
+///
+/// ⭐ `sentient::ReceiveAndStoreOp` IS IN THAT CHAIN (`Helper.cpp:139-142`) because the pass revisits
+/// ops it has already lowered, and the ONLY thing it reads off one is `hasAttr("marked")` — so that
+/// bool is the whole arm. See [`Marked`] for where the attribute lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedOp<'a> {
+    /// An op of the DataflowIR being lowered.
+    Dfir(&'a DfirOp),
+    /// An already-lowered `sentient.receive_and_store`, with whether it carries the mark.
+    ReceiveAndStore {
+        /// `recv_and_send_op->hasAttr("marked")`.
+        marked: bool,
+    },
+}
+
+/// THE OUTCOME OF [`check_basic_conditions`] — admissible, or WHICH of the reference's three
+/// diagnostics refused the op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum BasicConditions {
+    /// `LogicalResult::success()` (`:191`).
+    Admissible,
+    /// An unmarked `sentient.receive_and_store` — a bare `failure()` with no diagnostic (`:141`).
+    NotMarked,
+    /// *"Only permutations are allowed in the load order for lowering into sentient"* (`:145-151`).
+    DataOrderNotAPermutation,
+    /// *"The load set needs to be hyper rectangular for lowering into sentient"* (`:155-163`).
+    DataSetNotHyperRectangular,
+    /// *"Only permutations are allowed in the time order for lowering into sentient"* (`:168-175`).
+    TimeOrderNotAPermutation,
+}
+
+impl BasicConditions {
+    /// `success()` only for [`Self::Admissible`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, BasicConditions::Admissible)
+    }
+
+    /// The diagnostic the C++ emits, verbatim (`Helper.cpp:148-174`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            BasicConditions::Admissible | BasicConditions::NotMarked => None,
+            BasicConditions::DataOrderNotAPermutation => {
+                Some("Only permutations are allowed in the load order for lowering into sentient")
+            }
+            BasicConditions::DataSetNotHyperRectangular => {
+                Some("The load set needs to be hyper rectangular for lowering into sentient")
+            }
+            BasicConditions::TimeOrderNotAPermutation => {
+                Some("Only permutations are allowed in the time order for lowering into sentient")
+            }
+        }
+    }
+}
+
+/// Replaces: e210_checkBasicConditions
+///
+/// **210/384** `AgenToSentientLoweringPass::checkBasicConditions` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:58` (133L). Every transfer's data order must be a
+/// permutation and its data set a hyper rectangle; a composite's TIME order must be a permutation too.
+///
+/// ⛔ TWELVE `dyn_cast` ARMS COLLECT THE SAME TWO LISTS, and the class only decides how many go in:
+/// the load/store pair contribute one set and one order, the load-AND-store composites two of each.
+/// ⛔ THE TIME-ORDER CHECK IS NOT FOR EVERY COMPOSITE (`:167`): its `isa<>` names composite load,
+/// composite store and the two load-and-stores — the two INDIRECT single-ended composites set a
+/// `time_order` and are never asked about it.
+/// ⛔ AND THE TIME **SET** IS NOT CHECKED AT ALL — the reference's rectangularity test is commented out
+/// under *"TODO find out why time_set is not rectangle."* (`:177-187`), so it is not ported.
+/// ⛔ THE VECTOR PAIR'S SET AND ORDER ARE THE ISLAND'S DERIVED ONES ([`agen::access_set`],
+/// [`agen::access_order`]), so both checks pass by construction for them; a composite carries its own.
+/// ⛔ `signalPassFailure()` PRECEDES EVERY FAILURE AND IS NOT AN OUTCOME: the pass fails because the
+/// caller propagates this answer.
+pub fn check_basic_conditions(op: CheckedOp<'_>) -> BasicConditions {
+    let mut data_sets: Vec<IntegerSet> = Vec::new();
+    let mut data_orders: Vec<AffineMap> = Vec::new();
+    let mut time_order: Option<&AffineMap> = None;
+
+    match op {
+        // `:139-142` — the one arm that answers on its own.
+        CheckedOp::ReceiveAndStore { marked } => {
+            return if marked {
+                BasicConditions::Admissible
+            } else {
+                BasicConditions::NotMarked
+            };
+        }
+        // `:63-64`, `:71-72` — one set and one order each.
+        CheckedOp::Dfir(
+            DfirOp::Agen(dfir_op::agen::Op::VectorLoad { view_ty, ty, .. })
+            | DfirOp::Agen(dfir_op::agen::Op::VectorStore { view_ty, ty, .. }),
+        ) => {
+            data_sets.push(dfir_op::agen::access_set(view_ty, ty.len));
+            data_orders.push(dfir_op::agen::access_order(view_ty.shape.len()));
+        }
+        // `:125-133` — `CompositeLoadAndStoreOp`: two of each, a time order, and NO region check.
+        CheckedOp::Dfir(DfirOp::Agen(dfir_op::agen::Op::CompositeLoadAndStore(transfer))) => {
+            data_sets.push(transfer.load_set.clone());
+            data_sets.push(transfer.store_set.clone());
+            data_orders.push(transfer.load_order.clone());
+            data_orders.push(transfer.store_order.clone());
+            time_order = Some(&transfer.time_order);
+        }
+        // Every other op falls out of the chain with both lists empty and is admissible (`:191`).
+        CheckedOp::Dfir(_) => {}
+    }
+
+    // `:145-152` — `if (!inversePermutation(data_order))`.
+    if data_orders
+        .iter()
+        .any(|data_order| data_order.inverse_permutation().is_none())
+    {
+        return BasicConditions::DataOrderNotAPermutation;
+    }
+
+    // `:154-164` — `constraints.isHyperRectangular(0, constraints.getNumCols() - 1)`.
+    for data_set in &data_sets {
+        let constraints = FlatConstraints::from_integer_set(data_set);
+        if !constraints.is_hyper_rectangular(0, constraints.num_cols().saturating_sub(1)) {
+            return BasicConditions::DataSetNotHyperRectangular;
+        }
+    }
+
+    // `:166-176` — the composite time order, for the four classes named there.
+    if let Some(time_order) = time_order
+        && time_order.inverse_permutation().is_none()
+    {
+        return BasicConditions::TimeOrderNotAPermutation;
+    }
+    BasicConditions::Admissible
+}
+
+/// AN `agen.composite_memory_interleave`, AS THE CHECK READS IT — its `granularity` attribute and the
+/// operations in its region.
+///
+/// ⭐ A STRUCT FOR THE SAME REASON AS [`IndirectMemView`]: the op is not in either island — the region
+/// it carries holds SentientIR transfers by the time this runs, while the op itself is `agen` — and
+/// what the check reads off it is exactly these two things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryInterleave<'a> {
+    /// `getGranularity()` — [`None`] when the op carries no `granularity` attribute, which is the
+    /// reference's `hasAttr` test (`:324`).
+    pub granularity: Option<Elements>,
+    /// The region's operations in order, terminator included.
+    pub region: &'a [SenOp],
+}
+
+/// THE OUTCOME OF [`process_interleave_op`] — admissible, or WHICH of the reference's eight
+/// diagnostics refused the op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum InterleaveCheck {
+    /// `LogicalResult::success()` (`:385`).
+    Admissible,
+    /// *"only supported in L3 units"* (`:313-315`).
+    NotAnL3Unit,
+    /// *"illegal granularity setting"* (`:326-329`) — zero, or above the unit's burst size.
+    IllegalGranularity,
+    /// *"region does not contain enough operations"* (`:336-340`) — two transfers plus the yield.
+    RegionTooSmall,
+    /// *"invalid operation in region (no burst_size attribute)"* (`:345-349`).
+    ///
+    /// ⛔ THE FIRST REGION OP IS ASKED FOR ITS ATTRIBUTES BEFORE ANYTHING ASKS WHAT IT IS, which is
+    /// why an op outside the transfer family lands here rather than on
+    /// [`Self::InvalidOperationInRegion`].
+    NoBurstSizeAttribute,
+    /// *"invalid operation in region (no total_elements attribute)"* (`:353-357`).
+    ///
+    /// ⛔ STRUCTURALLY UNREACHABLE HERE: the two attributes are one [`sen::Extent`] on the island, so
+    /// an op that carries `burst_size` carries `total_elements` with it.
+    NoTotalElementsAttribute,
+    /// *"invalid operation found in op region"* (`:366-368`) — not one of the three transfers.
+    InvalidOperationInRegion,
+    /// *"operation with different burst found"* (`:370-373`).
+    DifferentBurst,
+    /// *"operation with different total_elements found"* (`:375-378`).
+    DifferentTotalElements,
+    /// *"operation with unexpected operation type found"* (`:380-382`) — a region mixing two of the
+    /// three transfer classes, which agree on burst and count.
+    UnexpectedOperationType,
+}
+
+impl InterleaveCheck {
+    /// `success()` only for [`Self::Admissible`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, InterleaveCheck::Admissible)
+    }
+
+    /// The diagnostic the C++ emits, verbatim (`Helper.cpp:314-381`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            InterleaveCheck::Admissible => None,
+            InterleaveCheck::NotAnL3Unit => Some("only supported in L3 units"),
+            InterleaveCheck::IllegalGranularity => Some("illegal granularity setting"),
+            InterleaveCheck::RegionTooSmall => Some("region does not contain enough operations"),
+            InterleaveCheck::NoBurstSizeAttribute => {
+                Some("invalid operation in region (no burst_size attribute)")
+            }
+            InterleaveCheck::NoTotalElementsAttribute => {
+                Some("invalid operation in region (no total_elements attribute)")
+            }
+            InterleaveCheck::InvalidOperationInRegion => {
+                Some("invalid operation found in op region")
+            }
+            InterleaveCheck::DifferentBurst => Some("operation with different burst found"),
+            InterleaveCheck::DifferentTotalElements => {
+                Some("operation with different total_elements found")
+            }
+            InterleaveCheck::UnexpectedOperationType => {
+                Some("operation with unexpected operation type found")
+            }
+        }
+    }
+}
+
+/// Replaces: e211_processInterleaveOp
+///
+/// **211/384** `AgenToSentientLoweringPass::processInterleaveOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:305` (80L). An interleaved region is lowerable only
+/// on an L3 unit, at a legal granularity, and only when every transfer in it is the SAME class with
+/// the SAME burst and the SAME element count.
+///
+/// ⛔ THE GRANULARITY DEFAULT IS THE MAXIMUM AND IS NEVER CHECKED (`:322-323`): the bounds test runs
+/// only when the attribute is present, so `l3BurstSize` itself is legal and 0 is not.
+/// ⛔ `region_ops.size() < 3` COUNTS THE TERMINATOR (`:333`), so it means two transfers.
+/// ⛔ THE IDENTITY TEST IS THE OP **NAME** (`:361`, `:380-381`), not the attributes: a region holding a
+/// `load_and_send` beside a `receive_and_store` with matching burst and count is still refused.
+/// ⛔ THE YIELD IS SKIPPED FIRST (`:363`) — it carries neither attribute and is not a transfer.
+/// ⛔ `DT_CHECK_MSG(interleave_op, ...)` (`:308`) IS THE PARAMETER TYPE, and the unit walk that reaches
+/// `comp` (`:311-312`) is the operand mechanism this port drops.
+pub fn process_interleave_op<A: Arch>(
+    comp: DfirUnit,
+    interleave: &MemoryInterleave<'_>,
+) -> InterleaveCheck {
+    // `:312-316` — `is_any_of(comp, L3LU, L3SU)`.
+    if !matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+        return InterleaveCheck::NotAnL3Unit;
+    }
+
+    // `:321-330` — `sysDef.l3BurstSize`, and the attribute is bounded by it only when present.
+    let max_burst = Elements(u64::from(A::L3_BURST));
+    if let Some(granularity) = interleave.granularity
+        && (granularity == Elements(0) || granularity > max_burst)
+    {
+        return InterleaveCheck::IllegalGranularity;
+    }
+
+    // `:332-340` — two transfers plus the yield.
+    if interleave.region.len() < 3 {
+        return InterleaveCheck::RegionTooSmall;
+    }
+    let Some(first) = interleave.region.first() else {
+        return InterleaveCheck::RegionTooSmall;
+    };
+    // `:343-358` — the front operation's two attributes, in the reference's order.
+    let Some(first_extent) = transfer_extent(first) else {
+        return InterleaveCheck::NoBurstSizeAttribute;
+    };
+
+    for region_op in interleave.region {
+        // `:363` — `if (isa<agen::YieldOp>(region_op)) continue;`.
+        if matches!(region_op, SenOp::Agen(dfir_op::agen::Op::Yield)) {
+            continue;
+        }
+        // `:364-368` — `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>`.
+        let Some(extent) = interleaved_transfer_extent(region_op) else {
+            return InterleaveCheck::InvalidOperationInRegion;
+        };
+        if extent.burst_size != first_extent.burst_size {
+            return InterleaveCheck::DifferentBurst;
+        }
+        if extent.total_elements != first_extent.total_elements {
+            return InterleaveCheck::DifferentTotalElements;
+        }
+        // `:380-382` — `region_op.getName().getStringRef() != op_type`.
+        if sentient_op_name(region_op) != sentient_op_name(first) {
+            return InterleaveCheck::UnexpectedOperationType;
+        }
+    }
+    InterleaveCheck::Admissible
+}
+
+/// THE `burst_size`/`total_elements` PAIR ANY OP CARRYING A [`sen::Extent`] HAS —
+/// `first_op->hasAttr("burst_size")` (`Helper.cpp:344`) over the whole rung.
+fn transfer_extent(op: &SenOp) -> Option<&sen::Extent> {
+    match op {
+        SenOp::Sentient(
+            sen::Op::Load { extent, .. }
+            | sen::Op::LoadAndSend { extent, .. }
+            | sen::Op::ReceiveAndStore { extent, .. }
+            | sen::Op::LoadAndStore { extent, .. },
+        ) => Some(extent),
+        _ => None,
+    }
+}
+
+/// THE SAME PAIR, BUT ONLY FROM THE THREE CLASSES AN INTERLEAVED REGION MAY HOLD —
+/// `isa<sentient::LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>` (`Helper.cpp:364-365`).
+///
+/// ⛔ `sentient.load` IS DELIBERATELY OUT: it carries both attributes, so the reference reads them off
+/// it as the front op and then refuses it in the loop.
+fn interleaved_transfer_extent(op: &SenOp) -> Option<&sen::Extent> {
+    match op {
+        SenOp::Sentient(
+            sen::Op::LoadAndSend { extent, .. }
+            | sen::Op::ReceiveAndStore { extent, .. }
+            | sen::Op::LoadAndStore { extent, .. },
+        ) => Some(extent),
+        _ => None,
+    }
+}
+
+/// WHICH OF THE THREE TRANSFERS AN OP IS — the reference's `getName().getStringRef()` (`:361`),
+/// narrowed to the classes that reach the comparison.
+fn sentient_op_name(op: &SenOp) -> Option<&'static str> {
+    match op {
+        SenOp::Sentient(sen::Op::LoadAndSend { .. }) => Some("sentient.load_and_send"),
+        SenOp::Sentient(sen::Op::ReceiveAndStore { .. }) => Some("sentient.receive_and_store"),
+        SenOp::Sentient(sen::Op::LoadAndStore { .. }) => Some("sentient.load_and_store"),
+        _ => None,
+    }
+}
+
+/// WHAT `gatherAffineLoadStoreDetails` AND `constructImmutableAddress` READ OFF ONE ACCESS RECORD.
+///
+/// ⭐⭐ A TRAIT BECAUSE THE C++ IS A TEMPLATE, and it has exactly two instantiations —
+/// `AccessDetailsAffine` and `AccessDetailsAffineComposite` (`Helper.cpp:2805`, `:2845`). The
+/// precedent is `LoopBodyOp` in this module.
+pub trait AccessRecord {
+    /// `getMemoryIndex()` — [`None`] is the reference's `kMax`, i.e. never set.
+    fn memory_index(&self) -> Option<MemoryOperandIndex>;
+    /// `getMemViewStartAddr()` — [`None`] is a null `Value`, i.e. no view resolved.
+    fn mem_view_start_addr(&self) -> Option<Val>;
+    /// `getIndicesCoeffDict()`.
+    fn indices_coeff_dict(&self) -> &IndicesCoeffDict;
+}
+
+impl AccessRecord for AccessDetailsAffine<'_> {
+    fn memory_index(&self) -> Option<MemoryOperandIndex> {
+        self.base.memory_index
+    }
+    fn mem_view_start_addr(&self) -> Option<Val> {
+        self.base.mem_view_start_addr
+    }
+    fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
+        &self.indices_coeff_dict
+    }
+}
+
+impl AccessRecord for AccessDetailsAffineComposite<'_> {
+    fn memory_index(&self) -> Option<MemoryOperandIndex> {
+        self.affine.base.memory_index
+    }
+    fn mem_view_start_addr(&self) -> Option<Val> {
+        self.affine.base.mem_view_start_addr
+    }
+    fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
+        &self.affine.indices_coeff_dict
+    }
+}
+
+/// EVERY LOOP ITERATOR ACROSS ALL THE ACCESS RECORDS, WITH ONE COEFFICIENT PER RECORD — the
+/// reference's `llvm::DenseMap<Value, std::vector<int64_t>> indices_coeff_dict` (`Helper.cpp:553`).
+///
+/// ⛔ EVERY ROW IS AS LONG AS THERE ARE RECORDS, zero-filled on first sight (`:559-565`), *"to make
+/// lowering simple"* — an iterator only one access uses still has a column for the other.
+/// ⛔ AND THE CONSTANT ROW IS ONE OF THEM. The reference keys it under `nullptr`
+/// ([`IndicesCoeffDict::constant`]), and entry 357 is what drops it again by skipping the null key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatheredCoefficients {
+    /// One row per distinct iterator, in first-seen order.
+    pub per_index: Vec<(Val, Vec<i64>)>,
+    /// The constant offsets, one per record.
+    pub constant: Vec<i64>,
+}
+
+/// THE OUTCOME OF [`gather_affine_load_store_details`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum GatheredDetails {
+    /// `success()` (`:615`).
+    Gathered,
+    /// *"Unable to generate address manipulation statements"* (`:606-607`) — entry 357's failure.
+    AddressManipulationFailed,
+    /// *"Unable to construct immutable addresses"* (`:611-612`) — entry 213's failure.
+    ImmutableAddressesFailed,
+}
+
+impl GatheredDetails {
+    /// `success()` only for [`Self::Gathered`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, GatheredDetails::Gathered)
+    }
+
+    /// The diagnostic the C++ emits, verbatim (`Helper.cpp:606`, `:611`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            GatheredDetails::Gathered => None,
+            GatheredDetails::AddressManipulationFailed => {
+                Some("Unable to generate address manipulation statements")
+            }
+            GatheredDetails::ImmutableAddressesFailed => {
+                Some("Unable to construct immutable addresses")
+            }
+        }
+    }
+}
+
+/// Replaces: e212_gatherAffineLoadStoreDetails
+///
+/// **212/384** `AgenToSentientLoweringPass::gatherAffineLoadStoreDetails` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:538` (74L). Mark the op, transpose every record's
+/// iterator coefficients into one table per iterator, collect the view start addresses under their
+/// operand, and hand both on to the address manipulation and the immutable addresses.
+///
+/// ⛔ THE START ADDRESS GOES INTO **TWO** CONTAINERS (`:570-573`): `mutable_addrs`, which entry 357
+/// then rewrites, and a local copy that entry 213 reads as `updated_mem_view_start_addrs`.
+/// ⛔ THE ROWS ARE ZERO-FILLED IN A FIRST PASS AND WRITTEN IN A SECOND (`:559-576`), which is what
+/// makes column `i` mean "record `i`" even for an iterator the earlier records never mentioned.
+/// ⛔ `insert` ABORTS ON A FILLED SLOT; here the slot is a capability ([`AccessContainer::vacancy`]), so
+/// a record whose operand is already taken — or which never resolved a view — is passed over.
+/// ⛔ THE `LLVM_DEBUG` BLOCK IS DROPPED (`:578-593`), and with it the only call to
+/// [`loop_nest_level`] in this function.
+pub fn gather_affine_load_store_details<T: AccessRecord>(
+    position: usize,
+    marked: &mut Marked,
+    comp: DfirUnit,
+    access_details: &AccessContainer<T>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &mut AccessContainer<Val>,
+) -> GatheredDetails {
+    // `:545-547` — the mark this pass recovers the op by.
+    marked.mark(position);
+
+    let records = access_details.entries();
+    let mut coefficients = GatheredCoefficients {
+        per_index: Vec::new(),
+        constant: vec![0; records.len()],
+    };
+    let mut mem_view_start_addrs = AccessContainer::<Val>::default();
+
+    for (i, record) in records.iter().enumerate() {
+        let dict = record.indices_coeff_dict();
+        for (index, coefficient) in &dict.per_index {
+            // `:561-565` — the row appears the first time its iterator does, zero-filled.
+            let row = match coefficients
+                .per_index
+                .iter_mut()
+                .find(|(known, _)| known == index)
+            {
+                Some((_, row)) => row,
+                None => {
+                    coefficients
+                        .per_index
+                        .push((*index, vec![0; records.len()]));
+                    match coefficients.per_index.last_mut() {
+                        Some((_, row)) => row,
+                        None => continue,
+                    }
+                }
+            };
+            // `:575-576` — column `i` is record `i`.
+            if let Some(slot) = row.get_mut(i) {
+                *slot = *coefficient;
+            }
+        }
+        if let Some(slot) = coefficients.constant.get_mut(i) {
+            *slot = dict.constant;
+        }
+
+        // `:570-573` — the same address under the same operand, in both containers.
+        if let Some(moi) = record.memory_index()
+            && let Some(start_addr) = record.mem_view_start_addr()
+        {
+            if let Some(slot) = mutable_addrs.vacancy(moi) {
+                slot.fill(start_addr);
+            }
+            if let Some(slot) = mem_view_start_addrs.vacancy(moi) {
+                slot.fill(start_addr);
+            }
+        }
+    }
+
+    // `generateAffineAddressManipulationStmts(...)` (`:600-608`) — entry 357/384, unported.
+    //
+    // ⛔ THE GATE IS THE ONE INPUT ON WHICH IT PROVABLY WRITES NOTHING: with no access details its
+    // `DT_CHECK` on the three sizes holds trivially, both of its loops (`:698`, `:771`) are empty, and
+    // it returns `success()` (`:827`). Every other input reaches statements this port does not have.
+    if !records.is_empty() {
+        todo!(
+            "e357_generateAffineAddressManipulationStmts not ported: {} access record(s) need their \
+             mutable address registers assigned and advanced across the loop nest \
+             (`Helper.cpp:625`)",
+            records.len()
+        );
+    }
+
+    // `:610-613` — entry 213, on the local copy entry 357 has just updated.
+    if !construct_immutable_address(comp, access_details, &mem_view_start_addrs, immutable_addrs)
+        .admissible()
+    {
+        return GatheredDetails::ImmutableAddressesFailed;
+    }
+    GatheredDetails::Gathered
+}
+
+/// THE OUTCOME OF [`construct_immutable_address`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ImmutableAddresses {
+    /// `success()` (`:1235`) — every record's immutable address is placed.
+    Constructed,
+    /// `failure()` with no diagnostic (`:1221-1223`): the two containers hold different counts.
+    SizeMismatch,
+}
+
+impl ImmutableAddresses {
+    /// `success()` only for [`Self::Constructed`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, ImmutableAddresses::Constructed)
+    }
+}
+
+/// Replaces: e213_constructImmutableAddress
+///
+/// **213/384** `AgenToSentientLoweringPass::constructImmutableAddress` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217` (16L). On L3 the immutable address is the
+/// memory view's own start address; everywhere else it is the one the address manipulation left.
+///
+/// ⭐ THE REASON IS THE REFERENCE'S OWN (`:594-597`): an L3 offset is handled in an LBR/EBR, so the
+/// register keeps the view's start and the offset rides elsewhere.
+/// ⛔ THE L3 ARM READS THE RECORD, THE OTHER ARM READS BY **POSITION** — `updated_mem_view_start_addrs[i]`
+/// (`:1229`) is the i-th entry in insertion order, not `get(moi)`, and the two orders agree only
+/// because entry 212 filled both containers from the same walk.
+/// ⛔ THE SIZE TEST IS WHY THAT INDEX IS IN RANGE (`:1221`), and it is a bare `failure()` with no
+/// message.
+pub fn construct_immutable_address<T: AccessRecord>(
+    comp: DfirUnit,
+    access_details: &AccessContainer<T>,
+    updated_mem_view_start_addrs: &AccessContainer<Val>,
+    immutable_addrs: &mut AccessContainer<Val>,
+) -> ImmutableAddresses {
+    let records = access_details.entries();
+    let updated = updated_mem_view_start_addrs.entries();
+    if records.len() != updated.len() {
+        return ImmutableAddresses::SizeMismatch;
+    }
+
+    for (i, record) in records.iter().enumerate() {
+        // `:1227-1231` — `is_any_of(comp, L3LU, L3SU)`.
+        let address = if matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+            record.mem_view_start_addr()
+        } else {
+            updated.get(i).copied()
+        };
+        if let Some(moi) = record.memory_index()
+            && let Some(address) = address
+            && let Some(slot) = immutable_addrs.vacancy(moi)
+        {
+            slot.fill(address);
+        }
+    }
+    ImmutableAddresses::Constructed
 }
