@@ -267,7 +267,8 @@ pub fn is_same_list_of_units(key_units: &[DfirOp], src_unit_ops: &[Val]) -> bool
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Agen(_)
-            | DfirOp::VectorChain(_) => return false,
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => return false,
         }
     }
     src_unit_ops == key_unit_ops.as_slice()

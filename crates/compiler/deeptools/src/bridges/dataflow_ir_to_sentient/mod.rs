@@ -415,6 +415,7 @@ fn statement<A: Arch>(
                 dfir_op::affine::Op::Apply { .. } => todo!("affine.apply"),
                 dfir_op::affine::Op::VectorLoad { .. } => todo!("affine.vector_load"),
                 dfir_op::affine::Op::VectorStore { .. } => todo!("affine.vector_store"),
+                dfir_op::affine::Op::If { .. } => todo!("affine.if -> the conditional lowering"),
             }
             1
         }

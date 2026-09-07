@@ -888,7 +888,8 @@ impl<'a> VectorLoadOp<'a> {
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
-            | DfirOp::VectorChain(_) => None,
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => None,
         }
     }
 }
@@ -1114,7 +1115,8 @@ impl<'a> VectorStoreOp<'a> {
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
-            | DfirOp::VectorChain(_) => None,
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => None,
         }
     }
 }

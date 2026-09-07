@@ -175,6 +175,28 @@ pub enum Op {
     /// `arith.muli`.
     MulI(IntBinary),
 
+    /// `arith.divsi` — SIGNED integer division.
+    ///
+    /// ⛔⛔ THE OP EVERY `sentient.for` BOUND IS. The scheduler writes a trip count as
+    /// `(upper - lower) / step`, and it writes it as two ops:
+    ///
+    /// ```text
+    /// %1 = arith.subi %c2, %c0 : index
+    /// %2 = arith.divsi %1, %c1 : index
+    /// sentient.for %arg1 = %2 { .. }
+    /// ```
+    /// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:226-228`)
+    ///
+    /// `getForOpBound` (entry 091) walks exactly that chain backwards from the loop's bound operand —
+    /// `arith::DivSIOp` → its `arith::SubIOp` lhs → the `arith.constant`s or `symbol.create_symbol`s
+    /// that feed it (`Conversion/VectorChainLowering/LoweringXRF.cpp:262-294`) — so without a
+    /// `divsi` in the island that walk has nothing to start from and the constant offset it computes
+    /// (`:498`) is unreachable.
+    ///
+    /// ⭐ SIGNED, NOT `divui`. The reference names `arith::DivSIOp` and every quantity involved is an
+    /// `index`, which MLIR treats as signed.
+    DivSI(IntBinary),
+
     /// `arith.cmpi <predicate>, %lhs, %rhs : index` — one integer comparison.
     ///
     /// (E) `first` IS `iv == lower bound` AND `last` IS `iv == upper bound - 1`
@@ -253,6 +275,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::AddI(op) => int_binary(out, "arith.addi", op),
         Op::SubI(op) => int_binary(out, "arith.subi", op),
         Op::MulI(op) => int_binary(out, "arith.muli", op),
+        Op::DivSI(op) => int_binary(out, "arith.divsi", op),
         Op::Compare {
             result,
             predicate,

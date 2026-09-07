@@ -351,6 +351,7 @@ mod unit_tests {
     fn load_set() -> IntegerSet {
         IntegerSet {
             dims: 1,
+            symbols: 0,
             constraints: vec![
                 Constraint {
                     expr: AffineExpr::dim(0),
@@ -369,6 +370,7 @@ mod unit_tests {
         let bounds = [1i64, 15, 0, 0];
         IntegerSet {
             dims: 4,
+            symbols: 0,
             constraints: (0..4)
                 .rev()
                 .flat_map(|dim| {

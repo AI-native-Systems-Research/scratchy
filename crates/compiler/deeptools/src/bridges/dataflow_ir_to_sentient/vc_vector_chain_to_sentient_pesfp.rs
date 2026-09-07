@@ -245,7 +245,8 @@ pub fn legality(op: &DfirOp) -> Legality {
             | vc::Op::ConstantBitstream { .. }
             | vc::Op::Rotate { .. }
             | vc::Op::Cast { .. }
-            | vc::Op::CreateAffineMask { .. },
+            | vc::Op::CreateAffineMask { .. }
+            | vc::Op::CreateAffineMaskSet { .. },
         ) => Legality::Legal,
 
         // ── every other dialect: `arith` and `dataflow` are declared legal outright, and `affine`,
@@ -254,7 +255,8 @@ pub fn legality(op: &DfirOp) -> Legality {
         | DfirOp::Affine(_)
         | DfirOp::Scf(_)
         | DfirOp::Dataflow(_)
-        | DfirOp::Agen(_) => Legality::Legal,
+        | DfirOp::Agen(_)
+        | DfirOp::Symbol(_) => Legality::Legal,
     }
 }
 
@@ -303,7 +305,8 @@ pub fn installed_pattern(op: &DfirOp) -> Option<ComputePattern> {
         | vc::Op::ConstantBitstream { .. }
         | vc::Op::Rotate { .. }
         | vc::Op::Cast { .. }
-        | vc::Op::CreateAffineMask { .. } => None,
+        | vc::Op::CreateAffineMask { .. }
+        | vc::Op::CreateAffineMaskSet { .. } => None,
     }
 }
 
@@ -583,12 +586,14 @@ mod unit_tests {
             op2: Val(2),
             iteration_space_ca: IntegerSet {
                 dims: 1,
+                symbols: 0,
                 constraints: Vec::new(),
             },
             access_function_ca: map(),
             access_function_a: map(),
             iteration_space_cb: IntegerSet {
                 dims: 1,
+                symbols: 0,
                 constraints: Vec::new(),
             },
             access_function_cb: map(),

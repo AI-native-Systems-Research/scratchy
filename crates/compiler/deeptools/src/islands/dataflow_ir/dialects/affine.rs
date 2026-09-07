@@ -84,6 +84,63 @@ pub enum Op {
         dbg_name: Option<String>,
     },
 
+    /// `affine.if #set(%dims)[%symbols] -> index { .. } else { .. }` — a branch on an AFFINE
+    /// predicate, and the DataflowIR rung's own conditional.
+    ///
+    /// # ⛔⛔ NOT A SPELLING OF [`super::scf::Op::If`] — THE CONDITION IS A SET, NOT A VALUE
+    ///
+    /// `scf.if` branches on an `i1` that was already computed; this op branches on whether its
+    /// operands SATISFY an integer set, and it yields a value the program then compares. The vendor
+    /// writes the pair together, in that order:
+    ///
+    /// ```text
+    /// %52 = affine.if #set0(%arg9) -> index {
+    ///   affine.yield %c1 : index
+    /// } else {
+    ///   affine.yield %c0 : index
+    /// }
+    /// %53 = arith.cmpi eq, %52, %c1 : index
+    /// scf.if %53 {
+    /// ```
+    /// (`dcc/test/PT/issue-236.mlir:59-65`)
+    ///
+    /// ⛔ AND THE PASSES ASK ABOUT IT BY NAME. `isOperationSelected` — the whole predicate deciding
+    /// what a conditional tree's NODES are — is `isa<mlir::affine::AffineIfOp, scf::IfOp>`
+    /// (`Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:34`, entry 095), and
+    /// `createDummyYieldInElseReg` (entry 096) closes an empty else region with an
+    /// `affine::AffineYieldOp` for this op and an `scf::YieldOp` for the other
+    /// (`:389-393`). With only one of the two in the island, half of each function is unreachable
+    /// and the tree can never hold a node the reference would have put in it.
+    ///
+    /// ⭐ 9 OCCURRENCES OVER 6 FILES in the authority tree's `dcc/test` — rarer than `scf.if`'s 788,
+    /// and every one of them at the DataflowIR rung this island models.
+    If {
+        /// `$condition` — the affine set the operands are tested against.
+        set: crate::islands::dataflow_ir::ty::IntegerSet,
+        /// The set's DIMENSION operands, printed `(%a, %b)`.
+        args: Vec<Val>,
+        /// The set's SYMBOL operands, printed `[%s]`.
+        ///
+        /// ⛔ A SEPARATE LIST BECAUSE MLIR PRINTS THEM SEPARATELY — `printDimAndSymbolList` splits at
+        /// `set.getNumDims()`, and the vendor writes both:
+        /// `affine.if affine_set<(d0, d1)[s0, s1] : (..)> (%i4, %i7)[%Din_Cin, %Cin_Sin] -> (index)`
+        /// (`dcc/test/PT/int8-genkg3-pt.mlir:147-148`).
+        symbol_args: Vec<Val>,
+        /// The values it binds — one per result, all `index`. Empty for a branch taken for effect.
+        ///
+        /// ⛔⛔ WHETHER THIS IS EMPTY DECIDES WHETHER THE TERMINATORS PRINT. MLIR passes
+        /// `printBlockTerminators = getNumResults()`, so a result-less `affine.if` prints its regions
+        /// with the `affine.yield` ELIDED — and that is exactly the state entry 096 changes, from an
+        /// else region with no block at all to one holding a bare terminator.
+        results: Vec<Val>,
+        /// The `then` region.
+        body: Vec<super::Op>,
+        /// The `else` region. ⛔ EMPTY MEANS NO BLOCK, WHICH IS WHAT `getRegions()[1].empty()` TESTS
+        /// (`CFGSDataflowConditionalTree.cpp:386`) — and printing then omits `else` entirely, as
+        /// MLIR's own printer does.
+        else_body: Vec<super::Op>,
+    },
+
     /// `affine.apply affine_map<..>(%args)` — an index computed from induction variables.
     Apply {
         /// The index it binds.
@@ -190,6 +247,49 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 }
             }
         }
+        Op::If {
+            set,
+            args,
+            symbol_args,
+            results,
+            body,
+            else_body,
+        } => {
+            // `printOptionalArrowTypeList`: nothing when there are no results, ` -> index` for one,
+            // ` -> (index, index)` for more (`issue-236.mlir:59` writes the single-result form).
+            let result_tys = match results.len() {
+                0 => String::new(),
+                1 => " -> index".to_owned(),
+                n => format!(" -> ({})", vec!["index"; n].join(", ")),
+            };
+            let bound = if results.is_empty() {
+                String::new()
+            } else {
+                format!("{} = ", print::vals(results))
+            };
+            let symbols = if symbol_args.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", print::vals(symbol_args))
+            };
+            let _ = writeln!(
+                out,
+                "{bound}affine.if {}({}){symbols}{result_tys} {{",
+                print::integer_set(set),
+                print::vals(args)
+            );
+            // ⭐ THE TERMINATOR PRINTS ONLY WHERE MLIR PRINTS IT — see [`Op::If::results`].
+            region(out, body, depth, !results.is_empty());
+            print::indent(out, depth);
+            if else_body.is_empty() {
+                out.push_str("}\n");
+            } else {
+                out.push_str("} else {\n");
+                region(out, else_body, depth, !results.is_empty());
+                print::indent(out, depth);
+                out.push_str("}\n");
+            }
+        }
         Op::Apply { result, map, args } => {
             let _ = writeln!(
                 out,
@@ -252,6 +352,24 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::vector(*ty)
             );
         }
+    }
+}
+
+/// ONE REGION OF AN `affine.if`, WITH ITS TERMINATOR PRINTED OR ELIDED.
+///
+/// ⛔ ELIDING IS NOT DROPPING. The `affine.yield` stays in the region — [`super::regions`] and every
+/// walk still see it, and entry 096's whole effect is to PUT one there — it is only unprinted, which
+/// is what MLIR does for a region whose parent binds no results.
+fn region(out: &mut String, ops: &[super::Op], depth: usize, print_terminator: bool) {
+    for (n, inner) in ops.iter().enumerate() {
+        let last = n + 1 == ops.len();
+        if last
+            && !print_terminator
+            && matches!(inner, super::Op::Affine(Op::Yield { operands }) if operands.is_empty())
+        {
+            continue;
+        }
+        print::emit(out, inner, depth + 1);
     }
 }
 

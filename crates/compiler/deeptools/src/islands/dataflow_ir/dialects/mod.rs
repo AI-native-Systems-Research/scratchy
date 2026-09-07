@@ -19,6 +19,7 @@ pub mod agen;
 pub mod arith;
 pub mod dataflow;
 pub mod scf;
+pub mod symbol;
 pub mod vectorchain;
 
 use crate::islands::dataflow_ir::Values;
@@ -75,6 +76,8 @@ pub enum Op {
     Agen(agen::Op),
     /// `VectorChain.td` — everything the PE and the SFP compute.
     VectorChain(vectorchain::Op),
+    /// Upstream `symbol` — a scalar the schedule fixes later.
+    Symbol(symbol::Op),
 }
 
 // ─────────────────────────────── THE USE LIST ────────────────────────────────
@@ -106,7 +109,10 @@ pub fn operands(op: &Op) -> Vec<Val> {
             // ⭐ THE ADDRESS ARITHMETIC READS TWO VALUES. `insertCopyAndAddStmtsHelper` closes a
             // carrying loop with `arith.addi %iter_arg, %c<coeff>` (`AgenToSentient.hpp:502-520`),
             // and BOTH the carried argument and the coefficient constant are uses of their values.
-            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+            arith::Op::AddI(bin)
+            | arith::Op::SubI(bin)
+            | arith::Op::MulI(bin)
+            | arith::Op::DivSI(bin) => {
                 reads.extend([bin.lhs, bin.rhs]);
             }
             // ⭐ THE PREDICATE IS NOT AN OPERAND — it is `arith.cmpi`'s first token, an
@@ -114,6 +120,8 @@ pub fn operands(op: &Op) -> Vec<Val> {
             arith::Op::Compare { lhs, rhs, .. } => reads.extend([*lhs, *rhs]),
             arith::Op::Logic { operands, .. } => reads.extend(operands.iter().copied()),
         },
+        // ⭐ A SYMBOL READS NOTHING — its id is an attribute, not an operand (`Symbol.td:59`).
+        Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
         Op::Scf(op) => match op {
             // ⛔ THE INDUCTION VARIABLES ARE NOT OPERANDS. `scf.parallel`'s `ivs` are the region's
             // arguments — values it DEFINES — so counting them here would make every loop a user of
@@ -165,6 +173,14 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend(carried.iter().map(|carried| carried.init));
             }
             affine::Op::Apply { args, .. } => reads.extend(args.iter().copied()),
+            // ⭐ THE SET'S OPERANDS ARE USES — both lists. `affine.if #set0(%arg9)` reads `%arg9`
+            // as surely as `scf.if %53` reads its predicate; the SET itself is an attribute.
+            affine::Op::If {
+                args, symbol_args, ..
+            } => {
+                reads.extend(args.iter().copied());
+                reads.extend(symbol_args.iter().copied());
+            }
             affine::Op::Yield { operands } => reads.extend(operands.iter().copied()),
             affine::Op::VectorLoad { view, indices, .. } => {
                 reads.push(*view);
@@ -227,6 +243,13 @@ pub fn operands(op: &Op) -> Vec<Val> {
         Op::VectorChain(op) => match op {
             vectorchain::Op::ConstantBitstream { .. }
             | vectorchain::Op::CreateAffineMask { .. } => {}
+            // ⛔ THE MASK PARAMETER IS AN OPERAND, AND ENTRY 089 IS THE READER THAT PROVES IT: it
+            // reaches the parameter's DEFINING op (`arith.constant` or `arith.subi`) to decide
+            // whether the mask is static (`Helper.cpp:64-79`, `:122-131`). A use-walk that missed it
+            // would call the value dead.
+            vectorchain::Op::CreateAffineMaskSet { mask_parameter, .. } => {
+                reads.extend(mask_parameter.iter().copied());
+            }
             vectorchain::Op::Estimate { input, .. }
             | vectorchain::Op::FastExp { input, .. }
             | vectorchain::Op::Floor { input, .. }
@@ -283,8 +306,15 @@ pub fn results(op: &Op) -> Vec<Val> {
             | arith::Op::Compare { result, .. }
             | arith::Op::Logic { result, .. }
             | arith::Op::DenseConstant { result, .. } => vec![*result],
-            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => vec![bin.result],
+            arith::Op::AddI(bin)
+            | arith::Op::SubI(bin)
+            | arith::Op::MulI(bin)
+            | arith::Op::DivSI(bin) => vec![bin.result],
         },
+        // ⛔ A `symbol.create_symbol` BINDS ITS EXTENT, and entry 091 reads it: the backward walk from
+        // a lowered loop's bound ends at either an `arith.constant` or this op
+        // (`LoweringXRF.cpp:278-288`), which it can only do if this walk answers for it.
+        Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![*result],
         Op::Scf(op) => match op {
             // ⭐ A CARRYING `scf.for` BINDS RESULTS, one per `iter_args` entry — the reference's own
             // input to `TransformLoopToLegalizeForSentientLowering` is
@@ -306,6 +336,9 @@ pub fn results(op: &Op) -> Vec<Val> {
                 carried.iter().map(|carried| carried.result).collect()
             }
             affine::Op::Yield { .. } | affine::Op::VectorStore { .. } => Vec::new(),
+            // ⭐ AND AN `affine.if` BINDS WHAT IT YIELDS — `%52 = affine.if #set0(%arg9) -> index`
+            // (`dcc/test/PT/issue-236.mlir:59`), which the `arith.cmpi` on the next line reads.
+            affine::Op::If { results, .. } => results.clone(),
             affine::Op::Apply { result, .. } | affine::Op::VectorLoad { result, .. } => {
                 vec![*result]
             }
@@ -348,7 +381,8 @@ pub fn results(op: &Op) -> Vec<Val> {
             | vectorchain::Op::Cast { result, .. }
             | vectorchain::Op::Pack { result, .. }
             | vectorchain::Op::Merge { result, .. }
-            | vectorchain::Op::CreateAffineMask { result, .. } => vec![*result],
+            | vectorchain::Op::CreateAffineMask { result, .. }
+            | vectorchain::Op::CreateAffineMaskSet { result, .. } => vec![*result],
         },
     }
 }
@@ -382,7 +416,10 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             arith::Op::Constant { .. }
             | arith::Op::ConstantInt { .. }
             | arith::Op::DenseConstant { .. } => {}
-            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+            arith::Op::AddI(bin)
+            | arith::Op::SubI(bin)
+            | arith::Op::MulI(bin)
+            | arith::Op::DivSI(bin) => {
                 places.extend([&mut bin.lhs, &mut bin.rhs]);
             }
             arith::Op::Compare { lhs, rhs, .. } => places.extend([lhs, rhs]),
@@ -425,6 +462,14 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             }
             affine::Op::Apply { args, .. } => places.extend(args.iter_mut()),
             affine::Op::Yield { operands } => places.extend(operands.iter_mut()),
+            // ⭐ BOTH OPERAND LISTS, DIMS THEN SYMBOLS — the order `affine.if #set(%d)[%s]` writes
+            // them in, and the order the set's two position spaces number them in.
+            affine::Op::If {
+                args, symbol_args, ..
+            } => {
+                places.extend(args.iter_mut());
+                places.extend(symbol_args.iter_mut());
+            }
             affine::Op::VectorLoad { view, indices, .. } => {
                 places.push(view);
                 index_operands_mut(indices, &mut places);
@@ -483,6 +528,11 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         Op::VectorChain(op) => match op {
             vectorchain::Op::ConstantBitstream { .. }
             | vectorchain::Op::CreateAffineMask { .. } => {}
+            // ⭐ THE MASK PARAMETER IS A PLAIN OPERAND, NOT A [`vectorchain::Predicate`]: it is an
+            // `index` substituted for the set's `s0`, so re-pointing it leaves no stale width behind.
+            vectorchain::Op::CreateAffineMaskSet { mask_parameter, .. } => {
+                places.extend(mask_parameter.iter_mut());
+            }
             vectorchain::Op::Estimate { input, .. }
             | vectorchain::Op::FastExp { input, .. }
             | vectorchain::Op::Floor { input, .. }
@@ -502,6 +552,9 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | vectorchain::Op::Pack { op1, op2, .. }
             | vectorchain::Op::Merge { op1, op2, .. } => places.extend([op1, op2]),
         },
+        // ⛔ A SYMBOL READS NOTHING. `symbol.create_symbol` names an extent that is not yet a value;
+        // entry 091's backward walk stops AT it, never through it.
+        Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
     }
     places
 }
@@ -519,16 +572,24 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | arith::Op::Compare { result, .. }
             | arith::Op::Logic { result, .. }
             | arith::Op::DenseConstant { result, .. } => vec![result],
-            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+            arith::Op::AddI(bin)
+            | arith::Op::SubI(bin)
+            | arith::Op::MulI(bin)
+            | arith::Op::DivSI(bin) => {
                 vec![&mut bin.result]
             }
         },
+        Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![result],
         Op::Scf(_) => Vec::new(),
         Op::Affine(op) => match op {
             affine::Op::For { carried, .. } => carried
                 .iter_mut()
                 .map(|carried| &mut carried.result)
                 .collect(),
+            // ⛔ `affine.if` BINDS A RESULT LIST, AND ENTRY 096 TURNS ON IT BEING EMPTY: a
+            // value-yielding conditional is not a candidate for a dummy `else`
+            // (`CFGSDataflowConditionalTree.cpp:383-386`), so the list is a fact this walk must state.
+            affine::Op::If { results, .. } => results.iter_mut().collect(),
             affine::Op::Yield { .. } | affine::Op::VectorStore { .. } => Vec::new(),
             affine::Op::Apply { result, .. } | affine::Op::VectorLoad { result, .. } => {
                 vec![result]
@@ -554,6 +615,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             }
         },
         Op::VectorChain(op) => match op {
+            vectorchain::Op::CreateAffineMaskSet { result, .. } => vec![result],
             vectorchain::Op::Estimate { result, .. }
             | vectorchain::Op::FastExp { result, .. }
             | vectorchain::Op::Floor { result, .. }
@@ -639,7 +701,8 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         | Op::Scf(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
-        | Op::VectorChain(_) => Vec::new(),
+        | Op::VectorChain(_)
+        | Op::Symbol(_) => Vec::new(),
     }
 }
 
@@ -651,7 +714,13 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         | Op::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. }) => {
             vec![body.as_slice()]
         }
+        // ⭐ TWO REGIONS EACH, `then` FIRST — the order `getRegions()[0]` / `getRegions()[1]`
+        // indexes them in, which is what `createDummyYieldInElseReg` relies on
+        // (`CFGSDataflowConditionalTree.cpp:386-388`).
         Op::Scf(scf::Op::If {
+            body, else_body, ..
+        })
+        | Op::Affine(affine::Op::If {
             body, else_body, ..
         }) => vec![body.as_slice(), else_body.as_slice()],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
@@ -661,7 +730,8 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         | Op::Scf(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
-        | Op::VectorChain(_) => Vec::new(),
+        | Op::VectorChain(_)
+        | Op::Symbol(_) => Vec::new(),
     }
 }
 
@@ -681,7 +751,12 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         | Op::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. }) => {
             vec![body]
         }
+        // ⭐ TWO REGIONS EACH, `then` FIRST — arm for arm with [`regions`], which is the order entry
+        // 096 indexes when it pushes a terminator into the second.
         Op::Scf(scf::Op::If {
+            body, else_body, ..
+        })
+        | Op::Affine(affine::Op::If {
             body, else_body, ..
         }) => vec![body, else_body],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
@@ -691,7 +766,8 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         | Op::Scf(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
-        | Op::VectorChain(_) => Vec::new(),
+        | Op::VectorChain(_)
+        | Op::Symbol(_) => Vec::new(),
     }
 }
 
@@ -734,7 +810,10 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             arith::Op::Constant { result, .. }
             | arith::Op::ConstantInt { result, .. }
             | arith::Op::DenseConstant { result, .. } => results.push(result),
-            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+            arith::Op::AddI(bin)
+            | arith::Op::SubI(bin)
+            | arith::Op::MulI(bin)
+            | arith::Op::DivSI(bin) => {
                 operands.extend([&mut bin.lhs, &mut bin.rhs]);
                 results.push(&mut bin.result);
             }
@@ -813,6 +892,21 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             affine::Op::Apply { result, args, .. } => {
                 operands.extend(args.iter_mut());
                 results.push(result);
+            }
+            // ⭐ FOUR GROUPS IN ONE OP, arm for arm with [`operands_mut`], [`results_mut`] and
+            // [`regions_mut`]: dims then symbols read, the result list bound, both regions held.
+            affine::Op::If {
+                set: _,
+                args,
+                symbol_args,
+                results: binds,
+                body,
+                else_body,
+            } => {
+                operands.extend(args.iter_mut());
+                operands.extend(symbol_args.iter_mut());
+                results.extend(binds.iter_mut());
+                regions.extend([body, else_body]);
             }
             affine::Op::Yield { operands: reads } => operands.extend(reads.iter_mut()),
             affine::Op::VectorLoad {
@@ -905,6 +999,15 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             }
         },
         Op::VectorChain(op) => match op {
+            // ⭐ THE PARAMETER IS AN OPERAND AND THE MASK IS THE RESULT — see [`operands_mut`].
+            vectorchain::Op::CreateAffineMaskSet {
+                result,
+                mask_parameter,
+                ..
+            } => {
+                operands.extend(mask_parameter.iter_mut());
+                results.push(result);
+            }
             vectorchain::Op::ConstantBitstream { result, .. }
             | vectorchain::Op::CreateAffineMask { result, .. } => results.push(result),
             vectorchain::Op::Estimate { result, input, .. }
@@ -990,6 +1093,8 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 results.push(result);
             }
         },
+        // ⛔ A SYMBOL READS NOTHING AND HOLDS NOTHING; it binds the extent entry 091's walk stops at.
+        Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => results.push(result),
     }
     OpPartsMut {
         operands,
@@ -1112,7 +1217,10 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             arith::Op::Constant { result, .. }
             | arith::Op::ConstantInt { result, .. }
             | arith::Op::DenseConstant { result, .. } => vals.push((Role::Result, result)),
-            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+            arith::Op::AddI(bin)
+            | arith::Op::SubI(bin)
+            | arith::Op::MulI(bin)
+            | arith::Op::DivSI(bin) => {
                 vals.push((Role::Operand, &mut bin.lhs));
                 vals.push((Role::Operand, &mut bin.rhs));
                 vals.push((Role::Result, &mut bin.result));
@@ -1191,6 +1299,20 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.extend(results);
                 vals.push((Role::BlockArg, iv));
                 vals.extend(args);
+            }
+            // ⭐ ROLE ORDER, [`operands`] ++ [`results`], AND NO BLOCK ARGUMENT: `affine.if`'s regions
+            // take none — the set's dims are OPERANDS of the op, not arguments of its blocks.
+            affine::Op::If {
+                set: _,
+                args,
+                symbol_args,
+                results,
+                body: _,
+                else_body: _,
+            } => {
+                vals.extend(args.iter_mut().map(|val| (Role::Operand, val)));
+                vals.extend(symbol_args.iter_mut().map(|val| (Role::Operand, val)));
+                vals.extend(results.iter_mut().map(|val| (Role::Result, val)));
             }
             affine::Op::Apply { result, args, .. } => {
                 vals.extend(args.iter_mut().map(|val| (Role::Operand, val)));
@@ -1304,6 +1426,15 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             | vectorchain::Op::CreateAffineMask { result, .. } => {
                 vals.push((Role::Result, result));
             }
+            // ⭐ THE MASK PARAMETER IS AN OPERAND — see [`operands_mut`].
+            vectorchain::Op::CreateAffineMaskSet {
+                result,
+                mask_parameter,
+                ..
+            } => {
+                vals.extend(mask_parameter.iter_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
+            }
             vectorchain::Op::Estimate { result, input, .. }
             | vectorchain::Op::ScanWithGap { result, input, .. }
             | vectorchain::Op::Select { result, input, .. }
@@ -1397,6 +1528,10 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Result, result));
             }
         },
+        // ⛔ A SYMBOL BINDS ITS EXTENT AND READS NOTHING — see [`operands_mut`].
+        Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => {
+            vals.push((Role::Result, result));
+        }
     }
     vals
 }

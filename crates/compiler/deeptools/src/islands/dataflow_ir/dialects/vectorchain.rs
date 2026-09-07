@@ -689,6 +689,65 @@ pub enum Op {
         /// [`LaneMask::binds`] hands the SAME `Vector` to the use site, so they cannot differ.
         mask: LaneMask,
     },
+
+    /// `vectorchain.create_affine_mask [%parameter] {mask_set} : vector<Nxi1>` — the SAME operation,
+    /// stated as the affine set it actually carries.
+    ///
+    /// ⛔⛔ NOT A DUPLICATE OF [`Op::CreateAffineMask`] — THE PREFIX FORM CANNOT STATE A PT MASK.
+    /// [`LaneMask`] holds a *live lane count*, which is enough for `getStaticContinuousMaskValue` and
+    /// exactly what defends the definition/use type agreement there. But `getMaskValueForPT`
+    /// (entry 089) reads FOUR facts off this op that a lane count does not carry
+    /// (`Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp:26-215`):
+    ///
+    /// * `mask_set.getNumDims()` and `mask_set.getNumSymbols()` — separate refusals, `:32` and `:82`;
+    /// * the CONSTRAINTS, matched term for term against
+    ///   `d0 + s0 * num_lanes_in_slice - op_num_elems` and `-d0 + (op_num_elems - 1)` (`:203-215`);
+    /// * the set's lower bound, which becomes the mask value (`:88-101`);
+    /// * `cam_op.getMaskParameter()` — present or absent, and if present, whether it is an
+    ///   `arith.constant` or an `arith.subi` (`:64-79`, `:122-131`).
+    ///
+    /// The vendor writes both forms in one file:
+    /// `vectorchain.create_affine_mask %14 {mask_set = #set} : vector<64xi1>` and
+    /// `vectorchain.create_affine_mask {mask_set = #set2} : vector<64xi1>`
+    /// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:252`, `:296`).
+    ///
+    /// ⭐ ADDITIVE ON PURPOSE. `tape.rs` is the only emitter of the prefix form and its type-agreement
+    /// defence is worth keeping intact, so this variant sits beside it rather than replacing it, and
+    /// both bind their predicate through [`Op::binds_predicate`].
+    CreateAffineMaskSet {
+        /// The i1 vector it binds.
+        result: Val,
+        /// `$mask_set` — the affine set, dims and symbols and all.
+        mask_set: IntegerSet,
+        /// `$mask_parameter` — the set's one symbol, when the set takes one.
+        ///
+        /// ⛔ `Optional` IN THE DIALECT, AND ITS ABSENCE IS A FACT ENTRY 089 READS:
+        /// `static_mask = !cam_op.getMaskParameter()` (`Helper.cpp:64`).
+        mask_parameter: Option<Val>,
+        /// The i1 vector type the mask is stated over — printed HERE and read from here by every use.
+        ty: Vector,
+    },
+}
+
+impl Op {
+    /// THE PREDICATE THIS OP BINDS, TAKING ITS TYPE FROM THE DEFINITION — `None` for an op that
+    /// binds no mask.
+    ///
+    /// ⭐ THE ONE WAY EITHER MASK FORM REACHES A USE. [`Predicate`]'s fields are private and it has
+    /// no public constructor precisely so that a use cannot restate the type
+    /// (see [`Predicate`]'s own note on granite-2b's `group_7`); this method extends that guarantee
+    /// to [`Op::CreateAffineMaskSet`] without opening one.
+    #[must_use]
+    pub fn binds_predicate(&self) -> Option<Predicate> {
+        match self {
+            Op::CreateAffineMask { result, mask } => Some(mask.binds(*result)),
+            Op::CreateAffineMaskSet { result, ty, .. } => Some(Predicate {
+                val: *result,
+                ty: *ty,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// ONE `vectorchain` OP AS TEXT. The caller has already indented.
@@ -1056,6 +1115,26 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::val(*result),
                 mask.live().saturating_sub(1),
                 print::vector(mask.ty())
+            );
+        }
+        Op::CreateAffineMaskSet {
+            result,
+            mask_set,
+            mask_parameter,
+            ty,
+        } => {
+            // `($mask_parameter^)? attr-dict `:` type(results)` — the operand is optional and the
+            // vendor omits it entirely when the set has no symbol (`dynamic_pt_masking.mlir:296`).
+            let parameter = match mask_parameter {
+                Some(v) => format!(" {}", print::val(*v)),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.create_affine_mask{parameter} {{mask_set = {}}} : {}",
+                print::val(*result),
+                print::integer_set(mask_set),
+                print::vector(*ty)
             );
         }
     }

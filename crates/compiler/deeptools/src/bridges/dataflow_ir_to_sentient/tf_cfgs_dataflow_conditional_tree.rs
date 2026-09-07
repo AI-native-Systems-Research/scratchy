@@ -79,7 +79,7 @@
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::ProgramUnit;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith, scf};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
 
 /// WHICH TRANSFORM MERGED THE OPERATIONS — the prefix a merged `dbgName` opens with.
 ///
@@ -610,6 +610,7 @@ mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
     use crate::islands::dataflow_ir::Units;
+    use crate::islands::dataflow_ir::ty::IntegerSet;
     use crate::units::DfirUnit;
 
     /// 🎯 097/384 — TWO MERGES OF THREE CONDITIONALS PRODUCE THE REFERENCE'S OWN NESTED NAME.
@@ -901,4 +902,327 @@ mod unit_tests {
         assert_eq!(oe.cache, defaults.cache);
         assert_eq!(oe.block_args, BlockArgEquivalence::SameOwnerAndIndex);
     }
+
+    /// 🎯 095/384 — THE TWO CONDITIONALS ARE SELECTED AND NOTHING ELSE IS.
+    ///
+    /// `return isa<mlir::affine::AffineIfOp, mlir::scf::IfOp>(op);`
+    /// (`Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:34-36`) — a loop is not a
+    /// conditional even though the pass walks both.
+    #[test]
+    fn only_an_affine_if_and_an_scf_if_are_selected() {
+        let scf_if = DfirOp::Scf(scf::Op::If {
+            cond: Val(0),
+            body: Vec::new(),
+            else_body: Vec::new(),
+        });
+        let affine_if = DfirOp::Affine(affine::Op::If {
+            set: IntegerSet::from_sizes(&[4]),
+            args: vec![Val(1)],
+            symbol_args: Vec::new(),
+            results: Vec::new(),
+            body: Vec::new(),
+            else_body: Vec::new(),
+        });
+        let parallel = DfirOp::Scf(scf::Op::Parallel {
+            ivs: vec![Val(2)],
+            body: Vec::new(),
+        });
+
+        assert!(is_operation_selected(&scf_if));
+        assert!(is_operation_selected(&affine_if));
+        assert!(!is_operation_selected(&parallel));
+        assert!(!is_operation_selected(&DfirOp::Scf(scf::Op::Yield {
+            operands: Vec::new(),
+        })));
+    }
+
+    /// 🎯 096/384 — THE DUMMY YIELD IS WHAT MAKES AN `else` PRINT AT ALL.
+    ///
+    /// An `scf.if` whose second region has no block prints no `else`; one whose block holds only the
+    /// elided terminator prints the reference's own text —
+    ///
+    /// ```text
+    /// } else {
+    /// }
+    /// ```
+    /// (`dcc/test/PT/issue-236.mlir:65-71`). So the observable of this function is a pair of braces,
+    /// and it is checked here through the island's printer rather than by counting ops.
+    #[test]
+    fn the_dummy_yield_is_what_makes_an_else_print() {
+        let mut op = DfirOp::Scf(scf::Op::If {
+            cond: Val(0),
+            body: vec![DfirOp::Scf(scf::Op::Yield {
+                operands: Vec::new(),
+            })],
+            else_body: Vec::new(),
+        });
+
+        let mut before = String::new();
+        crate::islands::dataflow_ir::print::emit(&mut before, &op, 0);
+        assert!(
+            !before.contains("else"),
+            "an empty region is NO BLOCK, and MLIR prints no else for one: {before}"
+        );
+
+        let region = EmptyElseRegion::of(&mut op).expect("an scf.if with an empty else region");
+        assert_eq!(region.kind(), ConditionalKind::Scf);
+        create_dummy_yield_in_else_reg(region);
+
+        let mut after = String::new();
+        crate::islands::dataflow_ir::print::emit(&mut after, &op, 0);
+        assert!(after.contains("} else {"), "{after}");
+        assert!(
+            !after.contains("scf.yield"),
+            "the terminator is ELIDED, not dropped: {after}"
+        );
+
+        let DfirOp::Scf(scf::Op::If { else_body, .. }) = &op else {
+            unreachable!("built above")
+        };
+        assert_eq!(
+            else_body.as_slice(),
+            [DfirOp::Scf(scf::Op::Yield {
+                operands: Vec::new(),
+            })],
+            "and the op IS in the region"
+        );
+    }
+
+    /// 🎯 096/384 — AN `else` THAT ALREADY HAS A BLOCK IS NOT A CANDIDATE, AND NEITHER IS AN
+    /// `affine.if` THAT YIELDS A VALUE.
+    ///
+    /// `if (if_op->getRegions()[1].empty() && if_op->getNumResults() == 0)`
+    /// (`CFGSDataflowConditionalTree.cpp:383-386`) — the conjunction, both halves.
+    #[test]
+    fn a_populated_else_and_a_value_yielding_if_are_not_candidates() {
+        let mut populated = DfirOp::Scf(scf::Op::If {
+            cond: Val(0),
+            body: Vec::new(),
+            else_body: vec![DfirOp::Scf(scf::Op::Yield {
+                operands: Vec::new(),
+            })],
+        });
+        assert!(EmptyElseRegion::of(&mut populated).is_none());
+
+        let mut yields_a_value = DfirOp::Affine(affine::Op::If {
+            set: IntegerSet::from_sizes(&[4]),
+            args: vec![Val(1)],
+            symbol_args: Vec::new(),
+            results: vec![Val(2)],
+            body: Vec::new(),
+            else_body: Vec::new(),
+        });
+        assert!(EmptyElseRegion::of(&mut yields_a_value).is_none());
+    }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 095/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH OF THE TWO CONDITIONAL OPS ONE STATEMENT IS.
+///
+/// # ⛔⛔ A TYPE, BECAUSE TWO FUNCTIONS ASK AND ONE OF THEM ABORTS ON THE ANSWER
+///
+/// `isOperationSelected` (entry 095) needs only *whether*; `createDummyYieldInElseReg` (entry 096)
+/// needs *which*, and closes with `llvm_unreachable("unexpected IfOp type")` for anything else
+/// (`CFGSDataflowConditionalTree.cpp:393`). Naming the two kinds once makes the second question
+/// answerable without a second `isa<>` chain, and makes that `llvm_unreachable` UNWRITABLE: there is
+/// no third variant to fall past.
+///
+/// ⭐ AND IT IS THE WHOLE OF THE REFERENCE'S LIST. `isa<mlir::affine::AffineIfOp, scf::IfOp>` names
+/// exactly these two (`:34`) — no `sentient.if`, which is one rung down, and no loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalKind {
+    /// `affine.if` — `mlir::affine::AffineIfOp`, the DataflowIR rung's own conditional, branching on
+    /// whether its operands satisfy an integer set.
+    Affine,
+    /// `scf.if` — `scf::IfOp`, branching on an `i1` the program already computed.
+    Scf,
+}
+
+impl ConditionalKind {
+    /// WHICH KIND ONE STATEMENT IS, or `None` for a statement that is not a conditional.
+    ///
+    /// ⛔ TOTAL OVER THE ISLAND'S OPS, NO WILDCARD ANYWHERE. This is the tree's entire node
+    /// predicate, so an op added to the island must say whether it is a conditional rather than
+    /// inheriting `false` — a wildcard here would silently shrink every conditional tree the moment
+    /// a third `if` form arrived.
+    #[must_use]
+    pub fn of(op: &DfirOp) -> Option<ConditionalKind> {
+        match op {
+            // ── the two the reference names ──────────────────────────────────────────────────────
+            DfirOp::Affine(affine::Op::If { .. }) => Some(ConditionalKind::Affine),
+            DfirOp::Scf(scf::Op::If { .. }) => Some(ConditionalKind::Scf),
+
+            // ── everything else, spelled out per dialect the predicate mentions ──────────────────
+            DfirOp::Affine(
+                affine::Op::For { .. }
+                | affine::Op::Apply { .. }
+                | affine::Op::Yield { .. }
+                | affine::Op::VectorLoad { .. }
+                | affine::Op::VectorStore { .. },
+            ) => None,
+            DfirOp::Scf(
+                scf::Op::Yield { .. } | scf::Op::Parallel { .. } | scf::Op::For { .. },
+            ) => None,
+
+            // ── dialects `isa<AffineIfOp, IfOp>` does not mention at all ─────────────────────────
+            DfirOp::Arith(_)
+            | DfirOp::Dataflow(_)
+            | DfirOp::Agen(_)
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => None,
+        }
+    }
+}
+
+/// Replaces: e095_isOperationSelected
+///
+/// # WHETHER THE CONDITIONAL TREE TAKES THIS OP AS A NODE
+///
+/// ```cpp
+/// bool CFGSDataflowConditionalTree::isOperationSelected(const Operation &op) {
+///   return isa<mlir::affine::AffineIfOp, scf::IfOp>(&op);
+/// }
+/// ```
+/// (`dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:33-35`)
+///
+/// ⭐⭐ TWO LINES THAT DECIDE WHAT SEVEN PASSES SEE. `OperationTree::compute()` builds its tree out
+/// of the ops this accepts, so "the tree is empty" is a question about UNDECIDED BRANCHES and not
+/// about program size — every one of `CFGSimplificationDataflowLevel`'s seven steps is a no-op on a
+/// unit for which this answers `false` everywhere. `opHasSideEffect` (entry 176) also calls it, to
+/// exclude a nested conditional from its own side-effect scan (`:40`).
+///
+/// ⛔ THE `const Operation &` IS TAKEN BY SHARED REFERENCE HERE TOO — this asks a question and
+/// changes nothing, which is what separates it from entry 096 next door.
+#[must_use]
+pub fn is_operation_selected(op: &DfirOp) -> bool {
+    ConditionalKind::of(op).is_some()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 096/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A CONDITIONAL WHOSE `else` REGION HAS NO BLOCK AND WHICH BINDS NOTHING — entry 096's two
+/// `DT_CHECK`s, as a type.
+///
+/// # ⛔⛔ THE PRECONDITIONS ARE THE MINTING RULE, NOT A RUNTIME TEST
+///
+/// ```cpp
+/// DT_CHECK_MSG(if_op, "Expect valid op.");
+/// DT_CHECK_MSG(
+///     if_op->getNumResults() == 0 && if_op->getRegions()[1].empty(),
+///     "Expect conditionals with empty else regions to yield no values.");
+/// ```
+/// (`CFGSDataflowConditionalTree.cpp:384-387`)
+///
+/// Three facts, each discharged where it is stated:
+///
+/// * `if_op` non-null — ⛔ **UNREPRESENTABLE HERE.** [`Self::of`] takes `&mut DfirOp`, and a Rust
+///   reference is never null.
+/// * `getNumResults() == 0` — [`super::super::islands::dataflow_ir::dialects::scf::Op::If`] carries
+///   no result list at all (it is DISCHARGED BY CONSTRUCTION for an `scf.if`), and an `affine.if`
+///   with a non-empty `results` list is declined by [`Self::of`].
+/// * `getRegions()[1].empty()` — declined by [`Self::of`] when the `else` region already holds a
+///   block. ⭐ This is the one that makes the whole function observable: see the note on
+///   [`super::super::islands::dataflow_ir::dialects::scf::Op::If::else_body`] for why "no block" and
+///   "a block holding only a terminator" are two different ops and print differently.
+///
+/// ⭐ AND THE KIND TRAVELS WITH IT, so [`create_dummy_yield_in_else_reg`] cannot reach the
+/// reference's `llvm_unreachable`.
+#[derive(Debug)]
+pub struct EmptyElseRegion<'a> {
+    /// Which conditional it is — decides which dialect's terminator goes in.
+    kind: ConditionalKind,
+    /// The `else` region's statement list, empty at minting time.
+    else_body: &'a mut Vec<DfirOp>,
+}
+
+impl<'a> EmptyElseRegion<'a> {
+    /// THE ONLY WAY TO MINT ONE — `None` for any op the reference's two checks would stop on.
+    #[must_use]
+    pub fn of(op: &'a mut DfirOp) -> Option<EmptyElseRegion<'a>> {
+        match op {
+            // ⛔ THE RESULT LIST IS CHECKED FIRST, as the reference's conjunction reads it. An
+            // `affine.if` that yields a value cannot take a bare `affine.yield` in one arm and a
+            // value-carrying one in the other.
+            DfirOp::Affine(affine::Op::If {
+                results, else_body, ..
+            }) if results.is_empty() && else_body.is_empty() => Some(EmptyElseRegion {
+                kind: ConditionalKind::Affine,
+                else_body,
+            }),
+            DfirOp::Scf(scf::Op::If { else_body, .. }) if else_body.is_empty() => {
+                Some(EmptyElseRegion {
+                    kind: ConditionalKind::Scf,
+                    else_body,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Which conditional this is.
+    #[must_use]
+    pub fn kind(&self) -> ConditionalKind {
+        self.kind
+    }
+}
+
+/// Replaces: e096_createDummyYieldInElseReg
+///
+/// # ADD A DUMMY YIELD TO THE `else` REGION
+///
+/// ```cpp
+/// /// Add a dummy yield op to the else region of \p if_op.
+/// /// Expect \p if_op's else region to be empty, and \p if_op to yield no values.
+/// static void createDummyYieldInElseReg(Operation *if_op) {
+///   DT_CHECK_MSG(if_op, "Expect valid op.");
+///   DT_CHECK_MSG(
+///       if_op->getNumResults() == 0 && if_op->getRegions()[1].empty(),
+///       "Expect conditionals with empty else regions to yield no values.");
+///   if_op->getRegions()[1].push_back(new Block);
+///   OpBuilder builder(if_op->getRegions()[1]);
+///   if (isa<scf::IfOp>(if_op))
+///     scf::YieldOp::create(builder, if_op->getLoc());
+///   else if (isa<affine::AffineIfOp>(if_op))
+///     affine::AffineYieldOp::create(builder, if_op->getLoc());
+///   else
+///     llvm_unreachable("unexpected IfOp type");
+/// }
+/// ```
+/// (`dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:383-396`)
+///
+/// # ⭐⭐ WHY A ONE-OP FUNCTION MATTERS: `mergeShallow` MERGES REGION *i* AGAINST REGION *i*
+///
+/// `mergeShallow` (entry 177) walks `i` over both regions and takes `src->getRegions()[i].front()`
+/// and `dst->getRegions()[i].front()` — the FRONT BLOCK of each. A region with no block has no
+/// front, so when exactly one side's region is empty this runs on that side first
+/// (`:409-412`) and the merge then has two blocks to splice. Skipping it does not lose a terminator;
+/// it dereferences a block that is not there.
+///
+/// ⛔ THE OP IS THE `else` REGION'S ONLY STATEMENT AND CARRIES NO OPERANDS. `scf::YieldOp::create`
+/// and `AffineYieldOp::create` are both called with a location and nothing else, and the op yields
+/// nothing because the conditional binds nothing — which is exactly the state
+/// [`EmptyElseRegion`] certifies.
+///
+/// ⛔ WHICH DIALECT'S TERMINATOR IS NOT A FREE CHOICE. An `scf.if` verifies that its regions end in
+/// an `scf.yield` and an `affine.if` in an `affine.yield`; putting the other one in is an invalid op,
+/// not a stylistic difference. The reference distinguishes them with two `isa<>` tests and stops on
+/// a third possibility — here the possibility does not exist ([`ConditionalKind`]).
+pub fn create_dummy_yield_in_else_reg(if_op: EmptyElseRegion<'_>) {
+    // `if_op->getRegions()[1].push_back(new Block)` and the builder positioned in it are the
+    // MECHANISM for reaching an insertion point; the island's `else_body` IS the block.
+    let terminator = match if_op.kind {
+        ConditionalKind::Scf => DfirOp::Scf(scf::Op::Yield {
+            operands: Vec::new(),
+        }),
+        ConditionalKind::Affine => DfirOp::Affine(affine::Op::Yield {
+            operands: Vec::new(),
+        }),
+    };
+    if_op.else_body.push(terminator);
+}
+

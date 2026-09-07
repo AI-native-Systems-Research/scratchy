@@ -292,6 +292,15 @@ pub enum AffineExpr {
     /// ⭐ NUMBERED IN ITS OWN SPACE. `s0` and `d0` are two different variables; the map states how
     /// many of each it takes ([`AffineMap::dims`], [`AffineMap::syms`]) and prints them in two
     /// groups, `(d0, d1)[s0, s1]`.
+    ///
+    /// ⭐ AND A SECOND LOWERING TURNS ON THE SAME DIFFERENCE. `getMaskValueForPT` (entry 089) refuses
+    /// a constant mask whose set still has a symbol (*"Mask affine set should not have any symbols"*)
+    /// and refuses a dynamic one that does not have exactly one (*"Mask affine set should have 1
+    /// symbol"*) — two counts, two messages, one set (`Helper.cpp:82-85`, `:117-120`). The vendor
+    /// writes both in one line: `#set = affine_set<(d0)[s0] : (d0 + s0 * 8 - 64 >= 0, -d0 + 63 >= 0)>`
+    /// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:5`), where `d0` is the
+    /// lane and `s0` the loop iterator the mask advances with. The separate position spaces are what
+    /// let [`IntegerSet::replace_symbols`] substitute `s0` without touching `d0`.
     Sym(u32),
     /// A literal.
     Const(i64),
@@ -312,7 +321,7 @@ impl AffineExpr {
         AffineExpr::Dim(n)
     }
 
-    /// `s<n>`.
+    /// `s<n>` — `bindSymbols(context, s0)` (`Helper.cpp:204`).
     #[must_use]
     pub fn sym(n: u32) -> AffineExpr {
         AffineExpr::Sym(n)
@@ -361,6 +370,15 @@ pub struct Constraint {
 pub struct IntegerSet {
     /// How many dimensions it constrains.
     pub dims: u32,
+    /// How many SYMBOLS it takes — `getNumSymbols()`, the `[s0, ..]` list.
+    ///
+    /// ⛔ A SEPARATE COUNT FROM `dims`, BECAUSE THE REFERENCE ASKS THEM SEPARATELY AND ANSWERS
+    /// DIFFERENTLY. `mask_set.getNumDims() != 1` and `mask_set.getNumSymbols() != 0` are two refusals
+    /// with two messages in one function (`Helper.cpp:32-35`, `:82-85`), and
+    /// `replaceDimsAndSymbols({}, {affine_const}, mask_set.getNumDims(), 0)` (`:75-76`) rebuilds a set
+    /// with the SAME dims and ZERO symbols — an operation that cannot even be written if the two share
+    /// one field.
+    pub symbols: u32,
     /// The constraints, in order.
     pub constraints: Vec<Constraint>,
 }
@@ -405,6 +423,9 @@ impl IntegerSet {
         }
         IntegerSet {
             dims: u32::try_from(sizes.len()).expect("a rank fits a u32"),
+            // `buildIntegerSetFromSizes` passes `/*numSymbols=*/0` (`DataTransferLowering.cpp:68`):
+            // a rectangle's bounds are the sizes themselves, with nothing left to substitute.
+            symbols: 0,
             constraints,
         }
     }
@@ -489,6 +510,71 @@ impl IntegerSet {
         }
         tightest
     }
+
+    /// SYMBOLS SUBSTITUTED AWAY — `IntegerSet::replaceDimsAndSymbols({}, symReplacements, dims, syms)`
+    /// with the dimension list left empty, which is the only way entry 089 calls it:
+    ///
+    /// ```text
+    /// mask_set = mask_set.replaceDimsAndSymbols({}, {affine_const}, mask_set.getNumDims(), 0);
+    /// ```
+    /// (`Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp:75-76`)
+    ///
+    /// ⛔⛔ THIS IS WHAT MAKES A DYNAMIC MASK STATIC, AND IT IS NOT A COSMETIC REWRITE. `getMaskValueForPT`
+    /// reads its `d0` bounds with `getConstantBound`, which answers `None` for any row that still holds
+    /// another variable. A mask whose parameter turned out to be an `arith.constant` therefore has to
+    /// have `s0` folded into the row FIRST; without this the constant branch reads no bound at all and
+    /// the reference's `static_mask = true` assignment (`:74`) would be a lie.
+    ///
+    /// ⭐ TOTAL, AND FAITHFUL ABOUT WHAT IT LEAVES ALONE. A symbol beyond `replacements` keeps its own
+    /// position, exactly as MLIR's does — the caller states the resulting symbol count, so a partial
+    /// substitution is expressible rather than silently completed.
+    #[must_use]
+    pub fn replace_symbols(&self, replacements: &[AffineExpr], result_symbols: u32) -> IntegerSet {
+        IntegerSet {
+            dims: self.dims,
+            symbols: result_symbols,
+            constraints: self
+                .constraints
+                .iter()
+                .map(|constraint| Constraint {
+                    expr: substitute_symbols(&constraint.expr, replacements),
+                    is_equality: constraint.is_equality,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// ONE EXPRESSION WITH ITS SYMBOLS REPLACED, LEAF BY LEAF.
+///
+/// ⭐ NO FOLDING. `s0 * 8` with `s0 := 8` becomes `8 * 8`, not `64`: the constructors
+/// ([`AffineExpr::times`], [`AffineExpr::plus`]) are the only place this island normalises, and
+/// [`terms_in`] flattens a product of literals when it reads the row, so folding here would only
+/// change the printed text.
+fn substitute_symbols(expr: &AffineExpr, replacements: &[AffineExpr]) -> AffineExpr {
+    match expr {
+        AffineExpr::Sym(n) => match replacements.get(*n as usize) {
+            Some(with) => with.clone(),
+            None => AffineExpr::Sym(*n),
+        },
+        AffineExpr::Dim(_) | AffineExpr::Const(_) => expr.clone(),
+        AffineExpr::Add(a, b) => AffineExpr::Add(
+            Box::new(substitute_symbols(a, replacements)),
+            Box::new(substitute_symbols(b, replacements)),
+        ),
+        AffineExpr::Mul(a, b) => AffineExpr::Mul(
+            Box::new(substitute_symbols(a, replacements)),
+            Box::new(substitute_symbols(b, replacements)),
+        ),
+        AffineExpr::Mod(a, b) => AffineExpr::Mod(
+            Box::new(substitute_symbols(a, replacements)),
+            Box::new(substitute_symbols(b, replacements)),
+        ),
+        AffineExpr::FloorDiv(a, b) => AffineExpr::FloorDiv(
+            Box::new(substitute_symbols(a, replacements)),
+            Box::new(substitute_symbols(b, replacements)),
+        ),
+    }
 }
 
 /// `ceil(n / d)` for a POSITIVE `d` — the rounding a lower bound needs.
@@ -552,6 +638,11 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
             coeff: 1,
             constant: 0,
         },
+        // ⛔ A SYMBOL IS ANOTHER VARIABLE, NOT A CONSTANT. `d0 + s0 * 8 - 64 >= 0` bounds `d0` only
+        // once `s0` is known, and MLIR's own answer is the same: `getConstantBound` reads the
+        // flattened matrix, where a symbol column is as unresolved as another dimension's. Entry 089
+        // never asks: it SUBSTITUTES the symbol first ([`IntegerSet::replace_symbols`]) and only then
+        // reads a bound, which is exactly why `replaceDimsAndSymbols` exists in that function.
         AffineExpr::Dim(_) | AffineExpr::Sym(_) => Terms::OtherVars,
         AffineExpr::Const(c) => Terms::Const(*c),
         AffineExpr::Add(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
@@ -741,6 +832,7 @@ mod tests {
     fn set(constraints: Vec<Constraint>) -> IntegerSet {
         IntegerSet {
             dims: 1,
+            symbols: 0,
             constraints,
         }
     }
@@ -834,6 +926,7 @@ mod tests {
 
         let elsewhere = IntegerSet {
             dims: 2,
+            symbols: 0,
             constraints: vec![ineq(AffineExpr::dim(1)), upper_of(1, 63)],
         };
         assert_eq!(elsewhere.constant_bound(BoundType::Lb, 0), None);
@@ -881,6 +974,7 @@ mod tests {
     fn a_non_unit_equality_bounds_nothing() {
         let scaled = IntegerSet {
             dims: 1,
+            symbols: 0,
             constraints: vec![Constraint {
                 expr: AffineExpr::dim(0).times(2).plus(AffineExpr::Const(-4)),
                 is_equality: true,

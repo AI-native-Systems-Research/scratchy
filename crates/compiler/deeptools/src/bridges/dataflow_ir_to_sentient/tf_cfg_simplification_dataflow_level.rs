@@ -59,6 +59,7 @@
 //! | `e383_runOnOperation` | 383/384 | 80 | `dcc/src/Transform/Dataflow/CFGSimplificationDataflowLevel.cpp:77` |
 
 use crate::arch::Arch;
+use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::is_operation_selected;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, affine, agen, dataflow, scf};
 use crate::islands::dataflow_ir::{self as dfir};
 
@@ -140,37 +141,18 @@ pub const STEPS: &[Step] = &[
     Step::SimplifyValueBasedConditionals,
 ];
 
-/// WHETHER THE CONDITIONAL TREE TAKES THIS OP AS A NODE.
+/// WHETHER THE CONDITIONAL TREE TAKES THIS OP AS A NODE — the anchored unit, not a second copy.
 ///
-/// `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:34` — the whole predicate is
-/// `isa<mlir::affine::AffineIfOp, scf::IfOp>`. Nothing else is a node, which is what makes
-/// "the tree is empty" a question about undecided branches and not about program size.
+/// ⛔⛔ THIS USED TO BE ITS OWN `isa<>` CHAIN, AND THAT WAS ONE PREDICATE WRITTEN TWICE.
+/// `isOperationSelected` (`CFGSDataflowConditionalTree.cpp:34`) is bridge-2 entry **095**, homed in
+/// [`super::tf_cfgs_dataflow_conditional_tree`]; this file needed the same question and answered it
+/// locally, before that entry was ported. Two records of one fact, and the local one carried a note
+/// that the `affine.if` half had no island variant — which is now false. It delegates.
 ///
-/// ⛔⛔ THE `affine.if` HALF HAS NO ISLAND VARIANT YET, AND THE MATCH IS EXHAUSTIVE SO THAT ADDING ONE
-/// CANNOT MISS IT. `affine::Op` declares five ops and none of them is `if`; a `DfirOp::Affine(_)`
-/// wildcard would answer `false` for an `affine::Op::If` the day somebody adds it, and this pass
-/// would then silently decline to simplify the very programs it exists for. Spelling the five out
-/// makes that a build error here.
+/// ⭐ THE CALL SITE IS UNCHANGED. `count_conditionals` still asks the same question of the same ops;
+/// the answer now comes from the one function the reference has.
 fn is_selected(op: &DfirOp) -> bool {
-    match op {
-        // ── the tree's two node kinds ────────────────────────────────────────────────────────────
-        DfirOp::Scf(scf::Op::If { .. }) => true,
-
-        // ── everything else, spelled out where the predicate names the dialect ───────────────────
-        DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. } | scf::Op::For { .. }) => {
-            false
-        }
-        DfirOp::Affine(
-            affine::Op::For { .. }
-            | affine::Op::Apply { .. }
-            | affine::Op::Yield { .. }
-            | affine::Op::VectorLoad { .. }
-            | affine::Op::VectorStore { .. },
-        ) => false,
-
-        // ── dialects the predicate does not name at all ──────────────────────────────────────────
-        DfirOp::Arith(_) | DfirOp::Dataflow(_) | DfirOp::Agen(_) | DfirOp::VectorChain(_) => false,
-    }
+    is_operation_selected(op)
 }
 
 /// PREORDER, DESCENDING INTO EVERY REGION — `walk<WalkOrder::PreOrder>`.
@@ -197,13 +179,23 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
             DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
                 walk_preorder(&transfer.body, visit);
             }
+            // ⭐ AN `affine.if` HAS TWO REGIONS TOO, and now that the island can hold one the walk
+            // has to descend into both — a preorder walk that skipped them would report a tree with
+            // no nodes for a program whose conditionals are all at the affine rung.
+            DfirOp::Affine(affine::Op::If {
+                body, else_body, ..
+            }) => {
+                walk_preorder(body, visit);
+                walk_preorder(else_body, visit);
+            }
             // no region.
             DfirOp::Arith(_)
             | DfirOp::Affine(_)
             | DfirOp::Scf(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
-            | DfirOp::VectorChain(_) => {}
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => {}
         }
     }
 }
