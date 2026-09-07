@@ -8,7 +8,9 @@ use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName, SyncSignal};
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{AffineMap, MemRef, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, Constraint, IntegerSet, MemRef, Vector,
+};
 
 /// WHERE ONE OF AN OPAQUE'S REGISTERS LIVES — the value its name binds to.
 ///
@@ -184,6 +186,141 @@ impl Precision {
     }
 }
 
+/// ONE PAGE'S EXTENT IN ONE VIEW DIMENSION — the inclusive span `lo ..= hi`.
+///
+/// ⛔⛔ INCLUSIVE, BECAUSE THE SET IT PRINTS AS IS. A page's `idx_set` writes its upper side as
+/// `-dk + <hi> >= 0` — `-d0 + 63 >= 0` is lanes `0 ..= 63`
+/// (`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:10`) — so `hi` is the last element and not the
+/// count. See [`crate::islands::dataflow_ir::ty::BoundType`], whose `Ub` says the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageSpan {
+    /// The first element of the page along this dimension.
+    pub lo: i64,
+    /// The last element, INCLUSIVE.
+    pub hi: i64,
+}
+
+/// ONE PAGE'S `idx_set` — a hyper-rectangle, one span per view dimension.
+///
+/// # ⛔⛔ A RECTANGLE BY CONSTRUCTION, WHICH IS A VERIFIER ERROR AND TWO `DT_CHECK`s DELETED
+///
+/// `GetPagedLogicalMemoryViewOp::verify` refuses a page whose set is not hyper-rectangular —
+/// *"idx_set should be hyper rectangular"* (`DataflowOps.cpp:291-293`, and
+/// `dcc/test/Transform/TransformPagedMemView/paged_mem_view_diag_2.mlir:30` is the test that
+/// provokes it) — `getPageValidity` `DT_CHECK`s the same property again
+/// (`TransformPagedMemViewImpl.cpp:117-119`), and `calculateStartElementsForPage` `DT_CHECK`s the
+/// consequence, *"expected constant lower bound"* (`:539`). A per-dimension span cannot express a
+/// non-rectangle and always has a constant lower bound, so all three checks become the type.
+///
+/// ⭐ AND IT PRINTS THE SET THE REFERENCE PRINTS — see [`PageRect::as_integer_set`], whose
+/// [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`] answers exactly what
+/// `getConstantBound(LB, dim)` answers on the flattened form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRect {
+    /// The spans, outermost dimension first — `d0` is `spans[0]`.
+    pub spans: Vec<PageSpan>,
+}
+
+impl PageRect {
+    /// THE `affine_set<..>` THIS RECTANGLE IS WRITTEN AS.
+    ///
+    /// A pinned dimension is one equality (`d2 == 0`); a spanning one is the PAIR `dk - lo >= 0` and
+    /// `-dk + hi >= 0`, with the `- lo` omitted when `lo` is zero. That is IBM's own spelling:
+    /// `(d0 >= 0, -d0 + 63 >= 0, d1 - 2 >= 0, -d1 + 3 >= 0, d2 == 0)`
+    /// (`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:11`, the round-tripped form of `#set1`).
+    #[must_use]
+    pub fn as_integer_set(&self) -> IntegerSet {
+        let mut constraints = Vec::new();
+        for (i, span) in self.spans.iter().enumerate() {
+            let dim = AffineExpr::dim(u32::try_from(i).expect("a rank fits a u32"));
+            // `dk - lo`, or the bare dimension when the page starts at zero.
+            let from_lo = if span.lo == 0 {
+                dim.clone()
+            } else {
+                dim.clone().plus(AffineExpr::Const(-span.lo))
+            };
+            if span.lo == span.hi {
+                // A single element is pinned, which is how `buildIntegerSetFromSizes` writes a size
+                // of one (`DataTransferLowering.cpp:40-69`) and how `d2 == 0` is written above.
+                constraints.push(Constraint {
+                    expr: from_lo,
+                    is_equality: true,
+                });
+            } else {
+                constraints.push(Constraint {
+                    expr: from_lo,
+                    is_equality: false,
+                });
+                constraints.push(Constraint {
+                    expr: dim.times(-1).plus(AffineExpr::Const(span.hi)),
+                    is_equality: false,
+                });
+            }
+        }
+        IntegerSet {
+            dims: u32::try_from(self.spans.len()).expect("a rank fits a u32"),
+            constraints,
+        }
+    }
+}
+
+/// ONE PAGE OF A PAGED VIEW — its extent and where it starts.
+///
+/// # ⛔⛔ THE PAIRING IS THE TYPE, AND THAT IS THE OP'S FIRST VERIFIER ERROR DELETED
+///
+/// The reference carries the two halves apart — `idx_sets` is an `ArrayAttr`, `page_start_addrs` a
+/// variadic operand list — and then has to check they agree: *"there should be a start address and
+/// idx_set for every page"* (`DataflowOps.cpp:276-278`). Its printer asserts it a second time
+/// (`:252-254`) before zipping them. One vector of pairs cannot disagree with itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// `idx_set = ..` — which elements of the view this page holds.
+    pub idx_set: PageRect,
+    /// `start_addr = ..` — where the page begins, in ELEMENTS, relative to the view's own start.
+    ///
+    /// ⚠️ THE VERIFIER ALSO REQUIRES THIS TO BE AN `arith.constant`: *"page start addresses should be
+    /// arith::ConstantOp"* (`DataflowOps.cpp:282-285`). That is a fact about the op that defines the
+    /// value, not about the value, so it stays with whoever mints it — the same shape
+    /// [`super::arith::Op::Compare`]'s `rhs` documents.
+    pub start_addr: Val,
+}
+
+/// A `dataflow.get_paged_logical_memory_view` — one view over SEVERAL disjoint pages.
+///
+/// # ⛔⛔ WITHOUT THIS OP `TransformPagedMemView` HAS NO INPUT
+///
+/// The whole pass exists to remove it: it picks the page a subscript can reach, guards the access
+/// with the conditions that prove the page is the right one, and rewrites the access against a plain
+/// [`Op::GetLogicalMemoryView`] over that page's start
+/// (`dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545-558`, entry
+/// 124). A paged view is therefore the one thing every one of that file's 39 functions reads, and
+/// nothing downstream of the pass ever sees one.
+///
+/// ⭐ ITS OPERANDS ARE `Index:$unit, Index:$start_addr, Variadic<Index>:$page_start_addrs` with
+/// `AffineMapAttr:$layout_map` and `ArrayAttr:$idx_sets` (`Dataflow.td:267-299`) — so a page's start
+/// address is an OPERAND and its extent is an ATTRIBUTE. [`Page`] holds them together.
+///
+/// ⛔ BOXED, for the reason [`super::agen::Op::CompositeLoadAndStore`] gives: it carries a page list,
+/// an affine map and a memref, and an enum is as large as its largest variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagedMemView {
+    /// The view it binds.
+    pub result: Val,
+    /// `$unit` — the memory unit viewed.
+    pub unit: Val,
+    /// `$start_addr` — the view's own start, in elements. A page's start is relative to it: entry
+    /// 124 emits `arith.addi %start_addr, %page_start_addr`.
+    pub start_addr: Val,
+    /// The pages, in the order the printer names them — `page0`, `page1`, ...
+    pub pages: Vec<Page>,
+    /// `layout_map` — how the view's indices map onto the linear region. The non-paged view entry
+    /// 124 creates carries this same map.
+    pub layout: AffineMap,
+    /// The view's type, which the non-paged view inherits: `cast<MemRefType>(getResult().getType())`
+    /// (`TransformPagedMemViewImpl.cpp:553`).
+    pub ty: MemRef,
+}
+
 /// ONE `dataflow` OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -248,6 +385,10 @@ pub enum Op {
         /// The view's type.
         ty: MemRef,
     },
+
+    /// `dataflow.get_paged_logical_memory_view %unit, %start {layout_map} {segments = page0: (..)}`
+    /// — see [`PagedMemView`], which is the whole of it.
+    GetPagedLogicalMemoryView(Box<PagedMemView>),
 
     /// `dataflow.program_unit %unit {precision} : { .. }` — one unit's whole program.
     ProgramUnit {
@@ -416,6 +557,50 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::memref(ty)
             );
         }
+        // ⭐ THREE LINES, AS THE OP'S OWN PRINTER WRITES IT: the two operands and the attribute
+        // dictionary, then `{segments =` on its own line, then one line per page
+        // (`DataflowOps.cpp:240-269`). The trailing type list is the unit's, the start address's and
+        // the result's — `index, index, memref<..>`.
+        //
+        // ⚠️ ONE CHARACTER FEWER THAN THE REFERENCE: it writes `"  {segments = "` and then a
+        // newline (`:248-249`), so its line ends in a SPACE. FileCheck's substring match hides it,
+        // which is why IBM's own autogenerated expectation reads `{segments =`
+        // (`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:20`), and the parser cannot see it either.
+        // Emitting the space would make the test below un-writable from the file it quotes.
+        Op::GetPagedLogicalMemoryView(view) => {
+            let PagedMemView {
+                result,
+                unit,
+                start_addr,
+                pages,
+                layout,
+                ty,
+            } = view.as_ref();
+            let _ = writeln!(
+                out,
+                "{} = dataflow.get_paged_logical_memory_view {}, {} {{layout_map = {}}}",
+                print::val(*result),
+                print::val(*unit),
+                print::val(*start_addr),
+                print::affine_map(layout)
+            );
+            print::indent(out, depth);
+            out.push_str("  {segments =");
+            for (page_num, page) in pages.iter().enumerate() {
+                if page_num > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                print::indent(out, depth);
+                let _ = write!(
+                    out,
+                    "    page{page_num}: (idx_set = {}, start_addr = {})",
+                    print::integer_set(&page.idx_set.as_integer_set()),
+                    print::val(page.start_addr)
+                );
+            }
+            let _ = writeln!(out, "}} : index, index, {}", print::memref(ty));
+        }
         Op::ProgramUnit {
             units,
             precision,
@@ -568,9 +753,12 @@ fn dictionary<K: Copy, V: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use crate::islands::dataflow_ir::dialects::dataflow::Op;
+    use crate::islands::dataflow_ir::dialects::dataflow::{
+        Op, Page, PageRect, PageSpan, PagedMemView,
+    };
     use crate::islands::dataflow_ir::dialects::{self, Val};
     use crate::islands::dataflow_ir::print::emit;
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef};
     use crate::units::{Core, Corelet, DfirUnit, Residency};
 
     /// A core this build's arch has.
@@ -673,5 +861,78 @@ mod tests {
             got.lines().count(),
             "emitted a different number of unit lines than IBM's block has"
         );
+    }
+
+    /// 🎯 IBM'S OWN PAGED VIEW, REPRODUCED — `dcc/test/Dialect/Dataflow/paged_mem_view.mlir`, whose
+    /// only purpose is to round-trip this op.
+    ///
+    /// ⛔⛔ THE FOUR-LINE SHAPE IS THE OP'S OWN PRINTER AND NOTHING GENERIC. `printOptionalAttrDict`
+    /// elides `idx_sets` and then a hand-written loop writes `page<N>: (idx_set = .., start_addr =
+    /// ..)` one per line with the comma BEFORE the newline (`DataflowOps.cpp:239-267`). Every part of
+    /// that is a choice: the two-space `{segments =` continuation, the four-space page indent, the
+    /// three-type trailing list. A test that only checked "the pages are all there" would agree with
+    /// an emitter that wrote them in a flat attribute dictionary, which `dcc-opt` cannot parse.
+    ///
+    /// ⭐⭐ AND IT PINS THE TWO SETS, WHICH IS WHERE [`PageRect`] EARNS ITS KEEP. `#set` starts at
+    /// zero and prints `d0 >= 0`; `#set1` starts at 2 and prints `d1 - 2 >= 0` — a SUBTRACTION, the
+    /// spelling MLIR uses for a negative addend and the reason [`crate::islands::dataflow_ir::print`]
+    /// grew that arm. The pinned third dimension prints `d2 == 0` rather than a `>= 0` pair.
+    ///
+    /// ⚠️ ONE DEVIATION, AND IT IS THE ISLAND'S TYPE: IBM writes `memref<?x?x64xf16>`, and
+    /// [`crate::islands::dataflow_ir::ty::MemRef`] holds extents rather than a dynamic marker (a `?`
+    /// in an emitted view is a shape nobody downstream could size), so this asks for
+    /// `memref<64x4x64xf16>` — the concrete extents the two pages cover.
+    #[test]
+    fn reproduces_ibms_paged_memory_view() {
+        // `#map = affine_map<(d0, d1, d2) -> (d2 * 64 + d1 * 64 + d0)>`.
+        let layout = AffineMap {
+            dims: 3,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(64)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        // 64 lanes of every page; page 0 holds rows 0..=1 and page 1 rows 2..=3; the third
+        // dimension is pinned to element 0 in both.
+        let page = |lo, hi, start_addr| Page {
+            idx_set: PageRect {
+                spans: vec![
+                    PageSpan { lo: 0, hi: 63 },
+                    PageSpan { lo, hi },
+                    PageSpan { lo: 0, hi: 0 },
+                ],
+            },
+            start_addr,
+        };
+        let op = dialects::Op::Dataflow(Op::GetPagedLogicalMemoryView(Box::new(PagedMemView {
+            result: Val(5),
+            unit: Val(1),
+            start_addr: Val(2),
+            pages: vec![page(0, 1, Val(3)), page(2, 3, Val(4))],
+            layout,
+            ty: MemRef {
+                shape: vec![64, 4, 64],
+                elem: ElemType::F16,
+            },
+        })));
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        // `paged_mem_view.mlir:19-22`, with the shape noted above and IBM's `%[[VAL_n]]` capture
+        // names resolved to the values they stood for.
+        let want = concat!(
+            "%5 = dataflow.get_paged_logical_memory_view %1, %2 ",
+            "{layout_map = affine_map<(d0, d1, d2) -> (d2 * 64 + d1 * 64 + d0)>}\n",
+            "  {segments =\n",
+            "    page0: (idx_set = affine_set<(d0, d1, d2) : ",
+            "(d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 == 0)>, start_addr = %3),\n",
+            "    page1: (idx_set = affine_set<(d0, d1, d2) : ",
+            "(d0 >= 0, -d0 + 63 >= 0, d1 - 2 >= 0, -d1 + 3 >= 0, d2 == 0)>, start_addr = %4)",
+            "} : index, index, memref<64x4x64xf16>\n",
+        );
+        assert_eq!(got, want);
     }
 }

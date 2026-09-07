@@ -98,14 +98,746 @@
 //!
 //! Original files homed here: `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp`, `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp`
 
-
 use super::agen_access_details::{TimeBound, TimeDim};
 use super::agen_helper::{AgenOpKind, store_op_from_load_store_pattern};
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, agen, results, uses};
-use crate::islands::dataflow_ir::ty::IntegerSet;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
+use crate::islands::dataflow_ir::dialects::dataflow::{Page, PageRect, PagedMemView};
+use crate::islands::dataflow_ir::dialects::{
+    self, Index, Op as DfirOp, Val, agen, arith, dataflow, results, scf, uses,
+};
+use crate::islands::dataflow_ir::ty::{IntegerSet, MemRef, ScalarTy, Vector};
 use crate::units::DfirUnit;
 use core::num::NonZeroU32;
 use std::collections::BTreeSet;
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 121/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE BOUND OF ONE SUBSCRIPT, AS THE THREE OPS THAT TEST IT — an `arith.constant`, an
+/// `arith.cmpi` and a one-armed `scf.if`.
+///
+/// ⭐ THE THREE ARE ONE THING. `arith.cmpi` takes two operands of the same type, so the bound has to
+/// be minted as a constant first (see [`arith::Op::Compare`]'s `rhs`), and the `scf.if` exists only
+/// to hold what the comparison guards. Naming them separately would let a caller emit two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundGuard {
+    /// The subscript under test — `lhs`, the same value in every guard of one dimension.
+    pub lhs: Val,
+    /// `sge` for a lower bound, `sle` for an upper one.
+    pub predicate: CmpIPredicate,
+    /// The literal the `arith.constant` binds — `rhs_lb` or `rhs_ub`.
+    pub bound: i64,
+    /// The value that constant binds.
+    pub constant: Val,
+    /// The `i1` the `arith.cmpi` binds, which the `scf.if` branches on.
+    pub cond: Val,
+}
+
+/// THE CONDITION UNDER WHICH ONE ACCESS REACHES ONE PAGE — a nest of one-armed `scf.if`s, still
+/// empty.
+///
+/// # ⛔⛔ THE GUARDS ARE HELD, NOT YET EMITTED, BECAUSE THE REFERENCE MOVES THE BUILDER INSTEAD
+///
+/// `createInequalityCondition` emits the lower bound's three ops, points the builder at the `scf.if`
+/// it just made (`builder = lb_if_op.getThenBodyBuilder()`, `:270`) and emits the upper bound's three
+/// INSIDE it — so the ops it creates and the statements it will guard interleave, and the caller's
+/// builder is left at the innermost point. A returned nest with a hole in the middle cannot be
+/// written down; a list of guards plus [`Condition::wrap`] can, and it emits the same ops in the same
+/// order with the same nesting.
+///
+/// ⭐ WHICH ALSO MAKES THE NESTING OF SUCCESSIVE DIMENSIONS ONE OPERATION — see
+/// [`Condition::and_then`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Condition {
+    /// The guards, OUTERMOST FIRST: the order the reference emits them in, which is the order they
+    /// nest in.
+    pub guards: Vec<BoundGuard>,
+}
+
+impl Condition {
+    /// THE STATEMENTS, WRAPPED IN THIS CONDITION — the whole emission of a `create*Condition` call.
+    ///
+    /// The list reads: `arith.constant`, `arith.cmpi`, `scf.if` — and inside that `scf.if`'s then
+    /// region, the next guard's three, and inside the innermost one, `guarded`.
+    ///
+    /// ⭐ BUILT INSIDE OUT, so the nest needs no descent into a region it has already built and there
+    /// is no position a walk could fail to find.
+    #[must_use]
+    pub fn wrap(&self, guarded: Vec<DfirOp>) -> Vec<DfirOp> {
+        let mut ops = guarded;
+        for guard in self.guards.iter().rev() {
+            ops = vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: guard.constant,
+                    value: guard.bound,
+                }),
+                DfirOp::Arith(arith::Op::Compare {
+                    result: guard.cond,
+                    predicate: guard.predicate,
+                    lhs: guard.lhs,
+                    rhs: guard.constant,
+                }),
+                DfirOp::Scf(scf::Op::If {
+                    cond: guard.cond,
+                    body: ops,
+                    // ⛔ ONE-ARMED, WHICH IS THE `false` LAST ARGUMENT OF EVERY `scf::IfOp::create`
+                    // in this file. A page a subscript cannot reach has nothing to do, not something
+                    // else to do.
+                    else_body: Vec::new(),
+                }),
+            ];
+        }
+        ops
+    }
+
+    /// THIS CONDITION WITH `inner`'s GUARDS INSIDE ITS OWN.
+    ///
+    /// ⭐⭐ THIS IS HOW SUCCESSIVE DIMENSIONS NEST. `createConditionsForHyperRectSubscripts` walks the
+    /// subscript map dimension by dimension and each call emits into what the previous one created —
+    /// the builder is never moved back out (`TransformPagedMemViewImpl.cpp:289-341`, entry 198) — so
+    /// dimension 1's guards sit inside dimension 0's then-region. Concatenation is that nesting, and
+    /// it keeps [`Condition::wrap`] the only place ops are built.
+    #[must_use]
+    pub fn and_then(mut self, inner: Condition) -> Condition {
+        self.guards.extend(inner.guards);
+        self
+    }
+}
+
+/// Replaces: e121_createInequalityCondition
+///
+/// **121/384** `TPMVBase::createInequalityCondition` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263` (14L).
+///
+/// ```cpp
+/// Operation *TPMVBase::createInequalityCondition(OpBuilder &builder, Value &lhs,
+///                                                int64_t rhs_lb, int64_t rhs_ub) {
+///   auto lb_const = arith::ConstantIndexOp::create(builder, lhs.getLoc(), rhs_lb);
+///   auto lb_cond = mlir::arith::CmpIOp::create(
+///       builder, lhs.getLoc(), mlir::arith::CmpIPredicate::sge, lhs, lb_const);
+///   auto lb_if_op = mlir::scf::IfOp::create(builder, lhs.getLoc(),
+///                                           lb_cond.getResult(), false);
+///   builder = lb_if_op.getThenBodyBuilder();
+///
+///   auto ub_const =
+///       mlir::arith::ConstantIndexOp::create(builder, lhs.getLoc(), rhs_ub);
+///   auto ub_cond = mlir::arith::CmpIOp::create(
+///       builder, lhs.getLoc(), mlir::arith::CmpIPredicate::sle, lhs, ub_const);
+///   return mlir::scf::IfOp::create(builder, lhs.getLoc(), ub_cond.getResult(),
+///                                  false);
+/// }
+/// ```
+///
+/// # ⛔⛔ TWO CONDITIONALS, NESTED — NOT ONE `andi` OF TWO COMPARISONS
+///
+/// A span is `lhs >= lb` AND `lhs <= ub`, and the obvious spelling of that is one `arith.andi` over
+/// two `cmpi`s under one `scf.if`. The reference emits **six** ops in **two** nested one-armed
+/// `scf.if`s, and the shape is load-bearing downstream: `CFGSDataflowConditionalTree` builds its tree
+/// out of `scf.if`s whose conditions are `cmpi`s, and reads the LHS and RHS straight off the
+/// comparison ([`super::tf_cfgs_dataflow_conditional_tree`], entry 098). A conjunction behind an
+/// `andi` is a condition it cannot decompose, so the tree that merges these conditionals across pages
+/// would see one opaque predicate per access instead of two comparable bounds.
+///
+/// ⭐ AND THE PREDICATES ARE SIGNED — `sge` then `sle`, in that order, on `index`. A page's bounds
+/// come out of [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`], which is signed
+/// arithmetic over an `affine_set`, so an unsigned comparison would be a different question.
+///
+/// ⛔ THE `builder` PARAMETER IS BY REFERENCE AND IS REASSIGNED (`:270`), which is the whole reason
+/// this returns a [`Condition`] rather than a list of ops: the caller's insertion point ends up
+/// INSIDE the inner conditional, and everything emitted afterwards is what the two comparisons guard.
+/// [`Condition::wrap`] is that, and `lhs.getLoc()` — threaded through all six creations because MLIR
+/// ops carry source locations — is the mechanism this island has no equivalent of.
+#[must_use]
+pub fn create_inequality_condition(
+    vals: &mut Values,
+    lhs: Val,
+    rhs_lb: i64,
+    rhs_ub: i64,
+) -> Condition {
+    // ⭐ MINTED IN THE REFERENCE'S OWN ORDER: constant, comparison, then the next bound's pair. The
+    // numbering is observable — it is what the printed IR names the values — so the order is part of
+    // the port.
+    let lb_const = vals.mint();
+    let lb_cond = vals.mint();
+    let ub_const = vals.mint();
+    let ub_cond = vals.mint();
+    Condition {
+        guards: vec![
+            BoundGuard {
+                lhs,
+                predicate: CmpIPredicate::Sge,
+                bound: rhs_lb,
+                constant: lb_const,
+                cond: lb_cond,
+            },
+            BoundGuard {
+                lhs,
+                predicate: CmpIPredicate::Sle,
+                bound: rhs_ub,
+                constant: ub_const,
+                cond: ub_cond,
+            },
+        ],
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 122/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT AN INSERT REFERENCE IS — the two things `insert_refs[i]` holds, and they are not the same
+/// kind of thing.
+///
+/// ⭐ `createConditionsFor*Subscripts` starts from `insert_refs = mem_ops_` and overwrites an entry
+/// with the conditional it created for that access (`TransformPagedMemViewImpl.cpp:190-196` and
+/// `:289-341`). So an entry is a conditional exactly when a condition was created for it, and the
+/// `dyn_cast<scf::IfOp>` that [`set_builder_to_insert_ref`] does is asking which of those two
+/// happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertRef<'a> {
+    /// A conditional this pass created for the access — the guarded statements go in its then-region.
+    Conditional(&'a Condition),
+    /// The memory operation itself, still unguarded — the statements go in its own block.
+    MemOp,
+}
+
+/// Replaces: e122_setBuilderToInsertRef
+///
+/// **122/384** `TPMVBase::setBuilderToInsertRef` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280` (6L).
+///
+/// ```cpp
+/// void TPMVBase::setBuilderToInsertRef(OpBuilder &builder,
+///                                      Operation *insert_ref) {
+///   DT_CHECK(insert_ref);
+///   if (auto if_op = dyn_cast<scf::IfOp>(insert_ref))
+///     builder = if_op.getThenBodyBuilder();
+///   else
+///     builder.setInsertionPoint(insert_ref);
+/// }
+/// ```
+///
+/// # ⛔⛔ THE TWO ARMS ARE TWO DIFFERENT PLACES, AND THE DIFFERENCE IS THE GUARD
+///
+/// `getThenBodyBuilder()` appends INSIDE the conditional, so the new access only happens when the
+/// page is the right one. `setInsertionPoint(insert_ref)` puts it in the reference's own block,
+/// immediately before the op it names — unguarded, which is correct precisely when the page needs no
+/// condition (a subscript that can only reach one page). Getting these the wrong way round emits an
+/// access that reads the wrong page unconditionally, and no verifier objects.
+///
+/// ⭐ SO THIS RETURNS THE STATEMENTS PLACED, NOT A CURSOR. The `MemOp` arm hands them back
+/// unwrapped for the caller to splice at the reference's position; entry 309 then erases the original
+/// access and its use chain (entry 129), so "immediately before it" ends up being "in its place".
+///
+/// ⛔ `DT_CHECK(insert_ref)` IS GONE BECAUSE A REFERENCE CANNOT BE NULL. The check guards the
+/// `dyn_cast` below it against a null `Operation*`; [`InsertRef`] has no such state — its two
+/// variants are the two things the cast distinguishes, not "present" and "absent".
+#[must_use]
+pub fn set_builder_to_insert_ref(insert_ref: InsertRef<'_>, ops: Vec<DfirOp>) -> Vec<DfirOp> {
+    match insert_ref {
+        // `builder = if_op.getThenBodyBuilder()`.
+        InsertRef::Conditional(condition) => condition.wrap(ops),
+        // `builder.setInsertionPoint(insert_ref)` — the reference's own block.
+        InsertRef::MemOp => ops,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 123/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE ELEMENT COORDINATE ALONG ONE VIEW DIMENSION — where a page begins on that axis.
+///
+/// ⭐ SIGNED, BECAUSE IT IS A BOUND AND NOT AN EXTENT.
+/// [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`] answers over signed arithmetic,
+/// and entry 259 SUBTRACTS these from a subscript map (`<original subscript> - <start element>`,
+/// `TransformPagedMemViewImpl.cpp:559-573`), where a `u64` would be the wrong thing to reach for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartElement(pub i64);
+
+/// Replaces: e123_calculateStartElementsForPage
+///
+/// **123/384** `TPMVBase::calculateStartElementsForPage` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532` (10L).
+///
+/// ```cpp
+/// // Calculates the elements that identify the start of the page.
+/// // Example:
+/// //   page idx_set: (d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0,
+/// //                                 d1 - 2 >= 0, -d1 + 3 >= 0,
+/// //                                 d2 >= 0, -d2 + 1 >= 0)
+/// //   Start elements of this page: [0, 2, 0]
+/// SmallVector<int64_t, 16> TPMVBase::calculateStartElementsForPage(
+///     FlatLinearValueConstraints &page_sel_constraints) {
+///   SmallVector<int64_t, 16> start_elements;
+///   for (int dim = 0; dim < page_sel_constraints.getNumDimVars(); ++dim) {
+///     auto lb = page_sel_constraints.getConstantBound(
+///         mlir::presburger::BoundType::LB, dim);
+///     DT_CHECK_MSG(lb.has_value(), "expected constant lower bound");
+///     start_elements.emplace_back((int64_t)lb.value());
+///   }
+///
+///   return start_elements;
+/// }
+/// ```
+///
+/// # ⛔⛔ THE LOWER BOUND OF EVERY DIMENSION, INCLUDING THE ONES THAT START AT ZERO
+///
+/// The result is positional — entry 259 subtracts `start_elements[dim]` from result `dim` of the
+/// subscript map — so a dimension whose page starts at 0 contributes a 0 and not nothing. The
+/// example above is the whole specification: three dimensions, `[0, 2, 0]`, and only the middle page
+/// is displaced.
+///
+/// ⭐⭐ AND `DT_CHECK_MSG(lb.has_value(), "expected constant lower bound")` IS NOW THE TYPE.
+/// [`crate::islands::dataflow_ir::dialects::dataflow::PageRect`] holds one
+/// [`crate::islands::dataflow_ir::dialects::dataflow::PageSpan`] per dimension, and a span's `lo` IS
+/// the constant lower bound — so there is no page whose bound is missing to check for. ⭐ THE
+/// PARAMETER TYPE IS THEREFORE THE GUARD, not a comment about one: a `FlatLinearValueConstraints`
+/// can hold any system at all, and the reference has to ask each dimension whether it happens to be
+/// bounded. The test below pins the two against each other — the span's `lo` beside
+/// [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`]`(Lb, dim)` on the very set the
+/// reference's example writes — so the type guard and the ported MLIR routine are checked to agree
+/// rather than merely asserted to.
+#[must_use]
+pub fn calculate_start_elements_for_page(page_sel_constraints: &PageRect) -> Vec<StartElement> {
+    page_sel_constraints
+        .spans
+        .iter()
+        .map(|span| StartElement(span.lo))
+        .collect()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 124/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A NON-PAGED VIEW OVER ONE PAGE — the ops that bind it, and the value they bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonPagedMemView {
+    /// `arith.addi` then `dataflow.get_logical_memory_view`, in emission order.
+    pub ops: Vec<DfirOp>,
+    /// The view the new access reads — `GetLogicalMemoryViewOp`'s result.
+    pub view: Val,
+    /// The sum the view starts at — `new_start_addr`, kept because it is an op's result and a caller
+    /// re-reading it should not have to dig it out of `ops`.
+    pub start_addr: Val,
+}
+
+/// Replaces: e124_createNonPagedMemView
+///
+/// **124/384** `TPMVBase::createNonPagedMemView` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545` (10L).
+///
+/// ```cpp
+/// dataflow::GetLogicalMemoryViewOp TPMVBase::createNonPagedMemView(
+///     OpBuilder &builder, dataflow::GetPagedLogicalMemoryViewOp &paged_mem_view,
+///     int page_idx) {
+///   auto new_start_addr = mlir::arith::AddIOp::create(
+///       builder, paged_mem_view->getLoc(), paged_mem_view.getStartAddr(),
+///       paged_mem_view.getPageStartAddrs()[page_idx]);
+///
+///   return mlir::dataflow::GetLogicalMemoryViewOp::create(
+///       builder, new_start_addr->getLoc(),
+///       cast<MemRefType>(paged_mem_view.getResult().getType()),
+///       paged_mem_view.getUnit(), new_start_addr->getResult(0),
+///       paged_mem_view.getLayoutMap());
+/// }
+/// ```
+///
+/// # ⛔⛔ THIS IS WHAT THE WHOLE PASS EXISTS TO PRODUCE
+///
+/// Everything else in this file decides WHICH page and under WHAT condition; these two ops are the
+/// answer. A page's `start_addr` is RELATIVE to the view's own, so the address is the SUM
+/// (`arith.addi`) — emitting the page's own start would address the page as if the view began at
+/// zero, which for view start 0 is right and for every other view silently reads the wrong memory.
+///
+/// ⭐ AND EVERYTHING ELSE IS INHERITED VERBATIM: the same `$unit`, the same `layout_map`, and the
+/// paged view's own result type as the new view's (`cast<MemRefType>`). The pages differ in where
+/// they start and in nothing else, which is why one `layout_map` describes them all.
+///
+/// ⭐ THE PAGE ARRIVES AS A [`Page`] RATHER THAN AN `int page_idx`, so
+/// `getPageStartAddrs()[page_idx]` cannot index past the end and cannot be paired with another
+/// page's `idx_set` — see [`Page`], which is where the reference's two parallel lists became one.
+///
+/// ⚠️ `paged_mem_view->getLoc()` then `new_start_addr->getLoc()` — the view is located at the sum it
+/// was given, not at the paged view. Pure MLIR bookkeeping; this island carries no locations.
+#[must_use]
+pub fn create_non_paged_mem_view(
+    vals: &mut Values,
+    paged_mem_view: &PagedMemView,
+    page: &Page,
+) -> NonPagedMemView {
+    let new_start_addr = vals.mint();
+    let view = vals.mint();
+    NonPagedMemView {
+        ops: vec![
+            DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: new_start_addr,
+                lhs: paged_mem_view.start_addr,
+                rhs: page.start_addr,
+                // ⭐ AN ADDRESS IS AN `index`, which is what both operands already are
+                // (`Dataflow.td:267-299` declares `Index:$start_addr` and
+                // `Variadic<Index>:$page_start_addrs`).
+                ty: ScalarTy::Index,
+            })),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: view,
+                from: paged_mem_view.unit,
+                start: new_start_addr,
+                layout: paged_mem_view.layout.clone(),
+                ty: paged_mem_view.ty.clone(),
+            }),
+        ],
+        view,
+        start_addr: new_start_addr,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 125/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A VIEW A CONDITIONAL BRANCH MAY USE — the clone, if one was needed, and the value to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClonedMemView {
+    /// The cloned `dataflow.get_logical_memory_view`, or nothing when the view was left alone.
+    pub ops: Vec<DfirOp>,
+    /// The value the access should read — the clone's result, or the original view unchanged.
+    pub value: Val,
+}
+
+/// Replaces: e125_cloneMemViewIfNonPaged
+///
+/// **125/384** `TPMVBase::cloneMemViewIfNonPaged` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633` (9L).
+///
+/// ```cpp
+/// Value TPMVBase::cloneMemViewIfNonPaged(OpBuilder &builder, Value mem_view) {
+///   if (auto non_paged_mem_view =
+///           dyn_cast_or_null<dataflow::GetLogicalMemoryViewOp>(
+///               mem_view.getDefiningOp())) {
+///     auto new_mem_view = builder.clone(*non_paged_mem_view);
+///     return new_mem_view->getResult(0);
+///   }
+///
+///   return mem_view;
+/// }
+/// ```
+///
+/// # ⛔⛔ THE CLONE EXISTS BECAUSE THE ACCESS IS MOVING INTO A REGION
+///
+/// The pass copies an access into one or more conditional branches. An `scf.if` body is a new SSA
+/// scope: a view DEFINED where the access used to be is still dominating, but a view whose definition
+/// this pass is about to move or erase is not — so the branch gets its own copy of it. ⭐ AND THE
+/// CONDITION IS PRECISELY "NON-PAGED": a *paged* view is what the pass is removing and every access
+/// under it is being rewritten against a fresh [`create_non_paged_mem_view`] anyway, so cloning it
+/// would duplicate the op the pass exists to delete.
+///
+/// ⭐ `dyn_cast_or_null` IS AN [`Option`] TWICE OVER. `mem_view.getDefiningOp()` is null for a region
+/// argument — see [`dialects::defining_op`], whose `None` is exactly that — and the cast is null for
+/// any other op. Both fall through to returning the value untouched, which is why one `if let` covers
+/// what the C++ needs two null states for.
+///
+/// ⛔ AND THE CLONE BINDS ITS OWN VALUE. `builder.clone` gives the copy fresh results, which is what
+/// `new_mem_view->getResult(0)` reads; see [`dialects::clone_with_fresh_results`], where minting is
+/// not optional.
+#[must_use]
+pub fn clone_mem_view_if_non_paged(
+    vals: &mut Values,
+    defining_op: Option<&DfirOp>,
+    mem_view: Val,
+) -> ClonedMemView {
+    if let Some(non_paged_mem_view @ DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { .. })) =
+        defining_op
+    {
+        let new_mem_view = dialects::clone_with_fresh_results(non_paged_mem_view, vals);
+        // `new_mem_view->getResult(0)` — the view a `dataflow.get_logical_memory_view` binds is its
+        // only result.
+        let value = dialects::results(&new_mem_view)
+            .first()
+            .copied()
+            .unwrap_or(mem_view);
+        return ClonedMemView {
+            ops: vec![new_mem_view],
+            value,
+        };
+    }
+    ClonedMemView {
+        ops: Vec::new(),
+        value: mem_view,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 126/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e126_getUseChain
+///
+/// **126/384** `TPMVVectorLoad::getUseChain` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673` (3L).
+///
+/// ```cpp
+/// SmallVector<Operation *> TPMVVectorLoad::getUseChain(Operation *mem_op) {
+///   auto load_op = cast<agen::VectorLoadOp>(mem_op);
+///   return load_op.getUseChain();
+/// }
+/// ```
+///
+/// # ⭐⭐ THE OVERRIDE IS THE CAST AND A FORWARD, AND THE SUBSTANCE IS THE DIALECT'S
+///
+/// `agen::VectorLoadOp::getUseChain` (`Agen.cpp:114-134`) is where the walk lives, and it is
+/// [`vector_load_use_chain`] — ported with entry 129, which needs the same chain to tear down. This
+/// is `TPMVBase::use_chain`'s override (entry 133), so it answers in the same [`UseChain`] the base
+/// does: the base says [`UseChain::None`], and a vector load says [`UseChain::ConsumerWard`].
+///
+/// # ⛔⛔ THE CHAIN IS THE LOAD *AND* EVERYTHING DOWNSTREAM OF IT, ENDING AT AN OP WITH NO RESULT
+///
+/// This is what makes the pass's clone correct: an `agen.vector_load` on its own is dead — its value
+/// has to reach a `dataflow.send` or an `agen.vector_store` — so copying the load into a conditional
+/// branch without copying the ops that consume it produces exactly the *"Dangling non-compute op has
+/// no use"* refusal this crate has already been taught by. `use_chain[0]` is the load itself, which is
+/// why entry 127 skips the first element.
+///
+/// ⭐ AND IT IS A CHAIN, NOT A CONE: one result, one use, all the way down. That is a real property of
+/// what the scheduler emits — a vector value is consumed once — and the reference asserts it at every
+/// step rather than handling a fork. A fork is therefore not a truncated chain but NO chain
+/// ([`UseChain::None`], and see [`vector_load_use_chain`] for why that is the contract's own answer
+/// rather than a weakening of the assert).
+#[must_use]
+pub fn get_use_chain<'s>(mem_op: VectorLoadOp<'s>, scope: &'s [DfirOp]) -> UseChain<'s> {
+    // `return load_op.getUseChain();`
+    vector_load_use_chain(mem_op, scope)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 127/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `agen::VectorLoadOp::cloneUseChainToNewOp` — the engine entries 127 and 128 share
+/// (`Agen.cpp:136`).
+///
+/// ```cpp
+/// void VectorLoadOp::cloneUseChainToNewOp(OpBuilder& builder, Operation* new_op) {
+///   assert(isa<VectorLoadOp>(new_op) && "Expected a vector load op");
+///   auto use_chain = getUseChain();
+///   Value prev_val = nullptr;
+///   Value prev_cloned_val = new_op->getResult(0);
+///   for (int i = 0, last_op_idx = use_chain.size() - 1; i <= last_op_idx; ++i) {
+///     // Clone all the ops except the first one. That one is covered by mem_op.
+///     if (prev_val) {
+///       auto cloned_op = builder.clone(*use_chain[i]);
+///       cloned_op->replaceUsesOfWith(prev_val, prev_cloned_val);
+///       builder.setInsertionPointAfter(cloned_op);
+///       if (i != last_op_idx) {
+///         prev_val = use_chain[i]->getResult(0);
+///         prev_cloned_val = cloned_op->getResult(0);
+///       }
+///     } else {
+///       prev_val = use_chain[i]->getResult(0);
+///     }
+///   }
+/// }
+/// ```
+///
+/// ⛔⛔ EVERY CLONE READS THE PREVIOUS **CLONE**, WHICH IS THE ONE LINE THAT MATTERS.
+/// `cloned_op->replaceUsesOfWith(prev_val, prev_cloned_val)` is what stitches the copy into a chain
+/// of its own; without it every clone reads the ORIGINAL chain's values, the copies compute from the
+/// old load, and the guarded branch quietly reads the page the pass was rewriting away from.
+///
+/// ⭐ `prev_val` DOUBLES AS THE "FIRST OP" FLAG. It is null only on the first iteration, so the
+/// `if (prev_val)` arm is "every op but the load"; the `else` arm records the load's result as the
+/// value the next clone must stop reading. The `if (i != last_op_idx)` guard is bookkeeping: the last
+/// op has no result to carry forward.
+///
+/// ⭐ AND THE INSERTION POINT WALKS FORWARD (`setInsertionPointAfter`), so the clones come out in
+/// chain order. Here that is the order of the returned list — a `Vec` cannot hold them any other way.
+fn clone_use_chain_to_new_op(
+    vals: &mut Values,
+    use_chain: &UseChain<'_>,
+    new_result: Val,
+) -> Vec<DfirOp> {
+    // ⛔ NOTHING TO CLONE UNLESS THE CHAIN RUNS CONSUMER-WARD FROM THE LOAD. `getUseChain`'s own
+    // "Empty if there isn't a use chain" (`TransformPagedMemViewImpl.hpp:322`) is the whole answer
+    // for a load with no linear chain, and a producer-ward chain belongs to a STORE
+    // (`VectorStoreOp::getUseChain`) — this is the load's method, so it is not one it can be handed.
+    let UseChain::ConsumerWard(use_chain) = use_chain else {
+        return Vec::new();
+    };
+    let mut cloned: Vec<DfirOp> = Vec::new();
+    let mut prev: Option<(Val, Val)> = None;
+    for (i, op) in use_chain.iter().enumerate() {
+        match prev {
+            // "Clone all the ops except the first one. That one is covered by mem_op."
+            Some((prev_val, prev_cloned_val)) => {
+                let mut cloned_op = dialects::clone_with_fresh_results(op, vals);
+                dialects::replace_uses_of_with(&mut cloned_op, prev_val, prev_cloned_val);
+                // `if (i != last_op_idx)` — the last op has no result to carry forward, and the
+                // walk asserts it has none at all.
+                //
+                // ⭐ AND THE PAIR MOVES ONLY WHEN BOTH HALVES EXIST, so a mid-chain op with no result
+                // leaves `prev` alone rather than clearing it. The reference reads `getResult(0)`
+                // there and would keep its old `prev_val`; clearing it would make the next clone
+                // take the first-iteration path and skip its re-pointing.
+                if i != use_chain.len() - 1
+                    && let Some(pair) = dialects::results(op)
+                        .first()
+                        .copied()
+                        .zip(dialects::results(&cloned_op).first().copied())
+                {
+                    prev = Some(pair);
+                }
+                cloned.push(cloned_op);
+            }
+            // The load itself: `prev_val = use_chain[i]->getResult(0)`, and
+            // `prev_cloned_val` is already the new load's result.
+            None => {
+                prev = dialects::results(op)
+                    .first()
+                    .copied()
+                    .map(|first| (first, new_result));
+            }
+        }
+    }
+    cloned
+}
+
+/// Replaces: e127_cloneUseChain
+///
+/// **127/384** `TPMVVectorLoad::cloneUseChain` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678` (3L).
+///
+/// ```cpp
+/// void TPMVVectorLoad::cloneUseChain(OpBuilder &builder, Operation *mem_op,
+///                                    Operation *new_mem_op) {
+///   auto load_op = cast<agen::VectorLoadOp>(mem_op);
+///   load_op.cloneUseChainToNewOp(builder, new_mem_op);
+/// }
+/// ```
+///
+/// ⭐ THE VIRTUAL SEAM: `TPMVBase` calls `cloneUseChain` on whichever manager it holds, and the
+/// vector-load one forwards to the op's own method. The forwarding is the function; the substance is
+/// [`clone_use_chain_to_new_op`], which entry 128 also calls.
+///
+/// ⛔ `assert(isa<VectorLoadOp>(new_op))` IS THE PARAMETER TYPE. `new_mem_op` arrives as a
+/// [`VectorLoadOp`], so the assertion inside the callee is discharged by whoever narrowed it — and
+/// `mem_op`'s own `cast<agen::VectorLoadOp>` is the same type, which is why neither is repeated here.
+#[must_use]
+pub fn clone_use_chain<'s>(
+    vals: &mut Values,
+    mem_op: VectorLoadOp<'s>,
+    new_mem_op: VectorLoadOp<'_>,
+    scope: &'s [DfirOp],
+) -> Vec<DfirOp> {
+    clone_use_chain_to_new_op(vals, &get_use_chain(mem_op, scope), new_mem_op.result)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 128/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE ACCESS THIS PASS PUT IN A BRANCH — the new load, its cloned chain, and the value it binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewMemOp {
+    /// The new `agen.vector_load` followed by its cloned use chain, in emission order.
+    ///
+    /// ⭐ THE ORDER IS `builder.setInsertionPointAfter(new_load_op)` MADE STRUCTURAL: the chain
+    /// follows the load because a `Vec` has no other way to say it.
+    pub ops: Vec<DfirOp>,
+    /// The new load's result — what the reference returns as `Operation *`, in the form callers use
+    /// (`new_mem_ops` is walked for its result and for erasure, entry 129).
+    pub result: Val,
+}
+
+/// Replaces: e128_createNewMemOp
+///
+/// **128/384** `TPMVVectorLoad::createNewMemOp` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684` (9L), whose
+/// first line is `agen::VectorLoadOp::cloneWithNewAccessInfo` (`Agen.cpp:161-179`).
+///
+/// ```cpp
+/// Operation *TPMVVectorLoad::createNewMemOp(OpBuilder &builder, Operation *mem_op,
+///                                           TPMVInfo &info, Value &mem_view,
+///                                           AffineMap &subscripts_map,
+///                                           SmallVectorImpl<Value> &indices) {
+///   auto load_op = cast<agen::VectorLoadOp>(mem_op);
+///   auto new_load_op = load_op.cloneWithNewAccessInfo(builder, mem_view,
+///                                                     subscripts_map, indices);
+///
+///   builder.setInsertionPointAfter(new_load_op);
+///   load_op.cloneUseChainToNewOp(builder, new_load_op);
+///
+///   return new_load_op;
+/// }
+///
+/// // Agen.cpp:161-179
+/// agen::VectorLoadOp VectorLoadOp::cloneWithNewAccessInfo(
+///     OpBuilder& builder, const Value mem_view, const AffineMap& subscripts_map,
+///     ValueRange indices) {
+///   return VectorLoadOp::create(
+///       builder, getLoc(), getResult().getType(), mem_view,
+///       getDbgNameAttr() ? getDbgNameAttr() : builder.getStringAttr(""),
+///       subscripts_map, indices, getLoadSet(), getLoadOrder(),
+///       getMulticastInfo());
+/// }
+/// ```
+///
+/// # ⛔⛔ WHAT CHANGES IS THE ACCESS; WHAT THE LOAD *IS* DOES NOT
+///
+/// Three things are replaced — the view, the subscript map and the indices — and everything else is
+/// carried over from the original load: its result type, its `load_set`, its `load_order` and its
+/// multicast info. That is the point of the pass: the same vector, read out of the same shape of
+/// memory, at a page-relative address.
+///
+/// ⭐ AND THE CHAIN COMES WITH IT, in the same call. A new load without its consumers is the dangling
+/// op the emitted program is rejected for; see [`get_use_chain`].
+///
+/// ⚠️ THE `subscripts_map` AND `indices` PARAMETERS ARE ONE LIST HERE.
+/// [`agen::Op::VectorLoad`] carries `indices: Vec<Index>` and an
+/// [`Index::Strided`] holds the strided sum inline, so the reference's
+/// `affine_map` attribute plus `map_indices` operands are the same information written in one place —
+/// see that variant, which records why this island writes the sum inline and what `dbo-opt` says
+/// about the alternative. Entry 259 produces the page-relative form.
+///
+/// ⚠️ AND TWO ATTRIBUTES HAVE NOTHING TO INHERIT: `dbgName` is discardable and this island's
+/// `agen.vector_load` carries none, and `load_set`/`load_order` are DERIVED at print time from the
+/// view's shape and the vector's length (`agen.rs`) rather than stored — so "keep the original's"
+/// is automatic for as long as the view's shape is inherited, which [`create_non_paged_mem_view`]
+/// guarantees. `getMulticastInfo()` has no island field either.
+///
+/// ⭐ `TPMVInfo &info` IS UNUSED IN THE BODY. It is in the signature because the composite manager's
+/// override needs it (`TransformPagedMemViewImpl.hpp:519`, entry 138), so nothing is dropped by its
+/// absence here.
+#[must_use]
+pub fn create_new_mem_op<'s>(
+    vals: &mut Values,
+    mem_op: VectorLoadOp<'s>,
+    mem_view: Val,
+    view_ty: MemRef,
+    indices: Vec<Index>,
+    scope: &'s [DfirOp],
+) -> NewMemOp {
+    let result = vals.mint();
+    let new_load_op = DfirOp::Agen(agen::Op::VectorLoad {
+        result,
+        view: mem_view,
+        indices,
+        view_ty,
+        // `getResult().getType()` — the vector the original load bound.
+        ty: mem_op.ty,
+    });
+
+    // `builder.setInsertionPointAfter(new_load_op)`, then the chain — hence the order of the list.
+    let mut ops = vec![new_load_op];
+    ops.extend(clone_use_chain_to_new_op(
+        vals,
+        &get_use_chain(mem_op, scope),
+        result,
+    ));
+    NewMemOp { ops, result }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 129/384
@@ -129,6 +861,12 @@ pub struct VectorLoadOp<'a> {
     pub op: &'a DfirOp,
     /// `getResult()` — the vector it binds.
     pub result: Val,
+    /// `getResult().getType()` — the type a rebuilt load inherits.
+    ///
+    /// ⭐ HERE BECAUSE `cloneWithNewAccessInfo` READS IT (`Agen.cpp:161-179`, entry 128): the new
+    /// load keeps the original's result type and replaces only the access. On a typed
+    /// `VectorLoadOp` that read is infallible, which is the same reason `result` is here.
+    pub ty: Vector,
 }
 
 impl<'a> VectorLoadOp<'a> {
@@ -136,9 +874,10 @@ impl<'a> VectorLoadOp<'a> {
     #[must_use]
     pub fn of(op: &'a DfirOp) -> Option<VectorLoadOp<'a>> {
         match op {
-            DfirOp::Agen(agen::Op::VectorLoad { result, .. }) => Some(VectorLoadOp {
+            DfirOp::Agen(agen::Op::VectorLoad { result, ty, .. }) => Some(VectorLoadOp {
                 op,
                 result: *result,
+                ty: *ty,
             }),
             DfirOp::Agen(
                 agen::Op::VectorStore { .. }
@@ -902,9 +1641,521 @@ impl<'p> TpmvVector<'p> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::islands::dataflow_ir::dialects::dataflow::PageSpan;
     use crate::islands::dataflow_ir::dialects::{Index, dataflow, vectorchain};
     use crate::islands::dataflow_ir::link::{Link, Lxlu as LxluUnit, Sfp as SfpUnit};
-    use crate::islands::dataflow_ir::ty::{ElemType, MemRef, Vector};
+    use crate::islands::dataflow_ir::print;
+    use crate::islands::dataflow_ir::ty::{
+        AffineExpr, AffineMap, BoundType, ElemType, MemRef, Vector,
+    };
+
+    /// The ops as MLIR text, at the top level.
+    fn text(ops: &[DfirOp]) -> String {
+        let mut out = String::new();
+        for op in ops {
+            print::emit(&mut out, op, 0);
+        }
+        out
+    }
+
+    /// `memref<64x4x64xf16>` — the shape both the paged view and the non-paged views cut from it
+    /// carry (`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:19-22`).
+    fn paged_view_ty() -> MemRef {
+        MemRef {
+            shape: vec![64, 4, 64],
+            elem: ElemType::F16,
+        }
+    }
+
+    /// `affine_map<(d0, d1, d2) -> (d2 * 64 + d1 * 64 + d0)>` — IBM's own layout map for a paged
+    /// view (`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:28`).
+    fn layout() -> AffineMap {
+        AffineMap {
+            dims: 3,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(64)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        }
+    }
+
+    /// A page of 64 lanes spanning rows `lo ..= hi`, pinned on the third axis.
+    fn page(lo: i64, hi: i64, start_addr: Val) -> Page {
+        Page {
+            idx_set: PageRect {
+                spans: vec![
+                    PageSpan { lo: 0, hi: 63 },
+                    PageSpan { lo, hi },
+                    PageSpan { lo: 0, hi: 0 },
+                ],
+            },
+            start_addr,
+        }
+    }
+
+    /// 🎯 121/384 — A SPAN IS TWO NESTED ONE-ARMED CONDITIONALS, AND SIX OPS IN THE REFERENCE'S OWN
+    /// ORDER.
+    ///
+    /// ⛔ THE SHAPE IS THE ASSERTION. An `arith.andi` of the two comparisons under a single `scf.if`
+    /// computes the same predicate and would pass any test that only asked "is the access guarded";
+    /// see [`create_inequality_condition`] for what downstream reads the nesting. The value numbers
+    /// pin the emission ORDER too — constant, comparison, conditional, twice — because the printed
+    /// names are what a vendored file is diffed against.
+    #[test]
+    fn a_span_is_two_nested_one_armed_conditionals() {
+        let mut vals = Values::default();
+        let lhs = vals.mint();
+        let condition = create_inequality_condition(&mut vals, lhs, 2, 3);
+        let guarded = vals.mint();
+        let ops = condition.wrap(vec![DfirOp::Arith(arith::Op::Constant {
+            result: guarded,
+            value: 7,
+        })]);
+
+        assert_eq!(
+            text(&ops),
+            "\
+%1 = arith.constant 2 : index
+%2 = arith.cmpi sge, %0, %1 : index
+scf.if %2 {
+  %3 = arith.constant 3 : index
+  %4 = arith.cmpi sle, %0, %3 : index
+  scf.if %4 {
+    %5 = arith.constant 7 : index
+  }
+}
+"
+        );
+    }
+
+    /// 🎯 121/384 — THE SECOND DIMENSION'S GUARDS SIT INSIDE THE FIRST'S.
+    ///
+    /// ⭐ WHICH IS WHAT MAKES THE CONJUNCTION ACROSS DIMENSIONS RIGHT: entry 198 walks the subscript
+    /// map dimension by dimension and never moves the builder back out, so an access reaching a page
+    /// is guarded by every dimension's bounds at once. Four guards, four `scf.if`s, one body.
+    #[test]
+    fn and_then_nests_the_next_dimension_inside_the_last() {
+        let mut vals = Values::default();
+        let d0 = vals.mint();
+        let d1 = vals.mint();
+        let outer = create_inequality_condition(&mut vals, d0, 0, 63);
+        let inner = create_inequality_condition(&mut vals, d1, 2, 3);
+        let guarded = vals.mint();
+        let ops = outer
+            .and_then(inner)
+            .wrap(vec![DfirOp::Arith(arith::Op::Constant {
+                result: guarded,
+                value: 7,
+            })]);
+
+        assert_eq!(
+            text(&ops),
+            "\
+%2 = arith.constant 0 : index
+%3 = arith.cmpi sge, %0, %2 : index
+scf.if %3 {
+  %4 = arith.constant 63 : index
+  %5 = arith.cmpi sle, %0, %4 : index
+  scf.if %5 {
+    %6 = arith.constant 2 : index
+    %7 = arith.cmpi sge, %1, %6 : index
+    scf.if %7 {
+      %8 = arith.constant 3 : index
+      %9 = arith.cmpi sle, %1, %8 : index
+      scf.if %9 {
+        %10 = arith.constant 7 : index
+      }
+    }
+  }
+}
+"
+        );
+    }
+
+    /// 🎯 122/384 — THE TWO ARMS PUT THE STATEMENTS IN TWO DIFFERENT PLACES.
+    ///
+    /// ⛔ AND THE UNGUARDED ARM IS NOT A NO-OP: it is the case where the subscript can only reach one
+    /// page, so the access is emitted in the reference's own block with no condition at all. Reading
+    /// the `dyn_cast` the wrong way round emits an unconditional access to one page of many, which
+    /// nothing downstream objects to.
+    #[test]
+    fn the_insert_reference_decides_guarded_or_in_place() {
+        let mut vals = Values::default();
+        let lhs = vals.mint();
+        let condition = create_inequality_condition(&mut vals, lhs, 0, 1);
+        let marker = vals.mint();
+        let ops = vec![DfirOp::Arith(arith::Op::Constant {
+            result: marker,
+            value: 7,
+        })];
+
+        // `dyn_cast<scf::IfOp>(insert_ref)` succeeds: `builder = if_op.getThenBodyBuilder()`.
+        let guarded = set_builder_to_insert_ref(InsertRef::Conditional(&condition), ops.clone());
+        assert_eq!(
+            text(&guarded),
+            "\
+%1 = arith.constant 0 : index
+%2 = arith.cmpi sge, %0, %1 : index
+scf.if %2 {
+  %3 = arith.constant 1 : index
+  %4 = arith.cmpi sle, %0, %3 : index
+  scf.if %4 {
+    %5 = arith.constant 7 : index
+  }
+}
+"
+        );
+
+        // `builder.setInsertionPoint(insert_ref)` — the memory operation's own block, unguarded.
+        assert_eq!(
+            set_builder_to_insert_ref(InsertRef::MemOp, ops.clone()),
+            ops
+        );
+    }
+
+    /// 🎯 123/384 — THE REFERENCE'S OWN EXAMPLE, AND THE TYPE GUARD CHECKED AGAINST THE MLIR ROUTINE.
+    ///
+    /// ⭐⭐ THE SET IS THE ONE `TransformPagedMemViewImpl.cpp:527-531` WRITES IN ITS COMMENT, and the
+    /// answer it states is `[0, 2, 0]`. Printing the set proves
+    /// [`crate::islands::dataflow_ir::dialects::dataflow::PageRect`] means what the comment's set
+    /// means — six constraints, `d1 - 2 >= 0` spelled as a subtraction — rather than merely
+    /// round-tripping our own construction.
+    ///
+    /// ⛔⛔ AND THE LAST LOOP IS WHY THE DELETED `DT_CHECK` IS SOUND. A span's `lo` is *asserted* to
+    /// be `getConstantBound(LB, dim)`; here that assertion is executed, dimension by dimension,
+    /// against the ported [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`]. If the two
+    /// ever disagreed, "the type makes the check unnecessary" would be false.
+    #[test]
+    fn the_start_elements_are_the_references_own_example() {
+        let page_sel_constraints = PageRect {
+            spans: vec![
+                PageSpan { lo: 0, hi: 63 },
+                PageSpan { lo: 2, hi: 3 },
+                PageSpan { lo: 0, hi: 1 },
+            ],
+        };
+        let set = page_sel_constraints.as_integer_set();
+        assert_eq!(
+            print::integer_set(&set),
+            "affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 - 2 >= 0, -d1 + 3 >= 0, \
+             d2 >= 0, -d2 + 1 >= 0)>"
+        );
+
+        let start_elements = calculate_start_elements_for_page(&page_sel_constraints);
+        assert_eq!(
+            start_elements,
+            vec![StartElement(0), StartElement(2), StartElement(0)]
+        );
+
+        for (dim, element) in start_elements.iter().enumerate() {
+            let dim = u32::try_from(dim).expect("three dimensions fit a u32");
+            assert_eq!(set.constant_bound(BoundType::Lb, dim), Some(element.0));
+        }
+    }
+
+    /// 🎯 124/384 — THE NEW VIEW STARTS AT THE **SUM**, AND INHERITS EVERYTHING ELSE.
+    ///
+    /// ⛔ THE VIEW'S OWN START IS `%1` AND THE PAGE'S IS `%3`; the `arith.addi` of the two is what
+    /// makes the second page addressable. A view built on the page's start alone prints identically
+    /// for a view that begins at zero and reads the wrong memory for every other one.
+    #[test]
+    fn the_non_paged_view_starts_at_the_sum_of_the_two_addresses() {
+        let mut vals = Values::default();
+        let unit = vals.mint();
+        let view_start = vals.mint();
+        let page0_start = vals.mint();
+        let page1_start = vals.mint();
+        let paged_result = vals.mint();
+        let paged_mem_view = PagedMemView {
+            result: paged_result,
+            unit,
+            start_addr: view_start,
+            pages: vec![page(0, 1, page0_start), page(2, 3, page1_start)],
+            layout: layout(),
+            ty: paged_view_ty(),
+        };
+
+        let made = create_non_paged_mem_view(&mut vals, &paged_mem_view, &paged_mem_view.pages[1]);
+
+        assert_eq!(
+            text(&made.ops),
+            "\
+%5 = arith.addi %1, %3 : index
+%6 = dataflow.get_logical_memory_view %0, %5 {layout_map = affine_map<(d0, d1, d2) -> \
+             (d2 * 64 + d1 * 64 + d0)>} : index, index, memref<64x4x64xf16>
+"
+        );
+        assert_eq!(made.start_addr, Val(5));
+        assert_eq!(made.view, Val(6));
+    }
+
+    /// 🎯 125/384 — A NON-PAGED VIEW IS CLONED; A PAGED ONE AND A REGION ARGUMENT ARE NOT.
+    ///
+    /// ⭐ THE CLONE BINDS ITS OWN VALUE (`%3`, not `%2`) — two ops binding one value is the diagnosis
+    /// [`crate::islands::dataflow_ir::Values`] exists to make impossible.
+    ///
+    /// ⛔ AND THE PAGED CASE MATTERS: cloning the paged view would duplicate the op the pass is
+    /// deleting, in a branch that is about to read a non-paged view instead.
+    #[test]
+    fn only_a_non_paged_view_is_cloned() {
+        let mut vals = Values::default();
+        let unit = vals.mint();
+        let start = vals.mint();
+        let mem_view = vals.mint();
+        let non_paged = DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result: mem_view,
+            from: unit,
+            start,
+            layout: layout(),
+            ty: paged_view_ty(),
+        });
+
+        let cloned = clone_mem_view_if_non_paged(&mut vals, Some(&non_paged), mem_view);
+        assert_eq!(
+            text(&cloned.ops),
+            "\
+%3 = dataflow.get_logical_memory_view %0, %1 {layout_map = affine_map<(d0, d1, d2) -> \
+             (d2 * 64 + d1 * 64 + d0)>} : index, index, memref<64x4x64xf16>
+"
+        );
+        assert_eq!(cloned.value, Val(3));
+
+        // `dyn_cast_or_null<GetLogicalMemoryViewOp>` fails on the paged view: pass it through.
+        let paged_result = vals.mint();
+        let paged = DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+            PagedMemView {
+                result: paged_result,
+                unit,
+                start_addr: start,
+                pages: vec![page(0, 1, start)],
+                layout: layout(),
+                ty: paged_view_ty(),
+            },
+        )));
+        let same = clone_mem_view_if_non_paged(&mut vals, Some(&paged), paged_result);
+        assert_eq!(same.ops, Vec::new());
+        assert_eq!(same.value, paged_result);
+
+        // `mem_view.getDefiningOp()` is null for a region argument — `dyn_cast_or_null`'s own case.
+        let arg = vals.mint();
+        let untouched = clone_mem_view_if_non_paged(&mut vals, None, arg);
+        assert_eq!(untouched.ops, Vec::new());
+        assert_eq!(untouched.value, arg);
+    }
+
+    /// A load, an estimate over its result, and a store of that — the shape of chain the pass clones.
+    ///
+    /// The terminator is an `agen.vector_store`, which has no results; the reference's own example of
+    /// a chain end is a `dataflow.send`, and [`a_send_terminated_chain_keeps_its_wire`] uses that one.
+    fn a_chain(vals: &mut Values) -> (Val, Val, Vec<DfirOp>) {
+        let view = vals.mint();
+        let loaded = vals.mint();
+        let estimated = vals.mint();
+        let ops = vec![
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result: loaded,
+                view,
+                indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
+                view_ty: paged_view_ty(),
+                ty: LANES,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Estimate {
+                result: estimated,
+                input: loaded,
+                kind: vectorchain::EstimateKind::Rec,
+                version: None,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                value: estimated,
+                view,
+                indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
+                view_ty: paged_view_ty(),
+                ty: LANES,
+            }),
+        ];
+        (view, loaded, ops)
+    }
+
+    /// 🎯 126/384 — THE CHAIN IS THE LOAD AND EVERYTHING DOWNSTREAM, ENDING AT THE OP WITH NO RESULT.
+    ///
+    /// ⛔ AND A FORK IS NOT A SHORTER CHAIN, IT IS NO CHAIN. The reference asserts one use per value
+    /// and aborts otherwise; the answer here is [`UseChain::None`] — `getUseChain`'s own documented
+    /// "Empty if there isn't a use chain" (`TransformPagedMemViewImpl.hpp:322`) — so a second
+    /// consumer means the load keeps the tail it already has rather than half of it being copied
+    /// into a guarded branch.
+    #[test]
+    fn the_use_chain_runs_to_the_op_with_no_results() {
+        let mut vals = Values::default();
+        let (view, _, ops) = a_chain(&mut vals);
+        let mem_op = VectorLoadOp::of(&ops[0]).expect("the first op is the load");
+
+        let chain = get_use_chain(mem_op, &ops);
+        assert_eq!(
+            chain,
+            UseChain::ConsumerWard(vec![&ops[0], &ops[1], &ops[2]])
+        );
+        assert!(dialects::results(&ops[2]).is_empty());
+
+        // A second reader of the estimate: `res.hasOneUse()` is false, and the walk stops there.
+        let mut forked = ops.clone();
+        let estimated = dialects::results(&ops[1])[0];
+        forked.push(DfirOp::Agen(agen::Op::VectorStore {
+            value: estimated,
+            view,
+            indices: vec![Index::Const(1), Index::Const(0), Index::Const(0)],
+            view_ty: paged_view_ty(),
+            ty: LANES,
+        }));
+        let mem_op = VectorLoadOp::of(&forked[0]).expect("the first op is the load");
+        assert_eq!(get_use_chain(mem_op, &forked), UseChain::None);
+    }
+
+    /// 🎯 127/384 — EVERY CLONE READS THE PREVIOUS **CLONE**, AND THE LOAD ITSELF IS NOT CLONED.
+    ///
+    /// ⛔⛔ THIS IS THE ONE DEFECT A SHAPE-ONLY TEST WOULD MISS. Drop
+    /// `replaceUsesOfWith` and the printed chain still has the right ops in the right order — but
+    /// `%6` reads `%1`, the ORIGINAL load, so the guarded branch computes from the page the pass was
+    /// rewriting away from. The assertion is therefore on the OPERANDS: the cloned estimate reads the
+    /// new load's `%4`, and the cloned store reads the cloned estimate's `%6`.
+    #[test]
+    fn the_cloned_chain_reads_the_new_load() {
+        let mut vals = Values::default();
+        let (view, _, ops) = a_chain(&mut vals);
+        let mem_op = VectorLoadOp::of(&ops[0]).expect("the first op is the load");
+
+        // The new load entry 128 creates; only its result is used here.
+        let new_result = vals.mint();
+        let new_load = DfirOp::Agen(agen::Op::VectorLoad {
+            result: new_result,
+            view,
+            indices: vec![Index::Const(0), Index::Const(2), Index::Const(0)],
+            view_ty: paged_view_ty(),
+            ty: LANES,
+        });
+        let new_mem_op = VectorLoadOp::of(&new_load).expect("it is a load");
+
+        let cloned = clone_use_chain(&mut vals, mem_op, new_mem_op, &ops);
+
+        // Two ops: the chain without its first element.
+        assert_eq!(cloned.len(), 2);
+        assert_eq!(
+            text(&cloned),
+            "\
+%4 = vectorchain.rec_estimate %3 : vector<64xf16>, vector<64xf16>
+agen.vector_store %4, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, \
+             store_set = affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>} \
+             : memref<64x4x64xf16>, vector<64xf16>
+"
+        );
+        assert_eq!(dialects::operands(&cloned[0]), vec![new_result]);
+        assert_eq!(dialects::results(&cloned[0]), vec![Val(4)]);
+    }
+
+    /// 🎯 127/384 — A CHAIN THAT ENDS IN A `dataflow.send` HAS ITS DATA RE-POINTED AND ITS WIRE LEFT
+    /// ALONE.
+    ///
+    /// ⭐⭐ THE REFERENCE'S OWN EXAMPLE OF A CHAIN END IS A SEND (`Agen.cpp:120`), and a send carries
+    /// two operands of very different kinds: the DATA, which the clone must re-point, and the wire
+    /// end, which it must not. [`dialects::operands_mut`] excludes the second on purpose; this is the
+    /// test that the exclusion is the right one — the cloned send reads the cloned estimate and still
+    /// drives the same unit.
+    #[test]
+    fn a_send_terminated_chain_keeps_its_wire() {
+        let mut vals = Values::default();
+        let view = vals.mint();
+        let producer = vals.mint();
+        let consumer = vals.mint();
+        let loaded = vals.mint();
+        let estimated = vals.mint();
+        let (to, _) = Link::<LxluUnit, SfpUnit>::between(producer, consumer).ends();
+        let ops = vec![
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result: loaded,
+                view,
+                indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
+                view_ty: paged_view_ty(),
+                ty: LANES,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Estimate {
+                result: estimated,
+                input: loaded,
+                kind: vectorchain::EstimateKind::Rec,
+                version: None,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: estimated,
+                ty: LANES,
+            }),
+        ];
+        let mem_op = VectorLoadOp::of(&ops[0]).expect("the first op is the load");
+        let new_result = vals.mint();
+        let new_load = DfirOp::Agen(agen::Op::VectorLoad {
+            result: new_result,
+            view,
+            indices: vec![Index::Const(0), Index::Const(2), Index::Const(0)],
+            view_ty: paged_view_ty(),
+            ty: LANES,
+        });
+        let new_mem_op = VectorLoadOp::of(&new_load).expect("it is a load");
+
+        let cloned = clone_use_chain(&mut vals, mem_op, new_mem_op, &ops);
+
+        assert_eq!(
+            text(&cloned),
+            "\
+%6 = vectorchain.rec_estimate %5 : vector<64xf16>, vector<64xf16>
+dataflow.send %2, %6 : vector<64xf16>
+"
+        );
+    }
+
+    /// 🎯 128/384 — THE NEW LOAD FIRST, THEN ITS CHAIN, ALL READING FORWARD.
+    ///
+    /// ⭐ THE ORDER IS `builder.setInsertionPointAfter(new_load_op)` made structural, and it is what
+    /// keeps the emitted region in SSA order: the estimate cannot precede the load whose value it
+    /// reads.
+    ///
+    /// ⛔ AND THE NEW LOAD IS THE ORIGINAL IN EVERY RESPECT BUT THE ACCESS — the same
+    /// `vector<64xf16>`, the same `memref<64x4x64xf16>`, hence the same derived `load_set` and
+    /// `load_order`; only the view and the page-relative indices differ.
+    #[test]
+    fn the_new_access_is_the_load_then_its_cloned_chain() {
+        let mut vals = Values::default();
+        let (_, _, ops) = a_chain(&mut vals);
+        let mem_op = VectorLoadOp::of(&ops[0]).expect("the first op is the load");
+        let mem_view = vals.mint();
+
+        let made = create_new_mem_op(
+            &mut vals,
+            mem_op,
+            mem_view,
+            paged_view_ty(),
+            // The page-relative subscripts entry 259 produces for a page starting at row 2.
+            vec![Index::Const(0), Index::Const(0), Index::Const(0)],
+            &ops,
+        );
+
+        assert_eq!(made.result, Val(4));
+        assert_eq!(
+            text(&made.ops),
+            "\
+%4 = agen.vector_load %3[0, 0, 0] {load_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, \
+             load_set = affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>} \
+             : memref<64x4x64xf16>, vector<64xf16>
+%5 = vectorchain.rec_estimate %4 : vector<64xf16>, vector<64xf16>
+agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, \
+             store_set = affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>} \
+             : memref<64x4x64xf16>, vector<64xf16>
+"
+        );
+    }
 
     /// `%mem_view = dataflow.get_paged_logical_memory_view %lx, %c128 …` — the paged view being
     /// de-paged (`paged_mem_view_loads.mlir:288`).

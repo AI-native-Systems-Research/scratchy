@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`89/384 ported; 89/384 audited`
+`97/384 ported; 97/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -304,6 +304,68 @@ and 138 are the derived constructors, so the three virtuals are inherent methods
 and `erase_vector_load_and_use_chain` is `TPMVVectorLoad`'s override standing beside them as a free
 function.
 
+⭐ AND ENTRIES 121-128 — the paged-memory-view transform's page-guard and use-chain layer, all in
+`tf_transform_paged_mem_view_impl.rs`: `createInequalityCondition`, `setBuilderToInsertRef`,
+`calculateStartElementsForPage`, `createNonPagedMemView`, `cloneMemViewIfNonPaged`, `getUseChain`,
+`cloneUseChain` and `createNewMemOp`.
+
+⛔ A MUTATED `OpBuilder &` IS NOT A RETURN VALUE, and both 121 and 122 hand one back. The reference
+reassigns the caller's builder to the then-region of the `scf.if` it just built
+(`TransformPagedMemViewImpl.cpp:275`) so that whatever is emitted next lands inside the guard. Here the
+guard is a VALUE: `Condition` holds the per-dimension `BoundGuard`s and `Condition::wrap(guarded)`
+nests the statements inside-out. 122's two arms are then `InsertRef::Conditional` (wrap) and
+`InsertRef::MemOp` (hand the statements back unwrapped, for the caller to splice at the op's own
+position) — no cursor, and no way to emit into a region that was never opened.
+
+⭐ 121 IS TWO NESTED ONE-ARMED `scf.if`s AND NOT ONE `arith.andi`. The reference builds the `sge`
+guard, descends into its then-body and builds the `sle` guard there, so the four values are minted
+lb_const, lb_cond, ub_const, ub_cond and the SSA numbering follows. `BoundGuard` carries its
+predicate rather than hard-coding the pair, because 120 (`createEqualityCondition`) is the `eq`
+sibling one guard wide and belongs in this same type rather than a second one.
+
+⛔ THE ISLAND GREW `dataflow.get_paged_logical_memory_view`, WHICH IS THIS TRANSFORM'S ENTIRE INPUT —
+without it none of 123-128 had anything to run on. `PagedMemView` carries `pages: Vec<Page>`, and
+`Page` PAIRS an `idx_set` with a `start_addr`, which turns the verifier's *"there should be a start
+address and idx_set for every page"* into the pairing. `PageRect`'s per-dimension
+`PageSpan { lo, hi }` turns both *"idx_set should be hyper rectangular"* and 123's *"expected
+constant lower bound"* into the parameter type: 123 is `spans.iter().map(|span| span.lo)`, and its
+test EXECUTES that equivalence against `IntegerSet::constant_bound(Lb, dim)` rather than asserting
+it. The printer reproduces `DataflowOps.cpp:239-267` and is checked verbatim against
+`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:19-22`.
+
+⚠️ AND THAT TEST FOUND A PRINTER DEFECT ONE LEVEL DOWN: `AffineExpr::Add(d1, -2)` printed
+`d1 + -2` where MLIR writes `d1 - 2`, and that is the lower half of every page whose span does not
+start at zero (`#set1` of the same file). A negative addend is now a subtraction — the same reason
+`d2 * -1` was already printed `-d2`.
+
+⭐ THE THREE ASSERTS IN 126'S WALK BECAME STOPPING CONDITIONS. `getUseChain` aborts on an op with
+more than one result and on a result with more than one use; `let [res] = results[..] else { break }`
+stops the walk at exactly those shapes, so the caller gets a chain that ends where the reference's
+assert would have fired — which is what a chain that cannot be cloned means. 127's
+`assert(isa<VectorLoadOp>(new_op))` became a parameter type instead: `VectorLoadRef` does the
+`cast<agen::VectorLoadOp>` once and 126/127/128 all take one.
+
+⭐ ONE VOCABULARY, NOT TWO (AGAIN): 121-128 landed after 129-136, in the same file, and were rebased
+onto that batch's names rather than carrying a second set. Entry 129 ported the DIALECT walk
+(`agen::VectorLoadOp::getUseChain`, `Agen.cpp:114-134`) as `vector_load_use_chain` because its
+teardown needs the same chain — so 126, whose C++ is a cast and a forward, IS that forward, and it
+answers in the `UseChain` that 133's `TPMVBase::use_chain` returns. ⛔ AND THE FORK CASE IS 129'S
+READING, WHICH IS THE STRONGER ONE: a value with two readers means there is NO chain
+(`UseChain::None`, the contract's own "Empty if there isn't a use chain",
+`TransformPagedMemViewImpl.hpp:322`), not a chain truncated at the fork — half a chain cloned into a
+guarded branch is a worse answer than none. 129's `VectorLoadOp` replaced the `VectorLoadRef` this
+batch had narrowed for itself, and gained the `getResult().getType()` that 128 rebuilds the load
+with.
+
+⭐ AND THE ISLAND GAINED THE MUTABLE HALF OF ITS OWN CENSUS, for 125/127/128: `operands_mut`,
+`results_mut`, `replace_uses_of_with` (one entry per USE, mirroring `uses()`) and
+`clone_with_fresh_results`. ⛔ `operands_mut` EXCLUDES TWO OPERANDS BY DESIGN — a link end (`Send`'s
+`to`, `Receive`'s `from`), because `link::Link` hands its two ends out once by consuming itself, and
+`vectorchain::Predicate`'s mask, which carries the type it was defined at. A send's `data` IS
+included, and that is what a chain clone re-points. ⛔ `clone_with_fresh_results` DOES NOT REMAP
+REGIONS; both callers are region-free chain ops (`Agen.cpp:114-134`).
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -546,22 +608,22 @@ function.
 - [ ] **AUDIT 119/384** `replaceDimsInMapWithSyms` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:47`, line by line against the C++
 - [ ] **PORT 120/384** `createEqualityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:253`, 7 lines
 - [ ] **AUDIT 120/384** `createEqualityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:253`, line by line against the C++
-- [ ] **PORT 121/384** `createInequalityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263`, 14 lines
-- [ ] **AUDIT 121/384** `createInequalityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263`, line by line against the C++
-- [ ] **PORT 122/384** `setBuilderToInsertRef` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280`, 6 lines
-- [ ] **AUDIT 122/384** `setBuilderToInsertRef` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280`, line by line against the C++
-- [ ] **PORT 123/384** `calculateStartElementsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532`, 10 lines
-- [ ] **AUDIT 123/384** `calculateStartElementsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532`, line by line against the C++
-- [ ] **PORT 124/384** `createNonPagedMemView` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545`, 10 lines
-- [ ] **AUDIT 124/384** `createNonPagedMemView` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545`, line by line against the C++
-- [ ] **PORT 125/384** `cloneMemViewIfNonPaged` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633`, 9 lines
-- [ ] **AUDIT 125/384** `cloneMemViewIfNonPaged` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633`, line by line against the C++
-- [ ] **PORT 126/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673`, 3 lines
-- [ ] **AUDIT 126/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673`, line by line against the C++
-- [ ] **PORT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, 3 lines
-- [ ] **AUDIT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, line by line against the C++
-- [ ] **PORT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, 9 lines
-- [ ] **AUDIT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, line by line against the C++
+- [x] **PORT 121/384** `createInequalityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263`, 14 lines
+- [x] **AUDIT 121/384** `createInequalityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263`, line by line against the C++
+- [x] **PORT 122/384** `setBuilderToInsertRef` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280`, 6 lines
+- [x] **AUDIT 122/384** `setBuilderToInsertRef` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280`, line by line against the C++
+- [x] **PORT 123/384** `calculateStartElementsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532`, 10 lines
+- [x] **AUDIT 123/384** `calculateStartElementsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532`, line by line against the C++
+- [x] **PORT 124/384** `createNonPagedMemView` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545`, 10 lines
+- [x] **AUDIT 124/384** `createNonPagedMemView` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545`, line by line against the C++
+- [x] **PORT 125/384** `cloneMemViewIfNonPaged` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633`, 9 lines
+- [x] **AUDIT 125/384** `cloneMemViewIfNonPaged` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633`, line by line against the C++
+- [x] **PORT 126/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673`, 3 lines
+- [x] **AUDIT 126/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673`, line by line against the C++
+- [x] **PORT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, 3 lines
+- [x] **AUDIT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, line by line against the C++
+- [x] **PORT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, 9 lines
+- [x] **AUDIT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, line by line against the C++
 - [x] **PORT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, 3 lines
 - [x] **AUDIT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, line by line against the C++
 - [x] **PORT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, 6 lines
