@@ -383,6 +383,7 @@ mod unit_tests {
             iv: Val(0),
             lo: affine::Bound::Const(0),
             hi: affine::Bound::Const(4),
+            carried: Vec::new(),
             body: vec![],
         })));
     }
@@ -418,6 +419,7 @@ mod unit_tests {
             iv: Val(2),
             lo: affine::Bound::Const(0),
             hi: affine::Bound::Const(4),
+            carried: Vec::new(),
             body: vec![branch(3, vec![], vec![])],
         });
         let unit = unit_holding(vec![branch(
