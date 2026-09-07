@@ -20,6 +20,52 @@ pub enum LogicKind {
     Not,
 }
 
+/// WHICH INTEGER COMPARISON — `mlir::arith::CmpIPredicate`, as `arith.cmpi` spells it.
+///
+/// ⭐ THE SPELLING IS THE ENUMERATOR'S OWN NAME, printed as a bare keyword before the operands:
+/// `%21 = arith.cmpi eq, %20, %7 : index`
+/// (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:37`).
+///
+/// # ⛔⛔ SIX, NOT MLIR'S TEN — THE UNSIGNED FOUR ARE WHAT THE REFERENCE ABORTS ON
+///
+/// `mlir::arith::CmpIPredicate` has ten enumerators; `ult`, `ule`, `ugt` and `uge` are absent here
+/// because `getSentientCmpIPredicate` (`StandardToSentient.cpp:36-53`, bridge-2 entry 048) is an
+/// if-chain over the six signed forms whose `else` is `DT_CHECK(0)`. An unsigned comparison reaching
+/// this pipeline is a stop, not a lowering — so it is a value this island must not be able to hold,
+/// and the reference's abort is then unreachable BY CONSTRUCTION rather than by convention.
+/// `SentientTypes.td`'s own `CmpPredicate` is the same six.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpIPredicate {
+    /// `eq` — equal. The only one this pipeline emits today, and the one a loop-position predicate
+    /// and a value-based conditional are both built from.
+    Eq,
+    /// `ne` — not equal.
+    Ne,
+    /// `slt` — signed less than.
+    Slt,
+    /// `sle` — signed less than or equal.
+    Sle,
+    /// `sgt` — signed greater than.
+    Sgt,
+    /// `sge` — signed greater than or equal.
+    Sge,
+}
+
+impl CmpIPredicate {
+    /// THE KEYWORD `arith.cmpi` PRINTS.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            CmpIPredicate::Eq => "eq",
+            CmpIPredicate::Ne => "ne",
+            CmpIPredicate::Slt => "slt",
+            CmpIPredicate::Sle => "sle",
+            CmpIPredicate::Sgt => "sgt",
+            CmpIPredicate::Sge => "sge",
+        }
+    }
+}
+
 /// AN INTEGER LITERAL AND THE WIDTH IT IS TYPED AT — what an `arith.constant` of integer type binds.
 ///
 /// ⛔⛔ `i1` IS A CASE OF ITS OWN BECAUSE THE REFERENCE READS IT BACK DIFFERENTLY. An `i1` constant
@@ -129,22 +175,34 @@ pub enum Op {
     /// `arith.muli`.
     MulI(IntBinary),
 
-    /// `arith.cmpi eq, %iv, <bound> : index` — one loop-position predicate.
+    /// `arith.cmpi <predicate>, %lhs, %rhs : index` — one integer comparison.
     ///
     /// (E) `first` IS `iv == lower bound` AND `last` IS `iv == upper bound - 1`
     /// (`SNControlFlowLowering.cpp:100-108`). Comparing against the trip count rather than one less
     /// than it makes `last` true on no trip at all.
+    ///
+    /// # ⛔⛔ THE PREDICATE IS A FIELD BECAUSE READERS OF THIS OP BRANCH ON IT
+    ///
+    /// It was welded into the printer while every emitter here happened to want `eq`, and that made
+    /// two of the reference's functions half unreachable:
+    /// `ConditionalSimplificationManager::getLhsRhsOfEQPredicate`
+    /// (`CFGSDataflowConditionalTree.cpp:519-532`, bridge-2 entry 098) declines any conditional whose
+    /// condition is not an `eq` — a test that cannot fail against an island with no other predicate —
+    /// and `getSentientCmpIPredicate` (`StandardToSentient.cpp:36-53`, entry 048) maps all six.
+    /// ⭐ EVERY OP THIS CRATE EMITS TODAY IS AN [`CmpIPredicate::Eq`] AND PRINTS EXACTLY AS BEFORE.
     Compare {
         /// The i1 it binds.
         result: Val,
-        /// The induction variable tested.
-        iv: Val,
-        /// What it is compared against.
+        /// Which comparison — `arith.cmpi`'s first token.
+        predicate: CmpIPredicate,
+        /// `$lhs` — the induction variable, where this is a loop-position predicate.
+        lhs: Val,
+        /// `$rhs` — what it is compared against.
         ///
         /// (E) AN SSA VALUE, NOT A LITERAL. `arith.cmpi` takes two operands of the same type;
         /// writing `arith.cmpi eq, %14, 0 : index` is "expected SSA operand". The bound is minted as
         /// an `arith.constant` first.
-        against: Val,
+        rhs: Val,
     },
 
     /// `arith.andi` / `arith.ori` / `arith.xori %c, true` - the connectives of a predicate.
@@ -197,15 +255,17 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::MulI(op) => int_binary(out, "arith.muli", op),
         Op::Compare {
             result,
-            iv,
-            against,
+            predicate,
+            lhs,
+            rhs,
         } => {
             let _ = writeln!(
                 out,
-                "{} = arith.cmpi eq, {}, {} : index",
+                "{} = arith.cmpi {}, {}, {} : index",
                 print::val(*result),
-                print::val(*iv),
-                print::val(*against)
+                predicate.spelling(),
+                print::val(*lhs),
+                print::val(*rhs)
             );
         }
         Op::Logic {

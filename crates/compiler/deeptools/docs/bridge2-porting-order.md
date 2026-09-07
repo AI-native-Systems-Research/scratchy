@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`65/384 ported; 65/384 audited`
+`73/384 ported; 73/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -69,6 +69,40 @@ arena, so the unchecked `static_cast` to the derived node is minting a `LoopMask
 `LowerSubIOpToSentient`, `LowerMulIOpToSentient`, the `If` shape law, `LowerConstantIndexToSentient`,
 `LowerConstantIntToSentient`) in `src/bridges/dataflow_ir_to_sentient/std_standard_to_sentient.rs`,
 and `OperandReuse`'s two getters (`getId`, `getAbsorbtionFlag`) in `vc_operand_reuse.rs`.
+
+⭐ AND ENTRIES 097-104 — the conditional-tree pair (`getNewDbgNameFromList`,
+`getLhsRhsOfEQPredicate`), `ConditionalSimplificationManager`'s destructor and
+`CFGSDataflowConditionalTree`'s constructor in `tf_cfgs_dataflow_conditional_tree.rs`, and
+`LocalOpNode`'s constructor with its three link reads (`getParentNode`, `getFirstChild`,
+`getNextSibling`) in `tf_flattening_local_regions.rs`.
+
+⭐ 097'S CITATION IS A CALL SITE, NOT A FUNCTION. `CFGSDataflowConditionalTree.cpp:456` is inside
+`mergeConditionalBranchesInSubtree`; the function itself is `dataflow::utils::getNewDbgNameFromList`
+(`dcc/src/Dialect/dialect_utils/Dataflow/Utils.cpp:167`, 19 lines) and that is what was ported —
+head-plus-rest rather than a first-iteration flag, and a per-operation `Option<&str>` because the
+whole name is abandoned the moment one operation carries no `dbgName`.
+
+⭐ THE ISLAND GREW FOR 098, AS THE BRIEF REQUIRES. `getLhsRhsOfEQPredicate` tests
+`cmpi_op.getPredicate() != eq`, and `arith::Op::Compare` carried no predicate at all — it printed
+`arith.cmpi eq` unconditionally. `CmpIPredicate` now names the SIX signed forms
+`getSentientCmpIPredicate` accepts (`StandardToSentient.cpp:36-53`, entry 048), whose `else` is
+`DT_CHECK(0)`; the four unsigned MLIR forms are absent BY CONSTRUCTION rather than refused. `Compare`
+had no construction site crate-wide, so emission is unchanged for `Eq`.
+
+⚠️ AND THE EXTRACT HAD TRUNCATED 098: its bodies stop at `rhs = cmpi_op.getRhs(); return true;`, i.e.
+at the half of the function that produces the answer. Ported from the authority at
+`CFGSDataflowConditionalTree.cpp:519`.
+
+⛔ **TWO HOLES IN THE VALUE-BASED SIMPLIFICATION PATH, NEITHER OF THEM MINE TO FILL.** Entry 381
+(`simplifyValueBasedConditionals`) needs the manager to be constructible and parseable, and:
+- `parseConditional` (`CFGSDataflowConditionalTree.cpp:534`) is excluded above under *MLIR
+  printing/parsing/verification*, which is a name-based misclassification — it parses no text. It
+  walks the conditional tree and fills `val_array_` with the value each iteration yields, and it is
+  the only writer of the array entry 099's destructor frees.
+- `ConditionalSimplificationManager`'s CONSTRUCTOR (`CFGSDataflowConditionalTree.hpp:55-76`, 22
+  lines) is in no batch and on no exclusion list. Entry 099 is the DESTRUCTOR at `:78`. The
+  constructor is where `is_candidate_` is decided and where `num_iterations` sizes the array, so
+  without it the destructor has nothing to own.
 
 ⭐ 001/384 MOVED TO ITS OWN TRANSLATION UNIT'S HOME: `lower_affine_yield` was living in
 `dataflow_ir_to_sentient/mod.rs`, and `crustify/crates.json` homes `e001_matchAndRewrite` in
@@ -348,22 +382,22 @@ reference too — `getPrecisionInString` can only produce `int<n>`, `bf16`, `mxf
 - [ ] **AUDIT 095/384** `isOperationSelected` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:34`, line by line against the C++
 - [ ] **PORT 096/384** `createDummyYieldInElseReg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:383`, 13 lines
 - [ ] **AUDIT 096/384** `createDummyYieldInElseReg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:383`, line by line against the C++
-- [ ] **PORT 097/384** `getNewDbgNameFromList` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:456`, 2 lines
-- [ ] **AUDIT 097/384** `getNewDbgNameFromList` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:456`, line by line against the C++
-- [ ] **PORT 098/384** `getLhsRhsOfEQPredicate` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:519`, 11 lines
-- [ ] **AUDIT 098/384** `getLhsRhsOfEQPredicate` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:519`, line by line against the C++
-- [ ] **PORT 099/384** `ConditionalSimplificationManager` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:78`, 2 lines
-- [ ] **AUDIT 099/384** `ConditionalSimplificationManager` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:78`, line by line against the C++
-- [ ] **PORT 100/384** `TransformationConditionalTree` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:111`, 5 lines
-- [ ] **AUDIT 100/384** `TransformationConditionalTree` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:111`, line by line against the C++
-- [ ] **PORT 101/384** `OperationNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:51`, 0 lines
-- [ ] **AUDIT 101/384** `OperationNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:51`, line by line against the C++
-- [ ] **PORT 102/384** `getParentNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:53`, 2 lines
-- [ ] **AUDIT 102/384** `getParentNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:53`, line by line against the C++
-- [ ] **PORT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, 2 lines
-- [ ] **AUDIT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, line by line against the C++
-- [ ] **PORT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, 2 lines
-- [ ] **AUDIT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, line by line against the C++
+- [x] **PORT 097/384** `getNewDbgNameFromList` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:456`, 2 lines
+- [x] **AUDIT 097/384** `getNewDbgNameFromList` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:456`, line by line against the C++
+- [x] **PORT 098/384** `getLhsRhsOfEQPredicate` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:519`, 11 lines
+- [x] **AUDIT 098/384** `getLhsRhsOfEQPredicate` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:519`, line by line against the C++
+- [x] **PORT 099/384** `ConditionalSimplificationManager` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:78`, 2 lines
+- [x] **AUDIT 099/384** `ConditionalSimplificationManager` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:78`, line by line against the C++
+- [x] **PORT 100/384** `TransformationConditionalTree` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:111`, 5 lines
+- [x] **AUDIT 100/384** `TransformationConditionalTree` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:111`, line by line against the C++
+- [x] **PORT 101/384** `OperationNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:51`, 0 lines
+- [x] **AUDIT 101/384** `OperationNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:51`, line by line against the C++
+- [x] **PORT 102/384** `getParentNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:53`, 2 lines
+- [x] **AUDIT 102/384** `getParentNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:53`, line by line against the C++
+- [x] **PORT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, 2 lines
+- [x] **AUDIT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, line by line against the C++
+- [x] **PORT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, 2 lines
+- [x] **AUDIT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, line by line against the C++
 - [ ] **PORT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, 2 lines
 - [ ] **AUDIT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, line by line against the C++
 - [ ] **PORT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, 0 lines
