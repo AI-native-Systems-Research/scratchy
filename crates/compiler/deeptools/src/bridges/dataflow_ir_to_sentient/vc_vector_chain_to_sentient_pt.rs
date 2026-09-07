@@ -62,3 +62,124 @@
 //! | `e369_fuseComputeOps` | 369/384 | 628 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245` |
 //! | `e379_runOnOperation` | 379/384 | 54 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975` |
 
+use crate::islands::dataflow_ir::dialects::dataflow;
+use crate::islands::sentient::dialects::sentient;
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 094/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e094_computeUnitPrecision
+///
+/// # THE PRECISION A PT UNIT'S COMPUTES ARE EMITTED AT
+///
+/// ```cpp
+/// std::string VectorChainToSentientPTLoweringPass::computeUnitPrecision(
+///     dataflow::ProgramUnitOp &unit, const SenComponents &comp) {
+///   DT_CHECK(comp == PT);
+///   DT_CHECK_MSG(unit.getPrecision().has_value(),
+///                "Precision attribute for PT is expected");
+///   std::string precision = unit.getPrecision().value().str();
+///   // Currently, we use fp80 type in MLIR to represent fp8.
+///   if (precision == "fp80") return "fp8";
+///
+///   return precision;
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:30-41`)
+///
+/// # ⭐⭐ WHAT IT PRODUCES IS THE MAC'S `ComputePrecision`
+///
+/// Its one caller passes the answer straight into the compute lowering, and the vendor's own golden
+/// shows where it lands: a unit declared `dataflow.program_unit … {precision = "mxfp4"}` yields
+/// `sentient.vector_mac {ComputePrecision = #sentient<precision mxfp4>, …}` at all 24 of its MACs
+/// (`dcc/test/Conversion/VectorChainToSentientPT/xrf_increments.mlir:374`). So this is a
+/// `dataflow`-rung spelling crossing to the `sentient`-rung enum — which is why the port's signature
+/// is [`dataflow::Precision`] in, [`sentient::Precision`] out, rather than `String` to `String`.
+///
+/// # ⛔⛔ ONE NON-IDENTITY ENTRY, AND IT IS THE WHOLE FUNCTION
+///
+/// `fp80 -> fp8`. Everything else passes through. The reference states the reason in a comment —
+/// *"Currently, we use fp80 type in MLIR to represent fp8"* — and
+/// [`dataflow::Precision::Fp80`] records that the spelling appears NOWHERE in the authority tree's
+/// `dcc/test`, so this branch is defensive. It is still the only content this function has: a port
+/// that dropped it would be `identity` with a citation attached, which is exactly the failure mode
+/// the campaign brief names.
+///
+/// # THE TWO `DT_CHECK`s
+///
+/// * `DT_CHECK(comp == PT)` — ⛔ **UNREPRESENTABLE HERE.** The component parameter's only use in the
+///   body is this comparison. Dropping it removes the way to call this with anything else: the
+///   function names the PT lowering in its module and takes no component, so there is no value to
+///   compare and no comparison to fail.
+/// * `DT_CHECK_MSG(unit.getPrecision().has_value(), "Precision attribute for PT is expected")` —
+///   ⛔ **DISCHARGED BY CONSTRUCTION.** The parameter is a [`dataflow::Precision`], not an
+///   `Optional`. The island's `ProgramUnit::precision` IS an `Option` (a `dataflow.program_unit` may
+///   legitimately carry no attribute, and 
+///   [`crate::islands::dataflow_ir::dialects::dataflow::Precision`] documents why), so the absent
+///   case is a fact about the UNIT that its reader states — and this function is only reachable once
+///   that reader has one, which is what taking the value rather than the option means.
+#[must_use]
+pub const fn compute_unit_precision(precision: dataflow::Precision) -> sentient::Precision {
+    match precision {
+        // ⭐ THE ONE REMAP.
+        dataflow::Precision::Fp80 | dataflow::Precision::Fp8 => sentient::Precision::Fp8,
+
+        // ── `return precision` — the same spelling, at the sentient rung ─────────────────────────
+        dataflow::Precision::Int8 => sentient::Precision::Int8,
+        dataflow::Precision::Int4 => sentient::Precision::Int4,
+        dataflow::Precision::Fp4 => sentient::Precision::Fp4,
+        dataflow::Precision::Fp16 => sentient::Precision::Fp16,
+        dataflow::Precision::Fp32 => sentient::Precision::Fp32,
+        dataflow::Precision::Bf16 => sentient::Precision::Bf16,
+        dataflow::Precision::Mxfp4 => sentient::Precision::Mxfp4,
+        dataflow::Precision::Mxfp8 => sentient::Precision::Mxfp8,
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::compute_unit_precision;
+    use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::sentient::dialects::sentient;
+
+    /// 🎯 094/384 — THE ONE NON-IDENTITY ENTRY.
+    ///
+    /// `if (precision == "fp80") return "fp8";`
+    /// (`VectorChainToSentientPT.cpp:37-38`) — the whole reason this function is not the identity.
+    #[test]
+    fn fp80_is_the_mlir_spelling_of_fp8() {
+        assert_eq!(
+            compute_unit_precision(dataflow::Precision::Fp80),
+            sentient::Precision::Fp8
+        );
+    }
+
+    /// 🎯 094/384 — AND EVERY OTHER SPELLING SURVIVES ITSELF.
+    ///
+    /// ⭐ THE FOUR MEASURED SPELLINGS ARE ALL HERE. A census of `precision = "…"` across the
+    /// authority tree's `dcc/test` gives `int8` 500, `fp16` 492, `mxfp8` 4, `mxfp4` 4, `bf16` 3,
+    /// `fp8` 2, `fp32` 2, `int4` 1 — and `xrf_increments.mlir:374` pins the `mxfp4` answer against
+    /// `ComputePrecision = #sentient<precision mxfp4>` in its own `CHECK-SENT-IR`.
+    #[test]
+    fn every_other_precision_passes_through_unchanged() {
+        for (from, to) in [
+            (dataflow::Precision::Int8, sentient::Precision::Int8),
+            (dataflow::Precision::Int4, sentient::Precision::Int4),
+            (dataflow::Precision::Fp4, sentient::Precision::Fp4),
+            (dataflow::Precision::Fp8, sentient::Precision::Fp8),
+            (dataflow::Precision::Fp16, sentient::Precision::Fp16),
+            (dataflow::Precision::Fp32, sentient::Precision::Fp32),
+            (dataflow::Precision::Bf16, sentient::Precision::Bf16),
+            (dataflow::Precision::Mxfp4, sentient::Precision::Mxfp4),
+            (dataflow::Precision::Mxfp8, sentient::Precision::Mxfp8),
+        ] {
+            assert_eq!(compute_unit_precision(from), to, "{}", from.spelling());
+            // ⭐⭐ AND THE ANSWER SPELLS ITSELF THE SAME. `return precision` returns the STRING, which
+            // the caller then symbolizes — so a mapping that changed the spelling would change the
+            // attribute, and this is the test that would catch it.
+            assert_eq!(from.spelling(), to.spelling(), "{}", from.spelling());
+        }
+    }
+}
+

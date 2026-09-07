@@ -1520,6 +1520,22 @@ pub struct Reg {
 pub struct Carried {
     /// One of `$initArgs` — what enters the loop.
     pub init: Val,
+    /// THE BODY ARGUMENT THIS VALUE ARRIVES AS — what the ops inside the loop actually read.
+    ///
+    /// ⛔⛔ WITHOUT IT THE LOOP'S OWN INTERFACE IS UNADDRESSABLE. `getRegionIterArgs()` is
+    /// `getBody()->getArguments().drop_front(1)` (`SentientOps.td:100-102`), and `getXrfValue`
+    /// (entry 090) answers an xrf pointer carried by a loop with exactly
+    /// `cast<sentient::ForOp>(xrf_ptr).getBody()->getArgument(1 + idx)`
+    /// (`Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:252-254`) — the
+    /// argument, NOT the initial value and NOT the result. A `Carried` holding only `init` and
+    /// `result` makes that answer inexpressible, and substituting `init` for it hands the caller a
+    /// value defined OUTSIDE the loop: every iteration would then read the pointer the loop started
+    /// with instead of the one the previous iteration advanced.
+    ///
+    /// ⭐ AND IT IS THE FIELD `affine::Carried` ALREADY HAS — see
+    /// [`crate::islands::dataflow_ir::dialects::affine::Carried::arg`]. The two rungs describe the
+    /// same loop interface, so they carry the same three values.
+    pub arg: Val,
     /// The matching result — what leaves it.
     pub result: Val,
     /// Where it lives, from `$regLocales` and `$regIndices` at this position.
@@ -1661,6 +1677,24 @@ pub enum Op {
     /// ⛔ THE BOUND IS AN SSA VALUE, NOT A LITERAL, and `regLocales`/`regIndices` are ARRAYS: one
     /// entry per iter arg, because each carried value needs its own register.
     For {
+        /// THE INDUCTION VARIABLE — ⛔ THE REGION'S FIRST ARGUMENT, and the first thing the op prints.
+        ///
+        /// ⛔⛔ IT IS SYNTAX, NOT AN OPERAND. `ForOp::print` opens with
+        /// `p << " " << op.getInductionVar() << " = " << op.getBound()`
+        /// (`Dialect/Sentient/SentientOps.cpp:1000`), so `sentient.for %arg1 = %2` names the
+        /// induction variable and then the trip count — and the reference's own expectations are
+        /// exactly that: `sentient.for %[[VAL_11:.*]] = %[[VAL_10]] {..}{`
+        /// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:25`). This field was
+        /// absent and the printer put the RESULT LIST where the induction variable goes, which made a
+        /// loop carrying nothing print a leading ` = ` and a loop carrying values print its results
+        /// twice.
+        ///
+        /// ⛔ AND `getMaskValueForPT` (entry 089) IDENTIFIES A DYNAMIC MASK BY IT. The mask parameter
+        /// must be `arith.subi %bound, %iv` of the enclosing loop —
+        /// `lhs != rhs_parent.getBound() || rhs != rhs_parent.getInductionVar()` is the refusal
+        /// (`VectorChainToSentientPT/Helper.cpp:160`) — so a loop with no nameable induction variable
+        /// cannot be the parent of any mask this pipeline accepts.
+        iv: Val,
         /// `$bound` — the trip count.
         bound: Val,
         /// THE VALUES THE LOOP CARRIES — ⛔ ONE ENTRY EACH, so the iter-operand list and the register
@@ -2277,6 +2311,359 @@ struct ComputeShared<'a> {
     dbg_name: &'a Option<String>,
 }
 
+/// THE VALUES ONE `sentient.*` OP **READS**, AS PLACES THAT CAN BE WRITTEN — `getOpOperands()`.
+///
+/// # 🛑 THIS EXISTS SO THAT `replaceAllUsesWith` CAN BE PERFORMED, NOT APPROXIMATED
+///
+/// ⛔⛔ `replaceAndEraseDummyMacOps` (entry 093) IS TWO RAUWs AND TWO ERASES AND NOTHING ELSE
+/// (`Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:681-688`). The dummy
+/// `sentient.mac` inserted by `insertDummyMacOp` (`:312-327`) is a placeholder standing where the
+/// real compute's xrf pointer result will be, and every op downstream of it — the next
+/// `sentient.add` in the pointer chain, the loop's `sentient.yield`, the real mac's own
+/// `pointers(..)` list — was wired to the placeholder. Without a way to WRITE an operand, the
+/// placeholder survives into the emitted program and the real mac's pointers are read by nobody.
+///
+/// ⛔ SO IT IS TOTAL OVER THE TWENTY-NINE, WITH NO WILDCARD. A thirtieth operation must be a build
+/// error here: an op left out would be an op whose uses a rewrite silently fails to update, and a
+/// partial rewrite is worse than none — it leaves two values live where the reference leaves one.
+///
+/// ⭐ OPERANDS ONLY. What an op BINDS is [`results`]; what its region binds is [`block_args`]. The
+/// three lists are disjoint, which is what makes a use-walk and a def-walk answer different
+/// questions about the same value.
+#[must_use]
+pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
+    let mut reads: Vec<&mut Val> = Vec::new();
+    match op {
+        // ⛔ THE INDUCTION VARIABLE IS NOT AN OPERAND and neither is a carried value's `arg` or
+        // `result`: the first two are the region's arguments and the third is what the loop binds.
+        // Only the trip count and the initialisers are read, and the initialisers are read OUTSIDE
+        // the loop — which is why an `iter_args` value can be rewritten without touching the body.
+        Op::For {
+            iv: _,
+            bound,
+            carried,
+            dbg_name: _,
+            body: _,
+        } => {
+            reads.push(bound);
+            reads.extend(carried.iter_mut().map(|carried| &mut carried.init));
+        }
+        // ⭐ THE PREDICATE IS AN ATTRIBUTE, the two compared values are operands. `yielded`'s
+        // `result` is what the op binds.
+        Op::If { lhs, rhs, .. } => reads.extend([lhs, rhs]),
+        // ⛔⛔ `sentient.yield`'s `results` FIELD IS ITS **OPERAND LIST**, and the `.td` is why the
+        // field is called that (`SentientOps.td:32`, `$results` under `let arguments`). A terminator
+        // binds nothing; it reads what the region hands back — and this is the very list
+        // `updateYieldArgs` (entry 175) appends an xrf pointer to.
+        Op::Yield { results } => reads.extend(results.iter_mut()),
+        // ⛔ THE POINTERS ARE OPERANDS AND THE POINTERS ARE WHAT ENTRY 093 REWIRES. `results` is what
+        // this op binds — the advanced write pointer then the advanced read pointer, in that order.
+        Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            ..
+        } => {
+            reads.extend(mask.iter_mut());
+            reads.extend(xrf_write_ptr.iter_mut());
+            reads.extend(xrf_read_ptr.iter_mut());
+        }
+        // ⭐ THE MASK IS THE ONLY SSA OPERAND OF THE OTHER THREE COMPUTES. Their A/B/C operands are
+        // PORTS — `opA = #sentient<compute_port zero>` — which are attributes, not values; see
+        // [`Operand`].
+        Op::VectorBinary { mask, .. } | Op::VectorUnary { mask, .. } => reads.push(mask),
+        Op::VectorTernary { mask, .. } => reads.extend(mask.iter_mut()),
+        Op::Load { src, .. } => reads.push(src),
+        Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            ..
+        }
+        | Op::LoadAndExtractScalar {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            ..
+        } => reads.extend([mutable_addr, immutable_addr, increment]),
+        Op::ReceiveAndStore {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            dst,
+            drop_first,
+            multicast_info,
+            ..
+        } => {
+            reads.extend([mutable_addr, immutable_addr, increment]);
+            reads.extend(dst.iter_mut());
+            reads.extend(drop_first.iter_mut());
+            reads.extend(multicast_info.iter_mut());
+        }
+        Op::LoadAndStore {
+            src,
+            dst,
+            src_mutable_addr,
+            src_immutable_addr,
+            src_inc,
+            dst_mutable_addr,
+            dst_immutable_addr,
+            dst_inc,
+            multicast_info,
+            ..
+        } => {
+            reads.extend([
+                src,
+                dst,
+                src_mutable_addr,
+                src_immutable_addr,
+                src_inc,
+                dst_mutable_addr,
+                dst_immutable_addr,
+                dst_inc,
+            ]);
+            reads.extend(multicast_info.iter_mut());
+        }
+        Op::LoadComputeAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            element_index,
+            scale_index,
+            ..
+        } => {
+            reads.extend([
+                mutable_addr,
+                immutable_addr,
+                increment,
+                element_index,
+                scale_index,
+            ]);
+        }
+        Op::ReceiveAndExtractScalar { position, .. } => reads.push(position),
+        Op::ScalarAdd { lhs, rhs, .. }
+        | Op::ScalarSub { lhs, rhs, .. }
+        | Op::ScalarMul { lhs, rhs, .. } => reads.extend([lhs, rhs]),
+        Op::ScalarCopy { input, .. } => reads.push(input),
+        // ⛔ ALL THREE OF `sentient.splat`'s VALUES ARE ARGUMENTS, `output` INCLUDED
+        // (`SentientOps.td:949-951` declares `input`, `output` and `mask` under `let arguments` and
+        // the op has no results at all). Treating `output` as a binding would make a splat the
+        // definition of a value some other op already defines.
+        Op::Splat {
+            input,
+            output,
+            mask,
+            ..
+        } => reads.extend([input, output, mask]),
+        Op::Samv { mask_value, .. } | Op::SetMask { mask_value, .. } => reads.push(mask_value),
+        // ⭐ A LITERAL, A PORT NAME AND A BARRIER READ NOTHING. `sentient.sync`'s peers are an
+        // attribute (`SentientOps.td:876`), `set_send_dst`'s units likewise, and `sentient.opaque`
+        // names its registers by NAME and ADDRESS rather than by value.
+        Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => {}
+    }
+    reads
+}
+
+/// THE VALUES ONE `sentient.*` OP **BINDS AS RESULTS** — what `getResult(n)` answers.
+///
+/// ⛔⛔ THE ORDER IS THE `.td`'S, AND TWO PORTS READ IT BY POSITION. `getXrfValue` (entry 090) takes
+/// `getResult(0 + idx)` of a loop's parent op and `replaceAndEraseDummyMacOps` (entry 093) takes
+/// `getResult(0)` and `getResult(1)` of a real `sentient.mac` — the WRITE pointer then the READ
+/// pointer, the same order the `pointers(..)` operand list uses (`SentientOps.td:234`). A list built
+/// in any other order would swap the two pointers of every fused compute.
+///
+/// ⛔ RESULTS ONLY: a region argument is defined by no op, which is what makes
+/// `Value::getDefiningOp()` null for one. Those are [`block_args`].
+#[must_use]
+pub fn results(op: &Op) -> Vec<Val> {
+    match op {
+        // ⭐ ONE RESULT PER CARRIED VALUE, and none for a loop that carries nothing.
+        Op::For { carried, .. } => carried.iter().map(|carried| carried.result).collect(),
+        Op::If { yielded, .. } => yielded.iter().map(|yielded| yielded.result).collect(),
+        Op::VectorMac { results, .. } => results.clone(),
+        Op::LoadAndStore { results, .. } => vec![results.0, results.1],
+        Op::LoadAndExtractScalar {
+            addr_result,
+            data_result,
+            ..
+        } => vec![*addr_result, *data_result],
+        Op::LoadAndSend { result, .. }
+        | Op::ReceiveAndStore { result, .. }
+        | Op::LoadComputeAndSend { result, .. }
+        | Op::ReceiveAndExtractScalar { result, .. }
+        | Op::ScalarAdd { result, .. }
+        | Op::ScalarSub { result, .. }
+        | Op::ScalarMul { result, .. }
+        | Op::ScalarCopy { result, .. }
+        | Op::ScalarConstant { result, .. }
+        | Op::VectorConstant { result, .. }
+        | Op::LogicalPort { result, .. } => vec![*result],
+        // ⛔ NONE OF THESE BINDS ANYTHING — `let results` is absent from all nine
+        // (`SentientOps.td`). `sentient.yield`'s `results` field is its OPERAND list; `splat`'s
+        // `output` is an argument.
+        Op::Yield { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => Vec::new(),
+    }
+}
+
+/// THE VALUES ONE `sentient.*` OP'S REGION **BINDS AS ARGUMENTS** — what no op defines.
+///
+/// ⛔⛔ THE INDUCTION VARIABLE IS ARGUMENT **0** AND THE CARRIED VALUES FOLLOW. `getInductionVar()`
+/// is `getBody()->getArgument(0)` and `getRegionIterArgs()` drops exactly that one front argument
+/// (`SentientOps.td:90-102`) — which is why `getXrfValue` reads a loop-carried xrf pointer as
+/// `getArgument(1 + idx)` (`LoweringXRF.cpp:252-254`). An off-by-one here hands out the trip
+/// counter where a pointer was asked for.
+#[must_use]
+pub fn block_args(op: &Op) -> Vec<Val> {
+    match op {
+        Op::For { iv, carried, .. } => {
+            let mut args = vec![*iv];
+            args.extend(carried.iter().map(|carried| carried.arg));
+            args
+        }
+        // ⛔ A `sentient.if` REGION TAKES NO ARGUMENTS. It has no `initArgs` — only results — so
+        // there is no argument list to drop a front element from.
+        Op::If { .. } => Vec::new(),
+        Op::Yield { .. }
+        | Op::VectorMac { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::LoadAndSend { .. }
+        | Op::ReceiveAndStore { .. }
+        | Op::LoadAndStore { .. }
+        | Op::LoadComputeAndSend { .. }
+        | Op::LoadAndExtractScalar { .. }
+        | Op::ReceiveAndExtractScalar { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => Vec::new(),
+    }
+}
+
+/// THE REGIONS ONE `sentient.*` OP HOLDS, in the order `getRegions()` indexes them.
+///
+/// ⭐ ONLY TWO OPS OF THIS DIALECT HAVE ANY, and their bodies hold [`super::Op`] — the whole mixed
+/// rung, not just this dialect. See [`Op::For`]'s `body`.
+#[must_use]
+pub fn regions(op: &Op) -> Vec<&[super::Op]> {
+    match op {
+        Op::For { body, .. } => vec![body.as_slice()],
+        // ⭐ `then` FIRST, and an empty `else` is NO REGION rather than an empty one — the
+        // distinction the printer skips a region for (`SentientOps.cpp:1310-1315`).
+        Op::If {
+            then_body,
+            else_body,
+            ..
+        } => vec![then_body.as_slice(), else_body.as_slice()],
+        // ⛔ NO `_` ARM: a thirtieth operation with a region must be a build error here, not an op
+        // whose body every walk quietly skips.
+        Op::Yield { .. }
+        | Op::VectorMac { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::LoadAndSend { .. }
+        | Op::ReceiveAndStore { .. }
+        | Op::LoadAndStore { .. }
+        | Op::LoadComputeAndSend { .. }
+        | Op::LoadAndExtractScalar { .. }
+        | Op::ReceiveAndExtractScalar { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => Vec::new(),
+    }
+}
+
+/// THE REGIONS ONE `sentient.*` OP HOLDS, AS PLACES THAT CAN BE WRITTEN — [`regions`]'s counterpart.
+///
+/// ⛔ A REWRITE HAS TO DESCEND. The xrf pointer chain runs THROUGH loops — the placeholder a
+/// `sentient.yield` inside a `sentient.for` reads is the one entry 093 rewires — so a rewrite that
+/// stopped at the top level would leave every nested use pointing at an erased op.
+#[must_use]
+pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<super::Op>> {
+    match op {
+        Op::For { body, .. } => vec![body],
+        Op::If {
+            then_body,
+            else_body,
+            ..
+        } => vec![then_body, else_body],
+        // ⛔ NO `_` ARM — see [`regions`].
+        Op::Yield { .. }
+        | Op::VectorMac { .. }
+        | Op::VectorBinary { .. }
+        | Op::VectorUnary { .. }
+        | Op::VectorTernary { .. }
+        | Op::Load { .. }
+        | Op::LoadAndSend { .. }
+        | Op::ReceiveAndStore { .. }
+        | Op::LoadAndStore { .. }
+        | Op::LoadComputeAndSend { .. }
+        | Op::LoadAndExtractScalar { .. }
+        | Op::ReceiveAndExtractScalar { .. }
+        | Op::ScalarAdd { .. }
+        | Op::ScalarSub { .. }
+        | Op::ScalarMul { .. }
+        | Op::ScalarCopy { .. }
+        | Op::ScalarConstant { .. }
+        | Op::VectorConstant { .. }
+        | Op::Sync { .. }
+        | Op::Nop { .. }
+        | Op::SetSendDst { .. }
+        | Op::LogicalPort { .. }
+        | Op::Splat { .. }
+        | Op::Samv { .. }
+        | Op::SetMask { .. }
+        | Op::IncrMask { .. }
+        | Op::Opaque { .. } => Vec::new(),
+    }
+}
+
 /// ONE `sentient` OP AS TEXT. The caller has already indented.
 ///
 /// ⛔⛔ THE ATTRIBUTE DICTIONARY IS **ALPHABETICAL**, because MLIR's `printOptionalAttrDict` sorts it
@@ -2303,6 +2690,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         // `p << " " << inductionVar << " = " << bound`, then the iter-operand types, the dict, and
         // the region (`SentientOps.cpp:998-1010`).
         Op::For {
+            iv,
             bound,
             carried,
             dbg_name,
@@ -2332,16 +2720,32 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             }
             attrs.sort();
             let bound_val = print::val(*bound);
+            // ⭐ `printInitializationList` PAIRS THE BODY ARGUMENT WITH ITS INITIAL VALUE, under the
+            // prefix ` iter_args` and only when there is one (`SentientOps.cpp:984-996, 1002`):
+            // `iter_args(%28 = %0, %29 = %25)`
+            // (`dcc/test/L3SU/dyn_node_e2e.mlir:79` writes exactly that form). The `= ` between them
+            // is why [`Carried::arg`] has to exist for this line to be writable at all.
             let inits = if carried.is_empty() {
                 String::new()
             } else {
-                let args: Vec<Val> = carried.iter().map(|c| c.init).collect();
-                format!(" ({})", print::vals(&args))
+                let pairs: Vec<String> = carried
+                    .iter()
+                    .map(|c| format!("{} = {}", print::val(c.arg), print::val(c.init)))
+                    .collect();
+                format!(" iter_args({})", pairs.join(", "))
+            };
+            // ⛔ NO RESULT LIST WHERE THE LOOP CARRIES NOTHING. The generic printer writes the bound
+            // values before the mnemonic, and a loop with no `initArgs` binds none — so
+            // `sentient.for %arg1 = %2 {..}{` is the whole line, with no leading ` = `.
+            let produced = if results.is_empty() {
+                String::new()
+            } else {
+                format!("{} = ", print::vals(&results))
             };
             let _ = writeln!(
                 out,
-                "{} = sentient.for {bound_val}{inits}{iter_types} {} {{",
-                print::vals(&results),
+                "{produced}sentient.for {} = {bound_val}{inits}{iter_types} {} {{",
+                print::val(*iv),
                 dict(&attrs)
             );
             for inner in body {

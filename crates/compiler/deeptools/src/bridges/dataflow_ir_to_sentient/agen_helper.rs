@@ -569,7 +569,8 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
         | DfirOp::Scf(_)
         | DfirOp::Affine(_)
         | DfirOp::Dataflow(_)
-        | DfirOp::VectorChain(_) => None,
+        | DfirOp::VectorChain(_)
+        | DfirOp::Symbol(_) => None,
     }
 }
 
@@ -650,7 +651,8 @@ impl AgenLoad {
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
-            | DfirOp::VectorChain(_) => None,
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => None,
         }
     }
 }
@@ -695,13 +697,15 @@ impl Rearrangement {
                 // a load feeding a pack has no consumer by this rule.
                 | dfir_op::vectorchain::Op::Pack { .. }
                 | dfir_op::vectorchain::Op::Merge { .. }
-                | dfir_op::vectorchain::Op::CreateAffineMask { .. } => None,
+                | dfir_op::vectorchain::Op::CreateAffineMask { .. }
+                | dfir_op::vectorchain::Op::CreateAffineMaskSet { .. } => None,
             },
             DfirOp::Arith(_)
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
-            | DfirOp::Agen(_) => None,
+            | DfirOp::Agen(_)
+            | DfirOp::Symbol(_) => None,
         }
     }
 }

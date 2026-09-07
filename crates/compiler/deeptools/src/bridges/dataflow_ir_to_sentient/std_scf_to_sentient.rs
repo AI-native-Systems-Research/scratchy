@@ -260,8 +260,11 @@ pub const fn legality(op: &DfirOp) -> Legality {
         DfirOp::Scf(_) => Legality::Illegal,
         // `addLegalDialect<arith::ArithDialect, vectorchain::VectorChainDialect, ...>`.
         DfirOp::Arith(_) | DfirOp::VectorChain(_) => Legality::Legal,
-        // Named by neither list.
-        DfirOp::Affine(_) | DfirOp::Dataflow(_) | DfirOp::Agen(_) => Legality::Unmentioned,
+        // Named by neither list. ⭐ `symbol` JOINS THEM: the pass's two lists do not mention it, and
+        // a `symbol.create_symbol` does survive this rung — see [`sen::Op::Symbol`].
+        DfirOp::Affine(_) | DfirOp::Dataflow(_) | DfirOp::Agen(_) | DfirOp::Symbol(_) => {
+            Legality::Unmentioned
+        }
     }
 }
 
@@ -314,7 +317,8 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
             | DfirOp::Scf(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
-            | DfirOp::VectorChain(_) => {}
+            | DfirOp::VectorChain(_)
+            | DfirOp::Symbol(_) => {}
         }
     }
 }

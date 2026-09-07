@@ -32,7 +32,22 @@ pub enum Op {
         cond: Val,
         /// The `then` region.
         body: Vec<super::Op>,
-        /// The `else` region. Empty prints no `else` at all, which is the one-armed branch.
+        /// The `else` region.
+        ///
+        /// ⛔⛔ EMPTY MEANS **NO BLOCK**, AND THAT IS A DIFFERENT OP FROM A BLOCK HOLDING ONLY A
+        /// TERMINATOR. `getRegions()[1].empty()` is the test `createDummyYieldInElseReg` (entry 096)
+        /// guards on, and pushing a bare `scf.yield` into the region is that function's ENTIRE effect
+        /// (`Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:383-396`). MLIR prints the
+        /// difference: no block prints no `else` at all, a block with an elided terminator prints
+        /// `} else {` and an empty pair of braces —
+        /// ```text
+        /// scf.if %53 {
+        ///   ..
+        /// } else {
+        /// }
+        /// ```
+        /// (`dcc/test/PT/issue-236.mlir:65-71`). A `Vec` that flattened the two states would make
+        /// entry 096 a function with no observable result.
         else_body: Vec<super::Op>,
     },
 
@@ -112,6 +127,28 @@ pub enum Op {
     },
 }
 
+/// ONE REGION OF AN `scf.if`, WITH ITS OPERAND-LESS TERMINATOR ELIDED.
+///
+/// ⛔ MLIR ELIDES IT BECAUSE THIS OP BINDS NOTHING. `SCF.cpp`'s printer passes
+/// `printBlockTerminators = !getResults().empty()`, and [`Op::If`] carries no result list at all —
+/// deliberately, see its note — so the `scf.yield` a region ends with is never printed. That is what
+/// makes `} else {` followed by a bare `}` the reference's own text
+/// (`dcc/test/PT/issue-236.mlir:70-71`) rather than a region printed with a stray terminator.
+///
+/// ⭐ ELIDED, NOT DROPPED. The op stays in the region: [`super::regions`] and every walk still see
+/// it, and entry 096's whole job is to put one there.
+fn region(out: &mut String, ops: &[super::Op], depth: usize) {
+    for (n, inner) in ops.iter().enumerate() {
+        let last = n + 1 == ops.len();
+        if last
+            && matches!(inner, super::Op::Scf(Op::Yield { operands }) if operands.is_empty())
+        {
+            continue;
+        }
+        print::emit(out, inner, depth + 1);
+    }
+}
+
 /// ONE `scf` OP AS TEXT. The caller has already indented the opening line.
 pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
     match op {
@@ -175,17 +212,13 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             else_body,
         } => {
             let _ = writeln!(out, "scf.if {} {{", print::val(*cond));
-            for inner in body {
-                print::emit(out, inner, depth + 1);
-            }
+            region(out, body, depth);
             print::indent(out, depth);
             if else_body.is_empty() {
                 out.push_str("}\n");
             } else {
                 out.push_str("} else {\n");
-                for inner in else_body {
-                    print::emit(out, inner, depth + 1);
-                }
+                region(out, else_body, depth);
                 print::indent(out, depth);
                 out.push_str("}\n");
             }

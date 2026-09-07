@@ -169,6 +169,38 @@ pub enum Precision {
     Fp16,
     /// `fp32` — `FMA32`, and also `FNMS`, which `stringifyComputePrecision` maps here too (`:67-68`).
     Fp32,
+
+    // ── THE FOUR SPELLINGS `stringifyComputePrecision` DOES NOT WRITE ────────────────────────────
+    //
+    // ⛔⛔ THE PRODUCER IS NOT THE ONLY SOURCE OF THIS ATTRIBUTE. `stringifyComputePrecision`
+    // (`DSC2ToDataflowIR.hpp:54-71`) emits exactly the six above, and an island that stopped there
+    // could not HOLD the DataflowIR the reference's own tests feed the PT lowering. A census of
+    // `precision = "…"` on `dataflow.program_unit` across the authority tree's `dcc/test` gives:
+    // `int8` 500, `fp16` 492, `mxfp8` 4, `mxfp4` 4, `bf16` 3, `fp8` 2, `fp32` 2, `int4` 1. Three of
+    // those eight had no variant, so `computeUnitPrecision` (entry 094) could not be exercised on the
+    // very files that pin its answer.
+    /// `bf16`. ⚠️ NOT WRITTEN BY `stringifyComputePrecision` — 3 occurrences in `dcc/test`.
+    Bf16,
+    /// `mxfp4` — 4 occurrences, e.g. `dataflow.program_unit … {precision = "mxfp4"}` lowering to
+    /// `ComputePrecision = #sentient<precision mxfp4>`
+    /// (`dcc/test/Conversion/VectorChainToSentientPT/xrf_increments.mlir:374`).
+    Mxfp4,
+    /// `mxfp8` — 4 occurrences.
+    Mxfp8,
+
+    /// `fp80` — ⛔⛔ **AN ALIAS FOR `fp8`, AND THE ONLY REASON ENTRY 094 IS NOT THE IDENTITY.**
+    ///
+    /// ```cpp
+    /// // Currently, we use fp80 type in MLIR to represent fp8.
+    /// if (precision == "fp80") return "fp8";
+    /// ```
+    /// (`Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:37-38`)
+    ///
+    /// ⚠️ IT APPEARS **NOWHERE** in the authority tree's `dcc/test` — the remap is defensive. It is
+    /// still the whole content of a scheduled function, so the island has to be able to state the
+    /// input that reaches its one non-identity branch; a port that dropped it would be the identity
+    /// function wearing a citation.
+    Fp80,
 }
 
 impl Precision {
@@ -182,6 +214,10 @@ impl Precision {
             Self::Fp8 => "fp8",
             Self::Fp16 => "fp16",
             Self::Fp32 => "fp32",
+            Self::Bf16 => "bf16",
+            Self::Mxfp4 => "mxfp4",
+            Self::Mxfp8 => "mxfp8",
+            Self::Fp80 => "fp80",
         }
     }
 }
@@ -259,6 +295,9 @@ impl PageRect {
         }
         IntegerSet {
             dims: u32::try_from(self.spans.len()).expect("a rank fits a u32"),
+            // ⛔ NO SYMBOLS: a span states its own bounds as literals, so there is nothing left to
+            // substitute — the same `/*numSymbols=*/0` `buildIntegerSetFromSizes` passes.
+            symbols: 0,
             constraints,
         }
     }

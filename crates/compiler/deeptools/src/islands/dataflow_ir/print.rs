@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::dataflow::Precision;
 use crate::islands::dataflow_ir::dialects::{
-    Index, Op, Val, affine, agen, arith, dataflow, scf, vectorchain,
+    Index, Op, Val, affine, agen, arith, dataflow, scf, symbol, vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, ElemType, IntegerSet, MemRef, Vector,
@@ -139,6 +139,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::Dataflow(op) => dataflow::emit(out, op, depth),
         Op::Agen(op) => agen::emit(out, op, depth),
         Op::VectorChain(op) => vectorchain::emit(out, op),
+        Op::Symbol(op) => symbol::emit(out, op),
     }
 }
 
@@ -225,12 +226,29 @@ pub(crate) fn affine_map(map: &AffineMap) -> String {
     format!("affine_map<({dims}){syms} -> ({results})>")
 }
 
-/// `affine_set<(d0, ..) : (c, ..)>` — the constraints in the order they were built.
+/// `affine_set<(d0, ..)[s0, ..] : (c, ..)>` — the constraints in the order they were built.
+///
+/// ⭐ THE SYMBOL LIST IS WRITTEN ONLY WHEN THERE IS ONE, which is how MLIR writes it: the static
+/// masks print `affine_set<(d0) : (d0 - 48 >= 0, -d0 + 63 >= 0)>` and the dynamic one
+/// `affine_set<(d0)[s0] : (d0 + s0 * 8 - 64 >= 0, -d0 + 63 >= 0)>`
+/// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:5-7`). An always-printed
+/// `[]` would make every static set a diff against a vendored file.
 pub(crate) fn integer_set(set: &IntegerSet) -> String {
     let dims = (0..set.dims)
         .map(|d| format!("d{d}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let symbols = if set.symbols == 0 {
+        String::new()
+    } else {
+        format!(
+            "[{}]",
+            (0..set.symbols)
+                .map(|s| format!("s{s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let constraints = set
         .constraints
         .iter()
@@ -240,7 +258,7 @@ pub(crate) fn integer_set(set: &IntegerSet) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("affine_set<({dims}) : ({constraints})>")
+    format!("affine_set<({dims}){symbols} : ({constraints})>")
 }
 
 /// BINDING POWER, so the printed map is the one MLIR would print.

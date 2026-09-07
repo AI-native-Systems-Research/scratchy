@@ -567,6 +567,7 @@ impl<'a> AccessDetailsBase<'a> {
             // `IntegerSetAttr transfer_set_;` (`hpp:202`) — see the null-attribute note above.
             transfer_set: IntegerSet {
                 dims: 0,
+                symbols: 0,
                 constraints: Vec::new(),
             },
             // `AffineMap transfer_order_;` (`hpp:205`).

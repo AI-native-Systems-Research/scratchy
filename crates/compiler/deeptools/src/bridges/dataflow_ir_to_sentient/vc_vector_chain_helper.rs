@@ -333,7 +333,8 @@ fn element_type_of(op: &DfirOp) -> ElemType {
 ///
 /// ⛔⛔ THE MEMBERSHIP LIST IS THE WHOLE CONTENT, AND IT IS NOT "EVERY OP WITH A VECTOR RESULT".
 /// [`vc::Op::Cast`], [`vc::Op::Select`], [`vc::Op::Rotate`], [`vc::Op::ConstantBitstream`],
-/// [`vc::Op::CreateAffineMask`] and [`vc::Op::Merge`] every one of them results in a vector, and
+/// [`vc::Op::CreateAffineMask`], [`vc::Op::CreateAffineMaskSet`] and [`vc::Op::Merge`] every one of
+/// them results in a vector, and
 /// every one of them is ABSENT from both reference lists — so `getElementType` aborts on a cast.
 /// ⛔ `RotateOp` IS THE ONE TO WATCH: `getLoadConsumer` names it beside `SelectOp` and `ShuffleOp`
 /// as a rearrangement (`Helper.cpp:1268-1270`), and of those three only the SHUFFLE is in
@@ -372,7 +373,11 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         DfirOp::Affine(
             dfir_op::affine::Op::For { .. }
             | dfir_op::affine::Op::Apply { .. }
-            | dfir_op::affine::Op::Yield { .. },
+            | dfir_op::affine::Op::Yield { .. }
+            // ⭐ AN `affine.if` YIELDS `index`, NEVER A VECTOR — `%52 = affine.if #set0(%arg9) -> index`
+            // (`dcc/test/PT/issue-236.mlir:59`). It is absent from both reference lists for the same
+            // reason it answers `None` here.
+            | dfir_op::affine::Op::If { .. },
         ) => None,
         // The `vectorchain` ops both reference lists name, including the estimate family:
         // `ExpEstimateOp` (`Utils.cpp:598`), `RecEstimateOp`, `LnEstimateOp`, `RsqrtEstimateOp`,
@@ -399,10 +404,11 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             | vc::Op::ConstantBitstream { .. }
             | vc::Op::Cast { .. }
             | vc::Op::CreateAffineMask { .. }
+            | vc::Op::CreateAffineMaskSet { .. }
             | vc::Op::Merge { .. },
         ) => None,
-        // Neither reference list mentions an `arith` or an `scf` op.
-        DfirOp::Arith(_) | DfirOp::Scf(_) => None,
+        // Neither reference list mentions an `arith`, an `scf` or a `symbol` op.
+        DfirOp::Arith(_) | DfirOp::Scf(_) | DfirOp::Symbol(_) => None,
     }
 }
 
@@ -936,13 +942,15 @@ fn reset_data_ids(ops: &mut [SenOp]) {
                 | sen::Op::IncrMask { .. }
                 | sen::Op::Opaque { .. } => {}
             },
-            // The shared dialects' nested bodies are `Vec<DfirOp>` — no compute can be in one.
+            // The shared dialects' nested bodies are `Vec<DfirOp>` — no compute can be in one, and
+            // `symbol.create_symbol` has no body at all.
             SenOp::Dataflow(_)
             | SenOp::Agen(_)
             | SenOp::VectorChain(_)
             | SenOp::Affine(_)
             | SenOp::Arith(_)
-            | SenOp::Scf(_) => {}
+            | SenOp::Scf(_)
+            | SenOp::Symbol(_) => {}
         }
     }
 }
@@ -1258,7 +1266,8 @@ pub fn vector_ternary_to_sentient_ternary(op: &vc::Op) -> sen::TernaryOp {
         | vc::Op::Shuffle { .. }
         | vc::Op::Rotate { .. }
         | vc::Op::Cast { .. }
-        | vc::Op::CreateAffineMask { .. } => {
+        | vc::Op::CreateAffineMask { .. }
+        | vc::Op::CreateAffineMaskSet { .. } => {
             todo!("unknown vectorchain Ternary operator (VectorChainHelper.hpp:255)")
         }
     }
@@ -1630,6 +1639,7 @@ mod unit_tests {
         for (from, to) in [(0, 63), (0, 127), (0, 31), (0, 0), (64, 63)] {
             let mask = IntegerSet {
                 dims: 1,
+                symbols: 0,
                 constraints: vec![
                     Constraint {
                         expr: AffineExpr::dim(0).plus(AffineExpr::Const(-from)),
@@ -1653,6 +1663,7 @@ mod unit_tests {
     fn a_mask_set_missing_either_side_has_no_constant_bounds() {
         let lower_only = IntegerSet {
             dims: 1,
+            symbols: 0,
             constraints: vec![Constraint {
                 expr: AffineExpr::dim(0),
                 is_equality: false,
@@ -1660,6 +1671,7 @@ mod unit_tests {
         };
         let upper_only = IntegerSet {
             dims: 1,
+            symbols: 0,
             constraints: vec![Constraint {
                 expr: AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(63)),
                 is_equality: false,
@@ -1667,6 +1679,7 @@ mod unit_tests {
         };
         let unconstrained = IntegerSet {
             dims: 1,
+            symbols: 0,
             constraints: vec![],
         };
         assert!(!has_constant_bounds(&lower_only));
@@ -2082,6 +2095,9 @@ mod unit_tests {
         let mut unit = sentient_unit(std::vec![
             mac(1, 2, 3),
             SenOp::Sentient(sen::Op::For {
+                // ⭐ THE INDUCTION VARIABLE IS SYNTAX, NOT AN OPERAND — see [`sen::Op::For::iv`]. The
+                // walk under test ignores it; it is here because the op always names one.
+                iv: Val(11),
                 bound: Val(1),
                 carried: Vec::new(),
                 dbg_name: None,
