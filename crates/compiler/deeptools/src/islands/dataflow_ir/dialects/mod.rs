@@ -1149,6 +1149,35 @@ pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
     None
 }
 
+/// THE OP WHOSE REGION BINDS A VALUE AS AN ARGUMENT — `BlockArgument::getOwner()->getParentOp()`.
+///
+/// ⭐ THE MIRROR OF [`defining_op`], AND EXACTLY ONE OF THE TWO ANSWERS. A value is either an op's
+/// result or a region's argument, never both — so `region_owner(v, scope).is_some()` is
+/// `isa<BlockArgument>(v)` and `defining_op(v, scope).is_some()` is `!isa<BlockArgument>(v)`.
+///
+/// ⛔ IT ANSWERS WITH THE **PARENT OP**, NOT THE BLOCK. MLIR's `getOwner()` is the block and callers
+/// immediately ask it for `getParentOp()` — `cast<BlockArgument>(index).getOwner()->getParentOp()`
+/// then `isa<affine::AffineForOp, scf::ForOp>(loop_op)`
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:360-362`). This island has no block between
+/// an op and its region's arguments, so the op is the whole answer.
+///
+/// ⛔ AND IT DESCENDS INTO REGIONS, for [`uses`]' reason: the loop whose induction variable a
+/// subscript names is nested inside the program unit, not beside it.
+#[must_use]
+pub fn region_owner(val: Val, scope: &[Op]) -> Option<&Op> {
+    for op in scope {
+        if block_args(op).contains(&val) {
+            return Some(op);
+        }
+        for region in regions(op) {
+            if let Some(found) = region_owner(val, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// THE SSA VALUES ONE INDEX LIST READS.
 ///
 /// ⛔ A STRIDED SUM READS EVERY VARIABLE IN IT. `%arg9 + %arg8 * 8` is two uses, not one — see

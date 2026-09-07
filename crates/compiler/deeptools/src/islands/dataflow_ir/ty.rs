@@ -816,9 +816,679 @@ impl AffineMap {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// THE AFFINE ALGEBRA A TRANSFER'S GEOMETRY IS DERIVED WITH.
+//
+// ⭐ THE ISLAND WIDENED HERE BECAUSE `constructExtentAndTotalElements` CANNOT BE WRITTEN WITHOUT IT.
+// That function is four MLIR calls before it looks at anything —
+// `FlatAffineValueConstraints(set)`, `composeMatchingMap(order)`, `projectOut(..)`,
+// `removeRedundantConstraints()` (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:33-40`) —
+// and its answer is read back out of the resulting MATRIX by two predicates that scan coefficient
+// ROWS (`dialect_utils/Agen/Utils.cpp:121-170`). An `IntegerSet` holds expressions, not rows, so the
+// matrix is a type of its own rather than a reading of the set.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE AFFINE EXPRESSION AS A COEFFICIENT ROW — `getFlattenedAffineExpr(expr, numDims, numSymbols,
+/// &coeffs, &csts)` (`mlir/Dialect/Affine/Analysis/AffineStructures.h`), which
+/// `agen::utils::getMapCoefficients` (`dialect_utils/Agen/Utils.cpp:65-71`) and
+/// `constructDimCoefficients` (`:78-95`) are both thin wrappers around.
+///
+/// ⛔⛔ THE LAST ENTRY IS THE CONSTANT TERM, NOT A VARIABLE, and every consumer in this campaign
+/// depends on knowing that: `LoweringXRF.cpp:50` asserts `layout_coeffs.size() == operands.size() +
+/// 1`, `calculateTimeOffsets` splits the row at `size() - 1` and re-appends `back()`
+/// (`Utils.cpp:112-116`), and `constructIteratorCoeffDict` reads `coeffs.back()` as the offset
+/// (`dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:73-76`). So the row is
+/// `[d0 .. dn, s0 .. sm, constant]`: `d0 * 4 + d1 + 7` over two dimensions and no symbols is
+/// `[4, 1, 7]`.
+///
+/// ⛔ NO LOCAL VARIABLES. MLIR's flattener introduces one extra column per `mod`, `floordiv` or
+/// `ceildiv` it meets, together with the inequalities that define it; nothing this bridge builds has
+/// one, so those two arms are [`todo!`]s that name the missing machinery rather than a silent
+/// mis-flattening. [`terms_in`] already declines the same two shapes for the same reason.
+fn flattened(expr: &AffineExpr, dims: u32, syms: u32) -> Vec<i64> {
+    let vars = dims as usize + syms as usize;
+    let mut row = vec![0_i64; vars + 1];
+    match expr {
+        AffineExpr::Dim(n) => match usize::try_from(*n) {
+            Ok(pos) if pos < dims as usize => row[pos] = 1,
+            _ => todo!(
+                "flattening d{n} against a map that declares {dims} dimensions — MLIR's own \
+                 getFlattenedAffineExpr asserts the position is inside the space it is given"
+            ),
+        },
+        AffineExpr::Sym(n) => match usize::try_from(*n) {
+            Ok(pos) if pos < syms as usize => row[dims as usize + pos] = 1,
+            _ => todo!(
+                "flattening s{n} against a map that declares {syms} symbols — MLIR's own \
+                 getFlattenedAffineExpr asserts the position is inside the space it is given"
+            ),
+        },
+        AffineExpr::Const(c) => row[vars] = *c,
+        AffineExpr::Add(a, b) => {
+            let (lhs, rhs) = (flattened(a, dims, syms), flattened(b, dims, syms));
+            for (slot, (x, y)) in row.iter_mut().zip(lhs.iter().zip(rhs.iter())) {
+                *slot = x + y;
+            }
+        }
+        // ⛔ ONE SIDE MUST BE A LITERAL. `SimpleAffineExprFlattener::visitMulExpr` requires the RHS
+        // to flatten to a constant and reports failure otherwise — a product of two variables is
+        // SEMI-affine, which no `AffineMap` in the reference's IR is.
+        AffineExpr::Mul(a, b) => {
+            let (lhs, rhs) = (flattened(a, dims, syms), flattened(b, dims, syms));
+            let literal = |flat: &[i64]| {
+                flat[..vars]
+                    .iter()
+                    .all(|coeff| *coeff == 0)
+                    .then(|| flat[vars])
+            };
+            match (literal(&lhs), literal(&rhs)) {
+                (_, Some(k)) => {
+                    for (slot, x) in row.iter_mut().zip(lhs.iter()) {
+                        *slot = x * k;
+                    }
+                }
+                (Some(k), None) => {
+                    for (slot, y) in row.iter_mut().zip(rhs.iter()) {
+                        *slot = y * k;
+                    }
+                }
+                (None, None) => todo!("a product of two affine variables is not an affine map"),
+            }
+        }
+        AffineExpr::Mod(..) => todo!(
+            "flattening a `mod` needs the local variable and the two inequalities MLIR's \
+             SimpleAffineExprFlattener introduces for it"
+        ),
+        AffineExpr::FloorDiv(..) => todo!(
+            "flattening a `floordiv` needs the local variable and the two inequalities MLIR's \
+             SimpleAffineExprFlattener introduces for it"
+        ),
+    }
+    row
+}
+
+/// ONE EXPRESSION WITH ITS DIMENSIONS **AND** SYMBOLS REPLACED — `AffineExpr::replaceDimsAndSymbols`.
+///
+/// ⭐ A POSITION BEYOND ITS REPLACEMENT LIST IS LEFT ALONE, which is MLIR's own rule
+/// (`return *this` when `pos >= dimReplacements.size()`) and what makes a PARTIAL substitution
+/// expressible — see [`IntegerSet::replace_symbols`], which relies on the same for symbols.
+fn replace_dims_and_symbols_in(
+    expr: &AffineExpr,
+    dim_repl: &[AffineExpr],
+    sym_repl: &[AffineExpr],
+) -> AffineExpr {
+    let recur = |e| replace_dims_and_symbols_in(e, dim_repl, sym_repl);
+    match expr {
+        AffineExpr::Dim(n) => match usize::try_from(*n).ok().and_then(|p| dim_repl.get(p)) {
+            Some(with) => with.clone(),
+            None => expr.clone(),
+        },
+        AffineExpr::Sym(n) => match usize::try_from(*n).ok().and_then(|p| sym_repl.get(p)) {
+            Some(with) => with.clone(),
+            None => expr.clone(),
+        },
+        AffineExpr::Const(_) => expr.clone(),
+        AffineExpr::Add(a, b) => AffineExpr::Add(Box::new(recur(a)), Box::new(recur(b))),
+        AffineExpr::Mul(a, b) => AffineExpr::Mul(Box::new(recur(a)), Box::new(recur(b))),
+        AffineExpr::Mod(a, b) => AffineExpr::Mod(Box::new(recur(a)), Box::new(recur(b))),
+        AffineExpr::FloorDiv(a, b) => AffineExpr::FloorDiv(Box::new(recur(a)), Box::new(recur(b))),
+    }
+}
+
+/// EVERY SYMBOL MOVED UP BY `by` — `AffineMap::shiftSymbols`, the renumbering
+/// `AffineMap::compose` does to keep the two maps' symbol spaces apart.
+fn shift_symbols(expr: &AffineExpr, by: u32) -> AffineExpr {
+    match expr {
+        AffineExpr::Sym(n) => AffineExpr::Sym(n + by),
+        AffineExpr::Dim(_) | AffineExpr::Const(_) => expr.clone(),
+        AffineExpr::Add(a, b) => AffineExpr::Add(
+            Box::new(shift_symbols(a, by)),
+            Box::new(shift_symbols(b, by)),
+        ),
+        AffineExpr::Mul(a, b) => AffineExpr::Mul(
+            Box::new(shift_symbols(a, by)),
+            Box::new(shift_symbols(b, by)),
+        ),
+        AffineExpr::Mod(a, b) => AffineExpr::Mod(
+            Box::new(shift_symbols(a, by)),
+            Box::new(shift_symbols(b, by)),
+        ),
+        AffineExpr::FloorDiv(a, b) => AffineExpr::FloorDiv(
+            Box::new(shift_symbols(a, by)),
+            Box::new(shift_symbols(b, by)),
+        ),
+    }
+}
+
+impl AffineMap {
+    /// THIS MAP'S RESULT `result` AS A COEFFICIENT ROW — `agen::utils::getMapCoefficients(coeffs,
+    /// map, result)` (`dialect_utils/Agen/Utils.cpp:65-71`).
+    ///
+    /// ⛔ ONE COEFFICIENT PER DIMENSION AND SYMBOL, PLUS THE CONSTANT TERM LAST — see [`flattened`].
+    /// The layout map of a rank-`n` view therefore gives `n + 1` coefficients, which is the
+    /// relation `LoweringXRF.cpp:50` asserts and the reason
+    /// `constructExtentAndTotalElements` compares `layout_coeffs.size()` against the constraint
+    /// system's DIMENSION count rather than assuming they are equal
+    /// (`AccessDetails.cpp:47-50`).
+    ///
+    /// ⭐ AN ABSENT RESULT GIVES AN EMPTY ROW, where MLIR's `map.getResult(result)` would read past
+    /// the end. Nothing in the reference asks for one: every caller passes 0 on a map whose single
+    /// result is the linearised address.
+    #[must_use]
+    pub fn coefficients(&self, result: usize) -> Vec<i64> {
+        match self.results.get(result) {
+            Some(expr) => flattened(expr, self.dims, self.syms),
+            None => Vec::new(),
+        }
+    }
+
+    /// DIMENSIONS AND SYMBOLS SUBSTITUTED, WITH THE RESULT'S ARITIES STATED —
+    /// `AffineMap::replaceDimsAndSymbols(dimReplacements, symReplacements, numResultDims,
+    /// numResultSyms)`.
+    ///
+    /// ⛔⛔ THE NEW ARITIES ARE THE CALLER'S, NOT THE SUBSTITUTION'S, and that is what
+    /// `constructIndices` uses it for: it rewrites the subscripts map's operand list so that the
+    /// dimensions it FOLDED become constants and the ones it KEPT are renumbered densely, then
+    /// declares the surviving count — `subscripts_map.replaceDimsAndSymbols(operand_exprs,
+    /// symbol_exprs, ndims, 0)` with `ndims` counted as it went
+    /// (`AccessDetails.cpp:385-401`). A map that inferred its own arity from the expressions left in
+    /// it would keep the folded dimensions' columns and every constraint row built from it would be
+    /// too wide.
+    #[must_use]
+    pub fn replace_dims_and_symbols(
+        &self,
+        dim_repl: &[AffineExpr],
+        sym_repl: &[AffineExpr],
+        result_dims: u32,
+        result_syms: u32,
+    ) -> AffineMap {
+        AffineMap {
+            dims: result_dims,
+            syms: result_syms,
+            results: self
+                .results
+                .iter()
+                .map(|expr| replace_dims_and_symbols_in(expr, dim_repl, sym_repl))
+                .collect(),
+        }
+    }
+
+    /// `self ∘ other` — `AffineMap::compose(AffineMap map)`: `other`'s results are fed into `self`'s
+    /// dimensions, so the composition takes `other`'s inputs and produces `self`'s results.
+    ///
+    /// ⛔⛔ THE SYMBOL SPACES ARE CONCATENATED, `self`'s FIRST. MLIR renumbers `other`'s symbols to
+    /// start at `self.getNumSymbols()` before substituting, so a symbol of the outer map and a
+    /// symbol of the inner one cannot collide. Both maps in this campaign's uses are symbol-free —
+    /// `mem_view_layout_map.compose(time_addr_map)` (`dialect_utils/Agen/Utils.cpp:103`) and
+    /// `transfer_order.compose(subscripts_map)`
+    /// (`dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:57-60`) — but dropping the shift
+    /// would make this function wrong for the paged-view maps, which are not.
+    ///
+    /// ⭐ A RESULT COUNT MISMATCH LEAVES `self`'s SURPLUS DIMENSION UNSUBSTITUTED rather than
+    /// aborting: MLIR asserts `getNumDims() == map.getNumResults()`, and a dimension with no
+    /// replacement keeps its own position ([`replace_dims_and_symbols_in`]). The composed map then
+    /// still names a variable of the inner space, which is a shape every downstream reader answers
+    /// "not constant" to — a wrong ANSWER is what an unchecked substitution would produce instead.
+    #[must_use]
+    pub fn compose(&self, other: &AffineMap) -> AffineMap {
+        let shifted: Vec<AffineExpr> = other
+            .results
+            .iter()
+            .map(|expr| shift_symbols(expr, self.syms))
+            .collect();
+        AffineMap {
+            dims: other.dims,
+            syms: self.syms + other.syms,
+            results: self
+                .results
+                .iter()
+                .map(|expr| replace_dims_and_symbols_in(expr, &shifted, &[]))
+                .collect(),
+        }
+    }
+}
+
+/// AN INTEGER SET AS A COEFFICIENT MATRIX — `mlir::affine::FlatAffineValueConstraints`.
+///
+/// # ⭐⭐ THE ROWS ARE WHAT THE REFERENCE READS, NOT THE EXPRESSIONS
+///
+/// `isDimValueZero` and `isDimAConstantRange` (`dialect_utils/Agen/Utils.cpp:121-170`) walk
+/// `atEq(r, c)` / `atIneq(r, c)` counting the NONZERO COLUMNS of a row, and
+/// `constructExtentAndTotalElements` reaches them only after `composeMatchingMap` and `projectOut`
+/// have rewritten the system into a space the original set has no dimensions in
+/// (`AccessDetails.cpp:33-40`). Neither step is expressible on [`IntegerSet`], whose constraints are
+/// expression trees.
+///
+/// ⛔ COLUMN ORDER IS MLIR'S: every DIMENSION, then every SYMBOL, then the CONSTANT term — one row
+/// per constraint, `getNumCols() == getNumDimVars() + getNumSymbolVars() + 1`. Both predicates
+/// scan `c < getNumCols() - 1`, i.e. the variables only, and then read the constant at
+/// `getNumCols() - 1`, so a layout that put the constant anywhere else would change both answers.
+///
+/// ⛔ NO LOCAL-VARIABLE COLUMNS, for the reason [`flattened`] gives: nothing here builds a `mod` or
+/// a `floordiv`, and MLIR's local columns sit between the symbols and the constant — so admitting
+/// them later is a widening of this type rather than a reinterpretation of it.
+///
+/// ⛔ AND A ROW IS `expr >= 0` OR `expr == 0`, NEVER `<= 0`. `IntegerSet` states its inequalities
+/// that way ([`Constraint`]), which is why an upper bound arrives as `-dk + n >= 0` and
+/// `isDimAConstantRange` recognises an upper bound by a coefficient of **-1**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatConstraints {
+    /// How many DIMENSION columns — `getNumDimVars()`.
+    pub dims: u32,
+    /// How many SYMBOL columns — `getNumSymbolVars()`.
+    pub syms: u32,
+    /// The `== 0` rows, in order — `getNumEqualities()` of them.
+    pub equalities: Vec<Vec<i64>>,
+    /// The `>= 0` rows, in order — `getNumInequalities()` of them.
+    pub inequalities: Vec<Vec<i64>>,
+}
+
+impl FlatConstraints {
+    /// THE SYSTEM AN INTEGER SET FLATTENS INTO — `FlatAffineValueConstraints(IntegerSet)`, the
+    /// constructor `constructExtentAndTotalElements` opens with (`AccessDetails.cpp:33-34`) and
+    /// `calculateTimeBounds` too (`dialect_utils/Agen/Utils.cpp:220`).
+    #[must_use]
+    pub fn from_integer_set(set: &IntegerSet) -> FlatConstraints {
+        let mut equalities = Vec::new();
+        let mut inequalities = Vec::new();
+        for constraint in &set.constraints {
+            let row = flattened(&constraint.expr, set.dims, set.symbols);
+            if constraint.is_equality {
+                equalities.push(row);
+            } else {
+                inequalities.push(row);
+            }
+        }
+        FlatConstraints {
+            dims: set.dims,
+            syms: set.symbols,
+            equalities,
+            inequalities,
+        }
+    }
+
+    /// `getNumCols()` — one per variable, plus the constant.
+    #[must_use]
+    pub fn num_cols(&self) -> usize {
+        self.dims as usize + self.syms as usize + 1
+    }
+
+    /// `getNumDimVars()`, which `constructExtentAndTotalElements` reads TWICE: to decide whether the
+    /// layout map has one coefficient more than the system has dimensions (`AccessDetails.cpp:47-50`)
+    /// and as the loop bound over the extents (`:56`).
+    #[must_use]
+    pub fn num_dim_vars(&self) -> u32 {
+        self.dims
+    }
+
+    /// A MAP COMPOSED ONTO THIS SYSTEM'S DIMENSIONS — `composeMatchingMap(AffineMap other)`.
+    ///
+    /// ⭐⭐ WHAT IT DOES IS RE-EXPRESS THE SET IN THE MAP'S **INPUT** SPACE. `other`'s inputs are
+    /// inserted as new dimensions at position 0 (`insertDimVar(0, other.getNumDims())`), and one
+    /// equality per result ties each ORIGINAL dimension to the expression that produces it —
+    /// `flat_expr - d_i == 0`. The original dimensions are then dead weight that
+    /// [`Self::project_out`] removes, which is exactly the pair of calls
+    /// `constructExtentAndTotalElements` makes (`AccessDetails.cpp:35-40`).
+    ///
+    /// ⛔ THE NEW DIMENSIONS COME FIRST, so after this call column `i` is the map's `i`-th input and
+    /// column `other.dims + i` is the set's own `i`-th dimension. `projectOut(order.getNumDims(),
+    /// order.getNumDims())` reads exactly that layout: it starts at the first original dimension and
+    /// removes as many as the order has results.
+    ///
+    /// ⛔ MLIR ASSERTS `other.getNumResults() == getNumDimVars()` AND THAT ASSERTION IS NOT A
+    /// FORMALITY — it is what makes the composed system square. Here a shorter result list simply
+    /// leaves the surplus original dimensions untied, and [`Self::project_out`] then eliminates them
+    /// by Fourier–Motzkin instead of by substitution; the extents that come out are a
+    /// non-hyper-rectangular system, which is the one shape
+    /// `constructExtentAndTotalElements` already has a refusal for. A longer one is impossible: a
+    /// result past the last original dimension has nothing to be tied to and is dropped.
+    ///
+    /// ⛔ THE SYMBOL SPACES ARE ASSUMED ALIGNED, which is MLIR's own precondition —
+    /// `flattenAlignedMapAndMergeLocals` requires the map's symbols to be the system's symbols. Both
+    /// are zero everywhere this is used (`buildIntegerSetFromSizes` passes `numSymbols=0`, and a
+    /// transfer order is a permutation), and the wider of the two counts is kept so a symbol column
+    /// is never silently dropped.
+    #[must_use]
+    pub fn compose_matching_map(&self, other: &AffineMap) -> FlatConstraints {
+        let inserted = other.dims as usize;
+        let old_dims = self.dims as usize;
+        let dims = self.dims + other.dims;
+        let syms = self.syms.max(other.syms);
+        let width = dims as usize + syms as usize + 1;
+        let shift = |row: &Vec<i64>| -> Vec<i64> {
+            let mut out = vec![0_i64; width];
+            out[inserted..inserted + old_dims].copy_from_slice(&row[..old_dims]);
+            for j in 0..self.syms as usize {
+                out[dims as usize + j] = row[old_dims + j];
+            }
+            out[width - 1] = row[self.num_cols() - 1];
+            out
+        };
+        let mut equalities: Vec<Vec<i64>> = self.equalities.iter().map(shift).collect();
+        let inequalities: Vec<Vec<i64>> = self.inequalities.iter().map(shift).collect();
+
+        for (i, expr) in other.results.iter().enumerate().take(old_dims) {
+            let flat = flattened(expr, other.dims, other.syms);
+            let mut row = vec![0_i64; width];
+            row[..inserted].copy_from_slice(&flat[..inserted]);
+            for j in 0..other.syms as usize {
+                row[dims as usize + j] = flat[inserted + j];
+            }
+            row[width - 1] = flat[flat.len() - 1];
+            // `eq[other.getNumDims() + i] = -1` — the system's own dimension `i`, now shifted right
+            // by the inserted inputs.
+            row[inserted + i] = -1;
+            equalities.push(row);
+        }
+
+        FlatConstraints {
+            dims,
+            syms,
+            equalities,
+            inequalities,
+        }
+    }
+
+    /// `num` VARIABLES ELIMINATED, STARTING AT COLUMN `pos` — `projectOut(pos, num)`, MLIR's
+    /// `IntegerRelation::eliminateVars`.
+    ///
+    /// ⭐⭐ TWO ELIMINATIONS, AND WHICH ONE RUNS IS DECIDED PER VARIABLE, exactly as MLIR decides
+    /// it: an EQUALITY naming the variable lets it be substituted away (Gaussian), and otherwise its
+    /// lower bounds are combined with its upper bounds pairwise (Fourier–Motzkin) and every row that
+    /// named it is dropped.
+    ///
+    /// ⛔ GAUSSIAN IS THE PATH THIS CAMPAIGN TAKES, AND IT IS EXACT.
+    /// `constructExtentAndTotalElements` projects out precisely the dimensions
+    /// [`Self::compose_matching_map`] has just tied down with one `flat_expr - d_i == 0` row each, so
+    /// every eliminated variable has a ±1 coefficient in an equality and the substitution is integer
+    /// arithmetic with no rounding. Fourier–Motzkin is here because MLIR's `projectOut` is total and
+    /// a caller may hand this system anything.
+    ///
+    /// ⚠️ FOURIER–MOTZKIN COMPUTES THE **RATIONAL** SHADOW, which is what MLIR's own
+    /// `fourierMotzkinEliminate(.., darkShadow=false)` computes: the result may admit a rational
+    /// point where the original admitted no integer one. That is an over-approximation of the
+    /// projection, not a wrong bound on a dimension that has one.
+    ///
+    /// ⛔ AN OUT-OF-RANGE RANGE ELIMINATES WHAT IT CAN AND NOTHING ELSE. MLIR asserts
+    /// `pos + num <= getNumVars()`; the loop below simply stops at the last real column, because a
+    /// column that does not exist cannot be holding a variable.
+    #[must_use]
+    pub fn project_out(&self, pos: u32, num: u32) -> FlatConstraints {
+        let mut system = self.clone();
+        let last = (pos as usize + num as usize).min(system.dims as usize + system.syms as usize);
+        // ⛔ HIGHEST COLUMN FIRST, so that removing one does not renumber the ones still to go.
+        for column in (pos as usize..last).rev() {
+            system.eliminate(column);
+        }
+        system
+    }
+
+    /// ONE VARIABLE COLUMN ELIMINATED AND REMOVED — see [`Self::project_out`].
+    fn eliminate(&mut self, column: usize) {
+        // `gaussianEliminateVar`: an equality with a ±1 coefficient substitutes exactly.
+        let pivot = self
+            .equalities
+            .iter()
+            .position(|row| row[column] == 1 || row[column] == -1);
+        if let Some(index) = pivot {
+            let pivot = self.equalities.remove(index);
+            let coeff = pivot[column];
+            for row in self
+                .equalities
+                .iter_mut()
+                .chain(self.inequalities.iter_mut())
+            {
+                // `row - (row[column] / coeff) * pivot`, and `coeff` is ±1 so the division is exact.
+                let factor = row[column] / coeff;
+                if factor != 0 {
+                    for (slot, term) in row.iter_mut().zip(pivot.iter()) {
+                        *slot -= factor * term;
+                    }
+                }
+            }
+        } else {
+            // An equality with a coefficient other than ±1 becomes the two inequalities it is worth,
+            // so Fourier–Motzkin sees the whole system.
+            let mut equalities = Vec::new();
+            for row in std::mem::take(&mut self.equalities) {
+                if row[column] == 0 {
+                    equalities.push(row);
+                } else {
+                    self.inequalities
+                        .push(row.iter().map(|term| -term).collect());
+                    self.inequalities.push(row);
+                }
+            }
+            self.equalities = equalities;
+
+            let (mut kept, mut lower, mut upper) = (Vec::new(), Vec::new(), Vec::new());
+            for row in std::mem::take(&mut self.inequalities) {
+                match row[column].cmp(&0) {
+                    std::cmp::Ordering::Equal => kept.push(row),
+                    // `a * x + rest >= 0` with `a > 0` bounds `x` from BELOW.
+                    std::cmp::Ordering::Greater => lower.push(row),
+                    std::cmp::Ordering::Less => upper.push(row),
+                }
+            }
+            for low in &lower {
+                for high in &upper {
+                    let (a, b) = (low[column], -high[column]);
+                    let mut combined: Vec<i64> = low
+                        .iter()
+                        .zip(high.iter())
+                        .map(|(x, y)| b * x + a * y)
+                        .collect();
+                    normalise(&mut combined);
+                    kept.push(combined);
+                }
+            }
+            self.inequalities = kept;
+        }
+
+        for row in self
+            .equalities
+            .iter_mut()
+            .chain(self.inequalities.iter_mut())
+        {
+            row.remove(column);
+        }
+        if column < self.dims as usize {
+            self.dims -= 1;
+        } else {
+            self.syms -= 1;
+        }
+    }
+
+    /// THE ROWS THAT SAY SOMETHING, TIGHTENED — `removeRedundantConstraints()`.
+    ///
+    /// ⭐⭐ IT IS WHAT MAKES [`Self::is_dim_value_zero`] ANSWERABLE AT ALL. That predicate reports a
+    /// dimension pinned as soon as it finds an equality row with no OTHER variable in it — a row of
+    /// all zeros qualifies, so a single `0 == 0` left behind would report EVERY dimension pinned and
+    /// give a transfer of one element per dimension. Gaussian elimination leaves such rows behind
+    /// routinely, which is why the reference's call order is `projectOut` then this and not the
+    /// reverse (`AccessDetails.cpp:39-40`).
+    ///
+    /// What it does, in MLIR's order:
+    ///
+    /// 1. `gcdTightenInequalities` — divide a row's variable coefficients by their GCD and FLOOR the
+    ///    constant, so `2*d0 - 3 >= 0` becomes `d0 - 2 >= 0`. That is an integer tightening, not a
+    ///    rescaling: it is why the predicates may insist on a coefficient of exactly ±1.
+    /// 2. Drop the trivially true rows — `removeTrivialRedundancy`'s first half.
+    /// 3. Keep the TIGHTEST of the rows that name the same variables with the same coefficients. For
+    ///    `sum + c >= 0` a SMALLER `c` is the stronger row whichever side it bounds, so the minimum
+    ///    wins; identical equalities collapse to one.
+    ///
+    /// ⚠️ ONE DELIBERATE DIVERGENCE: MLIR follows the above with a Simplex over the whole system
+    /// (`Simplex::detectRedundant`), which finds rows made redundant by COMBINATIONS of others. It
+    /// has nothing to find here — the systems this campaign builds are one bound pair per dimension
+    /// out of `buildIntegerSetFromSizes` (`DataTransferLowering.cpp:40-69`) composed with a
+    /// permutation — and a row it would have removed cannot change either predicate's answer anyway:
+    /// both scan for rows naming a single variable, and step 3 has already left at most one of those
+    /// per variable and coefficient vector.
+    ///
+    /// ⛔ A TRIVIALLY **FALSE** ROW IS KEPT. `0 >= 1` means the system admits nothing, and
+    /// `IntegerSet::constant_bound` documents why an empty system still has to be readable: IBM
+    /// writes twenty masks whose sets are empty and expects each to lower to the all-lanes-off
+    /// constant. Dropping the row would make the emptiness unobservable.
+    #[must_use]
+    pub fn remove_redundant_constraints(&self) -> FlatConstraints {
+        let vars = self.dims as usize + self.syms as usize;
+        let names_no_variable = |row: &[i64]| row[..vars].iter().all(|term| *term == 0);
+
+        let mut equalities: Vec<Vec<i64>> = Vec::new();
+        for row in &self.equalities {
+            // `0 == 0` says nothing; `0 == 5` says the system is empty and is kept.
+            if names_no_variable(row) && row[vars] == 0 {
+                continue;
+            }
+            if !equalities.contains(row) {
+                equalities.push(row.clone());
+            }
+        }
+
+        let mut inequalities: Vec<Vec<i64>> = Vec::new();
+        for row in &self.inequalities {
+            let mut row = row.clone();
+            gcd_tighten(&mut row);
+            if names_no_variable(&row) && row[vars] >= 0 {
+                continue;
+            }
+            match inequalities
+                .iter_mut()
+                .find(|kept| kept[..vars] == row[..vars])
+            {
+                Some(kept) => kept[vars] = kept[vars].min(row[vars]),
+                None => inequalities.push(row),
+            }
+        }
+
+        FlatConstraints {
+            dims: self.dims,
+            syms: self.syms,
+            equalities,
+            inequalities,
+        }
+    }
+
+    /// IS DIMENSION `dim_pos` PINNED BY AN EQUALITY THAT NAMES NOTHING ELSE? —
+    /// `agen::utils::isDimValueZero(csts, dim_pos)` (`dialect_utils/Agen/Utils.cpp:121-137`).
+    ///
+    /// ```cpp
+    /// int num = csts.getNumCols() - 1;
+    /// for (unsigned r = 0, e = csts.getNumEqualities(); r < e; r++) {
+    ///   unsigned sum = 1;
+    ///   for (unsigned c = 0; c < num; c++)
+    ///     if (c != dim_pos) { if (csts.atEq(r, c) != 0) sum++; }
+    ///   if (sum > 1) continue; else return true;
+    /// }
+    /// return false;
+    /// ```
+    ///
+    /// ⛔⛔ ITS NAME OVERSTATES WHAT IT CHECKS, AND THE PORT KEEPS THE REFERENCE'S ANSWER. The scan
+    /// stops at `getNumCols() - 1`, so the CONSTANT column is never looked at: `d2 - 5 == 0` answers
+    /// **true** as loudly as `d2 == 0`. That is correct for the caller's purpose either way — a
+    /// dimension pinned to any single value has an extent of 1, which is what
+    /// `constructExtentAndTotalElements` (`:58-60`) and `calculateTimeBounds` (`Utils.cpp:232-233`)
+    /// push — so this is a misleading NAME rather than a defect, and narrowing it to "pinned to
+    /// zero" would change the extents of every set that pins a dimension to a nonzero offset.
+    ///
+    /// ⛔ NOR DOES IT REQUIRE A COEFFICIENT ON `dim_pos` AT ALL: a row of all zeros passes. See
+    /// [`Self::remove_redundant_constraints`], which is what keeps one from reaching here.
+    #[must_use]
+    pub fn is_dim_value_zero(&self, dim_pos: u32) -> bool {
+        let vars = self.num_cols() - 1;
+        self.equalities
+            .iter()
+            .any(|row| (0..vars).all(|column| column == dim_pos as usize || row[column] == 0))
+    }
+
+    /// THE WIDTH OF DIMENSION `dim_pos`'S CONSTANT RANGE, or [`None`] when it has none —
+    /// `agen::utils::isDimAConstantRange(csts, dim_pos, width)`
+    /// (`dialect_utils/Agen/Utils.cpp:139-170`).
+    ///
+    /// ⭐ THE OUT-PARAMETER AND THE `bool` ARE ONE VALUE. The C++ writes `width = max - min + 1` and
+    /// returns true, or writes `width = -1` and returns false; both callers test the `bool` and then
+    /// read `width` (`AccessDetails.cpp:61`, `Utils.cpp:234-235`), and `constructExtentAndTotalElements`
+    /// separately refuses a non-positive width as *"Extent along a dimension is negative"* (`:81-83`).
+    /// [`Option`] carries the same pair with the `-1` unspellable.
+    ///
+    /// ⛔ INCLUSIVE, AND ONLY FROM ROWS THAT NAME THIS DIMENSION ALONE. A lower bound is a
+    /// coefficient of exactly **+1** and gives `min = -constant`; an upper bound is exactly **-1**
+    /// and gives `max = constant`; both must be found. So `d0 >= 0` with `-d0 + 63 >= 0` is a width
+    /// of 64, and a row whose coefficient is 2 is ignored rather than halved — which is what
+    /// [`Self::remove_redundant_constraints`]' GCD tightening exists to prevent from mattering.
+    ///
+    /// ⛔ THE **LAST** MATCHING ROW WINS, because the C++ overwrites `min_value`/`max_value` without
+    /// testing whether it already found one. After the tightening and de-duplication above there is
+    /// at most one row per side, so the two agree; transcribing the reference's assignment keeps them
+    /// agreeing on a system that was not simplified.
+    #[must_use]
+    pub fn is_dim_a_constant_range(&self, dim_pos: u32) -> Option<i64> {
+        let vars = self.num_cols() - 1;
+        let (mut min_value, mut max_value) = (None, None);
+        for row in &self.inequalities {
+            let names_only_this =
+                (0..vars).all(|column| column == dim_pos as usize || row[column] == 0);
+            if !names_only_this {
+                continue;
+            }
+            match row[dim_pos as usize] {
+                1 => min_value = Some(-row[vars]),
+                -1 => max_value = Some(row[vars]),
+                _ => {}
+            }
+        }
+        match (min_value, max_value) {
+            (Some(min_value), Some(max_value)) => Some(max_value - min_value + 1),
+            _ => None,
+        }
+    }
+}
+
+/// A ROW DIVIDED BY THE GCD OF EVERYTHING IN IT — the normalisation Fourier–Motzkin needs so that
+/// combined rows do not grow coefficients without bound.
+///
+/// ⭐ THE CONSTANT IS INCLUDED IN THE GCD, so the division is exact and the row keeps its exact
+/// meaning. [`gcd_tighten`] is the other, INTEGER-tightening rule.
+fn normalise(row: &mut [i64]) {
+    let divisor = row.iter().fold(0_i64, |acc, term| gcd(acc, term.abs()));
+    if divisor > 1 {
+        for term in row.iter_mut() {
+            *term /= divisor;
+        }
+    }
+}
+
+/// `a * x + c >= 0` TIGHTENED OVER THE INTEGERS — `gcdTightenInequalities()`.
+///
+/// ⛔ THE CONSTANT IS **FLOORED**, NOT DIVIDED. `2*d0 - 3 >= 0` is `d0 >= 1.5`, and over the
+/// integers that is `d0 - 2 >= 0`: dividing the constant would have given `d0 - 1 >= 0`, which
+/// admits `d0 == 1` and is a bound the original row does not have.
+fn gcd_tighten(row: &mut [i64]) {
+    let Some((constant, variables)) = row.split_last_mut() else {
+        return;
+    };
+    let divisor = variables
+        .iter()
+        .fold(0_i64, |acc, term| gcd(acc, term.abs()));
+    if divisor > 1 {
+        for term in variables.iter_mut() {
+            *term /= divisor;
+        }
+        *constant = constant.div_euclid(divisor);
+    }
+}
+
+/// The greatest common divisor of two NON-NEGATIVE numbers, with `gcd(0, n) == n`.
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::islands::dataflow_ir::ty::{AffineExpr, BoundType, Constraint, IntegerSet};
+    use crate::islands::dataflow_ir::ty::{
+        AffineExpr, AffineMap, BoundType, Constraint, FlatConstraints, IntegerSet,
+    };
 
     /// `expr >= 0`.
     fn ineq(expr: AffineExpr) -> Constraint {
@@ -982,5 +1652,290 @@ mod tests {
         };
         assert_eq!(scaled.constant_bound(BoundType::Lb, 0), None);
         assert_eq!(scaled.constant_bound(BoundType::Ub, 0), None);
+    }
+
+    // ───────────── THE FLATTENED MATRIX, AND WHAT `constructExtentAndTotalElements` READS ─────────────
+
+    /// A LAYOUT MAP'S COEFFICIENTS ARE ITS STRIDES, PLUS A TRAILING CONSTANT TERM.
+    ///
+    /// `affine_map<(d0, d1) -> (d0 * 64 + d1)>` is the layout of a `memref<8x64xf16>` view, and
+    /// `getMapCoefficients` gives `[64, 1, 0]` — three entries for two dimensions, which is the
+    /// relation `LoweringXRF.cpp:50` asserts.
+    #[test]
+    fn a_layout_maps_coefficients_are_its_strides_and_a_constant() {
+        assert_eq!(AffineMap::linear(&[64, 1]).coefficients(0), vec![64, 1, 0]);
+        assert_eq!(AffineMap::linear(&[1]).coefficients(0), vec![1, 0]);
+        // A constant term survives into the last column and nowhere else.
+        let shifted = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(0)
+                    .times(64)
+                    .plus(AffineExpr::dim(1))
+                    .plus(AffineExpr::Const(7)),
+            ],
+        };
+        assert_eq!(shifted.coefficients(0), vec![64, 1, 7]);
+    }
+
+    /// A SYMBOL GETS ITS OWN COLUMN, AFTER EVERY DIMENSION — never the constant one.
+    #[test]
+    fn a_symbol_is_a_column_of_its_own() {
+        let map = AffineMap {
+            dims: 2,
+            syms: 1,
+            results: vec![
+                AffineExpr::dim(1)
+                    .plus(AffineExpr::Sym(0).times(8))
+                    .plus(AffineExpr::Const(-1)),
+            ],
+        };
+        assert_eq!(map.coefficients(0), vec![0, 1, 8, -1]);
+    }
+
+    /// `mem_view_layout_map.compose(time_addr_map)` — the composition `calculateTimeOffsets` takes
+    /// (`dialect_utils/Agen/Utils.cpp:103`).
+    ///
+    /// The layout of a `memref<2x64>` view is `(d0, d1) -> (d0 * 64 + d1)`; a one-step time address
+    /// map is `(d0) -> (d0, 0)`. Composed, one time step moves 64 elements.
+    #[test]
+    fn composing_a_layout_over_a_time_address_map_gives_the_step_in_elements() {
+        let layout = AffineMap::linear(&[64, 1]);
+        let time_addr = AffineMap {
+            dims: 1,
+            syms: 0,
+            results: vec![AffineExpr::dim(0), AffineExpr::Const(0)],
+        };
+        let composed = layout.compose(&time_addr);
+        assert_eq!(
+            composed.dims, 1,
+            "the composition takes the inner map's inputs"
+        );
+        assert_eq!(composed.coefficients(0), vec![64, 0]);
+    }
+
+    /// ⛔ THE INNER MAP'S SYMBOLS ARE RENUMBERED ABOVE THE OUTER MAP'S, so two `s0`s cannot collide.
+    #[test]
+    fn composition_keeps_the_two_symbol_spaces_apart() {
+        let outer = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::dim(0).plus(AffineExpr::Sym(0))],
+        };
+        let inner = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::Sym(0).times(4)],
+        };
+        let composed = outer.compose(&inner);
+        assert_eq!(composed.syms, 2);
+        // `s0` is still the OUTER map's; the inner map's became `s1`.
+        assert_eq!(composed.coefficients(0), vec![0, 1, 4, 0]);
+    }
+
+    /// `constructIndices`' REWRITE: a constant subscript is folded into the map and the surviving
+    /// dimensions are renumbered densely (`AccessDetails.cpp:385-401`).
+    ///
+    /// Subscripts `%iv, %c0` over the layout above become a one-dimensional map, and the declared
+    /// arity is the caller's `ndims` — 1 — not what the expressions happen to mention.
+    #[test]
+    fn folding_a_constant_subscript_renumbers_the_rest_and_states_the_new_arity() {
+        let subscripts = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(0), AffineExpr::dim(1)],
+        };
+        let folded = subscripts.replace_dims_and_symbols(
+            &[AffineExpr::dim(0), AffineExpr::Const(3)],
+            &[],
+            1,
+            0,
+        );
+        assert_eq!(folded.dims, 1);
+        assert_eq!(folded.syms, 0);
+        assert_eq!(
+            folded.results,
+            vec![AffineExpr::dim(0), AffineExpr::Const(3)]
+        );
+    }
+
+    /// THE TRANSFER SET'S OWN GEOMETRY, READ OFF THE MATRIX — `IntegerSet::from_sizes(&[1, 64])`.
+    ///
+    /// Dimension 0 is pinned by an equality, so `isDimValueZero` answers true and it has no constant
+    /// range; dimension 1 spans `0 ..= 63`, so it has a width of 64 and is not pinned.
+    #[test]
+    fn a_rectangle_reads_back_as_one_pinned_dimension_and_one_span() {
+        let csts = FlatConstraints::from_integer_set(&IntegerSet::from_sizes(&[1, 64]));
+        assert_eq!(csts.dims, 2);
+        assert_eq!(csts.num_cols(), 3);
+        assert_eq!(csts.equalities, vec![vec![1, 0, 0]]);
+        assert_eq!(csts.inequalities, vec![vec![0, 1, 0], vec![0, -1, 63]]);
+
+        assert!(csts.is_dim_value_zero(0));
+        assert_eq!(csts.is_dim_a_constant_range(0), None);
+        assert!(!csts.is_dim_value_zero(1));
+        assert_eq!(csts.is_dim_a_constant_range(1), Some(64));
+    }
+
+    /// ⛔ A DIMENSION PINNED TO A **NONZERO** CONSTANT ALSO ANSWERS `isDimValueZero` — the scan never
+    /// looks at the constant column. Its extent is 1 either way, which is what both callers push.
+    #[test]
+    fn a_dimension_pinned_to_a_nonzero_constant_still_reads_as_pinned() {
+        let pinned = IntegerSet {
+            dims: 1,
+            symbols: 0,
+            constraints: vec![Constraint {
+                expr: AffineExpr::dim(0).plus(AffineExpr::Const(-5)),
+                is_equality: true,
+            }],
+        };
+        assert!(FlatConstraints::from_integer_set(&pinned).is_dim_value_zero(0));
+    }
+
+    /// 🎯 THE FOUR CALLS `constructExtentAndTotalElements` OPENS WITH, ON IBM'S OWN SHAPE.
+    ///
+    /// The transfer set of a `[1, 1, 64]` access is `affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0,
+    /// d2 >= 0, -d2 + 63 >= 0)>` and its order is the identity, so composing the order, projecting
+    /// out the set's own dimensions and simplifying must leave the SAME three extents — `[1, 1, 64]`.
+    #[test]
+    fn composing_the_identity_order_and_projecting_leaves_the_extents_alone() {
+        let csts = FlatConstraints::from_integer_set(&IntegerSet::from_sizes(&[1, 1, 64]))
+            .compose_matching_map(&AffineMap::identity(3))
+            .project_out(3, 3)
+            .remove_redundant_constraints();
+
+        assert_eq!(csts.num_dim_vars(), 3);
+        let extents: Vec<Option<i64>> = (0..3)
+            .map(|dim| {
+                if csts.is_dim_value_zero(dim) {
+                    Some(1)
+                } else {
+                    csts.is_dim_a_constant_range(dim)
+                }
+            })
+            .collect();
+        assert_eq!(extents, vec![Some(1), Some(1), Some(64)]);
+    }
+
+    /// 🎯 AND A **TRANSPOSING** ORDER MOVES THEM, WHICH IS THE WHOLE REASON THE ORDER IS COMPOSED.
+    ///
+    /// `store_order = affine_map<(d0, d1) -> (d1, d0)>` over a `[1, 64]` set: read in the order's own
+    /// input space the extents are `[64, 1]`, not `[1, 64]`.
+    #[test]
+    fn a_transposing_order_transposes_the_extents() {
+        let transposed = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(1), AffineExpr::dim(0)],
+        };
+        let csts = FlatConstraints::from_integer_set(&IntegerSet::from_sizes(&[1, 64]))
+            .compose_matching_map(&transposed)
+            .project_out(2, 2)
+            .remove_redundant_constraints();
+
+        assert_eq!(csts.num_dim_vars(), 2);
+        assert_eq!(csts.is_dim_a_constant_range(0), Some(64));
+        assert!(!csts.is_dim_value_zero(0));
+        assert!(csts.is_dim_value_zero(1));
+    }
+
+    /// ⛔⛔ THE ZERO ROW GAUSSIAN ELIMINATION LEAVES BEHIND WOULD PIN EVERY DIMENSION.
+    ///
+    /// `projectOut` substitutes each tied dimension away with the equality that ties it, and MLIR
+    /// drops that row as it goes. If one survived as `0 == 0`, `isDimValueZero` would answer true for
+    /// EVERY dimension — the extents would come out all ones and the transfer would move one element.
+    /// This is why the reference calls `removeRedundantConstraints()` immediately after
+    /// (`AccessDetails.cpp:39-40`).
+    #[test]
+    fn projection_leaves_no_equality_that_pins_everything() {
+        let csts = FlatConstraints::from_integer_set(&IntegerSet::from_sizes(&[1, 64]))
+            .compose_matching_map(&AffineMap::identity(2))
+            .project_out(2, 2);
+        assert!(
+            !csts
+                .equalities
+                .iter()
+                .any(|row| row.iter().all(|t| *t == 0)),
+            "an all-zero equality row makes every dimension read as pinned"
+        );
+        assert!(csts.is_dim_value_zero(0));
+        assert!(!csts.is_dim_value_zero(1));
+    }
+
+    /// FOURIER–MOTZKIN, WHEN NO EQUALITY TIES THE VARIABLE DOWN.
+    ///
+    /// `d0 >= 0`, `-d0 + 7 >= 0`, `-d0 + d1 >= 0` — eliminating `d0` pairs its one lower bound with
+    /// each upper bound: `0 + 7 >= 0` is trivially true and drops out, and `-0 + d1 >= 0` survives as
+    /// the bound `d1` inherits.
+    #[test]
+    fn eliminating_a_variable_with_no_equality_combines_its_bounds() {
+        let system = FlatConstraints {
+            dims: 2,
+            syms: 0,
+            equalities: Vec::new(),
+            inequalities: vec![vec![1, 0, 0], vec![-1, 0, 7], vec![-1, 1, 0]],
+        };
+        let projected = system.project_out(0, 1).remove_redundant_constraints();
+        assert_eq!(projected.dims, 1);
+        assert_eq!(projected.inequalities, vec![vec![1, 0]]);
+        // A lower bound alone is not a constant range.
+        assert_eq!(projected.is_dim_a_constant_range(0), None);
+    }
+
+    /// ⛔ THE GCD TIGHTENING IS AN INTEGER TIGHTENING, AND IT IS WHAT LETS THE PREDICATES INSIST ON ±1.
+    ///
+    /// `2*d0 - 3 >= 0` is `d0 >= 1.5`, so over the integers it is `d0 - 2 >= 0`. Paired with
+    /// `-d0 + 5 >= 0` the width is `5 - 2 + 1 == 4`; without the tightening the row's coefficient is
+    /// 2, `isDimAConstantRange` ignores it, and the dimension reports no range at all.
+    #[test]
+    fn a_scaled_lower_bound_is_tightened_to_a_unit_one() {
+        let system = FlatConstraints {
+            dims: 1,
+            syms: 0,
+            equalities: Vec::new(),
+            inequalities: vec![vec![2, -3], vec![-1, 5]],
+        };
+        assert_eq!(
+            system.is_dim_a_constant_range(0),
+            None,
+            "a coefficient of 2 is not a bound this predicate reads"
+        );
+        let tightened = system.remove_redundant_constraints();
+        assert_eq!(tightened.inequalities, vec![vec![1, -2], vec![-1, 5]]);
+        assert_eq!(tightened.is_dim_a_constant_range(0), Some(4));
+    }
+
+    /// THE TIGHTEST OF TWO ROWS WITH THE SAME COEFFICIENTS SURVIVES — `sum + c >= 0` is stronger for
+    /// a SMALLER `c`, whichever side it bounds.
+    #[test]
+    fn duplicate_rows_collapse_onto_the_tightest_one() {
+        let system = FlatConstraints {
+            dims: 1,
+            syms: 0,
+            equalities: vec![vec![1, 0], vec![1, 0]],
+            inequalities: vec![vec![1, 0], vec![1, -4], vec![-1, 63], vec![-1, 31]],
+        };
+        let simplified = system.remove_redundant_constraints();
+        assert_eq!(simplified.equalities, vec![vec![1, 0]]);
+        assert_eq!(simplified.inequalities, vec![vec![1, -4], vec![-1, 31]]);
+        // `d0 >= 4` and `d0 <= 31`.
+        assert_eq!(simplified.is_dim_a_constant_range(0), Some(28));
+    }
+
+    /// ⛔ AN EMPTY SYSTEM STAYS READABLE. `0 >= 1` is kept, for the reason
+    /// [`IntegerSet::constant_bound`] documents: IBM writes empty mask sets and expects them to lower.
+    #[test]
+    fn a_trivially_false_row_is_not_dropped() {
+        let system = FlatConstraints {
+            dims: 1,
+            syms: 0,
+            equalities: Vec::new(),
+            inequalities: vec![vec![0, -1], vec![1, 0]],
+        };
+        assert_eq!(
+            system.remove_redundant_constraints().inequalities,
+            vec![vec![0, -1], vec![1, 0]]
+        );
     }
 }
