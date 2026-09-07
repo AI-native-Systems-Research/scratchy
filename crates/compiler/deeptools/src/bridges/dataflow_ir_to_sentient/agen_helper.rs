@@ -117,12 +117,14 @@
 //! | `e374_lowerSymbolicVectorLoadOp` | 374/384 | 26 | `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380` |
 //! | `e375_lowerSymbolicVectorStoreOp` | 375/384 | 30 | `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410` |
 
+use super::agen_access_details::{AccessContainer, AccessDetailsSymbolic};
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::islands::dataflow_ir::dialects::{
-    self as dfir_op, Op as DfirOp, Val, arith, dataflow, defining_op, results, uses,
+    self as dfir_op, Index, Op as DfirOp, Val, arith, dataflow, defining_op, results, uses,
 };
 use crate::islands::dataflow_ir::link::SendEnd;
-use crate::islands::dataflow_ir::ty::{AffineMap, GenericComp, Vector};
+use crate::islands::dataflow_ir::ty::{AffineMap, GenericComp, MemRef, Vector};
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
 use crate::units::DfirUnit;
 use core::num::NonZeroU32;
@@ -1505,9 +1507,10 @@ pub fn add_load_chain_to_delete_list<'a>(
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
+    use crate::bridges::dataflow_ir_to_sentient::agen_access_details::MemoryOperandIndex;
     use crate::generated::SyncSignal;
     use crate::islands::dataflow_ir::dialects::{
-        Index, affine, agen, arith, dataflow, vectorchain,
+        Index, affine, agen, arith, dataflow, uniform, vectorchain,
     };
     use crate::islands::dataflow_ir::link::{
         CrossPtnLink as CrossPtnLinkUnit, L0su as L0suUnit, Link, Lxlu as LxluUnit, PtRowUnit,
@@ -2707,4 +2710,1617 @@ mod unit_tests {
         add_load_chain_to_delete_list(Val(31), &dangling, &mut listed);
         assert_eq!(listed, vec![&dangling[1]]);
     }
+
+    /// ⭐ THE TWO COMPOSITE FAMILIES: a load region sends before it yields, a store region yields what
+    /// its receive bound.
+    #[test]
+    fn a_composite_region_is_checked_per_family() {
+        let (to, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
+        let (_, from) = Link::<PtRowUnit<0>, LxluUnit>::between(PT, LXLU).ends();
+        let load_body = vec![
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result: Val(31),
+                view: VIEW,
+                indices: vec![Index::Const(0)],
+                view_ty: stick_view(),
+                ty: LANES,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: Val(31),
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::Yield),
+        ];
+        assert!(check_composite_region(CompositeFamily::Load, &load_body, &[]).admissible());
+
+        // ⛔ THE SEND MUST BE THE STATEMENT BEFORE THE YIELD — a two-statement region whose front is
+        // the load has none.
+        assert_eq!(
+            check_composite_region(CompositeFamily::Load, &load_body[..2], &[]),
+            CompositeRegionCheck::LoadSendDoesNotPrecedeYield
+        );
+
+        let store_body = vec![
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(41),
+                from,
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::Yield),
+        ];
+        assert!(
+            check_composite_region(CompositeFamily::Store, &store_body, &[Val(41)]).admissible()
+        );
+
+        // ⛔ AND A STORE REGION THAT YIELDS SOMETHING ELSE leaves the received value unread.
+        assert_eq!(
+            check_composite_region(CompositeFamily::Store, &store_body, &[]),
+            CompositeRegionCheck::StoreYieldsIncorrectValue
+        );
+    }
+
+    /// ⭐ ONE INDEX, RESOLVING TO ZERO, OVER A ONE-DIMENSIONAL VIEW — and each refusal names itself.
+    #[test]
+    fn the_extract_store_wants_one_zero_index_over_one_dimension() {
+        let one_d = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(64),
+        };
+        let scope = [DfirOp::Arith(arith::Op::Constant {
+            result: Val(3),
+            value: 0,
+        })];
+
+        assert!(
+            check_store_op_from_extract_pattern(&[Index::Val(Val(3))], &one_d, &scope).admissible()
+        );
+        assert!(
+            check_store_op_from_extract_pattern(&[Index::Const(0)], &one_d, &scope).admissible()
+        );
+
+        assert_eq!(
+            check_store_op_from_extract_pattern(
+                &[Index::Const(0), Index::Const(0)],
+                &one_d,
+                &scope
+            ),
+            StoreFromExtractCheck::ExpectingIndicesSizeOne
+        );
+        assert_eq!(
+            check_store_op_from_extract_pattern(&[Index::Const(1)], &one_d, &scope),
+            StoreFromExtractCheck::ExpectingStartOffsetZero
+        );
+        // ⛔ AND A LOOP-VARIABLE INDEX, which is where the reference dereferences null.
+        assert_eq!(
+            check_store_op_from_extract_pattern(&[Index::Val(Val(9))], &one_d, &scope),
+            StoreFromExtractCheck::ExpectingStartOffsetZero
+        );
+        assert_eq!(
+            check_store_op_from_extract_pattern(
+                &[Index::Const(0)],
+                &MemRef {
+                    shape: vec![2, 32],
+                    elem: ElemType::Int(64)
+                },
+                &scope
+            ),
+            StoreFromExtractCheck::ExpectingOneDimStoreSet
+        );
+    }
+
+    /// `vector<128xi8>`'s view — one stick of `i8`.
+    fn stick_view() -> MemRef {
+        MemRef {
+            shape: vec![128],
+            elem: ElemType::Int(8),
+        }
+    }
+
+    /// ⭐ THE GATHER INDEX'S PATH: an `agen.vector_load` off an LX view whose one consumer stores into
+    /// a virtual-IBR view (`lx_indirect_loads_stores_composite.mlir:30,36`).
+    fn extract_scalar_scope() -> Vec<DfirOp> {
+        let ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(64),
+        };
+        vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(11),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lx,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(21),
+                from: Val(11),
+                start: Val(3),
+                layout: identity_1d(),
+                ty: ty.clone(),
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(13),
+                residency: Residency::Global,
+                unit: DfirUnit::LxVirtualIbr,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(23),
+                from: Val(13),
+                start: Val(3),
+                layout: identity_1d(),
+                ty: ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result: Val(31),
+                view: Val(21),
+                indices: vec![Index::Const(0)],
+                view_ty: ty.clone(),
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                value: Val(31),
+                view: Val(23),
+                indices: vec![Index::Const(0)],
+                view_ty: ty,
+                ty: LANES,
+            }),
+        ]
+    }
+
+    /// ⛔ THE ORDER IS THE PATTERN: LX for the load, virtual IBR for the store.
+    #[test]
+    fn a_load_of_the_lx_stored_into_the_virtual_ibr_is_the_extract_pattern() {
+        let scope = extract_scalar_scope();
+        assert!(is_load_and_extract_scalar_pattern(&scope[4], &scope));
+
+        // The store is not a load, and neither is a load whose view is the IBR's.
+        assert!(!is_load_and_extract_scalar_pattern(&scope[5], &scope));
+        let mut from_the_ibr = scope.clone();
+        from_the_ibr[4] = DfirOp::Agen(agen::Op::VectorLoad {
+            result: Val(31),
+            view: Val(23),
+            indices: vec![Index::Const(0)],
+            view_ty: stick_view(),
+            ty: LANES,
+        });
+        assert!(!is_load_and_extract_scalar_pattern(
+            &from_the_ibr[4],
+            &from_the_ibr
+        ));
+    }
+
+    /// ⛔ THE STORE SIDE ASKS ONE QUESTION — is the view cut from the virtual IBR?
+    #[test]
+    fn a_store_into_the_virtual_ibr_is_the_receive_and_extract_pattern() {
+        let scope = extract_scalar_scope();
+        assert!(is_receive_and_extract_scalar_pattern(&scope[5], &scope));
+
+        let mut into_the_lx = scope.clone();
+        into_the_lx[5] = DfirOp::Agen(agen::Op::VectorStore {
+            value: Val(31),
+            view: Val(21),
+            indices: vec![Index::Const(0)],
+            view_ty: stick_view(),
+            ty: LANES,
+        });
+        assert!(!is_receive_and_extract_scalar_pattern(
+            &into_the_lx[5],
+            &into_the_lx
+        ));
+    }
+
+    /// ⭐ EVERY HANDLE A SYMBOLIC ACCESS HOLDS IS READ THROUGH THE CLONE'S MAPPING — the five values
+    /// AND the operation.
+    #[test]
+    fn a_symbolic_access_follows_the_clone() {
+        let original = agen::Op::VectorLoad {
+            result: Val(31),
+            view: Val(21),
+            indices: vec![Index::Val(Val(5))],
+            view_ty: stick_view(),
+            ty: LANES,
+        };
+        let cloned = agen::Op::VectorLoad {
+            result: Val(131),
+            view: Val(121),
+            indices: vec![Index::Val(Val(105))],
+            view_ty: stick_view(),
+            ty: LANES,
+        };
+
+        let mut details = AccessDetailsSymbolic::new(&original, DfirUnit::Lxlu);
+        details.base.set_indices(&[Val(5)]);
+        details.set_strides(&[Val(6)]);
+        details.base.mem_ref = Some(Val(7));
+        details.base.set_mem_view_start_addr(Val(8));
+        details.base.memory = Some(Val(9));
+
+        let mut container = AccessContainer::default();
+        container
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("a fresh container has every slot empty")
+            .fill(details);
+
+        let mut ir_map = ValueMapping::new();
+        for (from, to) in [
+            (Val(5), Val(105)),
+            (Val(6), Val(106)),
+            (Val(7), Val(107)),
+            (Val(8), Val(108)),
+            (Val(9), Val(109)),
+        ] {
+            ir_map.map(from, to);
+        }
+        let mut op_map = OpMapping::new();
+        op_map.map(&original, &cloned);
+
+        update_symbolic_access_details(&mut container, &ir_map, &op_map);
+
+        let updated = &container.entries()[0];
+        assert!(
+            core::ptr::eq(updated.base.op, &cloned),
+            "the operation is remapped too"
+        );
+        assert_eq!(updated.base.indices, vec![Val(105)]);
+        assert_eq!(updated.strides(), &[Val(106)]);
+        assert_eq!(updated.base.mem_ref, Some(Val(107)));
+        assert_eq!(updated.base.mem_view_start_addr, Some(Val(108)));
+        assert_eq!(updated.base.memory, Some(Val(109)));
+    }
+
+    /// ⭐ THE TWO PRODUCERS A STORE MAY HAVE: a receive off a `get_unit`, and a splat of a one-value
+    /// bitstream.
+    #[test]
+    fn a_store_producer_is_the_receive_or_the_splat_behind_it() {
+        let (_, from) = Link::<PtRowUnit<0>, LxluUnit>::between(PT, LXLU).ends();
+        let received = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: PT,
+                residency: at_corelet_zero(),
+                unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(41),
+                from,
+                ty: LANES,
+            }),
+        ];
+        assert_eq!(
+            get_store_producer(&AgenStore::Vector { value: Val(41) }, &received),
+            StoreProducer::Found {
+                inp_op: &received[1],
+                producer: &received[0],
+            }
+        );
+
+        let splat = vec![
+            DfirOp::VectorChain(vectorchain::Op::ConstantBitstream {
+                result: Val(51),
+                value: vec![0],
+                ty: LANES,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                result: Val(52),
+                input: Val(51),
+                indices: vec![0],
+                repetition: 128,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+        ];
+        assert_eq!(
+            get_store_producer(&AgenStore::Vector { value: Val(52) }, &splat),
+            StoreProducer::Found {
+                inp_op: &splat[1],
+                producer: &splat[0],
+            }
+        );
+        // ⛔ AND THE COMPOSITE'S REGION IS READ THE SAME WAY — a bitstream in front of the shuffle.
+        assert_eq!(
+            get_store_producer(
+                &AgenStore::Composite {
+                    input_vector: None,
+                    body: &splat,
+                },
+                &splat
+            ),
+            StoreProducer::Found {
+                inp_op: &splat[1],
+                producer: &splat[0],
+            }
+        );
+
+        // ⛔ ONE VALUE ONLY, and a stored value from neither op is not a producer at all.
+        let mut two_values = splat.clone();
+        two_values[0] = DfirOp::VectorChain(vectorchain::Op::ConstantBitstream {
+            result: Val(51),
+            value: vec![0, 1],
+            ty: LANES,
+        });
+        assert_eq!(
+            get_store_producer(&AgenStore::Vector { value: Val(52) }, &two_values),
+            StoreProducer::BitstreamNotOneValue
+        );
+        assert_eq!(
+            get_store_producer(&AgenStore::Vector { value: Val(51) }, &splat),
+            StoreProducer::StoreValueNotReceiveOrShuffle
+        );
+    }
+
+    /// ⭐⭐ THE VENDOR'S OWN ANSWER KEY — all five `slice_mask_map`s of
+    /// `dcc/test/Conversion/AgenToSentient/set_transfer_mask_state.mlir` with the `numvalidentry`,
+    /// `sliceid_xsl`, `xslinner` and `wsllen` its `CHECK-SENT-IR` lines require, over `vector<128xi8>`
+    /// at eight slices.
+    #[test]
+    fn the_vendors_five_mask_maps_encode_as_they_check() {
+        let of = |map: SliceMaskMap| SetTransferMaskState {
+            mask_value: Val(5),
+            num_slices: NonZeroU32::new(8).expect("eight slices"),
+            slice_mask_map: map,
+            ty: LANES,
+            dbg_name: None,
+        };
+        let generic = |slice: u32, wsl: (u64, u64), xsl: (u64, u64)| {
+            of(SliceMaskMap::Generic {
+                slice_id_xsl: sen::SliceId(slice),
+                wsl: MaskRun {
+                    unmasked: Elements(wsl.0),
+                    masked: Elements(wsl.1),
+                },
+                xsl: MaskRun {
+                    unmasked: Elements(xsl.0),
+                    masked: Elements(xsl.1),
+                },
+            })
+        };
+        // `(numvalidentry, sliceid_xsl, xslinner, wsllen, maskall, precision)`.
+        let fields = |mask: &SetTransferMaskState| match construct_set_active_mask_value_op::<Dd2>(
+            DfirUnit::Lxlu,
+            mask,
+        ) {
+            ActiveMaskValue::Samv(SenOp::Sentient(sen::Op::Samv {
+                num_valid_entry,
+                slice_id_xsl,
+                xsl_inner,
+                wsl_len,
+                mask_all,
+                precision,
+                ..
+            })) => Some((
+                num_valid_entry.0,
+                slice_id_xsl.0,
+                xsl_inner,
+                wsl_len.0,
+                mask_all,
+                precision.0,
+            )),
+            _ => None,
+        };
+
+        // `(A)(A)(A)(A)(A)(A|B)(1)(1)`, maskA (8, 8) and maskB (1, 1).
+        assert_eq!(
+            fields(&generic(5, (8, 8), (1, 1))),
+            Some((12, 5, true, 8, false, 8))
+        );
+        // `(A)(A)(A)(A)(A)(A)(A)(A|B)`, maskA (4, 12) and maskB (2, 2).
+        assert_eq!(
+            fields(&generic(7, (4, 12), (2, 2))),
+            Some((9, 7, true, 4, false, 8))
+        );
+        // `(A|B)(1)(1)(1)(1)(1)(1)(1)`, maskA (3, 1) and maskB (12, 4) — the outer mask is the XSL's,
+        // so `xslinner` is false and `wsllen` is the inner length.
+        assert_eq!(
+            fields(&generic(0, (3, 1), (12, 4))),
+            Some((15, 0, false, 4, false, 8))
+        );
+        // `(0)(0)(0)(0)(0)(0)(0)(0)` and `(1)(1)(1)(1)(1)(1)(1)(1)`.
+        assert_eq!(
+            fields(&of(SliceMaskMap::Unmask)),
+            Some((0, 7, false, 1, false, 8))
+        );
+        assert_eq!(
+            fields(&of(SliceMaskMap::FullMask)),
+            Some((0, 0, false, 1, true, 8))
+        );
+
+        // ⛔ AND SAMV IS AN LXLU OP.
+        assert_eq!(
+            construct_set_active_mask_value_op::<Dd2>(DfirUnit::Lxsu, &of(SliceMaskMap::FullMask)),
+            ActiveMaskValue::NotInLxlu
+        );
+    }
+
+    /// ⭐ THE FIRST REGION BUILDS THE OP AND HOISTS THE IN-LOOP UNIT; THE LAST REGION FINDS IT AND
+    /// CLEARS THE FLAG.
+    #[test]
+    fn the_first_region_builds_the_op_and_the_last_clears_the_flag() {
+        let in_loop = DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result: Val(92),
+            residency: at_corelet_zero(),
+            unit: DfirUnit::Lxlu,
+            num_folds: None,
+        });
+        let source = UniformizeSource {
+            kind: RegionOpKind::UniformizeRegions,
+            regions: vec![
+                vec![
+                    UnitOperand::Outside(Val(90)),
+                    UnitOperand::InsideLoop {
+                        unit: Val(92),
+                        def: &in_loop,
+                    },
+                ],
+                vec![UnitOperand::Outside(Val(91))],
+            ],
+        };
+
+        let mut values = Values::default();
+        let yield_of = |arg: Val| {
+            vec![DfirOp::Uniform(uniform::Op::Yield {
+                operands: vec![arg],
+            })]
+        };
+        // The clone is minted first, then the op's one `index` result, then each region's argument.
+        let expected = Uniformized {
+            op: DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                regions: vec![
+                    uniform::LocalRegion {
+                        arg: Val(2),
+                        units: vec![Val(90), Val(0)],
+                        body: yield_of(Val(2)),
+                    },
+                    uniform::LocalRegion {
+                        arg: Val(3),
+                        units: vec![Val(91)],
+                        body: yield_of(Val(3)),
+                    },
+                ],
+                results: vec![Val(1)],
+            }),
+            hoisted: vec![DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(0),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lxlu,
+                num_folds: None,
+            })],
+            active: true,
+        };
+        assert_eq!(
+            create_uniformize_regions_op(&mut values, &source, 0, &mut []),
+            CreatedUniformize::Created(Box::new(expected.clone()))
+        );
+
+        // The second region is also the last, so it finds the op and removes the attribute.
+        let mut preceding = vec![expected];
+        assert_eq!(
+            create_uniformize_regions_op(&mut values, &source, 1, &mut preceding),
+            CreatedUniformize::Existing(0)
+        );
+        assert!(!preceding[0].active, "the last region clears it");
+
+        // ⛔ NOTHING ACTIVE BEFORE THE LOOP is where the reference walks off the front of the block.
+        assert_eq!(
+            create_uniformize_regions_op(&mut values, &source, 1, &mut preceding),
+            CreatedUniformize::NoActiveOp
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 151/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH COMPOSITE FAMILY A REGION BELONGS TO — the two `isa<>` groups `checkCompositeRegion`
+/// dispatches on (`Helper.cpp:207`, `:241`).
+///
+/// ⛔ AN OP IN NEITHER GROUP IS NOT REPRESENTABLE, and that is the reference's own fall-through:
+/// `checkCompositeRegion` returns `success()` for anything else without looking at a region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeFamily {
+    /// `agen.composite_load`.
+    Load,
+    /// `agen.composite_indirect_load`.
+    IndirectLoad,
+    /// `agen.composite_store`.
+    Store,
+    /// `agen.composite_indirect_store`.
+    IndirectStore,
+}
+
+/// THE OUTCOME OF [`check_composite_region`] — admissible, or WHICH of the reference's diagnostics
+/// refused the region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum CompositeRegionCheck {
+    /// `LogicalResult::success()`.
+    Admissible,
+    /// The load's region holds neither 2 nor 3 operations.
+    LoadRegionSizeNotTwoOrThree,
+    /// The operation before the load's yield is not a `dataflow.send`.
+    LoadSendDoesNotPrecedeYield,
+    /// Size 2: the operation before the store's yield is not a `dataflow.receive`.
+    StoreReceiveDoesNotPrecedeYield,
+    /// Size 2: nothing reads the receive's result.
+    StoreYieldsIncorrectValue,
+    /// Size 3: the front operation is neither a `vectorchain.constant_bitstream` nor a
+    /// `dataflow.receive`.
+    StoreRegionSizeThreeWrongFront,
+    /// Size 3: the operation after the front one is not a `vectorchain.shuffle`.
+    StoreRegionSizeThreeWithoutShuffle,
+    /// Size 3: front, shuffle and terminator are not one chain.
+    StoreRegionIsNotALinearChain,
+    /// The store's region holds neither 2 nor 3 operations.
+    StoreRegionSizeNotTwoOrThree,
+}
+
+impl CompositeRegionCheck {
+    /// The C++'s own return value: `success()` only for [`Self::Admissible`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, CompositeRegionCheck::Admissible)
+    }
+
+    /// The diagnostic the C++ emits for this outcome, verbatim (`Helper.cpp:219-292`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            CompositeRegionCheck::Admissible => None,
+            CompositeRegionCheck::LoadRegionSizeNotTwoOrThree => Some(
+                "composite_load's region size must be 2 or 3 and only dataflow.send, \
+                 vectorchain.select + dataflow.send, or vectorchain.shuffle + dataflow.send are \
+                 allowed!\n",
+            ),
+            CompositeRegionCheck::LoadSendDoesNotPrecedeYield => {
+                Some("A sendOp must precede yieldOp.\n")
+            }
+            CompositeRegionCheck::StoreReceiveDoesNotPrecedeYield => {
+                Some("A ReceiveOp must precede yieldOp.\n")
+            }
+            CompositeRegionCheck::StoreYieldsIncorrectValue => {
+                Some("composite_store region yielding incorrect value!")
+            }
+            CompositeRegionCheck::StoreRegionSizeThreeWrongFront => Some(
+                "composite_store with region size 3 must contain only dataflow.receive and one \
+                 vectorchain.shuffle or vectorchain.constant_bitstream and one \
+                 vectorchain.shuffle!\n",
+            ),
+            CompositeRegionCheck::StoreRegionSizeThreeWithoutShuffle => {
+                Some("composite_store with region size 3 must contain a vectorchain.shuffle!\n")
+            }
+            CompositeRegionCheck::StoreRegionIsNotALinearChain => {
+                Some("composite_store region is not a linear chain to the terminator!\n")
+            }
+            CompositeRegionCheck::StoreRegionSizeNotTwoOrThree => Some(
+                "composite_store's region size must be 2 or 3 and only 1 dataflow.receive OR 1 \
+                 dataflow.receive/vectorchain.constant_bitstream and 1 vectorchain.shuffle is \
+                 allowed!\n",
+            ),
+        }
+    }
+}
+
+/// EVERY USE OF `bound` INSIDE ONE COMPOSITE REGION — the body's reads PLUS the terminator's.
+///
+/// ⛔ THE ISLAND'S `agen.yield` CARRIES NO OPERANDS (`dialects/agen.rs:105`), so a region's
+/// terminator reads nothing and its operand list has to be counted separately. That is what makes
+/// `hasOneUse()` answerable for a value the yield is the only reader of.
+fn uses_in_region(bound: Val, body: &[DfirOp], yielded: &[Val]) -> usize {
+    uses(bound, body).len() + yielded.iter().filter(|operand| **operand == bound).count()
+}
+
+/// Replaces: e151_checkCompositeRegion
+///
+/// `checkCompositeRegion` (`Helper.cpp:206`) — a composite transfer's region must be one of the
+/// shapes the lowering knows how to read, and `body` holds it INCLUDING its `agen.yield`.
+///
+/// ⛔ *"Wrong send_data's def op."* IS UNREACHABLE IN THE REFERENCE: the two conjuncts need
+/// `curr_op` to be both at and not at `rend` (`:236-240`), so no region is ever refused by it and it
+/// gets no outcome here.
+/// ⛔ `yielded` IS THE TERMINATOR'S OPERAND LIST — see [`uses_in_region`].
+#[must_use]
+pub fn check_composite_region(
+    family: CompositeFamily,
+    body: &[DfirOp],
+    yielded: &[Val],
+) -> CompositeRegionCheck {
+    match family {
+        CompositeFamily::Load | CompositeFamily::IndirectLoad => {
+            // `:217-224` — `region_size != 3 && region_size != 2`.
+            if body.len() != 2 && body.len() != 3 {
+                return CompositeRegionCheck::LoadRegionSizeNotTwoOrThree;
+            }
+            // `:226-231` — `rbegin()`, one `++` past the yield, then `dyn_cast<dataflow::SendOp>`.
+            let before_yield = &body[body.len() - 2];
+            if !matches!(
+                before_yield,
+                DfirOp::Dataflow(dfir_op::dataflow::Op::Send { .. })
+            ) {
+                return CompositeRegionCheck::LoadSendDoesNotPrecedeYield;
+            }
+            // `:233-240` — the send_data check, dead for the reason in this function's own note.
+            CompositeRegionCheck::Admissible
+        }
+        CompositeFamily::Store | CompositeFamily::IndirectStore => match body.len() {
+            // `:255-263`.
+            2 => {
+                let front = &body[0];
+                if !matches!(
+                    front,
+                    DfirOp::Dataflow(dfir_op::dataflow::Op::Receive { .. })
+                ) {
+                    return CompositeRegionCheck::StoreReceiveDoesNotPrecedeYield;
+                }
+                // `:259-262` — `user_begin() == user_end()`: nothing reads what the receive bound.
+                if results(front)
+                    .iter()
+                    .all(|bound| uses_in_region(*bound, body, yielded) == 0)
+                {
+                    return CompositeRegionCheck::StoreYieldsIncorrectValue;
+                }
+                CompositeRegionCheck::Admissible
+            }
+            // `:264-289`.
+            3 => {
+                let front = &body[0];
+                if !matches!(
+                    front,
+                    DfirOp::VectorChain(dfir_op::vectorchain::Op::ConstantBitstream { .. })
+                        | DfirOp::Dataflow(dfir_op::dataflow::Op::Receive { .. })
+                ) {
+                    return CompositeRegionCheck::StoreRegionSizeThreeWrongFront;
+                }
+                // `:276-281` — `dyn_cast<ShuffleOp>(curr_op.getNextNode())`.
+                let DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle {
+                    result: shuffled, ..
+                }) = &body[1]
+                else {
+                    return CompositeRegionCheck::StoreRegionSizeThreeWithoutShuffle;
+                };
+                // `:283-288` — `!curr_op.hasOneUse() || !shuffle_op->hasOneUse() ||
+                // *shuffle_op->getUsers().begin() != yield_op`.
+                let front_uses: usize = results(front)
+                    .iter()
+                    .map(|bound| uses_in_region(*bound, body, yielded))
+                    .sum();
+                if front_uses != 1
+                    || uses_in_region(*shuffled, body, yielded) != 1
+                    || !yielded.contains(shuffled)
+                {
+                    return CompositeRegionCheck::StoreRegionIsNotALinearChain;
+                }
+                CompositeRegionCheck::Admissible
+            }
+            _ => CompositeRegionCheck::StoreRegionSizeNotTwoOrThree,
+        },
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 152/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`check_store_op_from_extract_pattern`] — the reference's four diagnostics as
+/// values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum StoreFromExtractCheck {
+    /// A 1D identity store from offset 0 — `return true`.
+    Admissible,
+    /// The subscript is not one index long.
+    ExpectingIndicesSizeOne,
+    /// That index is not the constant 0.
+    ExpectingStartOffsetZero,
+    /// The `store_set` is not one-dimensional.
+    ExpectingOneDimStoreSet,
+    /// The `store_order` is not the one-dimensional identity.
+    ExpectingOneDimIdentityStoreOrder,
+}
+
+impl StoreFromExtractCheck {
+    /// The C++'s own return value: `true` only for [`Self::Admissible`].
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, StoreFromExtractCheck::Admissible)
+    }
+
+    /// The diagnostic the C++ emits for this outcome, verbatim (`Helper.cpp:437-456`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            StoreFromExtractCheck::Admissible => None,
+            StoreFromExtractCheck::ExpectingIndicesSizeOne => Some("expecting indices size 1"),
+            StoreFromExtractCheck::ExpectingStartOffsetZero => {
+                Some("expecting start offset of 0 from vector_store")
+            }
+            StoreFromExtractCheck::ExpectingOneDimStoreSet => Some("expecting 1D store_set"),
+            StoreFromExtractCheck::ExpectingOneDimIdentityStoreOrder => {
+                Some("expecting 1D identity map for store_map")
+            }
+        }
+    }
+}
+
+/// Replaces: e152_checkStoreOpFromExtractPattern
+///
+/// `checkStoreOpFromExtractPattern` (`Helper.cpp:433`) — *"StoreOp should be for a 1d space with 0
+/// start address"*, taking the `agen.vector_store`'s own subscript and view type.
+///
+/// ⛔ THE REFERENCE NULL-DEREFERENCES A NON-CONSTANT INDEX: `dyn_cast<arith::ConstantOp>` is
+/// unguarded and `.getValue()` follows (`:440-443`), so an index that is a loop variable crashes it.
+/// Here that answers [`StoreFromExtractCheck::ExpectingStartOffsetZero`], which is what the guarded
+/// read would have said.
+#[must_use]
+pub fn check_store_op_from_extract_pattern(
+    indices: &[Index],
+    view_ty: &MemRef,
+    scope: &[DfirOp],
+) -> StoreFromExtractCheck {
+    // `:435-439` — `getMapOperands().size() != 1`.
+    let [start] = indices else {
+        return StoreFromExtractCheck::ExpectingIndicesSizeOne;
+    };
+    // `:440-447` — the operand's defining `arith.constant`, and its integer must be 0. A map
+    // operand is typed `index`, so `arith.constant` here is the island's index form.
+    let start_addr = match start {
+        Index::Const(value) => Some(*value),
+        Index::Val(val) => match defining_op(*val, scope) {
+            Some(DfirOp::Arith(dfir_op::arith::Op::Constant { value, .. })) => Some(*value),
+            _ => None,
+        },
+        Index::Strided(..) => None,
+    };
+    if start_addr != Some(0) {
+        return StoreFromExtractCheck::ExpectingStartOffsetZero;
+    }
+    // `:449-452` — `getStoreSet().getValue().getNumDims() != 1`. The island synthesises the set over
+    // the view's dimensions (`dialects/agen.rs:258-270`), so its dim count IS the view's rank.
+    if view_ty.shape.len() != 1 {
+        return StoreFromExtractCheck::ExpectingOneDimStoreSet;
+    }
+    // `:454-458` — `getStoreOrder()`'s `getNumDims() != 1 || !isIdentity()`. ⭐ THE ISLAND'S
+    // `store_order` IS `identity_map(rank)` (`:241-244`), so it is always an identity and only the
+    // rank can refuse — the same question the set answered, kept as its own check because the
+    // reference reports it with its own message.
+    if view_ty.shape.len() != 1 {
+        return StoreFromExtractCheck::ExpectingOneDimIdentityStoreOrder;
+    }
+    // `:460`
+    StoreFromExtractCheck::Admissible
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 153/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE UNIT A VIEW IS CUT FROM — `getMemRef()` → `dataflow.get_logical_memory_view` →
+/// `getFromUnit()` → `dataflow.get_unit`, the walk entries 153 and 154 both open with.
+///
+/// ⛔ `None` IS EVERY ONE OF THE REFERENCE'S THREE NULL `dyn_cast`s: a view that is the PAGED op, a
+/// from-unit that is not a `get_unit`, and an operand no op in scope defines.
+fn viewed_unit(view: Val, scope: &[DfirOp]) -> Option<DfirUnit> {
+    let DfirOp::Dataflow(dfir_op::dataflow::Op::GetLogicalMemoryView { from, .. }) =
+        defining_op(view, scope)?
+    else {
+        return None;
+    };
+    let DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit { unit, .. }) = defining_op(*from, scope)?
+    else {
+        return None;
+    };
+    Some(*unit)
+}
+
+/// Replaces: e153_isLoadAndExtractScalarPattern
+///
+/// `isLoadAndExtractScalarPattern` (`Helper.cpp:463`) — an `agen.vector_load` OF THE LX whose one
+/// consumer stores INTO THE VIRTUAL IBR: the gather's index arriving where an address can read it.
+///
+/// ⛔ THE TWO COMPONENTS ARE DIFFERENT UNITS AND THE ORDER IS THE PATTERN — LX for the load, and
+/// [`DfirUnit::LxVirtualIbr`] for the store. A load out of the IBR is not this pattern.
+/// ⭐ THE REFERENCE TAKES A `VectorLoadOp&`; anything else answers `false` here rather than being
+/// unrepresentable, because the callers walk a body and ask of each statement.
+#[must_use]
+pub fn is_load_and_extract_scalar_pattern(load: &DfirOp, scope: &[DfirOp]) -> bool {
+    let DfirOp::Agen(dfir_op::agen::Op::VectorLoad { result, view, .. }) = load else {
+        return false;
+    };
+    // `:465-473` — the load's view must be cut from the LX itself.
+    if viewed_unit(*view, scope) != Some(DfirUnit::Lx) {
+        return false;
+    }
+    // `:475-477` — `!load_op->hasOneUse()`, then the user must be an `agen.vector_store`.
+    let users = uses(*result, scope);
+    let [
+        DfirOp::Agen(dfir_op::agen::Op::VectorStore {
+            view: store_view, ..
+        }),
+    ] = users.as_slice()
+    else {
+        return false;
+    };
+    // `:478-488` — and that store's view must be cut from the virtual IBR.
+    viewed_unit(*store_view, scope) == Some(DfirUnit::LxVirtualIbr)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 154/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e154_isReceiveAndExtractScalarPattern
+///
+/// `isReceiveAndExtractScalarPattern` (`Helper.cpp:493`) — an `agen.vector_store` INTO THE VIRTUAL
+/// IBR, which is a received index landing where an address can read it.
+///
+/// ⛔ `dcc::getUnitType()` IS NOT USABLE HERE and the reference says why (`:505-507`): a memory
+/// view's `type=` spells L0/LX/PE components that the generic-component enum does not carry. The
+/// comparison is against the view's own unit, which is what [`viewed_unit`] answers.
+/// ⭐ `DT_CHECK(store_op)` has no representation: a null op cannot be passed.
+#[must_use]
+pub fn is_receive_and_extract_scalar_pattern(store: &DfirOp, scope: &[DfirOp]) -> bool {
+    let DfirOp::Agen(dfir_op::agen::Op::VectorStore { view, .. }) = store else {
+        return false;
+    };
+    // `:496-509`
+    viewed_unit(*view, scope) == Some(DfirUnit::LxVirtualIbr)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 155/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE **OPERATION** STANDING FOR ANOTHER — the half of MLIR's `IRMapping` that
+/// [`ValueMapping`] does not carry.
+///
+/// ⛔⛔ `Operation::clone(IRMapping&)` RECORDS `mapper.map(this, newOp)`, which is what makes
+/// `ir_map.lookupOrDefault(ad.getOp())` answer with the clone: `copyLoopBody` clones every statement
+/// of the body through one map and hands it back (`Utils.cpp:357-381`). Without an op half, entry 155
+/// could remap an access's values but not the access's own operation.
+///
+/// ⭐ KEYED BY ADDRESS, as the C++ keys on `Operation*` — two structurally equal ops are two ops.
+#[derive(Debug, Default, Clone)]
+pub struct OpMapping<'a> {
+    pairs: Vec<(&'a dfir_op::agen::Op, &'a dfir_op::agen::Op)>,
+}
+
+impl<'a> OpMapping<'a> {
+    /// An empty mapping: every operation stands for itself.
+    #[must_use]
+    pub fn new() -> OpMapping<'a> {
+        OpMapping { pairs: Vec::new() }
+    }
+
+    /// `from` now stands for `to`.
+    pub fn map(&mut self, from: &'a dfir_op::agen::Op, to: &'a dfir_op::agen::Op) {
+        self.pairs.push((from, to));
+    }
+
+    /// What `op` stands for — ITSELF where nothing was mapped, which is `lookupOrDefault`. The search
+    /// is from the back, so the newest entry wins, as in [`ValueMapping::lookup_or_default`].
+    #[must_use]
+    pub fn lookup_or_default(&self, op: &'a dfir_op::agen::Op) -> &'a dfir_op::agen::Op {
+        self.pairs
+            .iter()
+            .rev()
+            .find(|(from, _)| core::ptr::eq(*from, op))
+            .map_or(op, |(_, to)| *to)
+    }
+}
+
+/// Replaces: e155_updateSymbolicAccessDetails
+///
+/// `updateSymbolicAccessDetails` (`Helper.cpp:1013`) — a symbolic access built against a loop body
+/// that has since been CLONED names the original's values; this reads all six of its handles through
+/// the clone's mapping, in the reference's order.
+///
+/// ⛔ THE OP REMAP IS BEHAVIOUR, NOT BOOKKEEPING, and the reference says why: *"This will always be
+/// in the innermost loop so it will always be cloned"* (`:1016-1017`). See [`OpMapping`].
+/// ⛔ A NULL `Value` MAPS TO ITSELF — `lookupOrDefault` on the three optional handles leaves [`None`].
+pub fn update_symbolic_access_details<'a>(
+    access_details: &mut AccessContainer<AccessDetailsSymbolic<'a>>,
+    ir_map: &ValueMapping,
+    op_map: &OpMapping<'a>,
+) {
+    // `:1015` — `for (auto& ad : access_details)`, over the container's own insertion order.
+    for ad in access_details.entries_mut() {
+        // `:1017-1019` — the operation.
+        ad.base.op = op_map.lookup_or_default(ad.base.op);
+
+        // `:1021-1027` — every index, then `setIndices`.
+        let indices: Vec<Val> = ad
+            .base
+            .indices
+            .iter()
+            .map(|index| ir_map.lookup_or_default(*index))
+            .collect();
+        ad.base.set_indices(&indices);
+
+        // `:1029-1035` — every stride, then `setStrides`.
+        let strides: Vec<Val> = ad
+            .strides()
+            .iter()
+            .map(|stride| ir_map.lookup_or_default(*stride))
+            .collect();
+        ad.set_strides(&strides);
+
+        // `:1037-1039` — the mem_ref.
+        ad.base.mem_ref = ad
+            .base
+            .mem_ref
+            .map(|mem_ref| ir_map.lookup_or_default(mem_ref));
+
+        // `:1041-1043` — the mem_view_start_addr.
+        if let Some(start) = ad.base.mem_view_start_addr {
+            ad.base
+                .set_mem_view_start_addr(ir_map.lookup_or_default(start));
+        }
+
+        // `:1045-1046` — the memory operand.
+        ad.base.memory = ad
+            .base
+            .memory
+            .map(|memory| ir_map.lookup_or_default(memory));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 156/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A STORE AS `getStoreProducer` CLASSES IT — five stores, each naming where the search starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgenStore<'a> {
+    /// `agen.vector_store` — the search starts at the stored value.
+    Vector {
+        /// The stored vector.
+        value: Val,
+    },
+    /// `agen.indirect_vector_store`.
+    IndirectVector {
+        /// The stored vector.
+        value: Val,
+    },
+    /// `agen.symbolic_vector_store`.
+    SymbolicVector {
+        /// The stored vector.
+        value: Val,
+    },
+    /// `agen.composite_load_and_store` — the input vector when it has one, else the region's front.
+    Composite {
+        /// The `input_vector` operand.
+        input_vector: Option<Val>,
+        /// The store region's statements, terminator last.
+        body: &'a [DfirOp],
+    },
+    /// `agen.composite_indirect_load_and_store`, read through its region only.
+    CompositeIndirect {
+        /// The store region's statements, terminator last.
+        body: &'a [DfirOp],
+    },
+}
+
+/// WHAT FEEDS A STORE: the op holding the value, and the op behind THAT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreProducer<'a> {
+    /// The pair the reference returns.
+    Found {
+        /// The receive or shuffle holding the stored value.
+        inp_op: &'a DfirOp,
+        /// What feeds `inp_op`.
+        producer: &'a DfirOp,
+    },
+    /// The stored value came from neither a receive nor a shuffle.
+    StoreValueNotReceiveOrShuffle,
+    /// A `vectorchain.coalesce` input that no receive precedes.
+    CoalesceNotPrecededByReceive,
+    /// A composite's `input_vector` came from none of the three accepted ops.
+    CompositeInputUnsupported,
+    /// No first stage matched at all.
+    UnsupportedStoreProducer1,
+    /// A receive fed by none of the four accepted producers.
+    ReceiveProducerUnsupported,
+    /// A shuffle over a receive whose own producer is not a `get_unit`.
+    ShuffleReceiveProducerNotAGetUnit,
+    /// A constant bitstream carrying more or fewer than one value.
+    BitstreamNotOneValue,
+    /// A constant bitstream of an unsupported width.
+    BitstreamWidthNotSupported,
+    /// A shuffle over a bitstream that is not a first-element splat.
+    UnsupportedSplatMode,
+    /// A splat whose result shape is none of the three the hardware has.
+    UnsupportedSplatResult,
+    /// A shuffle fed by neither a receive nor a bitstream.
+    ShuffleInputNotReceiveOrBitstream,
+    /// The value's op was neither a receive nor a shuffle after the first stage.
+    UnsupportedStoreProducer2,
+}
+
+impl<'a> StoreProducer<'a> {
+    /// The reference's message for a rejection, verbatim.
+    #[must_use]
+    pub fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            StoreProducer::Found { .. } => None,
+            StoreProducer::StoreValueNotReceiveOrShuffle => {
+                Some("expecting a ReceiveOp or a ShuffleOp as input to VectorStoreOp")
+            }
+            StoreProducer::CoalesceNotPrecededByReceive => {
+                Some("must be preceded by dataflow.receiveOp.")
+            }
+            StoreProducer::CompositeInputUnsupported => Some(
+                "must be preceded by vectorchain.coalesce, vectorchain.shuffle, or dataflow.receive.",
+            ),
+            StoreProducer::UnsupportedStoreProducer1 => Some("unsupported storeOp producer! (1)"),
+            StoreProducer::ReceiveProducerUnsupported => Some(
+                "expected a get_unit, create_multicast_group, or ifOp producer for receive inputs",
+            ),
+            StoreProducer::ShuffleReceiveProducerNotAGetUnit => {
+                Some("producers for ReceiveOps feeding ShuffleOps should be a GetUnitOp")
+            }
+            StoreProducer::BitstreamNotOneValue => {
+                Some("ConstantBitstreamOp producers should contain 1 value")
+            }
+            StoreProducer::BitstreamWidthNotSupported => {
+                Some("ConstantBitstreamOp producers should be 8 or 16 bits")
+            }
+            StoreProducer::UnsupportedSplatMode => {
+                Some("unsupported splat mode for ShuffleOp input")
+            }
+            StoreProducer::UnsupportedSplatResult => {
+                Some("unsupported splat result for ShuffleOp input")
+            }
+            StoreProducer::ShuffleInputNotReceiveOrBitstream => {
+                Some("ShuffleOp inp_op producers can only be a ReceiveOp or a ConstantBitstreamOp")
+            }
+            StoreProducer::UnsupportedStoreProducer2 => Some("unsupported storeOp producer! (2)"),
+        }
+    }
+}
+
+/// EVERY EXPANDED SHUFFLE INDEX IS 0 — `isFirstElemSplat` (`VectorChain/Utils.cpp:80-88`).
+///
+/// ⭐ The reference expands each index `repetition` times before testing; a repeated 0 is still 0, so
+/// the repetition count cannot change the answer and is not read here.
+fn is_first_elem_splat(indices: &[i32]) -> bool {
+    indices.iter().all(|index| *index == 0)
+}
+
+/// `findYieldsResolvingTo<dataflow::GetUnitOp, scf::IfOp>` (`dcc/src/Utils/Utils.cpp:183-208`) — does
+/// either arm of this conditional yield something that resolves to a `dataflow.get_unit`?
+///
+/// ⛔ A BLOCK ARGUMENT IS SKIPPED, NOT REJECTED (`:191`): here it is an operand with no defining op.
+fn yields_resolving_to_get_unit(if_op: &DfirOp, result_index: usize, scope: &[DfirOp]) -> bool {
+    let DfirOp::Scf(dfir_op::scf::Op::If {
+        body, else_body, ..
+    }) = if_op
+    else {
+        return false;
+    };
+    [body, else_body].into_iter().any(|region| {
+        // `getRegion(i).front().getTerminator()->getOperand(result_index)`.
+        let Some(DfirOp::Scf(dfir_op::scf::Op::Yield { operands })) = region.last() else {
+            return false;
+        };
+        let Some(yielded) = operands.get(result_index) else {
+            return false;
+        };
+        match defining_op(*yielded, scope) {
+            Some(DfirOp::Dataflow(dataflow::Op::GetUnit { .. })) => true,
+            // `:196-201` — a query over a mapping every one of whose values is a `get_unit`.
+            Some(DfirOp::Uniform(dfir_op::uniform::Op::QueryMap { map, .. })) => matches!(
+                defining_op(*map, scope),
+                Some(DfirOp::Uniform(dfir_op::uniform::Op::DefImmutableMapping { pairs, .. }))
+                    if pairs.iter().all(|(_, value)| matches!(
+                        defining_op(*value, scope),
+                        Some(DfirOp::Dataflow(dataflow::Op::GetUnit { .. }))
+                    ))
+            ),
+            // `:202-205` — a nested conditional, asked about the result the yield actually names.
+            Some(nested @ DfirOp::Scf(dfir_op::scf::Op::If { results, .. })) => results
+                .iter()
+                .position(|result| *result == *yielded)
+                .is_some_and(|at| yields_resolving_to_get_unit(nested, at, scope)),
+            _ => false,
+        }
+    })
+}
+
+/// The four producers the `DT_CHECK` at `Helper.cpp:1375-1387` accepts behind a `dataflow.receive`.
+///
+/// ⛔ `dataflow.create_multicast_group` HAS NO ISLAND OP, so two of the four arms — the direct one and
+/// `findYieldsResolvingTo<CreateMulticastGroupOp, IfOp>` — have nothing here to match. The gap is
+/// recorded rather than stood in for.
+fn receive_producer_is_supported(producer: &DfirOp, scope: &[DfirOp]) -> bool {
+    match producer {
+        DfirOp::Dataflow(dataflow::Op::GetUnit { .. })
+        | DfirOp::Uniform(dfir_op::uniform::Op::QueryMap { .. }) => true,
+        DfirOp::Scf(dfir_op::scf::Op::If { .. }) => {
+            yields_resolving_to_get_unit(producer, 0, scope)
+        }
+        _ => false,
+    }
+}
+
+/// Replaces: e156_getStoreProducer
+///
+/// `getStoreProducer` (`Helper.cpp:1283`) — the op holding a store's value, and the op behind THAT,
+/// which is what tells the destination lowering where the data came from.
+///
+/// ⛔ TWO STAGES, AND THE SECOND RE-EXAMINES THE FIRST'S ANSWER: stage one finds `inp_op` per store
+/// class, stage two accepts it only as a receive (four producer classes) or a shuffle (a receive over
+/// a `get_unit`, or a splat of a one-value bitstream at 4/8/16 bits).
+/// ⛔ THE SPLAT'S RESULT SHAPE IS CHECKED AGAINST THE STICK, not against the bitstream: 256×4b,
+/// 128×8b or 64×16b and nothing else (`:1424-1430`).
+#[must_use]
+pub fn get_store_producer<'a>(store: &AgenStore<'a>, scope: &'a [DfirOp]) -> StoreProducer<'a> {
+    // Stage one — `:1287-1366`. Each class reaches its own `inp_op`.
+    let inp_op: &'a DfirOp = match store {
+        // `:1287-1300` — the three plain stores are read identically.
+        AgenStore::Vector { value }
+        | AgenStore::IndirectVector { value }
+        | AgenStore::SymbolicVector { value } => {
+            let Some(def) = defining_op(*value, scope) else {
+                return StoreProducer::UnsupportedStoreProducer1;
+            };
+            match def {
+                DfirOp::Dataflow(dataflow::Op::Receive { .. })
+                | DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle { .. }) => def,
+                _ => return StoreProducer::StoreValueNotReceiveOrShuffle,
+            }
+        }
+        // `:1302-1327` — a composite with an input vector. The reference's middle arm is a
+        // `vectorchain.coalesce`, which this island does not have; see
+        // [`StoreProducer::CoalesceNotPrecededByReceive`].
+        AgenStore::Composite {
+            input_vector: Some(input),
+            ..
+        } => {
+            let Some(def) = defining_op(*input, scope) else {
+                return StoreProducer::CompositeInputUnsupported;
+            };
+            match def {
+                DfirOp::Dataflow(dataflow::Op::Receive { .. })
+                | DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle { .. }) => def,
+                _ => return StoreProducer::CompositeInputUnsupported,
+            }
+        }
+        // `:1329-1366` — no input vector: the store region's first two statements decide. A receive
+        // that yields straight away IS the input op; anything else must be the shuffle behind it.
+        AgenStore::Composite { body, .. } | AgenStore::CompositeIndirect { body } => {
+            let Some(front) = body.first() else {
+                return StoreProducer::UnsupportedStoreProducer1;
+            };
+            let next = body.get(1);
+            match front {
+                DfirOp::Dataflow(dataflow::Op::Receive { .. }) => match next {
+                    Some(DfirOp::Agen(dfir_op::agen::Op::Yield)) => front,
+                    Some(
+                        shuffle @ DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle { .. }),
+                    ) => shuffle,
+                    _ => return StoreProducer::UnsupportedStoreProducer1,
+                },
+                DfirOp::VectorChain(dfir_op::vectorchain::Op::ConstantBitstream { .. }) => {
+                    match next {
+                        Some(
+                            shuffle @ DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle {
+                                ..
+                            }),
+                        ) => shuffle,
+                        _ => return StoreProducer::UnsupportedStoreProducer1,
+                    }
+                }
+                _ => return StoreProducer::UnsupportedStoreProducer1,
+            }
+        }
+    };
+
+    // Stage two — `:1368-1440`.
+    let producer: &'a DfirOp = match inp_op {
+        // `:1371-1388` — the receive's own producer.
+        DfirOp::Dataflow(dataflow::Op::Receive { from, .. }) => {
+            let Some(producer) = defining_op(from.val(), scope) else {
+                return StoreProducer::ReceiveProducerUnsupported;
+            };
+            if !receive_producer_is_supported(producer, scope) {
+                return StoreProducer::ReceiveProducerUnsupported;
+            }
+            producer
+        }
+        // `:1390-1436` — the shuffle's input, which is a receive or a splat source.
+        DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle {
+            input, indices, ty, ..
+        }) => match defining_op(*input, scope) {
+            Some(DfirOp::Dataflow(dataflow::Op::Receive { from, .. })) => {
+                let Some(producer) = defining_op(from.val(), scope) else {
+                    return StoreProducer::ShuffleReceiveProducerNotAGetUnit;
+                };
+                if !matches!(producer, DfirOp::Dataflow(dataflow::Op::GetUnit { .. })) {
+                    return StoreProducer::ShuffleReceiveProducerNotAGetUnit;
+                }
+                producer
+            }
+            Some(
+                bitstream @ DfirOp::VectorChain(dfir_op::vectorchain::Op::ConstantBitstream {
+                    value,
+                    ty: bitstream_ty,
+                    ..
+                }),
+            ) => {
+                if value.len() != 1 {
+                    return StoreProducer::BitstreamNotOneValue;
+                }
+                let bitstream_bits = bitstream_ty.elem.bits();
+                if bitstream_bits != 4 && bitstream_bits != 8 && bitstream_bits != 16 {
+                    return StoreProducer::BitstreamWidthNotSupported;
+                }
+                if !is_first_elem_splat(indices) {
+                    return StoreProducer::UnsupportedSplatMode;
+                }
+                let splat_bits = ty.elem.bits();
+                let stick_wide = (ty.len == 256 && splat_bits == 4)
+                    || (ty.len == 128 && splat_bits == 8)
+                    || (ty.len == 64 && splat_bits == 16);
+                if !stick_wide {
+                    return StoreProducer::UnsupportedSplatResult;
+                }
+                bitstream
+            }
+            _ => return StoreProducer::ShuffleInputNotReceiveOrBitstream,
+        },
+        _ => return StoreProducer::UnsupportedStoreProducer2,
+    };
+
+    StoreProducer::Found { inp_op, producer }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 157/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE OF `set_transfer_mask_state`'s MASK ATTRIBUTE PAIRS — `num_unmasked_elements[i]` beside
+/// `num_masked_elements[i]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskRun {
+    /// How many elements the mask leaves live.
+    pub unmasked: Elements,
+    /// How many it masks off.
+    pub masked: Elements,
+}
+
+impl MaskRun {
+    /// The run's whole length. The verifier has already made the two attributes the same length.
+    #[must_use]
+    pub const fn elems(self) -> Elements {
+        Elements(self.unmasked.0 + self.masked.0)
+    }
+}
+
+/// A `slice_mask_map` AS THE THREE SAMV PATTERNS, so that `isUnmask`, `isFullMask`, `isGenericSAMV`
+/// and `getSliceIDXsl` are all answered by the variant instead of re-parsed from the string.
+///
+/// ⛔ THE TWO DEGENERATE PATTERNS CARRY NO MASK, which is the reference's two `DT_CHECK_MSG`s —
+/// *"SAMVs resetting the mask should not have mask attributes"* and *"SAMVs fully masking should not
+/// contain a mask"* — held by the type instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SliceMaskMap {
+    /// `(0)(0)(0)(0)(0)(0)(0)(0)` — the mask is being reset.
+    Unmask,
+    /// `(1)(1)(1)(1)(1)(1)(1)(1)` — everything is masked.
+    FullMask,
+    /// 0-7 `(A)`, then one `(A|B)`, then 0-7 `(1)`: two masks, and the index of the `(A|B)` slice.
+    Generic {
+        /// `getSliceIDXsl` — which slice carries the crossover.
+        slice_id_xsl: sen::SliceId,
+        /// maskA, the within-slice mask.
+        wsl: MaskRun,
+        /// maskB, the cross-slice mask.
+        xsl: MaskRun,
+    },
+}
+
+/// `agen.set_transfer_mask_state`'s operands and attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetTransferMaskState {
+    /// `$mask_value`.
+    pub mask_value: Val,
+    /// `$num_slices`.
+    pub num_slices: NonZeroU32,
+    /// `$slice_mask_map`.
+    pub slice_mask_map: SliceMaskMap,
+    /// The result vector's type — its element count and precision are both read.
+    pub ty: Vector,
+    /// `$dbgName`.
+    pub dbg_name: Option<String>,
+}
+
+/// The `sentient.samv` a `set_transfer_mask_state` becomes, or why it cannot become one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveMaskValue {
+    /// The emitted op.
+    Samv(SenOp),
+    /// The unit is not an LXLU.
+    NotInLxlu,
+    /// SAMV is defined for eight slices only.
+    NotEightSlices,
+    /// The mask does not span a stick.
+    NotStickLength,
+    /// Eight slices share fewer than eight elements, so no slice holds one.
+    SliceHoldsNoElements,
+    /// The inner mask does not tile the slice.
+    InnerDimNotDivisible,
+    /// The outer mask covers less or more than a slice.
+    OuterDimDoesNotSpanSlice,
+}
+
+impl ActiveMaskValue {
+    /// The reference's message for a rejection, verbatim.
+    ///
+    /// ⛔ [`SliceHoldsNoElements`](ActiveMaskValue::SliceHoldsNoElements) HAS NO MESSAGE because the
+    /// reference has no check: it divides by the count instead (`Helper.cpp:2669`).
+    #[must_use]
+    pub fn diagnostic(&self) -> Option<&'static str> {
+        match self {
+            ActiveMaskValue::Samv(_) | ActiveMaskValue::SliceHoldsNoElements => None,
+            ActiveMaskValue::NotInLxlu => Some("only supported in LXLU unit"),
+            ActiveMaskValue::NotEightSlices => Some("SAMV requires 8 slices"),
+            ActiveMaskValue::NotStickLength => Some("SAMV requires masks of stick length"),
+            ActiveMaskValue::InnerDimNotDivisible => {
+                Some("inner dim mask should be evenly divisible into the slice")
+            }
+            ActiveMaskValue::OuterDimDoesNotSpanSlice => {
+                Some("outer dim masked and unmasked should span a whole slice")
+            }
+        }
+    }
+}
+
+/// Replaces: e157_constructSetActiveMaskValueOp
+///
+/// `constructSetActiveMaskValueOp` (`Helper.cpp:2566`) — an `agen.set_transfer_mask_state` becomes
+/// one `sentient.samv`, whose `numvalidentry` PACKS TWO COUNTS: the outer dimension's valid entries
+/// shifted by the bits the inner dimension needs, plus the inner's, swapped when the cross-slice mask
+/// is the inner one.
+///
+/// ⛔ A FULL COUNT ENCODES AS ZERO, twice (`:2681`, `:2708`): `inner == inner_dim_len` and
+/// `outer == outer_dim_len` are both written back as 0, so the field never has to hold the width.
+/// ⛔ `maskall` IS TRUE FOR THE FULL-MASK PATTERN ONLY; the generic path always writes false.
+/// ⛔ THE REFERENCE COMPUTES `mask_wsl_elems` AND NEVER READS IT (`:2648`) — only maskB's total
+/// decides `xslinner`.
+#[must_use]
+pub fn construct_set_active_mask_value_op<A: Arch>(
+    unit: DfirUnit,
+    mask_op: &SetTransferMaskState,
+) -> ActiveMaskValue {
+    // `:2569-2573` — LXLU only.
+    if unit != DfirUnit::Lxlu {
+        return ActiveMaskValue::NotInLxlu;
+    }
+
+    // `:2575-2577`.
+    let num_slices = u64::from(mask_op.num_slices.get());
+    if num_slices != 8 {
+        return ActiveMaskValue::NotEightSlices;
+    }
+
+    // `:2579-2584` and `:2586-2591` — the slice's share, and the mask's own width.
+    let elems_per_slice = Elements(mask_op.ty.len / num_slices);
+    let precision = u64::from(mask_op.ty.elem.bits());
+    if mask_op.ty.len * precision != A::BYTES_PER_STICK.get() * 8 {
+        return ActiveMaskValue::NotStickLength;
+    }
+    let raw_precision = sen::RawPrecision(u32::try_from(precision).unwrap_or(u32::MAX));
+
+    let (mask_all, num_valid_entry, slice_id_xsl, xsl_inner, wsl_len) = match &mask_op
+        .slice_mask_map
+    {
+        // `:2596-2610`.
+        SliceMaskMap::Unmask => (false, 0, sen::SliceId(7), false, 1),
+        // `:2611-2623`.
+        SliceMaskMap::FullMask => (true, 0, sen::SliceId(0), false, 1),
+        SliceMaskMap::Generic {
+            slice_id_xsl,
+            wsl,
+            xsl,
+        } => {
+            if elems_per_slice.0 == 0 {
+                return ActiveMaskValue::SliceHoldsNoElements;
+            }
+
+            // `:2650` — maskB spanning the slice means the cross-slice mask is the OUTER one.
+            let xsl_inner = xsl.elems() != elems_per_slice;
+            // `:2652-2673` — which mask is which, then the inner dimension's length.
+            let (inner, outer) = if xsl_inner { (xsl, wsl) } else { (wsl, xsl) };
+            let inner_dim_len = inner.elems().0;
+            // A zero-length inner mask divides nothing, which is this same rejection rather than the
+            // reference's division by zero.
+            if elems_per_slice.0.checked_rem(inner_dim_len) != Some(0) {
+                return ActiveMaskValue::InnerDimNotDivisible;
+            }
+
+            // `:2675-2682`.
+            let mut inner_dim_valid = inner.unmasked.0;
+            if inner_dim_valid == inner_dim_len {
+                inner_dim_valid = 0;
+            }
+
+            // `:2684-2686`.
+            let outer_dim_len = elems_per_slice.0 / inner_dim_len;
+
+            // `:2688-2710`.
+            if outer.elems() != elems_per_slice {
+                return ActiveMaskValue::OuterDimDoesNotSpanSlice;
+            }
+            let mut outer_dim_valid = outer.unmasked.0 / inner_dim_len;
+            if outer_dim_valid == outer_dim_len {
+                outer_dim_valid = 0;
+            }
+
+            // `:2712-2732` — the packing.
+            let num_valid_entry = if xsl_inner {
+                (inner_dim_valid << outer_dim_len.checked_ilog2().unwrap_or(0)) + outer_dim_valid
+            } else {
+                (outer_dim_valid << inner_dim_len.checked_ilog2().unwrap_or(0)) + inner_dim_valid
+            };
+            let wsl_len = if xsl_inner {
+                outer_dim_len
+            } else {
+                inner_dim_len
+            };
+            (false, num_valid_entry, *slice_id_xsl, xsl_inner, wsl_len)
+        }
+    };
+
+    // `:2734-2740`.
+    ActiveMaskValue::Samv(SenOp::Sentient(sen::Op::Samv {
+        mask_value: mask_op.mask_value,
+        mask_all,
+        num_valid_entry: sen::ValidEntries(u32::try_from(num_valid_entry).unwrap_or(u32::MAX)),
+        slice_id_xsl,
+        xsl_inner,
+        wsl_len: sen::WslLen(u32::try_from(wsl_len).unwrap_or(u32::MAX)),
+        precision: raw_precision,
+        dbg_name: mask_op.dbg_name.clone(),
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 158/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH REGION-BEARING OP the units and list sizes are read from — the reference's two accepted
+/// classes, so that its `DT_ERROR("num_of_regions was not set")` third case cannot be spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionOpKind {
+    /// `uniform.uniformize_regions`.
+    UniformizeRegions,
+    /// `uniform.equalize_pattern`.
+    EqualizePattern,
+}
+
+/// ONE UNIT OPERAND, PLACED RELATIVE TO THE LOOP the new op is being lifted out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitOperand<'a> {
+    /// Defined outside the loop already — usable as it stands.
+    Outside(Val),
+    /// Defined inside the loop by a `dataflow.create_group` or `dataflow.get_unit`, which is cloned.
+    InsideLoop {
+        /// The operand as it stands.
+        unit: Val,
+        /// The op to clone.
+        def: &'a DfirOp,
+    },
+    /// ⛔ DEFINED INSIDE THE LOOP BY SOMETHING ELSE, and the reference leaves it there (`:3906`) — the
+    /// new op then reads a value its own position dominates nothing of.
+    InsideLoopOther(Val),
+}
+
+/// The `$units`/`$list_sizes` pair of the op being rebuilt, zipped per region as [`LocalRegion`] takes
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniformizeSource<'a> {
+    /// Which op they came from.
+    pub kind: RegionOpKind,
+    /// One unit list per region; `regions.len()` is `getNumRegions()`.
+    pub regions: Vec<Vec<UnitOperand<'a>>>,
+}
+
+/// A NEWLY BUILT `uniform.uniformize_regions`, with the clones that must precede it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uniformized {
+    /// The op.
+    pub op: DfirOp,
+    /// The unit definitions hoisted out of the loop, in the order they were cloned.
+    pub hoisted: Vec<DfirOp>,
+    /// The `"active"` attribute — bookkeeping between one call and the next, never emitted.
+    pub active: bool,
+}
+
+/// Which op a region got: a new one, or the one an earlier region of the same op already made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreatedUniformize {
+    /// The first region built this.
+    Created(Box<Uniformized>),
+    /// A later region reuses the op at this position among the preceding ops.
+    Existing(usize),
+    /// ⛔ NOTHING ACTIVE PRECEDES THE LOOP. The reference's `while (!prev_node->hasAttr("active"))`
+    /// walks off the front of the block and dereferences null (`:3932-3934`).
+    NoActiveOp,
+}
+
+/// Replaces: e158_createUniformizeRegionsOp
+///
+/// `createUniformizeRegionsOp` (`Helper.cpp:3880`) — the FIRST region of a region-bearing op builds one
+/// `uniform.uniformize_regions` outside the loop, whose every region is an empty block yielding its own
+/// argument; every later region of that same op finds and reuses it.
+///
+/// ⛔ THE HANDOFF IS AN ATTRIBUTE ON THE IR: `"active"` is set only when there is more than one region,
+/// searched for backwards from the loop, and removed by the LAST region (`:3924-3940`).
+/// ⛔ ONLY `create_group` AND `get_unit` ARE HOISTED; any other in-loop definition is left where it is.
+#[must_use]
+pub fn create_uniformize_regions_op(
+    values: &mut Values,
+    source: &UniformizeSource<'_>,
+    region_idx: usize,
+    preceding: &mut [Uniformized],
+) -> CreatedUniformize {
+    let num_of_regions = source.regions.len();
+
+    // `:3924-3940` — the later regions do not build anything.
+    if region_idx != 0 {
+        let Some(at) = preceding.iter().rposition(|earlier| earlier.active) else {
+            return CreatedUniformize::NoActiveOp;
+        };
+        if region_idx == num_of_regions.saturating_sub(1) {
+            preceding[at].active = false;
+        }
+        return CreatedUniformize::Existing(at);
+    }
+
+    // `:3902-3911` — make sure the units are outside the loop.
+    let mut hoisted: Vec<DfirOp> = Vec::new();
+    let mut mapping = ValueMapping::new();
+    let mut units_per_region: Vec<Vec<Val>> = Vec::with_capacity(num_of_regions);
+    for region in &source.regions {
+        let mut units: Vec<Val> = Vec::with_capacity(region.len());
+        for operand in region {
+            units.push(match operand {
+                UnitOperand::Outside(unit) | UnitOperand::InsideLoopOther(unit) => *unit,
+                UnitOperand::InsideLoop { unit, def } => {
+                    let clone = values.clone_without_regions(def, &mut mapping);
+                    let cloned_unit = results(&clone).first().copied().unwrap_or(*unit);
+                    hoisted.push(clone);
+                    cloned_unit
+                }
+            });
+        }
+        units_per_region.push(units);
+    }
+
+    // `:3913-3915` — one `index` result, then `:3916-3922` one block per region, each binding an
+    // `index` argument and yielding it straight back.
+    let result = values.mint();
+    let regions: Vec<dfir_op::uniform::LocalRegion> = units_per_region
+        .into_iter()
+        .map(|units| {
+            let arg = values.mint();
+            dfir_op::uniform::LocalRegion {
+                arg,
+                units,
+                body: vec![DfirOp::Uniform(dfir_op::uniform::Op::Yield {
+                    operands: vec![arg],
+                })],
+            }
+        })
+        .collect();
+
+    CreatedUniformize::Created(Box::new(Uniformized {
+        op: DfirOp::Uniform(dfir_op::uniform::Op::UniformizeRegions {
+            regions,
+            results: vec![result],
+        }),
+        hoisted,
+        // `:3923-3925`.
+        active: num_of_regions > 1,
+    }))
 }

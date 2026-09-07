@@ -652,6 +652,18 @@ pub struct AccessDetailsBase<'a> {
     /// default-constructed and only `initializeMemViewInfo` gives it one.
     pub memory: Option<Val>,
 
+    /// `mem_ref_` — the view operand the access addresses through (`hpp:166`). Getter `getMemRef`
+    /// (`hpp:59`), setter `setMemRef` (`hpp:80`), both **public** and both excluded from the port as
+    /// field accessors.
+    ///
+    /// ⭐ `None` IS THE C++ NULL `Value`, as for [`Self::mem_view_start_addr`]: the member
+    /// default-constructs and only an `initialize()` gives it one.
+    ///
+    /// ⛔ IT IS THE VIEW, NOT THE MEMORY. [`Self::memory`] holds the view's own unit operand; this
+    /// holds the `get_logical_memory_view` result the access subscripts — which is why
+    /// `e155_updateSymbolicAccessDetails` remaps BOTH (`Helper.cpp:1037-1046`).
+    pub mem_ref: Option<Val>,
+
     /// `mem_view_start_addr_` — *"Associated memory view start address"* (`:168`). Setter e004,
     /// **public**: `generateAffineAddressManipulationStmts` rewrites it to a mutable address base
     /// (`Helper.cpp:901`), and `updateSymbolicAccessDetails` remaps it onto a clone (`:1043`).
@@ -775,6 +787,8 @@ impl<'a> AccessDetailsBase<'a> {
             layout_coeffs: Vec::new(),
             // `Value memory_;` (`hpp:163`) — a null `Value` until a view resolves.
             memory: None,
+            // `Value mem_ref_;` (`hpp:166`) — null for the same reason.
+            mem_ref: None,
             // `Value mem_view_start_addr_;` (`hpp:169`) — a null `Value` until a view resolves.
             mem_view_start_addr: None,
             // `AffineMap mem_view_layout_map_;` (`hpp:172`) — null for the same reason.
@@ -2171,16 +2185,35 @@ impl<'a> AccessDetailsAffineComposite<'a> {
 /// `symbol.create_symbol`, a toggling JCR base — so the strides can only be carried as the values
 /// themselves and the arithmetic has to be emitted.
 ///
-/// Only the field [`e025_setStrides`](Self::set_strides) owns is present; the rest of this class
-/// arrives with `e155_updateSymbolicAccessDetails`, `e265_constructDetails` and the base class's own
-/// fields, which are other entries.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AccessDetailsSymbolic {
+/// Only the field [`e025_setStrides`](Self::set_strides) owns and the base class it derives from are
+/// present; the rest arrives with `e265_constructDetails`, which is another entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessDetailsSymbolic<'a> {
+    /// The `AccessDetailsBase` this derives from (`AccessDetails.hpp:340`).
+    ///
+    /// ⛔ `e155_updateSymbolicAccessDetails` REWRITES FIVE OF ITS FIELDS — the op, the indices, the
+    /// mem_ref, the view start address and the memory (`Helper.cpp:1017-1046`) — so the base is not
+    /// optional decoration on this class; without it that entry has nothing to remap.
+    pub base: AccessDetailsBase<'a>,
     /// `strides_` — *"strides used in the indices accesses"* (`AccessDetails.hpp:366`).
     strides: Vec<Val>,
 }
 
-impl AccessDetailsSymbolic {
+impl<'a> AccessDetailsSymbolic<'a> {
+    /// `explicit AccessDetailsSymbolic(mlir::Operation* op, SenComponents comp)
+    /// : AccessDetailsBase(op, comp) {}` (`AccessDetails.hpp:342-343`).
+    ///
+    /// ⭐ NOT A SCHEDULED UNIT — the winnow excluded it with the other delegating constructors; it is
+    /// written here for the reason [`AccessDetailsBase::new`] is, because a caller needs a way to
+    /// build one and `Default` cannot name the operation the object describes.
+    #[must_use]
+    pub fn new(op: &'a agen::Op, comp: DfirUnit) -> Self {
+        AccessDetailsSymbolic {
+            base: AccessDetailsBase::new(op, comp),
+            // `SmallVector<Value> strides_;` (`hpp:366`).
+            strides: Vec::new(),
+        }
+    }
     /// The strides, in the order the access lists its indices — `getStrides`
     /// (`AccessDetails.hpp:352`).
     #[must_use]
@@ -2245,6 +2278,17 @@ impl<T> AccessContainer<T> {
     #[must_use]
     pub fn entries(&self) -> &[T] {
         &self.entries
+    }
+
+    /// The entries in insertion order, MUTABLY — `for (auto& ad : access_details)` over the C++'s
+    /// `std::vector<T>` base class (`Helper.cpp:1015`).
+    ///
+    /// ⛔ THE SLOT MAP IS UNTOUCHED BY DESIGN. A caller may rewrite what an entry SAYS —
+    /// `e155_updateSymbolicAccessDetails` remaps every value in it onto a clone — but not which
+    /// operand owns it, so `slots` stays private and the invariant it carries cannot be broken from
+    /// outside.
+    pub fn entries_mut(&mut self) -> &mut [T] {
+        &mut self.entries
     }
 
     /// Replaces: e026_has
@@ -3203,7 +3247,8 @@ mod unit_tests {
     /// repeatedly as it re-derives the strides for a new loop nest.
     #[test]
     fn set_strides_replaces_the_previous_list() {
-        let mut details = AccessDetailsSymbolic::default();
+        let op = vector_load();
+        let mut details = AccessDetailsSymbolic::new(&op, DfirUnit::Lxlu);
         assert_eq!(details.strides(), &[]);
 
         details.set_strides(&[Val(3), Val(4), Val(5)]);
@@ -3220,7 +3265,8 @@ mod unit_tests {
     /// An empty set of strides is a set of strides — `assign` from an empty range empties the list.
     #[test]
     fn set_strides_accepts_none() {
-        let mut details = AccessDetailsSymbolic::default();
+        let op = vector_load();
+        let mut details = AccessDetailsSymbolic::new(&op, DfirUnit::Lxlu);
         details.set_strides(&[Val(1)]);
         details.set_strides(&[]);
         assert_eq!(details.strides(), &[]);

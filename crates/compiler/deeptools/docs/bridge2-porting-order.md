@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`167/384 ported; 167/384 audited`
+`175/384 ported; 175/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -840,6 +840,43 @@ STRICTER than the reference's own walk — it requires the value to BE the induc
 carried `iter_arg` answers "not an IV" — and it appends, because the time dimensions follow at
 entry 131.
 
+⭐ AND ENTRIES 151-158 — the AgenToSentient helpers for the composite regions, the extract-scalar
+pattern and the SAMV: `checkCompositeRegion`, `checkStoreOpFromExtractPattern`,
+`isLoadAndExtractScalarPattern`, `isReceiveAndExtractScalarPattern`, `updateSymbolicAccessDetails`,
+`getStoreProducer`, `constructSetActiveMaskValueOp` and `createUniformizeRegionsOp`, all in
+`agen_helper.rs`.
+
+⛔⛔ 157'S `numvalidentry` IS TWO COUNTS IN ONE FIELD AND A FULL COUNT ENCODES AS ZERO. The inner
+dimension's valid count is shifted by the bits the outer needs (or the reverse when the cross-slice
+mask is the inner one), and both counts are rewritten to 0 when they equal their own width
+(`Helper.cpp:2681`, `:2708`) — so the field never has to hold the width, and reading it as a plain
+count would place the mask a whole dimension out. ⭐ THE VENDOR'S FIVE CASES ARE THE TEST:
+`set_transfer_mask_state.mlir` gives `numvalidentry`/`sliceid_xsl`/`xslinner`/`wsllen` for three
+generic maps and the two degenerate ones, and all five are asserted. The three-pattern
+`slice_mask_map` enum is what types away `isUnmask`, `isFullMask`, `isGenericSAMV`, `getSliceIDXsl`
+and the reference's four mask-attribute `DT_CHECK_MSG`s; the reference also computes `mask_wsl_elems`
+and never reads it (`:2648`).
+
+⛔ 155 NEEDS AN OPERATION MAPPING, NOT JUST A VALUE ONE. `ir_map.lookupOrDefault(ad.getOp())` answers
+with the clone because `Operation::clone(IRMapping&)` records `map(this, newOp)` — so `OpMapping`
+joins `ValueMapping` in `agen_helper.rs`, keyed by address as the C++ keys on `Operation*`. This is
+also what promoted `AccessDetailsSymbolic` to carry its `AccessDetailsBase`: five of the six handles
+entry 155 rewrites live on the base, and `mem_ref_` had no field at all.
+
+⛔ 151 TAKES THE TERMINATOR'S OPERANDS BESIDE THE REGION. The island's `agen.yield` is a unit
+variant, and 151's store arms ask what the region YIELDS (`hasOneUse` against the yield, at
+`Helper.cpp:283-288`) — so `yielded: &[Val]` is passed alongside the body rather than reshaping the op
+at twenty match sites. Its load arm's send_data check is unreachable in the reference itself and gets
+no outcome, on the precedent entry 031's `ViewStart` set.
+
+⛔ TWO ISLAND GAPS ARE RECORDED RATHER THAN STOOD IN FOR, both in 156: there is no
+`vectorchain.coalesce`, so the coalesce-store arm and its *"must be preceded by
+dataflow.receiveOp."* have nothing to match, and no `dataflow.create_multicast_group`, so two of the
+four producer classes its `DT_CHECK` accepts cannot arrive. Each outcome exists and carries the
+reference's message; neither is given a substitute op. 158'S `"active"` ATTRIBUTE IS NOT IR — it is
+set, searched for backwards from the loop and removed by the last region, all within the pass, so it
+is a field on the returned record instead of an attribute on the emitted op.
+
 
 ## Level 0
 
@@ -1146,22 +1183,22 @@ entry 131.
 - [ ] **AUDIT 149/384** `insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:388`, line by line against the C++
 - [ ] **PORT 150/384** `get` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:401`, 4 lines
 - [ ] **AUDIT 150/384** `get` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:401`, line by line against the C++
-- [ ] **PORT 151/384** `checkCompositeRegion` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:206`, 89 lines
-- [ ] **AUDIT 151/384** `checkCompositeRegion` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:206`, line by line against the C++
-- [ ] **PORT 152/384** `checkStoreOpFromExtractPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:433`, 27 lines
-- [ ] **AUDIT 152/384** `checkStoreOpFromExtractPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:433`, line by line against the C++
-- [ ] **PORT 153/384** `isLoadAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:463`, 27 lines
-- [ ] **AUDIT 153/384** `isLoadAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:463`, line by line against the C++
-- [ ] **PORT 154/384** `isReceiveAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:493`, 17 lines
-- [ ] **AUDIT 154/384** `isReceiveAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:493`, line by line against the C++
-- [ ] **PORT 155/384** `updateSymbolicAccessDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1013`, 35 lines
-- [ ] **AUDIT 155/384** `updateSymbolicAccessDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1013`, line by line against the C++
-- [ ] **PORT 156/384** `getStoreProducer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1285`, 159 lines
-- [ ] **AUDIT 156/384** `getStoreProducer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1285`, line by line against the C++
-- [ ] **PORT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, 161 lines
-- [ ] **AUDIT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, line by line against the C++
-- [ ] **PORT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, 57 lines
-- [ ] **AUDIT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, line by line against the C++
+- [x] **PORT 151/384** `checkCompositeRegion` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:206`, 89 lines
+- [x] **AUDIT 151/384** `checkCompositeRegion` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:206`, line by line against the C++
+- [x] **PORT 152/384** `checkStoreOpFromExtractPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:433`, 27 lines
+- [x] **AUDIT 152/384** `checkStoreOpFromExtractPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:433`, line by line against the C++
+- [x] **PORT 153/384** `isLoadAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:463`, 27 lines
+- [x] **AUDIT 153/384** `isLoadAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:463`, line by line against the C++
+- [x] **PORT 154/384** `isReceiveAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:493`, 17 lines
+- [x] **AUDIT 154/384** `isReceiveAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:493`, line by line against the C++
+- [x] **PORT 155/384** `updateSymbolicAccessDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1013`, 35 lines
+- [x] **AUDIT 155/384** `updateSymbolicAccessDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1013`, line by line against the C++
+- [x] **PORT 156/384** `getStoreProducer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1285`, 159 lines
+- [x] **AUDIT 156/384** `getStoreProducer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1285`, line by line against the C++
+- [x] **PORT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, 161 lines
+- [x] **AUDIT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, line by line against the C++
+- [x] **PORT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, 57 lines
+- [x] **AUDIT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, line by line against the C++
 - [x] **PORT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, 10 lines
 - [x] **AUDIT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, line by line against the C++
 - [x] **PORT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, 6 lines
