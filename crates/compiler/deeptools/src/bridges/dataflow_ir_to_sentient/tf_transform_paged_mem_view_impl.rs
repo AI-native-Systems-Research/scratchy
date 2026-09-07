@@ -1640,6 +1640,259 @@ impl<'p> TpmvVector<'p> {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 137/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A PAGED VIEW READ BY ONE `agen.vector_load` — `TPMVVectorLoad`
+/// (`dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:394-410`).
+///
+/// # ⛔ THE SIX LEAVES DIFFER ONLY IN THEIR OVERRIDES, AND THAT IS WHY THEY ARE SIX TYPES
+///
+/// Every one of the six leaf constructors is a bare delegation with an empty body, so a single Rust
+/// struct would compile — and would make entry 139 ([`super::tf_transform_paged_mem_view_manager`]),
+/// whose *entire* content is choosing WHICH leaf to build, a function that returns the same thing six
+/// times. `TPMVVectorLoad::createNewMemOp` builds an `agen.vector_load` and
+/// `TPMVVectorStore::createNewMemOp` an `agen.vector_store` (`hpp:400-409`, `:418-427`), and
+/// `TPMVVectorLoad::getUseChain` answers a chain where [`TpmvBase::use_chain`] answers none: the type
+/// IS the dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvVectorLoad<'p> {
+    /// The `TPMVVector` subobject.
+    pub vector: TpmvVector<'p>,
+}
+
+impl<'p> TpmvVectorLoad<'p> {
+    /// Replaces: e137_TPMVVector
+    ///
+    /// **137/384** `TPMVVectorLoad::TPMVVectorLoad` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397` (0L).
+    ///
+    /// ```cpp
+    /// TPMVVectorLoad(Operation *mem_op, SenComponents comp)
+    ///     : TPMVVector(mem_op, comp) {}
+    /// ```
+    ///
+    /// # ⛔ THE UNIT IS THE **`TPMVVectorLoad`** CONSTRUCTOR, DESPITE ITS NAME
+    ///
+    /// `hpp:397` is the mem-initializer line `: TPMVVector(mem_op, comp) {}`, and the extractor names
+    /// an entry after the token it found at the cited line — so `e137_TPMVVector` is the DERIVED
+    /// constructor delegating to the base, exactly as `e136_TPMVBase` (`hpp:389`) is
+    /// [`TpmvVector::new`], whose anchor records the same habit. Entry 138 (`e138_TPMVComposite`,
+    /// `hpp:519`) is this pattern once more on the other branch.
+    ///
+    /// ⭐ ITS WHOLE BODY IS THE DELEGATION: both arguments forwarded, every other member left at its
+    /// declared default. The base chain is a CALL and not a literal — `TPMVVector(mem_op, comp)` is
+    /// entry 136, and `mem_ops_ = {mem_op}` happens inside [`TpmvBase::new`] two levels down.
+    ///
+    /// ⭐ ONLY THREE OF THE NINE TPMV CONSTRUCTORS GOT ENTRIES, because the extractor deduplicates by
+    /// text: `: TPMVVector(mem_op, comp) {}` appears three times (`hpp:397`, `:415`, `:433`) and
+    /// `: TPMVComposite(mem_op, comp) {}` three more (`:519`, `:534`, `:549`). The five siblings
+    /// below are the deduplicated ones — identical delegations, no anchor of their own — and entry
+    /// 139 builds all six.
+    #[must_use]
+    pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvVectorLoad<'p> {
+        TpmvVectorLoad {
+            vector: TpmvVector::new(mem_op, comp),
+        }
+    }
+}
+
+/// A PAGED VIEW WRITTEN BY ONE `agen.vector_store` — `TPMVVectorStore` (`hpp:412-427`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvVectorStore<'p> {
+    /// The `TPMVVector` subobject.
+    pub vector: TpmvVector<'p>,
+}
+
+impl<'p> TpmvVectorStore<'p> {
+    /// `TPMVVectorStore(Operation *mem_op, SenComponents comp) : TPMVVector(mem_op, comp) {}`
+    /// (`TransformPagedMemViewImpl.hpp:414-415`).
+    ///
+    /// ⭐ NO ANCHOR: the extractor deduplicated this against entry 137, whose mem-initializer is the
+    /// same text one class up. See [`TpmvVectorLoad::new`].
+    #[must_use]
+    pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvVectorStore<'p> {
+        TpmvVectorStore {
+            vector: TpmvVector::new(mem_op, comp),
+        }
+    }
+}
+
+/// A PAGED VIEW A LOAD READS AND A STORE WRITES BACK — `TPMVVectorLoadStore` (`hpp:429-445`).
+///
+/// The two halves of one move: `%data = agen.vector_load %src_mem_view[..]` followed by
+/// `agen.vector_store %data, %dst_mem_view[..]`
+/// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_load_and_store.mlir:1287-1289`). Either
+/// view can be the paged one, which is why entry 139 reaches this leaf from both of its first two
+/// arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvVectorLoadStore<'p> {
+    /// The `TPMVVector` subobject.
+    pub vector: TpmvVector<'p>,
+}
+
+impl<'p> TpmvVectorLoadStore<'p> {
+    /// `TPMVVectorLoadStore(Operation *mem_op, agen::VectorStoreOp &store_op, SenComponents comp)
+    /// : TPMVVector(mem_op, comp) {}` (`TransformPagedMemViewImpl.hpp:431-433`).
+    ///
+    /// ⭐ NO ANCHOR: deduplicated against entry 137 like [`TpmvVectorStore::new`].
+    ///
+    /// # ⛔⛔ THE `store_op` ARGUMENT IS ACCEPTED AND DROPPED
+    ///
+    /// The mem-initializer forwards `mem_op` and `comp` and nothing else, and the body is empty — so
+    /// the store its caller went to the trouble of finding is not kept anywhere.
+    /// `TPMVVectorLoadStore::initialize` re-derives it: [`store_op_from_load_store_pattern`] (entry
+    /// 130, `Impl.cpp:843-848`) walks the load result's single user and casts it, then
+    /// `mem_ops_.push_back` appends it (`Impl.cpp:512-520`). Keeping the parameter and naming what
+    /// happens to it is the faithful port; quietly dropping it from the signature would hide that
+    /// entry 130 exists to undo this.
+    ///
+    /// ⛔ WHICH OP IS `mem_op` DEPENDS ON WHICH ARM CALLED — always the LOAD in the reference
+    /// (`TransformPagedMemViewManager.cpp:32`, `:46`), even in the arm whose user search found the
+    /// store. See [`super::tf_transform_paged_mem_view_manager::run`].
+    #[must_use]
+    pub fn new(
+        mem_op: &'p DfirOp,
+        _store_op: &'p DfirOp,
+        comp: DfirUnit,
+    ) -> TpmvVectorLoadStore<'p> {
+        TpmvVectorLoadStore {
+            vector: TpmvVector::new(mem_op, comp),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 138/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A PAGED VIEW REACHED BY A **COMPOSITE** TRANSFER — `TPMVComposite` (`hpp:447-514`).
+///
+/// The `agen.composite_*` family: a transfer that walks AGEN time dimensions, so the page a given
+/// time step lands in is itself a function of time. That is what its extra members are for — and its
+/// `run()` (`Impl.cpp:855`) is the one entry the winnow lost: the extractor deduplicated `run`
+/// against entry 373 (`TPMVVector::run`, `Impl.cpp:647`), so it appears in neither the 384 nor the
+/// exclusions.
+///
+/// ⛔ ITS FOUR EXTRA MEMBERS ARE NOT DECLARED YET, for the reason [`TpmvBase`] gives: `time_set_`,
+/// `access_details_`, `page_dependent_time_syms_` and `tpmv_comp_info_` (`hpp:508-513`) are all
+/// *"Set during initialization"* and arrive with entries 326 (`initialize`), 310 (`analyzeValidPages`)
+/// and 260 (`gatherPageDependentDimsForPage`). The constructor writes none of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvComposite<'p> {
+    /// The `TPMVBase` subobject.
+    pub base: TpmvBase<'p>,
+}
+
+impl<'p> TpmvComposite<'p> {
+    /// `TPMVComposite(Operation *mem_op, SenComponents comp) : TPMVBase(mem_op, comp) {}`
+    /// (`TransformPagedMemViewImpl.hpp:449-450`).
+    ///
+    /// ⭐ NO ANCHOR: `: TPMVBase(mem_op, comp) {}` is also entry 136's cited text (`hpp:389`), so the
+    /// extractor deduplicated this constructor against it. Written here because entry 138 delegates
+    /// to it, the same standing [`TpmvBase::new`] itself has.
+    #[must_use]
+    pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvComposite<'p> {
+        TpmvComposite {
+            base: TpmvBase::new(mem_op, comp),
+        }
+    }
+}
+
+/// A PAGED VIEW READ BY AN `agen.composite_load` — `TPMVCompositeLoad` (`hpp:516-529`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvCompositeLoad<'p> {
+    /// The `TPMVComposite` subobject.
+    pub composite: TpmvComposite<'p>,
+}
+
+impl<'p> TpmvCompositeLoad<'p> {
+    /// Replaces: e138_TPMVComposite
+    ///
+    /// **138/384** `TPMVCompositeLoad::TPMVCompositeLoad` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519` (0L).
+    ///
+    /// ```cpp
+    /// TPMVCompositeLoad(Operation *mem_op, SenComponents comp)
+    ///     : TPMVComposite(mem_op, comp) {}
+    /// ```
+    ///
+    /// ⛔ THE UNIT IS THE **`TPMVCompositeLoad`** CONSTRUCTOR, DESPITE ITS NAME — `hpp:519` is the
+    /// mem-initializer line. The same reading as entry 137, one branch over; see
+    /// [`TpmvVectorLoad::new`].
+    ///
+    /// # ⛔ ITS INPUT HAS NO ISLAND OP YET, AND THAT IS RECORDED RATHER THAN INVENTED
+    ///
+    /// `agen.composite_load` — the op whose paged view selects this leaf
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:331`) — is one of the
+    /// eleven `agen` operations [`crate::islands::dataflow_ir::dialects::agen`] does not declare;
+    /// only `composite_load_and_store` is present. So this constructor is reachable from a vendor test
+    /// and from nothing this crate emits, the same position
+    /// [`super::agen_helper::AgenLoad`] documents for three of its five load classes. The campaign's
+    /// *add the op to the island* rule (`AGENT-BRIEF.md:57`) was applied to entry 139's actual input,
+    /// `dataflow.get_paged_logical_memory_view`, which without it could not be spelled at all; a
+    /// branch of a `dyn_cast` chain that no emitter can reach is a different case, and minting two
+    /// composite ops nothing produces would be the stand-in the crate rules forbid.
+    ///
+    /// ⭐ THE BODY IS THE DELEGATION, as in entry 137: both arguments forwarded, the four members
+    /// [`TpmvComposite`] documents left unset.
+    #[must_use]
+    pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvCompositeLoad<'p> {
+        TpmvCompositeLoad {
+            composite: TpmvComposite::new(mem_op, comp),
+        }
+    }
+}
+
+/// A PAGED VIEW WRITTEN BY AN `agen.composite_store` — `TPMVCompositeStore` (`hpp:531-544`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvCompositeStore<'p> {
+    /// The `TPMVComposite` subobject.
+    pub composite: TpmvComposite<'p>,
+}
+
+impl<'p> TpmvCompositeStore<'p> {
+    /// `TPMVCompositeStore(Operation *mem_op, SenComponents comp) : TPMVComposite(mem_op, comp) {}`
+    /// (`TransformPagedMemViewImpl.hpp:533-534`).
+    ///
+    /// ⭐ NO ANCHOR: deduplicated against entry 138. Its input, `agen.composite_store`
+    /// (`paged_mem_view_stores.mlir:361`), is absent from the island for the reason
+    /// [`TpmvCompositeLoad::new`] records.
+    #[must_use]
+    pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvCompositeStore<'p> {
+        TpmvCompositeStore {
+            composite: TpmvComposite::new(mem_op, comp),
+        }
+    }
+}
+
+/// A PAGED VIEW ONE `agen.composite_load_and_store` BOTH READS AND WRITES — `TPMVCompositeLoadStore`
+/// (`hpp:546-562`).
+///
+/// ⭐ THE ONE COMPOSITE LEAF WHOSE INPUT THE ISLAND HAS: `agen.composite_load_and_store`
+/// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_load_and_store.mlir:1094`) is
+/// [`crate::islands::dataflow_ir::dialects::agen::Op::CompositeLoadAndStore`], and it is how a weight
+/// leaves the HBM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvCompositeLoadStore<'p> {
+    /// The `TPMVComposite` subobject.
+    pub composite: TpmvComposite<'p>,
+}
+
+impl<'p> TpmvCompositeLoadStore<'p> {
+    /// `TPMVCompositeLoadStore(Operation *mem_op, SenComponents comp)
+    /// : TPMVComposite(mem_op, comp) {}` (`TransformPagedMemViewImpl.hpp:548-549`).
+    ///
+    /// ⭐ NO ANCHOR: deduplicated against entry 138.
+    #[must_use]
+    pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvCompositeLoadStore<'p> {
+        TpmvCompositeLoadStore {
+            composite: TpmvComposite::new(mem_op, comp),
+        }
+    }
+}
+
 
 /// WHETHER EVERY VALUE ASKED FOR WAS THERE — the `DT_CHECK_MSG` of [`remove_values_from_indices`].
 ///
@@ -2785,7 +3038,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// singleton is the invariant this constructor establishes.
     #[test]
     fn the_vector_constructor_seeds_one_mem_op_and_the_component() {
-        let program = vec![vector_load(Val(31)), send(Val(31))];
+        let program = [vector_load(Val(31)), send(Val(31))];
         let tpmv = TpmvVector::new(&program[0], DfirUnit::Lxlu);
 
         assert_eq!(tpmv.base.mem_ops, vec![&program[0]]);
@@ -2793,6 +3046,74 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
 
         // ⭐ AND IT ADDS NO STATE OF ITS OWN: the base is all of it.
         assert_eq!(tpmv.base, TpmvBase::new(&program[0], DfirUnit::Lxlu));
+    }
+
+    /// 🎯 137/384 — THE DERIVED CONSTRUCTOR SEEDS THE SAME ONE OP, TWO LEVELS DOWN.
+    ///
+    /// `: TPMVVector(mem_op, comp) {}` (`hpp:397`) has no body at all, so the only thing to check is
+    /// that the delegation chain runs: `mem_ops_` holds the op it was handed and `comp_` the
+    /// component, both written by [`TpmvBase::new`] through [`TpmvVector::new`].
+    #[test]
+    fn the_vector_load_constructor_carries_the_op_and_the_component() {
+        let program = [vector_load(Val(31)), send(Val(31))];
+        let tpmv = TpmvVectorLoad::new(&program[0], DfirUnit::Lxlu);
+
+        assert_eq!(tpmv.vector.base.mem_ops, vec![&program[0]]);
+        assert_eq!(tpmv.vector.base.comp, DfirUnit::Lxlu);
+
+        // ⭐ AND IT ADDS NO STATE OF ITS OWN either, so the whole object is entry 136's.
+        assert_eq!(tpmv.vector, TpmvVector::new(&program[0], DfirUnit::Lxlu));
+    }
+
+    /// 🎯 138/384 — THE SAME ON THE COMPOSITE BRANCH, which reaches [`TpmvBase`] through
+    /// [`TpmvComposite`] rather than [`TpmvVector`].
+    #[test]
+    fn the_composite_load_constructor_carries_the_op_and_the_component() {
+        let program = [vector_load(Val(31))];
+        let tpmv = TpmvCompositeLoad::new(&program[0], DfirUnit::Sfp);
+
+        assert_eq!(tpmv.composite.base.mem_ops, vec![&program[0]]);
+        assert_eq!(tpmv.composite.base.comp, DfirUnit::Sfp);
+    }
+
+    /// ⛔ THE `store_op` ARGUMENT IS DROPPED — `mem_ops_` holds the LOAD and nothing else after
+    /// construction, and entry 130's `getStoreOp` is what puts the store back
+    /// (`Impl.cpp:512-520`). A port that stashed the store here would make that entry dead.
+    #[test]
+    fn the_load_store_constructor_drops_the_store() {
+        let program = vec![vector_load(Val(31)), vector_store(Val(31))];
+        let tpmv = TpmvVectorLoadStore::new(&program[0], &program[1], DfirUnit::Lxlu);
+
+        assert_eq!(tpmv.vector.base.mem_ops, vec![&program[0]]);
+        assert_eq!(
+            store_op_from_load_store_pattern(AgenOpKind::VectorStore, &program[0], &program),
+            Some(&program[1])
+        );
+    }
+
+    /// ⛔ THE SIX LEAVES ARE SIX TYPES, which is what makes entry 139 a choice rather than a
+    /// constructor call. Nothing here can assert that at run time — the check is that the six
+    /// constructors exist and yield values of six distinct types, which is a compile-time fact this
+    /// test's mere existence establishes.
+    #[test]
+    fn all_six_leaves_construct() {
+        let program = [vector_load(Val(31)), vector_store(Val(31))];
+        let (load, store) = (&program[0], &program[1]);
+        let comp = DfirUnit::Lxlu;
+
+        let vector_load = TpmvVectorLoad::new(load, comp);
+        let vector_store = TpmvVectorStore::new(store, comp);
+        let vector_load_store = TpmvVectorLoadStore::new(load, store, comp);
+        let composite_load = TpmvCompositeLoad::new(load, comp);
+        let composite_store = TpmvCompositeStore::new(store, comp);
+        let composite_load_store = TpmvCompositeLoadStore::new(load, comp);
+
+        assert_eq!(vector_load.vector.base.mem_ops, vec![load]);
+        assert_eq!(vector_store.vector.base.mem_ops, vec![store]);
+        assert_eq!(vector_load_store.vector.base.mem_ops, vec![load]);
+        assert_eq!(composite_load.composite.base.mem_ops, vec![load]);
+        assert_eq!(composite_store.composite.base.mem_ops, vec![store]);
+        assert_eq!(composite_load_store.composite.base.mem_ops, vec![load]);
     }
     /// 🎯 118/384 — THE COLLAPSED DIMENSIONS COME OUT AND THE SURVIVORS KEEP THEIR ORDER.
     ///

@@ -176,6 +176,12 @@ mod unit_tests {
     }
 
     /// 🎯 001/384 — AND THE TWO TERMINATORS PRINT AS THE REFERENCE WRITES THEM.
+    ///
+    /// ⛔ THE TYPE LIST IS PART OF THAT. This asserted `scf.yield %3` while the reference writes
+    /// `scf.yield %20 : index`
+    /// (`dcc/test/Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:311`) — the same
+    /// mandatory `type($results)` the `affine.yield` printer already carried a note about. The
+    /// operand-carrying form only became reachable in a printed program with [`dfir_op::scf::Op::For`].
     #[test]
     fn the_terminators_print() {
         use crate::islands::dataflow_ir::print;
@@ -187,7 +193,7 @@ mod unit_tests {
             }),
             0,
         );
-        assert_eq!(out.trim(), "scf.yield %3");
+        assert_eq!(out.trim(), "scf.yield %3 : index");
         out.clear();
         print::emit(
             &mut out,
