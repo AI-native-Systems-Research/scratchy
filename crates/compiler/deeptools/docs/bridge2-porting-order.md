@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`143/384 ported; 143/384 audited`
+`151/384 ported; 151/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -677,6 +677,61 @@ operands under `dcc/test` carries its types — the same mandatory `type($result
 printer already carried a note about, unreachable until an `scf.for` could carry an `iter_args`.
 Fixed, with the two vendor loops as printer tests, and 001's terminator test now asserts the type list.
 
+⭐ AND ENTRIES 159-166 — the sync's destination sort and the SFP's permutation namer:
+`getUnitNameFromAListOfGetUnitOp`, `areCoreletsDifferent` and `separateBasedOnDestinationUnits` in
+`dfs_dataflow_to_sentient.rs`, `OperandReuse::insertIfNotExists` in `vc_operand_reuse.rs`,
+`getMaskValueConstantForNonPT`, `checkValidityOfPackAndShuffleLowering` and
+`getMergeTypeFromIndices` in `vc_vector_chain_helper.rs`, and `getOperandFromConstantOp` in
+`vc_vector_operands.rs`. 32 unit tests. No equivalence tests: there is no C to call.
+
+⛔ THE ISLAND GREW THREE TIMES FOR THIS WAVE, EACH FOR A FUNCTION WHOSE INPUT IT COULD NOT SPELL.
+(1) `dataflow.create_group` — 161's FOURTH bucket is `dyn_cast<CreateGroupOp>` and nothing else
+(`DataflowToSentient.cpp:780-782`), and its only caller branches on that list being non-empty
+(`:796-800`), so without the op the port would have been the same function with one arm deleted; the
+vendor writes it six units wide at `dcc/test/L3SU/sync-op-l3su.mlir:75`. (2)
+`arith::Op::DenseConstant` held `one: bool`, and 166 accepts 0, 1, **2 and 3** through
+`constValToField` (`VectorOperands.cpp:250-262`) with `dense<2>` real input
+(`VectorChainToSentientPESFP/splat.mlir:68`) — a boolean made two of the four compute ports
+unreachable, so the field is now an `i64` splat and MLIR's `%e` float spelling is emitted from it.
+(3) `vectorchain::LaneMask::as_set` — 089 and 163 each reconstructed the prefix form's elided
+`mask_set`, and two derivations of one set is one too many; 089 now reads it from there.
+
+⛔⛔ 161'S `// corelet = 1` COMMENT IS WRONG AND THE CODE IS WHAT IS PORTED. The test is
+`getAttr("corelet") == getI32IntegerAttr(0)`, so a destination with NO `corelet` — the LX scratchpad,
+`Residency::Scratchpad` — lands in `src_dst_lx_corelet1` beside the genuine corelet-1 units, and
+`lowerSyncLXL3ToLXL3` then treats that list as a corelet-1 region. The same null means `false` in 160,
+where both disjuncts need an attribute; and `Residency::CoreWide` prints `corelet = 0 : i32`
+(`UnitMaterializer.cpp:62-80` against `:142-152`), so an L3 half IS on corelet 0 to `getAttr` — which
+is why the `substr(0, 2) != "l3"` prefix test has to be decided first.
+
+⛔ 163 EMITS NOTHING AND THAT IS THE REFERENCE'S OWN SPLIT: the `sentient.scalar_constant` is created
+by the header template `getMaskValueForNonPT` (entry 229, `VectorChainHelper.hpp:114-125`), which owns
+the builder. Its answer is always 0 across the corpus — every one-dimensional `mask_set` a
+`create_affine_mask` carries in the 825 `.mlir` files is the all-lanes-live
+`(d0 - N >= 0, -d0 + (N-1) >= 0)`, so `from_slice` is one past the last slice and the range is EMPTY
+(`fnms_with_cast.mlir:11-12`, `:20`). ⛔ WHICH IS WHY `from_slice` MUST NOT BE UPPER-BOUNDED: refusing
+`64 / 8 == 8` would refuse every mask IBM writes. A negative `lb / lanes_per_slice` wraps through
+`unsigned` there and answers 0, reproduced as 0; a `to_slice` past the eight-bit slice mask is `1 << i`
+out of range and is declined, which no mask in the corpus reaches. ⛔ AND THE MASK **PARAMETER** IS
+IGNORED ON THIS SIDE where the PT folds it in — `fold_mode_df.mlir:92` carries a `%c0` this path never
+reads.
+
+⛔⛔ 165'S TABLE ORDER IS LOAD-BEARING AND IBM'S OWN TEST PROVES IT. `pack0` and `pack16` have
+IDENTICAL rows (`VectorChainHelper.cpp:374`, `:383`) and the scan returns the FIRST match, so `pack16`
+is unreachable: `dcc/test/SFP/merge_and_pack.mlir:232` writes a pack it NAMES `%pack16` and the
+reference lowers it to `binary_operator pack0`. So the 34 rows are a `Vec` and not a map, and all 34
+are pinned as one golden against that file's ordered `CHECK-SENT-IR`. ⭐ `scale` is why one table
+serves four element widths, and a row holding `-1` cannot widen; the checksum filter applies only at
+`scale == 1`; `repetition` is a member DEFAULT of eight that no row overrides (`:310`).
+
+⭐ 164'S OUT-PARAMETER BECAME A TYPE, WHICH IS WHAT 165 AND 277 TAKE. `ValidPackIndices` can only be
+minted by the four gates passing, so the checked list cannot be swapped for another on the way to the
+scan, and `DT_CHECK_MSG((pack_op || shuffle_op))` is discharged by the `PackOrShuffle` witness.
+⛔ `index > 2 * (int)indices.size()` is STRICTLY greater, so `index == 2 * size` is admitted; that is
+reproduced and noted, and nothing downstream indexes with these.
+
+⚠️ 160 HAS NO CALLER AT `a0d29abbed` — a grep of the authority tree finds the symbol once, at its own
+definition; its neighbours decide the corelet split inline or through 161. Ported anyway, as 042 was.
 
 ## Level 0
 
@@ -999,22 +1054,22 @@ Fixed, with the two vendor loops as printer tests, and 001's terminator test now
 - [ ] **AUDIT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, line by line against the C++
 - [ ] **PORT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, 57 lines
 - [ ] **AUDIT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, line by line against the C++
-- [ ] **PORT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, 10 lines
-- [ ] **AUDIT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, line by line against the C++
-- [ ] **PORT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, 6 lines
-- [ ] **AUDIT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, line by line against the C++
-- [ ] **PORT 161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761`, 18 lines
-- [ ] **AUDIT 161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761`, line by line against the C++
-- [ ] **PORT 162/384** `insertIfNotExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81`, 8 lines
-- [ ] **AUDIT 162/384** `insertIfNotExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81`, line by line against the C++
-- [ ] **PORT 163/384** `getMaskValueConstantForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93`, 40 lines
-- [ ] **AUDIT 163/384** `getMaskValueConstantForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93`, line by line against the C++
-- [ ] **PORT 164/384** `checkValidityOfPackAndShuffleLowering` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140`, 45 lines
-- [ ] **AUDIT 164/384** `checkValidityOfPackAndShuffleLowering` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140`, line by line against the C++
-- [ ] **PORT 165/384** `getMergeTypeFromIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301`, 109 lines
-- [ ] **AUDIT 165/384** `getMergeTypeFromIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301`, line by line against the C++
-- [ ] **PORT 166/384** `getOperandFromConstantOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267`, 26 lines
-- [ ] **AUDIT 166/384** `getOperandFromConstantOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267`, line by line against the C++
+- [x] **PORT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, 10 lines
+- [x] **AUDIT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, line by line against the C++
+- [x] **PORT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, 6 lines
+- [x] **AUDIT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, line by line against the C++
+- [x] **PORT 161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761`, 18 lines
+- [x] **AUDIT 161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761`, line by line against the C++
+- [x] **PORT 162/384** `insertIfNotExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81`, 8 lines
+- [x] **AUDIT 162/384** `insertIfNotExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81`, line by line against the C++
+- [x] **PORT 163/384** `getMaskValueConstantForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93`, 40 lines
+- [x] **AUDIT 163/384** `getMaskValueConstantForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93`, line by line against the C++
+- [x] **PORT 164/384** `checkValidityOfPackAndShuffleLowering` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140`, 45 lines
+- [x] **AUDIT 164/384** `checkValidityOfPackAndShuffleLowering` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140`, line by line against the C++
+- [x] **PORT 165/384** `getMergeTypeFromIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301`, 109 lines
+- [x] **AUDIT 165/384** `getMergeTypeFromIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301`, line by line against the C++
+- [x] **PORT 166/384** `getOperandFromConstantOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267`, 26 lines
+- [x] **AUDIT 166/384** `getOperandFromConstantOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267`, line by line against the C++
 - [ ] **PORT 167/384** `getOperandFromConstantBitstreamOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:299`, 5 lines
 - [ ] **AUDIT 167/384** `getOperandFromConstantBitstreamOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:299`, line by line against the C++
 - [ ] **PORT 168/384** `getOperandFromNegOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:366`, 5 lines

@@ -562,10 +562,11 @@ pub fn get_mask_value_for_pt<A: Arch>(
     // ⛔ THE TWO ISLAND VARIANTS ARE ONE C++ OP. `vectorchain.create_affine_mask` carries a required
     // `mask_set` attribute whichever form it is printed in; this island splits the op in two so that
     // the prefix form can defend its own type agreement ([`vectorchain::Op::CreateAffineMaskSet`]),
-    // and the prefix form's set is the one it elides — `lanes` live lanes of `len` is
-    // `(d0 - lanes >= 0, -d0 + (len - 1) >= 0)`, one dimension and no symbol. ⭐ CHECKED AGAINST THE
-    // GOLDENS: 48 live of 64 is `#set2` and lowers to `{value = 2}`, 64 live of 64 is the all-off set
-    // and lowers to `{value = 0}` (`dynamic_pt_masking.mlir:85-86`).
+    // the prefix form's set is the one it elides — [`vectorchain::LaneMask::as_set`] writes it, and
+    // it writes it for `getMaskValueConstantForNonPT` (entry 163) too rather than each reader
+    // restating it. ⭐ CHECKED AGAINST THE GOLDENS: 48 live of 64 is `#set2` and lowers to
+    // `{value = 2}`, 64 live of 64 is the all-off set and lowers to `{value = 0}`
+    // (`dynamic_pt_masking.mlir:85-86`).
     let (mask_set, mask_parameter, mask_ty) = match mask {
         vectorchain::Op::CreateAffineMaskSet {
             mask_set,
@@ -573,28 +574,7 @@ pub fn get_mask_value_for_pt<A: Arch>(
             ty,
             ..
         } => (mask_set.clone(), *mask_parameter, *ty),
-        vectorchain::Op::CreateAffineMask { mask, .. } => {
-            let ty = mask.ty();
-            let live = i64::try_from(mask.live()).ok()?;
-            let len = i64::try_from(ty.len).ok()?;
-            let set = IntegerSet {
-                dims: 1,
-                symbols: 0,
-                constraints: vec![
-                    crate::islands::dataflow_ir::ty::Constraint {
-                        expr: AffineExpr::dim(0).plus(AffineExpr::Const(-live)),
-                        is_equality: false,
-                    },
-                    crate::islands::dataflow_ir::ty::Constraint {
-                        expr: AffineExpr::dim(0)
-                            .times(-1)
-                            .plus(AffineExpr::Const(len - 1)),
-                        is_equality: false,
-                    },
-                ],
-            };
-            (set, None, ty)
-        }
+        vectorchain::Op::CreateAffineMask { mask, .. } => (mask.as_set()?, None, mask.ty()),
         // `if (!cam_op) { operand->emitOpError("PT mask should come from a CreateAffineMaskOp"); }`
         _ => return None,
     };

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet, Vector};
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, Vector};
 
 /// WHICH COMPARISON — `VectorChainElementWiseCompareOperator` (`VectorChainEnums.td`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +249,49 @@ impl LaneMask {
     #[must_use]
     pub const fn ty(self) -> Vector {
         self.ty
+    }
+
+    /// THE AFFINE SET THIS PREFIX ELIDES — the `mask_set` attribute, as the other form of the op
+    /// writes it out.
+    ///
+    /// ⛔⛔ THE PREFIX FORM IS NOT A DIFFERENT OPERATION, AND BOTH MASK READERS ASK FOR THE SET.
+    /// `vectorchain.create_affine_mask` carries a REQUIRED `mask_set` whichever way this island
+    /// prints it, and `getMaskValueForPT` (bridge-2 entry 089) and `getMaskValueConstantForNonPT`
+    /// (entry 163) each read that attribute and nothing else. `lanes` live lanes of `ty.len` is
+    /// `(d0 - lanes >= 0, -d0 + (ty.len - 1) >= 0)` — one dimension, no symbol — and ⛔ THE SET
+    /// DESCRIBES THE LANES THAT ARE **OFF**: `d0` ranges over the masked tail, which is why a
+    /// fully live mask states the EMPTY span `Lb = lanes > Ub = lanes - 1`.
+    ///
+    /// ⭐ ONE STATEMENT OF IT, PINNED BY A GOLDEN ON EACH SIDE. 48 live of 64 is IBM's `#set2` and
+    /// lowers to `sentient.scalar_constant {value = 2 : si64}` on the PT
+    /// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:86`); 64 live of 64 is
+    /// `(d0 - 64 >= 0, -d0 + 63 >= 0)` and lowers to `{value = 0 : si64}` on the PT (`:85`) and on
+    /// the PE/SFP (`dcc/test/Conversion/VectorChainToSentientPESFP/fnms_with_cast.mlir:11`). Both
+    /// entries reconstructed it separately until this method existed, and two derivations of one
+    /// set is one too many.
+    ///
+    /// ⭐ `None` FOR A MASK NO `i64` CAN STATE. The constraints hold signed constants; a lane count
+    /// past `i64::MAX` is not a vector this compiler addresses.
+    #[must_use]
+    pub fn as_set(self) -> Option<IntegerSet> {
+        let live = i64::try_from(self.lanes).ok()?;
+        let len = i64::try_from(self.ty.len).ok()?;
+        Some(IntegerSet {
+            dims: 1,
+            symbols: 0,
+            constraints: vec![
+                Constraint {
+                    expr: AffineExpr::dim(0).plus(AffineExpr::Const(-live)),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(0)
+                        .times(-1)
+                        .plus(AffineExpr::Const(len - 1)),
+                    is_equality: false,
+                },
+            ],
+        })
     }
 
     /// THE VALUE A `create_affine_mask` BOUND, CARRYING THIS MASK'S OWN TYPE.

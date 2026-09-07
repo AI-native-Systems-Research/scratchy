@@ -355,6 +355,7 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         DfirOp::Dataflow(
             dfir_op::dataflow::Op::GetUnit { .. }
             | dfir_op::dataflow::Op::GetLocalUnit { .. }
+            | dfir_op::dataflow::Op::CreateGroup { .. }
             | dfir_op::dataflow::Op::GetLogicalMemoryView { .. }
             | dfir_op::dataflow::Op::GetPagedLogicalMemoryView(_)
             | dfir_op::dataflow::Op::ProgramUnit { .. }
@@ -533,9 +534,8 @@ impl MergeAndPack {
     /// `pack12` and `pack13`, the twins they differ from in nothing else, rather than differing in an
     /// omission.
     ///
-    /// ⚠️ ITS CALLER IS UNPORTED. The table of thirty-four rows and the matching loop are
-    /// `getMergeTypeFromIndices` (entry 165), which is not this worklist's; nothing in the crate
-    /// builds a row yet.
+    /// ⭐ ITS THIRTY-FOUR CALLERS ARE [`merge_and_pack_insts`], the table `getMergeTypeFromIndices`
+    /// (entry 165) scans — which is where the two filters above are spent.
     #[must_use]
     pub fn new(
         name: MergeOrPack,
@@ -1275,13 +1275,892 @@ pub fn vector_ternary_to_sentient_ternary(op: &vc::Op) -> sen::TernaryOp {
     }
 }
 
+// ═══════════════════════════════════════════ 163/384 ═══════════════════════════════════════════
+
+/// WHICH SLICES OF A STICK A NON-PT MASK TURNS OFF — the `unsigned` `getMaskValueConstantForNonPT`
+/// answers, as one bit per slice.
+///
+/// ⛔⛔ A BITMAP, AND THE PT'S MASK VALUE IS A COUNT. `getMaskValueForPT` returns
+/// `masked_columns` — a NUMBER of columns, carried by
+/// [`super::vc_loop_mask_tree::MaskedColumns`] — while this side sums `1 << i` over a RANGE OF SLICE INDICES
+/// (`VectorChainHelper.cpp:130-131`). Both end up in the same
+/// `sentient.scalar_constant {value = N : si64}` attribute, so a bare integer would let the two be
+/// interchanged silently: `2` means *"two columns are masked"* on the PT and *"slice 1 is masked"*
+/// here.
+///
+/// ⭐ AND IT IS AT MOST [`Arch::SLICES_PER_STICK`] BITS WIDE, which is what makes the shift in
+/// [`get_mask_value_constant_for_non_pt`] total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SliceMask(u32);
+
+impl SliceMask {
+    /// The literal the mask constant carries.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// Replaces: e163_getMaskValueConstantForNonPT
+///
+/// # THE MASK VALUE A PE, SFP OR L-UNIT COMPUTE TAKES, READ OFF THE `create_affine_mask`
+///
+/// ```cpp
+/// std::optional<unsigned> vectorchain::getMaskValueConstantForNonPT(
+///     Operation* op, Operation* operand, const SenSystemDef& sys_def) {
+///   if (!operand->hasAttr("mask_set")) {
+///     operand->emitOpError("Mask operation doesn't have mask_set attribute.");
+///     return std::nullopt;
+///   }
+///   auto mask_set_attr = operand->getAttr("mask_set");
+///   auto mask_set = cast<IntegerSetAttr>(mask_set_attr).getValue();
+///   if (mask_set.getNumDims() != 1) {
+///     operand->emitOpError("Mask affine set has to have one dimension.");
+///     return std::nullopt;
+///   }
+///   if (mask_set.getNumSymbols() > 0) {
+///     operand->emitOpError("Mask affine set should not have any symbols");
+///     return std::nullopt;
+///   }
+///   affine::FlatAffineValueConstraints mask_set_flat(mask_set);
+///   if (!hasConstantBounds(mask_set_flat)) {
+///     operand->emitOpError("Mask affine set has to have constant bounds.");
+///     return std::nullopt;
+///   }
+///   auto lowerbound_elm = int64_t(mask_set_flat.getConstantBound(BoundType::LB, 0).value());
+///   auto upperbound_elm = int64_t(mask_set_flat.getConstantBound(BoundType::UB, 0).value());
+///   DT_CHECK_MSG(isa<VectorType>(operand->getOpResult(0).getType()),
+///                "expecting operand to be VectorType");
+///   auto dim = cast<VectorType>(operand->getOpResult(0).getType()).getDimSize(0);
+///   DT_CHECK(dim / sys_def.numSlicesPerStick > 0);
+///   unsigned from_slice = lowerbound_elm / (dim / sys_def.numSlicesPerStick) + 1;
+///   unsigned to_slice = upperbound_elm / (dim / sys_def.numSlicesPerStick);
+///   unsigned mask_val = 0;
+///   for (unsigned i = from_slice - 1; i <= to_slice; i++) mask_val += 1 << i;
+///   return mask_val;
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93-133`)
+///
+/// # ⭐⭐ THE `+ 1` AND THE `- 1` CANCEL, AND THE ANSWER IS A CLOSED RANGE OF SLICES
+///
+/// `from_slice` is `lb / lanes_per_slice + 1` and the loop starts at `from_slice - 1`, so the mask is
+/// exactly `OR of 1 << i for i in (lb / lanes_per_slice) ..= (ub / lanes_per_slice)` — the slices the
+/// masked span touches, with `lanes_per_slice = dim / numSlicesPerStick`. ⛔ THE ROUND TRIP IS NOT
+/// COSMETIC, THOUGH: it happens through an `unsigned`, which is where the negative case below comes
+/// from.
+///
+/// # ⛔ IT EMITS NOTHING, AND THAT IS THE SPLIT THE REFERENCE MADE
+///
+/// The `sentient.scalar_constant` this value becomes is emitted one level up, by the header template
+/// `getMaskValueForNonPT` (entry 229) — `builder.setInsertionPoint(op)` then
+/// `sentient::ConstantOp::create(builder, op->getLoc(), builder.getIndexType(), mask_val.value())`
+/// (`VectorChainHelper.hpp:114-125`). So this entry legitimately returns a number: the op belongs to
+/// the entry that has the builder.
+///
+/// # ⛔ THE MASK **PARAMETER** IS IGNORED, WHERE THE PT FOLDS IT IN
+///
+/// This side reads the `mask_set` attribute and only that. A `create_affine_mask %14 {mask_set}` on
+/// a PE therefore lowers as though it were static, and a set that actually USES its symbol is refused
+/// outright by `getNumSymbols() > 0`. The PT sibling instead folds a constant parameter into the set
+/// and accepts a loop-dependent one (entry 089) — two masks with the same spelling and two different
+/// readings, which is the reference's own asymmetry and not a simplification here.
+///
+/// ⭐ AND THE FIRST PARAMETER IS UNUSED. `op` is the masked compute; nothing in the body touches it.
+/// It exists for the diagnostics — `operand->emitOpError` is called on the MASK — and for the
+/// template above, which needs it for the insertion point.
+///
+/// # THE GOLDEN, AND WHY IT IS ALWAYS ZERO
+///
+/// `#set = affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` over `vector<64xi1>`
+/// (`dcc/test/Conversion/VectorChainToSentientPESFP/fnms_with_cast.mlir:20`, `:30`): `Lb` is 64 and
+/// `Ub` is 63, `lanes_per_slice` is 8, so the range is `8 ..= 7` — EMPTY — and the mask is 0. The
+/// `CHECK-SENT-IR` is `sentient.scalar_constant {value = 0 : si64}` feeding
+/// `vector_mac mask(...)` (`:11-12`).
+///
+/// ⭐ A CENSUS, NOT A SAMPLE: every one-dimensional `mask_set` a `create_affine_mask` carries in the
+/// authority's 825 `.mlir` files is of that all-lanes-live shape — `(d0 - N >= 0, -d0 + (N-1) >= 0)`
+/// for N of 64, 128, 256 and 2048 — so every non-PT mask constant IBM's own tests produce is 0. The
+/// non-zero answers below are derived from the arithmetic and marked as such.
+///
+/// ⛔ SO `from_slice` MUST NOT BE RANGE-CHECKED AT ITS TOP END. 64 / 8 = 8 is one past the last
+/// slice of the stick, and refusing it would refuse every mask in the corpus. The empty range is the
+/// answer.
+///
+/// # THE STOPS, EACH A CITED ABORT OR UB
+///
+/// * `DT_CHECK(dim / sys_def.numSlicesPerStick > 0)` — a mask narrower than a stick has slices
+///   (`:129`). Declined here, in the crate's manner: `DT_CHECK` throws
+///   (`util/dt_exception.hpp:110-121`), and a vector of fewer than eight lanes is not a mask this
+///   lowering can read either way.
+/// * ⛔ A NEGATIVE `lb / lanes_per_slice` IS AN UNSIGNED WRAP THERE, AND THE MASK IS 0. `from_slice`
+///   is an `unsigned`: `lb / lps == -1` makes it 0 and `from_slice - 1` becomes `0xFFFFFFFF`, and
+///   anything below that makes it larger still — the loop condition is false at once either way.
+///   This port answers 0 for the same input, which reproduces the OBSERVABLE result rather than the
+///   wrap.
+/// * ⛔ AN UPPER SLICE PAST THE STICK IS `1 << i` OUT OF RANGE, AND IS DECLINED. There is no upper
+///   guard on this side — the PT's sibling checks `upper_bound == op_num_elems - 1` explicitly
+///   (`VectorChainToSentientPT/Helper.cpp:96-99`) and this one checks nothing — so a `dim` that is
+///   not a multiple of eight (say 12, giving `lps == 1` and `to_slice == 11`) shifts past the
+///   eight-bit slice mask, and a `dim` of 32 or less with a wide span shifts past 31, which is
+///   undefined behaviour in C++. `to_slice` outside `0 .. SLICES_PER_STICK` is refused here; ⭐ no
+///   mask in the corpus is affected, because every one of them is stated over a multiple of eight
+///   lanes.
+///
+/// # THE DT_CHECK THAT IS **DISCHARGED BY CONSTRUCTION**
+///
+/// `isa<VectorType>(operand->getOpResult(0).getType())` (`:123-124`) — both mask forms of this island
+/// carry a [`Vector`], so the mask's result type cannot be anything else and `getDimSize(0)` cannot
+/// be asked of a scalar.
+#[must_use]
+pub fn get_mask_value_constant_for_non_pt<A: Arch>(mask: &vc::Op) -> Option<SliceMask> {
+    // `if (!operand->hasAttr("mask_set"))` — ⭐ THE TWO ISLAND VARIANTS ARE ONE C++ OP, and both
+    // carry the attribute; the prefix form's set is written by [`vc::LaneMask::as_set`]. Any other op
+    // has no `mask_set` at all, which is the first refusal.
+    let (mask_set, mask_ty) = match mask {
+        vc::Op::CreateAffineMaskSet { mask_set, ty, .. } => (mask_set.clone(), *ty),
+        vc::Op::CreateAffineMask { mask, .. } => (mask.as_set()?, mask.ty()),
+        // ⭐ A WITNESS MATCH, not a walk — the precedent [`super::vc_helper::get_mask_value_for_pt`]
+        // set for the same pair of variants.
+        _ => return None,
+    };
+
+    // `if (mask_set.getNumDims() != 1)` — "Mask affine set has to have one dimension."
+    if mask_set.dims != 1 {
+        return None;
+    }
+
+    // `if (mask_set.getNumSymbols() > 0)` — "Mask affine set should not have any symbols". ⛔ THIS IS
+    // WHERE A DYNAMIC MASK STOPS on this side; see the note on the mask parameter above.
+    if mask_set.symbols > 0 {
+        return None;
+    }
+
+    // `if (!hasConstantBounds(mask_set_flat))` — entry 063, whose only caller is this line.
+    if !has_constant_bounds(&mask_set) {
+        return None;
+    }
+
+    // The two `.value()` calls. [`has_constant_bounds`] above is what makes both present, so the `?`
+    // restates that gate rather than adding a second refusal.
+    let lowerbound_elm = mask_set.constant_bound(BoundType::Lb, 0)?;
+    let upperbound_elm = mask_set.constant_bound(BoundType::Ub, 0)?;
+
+    // `auto dim = cast<VectorType>(operand->getOpResult(0).getType()).getDimSize(0);`
+    let dim = i64::try_from(mask_ty.len).ok()?;
+    let slices_per_stick = i64::from(A::SLICES_PER_STICK);
+
+    // `DT_CHECK(dim / sys_def.numSlicesPerStick > 0);`
+    let lanes_per_slice = dim / slices_per_stick;
+    if lanes_per_slice <= 0 {
+        return None;
+    }
+
+    // `from_slice - 1` and `to_slice`, with the `+ 1` and the `- 1` already cancelled.
+    let from_slice = lowerbound_elm / lanes_per_slice;
+    let to_slice = upperbound_elm / lanes_per_slice;
+
+    // ⛔ THE UPPER END FIRST, because it is the one that shifts: see this function's third stop.
+    if to_slice < 0 || to_slice >= slices_per_stick {
+        return None;
+    }
+
+    // ⛔ AND A NEGATIVE START IS THE UNSIGNED WRAP, whose observable result is an empty loop.
+    if from_slice < 0 {
+        return Some(SliceMask(0));
+    }
+
+    // `for (unsigned i = from_slice - 1; i <= to_slice; i++) mask_val += 1 << i;` — a range that runs
+    // backwards is empty, which is the all-lanes-live answer.
+    let mut mask_val = 0;
+    for i in u32::try_from(from_slice).ok()?..=u32::try_from(to_slice).ok()? {
+        mask_val += 1 << i;
+    }
+
+    Some(SliceMask(mask_val))
+}
+
+// ═══════════════════════════════════════════ 164/384 ═══════════════════════════════════════════
+
+/// HOW MANY TIMES A PACK OR SHUFFLE PATTERN REPEATS — `is_any_of(repetition, 4, 8)`
+/// (`VectorChainHelper.cpp:142-146`).
+///
+/// ⛔⛔ TWO VALUES, AND THE OP'S FIELD IS A `u32`. `vectorchain.pack`'s `repetition` is an
+/// `IndexAttr` and `vectorchain.shuffle`'s an `i32` — the island keeps both as they are printed — so
+/// the closed set lives here, at the one place that decides it, and the refusal *"the cases with
+/// !is_any_of(repetition, 4, 8) are not supported yet"* is spent once.
+///
+/// ⭐ AND `Four` MATCHES NO ROW OF THE MERGE-AND-PACK TABLE. Every one of the thirty-four rows takes
+/// the member default `repetition = 8` and [`merge_type_from_indices`] compares for equality
+/// (`:399`), so a repetition of four reaches that function and finds nothing — it is a GCVT/FCVT
+/// shuffle's number (entry 277), which is why this gate accepts it and the table does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PackRepetition {
+    /// `repetition = 4`.
+    Four,
+    /// `repetition = 8` — the whole merge-and-pack table's value.
+    Eight,
+}
+
+impl PackRepetition {
+    /// `is_any_of(repetition, 4, 8)`, as a witness.
+    #[must_use]
+    pub const fn of(repetition: u32) -> Option<PackRepetition> {
+        match repetition {
+            4 => Some(PackRepetition::Four),
+            8 => Some(PackRepetition::Eight),
+            _ => None,
+        }
+    }
+
+    /// The repetition itself.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            PackRepetition::Four => 4,
+            PackRepetition::Eight => 8,
+        }
+    }
+}
+
+/// EITHER OF THE TWO OPS THIS CHECK ACCEPTS, with the three things it reads off them.
+///
+/// ⛔⛔ THIS IS `DT_CHECK_MSG((pack_op || shuffle_op), "Expect a pack or shuffle op.")`
+/// (`VectorChainHelper.cpp:150`) DISCHARGED BY CONSTRUCTION. The reference takes a bare
+/// `Operation*`, casts to both, aborts if neither, and then writes the SAME THREE READS TWICE with a
+/// ternary — `pack_op ? pack_op.getIndices() : shuffle_op.getIndices()`, and again for the type
+/// (`:151-153`). A witness minted from the op does the discrimination once, and the reference's abort
+/// becomes the `None` at [`PackOrShuffle::of`], the way [`super::vc_helper::PtUnit::of`] handles its
+/// own component check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackOrShuffle<'a> {
+    /// `getIndices()` — one entry per element of the pattern.
+    indices: &'a [i32],
+    /// `getRepetition()`, still as the op prints it.
+    repetition: u32,
+    /// `getType()` — the RESULT type, which is what `getTotalVectorSize` is asked about.
+    ty: Vector,
+}
+
+impl<'a> PackOrShuffle<'a> {
+    /// A PACK OR A SHUFFLE, or `None` for anything else — the reference's `DT_CHECK_MSG`.
+    ///
+    /// ⭐ THE REPETITION COMES FROM THE OP, and that is not a shortcut: all four call sites pass the
+    /// op's own — `int repetition = shuffle_op.getRepetition();`
+    /// (`VectorChainToSentientPESFP.cpp:633-637`), `pack_op.getRepetition().getSExtValue()`
+    /// (`:688-691`), and the same two in `VectorChainToSentientPT.cpp:629`, `:822`. Passing it
+    /// separately would let a caller validate one op's indices against another's repetition.
+    #[must_use]
+    pub fn of(op: &'a vc::Op) -> Option<PackOrShuffle<'a>> {
+        match op {
+            vc::Op::Pack {
+                indices,
+                repetition,
+                ty,
+                ..
+            }
+            | vc::Op::Shuffle {
+                indices,
+                repetition,
+                ty,
+                ..
+            } => Some(PackOrShuffle {
+                indices,
+                repetition: *repetition,
+                ty: *ty,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The result type the indices have to fill.
+    #[must_use]
+    pub const fn ty(&self) -> Vector {
+        self.ty
+    }
+}
+
+/// AN INDEX LIST THAT HAS PASSED [`check_validity_of_pack_and_shuffle_lowering`], with the
+/// repetition it was checked against.
+///
+/// ⛔⛔ IT IS THE REFERENCE'S OUT-PARAMETER, AND A TYPE IS WHAT MAKES THE ORDER UNSKIPPABLE. The C++
+/// signature is `checkValidityOfPackAndShuffleLowering(Operation* op, std::vector<int>& indices, int
+/// repetition)`: the caller declares an EMPTY vector, the callee fills it, and the caller then hands
+/// that same vector to `getMergeTypeFromIndices` or
+/// `getGCVTorFCVTTypeFromIndicesAndCastInputs` (`VectorChainToSentientPESFP.cpp:688-707`). Nothing
+/// but call order stops those two from being handed an unchecked list. Here they take this, and only
+/// this function makes one.
+///
+/// ⭐ IT BORROWS THE OP'S OWN LIST RATHER THAN COPYING IT, and that is exact: the loop at `:155-166`
+/// pushes EVERY element and fails on the first one it cannot accept, so on success the filled vector
+/// is elementwise the op's `indices` attribute. ⛔ The `else` arm of that loop — *"Indices should be
+/// integers"* — is unrepresentable here, because [`vc::Op::Pack::indices`] is a `Vec<i32>` and an
+/// attribute of another kind could not have been parsed into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidPackIndices<'a> {
+    /// The op's own indices, all `>= -1`.
+    indices: &'a [i32],
+    /// The repetition they were checked against.
+    repetition: PackRepetition,
+}
+
+impl<'a> ValidPackIndices<'a> {
+    /// The checked indices, where `-1` is a lane the instruction does not write.
+    #[must_use]
+    pub const fn indices(&self) -> &'a [i32] {
+        self.indices
+    }
+
+    /// The repetition they were checked against.
+    #[must_use]
+    pub const fn repetition(&self) -> PackRepetition {
+        self.repetition
+    }
+}
+
+/// Replaces: e164_checkValidityOfPackAndShuffleLowering
+///
+/// # WHETHER A PACK OR SHUFFLE CAN BE LOWERED AT ALL — the four gates ahead of naming an instruction
+///
+/// ```cpp
+/// mlir::LogicalResult vectorchain::checkValidityOfPackAndShuffleLowering(
+///     Operation* op, std::vector<int>& indices, int repetition) {
+///   if (!is_any_of(repetition, 4, 8)) {
+///     op->emitError("The cases with !is_any_of(repetition, 4, 8) are not supported yet");
+///     return failure();
+///   }
+///   auto pack_op = llvm::dyn_cast<vectorchain::PackOp>(op);
+///   auto shuffle_op = llvm::dyn_cast<vectorchain::ShuffleOp>(op);
+///   DT_CHECK_MSG((pack_op || shuffle_op), "Expect a pack or shuffle op.");
+///   auto op_indices = pack_op ? pack_op.getIndices().getValue()
+///                             : shuffle_op.getIndices().getValue();
+///   Type type = pack_op ? pack_op.getType() : shuffle_op.getType();
+///   int vec_size = dcc::utils::getTotalVectorSize(type);
+///   for (auto index_iter : op_indices) {
+///     if (auto index_attr = mlir::dyn_cast<IntegerAttr>(index_iter)) {
+///       int index = index_attr.getInt();
+///       if (index < -1) {
+///         op->emitError("Indices should be integers >= -1");
+///         return failure();
+///       }
+///       indices.push_back(index);
+///     } else {
+///       op->emitError("Indices should be integers");
+///       return failure();
+///     }
+///   }
+///   if (repetition * indices.size() != vec_size) {
+///     op->emitError("Size of array indices multiply to repetition should be equal to "
+///                   "the size of vector");
+///     return failure();
+///   }
+///   for (auto index : indices) {
+///     if (index > 2 * (int)indices.size()) {
+///       op->emitError("None of the elements of the indices array can be greater than 2 "
+///                     "times the size of the array");
+///       op->dump();
+///       return failure();
+///     }
+///   }
+///   return success();
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140-185`)
+///
+/// # ⭐ THE PATTERN TILES THE RESULT — `repetition * indices.size() == vec_size`
+///
+/// A `vectorchain.pack` states one period of its permutation and a repetition count, and the two
+/// have to fill the result exactly: 16 indices × 8 for a `vector<128xi8>`, 8 × 8 for a
+/// `vector<64xi16>`, 32 × 8 for a `vector<256xi4>`, 64 × 8 for a `vector<512xi2>` — all four widths
+/// of `dcc/test/SFP/merge_and_pack.mlir:161-266`. ⛔ AND `vec_size` IS THE **RESULT** TYPE'S
+/// element count (`:153`), not an operand's; on those fixtures all three agree, and where a pack
+/// narrows they would not.
+///
+/// # ⛔ THE LAST GATE IS **STRICTLY** GREATER, AND IT IS LOOSER THAN IT LOOKS
+///
+/// `index > 2 * (int)indices.size()` (`:176`) admits `index == 2 * size` — for eight indices, 16 —
+/// even though the two operands concatenated hold exactly `2 * size` elements, whose last index is
+/// `2 * size - 1`. So one out-of-range index per shape passes this check. ⭐ REPRODUCED, NOT
+/// TIGHTENED: nothing downstream indexes a buffer with these — [`merge_type_from_indices`] compares
+/// them against a table and answers `None` for a list no instruction implements — so the loose bound
+/// costs a diagnostic, not a read out of bounds, and closing it here would be this port inventing a
+/// rule. `pack1`'s `15` is the largest any fixture uses.
+///
+/// ⛔ AND THE ORDER OF THE TWO LOOPS MATTERS. The `>= -1` test is per element DURING the copy and the
+/// `2 * size` test is a second pass over the whole list (`:155-166` then `:175-183`), so a list that
+/// is both too short and holds a `-2` is refused for the `-2` — which is the diagnostic a reader gets
+/// and therefore part of the answer.
+#[must_use]
+pub fn check_validity_of_pack_and_shuffle_lowering(
+    op: PackOrShuffle<'_>,
+) -> Option<ValidPackIndices<'_>> {
+    // `if (!is_any_of(repetition, 4, 8))` — "The cases with !is_any_of(repetition, 4, 8) are not
+    // supported yet".
+    let repetition = PackRepetition::of(op.repetition)?;
+
+    // `int vec_size = dcc::utils::getTotalVectorSize(type);` — ⭐ THE PRODUCT OF THE SHAPE
+    // (`dcc/src/Utils/Utils.cpp:704-714`), which for this island's one-dimensional [`Vector`] is
+    // its length.
+    let vec_size = op.ty.len;
+
+    // `for (auto index_iter : op_indices) { … if (index < -1) … indices.push_back(index); }`
+    for &index in op.indices {
+        // `op->emitError("Indices should be integers >= -1")`
+        if index < -1 {
+            return None;
+        }
+    }
+
+    // `if (repetition * indices.size() != vec_size)`
+    if u64::from(repetition.count()) * op.indices.len() as u64 != vec_size {
+        return None;
+    }
+
+    // `for (auto index : indices) if (index > 2 * (int)indices.size())` — strictly greater; see the
+    // note above.
+    let bound = 2 * i64::try_from(op.indices.len()).ok()?;
+    for &index in op.indices {
+        if i64::from(index) > bound {
+            return None;
+        }
+    }
+
+    // `return success();` — with the checked list, so its two consumers cannot be handed another.
+    Some(ValidPackIndices {
+        indices: op.indices,
+        repetition,
+    })
+}
+
+// ═══════════════════════════════════════════ 165/384 ═══════════════════════════════════════════
+
+/// THE THIRTY-FOUR MERGE-AND-PACK INSTRUCTIONS THE SFP IMPLEMENTS, IN THE ORDER
+/// `getMergeTypeFromIndices` SCANS THEM (`VectorChainHelper.cpp:327-390`).
+///
+/// # ⛔⛔ THE ORDER IS LOAD-BEARING, AND IBM'S OWN TEST PROVES IT
+///
+/// `pack0` and `pack16` have IDENTICAL rows — `{0, 1, 2, 3, 4, 5, 6, 7}` at 16 bits, same repetition,
+/// same `sign_extend` (`:374`, `:383`) — and the scan returns the FIRST match, so `pack16` is
+/// unreachable. `dcc/test/SFP/merge_and_pack.mlir:232` writes a pack it names `%pack16` and the
+/// reference lowers it to `binary_operator pack0` (the 24th `binary_operator` of that file's
+/// `CHECK-SENT-IR`). Sorting this table, or making it a map, would change that answer.
+///
+/// ⭐ SO IT IS A `Vec` AND NOT A `BTreeMap`, and the sole test of a row's identity is its position.
+///
+/// ⭐ WHY IT IS BUILT PER CALL, as the C++ does (a function-local `std::vector` initialised on every
+/// entry, `:327`): the rows own their index vectors, `MergeAndPack` is not `Copy`, and this is called
+/// once per pack op in a program. A `LazyLock` would be the same table with a `static` in front of
+/// it; nothing here mutates a row, so there is nothing to protect.
+#[must_use]
+pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
+    vec![
+        // ── 2-BIT ELEMENTS — sixteen real lanes and forty-eight pads (`:328-333`).
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P24),
+            Bits(2),
+            vec![
+                0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, -1, -1, -1, -1,
+                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                -1, -1,
+            ],
+            false,
+        ),
+        // ── 4-BIT ELEMENTS (`:334-341`).
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P8),
+            Bits(4),
+            vec![
+                0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, -1, -1, -1, -1, -1,
+                -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            ],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P9),
+            Bits(4),
+            vec![
+                0, 32, -1, -1, 4, 36, -1, -1, 8, 40, -1, -1, 12, 44, -1, -1, 16, 48, -1, -1, 20,
+                52, -1, -1, 24, 56, -1, -1, 28, 60, -1, -1,
+            ],
+            false,
+        ),
+        // ── 8-BIT ELEMENTS (`:342-368`).
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W8,
+                high: true,
+            },
+            Bits(8),
+            vec![1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W8,
+                high: false,
+            },
+            Bits(8),
+            vec![0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P12),
+            Bits(8),
+            vec![0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P13),
+            Bits(8),
+            vec![8, -1, 9, -1, 10, -1, 11, -1, 12, -1, 13, -1, 14, -1, 15, -1],
+            false,
+        ),
+        // ⛔ `pack14` AND `pack15` ARE `pack12` AND `pack13` WITH `sign_extend` — the only two rows
+        // of the thirty-four that set it (`:350-357`), and the only reason the scan needs the
+        // `inst.sign_extend == sign_extend` test at all.
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P14),
+            Bits(8),
+            vec![0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1],
+            true,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P15),
+            Bits(8),
+            vec![8, -1, 9, -1, 10, -1, 11, -1, 12, -1, 13, -1, 14, -1, 15, -1],
+            true,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P25),
+            Bits(8),
+            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P26),
+            Bits(8),
+            vec![0, 2, 4, 6, 16, 18, 20, 22, 8, 10, 12, 14, 24, 26, 28, 30],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P27),
+            Bits(8),
+            vec![0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30],
+            false,
+        ),
+        // ── 16-BIT ELEMENTS (`:370-390`).
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W16,
+                high: true,
+            },
+            Bits(16),
+            vec![1, 9, 3, 11, 5, 13, 7, 15],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W16,
+                high: false,
+            },
+            Bits(16),
+            vec![0, 8, 2, 10, 4, 12, 6, 14],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W32,
+                high: true,
+            },
+            Bits(16),
+            vec![2, 3, 10, 11, 6, 7, 14, 15],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W32,
+                high: false,
+            },
+            Bits(16),
+            vec![0, 1, 8, 9, 4, 5, 12, 13],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W64,
+                high: true,
+            },
+            Bits(16),
+            vec![4, 5, 6, 7, 12, 13, 14, 15],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Merge {
+                width: sen::MergeWidth::W64,
+                high: false,
+            },
+            Bits(16),
+            vec![0, 1, 2, 3, 8, 9, 10, 11],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P0),
+            Bits(16),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P1),
+            Bits(16),
+            vec![15, 1, 2, 3, 4, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P2),
+            Bits(16),
+            vec![14, 15, 2, 3, 4, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P3),
+            Bits(16),
+            vec![13, 14, 15, 3, 4, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P4),
+            Bits(16),
+            vec![12, 13, 14, 15, 4, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P5),
+            Bits(16),
+            vec![11, 12, 13, 14, 15, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P6),
+            Bits(16),
+            vec![10, 11, 12, 13, 14, 15, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P7),
+            Bits(16),
+            vec![9, 10, 11, 12, 13, 14, 15, 7],
+            false,
+        ),
+        // ⛔ THE UNREACHABLE ROW — `pack0`'s twin, kept in place because removing it would change
+        // nothing and pretending it is absent would misdescribe the table. See this function's note.
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P16),
+            Bits(16),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P17),
+            Bits(16),
+            vec![8, 0, 1, 2, 3, 4, 5, 6],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P18),
+            Bits(16),
+            vec![8, 9, 0, 1, 2, 3, 4, 5],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P19),
+            Bits(16),
+            vec![8, 9, 10, 0, 1, 2, 3, 4],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P20),
+            Bits(16),
+            vec![8, 9, 10, 11, 0, 1, 2, 3],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P21),
+            Bits(16),
+            vec![8, 9, 10, 11, 12, 0, 1, 2],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P22),
+            Bits(16),
+            vec![8, 9, 10, 11, 12, 13, 0, 1],
+            false,
+        ),
+        MergeAndPack::new(
+            MergeOrPack::Pack(sen::PackIndex::P23),
+            Bits(16),
+            vec![8, 9, 10, 11, 12, 13, 14, 0],
+            false,
+        ),
+    ]
+}
+
+/// Replaces: e165_getMergeTypeFromIndices
+///
+/// # WHICH MERGE OR PACK INSTRUCTION A PERMUTATION IS — the table scan, and `""` for *"there is no
+/// merge or pack instruction corresponding to the following operation"*
+///
+/// ```cpp
+/// std::string vectorchain::getMergeTypeFromIndices(std::vector<int> indices,
+///                                                  int repetition,
+///                                                  bool sign_extend,
+///                                                  unsigned element_bit_width) {
+///   struct merge_and_pack_type { … };                 // ported at `MergeAndPack::new` (entry 064)
+///   std::vector<merge_and_pack_type> merge_and_pack_insts = { … };  // `merge_and_pack_insts` above
+///
+///   int indices_sum = 0;
+///   for (auto index : indices) indices_sum += index;
+///
+///   for (auto merge_and_pack_inst : merge_and_pack_insts) {
+///     if (element_bit_width > merge_and_pack_inst.element_bit_width) continue;
+///     int scale = merge_and_pack_inst.element_bit_width / element_bit_width;
+///     bool found = true;
+///     if (indices.size() != merge_and_pack_inst.size * scale) continue;
+///     if (repetition != merge_and_pack_inst.repetition) continue;
+///     if (scale == 1 && indices_sum != merge_and_pack_inst.sum) continue;
+///
+///     for (int i = 0; i < merge_and_pack_inst.size && found; i++) {
+///       for (int j = 0; j < scale && found; j++) {
+///         if (indices[i * scale + j] != merge_and_pack_inst.vec[i] * scale + j)
+///           found = false;
+///       }
+///     }
+///
+///     if (found && merge_and_pack_inst.sign_extend == sign_extend)
+///       return merge_and_pack_inst.name;
+///   }
+///   return "";
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301-412` — the
+/// thirty-four-row initialiser at `:327-390` is [`merge_and_pack_insts`] and the local struct at
+/// `:304-325` is [`MergeAndPack`], so only the scan is repeated here)
+///
+/// # ⭐⭐ `scale` IS WHY ONE TABLE SERVES FOUR ELEMENT WIDTHS
+///
+/// Every row is written at the widest element it applies to, and a NARROWER element reaches the same
+/// instruction by moving `scale` neighbours at a time: at `element_bit_width == 8` a 16-bit row's
+/// index `k` becomes the pair `2k, 2k+1`, so `merge32l`'s `{0, 1, 8, 9, …}` also names the 8-bit
+/// permutation `{0, 1, 2, 3, 16, 17, 18, 19, …}`. That is exactly what the inner double loop tests —
+/// `indices[i * scale + j] == vec[i] * scale + j` for every `j` — and it is why the row's `size` is
+/// multiplied by `scale` before the lengths are compared.
+///
+/// ⛔ A ROW WITH A `-1` IN IT CAN THEREFORE ONLY MATCH AT `scale == 1`. `pack12`'s pad would demand
+/// `-1 * 2 + 0 == -2` at 4-bit elements, and [`check_validity_of_pack_and_shuffle_lowering`] refuses
+/// any index below `-1` before this is ever called — so the pads are not "expanded", they simply
+/// stop the widening. Nothing in the reference says so; the arithmetic does.
+///
+/// ⛔ AND THE CHECKSUM FILTER IS GATED ON `scale == 1` FOR THE SAME REASON. `indices_sum` compares
+/// against a sum taken at the row's own width; at `scale > 1` the list is longer and its sum is
+/// larger, so the filter is skipped rather than scaled (`:400`) — a fast path only, since the
+/// per-lane loop decides.
+///
+/// # ⛔ `element_bit_width` IS THE **RESULT** ELEMENT'S WIDTH, AND ITS ONLY CALLER SAYS SO
+///
+/// `getMergeTypeFromIndices(indices, repetition, pack_op.getSignExtend(),
+/// dataflow::utils::getElementTypeBitWidth(pack_op.getResult().getType()))`
+/// (`VectorChainToSentientPESFP.cpp:703-707`) — reached only when NEITHER operand comes from a
+/// `vectorchain.cast` (`:697-707`); with casts it is `getGCVTorFCVTTypeFromIndicesAndCastInputs`
+/// (entry 277) instead. ⭐ AND THAT CALL SITE ALSO SETS `op_info.compute_precision_ = "none"`,
+/// because *"MERGE/PACK instructions are bitwise operations"* (`:700-702`) — the precision belongs to
+/// the caller's own port and not to this answer.
+///
+/// # THE ONE STOP THIS PORT ADDS
+///
+/// ⛔ `element_bit_width == 0` DIVIDES BY ZERO AT `:396`. `unsigned` there, and nothing on the path
+/// excludes it: `getElementTypeBitWidth` of a zero-width element would reach the first row with
+/// `0 > 2` false and then divide. A vector of zero-bit elements is not a pack this lowering can name,
+/// so it answers `None` — the reference would trap.
+#[must_use]
+pub fn merge_type_from_indices(
+    indices: &ValidPackIndices<'_>,
+    sign_extend: bool,
+    element_bit_width: Bits,
+) -> Option<MergeOrPack> {
+    // ⛔ THE DIVISOR — see this function's last note.
+    if element_bit_width.0 == 0 {
+        return None;
+    }
+
+    let repetition = indices.repetition().count();
+    let indices = indices.indices();
+
+    // `int indices_sum = 0; for (auto index : indices) indices_sum += index;`
+    let indices_sum: i32 = indices.iter().sum();
+
+    for inst in merge_and_pack_insts() {
+        // `if (element_bit_width > merge_and_pack_inst.element_bit_width) continue;` — a row cannot
+        // be narrowed, only widened.
+        if element_bit_width.0 > inst.element_bit_width().0 {
+            continue;
+        }
+
+        // `int scale = merge_and_pack_inst.element_bit_width / element_bit_width;` — ⛔ TRUNCATING,
+        // and the reference's own division: an element width that does not divide the row's (a
+        // 3-bit element against a 16-bit row) gives 5, and the length test below then rejects it.
+        let scale = (inst.element_bit_width().0 / element_bit_width.0) as usize;
+
+        // `if (indices.size() != merge_and_pack_inst.size * scale) continue;`
+        if indices.len() != inst.size() * scale {
+            continue;
+        }
+
+        // `if (repetition != merge_and_pack_inst.repetition) continue;`
+        if repetition != inst.repetition() {
+            continue;
+        }
+
+        // `if (scale == 1 && indices_sum != merge_and_pack_inst.sum) continue;`
+        if scale == 1 && indices_sum != inst.sum() {
+            continue;
+        }
+
+        // The per-lane comparison — `found` starts true and both loops stop at the first mismatch.
+        // ⭐ THE CASTS ARE EXACT: `scale` is at most sixteen — the widest row divided by a
+        // one-bit element — and `j` is below it.
+        let scale_step = scale as i32;
+        let mut found = true;
+        for i in 0..inst.size() {
+            for j in 0..scale {
+                if indices[i * scale + j] != inst.vec()[i] * scale_step + j as i32 {
+                    found = false;
+                    break;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+
+        // `if (found && merge_and_pack_inst.sign_extend == sign_extend) return inst.name_;`
+        if found && inst.sign_extend() == sign_extend {
+            return Some(inst.name());
+        }
+    }
+
+    // `return "";` — no instruction implements this permutation.
+    None
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        MergeAndPack, MergeOrPack, MinOrMaxFusion, compute_precision_of_op,
-        fuse_compare_and_select_into_min_or_max, has_constant_bounds, input_precision_from_operand,
-        is_sentient_binary_logical_op, precision_in_string, redefine_constant_vectors,
-        reset_sentient_fmas_if_exists, result_precision_from_operands,
+        MergeAndPack, MergeOrPack, MinOrMaxFusion, PackOrShuffle, PackRepetition, SliceMask,
+        check_validity_of_pack_and_shuffle_lowering, compute_precision_of_op,
+        fuse_compare_and_select_into_min_or_max, get_mask_value_constant_for_non_pt,
+        has_constant_bounds, input_precision_from_operand, is_sentient_binary_logical_op,
+        merge_and_pack_insts, merge_type_from_indices, precision_in_string,
+        redefine_constant_vectors, reset_sentient_fmas_if_exists, result_precision_from_operands,
         vector_binary_to_sentient_binary,
         vector_element_wise_compare_operator_to_sentient_binary_operator,
         vector_ternary_to_sentient_ternary, vector_type_of,
@@ -1841,7 +2720,7 @@ mod unit_tests {
     fn dense_zero(result: u32) -> DfirOp {
         DfirOp::Arith(dfir_op::arith::Op::DenseConstant {
             result: Val(result),
-            one: false,
+            splat: 0,
             ty: f16x64(),
         })
     }
@@ -2421,5 +3300,451 @@ mod unit_tests {
             sen::TernaryOp::Select
         );
         assert_eq!(sen::TernaryOp::Select.spelling(), "select");
+    }
+
+    // ═══════════════════════════════════════ 163 ═══════════════════════════════════════
+
+    /// `affine_set<(d0) : (d0 - lb >= 0, -d0 + ub >= 0)>` — the ONE shape every `mask_set` in the
+    /// authority tree's 825 `.mlir` files is written in.
+    fn lane_span(lb: i64, ub: i64) -> IntegerSet {
+        IntegerSet {
+            dims: 1,
+            symbols: 0,
+            constraints: vec![
+                Constraint {
+                    expr: AffineExpr::dim(0).plus(AffineExpr::Const(-lb)),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(ub)),
+                    is_equality: false,
+                },
+            ],
+        }
+    }
+
+    /// `vectorchain.create_affine_mask %param {mask_set = #set} : ty` — the written-out form.
+    fn mask_set_op(mask_set: IntegerSet, mask_parameter: Option<Val>, ty: Vector) -> vc::Op {
+        vc::Op::CreateAffineMaskSet {
+            result: Val(20),
+            mask_set,
+            mask_parameter,
+            ty,
+        }
+    }
+
+    /// The mask value, as the emitted `sentient.scalar_constant` would carry it.
+    fn non_pt_mask(op: &vc::Op) -> Option<u32> {
+        get_mask_value_constant_for_non_pt::<Target>(op).map(SliceMask::bits)
+    }
+
+    /// ⭐ 163/384 — THE ALL-LANES-LIVE MASK MASKS NO SLICE, over two widths and both island forms.
+    ///
+    /// `#set = affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` on a `vector<64xi1>`
+    /// (`dcc/test/Conversion/VectorChainToSentientPESFP/fnms_with_cast.mlir:20`, `:30`) lowers to
+    /// `sentient.scalar_constant {value = 0 : si64}` (`:11`), and `fold_mode_df.mlir:92` writes THE
+    /// SAME SET over a `vector<128xi1>` for the same answer (`:26`, `:29`) — one is `Lb 64 > Ub 63`
+    /// at eight lanes a slice, the other at sixteen, and an empty range is zero either way.
+    #[test]
+    fn a_live_mask_masks_no_slice() {
+        let sixty_four = mask_set_op(lane_span(64, 63), None, mask_ty());
+        assert_eq!(non_pt_mask(&sixty_four), Some(0));
+
+        let one_twenty_eight = mask_set_op(lane_span(64, 63), None, vec(128, ElemType::Int(1)));
+        assert_eq!(non_pt_mask(&one_twenty_eight), Some(0));
+
+        // The prefix form states the same set — [`vc::LaneMask::as_set`].
+        let prefix = vc::Op::CreateAffineMask {
+            result: Val(20),
+            mask: vc::LaneMask::prefix_of(64, mask_ty()),
+        };
+        assert_eq!(non_pt_mask(&prefix), Some(0));
+    }
+
+    /// ⭐ 163/384 — THE MASK PARAMETER IS IGNORED HERE, WHICH IS THE ASYMMETRY WITH THE PT.
+    ///
+    /// `%19 = vectorchain.create_affine_mask %c0 {mask_set = #set2} : vector<128xi1>`
+    /// (`fold_mode_df.mlir:92`) carries a parameter AND is lowered by the PE/SFP path, whose
+    /// `CHECK-SENT-IR` is the same `{value = 0 : si64}` — entry 089 would fold `%c0` into the set's
+    /// symbol first, and this side never looks at it.
+    #[test]
+    fn the_mask_parameter_is_not_read() {
+        let with_parameter =
+            mask_set_op(lane_span(64, 63), Some(Val(9)), vec(128, ElemType::Int(1)));
+        assert_eq!(non_pt_mask(&with_parameter), Some(0));
+    }
+
+    /// 🎯 DERIVED — ONE BIT PER MASKED SLICE, and the PT's answer for the same mask is a COUNT.
+    ///
+    /// ⚠️ NO VENDOR CASE: every non-PT `mask_set` in the authority tree is the all-lanes-live shape
+    /// above, so these come from the arithmetic at `VectorChainHelper.cpp:130-131`. Sixteen live
+    /// lanes of 64 leaves slices 2..=7 masked (`0b1111_1100`); a mask that turns off the whole stick
+    /// is `0b1111_1111`; and 48 live of 64 — the set IBM writes as `#set2` on the PT, where the
+    /// answer is *two columns* (`dynamic_pt_masking.mlir:86`) — is slices 6 and 7 here.
+    #[test]
+    fn each_masked_slice_is_one_bit() {
+        assert_eq!(
+            non_pt_mask(&mask_set_op(lane_span(16, 63), None, mask_ty())),
+            Some(0b1111_1100)
+        );
+        assert_eq!(
+            non_pt_mask(&mask_set_op(lane_span(0, 63), None, mask_ty())),
+            Some(0b1111_1111)
+        );
+        assert_eq!(
+            non_pt_mask(&mask_set_op(lane_span(48, 63), None, mask_ty())),
+            Some(0b1100_0000)
+        );
+        // The prefix form of that last one, through [`vc::LaneMask::as_set`].
+        let prefix = vc::Op::CreateAffineMask {
+            result: Val(20),
+            mask: vc::LaneMask::prefix_of(48, mask_ty()),
+        };
+        assert_eq!(non_pt_mask(&prefix), Some(0b1100_0000));
+    }
+
+    /// 🎯 DERIVED — A NEGATIVE FIRST SLICE IS THE REFERENCE'S UNSIGNED WRAP, whose observable result
+    /// is an empty loop: `from_slice - 1` under `unsigned` becomes huge and `i <= to_slice` is false
+    /// at once (`VectorChainHelper.cpp:130-131`).
+    #[test]
+    fn a_negative_first_slice_masks_nothing() {
+        assert_eq!(
+            non_pt_mask(&mask_set_op(lane_span(-8, 63), None, mask_ty())),
+            Some(0)
+        );
+    }
+
+    /// 🎯 THE FOUR REFUSALS AND THE ONE STOP THIS PORT ADDS.
+    ///
+    /// ⚠️ DERIVED — the reference reaches each of these with an `emitOpError`, and no fixture does.
+    #[test]
+    fn a_mask_this_lowering_cannot_read_is_declined() {
+        // "Mask affine set has to have one dimension." — two dims.
+        let two_dims = IntegerSet {
+            dims: 2,
+            symbols: 0,
+            constraints: lane_span(64, 63).constraints,
+        };
+        assert_eq!(non_pt_mask(&mask_set_op(two_dims, None, mask_ty())), None);
+
+        // "Mask affine set should not have any symbols" — ⛔ WHERE A DYNAMIC MASK STOPS on this side.
+        let symbolic = IntegerSet {
+            dims: 1,
+            symbols: 1,
+            constraints: lane_span(64, 63).constraints,
+        };
+        assert_eq!(non_pt_mask(&mask_set_op(symbolic, None, mask_ty())), None);
+
+        // "Mask affine set has to have constant bounds." — one-sided, so entry 063 answers false.
+        let one_sided = IntegerSet {
+            dims: 1,
+            symbols: 0,
+            constraints: vec![Constraint {
+                expr: AffineExpr::dim(0).plus(AffineExpr::Const(-64)),
+                is_equality: false,
+            }],
+        };
+        assert!(!has_constant_bounds(&one_sided));
+        assert_eq!(non_pt_mask(&mask_set_op(one_sided, None, mask_ty())), None);
+
+        // `DT_CHECK(dim / sys_def.numSlicesPerStick > 0)` — fewer lanes than a stick has slices.
+        assert_eq!(
+            non_pt_mask(&mask_set_op(
+                lane_span(0, 3),
+                None,
+                vec(4, ElemType::Int(1))
+            )),
+            None
+        );
+
+        // ⛔ THE STOP THIS PORT ADDS — `1 << to_slice` past the eight-bit slice mask. Twelve lanes
+        // give one lane a slice, so the last slice is 11 and the reference shifts out of range.
+        assert_eq!(
+            non_pt_mask(&mask_set_op(
+                lane_span(0, 11),
+                None,
+                vec(12, ElemType::Int(1))
+            )),
+            None
+        );
+
+        // Anything but the two mask forms has no `mask_set` at all.
+        assert_eq!(
+            non_pt_mask(&vc::Op::Rotate {
+                result: Val(20),
+                input: Val(19),
+                position: Val(18),
+                right_shift: true,
+                input_ty: mask_ty(),
+                ty: mask_ty(),
+            }),
+            None
+        );
+    }
+
+    // ═══════════════════════════════════════ 164-165 ═══════════════════════════════════════
+
+    /// THE THIRTY-FOUR PACKS OF `dcc/test/SFP/merge_and_pack.mlir:161-266`, each with the
+    /// `binary_operator` its `CHECK-SENT-IR` names — in file order, which is the answer key for
+    /// BOTH entries: every one has to pass entry 164 and then name its instruction through entry 165.
+    ///
+    /// ⛔ THE 24TH ROW IS THE POINT. The file's `%pack16` is written with `pack0`'s own indices and
+    /// the reference answers `pack0`, because the scan returns the first match and the table has
+    /// `pack0` eight rows earlier.
+    ///
+    /// One row per line is the whole point of a key, so `rustfmt` is held off this one.
+    #[rustfmt::skip]
+    fn merge_and_pack_key() -> Vec<(MergeOrPack, Vec<i32>, u32, bool)> {
+        let merge = |width: sen::MergeWidth, high: bool| MergeOrPack::Merge { width, high };
+        let pack = MergeOrPack::Pack;
+        vec![
+            (merge(sen::MergeWidth::W8, true), vec![1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31], 8, false),
+            (merge(sen::MergeWidth::W8, false), vec![0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30], 8, false),
+            (pack(sen::PackIndex::P25), vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30], 8, false),
+            (pack(sen::PackIndex::P26), vec![0, 2, 4, 6, 16, 18, 20, 22, 8, 10, 12, 14, 24, 26, 28, 30], 8, false),
+            (pack(sen::PackIndex::P27), vec![0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30], 8, false),
+            (pack(sen::PackIndex::P12), vec![0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1], 8, false),
+            (pack(sen::PackIndex::P13), vec![8, -1, 9, -1, 10, -1, 11, -1, 12, -1, 13, -1, 14, -1, 15, -1], 8, false),
+            (pack(sen::PackIndex::P14), vec![0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1], 8, true),
+            (pack(sen::PackIndex::P15), vec![8, -1, 9, -1, 10, -1, 11, -1, 12, -1, 13, -1, 14, -1, 15, -1], 8, true),
+            (merge(sen::MergeWidth::W16, true), vec![1, 9, 3, 11, 5, 13, 7, 15], 16, false),
+            (merge(sen::MergeWidth::W16, false), vec![0, 8, 2, 10, 4, 12, 6, 14], 16, false),
+            (merge(sen::MergeWidth::W32, true), vec![2, 3, 10, 11, 6, 7, 14, 15], 16, false),
+            (merge(sen::MergeWidth::W32, false), vec![0, 1, 8, 9, 4, 5, 12, 13], 16, false),
+            (merge(sen::MergeWidth::W64, true), vec![4, 5, 6, 7, 12, 13, 14, 15], 16, false),
+            (merge(sen::MergeWidth::W64, false), vec![0, 1, 2, 3, 8, 9, 10, 11], 16, false),
+            (pack(sen::PackIndex::P0), vec![0, 1, 2, 3, 4, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P1), vec![15, 1, 2, 3, 4, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P2), vec![14, 15, 2, 3, 4, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P3), vec![13, 14, 15, 3, 4, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P4), vec![12, 13, 14, 15, 4, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P5), vec![11, 12, 13, 14, 15, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P6), vec![10, 11, 12, 13, 14, 15, 6, 7], 16, false),
+            (pack(sen::PackIndex::P7), vec![9, 10, 11, 12, 13, 14, 15, 7], 16, false),
+            // `%pack16` in, `pack0` out — `merge_and_pack.mlir:232` against the 24th
+            // `binary_operator` of its `CHECK-SENT-IR`.
+            (pack(sen::PackIndex::P0), vec![0, 1, 2, 3, 4, 5, 6, 7], 16, false),
+            (pack(sen::PackIndex::P17), vec![8, 0, 1, 2, 3, 4, 5, 6], 16, false),
+            (pack(sen::PackIndex::P18), vec![8, 9, 0, 1, 2, 3, 4, 5], 16, false),
+            (pack(sen::PackIndex::P19), vec![8, 9, 10, 0, 1, 2, 3, 4], 16, false),
+            (pack(sen::PackIndex::P20), vec![8, 9, 10, 11, 0, 1, 2, 3], 16, false),
+            (pack(sen::PackIndex::P21), vec![8, 9, 10, 11, 12, 0, 1, 2], 16, false),
+            (pack(sen::PackIndex::P22), vec![8, 9, 10, 11, 12, 13, 0, 1], 16, false),
+            (pack(sen::PackIndex::P23), vec![8, 9, 10, 11, 12, 13, 14, 0], 16, false),
+            (pack(sen::PackIndex::P8), vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 4, false),
+            (pack(sen::PackIndex::P9), vec![0, 32, -1, -1, 4, 36, -1, -1, 8, 40, -1, -1, 12, 44, -1, -1, 16, 48, -1, -1, 20, 52, -1, -1, 24, 56, -1, -1, 28, 60, -1, -1], 4, false),
+            (pack(sen::PackIndex::P24), vec![0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 2, false),
+        ]
+    }
+
+    /// `vectorchain.pack %x, %z {indices, repetition = 8 : index, sign_extend} : t, t, t` — every
+    /// fixture of `merge_and_pack.mlir` is a full stick of `bits`-wide elements.
+    fn pack_op(indices: Vec<i32>, bits: u32, sign_extend: bool) -> vc::Op {
+        let ty = vec(1024 / u64::from(bits), ElemType::Int(bits));
+        vc::Op::Pack {
+            result: Val(50),
+            op1: Val(48),
+            op2: Val(49),
+            mask: None,
+            indices,
+            repetition: 8,
+            sign_extend,
+            operand_ty: ty,
+            ty,
+        }
+    }
+
+    /// ⭐ 164/384 + 165/384 — THE WHOLE ANSWER KEY: all thirty-four packs of
+    /// `dcc/test/SFP/merge_and_pack.mlir` pass the validity check and name the instruction their
+    /// `CHECK-SENT-IR` says, `%pack16 → pack0` included.
+    #[test]
+    fn every_vendor_pack_names_its_instruction() {
+        for (expected, indices, bits, sign_extend) in merge_and_pack_key() {
+            let op = pack_op(indices.clone(), bits, sign_extend);
+            let witness = PackOrShuffle::of(&op).expect("a pack is one");
+            let valid = check_validity_of_pack_and_shuffle_lowering(witness)
+                .unwrap_or_else(|| panic!("{expected:?} {indices:?} was refused"));
+            assert_eq!(valid.indices(), indices.as_slice());
+            assert_eq!(valid.repetition(), PackRepetition::Eight);
+            assert_eq!(
+                merge_type_from_indices(&valid, sign_extend, Bits(bits)),
+                Some(expected),
+                "{indices:?} at {bits} bits"
+            );
+        }
+    }
+
+    /// ⭐ 165/384 — `sign_extend` IS THE WHOLE DIFFERENCE BETWEEN TWO PAIRS OF ROWS. `pack12` and
+    /// `pack14` share their indices and their width (`merge_and_pack.mlir:176`, `:182`), so asking
+    /// for the wrong one finds neither `pack12` nor anything else.
+    #[test]
+    fn the_sign_extending_twins_are_not_interchangeable() {
+        let pack12 = vec![0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1];
+        let op = pack_op(pack12, 8, false);
+        let valid = check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&op).unwrap())
+            .expect("valid");
+
+        assert_eq!(
+            merge_type_from_indices(&valid, false, Bits(8)),
+            Some(MergeOrPack::Pack(sen::PackIndex::P12))
+        );
+        assert_eq!(
+            merge_type_from_indices(&valid, true, Bits(8)),
+            Some(MergeOrPack::Pack(sen::PackIndex::P14))
+        );
+    }
+
+    /// 🎯 THE FOUR REFUSALS OF ENTRY 164, and the one it deliberately lets through.
+    ///
+    /// ⚠️ DERIVED — no fixture is refused; each of these is an `emitError` in the reference.
+    #[test]
+    fn an_unlowerable_pack_is_refused() {
+        let ok = vec![0, 1, 2, 3, 4, 5, 6, 7];
+
+        // `!is_any_of(repetition, 4, 8)`.
+        let mut two = pack_op(ok.clone(), 16, false);
+        if let vc::Op::Pack { repetition, .. } = &mut two {
+            *repetition = 2;
+        }
+        assert_eq!(
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&two).unwrap()),
+            None
+        );
+        assert_eq!(PackRepetition::of(2), None);
+
+        // "Indices should be integers >= -1".
+        let minus_two = pack_op(vec![0, 1, 2, 3, 4, 5, 6, -2], 16, false);
+        assert_eq!(
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&minus_two).unwrap()),
+            None
+        );
+
+        // `repetition * indices.size() != vec_size` — eight indices, eight repetitions, but the
+        // sixteen-bit stick holds sixty-four lanes and this one says it holds a hundred and twenty
+        // eight.
+        let mut wrong_width = pack_op(ok.clone(), 16, false);
+        if let vc::Op::Pack { ty, .. } = &mut wrong_width {
+            ty.len = 128;
+        }
+        assert_eq!(
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&wrong_width).unwrap()),
+            None
+        );
+
+        // ⛔ `index > 2 * (int)indices.size()` IS STRICTLY GREATER, so sixteen passes for eight
+        // indices and seventeen does not — reproduced, not tightened. Neither names an instruction.
+        let at_the_bound = pack_op(vec![16, 1, 2, 3, 4, 5, 6, 7], 16, false);
+        let admitted =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&at_the_bound).unwrap())
+                .expect("2 * size is admitted");
+        assert_eq!(merge_type_from_indices(&admitted, false, Bits(16)), None);
+
+        let past_it = pack_op(vec![17, 1, 2, 3, 4, 5, 6, 7], 16, false);
+        assert_eq!(
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&past_it).unwrap()),
+            None
+        );
+
+        // Neither a pack nor a shuffle.
+        assert!(
+            PackOrShuffle::of(&vc::Op::CreateAffineMask {
+                result: Val(20),
+                mask: vc::LaneMask::prefix_of(64, mask_ty()),
+            })
+            .is_none()
+        );
+    }
+
+    /// ⭐ 164/384 + 165/384 — A REPETITION OF FOUR IS VALID AND NAMES NOTHING IN THIS TABLE. It is a
+    /// GCVT/FCVT shuffle's number, taken by entry 277 instead
+    /// (`VectorChainToSentientPESFP.cpp:633-641`).
+    #[test]
+    fn a_repetition_of_four_is_valid_and_matches_no_row() {
+        let ty = f16x64();
+        let shuffle = vc::Op::Shuffle {
+            result: Val(44),
+            input: Val(43),
+            indices: (0..16).collect(),
+            repetition: 4,
+            input_ty: ty,
+            ty,
+        };
+
+        let valid =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&shuffle).unwrap())
+                .expect("four is one of the two accepted repetitions");
+        assert_eq!(valid.repetition(), PackRepetition::Four);
+        assert_eq!(merge_type_from_indices(&valid, false, Bits(16)), None);
+        assert!(
+            merge_and_pack_insts()
+                .iter()
+                .all(|inst| inst.repetition() == 8)
+        );
+    }
+
+    /// ⭐ 165/384 — THE TABLE IS THIRTY-FOUR ROWS AND ITS ORDER IS THE ANSWER. `pack16` sits eight
+    /// rows behind an identical `pack0` (`VectorChainHelper.cpp:374`, `:383`), so nothing can reach
+    /// it — which is why the vendor's own `%pack16` lowers to `pack0`.
+    #[test]
+    fn the_table_is_ordered_and_pack16_is_unreachable() {
+        let insts = merge_and_pack_insts();
+        assert_eq!(insts.len(), 34);
+
+        let pack0 = &insts[18];
+        let pack16 = &insts[26];
+        assert_eq!(pack0.name(), MergeOrPack::Pack(sen::PackIndex::P0));
+        assert_eq!(pack16.name(), MergeOrPack::Pack(sen::PackIndex::P16));
+        assert_eq!(pack0.vec(), pack16.vec());
+        assert_eq!(pack0.element_bit_width(), pack16.element_bit_width());
+        assert_eq!(pack0.sign_extend(), pack16.sign_extend());
+
+        // `pack24`'s checksum counts its forty-eight pads: 960 - 48.
+        assert_eq!(insts[0].name(), MergeOrPack::Pack(sen::PackIndex::P24));
+        assert_eq!(insts[0].sum(), 912);
+        assert_eq!(insts[0].size(), 64);
+    }
+
+    /// 🎯 DERIVED — A NARROWER ELEMENT REACHES THE SAME ROW `scale` LANES AT A TIME.
+    ///
+    /// ⚠️ NO VENDOR CASE: every fixture states its permutation at the row's own width. `merge32l`'s
+    /// `{0, 1, 8, 9, 4, 5, 12, 13}` is written for sixteen-bit elements, and the inner loop at
+    /// `VectorChainHelper.cpp:402-408` makes the same instruction name the eight-bit permutation that
+    /// moves those halves in pairs. ⛔ AND A ROW WITH A PAD CANNOT WIDEN — `pack12` at scale two
+    /// would demand an index of `-2`, which entry 164 refuses outright.
+    #[test]
+    fn a_row_widens_by_its_scale() {
+        let paired = vec![0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 27];
+        let op = pack_op(paired, 8, false);
+        let valid =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&op).unwrap()).unwrap();
+
+        assert_eq!(
+            merge_type_from_indices(&valid, false, Bits(8)),
+            Some(MergeOrPack::Merge {
+                width: sen::MergeWidth::W32,
+                high: false
+            })
+        );
+
+        // The same list one lane out names nothing at all.
+        let wrong = pack_op(
+            vec![0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 28],
+            8,
+            false,
+        );
+        let valid_wrong =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&wrong).unwrap())
+                .unwrap();
+        assert_eq!(merge_type_from_indices(&valid_wrong, false, Bits(8)), None);
+    }
+
+    /// 🎯 A ZERO ELEMENT WIDTH IS THE ONE STOP THIS PORT ADDS TO ENTRY 165 — `scale` divides by it
+    /// (`VectorChainHelper.cpp:396`).
+    #[test]
+    fn a_zero_element_width_names_nothing() {
+        let op = pack_op(vec![0, 1, 2, 3, 4, 5, 6, 7], 16, false);
+        let valid =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&op).unwrap()).unwrap();
+        assert_eq!(merge_type_from_indices(&valid, false, Bits(0)), None);
     }
 }

@@ -371,6 +371,7 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
         | DfirOp::Dataflow(
             dataflow::Op::GetUnit { .. }
             | dataflow::Op::GetLocalUnit { .. }
+            | dataflow::Op::CreateGroup { .. }
             | dataflow::Op::GetLogicalMemoryView { .. }
             | dataflow::Op::GetPagedLogicalMemoryView { .. }
             | dataflow::Op::ProgramUnit { .. },
