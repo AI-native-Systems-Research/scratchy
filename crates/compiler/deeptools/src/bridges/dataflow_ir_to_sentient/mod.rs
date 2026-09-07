@@ -201,6 +201,7 @@ fn program<A: Arch, M: Model, W: Workload>(
                 result,
                 residency,
                 unit,
+                num_folds,
             }) => {
                 // ⛔⛔ THE `constant` UNIT IS DROPPED. The input binds seven units and the golden
                 // holds six: `C0-constant-CL0` is gone. It is a pseudo-unit naming where immediates
@@ -215,6 +216,7 @@ fn program<A: Arch, M: Model, W: Workload>(
                     result: fresh,
                     residency: *residency,
                     unit: *unit,
+                    num_folds: *num_folds,
                 }));
             }
             // ⛔ VIEWS ARE RECORDED, NOT EMITTED — see [`Bound`].

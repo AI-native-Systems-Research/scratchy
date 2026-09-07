@@ -397,6 +397,16 @@ pub enum Op {
         residency: crate::units::Residency,
         /// `type=`.
         unit: crate::units::DfirUnit,
+        /// `num_folds=`, or [`None`] for an op that carries no such attribute.
+        ///
+        /// ⛔ AN [`Option`] BECAUSE ONE WRITER IN THE TREE SETS IT AND NOTHING ELSE DOES:
+        /// `UnitFilteringPass::cleanup` rebuilds a `get_unit` with
+        /// `setAttr("num_folds", getI32IntegerAttr(new_num_folds))` (`UnitFiltering.cpp:296-297`),
+        /// which is the only `setAttr` of it in `dcc/src`. Every other producer — the materializer
+        /// among them — writes a `get_unit` without one, and the vendor's own hand-written PT input
+        /// carries `num_folds = 1 : i32` (`dcc/test/PT/fp8-bmm-1p5.mlir:104`). A mandatory field
+        /// would print the attribute on ops the reference prints bare.
+        num_folds: Option<crate::units::NumFolds>,
     },
 
     /// `dataflow.get_local_unit %unit {name} : index` — a register file of a unit already held.
@@ -562,6 +572,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             result,
             residency,
             unit,
+            num_folds,
         } => {
             use crate::units::Residency;
 
@@ -590,9 +601,16 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                     format!("C{}-{spelling}-CL{}", core.get(), corelet.get()),
                 ),
             };
+            // ⛔ `num_folds` SITS BETWEEN `name` AND `type`, which is where alphabetical order
+            // puts it: `{core = 0 : i32, corelet = 0 : i32, name = "ptrow0-CL0",
+            // num_folds = 1 : i32, type = "ptrow0"}` (`dcc/test/PT/fp8-bmm-1p5.mlir:104`).
+            let folds = match num_folds {
+                Some(folds) => format!("num_folds = {} : i32, ", folds.0),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", type = \"{spelling}\"}} : index",
+                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}type = \"{spelling}\"}} : index",
                 print::val(*result),
             );
         }
@@ -875,6 +893,7 @@ mod tests {
                 result: Val(next),
                 residency,
                 unit,
+                num_folds: None,
             });
             next += 1;
             ops.push(op);

@@ -2335,6 +2335,7 @@ mod unit_tests {
                     corelet: Corelet::checked(0).expect("the arch has corelet 0"),
                 },
                 unit: DfirUnit::Lx,
+                num_folds: None,
             }),
             xrf_view(Val(45), Val(81)),
         ];

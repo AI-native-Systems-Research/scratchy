@@ -67,8 +67,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, agen, dataflow, defining_op};
-use crate::units::{Core, Corelet, Residency};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, regions, regions_mut, uniform, uses,
+};
+use crate::units::{Core, Corelet, NumFolds, Residency};
 
 /// WHICH FOLD A UNIT HANDLE IS THE INSTANCE OF — `dyn_cast<OpResult>(unit).getResultNumber()`
 /// (`UnitFiltering.cpp:245`).
@@ -123,6 +126,12 @@ impl<T: Ord> Only<T> {
     #[must_use]
     pub fn keeps(&self, id: &T) -> bool {
         self.0.contains(id)
+    }
+
+    /// The ids it names, ascending — `for (auto fold_id : filter_folds_except_)` (`:285`), which
+    /// entry 204 counts rather than tests. ⭐ A `std::set` iterates sorted; so does a [`BTreeSet`].
+    pub fn ids(&self) -> impl Iterator<Item = &T> {
+        self.0.iter()
     }
 }
 
@@ -203,6 +212,47 @@ const fn corelet_id(residency: Residency) -> Option<Corelet> {
     }
 }
 
+/// THE THREE-CLAUSE FILTER TEST — `UnitFiltering.cpp:250-255` (entry 140) and `:186-191`
+/// (entry 203), character for character in the reference and once here.
+///
+/// ⛔ -1 IS NOT A CORE AND IT IS IN NO FILTER SET, so a non-empty core filter erases a core-less
+/// unit; the corelet clause's `corelet_id != -1` guard is the OPPOSITE — an absent corelet survives.
+/// See [`UnitFilters`] and [`corelet_id`].
+fn unit_is_filtered_out(unit: Val, scope: &[DfirOp], filters: &UnitFilters) -> bool {
+    // `dyn_cast<OpResult>(unit).getResultNumber()` and
+    // `dyn_cast<GetUnitOp>(unit.getDefiningOp())`, together.
+    let Some((fold_id, residency)) = unit_bound_by(unit, scope) else {
+        // Not a `get_unit` result — see [`unit_bound_by`]. Kept.
+        return false;
+    };
+
+    // `!filter_folds_except_.empty() && filter_folds_except_.count(fold_id) == 0`.
+    let wrong_fold = filters
+        .folds
+        .as_ref()
+        .is_some_and(|only| !only.keeps(&fold_id));
+    // `!filter_cores_except_.empty() && filter_cores_except_.count(core_id) == 0`, where a core-less
+    // unit's `core_id` is -1 and no set holds it.
+    let wrong_core = filters
+        .cores
+        .as_ref()
+        .is_some_and(|only| match residency.core() {
+            Some(core) => !only.keeps(&core),
+            None => true,
+        });
+    // `!filter_corelets_except_.empty() && corelet_id != -1 &&
+    //  filter_corelets_except_.count(corelet_id) == 0`.
+    let wrong_corelet = filters
+        .corelets
+        .as_ref()
+        .is_some_and(|only| match corelet_id(residency) {
+            Some(corelet) => !only.keeps(&corelet),
+            None => false,
+        });
+
+    wrong_fold || wrong_core || wrong_corelet
+}
+
 /// Replaces: e140_removeCoresCoreletsFoldsFromProgramUnit
 ///
 /// **140/384** `UnitFilteringPass::removeCoresCoreletsFoldsFromProgramUnit` —
@@ -274,42 +324,8 @@ pub fn remove_cores_corelets_folds_from_program_unit(
     scope: &[DfirOp],
     filters: &UnitFilters,
 ) {
-    units.retain(|unit| {
-        // `dyn_cast<OpResult>(unit).getResultNumber()` and
-        // `dyn_cast<GetUnitOp>(unit.getDefiningOp())`, together.
-        let Some((fold_id, residency)) = unit_bound_by(*unit, scope) else {
-            // Not a `get_unit` result — see [`unit_bound_by`]. Kept.
-            return true;
-        };
-
-        // `!filter_folds_except_.empty() && filter_folds_except_.count(fold_id) == 0`.
-        let wrong_fold = filters
-            .folds
-            .as_ref()
-            .is_some_and(|only| !only.keeps(&fold_id));
-        // `!filter_cores_except_.empty() && filter_cores_except_.count(core_id) == 0`, where a
-        // core-less unit's `core_id` is -1 and no set holds it.
-        let wrong_core = filters
-            .cores
-            .as_ref()
-            .is_some_and(|only| match residency.core() {
-                Some(core) => !only.keeps(&core),
-                None => true,
-            });
-        // `!filter_corelets_except_.empty() && corelet_id != -1 &&
-        //  filter_corelets_except_.count(corelet_id) == 0`.
-        let wrong_corelet =
-            filters
-                .corelets
-                .as_ref()
-                .is_some_and(|only| match corelet_id(residency) {
-                    Some(corelet) => !only.keeps(&corelet),
-                    None => false,
-                });
-
-        // `unit_op->eraseOperand(i)` for the units this keeps out.
-        !(wrong_fold || wrong_core || wrong_corelet)
-    });
+    // The three clauses are [`unit_is_filtered_out`]; `unit_op->eraseOperand(i)` is what this drops.
+    units.retain(|unit| !unit_is_filtered_out(*unit, scope, filters));
 }
 
 /// Replaces: e141_isDataTransfer
@@ -436,6 +452,7 @@ mod unit_tests {
                 corelet: corelet(0),
             },
             unit: DfirUnit::Lxlu,
+            num_folds: None,
         })
     }
 
@@ -493,6 +510,7 @@ mod unit_tests {
                 result: Val(101),
                 residency: Residency::Global,
                 unit: DfirUnit::Hbm,
+                num_folds: None,
             }),
         ];
         let mut units = vec![Val(100), Val(101)];
@@ -516,6 +534,7 @@ mod unit_tests {
             result: Val(100),
             residency: Residency::Scratchpad { core: core(0) },
             unit: DfirUnit::Lx,
+            num_folds: None,
         })];
         let mut units = vec![Val(100)];
         let filters = UnitFilters {
@@ -539,6 +558,7 @@ mod unit_tests {
             result: Val(100),
             residency: Residency::CoreWide { core: core(0) },
             unit: DfirUnit::L3lu,
+            num_folds: None,
         })];
         let mut units = vec![Val(100)];
         let filters = UnitFilters {
@@ -565,6 +585,7 @@ mod unit_tests {
                     corelet: corelet(1),
                 },
                 unit: DfirUnit::Lxlu,
+                num_folds: None,
             }),
         ];
         let mut units = vec![Val(100), Val(101)];
@@ -727,4 +748,333 @@ mod unit_tests {
             assert!(!is_data_transfer(op), "{op:?} is not in the isa<> list");
         }
     }
+
+    /// 🎯 203/384 — A REDUCED MAP IS REBUILT; A MAP NOTHING SURVIVES IS LEFT ALONE.
+    ///
+    /// ⛔ BOTH BRANCHES OF `if (!unit_list_is_reduced || new_keys.empty()) return;` ARE THE
+    /// ASSERTION. Rebuilding an empty map would leave a `uniform.def_immutable_mapping` with no keys
+    /// behind for a region this pass is about to delete whole (`:126-128`).
+    #[test]
+    fn a_reduced_map_is_rebuilt_and_an_emptied_one_is_left_alone() {
+        let scope = vec![lxlu_of_core(Val(100), 0), lxlu_of_core(Val(101), 1)];
+        let pairs = vec![(Val(100), Val(200)), (Val(101), Val(201))];
+        let mut vals = Values::default();
+        let filters = UnitFilters {
+            cores: Only::these(BTreeSet::from([core(0)])),
+            ..no_filters()
+        };
+
+        let reduced = remove_cores_corelets_folds_from_def_immut_map(
+            &mut vals,
+            Val(50),
+            &pairs,
+            &scope,
+            &filters,
+        )
+        .expect("core 1's key is filtered out, core 0's survives");
+        assert_eq!(Val(50), reduced.to_delete);
+        assert_eq!(
+            DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                result: reduced.map,
+                pairs: vec![(Val(100), Val(200))],
+            }),
+            reduced.op
+        );
+
+        // ⛔ AND THE TWO CASES THAT MUST NOT REBUILD: nothing filtered, and everything filtered.
+        assert!(
+            remove_cores_corelets_folds_from_def_immut_map(
+                &mut vals,
+                Val(50),
+                &pairs,
+                &scope,
+                &no_filters()
+            )
+            .is_none()
+        );
+        let no_core = UnitFilters {
+            cores: Only::these(BTreeSet::from([core(7)])),
+            ..no_filters()
+        };
+        assert!(
+            remove_cores_corelets_folds_from_def_immut_map(
+                &mut vals,
+                Val(50),
+                &pairs,
+                &scope,
+                &no_core
+            )
+            .is_none()
+        );
+    }
+
+    /// 🎯 204/384 — THE USE-EMPTY BINDERS GO, THE USED `get_unit` IS REBUILT WITH `num_folds`.
+    ///
+    /// ⛔ `num_folds = 1 : i32` IS THE WHOLE OBSERVABLE REBUILD in this island, so a port that
+    /// erased-and-recreated the op without setting the attribute would print the input back
+    /// unchanged and pass any test that only counted ops. ⭐ The group that is read survives; the one
+    /// nothing reads does not.
+    #[test]
+    fn use_empty_binders_are_erased_and_a_used_unit_is_rebuilt() {
+        let mut module = vec![
+            lxlu_of_core(Val(100), 0),
+            lxlu_of_core(Val(101), 1),
+            DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                result: Val(102),
+                unit_ids: vec![Val(100)],
+            }),
+            DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                result: Val(103),
+                unit_ids: vec![Val(100)],
+            }),
+            DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+                units: vec![Val(102)],
+                precision: None,
+                body: Vec::new(),
+            }),
+        ];
+        let filters = UnitFilters {
+            folds: Only::these(BTreeSet::from([FoldId::ZERO])),
+            ..no_filters()
+        };
+
+        cleanup(&mut module, &filters);
+
+        assert_eq!(
+            vec![
+                // ⭐ REBUILT: the same handle, name, type and residency, plus the attribute.
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(100),
+                    residency: Residency::Corelet {
+                        core: core(0),
+                        corelet: corelet(0),
+                    },
+                    unit: DfirUnit::Lxlu,
+                    num_folds: Some(NumFolds::ONE),
+                }),
+                // `%101` was read by nothing, `%103` by nothing; `%102` is read by the program unit.
+                DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                    result: Val(102),
+                    unit_ids: vec![Val(100)],
+                }),
+                DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+                    units: vec![Val(102)],
+                    precision: None,
+                    body: Vec::new(),
+                }),
+            ],
+            module
+        );
+    }
+
+    /// 🎯 205/384 — AN EMPTY TRANSFER FILTER KEEPS **NOTHING**, WHICH IS THE OPPOSITE OF THE OTHERS.
+    ///
+    /// ⛔ THE MISSING `!empty()` GUARD IS THE ASSERTION (`:327-337` has none). Reading this filter
+    /// like the fold/core/corelet ones would make every transfer in the module "to keep" on an
+    /// ordinary compile, and entry 263 would then preserve the whole program.
+    #[test]
+    fn only_a_named_transfer_in_a_non_empty_filter_is_kept() {
+        let named = DfirOp::Dataflow(dataflow::Op::Opaque(dataflow::Opaque {
+            func: OpaqueFunc::Reciprocal,
+            read_write: Vec::new(),
+            read_only: Vec::new(),
+            params: Vec::new(),
+            dbg_name: Some("copy-in".to_owned()),
+        }));
+        let filter = Only::these(BTreeSet::from(["copy-in".to_owned()]));
+
+        assert!(is_data_transfer_to_keep(&named, filter.as_ref()));
+        // ⛔ NO FILTER AT ALL KEEPS IT NO MORE THAN A FILTER THAT DOES NOT NAME IT.
+        assert!(!is_data_transfer_to_keep(&named, None));
+        // ⛔ AND A TRANSFER WITH NO `dbgName` IS NEVER KEPT — every `agen` access in this island.
+        let load = DfirOp::Agen(agen::Op::VectorLoad {
+            result: Val(30),
+            view: Val(10),
+            indices: vec![Index::Const(0)],
+            view_ty: MemRef {
+                shape: vec![64],
+                elem: ElemType::F16,
+            },
+            ty: LANES,
+        });
+        assert!(is_data_transfer(&load) && !is_data_transfer_to_keep(&load, filter.as_ref()));
+    }
+}
+
+/// THE MAP THIS PASS PUTS IN PLACE OF A FILTERED ONE — the `DefImmutableMappingOp::create` at
+/// `UnitFiltering.cpp:130-135` together with what the reference does to the old op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducedDefImmutMap {
+    /// The new `uniform.def_immutable_mapping`, carrying the surviving pairs.
+    pub op: DfirOp,
+    /// Its handle — `immutable_map.replaceAllUsesWith(new_immutable_map)` reads every use of the old
+    /// one through this.
+    pub map: Val,
+    /// `to_delete_.push_back(immutable_map)` — the old map's handle, erased at the end of the pass
+    /// (entry 296) rather than here.
+    pub to_delete: Val,
+}
+
+/// Replaces: e203_removeCoresCoreletsFoldsFromDefImmutMap
+///
+/// **203/384** `UnitFilteringPass::removeCoresCoreletsFoldsFromDefImmutMap` —
+/// `dcc/src/Transform/Dataflow/UnitFiltering.cpp:99` (37L).
+///
+/// ⛔ [`None`] IS "DO NOT MODIFY THE MAP" AND IT COVERS TWO CASES: nothing was filtered, or
+/// EVERYTHING was — "If all keys are to be filtered out, do not modify the map. Instead, the entire
+/// region should be deleted at the last step of this pass" (`:126-128`). ⚠️ `DT_CHECK(!values.empty())`
+/// has no counterpart: an empty map reduces nothing and takes the same [`None`].
+#[must_use]
+pub fn remove_cores_corelets_folds_from_def_immut_map(
+    vals: &mut Values,
+    map: Val,
+    pairs: &[(Val, Val)],
+    scope: &[DfirOp],
+    filters: &UnitFilters,
+) -> Option<ReducedDefImmutMap> {
+    // `std::vector<mlir::Value> new_keys; new_values;` / `bool unit_list_is_reduced = false;` — one
+    // list here, as [`uniform::Op::DefImmutableMapping`] holds them.
+    let mut new_pairs: Vec<(Val, Val)> = Vec::new();
+    let mut unit_list_is_reduced = false;
+
+    // `for (int i = 0; i < values.size(); ++i)`, whose key is the unit the three clauses judge.
+    for &(key, value) in pairs {
+        if unit_is_filtered_out(key, scope, filters) {
+            unit_list_is_reduced = true;
+            continue;
+        }
+        new_pairs.push((key, value));
+    }
+
+    // `if (!unit_list_is_reduced || new_keys.empty()) return;`
+    if !unit_list_is_reduced || new_pairs.is_empty() {
+        return None;
+    }
+
+    // `DefImmutableMappingOp::create(builder, loc, builder.getIndexType(), new_keys, new_values)`,
+    // then `replaceAllUsesWith` and `to_delete_.push_back(immutable_map)`.
+    let new_map = vals.mint();
+    Some(ReducedDefImmutMap {
+        op: DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+            result: new_map,
+            pairs: new_pairs,
+        }),
+        map: new_map,
+        to_delete: map,
+    })
+}
+
+/// Replaces: e204_cleanup
+///
+/// **204/384** `UnitFilteringPass::cleanup` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:263`
+/// (49L).
+///
+/// ⛔ THE REBUILD'S ONLY OBSERVABLE EFFECT HERE IS `num_folds`: this island's `get_unit` binds ONE
+/// result ([`FoldId`]) and a non-empty fold filter always holds fold 0 (`:383-385`, entry 296), so
+/// `new_num_folds` is 1 and the new op carries the same name, type, residency and handle — only the
+/// attribute the reference `setAttr`s is new. ⚠️ See the body for the one attribute this cannot write.
+pub fn cleanup(module: &mut Vec<DfirOp>, filters: &UnitFilters) {
+    // `module_op.walk(..)`: `use_empty()` is a MODULE-WIDE question — a top-level `get_unit` is read
+    // inside a `program_unit`'s region — so the erasures are planned over the whole module first.
+    //
+    // ⭐ WHICH IS THE SAME ANSWER THE REFERENCE'S IN-ORDER WALK GIVES. The only erasure that removes
+    // a use is a `create_group`'s, and a group is defined after the units it names, so the walk has
+    // already decided about those units when it reaches the group. Nothing cascades within one pass.
+    let mut to_erase: BTreeSet<Val> = BTreeSet::new();
+    plan_cleanup(module, module, &mut to_erase);
+    apply_cleanup(module, filters, &to_erase);
+}
+
+/// WHICH BINDERS NOTHING READS — the `op->use_empty()` half of [`cleanup`], over the whole module.
+fn plan_cleanup(scope: &[DfirOp], module: &[DfirOp], to_erase: &mut BTreeSet<Val>) {
+    for op in scope {
+        for region in regions(op) {
+            plan_cleanup(region, module, to_erase);
+        }
+
+        // `isa<dataflow::CreateGroupOp, dataflow::CreateMulticastGroupOp>(op) && op->use_empty()`,
+        // and the `get_unit_op.use_empty()` arm below it. ⚠️ `create_multicast_group` is not declared
+        // in this island (as entry 141 records for ten `agen` classes); it belongs in this pattern
+        // the day it is.
+        if let DfirOp::Dataflow(
+            dataflow::Op::CreateGroup { result, .. } | dataflow::Op::GetUnit { result, .. },
+        ) = op
+            && uses(*result, module).is_empty()
+        {
+            to_erase.insert(*result);
+        }
+    }
+}
+
+/// THE ERASURES AND THE ONE REBUILD — `op->erase()` and the `GetUnitOp::create` beside it.
+fn apply_cleanup(scope: &mut Vec<DfirOp>, filters: &UnitFilters, to_erase: &BTreeSet<Val>) {
+    for op in scope.iter_mut() {
+        for region in regions_mut(op) {
+            apply_cleanup(region, filters, to_erase);
+        }
+    }
+
+    scope.retain_mut(|op| match op {
+        DfirOp::Dataflow(dataflow::Op::CreateGroup { result, .. }) => !to_erase.contains(result),
+        DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result, num_folds, ..
+        }) => {
+            // `if (get_unit_op.use_empty()) { erase(); return advance(); }`
+            if to_erase.contains(result) {
+                return false;
+            }
+
+            // `if (filter_folds_except_.empty()) return WalkResult::advance();`
+            if let Some(folds) = &filters.folds {
+                // `int orig_num_folds = get_unit_op.getNumResults();` — ONE here ([`FoldId`]).
+                let orig_num_folds = 1;
+                // "Cannot assume all elements of filter_folds_except_ are existing fold IDs."
+                let new_num_folds: u32 = folds
+                    .ids()
+                    .filter(|fold_id| fold_id.get() < orig_num_folds)
+                    .map(|_| 1)
+                    .sum();
+
+                // The rebuilt op: `getNameAttr()`/`getTypeAttr()` and `setAttr("core", core_id)` are
+                // the residency this one already carries, `setAttr("num_folds", new_num_folds)` is
+                // the new attribute, and the fold mapping plus `dropAllUses()` are the identity for a
+                // single result whose id the filter holds.
+                //
+                // ⚠️ THE ONE ATTRIBUTE THIS CANNOT WRITE: the reference `setAttr`s `core` even when
+                // `getCoreId` answered -1 (`:293`, an `unsigned` holding -1), so a surviving HBM
+                // handle comes out of the reference carrying `core = -1 : i32`. A [`Core`] in this
+                // crate is a validated non-negative id and [`Residency::Global`] prints no `core` at
+                // all, so that unit is printed bare here.
+                *num_folds = Some(NumFolds(new_num_folds));
+            }
+
+            true
+        }
+        _ => true,
+    });
+}
+
+/// Replaces: e205_isDataTransferToKeep
+///
+/// **205/384** `UnitFilteringPass::isDataTransferToKeep` —
+/// `dcc/src/Transform/Dataflow/UnitFiltering.cpp:327` (10L).
+///
+/// ⛔ NO `!empty()` GUARD, WHICH INVERTS EVERY OTHER FILTER IN THIS FILE: an empty
+/// `filter_transfers_except_` keeps NOTHING, where an empty fold/core/corelet set keeps everything
+/// ([`Only`]). ⛔ And only `dataflow.opaque` carries a `dbgName` in this island
+/// ([`dbg_name`]), so every `agen` access answers [`None`] here and no filter can keep one.
+#[must_use]
+pub fn is_data_transfer_to_keep(op: &DfirOp, filter_transfers: Option<&Only<String>>) -> bool {
+    // `if (isDataTransfer(op))` — entry 141.
+    if !is_data_transfer(op) {
+        return false;
+    }
+
+    // `if (auto dbg_name = getDbgNameAttr(op))`.
+    let Some(name) = dbg_name(op) else {
+        return false;
+    };
+
+    // `std::find(filter_transfers_except_.begin(), .., dbg_name.str()) != .end()`.
+    filter_transfers.is_some_and(|only| only.keeps(&name.to_owned()))
 }

@@ -539,6 +539,7 @@ mod unit_tests {
             result: Val(result),
             residency,
             unit,
+            num_folds: None,
         })
     }
 

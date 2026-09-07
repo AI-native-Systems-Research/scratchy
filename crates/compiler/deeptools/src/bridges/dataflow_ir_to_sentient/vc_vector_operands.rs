@@ -1378,7 +1378,7 @@ fn logical_view(base: Val, scope: &[DfirOp]) -> Option<(OpId, AffineMap)> {
 /// CALLER TESTS EXACTLY THIS: `LoweringXRF::getLayoutExpr` guards its whole simplification on
 /// `logical_view_map.getNumInputs() == operands.size()` (`LoweringXRF.cpp:38`) and silently skips it
 /// otherwise, so a map with a dimension per subscript would take the untaken branch.
-fn access_map(indices: &[Index]) -> (AffineMap, Vec<Val>) {
+pub(super) fn access_map(indices: &[Index]) -> (AffineMap, Vec<Val>) {
     let mut operands: Vec<Val> = Vec::new();
     let mut results: Vec<AffineExpr> = Vec::new();
 

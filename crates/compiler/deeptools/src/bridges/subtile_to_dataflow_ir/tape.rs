@@ -248,12 +248,14 @@ fn node_program<
         result: hbm,
         residency: Residency::Global,
         unit: DfirUnit::Hbm,
+        num_folds: None,
     }));
     let lx = vals.mint();
     body.push(Op::Dataflow(dataflow::Op::GetUnit {
         result: lx,
         residency: Residency::Scratchpad { core },
         unit: DfirUnit::Lx,
+        num_folds: None,
     }));
 
     // Then every unit the schedule itself names, in the order it names them, each with the
@@ -274,6 +276,7 @@ fn node_program<
             result: val,
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
+            num_folds: None,
         }));
         val
     };
@@ -703,6 +706,7 @@ fn nest<
                     corelet: Corelet::checked(0).expect("every arch has a corelet 0"),
                 },
                 unit: DfirUnit::Lxlu,
+                num_folds: None,
             }));
             step_body.push(Op::Dataflow(dataflow::Op::SyncSend {
                 to: mover,

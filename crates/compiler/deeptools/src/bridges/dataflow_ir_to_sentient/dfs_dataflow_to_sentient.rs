@@ -553,6 +553,7 @@ mod unit_tests {
             result: Val(result),
             residency: crate::units::residency_of(unit, core, corelet0()),
             unit,
+            num_folds: None,
         })
     }
 
@@ -934,6 +935,7 @@ mod unit_tests {
             result: Val(result),
             residency: crate::units::residency_of(unit, core, corelet),
             unit,
+            num_folds: None,
         })
     }
 

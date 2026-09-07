@@ -75,6 +75,21 @@ impl ValueMapping {
         self.pairs.push((from, to));
     }
 
+    /// What `val` stands for, or [`None`] where nothing was mapped — `IRMapping::lookupOrNull`.
+    ///
+    /// ⛔ A DIFFERENT ANSWER FROM [`Self::lookup_or_default`]'s, AND CALLERS BRANCH ON IT.
+    /// `updateTPMVInfo` reassigns an index only when the lookup hit, because *"indices may contain
+    /// iterators that weren't re-cloned"* (`TransformPagedMemViewImpl.cpp:385-387`) — with the
+    /// defaulting form that test could never fail.
+    #[must_use]
+    pub fn lookup(&self, val: Val) -> Option<Val> {
+        self.pairs
+            .iter()
+            .rev()
+            .find(|(from, _)| *from == val)
+            .map(|(_, to)| *to)
+    }
+
     /// What `val` stands for — ITSELF where nothing was mapped.
     ///
     /// ⛔ THE SEARCH IS FROM THE BACK, so the newest entry for a value wins. Cloning one body twice

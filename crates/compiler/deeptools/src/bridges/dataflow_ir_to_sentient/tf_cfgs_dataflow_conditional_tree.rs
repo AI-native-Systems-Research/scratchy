@@ -1096,6 +1096,7 @@ mod unit_tests {
             result: Val(9),
             residency: Residency::Global,
             unit: DfirUnit::Pe,
+            num_folds: None,
         })
     }
 

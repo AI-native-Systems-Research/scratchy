@@ -2048,7 +2048,8 @@ scf.for %1 = %2 to %3 step %4 {
     /// ONE KEY OF A MAPPING — a `dataflow.get_unit`, which is what the verifier requires the keys to
     /// be (`Uniform.cpp:477-486`) and the shape the vendor's own mapping pairs against: a per-corelet
     /// `ptrow0` (`dcc/test/PT/fp8-bmm.mlir:87, 857`). ⚠️ This island's emitter writes the `name=` with
-    /// its core prefix and no `num_folds`, so the printed line is not that file's byte for byte —
+    /// its core prefix and this op carries no `num_folds`, so the printed line is not that file's
+    /// byte for byte —
     /// unrelated to this entry, and the keys are the operands [`is_arith_constant`] never reads.
     fn a_unit_key(result: Val, core_index: u32) -> DfirOp {
         DfirOp::Dataflow(dataflow::Op::GetUnit {
@@ -2058,6 +2059,7 @@ scf.for %1 = %2 to %3 step %4 {
                 corelet: Corelet::checked(0).expect("the arch has 2 corelets per core"),
             },
             unit: DfirUnit::PtRow(Row::checked(0).expect("every PT has a row 0")),
+            num_folds: None,
         })
     }
 

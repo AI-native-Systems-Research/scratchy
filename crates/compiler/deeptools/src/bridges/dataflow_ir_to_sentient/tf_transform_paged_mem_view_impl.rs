@@ -98,18 +98,22 @@
 //!
 //! Original files homed here: `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp`, `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp`
 
-use super::agen_access_details::{TimeBound, TimeDim};
+use super::agen_access_details::{MemoryOperandIndex, TimeBound, TimeDim};
 use super::agen_helper::{AgenOpKind, store_op_from_load_store_pattern};
 use super::tf_utils::{LoopBound, get_dataflow_for_loop_info_if_iv};
-use crate::islands::dataflow_ir::Values;
+// ⭐ THE MANAGER'S `dyn_cast` HANDLE, aliased because this file's `PagedMemView` is the island op it
+// wraps — `cast<GetPagedLogicalMemoryViewOp>` at `:396` and `:663` is [`PagedMemViewHandle::of`].
+use super::tf_transform_paged_mem_view_manager::PagedMemView as PagedMemViewHandle;
+use super::vc_vector_operands::access_map;
 use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
 use crate::islands::dataflow_ir::dialects::dataflow::{Page, PageRect, PagedMemView};
 use crate::islands::dataflow_ir::dialects::{
-    self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, results, scf, uses,
+    self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results, scf, uses,
 };
 use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, IntegerSet, MemRef, ScalarTy, Vector,
 };
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::units::DfirUnit;
 use core::num::NonZeroU32;
 use std::collections::BTreeSet;
@@ -865,6 +869,11 @@ pub struct VectorLoadOp<'a> {
     pub op: &'a DfirOp,
     /// `getResult()` — the vector it binds.
     pub result: Val,
+    /// `getMemRef()` — the view read, which entry 202 casts to a [`PagedMemView`].
+    pub view: Val,
+    /// `getAffineMapAttr()` AND `getMapIndices()` TOGETHER — the access, as this island writes it
+    /// inline. [`super::vc_vector_operands::access_map`] is the split into those two halves.
+    pub indices: &'a [Index],
     /// `getResult().getType()` — the type a rebuilt load inherits.
     ///
     /// ⭐ HERE BECAUSE `cloneWithNewAccessInfo` READS IT (`Agen.cpp:161-169`, entry 128): the new
@@ -878,9 +887,17 @@ impl<'a> VectorLoadOp<'a> {
     #[must_use]
     pub fn of(op: &'a DfirOp) -> Option<VectorLoadOp<'a>> {
         match op {
-            DfirOp::Agen(agen::Op::VectorLoad { result, ty, .. }) => Some(VectorLoadOp {
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result,
+                view,
+                indices,
+                ty,
+                ..
+            }) => Some(VectorLoadOp {
                 op,
                 result: *result,
+                view: *view,
+                indices,
                 ty: *ty,
             }),
             DfirOp::Agen(
@@ -1415,6 +1432,51 @@ pub fn identify_time_dim_for_explicit_loops(
 // 133/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
+/// WHAT ONE PAGED ACCESS IS BEING DE-PAGED FROM — `TPMVBase::TPMVInfo`
+/// (`TransformPagedMemViewImpl.hpp:42-58`), one per memory operand of the op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvInfo<'p> {
+    /// `paged_mem_view_` — the view the access reads.
+    ///
+    /// ⛔ AN [`Option`] BECAUSE THE REFERENCE'S HANDLE CAN GO NULL: `transform()` erases the view and
+    /// entry 200 tests `if (info.paged_mem_view_)` before touching it (`:390`).
+    pub paged_mem_view: Option<PagedMemViewHandle<'p>>,
+    /// `subscripts_map_` — the access's affine map.
+    pub subscripts_map: AffineMap,
+    /// `indices_` — its operands, one per dimension of that map.
+    pub indices: Vec<Val>,
+    /// `indices_ranges_` — each iterator's whole range, as [`calculate_indices_ranges`] computes it.
+    pub indices_ranges: Vec<IvRange>,
+    /// `conditional_iter_args_` — the values entry 295 computes each subscript into, and entry 199
+    /// compares against a page's bounds.
+    pub conditional_iter_args: Vec<Val>,
+    /// `mem_index_` — which memory operand this describes.
+    pub mem_index: MemoryOperandIndex,
+}
+
+impl<'p> TpmvInfo<'p> {
+    /// BOTH CONSTRUCTORS (`hpp:43-50`) — the two differ only in whether `mem_index` is defaulted, and
+    /// `MemoryOperandIndex::kDirSrc` is that default.
+    ///
+    /// ⚠️ UNANCHORED: the `TPMVInfo` members are among the 106 excluded data-member entries, and
+    /// entry 202 is the first thing that needs one.
+    #[must_use]
+    pub fn new(
+        paged_mem_view: PagedMemViewHandle<'p>,
+        subscripts_map: AffineMap,
+        mem_index: MemoryOperandIndex,
+    ) -> TpmvInfo<'p> {
+        TpmvInfo {
+            paged_mem_view: Some(paged_mem_view),
+            subscripts_map,
+            indices: Vec::new(),
+            indices_ranges: Vec::new(),
+            conditional_iter_args: Vec::new(),
+            mem_index,
+        }
+    }
+}
+
 /// THE BASE OF THE `TPMV*` HIERARCHY — `TPMVBase`
 /// (`dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:28`).
 ///
@@ -1423,7 +1485,7 @@ pub fn identify_time_dim_for_explicit_loops(
 /// `TPMVBase` → `TPMVVector` → {`TPMVVectorLoad`, `TPMVVectorStore`, `TPMVVectorLoadStore`} and
 /// `TPMVBase` → `TPMVComposite` → {`TPMVCompositeLoad`, `TPMVCompositeStore`, …}.
 ///
-/// # ⭐ ONLY THE TWO CONSTRUCTION-TIME MEMBERS ARE HERE, BECAUSE THAT IS WHAT THE REFERENCE SAYS
+/// # ⭐ EVERY MEMBER BUT `context_`, WHICH THIS CRATE HAS NO COUNTERPART FOR
 ///
 /// ```cpp
 /// /**********************************************/
@@ -1439,8 +1501,8 @@ pub fn identify_time_dim_for_explicit_loops(
 /// ```
 /// (`hpp:375-384`). The second group is written by `initialize()` — entry 202 for the vector
 /// classes, entry 326 for the composites — and `context_` is an `MLIRContext *`, which this crate
-/// has no counterpart for at all. ⚠️ `tpmv_info_` arrives with those entries; a field added now
-/// would be a shape guessed ahead of its writer.
+/// has no counterpart for at all. ⭐ `tpmv_info_` IS HERE AS OF ENTRY 202, its first writer
+/// ([`TpmvVectorLoad::initialize`]) — see [`TpmvInfo`].
 ///
 /// ⛔ `Vec<&'p DfirOp>` AND NOT AN OWNED CLONE. The identity of the op is the point: `mem_ops_` is
 /// what `eraseMemOpAndUseChain` is called over (`:618`) and what `initialize()` casts to read the
@@ -1458,6 +1520,9 @@ pub struct TpmvBase<'p> {
     /// this crate's programs name, as [`super::agen_access_details::AccessDetailsAffineComposite`]
     /// already established.
     pub comp: DfirUnit,
+    /// `tpmv_info_` — one entry per memory operand, written by `initialize()`: entry 202 for the
+    /// vector classes, entry 326 for the composites (which fill TWO).
+    pub tpmv_info: Vec<TpmvInfo<'p>>,
 }
 
 impl<'p> TpmvBase<'p> {
@@ -1485,6 +1550,7 @@ impl<'p> TpmvBase<'p> {
         TpmvBase {
             mem_ops: vec![mem_op],
             comp,
+            tpmv_info: Vec::new(),
         }
     }
 
@@ -2729,6 +2795,20 @@ mod unit_tests {
                     .plus(AffineExpr::dim(0)),
             ],
         }
+    }
+
+    /// `dataflow.get_paged_logical_memory_view` binding `result`, with one page.
+    fn paged_view(result: Val) -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+            PagedMemView {
+                result,
+                unit: Val(0),
+                start_addr: Val(1),
+                pages: vec![page(0, 1, Val(2))],
+                layout: layout(),
+                ty: paged_view_ty(),
+            },
+        )))
     }
 
     /// A page of 64 lanes spanning rows `lo ..= hi`, pinned on the third axis.
@@ -4438,5 +4518,307 @@ scf.if %3 {
                 &pinned
             )
         );
+    }
+
+    /// 🎯 199/384 — A CONSTANT RESULT CONSUMES NO ITERATOR ARGUMENT.
+    ///
+    /// ⛔ `arg_idx` IS THE ASSERTION. It advances only past a result that got a condition, so the
+    /// pinned middle result must be compared against `iter_args[0]` and the ranged one against
+    /// `iter_args[1]`. A port that indexed `iter_args[res]` would guard the wrong subscript with the
+    /// right bound, and every op it emits verifies.
+    #[test]
+    fn a_constant_result_consumes_no_iterator_argument() {
+        let mut vals = Values::default();
+        let subscripts_map = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::Const(0), AffineExpr::dim(0), AffineExpr::dim(1)],
+        };
+        // One `getConstantBound` pair per RESULT — the first belongs to the constant and is skipped.
+        let page_set_bounds = [
+            IvRange { lb: 7, ub: 7 },
+            IvRange { lb: 2, ub: 2 },
+            IvRange { lb: 0, ub: 3 },
+        ];
+
+        let nests = create_conditions_for_non_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::MemOp],
+            &subscripts_map,
+            &[Val(50), Val(51)],
+            &page_set_bounds,
+        );
+
+        let nest = nests.first().expect("one insert reference in, one out");
+        assert_eq!(
+            vec![
+                (Val(50), CmpIPredicate::Eq, 2),
+                (Val(51), CmpIPredicate::Sge, 0),
+                (Val(51), CmpIPredicate::Sle, 3),
+            ],
+            nest.guards
+                .iter()
+                .map(|guard| (guard.lhs, guard.predicate, guard.bound))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 🎯 200/384 — ONLY THE REMAPPED INDEX MOVES, AND THE VIEW IS RE-CAST.
+    ///
+    /// ⛔ THE UNTOUCHED INDEX IS THE ASSERTION: `lookupOrDefault` would answer `Val(21)` for it too,
+    /// so the two lookups only differ where a caller can see it — an iterator that was not re-cloned.
+    #[test]
+    fn only_the_remapped_index_moves_and_the_view_follows_the_clone() {
+        let scope = vec![paged_view(VIEW), paged_view(Val(40))];
+        let mut info = TpmvInfo::new(
+            PagedMemViewHandle::of(&scope[0]).expect("a paged view"),
+            AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![AffineExpr::dim(0), AffineExpr::dim(1)],
+            },
+            MemoryOperandIndex::DirSrc,
+        );
+        info.indices = vec![Val(20), Val(21)];
+
+        let mut ir_map = ValueMapping::new();
+        ir_map.map(Val(20), Val(120));
+        ir_map.map(VIEW, Val(40));
+
+        update_tpmv_info(&mut info, &ir_map, &scope);
+
+        assert_eq!(vec![Val(120), Val(21)], info.indices);
+        assert_eq!(Some(Val(40)), info.paged_mem_view.map(|view| view.result));
+    }
+
+    /// 🎯 201/384 — OUTERMOST FIRST, WHATEVER ORDER THE INDICES ARRIVE IN.
+    ///
+    /// ⛔ THE INPUT IS THE VENDOR'S NEST WITH ITS ITERATORS REVERSED, so an implementation that
+    /// returned `0..n` unsorted — or sorted innermost first, which `isProperAncestor` reads like if
+    /// its arguments are swapped — answers differently. The third index is bound by no block.
+    #[test]
+    fn the_iterators_sort_outermost_first() {
+        let scope = vendor_loop_nest();
+
+        assert_eq!(
+            vec![1, 0, 2],
+            set_loop_iterator_order(&[Val(102), Val(101), Val(9)], &scope)
+        );
+    }
+
+    /// 🎯 202/384 — ONE `TPMVInfo`, CARRYING THE VIEW BEHIND `getMemRef()` AND THE ACCESS ITSELF.
+    ///
+    /// ⛔ THE MAP AND THE OPERANDS ARE ONE THING IN THIS ISLAND AND TWO IN THE REFERENCE
+    /// (`getAffineMapAttr()`, `getMapIndices()`), so the split is what is checked: three subscripts
+    /// give a three-dimensional identity map and three operands, in order.
+    #[test]
+    fn initialize_records_the_view_and_the_split_access() {
+        let scope = vec![paged_view(VIEW), vector_load(Val(30))];
+        let mut tpmv = TpmvVectorLoad::new(&scope[1], DfirUnit::Lxlu);
+
+        tpmv.initialize(&scope);
+
+        let info = tpmv
+            .vector
+            .base
+            .tpmv_info
+            .first()
+            .expect("one memory operand, one entry");
+        assert_eq!(Some(VIEW), info.paged_mem_view.map(|view| view.result));
+        assert_eq!(
+            AffineMap {
+                dims: 3,
+                syms: 0,
+                results: vec![AffineExpr::dim(0), AffineExpr::dim(1), AffineExpr::dim(2)],
+            },
+            info.subscripts_map
+        );
+        assert_eq!(vec![Val(1), Val(20), Val(21)], info.indices);
+        assert_eq!(MemoryOperandIndex::DirSrc, info.mem_index);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 199/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e199_createConditionsForNonHyperRectSubscripts
+///
+/// **199/384** `TPMVBase::createConditionsForNonHyperRectSubscripts` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:342` (35L).
+///
+/// ⛔ THE BOUNDS ARE THE PAGE SET'S, NOT THE ITERATORS': `page_set_bounds` is one
+/// `getConstantBound(LB/UB, res)` pair per map RESULT (the opening `DT_CHECK`) while `iter_args` holds
+/// one value per NON-CONSTANT result — `arg_idx`, which entry 295 computes. Hence, unlike entry 198,
+/// no map or index rewrite and no whole-range skip; the `DT_CHECK_MSG` on the pair is [`IvRange`].
+#[must_use]
+pub fn create_conditions_for_non_hyper_rect_subscripts(
+    vals: &mut Values,
+    insert_refs: &[InsertRef<'_>],
+    subscripts_map: &AffineMap,
+    iter_args: &[Val],
+    page_set_bounds: &[IvRange],
+) -> Vec<Condition> {
+    // `SmallVector<Operation *, 16> insert_refs = mem_ops_;` at the call site (`:201`), an entry of
+    // which is already a conditional once an earlier page created one for that access.
+    let mut nests: Vec<Condition> = insert_refs
+        .iter()
+        .map(|insert_ref| match insert_ref {
+            InsertRef::Conditional(condition) => (*condition).clone(),
+            InsertRef::MemOp => Condition::default(),
+        })
+        .collect();
+
+    // `for (int res = 0, e = subscripts_map.getNumResults(); res < e; ++res)` with
+    // `if (isa<AffineConstantExpr>(..)) continue;` — and the second zip IS `iter_args[arg_idx]`
+    // together with the `++arg_idx` that only a non-constant result reaches.
+    let bounded = subscripts_map
+        .results
+        .iter()
+        .zip(page_set_bounds)
+        .filter(|(result, _)| !matches!(result, AffineExpr::Const(_)))
+        .map(|(_, bound)| bound)
+        .zip(iter_args);
+
+    for (bound, &iter_arg) in bounded {
+        for nest in &mut nests {
+            let created = if bound.lb == bound.ub {
+                // "Equality"
+                create_equality_condition(vals, iter_arg, bound.lb)
+            } else {
+                // "Inequality - one condition for each bound"
+                create_inequality_condition(vals, iter_arg, bound.lb, bound.ub)
+            };
+            // `setBuilderToInsertRef(builder, insert_refs[i])` then `insert_refs[i] = ..`: the new
+            // guard nests inside whatever that slot already holds.
+            *nest = core::mem::take(nest).and_then(created);
+        }
+    }
+
+    nests
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 200/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e200_updateTPMVInfo
+///
+/// **200/384** `TPMVBase::updateTPMVInfo` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:382` (17L).
+///
+/// ⛔ `lookupOrNull` FOR THE INDICES AND `lookupOrDefault` FOR THE VIEW: "indices may contain
+/// iterators that weren't re-cloned", so a miss leaves the index alone, while the view defaults to
+/// itself and is then re-`cast`. ⛔ Where that `cast` would abort — the mapped value defines no paged
+/// view — the old handle stands, which is the one thing this cannot do faithfully.
+pub fn update_tpmv_info<'p>(info: &mut TpmvInfo<'p>, ir_map: &ValueMapping, scope: &'p [DfirOp]) {
+    // "Update the indices to keep them in sync as we clone the loops."
+    for index in &mut info.indices {
+        // `auto new_index = ir_map.lookupOrNull(info.indices_[i]); if (new_index) ..`
+        if let Some(new_index) = ir_map.lookup(*index) {
+            *index = new_index;
+        }
+    }
+
+    // "Update paged_mem_view, if it exists, since it may have changed. The mem_view may not be in the
+    // innermost loop."
+    if let Some(paged_mem_view) = info.paged_mem_view {
+        // `ir_map.lookupOrDefault(info.paged_mem_view_)`, then
+        // `cast<GetPagedLogicalMemoryViewOp>(new_mem_view.getDefiningOp())`.
+        let new_mem_view = ir_map.lookup_or_default(paged_mem_view.result);
+        if let Some(found) = defining_op(new_mem_view, scope).and_then(PagedMemViewHandle::of) {
+            info.paged_mem_view = Some(found);
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 201/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e201_setLoopIteratorOrder
+///
+/// **201/384** `TPMVBase::setLoopIteratorOrder` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:575` (13L).
+///
+/// ⛔ A KEY, NOT A COMPARATOR: `isProperAncestor` answers false BOTH ways for two sibling loops, which
+/// is not a strict weak ordering and is unspecified input to Rust's sort. A loop's ancestry IS its
+/// region path and an ancestor's path is a PREFIX, so lexicographic order on that path is the
+/// reference's own answer — outermost first (`:433`, "Loops are updated from outermost to innermost").
+#[must_use]
+pub fn set_loop_iterator_order(indices: &[Val], scope: &[DfirOp]) -> Vec<usize> {
+    // "Initialize the ordered_indices_idxs vector to prepare for sorting."
+    let mut ordered_indices_idxs: Vec<usize> = (0..indices.len()).collect();
+
+    // `cast<BlockArgument>(indices[a]).getOwner()->getParentOp()`, as a position rather than a handle.
+    // ⛔ AN INDEX NO REGION BINDS SORTS LAST, where the reference's `cast` aborts: `false` is the only
+    // other answer available, and a stable sort then leaves it where it was.
+    ordered_indices_idxs.sort_by_key(|&idx| {
+        let path = loop_path_of(indices[idx], scope, &[]);
+        (path.is_none(), path.unwrap_or_default())
+    });
+
+    ordered_indices_idxs
+}
+
+/// WHERE THE OP WHOSE REGION BINDS `val` SITS — `getOwner()->getParentOp()`, as the path of ordinals
+/// that answers `isProperAncestor` by being a prefix. [`None`] when no region binds it.
+fn loop_path_of(val: Val, scope: &[DfirOp], prefix: &[usize]) -> Option<Vec<usize>> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(ordinal);
+        if dialects::block_args(op).contains(&val) {
+            return Some(path);
+        }
+        for region in dialects::regions(op) {
+            if let Some(found) = loop_path_of(val, region, &path) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 202/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+impl<'p> TpmvVectorLoad<'p> {
+    /// Replaces: e202_initialize
+    ///
+    /// **202/384** `TPMVVectorLoad::initialize` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:658` (13L).
+    ///
+    /// ⛔ THE THREE `DT_CHECK`s ARE THE THREE `let … else`: exactly one mem op, an `agen.vector_load`,
+    /// and a paged view behind its `getMemRef()`. ⭐ `getAffineMapAttr()` + `getMapIndices()` are this
+    /// island's inline indices split by [`access_map`]; `context_` has no counterpart and the
+    /// `LogicalResult` is unconditionally success, so nothing is returned.
+    pub fn initialize(&mut self, scope: &'p [DfirOp]) {
+        // `DT_CHECK(mem_ops_.size() == 1);` then `dyn_cast<agen::VectorLoadOp>(mem_ops_[0])` and
+        // `DT_CHECK(op)`.
+        let [mem_op] = self.vector.base.mem_ops.as_slice() else {
+            return;
+        };
+        let mem_op: &'p DfirOp = mem_op;
+        let Some(op) = VectorLoadOp::of(mem_op) else {
+            return;
+        };
+
+        // `cast<dataflow::GetPagedLogicalMemoryViewOp>(op.getMemRef().getDefiningOp())`.
+        let Some(paged_mem_view) = defining_op(op.view, scope).and_then(PagedMemViewHandle::of)
+        else {
+            return;
+        };
+
+        // `tpmv_info_.emplace_back(paged_mem_view, op.getAffineMapAttr().getValue());` — the
+        // two-argument constructor, so `mem_index_` stays at its default.
+        let (subscripts_map, indices) = access_map(op.indices);
+        let mut info = TpmvInfo::new(paged_mem_view, subscripts_map, MemoryOperandIndex::DirSrc);
+
+        // `for (auto index : op.getMapIndices()) tpmv_info_[0].indices_.push_back(index);`
+        info.indices = indices;
+
+        self.vector.base.tpmv_info.push(info);
     }
 }
