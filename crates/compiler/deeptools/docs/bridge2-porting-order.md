@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`159/384 ported; 159/384 audited`
+`167/384 ported; 167/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -798,6 +798,48 @@ clone correctly reading a value from outside the region. It was caught by readin
 the assertion, and the fixture now starts its counter past the program (`values_past(300)`), which is
 also why the pinned text can be read against `flatten_local_region4.mlir:345-358` line for line.
 
+⭐ AND ENTRIES 191-198 — `calculateFullShift` and `calculateDimWeights` in
+`tf_mutable_start_addr_shifting.rs`; `ProgramUnitsReductionPass::matchUnits` in
+`tf_program_units_reduction.rs`; `analyzeLoop` and `transformLoop` in
+`tf_transform_loop_to_legalize_for_sentient_lowering.rs`; `TransformPagedMemViewPass::runOnOperation`
+in `tf_transform_paged_mem_view.rs`; and `calculateIndicesRanges` and
+`createConditionsForHyperRectSubscripts` in `tf_transform_paged_mem_view_impl.rs`.
+
+⛔ 191'S TERNARY IS NOT A BOUNDS CHECK, AND ITS CONSTANT COLUMN IS NOT A LITERAL IN THE SUBSCRIPT.
+`coeffs.size() != num_dims ? coeffs.back() : 0` (`:478`) reads like an index guard; the flattened row
+is `num_dims + num_syms + num_locals + 1` wide, so it is longer than `num_dims` for every expression
+that flattens at all and the `: 0` arm is dead. What the guard shields is FAILURE — a non-affine
+subscript leaves `coeffs` EMPTY and `coeffs.back()` is then undefined behaviour. The island gained
+MLIR's flattener for this (`AffineExpr::flatten` and `FlatAffineExpr` in `islands/dataflow_ir/ty.rs`,
+`getFlattenedAffineExpr`), which names the constant column instead of counting the row's width: it is
+the whole reason 191 cannot pattern-match an `Add` against a literal, because `(d0 + 5) floordiv 8`
+has a 5 in it and a constant column of ZERO, and shifting 5 out of it would move the start address
+eight times too far. The locals carry what they stand for, so `(x floordiv 2) + (x floordiv 2)` is ONE
+column of coefficient 2 — a difference an enclosing `mod 2` can see.
+
+⛔⛔ 195'S `ub_const.value()` IS SAFE ONLY BECAUSE 194 ORDERS ITS TESTS THE WAY IT DOES. The three
+`getDefiningOp<arith::ConstantIndexOp>()`s at `:417-421` are read with no null check, and an `scf.for`
+whose bound is an `arith.select` would fault there — it cannot arrive, because `analyzeLoop` tests
+`!constant_bounds` at `:340-343` and the register file only at `:347-390`, so a non-constant `scf.for`
+on a unit that owns one leaves as `KSplitParent` and never reaches `KUnroll`. ⭐⭐ THE VENDOR PROVES IT
+ON AN INPUT WHERE BOTH TESTS MATCH: `dyn-loops-cond-bound.mlir` runs on `ptrow0` with an
+`arith.select` bound whose induction variable is read by a store on `pt_lrfreg`, and the expectation
+is an `scf.if`, not an unrolled loop. ⭐ `KSplitParent` is therefore `scf.for`-only —
+`!constant_bounds && !affine_non_const_maps` is `!cb && cb` on the affine path — and 195's
+`affine.for` arm for it is unreachable rather than merely unused.
+
+⛔⛔ AND 198'S `num_dim_vars++` RUNS BEFORE THE `continue`, which is what makes the new subscripts map
+renumber correctly for a dimension whose selected range is the whole range: the position is spent
+whether or not a condition is emitted for it. `getConstantBound(LB/UB, dim)` there is a bound on the
+loop ITERATOR, not on a view axis — `page_sel_constraints` is the page set with its dimensions
+replaced by the symbol-form subscripts map's results, one symbol per iterator — which is why
+`arg1 * 3` confined to `[0, 1]` prints `cmpi eq %arg1, 0` in
+`paged_mem_view_loads.mlir:45-56`, and why the reference's two-field skip test is a single `==` on two
+values of the same kind here. ⭐ 197 REUSES ENTRY 142 rather than re-walking the nest, and 142 is
+STRICTER than the reference's own walk — it requires the value to BE the induction variable, so a
+carried `iter_arg` answers "not an IV" — and it appends, because the time dimensions follow at
+entry 131.
+
 
 ## Level 0
 
@@ -1184,22 +1226,22 @@ also why the pinned text can be read against `flatten_local_region4.mlir:345-358
 - [ ] **AUDIT 189/384** `synthesizeTimeInfo` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1256`, line by line against the C++
 - [ ] **PORT 190/384** `createExplicitTimeLoops` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1282`, 57 lines
 - [ ] **AUDIT 190/384** `createExplicitTimeLoops` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1282`, line by line against the C++
-- [ ] **PORT 191/384** `calculateFullShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:462`, 25 lines
-- [ ] **AUDIT 191/384** `calculateFullShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:462`, line by line against the C++
-- [ ] **PORT 192/384** `calculateDimWeights` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:560`, 26 lines
-- [ ] **AUDIT 192/384** `calculateDimWeights` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:560`, line by line against the C++
-- [ ] **PORT 193/384** `matchUnits` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:69`, 77 lines
-- [ ] **AUDIT 193/384** `matchUnits` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:69`, line by line against the C++
-- [ ] **PORT 194/384** `analyzeLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268`, 127 lines
-- [ ] **AUDIT 194/384** `analyzeLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268`, line by line against the C++
-- [ ] **PORT 195/384** `transformLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399`, 38 lines
-- [ ] **AUDIT 195/384** `transformLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399`, line by line against the C++
-- [ ] **PORT 196/384** `runOnOperation` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:41`, 23 lines
-- [ ] **AUDIT 196/384** `runOnOperation` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:41`, line by line against the C++
-- [ ] **PORT 197/384** `calculateIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56`, 25 lines
-- [ ] **AUDIT 197/384** `calculateIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56`, line by line against the C++
-- [ ] **PORT 198/384** `createConditionsForHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289`, 48 lines
-- [ ] **AUDIT 198/384** `createConditionsForHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289`, line by line against the C++
+- [x] **PORT 191/384** `calculateFullShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:462`, 25 lines
+- [x] **AUDIT 191/384** `calculateFullShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:462`, line by line against the C++
+- [x] **PORT 192/384** `calculateDimWeights` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:560`, 26 lines
+- [x] **AUDIT 192/384** `calculateDimWeights` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:560`, line by line against the C++
+- [x] **PORT 193/384** `matchUnits` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:69`, 77 lines
+- [x] **AUDIT 193/384** `matchUnits` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:69`, line by line against the C++
+- [x] **PORT 194/384** `analyzeLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268`, 127 lines
+- [x] **AUDIT 194/384** `analyzeLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268`, line by line against the C++
+- [x] **PORT 195/384** `transformLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399`, 38 lines
+- [x] **AUDIT 195/384** `transformLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399`, line by line against the C++
+- [x] **PORT 196/384** `runOnOperation` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:41`, 23 lines
+- [x] **AUDIT 196/384** `runOnOperation` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:41`, line by line against the C++
+- [x] **PORT 197/384** `calculateIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56`, 25 lines
+- [x] **AUDIT 197/384** `calculateIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56`, line by line against the C++
+- [x] **PORT 198/384** `createConditionsForHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289`, 48 lines
+- [x] **AUDIT 198/384** `createConditionsForHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289`, line by line against the C++
 - [ ] **PORT 199/384** `createConditionsForNonHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:342`, 35 lines
 - [ ] **AUDIT 199/384** `createConditionsForNonHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:342`, line by line against the C++
 - [ ] **PORT 200/384** `updateTPMVInfo` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:382`, 17 lines

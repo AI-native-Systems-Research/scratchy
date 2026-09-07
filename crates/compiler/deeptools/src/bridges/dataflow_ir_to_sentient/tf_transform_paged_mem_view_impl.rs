@@ -100,13 +100,16 @@
 
 use super::agen_access_details::{TimeBound, TimeDim};
 use super::agen_helper::{AgenOpKind, store_op_from_load_store_pattern};
+use super::tf_utils::{LoopBound, get_dataflow_for_loop_info_if_iv};
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
 use crate::islands::dataflow_ir::dialects::dataflow::{Page, PageRect, PagedMemView};
 use crate::islands::dataflow_ir::dialects::{
-    self, Index, Op as DfirOp, Val, agen, arith, dataflow, results, scf, uses,
+    self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, results, scf, uses,
 };
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, IntegerSet, MemRef, ScalarTy, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, IntegerSet, MemRef, ScalarTy, Vector,
+};
 use crate::units::DfirUnit;
 use core::num::NonZeroU32;
 use std::collections::BTreeSet;
@@ -881,9 +884,7 @@ impl<'a> VectorLoadOp<'a> {
                 ty: *ty,
             }),
             DfirOp::Agen(
-                agen::Op::VectorStore { .. }
-                | agen::Op::CompositeLoadAndStore(_)
-                | agen::Op::Yield,
+                agen::Op::VectorStore { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield,
             )
             | DfirOp::Arith(_)
             | DfirOp::Scf(_)
@@ -1108,14 +1109,11 @@ impl<'a> VectorStoreOp<'a> {
     #[must_use]
     pub fn of(op: &'a DfirOp) -> Option<VectorStoreOp<'a>> {
         match op {
-            DfirOp::Agen(agen::Op::VectorStore { value, .. }) => Some(VectorStoreOp {
-                op,
-                value: *value,
-            }),
+            DfirOp::Agen(agen::Op::VectorStore { value, .. }) => {
+                Some(VectorStoreOp { op, value: *value })
+            }
             DfirOp::Agen(
-                agen::Op::VectorLoad { .. }
-                | agen::Op::CompositeLoadAndStore(_)
-                | agen::Op::Yield,
+                agen::Op::VectorLoad { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield,
             )
             | DfirOp::Arith(_)
             | DfirOp::Scf(_)
@@ -1236,7 +1234,10 @@ impl TimeSteps {
     pub fn of(bound: TimeBound) -> Option<TimeSteps> {
         match bound {
             // `b - 1 >= 0` holds for every `b >= 1`; `Steps(0)` is the reachable case it excludes.
-            TimeBound::Steps(steps) => u32::try_from(steps).ok().and_then(NonZeroU32::new).map(TimeSteps),
+            TimeBound::Steps(steps) => u32::try_from(steps)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .map(TimeSteps),
             // `kCoalesced = -2` and `kInvalid = -1` — "no special time bound values should exist".
             TimeBound::Coalesced | TimeBound::Variable => None,
         }
@@ -1913,7 +1914,6 @@ impl<'p> TpmvCompositeLoadStore<'p> {
     }
 }
 
-
 /// WHETHER EVERY VALUE ASKED FOR WAS THERE — the `DT_CHECK_MSG` of [`remove_values_from_indices`].
 ///
 /// ⛔ NOT AN ERROR TYPE. The reference aborts the compiler with *"could not find value to delete in
@@ -2139,7 +2139,554 @@ pub fn create_equality_condition(vals: &mut Values, lhs: Val, rhs: i64) -> Condi
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 197/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 
+/// A SUBSCRIPT THAT IS A CONSTANT-BOUNDED `affine.for`'s INDUCTION VARIABLE.
+///
+/// # ⛔⛔ THE TWO `DT_CHECK_MSG`s AND THE `llvm_unreachable` ARE THIS TYPE
+///
+/// [`calculate_indices_ranges`] opens with three aborts over `indices[dim]`
+/// (`TransformPagedMemViewImpl.cpp:58-78`):
+///
+/// ```cpp
+/// auto block_arg = dyn_cast<BlockArgument>(index);
+/// DT_CHECK_MSG(block_arg, "expecting only BlockArguments in indices");
+/// auto *loop_op = block_arg.getOwner()->getParentOp();
+/// auto affine_for = dyn_cast<affine::AffineForOp>(loop_op);
+/// DT_CHECK_MSG(affine_for, "agen memory operations involving loop iterators can only have loop "
+///                          "iterators from affine::AffineForOps in the subscripts");
+/// ..
+/// } else {
+///   llvm_unreachable("only loops with constant bounds are supported");
+/// }
+/// ```
+///
+/// All three ask the same question — *is this subscript a loop iterator whose bounds are literals* —
+/// and none of them is recoverable. A value that answers no has no range to contribute, so the port
+/// makes it unrepresentable: [`SubscriptIv::of`] is the one door, and a `&[SubscriptIv]` is a list
+/// of subscripts the reference would not have aborted on.
+///
+/// ⭐ ONE `None` FOR THREE ABORTS, WHICH IS NOT A LOSS. The reference's three messages differ, but
+/// what a caller can do about them does not: all three stop the compiler. Keeping them apart would
+/// mean an enum whose variants no code reads.
+///
+/// # ⭐⭐ AND THE BOUNDS COME FROM ENTRY 142, WHICH IS THE SAME TWO QUESTIONS ALREADY ANSWERED
+///
+/// [`super::tf_utils::get_dataflow_for_loop_info_if_iv`] walks the block arguments to find the op
+/// that binds a value, then reads that op's constant bounds — the reference's
+/// `getOwner()->getParentOp()` plus `hasConstantLowerBound() && hasConstantUpperBound()`, which is
+/// `lb_map.isSingleConstant() && ub_map.isSingleConstant()` spelled the way `AffineForOp` spells it.
+/// Reimplementing the descent here would be a second walk over the same tree.
+///
+/// ⚠️ IT IS STRICTER IN ONE PLACE, AND DELIBERATELY. Entry 142 ends with
+/// `affine_for.getInductionVar() == val`, so a loop's CARRIED region argument answers [`None`]; the
+/// reference reads `getParentOp()` and would take the enclosing loop's bounds for it. The abort
+/// message names *"loop iterators"*, and a carried address is not one — an `iter_arg` in a subscript
+/// would give that subscript the loop's trip range, which is a range it does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptIv {
+    /// The subscript itself — `indices[dim]`, which is the loop's induction variable.
+    pub iv: Val,
+    /// `lb_map.getSingleConstantResult()` — the first value the iterator takes.
+    pub lo: LoopBound,
+    /// `ub_map.getSingleConstantResult()` — ⛔ EXCLUSIVE, as an `affine.for`'s upper bound is. The
+    /// `- 1` that turns it into an inclusive range belongs to [`calculate_indices_ranges`], which is
+    /// where the reference does it.
+    pub hi: LoopBound,
+}
+
+impl SubscriptIv {
+    /// THE DOOR — a subscript the reference would accept, or [`None`] for one it aborts on.
+    #[must_use]
+    pub fn of(index: Val, scope: &[DfirOp]) -> Option<SubscriptIv> {
+        // `dyn_cast<BlockArgument>(index)`, `block_arg.getOwner()->getParentOp()`, and both
+        // `isSingleConstant()` tests — see the note above on which of the three aborts each is.
+        let info = get_dataflow_for_loop_info_if_iv(index, scope)?;
+
+        // `dyn_cast<affine::AffineForOp>(loop_op)`. ⛔ AN `scf.for` IS REFUSED HERE EVEN THOUGH
+        // ENTRY 142 ACCEPTS ONE: it tests that class FIRST and answers with constant bounds for it,
+        // and this function's second `DT_CHECK_MSG` is precisely the one that rules it out.
+        if !matches!(info.for_op, DfirOp::Affine(affine::Op::For { .. })) {
+            return None;
+        }
+
+        Some(SubscriptIv {
+            iv: index,
+            lo: info.lo,
+            hi: info.hi,
+        })
+    }
+
+    /// EVERY SUBSCRIPT OR NONE — the walk over `indices` with the aborts hoisted out of it.
+    ///
+    /// ⛔⛔ ALL-OR-NOTHING, BECAUSE THE POSITIONS ARE READ BY NUMBER. `indices_ranges[dim]` is what
+    /// entry 198 compares a page's bounds against (`:325-326`) and `indices_ranges[sym_idx]` is what
+    /// `addConstraintsForIVRanges` builds its constraint rows from (`:99-104`), so dropping one
+    /// subscript would shift every later range onto the wrong iterator — a silently different set of
+    /// valid pages. The reference stops the compiler instead, and so does this: a caller with a
+    /// subscript it cannot describe gets no list at all.
+    #[must_use]
+    pub fn all_of(indices: &[Val], scope: &[DfirOp]) -> Option<Vec<SubscriptIv>> {
+        indices
+            .iter()
+            .map(|index| SubscriptIv::of(*index, scope))
+            .collect()
+    }
+}
+
+/// Replaces: e197_calculateIndicesRanges
+///
+/// **197/384** `TPMVBase::calculateIndicesRanges` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56` (25L).
+///
+/// ```cpp
+/// void TPMVBase::calculateIndicesRanges(
+///     SmallVectorImpl<Value> &indices, SmallVectorImpl<IVRange> &indices_ranges) {
+///   for (int dim = 0; dim < indices.size(); ++dim) {
+///     auto index = indices[dim];
+///     auto block_arg = dyn_cast<BlockArgument>(index);
+///     DT_CHECK_MSG(block_arg, "expecting only BlockArguments in indices");
+///
+///     auto *loop_op = block_arg.getOwner()->getParentOp();
+///     auto affine_for = dyn_cast<affine::AffineForOp>(loop_op);
+///     DT_CHECK_MSG(
+///         affine_for,
+///         "agen memory operations involving loop iterators can only have loop "
+///         "iterators from affine::AffineForOps in the subscripts");
+///
+///     auto lb_map = affine_for.getLowerBoundMap();
+///     auto ub_map = affine_for.getUpperBoundMap();
+///     int lb, ub;
+///     if (lb_map.isSingleConstant() && ub_map.isSingleConstant()) {
+///       lb = lb_map.getSingleConstantResult();
+///       ub = ub_map.getSingleConstantResult() - 1;
+///     } else {
+///       llvm_unreachable("only loops with constant bounds are supported");
+///     }
+///
+///     indices_ranges.emplace_back(lb, ub);
+///   }
+/// }
+/// ```
+///
+/// # ⭐⭐ THE ITERATION SPACE, AS A CLOSED INTERVAL — AND THE `- 1` IS THE WHOLE ARITHMETIC
+///
+/// `affine.for %arg = 0 to 2` runs over `{0, 1}`, so its range is `[0, 1]`. The reference's `ub - 1`
+/// converts MLIR's exclusive upper bound into the inclusive one [`IvRange`] holds, which is the form
+/// `addConstraintsForIVRanges` emits (`-<sym> + <ub> >= 0`, `:99-104`) and the form entry 198
+/// compares against. Carrying the exclusive bound through instead would put every page's upper
+/// constraint one element too wide, and no verifier would object.
+///
+/// ⭐ AND ITS PURPOSE IS AT THE CALL SITE, in the reference's own comment: *"Ranges of the loop
+/// iterators are used to only choose pages within the loop iteration space."* (`:609-610`, `:1008-1009`).
+/// A page the iterators cannot reach is not a candidate, so a subscript whose bounds already span its
+/// whole loop needs no condition at all — which is exactly the `continue` of entry 198 (`:325-327`).
+///
+/// # ⛔⛔ IT APPENDS, AND THE POSITION IT APPENDS AT IS LOAD-BEARING
+///
+/// Both call sites pass the member vector `info.indices_ranges_`, and one of them then extends the
+/// SAME vector with the time dimensions (`addTimeDimIndicesRanges`, entry 131, `:1016-1017`) before
+/// checking `subscripts_map_time[i].getNumDims() == indices_ranges_.size()` (`:1018-1019`). So the
+/// layout is **non-time subscripts first, then time dims**, indexed by symbol number; see
+/// [`add_time_dim_indices_ranges`] and [`NonTimeDims::sym_for`], which do that arithmetic. Clearing
+/// the vector here, or writing over slot `dim`, would renumber every page-selection constraint.
+///
+/// ⚠️ `saturating_sub` FOR AN `int` SUBTRACTION THAT CANNOT UNDERFLOW IN PRACTICE. Every loop bound
+/// this pipeline emits is a non-negative trip count, so `ub - 1` is ordinary arithmetic; the
+/// saturating form is how the crate spells "this does not wrap" without an `assert!`, and it changes
+/// nothing for any bound a program contains.
+pub fn calculate_indices_ranges(indices: &[SubscriptIv], indices_ranges: &mut Vec<IvRange>) {
+    for index in indices {
+        // `indices_ranges.emplace_back(lb, ub)`, with `lb = lb_map.getSingleConstantResult()` and
+        // `ub = ub_map.getSingleConstantResult() - 1`.
+        indices_ranges.push(IvRange {
+            lb: index.lo.0,
+            ub: index.hi.0.saturating_sub(1),
+        });
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 198/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE DIMENSION OF A SUBSCRIPT MAP, WITH EVERYTHING THE WALK READS AT THAT POSITION.
+///
+/// # ⭐⭐ THREE PARALLEL LISTS INDEXED BY ONE COUNTER BECOME ONE RECORD
+///
+/// `createConditionsForHyperRectSubscripts` walks `dim` from `0` to `subscripts_map.getNumDims()`
+/// and reads three things at it — `page_sel_constraints.getConstantBound(.., dim)`, `indices[dim]`
+/// and `indices_ranges[dim]` (`:300-326`). One record per dimension is the same information with the
+/// three indexings gone, which is the shape [`Page`] already uses in this file for the reference's
+/// two parallel page lists.
+///
+/// # ⛔⛔ AND THE TWO RANGES ARE THE SAME KIND OF THING, WHICH IS WHY THE SKIP TEST IS ONE `==`
+///
+/// [`Self::selected`] is which values of this iterator can reach the page being selected;
+/// [`Self::whole`] is which values it takes at all. The reference compares them field by field —
+/// `if (lb_val == indices_ranges[dim].first && ub_val == indices_ranges[dim].second) continue;`
+/// (`:325-327`) — and a conjunction of two comparisons is a thing to get half right. One [`IvRange`]
+/// equality cannot compare one end and forget the other.
+///
+/// ⭐ AND `getConstantBound(LB/UB, dim)` REALLY IS A BOUND ON THE ITERATOR, not on a view axis.
+/// `page_sel_constraints` is built from the page's `idx_set` with its DIMENSIONS replaced by the
+/// symbol-form subscript map's results (`getPageValidity`, `:114-147`, over
+/// [`replace_dims_in_map_with_syms`]) and then constrained by the iterator ranges, so it has no
+/// dimension variables and one symbol per iterator — position `dim` is loop iterator `dim`. The
+/// vendor's own case says so: `%mem_view[%c0, %arg1 * 3, %arg2 * 2 + %c2]` against a page holding
+/// `d1 >= 0, -d1 + 1 >= 0` gives `arith.cmpi eq, %arg1, 0`
+/// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:289-297` and `:45-46`) —
+/// `arg1 * 3` inside `[0, 1]` pins `arg1`, not the axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptDim {
+    /// `indices[dim]` — the loop iterator this dimension stands for.
+    pub index: Val,
+    /// `getConstantBound(BoundType::LB, dim)` and `(BoundType::UB, dim)` — the values of the
+    /// iterator that land inside the page being selected, INCLUSIVE on both ends.
+    pub selected: IvRange,
+    /// `indices_ranges[dim]` — the iterator's whole range, as [`calculate_indices_ranges`] computed
+    /// it.
+    pub whole: IvRange,
+}
+
+impl SubscriptDim {
+    /// THE DOOR — ⛔ `DT_CHECK_MSG(lb.has_value() && ub.has_value(), "expected constant lower and
+    /// upper bounds")` (`:304-305`).
+    ///
+    /// [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`] answers an [`Option`] for the
+    /// same reason `getConstantBound` answers a `std::optional`: a dimension the constraints leave
+    /// open has no literal bound. Taking both optionals here means a [`SubscriptDim`] cannot hold a
+    /// bound that is not constant, so the walk below has no abort left in it.
+    #[must_use]
+    pub fn of(
+        index: Val,
+        lb: Option<i64>,
+        ub: Option<i64>,
+        whole: IvRange,
+    ) -> Option<SubscriptDim> {
+        Some(SubscriptDim {
+            index,
+            // ⭐ ONE `DT_CHECK_MSG` OVER BOTH, so a dimension with only one constant end is refused
+            // exactly as the reference refuses it.
+            selected: IvRange { lb: lb?, ub: ub? },
+            whole,
+        })
+    }
+}
+
+/// WHAT `createConditionsForHyperRectSubscripts` REWROTE — its four by-reference outputs, none of
+/// them dropped.
+///
+/// ⭐ THE REFERENCE RETURNS `void` AND WRITES THROUGH FOUR ALIASES: `insert_refs[i]`,
+/// `subscripts_map`, `indices`, and the abort inside `removeValuesFromIndices`. A caller that took
+/// only the conditions would emit the access with its ORIGINAL subscripts, reading the paged view's
+/// coordinates out of a view that no longer has pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperRectConditions {
+    /// `insert_refs` on the way out — one nest per access, in the order they came in.
+    ///
+    /// ⭐ AN EMPTY [`Condition`] IS THE UNTOUCHED ENTRY. Where every dimension was skipped the
+    /// reference leaves `insert_refs[i]` holding the memory op itself, and
+    /// [`set_builder_to_insert_ref`] then places the statements in that op's own block — which is
+    /// what `Condition::wrap` over no guards does (`InsertRef::MemOp => ops`). The two spellings
+    /// place the same statements in the same place, so the distinction has nothing left to carry.
+    pub insert_refs: Vec<Condition>,
+    /// `subscripts_map` on the way out — pinned dimensions substituted away, the rest renumbered.
+    pub subscripts_map: AffineMap,
+    /// `indices` on the way out — the surviving iterators, in order.
+    pub indices: Vec<Val>,
+    /// Whether every pinned iterator was found in `indices` — see [`IndexRemoval`], which records
+    /// why this can only ever be [`IndexRemoval::Removed`] here.
+    pub removal: IndexRemoval,
+}
+
+/// Replaces: e198_createConditionsForHyperRectSubscripts
+///
+/// **198/384** `TPMVBase::createConditionsForHyperRectSubscripts` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289` (48L).
+///
+/// ```cpp
+/// void TPMVBase::createConditionsForHyperRectSubscripts(
+///     SmallVectorImpl<Operation *> &insert_refs,
+///     FlatLinearValueConstraints &page_sel_constraints, AffineMap &subscripts_map,
+///     SmallVectorImpl<Value> &indices, SmallVectorImpl<IVRange> &indices_ranges) {
+///   int num_dim_vars = 0;
+///   SmallVector<AffineExpr, 16> new_dim_exprs;
+///   SmallVector<Value> indices_to_delete;
+///
+///   OpBuilder builder(context_);
+///   int num_dims = subscripts_map.getNumDims();
+///   for (unsigned dim = 0; dim < num_dims; ++dim) {
+///     auto lb = page_sel_constraints.getConstantBound(
+///         mlir::presburger::BoundType::LB, dim);
+///     auto ub = page_sel_constraints.getConstantBound(
+///         mlir::presburger::BoundType::UB, dim);
+///     DT_CHECK_MSG(lb.has_value() && ub.has_value(),
+///                  "expected constant lower and upper bounds");
+///     auto lb_val = (int64_t)lb.value();
+///     auto ub_val = (int64_t)ub.value();
+///
+///     if (lb_val == ub_val) {
+///       // If LB == UB, we only need one equality condition.
+///       for (int i = 0, e = insert_refs.size(); i < e; ++i) {
+///         setBuilderToInsertRef(builder, insert_refs[i]);
+///         insert_refs[i] = createEqualityCondition(builder, indices[dim], lb_val);
+///       }
+///
+///       // If LB == UB, the loop iterator can be replaced by a constant in the
+///       // subscripts.
+///       new_dim_exprs.emplace_back(getAffineConstantExpr(lb_val, context_));
+///       indices_to_delete.push_back(indices[dim]);
+///     } else {
+///       new_dim_exprs.emplace_back(getAffineDimExpr(num_dim_vars++, context_));
+///       // If the lower and upper bounds span the whole loop iteration space,
+///       // the loop iterator does not aid in identifying a unique page. It can
+///       // be skipped.
+///       if (lb_val == indices_ranges[dim].first &&
+///           ub_val == indices_ranges[dim].second)
+///         continue;
+///
+///       for (int i = 0, e = insert_refs.size(); i < e; ++i) {
+///         setBuilderToInsertRef(builder, insert_refs[i]);
+///         insert_refs[i] =
+///             createInequalityCondition(builder, indices[dim], lb_val, ub_val);
+///       }
+///     }
+///   }
+///   subscripts_map = subscripts_map.replaceDimsAndSymbols({new_dim_exprs}, {},
+///                                                         num_dim_vars, 0);
+///   if (!indices_to_delete.empty())
+///     removeValuesFromIndices(indices, indices_to_delete);
+/// }
+/// ```
+///
+/// # ⭐⭐ THIS IS HOW ONE PAGE OF A PAGED VIEW GETS ITS OWN COPY OF THE ACCESS
+///
+/// A `dataflow.get_paged_logical_memory_view` is one HBM region cut into pages with unrelated start
+/// addresses, and an affine subscript cannot name a page. `constructValidPage` (entry 309) makes one
+/// non-paged view per candidate page and calls this to say *when* the access lands on it: one
+/// condition per subscript dimension whose iterator has to be inside a sub-range, nested, guarding
+/// the copy. `indices` and `subscripts_map` come back rewritten for that page, because a pinned
+/// iterator is a constant there and is no longer an operand at all.
+///
+/// # ⛔⛔ THREE CASES PER DIMENSION, AND THE MIDDLE ONE STILL COSTS A DIMENSION
+///
+/// | `selected` vs `whole` | condition | map |
+/// |---|---|---|
+/// | a single value (`lb == ub`) | one `cmpi eq` | the constant, and the iterator drops out |
+/// | a strict sub-range | `cmpi sge` nested over `cmpi sle` | `d<num_dim_vars++>` |
+/// | the whole range | ⭐ NONE — `continue` | `d<num_dim_vars++>` |
+///
+/// ⛔⛔ `num_dim_vars++` HAPPENS **BEFORE** THE `continue` (`:321` then `:325-327`), so a dimension
+/// that needs no condition still takes its slot in the new map. Moving the increment after the skip
+/// would renumber every later dimension down by one and silently point each surviving subscript at
+/// the wrong iterator — an access that reads the right page at the wrong address, with a map that
+/// verifies.
+///
+/// ⭐ AND THE `continue` NEEDS BOTH ENDS TO MATCH. The vendor's second page selects `arg2` over
+/// `[2, 3]` out of a whole range of `[0, 3]` — the upper end agrees and the lower does not, and the
+/// reference emits BOTH comparisons for it (`cmpi sge, %arg2, 2` and `cmpi sle, %arg2, 3`,
+/// `paged_mem_view_loads.mlir:65-69`). See [`SubscriptDim`] for why that is one `==` here.
+///
+/// # ⛔ THE VALUE NUMBERING IS DIMENSION-MAJOR, ACCESS-MINOR
+///
+/// The `for (int i = 0, e = insert_refs.size(); i < e; ++i)` loop is INSIDE the dimension loop, and
+/// each turn of it mints its own constants and comparisons — a composite load/store pair
+/// (`insert_refs = mem_ops_`, `:201`) gets dimension 0's guards for both accesses before dimension
+/// 1's guards for either. The printed `%N`s are what a vendored expectation is diffed against, so the
+/// order is part of the port.
+///
+/// # ⭐ AND EACH ACCESS'S NEST GROWS OUTWARD-IN
+///
+/// `setBuilderToInsertRef(builder, insert_refs[i])` points the builder at what the PREVIOUS dimension
+/// created and the new condition is emitted inside it, then overwrites the slot. That is
+/// [`Condition::and_then`] — the guards of dimension `k + 1` sit inside those of dimension `k` — and
+/// it is why an entry that arrives as [`InsertRef::Conditional`] seeds the nest with the condition it
+/// already carries rather than starting empty.
+///
+/// # ⛔ `replaceDimsAndSymbols(.., {}, num_dim_vars, 0)` DECLARES ZERO SYMBOLS
+///
+/// Every subscript map on this path is built by `AffineMap::get(num_dims, 0, ..)` and has none, so
+/// the new arity is exact. ⚠️ A map that did carry a symbol would keep it, unrenumbered, in a map
+/// that says it has zero — the reference's own behaviour, recorded here for the same reason
+/// [`replace_dims_in_map_with_syms`] records it.
+///
+/// # ⚠️ `num_dims` IS `dims.len()`, AND THAT REMOVES A MISMATCH RATHER THAN CHECKING FOR ONE
+///
+/// The reference reads the loop's extent off the map (`subscripts_map.getNumDims()`) and then indexes
+/// two vectors with it; the three agree because `replaceConstOpsInSubscriptsMap` keeps `indices_` and
+/// `subscripts_map_` in step (`:600-601`, `:988-989`) and the call site checks the count against the
+/// ranges (`:1018-1019`). Taking the per-dimension records as the extent makes that agreement the
+/// signature. ⭐ The ranges vector may be LONGER — the composite path appends the time dimensions to
+/// it (entry 131) — and the reference never reaches those entries either.
+#[must_use]
+pub fn create_conditions_for_hyper_rect_subscripts(
+    vals: &mut Values,
+    insert_refs: &[InsertRef<'_>],
+    subscripts_map: &AffineMap,
+    dims: &[SubscriptDim],
+) -> HyperRectConditions {
+    // `int num_dim_vars = 0;` / `SmallVector<AffineExpr, 16> new_dim_exprs;` /
+    // `SmallVector<Value> indices_to_delete;`
+    let mut num_dim_vars = 0;
+    let mut new_dim_exprs = Vec::new();
+    let mut indices_to_delete = Vec::new();
+
+    // `SmallVector<Operation *, 16> insert_refs = mem_ops_;` at the call site (`:201`) — every entry
+    // is a bare memory op there, and this pass may have wrapped one already on an earlier page.
+    let mut nests: Vec<Condition> = insert_refs
+        .iter()
+        .map(|insert_ref| match insert_ref {
+            InsertRef::Conditional(condition) => (*condition).clone(),
+            InsertRef::MemOp => Condition::default(),
+        })
+        .collect();
+
+    // `for (unsigned dim = 0; dim < num_dims; ++dim)`.
+    for dim in dims {
+        // `if (lb_val == ub_val)` — the two `getConstantBound` calls and their `DT_CHECK_MSG` are
+        // [`SubscriptDim::of`].
+        if dim.selected.lb == dim.selected.ub {
+            // "If LB == UB, we only need one equality condition."
+            for nest in &mut nests {
+                let created = create_equality_condition(vals, dim.index, dim.selected.lb);
+                // `setBuilderToInsertRef(builder, insert_refs[i])` then
+                // `insert_refs[i] = createEqualityCondition(..)` — the new guard nests inside what
+                // this slot already holds.
+                *nest = core::mem::take(nest).and_then(created);
+            }
+
+            // "If LB == UB, the loop iterator can be replaced by a constant in the subscripts."
+            new_dim_exprs.push(AffineExpr::Const(dim.selected.lb));
+            indices_to_delete.push(dim.index);
+        } else {
+            // `new_dim_exprs.emplace_back(getAffineDimExpr(num_dim_vars++, context_));` — ⛔ BEFORE
+            // the skip below, so a dimension that needs no condition keeps its slot.
+            new_dim_exprs.push(AffineExpr::dim(num_dim_vars));
+            num_dim_vars += 1;
+
+            // "If the lower and upper bounds span the whole loop iteration space, the loop iterator
+            // does not aid in identifying a unique page. It can be skipped."
+            if dim.selected == dim.whole {
+                continue;
+            }
+
+            for nest in &mut nests {
+                let created =
+                    create_inequality_condition(vals, dim.index, dim.selected.lb, dim.selected.ub);
+                *nest = core::mem::take(nest).and_then(created);
+            }
+        }
+    }
+
+    // `SmallVector<Value> indices = info.indices_;` at the call site (`:197`), which is the one value
+    // per subscript dimension that [`SubscriptDim::index`] holds.
+    let mut indices: Vec<Val> = dims.iter().map(|dim| dim.index).collect();
+
+    // `if (!indices_to_delete.empty()) removeValuesFromIndices(indices, indices_to_delete);`
+    //
+    // ⭐ THE GUARD IS A NO-OP FOR THE ANSWER: an empty request erases nothing and finds nothing
+    // missing, so entry 118 says [`IndexRemoval::Removed`] for it either way.
+    let removal = remove_values_from_indices(&mut indices, &indices_to_delete);
+
+    HyperRectConditions {
+        insert_refs: nests,
+        // `subscripts_map.replaceDimsAndSymbols({new_dim_exprs}, {}, num_dim_vars, 0)`.
+        subscripts_map: AffineMap {
+            dims: num_dim_vars,
+            syms: 0,
+            results: subscripts_map
+                .results
+                .iter()
+                .map(|result| replace_dims(result, &new_dim_exprs))
+                .collect(),
+        },
+        indices,
+        removal,
+    }
+}
+
+/// ONE EXPRESSION WITH `d<k>` REPLACED BY `with[k]` — `AffineExpr::replaceDimsAndSymbols` over the
+/// dimension list alone.
+///
+/// # ⛔⛔ IT FOLDS, AND THE VENDOR'S OWN OUTPUT IS THE PROOF
+///
+/// MLIR builds every replaced node through `getAffineBinaryOpExpr`, which simplifies as it
+/// constructs, so substituting a constant into `d0 * 3` yields a CONSTANT and not a multiplication.
+/// The vendor's third page pins `arg1` to 1 and prints `agen.vector_load %24[0, 1, ..]`
+/// (`paged_mem_view_loads.mlir:90`) — `1 * 3` folded to `3`, which entry 259 then shifts by that
+/// page's start element of 2. An unfolded `1 * 3` would print as `1 * 3`, and the flattening every
+/// later constraint system does would have to fold it instead.
+///
+/// ⭐ THE CRATE'S OWN CONSTRUCTORS DO NOT FOLD ([`AffineExpr::times`] builds the node as written),
+/// which is why the folding is here rather than borrowed from them, and the rules are the ones
+/// [`crate::islands::dataflow_ir::ty::AffineExpr::flatten`] states for the same operators: `mod` and
+/// `floordiv` are FLOORED, so `-3 mod 4` is 1 and `-3 floordiv 4` is -1.
+///
+/// ⚠️ ONLY CONSTANT-OVER-CONSTANT, WHICH IS EXACTLY WHAT THIS SUBSTITUTION CAN NEWLY CREATE. MLIR
+/// also folds `x * 1`, `x + 0` and the like, and a map arriving here already has those folded away
+/// because MLIR built it; replicating them would change expressions this function did not touch.
+///
+/// ⚠️ A `d<k>` PAST THE REPLACEMENT LIST IS LEFT ALONE — MLIR's own behaviour for a short list, and
+/// unreachable here because the list has one entry per dimension of the map (see the note on
+/// [`create_conditions_for_hyper_rect_subscripts`]).
+///
+/// ⛔ A NON-POSITIVE OR NON-LITERAL DIVISOR IS LEFT UNFOLDED rather than divided by:
+/// `assert(rhsConst > 0 && "RHS constant has to be positive")` is MLIR's rule for these two
+/// operators, and a node the port declines to fold is still the same expression.
+fn replace_dims(expr: &AffineExpr, with: &[AffineExpr]) -> AffineExpr {
+    match expr {
+        // `getAffineDimExpr(num_dim_vars++, ..)` or `getAffineConstantExpr(lb_val, ..)`, whichever
+        // this dimension's turn of the walk pushed.
+        AffineExpr::Dim(dim) => with
+            .get(*dim as usize)
+            .cloned()
+            .unwrap_or(AffineExpr::Dim(*dim)),
+        // The symbol replacement list is empty — see the note on the caller.
+        AffineExpr::Sym(sym) => AffineExpr::Sym(*sym),
+        AffineExpr::Const(value) => AffineExpr::Const(*value),
+        AffineExpr::Add(lhs, rhs) => {
+            let (lhs, rhs) = (replace_dims(lhs, with), replace_dims(rhs, with));
+            match (&lhs, &rhs) {
+                (AffineExpr::Const(a), AffineExpr::Const(b)) => {
+                    AffineExpr::Const(a.saturating_add(*b))
+                }
+                _ => AffineExpr::Add(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        AffineExpr::Mul(lhs, rhs) => {
+            let (lhs, rhs) = (replace_dims(lhs, with), replace_dims(rhs, with));
+            match (&lhs, &rhs) {
+                (AffineExpr::Const(a), AffineExpr::Const(b)) => {
+                    AffineExpr::Const(a.saturating_mul(*b))
+                }
+                _ => AffineExpr::Mul(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        AffineExpr::Mod(lhs, rhs) => {
+            let (lhs, rhs) = (replace_dims(lhs, with), replace_dims(rhs, with));
+            match (&lhs, &rhs) {
+                // "Folded at construction by `simplifyMod`, which is floored: `-3 mod 4` is 1."
+                (AffineExpr::Const(a), AffineExpr::Const(b)) if *b > 0 => {
+                    AffineExpr::Const(a.rem_euclid(*b))
+                }
+                _ => AffineExpr::Mod(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+        AffineExpr::FloorDiv(lhs, rhs) => {
+            let (lhs, rhs) = (replace_dims(lhs, with), replace_dims(rhs, with));
+            match (&lhs, &rhs) {
+                // "Folded at construction by `simplifyFloorDiv`: `-3 floordiv 4` is -1."
+                (AffineExpr::Const(a), AffineExpr::Const(b)) if *b > 0 => {
+                    AffineExpr::Const(a.div_euclid(*b))
+                }
+                _ => AffineExpr::FloorDiv(Box::new(lhs), Box::new(rhs)),
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -2147,7 +2694,9 @@ mod unit_tests {
     use crate::islands::dataflow_ir::dialects::{Index, dataflow, vectorchain};
     use crate::islands::dataflow_ir::link::{Link, Lxlu as LxluUnit, Sfp as SfpUnit};
     use crate::islands::dataflow_ir::print;
-    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, BoundType, ElemType, MemRef, Vector};
+    use crate::islands::dataflow_ir::ty::{
+        AffineExpr, AffineMap, BoundType, ElemType, MemRef, Vector,
+    };
 
     /// The ops as MLIR text, at the top level.
     fn text(ops: &[DfirOp]) -> String {
@@ -2745,7 +3294,11 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// goes first and the load last.
     #[test]
     fn a_paged_loads_chain_is_erased_from_its_send_back_to_the_load() {
-        let program = vec![vector_load(Val(31)), rotate(Val(41), Val(31)), send(Val(41))];
+        let program = vec![
+            vector_load(Val(31)),
+            rotate(Val(41), Val(31)),
+            send(Val(41)),
+        ];
         let load = VectorLoadOp::of(&program[0]).expect("an agen.vector_load");
 
         assert_eq!(
@@ -2826,7 +3379,11 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// producer-ward with the store itself first (`:207-222`). Both end up consumer-first.
     #[test]
     fn the_direction_decides_whether_the_chain_is_reversed() {
-        let program = vec![vector_load(Val(31)), rotate(Val(41), Val(31)), send(Val(41))];
+        let program = vec![
+            vector_load(Val(31)),
+            rotate(Val(41), Val(31)),
+            send(Val(41)),
+        ];
         let ops: Vec<&DfirOp> = program.iter().collect();
 
         assert_eq!(
@@ -2861,11 +3418,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
         assert!(store_op(load, &sent).is_none());
 
         // ⛔ `DT_CHECK(load_op.getResult().hasOneUse())` — a store AND a send read it.
-        let both = vec![
-            vector_load(Val(31)),
-            vector_store(Val(31)),
-            send(Val(31)),
-        ];
+        let both = vec![vector_load(Val(31)), vector_store(Val(31)), send(Val(31))];
         let load = VectorLoadOp::of(&both[0]).expect("an agen.vector_load");
         assert!(store_op(load, &both).is_none());
     }
@@ -3025,7 +3578,11 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// `TPMVVectorLoadStore` and every composite inherit all three.
     #[test]
     fn the_base_class_knows_no_use_chain_and_erases_only_the_mem_op() {
-        let program = vec![vector_load(Val(31)), rotate(Val(41), Val(31)), send(Val(41))];
+        let program = vec![
+            vector_load(Val(31)),
+            rotate(Val(41), Val(31)),
+            send(Val(41)),
+        ];
         let base = TpmvBase::new(&program[0], DfirUnit::Lxlu);
 
         // Entry 133: `return {};` — even though this very op HAS a chain, which entry 129 finds.
@@ -3218,7 +3775,10 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
             "affine_map<()[s0, s1] -> (s0 * 8 + s1)>"
         );
         // ⛔ AND THE INPUT IS UNTOUCHED — both callers keep the dimension form for the access itself.
-        assert_eq!(print::affine_map(&map), "affine_map<(d0, d1) -> (d0 * 8 + d1)>");
+        assert_eq!(
+            print::affine_map(&map),
+            "affine_map<(d0, d1) -> (d0 * 8 + d1)>"
+        );
     }
 
     /// 🎯 119/384 — THE SUBSTITUTION REACHES EVERY LEAF, INCLUDING UNDER `mod` AND `floordiv`.
@@ -3323,5 +3883,560 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
         assert_eq!(second.guards[0].bound, 1);
         assert_ne!(first.guards[0].cond, second.guards[0].cond);
         assert_ne!(first.wrap(Vec::new()), second.wrap(Vec::new()));
+    }
+
+    /// The vendor's own nest — `affine.for %arg1 = 0 to 2 { affine.for %arg2 = 0 to 4 { .. } }`
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:266-268`), whose body
+    /// holds the paged access `%mem_view[%c0, %arg1 * 3, %arg2 * 2 + %c2]`.
+    fn vendor_loop_nest() -> Vec<DfirOp> {
+        vec![DfirOp::Affine(affine::Op::For {
+            iv: Val(101),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(2),
+            carried: Vec::new(),
+            body: vec![DfirOp::Affine(affine::Op::For {
+                iv: Val(102),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: Vec::new(),
+                dbg_name: None,
+            })],
+            dbg_name: None,
+        })]
+    }
+
+    /// 🎯 197/384 — TWO LOOP ITERATORS, TWO CLOSED INTERVALS, AND THE UPPER BOUND IS ONE LESS THAN
+    /// THE LOOP'S.
+    ///
+    /// ⛔ THE `- 1` IS THE ASSERTION. `affine.for %arg1 = 0 to 2` runs over `{0, 1}` and
+    /// `%arg2 = 0 to 4` over `{0, 1, 2, 3}`, so the vendor's nest gives `[0, 1]` and `[0, 3]`. Taking
+    /// the exclusive bound through would give `[0, 2]` and `[0, 4]` — one element too wide on every
+    /// axis, which makes a page the iterators cannot reach look reachable.
+    #[test]
+    fn the_iteration_space_is_the_closed_interval_the_loop_covers() {
+        let scope = vendor_loop_nest();
+        let indices = SubscriptIv::all_of(&[Val(101), Val(102)], &scope)
+            .expect("both subscripts are constant-bounded affine.for induction variables");
+
+        let mut ranges = Vec::new();
+        calculate_indices_ranges(&indices, &mut ranges);
+
+        assert_eq!(
+            vec![IvRange { lb: 0, ub: 1 }, IvRange { lb: 0, ub: 3 }],
+            ranges
+        );
+    }
+
+    /// 🎯 197/384 — IT APPENDS, WHICH IS WHAT LETS THE TIME DIMENSIONS FOLLOW.
+    ///
+    /// ⛔⛔ THE ORDER IS THE ASSERTION, not the contents. `:1010-1019` runs this and then
+    /// [`add_time_dim_indices_ranges`] over one vector and checks the total against the map's
+    /// dimension count, and every constraint row is built by indexing that vector by symbol number
+    /// ([`NonTimeDims::sym_for`]). A port that cleared the vector, or prepended, would pass a test
+    /// that only counted entries.
+    #[test]
+    fn the_ranges_append_before_the_time_dimensions() {
+        let scope = vendor_loop_nest();
+        let indices =
+            SubscriptIv::all_of(&[Val(101), Val(102)], &scope).expect("both are iterators");
+
+        let mut ranges = Vec::new();
+        calculate_indices_ranges(&indices, &mut ranges);
+        let steps = TimeSteps::of(TimeBound::Steps(8)).expect("eight steps is a real bound");
+        add_time_dim_indices_ranges(&[steps], &mut ranges);
+
+        assert_eq!(
+            vec![
+                IvRange { lb: 0, ub: 1 },
+                IvRange { lb: 0, ub: 3 },
+                IvRange { lb: 0, ub: 7 },
+            ],
+            ranges
+        );
+        // And the slot entry 132's arithmetic names for time dim 0 is where that range landed.
+        let sym = NonTimeDims(2).sym_for(TimeDim(0));
+        assert_eq!(PageSelSym(2), sym);
+        assert_eq!(IvRange { lb: 0, ub: 7 }, ranges[sym.0 as usize]);
+    }
+
+    /// 🎯 197/384 — ⛔ `DT_CHECK_MSG(block_arg, "expecting only BlockArguments in indices")`.
+    ///
+    /// A subscript that no block binds — an `arith.constant` folded into the map would be one — is
+    /// the reference's first abort.
+    #[test]
+    fn a_subscript_no_block_binds_is_not_a_loop_iterator() {
+        let scope = vendor_loop_nest();
+
+        assert_eq!(None, SubscriptIv::of(Val(7), &scope));
+    }
+
+    /// 🎯 197/384 — ⛔⛔ THE SECOND ABORT, AND IT IS THE ONE ENTRY 142 WOULD HAVE ANSWERED.
+    ///
+    /// *"agen memory operations involving loop iterators can only have loop iterators from
+    /// affine::AffineForOps in the subscripts"* — [`super::tf_utils::get_dataflow_for_loop_info_if_iv`]
+    /// tests `scf::ForOp` FIRST and answers constant bounds for it, so a port that simply forwarded
+    /// its result would accept this scope. The `dyn_cast<affine::AffineForOp>` is what refuses it.
+    #[test]
+    fn an_scf_for_iterator_is_refused_even_though_its_bounds_are_constant() {
+        let lo = Val(200);
+        let hi = Val(201);
+        let step = Val(202);
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: lo,
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: hi,
+                value: 4,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: step,
+                value: 1,
+            }),
+            DfirOp::Scf(scf::Op::For {
+                iv: Val(203),
+                lo,
+                hi,
+                step,
+                carried: Vec::new(),
+                body: Vec::new(),
+                dbg_name: None,
+            }),
+        ];
+
+        // Entry 142 does answer for it — which is why the class test above it is not redundant.
+        assert!(get_dataflow_for_loop_info_if_iv(Val(203), &scope).is_some());
+        assert_eq!(None, SubscriptIv::of(Val(203), &scope));
+    }
+
+    /// 🎯 197/384 — ⛔ `llvm_unreachable("only loops with constant bounds are supported")`.
+    ///
+    /// `affine.for %i = 0 to %extent` — `ub_map.isSingleConstant()` is false, and the reference has
+    /// no path out of the `else`.
+    #[test]
+    fn a_symbolic_loop_bound_has_no_range() {
+        let scope = vec![DfirOp::Affine(affine::Op::For {
+            iv: Val(104),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Val(Val(9)),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        })];
+
+        assert_eq!(None, SubscriptIv::of(Val(104), &scope));
+    }
+
+    /// 🎯 197/384 — ⛔⛔ ONE BAD SUBSCRIPT COSTS THE WHOLE LIST, BECAUSE THE POSITIONS ARE READ BY
+    /// NUMBER.
+    ///
+    /// `indices_ranges[dim]` (`:325-326`) and `indices_ranges[sym_idx]` (`:99-104`) index this list
+    /// by the subscript's dimension, so a list with a hole compacted out of it describes a different
+    /// program. `all_of` declines rather than skipping.
+    #[test]
+    fn a_list_with_one_unusable_subscript_yields_no_list_at_all() {
+        let scope = vendor_loop_nest();
+
+        assert_eq!(None, SubscriptIv::all_of(&[Val(101), Val(7)], &scope));
+        assert_eq!(None, SubscriptIv::all_of(&[Val(7), Val(102)], &scope));
+    }
+
+    /// `affine_map<(d0, d1) -> (0, d0 * 3, d1 * 2 + 2)>` — the vendor's own subscripts for the
+    /// hyper-rectangular load, after `replaceConstOpsInSubscriptsMap` has folded `%c0` and `%c2` in:
+    /// `%mem_view[%c0, %arg1 * 3, %arg2 * 2 + %c2]`
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:297`).
+    fn vendor_subscripts() -> AffineMap {
+        AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(0).times(3),
+                AffineExpr::dim(1).times(2).plus(AffineExpr::Const(2)),
+            ],
+        }
+    }
+
+    /// 🎯 198/384 — THE VENDOR'S FIRST PAGE: ONE PINNED ITERATOR, ONE SUB-RANGE, THREE NESTED
+    /// CONDITIONALS.
+    ///
+    /// `page0` holds `d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 4 >= 0` (`:291`), so `arg1 * 3` inside
+    /// `[0, 1]` pins `arg1` to 0 and `arg2 * 2 + 2` inside `[0, 4]` selects `arg2` over `[0, 1]` out
+    /// of its whole `[0, 3]`. ⛔ THE EMISSION IS THE ASSERTION — constant, `cmpi eq`, `scf.if`, then
+    /// the two-sided form inside it, which is `:45-53` of the expectation value for value.
+    #[test]
+    fn the_vendors_first_page_pins_one_iterator_and_bounds_the_other() {
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let dims = [
+            SubscriptDim {
+                index: arg1,
+                selected: IvRange { lb: 0, ub: 0 },
+                whole: IvRange { lb: 0, ub: 1 },
+            },
+            SubscriptDim {
+                index: arg2,
+                selected: IvRange { lb: 0, ub: 1 },
+                whole: IvRange { lb: 0, ub: 3 },
+            },
+        ];
+
+        let rewritten = create_conditions_for_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::MemOp],
+            &vendor_subscripts(),
+            &dims,
+        );
+
+        let load = vals.mint();
+        assert_eq!(
+            text(
+                &rewritten.insert_refs[0].wrap(vec![DfirOp::Arith(arith::Op::Constant {
+                    result: load,
+                    value: 7,
+                })])
+            ),
+            "\
+%2 = arith.constant 0 : index
+%3 = arith.cmpi eq, %0, %2 : index
+scf.if %3 {
+  %4 = arith.constant 0 : index
+  %5 = arith.cmpi sge, %1, %4 : index
+  scf.if %5 {
+    %6 = arith.constant 1 : index
+    %7 = arith.cmpi sle, %1, %6 : index
+    scf.if %7 {
+      %8 = arith.constant 7 : index
+    }
+  }
+}
+"
+        );
+
+        // `[0, 0, %arg2 * 2 + 2]` (`:56`): the pinned iterator became a constant, `0 * 3` FOLDED to
+        // `0`, and the surviving one is renumbered to `d0`.
+        assert_eq!(
+            AffineMap {
+                dims: 1,
+                syms: 0,
+                results: vec![
+                    AffineExpr::Const(0),
+                    AffineExpr::Const(0),
+                    AffineExpr::dim(0).times(2).plus(AffineExpr::Const(2)),
+                ],
+            },
+            rewritten.subscripts_map
+        );
+        // And the pinned iterator is no longer an operand of the access.
+        assert_eq!(vec![arg2], rewritten.indices);
+        assert_eq!(IndexRemoval::Removed, rewritten.removal);
+    }
+
+    /// 🎯 198/384 — ⛔⛔ THE SKIP NEEDS **BOTH** ENDS TO MATCH, AND THE VENDOR'S SECOND PAGE IS THE
+    /// CASE THAT PROVES IT.
+    ///
+    /// `page1` puts `arg2 * 2 + 2` inside `[5, 9]`, which selects `arg2` over `[2, 3]` — the UPPER
+    /// end is its whole range's upper end and the lower is not. The reference emits both comparisons
+    /// (`cmpi sge, %arg2, 2` / `cmpi sle, %arg2, 3`, `:65-69`); a skip test that compared only the
+    /// upper bound, or only one end of either, would emit none and let the access read `page0`'s
+    /// address for iterations that belong to `page1`.
+    #[test]
+    fn a_sub_range_sharing_one_end_with_the_whole_still_needs_both_comparisons() {
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let dims = [
+            SubscriptDim {
+                index: arg1,
+                selected: IvRange { lb: 0, ub: 0 },
+                whole: IvRange { lb: 0, ub: 1 },
+            },
+            SubscriptDim {
+                index: arg2,
+                selected: IvRange { lb: 2, ub: 3 },
+                whole: IvRange { lb: 0, ub: 3 },
+            },
+        ];
+
+        let rewritten = create_conditions_for_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::MemOp],
+            &vendor_subscripts(),
+            &dims,
+        );
+
+        let guards = &rewritten.insert_refs[0].guards;
+        assert_eq!(3, guards.len());
+        assert_eq!(
+            (CmpIPredicate::Eq, 0, arg1),
+            (guards[0].predicate, guards[0].bound, guards[0].lhs)
+        );
+        assert_eq!(
+            (CmpIPredicate::Sge, 2, arg2),
+            (guards[1].predicate, guards[1].bound, guards[1].lhs)
+        );
+        assert_eq!(
+            (CmpIPredicate::Sle, 3, arg2),
+            (guards[2].predicate, guards[2].bound, guards[2].lhs)
+        );
+    }
+
+    /// 🎯 198/384 — ⛔⛔ A SKIPPED DIMENSION STILL TAKES ITS SLOT IN THE NEW MAP.
+    ///
+    /// `num_dim_vars++` runs at `:321`, BEFORE the `continue` at `:327`. Here the first iterator
+    /// spans its whole range and needs no condition, and the second needs one — so the new map must
+    /// still read `d0 * 3` for the first and `d1 * 2 + 2` for the second. Moving the increment after
+    /// the skip would produce `(d0) -> (0, d0 * 3, d0 * 2 + 2)`: one iterator standing for two, with
+    /// an arity that verifies.
+    #[test]
+    fn a_dimension_that_needs_no_condition_still_claims_its_dimension_variable() {
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let dims = [
+            SubscriptDim {
+                index: arg1,
+                selected: IvRange { lb: 0, ub: 1 },
+                whole: IvRange { lb: 0, ub: 1 },
+            },
+            SubscriptDim {
+                index: arg2,
+                selected: IvRange { lb: 0, ub: 1 },
+                whole: IvRange { lb: 0, ub: 3 },
+            },
+        ];
+
+        let rewritten = create_conditions_for_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::MemOp],
+            &vendor_subscripts(),
+            &dims,
+        );
+
+        assert_eq!(vendor_subscripts(), rewritten.subscripts_map);
+        // Only the second iterator is guarded, and nothing was removed from the operands.
+        assert_eq!(2, rewritten.insert_refs[0].guards.len());
+        assert_eq!(vec![arg1, arg2], rewritten.indices);
+        assert_eq!(IndexRemoval::Removed, rewritten.removal);
+    }
+
+    /// 🎯 198/384 — A PINNED ITERATOR IN A PRODUCT FOLDS TO ONE CONSTANT, WHICH IS THE VENDOR'S
+    /// THIRD PAGE.
+    ///
+    /// `page2` holds `d1 >= 2, -d1 + 3 >= 0` (`:293`), so `arg1 * 3` inside `[2, 3]` pins `arg1` to
+    /// 1 and the subscript becomes `1 * 3` = **3**. The printed expectation is `[0, 1, ..]` (`:90`)
+    /// because entry 259 then subtracts that page's start element of 2 — so `3` is what this function
+    /// is responsible for, and an unfolded `1 * 3` is what it must not leave behind.
+    #[test]
+    fn a_pinned_iterator_folds_through_its_coefficient() {
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let dims = [
+            SubscriptDim {
+                index: arg1,
+                selected: IvRange { lb: 1, ub: 1 },
+                whole: IvRange { lb: 0, ub: 1 },
+            },
+            SubscriptDim {
+                index: arg2,
+                selected: IvRange { lb: 0, ub: 1 },
+                whole: IvRange { lb: 0, ub: 3 },
+            },
+        ];
+
+        let rewritten = create_conditions_for_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::MemOp],
+            &vendor_subscripts(),
+            &dims,
+        );
+
+        assert_eq!(
+            AffineMap {
+                dims: 1,
+                syms: 0,
+                results: vec![
+                    AffineExpr::Const(0),
+                    AffineExpr::Const(3),
+                    AffineExpr::dim(0).times(2).plus(AffineExpr::Const(2)),
+                ],
+            },
+            rewritten.subscripts_map
+        );
+        assert_eq!(1, rewritten.insert_refs[0].guards[0].bound);
+    }
+
+    /// 🎯 198/384 — ⛔ THE VALUE NUMBERING IS DIMENSION-MAJOR, ACCESS-MINOR.
+    ///
+    /// `insert_refs = mem_ops_` is a whole composite's memory ops (`:201`), and the inner loop over
+    /// them sits INSIDE the dimension loop — so the second access's outer guard is minted before the
+    /// first access's inner one. An access-major port would give each nest a contiguous run of
+    /// numbers and diff differently against every vendored expectation with two memory ops.
+    #[test]
+    fn two_accesses_interleave_their_value_numbers_dimension_by_dimension() {
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let dims = [
+            SubscriptDim {
+                index: arg1,
+                selected: IvRange { lb: 0, ub: 0 },
+                whole: IvRange { lb: 0, ub: 1 },
+            },
+            SubscriptDim {
+                index: arg2,
+                selected: IvRange { lb: 0, ub: 1 },
+                whole: IvRange { lb: 0, ub: 3 },
+            },
+        ];
+
+        let rewritten = create_conditions_for_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::MemOp, InsertRef::MemOp],
+            &vendor_subscripts(),
+            &dims,
+        );
+
+        // Dimension 0 mints for the load (%2, %3) then for the store (%4, %5); dimension 1 then
+        // mints four each, load first.
+        let first: Vec<Val> = rewritten.insert_refs[0]
+            .guards
+            .iter()
+            .map(|guard| guard.constant)
+            .collect();
+        let second: Vec<Val> = rewritten.insert_refs[1]
+            .guards
+            .iter()
+            .map(|guard| guard.constant)
+            .collect();
+        assert_eq!(vec![Val(2), Val(6), Val(8)], first);
+        assert_eq!(vec![Val(4), Val(10), Val(12)], second);
+    }
+
+    /// 🎯 198/384 — AN ENTRY THAT ARRIVES ALREADY CONDITIONAL KEEPS ITS GUARDS OUTSIDE THE NEW ONES.
+    ///
+    /// ⭐ `setBuilderToInsertRef` points the builder INTO whatever `insert_refs[i]` holds before the
+    /// new condition is created (`:312-313`, `:330-332`), so a nest that is already there is the
+    /// outer one. An empty [`Condition`] is what a bare memory op contributes, which is why
+    /// [`InsertRef::MemOp`] and a condition with no guards place statements identically.
+    #[test]
+    fn an_existing_conditional_becomes_the_outer_nest() {
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let outer = create_equality_condition(&mut vals, arg1, 9);
+        let dims = [SubscriptDim {
+            index: arg1,
+            selected: IvRange { lb: 0, ub: 0 },
+            whole: IvRange { lb: 0, ub: 1 },
+        }];
+
+        let rewritten = create_conditions_for_hyper_rect_subscripts(
+            &mut vals,
+            &[InsertRef::Conditional(&outer)],
+            &vendor_subscripts(),
+            &dims,
+        );
+
+        let guards = &rewritten.insert_refs[0].guards;
+        assert_eq!(2, guards.len());
+        assert_eq!(9, guards[0].bound);
+        assert_eq!(0, guards[1].bound);
+    }
+
+    /// 🎯 198/384 — ⛔ `DT_CHECK_MSG(lb.has_value() && ub.has_value(), ..)`.
+    ///
+    /// `getConstantBound` answers `std::nullopt` for a variable the constraints leave open, and one
+    /// open end is enough: *"expected constant lower and upper bounds"*.
+    #[test]
+    fn a_dimension_without_two_constant_bounds_is_no_dimension() {
+        let whole = IvRange { lb: 0, ub: 3 };
+
+        assert_eq!(None, SubscriptDim::of(Val(1), None, Some(3), whole));
+        assert_eq!(None, SubscriptDim::of(Val(1), Some(0), None, whole));
+        assert_eq!(None, SubscriptDim::of(Val(1), None, None, whole));
+        assert_eq!(
+            Some(SubscriptDim {
+                index: Val(1),
+                selected: IvRange { lb: 0, ub: 3 },
+                whole,
+            }),
+            SubscriptDim::of(Val(1), Some(0), Some(3), whole)
+        );
+    }
+
+    /// 🎯 198/384 — THE PAGE'S OWN SET ANSWERS THE BOUNDS THE DOOR TAKES.
+    ///
+    /// ⭐ END TO END OVER THE ISLAND'S OWN TYPES: a page written as an `affine_set` is what
+    /// [`crate::islands::dataflow_ir::ty::IntegerSet::constant_bound`] reads, and its two answers are
+    /// what [`SubscriptDim::of`] takes — `d1 >= 0, -d1 + 1 >= 0` giving `[0, 1]` is the vendor's
+    /// `page0` on its second axis (`:291`).
+    #[test]
+    fn a_pages_span_is_the_constant_bound_pair_the_door_takes() {
+        let set = PageRect {
+            spans: vec![
+                PageSpan { lo: 0, hi: 63 },
+                PageSpan { lo: 0, hi: 1 },
+                PageSpan { lo: 0, hi: 4 },
+            ],
+        }
+        .as_integer_set();
+
+        let dim = SubscriptDim::of(
+            Val(1),
+            set.constant_bound(BoundType::Lb, 1),
+            set.constant_bound(BoundType::Ub, 1),
+            IvRange { lb: 0, ub: 3 },
+        )
+        .expect("a hyper-rectangle has constant bounds on every axis");
+
+        assert_eq!(IvRange { lb: 0, ub: 1 }, dim.selected);
+    }
+
+    /// 🎯 198/384 — THE SUBSTITUTION FOLDS CONSTANT OVER CONSTANT, AND FLOORS ITS DIVISIONS.
+    ///
+    /// ⭐ THE RULES ARE [`crate::islands::dataflow_ir::ty::AffineExpr::flatten`]'s: `-3 mod 4` is 1
+    /// and `-3 floordiv 4` is -1, because MLIR's `simplifyMod` and `simplifyFloorDiv` are floored.
+    ///
+    /// ⛔ AND A DIVISOR THAT IS NOT A POSITIVE LITERAL IS LEFT ALONE rather than divided by —
+    /// `assert(rhsConst > 0 && "RHS constant has to be positive")`.
+    #[test]
+    fn the_substitution_folds_the_way_mlirs_constructors_fold() {
+        let pinned = [AffineExpr::Const(-3)];
+
+        assert_eq!(
+            AffineExpr::Const(1),
+            replace_dims(&AffineExpr::dim(0).modulo(4), &pinned)
+        );
+        assert_eq!(
+            AffineExpr::Const(-1),
+            replace_dims(&AffineExpr::dim(0).floordiv(4), &pinned)
+        );
+        assert_eq!(
+            AffineExpr::Const(-1),
+            replace_dims(
+                &AffineExpr::dim(0).times(2).plus(AffineExpr::Const(5)),
+                &pinned
+            )
+        );
+
+        // A zero divisor is not folded, and neither is a symbolic one.
+        assert_eq!(
+            AffineExpr::Const(-3).floordiv(0),
+            replace_dims(&AffineExpr::dim(0).floordiv(0), &pinned)
+        );
+        assert_eq!(
+            AffineExpr::Mod(
+                Box::new(AffineExpr::Const(-3)),
+                Box::new(AffineExpr::sym(0))
+            ),
+            replace_dims(
+                &AffineExpr::Mod(Box::new(AffineExpr::dim(0)), Box::new(AffineExpr::sym(0))),
+                &pinned
+            )
+        );
     }
 }

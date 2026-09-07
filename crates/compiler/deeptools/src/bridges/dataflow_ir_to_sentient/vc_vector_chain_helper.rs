@@ -82,6 +82,7 @@
 //!
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp`
 
+use super::tf_program_units_reduction::HighPreference;
 use super::vc_vector_operands::VectorOperand;
 use crate::arch::Arch;
 use crate::formats::Bits;
@@ -90,8 +91,8 @@ use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::ty::{BoundType, ElemType, IntegerSet, Vector};
 use crate::islands::dataflow_ir::{Program as DfirProgram, Values};
 use crate::islands::sentient::ProgramUnit as SentientProgramUnit;
-use crate::islands::sentient::dialects::sentient as sen;
 use crate::islands::sentient::dialects::Op as SenOp;
+use crate::islands::sentient::dialects::sentient as sen;
 use std::collections::BTreeMap;
 
 /// Replaces: e059_isSentientBinaryLogicalOp
@@ -109,10 +110,9 @@ use std::collections::BTreeMap;
 #[must_use]
 pub const fn is_sentient_binary_logical_op(sb: sen::BinaryOp) -> bool {
     match sb {
-        sen::BinaryOp::And
-        | sen::BinaryOp::Or
-        | sen::BinaryOp::Xnor
-        | sen::BinaryOp::AndNot => true,
+        sen::BinaryOp::And | sen::BinaryOp::Or | sen::BinaryOp::Xnor | sen::BinaryOp::AndNot => {
+            true
+        }
         sen::BinaryOp::Min
         | sen::BinaryOp::Max
         | sen::BinaryOp::AbsMin
@@ -611,7 +611,6 @@ impl MergeAndPack {
     }
 }
 
-
 /// WHAT [`fuse_compare_and_select_into_min_or_max`] DECIDED — the two out-bools as one answer.
 ///
 /// ⭐⭐ THREE STATES, NOT TWO BOOLS. The reference hands back `bool& fusion_to_min` and
@@ -737,11 +736,14 @@ pub fn fuse_compare_and_select_into_min_or_max(
         return MinOrMaxFusion::NotFused;
     };
 
-    let same_pair_matching = ops_are_equivalent(lhs_def, op1_def, scope)
-        && ops_are_equivalent(rhs_def, op2_def, scope);
+    // `dcc::OperationEquivalence oe;` — the three-argument constructor, which leaves `functor_`
+    // default-constructed and so null.
+    let no_functor = HighPreference::None;
+    let same_pair_matching = ops_are_equivalent(lhs_def, op1_def, scope, no_functor)
+        && ops_are_equivalent(rhs_def, op2_def, scope, no_functor);
     let opposite_pair_matching = !same_pair_matching
-        && ops_are_equivalent(lhs_def, op2_def, scope)
-        && ops_are_equivalent(rhs_def, op1_def, scope);
+        && ops_are_equivalent(lhs_def, op2_def, scope, no_functor)
+        && ops_are_equivalent(rhs_def, op1_def, scope, no_functor);
 
     // `if (!same_pair_matching && !opposite_pair_matching) return;`
     if !same_pair_matching && !opposite_pair_matching {
@@ -756,7 +758,9 @@ pub fn fuse_compare_and_select_into_min_or_max(
         (vc::CompareOp::Lt | vc::CompareOp::Le, true) => MinOrMaxFusion::ToMin,
         (vc::CompareOp::Lt | vc::CompareOp::Le, false) => MinOrMaxFusion::ToMax,
         (vc::CompareOp::Eq | vc::CompareOp::Neq, _) => {
-            todo!("Unable to lower compare and select into max/min operation (VectorChainHelper.cpp:463)")
+            todo!(
+                "Unable to lower compare and select into max/min operation (VectorChainHelper.cpp:463)"
+            )
         }
     }
 }
@@ -769,7 +773,11 @@ pub fn fuse_compare_and_select_into_min_or_max(
 /// because e065 is unportable without it (the `relu.mlir` duplicate-constant case above). The
 /// defaults it is built with are `dcc::OperationEquivalence oe;`, i.e.
 /// `do_recursive_compare = true, all_block_args_are_equiv = true, use_equiv_classes = true`
-/// (`OperationEquivalence.hpp:27-34`), with a null functor and a null `operands_equiv_checker`.
+/// (`OperationEquivalence.hpp:27-34`), with a null `operands_equiv_checker`.
+///
+/// ⭐ `preference` IS `functor_` TOGETHER WITH ITS `context_`, and it is `HighPreference::None` for
+/// e065 and every other site but one. Entry 193 is the exception, and it is a second caller of this
+/// function: see [`HighPreference::prefers`].
 ///
 /// The reference's shape, in order: same pointer ⇒ true; dialect, name, result count, operand count,
 /// region count, successor count and result types must match; attribute dictionaries compared
@@ -797,9 +805,20 @@ pub fn fuse_compare_and_select_into_min_or_max(
 /// compares their result numbers and calls them identical if equal — but two *different* values from
 /// one op have different result numbers by construction, so that branch never fires and a shared
 /// definition is always a mismatch.
-fn ops_are_equivalent(a: &DfirOp, b: &DfirOp, scope: &[DfirOp]) -> bool {
+pub(crate) fn ops_are_equivalent(
+    a: &DfirOp,
+    b: &DfirOp,
+    scope: &[DfirOp],
+    preference: HighPreference,
+) -> bool {
     // `if (&op_a == &op_b) return true;` — also the recursion's cycle guard.
     if core::ptr::eq(a, b) {
+        return true;
+    }
+
+    // `if (functor_ && functor_(op_a, op_b, context_)) return true;` (`:115-118`), which sits after
+    // the equivalence-class check this port drops and before every structural test below it.
+    if preference.prefers(a, b) {
         return true;
     }
 
@@ -819,7 +838,9 @@ fn ops_are_equivalent(a: &DfirOp, b: &DfirOp, scope: &[DfirOp]) -> bool {
             // Both are results. One shared definition means differing result numbers, hence a
             // mismatch; otherwise ask whether the two definitions compute the same thing.
             (Some(def_a), Some(def_b)) => {
-                if core::ptr::eq(def_a, def_b) || !ops_are_equivalent(def_a, def_b, scope) {
+                if core::ptr::eq(def_a, def_b)
+                    || !ops_are_equivalent(def_a, def_b, scope, preference)
+                {
                     return false;
                 }
             }
@@ -837,7 +858,7 @@ fn ops_are_equivalent(a: &DfirOp, b: &DfirOp, scope: &[DfirOp]) -> bool {
             return false;
         }
         for (inner_a, inner_b) in region_a.iter().zip(region_b.iter()) {
-            if !ops_are_equivalent(inner_a, inner_b, scope) {
+            if !ops_are_equivalent(inner_a, inner_b, scope, preference) {
                 return false;
             }
         }
@@ -2170,6 +2191,7 @@ pub fn merge_type_from_indices(
 
 #[cfg(test)]
 mod unit_tests {
+    use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
     use super::{
         MergeAndPack, MergeOrPack, MinOrMaxFusion, PackOrShuffle, PackRepetition, SliceMask,
         check_validity_of_pack_and_shuffle_lowering, compute_precision_of_op,
@@ -2181,7 +2203,6 @@ mod unit_tests {
         vector_element_wise_compare_operator_to_sentient_binary_operator,
         vector_ternary_to_sentient_ternary, vector_type_of,
     };
-    use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
     use crate::arch::Dd2;
     use crate::formats::Bits;
     use crate::generated::OpFunc;
@@ -2194,14 +2215,14 @@ mod unit_tests {
     /// The arch every fixture below is built for; nothing here is arch-dependent.
     type Target = Dd2;
 
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::{
+        OpId, VectorOperand, VectorOperandType,
+    };
     use crate::islands::dataflow_ir::dialects::Val;
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp};
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, Vector,
-    };
-    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::{
-        OpId, VectorOperand, VectorOperandType,
     };
     use crate::islands::sentient::dialects::sentient as sen;
 
@@ -2468,10 +2489,7 @@ mod unit_tests {
             compute_precision_of_op(&shuffle(vec(64, ElemType::F16))),
             sen::Precision::Fp16
         );
-        assert_ne!(
-            precision_in_string(ElemType::F16),
-            sen::Precision::IeeeFp16
-        );
+        assert_ne!(precision_in_string(ElemType::F16), sen::Precision::IeeeFp16);
     }
 
     /// ⛔ 062/384 — THE FIVE VECTOR-RESULTED OPS THAT ARE STILL OUTSIDE THE ELEMENT-TYPE DOMAIN.
@@ -2605,12 +2623,7 @@ mod unit_tests {
     fn ibms_pack24_row_is_sixty_four_indices_summing_to_912() {
         let mut vec: Vec<i32> = (0..16).map(|lane| lane * 8).collect();
         vec.extend(std::iter::repeat_n(-1, 48));
-        let row = MergeAndPack::new(
-            MergeOrPack::Pack(sen::PackIndex::P24),
-            Bits(2),
-            vec,
-            false,
-        );
+        let row = MergeAndPack::new(MergeOrPack::Pack(sen::PackIndex::P24), Bits(2), vec, false);
         assert_eq!(row.size(), 64);
         assert_eq!(row.sum(), 912);
         assert_eq!(
@@ -2636,12 +2649,8 @@ mod unit_tests {
             lanes.clone(),
             false,
         );
-        let pack14 = MergeAndPack::new(
-            MergeOrPack::Pack(sen::PackIndex::P14),
-            Bits(8),
-            lanes,
-            true,
-        );
+        let pack14 =
+            MergeAndPack::new(MergeOrPack::Pack(sen::PackIndex::P14), Bits(8), lanes, true);
         assert_eq!(pack12.size(), pack14.size());
         assert_eq!(pack12.sum(), pack14.sum());
         assert_eq!(pack12.vec(), pack14.vec());
@@ -3212,7 +3221,10 @@ mod unit_tests {
         let first = dfir_op::results(&body[0])[0];
         let second = dfir_op::results(&body[1])[0];
         assert_ne!(first, second);
-        assert_eq!(dfir_op::operands(&body[2]), std::vec![first, second, Val(300)]);
+        assert_eq!(
+            dfir_op::operands(&body[2]),
+            std::vec![first, second, Val(300)]
+        );
     }
 
     /// 🎯 AN UNUSED VECTOR CONSTANT AND EVERY SCALAR CONSTANT ARE LEFT EXACTLY WHERE THEY WERE.

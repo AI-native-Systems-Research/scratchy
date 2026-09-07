@@ -1745,10 +1745,325 @@ fn gcd(a: i64, b: i64) -> i64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+/// ONE LOCAL VARIABLE OF A FLATTENED ROW — the quotient MLIR introduces for a `floordiv` or a `mod`
+/// whose divisor does not cancel.
+///
+/// ⭐ IT CARRIES WHAT IT STANDS FOR, WHICH IS WHAT MAKES TWO OF THEM ONE COLUMN.
+/// `SimpleAffineExprFlattener` keeps a parallel `localExprs` list and `findLocalId` reuses the column
+/// of a local it has already introduced, so `(x floordiv 2) + (x floordiv 2)` is ONE column with
+/// coefficient 2 rather than two columns of 1. That difference is visible: an enclosing `mod 2` asks
+/// whether every column divides by 2, and the two spellings answer differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Local {
+    /// The dividend, itself flattened and already divided through by the common factor.
+    pub dividend: Box<FlatAffineExpr>,
+    /// The divisor, always positive.
+    pub divisor: i64,
+    /// This local's coefficient in the row that holds it.
+    pub coeff: i64,
+}
+
+/// ONE AFFINE EXPRESSION AS A COEFFICIENT ROW — the `flattenedExpr` of MLIR's
+/// `getFlattenedAffineExpr(expr, numDims, numSymbols, &coeffs, &constraints)`.
+///
+/// MLIR hands back ONE `SmallVector<int64_t>` laid out as
+/// `[dims.., syms.., locals.., constant]`, which is why its callers read the constant term as
+/// `coeffs.back()`:
+///
+/// ```cpp
+/// SmallVector<int64_t> coeffs;
+/// affine::FlatAffineValueConstraints constraints;
+/// auto flat_result =
+///     getFlattenedAffineExpr(expr, num_dims, 0, &coeffs, &constraints);
+/// int constant_offset = coeffs.size() != num_dims ? coeffs.back() : 0;
+/// ```
+/// (`Transform/Dataflow/MutableStartAddrShifting.cpp:474-478`, entries 191 and 192)
+///
+/// ⛔ THE FOUR GROUPS ARE SEPARATE FIELDS HERE, BECAUSE THE ONE FLAT VECTOR IS WHAT MAKES THAT
+/// `coeffs.size() != num_dims` GUARD LOOK LIKE A BOUNDS CHECK. It is not one: the row is always
+/// `num_dims + num_syms + num_locals + 1` wide, so it is longer than `num_dims` for every expression
+/// that flattens at all, and the `: 0` arm is dead. What it actually guards is FAILURE — a
+/// non-affine expression leaves `coeffs` EMPTY, and `coeffs.back()` on an empty `SmallVector` is
+/// undefined behaviour whenever `num_dims != 0`. Naming the constant column ([`Self::constant`])
+/// makes both the dead arm and the undefined one unwritable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatAffineExpr {
+    /// One coefficient per dimension of the space the expression was flattened over.
+    pub dims: Vec<i64>,
+    /// One coefficient per SYMBOL of that space.
+    pub syms: Vec<i64>,
+    /// The locals introduced along the way, in the order they were introduced.
+    pub locals: Vec<Local>,
+    /// The constant term — `coeffs.back()`.
+    pub constant: i64,
+}
+
+impl FlatAffineExpr {
+    /// THE ALL-ZERO ROW over a space of `dims` dimensions and `syms` symbols.
+    #[must_use]
+    pub fn zero(dims: u32, syms: u32) -> FlatAffineExpr {
+        FlatAffineExpr {
+            dims: vec![0; dims as usize],
+            syms: vec![0; syms as usize],
+            locals: Vec::new(),
+            constant: 0,
+        }
+    }
+
+    /// THE ROW AS A LITERAL, or `None` when it still holds a variable — `isa<AffineConstantExpr>` on
+    /// the flattened side, which is the test MLIR's `visitMulExpr`, `visitModExpr` and `visitDivExpr`
+    /// each make of their right-hand operand.
+    #[must_use]
+    pub fn as_constant(&self) -> Option<i64> {
+        let variable = self.dims.iter().chain(self.syms.iter()).any(|c| *c != 0)
+            || self.locals.iter().any(|local| local.coeff != 0);
+        if variable { None } else { Some(self.constant) }
+    }
+
+    /// EVERY COLUMN OF THE ROW, THE CONSTANT ONE INCLUDED — MLIR's `for (i = 0, e = lhs.size(); ..)`,
+    /// which runs over the whole `SmallVector` and therefore over the constant term as well.
+    fn row(&self) -> impl Iterator<Item = i64> {
+        self.dims
+            .iter()
+            .copied()
+            .chain(self.syms.iter().copied())
+            .chain(self.locals.iter().map(|local| local.coeff))
+            .chain(core::iter::once(self.constant))
+    }
+
+    /// `for (int64_t &v : lhs) v *= rhsConst;` — `visitMulExpr`.
+    fn scale(&mut self, k: i64) {
+        for coeff in self.dims.iter_mut().chain(self.syms.iter_mut()) {
+            *coeff *= k;
+        }
+        for local in &mut self.locals {
+            local.coeff *= k;
+        }
+        self.constant *= k;
+    }
+
+    /// `for (auto &c : lhs) c /= gcd;` — the numerator simplification `visitDivExpr` and
+    /// `visitModExpr` share. Every column divides exactly, `gcd` being their common factor.
+    fn divide(&mut self, gcd: i64) {
+        for coeff in self.dims.iter_mut().chain(self.syms.iter_mut()) {
+            *coeff /= gcd;
+        }
+        for local in &mut self.locals {
+            local.coeff /= gcd;
+        }
+        self.constant /= gcd;
+    }
+
+    /// TWO ROWS ADDED COLUMN BY COLUMN — `visitAddExpr`.
+    ///
+    /// ⭐ A LOCAL THE OTHER ROW ALREADY NAMES SHARES ITS COLUMN, which is `findLocalId`; one it does
+    /// not gets a new column, which is `addLocalFloorDivId`. See [`Local`].
+    fn add(&mut self, other: &FlatAffineExpr) {
+        if self.dims.len() < other.dims.len() {
+            self.dims.resize(other.dims.len(), 0);
+        }
+        if self.syms.len() < other.syms.len() {
+            self.syms.resize(other.syms.len(), 0);
+        }
+        for (mine, theirs) in self.dims.iter_mut().zip(&other.dims) {
+            *mine += *theirs;
+        }
+        for (mine, theirs) in self.syms.iter_mut().zip(&other.syms) {
+            *mine += *theirs;
+        }
+        for local in &other.locals {
+            self.add_local(local.clone());
+        }
+        self.constant += other.constant;
+    }
+
+    /// ONE LOCAL INTO THE ROW — `findLocalId` first, `addLocalFloorDivId` otherwise.
+    fn add_local(&mut self, local: Local) {
+        match self
+            .locals
+            .iter_mut()
+            .find(|held| held.dividend == local.dividend && held.divisor == local.divisor)
+        {
+            Some(held) => held.coeff += local.coeff,
+            None => self.locals.push(local),
+        }
+    }
+}
+
+impl AffineExpr {
+    /// THIS EXPRESSION AS A COEFFICIENT ROW — `getFlattenedAffineExpr(expr, num_dims, num_syms, ..)`,
+    /// MLIR's `SimpleAffineExprFlattener` transcribed.
+    ///
+    /// The row's constant column is what entries 191 and 192 read out of a subscript to learn how much
+    /// of it is a CONSTANT OFFSET that can be shifted into an immutable start address; see
+    /// [`FlatAffineExpr`].
+    ///
+    /// # ⭐ THE THREE INTERESTING CASES, AND WHY EACH IS WHAT IT IS
+    ///
+    /// **A product** must have a literal on one side (`visitMulExpr`); it scales the other side's row.
+    /// MLIR insists the literal be the RIGHT one, its canonical form, and reports failure otherwise —
+    /// this accepts either side, because `Mul(Const(8), Dim(0))` is writable in this island and
+    /// answering `8 * d0` for it is not a different answer, only a reachable one.
+    ///
+    /// **A `mod k`** is zero when every column of the dividend divides by `k` — `x * 8 mod 4` is
+    /// nothing — and otherwise becomes `dividend - k * q`, where `q` is a fresh local standing for
+    /// `dividend floordiv k`. The constant column is left ALONE in that second case: the local absorbs
+    /// the remainder, so a subscript like `(d0 + 5) mod 8` still reports a constant offset of 5.
+    ///
+    /// **A `floordiv k`** cancels when `k` divides every column, giving the divided row; otherwise the
+    /// whole row becomes a single fresh local with coefficient 1 and the constant column goes to ZERO
+    /// — `(d0 + 5) floordiv 8` offers no constant offset to shift, and reporting 5 there would shift
+    /// eight times too much.
+    ///
+    /// # ⛔ A LITERAL DIVIDEND IS FOLDED, BECAUSE MLIR FOLDS IT BEFORE THE FLATTENER EVER SEES IT
+    ///
+    /// `getAffineConstantExpr(-3).floorDiv(4)` is `-1` the moment it is built (`simplifyFloorDiv`,
+    /// `simplifyMod`), so the flattener's local-variable path is unreachable for an expression with no
+    /// variables in it. This island does not fold in its constructors — [`substitute_symbols`] says so
+    /// — so the fold happens HERE instead, and `Const(-3).floordiv(4)` reports `-1` rather than a
+    /// local standing for a value that is already known.
+    ///
+    /// # ⛔ WHAT IS A `todo!` AND NOT AN ANSWER
+    ///
+    /// A product of two variables, and a `mod`/`floordiv` by anything but a positive literal, are not
+    /// pure affine expressions. MLIR asserts (`"RHS constant has to be positive"`) or reports failure,
+    /// and its caller in entry 191 then reads `coeffs.back()` off an empty vector — undefined
+    /// behaviour. A `todo!` naming the shape is this crate's answer to that, exactly as
+    /// [`terms_in`] answers it for a constraint row.
+    #[must_use]
+    pub fn flatten(&self, dims: u32, syms: u32) -> FlatAffineExpr {
+        match self {
+            AffineExpr::Dim(n) => {
+                let mut row = FlatAffineExpr::zero(dims, syms);
+                set_column(&mut row.dims, *n);
+                row
+            }
+            AffineExpr::Sym(n) => {
+                let mut row = FlatAffineExpr::zero(dims, syms);
+                set_column(&mut row.syms, *n);
+                row
+            }
+            AffineExpr::Const(c) => FlatAffineExpr {
+                constant: *c,
+                ..FlatAffineExpr::zero(dims, syms)
+            },
+            AffineExpr::Add(a, b) => {
+                let mut row = a.flatten(dims, syms);
+                row.add(&b.flatten(dims, syms));
+                row
+            }
+            AffineExpr::Mul(a, b) => {
+                let lhs = a.flatten(dims, syms);
+                let rhs = b.flatten(dims, syms);
+                match (lhs.as_constant(), rhs.as_constant()) {
+                    // `int64_t rhsConst = rhs[getConstantIndex()]; for (v : lhs) v *= rhsConst;`
+                    (_, Some(k)) => {
+                        let mut row = lhs;
+                        row.scale(k);
+                        row
+                    }
+                    (Some(k), None) => {
+                        let mut row = rhs;
+                        row.scale(k);
+                        row
+                    }
+                    (None, None) => todo!(
+                        "a product of two variables is not an affine expression; MLIR's \
+                         visitMulExpr reports failure for it and its caller then reads the \
+                         constant column off an empty row"
+                    ),
+                }
+            }
+            AffineExpr::Mod(a, b) => {
+                let lhs = a.flatten(dims, syms);
+                let modulus = positive_literal(b, dims, syms, "mod");
+                if let Some(dividend) = lhs.as_constant() {
+                    // Folded at construction by `simplifyMod`, which is floored: `-3 mod 4` is 1.
+                    return FlatAffineExpr {
+                        constant: dividend.rem_euclid(modulus),
+                        ..FlatAffineExpr::zero(dims, syms)
+                    };
+                }
+                // "Check if the LHS expression is a multiple of modulo factor" — if it is, the
+                // whole expression is zero.
+                if lhs.row().all(|coeff| coeff % modulus == 0) {
+                    return FlatAffineExpr::zero(dims, syms);
+                }
+                // `expr % c` becomes `expr - c * q` with `q = expr floordiv c`, the GCD of the
+                // dividend and `c` cancelled out of the quotient first.
+                let common = lhs.row().fold(modulus, |g, coeff| gcd(g, coeff.abs()));
+                let mut dividend = lhs.clone();
+                dividend.divide(common);
+                let mut row = lhs;
+                row.add_local(Local {
+                    dividend: Box::new(dividend),
+                    divisor: modulus / common,
+                    coeff: -modulus,
+                });
+                row
+            }
+            AffineExpr::FloorDiv(a, b) => {
+                let lhs = a.flatten(dims, syms);
+                let divisor = positive_literal(b, dims, syms, "floordiv");
+                if let Some(dividend) = lhs.as_constant() {
+                    // Folded at construction by `simplifyFloorDiv`: `-3 floordiv 4` is -1.
+                    return FlatAffineExpr {
+                        constant: dividend.div_euclid(divisor),
+                        ..FlatAffineExpr::zero(dims, syms)
+                    };
+                }
+                // "Simplify the floordiv, ceildiv if possible by canceling out the greatest common
+                // divisors of the numerator and denominator."
+                let common = lhs.row().fold(divisor, |g, coeff| gcd(g, coeff.abs()));
+                let mut row = lhs;
+                row.divide(common);
+                let denominator = divisor / common;
+                // "If the denominator becomes 1, the updated LHS is the result."
+                if denominator == 1 {
+                    return row;
+                }
+                let mut divided = FlatAffineExpr::zero(dims, syms);
+                divided.locals.push(Local {
+                    dividend: Box::new(row),
+                    divisor: denominator,
+                    coeff: 1,
+                });
+                divided
+            }
+        }
+    }
+}
+
+/// COLUMN `pos` OF A COEFFICIENT GROUP SET TO ONE.
+///
+/// ⚠️ A POSITION PAST THE STATED ARITY GETS ITS OWN COLUMN rather than being dropped. MLIR asserts
+/// `position < numDims`; dropping the variable instead would make `d7` read as ZERO in a two-
+/// dimensional space, which is a wrong constant column rather than a missing one.
+fn set_column(coeffs: &mut Vec<i64>, pos: u32) {
+    let pos = pos as usize;
+    if coeffs.len() <= pos {
+        coeffs.resize(pos + 1, 0);
+    }
+    coeffs[pos] = 1;
+}
+
+/// THE DIVISOR OF A `mod` OR A `floordiv`, WHICH HAS TO BE A POSITIVE LITERAL —
+/// `assert(rhsConst > 0 && "RHS constant has to be positive")`.
+fn positive_literal(expr: &AffineExpr, dims: u32, syms: u32, op: &str) -> i64 {
+    match expr.flatten(dims, syms).as_constant() {
+        Some(k) if k > 0 => k,
+        _ => todo!(
+            "a `{op}` by anything but a positive literal is not a pure affine expression; MLIR's \
+             flattener asserts `rhsConst > 0` and its caller then reads the constant column off an \
+             empty row"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::islands::dataflow_ir::ty::{
-        AffineExpr, AffineMap, BoundType, Constraint, FlatConstraints, IntegerSet,
+        AffineExpr, AffineMap, BoundType, Constraint, FlatAffineExpr, FlatConstraints, IntegerSet,
     };
 
     /// `expr >= 0`.
@@ -2324,6 +2639,232 @@ mod tests {
                 Box::new(AffineExpr::dim(1)),
                 Box::new(AffineExpr::dim(0))
             )]
+        );
+    }
+
+    /// ⭐ COMPOSING A SUBSCRIPTS MAP WITH ITS TRANSFER ORDER REORDERS THE SUBSCRIPTS — the one thing
+    /// `ad.getTransferOrder().compose(ad.getSubscriptsMap())` is for (entries 191 and 192).
+    ///
+    /// An order of `(d0, d1) -> (d1, d0)` over subscripts `(d0 + 3, d1 * 8 + 5)` puts the SECOND
+    /// subscript first, so the constant offsets entry 191 reads come out in transfer order: 5 then 3.
+    #[test]
+    fn compose_applies_the_transfer_order_to_the_subscripts() {
+        let order = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(1), AffineExpr::dim(0)],
+        };
+        let subscripts = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(0).plus(AffineExpr::Const(3)),
+                AffineExpr::dim(1).times(8).plus(AffineExpr::Const(5)),
+            ],
+        };
+        let ordered = order.compose(&subscripts);
+        assert_eq!(ordered.dims, 2);
+        assert_eq!(ordered.syms, 0);
+        assert_eq!(
+            ordered.results,
+            vec![
+                AffineExpr::dim(1).times(8).plus(AffineExpr::Const(5)),
+                AffineExpr::dim(0).plus(AffineExpr::Const(3)),
+            ]
+        );
+        // And the constant columns come out in that order.
+        let offsets: Vec<i64> = ordered
+            .results
+            .iter()
+            .map(|expr| expr.flatten(ordered.dims, 0).constant)
+            .collect();
+        assert_eq!(offsets, vec![5, 3]);
+    }
+
+    /// ⭐ AND THE IDENTITY ORDER LEAVES THEM ALONE — the common case, an unpermuted transfer.
+    #[test]
+    fn composing_with_the_identity_order_changes_nothing() {
+        let subscripts = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(1).plus(AffineExpr::Const(64)),
+                AffineExpr::dim(2),
+            ],
+        };
+        assert_eq!(AffineMap::identity(3).compose(&subscripts), subscripts);
+    }
+
+    /// ⛔ THE COMPOSED MAP'S SYMBOL SPACES ARE CONCATENATED, `self`'s FIRST.
+    ///
+    /// MLIR renumbers the inner map's symbols to start after the outer map's and states the SUM as the
+    /// result's symbol count, so the inner `s0` becomes `s1` here. Aliasing them would make one
+    /// constraint row solve for the other map's parameter.
+    #[test]
+    fn compose_renumbers_the_inner_maps_symbols() {
+        let outer = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::dim(0).plus(AffineExpr::sym(0))],
+        };
+        let inner = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::sym(0).plus(AffineExpr::Const(2))],
+        };
+        let composed = outer.compose(&inner);
+        assert_eq!(composed.dims, 1);
+        assert_eq!(composed.syms, 2);
+        assert_eq!(
+            composed.results,
+            vec![
+                AffineExpr::sym(1)
+                    .plus(AffineExpr::Const(2))
+                    .plus(AffineExpr::sym(0)),
+            ]
+        );
+    }
+
+    /// ⭐ THE CONSTANT COLUMN OF A FLATTENED SUBSCRIPT IS THE OFFSET ENTRIES 191 AND 192 SHIFT.
+    #[test]
+    fn flatten_reads_a_subscripts_constant_offset() {
+        assert_eq!(AffineExpr::dim(0).flatten(2, 0).constant, 0);
+        assert_eq!(
+            AffineExpr::dim(0).plus(AffineExpr::Const(3)).flatten(2, 0),
+            FlatAffineExpr {
+                dims: vec![1, 0],
+                syms: vec![],
+                locals: vec![],
+                constant: 3,
+            }
+        );
+        assert_eq!(
+            AffineExpr::dim(1)
+                .times(8)
+                .plus(AffineExpr::Const(5))
+                .flatten(2, 0),
+            FlatAffineExpr {
+                dims: vec![0, 8],
+                syms: vec![],
+                locals: vec![],
+                constant: 5,
+            }
+        );
+        // A symbol has its own column, and a constant multiple of it scales that column.
+        assert_eq!(
+            AffineExpr::sym(0).times(-4).flatten(1, 2),
+            FlatAffineExpr {
+                dims: vec![0],
+                syms: vec![-4, 0],
+                locals: vec![],
+                constant: 0,
+            }
+        );
+    }
+
+    /// ⛔ THE `coeffs.size() != num_dims` GUARD IS DEAD, WHICH IS WHY THE PORT DOES NOT WRITE IT.
+    ///
+    /// The row is `num_dims + num_syms + num_locals + 1` wide, so it is longer than `num_dims` for
+    /// every expression that flattens at all — the `: 0` arm of entry 191's ternary is unreachable and
+    /// what the guard really shields is a FAILED flattening, where MLIR leaves `coeffs` empty and
+    /// `coeffs.back()` is undefined behaviour.
+    #[test]
+    fn the_row_is_always_wider_than_the_dimension_count() {
+        for expr in [
+            AffineExpr::Const(0),
+            AffineExpr::dim(0),
+            AffineExpr::dim(1).times(8).plus(AffineExpr::Const(5)),
+            AffineExpr::dim(0).plus(AffineExpr::Const(5)).modulo(8),
+        ] {
+            let row = expr.flatten(2, 0);
+            assert!(row.dims.len() + row.syms.len() + row.locals.len() + 1 > 2);
+        }
+    }
+
+    /// ⭐ A `mod` WHOSE DIVIDEND IS A MULTIPLE OF THE MODULUS IS NOTHING AT ALL, and one that is not
+    /// keeps its constant column while a local absorbs the remainder.
+    ///
+    /// `(d0 * 8) mod 4` is zero — every column divides by 4. `(d0 + 5) mod 8` still reports the
+    /// offset 5, because `expr % c` flattens to `expr - c * q` and only `q`'s column carries the `-8`.
+    #[test]
+    fn flatten_of_a_mod_is_zero_only_when_the_dividend_is_a_multiple() {
+        assert_eq!(
+            AffineExpr::dim(0).times(8).modulo(4).flatten(1, 0),
+            FlatAffineExpr::zero(1, 0)
+        );
+        let remainder = AffineExpr::dim(0)
+            .plus(AffineExpr::Const(5))
+            .modulo(8)
+            .flatten(1, 0);
+        assert_eq!(remainder.constant, 5);
+        assert_eq!(remainder.dims, vec![1]);
+        assert_eq!(remainder.locals.len(), 1);
+        assert_eq!(remainder.locals[0].coeff, -8);
+        assert_eq!(remainder.locals[0].divisor, 8);
+    }
+
+    /// ⭐ A `floordiv` THAT CANCELS DIVIDES THE ROW; ONE THAT DOES NOT ZEROES THE CONSTANT COLUMN.
+    ///
+    /// ⛔ AND THAT SECOND HALF IS LOAD-BEARING FOR ENTRY 191. `(d0 + 5) floordiv 8` offers NO constant
+    /// offset to shift out — the 5 is inside the quotient — and reporting 5 there would move the
+    /// immutable start address by eight times too much.
+    #[test]
+    fn flatten_of_a_floordiv_cancels_or_becomes_a_local() {
+        assert_eq!(
+            AffineExpr::dim(0)
+                .times(8)
+                .plus(AffineExpr::Const(16))
+                .floordiv(8)
+                .flatten(1, 0),
+            FlatAffineExpr {
+                dims: vec![1],
+                syms: vec![],
+                locals: vec![],
+                constant: 2,
+            }
+        );
+        let uncancelled = AffineExpr::dim(0)
+            .plus(AffineExpr::Const(5))
+            .floordiv(8)
+            .flatten(1, 0);
+        assert_eq!(uncancelled.constant, 0);
+        assert_eq!(uncancelled.dims, vec![0]);
+        assert_eq!(uncancelled.locals.len(), 1);
+        assert_eq!(uncancelled.locals[0].coeff, 1);
+    }
+
+    /// ⛔ A LITERAL DIVIDEND IS FOLDED, AND FLOORED — what MLIR's own constructors do before the
+    /// flattener is ever called (`simplifyFloorDiv`, `simplifyMod`).
+    ///
+    /// `-3 floordiv 4` is `-1` and `-3 mod 4` is `1`; truncating division would answer `0` and `-3`.
+    #[test]
+    fn a_literal_dividend_folds_the_way_mlirs_constructors_fold_it() {
+        assert_eq!(AffineExpr::Const(-3).floordiv(4).flatten(1, 0).constant, -1);
+        assert_eq!(AffineExpr::Const(-3).modulo(4).flatten(1, 0).constant, 1);
+        assert_eq!(AffineExpr::Const(9).floordiv(4).flatten(1, 0).constant, 2);
+        assert_eq!(AffineExpr::Const(9).modulo(4).flatten(1, 0).constant, 1);
+    }
+
+    /// ⛔ ONE LOCAL, ONE COLUMN — `findLocalId`, and the divisibility test that depends on it.
+    ///
+    /// `(d0 floordiv 2) + (d0 floordiv 2)` is one column with coefficient 2, so an enclosing `mod 2`
+    /// cancels the whole expression. Two columns of 1 each — a flattener that appended blindly —
+    /// would answer that nothing divides by 2 and report a constant offset of 4 for the `+ 4` below.
+    #[test]
+    fn a_repeated_local_shares_its_column() {
+        let half = AffineExpr::dim(0).floordiv(2);
+        let doubled = half.clone().plus(half);
+        let row = doubled.flatten(1, 0);
+        assert_eq!(row.locals.len(), 1);
+        assert_eq!(row.locals[0].coeff, 2);
+        assert_eq!(
+            doubled
+                .plus(AffineExpr::Const(4))
+                .modulo(2)
+                .flatten(1, 0)
+                .constant,
+            0
         );
     }
 }

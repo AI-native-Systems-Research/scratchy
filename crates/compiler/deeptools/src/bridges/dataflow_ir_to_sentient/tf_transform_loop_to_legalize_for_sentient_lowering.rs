@@ -63,7 +63,11 @@
 //! | `e292_transformSCFLoopWithNonConstantUpperBound` | 292/384 | 94 | `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169` |
 //! | `e293_runOn` | 293/384 | 5 | `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447` |
 
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, scf};
+use super::tf_loop_unroll_for_shuffle_op::TripCount;
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol, uses,
+};
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 
 /// AN `scf.for` AS THIS REWRITE READS IT — the `dyn_cast`, and only the fields it touches.
@@ -329,6 +333,704 @@ pub fn transform_scf_to_affine_loop(
     }))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 194/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH LOOP FORMS `analyzeLoop` RECOGNISES — its three `dyn_cast`s (`:273`, `:281`, `:310`).
+///
+/// ⛔⛔ THREE VARIANTS BECAUSE THE FOURTH ANSWER IS `llvm_unreachable("Unknown loop operation")`
+/// (`:315`). The parameter's type is `LoopLikeOpInterface`, which `scf.while`, `scf.parallel` and
+/// `affine.parallel` also implement, so the reference ABORTS on a loop it does not know. Making the
+/// three a closed set moves that from a run-time abort to a place where it cannot be constructed:
+/// [`Self::of`] answers `None`, and a walk that skips the op leaves it exactly as the abort's premise
+/// says it should never have been. This crate never asserts, and a stop here would pre-empt dbo-opt —
+/// the only oracle (`crates/targets/spyre/tests/dfir_never_runtime_refuses.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopUnderAnalysis<'a> {
+    /// `dyn_cast<affine::AffineForOp>(loop.getOperation())`.
+    AffineFor {
+        /// `affine_for.getInductionVar()`.
+        iv: Val,
+        /// The lower bound map.
+        lo: affine::Bound,
+        /// The upper bound map.
+        hi: affine::Bound,
+        /// The region's single block.
+        body: &'a [DfirOp],
+    },
+    /// `dyn_cast<scf::ForOp>(loop.getOperation())`.
+    ScfFor {
+        /// `scf_for.getInductionVar()`.
+        iv: Val,
+        /// `getLowerBound()`, an operand.
+        lo: Val,
+        /// `getUpperBound()`, an operand.
+        hi: Val,
+        /// `getStep()`, an operand.
+        step: Val,
+        /// The region's single block.
+        body: &'a [DfirOp],
+    },
+    /// `dyn_cast<sentient::ForOp>(loop.getOperation())` — already lowered, so nothing to legalize.
+    ///
+    /// ⚠️ [`Self::of`] NEVER PRODUCES THIS ONE, and that is a fact about the two islands rather than
+    /// an omission: a `sentient.for` is a [`crate::islands::sentient::dialects::Op`], not a
+    /// [`DfirOp`], so a DataflowIR program cannot hold one. The variant is here because the answer
+    /// for it — `kNone` — is part of what entry 194 says, and a caller holding a mixed module can
+    /// state it.
+    SentientFor,
+}
+
+impl<'a> LoopUnderAnalysis<'a> {
+    /// The three `dyn_cast`s, in the reference's own order.
+    ///
+    /// `None` is `llvm_unreachable("Unknown loop operation")` — see the type's note.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<LoopUnderAnalysis<'a>> {
+        match op {
+            DfirOp::Affine(affine::Op::For {
+                iv, lo, hi, body, ..
+            }) => Some(LoopUnderAnalysis::AffineFor {
+                iv: *iv,
+                lo: *lo,
+                hi: *hi,
+                body,
+            }),
+            DfirOp::Scf(scf::Op::For {
+                iv,
+                lo,
+                hi,
+                step,
+                body,
+                ..
+            }) => Some(LoopUnderAnalysis::ScfFor {
+                iv: *iv,
+                lo: *lo,
+                hi: *hi,
+                step: *step,
+                body,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// `enum TransformType { kNone, KUnroll, KSplitParent }` (`:53`).
+///
+/// ⭐ NOT A REFUSAL IN ANY VARIANT. This is a decision about what to DO to a loop, and
+/// [`Self::None`] is *"if no action required, return"* (`:401-404`) — the answer for the vast
+/// majority of loops in a program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopTransform {
+    /// `kNone` — leave the loop alone.
+    None,
+    /// `KUnroll` — the loop indexes an LRF register file, which the Sentient ISA cannot address
+    /// dynamically, so the iterations must become straight-line code.
+    Unroll,
+    /// `KSplitParent` — the loop's bound is not a constant, so the CONDITIONAL that computes it has
+    /// to be lifted out into an `scf.if` with one affine loop per branch (entry 292).
+    SplitParent,
+}
+
+/// `is_any_of(curr_unit_, L3LU, L3SU, LXLU, LXSU, L0LU, L0SU)` — the six load and store halves.
+///
+/// ⭐ THE UNITS WHOSE LOOPS `AgenToSentient` HANDLES NATIVELY, which is the reference's own reason:
+/// *"Allow for symbolic upper bounds in case of load/store units since AgenToSentient is already
+/// enhanced to support scf.for loops natively"* (`:299-300`).
+const LOAD_AND_STORE_UNITS: [GenericComp; 6] = [
+    GenericComp::L3lu,
+    GenericComp::L3su,
+    GenericComp::Lxlu,
+    GenericComp::Lxsu,
+    GenericComp::L0lu,
+    GenericComp::L0su,
+];
+
+/// `is_any_of(curr_unit_, L3LU, L3SU)` — the two halves whose parent is NOT split.
+const L3_HALVES: [GenericComp; 2] = [GenericComp::L3lu, GenericComp::L3su];
+
+/// `is_any_of(curr_unit_, PT, SFP, PE)` — the three units that own register files.
+const REGISTER_FILE_UNITS: [GenericComp; 3] = [GenericComp::Pt, GenericComp::Sfp, GenericComp::Pe];
+
+/// `isa<agen::VectorLoadOp, agen::VectorStoreOp, agen::CompositeLoadOp, agen::CompositeStoreOp,
+/// agen::CompositeLoadAndStoreOp>(use)` (`:329-331`).
+///
+/// ⚠️ THREE OF THE FIVE, for the reason entry 141 already records: the island declares
+/// `vector_load`, `vector_store` and `composite_load_and_store` and not `composite_load` or
+/// `composite_store`, and the brief's rule to grow the island is about a function's *input*
+/// (`AGENT-BRIEF.md:57`) — this predicate's input is any op at all. See
+/// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::is_data_transfer`], which lists the
+/// same absences.
+///
+/// ⛔ NO WILDCARD. A new island op has to state whether the induction variable reaching it makes the
+/// loop a candidate; falling through to `false` would silently stop a loop being unrolled.
+fn is_memory_op(op: &DfirOp) -> bool {
+    match op {
+        DfirOp::Agen(
+            agen::Op::VectorLoad { .. }
+            | agen::Op::VectorStore { .. }
+            | agen::Op::CompositeLoadAndStore(_),
+        ) => true,
+        // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else.
+        DfirOp::Agen(agen::Op::Yield)
+        | DfirOp::Arith(_)
+        | DfirOp::Scf(_)
+        | DfirOp::Affine(_)
+        | DfirOp::Dataflow(_)
+        // ⛔ `vector.load`/`vector.store` ARE NOT IN THE FIVE-CLASS `isa<>` LIST, AND THAT IS THE
+        // ANSWER TO WATCH: the `memref` switch below DOES name `affine::AffineVectorLoadOp` and
+        // `affine::AffineStoreOp` (`:348-362`), so the reference asks a WIDER question there than
+        // it asks here. A loop whose induction variable reaches only a plain upstream access is not
+        // a candidate at all, so it never reaches that switch and the difference is unobservable.
+        | DfirOp::Vector(_)
+        // ⭐ AND NO `uniform.` OP IS ONE. `uniform.uniformize_regions` HOLDS accesses rather than
+        // being one — the ones inside its regions answer for themselves — and `uniform.query_map`
+        // binds an index the schedule resolves later.
+        | DfirOp::Uniform(_)
+        | DfirOp::VectorChain(_)
+        | DfirOp::Symbol(_) => false,
+    }
+}
+
+/// THE VIEW A MEMORY OP READS OR WRITES — the reference's `memref` switch (`:348-362`).
+///
+/// ```cpp
+/// Value memref = nullptr;
+/// if (auto agen_load = llvm::dyn_cast<agen::VectorLoadOp>(use)) {
+///   memref = agen_load.getMemRef();
+/// } else if (auto agen_store = llvm::dyn_cast<agen::VectorStoreOp>(use)) {
+///   memref = agen_store.getMemRef();
+/// } else if (auto vec_load = llvm::dyn_cast<affine::AffineVectorLoadOp>(use)) {
+///   memref = vec_load.getMemref();
+/// } else if (auto vec_store = llvm::dyn_cast<affine::AffineStoreOp>(use)) {
+///   memref = vec_store.getMemref();
+/// } else {
+///   // note that there is no composite load/store and load_store for PT, PE,
+///   // SFP
+///   llvm_unreachable("Memory operation not supported");
+/// }
+/// ```
+///
+/// ⛔⛔ THE TWO `affine` ARMS ARE DEAD IN THE REFERENCE. [`is_memory_op`] above admits five `agen`
+/// classes and NEITHER affine form, so `use` can never be an `affine.vector_load` or an
+/// `affine.store` by the time this switch runs. They are transcribed because they are what the file
+/// says; nothing reaches them.
+///
+/// ⚠️ AND THE FOURTH ARM IS `affine::AffineStoreOp` — `affine.store`, a SCALAR store, despite the
+/// variable being named `vec_store`. This island declares only `affine.vector_store`, which is the
+/// arm below; the pairing does not matter, because neither is reachable.
+///
+/// ⛔ AND THE `llvm_unreachable` IS THE THREE COMPOSITES, guarded by the caller's
+/// [`REGISTER_FILE_UNITS`] test and the reference's own note that *"there is no composite load/store
+/// and load_store for PT, PE, SFP"*. `None` is that abort: the caller moves to the next user, which
+/// leaves the loop untouched and lets dbo-opt speak if the premise was ever wrong.
+fn view_of(op: &DfirOp) -> Option<Val> {
+    match op {
+        DfirOp::Agen(agen::Op::VectorLoad { view, .. } | agen::Op::VectorStore { view, .. }) => {
+            Some(*view)
+        }
+        // The two arms `is_memory_op` never admits.
+        DfirOp::Affine(
+            affine::Op::VectorLoad { view, .. } | affine::Op::VectorStore { view, .. },
+        ) => Some(*view),
+        _ => None,
+    }
+}
+
+/// `memref.getDefiningOp<dataflow::GetLogicalMemoryViewOp>().getFromUnit()` (`:364-367`).
+///
+/// ⚠️ THE PAGED VIEW IS ANSWERED TOO, WHERE THE REFERENCE WOULD FOLLOW A NULL. `getDefiningOp<T>()`
+/// returns null for a `get_paged_logical_memory_view` and `getFromUnit()` is called on it
+/// unconditionally. The two ops differ only in whether the region is segmented and the question
+/// being asked is about the UNIT the view is over, so answering it from either is the same fact —
+/// and it is the only answer that is not a crash.
+fn view_from_unit(view: Val, scope: &[DfirOp]) -> Option<Val> {
+    match defining_op(view, scope)? {
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { from, .. }) => Some(*from),
+        DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(paged)) => Some(paged.unit),
+        _ => None,
+    }
+}
+
+/// `is_any_of(mem_unit, LRFREG)` where `mem_unit = dcc::getUnitType(..)` (`:366-387`, `:389-390`).
+///
+/// # ⭐⭐ EXACTLY THREE OF THIS ISLAND'S SIX `get_local_unit` NAMES ARE `LRFREG`
+///
+/// `getUnitType` lowercases the op's `name` (a `get_local_unit`) or `type` (a `get_unit`), looks it
+/// up in `stringToSenComponents`, and maps the result through `senCompToGenericComp`
+/// (`Utils/DccExtContext.cpp:126-138`). That table sends `PE_LRFREG`, `SFP_LRFREG`, `PT_LRFREG` and
+/// the bare `LRFREG` to `LRFREG` — and sends `PTXRF` to `PTXRF`, `PTARF` to `PTARF`, `PELRF` to
+/// `PELRF` and `SFPLRF` to `SFPLRF`, each its own image (`sys-arch-spec/arch_enums.cpp:153-162`).
+///
+/// ⛔ SO THE PT's TRANSPOSED AND ACCUMULATOR FILES ARE **NOT** LRF REGISTERS HERE. A loop indexing an
+/// `ptxrf` view is not unrolled by this pass, and a port that had matched "any register file" would
+/// have fully unrolled every matmul's kernel walk.
+///
+/// ⚠️ AND A `get_unit` IS NEVER ONE. [`crate::units::DfirUnit`] has no `lrfreg` spelling — register
+/// files are bound by `dataflow.get_local_unit`, never by `get_unit` — so
+/// [`crate::units::DfirUnit::generic`] cannot answer `LRFREG` and [`GenericComp`] has no variant for
+/// it. The whole question is therefore *"is this view over one of the three LRFs?"*
+///
+/// ⚠️ AND `l0scale` IS A LOOKUP THE REFERENCE THROWS ON. `senCompToGenericComp` has 300-odd entries
+/// and NO `L0_SCALE` key (`arch_enums.cpp:153-162` names every register file but that one), so
+/// `.at(record->second)` raises `std::out_of_range` for a view over the L0's scale region. `false` is
+/// the fact the missing entry stands for: a scale region is not an LRF.
+///
+/// ⚠️ The `uniform::QueryMapOp` arm (`:373-384`) has no input in this island — see
+/// [`crate::bridges::dataflow_ir_to_sentient::agen_helper::ConsumerUnits`], which records the same
+/// absence — and the reference's `llvm_unreachable("Unknown unit")` (`:386`) is what `false` stands
+/// for below.
+///
+/// ⚠️ `getUnitType` ALSO DEREFERENCES AN END ITERATOR for a name outside
+/// `stringToSenComponents`: `find(op.getName().lower())` is read as `record->second` with no check
+/// (`DccExtContext.cpp:133-138`). A [`dataflow::LocalUnit`] is a closed set of six, so this port has
+/// no unspellable name to reach it with.
+fn unit_is_lrf(unit: Val, scope: &[DfirOp]) -> bool {
+    match defining_op(unit, scope) {
+        Some(DfirOp::Dataflow(dataflow::Op::GetLocalUnit { which, .. })) => match which {
+            dataflow::LocalUnit::PeLrf
+            | dataflow::LocalUnit::SfpLrf
+            | dataflow::LocalUnit::PtLrf => true,
+            // `PTXRF`, `PTARF` and `L0SCALE` are each their own generic component.
+            dataflow::LocalUnit::PtXrf
+            | dataflow::LocalUnit::PtArf
+            | dataflow::LocalUnit::L0Scale => false,
+        },
+        // A `get_unit` cannot name a register file; anything else is the `llvm_unreachable`.
+        _ => false,
+    }
+}
+
+/// `getDefiningOp<arith::ConstantIndexOp>()`, and its value where there is one.
+fn index_constant(val: Val, scope: &[DfirOp]) -> Option<i64> {
+    match defining_op(val, scope)? {
+        DfirOp::Arith(arith::Op::Constant { value, .. }) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Replaces: e194_analyzeLoop
+///
+/// **194/384** `TransformLoopToLegalizeForSentientLowering::analyzeLoop` —
+/// `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268` (127L).
+///
+/// ```cpp
+/// TransformType analyzeLoop(LoopLikeOpInterface loop) {
+///   Value induc_var = nullptr;
+///   bool constant_bounds = false;
+///   bool affine_non_const_maps = true;
+///   if (auto affine_for = llvm::dyn_cast<affine::AffineForOp>(loop.getOperation())) {
+///     induc_var = affine_for.getInductionVar();
+///     constant_bounds = affine_for.hasConstantBounds();
+///     affine_non_const_maps = !affine_for.hasConstantBounds();
+///   } else if (auto scf_for = llvm::dyn_cast<scf::ForOp>(loop.getOperation())) {
+///     // if a bound is defined for uniformation purpose, don't convert
+///     if (dyn_cast<uniform::QueryMapOp>(scf_for.getLowerBound().getDefiningOp()) ||
+///         dyn_cast<uniform::QueryMapOp>(scf_for.getUpperBound().getDefiningOp())) {
+///       return kNone;
+///     }
+///     affine_non_const_maps = false;
+///     induc_var = scf_for.getInductionVar();
+///     auto lb_const = isa<arith::ConstantIndexOp>(scf_for.getLowerBound().getDefiningOp());
+///     bool ub_const = isa<arith::ConstantIndexOp>(scf_for.getUpperBound().getDefiningOp());
+///     auto step_const = scf_for.getStep().getDefiningOp<arith::ConstantIndexOp>();
+///     DT_CHECK_MSG(step_const.value() == 1,
+///                  "We expect the SCF-for loop to have step size of 1");
+///
+///     // Allow for symbolic upper bounds in case of load/store units since
+///     // AgenToSentient is already enhanced to support scf.for loops natively.
+///     if (!ub_const && is_any_of(curr_unit_, L3LU, L3SU, LXLU, LXSU, L0LU, L0SU)) {
+///       if (isa<mlir::symbol::CreateSymbolOp>(scf_for.getUpperBound().getDefiningOp())) {
+///         return kNone;
+///       }
+///     }
+///     constant_bounds = lb_const && ub_const && step_const;
+///   } else if (auto sentient_for = llvm::dyn_cast<sentient::ForOp>(loop.getOperation())) {
+///     affine_non_const_maps = false;
+///     return kNone;
+///   } else {
+///     llvm_unreachable("Unknown loop operation");
+///   }
+///
+///   // if loop has constant bounds in load units or store units --> don't perform conversion
+///   if (constant_bounds && is_any_of(curr_unit_, L3LU, L3SU, LXLU, LXSU, L0LU, L0SU)) {
+///     return kNone;
+///   }
+///
+///   for (auto* use : induc_var.getUsers()) {
+///     bool is_memory_op = isa<agen::VectorLoadOp, agen::VectorStoreOp, agen::CompositeLoadOp,
+///                             agen::CompositeStoreOp, agen::CompositeLoadAndStoreOp>(use);
+///     // if it's not a memory operation, --> don't perform conversion
+///     if (!is_memory_op) { continue; }
+///
+///     // if it's not constant, then unrolling doesn't work.
+///     // we currently support bound being part of conditional on the parent loop.
+///     if (!constant_bounds && !affine_non_const_maps) {
+///       // TODO: enhance condition to do splitting only for PT.
+///       if (!is_any_of(curr_unit_, L3LU, L3SU)) return KSplitParent;
+///     }
+///
+///     // in the constant bounds and in PT LRF's --> perform unrolling
+///     if (is_any_of(curr_unit_, PT, SFP, PE)) {
+///       Value memref = nullptr;                        /* the switch, `:348-362` */
+///       auto view_op = memref.getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///       SenComponents mem_unit;                        /* the three unit forms, `:366-387` */
+///       if (is_any_of(mem_unit, LRFREG)) { return KUnroll; }
+///     }
+///   }
+///
+///   return kNone;
+/// }
+/// ```
+///
+/// # ⭐⭐ `affine_non_const_maps` IS NOT A SECOND FACT — IT IS "THIS IS AN `scf.for`"
+///
+/// Read the three assignments together. The affine arm sets it to `!hasConstantBounds()` while
+/// `constant_bounds` is `hasConstantBounds()`, so the two are COMPLEMENTS there; the scf arm sets it
+/// to `false`; the sentient arm sets it and returns. The one place it is read is
+/// `!constant_bounds && !affine_non_const_maps` (`:340`), which is therefore
+///
+/// | loop | `!constant_bounds && !affine_non_const_maps` |
+/// |---|---|
+/// | `affine.for` | `!cb && cb` — **always false** |
+/// | `scf.for` | `!cb && true` — exactly *"the bounds are not all constants"* |
+///
+/// ⛔⛔ SO `KSplitParent` IS `scf.for`-ONLY, and `transformLoop` agrees: its `affine.for` branch
+/// handles `KUnroll` and nothing else (`:406-414`), while `KSplitParent` reaches
+/// `transformSCFLoopWithNonConstantUpperBound(scf_for)` (`:430-435`). A port that had carried
+/// `affine_non_const_maps` as a free `bool` would have made an unreachable state reachable; the match
+/// below states the loop's FORM once and derives both.
+///
+/// # ⭐ THE THREE ANSWERS, AGAINST THE VENDOR'S OWN THREE FILES
+///
+/// | vendor case | unit | loop | answer |
+/// |---|---|---|---|
+/// | `l3lu_disable_transformation.mlir` | `l3lu` | `scf.for %c0 to %10` where `%10 = arith.select` | [`LoopTransform::None`] — output is byte-identical to input |
+/// | `memory-dyn-loops.mlir` | `l0lurow0` | the same shape, one `agen.vector_load` on the `iv` | [`LoopTransform::SplitParent`] — `:127` becomes `scf.if` + two `affine.for`s of extent 2 and 1 |
+/// | `dyn-loops-cond-bound.mlir` | `ptrow0` | two `scf.for`s on `arith.select` bounds, each with a memory user on `pt_lrfreg` | [`LoopTransform::SplitParent`] — `:173` and `:185` each become `scf.if`, the then-arm holding TWO body copies and the else-arm ONE |
+///
+/// ⛔ THE L3 CASE IS THE ONE THAT PROVES THE COMPONENT TEST MATTERS: the two inputs have the same
+/// loop, the same `arith.select` bound and the same memory user, and the ONLY difference is which
+/// unit the enclosing `dataflow.program_unit` runs on. The vendor's `CHECK-SENT-IR` for the `l3lu`
+/// file reproduces its input line for line.
+///
+/// # ⛔ THE `DT_CHECK_MSG` ON THE STEP BECOMES `kNone`, NOT AN ABORT
+///
+/// *"We expect the SCF-for loop to have step size of 1"* (`:296-297`) is an assertion, and
+/// `step_const.value()` also dereferences a null when the step is not a constant at all. This crate
+/// never asserts. `kNone` is the answer that leaves the loop EXACTLY as the assertion's premise says
+/// it already is — untouched — so a step-2 `scf.for` over an LRF reaches dbo-opt and is refused
+/// there, by the only oracle, instead of stopping the build before the tape is emitted.
+///
+/// # ⚠️ TWO NULL DEREFERENCES THIS PORT ANSWERS INSTEAD OF FOLLOWING
+///
+/// `scf_for.getLowerBound().getDefiningOp()` is handed straight to `dyn_cast<QueryMapOp>` (`:283-286`)
+/// with no null check, so an `scf.for` whose bound is a region argument — a loop carrying a bound
+/// from its parent — segfaults `dcc`. [`defining_op`] answers `None`, the bound is not a
+/// constant, and analysis continues.
+#[must_use]
+pub fn analyze_loop(
+    loop_op: &LoopUnderAnalysis<'_>,
+    curr_unit: GenericComp,
+    scope: &[DfirOp],
+) -> LoopTransform {
+    // `Value induc_var = nullptr; bool constant_bounds = false; bool affine_non_const_maps = true;`
+    // — one match instead of three, because the flag IS the form. See the doc's table.
+    let (induc_var, body, constant_bounds, affine_non_const_maps) = match loop_op {
+        LoopUnderAnalysis::AffineFor { iv, lo, hi, body } => {
+            // `constant_bounds = affine_for.hasConstantBounds();`
+            // `affine_non_const_maps = !affine_for.hasConstantBounds();`
+            //
+            // ⭐ AND THE REFERENCE'S OWN NOTE ON WHY THOSE TWO ARE COMPLEMENTS HERE:
+            // *"TODO: Sometimes, loop bounds are constant SSA variables rather than constant maps.
+            // Hence, we may have to check about them. this leads to different values of
+            // affine_const_maps and constant_bounds"* (`:278-280`) — i.e. reading THROUGH an
+            // `arith.constant` operand would make `constant_bounds` true while the MAP stayed
+            // non-constant, and only then would the two flags carry different facts. Until that
+            // happens they do not, which is what the doc's table turns on.
+            //
+            // ⭐ `Bound::Val` IS A NON-CONSTANT MAP. `affine.for %i = 0 to %extent` takes the bound
+            // as an operand of an otherwise trivial map, which is exactly what
+            // `hasConstantBounds()` answers `false` for.
+            let constant_bounds =
+                matches!(lo, affine::Bound::Const(_)) && matches!(hi, affine::Bound::Const(_));
+            (*iv, *body, constant_bounds, !constant_bounds)
+        }
+        LoopUnderAnalysis::ScfFor {
+            iv,
+            lo,
+            hi,
+            step,
+            body,
+        } => {
+            // `if (dyn_cast<uniform::QueryMapOp>(getLowerBound().getDefiningOp()) || ..) return
+            // kNone;` — *"if a bound is defined for uniformation purpose, don't convert"*. The
+            // `uniform` dialect is not in this island, so the test has no input; see
+            // [`unit_is_lrf`]'s note on the same absence.
+
+            // `auto lb_const = isa<arith::ConstantIndexOp>(getLowerBound().getDefiningOp());`
+            let lb_const = index_constant(*lo, scope).is_some();
+            // `bool ub_const = isa<arith::ConstantIndexOp>(getUpperBound().getDefiningOp());`
+            let ub_const = index_constant(*hi, scope).is_some();
+            // `auto step_const = getStep().getDefiningOp<arith::ConstantIndexOp>();`
+            let step_const = index_constant(*step, scope);
+
+            // `DT_CHECK_MSG(step_const.value() == 1, "We expect the SCF-for loop to have step size
+            // of 1");` — see the doc for why this is `kNone` and not a stop.
+            //
+            // ⛔ IN EVERY BUILD. `DT_CHECK_MSG` throws a `DtException` unconditionally
+            // (`util/dt_exception.hpp:110-118`); it is `DT_CHECK_MSG_OPT` that compiles away without
+            // `DT_USE_OPTIONAL_CHECK` (`:136-145`). So a step of 2 is not a release-mode fall-through
+            // in the reference either — it stops the compiler.
+            if step_const != Some(1) {
+                return LoopTransform::None;
+            }
+
+            // *"Allow for symbolic upper bounds in case of load/store units since AgenToSentient is
+            // already enhanced to support scf.for loops natively."*
+            if !ub_const
+                && LOAD_AND_STORE_UNITS.contains(&curr_unit)
+                && matches!(
+                    defining_op(*hi, scope),
+                    Some(DfirOp::Symbol(symbol::Op::CreateSymbol { .. }))
+                )
+            {
+                return LoopTransform::None;
+            }
+
+            // `constant_bounds = lb_const && ub_const && step_const;` — the third conjunct is a
+            // non-null OP, which the check above has already established.
+            (
+                *iv,
+                *body,
+                lb_const && ub_const && step_const.is_some(),
+                false,
+            )
+        }
+        // `affine_non_const_maps = false; return kNone;` — the store is dead, the return is not.
+        LoopUnderAnalysis::SentientFor => return LoopTransform::None,
+    };
+
+    // *"if loop has constant bounds in load units or store units --> don't perform conversion"*.
+    if constant_bounds && LOAD_AND_STORE_UNITS.contains(&curr_unit) {
+        return LoopTransform::None;
+    }
+
+    // `for (auto* use : induc_var.getUsers())` — the induction variable is only nameable inside its
+    // own body, so the body IS the whole use list. [`uses`] descends into nested regions,
+    // which is where `memory-dyn-loops.mlir`'s `agen.vector_load` sits.
+    for user in uses(induc_var, body) {
+        // *"if it's not a memory operation, --> don't perform conversion"*.
+        if !is_memory_op(user) {
+            continue;
+        }
+
+        // *"if it's not constant, then unrolling doesn't work. we currently support bound being part
+        // of conditional on the parent loop."*
+        if !constant_bounds && !affine_non_const_maps {
+            // `// TODO: enhance condition to do splitting only for PT.`
+            if !L3_HALVES.contains(&curr_unit) {
+                return LoopTransform::SplitParent;
+            }
+        }
+
+        // *"in the constant bounds and in PT LRF's --> perform unrolling"*.
+        if REGISTER_FILE_UNITS.contains(&curr_unit) {
+            let Some(view) = view_of(user) else {
+                // `llvm_unreachable("Memory operation not supported")`.
+                continue;
+            };
+            let Some(mem_unit) = view_from_unit(view, scope) else {
+                continue;
+            };
+            if unit_is_lrf(mem_unit, scope) {
+                return LoopTransform::Unroll;
+            }
+        }
+    }
+
+    LoopTransform::None
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 195/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT `transformLoop` ASKED FOR.
+///
+/// # ⛔⛔ THE REQUEST, BECAUSE NOT ONE OF THE THREE TRANSFORMS IS THIS FUNCTION'S TO PERFORM
+///
+/// `loopUnrollFull` and `loopUnrollByFactor` are upstream MLIR — `mlir/Dialect/{Affine,SCF}/Utils` —
+/// and `transformSCFLoopWithNonConstantUpperBound` is entry **292** of this campaign, 94 lines in this
+/// same file, unported. So all three lie outside entry 195, and what IS inside it is the dispatch on
+/// the loop's form, the unroll factor it computes from the loop's own three constants, and the pairing
+/// it silently ignores.
+///
+/// ⭐ THE SAME SHAPE ENTRY 109 ALREADY TOOK, for the same reason and against the same two utilities:
+/// [`Unroll`](super::tf_loop_unroll_for_shuffle_op::Unroll) names the call rather than pretending to
+/// have made it, and this enum's factor is the very
+/// [`TripCount`](super::tf_loop_unroll_for_shuffle_op::TripCount) that one carries.
+///
+/// ⛔ AND NO FAILURE VARIANT, unlike entry 109's. Every `failed(..)` in `transformLoop` is the
+/// CALLEE's — `emitError("Unable to unroll loop")` (`:410`), `emitError("Unable to unroll the scf
+/// loop")` (`:426`), `emitError("Doesn't support this loops for transformation")` (`:432`), each
+/// followed by `signalPassFailure()`. This function has no decline of its own to state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum LoopRewrite {
+    /// *"if no action required, return"* (`:401-404`) — and the three pairings the reference passes
+    /// over in silence; see [`transform_loop`].
+    Nothing,
+    /// `loopUnrollFull(affine_for)` (`:409`) — affine derives the trip count from the loop's own maps,
+    /// so the request carries nothing.
+    UnrollAffineFully,
+    /// `loopUnrollByFactor(scf_for, unroll_size)` (`:425`), where
+    /// `unroll_size = (ub_const.value() - lb_const.value()) / step_const.value()` (`:423-424`).
+    ///
+    /// ⭐ THE ONLY ARITHMETIC IN THE WHOLE FUNCTION, and the reason SCF needs a factor where affine
+    /// does not: *"SCF lacks a dedicated full unroll function"*
+    /// (`LoopUnrollForShuffleOp.cpp:157-158`).
+    UnrollScfBy(TripCount),
+    /// `transformSCFLoopWithNonConstantUpperBound(scf_for)` (`:431`) — **entry 292**, which lifts the
+    /// conditional that computes the bound into an `scf.if` with one `affine.for` per arm.
+    SplitParent,
+}
+
+/// Replaces: e195_transformLoop
+///
+/// **195/384** `TransformLoopToLegalizeForSentientLowering::transformLoop` —
+/// `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399` (38L).
+///
+/// ```cpp
+/// // Transforms loop based on the TransformType
+/// void transformLoop(mlir::LoopLikeOpInterface loop_op, TransformType type) {
+///   // if no action required, return;
+///   if (type == TransformType::kNone) {
+///     return;
+///   }
+///
+///   if (auto affine_for = llvm::dyn_cast<affine::AffineForOp>(loop_op.getOperation())) {
+///     if (type == TransformType::KUnroll) {
+///       if (failed(loopUnrollFull(affine_for))) {
+///         affine_for->emitError("Unable to unroll loop");
+///         signalPassFailure();
+///         return;
+///       }
+///     }
+///   } else if (auto scf_for = llvm::dyn_cast<scf::ForOp>(loop_op.getOperation())) {
+///     auto lb_const = scf_for.getLowerBound().getDefiningOp<arith::ConstantIndexOp>();
+///     auto ub_const = scf_for.getUpperBound().getDefiningOp<arith::ConstantIndexOp>();
+///     auto step_const = scf_for.getStep().getDefiningOp<arith::ConstantIndexOp>();
+///     if (type == TransformType::KUnroll) {
+///       auto unroll_size = (ub_const.value() - lb_const.value()) / step_const.value();
+///       if (failed(loopUnrollByFactor(scf_for, unroll_size))) {
+///         scf_for->emitError("Unable to unroll the scf loop");
+///         signalPassFailure();
+///         return;
+///       }
+///     } else {  // kParentSplit
+///       if (failed(transformSCFLoopWithNonConstantUpperBound(scf_for))) {
+///         scf_for->emitError("Doesn't support this loops for transformation");
+///         signalPassFailure();
+///         return;
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// # ⭐⭐ THE `else` IS `KSplitParent` AND NOTHING ELSE, WHICH IS WHY THE PAIRING MATTERS
+///
+/// The scf branch's `else` carries the comment `// kParentSplit`, so it is not a default over two
+/// remaining values — `kNone` returned at the top, leaving exactly `KUnroll` and `KSplitParent`. The
+/// affine branch has no `else` at all, so an affine loop asked to split its parent is passed over in
+/// silence.
+///
+/// ⛔ AND THAT SILENCE IS UNREACHABLE, BY ENTRY 194. `!constant_bounds && !affine_non_const_maps` is
+/// `!cb && cb` on the affine path, so `analyzeLoop` never answers `KSplitParent` for an
+/// `affine.for` — see [`analyze_loop`]'s own table. The pairing is not merely unlikely; it is a
+/// consequence of the only function that produces the second argument.
+///
+/// # ⭐ THE THREE BOUND READS ARE UNCONDITIONAL IN THE REFERENCE AND USED ON ONE PATH
+///
+/// `:417-421` reads `lb_const`, `ub_const` and `step_const` before `:422` looks at `type`, so the
+/// split path reads them and throws all three away. `getDefiningOp<T>()` is a pure query returning
+/// null on a mismatch, so reading them inside the `KUnroll` arm — where the one use is — is the same
+/// program. That is also why the port needs `scope`: it is this island's `getDefiningOp`.
+///
+/// # ⛔⛔ `ub_const.value()` IS SAFE ONLY BECAUSE ENTRY 194 ORDERS ITS TESTS THE WAY IT DOES
+///
+/// The three `getDefiningOp<arith::ConstantIndexOp>()`s are read with NO null check. An `scf.for`
+/// whose bound is an `arith.select` would fault here — and cannot arrive, because `analyzeLoop` tests
+/// `!constant_bounds` at `:340-343` and the register file only at `:347-390`, so a non-constant
+/// `scf.for` on a unit that owns one leaves as `KSplitParent` and never reaches `KUnroll`.
+///
+/// ⭐⭐ AND THE VENDOR PROVES IT ON AN INPUT WHERE BOTH TESTS MATCH — `dyn-loops-cond-bound.mlir` runs
+/// on `ptrow0` (`:148`) and its `scf.for` (`:173`) has an `arith.select` bound (`:172`) with the
+/// induction variable read by a store on `pt_lrfreg` (`:181`, `:154`). The answer is `scf.if` (`:47`),
+/// not an unrolled loop. See
+/// [`a_non_constant_bound_splits_before_the_register_file_is_consulted`](unit_tests::a_non_constant_bound_splits_before_the_register_file_is_consulted).
+///
+/// ⭐ SO A MISSING CONSTANT ANSWERS [`LoopRewrite::Nothing`], the same answer the reference's own
+/// silent pairings give: the loop is left exactly as it stands, which is what "this cannot happen"
+/// claims about it, and dbo-opt is the oracle if the claim was ever wrong.
+///
+/// ⛔ AND SO DOES AN `unroll_size` OF ZERO OR LESS. `lb = ub` is a loop the folder produces routinely
+/// and `(ub - lb) / step` is then `0`, which reaches `loopUnrollByFactor`'s `assert(unrollFactor > 0)`
+/// — the very defect [`TripCount`](super::tf_loop_unroll_for_shuffle_op::TripCount) exists to keep out
+/// of this crate, documented there for entry 109. Leaving an empty loop alone is what unrolling it
+/// zero times would have meant.
+///
+/// # Arguments
+///
+/// * `loop_op` — the loop, classified. `analyzeAndTransform` passes the very op it just analysed
+///   (`:440-445`), which is what makes the pairing arguments above hold.
+/// * `transform` — [`analyze_loop`]'s answer for that same loop.
+/// * `scope` — where the `scf.for`'s three bound operands are defined.
+pub fn transform_loop(
+    loop_op: &LoopUnderAnalysis<'_>,
+    transform: LoopTransform,
+    scope: &[DfirOp],
+) -> LoopRewrite {
+    // `if (type == TransformType::kNone) { return; }`
+    if transform == LoopTransform::None {
+        return LoopRewrite::Nothing;
+    }
+
+    match loop_op {
+        // `:406-414` — the affine branch, whose only action is a full unroll.
+        LoopUnderAnalysis::AffineFor { .. } => match transform {
+            LoopTransform::Unroll => LoopRewrite::UnrollAffineFully,
+            // No `else` in the reference, and entry 194 cannot produce this pairing.
+            LoopTransform::SplitParent | LoopTransform::None => LoopRewrite::Nothing,
+        },
+        // `:415-437` — the scf branch, which reads all three bounds before it looks at `type`.
+        LoopUnderAnalysis::ScfFor { lo, hi, step, .. } => match transform {
+            LoopTransform::Unroll => {
+                // `auto unroll_size = (ub_const.value() - lb_const.value()) / step_const.value();`
+                match (
+                    index_constant(*lo, scope),
+                    index_constant(*hi, scope),
+                    index_constant(*step, scope),
+                ) {
+                    (Some(lb), Some(ub), Some(step)) if step != 0 => {
+                        TripCount::positive((ub - lb) / step)
+                            .map_or(LoopRewrite::Nothing, LoopRewrite::UnrollScfBy)
+                    }
+                    // A bound the reference reads through a null pointer, and a step of zero, which
+                    // divides by it. Neither can arrive; see the doc.
+                    _ => LoopRewrite::Nothing,
+                }
+            }
+            // `} else {  // kParentSplit` — entry 292.
+            LoopTransform::SplitParent => LoopRewrite::SplitParent,
+            LoopTransform::None => LoopRewrite::Nothing,
+        },
+        // Neither `dyn_cast` matches a `sentient.for`, so the function body falls off its end.
+        LoopUnderAnalysis::SentientFor => LoopRewrite::Nothing,
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -338,6 +1040,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef, ScalarTy, Vector,
     };
+    use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
 
     /// `memref<64xf16>` — the transfer's source and destination type in the vendor's case.
     fn stick() -> MemRef {
@@ -384,7 +1087,9 @@ mod unit_tests {
                             expr: if upper == 0 {
                                 AffineExpr::dim(dim).times(-1)
                             } else {
-                                AffineExpr::dim(dim).times(-1).plus(AffineExpr::Const(upper))
+                                AffineExpr::dim(dim)
+                                    .times(-1)
+                                    .plus(AffineExpr::Const(upper))
                             },
                             is_equality: false,
                         },
@@ -874,5 +1579,858 @@ mod unit_tests {
             .collect();
         found.extend(nested);
         found
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 🎯 194/384 — `analyzeLoop`, against the vendor's two dynamic-loop keys.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// WHICH LOOP HOLDS THE BODY. The two forms take their bounds from different places, and that is
+    /// the whole reason `affine_non_const_maps` exists.
+    #[derive(Clone, Copy)]
+    enum Form {
+        /// `scf.for %arg28 = %c0 to %18 step %c1` — bounds are OPERANDS, so each is a `getDefiningOp`.
+        Scf,
+        /// `affine.for %arg21 = 0 to 4` — `hasConstantBounds()` is true.
+        AffineConstant(i64),
+        /// `affine.for %arg = 0 to %extent` — the bound is an operand of the MAP, which
+        /// `hasConstantBounds()` answers false for.
+        AffineSymbolic,
+    }
+
+    /// HOW AN `scf.for`'s UPPER BOUND IS BOUND — the four shapes entry 194 distinguishes.
+    #[derive(Clone, Copy, Debug)]
+    enum UpperBound {
+        /// `%c8 = arith.constant 8 : index`.
+        Literal(i64),
+        /// `%18 = arith.select %17, %c2, %c1 : index` — the bound BOTH vendor cases carry.
+        ///
+        /// ⚠️ STOOD IN FOR BY `arith.subi`, because `arith.select` is not one of this island's ops.
+        /// What `analyze_loop` asks of a bound is only whether an `arith.constant` defines it, so any
+        /// computed index is the same input.
+        Computed,
+        /// `%s = symbol.create_symbol {SymbolId = 0 : i32}` — the bound `AgenToSentient` resolves
+        /// itself, which is the one non-constant bound the load and store units keep.
+        Symbol,
+        /// A block argument of an enclosing loop: nothing in the program defines it. ⛔ THE CASE THE
+        /// REFERENCE HANDS A NULL `Operation*` TO `dyn_cast`.
+        BlockArgument,
+    }
+
+    /// WHAT THE LOOP'S MEMORY USER READS THROUGH.
+    #[derive(Clone, Copy)]
+    enum Viewed {
+        /// `%19 = get_logical_memory_view %3, ..` where `%3` is a `get_unit` — the vendor's `l0`.
+        Unit(DfirUnit),
+        /// A view over a `dataflow.get_local_unit`, which is how a register file is named.
+        LocalUnit(dataflow::LocalUnit),
+        /// `get_paged_logical_memory_view` over one — the form
+        /// `memref.getDefiningOp<GetLogicalMemoryViewOp>()` answers null for.
+        PagedLocalUnit(dataflow::LocalUnit),
+    }
+
+    /// WHAT USES THE INDUCTION VARIABLE.
+    #[derive(Clone, Copy)]
+    enum Reader {
+        /// `%20 = agen.vector_load %19[%arg27 * 4, %arg28 * 2 + %arg26, %arg25, 0, 0]`.
+        VectorLoad,
+        /// `agen.composite_load_and_store` — an `isa<>` member with no `getMemRef()` to reach.
+        CompositeTransfer,
+        /// `arith.addi %arg28, %c0` — not a memory operation at all.
+        Arithmetic,
+    }
+
+    /// THE VENDOR'S DYNAMIC LOOP, ALONG FIVE AXES.
+    #[derive(Clone, Copy)]
+    struct Case {
+        form: Form,
+        hi: UpperBound,
+        /// `Some(n)` for `arith.constant n`, `None` for a step nothing defines.
+        step: Option<i64>,
+        viewed: Viewed,
+        reader: Reader,
+    }
+
+    impl Case {
+        /// `memory-dyn-loops.mlir:126-129` VERBATIM IN SHAPE:
+        ///
+        /// ```mlir
+        /// %18 = arith.select %17, %c2, %c1 : index
+        /// scf.for %arg28 = %c0 to %18 step %c1 {
+        ///   %19 = dataflow.get_logical_memory_view %3, %arg24 {layout_map = #map0} : index, index, memref<8x4x1x1x1xi8>
+        ///   %20 = agen.vector_load %19[%arg27 * 4, %arg28 * 2 + %arg26, %arg25, 0, 0] {..} : memref<8x4x1x1x1xi8>, vector<4xi8>
+        /// ```
+        ///
+        /// ⭐ `l3lu_disable_transformation.mlir:63-77` IS THE SAME LOOP OVER A DIFFERENT UNIT — an
+        /// `arith.select` bound, a memory user on the induction variable — and its `CHECK-SENT-IR`
+        /// reproduces its input line for line. The two files differ only in the enclosing
+        /// `dataflow.program_unit`'s component, which is what the first two tests below assert.
+        const VENDOR: Case = Case {
+            form: Form::Scf,
+            hi: UpperBound::Computed,
+            step: Some(1),
+            viewed: Viewed::Unit(DfirUnit::L0),
+            reader: Reader::VectorLoad,
+        };
+    }
+
+    /// `memref<8x4x1x1x1xi8>` — the view the vendor's `agen.vector_load` reads.
+    fn tile() -> MemRef {
+        MemRef {
+            shape: vec![8, 4, 1, 1, 1],
+            elem: ElemType::Int(8),
+        }
+    }
+
+    /// The unit a register file belongs to — `get_local_unit`'s `%unit` operand.
+    fn owner_of(which: dataflow::LocalUnit) -> DfirUnit {
+        match which {
+            dataflow::LocalUnit::PeLrf => DfirUnit::Pe,
+            dataflow::LocalUnit::SfpLrf => DfirUnit::Sfp,
+            dataflow::LocalUnit::PtLrf
+            | dataflow::LocalUnit::PtXrf
+            | dataflow::LocalUnit::PtArf => {
+                DfirUnit::PtRow(Row::checked(0).expect("every arch's PT has a row 0"))
+            }
+            dataflow::LocalUnit::L0Scale => DfirUnit::L0,
+        }
+    }
+
+    /// `{core = 0 : i32, corelet = 0 : i32}`, which is where both vendor files put every unit.
+    fn at_corelet_zero() -> Residency {
+        Residency::Corelet {
+            core: Core::checked(0).expect("every arch has a core 0"),
+            corelet: Corelet::checked(0).expect("every arch has a corelet 0"),
+        }
+    }
+
+    /// An `agen.composite_load_and_store` whose source index reads `iv` — one of the three `isa<>`
+    /// members [`view_of`] has no `getMemRef()` for.
+    fn transfer_reading(vals: &mut Values, iv: Val, view: Val) -> DfirOp {
+        let load_iv = vals.mint();
+        DfirOp::Agen(agen::Op::CompositeLoadAndStore(Box::new(
+            agen::CompositeTransfer {
+                src: view,
+                src_indices: vec![Index::Strided(vec![(iv, 2)], 0)],
+                src_ty: stick(),
+                dst: view,
+                dst_indices: vec![Index::Const(0)],
+                dst_ty: stick(),
+                load_iv,
+                load_iv_ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+                load_set: load_set(),
+                load_order: AffineMap::identity(1),
+                store_set: load_set(),
+                store_order: AffineMap::identity(1),
+                time_set: time_set(),
+                time_order: AffineMap::identity(4),
+                load_time_addr_map: AffineMap::identity(4),
+                store_time_addr_map: AffineMap::identity(4),
+                body: vec![DfirOp::Agen(agen::Op::Yield)],
+            },
+        )))
+    }
+
+    /// THE CASE AS A PROGRAM, ITS LOOP LAST.
+    ///
+    /// The loop goes last because [`analyze_loop`]'s `scope` has to reach the view bound INSIDE the
+    /// body — which is where both vendor files put it.
+    fn program(vals: &mut Values, case: Case) -> Vec<DfirOp> {
+        let c0 = vals.mint();
+        let mut scope = vec![DfirOp::Arith(arith::Op::Constant {
+            result: c0,
+            value: 0,
+        })];
+
+        // `%18`, the upper bound, in whichever of the four forms.
+        let bound = vals.mint();
+        match case.hi {
+            UpperBound::Literal(value) => scope.push(DfirOp::Arith(arith::Op::Constant {
+                result: bound,
+                value,
+            })),
+            UpperBound::Computed => scope.push(DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                result: bound,
+                lhs: c0,
+                rhs: c0,
+                ty: ScalarTy::Index,
+            }))),
+            UpperBound::Symbol => scope.push(DfirOp::Symbol(symbol::Op::CreateSymbol {
+                result: bound,
+                symbol_id: 0,
+            })),
+            UpperBound::BlockArgument => {}
+        }
+
+        // `step %c1`, or a step nothing defines.
+        let step = vals.mint();
+        if let Some(value) = case.step {
+            scope.push(DfirOp::Arith(arith::Op::Constant {
+                result: step,
+                value,
+            }));
+        }
+
+        // `%3 = dataflow.get_unit`, and above a register file the `get_local_unit` that names it.
+        let unit = vals.mint();
+        let viewed_unit = match case.viewed {
+            Viewed::Unit(dfir_unit) => {
+                scope.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: unit,
+                    residency: at_corelet_zero(),
+                    unit: dfir_unit,
+                }));
+                unit
+            }
+            Viewed::LocalUnit(which) | Viewed::PagedLocalUnit(which) => {
+                scope.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: unit,
+                    residency: at_corelet_zero(),
+                    unit: owner_of(which),
+                }));
+                let file = vals.mint();
+                scope.push(DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+                    result: file,
+                    of: unit,
+                    which,
+                }));
+                file
+            }
+        };
+
+        // `%19 = dataflow.get_logical_memory_view %3, %arg24`.
+        let view = vals.mint();
+        let view_op = match case.viewed {
+            Viewed::Unit(_) | Viewed::LocalUnit(_) => {
+                DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                    result: view,
+                    from: viewed_unit,
+                    start: c0,
+                    layout: AffineMap::identity(5),
+                    ty: tile(),
+                })
+            }
+            Viewed::PagedLocalUnit(_) => DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(
+                Box::new(dataflow::PagedMemView {
+                    result: view,
+                    unit: viewed_unit,
+                    start_addr: c0,
+                    pages: vec![],
+                    layout: AffineMap::identity(5),
+                    ty: tile(),
+                }),
+            )),
+        };
+
+        let iv = vals.mint();
+        let read = vals.mint();
+        let reader = match case.reader {
+            Reader::VectorLoad => DfirOp::Agen(agen::Op::VectorLoad {
+                result: read,
+                view,
+                // `[%arg27 * 4, %arg28 * 2 + %arg26, %arg25, 0, 0]` — the induction variable is the
+                // second index's stride-2 term.
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(iv, 2)], 0),
+                    Index::Const(0),
+                    Index::Const(0),
+                    Index::Const(0),
+                ],
+                view_ty: tile(),
+                ty: Vector {
+                    len: 4,
+                    elem: ElemType::Int(8),
+                },
+            }),
+            Reader::CompositeTransfer => transfer_reading(vals, iv, view),
+            Reader::Arithmetic => DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: read,
+                lhs: iv,
+                rhs: c0,
+                ty: ScalarTy::Index,
+            })),
+        };
+
+        let body = vec![view_op, reader];
+        scope.push(match case.form {
+            Form::Scf => DfirOp::Scf(scf::Op::For {
+                iv,
+                lo: c0,
+                hi: bound,
+                step,
+                carried: vec![],
+                body,
+                dbg_name: None,
+            }),
+            Form::AffineConstant(extent) => DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(extent),
+                carried: vec![],
+                body,
+                dbg_name: None,
+            }),
+            Form::AffineSymbolic => DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Val(bound),
+                carried: vec![],
+                body,
+                dbg_name: None,
+            }),
+        });
+        scope
+    }
+
+    /// The case's answer on a unit.
+    fn analyzed(case: Case, curr_unit: GenericComp) -> LoopTransform {
+        let mut vals = Values::default();
+        let scope = program(&mut vals, case);
+        let loop_op =
+            LoopUnderAnalysis::of(scope.last().expect("the fixture's last op is its loop"))
+                .expect("the fixture's loop is one of the two forms");
+        analyze_loop(&loop_op, curr_unit, &scope)
+    }
+
+    /// `l3lu_disable_transformation.mlir` — the vendor's output is its input, line for line.
+    #[test]
+    fn the_vendors_l3_loop_is_left_exactly_as_it_stands() {
+        assert_eq!(
+            analyzed(Case::VENDOR, GenericComp::L3lu),
+            LoopTransform::None
+        );
+        assert_eq!(
+            analyzed(Case::VENDOR, GenericComp::L3su),
+            LoopTransform::None
+        );
+    }
+
+    /// `memory-dyn-loops.mlir` — the same loop on an `l0lurow0` unit becomes an `scf.if` holding one
+    /// `affine.for` per arm of the `arith.select` (`:125-132` in, `:41-56` out).
+    #[test]
+    fn the_vendors_l0_loop_has_its_parent_split() {
+        assert_eq!(
+            analyzed(Case::VENDOR, DfirUnit::L0lu.generic()),
+            LoopTransform::SplitParent
+        );
+    }
+
+    /// *"if loop has constant bounds in load units or store units --> don't perform conversion"*
+    /// (`:318-325`) — and that is the ONLY reason those six are exempt, so the guard has to see
+    /// constant bounds and not merely the component.
+    #[test]
+    fn a_constant_bound_on_a_load_or_store_unit_is_left_alone() {
+        for unit in LOAD_AND_STORE_UNITS {
+            assert_eq!(
+                analyzed(
+                    Case {
+                        hi: UpperBound::Literal(8),
+                        ..Case::VENDOR
+                    },
+                    unit,
+                ),
+                LoopTransform::None,
+                "{unit:?} with a constant bound"
+            );
+        }
+    }
+
+    /// *"Allow for symbolic upper bounds in case of load/store units since AgenToSentient is already
+    /// enhanced to support scf.for loops natively"* (`:299-307`).
+    ///
+    /// ⛔ AND THE ESCAPE IS THOSE SIX UNITS ONLY. The same `symbol.create_symbol` bound on a unit that
+    /// owns a register file still splits, because nothing below the PT reads a symbol as a trip count.
+    #[test]
+    fn a_symbolic_bound_is_kept_only_on_the_load_and_store_units() {
+        let symbolic = Case {
+            hi: UpperBound::Symbol,
+            ..Case::VENDOR
+        };
+        for unit in LOAD_AND_STORE_UNITS {
+            assert_eq!(analyzed(symbolic, unit), LoopTransform::None, "{unit:?}");
+        }
+        for unit in REGISTER_FILE_UNITS {
+            assert_eq!(
+                analyzed(symbolic, unit),
+                LoopTransform::SplitParent,
+                "{unit:?}"
+            );
+        }
+    }
+
+    /// `DT_CHECK_MSG(step_const.value() == 1, "We expect the SCF-for loop to have step size of 1")`
+    /// (`:296-297`) — an assertion, and a null dereference when the step is not a constant at all.
+    ///
+    /// ⭐ BOTH ANSWER `kNone`, WHICH IS WHAT THE ASSERTION'S PREMISE ALREADY CLAIMS: the loop is left
+    /// as it stands, and dbo-opt speaks if the premise was wrong.
+    #[test]
+    fn a_step_that_is_not_a_literal_one_leaves_the_loop_alone() {
+        for step in [Some(2), Some(-1), None] {
+            assert_eq!(
+                analyzed(
+                    Case {
+                        step,
+                        ..Case::VENDOR
+                    },
+                    GenericComp::Pt
+                ),
+                LoopTransform::None,
+                "step {step:?}"
+            );
+        }
+    }
+
+    /// ⛔ THE BOUND THE REFERENCE SEGFAULTS ON: `scf_for.getUpperBound().getDefiningOp()` is null for
+    /// a bound carried in from an enclosing loop, and `:283` hands it straight to `dyn_cast`.
+    /// Answering `None` makes the bound non-constant, which is the fact a null defining op states.
+    #[test]
+    fn a_bound_no_operation_defines_is_simply_not_a_constant() {
+        assert_eq!(
+            analyzed(
+                Case {
+                    hi: UpperBound::BlockArgument,
+                    ..Case::VENDOR
+                },
+                DfirUnit::L0lu.generic(),
+            ),
+            LoopTransform::SplitParent
+        );
+    }
+
+    /// *"in the constant bounds and in PT LRF's --> perform unrolling"* (`:346-390`), from both loop
+    /// forms — an `scf.for` over an LRF reaches `KUnroll` just as an `affine.for` does.
+    #[test]
+    fn a_loop_indexing_a_register_file_is_unrolled() {
+        for form in [Form::Scf, Form::AffineConstant(4)] {
+            for (which, unit) in [
+                (dataflow::LocalUnit::PtLrf, GenericComp::Pt),
+                (dataflow::LocalUnit::PeLrf, GenericComp::Pe),
+                (dataflow::LocalUnit::SfpLrf, GenericComp::Sfp),
+            ] {
+                assert_eq!(
+                    analyzed(
+                        Case {
+                            form,
+                            hi: UpperBound::Literal(4),
+                            viewed: Viewed::LocalUnit(which),
+                            ..Case::VENDOR
+                        },
+                        unit,
+                    ),
+                    LoopTransform::Unroll,
+                    "{which:?}"
+                );
+            }
+        }
+    }
+
+    /// `dyn-loops-cond-bound.mlir` — ⭐⭐ THE VENDOR'S OWN PROOF THAT `:340-343` OUTRANKS `:346-390`,
+    /// on an input where BOTH tests match. The enclosing unit is `ptrow0` (`:148`), a
+    /// [`REGISTER_FILE_UNITS`] member; `scf.for %arg15 = %c0 to %8 step %c1` (`:173`) takes its upper
+    /// bound from an `arith.select` (`:172`), so `constant_bounds` is false; and the induction variable
+    /// is read by `agen.vector_store %16, %17[0, %arg15, 0, 0, 0]` (`:181`) whose view sits on
+    /// `%5 = dataflow.get_local_unit %0 {name = "pt_lrfreg"}` (`:154`) — an LRF. The second loop
+    /// (`:185`) is the same arrangement with an `agen.vector_load` (`:191`) instead, and [`view_of`]
+    /// reads both through the same two arms.
+    ///
+    /// ⛔ AND THE ANSWER IS THE SPLIT. The `CHECK-SENT-IR` gives `scf.if` (`:47`) whose then-arm holds
+    /// two body copies and whose else-arm holds one — a split parent, NOT an unrolled loop. Had the
+    /// register file been consulted first, `transformLoop` would have computed an unroll factor from
+    /// `ub_const.value()` on an `arith.select`; see [`transform_loop`]'s note on that read.
+    #[test]
+    fn a_non_constant_bound_splits_before_the_register_file_is_consulted() {
+        for (which, unit) in [
+            (dataflow::LocalUnit::PtLrf, GenericComp::Pt),
+            (dataflow::LocalUnit::PeLrf, GenericComp::Pe),
+            (dataflow::LocalUnit::SfpLrf, GenericComp::Sfp),
+        ] {
+            assert_eq!(
+                analyzed(
+                    Case {
+                        hi: UpperBound::Computed,
+                        viewed: Viewed::LocalUnit(which),
+                        ..Case::VENDOR
+                    },
+                    unit,
+                ),
+                LoopTransform::SplitParent,
+                "{which:?}"
+            );
+        }
+    }
+
+    /// ⛔⛔ THE PT'S TRANSPOSED AND ACCUMULATOR FILES ARE NOT `LRFREG`. `senCompToGenericComp` sends
+    /// `PTXRF` to `PTXRF` and `PTARF` to `PTARF`, each its own image
+    /// (`sys-arch-spec/arch_enums.cpp:153-162`), so only three of this island's six register files
+    /// answer `is_any_of(mem_unit, LRFREG)`.
+    ///
+    /// A port that had matched "any register file" would fully unroll every matmul's kernel walk.
+    #[test]
+    fn the_transposed_and_accumulator_files_are_not_lrf_registers() {
+        for which in [
+            dataflow::LocalUnit::PtXrf,
+            dataflow::LocalUnit::PtArf,
+            dataflow::LocalUnit::L0Scale,
+        ] {
+            assert_eq!(
+                analyzed(
+                    Case {
+                        hi: UpperBound::Literal(4),
+                        viewed: Viewed::LocalUnit(which),
+                        ..Case::VENDOR
+                    },
+                    GenericComp::Pt,
+                ),
+                LoopTransform::None,
+                "{which:?}"
+            );
+        }
+    }
+
+    /// ⛔⛔ `KSplitParent` IS `scf.for`-ONLY. `!constant_bounds && !affine_non_const_maps` is
+    /// `!cb && cb` on the affine path — always false — which is why `transformLoop`'s affine branch
+    /// handles `KUnroll` and nothing else (`:406-414`).
+    #[test]
+    fn an_affine_loop_never_splits_its_parent() {
+        // A bound that is an operand of the map: `hasConstantBounds()` is false, and the loop is
+        // STILL not a candidate for splitting.
+        assert_eq!(
+            analyzed(
+                Case {
+                    form: Form::AffineSymbolic,
+                    ..Case::VENDOR
+                },
+                DfirUnit::L0lu.generic(),
+            ),
+            LoopTransform::None
+        );
+        // The same non-constant map over an LRF is unrolled, so it is the SPLIT that is unreachable
+        // from the affine path and not the walk.
+        assert_eq!(
+            analyzed(
+                Case {
+                    form: Form::AffineSymbolic,
+                    viewed: Viewed::LocalUnit(dataflow::LocalUnit::PtLrf),
+                    ..Case::VENDOR
+                },
+                GenericComp::Pt,
+            ),
+            LoopTransform::Unroll
+        );
+    }
+
+    /// ⚠️ THE VIEW THE REFERENCE WOULD FOLLOW A NULL FOR: `getDefiningOp<GetLogicalMemoryViewOp>()`
+    /// is null for a `get_paged_logical_memory_view` and `:367` calls `getFromUnit()` on it anyway.
+    /// The paged form names the same unit, so the question has an answer.
+    #[test]
+    fn a_paged_view_over_a_register_file_is_answered_rather_than_followed() {
+        assert_eq!(
+            analyzed(
+                Case {
+                    hi: UpperBound::Literal(4),
+                    viewed: Viewed::PagedLocalUnit(dataflow::LocalUnit::PtLrf),
+                    ..Case::VENDOR
+                },
+                GenericComp::Pt,
+            ),
+            LoopTransform::Unroll
+        );
+    }
+
+    /// `llvm_unreachable("Memory operation not supported")` (`:361`), reached for a composite
+    /// transfer — *"note that there is no composite load/store and load_store for PT, PE, SFP"*.
+    /// Moving to the next user leaves the loop alone, which is what that note says already holds.
+    #[test]
+    fn a_composite_transfer_has_no_view_for_this_pass_to_follow() {
+        assert_eq!(
+            analyzed(
+                Case {
+                    hi: UpperBound::Literal(4),
+                    viewed: Viewed::LocalUnit(dataflow::LocalUnit::PtLrf),
+                    reader: Reader::CompositeTransfer,
+                    ..Case::VENDOR
+                },
+                GenericComp::Pt,
+            ),
+            LoopTransform::None
+        );
+        // ⭐ AND IT IS STILL A MEMORY OPERATION, so a non-constant bound splits the parent on the
+        // strength of the `isa<>` test alone — the switch below it never runs.
+        assert_eq!(
+            analyzed(
+                Case {
+                    reader: Reader::CompositeTransfer,
+                    ..Case::VENDOR
+                },
+                GenericComp::Pt,
+            ),
+            LoopTransform::SplitParent
+        );
+    }
+
+    /// *"if it's not a memory operation, --> don't perform conversion"* (`:333-336`). An induction
+    /// variable only arithmetic reads is not a reason to touch its loop.
+    #[test]
+    fn an_induction_variable_no_memory_operation_reads_is_left_alone() {
+        for unit in [GenericComp::Pt, DfirUnit::L0lu.generic()] {
+            assert_eq!(
+                analyzed(
+                    Case {
+                        reader: Reader::Arithmetic,
+                        ..Case::VENDOR
+                    },
+                    unit,
+                ),
+                LoopTransform::None,
+                "{unit:?}"
+            );
+        }
+    }
+
+    /// `dyn_cast<sentient::ForOp>(..)` → `return kNone` (`:310-313`) — a loop already lowered needs
+    /// no legalizing.
+    #[test]
+    fn a_sentient_loop_needs_no_legalizing() {
+        assert_eq!(
+            analyze_loop(&LoopUnderAnalysis::SentientFor, GenericComp::Pt, &[]),
+            LoopTransform::None
+        );
+    }
+
+    /// `llvm_unreachable("Unknown loop operation")` (`:315`) as a `None`: the three `dyn_cast`s are
+    /// what this pass reads, and an op that is not a loop at all is not one of them.
+    #[test]
+    fn only_the_two_loop_forms_are_analysed() {
+        let mut vals = Values::default();
+        let scf = program(&mut vals, Case::VENDOR);
+        assert!(matches!(
+            LoopUnderAnalysis::of(scf.last().expect("the loop is last")),
+            Some(LoopUnderAnalysis::ScfFor { .. })
+        ));
+
+        let affine = program(
+            &mut vals,
+            Case {
+                form: Form::AffineConstant(4),
+                ..Case::VENDOR
+            },
+        );
+        assert!(matches!(
+            LoopUnderAnalysis::of(affine.last().expect("the loop is last")),
+            Some(LoopUnderAnalysis::AffineFor { .. })
+        ));
+
+        assert!(
+            LoopUnderAnalysis::of(&DfirOp::Arith(arith::Op::Constant {
+                result: vals.mint(),
+                value: 0,
+            }))
+            .is_none()
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 195/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// An `scf.for` with each of its three bounds either an `arith.constant` of a given value or
+    /// nothing at all — which is what a bound whose defining op is not an `arith.constant` is here.
+    fn scf_bounded(lo: Option<i64>, hi: Option<i64>, step: Option<i64>) -> (Vec<DfirOp>, DfirOp) {
+        let mut vals = Values::default();
+        let mut scope = Vec::new();
+        let mut bound = |scope: &mut Vec<DfirOp>, value: Option<i64>| {
+            let result = vals.mint();
+            if let Some(value) = value {
+                scope.push(DfirOp::Arith(arith::Op::Constant { result, value }));
+            }
+            result
+        };
+        let lo = bound(&mut scope, lo);
+        let hi = bound(&mut scope, hi);
+        let step = bound(&mut scope, step);
+        let loop_op = DfirOp::Scf(scf::Op::For {
+            iv: vals.mint(),
+            lo,
+            hi,
+            step,
+            carried: vec![],
+            body: vec![],
+            dbg_name: None,
+        });
+        (scope, loop_op)
+    }
+
+    /// The rewrite asked of an `scf.for` with those three bounds.
+    fn rewrite_of_scf(
+        lo: Option<i64>,
+        hi: Option<i64>,
+        step: Option<i64>,
+        transform: LoopTransform,
+    ) -> LoopRewrite {
+        let (scope, loop_op) = scf_bounded(lo, hi, step);
+        let classified =
+            LoopUnderAnalysis::of(&loop_op).expect("an scf.for is one of the two forms");
+        transform_loop(&classified, transform, &scope)
+    }
+
+    /// An `affine.for %i = 0 to 4`, whose maps carry their own trip count.
+    fn affine_loop() -> DfirOp {
+        DfirOp::Affine(affine::Op::For {
+            iv: Values::default().mint(),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: vec![],
+            body: vec![],
+            dbg_name: None,
+        })
+    }
+
+    /// *"if no action required, return"* (`:401-404`) — before either `dyn_cast`, so the answer does
+    /// not depend on the loop's form.
+    #[test]
+    fn no_action_is_required_of_any_form() {
+        let affine = affine_loop();
+        let (scope, scf) = scf_bounded(Some(0), Some(4), Some(1));
+        for loop_op in [
+            LoopUnderAnalysis::of(&affine).expect("an affine.for is one of the two forms"),
+            LoopUnderAnalysis::of(&scf).expect("an scf.for is one of the two forms"),
+            LoopUnderAnalysis::SentientFor,
+        ] {
+            assert_eq!(
+                transform_loop(&loop_op, LoopTransform::None, &scope),
+                LoopRewrite::Nothing
+            );
+        }
+    }
+
+    /// `loopUnrollFull(affine_for)` (`:409`) — the affine branch's one action, and it carries no
+    /// factor because `AffineForOp`'s own maps hold the trip count.
+    #[test]
+    fn an_affine_loop_is_unrolled_in_full() {
+        let affine = affine_loop();
+        let classified =
+            LoopUnderAnalysis::of(&affine).expect("an affine.for is one of the two forms");
+        assert_eq!(
+            transform_loop(&classified, LoopTransform::Unroll, &[]),
+            LoopRewrite::UnrollAffineFully
+        );
+    }
+
+    /// `unroll_size = (ub_const.value() - lb_const.value()) / step_const.value()` (`:423-424`), read
+    /// off the loop's own three constants.
+    ///
+    /// ⭐ THE STEP ≠ 1 ROWS ARE UNREACHABLE and transcribed anyway: entry 194 answers `kNone` for a
+    /// step that is not one (`:296-297`), so a loop reaching `KUnroll` always divides by 1. The formula
+    /// is what the reference wrote, and truncation toward zero is what both languages do with it.
+    #[test]
+    fn the_scf_factor_is_the_span_over_the_step() {
+        for (lo, hi, step, factor) in [
+            (0, 4, 1, 4),
+            (0, 1, 1, 1),
+            (2, 10, 1, 8),
+            (2, 10, 2, 4),
+            (0, 7, 2, 3),
+            (0, -8, -2, 4),
+        ] {
+            assert_eq!(
+                rewrite_of_scf(Some(lo), Some(hi), Some(step), LoopTransform::Unroll),
+                LoopRewrite::UnrollScfBy(
+                    TripCount::positive(factor).expect("the row's factor is positive")
+                ),
+                "{lo}..{hi} step {step}"
+            );
+        }
+    }
+
+    /// `} else {  // kParentSplit` (`:430-435`) — the scf branch's only other action, and the reason
+    /// the `else` is not a default: `kNone` has already returned at `:402`.
+    #[test]
+    fn the_scf_branchs_other_action_is_the_parent_split() {
+        assert_eq!(
+            rewrite_of_scf(Some(0), None, Some(1), LoopTransform::SplitParent),
+            LoopRewrite::SplitParent
+        );
+    }
+
+    /// ⛔ THE AFFINE BRANCH HAS NO `else` (`:406-414`), so an `affine.for` asked to split its parent is
+    /// passed over in silence — and entry 194 cannot ask, because `!constant_bounds &&
+    /// !affine_non_const_maps` is `!cb && cb` there. See
+    /// [`an_affine_loop_never_splits_its_parent`].
+    #[test]
+    fn an_affine_loop_asked_to_split_its_parent_is_left_alone() {
+        let affine = affine_loop();
+        let classified =
+            LoopUnderAnalysis::of(&affine).expect("an affine.for is one of the two forms");
+        assert_eq!(
+            transform_loop(&classified, LoopTransform::SplitParent, &[]),
+            LoopRewrite::Nothing
+        );
+    }
+
+    /// ⛔ NEITHER `dyn_cast` MATCHES A `sentient.for`, so the reference's body falls off its end
+    /// (`:437-438`) — no `llvm_unreachable`, unlike `analyzeLoop`'s `:315`. Entry 194 cannot ask for
+    /// one either, since its sentient arm returns `kNone` at `:313`.
+    #[test]
+    fn a_sentient_loop_is_matched_by_neither_dyn_cast() {
+        for transform in [
+            LoopTransform::None,
+            LoopTransform::Unroll,
+            LoopTransform::SplitParent,
+        ] {
+            assert_eq!(
+                transform_loop(&LoopUnderAnalysis::SentientFor, transform, &[]),
+                LoopRewrite::Nothing,
+                "{transform:?}"
+            );
+        }
+    }
+
+    /// ⛔ THE READ THE REFERENCE MAKES THROUGH A NULL POINTER: `ub_const.value()` on an `scf.for`
+    /// whose bound is an `arith.select`. It cannot arrive — the loop would have left as `KSplitParent`
+    /// at `:340-343` — and answering [`LoopRewrite::Nothing`] leaves it exactly as it stands.
+    #[test]
+    fn a_bound_no_constant_defines_asks_for_nothing() {
+        for (lo, hi, step) in [
+            (None, Some(4), Some(1)),
+            (Some(0), None, Some(1)),
+            (Some(0), Some(4), None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                rewrite_of_scf(lo, hi, step, LoopTransform::Unroll),
+                LoopRewrite::Nothing,
+                "{lo:?}..{hi:?} step {step:?}"
+            );
+        }
+    }
+
+    /// ⛔⛔ AN EMPTY OR REVERSED RANGE IS NOT AN UNROLL FACTOR. `lb = ub` gives `unroll_size = 0`, which
+    /// reaches `loopUnrollByFactor`'s `assert(unrollFactor > 0)`; a reversed range gives a negative
+    /// count, which its `uint64_t` parameter turns into an enormous one. `TripCount` refuses both, for
+    /// the reason entry 109 records against the same utility.
+    #[test]
+    fn an_empty_or_reversed_range_asks_for_nothing() {
+        for (lo, hi, step) in [(4, 4, 1), (0, 0, 1), (8, 4, 1), (0, 4, -1)] {
+            assert_eq!(
+                rewrite_of_scf(Some(lo), Some(hi), Some(step), LoopTransform::Unroll),
+                LoopRewrite::Nothing,
+                "{lo}..{hi} step {step}"
+            );
+        }
+    }
+
+    /// ⛔ AND A STEP OF ZERO DOES NOT DIVIDE. `step_const.value() == 0` makes `:423-424` an
+    /// integer division by zero — a trap in both languages. Entry 194's `:296-297` rules it out; this
+    /// states the answer rather than reproducing the trap.
+    #[test]
+    fn a_step_of_zero_asks_for_nothing() {
+        assert_eq!(
+            rewrite_of_scf(Some(0), Some(4), Some(0), LoopTransform::Unroll),
+            LoopRewrite::Nothing
+        );
     }
 }
