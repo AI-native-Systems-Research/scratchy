@@ -8,6 +8,36 @@ Read [`TASK.md`](TASK.md) (this directory) for the campaign statement, and
 [`../crates/compiler/deeptools/CLAUDE.md`](../crates/compiler/deeptools/CLAUDE.md) for the crate's
 rules. Both outrank the generic C-porting conventions in your system prompt.
 
+## 0. 🛑 THE BUDGET — MEASURED, AND IT IS WHY THIS SECTION IS FIRST
+
+The first 144 functions cost **43 hours of wall clock, 89% of it model time, 586 MILLION cache-read
+tokens against 5 million output** — 30 to 48 turns per function. That rate does not finish this
+campaign. The measurement also says exactly where it went: of 30,991 lines produced, **5,306 were
+implementation, 12,333 were doc comments and 12,575 were tests.** 82% of the output was not the port.
+
+So the following are **HARD CAPS**, not guidance. A batch that exceeds them will be sent back.
+
+| per ported function | cap |
+|---|---|
+| doc comment lines | **8** — the `/// Replaces: eNNN_name` anchor, one line of what it does, and any TRAP. Nothing else. |
+| test functions | **1**, or 2 where the vendor's own case plus one negative both apply |
+| `cargo check`/`cargo test` runs | **once per BATCH**, at the end — not per function |
+
+⛔ **DO NOT RE-VERIFY CITATIONS.** Take the `file:line` from `UNITS.tsv` as given. Re-measuring line
+numbers cost a large share of the turns above, and **the review pass owns that check** — it re-measured
+every drifted citation in level 0 and will do the same for yours.
+
+⛔ **DO NOT GREP THE CRATE TO DISCOVER TYPES.** Your `.rs` home's header names the island types your
+units need. If something genuinely is not there, add it and say so in the commit message — do not go
+looking first.
+
+⛔ **NO TUTORIALS IN COMMENTS.** A trap is *"the non-L3 arm sets BOTH fields to stride_size"*. A
+tutorial is three paragraphs on why MLIR builds IR at run time. The first earns its 8 lines; the second
+is what 12,333 doc lines were.
+
+⭐ WHAT IS NOT CAPPED: **correctness, and the emission.** The op a function emits IS the function —
+see §3. Cutting the port to hit a cap is the one failure worse than being slow.
+
 ## 1. Where the C++ actually is
 
 ⛔ **The authority is the C++ tree, not the extract.**
@@ -88,26 +118,21 @@ Your system prompt's conventions cover C-to-Rust *wrapping*. **None of the follo
 - ⛔ Never substitute a stand-in op to dodge a `todo!` (an unbuilt op lowered as `Identity` compiles
   and emits garbage).
 
-## 6. Tests
+## 6. Tests — ⛔ ONE PER FUNCTION (see §0)
 
-Unit tests come with each port, in `#[cfg(test)] mod unit_tests` beside the code. Where the vendor
-has a case for it, port theirs — the authority tree's `dcc/test/` holds 825 `.mlir` tests and **668
-carry `CHECK-SENT-IR`** expectations:
+`#[cfg(test)] mod unit_tests` beside the code. **One test per ported function.** Where the vendor has a
+case, port THEIRS rather than inventing one — the authority tree's `dcc/test/` has 668 files carrying
+`CHECK-SENT-IR` expectations. Their *input* is MLIR text and **this crate has no parser and must not get
+one**: build the typed input in the test and take the *expectation* from their `CHECK` lines.
 
-```bash
-grep -rl "CHECK-SENT-IR" /Users/nickm/git/deeptools-src/dcc/test | head
-```
-
-Their *input* is MLIR text and **this crate has no parser and must not get one**: build the typed
-input in the test and take the *expectation* from their `CHECK` lines.
-`crates/compiler/deeptools/tests/sentient_corpus/` holds 18 pairs of our own emitted DataflowIR
-beside the reference's SentientIR for the same program — the answer key.
+A second test is justified only when the vendor's case plus one negative both apply. Level 0 averaged
+87 lines of test per function; that is roughly ten times the budget.
 
 ## 7. Your gates — and the one you must NOT run
 
 ```bash
-cargo check -p deeptools          # seconds; one path dependency, no registry deps
-cargo test  -p deeptools
+cargo check -p deeptools          # ONCE per batch, at the end — not per function
+cargo test  -p deeptools          # ONCE per batch
 ```
 
 ⛔ **Do not run the workspace build or the acceptance build in your worktree.** Its `target/` is
