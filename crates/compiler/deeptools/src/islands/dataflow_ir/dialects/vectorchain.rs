@@ -287,8 +287,11 @@ impl Predicate {
     /// THE MASK'S VALUE, MUTABLY — for RENUMBERING ONLY.
     ///
     /// ⛔ THE TYPE IS NOT REACHABLE THROUGH THIS. A clone renames the values of the op it copied
-    /// (`dialects::parts_mut`); the type this predicate was DEFINED at is the same fact before and
-    /// after, which is the whole reason the two travel together.
+    /// (`dialects::parts_mut`) and a rewriter redirects a single use in place
+    /// (`dialects::vals_mut`, `VectorChainHelper.cpp:600-602`); the type this predicate was DEFINED
+    /// at is the same fact before and after, which is the whole reason the two travel together — so
+    /// substituting one value for another of the SAME definition, which is exactly what
+    /// `redefineConstantVectors` does, cannot change a mask's width.
     pub(crate) const fn val_mut(&mut self) -> &mut Val {
         &mut self.val
     }
@@ -298,6 +301,7 @@ impl Predicate {
     pub const fn ty(self) -> Vector {
         self.ty
     }
+
 }
 
 /// ONE `vectorchain` OPERATION.

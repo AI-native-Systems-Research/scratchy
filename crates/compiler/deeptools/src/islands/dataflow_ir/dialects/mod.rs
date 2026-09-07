@@ -1068,3 +1068,572 @@ fn index_operands_mut<'o>(indices: &'o mut [Index], into: &mut Vec<&'o mut Val>)
         }
     }
 }
+
+// ───────────────────────────── THE SAME WALK, IN PLACE ──────────────────────────────
+
+/// WHICH ROLE A `Val` PLAYS IN THE OP THAT NAMES IT.
+///
+/// ⛔ THREE ROLES AND NO FOURTH, because the three walks above are exactly these three questions:
+/// [`operands`] is what an op READS, [`results`] what it DEFINES, [`block_args`] what its regions
+/// BIND. A mutable walk that did not carry the role would let a rewrite meant for an operand land on
+/// a result and silently re-define a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    /// A value the op READS — see [`operands`].
+    Operand,
+    /// A value the op DEFINES as a result — see [`results`].
+    Result,
+    /// A value the op's regions BIND — see [`block_args`].
+    BlockArg,
+}
+
+/// EVERY `Val` ONE OP NAMES, BY ROLE, ASSIGNABLE IN PLACE.
+///
+/// # 🛑 `setOperand` IS AN OPERATION THIS ISLAND DID NOT HAVE
+///
+/// ⛔⛔ `redefineConstantVectors` REDIRECTS **ONE** USE OF A VALUE AND LEAVES THE OTHERS ALONE —
+/// `group.op_to_update_->setOperand(group.location_, group.update_with_)`
+/// (`VectorChainHelper.cpp:600-602`). Nothing here could express that: [`operands`] hands out
+/// COPIES. Rebuilding the op from a fresh literal instead means restating every other field of the
+/// variant at the rewrite site, which is how the wrong field gets reset to a default.
+///
+/// ⭐⭐ ONE TOTAL MATCH FOR ALL THREE ROLES, AND [`operands_mut`] IS A FILTER OVER IT. Three separate
+/// mutable walks could drift out of step with [`operands`], [`results`] and [`block_args`] one
+/// variant at a time; one walk that says which role each slot is cannot. The order WITHIN a role is
+/// theirs, and `unit_tests::the_mutable_walk_agrees_with_the_immutable_ones` freezes that.
+///
+/// ⛔ AND IT DOES NOT DESCEND INTO REGIONS, exactly like the three walks it mirrors. [`regions_mut`]
+/// is how a caller goes down.
+#[must_use]
+pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
+    let mut vals: Vec<(Role, &mut Val)> = Vec::new();
+    match op {
+        Op::Arith(op) => match op {
+            arith::Op::Constant { result, .. }
+            | arith::Op::ConstantInt { result, .. }
+            | arith::Op::DenseConstant { result, .. } => vals.push((Role::Result, result)),
+            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+                vals.push((Role::Operand, &mut bin.lhs));
+                vals.push((Role::Operand, &mut bin.rhs));
+                vals.push((Role::Result, &mut bin.result));
+            }
+            arith::Op::Compare {
+                result, lhs, rhs, ..
+            } => {
+                vals.push((Role::Operand, lhs));
+                vals.push((Role::Operand, rhs));
+                vals.push((Role::Result, result));
+            }
+            arith::Op::Logic {
+                result, operands, ..
+            } => {
+                vals.extend(operands.iter_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
+            }
+        },
+        Op::Scf(op) => match op {
+            // ⛔ THE INDUCTION VARIABLES ARE THE REGION'S ARGUMENTS, not operands — see [`operands`].
+            scf::Op::Parallel { ivs, body: _ } => {
+                vals.extend(ivs.iter_mut().map(|iv| (Role::BlockArg, iv)));
+            }
+            // ⭐ THE IV IS THE ONE THING [`operands_mut`] HAS NO ROLE FOR — an `scf.for` binds it
+            // as its body's argument, exactly as [`scf::Op::Parallel`] binds its `ivs`.
+            scf::Op::For {
+                iv,
+                lo,
+                hi,
+                step,
+                carried,
+                body: _,
+                dbg_name: _,
+            } => {
+                vals.extend([lo, hi, step].map(|val| (Role::Operand, val)));
+                vals.push((Role::BlockArg, iv));
+                for carried in carried.iter_mut() {
+                    vals.push((Role::Operand, &mut carried.init));
+                    vals.push((Role::BlockArg, &mut carried.arg));
+                    vals.push((Role::Result, &mut carried.result));
+                }
+            }
+            scf::Op::If { cond, .. } => vals.push((Role::Operand, cond)),
+            scf::Op::Yield { operands } => {
+                vals.extend(operands.iter_mut().map(|val| (Role::Operand, val)));
+            }
+        },
+        Op::Affine(op) => match op {
+            // ⭐ THE THREE ROLES INTERLEAVE IN ONE VARIANT, and this is the only op where they do:
+            // each `iter_args` entry contributes an operand (its initialiser), a result and a region
+            // argument. They are collected in ONE pass over `carried` and appended in role order, so
+            // the sequence matches [`operands`] ++ [`results`] ++ [`block_args`] and not the field
+            // order of [`affine::Carried`].
+            affine::Op::For {
+                iv,
+                lo,
+                hi,
+                carried,
+                body: _,
+                dbg_name: _,
+            } => {
+                for bound in [lo, hi] {
+                    if let affine::Bound::Val(val) = bound {
+                        vals.push((Role::Operand, val));
+                    }
+                }
+                let mut inits: Vec<(Role, &mut Val)> = Vec::new();
+                let mut results: Vec<(Role, &mut Val)> = Vec::new();
+                let mut args: Vec<(Role, &mut Val)> = Vec::new();
+                for carried in carried.iter_mut() {
+                    inits.push((Role::Operand, &mut carried.init));
+                    results.push((Role::Result, &mut carried.result));
+                    args.push((Role::BlockArg, &mut carried.arg));
+                }
+                vals.extend(inits);
+                vals.extend(results);
+                vals.push((Role::BlockArg, iv));
+                vals.extend(args);
+            }
+            affine::Op::Apply { result, args, .. } => {
+                vals.extend(args.iter_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
+            }
+            affine::Op::Yield { operands } => {
+                vals.extend(operands.iter_mut().map(|val| (Role::Operand, val)));
+            }
+            affine::Op::VectorLoad {
+                result,
+                view,
+                indices,
+                ..
+            } => {
+                vals.push((Role::Operand, view));
+                index_vals_mut(indices, &mut vals);
+                vals.push((Role::Result, result));
+            }
+            affine::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                vals.push((Role::Operand, value));
+                vals.push((Role::Operand, view));
+                index_vals_mut(indices, &mut vals);
+            }
+        },
+        Op::Dataflow(op) => match op {
+            dataflow::Op::GetUnit { result, .. } => vals.push((Role::Result, result)),
+            dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetPagedLogicalMemoryView(view) => {
+                vals.push((Role::Operand, &mut view.unit));
+                vals.push((Role::Operand, &mut view.start_addr));
+                vals.extend(
+                    view.pages
+                        .iter_mut()
+                        .map(|page| (Role::Operand, &mut page.start_addr)),
+                );
+                vals.push((Role::Result, &mut view.result));
+            }
+            dataflow::Op::GetLocalUnit { result, of, .. } => {
+                vals.push((Role::Operand, of));
+                vals.push((Role::Result, result));
+            }
+            dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                ..
+            } => {
+                vals.push((Role::Operand, from));
+                vals.push((Role::Operand, start));
+                vals.push((Role::Result, result));
+            }
+            dataflow::Op::ProgramUnit { units, .. } => {
+                vals.extend(units.iter_mut().map(|val| (Role::Operand, val)));
+            }
+            dataflow::Op::Send { to, data, .. } => {
+                vals.push((Role::Operand, to.val_mut()));
+                vals.push((Role::Operand, data));
+            }
+            dataflow::Op::Receive { result, from, .. } => {
+                vals.push((Role::Operand, from.val_mut()));
+                vals.push((Role::Result, result));
+            }
+            dataflow::Op::SyncSend { to, .. } => vals.push((Role::Operand, to)),
+            dataflow::Op::SyncRecv { from, .. } => vals.push((Role::Operand, from)),
+            dataflow::Op::ImplicitSync {
+                view, dst, size, ..
+            } => {
+                vals.push((Role::Operand, view));
+                vals.push((Role::Operand, dst));
+                vals.push((Role::Operand, size));
+            }
+        },
+        Op::Agen(op) => match op {
+            agen::Op::Yield => {}
+            agen::Op::VectorLoad {
+                result,
+                view,
+                indices,
+                ..
+            } => {
+                vals.push((Role::Operand, view));
+                index_vals_mut(indices, &mut vals);
+                vals.push((Role::Result, result));
+            }
+            agen::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                vals.push((Role::Operand, value));
+                vals.push((Role::Operand, view));
+                index_vals_mut(indices, &mut vals);
+            }
+            agen::Op::CompositeLoadAndStore(transfer) => {
+                let transfer = transfer.as_mut();
+                vals.push((Role::Operand, &mut transfer.src));
+                index_vals_mut(&mut transfer.src_indices, &mut vals);
+                vals.push((Role::Operand, &mut transfer.dst));
+                index_vals_mut(&mut transfer.dst_indices, &mut vals);
+                vals.push((Role::BlockArg, &mut transfer.load_iv));
+            }
+        },
+        Op::VectorChain(op) => match op {
+            vectorchain::Op::ConstantBitstream { result, .. }
+            | vectorchain::Op::CreateAffineMask { result, .. } => {
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::Estimate { result, input, .. }
+            | vectorchain::Op::ScanWithGap { result, input, .. }
+            | vectorchain::Op::Select { result, input, .. }
+            | vectorchain::Op::Shuffle { result, input, .. }
+            | vectorchain::Op::FastExp { result, input, .. }
+            | vectorchain::Op::Floor { result, input, .. }
+            | vectorchain::Op::Cast { result, input, .. } => {
+                vals.push((Role::Operand, input));
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::Rotate {
+                result,
+                input,
+                position,
+                ..
+            } => {
+                vals.push((Role::Operand, input));
+                vals.push((Role::Operand, position));
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::Multiply { result, a, b, .. } => {
+                vals.push((Role::Operand, a));
+                vals.push((Role::Operand, b));
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::MultiplyAccumulate {
+                result, a, b, acc, ..
+            } => {
+                vals.push((Role::Operand, a));
+                vals.push((Role::Operand, b));
+                vals.push((Role::Operand, acc));
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::ElementWiseCompare {
+                result,
+                op1,
+                op2,
+                mask,
+                ..
+            } => {
+                vals.push((Role::Operand, op1));
+                vals.push((Role::Operand, op2));
+                if let Some(mask) = mask.as_mut() {
+                    vals.push((Role::Operand, mask.val_mut()));
+                }
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::ElementWiseSelection {
+                result,
+                cond,
+                lhs,
+                rhs,
+                mask,
+                ..
+            } => {
+                vals.push((Role::Operand, cond.val_mut()));
+                vals.push((Role::Operand, lhs));
+                vals.push((Role::Operand, rhs));
+                if let Some(mask) = mask.as_mut() {
+                    vals.push((Role::Operand, mask.val_mut()));
+                }
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::Binary {
+                result,
+                op1,
+                op2,
+                mask,
+                ..
+            }
+            | vectorchain::Op::Pack {
+                result,
+                op1,
+                op2,
+                mask,
+                ..
+            } => {
+                vals.push((Role::Operand, op1));
+                vals.push((Role::Operand, op2));
+                if let Some(mask) = mask.as_mut() {
+                    vals.push((Role::Operand, mask.val_mut()));
+                }
+                vals.push((Role::Result, result));
+            }
+            // ⛔ NO MASK — see [`operands`].
+            vectorchain::Op::Merge {
+                result, op1, op2, ..
+            } => {
+                vals.push((Role::Operand, op1));
+                vals.push((Role::Operand, op2));
+                vals.push((Role::Result, result));
+            }
+        },
+    }
+    vals
+}
+
+/// THE SSA SLOTS ONE INDEX LIST READS — [`index_operands`], assignable.
+fn index_vals_mut<'a>(indices: &'a mut [Index], into: &mut Vec<(Role, &'a mut Val)>) {
+    for index in indices {
+        match index {
+            Index::Val(val) => into.push((Role::Operand, val)),
+            Index::Const(_) => {}
+            Index::Strided(terms, _) => {
+                into.extend(terms.iter_mut().map(|(val, _)| (Role::Operand, val)));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{
+        Index, Op, Role, Val, block_args, operands, operands_mut, regions, regions_mut, results,
+        vals_mut,
+    };
+    use super::{affine, agen, arith, dataflow, scf, vectorchain};
+    use crate::islands::dataflow_ir::link::{Link, Lxlu, Sfp};
+    use crate::islands::dataflow_ir::ty::{
+        AffineMap, ElemType, IntegerSet, MemRef, ScalarTy, Vector,
+    };
+
+    fn vector() -> Vector {
+        Vector {
+            len: 64,
+            elem: ElemType::F16,
+        }
+    }
+
+    fn memref() -> MemRef {
+        MemRef {
+            shape: vec![8, 64],
+            elem: ElemType::F16,
+        }
+    }
+
+    fn predicate(val: u32) -> vectorchain::Predicate {
+        vectorchain::LaneMask::prefix_of(64, vector()).binds(Val(val))
+    }
+
+    /// ONE OP PER MECHANISM THE MUTABLE WALK HAS TO GET RIGHT.
+    ///
+    /// ⛔ THIS IS NOT A SAMPLE OF THE ENUM AND IT IS NOT TRYING TO BE. Coverage of the variants is
+    /// the COMPILER'S job: [`vals_mut`] and [`regions_mut`] have no wildcard arm, so a new op cannot
+    /// be added without stating its slots. What a test has to check instead is the part the compiler
+    /// cannot — that the slots come out in the ORDER the three immutable walks name them — and the
+    /// list below holds one op for each shape that could get that wrong: a sub-struct's fields, a
+    /// `Vec` of operands, the one variant where all three roles interleave, an index list with a
+    /// strided sum, the two ops whose operand is a private link end, the two private
+    /// [`vectorchain::Predicate`]s of a masked selection, a boxed payload with a region argument, and
+    /// an op with two regions.
+    fn one_of_each_mechanism() -> Vec<Op> {
+        vec![
+            // A sub-struct's three fields, in one arm.
+            Op::Arith(arith::Op::AddI(arith::IntBinary {
+                result: Val(3),
+                lhs: Val(1),
+                rhs: Val(2),
+                ty: ScalarTy::Index,
+            })),
+            // A `Vec` of operands ahead of the result.
+            Op::Arith(arith::Op::Logic {
+                result: Val(7),
+                kind: arith::LogicKind::And,
+                operands: vec![Val(4), Val(5), Val(6)],
+            }),
+            // ⭐ THE HARD ONE: a dynamic bound, and one carried value contributing an operand, a
+            // result and a region argument.
+            Op::Affine(affine::Op::For {
+                iv: Val(10),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Val(Val(8)),
+                carried: vec![affine::Carried {
+                    init: Val(9),
+                    arg: Val(11),
+                    result: Val(12),
+                }],
+                body: Vec::new(),
+                dbg_name: None,
+            }),
+            // An index list holding a strided sum and a literal.
+            Op::Agen(agen::Op::VectorLoad {
+                result: Val(20),
+                view: Val(13),
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(Val(14), 1), (Val(15), 8)], 4),
+                    Index::Val(Val(16)),
+                ],
+                view_ty: memref(),
+                ty: vector(),
+            }),
+            // The private link ends.
+            Op::Dataflow(dataflow::Op::Send {
+                to: Link::<Lxlu, Sfp>::between(Val(30), Val(31)).ends().0,
+                data: Val(32),
+                ty: vector(),
+            }),
+            Op::Dataflow(dataflow::Op::Receive {
+                result: Val(35),
+                from: Link::<Lxlu, Sfp>::between(Val(33), Val(34)).ends().1,
+                ty: vector(),
+            }),
+            // Two private predicates, one of them optional.
+            Op::VectorChain(vectorchain::Op::ElementWiseSelection {
+                result: Val(45),
+                cond: predicate(40),
+                lhs: Val(41),
+                rhs: Val(42),
+                mask: Some(predicate(43)),
+                ty: vector(),
+            }),
+            // A boxed payload with two index lists and a region argument.
+            Op::Agen(agen::Op::CompositeLoadAndStore(Box::new(
+                agen::CompositeTransfer {
+                    src: Val(50),
+                    src_indices: vec![Index::Val(Val(51))],
+                    src_ty: memref(),
+                    dst: Val(52),
+                    dst_indices: vec![Index::Val(Val(53))],
+                    dst_ty: memref(),
+                    load_iv: Val(54),
+                    load_iv_ty: vector(),
+                    load_set: IntegerSet::from_sizes(&[8]),
+                    load_order: AffineMap::identity(1),
+                    store_set: IntegerSet::from_sizes(&[8]),
+                    store_order: AffineMap::identity(1),
+                    time_set: IntegerSet::from_sizes(&[8]),
+                    time_order: AffineMap::identity(1),
+                    load_time_addr_map: AffineMap::identity(1),
+                    store_time_addr_map: AffineMap::identity(1),
+                    body: vec![Op::Agen(agen::Op::Yield)],
+                },
+            ))),
+            // Two regions.
+            Op::Scf(scf::Op::If {
+                cond: Val(60),
+                body: vec![Op::Agen(agen::Op::Yield)],
+                else_body: Vec::new(),
+            }),
+        ]
+    }
+
+    /// ⛔⛔ THE MUTABLE WALK IS ONLY USEFUL IF A POSITION MEANS THE SAME THING IN BOTH. `setOperand`
+    /// is indexed by `use.getOperandNumber()` (`VectorChainHelper.cpp:600-602`), so slot `i` of
+    /// [`operands_mut`] has to be value `i` of [`operands`] — and the same for the other two roles.
+    #[test]
+    fn the_mutable_walk_agrees_with_the_immutable_ones() {
+        for op in one_of_each_mechanism() {
+            let expected_operands = operands(&op);
+            let expected_results = results(&op);
+            let expected_args = block_args(&op);
+            let expected_regions: Vec<usize> =
+                regions(&op).iter().map(|region| region.len()).collect();
+
+            let mut walked = op.clone();
+            let by_role = |role: Role| -> Vec<Val> {
+                let mut copy = op.clone();
+                vals_mut(&mut copy)
+                    .into_iter()
+                    .filter(|(seen, _)| *seen == role)
+                    .map(|(_, val)| *val)
+                    .collect()
+            };
+
+            assert_eq!(by_role(Role::Operand), expected_operands, "{op:?}");
+            assert_eq!(by_role(Role::Result), expected_results, "{op:?}");
+            assert_eq!(by_role(Role::BlockArg), expected_args, "{op:?}");
+            // ⛔ [`operands_mut`] IS A SUBSEQUENCE OF THE ROLE, NOT THE WHOLE OF IT. It withholds a
+            // link end and a [`vectorchain::Predicate`] on purpose, for the reason its own doc gives;
+            // what has to hold is that every place it DOES hand out appears in [`operands`] in the
+            // same relative order, so neither walk shifts the other's slots.
+            let narrow: Vec<Val> = operands_mut(&mut walked)
+                .into_iter()
+                .map(|val| *val)
+                .collect();
+            let mut wide = expected_operands.iter();
+            for place in &narrow {
+                assert!(wide.any(|seen| seen == place), "{place:?} of {op:?}");
+            }
+            assert_eq!(
+                regions_mut(&mut walked)
+                    .iter()
+                    .map(|region| region.len())
+                    .collect::<Vec<_>>(),
+                expected_regions,
+                "{op:?}"
+            );
+        }
+    }
+
+    /// ⛔ ASSIGNING ONE SLOT MOVES ONE VALUE. The whole reason `redefineConstantVectors` needs a
+    /// positional rewrite is that a value read TWICE by one op gets two DIFFERENT clones, one per
+    /// position (`VectorChainHelper.cpp:589-595`) — so a walk that rewrote every matching operand at
+    /// once would be the wrong operation.
+    #[test]
+    fn assigning_one_operand_slot_leaves_the_others_alone() {
+        let mut op = Op::Arith(arith::Op::Logic {
+            result: Val(7),
+            kind: arith::LogicKind::And,
+            operands: vec![Val(4), Val(4), Val(6)],
+        });
+
+        *operands_mut(&mut op)[1] = Val(99);
+
+        assert_eq!(operands(&op), vec![Val(4), Val(99), Val(6)]);
+        assert_eq!(results(&op), vec![Val(7)]);
+    }
+
+    /// ⛔ A MASK'S TYPE SURVIVES THE SUBSTITUTION. [`vectorchain::Predicate`] exists so that the type
+    /// travels with the value from its definition, and `val_mut` is deliberately unable to touch it.
+    /// ⭐ ONLY [`vals_mut`] REACHES A CONDITION VECTOR AT ALL — [`operands_mut`] withholds it, so
+    /// this substitution is one a positional rewrite can make and a use re-pointing cannot.
+    #[test]
+    fn substituting_a_mask_value_keeps_the_type_it_was_defined_at() {
+        let mut op = Op::VectorChain(vectorchain::Op::ElementWiseSelection {
+            result: Val(45),
+            cond: predicate(40),
+            lhs: Val(41),
+            rhs: Val(42),
+            mask: None,
+            ty: vector(),
+        });
+
+        *vals_mut(&mut op)[0].1 = Val(70);
+
+        let Op::VectorChain(vectorchain::Op::ElementWiseSelection { cond, .. }) = &op else {
+            unreachable!("the op above is an element_wise_selection")
+        };
+        assert_eq!(cond.val(), Val(70));
+        assert_eq!(cond.ty(), vector());
+    }
+}

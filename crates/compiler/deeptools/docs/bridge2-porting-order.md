@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`121/384 ported; 121/384 audited`
+`129/384 ported; 129/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -509,6 +509,93 @@ included, and that is what a chain clone re-points. ⛔ `clone_with_fresh_result
 REGIONS; both callers are region-free chain ops (`Agen.cpp:114-134`).
 
 
+⭐ AND ENTRIES 065-072 — the rest of `VectorChainHelper`'s fusion and mapping layer in
+`vc_vector_chain_helper.rs` (`fuseCompareAndSelectIntoMinOrMax`, `resetSentientFMAsIfExists`,
+`redefineConstantVectors`, `getVectorBinaryToSentientBinary`,
+`getVectorElementWiseCompareOperatorToSentientBinaryOperator`, `getVectorTernaryToSentientTernary`)
+and `VectorOperand`'s two link resolvers (`getOperandFromReceiveOp`, `getOperandFromSendOp`) in
+`vc_vector_operands.rs`.
+
+⛔ 065's TWO OUT-BOOLS BECAME ONE THREE-STATE ANSWER. `bool& fusion_to_min, bool& fusion_to_max` has
+a fourth state the reference reaches only to `DT_ERROR` on it; `MinOrMaxFusion` is
+`NotFused | ToMin | ToMax` and the impossible pair is gone from the type. The arm order is the
+reference's and it carries information: `compare_gt`/`compare_ge` with the arms in the compare's own
+order is a MAX and reversed is a MIN, and `compare_lt`/`compare_le` is the transpose of that — eight
+rows, all eight pinned by a table test. `compare_eq`/`compare_neq` is the one `todo!`, and it is the
+reference's `DT_ERROR` at `VectorChainHelper.cpp:460-462`.
+
+⭐ AND 065 IS UNPORTABLE WITHOUT OPERATION EQUIVALENCE, whose comment says why:
+*"some times constant operands are duplicated, and direct match may result in spurious mismatches"*.
+`relu.mlir` is that case — `:50-51` are two separate `dense<0.0>` constants, the compare reads `%cst`
+and the selection reads `%cst_1` (`:73-74`), and it still fuses to the `max` at `:35`/`:37`.
+`dcc::OperationEquivalence` (`dcc/src/Analysis/OperationEquivalence.cpp`) is not on this list, so what
+landed is the minimum 065 needs: a `skeleton()` that clones an op, clears its regions and blanks every
+`Val`, then compares operands pairwise through their defining ops. ⛔ IT IS BLANK-AND-COMPARE RATHER
+THAN A HAND-WRITTEN PER-VARIANT TEST SO THAT NO COMPARISON CAN FALL BEHIND THE `Op` ENUM — a new
+attribute is compared the day it is added. Three divergences are documented at the function: the
+reference's `dbgName` filter has nothing to filter here, `IntegerSetAttr` equality is plain rather
+than order-insensitive, and the equivalence-class memo is omitted.
+
+⭐ 066'S WALK IS PROVABLY COMPLETE, AND THAT IS A FACT ABOUT THE ISLAND. `unit.walk<PreOrder>` visits
+every nested operation; the Rust recursion has exactly three arms because `sentient::Op::For` and
+`sentient::Op::If` are the ONLY region-carrying variants in the whole sentient island (checked across
+all seven of its dialects). `si32 = -1` is `data_id: None` — the sentinel is the absence. MAC and
+BINARY only: a unary or a ternary keeps its data IDs, which is a test.
+
+⛔ 067 IS POSITIONAL REWRITING, NOT VALUE SUBSTITUTION, and that is the difference between a port and
+a paraphrase. The reference clones the constant with an `OpBuilder` positioned at EACH USER, records
+`{owner, new result, use.getOperandNumber()}`, and only then calls `setOperand` — so one op reading a
+constant twice gets TWO clones, and a nested user gets its clone inside its own block. Both are tests.
+`!use_empty()` is a real guard: an unused vector constant is neither cloned nor erased.
+`const-vector-multiple-uses.mlir` is the golden — `%cst_1` is read six times at four depths in the
+input (`:179`, `:184`, `:185`, down to the `multiply_and_accumulate` at `:310`) and NO `dense<…>`
+survives into the expectation at `:15-24`. ⭐ AND THE SCOPE IS THE MODULE, NOT A UNIT: both call sites
+pass `module_op` (`VectorChainToSentientPT.cpp:983`, `VectorChainToSentientPESFP.cpp:1385`), so the
+port takes the whole `Program` — preamble and every unit. The `isa<VectorType,
+dataflow::CustomVectorType>` test is discharged by the variant, because `arith::Op::DenseConstant`'s
+`ty` IS a `Vector` while `Constant` is an `index` and `ConstantInt` an `i<n>`.
+
+⭐ 068 CARRIES NO `todo!` AT ALL: `vc::BinaryOp` has exactly twelve variants and the reference names
+all twelve, so its `DT_ERROR` is unreachable once the argument is a Rust enum. It is still not an
+identity — `sen::BinaryOp` has twenty, the two converts, `merge`, `pack` and the four `fcmp`s having
+no `vectorchain` counterpart. 069 is four arms for six inputs BY DESIGN: the ISA has no element-wise
+`gt`/`ge` and the caller reorders the operands instead (`VectorChainToSentientPESFP.cpp:450-485`),
+which `fcmp_select.mlir` shows both halves of — input `:136` is `compare_gt` and expectation `:48` is
+`fcmp_lt` with `opA`/`opB` swapped. ⛔ 069'S `todo!` MESSAGE SAYS "Ternary" BECAUSE THE REFERENCE'S
+DOES: it is a copy-paste from 070, kept verbatim so a grep for the text finds the C++ line.
+
+⛔ 071/072 ARE THE LINK NAME, AND THE LINK NAME IS THE OPERAND. Both resolve a peer unit plus the
+asking component into a `sen::Port`, and the reference's string arms became total matches over
+`DfirUnit`, so a nineteenth unit has to say which arm it belongs to. `generic == PT` is every
+`PtRow(_)` and `generic == CROSSPTNLINK` is one unit, both checked against `senCompToGenericComp`
+(`sys-arch-spec/arch_enums.cpp:124-211`). Goldens: `loweringXRF_with_if_branch.mlir:145` receives from
+an `l0lu` and expects `opA = #sentient<compute_port west>` (`:49`); `xrf_increments.mlir:413-457`
+receives from an `lxlu` on a PT and expects `opC = … north` (`:71`); `xrf_increments.mlir:422` sends
+to a `ptrow1` and expects `ResultForwarding = [#sentient<compute_port south>]` (`:81`).
+⭐ THE ASYMMETRY IS THE REFERENCE'S: a PE/SFP may SEND to the L0 and to either LX half, and may not
+RECEIVE from the L0 at all. ⛔ AND THE PT BRANCH OF 072 HAS NO `else` — an unmatched destination falls
+out with `link` empty into the bottom `if (link.empty())`, whose message says *"Unsupported
+destination for PE/SFP FMA"* even though the unit asking is the PT; both branches are written and the
+message is reproduced as the reference words it. Two of the four failure paths in each are
+unreachable from a resolved `DfirUnit` and are documented rather than written: `findUnitType`'s empty
+optional is a disagreement between attributes the caller resolved earlier, and
+*"Unknown receiver"*/*"Unknown destination"* is a lookup into the same table `DfirUnit::spelling`
+came out of.
+
+⛔ THE `sfpring` RE-CHECK IS A TAUTOLOGY IN THE REFERENCE ITSELF: 071's
+`stringToSenComponents.at(unit_str) == SFP` sits inside `else if (record->second == SFP)`, where
+`record->second` IS that lookup. And 072's `emitWarning` arm — SFP→SFP below DD1 — is unreachable on
+every arch this crate builds for, which is what `supports_sfp_ring` says; it is written because it is
+the function and it is where an older generation lands the day one is added to `IsaGen`.
+
+⭐ THE ISLAND GREW FOR 066/067, AS THE BRIEF REQUIRES. Both are IN-PLACE REWRITES and the islands were
+emit-only, so `dialects::vals_mut`/`operands_mut`/`regions_mut` arrived in the DataflowIR island
+(`dialects/mod.rs`) as ONE total match with no wildcard arm — a new op cannot be silently skipped by
+the rewriters — plus `Role` to tell an operand from a result, `ProgramUnits::iter_mut`, and a
+`pub(super) val_mut` on `SendEnd`/`RecvEnd`/`Predicate` for `setOperand`. ⛔ `Predicate::val_mut`
+CANNOT TOUCH ITS `ty`, so the invariant that type exists for still holds.
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -639,22 +726,22 @@ REGIONS; both callers are region-free chain ops (`Agen.cpp:114-134`).
 - [x] **AUDIT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, line by line against the C++
 - [x] **PORT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, 6 lines
 - [x] **AUDIT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, line by line against the C++
-- [ ] **PORT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, 49 lines
-- [ ] **AUDIT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, line by line against the C++
-- [ ] **PORT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, 13 lines
-- [ ] **AUDIT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, line by line against the C++
-- [ ] **PORT 067/384** `redefineConstantVectors` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571`, 37 lines
-- [ ] **AUDIT 067/384** `redefineConstantVectors` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571`, line by line against the C++
-- [ ] **PORT 068/384** `getVectorBinaryToSentientBinary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32`, 17 lines
-- [ ] **AUDIT 068/384** `getVectorBinaryToSentientBinary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32`, line by line against the C++
-- [ ] **PORT 069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55`, 9 lines
-- [ ] **AUDIT 069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55`, line by line against the C++
-- [ ] **PORT 070/384** `getVectorTernaryToSentientTernary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247`, 7 lines
-- [ ] **AUDIT 070/384** `getVectorTernaryToSentientTernary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247`, line by line against the C++
-- [ ] **PORT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, 54 lines
-- [ ] **AUDIT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, line by line against the C++
-- [ ] **PORT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, 50 lines
-- [ ] **AUDIT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, line by line against the C++
+- [x] **PORT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, 49 lines
+- [x] **AUDIT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, line by line against the C++
+- [x] **PORT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, 13 lines
+- [x] **AUDIT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, line by line against the C++
+- [x] **PORT 067/384** `redefineConstantVectors` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571`, 37 lines
+- [x] **AUDIT 067/384** `redefineConstantVectors` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571`, line by line against the C++
+- [x] **PORT 068/384** `getVectorBinaryToSentientBinary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32`, 17 lines
+- [x] **AUDIT 068/384** `getVectorBinaryToSentientBinary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32`, line by line against the C++
+- [x] **PORT 069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55`, 9 lines
+- [x] **AUDIT 069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55`, line by line against the C++
+- [x] **PORT 070/384** `getVectorTernaryToSentientTernary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247`, 7 lines
+- [x] **AUDIT 070/384** `getVectorTernaryToSentientTernary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247`, line by line against the C++
+- [x] **PORT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, 54 lines
+- [x] **AUDIT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, line by line against the C++
+- [x] **PORT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, 50 lines
+- [x] **AUDIT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, line by line against the C++
 - [x] **PORT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, 12 lines
 - [x] **AUDIT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, line by line against the C++
 - [x] **PORT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, 11 lines

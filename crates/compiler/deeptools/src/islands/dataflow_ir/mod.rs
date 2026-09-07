@@ -325,6 +325,17 @@ impl<A: Arch> ProgramUnits<A> {
     pub fn iter(&self) -> impl Iterator<Item = &ProgramUnit<A>> {
         core::iter::once(&self.head).chain(self.rest.iter())
     }
+
+    /// Every unit, head first, FOR REWRITING IN PLACE.
+    ///
+    /// ⭐ FOR A MODULE-WIDE PASS. `redefineConstantVectors(module_op)`
+    /// (`VectorChainToSentientPT.cpp:983`) walks the whole module before any unit is lowered, and the
+    /// module here IS this list plus [`Program::preamble`] — so a pass that rewrites a use needs to
+    /// reach every body. ⛔ IT CANNOT ADD OR REMOVE A UNIT, so the non-emptiness this type exists for
+    /// still holds.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ProgramUnit<A>> {
+        core::iter::once(&mut self.head).chain(self.rest.iter_mut())
+    }
 }
 
 /// ONE PROGRAM: a named module holding the DataflowIR one schedule runs.

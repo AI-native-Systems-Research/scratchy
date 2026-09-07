@@ -154,9 +154,12 @@ impl SendEnd {
     /// THE END'S VALUE, MUTABLY — for RENUMBERING ONLY.
     ///
     /// ⛔ THIS DOES NOT REPAIR THE WIRE, AND IT IS NOT A PUBLIC SETTER. A clone rewrites every value
-    /// of an op it copied (`dialects::parts_mut`), and the send's destination is one of them; the
-    /// [`Link`] the end came from still says which two units it joins, because renaming a value does
-    /// not move it. Anything that wants a DIFFERENT destination takes a different [`Link`].
+    /// of an op it copied (`dialects::parts_mut`), and a rewriter redirects a single use in place
+    /// (`dialects::vals_mut`, `VectorChainHelper.cpp:600-602`); the send's destination is one of the
+    /// values either one names. Both are SUBSTITUTION, NOT MINTING — the [`Link`] the end came from
+    /// still says which two units it joins, because renaming a value does not move it, and
+    /// [`Link::ends`] remains the only way to obtain an end in the first place. Anything that wants a
+    /// DIFFERENT destination takes a different [`Link`].
     pub(crate) const fn val_mut(&mut self) -> &mut Val {
         &mut self.0
     }
