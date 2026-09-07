@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 
 use crate::islands::sentient::dialects::{
-    Op, affine, agen, arith, dataflow, scf, sentient, symbol, vectorchain,
+    Op, affine, agen, arith, dataflow, scf, sentient, symbol, vector, vectorchain,
 };
 use crate::islands::sentient::{Program, Run};
 
@@ -108,6 +108,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::Arith(op) => arith::emit(out, op),
         Op::Scf(op) => scf::emit(out, op, depth),
         Op::Affine(op) => affine::emit(out, op, depth),
+        Op::Vector(op) => vector::emit(out, op),
         Op::Dataflow(op) => dataflow::emit(out, op, depth),
         Op::Agen(op) => agen::emit(out, op, depth),
         Op::VectorChain(op) => vectorchain::emit(out, op),

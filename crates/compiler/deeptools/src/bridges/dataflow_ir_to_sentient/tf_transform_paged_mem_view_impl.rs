@@ -887,6 +887,9 @@ impl<'a> VectorLoadOp<'a> {
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
+            // ⭐ `dyn_cast<agen::VectorLoadOp>` IS NULL ON AN UPSTREAM `vector.load` — a different
+            // dialect's op, and the whole `TPMVBase` hierarchy is written against the `agen` ones.
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => None,
         }
@@ -1114,6 +1117,9 @@ impl<'a> VectorStoreOp<'a> {
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
+            // ⭐ `dyn_cast<agen::VectorLoadOp>` IS NULL ON AN UPSTREAM `vector.load` — a different
+            // dialect's op, and the whole `TPMVBase` hierarchy is written against the `agen` ones.
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => None,
         }

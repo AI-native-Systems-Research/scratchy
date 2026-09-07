@@ -409,6 +409,31 @@ pub enum Op {
         ty: Vector,
     },
 
+    /// `vectorchain.neg %in [%mask : tm] : tin, tout` — the negation, `VectorChain_NegOp`
+    /// (`VectorChain.td:359-373`): *"This operation negates the input SSA variable."*
+    ///
+    /// ⛔ IT CARRIES A MASK AND [`Op::Floor`] DOES NOT, which is why this is its own variant and not a
+    /// third mnemonic on that arm. `(ins AnyVectorOfAnyRank:$op, Optional<VectorOfRankAndType<[1],
+    /// [I1]>>:$mask, OptionalAttr<StrAttr>:$dbgName)` (`:366-367`) — and the mask is narrower than the
+    /// elementwise family's `Optional<AnyVectorOfAnyRank>`: rank exactly 1, element type exactly `i1`.
+    ///
+    /// ⭐ ADDED FOR `e168_getOperandFromNegOp`, whose whole body is `op.getOperand(0).getDefiningOp()`
+    /// followed by a recursion — an op the island could not spell, so the operand that function
+    /// forwards had nowhere to come from.
+    Neg {
+        /// The vector it binds — `(outs AnyVectorOfAnyRank:$data)`.
+        result: Val,
+        /// `$op` — what is negated. ⭐ THE OPERAND `e168` FORWARDS IS THIS ONE, at index 0.
+        input: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `Optional`, so an unmasked negation is [`None`] and
+        /// prints no bracket at all.
+        mask: Option<Predicate>,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
     /// `vectorchain.scan_with_gap %in {reduction_op, gap, eval_order} : tin, tout` — a reduction.
     ///
     /// ⛔ WHICH REDUCTION IS THE COMPUTE'S `mode=`: 1 add, 8 max, 10 abs_max, 12 min, 14 abs_min
@@ -845,6 +870,26 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 "{} = vectorchain.{mnemonic} {} : {}, {}",
                 print::val(*result),
                 print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        // ⛔ ITS OWN ARM BECAUSE OF THE BRACKET: `$op (`[` $mask^ `:` type($mask) `]`)? attr-dict `:`
+        // type($op) `,` type(results)` (`VectorChain.td:370-372`) — the mask sits BEFORE the `:`, so
+        // folding this into the attribute-free unary arm above would drop it.
+        Op::Neg {
+            result,
+            input,
+            mask,
+            input_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.neg {}{} : {}, {}",
+                print::val(*result),
+                print::val(*input),
+                mask_bracket(*mask),
                 print::vector(*input_ty),
                 print::vector(*ty)
             );

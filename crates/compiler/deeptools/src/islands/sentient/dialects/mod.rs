@@ -37,6 +37,8 @@ pub use crate::islands::dataflow_ir::dialects::dataflow;
 pub use crate::islands::dataflow_ir::dialects::scf;
 /// `Symbol.td` — re-exported; a symbolic loop bound survives into this rung. See [`Op::Symbol`].
 pub use crate::islands::dataflow_ir::dialects::symbol;
+/// Upstream `vector` — re-exported; the two plain accesses the vectorchain lowerings read.
+pub use crate::islands::dataflow_ir::dialects::vector;
 /// `VectorChain.td` — re-exported; what `VectorChainToSentientPE_SFP`/`_PT` consume.
 pub use crate::islands::dataflow_ir::dialects::vectorchain;
 
@@ -70,6 +72,8 @@ pub enum Op {
     VectorChain(vectorchain::Op),
     /// Upstream `affine` — the loop nest and the applied maps.
     Affine(affine::Op),
+    /// Upstream `vector` — a plain access still awaiting its `sentient` form.
+    Vector(vector::Op),
     /// Upstream `arith` — constants and predicates.
     Arith(arith::Op),
     /// Upstream `scf`.
@@ -123,6 +127,7 @@ fn lowered(op: &Op) -> Option<crate::islands::dataflow_ir::dialects::Op> {
         Op::Agen(op) => Some(LowerOp::Agen(op.clone())),
         Op::VectorChain(op) => Some(LowerOp::VectorChain(op.clone())),
         Op::Affine(op) => Some(LowerOp::Affine(op.clone())),
+        Op::Vector(op) => Some(LowerOp::Vector(op.clone())),
         Op::Arith(op) => Some(LowerOp::Arith(op.clone())),
         Op::Scf(op) => Some(LowerOp::Scf(op.clone())),
         Op::Symbol(op) => Some(LowerOp::Symbol(op.clone())),

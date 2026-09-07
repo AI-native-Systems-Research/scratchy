@@ -1077,6 +1077,7 @@ impl ConditionalKind {
             DfirOp::Arith(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => None,
         }

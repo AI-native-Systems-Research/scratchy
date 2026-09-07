@@ -937,7 +937,7 @@ impl LoopMaskTree {
     ///
     /// ⛔ THE PAIR OF PREDICATES IS ON THE EXCLUDED LIST as field accessors; this is the read they
     /// become. Every C++ caller asks the question and then downcasts —
-    /// `verifyLoopNest`'s `DT_CHECK_MSG(node->isLoopNode(), …)` (`LoweringPTMasks.cpp:112`),
+    /// `verifyLoopNest`'s `DT_CHECK_MSG(node->isLoopNode(), …)` (`LoweringPTMasks.cpp:115`),
     /// `print`'s three-way branch (`LoopMaskTree.cpp:102-111`) — and here the answer carries the
     /// payload with it.
     pub fn node(&self, n: LoopMaskNodeId) -> &LoopMaskNode {
@@ -1036,13 +1036,138 @@ impl LoopMaskTree {
         self.base
             .breadth_first_walk(self.base.root(), &mut |n| action(LoopMaskNodeId(n)));
     }
+
+    /// A NODE'S MASK, IF IT HAS ONE — `n->isMaskNode()` followed by `static_cast<MaskNode *>(n)`,
+    /// the pair every C++ caller writes (`LoweringPTMasks.cpp:123-125`, `:174-178`,
+    /// `LoopMaskTree.cpp:104-105`).
+    ///
+    /// ⛔⛔ THIS IS WHERE THE DOWNCAST HAPPENS, ONCE, AND IT IS THE ONLY PLACE IT CAN. Minting a
+    /// [`MaskNodeId`] copies the payload out at the same moment it classifies, so
+    /// [`Self::is_mask_equivalent_to_node`] — whose C++ signature takes `MaskNode *` on both sides
+    /// (`LoopMaskTree.hpp:84`) — has nothing left to check and no arm to answer for a node that turned
+    /// out not to be a mask. ⭐ `Option` HERE IS THE PREDICATE, NOT A CHECKED NARROWING: `isMaskNode`
+    /// is a question with two honest answers, and `None` is the one the reference spells `false`.
+    #[must_use]
+    pub fn mask_node(&self, n: LoopMaskNodeId) -> Option<MaskNodeId> {
+        match self.node(n) {
+            LoopMaskNode::Mask(mask) => Some(MaskNodeId {
+                node: n,
+                mask: *mask,
+            }),
+            LoopMaskNode::SyntheticRoot | LoopMaskNode::Loop(LMTLoopNode) => None,
+        }
+    }
+
+    /// Replaces: e171_isMaskEquivalentToNode
+    ///
+    /// **171/384** `MaskNode::isMaskEquivalentToNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:123` (4L).
+    ///
+    /// ```cpp
+    /// bool MaskNode::isMaskEquivalentToNode(MaskNode *n) {
+    ///   return (n->getParentNode() == getParentNode() &&
+    ///           n->getStartVal() == getStartVal() &&
+    ///           n->getIncrement() == getIncrement());
+    /// }
+    /// ```
+    ///
+    /// # 🛑 THREE CLAUSES, AND THE FIRST ONE IS THE ONE THAT DECIDES
+    ///
+    /// ⭐⭐ "EQUIVALENT" MEANS **SAME PARENT LOOP** AND SAME MASK, WHICH MAKES IT A TEST FOR SIBLINGS.
+    /// The reference's own worked example proves the parent clause is not redundant
+    /// (`LoweringPTMasks.cpp:152-163`):
+    ///
+    /// ```text
+    ///             A:[root]
+    ///                /  \
+    ///       B:[loop i]  C:[mask {2,0}]
+    ///          /    \
+    ///  D:[loop j]   E:[mask {0,1}]
+    ///       |
+    ///  F:[mask {0,1}]
+    /// ```
+    ///
+    /// E and F carry `{0, 1}` each — identical on both of the fields `:125-126` compares — and the
+    /// comment above the diagram still says *"We find another mask node so the program is not
+    /// supported and we signal pass failure"* (`:160-163`). Only the parent comparison can produce that
+    /// answer: E hangs off B and F off D. A port that compared the two masks alone would call them
+    /// equivalent, and `insertMaskOps` would then emit ONE `set_mask`/`incrmask`/`set_mask 0` trio for
+    /// two nests that each need their own.
+    ///
+    /// ⭐ AND THE CASE IT *DOES* ALLOW IS THE VENDOR'S OWN. `dynamic_pt_masking.mlir` has two macs
+    /// under `for %arg4`, both masked by `%arg4` and so both `{0, 1}` with the SAME parent node — the
+    /// reason the golden output brackets that loop once (`:38`, `:53`, `:56`) rather than twice. That is
+    /// what *"If the mask is equivalent, it is allowed"* (`:124`) is for.
+    ///
+    /// ⛔ THE PARENTS ARE COMPARED AS IDENTITIES, NOT AS VALUES. The C++ `==` is on
+    /// `LoopMaskNode *` — pointer equality — so two DIFFERENT loop nodes standing for the same
+    /// `sentient.for` would still compare unequal. [`LoopMaskNodeId`] is that identity; comparing the
+    /// operations instead would fuse nodes the tree keeps apart.
+    ///
+    /// ⭐ NEITHER PARENT NEEDS A NULL TEST, AND THE REFERENCE TAKES NONE. A mask node always has a
+    /// parent — `addMaskNode` attaches it under a loop, or under the root when no loop encloses it
+    /// (`LoopMaskTree.cpp:142-147`) — so `Option<LoopMaskNodeId>` here is compared, never unwrapped,
+    /// and `None == None` is the two-root case the reference's `nullptr == nullptr` also calls equal.
+    ///
+    /// ⛔ THE RECEIVER AND THE ARGUMENT ARE INTERCHANGEABLE and the relation is an equivalence — all
+    /// three clauses are symmetric. `verifyLoopNest` relies on it, calling
+    /// `m->isMaskEquivalentToNode(mask_node)` with `m` from the walk and `mask_node` from the caller
+    /// (`LoweringPTMasks.cpp:126`); which of the two is the receiver is not a decision anyone made.
+    #[must_use]
+    pub fn is_mask_equivalent_to_node(&self, this: MaskNodeId, other: MaskNodeId) -> bool {
+        // `n->getParentNode() == getParentNode() &&`
+        self.parent_node(other.node) == self.parent_node(this.node)
+            // `n->getStartVal() == getStartVal() &&`
+            && other.mask.start_val == this.mask.start_val
+            // `n->getIncrement() == getIncrement());`
+            && other.mask.increment == this.mask.increment
+    }
+}
+
+/// A NODE KNOWN TO CARRY A MASK — the `MaskNode *` that `isMaskEquivalentToNode` takes on both sides
+/// (`LoopMaskTree.hpp:84`), and that `insertMaskOps` takes as its only argument
+/// (`LoweringPTMasks.cpp:45`, entry 239).
+///
+/// # 🛑 THE WITNESS AND ITS PAYLOAD TRAVEL TOGETHER
+///
+/// ⛔⛔ A `MaskNode *` IN THE C++ IS A CLAIM SOMEONE ELSE ALREADY CHECKED. Both call sites reach one
+/// the same way — `if (n->isMaskNode()) { auto m = static_cast<MaskNode *>(n); … }`
+/// (`LoweringPTMasks.cpp:123-125`, `:174-178`) — and after that the two `int`s are read with no
+/// further test. Here [`LoopMaskTree::mask_node`] performs that pair once and copies the
+/// [`MaskNode`] out with the identity, so no reader downcasts a second time and none needs an
+/// `unreachable!` arm for a node that is not a mask. ⭐ A PAIRING IS A WITNESS CONSUMED ONCE, which
+/// is this crate's rule and the reason the payload is a field rather than a lookup.
+///
+/// ⛔ THE IDENTITY IS STILL CARRIED, because the mask alone does not answer the question: the parent
+/// clause of [`LoopMaskTree::is_mask_equivalent_to_node`] needs the node, and `insertMaskOps` needs
+/// both the node's own operation and its parent's (`LoweringPTMasks.cpp:74`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MaskNodeId {
+    /// Which node it is — the `LoopMaskNode *` the `static_cast` started from.
+    node: LoopMaskNodeId,
+    /// `start_val_` and `increment_`, copied at the moment of the cast (`LoopMaskTree.hpp:87`).
+    mask: MaskNode,
+}
+
+impl MaskNodeId {
+    /// The node's identity, for the accessors [`LoopMaskTree`] takes a [`LoopMaskNodeId`] for.
+    #[must_use]
+    pub const fn node(self) -> LoopMaskNodeId {
+        self.node
+    }
+
+    /// `getStartVal()` and `getIncrement()` (`LoopMaskTree.hpp:76-77`) — the two excluded field
+    /// accessors, already downcast.
+    #[must_use]
+    pub const fn mask(self) -> MaskNode {
+        self.mask
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         LMTLoopNode, LoopMaskNode, LoopMaskNodeId, LoopMaskTree, MaskIncrement, MaskNode,
-        MaskedColumns, Node, OpId, OperationTreeBase,
+        MaskNodeId, MaskedColumns, Node, OpId, OperationTreeBase,
     };
 
     /// HOW DEEP A NODE SITS — `OperationNode::getDepth()` (`OperationTree.hpp:62-67`), which is
@@ -1734,10 +1859,10 @@ mod unit_tests {
                 seen_after_bail += 1;
                 return;
             }
-            if let LoopMaskNode::Mask(mask) = v.tree.node(n) {
-                if mask.increment == MaskIncrement::PerParentLoopIteration {
-                    bailed = true;
-                }
+            if let LoopMaskNode::Mask(mask) = v.tree.node(n)
+                && mask.increment == MaskIncrement::PerParentLoopIteration
+            {
+                bailed = true;
             }
         });
 
@@ -1745,6 +1870,202 @@ mod unit_tests {
         assert_eq!(
             seen_after_bail, 5,
             "n1_m2, n2_l5, n2_l6, n2_m_const and n2_m_dyn are all still visited"
+        );
+    }
+
+    /// THE REFERENCE'S OWN WORKED EXAMPLE, NODE FOR NODE — the diagram `analyzeAndInsertMaskOps`
+    /// carries above itself (`LoweringPTMasks.cpp:152-158`):
+    ///
+    /// ```text
+    ///             A:[root]
+    ///                /  \
+    ///       B:[loop i]  C:[mask {2,0}]
+    ///          /    \
+    ///  D:[loop j]   E:[mask {0,1}]
+    ///       |
+    ///  F:[mask {0,1}]
+    /// ```
+    ///
+    /// ⭐ WORTH BUILDING BESIDE [`Vendor`] BECAUSE OF WHAT IT ISOLATES: two masks that are identical on
+    /// BOTH compared fields and differ only in their parent. The vendor case has no such pair — its
+    /// cross-nest masks differ in start value too — so it cannot tell the parent clause apart from the
+    /// other two.
+    struct Diagram {
+        tree: LoopMaskTree,
+        b_loop_i: LoopMaskNodeId,
+        c_mask: LoopMaskNodeId,
+        d_loop_j: LoopMaskNodeId,
+        e_mask: LoopMaskNodeId,
+        f_mask: LoopMaskNodeId,
+    }
+
+    impl Diagram {
+        fn build() -> Self {
+            let mut base = OperationTreeBase::with_root(LoopMaskNode::SyntheticRoot);
+            let root = base.root();
+            let b = base.push_named_child(root, OpId::at(&[0]), loop_node());
+            let c = base.push_named_child(root, OpId::at(&[1]), constant_mask(2));
+            let d = base.push_named_child(b, OpId::at(&[0, 0]), loop_node());
+            let e = base.push_named_child(b, OpId::at(&[0, 1]), dynamic_mask());
+            let f = base.push_named_child(d, OpId::at(&[0, 0, 0]), dynamic_mask());
+            Self {
+                tree: LoopMaskTree { base },
+                b_loop_i: LoopMaskNodeId(b),
+                c_mask: LoopMaskNodeId(c),
+                d_loop_j: LoopMaskNodeId(d),
+                e_mask: LoopMaskNodeId(e),
+                f_mask: LoopMaskNodeId(f),
+            }
+        }
+
+        /// The `isMaskNode()` test and the `static_cast<MaskNode *>` that follows it, as the caller
+        /// writes them (`LoweringPTMasks.cpp:174-178`).
+        fn mask(&self, n: LoopMaskNodeId) -> MaskNodeId {
+            self.tree
+                .mask_node(n)
+                .expect("the diagram's C, E and F are mask nodes")
+        }
+    }
+
+    /// 🎯 171 ⛔⛔ THE DECIDING CLAUSE IS THE PARENT, PROVED ON THE REFERENCE'S OWN DIAGRAM.
+    ///
+    /// E and F carry `{0, 1}` each — equal on both of the fields `LoopMaskTree.cpp:125-126` compares —
+    /// and the comment above the diagram still says the program is unsupported: *"We find another mask
+    /// node so the program is not supported and we signal pass failure"* (`LoweringPTMasks.cpp:160-163`).
+    /// Only `:124` can produce that answer.
+    #[test]
+    fn the_worked_examples_two_identical_masks_are_not_equivalent_across_nests() {
+        let d = Diagram::build();
+
+        // The premise: same mask, different parent.
+        assert_eq!(d.tree.node(d.e_mask), d.tree.node(d.f_mask));
+        assert_eq!(d.tree.parent_node(d.e_mask), Some(d.b_loop_i));
+        assert_eq!(d.tree.parent_node(d.f_mask), Some(d.d_loop_j));
+
+        assert!(
+            !d.tree
+                .is_mask_equivalent_to_node(d.mask(d.e_mask), d.mask(d.f_mask))
+        );
+        assert!(
+            !d.tree
+                .is_mask_equivalent_to_node(d.mask(d.f_mask), d.mask(d.e_mask))
+        );
+
+        // ⭐ AND C IS UNEQUIVALENT TO EITHER FOR ALL THREE REASONS AT ONCE — the root is its parent,
+        // and `{2, 0}` matches neither field.
+        assert!(
+            !d.tree
+                .is_mask_equivalent_to_node(d.mask(d.c_mask), d.mask(d.e_mask))
+        );
+    }
+
+    /// 🎯 171 — AND THE CASE IT ALLOWS IS THE VENDOR'S OWN PAIR. `n1_m1` and `n1_m2` are both `{0, 1}`
+    /// and both parented to `n1_l4`, which is *"If the mask is equivalent, it is allowed"*
+    /// (`LoweringPTMasks.cpp:124`) and the reason `dynamic_pt_masking.mlir` brackets `for %arg4` ONCE
+    /// (`:38`, `:53`, `:56`) with two masked macs under it.
+    #[test]
+    fn two_sibling_masks_with_the_same_start_and_increment_are_equivalent() {
+        let v = Vendor::build();
+        let m1 = v.tree.mask_node(v.n1_m1).expect("n1_m1 is a mask node");
+        let m2 = v.tree.mask_node(v.n1_m2).expect("n1_m2 is a mask node");
+
+        assert_eq!(v.tree.parent_node(v.n1_m1), v.tree.parent_node(v.n1_m2));
+        assert!(v.tree.is_mask_equivalent_to_node(m1, m2));
+        assert!(
+            v.tree.is_mask_equivalent_to_node(m2, m1),
+            "all three clauses are symmetric, so which side is the receiver cannot matter"
+        );
+        assert!(
+            v.tree.is_mask_equivalent_to_node(m1, m1),
+            "and reflexive — the BFS starts at `node` itself, so `mask_node` is compared with \
+             itself first (`LoweringPTMasks.cpp:120-126`)"
+        );
+
+        // ⛔ ACROSS THE TWO NESTS IT IS FALSE EVEN FOR THE SAME MASK: `n2_m_dyn` is `{0, 1}` too, and
+        // its parent is `n2_l6`.
+        let dynamic = v
+            .tree
+            .mask_node(v.n2_m_dyn)
+            .expect("n2_m_dyn is a mask node");
+        assert_eq!(v.tree.node(v.n1_m1), v.tree.node(v.n2_m_dyn));
+        assert!(!v.tree.is_mask_equivalent_to_node(m1, dynamic));
+    }
+
+    /// 🎯 171 — THE OTHER TWO CLAUSES, EACH ISOLATED UNDER ONE PARENT. Three masks under the same loop:
+    /// `{0, incr}`, `{4, incr}` and `{0, const}`, so the second differs only in `getStartVal()` and the
+    /// third only in `getIncrement()`.
+    #[test]
+    fn a_different_start_or_increment_is_not_equivalent_under_one_parent() {
+        let mut base = OperationTreeBase::with_root(LoopMaskNode::SyntheticRoot);
+        let root = base.root();
+        let driving_loop = base.push_named_child(root, OpId::at(&[0]), loop_node());
+        let baseline = base.push_named_child(driving_loop, OpId::at(&[0, 0]), dynamic_mask());
+        let other_start = base.push_named_child(
+            driving_loop,
+            OpId::at(&[0, 1]),
+            LoopMaskNode::Mask(MaskNode {
+                start_val: MaskedColumns(4),
+                increment: MaskIncrement::PerParentLoopIteration,
+            }),
+        );
+        let other_increment =
+            base.push_named_child(driving_loop, OpId::at(&[0, 2]), constant_mask(0));
+        let tree = LoopMaskTree { base };
+        let mask = |n| tree.mask_node(n).expect("all three are mask nodes");
+
+        let baseline = mask(LoopMaskNodeId(baseline));
+        let other_start = mask(LoopMaskNodeId(other_start));
+        let other_increment = mask(LoopMaskNodeId(other_increment));
+
+        // The premise: one parent for all three, so only the mask can differ.
+        assert_eq!(
+            tree.parent_node(baseline.node()),
+            tree.parent_node(other_start.node())
+        );
+        assert_eq!(
+            tree.parent_node(baseline.node()),
+            tree.parent_node(other_increment.node())
+        );
+
+        assert_eq!(baseline.mask().increment, other_start.mask().increment);
+        assert!(!tree.is_mask_equivalent_to_node(baseline, other_start));
+
+        assert_eq!(baseline.mask().start_val, other_increment.mask().start_val);
+        assert!(!tree.is_mask_equivalent_to_node(baseline, other_increment));
+    }
+
+    /// 🎯 171 — ONLY A MASK NODE IS CLASSIFIED AS ONE, WHICH IS THE `MaskNode *` IN THE SIGNATURE.
+    /// A loop node and the synthetic root have no mask to read, so they cannot reach
+    /// [`LoopMaskTree::is_mask_equivalent_to_node`] at all — there is no `static_cast` left to be
+    /// wrong and no arm that has to answer for one.
+    #[test]
+    fn only_a_mask_node_is_classified_as_one() {
+        let v = Vendor::build();
+
+        assert_eq!(v.tree.mask_node(v.root), None);
+        assert_eq!(
+            v.tree.mask_node(v.n1_l4),
+            None,
+            "a `sentient.for` carries no mask"
+        );
+        assert_eq!(
+            v.tree.mask_node(v.n1_m1).map(MaskNodeId::mask),
+            Some(MaskNode {
+                start_val: MaskedColumns(0),
+                increment: MaskIncrement::PerParentLoopIteration,
+            })
+        );
+        assert_eq!(
+            v.tree.mask_node(v.n2_m_const).map(MaskNodeId::mask),
+            Some(MaskNode {
+                start_val: MaskedColumns(2),
+                increment: MaskIncrement::Constant,
+            })
+        );
+        assert_eq!(
+            v.tree.mask_node(v.n1_m1).map(MaskNodeId::node),
+            Some(v.n1_m1),
+            "the witness keeps the identity it was minted from"
         );
     }
 }

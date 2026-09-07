@@ -78,10 +78,12 @@
 
 
 use crate::arch::{Arch, IsaGen};
-use crate::islands::dataflow_ir::dialects::arith;
+use crate::islands::dataflow_ir::dialects::vectorchain as vc;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, operands, regions, regions_mut, results, uses,
+    Index, Op as DfirOp, Val, operands, regions, regions_mut, results, uses,
 };
+use crate::islands::dataflow_ir::dialects::{agen, arith, dataflow, vector};
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, MemRef};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
 
@@ -229,10 +231,10 @@ pub struct VectorOperand {
 
 /// ONE ENTRY OF `values_` — an operand's value (`VectorOperands.hpp:44-46`).
 ///
-/// # ⚠️ ONE CASE OF SEVERAL, AND THAT IS DELIBERATE
+/// # ⚠️ THREE CASES, ONE PER THING THE C++ STRING HOLDS
 ///
-/// ⛔⛔ THE C++ STRING HOLDS AT LEAST THREE DIFFERENT THINGS, AND GUESSING THE CLOSED SET HERE WOULD
-/// BE WRONG TWICE OVER. `getName` (`VectorOperands.cpp:866-877`) shows the split by `type_`:
+/// ⛔⛔ THE C++ STRING HOLDS AT LEAST THREE DIFFERENT THINGS, AND SPELLING THEM AS ONE WOULD BE WRONG
+/// THREE WAYS OVER. `getName` (`VectorOperands.cpp:866-877`) shows the split by `type_`:
 ///
 /// - a `LINK` operand's value is a **compute port**, handed straight to
 ///   `symbolizeSentientComputePort` (`VectorChainToSentientPESFP.cpp:722-726`) — this variant, and
@@ -240,7 +242,8 @@ pub struct VectorOperand {
 /// - an `LRF`/`IRF`/`ISTATE` operand's value is a **decimal slice index**, computed as
 ///   `(start_address + layout_map.getSingleConstantResult()) * bit_width / 1024` and printed with
 ///   `std::to_string` (`VectorOperands.cpp:222-241`), which `getName` prefixes with `lrf`/`irf`/
-///   `istate`. That one arrives with `e232_getOperandFromLoadOrStoreOp`;
+///   `istate` — [`Self::Slice`], which arrives with `e169_getName` because that is the unit that
+///   READS the prefix decision. `e232_getOperandFromLoadOrStoreOp` is what will WRITE it;
 /// - a `CONSTANT` operand's value comes from `constValToField` (`VectorOperands.cpp:250`), which
 ///   entry 073 ported in this same file — and its answer is a [`sen::Port`] too, one of the four
 ///   pseudo-units, so [`Self::Port`] already covers that case. See [`const_val_to_field`].
@@ -252,6 +255,62 @@ pub struct VectorOperand {
 pub enum OperandValue {
     /// A COMPUTE PORT — the link a value arrives over or leaves by.
     Port(sen::Port),
+    /// A REGISTER-FILE SLICE — the index `getName` prefixes with its file's name.
+    Slice(RegisterSlice),
+    /// A RAW IMMEDIATE — `std::to_string(const_val)` on a constant bitstream the caller did NOT ask
+    /// to read as a splatted vector (`VectorOperands.cpp:302-303`).
+    ///
+    /// ⛔⛔ THIS ONE HAS NO COMPUTE-PORT SPELLING AND THAT IS THE REFERENCE'S OWN GAP, not a
+    /// restriction added here. `SentientComputePort` is a closed sixty-three-case enum
+    /// (`SentientTypes.td:98-160`) with no decimal case, so `symbolizeSentientComputePort("7")`
+    /// answers `std::nullopt` and every one of `getName`'s call sites then calls `.value()` on it.
+    /// [`VectorOperand::name`] answers `None` here, which is that `nullopt` and nothing more.
+    ///
+    /// ⭐ THE NUMBER IS STILL READ, JUST NOT THROUGH THE VALUE. `Splat::createSentientConstants`
+    /// re-reads the immediate off `op_`'s own `vectorchain.constant_bitstream`
+    /// (`VectorChainToSentientPESFP/Splat.cpp:41-42`, inside `createSentientConstants` at `:34-67`),
+    /// which is why a literal never has to become a port.
+    Literal(i64),
+}
+
+/// WHICH REGISTER FILE AND WHICH SLICE OF IT — one entry of `values_` for an `LRF`, `IRF` or
+/// `ISTATE` operand (`VectorOperands.cpp:222-241`).
+///
+/// ⛔⛔ THE FILE IS PART OF THE VALUE HERE AND IN THE REFERENCE IT IS NOT — the C++ value is the bare
+/// decimal and `getName` reads the file off `type_`. **THE BOUND IS WHY.** A slice index is
+/// `(start_address + layout_map.getSingleConstantResult()) * bit_width / 1024`, and how large it may
+/// be is a property of the FILE: thirty-two for the LRF ([`sen::LrfIndex`]), two for the IRF
+/// ([`IrfIndex`]), four for the state file ([`sen::IStateIndex`]). A single unbounded `SliceIndex`
+/// would have to be narrowed at [`VectorOperand::name`] instead, and a checked narrowing there is a
+/// runtime refusal — precisely the one `LrfIndex` was rewritten as thirty-two variants to delete
+/// (see its note). Minting the file and its bounded index together is what makes `name` total.
+///
+/// ⭐ AND THE REDUNDANCY WITH [`VectorOperandType`] IS LOAD-BEARING, NOT AN OVERSIGHT. See
+/// [`VectorOperand::name`]: the reference reads the file from `type_` and the index from the value,
+/// and that is exactly how it produces `"lrflatch"` for an operand one of
+/// `OperandReuse.cpp:28`, `:30`, `:32`, `:40` or `:43` re-valued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RegisterSlice {
+    /// A slice of the local register file — `getName` spells it `lrf<n>`.
+    Lrf(sen::LrfIndex),
+    /// A slice of the indirect register file — `irf<n>`.
+    Irf(IrfIndex),
+    /// A slice of the state file — `istate<n>`.
+    IState(sen::IStateIndex),
+}
+
+/// WHICH `irf<n>` — ⛔ TWO, BECAUSE `SentientTypes.td:108-109` DECLARES TWO.
+///
+/// ⛔ THERE IS NO `sen::IrfIndex` TO REUSE, and that is because [`sen::Port`] spells the two files as
+/// separate cases ([`sen::Port::Irf0`], [`sen::Port::Irf1`]) rather than as an indexed one — the same
+/// shape the `.td` has. This type is the *operand side* of that pair, so that a slice can be carried
+/// before it is turned into a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IrfIndex {
+    /// `irf0`.
+    I0,
+    /// `irf1`.
+    I1,
 }
 
 /// WHICH COMPUTE UNIT IS ASKING — the `comp` argument of `getOperandFromReceiveOp` and
@@ -911,21 +970,632 @@ pub fn erase_op(op: &OpId, scope: &mut Vec<DfirOp>) {
 
 
 
+/// WHICH READING A CALLER WANTS OF A `vectorchain.constant_bitstream`'S FIRST ELEMENT — the
+/// `is_constant_splatted_vector` argument of `getOperandFromConstantBitstreamOp`
+/// (`VectorOperands.cpp:299-301`).
+///
+/// ⛔⛔ THE FLAG DECIDES WHAT KIND OF THING THE VALUE IS, so it is not a `bool` beside an `i64` but
+/// the integer's own tag. `true` runs the element through `constValToField` and the answer is one of
+/// four PSEUDO-UNITS; `false` runs it through `std::to_string` and the answer is an IMMEDIATE with no
+/// compute-port spelling at all (see [`OperandValue::Literal`]). A `bool` and an `i64` in the same
+/// signature can be transposed at a call site; these cannot.
+///
+/// ⭐ AND THE CLASSIFICATION IS THE CALLER'S, WHICH IS WHY THE SPLATTED CASE CARRIES A
+/// [`ConstantOperandValue`]. `constValToField` has no answer for a fifth value — its `default:` is an
+/// unconditional throw (see [`const_val_to_field`]) — and entry 073 already made that domain a type
+/// rather than a runtime refusal. The only caller that passes `true` is
+/// `getOperandFromShuffleOp`'s trivial-shuffle branch (`VectorOperands.cpp:333-334`, entry 278), which
+/// is exactly the one that has established the shuffle is a recognised splat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BitstreamConstant {
+    /// `is_constant_splatted_vector == true` — the element names a pseudo-unit.
+    SplattedVector(ConstantOperandValue),
+    /// `is_constant_splatted_vector == false` — the element IS the immediate.
+    Immediate(i64),
+}
+
+/// WHAT `getLayoutMapAndIndices` HANDS BACK — the reference's three out-parameters
+/// (`VectorOperands.cpp:879-881`).
+///
+/// ⛔ THREE OUT-PARAMETERS PLUS A `LogicalResult` IS ONE `Option<Self>`. The reference writes
+/// `layout_map`, `operands` and `logical_view_op` through references and returns `success()`/
+/// `failure()`; every caller checks the result before reading any of them, so "all three or none" is
+/// the actual contract and a struct states it. ⛔ AND `Option` HERE IS A CLASSIFICATION, NOT A RUNTIME
+/// REFUSAL: `None` is the reference's `else` arm, which is a diagnostic saying the op is not one of
+/// the four memory accesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutAndIndices {
+    /// `layout_map` — the view's layout, composed with the access's own subscripts for an `agen`
+    /// access and left alone for a plain one. See [`layout_map_and_indices`] on why that differs.
+    pub layout_map: AffineMap,
+    /// `operands` — the SSA values the subscripts are computed from, in the order the access lists
+    /// them.
+    pub operands: Vec<Val>,
+    /// `logical_view_op` — where the `dataflow.get_logical_memory_view` the access indexes lives.
+    pub logical_view_op: OpId,
+}
+
+impl VectorOperand {
+    /// Replaces: e167_getOperandFromConstantBitstreamOp
+    ///
+    /// **167/384** `VectorOperand::getOperandFromConstantBitstreamOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:299` (5L).
+    ///
+    /// ```cpp
+    /// auto const_val = mlir::cast<IntegerAttr>(op.getValue()[0]).getInt();
+    /// std::string value = is_constant_splatted_vector ? constValToField(const_val)
+    ///                                                 : std::to_string(const_val);
+    /// return VectorOperand(Constant, value, op.getOperation());
+    /// ```
+    ///
+    /// ⛔⛔ THE KIND IS `Constant`, NOT `ConstantBitstream`, EVEN THOUGH THE OP IS ONE. Both callers
+    /// then disagree about that: the trivial-shuffle path overwrites it with `ConstantBitstream`
+    /// immediately (`VectorOperands.cpp:335`) and `getOperandWithPrecision`'s own arm leaves it
+    /// `Constant` (`:522-530`). The difference is load-bearing downstream — `OperandReuse` skips a
+    /// `Constant` operand entirely (`OperandReuse.cpp:26`, `:57`) and would latch a
+    /// `ConstantBitstream` one — so this function's answer is the `Constant` the reference writes, and
+    /// re-tagging is the caller's line, not a correction to make here.
+    ///
+    /// ⛔ THE FIRST ELEMENT AND ONLY THE FIRST. `getValue()` is the op's whole `ArrayAttr`: a splat
+    /// carries one element and a vector constant carries `128 / bitwidth` of them
+    /// (`VectorChainToSentientPESFP/Splat.cpp:46-56`), and this function indexes `[0]` unconditionally with no arity check. That
+    /// is sound for the splatted caller — a trivial shuffle IS the one-element case — and the other
+    /// caller reaches it for any constant bitstream at all, taking element zero as the whole value.
+    /// ⭐ SO THE PARAMETER IS THE ELEMENT, NOT THE OP'S VALUE LIST: nothing here can use a second
+    /// element, and handing this function the list would invite a porter to think it could.
+    ///
+    /// ⛔ THE `std::optional` NEVER HOLDS `nullopt` AND BOTH CALLERS PROVE IT, calling `.value()` on
+    /// the result with no `has_value()` test at all (`VectorOperands.cpp:335`, `:526-529`). There is
+    /// no `return std::nullopt` in the body. So the port returns a [`VectorOperand`] outright rather
+    /// than an `Option` no caller could ever see empty.
+    ///
+    /// ⭐ AND BOTH CALLERS OVERWRITE SOMETHING THE MOMENT THEY GET IT: the shuffle path the kind, and
+    /// `getOperandWithPrecision` both precisions, from
+    /// `getElementType(const_bit_op.getType())` (`:525-529`) — which is why the two precisions start
+    /// unset here (see [`VectorOperand::new`]).
+    #[must_use]
+    pub fn from_constant_bitstream_op(element: BitstreamConstant, op: OpId) -> VectorOperand {
+        // `std::string value = is_constant_splatted_vector ? constValToField(const_val)
+        //                                                  : std::to_string(const_val);`
+        let value = match element {
+            BitstreamConstant::SplattedVector(field) => {
+                OperandValue::Port(const_val_to_field(field))
+            }
+            BitstreamConstant::Immediate(const_val) => OperandValue::Literal(const_val),
+        };
+        // `return VectorOperand(Constant, value, op.getOperation());`
+        VectorOperand::new(VectorOperandType::Constant, value, op)
+    }
+
+    /// Replaces: e168_getOperandFromNegOp
+    ///
+    /// **168/384** `VectorOperand::getOperandFromNegOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:366` (5L).
+    ///
+    /// ```cpp
+    /// DT_CHECK(isa<vectorchain::NegOp>(op));
+    /// auto *parent = op.getOperand(0).getDefiningOp();
+    /// auto operand = getOperand(dcc_ext_ctx, parent, comp);
+    /// return operand;
+    /// ```
+    ///
+    /// ⛔⛔ A NEGATION IS TRANSPARENT TO THIS QUESTION — that is the whole function. The operand of a
+    /// compute that reads a `vectorchain.neg` is the operand of whatever the NEGATION reads, with the
+    /// negation itself contributing nothing to the answer. It can do that because the PE/SFP lowering
+    /// never converts a `NegOp`: it FOLDS one into the FMA it feeds, by `dyn_cast`ing both inputs of
+    /// the multiply (`VectorChainToSentientPESFP.cpp:534-539`), so the sign lives on the consuming
+    /// instruction and the operand chain must skip straight past it. ⭐ ITS SOLE CALLER SAYS SO IN A
+    /// COMMENT: *"The NegOp doesn't change the original precision"* (`VectorOperands.cpp:568`), and
+    /// unlike every neighbouring arm it does NOT overwrite either precision afterwards.
+    ///
+    /// ⛔ OPERAND 0 IS `$op` AND OPERAND 1 IS THE OPTIONAL `$mask` (`VectorChain.td:359-373`), so
+    /// `getOperand(0)` is the value being negated whether or not a mask is present. Reading the mask's
+    /// producer instead would give the compute a predicate as its data source.
+    ///
+    /// ⛔ `DT_CHECK(isa<NegOp>(op))` IS NOT AN `assert!` HERE. A position that does not hold a
+    /// `vectorchain.neg` has no operand to report, so the total answer is `None` — the same answer the
+    /// reference's own `parent == nullptr` case degenerates to. This crate never runtime-refuses; see
+    /// the file banner.
+    ///
+    /// ⛔ `get_operand` IS AN SCC CUT AND IT IS SPELLED AS ONE. `getOperand` (entry 320) tail-calls
+    /// `getOperandWithPrecision` (entry 304, 254 lines), which reaches this function back through its
+    /// `NegOp` arm (`:566-569`) — a genuine cycle. Taking the recursion as a caller-supplied closure
+    /// is the same seam `std_scf_to_sentient.rs:305` and `agen_helper.rs:1405` already use, and it
+    /// keeps this unit's own content — "skip the negation, ask about its input" — testable on its own.
+    ///
+    /// ⭐ AND THE CUT CARRIES `traverse_upwards = true`, the declaration's default
+    /// (`VectorOperands.hpp:85`), because this call passes only three arguments. That is not
+    /// cosmetic: it selects the *upward* branch of `getOperandWithPrecision`'s cast and select arms
+    /// (`:544` versus `:556`), so a closure that hard-coded `false` would resolve a negated
+    /// cast through the cast's USER instead of its input.
+    #[must_use]
+    pub fn from_neg_op(
+        neg_op: &OpId,
+        comp: ComputeComp,
+        scope: &[DfirOp],
+        get_operand: &mut impl FnMut(&OpId, ComputeComp) -> Option<VectorOperand>,
+    ) -> Option<VectorOperand> {
+        // `DT_CHECK(isa<vectorchain::NegOp>(op));`
+        let Some(DfirOp::VectorChain(vc::Op::Neg { input, .. })) = op_at(neg_op, scope) else {
+            return None;
+        };
+        // `auto *parent = op.getOperand(0).getDefiningOp();`
+        let parent = defining_position(*input, scope)?;
+        // `auto operand = getOperand(dcc_ext_ctx, parent, comp); return operand;`
+        get_operand(&parent, comp)
+    }
+
+    /// Replaces: e169_getName
+    ///
+    /// **169/384** `VectorOperand::getName` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:866` (11L).
+    ///
+    /// ```cpp
+    /// if (this->type_ == LRF) return "lrf" + this->getFirstValue();
+    /// else if (this->type_ == IRF) return "irf" + this->getFirstValue();
+    /// else if (this->type_ == XRF) return "xrf";
+    /// else if (this->type_ == ISTATE) return "istate" + this->getFirstValue();
+    /// else return this->getFirstValue();
+    /// ```
+    ///
+    /// THE OPERAND'S NAME AS THE SENTIENT INSTRUCTION SPELLS IT — a register file's slice gets its
+    /// file's prefix, everything else is its value verbatim.
+    ///
+    /// ⛔⛔ IT MATCHES THE **VALUE** AND THE REFERENCE MATCHES `type_`, AND THAT DIFFERENCE IS A
+    /// DELIBERATE DIVERGENCE THAT FIXES A DEFECT. `OperandReuse::setReuseInformation` re-values an
+    /// operand to `"latch"` for every kind except `Constant` (`OperandReuse.cpp:26-43`) — **including
+    /// `LRF`** — and never touches `type_`. So on the reference a latched LRF operand answers
+    /// `"lrflatch"`, which is not a `SentientComputePort` at all. ⭐ AND THE SAME FUNCTION'S OWN
+    /// SECOND LOOP IS THE EVIDENCE THAT `latch` WAS THE INTENDED ANSWER: `:57` tests
+    /// `from.getName() != "latch"` **unprefixed**, so a latched LRF passes a test written to exclude
+    /// it and gets `setReuseFlag` called on the very op that was just told to re-read. Here the value
+    /// carries which register file it is a slice OF (see [`RegisterSlice`]), so `latch` answers
+    /// `latch` and there is no spelling to concatenate.
+    ///
+    /// ⭐ THE `XRF` ARM IS REDUNDANT WITH THE `else`, AND SAYING SO IS THE POINT. An `XRF` operand is
+    /// constructed as `VectorOperand(operand_type, "xrf", op)` (`VectorOperands.cpp:218-220`) — the
+    /// only place one is built — so its first value already IS `"xrf"` and the `else` would return the
+    /// same string. It is also the only kind with no slice index, because the XRF is one register and
+    /// the arm above it skips the whole slice computation for exactly that reason (`:208`, `:218`).
+    /// [`OperandValue::Port`] covers it with no arm of its own.
+    ///
+    /// ⛔ THE RESULT IS A [`sen::Port`], NOT A `String`, BECAUSE ITS READERS ARE A CLOSED SET.
+    /// Every consumer either hands it to `symbolizeSentientComputePort(...).value()` — some thirty
+    /// sites across `VectorChainToSentientPT.cpp:398-856` — or COMPARES two of them for equality
+    /// (`OperandReuse.cpp:37-38`). Both survive typing; only the string does not.
+    ///
+    /// ⛔ AND `None` IS THAT `symbolize` RETURNING `std::nullopt`, NOT A REFUSAL ADDED HERE. It is
+    /// reachable one way: an [`OperandValue::Literal`], whose decimal has no case in the sixty-three
+    /// the `.td` declares (`SentientTypes.td:98-160`). The reference calls `.value()` on the empty
+    /// optional there and dies; this hands the caller the same fact as a value.
+    /// ⭐ AND IT CANNOT REACH THE EQUALITY READER, so `None == None` conflating two distinct
+    /// immediates is not a behaviour this introduces: `OperandReuse.cpp:37-38` compares only inside
+    /// `if (operand_i.type_ != Constant)`, and a literal value is written by exactly one constructor —
+    /// [`Self::from_constant_bitstream_op`], which tags the operand `Constant`.
+    ///
+    /// ⛔ AN EMPTY VALUE LIST IS ALSO `None`, AND THE REFERENCE CANNOT GET THERE: `getFirstValue()` is
+    /// `values_.front()` (`VectorOperands.hpp:76`) on a vector every constructor pushes one entry
+    /// into, so an empty one would be undefined behaviour rather than a case. `None` is the only total
+    /// answer this port can give it.
+    #[must_use]
+    pub fn name(&self) -> Option<sen::Port> {
+        match self.values.first() {
+            // `if (this->type_ == LRF) return "lrf" + this->getFirstValue();`
+            Some(OperandValue::Slice(RegisterSlice::Lrf(slice))) => Some(sen::Port::Lrf(*slice)),
+            // `else if (this->type_ == IRF) return "irf" + this->getFirstValue();`
+            Some(OperandValue::Slice(RegisterSlice::Irf(IrfIndex::I0))) => Some(sen::Port::Irf0),
+            Some(OperandValue::Slice(RegisterSlice::Irf(IrfIndex::I1))) => Some(sen::Port::Irf1),
+            // `else if (this->type_ == ISTATE) return "istate" + this->getFirstValue();`
+            Some(OperandValue::Slice(RegisterSlice::IState(slice))) => {
+                Some(sen::Port::IState(*slice))
+            }
+            // `else if (this->type_ == XRF) return "xrf";` — and `else return this->getFirstValue();`,
+            // which answers the same thing for it. See the note on the redundant arm.
+            Some(OperandValue::Port(port)) => Some(*port),
+            // The `else` for a value with no port spelling, and for a list the reference cannot have.
+            Some(OperandValue::Literal(_)) | None => None,
+        }
+    }
+}
+
+/// Replaces: e170_getLayoutMapAndIndices
+///
+/// **170/384** `vectorchain::getLayoutMapAndIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:879` (40L).
+///
+/// WHERE A MEMORY ACCESS LANDS IN ITS VIEW'S LINEAR REGION, AND WHICH VALUES ITS SUBSCRIPTS ARE
+/// COMPUTED FROM — the four accesses the vectorchain lowering can read, and nothing else.
+///
+/// ```cpp
+/// if (auto tmp_op = dyn_cast<agen::VectorStoreOp>(op)) {
+///   auto indices = tmp_op.getMapOperands();
+///   operands = {indices.begin(), indices.end()};
+///   logical_view_op = tmp_op.getMemRef().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///   layout_map = logical_view_op.getLayoutMap();
+///   auto indices_map = tmp_op.getAffineMap();
+///   auto order_map = tmp_op.getStoreOrder();
+///   indices_map = order_map.compose(indices_map);
+///   layout_map = layout_map.compose(indices_map);
+///   layout_map = compressUnusedSymbols(layout_map);
+/// } else if (auto tmp_op = dyn_cast<vector::StoreOp>(op)) {
+///   auto indices = tmp_op.getIndices();
+///   operands = {indices.begin(), indices.end()};
+///   logical_view_op = tmp_op.getBase().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///   layout_map = logical_view_op.getLayoutMap();
+/// } else if (auto tmp_op = dyn_cast<agen::VectorLoadOp>(op)) {   // as the agen store, with
+///   ...                                                          // getMapIndices/getLoadOrder
+/// } else if (auto tmp_op = dyn_cast<vector::LoadOp>(op)) {       // as the vector store
+///   ...
+/// } else {
+///   op->emitOpError("can't extract memory layout map or indices.");
+///   return failure();
+/// }
+/// return success();
+/// ```
+///
+/// ⛔⛔ THE `agen` PAIR COMPOSE AND THE `vector` PAIR DO NOT, AND THAT ASYMMETRY IS THE REFERENCE'S
+/// OWN. It is not an omission to repair: an `agen` access carries its subscripts as an
+/// `AffineMapAttr` plus operands and a separate `load_order`/`store_order` permutation, so the address
+/// it names is only known after both are folded into the view's layout; a `vector.load`/`vector.store`
+/// has neither — `Vector_LoadOp`'s arguments are `$base` and `Variadic<Index>:$indices` and that is
+/// all (see [`vector::Op`]) — so its subscripts are already the view's own dimensions and the layout
+/// map alone answers the question. ⛔ THE CONSEQUENCE IS VISIBLE TO BOTH CALLERS: for a plain access
+/// the returned map is indexed by the VIEW's dimensions, and for an `agen` one by the LOOP NEST's.
+/// `getOperandFromLoadOrStoreOp` (entry 232) then requires one result and a single constant
+/// (`VectorOperands.cpp:165`, `:209`), and `LoweringXRF::getLayoutExpr` (entry 240) feeds the map and
+/// the operand list to `fullyComposeAffineMapAndOperands` and requires
+/// `getNumInputs() == operands.size()` (`LoweringXRF.cpp:37-38`) — so both the map's arity and its
+/// dimension space are contracts, not incidentals.
+///
+/// ⛔ THE `order_map` IS THE IDENTITY HERE BECAUSE THIS ISLAND EMITS NO OTHER. `agen.vector_load`'s
+/// `load_order` is a real attribute that CAN permute — `Agen.td`'s own example writes
+/// `affine_map<(d0, d1) -> (d1, d0)>` — but [`agen::Op::VectorLoad`] does not carry the field, and its
+/// printer derives `load_order = identity_map(view_ty.shape.len())`. So the composition runs for real
+/// against the order map this bridge actually writes, and a permuting order is an island field to add
+/// on the day something needs one, not a silently dropped step. ⭐ AND MLIR'S OWN
+/// `replaceDimsAndSymbols` MAKES THE IDENTITY CASE EXACT rather than approximately right: composing
+/// with it rebuilds no node at all (see [`AffineExpr::replace_dims_and_symbols`]), so
+/// `order_map.compose(indices_map)` gives back `indices_map` unchanged.
+///
+/// ⛔ AND `getAffineMap()` IS RECOVERED FROM THE INDEX LIST, WHICH IS WHERE THIS ISLAND KEEPS IT. The
+/// vendor writes `agen.vector_store %48, %49[0, %arg9 + %arg8 * 8, 0]`
+/// (`dcc/test/PT/bf16-pt.mlir:161`) — an `AffineMapAttr` `(d0, d1) -> (0, d0 + d1 * 8, 0)` printed in
+/// MLIR's fused form beside its two operands — and [`Index`] is that same fusion. Splitting it back
+/// out is [`access_map`], and it is the map attribute that the reference reads, not a new one.
+///
+/// ⛔ `None` IS THE REFERENCE'S TWO WAYS OF NOT ANSWERING, AND ONE OF THEM IT DOES NOT SURVIVE. The
+/// `else` arm is a real diagnostic over every other op class; the `getDefiningOp<...>()` casts are
+/// NOT — they return null for a base defined by anything other than a
+/// `dataflow.get_logical_memory_view` (a paged view, say, before `TransformPagedMemView` has run) and
+/// the very next line dereferences it. Both become `None`.
+///
+/// ⛔ AND THE `_` ARM IS RIGHT HERE, unlike in the islands' classification tables where a new dialect
+/// must be a build error. The reference's `else` IS the open case — it reports the op class it was
+/// handed — so there is no arm to add when the IR grows a memory access this pass does not read.
+#[must_use]
+pub fn layout_map_and_indices(op: &OpId, scope: &[DfirOp]) -> Option<LayoutAndIndices> {
+    match op_at(op, scope)? {
+        // `if (auto tmp_op = dyn_cast<agen::VectorStoreOp>(op))` — `getMapOperands`/`getStoreOrder`.
+        DfirOp::Agen(agen::Op::VectorStore {
+            view,
+            indices,
+            view_ty,
+            ..
+        })
+        // `} else if (auto tmp_op = dyn_cast<agen::VectorLoadOp>(op)) {` — `getMapIndices`/
+        // `getLoadOrder`. ⭐ TWO ACCESSORS SPELLED DIFFERENTLY FOR THE SAME THING: the store's
+        // operand list is `getMapOperands()` and the load's is `getMapIndices()`, and the bodies are
+        // otherwise identical.
+        | DfirOp::Agen(agen::Op::VectorLoad {
+            view,
+            indices,
+            view_ty,
+            ..
+        }) => mapped_access(*view, indices, view_ty, scope),
+        // `} else if (auto tmp_op = dyn_cast<vector::StoreOp>(op)) {` and the `vector::LoadOp` arm —
+        // `getIndices()`, `getBase()`, and NO composition.
+        DfirOp::Vector(vector::Op::Store { base, indices, .. })
+        | DfirOp::Vector(vector::Op::Load { base, indices, .. }) => {
+            plain_access(*base, indices, scope)
+        }
+        // `} else { op->emitOpError("can't extract memory layout map or indices."); return failure(); }`
+        _ => None,
+    }
+}
+
+/// THE `agen` ARMS OF [`layout_map_and_indices`] — the two that compose.
+fn mapped_access(
+    view: Val,
+    indices: &[Index],
+    view_ty: &MemRef,
+    scope: &[DfirOp],
+) -> Option<LayoutAndIndices> {
+    // `auto indices = tmp_op.getMapOperands(); operands = {indices.begin(), indices.end()};` and
+    // `auto indices_map = tmp_op.getAffineMap();` — one field here, see the anchor's note.
+    let (indices_map, operands) = access_map(indices);
+    // `logical_view_op = tmp_op.getMemRef().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();`
+    // `layout_map = logical_view_op.getLayoutMap();`
+    let (logical_view_op, layout_map) = logical_view(view, scope)?;
+    // `auto order_map = tmp_op.getStoreOrder();` / `getLoadOrder()`.
+    let order_map = AffineMap::identity(view_ty.shape.len() as u32);
+    // `indices_map = order_map.compose(indices_map);`
+    let indices_map = order_map.compose(&indices_map);
+    // `layout_map = layout_map.compose(indices_map);`
+    let layout_map = layout_map.compose(&indices_map);
+    Some(LayoutAndIndices {
+        // `layout_map = compressUnusedSymbols(layout_map);`
+        layout_map: layout_map.compress_unused_symbols(),
+        operands,
+        logical_view_op,
+    })
+}
+
+/// THE `vector` ARMS OF [`layout_map_and_indices`] — the two that do not.
+fn plain_access(base: Val, indices: &[Index], scope: &[DfirOp]) -> Option<LayoutAndIndices> {
+    // `auto indices = tmp_op.getIndices(); operands = {indices.begin(), indices.end()};`
+    //
+    // ⛔ THE SUBSCRIPTS ARE THE OPERANDS THEMSELVES HERE, with no map to split them out of:
+    // `Variadic<Index>:$indices` is an SSA list. ⭐ A LITERAL INDEX CONTRIBUTES NONE, because in
+    // vendor MLIR it would be an `arith.constant` result and [`Index::Const`] is this island's
+    // folded form of exactly that — so it is an operand the reference has and this island does not
+    // spell, not a subscript being dropped.
+    let (_, operands) = access_map(indices);
+    // `logical_view_op = tmp_op.getBase().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();`
+    // `layout_map = logical_view_op.getLayoutMap();` — and that is the whole arm.
+    let (logical_view_op, layout_map) = logical_view(base, scope)?;
+    Some(LayoutAndIndices {
+        layout_map,
+        operands,
+        logical_view_op,
+    })
+}
+
+/// THE VIEW A MEMORY ACCESS INDEXES — `getMemRef()`/`getBase()` followed by
+/// `getDefiningOp<dataflow::GetLogicalMemoryViewOp>()`, and its `layout_map`.
+///
+/// ⛔ THE TEMPLATED `getDefiningOp<T>()` IS A `dyn_cast`, SO A BASE DEFINED BY ANYTHING ELSE IS NULL —
+/// and the reference then calls `getLayoutMap()` on it. `None` is what this port answers instead; see
+/// [`layout_map_and_indices`].
+fn logical_view(base: Val, scope: &[DfirOp]) -> Option<(OpId, AffineMap)> {
+    let at = defining_position(base, scope)?;
+    match op_at(&at, scope)? {
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { layout, .. }) => {
+            Some((at, layout.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// SPLIT AN INDEX LIST BACK INTO THE `AffineMapAttr` AND THE OPERANDS MLIR KEEPS IT AS —
+/// `getAffineMap()` beside `getMapOperands()`.
+///
+/// ⛔⛔ THE MAP IS BUILT WITH THE **SIMPLIFYING** OPERATORS, and that is not a shortcut. An
+/// `affine_map` attribute in MLIR cannot be anything but canonical — the only ways to make one are the
+/// parser and `AffineExpr`'s operators, both of which run `simplifyAdd`/`simplifyMul` — so
+/// reconstructing `[%arg9]` as `d0 * 1 + 0` would hand [`AffineMap::compose`] a map the vendor op
+/// does not carry. See [`AffineExpr::added`].
+///
+/// ⛔ ONE DIMENSION PER DISTINCT OPERAND, NUMBERED BY FIRST APPEARANCE, because that is what
+/// `getMapOperands()` returns beside the map: a value used by two subscripts is one operand and one
+/// `d<i>`. Numbering per *subscript* instead would declare a map with more dimensions than the access
+/// has operands, and `compose`'s arity precondition would then be wrong for every caller. ⭐ AND ONE
+/// CALLER TESTS EXACTLY THIS: `LoweringXRF::getLayoutExpr` guards its whole simplification on
+/// `logical_view_map.getNumInputs() == operands.size()` (`LoweringXRF.cpp:38`) and silently skips it
+/// otherwise, so a map with a dimension per subscript would take the untaken branch.
+fn access_map(indices: &[Index]) -> (AffineMap, Vec<Val>) {
+    let mut operands: Vec<Val> = Vec::new();
+    let mut results: Vec<AffineExpr> = Vec::new();
+
+    for index in indices {
+        results.push(match index {
+            // `%arg1` — the subscript is the operand.
+            Index::Val(val) => AffineExpr::Dim(dim_of(*val, &mut operands)),
+            // `4` — a literal, which is a result and not an operand.
+            Index::Const(constant) => AffineExpr::Const(*constant),
+            // `%arg9 + %arg8 * 8 + 4` — the sum [`Index::Strided`] holds, term by term, with the
+            // constant addend added LAST so `fold_add`'s `x + 0` rule can drop a zero one.
+            Index::Strided(terms, addend) => {
+                let mut sum: Option<AffineExpr> = None;
+                for (val, stride) in terms {
+                    let term = AffineExpr::Dim(dim_of(*val, &mut operands)).scaled(*stride);
+                    sum = Some(match sum {
+                        Some(so_far) => so_far.added(term),
+                        None => term,
+                    });
+                }
+                match sum {
+                    Some(so_far) => so_far.added(AffineExpr::Const(*addend)),
+                    None => AffineExpr::Const(*addend),
+                }
+            }
+        });
+    }
+
+    let map = AffineMap {
+        dims: operands.len() as u32,
+        // ⭐ NONE, AND [`AffineMap::syms`] SAYS WHY: an access this bridge emits has no symbol, which
+        // is also why `compressUnusedSymbols` has nothing to do at the end of an `agen` arm.
+        syms: 0,
+        results,
+    };
+    (map, operands)
+}
+
+/// WHICH `d<i>` A VALUE IS, ADDING IT TO THE OPERAND LIST THE FIRST TIME IT APPEARS.
+fn dim_of(val: Val, operands: &mut Vec<Val>) -> u32 {
+    match operands.iter().position(|held| *held == val) {
+        Some(already) => already as u32,
+        None => {
+            operands.push(val);
+            (operands.len() - 1) as u32
+        }
+    }
+}
+
+/// WHERE THE OP THAT PRODUCES A VALUE LIVES — `Value::getDefiningOp()`.
+///
+/// ⛔ IT DESCENDS INTO REGIONS, for the reason [`use_positions`] gives in the other direction: a
+/// value defined inside an `affine.for` body has a defining op, and a walk that stopped at the top
+/// level would report none. ⭐ THE FIRST MATCH WINS because an SSA value has exactly one definition;
+/// a second match would mean the scope handed in is not SSA.
+///
+/// ⛔ A BLOCK ARGUMENT HAS NO DEFINING OP AND ANSWERS `None`, exactly as MLIR's own accessor does —
+/// `getDefiningOp()` returns null for one. A loop induction variable is the case that reaches this.
+fn defining_position(val: Val, scope: &[DfirOp]) -> Option<OpId> {
+    find_defining_position(val, scope, &[], 0)
+}
+
+/// [`defining_position`]'s recursion, numbered the way [`op_at`] reads a path back.
+fn find_defining_position(val: Val, scope: &[DfirOp], prefix: &[u32], base: u32) -> Option<OpId> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path: Vec<u32> = prefix.to_vec();
+        path.push(base + ordinal as u32);
+
+        if results(op).contains(&val) {
+            return Some(OpId::at(&path));
+        }
+
+        let mut child = 0u32;
+        for region in regions(op) {
+            if let Some(found) = find_defining_position(val, region, &path, child) {
+                return Some(found);
+            }
+            child += region.len() as u32;
+        }
+    }
+    None
+}
+
+impl VectorOperand {
+    /// Replaces: e166_getOperandFromConstantOp
+    ///
+    /// # WHICH PSEUDO-PORT A SPLATTED VECTOR CONSTANT IS READ FROM
+    ///
+    /// ```cpp
+    /// std::optional<VectorOperand> VectorOperand::getOperandFromConstantOp(
+    ///     mlir::arith::ConstantOp &op) {
+    ///   std::string value;
+    ///   auto splat_attr = mlir::cast<SplatElementsAttr>(op.getValue());
+    ///   if (splat_attr) {
+    ///     double const_val;
+    ///     auto splat_value = splat_attr.getSplatValue<Attribute>();
+    ///     if (mlir::isa<IntegerAttr>(splat_value)) {
+    ///       const_val = mlir::cast<IntegerAttr>(splat_value).getInt();
+    ///     } else if (mlir::isa<FloatAttr>(splat_value)) {
+    ///       const_val = mlir::cast<FloatAttr>(splat_value).getValueAsDouble();
+    ///     } else {
+    ///       op->emitError("Only integer or float vectors are supported");
+    ///       return std::nullopt;
+    ///     }
+    ///
+    ///     value = constValToField(const_val);
+    ///     if (value == "") {
+    ///       op->emitError("Only 0, 1, 2, or 3 are supported values");
+    ///       return std::nullopt;
+    ///     }
+    ///   } else {
+    ///     op->emitError("Only constant splatted vectors are supported");
+    ///     return std::nullopt;
+    ///   }
+    ///
+    ///   return VectorOperand(Constant, value, op.getOperation());
+    /// }
+    /// ```
+    /// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:264-293`)
+    ///
+    /// # ⭐⭐ A CONSTANT OPERAND COSTS NO PORT — THE HARDWARE HAS FOUR OF THEM WIRED IN
+    ///
+    /// `dcc/test/PE/test1.mlir:38-39` declares `%cst_0 = arith.constant dense<1.000000e+00> :
+    /// vector<64xf16>` and `%cst_1 = arith.constant dense<0.000000e+00>`, hands both to a
+    /// `vectorchain.multiply_and_accumulate` (`:60`), and the reference's own `CHECK-SENT-IR` reads
+    /// `opB = #sentient<compute_port one>, opC = #sentient<compute_port zero>` (`:18`). No load, no
+    /// link, no register — the operand IS the port, which is why this function returns an operand
+    /// rather than emitting anything.
+    ///
+    /// # ⛔ THE INTEGER/FLOAT SPLIT COLLAPSES, AND THE ISLAND IS WHY
+    ///
+    /// `IntegerAttr::getInt()` and `FloatAttr::getValueAsDouble()` (`:275-281`) exist because MLIR
+    /// keeps two attribute kinds; both feed ONE `double` and one chain of `const_val == N` tests.
+    /// [`arith::Op::DenseConstant::splat`] is a single `i64` for exactly this reason — see its own
+    /// note for the census that every `arith.constant dense<…>` in the authority tree is integral —
+    /// so *"Only integer or float vectors are supported"* names no third case here.
+    ///
+    /// ⛔ AND `if (value == "")` IS STATICALLY FALSE. `constValToField` ends in an unconditional
+    /// `DT_ERROR` (`:260`), so its `return ""` and this arm are both dead in the reference; the
+    /// domain is [`ConstantOperandValue`] and the refusal happens where the value is recognised. See
+    /// [`ConstantOperandValue::of`].
+    ///
+    /// # THE TWO ABORTS, EACH DECLINED HERE
+    ///
+    /// * ⛔ A SPLAT OUTSIDE `0..=3` THROWS IN THE REFERENCE. `DT_ERROR` is not a diagnostic
+    ///   (`util/dt_exception.hpp:110-121`); a `dense<4>` vector operand takes the compiler down. This
+    ///   port answers `None`, which is the same refusal without the crash — and it is reachable, not
+    ///   theoretical: `dense<4.000000e+00>` appears twice in the authority's tests.
+    /// * ⛔ A **SCALAR** `arith.constant` IS `mlir::cast`'s OWN ASSERT (`:270`), and the caller
+    ///   reaches this for any `isa<mlir::arith::ConstantOp>` (`VectorOperands.cpp:513-515`) — an
+    ///   `arith.constant 3 : index` included. It then asks `getElementType` of that scalar type
+    ///   (`:516`), which aborts as well. So the input is ill-formed twice over and `None` is the only
+    ///   answer this crate can give; [`arith::Op::Constant`] and [`arith::Op::ConstantInt`] are named
+    ///   rather than wildcarded so a fourth constant form has to decide.
+    ///
+    /// ⭐ THE TWO PRECISIONS ARE THE CALLER'S. `getOperand` sets `orig_precision_` and
+    /// `on_the_fly_conv_precision_` from `getElementType(const_op.getType())` immediately after this
+    /// returns (`:516-521`) — which is why `test1.mlir`'s golden also carries
+    /// `opBPrecision = #sentient<precision fp16>` — and [`VectorOperand::new`] leaves both unset.
+    #[must_use]
+    pub fn from_constant_op(op: &arith::Op, at: OpId) -> Option<VectorOperand> {
+        // `auto splat_attr = mlir::cast<SplatElementsAttr>(op.getValue());` — and the `else` arm
+        // *"Only constant splatted vectors are supported"* that this cast makes unreachable.
+        let splat = match op {
+            arith::Op::DenseConstant { splat, .. } => *splat,
+            arith::Op::Constant { .. } | arith::Op::ConstantInt { .. } => return None,
+            // ⛔ NOT AN `arith.constant` AT ALL, and the reference could not be handed one: its
+            // parameter is an `mlir::arith::ConstantOp&`. This island's [`arith::Op`] is one enum
+            // over the whole dialect, so the six arithmetic forms are written out rather than
+            // wildcarded — [`is_arith_constant`] draws the same line for [`same_block`].
+            arith::Op::AddI(_)
+            | arith::Op::SubI(_)
+            | arith::Op::MulI(_)
+            | arith::Op::DivSI(_)
+            | arith::Op::Compare { .. }
+            | arith::Op::Logic { .. } => return None,
+        };
+
+        // `const_val` — either attribute kind reaches the same number — and
+        // `value = constValToField(const_val);`.
+        let value = const_val_to_field(ConstantOperandValue::of(splat)?);
+
+        // `return VectorOperand(Constant, value, op.getOperation());`
+        Some(VectorOperand::new(
+            VectorOperandType::Constant,
+            OperandValue::Port(value),
+            at,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
+    use super::{BitstreamConstant, IrfIndex, LayoutAndIndices, RegisterSlice};
     use super::{ComputeComp, ConstantOperandValue, OpId, OperandValue, VectorOperand};
-    use super::{VectorOperandType, const_val_to_field, erase_op, same_block};
+    use super::{
+        VectorOperandType, const_val_to_field, erase_op, layout_map_and_indices, same_block,
+    };
     use crate::arch::{Dd2, Sen1p5};
     use crate::units::{DfirUnit, Row};
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
-    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
-    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, Vector};
+    use crate::islands::dataflow_ir::dialects::{Index, Op as DfirOp, Val};
+    use crate::islands::dataflow_ir::dialects::{affine, agen, arith, dataflow, vector};
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
     use crate::islands::sentient::dialects::sentient as sen;
 
     /// The vector every op in these fixtures is typed at — 128 lanes of bf16, the width
     /// `dcc/test/PESFP/*.mlir` computes at.
     const V: Vector = Vector {
         len: 128,
+        elem: ElemType::Bf16,
+    };
+
+    /// The vector the PT row's transfers move — 64 lanes of bf16, one stick
+    /// (`dcc/test/PT/bf16-pt.mlir:161`, `:214`).
+    const V64: Vector = Vector {
+        len: 64,
         elem: ElemType::Bf16,
     };
 
@@ -1383,112 +2053,432 @@ mod unit_tests {
             .is_none()
         );
     }
-}
+    // ── e167_getOperandFromConstantBitstreamOp ────────────────────────────────────────────────
 
-impl VectorOperand {
-    /// Replaces: e166_getOperandFromConstantOp
-    ///
-    /// # WHICH PSEUDO-PORT A SPLATTED VECTOR CONSTANT IS READ FROM
-    ///
-    /// ```cpp
-    /// std::optional<VectorOperand> VectorOperand::getOperandFromConstantOp(
-    ///     mlir::arith::ConstantOp &op) {
-    ///   std::string value;
-    ///   auto splat_attr = mlir::cast<SplatElementsAttr>(op.getValue());
-    ///   if (splat_attr) {
-    ///     double const_val;
-    ///     auto splat_value = splat_attr.getSplatValue<Attribute>();
-    ///     if (mlir::isa<IntegerAttr>(splat_value)) {
-    ///       const_val = mlir::cast<IntegerAttr>(splat_value).getInt();
-    ///     } else if (mlir::isa<FloatAttr>(splat_value)) {
-    ///       const_val = mlir::cast<FloatAttr>(splat_value).getValueAsDouble();
-    ///     } else {
-    ///       op->emitError("Only integer or float vectors are supported");
-    ///       return std::nullopt;
-    ///     }
-    ///
-    ///     value = constValToField(const_val);
-    ///     if (value == "") {
-    ///       op->emitError("Only 0, 1, 2, or 3 are supported values");
-    ///       return std::nullopt;
-    ///     }
-    ///   } else {
-    ///     op->emitError("Only constant splatted vectors are supported");
-    ///     return std::nullopt;
-    ///   }
-    ///
-    ///   return VectorOperand(Constant, value, op.getOperation());
-    /// }
-    /// ```
-    /// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:264-293`)
-    ///
-    /// # ⭐⭐ A CONSTANT OPERAND COSTS NO PORT — THE HARDWARE HAS FOUR OF THEM WIRED IN
-    ///
-    /// `dcc/test/PE/test1.mlir:38-39` declares `%cst_0 = arith.constant dense<1.000000e+00> :
-    /// vector<64xf16>` and `%cst_1 = arith.constant dense<0.000000e+00>`, hands both to a
-    /// `vectorchain.multiply_and_accumulate` (`:60`), and the reference's own `CHECK-SENT-IR` reads
-    /// `opB = #sentient<compute_port one>, opC = #sentient<compute_port zero>` (`:18`). No load, no
-    /// link, no register — the operand IS the port, which is why this function returns an operand
-    /// rather than emitting anything.
-    ///
-    /// # ⛔ THE INTEGER/FLOAT SPLIT COLLAPSES, AND THE ISLAND IS WHY
-    ///
-    /// `IntegerAttr::getInt()` and `FloatAttr::getValueAsDouble()` (`:275-281`) exist because MLIR
-    /// keeps two attribute kinds; both feed ONE `double` and one chain of `const_val == N` tests.
-    /// [`arith::Op::DenseConstant::splat`] is a single `i64` for exactly this reason — see its own
-    /// note for the census that every `arith.constant dense<…>` in the authority tree is integral —
-    /// so *"Only integer or float vectors are supported"* names no third case here.
-    ///
-    /// ⛔ AND `if (value == "")` IS STATICALLY FALSE. `constValToField` ends in an unconditional
-    /// `DT_ERROR` (`:260`), so its `return ""` and this arm are both dead in the reference; the
-    /// domain is [`ConstantOperandValue`] and the refusal happens where the value is recognised. See
-    /// [`ConstantOperandValue::of`].
-    ///
-    /// # THE TWO ABORTS, EACH DECLINED HERE
-    ///
-    /// * ⛔ A SPLAT OUTSIDE `0..=3` THROWS IN THE REFERENCE. `DT_ERROR` is not a diagnostic
-    ///   (`util/dt_exception.hpp:110-121`); a `dense<4>` vector operand takes the compiler down. This
-    ///   port answers `None`, which is the same refusal without the crash — and it is reachable, not
-    ///   theoretical: `dense<4.000000e+00>` appears twice in the authority's tests.
-    /// * ⛔ A **SCALAR** `arith.constant` IS `mlir::cast`'s OWN ASSERT (`:270`), and the caller
-    ///   reaches this for any `isa<mlir::arith::ConstantOp>` (`VectorOperands.cpp:513-515`) — an
-    ///   `arith.constant 3 : index` included. It then asks `getElementType` of that scalar type
-    ///   (`:516`), which aborts as well. So the input is ill-formed twice over and `None` is the only
-    ///   answer this crate can give; [`arith::Op::Constant`] and [`arith::Op::ConstantInt`] are named
-    ///   rather than wildcarded so a fourth constant form has to decide.
-    ///
-    /// ⭐ THE TWO PRECISIONS ARE THE CALLER'S. `getOperand` sets `orig_precision_` and
-    /// `on_the_fly_conv_precision_` from `getElementType(const_op.getType())` immediately after this
-    /// returns (`:516-521`) — which is why `test1.mlir`'s golden also carries
-    /// `opBPrecision = #sentient<precision fp16>` — and [`VectorOperand::new`] leaves both unset.
-    #[must_use]
-    pub fn from_constant_op(op: &arith::Op, at: OpId) -> Option<VectorOperand> {
-        // `auto splat_attr = mlir::cast<SplatElementsAttr>(op.getValue());` — and the `else` arm
-        // *"Only constant splatted vectors are supported"* that this cast makes unreachable.
-        let splat = match op {
-            arith::Op::DenseConstant { splat, .. } => *splat,
-            arith::Op::Constant { .. } | arith::Op::ConstantInt { .. } => return None,
-            // ⛔ NOT AN `arith.constant` AT ALL, and the reference could not be handed one: its
-            // parameter is an `mlir::arith::ConstantOp&`. This island's [`arith::Op`] is one enum
-            // over the whole dialect, so the six arithmetic forms are written out rather than
-            // wildcarded — [`is_arith_constant`] draws the same line for [`same_block`].
-            arith::Op::AddI(_)
-            | arith::Op::SubI(_)
-            | arith::Op::MulI(_)
-            | arith::Op::DivSI(_)
-            | arith::Op::Compare { .. }
-            | arith::Op::Logic { .. } => return None,
+    /// ⭐ THE SPLATTED READING IS A PSEUDO-UNIT PORT, NOT A NUMBER. `getOperandFromShuffleOp`'s
+    /// trivial-shuffle branch is the only caller that passes `is_constant_splatted_vector = true`
+    /// (`VectorOperands.cpp:333-334`), and it re-tags the answer `ConstantBitstream` on the very next
+    /// line (`:335`) — so the only thing THIS function decides for that caller is the value.
+    #[test]
+    fn a_splatted_bitstream_constant_reads_as_its_pseudo_unit_port() {
+        let operand = VectorOperand::from_constant_bitstream_op(
+            BitstreamConstant::SplattedVector(ConstantOperandValue::Two),
+            OpId::at(&[4]),
+        );
+        assert_eq!(operand.kind, VectorOperandType::Constant);
+        assert_eq!(operand.values, vec![OperandValue::Port(sen::Port::Two)]);
+        assert_eq!(operand.op, OpId::at(&[4]));
+        assert_eq!(operand.name(), Some(sen::Port::Two));
+    }
+
+    /// ⛔ WITHOUT THE FLAG IT IS A DECIMAL WITH NO COMPUTE-PORT SPELLING AT ALL. `:522-530` is the
+    /// caller that takes the default, and `symbolizeSentientComputePort("7")` has no case to answer
+    /// with — see [`OperandValue::Literal`]. ⭐ AND BOTH PRECISIONS STAY UNSET, because that caller
+    /// writes them itself off the bitstream's element type (`:525-529`), not this function.
+    #[test]
+    fn an_unsplatted_bitstream_constant_stays_an_immediate_with_no_port() {
+        let operand = VectorOperand::from_constant_bitstream_op(
+            BitstreamConstant::Immediate(7),
+            OpId::at(&[4]),
+        );
+        assert_eq!(operand.kind, VectorOperandType::Constant);
+        assert_eq!(operand.values, vec![OperandValue::Literal(7)]);
+        assert_eq!(operand.name(), None);
+        assert_eq!(operand.orig_precision, None);
+        assert_eq!(operand.on_the_fly_conv_precision, None);
+    }
+
+    // ── e168_getOperandFromNegOp ──────────────────────────────────────────────────────────────
+
+    /// `vectorchain.neg %input : vector<128xbf16>` binding `result`.
+    fn neg(result: Val, input: Val) -> DfirOp {
+        DfirOp::VectorChain(vc::Op::Neg {
+            result,
+            input,
+            mask: None,
+            input_ty: V,
+            ty: V,
+        })
+    }
+
+    /// ⭐⭐ THE QUESTION IS FORWARDED ABOUT THE INPUT'S DEFINER, NEVER ABOUT THE NEGATION. Here
+    /// `%2 = vectorchain.neg %1` reads the `fast_exp` at `[1]`, so the recursion is asked exactly once
+    /// and about `[1]`, and its answer comes back untouched — precisions included, because
+    /// `getOperandFromNegOp` writes none (`VectorOperands.cpp:366-373`) and its sole caller says why:
+    /// *"The NegOp doesn't change the original precision"* (`:568`).
+    #[test]
+    fn a_negation_forwards_the_operand_of_what_it_reads() {
+        let scope = vec![dense(Val(0)), fast_exp(Val(1), Val(0)), neg(Val(2), Val(1))];
+        let mut asked: Vec<(OpId, ComputeComp)> = Vec::new();
+        let answer = {
+            let mut recurse = |at: &OpId, comp: ComputeComp| {
+                asked.push((at.clone(), comp));
+                Some(operand(VectorOperandType::Nfwd, at.path()))
+            };
+            VectorOperand::from_neg_op(&OpId::at(&[2]), ComputeComp::Sfp, &scope, &mut recurse)
         };
+        assert_eq!(asked, vec![(OpId::at(&[1]), ComputeComp::Sfp)]);
+        assert_eq!(answer, Some(operand(VectorOperandType::Nfwd, &[1])));
+    }
 
-        // `const_val` — either attribute kind reaches the same number — and
-        // `value = constValToField(const_val);`.
-        let value = const_val_to_field(ConstantOperandValue::of(splat)?);
+    /// ⛔ `DT_CHECK(isa<vectorchain::NegOp>(op))` IS A CLASSIFICATION HERE, NOT AN ABORT. A caller
+    /// that arrives with anything else gets `None`, and the recursion is never consulted at all.
+    #[test]
+    fn a_position_holding_no_negation_answers_none_without_recursing() {
+        let scope = vec![dense(Val(0)), fast_exp(Val(1), Val(0))];
+        let mut asked = 0_usize;
+        let answer = {
+            let mut recurse = |_: &OpId, _: ComputeComp| {
+                asked += 1;
+                Some(operand(VectorOperandType::Nfwd, &[0]))
+            };
+            VectorOperand::from_neg_op(&OpId::at(&[1]), ComputeComp::Pe, &scope, &mut recurse)
+        };
+        assert_eq!(answer, None);
+        assert_eq!(asked, 0);
+    }
 
-        // `return VectorOperand(Constant, value, op.getOperation());`
-        Some(VectorOperand::new(
-            VectorOperandType::Constant,
-            OperandValue::Port(value),
-            at,
-        ))
+    /// ⛔ A NEGATION READING A BLOCK ARGUMENT HAS NO DEFINER, and the reference dereferences the
+    /// null: `getOperand(…, nullptr, comp)` tail-calls `getOperandWithPrecision`, whose first
+    /// statement past the out-parameter is `isa<vector::LoadOp>(op)` (`VectorOperands.cpp:394`).
+    /// `None` is the deliberate divergence, and the recursion is not asked about a position that
+    /// does not exist.
+    #[test]
+    fn a_negation_of_a_loop_induction_variable_answers_none() {
+        let scope = vec![for_loop(Val(9), vec![neg(Val(2), Val(9))])];
+        let mut asked = 0_usize;
+        let answer = {
+            let mut recurse = |_: &OpId, _: ComputeComp| {
+                asked += 1;
+                Some(operand(VectorOperandType::Nfwd, &[0]))
+            };
+            VectorOperand::from_neg_op(&OpId::at(&[0, 0]), ComputeComp::Pt, &scope, &mut recurse)
+        };
+        assert_eq!(answer, None);
+        assert_eq!(asked, 0);
+    }
+
+    // ── e169_getName ──────────────────────────────────────────────────────────────────────────
+
+    /// ⭐ THE FOUR PREFIXED ARMS, ONE ASSERTION EACH — `"lrf" + value`, `"irf" + value`,
+    /// `"istate" + value` (`VectorOperands.cpp:866-877`). In this port the file and its bounded index
+    /// travel together in the VALUE, so there is no decimal to concatenate a prefix onto: the prefix
+    /// is which [`RegisterSlice`] case the value is.
+    #[test]
+    fn a_register_file_slice_names_itself_with_its_files_prefix() {
+        let named = |kind: VectorOperandType, value: OperandValue| {
+            VectorOperand::new(kind, value, OpId::at(&[0])).name()
+        };
+        assert_eq!(
+            named(
+                VectorOperandType::Lrf,
+                OperandValue::Slice(RegisterSlice::Lrf(sen::LrfIndex::L3))
+            ),
+            Some(sen::Port::Lrf(sen::LrfIndex::L3))
+        );
+        assert_eq!(
+            named(
+                VectorOperandType::Irf,
+                OperandValue::Slice(RegisterSlice::Irf(IrfIndex::I0))
+            ),
+            Some(sen::Port::Irf0)
+        );
+        assert_eq!(
+            named(
+                VectorOperandType::Irf,
+                OperandValue::Slice(RegisterSlice::Irf(IrfIndex::I1))
+            ),
+            Some(sen::Port::Irf1)
+        );
+        assert_eq!(
+            named(
+                VectorOperandType::IState,
+                OperandValue::Slice(RegisterSlice::IState(sen::IStateIndex::S2))
+            ),
+            Some(sen::Port::IState(sen::IStateIndex::S2))
+        );
+    }
+
+    /// ⛔⛔ THE `latch` DIVERGENCE, AND IT IS THE WHOLE REASON THIS PORT READS THE VALUE AND NOT
+    /// `type_`. `OperandReuse.cpp` re-values a reused operand `"latch"` and leaves `type_` alone
+    /// (`:28`, `:30`, `:32`, `:40`, `:43`), so the reference's `getName()` answers `"lrflatch"` for a
+    /// latched LRF operand — which is not a `SentientComputePort` at all, and every call site then
+    /// calls `.value()` on the `nullopt`. ⭐ `:57` IS THE EVIDENCE FOR WHICH ANSWER WAS MEANT: its
+    /// own test is the unprefixed `from.getName() != "latch"`.
+    #[test]
+    fn a_latched_lrf_operand_names_the_latch_and_not_lrflatch() {
+        let operand = VectorOperand::new(
+            VectorOperandType::Lrf,
+            OperandValue::Port(sen::Port::Latch),
+            OpId::at(&[0]),
+        );
+        assert_eq!(operand.name(), Some(sen::Port::Latch));
+    }
+
+    /// ⭐ THE `XRF` ARM IS REDUNDANT WITH THE `else`, AND THIS SHOWS IT RATHER THAN ASSERTING IT. An
+    /// XRF operand is built exactly once in the whole reference, as
+    /// `VectorOperand(operand_type, "xrf", op)` (`VectorOperands.cpp:218-220`), so its value already
+    /// IS the string that arm returns — and the `else` therefore answers identically.
+    #[test]
+    fn an_xrf_operand_names_the_xrf_from_its_value_alone() {
+        let named = |kind: VectorOperandType| {
+            VectorOperand::new(kind, OperandValue::Port(sen::Port::Xrf), OpId::at(&[0])).name()
+        };
+        assert_eq!(named(VectorOperandType::Xrf), Some(sen::Port::Xrf));
+        assert_eq!(named(VectorOperandType::Link), Some(sen::Port::Xrf));
+    }
+
+    /// ⛔ AN OPERAND CARRYING NO VALUE HAS NO NAME, and in the reference it has no defined behaviour:
+    /// `getFirstValue()` is `values_.front()` on an empty `std::vector` (`VectorOperands.hpp:76`).
+    #[test]
+    fn an_operand_with_no_value_has_no_name() {
+        assert_eq!(operand(VectorOperandType::Link, &[0]).name(), None);
+    }
+
+    // ── e170_getLayoutMapAndIndices ───────────────────────────────────────────────────────────
+
+    /// `memref<64x16x1xbf16>` — the PT row's own view throughout `dcc/test/PT/bf16-pt.mlir`.
+    fn row_view_ty() -> MemRef {
+        MemRef {
+            shape: vec![64, 16, 1],
+            elem: ElemType::Bf16,
+        }
+    }
+
+    /// `#map4 = affine_map<(d0, d1, d2) -> (d2 * 1024 + d1 * 64 + d0)>` (`bf16-pt.mlir:69`) — built
+    /// with the VERBATIM operators, because a printed map is transcribed exactly as the program
+    /// spells it.
+    fn layout_map4() -> AffineMap {
+        AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(1024)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        }
+    }
+
+    /// `%52 = dataflow.get_logical_memory_view %47, %c0_0 {layout_map = #map4} : index, index,
+    /// memref<64x16x1xbf16>` (`bf16-pt.mlir:211`).
+    fn row_view() -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result: Val(52),
+            from: Val(47),
+            start: Val(1),
+            layout: layout_map4(),
+            ty: row_view_ty(),
+        })
+    }
+
+    /// `[0, %arg12 + %arg11 * 2 + %arg10 * 8, 0]` — the load's subscripts at `bf16-pt.mlir:214`.
+    fn row_subscripts() -> Vec<Index> {
+        vec![
+            Index::Const(0),
+            Index::Strided(vec![(Val(12), 1), (Val(11), 2), (Val(10), 8)], 0),
+            Index::Const(0),
+        ]
+    }
+
+    /// `d0 + d1 * 2 + d2 * 8` — the flattened stick index those subscripts compute, one dimension per
+    /// distinct operand in the order the access lists them.
+    fn flat_stick_index() -> AffineExpr {
+        AffineExpr::dim(0)
+            .plus(AffineExpr::dim(1).times(2))
+            .plus(AffineExpr::dim(2).times(8))
+    }
+
+    /// ⭐⭐ THE `agen` ARM COMPOSES, AND ON THE VENDOR'S OWN PROGRAM THE ANSWER IS THE VECTOR WIDTH.
+    /// `bf16-pt.mlir:214` loads `%52[0, %arg12 + %arg11 * 2 + %arg10 * 8, 0]` from a view whose
+    /// `layout_map` is `#map4 = (d0, d1, d2) -> (d2 * 1024 + d1 * 64 + d0)` (`:69`): the lane axis
+    /// `d0` and the page axis `d2` are both literal zero, so the composite collapses to `64 *` the
+    /// flattened stick index — sixty-four elements per stick, which is exactly the `vector<64xbf16>`
+    /// the load binds. ⛔ AND THE ORDER MAP LEAVES IT ALONE: the program writes
+    /// `load_order = #map5` (`:70`), the identity over three dims, which is precisely what
+    /// [`AffineMap::identity`] over `view_ty.shape.len()` derives.
+    #[test]
+    fn an_agen_load_composes_the_views_layout_with_its_own_subscripts() {
+        let scope = vec![
+            row_view(),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result: Val(53),
+                view: Val(52),
+                indices: row_subscripts(),
+                view_ty: row_view_ty(),
+                ty: V64,
+            }),
+        ];
+        assert_eq!(
+            layout_map_and_indices(&OpId::at(&[1]), &scope),
+            Some(LayoutAndIndices {
+                layout_map: AffineMap {
+                    dims: 3,
+                    syms: 0,
+                    results: vec![flat_stick_index().times(64)],
+                },
+                operands: vec![Val(12), Val(11), Val(10)],
+                logical_view_op: OpId::at(&[0]),
+            })
+        );
+    }
+
+    /// ⭐ THE STORE ARM IS THE SAME BODY UNDER A DIFFERENT ACCESSOR NAME — the store's operand list is
+    /// `getMapOperands()` and the load's is `getMapIndices()`. `bf16-pt.mlir:161` stores through the
+    /// same `#map4` view (`:158`) at `[0, %arg9 + %arg8 * 8, 0]`, two operands instead of three, so
+    /// the composite takes TWO dimensions: the arity of the answer follows the ACCESS, not the view.
+    #[test]
+    fn an_agen_store_composes_the_same_way_over_its_own_operand_count() {
+        let scope = vec![
+            row_view(),
+            DfirOp::Agen(agen::Op::VectorStore {
+                value: Val(48),
+                view: Val(52),
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(Val(9), 1), (Val(8), 8)], 0),
+                    Index::Const(0),
+                ],
+                view_ty: row_view_ty(),
+                ty: V64,
+            }),
+        ];
+        assert_eq!(
+            layout_map_and_indices(&OpId::at(&[1]), &scope),
+            Some(LayoutAndIndices {
+                layout_map: AffineMap {
+                    dims: 2,
+                    syms: 0,
+                    results: vec![
+                        AffineExpr::dim(0)
+                            .plus(AffineExpr::dim(1).times(8))
+                            .times(64)
+                    ],
+                },
+                operands: vec![Val(9), Val(8)],
+                logical_view_op: OpId::at(&[0]),
+            })
+        );
+    }
+
+    /// ⛔⛔ THE SAME VIEW AND THE SAME SUBSCRIPTS THROUGH A `vector.load` COMPOSE NOTHING — the
+    /// layout comes back VERBATIM, `#map4` and not `#map4 ∘ anything`. That asymmetry is the
+    /// reference's own: its two `vector` arms take `getIndices()` and the view's `getLayoutMap()` and
+    /// stop (`VectorOperands.cpp:893-898` and `:910-915`), because `Vector_LoadOp` carries no order map and
+    /// no access
+    /// map to compose with. A port that composed here "for consistency" would address a different
+    /// element of every view.
+    #[test]
+    fn a_plain_vector_load_takes_the_views_layout_verbatim() {
+        let scope = vec![
+            row_view(),
+            DfirOp::Vector(vector::Op::Load {
+                result: Val(53),
+                base: Val(52),
+                indices: row_subscripts(),
+                base_ty: row_view_ty(),
+                ty: V64,
+            }),
+        ];
+        assert_eq!(
+            layout_map_and_indices(&OpId::at(&[1]), &scope),
+            Some(LayoutAndIndices {
+                layout_map: layout_map4(),
+                operands: vec![Val(12), Val(11), Val(10)],
+                logical_view_op: OpId::at(&[0]),
+            })
+        );
+    }
+
+    /// `%lrf_memory_fp16 = dataflow.get_logical_memory_view %lrf_memory_unit, %c0
+    /// {layout_map = affine_map<(i, j) -> (64 * i + j)>} : index, index, memref<8x64xf16>`
+    /// (`sfp-to-sfp-ring.mlir:168-170`).
+    ///
+    /// ⭐ THE CONSTANT MOVES TO THE RIGHT AND THAT IS THE PARSER, NOT US: MLIR builds `64 * i`
+    /// through `AffineExpr::operator*`, whose `simplifyMul` canonicalises the constant term to the
+    /// RHS, so the map the attribute holds — and the one this island prints — is `d0 * 64 + d1`. It is
+    /// the reason [`AffineExpr::added`] and [`AffineExpr::scaled`] exist beside the verbatim pair.
+    fn lrf_view() -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result: Val(80),
+            from: Val(81),
+            start: Val(82),
+            layout: AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![AffineExpr::dim(0).times(64).plus(AffineExpr::dim(1))],
+            },
+            ty: MemRef {
+                shape: vec![8, 64],
+                elem: ElemType::F16,
+            },
+        })
+    }
+
+    /// ⭐ AND A CONSTANT-SUBSCRIPTED ACCESS CONTRIBUTES NO OPERANDS AT ALL.
+    /// `sfp-to-sfp-ring.mlir:171` is `%data1 = vector.load %lrf_memory_fp16[%c4, %c0] :
+    /// memref<8x64xf16>, vector<64xf16>`: in vendor MLIR those subscripts are two `arith.constant`
+    /// results and so two entries of `getIndices()`, and [`Index::Const`] is this island's folded form
+    /// of exactly that. The layout still comes back as the view's, untouched.
+    #[test]
+    fn a_constant_subscripted_vector_load_has_no_operands() {
+        let DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            layout: lrf_layout,
+            ty: lrf_ty,
+            ..
+        }) = lrf_view()
+        else {
+            unreachable!("`lrf_view` is a logical memory view")
+        };
+        let scope = vec![
+            lrf_view(),
+            DfirOp::Vector(vector::Op::Load {
+                result: Val(83),
+                base: Val(80),
+                indices: vec![Index::Const(4), Index::Const(0)],
+                base_ty: lrf_ty,
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            }),
+        ];
+        assert_eq!(
+            layout_map_and_indices(&OpId::at(&[1]), &scope),
+            Some(LayoutAndIndices {
+                layout_map: lrf_layout,
+                operands: Vec::new(),
+                logical_view_op: OpId::at(&[0]),
+            })
+        );
+    }
+
+    /// ⛔ A BASE THAT IS NOT A `dataflow.get_logical_memory_view` ANSWERS NOTHING. The reference's
+    /// `getDefiningOp<dataflow::GetLogicalMemoryViewOp>()` is a `dyn_cast`, so it yields null there
+    /// and the very next line calls `getLayoutMap()` on it (`VectorOperands.cpp:902-904`). `None` is
+    /// the classification that replaces the dereference.
+    #[test]
+    fn an_access_whose_base_is_not_a_logical_view_answers_none() {
+        let scope = vec![
+            dense(Val(52)),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                result: Val(53),
+                view: Val(52),
+                indices: row_subscripts(),
+                view_ty: row_view_ty(),
+                ty: V64,
+            }),
+        ];
+        assert_eq!(layout_map_and_indices(&OpId::at(&[1]), &scope), None);
+    }
+
+    /// ⛔ AND SO DOES AN OP THAT IS NONE OF THE FOUR MEMORY ACCESSES — the reference's `else` arm,
+    /// `op->emitOpError("can't extract memory layout map or indices.")`. Asked about the VIEW itself,
+    /// which defines a memref but reads none.
+    #[test]
+    fn an_op_that_is_not_a_memory_access_answers_none() {
+        let scope = vec![row_view()];
+        assert_eq!(layout_map_and_indices(&OpId::at(&[0]), &scope), None);
     }
 }
