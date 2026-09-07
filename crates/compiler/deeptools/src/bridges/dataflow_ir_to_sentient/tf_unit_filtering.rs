@@ -173,6 +173,10 @@ fn unit_bound_by(unit: Val, scope: &[DfirOp]) -> Option<(FoldId, Residency)> {
             | DfirOp::VectorChain(_)
             // ⭐ `symbol` HERE TOO: a `symbol.create_symbol` result is an `index`, not the `!ddl.unit`
             // a `program_unit` operand is, so it is one more `dyn_cast<GetUnitOp>` null.
+            // ⭐ AND `uniform`: a `program_unit` operand defined by a `uniform.query_map` is an
+            // `index` the schedule resolves later, not the `get_unit` result this `dyn_cast` wants,
+            // so the operand is KEPT rather than filtered — see the note above.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_),
         )
         | None => None,
@@ -390,6 +394,9 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
         | DfirOp::VectorChain(_)
         // ⭐ `symbol.create_symbol` IS NOT IN THE NINETEEN-CLASS `isa<>` LIST EITHER. It binds a
         // scalar the schedule fixes later; nothing crosses a datapath because of it.
+        // ⭐ AND NO `uniform.` OP IS IN THE NINETEEN-CLASS LIST. `uniform.uniformize_regions` holds
+        // the transfers rather than being one; the transfers inside it answer for themselves.
+        | DfirOp::Uniform(_)
         | DfirOp::Symbol(_) => false,
     }
 }

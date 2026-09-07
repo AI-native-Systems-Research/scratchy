@@ -314,6 +314,10 @@ pub fn get_dataflow_for_loop_info_if_iv<'a>(
         // ⭐ `symbol.create_symbol` CARRIES NO REGION, so it owns no block and cannot be the parent
         // op [`owner_of_block_arg`] found — this arm exists because the match is total, not because
         // the walk can land on it.
+        // ⭐ `uniform.uniformize_regions` DOES OWN A BLOCK PER REGION, and its argument is the unit
+        // the region runs on — never an induction variable. Neither `dyn_cast` succeeds, which is
+        // this arm's answer and not a gap in it.
+        | DfirOp::Uniform(_)
         | DfirOp::Symbol(_) => return None,
     };
 
@@ -381,6 +385,9 @@ fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
         // `Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:278-284`);
         // borrowing it here would hand every caller of this one a trip count of `0 - 0`.
         DfirOp::Symbol(_) => None,
+        // ⭐ AND `uniform` WITH IT: a `uniform.query_map` result is an `index` whose value the
+        // schedule fixes later, so `dyn_cast<arith::ConstantIndexOp>` is null for it too.
+        DfirOp::Uniform(_) => None,
     }
 }
 

@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::dataflow::Precision;
 use crate::islands::dataflow_ir::dialects::{
-    Index, Op, Val, affine, agen, arith, dataflow, scf, symbol, vector, vectorchain,
+    Index, Op, Val, affine, agen, arith, dataflow, scf, symbol, uniform, vector, vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, ElemType, IntegerSet, MemRef, Vector,
@@ -141,6 +141,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::Agen(op) => agen::emit(out, op, depth),
         Op::VectorChain(op) => vectorchain::emit(out, op),
         Op::Symbol(op) => symbol::emit(out, op),
+        Op::Uniform(op) => uniform::emit(out, op, depth),
     }
 }
 

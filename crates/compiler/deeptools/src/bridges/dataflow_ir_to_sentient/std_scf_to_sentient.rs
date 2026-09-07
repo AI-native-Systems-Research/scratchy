@@ -267,11 +267,15 @@ pub const fn legality(op: &DfirOp) -> Legality {
         // `addIllegalDialect<scf>` names one (`SCFToSentient.cpp:261-266`) — `mlir::vector` is in
         // neither, so a `vector.store` sitting beside the `scf.for` this pass rewrites is tolerated
         // by the partial conversion exactly as an `agen` access is.
+        //
+        // ⭐ AND SO DOES `uniform`, BY THE SAME OMISSION — a `uniform.uniformize_regions` still
+        // standing at this rung is left exactly where it is.
         DfirOp::Affine(_)
         | DfirOp::Dataflow(_)
         | DfirOp::Agen(_)
         | DfirOp::Vector(_)
-        | DfirOp::Symbol(_) => Legality::Unmentioned,
+        | DfirOp::Symbol(_)
+        | DfirOp::Uniform(_) => Legality::Unmentioned,
     }
 }
 
@@ -590,8 +594,10 @@ mod unit_tests {
         assert_eq!(
             pattern_for(&scf::Op::If {
                 cond: Val(0),
+                results: Vec::new(),
                 body: Vec::new(),
                 else_body: Vec::new(),
+                dbg_name: None,
             }),
             Some(Pattern::IfOpLowering)
         );
@@ -650,8 +656,10 @@ mod unit_tests {
             Vec::new(),
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(0),
+                results: Vec::new(),
                 body: Vec::new(),
                 else_body: Vec::new(),
+                dbg_name: None,
             })],
         ));
     }
@@ -694,6 +702,7 @@ mod unit_tests {
                 results: Vec::new(),
                 body,
                 else_body,
+                dbg_name: None,
             })],
         )
     }
@@ -730,8 +739,10 @@ mod unit_tests {
             Vec::new(),
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(0),
+                results: Vec::new(),
                 body: Vec::new(),
                 else_body: Vec::new(),
+                dbg_name: None,
             })],
         ));
     }

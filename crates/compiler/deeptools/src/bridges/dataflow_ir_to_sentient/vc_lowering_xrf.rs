@@ -1278,14 +1278,150 @@ fn viewed_unit_is_xrf(from_unit: Val, scope: &[DfirOp]) -> bool {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 175/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH OF THE ENCLOSING OP'S REGIONS HOLDS THE `sentient.yield` BEING EXTENDED.
+///
+/// # ⛔ THE REFERENCE HOLDS THE YIELD; THIS ISLAND HAS TO SAY WHERE IT IS
+///
+/// `updateYieldArgs` takes a `sentient::YieldOp &` and then asks it for `getParentOp()`. A region here
+/// is a `Vec` of ops with no parent pointer, so the pair *(enclosing op, which of its regions)*
+/// replaces the yield handle — the "mechanism for reaching operands" the campaign brief allows a port
+/// to be given instead of walking. It is an `enum` and not an index because the two positions are the
+/// only two that exist: [`sentient::regions`] gives one region for a `sentient.for` and exactly two,
+/// `then` first, for a `sentient.if`.
+///
+/// ⭐ AND IT IS THE DISTINCTION THE CALLER ALREADY MAKES. The one call site branches on
+/// `if_op.getThenRegion().isAncestor(yield_op->getParentRegion())`
+/// (`dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:510`) to decide
+/// whether the pointer chain continues or is reset to the `then` region's initial pointer, so the
+/// walker that will call this in entry 345 knows which region it descended into before it gets here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum YieldRegion {
+    /// Region 0 — a `sentient.for`'s body, or a `sentient.if`'s `then` region.
+    BodyOrThen,
+    /// Region 1 — a `sentient.if`'s `else` region. ⛔ A `sentient.for` has no second region, so this
+    /// names nothing on one and [`update_yield_args`] answers [`None`].
+    Else,
+}
+
+impl YieldRegion {
+    /// THE POSITION `getRegions()` INDEXES IT AT.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            YieldRegion::BodyOrThen => 0,
+            YieldRegion::Else => 1,
+        }
+    }
+}
+
+/// Replaces: e175_updateYieldArgs
+///
+/// # A REGION HANDS ONE MORE VALUE BACK, AND THE POINTER IS THEN READ AS THE ENCLOSING OP'S RESULT
+///
+/// ```cpp
+/// Value LoweringXRF::updateYieldArgs(sentient::YieldOp &yield_op,
+///                                    Value &xrf_ptr_val, int idx) {
+///   SmallVector<Value, 2> yield_args;
+///   for (auto it : yield_op.getOperands()) {
+///     yield_args.push_back(it);
+///   }
+///   yield_args.push_back(xrf_ptr_val);
+///   yield_op->setOperands(yield_args);
+///   return getXrfValue(yield_op, idx);
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690-699`)
+///
+/// ⛔ THE EXTRACT DROPPED THE `return getXrfValue(yield_op, idx);` — `crustify-bridge2/source/bridge2.cpp`
+/// ends this body at `setOperands`, and `crustify-bridge2/UNITS.tsv` therefore records NO callee for
+/// entry 175. The tail is the half that makes the function a *function* rather than a mutation: the
+/// copy-and-append is a `push`, and what the caller assigns is [`xrf_value`]'s answer.
+///
+/// # ⭐⭐ THE APPEND AND THE ANSWER ARE THE SAME POSITION, WHICH IS WHY `idx` SERVES BOTH
+///
+/// The pointers are appended in the order `processXrfPtrPerUnit` loops them — write at `i = 0`, read at
+/// `i = 1` (`LoweringXRF.cpp:351-354`) — and the enclosing op's results were created in that same order
+/// by `createForOpWithReturnValue` (entry 241) and `createIfOpWithReturnValue` (entry 242), which append
+/// the two xrf pointers as the last iter args and give the `if` two `IndexType` results. So the `idx`-th
+/// operand of the yield and the `idx`-th result of its parent are one pointer, and the reference's own
+/// expectation shows both ends of it:
+///
+/// ```mlir
+/// %51:2 = sentient.for %52 = %28 iter_args(%53 = %50#0, %54 = %50#1) -> (index, index) {…}{
+///   …
+///   %63:2 = sentient.vector_mac pointers(%53, %59) {…}
+///   %64 = sentient.scalar_constant {value = -4 : si64} : index
+///   %65 = sentient.scalar_add %64, %63#1 : index, index
+///   sentient.yield %63#0, %65 : index, index
+/// }
+/// %66 = sentient.scalar_constant {value = -32 : si64} : index
+/// %67 = sentient.scalar_add %66, %51#1 : index, index
+/// ```
+/// (`dcc/test/Conversion/VectorChainToSentientPT/loweringXRF_with_if_branch.mlir:59-74`, `CHECK-SENT-IR`)
+///
+/// Two calls built that `sentient.yield` — one appending the write pointer `%63#0`, one the read pointer
+/// `%65` — and the value the second call returned is `%51#1`, which is what the next offset is added to.
+///
+/// # ⚠️ IT DOES NOT CREATE THE RESULT IT NAMES
+///
+/// Appending a yield operand does not widen the parent's result list; the parent was built with both
+/// results already — `createForOpWithReturnValue` pushes the `xrfwrptr` and `xrfrdptr` constants on as
+/// the last two iter args (entry 241, `LoweringXRF.cpp:146-147`) and `createIfOpWithReturnValue` asks
+/// for two `IndexType` results and puts a BARE `sentient.yield` in each region before cloning the body
+/// in FRONT of it (entry 242, `LoweringXRF.cpp:192-195`, `:206`, `:212`, `:216`) — so the terminator is
+/// the region's last op — and this closes the region over them. On an op whose result
+/// list is shorter than `idx` the answer is [`None`] — `getResult`'s own assertion — and the pointer
+/// simply has nowhere to be read from, so nothing is emitted rather than a wrong slot being read.
+#[must_use]
+pub fn update_yield_args(
+    enclosing: &mut sen::Op,
+    region: YieldRegion,
+    xrf_ptr_val: Val,
+    ptr: XrfPtr,
+) -> Option<Val> {
+    // `yield_args` is `getOperands()` copied and then `push_back(xrf_ptr_val)`, and `setOperands`
+    // installs it — one `push` onto the terminator's own operand list.
+    let host = match enclosing {
+        sen::Op::Sentient(host) => host,
+        _ => return None,
+    };
+    match sentient::regions_mut(host)
+        .into_iter()
+        .nth(region.index())
+        .and_then(|ops| ops.last_mut())
+    {
+        Some(sen::Op::Sentient(sentient::Op::Yield { results })) => results.push(xrf_ptr_val),
+        // ⭐ A REGION WHOSE LAST OP IS NOT A `sentient.yield` HAS NO YIELD TO EXTEND. The reference is
+        // handed one and cannot be here; an `else` region asked of a `sentient.for` lands here too.
+        Some(_) | None => return None,
+    }
+
+    // `return getXrfValue(yield_op, idx);` — entry 090's `sentient::YieldOp` arm, which is
+    // `xrf_ptr->getParentOp()->getResult(0 + idx)`. Both borrows below are shared reborrows of the op
+    // just written; the second lookup exists so this returns entry 090's answer rather than a copy of
+    // its yield arm.
+    let host = match &*enclosing {
+        sen::Op::Sentient(host) => host,
+        _ => return None,
+    };
+    let regions = sentient::regions(host);
+    let yield_op = (*regions.get(region.index())?).last()?;
+    xrf_value(yield_op, Some(&*enclosing), ptr)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
         DfirOp, DummyMacPtrs, ForOpBound, LayoutExpr, LayoutExprMap, LocalUnit, MacXrfIncrements,
         OpId, StickOffset, Values, XrfLayoutExprs, XrfPtr, XrfPtrAdvance, XrfPtrPair, XrfPtrs,
-        agen, are_xrf_accesses_legal, dataflow, for_op_bound, insert_const_and_add_ops,
-        is_xrf_related, replace_and_erase_dummy_mac_ops, set_sentient_mac_xrf_reg_incr_attr,
-        vector, xrf_rd_ptr_incr_val_after_mac, xrf_value,
+        YieldRegion, agen, are_xrf_accesses_legal, dataflow, for_op_bound,
+        insert_const_and_add_ops, is_xrf_related, replace_and_erase_dummy_mac_ops,
+        set_sentient_mac_xrf_reg_incr_attr, update_yield_args, vector,
+        xrf_rd_ptr_incr_val_after_mac, xrf_value,
     };
     use crate::arch::{Dd2, Sen1p5};
     use crate::islands::dataflow_ir::dialects::Index;
@@ -2263,5 +2399,170 @@ mod unit_tests {
                 unit.spelling()
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 175/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// A `sentient.yield` handing back the values a region closes over.
+    fn a_yield(results: Vec<Val>) -> sen::Op {
+        sen::Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// A `sentient.if` with two results and a `sentient.yield` at the end of each region — the shape
+    /// `%42:2` has in `loweringXRF_with_if_branch.mlir`.
+    fn if_yielding(results: [Val; 2], then_body: Vec<sen::Op>, else_body: Vec<sen::Op>) -> sen::Op {
+        sen::Op::Sentient(sentient::Op::If {
+            predicate: sentient::CmpPredicate::Slt,
+            lhs: Val(26),
+            rhs: Val(6),
+            yielded: results
+                .into_iter()
+                .map(|result| sentient::Yielded {
+                    result,
+                    reg: sentient::Reg {
+                        locale: sentient::RegType::Unknown,
+                        index: None,
+                    },
+                })
+                .collect(),
+            dbg_name: None,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// What the terminator of one region hands back, or nothing when that region has no terminator.
+    fn yielded_operands(op: &sen::Op, region: YieldRegion) -> Vec<Val> {
+        let sen::Op::Sentient(host) = op else {
+            unreachable!("built above")
+        };
+        let regions = sentient::regions(host);
+        match regions.get(region.index()).and_then(|ops| ops.last()) {
+            Some(sen::Op::Sentient(sentient::Op::Yield { results })) => results.clone(),
+            Some(_) | None => Vec::new(),
+        }
+    }
+
+    /// 🎯 175/384 — THE VENDOR'S OWN INNERMOST LOOP: two appends build `sentient.yield %63#0, %65`,
+    /// and what they hand back are the loop's two results `%51#0` and `%51#1`.
+    ///
+    /// `dcc/test/Conversion/VectorChainToSentientPT/loweringXRF_with_if_branch.mlir:59-74`.
+    #[test]
+    fn both_pointers_appended_in_order_read_back_as_the_loops_two_results() {
+        // `%51:2 = sentient.for %52 = %28 iter_args(%53 = %50#0, %54 = %50#1) -> (index, index)`.
+        let mut for_op = loop_carrying(
+            Val(28),
+            Val(52),
+            [(Val(500), Val(53), Val(510)), (Val(501), Val(54), Val(511))],
+        );
+        if let sen::Op::Sentient(sentient::Op::For { body, .. }) = &mut for_op {
+            body.push(a_yield(Vec::new()));
+        }
+
+        // `i = 0`, the write pointer: `%63#0`.
+        let write = update_yield_args(
+            &mut for_op,
+            YieldRegion::BodyOrThen,
+            Val(630),
+            XrfPtr::Write,
+        );
+        // `i = 1`, the read pointer: `%65 = sentient.scalar_add %64, %63#1`.
+        let read = update_yield_args(&mut for_op, YieldRegion::BodyOrThen, Val(65), XrfPtr::Read);
+
+        assert_eq!(
+            yielded_operands(&for_op, YieldRegion::BodyOrThen),
+            vec![Val(630), Val(65)],
+            "sentient.yield %63#0, %65 — write pointer first, in the order the caller loops i"
+        );
+        assert_eq!(
+            (write, read),
+            (Some(Val(510)), Some(Val(511))),
+            "getXrfValue(yield_op, idx) is the parent's result at that same position — %51#0, %51#1"
+        );
+    }
+
+    /// 🎯 175/384 — THE TWO REGIONS OF A `sentient.if` ARE EXTENDED SEPARATELY, and both are read back
+    /// as the *same* result of the `if`: the golden's `then` ends `sentient.yield %51#0, %69` and its
+    /// `else` ends `sentient.yield %77#0, %77#1`, after which `%79 = sentient.scalar_add %78, %42#1`
+    /// reads one pointer for both paths
+    /// (`loweringXRF_with_if_branch.mlir:77`, `:87`, `:90`).
+    #[test]
+    fn each_region_of_an_if_is_extended_on_its_own_and_both_answer_the_ifs_result() {
+        let mut if_op = if_yielding(
+            [Val(420), Val(421)],
+            vec![a_yield(vec![Val(510)])],
+            vec![a_yield(vec![Val(770)])],
+        );
+
+        let then_read =
+            update_yield_args(&mut if_op, YieldRegion::BodyOrThen, Val(69), XrfPtr::Read);
+        assert_eq!(
+            yielded_operands(&if_op, YieldRegion::BodyOrThen),
+            vec![Val(510), Val(69)],
+            "the then region grew"
+        );
+        assert_eq!(
+            yielded_operands(&if_op, YieldRegion::Else),
+            vec![Val(770)],
+            "and the else region did not"
+        );
+
+        let else_read = update_yield_args(&mut if_op, YieldRegion::Else, Val(771), XrfPtr::Read);
+        assert_eq!(
+            yielded_operands(&if_op, YieldRegion::Else),
+            vec![Val(770), Val(771)]
+        );
+        assert_eq!(
+            (then_read, else_read),
+            (Some(Val(421)), Some(Val(421))),
+            "one result of the if, whichever region yielded it"
+        );
+    }
+
+    /// 🎯 175/384 — A `sentient.for` HAS NO SECOND REGION, so there is nothing to extend and nothing
+    /// to read: the position names no region at all.
+    #[test]
+    fn a_loop_has_no_else_region_to_extend() {
+        let mut for_op = loop_carrying(
+            Val(28),
+            Val(52),
+            [(Val(500), Val(53), Val(510)), (Val(501), Val(54), Val(511))],
+        );
+        if let sen::Op::Sentient(sentient::Op::For { body, .. }) = &mut for_op {
+            body.push(a_yield(Vec::new()));
+        }
+
+        assert_eq!(
+            update_yield_args(&mut for_op, YieldRegion::Else, Val(65), XrfPtr::Read),
+            None
+        );
+        assert!(
+            yielded_operands(&for_op, YieldRegion::BodyOrThen).is_empty(),
+            "and the body's own yield was left alone"
+        );
+    }
+
+    /// 🎯 175/384 — A REGION WHOSE LAST OP IS NOT A `sentient.yield` IS NOT A REGION THIS CLOSES.
+    /// The reference is handed a `sentient::YieldOp` and cannot be asked this; here the answer is an
+    /// absence rather than an operand appended to whatever op happened to be last.
+    #[test]
+    fn a_region_not_terminated_by_a_yield_is_left_untouched() {
+        let mut if_op = if_yielding(
+            [Val(420), Val(421)],
+            vec![sen::Op::Sentient(mac(
+                sentient::Port::Xrf,
+                Vec::new(),
+                vec![Val(500), Val(501)],
+                sentient::Precision::Int8,
+            ))],
+            Vec::new(),
+        );
+        assert_eq!(
+            update_yield_args(&mut if_op, YieldRegion::BodyOrThen, Val(69), XrfPtr::Read),
+            None
+        );
+        assert!(yielded_operands(&if_op, YieldRegion::BodyOrThen).is_empty());
     }
 }

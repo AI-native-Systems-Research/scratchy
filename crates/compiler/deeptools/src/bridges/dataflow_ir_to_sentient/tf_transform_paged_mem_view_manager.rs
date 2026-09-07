@@ -98,6 +98,8 @@ impl<'a> PagedMemView<'a> {
             | DfirOp::VectorChain(_)
             // ⭐ `symbol` WITH THEM: `symbol.create_symbol` binds an `index`, never a memref, so it
             // is never a paged view — one more `dyn_cast<GetPagedLogicalMemoryViewOp>` null.
+            // ⭐ AND `uniform` WITH IT, for the same reason: no `uniform.` op binds a memref.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }
@@ -352,6 +354,9 @@ impl<'a> TpmvManager<'a> {
             // ⭐ AND `symbol` WITH THEM: `symbol.create_symbol` takes no operands at all
             // (`NoMemoryEffect`, `Symbol.td:53`), so it cannot be a use of the view's result;
             // reaching this arm through one would mean the use list lied.
+            // ⭐ AND `uniform` WITH THEM: a `uniformize_regions` takes `!ddl.unit` operands and the
+            // mapping ops take `index`, so none of them can be a use of a paged view's memref.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => Selection::Unsupported,
         }
     }

@@ -420,7 +420,10 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             | vc::Op::Merge { .. },
         ) => None,
         // Neither reference list mentions an `arith`, an `scf` or a `symbol` op.
-        DfirOp::Arith(_) | DfirOp::Scf(_) | DfirOp::Symbol(_) => None,
+        // Neither reference list mentions an `arith`, an `scf`, a `symbol` or a `uniform` op.
+        // ⭐ `uniform.uniformize_regions` MAY BIND RESULTS and none of them is a vector: its own
+        // verifier restricts them to `index` (`Uniform.cpp:99-121` prints exactly that type).
+        DfirOp::Arith(_) | DfirOp::Scf(_) | DfirOp::Symbol(_) | DfirOp::Uniform(_) => None,
     }
 }
 

@@ -30,6 +30,25 @@ pub enum Op {
     If {
         /// The predicate.
         cond: Val,
+        /// THE VALUES IT BINDS — one per result, all `index`. Empty for a branch taken for effect.
+        ///
+        /// ⛔⛔ THE VENDOR'S OWN INPUT BINDS ONE, so a conditional without a result list cannot hold
+        /// the pass's input at all: `%13 = scf.if %12 -> (index) { scf.yield %c1 : index } else {
+        /// scf.yield %c2 : index }`
+        /// (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:129-133`), and `:117` is
+        /// the same op binding an `i1`.
+        ///
+        /// ⛔ AND THE SHALLOW MERGE BRANCHES ON WHETHER IT IS EMPTY. `mergeShallow` (entry 177) keeps
+        /// the destination's terminator when `dst->getNumResults() != 0` and the source's otherwise
+        /// (`CFGSDataflowConditionalTree.cpp:420-428`), `shallowlyMergeConditionals` picks WHICH of
+        /// two candidates is the destination by `n_if_op->getNumResults() > 0` (`:237-247`), and
+        /// `areShallowlyMergeable` declines outright when BOTH bind something (`:348`). A census that
+        /// answered "none" for every `scf.if` would make all three of those decisions constant.
+        ///
+        /// ⚠️ EVERY RESULT PRINTS AS `index`, as everywhere else in this island — see [`Carried`]. The
+        /// fixture's `-> (i1)` conditional is a condition-forwarding form this crate does not emit;
+        /// its own merged output binds an `index` (`merging.mlir:40`).
+        results: Vec<Val>,
         /// The `then` region.
         body: Vec<super::Op>,
         /// The `else` region.
@@ -49,6 +68,21 @@ pub enum Op {
         /// (`dcc/test/PT/issue-236.mlir:65-71`). A `Vec` that flattened the two states would make
         /// entry 096 a function with no observable result.
         else_body: Vec<super::Op>,
+        /// `{dbgName = ".."}` — WHICH SOURCE CONDITIONALS THIS ONE WAS MERGED OUT OF.
+        ///
+        /// ⛔ AN `scf.if` DOES NOT IMPLEMENT `DebugNameOpInterface`, so `setDbgNameAttr` takes its
+        /// fallback path and writes a DISCARDABLE attribute named `"dbgName"`
+        /// (`DataflowOpInterfaces.cpp:38-50`, `DataflowInterfaces.td:68`) — which is why it prints in
+        /// the attribute dictionary after the regions rather than inside the operation's own syntax:
+        /// `} {dbgName = "SCF-If #2"}`
+        /// (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:128`).
+        ///
+        /// ⭐ AND IT IS AN OUTPUT OF THE PASS, NOT ONLY OF ITS INPUT. `mergeShallow` (entry 177) ends
+        /// by naming the merged conditional after both halves, so the reference's own expectation
+        /// after two merges is `} {dbgName = "CFGSM(SCF-If #4, CFGSM(SCF-If #2, SCF-If #3))"}`
+        /// (`merging.mlir:59`) — see
+        /// [`crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::new_dbg_name_from_list`].
+        dbg_name: Option<String>,
     },
 
     /// `%r = scf.for %i = %lo to %hi step %st iter_args(%a = %init) -> (index) { .. }` — THE
@@ -127,20 +161,23 @@ pub enum Op {
     },
 }
 
-/// ONE REGION OF AN `scf.if`, WITH ITS OPERAND-LESS TERMINATOR ELIDED.
+/// ONE REGION OF AN `scf.if`, WITH ITS TERMINATOR PRINTED OR ELIDED.
 ///
-/// ⛔ MLIR ELIDES IT BECAUSE THIS OP BINDS NOTHING. `SCF.cpp`'s printer passes
-/// `printBlockTerminators = !getResults().empty()`, and [`Op::If`] carries no result list at all —
-/// deliberately, see its note — so the `scf.yield` a region ends with is never printed. That is what
-/// makes `} else {` followed by a bare `}` the reference's own text
-/// (`dcc/test/PT/issue-236.mlir:70-71`) rather than a region printed with a stray terminator.
+/// ⛔ MLIR ELIDES IT WHEN THE OP BINDS NOTHING. `SCF.cpp`'s printer passes
+/// `printBlockTerminators = !getResults().empty()`, so a result-less conditional's `scf.yield` is
+/// never printed — which is what makes `} else {` followed by a bare `}` the reference's own text
+/// (`dcc/test/PT/issue-236.mlir:70-71`) rather than a region printed with a stray terminator. One
+/// that DOES bind a result prints both terminators, and the vendor writes them:
+/// `scf.yield %c1 : index` inside `%13 = scf.if %12 -> (index)`
+/// (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:129-133`).
 ///
 /// ⭐ ELIDED, NOT DROPPED. The op stays in the region: [`super::regions`] and every walk still see
 /// it, and entry 096's whole job is to put one there.
-fn region(out: &mut String, ops: &[super::Op], depth: usize) {
+fn region(out: &mut String, ops: &[super::Op], depth: usize, print_terminator: bool) {
     for (n, inner) in ops.iter().enumerate() {
         let last = n + 1 == ops.len();
         if last
+            && !print_terminator
             && matches!(inner, super::Op::Scf(Op::Yield { operands }) if operands.is_empty())
         {
             continue;
@@ -208,19 +245,38 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         }
         Op::If {
             cond,
+            results,
             body,
             else_body,
+            dbg_name,
         } => {
-            let _ = writeln!(out, "scf.if {} {{", print::val(*cond));
-            region(out, body, depth);
-            print::indent(out, depth);
-            if else_body.is_empty() {
-                out.push_str("}\n");
+            // ⛔ SCF PARENTHESISES A SINGLE RESULT WHERE AFFINE DOES NOT: the vendor's one-result
+            // form is `%13 = scf.if %12 -> (index) {` (`merging.mlir:129`), against
+            // [`super::affine::Op::If`]'s bare ` -> index` (`issue-236.mlir:59`).
+            let (bound, result_tys) = if results.is_empty() {
+                (String::new(), String::new())
             } else {
+                (
+                    format!("{} = ", print::vals(results)),
+                    format!(" -> ({})", vec!["index"; results.len()].join(", ")),
+                )
+            };
+            let _ = writeln!(out, "{bound}scf.if {}{result_tys} {{", print::val(*cond));
+            // ⭐ THE TERMINATORS PRINT ONLY WHERE MLIR PRINTS THEM — see [`Op::If::results`].
+            region(out, body, depth, !results.is_empty());
+            print::indent(out, depth);
+            if !else_body.is_empty() {
                 out.push_str("} else {\n");
-                region(out, else_body, depth);
+                region(out, else_body, depth, !results.is_empty());
                 print::indent(out, depth);
-                out.push_str("}\n");
+            }
+            // ⛔ AFTER THE REGIONS, NOT BEFORE THEM — a discardable attribute prints in the trailing
+            // dictionary: `} {dbgName = "SCF-If #2"}` (`merging.mlir:128`).
+            match dbg_name {
+                None => out.push_str("}\n"),
+                Some(name) => {
+                    let _ = writeln!(out, "}} {{dbgName = \"{name}\"}}");
+                }
             }
         }
         Op::Yield { operands } => {

@@ -269,6 +269,9 @@ pub fn is_same_list_of_units(key_units: &[DfirOp], src_unit_ops: &[Val]) -> bool
             | DfirOp::Agen(_)
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+            // ⭐ `uniform` JOINS THE `false` SIDE: a `uniformize_regions` binds its own results and a
+            // `query_map` binds an `index`, so neither is the `get_unit` this `dyn_cast` wants.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => return false,
         }
     }
@@ -1416,7 +1419,13 @@ pub fn separate_based_on_destination_units(
                 | DfirOp::Agen(_)
                 | DfirOp::VectorChain(_)
                 | DfirOp::Vector(_)
-                | DfirOp::Symbol(_),
+                | DfirOp::Symbol(_)
+                // ⭐ AND `uniform` JOINS THE DROP SIDE — not vacuously, which is why it is worth a
+                // line. A destination reached INSIDE a local region is a `uniform.query_map` result
+                // (`flatten_local_region4.mlir:355-356`), and neither `dyn_cast` accepts one, so the
+                // reference drops that pair too: the unit such a value stands for is chosen per
+                // region, and this sort is over units named at the definition site.
+                | DfirOp::Uniform(_),
             )
             | None => {}
         }

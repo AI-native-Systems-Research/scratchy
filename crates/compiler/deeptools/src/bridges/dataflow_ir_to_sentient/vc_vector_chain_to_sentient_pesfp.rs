@@ -266,6 +266,10 @@ pub fn legality(op: &DfirOp) -> Legality {
         // memref, uniform, symbol>` (`:1257-1261`) nor the thirteen-op `addIllegalOp` mentions it, and
         // an op a partial conversion never declares illegal survives untouched.
         | DfirOp::Vector(_)
+        // ⭐ AND `uniform` IS IN THAT `addLegalDialect` BY NAME (`:1261`), which is the stronger
+        // statement of the same outcome: a local region's `query_map` result feeds the compute ops
+        // this pass rewrites, so the target declares the dialect legal rather than leaving it unnamed.
+        | DfirOp::Uniform(_)
         | DfirOp::Symbol(_) => Legality::Legal,
     }
 }

@@ -60,7 +60,9 @@
 
 use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::is_operation_selected;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, affine, agen, dataflow, scf};
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, affine, agen, dataflow, scf, uniform,
+};
 use crate::islands::dataflow_ir::{self as dfir};
 
 /// HOW MANY TIMES ONE BOUNDED REWRITE MAY FIRE ON ONE UNIT.
@@ -188,6 +190,15 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
                 walk_preorder(body, visit);
                 walk_preorder(else_body, visit);
             }
+            // ⭐ AND A `uniform.uniformize_regions` HAS ONE REGION PER UNIT CLASS. Every conditional
+            // the scheduler wrote once and mapped onto many units lives inside them, so a walk that
+            // stopped at the op would count a tree with no nodes for exactly the programs this pass
+            // is run on.
+            DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+                for region in regions {
+                    walk_preorder(&region.body, visit);
+                }
+            }
             // no region.
             DfirOp::Arith(_)
             | DfirOp::Affine(_)
@@ -196,6 +207,12 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
             | DfirOp::Agen(_)
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+            // `uniform.yield` terminates one of those regions; the two mapping ops carry none.
+            | DfirOp::Uniform(
+                uniform::Op::Yield { .. }
+                | uniform::Op::DefImmutableMapping { .. }
+                | uniform::Op::QueryMap { .. },
+            )
             | DfirOp::Symbol(_) => {}
         }
     }
@@ -351,8 +368,10 @@ mod unit_tests {
     fn branch(cond: u32, body: Vec<DfirOp>, else_body: Vec<DfirOp>) -> DfirOp {
         DfirOp::Scf(scf::Op::If {
             cond: Val(cond),
+            results: Vec::new(),
             body,
             else_body,
+            dbg_name: None,
         })
     }
 
