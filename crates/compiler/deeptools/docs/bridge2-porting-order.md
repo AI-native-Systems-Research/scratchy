@@ -37,6 +37,27 @@ are ported when tiling lands and the corpus is regenerated.
 - ⛔ `cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel` is the
   acceptance gate. E2E when bridge 1 lands.
 
+## ⛔ MEASURED FOR ENTRIES 230-253: THE EXTRACT DROPS THE STATEMENT THAT DOES THE WORK
+
+Brace-matched from the authority at each unit's cited line and diffed against `source/bridge2.cpp`'s
+body — **not** re-sliced with the recorded `loc`, which is itself one short in every one of the 24.
+**11 of 24 bodies lose at least one real statement**, and in three of them what is lost is the call that
+makes the function have an effect:
+
+| unit | dropped from the extract's body |
+|---|---|
+| **251 `setupForPartitioning`** | **the WHOLE body** — `DT_CHECK(isEligibleForSplitting(all_mem_views))`, `sortDataBasedOnWeight`, `calculatePartitionSizes` (`:825-829`) |
+| **252 `fillPartitions`** | `return nullptr;`, the lambda's `};`, and `dcc::CondNode::walk<kReverseBFS>(cond_tree.getRoot(), addOpsToPartitions)` (`:1180-1184`) — the extract never RUNS the lambda it builds |
+| **239 `insertPTMaskOps`** | `pt_masking_tree->walk(analyzeAndInsertMaskOps);` (`:205`) — same defect |
+| 235 `createSentientConstants` | `rewriter.getI32ArrayAttr(extended_vals));` and `return sentient_vconst_op.getResult();` — the op's values AND its result |
+| 236 `addMaskNode` | `op_to_node_.insert(std::make_pair(mask_related_op, mask_node));` — the node is built and never registered |
+| 253 `adjustForEvenImmutableAddr` | `AffineMap::get`'s `getNumSymbols()`/`getContext()` arguments |
+| 250 `initMASData` | `max_mutable += weight;` |
+| 230 / 241 / 243 / 244 | `llvm_unreachable("unknown type string")` · `return new_for_op;` · `return ret.getResult(0);` · `return true;` |
+
+Benign: 232, 233, 245 and 249 lose only a nested `}` / `});` that the extractor's brace-balancer put
+back. Identical to the authority: 231, 234, 237, 238, 240, 242, 246, 247, 248.
+
 ## Progress
 
 `201/384 ported; 201/384 audited`

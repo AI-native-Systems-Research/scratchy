@@ -1370,9 +1370,9 @@ impl YieldRegion {
 ///
 /// Appending a yield operand does not widen the parent's result list; the parent was built with both
 /// results already — `createForOpWithReturnValue` pushes the `xrfwrptr` and `xrfrdptr` constants on as
-/// the last two iter args (entry 241, `LoweringXRF.cpp:146-147`) and `createIfOpWithReturnValue` asks
+/// the last two iter args (entry 241, `LoweringXRF.cpp:145-146`) and `createIfOpWithReturnValue` asks
 /// for two `IndexType` results and puts a BARE `sentient.yield` in each region before cloning the body
-/// in FRONT of it (entry 242, `LoweringXRF.cpp:192-195`, `:206`, `:212`, `:216`) — so the terminator is
+/// in FRONT of it (entry 242, `LoweringXRF.cpp:192-195`, `:207`, `:212`, `:216`) — so the terminator is
 /// the region's last op — and this closes the region over them. On an op whose result
 /// list is shorter than `idx` the answer is [`None`] — `getResult`'s own assertion — and the pointer
 /// simply has nowhere to be read from, so nothing is emitted rather than a wrong slot being read.

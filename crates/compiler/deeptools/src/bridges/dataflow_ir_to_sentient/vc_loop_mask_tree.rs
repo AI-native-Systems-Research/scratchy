@@ -228,7 +228,7 @@ impl<N> Node<N> {
     /// difference is not taste: that node is built, read and dropped inside one non-mutating walk of
     /// `uniform.uniformize_regions`, and entries 101-104 never look at the op at all. This one is
     /// SEARCHED BY IDENTITY (`findNodeFromOp`, entry 078) and used as an INSERTION POINT
-    /// (`n->getParentNode()->getOperation()`, `LoweringPTMasks.cpp:74`), and [`OpId`] — this crate's
+    /// (`n->getParentNode()->getOperation()`, `LoweringPTMasks.cpp:75`), and [`OpId`] — this crate's
     /// stand-in for `Operation *`, one ordinal per region level — answers both.
     ///
     /// ⛔ `None` IS THE SYNTHETIC ROOT AND ONLY THE ROOT. `new LoopMaskNode(nullptr)`
@@ -1010,10 +1010,10 @@ impl LoopMaskTree {
     /// The one caller is `insertPTMaskOps`, whose action `analyzeAndInsertMaskOps` looks at ONE node's
     /// children at a time and decides what mask ops to emit around it (`LoweringPTMasks.cpp:164-205`).
     /// Breadth-first is what makes that sound: a loop is visited before anything nested inside it, so
-    /// when `verifyLoopNest` walks the nest below a node to prove that no second, different mask
-    /// lives there (`:112-140`), the nodes it inspects have not yet been lowered. A pre-order walk
-    /// would visit the same nodes in a different order and a post-order one would visit the inner
-    /// masks first — the `visited_nodes` set at `:173` is what records the decision this order makes.
+    /// when `verifyLoopNest` re-walks the nest FROM the node itself, once per loop child, to prove no
+    /// second different mask lives there (`:114-138`), the nodes it inspects have not yet been lowered.
+    /// ⚠️ Its `WalkResult::interrupt()` at `:128` is a DISCARDED temporary — `found_mask_node` at `:134`
+    /// is what stops the sibling loop. The `visited_nodes` set at `:173` records what this order decides.
     ///
     /// # ⭐ THE `LoopMaskNode::walk<kBFS>` SPECIALIZATION IS THE CLOSURE BELOW
     ///

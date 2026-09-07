@@ -5532,7 +5532,7 @@ fn with_terminator(mut ops: Vec<DfirOp>) -> Vec<DfirOp> {
 /// One row of the reference's `SmallVector<SmallVector<int64_t>>`, with the dimension it belongs to
 /// attached. ⭐ THE `dim` IS NOT DECORATION: the reference recovers it by re-indexing
 /// `mas_data[p].dim_` at every use, and `fillPartitions` pairs a row with a `mas_data` entry
-/// (`:1122-1136`) — a row that carries its own dimension cannot be paired with the wrong one.
+/// (`:1119`, `:1148`, `:1151`) — a row carrying its own dimension cannot be paired with the wrong one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DimCoefficients {
     /// `mas_data[p].dim_` — the position in the subscripts map this row is about.
