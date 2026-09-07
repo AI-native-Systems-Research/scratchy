@@ -155,7 +155,11 @@ pub struct TripCount(i64);
 
 impl TripCount {
     /// THE ONLY CONSTRUCTOR — a non-positive count is not a trip count.
-    fn positive(trips: i64) -> Option<Self> {
+    ///
+    /// ⭐ SHARED WITH ENTRY 195, which asks `loopUnrollByFactor` for the same quantity from a loop's
+    /// own three constants — see
+    /// [`LoopRewrite`](super::tf_transform_loop_to_legalize_for_sentient_lowering::LoopRewrite).
+    pub(crate) fn positive(trips: i64) -> Option<Self> {
         (trips > 0).then_some(Self(trips))
     }
 

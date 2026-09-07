@@ -77,6 +77,7 @@
 //!
 //! Original files homed here: `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp`, `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp`
 
+use super::tf_program_units_reduction::HighPreference;
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::ProgramUnit;
 use crate::islands::dataflow_ir::dialects::{
@@ -433,6 +434,12 @@ pub enum EquivalenceTag {
     LoopMerging,
     /// `"loop-absorption"` — likewise (`Sentient/LoopAbsorption.cpp:18-19`, `:43`).
     LoopAbsorption,
+    /// `"program-units-reduction"` — `ProgramUnitsReduction`'s own comparison, the one site that
+    /// passes a [`HighPreference`] (`Dataflow/ProgramUnitsReduction.cpp:136`).
+    ///
+    /// ⛔ THE TAG IS A LITERAL HERE, NOT `DEBUG_TYPE`. `ProgramUnitsReduction.cpp` defines no
+    /// `DEBUG_TYPE` at all, so this string is the only name that comparison traces under.
+    ProgramUnitsReduction,
 }
 
 impl EquivalenceTag {
@@ -445,6 +452,7 @@ impl EquivalenceTag {
             EquivalenceTag::CfgDeepMergingCondTree => "cfg-deep-merging-cond-tree",
             EquivalenceTag::LoopMerging => "loop-merging",
             EquivalenceTag::LoopAbsorption => "loop-absorption",
+            EquivalenceTag::ProgramUnitsReduction => "program-units-reduction",
         }
     }
 }
@@ -491,25 +499,30 @@ pub enum EquivalenceCache {
 
 /// HOW ONE ANALYSIS COMPARES TWO OPERATIONS — `dcc::OperationEquivalence`'s configuration.
 ///
-/// # ⛔⛔ NO FUNCTOR, BECAUSE NOTHING IN THE REFERENCE EVER PASSES ONE
+/// # ⛔⛔ ONE SITE IN THE REFERENCE DOES PASS A FUNCTOR, AND IT IS ENTRY 193
 ///
 /// The six-argument constructor takes `function_ref<bool(Operation&, Operation&, void*)> functor`
-/// and a `void *extent` for it to read (`dcc/src/Analysis/OperationEquivalence.hpp:35-45`), and
-/// `functor_` is consulted at `OperationEquivalence.cpp:116`. All five construction sites in `dcc`
+/// and a `void *extent` for it to read (`dcc/src/Analysis/OperationEquivalence.hpp:36-45`), and
+/// `functor_` is consulted at `OperationEquivalence.cpp:116` under the comment *"Functor carries
+/// higher precedence as it is user-controlled."* Six of the seven sites that use that constructor
 /// pass `nullptr, nullptr` — this file's `:112`, `CFGSSentientLevelConditionalTree.hpp:316`,
-/// `CFGDeepMergingConditionalTree.hpp:29`, `LoopMerging.cpp:58` and `LoopAbsorption.cpp:43` — and the
-/// three-argument constructor leaves it default-constructed, which for a `function_ref` is null. ⭐ SO
-/// THE OVERRIDE HOOK IS DEAD IN THE WHOLE REFERENCE, and modelling it would be modelling a
-/// possibility no input can reach. (The per-call `operands_equiv_checker` on
-/// `operationsAreEquivalent` is a different parameter and is used; it belongs to the call, not here.)
+/// `CFGDeepMergingConditionalTree.hpp:29`, `LoopMerging.cpp:58`, `LoopAbsorption.cpp:43` and
+/// `LoopRolling.cpp:987` — and the three-argument constructor leaves it default-constructed, which
+/// for a `function_ref` is null. **The seventh is `ProgramUnitsReduction.cpp:103-136`**, whose lambda
+/// is what makes a program unit's core and corelet ids parametric. So the field is
+/// [`HighPreference`], not an omission. (The per-call `operands_equiv_checker` on
+/// `operationsAreEquivalent` is a different parameter and is also used; it belongs to the call, not
+/// here.)
 ///
-/// ⚠️ `eq_classes_` IS NOT A FIELD HERE EITHER: it is the memo the comparison fills as it runs, which
-/// is the mechanism the brief lets a port drop, and it arrives with whichever unit ports
+/// ⚠️ `eq_classes_` IS NOT A FIELD HERE: it is the memo the comparison fills as it runs, which is the
+/// mechanism the brief lets a port drop, and it arrives with whichever unit ports
 /// `operationsAreEquivalent` — a function of `dcc/src/Analysis/`, outside the 384.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationEquivalence {
     /// `debug_` — which `-debug-only=` name this comparison traces under.
     pub debug: EquivalenceTag,
+    /// `functor_` together with the `context_` it reads — the positive-only override.
+    pub preference: HighPreference,
     /// `do_recursive_compare_`.
     pub subregions: SubregionCompare,
     /// `all_block_args_are_equiv_`.
@@ -533,8 +546,27 @@ impl OperationEquivalence {
     ) -> Self {
         Self {
             debug,
+            preference: HighPreference::None,
             subregions,
             block_args,
+            cache: EquivalenceCache::Reuse,
+        }
+    }
+
+    /// THE FUNCTOR FORM WITH ALL THREE BOOLS LEFT AT THEIR DEFAULTS — what
+    /// `ProgramUnitsReduction.cpp:103-136` constructs.
+    ///
+    /// ⭐ THE DEFAULTS ARE THE WHOLE OF WHAT THAT SITE SAYS ABOUT THEM. It names `functor`, `extent`
+    /// and `debug` and stops, so `do_recursive_compare`, `all_block_args_are_equiv` and
+    /// `use_equiv_classes` all take `true` (`OperationEquivalence.hpp:36-45`) — the same three values
+    /// a bare `dcc::OperationEquivalence oe;` gets.
+    #[must_use]
+    pub const fn preferring(preference: HighPreference, debug: EquivalenceTag) -> Self {
+        Self {
+            debug,
+            preference,
+            subregions: SubregionCompare::Recursive,
+            block_args: BlockArgEquivalence::AllEquivalent,
             cache: EquivalenceCache::Reuse,
         }
     }
@@ -871,6 +903,7 @@ mod unit_tests {
             tree.oe,
             OperationEquivalence {
                 debug: EquivalenceTag::CfgMergingAndHoistingCondTree,
+                preference: HighPreference::None,
                 subregions: SubregionCompare::Recursive,
                 block_args: BlockArgEquivalence::SameOwnerAndIndex,
                 cache: EquivalenceCache::Reuse,
@@ -1599,9 +1632,9 @@ impl ConditionalKind {
                 | affine::Op::VectorLoad { .. }
                 | affine::Op::VectorStore { .. },
             ) => None,
-            DfirOp::Scf(
-                scf::Op::Yield { .. } | scf::Op::Parallel { .. } | scf::Op::For { .. },
-            ) => None,
+            DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. } | scf::Op::For { .. }) => {
+                None
+            }
 
             // ── dialects `isa<AffineIfOp, IfOp>` does not mention at all ─────────────────────────
             DfirOp::Arith(_)
