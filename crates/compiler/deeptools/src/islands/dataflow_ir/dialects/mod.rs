@@ -119,6 +119,17 @@ pub fn operands(op: &Op) -> Vec<Val> {
             // arguments — values it DEFINES — so counting them here would make every loop a user of
             // its own variable.
             scf::Op::Parallel { ivs: _, body: _ } => {}
+            // ⭐ ALL THREE BOUNDS ARE OPERANDS — `scf.for`'s lower bound, upper bound and step are
+            // SSA values it reads, which is exactly why the trip count has to be reconstructed from
+            // their defining constants (`LoopUnrollForShuffleOp.cpp:168-170`). The `iv` is the
+            // region's argument, not an operand, same as `scf.parallel`'s.
+            scf::Op::For {
+                iv: _,
+                lo,
+                hi,
+                step,
+                body: _,
+            } => reads.extend([*lo, *hi, *step]),
             scf::Op::If { cond, .. } => reads.push(*cond),
             scf::Op::Yield { operands } => reads.extend(operands.iter().copied()),
         },
@@ -261,8 +272,9 @@ pub fn results(op: &Op) -> Vec<Val> {
             | arith::Op::DenseConstant { result, .. } => vec![*result],
             arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => vec![bin.result],
         },
-        // ⛔ NONE OF THE THREE BINDS A RESULT IN THIS ISLAND. `scf.if`'s and `scf.parallel`'s
-        // results would be the values their yields carry, and nothing this crate emits reads one.
+        // ⛔ NONE OF THE FOUR BINDS A RESULT IN THIS ISLAND. `scf.if`'s and `scf.parallel`'s
+        // results would be the values their yields carry, `scf.for`'s would be its `iter_args`, and
+        // nothing this crate emits reads one — see [`scf::Op::For`].
         Op::Scf(_) => Vec::new(),
         Op::Affine(op) => match op {
             // ⭐ A CARRYING LOOP DOES BIND RESULTS — one per `iter_args` entry, which is how the
@@ -354,6 +366,15 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         },
         Op::Scf(op) => match op {
             scf::Op::Parallel { ivs: _, body: _ } => {}
+            // ⭐ THE THREE BOUNDS ARE PLAIN VALUES, WHICH IS WHY THIS ARM IS SHORTER THAN
+            // `affine.for`'s: an `scf.for` has no `Bound` to unwrap and no `iter_args` to re-point.
+            scf::Op::For {
+                iv: _,
+                lo,
+                hi,
+                step,
+                body: _,
+            } => places.extend([lo, hi, step]),
             scf::Op::If { cond, .. } => places.push(cond),
             scf::Op::Yield { operands } => places.extend(operands.iter_mut()),
         },
@@ -567,6 +588,11 @@ pub fn block_args(op: &Op) -> Vec<Val> {
             args
         }
         Op::Scf(scf::Op::Parallel { ivs, .. }) => ivs.clone(),
+        // ⭐ AND `scf.for` BINDS ITS INDUCTION VARIABLE THE SAME WAY. `runOnOperation` reaches this
+        // loop by asking whether a shuffle's variable IS this argument
+        // (`LoopUnrollForShuffleOp.cpp:97`), so a walk that did not report it would never find a
+        // candidate.
+        Op::Scf(scf::Op::For { iv, .. }) => vec![*iv],
         // ⭐ THE COMPOSITE TRANSFER'S `load_iv` IS ITS REGION'S ARGUMENT — the loaded vector the
         // body reads. `getLoadInductionVar()` is what `getLoadConsumer` roots a composite load's
         // consumer chain at (`Helper.cpp:1250`).
@@ -584,7 +610,8 @@ pub fn block_args(op: &Op) -> Vec<Val> {
 #[must_use]
 pub fn regions(op: &Op) -> Vec<&[Op]> {
     match op {
-        Op::Affine(affine::Op::For { body, .. }) | Op::Scf(scf::Op::Parallel { body, .. }) => {
+        Op::Affine(affine::Op::For { body, .. })
+        | Op::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. }) => {
             vec![body.as_slice()]
         }
         Op::Scf(scf::Op::If {

@@ -188,6 +188,32 @@ pub trait Arch {
     /// `reservedProgLxAddr` (`sysdef.cpp:237`), stick `0x3f00` — where the program region starts.
     const RESERVED_PROG_LX_ADDR: Sticks;
 
+    /// HOW WIDE AN L3 **EAR** IS — `regInfoPerUnit[L3LU][RegType::EAR].bitSize`, 21 on every arch
+    /// (`sysdef.cpp:313-314`, and `:336-337` for `L3SU`).
+    ///
+    /// ⭐ THE EXTERNAL **ADDRESS** REGISTER, which is the MUTABLE half of an external address: what a
+    /// transfer's address may reach without splitting is `2^bitSize` sticks of it
+    /// (`MutableAddrSplitting.cpp:673-681`).
+    ///
+    /// ⛔ BOUNDED SO THE RANGE CANNOT OVERFLOW. The range the splitting pass computes from this is
+    /// `2^bitSize * bytesPerStick * 8`, returned as an `int64_t`; a register wider than 52 bits would
+    /// overflow the reference's own return type with a 128-byte stick. The bound is that type, not a
+    /// guess, and [`Bounded::at`] checks it where the arch writes the number.
+    const L3_EAR_BITS: Bounded<53>;
+
+    /// HOW WIDE AN L3 **EBR** IS — `regInfoPerUnit[L3LU][RegType::EBR].bitSize`.
+    ///
+    /// ⛔⛔ THIS ONE IS ARCH-DEPENDENT WHERE THE EAR IS NOT: 30 bits on `coreArch <= RCUDD1A_ISA`
+    /// (`sysdef.cpp:321-322`) and 32 from SEN1P5 (`sysdef.cpp:331-332`) — the same split the store
+    /// half declares at `:344-345` and `:354-355`. The IMMUTABLE range a program may occupy is four
+    /// times larger on SEN1P5 for that reason alone, so reading one arch's number on the other
+    /// under- or over-states the space the splitting pass believes it has
+    /// (`MutableAddrSplitting.cpp:683-692`).
+    ///
+    /// ⭐ AND THE SAME BRANCH DELETES THE `LBR`, which is the note the reference leaves beside it:
+    /// *"NO LBR for sentient1.5"*.
+    const L3_EBR_BITS: Bounded<53>;
+
     /// A COUNT OF STICKS IN BYTES. On the arch and not a `From`, because the factor is
     /// [`Arch::BYTES_PER_STICK`] and a free conversion would be one that had to assume it.
     #[must_use]
@@ -231,6 +257,8 @@ impl Arch for Dd2 {
     const HBM_SEGMENTS: u32 = 8;
     const EBR_GRANULARITY: Sticks = Sticks(1);
     const RESERVED_PROG_LX_ADDR: Sticks = Sticks(0x3f00);
+    const L3_EAR_BITS: Bounded<53> = Bounded::at::<21>();
+    const L3_EBR_BITS: Bounded<53> = Bounded::at::<30>();
 }
 
 /// THE SEN1P5 GENERATION — `SEN1P5_ISA`.
@@ -262,6 +290,8 @@ impl Arch for Sen1p5 {
     const HBM_SEGMENTS: u32 = 32;
     const EBR_GRANULARITY: Sticks = Sticks(2);
     const RESERVED_PROG_LX_ADDR: Sticks = Sticks(0x3f00);
+    const L3_EAR_BITS: Bounded<53> = Bounded::at::<21>();
+    const L3_EBR_BITS: Bounded<53> = Bounded::at::<32>();
 }
 
 /// 🛑 EXACTLY ONE ARCH FEATURE. Both is a compiler built for one machine against another's tables;

@@ -157,7 +157,9 @@ fn is_selected(op: &DfirOp) -> bool {
         DfirOp::Scf(scf::Op::If { .. }) => true,
 
         // ── everything else, spelled out where the predicate names the dialect ───────────────────
-        DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. }) => false,
+        DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. } | scf::Op::For { .. }) => {
+            false
+        }
         DfirOp::Affine(
             affine::Op::For { .. }
             | affine::Op::Apply { .. }
