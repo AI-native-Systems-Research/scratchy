@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`41/384 ported; 41/384 audited`
+`49/384 ported; 49/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -52,9 +52,11 @@ and `AccessDetailsAffineComposite`'s constructor plus its time setters (`setTime
 (extract) pattern: `setStrides` and `has` (`agen_access_details.rs`), the two
 `construct*Stmt` overloads and `insertCopyAndAddStmtsHelper` (`agen_agen_to_sentient.rs`), and
 `getLoopNestLevel`, `checkIndirectMemViewForExtractOp` and `findExtractScalarOp`
-(`agen_helper.rs`). Unticked by their own audits and
-awaiting re-port with their emission: `setldtype`, `generateSetSendDestinationStmts`,
-`getLoadConsumer`.
+(`agen_helper.rs`), and entries 033-040 — the AgenToSentient load-consumer chain
+(`getLoadConsumer`, `setldtype`, `generateSetSendDestinationStmts`,
+`getStoreOpFromLoadStorePattern`, `findCandidateForLowering`, `addLoadChainToDeleteList`, all in
+`agen_helper.rs`) plus `isSenComponentL0LU`/`isSenComponentL0SU`
+(`dfs_dataflow_to_sentient.rs`).
 
 ⭐ AND ENTRIES 049-056 — the six `StandardToSentient` scalar lowerings (`LowerAddIOpToSentient`,
 `LowerSubIOpToSentient`, `LowerMulIOpToSentient`, the `If` shape law, `LowerConstantIndexToSentient`,
@@ -85,6 +87,28 @@ terminator alone because `scf` is already legal in its target.
 What it states is the SHAPE a conjunction lowers to, and that is what `NestedIf` holds; the recursion
 around it stays entry 338's. ⛔ The comment names `lhs` as the outer `if` while the code returns
 `rhs_if_op` (`:175`) — the emitted nest has the RIGHT-hand conjunct outermost.
+
+⭐ **THE THREE THAT WERE UNTICKED BY THEIR OWN AUDITS ARE NOW RE-PORTED WITH THEIR EMISSION.**
+`getLoadConsumer`, `setldtype` and `generateSetSendDestinationStmts` had been reduced to documented
+predicates; `generate_set_send_destination_stmts` now builds the `sentient.set_send_dst` and a test
+checks the three the vendor's own golden expects, verbatim
+(`dcc/test/Conversion/AgenToSentient/lx-to-sfp-bypass-1.mlir:47,55,63`).
+
+⭐ **WHAT ENTRIES 033-040 NEEDED FROM THE ISLANDS, added rather than worked around.**
+`islands/dataflow_ir/dialects/mod.rs` gained the operand/result/region/use census — `uses()` counts
+one entry per USE and descends into regions, which is what `hasOneUse()` means and what a previous
+attempt's shape-matching faked. `GenericComp` grew from 6 variants to the ones that are
+`senCompToGenericComp`'s true image, because the port could not tell `l0lu` from `l0su` while they
+folded onto one `L0`. `DfirUnit` gained `CrossPtnLink` (the fourth member of the SFP-bypass set) and
+`vectorchain::Op::Rotate` (the third rearrangement the two chain functions name). `link.rs` gained
+`PtRowUnit<ROW>`, `L0su`, `L0lu` and `CrossPtnLink` markers, because `dataflow.send %pt, %9` — a line
+in the reference's own test input — was not constructible.
+
+⛔ **THREE DISCREPANCIES THE 033-040 AUDITS FOUND IN THE REFERENCE**, each recorded beside the port
+that carries it: `getLoadConsumer`'s comment promises a `storeOp` arm the code does not have (so a
+stored load hits `emitError("unsupported loadOp consumer!")`); `generateSetSendDestinationStmts`
+binds `map_op` and never reads it; `addLoadChainToDeleteList` dereferences
+`*user->getUsers().begin()` on a rearrangement whose result nothing reads.
 
 
 ## Level 0
@@ -153,22 +177,22 @@ around it stays entry 338's. ⛔ The comment names `lhs` as the outer `if` while
 - [x] **AUDIT 031/384** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, line by line against the C++
 - [x] **PORT 032/384** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, 20 lines
 - [x] **AUDIT 032/384** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, line by line against the C++
-- [ ] **PORT 033/384** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
-- [ ] **AUDIT 033/384** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, line by line against the C++
-- [ ] **PORT 034/384** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
-- [ ] **AUDIT 034/384** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, line by line against the C++
-- [ ] **PORT 035/384** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
-- [ ] **AUDIT 035/384** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, line by line against the C++
-- [ ] **PORT 036/384** `getStoreOpFromLoadStorePattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2872`, 8 lines
-- [ ] **AUDIT 036/384** `getStoreOpFromLoadStorePattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2872`, line by line against the C++
-- [ ] **PORT 037/384** `findCandidateForLowering` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2884`, 12 lines
-- [ ] **AUDIT 037/384** `findCandidateForLowering` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2884`, line by line against the C++
-- [ ] **PORT 038/384** `addLoadChainToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2975`, 9 lines
-- [ ] **AUDIT 038/384** `addLoadChainToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2975`, line by line against the C++
-- [ ] **PORT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, 2 lines
-- [ ] **AUDIT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, line by line against the C++
-- [ ] **PORT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, 2 lines
-- [ ] **AUDIT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, line by line against the C++
+- [x] **PORT 033/384** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
+- [x] **AUDIT 033/384** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, line by line against the C++
+- [x] **PORT 034/384** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
+- [x] **AUDIT 034/384** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, line by line against the C++
+- [x] **PORT 035/384** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
+- [x] **AUDIT 035/384** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, line by line against the C++
+- [x] **PORT 036/384** `getStoreOpFromLoadStorePattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2872`, 8 lines
+- [x] **AUDIT 036/384** `getStoreOpFromLoadStorePattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2872`, line by line against the C++
+- [x] **PORT 037/384** `findCandidateForLowering` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2884`, 12 lines
+- [x] **AUDIT 037/384** `findCandidateForLowering` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2884`, line by line against the C++
+- [x] **PORT 038/384** `addLoadChainToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2975`, 9 lines
+- [x] **AUDIT 038/384** `addLoadChainToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2975`, line by line against the C++
+- [x] **PORT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, 2 lines
+- [x] **AUDIT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, line by line against the C++
+- [x] **PORT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, 2 lines
+- [x] **AUDIT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, line by line against the C++
 - [ ] **PORT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, 11 lines
 - [ ] **AUDIT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, line by line against the C++
 - [ ] **PORT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, 10 lines

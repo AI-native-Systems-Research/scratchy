@@ -74,3 +74,330 @@ pub enum Op {
     /// `VectorChain.td` — everything the PE and the SFP compute.
     VectorChain(vectorchain::Op),
 }
+
+// ─────────────────────────────── THE USE LIST ────────────────────────────────
+
+/// EVERY VALUE ONE OP **READS**, in the order the op names them.
+///
+/// # 🛑 THIS EXISTS SO THAT `hasOneUse` CAN BE ASKED HONESTLY
+///
+/// ⛔⛔ A SEARCH THAT ONLY INSPECTS THE OPS IT EXPECTS CANNOT COUNT USES. `getLoadConsumer`
+/// (`Helper.cpp:1256`) refuses a load whose result has more than one use, and the whole point of that
+/// refusal is the use it did not expect — a compute that also reads the loaded vector. A census
+/// restricted to sends and rearrangements would report one use for a value that has three and the
+/// refusal would never fire.
+///
+/// ⛔ SO IT IS TOTAL OVER THE ENUM, WITH NO WILDCARD ANYWHERE. A new op must state what it reads;
+/// falling through to "nothing" would silently under-count.
+///
+/// ⛔ AND IT DOES NOT DESCEND INTO REGIONS. An op's operands are its own; a value read inside an
+/// `affine.for` body is read by the op in that body, which is what [`uses`] walks.
+#[must_use]
+pub fn operands(op: &Op) -> Vec<Val> {
+    let mut reads: Vec<Val> = Vec::new();
+    match op {
+        Op::Arith(op) => match op {
+            // A literal reads nothing.
+            arith::Op::Constant { .. }
+            | arith::Op::ConstantInt { .. }
+            | arith::Op::DenseConstant { .. } => {}
+            // ⭐ THE ADDRESS ARITHMETIC READS TWO VALUES. `insertCopyAndAddStmtsHelper` closes a
+            // carrying loop with `arith.addi %iter_arg, %c<coeff>` (`AgenToSentient.hpp:502-520`),
+            // and BOTH the carried argument and the coefficient constant are uses of their values.
+            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+                reads.extend([bin.lhs, bin.rhs]);
+            }
+            arith::Op::Compare { iv, against, .. } => reads.extend([*iv, *against]),
+            arith::Op::Logic { operands, .. } => reads.extend(operands.iter().copied()),
+        },
+        Op::Scf(op) => match op {
+            // ⛔ THE INDUCTION VARIABLES ARE NOT OPERANDS. `scf.parallel`'s `ivs` are the region's
+            // arguments — values it DEFINES — so counting them here would make every loop a user of
+            // its own variable.
+            scf::Op::Parallel { ivs: _, body: _ } => {}
+            scf::Op::If { cond, .. } => reads.push(*cond),
+            scf::Op::Yield { operands } => reads.extend(operands.iter().copied()),
+        },
+        Op::Affine(op) => match op {
+            // Same as `scf.parallel`: `iv` is the body's argument, not an operand. A dynamic bound
+            // IS one.
+            affine::Op::For {
+                iv: _,
+                lo,
+                hi,
+                carried,
+                body: _,
+            } => {
+                for bound in [lo, hi] {
+                    if let affine::Bound::Val(val) = bound {
+                        reads.push(*val);
+                    }
+                }
+                // ⭐ AN `iter_args` INITIALISER IS AN OPERAND OF THE LOOP, evaluated outside it —
+                // so the address a carrying loop starts from is USED by the `affine.for` itself.
+                // Its `arg` and its `result` are not: they are [`block_args`] and [`results`].
+                reads.extend(carried.iter().map(|carried| carried.init));
+            }
+            affine::Op::Apply { args, .. } => reads.extend(args.iter().copied()),
+            affine::Op::Yield { operands } => reads.extend(operands.iter().copied()),
+            affine::Op::VectorLoad { view, indices, .. } => {
+                reads.push(*view);
+                index_operands(indices, &mut reads);
+            }
+            affine::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                reads.extend([*value, *view]);
+                index_operands(indices, &mut reads);
+            }
+        },
+        Op::Dataflow(op) => match op {
+            dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetLocalUnit { of, .. } => reads.push(*of),
+            dataflow::Op::GetLogicalMemoryView { from, start, .. } => reads.extend([*from, *start]),
+            dataflow::Op::ProgramUnit { units, .. } => reads.extend(units.iter().copied()),
+            // ⭐ THE SEND'S DESTINATION IS AN OPERAND, and it is the one `getLoadConsumer` follows
+            // back to a `get_unit` (`Helper.cpp:1266`).
+            dataflow::Op::Send { to, data, .. } => reads.extend([to.val(), *data]),
+            dataflow::Op::Receive { from, .. } => reads.push(from.val()),
+            dataflow::Op::SyncSend { to, .. } => reads.push(*to),
+            dataflow::Op::SyncRecv { from, .. } => reads.push(*from),
+            dataflow::Op::ImplicitSync {
+                view, dst, size, ..
+            } => reads.extend([*view, *dst, *size]),
+        },
+        Op::Agen(op) => match op {
+            agen::Op::Yield => {}
+            agen::Op::VectorLoad { view, indices, .. } => {
+                reads.push(*view);
+                index_operands(indices, &mut reads);
+            }
+            agen::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                reads.extend([*value, *view]);
+                index_operands(indices, &mut reads);
+            }
+            // ⛔ `load_iv` IS THE REGION'S ARGUMENT, not an operand — see [`block_args`].
+            agen::Op::CompositeLoadAndStore(transfer) => {
+                reads.push(transfer.src);
+                index_operands(&transfer.src_indices, &mut reads);
+                reads.push(transfer.dst);
+                index_operands(&transfer.dst_indices, &mut reads);
+            }
+        },
+        Op::VectorChain(op) => match op {
+            vectorchain::Op::ConstantBitstream { .. }
+            | vectorchain::Op::CreateAffineMask { .. } => {}
+            vectorchain::Op::Estimate { input, .. }
+            | vectorchain::Op::ScanWithGap { input, .. }
+            | vectorchain::Op::Select { input, .. }
+            | vectorchain::Op::Shuffle { input, .. }
+            | vectorchain::Op::Cast { input, .. } => reads.push(*input),
+            vectorchain::Op::Rotate {
+                input, position, ..
+            } => reads.extend([*input, *position]),
+            vectorchain::Op::Multiply { a, b, .. } => reads.extend([*a, *b]),
+            vectorchain::Op::MultiplyAccumulate { a, b, acc, .. } => reads.extend([*a, *b, *acc]),
+            vectorchain::Op::ElementWiseCompare { op1, op2, mask, .. } => {
+                reads.extend([*op1, *op2]);
+                reads.extend(mask.map(|m| m.val()));
+            }
+            vectorchain::Op::ElementWiseSelection {
+                cond,
+                lhs,
+                rhs,
+                mask,
+                ..
+            } => {
+                reads.extend([cond.val(), *lhs, *rhs]);
+                reads.extend(mask.map(|m| m.val()));
+            }
+            vectorchain::Op::Binary { op1, op2, mask, .. } => {
+                reads.extend([*op1, *op2]);
+                reads.extend(mask.map(|m| m.val()));
+            }
+        },
+    }
+    reads
+}
+
+/// THE VALUES AN OP **DEFINES AS RESULTS** — what `getDefiningOp` answers this op for.
+///
+/// ⛔ RESULTS ONLY. A region argument is defined by no op at all, and MLIR's `getDefiningOp()`
+/// returns null for one — a distinction `getLoadConsumer` depends on, since a send whose `to` is a
+/// block argument yields the null second half of its pair (`Helper.cpp:1266`). Those are
+/// [`block_args`].
+#[must_use]
+pub fn results(op: &Op) -> Vec<Val> {
+    match op {
+        Op::Arith(op) => match op {
+            arith::Op::Constant { result, .. }
+            | arith::Op::ConstantInt { result, .. }
+            | arith::Op::Compare { result, .. }
+            | arith::Op::Logic { result, .. }
+            | arith::Op::DenseConstant { result, .. } => vec![*result],
+            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => vec![bin.result],
+        },
+        // ⛔ NONE OF THE THREE BINDS A RESULT IN THIS ISLAND. `scf.if`'s and `scf.parallel`'s
+        // results would be the values their yields carry, and nothing this crate emits reads one.
+        Op::Scf(_) => Vec::new(),
+        Op::Affine(op) => match op {
+            // ⭐ A CARRYING LOOP DOES BIND RESULTS — one per `iter_args` entry, which is how the
+            // address a nest computes leaves it (`AgenToSentient.hpp:502-520`). A plain counted
+            // loop carries nothing and binds nothing.
+            affine::Op::For { carried, .. } => {
+                carried.iter().map(|carried| carried.result).collect()
+            }
+            affine::Op::Yield { .. } | affine::Op::VectorStore { .. } => Vec::new(),
+            affine::Op::Apply { result, .. } | affine::Op::VectorLoad { result, .. } => {
+                vec![*result]
+            }
+        },
+        Op::Dataflow(op) => match op {
+            dataflow::Op::GetUnit { result, .. }
+            | dataflow::Op::GetLocalUnit { result, .. }
+            | dataflow::Op::GetLogicalMemoryView { result, .. }
+            | dataflow::Op::Receive { result, .. } => vec![*result],
+            // ⛔ `dataflow.send` HAS NO RESULT (`Dataflow.td`), which is why `getLoadConsumer`
+            // returns the send op itself rather than a value.
+            dataflow::Op::ProgramUnit { .. }
+            | dataflow::Op::Send { .. }
+            | dataflow::Op::SyncSend { .. }
+            | dataflow::Op::SyncRecv { .. }
+            | dataflow::Op::ImplicitSync { .. }
+            | dataflow::Op::Opaque { .. } => Vec::new(),
+        },
+        Op::Agen(op) => match op {
+            agen::Op::VectorLoad { result, .. } => vec![*result],
+            agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
+                Vec::new()
+            }
+        },
+        Op::VectorChain(op) => match op {
+            vectorchain::Op::Estimate { result, .. }
+            | vectorchain::Op::ScanWithGap { result, .. }
+            | vectorchain::Op::Select { result, .. }
+            | vectorchain::Op::Multiply { result, .. }
+            | vectorchain::Op::MultiplyAccumulate { result, .. }
+            | vectorchain::Op::ElementWiseCompare { result, .. }
+            | vectorchain::Op::ElementWiseSelection { result, .. }
+            | vectorchain::Op::Binary { result, .. }
+            | vectorchain::Op::ConstantBitstream { result, .. }
+            | vectorchain::Op::Shuffle { result, .. }
+            | vectorchain::Op::Rotate { result, .. }
+            | vectorchain::Op::Cast { result, .. }
+            | vectorchain::Op::CreateAffineMask { result, .. } => vec![*result],
+        },
+    }
+}
+
+/// THE VALUES AN OP'S REGIONS BIND — arguments, which no op defines.
+#[must_use]
+pub fn block_args(op: &Op) -> Vec<Val> {
+    match op {
+        // ⭐ THE REGION BINDS THE INDUCTION VARIABLE FIRST, THEN ONE ARGUMENT PER CARRIED VALUE —
+        // the order `affine.for`'s body block declares them in.
+        Op::Affine(affine::Op::For { iv, carried, .. }) => {
+            let mut args = vec![*iv];
+            args.extend(carried.iter().map(|carried| carried.arg));
+            args
+        }
+        Op::Scf(scf::Op::Parallel { ivs, .. }) => ivs.clone(),
+        // ⭐ THE COMPOSITE TRANSFER'S `load_iv` IS ITS REGION'S ARGUMENT — the loaded vector the
+        // body reads. `getLoadInductionVar()` is what `getLoadConsumer` roots a composite load's
+        // consumer chain at (`Helper.cpp:1250`).
+        Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.load_iv],
+        Op::Arith(_)
+        | Op::Affine(_)
+        | Op::Scf(_)
+        | Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_) => Vec::new(),
+    }
+}
+
+/// THE OPS AN OP'S REGIONS HOLD, in the order they are written.
+#[must_use]
+pub fn regions(op: &Op) -> Vec<&[Op]> {
+    match op {
+        Op::Affine(affine::Op::For { body, .. }) | Op::Scf(scf::Op::Parallel { body, .. }) => {
+            vec![body.as_slice()]
+        }
+        Op::Scf(scf::Op::If {
+            body, else_body, ..
+        }) => vec![body.as_slice(), else_body.as_slice()],
+        Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
+        Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
+        Op::Arith(_)
+        | Op::Affine(_)
+        | Op::Scf(_)
+        | Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_) => Vec::new(),
+    }
+}
+
+/// EVERY **USE** OF ONE VALUE IN `scope`, INNERMOST OPS INCLUDED — one entry per use.
+///
+/// ⛔⛔ ONE ENTRY PER USE, NOT PER USER, because that is what MLIR counts. `Value::hasOneUse()` is
+/// false for a value one op reads twice, and `getUsers()` is a mapped range over the same use list —
+/// so `uses(v, scope).len() == 1` is exactly `hasOneUse()` and `uses(v, scope).first()` is exactly
+/// `*getUsers().begin()`.
+///
+/// ⛔ AND IT DESCENDS INTO REGIONS. A load's result is read by a send inside an `affine.for` body,
+/// and a walk that stopped at the top level would call that value unused.
+#[must_use]
+pub fn uses(of: Val, scope: &[Op]) -> Vec<&Op> {
+    let mut users: Vec<&Op> = Vec::new();
+    for op in scope {
+        for read in operands(op) {
+            if read == of {
+                users.push(op);
+            }
+        }
+        for region in regions(op) {
+            users.extend(uses(of, region));
+        }
+    }
+    users
+}
+
+/// THE OP THAT DEFINES A VALUE AS A RESULT — `Value::getDefiningOp()`.
+///
+/// ⛔ `None` FOR A REGION ARGUMENT, which is what the reference gets as a null pointer. See
+/// [`results`].
+#[must_use]
+pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
+    for op in scope {
+        if results(op).contains(&val) {
+            return Some(op);
+        }
+        for region in regions(op) {
+            if let Some(found) = defining_op(val, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// THE SSA VALUES ONE INDEX LIST READS.
+///
+/// ⛔ A STRIDED SUM READS EVERY VARIABLE IN IT. `%arg9 + %arg8 * 8` is two uses, not one — see
+/// [`Index::Strided`].
+fn index_operands(indices: &[Index], into: &mut Vec<Val>) {
+    for index in indices {
+        match index {
+            Index::Val(val) => into.push(*val),
+            Index::Const(_) => {}
+            Index::Strided(terms, _) => into.extend(terms.iter().map(|(val, _)| *val)),
+        }
+    }
+}

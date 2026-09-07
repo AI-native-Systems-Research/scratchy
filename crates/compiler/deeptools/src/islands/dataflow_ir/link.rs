@@ -72,6 +72,32 @@ pub struct Sfp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lxsu;
 
+/// ONE ROW OF THE PT — ⛔⛔ ADDED BECAUSE THE ISLAND COULD NOT STATE THE REFERENCE'S OWN PROGRAM.
+///
+/// `dcc/test/Conversion/AgenToSentient/lx-to-sfp-bypass-1.mlir:126-127` is
+/// `%pt = dataflow.get_unit {..., type = "ptrow0"}` followed by `dataflow.send %pt, %9`, and the
+/// expected SentientIR for it is `sentient.set_send_dst(%[[VAL_10]])` on that same value (`:47`).
+/// With no marker for a PT row, a send to one was not constructible — so the bypass rule
+/// `generateSetSendDestinationStmts` exists to implement had no input it could be tested on.
+///
+/// ⭐ THE ROW IS THE CONST PARAMETER, so `PtRowUnit<0>` and `PtRowUnit<1>` are different types and a
+/// wire to row 0 cannot be spent as a wire to row 1.
+///
+/// ⛔ AND A ROW THIS ARCH DOES NOT HAVE IS A BUILD FAILURE, not a runtime one: [`UnitKind::KIND`] is
+/// a const, so `PtRowUnit<9>::KIND` fails const evaluation on an 8-row arch at the point of use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtRowUnit<const ROW: u32>;
+/// The L0 store unit — one of the four destinations that make a load bypass the SFP
+/// (`Helper.cpp:2764-2765`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L0su;
+/// The L0 load unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L0lu;
+/// The link out of this partition — the fourth bypass destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossPtnLink;
+
 impl sealed::Sealed for L3lu {}
 impl sealed::Sealed for Lxlu {}
 impl sealed::Sealed for Sfp {}
@@ -87,6 +113,28 @@ impl UnitKind for Sfp {
 }
 impl UnitKind for Lxsu {
     const KIND: DfirUnit = DfirUnit::Lxsu;
+}
+impl<const ROW: u32> sealed::Sealed for PtRowUnit<ROW> {}
+impl sealed::Sealed for L0su {}
+impl sealed::Sealed for L0lu {}
+impl sealed::Sealed for CrossPtnLink {}
+impl<const ROW: u32> UnitKind for PtRowUnit<ROW> {
+    // ⛔ THE `None` ARM IS A CONST PANIC, WHICH IS A COMPILE ERROR. `Row` carries this arch's row
+    // count, so naming a row it does not have fails to build rather than falling back to a wrong
+    // unit — the trap `PtRow::unit()` was deleted for.
+    const KIND: DfirUnit = match crate::units::Row::checked(ROW) {
+        Some(row) => DfirUnit::PtRow(row),
+        None => panic!("this arch's PT has no such row"),
+    };
+}
+impl UnitKind for L0su {
+    const KIND: DfirUnit = DfirUnit::L0su;
+}
+impl UnitKind for L0lu {
+    const KIND: DfirUnit = DfirUnit::L0lu;
+}
+impl UnitKind for CrossPtnLink {
+    const KIND: DfirUnit = DfirUnit::CrossPtnLink;
 }
 
 /// THE PRODUCER'S END OF ONE WIRE — what `dataflow.send`'s `to` must be.

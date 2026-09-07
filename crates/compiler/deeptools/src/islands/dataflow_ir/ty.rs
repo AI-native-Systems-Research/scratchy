@@ -2,25 +2,72 @@
 
 use crate::generated::{DataType, Unit};
 
-/// WHICH GENERIC COMPONENT a unit belongs to — `senCompToGenericComp`.
+/// WHICH GENERIC COMPONENT a unit belongs to — the IMAGE of `senCompToGenericComp`
+/// (`sys-arch-spec/arch_enums.cpp:124-211`).
 ///
 /// ⭐ IT EXISTS BECAUSE ONE ELEMENT FORMAT DEPENDS ON IT. `SENINT24` is `i24` on the PT and `i16`
 /// everywhere else (`SNComputeLowering.cpp:291-297`), so the format alone does not determine the
 /// type — a fact that is invisible until an accumulator is silently eight bits narrow.
+///
+/// # 🛑 A LOAD UNIT AND A STORE UNIT ARE DIFFERENT GENERIC COMPONENTS
+///
+/// ⛔⛔ THIS ENUM HAD ONE `Lx` FOR BOTH LX HALVES AND ONE `L0` FOR BOTH L0 HALVES, while citing the
+/// very map that keeps them apart. `senCompToGenericComp` sends `LXLU0`, `LXLU1` and `LXLU` to
+/// **`LXLU`** and `LXSU0`, `LXSU1`, `LXSU` to **`LXSU`** (`arch_enums.cpp:167-175`), and the
+/// twenty-odd `L0LUROW*` spellings to **`L0LU`** against `L0SU0`/`L0SU1`/`L0SU` to **`L0SU`**
+/// (`:177-204`). `LX` and the two L3 halves are their own images as well.
+///
+/// ⛔ AND THE COLLAPSE MADE TWO REFERENCE FUNCTIONS INEXPRESSIBLE. `isSenComponentL0LU` and
+/// `isSenComponentL0SU` (`DataflowToSentient.cpp:96,100`) are *"is this unit's generic component
+/// `L0LU`"* and *"… `L0SU`"* — two functions that would have had the same answer under one `L0`, and
+/// their callers use them to tell a producer from a consumer.
+///
+/// # 🛑 THREE OF OUR UNITS ARE NOT IN THE MAP AT ALL
+///
+/// ⛔ `L0`, `CONSTANT` AND `SFPRING` ARE NOT KEYS (checked against the whole table,
+/// `arch_enums.cpp:124-211`), so the reference's `senCompToGenericComp.at(comp)` **throws** for
+/// them. This crate never runtime-refuses, so they are their own images here — a total function
+/// where the reference has a partial one. That is safe for every rule built on this: each asks
+/// `generic() == <a specific component>`, and these three answer no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenericComp {
-    /// The matrix unit, including every row and row span of it.
+    /// `PT` — the matrix unit, including every row, row span and per-fold copy of it.
     Pt,
-    /// The processing element.
+    /// `PE` — the processing element (`PE0`/`PE1` fold into it).
     Pe,
-    /// The special function processor.
+    /// `SFP` — the special function processor (`SFP0`/`SFP1` fold into it).
     Sfp,
-    /// An LX load or store unit.
+    /// `LXLU` — the LX **load** unit.
+    Lxlu,
+    /// `LXSU` — the LX **store** unit.
+    Lxsu,
+    /// `LX` — the LX memory itself, which is its own image (`arch_enums.cpp:176`).
     Lx,
-    /// An L0 load or store unit.
+    /// `L0LU` — the L0 **load** unit, which every `L0LUROW*` spelling folds into.
+    L0lu,
+    /// `L0SU` — the L0 **store** unit.
+    L0su,
+    /// `L3LU` — the L3 load half.
+    L3lu,
+    /// `L3SU` — the L3 store half.
+    L3su,
+    /// `HBM` — the device's global memory.
+    Hbm,
+    /// `LXVIRTUALIBR` — the LX virtual indirection base register, its own image
+    /// (`arch_enums.cpp:209`): the map sends `LXVIRTUALIBR` to `LXVIRTUALIBR`.
+    LxVirtualIbr,
+    /// `CROSSPTNLINK` — the link out of this partition.
+    CrossPtnLink,
+    /// `SFPSTATE`.
+    SfpState,
+    /// `PESTATE`.
+    PeState,
+    /// The L0 memory itself. ⛔ NOT A KEY OF THE REFERENCE MAP — see the type's note.
     L0,
-    /// A constant source — not a hardware unit, but a `unit="constant"` a transfer sources from.
+    /// A constant source — a `unit="constant"` a transfer reads from. ⛔ NOT A KEY.
     Constant,
+    /// The SFP ring. ⛔ NOT A KEY.
+    SfpRing,
 }
 
 impl Unit {
@@ -41,9 +88,15 @@ impl Unit {
             | Self::Ptrow1To3
             | Self::Ptrow1To7 => GenericComp::Pt,
             Self::Pe => GenericComp::Pe,
-            Self::Sfp | Self::Sfpring => GenericComp::Sfp,
-            Self::Lxlu | Self::Lxsu => GenericComp::Lx,
-            Self::L0lu | Self::L0su => GenericComp::L0,
+            Self::Sfp => GenericComp::Sfp,
+            // ⛔ THE RING IS NOT THE SFP. `SFPRING` is not a key of `senCompToGenericComp` at all
+            // (`arch_enums.cpp:124-211`), so folding it into `SFP` here was this crate's invention.
+            Self::Sfpring => GenericComp::SfpRing,
+            // ⛔ THE LOAD HALF AND THE STORE HALF ARE DIFFERENT IMAGES (`arch_enums.cpp:167-175`).
+            Self::Lxlu => GenericComp::Lxlu,
+            Self::Lxsu => GenericComp::Lxsu,
+            Self::L0lu => GenericComp::L0lu,
+            Self::L0su => GenericComp::L0su,
             Self::Constant => GenericComp::Constant,
         }
     }
@@ -121,9 +174,21 @@ impl ElemType {
                 GenericComp::Pt => ElemType::Int(24),
                 GenericComp::Pe
                 | GenericComp::Sfp
+                | GenericComp::Lxlu
+                | GenericComp::Lxsu
                 | GenericComp::Lx
+                | GenericComp::L0lu
+                | GenericComp::L0su
                 | GenericComp::L0
-                | GenericComp::Constant => ElemType::Int(16),
+                | GenericComp::L3lu
+                | GenericComp::L3su
+                | GenericComp::Hbm
+                | GenericComp::LxVirtualIbr
+                | GenericComp::CrossPtnLink
+                | GenericComp::SfpState
+                | GenericComp::PeState
+                | GenericComp::Constant
+                | GenericComp::SfpRing => ElemType::Int(16),
             },
             DataType::Sen169Fp16 => ElemType::F16,
             DataType::Bfloat16 => ElemType::Bf16,

@@ -1,6 +1,6 @@
 //! `VectorChain.td` — EVERYTHING THE PE AND THE SFP COMPUTE.
 //!
-//! The dialect declares twenty-three operations; the twelve here are the ones an emitted program
+//! The dialect declares twenty-three operations; the thirteen here are the ones an emitted program
 //! contains. The attribute enumerations they carry are `VectorChainEnums.td`'s, and each records
 //! which of the two — the enum's own name, or the operand's — is the mnemonic MLIR parses.
 
@@ -487,6 +487,32 @@ pub enum Op {
         ty: Vector,
     },
 
+    /// `vectorchain.rotate %in, %pos {right_shift} : tin, index, tout` — the circular shift.
+    ///
+    /// ⛔ ADDED FOR THE CHAIN THAT SITS BETWEEN A LOAD AND ITS SEND. `getLoadConsumer` accepts a
+    /// load whose single user is a `SelectOp`, a `ShuffleOp` **or a `RotateOp`** before the send
+    /// (`Helper.cpp:1268-1270`), and `addLoadChainToDeleteList` deletes the same three
+    /// (`Helper.cpp:2977-2980`). With two of the three in this enum the third was a shape the
+    /// island could not state, so those two functions could not be ported over their own domain.
+    ///
+    /// ⛔ THE POSITION IS AN SSA VALUE, NOT AN ATTRIBUTE (`VectorChain.td:552-555`), and the op
+    /// *"views the vector as a circular array"* — linearised first when it is multi-dimensional.
+    Rotate {
+        /// The vector it binds.
+        result: Val,
+        /// What is rotated.
+        input: Val,
+        /// `$position` — where the rotation starts, as an `index` value.
+        position: Val,
+        /// `$right_shift` — ⛔ the `.td` DEFAULTS IT TO TRUE (`VectorChain.td:555`), so a left
+        /// rotate is the one that has to say so.
+        right_shift: bool,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
     /// `vectorchain.cast %v : tin, tout` — a precision conversion.
     ///
     /// ⛔ THE C++ EMITS ONE WHERE THE SOURCE AND DESTINATION FORMATS DIFFER: "Convert data if src
@@ -728,6 +754,27 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 "{} = vectorchain.shuffle input({}) {{indices = [{indices}], repetition = {repetition} : i32}} : {}, {}",
                 print::val(*result),
                 print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::Rotate {
+            result,
+            input,
+            position,
+            right_shift,
+            input_ty,
+            ty,
+        } => {
+            // `$input `,` $position attr-dict `:` type($input) `,` type($position) `,`
+            // type(results)` (`VectorChain.td:558-560`) — and the position's type is always
+            // `index`, which is what the operand is declared as.
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.rotate {}, {} {{right_shift = {right_shift}}} : {}, index, {}",
+                print::val(*result),
+                print::val(*input),
+                print::val(*position),
                 print::vector(*input_ty),
                 print::vector(*ty)
             );

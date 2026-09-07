@@ -78,3 +78,101 @@
 //! | `e337_lowerSyncOperation` | 337/384 | 80 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901` |
 //! | `e361_runOnOperation` | 361/384 | 33 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` |
 
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::units::DfirUnit;
+
+/// Replaces: e039_isSenComponentL0LU
+///
+/// **039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96` (2L).
+///
+/// ```cpp
+/// static inline bool isSenComponentL0LU(SenComponents comp) {
+///   return EnumsConversion::senCompToGenericComp.at(comp) == SenComponents::L0LU;
+/// }
+/// ```
+///
+/// ⭐⭐ IT IS THE **GENERIC** COMPONENT THAT IS TESTED, NOT THE SPELLING. `senCompToGenericComp`
+/// (`sys-arch-spec/arch_enums.cpp:124-211`) maps every per-core, per-corelet spelling onto the one
+/// image the ISA names, so this answers `true` for `L0LU` and for nothing else — and in particular
+/// **not** for `L0SU`. A port that had folded the two halves together would answer `true` for both
+/// and this predicate would select every L0 unit in the program.
+///
+/// ⛔ THE `.at()` CAN THROW AND OURS CANNOT. `L0`, `CONSTANT` and `SFPRING` are not keys of that map,
+/// so the reference aborts on them; [`DfirUnit::generic`] is total, and each of the three has its own
+/// image — none of which is `L0LU`, so those units answer `false` here.
+#[must_use]
+pub const fn is_sen_component_l0lu(unit: DfirUnit) -> bool {
+    matches!(unit.generic(), GenericComp::L0lu)
+}
+
+/// Replaces: e040_isSenComponentL0SU
+///
+/// **040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100` (2L).
+///
+/// ```cpp
+/// static inline bool isSenComponentL0SU(SenComponents comp) {
+///   return EnumsConversion::senCompToGenericComp.at(comp) == SenComponents::L0SU;
+/// }
+/// ```
+///
+/// ⭐ THE STORE HALF, AND ONLY IT — see [`is_sen_component_l0lu`] for why the two are separate
+/// images rather than one `L0`.
+#[must_use]
+pub const fn is_sen_component_l0su(unit: DfirUnit) -> bool {
+    matches!(unit.generic(), GenericComp::L0su)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::units::Row;
+
+    /// 🎯 039/384 + 040/384 — THE LOAD HALF AND THE STORE HALF ARE TOLD APART.
+    ///
+    /// ⛔ THE POINT OF THE PAIR. The two predicates exist to route a sync onto one half of the L0, so
+    /// a mapping that collapsed `l0lu` and `l0su` onto one generic component would make both answer
+    /// `true` for both units and every L0 sync would be emitted twice.
+    #[test]
+    fn the_l0_halves_are_distinct_generic_components() {
+        assert!(is_sen_component_l0lu(DfirUnit::L0lu));
+        assert!(!is_sen_component_l0su(DfirUnit::L0lu));
+
+        assert!(is_sen_component_l0su(DfirUnit::L0su));
+        assert!(!is_sen_component_l0lu(DfirUnit::L0su));
+    }
+
+    /// 🎯 039/384 + 040/384 — AND NO OTHER UNIT IS AN L0 HALF.
+    ///
+    /// ⛔ INCLUDING THE THREE THE REFERENCE'S MAP HAS NO KEY FOR. `senCompToGenericComp.at(L0)`,
+    /// `.at(CONSTANT)` and `.at(SFPRING)` throw (`arch_enums.cpp:124-211` has no entry for them);
+    /// ours answer `false`, which is the routing decision those units need.
+    #[test]
+    fn nothing_else_is_an_l0_half() {
+        for unit in [
+            DfirUnit::PtRow(Row::checked(0).expect("row 0 exists on every arch")),
+            DfirUnit::Pe,
+            DfirUnit::Sfp,
+            DfirUnit::Lxlu,
+            DfirUnit::Lxsu,
+            DfirUnit::Lx,
+            DfirUnit::L3lu,
+            DfirUnit::L3su,
+            DfirUnit::Hbm,
+            DfirUnit::CrossPtnLink,
+            DfirUnit::SfpState,
+            DfirUnit::PeState,
+            DfirUnit::L0,
+            DfirUnit::Constant,
+            DfirUnit::SfpRing,
+        ] {
+            assert!(
+                !is_sen_component_l0lu(unit),
+                "{unit:?} is not the L0 load unit"
+            );
+            assert!(
+                !is_sen_component_l0su(unit),
+                "{unit:?} is not the L0 store unit"
+            );
+        }
+    }
+}
