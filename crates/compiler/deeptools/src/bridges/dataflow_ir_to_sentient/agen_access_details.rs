@@ -101,9 +101,145 @@
 
 use crate::arch::Elements;
 use crate::formats::Bits;
-use crate::islands::dataflow_ir::dialects::agen;
+use crate::islands::dataflow_ir::dialects::{Val, agen};
 use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet};
 use crate::units::DfirUnit;
+
+/// ONE TIME DIMENSION'S POSITION among a composite transfer's ordered time dimensions.
+///
+/// ⛔ A NEWTYPE, BECAUSE THE `int` IT REPLACES HELD TWO DIFFERENT KINDS OF THING. `burst_index_` and
+/// `interleave_group_index_` index `time_bounds_` and `time_offsets_` — `time_bounds[burst_index]`,
+/// `time_offsets[burst_index]` (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:820-822`) — and
+/// both spell "no dimension chosen" as `-1` (`AccessDetails.hpp:324,329`). That is why
+/// `computeBurstAndGroup` has to ask `if (burst_index < 0)` before it may index with the value
+/// (`AccessDetails.cpp:813`). `Option<TimeDim>` cannot be indexed with until the question is asked,
+/// so the guard is the match and no arm can index with the sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimeDim(pub u32);
+
+impl TimeDim {
+    /// The position as a slice index.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// ONE TIME DIMENSION'S BOUND — ⛔ THE THREE STATES ONE `int64_t` WAS CARRYING AT ONCE.
+///
+/// ```text
+/// enum SpecialTimeBoundValues {
+///   kInvalid = -1,
+///   kCoalesced = -2,  // time dimension that should be skipped
+/// };
+/// ```
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:252-255`), and the comment above it says
+/// exactly why the overload existed: the flags are there "to distinguish coalesced bounds
+/// (equivalent in value to 1) from non-coalesceable bounds with value 1" (`:249-251`). A reader must
+/// therefore test the SIGN before it may use the number —
+/// `if (curr_bound == kCoalesced) continue; else if (curr_bound < 0) return;`
+/// (`AccessDetails.cpp:803-808`).
+///
+/// ⭐ AS AN ENUM THE TEST IS THE MATCH. Nothing can multiply a flag into a trip product the way
+/// `coalesced_bound *= time_bounds[time_index_outer]` (`AccessDetails.cpp:777`) would if the -2
+/// reached it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeBound {
+    /// This dimension takes this many steps.
+    ///
+    /// `calculateTimeBounds` pushes `1` for a pinned dimension, the constant extent of a ranged one,
+    /// or a constant symbol's value (`dialect_utils/Agen/Utils.cpp:216-256`). ⛔ `Steps(0)` IS
+    /// REACHABLE AND IS ITS OWN CASE: `computeBurstAndGroup` gives `curr_bound == 0` an explicit
+    /// empty branch that neither terminates the search nor claims a field
+    /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:809`).
+    Steps(u64),
+    /// `kCoalesced = -2` — this dimension was merged into an inner one and is skipped.
+    ///
+    /// Written only by `setCoalescedBoundValues` over the strictly-interior dimensions of a merged
+    /// run (`AccessDetails.cpp:676-678`), and skipped by `continue` on the way out
+    /// (`AccessDetails.cpp:803-805`).
+    Coalesced,
+    /// `kInvalid = -1` — a bound that is not a compile-time constant.
+    ///
+    /// The reference documents it on the producer — "Non-constant dimensions get -1 as bound value"
+    /// (`AccessDetails.hpp:273-274`) — and the consumer defends against it by terminating the burst
+    /// search: "if forOp bound is variable, terminate search" (`AccessDetails.cpp:806-808`).
+    ///
+    /// ⛔ ON THIS PATH IT IS UNREACHABLE, AND THE VARIANT STAYS ANYWAY. dcc's own
+    /// `calculateTimeBounds` returns `failure()` for a non-constant dimension rather than pushing -1
+    /// (`dialect_utils/Agen/Utils.cpp:216-256`), so `constructTimeStepsInfo` aborts the whole
+    /// lowering instead (`AccessDetails.cpp:643-646`). Dropping the variant would delete the only
+    /// distinction the consumer's own guard is written against.
+    Variable,
+}
+
+/// THE ADDRESS OFFSETS ALONG A COMPOSITE TRANSFER'S TIME DIMENSIONS — ⛔ THE TRAILING CONSTANT IS
+/// NOT A DIMENSION.
+///
+/// `calculateTimeOffsets` flattens `mem_view_layout_map.compose(time_addr_map)`, drops the flattened
+/// expression's last term from the per-dimension part, reorders what is left by `time_order`, and
+/// only then appends that last term back:
+/// ```text
+/// for (int i = 0, e = tmp_time_offsets.size() - 1; i < e; ++i)
+///   tmp_non_const_time_offsets.push_back(tmp_time_offsets[i]);
+/// time_offsets = time_order.compose(tmp_non_const_time_offsets);
+/// time_offsets.push_back(tmp_time_offsets.back());
+/// ```
+/// (`dialect_utils/Agen/Utils.cpp:112-116`). So the vector is n offsets plus one constant, and
+/// `getFlattenedAffineExpr`'s trailing term is a CONSTANT TERM, not the (n+1)-th dimension.
+///
+/// ⭐⭐ WHICH IS WHY THE REFERENCE HAS TO CHECK THE LENGTHS BY HAND, TWICE:
+/// `DT_CHECK(getTimeBounds().size() == getTimeOffsets().size() - 1)`
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:684-685`, again at `:696-701`) and
+/// `DT_CHECK_MSG(time_bounds.size() + 1 == time_offsets.size(), "expected same number of dimensions
+/// for time_addr map and time_set")` (`:742-744`). Naming the constant makes `per_dim` index in
+/// lockstep with `time_bounds` by construction, and those three run-time checks have nothing left to
+/// check.
+///
+/// ⛔ `Default` IS THE CONSTRUCTED-BUT-UNSET STATE and it is not an invention: an affine expression
+/// with no constant term has constant term 0, which is what `calculateTimeOffsets`'s own
+/// `const_value` fallback says (`dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:73-76`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimeOffsets {
+    /// One offset per time dimension, ordered by `time_order` — outermost first.
+    pub per_dim: Vec<i64>,
+    /// The flattened constant term, `time_offsets.back()`.
+    pub constant: i64,
+}
+
+/// THE LOOP-ITERATOR COEFFICIENTS OF AN ACCESS — ⛔ WITH THE `nullptr` KEY GIVEN A NAME.
+///
+/// `constructIteratorCoeffDict` builds a `DenseMap<Value, int64_t>` of one coefficient per index and
+/// then stores the flattened constant term under a NULL `Value`:
+/// ```text
+/// // indices_coeff_dict is a map from loop iterators to coefficients associated
+/// // with them. nullptr refers to constant offset
+/// // for, e.g., 2xi + 3xj + 10
+/// // coefficient with i is 2, j is 3, and nullptr is 10.
+/// indices_coeff_dict[nullptr] = const_value;
+/// ```
+/// (`dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:69-82`).
+/// [`Val`] has no null, and inventing one would put the flag back.
+///
+/// ⭐⭐ EVERY CONSUMER READS THAT KEY BY HAND AND ONE OF THEM COUNTS IT:
+/// `auto const_offset = iter_coeff_dict[nullptr]` (`dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:402`),
+/// `max_mutable = iter_coeff_dict[nullptr]` (`dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:724`)
+/// guarded by `DT_CHECK(iter_coeff_dict.size() == indices.size() + 1)` (`:717`) — the `+ 1` IS this
+/// field — and the iterating consumer has to test for it, `if (inner_record.first && ...)`
+/// (`dcc/src/Conversion/AgenToSentient/Helper.cpp:577`). As a named field the check is structural and
+/// the test disappears.
+///
+/// ⛔ A VEC, NOT A MAP, BECAUSE THE ORDER IS THE LOOP NESTING. The producer inserts in `indices_`
+/// order under its own comment "Sort the indices from outermost to innnermost" (`Utils.cpp:68-71`);
+/// a `BTreeMap<Val, i64>` would reorder that by SSA number and a `HashMap` by hash, and
+/// `MutableAddrSplitting`'s weights are accumulated per nesting level (`:725-738`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndicesCoeffDict {
+    /// One `(index, coefficient)` pair per access index, outermost loop first.
+    pub per_index: Vec<(Val, i64)>,
+    /// The constant offset — C++'s `indices_coeff_dict[nullptr]`.
+    pub constant: i64,
+}
 
 /// WHAT ONE MEMORY OPERAND'S LOWERING KNOWS ABOUT ITS ACCESS — `AccessDetailsBase`
 /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:43-212`).
@@ -459,6 +595,16 @@ impl<'a> AccessDetailsBase<'a> {
 pub struct AccessDetailsAffine<'a> {
     /// The `AccessDetailsBase` this derives from.
     pub base: AccessDetailsBase<'a>,
+    /// `subscripts_map_` — the affine map holding the subscripts (`AccessDetails.hpp:241`).
+    ///
+    /// ⛔ `None` IS C++'S DEFAULT-CONSTRUCTED NULL `AffineMap`, NOT AN EMPTY ONE. A null `AffineMap`
+    /// is a pointer that `getNumResults()` cannot be called on; `affine_map<() -> ()>` is a legal map
+    /// of no results that it can. Substituting the empty map for the unset state would be a stand-in
+    /// op, and `MutableStartAddrShifting.cpp:411` loops over `subscripts_map.getNumResults()`.
+    pub subscripts_map: Option<AffineMap>,
+    /// `indices_coeff_dict_` — the loop iterators involved with their coefficients
+    /// (`AccessDetails.hpp:244`).
+    pub indices_coeff_dict: IndicesCoeffDict,
 }
 
 impl<'a> AccessDetailsAffine<'a> {
@@ -487,17 +633,292 @@ impl<'a> AccessDetailsAffine<'a> {
     pub fn new(op: &'a agen::Op, comp: DfirUnit) -> Self {
         AccessDetailsAffine {
             base: AccessDetailsBase::new(op, comp),
+            subscripts_map: None,
+            indices_coeff_dict: IndicesCoeffDict::default(),
         }
+    }
+
+    /// Replaces: e017_setSubscriptsMap
+    ///
+    /// **`setSubscriptsMap`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228-230` (3L).
+    ///
+    /// ```text
+    /// void setSubscriptsMap(AffineMap subscripts_map) {
+    ///   subscripts_map_ = subscripts_map;
+    /// }
+    /// ```
+    ///
+    /// ⭐ AN `AffineMap` IS ALREADY A HANDLE IN C++ — a uniqued, immutable, pointer-sized value — so
+    /// passing it by value there and moving our own owned [`AffineMap`] here are the same operation.
+    ///
+    /// ⛔ A SET, NEVER A CLEAR, SO IT TAKES AN [`AffineMap`] AND NOT AN `Option`. Every callsite
+    /// hands it a map the op itself carries — `setSubscriptsMap(load_op.getAffineMap())`
+    /// (`AccessDetails.cpp:305`), `composite_load_and_store_op.getSrcAffineMapAttr().getValue()`
+    /// (`:528`) or its `getDst` twin (`:539`) — and the one remaining callsite re-installs the map it
+    /// just read after folding constant operands out of it (`:398-401`). None of them can be null,
+    /// and the unset state belongs to the constructor alone.
+    pub fn set_subscripts_map(&mut self, subscripts_map: AffineMap) {
+        self.subscripts_map = Some(subscripts_map);
+    }
+
+    /// Replaces: e018_setIndicesCoeffDict
+    ///
+    /// **`setIndicesCoeffDict`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231-233` (3L).
+    ///
+    /// ```text
+    /// void setIndicesCoeffDict(DenseMap<Value, int64_t>& indices_coeff_dict) {
+    ///   indices_coeff_dict_ = indices_coeff_dict;
+    /// }
+    /// ```
+    ///
+    /// ⭐ C++ TAKES A MUTABLE REFERENCE AND THEN COPY-ASSIGNS FROM IT — the reference is non-const
+    /// only because `DenseMap`'s `operator[]` is, and the caller's map is dead after the call
+    /// (`AccessDetails.cpp:411-413`, which hands over the dictionary
+    /// `constructIteratorCoeffDict` just returned and then returns itself). Taking
+    /// [`IndicesCoeffDict`] by value is that copy without the copy.
+    ///
+    /// ⛔ WHOLESALE REPLACEMENT, NOT A MERGE. `operator=` on a `DenseMap` drops every existing entry,
+    /// so a second call cannot leave a coefficient from the first behind.
+    pub fn set_indices_coeff_dict(&mut self, indices_coeff_dict: IndicesCoeffDict) {
+        self.indices_coeff_dict = indices_coeff_dict;
+    }
+}
+
+/// AN AFFINE ACCESS THAT ALSO WALKS TIME — `AccessDetailsAffineComposite`
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:247-343`).
+///
+/// ⭐⭐ TIME IS WHAT A COMPOSITE TRANSFER ADDS. "An AGEN composite transfer moves at most one
+/// hardware vector per time step, so a transfer wider than that has to walk the remaining elements
+/// over AGEN time dimensions" — the seven members below are that walk, and
+/// [`agen::Op::CompositeLoadAndStore`](crate::islands::dataflow_ir::dialects::agen::Op::CompositeLoadAndStore)
+/// is the op they are read off.
+///
+/// ⭐ THE `pub` FIELDS ARE THE PUBLIC GETTERS OF `:262-269`, and the three setters
+/// `docs/bridge2-porting-order.md` excludes — `setTimeOrder` (`:284`), `setTimeSet` (`:285`) and
+/// `setBurstIndex` (`:298`) — are the field itself in Rust.
+///
+/// ⛔⛔ A FIELD IS A BORROW AND `getTimeBounds()` WAS A COPY. Every getter here returns a
+/// `SmallVector` BY VALUE, and two consumers rely on that: `coalesceTimeDimensions` mutates
+/// `auto time_bounds = ...getTimeBounds()` and only then stores it back (`AccessDetails.cpp:690-691,
+/// 720-739, 787`), and `computeBurstAndGroup` reads its own copy while calling setters on `self`
+/// (`:797-798`). Whoever ports those must `.clone()` where C++ copied; mutating the field in place
+/// would let a half-rebuilt vector be read through `getFirst()` by the other operand's pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessDetailsAffineComposite<'a> {
+    /// The base class (`AccessDetails.hpp:247`).
+    pub affine: AccessDetailsAffine<'a>,
+    /// `time_order_` — the order the time dimensions are walked in (`AccessDetails.hpp:304`).
+    ///
+    /// ⛔ `None` is the default-constructed NULL map, for the same reason as
+    /// [`AccessDetailsAffine::subscripts_map`]. Every bound and offset is reordered THROUGH it —
+    /// `time_offsets = time_order.compose(...)` (`dialect_utils/Agen/Utils.cpp:115`),
+    /// `time_bounds = time_order.compose(time_bounds)` (`:255`) — which is why the two vectors below
+    /// are documented as already ordered (`AccessDetails.cpp:689`).
+    pub time_order: Option<AffineMap>,
+    /// `time_set_` — the time iteration domain (`AccessDetails.hpp:307`).
+    pub time_set: Option<IntegerSet>,
+    /// `time_addr_map_` — the address map over the time dimensions (`AccessDetails.hpp:310`).
+    pub time_addr_map: Option<AffineMap>,
+    /// `time_symbols_` — the SSA values the time set's bounds are written against
+    /// (`AccessDetails.hpp:313`).
+    pub time_symbols: Vec<Val>,
+    /// `time_offsets_` — the address offset along each time dimension (`AccessDetails.hpp:316`),
+    /// plus the flattened constant. See [`TimeOffsets`].
+    pub time_offsets: TimeOffsets,
+    /// `time_bounds_` — the bound of each time dimension (`AccessDetails.hpp:319`). See
+    /// [`TimeBound`].
+    pub time_bounds: Vec<TimeBound>,
+    /// `burst_index_` — the time dimension claimed as the burst (`AccessDetails.hpp:321-324`).
+    ///
+    /// ⛔ `None` IS THE `-1` THE FIELD DEFAULTS TO, and `computeBurstAndGroup` reads it as a question
+    /// before an index: `if (burst_index < 0) setBurstIndex(i);` (`AccessDetails.cpp:812-815`).
+    /// `setBurstIndex` (`AccessDetails.hpp:298`) is excluded from the port as the field itself.
+    pub burst_index: Option<TimeDim>,
+    /// `interleave_group_index_` — the time dimension claimed as the interleave group
+    /// (`AccessDetails.hpp:326-329`).
+    pub interleave_group_index: Option<TimeDim>,
+}
+
+impl<'a> AccessDetailsAffineComposite<'a> {
+    /// Replaces: e019_AccessDetailsAffine
+    ///
+    /// **`AccessDetailsAffineComposite::AccessDetailsAffineComposite`** —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:257-259` (3L).
+    ///
+    /// ```text
+    /// explicit AccessDetailsAffineComposite(mlir::Operation* op, SenComponents comp)
+    ///     : AccessDetailsAffine(op, comp) {}
+    /// ```
+    ///
+    /// ⛔ THE ENTRY'S NAME IS THE BASE INITIALIZER, NOT THE CONSTRUCTOR. The extractor named unit 019
+    /// `AccessDetailsAffine` after the `AccessDetailsAffine(op, comp)` token on line 259, but the
+    /// definition at that citation is `AccessDetailsAffineComposite`'s constructor — `:217-218` is
+    /// the `AccessDetailsAffine` one, and it is unit 016. The port follows the line citation.
+    ///
+    /// ⭐ AN EMPTY BODY IS THE WHOLE PORT, AND WHAT IT LEAVES UNSET IS THE POINT: seven of the nine
+    /// members default-initialize (`:304-329`) and every one of them is filled later by
+    /// `initialize()` and `constructTimeStepsInfo`. The two negative sentinels among them become
+    /// [`None`] here, so a freshly constructed object cannot be indexed with as though a burst had
+    /// already been chosen.
+    ///
+    /// ⭐ THE BASE CHAIN IS A CALL, NOT A LITERAL, exactly as `: AccessDetailsAffine(op, comp)` is.
+    /// That constructor is unit 016 and carries its own anchor; this one delegates to it.
+    #[must_use]
+    pub fn new(op: &'a agen::Op, comp: DfirUnit) -> AccessDetailsAffineComposite<'a> {
+        AccessDetailsAffineComposite {
+            affine: AccessDetailsAffine::new(op, comp),
+            time_order: None,
+            time_set: None,
+            time_addr_map: None,
+            time_symbols: Vec::new(),
+            time_offsets: TimeOffsets::default(),
+            time_bounds: Vec::new(),
+            burst_index: None,
+            interleave_group_index: None,
+        }
+    }
+
+    /// Replaces: e020_setTimeAddrMap
+    ///
+    /// **`setTimeAddrMap`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286-288` (3L).
+    ///
+    /// ```text
+    /// void setTimeAddrMap(AffineMap time_addr_map) {
+    ///   time_addr_map_ = time_addr_map;
+    /// }
+    /// ```
+    ///
+    /// ⭐⭐ THIS FIELD IS PER OPERAND WHILE ITS NEIGHBOURS ARE PER OP, and `initialize` draws the
+    /// line: `setTimeSet`, `setTimeOrder` and `setTimeSymbols` run once for the whole
+    /// `composite_load_and_store` (`AccessDetails.cpp:519-521`), but the branch below them picks
+    /// `getLoadTimeAddrMap()` for `kDirSrc` (`:532`) and `getStoreTimeAddrMap()` for the dst (`:543`).
+    /// Those are the two maps
+    /// [`CompositeTransfer`](crate::islands::dataflow_ir::dialects::agen::CompositeTransfer) carries,
+    /// which is why one transfer needs one access detail per operand.
+    ///
+    /// ⭐ `calculateTimeOffsets` composes it under the memory view's layout to get the offsets
+    /// (`dialect_utils/Agen/Utils.cpp:103`).
+    pub fn set_time_addr_map(&mut self, time_addr_map: AffineMap) {
+        self.time_addr_map = Some(time_addr_map);
+    }
+
+    /// Replaces: e021_setTimeSymbols
+    ///
+    /// **`setTimeSymbols`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289-291` (3L).
+    ///
+    /// ```text
+    /// void setTimeSymbols(const Operation::operand_range time_symbols) {
+    ///   time_symbols_.assign(time_symbols.begin(), time_symbols.end());
+    /// }
+    /// ```
+    ///
+    /// ⭐ `Operation::operand_range` IS A BORROWED VIEW OVER THE OP'S OWN OPERANDS and `assign`
+    /// copies out of it, which is exactly `&[Val]` plus `to_vec`. `assign` also CLEARS first, so a
+    /// second call replaces rather than appends.
+    ///
+    /// ⭐ ONE CALL PER OP, NOT PER OPERAND: it sits beside `setTimeSet` and `setTimeOrder` above the
+    /// `kDirSrc` branch (`AccessDetails.cpp:519-521`), unlike
+    /// [`set_time_addr_map`](Self::set_time_addr_map).
+    ///
+    /// ⛔⛔ OUR ISLAND CANNOT YET PRODUCE A NON-EMPTY RANGE, AND THAT IS A FACT ABOUT THE ISLAND, NOT
+    /// A REASON TO SKIP THE SETTER. `agen.composite_load_and_store` prints its time symbols as a
+    /// literal empty `time_symbols()` in this crate's emitter, and all eighteen
+    /// `tests/sentient_corpus/*.dfir.mlir` files agree. The reason is structural: the only consumer
+    /// is `calculateTimeBounds`, which consults a symbol solely for a dimension whose bound is
+    /// symbolic (`dialect_utils/Agen/Utils.cpp:216-256`), and
+    /// [`IntegerSet`](crate::islands::dataflow_ir::ty::IntegerSet) here has a dimension count and no
+    /// symbol count at all — so no set we can build has a symbolic bound to resolve. The field is
+    /// ported faithfully and the island is deliberately NOT widened, because widening it would add a
+    /// symbol operand that nothing in this crate can populate. Reported to the orchestrator.
+    pub fn set_time_symbols(&mut self, time_symbols: &[Val]) {
+        self.time_symbols = time_symbols.to_vec();
+    }
+
+    /// Replaces: e022_setTimeBounds
+    ///
+    /// **`setTimeBounds`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292-294` (3L).
+    ///
+    /// ```text
+    /// void setTimeBounds(const SmallVectorImpl<int64_t>& time_bounds) {
+    ///   time_bounds_.assign(time_bounds.begin(), time_bounds.end());
+    /// }
+    /// ```
+    ///
+    /// ⛔ `assign` REPLACES, AND COALESCING DEPENDS ON IT. `coalesceTimeDimensions` rebuilds the
+    /// vector from scratch — clearing it, refilling it inner-to-outer, then re-inserting the
+    /// dimensions above the cut — and stores the result over BOTH mandatory operands
+    /// (`AccessDetails.cpp:720-739,785-792`). An appending setter would double the time dimensions
+    /// of every coalesced transfer.
+    ///
+    /// ⭐ THE SLICE IS `&[TimeBound]` AND NOT `&[i64]`, so the two sentinels of
+    /// `SpecialTimeBoundValues` cannot arrive here as ordinary counts. See [`TimeBound`].
+    pub fn set_time_bounds(&mut self, time_bounds: &[TimeBound]) {
+        self.time_bounds = time_bounds.to_vec();
+    }
+
+    /// Replaces: e023_setTimeOffsets
+    ///
+    /// **`setTimeOffsets`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295-297` (3L).
+    ///
+    /// ```text
+    /// void setTimeOffsets(const SmallVectorImpl<int64_t>& time_offsets) {
+    ///   time_offsets_.assign(time_offsets.begin(), time_offsets.end());
+    /// }
+    /// ```
+    ///
+    /// ⛔ THE PARAMETER IS NOT A FLAT VECTOR OF OFFSETS — its last element is a constant term and
+    /// never a dimension, which is why the reference has to write
+    /// `time_bounds.size() == time_offsets.size() - 1` three times to keep the two in step. Taking
+    /// [`TimeOffsets`] makes `per_dim` index in lockstep with `time_bounds` by construction; see
+    /// that type for the derivation.
+    ///
+    /// ⭐ BY VALUE, BECAUSE THE CALLER'S VECTOR IS DEAD AFTER THE CALL. `constructTimeStepsInfo`
+    /// reads the current value out, lets `calculateTimeOffsets` fill it, and hands it straight back
+    /// (`AccessDetails.cpp:651-658`) — a move, not a shared borrow.
+    pub fn set_time_offsets(&mut self, time_offsets: TimeOffsets) {
+        self.time_offsets = time_offsets;
+    }
+
+    /// Replaces: e024_setInterleaveGroupIndex
+    ///
+    /// **`setInterleaveGroupIndex`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299-301`
+    /// (3L).
+    ///
+    /// ```text
+    /// void setInterleaveGroupIndex(int interleave_group_index) {
+    ///   interleave_group_index_ = interleave_group_index;
+    /// }
+    /// ```
+    ///
+    /// ⛔⛔ IT TAKES A [`TimeDim`] AND NOT AN `int`, BECAUSE ITS ONE CALLSITE HANDS IT THE BURST'S OWN
+    /// INDEX. `computeBurstAndGroup` promotes the dimension already holding the burst into the group
+    /// field and moves the burst inward:
+    /// ```text
+    /// if ((time_bounds[burst_index] == 2 || time_bounds[burst_index] == 4) &&
+    ///     time_offsets[i] == getLdOrStSize() && time_offsets[burst_index] != 0) {
+    ///   setInterleaveGroupIndex(burst_index);
+    ///   setBurstIndex(i);
+    /// }
+    /// ```
+    /// (`AccessDetails.cpp:820-824`). `burst_index` is `>= 0` there — the `< 0` branch above it took
+    /// the other path (`:813`) — so the argument is always a real dimension and the `-1` this field
+    /// starts at is never passed in. Nothing clears the field, which is why there is no
+    /// `Option`-taking form.
+    pub fn set_interleave_group_index(&mut self, interleave_group_index: TimeDim) {
+        self.interleave_group_index = Some(interleave_group_index);
     }
 }
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{AccessDetailsAffine, AccessDetailsBase};
+    use super::{
+        AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase, IndicesCoeffDict,
+        TimeBound, TimeDim, TimeOffsets,
+    };
     use crate::arch::Elements;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::dialects::agen;
-    use crate::islands::dataflow_ir::dialects::{Index, Val};
+    use crate::islands::dataflow_ir::dialects::{Index, Op as DfirOp, Val};
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef, Vector,
     };
@@ -711,5 +1132,258 @@ mod unit_tests {
         assert!(ad.base.transfer_set.constraints.is_empty());
         assert_eq!(ad.base.transfer_order.dims, 0);
         assert!(ad.base.transfer_order.results.is_empty());
+    }
+
+    /// A REAL `agen.composite_load_and_store`, because that is what an access detail describes.
+    ///
+    /// `constructTimeStepsInfo` checks the op it was handed is one of the six composite forms
+    /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:632-635`), so a stand-in op would make
+    /// every test below a test of something that cannot reach these setters. This is the HBM-to-LX
+    /// transfer of `/tmp/ktir_ref/export/debug/dfir.mlir:78-84`, built through the same
+    /// [`plan`](crate::bridges::subtile_to_dataflow_ir::transfer::plan) the emitter uses.
+    fn composite_load_and_store() -> agen::Op {
+        use crate::bridges::subtile_to_dataflow_ir::transfer::{Lanes, plan};
+
+        let planned = plan(&[1, 1, 64], &[1, 1, 1, 1, 64], 64, Lanes::F16)
+            .expect("one 64-lane vector is the unsplit case");
+
+        agen::Op::CompositeLoadAndStore(Box::new(agen::CompositeTransfer {
+            src: Val(21),
+            src_indices: vec![Index::Val(Val(1)), Index::Val(Val(4)), Index::Const(0)],
+            src_ty: MemRef {
+                shape: vec![12, 64, 64],
+                elem: ElemType::F16,
+            },
+            dst: Val(27),
+            dst_indices: vec![Index::Const(0); 5],
+            dst_ty: MemRef {
+                shape: vec![2, 2, 1, 1, 64],
+                elem: ElemType::F16,
+            },
+            load_iv: Val(9),
+            load_iv_ty: Vector {
+                len: planned.vector_lanes,
+                elem: ElemType::F16,
+            },
+            load_set: planned.load_set,
+            load_order: planned.load_order,
+            store_set: planned.store_set,
+            store_order: planned.store_order,
+            time_set: planned.time_set,
+            time_order: planned.time_order,
+            load_time_addr_map: planned.load_time_addr_map,
+            store_time_addr_map: planned.store_time_addr_map,
+            body: vec![DfirOp::Agen(agen::Op::Yield)],
+        }))
+    }
+
+    /// The `AccessDetailsAffine` half of a freshly constructed composite. ⛔ `AccessDetailsAffine`'s
+    /// own constructor is unit 016 and is not this batch's, so the base is reached through 019.
+    fn fresh_affine(op: &agen::Op) -> AccessDetailsAffine<'_> {
+        AccessDetailsAffineComposite::new(op, DfirUnit::Lxlu).affine
+    }
+
+    /// e017 — `subscripts_map_` starts as C++'s NULL `AffineMap` and the setter installs a real one.
+    #[test]
+    fn set_subscripts_map_installs_the_ops_own_map() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+        assert_eq!(affine.subscripts_map, None, "the constructor sets no map");
+
+        let map = AffineMap::identity(3);
+        affine.set_subscripts_map(map.clone());
+        assert_eq!(affine.subscripts_map, Some(map));
+    }
+
+    /// e018 — the `nullptr` key is a named field, so `size() == indices.size() + 1` is structural.
+    ///
+    /// `MutableAddrSplitting.cpp:717` checks that length relation by hand and `:724` reads the key as
+    /// `iter_coeff_dict[nullptr]`; here the constant is not in `per_index` at all.
+    #[test]
+    fn the_coeff_dict_holds_the_constant_beside_the_indices() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+        assert_eq!(affine.indices_coeff_dict, IndicesCoeffDict::default());
+
+        // `2*i + 3*j + 10` — the reference's own worked example (Agen/Utils.cpp:80-81).
+        affine.set_indices_coeff_dict(IndicesCoeffDict {
+            per_index: vec![(Val(1), 2), (Val(4), 3)],
+            constant: 10,
+        });
+
+        assert_eq!(affine.indices_coeff_dict.per_index.len(), 2);
+        assert_eq!(affine.indices_coeff_dict.constant, 10);
+        assert_eq!(affine.indices_coeff_dict.per_index[0], (Val(1), 2));
+    }
+
+    /// e018 — `operator=` on a `DenseMap` drops every existing entry, so the second call wins whole.
+    #[test]
+    fn set_indices_coeff_dict_replaces_rather_than_merges() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+
+        affine.set_indices_coeff_dict(IndicesCoeffDict {
+            per_index: vec![(Val(1), 2), (Val(4), 3)],
+            constant: 10,
+        });
+        affine.set_indices_coeff_dict(IndicesCoeffDict {
+            per_index: vec![(Val(7), 1)],
+            constant: 0,
+        });
+
+        assert_eq!(affine.indices_coeff_dict.per_index, vec![(Val(7), 1)]);
+        assert_eq!(affine.indices_coeff_dict.constant, 0);
+    }
+
+    /// e019 — the constructor binds `op_` and `comp_` and leaves every other member unset.
+    ///
+    /// ⛔ THE TWO SENTINELS ARE THE POINT. `burst_index_ = -1` and `interleave_group_index_ = -1`
+    /// (`AccessDetails.hpp:324,329`) are `None` here, so nothing can index `time_bounds` with a
+    /// freshly constructed object's burst the way `time_bounds[burst_index]` would.
+    #[test]
+    fn the_composite_constructor_binds_only_the_op_and_the_component() {
+        let op = composite_load_and_store();
+        let details = AccessDetailsAffineComposite::new(&op, DfirUnit::L3lu);
+
+        assert_eq!(*details.affine.base.op, op);
+        assert_eq!(details.affine.base.comp, DfirUnit::L3lu);
+        assert_eq!(details.affine.subscripts_map, None);
+        assert_eq!(
+            details.affine.indices_coeff_dict,
+            IndicesCoeffDict::default()
+        );
+        assert_eq!(details.time_order, None);
+        assert_eq!(details.time_set, None);
+        assert_eq!(details.time_addr_map, None);
+        assert_eq!(details.time_symbols, Vec::new());
+        assert_eq!(details.time_offsets, TimeOffsets::default());
+        assert_eq!(details.time_bounds, Vec::new());
+        assert_eq!(details.burst_index, None);
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    /// e020 — the map stored is the one belonging to THIS operand.
+    ///
+    /// `initialize` picks `getLoadTimeAddrMap()` for `kDirSrc` and `getStoreTimeAddrMap()` for the
+    /// dst (`AccessDetails.cpp:532,543`), so two access details over one op hold two different maps.
+    #[test]
+    fn set_time_addr_map_is_per_operand() {
+        let op = composite_load_and_store();
+        let mut load = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxlu);
+        let mut store = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxsu);
+
+        let load_map = AffineMap::linear(&[128, 1024]);
+        let store_map = AffineMap::linear(&[1, 64]);
+        load.set_time_addr_map(load_map.clone());
+        store.set_time_addr_map(store_map.clone());
+
+        assert_eq!(load.time_addr_map, Some(load_map));
+        assert_eq!(store.time_addr_map, Some(store_map));
+    }
+
+    /// e021 — `assign` clears first, so a second call replaces the symbols rather than appending.
+    #[test]
+    fn set_time_symbols_replaces_rather_than_appends() {
+        let op = composite_load_and_store();
+        let mut details = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxlu);
+
+        details.set_time_symbols(&[Val(3), Val(5)]);
+        assert_eq!(details.time_symbols, vec![Val(3), Val(5)]);
+
+        details.set_time_symbols(&[Val(8)]);
+        assert_eq!(details.time_symbols, vec![Val(8)]);
+
+        // ⭐ AND THE EMPTY RANGE IS THE ONE OUR OWN ISLAND PRODUCES — every
+        // `tests/sentient_corpus/*.dfir.mlir` prints `time_symbols()`.
+        details.set_time_symbols(&[]);
+        assert_eq!(details.time_symbols, Vec::new());
+    }
+
+    /// e022 — all three states of a bound survive the setter as distinct values.
+    ///
+    /// The vector below is what `setCoalescedBoundValues` leaves behind: the merged trip count on
+    /// the innermost dimension of the run and `kCoalesced` on the interior ones
+    /// (`AccessDetails.cpp:675-678`).
+    #[test]
+    fn set_time_bounds_carries_all_three_states() {
+        let op = composite_load_and_store();
+        let mut details = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxlu);
+
+        details.set_time_bounds(&[
+            TimeBound::Steps(1),
+            TimeBound::Coalesced,
+            TimeBound::Steps(12),
+            TimeBound::Variable,
+            TimeBound::Steps(0),
+        ]);
+
+        assert_eq!(details.time_bounds.len(), 5);
+        // ⛔ A COALESCED DIMENSION IS NOT A BOUND OF 1, which is the whole reason the enum exists
+        // (`AccessDetails.hpp:249-251`).
+        assert_ne!(details.time_bounds[1], TimeBound::Steps(1));
+        assert_eq!(details.time_bounds[2], TimeBound::Steps(12));
+        assert_ne!(details.time_bounds[3], details.time_bounds[4]);
+
+        // `assign` replaces.
+        details.set_time_bounds(&[TimeBound::Steps(2)]);
+        assert_eq!(details.time_bounds, vec![TimeBound::Steps(2)]);
+    }
+
+    /// e023 — the trailing constant is not a dimension, so `per_dim` indexes with `time_bounds`.
+    ///
+    /// ⭐⭐ THIS IS THE THREE `DT_CHECK`s DISSOLVED. `time_bounds.size() + 1 == time_offsets.size()`
+    /// (`AccessDetails.cpp:684-685`, `:696-701`, `:742-744`) holds by construction once the constant
+    /// has its own field, and `computeBurstAndGroup` indexes both vectors with one `i` (`:820-822`).
+    #[test]
+    fn set_time_offsets_keeps_the_constant_out_of_the_dimensions() {
+        let op = composite_load_and_store();
+        let mut details = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxlu);
+
+        details.set_time_bounds(&[TimeBound::Steps(4), TimeBound::Steps(2)]);
+        details.set_time_offsets(TimeOffsets {
+            per_dim: vec![1024, 128],
+            constant: 64,
+        });
+
+        assert_eq!(
+            details.time_offsets.per_dim.len(),
+            details.time_bounds.len()
+        );
+        assert_eq!(details.time_offsets.constant, 64);
+        assert_eq!(details.time_offsets.per_dim[1], 128);
+    }
+
+    /// e024 — the group takes the burst's OWN dimension and the burst moves inward.
+    ///
+    /// This replays `computeBurstAndGroup`'s promotion verbatim: with a burst already claimed on the
+    /// outer dimension and its bound 2, the inner dimension whose offset equals the load size takes
+    /// the burst and the outer one becomes the interleave group (`AccessDetails.cpp:812-824`).
+    #[test]
+    fn the_group_takes_the_old_burst_and_the_burst_moves_inward() {
+        let op = composite_load_and_store();
+        let mut details = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxlu);
+
+        details.set_time_bounds(&[TimeBound::Steps(2), TimeBound::Steps(8)]);
+        details.set_time_offsets(TimeOffsets {
+            per_dim: vec![4096, 64],
+            constant: 0,
+        });
+
+        // `if (burst_index < 0) setBurstIndex(i)` — the field itself, not a ported setter.
+        details.burst_index = Some(TimeDim(0));
+        assert_eq!(details.interleave_group_index, None);
+
+        let old_burst = details.burst_index.expect("the burst was claimed above");
+        details.set_interleave_group_index(old_burst);
+        details.burst_index = Some(TimeDim(1));
+
+        assert_eq!(details.interleave_group_index, Some(TimeDim(0)));
+        assert_eq!(details.burst_index, Some(TimeDim(1)));
+        // ⛔ AND THE INDEX IS USABLE AS A POSITION, which is what `time_bounds[burst_index]` needs.
+        assert_eq!(
+            details.time_bounds[old_burst.index()],
+            TimeBound::Steps(2),
+            "the promoted dimension is the one whose bound gated the promotion"
+        );
     }
 }
