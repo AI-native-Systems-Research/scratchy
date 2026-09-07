@@ -1746,6 +1746,7 @@ mod unit_tests {
                 result,
                 residency: at_corelet_zero(),
                 unit,
+                num_folds: None,
             })
         };
         // `dataflow.send %pt, %9` — one end of an LXLU-to-PT-row-0 link, which is the only way a send
@@ -1955,6 +1956,7 @@ mod unit_tests {
             result: PT,
             residency: at_corelet_zero(),
             unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
+            num_folds: None,
         });
 
         let through = vec![
@@ -2287,6 +2289,7 @@ mod unit_tests {
                 result: Val(13),
                 residency: Residency::Global,
                 unit: DfirUnit::LxVirtualIbr,
+                num_folds: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
                 result: Val(23),

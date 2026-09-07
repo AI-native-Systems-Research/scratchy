@@ -1783,6 +1783,7 @@ mod unit_tests {
                     result: unit,
                     residency: at_corelet_zero(),
                     unit: dfir_unit,
+                    num_folds: None,
                 }));
                 unit
             }
@@ -1791,6 +1792,7 @@ mod unit_tests {
                     result: unit,
                     residency: at_corelet_zero(),
                     unit: owner_of(which),
+                    num_folds: None,
                 }));
                 let file = vals.mint();
                 scope.push(DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
