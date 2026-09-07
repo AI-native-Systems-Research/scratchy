@@ -70,7 +70,7 @@
 //! | `e376_runOnOperation` | 376/384 | 34 | `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439` |
 
 use crate::islands::dataflow_ir::dialects::Val;
-use crate::islands::dataflow_ir::dialects::arith::{IntBinary, IntConst};
+use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::sentient as sen;
 
@@ -224,7 +224,7 @@ pub fn lower_muli_op_to_sentient(op: &IntBinary) -> sen::Op {
 ///
 /// ⛔ THE COMPARISON IS ALREADY TRANSLATED. `ConstructIFRecursively`'s base case reads the
 /// `arith.cmpi`'s predicate through `getSentientCmpIPredicate` (entry 048) and its two operands
-/// straight through (`StandardToSentient.cpp:126-133`); by the time the nesting rule below applies,
+/// straight through (`StandardToSentient.cpp:126-132`); by the time the nesting rule below applies,
 /// the conjunct is a predicate and two values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conjunct {
@@ -475,6 +475,80 @@ pub fn lower_constant_int_to_sentient(result: Val, value: IntConst) -> sen::Op {
         result,
         reg_locale: sen::RegType::Imm,
         ty: value.ty(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 048/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e048_getSentientCmpIPredicate
+///
+/// **048/384** `getSentientCmpIPredicate` —
+/// `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36` (18L).
+///
+/// ```cpp
+/// static CmpIPredicate getSentientCmpIPredicate(
+///     mlir::arith::CmpIPredicate condop) {
+///   if (condop == mlir::arith::CmpIPredicate::eq) {
+///     return CmpIPredicate::eq;
+///   } else if (condop == mlir::arith::CmpIPredicate::ne) {
+///     return CmpIPredicate::ne;
+///   } else if (condop == mlir::arith::CmpIPredicate::slt) {
+///     return CmpIPredicate::slt;
+///   } else if (condop == mlir::arith::CmpIPredicate::sle) {
+///     return CmpIPredicate::sle;
+///   } else if (condop == mlir::arith::CmpIPredicate::sgt) {
+///     return CmpIPredicate::sgt;
+///   } else if (condop == mlir::arith::CmpIPredicate::sge) {
+///     return CmpIPredicate::sge;
+///   } else {
+///     DT_CHECK(0);
+///   }
+///   // to silence to warning
+///   return CmpIPredicate::eq;
+/// }
+/// ```
+///
+/// # ⭐⭐ THE SIX SIGNED PREDICATES, NARROWED ACROSS A RUNG BOUNDARY
+///
+/// `mlir::arith::CmpIPredicate` declares ten enumerators; `SentientTypes.td:474-489` declares six.
+/// So this is a narrowing and not a cast, which is why it is a function. Its one caller is
+/// `ConstructIFRecursively`'s base case (`:126-133`), which reads the `arith.cmpi`'s predicate through
+/// here and wraps the answer in a `CmpIPredicateAttr` for the `sentient.if` it builds — the value that
+/// ends up in [`Conjunct::predicate`].
+///
+/// # ⛔⛔ `DT_CHECK(0)` HAS NO INPUT HERE, BY CONSTRUCTION
+///
+/// `ult`/`ule`/`ugt`/`uge` are the four values that reach it. This island's [`CmpIPredicate`] declares
+/// the six signed forms and nothing else, *because* of this function — see that type's own note, which
+/// cites this entry by number. An unsigned comparison reaching this pipeline is a value the IR cannot
+/// hold rather than a run-time stop, so the abort is unreachable by construction and needs no arm.
+///
+/// # ⛔ AND THE FALL-THROUGH `return ...::eq;` IS NOT A DEFAULT
+///
+/// The comment says what it is: *"to silence to warning"*. `DT_CHECK(0)` does not return, so the line
+/// exists to give the compiler a terminating path and is dead in every build where the check is armed.
+/// Porting it as `_ => Eq` would turn an abort into the answer `eq` — a comparison silently lowered to
+/// the wrong branch. The `match` below is total over the six, so there is no arm to give it.
+///
+/// # ⚠️ AND THERE ARE TWO COPIES OF THIS FUNCTION IN THE REFERENCE
+///
+/// Entry 045 is the same if-chain, file-static in `SCFToSentient.cpp:33`, whose `else` is
+/// `llvm_unreachable("invalid predicate")` and which therefore has no fall-through return. Both are
+/// scheduled and each is ported in its own pass's home
+/// ([`super::std_scf_to_sentient::get_sentient_cmp_i_predicate`]) rather than shared: one file's copy
+/// diverging from the other's is a fact about the reference that a single helper would hide, and their
+/// `else` arms already differ.
+#[must_use]
+pub const fn get_sentient_cmp_i_predicate(condop: CmpIPredicate) -> sen::CmpPredicate {
+    match condop {
+        CmpIPredicate::Eq => sen::CmpPredicate::Eq,
+        CmpIPredicate::Ne => sen::CmpPredicate::Ne,
+        CmpIPredicate::Slt => sen::CmpPredicate::Slt,
+        CmpIPredicate::Sle => sen::CmpPredicate::Sle,
+        CmpIPredicate::Sgt => sen::CmpPredicate::Sgt,
+        CmpIPredicate::Sge => sen::CmpPredicate::Sge,
     }
 }
 
@@ -922,5 +996,96 @@ mod unit_tests {
         );
         assert_eq!(out.trim(), "%3 = arith.constant -3 : i32");
     }
-}
 
+    /// 🎯 048/384 — THE SIX SIGNED PREDICATES CROSS THE RUNG UNCHANGED, AND KEEP THEIR SPELLING.
+    ///
+    /// The input `%16 = arith.cmpi slt, %15, %c4096 : index` lowers to a `sentient.if` printing
+    /// `predicate = slt` (`dcc/test/Conversion/StandardToSentient/cmpi_select_different_BB.mlir`), so
+    /// a map that permuted two predicates would still be total, still exhaustive, and would invert a
+    /// branch.
+    #[test]
+    fn the_six_signed_predicates_cross_unchanged() {
+        for (arith_pred, sen_pred) in [
+            (CmpIPredicate::Eq, sen::CmpPredicate::Eq),
+            (CmpIPredicate::Ne, sen::CmpPredicate::Ne),
+            (CmpIPredicate::Slt, sen::CmpPredicate::Slt),
+            (CmpIPredicate::Sle, sen::CmpPredicate::Sle),
+            (CmpIPredicate::Sgt, sen::CmpPredicate::Sgt),
+            (CmpIPredicate::Sge, sen::CmpPredicate::Sge),
+        ] {
+            assert_eq!(get_sentient_cmp_i_predicate(arith_pred), sen_pred);
+            assert_eq!(
+                get_sentient_cmp_i_predicate(arith_pred).spelling(),
+                arith_pred.spelling(),
+                "the two rungs spell {arith_pred:?} the same way"
+            );
+        }
+    }
+
+    /// 🎯 048/384 — AND `eq` IS THE ANSWER TO `eq` ONLY.
+    ///
+    /// ⛔⛔ THE FALL-THROUGH `return ...::eq;` IS NOT A DEFAULT, and this is what it would look like
+    /// if it had been ported as one: five of the six predicates answering `eq`. The line exists to
+    /// silence a warning after an unreachable `DT_CHECK(0)`; see [`get_sentient_cmp_i_predicate`].
+    #[test]
+    fn eq_is_the_answer_to_eq_alone() {
+        let eq_answers: Vec<CmpIPredicate> = [
+            CmpIPredicate::Eq,
+            CmpIPredicate::Ne,
+            CmpIPredicate::Slt,
+            CmpIPredicate::Sle,
+            CmpIPredicate::Sgt,
+            CmpIPredicate::Sge,
+        ]
+        .into_iter()
+        .filter(|pred| get_sentient_cmp_i_predicate(*pred) == sen::CmpPredicate::Eq)
+        .collect();
+        assert_eq!(eq_answers, vec![CmpIPredicate::Eq]);
+    }
+
+    /// 🎯 048/384 + 052/384 — AND THE MAPPED PREDICATE IS THE ONE THE EMITTED `sentient.if` CARRIES.
+    ///
+    /// ⭐ THIS IS THE SEAM THE FUNCTION EXISTS FOR. `ConstructIFRecursively`'s base case
+    /// (`StandardToSentient.cpp:126-132`) reads the `arith.cmpi`'s predicate through here and wraps
+    /// the answer in a `CmpIPredicateAttr` on the `sentient.if` it builds, so the mapped value is
+    /// observable in the emitted op and not just in a local. `sge` is chosen because it is the one
+    /// predicate a `select` lowering in the reference's own test actually carries
+    /// (`cmpi_select_different_BB.mlir`) and the one an `eq`-only island could never have produced.
+    #[test]
+    fn the_mapped_predicate_reaches_the_emitted_if() {
+        let nest = NestedIf {
+            conjuncts: vec![Conjunct {
+                predicate: get_sentient_cmp_i_predicate(CmpIPredicate::Sge),
+                lhs: Val(18),
+                rhs: Val(1),
+                result: Val(30),
+                dbg_name: None,
+            }],
+            true_value: Val(20),
+            false_value: Val(19),
+            ty: ScalarTy::Index,
+        };
+        assert_eq!(
+            nest.into_op(),
+            vec![SenOp::Sentient(sen::Op::If {
+                predicate: sen::CmpPredicate::Sge,
+                lhs: Val(18),
+                rhs: Val(1),
+                yielded: vec![sen::Yielded {
+                    result: Val(30),
+                    reg: sen::Reg {
+                        locale: sen::RegType::Unknown,
+                        index: None,
+                    },
+                }],
+                dbg_name: None,
+                then_body: vec![SenOp::Sentient(sen::Op::Yield {
+                    results: vec![Val(20)],
+                })],
+                else_body: vec![SenOp::Sentient(sen::Op::Yield {
+                    results: vec![Val(19)],
+                })],
+            })]
+        );
+    }
+}

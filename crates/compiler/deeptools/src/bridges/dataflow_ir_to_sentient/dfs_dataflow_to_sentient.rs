@@ -78,8 +78,10 @@
 //! | `e337_lowerSyncOperation` | 337/384 | 80 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901` |
 //! | `e361_runOnOperation` | 361/384 | 33 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` |
 
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::units::DfirUnit;
+use crate::islands::sentient::dialects::sentient as sen;
+use crate::units::{Corelet, DfirUnit};
 
 /// Replaces: e039_isSenComponentL0LU
 ///
@@ -122,10 +124,318 @@ pub const fn is_sen_component_l0su(unit: DfirUnit) -> bool {
     matches!(unit.generic(), GenericComp::L0su)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 041/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH HALF OF THE LX A SYNC NAMES — the only two components either caller extends.
+///
+/// ⛔⛔ TWO CASES, BECAUSE BOTH CALL SITES GUARD ON EXACTLY TWO. `ExtendUnitNameToCorelet` is reached
+/// only under `(dst_comp == SenComponents::LXLU || dst_comp == SenComponents::LXSU)`
+/// (`DataflowToSentient.cpp:409-411` and `:709-713`) — the already-numbered `LXLU0`/`LXSU0`/`LXLU1`/
+/// `LXSU1` spellings and every L3 component take the sibling branch and are never extended. Taking a
+/// whole [`sen::Consumer`] here would offer fourteen inputs the reference cannot present, and each
+/// one would need a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LxHalf {
+    /// `lxlu` — the LX **load** unit, `SenComponents::LXLU`.
+    Load,
+    /// `lxsu` — the LX **store** unit, `SenComponents::LXSU`.
+    Store,
+}
+
+/// Replaces: e041_ExtendUnitNameToCorelet
+///
+/// **041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104` (11L).
+///
+/// ```cpp
+/// static inline LogicalResult ExtendUnitNameToCorelet(std::string &name,
+///                                                     dataflow::GetUnitOp unit,
+///                                                     OpBuilder builder) {
+///   if (!unit->hasAttr("corelet")) {
+///     unit->emitError("Unknown corelet information for sentient");
+///     return LogicalResult::failure();
+///   }
+///   if (unit->getAttr("corelet") == builder.getI32IntegerAttr(0)) {
+///     name += "0";
+///   } else {
+///     name += "1";
+///   }
+///   return LogicalResult::success();
+/// }
+/// ```
+///
+/// # ⭐⭐ THE NAME IT EXTENDS BECOMES A `SentientLoadConsumer`, WHICH IS WHY THE RESULT IS ONE
+///
+/// Both callers feed the extended string straight into
+/// `symbolizeSentientLoadConsumer(dst_unit_name).value()` and wrap it in a
+/// `SentientLoadConsumerAttr` (`:419-421` and `:715-718`). So the function's real output is not text:
+/// it is the choice between `lxlu0` and `lxlu1` (or `lxsu0`/`lxsu1`) that the sync op carries. Naming
+/// it [`sen::Consumer`] is what makes `.value()` — an `std::optional` unwrap that aborts on a
+/// spelling the enum has no case for — unreachable.
+///
+/// # ⛔ ANY NON-ZERO CORELET BECOMES `1`, AND THAT IS THE REFERENCE'S OWN CHOICE
+///
+/// The test is `== builder.getI32IntegerAttr(0)`, with a bare `else`. There is no `lxlu2` in
+/// `SentientLoadConsumer` (`SentientTypes.td:556-596`), so a third corelet could not be named even if
+/// the arm existed — the vocabulary tops out at two. `SenComponents::LXLU1` is what corelet 1 gets and
+/// what anything above it would get.
+///
+/// # ⛔⛔ AND THE ERROR ARM HAS NO INPUT HERE, BY CONSTRUCTION
+///
+/// The refusal is *"Unknown corelet information for sentient"* — a `get_unit` with no `corelet`
+/// attribute. In this crate a unit's attributes come from [`crate::units::residency_of`], which sends
+/// **both** LX halves to `Residency::Corelet { core, corelet }` unconditionally
+/// (`src/units.rs:583-594`, following `UnitMaterializer.cpp:82-115`): an `lxlu` that carries no
+/// corelet is not constructible. Taking a [`Corelet`] rather than a whole
+/// [`crate::units::Residency`] is that guard — the three residencies without a corelet cannot be
+/// passed, so the failure is a build error at the call site instead of a run-time refusal.
+#[must_use]
+pub const fn extend_unit_name_to_corelet(half: LxHalf, corelet: Corelet) -> sen::Consumer {
+    match (half, corelet.get()) {
+        (LxHalf::Load, 0) => sen::Consumer::Lxlu0,
+        (LxHalf::Load, _) => sen::Consumer::Lxlu1,
+        (LxHalf::Store, 0) => sen::Consumer::Lxsu0,
+        (LxHalf::Store, _) => sen::Consumer::Lxsu1,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 042/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e042_isSameListOfUnits
+///
+/// **042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175` (10L).
+///
+/// ```cpp
+/// static bool isSameListOfUnits(
+///     std::vector<mlir::Operation *> key_units,
+///     std::vector<mlir::dataflow::GetUnitOp> src_unit_ops) {
+///   std::vector<mlir::dataflow::GetUnitOp> key_unit_ops;
+///   for (auto key : key_units) {
+///     if (auto unit = llvm::dyn_cast<dataflow::GetUnitOp>(key)) {
+///       key_unit_ops.push_back(unit);
+///     } else {
+///       return false;
+///     }
+///   }
+///   return src_unit_ops == key_unit_ops;
+/// }
+/// ```
+///
+/// # ⭐⭐ IT COMPARES OP **IDENTITY**, NOT UNIT KIND
+///
+/// `std::vector<GetUnitOp> == std::vector<GetUnitOp>` compares element-wise, and an `OpState`'s
+/// `operator==` is *"the same operation"* — the underlying `Operation *`. So two distinct `get_unit`
+/// ops that both bind `C0-lxlu-CL0` are **not** the same list. Comparing kinds instead would answer
+/// `true` for two different bindings of one unit, and the caller uses this to decide whether a
+/// memoised lowering may be reused.
+///
+/// Here a `get_unit`'s identity is the [`Val`] it defines: values are minted once
+/// ([`crate::islands::dataflow_ir::Values::mint`]) and no two ops share one, so `result` equality
+/// *is* pointer equality. That is why the source side is a list of [`Val`]s and not of units.
+///
+/// # ⭐ LENGTH IS PART OF IT
+///
+/// `std::vector::operator==` compares sizes first, so a prefix is not a match. Slice equality says
+/// the same.
+///
+/// # ⛔ THE FIRST NON-`get_unit` KEY DECIDES, AND WHAT WAS PUSHED BEFORE IT IS DISCARDED
+///
+/// The reference returns from inside the loop, so a key list of `[get_unit, send]` is `false` however
+/// long the source list is — it never reaches the comparison.
+///
+/// # ⚠️ NO CALLER AT `a0d29abbed`
+///
+/// A grep of every `.cpp`/`.hpp`/`.h` in the authority tree finds this symbol exactly once, at its
+/// own definition: the memoising caller it was written for
+/// (`lowerL0LXSyncOperationForAUnit`, `:189`, entry 273) now keys its map another way. It is ported
+/// anyway — the campaign's rule is that a scheduled function gets its port and its audit, and a
+/// predicate the reference kept is not this port's to delete.
+#[must_use]
+pub fn is_same_list_of_units(key_units: &[DfirOp], src_unit_ops: &[Val]) -> bool {
+    let mut key_unit_ops: Vec<Val> = Vec::with_capacity(key_units.len());
+    for key in key_units {
+        match key {
+            // `dyn_cast<dataflow::GetUnitOp>(key)` succeeded.
+            DfirOp::Dataflow(dataflow::Op::GetUnit { result, .. }) => key_unit_ops.push(*result),
+            // ⛔ IT DID NOT — and the dialects are spelled out rather than wildcarded so that a new
+            // op cannot silently join the `false` side without being looked at.
+            DfirOp::Dataflow(_)
+            | DfirOp::Arith(_)
+            | DfirOp::Scf(_)
+            | DfirOp::Affine(_)
+            | DfirOp::Agen(_)
+            | DfirOp::VectorChain(_) => return false,
+        }
+    }
+    src_unit_ops == key_unit_ops.as_slice()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 043/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e043_isTargetL3
+///
+/// **043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720` (6L).
+///
+/// ```cpp
+/// static bool isTargetL3(uniform::QueryMapOp query_map) {
+///   auto unit_type =
+///       dcc::uniform::utils::getUnitTypeFromUniformMappingAsString(query_map);
+///   if (unit_type.has_value())
+///     return (unit_type.value().substr(0, 2) == "l3" ? true : false);
+///   return true;
+/// }
+/// ```
+///
+/// # ⭐⭐ ONLY THE **FIRST** QUERIED VALUE IS READ
+///
+/// `getUnitTypeFromUniformMappingAsString` (`dcc/src/Dialect/Uniform/Utils.cpp:258-284`, itself
+/// outside the 384) takes `def_map_op.getValues()[0]` and returns that one unit's `type` (for a
+/// `get_unit`) or its `name` (for a `get_local_unit`), lower-cased. It never looks at the rest — a
+/// query naming `[l3lu, lxlu]` answers on the `l3lu` alone. Hence [`slice::first`] and not `all` or
+/// `any`.
+///
+/// # ⛔⛔ AND ABSENT MEANS **TRUE**, WHICH IS THE OPPOSITE DEFAULT FROM THE ONE IT LOOKS LIKE
+///
+/// `std::nullopt` — no `DefImmutableMappingOp` behind the map, or a mapping with no values at all —
+/// returns `true`, i.e. *treat the target as L3*. In the caller (`:1838`) that picks the single merged
+/// `lowerSyncLXL3ToLXL3(..., -1, false)` over the two-region `uniform::UniformizeRegionsOp` split, so
+/// defaulting the other way would emit two per-corelet regions for a sync the reference emits once.
+/// An empty list here is that case.
+///
+/// # ⛔ THE THIRD OUTCOME OF THE C++ HELPER IS UNREPRESENTABLE HERE, AND THAT IS THE GUARD
+///
+/// If `values[0]` is defined by neither a `get_unit` nor a `get_local_unit`, the helper falls out of
+/// both branches and returns a **present but empty** string — so `substr(0, 2)` is `""` and the answer
+/// is `false`, not the `true` of the absent case. Two very different defaults, told apart by whether
+/// the string exists. A query map here names units by type ([`DfirUnit`]), so "a queried value that is
+/// not a unit" has no spelling; the two cases that remain are the two this function distinguishes.
+///
+/// # ⛔ `l3` IS A PREFIX TEST OVER THE LOWER-CASED SPELLING, AND ONLY THE TWO L3 HALVES PASS IT
+///
+/// `l3lu` and `l3su` are the only unit spellings in the vocabulary beginning `l3` — `l0`, `lx`,
+/// `lxlu`, `lxsu` and `lxvirtualibr` all fail it, and so does every `get_local_unit` name. Matching
+/// the variants states that without putting a string comparison in the compiler.
+#[must_use]
+pub fn is_target_l3(queried_units: &[DfirUnit]) -> bool {
+    match queried_units.first() {
+        // `!def_map_op` or `getValues().empty()` — `std::nullopt`, and the default is `true`.
+        None => true,
+        // `unit_type.value().substr(0, 2) == "l3"`.
+        Some(unit) => matches!(unit, DfirUnit::L3lu | DfirUnit::L3su),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 044/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e044_lowerOpaqueOperation
+///
+/// **044/384** `DataflowToSentientLoweringPass::lowerOpaqueOperation` —
+/// `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984` (27L).
+///
+/// ```cpp
+/// LogicalResult DataflowToSentientLoweringPass::lowerOpaqueOperation(
+///     dataflow::OpaqueOp opaque_op) {
+///   for (auto itr : opaque_op.getReadWriteRegisterDictionary()) {
+///     if (!mlir::dyn_cast<StringAttr>(itr.getValue())) {
+///       opaque_op->emitError("Registers parameters should have values.");
+///       return LogicalResult::failure();
+///     }
+///   }
+///   for (auto itr : opaque_op.getReadOnlyRegisterDictionary()) {
+///     if (!mlir::dyn_cast<StringAttr>(itr.getValue())) {
+///       opaque_op->emitError("Registers parameters should have values.");
+///       return LogicalResult::failure();
+///     }
+///   }
+///   for (auto itr : opaque_op.getParameterDictionary()) {
+///     if (!mlir::dyn_cast<StringAttr>(itr.getValue())) {
+///       opaque_op->emitError("Parameters should have values.");
+///       return LogicalResult::failure();
+///     }
+///   }
+///   OpBuilder builder(opaque_op);
+///   auto dofunc = opaque_op.getFuncName();
+///   StringAttr dbg_name_attr = getDbgNameAttr(opaque_op);
+///   sentient::OpaqueOp::create(builder, opaque_op->getLoc(), dbg_name_attr,
+///                              dofunc, opaque_op.getReadWriteRegisterDictionary(),
+///                              opaque_op.getReadOnlyRegisterDictionary(),
+///                              opaque_op.getParameterDictionary());
+///   return LogicalResult::success();
+/// }
+/// ```
+///
+/// # ⭐⭐ EVERY FIELD CROSSES UNCHANGED, INCLUDING THE ORDER WITHIN EACH DICTIONARY
+///
+/// The three dictionaries are handed over as whole `DictionaryAttr`s, so the lowered op's registers
+/// and parameters are byte-for-byte the ones the rung below wrote. IBM's own answer key is one line
+/// (`dcc/test/Conversion/DataflowToSentient/opaque.mlir:18`):
+///
+/// ```text
+/// sentient.opaque {dbgName = "opaque_op #1", func_name = "reciprocal", parameter_dictionary = {a = "A", b = "B", c = "C"}, read_only_register_dictionary = {}, read_write_register_dictionary = {P0 = "R0", P1 = "R1"}}
+/// ```
+///
+/// from the input `dataflow.opaque {dbgName="opaque_op #1", func_name= "reciprocal",
+/// read_write_register_dictionary = {"P0" = "R0", "P1" = "R1"}, read_only_register_dictionary = {},
+/// parameter_dictionary = {"a" = "A", "b" = "B","c" = "C"}}` (`:32`). Note that the EMPTY dictionary
+/// is still printed, and that `read_only`/`read_write` do not swap.
+///
+/// ⚠️ THAT ANSWER KEY IS WHY THE PRINTER CHANGED IN THIS CHANGESET. `sentient.opaque` was rendering
+/// `func_name = "RECIPROCAL"` (the generated enum's own spelling) and `{P0 = "0"}` (the register
+/// address with no `R`), neither of which is what the reference forwards. Both are fixed in
+/// [`crate::islands::sentient::dialects::sentient`]; the dictionaries are also key-sorted there now,
+/// as MLIR stores them and as the rung below already printed them.
+///
+/// # ⛔⛔ ALL THREE VALIDATION LOOPS HAVE NO INPUT, BY CONSTRUCTION
+///
+/// Each loop asks only whether a dictionary's value is a `StringAttr` — the reference's dictionaries
+/// are `DictionaryAttr`s that could hold an integer, an array or a nested dictionary. Ours cannot: a
+/// register binds to a [`dataflow::RegAddr`] and a parameter to a
+/// [`crate::generated::ParamValue`], both by type. So *"Registers parameters should have values."* and
+/// *"Parameters should have values."* are unreachable rather than unchecked — and the newtype exists
+/// **because** of this check: an empty `String` once satisfied it and then substituted an empty
+/// operand into the instruction (see [`dataflow::RegAddr`]).
+///
+/// # ⛔ WHAT THE PORT DROPS
+///
+/// `OpBuilder builder(opaque_op)` positions the insertion point; the caller
+/// (`runOnOperation`, `:2027-2029`, entry 361) overrides it with
+/// `builder.setInsertionPointToStart(&unit_op.getRegion().front())` before this runs, so the
+/// `sentient.opaque` lands at the TOP of the unit's region and the `dataflow.opaque` is erased
+/// afterwards via `to_be_deleted`. Both are placement, which is the one mechanism this campaign's
+/// ports may drop — the op itself is what this function decides.
+#[must_use]
+pub fn lower_opaque_operation(opaque: &dataflow::Opaque) -> sen::Op {
+    sen::Op::Opaque {
+        // `opaque_op.getFuncName()`.
+        func: opaque.func,
+        // `opaque_op.getReadWriteRegisterDictionary()` — ⛔ FIRST OF THE TWO, and the reference
+        // passes read-write before read-only (`:2007-2009`).
+        read_write: opaque.read_write.clone(),
+        // `opaque_op.getReadOnlyRegisterDictionary()`.
+        read_only: opaque.read_only.clone(),
+        // `opaque_op.getParameterDictionary()`.
+        params: opaque.params.clone(),
+        // `getDbgNameAttr(opaque_op)` — absent stays absent: `getDbgNameAttr` returns a null
+        // `StringAttr` when the op has no `dbgName`, and `sentient::OpaqueOp::create` takes it as the
+        // optional attribute it is declared to be.
+        dbg_name: opaque.dbg_name.clone(),
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::units::Row;
+    use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
+    use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
+    use crate::islands::sentient::dialects::Op as SenOp;
+    use crate::units::{Core, Row};
 
     /// 🎯 039/384 + 040/384 — THE LOAD HALF AND THE STORE HALF ARE TOLD APART.
     ///
@@ -174,5 +484,297 @@ mod unit_tests {
                 "{unit:?} is not the L0 store unit"
             );
         }
+    }
+    /// Corelet 0 of this build's arch.
+    fn corelet0() -> Corelet {
+        Corelet::checked(0).expect("every arch has corelet 0")
+    }
+
+    /// Corelet 1 of this build's arch.
+    fn corelet1() -> Corelet {
+        Corelet::checked(1).expect("every arch this crate builds for has two corelets")
+    }
+
+    /// 🎯 041/384 — THE CORELET PICKS THE NUMBERED CONSUMER, AND THE HALVES DO NOT CROSS.
+    ///
+    /// ⛔ `lxlu` + corelet 1 IS `lxlu1`, which is the reference's own worked case: `type = "lxlu"`
+    /// with `corelet = 1` becomes `SentientLoadConsumer::lxlu1` (`DataflowToSentient.cpp:104-117`
+    /// feeding `symbolizeSentientLoadConsumer` at `:419-421`). Extending the STORE half's name with
+    /// the LOAD half's number would name a unit that is not on the other end of the sync.
+    #[test]
+    fn the_corelet_numbers_the_lx_consumer() {
+        assert_eq!(
+            extend_unit_name_to_corelet(LxHalf::Load, corelet0()),
+            sen::Consumer::Lxlu0
+        );
+        assert_eq!(
+            extend_unit_name_to_corelet(LxHalf::Load, corelet1()),
+            sen::Consumer::Lxlu1
+        );
+        assert_eq!(
+            extend_unit_name_to_corelet(LxHalf::Store, corelet0()),
+            sen::Consumer::Lxsu0
+        );
+        assert_eq!(
+            extend_unit_name_to_corelet(LxHalf::Store, corelet1()),
+            sen::Consumer::Lxsu1
+        );
+    }
+
+    /// 🎯 041/384 — AND THE EXTENDED NAME IS THE SPELLING `symbolizeSentientLoadConsumer` TAKES.
+    ///
+    /// ⭐ THE REFERENCE APPENDS A DIGIT TO A NAME AND THEN LOOKS THE WHOLE STRING UP. So the port is
+    /// only right if the consumer it returns spells `"lxlu"` + `"0"`; a variant whose spelling were
+    /// `lxlu_0` would round-trip through nothing.
+    #[test]
+    fn the_numbered_consumer_spells_the_extended_name() {
+        for (half, corelet, spelling) in [
+            (LxHalf::Load, corelet0(), "lxlu0"),
+            (LxHalf::Load, corelet1(), "lxlu1"),
+            (LxHalf::Store, corelet0(), "lxsu0"),
+            (LxHalf::Store, corelet1(), "lxsu1"),
+        ] {
+            assert_eq!(
+                extend_unit_name_to_corelet(half, corelet).spelling(),
+                spelling
+            );
+        }
+    }
+
+    /// A `dataflow.get_unit` binding `unit` on core 0, corelet 0.
+    fn get_unit(result: u32, unit: DfirUnit) -> DfirOp {
+        let core = Core::checked(0).expect("every arch has core 0");
+        DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: crate::units::residency_of(unit, core, corelet0()),
+            unit,
+        })
+    }
+
+    /// 🎯 042/384 — THE SAME OPS IN THE SAME ORDER, AND NOTHING ELSE IS THE SAME LIST.
+    ///
+    /// ⛔ IDENTITY, NOT KIND. The last case is two DIFFERENT bindings of the same two units: the
+    /// reference compares `Operation *`s, so that is `false`. A port that compared unit kinds would
+    /// reuse a memoised lowering keyed on somebody else's `get_unit`.
+    #[test]
+    fn the_same_list_of_units_is_the_same_ops() {
+        let keys = vec![get_unit(3, DfirUnit::Lxlu), get_unit(4, DfirUnit::L3lu)];
+
+        assert!(is_same_list_of_units(&keys, &[Val(3), Val(4)]));
+        // Order matters.
+        assert!(!is_same_list_of_units(&keys, &[Val(4), Val(3)]));
+        // Length matters — a prefix is not a match.
+        assert!(!is_same_list_of_units(&keys, &[Val(3)]));
+        assert!(!is_same_list_of_units(&keys, &[Val(3), Val(4), Val(5)]));
+        // Different bindings of the same units are different ops.
+        assert!(!is_same_list_of_units(&keys, &[Val(7), Val(8)]));
+    }
+
+    /// 🎯 042/384 — A KEY THAT IS NOT A `get_unit` DECIDES ON ITS OWN.
+    ///
+    /// ⛔ AND IT DECIDES EVEN THOUGH THE `get_unit`s BEFORE IT MATCHED. The reference returns from
+    /// inside the loop (`DataflowToSentient.cpp:180-184`), so the comparison never runs.
+    #[test]
+    fn a_key_that_is_not_a_get_unit_refuses_the_whole_list() {
+        let keys = vec![
+            get_unit(3, DfirUnit::Lxlu),
+            DfirOp::Dataflow(dataflow::Op::SyncSend {
+                to: Val(3),
+                signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
+            }),
+        ];
+        assert!(!is_same_list_of_units(&keys, &[Val(3), Val(4)]));
+        // Not even against the one value it did collect.
+        assert!(!is_same_list_of_units(&keys, &[Val(3)]));
+    }
+
+    /// 🎯 042/384 — TWO EMPTY LISTS ARE THE SAME LIST.
+    ///
+    /// ⭐ THE LOOP BODY NEVER RUNS AND `{} == {}`. No arm of the reference excludes it.
+    #[test]
+    fn two_empty_lists_are_the_same_list() {
+        assert!(is_same_list_of_units(&[], &[]));
+        assert!(!is_same_list_of_units(&[], &[Val(0)]));
+    }
+
+    /// 🎯 043/384 — ONLY THE FIRST QUERIED UNIT IS READ.
+    ///
+    /// ⛔ `getValues()[0]` (`dcc/src/Dialect/Uniform/Utils.cpp:268`). A query naming an L3 half first
+    /// is an L3 target however the rest of the list reads, and one naming an LX half first is not —
+    /// which is the difference between one merged `lowerSyncLXL3ToLXL3(..., -1, false)` and a
+    /// two-region uniformize split (`DataflowToSentient.cpp:1838-1860`).
+    #[test]
+    fn only_the_first_queried_unit_decides_the_l3_target() {
+        assert!(is_target_l3(&[DfirUnit::L3lu]));
+        assert!(is_target_l3(&[DfirUnit::L3su]));
+        assert!(is_target_l3(&[DfirUnit::L3lu, DfirUnit::Lxlu]));
+        assert!(!is_target_l3(&[DfirUnit::Lxlu, DfirUnit::L3lu]));
+    }
+
+    /// 🎯 043/384 — AND NO QUERIED UNIT AT ALL IS **TRUE**.
+    ///
+    /// ⛔⛔ THE DEFAULT IS THE L3 SIDE. `std::nullopt` — no `DefImmutableMappingOp`, or a mapping with
+    /// no values — reaches `return true` (`DataflowToSentient.cpp:1725`). Defaulting to `false` would
+    /// split a sync into two corelet regions the reference emits as one.
+    #[test]
+    fn a_query_naming_nothing_is_an_l3_target() {
+        assert!(is_target_l3(&[]));
+    }
+
+    /// 🎯 043/384 — AND `l3` IS A PREFIX NO OTHER UNIT SPELLING HAS.
+    ///
+    /// ⛔ `l0` AND `lx` BOTH BEGIN WITH `l`. The reference tests `substr(0, 2) == "l3"`, so the L0 and
+    /// LX halves — the units this arm exists to tell the L3 apart from — are not L3 targets.
+    #[test]
+    fn no_other_unit_spelling_begins_l3() {
+        for unit in [
+            DfirUnit::Lxlu,
+            DfirUnit::Lxsu,
+            DfirUnit::Lx,
+            DfirUnit::L0lu,
+            DfirUnit::L0su,
+            DfirUnit::L0,
+            DfirUnit::LxVirtualIbr,
+            DfirUnit::Hbm,
+            DfirUnit::Pe,
+            DfirUnit::Sfp,
+        ] {
+            assert!(
+                !is_target_l3(&[unit]),
+                "{unit:?} does not spell an l3 unit type"
+            );
+            assert!(
+                !unit.spelling().starts_with("l3"),
+                "{unit:?} must also fail the reference's own prefix test"
+            );
+        }
+        for unit in [DfirUnit::L3lu, DfirUnit::L3su] {
+            assert!(unit.spelling().starts_with("l3"));
+        }
+    }
+
+    /// IBM's own opaque body, typed — `dcc/test/Conversion/DataflowToSentient/opaque.mlir:32`.
+    ///
+    /// ⚠️ WITH THIS CRATE'S OWN VOCABULARY, NOT THE TEST FILE'S STRINGS. `func_name = "reciprocal"` is
+    /// [`OpaqueFunc::Reciprocal`]; the vendored file's `P0`/`a`/`A` are hand-written names that no
+    /// template in this crate's census declares, so the registers and parameters here are real
+    /// [`RegName`]/[`ParamKey`]/[`ParamValue`] cases. What is under test is the FORWARDING, and the
+    /// shape — two read-write registers, an empty read-only dictionary, three parameters, a `dbgName`
+    /// — is the vendored one.
+    fn ibms_opaque() -> dataflow::Opaque {
+        dataflow::Opaque {
+            func: OpaqueFunc::Reciprocal,
+            read_write: vec![
+                (RegName::A00, RegAddr(0)),
+                (RegName::A01, RegAddr(1)),
+            ],
+            read_only: Vec::new(),
+            params: vec![
+                (ParamKey::Prec, ParamValue::Fp16),
+                (ParamKey::Unroll, ParamValue::N4),
+                (ParamKey::Out0, ParamValue::Result),
+            ],
+            dbg_name: Some("opaque_op #1".to_owned()),
+        }
+    }
+
+    /// 🎯 044/384 — EVERY FIELD CROSSES THE RUNG UNCHANGED.
+    ///
+    /// ⛔ INCLUDING THE EMPTY DICTIONARY AND THE `dbgName`. The reference hands all three
+    /// `DictionaryAttr`s and `getDbgNameAttr(opaque_op)` to `sentient::OpaqueOp::create`
+    /// (`DataflowToSentient.cpp:2005-2010`); dropping the empty one would change the op's attribute
+    /// set, and dropping the name loses the only handle a debugger has on a spliced `.smc` body.
+    #[test]
+    fn the_opaque_body_crosses_the_rung_unchanged() {
+        let dfir = ibms_opaque();
+        assert_eq!(
+            lower_opaque_operation(&dfir),
+            sen::Op::Opaque {
+                func: OpaqueFunc::Reciprocal,
+                read_write: vec![(RegName::A00, RegAddr(0)), (RegName::A01, RegAddr(1))],
+                read_only: Vec::new(),
+                params: vec![
+                    (ParamKey::Prec, ParamValue::Fp16),
+                    (ParamKey::Unroll, ParamValue::N4),
+                    (ParamKey::Out0, ParamValue::Result),
+                ],
+                dbg_name: Some("opaque_op #1".to_owned()),
+            }
+        );
+    }
+
+    /// 🎯 044/384 — AND THE TWO DICTIONARIES DO NOT SWAP.
+    ///
+    /// ⛔⛔ THE ARGUMENT ORDER IS `read_write` THEN `read_only` (`:2007-2008`), and the two mean
+    /// opposite things: `read_write` is the body's INTERNAL scratch, `read_only` the caller-bound
+    /// input/output registers (`ddcv1.cpp:3369-3391`). A port that crossed them would bind a kernel's
+    /// scratch registers to its caller's operands.
+    #[test]
+    fn the_register_dictionaries_do_not_swap() {
+        let dfir = dataflow::Opaque {
+            func: OpaqueFunc::Exp,
+            read_write: vec![(RegName::A00, RegAddr(0))],
+            read_only: vec![(RegName::A01, RegAddr(8))],
+            params: Vec::new(),
+            dbg_name: None,
+        };
+        let sen::Op::Opaque {
+            read_write,
+            read_only,
+            dbg_name,
+            ..
+        } = lower_opaque_operation(&dfir)
+        else {
+            panic!("lowering an opaque yields an opaque");
+        };
+        assert_eq!(read_write, vec![(RegName::A00, RegAddr(0))]);
+        assert_eq!(read_only, vec![(RegName::A01, RegAddr(8))]);
+        // ⭐ ABSENT STAYS ABSENT — `getDbgNameAttr` returns a null attribute for an op without one.
+        assert_eq!(dbg_name, None);
+    }
+
+    /// 🎯 044/384 — AND THE LOWERED OP PRINTS AS IBM'S ANSWER KEY WRITES IT.
+    ///
+    /// ⛔⛔ THIS IS THE TEST THAT FOUND THE PRINTER DEFECTS. The expectation is
+    /// `dcc/test/Conversion/DataflowToSentient/opaque.mlir:18` — key-sorted attributes, a lower-cased
+    /// `func_name`, and register addresses carrying the `R` that
+    /// `dcc/src/Dialect/Sentient/Utils.cpp:157` strips back off by position. `sentient.opaque` was
+    /// printing `func_name = "RECIPROCAL"` and `{a0_0 = "0"}`, which is the wrong port, silently.
+    #[test]
+    fn the_lowered_opaque_prints_as_the_reference_writes_it() {
+        let mut out = String::new();
+        crate::islands::sentient::print::emit(
+            &mut out,
+            &SenOp::Sentient(lower_opaque_operation(&ibms_opaque())),
+            0,
+        );
+        assert_eq!(
+            out.trim(),
+            "sentient.opaque {dbgName = \"opaque_op #1\", func_name = \"reciprocal\", \
+             parameter_dictionary = {out0 = \"result\", prec = \"fp16\", unroll = \"4\"}, \
+             read_only_register_dictionary = {}, \
+             read_write_register_dictionary = {a0_0 = \"R0\", a0_1 = \"R1\"}}"
+        );
+    }
+
+    /// 🎯 044/384 — AND THE RUNG BELOW PRINTS THE SAME BODY, WHICH IS WHERE IT CAME FROM.
+    ///
+    /// ⭐ THE INPUT SIDE OF THE ANSWER KEY (`opaque.mlir:32`). `dataflow.opaque` gained its `dbgName`
+    /// in this changeset precisely so that [`lower_opaque_operation`] has one to forward.
+    #[test]
+    fn the_dataflow_opaque_prints_its_debug_name() {
+        let mut out = String::new();
+        crate::islands::dataflow_ir::print::emit(
+            &mut out,
+            &DfirOp::Dataflow(dataflow::Op::Opaque(ibms_opaque())),
+            0,
+        );
+        assert_eq!(
+            out.trim(),
+            "dataflow.opaque {dbgName = \"opaque_op #1\", func_name = \"reciprocal\", \
+             parameter_dictionary = {out0 = \"result\", prec = \"fp16\", unroll = \"4\"}, \
+             read_only_register_dictionary = {}, \
+             read_write_register_dictionary = {a0_0 = \"R0\", a0_1 = \"R1\"}}"
+        );
     }
 }

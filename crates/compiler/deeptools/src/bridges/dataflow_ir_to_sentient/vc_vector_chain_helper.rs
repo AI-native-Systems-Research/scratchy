@@ -354,7 +354,7 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             | dfir_op::dataflow::Op::SyncSend { .. }
             | dfir_op::dataflow::Op::SyncRecv { .. }
             | dfir_op::dataflow::Op::ImplicitSync { .. }
-            | dfir_op::dataflow::Op::Opaque { .. },
+            | dfir_op::dataflow::Op::Opaque(_),
         ) => None,
         // `agen::VectorLoadOp` and `agen::VectorStoreOp`.
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad { ty, .. }) => Some(*ty),

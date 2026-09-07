@@ -157,7 +157,7 @@ pub fn operands(op: &Op) -> Vec<Val> {
             }
         },
         Op::Dataflow(op) => match op {
-            dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque(_) => {}
             dataflow::Op::GetLocalUnit { of, .. } => reads.push(*of),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => reads.extend([*from, *start]),
             dataflow::Op::ProgramUnit { units, .. } => reads.extend(units.iter().copied()),
@@ -280,7 +280,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::SyncSend { .. }
             | dataflow::Op::SyncRecv { .. }
             | dataflow::Op::ImplicitSync { .. }
-            | dataflow::Op::Opaque { .. } => Vec::new(),
+            | dataflow::Op::Opaque(_) => Vec::new(),
         },
         Op::Agen(op) => match op {
             agen::Op::VectorLoad { result, .. } => vec![*result],

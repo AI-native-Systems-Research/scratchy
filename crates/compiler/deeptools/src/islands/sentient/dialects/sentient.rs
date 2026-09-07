@@ -3119,7 +3119,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             dbg_name,
         } => {
             let mut attrs = vec![
-                attr("func_name", &quoted(func.spelling())),
+                // ⛔ LOWER-CASED, WHICH IS WHAT THE RUNG BELOW WROTE. The generated enum spells the
+                // template's `RECIPROCAL`; `dataflow.opaque` prints `func_name = "reciprocal"` and
+                // `lowerOpaqueOperation` forwards that `StringAttr` untouched, so IBM's lowered
+                // output is `func_name = "reciprocal"` too
+                // (`dcc/test/Conversion/DataflowToSentient/opaque.mlir:18`).
+                attr("func_name", &quoted(&func.spelling().to_lowercase())),
                 attr(
                     "read_write_register_dictionary",
                     &reg_dict(read_write),
@@ -3306,20 +3311,50 @@ fn bool_array(flags: impl Iterator<Item = bool>) -> String {
 
 /// An opaque's register dictionary — symbol to the address its allocation starts at.
 fn reg_dict(entries: &[(RegName, RegAddr)]) -> String {
-    let rendered: Vec<String> = entries
-        .iter()
-        .map(|(name, addr)| format!("{} = \"{}\"", name.spelling(), addr.0))
-        .collect();
-    format!("{{{}}}", rendered.join(", "))
+    // ⛔⛔ THE `R` IS LOAD-BEARING AND WAS MISSING. `insertReg` writes
+    // `"R" + std::to_string(startAddress)` (`ddc/ddcv1.cpp:3350`) and the consumer takes it back off
+    // BY POSITION: `port_str = "lrf" + port_str.erase(0, 1)`
+    // (`dcc/src/Dialect/Sentient/Utils.cpp:157`). IBM's own lowered output is
+    // `read_write_register_dictionary = {P0 = "R0", P1 = "R1"}`
+    // (`dcc/test/Conversion/DataflowToSentient/opaque.mlir:18`); a bare `"0"` becomes `lrf`, which is
+    // no port at all. `dataflow.opaque` prints it — `lowerOpaqueOperation` forwards the dictionary
+    // unchanged, so `sentient.opaque` must print the same string.
+    sorted_dict(entries, |name: RegName| name.spelling(), |addr: RegAddr| {
+        format!("R{}", addr.0)
+    })
 }
 
 /// An opaque's parameter dictionary.
 fn param_dict(entries: &[(ParamKey, ParamValue)]) -> String {
-    let rendered: Vec<String> = entries
-        .iter()
-        .map(|(key, value)| format!("{} = \"{}\"", key.spelling(), value.spelling()))
-        .collect();
-    format!("{{{}}}", rendered.join(", "))
+    sorted_dict(
+        entries,
+        |key: ParamKey| key.spelling(),
+        |value: ParamValue| value.spelling().to_owned(),
+    )
+}
+
+/// A `{key = "value", ..}` attribute dictionary, KEY-SORTED.
+///
+/// ⛔ SORTED BECAUSE MLIR SORTS. A `DictionaryAttr` is stored key-ordered, so a round trip through
+/// the parser reorders anything else — and a printer whose output does not survive a round trip
+/// cannot be checked against the vendored files. The rung below prints its dictionaries the same way
+/// (`crate::islands::dataflow_ir::dialects::dataflow`).
+fn sorted_dict<K: Copy, V: Copy>(
+    entries: &[(K, V)],
+    key: impl Fn(K) -> &'static str,
+    value: impl Fn(V) -> String,
+) -> String {
+    let mut sorted: Vec<(&'static str, String)> =
+        entries.iter().map(|(k, v)| (key(*k), value(*v))).collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    format!(
+        "{{{}}}",
+        sorted
+            .iter()
+            .map(|(key, value)| format!("{key} = \"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// `name = value`.
