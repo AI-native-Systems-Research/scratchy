@@ -103,7 +103,55 @@ use crate::arch::Elements;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{Val, agen};
 use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet};
+use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// THE VOCABULARY `AccessDetails` IS WRITTEN IN.
+//
+// ⭐ These are the types the reference declares alongside the class in the same header, so they are
+// homed with it. Each one exists because a field of `AccessDetailsBase` or a parameter of one of its
+// members is an `int64_t`/`std::string`/`enum` in the C++ that this crate may not leave raw.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH ADDRESS OPERAND OF A MEMORY ACCESS ONE `AccessDetails` DESCRIBES — `MemoryOperandIndex`
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:38`).
+///
+/// ⛔⛔ FOUR OPERANDS, NOT FIVE. The reference's fifth enumerator `kMax` is not an operand at all —
+/// it is simultaneously the COUNT (`AccessContainer` sizes `index_mapping_` with `(int)kMax`,
+/// `:375`) and the "not set yet" value of `memory_index_` (`:151`), which the reference then has to
+/// defend at run time: `DT_CHECK_MSG(getMemoryIndex() != MemoryOperandIndex::kMax, ...)` appears
+/// three times (`AccessDetails.cpp:296`, `:443`, `:859`). Here "not set" is `None` in the field's own
+/// `Option`, so all three of those checks become the absence of a value rather than an assertion.
+///
+/// ⭐ WHICH ONES A GIVEN OP USES (`:31-35`): every memory op but the composite stores uses `kDirSrc`;
+/// `composite_load_and_store` uses `kDirSrc` for the load and `kDirDst` for the store;
+/// `composite_indirect_load_and_store` uses either or both of `kIndSrc` and `kIndDst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MemoryOperandIndex {
+    /// `kDirSrc` — the direct source operand.
+    DirSrc,
+    /// `kIndSrc` — the indirect source operand.
+    IndSrc,
+    /// `kDirDst` — the direct destination operand.
+    DirDst,
+    /// `kIndDst` — the indirect destination operand.
+    IndDst,
+}
+
+/// ONE COEFFICIENT OF A MEMORY VIEW'S LAYOUT MAP — a STRIDE, in elements.
+///
+/// ⛔ A NEWTYPE, AND SIGNED. `agen::utils::getMapCoefficients` flattens the view's `layout_map` into
+/// one coefficient per dimension plus a trailing CONSTANT term —
+/// `Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:50` asserts
+/// `layout_coeffs.size() == operands.size() + 1` — and the reference carries them as `int64_t`,
+/// flattened by MLIR's own `getFlattenedAffineExpr` (`dialect_utils/Agen/Utils.cpp:65-71`).
+/// Typing them as [`crate::arch::Elements`] would claim they are a COUNT of elements rather than a
+/// stride in elements, and its `u64` would assert a non-negativity `getMapCoefficients` never
+/// promises. Later units divide neighbours to recover extents (`AccessDetails.cpp:69`, `:151`,
+/// `:176`), so the ratio between two coefficients carries as much as either value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LayoutCoeff(pub i64);
 
 /// ONE TIME DIMENSION'S POSITION among a composite transfer's ordered time dimensions.
 ///
@@ -241,6 +289,72 @@ pub struct IndicesCoeffDict {
     pub constant: i64,
 }
 
+/// Replaces: e002_setCoalescedBoundValues
+///
+/// `AccessDetailsAffineComposite::setCoalescedBoundValues` —
+/// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672` (5L), entry 002/384.
+///
+/// ```cpp
+/// void AccessDetailsAffineComposite::setCoalescedBoundValues(
+///     SmallVectorImpl<int64_t>& time_bounds, int outer_dim, int inner_dim,
+///     int64_t coalesced_bound) {
+///   time_bounds[inner_dim] = coalesced_bound;
+///   for (int i = outer_dim + 1; i < inner_dim; i++) {
+///     time_bounds[i] = SpecialTimeBoundValues::kCoalesced;
+///   }
+/// }
+/// ```
+///
+/// ⚠️⚠️ THE EXTRACT DROPPED THE LOOP'S ONLY STATEMENT. `crustify-bridge2/source/bridge2.cpp:35-41`
+/// ends with `for (int i = outer_dim + 1; i < inner_dim; i++) {` and two bare braces — an empty loop,
+/// which is HALF of this function and the half that marks the merged dimensions. Ported from the
+/// authority at the cited line.
+///
+/// # ⛔⛔ THE WRITE SET IS `inner` PLUS THE DIMENSIONS STRICTLY BETWEEN, AND `outer` IS UNTOUCHED
+///
+/// The merged run's whole product lands on the INNERMOST dimension of the run and every dimension
+/// above it inside the run becomes [`TimeBound::Coalesced`], i.e. a trip count of 1
+/// (`Helper.cpp:1813-1819`). `outer_dim` itself is the dimension the run stopped BELOW — the loop
+/// starts at `outer_dim + 1` — so it keeps its own bound. Off by one at either end and the product of
+/// the trip counts changes, which is a transfer of the wrong length.
+///
+/// ⭐ `outer_dim == -1` IS A DELIBERATE SENTINEL, NOT AN ERROR. Its caller's scan runs
+/// `for (int time_index_outer = num_of_dim - 2; time_index_outer >= -1; --time_index_outer)` with the
+/// comment *"time_index_outer goes down to -1 to catch the outermost time dim"* (`:752-755`), so `-1`
+/// means *the run reaches the top of the nest* and `outer_dim + 1` is dimension 0. That is [`None`]
+/// here: an `Option<TimeDim>` cannot be confused with dimension zero, where an `i32` could.
+///
+/// ⭐ ONE DELIBERATE DIVERGENCE, AND THE MERGE IS ALL-OR-NOTHING BECAUSE OF IT. The reference
+/// subscripts `time_bounds[inner_dim]` directly, so an `inner_dim` past the end writes past the
+/// vector — and its marking loop then writes `kCoalesced` over every dimension there is, because
+/// `i < inner_dim` is true for all of them. Both halves of that are dropped here: with no
+/// `inner_dim` to receive the product, nothing is marked either, so the nest's trip count is
+/// preserved instead of collapsing to 1. For every in-range argument the written slots are exactly
+/// the reference's, and the only caller (`coalesceTimeDimensions:763`) is always in range.
+pub fn set_coalesced_bound_values(
+    time_bounds: &mut [TimeBound],
+    outer_dim: Option<TimeDim>,
+    inner_dim: TimeDim,
+    coalesced_bound: TimeBound,
+) {
+    // ⛔ `outer_dim + 1`, WITH `-1` MAPPING TO 0. `None` is the reference's `-1` sentinel, so the run
+    // starts at the outermost dimension; `Some(d)` starts one inside `d`, leaving `d` alone.
+    let first_merged = outer_dim.map_or(0, |outer| outer.index() + 1);
+    // ⛔ NO DIMENSION TO CARRY THE PRODUCT MEANS NO MERGE AT ALL — see the divergence note above.
+    if inner_dim.index() >= time_bounds.len() {
+        return;
+    }
+    for (dim, bound) in time_bounds.iter_mut().enumerate() {
+        if dim == inner_dim.index() {
+            // ⛔ THE WHOLE RUN'S PRODUCT, on the innermost dimension of the run. The caller has
+            // already multiplied it up (`coalesceTimeDimensions:777`).
+            *bound = coalesced_bound;
+        } else if dim >= first_merged && dim < inner_dim.index() {
+            *bound = TimeBound::Coalesced;
+        }
+    }
+}
+
 /// WHAT ONE MEMORY OPERAND'S LOWERING KNOWS ABOUT ITS ACCESS — `AccessDetailsBase`
 /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:43-212`).
 ///
@@ -269,13 +383,21 @@ pub struct IndicesCoeffDict {
 ///
 /// # ⛔ THIS STRUCT IS FILLED WAVE BY WAVE
 ///
-/// Only the members whose setters have been ported are declared. `memory_index_`, `layout_coeffs_`,
-/// `memory_`, `mem_ref_`, `mem_view_start_addr_`, `mem_view_layout_map_`, `chunk_size_`,
-/// `chunk_stride_`, `shuffle_mode_`, `indices_` and `ld_or_st_size_` arrive with entries 003-008 and
-/// the `construct*` entries that write them. The order below is the C++'s own declaration order
+/// Only the members whose setters have been ported are declared. Entries 003-008 brought
+/// `memory_index_`, `layout_coeffs_`, `mem_view_start_addr_`, `mem_view_layout_map_`,
+/// `shuffle_mode_` and `indices_`; `memory_`, `mem_ref_`, `chunk_size_`, `chunk_stride_` and
+/// `ld_or_st_size_` still arrive with the `construct*` entries that write them. The order below is the C++'s own declaration order
 /// (`hpp:150-210`), so each wave inserts rather than reorders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessDetailsBase<'a> {
+    /// `memory_index_` — *"The memory operand this object represents"* (`:150`). Setter e005,
+    /// **protected**.
+    ///
+    /// ⛔ `None` IS THE REFERENCE'S `kMax` DEFAULT, the one it guards with three
+    /// `DT_CHECK_MSG(... != kMax)`s. Once `constructDetails` sets it (`:421`, `:837`, `:901`) it is
+    /// never returned to unset.
+    pub memory_index: Option<MemoryOperandIndex>,
+
     /// `op_` (`hpp:154`) — *"Operation represented by this object"*.
     ///
     /// ⛔ NARROWED FROM `mlir::Operation*` TO THE AGEN DIALECT, and the source supports it: every
@@ -298,6 +420,31 @@ pub struct AccessDetailsBase<'a> {
     /// `constructLdOrStType`, `AccessDetails.cpp:267-272`).
     pub comp: DfirUnit,
 
+    /// `layout_coeffs_` — *"Coefficients of layout associated with memory view"* (`:159`). Setter
+    /// e006, **protected**: only `constructExtentAndTotalElements` writes it, from
+    /// `getMapCoefficients` on the view's layout map (`:45-46`).
+    pub layout_coeffs: Vec<LayoutCoeff>,
+
+    /// `mem_view_start_addr_` — *"Associated memory view start address"* (`:168`). Setter e004,
+    /// **public**: `generateAffineAddressManipulationStmts` rewrites it to a mutable address base
+    /// (`Helper.cpp:901`), and `updateSymbolicAccessDetails` remaps it onto a clone (`:1043`).
+    ///
+    /// ⭐ `None` IS THE C++ NULL `Value`. The member is default-constructed and only
+    /// `initializeMemViewInfo` (`AccessDetails.cpp:277-283`) gives it one, so "no view resolved yet"
+    /// is a real state and not a zero address.
+    pub mem_view_start_addr: Option<Val>,
+
+    /// `mem_view_layout_map_` — *"Associated memory view layout"* (`:171`). Setter e007,
+    /// **protected**: only `initializeMemViewInfo` writes it (`:277`, `:282`).
+    ///
+    /// ⭐ `None` IS THE C++ NULL `AffineMap`, for the same reason as `mem_view_start_addr`.
+    pub mem_view_layout_map: Option<AffineMap>,
+
+    /// `shuffle_mode_` — *"Shuffle mode on the data"* (`:180`). Setter e008, **protected**.
+    ///
+    /// ⛔ AN ENUM, NOT A STRING. See [`AccessDetailsBase::set_shuffle_mode`].
+    pub shuffle_mode: sen::ShuffleMode,
+
     /// `rotation_position_` (`hpp:184`) — *"Rotation position on the data"*. Written by
     /// [`Self::set_rotation_position`].
     pub rotation_position: Elements,
@@ -317,6 +464,11 @@ pub struct AccessDetailsBase<'a> {
     /// `element_width_` (`hpp:196`) — *"Width (in terms of bits) of an element inside the
     /// transfer"*. Written by [`Self::set_element_width`].
     pub element_width: Bits,
+
+    /// `indices_` — *"Indices used in the access subscripts"* (`:198`, declared `:199`). Setter e003,
+    /// **public**: `updateSymbolicAccessDetails` remaps every index onto its clone and writes that
+    /// back from another translation unit (`Helper.cpp:1027`).
+    pub indices: Vec<Val>,
 
     /// `transfer_set_` (`hpp:202`) — *"Load or store set within a transfer"*. Written by
     /// [`Self::set_transfer_set`].
@@ -341,6 +493,11 @@ impl<'a> AccessDetailsBase<'a> {
     /// means, because `constructChunkAndShuffleInfo` only assigns it when it finds one
     /// (`AccessDetails.cpp:243-256`).
     ///
+    /// ⛔ AND TWO OF THEM ARE NOT ZERO. `shuffle_mode_ = "noshuffle"` (`hpp:181`) is this class's
+    /// starting mode, not an absent one, and `memory_index_ = kMax` (`hpp:151`) is the reference's
+    /// "no operand chosen yet" — [`None`] here, which is what retires its three
+    /// `DT_CHECK_MSG(getMemoryIndex() != kMax)`s (`AccessDetails.cpp:296`, `:443`, `:859`).
+    ///
     /// ⛔ THE TWO MLIR ATTRIBUTES DEFAULT-CONSTRUCT TO **NULL** IN THE C++ (`hpp:202`, `:205`), and a
     /// null `AffineMap`/`IntegerSetAttr` has no Rust counterpart that is not an `Option` — which
     /// would put an unwrap on every read. They start EMPTY instead: the [`IntegerSet`] with no
@@ -354,8 +511,20 @@ impl<'a> AccessDetailsBase<'a> {
     #[must_use]
     pub fn new(op: &'a agen::Op, comp: DfirUnit) -> Self {
         AccessDetailsBase {
+            // `MemoryOperandIndex memory_index_ = MemoryOperandIndex::kMax;` (`hpp:151`) — unset.
+            memory_index: None,
             op,
             comp,
+            // `SmallVector<int64_t> layout_coeffs_;` (`hpp:160`).
+            layout_coeffs: Vec::new(),
+            // `Value mem_view_start_addr_;` (`hpp:169`) — a null `Value` until a view resolves.
+            mem_view_start_addr: None,
+            // `AffineMap mem_view_layout_map_;` (`hpp:172`) — null for the same reason.
+            mem_view_layout_map: None,
+            // `std::string shuffle_mode_ = "noshuffle";` (`hpp:181`) — NOT the zero value.
+            shuffle_mode: sen::ShuffleMode::NoShuffle,
+            // `SmallVector<Value> indices_;` (`hpp:199`).
+            indices: Vec::new(),
             // `int rotation_position_ = 0;` (`hpp:184`).
             rotation_position: Elements(0),
             // `int expected_total_elements_{};` (`hpp:187`) — value-initialised, so zero.
@@ -377,6 +546,141 @@ impl<'a> AccessDetailsBase<'a> {
                 results: Vec::new(),
             },
         }
+    }
+
+    /// Replaces: e003_setIndices
+    ///
+    /// `AccessDetailsBase::setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`
+    /// (2L), entry 003/384. **public** in the reference.
+    ///
+    /// ```cpp
+    /// void setIndices(const SmallVectorImpl<Value>& indices) {
+    ///   indices_.assign(indices.begin(), indices.end());
+    /// }
+    /// ```
+    ///
+    /// ⛔⛔ `assign`, NOT `append` — THE WHOLE LIST IS REPLACED, and that is load-bearing rather than
+    /// incidental. Of its five callers three are the `initialize()` overrides that fill the list from
+    /// the op (`AccessDetails.cpp:347`, `:619`, `:890`), and TWO WRITE OVER AN OBJECT THAT ALREADY
+    /// HOLDS ONE: `AccessDetailsAffine::constructIndices` reads it back with `getIndices()` (`:358`),
+    /// keeps only the loop iterators, folds the constant subscripts into the subscripts map instead,
+    /// and writes the SHORTER list over it (`:380`); `updateSymbolicAccessDetails` remaps each index
+    /// onto its clone and writes that (`Helper.cpp:1027`). Appending would leave the stale subscripts
+    /// in front of the live ones, which is an access at the wrong offset.
+    pub fn set_indices(&mut self, indices: &[Val]) {
+        self.indices = indices.to_vec();
+    }
+
+    /// Replaces: e004_setMemViewStartAddr
+    ///
+    /// `AccessDetailsBase::setMemViewStartAddr` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81` (2L), entry 004/384. **public** in
+    /// the reference.
+    ///
+    /// ```cpp
+    /// void setMemViewStartAddr(Value mem_view_start_addr) {
+    ///   mem_view_start_addr_ = mem_view_start_addr;
+    /// }
+    /// ```
+    ///
+    /// ⛔ IT TAKES A VALUE, NOT AN OPTION. The C++ parameter is a `Value` that could be null, but no
+    /// caller passes one: the two inside this file pass a view's own start address
+    /// (`AccessDetails.cpp:278`, `:283`), `Helper.cpp:901` passes a mutable address base, and
+    /// `:1043` passes the clone of the address already there. So the field's `None` means *never
+    /// set*, and this setter cannot return it to that state.
+    pub fn set_mem_view_start_addr(&mut self, mem_view_start_addr: Val) {
+        self.mem_view_start_addr = Some(mem_view_start_addr);
+    }
+
+    /// Replaces: e005_setMemoryIndex
+    ///
+    /// `AccessDetailsBase::setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`
+    /// (2L), entry 005/384. **protected** in the reference — only the `constructDetails` overrides
+    /// call it (`AccessDetails.cpp:421`, `:837`, `:901`), each as the first statement of the
+    /// construction it names.
+    ///
+    /// ```cpp
+    /// void setMemoryIndex(MemoryOperandIndex memory_index) {
+    ///   memory_index_ = memory_index;
+    /// }
+    /// ```
+    ///
+    /// ⛔ THE ARGUMENT IS ONE OF THE FOUR REAL OPERANDS, so this can only move the field from unset to
+    /// set. `kMax` is not in [`MemoryOperandIndex`] and therefore cannot be passed — which is exactly
+    /// what the reference's three `DT_CHECK_MSG(getMemoryIndex() != kMax)` assertions were checking.
+    pub fn set_memory_index(&mut self, memory_index: MemoryOperandIndex) {
+        self.memory_index = Some(memory_index);
+    }
+
+    /// Replaces: e006_setLayoutCoeffs
+    ///
+    /// `AccessDetailsBase::setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`
+    /// (2L), entry 006/384. **protected** in the reference — only
+    /// `constructExtentAndTotalElements` writes it (`AccessDetails.cpp:46`), straight from the
+    /// `getMapCoefficients` call one line above it (`:45`).
+    ///
+    /// ```cpp
+    /// void setLayoutCoeffs(const SmallVectorImpl<int64_t>& layout_coeffs) {
+    ///   layout_coeffs_.assign(layout_coeffs.begin(), layout_coeffs.end());
+    /// }
+    /// ```
+    ///
+    /// ⛔ `assign` AGAIN — a replacement, not an append. The one caller passes a fresh local
+    /// `SmallVector<int64_t, 8>` it has just filled, so appending would double the list on any object
+    /// whose extents were constructed twice.
+    pub fn set_layout_coeffs(&mut self, layout_coeffs: &[LayoutCoeff]) {
+        self.layout_coeffs = layout_coeffs.to_vec();
+    }
+
+    /// Replaces: e007_setMemViewLayoutMap
+    ///
+    /// `AccessDetailsBase::setMemViewLayoutMap` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99` (2L), entry 007/384. **protected** in
+    /// the reference — only `initializeMemViewInfo` writes it, from a `get_logical_memory_view`'s
+    /// `getLayoutMap()` (`AccessDetails.cpp:277`) or a paged view's (`:282`).
+    ///
+    /// ```cpp
+    /// void setMemViewLayoutMap(AffineMap mem_view_layout_map) {
+    ///   mem_view_layout_map_ = mem_view_layout_map;
+    /// }
+    /// ```
+    ///
+    /// ⛔ THE MAP IS THE VIEW'S, IN ELEMENTS — the same `layout_map` the island documents on
+    /// `get_logical_memory_view` (*"Addresses in Dataflow IR are in \*element\* granularity, not
+    /// bytes."*, `dataflow-scheduler-dialects/…/Dialect/Dataflow/Dataflow.td:250`). It is taken by
+    /// value here as it is there; `AffineMap` is an interned handle
+    /// in MLIR and a small owned value in this crate, and neither is shared mutably.
+    pub fn set_mem_view_layout_map(&mut self, mem_view_layout_map: AffineMap) {
+        self.mem_view_layout_map = Some(mem_view_layout_map);
+    }
+
+    /// Replaces: e008_setShuffleMode
+    ///
+    /// `AccessDetailsBase::setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`
+    /// (2L), entry 008/384. **protected** in the reference.
+    ///
+    /// ```cpp
+    /// void setShuffleMode(std::string shuffle_mode) {
+    ///   shuffle_mode_ = shuffle_mode;
+    /// }
+    /// ```
+    ///
+    /// # ⛔⛔ THE `std::string` IS A CLOSED SET AND BECOMES ONE
+    ///
+    /// The reference's field is a `std::string` initialised to `"noshuffle"` (`:181`) and there is
+    /// **exactly one** call to this setter in the whole of `dcc/src`: `setShuffleMode("splat")` at
+    /// `AccessDetails.cpp:231`. So the reachable value set is two spellings, both of them
+    /// enumerators of `SentientShuffleMode` (`dcc/src/Dialect/Sentient/SentientTypes.td:511-533`),
+    /// which this crate
+    /// already carries as [`sen::ShuffleMode`]. Taking the enum is what makes an unspellable mode
+    /// unrepresentable instead of a string that fails somewhere downstream.
+    ///
+    /// ⭐ THE WIDER ENUM IS STILL THE RIGHT PARAMETER TYPE. `setldtype` (`Helper.cpp:1647`) assigns
+    /// `splat2b` and `zpad16b` for LX loads (`:1669`, `:1683`) on the sentient op directly rather than
+    /// through this field, so the mode vocabulary is genuinely the attribute's and narrowing this
+    /// parameter to the two spellings seen here would split one closed set into two.
+    pub fn set_shuffle_mode(&mut self, shuffle_mode: sen::ShuffleMode) {
+        self.shuffle_mode = shuffle_mode;
     }
 
     /// Replaces: e009_setRotationPosition
@@ -913,7 +1217,8 @@ impl<'a> AccessDetailsAffineComposite<'a> {
 mod unit_tests {
     use super::{
         AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase, IndicesCoeffDict,
-        TimeBound, TimeDim, TimeOffsets,
+        LayoutCoeff, MemoryOperandIndex, TimeBound, TimeDim, TimeOffsets, sen,
+        set_coalesced_bound_values,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
@@ -1385,5 +1690,319 @@ mod unit_tests {
             TimeBound::Steps(2),
             "the promoted dimension is the one whose bound gated the promotion"
         );
+    }
+
+    /// THE TIME NEST'S TRIP COUNT FOR ONE DIMENSION — ⭐ DERIVED FROM A DIFFERENT FILE THAN THE CODE
+    /// UNDER TEST, so the expectations below are not this module's own arithmetic played back.
+    ///
+    /// `constructTimeLoops` reads the bounds this way and no other
+    /// (`dcc/src/Conversion/AgenToSentient/Helper.cpp:1815-1820`):
+    ///
+    /// ```cpp
+    /// size_t loop_bound =
+    ///     (time_bounds[idx] == AccessDetailsAffineComposite::
+    ///                              SpecialTimeBoundValues::kCoalesced
+    ///          ? 1
+    ///          : time_bounds[idx]);
+    /// DT_CHECK(loop_bound > 0);
+    /// ```
+    fn trip_count(bound: TimeBound) -> u64 {
+        match bound {
+            TimeBound::Coalesced => 1,
+            TimeBound::Steps(n) => n,
+            // ⛔ `kInvalid` (`TimeBound::Variable`) REACHES THE `DT_CHECK(loop_bound > 0)` AND FAILS IT — a variable bound
+            // never gets as far as a time loop. Zero marks it here so a product that includes one
+            // collapses instead of quietly passing.
+            TimeBound::Variable => 0,
+        }
+    }
+
+    fn trips(bounds: &[TimeBound]) -> u64 {
+        bounds.iter().copied().map(trip_count).product()
+    }
+
+    /// 🎯 002/384 — THE MERGED RUN'S PRODUCT LANDS ON ITS INNERMOST DIMENSION AND THE ONES ABOVE IT
+    /// GO TO `kCoalesced`.
+    ///
+    /// The scenario is `coalesceTimeDimensions`': a four-deep nest `2 × 3 × 4 × 5` whose inner three
+    /// dimensions turned out contiguous, so the scan stopped with `outer_dim = 0` and had already
+    /// multiplied `3 * 4 * 5 = 60` into `coalesced_bound` (`AccessDetails.cpp:777`).
+    #[test]
+    fn the_merged_run_collapses_onto_its_innermost_dimension() {
+        let mut bounds = [
+            TimeBound::Steps(2),
+            TimeBound::Steps(3),
+            TimeBound::Steps(4),
+            TimeBound::Steps(5),
+        ];
+        set_coalesced_bound_values(
+            &mut bounds,
+            Some(TimeDim(0)),
+            TimeDim(3),
+            TimeBound::Steps(60),
+        );
+        assert_eq!(
+            bounds,
+            [
+                TimeBound::Steps(2),
+                TimeBound::Coalesced,
+                TimeBound::Coalesced,
+                TimeBound::Steps(60),
+            ],
+            "dimension 0 is the one the run stopped BELOW and keeps its own bound"
+        );
+    }
+
+    /// 🎯 002/384 — AND THE NEST STILL RUNS THE SAME NUMBER OF TIMES.
+    ///
+    /// ⛔ THIS IS THE INVARIANT THE OFF-BY-ONES BREAK. Both totals are written out as literals and the
+    /// per-dimension rule comes from [`trip_count`] above, i.e. from `Helper.cpp`, not from
+    /// [`set_coalesced_bound_values`]: `2 × 3 × 4 × 5 = 120` before, and `2 × 1 × 1 × 60 = 120`
+    /// after. Starting the run at `outer_dim` instead of `outer_dim + 1` would give 60, and stopping
+    /// at `inner_dim - 1` would give 600.
+    #[test]
+    fn the_trip_count_product_survives_the_merge() {
+        let mut bounds = [
+            TimeBound::Steps(2),
+            TimeBound::Steps(3),
+            TimeBound::Steps(4),
+            TimeBound::Steps(5),
+        ];
+        assert_eq!(trips(&bounds), 120, "2 * 3 * 4 * 5");
+        set_coalesced_bound_values(
+            &mut bounds,
+            Some(TimeDim(0)),
+            TimeDim(3),
+            TimeBound::Steps(60),
+        );
+        assert_eq!(trips(&bounds), 120, "2 * 1 * 1 * 60");
+    }
+
+    /// 🎯 002/384 — A RUN THAT REACHES THE TOP OF THE NEST IS `outer_dim == -1`, WHICH IS [`None`].
+    ///
+    /// `coalesceTimeDimensions`' scan runs down to `-1` deliberately — *"time_index_outer goes down to
+    /// -1 to catch the outermost time dim"* (`AccessDetails.cpp:753`) — and then dimension 0 IS part
+    /// of the run. `2 × 3 × 4 × 5 = 120` all on the innermost.
+    #[test]
+    fn an_absent_outer_dimension_merges_from_dimension_zero() {
+        let mut bounds = [
+            TimeBound::Steps(2),
+            TimeBound::Steps(3),
+            TimeBound::Steps(4),
+            TimeBound::Steps(5),
+        ];
+        set_coalesced_bound_values(&mut bounds, None, TimeDim(3), TimeBound::Steps(120));
+        assert_eq!(
+            bounds,
+            [
+                TimeBound::Coalesced,
+                TimeBound::Coalesced,
+                TimeBound::Coalesced,
+                TimeBound::Steps(120),
+            ]
+        );
+        assert_eq!(trips(&bounds), 120, "one loop of 120, three of 1");
+    }
+
+    /// 🎯 002/384 — DIMENSIONS OUTSIDE THE RUN ARE NOT TOUCHED AT EITHER END.
+    ///
+    /// Five deep, run over 2..=3 only: dimensions 0 and 1 sit above it, dimension 4 below it.
+    #[test]
+    fn the_dimensions_outside_the_run_keep_their_bounds() {
+        let mut bounds = [
+            TimeBound::Steps(2),
+            TimeBound::Steps(3),
+            TimeBound::Steps(4),
+            TimeBound::Steps(5),
+            TimeBound::Steps(6),
+        ];
+        set_coalesced_bound_values(
+            &mut bounds,
+            Some(TimeDim(1)),
+            TimeDim(3),
+            TimeBound::Steps(20),
+        );
+        assert_eq!(
+            bounds,
+            [
+                TimeBound::Steps(2),
+                TimeBound::Steps(3),
+                TimeBound::Coalesced,
+                TimeBound::Steps(20),
+                TimeBound::Steps(6),
+            ],
+            "dimension 4 is INSIDE the merged one and is not part of the run"
+        );
+        assert_eq!(
+            trips(&bounds),
+            720,
+            "2 * 3 * 1 * 20 * 6 == 2 * 3 * 4 * 5 * 6"
+        );
+    }
+
+    /// 🎯 002/384 — WITH NOTHING BETWEEN THEM ONLY THE INNER BOUND IS WRITTEN.
+    ///
+    /// ⭐ THE REFERENCE NEVER ASKS FOR THIS, and that is the point of testing it: the call is guarded
+    /// by `if ((time_index_inner - time_index_outer) > 1)` (`AccessDetails.cpp:759`), so adjacent
+    /// dimensions are not a merge. The function still has to be well behaved on it — the empty range
+    /// marks nothing, and the bound written is the caller's own single bound.
+    #[test]
+    fn adjacent_dimensions_mark_nothing_as_coalesced() {
+        let mut bounds = [TimeBound::Steps(4), TimeBound::Steps(7)];
+        set_coalesced_bound_values(
+            &mut bounds,
+            Some(TimeDim(0)),
+            TimeDim(1),
+            TimeBound::Steps(7),
+        );
+        assert_eq!(bounds, [TimeBound::Steps(4), TimeBound::Steps(7)]);
+    }
+
+    /// 🎯 002/384 — A COALESCED DIMENSION IS NOT A DIMENSION OF ONE STEP, AND THE TYPE KEEPS THEM
+    /// APART.
+    ///
+    /// ⛔⛔ THIS IS WHY [`TimeBound`] IS AN ENUM. The reference's comment says it outright: *"eg to
+    /// distinguish coalesced bounds (equivalent in value to 1) from non-coalesceable bounds with
+    /// value 1"* (`AccessDetails.hpp:249-251`). Both run their loop once, and only one of them is
+    /// skipped by `computeBurstAndGroup`'s `continue` (`AccessDetails.cpp:803-805`).
+    #[test]
+    fn a_coalesced_bound_is_distinguishable_from_a_single_step() {
+        assert_ne!(TimeBound::Coalesced, TimeBound::Steps(1));
+        assert_eq!(
+            trip_count(TimeBound::Coalesced),
+            trip_count(TimeBound::Steps(1))
+        );
+    }
+
+    /// 🎯 002/384 — AN OUT-OF-RANGE INNER DIMENSION WRITES NOTHING RATHER THAN OUT OF BOUNDS.
+    ///
+    /// ⭐ THE ONE DELIBERATE DIVERGENCE from `time_bounds[inner_dim] = coalesced_bound;`. No caller
+    /// reaches it; if one ever did, the reference would store past the vector AND mark every
+    /// dimension it does have as coalesced, which loses the whole nest's trip count. Dropping the
+    /// marking with the store is what keeps the product below intact.
+    #[test]
+    fn an_inner_dimension_past_the_end_leaves_the_nest_alone() {
+        let mut bounds = [TimeBound::Steps(2), TimeBound::Steps(3)];
+        set_coalesced_bound_values(&mut bounds, None, TimeDim(9), TimeBound::Steps(6));
+        assert_eq!(bounds, [TimeBound::Steps(2), TimeBound::Steps(3)]);
+        assert_eq!(
+            trips(&bounds),
+            6,
+            "2 * 3, not the 1 a partial merge would leave"
+        );
+    }
+
+    /// 🎯 002-008 — THE SIX MEMBERS THESE SETTERS OWN START AT THE REFERENCE'S OWN INITIALISERS.
+    ///
+    /// ⛔ `shuffle_mode_` STARTS AT `"noshuffle"`, NOT EMPTY (`AccessDetails.hpp:181`), and
+    /// `memory_index_` starts at `kMax` (`:151`) — the two that are not zero values. The other four
+    /// are default-constructed. [`the_affine_constructor_delegates_op_and_comp_and_defaults_the_rest`]
+    /// covers the members entries 009-015 own.
+    #[test]
+    fn the_setter_owned_members_start_at_the_references_initialisers() {
+        let op = vector_load();
+        let ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        assert_eq!(ad.shuffle_mode, sen::ShuffleMode::NoShuffle);
+        assert_eq!(ad.shuffle_mode.spelling(), "noshuffle");
+        assert!(ad.indices.is_empty());
+        assert!(ad.layout_coeffs.is_empty());
+        assert_eq!(ad.mem_view_start_addr, None);
+        assert_eq!(ad.mem_view_layout_map, None);
+        assert_eq!(
+            ad.memory_index, None,
+            "the reference's kMax — set by constructDetails, not before"
+        );
+    }
+
+    /// 🎯 003/384 — `setIndices` REPLACES THE LIST.
+    ///
+    /// ⛔⛔ THE SECOND CALL IS REAL. `AccessDetailsAffine::initialize` fills the list from the op
+    /// (`AccessDetails.cpp:347`); `constructIndices` then reads it back (`:358`) and writes a SHORTER
+    /// one over it, because the constant subscripts move into the map itself (`:380`). The
+    /// reference's `assign` throws the first list away — appending would leave four subscripts on a
+    /// two-dimensional access.
+    #[test]
+    fn setting_the_indices_twice_keeps_only_the_second_list() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_indices(&[Val(3), Val(4)]);
+        assert_eq!(ad.indices, vec![Val(3), Val(4)]);
+        ad.set_indices(&[Val(11)]);
+        assert_eq!(ad.indices, vec![Val(11)], "assign, not append");
+    }
+
+    /// 🎯 006/384 — AND SO DOES `setLayoutCoeffs`, WHICH IS THE SAME `assign`.
+    ///
+    /// ⭐ THE COEFFICIENTS ARE SIGNED AND ORDERED, one per view dimension plus the trailing constant
+    /// term (`VectorChainToSentientPT/LoweringXRF.cpp:50`).
+    #[test]
+    fn setting_the_layout_coefficients_twice_keeps_only_the_second_list() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_layout_coeffs(&[LayoutCoeff(128), LayoutCoeff(1), LayoutCoeff(0)]);
+        ad.set_layout_coeffs(&[LayoutCoeff(512), LayoutCoeff(-4), LayoutCoeff(64)]);
+        assert_eq!(
+            ad.layout_coeffs,
+            vec![LayoutCoeff(512), LayoutCoeff(-4), LayoutCoeff(64)],
+            "a stride may be negative, and the last entry is the constant term"
+        );
+    }
+
+    /// 🎯 004/384 + 007/384 — THE VIEW'S START ADDRESS AND ITS LAYOUT MAP BOTH GO FROM ABSENT TO SET.
+    ///
+    /// `initializeMemViewInfo` writes the pair together, from a `get_logical_memory_view`
+    /// (`AccessDetails.cpp:277-278`) or from a paged view (`:282-283`), and `Helper.cpp:901` later
+    /// rewrites the address alone once the base becomes a mutable value.
+    #[test]
+    fn the_view_start_address_and_layout_map_go_from_absent_to_set() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        // `affine_map<(d0, d1) -> (d0 * 128 + d1)>` — a row-major 2-D view, 128 elements to a row.
+        let layout = AffineMap {
+            dims: 2,
+            results: vec![AffineExpr::dim(0).times(128).plus(AffineExpr::dim(1))],
+        };
+        ad.set_mem_view_start_addr(Val(21));
+        ad.set_mem_view_layout_map(layout.clone());
+        assert_eq!(ad.mem_view_start_addr, Some(Val(21)));
+        assert_eq!(ad.mem_view_layout_map, Some(layout));
+
+        // ⛔ AND THE ADDRESS IS REWRITABLE — `Helper.cpp:1043` does exactly this, remapping the
+        // address onto its clone when the op is copied into the time loops.
+        ad.set_mem_view_start_addr(Val(40));
+        assert_eq!(ad.mem_view_start_addr, Some(Val(40)));
+    }
+
+    /// 🎯 005/384 — THE MEMORY INDEX GOES FROM ABSENT TO ONE OF THE FOUR OPERANDS, AND STAYS SET.
+    ///
+    /// ⛔ THE THREE `DT_CHECK_MSG(getMemoryIndex() != kMax, ...)`s (`AccessDetails.cpp:296`, `:443`,
+    /// `:859`) ARE THIS TEST'S FIRST LINE. `kMax` is not a variant, so the only way to observe "not
+    /// set" is `None`, and no argument to the setter can restore it.
+    #[test]
+    fn the_memory_index_starts_absent_and_names_one_operand() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        assert_eq!(ad.memory_index, None);
+        ad.set_memory_index(MemoryOperandIndex::DirSrc);
+        assert_eq!(ad.memory_index, Some(MemoryOperandIndex::DirSrc));
+        // A composite load-and-store's store half — `constructDetails` sets `kDirDst` for it.
+        ad.set_memory_index(MemoryOperandIndex::DirDst);
+        assert_eq!(ad.memory_index, Some(MemoryOperandIndex::DirDst));
+    }
+
+    /// 🎯 008/384 — THE ONLY SHUFFLE MODE THE REFERENCE EVER SETS IS `splat`.
+    ///
+    /// ⛔⛔ THE `std::string` WAS A CLOSED SET ALL ALONG. `setShuffleMode("splat")`
+    /// (`AccessDetails.cpp:231`) is the sole call in `dcc/src`, against a `"noshuffle"` default —
+    /// and both spellings are enumerators of `SentientShuffleModeAttr`. The spellings are asserted
+    /// because they are what reaches the emitted attribute.
+    #[test]
+    fn the_shuffle_mode_moves_from_noshuffle_to_splat() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        assert_eq!(ad.shuffle_mode.spelling(), "noshuffle");
+        ad.set_shuffle_mode(sen::ShuffleMode::Splat);
+        assert_eq!(ad.shuffle_mode, sen::ShuffleMode::Splat);
+        assert_eq!(ad.shuffle_mode.spelling(), "splat");
     }
 }

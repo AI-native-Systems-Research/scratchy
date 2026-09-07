@@ -58,3 +58,144 @@
 //! |---|---|---|---|
 //! | `e001_matchAndRewrite` | 001/384 | 8 | `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41` |
 
+use crate::islands::dataflow_ir::dialects::{self as dfir_op, Val};
+
+/// WHAT ENCLOSES A TERMINATOR — the one input `AffineYieldOpLowering` reads besides the op itself.
+///
+/// ⛔ THE KIND, NOT THE OP. The reference asks exactly one question of the parent —
+/// `isa<scf::ParallelOp>(op->getParentOp())` — so carrying the whole parent would offer callers a
+/// dozen other questions the rule does not ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parent {
+    /// An `scf.parallel`. ⛔ THE ONE CASE THAT DECLINES.
+    ScfParallel,
+    /// Anything else — an `affine.for`, an `scf.if`, a `dataflow.program_unit`.
+    Other,
+}
+
+/// THE RESULT OF THE REWRITE — ⛔ DECLINING IS NOT FAILING.
+///
+/// ⛔⛔ THE REFERENCE RETURNS `LogicalResult::failure()` AND THAT IS NOT AN ERROR. In MLIR a pattern
+/// returning failure means *this pattern does not apply here*; the driver tries others, the op is
+/// left alone and the module is untouched. Modelling it as an error would stop a lowering the
+/// reference completes.
+///
+/// ⭐ AND NOTHING ELSE IN dcc's PASS PICKS THE OP UP. The reference's reason —
+/// *"Terminator is rewritten as part of the "affine.parallel" lowering pattern."*
+/// (`AffineToStandard.cpp:44-45`) — is inherited from upstream MLIR, whose `AffineParallelLowering`
+/// builds the `scf.parallel` and its terminator together. dcc's copy of the pass registers four
+/// patterns and no parallel lowering at all (`:198-206`), and its conversion target already declares
+/// the whole `scf` dialect legal (`:227-228`). So under an `scf.parallel` the terminator is an `scf`
+/// terminator already and declining is what leaves the IR correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum YieldRewrite {
+    /// The `scf.yield` that replaces the `affine.yield`.
+    Yielded(dfir_op::scf::Op),
+    /// This pattern does not apply — the parallel lowering owns this terminator.
+    Declined,
+}
+
+/// Replaces: e001_matchAndRewrite
+///
+/// `AffineYieldOpLowering::matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`
+/// (8L), entry 001/384.
+///
+/// ```cpp
+/// LogicalResult matchAndRewrite(AffineYieldOp op,
+///                               PatternRewriter &rewriter) const override {
+///   if (isa<scf::ParallelOp>(op->getParentOp())) {
+///     // Terminator is rewritten as part of the "affine.parallel" lowering
+///     // pattern.
+///     return failure();
+///   }
+///   rewriter.replaceOpWithNewOp<scf::YieldOp>(op, op.getOperands());
+///   return success();
+/// }
+/// ```
+///
+/// ⛔ THE OPERANDS CARRY THROUGH UNCHANGED. `replaceOpWithNewOp<scf::YieldOp>(op, op.getOperands())`
+/// passes the yield's own operand list to the new op, so a loop carrying two values yields two. An
+/// empty list is a terminator of a loop that carries nothing, not a missing list.
+///
+/// ⚠️ THE EXTRACT DROPPED THE `return success();` (`crustify-bridge2/source/bridge2.cpp:24-33` ends on
+/// the `replaceOpWithNewOp` call and two bare braces). The authority at the cited line has it, and it
+/// is the difference between a pattern that applied and one that declined — which is the whole
+/// distinction this function makes. Ported from the authority.
+pub fn lower_affine_yield(parent: Parent, operands: &[Val]) -> YieldRewrite {
+    match parent {
+        Parent::ScfParallel => YieldRewrite::Declined,
+        Parent::Other => YieldRewrite::Yielded(dfir_op::scf::Op::Yield {
+            operands: operands.to_vec(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::dialects::Op as DfirOp;
+
+    /// 🎯 001/384 — AN `affine.yield` BECOMES AN `scf.yield` CARRYING THE SAME OPERANDS.
+    #[test]
+    fn an_affine_yield_becomes_an_scf_yield() {
+        let carried = [Val(7), Val(9)];
+        assert_eq!(
+            lower_affine_yield(Parent::Other, &carried),
+            YieldRewrite::Yielded(dfir_op::scf::Op::Yield {
+                operands: vec![Val(7), Val(9)],
+            }),
+            "the operand list passes through unchanged"
+        );
+    }
+
+    /// 🎯 001/384 — AND A LOOP CARRYING NOTHING STILL YIELDS.
+    ///
+    /// ⛔ AN EMPTY OPERAND LIST IS A TERMINATOR, not an absent one. The reference has no arm for it:
+    /// `getOperands()` on a bare `affine.yield` is empty and the rewrite runs anyway.
+    #[test]
+    fn a_yield_with_no_carried_values_still_rewrites() {
+        assert_eq!(
+            lower_affine_yield(Parent::Other, &[]),
+            YieldRewrite::Yielded(dfir_op::scf::Op::Yield {
+                operands: Vec::new()
+            })
+        );
+    }
+
+    /// 🎯 001/384 — UNDER AN `scf.parallel` THE PATTERN DECLINES.
+    ///
+    /// ⛔ AND DECLINING MUST NOT EMIT. The parallel lowering rewrites this terminator itself; a
+    /// rewrite here as well would produce two `scf.yield`s for one `affine.yield`.
+    #[test]
+    fn under_a_parallel_parent_the_pattern_declines() {
+        assert_eq!(
+            lower_affine_yield(Parent::ScfParallel, &[Val(1)]),
+            YieldRewrite::Declined
+        );
+    }
+
+    /// 🎯 001/384 — AND THE TWO TERMINATORS PRINT AS THE REFERENCE WRITES THEM.
+    #[test]
+    fn the_terminators_print() {
+        use crate::islands::dataflow_ir::print;
+        let mut out = String::new();
+        print::emit(
+            &mut out,
+            &DfirOp::Scf(dfir_op::scf::Op::Yield {
+                operands: vec![Val(3)],
+            }),
+            0,
+        );
+        assert_eq!(out.trim(), "scf.yield %3");
+        out.clear();
+        print::emit(
+            &mut out,
+            &DfirOp::Affine(dfir_op::affine::Op::Yield {
+                operands: Vec::new(),
+            }),
+            0,
+        );
+        assert_eq!(out.trim(), "affine.yield");
+    }
+}

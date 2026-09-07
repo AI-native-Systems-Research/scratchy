@@ -39,39 +39,56 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`18/384 ported; 18/384 audited`
+`25/384 ported; 25/384 audited`
 
-Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`) and
-`setImmutableAddrAndIncrements`; entries 009-016, the `AccessDetailsBase` state setters
-(`setRotationPosition`, `setExpectedTotalElements`, `setExtents`, `setTotalElements`,
-`setElementWidth`, `setTransferSet`, `setTransferOrder`) and the `AccessDetailsAffine` constructor,
-and entries 017-024, `AccessDetailsAffine`'s two setters (`setSubscriptsMap`,
-`setIndicesCoeffDict`) and `AccessDetailsAffineComposite`'s constructor plus its time setters
-(`setTimeAddrMap`, `setTimeSymbols`, `setTimeBounds`, `setTimeOffsets`,
-`setInterleaveGroupIndex`), all in
+Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
+`src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
+(entry 214), and entries 002-024 — `setCoalescedBoundValues`, the six `AccessDetailsBase` setters
+that establish its access state and the seven that establish its transfer state, the
+`AccessDetailsAffine` constructor and its two setters (`setSubscriptsMap`, `setIndicesCoeffDict`),
+and `AccessDetailsAffineComposite`'s constructor plus its time setters (`setTimeAddrMap`,
+`setTimeSymbols`, `setTimeBounds`, `setTimeOffsets`, `setInterleaveGroupIndex`), all in
 `src/bridges/dataflow_ir_to_sentient/agen_access_details.rs`. Unticked by their own audits and
 awaiting re-port with their emission: `setldtype`, `generateSetSendDestinationStmts`,
 `getLoadConsumer`.
+
+⭐ 001/384 MOVED TO ITS OWN TRANSLATION UNIT'S HOME: `lower_affine_yield` was living in
+`dataflow_ir_to_sentient/mod.rs`, and `crustify/crates.json` homes `e001_matchAndRewrite` in
+`std_affine_to_standard.rs`. It carries its `/// Replaces:` anchor there and `mod.rs` imports it.
+
+⭐ ONE VOCABULARY, NOT TWO: 002's port and 022's arrived with their own `TimeDim` and `TimeBound`.
+022's landed first and is the one kept — its `TimeDim` is a `u32` with an `index()` accessor and its
+`kInvalid` variant is spelled `Variable`. `set_coalesced_bound_values` was rebased onto it rather
+than duplicating the pair, so `MemoryOperandIndex` and `LayoutCoeff` are all 002-008 adds to the
+shared vocabulary block.
+
+⚠️ THE AUDIT OF 002-008 CORRECTED ITS OWN CITATIONS, and one of 001's. Six field references pointed at
+the doc comment above the declaration rather than the declaration; `kMax`'s container use is
+`AccessDetails.hpp:375` not `:377`; `coalesced_bound *=` is `AccessDetails.cpp:777` not `:772`; the
+time-loop trip rule is `Helper.cpp:1815-1820`. And 001's note credited the decline to an
+`AffineParallelLowering` pattern — **dcc's copy of the pass registers no such pattern**
+(`AffineToStandard.cpp:198-206`); the reference's comment is upstream MLIR's, and dcc leaves the
+terminator alone because `scf` is already legal in its target.
 
 
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
 - [x] **AUDIT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, line by line against the C++
-- [ ] **PORT 002/384** `setCoalescedBoundValues` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672`, 5 lines
-- [ ] **AUDIT 002/384** `setCoalescedBoundValues` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672`, line by line against the C++
-- [ ] **PORT 003/384** `setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`, 2 lines
-- [ ] **AUDIT 003/384** `setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`, line by line against the C++
-- [ ] **PORT 004/384** `setMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81`, 2 lines
-- [ ] **AUDIT 004/384** `setMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81`, line by line against the C++
-- [ ] **PORT 005/384** `setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`, 2 lines
-- [ ] **AUDIT 005/384** `setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`, line by line against the C++
-- [ ] **PORT 006/384** `setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`, 2 lines
-- [ ] **AUDIT 006/384** `setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`, line by line against the C++
-- [ ] **PORT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, 2 lines
-- [ ] **AUDIT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, line by line against the C++
-- [ ] **PORT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, 2 lines
-- [ ] **AUDIT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, line by line against the C++
+- [x] **PORT 002/384** `setCoalescedBoundValues` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672`, 5 lines
+- [x] **AUDIT 002/384** `setCoalescedBoundValues` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672`, line by line against the C++
+- [x] **PORT 003/384** `setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`, 2 lines
+- [x] **AUDIT 003/384** `setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`, line by line against the C++
+- [x] **PORT 004/384** `setMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81`, 2 lines
+- [x] **AUDIT 004/384** `setMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81`, line by line against the C++
+- [x] **PORT 005/384** `setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`, 2 lines
+- [x] **AUDIT 005/384** `setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`, line by line against the C++
+- [x] **PORT 006/384** `setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`, 2 lines
+- [x] **AUDIT 006/384** `setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`, line by line against the C++
+- [x] **PORT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, 2 lines
+- [x] **AUDIT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, line by line against the C++
+- [x] **PORT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, 2 lines
+- [x] **AUDIT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, line by line against the C++
 - [x] **PORT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, 2 lines
 - [x] **AUDIT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, line by line against the C++
 - [x] **PORT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, 2 lines
