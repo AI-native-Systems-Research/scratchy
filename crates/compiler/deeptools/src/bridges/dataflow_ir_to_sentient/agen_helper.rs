@@ -196,7 +196,7 @@ pub fn loop_nest_level(of: LoopKind, enclosing: &[LoopKind]) -> LoopNestLevel {
 }
 
 /// WHAT AN INDIRECT MEMORY VIEW'S `from_unit` OPERAND RESOLVED TO — `dyn_cast_or_null` on its
-/// defining op (`Helper.cpp:391-393`).
+/// defining op (`Helper.cpp:392-393`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewedUnit {
     /// It is a `dataflow.get_unit` of this kind.
@@ -205,7 +205,7 @@ pub enum ViewedUnit {
     NotAGetUnit,
 }
 
-/// WHAT AN INDIRECT MEMORY VIEW'S `start_address` OPERAND RESOLVED TO — `Helper.cpp:409-424`.
+/// WHAT AN INDIRECT MEMORY VIEW'S `start_address` OPERAND RESOLVED TO — `Helper.cpp:409-422`.
 ///
 /// ⭐ THE C++ HAS A THIRD OUTCOME THAT CANNOT HAPPEN. Its second test is
 /// `!ind_mem_view_start_addr_int || getInt() != 0` — an `arith.constant` whose value is not an
@@ -308,7 +308,7 @@ impl IndirectMemViewCheck {
         matches!(self, IndirectMemViewCheck::Admissible)
     }
 
-    /// The diagnostic the C++ emits for this outcome, verbatim (`Helper.cpp:394-430`).
+    /// The diagnostic the C++ emits for this outcome, verbatim (`Helper.cpp:395-426`).
     #[must_use]
     pub const fn diagnostic(self) -> Option<&'static str> {
         match self {
@@ -349,18 +349,18 @@ impl IndirectMemViewCheck {
 /// between.
 #[must_use]
 pub fn check_indirect_mem_view_for_extract_op(view: &IndirectMemView<'_>) -> IndirectMemViewCheck {
-    // `:391-397` — the from-unit must be a get_unit before its type can be read.
+    // `:392-398` — the from-unit must be a get_unit before its type can be read.
     let unit = match view.from_unit {
         ViewedUnit::NotAGetUnit => return IndirectMemViewCheck::FromUnitIsNotAGetUnit,
         ViewedUnit::GetUnit(unit) => unit,
     };
-    // `:398-407` — and the unit it names must be the virtual IBR. The C++ compares
+    // `:399-407` — and the unit it names must be the virtual IBR. The C++ compares
     // `stringToSenComponents.find(getType().str())->second` against `SenComponents::LXVIRTUALIBR`;
     // here the `type=` string and the enum are the same value (`DfirUnit::spelling`).
     if unit != DfirUnit::LxVirtualIbr {
         return IndirectMemViewCheck::NotOnAVirtualIbr;
     }
-    // `:409-424` — a constant start address, and it must be zero. TWO checks, not one: the C++
+    // `:409-422` — a constant start address, and it must be zero. TWO checks, not one: the C++
     // reports "does not have a constant start address" and "start address is not 0" separately.
     match view.start_address {
         ViewStart::NotAConstant => return IndirectMemViewCheck::StartAddressIsNotConstant,
@@ -369,11 +369,11 @@ pub fn check_indirect_mem_view_for_extract_op(view: &IndirectMemView<'_>) -> Ind
         }
         ViewStart::Constant(_) => {}
     }
-    // `:426-431` — `getNumDims() != 1 || !isIdentity()`.
+    // `:424-428` — `getNumDims() != 1 || !isIdentity()`.
     if view.layout_map.dims != 1 || !view.layout_map.is_identity() {
         return IndirectMemViewCheck::LayoutMapIsNot1DIdentity;
     }
-    // `:433` — `return true;`
+    // `:430` — `return true;`
     IndirectMemViewCheck::Admissible
 }
 
