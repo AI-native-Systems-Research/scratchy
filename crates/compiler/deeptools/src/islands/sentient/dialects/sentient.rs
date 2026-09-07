@@ -35,6 +35,7 @@ use std::fmt::Write as _;
 use crate::arch::{Bounded, Bytes, Elements};
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::sentient::dialects::Val;
 use crate::islands::sentient::print;
@@ -2021,6 +2022,30 @@ pub enum Op {
 
     // ───────────────────────── scalars ─────────────────────────
     /// `sentient.scalar_add` (`SentientOps.td:700`). Syntax declared in the `.td`.
+    ///
+    /// # ⛔⛔ THE REGISTER IS AN `Option` BECAUSE A LOWERING LEAVES IT UNSAID
+    ///
+    /// `regLocale` and `regIndex` are `DefaultValuedAttr`s (`SentientOps.td:703-704`), and
+    /// `AddOp::create(builder, loc, type, lhs, rhs)` passes neither — so the op the lowering emits
+    /// carries no register attributes at all and `attr-dict` prints nothing:
+    ///
+    /// ```text
+    /// %12 = sentient.scalar_sub %5, %11 : index, index
+    /// %29 = sentient.scalar_add %18, %1 : index, index
+    /// ```
+    ///
+    /// (`dcc/test/Conversion/StandardToSentient/cmpi_select_different_BB.mlir:19,58`, the output of
+    /// `--dcc-standard-to-sentient` alone.) Once `registerManagementPasses` (D64-D75) has decided,
+    /// the same op prints them:
+    ///
+    /// ```text
+    /// %20 = sentient.scalar_add %17, %1 {element_size = 8 : i32, regIndex = 1 : i32, regLocale = #sentient<reg_type lrf>} : index, index
+    /// ```
+    ///
+    /// (`dcc/test/LXLU/rotate-composite.mlir:24`.) ⛔ A NON-OPTIONAL `Reg` COULD NOT SPELL THE
+    /// FIRST: `RegType::Unknown` is a locale the reference also writes *explicitly*
+    /// (`regLocale = #sentient<reg_type unknown>` on the same test's `load_and_send`), so "unknown"
+    /// and "unsaid" are two states and collapsing them loses the one every lowering produces.
     ScalarAdd {
         /// `$inp1`.
         lhs: Val,
@@ -2028,8 +2053,10 @@ pub enum Op {
         rhs: Val,
         /// `$out`.
         result: Val,
-        /// Where the scalar lives.
-        reg: Reg,
+        /// Where the scalar lives — ⛔ `None` UNTIL AN ALLOCATOR SAYS. See [`Op::ScalarAdd`]'s note.
+        reg: Option<Reg>,
+        /// The type of both operands and of the result — `SameOperandsAndResultType`.
+        ty: ScalarTy,
     },
 
     /// `sentient.scalar_sub` (`SentientOps.td:801`).
@@ -2040,8 +2067,10 @@ pub enum Op {
         rhs: Val,
         /// `$out`.
         result: Val,
-        /// Where the scalar lives.
-        reg: Reg,
+        /// Where the scalar lives — ⛔ `None` until an allocator says.
+        reg: Option<Reg>,
+        /// The type of both operands and of the result.
+        ty: ScalarTy,
     },
 
     /// `sentient.scalar_mul` (`SentientOps.td:816`).
@@ -2056,8 +2085,10 @@ pub enum Op {
         rhs: Val,
         /// `$out`.
         result: Val,
-        /// `$regLocale`.
-        reg_locale: RegType,
+        /// `$regLocale` — ⛔ `None` until an allocator says; see [`Op::ScalarAdd`].
+        reg_locale: Option<RegType>,
+        /// The type of both operands and of the result.
+        ty: ScalarTy,
     },
 
     /// `sentient.scalar_copy` (`SentientOps.td:830`).
@@ -2081,8 +2112,17 @@ pub enum Op {
         value: i64,
         /// `$out`.
         result: Val,
-        /// `$regLocale`.
+        /// `$regLocale` — ⛔ CARRIED AND NEVER PRINTED. `ConstantOp` has
+        /// `hasCustomAssemblyFormat` and its printer emits the value and the result type only,
+        /// with no attribute dictionary unless the op is a symbol
+        /// (`SentientOps.cpp:1698-1715`), which is why the reference's own output shows
+        /// `sentient.scalar_constant {value = 0 : si64} : index` and never a locale. The attribute
+        /// is still on the op for the passes that read it.
         reg_locale: RegType,
+        /// `$out`'s type — ⭐ PRINTED, AND IT VARIES. `{value = 0 : si64} : index` sits beside
+        /// `{value = 0 : si64} : i1` in one function
+        /// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:6-8`).
+        ty: ScalarTy,
     },
 
     /// `sentient.vector_constant` — a whole vector of immediates (`SentientOps.td:866`).
@@ -2857,42 +2897,36 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             rhs,
             result,
             reg,
-        } => scalar_binary(
-            out,
-            "scalar_add",
-            *result,
-            *lhs,
-            *rhs,
-            *reg,
-        ),
+            ty,
+        } => scalar_binary(out, "scalar_add", *result, *lhs, *rhs, *reg, *ty),
         Op::ScalarSub {
             lhs,
             rhs,
             result,
             reg,
-        } => scalar_binary(
-            out,
-            "scalar_sub",
-            *result,
-            *lhs,
-            *rhs,
-            *reg,
-        ),
+            ty,
+        } => scalar_binary(out, "scalar_sub", *result, *lhs, *rhs, *reg, *ty),
         Op::ScalarMul {
             lhs,
             rhs,
             result,
             reg_locale,
+            ty,
         } => {
             // ⛔ NO `regIndex` ON THIS ONE — the asymmetry is the reference's
             // (`SentientOps.td:816-829`).
+            let attrs: Vec<String> = reg_locale
+                .map(|locale| vec![attr("regLocale", &locale_attr(locale))])
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "{} = sentient.scalar_mul {}, {} {} : index, index",
+                "{} = sentient.scalar_mul {}, {}{} : {}, {}",
                 print::val(*result),
                 print::val(*lhs),
                 print::val(*rhs),
-                dict(&[attr("reg_locale", &quoted(reg_locale.spelling()))])
+                dict(&attrs),
+                ty.spelling(),
+                ty.spelling()
             );
         }
         Op::ScalarCopy {
@@ -2920,16 +2954,18 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::ScalarConstant {
             value,
             result,
-            reg_locale,
+            reg_locale: _,
+            ty,
         } => {
+            // ⛔ THE VALUE AND THE TYPE, AND NOTHING ELSE. `ConstantOp::print` writes
+            // `" {value = " << int_val << " : si64} : " << resultTypes` and never the attribute
+            // dictionary (`SentientOps.cpp:1698-1715`), so the locale does not appear here even
+            // when it has been set.
             let _ = writeln!(
                 out,
-                "{} = sentient.scalar_constant {} : index",
+                "{} = sentient.scalar_constant {{value = {value} : si64}} : {}",
                 print::val(*result),
-                dict(&[
-                    attr("reg_locale", &quoted(reg_locale.spelling())),
-                    attr("value", &format!("{value} : si64")),
-                ])
+                ty.spelling()
             );
         }
         Op::VectorConstant { value, result } => {
@@ -3116,20 +3152,44 @@ fn masked(mask: Option<Val>) -> String {
 }
 
 /// `scalar_add` and `scalar_sub`, whose printed shape the `.td` declares identically.
-fn scalar_binary(out: &mut String, mnemonic: &str, result: Val, lhs: Val, rhs: Val, reg: Reg) {
-    let mut attrs = vec![attr("reg_locale", &quoted(reg.locale.spelling()))];
-    if let Some(index) = reg.index {
-        attrs.push(attr("reg_index", &format!("{} : i32", index.get())));
+fn scalar_binary(
+    out: &mut String,
+    mnemonic: &str,
+    result: Val,
+    lhs: Val,
+    rhs: Val,
+    reg: Option<Reg>,
+    ty: ScalarTy,
+) {
+    // ⛔ NO DICTIONARY AT ALL WHEN NO ALLOCATOR HAS SPOKEN — see [`Op::ScalarAdd`].
+    let mut attrs: Vec<String> = Vec::new();
+    if let Some(reg) = reg {
+        attrs.push(attr("regLocale", &locale_attr(reg.locale)));
+        if let Some(index) = reg.index {
+            attrs.push(attr("regIndex", &format!("{} : i32", index.get())));
+        }
+        attrs.sort();
     }
-    attrs.sort();
     let _ = writeln!(
         out,
-        "{} = sentient.{mnemonic} {}, {} {} : index, index",
+        "{} = sentient.{mnemonic} {}, {}{} : {}, {}",
         print::val(result),
         print::val(lhs),
         print::val(rhs),
-        dict(&attrs)
+        dict(&attrs),
+        ty.spelling(),
+        ty.spelling()
     );
+}
+
+/// ONE `SentientRegTypeAttr` AS THE REFERENCE WRITES IT — `#sentient<reg_type lrf>`.
+///
+/// ⚠️ THE ARRAY FORMS AND THE OTHER SINGLE-REGISTER OPS STILL SPELL IT `"lrf"`, a quoted string
+/// ([`locale_array`]), which no reference output shows. Correcting them is a change to the printed
+/// form of ops other units own, so it is left to those units; this is the spelling
+/// `dcc/test/LXLU/rotate-composite.mlir:24` and `dcc/test/L3SU/dyn_node_e2e.mlir:75` show.
+fn locale_attr(locale: RegType) -> String {
+    format!("#sentient<reg_type {}>", locale.spelling())
 }
 
 /// THE ATTRIBUTE DICTIONARY OF ONE COMPUTE OP, sorted.
