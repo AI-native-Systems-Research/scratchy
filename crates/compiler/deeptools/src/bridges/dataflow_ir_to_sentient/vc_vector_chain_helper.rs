@@ -523,14 +523,15 @@ impl MergeAndPack {
     /// forty-eight `-1`s, so its sum is 960 - 48 = 912, not 960. Summing only the non-negative
     /// entries would make the fast filter accept index lists it should reject.
     ///
-    /// ⛔ `repetition` IS ALWAYS EIGHT. It is a member DEFAULT (`int repetition = 8;`, `:309`) that
+    /// ⛔ `repetition` IS ALWAYS EIGHT. It is a member DEFAULT (`int repetition = 8;`, `:310`) that
     /// the constructor never assigns and no row overrides, and it is compared for equality against
     /// the pack op's own `repetition` (`:399`) — so it is a constant of the table, not a parameter.
     ///
     /// ⛔ `sign_extend` IS EXPLICIT AT EVERY CALL. The C++ defaults it (`bool sign_extend = false`,
-    /// `:313`) and thirty of the thirty-four rows leave it out; Rust has no default arguments, so the
-    /// four rows that DO set it — `pack14`, `pack15`, and the two the table pairs them with — read
-    /// beside their twins rather than differing in an omission.
+    /// `:314`) and thirty-two of the thirty-four rows leave it out; Rust has no default arguments, so
+    /// the two rows that DO set it — `pack14` (`:350-353`) and `pack15` (`:354-357`) — read beside
+    /// `pack12` and `pack13`, the twins they differ from in nothing else, rather than differing in an
+    /// omission.
     ///
     /// ⚠️ ITS CALLER IS UNPORTED. The table of thirty-four rows and the matching loop are
     /// `getMergeTypeFromIndices` (entry 165), which is not this worklist's; nothing in the crate
@@ -601,7 +602,7 @@ impl MergeAndPack {
 ///
 /// ⭐⭐ THREE STATES, NOT TWO BOOLS. The reference hands back `bool& fusion_to_min` and
 /// `bool& fusion_to_max` and then has to ask itself `if (!fusion_to_min && !fusion_to_max)`
-/// (`VectorChainHelper.cpp:460-462`), because the pair can spell a fourth thing — *both* — that
+/// (`VectorChainHelper.cpp:462-464`), because the pair can spell a fourth thing — *both* — that
 /// means nothing at all. One value cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[must_use]
@@ -666,7 +667,7 @@ pub enum MinOrMaxFusion {
 ///
 /// ⭐⭐ `max(a, b)` IS WRITTEN IN THIS IR AS `a > b ? a : b`, AND THIS IS WHERE IT IS RECOGNISED.
 /// A `vectorchain.element_wise_compare` feeding a `vectorchain.element_wise_selection` whose two arms
-/// are the compare's own two operands is one Sentient instruction, not two: `fmax.mlir:117-118` is
+/// are the compare's own two operands is one Sentient instruction, not two: `fmax.mlir:119-120` is
 /// exactly that pair and `fmax.mlir:42` lowers it to a single
 /// `sentient.vector_binary … binaryOp = #sentient<binary_operator max>`. Get this wrong and a
 /// two-instruction chain is emitted where the ISA has one — or worse, `min` where the program said
@@ -682,7 +683,7 @@ pub enum MinOrMaxFusion {
 ///
 /// ⛔ THE ARGUMENT IS THE SELECTION'S THREE FIELDS, NOT A `&vc::Op`. The reference's parameter type is
 /// `ElementWiseSelectionOp` — the narrowing has already happened at the call site, and taking a whole
-/// [`vc::Op`] here would force a `todo!` arm for the fourteen variants the C++ signature already rules
+/// [`vc::Op`] here would force a `todo!` arm for the seventeen variants the C++ signature already rules
 /// out. `scope` is the block to resolve definitions in; the reference gets that from the operand's own
 /// `getDefiningOp()`, which this island reaches through [`dfir_op::defining_op`].
 ///
@@ -741,7 +742,7 @@ pub fn fuse_compare_and_select_into_min_or_max(
         (vc::CompareOp::Lt | vc::CompareOp::Le, true) => MinOrMaxFusion::ToMin,
         (vc::CompareOp::Lt | vc::CompareOp::Le, false) => MinOrMaxFusion::ToMax,
         (vc::CompareOp::Eq | vc::CompareOp::Neq, _) => {
-            todo!("Unable to lower compare and select into max/min operation (VectorChainHelper.cpp:460-462)")
+            todo!("Unable to lower compare and select into max/min operation (VectorChainHelper.cpp:463)")
         }
     }
 }
@@ -1245,8 +1246,9 @@ pub fn vector_element_wise_compare_operator_to_sentient_binary_operator(
 ///
 /// ⛔ THE ARGUMENT NARROWS FROM `Operation*` TO [`&vc::Op`](vc::Op) — a non-`vectorchain` op fails
 /// `isa<ElementWiseSelectionOp>` and reaches the `DT_ERROR` anyway, so nothing an outer dialect could
-/// pass has an answer this function could give. The remaining fourteen `vectorchain` ops keep it:
-/// they are compares, binaries and multiplies, none of which is a ternary.
+/// pass has an answer this function could give. The remaining seventeen `vectorchain` ops keep it —
+/// [`Select`](vc::Op::Select) among them, which despite the name is the reference's own
+/// `vectorchain.select` and NOT an `ElementWiseSelectionOp`, so the C++ falls through on it too.
 #[must_use]
 pub fn vector_ternary_to_sentient_ternary(op: &vc::Op) -> sen::TernaryOp {
     match op {
@@ -1268,7 +1270,7 @@ pub fn vector_ternary_to_sentient_ternary(op: &vc::Op) -> sen::TernaryOp {
         | vc::Op::Cast { .. }
         | vc::Op::CreateAffineMask { .. }
         | vc::Op::CreateAffineMaskSet { .. } => {
-            todo!("unknown vectorchain Ternary operator (VectorChainHelper.hpp:255)")
+            todo!("unknown vectorchain Ternary operator (VectorChainHelper.hpp:254)")
         }
     }
 }
@@ -1860,7 +1862,7 @@ mod unit_tests {
     /// 🎯 `fmax.mlir` — A RECEIVE AND A LOAD, COMPARED `gt` AND SELECTED IN THAT ORDER, IS ONE `max`.
     ///
     /// The vendor input is `element_wise_compare %53, %55 {compare_gt}` followed by
-    /// `element_wise_selection %57 ? %53 : %55` (`fmax.mlir:117-118`), and the expectation is a single
+    /// `element_wise_selection %57 ? %53 : %55` (`fmax.mlir:119-120`), and the expectation is a single
     /// `sentient.vector_binary … binaryOp = #sentient<binary_operator max>` (`fmax.mlir:42`).
     #[test]
     fn a_receive_and_a_load_compared_greater_than_fuse_to_max() {

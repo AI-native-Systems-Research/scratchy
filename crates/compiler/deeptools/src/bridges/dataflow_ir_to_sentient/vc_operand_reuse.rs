@@ -263,9 +263,14 @@ impl OperandReuse {
     /// then visible to [`Self::absorbtion_flag`] as `Some(true)` — registered, absorbed — while
     /// [`Self::id`] answers -1 for it either way.
     ///
-    /// ⭐ IT IS REACHABLE. `setReuseInformation`'s second loop calls it for every non-`Constant`
-    /// operand whose producer is not a `latch` (`OperandReuse.cpp:56-62`), and the first loop does
-    /// not insert every operand the second one reaches.
+    /// ⛔ THE DEFAULT-INSERT IS UNREACHABLE THROUGH THE REFERENCE'S ONLY CALLER, AND THAT IS WHY THE
+    /// COMMENT IS THERE. `OperandReuse.cpp:58` is the sole call site; its loop
+    /// (`OperandReuse.cpp:55-60`) reaches only operands with `type_ != Constant`, and the first loop
+    /// has already called `insertIfNotExists` on **every** operand with `type_ != Constant`
+    /// (`:26-27`) or returned `nullopt` — while `setValue` only rewrites the name, never `type_`. So
+    /// every key that gets here is present. ⛔ THE PORT STILL MODELS `operator[]` AND NOT THE COMMENT:
+    /// the reference's *code* default-inserts, `e276_setReuseInformation` is not yet ported, and a
+    /// port that answered the comment instead would diverge the moment a second caller appears.
     // ⭐ DEAD IN A LIBRARY BUILD, LIVE UNDER TEST. Its only caller is `e276_setReuseInformation`,
     // which is not scheduled in this wave; `expect` rather than `allow` so the attribute has to come
     // off when that unit lands.
@@ -287,7 +292,7 @@ impl OperandReuse {
     ///
     /// ```cpp
     /// bool dominates(Operation *op1, Operation *op2) {
-    ///   return dominance_info_->dominates(op1, op2);
+    ///   return dominance_info_.dominates(op1, op2);
     /// }
     /// ```
     ///
@@ -297,7 +302,8 @@ impl OperandReuse {
     /// itself — and `properlyDominates` is the strict form. `setReuseInformation` wants the strict
     /// question and gets the right answer anyway, because it only ever compares two DIFFERENT
     /// operands (`OperandReuse.cpp:39-46`). But `analyzeNonComputeOpsForFusion` hands this straight
-    /// to `llvm::sort` as a comparator (`VectorChainHelper.cpp:669-672`):
+    /// to `llvm::sort` as a comparator (`VectorChainHelper.cpp:655-658`, paraphrased to one line
+    /// here):
     ///
     /// ```cpp
     /// llvm::sort(users, [&](Operation *l, Operation *r) { return reuse_info.dominates(l, r); });
@@ -322,6 +328,15 @@ impl OperandReuse {
     ///    region that does not contain `b`, and dominates nothing outside it. ⛔ THIS IS THE CASE A
     ///    FLAT PROGRAM ORDER GETS WRONG: `a` at `[3, 0, 5]` precedes `b` at `[3, 1]` in a flat walk
     ///    and dominates it in no sense at all.
+    ///
+    /// ⛔ SIBLING REGIONS OF ONE OP ARE THE MODEL'S BLIND SPOT, AND IT COSTS NOTHING HERE.
+    /// [`OpId::block`] flattens a multi-region op's regions into one prefix, so an op in an
+    /// `scf.if`'s `then` and one in its `else` look like siblings in a block and case (2) declares the
+    /// first dominates the second — which is false in MLIR, where neither dominates the other. It
+    /// cannot mislead the only caller: `setReuseInformation` compares two operands of ONE compute
+    /// (`OperandReuse.cpp:37-48`), and an operand that reaches a compute is in a block on that
+    /// compute's own ancestor chain, never in a sibling region. ⛔ Whoever ports a caller that asks
+    /// dominance of two arbitrary positions needs the block CFG this model does not carry.
     ///
     /// ⭐ AN OP, NOT A [`Val`]. The table above keys on the value a data origin produces because that
     /// is what identifies it; dominance is asked of two operations' POSITIONS, and the two questions
@@ -371,7 +386,8 @@ mod unit_tests {
     ///
     /// The reference's miss branch is `return -1;` on an engaged optional, and its callers
     /// `.value()` it without a guard, so the -1 lands in the emitted compute's `op<X>DataID` and
-    /// prints there — `opADataID = -1 : si32`, which 88 of the authority's test cases show.
+    /// prints there — `opADataID = -1 : si32`, which 144 of the authority's test files show (12,350
+    /// explicit -1 data ids in all, the figure [`DataId`] quotes).
     #[test]
     fn an_unregistered_origin_answers_minus_one() {
         let reuse = table(&[]);

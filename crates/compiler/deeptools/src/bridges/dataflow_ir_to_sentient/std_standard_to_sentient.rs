@@ -319,13 +319,18 @@ impl NestedIf {
     /// branch holding an `arith.andi`, which has two operands, so a nest has at least two levels; a
     /// caller that passes one conjunct gets the single `if` the base case builds, and one that
     /// passes none gets a bare `sentient.yield` of the true value — the conjunction of nothing.
+    ///
+    /// ⛔ IT TAKES `self` BY VALUE BECAUSE `into_` PROMISES TO. The nest owns every conjunct's
+    /// `dbgName`, and a `&self` form would have to clone each of them to hand the same names to the
+    /// ops it builds — the only `into_*(&self)` in the crate, and the one shape
+    /// `clippy::wrong_self_convention` names.
     #[must_use]
-    pub fn into_op(&self) -> Vec<super::SenOp> {
+    pub fn into_op(self) -> Vec<super::SenOp> {
         // ⭐ BUILT INSIDE OUT, so each level already has the result its parent must yield.
         let mut nest: Vec<super::SenOp> = vec![super::SenOp::Sentient(sen::Op::Yield {
             results: vec![self.true_value],
         })];
-        for conjunct in self.conjuncts.iter().rev() {
+        for conjunct in self.conjuncts.into_iter().rev() {
             nest = vec![
                 super::SenOp::Sentient(sen::Op::If {
                     predicate: conjunct.predicate,
@@ -341,7 +346,7 @@ impl NestedIf {
                             index: None,
                         },
                     }],
-                    dbg_name: conjunct.dbg_name.clone(),
+                    dbg_name: conjunct.dbg_name,
                     then_body: nest,
                     else_body: vec![super::SenOp::Sentient(sen::Op::Yield {
                         results: vec![self.false_value],
