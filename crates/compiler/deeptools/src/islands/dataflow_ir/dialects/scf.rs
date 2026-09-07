@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
+use crate::islands::dataflow_ir::dialects::affine::Carried;
 use crate::islands::dataflow_ir::print;
 
 /// ONE `scf` OPERATION.
@@ -35,6 +36,61 @@ pub enum Op {
         else_body: Vec<super::Op>,
     },
 
+    /// `%r = scf.for %i = %lo to %hi step %st iter_args(%a = %init) -> (index) { .. }` — THE
+    /// COUNTED LOOP WHOSE BOUNDS ARE VALUES.
+    ///
+    /// # ⛔⛔ THE WHOLE DIFFERENCE FROM [`super::affine::Op::For`] IS WHERE THE BOUNDS LIVE
+    ///
+    /// An `affine.for` states its bounds as affine maps over the enclosing loops' induction
+    /// variables — literals, in every loop this crate builds. An `scf.for` takes them as OPERANDS,
+    /// so a bound may be any SSA value at all, including an `arith.select` between two constants.
+    /// That is precisely the shape `TransformLoopToLegalizeForSentientLowering` exists to remove:
+    /// its header says it *"converts `scf.for` with conditional upper bounds into `scf.if` + affine
+    /// loops so agen iterators are affine"* (`:8-16`), because the address generator can only walk
+    /// an affine iteration space.
+    ///
+    /// ⛔ SO THIS IS AN **INPUT** OP, NOT ONE THE BRIDGE EMITS. It is here because the pass's input
+    /// contains it — `dcc/test/Transform/TransformLoopToLegalizeForSentientLowering/scf_loop_with_result.mlir:32`
+    /// is `%11 = scf.for %arg4 = %c0 to %10 step %c1 iter_args(%arg5 = %arg3) -> (index)` with `%10`
+    /// an `arith.select` — and without it `transformSCFToAffineLoop` has no argument to be given and
+    /// the pass could not be ported at all.
+    ///
+    /// ⭐ THE STEP IS A FIELD BECAUSE THE PASS BRANCHES ON IT. `transformSCFToAffineLoop` transforms
+    /// only `lbound == 0 && step == 1` (`:105`) and reports failure otherwise, so a representation
+    /// that assumed a unit step could not express the case it declines.
+    ///
+    /// ⭐ AND A SECOND PASS CLASSIFIES ITS INPUT BY IT. `performFullUnroll` dispatches over exactly
+    /// two loop kinds (`LoopUnrollForShuffleOp.cpp:141-149`) and a candidate it cannot hold is a
+    /// candidate the dispatch cannot be written total over — see
+    /// [`crate::bridges::dataflow_ir_to_sentient::tf_loop_unroll_for_shuffle_op::Loop`]. Where an
+    /// `affine.for` lets affine's own analysis derive the trip count from its bound maps (`:162-165`),
+    /// this loop's three bounds are SSA operands and the count has to be reconstructed by asking each
+    /// of them for its defining constant (`:167-182`) — which is why one overload is one line and the
+    /// other needs a helper. Holding the bounds as [`Val`] is what makes that reconstruction
+    /// expressible.
+    For {
+        /// The induction variable it binds — the region's first argument.
+        iv: Val,
+        /// `$lowerBound`, an operand.
+        lo: Val,
+        /// `$upperBound`, an operand.
+        hi: Val,
+        /// `$step`, an operand.
+        step: Val,
+        /// THE VALUES IT CARRIES ACROSS ITERATIONS — empty for the plain counted loop.
+        ///
+        /// ⭐ THE SAME THREE-VALUE RECORD AN `affine.for` USES, and deliberately the same type:
+        /// `transformSCFToAffineLoop` hands `scf_for.getInits()` straight to
+        /// `affine::AffineForOp::create` (`:107-108`), so the two ops' carried lists are the same
+        /// list and a second type for it would be two records of one fact.
+        carried: Vec<Carried>,
+        /// The body, ending in an [`Op::Yield`] once anything is carried.
+        body: Vec<super::Op>,
+        /// `{dbgName = ".."}` — see [`super::affine::Op::For`]'s field of the same name for why an
+        /// emitter must carry it.
+        dbg_name: Option<String>,
+    },
+
     /// `scf.yield %operands` — what an `affine.yield` becomes (`AffineToStandard.cpp:48`).
     Yield {
         /// The carried values, which are the `affine.yield`'s own.
@@ -54,43 +110,65 @@ pub enum Op {
         /// The body.
         body: Vec<super::Op>,
     },
-
-    /// `scf.for %iv = %lo to %hi step %step { .. }` — the UNSTRUCTURED-BOUND counted loop.
-    ///
-    /// ⛔ PRESENT BECAUSE ONE PASS MUST CLASSIFY ITS INPUT, not because this crate emits it. Every
-    /// loop the bridge builds is an [`super::affine::Op::For`]; this variant exists because
-    /// `performFullUnroll` dispatches over exactly two loop kinds
-    /// (`LoopUnrollForShuffleOp.cpp:141-149`) and a candidate it cannot hold is a candidate the
-    /// dispatch cannot be written total over — see
-    /// [`crate::bridges::dataflow_ir_to_sentient::tf_loop_unroll_for_shuffle_op::Loop`].
-    ///
-    /// ⛔⛔ THE BOUNDS ARE VALUES, AND THAT IS THE WHOLE DIFFERENCE BETWEEN THE TWO OVERLOADS.
-    /// `affine.for`'s bounds are affine maps, so affine's own analysis derives the trip count from
-    /// the map and the reference just asks for a full unroll (`:162-165`). An `scf.for`'s bounds are
-    /// three SSA operands, so the trip count has to be reconstructed by asking each of them for its
-    /// defining constant (`:167-182`) — which is why one overload is one line and the other needs a
-    /// helper. Holding them as [`Val`] is what makes that reconstruction expressible.
-    ///
-    /// ⛔ NO `iter_args`, for the same reason [`results`](super::results) gives no `scf` op a result:
-    /// nothing in this pipeline binds one. A carrying loop is an `affine.for` with
-    /// [`super::affine::Carried`].
-    For {
-        /// The induction variable its region binds.
-        iv: Val,
-        /// The lower bound — `getLowerBound()`.
-        lo: Val,
-        /// The upper bound, exclusive — `getUpperBound()`.
-        hi: Val,
-        /// The step — `getStep()`.
-        step: Val,
-        /// The body.
-        body: Vec<super::Op>,
-    },
 }
 
 /// ONE `scf` OP AS TEXT. The caller has already indented the opening line.
 pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
     match op {
+        Op::For {
+            iv,
+            lo,
+            hi,
+            step,
+            carried,
+            body,
+            dbg_name,
+        } => {
+            // ⭐ THE THREE RENDERINGS OF ONE LIST, exactly as `affine.for` prints them — see
+            // [`super::affine::Carried`]. A loop that carries nothing prints no results, no
+            // `iter_args` and no `-> (..)`.
+            let (results, iter_args, result_tys) = if carried.is_empty() {
+                (String::new(), String::new(), String::new())
+            } else {
+                (
+                    format!(
+                        "{} = ",
+                        carried
+                            .iter()
+                            .map(|c| print::val(c.result))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    format!(
+                        " iter_args({})",
+                        carried
+                            .iter()
+                            .map(|c| format!("{} = {}", print::val(c.arg), print::val(c.init)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    format!(" -> ({})", vec!["index"; carried.len()].join(", ")),
+                )
+            };
+            let _ = writeln!(
+                out,
+                "{results}scf.for {} = {} to {} step {}{iter_args}{result_tys} {{",
+                print::val(*iv),
+                print::val(*lo),
+                print::val(*hi),
+                print::val(*step)
+            );
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            match dbg_name {
+                None => out.push_str("}\n"),
+                Some(name) => {
+                    let _ = writeln!(out, "}} {{dbgName = \"{name}\"}}");
+                }
+            }
+        }
         Op::If {
             cond,
             body,
@@ -121,27 +199,6 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         }
         Op::Parallel { ivs, body } => {
             let _ = writeln!(out, "scf.parallel ({}) {{", print::vals(ivs));
-            for inner in body {
-                print::emit(out, inner, depth + 1);
-            }
-            print::indent(out, depth);
-            out.push_str("}\n");
-        }
-        Op::For {
-            iv,
-            lo,
-            hi,
-            step,
-            body,
-        } => {
-            let _ = writeln!(
-                out,
-                "scf.for {} = {} to {} step {} {{",
-                print::val(*iv),
-                print::val(*lo),
-                print::val(*hi),
-                print::val(*step)
-            );
             for inner in body {
                 print::emit(out, inner, depth + 1);
             }

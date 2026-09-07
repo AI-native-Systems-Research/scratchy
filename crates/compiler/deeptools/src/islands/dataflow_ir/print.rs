@@ -201,13 +201,28 @@ pub(crate) fn affine_map(map: &AffineMap) -> String {
         .map(|d| format!("d{d}"))
         .collect::<Vec<_>>()
         .join(", ");
+    // ⛔ THE SYMBOL GROUP IS OMITTED WHEN THERE ARE NONE, NOT PRINTED EMPTY. MLIR writes
+    // `affine_map<(d0) -> (d0)>` and `affine_map<()[s0] -> (s0)>`; `affine_map<(d0)[] -> (d0)>`
+    // does not round-trip. So a map with `syms: 0` prints exactly what it printed before symbols
+    // existed, which is every map this bridge emits into a program.
+    let syms = if map.syms == 0 {
+        String::new()
+    } else {
+        format!(
+            "[{}]",
+            (0..map.syms)
+                .map(|s| format!("s{s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let results = map
         .results
         .iter()
         .map(|expr| affine_expr(expr, 0, false))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("affine_map<({dims}) -> ({results})>")
+    format!("affine_map<({dims}){syms} -> ({results})>")
 }
 
 /// `affine_set<(d0, ..) : (c, ..)>` — the constraints in the order they were built.
@@ -233,7 +248,7 @@ pub(crate) fn integer_set(set: &IntegerSet) -> String {
 /// `+` is loosest; `*`, `mod` and `floordiv` bind tighter; a dimension or a literal is atomic.
 const fn precedence(expr: &AffineExpr) -> u8 {
     match expr {
-        AffineExpr::Dim(_) | AffineExpr::Const(_) => 3,
+        AffineExpr::Dim(_) | AffineExpr::Sym(_) | AffineExpr::Const(_) => 3,
         AffineExpr::Mul(..) | AffineExpr::Mod(..) | AffineExpr::FloorDiv(..) => 2,
         AffineExpr::Add(..) => 1,
     }
@@ -256,6 +271,7 @@ fn affine_expr(expr: &AffineExpr, parent: u8, parent_is_divlike: bool) -> String
     let own = precedence(expr);
     let text = match expr {
         AffineExpr::Dim(d) => format!("d{d}"),
+        AffineExpr::Sym(sym) => format!("s{sym}"),
         AffineExpr::Const(n) => n.to_string(),
         // ⛔ A NEGATIVE ADDEND IS A SUBTRACTION, NOT A SUM WITH A NEGATIVE. MLIR prints `d1 - 2 >= 0`
         // and never `d1 + -2 >= 0`, and that is the lower half of every spanning constraint whose

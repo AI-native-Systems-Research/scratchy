@@ -672,6 +672,7 @@ mod unit_tests {
                 lo: affine::Bound::Const(0),
                 hi: affine::Bound::Const(4),
                 carried: Vec::new(),
+                dbg_name: None,
                 body: vec![DfirOp::Scf(scf::Op::Yield {
                     operands: Vec::new(),
                 })],

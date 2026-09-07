@@ -82,7 +82,11 @@
 
 use crate::arch::{Arch, Bounded, Elements, Sticks};
 use crate::generated::DataType;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith, dataflow, defining_op};
+use crate::islands::dataflow_ir::ty::{AffineMap, MemRef};
 use crate::units::DfirUnit;
+
 
 /// WHICH HALF OF THE L3 — the `DT_CHECK(is_any_of(comp, L3LU, L3SU))` both range queries open with.
 ///
@@ -285,12 +289,369 @@ pub fn max_immutable_range<A: Arch>(_half: L3Half) -> AddrRange {
     }
 }
 
+
+/// A `dataflow.get_logical_memory_view` WHOSE START ADDRESS IS A CONSTANT — everything a clone of it
+/// needs, and the PROOF that [`is_eligible_for_splitting`] admitted it.
+///
+/// ⭐⭐ THIS TYPE IS THE GATE'S OUTPUT AND [`create_new_mem_view_with_mod`]'s INPUT, which is what
+/// makes the pass's own precondition checkable. `setupForPartitioning` runs
+/// `DT_CHECK(isEligibleForSplitting(all_mem_views))` first (`MutableAddrSplitting.cpp:826`) and every
+/// view the partitioning then clones is one of the views that check passed over; carrying the
+/// constant start as an `i64` rather than a `Val` is that fact in the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstStartMemView<'a> {
+    /// `mem_view_op.getMemory()` — the memory unit viewed.
+    pub from: Val,
+    /// The value of the `arith.constant` bound to `mem_view_op.getStartAddress()`, in elements.
+    pub start: i64,
+    /// `layout_map`.
+    pub layout: &'a AffineMap,
+    /// The view's type.
+    pub ty: &'a MemRef,
+}
+
+/// WHAT ONE MEMORY VIEW OF A LOAD/STORE CHAIN LOOKS LIKE TO THE SPLITTING GATE.
+///
+/// ⛔ NOT AN ERROR TYPE. Nothing here is a `Result` and nothing stops: these are the three shapes
+/// `isEligibleForSplitting`'s two `dyn_cast`/`isConstant` tests distinguish, and two of them make the
+/// gate answer `false` — which is a fact about the program, reported by [`SplittingEligibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitCandidateView<'a> {
+    /// A `dataflow.get_logical_memory_view` whose start address is an `arith.constant`.
+    ConstantStart(ConstStartMemView<'a>),
+    /// A `dataflow.get_logical_memory_view` whose start address is bound by something else — a
+    /// toggle (`arith.subi` over an `iter_args` chain), a conditional, or a region argument.
+    NonConstantStart,
+    /// Bound by an operation that is not a `get_logical_memory_view`, or by no operation at all.
+    NotAMemoryView,
+}
+
+impl<'a> SplitCandidateView<'a> {
+    /// RESOLVES ONE VIEW VALUE AGAINST THE OPS IN SCOPE — the two `dyn_cast`s, in the gate's order.
+    ///
+    /// ⚠️ `scope` IS THE DEF-USE WALK, WHICH IS MECHANISM. `mem_view.getDefiningOp()` is MLIR asking
+    /// a value which operation bound it; this island has no use lists, so the caller passes the ops
+    /// in scope and [`defining_op`] scans them. An SSA value is bound exactly once, so the two agree
+    /// on every well-formed program.
+    ///
+    /// ⛔ A REGION ARGUMENT IS [`SplitCandidateView::NotAMemoryView`], NOT A MISSING CASE.
+    /// `mem_view.getDefiningOp()` is null for one and `dyn_cast<GetLogicalMemoryViewOp>(nullptr)` is
+    /// null too, so the reference takes the `return false` — the same answer, reached the same way.
+    #[must_use]
+    pub fn resolve(mem_view: Val, scope: &'a [DfirOp]) -> SplitCandidateView<'a> {
+        // `dyn_cast<dataflow::GetLogicalMemoryViewOp>(mem_view.getDefiningOp())`.
+        let Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            from,
+            start,
+            layout,
+            ty,
+            ..
+        })) = defining_op(mem_view, scope)
+        else {
+            return SplitCandidateView::NotAMemoryView;
+        };
+        // `dcc::utils::isConstant<arith::ConstantOp>(mem_view_op.getStartAddress())`.
+        //
+        // ⛔ THE `uniform::QueryMapOp` ARM OF `isConstant` COLLAPSES HERE. `Utils.cpp:428-441` also
+        // answers true for a query into an immutable mapping whose every value is a constant; there
+        // is no `uniform` dialect in this island (a query map is a UNIFORMIZATION artefact, and this
+        // crate emits programs already specialised per unit), so the only true case is the
+        // `arith.constant` one. If the island ever grows one, this is the arm that grows with it.
+        //
+        // ⛔ AND `isa<BlockArgument>(val) → false` (`:426`) IS THE `None` ARM below: a start address
+        // that is a region argument is not a constant, which is the whole toggle pattern
+        // `AddressPinningAndToggle` leaves behind.
+        match defining_op(*start, scope) {
+            Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => {
+                SplitCandidateView::ConstantStart(ConstStartMemView {
+                    from: *from,
+                    start: *value,
+                    layout,
+                    ty,
+                })
+            }
+            _ => SplitCandidateView::NonConstantStart,
+        }
+    }
+}
+
+/// WHETHER THE CHAIN'S MEMORY VIEWS MAY BE SPLIT — and, where not, WHICH ONE SAID NO.
+///
+/// ⛔ NOT AN ERROR TYPE, AND NOT A DIAGNOSTIC EITHER. The reference's caller wraps this in
+/// `DT_CHECK(isEligibleForSplitting(all_mem_views))` (`:826`), which aborts the compiler with an
+/// assertion and no message. Naming the offending view is strictly more than `false` carried and
+/// costs nothing; [`Self::eligible`] is the reference's own boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplittingEligibility {
+    /// Every view is a `get_logical_memory_view` with a constant start address.
+    Eligible,
+    /// This view is bound by something that is not a `get_logical_memory_view`.
+    ViewIsNotAMemoryView(Val),
+    /// This view's start address is not an `arith.constant`.
+    ViewStartAddressIsNotConstant(Val),
+}
+
+impl SplittingEligibility {
+    /// The reference's own `bool`.
+    #[must_use]
+    pub const fn eligible(self) -> bool {
+        matches!(self, SplittingEligibility::Eligible)
+    }
+}
+
+/// Replaces: e113_isEligibleForSplitting
+///
+/// **113/384** `MutableAddrSplittingPass::isEligibleForSplitting` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:832` (20L).
+///
+/// ```cpp
+/// bool MutableAddrSplittingPass::isEligibleForSplitting(
+///     const SmallVectorImpl<Value> &all_mem_views) const {
+///   // Other passes are responsible to remove variability from immutable
+///   // addresses. Currently, AddressPinningAndToggle is one such pass. However, it
+///   // expects a toggle or conditional immutable address to be used only in one
+///   // memory operation and a yield operation. At this time, MutableAddrSplitting
+///   // will not support any memory view used in the load/store chain where
+///   // splitting is required that does not have a constant start address.
+///   for (auto &mem_view : all_mem_views) {
+///     // Ineligible for splitting if any of the mem views are not a
+///     // GetLogicalMemoryViewOp.
+///     auto mem_view_op =
+///         dyn_cast<dataflow::GetLogicalMemoryViewOp>(mem_view.getDefiningOp());
+///     if (!mem_view_op) return false;
+///
+///     // Start address must be a constant.
+///     if (!dcc::utils::isConstant<arith::ConstantOp>(
+///             mem_view_op.getStartAddress()))
+///       return false;
+///   }
+///   return true;
+/// }
+/// ```
+///
+/// # ⭐ WHY A CONSTANT START IS THE PRICE OF SPLITTING
+///
+/// Splitting a transfer whose mutable address has overflowed means emitting the SAME transfer several
+/// times over disjoint partitions of its iteration space, each reading a view whose start address is
+/// the original PLUS a partition offset ([`create_new_mem_view_with_mod`]). Where the start address
+/// is a constant that offset is another constant and the clone is free. Where it is a toggle or a
+/// conditional it is a VALUE, computed inside the unit, and moving it means rewriting the chain that
+/// computes it — which is what the leading comment declines: `AddressPinningAndToggle` has already
+/// arranged for a toggled address to be used by exactly one memory operation and one yield, and a
+/// second user would break that.
+///
+/// # ⛔ EVERY VIEW, NOT THE ONE BEING SPLIT
+///
+/// `all_mem_views` is the whole load/store chain — a composite transfer names two, source and
+/// destination — and ONE non-constant start makes the whole chain ineligible. Checking only the view
+/// about to be cloned would admit exactly the case the comment rules out.
+///
+/// # ⚠️ EMPTY IS ELIGIBLE
+///
+/// A `for` over nothing falls through to `return true`. Kept, because `initialize` collects the views
+/// before this runs and a chain with none has no view to fail the test.
+#[must_use]
+pub fn is_eligible_for_splitting(all_mem_views: &[Val], scope: &[DfirOp]) -> SplittingEligibility {
+    for mem_view in all_mem_views {
+        match SplitCandidateView::resolve(*mem_view, scope) {
+            SplitCandidateView::ConstantStart(_) => {}
+            SplitCandidateView::NotAMemoryView => {
+                return SplittingEligibility::ViewIsNotAMemoryView(*mem_view);
+            }
+            SplitCandidateView::NonConstantStart => {
+                return SplittingEligibility::ViewStartAddressIsNotConstant(*mem_view);
+            }
+        }
+    }
+    SplittingEligibility::Eligible
+}
+
+/// ONE LOOP ITERATOR OF A MEMORY OPERATION'S SUBSCRIPTS — `MutableAddrSplitting.cpp:104-125`.
+///
+/// ```cpp
+/// /// @brief This data structure contains information about a loop iterator used
+/// /// in memory operation subscripts. May include implicit loop iterators.
+/// struct MASData {
+///   // If the loop is an implicit loop, the iter_arg_ value will be null.
+///   Value iter_arg_ = nullptr;
+///   int dim_;
+///   // The coefficient taking into account the layout map.
+///   int64_t composed_coeff_;
+///   int64_t num_iters_;
+///   int64_t weight_;
+/// };
+/// ```
+///
+/// ⭐ THE TWO CONSTRUCTORS ARE ONE TYPE WITH AN `Option`. The four-argument one leaves `iter_arg_`
+/// null for an IMPLICIT loop — a time dimension the transfer's `time_set` describes and no
+/// `affine.for` binds — so the field is genuinely absent rather than zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasData {
+    /// `iter_arg_` — the loop's induction variable, or `None` for an implicit loop.
+    pub iter_arg: Option<Val>,
+    /// `dim_` — which subscript dimension it is, in the order `getIndices()` lists them.
+    pub dim: u32,
+    /// `composed_coeff_` — *"The coefficient taking into account the layout map."*
+    pub composed_coeff: i64,
+    /// `num_iters_` — the loop's trip count (entry 184, `getLoopTripCount`).
+    pub num_iters: i64,
+    /// `weight_` — how much mutable address this iterator is responsible for.
+    ///
+    /// ⭐ `num_iters < 2 ? 0 : (num_iters - 2) * composed_coeff` (entry 250, `initMASData`,
+    /// `:735`), under the comment *"The iter_arg will be the number of iterations - 1 at maximum and
+    /// the last iteration of every loop can overflow the mutable as no data transfer will occur
+    /// after it. So really, the number of iterations - 2 is the last utilized mutable address."*
+    /// So the weight is NOT the span of the loop: it is the span of the addresses the loop actually
+    /// transfers from, which is two iterations short of it.
+    pub weight: i64,
+}
+
+/// Replaces: e114_sortDataBasedOnWeight
+///
+/// **114/384** `MutableAddrSplittingPass::sortDataBasedOnWeight` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:855` (4L).
+///
+/// ```cpp
+/// void MutableAddrSplittingPass::sortDataBasedOnWeight(
+///     SmallVectorImpl<MASData> &mas_data) const {
+///   llvm::sort(mas_data, [](MASData &a, MASData &b) -> bool {
+///     return a.weight_ > b.weight_;
+///   });
+/// }
+/// ```
+///
+/// # ⭐ HEAVIEST FIRST, BECAUSE THAT IS THE ORDER THE SPLIT IS SEARCHED IN
+///
+/// `calculatePartitionSizes` walks the sorted list and, per dimension, asks whether splitting THIS
+/// one brings the mutable address back in range; if it does not, it splits the dimension fully and
+/// moves to the next (`:862-905`, under *"Note: This is not optimal at all"*). Descending weight is
+/// what makes that greedy walk reach a decision in as few splits as possible — a different order
+/// would still produce a correct partitioning, but a different, larger one, and the partition count
+/// is charged against `MaxNumConditionals` (`:959-967`).
+///
+/// # ⛔ STABLE, WHERE `llvm::sort` IS NOT — AND THAT IS A DELIBERATE NARROWING
+///
+/// `llvm::sort` is `std::sort` (plus a shuffle under `EXPENSIVE_CHECKS`): the relative order of two
+/// dimensions of EQUAL weight is unspecified, so every tie order is a conformant answer and the
+/// reference itself does not promise one. This crate's whole emission is byte-reproducible by
+/// construction ([`crate::islands::dataflow_ir::print`]), so it takes the one tie order that keeps it
+/// that way — `slice::sort_by`, which is stable, leaving equal weights in the order `initMASData`
+/// filled them, i.e. by subscript dimension.
+///
+/// # ⚠️ `&mut [MasData]`, NOT `&mut Vec<MasData>`
+///
+/// A sort permutes; it does not add or remove. `SmallVectorImpl<MASData>&` is the reference's only
+/// way to say "some vector", and the slice says what this function actually needs.
+pub fn sort_data_based_on_weight(mas_data: &mut [MasData]) {
+    // `return a.weight_ > b.weight_` — descending, so `b` is the left operand of the comparison.
+    mas_data.sort_by(|a, b| b.weight.cmp(&a.weight));
+}
+
+/// WHAT `createNewMemViewWithMod` LEAVES BEHIND — a fresh start address and the view that reads it.
+///
+/// ⛔ TWO OPS, AND THEY DO NOT GO IN THE SAME PLACE. The reference builds the constant with
+/// `OpBuilder const_builder(unit)` — at the `dataflow.program_unit`, i.e. OUTSIDE the unit's body —
+/// and the cloned view with the caller's own builder, wherever the original view sat. That placement
+/// is the caller's (it owns the two op lists); the fields say which is which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewMemViewWithMod {
+    /// `arith.constant <start + modifier> : index`, for the preamble.
+    pub start_address: DfirOp,
+    /// The cloned `dataflow.get_logical_memory_view`, reading that constant.
+    pub mem_view: DfirOp,
+    /// The value the cloned view binds — what the new memory operation is built against.
+    pub result: Val,
+}
+
+/// Replaces: e115_createNewMemViewWithMod
+///
+/// **115/384** `MutableAddrSplittingPass::createNewMemViewWithMod` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:966` (12L).
+///
+/// ```cpp
+/// dataflow::GetLogicalMemoryViewOp
+/// MutableAddrSplittingPass::createNewMemViewWithMod(
+///     ExpressionEvaluator &evaluator, OpBuilder &builder,
+///     dataflow::ProgramUnitOp unit, Operation *op,
+///     dataflow::GetLogicalMemoryViewOp &mem_view_op, int64_t modifier) const {
+///   auto start_addr_op = mem_view_op.getStartAddress().getDefiningOp();
+///   DT_CHECK(start_addr_op);
+///
+///   auto new_mem_view_op =
+///       cast<dataflow::GetLogicalMemoryViewOp>(builder.clone(*mem_view_op));
+///   OpBuilder const_builder(unit);
+///   OpBuilder query_map_builder(dcc::uniform::utils::getLocalOrGlobalRegion(op));
+///   dcc::agen::utils::updateMemViewStartAddress(
+///       evaluator, const_builder, query_map_builder, new_mem_view_op, modifier);
+///
+///   return new_mem_view_op;
+/// }
+/// ```
+///
+/// # ⭐⭐ THE THREE-ARMED HELPER COLLAPSES TO ONE ARM, BY THE TYPE
+///
+/// `updateMemViewStartAddress` (`dcc/src/Dialect/Agen/Utils.cpp:337-410`) branches on what binds the
+/// start address:
+///
+/// | binder | what it does |
+/// |---|---|
+/// | `arith.constant` or `uniform.query_map` | evaluate, add `modifier`, rebuild the start value and assign it |
+/// | `arith.subi` (a toggle) | operand 0 gets `2 * modifier`, the `iter_args` chain's init gets `modifier` |
+/// | `scf.if` / `affine.if` | walk the conditional tree and update each yielded constant |
+/// | anything else | `llvm_unreachable` |
+///
+/// ⛔ AND ONLY THE FIRST IS REACHABLE FROM HERE. Every view this pass clones has passed
+/// [`is_eligible_for_splitting`], which returns false for a start address that is not an
+/// `arith.constant` — so the toggle and conditional arms belong to the helper's OTHER callers, and
+/// taking a [`ConstStartMemView`] rather than a `Val` is what makes that argument checkable instead
+/// of a comment. `updateMemViewStartAddress` is not a bridge-2 unit and is not presented as one here.
+///
+/// ⭐ SO THE WHOLE OF ARM ONE IS: `evaluateValue(start)` reads the constant,
+/// `evaluateAddWithConst(ev, modifier)` adds the offset, `buildOffsetValue` materialises the sum with
+/// `createArithConstant` — `arith::ConstantOp` of `builder.getIndexType()` — and
+/// `getStartAddressMutable().assign(new_start_addr)` points the cloned view at it. Two ops, and the
+/// arithmetic is `start + modifier`.
+///
+/// ⚠️ `DT_CHECK(start_addr_op)` and the `cast<>` of the clone are both discharged by the types: a
+/// [`ConstStartMemView`] exists only where an `arith.constant` was found bound to the start address,
+/// and cloning a view in this island cannot produce anything but a view.
+///
+/// ⚠️ `evaluator`, `unit`, `op` and the two extra builders are MECHANISM — an insertion point apiece
+/// and a memoised evaluation of an SSA value this crate reads as a literal. See
+/// [`NewMemViewWithMod`] for where the two ops belong.
+#[must_use]
+pub fn create_new_mem_view_with_mod(
+    vals: &mut Values,
+    view: &ConstStartMemView<'_>,
+    modifier: i64,
+) -> NewMemViewWithMod {
+    // `createArithConstant(const_builder, .., getIndexType(), start + modifier)`.
+    let start = vals.mint();
+    let result = vals.mint();
+    NewMemViewWithMod {
+        start_address: DfirOp::Arith(arith::Op::Constant {
+            result: start,
+            value: view.start + modifier,
+        }),
+        // `builder.clone(*mem_view_op)`, with the start address assigned. Everything else — the
+        // memory it views, its layout map and its type — is the original's.
+        mem_view: DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result,
+            from: view.from,
+            start,
+            layout: view.layout.clone(),
+            ty: view.ty.clone(),
+        }),
+        result,
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
-    use super::{AddrRange, L3Half, max_immutable_range, max_mutable_range};
-    use crate::arch::{Dd2, Elements, Sen1p5};
-    use crate::generated::DataType;
-    use crate::units::{DfirUnit, Row};
+    use super::*;
+    use crate::arch::{Dd2, Sen1p5};
+    use crate::islands::dataflow_ir::ty::{ElemType, ScalarTy};
+    use crate::units::Row;
 
     /// 🎯 111/384 — THE MUTABLE RANGE IS THE EAR'S 21 BITS OF STICKS, IN BITS.
     ///
@@ -434,5 +795,219 @@ mod unit_tests {
         assert_eq!(given.bits(), 4096);
         assert_ne!(given, max_mutable_range::<Dd2>(L3Half::Load));
         assert_eq!(given.elements(DataType::Senint8), Elements(512));
+    }
+    /// One `dataflow.get_logical_memory_view` over a constant start, and the ops that bind it.
+    fn view_with_start(vals: &mut Values, start: DfirOp) -> (Vec<DfirOp>, Val) {
+        let result = vals.mint();
+        let start_val = match &start {
+            DfirOp::Arith(arith::Op::Constant { result, .. }) => *result,
+            _ => unreachable!("the fixtures bind the start with a constant"),
+        };
+        let view = DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result,
+            from: Val(0),
+            start: start_val,
+            layout: AffineMap::linear(&[128, 1]),
+            ty: MemRef {
+                shape: vec![4, 128],
+                elem: ElemType::F16,
+            },
+        });
+        (vec![start, view], result)
+    }
+
+    /// 🎯 113/384 — A CONSTANT START IS ELIGIBLE, AND THE GATE HANDS THE CLONE ITS INPUT.
+    #[test]
+    fn a_constant_start_address_is_eligible() {
+        let mut vals = Values::default();
+        let _memory = vals.mint();
+        let start = vals.mint();
+        let (scope, view) = view_with_start(
+            &mut vals,
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 2048,
+            }),
+        );
+
+        assert_eq!(
+            is_eligible_for_splitting(&[view], &scope),
+            SplittingEligibility::Eligible
+        );
+        assert!(is_eligible_for_splitting(&[view], &scope).eligible());
+
+        let SplitCandidateView::ConstantStart(candidate) =
+            SplitCandidateView::resolve(view, &scope)
+        else {
+            unreachable!("a constant start resolves to ConstantStart");
+        };
+        assert_eq!(candidate.start, 2048);
+        assert_eq!(candidate.from, Val(0));
+    }
+
+    /// 🎯 113/384 — A START ADDRESS BOUND BY A TOGGLE IS NOT.
+    ///
+    /// `AddressPinningAndToggle` leaves `%addr = arith.subi %arg, %step`, and the leading comment at
+    /// `MutableAddrSplitting.cpp:832-839` is about exactly that shape: the toggled address may be used
+    /// by one memory operation and one yield, so splitting — which would add a second user — declines.
+    #[test]
+    fn a_toggled_start_address_is_not_eligible() {
+        let mut vals = Values::default();
+        let _memory = vals.mint();
+        let iter_arg = vals.mint();
+        let step = vals.mint();
+        let start = vals.mint();
+        let result = vals.mint();
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: step,
+                value: 16,
+            }),
+            DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                result: start,
+                lhs: iter_arg,
+                rhs: step,
+                ty: ScalarTy::Index,
+            })),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from: Val(0),
+                start,
+                layout: AffineMap::linear(&[1]),
+                ty: MemRef {
+                    shape: vec![512],
+                    elem: ElemType::F16,
+                },
+            }),
+        ];
+
+        assert_eq!(
+            SplitCandidateView::resolve(result, &scope),
+            SplitCandidateView::NonConstantStart
+        );
+        assert_eq!(
+            is_eligible_for_splitting(&[result], &scope),
+            SplittingEligibility::ViewStartAddressIsNotConstant(result)
+        );
+    }
+
+    /// 🎯 113/384 — A VALUE NO `get_logical_memory_view` BINDS IS THE FIRST `dyn_cast`'s `false`, AND
+    /// ONE INELIGIBLE VIEW CONDEMNS THE WHOLE CHAIN.
+    #[test]
+    fn one_non_view_condemns_every_view() {
+        let mut vals = Values::default();
+        let _memory = vals.mint();
+        let start = vals.mint();
+        let (mut scope, good) = view_with_start(
+            &mut vals,
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 0,
+            }),
+        );
+        // A region argument: nothing in scope binds it.
+        let unbound = Val(4096);
+        assert_eq!(
+            SplitCandidateView::resolve(unbound, &scope),
+            SplitCandidateView::NotAMemoryView
+        );
+
+        assert_eq!(
+            is_eligible_for_splitting(&[good, unbound], &scope),
+            SplittingEligibility::ViewIsNotAMemoryView(unbound)
+        );
+
+        // ⭐ AND THE OFFENDER IS THE FIRST IN LOOP ORDER, WHICH IS WHERE THE `for` RETURNS.
+        let other_start = vals.mint();
+        scope.push(DfirOp::Arith(arith::Op::Constant {
+            result: other_start,
+            value: 1,
+        }));
+        assert_eq!(
+            is_eligible_for_splitting(&[unbound, good], &scope),
+            SplittingEligibility::ViewIsNotAMemoryView(unbound)
+        );
+    }
+
+    /// 🎯 113/384 — NO VIEWS AT ALL FALLS THROUGH TO `return true`.
+    #[test]
+    fn an_empty_chain_is_eligible() {
+        assert_eq!(
+            is_eligible_for_splitting(&[], &[]),
+            SplittingEligibility::Eligible
+        );
+    }
+
+    /// 🎯 114/384 — HEAVIEST FIRST, AND EQUAL WEIGHTS KEEP THEIR DIMENSION ORDER.
+    #[test]
+    fn the_sort_is_descending_by_weight_and_stable() {
+        let entry = |dim: u32, weight: i64| MasData {
+            iter_arg: None,
+            dim,
+            composed_coeff: 1,
+            num_iters: 4,
+            weight,
+        };
+        let mut data = vec![
+            entry(0, 16),
+            entry(1, 4096),
+            entry(2, 16),
+            entry(3, 0),
+            entry(4, 4096),
+        ];
+        sort_data_based_on_weight(&mut data);
+        assert_eq!(
+            data.iter().map(|d| (d.dim, d.weight)).collect::<Vec<_>>(),
+            vec![(1, 4096), (4, 4096), (0, 16), (2, 16), (3, 0)]
+        );
+    }
+
+    /// 🎯 115/384 — THE CLONE IS THE ORIGINAL WITH `start + modifier`, AND EVERYTHING ELSE UNTOUCHED.
+    #[test]
+    fn the_clone_shifts_only_the_start_address() {
+        let mut vals = Values::default();
+        let memory = vals.mint();
+        let layout = AffineMap::linear(&[128, 1]);
+        let ty = MemRef {
+            shape: vec![4, 128],
+            elem: ElemType::F16,
+        };
+        let view = ConstStartMemView {
+            from: memory,
+            start: 2048,
+            layout: &layout,
+            ty: &ty,
+        };
+
+        let new = create_new_mem_view_with_mod(&mut vals, &view, 512);
+        assert_eq!(
+            new.start_address,
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 2560,
+            })
+        );
+        assert_eq!(
+            new.mem_view,
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(2),
+                from: memory,
+                start: Val(1),
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        );
+        assert_eq!(new.result, Val(2));
+
+        // ⭐ A NEGATIVE MODIFIER SHIFTS THE OTHER WAY — `evaluateAddWithConst` is signed addition, and
+        // `MutableStartAddrShifting` is the caller that passes one.
+        let back = create_new_mem_view_with_mod(&mut vals, &view, -1024);
+        assert_eq!(
+            back.start_address,
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(3),
+                value: 1024,
+            })
+        );
     }
 }

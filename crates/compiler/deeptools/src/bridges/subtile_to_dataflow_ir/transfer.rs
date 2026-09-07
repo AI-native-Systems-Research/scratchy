@@ -266,10 +266,12 @@ pub fn plan(
         time_order: AffineMap::identity(time_rank),
         load_time_addr_map: AffineMap {
             dims: time_rank,
+            syms: 0,
             results: src_time.offsets,
         },
         store_time_addr_map: AffineMap {
             dims: time_rank,
+            syms: 0,
             results: dst_time.offsets,
         },
     })

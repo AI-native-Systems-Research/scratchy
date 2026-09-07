@@ -184,7 +184,7 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
         visit(op);
         match op {
             DfirOp::Affine(affine::Op::For { body, .. })
-            | DfirOp::Scf(scf::Op::Parallel { body, .. })
+            | DfirOp::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. })
             | DfirOp::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => {
                 walk_preorder(body, visit);
             }
@@ -385,6 +385,7 @@ mod unit_tests {
             iv: Val(0),
             lo: affine::Bound::Const(0),
             hi: affine::Bound::Const(4),
+            dbg_name: None,
             carried: Vec::new(),
             body: vec![],
         })));
@@ -421,6 +422,7 @@ mod unit_tests {
             iv: Val(2),
             lo: affine::Bound::Const(0),
             hi: affine::Bound::Const(4),
+            dbg_name: None,
             carried: Vec::new(),
             body: vec![branch(3, vec![], vec![])],
         });

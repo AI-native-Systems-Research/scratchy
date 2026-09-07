@@ -64,6 +64,24 @@ pub enum Op {
         carried: Vec<Carried>,
         /// The body, ending in an [`Op::Yield`] once anything is carried.
         body: Vec<super::Op>,
+        /// `{dbgName = ".."}` — the loop's name in the reference's own output.
+        ///
+        /// ⛔⛔ AN ATTRIBUTE THE REFERENCE READS BACK, NOT A COMMENT. `getDbgNameAttr` /
+        /// `setDbgNameAttr` are how dcc carries a loop's identity across a rewrite:
+        /// `transformSCFToAffineLoop` copies the `scf.for`'s name onto the `affine.for` it builds
+        /// (`TransformLoopToLegalizeForSentientLowering.cpp:110-111`), and the vendor's own
+        /// expectation for that pass checks the name survived —
+        /// `{dbgName = "c0-l3lu-loop-ibr-chunk-y"}` on the transformed loop
+        /// (`dcc/test/Transform/TransformLoopToLegalizeForSentientLowering/scf_loop_with_result.mlir:59`).
+        /// Dropping it would make a ported rewrite pass its own test and fail the vendor's.
+        ///
+        /// ⭐ AFTER THE CLOSING BRACE, WHICH IS WHERE MLIR PUTS AN OP'S ATTRIBUTE DICTIONARY WHEN
+        /// THE OP HAS A REGION: `affine.for %arg9 = 0 to 4 { .. } {dbgName = ".."}`
+        /// (`dcc/test/PT/fp8-bmm.mlir:1019-1027`).
+        ///
+        /// ⭐ `None` PRINTS NOTHING AT ALL. Most loops this bridge builds are unnamed, and an empty
+        /// dictionary is not the same text as no dictionary.
+        dbg_name: Option<String>,
     },
 
     /// `affine.apply affine_map<..>(%args)` — an index computed from induction variables.
@@ -127,6 +145,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             hi,
             carried,
             body,
+            dbg_name,
         } => {
             // ⭐ THE THREE RENDERINGS OF ONE LIST. A loop that carries nothing prints exactly what
             // it printed before this field existed — no results, no `iter_args`, no `-> (..)`.
@@ -164,7 +183,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::emit(out, inner, depth + 1);
             }
             print::indent(out, depth);
-            out.push_str("}\n");
+            match dbg_name {
+                None => out.push_str("}\n"),
+                Some(name) => {
+                    let _ = writeln!(out, "}} {{dbgName = \"{name}\"}}");
+                }
+            }
         }
         Op::Apply { result, map, args } => {
             let _ = writeln!(

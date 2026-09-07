@@ -140,9 +140,13 @@ use std::collections::BTreeSet;
 pub enum LoopKind {
     /// `affine.for` — [`crate::islands::dataflow_ir::dialects::affine::Op::For`].
     AffineFor,
-    /// `scf.for`. Not in the island yet: nothing this bridge emits builds one, and a printed variant
-    /// no emitter constructs is the dead arm this crate keeps out. It is a KIND a loop can have,
-    /// which is all `getLoopNestLevel` asks.
+    /// `scf.for` — [`crate::islands::dataflow_ir::dialects::scf::Op::For`].
+    ///
+    /// ⭐ AN **INPUT** LOOP, WHICH IS WHY IT IS HERE. Nothing this bridge emits builds one; the pass
+    /// input contains them (`scf_loop_with_result.mlir:32`) and
+    /// [`super::tf_transform_loop_to_legalize_for_sentient_lowering::transform_scf_to_affine_loop`]
+    /// is what turns the legal ones into `affine.for`. Until it has run, a nest can hold both kinds,
+    /// which is exactly when the counting rule above matters.
     ScfFor,
 }
 
@@ -1654,6 +1658,7 @@ mod unit_tests {
     fn layout() -> AffineMap {
         AffineMap {
             dims: 4,
+            syms: 0,
             results: vec![
                 AffineExpr::dim(3)
                     .plus(AffineExpr::dim(2).times(128))
@@ -1680,6 +1685,7 @@ mod unit_tests {
             lo: affine::Bound::Const(0),
             hi: affine::Bound::Val(Val(0)),
             // The golden's loops are plain counted ones: they carry nothing.
+            dbg_name: None,
             carried: Vec::new(),
             body: vec![
                 DfirOp::Agen(agen::Op::VectorLoad {
@@ -1749,12 +1755,14 @@ mod unit_tests {
                     lo: affine::Bound::Const(0),
                     hi: affine::Bound::Val(Val(0)),
                     // The golden's loops are plain counted ones: they carry nothing.
+                    dbg_name: None,
                     carried: Vec::new(),
                     body: vec![DfirOp::Affine(affine::Op::For {
                         iv: Val(21),
                         lo: affine::Bound::Const(0),
                         hi: affine::Bound::Val(Val(0)),
                         // The golden's loops are plain counted ones: they carry nothing.
+                        dbg_name: None,
                         carried: Vec::new(),
                         body: vec![
                             DfirOp::Dataflow(dataflow::Op::SyncRecv {

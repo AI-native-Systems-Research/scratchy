@@ -284,6 +284,15 @@ impl Predicate {
         self.val
     }
 
+    /// THE MASK'S VALUE, MUTABLY — for RENUMBERING ONLY.
+    ///
+    /// ⛔ THE TYPE IS NOT REACHABLE THROUGH THIS. A clone renames the values of the op it copied
+    /// (`dialects::parts_mut`); the type this predicate was DEFINED at is the same fact before and
+    /// after, which is the whole reason the two travel together.
+    pub(crate) const fn val_mut(&mut self) -> &mut Val {
+        &mut self.val
+    }
+
     /// The type it was DEFINED at — never recomputed at the use.
     #[must_use]
     pub const fn ty(self) -> Vector {

@@ -779,6 +779,7 @@ mod unit_tests {
             hi: affine::Bound::Const(8),
             carried: Vec::new(),
             body: vec![binary()],
+            dbg_name: None,
         })]);
         assert_eq!(
             compute_ops_to_fuse(&unit),

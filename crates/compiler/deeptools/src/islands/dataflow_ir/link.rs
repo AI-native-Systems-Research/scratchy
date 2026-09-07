@@ -150,6 +150,16 @@ impl SendEnd {
     pub const fn val(self) -> Val {
         self.0
     }
+
+    /// THE END'S VALUE, MUTABLY — for RENUMBERING ONLY.
+    ///
+    /// ⛔ THIS DOES NOT REPAIR THE WIRE, AND IT IS NOT A PUBLIC SETTER. A clone rewrites every value
+    /// of an op it copied (`dialects::parts_mut`), and the send's destination is one of them; the
+    /// [`Link`] the end came from still says which two units it joins, because renaming a value does
+    /// not move it. Anything that wants a DIFFERENT destination takes a different [`Link`].
+    pub(crate) const fn val_mut(&mut self) -> &mut Val {
+        &mut self.0
+    }
 }
 
 /// THE CONSUMER'S END OF ONE WIRE — what `dataflow.receive`'s `from` must be.
@@ -161,6 +171,11 @@ impl RecvEnd {
     #[must_use]
     pub const fn val(self) -> Val {
         self.0
+    }
+
+    /// THE END'S VALUE, MUTABLY — for RENUMBERING ONLY. See [`SendEnd::val_mut`].
+    pub(crate) const fn val_mut(&mut self) -> &mut Val {
+        &mut self.0
     }
 }
 

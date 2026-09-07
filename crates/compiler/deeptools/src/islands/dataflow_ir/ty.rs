@@ -278,6 +278,21 @@ pub struct Vector {
 pub enum AffineExpr {
     /// `d<N>` — the Nth dimension of the map.
     Dim(u32),
+    /// `s<N>` — the Nth SYMBOL of the map.
+    ///
+    /// ⛔⛔ A SYMBOL IS NOT A DIMENSION, AND THE DIFFERENCE IS WHAT MAKES A CONSTRAINT SOLVABLE.
+    /// MLIR's own rule: a dimension is a value the map is *indexed by*, a symbol is a value that is
+    /// **loop-invariant with respect to the map's own iteration space** — so a symbol may be
+    /// multiplied by a dimension and still be affine, while a product of two dimensions is not.
+    /// `TPMVBase::replaceDimsInMapWithSyms` (`TransformPagedMemViewImpl.cpp:47`) exists for exactly
+    /// that reason: it rewrites a subscripts map's loop iterators as symbols so the map can be fed
+    /// to a `FlatLinearValueConstraints` system that solves for which PAGE a subscript lands in,
+    /// with the iterators as parameters rather than as unknowns.
+    ///
+    /// ⭐ NUMBERED IN ITS OWN SPACE. `s0` and `d0` are two different variables; the map states how
+    /// many of each it takes ([`AffineMap::dims`], [`AffineMap::syms`]) and prints them in two
+    /// groups, `(d0, d1)[s0, s1]`.
+    Sym(u32),
     /// A literal.
     Const(i64),
     /// `a + b`.
@@ -295,6 +310,12 @@ impl AffineExpr {
     #[must_use]
     pub fn dim(n: u32) -> AffineExpr {
         AffineExpr::Dim(n)
+    }
+
+    /// `s<n>`.
+    #[must_use]
+    pub fn sym(n: u32) -> AffineExpr {
+        AffineExpr::Sym(n)
     }
 
     /// `self + other`.
@@ -485,9 +506,14 @@ fn ceil_div(n: i64, d: i64) -> i64 {
 ///
 /// ⭐ THIS IS THE `FlatAffineValueConstraints` MATRIX, INLINED. MLIR flattens every constraint into
 /// a coefficient row over all variables and then eliminates every variable but `pos`; a row naming
-/// only other dimensions survives that elimination with a zero coefficient here, which is what
-/// [`Terms::OtherDims`] stands for. Every `affine_set` in the authority tree's tests constrains one
+/// only other variables survives that elimination with a zero coefficient here, which is what
+/// [`Terms::OtherVars`] stands for. Every `affine_set` in the authority tree's tests constrains one
 /// dimension per constraint, so the row and this enum agree on all of them.
+///
+/// ⛔ A SYMBOL IS ANOTHER VARIABLE OF THAT ROW, NOT A CONSTANT. MLIR's flattening gives dimensions
+/// and symbols adjacent coefficient columns (`getNumDimAndSymbolVars()`), so an
+/// [`AffineExpr::Sym`] is [`Terms::OtherVars`] for every `pos` — never [`Terms::Const`], which
+/// would let a parameterised bound be read as a literal one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Terms {
     /// `c` — no dimension at all.
@@ -499,8 +525,9 @@ enum Terms {
         /// Everything else, moved to the constant column.
         constant: i64,
     },
-    /// Some dimension other than `pos`, and not `pos` — a row that says nothing about it.
-    OtherDims,
+    /// Some variable other than `d<pos>` — a dimension that is not `pos`, or a symbol. A row that
+    /// says nothing about the dimension asked about.
+    OtherVars,
 }
 
 impl Terms {
@@ -525,7 +552,7 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
             coeff: 1,
             constant: 0,
         },
-        AffineExpr::Dim(_) => Terms::OtherDims,
+        AffineExpr::Dim(_) | AffineExpr::Sym(_) => Terms::OtherVars,
         AffineExpr::Const(c) => Terms::Const(*c),
         AffineExpr::Add(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
             (Terms::Const(x), Terms::Const(y)) => Terms::Const(x + y),
@@ -543,9 +570,9 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
                     constant: b_const,
                 },
             ) => Terms::on_pos(a_coeff + b_coeff, a_const + b_const),
-            (Terms::OtherDims, Terms::Const(_) | Terms::OtherDims)
-            | (Terms::Const(_), Terms::OtherDims) => Terms::OtherDims,
-            (Terms::OtherDims, Terms::OnPos { .. }) | (Terms::OnPos { .. }, Terms::OtherDims) => {
+            (Terms::OtherVars, Terms::Const(_) | Terms::OtherVars)
+            | (Terms::Const(_), Terms::OtherVars) => Terms::OtherVars,
+            (Terms::OtherVars, Terms::OnPos { .. }) | (Terms::OnPos { .. }, Terms::OtherVars) => {
                 todo!(
                     "a constant bound on d{pos} from a constraint that also mentions another \
                      dimension needs the Fourier-Motzkin elimination \
@@ -560,13 +587,13 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
                 Terms::on_pos(coeff * k, constant * k)
             }
             // ⭐ `0 * d1` IS ZERO, not "some other dimension" — the row loses the variable.
-            (Terms::Const(0), Terms::OtherDims) | (Terms::OtherDims, Terms::Const(0)) => {
+            (Terms::Const(0), Terms::OtherVars) | (Terms::OtherVars, Terms::Const(0)) => {
                 Terms::Const(0)
             }
-            (Terms::Const(_), Terms::OtherDims) | (Terms::OtherDims, Terms::Const(_)) => {
-                Terms::OtherDims
+            (Terms::Const(_), Terms::OtherVars) | (Terms::OtherVars, Terms::Const(_)) => {
+                Terms::OtherVars
             }
-            (Terms::OnPos { .. } | Terms::OtherDims, Terms::OnPos { .. } | Terms::OtherDims) => {
+            (Terms::OnPos { .. } | Terms::OtherVars, Terms::OnPos { .. } | Terms::OtherVars) => {
                 todo!("a constraint that multiplies two dimensions is not affine")
             }
         },
@@ -587,11 +614,26 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
     }
 }
 
-/// An `affine_map<(d0, ..) -> (..)>`.
+/// An `affine_map<(d0, ..)[s0, ..] -> (..)>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AffineMap {
     /// How many dimensions it takes.
     pub dims: u32,
+    /// How many SYMBOLS it takes.
+    ///
+    /// ⛔⛔ A SEPARATE COUNT, NOT DERIVED FROM THE RESULTS. `AffineMap::get(numDims, numSymbols, ..)`
+    /// carries both arities, and a symbol a map DECLARES but never mentions is a real map: the
+    /// output of `TPMVBase::replaceDimsInMapWithSyms` (`TransformPagedMemViewImpl.cpp:47`) declares
+    /// one symbol per dimension of the ORIGINAL map, and a subscript that ignored one of its
+    /// iterators leaves the matching `s<N>` unused. Recomputing this from the largest
+    /// [`AffineExpr::Sym`] present would silently narrow such a map, and every constraint row built
+    /// from it would then be one column short.
+    ///
+    /// ⭐ ZERO FOR EVERY MAP THIS BRIDGE EMITS INTO A PROGRAM. Symbols exist here for the
+    /// constraint systems `TransformPagedMemView` solves; a printed `affine_map` in an emitted
+    /// DataflowIR program has none, which is why `syms: 0` prints exactly what it printed before
+    /// this field existed.
+    pub syms: u32,
     /// What it produces — one expression per result.
     pub results: Vec<AffineExpr>,
 }
@@ -602,6 +644,7 @@ impl AffineMap {
     pub fn unary(expr: AffineExpr) -> AffineMap {
         AffineMap {
             dims: 1,
+            syms: 0,
             results: vec![expr],
         }
     }
@@ -616,6 +659,7 @@ impl AffineMap {
     pub fn identity(rank: u32) -> AffineMap {
         AffineMap {
             dims: rank,
+            syms: 0,
             results: (0..rank).map(AffineExpr::dim).collect(),
         }
     }
@@ -648,6 +692,7 @@ impl AffineMap {
     pub fn constants(dims: u32, results: &[i64]) -> AffineMap {
         AffineMap {
             dims,
+            syms: 0,
             results: results.iter().copied().map(AffineExpr::Const).collect(),
         }
     }
@@ -674,6 +719,7 @@ impl AffineMap {
             .unwrap_or(AffineExpr::Const(0));
         AffineMap {
             dims: u32::try_from(strides.len()).expect("a shape rank fits a u32"),
+            syms: 0,
             results: vec![expr],
         }
     }
