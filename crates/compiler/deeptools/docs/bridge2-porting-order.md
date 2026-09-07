@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`175/384 ported; 175/384 audited`
+`178/384 ported; 178/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -1408,12 +1408,12 @@ is a field on the returned record instead of an attribute on the emitted op.
 - [ ] **AUDIT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, line by line against the C++
 - [ ] **PORT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, 41 lines
 - [ ] **AUDIT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, line by line against the C++
-- [ ] **PORT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, 98 lines
-- [ ] **AUDIT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, line by line against the C++
-- [ ] **PORT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, 18 lines
-- [ ] **AUDIT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, line by line against the C++
-- [ ] **PORT 264/384** `createForOpWithAdditionalReturnValue` — `dcc/src/Transform/Dataflow/Utils.cpp:28`, 66 lines
-- [ ] **AUDIT 264/384** `createForOpWithAdditionalReturnValue` — `dcc/src/Transform/Dataflow/Utils.cpp:28`, line by line against the C++
+- [x] **PORT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, 98 lines
+- [x] **AUDIT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, line by line against the C++
+- [x] **PORT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, 18 lines
+- [x] **AUDIT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, line by line against the C++
+- [x] **PORT 264/384** `createForOpWithAdditionalReturnValue` — `dcc/src/Transform/Dataflow/Utils.cpp:28`, 66 lines
+- [x] **AUDIT 264/384** `createForOpWithAdditionalReturnValue` — `dcc/src/Transform/Dataflow/Utils.cpp:28`, line by line against the C++
 
 ## Level 3
 
