@@ -106,18 +106,10 @@ jobs:
       # separate member since it was split out) building as a root, and it
       # depends unconditionally on `scratchy-target-metal`, so `objc2` came
       # back in through the side door.
-      #
-      # `scratchy-sdsc` is the same shape, for spyre: `cargo tree -e features -i
-      # scratchy-sdsc` under `-Fcuda` also reports `feature "default"
-      # (command-line)` with no parent. It is the SDSC/spyre lowering tower —
-      # its own deps hard-enable `scratchy-subtile/spyre,superdsc` — so it
-      # compiles AS SPYRE even in a cuda build, and nothing in the cuda graph
-      # references it. Linting a spyre crate is the spyre gate's job.
       - name: Clippy
         run: cargo clippy --workspace --features cuda,scratchy-models/all
           --exclude scratchy-target-metal
           --exclude scratchy-target-metal-compiler
-          --exclude scratchy-sdsc
           -- -D warnings
 
   # ---------------------------------------------------------------------------

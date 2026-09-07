@@ -3664,14 +3664,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scratchy-sdsc"
-version = "0.1.0"
-dependencies = [
- "scratchy-subtile",
- "scratchy-target-spyre",
-]
-
-[[package]]
 name = "scratchy-serving-api"
 version = "0.1.0"
 dependencies = [
