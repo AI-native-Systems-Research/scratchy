@@ -304,6 +304,27 @@ time-loop trip rule is `Helper.cpp:1815-1820`. And 001's note credited the decli
 (`AffineToStandard.cpp:198-206`); the reference's comment is upstream MLIR's, and dcc leaves the
 terminator alone because `scf` is already legal in its target.
 
+⚠️ **THE RE-AUDIT OF 001-024 FOUND FIVE DOCUMENTED CLAIMS THE AUTHORITY CONTRADICTS**, all in
+`agen_access_details.rs`, and no defect in the ported code itself. (1) ⛔ **024'S PROMOTION MOVES THE
+BURST OUTWARD, NOT INWARD.** `computeBurstAndGroup` scans `for (int i = time_bounds.size() - 1;
+i >= 0; --i)` (`AccessDetails.cpp:798`) over a vector whose index 0 is the OUTERMOST time dimension —
+`constructTimeLoops` builds loop `idx` inside loop `idx - 1` and stops at `loop_num = burst_index`
+(`Helper.cpp:1807-1857`), so the burst is claimed on the innermost valid dimension first and the
+promotion hands THAT dimension to the interleave group. The anchor doc said "moves the burst inward"
+and the test asserted the mirror image (burst 0 → 1, group 0), a state the scan cannot reach; it now
+replays burst 1 → 0, group 1. (2) `TimeOffsets`' `Default` was grounded in "`calculateTimeOffsets`'s
+own `const_value` fallback" — that function has no fallback, it takes `tmp_time_offsets.back()`
+unconditionally (`dialect_utils/Agen/Utils.cpp:116`); the `? … : 0` ternary at the cited lines is
+`constructIteratorCoeffDict`'s, and the real ground is that `getFlattenedAffineExpr` always emits a
+trailing constant coefficient. (3) `IndicesCoeffDict`'s `Vec` was justified by the producer's
+insertion order — a `DenseMap` preserves none; the ordered walk is `initMASData`'s over
+`ad.getIndices()` (`MutableAddrSplitting.cpp:724-737`) and the ground is positional pairing with
+`indices_`. (4) The struct's wave list stopped at entry 008 while entries 009-015's seven members are
+declared beside those. (5) The composite fixture cited `/tmp/ktir_ref/export/debug/dfir.mlir:78-84`,
+which does not exist on this host; re-pointed at
+`tests/sentient_corpus/group_0__g0_7_matmul.dfir.mlir:25-30`, with the extents it does NOT share
+stated rather than implied.
+
 ⛔ **052 IS A COMMENT, NOT A FUNCTION** — `StandardToSentient.cpp:159` is the line
 `// return If(lhs) {If(rhs) true_val; else false_val} else false_val;` inside
 `ConstructIFRecursively`'s `and` branch, which the extractor read as a 0-line function called `If`.

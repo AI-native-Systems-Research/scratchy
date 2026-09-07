@@ -186,7 +186,7 @@ pub struct LayoutCoeff(pub i64);
 ///
 /// ⛔ A NEWTYPE, BECAUSE THE `int` IT REPLACES HELD TWO DIFFERENT KINDS OF THING. `burst_index_` and
 /// `interleave_group_index_` index `time_bounds_` and `time_offsets_` — `time_bounds[burst_index]`,
-/// `time_offsets[burst_index]` (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:820-822`) — and
+/// `time_offsets[burst_index]` (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:819-821`) — and
 /// both spell "no dimension chosen" as `-1` (`AccessDetails.hpp:324,329`). That is why
 /// `computeBurstAndGroup` has to ask `if (burst_index < 0)` before it may index with the value
 /// (`AccessDetails.cpp:813`). `Option<TimeDim>` cannot be indexed with until the question is asked,
@@ -273,9 +273,13 @@ pub enum TimeBound {
 /// lockstep with `time_bounds` by construction, and those three run-time checks have nothing left to
 /// check.
 ///
-/// ⛔ `Default` IS THE CONSTRUCTED-BUT-UNSET STATE and it is not an invention: an affine expression
-/// with no constant term has constant term 0, which is what `calculateTimeOffsets`'s own
-/// `const_value` fallback says (`dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:73-76`).
+/// ⛔ `Default` IS THE CONSTRUCTED-BUT-UNSET STATE and it is not an invention: `time_offsets.back()`
+/// is a `getFlattenedAffineExpr` coefficient vector's LAST entry, which that function always emits
+/// and which is 0 for an expression with no constant term. `calculateTimeOffsets` takes it
+/// unconditionally (`dialect_utils/Agen/Utils.cpp:116`) — it has no fallback of its own; the
+/// `const_value ? … : 0` ternary belongs to `constructIteratorCoeffDict`
+/// (`dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:73-76`),
+/// which is [`IndicesCoeffDict`]'s producer, not this one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeOffsets {
     /// One offset per time dimension, ordered by `time_order` — outermost first.
@@ -306,10 +310,19 @@ pub struct TimeOffsets {
 /// (`dcc/src/Conversion/AgenToSentient/Helper.cpp:577`). As a named field the check is structural and
 /// the test disappears.
 ///
-/// ⛔ A VEC, NOT A MAP, BECAUSE THE ORDER IS THE LOOP NESTING. The producer inserts in `indices_`
-/// order under its own comment "Sort the indices from outermost to innnermost" (`Utils.cpp:68-71`);
-/// a `BTreeMap<Val, i64>` would reorder that by SSA number and a `HashMap` by hash, and
-/// `MutableAddrSplitting`'s weights are accumulated per nesting level (`:725-738`).
+/// ⛔ A VEC, NOT A MAP, BECAUSE EVERY CONSUMER REACHES A COEFFICIENT THROUGH `indices_`, POSITION AND
+/// ALL. ⚠️ Not because the C++ map carries an order — a `DenseMap` cannot, whatever order it was
+/// filled in, and the *"Sort the indices from outermost to innnermost"* comment (`Utils.cpp:68`)
+/// describes the `indices` vector the loop reads, not the map it writes. The ordered walk is
+/// `initMASData`'s, over `ad.getIndices()`, keying the dict per index and recording the POSITION `i`
+/// in the `MASData` it builds (`MutableAddrSplitting.cpp:724-737`); `Helper.cpp:559-572` and `:922`
+/// key it the same way. So `per_index[i]` pairs `indices[i]` with its coefficient and one field
+/// carries what the reference needs a vector plus a map to express.
+///
+/// ⚠️ THE ONE THING THE MAP DID THAT A VEC DOES NOT is deduplicate a repeated index. The reference's
+/// own `DT_CHECK(iter_coeff_dict.size() == indices.size() + 1)` (`MutableAddrSplitting.cpp:717`) is
+/// the evidence that it never has to: a duplicate would collapse two entries into one and fail that
+/// length relation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndicesCoeffDict {
     /// One `(index, coefficient)` pair per access index, outermost loop first.
@@ -414,7 +427,9 @@ pub fn set_coalesced_bound_values(
 ///
 /// Only the members whose setters have been ported are declared. Entries 003-008 brought
 /// `memory_index_`, `layout_coeffs_`, `mem_view_start_addr_`, `mem_view_layout_map_`,
-/// `shuffle_mode_` and `indices_`; `memory_`, `mem_ref_`, `chunk_size_`, `chunk_stride_` and
+/// `shuffle_mode_` and `indices_`, and entries 009-015 brought `rotation_position_`,
+/// `expected_total_elements_`, `extents_`, `total_elements_`, `element_width_`, `transfer_set_` and
+/// `transfer_order_`; `memory_`, `mem_ref_`, `chunk_size_`, `chunk_stride_` and
 /// `ld_or_st_size_` still arrive with the `construct*` entries that write them. The order below is the C++'s own declaration order
 /// (`hpp:150-210`), so each wave inserts rather than reorders.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1227,7 +1242,7 @@ impl<'a> AccessDetailsAffineComposite<'a> {
     ///
     /// ⛔⛔ IT TAKES A [`TimeDim`] AND NOT AN `int`, BECAUSE ITS ONE CALLSITE HANDS IT THE BURST'S OWN
     /// INDEX. `computeBurstAndGroup` promotes the dimension already holding the burst into the group
-    /// field and moves the burst inward:
+    /// field and moves the burst OUTWARD onto the dimension it is currently visiting:
     /// ```text
     /// if ((time_bounds[burst_index] == 2 || time_bounds[burst_index] == 4) &&
     ///     time_offsets[i] == getLdOrStSize() && time_offsets[burst_index] != 0) {
@@ -1235,7 +1250,16 @@ impl<'a> AccessDetailsAffineComposite<'a> {
     ///   setBurstIndex(i);
     /// }
     /// ```
-    /// (`AccessDetails.cpp:820-824`). `burst_index` is `>= 0` there — the `< 0` branch above it took
+    /// (`AccessDetails.cpp:819-823`).
+    ///
+    /// ⚠️ OUTWARD, AND THE DIRECTION IS THE SCAN'S. The loop runs
+    /// `for (int i = time_bounds.size() - 1; i >= 0; --i)` (`:798`) over a vector whose index 0 is
+    /// the OUTERMOST time dimension — `constructTimeLoops` builds loop `idx` inside loop `idx - 1`
+    /// (`Helper.cpp:1808-1857`) and stops at `loop_num = burst_index`, so the burst dimension and
+    /// everything inside it are absorbed by the hardware fields instead of becoming loops
+    /// (`:1807`, `:1859-1860`). The burst is therefore claimed on the INNERMOST valid dimension
+    /// first, and the promotion hands that inner dimension to the group while the burst moves out
+    /// to `i`. `burst_index` is `>= 0` there — the `< 0` branch above it took
     /// the other path (`:813`) — so the argument is always a real dimension and the `-1` this field
     /// starts at is never passed in. Nothing clears the field, which is why there is no
     /// `Option`-taking form.
@@ -1582,9 +1606,12 @@ mod unit_tests {
     ///
     /// `constructTimeStepsInfo` checks the op it was handed is one of the six composite forms
     /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:632-635`), so a stand-in op would make
-    /// every test below a test of something that cannot reach these setters. This is the HBM-to-LX
-    /// transfer of `/tmp/ktir_ref/export/debug/dfir.mlir:78-84`, built through the same
-    /// [`plan`](crate::bridges::subtile_to_dataflow_ir::transfer::plan) the emitter uses.
+    /// every test below a test of something that cannot reach these setters. It is an HBM-to-LX
+    /// transfer — the form `tests/sentient_corpus/group_0__g0_7_matmul.dfir.mlir:25-30` prints, src
+    /// on the `hbm` unit and dst on `C0-lx` — with every set, order and time-addr map built through
+    /// the same [`plan`](crate::bridges::subtile_to_dataflow_ir::transfer::plan) the emitter uses
+    /// rather than transcribed. ⚠️ ITS EXTENTS ARE THIS TEST'S OWN, not that file's: the corpus op
+    /// moves `memref<1x2048xf16>`, and nothing below depends on the shapes agreeing with it.
     fn composite_load_and_store() -> agen::Op {
         use crate::bridges::subtile_to_dataflow_ir::transfer::{Lanes, plan};
 
@@ -1777,7 +1804,8 @@ mod unit_tests {
     ///
     /// ⭐⭐ THIS IS THE THREE `DT_CHECK`s DISSOLVED. `time_bounds.size() + 1 == time_offsets.size()`
     /// (`AccessDetails.cpp:684-685`, `:696-701`, `:742-744`) holds by construction once the constant
-    /// has its own field, and `computeBurstAndGroup` indexes both vectors with one `i` (`:820-822`).
+    /// has its own field, and `computeBurstAndGroup` indexes both vectors with one `i`
+    /// (`time_bounds[i]` at `:800`, `time_offsets[i]` at `:820`).
     #[test]
     fn set_time_offsets_keeps_the_constant_out_of_the_dimensions() {
         let op = composite_load_and_store();
@@ -1797,38 +1825,57 @@ mod unit_tests {
         assert_eq!(details.time_offsets.per_dim[1], 128);
     }
 
-    /// e024 — the group takes the burst's OWN dimension and the burst moves inward.
+    /// e024 — the group takes the burst's OWN dimension and the burst moves OUTWARD.
     ///
-    /// This replays `computeBurstAndGroup`'s promotion verbatim: with a burst already claimed on the
-    /// outer dimension and its bound 2, the inner dimension whose offset equals the load size takes
-    /// the burst and the outer one becomes the interleave group (`AccessDetails.cpp:812-824`).
+    /// ⛔ THE DIRECTION IS THE SCAN'S, AND THE SCAN RUNS INWARD-OUT.
+    /// `for (int i = time_bounds.size() - 1; i >= 0; --i)` (`AccessDetails.cpp:798`) walks a vector
+    /// whose index 0 is the OUTERMOST time dimension (`constructTimeLoops` nests loop `idx` inside
+    /// loop `idx - 1`, `Helper.cpp:1808-1857`), so the burst is claimed on the innermost valid
+    /// dimension first. This replays the promotion from there: the inner dimension holding the
+    /// burst has bound 2 and a nonzero offset, the outer dimension's offset is one load's worth, so
+    /// the inner one becomes the interleave group and the burst moves out to it
+    /// (`AccessDetails.cpp:812-823`).
     #[test]
-    fn the_group_takes_the_old_burst_and_the_burst_moves_inward() {
+    fn the_group_takes_the_old_burst_and_the_burst_moves_outward() {
         let op = composite_load_and_store();
         let mut details = AccessDetailsAffineComposite::new(&op, DfirUnit::Lxlu);
 
-        details.set_time_bounds(&[TimeBound::Steps(2), TimeBound::Steps(8)]);
+        // Dimension 0 is the outermost; its offset is the 64-element load size the promotion looks
+        // for, and the inner dimension carries the bound of 2 that gates it.
+        details.set_time_bounds(&[TimeBound::Steps(8), TimeBound::Steps(2)]);
         details.set_time_offsets(TimeOffsets {
-            per_dim: vec![4096, 64],
+            per_dim: vec![64, 4096],
             constant: 0,
         });
 
-        // `if (burst_index < 0) setBurstIndex(i)` — the field itself, not a ported setter.
-        details.burst_index = Some(TimeDim(0));
-        assert_eq!(details.interleave_group_index, None);
-
-        let old_burst = details.burst_index.expect("the burst was claimed above");
-        details.set_interleave_group_index(old_burst);
+        // `i = 1`, the innermost: `if (burst_index < 0) setBurstIndex(i)` — the field itself, not a
+        // ported setter.
         details.burst_index = Some(TimeDim(1));
-
-        assert_eq!(details.interleave_group_index, Some(TimeDim(0)));
+        assert_eq!(details.interleave_group_index, None);
+        // ⛔ ASSERTED BEFORE THE `if let` BELOW, so the promotion cannot be skipped silently.
         assert_eq!(details.burst_index, Some(TimeDim(1)));
-        // ⛔ AND THE INDEX IS USABLE AS A POSITION, which is what `time_bounds[burst_index]` needs.
-        assert_eq!(
-            details.time_bounds[old_burst.index()],
-            TimeBound::Steps(2),
-            "the promoted dimension is the one whose bound gated the promotion"
-        );
+
+        // `i = 0`: all three conjuncts hold, so the promotion fires. `getBurstIndex()` is read
+        // before it is overwritten, which is why the group gets the OLD value.
+        if let Some(old_burst) = details.burst_index {
+            details.set_interleave_group_index(old_burst);
+            details.burst_index = Some(TimeDim(0));
+
+            assert_eq!(details.interleave_group_index, Some(TimeDim(1)));
+            assert_eq!(details.burst_index, Some(TimeDim(0)));
+            // ⛔ AND THE INDEX IS USABLE AS A POSITION, which is what `time_bounds[burst_index]` and
+            // `time_offsets[group_index]` need (`Helper.cpp:1859-1863`).
+            assert_eq!(
+                details.time_bounds[old_burst.index()],
+                TimeBound::Steps(2),
+                "the promoted dimension is the one whose bound gated the promotion"
+            );
+            assert_eq!(
+                details.time_offsets.per_dim[old_burst.index()],
+                4096,
+                "and `stride_step` comes from the group's offset, not the burst's"
+            );
+        }
     }
 
     /// THE TIME NEST'S TRIP COUNT FOR ONE DIMENSION — ⭐ DERIVED FROM A DIFFERENT FILE THAN THE CODE
