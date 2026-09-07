@@ -377,7 +377,7 @@ impl OperandReuse {
     /// origin gets 0 and the *n*th gets *n*-1. This is the only place a [`DataOriginId`] is ever
     /// minted — [`Self::set_reuse_flag`]'s default-insert leaves the id at [`DataId::Unassigned`] —
     /// which is what makes the ids dense and makes `getTotalDataOriginsCount()`
-    /// (`OperandReuse.hpp:32`) equal to one past the highest id assigned here. ⛔ Reading the size
+    /// (`OperandReuse.hpp:33`) equal to one past the highest id assigned here. ⛔ Reading the size
     /// *after* inserting would start the ids at 1 and shift every `op<X>DataID` the emitted computes
     /// carry.
     ///

@@ -3583,7 +3583,7 @@ pub fn check_composite_region(
             if body.len() != 2 && body.len() != 3 {
                 return CompositeRegionCheck::LoadRegionSizeNotTwoOrThree;
             }
-            // `:226-231` — `rbegin()`, one `++` past the yield, then `dyn_cast<dataflow::SendOp>`.
+            // `:226-230` — `rbegin()`, one `++` past the yield, then `dyn_cast<dataflow::SendOp>`.
             let before_yield = &body[body.len() - 2];
             if !matches!(
                 before_yield,
@@ -3595,7 +3595,7 @@ pub fn check_composite_region(
             CompositeRegionCheck::Admissible
         }
         CompositeFamily::Store | CompositeFamily::IndirectStore => match body.len() {
-            // `:255-263`.
+            // `:253-262`.
             2 => {
                 let front = &body[0];
                 if !matches!(
@@ -3613,7 +3613,7 @@ pub fn check_composite_region(
                 }
                 CompositeRegionCheck::Admissible
             }
-            // `:264-289`.
+            // `:263-285`.
             3 => {
                 let front = &body[0];
                 if !matches!(
@@ -3623,14 +3623,14 @@ pub fn check_composite_region(
                 ) {
                     return CompositeRegionCheck::StoreRegionSizeThreeWrongFront;
                 }
-                // `:276-281` — `dyn_cast<ShuffleOp>(curr_op.getNextNode())`.
+                // `:274` — `dyn_cast<ShuffleOp>(curr_op.getNextNode())`.
                 let DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle {
                     result: shuffled, ..
                 }) = &body[1]
                 else {
                     return CompositeRegionCheck::StoreRegionSizeThreeWithoutShuffle;
                 };
-                // `:283-288` — `!curr_op.hasOneUse() || !shuffle_op->hasOneUse() ||
+                // `:281-282` — `!curr_op.hasOneUse() || !shuffle_op->hasOneUse() ||
                 // *shuffle_op->getUsers().begin() != yield_op`.
                 let front_uses: usize = results(front)
                     .iter()
@@ -3778,11 +3778,11 @@ pub fn is_load_and_extract_scalar_pattern(load: &DfirOp, scope: &[DfirOp]) -> bo
     let DfirOp::Agen(dfir_op::agen::Op::VectorLoad { result, view, .. }) = load else {
         return false;
     };
-    // `:465-473` — the load's view must be cut from the LX itself.
+    // `:465-474` — the load's view must be cut from the LX itself.
     if viewed_unit(*view, scope) != Some(DfirUnit::Lx) {
         return false;
     }
-    // `:475-477` — `!load_op->hasOneUse()`, then the user must be an `agen.vector_store`.
+    // `:476-478` — `!load_op->hasOneUse()`, then the user must be an `agen.vector_store`.
     let users = uses(*result, scope);
     let [
         DfirOp::Agen(dfir_op::agen::Op::VectorStore {
@@ -3792,7 +3792,7 @@ pub fn is_load_and_extract_scalar_pattern(load: &DfirOp, scope: &[DfirOp]) -> bo
     else {
         return false;
     };
-    // `:478-488` — and that store's view must be cut from the virtual IBR.
+    // `:479-488` — and that store's view must be cut from the virtual IBR.
     viewed_unit(*store_view, scope) == Some(DfirUnit::LxVirtualIbr)
 }
 
@@ -3805,7 +3805,7 @@ pub fn is_load_and_extract_scalar_pattern(load: &DfirOp, scope: &[DfirOp]) -> bo
 /// `isReceiveAndExtractScalarPattern` (`Helper.cpp:493`) — an `agen.vector_store` INTO THE VIRTUAL
 /// IBR, which is a received index landing where an address can read it.
 ///
-/// ⛔ `dcc::getUnitType()` IS NOT USABLE HERE and the reference says why (`:505-507`): a memory
+/// ⛔ `dcc::getUnitType()` IS NOT USABLE HERE and the reference says why (`:502-504`): a memory
 /// view's `type=` spells L0/LX/PE components that the generic-component enum does not carry. The
 /// comparison is against the view's own unit, which is what [`viewed_unit`] answers.
 /// ⭐ `DT_CHECK(store_op)` has no representation: a null op cannot be passed.
@@ -3876,7 +3876,7 @@ pub fn update_symbolic_access_details<'a>(
 ) {
     // `:1015` — `for (auto& ad : access_details)`, over the container's own insertion order.
     for ad in access_details.entries_mut() {
-        // `:1017-1019` — the operation.
+        // `:1018-1019` — the operation.
         ad.base.op = op_map.lookup_or_default(ad.base.op);
 
         // `:1021-1027` — every index, then `setIndices`.
@@ -3908,7 +3908,7 @@ pub fn update_symbolic_access_details<'a>(
                 .set_mem_view_start_addr(ir_map.lookup_or_default(start));
         }
 
-        // `:1045-1046` — the memory operand.
+        // `:1046-1047` — the memory operand.
         ad.base.memory = ad
             .base
             .memory
@@ -4041,7 +4041,7 @@ fn is_first_elem_splat(indices: &[i32]) -> bool {
 /// `findYieldsResolvingTo<dataflow::GetUnitOp, scf::IfOp>` (`dcc/src/Utils/Utils.cpp:183-208`) — does
 /// either arm of this conditional yield something that resolves to a `dataflow.get_unit`?
 ///
-/// ⛔ A BLOCK ARGUMENT IS SKIPPED, NOT REJECTED (`:191`): here it is an operand with no defining op.
+/// ⛔ A BLOCK ARGUMENT IS SKIPPED, NOT REJECTED (`:188`): here it is an operand with no defining op.
 fn yields_resolving_to_get_unit(if_op: &DfirOp, result_index: usize, scope: &[DfirOp]) -> bool {
     let DfirOp::Scf(dfir_op::scf::Op::If {
         body, else_body, ..
@@ -4096,19 +4096,19 @@ fn receive_producer_is_supported(producer: &DfirOp, scope: &[DfirOp]) -> bool {
 
 /// Replaces: e156_getStoreProducer
 ///
-/// `getStoreProducer` (`Helper.cpp:1283`) — the op holding a store's value, and the op behind THAT,
+/// `getStoreProducer` (`Helper.cpp:1285`) — the op holding a store's value, and the op behind THAT,
 /// which is what tells the destination lowering where the data came from.
 ///
 /// ⛔ TWO STAGES, AND THE SECOND RE-EXAMINES THE FIRST'S ANSWER: stage one finds `inp_op` per store
 /// class, stage two accepts it only as a receive (four producer classes) or a shuffle (a receive over
 /// a `get_unit`, or a splat of a one-value bitstream at 4/8/16 bits).
 /// ⛔ THE SPLAT'S RESULT SHAPE IS CHECKED AGAINST THE STICK, not against the bitstream: 256×4b,
-/// 128×8b or 64×16b and nothing else (`:1424-1430`).
+/// 128×8b or 64×16b and nothing else (`:1427-1429`).
 #[must_use]
 pub fn get_store_producer<'a>(store: &AgenStore<'a>, scope: &'a [DfirOp]) -> StoreProducer<'a> {
     // Stage one — `:1287-1366`. Each class reaches its own `inp_op`.
     let inp_op: &'a DfirOp = match store {
-        // `:1287-1300` — the three plain stores are read identically.
+        // `:1288-1301` — the three plain stores are read identically.
         AgenStore::Vector { value }
         | AgenStore::IndirectVector { value }
         | AgenStore::SymbolicVector { value } => {
@@ -4121,7 +4121,7 @@ pub fn get_store_producer<'a>(store: &AgenStore<'a>, scope: &'a [DfirOp]) -> Sto
                 _ => return StoreProducer::StoreValueNotReceiveOrShuffle,
             }
         }
-        // `:1302-1327` — a composite with an input vector. The reference's middle arm is a
+        // `:1302-1328` — a composite with an input vector. The reference's middle arm is a
         // `vectorchain.coalesce`, which this island does not have; see
         // [`StoreProducer::CoalesceNotPrecededByReceive`].
         AgenStore::Composite {
@@ -4137,8 +4137,9 @@ pub fn get_store_producer<'a>(store: &AgenStore<'a>, scope: &'a [DfirOp]) -> Sto
                 _ => return StoreProducer::CompositeInputUnsupported,
             }
         }
-        // `:1329-1366` — no input vector: the store region's first two statements decide. A receive
-        // that yields straight away IS the input op; anything else must be the shuffle behind it.
+        // `:1330-1348` and `:1350-1366` — no input vector: the store region's first two statements
+        // decide. A receive that yields straight away IS the input op; anything else must be the
+        // shuffle behind it.
         AgenStore::Composite { body, .. } | AgenStore::CompositeIndirect { body } => {
             let Some(front) = body.first() else {
                 return StoreProducer::UnsupportedStoreProducer1;
@@ -4167,9 +4168,9 @@ pub fn get_store_producer<'a>(store: &AgenStore<'a>, scope: &'a [DfirOp]) -> Sto
         }
     };
 
-    // Stage two — `:1368-1440`.
+    // Stage two — `:1369-1442`.
     let producer: &'a DfirOp = match inp_op {
-        // `:1371-1388` — the receive's own producer.
+        // `:1375-1388` — the receive's own producer.
         DfirOp::Dataflow(dataflow::Op::Receive { from, .. }) => {
             let Some(producer) = defining_op(from.val(), scope) else {
                 return StoreProducer::ReceiveProducerUnsupported;
@@ -4309,7 +4310,9 @@ impl ActiveMaskValue {
     /// The reference's message for a rejection, verbatim.
     ///
     /// ⛔ [`SliceHoldsNoElements`](ActiveMaskValue::SliceHoldsNoElements) HAS NO MESSAGE because the
-    /// reference has no check: it divides by the count instead (`Helper.cpp:2669`).
+    /// reference has no check: `elems_per_slice == 0` reaches `(int)std::log2(0)`
+    /// (`Helper.cpp:2716-2720`), and the stick-length check (`:2589-2590`) makes that need
+    /// `precision > 128` — so it is unreachable there.
     #[must_use]
     pub fn diagnostic(&self) -> Option<&'static str> {
         match self {
@@ -4334,7 +4337,7 @@ impl ActiveMaskValue {
 /// shifted by the bits the inner dimension needs, plus the inner's, swapped when the cross-slice mask
 /// is the inner one.
 ///
-/// ⛔ A FULL COUNT ENCODES AS ZERO, twice (`:2681`, `:2708`): `inner == inner_dim_len` and
+/// ⛔ A FULL COUNT ENCODES AS ZERO, twice (`:2680`, `:2700`): `inner == inner_dim_len` and
 /// `outer == outer_dim_len` are both written back as 0, so the field never has to hold the width.
 /// ⛔ `maskall` IS TRUE FOR THE FULL-MASK PATTERN ONLY; the generic path always writes false.
 /// ⛔ THE REFERENCE COMPUTES `mask_wsl_elems` AND NEVER READS IT (`:2648`) — only maskB's total
@@ -4366,9 +4369,9 @@ pub fn construct_set_active_mask_value_op<A: Arch>(
     let (mask_all, num_valid_entry, slice_id_xsl, xsl_inner, wsl_len) = match &mask_op
         .slice_mask_map
     {
-        // `:2596-2610`.
+        // `:2595-2606`.
         SliceMaskMap::Unmask => (false, 0, sen::SliceId(7), false, 1),
-        // `:2611-2623`.
+        // `:2607-2618`.
         SliceMaskMap::FullMask => (true, 0, sen::SliceId(0), false, 1),
         SliceMaskMap::Generic {
             slice_id_xsl,
@@ -4379,9 +4382,9 @@ pub fn construct_set_active_mask_value_op<A: Arch>(
                 return ActiveMaskValue::SliceHoldsNoElements;
             }
 
-            // `:2650` — maskB spanning the slice means the cross-slice mask is the OUTER one.
+            // `:2651` — maskB spanning the slice means the cross-slice mask is the OUTER one.
             let xsl_inner = xsl.elems() != elems_per_slice;
-            // `:2652-2673` — which mask is which, then the inner dimension's length.
+            // `:2657-2671` — which mask is which, then the inner dimension's length.
             let (inner, outer) = if xsl_inner { (xsl, wsl) } else { (wsl, xsl) };
             let inner_dim_len = inner.elems().0;
             // A zero-length inner mask divides nothing, which is this same rejection rather than the
@@ -4390,16 +4393,16 @@ pub fn construct_set_active_mask_value_op<A: Arch>(
                 return ActiveMaskValue::InnerDimNotDivisible;
             }
 
-            // `:2675-2682`.
+            // `:2679-2680`.
             let mut inner_dim_valid = inner.unmasked.0;
             if inner_dim_valid == inner_dim_len {
                 inner_dim_valid = 0;
             }
 
-            // `:2684-2686`.
+            // `:2684`.
             let outer_dim_len = elems_per_slice.0 / inner_dim_len;
 
-            // `:2688-2710`.
+            // `:2693-2700`.
             if outer.elems() != elems_per_slice {
                 return ActiveMaskValue::OuterDimDoesNotSpanSlice;
             }
@@ -4408,7 +4411,7 @@ pub fn construct_set_active_mask_value_op<A: Arch>(
                 outer_dim_valid = 0;
             }
 
-            // `:2712-2732` — the packing.
+            // `:2716-2720` — the packing.
             let num_valid_entry = if xsl_inner {
                 (inner_dim_valid << outer_dim_len.checked_ilog2().unwrap_or(0)) + outer_dim_valid
             } else {
@@ -4423,7 +4426,7 @@ pub fn construct_set_active_mask_value_op<A: Arch>(
         }
     };
 
-    // `:2734-2740`.
+    // `:2724-2728`.
     ActiveMaskValue::Samv(SenOp::Sentient(sen::Op::Samv {
         mask_value: mask_op.mask_value,
         mask_all,
@@ -4496,7 +4499,7 @@ pub enum CreatedUniformize {
     /// A later region reuses the op at this position among the preceding ops.
     Existing(usize),
     /// ⛔ NOTHING ACTIVE PRECEDES THE LOOP. The reference's `while (!prev_node->hasAttr("active"))`
-    /// walks off the front of the block and dereferences null (`:3932-3934`).
+    /// walks off the front of the block and dereferences null (`:3931-3933`).
     NoActiveOp,
 }
 
@@ -4507,7 +4510,7 @@ pub enum CreatedUniformize {
 /// argument; every later region of that same op finds and reuses it.
 ///
 /// ⛔ THE HANDOFF IS AN ATTRIBUTE ON THE IR: `"active"` is set only when there is more than one region,
-/// searched for backwards from the loop, and removed by the LAST region (`:3924-3940`).
+/// searched for backwards from the loop, and removed by the LAST region (`:3923-3937`).
 /// ⛔ ONLY `create_group` AND `get_unit` ARE HOISTED; any other in-loop definition is left where it is.
 #[must_use]
 pub fn create_uniformize_regions_op(
@@ -4518,7 +4521,7 @@ pub fn create_uniformize_regions_op(
 ) -> CreatedUniformize {
     let num_of_regions = source.regions.len();
 
-    // `:3924-3940` — the later regions do not build anything.
+    // `:3926-3938` — the later regions do not build anything.
     if region_idx != 0 {
         let Some(at) = preceding.iter().rposition(|earlier| earlier.active) else {
             return CreatedUniformize::NoActiveOp;

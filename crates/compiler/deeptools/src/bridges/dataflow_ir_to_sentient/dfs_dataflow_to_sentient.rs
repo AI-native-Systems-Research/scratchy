@@ -1154,7 +1154,7 @@ pub fn unit_name_from_a_list_of_get_unit_op(units: &[DfirUnit]) -> Option<DfirUn
 /// `areCoreletsDifferent` reads, with the reference's own `DT_CHECK` discharged.
 ///
 /// ⛔⛔ THREE CASES BECAUSE THE FOURTH IS THE ABORT. `DT_CHECK(units_with_corelet_0.size() > 0 ||
-/// units_with_corelet_1.size() > 0)` (`DataflowToSentient.cpp:137-138`) says both lists empty is not
+/// units_with_corelet_1.size() > 0)` (`DataflowToSentient.cpp:136`) says both lists empty is not
 /// an input, and this is the only fact about the two lists that the body reads — everything else is
 /// `.size() > 0`. Stating the domain as a type moves that abort to the one place a value of this type
 /// is minted ([`OccupiedCorelets::of`]), which is how [`crate::bridges::dataflow_ir_to_sentient::vc_helper`]
@@ -1245,8 +1245,8 @@ impl OccupiedCorelets {
 /// `Operation::getAttr` returns a null `Attribute` for an absent name, and a null attribute equals no
 /// `IntegerAttr` — so both disjuncts' first conjunct is false and the answer is `false` whatever the
 /// lists hold. That is not an accident of the C++: a unit that carries no `corelet` is one the L3
-/// path handles, and `lowerL0LXSyncOperationForAUnit` refuses it by name two hundred lines earlier
-/// (*"Unknown corelet information for sentient"*, `:227-229`). Here that null is
+/// path handles, and `lowerL0LXSyncOperationForAUnit` refuses it by name ninety-four lines later
+/// (*"Unknown corelet information for sentient"*, `:226-229`). Here that null is
 /// [`crate::units::Residency::Scratchpad`] and [`crate::units::Residency::Global`], the two
 /// residencies that print no `corelet`.
 ///
@@ -1294,8 +1294,8 @@ pub fn are_corelets_different(unit: Residency, occupied: OccupiedCorelets) -> bo
 /// of `separateBasedOnDestinationUnits`.
 ///
 /// ⛔ FOUR LISTS AND NOT A MAP, BECAUSE THE CALLER TESTS THEM AGAINST EACH OTHER. `lowerSyncLXL3ToLXL3`
-/// asks whether three of the four are empty while the fourth is not, twice over
-/// (`DataflowToSentient.cpp:796-800`), so each list is a named field rather than a bucket to look up.
+/// asks whether three of the four are empty while the fourth is not, three times over
+/// (`DataflowToSentient.cpp:798-803`), so each list is a named field rather than a bucket to look up.
 ///
 /// ⭐ THE ORDER WITHIN EACH LIST IS THE DESTINATION ORDER, which is what makes `src_dst_l3[0]` mean
 /// anything: the reference walks `dst_vs` by index and pushes as it goes.
@@ -1365,7 +1365,7 @@ pub struct SeparatedDestinations {
 ///
 /// Both `dyn_cast`s failing means no `push_back` on any of the four lists, and the loop moves on.
 /// The pair vanishes — no diagnostic, no fifth bucket. The caller's
-/// `DT_CHECK(src_dst_lx_corelet0.size() != 0 || …)` (`:794-795`) is the only thing that notices, and
+/// `DT_CHECK(src_dst_lx_corelet0.size() != 0 || …)` (`:796-797`) is the only thing that notices, and
 /// only when *every* destination was dropped. `None` from
 /// [`defining_op`](crate::islands::dataflow_ir::dialects::defining_op) — a destination that is a
 /// region argument, which is the reference's null pointer — is the same silence.
@@ -1381,7 +1381,7 @@ pub struct SeparatedDestinations {
 ///
 /// As in [`are_corelets_different`] — no insertion point, no emission. The four lists ARE the
 /// function's output, so they are returned rather than filled through references; the reference's
-/// caller declares all four empty immediately before the call (`:791-793`), so appending and
+/// caller declares all four empty immediately before the call (`:791-792`), so appending and
 /// returning are the same thing here.
 #[must_use]
 pub fn separate_based_on_destination_units(
@@ -1396,7 +1396,7 @@ pub fn separate_based_on_destination_units(
             Some(DfirOp::Dataflow(dataflow::Op::GetUnit {
                 residency, unit, ..
             })) => {
-                // `if (dst_unit.getType().str().substr(0, 2) != "l3")` — the LX side.
+                // `} else {  // L3` (`:777`) — the reference's negated `substr(0, 2) != "l3"` arm.
                 if matches!(unit, DfirUnit::L3lu | DfirUnit::L3su) {
                     separated.l3.push((*src_v, *dst_v));
                 } else if is_corelet_0_attribute(*residency) {

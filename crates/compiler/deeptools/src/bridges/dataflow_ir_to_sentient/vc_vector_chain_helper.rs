@@ -1427,7 +1427,7 @@ impl SliceMask {
 /// # THE STOPS, EACH A CITED ABORT OR UB
 ///
 /// * `DT_CHECK(dim / sys_def.numSlicesPerStick > 0)` — a mask narrower than a stick has slices
-///   (`:129`). Declined here, in the crate's manner: `DT_CHECK` throws
+///   (`:127`). Declined here, in the crate's manner: `DT_CHECK` throws
 ///   (`util/dt_exception.hpp:110-121`), and a vector of fewer than eight lanes is not a mask this
 ///   lowering can read either way.
 /// * ⛔ A NEGATIVE `lb / lanes_per_slice` IS AN UNSIGNED WRAP THERE, AND THE MASK IS 0. `from_slice`
@@ -1584,8 +1584,8 @@ impl<'a> PackOrShuffle<'a> {
     ///
     /// ⭐ THE REPETITION COMES FROM THE OP, and that is not a shortcut: all four call sites pass the
     /// op's own — `int repetition = shuffle_op.getRepetition();`
-    /// (`VectorChainToSentientPESFP.cpp:633-637`), `pack_op.getRepetition().getSExtValue()`
-    /// (`:688-691`), and the same two in `VectorChainToSentientPT.cpp:629`, `:822`. Passing it
+    /// (`VectorChainToSentientPESFP.cpp:634-638`), `pack_op.getRepetition().getSExtValue()`
+    /// (`:688-692`), and the same two in `VectorChainToSentientPT.cpp:629`, `:822`. Passing it
     /// separately would let a caller validate one op's indices against another's repetition.
     #[must_use]
     pub fn of(op: &'a vc::Op) -> Option<PackOrShuffle<'a>> {
@@ -1624,11 +1624,11 @@ impl<'a> PackOrShuffle<'a> {
 /// signature is `checkValidityOfPackAndShuffleLowering(Operation* op, std::vector<int>& indices, int
 /// repetition)`: the caller declares an EMPTY vector, the callee fills it, and the caller then hands
 /// that same vector to `getMergeTypeFromIndices` or
-/// `getGCVTorFCVTTypeFromIndicesAndCastInputs` (`VectorChainToSentientPESFP.cpp:688-707`). Nothing
+/// `getGCVTorFCVTTypeFromIndicesAndCastInputs` (`VectorChainToSentientPESFP.cpp:687-708`). Nothing
 /// but call order stops those two from being handed an unchecked list. Here they take this, and only
 /// this function makes one.
 ///
-/// ⭐ IT BORROWS THE OP'S OWN LIST RATHER THAN COPYING IT, and that is exact: the loop at `:155-166`
+/// ⭐ IT BORROWS THE OP'S OWN LIST RATHER THAN COPYING IT, and that is exact: the loop at `:155-167`
 /// pushes EVERY element and fails on the first one it cannot accept, so on success the filled vector
 /// is elementwise the op's `indices` attribute. ⛔ The `else` arm of that loop — *"Indices should be
 /// integers"* — is unrepresentable here, because [`vc::Op::Pack::indices`] is a `Vec<i32>` and an
@@ -1710,12 +1710,12 @@ impl<'a> ValidPackIndices<'a> {
 /// have to fill the result exactly: 16 indices × 8 for a `vector<128xi8>`, 8 × 8 for a
 /// `vector<64xi16>`, 32 × 8 for a `vector<256xi4>`, 64 × 8 for a `vector<512xi2>` — all four widths
 /// of `dcc/test/SFP/merge_and_pack.mlir:161-266`. ⛔ AND `vec_size` IS THE **RESULT** TYPE'S
-/// element count (`:153`), not an operand's; on those fixtures all three agree, and where a pack
+/// element count (`:153-154`), not an operand's; on those fixtures all three agree, and where a pack
 /// narrows they would not.
 ///
 /// # ⛔ THE LAST GATE IS **STRICTLY** GREATER, AND IT IS LOOSER THAN IT LOOKS
 ///
-/// `index > 2 * (int)indices.size()` (`:176`) admits `index == 2 * size` — for eight indices, 16 —
+/// `index > 2 * (int)indices.size()` (`:177`) admits `index == 2 * size` — for eight indices, 16 —
 /// even though the two operands concatenated hold exactly `2 * size` elements, whose last index is
 /// `2 * size - 1`. So one out-of-range index per shape passes this check. ⭐ REPRODUCED, NOT
 /// TIGHTENED: nothing downstream indexes a buffer with these — [`merge_type_from_indices`] compares
@@ -1724,7 +1724,7 @@ impl<'a> ValidPackIndices<'a> {
 /// rule. `pack1`'s `15` is the largest any fixture uses.
 ///
 /// ⛔ AND THE ORDER OF THE TWO LOOPS MATTERS. The `>= -1` test is per element DURING the copy and the
-/// `2 * size` test is a second pass over the whole list (`:155-166` then `:175-183`), so a list that
+/// `2 * size` test is a second pass over the whole list (`:155-167` then `:176-184`), so a list that
 /// is both too short and holds a `-2` is refused for the `-2` — which is the diagnostic a reader gets
 /// and therefore part of the answer.
 #[must_use]
@@ -1772,12 +1772,12 @@ pub fn check_validity_of_pack_and_shuffle_lowering(
 // ═══════════════════════════════════════════ 165/384 ═══════════════════════════════════════════
 
 /// THE THIRTY-FOUR MERGE-AND-PACK INSTRUCTIONS THE SFP IMPLEMENTS, IN THE ORDER
-/// `getMergeTypeFromIndices` SCANS THEM (`VectorChainHelper.cpp:327-390`).
+/// `getMergeTypeFromIndices` SCANS THEM (`VectorChainHelper.cpp:328-389`).
 ///
 /// # ⛔⛔ THE ORDER IS LOAD-BEARING, AND IBM'S OWN TEST PROVES IT
 ///
 /// `pack0` and `pack16` have IDENTICAL rows — `{0, 1, 2, 3, 4, 5, 6, 7}` at 16 bits, same repetition,
-/// same `sign_extend` (`:374`, `:383`) — and the scan returns the FIRST match, so `pack16` is
+/// same `sign_extend` (`:374`, `:382`) — and the scan returns the FIRST match, so `pack16` is
 /// unreachable. `dcc/test/SFP/merge_and_pack.mlir:232` writes a pack it names `%pack16` and the
 /// reference lowers it to `binary_operator pack0` (the 24th `binary_operator` of that file's
 /// `CHECK-SENT-IR`). Sorting this table, or making it a map, would change that answer.
@@ -1785,13 +1785,13 @@ pub fn check_validity_of_pack_and_shuffle_lowering(
 /// ⭐ SO IT IS A `Vec` AND NOT A `BTreeMap`, and the sole test of a row's identity is its position.
 ///
 /// ⭐ WHY IT IS BUILT PER CALL, as the C++ does (a function-local `std::vector` initialised on every
-/// entry, `:327`): the rows own their index vectors, `MergeAndPack` is not `Copy`, and this is called
+/// entry, `:328`): the rows own their index vectors, `MergeAndPack` is not `Copy`, and this is called
 /// once per pack op in a program. A `LazyLock` would be the same table with a `static` in front of
 /// it; nothing here mutates a row, so there is nothing to protect.
 #[must_use]
 pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
     vec![
-        // ── 2-BIT ELEMENTS — sixteen real lanes and forty-eight pads (`:328-333`).
+        // ── 2-BIT ELEMENTS — sixteen real lanes and forty-eight pads (`:329-333`).
         MergeAndPack::new(
             MergeOrPack::Pack(sen::PackIndex::P24),
             Bits(2),
@@ -1803,7 +1803,7 @@ pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
             ],
             false,
         ),
-        // ── 4-BIT ELEMENTS (`:334-341`).
+        // ── 4-BIT ELEMENTS (`:334-339`).
         MergeAndPack::new(
             MergeOrPack::Pack(sen::PackIndex::P8),
             Bits(4),
@@ -1822,7 +1822,7 @@ pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
             ],
             false,
         ),
-        // ── 8-BIT ELEMENTS (`:342-368`).
+        // ── 8-BIT ELEMENTS (`:340-366`).
         MergeAndPack::new(
             MergeOrPack::Merge {
                 width: sen::MergeWidth::W8,
@@ -1886,7 +1886,7 @@ pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
             vec![0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30],
             false,
         ),
-        // ── 16-BIT ELEMENTS (`:370-390`).
+        // ── 16-BIT ELEMENTS (`:368-389`).
         MergeAndPack::new(
             MergeOrPack::Merge {
                 width: sen::MergeWidth::W16,
@@ -2080,8 +2080,8 @@ pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
 /// }
 /// ```
 /// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301-412` — the
-/// thirty-four-row initialiser at `:327-390` is [`merge_and_pack_insts`] and the local struct at
-/// `:304-325` is [`MergeAndPack`], so only the scan is repeated here)
+/// thirty-four-row initialiser at `:328-389` is [`merge_and_pack_insts`] and the local struct at
+/// `:305-326` is [`MergeAndPack`], so only the scan is repeated here)
 ///
 /// # ⭐⭐ `scale` IS WHY ONE TABLE SERVES FOUR ELEMENT WIDTHS
 ///
@@ -2106,10 +2106,10 @@ pub fn merge_and_pack_insts() -> Vec<MergeAndPack> {
 ///
 /// `getMergeTypeFromIndices(indices, repetition, pack_op.getSignExtend(),
 /// dataflow::utils::getElementTypeBitWidth(pack_op.getResult().getType()))`
-/// (`VectorChainToSentientPESFP.cpp:703-707`) — reached only when NEITHER operand comes from a
-/// `vectorchain.cast` (`:697-707`); with casts it is `getGCVTorFCVTTypeFromIndicesAndCastInputs`
+/// (`VectorChainToSentientPESFP.cpp:706-708`) — reached only when NEITHER operand comes from a
+/// `vectorchain.cast` (`:694-702`); with casts it is `getGCVTorFCVTTypeFromIndicesAndCastInputs`
 /// (entry 277) instead. ⭐ AND THAT CALL SITE ALSO SETS `op_info.compute_precision_ = "none"`,
-/// because *"MERGE/PACK instructions are bitwise operations"* (`:700-702`) — the precision belongs to
+/// because *"MERGE/PACK instructions are bitwise operations"* (`:703-705`) — the precision belongs to
 /// the caller's own port and not to this answer.
 ///
 /// # THE ONE STOP THIS PORT ADDS

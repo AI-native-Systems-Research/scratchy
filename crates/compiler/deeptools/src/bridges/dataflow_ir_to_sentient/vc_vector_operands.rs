@@ -1497,7 +1497,7 @@ impl VectorOperand {
     ///   return VectorOperand(Constant, value, op.getOperation());
     /// }
     /// ```
-    /// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:264-293`)
+    /// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267-294`)
     ///
     /// # ⭐⭐ A CONSTANT OPERAND COSTS NO PORT — THE HARDWARE HAS FOUR OF THEM WIRED IN
     ///

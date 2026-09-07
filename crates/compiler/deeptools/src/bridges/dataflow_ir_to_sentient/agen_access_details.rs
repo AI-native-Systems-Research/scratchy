@@ -520,12 +520,12 @@ pub enum TransferExtents {
     /// the return type.
     Rectangular,
 
-    /// *"Extent requsted along a dimension is more than its limit"* (`:71-74`, the reference's own
+    /// *"Extent requsted along a dimension is more than its limit"* (`:76-78`, the reference's own
     /// spelling).
     ///
     /// ⭐ THE LIMIT IS THE RATIO BETWEEN NEIGHBOURING LAYOUT STRIDES — how many elements fit along
     /// this dimension before the address walks into the next one — except at the fastest-moving end,
-    /// where `width + 1` makes the test vacuous (`:64-70`).
+    /// where `width + 1` makes the test vacuous (`:66-73`).
     ExtentOverLimit {
         /// Which transfer-set dimension.
         dim: TransferDim,
@@ -1332,7 +1332,7 @@ impl<'a> AccessDetailsBase<'a> {
     /// into the count the first one left. Transcribed as written.
     ///
     /// ⭐ THE PINNED CASE MULTIPLIES BY ONE, WHICH THE REFERENCE SPELLS OUT: `total_elements =
-    /// (total_elements == 0) ? 1 : total_elements * 1;` (`:59`). Only the seeding half is observable.
+    /// (total_elements == 0) ? 1 : total_elements * 1;` (`:60`). Only the seeding half is observable.
     ///
     /// ⛔ THE LIMIT'S DIVISION IS `checked_div`, BECAUSE A ZERO STRIDE IS DIVIDING BY ZERO. A
     /// dimension the address does not read has stride 0 — `(d0, d1) -> (d1)` flattens to `[0, 1, 0]` —
@@ -1658,10 +1658,10 @@ impl<'a> AccessDetailsBase<'a> {
     ///
     /// ⭐⭐ THREE FACTS OFF THE VIEW, IN THE REFERENCE'S ORDER — layout map, then start address, then
     /// unit. See [`MemViewSource`] for the two `dyn_cast` arms this collapses and for why
-    /// `llvm_unreachable("unsupported mem_ref type")` (`:287`) has nothing left to guard.
+    /// `llvm_unreachable("unsupported mem_ref type")` (`:286`) has nothing left to guard.
     ///
     /// ⛔ THE `LogicalResult` IS NOT AN OUTCOME. Every path through the reference reaches
-    /// `return LogicalResult::success()` (`:288`) — the third arm aborts the process instead of
+    /// `return LogicalResult::success()` (`:289`) — the third arm aborts the process instead of
     /// returning failure — so there is exactly one outcome and it is `()`.
     ///
     /// ⛔ IT TAKES THE VIEW RATHER THAN READING `mem_ref_`, and that is where the abort went. The
@@ -1945,7 +1945,7 @@ impl<'a> AccessDetailsAffine<'a> {
     /// }
     /// setSubscriptsMap(subscripts_map);
     /// ```
-    /// (`:384-403`). ⛔ `ndims` COUNTS ONLY THE SURVIVORS and is passed as the result map's dimension
+    /// (`:384-401`). ⛔ `ndims` COUNTS ONLY THE SURVIVORS and is passed as the result map's dimension
     /// count, so the folded dimensions' columns disappear rather than staying as unused ones — see
     /// [`AffineMap::replace_dims_and_symbols`], whose doc records why declaring the arity matters to
     /// every matrix built from the map afterwards.
@@ -1964,7 +1964,7 @@ impl<'a> AccessDetailsAffine<'a> {
     /// writes back the map it just read. With the map still unset it writes null over null, which is
     /// why leaving [`None`] alone is the same operation.
     pub fn construct_indices(&mut self, scope: &[DfirOp]) -> ConstructedIndices {
-        // Step-1: Construct indices (`:356`)
+        // Step-1: Construct indices (`:355`)
         let indices = self.base.indices.clone();
         let mut folded: Vec<Option<i64>> = vec![None; indices.len()];
         let mut new_indices: Vec<Val> = Vec::new();
@@ -1982,7 +1982,7 @@ impl<'a> AccessDetailsAffine<'a> {
         }
         self.base.set_indices(&new_indices);
 
-        // substitute constant indices into the subscripts map itself (`:383`)
+        // substitute constant indices into the subscripts map itself (`:382`)
         let mut subscripts_map = self.subscripts_map.clone();
         if folded.iter().any(Option::is_some) {
             subscripts_map = subscripts_map.as_ref().map(|map| {
@@ -2023,7 +2023,7 @@ impl<'a> AccessDetailsAffine<'a> {
     /// ⭐ FOUR READS, ONE CALL AND ONE WRITE — the whole body. The composition it delegates to is
     /// [`construct_iterator_coeff_dict`], which is where the substance is.
     ///
-    /// ⛔ `success()` UNCONDITIONALLY (`:414`), so there is no outcome: `constructIteratorCoeffDict`
+    /// ⛔ `success()` UNCONDITIONALLY (`:415`), so there is no outcome: `constructIteratorCoeffDict`
     /// returns a dictionary, not a `LogicalResult`.
     ///
     /// ⛔ WITH EITHER MAP STILL UNSET THERE IS NOTHING TO COMPOSE. The reference would compose
@@ -2059,7 +2059,7 @@ impl<'a> AccessDetailsAffine<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptOperand {
     /// A region argument of an `affine.for` or an `scf.for` — `isa<affine::AffineForOp, scf::ForOp>`
-    /// on the argument's parent op (`:361-362`). Kept in `indices_`.
+    /// on the argument's parent op (`:363-365`). Kept in `indices_`.
     ///
     /// ⛔⛔ A LOOP'S **CARRIED** ARGUMENT ANSWERS THIS TOO, and the reference means it to: the test is
     /// on the owning OP's type, not on whether the value is that loop's induction variable. An
@@ -2067,17 +2067,17 @@ pub enum SubscriptOperand {
     /// the induction variable would refuse accesses the reference lowers.
     LoopIterator,
     /// A region argument of any other op — the first refusal, *"The loop iterators involved in the
-    /// agen memory operation subscripts have to be affine loops"* (`:363-365`).
+    /// agen memory operation subscripts have to be affine loops"* (`:368-370`).
     ///
     /// ⭐ `scf.parallel`'s INDUCTION VARIABLES LAND HERE, not in [`Self::LoopIterator`]: the
     /// reference names `scf::ForOp` and not `scf::ParallelOp`. So does an
     /// `agen.composite_load_and_store`'s `load_iv`.
     ForeignRegionArgument,
     /// Defined by an `arith.constant` — folded into the subscripts map and dropped from `indices_`
-    /// (`:366-368`).
+    /// (`:371-373`).
     Constant(i64),
     /// Defined by any other op — the second refusal, *"All the map operands need to be either loop
-    /// iterators or constant values"* (`:370-372`).
+    /// iterators or constant values"* (`:375-377`).
     ///
     /// ⭐ AND BY NO OP AT ALL. A `Val` that neither an op in `scope` defines nor a region binds is a
     /// value from outside the scope handed in; the reference's `getDefiningOp<ConstantOp>()` returns
@@ -2121,7 +2121,7 @@ impl SubscriptOperand {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstructedIndices {
-    /// `success()` (`:404`) — every subscript was a loop iterator or a constant, `indices_` now holds
+    /// `success()` (`:403`) — every subscript was a loop iterator or a constant, `indices_` now holds
     /// the iterators alone and the subscripts map holds the constants.
     Affine,
     /// *"The loop iterators involved in the agen memory operation subscripts have to be affine
@@ -2504,7 +2504,7 @@ impl<'a> AccessDetailsAffineComposite<'a> {
     /// # ⛔⛔ THE `return` AFTER THE GROUP BRANCH IS UNCONDITIONAL, AND THE L3 ARM FALLS THROUGH
     ///
     /// Once a burst is held, a non-L3 component gets exactly ONE attempt at the group and then the
-    /// function returns whether or not it took it (`:824`) — so a third valid dimension is never
+    /// function returns whether or not it took it (`:828`) — so a third valid dimension is never
     /// examined. An L3 component takes neither branch: `!is_any_of(getComp(), L3LU, L3SU)` is false,
     /// nothing happens, and the loop keeps scanning outward without ever claiming a group. L3's LDST
     /// has no interleave-group field to fill.
