@@ -1035,7 +1035,7 @@ pub fn transform_loop(
 /// Replaces: e257_analyzeAndTransform
 ///
 /// **257/384** `TransformLoopToLegalizeForSentientLowering::analyzeAndTransform` —
-/// `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:440` (5L).
+/// `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441` (3L).
 ///
 /// ⭐ THE WHOLE FUNCTION IS THE PAIRING, AND IT IS WHY ENTRY 195'S SILENT ARMS ARE UNREACHABLE:
 /// `transformLoop` is only ever handed `analyzeLoop`'s answer for the SAME op, so the affine/

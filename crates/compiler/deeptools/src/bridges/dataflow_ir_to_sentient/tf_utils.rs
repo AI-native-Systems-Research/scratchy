@@ -866,8 +866,8 @@ mod unit_tests {
 
     /// 🎯 264/384 — ONE MORE ITER_ARG ON AN `scf.for`, AND THE FILL THAT MAKES IT A ONE.
     /// `arith::ConstantIndexOp::create(builder, loc, 1)` is the scf arm's init (`Utils.cpp:65`, where
-    /// the affine arm writes 0 at `:44`); `copyLoopBody` gives the added arg a yield of ITSELF
-    /// (`dcc/src/Utils/Utils.cpp:374-381`) and the old result is replaced positionally (`:81-83`).
+    /// the affine arm writes 0 at `:43`); `copyLoopBody` gives the added arg a yield of ITSELF
+    /// (`dcc/src/Utils/Utils.cpp:374-379`) and the old result is replaced positionally (`:82-83`).
     #[test]
     fn an_scf_loop_gains_an_iter_arg_initialised_to_one() {
         let source = DfirOp::Scf(scf::Op::For {
@@ -927,7 +927,7 @@ mod unit_tests {
             }),
             grown.op
         );
-        // ⛔ AND THE MAPPING IS READABLE BECAUSE `delete_op` WAS FALSE (`Utils.hpp:41-44`).
+        // ⛔ AND THE MAPPING IS READABLE BECAUSE `delete_op` WAS FALSE (`Utils.hpp:36-37`).
         assert_eq!(
             Some(Val(3)),
             grown
@@ -1027,18 +1027,19 @@ impl<'a> CountedLoop<'a> {
 #[derive(Debug, Clone)]
 pub struct ForOpWithExtraResults {
     /// The `arith::ConstantIndexOp`s that initialise the added iter_args, in creation order — they go
-    /// BEFORE the loop, where `OpBuilder builder(loop_op)` puts them (`:33`, `:43-46`).
+    /// BEFORE the loop, where `OpBuilder builder(loop_op)` puts them (`:34`, `:41-45`).
     pub consts: Vec<DfirOp>,
     /// The new `affine.for` or `scf.for`, `n_values` results and iter_args wider than the old one.
     pub op: DfirOp,
     /// `loop_op->getResult(i).replaceAllUsesWith(ret_op->getResult(i))`, old → new, positionally over
-    /// the OLD result count (`:81-83`).
+    /// the OLD result count (`:82-83`).
     pub replacements: Vec<(Val, Val)>,
     /// `IRMapping& ir_map` over the old body's values.
     ///
     /// ⛔ [`None`] WHERE THE REFERENCE ERASED THE OLD LOOP — *"Only valid for use if delete_op was
-    /// false"* (`Utils.hpp:41-44`), and two of the four callers pass `false` precisely to read it
-    /// (`TransformPagedMemViewImpl.cpp:452-453`, `AgenToSentient/Helper.cpp:1067-1068`).
+    /// false"* (`Utils.hpp:36-37`), and three of the FIVE callers pass `false` precisely to read it
+    /// (`TransformPagedMemViewImpl.cpp:452-453`, `AgenToSentient/Helper.cpp:1067-1068`,
+    /// `DuplicateReusedToggle.cpp:83-84`); the other two take the `true` default.
     pub ir_map: Option<ValueMapping>,
 }
 
@@ -1047,7 +1048,7 @@ pub struct ForOpWithExtraResults {
 /// **264/384** `createForOpWithAdditionalReturnValue` —
 /// `dcc/src/Transform/Dataflow/Utils.cpp:28` (66L).
 ///
-/// ⛔ THE FILL IS 0 IN THE AFFINE ARM AND 1 IN THE SCF ARM (`:44` against `:65`) — one function, two
+/// ⛔ THE FILL IS 0 IN THE AFFINE ARM AND 1 IN THE SCF ARM (`:43` against `:65`) — one function, two
 /// constants. ⚠️ `getStepAsInt()` is passed through and this island's `affine.for` carries no step
 /// ([`affine::Op::For`]), which makes that pass-through the identity.
 #[must_use]
@@ -1131,7 +1132,7 @@ pub fn create_for_op_with_additional_return_value(
     }
 
     // `if (auto dbg_name_attr = getDbgNameAttr(loop_op)) setDbgNameAttr(new_loop, dbg_name_attr);`,
-    // and with it the `for (auto attr : loop_op->getAttrs())` loop at `:85-90`: `dbgName` is the only
+    // and with it the `for (auto attr : loop_op->getAttrs())` loop at `:86-91`: `dbgName` is the only
     // attribute an island `for` carries, and `operandSegmentSizes` — the one that loop excludes — is
     // MLIR's own operand bookkeeping, which a typed field cannot have.
     let dbg_name = loop_op.dbg_name.map(str::to_owned);

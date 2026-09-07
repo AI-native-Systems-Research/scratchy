@@ -714,7 +714,7 @@ pub fn apply_shifts(
     );
 
     // `DT_CHECK(mem_view_op->hasOneUse())` — the pass refused a multi-use L3 view before it got here
-    // (`:172`). Then `updateMemViewStartAddress`, arm one: one `arith.constant` for `start +
+    // (`:156-158`). Then `updateMemViewStartAddress`, arm one: one `arith.constant` for `start +
     // modifier`, assigned to the view's start address.
     let start = vals.mint();
     ShiftedMemView {
@@ -1477,7 +1477,7 @@ mod unit_tests {
 
     /// 🎯 255/384 — THE VENDOR'S FULL SHIFT: `arith.constant 33856` AND `[0, %arg1 * 3, %arg2 * 2]`.
     ///
-    /// `@full_shift_zero_const_start` (`mutable_start_addr_shift_full.mlir:14-33`): every constant
+    /// `@full_shift_zero_const_start` (`mutable_start_addr_shift_full.mlir:14-34`): every constant
     /// leaves the subscripts and the view's start address carries all 33856 elements of them.
     #[test]
     fn the_vendors_shift_empties_the_subscripts_into_the_start_address() {

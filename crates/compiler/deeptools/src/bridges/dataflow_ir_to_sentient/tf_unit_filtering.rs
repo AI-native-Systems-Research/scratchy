@@ -904,9 +904,9 @@ mod unit_tests {
     }
 
     /// 🎯 262/384 — THE VENDOR'S OWN EDGE CASE: *"filtering by cores results in first region of
-    /// uniformize_region to be removed"* (`core_filtering_edge_case.mlir:190-191`). Its
+    /// uniformize_region to be removed"* (`core_filtering_edge_case.mlir:191-192`). Its
     /// `%788 = uniform.uniformize_regions -> index` binds two 16-unit regions, one over the odd cores
-    /// and one over the even (`:987-1000`); under `filter-cores-except=0` (`:2`) the expectation is
+    /// and one over the even (`:987-999`); under `filter-cores-except=0` (`:2`) the expectation is
     /// `(%[[VAL_155]] -> %[[VAL_130]]#0){ uniform.yield %[[VAL_150]] }` — ONE region, ONE unit
     /// (`%[[VAL_130]]` is `{core = 0 : i32, .., type = "lxlu"}`), and a yield of a value from OUTSIDE
     /// the region, unrenamed (`:166-170`, `:143`).
@@ -1212,7 +1212,7 @@ pub enum FilteredUniformizeRegions {
 /// **262/384** `UnitFilteringPass::removeCoresCoreletsFoldsFromUniformizeRegion` —
 /// `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139` (98L).
 ///
-/// ⛔ THE EXTRACT DROPS THE TAIL `to_delete_.push_back(uniformize_op);` (`:236`), so a REBUILD deletes
+/// ⛔ THE EXTRACT DROPS THE TAIL `to_delete_.push_back(uniformize_op);` (`:237`), so a REBUILD deletes
 /// the old op too and not only the total-filter case. ⚠️ `regIndices`/`regLocales` (`Uniform.td:88-89`)
 /// are undeclared in this island; the reference passes both through unchanged
 /// (`getRegIndicesIfExist()`, `getRegLocalesIfExist()`), which is the identity here.

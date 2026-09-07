@@ -5034,6 +5034,9 @@ pub fn gather_page_dependent_dims_for_page(
             if row.constant == compare_row.constant {
                 continue;
             }
+            // `for (int sym = 0; sym < num_syms; ++sym)` reads `ineq[sym]` from COLUMN 0, and that is
+            // still symbol 0 here: `replaceDimsAndSymbols(.., 0, getNumSymbols())` (`:123-125`) leaves
+            // the set ZERO-DIM, so the leading columns are the symbols.
             for (sym, (coeff, compare_coeff)) in
                 (0u32..).zip(row.syms.iter().zip(&compare_row.syms))
             {

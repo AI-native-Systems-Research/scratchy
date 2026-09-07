@@ -268,7 +268,7 @@ impl HighPreference {
 /// ⛔ NOT ONE OF THE 384, and it is here because entry 193's first parameter is one of these. The
 /// group starts out holding exactly the base's own units and entry 256 appends each matched
 /// candidate's (`:190-193`), which is what the pass finally writes back as the surviving unit's
-/// operands (`:213-221`).
+/// operands (`:214-222`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReducibleProgramUnits<'p, A: Arch> {
     /// `base_unit_program_` — the unit every candidate is compared against, borrowed because the
@@ -510,7 +510,7 @@ pub fn match_units<A: Arch>(
 }
 
 /// ONE SURVIVING `dataflow.program_unit` — what the reference's last loop writes onto its base
-/// (`ProgramUnitsReduction.cpp:213-226`).
+/// (`ProgramUnitsReduction.cpp:214-227`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReducedUnit<'p, A: Arch> {
     /// `group.base_unit_program_` — the unit that stays where it is; the rest of its group is erased.
@@ -576,7 +576,7 @@ pub fn run_on_operation<'p, A: Arch>(
             // `for (auto tmp_unit : unit.getUnits()) group.units_list_.push_back(..)`, then
             // `unit.erase()` — erasure is this port's "does not become a base".
             Some(group) => group.units_list.extend(unit.on.vals()),
-            // ⚠️ `ReducibleProgramUnits group(unit); reducible_groups_.push_back(unit);` (`:206-207`)
+            // ⚠️ `ReducibleProgramUnits group(unit); reducible_groups_.push_back(unit);` (`:207-208`)
             // — the named group is DISCARDED and a second one is built from the same base by the
             // implicit converting constructor. Two constructions, one outcome.
             None => reducible_groups.push(ReducibleProgramUnits::of(unit)),

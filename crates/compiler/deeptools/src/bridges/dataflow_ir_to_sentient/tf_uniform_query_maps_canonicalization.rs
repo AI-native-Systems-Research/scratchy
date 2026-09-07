@@ -169,10 +169,11 @@ fn simplify_query_map_with_same_target(result: Val, map: Val, scope: &[DfirOp]) 
 /// **261/384** `UniformQueryMapsCanonicalizationPass::runOnOperation` — a query map whose mapping
 /// says one thing becomes that thing, and the mapping goes with it when nothing else reads it.
 ///
-/// ⛔ `hasOneUse()` IS ASKED OF THE **REWRITTEN** IR (`:79`): `replaceAllUsesWith` has already moved
+/// ⛔ `hasOneUse()` IS ASKED OF THE **REWRITTEN** IR (`:81`): `replaceAllUsesWith` has already moved
 /// every use of the simplified query maps onto their targets, so [`CanonicalizedQueryMaps::substitutions`] must be
 /// counted in before a map value can be called dead. ⚠️ `EnableDeadMapVarDeletion` (default `true`)
-/// and `DisableThisPass` are `cl::opt`s, not questions this crate asks at run time.
+/// is read at `:87`; `DisableThisPass` is declared at `:35` and NEVER READ — this pass, unlike
+/// entry 256, has no disable arm at all.
 #[must_use]
 pub fn run_on_operation(module: &[DfirOp]) -> CanonicalizedQueryMaps<'_> {
     let mut walked = Vec::new();
