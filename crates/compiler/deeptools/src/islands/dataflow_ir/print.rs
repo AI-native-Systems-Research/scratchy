@@ -257,11 +257,21 @@ fn affine_expr(expr: &AffineExpr, parent: u8, parent_is_divlike: bool) -> String
     let text = match expr {
         AffineExpr::Dim(d) => format!("d{d}"),
         AffineExpr::Const(n) => n.to_string(),
-        AffineExpr::Add(a, b) => format!(
-            "{} + {}",
-            affine_expr(a, own, false),
-            affine_expr(b, own, false)
-        ),
+        // ⛔ A NEGATIVE ADDEND IS A SUBTRACTION, NOT A SUM WITH A NEGATIVE. MLIR prints `d1 - 2 >= 0`
+        // and never `d1 + -2 >= 0`, and that is the lower half of every spanning constraint whose
+        // page does NOT start at zero — `#set1` of `dcc/test/Dialect/Dataflow/paged_mem_view.mlir:11`
+        // is `(d0 >= 0, -d0 + 63 >= 0, d1 - 2 >= 0, -d1 + 3 >= 0, d2 == 0)`. Same reason as the
+        // negation below: printing the literal shape makes every such set a spurious diff.
+        AffineExpr::Add(a, b) => match **b {
+            AffineExpr::Const(n) if n < 0 => {
+                format!("{} - {}", affine_expr(a, own, false), n.unsigned_abs())
+            }
+            _ => format!(
+                "{} + {}",
+                affine_expr(a, own, false),
+                affine_expr(b, own, false)
+            ),
+        },
         // ⛔ TIMES MINUS ONE IS A NEGATION, NOT A PRODUCT. MLIR prints `-d2 + 63`, never
         // `d2 * -1 + 63`, and the upper half of every spanning constraint an `affine_set` carries
         // is exactly that shape (`#set`, `#set1`, `#set3` of the reference DataflowIR). Printing

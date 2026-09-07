@@ -350,6 +350,7 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             dfir_op::dataflow::Op::GetUnit { .. }
             | dfir_op::dataflow::Op::GetLocalUnit { .. }
             | dfir_op::dataflow::Op::GetLogicalMemoryView { .. }
+            | dfir_op::dataflow::Op::GetPagedLogicalMemoryView(_)
             | dfir_op::dataflow::Op::ProgramUnit { .. }
             | dfir_op::dataflow::Op::SyncSend { .. }
             | dfir_op::dataflow::Op::SyncRecv { .. }

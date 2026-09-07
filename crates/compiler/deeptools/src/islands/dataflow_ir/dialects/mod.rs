@@ -21,6 +21,8 @@ pub mod dataflow;
 pub mod scf;
 pub mod vectorchain;
 
+use crate::islands::dataflow_ir::Values;
+
 /// AN SSA VALUE, minted by the builder and never spelled by hand.
 ///
 /// ⛔ A NEWTYPE OVER THE NUMBER, so a value cannot be confused with an extent, an address or a loop
@@ -160,6 +162,12 @@ pub fn operands(op: &Op) -> Vec<Val> {
             dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque(_) => {}
             dataflow::Op::GetLocalUnit { of, .. } => reads.push(*of),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => reads.extend([*from, *start]),
+            // ⭐ EVERY PAGE'S START ADDRESS IS AN OPERAND — `Variadic<Index>:$page_start_addrs`
+            // (`Dataflow.td:267-299`) — and the extents beside them are attributes, so they are not.
+            dataflow::Op::GetPagedLogicalMemoryView(view) => {
+                reads.extend([view.unit, view.start_addr]);
+                reads.extend(view.pages.iter().map(|page| page.start_addr));
+            }
             dataflow::Op::ProgramUnit { units, .. } => reads.extend(units.iter().copied()),
             // ⭐ THE SEND'S DESTINATION IS AN OPERAND, and it is the one `getLoadConsumer` follows
             // back to a `get_unit` (`Helper.cpp:1266`).
@@ -273,6 +281,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::GetLocalUnit { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![*result],
+            dataflow::Op::GetPagedLogicalMemoryView(view) => vec![view.result],
             // ⛔ `dataflow.send` HAS NO RESULT (`Dataflow.td`), which is why `getLoadConsumer`
             // returns the send op itself rather than a value.
             dataflow::Op::ProgramUnit { .. }
@@ -306,6 +315,244 @@ pub fn results(op: &Op) -> Vec<Val> {
             | vectorchain::Op::CreateAffineMask { result, .. } => vec![*result],
         },
     }
+}
+
+/// EVERY VALUE ONE OP **READS**, AS A PLACE A REWRITE MAY WRITE — MLIR's `getOpOperands()`.
+///
+/// # ⛔⛔ THE MIRROR OF [`operands`], AND THE TWO MUST STAY IN STEP
+///
+/// It exists for [`replace_uses_of_with`], which is what cloning a use chain needs
+/// (`Agen.cpp:143-145`): every op after the first reads the previous op's result, and the clone has
+/// to read the previous CLONE's result instead. Total over the enum with no wildcard, for the reason
+/// [`operands`] gives.
+///
+/// # ⛔⛔ TWO OPERANDS ARE DELIBERATELY ABSENT, AND NEITHER IS AN OVERSIGHT
+///
+/// * A **link end** — [`dataflow::Op::Send`]'s `to` and [`dataflow::Op::Receive`]'s `from`. A
+///   [`crate::islands::dataflow_ir::link::Link`] hands its two ends out once, by consuming itself, so
+///   one wire is one send and one receive; a re-pointed end would name a unit no receive is paired
+///   with. A send's DATA is here, and the data is what a chain clone substitutes.
+/// * A **mask or condition vector** — [`vectorchain::Predicate`], which carries the type the value
+///   was DEFINED at and never recomputes it at the use. Writing the value without the type would
+///   keep the old width on the new value.
+///
+/// So this is every operand a rewrite may re-point, and the two it may not are the two whose pairing
+/// with something else would be broken by re-pointing them alone.
+#[must_use]
+pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
+    let mut places: Vec<&mut Val> = Vec::new();
+    match op {
+        Op::Arith(op) => match op {
+            arith::Op::Constant { .. }
+            | arith::Op::ConstantInt { .. }
+            | arith::Op::DenseConstant { .. } => {}
+            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+                places.extend([&mut bin.lhs, &mut bin.rhs]);
+            }
+            arith::Op::Compare { lhs, rhs, .. } => places.extend([lhs, rhs]),
+            arith::Op::Logic { operands, .. } => places.extend(operands.iter_mut()),
+        },
+        Op::Scf(op) => match op {
+            scf::Op::Parallel { ivs: _, body: _ } => {}
+            scf::Op::If { cond, .. } => places.push(cond),
+            scf::Op::Yield { operands } => places.extend(operands.iter_mut()),
+        },
+        Op::Affine(op) => match op {
+            affine::Op::For {
+                iv: _,
+                lo,
+                hi,
+                carried,
+                body: _,
+            } => {
+                for bound in [lo, hi] {
+                    if let affine::Bound::Val(val) = bound {
+                        places.push(val);
+                    }
+                }
+                places.extend(carried.iter_mut().map(|carried| &mut carried.init));
+            }
+            affine::Op::Apply { args, .. } => places.extend(args.iter_mut()),
+            affine::Op::Yield { operands } => places.extend(operands.iter_mut()),
+            affine::Op::VectorLoad { view, indices, .. } => {
+                places.push(view);
+                index_operands_mut(indices, &mut places);
+            }
+            affine::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                places.extend([value, view]);
+                index_operands_mut(indices, &mut places);
+            }
+        },
+        Op::Dataflow(op) => match op {
+            dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetLocalUnit { of, .. } => places.push(of),
+            dataflow::Op::GetLogicalMemoryView { from, start, .. } => places.extend([from, start]),
+            dataflow::Op::GetPagedLogicalMemoryView(view) => {
+                places.extend([&mut view.unit, &mut view.start_addr]);
+                places.extend(view.pages.iter_mut().map(|page| &mut page.start_addr));
+            }
+            dataflow::Op::ProgramUnit { units, .. } => places.extend(units.iter_mut()),
+            // ⛔ `to` IS A LINK END — see the exclusions above. The DATA is the operand a rewrite
+            // re-points, and it is the one a use-chain clone substitutes.
+            dataflow::Op::Send { to: _, data, .. } => places.push(data),
+            dataflow::Op::Receive { from: _, .. } => {}
+            dataflow::Op::SyncSend { to, .. } => places.push(to),
+            dataflow::Op::SyncRecv { from, .. } => places.push(from),
+            dataflow::Op::ImplicitSync {
+                view, dst, size, ..
+            } => places.extend([view, dst, size]),
+        },
+        Op::Agen(op) => match op {
+            agen::Op::Yield => {}
+            agen::Op::VectorLoad { view, indices, .. } => {
+                places.push(view);
+                index_operands_mut(indices, &mut places);
+            }
+            agen::Op::VectorStore {
+                value,
+                view,
+                indices,
+                ..
+            } => {
+                places.extend([value, view]);
+                index_operands_mut(indices, &mut places);
+            }
+            agen::Op::CompositeLoadAndStore(transfer) => {
+                places.push(&mut transfer.src);
+                index_operands_mut(&mut transfer.src_indices, &mut places);
+                places.push(&mut transfer.dst);
+                index_operands_mut(&mut transfer.dst_indices, &mut places);
+            }
+        },
+        Op::VectorChain(op) => match op {
+            vectorchain::Op::ConstantBitstream { .. }
+            | vectorchain::Op::CreateAffineMask { .. } => {}
+            vectorchain::Op::Estimate { input, .. }
+            | vectorchain::Op::ScanWithGap { input, .. }
+            | vectorchain::Op::Select { input, .. }
+            | vectorchain::Op::Shuffle { input, .. }
+            | vectorchain::Op::Cast { input, .. } => places.push(input),
+            vectorchain::Op::Rotate {
+                input, position, ..
+            } => places.extend([input, position]),
+            vectorchain::Op::Multiply { a, b, .. } => places.extend([a, b]),
+            vectorchain::Op::MultiplyAccumulate { a, b, acc, .. } => places.extend([a, b, acc]),
+            // ⛔ THE MASK AND THE CONDITION VECTOR ARE ABSENT — see the exclusions above.
+            vectorchain::Op::ElementWiseCompare { op1, op2, .. } => places.extend([op1, op2]),
+            vectorchain::Op::ElementWiseSelection { lhs, rhs, .. } => places.extend([lhs, rhs]),
+            vectorchain::Op::Binary { op1, op2, .. }
+            | vectorchain::Op::Pack { op1, op2, .. }
+            | vectorchain::Op::Merge { op1, op2, .. } => places.extend([op1, op2]),
+        },
+    }
+    places
+}
+
+/// THE VALUES AN OP **DEFINES AS RESULTS**, AS PLACES — the mirror of [`results`].
+///
+/// It exists for [`clone_with_fresh_results`]: a cloned op binds its own values, never the ones the
+/// original bound.
+#[must_use]
+pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
+    match op {
+        Op::Arith(op) => match op {
+            arith::Op::Constant { result, .. }
+            | arith::Op::ConstantInt { result, .. }
+            | arith::Op::Compare { result, .. }
+            | arith::Op::Logic { result, .. }
+            | arith::Op::DenseConstant { result, .. } => vec![result],
+            arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
+                vec![&mut bin.result]
+            }
+        },
+        Op::Scf(_) => Vec::new(),
+        Op::Affine(op) => match op {
+            affine::Op::For { carried, .. } => carried
+                .iter_mut()
+                .map(|carried| &mut carried.result)
+                .collect(),
+            affine::Op::Yield { .. } | affine::Op::VectorStore { .. } => Vec::new(),
+            affine::Op::Apply { result, .. } | affine::Op::VectorLoad { result, .. } => {
+                vec![result]
+            }
+        },
+        Op::Dataflow(op) => match op {
+            dataflow::Op::GetUnit { result, .. }
+            | dataflow::Op::GetLocalUnit { result, .. }
+            | dataflow::Op::GetLogicalMemoryView { result, .. }
+            | dataflow::Op::Receive { result, .. } => vec![result],
+            dataflow::Op::GetPagedLogicalMemoryView(view) => vec![&mut view.result],
+            dataflow::Op::ProgramUnit { .. }
+            | dataflow::Op::Send { .. }
+            | dataflow::Op::SyncSend { .. }
+            | dataflow::Op::SyncRecv { .. }
+            | dataflow::Op::ImplicitSync { .. }
+            | dataflow::Op::Opaque { .. } => Vec::new(),
+        },
+        Op::Agen(op) => match op {
+            agen::Op::VectorLoad { result, .. } => vec![result],
+            agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
+                Vec::new()
+            }
+        },
+        Op::VectorChain(op) => match op {
+            vectorchain::Op::Estimate { result, .. }
+            | vectorchain::Op::ScanWithGap { result, .. }
+            | vectorchain::Op::Select { result, .. }
+            | vectorchain::Op::Multiply { result, .. }
+            | vectorchain::Op::MultiplyAccumulate { result, .. }
+            | vectorchain::Op::ElementWiseCompare { result, .. }
+            | vectorchain::Op::ElementWiseSelection { result, .. }
+            | vectorchain::Op::Binary { result, .. }
+            | vectorchain::Op::ConstantBitstream { result, .. }
+            | vectorchain::Op::Shuffle { result, .. }
+            | vectorchain::Op::Rotate { result, .. }
+            | vectorchain::Op::Cast { result, .. }
+            | vectorchain::Op::Pack { result, .. }
+            | vectorchain::Op::Merge { result, .. }
+            | vectorchain::Op::CreateAffineMask { result, .. } => vec![result],
+        },
+    }
+}
+
+/// RE-POINT EVERY USE OF `from` AT `to` — `Operation::replaceUsesOfWith`.
+///
+/// ⭐ ONE ENTRY PER USE, so an op that reads a value twice has both re-pointed, exactly as MLIR walks
+/// its own operand list. See [`operands_mut`] for the two operands it does not reach and why.
+pub fn replace_uses_of_with(op: &mut Op, from: Val, to: Val) {
+    for place in operands_mut(op) {
+        if *place == from {
+            *place = to;
+        }
+    }
+}
+
+/// A COPY OF ONE OP BINDING ITS OWN VALUES — `OpBuilder::clone`.
+///
+/// The operands are the original's; every result is freshly minted, because two ops binding one
+/// value is not a diagnosis anyone enjoys making from MLIR's error (see
+/// [`crate::islands::dataflow_ir::Values`]).
+///
+/// # ⛔⛔ IT DOES NOT REMAP A REGION, AND THE CALLERS HAVE NONE
+///
+/// MLIR's `clone` deep-copies an op's regions and gives the copy's blocks their own arguments. An op
+/// whose region binds values would therefore need those reminted and every use inside the region
+/// re-pointed, which is not written here. Both callers are region-free by construction: entry 125
+/// clones a `dataflow.get_logical_memory_view`, and entry 127 clones a use chain, whose members are
+/// single-result computes and a terminating send or store (`Agen.cpp:114-134`). [`regions`] is what
+/// says which ops those are.
+#[must_use]
+pub fn clone_with_fresh_results(op: &Op, values: &mut Values) -> Op {
+    let mut clone = op.clone();
+    for result in results_mut(&mut clone) {
+        *result = values.mint();
+    }
+    clone
 }
 
 /// THE VALUES AN OP'S REGIONS BIND — arguments, which no op defines.
@@ -402,6 +649,17 @@ pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
 ///
 /// ⛔ A STRIDED SUM READS EVERY VARIABLE IN IT. `%arg9 + %arg8 * 8` is two uses, not one — see
 /// [`Index::Strided`].
+/// THE SSA VALUES ONE INDEX LIST READS, AS PLACES — the mirror of [`index_operands`].
+fn index_operands_mut<'o>(indices: &'o mut [Index], into: &mut Vec<&'o mut Val>) {
+    for index in indices {
+        match index {
+            Index::Val(val) => into.push(val),
+            Index::Const(_) => {}
+            Index::Strided(terms, _) => into.extend(terms.iter_mut().map(|(val, _)| val)),
+        }
+    }
+}
+
 fn index_operands(indices: &[Index], into: &mut Vec<Val>) {
     for index in indices {
         match index {
