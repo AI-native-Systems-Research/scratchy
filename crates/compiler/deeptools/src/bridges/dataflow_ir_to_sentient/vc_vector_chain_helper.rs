@@ -83,11 +83,16 @@
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp`
 
 use super::vc_vector_operands::VectorOperand;
+use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
-use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp};
+use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::ty::{BoundType, ElemType, IntegerSet, Vector};
+use crate::islands::dataflow_ir::{Program as DfirProgram, Values};
+use crate::islands::sentient::ProgramUnit as SentientProgramUnit;
 use crate::islands::sentient::dialects::sentient as sen;
+use crate::islands::sentient::dialects::Op as SenOp;
+use std::collections::BTreeMap;
 
 /// Replaces: e059_isSentientBinaryLogicalOp
 ///
@@ -586,14 +591,703 @@ impl MergeAndPack {
 }
 
 
+/// WHAT [`fuse_compare_and_select_into_min_or_max`] DECIDED — the two out-bools as one answer.
+///
+/// ⭐⭐ THREE STATES, NOT TWO BOOLS. The reference hands back `bool& fusion_to_min` and
+/// `bool& fusion_to_max` and then has to ask itself `if (!fusion_to_min && !fusion_to_max)`
+/// (`VectorChainHelper.cpp:460-462`), because the pair can spell a fourth thing — *both* — that
+/// means nothing at all. One value cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[must_use]
+pub enum MinOrMaxFusion {
+    /// Neither bool set: this selection is not a min or a max in disguise, and stays a ternary.
+    NotFused,
+    /// `fusion_to_min` — the pair lowers to one `#sentient<binary_operator min>`.
+    ToMin,
+    /// `fusion_to_max` — the pair lowers to one `#sentient<binary_operator max>`.
+    ToMax,
+}
+
+/// Replaces: e065_fuseCompareAndSelectIntoMinOrMax
+///
+/// **065/384** `vectorchain::fuseCompareAndSelectIntoMinOrMax` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415` (49L).
+///
+/// ```cpp
+/// void vectorchain::fuseCompareAndSelectIntoMinOrMax(
+///     ElementWiseSelectionOp selection_op, bool& fusion_to_min,
+///     bool& fusion_to_max) {
+///   fusion_to_min = false;
+///   fusion_to_max = false;
+///   if (auto compare_op = llvm::dyn_cast<ElementWiseCompareOp>(
+///           selection_op.getCond().getDefiningOp())) {
+///     bool same_pair_matching = false, opposite_pair_matching = false;
+///
+///     // Operation equivalence is used since some times constant operands
+///     // are duplicated, and direct match may result in spurious mismatches.
+///     dcc::OperationEquivalence oe;
+///
+///     auto lhs_def = selection_op.getLhs().getDefiningOp();
+///     auto rhs_def = selection_op.getRhs().getDefiningOp();
+///     auto op1_def = compare_op.getOp1().getDefiningOp();
+///     auto op2_def = compare_op.getOp2().getDefiningOp();
+///     if (!lhs_def || !rhs_def || !op1_def || !op2_def) return;
+///
+///     if (oe.operationsAreEquivalent(*lhs_def, *op1_def, nullptr) &&
+///         oe.operationsAreEquivalent(*rhs_def, *op2_def, nullptr)) {
+///       same_pair_matching = true;
+///     } else if (oe.operationsAreEquivalent(*lhs_def, *op2_def, nullptr) &&
+///                oe.operationsAreEquivalent(*rhs_def, *op1_def, nullptr)) {
+///       opposite_pair_matching = true;
+///     }
+///
+///     if (!same_pair_matching && !opposite_pair_matching) return;
+///
+///     if (is_any_of(compare_op.getCompareOp(), compare_gt, compare_ge)) {
+///       if (same_pair_matching)          fusion_to_max = true;
+///       else if (opposite_pair_matching) fusion_to_min = true;
+///     } else if (is_any_of(compare_op.getCompareOp(), compare_lt, compare_le)) {
+///       if (same_pair_matching)          fusion_to_min = true;
+///       else if (opposite_pair_matching) fusion_to_max = true;
+///     }
+///
+///     if (!fusion_to_min && !fusion_to_max) {
+///       DT_ERROR("Unable to lower compare and select into max/min operation");
+///     }
+///   }
+/// }
+/// ```
+///
+/// ⭐⭐ `max(a, b)` IS WRITTEN IN THIS IR AS `a > b ? a : b`, AND THIS IS WHERE IT IS RECOGNISED.
+/// A `vectorchain.element_wise_compare` feeding a `vectorchain.element_wise_selection` whose two arms
+/// are the compare's own two operands is one Sentient instruction, not two: `fmax.mlir:117-118` is
+/// exactly that pair and `fmax.mlir:42` lowers it to a single
+/// `sentient.vector_binary … binaryOp = #sentient<binary_operator max>`. Get this wrong and a
+/// two-instruction chain is emitted where the ISA has one — or worse, `min` where the program said
+/// `max`.
+///
+/// ⛔⛔ THE ARMS ARE COMPARED BY **STRUCTURE**, NOT BY SSA NAME, AND THAT IS LOAD-BEARING. The
+/// reference's own comment says why: *"since some times constant operands are duplicated, and direct
+/// match may result in spurious mismatches"*. `relu.mlir:50-51` has two separate
+/// `arith.constant dense<0.000000e+00> : vector<64xf16>` ops, `%cst` and `%cst_1`; the compare reads
+/// `%cst` and the selection reads `%cst_1` (`:73-74`), and it still has to fuse — `relu.mlir:35,37`
+/// shows the `max`. A `lhs == op1 && rhs == op2` test on value identity answers *false* there and
+/// emits the two-instruction form. See [`ops_are_equivalent`].
+///
+/// ⛔ THE ARGUMENT IS THE SELECTION'S THREE FIELDS, NOT A `&vc::Op`. The reference's parameter type is
+/// `ElementWiseSelectionOp` — the narrowing has already happened at the call site, and taking a whole
+/// [`vc::Op`] here would force a `todo!` arm for the fourteen variants the C++ signature already rules
+/// out. `scope` is the block to resolve definitions in; the reference gets that from the operand's own
+/// `getDefiningOp()`, which this island reaches through [`dfir_op::defining_op`].
+///
+/// ⭐ `NotFused` COVERS BOTH OF THE REFERENCE'S SILENT RETURNS: the cond was not a compare at all
+/// (`fcmp_select.mlir:156` — the selection's cond `%62` is an `agen.vector_load`, so the pair does not
+/// fuse and `:64` emits the `vector_ternary`), and an arm was a region argument with no defining op.
+///
+/// ⛔ ONE `todo!` FOR THE `DT_ERROR`, AND ITS DOMAIN IS EXACTLY `compare_eq`/`compare_neq`. Reaching
+/// the error needs a matching pair *and* an operator outside the four ordering comparisons, which
+/// leaves only equality — an `a == b ? a : b` that is neither a min nor a max. Every other route to
+/// `!fusion_to_min && !fusion_to_max` already returned above.
+pub fn fuse_compare_and_select_into_min_or_max(
+    cond: vc::Predicate,
+    lhs: Val,
+    rhs: Val,
+    scope: &[DfirOp],
+) -> MinOrMaxFusion {
+    // `llvm::dyn_cast<ElementWiseCompareOp>(selection_op.getCond().getDefiningOp())` — a cond
+    // defined by anything else, or by nothing, leaves both bools false.
+    let Some(DfirOp::VectorChain(vc::Op::ElementWiseCompare {
+        op1,
+        op2,
+        compare_op,
+        ..
+    })) = dfir_op::defining_op(cond.val(), scope)
+    else {
+        return MinOrMaxFusion::NotFused;
+    };
+
+    // `if (!lhs_def || !rhs_def || !op1_def || !op2_def) return;`
+    let (Some(lhs_def), Some(rhs_def), Some(op1_def), Some(op2_def)) = (
+        dfir_op::defining_op(lhs, scope),
+        dfir_op::defining_op(rhs, scope),
+        dfir_op::defining_op(*op1, scope),
+        dfir_op::defining_op(*op2, scope),
+    ) else {
+        return MinOrMaxFusion::NotFused;
+    };
+
+    let same_pair_matching = ops_are_equivalent(lhs_def, op1_def, scope)
+        && ops_are_equivalent(rhs_def, op2_def, scope);
+    let opposite_pair_matching = !same_pair_matching
+        && ops_are_equivalent(lhs_def, op2_def, scope)
+        && ops_are_equivalent(rhs_def, op1_def, scope);
+
+    // `if (!same_pair_matching && !opposite_pair_matching) return;`
+    if !same_pair_matching && !opposite_pair_matching {
+        return MinOrMaxFusion::NotFused;
+    }
+
+    // Past that guard `!same_pair_matching` IS `opposite_pair_matching`, so one bool decides which
+    // way round the arms sit and the reference's second `else if` needs no counterpart.
+    match (compare_op, same_pair_matching) {
+        (vc::CompareOp::Gt | vc::CompareOp::Ge, true) => MinOrMaxFusion::ToMax,
+        (vc::CompareOp::Gt | vc::CompareOp::Ge, false) => MinOrMaxFusion::ToMin,
+        (vc::CompareOp::Lt | vc::CompareOp::Le, true) => MinOrMaxFusion::ToMin,
+        (vc::CompareOp::Lt | vc::CompareOp::Le, false) => MinOrMaxFusion::ToMax,
+        (vc::CompareOp::Eq | vc::CompareOp::Neq, _) => {
+            todo!("Unable to lower compare and select into max/min operation (VectorChainHelper.cpp:460-462)")
+        }
+    }
+}
+
+/// ARE TWO OPS THE SAME COMPUTATION? — `dcc::OperationEquivalence::operationsAreEquivalent`
+/// (`dcc/src/Analysis/OperationEquivalence.cpp:88-334`), at the constructor defaults
+/// [`e065_fuseCompareAndSelectIntoMinOrMax`](fuse_compare_and_select_into_min_or_max) uses.
+///
+/// ⛔ NOT AN ANCHORED UNIT — it is `dcc/src/Analysis/`, not this campaign's file list, and it is here
+/// because e065 is unportable without it (the `relu.mlir` duplicate-constant case above). The
+/// defaults it is built with are `dcc::OperationEquivalence oe;`, i.e.
+/// `do_recursive_compare = true, all_block_args_are_equiv = true, use_equiv_classes = true`
+/// (`OperationEquivalence.hpp:27-34`), with a null functor and a null `operands_equiv_checker`.
+///
+/// The reference's shape, in order: same pointer ⇒ true; dialect, name, result count, operand count,
+/// region count, successor count and result types must match; attribute dictionaries compared
+/// pairwise with `dbgName` filtered out and `AffineMapAttr`/`IntegerSetAttr` given value comparisons;
+/// then the operand list; then the regions.
+///
+/// ⭐⭐ EVERYTHING BEFORE THE OPERAND LOOP IS ONE `==` HERE, because in this island an op's dialect,
+/// name, arity, attributes and result types are exactly the parts of its variant that are *not*
+/// [`Val`]s or nested ops. [`skeleton`] blanks those two and compares what is left — so a `Vec` of
+/// operands still compares by length (arity), a `reduction_map` still compares as an
+/// [`AffineMap`](crate::islands::dataflow_ir::ty::AffineMap), and no hand-written per-variant
+/// comparison can fall behind the enum.
+///
+/// ⚠️ THREE DELIBERATE DIVERGENCES, none of which can change an answer:
+/// - **The `dbgName` filter has nothing to filter.** No `dataflow_ir` op in this island carries a
+///   debug name — the reference's names are a printing concern this rung does not model — so the
+///   filtered dictionaries are the full ones.
+/// - **`IntegerSetAttr` gets order-insensitive constraint matching in the reference and plain
+///   equality here.** Ours are built by [`IntegerSet::from_sizes`], one constraint per dimension in
+///   dimension order, so two equal sets are equal element-wise.
+/// - **The equivalence-class memo (`use_equiv_classes_`) is omitted.** `eq_classes_.unionSets` only
+///   short-circuits a *repeat* question; it cannot answer one differently.
+///
+/// ⛔ AND ONE PLACE THE REFERENCE HAS DEAD CODE. When two differing operands share a defining op it
+/// compares their result numbers and calls them identical if equal — but two *different* values from
+/// one op have different result numbers by construction, so that branch never fires and a shared
+/// definition is always a mismatch.
+fn ops_are_equivalent(a: &DfirOp, b: &DfirOp, scope: &[DfirOp]) -> bool {
+    // `if (&op_a == &op_b) return true;` — also the recursion's cycle guard.
+    if core::ptr::eq(a, b) {
+        return true;
+    }
+
+    if skeleton(a) != skeleton(b) {
+        return false;
+    }
+
+    // The operand loop. `zip` is the reference's own `llvm::zip`; the counts already agree.
+    for (read_a, read_b) in dfir_op::operands(a).into_iter().zip(dfir_op::operands(b)) {
+        if read_a == read_b {
+            continue;
+        }
+        match (
+            dfir_op::defining_op(read_a, scope),
+            dfir_op::defining_op(read_b, scope),
+        ) {
+            // Both are results. One shared definition means differing result numbers, hence a
+            // mismatch; otherwise ask whether the two definitions compute the same thing.
+            (Some(def_a), Some(def_b)) => {
+                if core::ptr::eq(def_a, def_b) || !ops_are_equivalent(def_a, def_b, scope) {
+                    return false;
+                }
+            }
+            // Both are region arguments: equivalent, because `all_block_args_are_equiv_` is true.
+            (None, None) => {}
+            // One of each is a mismatch.
+            (Some(_), None) | (None, Some(_)) => return false,
+        }
+    }
+
+    // `do_recursive_compare_` is true: descend. `regionsAreEquivalent` compares region counts (equal
+    // by variant here) and then block sizes, which is this length check.
+    for (region_a, region_b) in dfir_op::regions(a).into_iter().zip(dfir_op::regions(b)) {
+        if region_a.len() != region_b.len() {
+            return false;
+        }
+        for (inner_a, inner_b) in region_a.iter().zip(region_b.iter()) {
+            if !ops_are_equivalent(inner_a, inner_b, scope) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// ONE OP WITH EVERY SSA NAME AND EVERY NESTED OP REMOVED — what [`ops_are_equivalent`] compares
+/// before it looks at operands.
+///
+/// ⛔ NOT A GENERAL-PURPOSE OPERATION, which is why it is private and returns a value nobody may
+/// emit: blanking the results leaves an op that binds `%0` twice. It exists to turn "same dialect,
+/// name, arity, attributes and result types" into one `==`.
+fn skeleton(op: &DfirOp) -> DfirOp {
+    let mut bare = op.clone();
+    for region in dfir_op::regions_mut(&mut bare) {
+        region.clear();
+    }
+    for (_, val) in dfir_op::vals_mut(&mut bare) {
+        *val = Val(0);
+    }
+    bare
+}
+
+/// Replaces: e066_resetSentientFMAsIfExists
+///
+/// **066/384** `vectorchain::resetSentientFMAsIfExists` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468` (13L).
+///
+/// ```cpp
+/// void vectorchain::resetSentientFMAsIfExists(dataflow::ProgramUnitOp unit) {
+///   Builder builder(unit);
+///   auto attr = builder.getSI32IntegerAttr(-1);
+///   unit.walk<WalkOrder::PreOrder>([&](mlir::Operation* op) {
+///     if (auto mac_op = llvm::dyn_cast<sentient::MacOp>(op)) {
+///       mac_op.setOpADataIDAttr(attr);
+///       mac_op.setOpBDataIDAttr(attr);
+///       mac_op.setOpCDataIDAttr(attr);
+///     } else if (auto bin_op = llvm::dyn_cast<sentient::BinaryOp>(op)) {
+///       bin_op.setOpADataIDAttr(attr);
+///       bin_op.setOpBDataIDAttr(attr);
+///     }
+///   });
+/// }
+/// ```
+///
+/// ⭐⭐ THE `-1` IS "UNASSIGNED", NOT "DATA ID MINUS ONE", so this is
+/// [`Operand::data_id`](sen::Operand::data_id)` = None` on every compute the unit already carries.
+/// It runs before `OperandReuse` re-derives them
+/// (`VectorChainToSentientPT.cpp:1006-1007`, `VectorChainToSentientPESFP.cpp:1385-1389`, both under
+/// the reference's own *"Order of these operations is important!"*): a unit lowered twice would
+/// otherwise keep the first pass's ids and reuse would be computed against stale numbering.
+///
+/// ⛔⛔ MAC AND BINARY ONLY — NOT UNARY, NOT TERNARY, AND THAT IS THE REFERENCE'S `else if` CHAIN, NOT
+/// AN OMISSION HERE. `sentient::UnaryOp` and `sentient::TernaryOp` are their own op classes that
+/// neither `dyn_cast` matches, so [`sen::Op::VectorUnary`] and [`sen::Op::VectorTernary`] keep the
+/// data ids they were emitted with.
+///
+/// ⛔ THE WALK IS PROVABLY COMPLETE WITH THREE RECURSION ARMS. Only [`sen::Op::For`] and
+/// [`sen::Op::If`] hold a `Vec<`[`SenOp`]`>`; every other nested body in this island is a
+/// `Vec<`[`DfirOp`]`>`, a type with no sentient variant at all, so no compute can hide inside one.
+/// And the match is total over both enums: a twenty-ninth `sentient` op that carries an
+/// [`Operand`](sen::Operand) stops the build here rather than silently keeping a stale id.
+pub fn reset_sentient_fmas_if_exists<A: Arch>(unit: &mut SentientProgramUnit<A>) {
+    reset_data_ids(&mut unit.body);
+}
+
+/// The `unit.walk<WalkOrder::PreOrder>` of [`reset_sentient_fmas_if_exists`], over one block.
+fn reset_data_ids(ops: &mut [SenOp]) {
+    for op in ops {
+        match op {
+            SenOp::Sentient(sentient_op) => match sentient_op {
+                sen::Op::VectorMac {
+                    op_a, op_b, op_c, ..
+                } => {
+                    op_a.data_id = None;
+                    op_b.data_id = None;
+                    op_c.data_id = None;
+                }
+                sen::Op::VectorBinary { op_a, op_b, .. } => {
+                    op_a.data_id = None;
+                    op_b.data_id = None;
+                }
+                sen::Op::For { body, .. } => reset_data_ids(body),
+                sen::Op::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    reset_data_ids(then_body);
+                    reset_data_ids(else_body);
+                }
+                sen::Op::Yield { .. }
+                | sen::Op::VectorUnary { .. }
+                | sen::Op::VectorTernary { .. }
+                | sen::Op::Load { .. }
+                | sen::Op::LoadAndSend { .. }
+                | sen::Op::ReceiveAndStore { .. }
+                | sen::Op::LoadAndStore { .. }
+                | sen::Op::LoadComputeAndSend { .. }
+                | sen::Op::LoadAndExtractScalar { .. }
+                | sen::Op::ReceiveAndExtractScalar { .. }
+                | sen::Op::ScalarAdd { .. }
+                | sen::Op::ScalarSub { .. }
+                | sen::Op::ScalarMul { .. }
+                | sen::Op::ScalarCopy { .. }
+                | sen::Op::ScalarConstant { .. }
+                | sen::Op::VectorConstant { .. }
+                | sen::Op::Sync { .. }
+                | sen::Op::Nop { .. }
+                | sen::Op::SetSendDst { .. }
+                | sen::Op::LogicalPort { .. }
+                | sen::Op::Splat { .. }
+                | sen::Op::Samv { .. }
+                | sen::Op::SetMask { .. }
+                | sen::Op::IncrMask { .. }
+                | sen::Op::Opaque { .. } => {}
+            },
+            // The shared dialects' nested bodies are `Vec<DfirOp>` — no compute can be in one.
+            SenOp::Dataflow(_)
+            | SenOp::Agen(_)
+            | SenOp::VectorChain(_)
+            | SenOp::Affine(_)
+            | SenOp::Arith(_)
+            | SenOp::Scf(_) => {}
+        }
+    }
+}
+
+/// Replaces: e067_redefineConstantVectors
+///
+/// **067/384** `vectorchain::redefineConstantVectors` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571` (37L).
+///
+/// ```cpp
+/// // The purpose of this method is to undo the effects of "SCCP" or
+/// // Canonicalizer pass in grouping multiple constant vectors with same values
+/// // into a single vector.
+/// // Reusing same SSA variable of constant vector operation for multiple
+/// // different vector operations breaks some assumptions leading to
+/// // incorrect lowering.
+/// void vectorchain::redefineConstantVectors(Operation* op) {
+///   struct updateInfo {
+///     Operation* op_to_update_;
+///     Value update_with_;
+///     unsigned int location_;
+///   };
+///
+///   std::vector<updateInfo> info;
+///   std::vector<Operation*> to_be_deleted;
+///   op->walk<WalkOrder::PreOrder>([&](arith::ConstantOp const_op) {
+///     auto is_vec = mlir::isa<VectorType, dataflow::CustomVectorType>(
+///         const_op.getResult().getType());
+///     if (is_vec && !const_op->use_empty()) {
+///       // MLIR doesn't allow updating uses while operating on getUses
+///       // If try instead, we are getting incorrect set of uses.
+///       for (auto& use : const_op->getUses()) {
+///         auto* owner = use.getOwner();
+///         OpBuilder builder(owner);
+///         auto* new_op = builder.clone(*const_op);
+///         info.push_back({owner, new_op->getResult(0), use.getOperandNumber()});
+///       }
+///
+///       to_be_deleted.push_back(const_op);
+///     }
+///   });
+///
+///   for (auto& group : info) {
+///     group.op_to_update_->setOperand(group.location_, group.update_with_);
+///   }
+///
+///   for (auto* tmp_op : to_be_deleted) {
+///     tmp_op->dropAllUses();
+///     tmp_op->erase();
+///   }
+/// }
+/// ```
+///
+/// ⭐⭐ ONE VECTOR CONSTANT PER USE, EACH IMMEDIATELY BEFORE ITS USER. `const-vector-multiple-uses.mlir`
+/// is the vendor case named after it: three `arith.constant dense<…>` ops at the top of the function
+/// (`:179`, `:184`, `:185`), `%cst_1` read six times from four different loop depths — and in the
+/// expectation (`:15-24`) the function head keeps `arith.constant true`, `false` and the index
+/// constants and has *no* `dense<…>` left. Every one was replaced by a clone next to its reader, and
+/// the original erased.
+///
+/// ⛔⛔ WHY IT MATTERS, IN THE REFERENCE'S OWN WORDS: this undoes SCCP/Canonicalizer CSE-ing equal
+/// vector constants into one SSA value, because *"reusing same SSA variable of constant vector
+/// operation for multiple different vector operations breaks some assumptions leading to incorrect
+/// lowering"*. The lowering that follows attaches per-*use* facts to a constant — which compute port
+/// it splats to, which precision, which data id — so two computes sharing one constant value fight
+/// over one op's attributes.
+///
+/// ⭐ POSITIONAL REWRITING, NOT `substitute(from, to)`. The reference clones once per **use**, so an
+/// op reading the same constant in two operand slots gets two distinct clones. A value-for-value
+/// substitution would give it one and re-create exactly the sharing this function exists to undo.
+/// [`dfir_op::vals_mut`] is what makes the per-slot assignment expressible.
+///
+/// ⛔ AND IT FILTERS [`dfir_op::vals_mut`] ITSELF RATHER THAN CALLING [`dfir_op::operands_mut`],
+/// WHICH IS NARROWER ON PURPOSE. That one withholds a link end and a [`vc::Predicate`] because
+/// re-*pointing* either alone would break its pairing with something else; `getUses()` withholds
+/// nothing, and cloning cannot break either pairing — a link end names a unit and never a constant,
+/// and the clone carries the SAME `Vector` type as the constant it copies, so a mask keeps its width.
+///
+/// ⛔ `!use_empty()` IS A REAL GUARD, NOT AN OPTIMISATION: an unused vector constant is neither cloned
+/// nor erased, and stays exactly where it was.
+///
+/// ⭐ `isa<VectorType, dataflow::CustomVectorType>` COLLAPSES TO A VARIANT TEST HERE.
+/// [`arith::Op::DenseConstant`](dfir_op::arith::Op::DenseConstant) is this island's only vector-typed
+/// constant; [`Constant`](dfir_op::arith::Op::Constant) and
+/// [`ConstantInt`](dfir_op::arith::Op::ConstantInt) are scalars, which is why the vendor
+/// expectation keeps its `arith.constant true` and its indices.
+///
+/// ⚠️ `values` IS THE ONE ARGUMENT THE REFERENCE DOES NOT HAVE, and it is the permitted kind of
+/// divergence: `builder.clone` mints an SSA name from the MLIR context, and in this island names come
+/// from [`Values`]. The reference walks a whole `module_op`
+/// (`VectorChainToSentientPT.cpp:983`), which here is [`Program::preamble`] plus every unit body —
+/// hence [`ProgramUnits::iter_mut`](crate::islands::dataflow_ir::ProgramUnits::iter_mut).
+pub fn redefine_constant_vectors<A: Arch>(program: &mut DfirProgram<A>, values: &mut Values) {
+    // The `walk<WalkOrder::PreOrder>([](arith::ConstantOp))` half: which vector constants exist, and
+    // the op to clone for each. Keyed by the value it binds, which is how a use names it.
+    let mut templates: BTreeMap<Val, DfirOp> = BTreeMap::new();
+    collect_vector_constants(&program.preamble, &mut templates);
+    for unit in program.units.iter() {
+        collect_vector_constants(&unit.body, &mut templates);
+    }
+
+    // `!const_op->use_empty()`.
+    templates.retain(|bound, _| {
+        !dfir_op::uses(*bound, &program.preamble).is_empty()
+            || program
+                .units
+                .iter()
+                .any(|unit| !dfir_op::uses(*bound, &unit.body).is_empty())
+    });
+
+    // The two rewrite loops, fused: `setOperand` per use with a clone placed before the user, and the
+    // original erased. One pass suffices because the clones are fresh values nothing else reads, so
+    // there is no "updating uses while operating on getUses" hazard to sequence around.
+    clone_constants_per_use(&mut program.preamble, &templates, values);
+    for unit in program.units.iter_mut() {
+        clone_constants_per_use(&mut unit.body, &templates, values);
+    }
+}
+
+/// Every `arith.constant` of vector type in `block` and below, by the value it binds.
+fn collect_vector_constants(block: &[DfirOp], into: &mut BTreeMap<Val, DfirOp>) {
+    for op in block {
+        if let DfirOp::Arith(dfir_op::arith::Op::DenseConstant { result, .. }) = op {
+            into.insert(*result, op.clone());
+        }
+        for region in dfir_op::regions(op) {
+            collect_vector_constants(region, into);
+        }
+    }
+}
+
+/// Rebuild one block with a private clone of every tracked constant in front of each op that reads
+/// it, and the originals dropped.
+fn clone_constants_per_use(
+    block: &mut Vec<DfirOp>,
+    templates: &BTreeMap<Val, DfirOp>,
+    values: &mut Values,
+) {
+    let mut rebuilt: Vec<DfirOp> = Vec::with_capacity(block.len());
+    for mut op in block.drain(..) {
+        // Descend first: a use inside a region gets its clone inside that region, which is what
+        // `OpBuilder builder(owner)` does when the owner is nested.
+        for region in dfir_op::regions_mut(&mut op) {
+            clone_constants_per_use(region, templates, values);
+        }
+
+        // `tmp_op->dropAllUses(); tmp_op->erase();` — by the time this runs no use is left.
+        if let DfirOp::Arith(dfir_op::arith::Op::DenseConstant { result, .. }) = &op
+            && templates.contains_key(result)
+        {
+            continue;
+        }
+
+        let mut clones: Vec<DfirOp> = Vec::new();
+        for slot in dfir_op::vals_mut(&mut op)
+            .into_iter()
+            .filter_map(|(role, val)| (role == dfir_op::Role::Operand).then_some(val))
+        {
+            if let Some(template) = templates.get(slot) {
+                let fresh = values.mint();
+                let mut clone = template.clone();
+                for (role, val) in dfir_op::vals_mut(&mut clone) {
+                    if role == dfir_op::Role::Result {
+                        *val = fresh;
+                    }
+                }
+                clones.push(clone);
+                *slot = fresh;
+            }
+        }
+        rebuilt.extend(clones);
+        rebuilt.push(op);
+    }
+    *block = rebuilt;
+}
+
+/// Replaces: e068_getVectorBinaryToSentientBinary
+///
+/// **068/384** `getVectorBinaryToSentientBinary` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32` (17L).
+///
+/// ```cpp
+/// static SentientBinaryOperator getVectorBinaryToSentientBinary(
+///     VectorChainBinaryOperator vb) {
+///   if (vb == VectorChainBinaryOperator::and0)     return SentientBinaryOperator::and0;
+///   if (vb == VectorChainBinaryOperator::or0)      return SentientBinaryOperator::or0;
+///   if (vb == VectorChainBinaryOperator::xnor)     return SentientBinaryOperator::xnor;
+///   if (vb == VectorChainBinaryOperator::and_not)  return SentientBinaryOperator::and_not;
+///   if (vb == VectorChainBinaryOperator::min)      return SentientBinaryOperator::min;
+///   if (vb == VectorChainBinaryOperator::max)      return SentientBinaryOperator::max;
+///   if (vb == VectorChainBinaryOperator::abs_min)  return SentientBinaryOperator::abs_min;
+///   if (vb == VectorChainBinaryOperator::abs_max)  return SentientBinaryOperator::abs_max;
+///   if (vb == VectorChainBinaryOperator::add)      return SentientBinaryOperator::add;
+///   if (vb == VectorChainBinaryOperator::mul)      return SentientBinaryOperator::mul;
+///   if (vb == VectorChainBinaryOperator::mul_div2) return SentientBinaryOperator::mul_div2;
+///   if (vb == VectorChainBinaryOperator::sub)      return SentientBinaryOperator::sub;
+///
+///   DT_ERROR("unknown vectorchain binary operator");
+/// }
+/// ```
+///
+/// ⭐⭐ TWELVE IN, TWELVE OUT, AND THE `DT_ERROR` IS UNREACHABLE — so this port carries no `todo!`.
+/// [`vc::BinaryOp`] has exactly twelve variants and all twelve appear above; the reference needs the
+/// trap only because a C++ enum argument can hold a value no enumerator names.
+///
+/// ⛔ IT IS NOT AN IDENTITY EVEN THOUGH IT LOOKS LIKE ONE. [`sen::BinaryOp`] has twenty variants —
+/// the converts, `merge`, `pack` and the four `fcmp`s have no `vectorchain` counterpart — so the two
+/// enums are genuinely different sets and this is the map between them.
+#[must_use]
+pub const fn vector_binary_to_sentient_binary(vb: vc::BinaryOp) -> sen::BinaryOp {
+    match vb {
+        vc::BinaryOp::And => sen::BinaryOp::And,
+        vc::BinaryOp::Or => sen::BinaryOp::Or,
+        vc::BinaryOp::Xnor => sen::BinaryOp::Xnor,
+        vc::BinaryOp::AndNot => sen::BinaryOp::AndNot,
+        vc::BinaryOp::Min => sen::BinaryOp::Min,
+        vc::BinaryOp::Max => sen::BinaryOp::Max,
+        vc::BinaryOp::AbsMin => sen::BinaryOp::AbsMin,
+        vc::BinaryOp::AbsMax => sen::BinaryOp::AbsMax,
+        vc::BinaryOp::Add => sen::BinaryOp::Add,
+        vc::BinaryOp::Mul => sen::BinaryOp::Mul,
+        vc::BinaryOp::MulDiv2 => sen::BinaryOp::MulDiv2,
+        vc::BinaryOp::Sub => sen::BinaryOp::Sub,
+    }
+}
+
+/// Replaces: e069_getVectorElementWiseCompareOperatorToSentientBinaryOperator
+///
+/// **069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55` (9L).
+///
+/// ```cpp
+/// static SentientBinaryOperator
+/// getVectorElementWiseCompareOperatorToSentientBinaryOperator(
+///     VectorChainElementWiseCompareOperator vb) {
+///   if (vb == VectorChainElementWiseCompareOperator::compare_eq)  return SentientBinaryOperator::fcmp_eq;
+///   if (vb == VectorChainElementWiseCompareOperator::compare_neq) return SentientBinaryOperator::fcmp_neq;
+///   if (vb == VectorChainElementWiseCompareOperator::compare_lt)  return SentientBinaryOperator::fcmp_lt;
+///   if (vb == VectorChainElementWiseCompareOperator::compare_le)  return SentientBinaryOperator::fcmp_le;
+///
+///   DT_ERROR("unknown vectorchain Ternary operator");
+/// }
+/// ```
+///
+/// ⭐⭐ FOUR ARMS FOR SIX INPUTS, AND `compare_gt`/`compare_ge` ARE ABSENT ON PURPOSE — THE ISA HAS NO
+/// GREATER-THAN. The caller reorders instead: *"Since Sentient ISA & Dialect doesn't support
+/// element-wise gt, ge, we reorder the input operands before lowering to Sentient IR"*
+/// (`VectorChainToSentientPESFP.cpp:450-485`), so a `compare_gt` arrives here already flipped to
+/// `compare_lt`. `fcmp_select.mlir` shows both halves of that: input `:136` is
+/// `element_wise_compare %53, %55 {compare_gt}` and the expectation `:48` is
+/// `binaryOp = #sentient<binary_operator fcmp_lt>` with `opA = lrf1` (`%55`) before `opB = lx`
+/// (`%53`) — the operands swapped.
+///
+/// ⛔ SO THE `todo!` IS REACHED ONLY BY A CALLER THAT SKIPPED THAT REORDERING, which is a defect in
+/// the caller and not an unported operator. ⛔ AND ITS MESSAGE SAYS "Ternary" — the reference's own
+/// copy-paste from `getVectorTernaryToSentientTernary`, kept verbatim so a grep for the emitted text
+/// finds the C++ line.
+#[must_use]
+pub fn vector_element_wise_compare_operator_to_sentient_binary_operator(
+    vb: vc::CompareOp,
+) -> sen::BinaryOp {
+    match vb {
+        vc::CompareOp::Eq => sen::BinaryOp::CompareEq,
+        vc::CompareOp::Neq => sen::BinaryOp::CompareNeq,
+        vc::CompareOp::Lt => sen::BinaryOp::CompareLt,
+        vc::CompareOp::Le => sen::BinaryOp::CompareLe,
+        vc::CompareOp::Gt | vc::CompareOp::Ge => todo!(
+            "unknown vectorchain Ternary operator — gt/ge must be reordered into lt/le first (VectorChainHelper.hpp:64, VectorChainToSentientPESFP.cpp:450-485)"
+        ),
+    }
+}
+
+/// Replaces: e070_getVectorTernaryToSentientTernary
+///
+/// **070/384** `getVectorTernaryToSentientTernary` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247` (7L).
+///
+/// ```cpp
+/// static SentientTernaryOperator getVectorTernaryToSentientTernary(
+///     Operation* op) {
+///   if (isa<vectorchain::ElementWiseSelectionOp>(op)) {
+///     return SentientTernaryOperator::select;
+///   }
+///
+///   DT_ERROR("unknown vectorchain Ternary operator");
+/// }
+/// ```
+///
+/// ⭐ ONE TERNARY EXISTS AND IT IS `select`. `fcmp_select.mlir:156` is the
+/// `vectorchain.element_wise_selection` and `:64` is its
+/// `ternaryOp = #sentient<ternary_operator select>`.
+///
+/// ⛔ THE ARGUMENT NARROWS FROM `Operation*` TO [`&vc::Op`](vc::Op) — a non-`vectorchain` op fails
+/// `isa<ElementWiseSelectionOp>` and reaches the `DT_ERROR` anyway, so nothing an outer dialect could
+/// pass has an answer this function could give. The remaining fourteen `vectorchain` ops keep it:
+/// they are compares, binaries and multiplies, none of which is a ternary.
+#[must_use]
+pub fn vector_ternary_to_sentient_ternary(op: &vc::Op) -> sen::TernaryOp {
+    match op {
+        vc::Op::ElementWiseSelection { .. } => sen::TernaryOp::Select,
+        vc::Op::Estimate { .. }
+        | vc::Op::FastExp { .. }
+        | vc::Op::Floor { .. }
+        | vc::Op::ScanWithGap { .. }
+        | vc::Op::Select { .. }
+        | vc::Op::Multiply { .. }
+        | vc::Op::MultiplyAccumulate { .. }
+        | vc::Op::ElementWiseCompare { .. }
+        | vc::Op::Binary { .. }
+        | vc::Op::Pack { .. }
+        | vc::Op::Merge { .. }
+        | vc::Op::ConstantBitstream { .. }
+        | vc::Op::Shuffle { .. }
+        | vc::Op::Rotate { .. }
+        | vc::Op::Cast { .. }
+        | vc::Op::CreateAffineMask { .. } => {
+            todo!("unknown vectorchain Ternary operator (VectorChainHelper.hpp:255)")
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        MergeAndPack, MergeOrPack, compute_precision_of_op, has_constant_bounds,
-        input_precision_from_operand, is_sentient_binary_logical_op, precision_in_string,
-        result_precision_from_operands, vector_type_of,
+        MergeAndPack, MergeOrPack, MinOrMaxFusion, compute_precision_of_op,
+        fuse_compare_and_select_into_min_or_max, has_constant_bounds, input_precision_from_operand,
+        is_sentient_binary_logical_op, precision_in_string, redefine_constant_vectors,
+        reset_sentient_fmas_if_exists, result_precision_from_operands,
+        vector_binary_to_sentient_binary,
+        vector_element_wise_compare_operator_to_sentient_binary_operator,
+        vector_ternary_to_sentient_ternary, vector_type_of,
     };
+    use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
+    use crate::arch::Dd2;
     use crate::formats::Bits;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::link::{Link, Lxlu, Sfp};
+    use crate::islands::dataflow_ir::ty::MemRef;
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit as DfirProgramUnit, ProgramUnits,
+    };
+
+    /// The arch every fixture below is built for; nothing here is arch-dependent.
+    type Target = Dd2;
+
     use crate::islands::dataflow_ir::dialects::Val;
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp};
@@ -610,6 +1304,7 @@ mod unit_tests {
         VectorOperand {
             kind: VectorOperandType::Link,
             op: OpId::at(&[0]),
+            values: Vec::new(),
             orig_precision: orig,
             on_the_fly_conv_precision: on_the_fly,
         }
@@ -1085,5 +1780,628 @@ mod unit_tests {
         assert_eq!(row.repetition(), 8);
         assert_eq!(row.size(), 16);
         assert_eq!(row.sum(), 240, "0, 2, .. 30");
+    }
+
+    // ═══════════════════ e065-e070 ═══════════════════
+
+    /// The `vector<64xf16>` every case below computes on.
+    fn f16x64() -> Vector {
+        vec(64, ElemType::F16)
+    }
+
+    /// A mask or a compare result — `vector<64xi1>`.
+    fn mask_ty() -> Vector {
+        vec(64, ElemType::Int(1))
+    }
+
+    /// A predicate over `val`, which is how a compare's result reaches a selection's `cond`.
+    fn pred(val: u32) -> vc::Predicate {
+        vc::LaneMask::prefix_of(64, mask_ty()).binds(Val(val))
+    }
+
+    /// `dataflow.receive … : vector<64xf16>` binding `result` — `fmax.mlir:112`.
+    fn receive(result: u32) -> DfirOp {
+        DfirOp::Dataflow(dfir_op::dataflow::Op::Receive {
+            result: Val(result),
+            from: Link::<Lxlu, Sfp>::between(Val(90), Val(91)).ends().1,
+            ty: f16x64(),
+        })
+    }
+
+    /// `agen.vector_load %view[0] … : vector<64xf16>` binding `result` — `fmax.mlir:116`.
+    fn vector_load(result: u32) -> DfirOp {
+        DfirOp::Agen(dfir_op::agen::Op::VectorLoad {
+            result: Val(result),
+            view: Val(92),
+            indices: std::vec![dfir_op::Index::Const(0)],
+            view_ty: MemRef {
+                shape: std::vec![64, 4, 1],
+                elem: ElemType::F16,
+            },
+            ty: f16x64(),
+        })
+    }
+
+    /// `arith.constant dense<0.000000e+00> : vector<64xf16>` — `relu.mlir:50`.
+    fn dense_zero(result: u32) -> DfirOp {
+        DfirOp::Arith(dfir_op::arith::Op::DenseConstant {
+            result: Val(result),
+            one: false,
+            ty: f16x64(),
+        })
+    }
+
+    /// `vectorchain.element_wise_compare %op1, %op2[%mask] {compare_op}`.
+    fn compare(result: u32, op1: u32, op2: u32, compare_op: vc::CompareOp) -> DfirOp {
+        DfirOp::VectorChain(vc::Op::ElementWiseCompare {
+            result: Val(result),
+            op1: Val(op1),
+            op2: Val(op2),
+            mask: Some(pred(56)),
+            compare_op,
+            operand_ty: f16x64(),
+            ty: mask_ty(),
+        })
+    }
+
+    /// 🎯 `fmax.mlir` — A RECEIVE AND A LOAD, COMPARED `gt` AND SELECTED IN THAT ORDER, IS ONE `max`.
+    ///
+    /// The vendor input is `element_wise_compare %53, %55 {compare_gt}` followed by
+    /// `element_wise_selection %57 ? %53 : %55` (`fmax.mlir:117-118`), and the expectation is a single
+    /// `sentient.vector_binary … binaryOp = #sentient<binary_operator max>` (`fmax.mlir:42`).
+    #[test]
+    fn a_receive_and_a_load_compared_greater_than_fuse_to_max() {
+        let scope = std::vec![
+            receive(53),
+            vector_load(55),
+            compare(57, 53, 55, vc::CompareOp::Gt),
+        ];
+
+        assert_eq!(
+            fuse_compare_and_select_into_min_or_max(pred(57), Val(53), Val(55), &scope),
+            MinOrMaxFusion::ToMax
+        );
+    }
+
+    /// 🎯 THE ARMS ARE MATCHED BY STRUCTURE, SO TWO SEPARATE `dense<0.0>` CONSTANTS STILL FUSE.
+    ///
+    /// ⛔⛔ THIS IS THE CASE THE REFERENCE'S COMMENT EXISTS FOR — *"since some times constant operands
+    /// are duplicated, and direct match may result in spurious mismatches"*. `relu.mlir:50-51` defines
+    /// `%cst` and `%cst_1` as two distinct `arith.constant dense<0.000000e+00> : vector<64xf16>` ops;
+    /// the compare reads the first and the selection the second (`:73-74`), and `relu.mlir:35,37` still
+    /// shows the `max` with `opB = #sentient<compute_port zero>`. A `lhs == op1 && rhs == op2` test on
+    /// SSA identity answers *false* here and emits two instructions instead of one.
+    #[test]
+    fn two_separate_but_identical_zero_constants_still_fuse() {
+        let scope = std::vec![
+            receive(16),
+            dense_zero(100),
+            dense_zero(101),
+            compare(18, 16, 100, vc::CompareOp::Gt),
+        ];
+
+        assert_eq!(
+            fuse_compare_and_select_into_min_or_max(pred(18), Val(16), Val(101), &scope),
+            MinOrMaxFusion::ToMax,
+            "%cst_1 is a different value from %cst but the same computation"
+        );
+    }
+
+    /// 🎯 THE FOUR ORDERING COMPARISONS AGAINST THE TWO ARM ORDERS — the reference's own table
+    /// (`VectorChainHelper.cpp:444-459`).
+    ///
+    /// ⭐ SWAPPING THE SELECTION'S ARMS INVERTS THE ANSWER, which is the whole reason `same` and
+    /// `opposite` are tracked separately: `a > b ? a : b` is `max`, and `a > b ? b : a` is `min`.
+    ///
+    /// ⚠️ NO VENDOR CASE PRODUCES A `min` — only three `.mlir` files in the authority tree contain an
+    /// `element_wise_selection` at all and all three fuse to `max` or not at all. The three rows below
+    /// that no vendor test pins come from the reference's branch table, and are marked as such.
+    #[test]
+    fn the_arm_order_decides_between_min_and_max() {
+        let table = std::vec![
+            (vc::CompareOp::Gt, true, MinOrMaxFusion::ToMax),
+            (vc::CompareOp::Ge, true, MinOrMaxFusion::ToMax),
+            (vc::CompareOp::Gt, false, MinOrMaxFusion::ToMin),
+            (vc::CompareOp::Ge, false, MinOrMaxFusion::ToMin),
+            (vc::CompareOp::Lt, true, MinOrMaxFusion::ToMin),
+            (vc::CompareOp::Le, true, MinOrMaxFusion::ToMin),
+            (vc::CompareOp::Lt, false, MinOrMaxFusion::ToMax),
+            (vc::CompareOp::Le, false, MinOrMaxFusion::ToMax),
+        ];
+
+        for (compare_op, same_order, expected) in table {
+            let scope = std::vec![
+                receive(53),
+                vector_load(55),
+                compare(57, 53, 55, compare_op),
+            ];
+            let (lhs, rhs) = if same_order {
+                (Val(53), Val(55))
+            } else {
+                (Val(55), Val(53))
+            };
+
+            assert_eq!(
+                fuse_compare_and_select_into_min_or_max(pred(57), lhs, rhs, &scope),
+                expected,
+                "{compare_op:?} with the arms {}",
+                if same_order { "in order" } else { "swapped" }
+            );
+        }
+    }
+
+    /// 🎯 `fcmp_select.mlir` — A CONDITION THAT IS NOT A COMPARE DOES NOT FUSE.
+    ///
+    /// The selection's cond is `%62`, an `agen.vector_load` of the state register
+    /// (`fcmp_select.mlir:148,156`), so the `dyn_cast<ElementWiseCompareOp>` fails, both bools stay
+    /// false, and `:64` emits the `sentient.vector_ternary … ternaryOp = select` instead.
+    #[test]
+    fn a_condition_loaded_from_memory_is_not_a_fusable_compare() {
+        let scope = std::vec![vector_load(62), vector_load(64), vector_load(65)];
+
+        assert_eq!(
+            fuse_compare_and_select_into_min_or_max(pred(62), Val(64), Val(65), &scope),
+            MinOrMaxFusion::NotFused
+        );
+    }
+
+    /// 🎯 ARMS THAT ARE NOT THE COMPARE'S OWN OPERANDS DO NOT FUSE — neither order matches.
+    ///
+    /// ⭐ AND THE MISMATCH IS STRUCTURAL, NOT NOMINAL: the selection's `rhs` here is a *receive*
+    /// where the compare's `op2` is a *load*, which is the case `skeleton` rejects on the op's name
+    /// before any operand is looked at.
+    #[test]
+    fn arms_from_a_different_computation_do_not_fuse() {
+        let scope = std::vec![
+            receive(53),
+            vector_load(55),
+            receive(70),
+            compare(57, 53, 55, vc::CompareOp::Gt),
+        ];
+
+        assert_eq!(
+            fuse_compare_and_select_into_min_or_max(pred(57), Val(53), Val(70), &scope),
+            MinOrMaxFusion::NotFused
+        );
+    }
+
+    /// 🎯 AN ARM WITH NO DEFINING OP DOES NOT FUSE — `if (!lhs_def || …) return;`.
+    ///
+    /// `Val(200)` is a region argument as far as `scope` can tell, which is exactly the null
+    /// `getDefiningOp()` the reference guards against.
+    #[test]
+    fn an_arm_that_is_a_region_argument_does_not_fuse() {
+        let scope = std::vec![
+            receive(53),
+            vector_load(55),
+            compare(57, 53, 200, vc::CompareOp::Gt),
+        ];
+
+        assert_eq!(
+            fuse_compare_and_select_into_min_or_max(pred(57), Val(53), Val(200), &scope),
+            MinOrMaxFusion::NotFused
+        );
+    }
+
+    /// An operand off `port` whose data id has already been assigned.
+    fn assigned(port: sen::Port, data_id: i32) -> sen::Operand {
+        sen::Operand {
+            data_id: Some(data_id),
+            ..sen::Operand::from(port)
+        }
+    }
+
+    /// `sentient.vector_mac` with all three data ids assigned.
+    fn mac(a: i32, b: i32, c: i32) -> SenOp {
+        SenOp::Sentient(sen::Op::VectorMac {
+            mask: None,
+            xrf_write_ptr: None,
+            xrf_read_ptr: None,
+            results: Vec::new(),
+            op_a: assigned(sen::Port::Lx, a),
+            op_b: assigned(sen::Port::Lrf(sen::LrfIndex::L1), b),
+            op_c: assigned(sen::Port::Xrf, c),
+            result: sen::ResultPorts::default(),
+            mode: sen::FmaMode::FusedMulAdd,
+            compute_precision: sen::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sen::UnrollFactor::X1,
+            xrf_read_incr: 0,
+            xrf_write_incr: 0,
+            dbg_name: None,
+        })
+    }
+
+    /// `sentient.vector_binary` with both data ids assigned — `fmax.mlir:42` carries `1` and `2`.
+    fn binary(a: i32, b: i32) -> SenOp {
+        SenOp::Sentient(sen::Op::VectorBinary {
+            mask: Val(0),
+            op_a: assigned(sen::Port::Lx, a),
+            op_b: assigned(sen::Port::Lrf(sen::LrfIndex::L1), b),
+            binary_op: sen::Binary::Plain(sen::BinaryOp::Max),
+            result: sen::ResultPorts::default(),
+            compute_precision: sen::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sen::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
+    /// A unit whose body is `body`.
+    fn sentient_unit(body: Vec<SenOp>) -> SentientProgramUnit<Target> {
+        SentientProgramUnit {
+            on: crate::islands::dataflow_ir::Units::one(crate::units::DfirUnit::Sfp, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// Every data id the unit's computes carry, in walk order.
+    fn data_ids(unit: &SentientProgramUnit<Target>) -> Vec<Option<i32>> {
+        fn collect(ops: &[SenOp], into: &mut Vec<Option<i32>>) {
+            for op in ops {
+                match op {
+                    SenOp::Sentient(sen::Op::VectorMac {
+                        op_a, op_b, op_c, ..
+                    })
+                    | SenOp::Sentient(sen::Op::VectorTernary {
+                        op_a, op_b, op_c, ..
+                    }) => into.extend([op_a.data_id, op_b.data_id, op_c.data_id]),
+                    SenOp::Sentient(sen::Op::VectorBinary { op_a, op_b, .. }) => {
+                        into.extend([op_a.data_id, op_b.data_id]);
+                    }
+                    SenOp::Sentient(sen::Op::VectorUnary { op_a, .. }) => {
+                        into.push(op_a.data_id);
+                    }
+                    SenOp::Sentient(sen::Op::For { body, .. }) => collect(body, into),
+                    SenOp::Sentient(sen::Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    }) => {
+                        collect(then_body, into);
+                        collect(else_body, into);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        collect(&unit.body, &mut ids);
+        ids
+    }
+
+    /// 🎯 EVERY MAC AND BINARY DATA ID BECOMES UNASSIGNED, AT EVERY LOOP AND BRANCH DEPTH.
+    ///
+    /// `-1` is the `.td`'s "unassigned", i.e. [`sen::Operand::data_id`]` == None`, and the walk is
+    /// `WalkOrder::PreOrder` over the whole unit — so a compute inside a `sentient.for` inside a
+    /// `sentient.if` is reset like one at the top.
+    #[test]
+    fn resetting_the_fmas_unassigns_every_mac_and_binary_data_id() {
+        let mut unit = sentient_unit(std::vec![
+            mac(1, 2, 3),
+            SenOp::Sentient(sen::Op::For {
+                bound: Val(1),
+                carried: Vec::new(),
+                dbg_name: None,
+                body: std::vec![
+                    binary(4, 5),
+                    SenOp::Sentient(sen::Op::If {
+                        predicate: sen::CmpPredicate::Eq,
+                        lhs: Val(2),
+                        rhs: Val(3),
+                        yielded: Vec::new(),
+                        dbg_name: None,
+                        then_body: std::vec![mac(6, 7, 8)],
+                        else_body: std::vec![binary(9, 10)],
+                    }),
+                ],
+            }),
+        ]);
+
+        assert_eq!(
+            data_ids(&unit),
+            std::vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+                Some(9),
+                Some(10),
+            ],
+            "the fixture starts with every id assigned"
+        );
+
+        reset_sentient_fmas_if_exists(&mut unit);
+
+        assert_eq!(data_ids(&unit), std::vec![None; 10]);
+    }
+
+    /// 🎯 A UNARY AND A TERNARY KEEP THEIRS — the reference's `else if` chain never reaches them.
+    ///
+    /// ⛔ `sentient::MacOp` and `sentient::BinaryOp` are the only two classes the `dyn_cast`s name
+    /// (`VectorChainHelper.cpp:471-478`); `sentient.vector_unary` and `sentient.vector_ternary` are
+    /// their own op classes and are left exactly as emitted.
+    #[test]
+    fn a_unary_and_a_ternary_keep_their_data_ids() {
+        let mut unit = sentient_unit(std::vec![
+            SenOp::Sentient(sen::Op::VectorUnary {
+                mask: Val(0),
+                op_a: assigned(sen::Port::Lx, 11),
+                unary_op: sen::UnaryOp::Floor,
+                result: sen::ResultPorts::default(),
+                compute_precision: sen::Precision::Fp16,
+                fold_mode: None,
+                unroll_factor: sen::UnrollFactor::X1,
+                dbg_name: None,
+            }),
+            SenOp::Sentient(sen::Op::VectorTernary {
+                mask: None,
+                op_a: assigned(sen::Port::IState(sen::IStateIndex::S0), 2),
+                op_b: assigned(sen::Port::Lrf(sen::LrfIndex::L1), 3),
+                op_c: assigned(sen::Port::Lx, 4),
+                ternary_op: sen::TernaryOp::Select,
+                result: sen::ResultPorts::default(),
+                compute_precision: sen::Precision::Fp16,
+                fold_mode: None,
+                unroll_factor: sen::UnrollFactor::X1,
+                unroll_incr_logical_result: false,
+                dbg_name: None,
+            }),
+        ]);
+
+        reset_sentient_fmas_if_exists(&mut unit);
+
+        assert_eq!(
+            data_ids(&unit),
+            std::vec![Some(11), Some(2), Some(3), Some(4)],
+            "fcmp_select.mlir:64 emits opADataID = 2, opBDataID = 3, opCDataID = 4"
+        );
+    }
+
+    /// A one-unit program whose preamble is `preamble` and whose only body is `body`.
+    fn dfir_program(preamble: Vec<DfirOp>, body: Vec<DfirOp>) -> DfirProgram<Target> {
+        DfirProgram {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble,
+            units: ProgramUnits::of(
+                DfirProgramUnit {
+                    on: crate::islands::dataflow_ir::Units::one(crate::units::DfirUnit::Pe, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// `affine.for` over `body`, so a use can sit two region depths down.
+    fn affine_for(iv: u32, body: Vec<DfirOp>) -> DfirOp {
+        DfirOp::Affine(dfir_op::affine::Op::For {
+            iv: Val(iv),
+            lo: dfir_op::affine::Bound::Const(0),
+            hi: dfir_op::affine::Bound::Const(10),
+            carried: Vec::new(),
+            body,
+            dbg_name: None,
+        })
+    }
+
+    /// `vectorchain.multiply_and_accumulate %a, %b, %acc[%mask]` — `const-vector-multiple-uses.mlir:241`.
+    fn mac_reading(a: u32, b: u32, result: u32) -> DfirOp {
+        DfirOp::VectorChain(vc::Op::MultiplyAccumulate {
+            result: Val(result),
+            a: Val(a),
+            b: Val(b),
+            acc: Val(300),
+            reduction_map: AffineMap::identity(1),
+            operand_ty: f16x64(),
+            ty: f16x64(),
+        })
+    }
+
+    /// 🎯 `const-vector-multiple-uses.mlir` — EVERY USE OF A VECTOR CONSTANT GETS ITS OWN CLONE, AND
+    /// THE ORIGINAL IS GONE.
+    ///
+    /// The vendor case defines `%cst_1 = arith.constant dense<1.000000e+00> : vector<64xf16>` at the
+    /// top of the function and reads it six times from four loop depths (`:185` and `:241,254,278,300,310,321`).
+    /// Its expectation's function head (`:15-24`) keeps `arith.constant true`, `false` and the index
+    /// constants and has **no** `dense<…>` left at all — every one moved next to its reader.
+    ///
+    /// ⭐ THE CLONE SITS IMMEDIATELY BEFORE ITS USER, at the user's own depth: that is what
+    /// `OpBuilder builder(owner)` means, and it is what lets the next pass attach per-use facts to it.
+    #[test]
+    fn every_use_of_a_vector_constant_gets_its_own_clone() {
+        let mut values = Values::default();
+        for _ in 0..400 {
+            let _ = values.mint();
+        }
+        let mut program = dfir_program(
+            std::vec![dense_zero(1)],
+            std::vec![
+                mac_reading(10, 1, 20),
+                affine_for(30, std::vec![mac_reading(11, 1, 21)]),
+            ],
+        );
+
+        redefine_constant_vectors(&mut program, &mut values);
+
+        assert!(
+            program.preamble.is_empty(),
+            "the original is erased once every use has a clone, leaving {:?}",
+            program.preamble
+        );
+
+        let body = &program.units.iter().next().expect("one unit").body;
+        let (top_clone, top_mac) = match &body[..] {
+            [clone, top, _] => (clone, top),
+            other => panic!("expected a clone ahead of the top-level mac, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                top_clone,
+                DfirOp::Arith(dfir_op::arith::Op::DenseConstant { .. })
+            ),
+            "the clone precedes its user"
+        );
+
+        let inner = match &body[2] {
+            DfirOp::Affine(dfir_op::affine::Op::For { body, .. }) => body,
+            other => panic!("expected the loop, got {other:?}"),
+        };
+        assert_eq!(inner.len(), 2, "the nested use got a clone inside the loop");
+
+        // Three distinct values now, where the input had one.
+        let clones = std::vec![
+            dfir_op::results(top_clone)[0],
+            dfir_op::results(&inner[0])[0],
+        ];
+        assert_ne!(clones[0], clones[1], "one clone per use, not one per value");
+        assert_eq!(dfir_op::operands(top_mac)[1], clones[0]);
+        assert_eq!(dfir_op::operands(&inner[1])[1], clones[1]);
+        assert!(
+            dfir_op::uses(Val(1), &program.preamble).is_empty()
+                && dfir_op::uses(Val(1), body).is_empty(),
+            "nothing reads the original any more"
+        );
+    }
+
+    /// 🎯 ONE OP READING THE SAME CONSTANT TWICE GETS **TWO** CLONES.
+    ///
+    /// ⛔⛔ THIS IS WHY THE REWRITE IS PER OPERAND SLOT AND NOT A VALUE SUBSTITUTION.
+    /// `const-vector-multiple-uses.mlir:310` is `multiply_and_accumulate %cst_0, %cst_1, %28` — two
+    /// constants on one op — and the reference clones per **use**, so a substitution that mapped the
+    /// value once would re-create exactly the sharing this function exists to undo.
+    #[test]
+    fn one_op_reading_a_constant_twice_gets_two_clones() {
+        let mut values = Values::default();
+        for _ in 0..400 {
+            let _ = values.mint();
+        }
+        let mut program = dfir_program(std::vec![dense_zero(1)], std::vec![mac_reading(1, 1, 20)]);
+
+        redefine_constant_vectors(&mut program, &mut values);
+
+        let body = &program.units.iter().next().expect("one unit").body;
+        assert_eq!(body.len(), 3, "two clones and the mac");
+        let first = dfir_op::results(&body[0])[0];
+        let second = dfir_op::results(&body[1])[0];
+        assert_ne!(first, second);
+        assert_eq!(dfir_op::operands(&body[2]), std::vec![first, second, Val(300)]);
+    }
+
+    /// 🎯 AN UNUSED VECTOR CONSTANT AND EVERY SCALAR CONSTANT ARE LEFT EXACTLY WHERE THEY WERE.
+    ///
+    /// `!use_empty()` is a real guard, not an optimisation. And `isa<VectorType, CustomVectorType>`
+    /// excludes the scalars, which is why the vendor expectation still opens with `arith.constant 10`,
+    /// `arith.constant true` and `arith.constant false` (`const-vector-multiple-uses.mlir:15-24`).
+    #[test]
+    fn an_unused_vector_constant_and_the_scalars_are_untouched() {
+        let mut values = Values::default();
+        let preamble = std::vec![
+            dense_zero(1),
+            DfirOp::Arith(dfir_op::arith::Op::Constant {
+                result: Val(2),
+                value: 10,
+            }),
+        ];
+        let mut program = dfir_program(
+            preamble.clone(),
+            std::vec![DfirOp::Arith(dfir_op::arith::Op::AddI(
+                dfir_op::arith::IntBinary {
+                    result: Val(3),
+                    lhs: Val(2),
+                    rhs: Val(2),
+                    ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+                }
+            ))],
+        );
+
+        redefine_constant_vectors(&mut program, &mut values);
+
+        assert_eq!(program.preamble, preamble);
+        assert_eq!(values.issued(), 0, "no clone was minted");
+    }
+
+    /// 🎯 ALL TWELVE `vectorchain` BINARY OPERATORS MAP, AND THE MAP IS NOT AN IDENTITY.
+    ///
+    /// ⭐ THE TWELVE ARE THE WHOLE DOMAIN, which is why this port carries no `todo!` where the
+    /// reference has a `DT_ERROR`.
+    #[test]
+    fn every_vectorchain_binary_operator_has_a_sentient_twin() {
+        let table = std::vec![
+            (vc::BinaryOp::And, sen::BinaryOp::And),
+            (vc::BinaryOp::Or, sen::BinaryOp::Or),
+            (vc::BinaryOp::Xnor, sen::BinaryOp::Xnor),
+            (vc::BinaryOp::AndNot, sen::BinaryOp::AndNot),
+            (vc::BinaryOp::Min, sen::BinaryOp::Min),
+            (vc::BinaryOp::Max, sen::BinaryOp::Max),
+            (vc::BinaryOp::AbsMin, sen::BinaryOp::AbsMin),
+            (vc::BinaryOp::AbsMax, sen::BinaryOp::AbsMax),
+            (vc::BinaryOp::Add, sen::BinaryOp::Add),
+            (vc::BinaryOp::Mul, sen::BinaryOp::Mul),
+            (vc::BinaryOp::MulDiv2, sen::BinaryOp::MulDiv2),
+            (vc::BinaryOp::Sub, sen::BinaryOp::Sub),
+        ];
+
+        assert_eq!(table.len(), 12, "the whole of vc::BinaryOp");
+        for (vb, expected) in table {
+            assert_eq!(vector_binary_to_sentient_binary(vb), expected, "{vb:?}");
+        }
+    }
+
+    /// 🎯 THE FOUR COMPARISONS THE ISA HAS BECOME THEIR `fcmp` — `gt` AND `ge` ARE NOT AMONG THEM.
+    ///
+    /// `fcmp_select.mlir` shows why: its input compare is `compare_gt` (`:136`) and its expectation is
+    /// `binaryOp = #sentient<binary_operator fcmp_lt>` with the operands swapped (`:48`) — the caller
+    /// reorders rather than asking for a `gt` that does not exist
+    /// (`VectorChainToSentientPESFP.cpp:450-485`). The spellings are pinned because the attribute text
+    /// is what a `CHECK` line matches.
+    #[test]
+    fn the_four_comparisons_the_isa_has_map_to_their_fcmp() {
+        let table = std::vec![
+            (vc::CompareOp::Eq, sen::BinaryOp::CompareEq, "fcmp_eq"),
+            (vc::CompareOp::Neq, sen::BinaryOp::CompareNeq, "fcmp_neq"),
+            (vc::CompareOp::Lt, sen::BinaryOp::CompareLt, "fcmp_lt"),
+            (vc::CompareOp::Le, sen::BinaryOp::CompareLe, "fcmp_le"),
+        ];
+
+        for (vb, expected, spelling) in table {
+            let got = vector_element_wise_compare_operator_to_sentient_binary_operator(vb);
+            assert_eq!(got, expected, "{vb:?}");
+            assert_eq!(got.spelling(), spelling);
+        }
+    }
+
+    /// 🎯 THE SELECTION IS THE ONLY TERNARY — `fcmp_select.mlir:156` in, `:64`'s
+    /// `ternaryOp = #sentient<ternary_operator select>` out.
+    #[test]
+    fn a_selection_is_the_only_ternary() {
+        let selection = vc::Op::ElementWiseSelection {
+            result: Val(67),
+            cond: pred(62),
+            lhs: Val(64),
+            rhs: Val(65),
+            mask: Some(pred(66)),
+            ty: f16x64(),
+        };
+
+        assert_eq!(
+            vector_ternary_to_sentient_ternary(&selection),
+            sen::TernaryOp::Select
+        );
+        assert_eq!(sen::TernaryOp::Select.spelling(), "select");
     }
 }

@@ -77,11 +77,13 @@
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp`
 
 
+use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::dialects::arith;
 use crate::islands::dataflow_ir::dialects::{
     Op as DfirOp, Val, operands, regions, regions_mut, results, uses,
 };
 use crate::islands::sentient::dialects::sentient as sen;
+use crate::units::DfirUnit;
 
 /// AN OPERATION'S IDENTITY — the stand-in for `mlir::Operation *`.
 ///
@@ -175,16 +177,17 @@ pub enum VectorOperandType {
 /// ONE OPERAND OF A COMPUTE, AS THE VECTORCHAIN LOWERING SEES IT — `VectorOperand`
 /// (`VectorOperands.hpp:38-113`).
 ///
-/// # ⚠️ PARTIAL BY DESIGN — three of the six data members are not here yet
+/// # ⚠️ PARTIAL BY DESIGN — `splat_` IS NOT HERE YET
 ///
-/// ⭐ THE MEMBERS ARRIVE WITH THE UNITS THAT READ THEM. `values_` (a uniformized value per
-/// core/corelet/fold) and `splat_` are only ever touched by `e169_getName`, `e234_setValue` and
-/// `e304_getOperandWithPrecision` — none of which is scheduled in this wave — and `values_` in
-/// particular holds a mix of a compute-port name (`symbolizeSentientComputePort` consumes it at
-/// `VectorChainToSentientPESFP.cpp:722-726`), the literal `"latch"`, and a slice index printed as
-/// decimal (`VectorOperands.cpp:240`). Choosing between one enum, three fields and an index newtype
-/// is a decision that belongs to whoever ports those units against their own callers, not a guess
-/// made here for a field this wave never reads.
+/// ⭐ THE MEMBER ARRIVES WITH THE UNIT THAT READS IT. `splat_` is *"to capture the select
+/// semantics"* (`VectorOperands.hpp:112`) and only `e304_getOperandWithPrecision` ever touches it;
+/// that entry is not this wave's, and what shape the field wants is a decision for its porter against
+/// its own callers rather than a guess made here.
+///
+/// ⭐ `values_` IS HERE NOW, because `e071_getOperandFromReceiveOp` and `e072_getOperandFromSendOp`
+/// exist to WRITE it — the link a compute reads over is the operand's value and nothing else. See
+/// [`Self::values`] and [`OperandValue`] for what one entry holds and what it deliberately does not
+/// yet spell.
 ///
 /// ⛔ THE TWO PRECISIONS ARE `Option`, AND THE EMPTY STRING IS WHY. The constructor
 /// (`VectorOperands.hpp:76-79`) sets only `type_`, `op_` and the value, so both precisions start
@@ -199,6 +202,16 @@ pub struct VectorOperand {
     pub kind: VectorOperandType,
     /// `op_` — the operation that produced it.
     pub op: OpId,
+    /// `values_` — ⭐ THE OPERAND'S VALUE, ONE ENTRY PER UNIFORMIZED CORE/CORELET/FOLD.
+    ///
+    /// The C++ is a `std::vector<std::string>` *"to handle uniformized values across
+    /// cores/corelets/folds"* (`VectorOperands.hpp:44-46`), and the three-argument constructor pushes
+    /// exactly one through `setValue` (`:72-79`) — which is what [`VectorOperand::new`] does.
+    ///
+    /// ⛔ A LIST AND NOT ONE VALUE, even though every constructor in the file writes exactly one.
+    /// `setValue` *clears* before pushing, so the vector is the member's own shape and a later unit
+    /// filling one entry per fold is not a change to this type.
+    pub values: Vec<OperandValue>,
     /// `orig_precision_` — the element precision of the value as it was produced. `None` is the
     /// reference's empty string; see the type's note.
     pub orig_precision: Option<sen::Precision>,
@@ -206,6 +219,342 @@ pub struct VectorOperand {
     /// equal to [`Self::orig_precision`] (`VectorOperands.cpp:399-400`) and only differs where a
     /// `vectorchain.cast` folded into the operand.
     pub on_the_fly_conv_precision: Option<sen::Precision>,
+}
+
+/// ONE ENTRY OF `values_` — an operand's value (`VectorOperands.hpp:44-46`).
+///
+/// # ⚠️ ONE CASE OF SEVERAL, AND THAT IS DELIBERATE
+///
+/// ⛔⛔ THE C++ STRING HOLDS AT LEAST THREE DIFFERENT THINGS, AND GUESSING THE CLOSED SET HERE WOULD
+/// BE WRONG TWICE OVER. `getName` (`VectorOperands.cpp:866-877`) shows the split by `type_`:
+///
+/// - a `LINK` operand's value is a **compute port**, handed straight to
+///   `symbolizeSentientComputePort` (`VectorChainToSentientPESFP.cpp:722-726`) — this variant, and
+///   what `e071_getOperandFromReceiveOp` and `e072_getOperandFromSendOp` write;
+/// - an `LRF`/`IRF`/`ISTATE` operand's value is a **decimal slice index**, computed as
+///   `(start_address + layout_map.getSingleConstantResult()) * bit_width / 1024` and printed with
+///   `std::to_string` (`VectorOperands.cpp:222-241`), which `getName` prefixes with `lrf`/`irf`/
+///   `istate`. That one arrives with `e232_getOperandFromLoadOrStoreOp`;
+/// - a `CONSTANT` operand's value comes from `constValToField` (`VectorOperands.cpp:250`), which
+///   entry 073 ported in this same file — and its answer is a [`sen::Port`] too, one of the four
+///   pseudo-units, so [`Self::Port`] already covers that case. See [`const_val_to_field`].
+///
+/// ⭐ SO THE ENUM STATES WHAT IT COVERS AND A NEW CASE IS AN ADDITION RATHER THAN A REINTERPRETATION.
+/// A `Vec<sen::Port>` would have to be replaced outright by the second unit that touches the field; a
+/// `Vec<String>` would put a closed set back into a string, which this crate does not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OperandValue {
+    /// A COMPUTE PORT — the link a value arrives over or leaves by.
+    Port(sen::Port),
+}
+
+/// WHICH COMPUTE UNIT IS ASKING — the `comp` argument of `getOperandFromReceiveOp` and
+/// `getOperandFromSendOp` (`VectorOperands.cpp:36`, `:97`).
+///
+/// # 🛑 THREE OF `SenComponents`' FIFTY, AND THE FUNCTIONS' OWN STRUCTURE PROVES IT
+///
+/// ⛔⛔ BOTH FUNCTIONS ARE WRITTEN AS `if (comp == PT) { … } else { /* PE/SFP */ … }` — the `else`
+/// carries that comment in the reference itself (`VectorOperands.cpp:64`, `:113`) and its body tests
+/// `comp == SFP` to decide the SFP ring. A fourth component reaching either of them would silently
+/// take the PE/SFP branch and be told to send over `pt`.
+///
+/// ⭐ AND THE CALL SITES AGREE. `getOperandWithPrecision` reaches these two from
+/// `VectorOperands.cpp:433` and `:443`, inside the vectorchain lowering that runs once for the PT
+/// (`VectorChainToSentientPT.cpp`) and once for `is_any_of(unit_comp, PE, SFP)`
+/// (`VectorChainToSentientPESFP.cpp:1385-1389`). Nothing else asks.
+///
+/// ⛔ SO IT IS ITS OWN THREE-CASE TYPE AND NOT [`crate::islands::dataflow_ir::ty::GenericComp`]:
+/// eighteen components can be a *peer* of one of these operations, and only three can be the one
+/// asking. Passing the peer where the asker goes must be an E0308.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ComputeComp {
+    /// `PT` — the matrix unit, whose links are compass directions.
+    Pt,
+    /// `PE`.
+    Pe,
+    /// `SFP`.
+    Sfp,
+}
+
+/// `dcc_ext_ctx.getArch() >= RCUDD1A_ISA` (`VectorOperands.cpp:70`, `:127`).
+///
+/// ⛔⛔ TRUE ON EVERY ARCH THIS CRATE BUILDS FOR, AND THAT IS A COMPILE-TIME FACT RATHER THAN AN
+/// ASSUMPTION. `IsaCoreGen` is ordered `MPW2 < MPW3 < MPW4 < RCUDD1A < SEN1P5` with
+/// `DEFAULT_ISA = RCUDD1A_ISA` (`sys-arch-spec/isa/isa.hpp:24-35`), and [`IsaGen`] models the last
+/// two only. The match is exhaustive, so adding an older generation to [`IsaGen`] stops the build
+/// here instead of silently answering `true` for it.
+const fn supports_sfp_ring(isa: IsaGen) -> bool {
+    match isa {
+        IsaGen::Rcudd1a | IsaGen::Sen1p5 => true,
+    }
+}
+
+impl VectorOperand {
+    /// AN OPERAND OF ONE KIND, CARRYING ONE VALUE — the three-argument constructor
+    /// (`VectorOperands.hpp:76-79`).
+    ///
+    /// ⭐ THE TWO PRECISIONS START UNSET, because the constructor initialises only `type_`, `op_` and
+    /// the value; see the type's own note on why that is an `Option` and not `Precision::None`.
+    ///
+    /// ⛔ NOT `e234_setValue`. The constructor's body IS a `setValue` call, and clearing before
+    /// pushing is trivially the same thing when the list starts empty — but `setValue` is a public
+    /// mutator with its own callers and its own entry (234/384), so it is not anchored here.
+    #[must_use]
+    pub fn new(kind: VectorOperandType, value: OperandValue, op: OpId) -> VectorOperand {
+        VectorOperand {
+            kind,
+            op,
+            values: vec![value],
+            orig_precision: None,
+            on_the_fly_conv_precision: None,
+        }
+    }
+
+    /// Replaces: e071_getOperandFromReceiveOp
+    ///
+    /// **071/384** `VectorOperand::getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34` (54L).
+    ///
+    /// ```cpp
+    /// std::string link;
+    /// std::string unit_str;
+    /// std::optional<std::string> unit_str_optional = dcc::uniform::utils::findUnitType(receive_op.getFromUnit());
+    /// if (unit_str_optional.has_value()) { unit_str = unit_str_optional.value(); }
+    /// else { receive_op.emitOpError("Unit type is inconsistent in ReceiveOp."); return std::nullopt; }
+    /// auto record = EnumsConversion::stringToSenComponents.find(unit_str);
+    /// if (record != EnumsConversion::stringToSenComponents.end()) {
+    ///   auto generic = EnumsConversion::senCompToGenericComp.at(record->second);
+    ///   if (comp == PT) {
+    ///     if (record->second == L0LU) { link = "west"; }
+    ///     else if (generic == CROSSPTNLINK) { link = "crossptnlink"; }
+    ///     else if (generic == PT || record->second == SFP || record->second == LXLU) { link = "north"; }
+    ///     else { receive_op->emitError("PT cannot expect data other than L0-LU, N-link, CROSS-PT-N-LINK"); return std::nullopt; }
+    ///   } else {  // PE/SFP
+    ///     if (record->second == LXLU || record->second == LXSU) { link = "lx"; }
+    ///     else if (record->second == PE) { link = "pe"; }
+    ///     else if (record->second == SFP) {
+    ///       link = "sfp";
+    ///       if (dcc_ext_ctx.getArch() >= RCUDD1A_ISA && comp == SFP) {
+    ///         if (EnumsConversion::stringToSenComponents.at(unit_str) == SFP) { link += "ring"; }
+    ///       }
+    ///     }
+    ///     else if (generic == PT) { link = "pt"; }
+    ///     else { receive_op->emitError("Unsupported receive unit for PE/SFP"); return std::nullopt; }
+    ///   }
+    ///   return VectorOperand(Link, link, receive_op.getOperation());
+    /// } else { receive_op->emitError("Unknown receiver"); return std::nullopt; }
+    /// ```
+    ///
+    /// ⛔⛔ THE OPERAND IT RETURNS **IS** THE FUNCTION, and its whole payload is the link name. A
+    /// version of this that decided the port and returned nothing would leave every PE/SFP compute
+    /// without an `opA`.
+    ///
+    /// ⭐⭐ WHICH PORT, MEASURED AGAINST THE VENDOR'S OWN GOLDENS.
+    /// `Conversion/VectorChainToSentientPT/loweringXRF_with_if_branch.mlir:130` is a
+    /// `dataflow.get_unit` with `type = "l0lu"`, three `dataflow.receive`s read it (`:145`, `:154`,
+    /// `:164`), and the expectation is `opA = #sentient<compute_port west>` (`:49`, `:58`, `:68`) —
+    /// the `L0LU` arm.
+    /// `.../xrf_increments.mlir:413-457` receives from an `lxlu` on a PT unit and expects
+    /// `opC = #sentient<compute_port north>` (`:71`, `:81`, `:88`) — the `LXLU` arm.
+    ///
+    /// ⛔ THE PEER IS A RESOLVED UNIT, NOT A STRING, so two of the reference's four failure paths
+    /// cannot be reached from here and are not written:
+    ///
+    /// - `findUnitType`'s empty optional (*"Unit type is inconsistent in ReceiveOp."*) is a
+    ///   disagreement between the `core`/`corelet` attributes of the units a `query_map` names — a
+    ///   question about the IR the caller resolved before it had a [`DfirUnit`] at all;
+    /// - *"Unknown receiver"* is `stringToSenComponents.find` missing. That map is
+    ///   `flipMap(senComponentsToString)` (`arch_enums.cpp`), and [`DfirUnit::spelling`] is the same
+    ///   table — so a spelling that came OUT of it cannot fail to go back IN.
+    ///
+    /// ⛔ AND THE `stringToSenComponents.at(unit_str) == SFP` RE-CHECK IS A TAUTOLOGY IN THE
+    /// REFERENCE ITSELF. It sits inside `else if (record->second == SFP)`, where `record->second` is
+    /// that exact lookup; the second `at()` asks a question already answered one line above.
+    ///
+    /// ⭐ THE IF-CHAIN IS A TOTAL MATCH HERE, AND THE ORDER SURVIVES IT. The reference's arms are
+    /// disjoint — `L0LU`, then the only unit whose generic is `CROSSPTNLINK`, then the PT rows plus
+    /// `SFP` and `LXLU` — so no unit reaches two of them and precedence carries no information. What
+    /// a match buys is that a nineteenth [`DfirUnit`] has to say which arm it belongs to.
+    #[must_use]
+    pub fn from_receive_op<A: Arch>(
+        from_unit: DfirUnit,
+        comp: ComputeComp,
+        receive_op: OpId,
+    ) -> VectorOperand {
+        let link = match comp {
+            ComputeComp::Pt => match from_unit {
+                DfirUnit::L0lu => sen::Port::West,
+                // `generic == CROSSPTNLINK` — one unit maps there.
+                DfirUnit::CrossPtnLink => sen::Port::CrossPtNorthLink,
+                // `generic == PT` is every row of the matrix unit; the other two are named exactly.
+                DfirUnit::PtRow(_) | DfirUnit::Sfp | DfirUnit::Lxlu => sen::Port::North,
+                DfirUnit::Pe
+                | DfirUnit::Lxsu
+                | DfirUnit::Lx
+                | DfirUnit::Hbm
+                | DfirUnit::L0su
+                | DfirUnit::L0
+                | DfirUnit::L3lu
+                | DfirUnit::L3su
+                | DfirUnit::Constant
+                | DfirUnit::SfpState
+                | DfirUnit::PeState
+                | DfirUnit::SfpRing
+                | DfirUnit::LxVirtualIbr => todo!(
+                    "PT cannot expect data other than L0-LU, N-link, CROSS-PT-N-LINK (VectorOperands.cpp:59-63)"
+                ),
+            },
+            // PE/SFP.
+            ComputeComp::Pe | ComputeComp::Sfp => match from_unit {
+                DfirUnit::Lxlu | DfirUnit::Lxsu => sen::Port::Lx,
+                DfirUnit::Pe => sen::Port::Pe,
+                // ⭐ THE RING IS THE SFP TALKING TO ITSELF. A PE receiving from an SFP gets plain
+                // `sfp`; only an SFP asking gets `sfpring`, and only from DD1 up — which is every
+                // arch here, see [`supports_sfp_ring`].
+                DfirUnit::Sfp => {
+                    if supports_sfp_ring(A::GEN) && matches!(comp, ComputeComp::Sfp) {
+                        sen::Port::SfpRing
+                    } else {
+                        sen::Port::Sfp
+                    }
+                }
+                DfirUnit::PtRow(_) => sen::Port::Pt,
+                DfirUnit::Lx
+                | DfirUnit::Hbm
+                | DfirUnit::L0lu
+                | DfirUnit::L0su
+                | DfirUnit::L0
+                | DfirUnit::L3lu
+                | DfirUnit::L3su
+                | DfirUnit::Constant
+                | DfirUnit::SfpState
+                | DfirUnit::PeState
+                | DfirUnit::SfpRing
+                | DfirUnit::LxVirtualIbr
+                | DfirUnit::CrossPtnLink => {
+                    todo!("Unsupported receive unit for PE/SFP (VectorOperands.cpp:76)")
+                }
+            },
+        };
+
+        VectorOperand::new(VectorOperandType::Link, OperandValue::Port(link), receive_op)
+    }
+
+    /// Replaces: e072_getOperandFromSendOp
+    ///
+    /// **072/384** `VectorOperand::getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95` (50L).
+    ///
+    /// ```cpp
+    /// std::string link;
+    /// std::string unit_str;
+    /// std::optional<std::string> unit_str_optional = dcc::uniform::utils::findUnitType(send_op.getToUnit());
+    /// if (unit_str_optional.has_value()) { unit_str = unit_str_optional.value(); }
+    /// else { send_op.emitOpError("Unit type is inconsistent in SendOp."); return std::nullopt; }
+    /// auto record = EnumsConversion::stringToSenComponents.find(unit_str);
+    /// if (record != EnumsConversion::stringToSenComponents.end()) {
+    ///   auto generic = EnumsConversion::senCompToGenericComp.at(record->second);
+    ///   if (comp == PT) {
+    ///     if (generic == PT || record->second == PE) { link = "south"; }
+    ///   } else {  // PE/SFP
+    ///     if (generic == PT) { link = "pt"; }
+    ///     else if (record->second == PE) { link = "pe"; }
+    ///     else if (record->second == SFP) {
+    ///       link = "sfp";
+    ///       if (comp == SFP) {
+    ///         if (dcc_ext_ctx.getArch() >= RCUDD1A_ISA) link += "ring";
+    ///         else send_op.emitWarning("SFP to SFP communication requires target arch DD1 and above");
+    ///       }
+    ///     }
+    ///     else if (record->second == L0LU || record->second == L0SU) { link = "l0"; }
+    ///     else if (record->second == LXLU || record->second == LXSU) { link = "lx"; }
+    ///   }
+    ///   if (link.empty()) { send_op->emitError("Unsupported destination for PE/SFP FMA: " + unit_str); return std::nullopt; }
+    ///   return VectorOperand(Link, link, send_op.getOperation());
+    /// } else { send_op->emitError("Unknown destination"); return std::nullopt; }
+    /// ```
+    ///
+    /// ⭐⭐ MEASURED AGAINST THE VENDOR'S OWN GOLDEN.
+    /// `Conversion/VectorChainToSentientPT/xrf_increments.mlir:422` is `dataflow.send %5, %44`, and
+    /// the expectation is `ResultForwarding = [#sentient<compute_port south>]` (`:81`, `:88`) — the
+    /// `generic == PT` arm of the PT branch. ⭐ `%5` IS NOT A UNIT BUT A `uniform.query_map` (`:378`)
+    /// over a mapping (`:377`) whose two targets are both `type = "ptrow1"` (`:375`, `:376`).
+    /// Resolving that is precisely what `findUnitType` does, and its empty optional — the reference's
+    /// *"Unit type is inconsistent in SendOp."* — is those two targets disagreeing.
+    ///
+    /// ⛔⛔ THE PT BRANCH HAS NO `else`, AND THAT IS WHY THE REFUSAL IS AT THE BOTTOM. An unmatched
+    /// destination on a PT leaves `link` empty and falls into `if (link.empty())` — whose message says
+    /// *"Unsupported destination for PE/SFP FMA"* even though the unit asking is the PT. Both branches
+    /// are written out here, both reach that same refusal, and the message is reproduced as the
+    /// reference words it.
+    ///
+    /// ⛔ THE `emitWarning` ARM IS UNREACHABLE ON EVERY ARCH THIS CRATE BUILDS FOR — see
+    /// [`supports_sfp_ring`] — so SFP→SFP always spells `sfpring` here. It is written because it is
+    /// the function, and it is where an older generation lands the day one is added to [`IsaGen`].
+    ///
+    /// ⛔ TWO FAILURE PATHS ARE UNREACHABLE FROM A RESOLVED [`DfirUnit`] — the same two
+    /// [`Self::from_receive_op`] documents, with *"Unknown destination"* in place of
+    /// *"Unknown receiver"*.
+    ///
+    /// ⭐ NOTE THE ASYMMETRY WITH THE RECEIVE SIDE, WHICH IS THE REFERENCE'S: a PE/SFP may SEND to
+    /// the L0 and to either LX half, and may not RECEIVE from the L0 at all.
+    #[must_use]
+    pub fn from_send_op<A: Arch>(
+        to_unit: DfirUnit,
+        comp: ComputeComp,
+        send_op: OpId,
+    ) -> VectorOperand {
+        let link = match comp {
+            ComputeComp::Pt => match to_unit {
+                DfirUnit::PtRow(_) | DfirUnit::Pe => sen::Port::South,
+                DfirUnit::Sfp
+                | DfirUnit::Lxlu
+                | DfirUnit::Lxsu
+                | DfirUnit::Lx
+                | DfirUnit::Hbm
+                | DfirUnit::L0lu
+                | DfirUnit::L0su
+                | DfirUnit::L0
+                | DfirUnit::L3lu
+                | DfirUnit::L3su
+                | DfirUnit::Constant
+                | DfirUnit::SfpState
+                | DfirUnit::PeState
+                | DfirUnit::SfpRing
+                | DfirUnit::LxVirtualIbr
+                | DfirUnit::CrossPtnLink => todo!(
+                    "Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139, reached from the PT branch)"
+                ),
+            },
+            // PE/SFP.
+            ComputeComp::Pe | ComputeComp::Sfp => match to_unit {
+                DfirUnit::PtRow(_) => sen::Port::Pt,
+                DfirUnit::Pe => sen::Port::Pe,
+                DfirUnit::Sfp => {
+                    if matches!(comp, ComputeComp::Sfp) && supports_sfp_ring(A::GEN) {
+                        sen::Port::SfpRing
+                    } else {
+                        sen::Port::Sfp
+                    }
+                }
+                DfirUnit::L0lu | DfirUnit::L0su => sen::Port::L0,
+                DfirUnit::Lxlu | DfirUnit::Lxsu => sen::Port::Lx,
+                DfirUnit::Lx
+                | DfirUnit::Hbm
+                | DfirUnit::L0
+                | DfirUnit::L3lu
+                | DfirUnit::L3su
+                | DfirUnit::Constant
+                | DfirUnit::SfpState
+                | DfirUnit::PeState
+                | DfirUnit::SfpRing
+                | DfirUnit::LxVirtualIbr
+                | DfirUnit::CrossPtnLink => todo!(
+                    "Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139)"
+                ),
+            },
+        };
+
+        VectorOperand::new(VectorOperandType::Link, OperandValue::Port(link), send_op)
+    }
 }
 
 /// THE VALUE A SPLATTED CONSTANT OPERAND CARRIES — the domain `constValToField` accepts.
@@ -533,8 +882,10 @@ pub fn erase_op(op: &OpId, scope: &mut Vec<DfirOp>) {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{ConstantOperandValue, OpId, VectorOperand, VectorOperandType};
-    use super::{const_val_to_field, erase_op, same_block};
+    use super::{ComputeComp, ConstantOperandValue, OpId, OperandValue, VectorOperand};
+    use super::{VectorOperandType, const_val_to_field, erase_op, same_block};
+    use crate::arch::{Dd2, Sen1p5};
+    use crate::units::{DfirUnit, Row};
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
     use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, Vector};
@@ -593,9 +944,140 @@ mod unit_tests {
         VectorOperand {
             kind,
             op: OpId::at(path),
+            values: Vec::new(),
             orig_precision: None,
             on_the_fly_conv_precision: None,
         }
+    }
+
+    fn row(index: u32) -> DfirUnit {
+        DfirUnit::PtRow(Row::checked(index).expect("this arch has a row zero"))
+    }
+
+    fn port(operand: &VectorOperand) -> sen::Port {
+        assert_eq!(operand.kind, VectorOperandType::Link);
+        let [OperandValue::Port(port)] = operand.values.as_slice() else {
+            unreachable!("a link operand carries exactly one port")
+        };
+        *port
+    }
+
+    /// ⭐ `loweringXRF_with_if_branch.mlir:130` is a `type = "l0lu"` unit, three receives read it
+    /// (`:145`, `:154`, `:164`), and `:49`/`:58`/`:68` expect `opA = #sentient<compute_port west>`.
+    #[test]
+    fn a_pt_receiving_from_the_l0_load_unit_reads_west() {
+        let operand =
+            VectorOperand::from_receive_op::<Dd2>(DfirUnit::L0lu, ComputeComp::Pt, OpId::at(&[0]));
+        assert_eq!(port(&operand), sen::Port::West);
+        assert_eq!(operand.op, OpId::at(&[0]));
+        assert_eq!(operand.orig_precision, None);
+        assert_eq!(operand.on_the_fly_conv_precision, None);
+    }
+
+    /// ⭐ `xrf_increments.mlir:413-457` receives from an `lxlu` on a PT unit; `:71`/`:81`/`:88` expect
+    /// `opC = #sentient<compute_port north>`. The row above it and the SFP take the same arm.
+    #[test]
+    fn a_pt_receives_from_the_lx_the_sfp_and_the_rows_over_north() {
+        for peer in [DfirUnit::Lxlu, DfirUnit::Sfp, row(0), row(1)] {
+            let operand =
+                VectorOperand::from_receive_op::<Dd2>(peer, ComputeComp::Pt, OpId::at(&[1]));
+            assert_eq!(port(&operand), sen::Port::North, "{peer:?}");
+        }
+    }
+
+    #[test]
+    fn a_pt_receiving_over_the_cross_pt_link_names_it() {
+        let operand = VectorOperand::from_receive_op::<Dd2>(
+            DfirUnit::CrossPtnLink,
+            ComputeComp::Pt,
+            OpId::at(&[2]),
+        );
+        assert_eq!(port(&operand), sen::Port::CrossPtNorthLink);
+    }
+
+    /// ⭐ THE PE/SFP BRANCH, ARM BY ARM. Both LX halves collapse to `lx`; the PT rows to `pt`.
+    #[test]
+    fn a_pe_receives_from_the_lx_halves_the_pt_and_the_sfp() {
+        for (peer, expected) in [
+            (DfirUnit::Lxlu, sen::Port::Lx),
+            (DfirUnit::Lxsu, sen::Port::Lx),
+            (DfirUnit::Pe, sen::Port::Pe),
+            (row(0), sen::Port::Pt),
+            (DfirUnit::Sfp, sen::Port::Sfp),
+        ] {
+            let operand =
+                VectorOperand::from_receive_op::<Dd2>(peer, ComputeComp::Pe, OpId::at(&[3]));
+            assert_eq!(port(&operand), expected, "{peer:?}");
+        }
+    }
+
+    /// ⛔ THE RING IS THE SFP ASKING, NOT THE SFP ANSWERING. Same peer, two askers, two ports.
+    #[test]
+    fn only_an_sfp_receiving_from_an_sfp_reads_the_ring() {
+        let asked_by_sfp =
+            VectorOperand::from_receive_op::<Dd2>(DfirUnit::Sfp, ComputeComp::Sfp, OpId::at(&[4]));
+        let asked_by_pe =
+            VectorOperand::from_receive_op::<Dd2>(DfirUnit::Sfp, ComputeComp::Pe, OpId::at(&[4]));
+        assert_eq!(port(&asked_by_sfp), sen::Port::SfpRing);
+        assert_eq!(port(&asked_by_pe), sen::Port::Sfp);
+        // ⭐ AND IT IS THE RING ON THE NEWER GENERATION TOO — `supports_sfp_ring` is total.
+        let on_sen1p5 =
+            VectorOperand::from_receive_op::<Sen1p5>(DfirUnit::Sfp, ComputeComp::Sfp, OpId::at(&[4]));
+        assert_eq!(port(&on_sen1p5), sen::Port::SfpRing);
+    }
+
+    /// ⭐ `xrf_increments.mlir:422` sends to `%5`, a `type = "ptrow1"` unit, and `:81`/`:88` expect
+    /// `ResultForwarding = [#sentient<compute_port south>]`. A send to the PE takes the same arm.
+    #[test]
+    fn a_pt_sends_to_the_rows_and_the_pe_over_south() {
+        for peer in [row(1), row(0), DfirUnit::Pe] {
+            let operand =
+                VectorOperand::from_send_op::<Dd2>(peer, ComputeComp::Pt, OpId::at(&[5]));
+            assert_eq!(port(&operand), sen::Port::South, "{peer:?}");
+        }
+    }
+
+    /// ⭐ THE SEND SIDE REACHES THE MEMORIES THE RECEIVE SIDE DOES NOT — both L0 halves and both LX
+    /// halves (`VectorOperands.cpp:128-133`).
+    #[test]
+    fn a_pe_sends_to_the_l0_and_lx_halves() {
+        for (peer, expected) in [
+            (DfirUnit::L0lu, sen::Port::L0),
+            (DfirUnit::L0su, sen::Port::L0),
+            (DfirUnit::Lxlu, sen::Port::Lx),
+            (DfirUnit::Lxsu, sen::Port::Lx),
+            (row(0), sen::Port::Pt),
+            (DfirUnit::Pe, sen::Port::Pe),
+        ] {
+            let operand =
+                VectorOperand::from_send_op::<Dd2>(peer, ComputeComp::Pe, OpId::at(&[6]));
+            assert_eq!(port(&operand), expected, "{peer:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_sfp_sending_to_an_sfp_uses_the_ring() {
+        let asked_by_sfp =
+            VectorOperand::from_send_op::<Dd2>(DfirUnit::Sfp, ComputeComp::Sfp, OpId::at(&[7]));
+        let asked_by_pe =
+            VectorOperand::from_send_op::<Dd2>(DfirUnit::Sfp, ComputeComp::Pe, OpId::at(&[7]));
+        assert_eq!(port(&asked_by_sfp), sen::Port::SfpRing);
+        assert_eq!(port(&asked_by_pe), sen::Port::Sfp);
+    }
+
+    /// ⛔ ONE VALUE, AND THE CONSTRUCTOR CLEARS FIRST. `setValue` is `values_.clear()` then
+    /// `emplace_back` (`VectorOperands.hpp:72-75`), so a freshly built operand has exactly one entry
+    /// however many folds it may later carry.
+    #[test]
+    fn a_new_operand_carries_exactly_one_value() {
+        let operand = VectorOperand::new(
+            VectorOperandType::Lrf,
+            OperandValue::Port(sen::Port::Latch),
+            OpId::at(&[8, 1]),
+        );
+        assert_eq!(operand.values, vec![OperandValue::Port(sen::Port::Latch)]);
+        assert_eq!(operand.kind, VectorOperandType::Lrf);
+        assert_eq!(operand.op.path(), &[8, 1]);
     }
 
     // ── e073_constValToField ──────────────────────────────────────────────────────────────────
