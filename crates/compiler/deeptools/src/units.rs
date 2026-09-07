@@ -12,6 +12,7 @@
 
 use crate::arch::{Arch, Bounded, IsaGen, Target};
 use crate::generated::Unit;
+use crate::islands::dataflow_ir::ty::GenericComp;
 
 /// ⭐⭐ THIS BUILD'S PT ROW TYPE — and the reason the arch is a cargo feature rather than a value.
 ///
@@ -244,14 +245,28 @@ impl<const ROWS: u32> PtRow<ROWS> {
 #[must_use]
 pub fn local_units(of: Unit) -> Vec<crate::islands::dataflow_ir::dialects::dataflow::LocalUnit> {
     use crate::islands::dataflow_ir::dialects::dataflow::LocalUnit;
-    use crate::islands::dataflow_ir::ty::GenericComp;
 
     let mut files = match of.generic() {
         GenericComp::Pt => vec![LocalUnit::PtLrf, LocalUnit::PtXrf],
         GenericComp::Pe => vec![LocalUnit::PeLrf],
         GenericComp::Sfp => vec![LocalUnit::SfpLrf],
-        // A load or store unit owns no register file of its own; it moves other units' data.
-        GenericComp::Lx | GenericComp::L0 | GenericComp::Constant => Vec::new(),
+        // A mover, a memory or a source owns no register file of its own; it moves or holds other
+        // units' data.
+        GenericComp::Lxlu
+        | GenericComp::Lxsu
+        | GenericComp::Lx
+        | GenericComp::L0lu
+        | GenericComp::L0su
+        | GenericComp::L0
+        | GenericComp::L3lu
+        | GenericComp::L3su
+        | GenericComp::Hbm
+        | GenericComp::LxVirtualIbr
+        | GenericComp::CrossPtnLink
+        | GenericComp::SfpState
+        | GenericComp::PeState
+        | GenericComp::Constant
+        | GenericComp::SfpRing => Vec::new(),
     };
     if matches!(of.generic(), GenericComp::Pt) && matches!(Target::GEN, IsaGen::Sen1p5) {
         files.push(LocalUnit::L0Scale);
@@ -331,6 +346,20 @@ pub enum DfirUnit {
     /// MEMORY A VIEW IS TAKEN OVER — `buildNeighborUnits` never binds it, which is why it is absent
     /// from [`neighbours`].
     LxVirtualIbr,
+
+    /// `crossptnlink` — the link that carries data OUT OF THIS PARTITION.
+    ///
+    /// ⛔⛔ IT IS A REAL DATAFLOWIR UNIT AND THIS VOCABULARY COULD NOT NAME IT. The authority tree's
+    /// own input binds it —
+    /// `%cross_pt_n_link = dataflow.get_unit {name = "CROSS-PT-N-LINK-CL0", type = "crossptnlink"}`
+    /// (`dcc/test/LXLU/int8-kg3-sen1_5-lxlu.mlir:203`) — and `SenComponents::CROSSPTNLINK` spells
+    /// `"crossptnlink"` and is its own generic component (`sys-arch-spec/arch_enums.cpp:207`).
+    ///
+    /// ⛔ AND ITS ABSENCE MADE A REFERENCE RULE UNSTATABLE. `generateSetSendDestinationStmts` emits
+    /// a `SETDSTMASK` when a load's consumer is any of `{PT, SFP, L0SU, CROSSPTNLINK}`
+    /// (`Helper.cpp:2764-2765`); with no variant for the fourth, the test could only ever be
+    /// written over three of them.
+    CrossPtnLink,
 }
 
 impl DfirUnit {
@@ -380,6 +409,50 @@ impl DfirUnit {
             Self::PeState => "pestate",
             Self::SfpRing => "sfpring",
             Self::LxVirtualIbr => "lxvirtualibr",
+            Self::CrossPtnLink => "crossptnlink",
+        }
+    }
+
+    /// WHICH GENERIC COMPONENT THIS UNIT IS —
+    /// `EnumsConversion::senCompToGenericComp` (`sys-arch-spec/arch_enums.cpp:124-211`) as a total
+    /// function.
+    ///
+    /// ⭐ NOT A SCHEDULED UNIT — the map every predicate over components consults. Entries 039/384 and
+    /// 040/384 ([`crate::bridges::dataflow_ir_to_sentient::dfs_dataflow_to_sentient::is_sen_component_l0lu`]
+    /// and its store twin) are `.at(comp) == L0LU`/`== L0SU` over this.
+    ///
+    /// ⭐ THE MAP IS MANY-TO-ONE AND THAT IS ITS WHOLE JOB: eight PT rows in two fold copies all
+    /// answer `PT`, and twenty-two `L0LUROW*` spellings all answer `L0LU`. Our vocabulary already
+    /// carries the row as an index rather than as twenty-four spellings, so the collapse is one arm.
+    ///
+    /// ⛔ TOTAL WHERE THE REFERENCE IS PARTIAL. `senCompToGenericComp.at(comp)` **throws** for
+    /// `L0`, `CONSTANT` and `SFPRING` — they are not keys. Those three answer themselves here; see
+    /// [`GenericComp`].
+    #[must_use]
+    pub const fn generic(self) -> GenericComp {
+        match self {
+            // `:127-152` — every row and row span of the matrix unit.
+            Self::PtRow(_) => GenericComp::Pt,
+            Self::Pe => GenericComp::Pe,
+            Self::Sfp => GenericComp::Sfp,
+            // `:167-175` — ⛔ THE HALVES ARE NOT ONE COMPONENT.
+            Self::Lxlu => GenericComp::Lxlu,
+            Self::Lxsu => GenericComp::Lxsu,
+            Self::Lx => GenericComp::Lx,
+            Self::L0lu => GenericComp::L0lu,
+            Self::L0su => GenericComp::L0su,
+            Self::L3lu => GenericComp::L3lu,
+            Self::L3su => GenericComp::L3su,
+            Self::Hbm => GenericComp::Hbm,
+            // `:209` — the virtual IBR is its own image, like the memories above it.
+            Self::LxVirtualIbr => GenericComp::LxVirtualIbr,
+            Self::CrossPtnLink => GenericComp::CrossPtnLink,
+            Self::SfpState => GenericComp::SfpState,
+            Self::PeState => GenericComp::PeState,
+            // The three the reference's `.at()` throws on.
+            Self::L0 => GenericComp::L0,
+            Self::Constant => GenericComp::Constant,
+            Self::SfpRing => GenericComp::SfpRing,
         }
     }
 }
@@ -461,7 +534,11 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
         | DfirUnit::Constant
         | DfirUnit::SfpState
         | DfirUnit::PeState
-        | DfirUnit::SfpRing => Vec::new(),
+        | DfirUnit::SfpRing
+        // ⛔ THE CROSS-PARTITION LINK IS A DESTINATION, NOT A PROGRAMMED UNIT — `buildNeighborUnits`
+        // has no arm for it, and the golden that binds it does so as a send target
+        // (`int8-kg3-sen1_5-lxlu.mlir:203`).
+        | DfirUnit::CrossPtnLink => Vec::new(),
     }
 }
 
@@ -511,7 +588,10 @@ pub fn residency_of(unit: DfirUnit, core: Core, corelet: Corelet) -> Residency {
         | DfirUnit::Constant
         | DfirUnit::SfpState
         | DfirUnit::PeState
-        | DfirUnit::SfpRing => Residency::Corelet { core, corelet },
+        | DfirUnit::SfpRing
+        // `CROSS-PT-N-LINK-CL0` carries the `-CL0` suffix, which is what a per-corelet name is
+        // (`int8-kg3-sen1_5-lxlu.mlir:203` against `UnitMaterializer.cpp:82-115`).
+        | DfirUnit::CrossPtnLink => Residency::Corelet { core, corelet },
     }
 }
 
