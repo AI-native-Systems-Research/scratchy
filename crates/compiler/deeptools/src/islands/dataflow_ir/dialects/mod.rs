@@ -107,7 +107,9 @@ pub fn operands(op: &Op) -> Vec<Val> {
             arith::Op::AddI(bin) | arith::Op::SubI(bin) | arith::Op::MulI(bin) => {
                 reads.extend([bin.lhs, bin.rhs]);
             }
-            arith::Op::Compare { iv, against, .. } => reads.extend([*iv, *against]),
+            // ⭐ THE PREDICATE IS NOT AN OPERAND — it is `arith.cmpi`'s first token, an
+            // attribute. Both compared values are uses; which comparison it is, is not.
+            arith::Op::Compare { lhs, rhs, .. } => reads.extend([*lhs, *rhs]),
             arith::Op::Logic { operands, .. } => reads.extend(operands.iter().copied()),
         },
         Op::Scf(op) => match op {
