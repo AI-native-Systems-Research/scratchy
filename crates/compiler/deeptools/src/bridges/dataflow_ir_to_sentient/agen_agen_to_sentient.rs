@@ -256,6 +256,9 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
              transfer's region",
             unit.on.kind()
         ),
+    }
+}
+
 use crate::arch::Elements;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::affine::Carried;
@@ -698,6 +701,11 @@ mod unit_tests {
     #[test]
     fn one_transfer_consumes_one_op() {
         assert_eq!(Consumed(1).ops(), 1);
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
     use super::*;
     use crate::islands::dataflow_ir::dialects::Op as DfirOp;
     use crate::islands::dataflow_ir::dialects::affine::Bound;

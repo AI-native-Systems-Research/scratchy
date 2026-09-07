@@ -63,9 +63,23 @@ disk() {
 
 stage() { # $1 wave json  $2 objective  $3 tag
   disk
-  say "STAGE $3 start ($2, $1)"
-  crustify --parallel-max 8 $ROOT . translate "$CAMP/$1" --objective "$2" > $LOGDIR/driver-$3.log 2>&1
-  say "STAGE $3 exit=$?"
+  # ⭐ RETRY, BECAUSE THE FAILURES ARE THE NETWORK AND NOT THE WORK. Every batch lost so far died
+  # with `API Error: Can't reach the API server (ENOTFOUND)` after 120-180 turns — 9 of 18 in the
+  # first level-0 wave, all three in the run before it. crustify commits per batch, so a retry
+  # re-runs only what is still unfilled if the schedule is a remainder; otherwise it re-runs the
+  # stage and the already-landed anchors make the finished units cheap to redo.
+  for attempt in 1 2 3; do
+    say "STAGE $3 start ($2, $1) attempt $attempt"
+    crustify --parallel-max 8 $ROOT . translate "$CAMP/$1" --objective "$2" > $LOGDIR/driver-$3.log 2>&1
+    rc=$?
+    say "STAGE $3 attempt $attempt exit=$rc"
+    [ $rc -eq 0 ] && break
+    if ! grep -q "ENOTFOUND\|Can't reach the API server\|exited 1 for TranslateAgent" $LOGDIR/driver-$3.log; then
+      say "STAGE $3 failed for a reason that is NOT the API — not retrying"; break
+    fi
+    say "STAGE $3 retrying in 120s (API failure)"; sleep 120
+  done
+  say "STAGE $3 exit=$rc"
   grep -E '^\[crustify\] [0-9]+ failure' $LOGDIR/driver-$3.log >> $TRACE 2>/dev/null
   promote $LOGDIR/driver-$3.log
   count
@@ -90,16 +104,16 @@ gate() { # $1 tag
 say "RESUME: sc1 port wave died with filled=0 (agent API ENOTFOUND); restarting from sc1-port"
 count
 
-stage level0-accessors-and-leaves/port.json            port   sc1-port
-stage level0-accessors-and-leaves/review.json          review sc1-review
+stage level0-accessors-and-leaves/port-remainder.json     port   sc1-port
+stage level0-accessors-and-leaves/review.json            review sc1-review
 gate sc1
-stage levels1-2-transfer-and-compute/port.json         port   sc2-port
-stage levels1-2-transfer-and-compute/review.json       review sc2-review
+stage levels1-2-transfer-and-compute/port-remainder.json port   sc2-port
+stage levels1-2-transfer-and-compute/review.json         review sc2-review
 gate sc2
-stage levels3-7-statements-and-passes/port.json        port   sc3-port
-stage levels3-7-statements-and-passes/review.json      review sc3-review
+stage levels3-7-statements-and-passes/port-remainder.json port  sc3-port
+stage levels3-7-statements-and-passes/review.json        review sc3-review
 gate sc3
-stage levels8-10-pass-drivers/port.json                port   sc4-port
-stage levels8-10-pass-drivers/review.json              review sc4-review
+stage levels8-10-pass-drivers/port-remainder.json        port   sc4-port
+stage levels8-10-pass-drivers/review.json                review sc4-review
 gate sc4
 say "CAMPAIGN DRIVER DONE"
