@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`73/384 ported; 73/384 audited`
+`81/384 ported; 81/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -69,6 +69,45 @@ arena, so the unchecked `static_cast` to the derived node is minting a `LoopMask
 `LowerSubIOpToSentient`, `LowerMulIOpToSentient`, the `If` shape law, `LowerConstantIndexToSentient`,
 `LowerConstantIntToSentient`) in `src/bridges/dataflow_ir_to_sentient/std_standard_to_sentient.rs`,
 and `OperandReuse`'s two getters (`getId`, `getAbsorbtionFlag`) in `vc_operand_reuse.rs`.
+
+⭐ AND ENTRIES 041-048 — the `dataflow.opaque` lowering and the two SCF/Standard predicate maps:
+`ExtendUnitNameToCorelet`, `isSameListOfUnits`, `isTargetL3` and `lowerOpaqueOperation` in
+`src/bridges/dataflow_ir_to_sentient/dfs_dataflow_to_sentient.rs`; `getSentientCmpIPredicate`, the
+`ForOpLowering` pattern registration and `SCFToSentientLoweringPass::runOnOperation` in
+`std_scf_to_sentient.rs`; and the second `getSentientCmpIPredicate` in
+`std_standard_to_sentient.rs`.
+
+⛔ THE ISLAND GREW FOR 044, AS THE BRIEF REQUIRES. `dataflow.opaque` carried no `dbgName`, and the
+reference forwards one into the `sentient.opaque` it creates (`DataflowToSentient.cpp:2006-2007`);
+`Dataflow.td:342` declares the attribute and IBM's own input writes it
+(`dcc/test/Conversion/DataflowToSentient/opaque.mlir:35`). `Op::Opaque` became a struct payload so
+the lowering takes one typed input, and the printer emits `dbgName = ".."` first as MLIR's key order
+requires.
+
+⚠️ AND THAT ANSWER KEY FALSIFIED THREE PRINTER LINES IN THE SENTIENT ISLAND. `sentient.opaque` was
+printing `func_name = "RECIPROCAL"` (the generated enum's spelling rather than the reference's
+lowercase), `{P0 = "0"}` for the register dictionaries (the address with no `R` — `ddcv1.cpp:3350`
+writes `"R" + startAddress` and `dcc/src/Dialect/Sentient/Utils.cpp:157` strips it back off by
+position), and both dictionaries unsorted. All three are fixed, and `opaque.mlir:18` is now
+reproduced byte for byte by a unit test.
+
+⛔ 042 HAS NO CALLER AT `a0d29abbed`. A grep of every `.cpp`/`.hpp`/`.h` in the authority tree finds
+`isSameListOfUnits` exactly once, at its own definition. It is ported anyway — this document's rule
+is that deciding a function is unnecessary is not the porter's judgement — and the note on it says so.
+
+⛔ 041'S ERROR ARM IS UNREACHABLE BY CONSTRUCTION, NOT UNCHECKED. `!unit->hasAttr("corelet")` is the
+failure, and `residency_of` sends both LX halves to `Residency::Corelet { .. }` unconditionally
+(`src/units.rs:594`), so the port takes a `Corelet` and the arm has no input. Both call sites
+(`:409-411`, `:709-713`) guard on `dst_comp == LXLU || dst_comp == LXSU` before calling, which is what
+the `LxHalf` enum is.
+
+⛔ AND 047 CANNOT LOWER A MODULE YET, BY DESIGN OF THE SCHEDULE RATHER THAN OF THE PORT. Its three
+patterns are `ForOpLowering::matchAndRewrite` (entry 225, unported), `IfOpLowering::matchAndRewrite`
+(`SCFToSentient.cpp:158`) and `YieldOpLowering::matchAndRewrite` (`:241`) — and the last two are in
+neither the 384 nor the 106 exclusions. The pass is wired in with a `todo!` naming the pattern that
+owes the rewrite, because the alternative is leaving an `scf` op in a module the Sentient rung is then
+asked to schedule. The `ConversionTarget` is a THREE-valued `Legality`: `applyPartialConversion` fails
+only on ops marked ILLEGAL, and `dataflow`/`affine`/`agen` are named by neither list.
 
 ⭐ AND ENTRIES 097-104 — the conditional-tree pair (`getNewDbgNameFromList`,
 `getLhsRhsOfEQPredicate`), `ConditionalSimplificationManager`'s destructor and
@@ -270,22 +309,22 @@ reference too — `getPrecisionInString` can only produce `int<n>`, `bf16`, `mxf
 - [x] **AUDIT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, line by line against the C++
 - [x] **PORT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, 2 lines
 - [x] **AUDIT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, line by line against the C++
-- [ ] **PORT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, 11 lines
-- [ ] **AUDIT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, line by line against the C++
-- [ ] **PORT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, 10 lines
-- [ ] **AUDIT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, line by line against the C++
-- [ ] **PORT 043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720`, 6 lines
-- [ ] **AUDIT 043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720`, line by line against the C++
-- [ ] **PORT 044/384** `lowerOpaqueOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984`, 27 lines
-- [ ] **AUDIT 044/384** `lowerOpaqueOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984`, line by line against the C++
-- [ ] **PORT 045/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:33`, 16 lines
-- [ ] **AUDIT 045/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:33`, line by line against the C++
-- [ ] **PORT 046/384** `ConversionPattern` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:70`, 0 lines
-- [ ] **AUDIT 046/384** `ConversionPattern` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:70`, line by line against the C++
-- [ ] **PORT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, 30 lines
-- [ ] **AUDIT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, line by line against the C++
-- [ ] **PORT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, 18 lines
-- [ ] **AUDIT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, line by line against the C++
+- [x] **PORT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, 11 lines
+- [x] **AUDIT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, line by line against the C++
+- [x] **PORT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, 10 lines
+- [x] **AUDIT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, line by line against the C++
+- [x] **PORT 043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720`, 6 lines
+- [x] **AUDIT 043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720`, line by line against the C++
+- [x] **PORT 044/384** `lowerOpaqueOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984`, 27 lines
+- [x] **AUDIT 044/384** `lowerOpaqueOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984`, line by line against the C++
+- [x] **PORT 045/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:33`, 16 lines
+- [x] **AUDIT 045/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:33`, line by line against the C++
+- [x] **PORT 046/384** `ConversionPattern` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:70`, 0 lines
+- [x] **AUDIT 046/384** `ConversionPattern` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:70`, line by line against the C++
+- [x] **PORT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, 30 lines
+- [x] **AUDIT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, line by line against the C++
+- [x] **PORT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, 18 lines
+- [x] **AUDIT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, line by line against the C++
 - [x] **PORT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, 9 lines
 - [x] **AUDIT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, line by line against the C++
 - [x] **PORT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, 10 lines

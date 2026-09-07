@@ -316,19 +316,37 @@ pub enum Op {
     /// `dataflow.opaque {func_name, read_write_register_dictionary, read_only_register_dictionary,
     /// parameter_dictionary}` — one op standing for a whole `.smc` body, which dcc splices.
     ///
-    /// ⛔⛔ THE TWO DICTIONARIES ARE CROSSED RELATIVE TO THEIR NAMES. `read_write_reg_map_` is filled
-    /// from the body's INTERNAL registers and `read_only_reg_map_` from the caller-bound INPUT/OUTPUT
-    /// ones (`ddcv1.cpp:3369-3391`).
-    Opaque {
-        /// `func_name=`.
-        func: OpaqueFunc,
-        /// `read_write_register_dictionary=` — the body's own scratch, from `internal_registers=`.
-        read_write: Vec<(RegName, RegAddr)>,
-        /// `read_only_register_dictionary=` — caller-bound, from `input_output_registers=`.
-        read_only: Vec<(RegName, RegAddr)>,
-        /// `parameter_dictionary=`, including the `prec` the op's own data format sets.
-        params: Vec<(ParamKey, ParamValue)>,
-    },
+    /// ⭐ THE FIELDS ARE THEIR OWN STRUCT because the rung above forwards ALL of them at once:
+    /// `lowerOpaqueOperation` (`DataflowToSentient.cpp:1984-2012`) reads the three dictionaries, the
+    /// func name and the `dbgName` and hands every one of them to `sentient::OpaqueOp::create`. A
+    /// five-field inline variant makes that one call five arguments; see [`Opaque`].
+    Opaque(Opaque),
+}
+
+/// WHAT ONE `dataflow.opaque` CARRIES — the whole `.smc` body's binding, in one value.
+///
+/// ⛔⛔ THE TWO DICTIONARIES ARE CROSSED RELATIVE TO THEIR NAMES. `read_write_reg_map_` is filled
+/// from the body's INTERNAL registers and `read_only_reg_map_` from the caller-bound INPUT/OUTPUT
+/// ones (`ddcv1.cpp:3369-3391`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opaque {
+    /// `func_name=`.
+    pub func: OpaqueFunc,
+    /// `read_write_register_dictionary=` — the body's own scratch, from `internal_registers=`.
+    pub read_write: Vec<(RegName, RegAddr)>,
+    /// `read_only_register_dictionary=` — caller-bound, from `input_output_registers=`.
+    pub read_only: Vec<(RegName, RegAddr)>,
+    /// `parameter_dictionary=`, including the `prec` the op's own data format sets.
+    pub params: Vec<(ParamKey, ParamValue)>,
+    /// `dbgName=` — ⛔ CARRIED BECAUSE THE RUNG ABOVE FORWARDS IT.
+    ///
+    /// `OptionalAttr<StrAttr>:$dbgName` (`Dataflow.td:342`), and `lowerOpaqueOperation` passes
+    /// `getDbgNameAttr(opaque_op)` straight into the `sentient.opaque` it builds
+    /// (`DataflowToSentient.cpp:2005-2010`). IBM's own input writes it —
+    /// `dataflow.opaque {dbgName="opaque_op #1", func_name= "reciprocal", ...}`
+    /// (`dcc/test/Conversion/DataflowToSentient/opaque.mlir:32`) — so without this field the port of
+    /// that pass has nothing to forward and the lowered op loses the only name a debugger has for it.
+    pub dbg_name: Option<String>,
 }
 
 /// ONE `dataflow` OP AS TEXT. The caller has already indented the opening line.
@@ -481,16 +499,24 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::memref(view_ty)
             );
         }
-        Op::Opaque {
-            func,
-            read_write,
-            read_only,
-            params,
-        } => {
+        Op::Opaque(opaque) => {
+            let Opaque {
+                func,
+                read_write,
+                read_only,
+                params,
+                dbg_name,
+            } = opaque;
+            // ⛔ `dbgName` SORTS FIRST — `d` before `f`. A `DictionaryAttr` is key-ordered, so the
+            // optional attribute is not a tail; it opens the dictionary when it is present.
+            let named = dbg_name
+                .as_ref()
+                .map_or_else(String::new, |name| format!("dbgName = \"{name}\", "));
             let _ = writeln!(
                 out,
-                "dataflow.opaque {{func_name = \"{}\", parameter_dictionary = {}, \
+                "dataflow.opaque {{{}func_name = \"{}\", parameter_dictionary = {}, \
                  read_only_register_dictionary = {}, read_write_register_dictionary = {}}}",
+                named,
                 func.spelling().to_lowercase(),
                 dictionary(params, ParamKey::spelling, |v| ParamValue::spelling(v)
                     .to_owned()),
