@@ -82,6 +82,7 @@ use crate::arch::{Arch, Bytes, Elements};
 use crate::bridges::dataflow_ir_to_sentient::agen_agen_to_sentient::ExtractIdx;
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::{self as dfir, Values};
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
 use crate::islands::sentient::{self, ProgramUnit, ProgramUnits};
 use crate::model::Model;
@@ -278,6 +279,9 @@ fn inherit_constants<A: Arch>(
                     value: *value,
                     result: fresh,
                     reg_locale: sen::RegType::Unknown,
+                    // ⛔ THE TYPE COMES FROM THE `arith.constant` IT REPLACES, and
+                    // `Op::Constant` is the `index` one (`arith.rs`).
+                    ty: ScalarTy::Index,
                 }));
             }
         }
@@ -321,6 +325,8 @@ fn mint_constants<A: Arch>(
                 value,
                 result: fresh,
                 reg_locale: sen::RegType::Unknown,
+                // ⛔ AN ADDRESS, AN INCREMENT AND A MASK ARE ALL `index` AT THIS RUNG.
+                ty: ScalarTy::Index,
             }));
         }
     }

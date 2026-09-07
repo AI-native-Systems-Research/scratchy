@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{ElemType, Vector};
+use crate::islands::dataflow_ir::ty::{ElemType, ScalarTy, Vector};
 
 /// WHICH CONNECTIVE - `ddl.condition_and` / `_or` / `_not`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,70 @@ pub enum LogicKind {
     Or,
     /// `arith.xori %c, true` - MLIR has no `not`, so a negation is an xor with true.
     Not,
+}
+
+/// AN INTEGER LITERAL AND THE WIDTH IT IS TYPED AT — what an `arith.constant` of integer type binds.
+///
+/// ⛔⛔ `i1` IS A CASE OF ITS OWN BECAUSE THE REFERENCE READS IT BACK DIFFERENTLY. An `i1` constant
+/// is an `IntegerAttr` of one signless bit, so `ConstantIntOp::value()` sign-extends it and `true`
+/// arrives as **-1**; `LowerConstantIntToSentient` therefore reads it through `BoolAttr::getValue()`
+/// instead, which is a `bool` (`StandardToSentient.cpp:361-366`). Splitting the case in the type is
+/// what lets that lowering pick the right reader without asking the value what it is at run time —
+/// and the reference's own output confirms which answer is intended: an `arith.constant false`
+/// lowers to `sentient.scalar_constant {value = 0 : si64} : i1`, a zero and not a minus one
+/// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:8`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntConst {
+    /// `arith.constant true` / `arith.constant false` — the `i1` a predicate is, and the one a
+    /// [`LogicKind::Not`] xors against.
+    ///
+    /// ⭐ MLIR PRINTS IT AS A KEYWORD, with no type: `%false = arith.constant false`
+    /// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir`).
+    Bool(bool),
+    /// `arith.constant N : i<bits>` at any other width.
+    Int {
+        /// The literal.
+        value: i64,
+        /// How many bits it is typed at.
+        bits: u32,
+    },
+}
+
+impl IntConst {
+    /// THE TYPE THE CONSTANT'S RESULT CARRIES.
+    #[must_use]
+    pub const fn ty(self) -> ScalarTy {
+        match self {
+            IntConst::Bool(_) => ScalarTy::Int(1),
+            IntConst::Int { bits, .. } => ScalarTy::Int(bits),
+        }
+    }
+}
+
+/// ONE TWO-OPERAND INTEGER ARITHMETIC OP — `arith.addi`, `arith.subi` or `arith.muli`.
+///
+/// ⭐ ONE STRUCT FOR THE THREE BECAUSE THE `.td` DECLARES THEM ALIKE: two operands and a result, all
+/// of one type. Which operation it is, is which variant of [`Op`] holds it, so the three lowerings
+/// stay three functions ([`Op::AddI`], [`Op::SubI`], [`Op::MulI`]) exactly as the reference keeps
+/// them three (`StandardToSentient.cpp:79`, `:90`, `:102`).
+///
+/// ⛔ NO ATTRIBUTE DICTIONARY, AND THAT IS A STATEMENT. `LowerMulIOpToSentient` alone copies the
+/// arith op's attributes onto the op it emits (`:108`) — `LowerSubIOpToSentient` says in a comment
+/// that it deliberately does not (`:96`: *"We do not use Arith Attributes"*). Nothing in `dcc/src`
+/// ever builds an `arith.muli`, no `arith.*` op in `dcc/test` carries an attribute dictionary, and
+/// the `AddIOp::create` calls in `AgenToSentient` set none, so the dictionary that copy transfers is
+/// empty at every site this pipeline can reach — and it is empty **by construction** here, which is
+/// the only form of that fact a type can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntBinary {
+    /// The value it binds.
+    pub result: Val,
+    /// `$lhs`.
+    pub lhs: Val,
+    /// `$rhs`.
+    pub rhs: Val,
+    /// The type of both operands and of the result.
+    pub ty: ScalarTy,
 }
 
 /// ONE `arith` OPERATION.
@@ -31,15 +95,30 @@ pub enum Op {
         value: i64,
     },
 
-    /// `arith.constant true` — the `i1` a negation xors against.
+    /// `arith.constant N : i<bits>` — an integer literal that is NOT an index.
     ///
-    /// (E) A SEPARATE OP BECAUSE THE TYPE DIFFERS. `Op::Constant` prints `: index`, and feeding that
-    /// to `arith.xori .. : i1` is "use of value expects different type than prior uses: 'i1' vs
+    /// (E) A SEPARATE OP BECAUSE THE TYPE DIFFERS. [`Op::Constant`] prints `: index`, and feeding
+    /// that to `arith.xori .. : i1` is "use of value expects different type than prior uses: 'i1' vs
     /// 'index'".
-    True {
-        /// The i1 it binds.
+    ///
+    /// ⭐ AND THE REFERENCE SPLITS IT THE SAME WAY: `arith::ConstantIndexOp` and
+    /// `arith::ConstantIntOp` are two op classes with two lowerings
+    /// (`StandardToSentient.cpp:347` and `:358`), dispatched apart at `:443-451`.
+    ConstantInt {
+        /// The value it binds.
         result: Val,
+        /// The literal and the width it is typed at.
+        value: IntConst,
     },
+
+    /// `arith.addi` — ⛔ THE OPERANDS, NOT AN ATTRIBUTE DICTIONARY. See [`IntBinary`].
+    AddI(IntBinary),
+
+    /// `arith.subi`.
+    SubI(IntBinary),
+
+    /// `arith.muli`.
+    MulI(IntBinary),
 
     /// `arith.cmpi eq, %iv, <bound> : index` — one loop-position predicate.
     ///
@@ -96,9 +175,17 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::val(*result)
             );
         }
-        Op::True { result } => {
-            let _ = writeln!(out, "{} = arith.constant true", print::val(*result));
+        Op::ConstantInt { result, value } => {
+            let literal = match value {
+                // ⭐ NO TYPE ON THE BOOLEAN FORM — `arith.constant true`, not `... : i1`.
+                IntConst::Bool(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+                IntConst::Int { value, bits } => format!("{value} : i{bits}"),
+            };
+            let _ = writeln!(out, "{} = arith.constant {literal}", print::val(*result));
         }
+        Op::AddI(op) => int_binary(out, "arith.addi", op),
+        Op::SubI(op) => int_binary(out, "arith.subi", op),
+        Op::MulI(op) => int_binary(out, "arith.muli", op),
         Op::Compare {
             result,
             iv,
@@ -146,4 +233,16 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             );
         }
     }
+}
+
+/// ONE `arith` INTEGER BINARY AS TEXT — `%r = <mnemonic> %lhs, %rhs : <ty>`.
+fn int_binary(out: &mut String, mnemonic: &str, op: &IntBinary) {
+    let _ = writeln!(
+        out,
+        "{} = {mnemonic} {}, {} : {}",
+        print::val(op.result),
+        print::val(op.lhs),
+        print::val(op.rhs),
+        op.ty.spelling()
+    );
 }

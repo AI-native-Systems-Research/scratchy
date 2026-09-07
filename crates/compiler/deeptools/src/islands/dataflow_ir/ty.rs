@@ -149,6 +149,43 @@ impl ElemType {
     }
 }
 
+/// THE TYPE OF ONE SCALAR THE PROGRAM COMPUTES WITH — `AnyTypeOf<[AnyInteger, Index]>`.
+///
+/// ⭐⭐ IT IS THE OPERAND **AND** RESULT TYPE OF EVERY SCALAR OP AT BOTH RUNGS. `arith.addi`,
+/// `arith.subi`, `arith.muli` and `arith.constant` carry it below;
+/// `sentient.scalar_add`/`_sub`/`_mul` declare it three times over with
+/// `SameOperandsAndResultType`, and `sentient.scalar_constant` prints it as its result type
+/// (`SentientOps.td:700`, `:801`, `:816`, `:848`). One type serves both because the lowering's
+/// whole job is to carry it across unchanged — `AddOp::create(builder, loc,
+/// addi_op.getLhs().getType(), ...)` (`StandardToSentient.cpp:81`) passes the operand's type in as
+/// the result type.
+///
+/// ⛔ NOT [`ElemType`]. That is the element format of a tensor or a vector — it has `f16`, `bf16`
+/// and the fp8 formats in it, and it has no `index` at all. A loop counter is not an element of
+/// anything, and the two sets meet only at `Int`.
+///
+/// ⛔ NO `AnyFloat`. `scalar_constant`'s result admits one (`SentientOps.td:850`) and prints its
+/// value as a hex bit pattern when it is a float (`SentientOps.cpp:1704-1706`); nothing at this rung
+/// emits one, so the case is absent rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarTy {
+    /// `index` — what every loop bound, address and induction variable is typed.
+    Index,
+    /// `i<bits>` — a signless integer. `i1` is the type of a predicate.
+    Int(u32),
+}
+
+impl ScalarTy {
+    /// HOW MLIR SPELLS IT.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        match self {
+            ScalarTy::Index => "index".to_owned(),
+            ScalarTy::Int(bits) => format!("i{bits}"),
+        }
+    }
+}
+
 /// A `memref<AxBx...xT>` — a multi-dimensional view over a linear region.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemRef {

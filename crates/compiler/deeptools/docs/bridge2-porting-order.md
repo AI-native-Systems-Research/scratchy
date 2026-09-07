@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`25/384 ported; 25/384 audited`
+`33/384 ported; 33/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -51,6 +51,11 @@ and `AccessDetailsAffineComposite`'s constructor plus its time setters (`setTime
 `src/bridges/dataflow_ir_to_sentient/agen_access_details.rs`. Unticked by their own audits and
 awaiting re-port with their emission: `setldtype`, `generateSetSendDestinationStmts`,
 `getLoadConsumer`.
+
+⭐ AND ENTRIES 049-056 — the six `StandardToSentient` scalar lowerings (`LowerAddIOpToSentient`,
+`LowerSubIOpToSentient`, `LowerMulIOpToSentient`, the `If` shape law, `LowerConstantIndexToSentient`,
+`LowerConstantIntToSentient`) in `src/bridges/dataflow_ir_to_sentient/std_standard_to_sentient.rs`,
+and `OperandReuse`'s two getters (`getId`, `getAbsorbtionFlag`) in `vc_operand_reuse.rs`.
 
 ⭐ 001/384 MOVED TO ITS OWN TRANSLATION UNIT'S HOME: `lower_affine_yield` was living in
 `dataflow_ir_to_sentient/mod.rs`, and `crustify/crates.json` homes `e001_matchAndRewrite` in
@@ -69,6 +74,13 @@ time-loop trip rule is `Helper.cpp:1815-1820`. And 001's note credited the decli
 `AffineParallelLowering` pattern — **dcc's copy of the pass registers no such pattern**
 (`AffineToStandard.cpp:198-206`); the reference's comment is upstream MLIR's, and dcc leaves the
 terminator alone because `scf` is already legal in its target.
+
+⛔ **052 IS A COMMENT, NOT A FUNCTION** — `StandardToSentient.cpp:159` is the line
+`// return If(lhs) {If(rhs) true_val; else false_val} else false_val;` inside
+`ConstructIFRecursively`'s `and` branch, which the extractor read as a 0-line function called `If`.
+What it states is the SHAPE a conjunction lowers to, and that is what `NestedIf` holds; the recursion
+around it stays entry 338's. ⛔ The comment names `lhs` as the outer `if` while the code returns
+`rhs_if_op` (`:175`) — the emitted nest has the RIGHT-hand conjunct outermost.
 
 
 ## Level 0
@@ -169,22 +181,22 @@ terminator alone because `scf` is already legal in its target.
 - [ ] **AUDIT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, line by line against the C++
 - [ ] **PORT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, 18 lines
 - [ ] **AUDIT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, line by line against the C++
-- [ ] **PORT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, 9 lines
-- [ ] **AUDIT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, line by line against the C++
-- [ ] **PORT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, 10 lines
-- [ ] **AUDIT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, line by line against the C++
-- [ ] **PORT 051/384** `LowerMulIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:102`, 9 lines
-- [ ] **AUDIT 051/384** `LowerMulIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:102`, line by line against the C++
-- [ ] **PORT 052/384** `If` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:159`, 0 lines
-- [ ] **AUDIT 052/384** `If` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:159`, line by line against the C++
-- [ ] **PORT 053/384** `LowerConstantIndexToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:347`, 8 lines
-- [ ] **AUDIT 053/384** `LowerConstantIndexToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:347`, line by line against the C++
-- [ ] **PORT 054/384** `LowerConstantIntToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:358`, 15 lines
-- [ ] **AUDIT 054/384** `LowerConstantIntToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:358`, line by line against the C++
-- [ ] **PORT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, 6 lines
-- [ ] **AUDIT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, line by line against the C++
-- [ ] **PORT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, 6 lines
-- [ ] **AUDIT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, line by line against the C++
+- [x] **PORT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, 9 lines
+- [x] **AUDIT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, line by line against the C++
+- [x] **PORT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, 10 lines
+- [x] **AUDIT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, line by line against the C++
+- [x] **PORT 051/384** `LowerMulIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:102`, 9 lines
+- [x] **AUDIT 051/384** `LowerMulIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:102`, line by line against the C++
+- [x] **PORT 052/384** `If` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:159`, 0 lines
+- [x] **AUDIT 052/384** `If` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:159`, line by line against the C++
+- [x] **PORT 053/384** `LowerConstantIndexToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:347`, 8 lines
+- [x] **AUDIT 053/384** `LowerConstantIndexToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:347`, line by line against the C++
+- [x] **PORT 054/384** `LowerConstantIntToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:358`, 15 lines
+- [x] **AUDIT 054/384** `LowerConstantIntToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:358`, line by line against the C++
+- [x] **PORT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, 6 lines
+- [x] **AUDIT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, line by line against the C++
+- [x] **PORT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, 6 lines
+- [x] **AUDIT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, line by line against the C++
 - [ ] **PORT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, 2 lines
 - [ ] **AUDIT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, line by line against the C++
 - [ ] **PORT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, 2 lines
