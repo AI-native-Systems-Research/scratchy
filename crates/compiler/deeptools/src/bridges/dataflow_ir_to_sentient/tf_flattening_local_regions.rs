@@ -112,7 +112,7 @@ pub struct LocalOpNodeId(OperationNodeId);
 /// WHICH REGION OF ITS PARENT AN OPERATION SITS IN — `is_in_region_num`.
 ///
 /// ⭐ AN INDEX, NOT A COUNT AND NOT A FLAG. `traverseRegion` recurses with the loop counter of
-/// `op.getNumRegions()` (`FlatteningLocalRegions.cpp:145-147`), so a node carries the index of the
+/// `op.getNumRegions()` (`FlatteningLocalRegions.cpp:144-146`), so a node carries the index of the
 /// PARENT'S region it was found in. ⚠️ The reference's field is an `int` and `compute` passes
 /// `false` for the uniformized op's own regions (`:164`), which is 0; every other site passes a
 /// non-negative counter, so `u32` is total over the values that can reach it.

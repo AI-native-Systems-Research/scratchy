@@ -78,9 +78,13 @@ use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, de
 /// ⛔⛔ THE `llvm_unreachable` IS THE TYPE, NOT A BRANCH. Taking an `Operation *` means the third arm
 /// has to exist and be undefined behaviour; taking this enum means there is no third arm to write.
 /// The classification that could fail happens once, in [`Loop::of`], where "not a loop" is a
-/// well-formed **answer** rather than a stop — and the reference agrees that it is an answer, because
-/// its own walk asks the same question with a `dyn_cast` before it ever calls this
-/// (`:96-106`).
+/// well-formed **answer** rather than a stop.
+///
+/// ⚠️ THE REFERENCE DOES NOT AGREE THAT IT IS AN ANSWER — it asks the same question earlier and
+/// aborts on it too. `runOnOperation`'s walk classifies the block argument's parent op with the same
+/// two `dyn_cast`s and closes with `else llvm_unreachable("unsupported loop type")` (`:96-108`), so
+/// the undefined behaviour is stated twice rather than guarded once. What makes it unreachable is
+/// upstream of both: the parent region of a `vectorchain.shuffle` operand's block argument IS a loop.
 ///
 /// ⭐ THE KIND, PLUS ONLY WHAT THE REFERENCE ASKS OF IT. `performFullUnroll(scf::ForOp)` reads the
 /// loop's three bounds and nothing else; `performFullUnroll(affine::AffineForOp)` reads NOTHING at
@@ -161,7 +165,7 @@ impl TripCount {
 /// WHAT `performFullUnroll` DECIDED — its `LogicalResult`, and the request behind a success.
 ///
 /// ⛔ NOT A `Result`. `LogicalResult` is a two-state domain answer that this pipeline's callers ask
-/// `.failed()` of (`:135`), not an error to propagate — and this crate freezes `Result` in the
+/// `.failed()` of (`:121`), not an error to propagate — and this crate freezes `Result` in the
 /// bridge at zero (`crates/targets/spyre/tests/dfir_never_runtime_refuses.rs`).
 ///
 /// ⭐⭐ THE TWO SUCCESS ARMS CARRY THE **REQUEST**, WHICH IS WHAT THIS FUNCTION EMITS. Neither
@@ -189,12 +193,12 @@ pub enum Unroll {
     /// `for_op->emitError("Non-constant trip bound for unrolling"); return failure();` (`:153-156`).
     ///
     /// ⭐ THE MESSAGE IS THE REFERENCE'S. The caller turns any failure into
-    /// `emitError("Cannot unroll candidate")` and `signalPassFailure()` (`:134-137`), so this variant
+    /// `emitError("Cannot unroll candidate")` and `signalPassFailure()` (`:121-124`), so this variant
     /// is a stop for the compilation, not for the port.
     NonConstantTripBound,
     /// A CONSTANT TRIP COUNT THAT IS NOT AN UNROLL FACTOR — see [`TripCount`] for the divergence.
     EmptyOrReversedRange,
-    /// `if (step <= 0) return std::nullopt;` (`:180`) — a non-advancing or backward step.
+    /// `if (step <= 0) return std::nullopt;` (`:179`) — a non-advancing or backward step.
     ///
     /// ⭐ ITS OWN VARIANT THOUGH THE REFERENCE FOLDS IT INTO `nullopt`, because it is a different
     /// fact about the loop from "the bound is not a constant" and both reach the same `failure()`.
@@ -202,7 +206,7 @@ pub enum Unroll {
 }
 
 impl Unroll {
-    /// `LogicalResult::failed()` — the one question `runOnOperation` asks of this result (`:135`).
+    /// `LogicalResult::failed()` — the one question `runOnOperation` asks of this result (`:121`).
     #[must_use]
     pub const fn failed(self) -> bool {
         match self {
@@ -273,7 +277,7 @@ pub fn perform_full_unroll(loop_op: Loop, scope: &[DfirOp]) -> Unroll {
 /// rather than a type query. Consistent with the vendor's only test for this pass taking the affine
 /// path throughout (`dcc/test/Transform/LoopUnrolForShuffleOp/ldcvti_pattern.mlir`).
 ///
-/// ⭐ ALL THREE ARE FETCHED BEFORE ANY IS CHECKED, WHICH IS WHY THE TUPLE IS THERE. `:171-174` looks
+/// ⭐ ALL THREE ARE FETCHED BEFORE ANY IS CHECKED, WHICH IS WHY THE TUPLE IS THERE. `:169-173` looks
 /// up every bound and only then tests the disjunction; a `?` chain would stop at the first
 /// non-constant one. The answer is the same either way — `getDefiningOp` has no side effects — but
 /// the tuple keeps the reference's shape readable beside its line numbers.
@@ -289,11 +293,11 @@ fn constant_trip_count(lo: Val, hi: Val, step: Val, scope: &[DfirOp]) -> TripBou
         signless_int_constant(hi, scope),
         signless_int_constant(step, scope),
     ) else {
-        // `:174` — `if (!lb_const || !ub_const || !step_const) return std::nullopt;`
+        // `:173` — `if (!lb_const || !ub_const || !step_const) return std::nullopt;`
         return TripBound::NoConstant;
     };
 
-    // `:180` — `if (step <= 0) return std::nullopt;`
+    // `:179` — `if (step <= 0) return std::nullopt;`
     if step <= 0 {
         return TripBound::NonPositiveStep;
     }
@@ -392,7 +396,7 @@ mod unit_tests {
     }
 
     /// `affine.for %arg7 = 0 to 2 { }` — the vendor's own outermost candidate,
-    /// `dcc/test/Transform/LoopUnrolForShuffleOp/ldcvti_pattern.mlir:130`.
+    /// `dcc/test/Transform/LoopUnrolForShuffleOp/ldcvti_pattern.mlir:144`.
     fn the_vendor_candidate() -> DfirOp {
         DfirOp::Affine(affine::Op::For {
             iv: Val(7),
@@ -490,7 +494,7 @@ mod unit_tests {
 
     /// 🎯 110/384 — AND ONE NON-CONSTANT BOUND IS ENOUGH, WHICHEVER OF THE THREE IT IS.
     ///
-    /// `if (!lb_const || !ub_const || !step_const) return std::nullopt;` (`:174`) is a disjunction,
+    /// `if (!lb_const || !ub_const || !step_const) return std::nullopt;` (`:173`) is a disjunction,
     /// so each bound is separately fatal — and a bound no op defines at all (a block argument, whose
     /// `getDefiningOp()` is null) is the same answer as one defined by the wrong op.
     #[test]
@@ -540,7 +544,7 @@ mod unit_tests {
 
     /// 🎯 110/384 — A STEP THAT DOES NOT ADVANCE IS REFUSED.
     ///
-    /// `if (step <= 0) return std::nullopt;` (`:180`) — and `true` is one of those steps, because
+    /// `if (step <= 0) return std::nullopt;` (`:179`) — and `true` is one of those steps, because
     /// `ConstantIntOp::value()` sign-extends a one-bit `1` to **-1**.
     #[test]
     fn a_non_advancing_step_is_refused() {
@@ -613,7 +617,7 @@ mod unit_tests {
 
     /// 🎯 109/384 — ONLY THE REFUSALS STOP THE PASS.
     ///
-    /// `if (performFullUnroll(candidate).failed())` is the caller's one question (`:135`); it turns
+    /// `if (performFullUnroll(candidate).failed())` is the caller's one question (`:121`); it turns
     /// any decline into `emitError("Cannot unroll candidate")` and `signalPassFailure()`.
     #[test]
     fn failure_is_exactly_the_three_declines() {

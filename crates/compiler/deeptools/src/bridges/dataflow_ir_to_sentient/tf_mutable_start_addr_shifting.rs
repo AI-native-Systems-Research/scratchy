@@ -128,7 +128,7 @@ pub const MAX_IMMUTABLE_SIZE: Option<AddrRange> = None;
 /// register names `2^bitSize` of them, each granule is one stick, a stick is `bytesPerStick` bytes,
 /// and a byte is 8 bits. So the product is the addressable span in bits — the unit the flag documents
 /// and the unit `ad.getElementWidth()` divides. `bytesPerStick` is 128 on both arches
-/// (`sysdef.cpp:213`), so the span is `2^30 * 1024` bits on RCUDD1A and `2^32 * 1024` on SEN1P5 —
+/// (`sysdef.cpp:206`), so the span is `2^30 * 1024` bits on RCUDD1A and `2^32 * 1024` on SEN1P5 —
 /// 128 GiB and 512 GiB of external memory.
 ///
 /// # ⛔ THE PORT DOES NOT USE `A::EBR_GRANULARITY`, AND THE REFERENCE DOES NOT EITHER
@@ -170,7 +170,7 @@ mod unit_tests {
     ///
     /// `{8, 30, 32, UNSIGNED, true}` for L3LU and L3SU under `coreArch <= RCUDD1A_ISA`, and
     /// `{16, 32, 32, UNSIGNED, true}` above it (`sys-arch-spec/sysdef.cpp:313-360`), with
-    /// `bytesPerStick = 128` on both (`:213`).
+    /// `bytesPerStick = 128` on both (`:206`).
     #[test]
     fn the_derived_range_is_the_ebr_span_in_bits() {
         for comp in [L3Half::Load, L3Half::Store] {
@@ -240,7 +240,7 @@ mod unit_tests {
         }
     }
 
-    /// 🎯 116/384 — AND THE RANGE CONVERTS TO ELEMENTS BY THE ELEMENT WIDTH, AS `:435` DIVIDES IT.
+    /// 🎯 116/384 — AND THE RANGE CONVERTS TO ELEMENTS BY THE ELEMENT WIDTH, AS `:437` DIVIDES IT.
     #[test]
     fn the_range_in_elements_is_the_reference_division() {
         let range = max_immutable_range::<Dd2>(L3Half::Load);
