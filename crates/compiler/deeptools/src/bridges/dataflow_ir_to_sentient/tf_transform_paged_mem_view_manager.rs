@@ -105,7 +105,7 @@ impl<'a> PagedMemView<'a> {
 /// WHICH TRANSFORMATION A PAGED VIEW GETS — one variant per leaf of the `TPMVBase` hierarchy.
 ///
 /// ⛔ SIX VARIANTS BECAUSE THE REFERENCE CONSTRUCTS SIX DIFFERENT CLASSES
-/// (`TransformPagedMemViewManager.cpp:32`, `:38`, `:46`, `:50`, `:54`, `:58`, `:62`), and which one
+/// (`TransformPagedMemViewManager.cpp:33`, `:38`, `:45`, `:49`, `:53`, `:57`, `:62`), and which one
 /// it picks decides which `initialize`/`createNewMemOp` override runs. Collapsing them would make
 /// [`run`] a function that answers the same thing every time. See
 /// [`super::tf_transform_paged_mem_view_impl::TpmvBase`].
@@ -113,14 +113,14 @@ impl<'a> PagedMemView<'a> {
 pub enum Tpmv<'a> {
     /// `TPMVVectorLoad tpmv(op, comp_);` (`:38`).
     VectorLoad(TpmvVectorLoad<'a>),
-    /// `TPMVVectorStore tpmv(op, comp_);` (`:50`).
+    /// `TPMVVectorStore tpmv(op, comp_);` (`:49`).
     VectorStore(TpmvVectorStore<'a>),
-    /// `TPMVVectorLoadStore tpmv(load_op, store_op, comp_);` (`:32`, `:46`) — reached from BOTH
+    /// `TPMVVectorLoadStore tpmv(load_op, store_op, comp_);` (`:33`, `:45`) — reached from BOTH
     /// vector arms.
     VectorLoadStore(TpmvVectorLoadStore<'a>),
-    /// `TPMVCompositeLoad tpmv(op, comp_);` (`:54`).
+    /// `TPMVCompositeLoad tpmv(op, comp_);` (`:53`).
     CompositeLoad(TpmvCompositeLoad<'a>),
-    /// `TPMVCompositeStore tpmv(op, comp_);` (`:58`).
+    /// `TPMVCompositeStore tpmv(op, comp_);` (`:57`).
     CompositeStore(TpmvCompositeStore<'a>),
     /// `TPMVCompositeLoadStore tpmv(op, comp_);` (`:62`).
     CompositeLoadStore(TpmvCompositeLoadStore<'a>),
@@ -131,7 +131,7 @@ pub enum Tpmv<'a> {
 /// ⛔ THE TWO FAILURE CASES ARE DIFFERENT ABORTS IN THE REFERENCE AND ARE KEPT APART:
 /// `DT_CHECK(paged_mem_view_->hasOneUse() && "expecting paged memory view to have one user")`
 /// (`TransformPagedMemViewManager.cpp:23-24`) and
-/// `llvm_unreachable("memory operation is not supported for static paged tensors")` (`:64-65`).
+/// `llvm_unreachable("memory operation is not supported for static paged tensors")` (`:65-66`).
 /// Both are hard stops there; here they are values, because the crate never runtime-refuses
 /// (`CLAUDE.md`) and the caller — `TransformPagedMemView.cpp:49-73`, entry 350 — is what decides
 /// what to say about them.
@@ -287,7 +287,7 @@ impl<'a> TpmvManager<'a> {
     /// # ⭐ THE TWO THINGS WITH NO COUNTERPART
     ///
     /// `DT_CHECK(op)` (`:26`) asserts the user pointer is non-null; a use here IS an op, so there is
-    /// nothing to check. And `return LogicalResult::failure()` (`:67`) is unreachable — every arm
+    /// nothing to check. And `return LogicalResult::failure()` (`:68`) is unreachable — every arm
     /// returns and the `else` is `llvm_unreachable` — so it exists only because C++ cannot see that.
     pub fn run(&self, scope: &'a [DfirOp]) -> Selection<'a> {
         // `DT_CHECK(paged_mem_view_->hasOneUse() && ..)`, then
@@ -687,7 +687,7 @@ mod unit_tests {
         assert_eq!(manager(&scope[0]).run(&scope), Selection::NotOneUser);
     }
 
-    /// ⛔ `llvm_unreachable("memory operation is not supported for static paged tensors")` (`:64-65`)
+    /// ⛔ `llvm_unreachable("memory operation is not supported for static paged tensors")` (`:65-66`)
     /// — the single user is an op that reads a view but is none of the five memory classes. The
     /// match has no wildcard, so a newly declared island op cannot fall in here by accident.
     #[test]

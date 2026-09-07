@@ -588,7 +588,7 @@ pub fn clone_mem_view_if_non_paged(
 ///
 /// # ⭐⭐ THE OVERRIDE IS THE CAST AND A FORWARD, AND THE SUBSTANCE IS THE DIALECT'S
 ///
-/// `agen::VectorLoadOp::getUseChain` (`Agen.cpp:114-134`) is where the walk lives, and it is
+/// `agen::VectorLoadOp::getUseChain` (`Agen.cpp:115-136`) is where the walk lives, and it is
 /// [`vector_load_use_chain`] — ported with entry 129, which needs the same chain to tear down. This
 /// is `TPMVBase::use_chain`'s override (entry 133), so it answers in the same [`UseChain`] the base
 /// does: the base says [`UseChain::None`], and a vector load says [`UseChain::ConsumerWard`].
@@ -617,14 +617,13 @@ pub fn get_use_chain<'s>(mem_op: VectorLoadOp<'s>, scope: &'s [DfirOp]) -> UseCh
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// `agen::VectorLoadOp::cloneUseChainToNewOp` — the engine entries 127 and 128 share
-/// (`Agen.cpp:136`).
+/// (`Agen.cpp:138-159`).
 ///
 /// ```cpp
 /// void VectorLoadOp::cloneUseChainToNewOp(OpBuilder& builder, Operation* new_op) {
-///   assert(isa<VectorLoadOp>(new_op) && "Expected a vector load op");
+///   assert(isa<VectorLoadOp>(new_op));
 ///   auto use_chain = getUseChain();
-///   Value prev_val = nullptr;
-///   Value prev_cloned_val = new_op->getResult(0);
+///   Value prev_val = nullptr, prev_cloned_val = new_op->getResult(0);
 ///   for (int i = 0, last_op_idx = use_chain.size() - 1; i <= last_op_idx; ++i) {
 ///     // Clone all the ops except the first one. That one is covered by mem_op.
 ///     if (prev_val) {
@@ -660,7 +659,7 @@ fn clone_use_chain_to_new_op(
     new_result: Val,
 ) -> Vec<DfirOp> {
     // ⛔ NOTHING TO CLONE UNLESS THE CHAIN RUNS CONSUMER-WARD FROM THE LOAD. `getUseChain`'s own
-    // "Empty if there isn't a use chain" (`TransformPagedMemViewImpl.hpp:322`) is the whole answer
+    // "Empty if there isn't a use chain" (`TransformPagedMemViewImpl.hpp:323-324`) is the whole answer
     // for a load with no linear chain, and a producer-ward chain belongs to a STORE
     // (`VectorStoreOp::getUseChain`) — this is the load's method, so it is not one it can be handed.
     let UseChain::ConsumerWard(use_chain) = use_chain else {
@@ -755,7 +754,7 @@ pub struct NewMemOp {
 ///
 /// **128/384** `TPMVVectorLoad::createNewMemOp` —
 /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684` (9L), whose
-/// first line is `agen::VectorLoadOp::cloneWithNewAccessInfo` (`Agen.cpp:161-179`).
+/// first line is `agen::VectorLoadOp::cloneWithNewAccessInfo` (`Agen.cpp:161-169`).
 ///
 /// ```cpp
 /// Operation *TPMVVectorLoad::createNewMemOp(OpBuilder &builder, Operation *mem_op,
@@ -772,7 +771,7 @@ pub struct NewMemOp {
 ///   return new_load_op;
 /// }
 ///
-/// // Agen.cpp:161-179
+/// // Agen.cpp:161-169
 /// agen::VectorLoadOp VectorLoadOp::cloneWithNewAccessInfo(
 ///     OpBuilder& builder, const Value mem_view, const AffineMap& subscripts_map,
 ///     ValueRange indices) {
@@ -863,7 +862,7 @@ pub struct VectorLoadOp<'a> {
     pub result: Val,
     /// `getResult().getType()` — the type a rebuilt load inherits.
     ///
-    /// ⭐ HERE BECAUSE `cloneWithNewAccessInfo` READS IT (`Agen.cpp:161-179`, entry 128): the new
+    /// ⭐ HERE BECAUSE `cloneWithNewAccessInfo` READS IT (`Agen.cpp:161-169`, entry 128): the new
     /// load keeps the original's result type and replaces only the access. On a typed
     /// `VectorLoadOp` that read is infallible, which is the same reason `result` is here.
     pub ty: Vector,
@@ -919,8 +918,8 @@ impl<'a> VectorLoadOp<'a> {
 ///
 /// ⭐⭐ AND THE DIRECTION IS EXACTLY WHAT THE TWO ERASE LOOPS DISAGREE ON. `VectorLoadOp::eraseOpAndUseChain`
 /// walks the chain BACKWARDS (`for (int idx = use_chain.size() - 1; idx >= 0; --idx)`,
-/// `Agen.cpp:176-177`) while `VectorStoreOp::eraseOpAndUseChain` walks it FORWARDS
-/// (`for (auto &o : use_chain)`, `:257`) — two loops that look contradictory and are the same rule:
+/// `Agen.cpp:177-178`) while `VectorStoreOp::eraseOpAndUseChain` walks it FORWARDS
+/// (`for (auto &o : use_chain)`, `:258`) — two loops that look contradictory and are the same rule:
 /// **tear the chain down consumer-first**, so no erased value still has a live use. [`Self::consumer_first`]
 /// is that one rule, and a chain that cannot say which way it runs cannot be handed to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -949,7 +948,7 @@ impl<'a> UseChain<'a> {
     /// THE CHAIN IN TEARDOWN ORDER — every consumer ahead of what it reads.
     ///
     /// This is what both `eraseOpAndUseChain` loops compute, each in the way its own chain's
-    /// direction demands (`Agen.cpp:176-177` reversed, `:257` as-is).
+    /// direction demands (`Agen.cpp:177-178` reversed, `:258` as-is).
     #[must_use]
     pub fn consumer_first(&self) -> Vec<&'a DfirOp> {
         match self {
@@ -988,7 +987,7 @@ impl<'a> UseChain<'a> {
 /// ⛔⛔ ITS THREE ASSERTS ARE THE SAME QUESTION, AND [`UseChain::None`] IS THEIR ANSWER. A chain is
 /// linear only while each op binds exactly one result that exactly one op reads; the moment either
 /// fails there is no chain to return, which is the contract's own "Empty if there isn't a use chain"
-/// (`TransformPagedMemViewImpl.hpp:322`) rather than an abort. The trailing
+/// (`TransformPagedMemViewImpl.hpp:323-324`) rather than an abort. The trailing
 /// `use_chain.size() >= 2` is the same test one step later — a load nothing reads.
 ///
 /// ⭐ AND THAT MAKES THE REFERENCE'S DEAD BRANCH LIVE. `eraseOpAndUseChain` opens
@@ -1047,7 +1046,7 @@ fn vector_load_use_chain<'a>(load: VectorLoadOp<'a>, scope: &'a [DfirOp]) -> Use
 ///
 /// ⭐⭐ A DELETE LIST, NOT AN ERASE — AND THE ORDER IS THE REFERENCE'S. This crate does not mutate a
 /// program in place, so the port returns the ops to remove in the order `eraseOpAndUseChain` would
-/// remove them: consumer-first (`Agen.cpp:176-177`). Entry 038 already established the shape —
+/// remove them: consumer-first (`Agen.cpp:177-178`). Entry 038 already established the shape —
 /// [`super::agen_helper::add_load_chain_to_delete_list`] returns the send before the shuffle that
 /// feeds it for the same reason.
 ///
@@ -1587,7 +1586,7 @@ impl<'p> TpmvBase<'p> {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// THE VECTOR-TRANSFER BRANCH OF THE HIERARCHY — `TPMVVector`
-/// (`dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389-395`).
+/// (`dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:387-392`).
 ///
 /// ```cpp
 /// class TPMVVector : public TPMVBase {
@@ -1742,14 +1741,23 @@ impl<'p> TpmvVectorLoadStore<'p> {
     ///
     /// The mem-initializer forwards `mem_op` and `comp` and nothing else, and the body is empty — so
     /// the store its caller went to the trouble of finding is not kept anywhere.
-    /// `TPMVVectorLoadStore::initialize` re-derives it: [`store_op_from_load_store_pattern`] (entry
-    /// 130, `Impl.cpp:843-848`) walks the load result's single user and casts it, then
-    /// `mem_ops_.push_back` appends it (`Impl.cpp:512-520`). Keeping the parameter and naming what
-    /// happens to it is the faithful port; quietly dropping it from the signature would hide that
-    /// entry 130 exists to undo this.
+    /// `TPMVVectorLoadStore::initialize` re-derives it: it re-asserts that `mem_ops_` still holds
+    /// exactly the load (`DT_CHECK(mem_ops_.size() == 1)`, `Impl.cpp:756`) and then calls
+    /// [`store_op_from_load_store_pattern`] (entry 130, `Impl.cpp:843-850`) to walk the load
+    /// result's single user and cast it (`Impl.cpp:766`).
+    ///
+    /// ⭐ AND WHAT THE STORE BECOMES IS A SECOND `TPMVInfo`, NOT A SECOND `mem_ops_` ENTRY:
+    /// `tpmv_info_.emplace_back(mem_view_dst, store_op.getAffineMapAttr().getValue(),
+    /// MemoryOperandIndex::kDirDst)` (`Impl.cpp:769-770`), followed by the store's `getMapIndices`
+    /// (`:771-772`). `mem_ops_` is never appended to anywhere in the file — the one place it grows a
+    /// new value is `createIterArgsForConditionals` REPLACING its entries through an `IRMapping`
+    /// after a clone (`Impl.cpp:505-508`), which is a remap of the same count.
+    ///
+    /// Keeping the parameter and naming what happens to it is the faithful port; quietly dropping it
+    /// from the signature would hide that entry 130 exists to undo this.
     ///
     /// ⛔ WHICH OP IS `mem_op` DEPENDS ON WHICH ARM CALLED — always the LOAD in the reference
-    /// (`TransformPagedMemViewManager.cpp:32`, `:46`), even in the arm whose user search found the
+    /// (`TransformPagedMemViewManager.cpp:33`, `:45`), even in the arm whose user search found the
     /// store. See [`super::tf_transform_paged_mem_view_manager::run`].
     #[must_use]
     pub fn new(
@@ -2465,7 +2473,7 @@ scf.if %2 {
     ///
     /// ⛔ AND A FORK IS NOT A SHORTER CHAIN, IT IS NO CHAIN. The reference asserts one use per value
     /// and aborts otherwise; the answer here is [`UseChain::None`] — `getUseChain`'s own documented
-    /// "Empty if there isn't a use chain" (`TransformPagedMemViewImpl.hpp:322`) — so a second
+    /// "Empty if there isn't a use chain" (`TransformPagedMemViewImpl.hpp:323-324`) — so a second
     /// consumer means the load keeps the tail it already has rather than half of it being copied
     /// into a guarded branch.
     #[test]
@@ -2721,7 +2729,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// ⭐⭐ `%load = agen.vector_load …` / `%rot = vectorchain.rotate %load, %c16` /
     /// `dataflow.send %sfp0, %rot` is `paged_mem_view_loads.mlir:297-299` verbatim — a paged vector
     /// load with a real chain. `VectorLoadOp::getUseChain` collects it load-first
-    /// (`Agen.cpp:115-136`) and `eraseOpAndUseChain` walks it BACKWARDS (`:176-177`), so the send
+    /// (`Agen.cpp:115-136`) and `eraseOpAndUseChain` walks it BACKWARDS (`:177-178`), so the send
     /// goes first and the load last.
     #[test]
     fn a_paged_loads_chain_is_erased_from_its_send_back_to_the_load() {
@@ -2801,8 +2809,8 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
 
     /// 🎯 129/384 — ⛔ THE TWO ERASE LOOPS ARE ONE RULE, AND THE DIRECTION IS WHAT THEY DISAGREE ON.
     ///
-    /// `VectorLoadOp::eraseOpAndUseChain` reverses its chain (`Agen.cpp:176-177`) and
-    /// `VectorStoreOp::eraseOpAndUseChain` does not (`:257`), because a store's chain is collected
+    /// `VectorLoadOp::eraseOpAndUseChain` reverses its chain (`Agen.cpp:177-178`) and
+    /// `VectorStoreOp::eraseOpAndUseChain` does not (`:258`), because a store's chain is collected
     /// producer-ward with the store itself first (`:207-222`). Both end up consumer-first.
     #[test]
     fn the_direction_decides_whether_the_chain_is_reversed() {
@@ -3077,8 +3085,10 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     }
 
     /// ⛔ THE `store_op` ARGUMENT IS DROPPED — `mem_ops_` holds the LOAD and nothing else after
-    /// construction, and entry 130's `getStoreOp` is what puts the store back
-    /// (`Impl.cpp:512-520`). A port that stashed the store here would make that entry dead.
+    /// construction, which `initialize` re-asserts (`DT_CHECK(mem_ops_.size() == 1)`,
+    /// `Impl.cpp:756`), and entry 130's `getStoreOp` is what puts the store back — as the
+    /// destination `TPMVInfo`, not as a second `mem_ops_` entry (`Impl.cpp:766-770`). A port that
+    /// stashed the store here would make that entry dead.
     #[test]
     fn the_load_store_constructor_drops_the_store() {
         let program = vec![vector_load(Val(31)), vector_store(Val(31))];
