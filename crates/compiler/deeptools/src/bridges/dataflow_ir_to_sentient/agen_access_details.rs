@@ -101,8 +101,10 @@
 
 use crate::arch::Elements;
 use crate::formats::Bits;
-use crate::islands::dataflow_ir::dialects::{Val, agen};
-use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet};
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, scf,
+};
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, FlatConstraints, IntegerSet};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
 
@@ -195,6 +197,25 @@ pub struct LayoutCoeff(pub i64);
 pub struct TimeDim(pub u32);
 
 impl TimeDim {
+    /// The position as a slice index.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// ONE **TRANSFER SET** DIMENSION'S POSITION — ⛔ NOT A [`TimeDim`].
+///
+/// `constructExtentAndTotalElements` walks the dimensions of the composed `load_set`/`store_set`
+/// (`AccessDetails.cpp:55`), which are the dimensions of ONE transfer's data, while a [`TimeDim`]
+/// indexes the sequence of transfers. The two are counted separately, indexed into different vectors
+/// — `extents_` and `layout_coeffs_` here, `time_bounds_` and `time_offsets_` there — and a composite
+/// op has both at once. Sharing one newtype would let an extent's position be passed where a time
+/// step's is meant, which is the E0308 this exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransferDim(pub u32);
+
+impl TransferDim {
     /// The position as a slice index.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -397,6 +418,155 @@ pub fn set_coalesced_bound_values(
     }
 }
 
+/// THE MEMORY VIEW AN ACCESS ADDRESSES THROUGH — the two facts `initializeMemViewInfo` narrows
+/// `mem_ref_` down to, plus the unit they belong to.
+///
+/// # ⛔⛔ ONE STRUCT, BECAUSE THE REFERENCE'S TWO BRANCHES DIFFER ONLY IN SPELLING
+///
+/// ```cpp
+/// if (auto mem_view = dyn_cast<dataflow::GetLogicalMemoryViewOp>(mem_ref)) {
+///   setMemViewLayoutMap(mem_view.getLayoutMap());
+///   setMemViewStartAddr(mem_view.getStartAddress());
+///   setMemory(mem_view.getFromUnit());
+/// } else if (auto paged_mem_view = dyn_cast<dataflow::GetPagedLogicalMemoryViewOp>(mem_ref)) {
+///   setMemViewLayoutMap(paged_mem_view.getLayoutMap());
+///   setMemViewStartAddr(paged_mem_view.getStartAddr());
+///   setMemory(paged_mem_view.getUnit());
+/// } else {
+///   llvm_unreachable("unsupported mem_ref type");
+/// }
+/// ```
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:274-289`). The two arms read the SAME three
+/// facts through differently-named accessors — `getStartAddress`/`getStartAddr`,
+/// `getFromUnit`/`getUnit` — and write them to the same three members in the same order. Nothing
+/// downstream of this function can tell which arm ran, so an enum here would carry a tag no reader
+/// has, and `TransformPagedMemViewImpl.cpp:553` confirms the paged form's own type is the plain
+/// form's.
+///
+/// # ⛔ THE WITNESS IS WHAT RETIRES `llvm_unreachable("unsupported mem_ref type")`
+///
+/// The reference resolves `mem_ref_` and aborts the compiler when it is neither view op. Here
+/// [`Self::of`] is the only way to obtain one, so
+/// [`initialize_mem_view_info`](AccessDetailsBase::initialize_mem_view_info) cannot be called on an
+/// unresolved `mem_ref` at all and the abort has nothing left to guard — the same witness-constructor
+/// shape as [`EnclosingLoop::of`](super::vc_helper::EnclosingLoop::of).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemViewSource<'a> {
+    /// `getLayoutMap()` — how the view's indices map onto its unit's linear region.
+    pub layout: &'a AffineMap,
+    /// `getStartAddress()` / `getStartAddr()` — the view's base, in elements.
+    pub start_address: Val,
+    /// `getFromUnit()` / `getUnit()` — the memory unit the view is cut from.
+    pub memory: Val,
+}
+
+impl<'a> MemViewSource<'a> {
+    /// THE VIEW A `mem_ref` RESOLVES TO — `mem_ref.getDefiningOp()` and the two `dyn_cast`s
+    /// (`AccessDetails.cpp:275-286`).
+    ///
+    /// ⛔ [`None`] IS BOTH OF THE REFERENCE'S UNWRITABLE STATES AT ONCE: a `mem_ref` that is a region
+    /// argument, so `getDefiningOp()` is null and the first `dyn_cast` reads through it, and one
+    /// defined by any other op, which is the `llvm_unreachable`. Neither is a state a caller may pass
+    /// on, and neither can be turned into a view.
+    #[must_use]
+    pub fn of(mem_ref: Val, scope: &'a [DfirOp]) -> Option<MemViewSource<'a>> {
+        match defining_op(mem_ref, scope)? {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                from,
+                start,
+                layout,
+                ..
+            }) => Some(MemViewSource {
+                layout,
+                start_address: *start,
+                memory: *from,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(view)) => {
+                Some(MemViewSource {
+                    layout: &view.layout,
+                    start_address: view.start_addr,
+                    memory: view.unit,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// WHAT `constructExtentAndTotalElements` FOUND — ⛔ THE `LogicalResult` WITH ITS FIVE
+/// `emitError`S KEPT APART.
+///
+/// The reference returns `success()` or one of five distinct `op->emitError(...)`s
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:32-95`), and its caller
+/// `constructDetails` propagates the failure without reading the message (`:418-437`). A `bool`
+/// would erase which refusal fired, and a `Result` is what this crate does not have — so the
+/// outcomes are variants, carrying the numbers the messages describe in prose.
+///
+/// ⭐ THE PRECEDENT IS `agen_helper.rs:834-864`: a `LogicalResult` + `emitOpError` function becomes a
+/// `#[must_use]` enum with one variant per outcome.
+///
+/// ⛔ A REFUSAL LEAVES THE OBJECT PARTLY WRITTEN, AND THAT IS THE REFERENCE'S BEHAVIOUR.
+/// `setLayoutCoeffs` runs before the loop (`:46`), and `setTotalElements`/`setExtents` run only after
+/// it completes (`:87-88`) — so an [`Self::ExtentOverLimit`] leaves the coefficients installed and the
+/// extents from the previous call in place, while an [`Self::ElementCountMismatch`] leaves all three
+/// written. Nothing rolls back, because the caller abandons the lowering.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferExtents {
+    /// `success()` — every dimension is a constant range or pinned, and the element count agrees with
+    /// the return type.
+    Rectangular,
+
+    /// *"Extent requsted along a dimension is more than its limit"* (`:71-74`, the reference's own
+    /// spelling).
+    ///
+    /// ⭐ THE LIMIT IS THE RATIO BETWEEN NEIGHBOURING LAYOUT STRIDES — how many elements fit along
+    /// this dimension before the address walks into the next one — except at the fastest-moving end,
+    /// where `width + 1` makes the test vacuous (`:64-70`).
+    ExtentOverLimit {
+        /// Which transfer-set dimension.
+        dim: TransferDim,
+        /// The extent asked for.
+        width: i64,
+        /// The limit the layout allows.
+        limit: i64,
+    },
+
+    /// *"Extent along a dimension is negative"* (`:81`) — reached for a width of **zero** as well,
+    /// because the reference tests `width > 0` (`:62`).
+    ExtentNotPositive {
+        /// Which transfer-set dimension.
+        dim: TransferDim,
+        /// The non-positive width `isDimAConstantRange` reported.
+        width: i64,
+    },
+
+    /// *"Not in a hyper-rectangular form"* (`:84`) — the dimension is neither pinned by an equality
+    /// nor bounded by a constant range on both sides, so it has no extent to read.
+    NotHyperRectangular {
+        /// Which transfer-set dimension.
+        dim: TransferDim,
+    },
+
+    /// *"Number of elements in return type not matching with load_set/store_set elements"* (`:91-93`).
+    ElementCountMismatch {
+        /// `getExpectedTotalElements()` — what the op's return type says it moves.
+        expected: Elements,
+        /// The product of the extents just computed.
+        found: Elements,
+    },
+
+    /// ⛔ NOT A REFERENCE OUTCOME: `mem_view_layout_map_` IS STILL THE NULL MAP.
+    ///
+    /// The reference hands `getMemViewLayoutMap()` straight to `getMapCoefficients`, which calls
+    /// `map.getResult(0)` on it (`dialect_utils/Agen/Utils.cpp:65-71`) — on a default-constructed
+    /// `AffineMap` that is a null dereference, so there is no behaviour to preserve and nothing is
+    /// knowable about the extents. Naming the state is the only total reading; it is unreachable on
+    /// the reference's own call order, because `constructDetails` runs `initialize()` — and with it
+    /// [`AccessDetailsBase::initialize_mem_view_info`] — before this function (`:418-437`).
+    MemoryViewUnresolved,
+}
+
 /// WHAT ONE MEMORY OPERAND'S LOWERING KNOWS ABOUT ITS ACCESS — `AccessDetailsBase`
 /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:43-212`).
 ///
@@ -429,8 +599,9 @@ pub fn set_coalesced_bound_values(
 /// `memory_index_`, `layout_coeffs_`, `mem_view_start_addr_`, `mem_view_layout_map_`,
 /// `shuffle_mode_` and `indices_`, and entries 009-015 brought `rotation_position_`,
 /// `expected_total_elements_`, `extents_`, `total_elements_`, `element_width_`, `transfer_set_` and
-/// `transfer_order_`; `memory_`, `mem_ref_`, `chunk_size_`, `chunk_stride_` and
-/// `ld_or_st_size_` still arrive with the `construct*` entries that write them. The order below is the C++'s own declaration order
+/// `transfer_order_`; entries 143-148 brought `memory_`, `chunk_size_` and `ld_or_st_size_`, and
+/// `mem_ref_` and `chunk_stride_` still arrive with the `construct*` entries that write them. The
+/// order below is the C++'s own declaration order
 /// (`hpp:150-210`), so each wave inserts rather than reorders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessDetailsBase<'a> {
@@ -469,6 +640,18 @@ pub struct AccessDetailsBase<'a> {
     /// `getMapCoefficients` on the view's layout map (`:45-46`).
     pub layout_coeffs: Vec<LayoutCoeff>,
 
+    /// `memory_` — *"Memory unit"* (`hpp:162-163`). Setter `setMemory` (`hpp:84`), **public** and
+    /// excluded from the port as *"a struct field in Rust"*; the only writer is
+    /// [`Self::initialize_mem_view_info`], which takes it from the view's own unit operand.
+    ///
+    /// ⭐ THE UNIT THE VIEW IS CUT FROM, NOT THE VIEW. `get_logical_memory_view %unit, %start` names
+    /// its memory as an operand, and it is that operand this field holds — `getFromUnit()` on the
+    /// plain view, `getUnit()` on the paged one (`AccessDetails.cpp:279`, `:285`).
+    ///
+    /// ⭐ `None` IS THE C++ NULL `Value`, for [`Self::mem_view_start_addr`]'s reason: the member is
+    /// default-constructed and only `initializeMemViewInfo` gives it one.
+    pub memory: Option<Val>,
+
     /// `mem_view_start_addr_` — *"Associated memory view start address"* (`:168`). Setter e004,
     /// **public**: `generateAffineAddressManipulationStmts` rewrites it to a mutable address base
     /// (`Helper.cpp:901`), and `updateSymbolicAccessDetails` remaps it onto a clone (`:1043`).
@@ -483,6 +666,20 @@ pub struct AccessDetailsBase<'a> {
     ///
     /// ⭐ `None` IS THE C++ NULL `AffineMap`, for the same reason as `mem_view_start_addr`.
     pub mem_view_layout_map: Option<AffineMap>,
+
+    /// `chunk_size_` — *"Chunk size - a group of chunks make a data set to transfer"*
+    /// (`hpp:174-175`), in elements. Setter `setChunkSize` (`hpp:102`), **protected** and excluded
+    /// from the port as a field.
+    ///
+    /// ⛔ THE FIELD IS DECLARED HERE BECAUSE ENTRY 144 READS IT: `constructLdOrStType` copies it into
+    /// `ld_or_st_size_` for an L0 component (`AccessDetails.cpp:267-272`). Its WRITER is
+    /// `constructChunkAndShuffleInfo` (`:97-265`), a later entry, so on an object this batch can
+    /// build it is still the declared `0`.
+    ///
+    /// ⭐ `int chunk_size_ = 0` (`hpp:175`), and zero is the "not computed yet" value rather than an
+    /// empty chunk: `constructChunkAndShuffleInfo` assigns it unconditionally before anything reads
+    /// it.
+    pub chunk_size: Elements,
 
     /// `shuffle_mode_` — *"Shuffle mode on the data"* (`:180`). Setter e008, **protected**.
     ///
@@ -521,6 +718,21 @@ pub struct AccessDetailsBase<'a> {
     /// `transfer_order_` (`hpp:205`) — *"Load order or store order within a transfer"*. Written by
     /// [`Self::set_transfer_order`].
     pub transfer_order: AffineMap,
+
+    /// `ld_or_st_size_` — *"Load or store size (different from total_element) and this is specific to
+    /// Sentient aspects"* (`hpp:207-211`), in elements. Written by
+    /// [`Self::construct_ld_or_st_type`].
+    ///
+    /// ⭐ THE COMMENT SAYS THE WHOLE RULE: *"In case of L0, ld size refers to chunk size. In other
+    /// cases, ld size refers to total_elements"* (`hpp:209-210`) — which is entry 144, and the one
+    /// place the two candidates are distinguished.
+    ///
+    /// ⛔ AND IT IS NOT `total_elements_`, WHICH IS WHY IT EXISTS. `computeBurstAndGroup` compares a
+    /// time offset against THIS field to decide whether an interleave group may be claimed
+    /// (`AccessDetails.cpp:820`); reading `total_elements_` there would use the transfer's whole
+    /// element count where the hardware's per-instruction count is meant, and on L0 those differ by
+    /// the number of chunks.
+    pub ld_or_st_size: Elements,
 }
 
 impl<'a> AccessDetailsBase<'a> {
@@ -561,10 +773,14 @@ impl<'a> AccessDetailsBase<'a> {
             comp,
             // `SmallVector<int64_t> layout_coeffs_;` (`hpp:160`).
             layout_coeffs: Vec::new(),
+            // `Value memory_;` (`hpp:163`) — a null `Value` until a view resolves.
+            memory: None,
             // `Value mem_view_start_addr_;` (`hpp:169`) — a null `Value` until a view resolves.
             mem_view_start_addr: None,
             // `AffineMap mem_view_layout_map_;` (`hpp:172`) — null for the same reason.
             mem_view_layout_map: None,
+            // `int chunk_size_ = 0;` (`hpp:175`).
+            chunk_size: Elements(0),
             // `std::string shuffle_mode_ = "noshuffle";` (`hpp:181`) — NOT the zero value.
             shuffle_mode: sen::ShuffleMode::NoShuffle,
             // `SmallVector<Value> indices_;` (`hpp:199`).
@@ -591,6 +807,8 @@ impl<'a> AccessDetailsBase<'a> {
                 syms: 0,
                 results: Vec::new(),
             },
+            // `int ld_or_st_size_ = 0;` (`hpp:211`).
+            ld_or_st_size: Elements(0),
         }
     }
 
@@ -931,6 +1149,242 @@ impl<'a> AccessDetailsBase<'a> {
     pub fn set_transfer_order(&mut self, transfer_order: AffineMap) {
         self.transfer_order = transfer_order;
     }
+
+    /// Replaces: e143_constructExtentAndTotalElements
+    ///
+    /// **143/384** `AccessDetailsBase::constructExtentAndTotalElements` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:32` (64L).
+    ///
+    /// # ⭐⭐ THE EXTENT OF EVERY DIMENSION, READ OFF THE TRANSFER SET'S OWN MATRIX
+    ///
+    /// A `load_set`/`store_set` is an [`IntegerSet`] over the transfer's data dimensions and a
+    /// `load_order`/`store_order` is the [`AffineMap`] that says which order those dimensions are
+    /// walked in. This function re-expresses the set in the ORDER'S input space and then reads one
+    /// extent per dimension out of the result:
+    ///
+    /// ```cpp
+    /// affine::FlatAffineValueConstraints transfer_set_csts(getTransferSet().getValue());
+    /// auto transfer_order = getTransferOrder();
+    /// if (transfer_set_csts.composeMatchingMap(transfer_order).failed())
+    ///   return LogicalResult::failure();
+    /// transfer_set_csts.projectOut(transfer_order.getNumDims(), transfer_order.getNumDims());
+    /// transfer_set_csts.removeRedundantConstraints();
+    /// ```
+    /// (`:33-41`) — [`FlatConstraints::compose_matching_map`], [`FlatConstraints::project_out`] and
+    /// [`FlatConstraints::remove_redundant_constraints`], which this batch added to the island for
+    /// this function.
+    ///
+    /// ⛔⛔ THE `removeRedundantConstraints()` IS NOT TIDYING. `projectOut` substitutes each tied
+    /// dimension away using the equality that ties it, and `isDimValueZero` answers TRUE for a
+    /// dimension as soon as it finds ANY equality naming no other variable — an all-zero row included.
+    /// A single leftover `0 == 0` would therefore report every dimension as pinned, every extent as
+    /// 1, and a transfer of one element. See [`FlatConstraints::is_dim_value_zero`].
+    ///
+    /// ⛔ `composeMatchingMap().failed()` HAS NO VARIANT HERE. MLIR's only failure path is
+    /// `flattenAlignedMapAndMergeLocals` refusing a map it cannot flatten — a semi-affine one, with a
+    /// multiplication or division by a non-constant. A transfer order is a permutation of dimensions,
+    /// and the island's flattener names that case with its own `todo!` rather than an outcome
+    /// (`islands/dataflow_ir/ty.rs`, `flattened`). The dimension-count mismatch MLIR *asserts* on is
+    /// covered too: a short result list leaves surplus dimensions untied, `project_out` eliminates
+    /// them by Fourier–Motzkin instead of by substitution, and what comes out is a system
+    /// [`TransferExtents::NotHyperRectangular`] already refuses.
+    ///
+    /// # ⛔ ROW MAJOR IS DECIDED BY COMPARING THE OUTERMOST STRIDE WITH THE INNERMOST
+    ///
+    /// ```cpp
+    /// auto layout_size = layout_coeffs.size();
+    /// auto last_index = layout_size != transfer_set_csts.getNumDimVars() ? layout_size - 2
+    ///                                                                   : layout_size - 1;
+    /// bool is_row_major = (layout_coeffs[0] > layout_coeffs[last_index]);
+    /// ```
+    /// (`:47-51`). `getMapCoefficients` flattens the layout map into one stride per dimension PLUS a
+    /// trailing constant term (see [`LayoutCoeff`]), so `layout_size` is one MORE than the number of
+    /// dimensions whenever the constant column is there — which is what the `!=` test detects, and why
+    /// it then steps back TWO to reach the last real stride. `[0] > [last]` says the first dimension
+    /// moves the address furthest, which is row major.
+    ///
+    /// ⛔ THE COMPARISON IS THROUGH [`Option`] AND NOT AN INDEX. `layout_coeffs[0]` on an empty
+    /// coefficient list is the reference's own out-of-bounds read; `first() > get(last_index)`
+    /// answers `false` — column major — for the layout with no strides at all, whose orientation is
+    /// unobservable because no dimension moves the address. It is unreachable in any case:
+    /// [`Self::initialize_mem_view_info`] only ever installs a real view's layout map.
+    ///
+    /// # ⛔ THE ACCUMULATOR STARTS AT THE FIELD, NOT AT ZERO
+    ///
+    /// `auto total_elements = getTotalElements();` (`:54`) reads `total_elements_` back, and every
+    /// step is written `(total_elements == 0) ? width : total_elements * width` — so a zero field
+    /// SEEDS the product rather than annihilating it, and a second call on the same object multiplies
+    /// into the count the first one left. Transcribed as written.
+    ///
+    /// ⭐ THE PINNED CASE MULTIPLIES BY ONE, WHICH THE REFERENCE SPELLS OUT: `total_elements =
+    /// (total_elements == 0) ? 1 : total_elements * 1;` (`:59`). Only the seeding half is observable.
+    ///
+    /// ⛔ THE LIMIT'S DIVISION IS `checked_div`, BECAUSE A ZERO STRIDE IS DIVIDING BY ZERO. A
+    /// dimension the address does not read has stride 0 — `(d0, d1) -> (d1)` flattens to `[0, 1, 0]` —
+    /// and `layout_coeffs[i - 1] / layout_coeffs[i]` on it faults in the reference. With no ratio
+    /// there is no limit to compare against, so the [`TransferExtents::ExtentOverLimit`] test is the
+    /// one thing skipped; every extent is still pushed and still multiplied in.
+    pub fn construct_extent_and_total_elements(&mut self) -> TransferExtents {
+        let transfer_order = self.transfer_order.clone();
+        let transfer_set_csts = FlatConstraints::from_integer_set(&self.transfer_set)
+            .compose_matching_map(&transfer_order)
+            .project_out(transfer_order.dims, transfer_order.dims)
+            .remove_redundant_constraints();
+
+        // TODO: currently, we do support only row major and column major in lowering. (the
+        // reference's own note, `:43`)
+        let Some(layout_map) = self.mem_view_layout_map.clone() else {
+            return TransferExtents::MemoryViewUnresolved;
+        };
+        let layout_coeffs: Vec<LayoutCoeff> = layout_map
+            .coefficients(0)
+            .into_iter()
+            .map(LayoutCoeff)
+            .collect();
+        self.set_layout_coeffs(&layout_coeffs);
+        let stride = |position: usize| layout_coeffs.get(position).map(|coeff| coeff.0);
+        let layout_size = layout_coeffs.len();
+        let dim_vars = transfer_set_csts.num_dim_vars();
+        let last_index = if layout_size == dim_vars as usize {
+            layout_size.saturating_sub(1)
+        } else {
+            layout_size.saturating_sub(2)
+        };
+        let is_row_major = layout_coeffs.first() > layout_coeffs.get(last_index);
+
+        let mut total_elements = self.total_elements;
+        let mut extents: Vec<Elements> = Vec::new();
+        for position in 0..dim_vars {
+            let dim = TransferDim(position);
+            if transfer_set_csts.is_dim_value_zero(position) {
+                extents.push(Elements(1));
+                if total_elements == Elements(0) {
+                    total_elements = Elements(1);
+                }
+            } else if let Some(width) = transfer_set_csts.is_dim_a_constant_range(position) {
+                if width <= 0 {
+                    return TransferExtents::ExtentNotPositive { dim, width };
+                }
+                extents.push(Elements(width.unsigned_abs()));
+                total_elements = if total_elements == Elements(0) {
+                    Elements(width.unsigned_abs())
+                } else {
+                    Elements(total_elements.0 * width.unsigned_abs())
+                };
+
+                let index = dim.index();
+                let limit = if is_row_major {
+                    if index == 0 {
+                        Some(width + 1)
+                    } else {
+                        ratio(stride(index - 1), stride(index))
+                    }
+                } else if index == last_index {
+                    Some(width + 1)
+                } else {
+                    ratio(stride(index + 1), stride(index))
+                };
+                if let Some(limit) = limit
+                    && width > limit
+                {
+                    return TransferExtents::ExtentOverLimit { dim, width, limit };
+                }
+            } else {
+                return TransferExtents::NotHyperRectangular { dim };
+            }
+        }
+        self.set_total_elements(total_elements);
+        self.set_extents(&extents);
+
+        if self.expected_total_elements != total_elements {
+            return TransferExtents::ElementCountMismatch {
+                expected: self.expected_total_elements,
+                found: total_elements,
+            };
+        }
+        TransferExtents::Rectangular
+    }
+
+    /// Replaces: e144_constructLdOrStType
+    ///
+    /// **144/384** `AccessDetailsBase::constructLdOrStType` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:267` (5L).
+    ///
+    /// ```cpp
+    /// void AccessDetailsBase::constructLdOrStType() {
+    ///   if (is_any_of(getComp(), L0LU, L0SU))
+    ///     setLdOrStSize(getChunkSize());
+    ///   else
+    ///     setLdOrStSize(getExpectedTotalElements());
+    /// }
+    /// ```
+    ///
+    /// ⭐⭐ THE WHOLE FUNCTION IS THE `hpp:209-210` COMMENT MADE EXECUTABLE: *"In case of L0, ld size
+    /// refers to chunk size. In other cases, ld size refers to total_elements."* An L0 load/store
+    /// unit issues ONE CHUNK per instruction, so the size its `ldtype`/`sttype` field carries is the
+    /// chunk; every other component issues the whole transfer.
+    ///
+    /// ⛔ AND IT IS `expected_total_elements_`, NOT `total_elements_`, DESPITE THAT COMMENT. The
+    /// comment says "total_elements"; the code reads the *expected* count — the one
+    /// [`Self::set_expected_total_elements`] takes from the op's RETURN TYPE (`hpp:186-187`) rather
+    /// than the one [`Self::construct_extent_and_total_elements`] derives from the transfer set. They
+    /// are equal on every accepted access, because that function refuses with
+    /// [`TransferExtents::ElementCountMismatch`] when they differ (`:90-93`) — which is exactly why
+    /// reading either is safe here and why the code's choice is the one to transcribe.
+    ///
+    /// ⛔ IT RETURNS `void`, ALONE AMONG THE `construct*` MEMBERS (`hpp:147`). There is no outcome to
+    /// carry: both branches assign, neither can fail.
+    ///
+    /// ⭐ `is_any_of(getComp(), L0LU, L0SU)` IS A [`matches!`], and the closed set is [`DfirUnit`].
+    /// L0's load unit and store unit are the two components with a chunked instruction; `L3LU`/`L3SU`
+    /// — the pair [`AccessDetailsAffineComposite::compute_burst_and_group`] singles out — are not
+    /// among them.
+    pub fn construct_ld_or_st_type(&mut self) {
+        self.ld_or_st_size = if matches!(self.comp, DfirUnit::L0lu | DfirUnit::L0su) {
+            self.chunk_size
+        } else {
+            self.expected_total_elements
+        };
+    }
+
+    /// Replaces: e145_initializeMemViewInfo
+    ///
+    /// **145/384** `AccessDetailsBase::initializeMemViewInfo` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:274` (16L).
+    ///
+    /// ⭐⭐ THREE FACTS OFF THE VIEW, IN THE REFERENCE'S ORDER — layout map, then start address, then
+    /// unit. See [`MemViewSource`] for the two `dyn_cast` arms this collapses and for why
+    /// `llvm_unreachable("unsupported mem_ref type")` (`:287`) has nothing left to guard.
+    ///
+    /// ⛔ THE `LogicalResult` IS NOT AN OUTCOME. Every path through the reference reaches
+    /// `return LogicalResult::success()` (`:288`) — the third arm aborts the process instead of
+    /// returning failure — so there is exactly one outcome and it is `()`.
+    ///
+    /// ⛔ IT TAKES THE VIEW RATHER THAN READING `mem_ref_`, and that is where the abort went. The
+    /// reference opens with `auto mem_ref = getMemRef().getDefiningOp();` (`:275`); here the caller
+    /// resolves it with [`MemViewSource::of`] and can only proceed with a view that exists. The
+    /// `mem_ref_` field itself belongs to `initialize()`, which is the entry that writes it.
+    ///
+    /// ⛔ THE ORDER OF THE THREE WRITES IS KEPT even though they touch different members, because a
+    /// later entry may come to read one of them mid-flight; reordering would be a change nothing in
+    /// the reference justifies.
+    pub fn initialize_mem_view_info(&mut self, view: MemViewSource<'_>) {
+        self.set_mem_view_layout_map(view.layout.clone());
+        self.set_mem_view_start_addr(view.start_address);
+        self.memory = Some(view.memory);
+    }
+}
+
+/// THE RATIO BETWEEN TWO NEIGHBOURING LAYOUT STRIDES, or [`None`] where the reference divides by
+/// zero or reads past its coefficient list.
+///
+/// ⭐ EXTRACTED SO THE FOUR CALLS IN
+/// [`AccessDetailsBase::construct_extent_and_total_elements`] read as the reference's two ternaries
+/// do. `layout_coeffs[i - 1] / layout_coeffs[i]` is an `int64_t` division there
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:66-70`), truncating toward zero, which is
+/// what [`i64::checked_div`] does.
+fn ratio(numerator: Option<i64>, denominator: Option<i64>) -> Option<i64> {
+    numerator?.checked_div(denominator?)
 }
 
 /// AN ACCESS WHOSE SUBSCRIPTS ARE AFFINE — `AccessDetailsAffine` (`AccessDetails.hpp:214-245`).
@@ -1031,6 +1485,332 @@ impl<'a> AccessDetailsAffine<'a> {
     /// so a second call cannot leave a coefficient from the first behind.
     pub fn set_indices_coeff_dict(&mut self, indices_coeff_dict: IndicesCoeffDict) {
         self.indices_coeff_dict = indices_coeff_dict;
+    }
+
+    /// Replaces: e146_constructIndices
+    ///
+    /// **146/384** `AccessDetailsAffine::constructIndices` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:354` (50L).
+    ///
+    /// # ⭐⭐ IT SEPARATES THE SUBSCRIPTS THAT VARY FROM THE ONES THAT DO NOT
+    ///
+    /// `indices_` arrives from `initialize()` holding every operand of the access's affine map. This
+    /// function keeps only the loop iterators among them and FOLDS each constant operand into the
+    /// subscripts map itself, so that afterwards `indices_` and the map's dimensions are the same
+    /// list in the same order — which is the invariant
+    /// [`Self::construct_iterator_coefficients`] then indexes by position and
+    /// `MutableAddrSplitting.cpp:717` checks by length.
+    ///
+    /// ```cpp
+    /// for (int dim = 0; dim < indices.size(); dim++) {
+    ///   auto& index = indices[dim];
+    ///   if (mlir::isa<BlockArgument>(index)) {
+    ///     auto* loop_op = mlir::cast<BlockArgument>(index).getOwner()->getParentOp();
+    ///     if (isa<affine::AffineForOp, scf::ForOp>(loop_op))
+    ///       new_indices.push_back(index);
+    ///     else
+    ///       return op->emitError("The loop iterators involved in the agen memory "
+    ///                            "operation subscripts have to be affine loops");
+    ///   } else if (auto const_op = index.getDefiningOp<mlir::arith::ConstantOp>()) {
+    ///     auto val = mlir::cast<IntegerAttr>(const_op.getValue()).getInt();
+    ///     dim_to_cst_val_map[dim] = val;
+    ///   } else {
+    ///     return op->emitError("All the map operands need to be either loop"
+    ///                          "iterators or constant values");
+    ///   }
+    /// }
+    /// setIndices(new_indices);
+    /// ```
+    /// (`:360-380`) — the classification is [`SubscriptOperand`].
+    ///
+    /// ⛔⛔ BOTH REFUSALS RETURN **BEFORE** `setIndices`, so a refused access keeps the index list it
+    /// arrived with, constants and all. That is load-bearing: `constructDetails` propagates the
+    /// failure and the op is never lowered, but nothing clears the object, and a half-filtered list
+    /// would be an access at the wrong offset if anything read it. Writing the list only on the
+    /// success path is the reference's own ordering, not a tidy-up.
+    ///
+    /// # ⛔ THE FOLD RENUMBERS THE SURVIVORS AND DECLARES THE NEW ARITY ITSELF
+    ///
+    /// ```cpp
+    /// if (!dim_to_cst_val_map.empty()) {
+    ///   int ndims = 0;
+    ///   for (int dim = 0; dim < indices.size(); dim++) {
+    ///     auto record = dim_to_cst_val_map.find(dim);
+    ///     if (record == dim_to_cst_val_map.end())
+    ///       operand_exprs.push_back(getAffineDimExpr(ndims++, op->getContext()));
+    ///     else
+    ///       operand_exprs.push_back(getAffineConstantExpr(record->second, op->getContext()));
+    ///   }
+    ///   subscripts_map = subscripts_map.replaceDimsAndSymbols(operand_exprs, symbol_exprs, ndims, 0);
+    /// }
+    /// setSubscriptsMap(subscripts_map);
+    /// ```
+    /// (`:384-403`). ⛔ `ndims` COUNTS ONLY THE SURVIVORS and is passed as the result map's dimension
+    /// count, so the folded dimensions' columns disappear rather than staying as unused ones — see
+    /// [`AffineMap::replace_dims_and_symbols`], whose doc records why declaring the arity matters to
+    /// every matrix built from the map afterwards.
+    ///
+    /// ⛔ `symbol_exprs` IS EMPTY AND `0` IS PASSED FOR THE SYMBOL COUNT, so a subscripts map with
+    /// symbols would lose them. The reference relies on affine subscripts having none.
+    ///
+    /// ⭐ THE `dim_to_cst_val_map` IS A `std::map<int, int>` KEYED BY POSITION, which is what makes
+    /// the second loop able to walk the ORIGINAL positions while `ndims` counts the new ones. A
+    /// `Vec<Option<i64>>` indexed by position is the same structure with the lookup made positional;
+    /// ⚠️ the reference's value type is `int` while `getInt()` returns `int64_t`, so a subscript
+    /// constant wider than 32 bits truncates there. Not copied: an index constant that large is not a
+    /// contract worth reproducing, and the folded value is carried as [`i64`] here.
+    ///
+    /// ⛔ THE UNCONDITIONAL `setSubscriptsMap` AT THE END IS A NO-OP WHEN NOTHING WAS FOLDED — it
+    /// writes back the map it just read. With the map still unset it writes null over null, which is
+    /// why leaving [`None`] alone is the same operation.
+    pub fn construct_indices(&mut self, scope: &[DfirOp]) -> ConstructedIndices {
+        // Step-1: Construct indices (`:356`)
+        let indices = self.base.indices.clone();
+        let mut folded: Vec<Option<i64>> = vec![None; indices.len()];
+        let mut new_indices: Vec<Val> = Vec::new();
+        for (position, index) in indices.iter().copied().enumerate() {
+            match SubscriptOperand::of(index, scope) {
+                SubscriptOperand::LoopIterator => new_indices.push(index),
+                SubscriptOperand::ForeignRegionArgument => {
+                    return ConstructedIndices::NotAnAffineLoopIterator { index };
+                }
+                SubscriptOperand::Constant(value) => folded[position] = Some(value),
+                SubscriptOperand::Computed => {
+                    return ConstructedIndices::NotAnIteratorOrConstant { index };
+                }
+            }
+        }
+        self.base.set_indices(&new_indices);
+
+        // substitute constant indices into the subscripts map itself (`:383`)
+        let mut subscripts_map = self.subscripts_map.clone();
+        if folded.iter().any(Option::is_some) {
+            subscripts_map = subscripts_map.as_ref().map(|map| {
+                let mut ndims = 0;
+                let operand_exprs: Vec<AffineExpr> = folded
+                    .iter()
+                    .map(|value| match value {
+                        Some(value) => AffineExpr::Const(*value),
+                        None => {
+                            let expr = AffineExpr::dim(ndims);
+                            ndims += 1;
+                            expr
+                        }
+                    })
+                    .collect();
+                map.replace_dims_and_symbols(&operand_exprs, &[], ndims, 0)
+            });
+        }
+        if let Some(subscripts_map) = subscripts_map {
+            self.set_subscripts_map(subscripts_map);
+        }
+
+        ConstructedIndices::Affine
+    }
+
+    /// Replaces: e147_constructIteratorCoefficients
+    ///
+    /// **147/384** `AccessDetailsAffine::constructIteratorCoefficients` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:406` (10L).
+    ///
+    /// ```cpp
+    /// auto indices_coeff_dict = agen::utils::constructIteratorCoeffDict(
+    ///     subscripts_map, transfer_order, mem_view_layout_map, indices);
+    /// setIndicesCoeffDict(indices_coeff_dict);
+    /// return success();
+    /// ```
+    ///
+    /// ⭐ FOUR READS, ONE CALL AND ONE WRITE — the whole body. The composition it delegates to is
+    /// [`construct_iterator_coeff_dict`], which is where the substance is.
+    ///
+    /// ⛔ `success()` UNCONDITIONALLY (`:414`), so there is no outcome: `constructIteratorCoeffDict`
+    /// returns a dictionary, not a `LogicalResult`.
+    ///
+    /// ⛔ WITH EITHER MAP STILL UNSET THERE IS NOTHING TO COMPOSE. The reference would compose
+    /// through a null `AffineMap` and dereference it; here the dictionary is the default —
+    /// no per-index entries and a zero constant, which is what `indices_coeff_dict[nullptr] = 0`
+    /// alone would leave. Unreachable on the reference's call order: `constructDetails` runs
+    /// `initialize()` and [`Self::construct_indices`] first, and both maps are set by then
+    /// (`:418-437`).
+    pub fn construct_iterator_coefficients(&mut self) {
+        let indices_coeff_dict = match (&self.subscripts_map, &self.base.mem_view_layout_map) {
+            (Some(subscripts_map), Some(mem_view_layout_map)) => construct_iterator_coeff_dict(
+                subscripts_map,
+                &self.base.transfer_order,
+                mem_view_layout_map,
+                &self.base.indices,
+            ),
+            _ => IndicesCoeffDict::default(),
+        };
+        self.set_indices_coeff_dict(indices_coeff_dict);
+    }
+}
+
+/// WHAT ONE SUBSCRIPT OF AN AFFINE ACCESS IS — the four cases `constructIndices` distinguishes
+/// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:360-378`).
+///
+/// ⭐⭐ FOUR, NOT THREE. The reference's two nested tests produce four outcomes, and it treats all
+/// four differently: a block argument of a loop is KEPT, a block argument of anything else is the
+/// first refusal, a constant is FOLDED, and everything else is the second refusal. Collapsing the two
+/// block-argument cases would lose the distinction the first `emitError` exists to report.
+///
+/// ⛔ THE CLASSIFICATION IS COMPLETE AND MUTUALLY EXCLUSIVE, because a value is either an op's result
+/// or a region's argument — see [`region_owner`], which is the island half this batch added for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptOperand {
+    /// A region argument of an `affine.for` or an `scf.for` — `isa<affine::AffineForOp, scf::ForOp>`
+    /// on the argument's parent op (`:361-362`). Kept in `indices_`.
+    ///
+    /// ⛔⛔ A LOOP'S **CARRIED** ARGUMENT ANSWERS THIS TOO, and the reference means it to: the test is
+    /// on the owning OP's type, not on whether the value is that loop's induction variable. An
+    /// `iter_args` argument of an `affine.for` is therefore accepted as a subscript. Narrowing it to
+    /// the induction variable would refuse accesses the reference lowers.
+    LoopIterator,
+    /// A region argument of any other op — the first refusal, *"The loop iterators involved in the
+    /// agen memory operation subscripts have to be affine loops"* (`:363-365`).
+    ///
+    /// ⭐ `scf.parallel`'s INDUCTION VARIABLES LAND HERE, not in [`Self::LoopIterator`]: the
+    /// reference names `scf::ForOp` and not `scf::ParallelOp`. So does an
+    /// `agen.composite_load_and_store`'s `load_iv`.
+    ForeignRegionArgument,
+    /// Defined by an `arith.constant` — folded into the subscripts map and dropped from `indices_`
+    /// (`:366-368`).
+    Constant(i64),
+    /// Defined by any other op — the second refusal, *"All the map operands need to be either loop
+    /// iterators or constant values"* (`:370-372`).
+    ///
+    /// ⭐ AND BY NO OP AT ALL. A `Val` that neither an op in `scope` defines nor a region binds is a
+    /// value from outside the scope handed in; the reference's `getDefiningOp<ConstantOp>()` returns
+    /// null for it and takes the same branch.
+    Computed,
+}
+
+impl SubscriptOperand {
+    /// WHICH OF THE FOUR A SUBSCRIPT IS — the two nested `isa`/`dyn_cast` tests, in the reference's
+    /// order.
+    ///
+    /// ⛔ THE BLOCK-ARGUMENT TEST COMES FIRST, and it must: `getDefiningOp()` on a block argument is
+    /// null, so asking about the constant first would classify an induction variable as
+    /// [`Self::Computed`] only if the null test were forgotten — and asking in the reference's order
+    /// makes the question unaskable.
+    #[must_use]
+    pub fn of(index: Val, scope: &[DfirOp]) -> SubscriptOperand {
+        if let Some(owner) = region_owner(index, scope) {
+            return match owner {
+                DfirOp::Affine(affine::Op::For { .. }) | DfirOp::Scf(scf::Op::For { .. }) => {
+                    SubscriptOperand::LoopIterator
+                }
+                _ => SubscriptOperand::ForeignRegionArgument,
+            };
+        }
+        match defining_op(index, scope) {
+            Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => {
+                SubscriptOperand::Constant(*value)
+            }
+            _ => SubscriptOperand::Computed,
+        }
+    }
+}
+
+/// WHAT `constructIndices` FOUND — its `success()` and its two `emitError`s.
+///
+/// ⛔ THE TWO REFUSALS STAY APART because the reference reports them differently, and because they
+/// mean different things to whoever reads the diagnostic: the first says the access is inside a loop
+/// form this lowering does not handle, the second says a subscript is computed rather than iterated.
+/// See [`SubscriptOperand`].
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructedIndices {
+    /// `success()` (`:404`) — every subscript was a loop iterator or a constant, `indices_` now holds
+    /// the iterators alone and the subscripts map holds the constants.
+    Affine,
+    /// *"The loop iterators involved in the agen memory operation subscripts have to be affine
+    /// loops"* (`:363-365`).
+    NotAnAffineLoopIterator {
+        /// The subscript that is a region argument of something other than an `affine.for`/`scf.for`.
+        index: Val,
+    },
+    /// *"All the map operands need to be either loop iterators or constant values"* (`:370-372`).
+    NotAnIteratorOrConstant {
+        /// The subscript that is neither a region argument nor an `arith.constant`.
+        index: Val,
+    },
+}
+
+/// THE COEFFICIENT OF EVERY LOOP ITERATOR IN AN ACCESS'S ADDRESS — `constructIteratorCoeffDict`
+/// (`dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:60-85`).
+///
+/// # ⭐⭐ TWO COMPOSITIONS, THEN ONE FLATTENED ROW
+///
+/// ```cpp
+/// auto composed_load_order_map = transfer_order.compose(subscripts_map);
+/// auto composed_layout_map = mem_view_layout_map.compose(composed_load_order_map);
+/// affine::fullyComposeAffineMapAndOperands(&composed_layout_map, &indices);
+/// auto composed_layout_coeffs = constructDimCoefficients(composed_layout_map);
+/// for (std::size_t i = 0; i < indices.size(); ++i)
+///   indices_coeff_dict[indices[i]] = composed_layout_coeffs[i];
+/// int const_value = composed_layout_coeffs.size() != composed_layout_map.getNumDims()
+///                       ? composed_layout_coeffs.back() : 0;
+/// indices_coeff_dict[nullptr] = const_value;
+/// ```
+///
+/// The subscripts map turns loop iterators into tensor coordinates, the transfer order permutes those
+/// coordinates, and the layout map turns them into a linear element address — so the flattened row of
+/// the whole composition is, per iterator, HOW MANY ELEMENTS ONE STEP OF THAT LOOP MOVES THE ADDRESS.
+/// That is what `MutableStartAddrShifting.cpp:402` and `MutableAddrSplitting.cpp:724` read it for.
+///
+/// ⛔ THE COMPOSITION ORDER IS INSIDE-OUT AND THE `compose` DIRECTION MATTERS.
+/// `a.compose(b)` substitutes `b`'s results into `a`'s dimensions, so the map applied FIRST is the
+/// argument: iterators → subscripts → order → layout. See [`AffineMap::compose`].
+///
+/// ⛔ THE `const_value` TERNARY ALWAYS TAKES `back()`. A flattened row is one entry per dimension,
+/// per symbol and per local, PLUS the constant — so its length is at least `getNumDims() + 1` and
+/// the `!=` can only be true. The `: 0` arm is dead in the reference and there is nothing to
+/// transcribe for it; `back()` on the row is the constant term, and it is 0 when the address has no
+/// constant offset, which is the same answer that arm would have given.
+///
+/// ⛔ `compressUnusedSymbols` AND `simplifyAffineMap` (`Utils.cpp:38-39`) ARE DROPPED AS
+/// CANONICALISATIONS. They exist so MLIR's flattener sees a minimal map; the island's flattener
+/// derives the coefficient row from the expression tree directly, and an unused symbol contributes a
+/// zero column either way. ⚠️ They are NOT dropped silently: had they changed `getNumDims()`, they
+/// would have changed the ternary — and the ternary is dead regardless, as above.
+///
+/// ⛔ `fullyComposeAffineMapAndOperands` IS THE OPERAND-REACHING MECHANISM, which is the one thing a
+/// port may leave behind. It folds `affine.apply` producers among `indices` into the map. This
+/// island has no `affine.apply`: a subscript is a [`Val`] or an inline strided sum
+/// (`islands/dataflow_ir/dialects/mod.rs`, `Index::Strided`, which records that IBM's own files
+/// contain zero of them and that emitting one made `dbo-opt` refuse). With nothing to fold, the call
+/// is the identity.
+///
+/// ⛔ A COEFFICIENT PAST THE END OF THE ROW IS 0, NOT A READ PAST IT. The reference indexes
+/// `composed_layout_coeffs[i]` for every index, relying on the composed map having one dimension per
+/// index — which [`AccessDetailsAffine::construct_indices`] is what establishes. A dimension the
+/// address does not read has coefficient 0, and that is the only meaning available for a column that
+/// is not there.
+fn construct_iterator_coeff_dict(
+    subscripts_map: &AffineMap,
+    transfer_order: &AffineMap,
+    mem_view_layout_map: &AffineMap,
+    indices: &[Val],
+) -> IndicesCoeffDict {
+    let composed_load_order_map = transfer_order.compose(subscripts_map);
+    let composed_layout_map = mem_view_layout_map.compose(&composed_load_order_map);
+    let composed_layout_coeffs = composed_layout_map.coefficients(0);
+
+    // Sort the indices from outermost to innnermost (`Utils.cpp:78`) — the walk is over `indices`,
+    // which is already in that order; see [`IndicesCoeffDict`] on why this is a vector.
+    IndicesCoeffDict {
+        per_index: indices
+            .iter()
+            .enumerate()
+            .map(|(position, index)| {
+                (
+                    *index,
+                    composed_layout_coeffs.get(position).copied().unwrap_or(0),
+                )
+            })
+            .collect(),
+        constant: composed_layout_coeffs.last().copied().unwrap_or(0),
     }
 }
 
@@ -1266,6 +2046,121 @@ impl<'a> AccessDetailsAffineComposite<'a> {
     pub fn set_interleave_group_index(&mut self, interleave_group_index: TimeDim) {
         self.interleave_group_index = Some(interleave_group_index);
     }
+
+    /// Replaces: e148_computeBurstAndGroup
+    ///
+    /// **148/384** `AccessDetailsAffineComposite::computeBurstAndGroup` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:796` (36L).
+    ///
+    /// # ⭐⭐ IT CLAIMS TIME DIMENSIONS FOR THE TWO HARDWARE FIELDS IN THE LDST INSTRUCTION
+    ///
+    /// *"This function tries to assign time dims to burst_size and group interleaving fields in LDST
+    /// instr"* (`hpp:335-336`). Every time dimension a field absorbs is a dimension
+    /// `constructTimeLoops` does NOT have to emit as a loop — it stops at `loop_num = burst_index`
+    /// (`Helper.cpp:1807`, `:1859-1860`) — so this is where a nest becomes an instruction.
+    ///
+    /// ```cpp
+    /// for (int i = time_bounds.size() - 1; i >= 0; --i) {
+    ///   auto curr_bound = time_bounds[i];
+    ///   if (curr_bound == kCoalesced) {
+    ///     continue;
+    ///   } else if (curr_bound < 0) {
+    ///     return;
+    ///   } else if (curr_bound == 0) {
+    ///   } else {
+    ///     auto burst_index = getBurstIndex();
+    ///     if (burst_index < 0) {
+    ///       setBurstIndex(i);
+    ///     } else if (!is_any_of(getComp(), L3LU, L3SU)) {
+    ///       if ((time_bounds[burst_index] == 2 || time_bounds[burst_index] == 4) &&
+    ///           time_offsets[i] == getLdOrStSize() && time_offsets[burst_index] != 0) {
+    ///         setInterleaveGroupIndex(burst_index);
+    ///         setBurstIndex(i);
+    ///       }
+    ///       return;
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// # ⛔⛔ INNERMOST FIRST, AND THE PROMOTION MOVES THE BURST **OUTWARD**
+    ///
+    /// The scan runs from `size() - 1` down to 0 over a vector whose index 0 is the OUTERMOST time
+    /// dimension, so the first valid dimension it meets is the innermost one and that is what takes
+    /// the burst. When a second valid dimension appears further out, the dimension already holding the
+    /// burst is handed to the interleave group and the burst moves out to the current one — see
+    /// [`Self::set_interleave_group_index`], whose doc traces the direction through
+    /// `constructTimeLoops`.
+    ///
+    /// # ⛔ FOUR ARMS, AND THE THREE THAT ARE NOT THE SEARCH ALL DO SOMETHING DIFFERENT
+    ///
+    /// A [`TimeBound::Coalesced`] dimension is SKIPPED and the scan goes on; a
+    /// [`TimeBound::Variable`] one TERMINATES the scan, because a bound the compiler cannot see
+    /// cannot be folded into an instruction field and neither can anything outside it; and
+    /// `Steps(0)` — the reference's empty `else if (curr_bound == 0) {}` — neither claims a field nor
+    /// stops the search. Those are three distinct behaviours behind one `int64_t`'s sign, which is
+    /// what [`TimeBound`] exists to keep apart.
+    ///
+    /// # ⛔⛔ THE `return` AFTER THE GROUP BRANCH IS UNCONDITIONAL, AND THE L3 ARM FALLS THROUGH
+    ///
+    /// Once a burst is held, a non-L3 component gets exactly ONE attempt at the group and then the
+    /// function returns whether or not it took it (`:824`) — so a third valid dimension is never
+    /// examined. An L3 component takes neither branch: `!is_any_of(getComp(), L3LU, L3SU)` is false,
+    /// nothing happens, and the loop keeps scanning outward without ever claiming a group. L3's LDST
+    /// has no interleave-group field to fill.
+    ///
+    /// ⛔ THE GROUP IS ONLY TAKEN FROM A BURST OF **2 OR 4** whose own offset is non-zero, and only
+    /// when the current dimension's offset is exactly one load/store's worth of elements
+    /// ([`AccessDetailsBase::ld_or_st_size`], which is why entry 144 has to have run first). Those
+    /// three conditions are what "interleaved" means in the hardware: two or four consecutive
+    /// transfers, each displaced from the last, repeating one whole instruction's stride outward.
+    ///
+    /// ⛔ THE BOUNDS AND OFFSETS ARE READ FROM COPIES, as `auto time_bounds = getTimeBounds()` is
+    /// (`:797-798`): the setters called inside the loop write `self`, and the reference's copies are
+    /// what keep the comparison `time_bounds[burst_index]` reading the vector as it was on entry.
+    pub fn compute_burst_and_group(&mut self) {
+        let time_bounds = self.time_bounds.clone();
+        let time_offsets = self.time_offsets.clone();
+        let offset = |dim: TimeDim| time_offsets.per_dim.get(dim.index()).copied().unwrap_or(0);
+        let count = u32::try_from(time_bounds.len()).unwrap_or(u32::MAX);
+
+        for position in (0..count).rev() {
+            let dim = TimeDim(position);
+            let Some(curr_bound) = time_bounds.get(dim.index()).copied() else {
+                continue;
+            };
+            match curr_bound {
+                // ignore coalesced time dim
+                TimeBound::Coalesced => continue,
+                // if forOp bound is variable, terminate search
+                TimeBound::Variable => return,
+                TimeBound::Steps(0) => {}
+                // if current bound is valid value, find a field to fit
+                TimeBound::Steps(_) => match self.burst_index {
+                    // always fill in burst field first before group.
+                    None => self.burst_index = Some(dim),
+                    Some(burst_index) => {
+                        // ⛔ L3 CLAIMS NO GROUP AND KEEPS SCANNING — the arm's condition is false, so
+                        // neither the promotion nor the `return` below is reached.
+                        if matches!(self.affine.base.comp, DfirUnit::L3lu | DfirUnit::L3su) {
+                            continue;
+                        }
+                        // if burst field has already been used, check if group field can be used.
+                        let burst_is_interleavable =
+                            matches!(time_bounds[burst_index.index()], TimeBound::Steps(2 | 4));
+                        let one_whole_transfer = u64::try_from(offset(dim))
+                            .is_ok_and(|offset| Elements(offset) == self.affine.base.ld_or_st_size);
+                        if burst_is_interleavable && one_whole_transfer && offset(burst_index) != 0
+                        {
+                            self.set_interleave_group_index(burst_index);
+                            self.burst_index = Some(dim);
+                        }
+                        return;
+                    }
+                },
+            }
+        }
+    }
 }
 
 /// THE ACCESS DETAILS OF A **SYMBOLIC** ACCESS — one whose strides are SSA VALUES rather than
@@ -1374,21 +2269,131 @@ impl<T> AccessContainer<T> {
     pub fn has(&self, moi: MemoryOperandIndex) -> bool {
         self.slots[moi.slot()].is_some()
     }
+
+    /// AN OPERAND'S SLOT, IF IT IS STILL EMPTY — the `!has(moi)` half of `insert`'s first
+    /// `DT_CHECK_MSG` (`AccessDetails.hpp:389-390`), turned into the only way to reach the insertion.
+    ///
+    /// ⛔⛔ THIS IS WHAT REPLACES *"trying to insert into a slot that is already filled"*. The check
+    /// is not moved, it is inverted: a [`VacantSlot`] can only be handed out for an empty slot, it
+    /// borrows the container exclusively so no second one can exist beside it, and
+    /// [`VacantSlot::fill`] consumes it — so filling the same operand twice is not a call the compiler
+    /// accepts. See [`VacantSlot`].
+    #[must_use]
+    pub fn vacancy(&mut self, moi: MemoryOperandIndex) -> Option<VacantSlot<'_, T>> {
+        if self.has(moi) {
+            return None;
+        }
+        Some(VacantSlot {
+            container: self,
+            moi,
+        })
+    }
+
+    /// Replaces: e150_get
+    ///
+    /// **150/384** `AccessContainer::get` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:401`
+    /// (4L).
+    ///
+    /// ```cpp
+    /// const T& get(MemoryOperandIndex moi) const {
+    ///   DT_CHECK_MSG(has(moi),
+    ///                "no entry exists for the requested memory operand index");
+    ///   return this->at(index_mapping_[(int)moi]);
+    /// }
+    /// ```
+    ///
+    /// ⛔⛔ THE `DT_CHECK_MSG` IS THE RETURN TYPE. *"no entry exists for the requested memory operand
+    /// index"* is precisely [`None`], and the reference's own callers already ask the question first —
+    /// `if (has(kDirSrc)) return get(kDirSrc);` is how `getFirst` is written (`:411-418`), and
+    /// `e374_lowerSymbolicVectorLoadOp` and `e327_gatherSymbolicLoadStoreDetails` branch on `has` to
+    /// tell an indirect access from a direct one. An [`Option`] makes the pair one lookup instead of
+    /// two, and there is no path left on which the check can be forgotten.
+    ///
+    /// ⛔ TWO INDIRECTIONS, AND BOTH ARE CHECKED BY THE SAME `?`. `index_mapping_[(int)moi]` is the
+    /// slot and `at(...)` is the entry; the reference's `at` throws where a slot names an entry that
+    /// is not there, which nothing can arrange because [`VacantSlot::fill`] writes the slot and the
+    /// entry together.
+    ///
+    /// ⚠️ THE NON-CONST OVERLOAD (`:406-408`) IS NOT THIS ENTRY. It is a `const_cast` twin of this one
+    /// and no unit of its own; in Rust the shared and exclusive lookups are separate functions, so it
+    /// arrives with the first entry that needs to mutate an entry in place —
+    /// `coalesceTimeDimensions`, which writes `access_details.get(kDirDst).setTimeBounds(...)`
+    /// (`AccessDetails.cpp:787`).
+    #[must_use]
+    pub fn get(&self, moi: MemoryOperandIndex) -> Option<&T> {
+        self.entries.get(self.slots[moi.slot()]?)
+    }
+}
+
+/// PROOF THAT ONE MEMORY OPERAND'S SLOT IS EMPTY, AND THE RIGHT TO FILL IT ONCE.
+///
+/// ⭐⭐ THE TWO `DT_CHECK_MSG`S OF `insert` BECOME THIS TYPE. `AccessDetails.hpp:388-395` guards its
+/// two statements with *"trying to insert into a slot that is already filled"* and *"no more than kMax
+/// entries are allowed"*; both are questions about the container that a caller could get wrong at run
+/// time. Obtained only from [`AccessContainer::vacancy`] and consumed by [`Self::fill`], this handle
+/// answers the first before the call exists and makes the second unreachable — with one slot per
+/// operand and a slot required, at most [`MemoryOperandIndex::COUNT`] entries can ever be pushed,
+/// which is the `kMax` the reference is counting against.
+#[derive(Debug)]
+pub struct VacantSlot<'a, T> {
+    /// The container the entry goes into, borrowed exclusively so no second vacancy can be live.
+    container: &'a mut AccessContainer<T>,
+    /// Which operand the new entry belongs to.
+    moi: MemoryOperandIndex,
+}
+
+impl<T> VacantSlot<'_, T> {
+    /// Replaces: e149_insert
+    ///
+    /// **149/384** `AccessContainer::insert` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:388` (7L).
+    ///
+    /// ```cpp
+    /// void insert(MemoryOperandIndex moi, T access) {
+    ///   DT_CHECK_MSG(!has(moi),
+    ///                "trying to insert into a slot that is already filled");
+    ///   DT_CHECK_MSG(this->size() <= MemoryOperandIndex::kMax,
+    ///                "no more than kMax entries are allowed");
+    ///   index_mapping_[moi] = this->size();
+    ///   this->push_back(access);
+    /// }
+    /// ```
+    ///
+    /// ⭐⭐ THE BODY IS TWO STATEMENTS AND THEIR ORDER IS THE WHOLE OF IT: the slot records
+    /// `size()` — the position the entry is ABOUT to take — and only then is the entry pushed. Reading
+    /// `size()` after the push would map every operand one past its own entry.
+    ///
+    /// ⛔ IT RETURNS `void`. `emplace_insert` (`:377-386`) is the twin that ends `return get(moi)`,
+    /// and it is entry 208; nothing here hands back the entry, so nothing here needs the exclusive
+    /// lookup that `get` has no unit for.
+    ///
+    /// ⛔ `T` BY VALUE, AS THE REFERENCE TAKES IT — `T access` is a copy in C++ and a move here, and
+    /// `push_back` transfers it into the vector either way.
+    ///
+    /// ⛔ CONSUMING `self` IS WHAT MAKES ONE VACANCY ONE INSERTION. See [`VacantSlot`] for the pair of
+    /// `DT_CHECK_MSG`s this retires.
+    pub fn fill(self, access: T) {
+        self.container.slots[self.moi.slot()] = Some(self.container.entries.len());
+        self.container.entries.push(access);
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase,
-        AccessDetailsSymbolic, IndicesCoeffDict, LayoutCoeff, MemoryOperandIndex, TimeBound,
-        TimeDim, TimeOffsets, sen, set_coalesced_bound_values,
+        AccessDetailsSymbolic, ConstructedIndices, IndicesCoeffDict, LayoutCoeff, MemViewSource,
+        MemoryOperandIndex, SubscriptOperand, TimeBound, TimeDim, TimeOffsets, TransferDim,
+        TransferExtents, sen, set_coalesced_bound_values,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::dialects::agen;
-    use crate::islands::dataflow_ir::dialects::{Index, Op as DfirOp, Val};
+    use crate::islands::dataflow_ir::dialects::{
+        Index, Op as DfirOp, Val, affine, arith, dataflow, scf,
+    };
     use crate::islands::dataflow_ir::ty::{
-        AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef, Vector,
+        AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef, ScalarTy, Vector,
     };
     use crate::units::DfirUnit;
 
@@ -2265,5 +3270,1132 @@ mod unit_tests {
         assert_eq!(MemoryOperandIndex::DirDst.slot(), 2);
         assert_eq!(MemoryOperandIndex::IndDst.slot(), 3);
         assert_eq!(MemoryOperandIndex::ALL.len(), MemoryOperandIndex::COUNT);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  143/384 — `constructExtentAndTotalElements`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// THE VIEW THE FIXTURE LOADS FROM — `memref<8x64xf16>`, row major.
+    ///
+    /// `affine_map<(d0, d1) -> (d0 * 64 + d1)>`, which is what a `get_logical_memory_view` over that
+    /// memref carries: 64 elements to a row, one to a column.
+    fn row_major_8x64() -> AffineMap {
+        AffineMap::linear(&[64, 1])
+    }
+
+    /// A SET WITH NO UPPER BOUND ON ITS ONE DIMENSION — `affine_set<(d0) : (d0 >= 0)>`.
+    ///
+    /// ⭐ `IntegerSet::from_sizes` CANNOT BUILD THIS, and that is the point: every set this campaign
+    /// mints is a bound PAIR per dimension, so the reference's *"Not in a hyper-rectangular form"*
+    /// refusal is only reachable from a set written by hand.
+    fn unbounded_above() -> IntegerSet {
+        IntegerSet {
+            dims: 1,
+            symbols: 0,
+            constraints: vec![Constraint {
+                expr: AffineExpr::dim(0),
+                is_equality: false,
+            }],
+        }
+    }
+
+    /// 🎯 143/384 — ONE PINNED DIMENSION AND ONE 64-ELEMENT SPAN GIVE EXTENTS `[1, 64]` AND 64
+    /// ELEMENTS.
+    ///
+    /// ⭐ THIS IS THE FIXTURE'S OWN TRANSFER. `agen.vector_load %view[0, 0]` off `memref<8x64xf16>`
+    /// into `vector<64xf16>`: the load set pins the row and spans the 64 columns, the load order is
+    /// the identity, and the expected count comes from the return type
+    /// (`AccessDetails.cpp:308-309`). All three agree, so the walk ends in
+    /// [`TransferExtents::Rectangular`] with `layout_coeffs_` installed as a side effect (`:45`).
+    #[test]
+    fn a_row_of_sixty_four_elements_reads_back_as_one_pinned_dimension_and_a_span() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(IntegerSet::from_sizes(&[1, 64]));
+        ad.set_transfer_order(AffineMap::identity(2));
+        ad.set_mem_view_layout_map(row_major_8x64());
+        ad.set_expected_total_elements(Elements(LOADED.len));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::Rectangular
+        );
+
+        assert_eq!(ad.extents, vec![Elements(1), Elements(64)]);
+        assert_eq!(ad.total_elements, Elements(64));
+        // ⛔ THE COEFFICIENTS ARE A SIDE EFFECT OF THIS FUNCTION, not of the layout setter — the
+        // strides plus the trailing constant term.
+        assert_eq!(
+            ad.layout_coeffs,
+            vec![LayoutCoeff(64), LayoutCoeff(1), LayoutCoeff(0)]
+        );
+    }
+
+    /// 🎯 143/384 — `total_elements` MULTIPLIES INTO WHATEVER IS ALREADY THERE.
+    ///
+    /// ⛔⛔ THE ACCUMULATOR IS READ, NOT RESET. `auto total_elements = getTotalElements();`
+    /// (`AccessDetails.cpp:54`) starts from the member, and `constructChunkAndShuffleInfo` runs this
+    /// function on the SAME object after having written it (`:220`), so a second walk multiplies
+    /// rather than replaces. Seeding it with 2 turns the 64 above into 128 — which is also why the
+    /// element-count cross-check below has to be against a count the return type states.
+    #[test]
+    fn a_nonzero_total_is_multiplied_into_rather_than_replaced() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(IntegerSet::from_sizes(&[1, 64]));
+        ad.set_transfer_order(AffineMap::identity(2));
+        ad.set_mem_view_layout_map(row_major_8x64());
+        ad.set_total_elements(Elements(2));
+        ad.set_expected_total_elements(Elements(128));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::Rectangular
+        );
+        assert_eq!(ad.total_elements, Elements(128), "2 * 1 * 64");
+    }
+
+    /// 🎯 143/384 — A TRANSPOSING LOAD ORDER TRANSPOSES THE EXTENTS.
+    ///
+    /// ⛔⛔ THE ORDER IS NOT DECORATION. `composeMatchingMap(transfer_order)` re-expresses the set in
+    /// the ORDER's input space (`:35-40`), so the same rectangle walked `(d1, d0)` yields the extents
+    /// the other way round — 64 then 1 rather than 1 then 64. The element count is invariant, which
+    /// is exactly why it cannot catch a transposition and the extents must be checked directly.
+    #[test]
+    fn a_transposing_load_order_transposes_the_extents() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(IntegerSet::from_sizes(&[1, 64]));
+        // `affine_map<(d0, d1) -> (d1, d0)>`.
+        ad.set_transfer_order(AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(1), AffineExpr::dim(0)],
+        });
+        // ⭐ AND THE LAYOUT HAS TO FOLLOW. `affine_map<(d0, d1) -> (d0 + d1 * 64)>` is column major
+        // (`layout_coeffs[0] < layout_coeffs[last_index]`), so the limit on the leading extent is
+        // `layout_coeffs[1] / layout_coeffs[0]` = 64 (`:69-70`) rather than the row-major ratio — the
+        // transposed walk is legal only against the transposed layout.
+        ad.set_mem_view_layout_map(AffineMap::linear(&[1, 64]));
+        ad.set_expected_total_elements(Elements(64));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::Rectangular
+        );
+        assert_eq!(ad.extents, vec![Elements(64), Elements(1)]);
+        assert_eq!(ad.total_elements, Elements(64));
+    }
+
+    /// 🎯 143/384 — AN EXTENT WIDER THAN THE NEXT STRIDE ALLOWS IS REFUSED, AND THE LIMIT IS THE
+    /// STRIDE RATIO.
+    ///
+    /// *"Extent requsted along a dimension is more than its limit"* (`:71-74`). Row major, so
+    /// dimension 1's limit is `layout_coeffs[0] / layout_coeffs[1]` = 64/1 = 64 (`:66-67`); a set
+    /// spanning 128 columns of a 64-column row would read into the next row.
+    #[test]
+    fn an_extent_wider_than_the_stride_ratio_is_refused_with_that_ratio() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(IntegerSet::from_sizes(&[1, 128]));
+        ad.set_transfer_order(AffineMap::identity(2));
+        ad.set_mem_view_layout_map(row_major_8x64());
+        ad.set_expected_total_elements(Elements(128));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::ExtentOverLimit {
+                dim: TransferDim(1),
+                width: 128,
+                limit: 64,
+            }
+        );
+        // ⛔ AND NOTHING IS ROLLED BACK — the refusal returns before `setExtents` (`:87`), so the
+        // extents stay as they were while the coefficients from `:45` are installed.
+        assert!(ad.extents.is_empty());
+        assert_eq!(
+            ad.layout_coeffs,
+            vec![LayoutCoeff(64), LayoutCoeff(1), LayoutCoeff(0)]
+        );
+    }
+
+    /// 🎯 143/384 — THE OUTERMOST DIMENSION OF A ROW-MAJOR LAYOUT HAS NO STRIDE ABOVE IT, SO ITS
+    /// LIMIT IS `width + 1`.
+    ///
+    /// ⭐ `size = (i == 0) ? (width + 1) : ..` (`:66`) — a limit deliberately one MORE than the width
+    /// being tested, which is the reference saying "unbounded" without writing a special case. All
+    /// eight rows of the view are therefore loadable at once, and the check never fires on `i == 0`.
+    #[test]
+    fn the_leading_row_major_dimension_is_never_over_its_limit() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        // All 8 rows and all 64 columns — 512 elements.
+        ad.set_transfer_set(IntegerSet::from_sizes(&[8, 64]));
+        ad.set_transfer_order(AffineMap::identity(2));
+        ad.set_mem_view_layout_map(row_major_8x64());
+        ad.set_expected_total_elements(Elements(512));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::Rectangular
+        );
+        assert_eq!(ad.extents, vec![Elements(8), Elements(64)]);
+        assert_eq!(ad.total_elements, Elements(512));
+    }
+
+    /// 🎯 143/384 — A COUNT THAT DISAGREES WITH THE RETURN TYPE IS REFUSED **AFTER** EVERYTHING IS
+    /// WRITTEN.
+    ///
+    /// *"Number of elements in return type not matching with load_set/store_set elements"*
+    /// (`:89-94`). ⛔ THE ORDER MATTERS: `setTotalElements` and `setExtents` run at `:86-87`, before
+    /// the comparison, so the members hold the SET's answer and the refusal only reports the
+    /// disagreement.
+    #[test]
+    fn a_set_that_disagrees_with_the_return_type_still_writes_the_sets_own_count() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(IntegerSet::from_sizes(&[1, 64]));
+        ad.set_transfer_order(AffineMap::identity(2));
+        ad.set_mem_view_layout_map(row_major_8x64());
+        // A `vector<32xf16>` return type over a 64-element load set.
+        ad.set_expected_total_elements(Elements(32));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::ElementCountMismatch {
+                expected: Elements(32),
+                found: Elements(64),
+            }
+        );
+        assert_eq!(ad.total_elements, Elements(64), "the set's count, written");
+        assert_eq!(ad.extents, vec![Elements(1), Elements(64)]);
+    }
+
+    /// 🎯 143/384 — A DIMENSION WITH ONLY A LOWER BOUND IS NOT A HYPER-RECTANGLE.
+    ///
+    /// *"Not in a hyper-rectangular form"* (`:84`), the `else` of both predicates: `isDimValueZero`
+    /// finds no equality and `isDimAConstantRange` finds a min without a max
+    /// (`dialect_utils/Agen/Utils.cpp:163-169`).
+    #[test]
+    fn a_dimension_with_no_upper_bound_is_not_hyper_rectangular() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(unbounded_above());
+        ad.set_transfer_order(AffineMap::identity(1));
+        ad.set_mem_view_layout_map(AffineMap::linear(&[1]));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::NotHyperRectangular {
+                dim: TransferDim(0)
+            }
+        );
+    }
+
+    /// 🎯 143/384 — AN UPPER BOUND BELOW THE LOWER ONE GIVES A NEGATIVE WIDTH, WHICH IS ITS OWN
+    /// REFUSAL.
+    ///
+    /// *"Extent along a dimension is negative"* (`:80-81`). `5 <= d0 <= 2` is a constant range by
+    /// `isDimAConstantRange`'s reckoning — it finds both bounds — and its `max - min + 1` is `-2`.
+    /// ⛔ THE REFERENCE'S GUARD IS `width > 0`, so a width of exactly zero takes this arm too.
+    #[test]
+    fn an_upper_bound_below_the_lower_one_is_a_negative_extent() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        // `affine_set<(d0) : (d0 - 5 >= 0, -d0 + 2 >= 0)>`.
+        ad.set_transfer_set(IntegerSet {
+            dims: 1,
+            symbols: 0,
+            constraints: vec![
+                Constraint {
+                    expr: AffineExpr::dim(0).plus(AffineExpr::Const(-5)),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(2)),
+                    is_equality: false,
+                },
+            ],
+        });
+        ad.set_transfer_order(AffineMap::identity(1));
+        ad.set_mem_view_layout_map(AffineMap::linear(&[1]));
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::ExtentNotPositive {
+                dim: TransferDim(0),
+                width: -2,
+            }
+        );
+    }
+
+    /// 🎯 143/384 — WITH NO LAYOUT MAP THERE IS NOTHING TO TAKE COEFFICIENTS FROM.
+    ///
+    /// ⭐ THE ONE OUTCOME WITH NO `emitError` BEHIND IT. `getMemViewLayoutMap()` is a null `AffineMap`
+    /// until `initializeMemViewInfo` writes it, and `getMapCoefficients` would dereference it
+    /// (`dialect_utils/Agen/Utils.cpp:65-71`); the reference's own call order makes that unreachable
+    /// (`:461-464` runs entry 145 first), and [`TransferExtents::MemoryViewUnresolved`] is what a
+    /// caller that got the order wrong is told instead of a crash.
+    #[test]
+    fn a_transfer_with_no_memory_view_yet_resolves_nothing() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_transfer_set(IntegerSet::from_sizes(&[1, 64]));
+        ad.set_transfer_order(AffineMap::identity(2));
+        assert_eq!(ad.mem_view_layout_map, None);
+
+        assert_eq!(
+            ad.construct_extent_and_total_elements(),
+            TransferExtents::MemoryViewUnresolved
+        );
+        assert!(ad.layout_coeffs.is_empty(), "nothing was installed");
+        assert_eq!(ad.total_elements, Elements(0));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  144/384 — `constructLdOrStType`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 144/384 — L0 TAKES THE **CHUNK** SIZE AND EVERY OTHER COMPONENT TAKES THE WHOLE TRANSFER.
+    ///
+    /// ⛔⛔ THE FIELD READ IS `expected_total_elements_`, NOT `total_elements_`, even though the
+    /// header calls it "total_elements" (`AccessDetails.hpp:208-210`):
+    ///
+    /// ```cpp
+    /// void AccessDetailsBase::constructLdOrStType() {
+    ///   setLdOrStSize(is_any_of(getComp(), L0LU, L0SU) ? getChunkSize()
+    ///                                                  : getExpectedTotalElements());
+    /// }
+    /// ```
+    ///
+    /// The two counts are seeded from different places and only agree once
+    /// `constructExtentAndTotalElements` has confirmed they do — so on a `ld_or_st_size` derived from
+    /// a transfer that has not been checked yet, it is the RETURN TYPE's count that reaches the
+    /// instruction.
+    #[test]
+    fn the_ld_or_st_size_is_the_chunk_on_l0_and_the_whole_transfer_elsewhere() {
+        let op = vector_load();
+        for comp in [DfirUnit::L0lu, DfirUnit::L0su] {
+            let mut ad = AccessDetailsBase::new(&op, comp);
+            ad.chunk_size = Elements(8);
+            ad.set_expected_total_elements(Elements(64));
+            ad.construct_ld_or_st_type();
+            assert_eq!(ad.ld_or_st_size, Elements(8), "{comp:?} takes the chunk");
+        }
+        for comp in [
+            DfirUnit::Lxlu,
+            DfirUnit::Lxsu,
+            DfirUnit::L3lu,
+            DfirUnit::L3su,
+        ] {
+            let mut ad = AccessDetailsBase::new(&op, comp);
+            ad.chunk_size = Elements(8);
+            ad.set_expected_total_elements(Elements(64));
+            ad.construct_ld_or_st_type();
+            assert_eq!(
+                ad.ld_or_st_size,
+                Elements(64),
+                "{comp:?} takes the whole transfer"
+            );
+        }
+    }
+
+    /// 🎯 144/384 — AND IT READS THE **EXPECTED** COUNT, WHICH THE SET-DERIVED ONE CANNOT STAND IN
+    /// FOR.
+    ///
+    /// ⛔ THE TWO ARE SEPARATE MEMBERS AND THIS IS THE TEST THAT SAYS WHICH ONE. With
+    /// `expected_total_elements_ = 64` and `total_elements_ = 512`, reading the wrong field gives an
+    /// LDST eight times too long — and `computeBurstAndGroup` compares a time offset against exactly
+    /// this value (`:820`), so the interleave group would be claimed on the wrong dimension too.
+    #[test]
+    fn the_ld_or_st_size_is_not_the_set_derived_count() {
+        let op = vector_load();
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.set_expected_total_elements(Elements(64));
+        ad.set_total_elements(Elements(512));
+        ad.construct_ld_or_st_type();
+        assert_eq!(ad.ld_or_st_size, Elements(64));
+        assert_ne!(ad.ld_or_st_size, ad.total_elements);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  145/384 — `initializeMemViewInfo`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// A `dataflow.get_logical_memory_view %unit, %start {layout_map}` binding [`Val`] 1.
+    fn logical_view() -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result: Val(1),
+            from: Val(0),
+            start: Val(21),
+            layout: row_major_8x64(),
+            ty: MemRef {
+                shape: vec![8, 64],
+                elem: ElemType::F16,
+            },
+        })
+    }
+
+    /// The paged form of the same view — one page covering the whole memref.
+    fn paged_view() -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+            dataflow::PagedMemView {
+                result: Val(1),
+                unit: Val(0),
+                start_addr: Val(21),
+                pages: vec![dataflow::Page {
+                    idx_set: dataflow::PageRect {
+                        spans: vec![
+                            dataflow::PageSpan { lo: 0, hi: 7 },
+                            dataflow::PageSpan { lo: 0, hi: 63 },
+                        ],
+                    },
+                    start_addr: Val(22),
+                }],
+                layout: row_major_8x64(),
+                ty: MemRef {
+                    shape: vec![8, 64],
+                    elem: ElemType::F16,
+                },
+            },
+        )))
+    }
+
+    /// 🎯 145/384 — THE THREE MEMBERS ARE WRITTEN TOGETHER FROM THE OP THAT DEFINES THE `mem_ref`.
+    ///
+    /// ```cpp
+    /// if (auto mem_view = mem_ref.getDefiningOp<dataflow::GetLogicalMemoryViewOp>()) {
+    ///   setMemViewLayoutMap(mem_view.getLayoutMap());
+    ///   setMemViewStartAddr(mem_view.getStartAddress());
+    ///   setMemory(mem_view.getFromUnit());
+    /// } else if (auto paged = ..GetPagedLogicalMemoryViewOp>()) { .. } else {
+    ///   return op->emitError("Expecting a memory view producing operation");
+    /// }
+    /// ```
+    ///
+    /// ⛔⛔ THE `emitError` IS [`MemViewSource::of`]'S [`None`], WHICH IS WHY THIS FUNCTION CANNOT
+    /// REFUSE. There is no argument to it that names an op that is not a view, so the third branch has
+    /// nothing left to report — the same witness-constructor shape as `EnclosingLoop::of`.
+    #[test]
+    fn the_view_writes_the_layout_the_start_and_the_unit_together() {
+        let op = vector_load();
+        let scope = vec![logical_view()];
+        let source = MemViewSource::of(Val(1), &scope).expect("a get_logical_memory_view");
+
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.initialize_mem_view_info(source);
+
+        assert_eq!(ad.mem_view_layout_map, Some(row_major_8x64()));
+        assert_eq!(ad.mem_view_start_addr, Some(Val(21)));
+        assert_eq!(ad.memory, Some(Val(0)), "the unit, not the view");
+    }
+
+    /// 🎯 145/384 — A PAGED VIEW ANSWERS WITH ITS OWN THREE, AND WITH `%start_addr` RATHER THAN A
+    /// PAGE'S.
+    ///
+    /// ⛔ `getStartAddr()` AND NOT A PAGE'S. The reference reads the paged op's own three getters
+    /// (`:282-284`); a page's `start_addr` is RELATIVE to this one, so taking it would place every
+    /// access at the wrong base. [`Val`] 22 below is the page's and must not appear.
+    #[test]
+    fn a_paged_view_answers_with_the_views_own_start_and_not_a_pages() {
+        let op = vector_load();
+        let scope = vec![paged_view()];
+        let source = MemViewSource::of(Val(1), &scope).expect("a paged view");
+
+        let mut ad = AccessDetailsBase::new(&op, DfirUnit::Lxlu);
+        ad.initialize_mem_view_info(source);
+
+        assert_eq!(ad.mem_view_layout_map, Some(row_major_8x64()));
+        assert_eq!(ad.mem_view_start_addr, Some(Val(21)));
+        assert_ne!(ad.mem_view_start_addr, Some(Val(22)));
+        assert_eq!(ad.memory, Some(Val(0)));
+    }
+
+    /// 🎯 145/384 — AND AN OP THAT IS NOT A VIEW IS *"Expecting a memory view producing operation"*.
+    #[test]
+    fn an_operand_that_is_not_a_view_has_no_source() {
+        let scope = vec![DfirOp::Arith(arith::Op::Constant {
+            result: Val(1),
+            value: 0,
+        })];
+        assert!(MemViewSource::of(Val(1), &scope).is_none());
+        // And a value nothing in scope defines at all.
+        assert!(MemViewSource::of(Val(99), &scope).is_none());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  146/384 — `constructIndices`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// A scope holding an `affine.for %arg0 = 0 to 8` whose induction variable is [`Val`] 30, an
+    /// `scf.for` binding [`Val`] 31, an `arith.constant 0` binding [`Val`] 40, and an `arith.addi`
+    /// binding [`Val`] 50.
+    fn subscript_scope() -> Vec<DfirOp> {
+        vec![
+            DfirOp::Affine(affine::Op::For {
+                iv: Val(30),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(8),
+                carried: vec![affine::Carried {
+                    init: Val(41),
+                    arg: Val(32),
+                    result: Val(33),
+                }],
+                body: vec![],
+                dbg_name: None,
+            }),
+            DfirOp::Scf(scf::Op::For {
+                iv: Val(31),
+                lo: Val(42),
+                hi: Val(43),
+                step: Val(44),
+                carried: vec![],
+                body: vec![],
+                dbg_name: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(40),
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: Val(50),
+                lhs: Val(30),
+                rhs: Val(40),
+                ty: ScalarTy::Index,
+            })),
+        ]
+    }
+
+    /// 🎯 146/384 — A CONSTANT SUBSCRIPT LEAVES `indices_` AND MOVES INTO THE MAP.
+    ///
+    /// ```cpp
+    /// for (auto index : llvm::enumerate(indices)) { .. }
+    /// setIndices(new_indices);
+    /// if (fold_operands) {
+    ///   auto operand_exprs = ..;                      // dim(n) or constant, per operand
+    ///   subscripts_map = subscripts_map.replaceDimsAndSymbols(operand_exprs, {}, ndims, 0);
+    ///   setSubscriptsMap(subscripts_map);
+    /// }
+    /// ```
+    ///
+    /// ⛔⛔ THE RENUMBERING IS THE WHOLE OF IT. `%view[%i, 0]` keeps one index and its map must become
+    /// one-dimensional — `(d0, d1) -> (d0, d1)` folds to `(d0) -> (d0, 0)`. Leaving the arity at two
+    /// would make every later `compose` read a dimension the access no longer has.
+    #[test]
+    fn a_constant_subscript_folds_into_the_map_and_renumbers_the_rest() {
+        let op = composite_load_and_store();
+        let scope = subscript_scope();
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30), Val(40)]);
+        affine.set_subscripts_map(AffineMap::identity(2));
+
+        assert_eq!(affine.construct_indices(&scope), ConstructedIndices::Affine);
+
+        assert_eq!(affine.base.indices, vec![Val(30)], "the constant is gone");
+        assert_eq!(
+            affine.subscripts_map,
+            Some(AffineMap {
+                dims: 1,
+                syms: 0,
+                results: vec![AffineExpr::dim(0), AffineExpr::Const(0)],
+            })
+        );
+    }
+
+    /// 🎯 146/384 — WITH NO CONSTANT AMONG THEM THE MAP IS LEFT EXACTLY AS IT WAS.
+    ///
+    /// ⭐ `fold_operands` GATES THE REWRITE (`:376-383`), and an `scf.for`'s induction variable
+    /// passes the affine-loop test alongside an `affine.for`'s: `isa<affine::AffineForOp, scf::ForOp>`
+    /// (`:361-362`).
+    #[test]
+    fn two_loop_iterators_leave_the_map_untouched() {
+        let op = composite_load_and_store();
+        let scope = subscript_scope();
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30), Val(31)]);
+        affine.set_subscripts_map(AffineMap::identity(2));
+
+        assert_eq!(affine.construct_indices(&scope), ConstructedIndices::Affine);
+        assert_eq!(affine.base.indices, vec![Val(30), Val(31)]);
+        assert_eq!(affine.subscripts_map, Some(AffineMap::identity(2)));
+    }
+
+    /// 🎯 146/384 — A LOOP'S **CARRIED** ARGUMENT PASSES THE TEST TOO.
+    ///
+    /// ⛔⛔ AND THE REFERENCE MEANS IT TO. The check is on the owning op's TYPE — *"if the operand is a
+    /// block argument of an affine loop"* — not on whether the value is that loop's induction
+    /// variable, so `iter_args(%arg1 = %c0)`'s `%arg1` is kept in `indices_` as readily as `%arg0`.
+    /// [`Val`] 32 is the carried argument of the fixture's `affine.for`.
+    #[test]
+    fn a_carried_argument_counts_as_a_loop_iterator() {
+        let op = composite_load_and_store();
+        let scope = subscript_scope();
+        assert_eq!(
+            SubscriptOperand::of(Val(32), &scope),
+            SubscriptOperand::LoopIterator
+        );
+
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(32)]);
+        affine.set_subscripts_map(AffineMap::identity(1));
+        assert_eq!(affine.construct_indices(&scope), ConstructedIndices::Affine);
+        assert_eq!(affine.base.indices, vec![Val(32)]);
+    }
+
+    /// 🎯 146/384 — A COMPOSITE'S `load_iv` IS A REGION ARGUMENT OF SOMETHING THAT IS NOT A LOOP.
+    ///
+    /// *"The loop iterators involved in the agen memory operation subscripts have to be affine
+    /// loops"* (`:363-365`). ⛔ AND THE REFUSAL RETURNS BEFORE `setIndices` (`:374`), so the original
+    /// list survives intact — a refused access is not left with a truncated subscript list.
+    #[test]
+    fn a_region_argument_of_a_non_loop_is_not_an_affine_iterator() {
+        let op = composite_load_and_store();
+        let mut scope = subscript_scope();
+        scope.push(DfirOp::Agen(op.clone()));
+
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30), Val(9)]);
+        affine.set_subscripts_map(AffineMap::identity(2));
+
+        assert_eq!(
+            affine.construct_indices(&scope),
+            ConstructedIndices::NotAnAffineLoopIterator { index: Val(9) }
+        );
+        assert_eq!(
+            affine.base.indices,
+            vec![Val(30), Val(9)],
+            "the refusal returns before setIndices"
+        );
+        assert_eq!(affine.subscripts_map, Some(AffineMap::identity(2)));
+    }
+
+    /// 🎯 146/384 — A COMPUTED SUBSCRIPT IS NEITHER AN ITERATOR NOR A CONSTANT.
+    ///
+    /// *"All the map operands need to be either loop iterators or constant values"* (`:370-372`).
+    /// [`Val`] 50 is `arith.addi %arg0, %c0` — affine in form, but not a value this lowering can
+    /// attach a coefficient to.
+    #[test]
+    fn a_computed_subscript_is_refused_and_the_indices_survive() {
+        let op = composite_load_and_store();
+        let scope = subscript_scope();
+        assert_eq!(
+            SubscriptOperand::of(Val(50), &scope),
+            SubscriptOperand::Computed
+        );
+
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(50)]);
+        affine.set_subscripts_map(AffineMap::identity(1));
+
+        assert_eq!(
+            affine.construct_indices(&scope),
+            ConstructedIndices::NotAnIteratorOrConstant { index: Val(50) }
+        );
+        assert_eq!(affine.base.indices, vec![Val(50)]);
+    }
+
+    /// 🎯 146/384 — AN ALL-CONSTANT ACCESS LEAVES NO INDICES AND A NULLARY MAP.
+    ///
+    /// ⭐ THIS IS THE FIXTURE'S STORE HALF: `dst_indices` is five `arith.constant 0`s, which is what
+    /// `tests/sentient_corpus`' composite transfers write. The map that comes out takes no dimensions
+    /// at all, and its results are the constants themselves.
+    #[test]
+    fn an_all_constant_access_leaves_a_nullary_map() {
+        let op = composite_load_and_store();
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(40),
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(45),
+                value: 3,
+            }),
+        ];
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(40), Val(45)]);
+        affine.set_subscripts_map(AffineMap::identity(2));
+
+        assert_eq!(affine.construct_indices(&scope), ConstructedIndices::Affine);
+        assert!(affine.base.indices.is_empty());
+        assert_eq!(
+            affine.subscripts_map,
+            Some(AffineMap {
+                dims: 0,
+                syms: 0,
+                results: vec![AffineExpr::Const(0), AffineExpr::Const(3)],
+            })
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  147/384 — `constructIteratorCoefficients`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 147/384 — EACH ITERATOR'S COEFFICIENT IS ITS STRIDE THROUGH THE **COMPOSED** MAP.
+    ///
+    /// ```cpp
+    /// AffineMap composed_load_order_map = getTransferOrder().compose(getSubscriptsMap());
+    /// AffineMap composed_layout_map = getMemViewLayoutMap().compose(composed_load_order_map);
+    /// SmallVector<int64_t> composed_layout_coeffs = constructDimCoefficients(composed_layout_map);
+    /// ..
+    /// indices_coeff_dict[index] = composed_layout_coeffs[i];
+    /// indices_coeff_dict[nullptr] = composed_layout_coeffs.back();
+    /// ```
+    ///
+    /// ⛔⛔ TWO COMPOSITIONS, NOT ONE, AND THE ORDER IS OUTERMOST-FIRST. The subscripts map goes
+    /// through the transfer ORDER before it meets the LAYOUT, so a transposing order changes every
+    /// coefficient. Here both are the identity over `(i, j)` and the layout is row-major
+    /// `d0 * 64 + d1`, so `%i` strides 64 elements and `%j` strides 1 — which is the reference's own
+    /// worked example, `2*i + 3*j + 10` in shape (`dialect_utils/Agen/Utils.cpp:73-81`).
+    #[test]
+    fn each_iterator_gets_its_stride_through_the_composed_layout() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30), Val(31)]);
+        affine.base.set_transfer_order(AffineMap::identity(2));
+        affine.base.set_mem_view_layout_map(row_major_8x64());
+        affine.set_subscripts_map(AffineMap::identity(2));
+
+        affine.construct_iterator_coefficients();
+
+        assert_eq!(
+            affine.indices_coeff_dict,
+            IndicesCoeffDict {
+                per_index: vec![(Val(30), 64), (Val(31), 1)],
+                constant: 0,
+            }
+        );
+    }
+
+    /// 🎯 147/384 — A TRANSPOSING TRANSFER ORDER SWAPS THE COEFFICIENTS.
+    ///
+    /// ⛔ THE PROOF THAT THE ORDER IS COMPOSED IN AND NOT IGNORED. Same indices, same layout, order
+    /// `(d0, d1) -> (d1, d0)`: `%i` now strides 1 and `%j` strides 64. An implementation that read the
+    /// layout coefficients directly would give the same answer as the test above and pass it.
+    #[test]
+    fn a_transposing_transfer_order_swaps_the_iterator_coefficients() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30), Val(31)]);
+        affine.base.set_transfer_order(AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(1), AffineExpr::dim(0)],
+        });
+        affine.base.set_mem_view_layout_map(row_major_8x64());
+        affine.set_subscripts_map(AffineMap::identity(2));
+
+        affine.construct_iterator_coefficients();
+
+        assert_eq!(
+            affine.indices_coeff_dict,
+            IndicesCoeffDict {
+                per_index: vec![(Val(30), 1), (Val(31), 64)],
+                constant: 0,
+            }
+        );
+    }
+
+    /// 🎯 147/384 — THE CONSTANT TERM IS THE COMPOSED MAP'S, AND IT IS NOT AN ITERATOR'S.
+    ///
+    /// ⭐⭐ `composed_layout_coeffs.back()` IS ALWAYS THE CONSTANT. The reference writes
+    /// `(composed_layout_coeffs.size() == indices.size() + 1) ? back() : 0` (`:419-421`), and the
+    /// ternary can only ever take the first arm: a flattened row is `numDims + numSymbols + 1` wide
+    /// and the dimensions ARE the surviving indices. A subscripts map with an offset — `(d0) -> (d0 + 3)`
+    /// over a row-major layout — puts `3 * 64 = 192` there.
+    #[test]
+    fn the_constant_term_is_the_composed_offset_and_not_an_index() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30)]);
+        affine.base.set_transfer_order(AffineMap::identity(2));
+        affine.base.set_mem_view_layout_map(row_major_8x64());
+        // `(d0) -> (d0 + 3, 0)` — a row offset of three on a one-iterator access.
+        affine.set_subscripts_map(AffineMap {
+            dims: 1,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(0).plus(AffineExpr::Const(3)),
+                AffineExpr::Const(0),
+            ],
+        });
+
+        affine.construct_iterator_coefficients();
+
+        assert_eq!(
+            affine.indices_coeff_dict,
+            IndicesCoeffDict {
+                per_index: vec![(Val(30), 64)],
+                constant: 192,
+            }
+        );
+    }
+
+    /// 🎯 147/384 — WITH EITHER MAP STILL ABSENT THE DICTIONARY IS EMPTY RATHER THAN WRONG.
+    ///
+    /// ⭐ THE `nullptr` KEY IS THE REFERENCE'S ONLY ENTRY ON THIS PATH TOO. `subscripts_map_` is null
+    /// until `constructIndices` runs and `mem_view_layout_map_` until entry 145 does; MLIR's
+    /// `compose` on a null map is a null dereference, so this is the ordering the reference's callers
+    /// keep (`:466-474`) rather than a case it handles.
+    #[test]
+    fn an_unresolved_map_leaves_the_dictionary_at_its_default() {
+        let op = composite_load_and_store();
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30)]);
+        affine.base.set_transfer_order(AffineMap::identity(1));
+
+        // Layout present, subscripts absent.
+        affine.base.set_mem_view_layout_map(row_major_8x64());
+        affine.construct_iterator_coefficients();
+        assert_eq!(affine.indices_coeff_dict, IndicesCoeffDict::default());
+
+        // Subscripts present, layout absent.
+        let mut affine = fresh_affine(&op);
+        affine.base.set_indices(&[Val(30)]);
+        affine.base.set_transfer_order(AffineMap::identity(1));
+        affine.set_subscripts_map(AffineMap::identity(1));
+        affine.construct_iterator_coefficients();
+        assert_eq!(affine.indices_coeff_dict, IndicesCoeffDict::default());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  148/384 — `computeBurstAndGroup`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// A composite whose bounds, offsets, component and load size are all set at once.
+    fn burst_case<'a>(
+        op: &'a agen::Op,
+        comp: DfirUnit,
+        bounds: &[TimeBound],
+        offsets: &[i64],
+        ld_or_st_size: Elements,
+    ) -> AccessDetailsAffineComposite<'a> {
+        let mut details = AccessDetailsAffineComposite::new(op, comp);
+        details.set_time_bounds(bounds);
+        details.set_time_offsets(TimeOffsets {
+            per_dim: offsets.to_vec(),
+            constant: 0,
+        });
+        details.affine.base.ld_or_st_size = ld_or_st_size;
+        details
+    }
+
+    /// 🎯 148/384 — THE BURST LANDS ON THE **INNERMOST** VALID DIMENSION.
+    ///
+    /// ⛔⛔ THE SCAN'S DIRECTION IS THE RESULT. `for (int i = time_bounds.size() - 1; i >= 0; --i)`
+    /// (`:798`) over a vector whose index 0 is the OUTERMOST dimension
+    /// (`Helper.cpp:1808-1857` nests loop `idx` inside `idx - 1`), so dimension 1 is examined first
+    /// and takes the field. Dimension 0's `Steps(0)` is the reference's empty
+    /// `else if (curr_bound == 0) {}` arm — it neither claims a field nor stops the search.
+    #[test]
+    fn the_burst_is_claimed_on_the_innermost_valid_dimension() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[TimeBound::Steps(0), TimeBound::Steps(8)],
+            &[0, 512],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(1)));
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    /// 🎯 148/384 — WITH A SECOND VALID DIMENSION THE GROUP TAKES THE OLD BURST AND THE BURST MOVES
+    /// OUTWARD.
+    ///
+    /// ⭐ ALL THREE CONJUNCTS HOLD (`:815-817`): the held burst's bound is 2, the current dimension's
+    /// offset is exactly one load's worth of elements, and the burst's own offset is nonzero. The
+    /// group therefore gets the value `getBurstIndex()` had BEFORE the reassignment, which is what
+    /// makes `stride_step` read the inner dimension's offset (`Helper.cpp:1859-1863`).
+    #[test]
+    fn a_second_valid_dimension_promotes_the_burst_and_seats_the_group() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[TimeBound::Steps(8), TimeBound::Steps(2)],
+            &[64, 4096],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(0)));
+        assert_eq!(details.interleave_group_index, Some(TimeDim(1)));
+    }
+
+    /// 🎯 148/384 — A BURST BOUND THAT IS NOT 2 OR 4 TAKES NO GROUP, AND THE SCAN STOPS ANYWAY.
+    ///
+    /// ⛔⛔ THE `return` AT `:824` IS OUTSIDE THE `if`. Once a burst is held, a non-L3 component gets
+    /// exactly ONE attempt at the group and then returns whether or not it took it — so dimension 0
+    /// below is never examined even though it would promote. A `return` moved inside the `if` would
+    /// give `burst = 0`, `group = 1` here.
+    #[test]
+    fn a_burst_bound_outside_two_or_four_ends_the_scan_without_a_group() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[
+                TimeBound::Steps(2),
+                TimeBound::Steps(4),
+                TimeBound::Steps(8),
+            ],
+            &[64, 64, 4096],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(2)), "the innermost");
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    /// 🎯 148/384 — AN OFFSET THAT IS NOT ONE WHOLE TRANSFER TAKES NO GROUP EITHER.
+    ///
+    /// `time_offsets[i] == getLdOrStSize()` (`:816`) — the outer dimension must step by exactly one
+    /// load's worth of elements for the two inner transfers to be interleaved rather than scattered.
+    /// 128 against a 64-element load fails it, and the `return` still fires.
+    #[test]
+    fn an_offset_that_is_not_one_transfer_wide_takes_no_group() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[TimeBound::Steps(8), TimeBound::Steps(2)],
+            &[128, 4096],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(1)));
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    /// 🎯 148/384 — AND NEITHER DOES A BURST WHOSE OWN OFFSET IS ZERO.
+    ///
+    /// `time_offsets[burst_index] != 0` (`:817`): two transfers at the same address are not two
+    /// interleaved transfers.
+    #[test]
+    fn a_burst_with_no_offset_of_its_own_takes_no_group() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[TimeBound::Steps(8), TimeBound::Steps(2)],
+            &[64, 0],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(1)));
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    /// 🎯 148/384 — A COALESCED DIMENSION IS SKIPPED AND THE SCAN CARRIES ON PAST IT.
+    ///
+    /// ⛔ `continue`, NOT `return` (`:803-805`). A merged-away dimension neither takes a field nor
+    /// stops the search, so the promotion below still fires from dimension 0 across a coalesced
+    /// dimension 1 — and it is dimension 2, not dimension 1, that becomes the group.
+    #[test]
+    fn a_coalesced_dimension_is_skipped_and_the_scan_continues_past_it() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[
+                TimeBound::Steps(8),
+                TimeBound::Coalesced,
+                TimeBound::Steps(2),
+            ],
+            &[64, 0, 4096],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(0)));
+        assert_eq!(details.interleave_group_index, Some(TimeDim(2)));
+    }
+
+    /// 🎯 148/384 — A VARIABLE BOUND TERMINATES THE SCAN.
+    ///
+    /// ⛔⛔ `else if (curr_bound < 0) return;` (`:806-807`) — and `kCoalesced` is `-2`, so the ORDER of
+    /// the two arms is what keeps a merged dimension from ending the search. Dimension 0 here would
+    /// promote on every conjunct; the variable dimension 1 above it means it is never reached.
+    #[test]
+    fn a_variable_bound_terminates_the_scan_before_the_promotion() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(
+            &op,
+            DfirUnit::Lxlu,
+            &[
+                TimeBound::Steps(8),
+                TimeBound::Variable,
+                TimeBound::Steps(2),
+            ],
+            &[64, 0, 4096],
+            Elements(64),
+        );
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, Some(TimeDim(2)));
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    /// 🎯 148/384 — L3 CLAIMS NO GROUP AND KEEPS SCANNING OUTWARD.
+    ///
+    /// ⛔⛔ THE L3 ARM FALLS THROUGH — it takes neither the promotion nor the `return`, because
+    /// `!is_any_of(getComp(), L3LU, L3SU)` is false and the `if` has no `else` (`:813-825`). L3's LDST
+    /// has no interleave-group field to fill. The identical input on an LX component promotes
+    /// ([`a_second_valid_dimension_promotes_the_burst_and_seats_the_group`]); here the burst stays on
+    /// the innermost dimension and the loop runs to the top of the nest.
+    #[test]
+    fn an_l3_component_claims_no_group_and_scans_to_the_top() {
+        let op = composite_load_and_store();
+        for comp in [DfirUnit::L3lu, DfirUnit::L3su] {
+            let mut details = burst_case(
+                &op,
+                comp,
+                &[TimeBound::Steps(8), TimeBound::Steps(2)],
+                &[64, 4096],
+                Elements(64),
+            );
+
+            details.compute_burst_and_group();
+
+            assert_eq!(details.burst_index, Some(TimeDim(1)), "{comp:?}");
+            assert_eq!(details.interleave_group_index, None, "{comp:?}");
+        }
+    }
+
+    /// 🎯 148/384 — A NEST WITH NO TIME DIMENSIONS LEAVES BOTH FIELDS UNSET.
+    ///
+    /// ⭐ WHICH IS THE `-1`/`-1` THE EMITTER READS AS "no burst, no group": `size() - 1` on an empty
+    /// vector is where the reference's `int i` signedness earns its keep, and the [`None`]s here are
+    /// the same answer without it.
+    #[test]
+    fn an_empty_time_nest_claims_neither_field() {
+        let op = composite_load_and_store();
+        let mut details = burst_case(&op, DfirUnit::Lxlu, &[], &[], Elements(64));
+
+        details.compute_burst_and_group();
+
+        assert_eq!(details.burst_index, None);
+        assert_eq!(details.interleave_group_index, None);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  149/384 and 150/384 — `AccessContainer::insert` and `::get`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 149/384 + 150/384 — A FILLED SLOT ANSWERS `has` AND HANDS BACK THE ENTRY.
+    #[test]
+    fn filling_a_vacancy_makes_the_operand_present_and_readable() {
+        let mut container = AccessContainer::<Val>::default();
+        container
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("a fresh container has every slot empty")
+            .fill(Val(7));
+
+        assert!(container.has(MemoryOperandIndex::DirSrc));
+        assert_eq!(container.get(MemoryOperandIndex::DirSrc), Some(&Val(7)));
+        assert_eq!(container.entries(), &[Val(7)]);
+    }
+
+    /// 🎯 149/384 — *"trying to insert into a slot that is already filled"* IS A [`None`] BEFORE THE
+    /// CALL EXISTS.
+    ///
+    /// ⛔⛔ THE CHECK IS INVERTED, NOT MOVED (`AccessDetails.hpp:389-390`). A second
+    /// [`AccessContainer::vacancy`] on a filled operand answers [`None`], so there is nothing to
+    /// `.fill()` — and because the vacancy borrows the container exclusively and `fill` consumes it,
+    /// two live vacancies on one container do not compile either.
+    #[test]
+    fn a_filled_slot_yields_no_second_vacancy() {
+        let mut container = AccessContainer::<Val>::default();
+        container
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("empty")
+            .fill(Val(7));
+
+        assert!(container.vacancy(MemoryOperandIndex::DirSrc).is_none());
+        assert_eq!(container.entries(), &[Val(7)], "and nothing was appended");
+    }
+
+    /// 🎯 149/384 — THE SLOT RECORDS THE POSITION THE ENTRY IS **ABOUT TO** TAKE.
+    ///
+    /// ⛔⛔ `index_mapping_[moi] = this->size();` COMES BEFORE `push_back` (`:393-394`). Filling
+    /// `kDirDst` first and `kDirSrc` second — which is not the order the enum declares them in — must
+    /// map dst to entry 0 and src to entry 1. Reading `size()` after the push would map every operand
+    /// one past its own entry, and `getFirst` would hand a store's details to a load.
+    #[test]
+    fn the_slot_is_the_position_before_the_push_not_after() {
+        let mut container = AccessContainer::<Val>::default();
+        container
+            .vacancy(MemoryOperandIndex::DirDst)
+            .expect("empty")
+            .fill(Val(11));
+        container
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("empty")
+            .fill(Val(22));
+
+        assert_eq!(container.entries(), &[Val(11), Val(22)], "insertion order");
+        assert_eq!(container.slots, [Some(1), None, Some(0), None]);
+        assert_eq!(container.get(MemoryOperandIndex::DirDst), Some(&Val(11)));
+        assert_eq!(container.get(MemoryOperandIndex::DirSrc), Some(&Val(22)));
+    }
+
+    /// 🎯 150/384 — *"no entry exists for the requested memory operand index"* IS [`None`].
+    ///
+    /// ⭐ AND THE REFERENCE'S OWN CALLERS ALREADY ASK THE QUESTION FIRST — `getFirst` is written
+    /// `if (has(kDirSrc)) return get(kDirSrc);` (`:411-418`), so the [`Option`] makes one lookup of
+    /// what was two.
+    #[test]
+    fn an_empty_slot_has_no_entry_to_get() {
+        let mut container = AccessContainer::<Val>::default();
+        container
+            .vacancy(MemoryOperandIndex::IndSrc)
+            .expect("empty")
+            .fill(Val(3));
+
+        assert_eq!(container.get(MemoryOperandIndex::IndSrc), Some(&Val(3)));
+        for moi in [
+            MemoryOperandIndex::DirSrc,
+            MemoryOperandIndex::DirDst,
+            MemoryOperandIndex::IndDst,
+        ] {
+            assert_eq!(container.get(moi), None, "{moi:?} was never filled");
+        }
+    }
+
+    /// 🎯 149/384 — *"no more than kMax entries are allowed"* IS STRUCTURALLY UNREACHABLE.
+    ///
+    /// ⛔⛔ ONE SLOT PER OPERAND AND A SLOT REQUIRED. Filling all four leaves exactly
+    /// [`MemoryOperandIndex::COUNT`] entries, and a fifth `fill` has no operand left to name — so the
+    /// second `DT_CHECK_MSG` (`:391-392`) is counting against a bound the type already imposes.
+    #[test]
+    fn every_operand_can_be_filled_once_and_that_is_the_whole_bound() {
+        let mut container = AccessContainer::<Val>::default();
+        for (i, moi) in MemoryOperandIndex::ALL.into_iter().enumerate() {
+            let value = Val(u32::try_from(i).expect("four operands fit a u32"));
+            container.vacancy(moi).expect("still empty").fill(value);
+        }
+
+        assert_eq!(container.entries().len(), MemoryOperandIndex::COUNT);
+        for (i, moi) in MemoryOperandIndex::ALL.into_iter().enumerate() {
+            assert!(container.vacancy(moi).is_none(), "{moi:?} is filled");
+            let value = Val(u32::try_from(i).expect("four operands fit a u32"));
+            assert_eq!(container.get(moi), Some(&value));
+        }
     }
 }
