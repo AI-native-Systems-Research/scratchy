@@ -76,6 +76,10 @@
 //!
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp`, `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp`
 
+use std::collections::VecDeque;
+
+use super::vc_vector_operands::OpId;
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 // THE BASE LAYER — `mlir::OperationNode` AND `mlir::OperationTreeBase`
 // (`dcc/src/Analysis/OperationTree.hpp`, `dcc/src/Analysis/OperationTree.cpp`)
@@ -113,7 +117,7 @@
 ///
 /// ⛔ IDS ARE MINTED ONLY BY THE TREE THAT OWNS THEM, which is why every read below indexes without
 /// a bounds question: an `OperationNodeId` can only have come from [`OperationTreeBase::with_root`]
-/// or [`OperationTreeBase::push_child`], the field is private, and nothing removes a node (the C++
+/// or one of its two inserts, the field is private, and nothing removes a node (the C++
 /// `unlink`/`clear` are entry 179's, in the other family's file).
 ///
 /// ⚠️ WHAT THAT DOES *NOT* RULE OUT is an id minted by one tree being read against another. It cannot
@@ -131,8 +135,8 @@ pub struct OperationNodeId(usize);
 /// ⛔ THERE IS NO `prev_sibling_` AND NO `last_child_` FIELD, and that is load-bearing rather than an
 /// omission to tidy up. `getPrevSibling` and `getLastChild` WALK the parent's chain
 /// (`OperationTree.cpp:30-46`) — they are O(children) and derive their answer from the three links
-/// alone. Caching either would be a second source of truth for one relation, and
-/// [`OperationTreeBase::push_child`] would then have two things to keep in step.
+/// alone. Caching either would be a second source of truth for one relation, and the insert
+/// ([`OperationTreeBase::push_child`]) would then have two things to keep in step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Links {
     /// `OperationNode *parent_operation_ = nullptr;` (`hpp:186`).
@@ -159,12 +163,89 @@ impl Links {
 /// the base of `LoopMaskNode` (`LoopMaskTree.hpp:28`) and of `LocalOpNode`
 /// (`FlatteningLocalRegions.cpp:47`); what each derived class adds is state, not overridden
 /// structure — the links, the walks and `insertChildNode` are the base's and are never overridden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ⛔ NOT `Copy`, AND THE FIELD BELOW IS WHY: an [`OpId`] owns its path. `Clone` survives only
+/// because [`OperationTreeBase`] is `Clone` and a WHOLE-TREE clone is sound where a single-node copy
+/// is not — the links are indices into the tree's own arena, so cloning every node together
+/// reproduces the same graph, while cloning one node would put two nodes with the same links and the
+/// same operation in one sibling chain. That single-node copy is what `OperationNode` deletes
+/// (`OperationTree.hpp:30-31`) and what `LocalOpNode` refuses to derive
+/// (`tf_flattening_local_regions.rs`); it is unreachable here because this type is private to this
+/// module.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Node<N> {
+    /// `Operation *operation_op_;` (`OperationTree.hpp:185`) — see [`Node::new`], entry 079.
+    op: Option<OpId>,
     /// The three links.
     links: Links,
     /// What the derived class adds.
     payload: N,
+}
+
+impl<N> Node<N> {
+    /// Replaces: e079_OperationNode
+    ///
+    /// **079/384** `LoopMaskNode::LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32` (0L).
+    ///
+    /// ```cpp
+    /// LoopMaskNode(Operation *op) : OperationNode(op) {};
+    /// ```
+    ///
+    /// which is the base's constructor and its three member initialisers:
+    ///
+    /// ```cpp
+    /// OperationNode(Operation *op) : operation_op_(op) {}
+    /// // ...
+    /// Operation *operation_op_;
+    /// OperationNode *parent_operation_ = nullptr;
+    /// OperationNode *first_child_ = nullptr;
+    /// OperationNode *next_sibling_ = nullptr;
+    /// ```
+    ///
+    /// # ⭐⭐ WHAT A ZERO-LINE CONSTRUCTOR DECIDES: A NODE **NAMES AN OPERATION** AND IS **DETACHED**
+    ///
+    /// Every one of the three links starts null and the insert (`insertChildNode`,
+    /// `OperationTree.cpp:239-254`) is the only thing that wires them, so a node that was minted but
+    /// never inserted is in no tree at all rather than in a broken one. That is why the mint sites
+    /// here are the insert sites: [`OperationTreeBase::with_root`],
+    /// [`OperationTreeBase::push_child`] and [`OperationTreeBase::push_named_child`].
+    ///
+    /// # 🛑 THE OPERATION IS AN [`OpId`] — A POSITION, NOT A BORROW
+    ///
+    /// ⛔⛔ A `&DfirOp` WOULD FREEZE THE PROGRAM AGAINST THE VERY REWRITES THIS TREE EXISTS FOR. The
+    /// reference builds one tree per PT program unit and then threads it through three *mutating*
+    /// passes — `fuseNonComputeOps`, `fuseComputeOps` and `lowerDanglingNonComputeOps`
+    /// (`VectorChainToSentientPT.cpp:1003-1014`) — and `insertPTMaskOps` walks it while inserting
+    /// `sentient.set_mask`/`incrmask` ops into the body (`LoweringPTMasks.cpp:74-100`). A shared
+    /// borrow of an op held across those calls forbids them; an owned position does not.
+    ///
+    /// ⭐ AND THE REFERENCE ITSELF SAYS IDENTITY MUST SURVIVE REWRITING: `updateNode(from, to)`
+    /// (entry 237, `LoopMaskTree.cpp:155-165`) exists precisely because a lowering REPLACES the op a
+    /// node names, and it re-keys `op_to_node_` in the same breath. A borrow cannot express that; a
+    /// re-assignable [`OpId`] can.
+    ///
+    /// ⚠️ SO THIS DIVERGES FROM `LocalOpNode::new`, WHICH TOOK `&'p DfirOp` (entry 101), and the
+    /// difference is not taste: that node is built, read and dropped inside one non-mutating walk of
+    /// `uniform.uniformize_regions`, and entries 101-104 never look at the op at all. This one is
+    /// SEARCHED BY IDENTITY (`findNodeFromOp`, entry 078) and used as an INSERTION POINT
+    /// (`n->getParentNode()->getOperation()`, `LoweringPTMasks.cpp:74`), and [`OpId`] — this crate's
+    /// stand-in for `Operation *`, one ordinal per region level — answers both.
+    ///
+    /// ⛔ `None` IS THE SYNTHETIC ROOT AND ONLY THE ROOT. `new LoopMaskNode(nullptr)`
+    /// (`LoopMaskTree.cpp:175`) is the one null the reference passes; `computeLoops` mints loop nodes
+    /// over a `sentient::ForOp` (`:178`) and `addMaskNode` mask nodes over a compute (`:138`). That is
+    /// enforced rather than documented: [`OperationTreeBase::push_named_child`], the insert this
+    /// tree uses, takes an [`OpId`] by value rather than an `Option`, so the only way to reach `None`
+    /// here is `with_root`. (The other insert, [`OperationTreeBase::push_child`], leaves it `None`
+    /// for a tree that names its operations in the payload instead — entry 101's.)
+    #[must_use]
+    const fn new(op: Option<OpId>, payload: N) -> Self {
+        Self {
+            op,
+            links: Links::UNLINKED,
+            payload,
+        }
+    }
 }
 
 /// ONE OPERATION TREE — `class OperationTreeBase` (`OperationTree.hpp:201`).
@@ -192,12 +273,13 @@ impl<N> OperationTreeBase<N> {
     /// it is set: `DT_CHECK(root_ && …)` in `getRoot` (`hpp:205-206`), `empty()` at `hpp:214`,
     /// `DT_CHECK_MSG(!root_ …)` at `LoopMaskTree.cpp:174`. Taking the root payload here makes a
     /// tree without a root unconstructible, so the question cannot be asked at run time.
+    ///
+    /// ⛔ AND THE ROOT NAMES NO OPERATION — `Node::new(None, …)`, the one null `Operation *` in this
+    /// family (`LoopMaskTree.cpp:175`, and see [`Node::new`]). The header says why: the synthetic root
+    /// is what *collects* the forest's trees, not one of them (`OperationTree.hpp:191-196`).
     pub fn with_root(root: N) -> Self {
         Self {
-            nodes: vec![Node {
-                links: Links::UNLINKED,
-                payload: root,
-            }],
+            nodes: vec![Node::new(None, root)],
             root: OperationNodeId(0),
         }
     }
@@ -215,7 +297,7 @@ impl<N> OperationTreeBase<N> {
     /// ⛔ ALL THREE CONJUNCTS HOLD BY CONSTRUCTION, which is why the `DT_CHECK` has no counterpart.
     /// `root_` is non-null because [`Self::with_root`] takes it; and the root's `parent` and
     /// `next_sibling` are `None` from [`Links::UNLINKED`] and stay so because the ONLY writer of
-    /// links is [`Self::push_child`], which writes the parent of the node it just created and the
+    /// links is the shared insert, which writes the parent of the node it just created and the
     /// `next_sibling` of an existing CHILD — never the fields of the node it was given as a parent.
     /// The root is never anyone's child, so nothing can reach either field.
     pub fn root(&self) -> OperationNodeId {
@@ -225,6 +307,82 @@ impl<N> OperationTreeBase<N> {
     /// A NODE'S PAYLOAD — the derived state the C++ reaches through the `static_cast`.
     pub fn payload(&self, n: OperationNodeId) -> &N {
         &self.nodes[n.0].payload
+    }
+
+    /// `OperationNode::getOperation()` — `OperationTree.hpp:37`, `return operation_op_;`.
+    ///
+    /// ⚠️ A FIELD ACCESSOR ON THE EXCLUDED LIST, written because the field it reads arrives with
+    /// entry 079. ⛔ `None` IS THE SYNTHETIC ROOT — `print` branches on exactly that
+    /// (`if (op) … else OS << " null, at depth: "`, `OperationTree.cpp:125-130`).
+    pub fn operation(&self, n: OperationNodeId) -> Option<&OpId> {
+        self.nodes[n.0].op.as_ref()
+    }
+
+    /// THE FIRST NODE NAMING `op` — the scan behind [`LoopMaskTree::find_node_from_op`] (entry 078).
+    ///
+    /// ⛔ THE ROOT CANNOT MATCH: its operation is `None` and this compares against `Some(op)`, which
+    /// is the same exclusion the reference gets from never inserting the root into `op_to_node_`
+    /// (`LoopMaskTree.cpp:175` inserts nothing; `:152` and `:179` are the only insertions).
+    fn find_by_op(&self, op: &OpId) -> Option<OperationNodeId> {
+        self.nodes
+            .iter()
+            .position(|node| node.op.as_ref() == Some(op))
+            .map(OperationNodeId)
+    }
+
+    /// `OperationNode::breadthFirstWalk(n, action)` — `OperationTree.cpp:183-198`.
+    ///
+    /// ```cpp
+    /// void OperationNode::breadthFirstWalk(OperationNode *n, ActionFuncTy action) {
+    ///   DT_CHECK_MSG(n, "expected valid node");
+    ///   std::queue<OperationNode *> queue;
+    ///   queue.push(n);
+    ///   while (!queue.empty()) {
+    ///     OperationNode *curr_node = queue.front();
+    ///     DT_CHECK_MSG(curr_node, "expected valid node");
+    ///     (void)action(curr_node);
+    ///     queue.pop();
+    ///     OperationNode *child = curr_node->getFirstChild();
+    ///     while (child) {
+    ///       queue.push(child);
+    ///       child = child->getNextSibling();
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// ⚠️ NOT A SCHEDULED UNIT — same standing as the rest of this base layer, and the body entry 077
+    /// delegates to. `kBFS` is the one of the seven `WalkOrder`s this file needs
+    /// (`LoopMaskTree.cpp:133`); the other six specializations are unscheduled and unwritten.
+    ///
+    /// ⭐⭐ `(void)action(curr_node)` IS WHY THE ACTION RETURNS NOTHING HERE. The C++ action type
+    /// returns a node (`ActionFuncTy`, `hpp:77`) because the two *guided* walks steer by it; a BFS
+    /// discards it. That has a consequence worth stating, because a reader of the one caller will
+    /// otherwise get it wrong: `analyzeAndInsertMaskOps`'s `return nullptr` after
+    /// `signalPassFailure()` (`LoweringPTMasks.cpp:197`) does **not** stop the walk — the remaining
+    /// queue is still visited and further masks are still lowered. Only the pass failure is recorded.
+    ///
+    /// ⛔ BOTH `DT_CHECK_MSG(…, "expected valid node")`s ARE UNREPRESENTABLE: an
+    /// [`OperationNodeId`] is never null, and the queue is fed only from `first_child`/`next_sibling`,
+    /// which yield ids that exist.
+    ///
+    /// ⭐ AND THE ACTION TAKES `&mut` WHILE THE TREE IS BORROWED SHARED, which is exactly the C++'s
+    /// contract for `kBFS`: *"The action must not remove itself, its siblings or any parent or
+    /// ancestor"* (`hpp:96-99`). Here it cannot mutate the tree at all, so the one freedom the C++
+    /// leaves — removing descendants mid-walk — is closed rather than merely documented. The one
+    /// caller uses none of it: `analyzeAndInsertMaskOps` reads the tree and rewrites the IR
+    /// (`LoweringPTMasks.cpp:164-203`).
+    fn breadth_first_walk(&self, from: OperationNodeId, action: &mut impl FnMut(OperationNodeId)) {
+        let mut queue: VecDeque<OperationNodeId> = VecDeque::new();
+        queue.push_back(from);
+        while let Some(curr_node) = queue.pop_front() {
+            action(curr_node);
+            let mut child = self.first_child(curr_node);
+            while let Some(c) = child {
+                queue.push_back(c);
+                child = self.next_sibling(c);
+            }
+        }
     }
 
     /// The three links of one node.
@@ -285,7 +443,7 @@ impl<N> OperationTreeBase<N> {
     /// ```
     ///
     /// ⛔⛔ THE `DT_CHECK` IS THE ROOT AND NOTHING ELSE, so it becomes an answer rather than a
-    /// refusal. Every node but the synthetic root has a parent — `push_child` sets it — so the only
+    /// refusal. Every node but the synthetic root has a parent — the insert sets it — so the only
     /// call that can reach the check is `prev_sibling(root)`, and for the root `None` is not a
     /// degraded answer but the true one: the root has no siblings at all
     /// (`getRoot`'s own invariant, `hpp:205-206`). ⭐ AND THE FIRST-CHILD ARM IS ALREADY THIS SAME
@@ -333,24 +491,60 @@ impl<N> OperationTreeBase<N> {
     ///
     /// ⛔ AND THE FIRST `DT_CHECK_MSG(child, …)` IS UNREPRESENTABLE HERE: this takes a payload by
     /// value and mints the node itself, so there is no null child to check for.
-    pub fn push_child(&mut self, parent: OperationNodeId, node: N) -> OperationNodeId {
+    ///
+    /// ⭐ TWO PUBLIC INSERTS OVER ONE BODY, AND THE REFERENCE IS WHY THERE IS ONLY ONE THERE. In C++
+    /// `operation_op_` is set by the node's own constructor, which the CALLER runs
+    /// (`new LMTLoopNode(op)`, `LoopMaskTree.cpp:178`), so `insertChildNode` never sees an operation.
+    /// Here the arena mints the node, so the two constructors that reach it reach it as two inserts:
+    /// [`Self::push_named_child`] for a tree that names the operation in the base by [`OpId`] (entry
+    /// 079, the Loop Mask Tree) and [`Self::push_child`] for one whose PAYLOAD names it (entry 101,
+    /// `LocalOpNode`'s `&DfirOp`). The linking below is shared because the reference shares it.
+    fn insert_child(
+        &mut self,
+        parent: OperationNodeId,
+        op: Option<OpId>,
+        node: N,
+    ) -> OperationNodeId {
         let child = OperationNodeId(self.nodes.len());
-        self.nodes.push(Node {
-            links: Links {
-                // `child->setParentNode(this)` (`:253`).
-                parent: Some(parent),
-                first_child: None,
-                next_sibling: None,
-            },
-            payload: node,
-        });
+        self.nodes.push(Node::new(op, node));
         match self.last_child(parent) {
             // `if (isLeaf()) setFirstChild(child)` (`:241-243`).
             None => self.nodes[parent.0].links.first_child = Some(child),
             // `else getLastChild()->setNextSibling(child)` (`:251-252`).
             Some(last) => self.nodes[last.0].links.next_sibling = Some(child),
         }
+        // `child->setParentNode(this)` (`:253`) — last, as in the reference. ⭐ The new node is not in
+        // any sibling chain until the `match` above runs, so `last_child(parent)` cannot see it.
+        self.nodes[child.0].links.parent = Some(parent);
         child
+    }
+
+    /// [`Self::insert_child`] FOR A TREE WHOSE PAYLOAD NAMES THE OPERATION.
+    ///
+    /// ⭐ `FlatteningLocalRegions`' node keeps the operation in `N` as a `&DfirOp` (entry 101), so
+    /// the base's own [`Node::op`] stays `None` for every node of that tree — including its root,
+    /// which does name an op (`new LocalOpNode(&op_)`, `FlatteningLocalRegions.cpp:392`). ⛔ SO
+    /// `None` HERE IS "NOT NAMED IN THE BASE", NOT "NAMES NOTHING": a tree built through this insert
+    /// must not be searched with [`Self::find_by_op`], which would find nothing.
+    pub fn push_child(&mut self, parent: OperationNodeId, node: N) -> OperationNodeId {
+        self.insert_child(parent, None, node)
+    }
+
+    /// [`Self::insert_child`] FOR A TREE THAT NAMES THE OPERATION IN THE BASE, BY [`OpId`].
+    ///
+    /// ⭐ `op` IS NOT AN `Option`, AND THAT IS WHAT MAKES "ONLY THE ROOT NAMES NO OPERATION" A TYPE
+    /// RATHER THAN A CLAIM FOR THE LOOP MASK TREE — see [`Node::new`]. Both C++ callers pass a real
+    /// op: `new LMTLoopNode(op)` over a `sentient::ForOp` (`LoopMaskTree.cpp:178`) and
+    /// `new MaskNode(mask_related_op, …)` over the compute the mask applies to (`:138`), and the
+    /// one null the reference passes goes to the root (`:175`), which only [`Self::with_root`]
+    /// builds.
+    pub fn push_named_child(
+        &mut self,
+        parent: OperationNodeId,
+        op: OpId,
+        node: N,
+    ) -> OperationNodeId {
+        self.insert_child(parent, Some(op), node)
     }
 }
 
@@ -527,6 +721,39 @@ pub enum LoopMaskNode {
     Mask(MaskNode),
 }
 
+/// Replaces: e080_LoopMaskNode
+///
+/// **080/384** `~LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34` (0L).
+///
+/// ```cpp
+/// virtual ~LoopMaskNode() {}
+/// ```
+///
+/// # ⭐⭐ THE BODY IS EMPTY AND THE `virtual` IS THE WHOLE CONTENT
+///
+/// ⛔ A NODE OWNS NOTHING — not its children, not its operation. `clear()` deletes every node in a
+/// post-order walk of the tree (`OperationTree.cpp:256`), so a destructor that freed its children
+/// would double-free them; and the operation belongs to the MLIR context, not to the node. That much
+/// this shares with `~MaskNode` and `~LMTLoopNode` (entries 086, 087, guarded above), and the guard
+/// below is the same statement: destroying one runs no code.
+///
+/// ⭐ WHAT IS DIFFERENT IS THAT THIS ONE IS **`virtual`** AND THOSE TWO ARE NOT. Every node in this
+/// family is reached through a `LoopMaskNode *` — the five `static_cast`s of entries 081-085 return
+/// one, `clear()` deletes through the base pointer — so without the vtable slot declared *here*,
+/// `delete` on a base pointer to a `MaskNode` would be undefined behaviour and the derived
+/// destructor would never run. The `virtual` is what makes the two non-virtual destructors below it
+/// safe.
+///
+/// ⭐⭐ AND IN RUST THAT SLOT IS NOT NEEDED, BECAUSE THE HIERARCHY IS ONE TYPE. [`LoopMaskNode`] is an
+/// enum: dropping one drops the right variant because the discriminant is in the value, so there is
+/// no base pointer through which the wrong destructor could be selected. The three-kind `match`
+/// replaced the vtable for `isLoopNode`/`isMaskNode` and it replaces it here too.
+///
+/// ⛔ THIS GUARDS THE PAYLOAD, NOT THE ARENA NODE. `needs_drop::<Node<LoopMaskNode>>()` is `true` and
+/// must be — a `Node` carries an [`OpId`], which owns its path (see [`Node::new`]). What the
+/// reference's destructor is about is the node's OWN state, and in this port that is the payload.
+const _: [(); 0] = [(); core::mem::needs_drop::<LoopMaskNode>() as usize];
+
 /// A NODE'S IDENTITY IN A LOOP MASK TREE — the `LoopMaskNode *` that the five `static_cast`s of
 /// entries 081-085 produce.
 ///
@@ -547,11 +774,23 @@ pub struct LoopMaskNodeId(OperationNodeId);
 /// THE LOOP MASK TREE — `class LoopMaskTree : public OperationTreeBase`
 /// (`LoopMaskTree.hpp:103-138`).
 ///
-/// ⛔ FILLED WAVE BY WAVE, LIKE `AccessDetailsBase`. What is declared here is what entries 081-088
-/// need. The private `DenseMap<Operation *, LoopMaskNode *> op_to_node_` (`hpp:137`) is deliberately
-/// ABSENT: its writers and its only reader are entries 236 (`addMaskNode`), 237 (`updateNode`) and
-/// 078 (`findNodeFromOp`), all of which also decide how an operation is named in this crate. A field
-/// declared now would be one nothing reads and whose key type is the next batch's choice.
+/// ⛔ FILLED WAVE BY WAVE, LIKE `AccessDetailsBase`. What is declared here is what entries 077-088
+/// need.
+///
+/// ⭐⭐ AND THE PRIVATE `DenseMap<Operation *, LoopMaskNode *> op_to_node_` (`hpp:137`) IS STILL
+/// ABSENT — ON PURPOSE, NOW THAT ITS READER IS WRITTEN. The map is a MEMO over one predicate: *which
+/// node names this operation*. Entry 078 answers that by scanning the arena
+/// ([`LoopMaskTree::find_node_from_op`]), so the map buys speed and nothing else — and it would cost
+/// a second source of truth that its two writers (entries 236 `addMaskNode` and 237 `updateNode`)
+/// have to keep in step with the nodes, which is exactly the bug its own
+/// `DT_CHECK_MSG(op_to_node_.find(mask_related_op) == op_to_node_.end(), "op already in map - should
+/// not happen")` (`LoopMaskTree.cpp:150-151`) exists to catch. The campaign brief lets a port drop
+/// the mechanism for REACHING an operand; a memo is that mechanism.
+///
+/// ⚠️ WHAT THAT TRADES IS COMPLEXITY, AND THE SIZE IS KNOWN: the tree has one node per
+/// `sentient.for` plus one per masked compute — 15 for the vendor's own two-nest case
+/// (`dynamic_pt_masking.mlir:215-317`) — and `addMaskNode` is the only per-compute caller. The day a
+/// profile says otherwise, the index belongs beside its writers in the same batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopMaskTree {
     /// The `OperationTreeBase` this derives from.
@@ -602,7 +841,7 @@ impl LoopMaskTree {
     /// establishes the relation, attaching a mask node under the `sentient.for` whose induction
     /// variable drives it (`LoopMaskTree.cpp:143-145`).
     ///
-    /// ⛔ `None` IS THE SYNTHETIC ROOT AND ONLY THE ROOT. `push_child` gives every other node a
+    /// ⛔ `None` IS THE SYNTHETIC ROOT AND ONLY THE ROOT. The insert gives every other node a
     /// parent, so `nullptr` here is not a "not found" — the C++ readers rely on that:
     /// `isMaskEquivalentToNode` compares two parents without a null test (`:124`) and
     /// `insertMaskOps` dereferences the result directly (`LoweringPTMasks.cpp:74`).
@@ -704,14 +943,118 @@ impl LoopMaskTree {
     pub fn node(&self, n: LoopMaskNodeId) -> &LoopMaskNode {
         self.base.payload(n.0)
     }
+
+    /// THE OPERATION A NODE NAMES — `LoopMaskNode::getOperation()`, the base's accessor
+    /// (`OperationTree.hpp:37`).
+    ///
+    /// ⛔ `None` IS THE SYNTHETIC ROOT AND ONLY THE ROOT (see [`Node::new`], entry 079). Its readers
+    /// treat it that way: `insertMaskOps` dereferences `n->getParentNode()->getOperation()` with no
+    /// null test to get the loop it emits around (`LoweringPTMasks.cpp:74`), and it only ever asks
+    /// that of a mask node's parent.
+    pub fn operation(&self, n: LoopMaskNodeId) -> Option<&OpId> {
+        self.base.operation(n.0)
+    }
+
+    /// Replaces: e078_findNodeFromOp
+    ///
+    /// **078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167` (4L).
+    ///
+    /// ```cpp
+    /// LoopMaskNode *LoopMaskTree::findNodeFromOp(Operation *op) {
+    ///   DT_CHECK_MSG(op, "valid op expected");
+    ///   if (op_to_node_.find(op) == op_to_node_.end()) return nullptr;
+    ///   return op_to_node_[op];
+    /// }
+    /// ```
+    ///
+    /// # ⭐⭐ THE MAP IS A MEMO, SO THE PORT ASKS THE QUESTION DIRECTLY
+    ///
+    /// A node NAMES its operation (entry 079), so *which node names this op* is answerable from the
+    /// nodes alone — and `op_to_node_` is a cache of that answer, populated in lockstep with the two
+    /// insertions that build the tree (`:152`, `:179`). Scanning the arena returns what the lookup
+    /// returns, without a second structure to keep in step; see [`LoopMaskTree`] for why that
+    /// trade is deliberate and what it costs.
+    ///
+    /// ⭐ THE TWO ANSWERS COINCIDE EXACTLY, and it is worth spelling out why rather than asserting it.
+    /// The map holds an entry for every node the tree creates except the root — `computeLoops`
+    /// inserts each loop node (`:179`) and `addMaskNode` each mask node (`:152`), while
+    /// `new LoopMaskNode(nullptr)` (`:175`) inserts nothing — and the scan skips the root for the same
+    /// reason, its operation being `None`. So *found in the map* and *found in the arena* are the same
+    /// set.
+    ///
+    /// ⛔ `DT_CHECK_MSG(op, "valid op expected")` IS UNREPRESENTABLE: this takes `&OpId`, so there is
+    /// no null to check. ⭐ AND THE `nullptr` RETURN IS A GENUINE ANSWER, NOT A FAILURE — `addMaskNode`
+    /// checks it (`DT_CHECK_MSG(found_node, "could not locate loop_op in tree")`, `:144`), so it is
+    /// `Option`, not a refusal.
+    ///
+    /// ⚠️ THE FIRST MATCH WINS, AND UNIQUENESS IS THE WRITER'S OBLIGATION. `addMaskNode`'s own
+    /// `DT_CHECK_MSG(op_to_node_.find(mask_related_op) == op_to_node_.end(), "op already in map -
+    /// should not happen")` (`:150-151`) is where the reference states that one op gets one node; that
+    /// check belongs to entry 236, which is the unit that inserts.
+    pub fn find_node_from_op(&self, op: &OpId) -> Option<LoopMaskNodeId> {
+        self.base.find_by_op(op).map(LoopMaskNodeId)
+    }
+
+    /// Replaces: e077_walk
+    ///
+    /// **077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132` (2L).
+    ///
+    /// ```cpp
+    /// void LoopMaskTree::walk(LoopMaskNode::ActionFuncTy action) {
+    ///   LoopMaskNode::walk<OperationNode::WalkOrder::kBFS>(getRoot(), action);
+    /// }
+    /// ```
+    ///
+    /// # ⭐⭐ BREADTH-FIRST FROM THE ROOT, AND THE ORDER IS THE POINT
+    ///
+    /// The one caller is `insertPTMaskOps`, whose action `analyzeAndInsertMaskOps` looks at ONE node's
+    /// children at a time and decides what mask ops to emit around it (`LoweringPTMasks.cpp:164-205`).
+    /// Breadth-first is what makes that sound: a loop is visited before anything nested inside it, so
+    /// when `verifyLoopNest` walks the nest below a node to prove that no second, different mask
+    /// lives there (`:112-140`), the nodes it inspects have not yet been lowered. A pre-order walk
+    /// would visit the same nodes in a different order and a post-order one would visit the inner
+    /// masks first — the `visited_nodes` set at `:173` is what records the decision this order makes.
+    ///
+    /// # ⭐ THE `LoopMaskNode::walk<kBFS>` SPECIALIZATION IS THE CLOSURE BELOW
+    ///
+    /// The seven specializations at `LoopMaskTree.cpp:25-94` exist for one reason the header states
+    /// outright — *"Callables cannot be type casted"* (`hpp:57-60`) — and each is the same three lines:
+    /// wrap the derived action in a lambda that downcasts the node, then call the base's walk. Here
+    /// `&mut |n| action(LoopMaskNodeId(n))` **is** that `action_wrapper` (`:68-71`), with the
+    /// `static_cast<LoopMaskNode *>` being the newtype wrap. ⛔ The other six orders are unscheduled
+    /// and unwritten: this file needs `kBFS` and nothing else.
+    ///
+    /// ⛔ THE ACTION RETURNS NOTHING BECAUSE `kBFS` DISCARDS THE RETURN, and one caller's apparent
+    /// early exit is therefore not one — see [`OperationTreeBase::breadth_first_walk`].
+    ///
+    /// ⭐ AND IT TAKES `&self`, NOT `&mut self`, which is why an action may freely READ the tree it is
+    /// walking: `analyzeAndInsertMaskOps` calls `getFirstChild`, `getNextSibling`, `getRoot` and
+    /// `getStartVal` on it (`:166-180`). Two shared borrows coexist; a mutating action would need the
+    /// C++'s own restriction (*the action can only remove descendants*) to become a type, and no
+    /// caller wants one.
+    pub fn walk(&self, action: &mut impl FnMut(LoopMaskNodeId)) {
+        self.base
+            .breadth_first_walk(self.base.root(), &mut |n| action(LoopMaskNodeId(n)));
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         LMTLoopNode, LoopMaskNode, LoopMaskNodeId, LoopMaskTree, MaskIncrement, MaskNode,
-        MaskedColumns, OperationTreeBase,
+        MaskedColumns, Node, OpId, OperationTreeBase,
     };
+
+    /// HOW DEEP A NODE SITS — `OperationNode::getDepth()` (`OperationTree.hpp:62-67`), which is
+    /// unscheduled and unported; the tests that need it count parents themselves.
+    fn depth(tree: &LoopMaskTree, mut n: LoopMaskNodeId) -> usize {
+        let mut d = 0;
+        while let Some(parent) = tree.parent_node(n) {
+            d += 1;
+            n = parent;
+        }
+        d
+    }
 
     /// A `sentient.for`'s node — [`LMTLoopNode`], as `computeLoops` mints it
     /// (`LoopMaskTree.cpp:178`).
@@ -791,6 +1134,9 @@ mod unit_tests {
         n1_m1: LoopMaskNodeId,
         n1_m2: LoopMaskNodeId,
         n2_l1: LoopMaskNodeId,
+        n2_l2: LoopMaskNodeId,
+        n2_l3: LoopMaskNodeId,
+        n2_l4: LoopMaskNodeId,
         n2_l5: LoopMaskNodeId,
         n2_l6: LoopMaskNodeId,
         n2_m_const: LoopMaskNodeId,
@@ -803,25 +1149,40 @@ mod unit_tests {
             let root = base.root();
 
             // ── `computeLoops`: every `sentient.for`, in pre-order ────────────────────────────────
-            let n1_l1 = base.push_child(root, loop_node());
-            let n1_l2 = base.push_child(n1_l1, loop_node());
-            let n1_l3 = base.push_child(n1_l2, loop_node());
-            let n1_l4 = base.push_child(n1_l3, loop_node());
-            let n1_l5 = base.push_child(n1_l4, loop_node());
-            let n2_l1 = base.push_child(root, loop_node());
-            let n2_l2 = base.push_child(n2_l1, loop_node());
-            let n2_l3 = base.push_child(n2_l2, loop_node());
-            let n2_l4 = base.push_child(n2_l3, loop_node());
-            let n2_l5 = base.push_child(n2_l4, loop_node());
-            let n2_l6 = base.push_child(n2_l5, loop_node());
+            //
+            // ⭐⭐ THE PATHS ARE THE VENDOR CASE'S OWN POSITIONS, counted inside the
+            // `dataflow.program_unit` body (`dynamic_pt_masking.mlir:225-315`), one ordinal per region
+            // level. The first nest's `sentient.for %arg1` is the third op of the body — two `arith`
+            // ops set up its bound first (`:226-228`) — and the second nest's is the sixth (`:268-270`).
+            let n1_l1 = base.push_named_child(root, OpId::at(&[2]), loop_node());
+            let n1_l2 = base.push_named_child(n1_l1, OpId::at(&[2, 3]), loop_node());
+            let n1_l3 = base.push_named_child(n1_l2, OpId::at(&[2, 3, 3]), loop_node());
+            let n1_l4 = base.push_named_child(n1_l3, OpId::at(&[2, 3, 3, 3]), loop_node());
+            // ⭐ THE FIFTEENTH OP OF `%arg4`'s BODY: eight setup ops, two receives, a select, a mask, the
+            // mac and a store come first (`:241-254`), then `sentient.for %arg5` (`:255`).
+            let n1_l5 = base.push_named_child(n1_l4, OpId::at(&[2, 3, 3, 3, 14]), loop_node());
+            let n2_l1 = base.push_named_child(root, OpId::at(&[5]), loop_node());
+            let n2_l2 = base.push_named_child(n2_l1, OpId::at(&[5, 3]), loop_node());
+            let n2_l3 = base.push_named_child(n2_l2, OpId::at(&[5, 3, 3]), loop_node());
+            let n2_l4 = base.push_named_child(n2_l3, OpId::at(&[5, 3, 3, 3]), loop_node());
+            let n2_l5 = base.push_named_child(n2_l4, OpId::at(&[5, 3, 3, 3, 8]), loop_node());
+            let n2_l6 = base.push_named_child(n2_l5, OpId::at(&[5, 3, 3, 3, 8, 9]), loop_node());
 
             // ── then `addMaskNode`, once per masked compute, in lowering order ────────────────────
-            let n1_m1 = base.push_child(n1_l4, dynamic_mask());
-            let n1_m2 = base.push_child(n1_l4, dynamic_mask());
+            //
+            // ⛔ A MASK NODE NAMES THE COMPUTE, NOT THE LOOP. `addMaskNode(loop_op, mask_related_op,
+            // …)` builds the node over the SECOND argument (`LoopMaskTree.cpp:138`) and attaches it
+            // under the first — `updateLoopMaskTreeForDynamicMask` passes the
+            // `vectorchain.multiply_and_accumulate` (`VectorChainToSentientPT.cpp:463-478`).
+            let n1_m1 = base.push_named_child(n1_l4, OpId::at(&[2, 3, 3, 3, 12]), dynamic_mask());
+            // ⭐ ITS MAC IS INSIDE `%arg5` (`:261`) WHILE ITS PARENT NODE IS `%arg4` — the mask is
+            // driven by `%14`, which `%arg4` owns.
+            let n1_m2 = base.push_named_child(n1_l4, OpId::at(&[2, 3, 3, 3, 14, 5]), dynamic_mask());
             // ⭐ `#set2 = affine_set<(d0) : (d0 - 48 >= 0, -d0 + 63 >= 0)>` over `vector<64xf16>`:
             // `(64 - 48) / 8 = 2`, the `scalar_constant {value = 2}` the golden's `set_mask` takes.
-            let n2_m_const = base.push_child(n2_l5, constant_mask(2));
-            let n2_m_dyn = base.push_child(n2_l6, dynamic_mask());
+            let n2_m_const = base.push_named_child(n2_l5, OpId::at(&[5, 3, 3, 3, 8, 5]), constant_mask(2));
+            let n2_m_dyn =
+                base.push_named_child(n2_l6, OpId::at(&[5, 3, 3, 3, 8, 9, 5]), dynamic_mask());
 
             Self {
                 tree: LoopMaskTree { base },
@@ -834,6 +1195,9 @@ mod unit_tests {
                 n1_m1: LoopMaskNodeId(n1_m1),
                 n1_m2: LoopMaskNodeId(n1_m2),
                 n2_l1: LoopMaskNodeId(n2_l1),
+                n2_l2: LoopMaskNodeId(n2_l2),
+                n2_l3: LoopMaskNodeId(n2_l3),
+                n2_l4: LoopMaskNodeId(n2_l4),
                 n2_l5: LoopMaskNodeId(n2_l5),
                 n2_l6: LoopMaskNodeId(n2_l6),
                 n2_m_const: LoopMaskNodeId(n2_m_const),
@@ -1100,4 +1464,288 @@ mod unit_tests {
         }
         assert_eq!((loops, masks), (11, 4));
     }
+
+    /// 🎯 079 — EVERY NODE NAMES ITS OPERATION, AND THE ROOT NAMES NONE.
+    ///
+    /// `OperationNode(Operation *op) : operation_op_(op)` (`OperationTree.hpp:29`) is the whole of
+    /// entry 079, and `new LoopMaskNode(nullptr)` (`LoopMaskTree.cpp:175`) is the one call that
+    /// passes null. This is the fact `print` branches on (`OperationTree.cpp:125-130`) and the fact
+    /// that makes `findNodeFromOp` a total function over the arena.
+    #[test]
+    fn only_the_synthetic_root_names_no_operation() {
+        let v = Vendor::build();
+
+        assert_eq!(v.tree.operation(v.root), None, "new LoopMaskNode(nullptr)");
+
+        let mut nodes: Vec<LoopMaskNodeId> = Vec::new();
+        v.tree.walk(&mut |n| nodes.push(n));
+        let nameless: Vec<LoopMaskNodeId> = nodes
+            .iter()
+            .copied()
+            .filter(|&n| v.tree.operation(n).is_none())
+            .collect();
+        assert_eq!(
+            nameless,
+            vec![v.root],
+            "every node but the root was minted over an op"
+        );
+    }
+
+    /// 🎯 079 — THE NODE KEEPS THE POSITION IT WAS MINTED WITH, AND A MASK NODE'S IS ITS **COMPUTE**.
+    ///
+    /// `addMaskNode(loop_op, mask_related_op, …)` builds the node over `mask_related_op`
+    /// (`LoopMaskTree.cpp:138`) and inserts it under `loop_op` (`:145`), so the two can disagree — and
+    /// in the vendor's own case they do. `n1_m2`'s mac sits inside `for %arg5`
+    /// (`dynamic_pt_masking.mlir:261`) while its tree parent is `for %arg4`, which owns the `%14` the
+    /// mask is affine in. ⛔ THAT DISAGREEMENT IS THE WHOLE REASON THE OP AND THE LINKS ARE SEPARATE
+    /// STATE: a reader that inferred the parent from the position would put the `set_mask` one loop
+    /// too deep.
+    #[test]
+    fn a_mask_node_names_its_compute_while_its_parent_is_the_driving_loop() {
+        let v = Vendor::build();
+
+        let mac = v.tree.operation(v.n1_m2).expect("a mask names its compute");
+        assert_eq!(mac.path(), &[2, 3, 3, 3, 14, 5]);
+
+        // ⭐ THE MAC IS INSIDE `n1_l5`: the loop's position is a prefix of the compute's.
+        let inner = v.tree.operation(v.n1_l5).expect("a loop names its for");
+        assert_eq!(inner.path(), &[2, 3, 3, 3, 14]);
+        assert!(mac.path().starts_with(inner.path()));
+
+        // ⛔ YET THE TREE PARENT IS `n1_l4`, one level out.
+        assert_eq!(v.tree.parent_node(v.n1_m2), Some(v.n1_l4));
+        assert_eq!(
+            v.tree
+                .operation(v.n1_l4)
+                .expect("a loop names its for")
+                .path(),
+            &[2, 3, 3, 3]
+        );
+    }
+
+    /// 🎯 080 — DESTROYING A NODE'S PAYLOAD RUNS NO CODE, AND THE ARENA NODE IS THE EXCEPTION.
+    ///
+    /// `virtual ~LoopMaskNode() {}` (`LoopMaskTree.hpp:34`) says the first half; the build-time guard
+    /// beside the type is what enforces it. What this test adds is the SECOND half, which no guard can
+    /// state: `Node<LoopMaskNode>` *does* need dropping, because entry 079 gave it an [`OpId`] that
+    /// owns its path. Pointing the guard at the wrong one of the two would silently stop guarding
+    /// anything.
+    #[test]
+    fn a_loop_mask_node_needs_no_destructor_but_its_arena_node_does() {
+        assert!(
+            !core::mem::needs_drop::<LoopMaskNode>(),
+            "~LoopMaskNode() {{}} — and ~MaskNode/~LMTLoopNode below it"
+        );
+        assert!(
+            core::mem::needs_drop::<Node<LoopMaskNode>>(),
+            "an arena node owns an OpId's path"
+        );
+    }
+
+    /// 🎯 078 — EVERY NODE IN THE TREE IS FOUND FROM THE OPERATION IT NAMES.
+    ///
+    /// This is the round trip `addMaskNode` depends on: it looks the loop up by its op and asserts it
+    /// is there (`DT_CHECK_MSG(found_node, "could not locate loop_op in tree")`,
+    /// `LoopMaskTree.cpp:143-144`). The scan replaces `op_to_node_`, so the property to hold is that
+    /// the scan and the map name the same set — every node except the root.
+    #[test]
+    fn every_named_node_is_found_from_its_operation() {
+        let v = Vendor::build();
+
+        let mut nodes: Vec<LoopMaskNodeId> = Vec::new();
+        v.tree.walk(&mut |n| nodes.push(n));
+        assert_eq!(nodes.len(), 16, "1 root + 11 loops + 4 masks");
+
+        for n in nodes {
+            match v.tree.operation(n) {
+                Some(op) => assert_eq!(
+                    v.tree.find_node_from_op(op),
+                    Some(n),
+                    "the node that names an op is the node found from it"
+                ),
+                None => assert_eq!(n, v.root, "only the root is nameless"),
+            }
+        }
+    }
+
+    /// 🎯 078 — AN OPERATION THE TREE DOES NOT NAME IS NOT FOUND, AND THAT IS AN ANSWER.
+    ///
+    /// `findNodeFromOp` returns `nullptr` for a miss (`:169`) and its caller tests the result
+    /// (`:144`), so this is `None`, not a refusal. The ops chosen are real ones from the vendor case
+    /// that the tree deliberately holds no node for: the `vector.store` at
+    /// `dynamic_pt_masking.mlir:254`, the `dataflow.receive` at `:249`, and the whole program unit's
+    /// body position — nothing but `sentient.for`s and masked computes gets a node
+    /// (`if (!isa<sentient::ForOp>(op)) return;`, `LoopMaskTree.cpp:177`).
+    #[test]
+    fn an_operation_with_no_node_is_not_found() {
+        let v = Vendor::build();
+
+        for path in [
+            &[2, 3, 3, 3, 13][..], // the `vector.store` after the mac
+            &[2, 3, 3, 3, 8][..],  // a `dataflow.receive`
+            &[0][..],              // the `arith.subi` that computes a loop bound
+            &[2, 3, 3, 3, 14, 4][..], // the `create_affine_mask`, not the mac
+        ] {
+            assert_eq!(
+                v.tree.find_node_from_op(&OpId::at(path)),
+                None,
+                "no node names {path:?}"
+            );
+        }
+    }
+
+    /// 🎯 078 — THE MAC INSIDE THE INNER LOOP FINDS ITS **MASK** NODE, NOT THE LOOP AROUND IT.
+    ///
+    /// Two nodes have positions in the same nest and the lookup must not confuse them: `n1_l5` names
+    /// `for %arg5` at `[2, 3, 3, 3, 14]` and `n1_m2` names the mac inside it at
+    /// `[2, 3, 3, 3, 14, 5]`. A prefix match would return the loop for both — the reference's
+    /// `DenseMap` keys on pointer identity, and the port keys on the WHOLE path.
+    #[test]
+    fn a_lookup_distinguishes_a_compute_from_the_loop_containing_it() {
+        let v = Vendor::build();
+
+        assert_eq!(
+            v.tree.find_node_from_op(&OpId::at(&[2, 3, 3, 3, 14, 5])),
+            Some(v.n1_m2)
+        );
+        assert_eq!(
+            v.tree.find_node_from_op(&OpId::at(&[2, 3, 3, 3, 14])),
+            Some(v.n1_l5)
+        );
+        // ⭐ AND THE TWO NESTS ARE NOT CONFUSED EITHER, though their bodies are identical in shape:
+        // `%arg4`'s two positions differ only in the outermost ordinal (`:240` vs `:282`).
+        assert_eq!(
+            v.tree.find_node_from_op(&OpId::at(&[5, 3, 3, 3])),
+            Some(v.n2_l4)
+        );
+        assert_eq!(
+            v.tree.find_node_from_op(&OpId::at(&[2, 3, 3, 3])),
+            Some(v.n1_l4)
+        );
+    }
+
+    /// 🎯 077 — THE WALK IS BREADTH-FIRST FROM THE ROOT, IN THE REFERENCE'S EXACT ORDER.
+    ///
+    /// `LoopMaskNode::walk<kBFS>(getRoot(), action)` (`LoopMaskTree.cpp:133`) over the queue at
+    /// `OperationTree.cpp:185-197`: each node's children are pushed in sibling order after it, so the
+    /// two nests interleave level by level. ⭐⭐ THE ORDER IS LOAD-BEARING, NOT INCIDENTAL — the one
+    /// caller decides at `for %arg4` whether the masks below it are consistent and remembers the
+    /// answer (`visited_nodes`, `LoweringPTMasks.cpp:173`), which only works if a loop is visited
+    /// before everything nested in it.
+    #[test]
+    fn the_walk_visits_the_tree_level_by_level_from_the_root() {
+        let v = Vendor::build();
+
+        let mut order: Vec<LoopMaskNodeId> = Vec::new();
+        v.tree.walk(&mut |n| order.push(n));
+
+        assert_eq!(
+            order,
+            vec![
+                v.root,
+                // level 1 — the two top-level nests, in program order
+                v.n1_l1,
+                v.n2_l1,
+                v.n1_l2,
+                v.n2_l2,
+                v.n1_l3,
+                v.n2_l3,
+                // level 4 — `for %arg4` in both nests
+                v.n1_l4,
+                v.n2_l4,
+                // level 5 — the first nest's three children come before the second nest's one
+                v.n1_l5,
+                v.n1_m1,
+                v.n1_m2,
+                v.n2_l5,
+                // level 6
+                v.n2_l6,
+                v.n2_m_const,
+                // level 7
+                v.n2_m_dyn,
+            ]
+        );
+
+        // ⛔ AND DEPTH NEVER DECREASES ALONG THE ORDER, which is what breadth-first means and what a
+        // pre-order walk of the same tree would violate at `n1_l5` → `n2_l1`.
+        let depths: Vec<usize> = order.iter().map(|&n| depth(&v.tree, n)).collect();
+        assert!(depths.windows(2).all(|w| w[0] <= w[1]), "{depths:?}");
+        assert_eq!(depths.first(), Some(&0), "the root is depth 0");
+        assert_eq!(depths.last(), Some(&7), "the deepest mask is seven down");
+    }
+
+    /// 🎯 077 — AN ACTION READS THE TREE IT IS WALKING, WHICH IS WHAT THE ONE CALLER DOES.
+    ///
+    /// `analyzeAndInsertMaskOps` visits each loop node and then walks that node's children looking for
+    /// mask nodes, reading `getFirstChild`, `getNextSibling`, `getStartVal` and `getIncrement` as it
+    /// goes (`LoweringPTMasks.cpp:164-201`). This is that shape: the closure holds a shared borrow of
+    /// the tree while `walk` holds one too, and it reproduces the caller's answer — which loops carry
+    /// masks directly beneath them, and how many.
+    #[test]
+    fn an_action_may_read_the_tree_while_walking_it() {
+        let v = Vendor::build();
+
+        let mut masked_loops: Vec<(LoopMaskNodeId, usize)> = Vec::new();
+        v.tree.walk(&mut |n| {
+            // `if (!n->isLoopNode() && n != pt_masking_tree->getRoot()) return n;` (`:166`).
+            if !matches!(v.tree.node(n), LoopMaskNode::Loop(_)) && n != v.tree.root() {
+                return;
+            }
+            let mut masks = 0;
+            let mut child = v.tree.first_child(n);
+            while let Some(c) = child {
+                if matches!(v.tree.node(c), LoopMaskNode::Mask(_)) {
+                    masks += 1;
+                }
+                child = v.tree.next_sibling(c);
+            }
+            if masks > 0 {
+                masked_loops.push((n, masks));
+            }
+        });
+
+        // ⭐ THREE LOOPS EMIT MASK OPS, and `n1_l4` is the one that emits for two masks at once — the
+        // pair the vendor output collapses into a single `set_mask`/`incrmask` trio
+        // (`dynamic_pt_masking.mlir:38`, `:53`, `:56`).
+        assert_eq!(
+            masked_loops,
+            vec![(v.n1_l4, 2), (v.n2_l5, 1), (v.n2_l6, 1)]
+        );
+    }
+
+    /// 🎯 077 — THE ACTION'S RETURN IS DISCARDED, SO A BFS CANNOT BE STOPPED EARLY.
+    ///
+    /// `(void)action(curr_node)` (`OperationTree.cpp:190`) is the line, and it is worth a test because
+    /// the one caller reads as though it exits: `analyzeAndInsertMaskOps` does
+    /// `signalPassFailure(); … return nullptr;` (`LoweringPTMasks.cpp:193-197`). Under `kBFS` the
+    /// remaining queue is visited anyway. ⛔ SO THE PORT'S ACTION RETURNS `()` — a `-> Option<…>` here
+    /// would advertise a steering the walk does not honour, and the two GUIDED orders that do honour
+    /// it are unscheduled.
+    #[test]
+    fn the_walk_continues_after_the_action_would_have_returned_null() {
+        let v = Vendor::build();
+
+        // The caller's shape: bail out at the first dynamic mask, as `analyzeAndInsertMaskOps` does
+        // when `verifyLoopNest` fails.
+        let mut seen_after_bail = 0;
+        let mut bailed = false;
+        v.tree.walk(&mut |n| {
+            if bailed {
+                seen_after_bail += 1;
+                return;
+            }
+            if let LoopMaskNode::Mask(mask) = v.tree.node(n) {
+                if mask.increment == MaskIncrement::PerParentLoopIteration {
+                    bailed = true;
+                }
+            }
+        });
+
+        assert!(bailed, "the first dynamic mask is n1_m1");
+        assert_eq!(
+            seen_after_bail, 5,
+            "n1_m2, n2_l5, n2_l6, n2_m_const and n2_m_dyn are all still visited"
+        );
+    }
 }
+

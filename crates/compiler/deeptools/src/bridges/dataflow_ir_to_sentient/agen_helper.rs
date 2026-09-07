@@ -676,6 +676,8 @@ impl Rearrangement {
                 dfir_op::vectorchain::Op::Shuffle { .. } => Some(Rearrangement::Shuffle),
                 dfir_op::vectorchain::Op::Rotate { .. } => Some(Rearrangement::Rotate),
                 dfir_op::vectorchain::Op::Estimate { .. }
+                | dfir_op::vectorchain::Op::FastExp { .. }
+                | dfir_op::vectorchain::Op::Floor { .. }
                 | dfir_op::vectorchain::Op::ScanWithGap { .. }
                 | dfir_op::vectorchain::Op::Multiply { .. }
                 | dfir_op::vectorchain::Op::MultiplyAccumulate { .. }

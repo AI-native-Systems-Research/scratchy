@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`105/384 ported; 105/384 audited`
+`113/384 ported; 113/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -183,6 +183,97 @@ had no construction site crate-wide, so emission is unchanged for `Eq`.
 ⚠️ AND THE EXTRACT HAD TRUNCATED 098: its bodies stop at `rhs = cmpi_op.getRhs(); return true;`, i.e.
 at the half of the function that produces the answer. Ported from the authority at
 `CFGSDataflowConditionalTree.cpp:519`.
+
+⭐ AND ENTRIES 073-080 — the constant-splat port name (`constValToField`), the same-block guard
+(`sameBlock`) and the use-erasing walk (`eraseOp`) in
+`src/bridges/dataflow_ir_to_sentient/vc_vector_operands.rs`; the PESFP compute-fusion pass
+(`fuseComputeOps`) in `vc_vector_chain_to_sentient_pesfp.rs`; and the Loop Mask Tree's walk, lookup
+and node layer (`LoopMaskTree::walk`, `findNodeFromOp`, `LoopMaskNode`'s constructor and its virtual
+destructor) in `vc_loop_mask_tree.rs`.
+
+⛔ 073'S RUNTIME REFUSAL IS DEAD CODE IN THE REFERENCE, AND THAT IS WHY THE DOMAIN IS A TYPE.
+`DT_ERROR` expands to `DT_CHECK_MSG(false, …)`, which THROWS (`util/dt_exception.hpp:110-121`), so
+`constValToField`'s `return ""` (`VectorOperands.cpp:261`) is unreachable and so are both callers'
+`if (value == "") { emitError; return nullopt; }` arms (`:284-287`, entries 166/167). The accepted
+domain is exactly `{0, 1, 2, 3}` — a four-variant `ConstantOperandValue` — and the `double`
+comparison chain went with it: what the chain decides is WHICH OF FOUR pseudo-unit ports
+(`SentientTypes.td:100-106`) the splat is read from, not a number.
+
+⛔⛔ 074 PROVED `kind == Constant` IS NOT `isa<arith::ConstantOp>`, AND THE TWO DISAGREE BOTH WAYS.
+`getOperandFromConstantBitstreamOp` tags a `vectorchain.constant_bitstream` operand `Constant`
+(`VectorOperands.cpp:305`) and the trivial-shuffle path re-tags an operand built over an
+`arith.constant` as `NFWD`/`ConstantBitstream` (`:317-336`). `sameBlock` asks the OP, so the port
+takes the enclosing scope as a parameter and interrogates the op class there — the precedent
+`agen_helper.rs`'s entry 038 set. ⚠️ The exemption is unreachable from the one caller today:
+`OperandReuse::setReuseInformation` guards with `type_ != Constant` (`OperandReuse.cpp:31`). Ported
+anyway.
+
+⛔ 075 CAN DELETE AN INNOCENT OP IN THE REFERENCE. `for (auto &use : op->getUses())` yields ONE ENTRY
+PER USE, so an op that reads the same result twice is pushed to `to_be_erased` twice and `e->erase()`d
+twice (`:809-819`) — a double free there, and in an arena a second erase at a stale position. The port
+deduplicates, and erases in DESCENDING position order because every position a removal invalidates is
+lexicographically greater than the one removed.
+
+⭐⭐ 076 SPLIT LEGALITY IN TWO, BECAUSE `applyPartialConversion` DOES. Sixteen patterns are installed
+(`VectorChainToSentientPESFP.cpp:1247-1255`) but only thirteen op classes are `addIllegalOp`
+(`:1262-1265`); an op that is neither legal nor explicitly illegal is still offered to the patterns
+and left alone if none matches. So `ElementWiseCompareOpLowering`, `ElementWiseSelectionOpLowering`
+and `ShuffleOpLowering` DO rewrite when they match while their ops are not required to lower —
+`Unlowered::Required` and `Unlowered::BestEffort` keep that asymmetry auditable instead of merging it
+away, and only the required work reaches the `todo!`.
+
+⭐⭐ 079 GAVE THE ARENA NODE AN `OpId`, NOT A BORROW, AND THE REFERENCE FORCED IT. A `LoopMaskTree` is
+built once per PT program unit and then threaded through three MUTATING passes — `fuseNonComputeOps`,
+`fuseComputeOps`, `lowerDanglingNonComputeOps` (`VectorChainToSentientPT.cpp:1003-1014`) — while
+`insertPTMaskOps` walks it inserting `set_mask`/`incrmask` ops (`LoweringPTMasks.cpp:74-100`). A
+`&DfirOp` held across those calls forbids exactly the rewrites the tree exists to drive, and
+`updateNode` (entry 237) exists BECAUSE a lowering replaces the op a node names. ⚠️ This diverges
+deliberately from `LocalOpNode::new` (entry 101), which took `&'p DfirOp`: that node is built, read
+and dropped inside one non-mutating walk and never asked which op it holds. And `push_child` takes the
+op by value rather than as an `Option`, so *only the synthetic root names no operation* is a type
+rather than a comment.
+
+⭐ 078 DROPPED THE `DenseMap` MEMO FOR AN ARENA SCAN, and the two answers coincide exactly: the map
+holds an entry for every node except the root (`LoopMaskTree.cpp:152`, `:179`, while `:175` inserts
+nothing) and the scan skips the root because its operation is `None`. What the map would cost is a
+second source of truth for its two writers (entries 236, 237) to keep in step — which is the bug its
+own `"op already in map - should not happen"` check exists to catch.
+
+⛔ 077'S ACTION RETURNS NOTHING, AND ONE CALLER READS AS THOUGH IT DOES NOT. `kBFS` discards the
+action's result (`(void)action(curr_node)`, `OperationTree.cpp:190`), so
+`analyzeAndInsertMaskOps`'s `signalPassFailure(); … return nullptr;` (`LoweringPTMasks.cpp:193-197`)
+does **not** stop the walk — the rest of the queue is visited and further masks are still lowered.
+Only the two GUIDED orders steer by the return value, and they are unscheduled. A test pins it.
+
+⭐ 079 PUT THE OPERATION IN THE **BASE**, WHICH IS WHERE THE REFERENCE KEEPS IT
+(`OperationNode::operation_op_`, `OperationTree.hpp:185`; `LocalOpNode(Operation *op)
+: OperationNode(op)`, `FlatteningLocalRegions.cpp:51`) — but entry 101 had already put it in the
+PAYLOAD, as a `&'p DfirOp`. In C++ there is one `insertChildNode` because the node's constructor,
+which the caller runs, has already set `operation_op_`; here the arena mints the node, so those two
+constructors reach it as TWO inserts over one shared body: `push_named_child` (an `OpId` in the base,
+so `find_node_from_op` can search it) and `push_child` (the base's `op` stays `None`; the payload
+names it). ⚠️ A tree built through the second must not be searched with `find_by_op`.
+
+⛔ **FIVE SCOPE HOLES FOUND IN THIS BATCH, NONE IN THE 384 AND NONE IN THE 106 EXCLUSIONS.**
+- The sixteen PESFP compute-pattern `matchAndRewrite` bodies (`VectorChainToSentientPESFP.cpp:328`,
+  `:569`, …) — entry 076 installs them and nothing ports them, so `fuseComputeOps` reaches a `todo!`
+  naming the first pattern it needs.
+- `VectorOperand::sameBlock`'s SECOND overload, over a
+  `SmallVectorImpl<optional<VectorOperand>>&` (`VectorOperands.cpp:670-685`), which is what
+  `VectorChainToSentientPT.cpp:142` and `VectorChainToSentientPESFP.cpp:121` actually call. Its body
+  is entry 074's applied to every element — same two failure arms, one `return success()` at the end
+  — so it is a fold over the ported one, but no caller can be built without it.
+- `VectorOperand::eraseOp`'s SECOND overload, taking a `ConversionPatternRewriter` and an
+  `erased_list` (`:829`), called from `VectorChainToSentientPESFP.cpp:1062`. It is the one that
+  deduplicates — `std::find` against both lists (`:837-841`) — which is what entry 075 had to decide
+  for itself.
+- `OperationNode::breadthFirstWalk` (`OperationTree.cpp:183`) and the six other
+  `LoopMaskNode::walk<>` specializations (`LoopMaskTree.cpp:26-93`). The BFS one is written here
+  unanchored, beside the rest of the base layer; the other six orders are not.
+- `LoopMaskNode`'s and `MaskNode`'s COPY constructors (`LoopMaskTree.hpp:33`, `:73`), and
+  `MaskNode`'s is a reference DEFECT: `MaskNode(const MaskNode &n) : LoopMaskNode(n.getOperation())`
+  copies the op and silently drops `start_val_` and `increment_`, leaving both uninitialised. Nothing
+  in the tree calls it today.
 
 ⛔ **TWO HOLES IN THE VALUE-BASED SIMPLIFICATION PATH, NEITHER OF THEM MINE TO FILL.** Entry 381
 (`simplifyValueBasedConditionals`) needs the manager to be constructible and parseable, and:
@@ -564,22 +655,22 @@ REGIONS; both callers are region-free chain ops (`Agen.cpp:114-134`).
 - [ ] **AUDIT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, line by line against the C++
 - [ ] **PORT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, 50 lines
 - [ ] **AUDIT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, line by line against the C++
-- [ ] **PORT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, 12 lines
-- [ ] **AUDIT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, line by line against the C++
-- [ ] **PORT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, 11 lines
-- [ ] **AUDIT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, line by line against the C++
-- [ ] **PORT 075/384** `eraseOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:806`, 16 lines
-- [ ] **AUDIT 075/384** `eraseOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:806`, line by line against the C++
-- [ ] **PORT 076/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1243`, 26 lines
-- [ ] **AUDIT 076/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1243`, line by line against the C++
-- [ ] **PORT 077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132`, 2 lines
-- [ ] **AUDIT 077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132`, line by line against the C++
-- [ ] **PORT 078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167`, 4 lines
-- [ ] **AUDIT 078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167`, line by line against the C++
-- [ ] **PORT 079/384** `OperationNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32`, 0 lines
-- [ ] **AUDIT 079/384** `OperationNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32`, line by line against the C++
-- [ ] **PORT 080/384** `LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34`, 0 lines
-- [ ] **AUDIT 080/384** `LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34`, line by line against the C++
+- [x] **PORT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, 12 lines
+- [x] **AUDIT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, line by line against the C++
+- [x] **PORT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, 11 lines
+- [x] **AUDIT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, line by line against the C++
+- [x] **PORT 075/384** `eraseOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:806`, 16 lines
+- [x] **AUDIT 075/384** `eraseOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:806`, line by line against the C++
+- [x] **PORT 076/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1243`, 26 lines
+- [x] **AUDIT 076/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1243`, line by line against the C++
+- [x] **PORT 077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132`, 2 lines
+- [x] **AUDIT 077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132`, line by line against the C++
+- [x] **PORT 078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167`, 4 lines
+- [x] **AUDIT 078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167`, line by line against the C++
+- [x] **PORT 079/384** `OperationNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32`, 0 lines
+- [x] **AUDIT 079/384** `OperationNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32`, line by line against the C++
+- [x] **PORT 080/384** `LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34`, 0 lines
+- [x] **AUDIT 080/384** `LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34`, line by line against the C++
 - [x] **PORT 081/384** `getParentNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:36`, 2 lines
 - [x] **AUDIT 081/384** `getParentNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:36`, line by line against the C++
 - [x] **PORT 082/384** `getFirstChild` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:39`, 2 lines

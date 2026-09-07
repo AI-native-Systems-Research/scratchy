@@ -217,6 +217,8 @@ pub fn operands(op: &Op) -> Vec<Val> {
             vectorchain::Op::ConstantBitstream { .. }
             | vectorchain::Op::CreateAffineMask { .. } => {}
             vectorchain::Op::Estimate { input, .. }
+            | vectorchain::Op::FastExp { input, .. }
+            | vectorchain::Op::Floor { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Shuffle { input, .. }
@@ -311,6 +313,8 @@ pub fn results(op: &Op) -> Vec<Val> {
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::Estimate { result, .. }
+            | vectorchain::Op::FastExp { result, .. }
+            | vectorchain::Op::Floor { result, .. }
             | vectorchain::Op::ScanWithGap { result, .. }
             | vectorchain::Op::Select { result, .. }
             | vectorchain::Op::Multiply { result, .. }
@@ -454,6 +458,8 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             vectorchain::Op::ConstantBitstream { .. }
             | vectorchain::Op::CreateAffineMask { .. } => {}
             vectorchain::Op::Estimate { input, .. }
+            | vectorchain::Op::FastExp { input, .. }
+            | vectorchain::Op::Floor { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Shuffle { input, .. }
@@ -523,6 +529,8 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::Estimate { result, .. }
+            | vectorchain::Op::FastExp { result, .. }
+            | vectorchain::Op::Floor { result, .. }
             | vectorchain::Op::ScanWithGap { result, .. }
             | vectorchain::Op::Select { result, .. }
             | vectorchain::Op::Multiply { result, .. }
@@ -619,6 +627,35 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         }) => vec![body.as_slice(), else_body.as_slice()],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
+        Op::Arith(_)
+        | Op::Affine(_)
+        | Op::Scf(_)
+        | Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_) => Vec::new(),
+    }
+}
+
+/// THE OPS AN OP'S REGIONS HOLD, MUTABLY — [`regions`] arm for arm.
+///
+/// ⛔⛔ THE TWO MUST STAY IN STEP, WHICH IS WHY THEY SIT TOGETHER AND MATCH IN THE SAME ORDER. A
+/// reader that descends with [`regions`] and a writer that descends with this one would disagree
+/// about where an op is the moment one of them gained an arm the other lacks — and a *position* is
+/// how `e075_eraseOp` names the op it removes.
+///
+/// ⭐ `&mut Vec<Op>` AND NOT `&mut [Op]`: the one caller removes elements, which is a `Vec`
+/// operation. The read side hands out slices because nothing reading needs the length to change.
+#[must_use]
+pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
+    match op {
+        Op::Affine(affine::Op::For { body, .. }) | Op::Scf(scf::Op::Parallel { body, .. }) => {
+            vec![body]
+        }
+        Op::Scf(scf::Op::If {
+            body, else_body, ..
+        }) => vec![body, else_body],
+        Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
+        Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
         Op::Arith(_)
         | Op::Affine(_)
         | Op::Scf(_)

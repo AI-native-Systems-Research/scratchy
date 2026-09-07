@@ -314,6 +314,45 @@ pub enum Op {
         ty: Vector,
     },
 
+    /// `vectorchain.fast_exp %in : tin, tout` — the exponential's auxiliary function.
+    ///
+    /// ⛔⛔ NOT `Estimate { kind: Exp }`. `VectorChain_FastExpOp` and `VectorChain_ExpEstimateOp` are
+    /// two op definitions in one `.td` (`VectorChain.td:237` and `:251`), with two mnemonics and two
+    /// lowering patterns (`FastExpOpLowering`, `ExpEstimateOpLowering`,
+    /// `VectorChainToSentientPESFP.cpp:1250`); the estimate takes a REQUIRED
+    /// `VectorChainExpEstimateAttr:$version` and this one takes no attribute at all. Folding it into
+    /// the estimate family would make `version` optional for a case that has none, and would print
+    /// the wrong mnemonic.
+    ///
+    /// ⭐ ADDED FOR `e076_fuseComputeOps`, which names `FastExpOp` in the set of ops its conversion
+    /// target declares illegal — an op the island could not spell.
+    FastExp {
+        /// The vector it binds.
+        result: Val,
+        /// What is exponentiated.
+        input: Val,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.floor %in : tin, tout` — the floor function.
+    ///
+    /// ⭐ ADDED FOR `e076_fuseComputeOps`, alongside [`Op::FastExp`]: `FloorOp` is one of the
+    /// thirteen ops that pass's target declares illegal (`VectorChainToSentientPESFP.cpp:1261-1263`).
+    /// It is `VectorChain_FloorOp` (`VectorChain.td:267`) — unary, no attribute, its own mnemonic.
+    Floor {
+        /// The vector it binds.
+        result: Val,
+        /// What is rounded down.
+        input: Val,
+        /// The input's type.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
     /// `vectorchain.scan_with_gap %in {reduction_op, gap, eval_order} : tin, tout` — a reduction.
     ///
     /// ⛔ WHICH REDUCTION IS THE COMPUTE'S `mode=`: 1 add, 8 max, 10 abs_max, 12 min, 14 abs_min
@@ -663,6 +702,33 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 "{} = vectorchain.{} {}{version} : {}, {}",
                 print::val(*result),
                 kind.spelling(),
+                print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
+        // ⭐ ONE ARM FOR THE TWO UNARY, ATTRIBUTE-FREE OPS — the mnemonic is the only difference,
+        // and it is named here rather than derived so that neither can print as the other.
+        Op::FastExp {
+            result,
+            input,
+            input_ty,
+            ty,
+        }
+        | Op::Floor {
+            result,
+            input,
+            input_ty,
+            ty,
+        } => {
+            let mnemonic = match op {
+                Op::FastExp { .. } => "fast_exp",
+                _ => "floor",
+            };
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.{mnemonic} {} : {}, {}",
+                print::val(*result),
                 print::val(*input),
                 print::vector(*input_ty),
                 print::vector(*ty)
