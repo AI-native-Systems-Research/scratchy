@@ -39,11 +39,15 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`2/384 ported; 2/384 audited`
+`10/384 ported; 10/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`) and
-`setImmutableAddrAndIncrements`. Unticked by their own audits and awaiting re-port with their
-emission: `setldtype`, `generateSetSendDestinationStmts`, `getLoadConsumer`.
+`setImmutableAddrAndIncrements`; entries 009-016, the `AccessDetailsBase` state setters
+(`setRotationPosition`, `setExpectedTotalElements`, `setExtents`, `setTotalElements`,
+`setElementWidth`, `setTransferSet`, `setTransferOrder`) and the `AccessDetailsAffine` constructor,
+in `src/bridges/dataflow_ir_to_sentient/agen_access_details.rs`. Unticked by their own audits and
+awaiting re-port with their emission: `setldtype`, `generateSetSendDestinationStmts`,
+`getLoadConsumer`.
 
 
 ## Level 0
@@ -64,22 +68,22 @@ emission: `setldtype`, `generateSetSendDestinationStmts`, `getLoadConsumer`.
 - [ ] **AUDIT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, line by line against the C++
 - [ ] **PORT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, 2 lines
 - [ ] **AUDIT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, line by line against the C++
-- [ ] **PORT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, 2 lines
-- [ ] **AUDIT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, line by line against the C++
-- [ ] **PORT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, 2 lines
-- [ ] **AUDIT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, line by line against the C++
-- [ ] **PORT 011/384** `setExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:113`, 2 lines
-- [ ] **AUDIT 011/384** `setExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:113`, line by line against the C++
-- [ ] **PORT 012/384** `setTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:116`, 2 lines
-- [ ] **AUDIT 012/384** `setTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:116`, line by line against the C++
-- [ ] **PORT 013/384** `setElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:119`, 2 lines
-- [ ] **AUDIT 013/384** `setElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:119`, line by line against the C++
-- [ ] **PORT 014/384** `setTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:122`, 2 lines
-- [ ] **AUDIT 014/384** `setTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:122`, line by line against the C++
-- [ ] **PORT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, 2 lines
-- [ ] **AUDIT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, line by line against the C++
-- [ ] **PORT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, 0 lines
-- [ ] **AUDIT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, line by line against the C++
+- [x] **PORT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, 2 lines
+- [x] **AUDIT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, line by line against the C++
+- [x] **PORT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, 2 lines
+- [x] **AUDIT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, line by line against the C++
+- [x] **PORT 011/384** `setExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:113`, 2 lines
+- [x] **AUDIT 011/384** `setExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:113`, line by line against the C++
+- [x] **PORT 012/384** `setTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:116`, 2 lines
+- [x] **AUDIT 012/384** `setTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:116`, line by line against the C++
+- [x] **PORT 013/384** `setElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:119`, 2 lines
+- [x] **AUDIT 013/384** `setElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:119`, line by line against the C++
+- [x] **PORT 014/384** `setTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:122`, 2 lines
+- [x] **AUDIT 014/384** `setTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:122`, line by line against the C++
+- [x] **PORT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, 2 lines
+- [x] **AUDIT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, line by line against the C++
+- [x] **PORT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, 0 lines
+- [x] **AUDIT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, line by line against the C++
 - [ ] **PORT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, 2 lines
 - [ ] **AUDIT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, line by line against the C++
 - [ ] **PORT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, 2 lines
