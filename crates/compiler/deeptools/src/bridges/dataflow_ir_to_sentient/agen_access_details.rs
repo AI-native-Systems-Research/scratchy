@@ -138,6 +138,35 @@ pub enum MemoryOperandIndex {
     /// `kIndDst` — the indirect destination operand.
     IndDst,
 }
+impl MemoryOperandIndex {
+    /// HOW MANY THERE ARE — the reference's `kMax`, which is a COUNT and not an operand.
+    ///
+    /// ⛔ AN ASSOCIATED CONSTANT, NOT A FIFTH VARIANT. `AccessContainer` sizes `index_mapping_` with
+    /// `(int)kMax` (`AccessDetails.hpp:375`), so in C++ `has(MemoryOperandIndex::kMax)` compiles and
+    /// reads one past the end of a four-element vector. Spelling the count here makes that call
+    /// unwritable.
+    pub const COUNT: usize = 4;
+
+    /// All four, in the reference's enumerator order.
+    pub const ALL: [MemoryOperandIndex; MemoryOperandIndex::COUNT] = [
+        MemoryOperandIndex::DirSrc,
+        MemoryOperandIndex::IndSrc,
+        MemoryOperandIndex::DirDst,
+        MemoryOperandIndex::IndDst,
+    ];
+
+    /// ITS SLOT IN AN [`AccessContainer`]'S INDEX MAP — the reference's `(int)moi`, and so its
+    /// enumerator value.
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        match self {
+            MemoryOperandIndex::DirSrc => 0,
+            MemoryOperandIndex::IndSrc => 1,
+            MemoryOperandIndex::DirDst => 2,
+            MemoryOperandIndex::IndDst => 3,
+        }
+    }
+}
 
 /// ONE COEFFICIENT OF A MEMORY VIEW'S LAYOUT MAP — a STRIDE, in elements.
 ///
@@ -1213,12 +1242,120 @@ impl<'a> AccessDetailsAffineComposite<'a> {
     }
 }
 
+/// THE ACCESS DETAILS OF A **SYMBOLIC** ACCESS — one whose strides are SSA VALUES rather than
+/// literals (`AccessDetails.hpp:340-367`).
+///
+/// ⭐ THAT IS THE WHOLE DIFFERENCE FROM THE AFFINE FORM. An affine access states its coefficients as
+/// integers the pass can fold; a symbolic one indexes through values the program computes — a
+/// `symbol.create_symbol`, a toggling JCR base — so the strides can only be carried as the values
+/// themselves and the arithmetic has to be emitted.
+///
+/// Only the field [`e025_setStrides`](Self::set_strides) owns is present; the rest of this class
+/// arrives with `e155_updateSymbolicAccessDetails`, `e265_constructDetails` and the base class's own
+/// fields, which are other entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessDetailsSymbolic {
+    /// `strides_` — *"strides used in the indices accesses"* (`AccessDetails.hpp:366`).
+    strides: Vec<Val>,
+}
+
+impl AccessDetailsSymbolic {
+    /// The strides, in the order the access lists its indices — `getStrides`
+    /// (`AccessDetails.hpp:352`).
+    #[must_use]
+    pub fn strides(&self) -> &[Val] {
+        &self.strides
+    }
+
+    /// Replaces: e025_setStrides
+    ///
+    /// `setStrides` (`AccessDetails.hpp:355-357`):
+    ///
+    /// ```c++
+    /// void setStrides(const SmallVectorImpl<Value>& strides) {
+    ///   strides_.assign(strides.begin(), strides.end());
+    /// }
+    /// ```
+    ///
+    /// ⛔ `assign`, NOT `append` — THE LIST IS REPLACED. `e155_updateSymbolicAccessDetails`
+    /// (`Helper.cpp:1013-1047`) calls this after it has recomputed the strides for a NEW enclosing
+    /// loop nest; appending would leave the previous nest's strides in front of them, and an access
+    /// with twice as many strides as indices addresses whatever the extra ones happen to reach.
+    pub fn set_strides(&mut self, strides: &[Val]) {
+        self.strides.clear();
+        self.strides.extend_from_slice(strides);
+    }
+}
+
+/// A MAP FROM EACH [`MemoryOperandIndex`] TO THE ACCESS DETAIL, ADDRESS OR VALUE IT OWNS —
+/// `AccessContainer<T>` (`AccessDetails.hpp:369-430`).
+///
+/// ⭐ TWO STRUCTURES IN ONE, AND BOTH ARE READ. The C++ derives from `std::vector<T>`, so callers
+/// index it POSITIONALLY (`access_details[0]`, `Helper.cpp:3181-3203`) in insertion order, while
+/// `index_mapping_` answers *which operand does slot `i` belong to*. Dropping either half would
+/// break a caller: the vector order is what "the first mandatory operand" means, and the mapping is
+/// what makes `has`/`get` answerable at all.
+///
+/// ⛔ NO `-1` SENTINEL. The C++ fills `index_mapping_` with `-1` and asks `!= -1`; a slot that is
+/// EMPTY is [`None`] here, so "unfilled" and "filled with entry 0" are different values rather than
+/// two readings of one `int`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessContainer<T> {
+    /// The entries, in insertion order — the `std::vector<T>` half.
+    entries: Vec<T>,
+    /// Which entry each memory operand owns, or [`None`] where it owns none — `index_mapping_`.
+    slots: [Option<usize>; MemoryOperandIndex::COUNT],
+}
+
+impl<T> Default for AccessContainer<T> {
+    /// An empty container: no entries, and every operand unfilled — the C++'s
+    /// `index_mapping_((int)kMax, -1)`.
+    fn default() -> Self {
+        AccessContainer {
+            entries: Vec::new(),
+            slots: [None; MemoryOperandIndex::COUNT],
+        }
+    }
+}
+
+impl<T> AccessContainer<T> {
+    /// The entries in insertion order — what the C++'s `std::vector<T>` base class exposes, and what
+    /// `access_details[0]` reads (`Helper.cpp:3203`).
+    #[must_use]
+    pub fn entries(&self) -> &[T] {
+        &self.entries
+    }
+
+    /// Replaces: e026_has
+    ///
+    /// `has` (`AccessDetails.hpp:397-399`):
+    ///
+    /// ```c++
+    /// bool has(MemoryOperandIndex moi) const {
+    ///   return index_mapping_[(int)moi] != -1;
+    /// }
+    /// ```
+    ///
+    /// ⭐ THE ONE QUESTION EVERY CALLER OF `get` MUST ASK FIRST. `get` is `DT_CHECK`ed on it
+    /// (*"no entry exists for the requested memory operand index"*, `:401-405`), and the lowerings
+    /// branch on it to decide what an op even is: `e374_lowerSymbolicVectorLoadOp` and
+    /// `e327_gatherSymbolicLoadStoreDetails` use it to tell an indirect access from a direct one.
+    ///
+    /// ⛔ FILLED WITH ENTRY **0** IS FILLED. The C++ compares against `-1` rather than testing for
+    /// zero, and the first insertion always maps to slot 0 — so a `has` written as "nonzero" would
+    /// answer `false` for the very first operand inserted, which is `kDirSrc` on almost every op.
+    #[must_use]
+    pub fn has(&self, moi: MemoryOperandIndex) -> bool {
+        self.slots[moi.slot()].is_some()
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase, IndicesCoeffDict,
-        LayoutCoeff, MemoryOperandIndex, TimeBound, TimeDim, TimeOffsets, sen,
-        set_coalesced_bound_values,
+        AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase,
+        AccessDetailsSymbolic, IndicesCoeffDict, LayoutCoeff, MemoryOperandIndex, TimeBound,
+        TimeDim, TimeOffsets, sen, set_coalesced_bound_values,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
@@ -2004,5 +2141,79 @@ mod unit_tests {
         ad.set_shuffle_mode(sen::ShuffleMode::Splat);
         assert_eq!(ad.shuffle_mode, sen::ShuffleMode::Splat);
         assert_eq!(ad.shuffle_mode.spelling(), "splat");
+    }
+
+    /// ⭐ `assign` REPLACES. Two sets in a row leave only the second — the difference between
+    /// `assign` and `append`, and the reason `e155_updateSymbolicAccessDetails` can call this
+    /// repeatedly as it re-derives the strides for a new loop nest.
+    #[test]
+    fn set_strides_replaces_the_previous_list() {
+        let mut details = AccessDetailsSymbolic::default();
+        assert_eq!(details.strides(), &[]);
+
+        details.set_strides(&[Val(3), Val(4), Val(5)]);
+        assert_eq!(details.strides(), &[Val(3), Val(4), Val(5)]);
+
+        details.set_strides(&[Val(9)]);
+        assert_eq!(
+            details.strides(),
+            &[Val(9)],
+            "assign() replaces the strides; appending would leave the previous nest's in front"
+        );
+    }
+
+    /// An empty set of strides is a set of strides — `assign` from an empty range empties the list.
+    #[test]
+    fn set_strides_accepts_none() {
+        let mut details = AccessDetailsSymbolic::default();
+        details.set_strides(&[Val(1)]);
+        details.set_strides(&[]);
+        assert_eq!(details.strides(), &[]);
+    }
+
+    /// ⭐ A FRESH CONTAINER HAS NOTHING — the C++'s `index_mapping_((int)kMax, -1)`.
+    #[test]
+    fn a_fresh_container_has_no_operand() {
+        let container = AccessContainer::<Val>::default();
+        for moi in MemoryOperandIndex::ALL {
+            assert!(!container.has(moi), "{moi:?} was never inserted");
+        }
+    }
+
+    /// ⛔⛔ ENTRY **ZERO** IS AN ENTRY. `index_mapping_[moi] = 0` is the FIRST insertion, which is
+    /// `kDirSrc` on almost every memory op; a `has` that tested for a nonzero slot would answer
+    /// `false` for it and every `get` behind it would refuse.
+    #[test]
+    fn the_first_entry_ever_inserted_reads_as_present() {
+        let container = AccessContainer {
+            entries: vec![Val(7)],
+            slots: [Some(0), None, None, None],
+        };
+        assert!(container.has(MemoryOperandIndex::DirSrc));
+        assert_eq!(container.entries(), &[Val(7)]);
+    }
+
+    /// ⭐ ONE FILLED SLOT IS ONE FILLED SLOT. A container holding the two INDIRECT operands of a
+    /// `composite_indirect_load_and_store` answers for exactly those two.
+    #[test]
+    fn has_answers_per_operand() {
+        let container = AccessContainer {
+            entries: vec![Val(10), Val(11)],
+            slots: [None, Some(0), None, Some(1)],
+        };
+        assert!(container.has(MemoryOperandIndex::IndSrc));
+        assert!(container.has(MemoryOperandIndex::IndDst));
+        assert!(!container.has(MemoryOperandIndex::DirSrc));
+        assert!(!container.has(MemoryOperandIndex::DirDst));
+    }
+
+    /// The slots are the C++ enumerator values, which is what `(int)moi` indexes with.
+    #[test]
+    fn the_slots_are_the_cpp_enumerator_values() {
+        assert_eq!(MemoryOperandIndex::DirSrc.slot(), 0);
+        assert_eq!(MemoryOperandIndex::IndSrc.slot(), 1);
+        assert_eq!(MemoryOperandIndex::DirDst.slot(), 2);
+        assert_eq!(MemoryOperandIndex::IndDst.slot(), 3);
+        assert_eq!(MemoryOperandIndex::ALL.len(), MemoryOperandIndex::COUNT);
     }
 }

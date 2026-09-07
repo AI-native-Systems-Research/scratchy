@@ -315,6 +315,22 @@ pub enum DfirUnit {
     PeState,
     /// `sfpring`.
     SfpRing,
+    /// `lxvirtualibr` — THE LX'S VIRTUAL INDEX BUFFER REGION, the unit an INDIRECT access indexes
+    /// through.
+    ///
+    /// ⛔⛔ THE ONE UNIT AN EXTRACT PATTERN IS ALLOWED TO VIEW, AND IT IS CHECKED BY NAME.
+    /// `checkIndirectMemViewForExtractOp` (`Helper.cpp:388-431`) resolves the indirect memory view's
+    /// `from_unit`, converts its `type=` string through `stringToSenComponents`, and refuses
+    /// anything but `SenComponents::LXVIRTUALIBR` with *"indirect memory view is not operating on a
+    /// virtual IBR"*. Without this variant the check has nothing to compare against and a gather's
+    /// index view is indistinguishable from a data view.
+    ///
+    /// `SenComponents::LXVIRTUALIBR` spells `"lxvirtualibr"` (`sys-arch-spec/arch_enums.cpp:105`).
+    ///
+    /// ⭐ NOT A NEIGHBOUR AND NOT A `get_local_unit`. Like [`Self::Lx`] and [`Self::Hbm`] it is a
+    /// MEMORY A VIEW IS TAKEN OVER — `buildNeighborUnits` never binds it, which is why it is absent
+    /// from [`neighbours`].
+    LxVirtualIbr,
 }
 
 impl DfirUnit {
@@ -363,6 +379,7 @@ impl DfirUnit {
             Self::SfpState => "sfpstate",
             Self::PeState => "pestate",
             Self::SfpRing => "sfpring",
+            Self::LxVirtualIbr => "lxvirtualibr",
         }
     }
 }
@@ -432,8 +449,11 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
             }
             units
         }
-        // Memories and sources, not units that run a program of their own.
+        // Memories and sources, not units that run a program of their own. The virtual IBR is one
+        // of them: `buildNeighborUnits` has no arm for it and nothing sends to it — an indirect
+        // access takes a VIEW over it (`Helper.cpp:388-431`).
         DfirUnit::Hbm
+        | DfirUnit::LxVirtualIbr
         | DfirUnit::Lx
         | DfirUnit::L0
         | DfirUnit::L3lu
@@ -468,7 +488,13 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
 pub fn residency_of(unit: DfirUnit, core: Core, corelet: Corelet) -> Residency {
     match unit {
         // The root of the memory tree: one for the device, neither attribute.
-        DfirUnit::Hbm => Residency::Global,
+        //
+        // ⭐ AND THE VIRTUAL IBR IS BOUND THE SAME WAY, which is the reference's own output rather
+        // than a guess: `%13 = dataflow.get_unit {name = "lxvirtualibr", type = "lxvirtualibr"}`
+        // carries NO `core` and NO `corelet`, on the same unit as an `lxlu` bound with both
+        // (`dcc/test/Conversion/AgenToSentient/lx_indirect_loads_stores_composite.mlir:20,30`).
+        // The `name` has no residency prefix for the same reason.
+        DfirUnit::Hbm | DfirUnit::LxVirtualIbr => Residency::Global,
         // Depth one: one per core, `core` and no `corelet`.
         DfirUnit::Lx => Residency::Scratchpad { core },
         // Declared in the core group, so shared across its corelets: `corelet = 0`.
