@@ -227,7 +227,22 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             if operands.is_empty() {
                 out.push_str("scf.yield\n");
             } else {
-                let _ = writeln!(out, "scf.yield {}", print::vals(operands));
+                // ⛔ THE TYPE LIST IS NOT OPTIONAL ONCE THERE ARE OPERANDS, exactly as for
+                // `affine.yield` — the op this one is converted FROM (`AffineToStandard.cpp:48`), so
+                // the two print the same list. `ScfYieldOp`'s assembly format is
+                // `attr-dict ($results^ ':' type($results))?`, and the vendor's own text is
+                // `scf.yield %20 : index`
+                // (`dcc/test/Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:311`);
+                // EVERY `scf.yield` with operands under `dcc/test` carries its types.
+                // ⭐ ALWAYS `index`, ONE PER OPERAND — see [`super::affine::Carried`] for why every
+                // value a loop in this island carries is an address, the same assumption the
+                // `-> (..)` result list above already makes.
+                let _ = writeln!(
+                    out,
+                    "scf.yield {} : {}",
+                    print::vals(operands),
+                    vec!["index"; operands.len()].join(", ")
+                );
             }
         }
         Op::Parallel { ivs, body } => {
@@ -238,5 +253,76 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             print::indent(out, depth);
             out.push_str("}\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::islands::dataflow_ir::dialects::affine::Carried;
+    use crate::islands::dataflow_ir::dialects::scf::Op;
+    use crate::islands::dataflow_ir::dialects::{self, Val};
+    use crate::islands::dataflow_ir::print::emit;
+
+    /// ⭐ THE PLAIN COUNTED FORM, AS THE VENDOR'S OWN INPUT WRITES IT.
+    ///
+    /// `dcc/test/Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:319` is
+    /// `scf.for %arg5 = %c0 to %c4 step %c1 {` — three operands, no results, no `iter_args`. This is
+    /// the input to case 3 of that test, *"Same as 2. but with scf.for instead of affine.for"*
+    /// (`:241`), which is the case bridge-2 entry 142's `scf` arm exists for.
+    #[test]
+    fn prints_the_vendors_counted_scf_loop() {
+        let op = dialects::Op::Scf(Op::For {
+            iv: Val(105),
+            lo: Val(100),
+            hi: Val(104),
+            step: Val(101),
+            carried: Vec::new(),
+            body: vec![dialects::Op::Scf(Op::Yield {
+                operands: Vec::new(),
+            })],
+            dbg_name: None,
+        });
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        assert_eq!(
+            "scf.for %105 = %100 to %104 step %101 {\n  scf.yield\n}\n",
+            got
+        );
+    }
+
+    /// ⭐ AND THE CARRYING FORM, WHICH THE SAME TEST'S EXPECTATION CONTAINS.
+    ///
+    /// `simplify-conditional.mlir:64`:
+    /// `%50 = scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49) -> (index) {` — init `%49`,
+    /// region argument `%52`, result `%50`, the three values [`Carried`] keeps apart. Its terminator
+    /// is `scf.yield %20 : index` (`:311`), types and all.
+    #[test]
+    fn prints_the_vendors_carrying_scf_loop() {
+        let op = dialects::Op::Scf(Op::For {
+            iv: Val(51),
+            lo: Val(47),
+            hi: Val(11),
+            step: Val(6),
+            carried: vec![Carried {
+                init: Val(49),
+                arg: Val(52),
+                result: Val(50),
+            }],
+            body: vec![dialects::Op::Scf(Op::Yield {
+                operands: vec![Val(52)],
+            })],
+            dbg_name: None,
+        });
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        assert_eq!(
+            "%50 = scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49) -> (index) {\n  \
+             scf.yield %52 : index\n}\n",
+            got
+        );
     }
 }

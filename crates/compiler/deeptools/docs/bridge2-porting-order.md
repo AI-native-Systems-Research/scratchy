@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`137/384 ported; 137/384 audited`
+`143/384 ported; 143/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -595,6 +595,67 @@ the rewriters — plus `Role` to tell an operand from a result, `ProgramUnits::i
 `pub(super) val_mut` on `SendEnd`/`RecvEnd`/`Predicate` for `setOperand`. ⛔ `Predicate::val_mut`
 CANNOT TOUCH ITS `ty`, so the invariant that type exists for still holds.
 
+⭐ AND ENTRIES 137-142 — the two leaf constructors of the de-paging hierarchy and its manager, the
+unit filter, and the loop-info query: `TPMVVectorLoad`/`TPMVCompositeLoad` in
+`tf_transform_paged_mem_view_impl.rs`, `TransformPagedMemViewManager::run` in
+`tf_transform_paged_mem_view_manager.rs`, `removeCoresCoreletsFoldsFromProgramUnit` and
+`isDataTransfer` in `tf_unit_filtering.rs`, and `getDataflowForLoopInfoIfIV` in `tf_utils.rs`.
+49 unit tests. No equivalence tests: there is no C to call.
+
+⛔ 137 AND 138 ARE THE **DERIVED** CONSTRUCTORS, NOT THE CLASSES THEY ARE NAMED AFTER, which is the
+same reading entry 136's anchor records: `hpp:397` is the mem-initializer `: TPMVVector(mem_op, comp)
+{}`, so `e137_TPMVVector` is `TPMVVectorLoad`'s constructor and `e138_TPMVComposite` (`hpp:519`) is
+`TPMVCompositeLoad`'s. Six leaf types exist because entry 139's ENTIRE content is choosing which one
+to build — a single struct would make that function return the same thing six times — and the five
+siblings of 137/138 carry no anchor because the extractor deduplicated them by text
+(`: TPMVVector(mem_op, comp) {}` at `hpp:397`, `:415`, `:433`; `: TPMVComposite(…)` at `:519`, `:534`,
+`:549`).
+
+⛔ 137'S SIBLING DROPS AN ARGUMENT ON PURPOSE. `TPMVVectorLoadStore(Operation *mem_op,
+agen::VectorStoreOp &store_op, SenComponents comp)` forwards `mem_op` and `comp` and keeps the store
+NOWHERE (`hpp:431-433`); `initialize` re-derives it through entry 130's `getStoreOp` and appends it to
+`mem_ops_` (`Impl.cpp:512-520`). The parameter and its fate are kept in the port, because a signature
+quietly narrowed to two arguments would hide the reason entry 130 exists.
+
+⛔ 138'S OWN INPUT HAS NO ISLAND OP, AND THAT IS RECORDED RATHER THAN INVENTED. `agen.composite_load`
+and `agen.composite_store` (`paged_mem_view_loads.mlir:331`, `paged_mem_view_stores.mlir:361`) are two
+of the eleven `agen` ops the island does not declare; only `composite_load_and_store` is present, so
+two of the three composite leaves are reachable from a vendor test and from nothing this crate emits.
+The campaign's *add the op to the island* rule was applied to entry 139's actual input — the paged view
+itself, which the 121-128 wave added — and minting two composite ops no emitter produces would be the
+stand-in the crate rules forbid.
+
+⛔ 139's DISPATCH IS ASYMMETRIC AND THE ASYMMETRY IS THE PORT. Both load-and-store arms build a
+`TPMVVectorLoadStore` over the **load** (`TransformPagedMemViewManager.cpp:32`, `:46`) — even the arm
+that reached the pattern from the store and had to walk BACK to the load, where the reference passes
+`load_op` and not the op it was handed. `Selection` carries that choice; a port that passed `op`
+through both arms would type-check and de-page the wrong op.
+
+⛔ 140's TWO FILTER FINDINGS, both recorded beside the port. `getCoreId` returns **-1** for a unit with
+no `core` attribute (`DccExtContext.cpp:78-124`) and -1 is in no filter set, so a non-empty
+`filter-cores-except` ERASES the HBM handle — modelled as `Residency::Global` having no core. And a
+`Residency::CoreWide` unit carries `corelet = 0` explicitly while a `Residency::Scratchpad` carries
+none, so `filter-corelets-except=1` erases the first and keeps the second; that is the reason
+`Residency` distinguishes them. The vendor's own `core_filtering_edge_case.mlir` (32 `lxlu-CL0`
+handles, `filter-cores-except=0`, one survivor) is reproduced as a test.
+
+⛔ 142 DEPARTS FROM THE REFERENCE ON ONE VALUE, DELIBERATELY. `(ub - lb) / step` is an `int64_t` there
+and its only consumer feeds it to `new std::optional<int64_t>[num_iterations]`
+(`CFGSDataflowConditionalTree.hpp:74-75`), so `4 to 0` sizes an array with **-4** and a zero step
+divides by zero. `Iterations` is unsigned and saturates at zero; `LoopStep` is positive by
+construction. The truncating division is kept as the reference's (`0 to 7 step 2` is three, not four),
+because the array the caller sizes with it is the reference's too. ⛔ Its `scf` arm is ported and not
+declined: `dyn_cast<scf::ForOp>` is the FIRST cast in the body (`Utils.cpp:99`) and case 3 of
+`Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:241` is *"Same as 2. but with
+scf.for instead of affine.for"* — answering `None` there would have been a port that declines the
+reference's own test.
+
+⚠️ AND A CARRYING `scf.for` FALSIFIED THE `scf.yield` PRINTER. It printed `scf.yield %3` while the
+reference writes `scf.yield %20 : index` (`simplify-conditional.mlir:311`) and every `scf.yield` with
+operands under `dcc/test` carries its types — the same mandatory `type($results)` the `affine.yield`
+printer already carried a note about, unreachable until an `scf.for` could carry an `iter_args`.
+Fixed, with the two vendor loops as printer tests, and 001's terminator test now asserts the type list.
+
 
 ## Level 0
 
@@ -870,18 +931,18 @@ CANNOT TOUCH ITS `ty`, so the invariant that type exists for still holds.
 - [x] **AUDIT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, line by line against the C++
 - [x] **PORT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, 0 lines
 - [x] **AUDIT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, line by line against the C++
-- [ ] **PORT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, 0 lines
-- [ ] **AUDIT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, line by line against the C++
-- [ ] **PORT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, 0 lines
-- [ ] **AUDIT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, line by line against the C++
-- [ ] **PORT 139/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp:21`, 48 lines
-- [ ] **AUDIT 139/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp:21`, line by line against the C++
-- [ ] **PORT 140/384** `removeCoresCoreletsFoldsFromProgramUnit` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:240`, 20 lines
-- [ ] **AUDIT 140/384** `removeCoresCoreletsFoldsFromProgramUnit` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:240`, line by line against the C++
-- [ ] **PORT 141/384** `isDataTransfer` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:314`, 11 lines
-- [ ] **AUDIT 141/384** `isDataTransfer` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:314`, line by line against the C++
-- [ ] **PORT 142/384** `getDataflowForLoopInfoIfIV` — `dcc/src/Transform/Dataflow/Utils.cpp:99`, 31 lines
-- [ ] **AUDIT 142/384** `getDataflowForLoopInfoIfIV` — `dcc/src/Transform/Dataflow/Utils.cpp:99`, line by line against the C++
+- [x] **PORT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, 0 lines
+- [x] **AUDIT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, line by line against the C++
+- [x] **PORT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, 0 lines
+- [x] **AUDIT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, line by line against the C++
+- [x] **PORT 139/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp:21`, 48 lines
+- [x] **AUDIT 139/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp:21`, line by line against the C++
+- [x] **PORT 140/384** `removeCoresCoreletsFoldsFromProgramUnit` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:240`, 20 lines
+- [x] **AUDIT 140/384** `removeCoresCoreletsFoldsFromProgramUnit` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:240`, line by line against the C++
+- [x] **PORT 141/384** `isDataTransfer` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:314`, 11 lines
+- [x] **AUDIT 141/384** `isDataTransfer` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:314`, line by line against the C++
+- [x] **PORT 142/384** `getDataflowForLoopInfoIfIV` — `dcc/src/Transform/Dataflow/Utils.cpp:99`, 31 lines
+- [x] **AUDIT 142/384** `getDataflowForLoopInfoIfIV` — `dcc/src/Transform/Dataflow/Utils.cpp:99`, line by line against the C++
 
 ## Level 1
 
