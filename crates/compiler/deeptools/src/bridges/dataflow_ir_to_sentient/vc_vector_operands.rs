@@ -1553,7 +1553,9 @@ impl VectorOperand {
             | arith::Op::SubI(_)
             | arith::Op::MulI(_)
             | arith::Op::DivSI(_)
+            | arith::Op::RemSI(_)
             | arith::Op::Compare { .. }
+            | arith::Op::Select { .. }
             | arith::Op::Logic { .. } => return None,
         };
 

@@ -118,9 +118,18 @@ pub fn operands(op: &Op) -> Vec<Val> {
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
             | arith::Op::MulI(bin)
-            | arith::Op::DivSI(bin) => {
+            | arith::Op::DivSI(bin)
+            | arith::Op::RemSI(bin) => {
                 reads.extend([bin.lhs, bin.rhs]);
             }
+            // ⭐ ALL THREE, AND THE CONDITION FIRST — `arith.select`'s operand order is
+            // `$condition, $true_value, $false_value`.
+            arith::Op::Select {
+                condition,
+                true_value,
+                false_value,
+                ..
+            } => reads.extend([*condition, *true_value, *false_value]),
             // ⭐ THE PREDICATE IS NOT AN OPERAND — it is `arith.cmpi`'s first token, an
             // attribute. Both compared values are uses; which comparison it is, is not.
             arith::Op::Compare { lhs, rhs, .. } => reads.extend([*lhs, *rhs]),
@@ -357,12 +366,14 @@ pub fn results(op: &Op) -> Vec<Val> {
             arith::Op::Constant { result, .. }
             | arith::Op::ConstantInt { result, .. }
             | arith::Op::Compare { result, .. }
+            | arith::Op::Select { result, .. }
             | arith::Op::Logic { result, .. }
             | arith::Op::DenseConstant { result, .. } => vec![*result],
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
             | arith::Op::MulI(bin)
-            | arith::Op::DivSI(bin) => vec![bin.result],
+            | arith::Op::DivSI(bin)
+            | arith::Op::RemSI(bin) => vec![bin.result],
         },
         // ⛔ A `symbol.create_symbol` BINDS ITS EXTENT, and entry 091 reads it: the backward walk from
         // a lowered loop's bound ends at either an `arith.constant` or this op
@@ -495,10 +506,17 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
             | arith::Op::MulI(bin)
-            | arith::Op::DivSI(bin) => {
+            | arith::Op::DivSI(bin)
+            | arith::Op::RemSI(bin) => {
                 places.extend([&mut bin.lhs, &mut bin.rhs]);
             }
             arith::Op::Compare { lhs, rhs, .. } => places.extend([lhs, rhs]),
+            arith::Op::Select {
+                condition,
+                true_value,
+                false_value,
+                ..
+            } => places.extend([condition, true_value, false_value]),
             arith::Op::Logic { operands, .. } => places.extend(operands.iter_mut()),
         },
         Op::Scf(op) => match op {
@@ -682,12 +700,14 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             arith::Op::Constant { result, .. }
             | arith::Op::ConstantInt { result, .. }
             | arith::Op::Compare { result, .. }
+            | arith::Op::Select { result, .. }
             | arith::Op::Logic { result, .. }
             | arith::Op::DenseConstant { result, .. } => vec![result],
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
             | arith::Op::MulI(bin)
-            | arith::Op::DivSI(bin) => {
+            | arith::Op::DivSI(bin)
+            | arith::Op::RemSI(bin) => {
                 vec![&mut bin.result]
             }
         },
@@ -1095,7 +1115,8 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
             | arith::Op::MulI(bin)
-            | arith::Op::DivSI(bin) => {
+            | arith::Op::DivSI(bin)
+            | arith::Op::RemSI(bin) => {
                 operands.extend([&mut bin.lhs, &mut bin.rhs]);
                 results.push(&mut bin.result);
             }
@@ -1103,6 +1124,16 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 result, lhs, rhs, ..
             } => {
                 operands.extend([lhs, rhs]);
+                results.push(result);
+            }
+            arith::Op::Select {
+                result,
+                condition,
+                true_value,
+                false_value,
+                ..
+            } => {
+                operands.extend([condition, true_value, false_value]);
                 results.push(result);
             }
             arith::Op::Logic {
@@ -1593,7 +1624,8 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
             | arith::Op::MulI(bin)
-            | arith::Op::DivSI(bin) => {
+            | arith::Op::DivSI(bin)
+            | arith::Op::RemSI(bin) => {
                 vals.push((Role::Operand, &mut bin.lhs));
                 vals.push((Role::Operand, &mut bin.rhs));
                 vals.push((Role::Result, &mut bin.result));
@@ -1603,6 +1635,18 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             } => {
                 vals.push((Role::Operand, lhs));
                 vals.push((Role::Operand, rhs));
+                vals.push((Role::Result, result));
+            }
+            arith::Op::Select {
+                result,
+                condition,
+                true_value,
+                false_value,
+                ..
+            } => {
+                vals.push((Role::Operand, condition));
+                vals.push((Role::Operand, true_value));
+                vals.push((Role::Operand, false_value));
                 vals.push((Role::Result, result));
             }
             arith::Op::Logic {

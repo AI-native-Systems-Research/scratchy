@@ -1166,6 +1166,7 @@ mod unit_tests {
             DfirOp::Symbol(symbol::Op::CreateSymbol {
                 result: Val(38),
                 symbol_id: 0,
+                max_value: None,
             }),
             // `!isOperationSelected(*op) &&` — the two conditionals, empty here.
             DfirOp::Scf(scf::Op::If {
@@ -1839,8 +1840,15 @@ fn is_named_harmless(op: &DfirOp) -> bool {
             | arith::Op::SubI(_)
             | arith::Op::MulI(_)
             | arith::Op::DivSI(_)
+            | arith::Op::RemSI(_)
             | arith::Op::Logic { .. },
         ) => false,
+
+        // ⛔ `arith::SelectOp` IS NOT ON THE LIST EITHER, and the omission is the reference's, not a
+        // gap here: the `isa<>` above names three constant forms and `CmpIOp`, and a `select` is
+        // neither. It is `Pure` in MLIR (`Arith.td`, `SelectOp`) exactly as the arithmetic above is,
+        // and this still answers *"has a side effect"* for it — the conservative direction.
+        DfirOp::Arith(arith::Op::Select { .. }) => false,
 
         // `scf::YieldOp, scf::ForOp`.
         DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::For { .. }) => true,

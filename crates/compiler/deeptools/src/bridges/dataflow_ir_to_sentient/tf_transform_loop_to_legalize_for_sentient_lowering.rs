@@ -1761,6 +1761,7 @@ mod unit_tests {
             UpperBound::Symbol => scope.push(DfirOp::Symbol(symbol::Op::CreateSymbol {
                 result: bound,
                 symbol_id: 0,
+                max_value: None,
             })),
             UpperBound::BlockArgument => {}
         }

@@ -346,7 +346,12 @@ pub fn get_dataflow_for_loop_info_if_iv<'a>(
 /// the integer one exactly as the reference does, with two ops and two lowerings
 /// (`StandardToSentient.cpp:347` and `:358`) — so an `arith.constant 4 : i32` behind a bound is a
 /// [`None`] here, which is the `dyn_cast`'s answer too.
-fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
+///
+/// ⚠️ `pub(super)` BECAUSE A SECOND BRIDGE-2 FUNCTION ASKS THE SAME QUESTION.
+/// [`get_loop_trip_count`](super::tf_mutable_addr_splitting::get_loop_trip_count) (entry 184) reads
+/// an `scf.for`'s three bound operands through exactly this `dyn_cast`, and the classification of the
+/// island's other twelve `arith` ops below is the part that must not be written twice.
+pub(super) fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
     match defining_op(val, scope)? {
         DfirOp::Arith(arith::Op::Constant { value, .. }) => Some(*value),
         // ⛔ THE `arith` ARM IS SPELLED OUT, because `arith` is where a rival constant would land:
@@ -365,7 +370,18 @@ fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
             // which is what makes [`get_dataflow_for_loop_info_if_iv`] decline it. Entry 091's
             // `getForOpBound` is the function that walks the chain instead of declining it.
             | arith::Op::DivSI(_)
+            // ⛔ AND `arith.remsi` FOR THE SAME REASON, one step further: it is the other half of an
+            // affine `mod` expansion (`AffineApplyExpander::visitModExpr`), so it stands where a
+            // literal would and is not one.
+            | arith::Op::RemSI(_)
             | arith::Op::Compare { .. }
+            // ⛔ `arith.select` IS A BOUND THE VENDOR ACTUALLY WRITES AND STILL NOT A LITERAL.
+            // `select_ub` gives an `scf.for` the bound `arith.select %c, %c8, %c4 : index`
+            // (`dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_one_dim.mlir:290`) —
+            // both arms constant and the answer still null, because `dyn_cast` looks at THIS op.
+            // Entry 184's `get_loop_trip_count` is the function that takes the larger arm instead of
+            // declining it.
+            | arith::Op::Select { .. }
             | arith::Op::Logic { .. },
         ) => None,
         // ⭐ AND THE OTHER DIALECTS BY DIALECT, because no future op of theirs could be an
