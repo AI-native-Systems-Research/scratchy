@@ -247,8 +247,25 @@ pub enum Op {
     DenseConstant {
         /// The vector it binds.
         result: Val,
-        /// Whether the value is one rather than zero — the only two the templates name.
-        one: bool,
+        /// THE VALUE EVERY LANE CARRIES, in the element's own domain.
+        ///
+        /// ⛔⛔ THIS WAS `one: bool` AND THAT COULD NOT SPELL THE VENDOR'S OWN INPUT.
+        /// `getOperandFromConstantOp` (entry 166) reads a splat through `constValToField`, whose
+        /// accepted domain is 0, 1, **2 and 3** (`VectorOperands.cpp:250-262`) — and
+        /// `dcc/test/Conversion/VectorChainToSentientPESFP/splat.mlir:68` writes
+        /// `%cst = arith.constant dense<2> : vector<128xi8>`. With a boolean here two of the four
+        /// compute ports that function can return were unreachable, so the port would have been a
+        /// predicate over a domain the island had shrunk.
+        ///
+        /// ⭐ INTEGRAL EVEN FOR A FLOAT VECTOR, WHICH IS A CENSUS AND NOT AN ASSUMPTION. Every
+        /// `arith.constant dense<…>` in the authority's 825 `dcc/test/**/*.mlir` files is integral:
+        /// 108 × `1.000000e+00`, 82 × `0.000000e+00`, 22 × `0`, 6 × `2.000000e+00`,
+        /// 4 × `3.000000e+00`, 2 × `4.000000e+00`, 1 × `2`. A float element prints this in MLIR's
+        /// scientific form, an integer element as the bare literal — see [`emit`].
+        ///
+        /// ⭐ AND 4 IS STILL SPELLABLE, so entry 166's refusal of a splat outside 0..=3 stays
+        /// reachable rather than becoming statically dead.
+        splat: i64,
         /// Its type.
         ty: Vector,
     },
@@ -308,14 +325,18 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::vals(operands)
             );
         }
-        Op::DenseConstant { result, one, ty } => {
+        Op::DenseConstant { result, splat, ty } => {
             // MLIR prints a float splat in scientific form, which is what the vendored IR shows:
             // `arith.constant dense<0.000000e+00> : vector<64xf16>`.
-            let literal = match (one, ty.elem) {
-                (false, ElemType::Int(_)) => "0".to_owned(),
-                (true, ElemType::Int(_)) => "1".to_owned(),
-                (false, _) => "0.000000e+00".to_owned(),
-                (true, _) => "1.000000e+00".to_owned(),
+            let literal = match ty.elem {
+                ElemType::Int(_) => splat.to_string(),
+                ElemType::F16
+                | ElemType::F32
+                | ElemType::Bf16
+                | ElemType::F8E4M3Fn
+                | ElemType::F8E8M0Fnu
+                | ElemType::F4E2M1Fn
+                | ElemType::MxFloat(_) => float_splat(*splat),
             };
             let _ = writeln!(
                 out,
@@ -324,6 +345,35 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::vector(*ty)
             );
         }
+    }
+}
+
+/// A FLOAT SPLAT IN MLIR'S OWN `%e` FORM — one digit, a point, six digits, then a SIGNED TWO-DIGIT
+/// exponent: `0.000000e+00`, `2.000000e+00`.
+///
+/// ⛔ RUST'S `{:e}` IS NOT THAT FORM. `format!("{:.6e}", 2.0_f64)` is `2.000000e0` — no sign and no
+/// padding — so printing it raw would emit an attribute MLIR reads back as a different literal only
+/// by luck. The exponent is re-spelled here rather than parsed, so nothing in this path can fail.
+fn float_splat(splat: i64) -> String {
+    // Lossless for every splat the corpus writes; see `Op::DenseConstant::splat`.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the corpus's splats are 0..=4 and an f64 holds every i64 below 2^53 exactly"
+    )]
+    let scientific = format!("{:.6e}", splat as f64);
+    let (mantissa, exponent) = match scientific.split_once('e') {
+        Some(split) => split,
+        // `{:.6e}` always writes an `e`; this arm is the total answer rather than an unwrap.
+        None => (scientific.as_str(), "0"),
+    };
+    let (sign, digits) = match exponent.strip_prefix('-') {
+        Some(magnitude) => ('-', magnitude),
+        None => ('+', exponent),
+    };
+    if digits.len() < 2 {
+        format!("{mantissa}e{sign}0{digits}")
+    } else {
+        format!("{mantissa}e{sign}{digits}")
     }
 }
 

@@ -352,6 +352,91 @@ impl OperandReuse {
             Some(i) => a.len() == i + 1 && a[i] < b[i],
         }
     }
+
+    /// Replaces: e162_insertIfNotExists
+    ///
+    /// **162/384** `OperandReuse::insertIfNotExists` —
+    /// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81` (8L).
+    ///
+    /// ```cpp
+    /// bool OperandReuse::insertIfNotExists(Operation *op) {
+    ///   if (data_origins_.count(op) == 0) {
+    ///     int new_id = data_origins_.size();
+    ///     data_origins_[op] = {new_id, false};
+    ///     return true;
+    ///   }
+    ///
+    ///   return false;
+    /// }
+    /// ```
+    ///
+    /// # ⭐⭐ THE ID IS THE TABLE'S SIZE **BEFORE** THE INSERT, SO THE IDS ARE 0, 1, 2, … IN
+    /// FIRST-SEEN ORDER
+    ///
+    /// `int new_id = data_origins_.size();` is read on the line above the insertion, so the first
+    /// origin gets 0 and the *n*th gets *n*-1. This is the only place a [`DataOriginId`] is ever
+    /// minted — [`Self::set_reuse_flag`]'s default-insert leaves the id at [`DataId::Unassigned`] —
+    /// which is what makes the ids dense and makes `getTotalDataOriginsCount()`
+    /// (`OperandReuse.hpp:32`) equal to one past the highest id assigned here. ⛔ Reading the size
+    /// *after* inserting would start the ids at 1 and shift every `op<X>DataID` the emitted computes
+    /// carry.
+    ///
+    /// # ⛔⛔ `true` MEANS "I HAD NEVER SEEN IT", AND THE CALLER READS IT INVERTED
+    ///
+    /// The header's comment is *"Return true if new entry inserted, false if already present"*
+    /// (`OperandReuse.hpp:50`), and `setReuseInformation` tests
+    /// `if (!this->insertIfNotExists(operand_i.op_)) { operand_i.setValue("latch"); }`
+    /// (`OperandReuse.cpp:27-28`) — so **`false` latches**. An operand whose data origin some
+    /// earlier operand already registered reads it out of the latch instead of off the wire; a
+    /// first sighting does not. Inverting this bool inverts every latch decision in a vector chain.
+    ///
+    /// # ⛔ IT IS A MUTATION THAT *ANSWERS*, WHICH IS WHY THE SIDE EFFECT CANNOT BE SPLIT OFF
+    ///
+    /// The insertion and the answer are one act: the caller's next line depends on whether this call
+    /// created the entry, and its `else if` branch then reads
+    /// [`Self::absorbtion_flag`]`.value()` on the same op with no guard — safe precisely because
+    /// this call has just guaranteed the key is present (see that unit's note on the unguarded
+    /// `.value()`). A port that asked "is it present?" and inserted separately would let those two
+    /// steps drift apart.
+    ///
+    /// # ⭐ THE NEW ENTRY IS `{new_id, false}` AND THE `false` IS LOAD-BEARING
+    ///
+    /// Not absorbed yet — which is exactly the `Some(false)` that
+    /// `VectorChainToSentientPESFP.cpp:1289-1290` waits for before it emits the mask constant and the
+    /// consuming compute. An entry born absorbed would silence its own consumer.
+    // ⭐ DEAD IN A LIBRARY BUILD, LIVE UNDER TEST — private in the reference too
+    // (`OperandReuse.hpp:51`), with `e276_setReuseInformation` its sole caller, unscheduled in this
+    // wave. Same `expect` as [`Self::set_reuse_flag`], so both attributes have to come off together.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "its only caller is e276_setReuseInformation, not scheduled in this wave"
+        )
+    )]
+    fn insert_if_not_exists(&mut self, op: Val) -> bool {
+        // ⭐ THE SIZE IS READ FIRST, exactly as the reference reads it: on the line before the
+        // insertion, so `new_id` is the position this origin takes in first-seen order.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "one program unit's data origins are its operands' origins; 2^32 of them is not \
+                      a program this compiler can be handed"
+        )]
+        let new_id = DataOriginId(self.data_origins.len() as u32);
+
+        match self.data_origins.entry(op) {
+            // `data_origins_.count(op) == 0` — the first sighting.
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(OperandTag {
+                    id: DataId::Assigned(new_id),
+                    absorbed: false,
+                });
+                true
+            }
+            // Already present: the table is left exactly as it was, id and flag both.
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -360,8 +445,9 @@ mod unit_tests {
 
     /// A TABLE HOLDING THE GIVEN ORIGINS.
     ///
-    /// ⛔ WRITTEN STRAIGHT, NOT THROUGH `insertIfNotExists` — that is entry 162 and it does not
-    /// exist yet. The ids here are what it will mint: the position of first insertion.
+    /// ⛔ WRITTEN STRAIGHT, NOT THROUGH [`OperandReuse::insert_if_not_exists`] — the ids here are
+    /// what that unit mints, the position of first insertion, but a test of [`OperandReuse::id`]
+    /// that could only reach a table the minting built would be testing the pair and not either.
     fn table(origins: &[(Val, OperandTag)]) -> OperandReuse {
         OperandReuse {
             data_origins: origins.iter().copied().collect(),
@@ -565,5 +651,102 @@ mod unit_tests {
         let reuse = table(&[]);
         assert!(!reuse.dominates(&OpId::at(&[3, 0, 5]), &OpId::at(&[3, 1])));
         assert!(reuse.dominates(&OpId::at(&[3, 0]), &OpId::at(&[3, 1, 2])));
+    }
+
+    /// 🎯 162/384 — THE IDS ARE 0, 1, 2 … IN FIRST-SEEN ORDER.
+    ///
+    /// ⛔ THE SIZE IS READ BEFORE THE INSERT. `int new_id = data_origins_.size();` sits on the line
+    /// above `data_origins_[op] = {new_id, false};` (`OperandReuse.cpp:83-84`), so the first origin
+    /// is 0 — reading it after would start at 1 and shift every `op<X>DataID` the emitted computes
+    /// carry.
+    #[test]
+    fn the_ids_are_minted_in_first_seen_order() {
+        let mut reuse = OperandReuse::default();
+
+        assert!(reuse.insert_if_not_exists(Val(9)));
+        assert!(reuse.insert_if_not_exists(Val(4)));
+        assert!(reuse.insert_if_not_exists(Val(7)));
+
+        // First-seen order, not value order: `%9` was seen first and is data origin 0.
+        assert_eq!(reuse.id(Val(9)), DataId::Assigned(DataOriginId(0)));
+        assert_eq!(reuse.id(Val(4)), DataId::Assigned(DataOriginId(1)));
+        assert_eq!(reuse.id(Val(7)), DataId::Assigned(DataOriginId(2)));
+        assert_eq!(reuse.id(Val(9)).attribute(), 0);
+    }
+
+    /// 🎯 162/384 — ⛔ `true` IS "NEVER SEEN BEFORE", AND A SECOND SIGHTING CHANGES NOTHING.
+    ///
+    /// THE CALLER READS IT INVERTED: `if (!this->insertIfNotExists(operand_i.op_)) { setValue("latch"); }`
+    /// (`OperandReuse.cpp:27-28`), so `false` latches. The re-insert must also leave the id alone —
+    /// giving the origin a fresh id on its second sighting would make two operands of one compute
+    /// disagree about which data origin they read.
+    #[test]
+    fn a_second_sighting_answers_false_and_leaves_the_entry_alone() {
+        let mut reuse = OperandReuse::default();
+
+        assert!(reuse.insert_if_not_exists(Val(1)));
+        assert!(reuse.insert_if_not_exists(Val(2)));
+
+        assert!(!reuse.insert_if_not_exists(Val(1)));
+        assert_eq!(reuse.id(Val(1)), DataId::Assigned(DataOriginId(0)));
+        // And the table did not grow, so the next new origin takes 2 rather than 3.
+        assert!(reuse.insert_if_not_exists(Val(3)));
+        assert_eq!(reuse.id(Val(3)), DataId::Assigned(DataOriginId(2)));
+    }
+
+    /// 🎯 162/384 — A NEW ENTRY IS BORN **UNABSORBED**, AND THE FLAG IS NOW READABLE.
+    ///
+    /// ⛔ BOTH HALVES OF `{new_id, false}` MATTER. The `false` is the `Some(false)` that
+    /// `VectorChainToSentientPESFP.cpp:1289-1290` waits for before it emits the mask constant and the
+    /// consuming compute — an entry born absorbed would silence its own consumer. And the entry
+    /// existing at all is what makes `getAbsorbtionFlag(...).value()` on the line after the insert
+    /// safe (`OperandReuse.cpp:29`): before the call the flag is [`None`], after it `Some(false)`.
+    #[test]
+    fn a_new_entry_is_born_unabsorbed_and_present() {
+        let mut reuse = OperandReuse::default();
+
+        assert_eq!(reuse.absorbtion_flag(Val(5)), None, "not a data origin yet");
+        assert!(reuse.insert_if_not_exists(Val(5)));
+        assert_eq!(reuse.absorbtion_flag(Val(5)), Some(false));
+    }
+
+    /// 🎯 162/384 + 057/384 — AND AN ABSORBED ORIGIN IS STILL "ALREADY PRESENT".
+    ///
+    /// ⛔ THE TWO MUTATIONS MEET ON THE SAME TABLE. `setReuseFlag` flips `absorbed_` on an entry this
+    /// unit made, and the next sighting of that origin must answer `false` — the caller's chain then
+    /// falls through to `else if (getAbsorbtionFlag(...).value())` and latches for the *other*
+    /// reason. A port that keyed presence on the flag rather than the key would take the wrong arm.
+    #[test]
+    fn an_absorbed_origin_is_still_present() {
+        let mut reuse = OperandReuse::default();
+
+        assert!(reuse.insert_if_not_exists(Val(6)));
+        reuse.set_reuse_flag(Val(6));
+
+        assert!(!reuse.insert_if_not_exists(Val(6)));
+        assert_eq!(reuse.absorbtion_flag(Val(6)), Some(true));
+        assert_eq!(reuse.id(Val(6)), DataId::Assigned(DataOriginId(0)));
+    }
+
+    /// 🎯 162/384 + 057/384 — ⛔ AND `setReuseFlag`'s DEFAULT-INSERT TAKES AN ID THIS UNIT NEVER
+    /// MINTED.
+    ///
+    /// `data_origins_[op].absorbed_ = true` on an absent key creates `OperandTag{-1, false}` and then
+    /// sets the flag, so the entry counts towards `data_origins_.size()` while carrying no id — and
+    /// the NEXT origin `insertIfNotExists` sees skips a number. That is the reference's arithmetic,
+    /// not a rounding of it: the ids stay unique but stop being contiguous. Unreachable through the
+    /// reference's only caller (see [`OperandReuse::set_reuse_flag`]), and pinned here so that the
+    /// two units' shared table is what an audit reads rather than either one alone.
+    #[test]
+    fn a_default_inserted_entry_consumes_an_id_number() {
+        let mut reuse = OperandReuse::default();
+
+        reuse.set_reuse_flag(Val(8));
+        assert_eq!(reuse.id(Val(8)), DataId::Unassigned);
+        assert_eq!(reuse.id(Val(8)).attribute(), -1);
+
+        // The table already holds one entry, so the first origin proper is data origin 1.
+        assert!(reuse.insert_if_not_exists(Val(9)));
+        assert_eq!(reuse.id(Val(9)), DataId::Assigned(DataOriginId(1)));
     }
 }

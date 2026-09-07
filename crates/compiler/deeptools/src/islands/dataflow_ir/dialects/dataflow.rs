@@ -409,6 +409,32 @@ pub enum Op {
         which: LocalUnit,
     },
 
+    /// `dataflow.create_group (%a, %b : index, index) : index` — ONE HANDLE STANDING FOR A SET OF
+    /// UNITS, which is what a collective sync addresses.
+    ///
+    /// ⛔⛔ ADDED FOR `separateBasedOnDestinationUnits` (entry 161), WHOSE FOURTH BUCKET IS THIS OP
+    /// AND NOTHING ELSE. The reference sorts a sync's destinations into LX-corelet-0, LX-corelet-1,
+    /// L3 and GROUP by `dyn_cast`-ing each destination's defining op to `GetUnitOp` **or**
+    /// `CreateGroupOp` (`DataflowToSentient.cpp:768-783`). With no variant for the second the group
+    /// list could never be non-empty, so the port would have been the same function with one arm
+    /// deleted — and `lowerSyncLXL3ToLXL3`, its only caller, branches on exactly that list being
+    /// non-empty (`:796-800`).
+    ///
+    /// ⭐ THE VENDOR WRITES IT SIX UNITS WIDE: `%group0 = dataflow.create_group (%lx_lu_unit0,
+    /// %lx_lu_unit1, %lx_su_unit0, %lx_su_unit1, %l3_lu_unit, %l3_su_unit : index, index, index,
+    /// index, index, index) : index` (`dcc/test/L3SU/sync-op-l3su.mlir:75`), and two units wide at
+    /// `:81`.
+    ///
+    /// ⛔ THE OPERAND LIST IS OPTIONAL IN THE ASSEMBLY FORMAT — `` `(` ($unit_ids^ `:`
+    /// type($unit_ids))? `)` `` (`Dataflow.td:155`) — so an empty group prints its parentheses with
+    /// nothing between them, NOT `( : )`.
+    CreateGroup {
+        /// `$group_id` — the one handle the group is addressed by.
+        result: Val,
+        /// `$unit_ids` — the members, in the order they were named.
+        unit_ids: Vec<Val>,
+    },
+
     /// `dataflow.get_logical_memory_view %unit, %start {layout_map} : index, index, memref<..>`.
     ///
     /// ⛔ `start` IS IN ELEMENTS (`Dataflow.td:250`).
@@ -577,6 +603,23 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::val(*result),
                 print::val(*of),
                 which.spelling()
+            );
+        }
+        Op::CreateGroup { result, unit_ids } => {
+            // ⭐ THE TYPE LIST REPEATS `index` ONCE PER MEMBER, and the whole `operands : types`
+            // clause is elided when the group is empty (`Dataflow.td:155`).
+            let members = if unit_ids.is_empty() {
+                String::new()
+            } else {
+                let types = std::iter::repeat_n("index", unit_ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} : {types}", print::vals(unit_ids))
+            };
+            let _ = writeln!(
+                out,
+                "{} = dataflow.create_group ({members}) : index",
+                print::val(*result)
             );
         }
         Op::GetLogicalMemoryView {

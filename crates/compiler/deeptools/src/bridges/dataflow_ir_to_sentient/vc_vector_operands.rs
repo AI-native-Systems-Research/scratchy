@@ -593,6 +593,31 @@ pub enum ConstantOperandValue {
     Three,
 }
 
+impl ConstantOperandValue {
+    /// THE SPLAT THIS IS, or `None` for a value no pseudo-port names.
+    ///
+    /// ⛔⛔ THIS IS THE HALF OF `constValToField` THAT NAMING ITS DOMAIN PUSHED OUT TO THE CALLER.
+    /// The reference's chain is `if (const_val == 0) return "zero"; else if (const_val == 1) …` with
+    /// a `DT_ERROR` under it (`VectorOperands.cpp:250-262`) — recognition and spelling in one
+    /// function. Entry 073 ported the spelling over this enum, so the recognition lives here, at the
+    /// one place a value from the IR becomes one of the four.
+    ///
+    /// ⭐ AND `None` IS THE REFERENCE'S `DT_ERROR`, NOT ITS `return ""`. Both of its callers
+    /// (entries 166 and 167) test the returned string for emptiness and never see it, because the
+    /// throw happens first; declining here is the same refusal reached the way this crate reaches
+    /// one.
+    #[must_use]
+    pub const fn of(splat: i64) -> Option<ConstantOperandValue> {
+        match splat {
+            0 => Some(ConstantOperandValue::Zero),
+            1 => Some(ConstantOperandValue::One),
+            2 => Some(ConstantOperandValue::Two),
+            3 => Some(ConstantOperandValue::Three),
+            _ => None,
+        }
+    }
+}
+
 /// Replaces: e073_constValToField
 ///
 /// THE COMPUTE PORT A SPLATTED CONSTANT OPERAND IS READ FROM — `constValToField`
@@ -908,7 +933,7 @@ mod unit_tests {
     fn dense(result: Val) -> DfirOp {
         DfirOp::Arith(arith::Op::DenseConstant {
             result,
-            one: false,
+            splat: 0,
             ty: V,
         })
     }
@@ -1278,5 +1303,192 @@ mod unit_tests {
         ];
         erase_op(&OpId::at(&[0]), &mut scope);
         assert_eq!(scope, vec![floor(Val(2), Val(8))]);
+    }
+
+    // ═══════════════════════════════════════ 166 ═══════════════════════════════════════
+
+    /// `arith.constant dense<splat> : vector<128xbf16>` at position `[0]`.
+    fn dense_splat(splat: i64) -> arith::Op {
+        arith::Op::DenseConstant {
+            result: Val(30),
+            splat,
+            ty: V,
+        }
+    }
+
+    /// ⭐ 166/384 — THE VENDOR'S OWN PAIR: `dcc/test/PE/test1.mlir:38-39` splats one and zero into a
+    /// MAC's `opB` and `opC`, and its `CHECK-SENT-IR` reads `opB = #sentient<compute_port one>,
+    /// opC = #sentient<compute_port zero>` (`:18`).
+    ///
+    /// ⭐ AND THE OPERAND IS `Constant`-KINDED OVER THE CONSTANT'S OWN OP, carrying exactly one value
+    /// with both precisions unset — the caller fills those (`VectorOperands.cpp:516-521`).
+    #[test]
+    fn a_splat_of_one_is_the_one_port() {
+        let at = OpId::at(&[3]);
+        let one =
+            VectorOperand::from_constant_op(&dense_splat(1), at.clone()).expect("one is a port");
+
+        assert_eq!(one.kind, VectorOperandType::Constant);
+        assert_eq!(one.op, at);
+        assert_eq!(one.values, vec![OperandValue::Port(sen::Port::One)]);
+        assert_eq!(one.orig_precision, None);
+        assert_eq!(one.on_the_fly_conv_precision, None);
+
+        let zero = VectorOperand::from_constant_op(&dense_splat(0), at).expect("zero is a port");
+        assert_eq!(zero.values, vec![OperandValue::Port(sen::Port::Zero)]);
+    }
+
+    /// 🎯 DERIVED — TWO AND THREE ARE PORTS TOO, and no test in the authority tree reaches them:
+    /// `compute_port` never spells anything but `zero` or `one` across all 825 files, because the
+    /// `dense<2>` and `dense<3.000000e+00>` constants they do contain feed a `sentient.splat`
+    /// instead. Their acceptance is `constValToField`'s own domain (`VectorOperands.cpp:250-262`).
+    #[test]
+    fn the_four_splats_are_the_four_pseudo_ports() {
+        let at = OpId::at(&[0]);
+        let ports = [
+            sen::Port::Zero,
+            sen::Port::One,
+            sen::Port::Two,
+            sen::Port::Three,
+        ];
+
+        for (splat, port) in (0..4).zip(ports) {
+            let operand = VectorOperand::from_constant_op(&dense_splat(splat), at.clone())
+                .unwrap_or_else(|| panic!("dense<{splat}> is a port"));
+            assert_eq!(operand.values, vec![OperandValue::Port(port)]);
+        }
+    }
+
+    /// 🎯 THE TWO ABORTS — a splat past three, and a constant that is not a vector at all.
+    ///
+    /// ⚠️ DERIVED: the reference throws for the first (`DT_ERROR`) and asserts inside `mlir::cast`
+    /// for the second, so neither has a fixture. ⭐ `dense<4.000000e+00>` is real input, though —
+    /// twice, in the authority's tests — which is why [`arith::Op::DenseConstant`] can spell it.
+    #[test]
+    fn a_splat_no_port_names_is_declined() {
+        let at = OpId::at(&[0]);
+        assert_eq!(ConstantOperandValue::of(4), None);
+        assert_eq!(ConstantOperandValue::of(-1), None);
+        assert!(VectorOperand::from_constant_op(&dense_splat(4), at.clone()).is_none());
+
+        // `arith.constant 3 : index` — the caller reaches this for any `arith.constant`.
+        assert!(
+            VectorOperand::from_constant_op(
+                &arith::Op::Constant {
+                    result: Val(31),
+                    value: 3,
+                },
+                at
+            )
+            .is_none()
+        );
+    }
+}
+
+impl VectorOperand {
+    /// Replaces: e166_getOperandFromConstantOp
+    ///
+    /// # WHICH PSEUDO-PORT A SPLATTED VECTOR CONSTANT IS READ FROM
+    ///
+    /// ```cpp
+    /// std::optional<VectorOperand> VectorOperand::getOperandFromConstantOp(
+    ///     mlir::arith::ConstantOp &op) {
+    ///   std::string value;
+    ///   auto splat_attr = mlir::cast<SplatElementsAttr>(op.getValue());
+    ///   if (splat_attr) {
+    ///     double const_val;
+    ///     auto splat_value = splat_attr.getSplatValue<Attribute>();
+    ///     if (mlir::isa<IntegerAttr>(splat_value)) {
+    ///       const_val = mlir::cast<IntegerAttr>(splat_value).getInt();
+    ///     } else if (mlir::isa<FloatAttr>(splat_value)) {
+    ///       const_val = mlir::cast<FloatAttr>(splat_value).getValueAsDouble();
+    ///     } else {
+    ///       op->emitError("Only integer or float vectors are supported");
+    ///       return std::nullopt;
+    ///     }
+    ///
+    ///     value = constValToField(const_val);
+    ///     if (value == "") {
+    ///       op->emitError("Only 0, 1, 2, or 3 are supported values");
+    ///       return std::nullopt;
+    ///     }
+    ///   } else {
+    ///     op->emitError("Only constant splatted vectors are supported");
+    ///     return std::nullopt;
+    ///   }
+    ///
+    ///   return VectorOperand(Constant, value, op.getOperation());
+    /// }
+    /// ```
+    /// (`dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:264-293`)
+    ///
+    /// # ⭐⭐ A CONSTANT OPERAND COSTS NO PORT — THE HARDWARE HAS FOUR OF THEM WIRED IN
+    ///
+    /// `dcc/test/PE/test1.mlir:38-39` declares `%cst_0 = arith.constant dense<1.000000e+00> :
+    /// vector<64xf16>` and `%cst_1 = arith.constant dense<0.000000e+00>`, hands both to a
+    /// `vectorchain.multiply_and_accumulate` (`:60`), and the reference's own `CHECK-SENT-IR` reads
+    /// `opB = #sentient<compute_port one>, opC = #sentient<compute_port zero>` (`:18`). No load, no
+    /// link, no register — the operand IS the port, which is why this function returns an operand
+    /// rather than emitting anything.
+    ///
+    /// # ⛔ THE INTEGER/FLOAT SPLIT COLLAPSES, AND THE ISLAND IS WHY
+    ///
+    /// `IntegerAttr::getInt()` and `FloatAttr::getValueAsDouble()` (`:275-281`) exist because MLIR
+    /// keeps two attribute kinds; both feed ONE `double` and one chain of `const_val == N` tests.
+    /// [`arith::Op::DenseConstant::splat`] is a single `i64` for exactly this reason — see its own
+    /// note for the census that every `arith.constant dense<…>` in the authority tree is integral —
+    /// so *"Only integer or float vectors are supported"* names no third case here.
+    ///
+    /// ⛔ AND `if (value == "")` IS STATICALLY FALSE. `constValToField` ends in an unconditional
+    /// `DT_ERROR` (`:260`), so its `return ""` and this arm are both dead in the reference; the
+    /// domain is [`ConstantOperandValue`] and the refusal happens where the value is recognised. See
+    /// [`ConstantOperandValue::of`].
+    ///
+    /// # THE TWO ABORTS, EACH DECLINED HERE
+    ///
+    /// * ⛔ A SPLAT OUTSIDE `0..=3` THROWS IN THE REFERENCE. `DT_ERROR` is not a diagnostic
+    ///   (`util/dt_exception.hpp:110-121`); a `dense<4>` vector operand takes the compiler down. This
+    ///   port answers `None`, which is the same refusal without the crash — and it is reachable, not
+    ///   theoretical: `dense<4.000000e+00>` appears twice in the authority's tests.
+    /// * ⛔ A **SCALAR** `arith.constant` IS `mlir::cast`'s OWN ASSERT (`:270`), and the caller
+    ///   reaches this for any `isa<mlir::arith::ConstantOp>` (`VectorOperands.cpp:513-515`) — an
+    ///   `arith.constant 3 : index` included. It then asks `getElementType` of that scalar type
+    ///   (`:516`), which aborts as well. So the input is ill-formed twice over and `None` is the only
+    ///   answer this crate can give; [`arith::Op::Constant`] and [`arith::Op::ConstantInt`] are named
+    ///   rather than wildcarded so a fourth constant form has to decide.
+    ///
+    /// ⭐ THE TWO PRECISIONS ARE THE CALLER'S. `getOperand` sets `orig_precision_` and
+    /// `on_the_fly_conv_precision_` from `getElementType(const_op.getType())` immediately after this
+    /// returns (`:516-521`) — which is why `test1.mlir`'s golden also carries
+    /// `opBPrecision = #sentient<precision fp16>` — and [`VectorOperand::new`] leaves both unset.
+    #[must_use]
+    pub fn from_constant_op(op: &arith::Op, at: OpId) -> Option<VectorOperand> {
+        // `auto splat_attr = mlir::cast<SplatElementsAttr>(op.getValue());` — and the `else` arm
+        // *"Only constant splatted vectors are supported"* that this cast makes unreachable.
+        let splat = match op {
+            arith::Op::DenseConstant { splat, .. } => *splat,
+            arith::Op::Constant { .. } | arith::Op::ConstantInt { .. } => return None,
+            // ⛔ NOT AN `arith.constant` AT ALL, and the reference could not be handed one: its
+            // parameter is an `mlir::arith::ConstantOp&`. This island's [`arith::Op`] is one enum
+            // over the whole dialect, so the six arithmetic forms are written out rather than
+            // wildcarded — [`is_arith_constant`] draws the same line for [`same_block`].
+            arith::Op::AddI(_)
+            | arith::Op::SubI(_)
+            | arith::Op::MulI(_)
+            | arith::Op::DivSI(_)
+            | arith::Op::Compare { .. }
+            | arith::Op::Logic { .. } => return None,
+        };
+
+        // `const_val` — either attribute kind reaches the same number — and
+        // `value = constValToField(const_val);`.
+        let value = const_val_to_field(ConstantOperandValue::of(splat)?);
+
+        // `return VectorOperand(Constant, value, op.getOperation());`
+        Some(VectorOperand::new(
+            VectorOperandType::Constant,
+            OperandValue::Port(value),
+            at,
+        ))
     }
 }

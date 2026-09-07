@@ -199,6 +199,8 @@ pub fn operands(op: &Op) -> Vec<Val> {
         Op::Dataflow(op) => match op {
             dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque(_) => {}
             dataflow::Op::GetLocalUnit { of, .. } => reads.push(*of),
+            // ⭐ EVERY MEMBER IS AN OPERAND — `Variadic<Index>:$unit_ids` (`Dataflow.td:152`).
+            dataflow::Op::CreateGroup { unit_ids, .. } => reads.extend(unit_ids.iter().copied()),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => reads.extend([*from, *start]),
             // ⭐ EVERY PAGE'S START ADDRESS IS AN OPERAND — `Variadic<Index>:$page_start_addrs`
             // (`Dataflow.td:267-299`) — and the extents beside them are attributes, so they are not.
@@ -346,6 +348,7 @@ pub fn results(op: &Op) -> Vec<Val> {
         Op::Dataflow(op) => match op {
             dataflow::Op::GetUnit { result, .. }
             | dataflow::Op::GetLocalUnit { result, .. }
+            | dataflow::Op::CreateGroup { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![*result],
             dataflow::Op::GetPagedLogicalMemoryView(view) => vec![view.result],
@@ -487,6 +490,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         Op::Dataflow(op) => match op {
             dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque { .. } => {}
             dataflow::Op::GetLocalUnit { of, .. } => places.push(of),
+            dataflow::Op::CreateGroup { unit_ids, .. } => places.extend(unit_ids.iter_mut()),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => places.extend([from, start]),
             dataflow::Op::GetPagedLogicalMemoryView(view) => {
                 places.extend([&mut view.unit, &mut view.start_addr]);
@@ -598,6 +602,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
         Op::Dataflow(op) => match op {
             dataflow::Op::GetUnit { result, .. }
             | dataflow::Op::GetLocalUnit { result, .. }
+            | dataflow::Op::CreateGroup { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![result],
             dataflow::Op::GetPagedLogicalMemoryView(view) => vec![&mut view.result],
@@ -934,6 +939,10 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             dataflow::Op::Opaque { .. } => {}
             dataflow::Op::GetLocalUnit { result, of, .. } => {
                 operands.push(of);
+                results.push(result);
+            }
+            dataflow::Op::CreateGroup { result, unit_ids } => {
+                operands.extend(unit_ids.iter_mut());
                 results.push(result);
             }
             dataflow::Op::GetLogicalMemoryView {
@@ -1386,6 +1395,10 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             }
             dataflow::Op::GetLocalUnit { result, of, .. } => {
                 vals.push((Role::Operand, of));
+                vals.push((Role::Result, result));
+            }
+            dataflow::Op::CreateGroup { result, unit_ids } => {
+                vals.extend(unit_ids.iter_mut().map(|val| (Role::Operand, val)));
                 vals.push((Role::Result, result));
             }
             dataflow::Op::GetLogicalMemoryView {

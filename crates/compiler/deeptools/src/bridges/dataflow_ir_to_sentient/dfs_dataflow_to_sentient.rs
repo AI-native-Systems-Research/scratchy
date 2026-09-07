@@ -78,10 +78,10 @@
 //! | `e337_lowerSyncOperation` | 337/384 | 80 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901` |
 //! | `e361_runOnOperation` | 361/384 | 33 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` |
 
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow, defining_op};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::sentient as sen;
-use crate::units::{Corelet, DfirUnit};
+use crate::units::{Corelet, DfirUnit, Residency};
 
 /// Replaces: e039_isSenComponentL0LU
 ///
@@ -777,5 +777,662 @@ mod unit_tests {
              read_only_register_dictionary = {}, \
              read_write_register_dictionary = {a0_0 = \"R0\", a0_1 = \"R1\"}}"
         );
+    }
+
+    /// 🎯 159/384 — ONE KIND ON THE LIST IS THE ANSWER, AND TWO KINDS ARE NO ANSWER.
+    ///
+    /// ⛔ THE MIXED LIST IS THE CASE THE FUNCTION EXISTS FOR. `"Src unit types has to be the same."`
+    /// (`DataflowToSentient.cpp:124`) — a sync whose sources straddle an `lxlu` and an `l3lu` has no
+    /// single generic component to route on, so there is nothing to hand
+    /// `stringToSenComponents.find(...)` and the answer must be absent rather than one of the two.
+    #[test]
+    fn one_unit_kind_across_the_list_is_the_name() {
+        assert_eq!(
+            unit_name_from_a_list_of_get_unit_op(&[DfirUnit::Lxlu]),
+            Some(DfirUnit::Lxlu)
+        );
+        assert_eq!(
+            unit_name_from_a_list_of_get_unit_op(&[DfirUnit::Lxlu, DfirUnit::Lxlu, DfirUnit::Lxlu]),
+            Some(DfirUnit::Lxlu)
+        );
+        assert_eq!(
+            unit_name_from_a_list_of_get_unit_op(&[DfirUnit::Lxlu, DfirUnit::L3lu]),
+            None
+        );
+        // And the mismatch is refused wherever on the list it sits, not just next to the head.
+        assert_eq!(
+            unit_name_from_a_list_of_get_unit_op(&[DfirUnit::L3su, DfirUnit::L3su, DfirUnit::Lxsu]),
+            None
+        );
+    }
+
+    /// 🎯 159/384 — AND THE EMPTY LIST IS THE SAME ABSENCE AS THE MISMATCH.
+    ///
+    /// ⛔⛔ BOTH OF THE REFERENCE'S FAILURES COLLAPSE HERE. `DT_CHECK(units.size() > 0)` aborts and
+    /// the mismatch returns `""`, and `""` is fed to `find(...)->second` — see the item's own note.
+    /// A port that answered `Some(_)` for the empty list would have to invent a unit kind.
+    #[test]
+    fn no_units_is_no_name() {
+        assert_eq!(unit_name_from_a_list_of_get_unit_op(&[]), None);
+    }
+
+    /// 🎯 159/384 — TWO CORELETS OF ONE KIND ARE ONE NAME.
+    ///
+    /// ⛔ BECAUSE `getType()` READS THE `type` ATTRIBUTE AND NOT THE NAME. `C0-lxlu-CL0` and
+    /// `C0-lxlu-CL1` are two `get_unit`s with `type = "lxlu"`, and the reference accepts them as one
+    /// name; the corelet split is [`are_corelets_different`]'s and
+    /// [`separate_based_on_destination_units`]'s job, not this one's. A port that keyed on the
+    /// PRINTED NAME would refuse every real two-corelet sync.
+    #[test]
+    fn the_two_corelets_of_one_kind_share_a_name() {
+        let core = Core::checked(0).expect("every arch has core 0");
+        // The two bindings this list stands for, spelled out to show they differ only in corelet.
+        assert_ne!(
+            crate::units::residency_of(DfirUnit::Lxlu, core, corelet0()),
+            crate::units::residency_of(DfirUnit::Lxlu, core, corelet1())
+        );
+        assert_eq!(
+            unit_name_from_a_list_of_get_unit_op(&[DfirUnit::Lxlu, DfirUnit::Lxlu]),
+            Some(DfirUnit::Lxlu)
+        );
+    }
+
+    /// 🎯 160/384 — THE SUBJECT IS THE UNIT, AND IT IS ASKED ABOUT THE **OTHER** CORELET.
+    ///
+    /// ⛔ NOT WHETHER THE TWO LISTS DIFFER. A corelet-0 unit whose peers are all on corelet 0
+    /// answers `false`; the same unit with a peer on corelet 1 answers `true`. Reading the predicate
+    /// as "are these two lists different" would answer `true` for the first case and split a region
+    /// the reference keeps whole.
+    #[test]
+    fn a_unit_is_different_from_the_corelet_it_is_not_on() {
+        let core = Core::checked(0).expect("every arch has core 0");
+        let on_0 = crate::units::residency_of(DfirUnit::Lxlu, core, corelet0());
+        let on_1 = crate::units::residency_of(DfirUnit::Lxlu, core, corelet1());
+
+        assert!(!are_corelets_different(on_0, OccupiedCorelets::Corelet0));
+        assert!(are_corelets_different(on_0, OccupiedCorelets::Corelet1));
+        assert!(are_corelets_different(on_0, OccupiedCorelets::Both));
+
+        assert!(are_corelets_different(on_1, OccupiedCorelets::Corelet0));
+        assert!(!are_corelets_different(on_1, OccupiedCorelets::Corelet1));
+        assert!(are_corelets_different(on_1, OccupiedCorelets::Both));
+    }
+
+    /// 🎯 160/384 — A UNIT WITH NO `corelet` ATTRIBUTE IS DIFFERENT FROM NOBODY.
+    ///
+    /// ⛔⛔ THE NULL ATTRIBUTE EQUALS NEITHER LITERAL. `getAttr("corelet")` is null for the LX
+    /// scratchpad and the HBM, so both disjuncts fail and the answer is `false` whatever the lists
+    /// hold — including `Both`, where a port that treated "absent" as "corelet 1" would say `true`.
+    #[test]
+    fn a_unit_with_no_corelet_attribute_is_never_different() {
+        for occupied in [
+            OccupiedCorelets::Corelet0,
+            OccupiedCorelets::Corelet1,
+            OccupiedCorelets::Both,
+        ] {
+            for residency in [
+                Residency::Global,
+                Residency::Scratchpad {
+                    core: Core::checked(0).expect("every arch has core 0"),
+                },
+            ] {
+                assert!(
+                    !are_corelets_different(residency, occupied),
+                    "{residency:?} carries no corelet attribute"
+                );
+            }
+        }
+    }
+
+    /// 🎯 160/384 — AND AN L3 HALF **IS** ON CORELET 0.
+    ///
+    /// ⛔⛔ `CoreWide` PRINTS `corelet = 0 : i32`. `C0-l3lu` is bound with `core` AND `corelet = 0`
+    /// while `C0-lx` is bound with `core` alone, so `getAttr("corelet")` answers the literal `0` for
+    /// an L3 half and null for the scratchpad. Folding the two residencies together — they are both
+    /// "not per corelet" — would make the L3 side answer `false` here.
+    #[test]
+    fn the_l3_halves_answer_as_corelet_zero() {
+        let core = Core::checked(0).expect("every arch has core 0");
+        let l3 = crate::units::residency_of(DfirUnit::L3lu, core, corelet0());
+        assert_eq!(l3, Residency::CoreWide { core });
+
+        assert!(!are_corelets_different(l3, OccupiedCorelets::Corelet0));
+        assert!(are_corelets_different(l3, OccupiedCorelets::Corelet1));
+    }
+
+    /// 🎯 160/384 — AND THE PAIR THE `DT_CHECK` RULES OUT IS UNSPELLABLE.
+    ///
+    /// ⛔ `DT_CHECK(units_with_corelet_0.size() > 0 || units_with_corelet_1.size() > 0)`
+    /// (`DataflowToSentient.cpp:137-138`) — two empty lists abort, so the domain is three cases and
+    /// [`OccupiedCorelets::of`] is the one place that says so. This is a type guard standing in for a
+    /// runtime abort, which is why there is no fourth variant to test.
+    #[test]
+    fn two_empty_lists_mint_no_occupancy() {
+        assert_eq!(OccupiedCorelets::of(&[], &[]), None);
+        assert_eq!(
+            OccupiedCorelets::of(&[Val(1)], &[]),
+            Some(OccupiedCorelets::Corelet0)
+        );
+        assert_eq!(
+            OccupiedCorelets::of(&[], &[Val(2)]),
+            Some(OccupiedCorelets::Corelet1)
+        );
+        assert_eq!(
+            OccupiedCorelets::of(&[Val(1)], &[Val(2)]),
+            Some(OccupiedCorelets::Both)
+        );
+    }
+
+    /// A `dataflow.get_unit` binding `unit` on core 0 and the given corelet.
+    fn get_unit_on(result: u32, unit: DfirUnit, corelet: Corelet) -> DfirOp {
+        let core = Core::checked(0).expect("every arch has core 0");
+        DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: crate::units::residency_of(unit, core, corelet),
+            unit,
+        })
+    }
+
+    /// 🎯 161/384 — THE FOUR BUCKETS, EACH REACHED BY A DESTINATION THAT BELONGS IN IT.
+    ///
+    /// ⛔ AND THE `create_group` BUCKET IS ONE OF THEM. `src_dst_group` is the reason
+    /// [`dataflow::Op::CreateGroup`] exists in the island at all: without it that list could never be
+    /// non-empty and `lowerSyncLXL3ToLXL3`'s collective arm would be dead.
+    #[test]
+    fn each_destination_kind_reaches_its_own_bucket() {
+        let scope = vec![
+            get_unit_on(10, DfirUnit::Lxlu, corelet0()),
+            get_unit_on(11, DfirUnit::Lxlu, corelet1()),
+            get_unit_on(12, DfirUnit::L3lu, corelet0()),
+            DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                result: Val(13),
+                unit_ids: vec![Val(10), Val(11)],
+            }),
+        ];
+        let separated = separate_based_on_destination_units(
+            &[
+                (Val(0), Val(10)),
+                (Val(1), Val(11)),
+                (Val(2), Val(12)),
+                (Val(3), Val(13)),
+            ],
+            &scope,
+        );
+        assert_eq!(
+            separated,
+            SeparatedDestinations {
+                lx_corelet0: vec![(Val(0), Val(10))],
+                lx_corelet1: vec![(Val(1), Val(11))],
+                l3: vec![(Val(2), Val(12))],
+                group: vec![(Val(3), Val(13))],
+            }
+        );
+    }
+
+    /// 🎯 161/384 — AN L3 DESTINATION GOES TO THE L3 LIST EVEN THOUGH ITS `corelet` IS `0`.
+    ///
+    /// ⛔⛔ THE PREFIX TEST COMES FIRST. `dst_unit.getType().str().substr(0, 2) != "l3"` guards the
+    /// whole corelet split (`DataflowToSentient.cpp:768-777`), and an L3 half carries
+    /// `corelet = 0 : i32` — so testing the corelet first would put every L3 destination in
+    /// `src_dst_lx_corelet0` and lose the merged L3 lowering. Both halves are checked because the
+    /// prefix, not the half, is what the reference reads.
+    #[test]
+    fn the_l3_prefix_outranks_the_corelet_attribute() {
+        for (id, unit) in [(20, DfirUnit::L3lu), (21, DfirUnit::L3su)] {
+            let scope = vec![get_unit_on(id, unit, corelet0())];
+            let separated = separate_based_on_destination_units(&[(Val(0), Val(id))], &scope);
+            assert_eq!(
+                separated,
+                SeparatedDestinations {
+                    l3: vec![(Val(0), Val(id))],
+                    ..SeparatedDestinations::default()
+                },
+                "{unit:?} is an L3 destination"
+            );
+            // And the residency it was bound with really is the one that prints `corelet = 0`.
+            assert!(is_corelet_0_attribute(crate::units::residency_of(
+                unit,
+                Core::checked(0).expect("every arch has core 0"),
+                corelet0()
+            )));
+        }
+    }
+
+    /// 🎯 161/384 — A NON-L3 DESTINATION WITH **NO** `corelet` LANDS ON THE CORELET-1 LIST.
+    ///
+    /// ⛔⛔ THE C++'s `// corelet = 1` COMMENT IS WRONG AND THE CODE IS WHAT IS PORTED. The test is
+    /// `== getI32IntegerAttr(0)`, so the LX scratchpad — bound with `core` and no `corelet` — takes
+    /// the `else`. This test pins the divergence so that an audit reading the comment cannot "fix"
+    /// the port into disagreeing with the reference.
+    #[test]
+    fn a_destination_with_no_corelet_takes_the_else() {
+        let scope = vec![get_unit_on(30, DfirUnit::Lx, corelet0())];
+        let separated = separate_based_on_destination_units(&[(Val(0), Val(30))], &scope);
+        assert_eq!(
+            separated,
+            SeparatedDestinations {
+                lx_corelet1: vec![(Val(0), Val(30))],
+                ..SeparatedDestinations::default()
+            }
+        );
+    }
+
+    /// 🎯 161/384 — A DESTINATION THAT IS NEITHER OP IS DROPPED WITHOUT A WORD.
+    ///
+    /// ⛔ BOTH `dyn_cast`s FAILING MEANS NO `push_back` AT ALL. There is no fifth bucket and no
+    /// diagnostic; the pair vanishes and the loop continues to the next destination — which this test
+    /// shows by keeping a good pair behind the dropped one. A value with no defining op at all (a
+    /// region argument, the reference's null pointer) is the same silence.
+    #[test]
+    fn a_destination_that_is_neither_op_is_dropped() {
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+                result: Val(40),
+                of: Val(41),
+                which: dataflow::LocalUnit::PeLrf,
+            }),
+            get_unit_on(41, DfirUnit::Lxsu, corelet0()),
+        ];
+        let separated = separate_based_on_destination_units(
+            &[
+                (Val(0), Val(40)),
+                // No op defines `%99` — the reference's `getDefiningOp()` is null here.
+                (Val(1), Val(99)),
+                (Val(2), Val(41)),
+            ],
+            &scope,
+        );
+        assert_eq!(
+            separated,
+            SeparatedDestinations {
+                lx_corelet0: vec![(Val(2), Val(41))],
+                ..SeparatedDestinations::default()
+            }
+        );
+    }
+
+    /// 🎯 161/384 — AND THE ORDER WITHIN A BUCKET IS THE DESTINATION ORDER.
+    ///
+    /// ⛔ BECAUSE THE CALLER INDEXES IT. `lowerSyncLXL3ToLXL3` reads `src_dst_l3[0]` and walks the
+    /// lists in order, so a port that sorted or grouped them would rename which sync is emitted
+    /// first.
+    #[test]
+    fn the_pairs_keep_their_destination_order() {
+        let scope = vec![
+            get_unit_on(50, DfirUnit::Lxlu, corelet0()),
+            get_unit_on(51, DfirUnit::Lxsu, corelet0()),
+        ];
+        let separated = separate_based_on_destination_units(
+            &[(Val(7), Val(51)), (Val(8), Val(50)), (Val(9), Val(51))],
+            &scope,
+        );
+        assert_eq!(
+            separated.lx_corelet0,
+            vec![(Val(7), Val(51)), (Val(8), Val(50)), (Val(9), Val(51))]
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 159/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e159_getUnitNameFromAListOfGetUnitOp
+///
+/// **159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119` (10L).
+///
+/// ```cpp
+/// static std::string getUnitNameFromAListOfGetUnitOp(
+///     std::vector<mlir::dataflow::GetUnitOp> &units) {
+///   DT_CHECK(units.size() > 0);
+///   std::string unit_name = units[0].getType().str();
+///   for (auto src_unit : units) {
+///     if (src_unit.getType().str() != unit_name) {
+///       units[0]->emitError("Src unit types has to be the same.");
+///       return "";
+///     }
+///   }
+///   return unit_name;
+/// }
+/// ```
+///
+/// # ⭐⭐ `getType()` IS THE `type` **ATTRIBUTE**, NOT THE VALUE'S MLIR TYPE
+///
+/// `dataflow.get_unit` declares `(ins StrAttr:$name, StrAttr:$type)` and returns
+/// `Variadic<Index>:$units` (`Dataflow.td:54-58`), so the generated `getType()` accessor hands back
+/// the `type` STRING — `"lxlu"`, `"l3su"`, `"pe"` — and `.str()` copies it. Every result of the op is
+/// an `index`, so reading the *value's* type would answer `index` for all six units and this function
+/// would never find a difference. That is why the answer here is a [`DfirUnit`] and the list is one
+/// of unit kinds: the `get_unit` ops' identities are not read, only their `type`.
+///
+/// # ⛔⛔ THE MISMATCH'S `""` AND THE EMPTY LIST'S ABORT ARE ONE ANSWER, BECAUSE NEITHER IS A NAME
+///
+/// The reference has two ways to fail and no way to report either. `DT_CHECK(units.size() > 0)`
+/// aborts; the mismatch returns the empty string — and every one of the four callers feeds the result
+/// straight into `EnumsConversion::stringToSenComponents.find(src_unit_name)->second`
+/// (`:245-246`, `:397-398`, `:487-488`, `:686-687`), which for `""` dereferences `end()`. So the
+/// empty string is not a value a caller can act on; it is UB one line later. [`None`] is the single
+/// answer that covers both, and it forces the caller to have the arm the reference does not.
+///
+/// # ⭐ THE FIRST ELEMENT IS COMPARED AGAINST ITSELF, AND THAT IS NOT A WASTED PASS
+///
+/// The loop starts at `units[0]`, whose comparison is trivially equal — so a one-element list always
+/// answers with that element. Skipping the head would give the same answer, and the port keeps the
+/// reference's shape so the pass count matches when the audit reads them side by side.
+///
+/// # ⭐ IT IS THE **KIND** THAT MUST AGREE, NOT THE CORELET
+///
+/// `C0-lxlu-CL0` and `C0-lxlu-CL1` are two `get_unit` ops with the same `type` and different `corelet`
+/// attributes, and this function accepts them as one name — deliberately: its callers use the answer
+/// to pick a lowering by COMPONENT (`senCompToGenericComp.at(src_comp)`, `:247`) and split the
+/// corelets separately, with [`are_corelets_different`] and
+/// [`separate_based_on_destination_units`]. A list mixing `lxlu` with `l3lu` is the case it refuses.
+#[must_use]
+pub fn unit_name_from_a_list_of_get_unit_op(units: &[DfirUnit]) -> Option<DfirUnit> {
+    // `DT_CHECK(units.size() > 0);` and `units[0].getType().str()` in one read.
+    let unit_name = *units.first()?;
+    for src_unit in units {
+        // `if (src_unit.getType().str() != unit_name)` — "Src unit types has to be the same."
+        if *src_unit != unit_name {
+            return None;
+        }
+    }
+    Some(unit_name)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 160/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH OF A CORE'S TWO CORELETS CARRY A SOURCE UNIT — the pair of lists
+/// `areCoreletsDifferent` reads, with the reference's own `DT_CHECK` discharged.
+///
+/// ⛔⛔ THREE CASES BECAUSE THE FOURTH IS THE ABORT. `DT_CHECK(units_with_corelet_0.size() > 0 ||
+/// units_with_corelet_1.size() > 0)` (`DataflowToSentient.cpp:137-138`) says both lists empty is not
+/// an input, and this is the only fact about the two lists that the body reads — everything else is
+/// `.size() > 0`. Stating the domain as a type moves that abort to the one place a value of this type
+/// is minted ([`OccupiedCorelets::of`]), which is how [`crate::bridges::dataflow_ir_to_sentient::vc_helper`]
+/// discharged the same shape for `PtLanes`.
+///
+/// ⭐ AND IT IS TWO CORELETS FOR THE SAME REASON THE REFERENCE HARD-CODES `0` AND `1`: the lists are
+/// built per corelet of one core, and `Target::CORELETS_PER_CORE` is two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupiedCorelets {
+    /// Only `units_with_corelet_0` is non-empty.
+    Corelet0,
+    /// Only `units_with_corelet_1` is non-empty.
+    Corelet1,
+    /// Both lists have a unit on them.
+    Both,
+}
+
+impl OccupiedCorelets {
+    /// WHICH CORELETS THE TWO LISTS OCCUPY, or [`None`] for the pair the reference's `DT_CHECK`
+    /// rules out.
+    ///
+    /// ⭐ THE ELEMENTS ARE NEVER LOOKED AT. `areCoreletsDifferent` reads its two vectors only through
+    /// `.size() > 0`, so this takes the `get_unit` results a caller already has and asks nothing else
+    /// of them.
+    #[must_use]
+    pub fn of(
+        units_with_corelet_0: &[Val],
+        units_with_corelet_1: &[Val],
+    ) -> Option<OccupiedCorelets> {
+        match (
+            units_with_corelet_0.is_empty(),
+            units_with_corelet_1.is_empty(),
+        ) {
+            (false, false) => Some(OccupiedCorelets::Both),
+            (false, true) => Some(OccupiedCorelets::Corelet0),
+            (true, false) => Some(OccupiedCorelets::Corelet1),
+            // `DT_CHECK(units_with_corelet_0.size() > 0 || units_with_corelet_1.size() > 0)`.
+            (true, true) => None,
+        }
+    }
+
+    /// Whether `units_with_corelet_0.size() > 0`.
+    #[must_use]
+    const fn holds_corelet_0(self) -> bool {
+        match self {
+            OccupiedCorelets::Corelet0 | OccupiedCorelets::Both => true,
+            OccupiedCorelets::Corelet1 => false,
+        }
+    }
+
+    /// Whether `units_with_corelet_1.size() > 0`.
+    #[must_use]
+    const fn holds_corelet_1(self) -> bool {
+        match self {
+            OccupiedCorelets::Corelet1 | OccupiedCorelets::Both => true,
+            OccupiedCorelets::Corelet0 => false,
+        }
+    }
+}
+
+/// Replaces: e160_areCoreletsDifferent
+///
+/// **160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132` (6L).
+///
+/// ```cpp
+/// static bool areCoreletsDifferent(
+///     OpBuilder builder, dataflow::GetUnitOp unit,
+///     std::vector<dataflow::GetUnitOp> units_with_corelet_0,
+///     std::vector<dataflow::GetUnitOp> units_with_corelet_1) {
+///   DT_CHECK(units_with_corelet_0.size() > 0 || units_with_corelet_1.size() > 0);
+///   return (unit->getAttr("corelet") == builder.getI32IntegerAttr(0) &&
+///           units_with_corelet_1.size() > 0) ||
+///          (unit->getAttr("corelet") == builder.getI32IntegerAttr(1) &&
+///           units_with_corelet_0.size() > 0);
+/// }
+/// ```
+///
+/// # ⭐⭐ IT ASKS WHETHER THIS UNIT IS ON THE **OTHER** CORELET FROM SOMEBODY
+///
+/// Not whether the two lists differ from each other: the subject is `unit`, and each disjunct pairs
+/// *its* corelet with the presence of a unit on the opposite one. A unit on corelet 0 with peers only
+/// on corelet 0 answers `false`; the same unit with any peer on corelet 1 answers `true`. That is why
+/// the two lists collapse to [`OccupiedCorelets`] — their contents never matter, only which corelets
+/// are occupied.
+///
+/// # ⛔⛔ A UNIT WITH **NO** `corelet` ATTRIBUTE ANSWERS `false`, AND THE NULL IS HOW
+///
+/// `Operation::getAttr` returns a null `Attribute` for an absent name, and a null attribute equals no
+/// `IntegerAttr` — so both disjuncts' first conjunct is false and the answer is `false` whatever the
+/// lists hold. That is not an accident of the C++: a unit that carries no `corelet` is one the L3
+/// path handles, and `lowerL0LXSyncOperationForAUnit` refuses it by name two hundred lines earlier
+/// (*"Unknown corelet information for sentient"*, `:227-229`). Here that null is
+/// [`crate::units::Residency::Scratchpad`] and [`crate::units::Residency::Global`], the two
+/// residencies that print no `corelet`.
+///
+/// # ⛔ AND `CoreWide` IS CORELET **ZERO**, NOT ABSENT
+///
+/// `C0-l3lu` carries `core` AND `corelet = 0` while `C0-lx` carries `core` alone
+/// (`UnitMaterializer.cpp:62-80` against `:142-152`) — the distinction [`crate::units::Residency`]
+/// exists to keep. So an L3 half reaching this function IS on corelet 0 as far as `getAttr` is
+/// concerned, and answers `true` whenever anything sits on corelet 1.
+///
+/// # ⛔ `builder` IS ONLY THERE TO MINT THE TWO LITERALS
+///
+/// `builder.getI32IntegerAttr(0)` and `...(1)` are how the C++ writes `0` and `1` as attributes it
+/// can compare against; the builder is not positioned and nothing is emitted. That is the mechanism
+/// for reaching an operand, which the campaign brief permits dropping.
+///
+/// # ⚠️ NO CALLER AT `a0d29abbed`
+///
+/// A grep of the authority tree finds this symbol exactly once, at its own definition. Its
+/// neighbours in the file — `lowerL0LXSyncOperationForAUnit` (`:189`) and `lowerSyncLXL3ToLXL3`
+/// (`:787`) — decide the corelet split with their own inline tests and
+/// [`separate_based_on_destination_units`] instead. It is ported anyway: a scheduled function gets
+/// its port and its audit, and a predicate the reference kept is not this port's to delete.
+#[must_use]
+pub fn are_corelets_different(unit: Residency, occupied: OccupiedCorelets) -> bool {
+    // `unit->getAttr("corelet")` — the attribute, or nothing. Spelled out over the four residencies
+    // so that a fifth cannot join the null side without being looked at.
+    let corelet = match unit {
+        Residency::Corelet { corelet, .. } => Some(corelet.get()),
+        // ⭐ `corelet = 0 : i32` IS PRINTED FOR A CORE-WIDE UNIT — see the note above.
+        Residency::CoreWide { .. } => Some(0),
+        // No `corelet` attribute at all: `getAttr` is null and equals neither literal.
+        Residency::Scratchpad { .. } | Residency::Global => None,
+    };
+
+    (corelet == Some(0) && occupied.holds_corelet_1())
+        || (corelet == Some(1) && occupied.holds_corelet_0())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 161/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A SYNC'S SOURCE/DESTINATION PAIRS SORTED BY WHERE THE DESTINATION LIVES — the four out-parameters
+/// of `separateBasedOnDestinationUnits`.
+///
+/// ⛔ FOUR LISTS AND NOT A MAP, BECAUSE THE CALLER TESTS THEM AGAINST EACH OTHER. `lowerSyncLXL3ToLXL3`
+/// asks whether three of the four are empty while the fourth is not, twice over
+/// (`DataflowToSentient.cpp:796-800`), so each list is a named field rather than a bucket to look up.
+///
+/// ⭐ THE ORDER WITHIN EACH LIST IS THE DESTINATION ORDER, which is what makes `src_dst_l3[0]` mean
+/// anything: the reference walks `dst_vs` by index and pushes as it goes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeparatedDestinations {
+    /// `src_dst_lx_corelet0` — pairs whose destination is a non-L3 unit on corelet 0.
+    pub lx_corelet0: Vec<(Val, Val)>,
+    /// `src_dst_lx_corelet1` — pairs whose destination is a non-L3 unit NOT on corelet 0.
+    pub lx_corelet1: Vec<(Val, Val)>,
+    /// `src_dst_l3` — pairs whose destination is an `l3lu` or `l3su`.
+    pub l3: Vec<(Val, Val)>,
+    /// `src_dst_group` — pairs whose destination is a `dataflow.create_group` handle.
+    pub group: Vec<(Val, Val)>,
+}
+
+/// Replaces: e161_separateBasedOnDestinationUnits
+///
+/// **161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761` (18L).
+///
+/// ```cpp
+/// static void separateBasedOnDestinationUnits(
+///     mlir::OpBuilder builder, std::vector<mlir::Value> src_vs,
+///     std::vector<mlir::Value> dst_vs,
+///     std::vector<std::pair<mlir::Value, mlir::Value>> &src_dst_lx_corelet0,
+///     std::vector<std::pair<mlir::Value, mlir::Value>> &src_dst_lx_corelet1,
+///     std::vector<std::pair<mlir::Value, mlir::Value>> &src_dst_l3,
+///     std::vector<std::pair<mlir::Value, mlir::Value>> &src_dst_group) {
+///   for (int i = 0; i < dst_vs.size(); i++) {
+///     if (auto dst_unit =
+///             llvm::dyn_cast<dataflow::GetUnitOp>(dst_vs[i].getDefiningOp())) {
+///       if (dst_unit.getType().str().substr(0, 2) != "l3") {  // LX
+///         if (dst_unit->getAttr("corelet") == builder.getI32IntegerAttr(0)) {
+///           src_dst_lx_corelet0.push_back(std::make_pair(src_vs[i], dst_vs[i]));
+///         } else {  // corelet = 1
+///           src_dst_lx_corelet1.push_back(std::make_pair(src_vs[i], dst_vs[i]));
+///         }
+///       } else {  // L3
+///         src_dst_l3.push_back(std::make_pair(src_vs[i], dst_vs[i]));
+///       }
+///     } else if (auto dst_unit = llvm::dyn_cast<dataflow::CreateGroupOp>(
+///                    dst_vs[i].getDefiningOp())) {
+///       src_dst_group.push_back(std::make_pair(src_vs[i], dst_vs[i]));
+///     }
+///   }
+/// }
+/// ```
+///
+/// # ⛔⛔ THE `else` BRANCH IS NOT "CORELET 1", IT IS "NOT CORELET 0", AND THE COMMENT LIES
+///
+/// The C++ writes `} else {  // corelet = 1`, but the test above it is
+/// `getAttr("corelet") == getI32IntegerAttr(0)` — so a destination with **no** `corelet` attribute at
+/// all lands in `src_dst_lx_corelet1` along with the genuine corelet-1 units, because a null
+/// `Attribute` equals no `IntegerAttr`. The only non-L3 unit that can carry no `corelet` is a
+/// scratchpad memory ([`crate::units::Residency::Scratchpad`], `C0-lx`), and `lowerSyncLXL3ToLXL3`
+/// then treats `src_dst_lx_corelet1` as a corelet-1 region. The port reproduces the CODE and this
+/// note records the divergence between it and the comment; see [`are_corelets_different`], which has
+/// the same null and where it means `false` instead.
+///
+/// # ⛔⛔ AND `substr(0, 2) != "l3"` IS DECIDED **BEFORE** THE CORELET, SO AN L3 HALF NEVER SPLITS
+///
+/// `l3lu` and `l3su` are the only unit spellings beginning `l3` — the same prefix test
+/// [`is_target_l3`] makes — and they are also the units that carry `corelet = 0` while belonging to
+/// the whole core ([`crate::units::Residency::CoreWide`]). Testing the corelet first would put every
+/// L3 destination in `src_dst_lx_corelet0` and lose the merged L3 lowering entirely.
+///
+/// # ⭐ A DESTINATION THAT IS NEITHER A `get_unit` NOR A `create_group` IS **SILENTLY DROPPED**
+///
+/// Both `dyn_cast`s failing means no `push_back` on any of the four lists, and the loop moves on.
+/// The pair vanishes — no diagnostic, no fifth bucket. The caller's
+/// `DT_CHECK(src_dst_lx_corelet0.size() != 0 || …)` (`:794-795`) is the only thing that notices, and
+/// only when *every* destination was dropped. `None` from
+/// [`defining_op`](crate::islands::dataflow_ir::dialects::defining_op) — a destination that is a
+/// region argument, which is the reference's null pointer — is the same silence.
+///
+/// # ⛔ THE PAIRS ARE INDEXED IN LOCKSTEP AND THE REFERENCE DOES NOT CHECK THE LENGTHS
+///
+/// The loop bounds on `dst_vs.size()` and indexes `src_vs[i]`, so a source list shorter than the
+/// destination list is an out-of-bounds read. Taking the two as ONE list of pairs makes that
+/// unspellable rather than checked, which is this crate's standing preference; a caller with two
+/// vectors zips them and the zip is where a length difference becomes visible.
+///
+/// # ⛔ `builder` MINTS THE LITERAL `0` AND NOTHING ELSE
+///
+/// As in [`are_corelets_different`] — no insertion point, no emission. The four lists ARE the
+/// function's output, so they are returned rather than filled through references; the reference's
+/// caller declares all four empty immediately before the call (`:791-793`), so appending and
+/// returning are the same thing here.
+#[must_use]
+pub fn separate_based_on_destination_units(
+    src_dst: &[(Val, Val)],
+    scope: &[DfirOp],
+) -> SeparatedDestinations {
+    let mut separated = SeparatedDestinations::default();
+
+    for (src_v, dst_v) in src_dst {
+        match defining_op(*dst_v, scope) {
+            // `llvm::dyn_cast<dataflow::GetUnitOp>(dst_vs[i].getDefiningOp())`.
+            Some(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                residency, unit, ..
+            })) => {
+                // `if (dst_unit.getType().str().substr(0, 2) != "l3")` — the LX side.
+                if matches!(unit, DfirUnit::L3lu | DfirUnit::L3su) {
+                    separated.l3.push((*src_v, *dst_v));
+                } else if is_corelet_0_attribute(*residency) {
+                    separated.lx_corelet0.push((*src_v, *dst_v));
+                } else {
+                    // `} else {  // corelet = 1` — and everything the attribute is not 0 for.
+                    separated.lx_corelet1.push((*src_v, *dst_v));
+                }
+            }
+            // `llvm::dyn_cast<dataflow::CreateGroupOp>(dst_vs[i].getDefiningOp())`.
+            Some(DfirOp::Dataflow(dataflow::Op::CreateGroup { .. })) => {
+                separated.group.push((*src_v, *dst_v));
+            }
+            // ⭐ BOTH CASTS FAILED, OR THERE IS NO DEFINING OP — the pair is dropped, exactly as the
+            // reference drops it. The dialects are named rather than wildcarded so that a new
+            // destination-binding op cannot join this side unnoticed.
+            Some(
+                DfirOp::Dataflow(_)
+                | DfirOp::Arith(_)
+                | DfirOp::Scf(_)
+                | DfirOp::Affine(_)
+                | DfirOp::Agen(_)
+                | DfirOp::VectorChain(_)
+                | DfirOp::Symbol(_),
+            )
+            | None => {}
+        }
+    }
+
+    separated
+}
+
+/// `unit->getAttr("corelet") == builder.getI32IntegerAttr(0)` — whether the printed `corelet`
+/// attribute is present AND zero.
+///
+/// ⭐ SHARED BY THE TWO UNITS THAT ASK IT, so the null-attribute rule is written once. See
+/// [`are_corelets_different`] for why an absent attribute is `false` and why
+/// [`crate::units::Residency::CoreWide`] is zero rather than absent.
+const fn is_corelet_0_attribute(residency: Residency) -> bool {
+    match residency {
+        Residency::Corelet { corelet, .. } => corelet.get() == 0,
+        Residency::CoreWide { .. } => true,
+        Residency::Scratchpad { .. } | Residency::Global => false,
     }
 }
