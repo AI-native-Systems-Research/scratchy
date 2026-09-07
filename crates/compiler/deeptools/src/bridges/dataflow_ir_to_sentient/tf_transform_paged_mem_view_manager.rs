@@ -94,6 +94,7 @@ impl<'a> PagedMemView<'a> {
             | DfirOp::Scf(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             // ⭐ `symbol` WITH THEM: `symbol.create_symbol` binds an `index`, never a memref, so it
             // is never a paged view — one more `dyn_cast<GetPagedLogicalMemoryViewOp>` null.
@@ -342,6 +343,11 @@ impl<'a> TpmvManager<'a> {
             | DfirOp::Affine(_)
             | DfirOp::Scf(_)
             | DfirOp::Dataflow(_)
+            // ⛔ AN UPSTREAM `vector.load` IS THE `llvm_unreachable` ARM, NOT A FOURTH TRANSFORM.
+            // The four `dyn_cast`s the reference tries are all `agen` (`:44-67`), so a paged view
+            // whose one user is a plain `vector` access falls to *"memory operation is not supported
+            // for static paged tensors"*.
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             // ⭐ AND `symbol` WITH THEM: `symbol.create_symbol` takes no operands at all
             // (`NoMemoryEffect`, `Symbol.td:53`), so it cannot be a use of the view's result;

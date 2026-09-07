@@ -342,11 +342,15 @@ fn element_type_of(op: &DfirOp) -> ElemType {
 /// "because it obviously has one" would paper over the abort the reference relies on
 /// [`compute_precision_of_op`] short-circuiting past.
 ///
-/// ⚠️ ONE DELIBERATE WIDENING, FLAGGED: the reference lists `vector::LoadOp` and `vector::StoreOp`,
-/// which are what D1's `AffineToStandard` leaves behind. This island still holds those accesses in
-/// their `affine` form ([`dfir_op::affine::Op::VectorLoad`]/`VectorStore`) as well as the `agen` one,
-/// so both spellings answer here. They are the same op one rung earlier; treating the affine pair as
-/// absent would make the answer depend on which side of D1 the query happens to run.
+/// ⭐ `vector::LoadOp` AND `vector::StoreOp` ARE ON THE LIST (`Utils.cpp:548-553`, between the
+/// `dataflow` transfer arms and the `agen` access arms), and they now exist here as
+/// [`dfir_op::vector::Op`] — so those two answer from their own `ty` directly.
+///
+/// ⚠️ ONE DELIBERATE WIDENING, FLAGGED, AND IT IS THE AFFINE PAIR: this island also holds the same
+/// two accesses in their pre-D1 `affine` form ([`dfir_op::affine::Op::VectorLoad`]/`VectorStore`),
+/// which the reference has no op class for because `AffineToStandard` has already rewritten them by
+/// the time `getVectorType` runs. They are the same access one rung earlier; treating them as absent
+/// would make the answer depend on which side of D1 the query happens to run.
 fn vector_type_of(op: &DfirOp) -> Option<Vector> {
     match op {
         // `dataflow::SendOp` and `dataflow::ReceiveOp`.
@@ -368,7 +372,10 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad { ty, .. }) => Some(*ty),
         DfirOp::Agen(dfir_op::agen::Op::VectorStore { ty, .. }) => Some(*ty),
         DfirOp::Agen(dfir_op::agen::Op::CompositeLoadAndStore(_) | dfir_op::agen::Op::Yield) => None,
-        // `vector::LoadOp` and `vector::StoreOp` — see the widening note.
+        // `vector::LoadOp` and `vector::StoreOp` (`Utils.cpp:548-553`).
+        DfirOp::Vector(dfir_op::vector::Op::Load { ty, .. }) => Some(*ty),
+        DfirOp::Vector(dfir_op::vector::Op::Store { ty, .. }) => Some(*ty),
+        // The same two accesses in their pre-D1 `affine` form — see the widening note.
         DfirOp::Affine(dfir_op::affine::Op::VectorLoad { ty, .. }) => Some(*ty),
         DfirOp::Affine(dfir_op::affine::Op::VectorStore { ty, .. }) => Some(*ty),
         DfirOp::Affine(
@@ -401,6 +408,10 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         // ⛔ THE SIX THAT RESULT IN A VECTOR AND ARE STILL ABSENT. See the note above.
         DfirOp::VectorChain(
             vc::Op::Select { .. }
+            // ⛔ `NegOp` IS ABSENT FROM BOTH REFERENCE LISTS TOO — it appears nowhere in
+            // `dcc/src/Utils/Utils.cpp` at all, exactly like `RotateOp`, even though
+            // `(outs AnyVectorOfAnyRank:$data)` gives it a vector result.
+            | vc::Op::Neg { .. }
             | vc::Op::Rotate { .. }
             | vc::Op::ConstantBitstream { .. }
             | vc::Op::Cast { .. }
@@ -949,6 +960,7 @@ fn reset_data_ids(ops: &mut [SenOp]) {
             | SenOp::Agen(_)
             | SenOp::VectorChain(_)
             | SenOp::Affine(_)
+            | SenOp::Vector(_)
             | SenOp::Arith(_)
             | SenOp::Scf(_)
             | SenOp::Symbol(_) => {}
@@ -1256,6 +1268,7 @@ pub fn vector_ternary_to_sentient_ternary(op: &vc::Op) -> sen::TernaryOp {
         vc::Op::Estimate { .. }
         | vc::Op::FastExp { .. }
         | vc::Op::Floor { .. }
+        | vc::Op::Neg { .. }
         | vc::Op::ScanWithGap { .. }
         | vc::Op::Select { .. }
         | vc::Op::Multiply { .. }

@@ -307,6 +307,9 @@ pub fn get_dataflow_for_loop_info_if_iv<'a>(
         | DfirOp::Arith(_)
         | DfirOp::Dataflow(_)
         | DfirOp::Agen(_)
+        // ⭐ A PLAIN ACCESS CARRIES NO REGION EITHER, so it owns no block — same reason as `symbol`
+        // below.
+        | DfirOp::Vector(_)
         | DfirOp::VectorChain(_)
         // ⭐ `symbol.create_symbol` CARRIES NO REGION, so it owns no block and cannot be the parent
         // op [`owner_of_block_arg`] found — this arm exists because the match is total, not because
@@ -367,6 +370,7 @@ fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
         | DfirOp::Scf(_)
         | DfirOp::Dataflow(_)
         | DfirOp::Agen(_)
+        | DfirOp::Vector(_)
         | DfirOp::VectorChain(_) => None,
         // ⛔⛔ `symbol` IS THE ONE THAT MATTERS, AND IT IS STILL A [`None`]. A bound defined by
         // `symbol.create_symbol` is a SYMBOLIC bound: `dyn_cast<arith::ConstantIndexOp>` answers null

@@ -71,8 +71,16 @@
 //! | `e345_processXrfPtrPerUnit` | 345/384 | 190 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337` |
 //! | `e367_createXrfIndexModifOps` | 367/384 | 97 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564` |
 
+use std::collections::BTreeMap;
+
+use super::vc_vector_operands::OpId;
 use crate::arch::{Arch, IsaGen};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::dataflow::LocalUnit;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, agen, dataflow, defining_op, vector};
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self as sen, Definitions, Val, arith, sentient, symbol};
+use crate::units::DfirUnit;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 090/384
@@ -691,19 +699,603 @@ pub fn replace_and_erase_dummy_mac_ops(body: &mut Vec<sen::Op>, map: &[DummyMacP
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 172/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A DISPLACEMENT IN STICKS — the unit every number in a [`LayoutExpr`] has been divided down to.
+///
+/// # ⛔⛔ SIGNED, WHICH IS WHY IT IS NOT [`crate::arch::Sticks`]
+///
+/// `Sticks` is a `u64` capacity ("how much HBM"); this is a displacement along one, and the
+/// arithmetic the reference does on it is subtraction: `curr_const - prev_const`
+/// (`LoweringXRF.cpp:447`), `prev_const - curr_const + stride` (`:480-483`) and
+/// `-(stride) * getForOpBound(..)` (`:495-498`) all produce negatives, and the last one is negative
+/// by construction. A `u64` cannot hold the offset this file's own callers compute.
+///
+/// # ⭐ AND IT IS ONE UNIT, NOT TWO, IN THE REFERENCE'S OWN ARITHMETIC
+///
+/// `getLayoutExpr` divides both the loop coefficients and the constant by `stick_elem_num` with the
+/// comment *"converted to stick number"* (`LoweringXRF.cpp:60-61`, `:75`), and
+/// `processXrfPtrPerUnit` then adds `xrf_incr_after_prev_mac` — a count of XRF rows a MAC consumes,
+/// from [`xrf_rd_ptr_incr_val_after_mac`] — straight into the same total
+/// (`:435-436`). So the XRF pointer's step and the layout's stick number are the same quantity there,
+/// and one type says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub struct StickOffset(pub i64);
+
+/// WHERE ONE XRF ACCESS SITS — `LayoutExpr` (`VectorChainToSentientPT.hpp:118-121`).
+///
+/// ```cpp
+/// struct LayoutExpr {
+///   std::unordered_map<Operation *, int64_t> layout_map;
+///   int64_t constant_val = 0;
+/// };
+/// ```
+///
+/// # ⭐⭐ THE MAP IS KEYED BY *ENCLOSING LOOP*, AND EVERY ENCLOSING LOOP IS IN IT
+///
+/// [`Self::layout_map`]'s key is a `sentient.for`, and its value is that loop's coefficient in the
+/// access's flattened address, in sticks. `getLayoutExpr` (entry 240) fills it twice over: once from
+/// the flattened affine expression, which only names the loops the subscripts actually read
+/// (`LoweringXRF.cpp:52-63`), and again by walking the op's enclosing regions and entering a **zero**
+/// for every loop the first pass missed (`:79-92`), with its own comment — *"loop iterator var that is
+/// not in layout expression has zero for coefficient"*. That second pass is what makes
+/// [`are_xrf_accesses_legal`] a total comparison: two accesses under the same nest have the same key
+/// set, so a coefficient present in one and absent from the other is a difference in the NEST, not in
+/// the subscripts.
+///
+/// ⛔ `constant_val` IS DELIBERATELY EXCLUDED FROM THAT COMPARISON. The reference says why:
+/// *"all xrf accesses have to have the same expr coeffients except constant expr"*
+/// (`LoweringXRF.cpp:115-116`) — a constant difference is the offset
+/// [`insert_const_and_add_ops`] emits, so it is legal by construction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayoutExpr {
+    /// `layout_map` — each enclosing `sentient.for`'s coefficient, in sticks.
+    ///
+    /// ⭐ ORDERED, NOT HASHED. The reference's `std::unordered_map` is iterated in
+    /// [`are_xrf_accesses_legal`], and the answer does not depend on the order (see there); a
+    /// `BTreeMap` removes the question instead of restating it.
+    pub layout_map: BTreeMap<OpId, StickOffset>,
+    /// `constant_val` — the access's own constant term, in sticks. ⛔ NOT COMPARED; see this type's
+    /// note.
+    pub constant_val: StickOffset,
+}
+
+/// `LayoutExprMap` (`VectorChainToSentientPT.hpp:123`) — one [`LayoutExpr`] per xrf access.
+///
+/// ```cpp
+/// using LayoutExprMap = std::unordered_map<Operation *, LayoutExpr>;
+/// ```
+///
+/// ⭐ THE KEY IS THE ACCESS, NOT THE LOOP. `createXrfIndexModifOps` fills it as
+/// `xrf_layout_expr_maps[0][op] = getLayoutExpr(op, stick_elem_num)` for each `agen.vector_store` /
+/// `vector.store` and `[1][op]` for each load (`LoweringXRF.cpp:641-646`), so the outer key is one of
+/// the four memory accesses [`is_xrf_related`] classifies and the inner key
+/// ([`LayoutExpr::layout_map`]) is a `sentient.for`. ⛔ TWO DIFFERENT OP POPULATIONS IN ONE NESTED
+/// MAP, and the C++ spells both `Operation *`.
+pub type LayoutExprMap = BTreeMap<OpId, LayoutExpr>;
+
+/// `LayoutExprMap expr_maps[2]` — the write pointer's accesses beside the read pointer's.
+///
+/// ```cpp
+/// LayoutExprMap xrf_layout_expr_maps[2] = {
+///     LayoutExprMap(),   // xrf write pointer
+///     LayoutExprMap()};  // xrf read pointer
+/// ```
+/// (`LoweringXRF.cpp:568-570`)
+///
+/// ⛔ AN ARRAY OF TWO WHOSE POSITIONS MEAN SOMETHING is the same shape [`XrfPtrPair`] names, and for
+/// the same reason: `expr_maps[0]` holds the STORES and `expr_maps[1]` the LOADS
+/// (`LoweringXRF.cpp:641-646`), so reading them the wrong way round compares a store's layout against
+/// a load's and calls a legal program illegal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XrfLayoutExprs {
+    /// `expr_maps[0]` — *"xrf write pointer"*: the stores.
+    pub write: LayoutExprMap,
+    /// `expr_maps[1]` — *"xrf read pointer"*: the loads.
+    pub read: LayoutExprMap,
+}
+
+impl XrfLayoutExprs {
+    /// One pointer's accesses — `expr_maps[i]`.
+    #[must_use]
+    pub const fn at(&self, ptr: XrfPtr) -> &LayoutExprMap {
+        match ptr {
+            XrfPtr::Write => &self.write,
+            XrfPtr::Read => &self.read,
+        }
+    }
+}
+
+/// Replaces: e172_areXrfAccessesLegal
+///
+/// # ONE REGISTER PER DIRECTION MEANS EVERY ACCESS MUST TRAVEL AT THE SAME RATE
+///
+/// ```cpp
+/// // utility function to check legality of xrf accesses
+/// bool LoweringXRF::areXrfAccessesLegal(LayoutExprMap expr_maps[]) {
+///   for (int i = 0; i < 2; i++) {
+///     auto expr_map = expr_maps[i];
+///     if (expr_map.size() <= 1) continue;
+///     std::vector<Operation *> keys;
+///
+///     // create a key list
+///     for (auto pair : expr_map) {
+///       keys.push_back(pair.first);
+///     }
+///
+///     for (int i = 0; i < keys.size() - 1; i++) {
+///       for (int j = i + 1; j < keys.size(); j++) {
+///         auto expr_a = expr_map[keys[i]];
+///         auto expr_b = expr_map[keys[j]];
+///         // only need to check union of expr_a and expr_b
+///         for (auto item : expr_a.layout_map) {
+///           // because there is only one reg for xrf read or write, all xrf
+///           // accesses have to have the same expr coeffients except constant expr
+///           if (item.first != nullptr && expr_b.layout_map.count(item.first) &&
+///               expr_b.layout_map[item.first] != item.second)
+///             return false;
+///         }
+///       }
+///     }
+///   }
+///
+///   return true;
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:97-126`)
+///
+/// # ⭐⭐ WHAT THE ANSWER DECIDES
+///
+/// It is the gate in front of the whole XRF pointer lowering, and the alternative is a hard error, not
+/// a fallback:
+///
+/// ```cpp
+/// if (xrf_layout_expr_maps[0].size() > 0 ||
+///     xrf_layout_expr_maps[1].size() > 0) {
+///   if (areXrfAccessesLegal(xrf_layout_expr_maps)) {
+///     vector_op_to_xrfptr_map =
+///         processXrfPtrPerUnit(unit, xrf_layout_expr_maps);
+///   } else {
+///     unit->emitError("XRF accesses are illegal");
+///   }
+/// }
+/// ```
+/// (`:650-659`) — an illegal unit gets a diagnostic and an EMPTY map, so nothing downstream threads
+/// any pointer at all. ⛔ THE REASON IS PHYSICAL AND THE REFERENCE STATES IT: *"because there is only
+/// one reg for xrf read or write"*. The write pointer is a single register advanced by one increment
+/// per loop iteration, so two stores under the same nest that want different per-iteration strides
+/// cannot both be served — there is no second register to advance differently.
+///
+/// # ⭐ THE COMMENT SAYS UNION, THE CODE DOES INTERSECTION, AND THE CODE IS RIGHT
+///
+/// *"only need to check union of expr_a and expr_b"* sits above a loop over `expr_a.layout_map`
+/// guarded by `expr_b.layout_map.count(item.first)` — the INTERSECTION. And that is sufficient
+/// **and** symmetric: a disagreement needs the loop to be in both maps, so iterating `a`'s keys finds
+/// every one that iterating `b`'s would. A key in `a` alone is a loop `b` does not sit under, which is
+/// a nesting difference [`LayoutExpr`]'s zero-filling pass has already removed for any two accesses
+/// that share a nest.
+///
+/// # ⛔⛔ THE `size() <= 1` GUARD IS LOAD-BEARING, AND NOT FOR THE REASON IT LOOKS LIKE
+///
+/// `keys.size()` is a `size_t`. With an EMPTY map, `keys.size() - 1` is `SIZE_MAX`, so `for (int i = 0;
+/// i < keys.size() - 1; i++)` becomes a loop over the whole index space with an inner loop that never
+/// runs — a hang, not a wrong answer. ⭐ AND AN EMPTY MAP REACHES HERE: the caller enters the block on
+/// `size() > 0` of EITHER map (`:651-652`), so a program with only loads leaves `expr_maps[0]` empty
+/// and this function is called with it. The guard is what turns that into `continue`.
+///
+/// That underflow has no counterpart below — `keys[i + 1..]` on a one- or zero-element slice is an
+/// empty slice — so the guard is documented here instead of written twice. Both answers are the same:
+/// a map with fewer than two accesses has no pair to disagree.
+///
+/// # ⛔ `item.first != nullptr` IS UNREPRESENTABLE, WHICH IS THE POINT
+///
+/// A null key would be a `layout_map` entry for *no loop*. `getLayoutExpr` cannot make one: the first
+/// pass runs `DT_CHECK_MSG(isa<sentient::ForOp>(for_op), ..)` before inserting
+/// (`LoweringXRF.cpp:57-61`) and the second tests `parent_op &&` (`:82`). An [`OpId`] key is not
+/// nullable, so the clause has nothing to test.
+///
+/// # ⭐ AND THE `keys` VECTOR IS MECHANISM
+///
+/// `std::unordered_map` has no random access, so the reference materialises a key list to index pairs
+/// out of. Iterating the values in place is the same traversal — and the reference's own
+/// `expr_map[keys[i]]` is `operator[]` on a by-value COPY of the map, which would default-insert on a
+/// missing key and cannot, because every key came out of it.
+#[must_use]
+pub fn are_xrf_accesses_legal(expr_maps: &XrfLayoutExprs) -> bool {
+    // `for (int i = 0; i < 2; i++) { auto expr_map = expr_maps[i]; .. }` — ⛔ AND `return false`
+    // LEAVES BOTH LOOPS, so one illegal direction condemns the unit.
+    [XrfPtr::Write, XrfPtr::Read]
+        .into_iter()
+        .all(|ptr| accesses_agree(expr_maps.at(ptr)))
+}
+
+/// ONE POINTER'S ACCESSES, PAIRWISE — the body of [`are_xrf_accesses_legal`]'s outer loop.
+///
+/// ⛔ THE INNER `int i` SHADOWS THE OUTER ONE in the reference (`LoweringXRF.cpp:99` and `:109` are
+/// both `int i`), which is invisible until you look for it and is why the two loops are separate
+/// functions here. Nothing reads the outer `i` after the shadow opens, so the shadowing is harmless —
+/// but a reader cannot know that without checking, and a later edit inside the pair loop could not
+/// reach the pointer index if it needed it.
+fn accesses_agree(expr_map: &LayoutExprMap) -> bool {
+    // `for (auto pair : expr_map) keys.push_back(pair.first);` — see the anchor on why no key list.
+    let exprs: Vec<&LayoutExpr> = expr_map.values().collect();
+
+    // `for (int i = 0; i < keys.size() - 1; i++) for (int j = i + 1; j < keys.size(); j++)` — every
+    // unordered pair once.
+    for (i, expr_a) in exprs.iter().enumerate() {
+        for expr_b in &exprs[i + 1..] {
+            // `for (auto item : expr_a.layout_map)` — a's loops, looked up in b.
+            for (for_op, coeff) in &expr_a.layout_map {
+                // `expr_b.layout_map.count(item.first) && expr_b.layout_map[item.first] != item.second`
+                if expr_b
+                    .layout_map
+                    .get(for_op)
+                    .is_some_and(|theirs| theirs != coeff)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 173/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT AN XRF POINTER ADVANCE ADDS TO A PROGRAM — the ops, and what the pointer reads as after.
+///
+/// ⭐⭐ THE OPS ARE THE VALUE BECAUSE THERE IS NO BUILDER TO POSITION. The reference communicates
+/// through an `OpBuilder *` its three call sites have each aimed somewhere different — *before* the
+/// memory access (`LoweringXRF.cpp:448`), *before* the `sentient.yield` (`:472-473`), and *after* the
+/// enclosing `sentient.for` (`:494`) — and the campaign brief allows dropping exactly that mechanism.
+/// So this returns the statements and the caller splices them at the position it chose, which is the
+/// shape
+/// [`NewMemOp`](super::tf_transform_paged_mem_view_impl::NewMemOp) already uses for the same problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrfPtrAdvance {
+    /// The `sentient.scalar_constant` then the `sentient.scalar_add`, in emission order —
+    /// ⛔ **EMPTY** for a zero offset, which is the whole of the reference's early return.
+    pub ops: Vec<sen::Op>,
+    /// `getXrfValue(add_op)` — the sum, or `xrf_ptr_val` itself when nothing was emitted.
+    pub value: Val,
+}
+
+/// Replaces: e173_insertConstAndAddOps
+///
+/// # MOVE THE XRF POINTER BY A CONSTANT, OR DO NOT MOVE IT AT ALL
+///
+/// ```cpp
+/// // utility function to insert constantOp and addOp for xrf ptr manipulation
+/// Value LoweringXRF::insertConstAndAddOps(OpBuilder *builder, Location &loc,
+///                                         Type &xrf_reg_type, Value xrf_ptr_val,
+///                                         int64_t val, std::string name) {
+///   if (val == 0) return xrf_ptr_val;
+///
+///   auto const_offset =
+///       sentient::ConstantOp::create(*builder, loc, xrf_reg_type, val);
+///
+///   Operation *add_op = sentient::AddOp::create(
+///       *builder, loc, xrf_reg_type, const_offset.getOut(), xrf_ptr_val);
+///
+///   return getXrfValue(add_op);
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:295-308`)
+///
+/// # ⭐⭐ THE ZERO CASE EMITS NOTHING, AND THAT IS AN OPTIMISATION WITH TEETH
+///
+/// All three callers compute a DIFFERENCE and hand it straight in: `curr_const - prev_const` for an
+/// access (`:447`), `prev_const - curr_const + stride` before a yield (`:480-483`), and
+/// `-stride * bound` after a loop (`:495-498`). Zero is the common case — consecutive accesses at the
+/// same offset, a loop whose stride is zero — and emitting `+ 0` for each would put a dead
+/// `scalar_constant`/`scalar_add` pair in front of every one of them. ⛔ AND THE RETURNED VALUE IS
+/// THEN THE **UNCHANGED** POINTER, so the caller's `xrf_ptr_val = insertConstAndAddOps(..)`
+/// assignment is a no-op rather than a rebinding — which is what keeps the chain of adds tied to the
+/// last op that really moved the pointer.
+///
+/// # ⛔ THE CONSTANT IS THE FIRST OPERAND OF THE ADD, AND THE GOLDEN PRINTS IT SECOND
+///
+/// `AddOp::create(.., const_offset.getOut(), xrf_ptr_val)` is const then pointer. The vendor's own
+/// output for this exact op is the other way round:
+///
+/// ```text
+/// %[[VAL_3:.*]] = sentient.scalar_constant {value = 63 : si64} : index
+/// ...
+/// %[[VAL_10:.*]] = sentient.scalar_add %[[VAL_9]]#1, %[[VAL_3]] {regIndex = 0 : i32, regLocale = #sentient<reg_type xrfrdptr>} : index, index
+/// ```
+/// (`dcc/test/PT/issue-212.mlir:16`, `:20` — pointer then constant). ⭐ THAT IS NOT THIS FUNCTION
+/// CHANGING ITS MIND: `Sentient_AddOp` carries `Commutative` (`SentientOps.td:700-701`), so
+/// canonicalization is free to order the operands, and the same golden shows the constant HOISTED
+/// clean out of the `dataflow.program_unit` it was created inside. The emission order below is the
+/// reference's; the print order is a later pass's.
+///
+/// # ⭐ WHAT THE GOLDEN DOES PIN
+///
+/// Both ops are `index`-typed, matching the only `xrf_reg_type` the three call sites pass
+/// (`Type xrf_reg_type = IndexType::get(unit.getContext())`, `LoweringXRF.cpp:371`) — kept as a
+/// parameter here because the reference takes one, and stated as [`ScalarTy`] so an `i32` pointer
+/// register is expressible rather than assumed away. And the add carries **no** register attributes
+/// when it is created: `regLocale`/`regIndex` in the golden are the register passes' work, which is
+/// exactly the state [`sentient::Op::ScalarAdd`]'s `Option<Reg>` exists to spell.
+///
+/// # ⛔ `std::string name` IS UNUSED BY THE REFERENCE, AND ITS VALUE SAYS WHAT IT WANTED
+///
+/// The parameter is never read. Its one caller passes `xrf_ptr_name`, which is
+/// `"imm"` under the comment *"regTypeAssignmentPass will assign reg type"*, over a commented-out
+/// `(i == 0) ? "xrfwrptr" : "xrfrdptr"` (`LoweringXRF.cpp:372-374`) — so it is a `regLocale` spelling
+/// that was meant for the constant and never wired. ⭐ `"imm"` IS ALREADY WHAT THE CONSTANT GETS:
+/// `Sentient_ConstantOp`'s `regLocale` defaults to `SentientRegType::imm` (`SentientOps.td:852`) and
+/// `ConstantOp::create(builder, loc, type, value)` passes no attribute. Dropping the parameter loses
+/// nothing; wiring it would have been a no-op.
+#[must_use]
+pub fn insert_const_and_add_ops(
+    vals: &mut Values,
+    xrf_reg_type: ScalarTy,
+    xrf_ptr_val: Val,
+    val: StickOffset,
+) -> XrfPtrAdvance {
+    // `if (val == 0) return xrf_ptr_val;`
+    if val == StickOffset(0) {
+        return XrfPtrAdvance {
+            ops: Vec::new(),
+            value: xrf_ptr_val,
+        };
+    }
+
+    let const_offset = vals.mint();
+    let sum = vals.mint();
+
+    XrfPtrAdvance {
+        ops: vec![
+            // `sentient::ConstantOp::create(*builder, loc, xrf_reg_type, val)`
+            sen::Op::Sentient(sentient::Op::ScalarConstant {
+                value: val.0,
+                result: const_offset,
+                // ⛔ THE DEFAULT, NOT A CHOICE — see this function's note on `name`.
+                reg_locale: sentient::RegType::Imm,
+                ty: xrf_reg_type,
+            }),
+            // `sentient::AddOp::create(*builder, loc, xrf_reg_type, const_offset.getOut(),
+            //  xrf_ptr_val)` — ⛔ CONST FIRST.
+            sen::Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: const_offset,
+                rhs: xrf_ptr_val,
+                result: sum,
+                // `AddOp::create` passes neither `regLocale` nor `regIndex`.
+                reg: None,
+                ty: xrf_reg_type,
+            }),
+        ],
+        // `return getXrfValue(add_op);` — ⭐ [`xrf_value`]'S `else` ARM, `xrf_ptr->getResult(0)`: a
+        // `sentient.scalar_add` is neither a `yield` nor a `for`, so the answer is the sum and the
+        // `idx` the reference does not pass is ignored.
+        value: sum,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 174/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e174_isXrfRelated
+///
+/// # DOES THIS ACCESS TOUCH THE PT'S TRANSPOSED REGISTER FILE?
+///
+/// ```cpp
+/// // utility function to check whether an op is xrf related.
+/// bool LoweringXRF::isXrfRelated(Operation *op) {
+///   dataflow::GetLogicalMemoryViewOp memory_view_op;
+///   if (auto load_op = dyn_cast<vector::LoadOp>(op)) {
+///     memory_view_op =
+///         load_op.getBase().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///   } else if (auto store_op = dyn_cast<vector::StoreOp>(op)) {
+///     memory_view_op =
+///         store_op.getBase().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///   } else if (auto load_op = dyn_cast<agen::VectorLoadOp>(op)) {
+///     memory_view_op =
+///         load_op.getMemRef().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///   } else if (auto store_op = dyn_cast<agen::VectorStoreOp>(op)) {
+///     memory_view_op =
+///         store_op.getMemRef().getDefiningOp<dataflow::GetLogicalMemoryViewOp>();
+///   } else if (auto tmp_op = dyn_cast<dataflow::GetLogicalMemoryViewOp>(op)) {
+///     memory_view_op = tmp_op;
+///   } else {
+///     op->emitError("unsupported in isXrfRelated()!");
+///     DT_ERROR("Could not determine if op is XRF-related");
+///   }
+///   std::string unit_name;
+///   std::optional<std::string> unit_str_optional =
+///       dcc::uniform::utils::findUnitType(memory_view_op.getFromUnit());
+///   if (unit_str_optional.has_value()) {
+///     unit_name = unit_str_optional.value();
+///   } else {
+///     memory_view_op.emitOpError("Unit type is inconsistent in memory view.");
+///     DT_ERROR("Could not determine if op is XRF-related");
+///   }
+///   if (unit_name.find("xrf") != std::string::npos) return true;
+///   return false;
+/// }
+/// ```
+/// (`dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:530-562`)
+///
+/// # ⭐⭐ FIVE OP CLASSES, ONE QUESTION: WHICH UNIT IS BEHIND THE VIEW
+///
+/// The four memory accesses reach their view through an operand — `getBase()` for the `vector` pair
+/// and `getMemRef()` for the `agen` pair, the same two spellings for one thing that
+/// [`layout_map_and_indices`](super::vc_vector_operands::layout_map_and_indices) (entry 170)
+/// documents — and a `dataflow.get_logical_memory_view` IS its own answer. Then the view's `from_unit`
+/// operand is resolved and its name tested for `xrf`.
+///
+/// # ⛔⛔ `.find("xrf")` HAS EXACTLY ONE MEMBER, AND IT IS A LOCAL UNIT
+///
+/// `findUnitType` returns one of three spellings (`dcc/src/Dialect/Uniform/Utils.cpp:286-301`): a
+/// `dataflow.get_unit`'s `type` attribute, a `dataflow.get_local_unit`'s `name` attribute, or a
+/// `uniform.query_map`'s resolved unit type. Only
+/// [`LocalUnit::PtXrf`](crate::islands::dataflow_ir::dialects::dataflow::LocalUnit::PtXrf) spells
+/// something containing those three letters — `"ptxrf"` — and no [`DfirUnit`] spelling does. So the
+/// substring test is an equality against one enum member, the same collapse
+/// [`MacXrfIncrements::of`] records for `stringifySentientComputePort(..).contains("xrf")`. Both
+/// matches below are exhaustive so that a new register file or unit type has to say which side it
+/// falls on, and a unit test compares every arm against `spelling().contains("xrf")` so the two
+/// cannot drift.
+///
+/// ⭐ AND THAT IS WHY *"is xrf related"* IS REALLY *"is this the PT's transposed register file"*: the
+/// ARF (`"ptarf"`), the three LRFs and the L0 scale region all answer no.
+///
+/// # ⛔ THE `uniform.query_map` ARM HAS NO COUNTERPART, AND CANNOT REACH THIS QUESTION
+///
+/// `findUnitType`'s third arm reads `uniform::QueryMapOp`, which this island does not carry — for the
+/// reason [`symbol::Op`](crate::islands::dataflow_ir::dialects::symbol::Op) gives about its own three
+/// missing siblings. It would not help here if it did: a `query_map` resolves to a *unit type*
+/// (`getUnitTypeFromUniformMappingAsString`), which is the [`DfirUnit`] vocabulary, and no member of
+/// it contains `xrf`. The vendor's own uniformized fixture shows both ops side by side and the view
+/// taking the LOCAL one: `%13 = uniform.query_map(map:%12, key:%arg0)` beside
+/// `%15 = dataflow.get_local_unit %arg0 {name = "ptxrf"}`, and it is `%15` that
+/// `dataflow.get_logical_memory_view` reads
+/// (`dcc/test/Conversion/VectorChainToSentientPT/xrf_increments.mlir:386-388`, `:414`).
+///
+/// # THE TWO STOPS
+///
+/// * `else { emitError("unsupported in isXrfRelated()!"); DT_ERROR(..) }` — ⛔ A `todo!`, because
+///   `DT_ERROR` does not continue. ⭐ AND IT IS UNREACHABLE FROM EVERY CALLER: all SIX call sites
+///   guard with `isa<>` over the same op classes first (`LoweringXRF.cpp:575-576`, `:586-588`,
+///   `:596-598`, `:632-634`, `:426-428`, `:458-460`).
+/// * `getDefiningOp<dataflow::GetLogicalMemoryViewOp>()` returning null — the reference then calls
+///   `getFromUnit()` through it, which is a crash rather than a branch, so a `todo!` names the shape
+///   instead of inventing the answer the crash withheld. ⭐ AND THE PAGED VIEW IS THE SHAPE IT
+///   WOULD BE: none of the eight `dcc/test/Conversion/VectorChainToSentientPT/*.mlir` fixtures
+///   carries a `dataflow.get_paged_logical_memory_view` — every one appears under
+///   `dcc/test/Transform/TransformPagedMemView/` instead, which is the pass that rewrites them
+///   (entry 124).
+#[must_use]
+pub fn is_xrf_related(op: &DfirOp, scope: &[DfirOp]) -> bool {
+    // `dataflow::GetLogicalMemoryViewOp memory_view_op;` and the chain that fills it.
+    let base = match op {
+        // `dyn_cast<vector::LoadOp>` / `dyn_cast<vector::StoreOp>` — `getBase()`.
+        DfirOp::Vector(vector::Op::Load { base, .. })
+        | DfirOp::Vector(vector::Op::Store { base, .. }) => *base,
+
+        // `dyn_cast<agen::VectorLoadOp>` / `dyn_cast<agen::VectorStoreOp>` — `getMemRef()`.
+        DfirOp::Agen(agen::Op::VectorLoad { view, .. })
+        | DfirOp::Agen(agen::Op::VectorStore { view, .. }) => *view,
+
+        // `dyn_cast<dataflow::GetLogicalMemoryViewOp>` — `memory_view_op = tmp_op`, no operand to
+        // follow.
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { from, .. }) => {
+            return viewed_unit_is_xrf(*from, scope);
+        }
+
+        other => todo!(
+            "isXrfRelated: unsupported op — DT_ERROR(\"Could not determine if op is XRF-related\") \
+             (LoweringXRF.cpp:547-550): {other:?}"
+        ),
+    };
+
+    // `.getDefiningOp<dataflow::GetLogicalMemoryViewOp>()`.
+    match defining_op(base, scope) {
+        Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { from, .. })) => {
+            viewed_unit_is_xrf(*from, scope)
+        }
+        other => todo!(
+            "isXrfRelated: a memory access whose base is not a dataflow.get_logical_memory_view — \
+             the reference reads `memory_view_op.getFromUnit()` through a null op \
+             (LoweringXRF.cpp:552-553): {other:?}"
+        ),
+    }
+}
+
+/// `findUnitType(memory_view_op.getFromUnit())` FOLLOWED BY `unit_name.find("xrf")` — see
+/// [`is_xrf_related`] on why that is one enum comparison.
+///
+/// ```cpp
+/// std::optional<std::string> findUnitType(
+///     mlir::TypedValue<mlir::IndexType> unit_index_type) {
+///   if (auto unit = unit_index_type.getDefiningOp<mlir::dataflow::GetUnitOp>())
+///     return unit.getType().str();
+///
+///   if (auto memory_unit =
+///           unit_index_type.getDefiningOp<mlir::dataflow::GetLocalUnitOp>())
+///     return memory_unit.getName().str();
+///
+///   if (auto mapping_unit_op =
+///           unit_index_type.getDefiningOp<mlir::uniform::QueryMapOp>())
+///     return dcc::uniform::utils::getUnitTypeFromUniformMappingAsString(
+///         mapping_unit_op);
+///
+///   return std::nullopt;
+/// }
+/// ```
+/// (`dcc/src/Dialect/Uniform/Utils.cpp:286-301`)
+fn viewed_unit_is_xrf(from_unit: Val, scope: &[DfirOp]) -> bool {
+    match defining_op(from_unit, scope) {
+        // `getDefiningOp<dataflow::GetUnitOp>()` → `unit.getType().str()`, the `type` attribute.
+        // ⛔ EXHAUSTIVE AND ALL FALSE: no unit TYPE names a register file; see [`is_xrf_related`].
+        Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) => match unit {
+            DfirUnit::Sfp
+            | DfirUnit::Pe
+            | DfirUnit::PtRow(_)
+            | DfirUnit::Lxlu
+            | DfirUnit::Lxsu
+            | DfirUnit::Lx
+            | DfirUnit::Hbm
+            | DfirUnit::L0lu
+            | DfirUnit::L0su
+            | DfirUnit::L0
+            | DfirUnit::L3lu
+            | DfirUnit::L3su
+            | DfirUnit::Constant
+            | DfirUnit::SfpState
+            | DfirUnit::PeState
+            | DfirUnit::SfpRing
+            | DfirUnit::LxVirtualIbr
+            | DfirUnit::CrossPtnLink => false,
+        },
+
+        // `getDefiningOp<dataflow::GetLocalUnitOp>()` → `memory_unit.getName().str()`, and `"ptxrf"`
+        // is the one name in that set containing `xrf`.
+        Some(DfirOp::Dataflow(dataflow::Op::GetLocalUnit { which, .. })) => match which {
+            LocalUnit::PtXrf => true,
+            LocalUnit::PeLrf
+            | LocalUnit::SfpLrf
+            | LocalUnit::PtLrf
+            | LocalUnit::PtArf
+            | LocalUnit::L0Scale => false,
+        },
+
+        // `return std::nullopt;` — `emitOpError("Unit type is inconsistent in memory view.")` and
+        // `DT_ERROR`. ⛔ A `todo!`: the reference stops, and a view whose unit operand is defined by
+        // neither op is one this pass cannot place.
+        other => todo!(
+            "isXrfRelated: Unit type is inconsistent in memory view — \
+             DT_ERROR(\"Could not determine if op is XRF-related\") (LoweringXRF.cpp:556-558): \
+             {other:?}"
+        ),
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        DummyMacPtrs, ForOpBound, MacXrfIncrements, XrfPtr, XrfPtrPair, XrfPtrs, for_op_bound,
-        replace_and_erase_dummy_mac_ops, set_sentient_mac_xrf_reg_incr_attr, xrf_value,
-        xrf_rd_ptr_incr_val_after_mac,
+        DfirOp, DummyMacPtrs, ForOpBound, LayoutExpr, LayoutExprMap, LocalUnit, MacXrfIncrements,
+        OpId, StickOffset, Values, XrfLayoutExprs, XrfPtr, XrfPtrAdvance, XrfPtrPair, XrfPtrs,
+        agen, are_xrf_accesses_legal, dataflow, for_op_bound, insert_const_and_add_ops,
+        is_xrf_related, replace_and_erase_dummy_mac_ops, set_sentient_mac_xrf_reg_incr_attr,
+        vector, xrf_rd_ptr_incr_val_after_mac, xrf_value,
     };
     use crate::arch::{Dd2, Sen1p5};
-    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::dialects::Index;
+    use crate::islands::dataflow_ir::ty::{
+        AffineExpr, AffineMap, ElemType, MemRef, ScalarTy, Vector,
+    };
     use crate::islands::sentient::dialects::{
         self as sen, Definitions, Val, arith, sentient, symbol,
     };
+    use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
 
     /// A `sentient.for` carrying the two xrf pointers, write then read.
     fn loop_carrying(bound: Val, iv: Val, ptrs: [(Val, Val, Val); 2]) -> sen::Op {
@@ -1190,5 +1782,486 @@ mod unit_tests {
             )
             .is_none()
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 172/384 — `areXrfAccessesLegal`
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// One access at `path`, with the coefficients it gives its enclosing loops and no constant.
+    fn access(coeffs: &[(&[u32], i64)]) -> LayoutExpr {
+        LayoutExpr {
+            layout_map: coeffs
+                .iter()
+                .map(|(loop_path, coeff)| (OpId::at(loop_path), StickOffset(*coeff)))
+                .collect(),
+            constant_val: StickOffset(0),
+        }
+    }
+
+    /// Two accesses under one nest, keyed by position.
+    fn one_pointer(a: LayoutExpr, b: LayoutExpr) -> XrfLayoutExprs {
+        XrfLayoutExprs {
+            write: [(OpId::at(&[0, 0]), a), (OpId::at(&[0, 1]), b)]
+                .into_iter()
+                .collect(),
+            read: LayoutExprMap::new(),
+        }
+    }
+
+    /// Two stores under the same `sentient.for` that want different per-iteration strides cannot both
+    /// be served by the one write-pointer register (`LoweringXRF.cpp:115-119`).
+    #[test]
+    fn accesses_disagreeing_on_a_shared_loop_are_illegal() {
+        let maps = one_pointer(access(&[(&[0], 4)]), access(&[(&[0], 8)]));
+
+        assert!(!are_xrf_accesses_legal(&maps));
+    }
+
+    /// The same stride is what a single register can walk.
+    #[test]
+    fn accesses_agreeing_on_every_shared_loop_are_legal() {
+        let maps = one_pointer(
+            access(&[(&[0], 4), (&[1], 16)]),
+            access(&[(&[0], 4), (&[1], 16)]),
+        );
+
+        assert!(are_xrf_accesses_legal(&maps));
+    }
+
+    /// ⛔ ONLY THE INTERSECTION IS TESTED. The reference's `expr_b.layout_map.count(item.first)`
+    /// guard means a loop only one access sits under says nothing about legality — and
+    /// [`LayoutExpr`]'s zero-filling pass (`LoweringXRF.cpp:79-92`) is what makes that safe for two
+    /// accesses that DO share a nest.
+    #[test]
+    fn loops_only_one_access_names_are_not_compared() {
+        let maps = one_pointer(access(&[(&[0], 4)]), access(&[(&[1], 8)]));
+
+        assert!(are_xrf_accesses_legal(&maps));
+    }
+
+    /// ⭐ THE CONSTANT TERM IS EXCLUDED BY DESIGN — *"all xrf accesses have to have the same expr
+    /// coeffients except constant expr"* (`LoweringXRF.cpp:115-116`): a constant difference is
+    /// exactly what [`insert_const_and_add_ops`] emits.
+    #[test]
+    fn a_differing_constant_term_is_legal() {
+        let mut a = access(&[(&[0], 4)]);
+        let mut b = access(&[(&[0], 4)]);
+        a.constant_val = StickOffset(0);
+        b.constant_val = StickOffset(63);
+
+        assert!(are_xrf_accesses_legal(&one_pointer(a, b)));
+    }
+
+    /// ⛔⛔ THE `size() <= 1` GUARD. A pointer with no accesses at all reaches this function — the
+    /// caller enters on `size() > 0` of EITHER map (`LoweringXRF.cpp:651-652`) — and the reference's
+    /// `keys.size() - 1` would underflow a `size_t` on it.
+    #[test]
+    fn a_pointer_with_fewer_than_two_accesses_is_legal() {
+        let empty = XrfLayoutExprs::default();
+        assert!(are_xrf_accesses_legal(&empty));
+
+        let single = XrfLayoutExprs {
+            write: [(OpId::at(&[0, 0]), access(&[(&[0], 4)]))]
+                .into_iter()
+                .collect(),
+            read: LayoutExprMap::new(),
+        };
+        assert!(are_xrf_accesses_legal(&single));
+    }
+
+    /// ⛔ EITHER DIRECTION CONDEMNS THE UNIT: `return false` leaves both of the reference's loops, and
+    /// the caller's only alternative is `emitError("XRF accesses are illegal")` (`:654-658`).
+    #[test]
+    fn an_illegal_read_pointer_condemns_a_legal_write_pointer() {
+        let maps = XrfLayoutExprs {
+            write: [(OpId::at(&[0, 0]), access(&[(&[0], 4)]))]
+                .into_iter()
+                .collect(),
+            read: [
+                (OpId::at(&[0, 1]), access(&[(&[0], 4)])),
+                (OpId::at(&[0, 2]), access(&[(&[0], 5)])),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        assert!(!are_xrf_accesses_legal(&maps));
+        assert!(are_xrf_accesses_legal(&XrfLayoutExprs {
+            write: maps.write.clone(),
+            read: LayoutExprMap::new(),
+        }));
+    }
+
+    /// Which map is which — `expr_maps[0]` is the write pointer's (`LoweringXRF.cpp:568-570`).
+    #[test]
+    fn the_two_maps_are_reachable_by_pointer() {
+        let maps = one_pointer(access(&[(&[0], 4)]), access(&[(&[0], 4)]));
+
+        assert_eq!(maps.at(XrfPtr::Write).len(), 2);
+        assert!(maps.at(XrfPtr::Read).is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 173/384 — `insertConstAndAddOps`
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// ⛔ A ZERO OFFSET EMITS NOTHING and hands back the pointer it was given, so the caller's
+    /// `xrf_ptr_val = insertConstAndAddOps(..)` is a no-op (`LoweringXRF.cpp:299`).
+    #[test]
+    fn a_zero_offset_emits_nothing() {
+        let mut vals = Values::default();
+        let ptr = vals.mint();
+
+        let advance = insert_const_and_add_ops(&mut vals, ScalarTy::Index, ptr, StickOffset(0));
+
+        assert_eq!(
+            advance,
+            XrfPtrAdvance {
+                ops: Vec::new(),
+                value: ptr,
+            }
+        );
+        // ⭐ AND NOTHING WAS MINTED, so no value name is burnt on an op that was not emitted.
+        assert_eq!(vals.issued(), 1);
+    }
+
+    /// The vendor's own pair for this function:
+    ///
+    /// ```text
+    /// %[[VAL_3:.*]] = sentient.scalar_constant {value = 63 : si64} : index
+    /// ...
+    /// %[[VAL_10:.*]] = sentient.scalar_add %[[VAL_9]]#1, %[[VAL_3]] {regIndex = 0 : i32, regLocale = #sentient<reg_type xrfrdptr>} : index, index
+    /// ```
+    /// (`dcc/test/PT/issue-212.mlir:16`, `:20`) — ⛔ THE GOLDEN'S OPERAND ORDER IS THE OTHER WAY
+    /// ROUND and its register attributes come from a later pass; see the anchor.
+    #[test]
+    fn a_non_zero_offset_emits_the_constant_then_the_add() {
+        let mut vals = Values::default();
+        let ptr = vals.mint();
+
+        let advance = insert_const_and_add_ops(&mut vals, ScalarTy::Index, ptr, StickOffset(63));
+
+        let offset = Val(1);
+        let sum = Val(2);
+        assert_eq!(
+            advance,
+            XrfPtrAdvance {
+                ops: vec![
+                    sen::Op::Sentient(sentient::Op::ScalarConstant {
+                        value: 63,
+                        result: offset,
+                        reg_locale: sentient::RegType::Imm,
+                        ty: ScalarTy::Index,
+                    }),
+                    sen::Op::Sentient(sentient::Op::ScalarAdd {
+                        // ⛔ CONST FIRST — `AddOp::create(.., const_offset.getOut(), xrf_ptr_val)`.
+                        lhs: offset,
+                        rhs: ptr,
+                        result: sum,
+                        // ⭐ NO REGISTER YET: `regTypeAssignmentPass` assigns it (`:373-374`).
+                        reg: None,
+                        ty: ScalarTy::Index,
+                    }),
+                ],
+                value: sum,
+            }
+        );
+    }
+
+    /// ⛔ THE OFFSET IS SIGNED, AND ONE CALLER'S IS NEGATIVE BY CONSTRUCTION:
+    /// `-(loop_stride_step) * getForOpBound(forop)` unwinds a loop's whole travel after it
+    /// (`LoweringXRF.cpp:495-498`), which is why [`StickOffset`] is not [`crate::arch::Sticks`].
+    #[test]
+    fn a_negative_offset_is_expressible() {
+        let mut vals = Values::default();
+        let ptr = vals.mint();
+        let stride = StickOffset(4);
+        let bound = ForOpBound(8);
+
+        let advance = insert_const_and_add_ops(
+            &mut vals,
+            ScalarTy::Index,
+            ptr,
+            StickOffset(-stride.0 * bound.0),
+        );
+
+        assert_eq!(
+            advance.ops.first(),
+            Some(&sen::Op::Sentient(sentient::Op::ScalarConstant {
+                value: -32,
+                result: Val(1),
+                reg_locale: sentient::RegType::Imm,
+                ty: ScalarTy::Index,
+            }))
+        );
+        assert_eq!(advance.value, Val(2));
+    }
+
+    /// The pointer register's type is a parameter, and an `i32` one is expressible even though the
+    /// three call sites all pass an `index` one (`LoweringXRF.cpp:371`, `:450`, `:485`, `:499`).
+    #[test]
+    fn the_register_type_is_carried_through() {
+        let mut vals = Values::default();
+        let ptr = vals.mint();
+
+        let advance = insert_const_and_add_ops(&mut vals, ScalarTy::Int(32), ptr, StickOffset(1));
+
+        assert!(advance.ops.iter().all(|op| matches!(
+            op,
+            sen::Op::Sentient(
+                sentient::Op::ScalarConstant {
+                    ty: ScalarTy::Int(32),
+                    ..
+                } | sentient::Op::ScalarAdd {
+                    ty: ScalarTy::Int(32),
+                    ..
+                }
+            )
+        )));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 174/384 — `isXrfRelated`
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// `%15 = dataflow.get_local_unit %arg0 {name = "ptxrf"} : index`
+    /// (`xrf_increments.mlir:388`), and its `pt_lrfreg` neighbour at `:387`.
+    fn local_unit(result: Val, which: LocalUnit) -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+            result,
+            of: Val(0),
+            which,
+        })
+    }
+
+    /// `%45 = dataflow.get_logical_memory_view %15, %c0 {layout_map = #map}
+    ///  : index, index, memref<4x64x64x1xf4E2M1FN>` (`xrf_increments.mlir:414`), whose `#map` is
+    /// `affine_map<(d0, d1, d2, d3) -> (d3 * 16384 + d2 * 256 + d1 * 4 + d0)>` (`:350`).
+    fn xrf_view(result: Val, from: Val) -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result,
+            from,
+            start: Val(1),
+            layout: AffineMap {
+                dims: 4,
+                syms: 0,
+                results: vec![
+                    AffineExpr::dim(3)
+                        .times(16384)
+                        .plus(AffineExpr::dim(2).times(256))
+                        .plus(AffineExpr::dim(1).times(4))
+                        .plus(AffineExpr::dim(0)),
+                ],
+            },
+            ty: MemRef {
+                shape: vec![4, 64, 64, 1],
+                elem: ElemType::F4E2M1Fn,
+            },
+        })
+    }
+
+    /// `agen.vector_store %44, %45[0, 0, %43 + %34 * 4 + %31 * 8 + %28 * 16, 0]
+    ///  {dbgName = "transfer_lds2_src:lxlu_dst:ptrow0", store_order = #map1, store_set = #set}
+    ///  : memref<4x64x64x1xf4E2M1FN>, vector<256xf4E2M1FN>` (`xrf_increments.mlir:415`).
+    fn xrf_store(view: Val) -> DfirOp {
+        DfirOp::Agen(agen::Op::VectorStore {
+            value: Val(44),
+            view,
+            indices: vec![
+                Index::Const(0),
+                Index::Const(0),
+                Index::Strided(
+                    vec![(Val(43), 1), (Val(34), 4), (Val(31), 8), (Val(28), 16)],
+                    0,
+                ),
+                Index::Const(0),
+            ],
+            view_ty: MemRef {
+                shape: vec![4, 64, 64, 1],
+                elem: ElemType::F4E2M1Fn,
+            },
+            ty: Vector {
+                len: 256,
+                elem: ElemType::F4E2M1Fn,
+            },
+        })
+    }
+
+    /// The vendor's own xrf store — a `ptxrf` view under an `agen.vector_store`
+    /// (`xrf_increments.mlir:388`, `:414-415`).
+    #[test]
+    fn an_agen_store_through_a_ptxrf_view_is_xrf_related() {
+        let scope = vec![
+            local_unit(Val(15), LocalUnit::PtXrf),
+            xrf_view(Val(45), Val(15)),
+            xrf_store(Val(45)),
+        ];
+
+        assert!(is_xrf_related(&scope[2], &scope));
+    }
+
+    /// ⛔ THE SAME STORE OVER THE LRF ANSWERS NO. `%14 = dataflow.get_local_unit %arg0
+    /// {name = "pt_lrfreg"}` (`xrf_increments.mlir:387`) sits one line above the `ptxrf` one in the
+    /// same unit, so the only thing separating an xrf access from an LRF access is which handle the
+    /// view was taken from.
+    #[test]
+    fn the_same_store_through_a_pt_lrfreg_view_is_not() {
+        let scope = vec![
+            local_unit(Val(14), LocalUnit::PtLrf),
+            xrf_view(Val(45), Val(14)),
+            xrf_store(Val(45)),
+        ];
+
+        assert!(!is_xrf_related(&scope[2], &scope));
+    }
+
+    /// ⭐ A MEMORY VIEW IS ITS OWN ANSWER — the fifth arm, which is the one the caller's `unit.walk`
+    /// uses to decide whether the unit touches the XRF at all
+    /// (`LoweringXRF.cpp:574-578`, `:545-546`).
+    #[test]
+    fn a_memory_view_is_classified_by_its_own_unit() {
+        let xrf = vec![
+            local_unit(Val(15), LocalUnit::PtXrf),
+            xrf_view(Val(45), Val(15)),
+        ];
+        let lrf = vec![
+            local_unit(Val(14), LocalUnit::PtLrf),
+            xrf_view(Val(45), Val(14)),
+        ];
+
+        assert!(is_xrf_related(&xrf[1], &xrf));
+        assert!(!is_xrf_related(&lrf[1], &lrf));
+    }
+
+    /// The plain-`vector` arm, over the SFP's register file:
+    ///
+    /// ```text
+    /// %lrf_memory_unit = dataflow.get_local_unit %sfp_c0 {name="sfp_lrfreg"} : index
+    /// %lrf_memory_fp16 = dataflow.get_logical_memory_view %lrf_memory_unit, %c0
+    ///                     {layout_map = affine_map<(i, j) -> (64 * i + j) >}
+    ///                     : index, index, memref<8x64xf16>
+    /// %data1 = vector.load %lrf_memory_fp16[%c4, %c0] : memref<8x64xf16>, vector<64xf16>
+    /// ```
+    /// (`dcc/test/Conversion/VectorChainToSentientPESFP/sfp-to-sfp-ring.mlir:167-171`)
+    ///
+    /// ⛔ NOT A PT FIXTURE, BECAUSE THE PT TREE HAS NO PLAIN `vector.load` OVER A LOCAL UNIT — every
+    /// PT access is an `agen` one. The two spellings differ only in the accessor name
+    /// (`getBase()` against `getMemRef()`), so the arm is real and this is what exercises it.
+    #[test]
+    fn a_plain_vector_load_over_an_sfp_lrf_view_is_not_xrf_related() {
+        let view = DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            result: Val(80),
+            from: Val(81),
+            start: Val(82),
+            layout: AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![AffineExpr::dim(0).times(64).plus(AffineExpr::dim(1))],
+            },
+            ty: MemRef {
+                shape: vec![8, 64],
+                elem: ElemType::F16,
+            },
+        });
+        let scope = vec![
+            local_unit(Val(81), LocalUnit::SfpLrf),
+            view,
+            DfirOp::Vector(vector::Op::Load {
+                result: Val(83),
+                base: Val(80),
+                indices: vec![Index::Const(4), Index::Const(0)],
+                base_ty: MemRef {
+                    shape: vec![8, 64],
+                    elem: ElemType::F16,
+                },
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            }),
+        ];
+
+        assert!(!is_xrf_related(&scope[2], &scope));
+    }
+
+    /// A view over a whole unit rather than a register file, from the vendor's own LX fixture:
+    /// `%lx_memory_unit = dataflow.get_unit {core = 0, corelet = 0, name = "C0-CL0-LX", type="lx"}`
+    /// feeding `dataflow.get_logical_memory_view` (`dcc/test/LXLU/rotate.mlir:129-132`).
+    #[test]
+    fn a_view_over_a_unit_type_is_not_xrf_related() {
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(81),
+                residency: Residency::Corelet {
+                    core: Core::checked(0).expect("the arch has core 0"),
+                    corelet: Corelet::checked(0).expect("the arch has corelet 0"),
+                },
+                unit: DfirUnit::Lx,
+            }),
+            xrf_view(Val(45), Val(81)),
+        ];
+
+        assert!(!is_xrf_related(&scope[1], &scope));
+    }
+
+    /// ⛔⛔ THE SUBSTRING TEST HAS EXACTLY ONE MEMBER, and this is what keeps the two exhaustive
+    /// matches in [`is_xrf_related`] honest: `.find("xrf")` over
+    /// [`LocalUnit::spelling`](crate::islands::dataflow_ir::dialects::dataflow::LocalUnit::spelling)
+    /// picks `"ptxrf"` and nothing else.
+    #[test]
+    fn ptxrf_is_the_only_local_unit_whose_name_contains_xrf() {
+        for which in [
+            LocalUnit::PeLrf,
+            LocalUnit::SfpLrf,
+            LocalUnit::PtLrf,
+            LocalUnit::PtXrf,
+            LocalUnit::PtArf,
+            LocalUnit::L0Scale,
+        ] {
+            let scope = vec![local_unit(Val(15), which), xrf_view(Val(45), Val(15))];
+
+            assert_eq!(
+                is_xrf_related(&scope[1], &scope),
+                which.spelling().contains("xrf"),
+                "{which:?} spells {}",
+                which.spelling()
+            );
+        }
+    }
+
+    /// ⛔ AND NO UNIT *TYPE* CONTAINS IT — which is why `findUnitType`'s `get_unit` arm
+    /// (`dcc/src/Dialect/Uniform/Utils.cpp:288-289`) is uniformly false, and why its third,
+    /// `uniform.query_map` arm would be too.
+    #[test]
+    fn no_unit_type_spelling_contains_xrf() {
+        let rows = (0..8).filter_map(Row::checked).map(DfirUnit::PtRow);
+        let units = [
+            DfirUnit::Sfp,
+            DfirUnit::Pe,
+            DfirUnit::Lxlu,
+            DfirUnit::Lxsu,
+            DfirUnit::Lx,
+            DfirUnit::Hbm,
+            DfirUnit::L0lu,
+            DfirUnit::L0su,
+            DfirUnit::L0,
+            DfirUnit::L3lu,
+            DfirUnit::L3su,
+            DfirUnit::Constant,
+            DfirUnit::SfpState,
+            DfirUnit::PeState,
+            DfirUnit::SfpRing,
+            DfirUnit::LxVirtualIbr,
+            DfirUnit::CrossPtnLink,
+        ];
+
+        for unit in units.into_iter().chain(rows) {
+            assert!(
+                !unit.spelling().contains("xrf"),
+                "{unit:?} spells {}",
+                unit.spelling()
+            );
+        }
     }
 }

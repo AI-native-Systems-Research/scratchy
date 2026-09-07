@@ -262,9 +262,16 @@ pub const fn legality(op: &DfirOp) -> Legality {
         DfirOp::Arith(_) | DfirOp::VectorChain(_) => Legality::Legal,
         // Named by neither list. ⭐ `symbol` JOINS THEM: the pass's two lists do not mention it, and
         // a `symbol.create_symbol` does survive this rung — see [`sen::Op::Symbol`].
-        DfirOp::Affine(_) | DfirOp::Dataflow(_) | DfirOp::Agen(_) | DfirOp::Symbol(_) => {
-            Legality::Unmentioned
-        }
+        // ⭐ AND `vector` JOINS THEM, WHICH THE LIST ABOVE SETTLES BY OMISSION:
+        // `addLegalDialect<arith, vectorchain, sentient, memref, func>` names five and
+        // `addIllegalDialect<scf>` names one (`SCFToSentient.cpp:261-266`) — `mlir::vector` is in
+        // neither, so a `vector.store` sitting beside the `scf.for` this pass rewrites is tolerated
+        // by the partial conversion exactly as an `agen` access is.
+        DfirOp::Affine(_)
+        | DfirOp::Dataflow(_)
+        | DfirOp::Agen(_)
+        | DfirOp::Vector(_)
+        | DfirOp::Symbol(_) => Legality::Unmentioned,
     }
 }
 

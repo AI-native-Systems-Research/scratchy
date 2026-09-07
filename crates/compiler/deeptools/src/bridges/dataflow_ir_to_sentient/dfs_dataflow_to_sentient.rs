@@ -267,6 +267,7 @@ pub fn is_same_list_of_units(key_units: &[DfirOp], src_unit_ops: &[Val]) -> bool
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Agen(_)
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => return false,
         }
@@ -1414,6 +1415,7 @@ pub fn separate_based_on_destination_units(
                 | DfirOp::Affine(_)
                 | DfirOp::Agen(_)
                 | DfirOp::VectorChain(_)
+                | DfirOp::Vector(_)
                 | DfirOp::Symbol(_),
             )
             | None => {}

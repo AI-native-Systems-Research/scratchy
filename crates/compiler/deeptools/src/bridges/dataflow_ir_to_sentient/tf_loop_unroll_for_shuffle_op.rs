@@ -128,6 +128,7 @@ impl Loop {
             | DfirOp::Arith(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => None,
         }
@@ -354,6 +355,7 @@ fn signless_int_constant(val: Val, scope: &[DfirOp]) -> Option<i64> {
         | DfirOp::Affine(_)
         | DfirOp::Dataflow(_)
         | DfirOp::Agen(_)
+        | DfirOp::Vector(_)
         | DfirOp::VectorChain(_)
         | DfirOp::Symbol(_) => None,
     }

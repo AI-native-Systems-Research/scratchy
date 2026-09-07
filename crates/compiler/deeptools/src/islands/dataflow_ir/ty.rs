@@ -350,6 +350,221 @@ impl AffineExpr {
     pub fn floordiv(self, k: i64) -> AffineExpr {
         AffineExpr::FloorDiv(Box::new(self), Box::new(AffineExpr::Const(k)))
     }
+
+    /// `self + other`, **SIMPLIFIED** — MLIR's `AffineExpr::operator+`, which is `simplifyAdd`.
+    ///
+    /// ⛔⛔ THIS IS NOT A DUPLICATE OF [`Self::plus`] AND THE PAIR IS DELIBERATE. [`Self::plus`]
+    /// builds the node verbatim, because a map this island *writes into a program* is printed exactly
+    /// as it was transcribed — see [`fold_add`]'s note. This one is for a map the island *recovers*:
+    /// `getLayoutMapAndIndices` reads `agen.vector_load`'s own `AffineMapAttr`
+    /// (`VectorOperands.cpp:904`), and an `affine_map` attribute in MLIR is **always** canonical,
+    /// because the only way to get one is through the parser or through these operators. Rebuilding it
+    /// unsimplified would hand `compose` a `d0 * 1 + 0` where the vendor's attribute holds `d0`.
+    #[must_use]
+    pub fn added(self, other: AffineExpr) -> AffineExpr {
+        fold_add(self, other)
+    }
+
+    /// `self * k`, **SIMPLIFIED** — MLIR's `AffineExpr::operator*`, which is `simplifyMul`. See
+    /// [`Self::added`] for why this exists beside [`Self::times`].
+    #[must_use]
+    pub fn scaled(self, k: i64) -> AffineExpr {
+        fold_mul(self, AffineExpr::Const(k))
+    }
+
+    /// DOES THIS EXPRESSION NAME NO DIMENSION? — `AffineExpr::isSymbolicOrConstant()`.
+    ///
+    /// ⛔ IT IS THE TEST THAT DECIDES WHICH SIDE OF A PRODUCT IS THE MULTIPLIER, and MLIR's
+    /// `simplifyMul` gives up outright when NEITHER side passes it: a product of two dimensions is
+    /// not affine, so `d0 * d1` is built and left alone rather than rewritten (`AffineExpr.cpp`,
+    /// `simplifyMul`'s second guard). A symbol passes because a symbol is loop-invariant with respect
+    /// to the map's own iteration space — see [`AffineExpr::Sym`].
+    #[must_use]
+    pub fn is_symbolic_or_constant(&self) -> bool {
+        match self {
+            AffineExpr::Const(_) | AffineExpr::Sym(_) => true,
+            AffineExpr::Dim(_) => false,
+            AffineExpr::Add(a, b)
+            | AffineExpr::Mul(a, b)
+            | AffineExpr::Mod(a, b)
+            | AffineExpr::FloorDiv(a, b) => {
+                a.is_symbolic_or_constant() && b.is_symbolic_or_constant()
+            }
+        }
+    }
+
+    /// SUBSTITUTE `d<i>` BY `dims[i]` AND `s<j>` BY `syms[j]`, LEAF BY LEAF —
+    /// `AffineExpr::replaceDimsAndSymbols`.
+    ///
+    /// ⛔ A POSITION BEYOND ITS REPLACEMENT LIST KEEPS ITSELF, which is not a courtesy but the
+    /// mechanism [`AffineMap::compose`] runs on: it hands the inner map an EMPTY dimension list in
+    /// effect (an identity one) and a symbol list covering only the inner map's own symbols, and the
+    /// OUTER map's symbols are then untouched because `compose` passes no symbol replacements for
+    /// them at all.
+    ///
+    /// ⛔ AND THE UNCHANGED-CHILDREN GUARD IS PART OF THE CONTRACT, not an optimisation. MLIR returns
+    /// `*this` when neither child moved, so a node nothing was substituted into is NOT re-simplified.
+    /// That is why composing with an order map that is the identity gives back the other map exactly:
+    /// every `d<i>` is replaced by `d<i>`, so no binary node is ever rebuilt and no fold runs.
+    #[must_use]
+    fn replace_dims_and_symbols(&self, dims: &[AffineExpr], syms: &[AffineExpr]) -> AffineExpr {
+        match self {
+            AffineExpr::Const(_) => self.clone(),
+            AffineExpr::Dim(n) => match dims.get(*n as usize) {
+                Some(with) => with.clone(),
+                None => self.clone(),
+            },
+            AffineExpr::Sym(n) => match syms.get(*n as usize) {
+                Some(with) => with.clone(),
+                None => self.clone(),
+            },
+            AffineExpr::Add(a, b)
+            | AffineExpr::Mul(a, b)
+            | AffineExpr::Mod(a, b)
+            | AffineExpr::FloorDiv(a, b) => {
+                let new_a = a.replace_dims_and_symbols(dims, syms);
+                let new_b = b.replace_dims_and_symbols(dims, syms);
+                if new_a == **a && new_b == **b {
+                    return self.clone();
+                }
+                match self {
+                    AffineExpr::Add(..) => fold_add(new_a, new_b),
+                    AffineExpr::Mul(..) => fold_mul(new_a, new_b),
+                    AffineExpr::Mod(..) => fold_mod(new_a, new_b),
+                    // The `FloorDiv` case; the four leaves are answered above.
+                    _ => fold_floordiv(new_a, new_b),
+                }
+            }
+        }
+    }
+}
+
+/// `lhs + rhs`, FOLDED — the head of MLIR's `simplifyAdd`, and the reason a composed map prints the
+/// way the reference's does.
+///
+/// ⭐⭐ THIS RUNS ONLY WHERE A SUBSTITUTION HAPPENED. The island's own constructors
+/// ([`AffineExpr::plus`], [`AffineExpr::times`]) still do not fold — that is stated at
+/// [`substitute_symbols`] and unchanged. This is `getAffineBinaryOpExpr`, which MLIR reaches ONLY
+/// from `replaceDimsAndSymbols` rebuilding a node, so an `affine_map` this island writes directly is
+/// printed exactly as it was built.
+///
+/// ⚠️ THE SUBSET IS BOUNDED AND THE BOUNDARY IS TEXTUAL, NOT SEMANTIC. Transcribed here: the
+/// constant fold, the canonicalisation that moves a constant (or a dimension-free expression) to the
+/// right, `x + 0`, and the successive-addition merge `(d0 + 2) + 3`. NOT transcribed: `c1*e + c2*e`
+/// collapsing, and the `expr + expr floordiv q * -q` to `expr mod q` recognition. An expression
+/// reaching one of those is BUILT rather than rewritten — which is also what MLIR does when
+/// `simplifyAdd` returns null — so the map we print is equal as a function and may carry one more
+/// node. ⭐ AND dbo-opt CLOSES EVEN THAT: MLIR's own affine parser builds every parsed expression
+/// through these same operators (`AsmParser/AffineParser.cpp:160-165` returns `lhs + rhs`), so
+/// whatever we print is re-simplified in full the moment the backend reads it.
+fn fold_add(lhs: AffineExpr, rhs: AffineExpr) -> AffineExpr {
+    // `if (lhsConst && rhsConst)` — ⛔ ON OVERFLOW MLIR RETURNS NULL AND BUILDS THE NODE, which
+    // `checked_add` reproduces rather than wrapping into a wrong literal.
+    if let (AffineExpr::Const(a), AffineExpr::Const(b)) = (&lhs, &rhs) {
+        match a.checked_add(*b) {
+            Some(sum) => return AffineExpr::Const(sum),
+            None => return AffineExpr::Add(Box::new(lhs), Box::new(rhs)),
+        }
+    }
+    // "Canonicalize so that only the RHS is a constant. (4 + d0 becomes d0 + 4)."
+    if matches!(lhs, AffineExpr::Const(_))
+        || (lhs.is_symbolic_or_constant() && !rhs.is_symbolic_or_constant())
+    {
+        return fold_add(rhs, lhs);
+    }
+    // "Addition with a zero is a noop."
+    if rhs == AffineExpr::Const(0) {
+        return lhs;
+    }
+    // "Fold successive additions like (d0 + 2) + 3 into d0 + 5."
+    if let (AffineExpr::Add(l, l_rhs), AffineExpr::Const(k)) = (&lhs, &rhs)
+        && let AffineExpr::Const(c) = **l_rhs
+        && let Some(sum) = c.checked_add(*k)
+    {
+        return fold_add((**l).clone(), AffineExpr::Const(sum));
+    }
+    AffineExpr::Add(Box::new(lhs), Box::new(rhs))
+}
+
+/// `lhs * rhs`, FOLDED — the head of MLIR's `simplifyMul`. See [`fold_add`] for the subset rule.
+///
+/// ⛔ THE SECOND GUARD IS THE AFFINE-NESS ONE AND IT COMES BEFORE EVERY CANONICALISATION: with
+/// neither side dimension-free the product is not affine, and MLIR returns null immediately rather
+/// than trying to pick a multiplier. Reordering it after the swap would recurse forever on `d0 * d1`.
+fn fold_mul(lhs: AffineExpr, rhs: AffineExpr) -> AffineExpr {
+    if let (AffineExpr::Const(a), AffineExpr::Const(b)) = (&lhs, &rhs) {
+        match a.checked_mul(*b) {
+            Some(product) => return AffineExpr::Const(product),
+            None => return AffineExpr::Mul(Box::new(lhs), Box::new(rhs)),
+        }
+    }
+    if !lhs.is_symbolic_or_constant() && !rhs.is_symbolic_or_constant() {
+        return AffineExpr::Mul(Box::new(lhs), Box::new(rhs));
+    }
+    // "Canonicalize the mul expression so that the constant/symbolic term is the RHS."
+    if !rhs.is_symbolic_or_constant() || matches!(lhs, AffineExpr::Const(_)) {
+        return fold_mul(rhs, lhs);
+    }
+    // "Multiplication with a one is a noop" / "Multiplication with zero."
+    if rhs == AffineExpr::Const(1) {
+        return lhs;
+    }
+    if rhs == AffineExpr::Const(0) {
+        return AffineExpr::Const(0);
+    }
+    if let AffineExpr::Mul(l, l_rhs) = &lhs
+        && let AffineExpr::Const(c) = **l_rhs
+    {
+        // "Fold successive multiplications: eg: (d0 * 2) * 3 into d0 * 6."
+        if let AffineExpr::Const(k) = rhs
+            && let Some(product) = c.checked_mul(k)
+        {
+            return fold_mul((**l).clone(), AffineExpr::Const(product));
+        }
+        // "turn (d0 * 2) * d1 into (d0 * d1) * 2."
+        return fold_mul(fold_mul((**l).clone(), rhs), AffineExpr::Const(c));
+    }
+    AffineExpr::Mul(Box::new(lhs), Box::new(rhs))
+}
+
+/// `lhs mod rhs`, FOLDED — the head of MLIR's `simplifyMod`.
+///
+/// ⛔ A NON-POSITIVE MODULUS IS PRESERVED AS IS, verbatim from the reference: *"mod w.r.t zero or
+/// negative numbers is undefined and preserved as is."* The remainder is the EUCLIDEAN one (MLIR's
+/// own `mod` helper), matching [`terms_in`]'s `rem_euclid`, not Rust's `%`.
+///
+/// ⚠️ NOT TRANSCRIBED: the `getLargestKnownDivisor` folds — `(i * 128) mod 64` to `0`, the
+/// summand-wise reduction, and `(e % a) % b`. Those need a divisor analysis this island has no
+/// reader for; see [`fold_add`] for why the difference is textual.
+fn fold_mod(lhs: AffineExpr, rhs: AffineExpr) -> AffineExpr {
+    if let AffineExpr::Const(d) = rhs
+        && d >= 1
+        && let AffineExpr::Const(n) = lhs
+    {
+        return AffineExpr::Const(n.rem_euclid(d));
+    }
+    AffineExpr::Mod(Box::new(lhs), Box::new(rhs))
+}
+
+/// `lhs floordiv rhs`, FOLDED — the head of MLIR's `simplifyFloorDiv`.
+///
+/// ⛔ A NON-CONSTANT OR ZERO DIVISOR IS PRESERVED AS IS, and the quotient FLOORS
+/// (`divideFloorSigned`), which `div_euclid` gives for a positive divisor and Rust's `/` does not.
+///
+/// ⚠️ NOT TRANSCRIBED: `(i * 128) floordiv 64` to `i * 2` and the summand-wise reduction, for the
+/// same reason as [`fold_mod`].
+fn fold_floordiv(lhs: AffineExpr, rhs: AffineExpr) -> AffineExpr {
+    if let AffineExpr::Const(d) = rhs
+        && d != 0
+    {
+        if let AffineExpr::Const(n) = lhs {
+            return AffineExpr::Const(n.div_euclid(d));
+        }
+        if d == 1 {
+            return lhs;
+        }
+    }
+    AffineExpr::FloorDiv(Box::new(lhs), Box::new(rhs))
 }
 
 /// ONE CONSTRAINT OF AN `affine_set` — an expression that is either zero or non-negative.
@@ -814,6 +1029,111 @@ impl AffineMap {
             results: vec![expr],
         }
     }
+
+    /// `self ∘ inner` — `AffineMap::compose(AffineMap map)`, this map applied to the other's results.
+    ///
+    /// ⛔⛔ THE ARGUMENT IS THE INNER MAP AND THE RESULT TAKES *ITS* DIMENSIONS. `self`'s `d<i>`
+    /// becomes `inner.results[i]`, so the composite is indexed by whatever `inner` is indexed by:
+    /// `(d0,d1) -> (d0*64 + d1)` composed with `(d0,d1,d2) -> (d1, d2)` is
+    /// `(d0,d1,d2) -> (d1*64 + d2)`. Reading the operand as the outer map would compose the pair
+    /// backwards and address the wrong element of every view.
+    ///
+    /// ⛔ THE ARITY PRECONDITION IS MLIR'S `assert(getNumDims() == map.getNumResults())`, and here it
+    /// is a `debug_assert`-free TOTAL function instead: a mismatched position simply keeps itself
+    /// (see [`AffineExpr::replace_dims_and_symbols`]), because this crate never runtime-refuses.
+    /// ⭐ THE CALLER IS WHAT GUARANTEES IT — `getLayoutMapAndIndices` composes a view's `layout_map`
+    /// with the access's own indices map, and the view is the memref the access indexes.
+    ///
+    /// ⛔ THE SYMBOLS CONCATENATE, OUTER FIRST. The result declares `self.syms + inner.syms`; the
+    /// outer map's symbols keep positions `0..self.syms` because `compose` passes no replacement for
+    /// them, and the inner map's `s<j>` is SHIFTED to `s<self.syms + j>`. Both maps numbering from
+    /// zero would make two different values one variable.
+    ///
+    /// ⭐ THE TWO COMPOSES ELSEWHERE IN THE CAMPAIGN ARE `mem_view_layout_map.compose(time_addr_map)`
+    /// (`dialect_utils/Agen/Utils.cpp:103`) and `transfer_order.compose(subscripts_map)`
+    /// (`dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:57-60`). Both of those maps are
+    /// symbol-free, so the shift is unobservable there — and dropping it would make this function
+    /// wrong for the paged-view maps, which are not.
+    #[must_use]
+    pub fn compose(&self, inner: &AffineMap) -> AffineMap {
+        let shifted_syms: Vec<AffineExpr> = (0..inner.syms)
+            .map(|j| AffineExpr::Sym(self.syms + j))
+            .collect();
+        // `newDims[idx] = getAffineDimExpr(idx)` — the identity, so the inner map's dimensions are
+        // rewritten to themselves and only its symbols move.
+        let inner_dims: Vec<AffineExpr> = (0..inner.dims).map(AffineExpr::Dim).collect();
+        let rewritten: Vec<AffineExpr> = inner
+            .results
+            .iter()
+            .map(|r| r.replace_dims_and_symbols(&inner_dims, &shifted_syms))
+            .collect();
+        AffineMap {
+            dims: inner.dims,
+            syms: self.syms + inner.syms,
+            // `expr.compose(newMap)` is `replaceDims(newMap.getResults())` — dimensions only, so the
+            // outer map's own symbols are the ones left in place.
+            results: self
+                .results
+                .iter()
+                .map(|r| r.replace_dims_and_symbols(&rewritten, &[]))
+                .collect(),
+        }
+    }
+
+    /// DROP THE SYMBOLS NOBODY MENTIONS AND RENUMBER THE REST DENSELY — `compressUnusedSymbols`.
+    ///
+    /// ⛔ IT IS `projectSymbols` WITH `compressSymbolsFlag=true` (`AffineMap.cpp:724-731`): each
+    /// symbol position is either replaced by `s<newPos>` with `newPos` counting only the KEPT ones,
+    /// or — for a projected one — by the constant `0`. Only unused symbols are projected here, so no
+    /// zero can appear in the result; the renumbering is the whole observable effect.
+    ///
+    /// ⭐ A NO-OP FOR EVERY MAP THIS BRIDGE COMPOSES, AND THAT IS WORTH SAYING RATHER THAN OMITTING
+    /// THE CALL. `getLayoutMapAndIndices` ends with it, and both of its inputs are printed maps with
+    /// [`syms`](AffineMap::syms)` == 0` — see that field's own note — so the composite has none to
+    /// compress. The reference calls it because a `get_logical_memory_view` MAY carry a parameterised
+    /// layout; leaving it out would make this port right only for the maps we happen to emit today.
+    #[must_use]
+    pub fn compress_unused_symbols(&self) -> AffineMap {
+        let used: Vec<bool> = (0..self.syms)
+            .map(|j| self.results.iter().any(|r| mentions_symbol(r, j)))
+            .collect();
+        let mut next = 0;
+        let replacements: Vec<AffineExpr> = used
+            .iter()
+            .map(|keep| {
+                if *keep {
+                    let at = next;
+                    next += 1;
+                    AffineExpr::Sym(at)
+                } else {
+                    AffineExpr::Const(0)
+                }
+            })
+            .collect();
+        AffineMap {
+            dims: self.dims,
+            syms: next,
+            results: self
+                .results
+                .iter()
+                // ⛔ SYMBOLS ONLY. `projectCommonImpl` calls `e.replaceSymbols(replacements)` for the
+                // symbol instantiation, so the dimensions are untouched and keep their positions.
+                .map(|r| r.replace_dims_and_symbols(&[], &replacements))
+                .collect(),
+        }
+    }
+}
+
+/// DOES ANY LEAF OF `expr` NAME `s<j>`? — the bit `getUnusedSymbolsBitVector` clears.
+fn mentions_symbol(expr: &AffineExpr, j: u32) -> bool {
+    match expr {
+        AffineExpr::Sym(n) => *n == j,
+        AffineExpr::Dim(_) | AffineExpr::Const(_) => false,
+        AffineExpr::Add(a, b)
+        | AffineExpr::Mul(a, b)
+        | AffineExpr::Mod(a, b)
+        | AffineExpr::FloorDiv(a, b) => mentions_symbol(a, j) || mentions_symbol(b, j),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -935,31 +1255,6 @@ fn replace_dims_and_symbols_in(
     }
 }
 
-/// EVERY SYMBOL MOVED UP BY `by` — `AffineMap::shiftSymbols`, the renumbering
-/// `AffineMap::compose` does to keep the two maps' symbol spaces apart.
-fn shift_symbols(expr: &AffineExpr, by: u32) -> AffineExpr {
-    match expr {
-        AffineExpr::Sym(n) => AffineExpr::Sym(n + by),
-        AffineExpr::Dim(_) | AffineExpr::Const(_) => expr.clone(),
-        AffineExpr::Add(a, b) => AffineExpr::Add(
-            Box::new(shift_symbols(a, by)),
-            Box::new(shift_symbols(b, by)),
-        ),
-        AffineExpr::Mul(a, b) => AffineExpr::Mul(
-            Box::new(shift_symbols(a, by)),
-            Box::new(shift_symbols(b, by)),
-        ),
-        AffineExpr::Mod(a, b) => AffineExpr::Mod(
-            Box::new(shift_symbols(a, by)),
-            Box::new(shift_symbols(b, by)),
-        ),
-        AffineExpr::FloorDiv(a, b) => AffineExpr::FloorDiv(
-            Box::new(shift_symbols(a, by)),
-            Box::new(shift_symbols(b, by)),
-        ),
-    }
-}
-
 impl AffineMap {
     /// THIS MAP'S RESULT `result` AS A COEFFICIENT ROW — `agen::utils::getMapCoefficients(coeffs,
     /// map, result)` (`dialect_utils/Agen/Utils.cpp:65-71`).
@@ -1009,40 +1304,6 @@ impl AffineMap {
                 .results
                 .iter()
                 .map(|expr| replace_dims_and_symbols_in(expr, dim_repl, sym_repl))
-                .collect(),
-        }
-    }
-
-    /// `self ∘ other` — `AffineMap::compose(AffineMap map)`: `other`'s results are fed into `self`'s
-    /// dimensions, so the composition takes `other`'s inputs and produces `self`'s results.
-    ///
-    /// ⛔⛔ THE SYMBOL SPACES ARE CONCATENATED, `self`'s FIRST. MLIR renumbers `other`'s symbols to
-    /// start at `self.getNumSymbols()` before substituting, so a symbol of the outer map and a
-    /// symbol of the inner one cannot collide. Both maps in this campaign's uses are symbol-free —
-    /// `mem_view_layout_map.compose(time_addr_map)` (`dialect_utils/Agen/Utils.cpp:103`) and
-    /// `transfer_order.compose(subscripts_map)`
-    /// (`dataflow-scheduler-dialects/lib/Dialect/Agen/Utils.cpp:57-60`) — but dropping the shift
-    /// would make this function wrong for the paged-view maps, which are not.
-    ///
-    /// ⭐ A RESULT COUNT MISMATCH LEAVES `self`'s SURPLUS DIMENSION UNSUBSTITUTED rather than
-    /// aborting: MLIR asserts `getNumDims() == map.getNumResults()`, and a dimension with no
-    /// replacement keeps its own position ([`replace_dims_and_symbols_in`]). The composed map then
-    /// still names a variable of the inner space, which is a shape every downstream reader answers
-    /// "not constant" to — a wrong ANSWER is what an unchecked substitution would produce instead.
-    #[must_use]
-    pub fn compose(&self, other: &AffineMap) -> AffineMap {
-        let shifted: Vec<AffineExpr> = other
-            .results
-            .iter()
-            .map(|expr| shift_symbols(expr, self.syms))
-            .collect();
-        AffineMap {
-            dims: other.dims,
-            syms: self.syms + other.syms,
-            results: self
-                .results
-                .iter()
-                .map(|expr| replace_dims_and_symbols_in(expr, &shifted, &[]))
                 .collect(),
         }
     }
@@ -1936,6 +2197,133 @@ mod tests {
         assert_eq!(
             system.remove_redundant_constraints().inequalities,
             vec![vec![0, -1], vec![1, 0]]
+        );
+    }
+
+    /// ⭐⭐ THE COMPOSE THE VENDOR'S OWN VIEW AND SUBSCRIPT PAIR PERFORMS.
+    ///
+    /// `#map = affine_map<(d0, d1) -> (d0 * 64 + d1)>` is the `layout_map` of a `4x64` view, and a
+    /// store subscripted `[%c0, %arg]` over a three-deep nest has an `affine_map` picking two of its
+    /// three iterators. The composite is indexed by the NEST, not by the view — which is the whole
+    /// reason `getLayoutMapAndIndices` returns the operands of the ACCESS beside the composed map.
+    #[test]
+    fn a_layout_composed_with_a_subscript_is_indexed_by_the_nest() {
+        let layout = AffineMap::linear(&[1, 64]);
+        let subscripts = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![AffineExpr::dim(2), AffineExpr::dim(1)],
+        };
+        let composed = layout.compose(&subscripts);
+        assert_eq!(composed.dims, 3);
+        assert_eq!(composed.syms, 0);
+        assert_eq!(
+            composed.results,
+            vec![AffineExpr::dim(2).plus(AffineExpr::dim(1).times(64))]
+        );
+    }
+
+    /// ⛔⛔ COMPOSING WITH THE IDENTITY ORDER MAP RETURNS THE OTHER MAP UNTOUCHED, node for node.
+    ///
+    /// `indices_map = order_map.compose(indices_map)` is the first of the two composes in
+    /// `getLayoutMapAndIndices`, and every access this island can state carries the identity order
+    /// (see [`AffineMap::identity`]). The unchanged-children guard is what makes this exact rather
+    /// than merely equivalent: no binary node is rebuilt, so no fold runs and nothing is renormalised.
+    #[test]
+    fn the_identity_order_map_composes_to_the_subscripts_verbatim() {
+        let subscripts = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(1).times(3).plus(AffineExpr::Const(7)),
+                AffineExpr::dim(0),
+            ],
+        };
+        assert_eq!(AffineMap::identity(2).compose(&subscripts), subscripts);
+    }
+
+    /// ⛔ A CONSTANT SUBSCRIPT FOLDS THROUGH THE STRIDE, and this is the one shape where the compose
+    /// MUST fold to print what the reference prints: `#map3 = affine_map<(d0) -> (0, 0, 0)>` is a real
+    /// time-address map in the scheduler's output, and `0 * 64 + 0` composed into a layout has to
+    /// arrive as `0`. `getConstantBound` reads a literal row; a `Mul` of two literals is not one.
+    #[test]
+    fn a_constant_subscript_folds_to_a_literal_offset() {
+        let composed = AffineMap::linear(&[1, 64]).compose(&AffineMap::constants(1, &[0, 0]));
+        assert_eq!(composed.results, vec![AffineExpr::Const(0)]);
+
+        let offset = AffineMap::linear(&[1, 64]).compose(&AffineMap {
+            dims: 1,
+            syms: 0,
+            results: vec![AffineExpr::Const(3), AffineExpr::Const(2)],
+        });
+        assert_eq!(offset.results, vec![AffineExpr::Const(131)]);
+    }
+
+    /// ⛔ THE INNER MAP'S SYMBOLS SHIFT PAST THE OUTER MAP'S, so two `s0`s do not become one variable.
+    #[test]
+    fn composing_concatenates_the_symbols_outer_first() {
+        let outer = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::dim(0).plus(AffineExpr::sym(0))],
+        };
+        let inner = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::sym(0)],
+        };
+        let composed = outer.compose(&inner);
+        assert_eq!(composed.syms, 2);
+        assert_eq!(
+            composed.results,
+            // `s1` is the INNER map's symbol; `s0` is still the outer's.
+            vec![AffineExpr::sym(1).plus(AffineExpr::sym(0))]
+        );
+    }
+
+    /// ⭐ `compressUnusedSymbols` RENUMBERS DENSELY AND IS A NO-OP ON A SYMBOL-FREE MAP — the two
+    /// cases `getLayoutMapAndIndices` can reach.
+    #[test]
+    fn compressing_symbols_renumbers_only_the_ones_that_are_used() {
+        let sparse = AffineMap {
+            dims: 1,
+            syms: 3,
+            results: vec![AffineExpr::dim(0).plus(AffineExpr::sym(2))],
+        };
+        let compressed = sparse.compress_unused_symbols();
+        assert_eq!(compressed.syms, 1);
+        assert_eq!(
+            compressed.results,
+            vec![AffineExpr::dim(0).plus(AffineExpr::sym(0))]
+        );
+
+        let plain = AffineMap::linear(&[1, 64]);
+        assert_eq!(plain.compress_unused_symbols(), plain);
+    }
+
+    /// ⛔ A PRODUCT OF TWO DIMENSIONS IS BUILT, NOT REWRITTEN — MLIR's affine-ness guard. Without it
+    /// `fold_mul`'s canonicalisation would swap the operands forever.
+    #[test]
+    fn a_product_of_two_dimensions_is_left_alone() {
+        let outer = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::Mul(
+                Box::new(AffineExpr::dim(0)),
+                Box::new(AffineExpr::dim(1)),
+            )],
+        };
+        let composed = outer.compose(&AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![AffineExpr::dim(1), AffineExpr::dim(0)],
+        });
+        assert_eq!(
+            composed.results,
+            vec![AffineExpr::Mul(
+                Box::new(AffineExpr::dim(1)),
+                Box::new(AffineExpr::dim(0))
+            )]
         );
     }
 }

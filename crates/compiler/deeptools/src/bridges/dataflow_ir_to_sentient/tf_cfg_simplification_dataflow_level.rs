@@ -194,6 +194,7 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
             | DfirOp::Scf(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => {}
         }

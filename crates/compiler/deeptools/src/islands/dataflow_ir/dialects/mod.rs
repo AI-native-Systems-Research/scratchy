@@ -20,6 +20,7 @@ pub mod arith;
 pub mod dataflow;
 pub mod scf;
 pub mod symbol;
+pub mod vector;
 pub mod vectorchain;
 
 use crate::islands::dataflow_ir::Values;
@@ -70,6 +71,8 @@ pub enum Op {
     Scf(scf::Op),
     /// Upstream `affine` — the loop nest, the applied maps, and `dcc-opt`'s vector accesses.
     Affine(affine::Op),
+    /// Upstream `vector` — the two plain accesses the vectorchain lowerings still read.
+    Vector(vector::Op),
     /// `Dataflow.td` — units, views, transfers between units, and the opaque bodies.
     Dataflow(dataflow::Op),
     /// `Agen.td` — the address-generator's accesses and composite transfers.
@@ -242,6 +245,23 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 index_operands(&transfer.dst_indices, &mut reads);
             }
         },
+        // ⭐ `$base` AND `$indices`, WHICH IS ALL A PLAIN ACCESS HAS. Same operand list as the
+        // `agen` pair above; what it lacks is the two attributes, not the operands.
+        Op::Vector(op) => match op {
+            vector::Op::Load { base, indices, .. } => {
+                reads.push(*base);
+                index_operands(indices, &mut reads);
+            }
+            vector::Op::Store {
+                value,
+                base,
+                indices,
+                ..
+            } => {
+                reads.extend([*value, *base]);
+                index_operands(indices, &mut reads);
+            }
+        },
         Op::VectorChain(op) => match op {
             vectorchain::Op::ConstantBitstream { .. }
             | vectorchain::Op::CreateAffineMask { .. } => {}
@@ -285,6 +305,11 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend([*op1, *op2]);
                 reads.extend(mask.map(|m| m.val()));
             }
+            // ⭐ THE ONE UNARY OP WITH A MASK — see [`vectorchain::Op::Neg`].
+            vectorchain::Op::Neg { input, mask, .. } => {
+                reads.push(*input);
+                reads.extend(mask.map(|m| m.val()));
+            }
             // ⛔ NO MASK — a merge states its two sides as iteration spaces, and those are
             // attributes and not operands (`VectorChain.td:164-185`).
             vectorchain::Op::Merge { op1, op2, .. } => reads.extend([*op1, *op2]),
@@ -317,6 +342,11 @@ pub fn results(op: &Op) -> Vec<Val> {
         // a lowered loop's bound ends at either an `arith.constant` or this op
         // (`LoweringXRF.cpp:278-288`), which it can only do if this walk answers for it.
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![*result],
+        // ⭐ A LOAD BINDS ITS VECTOR AND A STORE BINDS NOTHING — `results = (outs
+        // AnyVectorOfAnyRank:$result)` on `Vector_LoadOp`, and no `results` block at all on
+        // `Vector_StoreOp`.
+        Op::Vector(vector::Op::Load { result, .. }) => vec![*result],
+        Op::Vector(vector::Op::Store { .. }) => Vec::new(),
         Op::Scf(op) => match op {
             // ⭐ A CARRYING `scf.for` BINDS RESULTS, one per `iter_args` entry — the reference's own
             // input to `TransformLoopToLegalizeForSentientLowering` is
@@ -371,6 +401,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             vectorchain::Op::Estimate { result, .. }
             | vectorchain::Op::FastExp { result, .. }
             | vectorchain::Op::Floor { result, .. }
+            | vectorchain::Op::Neg { result, .. }
             | vectorchain::Op::ScanWithGap { result, .. }
             | vectorchain::Op::Select { result, .. }
             | vectorchain::Op::Multiply { result, .. }
@@ -529,6 +560,22 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 index_operands_mut(&mut transfer.dst_indices, &mut places);
             }
         },
+        // ⭐ ARM FOR ARM WITH [`operands`] — see the note there.
+        Op::Vector(op) => match op {
+            vector::Op::Load { base, indices, .. } => {
+                places.push(base);
+                index_operands_mut(indices, &mut places);
+            }
+            vector::Op::Store {
+                value,
+                base,
+                indices,
+                ..
+            } => {
+                places.extend([value, base]);
+                index_operands_mut(indices, &mut places);
+            }
+        },
         Op::VectorChain(op) => match op {
             vectorchain::Op::ConstantBitstream { .. }
             | vectorchain::Op::CreateAffineMask { .. } => {}
@@ -540,6 +587,9 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             vectorchain::Op::Estimate { input, .. }
             | vectorchain::Op::FastExp { input, .. }
             | vectorchain::Op::Floor { input, .. }
+            // ⛔ ITS MASK IS ABSENT HERE FOR THE SAME REASON THE ELEMENTWISE FAMILY'S IS — see the
+            // exclusions above.
+            | vectorchain::Op::Neg { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Shuffle { input, .. }
@@ -584,6 +634,8 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             }
         },
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![result],
+        Op::Vector(vector::Op::Load { result, .. }) => vec![result],
+        Op::Vector(vector::Op::Store { .. }) => Vec::new(),
         Op::Scf(_) => Vec::new(),
         Op::Affine(op) => match op {
             affine::Op::For { carried, .. } => carried
@@ -624,6 +676,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             vectorchain::Op::Estimate { result, .. }
             | vectorchain::Op::FastExp { result, .. }
             | vectorchain::Op::Floor { result, .. }
+            | vectorchain::Op::Neg { result, .. }
             | vectorchain::Op::ScanWithGap { result, .. }
             | vectorchain::Op::Select { result, .. }
             | vectorchain::Op::Multiply { result, .. }
@@ -706,6 +759,7 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         | Op::Scf(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
+        | Op::Vector(_)
         | Op::VectorChain(_)
         | Op::Symbol(_) => Vec::new(),
     }
@@ -735,6 +789,7 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         | Op::Scf(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
+        | Op::Vector(_)
         | Op::VectorChain(_)
         | Op::Symbol(_) => Vec::new(),
     }
@@ -771,6 +826,7 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         | Op::Scf(_)
         | Op::Dataflow(_)
         | Op::Agen(_)
+        | Op::Vector(_)
         | Op::VectorChain(_)
         | Op::Symbol(_) => Vec::new(),
     }
@@ -1007,6 +1063,28 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 regions.push(&mut transfer.body);
             }
         },
+        // ⭐ NO REGION AND NO BLOCK ARGUMENT — arm for arm with [`operands_mut`] and [`results_mut`].
+        Op::Vector(op) => match op {
+            vector::Op::Load {
+                result,
+                base,
+                indices,
+                ..
+            } => {
+                operands.push(base);
+                index_operands_mut(indices, &mut operands);
+                results.push(result);
+            }
+            vector::Op::Store {
+                value,
+                base,
+                indices,
+                ..
+            } => {
+                operands.extend([value, base]);
+                index_operands_mut(indices, &mut operands);
+            }
+        },
         Op::VectorChain(op) => match op {
             // ⭐ THE PARAMETER IS AN OPERAND AND THE MASK IS THE RESULT — see [`operands_mut`].
             vectorchain::Op::CreateAffineMaskSet {
@@ -1022,6 +1100,7 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             vectorchain::Op::Estimate { result, input, .. }
             | vectorchain::Op::FastExp { result, input, .. }
             | vectorchain::Op::Floor { result, input, .. }
+            | vectorchain::Op::Neg { result, input, .. }
             | vectorchain::Op::ScanWithGap { result, input, .. }
             | vectorchain::Op::Select { result, input, .. }
             | vectorchain::Op::Shuffle { result, input, .. }
@@ -1463,6 +1542,29 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::BlockArg, &mut transfer.load_iv));
             }
         },
+        // ⭐ ARM FOR ARM WITH [`parts_mut`]; a plain access binds no block argument.
+        Op::Vector(op) => match op {
+            vector::Op::Load {
+                result,
+                base,
+                indices,
+                ..
+            } => {
+                vals.push((Role::Operand, base));
+                index_vals_mut(indices, &mut vals);
+                vals.push((Role::Result, result));
+            }
+            vector::Op::Store {
+                value,
+                base,
+                indices,
+                ..
+            } => {
+                vals.push((Role::Operand, value));
+                vals.push((Role::Operand, base));
+                index_vals_mut(indices, &mut vals);
+            }
+        },
         Op::VectorChain(op) => match op {
             vectorchain::Op::ConstantBitstream { result, .. }
             | vectorchain::Op::CreateAffineMask { result, .. } => {
@@ -1483,6 +1585,7 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             | vectorchain::Op::Shuffle { result, input, .. }
             | vectorchain::Op::FastExp { result, input, .. }
             | vectorchain::Op::Floor { result, input, .. }
+            | vectorchain::Op::Neg { result, input, .. }
             | vectorchain::Op::Cast { result, input, .. } => {
                 vals.push((Role::Operand, input));
                 vals.push((Role::Result, result));

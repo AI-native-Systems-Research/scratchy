@@ -241,6 +241,12 @@ pub fn legality(op: &DfirOp) -> Legality {
             | vc::Op::ElementWiseSelection { .. }
             | vc::Op::Shuffle { .. }
             | vc::Op::Select { .. }
+            // ⛔ A NEGATION IS LEGAL HERE AND THAT IS NOT AN OVERSIGHT: this pass FOLDS one into the
+            // FMA it feeds rather than converting it — `dyn_cast<vectorchain::NegOp>` on the
+            // multiply's two inputs, `VectorChainToSentientPESFP.cpp:534-536` — so a `vectorchain.neg`
+            // whose consumer took it is already gone, and one whose consumer did not survives the
+            // conversion. No `NegOpLowering` exists; see [`installed_pattern`].
+            | vc::Op::Neg { .. }
             | vc::Op::Merge { .. }
             | vc::Op::ConstantBitstream { .. }
             | vc::Op::Rotate { .. }
@@ -256,6 +262,10 @@ pub fn legality(op: &DfirOp) -> Legality {
         | DfirOp::Scf(_)
         | DfirOp::Dataflow(_)
         | DfirOp::Agen(_)
+        // ⭐ `vector` IS UNNAMED BY BOTH LISTS — neither `addLegalDialect<arith, sentient, dataflow,
+        // memref, uniform, symbol>` (`:1257-1261`) nor the thirteen-op `addIllegalOp` mentions it, and
+        // an op a partial conversion never declares illegal survives untouched.
+        | DfirOp::Vector(_)
         | DfirOp::Symbol(_) => Legality::Legal,
     }
 }
@@ -286,6 +296,10 @@ pub fn installed_pattern(op: &DfirOp) -> Option<ComputePattern> {
         vc::Op::ScanWithGap { .. } => Some(ComputePattern::ScanWithGapOpLowering),
         vc::Op::FastExp { .. } => Some(ComputePattern::FastExpOpLowering),
         vc::Op::Floor { .. } => Some(ComputePattern::FloorOpLowering),
+        // ⛔ NO `NegOpLowering` IS INSTALLED. `compute_ops_patterns.insert<…>` never names `NegOp`,
+        // and grep over `dcc/src` finds no such class; the negation reaches sentient as the FMA
+        // fusion at `:534-536`, not as a pattern of its own.
+        vc::Op::Neg { .. } => None,
         vc::Op::Estimate { kind, .. } => Some(match kind {
             vc::EstimateKind::Exp => ComputePattern::ExpEstimateOpLowering,
             vc::EstimateKind::Rec => ComputePattern::RecEstimateOpLowering,

@@ -169,6 +169,7 @@ fn unit_bound_by(unit: Val, scope: &[DfirOp]) -> Option<(FoldId, Residency)> {
             | DfirOp::Arith(_)
             | DfirOp::Affine(_)
             | DfirOp::Scf(_)
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             // ⭐ `symbol` HERE TOO: a `symbol.create_symbol` result is an `index`, not the `!ddl.unit`
             // a `program_unit` operand is, so it is one more `dyn_cast<GetUnitOp>` null.
@@ -379,6 +380,13 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
         | DfirOp::Arith(_)
         | DfirOp::Affine(_)
         | DfirOp::Scf(_)
+        // ⛔⛔ AND NEITHER IS `vector.load`/`vector.store`, WHICH IS THE ANSWER TO WATCH HERE. The
+        // `isa<>` list is nineteen `dataflow` and `agen` classes; upstream's plain accesses are in
+        // none of them, so unit filtering does not treat one as data movement. They are also not a
+        // form the scheduler produces (see
+        // [`vector`](crate::islands::dataflow_ir::dialects::vector)), so no transfer of an emitted
+        // program is dropped by this answer.
+        | DfirOp::Vector(_)
         | DfirOp::VectorChain(_)
         // ⭐ `symbol.create_symbol` IS NOT IN THE NINETEEN-CLASS `isa<>` LIST EITHER. It binds a
         // scalar the schedule fixes later; nothing crosses a datapath because of it.

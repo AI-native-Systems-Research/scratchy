@@ -569,6 +569,10 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
         | DfirOp::Scf(_)
         | DfirOp::Affine(_)
         | DfirOp::Dataflow(_)
+        // ⭐ A `vector.load` IS NOT AN `agen` OP. Upstream's plain access is a different dialect's
+        // operation however much it reads like `agen.vector_load`, and every `isa<>` in
+        // `AgenToSentient` names the `agen` classes only.
+        | DfirOp::Vector(_)
         | DfirOp::VectorChain(_)
         | DfirOp::Symbol(_) => None,
     }
@@ -651,6 +655,11 @@ impl AgenLoad {
             | DfirOp::Scf(_)
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
+            // ⛔ AND `vector.load` IS NOT ONE OF THE FIVE EITHER. `getLoadConsumer`'s roots are
+            // `isa<VectorLoadOp, IndirectVectorLoadOp, SymbolicVectorLoadOp>` plus the two composite
+            // loads (`Conversion/AgenToSentient/Helper.cpp:1245-1250`) — all `agen`, no upstream
+            // `vector::LoadOp` anywhere in the chain.
+            | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
             | DfirOp::Symbol(_) => None,
         }
@@ -695,6 +704,12 @@ impl Rearrangement {
                 // ⛔ A PACK IS NOT A REARRANGEMENT, however much it looks like one: `getLoadConsumer`
                 // names `SelectOp`, `ShuffleOp` and `RotateOp` and stops (`Helper.cpp:1268-1270`), so
                 // a load feeding a pack has no consumer by this rule.
+                // ⛔ AND NEITHER IS A NEGATION, THOUGH THE REFERENCE DOES PAIR IT WITH A SELECT
+                // ELSEWHERE: `isa<…, vectorchain::NegOp, vectorchain::SelectOp>(user)` is a DIFFERENT
+                // test in a DIFFERENT function (`VectorChainToSentientPT.cpp:302`,
+                // `VectorOperands.cpp:706` and `:761`). `getLoadConsumer`'s three are Select, Shuffle
+                // and Rotate and it stops there.
+                | dfir_op::vectorchain::Op::Neg { .. }
                 | dfir_op::vectorchain::Op::Pack { .. }
                 | dfir_op::vectorchain::Op::Merge { .. }
                 | dfir_op::vectorchain::Op::CreateAffineMask { .. }
@@ -705,6 +720,8 @@ impl Rearrangement {
             | DfirOp::Affine(_)
             | DfirOp::Dataflow(_)
             | DfirOp::Agen(_)
+            // ⭐ NOT A REARRANGEMENT: the three are `vectorchain` ops.
+            | DfirOp::Vector(_)
             | DfirOp::Symbol(_) => None,
         }
     }
