@@ -1032,6 +1032,24 @@ pub fn transform_loop(
     }
 }
 
+/// Replaces: e257_analyzeAndTransform
+///
+/// **257/384** `TransformLoopToLegalizeForSentientLowering::analyzeAndTransform` —
+/// `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:440` (5L).
+///
+/// ⭐ THE WHOLE FUNCTION IS THE PAIRING, AND IT IS WHY ENTRY 195'S SILENT ARMS ARE UNREACHABLE:
+/// `transformLoop` is only ever handed `analyzeLoop`'s answer for the SAME op, so the affine/
+/// `KSplitParent` and non-constant/`KUnroll` combinations [`transform_loop`] documents cannot arrive.
+#[must_use]
+pub fn analyze_and_transform(
+    loop_op: &LoopUnderAnalysis<'_>,
+    curr_unit: GenericComp,
+    scope: &[DfirOp],
+) -> LoopRewrite {
+    // `auto type = analyzeLoop(loop_op); transformLoop(loop_op, type);`
+    transform_loop(loop_op, analyze_loop(loop_op, curr_unit, scope), scope)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -2435,5 +2453,28 @@ mod unit_tests {
             rewrite_of_scf(Some(0), Some(4), Some(0), LoopTransform::Unroll),
             LoopRewrite::Nothing
         );
+    }
+
+    /// The two vendor files that differ ONLY in their unit, taken end to end.
+    ///
+    /// `l3lu_disable_transformation.mlir` reproduces its input and `memory-dyn-loops.mlir` splits the
+    /// parent (`:41-56`); the same loop, the same `arith.select` bound, the same memory user.
+    #[test]
+    fn the_vendors_two_units_take_the_same_loop_to_different_rewrites() {
+        for (unit, expected) in [
+            (GenericComp::L3lu, LoopRewrite::Nothing),
+            (DfirUnit::L0lu.generic(), LoopRewrite::SplitParent),
+        ] {
+            let mut vals = Values::default();
+            let scope = program(&mut vals, Case::VENDOR);
+            let loop_op =
+                LoopUnderAnalysis::of(scope.last().expect("the fixture's last op is its loop"))
+                    .expect("the fixture's loop is one of the two forms");
+            assert_eq!(
+                analyze_and_transform(&loop_op, unit, &scope),
+                expected,
+                "{unit:?}"
+            );
+        }
     }
 }

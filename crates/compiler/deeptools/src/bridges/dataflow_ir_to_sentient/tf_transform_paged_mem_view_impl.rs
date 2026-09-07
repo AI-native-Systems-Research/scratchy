@@ -111,7 +111,7 @@ use crate::islands::dataflow_ir::dialects::{
     self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results, scf, uses,
 };
 use crate::islands::dataflow_ir::ty::{
-    AffineExpr, AffineMap, IntegerSet, MemRef, ScalarTy, Vector,
+    AffineExpr, AffineMap, Constraint, IntegerSet, MemRef, ScalarTy, Vector,
 };
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::units::DfirUnit;
@@ -4636,6 +4636,112 @@ scf.if %3 {
         assert_eq!(vec![Val(1), Val(20), Val(21)], info.indices);
         assert_eq!(MemoryOperandIndex::DirSrc, info.mem_index);
     }
+
+    /// A `>= 0` inequality for each end of each iterator's range, and nothing at all when the page's
+    /// constraints carry no symbol to bound.
+    #[test]
+    fn each_iterator_symbol_gains_its_two_bounds() {
+        let mut page_sel = IntegerSet {
+            dims: 0,
+            symbols: 2,
+            constraints: vec![],
+        };
+        add_constraints_for_iv_ranges(
+            &mut page_sel,
+            &[IvRange { lb: 0, ub: 7 }, IvRange { lb: 2, ub: 3 }],
+        );
+        assert_eq!(
+            vec![
+                // `s0 - 0` is `s0`, the `+ 0` folding away as it does in MLIR.
+                AffineExpr::sym(0),
+                AffineExpr::sym(0).times(-1).plus(AffineExpr::Const(7)),
+                AffineExpr::sym(1).plus(AffineExpr::Const(-2)),
+                AffineExpr::sym(1).times(-1).plus(AffineExpr::Const(3)),
+            ],
+            page_sel
+                .constraints
+                .iter()
+                .map(|constraint| constraint.expr.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(page_sel.constraints.iter().all(|c| !c.is_equality));
+
+        // `if (num_syms == 0) return;` — a constant subscript has no iterator to bound.
+        let mut no_syms = IntegerSet {
+            dims: 0,
+            symbols: 0,
+            constraints: vec![],
+        };
+        add_constraints_for_iv_ranges(&mut no_syms, &[IvRange { lb: 0, ub: 7 }]);
+        assert!(no_syms.constraints.is_empty());
+    }
+
+    /// The subscripts, rebased on the page's first element — and a start element of zero leaves its
+    /// subscript exactly as it was.
+    #[test]
+    fn the_subscripts_are_rebased_on_the_pages_start_elements() {
+        assert_eq!(
+            AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![
+                    AffineExpr::dim(0).plus(AffineExpr::Const(3)),
+                    AffineExpr::dim(1),
+                ],
+            },
+            create_new_subscripts_from_start_elements(
+                &AffineMap {
+                    dims: 2,
+                    syms: 0,
+                    results: vec![
+                        AffineExpr::dim(0).plus(AffineExpr::Const(5)),
+                        AffineExpr::dim(1),
+                    ],
+                },
+                &[StartElement(2), StartElement(0)]
+            )
+        );
+    }
+
+    /// Two pages whose rows differ in one inequality and one equality, the two sets listing their
+    /// constraints in DIFFERENT orders — which is what the reference's kind-by-kind walk pairs.
+    #[test]
+    fn only_the_symbols_of_a_moved_constraint_select_the_page() {
+        let ineq = |expr: AffineExpr| Constraint {
+            expr,
+            is_equality: false,
+        };
+        let eq = |expr: AffineExpr| Constraint {
+            expr,
+            is_equality: true,
+        };
+        let page_sel = IntegerSet {
+            dims: 0,
+            symbols: 3,
+            constraints: vec![
+                eq(AffineExpr::sym(1).plus(AffineExpr::Const(-2))),
+                ineq(AffineExpr::sym(0).plus(AffineExpr::Const(-4))),
+                ineq(AffineExpr::sym(2)),
+            ],
+        };
+        let compare = IntegerSet {
+            dims: 0,
+            symbols: 3,
+            constraints: vec![
+                ineq(AffineExpr::sym(0).plus(AffineExpr::Const(-8))),
+                ineq(AffineExpr::sym(2)),
+                eq(AffineExpr::sym(1).plus(AffineExpr::Const(-3))),
+            ],
+        };
+
+        let mut page_dependent_time_syms = BTreeSet::new();
+        gather_page_dependent_dims_for_page(&page_sel, &compare, &mut page_dependent_time_syms);
+        // `s0`'s inequality and `s1`'s equality moved; `s2`'s inequality did not.
+        assert_eq!(
+            BTreeSet::from([PageSelSym(0), PageSelSym(1)]),
+            page_dependent_time_syms
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -4820,5 +4926,122 @@ impl<'p> TpmvVectorLoad<'p> {
         info.indices = indices;
 
         self.vector.base.tpmv_info.push(info);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 258/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e258_addConstraintsForIVRanges
+///
+/// **258/384** `TPMVBase::addConstraintsForIVRanges` — one pair of inequalities per symbol,
+/// `s<i> - lb >= 0` and `-s<i> + ub >= 0`, appended to the page's own constraints.
+///
+/// ⭐ THE APPENDED SET'S SPACE MATCHES BECAUSE THE PAGE'S DIMS ARE ALREADY GONE: `getPageValidity`
+/// substitutes the subscripts into `page_set` with `replaceDimsAndSymbols(.., 0, getNumSymbols())`
+/// (`:121-126`), leaving ZERO dims and one symbol per loop iterator — which is also what makes
+/// `indices_ranges[sym_idx]` the range OF symbol `sym_idx`, in [`calculate_indices_ranges`]' order.
+pub fn add_constraints_for_iv_ranges(
+    page_sel_constraints: &mut IntegerSet,
+    indices_ranges: &[IvRange],
+) {
+    // `int num_syms = page_sel_constraints.getNumSymbolVars(); if (num_syms == 0) return;`
+    let ranges = indices_ranges
+        .iter()
+        .take(page_sel_constraints.symbols as usize);
+
+    for (sym_idx, range) in (0u32..).zip(ranges) {
+        let sym_expr = AffineExpr::sym(sym_idx);
+        // `<sym> - <lb> >= 0`, the pair's first element being the lower bound.
+        page_sel_constraints.constraints.push(Constraint {
+            expr: sym_expr.clone().added(AffineExpr::Const(-range.lb)),
+            is_equality: false,
+        });
+        // `-<sym> + <ub> >= 0`, the second being the inclusive upper bound.
+        page_sel_constraints.constraints.push(Constraint {
+            expr: sym_expr.scaled(-1).added(AffineExpr::Const(range.ub)),
+            is_equality: false,
+        });
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 259/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e259_createNewSubscriptsFromStartElements
+///
+/// **259/384** `TPMVBase::createNewSubscriptsFromStartElements` — every subscript less the page's
+/// start element in that dimension, over the input map's dims and ⛔ NO symbols.
+///
+/// ⚠️ `DT_CHECK(start_elements.size() >= subscripts_map.getNumResults())` IS THE PAIRING: the
+/// elements are [`calculate_start_elements_for_page`]'s, one per span of the page rectangle, and the
+/// map has one result per subscript of the access that reads it.
+#[must_use]
+pub fn create_new_subscripts_from_start_elements(
+    subscripts_map: &AffineMap,
+    start_elements: &[StartElement],
+) -> AffineMap {
+    AffineMap {
+        dims: subscripts_map.dims,
+        // `AffineMap::get(subscripts_map.getNumDims(), 0, ..)`.
+        syms: 0,
+        results: subscripts_map
+            .results
+            .iter()
+            .zip(start_elements)
+            // `subscripts_map.getResult(dim) - start_elements[dim]`.
+            .map(|(result, start)| result.clone().added(AffineExpr::Const(-start.0)))
+            .collect(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 260/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e260_gatherPageDependentDimsForPage
+///
+/// **260/384** `TPMVComposite::gatherPageDependentDimsForPage` — a symbol carried by a constraint
+/// whose CONSTANT column moved from one page to the next has a bearing on page selection.
+///
+/// ⛔ BOTH `DT_CHECK`s BECOME THE PAIRING: the row counts by zipping each kind's rows in the
+/// reference's own two passes, and `compare_ineq[sym] == ineq[sym]` by requiring the two coefficients
+/// to agree before the symbol counts. Under the premise the reference asserts, the same insertions.
+pub fn gather_page_dependent_dims_for_page(
+    page_sel_constraints: &IntegerSet,
+    compare_constraints: &IntegerSet,
+    page_dependent_time_syms: &mut BTreeSet<PageSelSym>,
+) {
+    // `getInequality(i)` then `getEquality(i)` — two loops, so a row is only ever compared with a row
+    // of its own kind, whatever order the set lists them in.
+    for is_equality in [false, true] {
+        let rows = |set: &IntegerSet| {
+            set.constraints
+                .iter()
+                .filter(|constraint| constraint.is_equality == is_equality)
+                .map(|constraint| constraint.expr.flatten(set.dims, set.symbols))
+                .collect::<Vec<_>>()
+        };
+
+        for (row, compare_row) in rows(page_sel_constraints)
+            .into_iter()
+            .zip(rows(compare_constraints))
+        {
+            // `if (compare_ineq[const_col] != ineq[const_col])` — the coefficients are the same
+            // across pages, so a constraint that moved moved in its constant column.
+            if row.constant == compare_row.constant {
+                continue;
+            }
+            for (sym, (coeff, compare_coeff)) in
+                (0u32..).zip(row.syms.iter().zip(&compare_row.syms))
+            {
+                // `if (ineq[sym] != 0) page_dependent_time_syms_.insert(sym);`
+                if *coeff != 0 && coeff == compare_coeff {
+                    page_dependent_time_syms.insert(PageSelSym(sym));
+                }
+            }
+        }
     }
 }

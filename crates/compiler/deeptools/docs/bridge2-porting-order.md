@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`178/384 ported; 178/384 audited`
+`186/384 ported; 186/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -285,6 +285,14 @@ names it). ⚠️ A tree built through the second must not be searched with `fin
   lines) is in no batch and on no exclusion list. Entry 099 is the DESTRUCTOR at `:78`. The
   constructor is where `is_candidate_` is decided and where `num_iterations` sizes the array, so
   without it the destructor has nothing to own.
+
+⛔ **THREE MORE SCOPE HOLES, ALL UNDER ENTRY 261 AND ALL IN `dcc/src/Dialect/Uniform/Utils.cpp`.**
+`UniformQueryMapsCanonicalization.cpp:59` calls `simplifyQueryMapWithSameTarget` (`:1263`), which is
+the WHOLE of what the pass does to a query map — the pass without it only erases — and which in turn
+calls `getRegionOpAndIndex` (`:343`) and `getUnitsOfRegion` (`:526`). None of the three is in the 384
+or in the 106 exclusions. All three are written unanchored beside entry 261's port, the last of them
+narrowed to the two region-owning ops this island carries: the reference's walk also stops at a
+`uniform.equalize_pattern`, which `islands/dataflow_ir/dialects/uniform.rs` deliberately omits.
 
 ⭐ 001/384 MOVED TO ITS OWN TRANSLATION UNIT'S HOME: `lower_affine_yield` was living in
 `dataflow_ir_to_sentient/mod.rs`, and `crustify/crates.json` homes `e001_matchAndRewrite` in
@@ -1392,22 +1400,22 @@ is a field on the returned record instead of an attribute on the emitted op.
 - [ ] **AUDIT 252/384** `fillPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1063`, line by line against the C++
 - [ ] **PORT 253/384** `adjustForEvenImmutableAddr` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1204`, 47 lines
 - [ ] **AUDIT 253/384** `adjustForEvenImmutableAddr` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1204`, line by line against the C++
-- [ ] **PORT 254/384** `offsetShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:590`, 22 lines
-- [ ] **AUDIT 254/384** `offsetShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:590`, line by line against the C++
-- [ ] **PORT 255/384** `applyShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:616`, 27 lines
-- [ ] **AUDIT 255/384** `applyShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:616`, line by line against the C++
-- [ ] **PORT 256/384** `runOnOperation` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:152`, 76 lines
-- [ ] **AUDIT 256/384** `runOnOperation` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:152`, line by line against the C++
-- [ ] **PORT 257/384** `analyzeAndTransform` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441`, 3 lines
-- [ ] **AUDIT 257/384** `analyzeAndTransform` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441`, line by line against the C++
-- [ ] **PORT 258/384** `addConstraintsForIVRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:86`, 22 lines
-- [ ] **AUDIT 258/384** `addConstraintsForIVRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:86`, line by line against the C++
-- [ ] **PORT 259/384** `createNewSubscriptsFromStartElements` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:562`, 10 lines
-- [ ] **AUDIT 259/384** `createNewSubscriptsFromStartElements` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:562`, line by line against the C++
-- [ ] **PORT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, 32 lines
-- [ ] **AUDIT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, line by line against the C++
-- [ ] **PORT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, 41 lines
-- [ ] **AUDIT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, line by line against the C++
+- [x] **PORT 254/384** `offsetShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:590`, 22 lines
+- [x] **AUDIT 254/384** `offsetShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:590`, line by line against the C++
+- [x] **PORT 255/384** `applyShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:616`, 27 lines
+- [x] **AUDIT 255/384** `applyShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:616`, line by line against the C++
+- [x] **PORT 256/384** `runOnOperation` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:152`, 76 lines
+- [x] **AUDIT 256/384** `runOnOperation` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:152`, line by line against the C++
+- [x] **PORT 257/384** `analyzeAndTransform` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441`, 3 lines
+- [x] **AUDIT 257/384** `analyzeAndTransform` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441`, line by line against the C++
+- [x] **PORT 258/384** `addConstraintsForIVRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:86`, 22 lines
+- [x] **AUDIT 258/384** `addConstraintsForIVRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:86`, line by line against the C++
+- [x] **PORT 259/384** `createNewSubscriptsFromStartElements` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:562`, 10 lines
+- [x] **AUDIT 259/384** `createNewSubscriptsFromStartElements` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:562`, line by line against the C++
+- [x] **PORT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, 32 lines
+- [x] **AUDIT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, line by line against the C++
+- [x] **PORT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, 41 lines
+- [x] **AUDIT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, line by line against the C++
 - [x] **PORT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, 98 lines
 - [x] **AUDIT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, line by line against the C++
 - [x] **PORT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, 18 lines
