@@ -63,7 +63,7 @@ use super::tf_cfgs_dataflow_conditional_tree::{EquivalenceTag, OperationEquivale
 use super::vc_vector_chain_helper::ops_are_equivalent;
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
-use crate::islands::dataflow_ir::{Program, ProgramUnit};
+use crate::islands::dataflow_ir::{Program, ProgramUnit, Units, Values};
 use crate::units::{Core, Corelet, DfirUnit, Residency};
 
 /// WHAT `sentient::getCoreOrCoreletID` READS OFF A `dataflow.get_unit` — its `core` and its
@@ -509,6 +509,101 @@ pub fn match_units<A: Arch>(
     }
 }
 
+/// ONE SURVIVING `dataflow.program_unit` — what the reference's last loop writes onto its base
+/// (`ProgramUnitsReduction.cpp:213-226`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducedUnit<'p, A: Arch> {
+    /// `group.base_unit_program_` — the unit that stays where it is; the rest of its group is erased.
+    pub base: &'p ProgramUnit<A>,
+    /// `setOperands(units_list)` — the base's own units, then each matched candidate's, in the order
+    /// they matched.
+    pub on: Units,
+    /// `getRegion().addArgument(builder.getIndexType(), getLoc())` — the `iter_arg` a merged body
+    /// reads its per-unit constants through, one per surviving unit.
+    pub iter_arg: Val,
+}
+
+/// Replaces: e256_runOnOperation
+///
+/// **256/384** `ProgramUnitsReductionPass::runOnOperation` — merges every program unit whose region
+/// [`match_units`] accepts into a group's base and hands back the survivors.
+///
+/// ⛔ THE ISLAND HAS NOWHERE TO BIND [`ReducedUnit::iter_arg`] YET: a `dataflow.program_unit` here
+/// carries no region argument and the printer writes none, where the vendor's every reduced unit
+/// prints `iter_arg : %arg0` (`mixed.mlir:11`). Minting it keeps the pass's second output; the field
+/// on [`ProgramUnit`] and its printing are one change across every emitter and are not this batch's.
+#[must_use]
+pub fn run_on_operation<'p, A: Arch>(
+    program: &'p Program<A>,
+    vals: &mut Values,
+) -> Vec<ReducedUnit<'p, A>> {
+    // `if (DisableThisPass) return;` (`:153`) is a `dcc-opt` command-line flag, and
+    // `if (dcc_ext_ctx_.getFolding()) return;` (`:156`) asks whether the SCHEDULER folded program time
+    // steps — a property of the input this crate does not emit yet (see
+    // [`super::tf_unit_filtering::FoldId`]). Neither is a runtime question here: which pass runs is a
+    // call in [`super::program`], and folding becomes a const generic on the day an emitter folds.
+    let scope = module_scope(program);
+
+    // `module_op.walk([&](dataflow::ProgramUnitOp unit) { .. })`.
+    let mut program_units: Vec<&ProgramUnit<A>> = Vec::new();
+    for unit in program.units.iter() {
+        // *"Check for presence of folds --> this could happen in standalone testing"*: two operands
+        // with ONE defining op. A `get_unit` binds `Variadic<Index>:$units`, one result per program
+        // time step (`Dataflow.td:48`), and this island binds a single result per op — so two
+        // operands share a definer exactly when the same [`Val`] is bound twice.
+        let bound = unit.on.vals();
+        let folding_exists = bound
+            .iter()
+            .enumerate()
+            .any(|(i, val)| bound[..i].contains(val));
+
+        // `auto unit_type = dcc::getUnitType(unit.getUnits()[0].getDefiningOp()); if
+        // (!is_any_of(unit_type, LXLU, LXSU)) program_units_.push_back(unit);` — the LX halves are
+        // left alone: their programs are the data transfers, which no other unit's work equals.
+        if !folding_exists && !matches!(unit.on.kind(), DfirUnit::Lxlu | DfirUnit::Lxsu) {
+            program_units.push(unit);
+        }
+    }
+
+    // *"Explore in reverse direction because dataflow.get_units would have been defined before and
+    // this avoids recreation of those operations."*
+    let mut reducible_groups: Vec<ReducibleProgramUnits<'p, A>> = Vec::new();
+    for unit in program_units.into_iter().rev() {
+        let matched = reducible_groups
+            .iter_mut()
+            .find(|group| match_units(group, unit, &scope) == UnitMatch::Matched);
+        match matched {
+            // `for (auto tmp_unit : unit.getUnits()) group.units_list_.push_back(..)`, then
+            // `unit.erase()` — erasure is this port's "does not become a base".
+            Some(group) => group.units_list.extend(unit.on.vals()),
+            // ⚠️ `ReducibleProgramUnits group(unit); reducible_groups_.push_back(unit);` (`:206-207`)
+            // — the named group is DISCARDED and a second one is built from the same base by the
+            // implicit converting constructor. Two constructions, one outcome.
+            None => reducible_groups.push(ReducibleProgramUnits::of(unit)),
+        }
+    }
+
+    reducible_groups
+        .into_iter()
+        .map(|group| {
+            // `for (auto tmp_unit : group.units_list_) for (auto fold : tmp_unit.getResults())
+            // units_list.push_back(fold);` — one result per `get_unit` here, so one push per unit.
+            let kind = group.base_unit_program.on.kind();
+            let bound: Vec<(DfirUnit, Val)> =
+                group.units_list.iter().map(|val| (kind, *val)).collect();
+            ReducedUnit {
+                base: group.base_unit_program,
+                // `Units::of` filters by kind and so answers `Option`; the list opens with the base's
+                // own units, so the empty list it declines cannot arise.
+                on: Units::of(kind, &bound).unwrap_or_else(|| group.base_unit_program.on.clone()),
+                // `if (getRegion().getNumArguments() == 0) addArgument(index)` — a program unit's
+                // region in this island has none, so every survivor takes one.
+                iter_arg: vals.mint(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -950,5 +1045,35 @@ mod unit_tests {
             Some(&get_unit(42, at(1, 1), DfirUnit::L0)),
             "the fourth unit's own `l0` binding"
         );
+    }
+
+    /// 🎯 256/384 — THE VENDOR'S FOUR UNITS REDUCE TO `(%3, %2, %0)` AND `(%1)`.
+    ///
+    /// `mixed.mlir:97` and `:11`. The reverse walk makes `(1,1)` the first base, `(1,0)` and `(0,0)`
+    /// join it, and `(0,1)` — whose `l0` sits on another corelet — survives alone.
+    #[test]
+    fn the_vendors_four_units_reduce_to_two() {
+        let program = mixed_program();
+        let mut vals = Values::default();
+        let reduced = run_on_operation(&program, &mut vals);
+
+        assert_eq!(
+            reduced
+                .iter()
+                .map(|unit| unit.on.vals())
+                .collect::<Vec<_>>(),
+            vec![vec![Val(3), Val(2), Val(0)], vec![Val(1)]],
+            "the group order is the reverse walk's, not the module's"
+        );
+        assert_eq!(
+            reduced
+                .iter()
+                .map(|unit| unit.base.on.first())
+                .collect::<Vec<_>>(),
+            vec![Val(3), Val(1)],
+            "each group's base is the unit that survives in place"
+        );
+        // Each region binds its OWN argument — `getRegionArg` is per region, never per op.
+        assert_ne!(reduced[0].iter_arg, reduced[1].iter_arg);
     }
 }

@@ -71,9 +71,11 @@
 //! | `e372_runOnOperation` | 372/384 | 69 | `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130` |
 
 use super::agen_access_details::{AccessDetailsAffine, LayoutCoeff};
-use super::tf_mutable_addr_splitting::{AddrRange, L3Half};
+use super::tf_mutable_addr_splitting::{AddrRange, ConstStartMemView, L3Half};
 use crate::arch::{Arch, Elements};
-use crate::islands::dataflow_ir::ty::AffineMap;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith};
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap};
 use core::cmp::Reverse;
 use core::num::{NonZeroU32, NonZeroU64};
 
@@ -628,6 +630,107 @@ pub fn calculate_dim_weights(inputs: &ShiftInputs<'_>) -> Vec<DimWeight> {
     // — descending by weight. `Reverse` over a stable sort, for the reason above.
     dim_weights.sort_by_key(|dim_weight| Reverse(dim_weight.weight));
     dim_weights
+}
+
+/// Replaces: e254_offsetShifts
+///
+/// **254/384** `MutableStartAddrShiftingPass::offsetShifts` — adds `offset` to the shift of the first
+/// subscript the transfer visits along `d0`, and to no other.
+///
+/// ⚠️ THE SECOND `DT_CHECK` IS VACUOUS (`:610`): `offset < 0 ? extents[res] >= offset : true` compares
+/// a count against a NEGATIVE, so it holds for every input, and the reference's own TODO above it
+/// says the check it wanted — that the innermost extent has room for the elements a negative shift
+/// adds — is unwritten.
+pub fn offset_shifts(shifts: &mut [Shift], transfer_order: &AffineMap, offset: Shift) {
+    // `if (offset == 0) return;`
+    if offset == Shift(0) {
+        return;
+    }
+    // `for (; res < num_res; ++res) if (transfer_order.getResult(res).isFunctionOfDim(0)) break;`
+    // — a transfer order with no `d0` anywhere is the reference's abort, and there is no shift to
+    // place; see [`SubscriptResult`] for why the position indexes `shifts` at all.
+    if let Some((slot, _)) = shifts
+        .iter_mut()
+        .zip(&transfer_order.results)
+        .find(|(_, expr)| expr.is_function_of_dim(0))
+    {
+        // `shifts[res] += offset;`
+        slot.0 += offset.0;
+    }
+}
+
+/// WHAT `applyShifts` LEAVES BEHIND — its returned map, plus the start address
+/// `updateMemViewStartAddress` assigned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShiftedMemView {
+    /// The subscripts map with every shift taken out of it — `res - shift` per result.
+    pub subscripts_map: AffineMap,
+    /// `arith.constant <view.start + total.elements()> : index`.
+    pub start_address: DfirOp,
+    /// The value the view's `start_address` operand is assigned.
+    pub start: Val,
+    /// `Σ shifts[i] * layout_coeffs[i]` — what the shifts moved the immutable address by.
+    pub total: TotalShift,
+}
+
+/// Replaces: e255_applyShifts
+///
+/// **255/384** `MutableStartAddrShiftingPass::applyShifts` — subtracts the shifts from the subscripts
+/// map and adds what they are worth in elements to the view's start address.
+///
+/// ⛔ A [`ConstStartMemView`] PINS ARM ONE of `updateMemViewStartAddress`, tabled on
+/// [`super::tf_mutable_addr_splitting::create_new_mem_view_with_mod`] — but UNLIKE entry 115 the
+/// other arms are reachable here: `hasValidL3ImmutableAddr` (`Dialect/Agen/Utils.cpp:140`), which
+/// entry 323 asserts before calling this, admits a `subi` toggle and an `scf.if` tree too.
+#[must_use]
+pub fn apply_shifts(
+    vals: &mut Values,
+    shifts: &[Shift],
+    inputs: &ShiftInputs<'_>,
+    view: &ConstStartMemView<'_>,
+) -> ShiftedMemView {
+    // `for (auto [shift, res] : zip(shifts, subscripts_map.getResults())) new_exprs.emplace_back(res -
+    // shift);` — `AffineExpr::operator-` SIMPLIFIES, so a result whose whole constant term was taken
+    // prints as `d0 * 3` and not as `d0 * 3 + 0`. The zip is `DT_CHECK(shifts.size() ==
+    // subscripts_map.getNumResults())`.
+    let results = inputs
+        .subscripts_map
+        .results
+        .iter()
+        .zip(shifts)
+        .map(|(res, shift)| res.clone().added(AffineExpr::Const(-shift.0)))
+        .collect();
+
+    // `total_shift += shifts[i] * layout_coeffs[i]`, RECOMPUTED and not entry 191's total, because
+    // `calculatePartialShift` has since rewritten `shifts` (`:544-557`). The zip is
+    // `DT_CHECK(layout_coeffs.size() >= shifts.size())`, and this arm asks nothing about sticks — see
+    // [`TotalShift::PartialStick`].
+    let total = inputs.elements_per_stick.total(
+        shifts
+            .iter()
+            .zip(inputs.layout_coeffs)
+            .map(|(shift, layout_coeff)| shift.0 * layout_coeff.0)
+            .sum(),
+    );
+
+    // `DT_CHECK(mem_view_op->hasOneUse())` — the pass refused a multi-use L3 view before it got here
+    // (`:172`). Then `updateMemViewStartAddress`, arm one: one `arith.constant` for `start +
+    // modifier`, assigned to the view's start address.
+    let start = vals.mint();
+    ShiftedMemView {
+        // `AffineMap::get(num_dims, 0, new_exprs, ctx)` — the ORIGINAL map's dimension count.
+        subscripts_map: AffineMap {
+            dims: inputs.subscripts_map.dims,
+            syms: 0,
+            results,
+        },
+        start_address: DfirOp::Arith(arith::Op::Constant {
+            result: start,
+            value: view.start + total.elements(),
+        }),
+        start,
+        total,
+    }
 }
 
 #[cfg(test)]
@@ -1345,6 +1448,87 @@ mod unit_tests {
         assert_eq!(
             weights.iter().map(|w| w.weight.0).sum::<i64>(),
             calculate_full_shift(&inputs).total.elements()
+        );
+    }
+    /// 🎯 254/384 — THE SLOT IS THE FIRST RESULT THE TRANSFER READS ALONG `d0`, NOT RESULT 0.
+    ///
+    /// `offsetShifts(shifts, ad, -num_elems_in_stick)` (`:427`) takes one stick of f16 back out of the
+    /// innermost dimension; under the fixture's identity order that is subscript 0, and under a
+    /// reversed order the same call lands on subscript 2.
+    #[test]
+    fn the_offset_lands_on_the_transfers_innermost_result() {
+        let mut shifts = vec![Shift(64), Shift(16), Shift(128)];
+        offset_shifts(&mut shifts, &AffineMap::identity(3), Shift(-64));
+        assert_eq!(shifts, vec![Shift(0), Shift(16), Shift(128)]);
+
+        let reversed = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![AffineExpr::dim(2), AffineExpr::dim(1), AffineExpr::dim(0)],
+        };
+        let mut shifts = vec![Shift(64), Shift(16), Shift(128)];
+        offset_shifts(&mut shifts, &reversed, Shift(-64));
+        assert_eq!(
+            shifts,
+            vec![Shift(64), Shift(16), Shift(64)],
+            "the transfer reads d0 third"
+        );
+    }
+
+    /// 🎯 255/384 — THE VENDOR'S FULL SHIFT: `arith.constant 33856` AND `[0, %arg1 * 3, %arg2 * 2]`.
+    ///
+    /// `@full_shift_zero_const_start` (`mutable_start_addr_shift_full.mlir:14-33`): every constant
+    /// leaves the subscripts and the view's start address carries all 33856 elements of them.
+    #[test]
+    fn the_vendors_shift_empties_the_subscripts_into_the_start_address() {
+        let subscripts = vendor_subscripts_map();
+        let layout = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(256)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        let ty = MemRef {
+            shape: vec![8, 64, 4],
+            elem: ElemType::F16,
+        };
+        let mut vals = Values::default();
+        let shifted = apply_shifts(
+            &mut vals,
+            &[Shift(64), Shift(16), Shift(128)],
+            &shift_inputs(&VENDOR_COEFFS, &AffineMap::identity(3), &subscripts, 16),
+            &ConstStartMemView {
+                from: Val(0),
+                start: 0,
+                layout: &layout,
+                ty: &ty,
+            },
+        );
+
+        assert_eq!(
+            shifted.subscripts_map,
+            AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![
+                    AffineExpr::Const(0),
+                    AffineExpr::dim(0).times(3),
+                    AffineExpr::dim(1).times(2),
+                ],
+            },
+            "d0 * 3 + 16 - 16 simplifies to d0 * 3"
+        );
+        assert_eq!(shifted.total, TotalShift::WholeSticks(33856));
+        assert_eq!(
+            shifted.start_address,
+            DfirOp::Arith(arith::Op::Constant {
+                result: shifted.start,
+                value: 33856,
+            })
         );
     }
 }
