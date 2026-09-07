@@ -71,7 +71,7 @@ use crate::islands::dataflow_ir::{ValueMapping, Values};
 /// ⛔ NO BOUNDS. `transformSCFToAffineLoop` never asks the loop what its bounds are: it takes
 /// `lbound`, `ubound` and `step` as parameters ([`StaticBounds`]) because the whole point of the pass
 /// is that the `scf.for`'s upper bound is NOT constant — an `arith.select` between two chunk widths
-/// (`scf_loop_with_result.mlir:37-38`) — and the caller has already resolved it per branch. Reading
+/// (`scf_loop_with_result.mlir:128`) — and the caller has already resolved it per branch. Reading
 /// the loop's own `hi` here would read the `select`, which is exactly the value being eliminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScfForOp<'a> {
@@ -225,7 +225,7 @@ pub enum LoopLegalization {
 /// transfer's coefficients, and the Sentient loop lowering counts `affine.for` nesting against
 /// [`crate::arch::Arch::MAX_NESTED_LOOPS`]. An `scf.for` reaching the lowering is not a legal input,
 /// which is what this pass's name says. The reason one is there in the first place is a bound that is
-/// not a constant — `%10 = arith.select %9, %c16, %c32` (`scf_loop_with_result.mlir:38`) — and
+/// not a constant — `%10 = arith.select %9, %c16, %c32` (`scf_loop_with_result.mlir:128`) — and
 /// [`crate::islands::dataflow_ir::dialects::affine::Bound`] has no variant for a computed value
 /// because `affine.for` has no way to take one.
 ///
@@ -240,8 +240,8 @@ pub enum LoopLegalization {
 ///
 /// `scf_for.getInits()` is evaluated OUTSIDE the loop, so those values are not in the mapping and must
 /// not be renumbered — the vendor's expectation shows the same `%20` initialising both branches'
-/// copies (`scf_loop_with_result.mlir:56,74`). Only the induction variable, the region arguments and
-/// whatever the body itself defines get new names.
+/// copies (`scf_loop_with_result.mlir:41` and `:64`). Only the induction variable, the region
+/// arguments and whatever the body itself defines get new names.
 ///
 /// # ⛔ THE MAPPING IS SEEDED BEFORE THE CLONE, WHICH IS WHY THE ORDER HERE IS FIXED
 ///
@@ -324,7 +324,7 @@ pub fn transform_scf_to_affine_loop(
         carried,
         body,
         // `if (auto dbg_name_attr = getDbgNameAttr(scf_for)) setDbgNameAttr(affine_for, ..)` — the
-        // name survives the rewrite, and `scf_loop_with_result.mlir:59` checks that it does.
+        // name survives the rewrite, and `scf_loop_with_result.mlir:61` checks that it does.
         dbg_name: scf_for.dbg_name.map(str::to_owned),
     }))
 }
@@ -396,7 +396,7 @@ mod unit_tests {
 
     /// THE VENDOR'S `scf.for` AND ITS CONTEXT, BUILT IN TYPED FORM.
     ///
-    /// `dcc/test/Transform/TransformLoopToLegalizeForSentientLowering/scf_loop_with_result.mlir:130-152`
+    /// `dcc/test/Transform/TransformLoopToLegalizeForSentientLowering/scf_loop_with_result.mlir:129-148`
     /// — the input of the pass, from `%11 = scf.for %arg4 = %c0 to %10 step %c1 iter_args(%arg5 =
     /// %arg3)` down to its `scf.yield %12`, with the four values its body reads from outside minted
     /// first so the printed numbering lines up with the vendor's.
@@ -589,7 +589,7 @@ mod unit_tests {
 
     /// THE VENDOR'S OWN EXPECTATION FOR THE `then` ARM, RENUMBERED.
     ///
-    /// `scf_loop_with_result.mlir:56-77`, the `CHECK-SENT-IR-NEXT` block from
+    /// `scf_loop_with_result.mlir:41-61`, the `CHECK-SENT-IR-NEXT` block from
     /// `%[[VAL_23]] = affine.for %[[VAL_24]] = 0 to 16` down to its
     /// `} {dbgName = "c0-l3lu-loop-ibr-chunk-y"}`.
     ///
@@ -657,10 +657,10 @@ mod unit_tests {
     /// 🎯 117/384 — THE SAME BODY TRANSFORMED TWICE BINDS TWO DISJOINT SETS OF NAMES.
     ///
     /// ⛔⛔ THE CALLER DOES THIS ON EVERY LOOP IT LEGALISES.
-    /// `transformSCFLoopWithNonConstantUpperBound` (entry 292, `:222` and `:236`) calls this once with
+    /// `transformSCFLoopWithNonConstantUpperBound` (entry 292, `:207` and `:227`) calls this once with
     /// the `then` builder and `then_ub` and once with the `else` builder and `else_ub`, on the SAME
     /// `scf.for` — the vendor's expectation is two copies of one body, at `to 16` and at `to 32`
-    /// (`scf_loop_with_result.mlir:56` and `:74`). Two copies sharing SSA names is not a program, and
+    /// (`scf_loop_with_result.mlir:41` and `:64`). Two copies sharing SSA names is not a program, and
     /// nothing in a typed island would say so; this is what says so.
     #[test]
     fn transforming_one_loop_twice_binds_disjoint_values() {

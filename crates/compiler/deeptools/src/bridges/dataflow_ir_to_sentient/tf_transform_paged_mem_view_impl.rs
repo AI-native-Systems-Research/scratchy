@@ -1943,7 +1943,7 @@ pub enum IndexRemoval {
 /// takes exactly one value inside the page being selected, so the pass emits ONE equality condition
 /// for it ([`create_equality_condition`]) and replaces the dimension in the subscript map with that
 /// constant — *"If LB == UB, the loop iterator can be replaced by a constant in the subscripts."*
-/// (`:315-316`). The loop iterator is then no longer an operand of the access, and this is what takes
+/// (`:316-317`). The loop iterator is then no longer an operand of the access, and this is what takes
 /// it out of the operand list so the shortened list still matches the shortened map.
 ///
 /// # ⛔ THE FIRST OCCURRENCE, NOT THE POSITION — AND HERE THEY COINCIDE
@@ -2107,7 +2107,7 @@ fn dims_as_syms(expr: &AffineExpr) -> AffineExpr {
 /// builds ONE guard rather than two, and the difference between the two functions is exactly that
 /// plus the predicate — a separate record would be two spellings of one nest, and
 /// `createConditionsForHyperRectSubscripts` stores whichever it got in the same `insert_refs` slot
-/// (`:310-315`).
+/// (`:313` here, `:331-332` for the two-sided form).
 #[must_use]
 pub fn create_equality_condition(vals: &mut Values, lhs: Val, rhs: i64) -> Condition {
     // `arith::ConstantIndexOp::create(builder, lhs.getLoc(), rhs)`.
@@ -3128,7 +3128,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// 🎯 118/384 — THE COLLAPSED DIMENSIONS COME OUT AND THE SURVIVORS KEEP THEIR ORDER.
     ///
     /// The delete list is built as `indices_to_delete.push_back(indices[dim])` in ascending `dim`
-    /// (`:317`), so it is a subsequence of the indices — here dimensions 1 and 3 of four.
+    /// (`:319`), so it is a subsequence of the indices — here dimensions 1 and 3 of four.
     #[test]
     fn the_requested_indices_are_removed_in_order() {
         let mut indices = vec![Val(10), Val(11), Val(12), Val(13)];

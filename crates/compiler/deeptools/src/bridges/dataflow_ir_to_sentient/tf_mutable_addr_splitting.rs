@@ -100,7 +100,7 @@ use crate::units::DfirUnit;
 /// ⭐⭐ AND THE HALF DOES NOT CHANGE THE ANSWER, WHICH IS WORTH KNOWING. `regInfoPerUnit` declares
 /// `L3LU`'s and `L3SU`'s registers in two separate blocks, and for `EAR` and `EBR` the two blocks are
 /// identical: `{16, 21, 32, UNSIGNED, true}` at `sysdef.cpp:313-314` and `:336-337`, and the same
-/// arch-split `EBR` at `:321-322`/`:331-332` and `:344-345`/`:354-355`. So the component selects a
+/// arch-split `EBR` at `:320-321`/`:326-327` and `:343-344`/`:349-350`. So the component selects a
 /// table row whose contents are the same either way, and its ONLY function in these two functions is
 /// the `DT_CHECK`. The parameter stays because the caller must still prove which unit it is asking
 /// about — see [`max_mutable_range`].
@@ -269,7 +269,7 @@ pub fn max_mutable_range<A: Arch>(_half: L3Half) -> AddrRange {
 ///
 /// ⛔⛔ TWO FUNCTIONS BECAUSE THE REGISTER IS DIFFERENT, AND THE DIFFERENCE IS NOT A CONSTANT FACTOR.
 /// The mutable range reads the `EAR` (21 bits, every arch) and the immutable range reads the `EBR`
-/// (30 bits on RCUDD1A, **32** from SEN1P5 — `sysdef.cpp:321-332`). So the immutable space is 512×
+/// (30 bits on RCUDD1A, **32** from SEN1P5 — `sysdef.cpp:320-327`). So the immutable space is 512×
 /// the mutable one on DD2 and 2048× on SEN1P5, and a port that shared one query between the two
 /// callers would silently pick one arch's ratio for both.
 ///
@@ -498,7 +498,7 @@ pub struct MasData {
     /// `weight_` — how much mutable address this iterator is responsible for.
     ///
     /// ⭐ `num_iters < 2 ? 0 : (num_iters - 2) * composed_coeff` (entry 250, `initMASData`,
-    /// `:735`), under the comment *"The iter_arg will be the number of iterations - 1 at maximum and
+    /// `:736`), under the comment *"The iter_arg will be the number of iterations - 1 at maximum and
     /// the last iteration of every loop can overflow the mutable as no data transfer will occur
     /// after it. So really, the number of iterations - 2 is the last utilized mutable address."*
     /// So the weight is NOT the span of the loop: it is the span of the addresses the loop actually
@@ -527,7 +527,7 @@ pub struct MasData {
 /// moves to the next (`:862-905`, under *"Note: This is not optimal at all"*). Descending weight is
 /// what makes that greedy walk reach a decision in as few splits as possible — a different order
 /// would still produce a correct partitioning, but a different, larger one, and the partition count
-/// is charged against `MaxNumConditionals` (`:959-967`).
+/// is charged against `MaxNumConditionals` (`:957-962`).
 ///
 /// # ⛔ STABLE, WHERE `llvm::sort` IS NOT — AND THAT IS A DELIBERATE NARROWING
 ///
@@ -590,7 +590,7 @@ pub struct NewMemViewWithMod {
 ///
 /// # ⭐⭐ THE THREE-ARMED HELPER COLLAPSES TO ONE ARM, BY THE TYPE
 ///
-/// `updateMemViewStartAddress` (`dcc/src/Dialect/Agen/Utils.cpp:337-410`) branches on what binds the
+/// `updateMemViewStartAddress` (`dcc/src/Dialect/Agen/Utils.cpp:337-420`) branches on what binds the
 /// start address:
 ///
 /// | binder | what it does |
@@ -675,7 +675,7 @@ mod unit_tests {
     /// 🎯 112/384 — AND THE IMMUTABLE RANGE IS THE EBR'S, WHICH IS NOT.
     ///
     /// ⛔⛔ 2^40 ON DD2 AND 2^42 FROM SEN1P5. The `EBR` row sits INSIDE the arch branch — 30 bits at
-    /// `sysdef.cpp:321-322`, 32 at `:331-332` — so the immutable space a program may occupy is four
+    /// `sysdef.cpp:320-321`, 32 at `:326-327` — so the immutable space a program may occupy is four
     /// times larger on SEN1P5. Reading one arch's number on the other is how a splitting decision
     /// comes out wrong while every line of the pass looks right.
     #[test]
@@ -717,7 +717,7 @@ mod unit_tests {
     /// 🎯 111/384 + 112/384 — THE HALF NEVER CHANGES THE ANSWER.
     ///
     /// ⭐ THE FINDING BEHIND [`L3Half`]'s NOTE. `regInfoPerUnit` declares the two halves in separate
-    /// blocks (`sysdef.cpp:313` vs `:336`, `:321` vs `:344`, `:331` vs `:354`) with identical `EAR`
+    /// blocks (`sysdef.cpp:313` vs `:336`, `:320` vs `:343`, `:326` vs `:349`) with identical `EAR`
     /// and `EBR` rows, so the component argument's only function in these two queries is the
     /// `DT_CHECK` — which is why it is a type here and not a value to test against.
     #[test]

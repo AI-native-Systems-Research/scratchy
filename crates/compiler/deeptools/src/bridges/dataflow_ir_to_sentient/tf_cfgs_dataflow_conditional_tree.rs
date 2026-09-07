@@ -195,11 +195,17 @@ impl DbgNamePrefix {
 /// # ⛔ AN UNNAMED OPERATION ANYWHERE IN THE LIST ABANDONS THE WHOLE NAME
 ///
 /// `dbgName` is a *discardable* attribute, so `getDbgNameAttr` returns null for any op that has none
-/// (`DataflowOpInterfaces.cpp:24-31`) — hence `Option<&str>` per operation rather than `&str`. The
+/// (`DataflowOpInterfaces.cpp:24-36`) — hence `Option<&str>` per operation rather than `&str`. The
 /// early `return nullptr` throws away the partially built string, so the result is all-or-nothing and
-/// `?` is exactly it. ⭐ AND THE CALLERS ALL TREAT IT THAT WAY: every site is
-/// `if (StringAttr n = getNewDbgNameFromList(...)) setDbgNameAttr(dst, n);`, which leaves the
-/// destination's existing name alone rather than clearing it.
+/// `?` is exactly it. ⭐ AND SEVEN OF THE TEN CALLERS TREAT IT THAT WAY: `if (StringAttr n =
+/// getNewDbgNameFromList(...)) setDbgNameAttr(dst, n);`, which leaves the destination's existing name
+/// alone rather than clearing it — `setDbgNameAttr(dst, nullptr)` would REMOVE the attribute
+/// (`DataflowOpInterfaces.cpp:49`), so the guard is load-bearing.
+///
+/// ⚠️ THE OTHER THREE HAND THE NULL STRAIGHT TO A `create()`. `SyncSendRecvFusion.cpp:93`,
+/// `PCFGToDataflowIR.cpp:1773` and `:3953` pass the result to `SyncOp::create` / `MergeOp::create` /
+/// `PackOp::create` as the new op's dbg-name attribute with no guard at all, so there `None` means
+/// the op being BUILT is unnamed. Either reading is `Option<String>`; neither is a refusal.
 ///
 /// ⚠️ THE `MLIRContext` IS DROPPED, and it is the one thing here that is pure mechanism:
 /// `StringAttr::get(list_of_ops.front()->getContext(), s)` interns the string in the context that
@@ -378,12 +384,12 @@ pub struct YieldedIndex(pub i64);
 /// constructor and no copy assignment — the rule of three, unfollowed. A copy would shallow-copy
 /// `val_array_` and the two objects would `delete[]` the same allocation. Nothing fires it today:
 /// the only instance in the tree is a local built and dropped inside one loop iteration
-/// (`CFGSDataflowConditionalTree.cpp:479`, `instance` in `simplifyValueBasedConditionals`). ⭐ HERE
+/// (`CFGSDataflowConditionalTree.cpp:477`, `instance` in `simplifyValueBasedConditionals`). ⭐ HERE
 /// THE HAZARD IS NOT AVAILABLE: the type is not `Copy`, and its derived `Clone` deep-copies the
 /// boxed slice, so a clone owns its own array. That is a divergence in the reference's favour, and it
 /// is the reason `Clone` is derived rather than suppressed.
 ///
-/// ⚠️ THE OTHER SIX FIELDS ARE NOT HERE, AND NEITHER IS THE CONSTRUCTOR. `is_candidate_`,
+/// ⚠️ THE OTHER SEVEN FIELDS ARE NOT HERE, AND NEITHER IS THE CONSTRUCTOR. `is_candidate_`,
 /// `top_node_`, `if_op_`, `common_lhs_`, `for_op_tuple_`, `seq_lb_` and `seq_step_` are read only by
 /// `parseConditional`, `replaceIfOpByIterArg` (entry 285) and `singleOpBranchToYieldVal` (entry 348),
 /// and `top_node_` is a `CondNode *` — a base-class type from `dcc/src/Analysis/`, which contributes
