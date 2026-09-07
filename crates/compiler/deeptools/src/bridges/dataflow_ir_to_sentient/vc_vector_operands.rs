@@ -76,3 +76,108 @@
 //!
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp`
 
+
+use crate::islands::sentient::dialects::sentient as sen;
+
+/// AN OPERATION'S IDENTITY — the stand-in for `mlir::Operation *`.
+///
+/// ⭐⭐ THE VALUE IS ITS PLACE IN THE REGION TREE, NOT A POINTER AND NOT A COUNTER. The reference
+/// keys `OperandReuse::data_origins_` by `Operation *` and asks `DominanceInfo` whether one op
+/// dominates another; both questions are about WHERE the op sits, so the identity carries the
+/// position and both answers fall out of it. A flat index would answer the first and lose the
+/// second the moment a loop body appears — an op inside `affine.for` #1 comes *later* in a flat
+/// walk than one inside `affine.for` #0 and dominates neither.
+///
+/// ⭐ ONE ORDINAL PER REGION LEVEL, OUTERMOST FIRST. `[3]` is the fourth op of the program unit's
+/// body; `[3, 0]` is the first op of that op's region. `mlir::Operation *` is a pointer, so nothing
+/// in the C++ names this structure — but every use of it in `OperandReuse` is one of the two
+/// questions above.
+///
+/// ⛔ NOT AN EXTENT. The ordinals index positions within a block; they are never lane counts,
+/// addresses or bounds, and nothing here does arithmetic on them beyond comparing two at the same
+/// level.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpId {
+    /// The ordinals, outermost first.
+    path: Vec<u32>,
+}
+
+impl OpId {
+    /// THE OP AT THIS PATH.
+    #[must_use]
+    pub fn at(path: &[u32]) -> OpId {
+        OpId {
+            path: path.to_vec(),
+        }
+    }
+
+    /// ITS PATH, OUTERMOST FIRST.
+    #[must_use]
+    pub fn path(&self) -> &[u32] {
+        &self.path
+    }
+}
+
+/// WHERE AN OPERAND COMES FROM — `VectorOperandType` (`VectorOperands.hpp:28-36`).
+///
+/// ⛔ EIGHT CASES AND NO NINTH. The reference switches on this to decide whether an operand is a
+/// register file, a link, an immediate or the internal state a compare/select forwards, and
+/// `OperandReuse::setReuseInformation` treats `Constant` and `LRF` specially by name
+/// (`OperandReuse.cpp:26,36`) — so a wildcard here would silently absorb a new source into the
+/// wrong rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VectorOperandType {
+    /// A value arriving over a link — a `dataflow.send`/`receive` pair's end.
+    Link,
+    /// The local register file.
+    Lrf,
+    /// The indirect register file.
+    Irf,
+    /// The cross register file.
+    Xrf,
+    /// An immediate.
+    Constant,
+    /// A `vectorchain.constant_bitstream`.
+    ConstantBitstream,
+    /// A neighbour forward.
+    Nfwd,
+    /// ⭐ THE INTERNAL STATE a `SELECT`/`FCMP`/`FMINMAX` forwards — the C++ says so in a trailing
+    /// comment on the enumerator itself (`VectorOperands.hpp:35`).
+    IState,
+}
+
+/// ONE OPERAND OF A COMPUTE, AS THE VECTORCHAIN LOWERING SEES IT — `VectorOperand`
+/// (`VectorOperands.hpp:38-113`).
+///
+/// # ⚠️ PARTIAL BY DESIGN — three of the six data members are not here yet
+///
+/// ⭐ THE MEMBERS ARRIVE WITH THE UNITS THAT READ THEM. `values_` (a uniformized value per
+/// core/corelet/fold) and `splat_` are only ever touched by `e169_getName`, `e234_setValue` and
+/// `e304_getOperandWithPrecision` — none of which is scheduled in this wave — and `values_` in
+/// particular holds a mix of a compute-port name (`symbolizeSentientComputePort` consumes it at
+/// `VectorChainToSentientPESFP.cpp:722-726`), the literal `"latch"`, and a slice index printed as
+/// decimal (`VectorOperands.cpp:240`). Choosing between one enum, three fields and an index newtype
+/// is a decision that belongs to whoever ports those units against their own callers, not a guess
+/// made here for a field this wave never reads.
+///
+/// ⛔ THE TWO PRECISIONS ARE `Option`, AND THE EMPTY STRING IS WHY. The constructor
+/// (`VectorOperands.hpp:76-79`) sets only `type_`, `op_` and the value, so both precisions start
+/// EMPTY, and `getInputPrecisionFromOperand`'s absent overload returns `""` for a missing operand
+/// (`VectorChainHelper.cpp:43-49`). The consumers test for it by name —
+/// `if (result_forwarding.empty() && result_precision == "") result_precision = compute_precision;`
+/// (`VectorChainToSentientPESFP.cpp:257-263` and again at `:1131-1136`) — so "unset" is a value this
+/// type has to be able to hold, and `Precision::None` is NOT it (that one spells `none` on the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorOperand {
+    /// `type_` — where it comes from.
+    pub kind: VectorOperandType,
+    /// `op_` — the operation that produced it.
+    pub op: OpId,
+    /// `orig_precision_` — the element precision of the value as it was produced. `None` is the
+    /// reference's empty string; see the type's note.
+    pub orig_precision: Option<sen::Precision>,
+    /// `on_the_fly_conv_precision_` — the precision it is converted to on the way in, which starts
+    /// equal to [`Self::orig_precision`] (`VectorOperands.cpp:399-400`) and only differs where a
+    /// `vectorchain.cast` folded into the operand.
+    pub on_the_fly_conv_precision: Option<sen::Precision>,
+}

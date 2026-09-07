@@ -684,6 +684,11 @@ impl Rearrangement {
                 | dfir_op::vectorchain::Op::Binary { .. }
                 | dfir_op::vectorchain::Op::ConstantBitstream { .. }
                 | dfir_op::vectorchain::Op::Cast { .. }
+                // ⛔ A PACK IS NOT A REARRANGEMENT, however much it looks like one: `getLoadConsumer`
+                // names `SelectOp`, `ShuffleOp` and `RotateOp` and stops (`Helper.cpp:1268-1270`), so
+                // a load feeding a pack has no consumer by this rule.
+                | dfir_op::vectorchain::Op::Pack { .. }
+                | dfir_op::vectorchain::Op::Merge { .. }
                 | dfir_op::vectorchain::Op::CreateAffineMask { .. } => None,
             },
             DfirOp::Arith(_)

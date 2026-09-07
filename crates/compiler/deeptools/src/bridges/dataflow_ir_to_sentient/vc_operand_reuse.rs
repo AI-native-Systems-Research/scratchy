@@ -68,6 +68,7 @@
 
 use std::collections::HashMap;
 
+use super::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::dialects::Val;
 
 /// WHICH DATA ORIGIN AN OPERAND READS, AS THE EMITTED OP SPELLS IT.
@@ -140,10 +141,14 @@ pub struct OperandTag {
 /// `VectorOperand`'s `op_`), so its result [`Val`] identifies it exactly and this crate has no
 /// address to key on.
 ///
-/// ⛔ THE CLASS DECLARATION IS ENTRY 227'S AND `dominance_info_` COMES WITH IT, together with the
-/// `dominates` predicate that reads it (entry 058, `OperandReuse.hpp:38`). This is the minimum the
-/// two getters below need, and it grows when those units land — [`Default`] stands in for the
-/// constructor's `data_origins_.clear()` (`OperandReuse.hpp:26-28`) until then.
+/// ⛔ THE CLASS DECLARATION IS ENTRY 227'S, and [`Default`] stands in for the constructor's
+/// `data_origins_.clear()` (`OperandReuse.hpp:26-28`) until that unit lands.
+///
+/// ⭐ AND `dominance_info_` DOES NOT COME WITH IT. The reference builds a `mlir::DominanceInfo` from
+/// the `dataflow.program_unit` it is constructed with, and that member exists to cache the region
+/// tree it walks; [`OpId`] already carries an op's place in that tree, so [`Self::dominates`] is a
+/// pure function of its two arguments and the cache has nothing left to hold. Dropping a memoisation
+/// is what the campaign brief permits; dropping the answer would not be.
 #[derive(Debug, Default)]
 pub struct OperandReuse {
     /// `data_origins_`.
@@ -231,6 +236,106 @@ impl OperandReuse {
     #[must_use]
     pub fn absorbtion_flag(&self, op: Val) -> Option<bool> {
         self.data_origins.get(&op).map(|tag| tag.absorbed)
+    }
+
+    /// Replaces: e057_setReuseFlag
+    ///
+    /// **057/384** `OperandReuse::setReuseFlag` —
+    /// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91` (2L).
+    ///
+    /// ```cpp
+    /// void OperandReuse::setReuseFlag(Operation *op) {
+    ///   data_origins_[op].absorbed_ = true;
+    /// }
+    /// ```
+    ///
+    /// # ⛔⛔ `operator[]` DEFAULT-INSERTS, SO THE COMMENT ON THE DECLARATION IS WRONG
+    ///
+    /// The header says *"Assumes that op is already present"* (`OperandReuse.hpp:48`), and the body
+    /// does not. For an absent key `data_origins_[op]` CREATES the entry as `OperandTag{-1, false}`
+    /// and then sets the flag — so an op that was never registered ends up in the table with
+    /// [`DataId::Unassigned`] and an absorbed flag, and `getTotalDataOriginsCount()` counts it.
+    /// `.entry(op).or_default()` is that behaviour exactly; a lookup that skipped absent keys would
+    /// be the behaviour the comment describes and not the behaviour the code has.
+    ///
+    /// ⭐ AND THE MINUS ONE IS ALREADY [`OperandTag`]'S DEFAULT, which is why this reads as one line:
+    /// see [`DataId`], where the sentinel lives. It matters here because the entry this creates is
+    /// then visible to [`Self::absorbtion_flag`] as `Some(true)` — registered, absorbed — while
+    /// [`Self::id`] answers -1 for it either way.
+    ///
+    /// ⭐ IT IS REACHABLE. `setReuseInformation`'s second loop calls it for every non-`Constant`
+    /// operand whose producer is not a `latch` (`OperandReuse.cpp:56-62`), and the first loop does
+    /// not insert every operand the second one reaches.
+    // ⭐ DEAD IN A LIBRARY BUILD, LIVE UNDER TEST. Its only caller is `e276_setReuseInformation`,
+    // which is not scheduled in this wave; `expect` rather than `allow` so the attribute has to come
+    // off when that unit lands.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "its only caller is e276_setReuseInformation, not scheduled in this wave"
+        )
+    )]
+    fn set_reuse_flag(&mut self, op: Val) {
+        self.data_origins.entry(op).or_default().absorbed = true;
+    }
+
+    /// Replaces: e058_dominates
+    ///
+    /// **058/384** `OperandReuse::dominates` —
+    /// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38` (2L).
+    ///
+    /// ```cpp
+    /// bool dominates(Operation *op1, Operation *op2) {
+    ///   return dominance_info_->dominates(op1, op2);
+    /// }
+    /// ```
+    ///
+    /// # ⛔⛔ REFLEXIVE, AND THE REFERENCE RELIES ON IT BEING SO SOMEWHERE IT SHOULD NOT
+    ///
+    /// `DominanceInfo::dominates(a, b)` is `a == b || properlyDominates(a, b)` — an op dominates
+    /// itself — and `properlyDominates` is the strict form. `setReuseInformation` wants the strict
+    /// question and gets the right answer anyway, because it only ever compares two DIFFERENT
+    /// operands (`OperandReuse.cpp:39-46`). But `analyzeNonComputeOpsForFusion` hands this straight
+    /// to `llvm::sort` as a comparator (`VectorChainHelper.cpp:669-672`):
+    ///
+    /// ```cpp
+    /// llvm::sort(users, [&](Operation *l, Operation *r) { return reuse_info.dominates(l, r); });
+    /// ```
+    ///
+    /// A reflexive comparator is not a strict weak ordering, so that sort has undefined behaviour on
+    /// any duplicate. ⛔ That is a defect in the reference, not a contract to reproduce: this
+    /// function answers `dominates`, and whoever ports `e341_analyzeNonComputeOpsForFusion` needs the
+    /// PROPER form there.
+    ///
+    /// ⭐ THE RULE IS THE REGION TREE'S, and [`OpId`] carries the tree. `mlir::DominanceInfo` walks
+    /// `b` up until it finds an ancestor in `a`'s block and then compares positions, with
+    /// `enclosingOpOk` defaulting to true so an op DOES dominate the contents of its own regions.
+    /// Over paths that is three cases:
+    ///
+    /// 1. Neither path diverges from the other over its length — one is a prefix of the other, so
+    ///    `a` is `b` or `a` encloses `b`. `a` dominates `b` exactly when it is the shorter or equal
+    ///    one.
+    /// 2. They diverge at level `i` and `a` STOPS there (`a.len() == i + 1`) — `a` and `b`'s
+    ///    ancestor are siblings in one block, and `a` dominates when it comes first.
+    /// 3. They diverge at level `i` and `a` continues past it — `a` is buried inside a sibling
+    ///    region that does not contain `b`, and dominates nothing outside it. ⛔ THIS IS THE CASE A
+    ///    FLAT PROGRAM ORDER GETS WRONG: `a` at `[3, 0, 5]` precedes `b` at `[3, 1]` in a flat walk
+    ///    and dominates it in no sense at all.
+    ///
+    /// ⭐ AN OP, NOT A [`Val`]. The table above keys on the value a data origin produces because that
+    /// is what identifies it; dominance is asked of two operations' POSITIONS, and the two questions
+    /// take different arguments in the reference as well (`Operation *` here, and the same pointer
+    /// used as a map key there).
+    #[must_use]
+    pub fn dominates(&self, op1: &OpId, op2: &OpId) -> bool {
+        let (a, b) = (op1.path(), op2.path());
+        match a.iter().zip(b).position(|(level_a, level_b)| level_a != level_b) {
+            // (1) one path is a prefix of the other.
+            None => a.len() <= b.len(),
+            // (2) and (3).
+            Some(i) => a.len() == i + 1 && a[i] < b[i],
+        }
     }
 }
 
@@ -351,5 +456,98 @@ mod unit_tests {
         assert_eq!(tag.id.attribute(), -1);
         assert!(!tag.absorbed);
     }
-}
 
+    // ⭐ NO VENDOR CASE TO PORT FOR THE TWO BELOW. `dcc/test`'s 825 `.mlir` files exercise
+    // `OperandReuse` only through `CHECK-SENT-IR` on a whole lowered program — a `latch` appearing as
+    // a compute port is its one externally visible trace — and neither `setReuseFlag` nor `dominates`
+    // has a case of its own. What is checkable here is the two facts the C++ states and its own code
+    // then contradicts or relies on: the default-inserting `operator[]`, and the region-tree shape of
+    // dominance.
+
+    /// 🎯 057/384 — ⛔ AN OP THAT WAS NEVER REGISTERED IS CREATED BY THE FLAG, WITH ID -1.
+    ///
+    /// This is the `operator[]` fact. The header claims the op is already present; a lookup that
+    /// honoured that claim would leave the table empty here.
+    #[test]
+    fn setting_the_flag_on_an_unregistered_op_inserts_it_with_no_id() {
+        let mut reuse = table(&[]);
+        reuse.set_reuse_flag(Val(4));
+        assert_eq!(
+            reuse.id(Val(4)),
+            DataId::Unassigned,
+            "the default-inserted tag carries the header's `int id_ = -1`, not a zero"
+        );
+        assert_eq!(
+            reuse.absorbtion_flag(Val(4)),
+            Some(true),
+            "and it is now a registered origin, so the flag is an answer and not `None`"
+        );
+        assert_eq!(
+            reuse.data_origins.len(),
+            1,
+            "which is what getTotalDataOriginsCount() counts"
+        );
+    }
+
+    /// 🎯 057/384 — AND AN OP THAT WAS REGISTERED KEEPS ITS ID.
+    #[test]
+    fn setting_the_flag_on_a_registered_op_keeps_its_id() {
+        let mut reuse = table(&[(
+            Val(4),
+            OperandTag {
+                id: DataId::Assigned(DataOriginId(7)),
+                absorbed: false,
+            },
+        )]);
+        reuse.set_reuse_flag(Val(4));
+        assert_eq!(reuse.id(Val(4)), DataId::Assigned(DataOriginId(7)));
+        assert_eq!(reuse.absorbtion_flag(Val(4)), Some(true));
+    }
+
+    /// 🎯 058/384 — DOMINANCE IS REFLEXIVE, which is `DominanceInfo::dominates` and not
+    /// `properlyDominates`.
+    #[test]
+    fn an_op_dominates_itself() {
+        let reuse = table(&[]);
+        let op = OpId::at(&[3, 1]);
+        assert!(reuse.dominates(&op, &op));
+    }
+
+    /// 🎯 058/384 — AN ENCLOSING OP DOMINATES ITS REGION'S CONTENTS, AND NOT THE REVERSE.
+    #[test]
+    fn an_enclosing_op_dominates_its_body() {
+        let reuse = table(&[]);
+        let loop_op = OpId::at(&[3]);
+        let in_body = OpId::at(&[3, 0]);
+        assert!(
+            reuse.dominates(&loop_op, &in_body),
+            "`enclosingOpOk` defaults to true"
+        );
+        assert!(!reuse.dominates(&in_body, &loop_op));
+    }
+
+    /// 🎯 058/384 — SIBLINGS ARE ORDERED BY POSITION, and an earlier sibling dominates everything
+    /// inside a later one.
+    #[test]
+    fn an_earlier_sibling_dominates_a_later_one_and_its_body() {
+        let reuse = table(&[]);
+        let earlier = OpId::at(&[3]);
+        let later = OpId::at(&[4]);
+        let inside_later = OpId::at(&[4, 1]);
+        assert!(reuse.dominates(&earlier, &later));
+        assert!(!reuse.dominates(&later, &earlier));
+        assert!(reuse.dominates(&earlier, &inside_later));
+    }
+
+    /// 🎯 058/384 — ⛔ THE CASE A FLAT PROGRAM ORDER GETS WRONG.
+    ///
+    /// `[3, 0, 5]` comes before `[3, 1]` in a flat walk of the same body and dominates it in no
+    /// sense: it lives inside the first sibling's region, which the second never enters. The op at
+    /// `[3, 0]` — the region itself — does dominate, because `[3, 1]`'s ancestor is its sibling.
+    #[test]
+    fn an_op_buried_in_an_earlier_sibling_region_dominates_nothing_outside_it() {
+        let reuse = table(&[]);
+        assert!(!reuse.dominates(&OpId::at(&[3, 0, 5]), &OpId::at(&[3, 1])));
+        assert!(reuse.dominates(&OpId::at(&[3, 0]), &OpId::at(&[3, 1, 2])));
+    }
+}

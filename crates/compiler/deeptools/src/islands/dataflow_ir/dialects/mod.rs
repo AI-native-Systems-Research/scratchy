@@ -219,10 +219,16 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend([cond.val(), *lhs, *rhs]);
                 reads.extend(mask.map(|m| m.val()));
             }
-            vectorchain::Op::Binary { op1, op2, mask, .. } => {
+            vectorchain::Op::Binary { op1, op2, mask, .. }
+            | vectorchain::Op::Pack {
+                op1, op2, mask, ..
+            } => {
                 reads.extend([*op1, *op2]);
                 reads.extend(mask.map(|m| m.val()));
             }
+            // ⛔ NO MASK — a merge states its two sides as iteration spaces, and those are
+            // attributes and not operands (`VectorChain.td:164-185`).
+            vectorchain::Op::Merge { op1, op2, .. } => reads.extend([*op1, *op2]),
         },
     }
     reads
@@ -293,6 +299,8 @@ pub fn results(op: &Op) -> Vec<Val> {
             | vectorchain::Op::Shuffle { result, .. }
             | vectorchain::Op::Rotate { result, .. }
             | vectorchain::Op::Cast { result, .. }
+            | vectorchain::Op::Pack { result, .. }
+            | vectorchain::Op::Merge { result, .. }
             | vectorchain::Op::CreateAffineMask { result, .. } => vec![*result],
         },
     }
