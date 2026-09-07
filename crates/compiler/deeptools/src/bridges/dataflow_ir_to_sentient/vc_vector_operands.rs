@@ -138,8 +138,14 @@ impl OpId {
     /// here needs to — the only use is the equality above.
     ///
     /// ⛔ A MULTI-REGION OP'S TWO BLOCKS ARE ONE PREFIX HERE, which is why [`op_at`] flattens
-    /// regions: `scf.if`'s `then` and `else` bodies would both answer `[3]`. Nothing this compiler
-    /// emits constructs an `scf.if`, so the conflation is unobservable today.
+    /// regions: `scf.if`'s `then` and `else` bodies both answer `[3]`. ⛔ AND THIS COMPILER DOES EMIT
+    /// `scf.if` — [`Condition::wrap`](super::tf_transform_paged_mem_view_impl::Condition::wrap) builds
+    /// one per page guard — but every one it builds is ONE-ARMED, its `else_body` an empty `Vec`,
+    /// which in [`scf::Op::If`](crate::islands::dataflow_ir::dialects::scf::Op::If) means *no block*
+    /// at all. One non-empty region has nothing to conflate. A two-armed `scf.if` or `affine.if`
+    /// arriving on the input side would conflate, and
+    /// [`OperandReuse::dominates`](super::vc_operand_reuse::OperandReuse::dominates) says what that
+    /// would and would not cost.
     #[must_use]
     pub fn block(&self) -> &[u32] {
         &self.path[..self.path.len().saturating_sub(1)]
