@@ -20,6 +20,7 @@ pub mod arith;
 pub mod dataflow;
 pub mod scf;
 pub mod symbol;
+pub mod uniform;
 pub mod vector;
 pub mod vectorchain;
 
@@ -81,6 +82,8 @@ pub enum Op {
     VectorChain(vectorchain::Op),
     /// Upstream `symbol` — a scalar the schedule fixes later.
     Symbol(symbol::Op),
+    /// `Uniform.td` — one program written once and mapped onto many units.
+    Uniform(uniform::Op),
 }
 
 // ─────────────────────────────── THE USE LIST ────────────────────────────────
@@ -125,6 +128,29 @@ pub fn operands(op: &Op) -> Vec<Val> {
         },
         // ⭐ A SYMBOL READS NOTHING — its id is an attribute, not an operand (`Symbol.td:59`).
         Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
+        Op::Uniform(op) => match op {
+            // ⛔⛔ THE UNITS ARE ONE FLAT OPERAND RANGE IN REGION ORDER, and this is where the
+            // reference's `$units` / `$list_sizes` pair is put back together.
+            // `Variadic<AnyType>:$units` (`Uniform.td:86`) is sliced per region by the prefix sum of
+            // `$list_sizes` (`Uniform.cpp:184-192`), so concatenating the per-region lists in region
+            // order **is** that range — see [`uniform::LocalRegion`]. The REGION ARGUMENTS are not
+            // here: they are block arguments (`Uniform.td:96`) and belong to [`block_args`].
+            uniform::Op::UniformizeRegions { regions, .. } => {
+                for region in regions {
+                    reads.extend(region.units.iter().copied());
+                }
+            }
+            // ⭐ A TERMINATOR READS WHAT IT YIELDS (`Uniform.td:71`).
+            uniform::Op::Yield { operands } => reads.extend(operands.iter().copied()),
+            // ⭐ KEYS AND VALUES BOTH, KEY FIRST — the two `Variadic` ranges in declaration order
+            // (`Uniform.td:132-133`), *"paired positionally"* (`:124-125`).
+            uniform::Op::DefImmutableMapping { pairs, .. } => {
+                for (key, value) in pairs {
+                    reads.extend([*key, *value]);
+                }
+            }
+            uniform::Op::QueryMap { map, key, .. } => reads.extend([*map, *key]),
+        },
         Op::Scf(op) => match op {
             // ⛔ THE INDUCTION VARIABLES ARE NOT OPERANDS. `scf.parallel`'s `ivs` are the region's
             // arguments — values it DEFINES — so counting them here would make every loop a user of
@@ -347,6 +373,16 @@ pub fn results(op: &Op) -> Vec<Val> {
         // `Vector_StoreOp`.
         Op::Vector(vector::Op::Load { result, .. }) => vec![*result],
         Op::Vector(vector::Op::Store { .. }) => Vec::new(),
+        // ⛔ A `uniform.uniformize_regions` MAY BIND RESULTS, and 47 of the 352 under `dcc/test` do —
+        // see [`uniform::Op::UniformizeRegions::results`]. A census that answered "none" would make
+        // the op's own verifier, which ties the count to every region's terminator
+        // (`Uniform.cpp:170-179`), a statement about nothing.
+        Op::Uniform(uniform::Op::UniformizeRegions { results, .. }) => results.clone(),
+        Op::Uniform(
+            uniform::Op::DefImmutableMapping { result, .. } | uniform::Op::QueryMap { result, .. },
+        ) => vec![*result],
+        // ⭐ A TERMINATOR BINDS NOTHING; the values it carries out are its PARENT's results.
+        Op::Uniform(uniform::Op::Yield { .. }) => Vec::new(),
         Op::Scf(op) => match op {
             // ⭐ A CARRYING `scf.for` BINDS RESULTS, one per `iter_args` entry — the reference's own
             // input to `TransformLoopToLegalizeForSentientLowering` is
@@ -355,10 +391,16 @@ pub fn results(op: &Op) -> Vec<Val> {
             // `scf_for.getNumResults() > 0` to decide whether to write a yield at all (`:129`). A
             // census that answered "none" would make that branch unreachable.
             scf::Op::For { carried, .. } => carried.iter().map(|carried| carried.result).collect(),
-            // ⛔ AND NEITHER OF THE OTHER TWO BINDS ONE IN THIS ISLAND. `scf.if`'s and
-            // `scf.parallel`'s results would be the values their yields carry, and nothing this
+            // ⭐ AND AN `scf.if` BINDS WHAT ITS ARMS YIELD — `%13 = scf.if %12 -> (index)`
+            // (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:129`). ⛔ THREE
+            // DECISIONS OF THE SHALLOW MERGE READ THIS LIST'S LENGTH: which of two candidates becomes
+            // the destination (`CFGSDataflowConditionalTree.cpp:237`), which region's terminator
+            // survives the splice (`:420`, `:440`), and whether the pair is mergeable at all
+            // (`:348`).
+            scf::Op::If { results, .. } => results.clone(),
+            // ⛔ `scf.parallel`'s results would be the values its reductions carry, and nothing this
             // crate emits reads one.
-            scf::Op::If { .. } | scf::Op::Yield { .. } | scf::Op::Parallel { .. } => Vec::new(),
+            scf::Op::Yield { .. } | scf::Op::Parallel { .. } => Vec::new(),
         },
         Op::Affine(op) => match op {
             // ⭐ A CARRYING LOOP DOES BIND RESULTS — one per `iter_args` entry, which is how the
@@ -609,6 +651,22 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         // ⛔ A SYMBOL READS NOTHING. `symbol.create_symbol` names an extent that is not yet a value;
         // entry 091's backward walk stops AT it, never through it.
         Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
+        // ⭐ ARM FOR ARM WITH [`operands`] — the units flattened in region order, and both halves of
+        // every mapping pair.
+        Op::Uniform(op) => match op {
+            uniform::Op::UniformizeRegions { regions, .. } => {
+                for region in regions {
+                    places.extend(region.units.iter_mut());
+                }
+            }
+            uniform::Op::Yield { operands } => places.extend(operands.iter_mut()),
+            uniform::Op::DefImmutableMapping { pairs, .. } => {
+                for (key, value) in pairs {
+                    places.extend([key, value]);
+                }
+            }
+            uniform::Op::QueryMap { map, key, .. } => places.extend([map, key]),
+        },
     }
     places
 }
@@ -636,7 +694,25 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![result],
         Op::Vector(vector::Op::Load { result, .. }) => vec![result],
         Op::Vector(vector::Op::Store { .. }) => Vec::new(),
-        Op::Scf(_) => Vec::new(),
+        Op::Uniform(uniform::Op::UniformizeRegions { results, .. }) => results.iter_mut().collect(),
+        Op::Uniform(
+            uniform::Op::DefImmutableMapping { result, .. } | uniform::Op::QueryMap { result, .. },
+        ) => vec![result],
+        Op::Uniform(uniform::Op::Yield { .. }) => Vec::new(),
+        // ⛔ THIS WAS `Op::Scf(_) => Vec::new()`, AND THAT DISAGREED WITH [`results`]. The read side
+        // has answered the carried results of an `scf.for` since the variant landed; the write side
+        // did not, so a clone that reminted an op's results left a carrying loop binding the
+        // ORIGINAL's names — which is exactly what [`crate::islands::dataflow_ir::Values::
+        // clone_without_regions`] asks for. The two are now arm for arm.
+        Op::Scf(op) => match op {
+            scf::Op::For { carried, .. } => carried
+                .iter_mut()
+                .map(|carried| &mut carried.result)
+                .collect(),
+            // ⛔ AND THE `scf.if` LIST JOINED BOTH WHEN THE SHALLOW MERGE NEEDED TO READ ITS LENGTH.
+            scf::Op::If { results, .. } => results.iter_mut().collect(),
+            scf::Op::Yield { .. } | scf::Op::Parallel { .. } => Vec::new(),
+        },
         Op::Affine(op) => match op {
             affine::Op::For { carried, .. } => carried
                 .iter_mut()
@@ -754,6 +830,19 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         // body reads. `getLoadInductionVar()` is what `getLoadConsumer` roots a composite load's
         // consumer chain at (`Helper.cpp:1250`).
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.load_iv],
+        // ⛔⛔ ONE ARGUMENT PER REGION, AND EACH REGION BINDS ITS OWN.
+        // `getRegionArg(i) { return getRegion(i).getArgument(0); }` (`Uniform.td:96`) — so a
+        // two-region op binds two values, and entry 182 maps the one belonging to the region it is
+        // cloning out of (`FlatteningLocalRegions.cpp:246-256`). A census that missed them would let
+        // a clone keep reading the ORIGINAL region's argument.
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+            regions.iter().map(|region| region.arg).collect()
+        }
+        Op::Uniform(
+            uniform::Op::Yield { .. }
+            | uniform::Op::DefImmutableMapping { .. }
+            | uniform::Op::QueryMap { .. },
+        ) => Vec::new(),
         Op::Arith(_)
         | Op::Affine(_)
         | Op::Scf(_)
@@ -784,6 +873,18 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         }) => vec![body.as_slice(), else_body.as_slice()],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
+        // ⛔⛔ AS MANY REGIONS AS IT HAS UNIT LISTS — `VariadicRegion<AnyRegion>:$regions`
+        // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
+        // `flatten` declines when `op_.getNumRegions() == num_of_regions`
+        // (`FlatteningLocalRegions.cpp:418`).
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+            regions.iter().map(|region| region.body.as_slice()).collect()
+        }
+        Op::Uniform(
+            uniform::Op::Yield { .. }
+            | uniform::Op::DefImmutableMapping { .. }
+            | uniform::Op::QueryMap { .. },
+        ) => Vec::new(),
         Op::Arith(_)
         | Op::Affine(_)
         | Op::Scf(_)
@@ -821,6 +922,15 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         }) => vec![body, else_body],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
+        // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+            regions.iter_mut().map(|region| &mut region.body).collect()
+        }
+        Op::Uniform(
+            uniform::Op::Yield { .. }
+            | uniform::Op::DefImmutableMapping { .. }
+            | uniform::Op::QueryMap { .. },
+        ) => Vec::new(),
         Op::Arith(_)
         | Op::Affine(_)
         | Op::Scf(_)
@@ -829,6 +939,117 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         | Op::Vector(_)
         | Op::VectorChain(_)
         | Op::Symbol(_) => Vec::new(),
+    }
+}
+
+/// THE OP'S `dbgName`, or `None` when it carries none — `dataflow::getDbgNameAttr`.
+///
+/// ```cpp
+/// auto mlir::dataflow::getDbgNameAttr(Operation* op) -> StringAttr {
+///   if (auto iface = dyn_cast<DebugNameOpInterface>(op); iface) {
+///     return iface.getDbgNameAttr();
+///   }
+///   if (const auto result =
+///           op->getAttrOfType<StringAttr>(DebugNameOpInterface::kDbgNameAttrName);
+///       result) {
+///     return result;
+///   }
+///   return nullptr;
+/// }
+/// ```
+/// (`DataflowOpInterfaces.cpp:24-36`, with `kDbgNameAttrName = "dbgName"` at
+/// `DataflowInterfaces.td:68`)
+///
+/// ⭐ THE TWO PATHS COLLAPSE TO ONE FIELD HERE. An op of IBM's own dialect implements the interface
+/// and holds the name in a property; an upstream `scf.if` does not and holds it as a discardable
+/// attribute — and the reference's getter erases that difference, which is why one `Option<String>`
+/// field per op that can carry one is the whole of it.
+///
+/// ⛔ `None` ALSO MEANS "COULD NOT CARRY ONE", exactly as the reference's `nullptr` does: an op with
+/// no such attribute and an op whose attribute is absent are the same answer.
+#[must_use]
+pub fn dbg_name(op: &Op) -> Option<&str> {
+    match op {
+        Op::Scf(scf::Op::For { dbg_name, .. } | scf::Op::If { dbg_name, .. })
+        | Op::Affine(affine::Op::For { dbg_name, .. } | affine::Op::If { dbg_name, .. })
+        | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => {
+            dbg_name.as_deref()
+        }
+        // ── the ops of this island that carry no name at all ─────────────────────────────────────
+        Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
+        | Op::Affine(
+            affine::Op::Apply { .. }
+            | affine::Op::Yield { .. }
+            | affine::Op::VectorLoad { .. }
+            | affine::Op::VectorStore { .. },
+        )
+        | Op::Arith(_)
+        | Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        // ⛔ AND `vector` HAS NO FIELD TO CARRY ONE. Upstream's `vector.load`/`vector.store` do print
+        // an `attr-dict`, so MLIR would let a `dbgName` ride on either — but
+        // [`super::vector::Op`] represents neither that dict nor any optional attribute, for the
+        // reason recorded there, and none of the nine occurrences in the authority tree carries one.
+        | Op::Vector(_)
+        | Op::Symbol(_)
+        // ⚠️ NO `uniform` OP CARRIES ONE ANYWHERE IN THE AUTHORITY'S FIXTURES. Its printer would
+        // show it — `printOptionalAttrDict(op->getAttrs(), {"list_sizes", "newly_added"})`
+        // (`Uniform.cpp:119-120`) hides only those two — and `dbgName` appears beside a
+        // `uniform.` op in none of `dcc/test`'s 352 `uniformize_regions`. The names in this pass's
+        // output belong to the `scf.if`s it clones (`flatten_local_region4.mlir:351`, `:357`).
+        | Op::Uniform(_) => None,
+    }
+}
+
+/// THE SLOT THE OP'S `dbgName` LIVES IN, or `None` for an op that cannot hold one —
+/// `dataflow::setDbgNameAttr`.
+///
+/// ```cpp
+/// void mlir::dataflow::setDbgNameAttr(Operation* op, StringAttr name) {
+///   if (auto iface = dyn_cast<DebugNameOpInterface>(op)) {
+///     iface.setDbgNameAttr(name);
+///     return;
+///   }
+///   if (name != nullptr) {
+///     op->setAttr(DebugNameOpInterface::kDbgNameAttrName, name);
+///     return;
+///   }
+///   op->removeAttr(DebugNameOpInterface::kDbgNameAttrName);
+/// }
+/// ```
+/// (`DataflowOpInterfaces.cpp:38-50`)
+///
+/// ⭐ A SLOT AND NOT A SETTER, because the reference's one function both writes and REMOVES: passing
+/// `nullptr` erases the attribute. `*slot = None` is that erasure, and `*slot = Some(..)` the write.
+///
+/// ⛔ AND `None` FROM THIS FUNCTION IS A DIFFERENT ANSWER FROM [`dbg_name`]'s: it says the op has no
+/// place to put a name, which for the reference is impossible (any `Operation*` takes a discardable
+/// attribute). Nothing in bridge 2 names an op that this island does not give a field to — the only
+/// caller is `mergeShallow`'s last statement, whose `dst` is one of the two conditionals.
+#[must_use]
+pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
+    match op {
+        Op::Scf(scf::Op::For { dbg_name, .. } | scf::Op::If { dbg_name, .. })
+        | Op::Affine(affine::Op::For { dbg_name, .. } | affine::Op::If { dbg_name, .. })
+        | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => Some(dbg_name),
+        Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
+        | Op::Affine(
+            affine::Op::Apply { .. }
+            | affine::Op::Yield { .. }
+            | affine::Op::VectorLoad { .. }
+            | affine::Op::VectorStore { .. },
+        )
+        | Op::Arith(_)
+        | Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        // ⛔ `vector` AGAIN, AND HERE THE `None` IS THE STRONGER CLAIM — see [`dbg_name`]: the island
+        // gives these two ops no slot, so `mergeShallow` could not name one if it were handed one.
+        // It is not: its `dst` is a conditional.
+        | Op::Vector(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_) => None,
     }
 }
 
@@ -920,10 +1141,14 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             }
             scf::Op::If {
                 cond,
+                results: binds,
                 body,
                 else_body,
+                // ⛔ NOT A VALUE, exactly as on the loop above.
+                dbg_name: _,
             } => {
                 operands.push(cond);
+                results.extend(binds.iter_mut());
                 regions.extend([body, else_body]);
             }
             scf::Op::Yield { operands: reads } => operands.extend(reads.iter_mut()),
@@ -963,6 +1188,8 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 results: binds,
                 body,
                 else_body,
+                // ⛔ NOT A VALUE, as on every other op that carries one.
+                dbg_name: _,
             } => {
                 operands.extend(args.iter_mut());
                 operands.extend(symbol_args.iter_mut());
@@ -1183,6 +1410,35 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
         },
         // ⛔ A SYMBOL READS NOTHING AND HOLDS NOTHING; it binds the extent entry 091's walk stops at.
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => results.push(result),
+        // ⛔⛔ FOUR GROUPS FOR ONE OP, AND ENTRY 182 USES THREE OF THEM. `cloneWithoutRegions`
+        // (`FlatteningLocalRegions.cpp:258`) rewrites the OPERANDS through its mapping, takes fresh
+        // RESULTS, and leaves the regions empty for the recursion to fill — so `units` must land in
+        // `operands`, `arg` in `block_args`, and `body` in `regions`, or the clone reads the
+        // original's values under a name the printer has already numbered.
+        Op::Uniform(op) => match op {
+            uniform::Op::UniformizeRegions {
+                regions: local_regions,
+                results: bound,
+            } => {
+                for region in local_regions {
+                    operands.extend(region.units.iter_mut());
+                    block_args.push(&mut region.arg);
+                    regions.push(&mut region.body);
+                }
+                results.extend(bound.iter_mut());
+            }
+            uniform::Op::Yield { operands: yielded } => operands.extend(yielded.iter_mut()),
+            uniform::Op::DefImmutableMapping { result, pairs } => {
+                for (key, value) in pairs {
+                    operands.extend([key, value]);
+                }
+                results.push(result);
+            }
+            uniform::Op::QueryMap { result, map, key } => {
+                operands.extend([map, key]);
+                results.push(result);
+            }
+        },
     }
     OpPartsMut {
         operands,
@@ -1380,7 +1636,10 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                     vals.push((Role::Result, &mut carried.result));
                 }
             }
-            scf::Op::If { cond, .. } => vals.push((Role::Operand, cond)),
+            scf::Op::If { cond, results, .. } => {
+                vals.push((Role::Operand, cond));
+                vals.extend(results.iter_mut().map(|val| (Role::Result, val)));
+            }
             scf::Op::Yield { operands } => {
                 vals.extend(operands.iter_mut().map(|val| (Role::Operand, val)));
             }
@@ -1426,6 +1685,7 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 results,
                 body: _,
                 else_body: _,
+                dbg_name: _,
             } => {
                 vals.extend(args.iter_mut().map(|val| (Role::Operand, val)));
                 vals.extend(symbol_args.iter_mut().map(|val| (Role::Operand, val)));
@@ -1677,6 +1937,32 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => {
             vals.push((Role::Result, result));
         }
+        // ⭐ THE UNITS ARE READ, THE REGION ARGUMENT IS BOUND, AND THE RESULTS ARE DEFINED — the
+        // three roles [`operands`], [`block_args`] and [`results`] give the same op, in that order.
+        Op::Uniform(op) => match op {
+            uniform::Op::UniformizeRegions { regions, results } => {
+                for region in regions {
+                    vals.extend(region.units.iter_mut().map(|unit| (Role::Operand, unit)));
+                    vals.push((Role::BlockArg, &mut region.arg));
+                }
+                vals.extend(results.iter_mut().map(|result| (Role::Result, result)));
+            }
+            uniform::Op::Yield { operands } => {
+                vals.extend(operands.iter_mut().map(|read| (Role::Operand, read)));
+            }
+            uniform::Op::DefImmutableMapping { result, pairs } => {
+                for (key, value) in pairs {
+                    vals.push((Role::Operand, key));
+                    vals.push((Role::Operand, value));
+                }
+                vals.push((Role::Result, result));
+            }
+            uniform::Op::QueryMap { result, map, key } => {
+                vals.push((Role::Operand, map));
+                vals.push((Role::Operand, key));
+                vals.push((Role::Result, result));
+            }
+        },
     }
     vals
 }
@@ -1821,8 +2107,10 @@ mod unit_tests {
             // Two regions.
             Op::Scf(scf::Op::If {
                 cond: Val(60),
+                results: Vec::new(),
                 body: vec![Op::Agen(agen::Op::Yield)],
                 else_body: Vec::new(),
+                dbg_name: None,
             }),
         ]
     }

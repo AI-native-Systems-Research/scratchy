@@ -574,6 +574,9 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
         // `AgenToSentient` names the `agen` classes only.
         | DfirOp::Vector(_)
         | DfirOp::VectorChain(_)
+        // ⭐ AND `uniform` WITH THEM: none of its four ops is in the `agen` dialect, so
+        // `dyn_cast<agen::…>` is null for every one of them.
+        | DfirOp::Uniform(_)
         | DfirOp::Symbol(_) => None,
     }
 }
@@ -661,6 +664,8 @@ impl AgenLoad {
             // `vector::LoadOp` anywhere in the chain.
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+            // ⭐ AND `uniform`: no `uniform.` op is one of the five load classes.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }
@@ -722,6 +727,9 @@ impl Rearrangement {
             | DfirOp::Agen(_)
             // ⭐ NOT A REARRANGEMENT: the three are `vectorchain` ops.
             | DfirOp::Vector(_)
+            // ⭐ AND NOR IS `uniform`: `isa<SelectOp, ShuffleOp, RotateOp>` names three
+            // `vectorchain` ops and nothing else.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }

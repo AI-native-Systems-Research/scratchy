@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`151/384 ported; 151/384 audited`
+`159/384 ported; 159/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -733,6 +733,72 @@ reproduced and noted, and nothing downstream indexes with these.
 ⚠️ 160 HAS NO CALLER AT `a0d29abbed` — a grep of the authority tree finds the symbol once, at its own
 definition; its neighbours decide the corelet split inline or through 161. Ported anyway, as 042 was.
 
+⭐ AND ENTRIES 175-182 — `updateYieldArgs` in `vc_lowering_xrf.rs`; `opHasSideEffect` and
+`mergeShallow` in `tf_cfgs_dataflow_conditional_tree.rs`; `CanonicalizeToggleDataflowPass::
+runOnOperation` in `tf_canonicalize_toggle.rs`; and the Flattening tree's `clear`, `traverseRegion`,
+`inRegionEmpty` and `cloneOpsForRegions` in `tf_flattening_local_regions.rs`. ⛔⛔ THE ISLAND GAINED A
+WHOLE DIALECT HERE, AS THE BRIEF REQUIRES: `uniform.uniformize_regions` is the op this entire pass
+family is about, and it was inexpressible. `islands/dataflow_ir/dialects/uniform.rs` declares its four
+ops — `uniformize_regions` with a `LocalRegion` per arm (a unit list, a block argument and a body),
+`yield`, `def_immutable_mapping` and `query_map` — as the eighth `dialects::Op` variant, wired through
+`operands`/`results`/`regions`/`block_args` and the printer, and answered in 22 census arms across the
+bridge. Every one of those arms is a `dyn_cast` in the reference that a `uniform.` op fails, and each
+carries the reason it fails rather than a catch-all.
+
+⛔⛔ 180 AND 182 ARE THE FLATTENING ITSELF, AND 182 IS WHERE THE BINDER MOVES. `traverseRegion` walks a
+local region attributing every operation to every unit and stamping its parent's region index;
+`cloneOpsForRegions` then rebuilds ONE equivalence class's body, dropping the nested
+`uniform.uniformize_regions` and splicing in the operations of whichever of its regions belongs to that
+class (`:235-238`). ⛔ THE REGION AN OPERATION CAME FROM HAS TO BE FOUND BY POINTER IDENTITY, NOT BY
+`is_in_region_num`: `compute` stamps `false` — 0 — for EVERY region of a uniformized op (`:164`), so
+the field cannot tell region 1 from region 0, and `:250-251` asks the parent which of its bodies holds
+this operation instead. That is what lets `uniform.query_map(map:%285, key:%arg48)` come out reading the
+NEW region's block argument (`flatten_local_region4.mlir:757` becomes `:355`), which is the whole point
+of the pass. ⭐ AND `if (block.empty()) block.erase()` (`:269`) IS AN EMPTY `Vec` HERE, because the
+island already records a blockless region as an empty `else_body` — the vendor's own flattened
+`scf.if` at `:353-357` prints no `else`, so the case is live rather than theoretical.
+
+⛔ 180 ENDS AT A `todo!` NAMING ENTRY 247, ON THE REFERENCE'S OWN `isa<>`. `traverseRegion` hands a
+nested `uniform.uniformize_regions` to `compute` (`:137-138`), which is entry 247 at level 2 and
+unported; the walk therefore refuses exactly the input the reference routes elsewhere, and every region
+of fixtures 1-3 and fixture 4's outer region walk completely. Same shape as 178, whose one rewrite is
+`DuplicateReusedToggle`'s pattern at level 6: the driver is ported, the `todo!` names the entry that
+owes the rewrite, and it is gated on the real match condition so a program with no reused toggle is a
+checked no-op.
+
+⛔ 181 HAS NO CALLER ANYWHERE IN THE AUTHORITY TREE, AND THE REASON IS A DEFECT WORTH RECORDING. It is
+declared (`:88`), defined (`:214`) and referenced nowhere else. The place that wants it is `:269` — is
+this region empty — and it would have answered WRONGLY there, twice over: `is_in_region_num` is 0 for
+every local region's children (`:164`) so a full region reads empty, and the predicate cannot see the
+unit-class filter at `:233` that decides what actually gets cloned. Ported anyway, per this document's
+rule that deciding a function is unnecessary is not the porter's judgement, with a test that pins the
+wrong answer rather than a port that quietly corrects it.
+
+⭐ THE ISLAND ALSO GAINED `Values::clone_without_regions` (MLIR's `Operation::cloneWithoutRegions`),
+`scf::Op::If::results` and `affine::Op::If::dbg_name`. The result list is not cosmetic: 177 keeps the
+DESTINATION's terminator when `dst->getNumResults() != 0` and the source's otherwise (`:420-428`), its
+caller picks which of two candidates is the destination by the same question (`:237-247`), and
+`areShallowlyMergeable` declines outright when both bind something (`:348`) — three decisions that a
+census answering "none" for every `scf.if` would have made constant. And the `dbgName` on an
+`affine.if` is there because `mergeShallow`'s candidates are `isa<affine::AffineIfOp, scf::IfOp>`
+(`:34`), so an `affine.if` reaches `setDbgNameAttr` on the same path.
+
+⛔ AND `UNITS.tsv`'s CALLEE COLUMN IS WRONG FOR FOUR OF THESE EIGHT. 175's is `-` because the extract
+truncated the body one line early, at `setOperands`, dropping `return getXrfValue(yield_op, idx)` — so
+the real edge is 175 → 090, and the tail is the half that makes the function a function rather than a
+mutation. 178's is `e001_matchAndRewrite`, but `AffineYieldOpLowering` has nothing to do with this pass;
+the pattern it adds is `e350_matchAndRewrite`. 177's names `e052_If`, which `mergeShallow` does not
+call. 180's is `-` although the body calls `compute` at `:138`. The ports follow the authority, not the
+column.
+
+⚠️ AND ONE OF THIS BATCH'S OWN TESTS PASSED FOR THE WRONG REASON BEFORE IT PASSED FOR THE RIGHT ONE.
+182's case-4 test built its `Values` counter at zero, so the clone minted `%4` while the fixture it was
+cloning still read the ORIGINAL `%4` — printing `%4 = arith.subi %2, %4`, which looks exactly like a
+clone correctly reading a value from outside the region. It was caught by reading the output rather than
+the assertion, and the fixture now starts its counter past the program (`values_past(300)`), which is
+also why the pinned text can be read against `flatten_local_region4.mlir:345-358` line for line.
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -1086,22 +1152,22 @@ definition; its neighbours decide the corelet split inline or through 161. Porte
 - [ ] **AUDIT 173/384** `insertConstAndAddOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:296`, line by line against the C++
 - [ ] **PORT 174/384** `isXrfRelated` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:531`, 31 lines
 - [ ] **AUDIT 174/384** `isXrfRelated` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:531`, line by line against the C++
-- [ ] **PORT 175/384** `updateYieldArgs` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690`, 8 lines
-- [ ] **AUDIT 175/384** `updateYieldArgs` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690`, line by line against the C++
-- [ ] **PORT 176/384** `opHasSideEffect` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38`, 13 lines
-- [ ] **AUDIT 176/384** `opHasSideEffect` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38`, line by line against the C++
-- [ ] **PORT 177/384** `mergeShallow` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398`, 60 lines
-- [ ] **AUDIT 177/384** `mergeShallow` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398`, line by line against the C++
-- [ ] **PORT 178/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49`, 42 lines
-- [ ] **AUDIT 178/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49`, line by line against the C++
-- [ ] **PORT 179/384** `clear` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112`, 15 lines
-- [ ] **AUDIT 179/384** `clear` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112`, line by line against the C++
-- [ ] **PORT 180/384** `traverseRegion` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129`, 17 lines
-- [ ] **AUDIT 180/384** `traverseRegion` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129`, line by line against the C++
-- [ ] **PORT 181/384** `inRegionEmpty` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214`, 6 lines
-- [ ] **AUDIT 181/384** `inRegionEmpty` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214`, line by line against the C++
-- [ ] **PORT 182/384** `cloneOpsForRegions` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223`, 60 lines
-- [ ] **AUDIT 182/384** `cloneOpsForRegions` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223`, line by line against the C++
+- [x] **PORT 175/384** `updateYieldArgs` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690`, 8 lines
+- [x] **AUDIT 175/384** `updateYieldArgs` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690`, line by line against the C++
+- [x] **PORT 176/384** `opHasSideEffect` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38`, 13 lines
+- [x] **AUDIT 176/384** `opHasSideEffect` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38`, line by line against the C++
+- [x] **PORT 177/384** `mergeShallow` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398`, 60 lines
+- [x] **AUDIT 177/384** `mergeShallow` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398`, line by line against the C++
+- [x] **PORT 178/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49`, 42 lines
+- [x] **AUDIT 178/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49`, line by line against the C++
+- [x] **PORT 179/384** `clear` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112`, 15 lines
+- [x] **AUDIT 179/384** `clear` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112`, line by line against the C++
+- [x] **PORT 180/384** `traverseRegion` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129`, 17 lines
+- [x] **AUDIT 180/384** `traverseRegion` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129`, line by line against the C++
+- [x] **PORT 181/384** `inRegionEmpty` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214`, 6 lines
+- [x] **AUDIT 181/384** `inRegionEmpty` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214`, line by line against the C++
+- [x] **PORT 182/384** `cloneOpsForRegions` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223`, 60 lines
+- [x] **AUDIT 182/384** `cloneOpsForRegions` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223`, line by line against the C++
 - [ ] **PORT 183/384** `expandAffineApplyOps` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:183`, 53 lines
 - [ ] **AUDIT 183/384** `expandAffineApplyOps` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:183`, line by line against the C++
 - [ ] **PORT 184/384** `getLoopTripCount` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:743`, 56 lines

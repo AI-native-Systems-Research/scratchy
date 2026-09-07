@@ -79,7 +79,9 @@
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::ProgramUnit;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+use crate::islands::dataflow_ir::dialects::{
+    self as dfir_op, Op as DfirOp, Val, affine, arith, scf, symbol,
+};
 
 /// WHICH TRANSFORM MERGED THE OPERATIONS — the prefix a merged `dbgName` opens with.
 ///
@@ -616,8 +618,9 @@ mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
     use crate::islands::dataflow_ir::Units;
-    use crate::islands::dataflow_ir::ty::IntegerSet;
-    use crate::units::DfirUnit;
+    use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::dataflow_ir::ty::{ElemType, IntegerSet, ScalarTy, Vector};
+    use crate::units::{DfirUnit, Residency};
 
     /// 🎯 097/384 — TWO MERGES OF THREE CONDITIONALS PRODUCE THE REFERENCE'S OWN NESTED NAME.
     ///
@@ -729,8 +732,10 @@ mod unit_tests {
     fn a_value_based_conditional() -> (DfirOp, Vec<DfirOp>) {
         let if_op = DfirOp::Scf(scf::Op::If {
             cond: Val(30),
+            results: Vec::new(),
             body: Vec::new(),
             else_body: Vec::new(),
+            dbg_name: None,
         });
         let scope = vec![
             DfirOp::Arith(arith::Op::Constant {
@@ -918,8 +923,10 @@ mod unit_tests {
     fn only_an_affine_if_and_an_scf_if_are_selected() {
         let scf_if = DfirOp::Scf(scf::Op::If {
             cond: Val(0),
+            results: Vec::new(),
             body: Vec::new(),
             else_body: Vec::new(),
+            dbg_name: None,
         });
         let affine_if = DfirOp::Affine(affine::Op::If {
             set: IntegerSet::from_sizes(&[4]),
@@ -928,6 +935,7 @@ mod unit_tests {
             results: Vec::new(),
             body: Vec::new(),
             else_body: Vec::new(),
+            dbg_name: None,
         });
         let parallel = DfirOp::Scf(scf::Op::Parallel {
             ivs: vec![Val(2)],
@@ -957,10 +965,12 @@ mod unit_tests {
     fn the_dummy_yield_is_what_makes_an_else_print() {
         let mut op = DfirOp::Scf(scf::Op::If {
             cond: Val(0),
+            results: Vec::new(),
             body: vec![DfirOp::Scf(scf::Op::Yield {
                 operands: Vec::new(),
             })],
             else_body: Vec::new(),
+            dbg_name: None,
         });
 
         let mut before = String::new();
@@ -994,8 +1004,8 @@ mod unit_tests {
         );
     }
 
-    /// 🎯 096/384 — AN `else` THAT ALREADY HAS A BLOCK IS NOT A CANDIDATE, AND NEITHER IS AN
-    /// `affine.if` THAT YIELDS A VALUE.
+    /// 🎯 096/384 — AN `else` THAT ALREADY HAS A BLOCK IS NOT A CANDIDATE, AND NEITHER IS A
+    /// CONDITIONAL OF EITHER KIND THAT YIELDS A VALUE.
     ///
     /// `if (if_op->getRegions()[1].empty() && if_op->getNumResults() == 0)`
     /// (`CFGSDataflowConditionalTree.cpp:383-386`) — the conjunction, both halves.
@@ -1003,10 +1013,12 @@ mod unit_tests {
     fn a_populated_else_and_a_value_yielding_if_are_not_candidates() {
         let mut populated = DfirOp::Scf(scf::Op::If {
             cond: Val(0),
+            results: Vec::new(),
             body: Vec::new(),
             else_body: vec![DfirOp::Scf(scf::Op::Yield {
                 operands: Vec::new(),
             })],
+            dbg_name: None,
         });
         assert!(EmptyElseRegion::of(&mut populated).is_none());
 
@@ -1017,8 +1029,526 @@ mod unit_tests {
             results: vec![Val(2)],
             body: Vec::new(),
             else_body: Vec::new(),
+            dbg_name: None,
         });
         assert!(EmptyElseRegion::of(&mut yields_a_value).is_none());
+
+        // ⭐ AND THE `scf` ARM ANSWERS THE SAME WAY NOW THAT THE OP CARRIES A RESULT LIST — the
+        // vendor's `%13 = scf.if %12 -> (index)` (`merging.mlir:129`) is the state the reference's
+        // `getNumResults() == 0` half of the conjunction stops on.
+        let mut scf_yields_a_value = DfirOp::Scf(scf::Op::If {
+            cond: Val(12),
+            results: vec![Val(13)],
+            body: Vec::new(),
+            else_body: Vec::new(),
+            dbg_name: None,
+        });
+        assert!(EmptyElseRegion::of(&mut scf_yields_a_value).is_none());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 176/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// `%9 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "pe-CL0", type = "pe"}`
+    /// (`merging-shallow-skip.mlir:22`) — an op of a dialect the side-effect list never mentions.
+    ///
+    /// ⚠️ The ops actually sitting BETWEEN that fixture's two conditionals are `dataflow.receive`,
+    /// `dataflow.send` and the two `vectorchain` ops (`:55-59`), and the island's send/receive pair
+    /// spends a [`crate::islands::dataflow_ir::link::Link`] end that a unit test cannot mint out of
+    /// nothing. They land on the SAME classification arm as this one — `DfirOp::Dataflow(_)` — which is
+    /// the fact under test.
+    fn a_dataflow_op() -> DfirOp {
+        DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result: Val(9),
+            residency: Residency::Global,
+            unit: DfirUnit::Pe,
+        })
+    }
+
+    /// 🎯 176/384 — THE ELEVEN NAMED OPS PASS, AND NOTHING ELSE DOES.
+    ///
+    /// The list is `isa<arith::ConstantOp, arith::ConstantIndexOp, arith::ConstantIntOp,
+    /// arith::CmpIOp, scf::YieldOp, scf::ForOp, affine::AffineForOp, affine::AffineYieldOp,
+    /// mlir::symbol::CreateSymbolOp>` plus the two conditionals `isOperationSelected` answers for
+    /// (`CFGSDataflowConditionalTree.cpp:41-44`).
+    #[test]
+    fn only_the_named_ops_are_free_of_side_effects() {
+        let harmless = [
+            // `%0 = arith.constant 1 : index` (`merging-shallow-skip.mlir:13`).
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(0),
+                value: 1,
+            }),
+            // `%1 = arith.constant true` (`:14`).
+            DfirOp::Arith(arith::Op::ConstantInt {
+                result: Val(1),
+                value: arith::IntConst::Bool(true),
+            }),
+            // `%3 = arith.constant dense<1.000000e+00> : vector<64xf16>` (`:16`) — still an
+            // `arith::ConstantOp`.
+            DfirOp::Arith(arith::Op::DenseConstant {
+                result: Val(3),
+                splat: 1,
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            }),
+            // `%22 = arith.cmpi eq, %21, %8 : index` (`:35`).
+            DfirOp::Arith(arith::Op::Compare {
+                result: Val(22),
+                predicate: arith::CmpIPredicate::Eq,
+                lhs: Val(21),
+                rhs: Val(8),
+            }),
+            // `scf.yield %1 : i1` (`:37`).
+            DfirOp::Scf(scf::Op::Yield {
+                operands: vec![Val(1)],
+            }),
+            // `scf.for` — a counted loop is not a movement barrier by itself.
+            DfirOp::Scf(scf::Op::For {
+                iv: Val(50),
+                lo: Val(51),
+                hi: Val(52),
+                step: Val(53),
+                carried: Vec::new(),
+                body: Vec::new(),
+                dbg_name: None,
+            }),
+            // `affine.for %21 = 0 to 28 {` (`:34`).
+            DfirOp::Affine(affine::Op::For {
+                iv: Val(21),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(28),
+                carried: Vec::new(),
+                body: Vec::new(),
+                dbg_name: None,
+            }),
+            // `affine.yield`.
+            DfirOp::Affine(affine::Op::Yield {
+                operands: Vec::new(),
+            }),
+            // `symbol.create_symbol {SymbolId = 0 : i32} : index`.
+            DfirOp::Symbol(symbol::Op::CreateSymbol {
+                result: Val(38),
+                symbol_id: 0,
+            }),
+            // `!isOperationSelected(*op) &&` — the two conditionals, empty here.
+            DfirOp::Scf(scf::Op::If {
+                cond: Val(23),
+                results: Vec::new(),
+                body: Vec::new(),
+                else_body: Vec::new(),
+                dbg_name: None,
+            }),
+            DfirOp::Affine(affine::Op::If {
+                set: IntegerSet::from_sizes(&[4]),
+                args: vec![Val(1)],
+                symbol_args: Vec::new(),
+                results: Vec::new(),
+                body: Vec::new(),
+                else_body: Vec::new(),
+                dbg_name: None,
+            }),
+        ];
+        for op in &harmless {
+            assert!(!op_has_side_effect(op), "on the list: {op:?}");
+        }
+
+        assert!(
+            op_has_side_effect(&a_dataflow_op()),
+            "a dialect the list never mentions"
+        );
+    }
+
+    /// 🎯 176/384 — ⛔ IT IS AN ALLOW-LIST, NOT A PURITY TEST: `arith.addi` and `arith.muli` are
+    /// `Pure` in MLIR and this answers *"has a side effect"* for both, because neither is named.
+    #[test]
+    fn pure_arithmetic_is_not_on_the_list() {
+        for op in [
+            arith::Op::AddI(arith::IntBinary {
+                result: Val(60),
+                lhs: Val(61),
+                rhs: Val(62),
+                ty: ScalarTy::Index,
+            }),
+            arith::Op::MulI(arith::IntBinary {
+                result: Val(63),
+                lhs: Val(64),
+                rhs: Val(65),
+                ty: ScalarTy::Index,
+            }),
+        ] {
+            assert!(op_has_side_effect(&DfirOp::Arith(op)));
+        }
+    }
+
+    /// 🎯 176/384 — THE WALK IS PRE-ORDER OVER THE WHOLE SUBTREE, so a listed op holding an unlisted
+    /// one answers for its body: the fixture's `scf.if %23 { %24 = dataflow.receive .. }` (`:41-47`)
+    /// is a conditional — on the list — whose contents are not.
+    #[test]
+    fn the_walk_descends_into_every_region() {
+        let with_a_dataflow_op_inside = DfirOp::Scf(scf::Op::If {
+            cond: Val(23),
+            results: Vec::new(),
+            body: vec![a_dataflow_op()],
+            else_body: Vec::new(),
+            dbg_name: None,
+        });
+        assert!(op_has_side_effect(&with_a_dataflow_op_inside));
+
+        // ⭐ AND THE `else` REGION IS WALKED TOO — half a conditional scanned is a merge across an op
+        // that must not move.
+        let only_in_the_else = DfirOp::Scf(scf::Op::If {
+            cond: Val(23),
+            results: Vec::new(),
+            body: Vec::new(),
+            else_body: vec![a_dataflow_op()],
+            dbg_name: None,
+        });
+        assert!(op_has_side_effect(&only_in_the_else));
+
+        // A nest of nothing but listed ops, three levels deep.
+        let clean = DfirOp::Affine(affine::Op::For {
+            iv: Val(21),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(28),
+            carried: Vec::new(),
+            body: vec![DfirOp::Scf(scf::Op::If {
+                cond: Val(23),
+                results: Vec::new(),
+                body: vec![DfirOp::Scf(scf::Op::Yield {
+                    operands: vec![Val(1)],
+                })],
+                else_body: vec![DfirOp::Scf(scf::Op::Yield {
+                    operands: vec![Val(2)],
+                })],
+                dbg_name: None,
+            })],
+            dbg_name: None,
+        });
+        assert!(!op_has_side_effect(&clean));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 177/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// ONE STATEMENT OF A CONDITIONAL'S ARM, IDENTIFIABLE BY WHAT IT BINDS.
+    ///
+    /// ⚠️ `merging.mlir`'s arms hold `dataflow.receive`/`dataflow.send` pairs, which spend a
+    /// [`crate::islands::dataflow_ir::link::Link`] end a unit test cannot mint out of nothing — the
+    /// same limit [`a_dataflow_op`] records. What a splice is observed by is ORDER, so a
+    /// distinguishable statement suffices and an `arith.constant` is the cheapest one.
+    fn statement(n: u32) -> DfirOp {
+        DfirOp::Arith(arith::Op::Constant {
+            result: Val(n),
+            value: i64::from(n),
+        })
+    }
+
+    /// AN `scf.if %12` WITH THE GIVEN ARMS AND NAME, ITS TERMINATORS EXPLICIT.
+    ///
+    /// ⭐ A `then` ARM ALWAYS HAS A BLOCK AND A BLOCK ALWAYS HAS ITS TERMINATOR — elided when
+    /// printed, present in the region (see [`scf::Op::If::else_body`]). An `else` arm given `None`
+    /// has NO BLOCK, which is the state entry 096 fills.
+    fn conditional(
+        results: Vec<Val>,
+        body: Vec<u32>,
+        else_body: Option<Vec<u32>>,
+        yields: (Vec<Val>, Vec<Val>),
+        dbg_name: &str,
+    ) -> DfirOp {
+        let arm = |ops: Vec<u32>, operands: Vec<Val>| {
+            let mut arm: Vec<DfirOp> = ops.into_iter().map(statement).collect();
+            arm.push(DfirOp::Scf(scf::Op::Yield { operands }));
+            arm
+        };
+        DfirOp::Scf(scf::Op::If {
+            cond: Val(12),
+            results,
+            body: arm(body, yields.0),
+            else_body: else_body.map_or_else(Vec::new, |ops| arm(ops, yields.1)),
+            dbg_name: Some(dbg_name.to_owned()),
+        })
+    }
+
+    /// THE TWO ARMS AND THE NAME OF A CONDITIONAL, FOR COMPARISON.
+    fn arms_and_name(op: &DfirOp) -> (&[DfirOp], &[DfirOp], Option<&str>) {
+        let DfirOp::Scf(scf::Op::If {
+            body, else_body, ..
+        }) = op
+        else {
+            unreachable!("every conditional in these tests is an scf.if")
+        };
+        (body, else_body, dfir_op::dbg_name(op))
+    }
+
+    /// 🎯 177/384 — `merging.mlir`'S TWO MERGES END WITH ITS OWN REGIONS AND ITS OWN NESTED NAME.
+    ///
+    /// The fixture's three mergeable conditionals on `%12` are, in block order
+    /// (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:122-146`):
+    ///
+    /// | name | binds | `then` | `else` |
+    /// |---|---|---|---|
+    /// | `"SCF-If #2"` (`:122-128`) | nothing | a receive/mac/send chain | ⛔ NO BLOCK |
+    /// | `"SCF-If #3"` (`:129-133`) | `%13 : index` | `scf.yield %c1` | `scf.yield %c2` |
+    /// | `"SCF-If #4"` (`:134-146`) | nothing | a chain on `%cst` | a chain on `%cst_1` |
+    ///
+    /// and `shallowlyMergeConditionals` performs exactly two merges over them, in this order and with
+    /// these arguments (`:237-247`):
+    ///
+    /// 1. `n` is `#2`, which binds nothing ⇒ `mergeShallow(src: #2, dst: #3, dst_before_src: false)`.
+    /// 2. `n` is now `#3`, which binds `%13` ⇒ `mergeShallow(src: #4, dst: #3, dst_before_src: true)`.
+    ///
+    /// ⭐⭐ AND THE EXPECTATION PINS THE RESULT ARM BY ARM (`:40-59`): one `scf.if -> (index)` whose
+    /// `then` holds `#2`'s chain, then `#4`'s chain, then `scf.yield %c1`, and whose `else` holds
+    /// `#4`'s `else` chain and then `scf.yield %c2` — so the earlier op's statements come first in
+    /// BOTH merges even though the two took opposite orders, and the only surviving terminators are
+    /// `#3`'s, the pair whose operands are the merged op's results.
+    #[test]
+    fn the_fixtures_two_merges_end_with_its_own_regions_and_name() {
+        let c1 = Val(1);
+        let c2 = Val(2);
+        let mut second = conditional(
+            Vec::new(),
+            vec![20],
+            None,
+            (Vec::new(), Vec::new()),
+            "SCF-If #2",
+        );
+        let mut third = conditional(
+            vec![Val(13)],
+            Vec::new(),
+            Some(Vec::new()),
+            (vec![c1], vec![c2]),
+            "SCF-If #3",
+        );
+        let mut fourth = conditional(
+            Vec::new(),
+            vec![40],
+            Some(vec![41]),
+            (Vec::new(), Vec::new()),
+            "SCF-If #4",
+        );
+
+        merge_shallow(&mut second, &mut third, MergeOrder::SrcFirst);
+        assert_eq!(
+            arms_and_name(&third),
+            (
+                [statement(20), DfirOp::Scf(scf::Op::Yield { operands: vec![c1] })].as_slice(),
+                [DfirOp::Scf(scf::Op::Yield { operands: vec![c2] })].as_slice(),
+                Some("CFGSM(SCF-If #2, SCF-If #3)"),
+            ),
+            "the source stands FIRST in the block, so its statements are prepended, and the \
+             destination's yields survive because the destination is what binds %13"
+        );
+
+        merge_shallow(&mut fourth, &mut third, MergeOrder::DstFirst);
+        assert_eq!(
+            arms_and_name(&third),
+            (
+                [
+                    statement(20),
+                    statement(40),
+                    DfirOp::Scf(scf::Op::Yield { operands: vec![c1] })
+                ]
+                .as_slice(),
+                [
+                    statement(41),
+                    DfirOp::Scf(scf::Op::Yield { operands: vec![c2] })
+                ]
+                .as_slice(),
+                Some("CFGSM(SCF-If #4, CFGSM(SCF-If #2, SCF-If #3))"),
+            ),
+            "merging.mlir:40-59 — and the name NESTS, because the second merge reads what the first \
+             one wrote"
+        );
+
+        // ⭐ AND THE SOURCES ARE LEFT SPLICED OUT, NOT DELETED: `shallowlyMergeConditionals` erases
+        // them afterwards through `deleteAncestorsIfPossible` (`:242`, `:257`, `:269`).
+        for spliced in [&second, &fourth] {
+            let (body, else_body, _) = arms_and_name(spliced);
+            assert!(body.is_empty() && else_body.is_empty(), "{spliced:?}");
+        }
+    }
+
+    /// 🎯 177/384 — AN ABSENT `else` ARM IS GIVEN ITS TERMINATOR BEFORE THE SPLICE, AND IS THEN A
+    /// DESTINATION LIKE ANY OTHER.
+    ///
+    /// `if (src_region_empty) createDummyYieldInElseReg(src); else if (dst_region_empty)
+    /// createDummyYieldInElseReg(dst);` (`CFGSDataflowConditionalTree.cpp:408-411`) — one call, on
+    /// whichever side is missing a block, and never on both because the arm was skipped when both
+    /// were empty (`:404`).
+    ///
+    /// ⭐ THE OBSERVABLE IS A PAIR OF BRACES THAT WAS NOT PRINTED BEFORE — a conditional whose `else`
+    /// region has no block prints no `else` at all (`dcc/test/PT/issue-236.mlir:65-71`, entry 096).
+    #[test]
+    fn an_absent_else_arm_is_filled_before_it_is_spliced_into() {
+        let mut src = conditional(
+            Vec::new(),
+            vec![70],
+            Some(vec![71]),
+            (Vec::new(), Vec::new()),
+            "src",
+        );
+        let mut dst = conditional(
+            Vec::new(),
+            vec![80],
+            None,
+            (Vec::new(), Vec::new()),
+            "dst",
+        );
+
+        let mut before = String::new();
+        crate::islands::dataflow_ir::print::emit(&mut before, &dst, 0);
+        assert!(!before.contains("else"), "{before}");
+
+        merge_shallow(&mut src, &mut dst, MergeOrder::DstFirst);
+
+        let (body, else_body, name) = arms_and_name(&dst);
+        assert_eq!(
+            body,
+            [
+                statement(80),
+                statement(70),
+                DfirOp::Scf(scf::Op::Yield {
+                    operands: Vec::new()
+                })
+            ],
+            "the destination stands first, so the source's statements are appended"
+        );
+        assert_eq!(
+            else_body,
+            [
+                statement(71),
+                DfirOp::Scf(scf::Op::Yield {
+                    operands: Vec::new()
+                })
+            ],
+            "the dummy terminator was popped and the source's whole else arm took its place"
+        );
+        assert_eq!(name, Some("CFGSM(src, dst)"));
+
+        let mut after = String::new();
+        crate::islands::dataflow_ir::print::emit(&mut after, &dst, 0);
+        assert!(after.contains("} else {"), "{after}");
+    }
+
+    /// 🎯 177/384 — THE TERMINATOR THAT SURVIVES IS THE ONE BELONGING TO WHICHEVER CONDITIONAL BINDS
+    /// A VALUE, AND IT ALWAYS ENDS UP LAST.
+    ///
+    /// All four rows of [`merge_shallow`]'s own table, over one `then` arm holding a single statement
+    /// on each side. `areShallowlyMergeable` guarantees at most one side binds anything (`:348`), so
+    /// these four are the whole space.
+    #[test]
+    fn the_yield_of_the_side_that_binds_a_value_is_the_one_kept() {
+        let kept = Val(1);
+        let dropped = Val(2);
+
+        for (order, src_results, dst_results, want) in [
+            (MergeOrder::DstFirst, Vec::new(), Vec::new(), vec![80, 70]),
+            (MergeOrder::DstFirst, Vec::new(), vec![kept], vec![80, 70]),
+            (MergeOrder::SrcFirst, Vec::new(), Vec::new(), vec![70, 80]),
+            (MergeOrder::SrcFirst, vec![kept], Vec::new(), vec![70, 80]),
+        ] {
+            // ⭐ THE SIDE THAT BINDS NOTHING YIELDS NOTHING, which is what makes the surviving
+            // terminator identifiable: `dropped` may only ever appear on the side with no results.
+            let src_yield = if src_results.is_empty() {
+                vec![dropped]
+            } else {
+                vec![kept]
+            };
+            let dst_yield = if dst_results.is_empty() {
+                vec![dropped]
+            } else {
+                vec![kept]
+            };
+            let mut src = conditional(
+                src_results.clone(),
+                vec![70],
+                None,
+                (src_yield, Vec::new()),
+                "src",
+            );
+            let mut dst = conditional(
+                dst_results.clone(),
+                vec![80],
+                None,
+                (dst_yield, Vec::new()),
+                "dst",
+            );
+
+            merge_shallow(&mut src, &mut dst, order);
+
+            let (body, _, _) = arms_and_name(&dst);
+            let mut expected: Vec<DfirOp> = want.into_iter().map(statement).collect();
+            expected.push(DfirOp::Scf(scf::Op::Yield {
+                operands: if src_results.is_empty() && dst_results.is_empty() {
+                    vec![dropped]
+                } else {
+                    vec![kept]
+                },
+            }));
+            assert_eq!(
+                body, expected,
+                "{order:?} with src binding {src_results:?} and dst binding {dst_results:?}: \
+                 program order is preserved and exactly one terminator is left, last"
+            );
+        }
+    }
+
+    /// 🎯 177/384 — A MERGE WHOSE HALVES ARE NOT BOTH NAMED LEAVES THE DESTINATION'S NAME ALONE.
+    ///
+    /// `if (StringAttr new_dbg_name_attr = getNewDbgNameFromList("CFGSM(", {src, dst}))`
+    /// (`CFGSDataflowConditionalTree.cpp:455-458`) — the assignment is the condition, and entry 097
+    /// returns null as soon as one operation has no name.
+    ///
+    /// ⭐ AND THE REGIONS STILL MERGE. The name is the last three lines of the function; nothing
+    /// about the splice depends on it.
+    #[test]
+    fn an_unnamed_half_leaves_the_destinations_name_untouched() {
+        for (src_name, dst_name, want) in [
+            (None, Some("dst"), Some("dst")),
+            (Some("src"), None, None),
+            (Some("src"), Some("dst"), Some("CFGSM(src, dst)")),
+        ] {
+            let mut src = conditional(
+                Vec::new(),
+                vec![70],
+                None,
+                (Vec::new(), Vec::new()),
+                "src",
+            );
+            let mut dst = conditional(
+                Vec::new(),
+                vec![80],
+                None,
+                (Vec::new(), Vec::new()),
+                "dst",
+            );
+            *dfir_op::dbg_name_mut(&mut src).expect("an scf.if carries a name") =
+                src_name.map(str::to_owned);
+            *dfir_op::dbg_name_mut(&mut dst).expect("an scf.if carries a name") =
+                dst_name.map(str::to_owned);
+
+            merge_shallow(&mut src, &mut dst, MergeOrder::DstFirst);
+
+            let (body, _, name) = arms_and_name(&dst);
+            assert_eq!(name, want, "src {src_name:?}, dst {dst_name:?}");
+            assert_eq!(
+                body,
+                [
+                    statement(80),
+                    statement(70),
+                    DfirOp::Scf(scf::Op::Yield {
+                        operands: Vec::new()
+                    })
+                ],
+                "the splice does not depend on the names"
+            );
+        }
     }
 }
 
@@ -1079,6 +1609,9 @@ impl ConditionalKind {
             | DfirOp::Agen(_)
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+        // ⭐ `uniform` IS NOT MENTIONED EITHER. A `uniformize_regions` carries regions, but they are
+        // one per unit class rather than the two arms of a branch — see [`arms_of`].
+        | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }
@@ -1129,9 +1662,10 @@ pub fn is_operation_selected(op: &DfirOp) -> bool {
 ///
 /// * `if_op` non-null — ⛔ **UNREPRESENTABLE HERE.** [`Self::of`] takes `&mut DfirOp`, and a Rust
 ///   reference is never null.
-/// * `getNumResults() == 0` — [`super::super::islands::dataflow_ir::dialects::scf::Op::If`] carries
-///   no result list at all (it is DISCHARGED BY CONSTRUCTION for an `scf.if`), and an `affine.if`
-///   with a non-empty `results` list is declined by [`Self::of`].
+/// * `getNumResults() == 0` — a conditional of either kind whose `results` list is non-empty is
+///   declined by [`Self::of`]. ⭐ THE `scf.if` ARM CHECKS IT TOO, since entry 177 needed that op to
+///   carry the result list the vendor's own input binds
+///   (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:129`).
 /// * `getRegions()[1].empty()` — declined by [`Self::of`] when the `else` region already holds a
 ///   block. ⭐ This is the one that makes the whole function observable: see the note on
 ///   [`super::super::islands::dataflow_ir::dialects::scf::Op::If::else_body`] for why "no block" and
@@ -1161,12 +1695,12 @@ impl<'a> EmptyElseRegion<'a> {
                 kind: ConditionalKind::Affine,
                 else_body,
             }),
-            DfirOp::Scf(scf::Op::If { else_body, .. }) if else_body.is_empty() => {
-                Some(EmptyElseRegion {
-                    kind: ConditionalKind::Scf,
-                    else_body,
-                })
-            }
+            DfirOp::Scf(scf::Op::If {
+                results, else_body, ..
+            }) if results.is_empty() && else_body.is_empty() => Some(EmptyElseRegion {
+                kind: ConditionalKind::Scf,
+                else_body,
+            }),
             _ => None,
         }
     }
@@ -1233,3 +1767,461 @@ pub fn create_dummy_yield_in_else_reg(if_op: EmptyElseRegion<'_>) {
     if_op.else_body.push(terminator);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 176/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE NINE OPS THE SIDE-EFFECT SCAN NAMES AS HARMLESS — `opHasSideEffect`'s `isa<>` list.
+///
+/// ```cpp
+/// !isa<arith::ConstantOp, arith::ConstantIndexOp, arith::ConstantIntOp,
+///      arith::CmpIOp, scf::YieldOp, scf::ForOp, affine::AffineForOp,
+///      affine::AffineYieldOp, mlir::symbol::CreateSymbolOp>(op)
+/// ```
+/// (`CFGSDataflowConditionalTree.cpp:42-44`)
+///
+/// ⛔ TOTAL OVER THE ISLAND'S OPS, NO WILDCARD. Falling past this list means *"has a side effect"*, so
+/// a wildcard would make every op added to the island harmless by default — and the visible effect of
+/// that is a conditional merged across an op that must not move.
+fn is_named_harmless(op: &DfirOp) -> bool {
+    match op {
+        // `arith::ConstantOp, arith::ConstantIndexOp, arith::ConstantIntOp` — ⭐ ONE OP CLASS IN THE
+        // ISLAND'S THREE SHAPES. The two `Constant*Op`s of the list are casters over `arith.constant`,
+        // and `isa<arith::ConstantOp>` matches ANY of them — the dense vector form included, which is
+        // what `%3 = arith.constant dense<1.000000e+00> : vector<64xf16>` is
+        // (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging-shallow-skip.mlir:16`).
+        DfirOp::Arith(
+            arith::Op::Constant { .. }
+            | arith::Op::ConstantInt { .. }
+            | arith::Op::DenseConstant { .. },
+        ) => true,
+
+        // `arith::CmpIOp` — the condition of an `scf.if` is one, so the scan has to let it through.
+        DfirOp::Arith(arith::Op::Compare { .. }) => true,
+
+        // ⛔ ARITHMETIC IS NOT ON THE LIST. `arith.addi` is `Pure` in MLIR and this still answers
+        // *"has a side effect"* for it — see [`op_has_side_effect`] on why that is the point.
+        DfirOp::Arith(
+            arith::Op::AddI(_)
+            | arith::Op::SubI(_)
+            | arith::Op::MulI(_)
+            | arith::Op::DivSI(_)
+            | arith::Op::Logic { .. },
+        ) => false,
+
+        // `scf::YieldOp, scf::ForOp`.
+        DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::For { .. }) => true,
+
+        // ⭐ AN `scf.if` IS ON NO LIST EITHER — [`is_operation_selected`] answers for it first, which
+        // is the `!isOperationSelected(*op) &&` half of the same condition. `scf.parallel` is on
+        // neither, so a conditional does not hoist or merge across one.
+        DfirOp::Scf(scf::Op::If { .. } | scf::Op::Parallel { .. }) => false,
+
+        // `affine::AffineForOp, affine::AffineYieldOp`.
+        DfirOp::Affine(affine::Op::For { .. } | affine::Op::Yield { .. }) => true,
+
+        // `affine.if` is [`is_operation_selected`]'s again; `affine.apply` and the vector transfers
+        // are named nowhere.
+        DfirOp::Affine(
+            affine::Op::If { .. }
+            | affine::Op::Apply { .. }
+            | affine::Op::VectorLoad { .. }
+            | affine::Op::VectorStore { .. },
+        ) => false,
+
+        // `mlir::symbol::CreateSymbolOp` — the whole of that dialect here.
+        DfirOp::Symbol(symbol::Op::CreateSymbol { .. }) => true,
+
+        // ── dialects the list does not mention at all ────────────────────────────────────────────
+        // ⭐ AND THIS IS THE ARM THAT DOES THE WORK: `dataflow.receive`, `dataflow.send`,
+        // `vectorchain.multiply_and_accumulate` and the composite transfers are exactly the ops
+        // between the two conditionals of `merging-shallow-skip.mlir:55-59` that the pass refuses to
+        // merge across.
+        // ⭐ `uniform` IS ON NO LIST EITHER, and the answer is the one that blocks movement: the
+        // nine-op `isa<>` above names no `uniform.` op, so a conditional does not hoist or merge
+        // across a `uniformize_regions`, a `query_map` or a mapping definition.
+        // ⭐ AND `vector.store` IS THE PLAINEST MEMBER OF THAT ARM: the nine-op list names neither it
+        // nor `vector.load`, and a write to a view is exactly the effect a conditional must not be
+        // moved across.
+        DfirOp::Dataflow(_)
+        | DfirOp::Agen(_)
+        | DfirOp::VectorChain(_)
+        | DfirOp::Vector(_)
+        | DfirOp::Uniform(_) => false,
+    }
+}
+
+/// Replaces: e176_opHasSideEffect
+///
+/// # WHETHER ANYTHING IN THIS SUBTREE IS NOT ON THE LIST
+///
+/// ```cpp
+/// bool CFGSDataflowConditionalTree::opHasSideEffect(Operation &op) {
+///   bool result = false;
+///   op.walk<WalkOrder::PreOrder>([&](Operation *op) {
+///     if (!isOperationSelected(*op) &&
+///         !isa<arith::ConstantOp, arith::ConstantIndexOp, arith::ConstantIntOp,
+///              arith::CmpIOp, scf::YieldOp, scf::ForOp, affine::AffineForOp,
+///              affine::AffineYieldOp, mlir::symbol::CreateSymbolOp>(op)) {
+///       result = true;
+///       return WalkResult::interrupt();
+///     }
+///     return WalkResult::advance();
+///   });
+///   return result;
+/// }
+/// ```
+/// (`dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38-50`)
+///
+/// # ⛔⛔ THE NAME SAYS "SIDE EFFECT"; THE TEST IS MEMBERSHIP IN A LIST OF ELEVEN OPS
+///
+/// This is not `mlir::isMemoryEffectFree` and not the `Pure` trait. `arith.addi` is pure and this
+/// answers `true` for it; `scf.for` may contain a `dataflow.send` and this answers `false` for the
+/// loop itself — the walk finds the `send` inside it. What the function really means is *"this subtree
+/// is nothing but conditionals, counted loops, integer constants, one comparison and a symbol"*, and
+/// its three callers use it as a **movement permit**:
+///
+/// * `isHoistable` — refuses to hoist the op, and refuses if ANY op before it in the block is
+///   unlisted (`:82-92`);
+/// * `areShallowlyMergeable` — refuses to merge two conditionals when an op strictly between them is
+///   unlisted (`:359`);
+/// * the deep-merge tree's own copy asks it of both conditionals (`Sentient/Analyses/CFGDeepMergingConditionalTree.cpp:207`).
+///
+/// ⭐ SO THE OBSERVABLE IS A MERGE THAT DOES NOT HAPPEN, and the authority tree has a fixture named
+/// for it: in `merging-shallow-skip.mlir` the two `scf.if %23` conditionals at `:41` and `:60` are left
+/// alone, because between them sit `dataflow.receive`, `arith.sitofp`,
+/// `vectorchain.create_affine_mask`, `vectorchain.multiply_and_accumulate` and `dataflow.send`
+/// (`:55-59`). In `merging.mlir` the ops between the conditionals that DO merge are `arith.constant`s
+/// and an `arith.cmpi`.
+///
+/// # THE WALK INCLUDES THE OP ITSELF
+///
+/// `Operation::walk` visits the operation it is called on before descending, which is what makes
+/// `opHasSideEffect(*to_hoist)` a question about `to_hoist` and not only about its body. The descent
+/// is [`dfir_op::regions`] rather than a second match of its own, and `WalkResult::interrupt()` is the
+/// short circuit [`Iterator::any`] already is.
+#[must_use]
+pub fn op_has_side_effect(op: &DfirOp) -> bool {
+    // `if (!isOperationSelected(*op) && !isa<…>(op)) { result = true; return interrupt(); }`
+    if !is_operation_selected(op) && !is_named_harmless(op) {
+        return true;
+    }
+
+    // `return WalkResult::advance();` — into every region of an op that passed.
+    dfir_op::regions(op)
+        .into_iter()
+        .flatten()
+        .any(op_has_side_effect)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 177/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH OF THE TWO CONDITIONALS COMES FIRST IN THE BLOCK — the reference's `bool dst_before_src`.
+///
+/// ⭐ THE ORDER IS NOT A PREFERENCE, IT IS WHERE THE OPS LAND. Program order is what a merge has to
+/// preserve: the source's statements go to the END of the destination's region when the destination
+/// stands first, and to the START of it when the source does (`CFGSDataflowConditionalTree.cpp:429-431`,
+/// `:449-451`). Get it wrong and a `dataflow.send` moves ahead of the `dataflow.receive` feeding it.
+///
+/// ⛔ AND THE CALLER DOES NOT CHOOSE FREELY EITHER. `shallowlyMergeConditionals` merges the SIBLING
+/// into `n` when `n` binds a result — `mergeShallow(src: sibling, dst: n, dst_before_src: true)`,
+/// because the merged op has to keep the result types of the one that yields (`:237-241`) — and
+/// otherwise merges `n` into its sibling with `dst_before_src: false` (`:244-247`). So the flag is
+/// determined by which candidate binds a value, and only ONE of the two ever does (`:348`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOrder {
+    /// `dst_before_src = true` — the destination stands first, so the source's ops are appended.
+    DstFirst,
+    /// `dst_before_src = false` — the source stands first, so its ops are prepended.
+    SrcFirst,
+}
+
+/// WHICH REGION OF A CONDITIONAL A SPLICE IS WORKING ON — `getRegions()[0]` and `getRegions()[1]`.
+///
+/// ⛔ AN INDEX WITH TWO NAMED VALUES, because `mergeShallow`'s `for (unsigned i = 0; i < 2; ++i)`
+/// (`CFGSDataflowConditionalTree.cpp:400`) is not a walk over however many regions an op has: it is
+/// the two arms of a conditional, and it is the reason entry 096 exists — `then` against `then`,
+/// `else` against `else`, never one against the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// Region 0, the `then` arm.
+    Then,
+    /// Region 1, the `else` arm — the one that may have no block at all.
+    Else,
+}
+
+impl Arm {
+    /// The reference's `i`.
+    const fn index(self) -> usize {
+        match self {
+            Arm::Then => 0,
+            Arm::Else => 1,
+        }
+    }
+}
+
+/// WHETHER THAT ARM OF THE CONDITIONAL HAS NO BLOCK — `op->getRegions()[i].empty()`.
+///
+/// ⭐ EMPTY MEANS NO BLOCK, WHICH IS WHY A `Vec` CAN ANSWER IT. A region MLIR would print as a block
+/// holding only an elided terminator still holds that terminator here — see
+/// [`crate::islands::dataflow_ir::dialects::scf::Op::If::else_body`] — so the only empty statement
+/// list is the region entry 096 fills.
+fn arm_is_empty(op: &DfirOp, arm: Arm) -> bool {
+    dfir_op::regions(op)
+        .get(arm.index())
+        .is_none_or(|ops| ops.is_empty())
+}
+
+/// THE TWO ARMS OF ONE CONDITIONAL, `then` FIRST — `getRegions()[0]` and `getRegions()[1]`, mutably.
+///
+/// ⛔ TOTAL OVER THE ISLAND'S OPS, NO WILDCARD, for the reason [`ConditionalKind::of`] gives: a third
+/// `if` form arriving in the island must say what its arms are rather than inheriting "not a
+/// conditional" and being skipped by every merge.
+fn arms_of(op: &mut DfirOp) -> Option<(&mut Vec<DfirOp>, &mut Vec<DfirOp>)> {
+    match op {
+        DfirOp::Scf(scf::Op::If {
+            body, else_body, ..
+        })
+        | DfirOp::Affine(affine::Op::If {
+            body, else_body, ..
+        }) => Some((body, else_body)),
+
+        DfirOp::Affine(
+            affine::Op::For { .. }
+            | affine::Op::Apply { .. }
+            | affine::Op::Yield { .. }
+            | affine::Op::VectorLoad { .. }
+            | affine::Op::VectorStore { .. },
+        )
+        | DfirOp::Scf(
+            scf::Op::For { .. } | scf::Op::Yield { .. } | scf::Op::Parallel { .. },
+        )
+        | DfirOp::Arith(_)
+        | DfirOp::Dataflow(_)
+        | DfirOp::Agen(_)
+        | DfirOp::VectorChain(_)
+        | DfirOp::Vector(_)
+        // ⭐ A `uniform.uniformize_regions` HAS REGIONS AND IS STILL NOT A CONDITIONAL: it has one per
+        // unit class, not a `then` and an `else`, and [`ConditionalKind::of`] declines it for the same
+        // reason.
+        | DfirOp::Uniform(_)
+        | DfirOp::Symbol(_) => None,
+    }
+}
+
+/// Replaces: e177_mergeShallow
+///
+/// # SPLICE ONE CONDITIONAL'S ARMS INTO ANOTHER'S, ARM AGAINST ARM
+///
+/// ```cpp
+/// void CFGSDataflowConditionalTree::mergeShallow(Operation *src, Operation *dst,
+///                                                bool dst_before_src) {
+///   for (unsigned i = 0; i < 2; ++i) {
+///     bool src_region_empty = src->getRegions()[i].empty();
+///     bool dst_region_empty = dst->getRegions()[i].empty();
+///     // No need to merge regions if both are empty.
+///     if (src_region_empty && dst_region_empty) continue;
+///
+///     // If the src/dst region is empty, create a dummy yield to help with the
+///     // merging.
+///     if (src_region_empty)
+///       createDummyYieldInElseReg(src);
+///     else if (dst_region_empty)
+///       createDummyYieldInElseReg(dst);
+///
+///     Block &src_bb = src->getRegions()[i].front();
+///     Block &dst_bb = dst->getRegions()[i].front();
+///     if (dst_before_src) {
+///       // Move all of src's ops to the end of dst_bb.
+///       // If dst yields results, its new terminator will simply be its old one.
+///       // Otherwise the new terminator will be src's terminator.
+///       auto *dst_terminator = dst_bb.getTerminator();
+///       bool dst_has_no_results = (dst->getNumResults() == 0);
+///       if (dst_has_no_results)
+///         dst_terminator->erase();
+///       else {
+///         auto *src_terminator = src_bb.getTerminator();
+///         DT_CHECK_MSG(src_terminator->getNumResults() == 0,
+///                      "Expect src to not yield any results if dst does.");
+///         src_terminator->erase();
+///       }
+///       while (!src_bb.getOperations().empty()) {
+///         Operation &op = src_bb.getOperations().front();
+///         op.moveBefore(&dst_bb, dst_bb.end());
+///       }
+///       if (!dst_has_no_results)
+///         dst_terminator->moveBefore(&dst_bb, dst_bb.end());
+///     } else {
+///       // Move all of src's ops except its terminator to the start of dst_bb.
+///       // If src does not yield results, dst's new terminator will simply be its
+///       // old one. Otherwise the new terminator will be src's terminator.
+///       auto *src_terminator = src_bb.getTerminator();
+///       if (src->getNumResults() == 0)
+///         src_terminator->erase();
+///       else {
+///         auto *dst_terminator = dst_bb.getTerminator();
+///         DT_CHECK_MSG(dst_terminator->getNumResults() == 0,
+///                      "Expect dst to not yield any results if src does.");
+///         src_terminator->moveBefore(dst_terminator);
+///         dst_terminator->erase();
+///       }
+///       while (!src_bb.getOperations().empty()) {
+///         Operation &op = src_bb.getOperations().back();
+///         op.moveBefore(&dst_bb, dst_bb.begin());
+///       }
+///     }
+///   }
+///   if (StringAttr new_dbg_name_attr =
+///           dataflow::utils::getNewDbgNameFromList("CFGSM(", {src, dst})) {
+///     dataflow::setDbgNameAttr(dst, new_dbg_name_attr);
+///   }
+/// }
+/// ```
+/// (`dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398-459`)
+///
+/// # ⭐⭐ EXACTLY ONE TERMINATOR SURVIVES EACH ARM, AND WHICH ONE IS THE WHOLE FUNCTION
+///
+/// Two conditionals on the same condition become one, so each arm ends up with two statement lists
+/// and two `yield`s where a block may have only one. The rule is that **the yield of the conditional
+/// that binds values survives**, because its operands are the merged op's results — and
+/// `areShallowlyMergeable` has already guaranteed that at most one of the two binds anything
+/// (`:348`). The other three combinations follow from program order:
+///
+/// | order | who binds | erased | the surviving terminator ends up |
+/// |---|---|---|---|
+/// | [`MergeOrder::DstFirst`] | neither | `dst`'s | last, and it is `src`'s (`:421-422`, `:429-431`) |
+/// | [`MergeOrder::DstFirst`] | `dst` | `src`'s | last, moved back there after the splice (`:433-434`) |
+/// | [`MergeOrder::SrcFirst`] | neither | `src`'s | last, and it is `dst`'s (`:440-441`) |
+/// | [`MergeOrder::SrcFirst`] | `src` | `dst`'s | last, where `dst`'s used to be (`:446-447`) |
+///
+/// ⛔ THE TWO `DT_CHECK`s ARE NOT CHECKS ON THE TERMINATORS THEY NAME (`:425-426`, `:444-445`).
+/// `src_terminator->getNumResults()`
+/// is the yield OP's own result count, which is zero for every `scf.yield` and `affine.yield` ever
+/// built — a yield binds nothing, it only carries operands. The condition the messages describe
+/// ("Expect src to not yield any results if dst does") is the one `areShallowlyMergeable` enforces on
+/// the CONDITIONALS, so nothing is lost by their absence here.
+///
+/// # ⛔ THE `while` LOOPS ARE A DIRECTION, NOT A COUNT
+///
+/// `moveBefore(&dst_bb, dst_bb.end())` taken over `front()` repeatedly appends in order (`:429-431`);
+/// `moveBefore(&dst_bb, dst_bb.begin())` taken over `back()` repeatedly prepends in order
+/// (`:449-451`). Both are
+/// "splice src's statements in, keeping their order" — one at the end, one at the start — which is
+/// [`Vec::append`] and a prepend of the taken list.
+///
+/// # ⭐ THE EMPTY-ARM CASE IS WHY ENTRY 096 EXISTS
+///
+/// A conditional with no `else` block has nothing to splice against, so the side that is missing one
+/// gets a bare terminator first ([`create_dummy_yield_in_else_reg`]) and the arm then has two lists.
+/// ⚠️ THE REFERENCE FILLS REGION **1** WHATEVER `i` IS — `createDummyYieldInElseReg` indexes
+/// `getRegions()[1]` unconditionally (`:388`) — so on `i == 0` it would fill the `else` arm and then
+/// dereference an absent `then` block. That is unreachable for a verified conditional, whose `then`
+/// region always has a block; here the same call is made and an arm that is still empty splices
+/// nothing into nothing.
+///
+/// # ⛔ THE NAME IS PART OF THE MERGE
+///
+/// The last three lines are not logging: `dbgName` is how the reference's own `CHECK` lines identify a
+/// merged conditional, and the expectation for this file's fixture after two merges is
+/// `} {dbgName = "CFGSM(SCF-If #4, CFGSM(SCF-If #2, SCF-If #3))"}`
+/// (`dcc/test/Transform/CFGSimplificationDataflowLevel/merging.mlir:59`) — nested, because the second
+/// merge reads the name the first one wrote. A conditional whose halves are not both named keeps its
+/// own name, which is [`new_dbg_name_from_list`] returning `None`.
+///
+/// ⭐ THE SOURCE IS LEFT AS AN EMPTY CONDITIONAL, NOT DELETED. `shallowlyMergeConditionals` collects
+/// it into `ops_to_delete` and erases it, with its dead ancestors, after the walk (`:242`, `:257`,
+/// `:269`) — so this function's postcondition is "src's arms are spliced out", not "src is gone".
+pub fn merge_shallow(src: &mut DfirOp, dst: &mut DfirOp, order: MergeOrder) {
+    // `for (unsigned i = 0; i < 2; ++i)`
+    for arm in [Arm::Then, Arm::Else] {
+        // `bool src_region_empty = src->getRegions()[i].empty();`
+        let src_region_empty = arm_is_empty(src, arm);
+        let dst_region_empty = arm_is_empty(dst, arm);
+
+        // `if (src_region_empty && dst_region_empty) continue;`
+        if src_region_empty && dst_region_empty {
+            continue;
+        }
+
+        // `if (src_region_empty) createDummyYieldInElseReg(src);`
+        // `else if (dst_region_empty) createDummyYieldInElseReg(dst);`
+        if src_region_empty {
+            if let Some(region) = EmptyElseRegion::of(src) {
+                create_dummy_yield_in_else_reg(region);
+            }
+        } else if dst_region_empty {
+            if let Some(region) = EmptyElseRegion::of(dst) {
+                create_dummy_yield_in_else_reg(region);
+            }
+        }
+
+        // `dst->getNumResults() == 0` and `src->getNumResults() == 0` — read before the arms are
+        // borrowed, since the result list is the op's and not the region's.
+        let dst_has_no_results = dfir_op::results(dst).is_empty();
+        let src_has_no_results = dfir_op::results(src).is_empty();
+
+        // `Block &src_bb = src->getRegions()[i].front();`
+        let (Some(src_arms), Some(dst_arms)) = (arms_of(src), arms_of(dst)) else {
+            continue;
+        };
+        let src_bb = match arm {
+            Arm::Then => src_arms.0,
+            Arm::Else => src_arms.1,
+        };
+        let dst_bb = match arm {
+            Arm::Then => dst_arms.0,
+            Arm::Else => dst_arms.1,
+        };
+
+        match order {
+            MergeOrder::DstFirst => {
+                if dst_has_no_results {
+                    // `dst_terminator->erase();` then src's whole list — terminator included —
+                    // appended, so src's terminator becomes the arm's.
+                    dst_bb.pop();
+                    dst_bb.append(src_bb);
+                } else {
+                    // `src_terminator->erase();` — dst's terminator is the one that must survive, so
+                    // it steps aside and goes back last (`:433-434`).
+                    src_bb.pop();
+                    let dst_terminator = dst_bb.pop();
+                    dst_bb.append(src_bb);
+                    dst_bb.extend(dst_terminator);
+                }
+            }
+            MergeOrder::SrcFirst => {
+                if src_has_no_results {
+                    // `src_terminator->erase();` — dst keeps its own.
+                    src_bb.pop();
+                } else {
+                    // `src_terminator->moveBefore(dst_terminator); dst_terminator->erase();` — src's
+                    // terminator takes the place of dst's, which is the end of the arm.
+                    let src_terminator = src_bb.pop();
+                    dst_bb.pop();
+                    dst_bb.extend(src_terminator);
+                }
+                // `op.moveBefore(&dst_bb, dst_bb.begin())` over src's ops from the BACK: they land at
+                // the FRONT, in their original order.
+                let mut spliced = std::mem::take(src_bb);
+                spliced.append(dst_bb);
+                *dst_bb = spliced;
+            }
+        }
+    }
+
+    // `getNewDbgNameFromList("CFGSM(", {src, dst})` — src first, dst second, and `None` unless BOTH
+    // halves are named.
+    let new_dbg_name = new_dbg_name_from_list(
+        DbgNamePrefix::Cfgsm,
+        dfir_op::dbg_name(src),
+        &[dfir_op::dbg_name(dst)],
+    );
+    // `dataflow::setDbgNameAttr(dst, new_dbg_name_attr);`
+    if let Some(new_dbg_name) = new_dbg_name {
+        if let Some(slot) = dfir_op::dbg_name_mut(dst) {
+            *slot = Some(new_dbg_name);
+        }
+    }
+}

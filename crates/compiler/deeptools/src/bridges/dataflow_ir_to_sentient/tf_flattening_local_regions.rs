@@ -74,7 +74,8 @@
 //! | `e305_runOnOperation` | 305/384 | 17 | `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459` |
 
 use super::vc_loop_mask_tree::{OperationNodeId, OperationTreeBase};
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val};
+use crate::islands::dataflow_ir::dialects::{self, Op as DfirOp, Val, uniform};
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 
 /// THE IDENTITY OF ONE NODE IN THE FLATTENING TREE — what a `LocalOpNode *` is in the C++.
 ///
@@ -138,12 +139,13 @@ pub struct RegionNum(pub u32);
 /// the one the reference asks — the identity question is `==` on two [`LocalOpNodeId`]s — so this
 /// type derives only `Debug`.
 ///
-/// ⚠️ `op` IS ANY `DfirOp` BECAUSE ENTRIES 101-108 NEVER LOOK AT IT. The ops this tree actually holds
-/// are `uniform.uniformize_regions` and `uniform.yield` and their contents, and the `uniform` dialect
-/// is not in `islands/dataflow_ir/` yet — the first unit that asks an op WHICH op it is
-/// (`isa<uniform::UniformizeRegionsOp>` in entries 180, 247, 182 and 287) is the one that has to add
-/// it, per the campaign brief. A constructor, four link reads and a partition are opaque in the
-/// operation: entry 108 compares op IDENTITY and never op contents.
+/// ⚠️ `op` IS ANY `DfirOp` BECAUSE ENTRIES 101-108 NEVER LOOK AT IT. A constructor, four link reads
+/// and a partition are opaque in the operation: entry 108 compares op IDENTITY and never op contents.
+/// The ops this tree actually holds are `uniform.uniformize_regions` and `uniform.yield` and their
+/// contents, and the first unit that asked an op WHICH op it is —
+/// [`FlatteningLocalRegionsTree::traverse_region`], entry 180, on
+/// `isa<uniform::UniformizeRegionsOp>` (`:137`) — is what added the dialect to
+/// [`crate::islands::dataflow_ir::dialects::uniform`]. Entries 247 and 287 ask the same question.
 #[derive(Debug)]
 pub struct LocalOpNode<'p> {
     /// `operation_op_` — the operation this node stands for
@@ -593,6 +595,533 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
         }
         equivalence_classes
     }
+
+    /// Replaces: e179_clear
+    ///
+    /// **179/384** `FlatteningLocalRegionsTree::clear` —
+    /// `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112` (15L).
+    ///
+    /// ```cpp
+    /// void FlatteningLocalRegionsTree::clear() {
+    ///   if (!empty()) {
+    ///     SmallVector<LocalOpNode *> to_be_deleted;
+    ///     LocalOpNode::walk<OperationNode::WalkOrder::kPostOrder>(
+    ///         const_cast<LocalOpNode *>(getRoot()),
+    ///         [&](LocalOpNode *n) -> LocalOpNode * {
+    ///           to_be_deleted.push_back(n);
+    ///           return nullptr;
+    ///         });
+    ///     for (LocalOpNode *n : to_be_deleted) delete n;
+    ///   } else if (root_)
+    ///     delete root_;
+    ///   root_ = nullptr;
+    ///
+    ///   unit_to_ops.clear();
+    /// }
+    /// ```
+    ///
+    /// # ⛔⛔ FOURTEEN OF ITS FIFTEEN LINES ARE THE `delete`, AND THE `delete` IS THE ARENA'S DROP
+    ///
+    /// The reference's tree is a heap of individually `new`ed nodes (`:134`, `:392`) wired by three raw
+    /// pointers, so freeing it needs a walk that reaches every node and frees each exactly once —
+    /// hence the two-phase shape: collect in a post-order walk, THEN delete, because deleting inside
+    /// the walk would free the node whose `next_sibling_` the walk is about to read. Here the nodes
+    /// live in one `Vec` inside [`OperationTreeBase`] (see [`LocalOpNodeId`]), so dropping the arena
+    /// frees all of them, in one statement, with no walk to get wrong.
+    ///
+    /// ⭐ THE THREE STATES THE `if` DISTINGUISHES ALL COLLAPSE TO `None`. `empty()` is
+    /// `!root_ || !root_->getFirstChild()` (`dcc/src/Analysis/OperationTree.hpp:214`), so the branches
+    /// are: a root WITH children (walk and delete every node, the root included — `postOrderWalk`
+    /// visits `n` itself after its descendants and never its siblings,
+    /// `dcc/src/Analysis/OperationTree.cpp:145-153`); a root with NO children (`delete root_`, the one
+    /// node); and NO root at all (nothing to free). The split exists because `getRoot()` re-asserts
+    /// `root_ != nullptr` (`hpp:205-206`) and so cannot be called in the third state — it is a guard
+    /// against the reference's own accessor, not a difference in what gets freed.
+    ///
+    /// ⛔ SO WHAT SURVIVES IS EXACTLY WHAT IS OBSERVABLE AFTERWARDS: `root_ = nullptr` (`:124`) and
+    /// `unit_to_ops.clear()` (`:126`) — a tree with no root and no attributed operations, which is
+    /// [`Self::new`]'s state. ⚠️ IT IS **NOT** WRITTEN AS `*self = Self::new()`, because that would
+    /// make the two functions one and this one would stop being a port of `:112`; the two fields are
+    /// reset in the reference's own order.
+    ///
+    /// # ⭐ ITS TWO CALLERS ARE THE DESTRUCTOR AND THE FIRST LINE OF `flatten`
+    ///
+    /// `~FlatteningLocalRegionsTree() { clear(); }` (`:79`, entry 246) is the RAII half — and it has
+    /// nothing to do here, because dropping the tree already drops the arena. `flatten` calls it as
+    /// its **first** statement (`:385`), before it knows whether the operation it was handed is a
+    /// `uniform.uniformize_regions` at all (`:386-387`) — which is why the rootless state is
+    /// reachable in the pass and not only at construction, and why [`Self::root`] returns an
+    /// [`Option`].
+    ///
+    /// ⚠️ AND IT IS NOT THE SUBTREE OVERLOAD. `OperationTreeBase::clear(OperationNode *start)`
+    /// (`hpp:230`, reached through `remove`, `hpp:216`) frees one subtree and keeps the tree; nothing
+    /// in this file calls it.
+    pub fn clear(&mut self) {
+        // `root_ = nullptr;` (`:124`) — and with it every node, since the arena owns them.
+        self.base = None;
+        // `unit_to_ops.clear();` (`:126`).
+        self.unit_to_ops = UnitToOps::new();
+    }
+
+    /// Replaces: e180_traverseRegion
+    ///
+    /// **180/384** `FlatteningLocalRegionsTree::traverseRegion` —
+    /// `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129` (17L).
+    ///
+    /// ```cpp
+    /// void FlatteningLocalRegionsTree::traverseRegion(mlir::Region &region,
+    ///                                                 LocalOpNode *parent_node,
+    ///                                                 std::vector<mlir::Value> &units,
+    ///                                                 int is_in_region_num) {
+    ///   for (auto &op : region.getOps()) {
+    ///     auto new_node = new LocalOpNode(&op);
+    ///     new_node->is_in_region_num = is_in_region_num;
+    ///     parent_node->insertChildNode(new_node);
+    ///     if (isa<uniform::UniformizeRegionsOp>(op)) {
+    ///       compute(new_node);
+    ///     } else {
+    ///       for (auto u : units) {
+    ///         new_node->units.push_back(u);
+    ///         unit_to_ops[u].push_back(&op);
+    ///       }
+    ///       for (int region_num = 0; region_num < op.getNumRegions(); region_num++) {
+    ///         traverseRegion(op.getRegion(region_num), new_node, units, region_num);
+    ///       }
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// # ⭐⭐ THE WALK THAT ATTRIBUTES EVERY OPERATION TO EVERY UNIT THAT RUNS IT
+    ///
+    /// It builds **two** things at once and the pass needs both: the node tree
+    /// [`Self::clone_ops_for_regions`] later clones from, and [`Self::unit_to_ops`] — the map
+    /// [`Self::partition_units`] turns into the equivalence classes that become the new op's regions.
+    /// Nothing else in the file writes either.
+    ///
+    /// # ⛔⛔ THE UNIT LIST IS INHERITED BY NESTING, NOT RE-DERIVED
+    ///
+    /// `:145` passes the SAME `units` into every nested region, so an operation inside an `scf.if`
+    /// inside a local region is attributed to every unit of that local region — the enclosing
+    /// conditional does not narrow it. That is what makes the vendor's four-region case decidable: in
+    /// `flatten_local_region4.mlir` all 32 units run the same outer `arith.cmpi`/`scf.if` chain and
+    /// differ **only** in the three operations of the nested local regions, so the partition comes back
+    /// as two classes of 16 (input `:737-765`, expectation `:325-395`).
+    ///
+    /// # ⛔⛔ A `uniform.uniformize_regions` GETS NO UNITS AND NO REGION WALK OF ITS OWN
+    ///
+    /// Its node is inserted and then handed to `compute` (`:137-138`), which re-derives a unit list
+    /// **per region** from the op's own `$units`/`$list_sizes` and calls back in
+    /// (`:151-166`). So the node itself stays with `units` empty — which is exactly the
+    /// `(uniformize_regions1, {})` of the worked example in the file's own algorithm comment
+    /// (`:303-382`) — and it is never subscripted into `unit_to_ops`. ⭐ THAT EMPTINESS IS LOAD-BEARING
+    /// in [`Self::clone_ops_for_regions`]: an op that is in no unit's list fails the
+    /// `std::find` at `:233` and takes the flatten-through branch at `:235-238`.
+    ///
+    /// ⛔ AND IT IS WHY `is_in_region_num` CANNOT IDENTIFY A LOCAL REGION. `compute` calls back with
+    /// `false` for **every** region index (`:164`), so all of a uniformized op's children are stamped
+    /// region 0 no matter which region they came from. Recovering the real one is a pointer comparison
+    /// against the parent's region list, and [`Self::clone_ops_for_regions`] does it at `:246-256`
+    /// because this walk did not.
+    ///
+    /// # ⛔ `compute` IS ENTRY 247/384 AND IS NOT MINE TO FILL
+    ///
+    /// It is level 2 of the campaign (`crustify-bridge2/UNITS.tsv`), a later wave, and the same file's
+    /// `flatten` (287) and `runOnOperation` (305) with it. So the recursion through a NESTED
+    /// `uniform.uniformize_regions` ends at a `todo!` naming that entry, gated on the reference's own
+    /// `isa<>` — the shape entry 178 already uses for its unported rewrite
+    /// (`super::tf_canonicalize_toggle`). ⚠️ A region with no nested local region walks completely,
+    /// which is every region of the vendor's cases 1-3 and the outer region of case 4.
+    ///
+    /// ⚠️ `region` IS A SLICE, NOT AN `mlir::Region`. A region here is the block's operation list
+    /// (`islands/dataflow_ir/dialects` has no block type), and `region.getOps()` is iterating it —
+    /// terminator included, which matters: `uniform.yield` and `scf.yield` DO get nodes and DO enter
+    /// `unit_to_ops`, and `cloneOpsForRegions` skips the former by kind (`:229`) rather than by absence.
+    pub fn traverse_region(
+        &mut self,
+        region: &'p [DfirOp],
+        parent_node: LocalOpNodeId,
+        units: &[Val],
+        is_in_region_num: RegionNum,
+    ) {
+        // `for (auto &op : region.getOps())` (`:133`) — in syntactic order, which is the order the
+        // sibling chain and `unit_to_ops` both come out in.
+        for op in region {
+            // `auto new_node = new LocalOpNode(&op); new_node->is_in_region_num = is_in_region_num;`
+            // (`:134-135`).
+            let mut new_node = LocalOpNode::new(op);
+            new_node.is_in_region_num = is_in_region_num;
+            // `isa<uniform::UniformizeRegionsOp>(op)` (`:137`) — asked once, because both branches
+            // below need the answer.
+            let uniformizes = matches!(op, DfirOp::Uniform(uniform::Op::UniformizeRegions { .. }));
+            if !uniformizes {
+                // `for (auto u : units) { new_node->units.push_back(u); unit_to_ops[u].push_back(&op); }`
+                // (`:140-143`) — one map entry per unit, appended in unit order.
+                //
+                // ⚠️ HOISTED ABOVE THE INSERTION, which the reference does after it (`:136`): the arena
+                // hands back an id rather than a reference, so the payload must be complete before it
+                // goes in. Nothing reads the node in between, and neither the sibling order nor the
+                // `unit_to_ops` order changes.
+                for unit in units {
+                    new_node.units.push(*unit);
+                    self.unit_to_ops.push_op(*unit, op);
+                }
+            }
+            // `parent_node->insertChildNode(new_node);` (`:136`) — appended after the parent's last
+            // child (`dcc/src/Analysis/OperationTree.hpp:118-131`), so the chain keeps program order.
+            //
+            // ⛔ NO BASE MEANS NO TREE, so there is no parent for a child to be inserted under and
+            // nothing to walk — the state `clear()` leaves and `flatten` returns early from
+            // (`:385-387`). It is unreachable from `compute`, which is only called on a node.
+            let Some(base) = self.base.as_mut() else {
+                return;
+            };
+            let new_node = LocalOpNodeId(base.push_child(parent_node.0, new_node));
+            if uniformizes {
+                // `compute(new_node);` (`:138`) — entry 247/384, level 2.
+                todo!(
+                    "e247_compute: a nested `uniform.uniformize_regions` in region {} of its parent \
+                     needs its own unit list per region, from `getUnitsPerRegionsAsVectorOfVector` \
+                     (`FlatteningLocalRegions.cpp:151-166`)",
+                    is_in_region_num.0
+                );
+            } else {
+                // `for (int region_num = 0; region_num < op.getNumRegions(); region_num++)
+                //    traverseRegion(op.getRegion(region_num), new_node, units, region_num);`
+                // (`:144-146`) — the child's `is_in_region_num` is the index of the PARENT'S region it
+                // sits in.
+                //
+                // ⛔ INSIDE THE `else`, AND THAT IS NOT COSMETIC: the reference does NOT walk a nested
+                // `uniform.uniformize_regions`' own regions from here, because `compute` walks them
+                // with the per-region unit lists instead. Nesting the loop is what keeps that true
+                // when entry 247 replaces the `todo!` above with a call.
+                for (region_num, inner) in (0u32..).zip(dialects::regions(op)) {
+                    self.traverse_region(inner, new_node, units, RegionNum(region_num));
+                }
+            }
+        }
+    }
+
+    /// Replaces: e181_inRegionEmpty
+    ///
+    /// **181/384** `FlatteningLocalRegionsTree::inRegionEmpty` —
+    /// `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214` (6L).
+    ///
+    /// ```cpp
+    /// bool FlatteningLocalRegionsTree::inRegionEmpty(int region_num,
+    ///                                                LocalOpNode *node) {
+    ///   while (node) {
+    ///     if (node->is_in_region_num == region_num) return false;
+    ///     node = node->getNextSibling();
+    ///   }
+    ///   return true;
+    /// }
+    /// ```
+    ///
+    /// # ⭐ DOES REGION `region_num` OF SOME PARENT HOLD NOTHING — ASKED OVER A SIBLING CHAIN
+    ///
+    /// `node` is one region's worth of operations reached as a chain, and every node in it carries the
+    /// index of the parent's region it came from (`:145`). So the question is answered by looking for
+    /// **any** sibling stamped `region_num`, and `true` means the parent's region `region_num`
+    /// contributed no node at all.
+    ///
+    /// ⚠️ `node` IS AN [`Option`] BECAUSE THE REFERENCE IS CALLED WITH `getFirstChild()`, which is null
+    /// for a leaf — `isLeaf()` is defined as exactly that (`dcc/src/Analysis/OperationTree.hpp:70`). A
+    /// chain that starts nowhere is a parent with no children, and `true` is the right answer.
+    ///
+    /// ⚠️ IT WALKS FORWARD ONLY, so it answers about the whole chain only when handed its head. Handed
+    /// a node in the middle it answers about the suffix, and nothing in the reference constrains that
+    /// — it is the caller's business.
+    ///
+    /// # ⛔⛔ IT HAS NO CALLER ANYWHERE IN THE AUTHORITY TREE, AND THE REASON IS INSTRUCTIVE
+    ///
+    /// The three mentions of `inRegionEmpty` in `dcc/` are its declaration (`:88`), this definition and
+    /// nothing else. ⭐ THE PLACE THAT WANTS IT IS `cloneOpsForRegions` AT `:269`, which needs to know
+    /// whether region `rn` of a cloned op came out empty — and it answers that by BUILDING the block
+    /// and calling `block.erase()` when it is still empty afterwards, a test on the RESULT rather than
+    /// on `is_in_region_num`. That is not a stylistic difference: this predicate would have given the
+    /// wrong answer there. `compute` stamps region 0 on the children of **every** region of a
+    /// uniformized op (`:164`), so `inRegionEmpty(1, uniformize_node->first_child())` reports "empty"
+    /// for a two-region local op whose second region is full — and `cloneOpsForRegions` also filters by
+    /// unit class (`:233`), which this predicate cannot see at all.
+    ///
+    /// ⛔ PORTED ANYWAY, uncalled, because it is a scheduled unit — the same decision entry 042 records.
+    /// Deciding it unnecessary is how the previous attempt failed.
+    #[must_use]
+    pub fn in_region_empty(&self, region_num: RegionNum, node: Option<LocalOpNodeId>) -> bool {
+        let mut node = node;
+        // `while (node)` (`:216`) — to the end of the sibling chain, which needs no count.
+        while let Some(current) = node {
+            // `if (node->is_in_region_num == region_num) return false;` (`:217`) — one operation from
+            // that region is enough.
+            if self
+                .node(current)
+                .is_some_and(|payload| payload.is_in_region_num == region_num)
+            {
+                return false;
+            }
+            // `node = node->getNextSibling();` (`:218`).
+            node = self.next_sibling(current);
+        }
+        // `return true;` (`:220`).
+        true
+    }
+
+    /// Replaces: e182_cloneOpsForRegions
+    ///
+    /// **182/384** `FlatteningLocalRegionsTree::cloneOpsForRegions` —
+    /// `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223` (60L).
+    ///
+    /// ```cpp
+    /// void FlatteningLocalRegionsTree::cloneOpsForRegions(
+    ///     LocalOpNode *node, const std::vector<mlir::Operation *> &op_list,
+    ///     mlir::OpBuilder builder_region, int region_num, IRMapping &arg_map,
+    ///     mlir::BlockArgument &block_arg) {
+    ///   std::map<mlir::Operation *, mlir::Operation *> old_to_new_op_map;
+    ///   while (node) {
+    ///     if (isa<mlir::uniform::YieldOp>(node->getOperation())) {
+    ///       node = node->getNextSibling();
+    ///       continue;
+    ///     }
+    ///     if (std::find(op_list.begin(), op_list.end(), node->getOperation()) == op_list.end()) {
+    ///       if (isa<uniform::UniformizeRegionsOp>(node->getOperation())) {
+    ///         cloneOpsForRegions(node->getFirstChild(), op_list, builder_region,
+    ///                            region_num, arg_map, block_arg);
+    ///       }
+    ///       node = node->getNextSibling();
+    ///       continue;
+    ///     }
+    ///     if (node->is_in_region_num != region_num) {
+    ///       node = node->getNextSibling();
+    ///       continue;
+    ///     }
+    ///     if (auto parent_uniform_op = llvm::dyn_cast<uniform::UniformizeRegionsOp>(
+    ///             node->getOperation()->getParentOp())) {
+    ///       for (int region_idx = 0; region_idx < parent_uniform_op.getNumRegions(); region_idx++) {
+    ///         if (&parent_uniform_op.getRegion(region_idx) ==
+    ///             node->getOperation()->getParentRegion()) {
+    ///           arg_map.map(parent_uniform_op.getRegion(region_idx).getArgument(0), block_arg);
+    ///         }
+    ///       }
+    ///     }
+    ///     auto new_op_ = builder_region.cloneWithoutRegions(*node->getOperation(), arg_map);
+    ///     old_to_new_op_map[node->getOperation()] = new_op_;
+    ///     if (new_op_->getNumRegions() > 0) {
+    ///       DT_CHECK(new_op_->getNumRegions() == node->getOperation()->getNumRegions());
+    ///       for (int rn = 0; rn < new_op_->getNumRegions(); rn++) {
+    ///         OpBuilder builder_inner_region(new_op_->getRegion(rn));
+    ///         auto &block = new_op_->getRegion(rn).emplaceBlock();
+    ///         builder_inner_region.setInsertionPointToStart(&block);
+    ///         cloneOpsForRegions(node->getFirstChild(), op_list, builder_inner_region,
+    ///                            rn, arg_map, block_arg);
+    ///         if (block.empty()) block.erase();
+    ///       }
+    ///     }
+    ///     node = node->getNextSibling();
+    ///   }
+    ///   for (auto old_new_op : old_to_new_op_map) {
+    ///     auto parent_region = old_new_op.second->getParentRegion();
+    ///     old_new_op.first->replaceUsesWithIf(
+    ///         old_new_op.second, [&](mlir::OpOperand &use) {
+    ///           auto curr_region = use.getOwner()->getParentRegion();
+    ///           while (!isa<dataflow::ProgramUnitOp>(curr_region->getParentOp())) {
+    ///             if (curr_region == parent_region) return true;
+    ///             curr_region = curr_region->getParentRegion();
+    ///           }
+    ///           return false;
+    ///         });
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// # ⭐⭐ ONE NEW LOCAL REGION'S BODY: THE OPERATIONS OF **ONE UNIT CLASS**, THE NESTING FLATTENED
+    ///
+    /// `flatten` makes one region per equivalence class (`:430-450`) and calls this once per region with
+    /// that class's representative's operation list (`:448`). Every node of the source tree is then
+    /// filtered by three questions, in this order:
+    ///
+    /// 1. **is it a `uniform.yield`** (`:229-232`) — skipped, because `flatten` builds the new region's
+    ///    terminator itself (`:450`) and cloning the old one would emit two;
+    /// 2. **is it one of this class's operations** (`:233-241`) — by ADDRESS, see
+    ///    [`runs_the_same_operations`]. A nested `uniform.uniformize_regions` is never in any list (the
+    ///    walk gives its node no units, `:137-139`), so it takes the special branch and its CHILDREN are
+    ///    cloned into the region being built — ⭐⭐ THAT IS THE FLATTENING: the inner local op disappears
+    ///    and the operations of whichever of its regions belong to this class are spliced in where it
+    ///    stood;
+    /// 3. **is it in region `region_num` of its parent** (`:242-245`) — which is how one pass over the
+    ///    parent's whole sibling chain fills one region of a cloned `scf.if` and a second pass fills the
+    ///    other.
+    ///
+    /// # ⛔⛔ `:246-256` IS WHAT REBINDS THE UNIT, AND IT IS THE REASON THE PASS WORKS AT ALL
+    ///
+    /// A local region's block argument IS the unit the region runs on. When the operation about to be
+    /// cloned sits directly inside a `uniform.uniformize_regions`, the region it sits in is found by
+    /// comparing against the parent's region list, and that region's argument is mapped to the NEW
+    /// region's block argument — so the clone reads the new binder. In the vendor's case 4 the nested
+    /// op's second region has argument `%arg48` and its `uniform.query_map(map:%285, key:%arg48)`
+    /// (`flatten_local_region4.mlir:757`) comes out as
+    /// `uniform.query_map(map:%VAL_356, key:%VAL_351)` (`:355`), where `%VAL_351` is the new outer
+    /// region's argument. Without this the flattened body would read a binder that no longer exists.
+    ///
+    /// ⛔ THE COMPARISON HAS TO BE POINTER IDENTITY, NOT `is_in_region_num`. `compute` stamps 0 on the
+    /// children of EVERY region of a uniformized op (`:164`), so the field cannot say which local region
+    /// an operation came from — see [`Self::in_region_empty`], whose whole defect is that. Here the
+    /// region is found by asking which of the parent's bodies actually contains this operation, which is
+    /// what `&parent_uniform_op.getRegion(i) == ...getParentRegion()` asks.
+    ///
+    /// # ⛔ THE REGIONS ARE FILLED FROM THE **ORIGINAL'S** CHILDREN, WHICH IS WHY THE CLONE IS SHALLOW
+    ///
+    /// `cloneWithoutRegions` (`:257-258`) copies the operation and its operands through `arg_map` and
+    /// leaves the regions empty; each region `rn` of the copy is then filled by re-walking the
+    /// ORIGINAL's children with `region_num = rn` (`:263-268`). A deep clone would have copied the
+    /// children this filter is about to reject, and copied them with the wrong names — see
+    /// [`Values::clone_without_regions`].
+    ///
+    /// ⭐ AND `if (block.empty()) block.erase()` (`:269`) IS AN EMPTY `Vec` HERE. MLIR distinguishes a
+    /// region with no block from one holding an empty block, and this island records that distinction as
+    /// an empty `else_body` — see [`crate::islands::dataflow_ir::dialects::scf::Op::If::else_body`]. So
+    /// leaving the vector empty **is** the erase, and the vendor's own output proves the case is live:
+    /// the flattened `scf.if %VAL_355 { .. } {dbgName = "condition__1"}` at
+    /// `flatten_local_region4.mlir:353-357` prints no `else`, because the source conditional's `else`
+    /// region held nothing belonging to either class.
+    ///
+    /// # ⚠️ THE TRAILING `replaceUsesWithIf` (`:274-285`) — SCOPED, AND ALREADY MOSTLY DONE
+    ///
+    /// MLIR's `cloneWithoutRegions(op, mapper)` records `old result -> new result` in the mapper, so an
+    /// operation cloned later in the same pass already reads the earlier clone's names through
+    /// `arg_map`: `%VAL_355 = arith.cmpi eq, %VAL_353, %VAL_4` (`:352`) reads the CLONE of the
+    /// conditional. What this loop adds is the same substitution applied to uses that were emitted into
+    /// the new region **without** going through the map, and its predicate bounds it to the region the
+    /// clone was inserted into and everything nested below it — climbing from the use's own region and
+    /// stopping at the enclosing `dataflow.program_unit`. That is a recursive rewrite of `into`.
+    ///
+    /// ⭐ THE `std::map` ITERATION ORDER IS UNOBSERVABLE, which is why a `Vec` of pairs replaces it: the
+    /// keys are `Operation *` and the order is address order, but every `to` is a value this pass just
+    /// minted and can therefore never be another pair's `from`, so the substitutions commute.
+    ///
+    /// ⚠️ `builder_region` BECOMES `into`, AND THE SHARING AT `:236` IS WHY. The reference passes its
+    /// `OpBuilder` **by value** but the two calls differ: `:236-237` hands on the SAME builder, so a
+    /// flattened-through operation lands in the caller's region, while `:264-267` builds a new one on
+    /// the clone's own region. A `&mut Vec<DfirOp>` reproduces both exactly.
+    ///
+    /// ⚠️ `values` HAS NO COUNTERPART: MLIR's builder mints result names implicitly. It is threaded
+    /// through because [`Values`] is this island's only source of a [`Val`].
+    pub fn clone_ops_for_regions(
+        &self,
+        node: Option<LocalOpNodeId>,
+        op_list: &[&DfirOp],
+        into: &mut Vec<DfirOp>,
+        region_num: RegionNum,
+        arg_map: &mut ValueMapping,
+        block_arg: Val,
+        values: &mut Values,
+    ) {
+        // `std::map<mlir::Operation *, mlir::Operation *> old_to_new_op_map;` (`:227`) — kept as the
+        // RESULT pairs, because `replaceUsesWithIf` reads nothing else out of it.
+        let mut old_to_new: Vec<(Val, Val)> = Vec::new();
+        let mut node = node;
+        // `while (node)` (`:228`).
+        while let Some(current) = node {
+            // Every branch below ends in `node = node->getNextSibling();`, so it is done once here.
+            node = self.next_sibling(current);
+            let Some(payload) = self.node(current) else {
+                continue;
+            };
+            // `if (isa<mlir::uniform::YieldOp>(..)) continue;` (`:229-232`).
+            if matches!(payload.op, DfirOp::Uniform(uniform::Op::Yield { .. })) {
+                continue;
+            }
+            // `if (std::find(op_list.begin(), op_list.end(), node->getOperation()) == op_list.end())`
+            // (`:233-234`) — membership by ADDRESS, as everywhere in this file.
+            if !op_list
+                .iter()
+                .any(|listed| core::ptr::eq(*listed, payload.op))
+            {
+                // `if (isa<uniform::UniformizeRegionsOp>(..)) cloneOpsForRegions(node->getFirstChild(),
+                //     op_list, builder_region, region_num, arg_map, block_arg);` (`:235-238`).
+                //
+                // ⭐⭐ THE SAME `into` AND THE SAME `region_num`: the nested local operation is dropped
+                // and its children are examined as if they were siblings of it, so those of them that
+                // belong to this class land where it stood.
+                if matches!(
+                    payload.op,
+                    DfirOp::Uniform(uniform::Op::UniformizeRegions { .. })
+                ) {
+                    self.clone_ops_for_regions(
+                        self.first_child(current),
+                        op_list,
+                        into,
+                        region_num,
+                        arg_map,
+                        block_arg,
+                        values,
+                    );
+                }
+                continue;
+            }
+            // `if (node->is_in_region_num != region_num) continue;` (`:242-245`).
+            if payload.is_in_region_num != region_num {
+                continue;
+            }
+            // `:246-256` — the operation sits directly inside a `uniform.uniformize_regions`, so the
+            // unit binder of the region it sits in now stands for the NEW region's block argument.
+            //
+            // ⛔ THE REGION IS FOUND BY ASKING WHICH BODY HOLDS THIS OPERATION, because
+            // `is_in_region_num` cannot say (`:164`). `core::ptr::eq` is
+            // `&parent.getRegion(i) == op->getParentRegion()`.
+            if let Some(parent) = self.parent_node(current)
+                && let Some(DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. })) =
+                    self.node(parent).map(|parent| parent.op)
+            {
+                for local in regions {
+                    if local
+                        .body
+                        .iter()
+                        .any(|sibling| core::ptr::eq(sibling, payload.op))
+                    {
+                        arg_map.map(local.arg, block_arg);
+                    }
+                }
+            }
+            // `auto new_op_ = builder_region.cloneWithoutRegions(*node->getOperation(), arg_map);`
+            // (`:257-258`).
+            let mut clone = values.clone_without_regions(payload.op, arg_map);
+            // `old_to_new_op_map[node->getOperation()] = new_op_;` (`:259`) — the results, pairwise, in
+            // the order the op binds them.
+            old_to_new.extend(
+                dialects::results(payload.op)
+                    .into_iter()
+                    .zip(dialects::results(&clone)),
+            );
+            // `if (new_op_->getNumRegions() > 0) { DT_CHECK(..); for (int rn = 0; ..) { .. } }`
+            // (`:260-271`) — the `> 0` guard is an empty loop and the `DT_CHECK` that the copy has as
+            // many regions as the original is discharged by [`Values::clone_without_regions`], which
+            // empties the regions rather than removing them.
+            //
+            // ⭐ `emplaceBlock()` THEN `if (block.empty()) block.erase()` (`:265`, `:269`) is a region
+            // that stays an empty `Vec` when nothing was cloned into it — the state that prints no
+            // `else` at all.
+            for (rn, inner) in (0u32..).zip(dialects::regions_mut(&mut clone)) {
+                self.clone_ops_for_regions(
+                    self.first_child(current),
+                    op_list,
+                    inner,
+                    RegionNum(rn),
+                    arg_map,
+                    block_arg,
+                    values,
+                );
+            }
+            into.push(clone);
+        }
+        // `for (auto old_new_op : old_to_new_op_map) { .. replaceUsesWithIf(..) }` (`:274-285`) — at or
+        // below the region the clones were inserted into, which is `into` and everything nested in it.
+        for (old, new) in old_to_new {
+            for op in into.iter_mut() {
+                replace_uses_at_or_below(op, old, new);
+            }
+        }
+    }
 }
 
 impl<'p> Default for FlatteningLocalRegionsTree<'p> {
@@ -629,10 +1158,728 @@ fn runs_the_same_operations(lhs: &[&DfirOp], rhs: &[&DfirOp]) -> bool {
 }
 
 
+
+/// `replaceUsesWithIf` WITH THIS PASS'S PREDICATE — one operation and everything nested inside it
+/// (`FlatteningLocalRegions.cpp:276-284`).
+///
+/// The predicate climbs from the use's own region towards the enclosing `dataflow.program_unit` and
+/// accepts as soon as it reaches the region the clone was inserted into, so a use is rewritten exactly
+/// when it sits at or below that region. Descending instead of climbing asks the same question of a
+/// tree that only has downward links.
+///
+/// ⭐ ONE ENTRY PER USE — [`dialects::replace_uses_of_with`] re-points every operand of one op, and this
+/// adds the regions it does not reach.
+fn replace_uses_at_or_below(op: &mut DfirOp, from: Val, to: Val) {
+    dialects::replace_uses_of_with(op, from, to);
+    for region in dialects::regions_mut(op) {
+        for inner in region.iter_mut() {
+            replace_uses_at_or_below(inner, from, to);
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::islands::dataflow_ir::dialects::{arith, scf};
+
+    /// 🎯 181/384 — AN OPERATION STAMPED WITH THE REGION MEANS IT IS NOT EMPTY.
+    ///
+    /// `traverseRegion` stamps each child with the index of the parent's region it was found in
+    /// (`FlatteningLocalRegions.cpp:145`), so a conditional whose `then` and `else` regions both hold an
+    /// operation has both answers `false` — and asking about a region the parent does not have gets
+    /// `true`, since no sibling can carry that index.
+    #[test]
+    fn a_region_holding_an_operation_is_not_empty() {
+        let program = a_uniformize_over(
+            vec![Val(10)],
+            vec![DfirOp::Scf(scf::Op::If {
+                cond: Val(282),
+                results: Vec::new(),
+                body: vec![DfirOp::Arith(arith::Op::Constant {
+                    result: Val(285),
+                    value: 1,
+                })],
+                else_body: vec![DfirOp::Arith(arith::Op::Constant {
+                    result: Val(286),
+                    value: 2,
+                })],
+                dbg_name: None,
+            })],
+        );
+        let region = the_region(&program);
+        let (mut tree, root) = a_rooted_tree(&program);
+        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
+        let conditional = tree.first_child(root).expect("the `scf.if`");
+        let chain = tree.first_child(conditional);
+
+        assert!(!tree.in_region_empty(RegionNum(0), chain), "the `then` region");
+        assert!(!tree.in_region_empty(RegionNum(1), chain), "the `else` region");
+        assert!(
+            tree.in_region_empty(RegionNum(2), chain),
+            "an `scf.if` has two regions, so nothing is stamped 2"
+        );
+    }
+
+    /// 🎯 181/384 — AN `else` WITH NO BLOCK LEAVES ITS REGION EMPTY, AND A LEAF HAS NO CHAIN AT ALL.
+    ///
+    /// An `scf.if` always has two regions, and an absent `else` is a region with no operations — the
+    /// state [`crate::islands::dataflow_ir::dialects::scf::Op::If::else_body`] records as an empty
+    /// `Vec` and MLIR prints by printing no `else` (`dcc/test/PT/issue-236.mlir:65-71`). So the walk
+    /// contributes no node stamped 1 and this predicate says so.
+    ///
+    /// ⚠️ AND `None` IS `getFirstChild()` ON A LEAF (`dcc/src/Analysis/OperationTree.hpp:70`): a chain
+    /// that starts nowhere is empty for every region number.
+    #[test]
+    fn a_region_with_no_block_and_a_leaf_are_both_empty() {
+        let program = a_uniformize_over(
+            vec![Val(10)],
+            vec![DfirOp::Scf(scf::Op::If {
+                cond: Val(282),
+                results: Vec::new(),
+                body: vec![DfirOp::Arith(arith::Op::Constant {
+                    result: Val(285),
+                    value: 1,
+                })],
+                else_body: Vec::new(),
+                dbg_name: None,
+            })],
+        );
+        let region = the_region(&program);
+        let (mut tree, root) = a_rooted_tree(&program);
+        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
+        let conditional = tree.first_child(root).expect("the `scf.if`");
+
+        assert!(!tree.in_region_empty(RegionNum(0), tree.first_child(conditional)));
+        assert!(
+            tree.in_region_empty(RegionNum(1), tree.first_child(conditional)),
+            "no `else` block, so no node carries region 1"
+        );
+        // The `arith.constant` in the `then` region is a leaf.
+        let leaf = tree.first_child(conditional).expect("the constant");
+        assert_eq!(tree.first_child(leaf), None, "a leaf has no children");
+        assert!(tree.in_region_empty(RegionNum(0), tree.first_child(leaf)));
+    }
+
+    /// 🎯 181/384 — ⛔ AND ON A UNIFORMIZED OP'S CHILDREN IT IS WRONG, WHICH IS WHY NOTHING CALLS IT.
+    ///
+    /// `compute` calls back with `false` for **every** region index (`:164`), so all of a
+    /// `uniform.uniformize_regions`' children are stamped region 0 whichever local region they came
+    /// from. This test builds that stamping directly — entry 247 is the unit that would produce it —
+    /// and shows the predicate reporting region 1 empty while it holds an operation. ⭐ THE PLACE THAT
+    /// NEEDED THE ANSWER TAKES A DIFFERENT ROUTE: `cloneOpsForRegions` builds the block and erases it
+    /// if it is still empty (`:265-269`).
+    #[test]
+    fn it_reports_a_full_local_region_empty_because_compute_stamps_zero() {
+        let ops = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 1,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(2),
+                value: 2,
+            }),
+        ];
+        // `traverseRegion(uniform_op.getRegion(idx), node, .., false)` for idx 0 AND idx 1 (`:162-164`).
+        let mut base = OperationTreeBase::with_root(LocalOpNode::new(&ops[0]));
+        let root = base.root();
+        for op in &ops {
+            base.push_child(root, LocalOpNode::new(op));
+        }
+        let tree = FlatteningLocalRegionsTree {
+            unit_to_ops: UnitToOps::new(),
+            base: Some(base),
+        };
+        let root = LocalOpNodeId(root);
+
+        assert!(!tree.in_region_empty(RegionNum(0), tree.first_child(root)));
+        assert!(
+            tree.in_region_empty(RegionNum(1), tree.first_child(root)),
+            "`ops[1]` came from region 1 and is stamped 0, so the answer is a lie"
+        );
+    }
+    use crate::generated::SyncSignal;
+    use crate::islands::dataflow_ir::dialects::{arith, dataflow, scf};
+    use crate::islands::dataflow_ir::print;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+
+    /// A COUNTER POSITIONED PAST EVERY VALUE IN A HAND-BUILT PROGRAM.
+    ///
+    /// ⛔ NOT A CONVENIENCE. In the pass the counter is the program's own — [`Values`] issued the names
+    /// the program already holds, so the next one it mints cannot collide with them. A test that starts
+    /// a fresh counter at zero re-issues names its own fixture is using, and the collision looks exactly
+    /// like a clone reading the right value.
+    fn values_past(highest: u32) -> Values {
+        let mut values = Values::default();
+        while values.issued() <= highest {
+            values.mint();
+        }
+        values
+    }
+
+    /// THE VENDOR'S CASE 4, SCALED TO ONE UNIT PER CLASS.
+    ///
+    /// `dcc/test/Transform/FlatteningLocalRegions/flatten_local_region4.mlir:737-765` is one outer local
+    /// region over 32 units (`%arg47`, `:738`) holding a condition chain and, inside a conditional, a
+    /// NESTED `uniform.uniformize_regions` that splits those 32 into two classes of 16. Two units stand
+    /// in for the two classes here; nothing in `cloneOpsForRegions` counts them.
+    ///
+    /// ⚠️ THE UNIT AND MAPPING VALUES ARE THE **EXPECTATION'S**, NOT THE INPUT'S. The two files number
+    /// the same values differently (the expectation runs them through FileCheck's `VAL_` capture), and a
+    /// mapping op's operands are units bound OUTSIDE the local region, so the clone carries them
+    /// through unchanged — `[%10 -> %74]` here is `%[[VAL_10]] -> %[[VAL_74]]` at `:354`. Taking them
+    /// from the expectation is what lets the pinned output be read against it line for line.
+    ///
+    /// ⚠️ THE FIXTURE'S `arith.cmpi` OPS ARE AN `arith.constant` AND AN `arith.subi`. This island has no
+    /// integer comparison; what the test needs of the second one is that it READS the conditional's
+    /// result, which `arith.subi` does — and `arith.subi` is in the vendor's own expectation
+    /// (`:379-386`).
+    fn a_case_four_program() -> DfirOp {
+        let nested = DfirOp::Uniform(uniform::Op::UniformizeRegions {
+            regions: vec![
+                // THE INPUT'S **SECOND** REGION: `(%arg48 -> ..16 units..){ .. receive_cl1 }`
+                // (`:755-760`), which `flatten` emits FIRST (`:344-359`) because the equivalence
+                // classes come out in `unit_rep_order` (`:448`), not in region order.
+                uniform::LocalRegion {
+                    arg: Val(48),
+                    units: vec![Val(10)],
+                    body: vec![
+                        DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                            result: Val(285),
+                            pairs: vec![(Val(10), Val(74))],
+                        }),
+                        DfirOp::Uniform(uniform::Op::QueryMap {
+                            result: Val(286),
+                            map: Val(285),
+                            key: Val(48),
+                        }),
+                        DfirOp::Dataflow(dataflow::Op::SyncRecv {
+                            from: Val(286),
+                            signal: SyncSignal::InputToLxsuToLxluToSync,
+                        }),
+                        DfirOp::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        }),
+                    ],
+                },
+                // AND THE INPUT'S **FIRST**: `(%arg48 -> ..16 units..){ .. receive_cl0 }`
+                // (`:749-754`), emitted second (`:360-374`).
+                //
+                // ⚠️ `Val(49)`, THOUGH THE INPUT PRINTS `%arg48` HERE TOO. A block argument is
+                // scoped to its own region in MLIR, so two regions may both name theirs
+                // `%arg48`; this island has one flat value space and needs two numbers. The
+                // rebinding at `:246-256` is what the test is about, and it is exactly this
+                // value that has to disappear from the output.
+                uniform::LocalRegion {
+                    arg: Val(49),
+                    units: vec![Val(11)],
+                    body: vec![
+                        DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                            result: Val(295),
+                            pairs: vec![(Val(11), Val(75))],
+                        }),
+                        DfirOp::Uniform(uniform::Op::QueryMap {
+                            result: Val(296),
+                            map: Val(295),
+                            key: Val(49),
+                        }),
+                        DfirOp::Dataflow(dataflow::Op::SyncRecv {
+                            from: Val(296),
+                            signal: SyncSignal::InputToLxsuToLxluToSync,
+                        }),
+                        DfirOp::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        }),
+                    ],
+                },
+            ],
+            results: Vec::new(),
+        });
+        a_uniformize_over(
+            vec![Val(10), Val(11)],
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(282),
+                    value: 0,
+                }),
+                DfirOp::Scf(scf::Op::If {
+                    cond: Val(282),
+                    results: vec![Val(283)],
+                    body: vec![
+                        DfirOp::Arith(arith::Op::Constant {
+                            result: Val(284),
+                            value: 1,
+                        }),
+                        DfirOp::Scf(scf::Op::Yield {
+                            operands: vec![Val(284)],
+                        }),
+                    ],
+                    else_body: vec![DfirOp::Scf(scf::Op::Yield {
+                        operands: vec![Val(4)],
+                    })],
+                    dbg_name: Some("condition__1".to_owned()),
+                }),
+                DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                    result: Val(290),
+                    lhs: Val(283),
+                    rhs: Val(4),
+                    ty: ScalarTy::Index,
+                })),
+                DfirOp::Scf(scf::Op::If {
+                    cond: Val(290),
+                    results: Vec::new(),
+                    body: vec![nested],
+                    else_body: Vec::new(),
+                    dbg_name: Some("condition__1".to_owned()),
+                }),
+                DfirOp::Uniform(uniform::Op::Yield {
+                    operands: Vec::new(),
+                }),
+            ],
+        )
+    }
+
+    /// THE TREE `traverseRegion` AND `compute` BUILD OVER [`a_case_four_program`], SPELLED OUT, WITH
+    /// `unit_to_ops` AS THE WALK WOULD LEAVE IT.
+    ///
+    /// ⚠️ BUILT BY HAND BECAUSE `compute` IS ENTRY 247/384 AND UNPORTED —
+    /// [`FlatteningLocalRegionsTree::traverse_region`] stops at a `todo!` on a nested
+    /// `uniform.uniformize_regions`. What is written here is exactly what the two together produce:
+    /// `is_in_region_num` is the parent's region index for ordinary nesting (`:145`) and **0 for both**
+    /// of the nested op's regions, because `compute` passes `false` (`:164`); `units` is the enclosing
+    /// region's list, except on the uniformize node itself, which gets none (`:137-139`).
+    fn a_case_four_tree(program: &DfirOp) -> (FlatteningLocalRegionsTree<'_>, LocalOpNodeId) {
+        let outer = the_region(program);
+        let both = [Val(10), Val(11)];
+        let mut base = OperationTreeBase::with_root(LocalOpNode::new(program));
+        let root = base.root();
+        // `new LocalOpNode(&op)`, stamped and attributed, then `parent_node->insertChildNode(new_node)`
+        // (`:134-136`, `:140-141`).
+        fn push<'p>(
+            base: &mut OperationTreeBase<LocalOpNode<'p>>,
+            parent: OperationNodeId,
+            op: &'p DfirOp,
+            rn: u32,
+            units: &[Val],
+        ) -> OperationNodeId {
+            let mut node = LocalOpNode::new(op);
+            node.is_in_region_num = RegionNum(rn);
+            node.units = units.to_vec();
+            base.push_child(parent, node)
+        }
+
+        // `%282 = arith.constant`.
+        push(&mut base, root, &outer.body[0], 0, &both);
+        // The condition-forwarding `scf.if` and its three inner operations, two in region 0 and one in
+        // region 1.
+        let forwarding = push(&mut base, root, &outer.body[1], 0, &both);
+        let arms = dialects::regions(&outer.body[1]);
+        push(&mut base, forwarding, &arms[0][0], 0, &both);
+        push(&mut base, forwarding, &arms[0][1], 0, &both);
+        push(&mut base, forwarding, &arms[1][0], 1, &both);
+        // `%290 = arith.subi %283, %4`.
+        push(&mut base, root, &outer.body[2], 0, &both);
+        // The guarding `scf.if`, its nested local operation, and that operation's two regions' worth of
+        // children — all stamped region 0, and each attributed to its own class's unit only.
+        let guard = push(&mut base, root, &outer.body[3], 0, &both);
+        let nested = &dialects::regions(&outer.body[3])[0][0];
+        let nested_node = push(&mut base, guard, nested, 0, &[]);
+        let inner = the_regions(nested);
+        for (region, unit) in inner.iter().zip([Val(10), Val(11)]) {
+            for op in &region.body {
+                push(&mut base, nested_node, op, 0, &[unit]);
+            }
+        }
+        // `uniform.yield`.
+        push(&mut base, root, &outer.body[4], 0, &both);
+
+        let mut tree = FlatteningLocalRegionsTree {
+            unit_to_ops: UnitToOps::new(),
+            base: Some(base),
+        };
+        // `unit_to_ops[u].push_back(&op)` in walk order (`:142`) — the nested operations before the
+        // outer terminator, because the walk reaches them there.
+        for unit in both {
+            for op in [
+                &outer.body[0],
+                &outer.body[1],
+                &arms[0][0],
+                &arms[0][1],
+                &arms[1][0],
+                &outer.body[2],
+                &outer.body[3],
+            ] {
+                tree.unit_to_ops.push_op(unit, op);
+            }
+        }
+        for (region, unit) in inner.iter().zip([Val(10), Val(11)]) {
+            for op in &region.body {
+                tree.unit_to_ops.push_op(unit, op);
+            }
+        }
+        for unit in both {
+            tree.unit_to_ops.push_op(unit, &outer.body[4]);
+        }
+        (tree, LocalOpNodeId(root))
+    }
+
+    /// 🎯 182/384 — THE SECOND CLASS GETS THE **OTHER** LOCAL REGION'S BODY, AND ITS OWN BLOCK ARGUMENT.
+    ///
+    /// The same tree, the same outer condition chain, one operation different: this class's
+    /// representative was attributed the nested op's SECOND region, so `:233-234` selects those three
+    /// operations and rejects the first region's. That is the whole contrast the vendor's expectation
+    /// draws between its two flattened regions — `..receive_cl1` at `flatten_local_region4.mlir:356`
+    /// against `..receive_cl0` at `:372`, over identical condition chains at `:345-353` and `:361-369`.
+    ///
+    /// ⭐ AND `key:` IS **THIS** REGION'S ARGUMENT: `%VAL_357 = uniform.query_map(map:.., key:%VAL_351)`
+    /// (`:355`) against `%VAL_364 = uniform.query_map(map:.., key:%VAL_358)` (`:371`). `flatten` mints one
+    /// block argument per new region and calls this function once per region (`:431-449`), and `:246-256`
+    /// maps whichever local region actually holds the operation to whichever argument it was handed.
+    #[test]
+    fn the_second_class_selects_the_other_local_region() {
+        let program = a_case_four_program();
+        let (tree, root) = a_case_four_tree(&program);
+        let class = tree
+            .unit_to_ops
+            .entries()
+            .iter()
+            .find(|(unit, _)| *unit == Val(11))
+            .map(|(_, ops)| ops.clone())
+            .expect("unit %11 is the second class's representative");
+
+        let mut values = values_past(300);
+        let block_arg = values.mint();
+        let mut arg_map = ValueMapping::new();
+        arg_map.map(the_region(&program).arg, block_arg);
+        let mut into = Vec::new();
+
+        tree.clone_ops_for_regions(
+            tree.first_child(root),
+            &class,
+            &mut into,
+            RegionNum(0),
+            &mut arg_map,
+            block_arg,
+            &mut values,
+        );
+
+        let mut got = String::new();
+        for op in &into {
+            print::emit(&mut got, op, 0);
+        }
+        assert_eq!(got, concat!(
+            // The same condition chain the first class got, cloned again for this region
+            // (`flatten_local_region4.mlir:361-369` against `:345-353`).
+            "%302 = arith.constant 0 : index\n",
+            "%303 = scf.if %302 -> (index) {\n",
+            "  %304 = arith.constant 1 : index\n",
+            "  scf.yield %304 : index\n",
+            "} else {\n",
+            "  scf.yield %4 : index\n",
+            "} {dbgName = \"condition__1\"}\n",
+            "%305 = arith.subi %303, %4 : index\n",
+            "scf.if %305 {\n",
+            // ⭐ `%11 -> %75`, NOT `%10 -> %74` — region ONE's mapping op, so `:233-234` really did
+            // select this class's list and reject the other region's (`:370` against `:354`).
+            "  %306 = uniform.def_immutable_mapping([%11 -> %75]):index\n",
+            // ⭐ AND `key:%301` AGAIN — this call was handed its own region's argument, exactly as
+            // `:371` reads `%VAL_358` where `:355` reads `%VAL_351`.
+            "  %307 = uniform.query_map(map:%306, key:%301) : index\n",
+            "  dataflow.sync_recv %307 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+            "} {dbgName = \"condition__1\"}\n",
+        ));
+    }
+
+    /// The regions of a `uniform.uniformize_regions`, for reaching a nested one's unit lists.
+    fn the_regions(op: &DfirOp) -> &[uniform::LocalRegion] {
+        match op {
+            DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => regions,
+            _ => unreachable!("only ever called on the nested local operation"),
+        }
+    }
+
+    /// 🎯 182/384 — THE VENDOR'S CASE 4: ONE CLASS'S BODY, WITH THE NESTED LOCAL REGION FLATTENED AWAY
+    /// AND ITS UNIT BINDER REBOUND TO THE NEW REGION'S ARGUMENT.
+    ///
+    /// This is `flatten_local_region4.mlir:344-358` — the first region of the flattened op — built from
+    /// the input at `:737-765`. Four things have to come out right and each is a different branch:
+    ///
+    /// * the outer condition chain is cloned, and `%VAL_355 = arith.cmpi eq, %VAL_353, ..` (`:352`)
+    ///   reads the CLONE of the conditional, not the original (`arg_map`, `:257-258`);
+    /// * the conditional's regions are refilled from the ORIGINAL's children by `is_in_region_num`, so
+    ///   the `then` region gets two operations and the `else` region one (`:263-268`, expectation
+    ///   `:346-351`);
+    /// * the nested `uniform.uniformize_regions` is GONE and the three operations of the region
+    ///   belonging to this class stand where it was (`:235-238`, expectation `:354-356`);
+    /// * `uniform.query_map(map:%285, key:%arg48)` becomes `key:%VAL_351` — the new region's block
+    ///   argument, mapped by `:246-256` because the operation's parent is a local op.
+    ///
+    /// ⛔ AND THE GUARDING `scf.if` PRINTS NO `else`: its source `else` region held nothing, so the
+    /// clone's stays an empty `Vec` — `if (block.empty()) block.erase()` (`:269`), expectation `:357`.
+    #[test]
+    fn the_vendor_case_four_first_region_is_one_class_with_the_nesting_flattened() {
+        let program = a_case_four_program();
+        let (tree, root) = a_case_four_tree(&program);
+        let class = tree
+            .unit_to_ops
+            .entries()
+            .iter()
+            .find(|(unit, _)| *unit == Val(10))
+            .map(|(_, ops)| ops.clone())
+            .expect("unit %10 is the first class's representative");
+
+        // `flatten`'s per-region setup: a fresh mapping, the new region's block argument, and the OLD
+        // region's argument mapped to it (`:444-446`).
+        let mut values = values_past(300);
+        let block_arg = values.mint();
+        let mut arg_map = ValueMapping::new();
+        arg_map.map(the_region(&program).arg, block_arg);
+        let mut into = Vec::new();
+
+        tree.clone_ops_for_regions(
+            tree.first_child(root),
+            &class,
+            &mut into,
+            RegionNum(0),
+            &mut arg_map,
+            block_arg,
+            &mut values,
+        );
+
+        let mut got = String::new();
+        for op in &into {
+            print::emit(&mut got, op, 0);
+        }
+        assert_eq!(
+            got,
+            concat!(
+                // `%VAL_352 = arith.cmpi eq, %VAL_310, %VAL_8 : index` (`:345`).
+                "%302 = arith.constant 0 : index\n",
+                // `:346-351` — the result is bound, the `then` region gets both of its operations and
+                // the `else` region its one, and the debug name prints after the regions.
+                "%303 = scf.if %302 -> (index) {\n",
+                "  %304 = arith.constant 1 : index\n",
+                "  scf.yield %304 : index\n",
+                "} else {\n",
+                "  scf.yield %4 : index\n",
+                "} {dbgName = \"condition__1\"}\n",
+                // ⭐ `%VAL_355 = arith.cmpi eq, %VAL_353, %VAL_4 : i1` (`:352`) — the first operand is
+                // the CLONE of the conditional, the second a value from outside the region and so
+                // unmapped.
+                "%305 = arith.subi %303, %4 : index\n",
+                // ⛔ NO `else`: the source conditional's `else` region held nothing for this class, so
+                // `if (block.empty()) block.erase()` (`:269`) leaves it empty — `:353-357`.
+                "scf.if %305 {\n",
+                // ⭐⭐ THE NESTED LOCAL OPERATION IS GONE AND ITS REGION-0 BODY STANDS HERE (`:354-356`),
+                // with `key:` rebound from `%arg48` to the new region's block argument (`:246-256`).
+                "  %306 = uniform.def_immutable_mapping([%10 -> %74]):index\n",
+                "  %307 = uniform.query_map(map:%306, key:%301) : index\n",
+                "  dataflow.sync_recv %307 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "} {dbgName = \"condition__1\"}\n",
+                // ⚠️ AND NO `uniform.yield`: `flatten` builds the new region's terminator itself
+                // (`:450`), which is `:358` of the expectation.
+            )
+        );
+    }
+
+    /// A `uniform.uniformize_regions` OVER ONE REGION — the shape `compute` hands to
+    /// [`FlatteningLocalRegionsTree::traverse_region`].
+    ///
+    /// `flatten` roots the tree at the operation itself (`FlatteningLocalRegions.cpp:392-393`) and
+    /// `compute` then walks each of its regions with that region's own unit list (`:162-165`), so a
+    /// test of the walk needs the op, not just the ops inside it.
+    fn a_uniformize_over(units: Vec<Val>, body: Vec<DfirOp>) -> DfirOp {
+        DfirOp::Uniform(uniform::Op::UniformizeRegions {
+            regions: vec![uniform::LocalRegion {
+                arg: Val(47),
+                units,
+                body,
+            }],
+            results: Vec::new(),
+        })
+    }
+
+    /// A TREE WITH A ROOT AND NO CHILDREN — `root_ = new LocalOpNode(&op_)` and nothing else yet
+    /// (`FlatteningLocalRegions.cpp:392-393`), which is the state `compute` is called in.
+    fn a_rooted_tree<'p>(op: &'p DfirOp) -> (FlatteningLocalRegionsTree<'p>, LocalOpNodeId) {
+        let base = OperationTreeBase::with_root(LocalOpNode::new(op));
+        let root = LocalOpNodeId(base.root());
+        let tree = FlatteningLocalRegionsTree {
+            unit_to_ops: UnitToOps::new(),
+            base: Some(base),
+        };
+        (tree, root)
+    }
+
+    /// The one region of [`a_uniformize_over`], for taking its body and units back out.
+    fn the_region(op: &DfirOp) -> &uniform::LocalRegion {
+        match op {
+            DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => &regions[0],
+            _ => unreachable!("built by `a_uniformize_over` one line above every caller"),
+        }
+    }
+
+    /// 🎯 180/384 — EVERY UNIT OF A LOCAL REGION IS ATTRIBUTED EVERY OPERATION IN IT, NESTING INCLUDED.
+    ///
+    /// `traverseRegion` passes the SAME unit list into each nested region (`:145`), so the enclosing
+    /// conditional does not narrow attribution. ⭐ THAT IS WHAT MAKES THE VENDOR'S CASE 4 DECIDABLE: all
+    /// 32 units run one `arith.cmpi`/`scf.if` chain in the outer region
+    /// (`dcc/test/Transform/FlatteningLocalRegions/flatten_local_region4.mlir:738-747`) and differ only
+    /// inside the nested local regions, so the outer walk contributes an identical list to every unit
+    /// and [`FlatteningLocalRegionsTree::partition_units`] has nothing to split on there.
+    ///
+    /// ⚠️ THE FIXTURE'S `arith.cmpi` IS AN `arith.constant` HERE. This island has no integer
+    /// comparison, and the walk is blind to what an operation IS except for the single
+    /// `isa<uniform::UniformizeRegionsOp>` at `:137` — so the substitution cannot change the answer.
+    #[test]
+    fn the_walk_attributes_nested_operations_to_every_unit_of_the_region() {
+        let program = a_uniformize_over(
+            vec![Val(10), Val(14)],
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(282),
+                    value: 0,
+                }),
+                DfirOp::Scf(scf::Op::If {
+                    cond: Val(282),
+                    results: vec![Val(283)],
+                    body: vec![DfirOp::Scf(scf::Op::Yield {
+                        operands: vec![Val(285)],
+                    })],
+                    else_body: vec![DfirOp::Scf(scf::Op::Yield {
+                        operands: vec![Val(4)],
+                    })],
+                    dbg_name: None,
+                }),
+                DfirOp::Uniform(uniform::Op::Yield {
+                    operands: Vec::new(),
+                }),
+            ],
+        );
+        let region = the_region(&program);
+        let (mut tree, root) = a_rooted_tree(&program);
+
+        // `traverseRegion(uniform_op.getRegion(idx), node, units_for_each_region.at(idx), false)`
+        // (`:163-164`) — `false` is region 0.
+        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
+
+        // Four operations reach the map: the constant, the conditional, and BOTH of its yields. The
+        // `uniform.yield` reaches it too — the walk does not filter terminators, `cloneOpsForRegions`
+        // does (`:229`).
+        let expected: Vec<&DfirOp> = vec![
+            &region.body[0],
+            &region.body[1],
+            &the_regions_of(&region.body[1])[0][0],
+            &the_regions_of(&region.body[1])[1][0],
+            &region.body[2],
+        ];
+        for (unit, ops) in tree.unit_to_ops.entries() {
+            assert!(
+                runs_the_same_operations(ops, &expected),
+                "unit {unit:?} was walked over a different operation list"
+            );
+        }
+        assert_eq!(
+            tree.unit_to_ops
+                .entries()
+                .iter()
+                .map(|(unit, _)| *unit)
+                .collect::<Vec<_>>(),
+            vec![Val(10), Val(14)],
+            "`llvm::MapVector` keeps the units in the order the walk pushed them"
+        );
+    }
+
+    /// The regions of one op, for naming a nested operation in a test expectation.
+    fn the_regions_of(op: &DfirOp) -> Vec<&[DfirOp]> {
+        dialects::regions(op)
+    }
+
+    /// 🎯 180/384 — A NODE CARRIES THE INDEX OF THE **PARENT'S** REGION IT WAS FOUND IN.
+    ///
+    /// `traverseRegion(op.getRegion(region_num), new_node, units, region_num)` (`:145`) stamps the loop
+    /// counter, so the `then` region's operations are region 0 and the `else` region's are region 1 —
+    /// the order [`dialects::regions`] indexes an `scf.if` in, and the distinction
+    /// [`FlatteningLocalRegionsTree::clone_ops_for_regions`] filters on at `:242`.
+    ///
+    /// ⭐ AND THE TOP CALL STAMPS 0, because `compute` passes `false` (`:164`).
+    #[test]
+    fn a_nested_operation_carries_the_index_of_its_parents_region() {
+        let program = a_uniformize_over(
+            vec![Val(10)],
+            vec![DfirOp::Scf(scf::Op::If {
+                cond: Val(282),
+                results: Vec::new(),
+                body: vec![DfirOp::Arith(arith::Op::Constant {
+                    result: Val(285),
+                    value: 1,
+                })],
+                else_body: vec![DfirOp::Arith(arith::Op::Constant {
+                    result: Val(286),
+                    value: 2,
+                })],
+                dbg_name: None,
+            })],
+        );
+        let region = the_region(&program);
+        let (mut tree, root) = a_rooted_tree(&program);
+
+        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
+
+        let conditional = tree.first_child(root).expect("the `scf.if` is the root's child");
+        assert_eq!(
+            tree.node(conditional).map(|node| node.is_in_region_num),
+            Some(RegionNum(0)),
+            "the outer operation is stamped by `compute`'s `false` (`:164`)"
+        );
+        let then_op = tree
+            .first_child(conditional)
+            .expect("the `then` region's constant");
+        let else_op = tree
+            .next_sibling(then_op)
+            .expect("the `else` region's constant, in the same sibling chain");
+        assert_eq!(
+            tree.node(then_op).map(|node| node.is_in_region_num),
+            Some(RegionNum(0))
+        );
+        assert_eq!(
+            tree.node(else_op).map(|node| node.is_in_region_num),
+            Some(RegionNum(1)),
+            "`getRegions()[1]` is the `else` region (`:802-810` of `dialects/mod.rs`)"
+        );
+        // ⛔ BOTH REGIONS' OPERATIONS ARE THE SAME UNIT'S — one sibling chain, two region numbers.
+        assert_eq!(
+            tree.node(else_op).map(|node| node.units.as_slice()),
+            Some([Val(10)].as_slice())
+        );
+    }
+
+    /// 🎯 180/384 — A NESTED `uniform.uniformize_regions` STOPS AT ENTRY 247, WHICH IS NOT IN THIS WAVE.
+    ///
+    /// `compute(new_node)` (`:138`) re-derives a unit list per region from the nested op's own
+    /// `$units`/`$list_sizes` (`:151-166`); that is `e247_compute`, level 2 of the campaign
+    /// (`crustify-bridge2/UNITS.tsv`). ⛔ THE GATE IS THE REFERENCE'S OWN `isa<>`, so a region with no
+    /// nested local region — every region of the vendor's cases 1-3, and the outer region of case 4 —
+    /// walks completely; only the case that genuinely needs 247 reaches the `todo!`.
+    #[test]
+    #[should_panic(expected = "e247_compute")]
+    fn a_nested_local_region_needs_entry_247() {
+        let program = a_uniformize_over(
+            vec![Val(10)],
+            vec![DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                regions: vec![uniform::LocalRegion {
+                    arg: Val(48),
+                    units: vec![Val(10)],
+                    body: Vec::new(),
+                }],
+                results: Vec::new(),
+            })],
+        );
+        let region = the_region(&program);
+        let (mut tree, root) = a_rooted_tree(&program);
+
+        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
+    }
 
     /// ONE OPERATION PER LINE OF A REGION — the ops the nodes below stand for.
     ///
@@ -643,8 +1890,10 @@ mod unit_tests {
         vec![
             DfirOp::Scf(scf::Op::If {
                 cond: Val(30),
+                results: Vec::new(),
                 body: Vec::new(),
                 else_body: Vec::new(),
+                dbg_name: None,
             }),
             DfirOp::Arith(arith::Op::Constant {
                 result: Val(1),
@@ -728,8 +1977,10 @@ mod unit_tests {
     fn a_fresh_node_carries_its_operation_and_nothing_else() {
         let op = DfirOp::Scf(scf::Op::If {
             cond: Val(30),
+            results: Vec::new(),
             body: Vec::new(),
             else_body: Vec::new(),
+            dbg_name: None,
         });
         let node = LocalOpNode::new(&op);
         assert!(
@@ -1014,4 +2265,46 @@ mod unit_tests {
         assert_eq!(keys, vec![Val(9), Val(7)], "`%9` was seen first");
         assert_eq!(map.entries()[0].1.len(), 2, "and it ran two operations");
     }
+
+    /// 🎯 179/384 — `clear()` PUTS BACK THE STATE `flatten` STARTS FROM.
+    ///
+    /// The reference frees every node and then sets `root_ = nullptr` and `unit_to_ops.clear()`
+    /// (`FlatteningLocalRegions.cpp:112-127`); what a caller can observe afterwards is a tree with no
+    /// root and no attributed operations — the same state as [`FlatteningLocalRegionsTree::new`], which
+    /// is why `flatten` can call it before it decides anything (`:385`).
+    #[test]
+    fn clearing_a_built_tree_leaves_no_root_and_no_operations() {
+        let ops = a_region();
+        let (mut tree, ids) = a_flattening_tree(&ops);
+        tree.unit_to_ops.push_op(Val(9), &ops[1]);
+        tree.unit_to_ops.push_op(Val(7), &ops[2]);
+        assert!(tree.root().is_some(), "the tree was built with a root");
+        assert_eq!(tree.first_child(ids[0]), Some(ids[1]), "and with children");
+        assert_eq!(tree.unit_to_ops.entries().len(), 2);
+
+        tree.clear();
+
+        assert_eq!(tree.root(), None, "`root_ = nullptr` (`:124`)");
+        assert!(
+            tree.unit_to_ops.entries().is_empty(),
+            "`unit_to_ops.clear()` (`:126`)"
+        );
+    }
+
+    /// 🎯 179/384 — AND ON A TREE THAT NEVER HAD A ROOT IT DOES NOTHING, WHICH IS THE THIRD BRANCH.
+    ///
+    /// `empty()` is `!root_ || !root_->getFirstChild()` (`dcc/src/Analysis/OperationTree.hpp:214`), so
+    /// a rootless tree takes the `else if (root_)` branch and frees nothing. ⭐ THE PASS REACHES THIS:
+    /// `flatten` clears, returns early when the operation is not a `uniform.uniformize_regions`
+    /// (`:386-387`), and its destructor then clears the same rootless tree a second time (`:79`).
+    #[test]
+    fn clearing_a_rootless_tree_is_the_state_it_was_already_in() {
+        let mut tree = FlatteningLocalRegionsTree::new();
+        tree.clear();
+        assert_eq!(tree.root(), None);
+        assert!(tree.unit_to_ops.entries().is_empty());
+    }
 }
+
+
+

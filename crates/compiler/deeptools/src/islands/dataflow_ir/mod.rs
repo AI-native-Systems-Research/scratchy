@@ -155,6 +155,56 @@ impl Values {
         }
         cloned
     }
+
+    /// ONE OP CLONED WITH ITS REGIONS LEFT EMPTY — `Operation::cloneWithoutRegions(IRMapping &)`.
+    ///
+    /// # ⭐⭐ THE THREE THINGS IT DOES, AND THE ONE IT DELIBERATELY DOES NOT
+    ///
+    /// It is [`Self::clone_ops`] for a single op minus the region recursion: operands are read through
+    /// `mapping`, every result is freshly minted and recorded in `mapping` so later clones of the same
+    /// body pick the new name up, and the regions come out EMPTY for the caller to fill.
+    ///
+    /// ⛔⛔ ITS ONE CALLER FILLS THEM WITH A DIFFERENT BODY, WHICH IS WHY IT EXISTS.
+    /// `cloneOpsForRegions` (`FlatteningLocalRegions.cpp:257-271`) clones a region-carrying op and then
+    /// fills region `rn` of the copy with only those of the ORIGINAL's children whose
+    /// `is_in_region_num` is `rn` **and** which belong to the unit class being built — so a deep clone
+    /// would copy the ops it is about to filter out, and copy them with the wrong names.
+    ///
+    /// # ⚠️ BLOCK ARGUMENTS ARE **NOT** REMINTED, AND THAT IS THE REFERENCE'S OWN GAP
+    ///
+    /// MLIR's `cloneWithoutRegions` creates the regions with NO BLOCKS AT ALL, so it maps no block
+    /// arguments; the caller then calls `emplaceBlock()` (`:265`), which creates a block with no
+    /// arguments either. A cloned op that BINDS one — an `affine.for`'s induction variable — therefore
+    /// has nothing declaring it in the reference, and every operand of the cloned body that read it
+    /// comes through `arg_map.lookupOrDefault` **unchanged**, naming a value the new op does not
+    /// define. This island holds a binder as a field on the op rather than as a block argument, so the
+    /// literal transcription — leave the field alone — is also the well-formed one: the copy declares
+    /// the same name its copied body reads. ⭐ No fixture reaches it. The only region-carrying ops the
+    /// pass actually clones are `scf.if`s, which bind nothing
+    /// (`dcc/test/Transform/FlatteningLocalRegions/flatten_local_region4.mlir:346-357`).
+    #[must_use]
+    pub fn clone_without_regions(&mut self, op: &Op, mapping: &mut ValueMapping) -> Op {
+        let mut copy = op.clone();
+        let parts = dialects::parts_mut(&mut copy);
+        // Operands first, for the same reason as in [`Self::clone_ops`]: an op cannot read what it
+        // defines.
+        for operand in parts.operands {
+            *operand = mapping.lookup_or_default(*operand);
+        }
+        // `mapper.map(getResult(i), newOp->getResult(i))` — MLIR's own clone records this, and
+        // `cloneOpsForRegions` depends on it: the ops it clones next read the copy's names.
+        for result in parts.results {
+            let fresh = self.mint();
+            mapping.map(*result, fresh);
+            *result = fresh;
+        }
+        // `op.clone()` above deep-copied the bodies; the copy's regions are emptied rather than never
+        // filled, because there is no way to build a `DfirOp` without its region fields.
+        for region in parts.regions {
+            region.clear();
+        }
+        copy
+    }
 }
 
 /// ONE `dataflow.program_unit` — the units it runs on, and what they run.
@@ -272,6 +322,15 @@ impl Units {
     /// ⭐ IBM AGREES: their `l3lu` unit holds the `composite_load_and_store`s
     /// (`/tmp/ktir_ref/export/debug/dfir.mlir:64` on `%0,%1`, transfers at `:82,:90`) while their
     /// `lxlu` unit holds `agen.vector_load` + `dataflow.send` and no transfer at all (`:104-129`).
+    ///
+    /// ⭐ AND A SECOND PASS ASKS THE SAME QUESTION IN THE SAME WORDS. `CanonicalizeToggle.cpp:59-61`
+    /// is the same `dcc::getUnitType(unit_op.getUnits()[0].getDefiningOp<GetUnitOp>())` followed by
+    /// the same `is_any_of(comp, L3LU, L3SU)`, selecting which units get their toggles canonicalized
+    /// (entry 178, see
+    /// [`crate::bridges::dataflow_ir_to_sentient::tf_canonicalize_toggle::run_on_operation`]) — a
+    /// toggle is a data transfer's address, so the units that hold one are the units that move
+    /// memory. ⛔ ONE PREDICATE, ASKED HERE: two copies of it would be two answers to whether an
+    /// `lxlu` moves memory.
     ///
     /// ⛔ EXHAUSTIVE, NO WILDCARD. A new unit kind must say whether it is an L3 half rather than
     /// silently inherit `false`.

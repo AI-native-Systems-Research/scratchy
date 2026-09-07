@@ -130,6 +130,9 @@ impl Loop {
             | DfirOp::Agen(_)
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+            // ⭐ AND `uniform`: `uniform.uniformize_regions` is region-carrying but neither
+            // `scf::ForOp` nor `affine::AffineForOp`, so both `dyn_cast`s are null.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }
@@ -357,6 +360,9 @@ fn signless_int_constant(val: Val, scope: &[DfirOp]) -> Option<i64> {
         | DfirOp::Agen(_)
         | DfirOp::Vector(_)
         | DfirOp::VectorChain(_)
+        // ⭐ AND `uniform`: a `query_map` binds an `index`, which is not the signless integer
+        // `ConstantIntOp` names — the same reason [`arith::Op::Constant`] is absent above.
+        | DfirOp::Uniform(_)
         | DfirOp::Symbol(_) => None,
     }
 }
@@ -437,8 +443,10 @@ mod unit_tests {
         for not_a_loop in [
             DfirOp::Scf(scf::Op::If {
                 cond: Val(1),
+                results: Vec::new(),
                 body: Vec::new(),
                 else_body: Vec::new(),
+                dbg_name: None,
             }),
             DfirOp::Scf(scf::Op::Parallel {
                 ivs: vec![Val(1)],

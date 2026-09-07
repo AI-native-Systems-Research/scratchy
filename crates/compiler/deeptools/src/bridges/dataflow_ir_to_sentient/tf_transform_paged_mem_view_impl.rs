@@ -181,11 +181,13 @@ impl Condition {
                 }),
                 DfirOp::Scf(scf::Op::If {
                     cond: guard.cond,
+                    results: Vec::new(),
                     body: ops,
                     // ⛔ ONE-ARMED, WHICH IS THE `false` LAST ARGUMENT OF EVERY `scf::IfOp::create`
                     // in this file. A page a subscript cannot reach has nothing to do, not something
                     // else to do.
                     else_body: Vec::new(),
+                    dbg_name: None,
                 }),
             ];
         }
@@ -891,6 +893,8 @@ impl<'a> VectorLoadOp<'a> {
             // dialect's op, and the whole `TPMVBase` hierarchy is written against the `agen` ones.
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+            // ⭐ AND `uniform`, which loads nothing.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }
@@ -1121,6 +1125,8 @@ impl<'a> VectorStoreOp<'a> {
             // dialect's op, and the whole `TPMVBase` hierarchy is written against the `agen` ones.
             | DfirOp::Vector(_)
             | DfirOp::VectorChain(_)
+            // ⭐ AND `uniform`, which stores nothing.
+            | DfirOp::Uniform(_)
             | DfirOp::Symbol(_) => None,
         }
     }

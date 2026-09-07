@@ -139,6 +139,18 @@ pub enum Op {
         /// (`CFGSDataflowConditionalTree.cpp:386`) — and printing then omits `else` entirely, as
         /// MLIR's own printer does.
         else_body: Vec<super::Op>,
+        /// `{dbgName = ".."}` — WHICH SOURCE CONDITIONALS THIS ONE WAS MERGED OUT OF.
+        ///
+        /// ⛔ THE SHALLOW MERGE NAMES ITS DESTINATION WHATEVER KIND IT IS. `mergeShallow` (entry 177)
+        /// ends in `dataflow::setDbgNameAttr(dst, ..)` (`CFGSDataflowConditionalTree.cpp:455-458`) and
+        /// the candidates it is given are `isa<mlir::affine::AffineIfOp, scf::IfOp>` (`:34`), so an
+        /// `affine.if` reaches that line on exactly the same path an `scf.if` does — see
+        /// [`super::scf::Op::If::dbg_name`], which carries the vendor's printed example.
+        ///
+        /// ⚠️ NO FIXTURE UNDER `dcc/test` PRINTS ONE ON AN `affine.if` (all 9 of them are unnamed),
+        /// so the form is MLIR's trailing attribute dictionary as for every other op that carries the
+        /// discardable attribute, and not a shape the vendor's own text pins down here.
+        dbg_name: Option<String>,
     },
 
     /// `affine.apply affine_map<..>(%args)` — an index computed from induction variables.
@@ -254,6 +266,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             results,
             body,
             else_body,
+            dbg_name,
         } => {
             // `printOptionalArrowTypeList`: nothing when there are no results, ` -> index` for one,
             // ` -> (index, index)` for more (`issue-236.mlir:59` writes the single-result form).
@@ -281,13 +294,17 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             // ⭐ THE TERMINATOR PRINTS ONLY WHERE MLIR PRINTS IT — see [`Op::If::results`].
             region(out, body, depth, !results.is_empty());
             print::indent(out, depth);
-            if else_body.is_empty() {
-                out.push_str("}\n");
-            } else {
+            if !else_body.is_empty() {
                 out.push_str("} else {\n");
                 region(out, else_body, depth, !results.is_empty());
                 print::indent(out, depth);
-                out.push_str("}\n");
+            }
+            // ⛔ AFTER THE REGIONS — see [`Op::If::dbg_name`].
+            match dbg_name {
+                None => out.push_str("}\n"),
+                Some(name) => {
+                    let _ = writeln!(out, "}} {{dbgName = \"{name}\"}}");
+                }
             }
         }
         Op::Apply { result, map, args } => {
