@@ -79,6 +79,7 @@ pub mod vc_vector_chain_to_sentient_pt;
 pub mod vc_vector_operands;
 
 use crate::arch::{Arch, Bytes, Elements};
+use crate::bridges::dataflow_ir_to_sentient::agen_agen_to_sentient::ExtractIdx;
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
@@ -157,6 +158,24 @@ struct Consts {
 fn program<A: Arch, M: Model, W: Workload>(
     input: &dfir::Program<A>,
 ) -> sentient::Program<A, M, W> {
+    // ── the dataflow-level rewrites run first, over the INPUT rung ────────────────────────────────
+    // ⭐⭐ A `Transform/Dataflow/` PASS IS NOT PART OF THE LOWERING, IT PRECEDES IT. `dcc` runs the CFG
+    // simplification on the DataflowIR module and hands the RESULT to `AgenToSentient`, so the walk
+    // below must see the simplified program — inheriting constants from the unsimplified one and then
+    // simplifying would renumber everything.
+    //
+    // ⛔ IT IS PROVABLY A NO-OP OVER EVERY PROGRAM THIS CRATE CURRENTLY BUILDS (no `scf.if` reaches
+    // this rung) and is wired in anyway, so that the day one does the build names the missing rewrite
+    // instead of lowering a conditional the Sentient rung mis-schedules. See
+    // [`tf_cfg_simplification_dataflow_level::run_on_operation`].
+    //
+    // ⛔ IT TAKES A SHARED REFERENCE BECAUSE IT HAS NOTHING TO WRITE BACK YET. An MLIR pass mutates
+    // its module in place; here all seven rewrites are unported, so the pass's entire observable
+    // effect is the choice between leaving the program alone and failing the build. Handing it a
+    // `&mut` copy today would clone every program to rewrite none of them, and would make the
+    // signature claim a capability nothing behind it has.
+    tf_cfg_simplification_dataflow_level::run_on_operation(input);
+
     // ⛔ A FRESH NUMBERING. The two rungs do not share SSA numbers: the views go away and three
     // constants arrive ahead of the units, so every value after the first shifts. Carrying the old
     // numbers would print a module whose values do not exist.
@@ -317,9 +336,13 @@ fn body<A: Arch>(
     consts: &Consts,
 ) -> ProgramUnit<A> {
     let mut out: Vec<SenOp> = Vec::new();
+    // ⛔ ONE COUNTER PER UNIT, minted here because that is the scope the reference gives it — a local
+    // of `fuseLoadOrStoreChainOps`, which the pass calls once per `dataflow.program_unit`
+    // (`AgenToSentient.cpp:27, 169-190`). See [`ExtractIdx`].
+    let mut extract = ExtractIdx::default();
     let mut i = 0;
     while i < unit.body.len() {
-        i += statement(&unit.body[i..], unit, bound, consts, &mut out);
+        i += statement(&unit.body[i..], unit, &mut extract, bound, consts, &mut out);
     }
     ProgramUnit {
         on: unit.on.clone(),
@@ -335,6 +358,7 @@ fn body<A: Arch>(
 fn statement<A: Arch>(
     rest: &[DfirOp],
     unit: &dfir::ProgramUnit<A>,
+    extract: &mut ExtractIdx,
     bound: &mut Bound,
     consts: &Consts,
     out: &mut Vec<SenOp>,
@@ -348,10 +372,19 @@ fn statement<A: Arch>(
             1
         }
 
-        // ── a memory-to-memory transfer: ONE op in, ONE op out ──────────────────────────────────
-        [DfirOp::Agen(dfir_op::agen::Op::CompositeLoadAndStore(transfer)), ..] => {
-            out.push(load_and_store(transfer, bound, consts));
-            1
+        // ── every `agen` candidate: `e382_fuseLoadOrStoreChainOps` ──────────────────────────────
+        // ⭐⭐ THE DISPATCH IS THE REFERENCE'S OWN AND LIVES IN ITS OWN HOME. `AgenToSentient.cpp:29`
+        // walks preorder for the FIRST op of twelve kinds and lowers exactly that one, then goes
+        // round again — this cursor IS that loop, so the arm hands the head of the window to the
+        // ported dispatch and advances by what it consumed. See
+        // [`agen_agen_to_sentient::fuse_load_or_store_chain_ops`].
+        // ⛔ NO PER-KIND ARM HERE. Splitting the twelve across two files is how the branch ORDER — a
+        // real part of a `dyn_cast` chain — gets lost.
+        [DfirOp::Agen(op), ..] => {
+            agen_agen_to_sentient::fuse_load_or_store_chain_ops(
+                op, unit, extract, bound, consts, out,
+            )
+            .ops()
         }
 
         // ── the `affine` ops ─────────────────────────────────────────────────────────────────────
