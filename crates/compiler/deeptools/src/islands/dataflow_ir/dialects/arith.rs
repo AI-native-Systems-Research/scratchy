@@ -197,6 +197,20 @@ pub enum Op {
     /// `index`, which MLIR treats as signed.
     DivSI(IntBinary),
 
+    /// `arith.remsi` — the SIGNED remainder.
+    ///
+    /// ⛔⛔ IN THE ISLAND BECAUSE `affine.apply`'S OWN EXPANSION EMITS IT. MLIR's
+    /// `AffineApplyExpander::visitModExpr` lowers `a mod b` as a `remsi` plus a sign correction —
+    /// *"Mod(a, b) = a - b * floordiv(a, b)"*, implemented as
+    /// `remsi`, `cmpi slt`, `addi` and a [`Op::Select`] — so a port of
+    /// `expandAffineApplyOps` (bridge-2 entry 183,
+    /// `Transform/Dataflow/LoopUnrollForShuffleOp.cpp:183`) that lacked this op could not expand an
+    /// [`AffineExpr::Mod`](crate::islands::dataflow_ir::ty::AffineExpr::Mod) at all.
+    ///
+    /// ⭐ SIGNED, LIKE [`Op::DivSI`], for the same reason: every quantity these maps compute is an
+    /// `index`, which MLIR treats as signed.
+    RemSI(IntBinary),
+
     /// `arith.cmpi <predicate>, %lhs, %rhs : index` — one integer comparison.
     ///
     /// (E) `first` IS `iv == lower bound` AND `last` IS `iv == upper bound - 1`
@@ -225,6 +239,50 @@ pub enum Op {
         /// writing `arith.cmpi eq, %14, 0 : index` is "expected SSA operand". The bound is minted as
         /// an `arith.constant` first.
         rhs: Val,
+    },
+
+    /// `arith.select %cond, %true_value, %false_value : index` — ONE VALUE CHOSEN BY A PREDICATE.
+    ///
+    /// # ⛔⛔ A LOOP BOUND CAN BE ONE, AND A PASS READS THROUGH IT
+    ///
+    /// `getLoopTripCount` (bridge-2 entry 184,
+    /// `Transform/Dataflow/MutableAddrSplitting.cpp:743`) has three arms for what may bind an
+    /// `scf.for`'s upper bound, and this op is the third:
+    ///
+    /// ```text
+    /// } else if (auto select_ub_op = dyn_cast<arith::SelectOp>(ub_op)) {
+    ///   auto true_op  = dyn_cast_or_null<arith::ConstantOp>(select_ub_op.getTrueValue().getDefiningOp());
+    ///   auto false_op = dyn_cast_or_null<arith::ConstantOp>(select_ub_op.getFalseValue().getDefiningOp());
+    ///   DT_CHECK_MSG(true_op && false_op, "Expecting SelectOp upper bound to contain constant values.");
+    ///   ub = true_val > false_val ? true_val : false_val;
+    /// }
+    /// ```
+    ///
+    /// ⭐⭐ AND THE VENDOR HAS A TEST NAMED AFTER IT. `select_ub` in
+    /// `dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_one_dim.mlir:290` writes
+    /// `%905 = arith.select %904, %c8, %c4 : index` as an `scf.for` bound and expects the pass to
+    /// partition against **8**. Without this op in the island that arm is unreachable, the bound
+    /// falls into the `llvm_unreachable("unsupported upper loop bound operation")` and the vendor's
+    /// own case cannot be built at all.
+    ///
+    /// ⭐ IT IS ALSO WHAT `affine.apply`'S EXPANSION BRANCHES WITH. MLIR's
+    /// `AffineApplyExpander::visitFloorDivExpr` picks between a dividend and its negated,
+    /// decremented form with this op, twice — see [`Op::RemSI`].
+    Select {
+        /// The value it binds.
+        result: Val,
+        /// `$condition` — the `i1` chosen on.
+        condition: Val,
+        /// `$true_value`.
+        true_value: Val,
+        /// `$false_value`.
+        false_value: Val,
+        /// The type of the two arms and of the result.
+        ///
+        /// ⛔ ONE TYPE FOR ALL THREE, WHICH IS `arith.select`'S OWN VERIFIER (`SameOperandsAndResultType`
+        /// over the arms). Every site this island can reach chooses between two `index` values — a
+        /// loop bound and an expanded subscript — so the field records which rather than assuming it.
+        ty: ScalarTy,
     },
 
     /// `arith.andi` / `arith.ori` / `arith.xori %c, true` - the connectives of a predicate.
@@ -293,6 +351,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::SubI(op) => int_binary(out, "arith.subi", op),
         Op::MulI(op) => int_binary(out, "arith.muli", op),
         Op::DivSI(op) => int_binary(out, "arith.divsi", op),
+        Op::RemSI(op) => int_binary(out, "arith.remsi", op),
         Op::Compare {
             result,
             predicate,
@@ -306,6 +365,25 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 predicate.spelling(),
                 print::val(*lhs),
                 print::val(*rhs)
+            );
+        }
+        Op::Select {
+            result,
+            condition,
+            true_value,
+            false_value,
+            ty,
+        } => {
+            // ⭐ THE CONDITION IS NOT PART OF THE PRINTED TYPE. `arith.select` prints one type, the
+            // one the arms and the result share; the condition's `i1` is implied.
+            let _ = writeln!(
+                out,
+                "{} = arith.select {}, {}, {} : {}",
+                print::val(*result),
+                print::val(*condition),
+                print::val(*true_value),
+                print::val(*false_value),
+                ty.spelling()
             );
         }
         Op::Logic {

@@ -351,6 +351,45 @@ impl AffineExpr {
         AffineExpr::FloorDiv(Box::new(self), Box::new(AffineExpr::Const(k)))
     }
 
+    /// `AffineExpr::isFunctionOfDim(unsigned position)` — DOES THIS EXPRESSION MENTION `d<dim>`?
+    ///
+    /// ```cpp
+    /// bool AffineExpr::isFunctionOfDim(unsigned position) const {
+    ///   if (getKind() == AffineExprKind::DimId) {
+    ///     return *this == mlir::getAffineDimExpr(position, getContext());
+    ///   }
+    ///   if (auto expr = llvm::dyn_cast<AffineBinaryOpExpr>(*this)) {
+    ///     return expr.getLHS().isFunctionOfDim(position) ||
+    ///            expr.getRHS().isFunctionOfDim(position);
+    ///   }
+    ///   return false;
+    /// }
+    /// ```
+    /// (`llvm-project/mlir/lib/IR/AffineExpr.cpp:314-323`)
+    ///
+    /// ⛔ A SYMBOL IS NEVER A DIMENSION, whatever value it carries — see [`AffineExpr::Sym`]. The
+    /// reference's own test is an identity comparison against `getAffineDimExpr(position)`, so
+    /// `d1` answers `false` for position 0 and nothing else in the grammar answers at all.
+    ///
+    /// ⭐⭐ TWO PORTS TURN ON IT, BOTH OVER A SUBSCRIPTS MAP.
+    /// `extractConstantOffsetsFromMapForDim` (`Dialect/Agen/Utils.cpp:520`) reads a **0** coefficient
+    /// for every result the split dimension does not appear in, and
+    /// `updateSubscriptsAndIndicesForExplicitTimeLoops` (`:466`) binds a **constant 0** for every time
+    /// dimension the concatenated map turns out not to use. Both are "this result does not move with
+    /// that iterator", and both are wrong in the same direction if a symbol were counted: an address
+    /// that shifts with an iterator it does not depend on.
+    #[must_use]
+    pub fn is_function_of_dim(&self, dim: u32) -> bool {
+        match self {
+            AffineExpr::Dim(n) => *n == dim,
+            AffineExpr::Sym(_) | AffineExpr::Const(_) => false,
+            AffineExpr::Add(a, b)
+            | AffineExpr::Mul(a, b)
+            | AffineExpr::Mod(a, b)
+            | AffineExpr::FloorDiv(a, b) => a.is_function_of_dim(dim) || b.is_function_of_dim(dim),
+        }
+    }
+
     /// `self + other`, **SIMPLIFIED** — MLIR's `AffineExpr::operator+`, which is `simplifyAdd`.
     ///
     /// ⛔⛔ THIS IS NOT A DUPLICATE OF [`Self::plus`] AND THE PAIR IS DELIBERATE. [`Self::plus`]
@@ -436,6 +475,32 @@ impl AffineExpr {
                 }
             }
         }
+    }
+
+    /// `AffineExpr::shiftDims(numDims, shift)` — RENUMBER `d<i>` TO `d<i + shift>`.
+    ///
+    /// ```cpp
+    /// for (unsigned idx = 0; idx < offset; ++idx)
+    ///   dims.push_back(getAffineDimExpr(idx, getContext()));
+    /// for (unsigned idx = offset; idx < numDims; ++idx)
+    ///   dims.push_back(getAffineDimExpr(idx + shift, getContext()));
+    /// return replaceDimsAndSymbols(dims, {});
+    /// ```
+    /// (`llvm-project/mlir/include/mlir/IR/AffineExpr.h:139-149`)
+    ///
+    /// ⭐ MLIR'S `offset` PARAMETER DEFAULTS TO 0 AND THE ONE CALL SITE THIS CAMPAIGN REACHES DOES
+    /// NOT PASS IT — `concatenateMaps` shifts EVERY dimension of the second map past the first map's
+    /// dimensions (`map_B.shiftDims(map_A.getNumDims())`, `dialect_utils/Agen/Utils.cpp:261`) — so
+    /// the leading-dimensions loop is absent here rather than carried as a parameter no port sets.
+    ///
+    /// ⭐ `num_dims` IS THE MAP'S ARITY, NOT THE EXPRESSION'S. A dimension at or above it is left
+    /// alone, which is `replaceDimsAndSymbols`' short-list rule doing the work.
+    #[must_use]
+    pub fn shifted_dims(&self, num_dims: u32, shift: u32) -> AffineExpr {
+        let dims: Vec<AffineExpr> = (0..num_dims)
+            .map(|idx| AffineExpr::Dim(idx.saturating_add(shift)))
+            .collect();
+        self.replace_dims_and_symbols(&dims, &[])
     }
 }
 
@@ -1227,34 +1292,6 @@ fn flattened(expr: &AffineExpr, dims: u32, syms: u32) -> Vec<i64> {
     row
 }
 
-/// ONE EXPRESSION WITH ITS DIMENSIONS **AND** SYMBOLS REPLACED — `AffineExpr::replaceDimsAndSymbols`.
-///
-/// ⭐ A POSITION BEYOND ITS REPLACEMENT LIST IS LEFT ALONE, which is MLIR's own rule
-/// (`return *this` when `pos >= dimReplacements.size()`) and what makes a PARTIAL substitution
-/// expressible — see [`IntegerSet::replace_symbols`], which relies on the same for symbols.
-fn replace_dims_and_symbols_in(
-    expr: &AffineExpr,
-    dim_repl: &[AffineExpr],
-    sym_repl: &[AffineExpr],
-) -> AffineExpr {
-    let recur = |e| replace_dims_and_symbols_in(e, dim_repl, sym_repl);
-    match expr {
-        AffineExpr::Dim(n) => match usize::try_from(*n).ok().and_then(|p| dim_repl.get(p)) {
-            Some(with) => with.clone(),
-            None => expr.clone(),
-        },
-        AffineExpr::Sym(n) => match usize::try_from(*n).ok().and_then(|p| sym_repl.get(p)) {
-            Some(with) => with.clone(),
-            None => expr.clone(),
-        },
-        AffineExpr::Const(_) => expr.clone(),
-        AffineExpr::Add(a, b) => AffineExpr::Add(Box::new(recur(a)), Box::new(recur(b))),
-        AffineExpr::Mul(a, b) => AffineExpr::Mul(Box::new(recur(a)), Box::new(recur(b))),
-        AffineExpr::Mod(a, b) => AffineExpr::Mod(Box::new(recur(a)), Box::new(recur(b))),
-        AffineExpr::FloorDiv(a, b) => AffineExpr::FloorDiv(Box::new(recur(a)), Box::new(recur(b))),
-    }
-}
-
 impl AffineMap {
     /// THIS MAP'S RESULT `result` AS A COEFFICIENT ROW — `agen::utils::getMapCoefficients(coeffs,
     /// map, result)` (`dialect_utils/Agen/Utils.cpp:65-71`).
@@ -1300,11 +1337,101 @@ impl AffineMap {
         AffineMap {
             dims: result_dims,
             syms: result_syms,
+            // ⛔⛔ AND IT SIMPLIFIES, WHICH IS [`AffineExpr::replace_dims_and_symbols`]'S JOB AND NOT
+            // A COURTESY. MLIR's map-level form is `llvm::map_range(getResults(), [](AffineExpr e) {
+            // return e.replaceDimsAndSymbols(..); })` handed to `AffineMap::get`, so every rebuilt
+            // node goes through `getAffineBinaryOpExpr` — and the vendor's own answer key is the
+            // proof: `constructIndices` folds two of five dimensions to `0` in
+            // `mutable_addr_splitting_time_dims.mlir` and the attribute it writes is
+            // `(d0, d1, d2) -> (d2 * 64, d0 * 16, d1 * 8)`, not `d0 * 16 + 0` and `d1 * 8 + 0 * 8`.
             results: self
                 .results
                 .iter()
-                .map(|expr| replace_dims_and_symbols_in(expr, dim_repl, sym_repl))
+                .map(|expr| expr.replace_dims_and_symbols(dim_repl, sym_repl))
                 .collect(),
+        }
+    }
+
+    /// `AffineMap::shiftDims(shift)` — RENUMBER EVERY DIMENSION UP BY `shift` AND WIDEN THE MAP TO
+    /// MATCH.
+    ///
+    /// ```cpp
+    /// AffineMap shiftDims(unsigned shift, unsigned offset = 0) const {
+    ///   assert(offset <= getNumDims());
+    ///   return AffineMap::get(getNumDims() + shift, getNumSymbols(),
+    ///       llvm::map_range(getResults(), [&](AffineExpr e) {
+    ///         return e.shiftDims(getNumDims(), shift, offset);
+    ///       }), getContext());
+    /// }
+    /// ```
+    /// (`llvm-project/mlir/include/mlir/IR/AffineMap.h:311-318`)
+    ///
+    /// ⭐⭐ THE ARITY GROWS, WHICH IS THE POINT: the shifted map takes the ORIGINAL map's dimensions
+    /// too, it just ignores them. `concatenateMaps` shifts the second map past the first so the sum
+    /// of the two can be indexed by both sets of iterators at once
+    /// (`dialect_utils/Agen/Utils.cpp:258-266`) — `(d0, d1, d2) -> (d0 * 64, d1, d2 * 8)` over a
+    /// two-dimensional first map becomes `(d0, .., d4) -> (d2 * 64, d3, d4 * 8)`.
+    ///
+    /// ⭐ SYMBOLS ARE UNTOUCHED, because they are numbered in their own space
+    /// (see [`AffineExpr::Sym`]).
+    #[must_use]
+    pub fn shift_dims(&self, shift: u32) -> AffineMap {
+        AffineMap {
+            dims: self.dims.saturating_add(shift),
+            syms: self.syms,
+            results: self
+                .results
+                .iter()
+                .map(|expr| expr.shifted_dims(self.dims, shift))
+                .collect(),
+        }
+    }
+
+    /// `AffineMap::isFunctionOfDim(position)` — DOES ANY RESULT OF THIS MAP MENTION `d<position>`?
+    ///
+    /// ```cpp
+    /// bool isFunctionOfDim(unsigned position) const {
+    ///   return llvm::any_of(getResults(),
+    ///                       [&](AffineExpr e) { return e.isFunctionOfDim(position); });
+    /// }
+    /// ```
+    /// (`llvm-project/mlir/include/mlir/IR/AffineMap.h:344-347`)
+    ///
+    /// ⭐⭐ THE QUESTION THAT DECIDES WHETHER A TIME DIMENSION BECOMES A LOOP OR A ZERO.
+    /// `updateSubscriptsAndIndicesForExplicitTimeLoops` binds a constant 0 for every dimension of the
+    /// concatenated map the map does not actually use (`Dialect/Agen/Utils.cpp:466`), and
+    /// `updateTimeSetForExplicitDims` keeps only those constraints that are a function of no
+    /// now-explicit time dimension (`:503`). Both are "this map does not move with that iterator";
+    /// see [`AffineExpr::is_function_of_dim`] for why a symbol never counts.
+    #[must_use]
+    pub fn is_function_of_dim(&self, position: u32) -> bool {
+        self.results
+            .iter()
+            .any(|expr| expr.is_function_of_dim(position))
+    }
+
+    /// `AffineMap::getDimPosition(idx)` — WHICH DIMENSION RESULT `idx` IS, when the result is a bare
+    /// dimension and nothing else.
+    ///
+    /// ```cpp
+    /// unsigned AffineMap::getDimPosition(unsigned idx) const {
+    ///   return llvm::cast<AffineDimExpr>(getResult(idx)).getPosition();
+    /// }
+    /// ```
+    /// (`llvm-project/mlir/lib/IR/AffineMap.cpp:319-321`)
+    ///
+    /// ⛔ `None` IS WHERE THE REFERENCE ABORTS. `cast` is not `dyn_cast`: a result that is not a bare
+    /// `d<n>` kills the compiler, so every caller is asserting the map is a PERMUTATION. This
+    /// campaign's one caller, `updateTimeSetForExplicitDims`, asks it of a `time_order`
+    /// (`Dialect/Agen/Utils.cpp:503`), and every `*_time_order` in the authority tree's tests is a
+    /// permutation of its dimensions — `#map = affine_map<(d0, d1, d2) -> (d2, d1, d0)>`
+    /// (`dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_time_dims.mlir:5`).
+    /// Reporting the shape instead of aborting is what lets the port stay total.
+    #[must_use]
+    pub fn dim_position(&self, idx: usize) -> Option<u32> {
+        match self.results.get(idx) {
+            Some(AffineExpr::Dim(position)) => Some(*position),
+            _ => None,
         }
     }
 }
@@ -2062,6 +2189,7 @@ fn positive_literal(expr: &AffineExpr, dims: u32, syms: u32, op: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::islands::dataflow_ir::print;
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, AffineMap, BoundType, Constraint, FlatAffineExpr, FlatConstraints, IntegerSet,
     };
@@ -2866,5 +2994,184 @@ mod tests {
                 .constant,
             0
         );
+    }
+
+    /// ⭐ `isFunctionOfDim` IS AN IDENTITY TEST ON THE POSITION, NOT "IS THERE A DIMENSION".
+    ///
+    /// `d2 * 256 + d1 * 64 + d0` — the layout map all five `MutableAddrSplitting` answer keys carry
+    /// (`mutable_addr_splitting_one_dim.mlir:5`) — is a function of each of its three dimensions and of
+    /// nothing else.
+    #[test]
+    fn a_dimension_is_found_by_its_position_alone() {
+        let expr = AffineExpr::dim(2)
+            .times(256)
+            .plus(AffineExpr::dim(1).times(64))
+            .plus(AffineExpr::dim(0));
+        assert!(expr.is_function_of_dim(0));
+        assert!(expr.is_function_of_dim(1));
+        assert!(expr.is_function_of_dim(2));
+        assert!(!expr.is_function_of_dim(3));
+    }
+
+    /// ⛔⛔ AND A SYMBOL IS NOT A DIMENSION, whatever it holds.
+    ///
+    /// `TPMVBase::replaceDimsInMapWithSyms` rewrites a subscripts map's loop iterators AS SYMBOLS
+    /// (`TransformPagedMemViewImpl.cpp:47`), so `s0` here is exactly the value `d0` was — and the
+    /// answer is still `false`, for either position.
+    #[test]
+    fn a_symbol_is_not_a_dimension_at_any_position() {
+        let expr = AffineExpr::sym(0).times(8).plus(AffineExpr::Const(64));
+        assert!(!expr.is_function_of_dim(0));
+        assert!(!expr.is_function_of_dim(1));
+    }
+
+    /// ⭐ AND IT REACHES THROUGH EVERY BINARY FORM, since the reference recurses on both operands of
+    /// any `AffineBinaryOpExpr`.
+    #[test]
+    fn every_binary_form_is_searched_on_both_sides() {
+        assert!(
+            AffineExpr::dim(0)
+                .modulo(128)
+                .floordiv(2)
+                .is_function_of_dim(0)
+        );
+        assert!(
+            AffineExpr::Const(0)
+                .plus(AffineExpr::dim(4).times(3))
+                .is_function_of_dim(4)
+        );
+        assert!(!AffineExpr::Const(7).is_function_of_dim(0));
+    }
+
+    /// ⭐⭐ THE WHOLE OF `concatenateMaps` FOLLOWED BY `createExplicitTimeLoops`' SUBSTITUTION, OVER
+    /// THE VENDOR'S OWN TWO MAPS.
+    ///
+    /// ```cpp
+    /// auto shifted_map_B = map_B.shiftDims(map_A.getNumDims());
+    /// for (int i = 0; i < map_A.getNumResults(); ++i)
+    ///   exprs[i] = map_A.getResult(i) + shifted_map_B.getResult(i);
+    /// return AffineMap::get(shifted_map_B.getNumDims(), 0, exprs, ...);
+    /// ```
+    /// (`dialect_utils/Agen/Utils.cpp:258-266`)
+    ///
+    /// The store of `mutable_addr_splitting_time_dims.mlir` carries
+    /// `dst_map = affine_map<(d0, d1) -> (0, d0 * 16, d1 * 8)>` (`:8`) and
+    /// `store_time_addr_map = affine_map<(d0, d1, d2) -> (d0 * 64, d1, d2 * 8)>` (`:6`), so the
+    /// concatenation is five-dimensional: `(d0, .., d4) -> (d2 * 64, d0 * 16 + d3, d1 * 8 + d4 * 8)`.
+    ///
+    /// ⛔ AND THEN ONLY ONE TIME DIMENSION BECOMES A LOOP. `time_dim_idx` is 0 for this case, so
+    /// `updateSubscriptsAndIndicesForExplicitTimeLoops` binds `d3` and `d4` to a constant 0 and keeps
+    /// three dimensions (`Dialect/Agen/Utils.cpp:466-478`) — `d0 * 16 + 0` folds back to `d0 * 16`
+    /// and `d1 * 8 + 0 * 8` to `d1 * 8`. ⭐ THAT the addresses come out UNCHANGED is the point: it is
+    /// why the answer key's `dst_map` prints exactly as it went in.
+    #[test]
+    fn two_maps_concatenate_and_the_unused_time_dimensions_fold_away() {
+        let dst_map = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(0).times(16),
+                AffineExpr::dim(1).times(8),
+            ],
+        };
+        let time_addr_map = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(0).times(64),
+                AffineExpr::dim(1),
+                AffineExpr::dim(2).times(8),
+            ],
+        };
+
+        let shifted = time_addr_map.shift_dims(dst_map.dims);
+        assert_eq!(
+            print::affine_map(&shifted),
+            "affine_map<(d0, d1, d2, d3, d4) -> (d2 * 64, d3, d4 * 8)>"
+        );
+
+        let concatenated = AffineMap {
+            dims: shifted.dims,
+            syms: 0,
+            results: dst_map
+                .results
+                .iter()
+                .zip(&shifted.results)
+                .map(|(a, b)| a.clone().added(b.clone()))
+                .collect(),
+        };
+        assert_eq!(
+            print::affine_map(&concatenated),
+            "affine_map<(d0, d1, d2, d3, d4) -> (d2 * 64, d0 * 16 + d3, d1 * 8 + d4 * 8)>"
+        );
+
+        let folded = concatenated.replace_dims_and_symbols(
+            &[
+                AffineExpr::dim(0),
+                AffineExpr::dim(1),
+                AffineExpr::dim(2),
+                AffineExpr::Const(0),
+                AffineExpr::Const(0),
+            ],
+            &[],
+            3,
+            0,
+        );
+        assert_eq!(
+            print::affine_map(&folded),
+            "affine_map<(d0, d1, d2) -> (d2 * 64, d0 * 16, d1 * 8)>"
+        );
+    }
+
+    /// ⭐ A MAP'S ARITY GROWS WITH ITS SHIFT, and its symbols do not move
+    /// (`llvm-project/mlir/include/mlir/IR/AffineMap.h:311-318`).
+    #[test]
+    fn shifting_a_map_widens_it_and_leaves_its_symbols_alone() {
+        let map = AffineMap {
+            dims: 2,
+            syms: 1,
+            results: vec![AffineExpr::dim(1).plus(AffineExpr::sym(0))],
+        };
+        let shifted = map.shift_dims(3);
+        assert_eq!(shifted.dims, 5);
+        assert_eq!(shifted.syms, 1);
+        assert_eq!(
+            print::affine_map(&shifted),
+            "affine_map<(d0, d1, d2, d3, d4)[s0] -> (d4 + s0)>"
+        );
+    }
+
+    /// ⭐ AND A MAP ANSWERS FOR EVERY RESULT AT ONCE — `isFunctionOfDim` over the whole map is an
+    /// `any_of` (`llvm-project/mlir/include/mlir/IR/AffineMap.h:344-347`).
+    #[test]
+    fn a_map_is_a_function_of_a_dimension_any_result_mentions() {
+        let map = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![AffineExpr::Const(0), AffineExpr::dim(2).times(8)],
+        };
+        assert!(map.is_function_of_dim(2));
+        assert!(!map.is_function_of_dim(0));
+        assert!(!map.is_function_of_dim(1));
+    }
+
+    /// ⛔ `getDimPosition` ON A RESULT THAT IS NOT A BARE DIMENSION IS AN ABORT IN C++ AND A `None`
+    /// HERE (`llvm-project/mlir/lib/IR/AffineMap.cpp:319-321`).
+    ///
+    /// The `time_order` of `mutable_addr_splitting_time_dims.mlir:5` is the reversal
+    /// `affine_map<(d0, d1, d2) -> (d2, d1, d0)>`, so `updateTimeSetForExplicitDims` reads 2, 1, 0
+    /// from it.
+    #[test]
+    fn a_dimension_position_is_reported_only_for_a_bare_dimension() {
+        let reversal = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![AffineExpr::dim(2), AffineExpr::dim(1), AffineExpr::dim(0)],
+        };
+        assert_eq!(reversal.dim_position(0), Some(2));
+        assert_eq!(reversal.dim_position(2), Some(0));
+        assert_eq!(reversal.dim_position(3), None);
+        assert_eq!(AffineMap::unary(AffineExpr::Const(0)).dim_position(0), None);
     }
 }

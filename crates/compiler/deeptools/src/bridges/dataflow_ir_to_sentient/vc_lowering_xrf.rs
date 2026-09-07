@@ -1635,6 +1635,7 @@ mod unit_tests {
             sen::Op::Symbol(symbol::Op::CreateSymbol {
                 result: Val(0),
                 symbol_id: 0,
+                max_value: None,
             }),
             sen::Op::Arith(arith::Op::Constant {
                 result: Val(1),
