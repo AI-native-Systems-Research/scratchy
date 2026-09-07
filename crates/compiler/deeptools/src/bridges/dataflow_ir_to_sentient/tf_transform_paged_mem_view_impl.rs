@@ -3966,7 +3966,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     }
 
     /// The vendor's own nest — `affine.for %arg1 = 0 to 2 { affine.for %arg2 = 0 to 4 { .. } }`
-    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:266-268`), whose body
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:286-287`), whose body
     /// holds the paged access `%mem_view[%c0, %arg1 * 3, %arg2 * 2 + %c2]`.
     fn vendor_loop_nest() -> Vec<DfirOp> {
         vec![DfirOp::Affine(affine::Op::For {

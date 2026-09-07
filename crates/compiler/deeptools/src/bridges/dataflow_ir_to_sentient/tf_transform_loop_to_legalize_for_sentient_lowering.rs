@@ -1679,9 +1679,9 @@ mod unit_tests {
         ///   %20 = agen.vector_load %19[%arg27 * 4, %arg28 * 2 + %arg26, %arg25, 0, 0] {..} : memref<8x4x1x1x1xi8>, vector<4xi8>
         /// ```
         ///
-        /// ⭐ `l3lu_disable_transformation.mlir:63-77` IS THE SAME LOOP OVER A DIFFERENT UNIT — an
+        /// ⭐ `l3lu_disable_transformation.mlir:97-105` IS THE SAME LOOP OVER A DIFFERENT UNIT — an
         /// `arith.select` bound, a memory user on the induction variable — and its `CHECK-SENT-IR`
-        /// reproduces its input line for line. The two files differ only in the enclosing
+        /// reproduces its input line for line. What differs and decides the answer is the enclosing
         /// `dataflow.program_unit`'s component, which is what the first two tests below assert.
         const VENDOR: Case = Case {
             form: Form::Scf,
