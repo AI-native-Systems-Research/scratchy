@@ -389,6 +389,204 @@ impl IntegerSet {
     }
 }
 
+/// WHICH SIDE OF A CONSTRAINT SYSTEM A BOUND COMES FROM — `mlir::presburger::BoundType`.
+///
+/// ⭐ ITS THIRD ENUMERATOR IS DELIBERATELY ABSENT. MLIR's own `getConstantBound` opens with
+/// `assert(type != BoundType::EQ && "EQ not implemented")`, so `EQ` exists there only to be
+/// rejected at run time; here it cannot be written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundType {
+    /// The greatest constant `l` with `l <= d<pos>` over the whole system.
+    Lb,
+    /// The least constant `u` with `d<pos> <= u`. **Inclusive**, so a 64-lane span is `0 ..= 63`.
+    Ub,
+}
+
+impl IntegerSet {
+    /// THE CONSTANT BOUND THIS SET PUTS ON DIMENSION `pos`, or `None` when it puts none —
+    /// `FlatAffineValueConstraints::getConstantBound`, MLIR's
+    /// `IntegerRelation::computeConstantLowerOrUpperBound`.
+    ///
+    /// An equality pinning the dimension to a constant on its own answers immediately; otherwise the
+    /// answer is the tightest of the one-sided inequality bounds — the MAX of the lower bounds for
+    /// [`BoundType::Lb`], the MIN of the upper bounds for [`BoundType::Ub`] — and `None` when the
+    /// requested side has none. A constraint on OTHER dimensions says nothing about this one.
+    ///
+    /// ⛔⛔ AN EMPTY SET STILL HAS BOUNDS, AND A LOWERING DEPENDS ON IT.
+    /// `affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` admits no integer at all, yet its `Lb` is
+    /// 64 and its `Ub` is 63 — both present. IBM writes exactly that set as the mask of twenty
+    /// `create_affine_mask` ops in
+    /// `dcc/test/Conversion/VectorChainToSentientPESFP/mixed_precision.mlir:747-895`, whose
+    /// `CHECK-SENT-IR` lowers each to `sentient.scalar_constant {value = 0 : si64}` (`:288`, `:296`)
+    /// — the all-lanes-off mask. `getConstantBound` runs no emptiness test, so `Lb > Ub` is a
+    /// reachable and meaningful pair, and an emptiness check added here would turn twenty legal masks
+    /// into `emitOpError("Mask affine set has to have constant bounds.")`.
+    ///
+    /// ⛔ AN EQUALITY WHOSE COEFFICIENT IS NOT ±1 BOUNDS NOTHING, which is MLIR's answer rather than
+    /// a simplification of it: `findEqualityToConstant` skips any row with `v * v != 1`, and the scan
+    /// that follows reads INEQUALITIES only — so `2*d0 - 4 == 0` gives `None` on both sides even
+    /// though `d0` is plainly 2. Every `affine_set` in the authority tree's tests writes `dk == 0` or
+    /// a `>= 0` pair with unit coefficients, so nothing there reaches that corner.
+    ///
+    /// ⚠️ NOT VERIFIABLE FROM THE AUTHORITY TREE. `getConstantBound` is MLIR's, and no MLIR source
+    /// or header is present on this host — the shape above is from MLIR's published implementation,
+    /// and only the ANSWERS are pinned by IBM's sets and their `CHECK-SENT-IR` lines.
+    #[must_use]
+    pub fn constant_bound(&self, bound: BoundType, pos: u32) -> Option<i64> {
+        // `findEqualityToConstant(*this, 0, symbolic=false)`: a unit coefficient, and no other
+        // dimension in the row. `-c / a` is exact because `a` is ±1.
+        for constraint in &self.constraints {
+            if let (true, Terms::OnPos { coeff, constant }) =
+                (constraint.is_equality, terms_in(&constraint.expr, pos))
+                && (coeff == 1 || coeff == -1)
+            {
+                return Some(-constant / coeff);
+            }
+        }
+
+        let mut tightest: Option<i64> = None;
+        for constraint in &self.constraints {
+            let Terms::OnPos { coeff, constant } = terms_in(&constraint.expr, pos) else {
+                continue;
+            };
+            if constraint.is_equality {
+                continue;
+            }
+            // `a*d + c >= 0`, so `a > 0` reads `d >= -c/a` rounded UP, and `a < 0` reads
+            // `d <= c/-a` rounded DOWN.
+            let side = match (bound, coeff > 0) {
+                (BoundType::Lb, true) => ceil_div(-constant, coeff),
+                (BoundType::Ub, false) => constant.div_euclid(-coeff),
+                // The constraint bounds this dimension's OTHER side.
+                (BoundType::Lb, false) | (BoundType::Ub, true) => continue,
+            };
+            tightest = Some(match (tightest, bound) {
+                (None, _) => side,
+                (Some(so_far), BoundType::Lb) => so_far.max(side),
+                (Some(so_far), BoundType::Ub) => so_far.min(side),
+            });
+        }
+        tightest
+    }
+}
+
+/// `ceil(n / d)` for a POSITIVE `d` — the rounding a lower bound needs.
+///
+/// ⛔ `/` TRUNCATES TOWARD ZERO, which is neither floor nor ceiling and rounds a negative bound the
+/// wrong way. `2*d0 + 1 >= 0` means `d0 >= -1/2`, and the integers satisfying it start at 0, not at
+/// `(-1)/2 == 0`… which agrees here and disagrees at `3*d0 + 1 >= 0`, where truncation gives 0 and
+/// the ceiling of `-1/3` is also 0 — the divergence appears in the LOWER direction, at
+/// `-3 >= 0`-style rows a caller can write. `div_euclid` floors unconditionally, so negate around it.
+fn ceil_div(n: i64, d: i64) -> i64 {
+    -((-n).div_euclid(d))
+}
+
+/// WHAT ONE CONSTRAINT EXPRESSION SAYS ABOUT ONE DIMENSION.
+///
+/// ⭐ THIS IS THE `FlatAffineValueConstraints` MATRIX, INLINED. MLIR flattens every constraint into
+/// a coefficient row over all variables and then eliminates every variable but `pos`; a row naming
+/// only other dimensions survives that elimination with a zero coefficient here, which is what
+/// [`Terms::OtherDims`] stands for. Every `affine_set` in the authority tree's tests constrains one
+/// dimension per constraint, so the row and this enum agree on all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terms {
+    /// `c` — no dimension at all.
+    Const(i64),
+    /// `a * d<pos> + c` with a nonzero `a`: the constraint bounds the dimension asked about.
+    OnPos {
+        /// The coefficient of `d<pos>`. Its SIGN decides which side is bounded.
+        coeff: i64,
+        /// Everything else, moved to the constant column.
+        constant: i64,
+    },
+    /// Some dimension other than `pos`, and not `pos` — a row that says nothing about it.
+    OtherDims,
+}
+
+impl Terms {
+    /// `a * d<pos> + c`, degenerating to a constant when `a` is zero.
+    fn on_pos(coeff: i64, constant: i64) -> Terms {
+        if coeff == 0 {
+            Terms::Const(constant)
+        } else {
+            Terms::OnPos { coeff, constant }
+        }
+    }
+}
+
+/// WHAT `expr` SAYS ABOUT `d<pos>`.
+///
+/// ⛔ MIXING `pos` WITH ANOTHER DIMENSION IS THE ONE SHAPE THIS CANNOT ANSWER, and answering
+/// "unbounded" for it would be a wrong answer rather than a missing one — eliminating the other
+/// variable combines the row with that variable's OPPOSING bounds, which needs the whole system.
+fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
+    match expr {
+        AffineExpr::Dim(n) if *n == pos => Terms::OnPos {
+            coeff: 1,
+            constant: 0,
+        },
+        AffineExpr::Dim(_) => Terms::OtherDims,
+        AffineExpr::Const(c) => Terms::Const(*c),
+        AffineExpr::Add(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+            (Terms::Const(x), Terms::Const(y)) => Terms::Const(x + y),
+            (Terms::Const(c), Terms::OnPos { coeff, constant })
+            | (Terms::OnPos { coeff, constant }, Terms::Const(c)) => {
+                Terms::on_pos(coeff, constant + c)
+            }
+            (
+                Terms::OnPos {
+                    coeff: a_coeff,
+                    constant: a_const,
+                },
+                Terms::OnPos {
+                    coeff: b_coeff,
+                    constant: b_const,
+                },
+            ) => Terms::on_pos(a_coeff + b_coeff, a_const + b_const),
+            (Terms::OtherDims, Terms::Const(_) | Terms::OtherDims)
+            | (Terms::Const(_), Terms::OtherDims) => Terms::OtherDims,
+            (Terms::OtherDims, Terms::OnPos { .. }) | (Terms::OnPos { .. }, Terms::OtherDims) => {
+                todo!(
+                    "a constant bound on d{pos} from a constraint that also mentions another \
+                     dimension needs the Fourier-Motzkin elimination \
+                     FlatAffineValueConstraints::projectOut runs"
+                )
+            }
+        },
+        AffineExpr::Mul(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+            (Terms::Const(x), Terms::Const(y)) => Terms::Const(x * y),
+            (Terms::Const(k), Terms::OnPos { coeff, constant })
+            | (Terms::OnPos { coeff, constant }, Terms::Const(k)) => {
+                Terms::on_pos(coeff * k, constant * k)
+            }
+            // ⭐ `0 * d1` IS ZERO, not "some other dimension" — the row loses the variable.
+            (Terms::Const(0), Terms::OtherDims) | (Terms::OtherDims, Terms::Const(0)) => {
+                Terms::Const(0)
+            }
+            (Terms::Const(_), Terms::OtherDims) | (Terms::OtherDims, Terms::Const(_)) => {
+                Terms::OtherDims
+            }
+            (Terms::OnPos { .. } | Terms::OtherDims, Terms::OnPos { .. } | Terms::OtherDims) => {
+                todo!("a constraint that multiplies two dimensions is not affine")
+            }
+        },
+        AffineExpr::Mod(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+            (Terms::Const(n), Terms::Const(d)) => Terms::Const(n.rem_euclid(d)),
+            _ => todo!(
+                "a constant bound across a `mod` needs the local variable MLIR's affine flattening \
+                 introduces for it"
+            ),
+        },
+        AffineExpr::FloorDiv(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+            (Terms::Const(n), Terms::Const(d)) => Terms::Const(n.div_euclid(d)),
+            _ => todo!(
+                "a constant bound across a `floordiv` needs the local variable MLIR's affine \
+                 flattening introduces for it"
+            ),
+        },
+    }
+}
+
 /// An `affine_map<(d0, ..) -> (..)>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AffineMap {
@@ -478,5 +676,171 @@ impl AffineMap {
             dims: u32::try_from(strides.len()).expect("a shape rank fits a u32"),
             results: vec![expr],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::islands::dataflow_ir::ty::{AffineExpr, BoundType, Constraint, IntegerSet};
+
+    /// `expr >= 0`.
+    fn ineq(expr: AffineExpr) -> Constraint {
+        Constraint {
+            expr,
+            is_equality: false,
+        }
+    }
+
+    /// A one-dimensional set — the only shape `getMaskValueConstantForNonPT` lets through.
+    fn set(constraints: Vec<Constraint>) -> IntegerSet {
+        IntegerSet {
+            dims: 1,
+            constraints,
+        }
+    }
+
+    /// `-d0 + c >= 0`.
+    fn upper(c: i64) -> Constraint {
+        ineq(AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(c)))
+    }
+
+    /// `-d<k> + c >= 0`.
+    fn upper_of(k: u32, c: i64) -> Constraint {
+        ineq(AffineExpr::dim(k).times(-1).plus(AffineExpr::Const(c)))
+    }
+
+    /// `d0 + c >= 0`.
+    fn lower(c: i64) -> Constraint {
+        ineq(AffineExpr::dim(0).plus(AffineExpr::Const(c)))
+    }
+
+    /// ⭐⭐ IBM'S ALL-LANES-OFF MASK: AN EMPTY SET THAT STILL HAS BOTH BOUNDS.
+    ///
+    /// `affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` holds no integer, and IBM writes it as the
+    /// mask of twenty `create_affine_mask` ops over `vector<64xi1>`
+    /// (`dcc/test/Conversion/VectorChainToSentientPESFP/mixed_precision.mlir:419`, `:747-895`) whose
+    /// `CHECK-SENT-IR` lowers each to `sentient.scalar_constant {value = 0 : si64}` (`:288`, `:296`).
+    /// The bounds CROSS, and both are present — which is the whole reason that mask lowers instead of
+    /// erroring out.
+    #[test]
+    fn the_empty_mask_set_ibm_writes_still_has_both_bounds() {
+        let empty = set(vec![lower(-64), upper(63)]);
+        assert_eq!(empty.constant_bound(BoundType::Lb, 0), Some(64));
+        assert_eq!(empty.constant_bound(BoundType::Ub, 0), Some(63));
+    }
+
+    /// ⭐ A FULL LANE SPAN — the commonest set in the authority tree's tests, 22 files' `#set`.
+    ///
+    /// `affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>` is lanes `0 ..= 63`, so the upper bound is
+    /// INCLUSIVE: 63, not 64. A 64 here would set one slice too many in every mask value derived
+    /// from it.
+    #[test]
+    fn a_full_lane_span_bounds_at_zero_and_at_the_last_lane() {
+        let span = set(vec![ineq(AffineExpr::dim(0)), upper(63)]);
+        assert_eq!(span.constant_bound(BoundType::Lb, 0), Some(0));
+        assert_eq!(span.constant_bound(BoundType::Ub, 0), Some(63));
+    }
+
+    /// ⭐ AND AN EQUALITY PINS BOTH SIDES TO THE SAME CONSTANT.
+    ///
+    /// `affine_set<(d0) : (d0 == 0)>` is what [`IntegerSet::from_sizes`] writes for a size of one —
+    /// `#set2` of the scheduler's own output.
+    #[test]
+    fn an_equality_pins_both_sides_to_one_constant() {
+        let pinned = IntegerSet::from_sizes(&[1]);
+        assert_eq!(pinned.constant_bound(BoundType::Lb, 0), Some(0));
+        assert_eq!(pinned.constant_bound(BoundType::Ub, 0), Some(0));
+    }
+
+    /// ⛔ A SET BOUNDS ONLY THE SIDE IT STATES, and the missing side is `None` rather than a default.
+    ///
+    /// A zero for an absent upper bound would read as "lane 0 only" — a mask of one lane where the
+    /// truth is "no constant bound", which is the case `hasConstantBounds` exists to reject.
+    #[test]
+    fn a_one_sided_set_has_only_the_bound_it_states() {
+        let half = set(vec![ineq(AffineExpr::dim(0))]);
+        assert_eq!(half.constant_bound(BoundType::Lb, 0), Some(0));
+        assert_eq!(half.constant_bound(BoundType::Ub, 0), None);
+
+        let other = set(vec![upper(63)]);
+        assert_eq!(other.constant_bound(BoundType::Lb, 0), None);
+        assert_eq!(other.constant_bound(BoundType::Ub, 0), Some(63));
+
+        let nothing = set(vec![]);
+        assert_eq!(nothing.constant_bound(BoundType::Lb, 0), None);
+        assert_eq!(nothing.constant_bound(BoundType::Ub, 0), None);
+    }
+
+    /// ⛔ A CONSTRAINT ON ANOTHER DIMENSION SAYS NOTHING ABOUT THIS ONE.
+    ///
+    /// `affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>` — the shape
+    /// [`IntegerSet::from_sizes`] gives `[1, 1, 64]`, and the shape 17 of the authority tree's tests
+    /// write — must answer 0 and 63 about `d2` while its two equalities are read as rows that pin a
+    /// DIFFERENT variable. Treating `d0 == 0` as a statement about `d2` would pin every walk to its
+    /// first lane.
+    #[test]
+    fn a_constraint_on_another_dimension_is_not_a_bound_on_this_one() {
+        let rect = IntegerSet::from_sizes(&[1, 1, 64]);
+        assert_eq!(rect.constant_bound(BoundType::Lb, 2), Some(0));
+        assert_eq!(rect.constant_bound(BoundType::Ub, 2), Some(63));
+        assert_eq!(rect.constant_bound(BoundType::Lb, 0), Some(0));
+        assert_eq!(rect.constant_bound(BoundType::Ub, 0), Some(0));
+
+        let elsewhere = IntegerSet {
+            dims: 2,
+            constraints: vec![ineq(AffineExpr::dim(1)), upper_of(1, 63)],
+        };
+        assert_eq!(elsewhere.constant_bound(BoundType::Lb, 0), None);
+        assert_eq!(elsewhere.constant_bound(BoundType::Ub, 0), None);
+    }
+
+    /// ⛔ THE TIGHTEST BOUND WINS — max over the lower ones, min over the upper ones.
+    ///
+    /// Taking the FIRST one found instead would answer 0 and 63 below, admitting 58 lanes the set
+    /// excludes.
+    #[test]
+    fn the_tightest_of_several_bounds_wins() {
+        let narrowed = set(vec![
+            ineq(AffineExpr::dim(0)),
+            lower(-5),
+            upper(63),
+            upper(31),
+        ]);
+        assert_eq!(narrowed.constant_bound(BoundType::Lb, 0), Some(5));
+        assert_eq!(narrowed.constant_bound(BoundType::Ub, 0), Some(31));
+    }
+
+    /// ⛔⛔ A LOWER BOUND ROUNDS **UP** AND AN UPPER BOUND ROUNDS **DOWN**, on both signs.
+    ///
+    /// `2*d0 + 5 >= 0` means `d0 >= -2.5`, whose least integer is -2; `-2*d0 - 5 >= 0` means
+    /// `d0 <= -2.5`, whose greatest integer is -3. Rust's `/` truncates toward zero and would answer
+    /// -2 for BOTH — widening the first bound is harmless and widening the second admits a lane the
+    /// set excludes. This is the case that separates `div_euclid` from `/`.
+    #[test]
+    fn a_bound_rounds_toward_the_side_that_keeps_the_set() {
+        let scaled = |coeff: i64, c: i64| set(vec![ineq(AffineExpr::dim(0).times(coeff).plus(AffineExpr::Const(c)))]);
+        assert_eq!(scaled(2, -5).constant_bound(BoundType::Lb, 0), Some(3));
+        assert_eq!(scaled(-2, 5).constant_bound(BoundType::Ub, 0), Some(2));
+        assert_eq!(scaled(2, 5).constant_bound(BoundType::Lb, 0), Some(-2));
+        assert_eq!(scaled(-2, -5).constant_bound(BoundType::Ub, 0), Some(-3));
+    }
+
+    /// ⛔ AN EQUALITY WHOSE COEFFICIENT IS NOT ±1 BOUNDS NOTHING — MLIR's answer, not a shortcut.
+    ///
+    /// `findEqualityToConstant` skips rows with `v * v != 1`, and the scan after it reads
+    /// inequalities only, so `2*d0 - 4 == 0` gives `None` on both sides even though `d0` is 2.
+    /// Nothing in the authority tree writes such an equality; reproducing the quirk costs nothing and
+    /// keeps this from being a different function than the one it ports.
+    #[test]
+    fn a_non_unit_equality_bounds_nothing() {
+        let scaled = IntegerSet {
+            dims: 1,
+            constraints: vec![Constraint {
+                expr: AffineExpr::dim(0).times(2).plus(AffineExpr::Const(-4)),
+                is_equality: true,
+            }],
+        };
+        assert_eq!(scaled.constant_bound(BoundType::Lb, 0), None);
+        assert_eq!(scaled.constant_bound(BoundType::Ub, 0), None);
     }
 }

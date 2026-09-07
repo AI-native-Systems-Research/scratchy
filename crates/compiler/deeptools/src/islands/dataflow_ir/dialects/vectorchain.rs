@@ -1,14 +1,16 @@
 //! `VectorChain.td` — EVERYTHING THE PE AND THE SFP COMPUTE.
 //!
-//! The dialect declares twenty-three operations; the thirteen here are the ones an emitted program
-//! contains. The attribute enumerations they carry are `VectorChainEnums.td`'s, and each records
-//! which of the two — the enum's own name, or the operand's — is the mnemonic MLIR parses.
+//! The dialect declares twenty-three operations; fourteen of the fifteen here are the ones an
+//! emitted program contains, and the fifteenth — [`Op::Merge`] — is here because
+//! `getComputePrecisionOfOp` must be able to be asked about one. The attribute enumerations they
+//! carry are `VectorChainEnums.td`'s, and each records which of the two — the enum's own name, or
+//! the operand's — is the mnemonic MLIR parses.
 
 use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{AffineMap, Vector};
+use crate::islands::dataflow_ir::ty::{AffineMap, IntegerSet, Vector};
 
 /// WHICH COMPARISON — `VectorChainElementWiseCompareOperator` (`VectorChainEnums.td`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +454,97 @@ pub enum Op {
         ty: Vector,
     },
 
+    /// `vectorchain.pack %op1, %op2 [%mask : t] {indices, repetition, sign_extend} : t1, t2, tres` —
+    /// TWO VECTORS INTERLEAVED BY AN INDEX LIST, and the whole merge/pack/gcvt/fcvt family is this
+    /// one op.
+    ///
+    /// ⛔⛔ THERE IS NO `vectorchain.merge_8h` AND NO `vectorchain.gcvt`. Every one of the
+    /// thirty-four `merge<w><half>` and `pack<n>` mnemonics — and every `gcvt_imm<n>`/`fcvt_imm<n>`
+    /// — is a `vectorchain.pack` distinguished ONLY by its `indices` and `sign_extend`, which is
+    /// what `getMergeTypeFromIndices` and `getGCVTorFCVTTypeFromIndicesAndCastInputs` decode
+    /// (`VectorChainHelper.cpp:301-414`, `:188-300`). IBM's own text spells `%merge8h =
+    /// vectorchain.pack %x128i8, %z128i8 {indices = [1,17,3,19,…]}`
+    /// (`dcc/test/SFP/merge_and_pack.mlir:161`) — the `merge8h` there is an SSA NAME, not a
+    /// mnemonic.
+    ///
+    /// ⛔ AND WHICH OF THE TWO DECODERS RUNS IS DECIDED BY THE OPERANDS' DEFINING OPS, NOT BY THIS
+    /// OP: both operands being [`Op::Cast`]s makes it a convert, neither being one makes it a
+    /// merge/pack, and one of each is an error the reference emits
+    /// (`VectorChainToSentientPESFP.cpp:693-715`).
+    Pack {
+        /// The vector it binds.
+        result: Val,
+        /// Left operand.
+        op1: Val,
+        /// Right operand.
+        op2: Val,
+        /// The lane mask, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
+        /// (`VectorChain.td:208`), so `None` prints no bracket at all.
+        mask: Option<Predicate>,
+        /// Which element of the concatenated pair each result element reads.
+        ///
+        /// ⛔ NEGATIVE ENTRIES ARE REAL AND MEAN "PAD". `pack12` is
+        /// `[0, -1, 1, -1, 2, -1, …]` (`dcc/test/SFP/merge_and_pack.mlir:176`) — an `i32` list, not
+        /// a `u32` one, and a `usize` here would refuse half the family.
+        indices: Vec<i32>,
+        /// How many times the index pattern repeats to fill the result — `IndexAttr`, printed
+        /// `: index` and not `: i32`.
+        ///
+        /// ⭐ ALWAYS EIGHT IN THE REFERENCE'S OWN TABLE: every one of the thirty-four entries of
+        /// `getMergeTypeFromIndices` is matched at `repetition == 8` and none of them overrides it.
+        repetition: u32,
+        /// Whether the pad lanes carry the sign — `true` for `pack14` and `pack15` alone, of the
+        /// whole thirty-four-entry table.
+        sign_extend: bool,
+        /// The operands' type.
+        operand_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
+    /// `vectorchain.merge %op1, %op2 {iteration_space_CA, access_function_CA, access_function_A,
+    /// iteration_space_CB, access_function_CB, access_function_B} : t1, t2, tres` — a merge stated
+    /// as a polyhedral mini-scop, *"where the order doesn't matter"* (`VectorChain.td:164-185`).
+    ///
+    /// ⛔⛔ A DIFFERENT OP FROM [`Op::Pack`], DESPITE THE NAME THE `pack` FAMILY'S MNEMONICS CARRY.
+    /// The `merge8h` in a lowered program came from a `vectorchain.pack`; THIS op states two
+    /// (iteration space, access function) pairs and no index list at all. `getComputePrecisionOfOp`
+    /// short-circuits on both (`isa<PackOp, MergeOp>`), which is the only place in bridge 2 they are
+    /// treated alike.
+    ///
+    /// ⚠️ NO VENDOR TEXT EXERCISES IT. `vectorchain.merge` appears in none of the authority tree's
+    /// 825 `.mlir` cases, so its printed form here is derived from the `assemblyFormat` in the `.td`
+    /// and is NOT byte-checked against IBM output the way [`Op::Pack`]'s is. Nothing emits one yet;
+    /// it exists because `getComputePrecisionOfOp` must be able to be asked about one.
+    ///
+    /// ⛔ AND IT IS ALSO WHY `getElementType` MUST NOT BE REACHED FOR IT: `MergeOp` is absent from
+    /// both `getVectorType` and `getCustomVectorType` (`Utils.cpp:538-694`), so an element-type
+    /// query on one hits `DT_CHECK_MSG(.., "Type is not a known vector type")`.
+    Merge {
+        /// The vector it binds.
+        result: Val,
+        /// Left operand.
+        op1: Val,
+        /// Right operand.
+        op2: Val,
+        /// `iteration_space_CA` — which indices of the combined space the A side is written over.
+        iteration_space_ca: IntegerSet,
+        /// `access_function_CA` — where in the result the A side lands.
+        access_function_ca: AffineMap,
+        /// `access_function_A` — where in `op1` the A side is read from.
+        access_function_a: AffineMap,
+        /// `iteration_space_CB` — as `iteration_space_CA`, for the B side.
+        iteration_space_cb: IntegerSet,
+        /// `access_function_CB` — as `access_function_CA`, for the B side.
+        access_function_cb: AffineMap,
+        /// `access_function_B` — as `access_function_A`, for `op2`.
+        access_function_b: AffineMap,
+        /// The operands' type.
+        operand_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
     /// `vectorchain.constant_bitstream {value = [0x0, 0x1]} : vector<Nxt>` — a literal, as wide as
     /// the constant the template declares.
     ///
@@ -723,6 +816,85 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::vector(*ty)
             );
         }
+        Op::Pack {
+            result,
+            op1,
+            op2,
+            mask,
+            indices,
+            repetition,
+            sign_extend,
+            operand_ty,
+            ty,
+        } => {
+            // ⭐ THE ATTRIBUTES IN BYTE-WISE NAME ORDER, which is the order `attr-dict` prints:
+            // `indices`, `repetition`, `sign_extend`.
+            //
+            // ⛔ `: index` ON THE REPETITION, NOT `: i32`. `IndexAttr:$repetition`
+            // (`VectorChain.td:207`) — where [`Op::Shuffle`]'s is an `i32`, so the two ops spell the
+            // same word differently and swapping them is a parse failure.
+            //
+            // ⭐ AND THE INDICES CARRY `: i32` EACH. `ArrayAttr:$indices` holds `IntegerAttr`s of
+            // whatever width built them, and `checkValidityOfPackAndShuffleLowering` accepts any
+            // (`VectorChainHelper.cpp:156-167`) — so the width is a choice, and this is IBM's:
+            // `indices = [0 : i32, 2 : i32, …]`
+            // (`dcc/test/Conversion/VectorChainToSentientPESFP/fpuop.mlir:217`), matching what
+            // [`Op::Shuffle`] already prints. `sign_extend` is spelled out even when false, as that
+            // line spells it.
+            let indices = indices
+                .iter()
+                .map(|index| format!("{index} : i32"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.pack {}, {}{} {{indices = [{indices}], repetition = {repetition} : index, sign_extend = {sign_extend}}} : {}, {}, {}",
+                print::val(*result),
+                print::val(*op1),
+                print::val(*op2),
+                mask_bracket(*mask),
+                print::vector(*operand_ty),
+                print::vector(*operand_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::Merge {
+            result,
+            op1,
+            op2,
+            iteration_space_ca,
+            access_function_ca,
+            access_function_a,
+            iteration_space_cb,
+            access_function_cb,
+            access_function_b,
+            operand_ty,
+            ty,
+        } => {
+            // ⭐ BYTE-WISE NAME ORDER AGAIN, and here it interleaves the two sides rather than
+            // grouping them: `access_function_A`, `access_function_B`, `access_function_CA`,
+            // `access_function_CB`, `iteration_space_CA`, `iteration_space_CB` — `'A' < 'B' < 'C'`,
+            // so the A and B access functions come BEFORE either CA or CB.
+            //
+            // ⚠️ DERIVED FROM THE `assemblyFormat`, NOT FROM VENDOR OUTPUT: `vectorchain.merge`
+            // occurs in none of the 825 authority tests. See [`Op::Merge`].
+            let _ = writeln!(
+                out,
+                "{} = vectorchain.merge {}, {} {{access_function_A = {}, access_function_B = {}, access_function_CA = {}, access_function_CB = {}, iteration_space_CA = {}, iteration_space_CB = {}}} : {}, {}, {}",
+                print::val(*result),
+                print::val(*op1),
+                print::val(*op2),
+                print::affine_map(access_function_a),
+                print::affine_map(access_function_b),
+                print::affine_map(access_function_ca),
+                print::affine_map(access_function_cb),
+                print::integer_set(iteration_space_ca),
+                print::integer_set(iteration_space_cb),
+                print::vector(*operand_ty),
+                print::vector(*operand_ty),
+                print::vector(*ty)
+            );
+        }
         Op::ConstantBitstream { result, value, ty } => {
             let values = value
                 .iter()
@@ -824,5 +996,54 @@ fn mask_bracket(mask: Option<Predicate>) -> String {
     match mask {
         Some(p) => format!("[{} : {}]", print::val(p.val()), print::vector(p.ty())),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::islands::dataflow_ir::dialects::Val;
+    use crate::islands::dataflow_ir::dialects::vectorchain::{Op, emit};
+    use crate::islands::dataflow_ir::ty::{ElemType, Vector};
+
+    /// ⭐⭐ IBM'S OWN PACK LINE, REPRODUCED BYTE FOR BYTE.
+    ///
+    /// `dcc/test/Conversion/VectorChainToSentientPESFP/fpuop.mlir:217` — the whole
+    /// merge/pack/gcvt/fcvt family is this one op, so the shape of this single line is the shape of
+    /// all thirty-four mnemonics, and its two consumers (`getMergeTypeFromIndices` and
+    /// `getGCVTorFCVTTypeFromIndicesAndCastInputs`) read nothing but `indices`, `repetition` and
+    /// `sign_extend`.
+    ///
+    /// ⛔ THE TWO SPELLINGS THAT ARE ONLY CHECKABLE AGAINST BYTES: `repetition = 8 : index` where
+    /// [`Op::Shuffle`]'s same-named attribute is `: i32`, and `sign_extend = false` printed rather
+    /// than elided. A shape assertion — "it names the op and lists sixteen indices" — passes on both
+    /// wrong spellings.
+    #[test]
+    fn reproduces_ibms_pack_line() {
+        let i8x128 = Vector {
+            len: 128,
+            elem: ElemType::Int(8),
+        };
+        let mut out = String::new();
+        emit(
+            &mut out,
+            &Op::Pack {
+                result: Val(29),
+                op1: Val(24),
+                op2: Val(27),
+                mask: None,
+                indices: (0..16).map(|i| i * 2).collect(),
+                repetition: 8,
+                sign_extend: false,
+                operand_ty: i8x128,
+                ty: i8x128,
+            },
+        );
+        assert_eq!(
+            out,
+            "%29 = vectorchain.pack %24, %27 {indices = [0 : i32, 2 : i32, 4 : i32, 6 : i32, \
+             8 : i32, 10 : i32, 12 : i32, 14 : i32, 16 : i32, 18 : i32, 20 : i32, 22 : i32, \
+             24 : i32, 26 : i32, 28 : i32, 30 : i32], repetition = 8 : index, sign_extend = false} \
+             : vector<128xi8>, vector<128xi8>, vector<128xi8>\n"
+        );
     }
 }

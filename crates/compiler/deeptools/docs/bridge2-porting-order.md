@@ -39,7 +39,7 @@ are ported when tiling lands and the corpus is regenerated.
 
 ## Progress
 
-`57/384 ported; 57/384 audited`
+`65/384 ported; 65/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
@@ -116,6 +116,42 @@ that carries it: `getLoadConsumer`'s comment promises a `storeOp` arm the code d
 stored load hits `emitError("unsupported loadOp consumer!")`); `generateSetSendDestinationStmts`
 binds `map_op` and never reads it; `addLoadChainToDeleteList` dereferences
 `*user->getUsers().begin()` on a rearrangement whose result nothing reads.
+
+⭐ AND ENTRIES 057-064 — `OperandReuse`'s `setReuseFlag` and `dominates` (`vc_operand_reuse.rs`),
+and the six `VectorChainHelper` units in `vc_vector_chain_helper.rs`:
+`isSentientBinaryLogicalOp`, `getInputPrecisionFromOperand`, `getResultPrecisionFromOperands`,
+`getComputePrecisionOfOp`, `hasConstantBounds` and the `merge_and_pack_type` constructor.
+
+⭐ ONE VOCABULARY, NOT TWO (AGAIN): 057/058 landed after 055/056 and were rebased onto that wave's
+`OperandTag`, `DataId` and `DataOriginId` rather than carrying a second `OperandTag` with a bare
+`int id_`. The table stays keyed by the `Val` a data origin produces — the sentinel lives in
+`DataId::Unassigned` and nowhere else, so `setReuseFlag`'s default-inserting `operator[]` gets the
+reference's `{-1, false}` from the derived `Default`. ⛔ AND `dominance_info_` DOES NOT ARRIVE WITH
+058 after all: `OpId` carries an op's path through the region tree, so `dominates` is a pure function
+of its two arguments and the reference's cached `DominanceInfo` has nothing left to hold. `dominates`
+takes two `OpId`s while the table takes a `Val`, which is the same split the C++ has (`Operation *`
+as a position here, as a map key there).
+
+⛔ 062's PACK/MERGE SHORT-CIRCUIT RUNS BEFORE THE ELEMENT-TYPE QUERY, and that order is the whole
+function: `MergeOp` appears in neither `getVectorType` nor `getCustomVectorType` (`Utils.cpp:520-702`),
+so reaching `getElementType` for one is `DT_CHECK_MSG("Type is not a known vector type")`. It is also a
+DIFFERENT answer — IBM's `gcvt.mlir` packs two `vector<128xf8E4M3FN>` and the compute reads
+`ComputePrecision = #sentient<precision fp16>`. `vectorchain.pack` and `vectorchain.merge` were added
+to the DataflowIR island for it; the pack printer is byte-exact against `fpuop.mlir:217` and the merge
+printer is derived from the `.td` and NOT byte-checked, because no vendor text writes a
+`vectorchain.merge`.
+
+⛔ AN EMPTY `affine_set` STILL HAS CONSTANT BOUNDS, and 063 must say so.
+`affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` admits no integer, yet its `LB` is 64 and its `UB`
+is 63 — and it is the all-lanes-off mask of twenty `create_affine_mask` ops in
+`Conversion/VectorChainToSentientPESFP/mixed_precision.mlir`, each lowering to
+`sentient.scalar_constant {value = 0 : si64}` (`:288`, `:296`). A `LB <= UB` test in
+`hasConstantBounds` would turn twenty legal masks into an `emitOpError`.
+
+⚠️ 060/061's `fp80 -> fp8` REMAP IS UNREPRESENTABLE, WHICH IS STRONGER THAN DROPPED. MLIR's
+`Float80Type` stands in for fp8 (`VectorOperands.cpp:227-232`); `ElemType` has no F80 and
+`sen::Precision` has no `Fp80`, so the remap collapses into the type. `dlfp16` is dead in the
+reference too — `getPrecisionInString` can only produce `int<n>`, `bf16`, `mxfp<n>` or `fp<n>`.
 
 
 ## Level 0
@@ -232,22 +268,22 @@ binds `map_op` and never reads it; `addLoadChainToDeleteList` dereferences
 - [x] **AUDIT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, line by line against the C++
 - [x] **PORT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, 6 lines
 - [x] **AUDIT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, line by line against the C++
-- [ ] **PORT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, 2 lines
-- [ ] **AUDIT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, line by line against the C++
-- [ ] **PORT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, 2 lines
-- [ ] **AUDIT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, line by line against the C++
-- [ ] **PORT 059/384** `isSentientBinaryLogicalOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:30`, 4 lines
-- [ ] **AUDIT 059/384** `isSentientBinaryLogicalOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:30`, line by line against the C++
-- [ ] **PORT 060/384** `getInputPrecisionFromOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:36`, 6 lines
-- [ ] **AUDIT 060/384** `getInputPrecisionFromOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:36`, line by line against the C++
-- [ ] **PORT 061/384** `getResultPrecisionFromOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:52`, 10 lines
-- [ ] **AUDIT 061/384** `getResultPrecisionFromOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:52`, line by line against the C++
-- [ ] **PORT 062/384** `getComputePrecisionOfOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:65`, 13 lines
-- [ ] **AUDIT 062/384** `getComputePrecisionOfOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:65`, line by line against the C++
-- [ ] **PORT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, 10 lines
-- [ ] **AUDIT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, line by line against the C++
-- [ ] **PORT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, 6 lines
-- [ ] **AUDIT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, line by line against the C++
+- [x] **PORT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, 2 lines
+- [x] **AUDIT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, line by line against the C++
+- [x] **PORT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, 2 lines
+- [x] **AUDIT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, line by line against the C++
+- [x] **PORT 059/384** `isSentientBinaryLogicalOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:30`, 4 lines
+- [x] **AUDIT 059/384** `isSentientBinaryLogicalOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:30`, line by line against the C++
+- [x] **PORT 060/384** `getInputPrecisionFromOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:36`, 6 lines
+- [x] **AUDIT 060/384** `getInputPrecisionFromOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:36`, line by line against the C++
+- [x] **PORT 061/384** `getResultPrecisionFromOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:52`, 10 lines
+- [x] **AUDIT 061/384** `getResultPrecisionFromOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:52`, line by line against the C++
+- [x] **PORT 062/384** `getComputePrecisionOfOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:65`, 13 lines
+- [x] **AUDIT 062/384** `getComputePrecisionOfOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:65`, line by line against the C++
+- [x] **PORT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, 10 lines
+- [x] **AUDIT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, line by line against the C++
+- [x] **PORT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, 6 lines
+- [x] **AUDIT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, line by line against the C++
 - [ ] **PORT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, 49 lines
 - [ ] **AUDIT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, line by line against the C++
 - [ ] **PORT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, 13 lines
