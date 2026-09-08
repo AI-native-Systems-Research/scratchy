@@ -379,7 +379,7 @@ fn regions_are_equivalent(
     block_a
         .iter()
         .zip(block_b)
-        .all(|(op_a, op_b)| ops_are_equivalent(op_a, op_b, scope, oe.preference))
+        .all(|(op_a, op_b)| ops_are_equivalent(op_a, op_b, scope, oe.preference, oe.block_args))
 }
 
 /// Replaces: e193_matchUnits
@@ -610,6 +610,7 @@ pub fn run_on_operation<'p, A: Arch>(
 
 #[cfg(test)]
 mod unit_tests {
+    use super::super::tf_cfgs_dataflow_conditional_tree::BlockArgEquivalence;
     use super::*;
     use crate::arch::Dd2;
     use crate::generated::{OpFunc, SyncSignal};
@@ -801,6 +802,7 @@ mod unit_tests {
                 curr,
                 &scope,
                 HighPreference::None,
+                BlockArgEquivalence::AllEquivalent,
             ),
             "an l0su at (1,1) and one at (1,0) are two different bindings structurally"
         );
@@ -813,6 +815,7 @@ mod unit_tests {
                     base_unit: UnitPlacement::of(at(1, 1)),
                     curr_unit: UnitPlacement::of(at(1, 0)),
                 }),
+                BlockArgEquivalence::AllEquivalent,
             ),
             "and the functor is why the pass can merge them"
         );
@@ -1032,9 +1035,9 @@ mod unit_tests {
             OperationEquivalence {
                 debug: EquivalenceTag::ProgramUnitsReduction,
                 preference: HighPreference::None,
-                subregions: super::super::tf_cfgs_dataflow_conditional_tree::SubregionCompare::Recursive,
-                block_args:
-                    super::super::tf_cfgs_dataflow_conditional_tree::BlockArgEquivalence::AllEquivalent,
+                subregions:
+                    super::super::tf_cfgs_dataflow_conditional_tree::SubregionCompare::Recursive,
+                block_args: BlockArgEquivalence::AllEquivalent,
                 cache: super::super::tf_cfgs_dataflow_conditional_tree::EquivalenceCache::Reuse,
             }
         );

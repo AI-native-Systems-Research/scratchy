@@ -2210,11 +2210,6 @@ mod unit_tests {
     }
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e281_OperationTreeBase
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 238/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2326,5 +2321,49 @@ mod compute_loops_tests {
         assert_eq!(tree.find_node_from_op(&OpId::at(&[1, 1])), Some(nested));
         assert_eq!(tree.first_child(nested), None);
         assert_eq!(tree.first_child(next), None);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 281/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+impl LoopMaskTree {
+    /// Replaces: e281_OperationTreeBase
+    ///
+    /// **281/384** `LoopMaskTree::LoopMaskTree(dataflow::ProgramUnitOp &)` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105` (2L).
+    ///
+    /// ⭐ `OperationTreeBase()` AND `computeLoops(unit)` ARE ONE ACT HERE: [`compute_loops`] hands
+    /// back a tree that already carries its synthetic root, so the base's null-`root_` state — the one
+    /// `computeLoops`' own `DT_CHECK_MSG(!root_ && op_to_node_.empty())` (`LoopMaskTree.cpp:173`)
+    /// guards against being filled twice — is unrepresentable, and this is the only way to get a tree.
+    #[must_use]
+    pub fn new(unit_body: &[sen::Op]) -> LoopMaskTree {
+        compute_loops(unit_body)
+    }
+}
+
+#[cfg(test)]
+mod loop_mask_tree_new_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::Values;
+
+    /// The constructor IS `computeLoops`, and what it rules out is a tree without a root.
+    #[test]
+    fn the_only_constructor_returns_a_rooted_tree_with_the_units_loops_in_it() {
+        let mut vals = Values::default();
+        let unit_body = vec![sen::Op::Sentient(sentient::Op::For {
+            iv: vals.mint(),
+            bound: vals.mint(),
+            carried: Vec::new(),
+            dbg_name: None,
+            body: Vec::new(),
+        })];
+
+        let tree = LoopMaskTree::new(&unit_body);
+        assert_eq!(*tree.node(tree.root()), LoopMaskNode::SyntheticRoot);
+        let loop_node = tree.first_child(tree.root()).expect("the unit's one loop");
+        assert_eq!(tree.operation(loop_node), Some(&OpId::at(&[0])));
+        assert_eq!(*tree.node(loop_node), LoopMaskNode::Loop(LMTLoopNode));
     }
 }

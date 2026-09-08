@@ -243,7 +243,8 @@ pub fn operands(op: &Op) -> Vec<Val> {
             // [`dataflow::Op::GetUnitCollection`].
             | dataflow::Op::GetUnitCollection { .. } => {}
             dataflow::Op::GetLocalUnit { of, .. } => reads.push(*of),
-            dataflow::Op::GetMyUnitInCollection { of, .. } => reads.push(*of),
+            dataflow::Op::GetMyUnitInCollection { of, .. }
+            | dataflow::Op::GetTotalUnitsInCollection { of, .. } => reads.push(*of),
             dataflow::Op::ProgramCollection { unit, .. } => reads.push(*unit),
             // ⭐ EVERY MEMBER IS AN OPERAND — `Variadic<Index>:$unit_ids` (`Dataflow.td:152`).
             dataflow::Op::CreateGroup { unit_ids, .. } => reads.extend(unit_ids.iter().copied()),
@@ -371,7 +372,9 @@ pub fn operands(op: &Op) -> Vec<Val> {
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Cast { input, .. } => reads.push(*input),
             // ⛔ AND THE `variable` SEGMENT, which is what entry 248 walks uses for.
-            vectorchain::Op::Shuffle { input, variable, .. } => {
+            vectorchain::Op::Shuffle {
+                input, variable, ..
+            } => {
                 reads.push(*input);
                 reads.extend(variable.iter().copied());
             }
@@ -395,9 +398,7 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend(mask.map(|m| m.val()));
             }
             vectorchain::Op::Binary { op1, op2, mask, .. }
-            | vectorchain::Op::Pack {
-                op1, op2, mask, ..
-            } => {
+            | vectorchain::Op::Pack { op1, op2, mask, .. } => {
                 reads.extend([*op1, *op2]);
                 reads.extend(mask.map(|m| m.val()));
             }
@@ -497,6 +498,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::GetUnitCollection { result, .. }
             | dataflow::Op::GetMyUnitInCollection { result, .. }
+            | dataflow::Op::GetTotalUnitsInCollection { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![*result],
             dataflow::Op::GetPagedLogicalMemoryView(view) => vec![view.result],
             // ⛔ `dataflow.send` HAS NO RESULT (`Dataflow.td`), which is why `getLoadConsumer`
@@ -656,7 +658,8 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::Opaque { .. }
             | dataflow::Op::GetUnitCollection { .. } => {}
             dataflow::Op::GetLocalUnit { of, .. } => places.push(of),
-            dataflow::Op::GetMyUnitInCollection { of, .. } => places.push(of),
+            dataflow::Op::GetMyUnitInCollection { of, .. }
+            | dataflow::Op::GetTotalUnitsInCollection { of, .. } => places.push(of),
             dataflow::Op::ProgramCollection { unit, .. } => places.push(unit),
             dataflow::Op::CreateGroup { unit_ids, .. } => places.extend(unit_ids.iter_mut()),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => places.extend([from, start]),
@@ -875,6 +878,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::GetUnitCollection { result, .. }
             | dataflow::Op::GetMyUnitInCollection { result, .. }
+            | dataflow::Op::GetTotalUnitsInCollection { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![result],
             dataflow::Op::GetPagedLogicalMemoryView(view) => vec![&mut view.result],
             dataflow::Op::ProgramUnit { .. }
@@ -1031,9 +1035,10 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
         // `flatten` declines when `op_.getNumRegions() == num_of_regions`
         // (`FlatteningLocalRegions.cpp:418`).
-        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
-            regions.iter().map(|region| region.body.as_slice()).collect()
-        }
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => regions
+            .iter()
+            .map(|region| region.body.as_slice())
+            .collect(),
         Op::Uniform(
             uniform::Op::Yield { .. }
             | uniform::Op::DefImmutableMapping { .. }
@@ -1393,7 +1398,8 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             dataflow::Op::GetUnit { result, .. }
             | dataflow::Op::GetUnitCollection { result, .. } => results.push(result),
             dataflow::Op::Opaque { .. } => {}
-            dataflow::Op::GetMyUnitInCollection { result, of } => {
+            dataflow::Op::GetMyUnitInCollection { result, of }
+            | dataflow::Op::GetTotalUnitsInCollection { result, of } => {
                 operands.push(of);
                 results.push(result);
             }
@@ -1682,7 +1688,6 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
         regions,
     }
 }
-
 
 /// EVERY **USE** OF ONE VALUE IN `scope`, INNERMOST OPS INCLUDED — one entry per use.
 ///
@@ -1977,7 +1982,8 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Result, result));
             }
             dataflow::Op::Opaque { .. } => {}
-            dataflow::Op::GetMyUnitInCollection { result, of } => {
+            dataflow::Op::GetMyUnitInCollection { result, of }
+            | dataflow::Op::GetTotalUnitsInCollection { result, of } => {
                 vals.push((Role::Operand, of));
                 vals.push((Role::Result, result));
             }

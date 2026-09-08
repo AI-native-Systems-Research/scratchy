@@ -407,6 +407,7 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             // and none of the nineteen `isa<>` classes is one of them.
             | dataflow::Op::GetUnitCollection { .. }
             | dataflow::Op::GetMyUnitInCollection { .. }
+            | dataflow::Op::GetTotalUnitsInCollection { .. }
             | dataflow::Op::ProgramCollection { .. },
         )
         | DfirOp::Arith(_)

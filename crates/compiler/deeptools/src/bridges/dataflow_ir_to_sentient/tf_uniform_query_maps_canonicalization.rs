@@ -58,6 +58,7 @@
 //! |---|---|---|---|
 //! | `e261_runOnOperation` | 261/384 | 41 | `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55` |
 
+use super::tf_cfgs_dataflow_conditional_tree::BlockArgEquivalence;
 use super::tf_program_units_reduction::HighPreference;
 use super::vc_vector_chain_helper::ops_are_equivalent;
 use crate::islands::dataflow_ir::dialects::{
@@ -142,7 +143,13 @@ fn simplify_query_map_with_same_target(result: Val, map: Val, scope: &[DfirOp]) 
             // op are two different targets.
             (Some(def), Some(def0)) if core::ptr::eq(def, def0) => *val != val0,
             // `if (!oe.operationsAreEquivalent(*val.getDefiningOp(), *val0.getDefiningOp()))`.
-            (Some(def), Some(def0)) => !ops_are_equivalent(def, def0, scope, HighPreference::None),
+            (Some(def), Some(def0)) => !ops_are_equivalent(
+                def,
+                def0,
+                scope,
+                HighPreference::None,
+                BlockArgEquivalence::AllEquivalent,
+            ),
             _ => true,
         }
     });

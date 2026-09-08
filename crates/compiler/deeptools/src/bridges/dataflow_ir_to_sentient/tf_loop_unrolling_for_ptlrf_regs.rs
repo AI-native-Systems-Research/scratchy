@@ -59,12 +59,14 @@
 //! | `e249_processComputeUnit` | 249/384 | 91 | `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:37` |
 //! | `e288_runOnOperation` | 288/384 | 22 | `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131` |
 
-
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::dataflow::LocalUnit;
 use crate::islands::dataflow_ir::dialects::{
-    Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, regions, scf,
-    uses,
+    Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, regions,
+    scf, uses,
 };
+use crate::islands::dataflow_ir::{self as dfir};
+use crate::units::DfirUnit;
 
 use super::tf_loop_unroll_for_shuffle_op::{Loop, Unroll, perform_full_unroll};
 
@@ -86,9 +88,9 @@ fn view_use_indices(op: &DfirOp) -> Option<&[Index]> {
         DfirOp::Affine(
             affine::Op::VectorLoad { indices, .. } | affine::Op::VectorStore { indices, .. },
         )
-        | DfirOp::Agen(agen::Op::VectorLoad { indices, .. } | agen::Op::VectorStore { indices, .. }) => {
-            Some(indices)
-        }
+        | DfirOp::Agen(
+            agen::Op::VectorLoad { indices, .. } | agen::Op::VectorStore { indices, .. },
+        ) => Some(indices),
         _ => None,
     }
 }
@@ -364,7 +366,102 @@ mod unit_tests {
     }
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e288_runOnOperation
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 288/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT THE PASS ASKED FOR ON ONE PROGRAM UNIT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitPtLrfUnrolling {
+    /// The kind `getUnits()[0]`'s type resolved to — a PT row, `pe` or `sfp`, since that is the filter.
+    pub on: DfirUnit,
+    /// What [`process_compute_unit`] marked, or the `emitError` that stopped it.
+    pub unrolling: PtLrfUnrolling,
+}
+
+/// Replaces: e288_runOnOperation
+///
+/// **288/384** `LoopUnrollingForPTLRFRegsPass::runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131` (22L).
+///
+/// One [`process_compute_unit`] per PT, PE or SFP program unit (`:149-151`); all three `DT_CHECK`s are
+/// types here, because [`dfir::Units`] is non-empty by construction and carries ONE kind.
+/// ⛔ THIS FILE IS NEVER COMPILED — `LLVM_OPTIONAL_SOURCES` names it and no target lists it
+/// (`Transform/Dataflow/CMakeLists.txt:5-7`), and the `DT_CHECK` at `:143-146` proves it: it hands a
+/// `std::string` to `senCompToGenericComp.find`, whose key type is `SenComponents`
+/// (`sys-arch-spec/arch_enums.h:130`). That is ill-formed, so this pass has never built or run and
+/// there is no vendor expectation to port — the same holds for entry 286's file, the other optional one.
+#[must_use]
+pub fn run_on_operation<A: Arch>(program: &dfir::Program<A>) -> Vec<UnitPtLrfUnrolling> {
+    // `module_op.walk([&](dataflow::ProgramUnitOp unit) { .. })` — the units are a field of the
+    // program, so the walk is an iteration (entry 248 takes the same shape over the same field).
+    program
+        .units
+        .iter()
+        .filter_map(|unit| {
+            // `SenComponents comp = senCompToGenericComp.at(record->second);` then
+            // `if (is_any_of(comp, PT, PE, SFP))` — the generic component of the unit's own type.
+            let on = unit.on.kind();
+            matches!(on, DfirUnit::PtRow(_) | DfirUnit::Pe | DfirUnit::Sfp).then(|| {
+                UnitPtLrfUnrolling {
+                    on,
+                    unrolling: process_compute_unit(&unit.body),
+                }
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod run_on_operation_tests {
+    use super::*;
+    use crate::arch::Target;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+    };
+    use crate::units::{DfirUnit, Row};
+
+    /// 🎯 288/384 — THE FILTER IS THE WHOLE PASS: a PT row is processed, an `lxlu` is not looked at.
+    #[test]
+    fn only_the_pt_pe_and_sfp_units_are_processed() {
+        let a_unit = |on: DfirUnit| ProgramUnit::<Target> {
+            on: Units::one(on, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        };
+        let program = dfir::Program::<Target> {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                a_unit(DfirUnit::PtRow(Row::checked(0).expect("row 0 exists"))),
+                vec![a_unit(DfirUnit::Lxlu), a_unit(DfirUnit::Sfp)],
+            ),
+            arch: core::marker::PhantomData,
+        };
+
+        assert_eq!(
+            run_on_operation(&program),
+            vec![
+                UnitPtLrfUnrolling {
+                    on: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
+                    unrolling: PtLrfUnrolling::Marked {
+                        unrolls: Vec::new()
+                    },
+                },
+                UnitPtLrfUnrolling {
+                    on: DfirUnit::Sfp,
+                    unrolling: PtLrfUnrolling::Marked {
+                        unrolls: Vec::new()
+                    },
+                },
+            ],
+            "`is_any_of(comp, PT, PE, SFP)` skips the LX load unit between them"
+        );
+    }
+}

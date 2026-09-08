@@ -151,7 +151,6 @@ impl Received {
     pub const fn ty(&self) -> Vector {
         self.ty
     }
-
 }
 
 /// THE NUMERIC PRECISION OF A UNIT'S PROGRAM — `dataflow.program_unit`'s `precision` attribute.
@@ -522,6 +521,20 @@ pub enum Op {
         of: Val,
     },
 
+    /// `dataflow.get_total_units_in_collection %collection : i32` — HOW MANY MEMBERS THE COLLECTION
+    /// HAS, which entry 286 folds to `type.getShape()[0]` and erases
+    /// (`EnumerateCollectionUnit.cpp:98-114`).
+    ///
+    /// ⭐ THE SIBLING OF [`Op::GetMyUnitInCollection`] — *which member am I* beside *how many are
+    /// there*, both `i32`, both read only the collection handle, and both gone once the collection is
+    /// enumerated. See [`Op::GetUnitCollection`] on the absence from `Dataflow.td`.
+    GetTotalUnitsInCollection {
+        /// The count it binds.
+        result: Val,
+        /// The collection asked about.
+        of: Val,
+    },
+
     /// `dataflow.program_collection %collection : { .. }` — ONE BODY, N UNITS.
     ///
     /// ⭐ WHAT ENTRY 245 CLONES: the body is copied once per member into a [`Op::ProgramUnit`] on
@@ -727,6 +740,14 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             let _ = writeln!(
                 out,
                 "{} = dataflow.get_my_unit_in_collection {} : i32",
+                print::val(*result),
+                print::val(*of),
+            );
+        }
+        Op::GetTotalUnitsInCollection { result, of } => {
+            let _ = writeln!(
+                out,
+                "{} = dataflow.get_total_units_in_collection {} : i32",
                 print::val(*result),
                 print::val(*of),
             );

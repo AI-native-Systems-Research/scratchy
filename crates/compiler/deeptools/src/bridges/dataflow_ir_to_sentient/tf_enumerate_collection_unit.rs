@@ -59,16 +59,10 @@
 //! | `e245_enumerateCollectionUnit` | 245/384 | 57 | `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:34` |
 //! | `e286_runOnOperation` | 286/384 | 32 | `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94` |
 
-
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e286_runOnOperation
-
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, arith, dataflow, defining_op, regions_mut, replace_uses_of_with, results,
-    results_mut,
+    Op as DfirOp, Val, arith, dataflow, defining_op, regions, regions_mut, replace_uses_of_with,
+    results, results_mut,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -255,7 +249,10 @@ mod enumerate_collection_unit_tests {
         let out = enumerate_collection_unit(&program, &scope, &mut vals);
         assert_eq!(out.len(), 6);
 
-        for (member, chunk) in [DfirUnit::Hbm, DfirUnit::L3lu].into_iter().zip(out.chunks(3)) {
+        for (member, chunk) in [DfirUnit::Hbm, DfirUnit::L3lu]
+            .into_iter()
+            .zip(out.chunks(3))
+        {
             let DfirOp::Dataflow(dataflow::Op::GetUnit { result, unit, .. }) = &chunk[0] else {
                 panic!("the member's unit");
             };
@@ -275,5 +272,168 @@ mod enumerate_collection_unit_tests {
             assert_eq!((add.lhs, add.rhs), (*index, *index));
             assert_ne!(add.result, sum);
         }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 286/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `moduleOp.walk(..)` COLLECTING EVERY `dataflow.get_total_units_in_collection`, innermost included —
+/// the `workList1` of [`run_on_operation`], each paired with the collection it asks about.
+fn collect_total_units(scope: &[DfirOp], into: &mut Vec<(Val, Val)>) {
+    for op in scope {
+        if let DfirOp::Dataflow(dataflow::Op::GetTotalUnitsInCollection { result, of }) = op {
+            into.push((*result, *of));
+        }
+        for region in regions(op) {
+            collect_total_units(region, into);
+        }
+    }
+}
+
+/// `OpBuilder builder(op)` THEN `op->erase()` AS ONE WRITE — the constant takes the total-units op's
+/// own slot at whatever depth it sat, which is what building *at* it and erasing it amounts to.
+fn fold_to_constant(block: &mut [DfirOp], result: Val, count: Val, n_units: i64) {
+    for op in block.iter_mut() {
+        let is_this_one = matches!(
+            op,
+            DfirOp::Dataflow(dataflow::Op::GetTotalUnitsInCollection { result: r, .. })
+                if *r == result
+        );
+        if is_this_one {
+            *op = DfirOp::Arith(arith::Op::ConstantInt {
+                result: count,
+                value: arith::IntConst::Int {
+                    value: n_units,
+                    bits: 32,
+                },
+            });
+            continue;
+        }
+        for region in regions_mut(op) {
+            fold_to_constant(region, result, count, n_units);
+        }
+    }
+}
+
+/// Replaces: e286_runOnOperation
+///
+/// **286/384** `EnumerateCollectionUnitPass::runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94` (32L).
+///
+/// Two rewrites over the module in order: every `get_total_units_in_collection` becomes the member
+/// count as an `arith.constant : i32`, then every `dataflow.program_collection` is replaced in place by
+/// [`enumerate_collection_unit`]'s expansion of it.
+/// ⛔⛔ THE `if (!type) return;` AT `:105` RETURNS FROM THE **PASS**, NOT FROM A WALK LAMBDA — it sits
+/// in `runOnOperation`'s own `for`, so one total-units op reading a non-collection abandons every
+/// later fold AND the whole collection expansion, with no diagnostic at all.
+/// ⛔ THIS FILE IS IN `LLVM_OPTIONAL_SOURCES` (`Transform/Dataflow/CMakeLists.txt:5-6`) and is not
+/// built, so there is no vendor case — see [`dataflow::Op::GetUnitCollection`] on its absent ops.
+pub fn run_on_operation(module: &mut Vec<DfirOp>, vals: &mut Values) {
+    // ── `// Collect the total units operations` (`:97-114`) ──────────────────────────────────────
+    let mut total_units: Vec<(Val, Val)> = Vec::new();
+    collect_total_units(module, &mut total_units);
+    for (result, of) in total_units {
+        // `auto type = dyn_cast<VectorType>(op.unit().getType()); if (!type) return;` — the operand is
+        // a `vector<Nxindex>` exactly when its definer is the collection binder, and
+        // `type.getShape()[0]` is the length of that binder's member list.
+        let Some(DfirOp::Dataflow(dataflow::Op::GetUnitCollection { members, .. })) =
+            defining_op(of, module)
+        else {
+            return;
+        };
+        // ⛔ COUNTED, NOT `try_from` — `Err(` is frozen at zero in this crate (`AGENT-BRIEF.md:110`).
+        let n_units = members.iter().fold(0_i64, |n, _| n + 1);
+        let count = vals.mint();
+        fold_to_constant(module, result, count, n_units);
+        // `op.replaceAllUsesWith(constTotalUnitsOp.getResult())` — after the erase, since no erased op
+        // is itself a user (entry 245's [`replace_and_erase_my_unit`] makes the same point).
+        repoint(module, result, count);
+    }
+
+    // ── `// Collect the collection unit operations` (`:116-125`) ─────────────────────────────────
+    let collections: Vec<usize> = module
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| matches!(op, DfirOp::Dataflow(dataflow::Op::ProgramCollection { .. })))
+        .map(|(at, _)| at)
+        .collect();
+    // ⛔ DESCENDING, BECAUSE EACH SPLICE SHIFTS EVERY LATER POSITION. The reference holds pointers and
+    // has no such problem; `collectionDefinitionOp->erase()` (`:124`) is this splice's removal, and
+    // `OpBuilder builder(collectionDefinitionOp)` (entry 245, `:52`) is its insertion.
+    for at in collections.into_iter().rev() {
+        let collection = module[at].clone();
+        let DfirOp::Dataflow(op) = &collection else {
+            continue;
+        };
+        let expanded = enumerate_collection_unit(op, module, vals);
+        drop(module.splice(at..=at, expanded));
+    }
+}
+
+#[cfg(test)]
+mod run_on_operation_tests {
+    use super::*;
+    use crate::units::{DfirUnit, Residency};
+
+    /// 🎯 286/384 — THE TOTAL FOLDS TO THE MEMBER COUNT AND THE COLLECTION EXPANDS WHERE IT STOOD.
+    #[test]
+    fn the_total_becomes_a_literal_and_the_collection_becomes_one_program_unit_per_member() {
+        let mut vals = Values::default();
+        let collection = vals.mint();
+        let total = vals.mint();
+        let member = |unit| dataflow::CollectionMember {
+            residency: Residency::Global,
+            unit,
+        };
+        let mut module = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnitCollection {
+                result: collection,
+                members: vec![member(DfirUnit::Hbm), member(DfirUnit::L3lu)],
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetTotalUnitsInCollection {
+                result: total,
+                of: collection,
+            }),
+            DfirOp::Dataflow(dataflow::Op::ProgramCollection {
+                unit: collection,
+                body: vec![DfirOp::Dataflow(dataflow::Op::GetMyUnitInCollection {
+                    result: vals.mint(),
+                    of: collection,
+                })],
+            }),
+        ];
+
+        run_on_operation(&mut module, &mut vals);
+
+        // Neither collection op survives.
+        assert!(!module.iter().any(|op| matches!(
+            op,
+            DfirOp::Dataflow(
+                dataflow::Op::GetTotalUnitsInCollection { .. }
+                    | dataflow::Op::ProgramCollection { .. }
+            )
+        )));
+        // The member count, then entry 245's one index per member.
+        assert_eq!(
+            module
+                .iter()
+                .filter_map(|op| match op {
+                    DfirOp::Arith(arith::Op::ConstantInt {
+                        value: arith::IntConst::Int { value, bits: 32 },
+                        ..
+                    }) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+        assert_eq!(
+            module
+                .iter()
+                .filter(|op| matches!(op, DfirOp::Dataflow(dataflow::Op::ProgramUnit { .. })))
+                .count(),
+            2
+        );
     }
 }

@@ -1152,6 +1152,117 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
             }
         }
     }
+
+    /// Replaces: e287_flatten
+    ///
+    /// **287/384** `FlatteningLocalRegionsTree::flatten` — `FlatteningLocalRegions.cpp:384` (70L): one
+    /// `uniform.uniformize_regions` rebuilt so its regions ARE the equivalence classes of its units.
+    ///
+    /// ⛔ THE `bool` IS THE REPLACEMENT: `true` means *"a new op stands beside `op_`, erase `op_`"*
+    /// (`:420-423`, `:472-475`), so handing the op back states it without an out-of-band edit, and
+    /// `None` is both `return false`s (`:387`, `:418`).
+    #[must_use]
+    pub fn flatten(&mut self, op: &'p DfirOp, values: &mut Values) -> Option<DfirOp> {
+        // `clear();` (`:385`) — this tree is built once per operation and the pass reuses the object.
+        self.clear();
+        // `auto uniform_op = dyn_cast<uniform::UniformizeRegionsOp>(op_); if (!uniform_op) return false;`
+        // (`:386-387`) — and `getUnitsPerRegionsAsVectorOfVector(uniform_op, units_of_old_local_regions)`
+        // (`:388-390`) is this binding: the old regions already carry their own unit lists.
+        let DfirOp::Uniform(uniform::Op::UniformizeRegions {
+            regions: units_of_old_local_regions,
+            ..
+        }) = op
+        else {
+            return None;
+        };
+
+        // `auto new_node = new LocalOpNode(&op_); root_ = new_node; compute(new_node);` (`:392-394`) —
+        // the operation being flattened is the root, and its own regions are walked by `compute`, not by
+        // `traverseRegion`, so each gets its own unit list.
+        let base = OperationTreeBase::with_root(LocalOpNode::new(op));
+        let root = LocalOpNodeId(base.root());
+        self.base = Some(base);
+        self.compute(root);
+
+        // `partitionUnits(equivalence_classes);` (`:396-397`).
+        //
+        // ⭐ THIS ONE VALUE IS `equivalence_classes`, `new_unit_list`, `new_list_sizes` AND
+        // `unit_rep_order` (`:408-415`) AT ONCE: the key is the representative, the members are the
+        // region's unit list, and their count is its `list_sizes` entry — which is also why
+        // `DT_CHECK(unit_rep_order.size() == num_of_regions)` (`:429`) is unwritable.
+        let equivalence_classes = self.partition_units();
+
+        // `int num_of_regions = equivalence_classes.size();
+        //  if (op_.getNumRegions() == num_of_regions) return false;` (`:417-418`) — nothing to flatten
+        // when the nesting already partitions the units, and the caller then keeps the original.
+        if units_of_old_local_regions.len() == equivalence_classes.len() {
+            return None;
+        }
+
+        // `for (int i = 0; i < num_of_regions; i++)` (`:430`) — one new region per class, in the
+        // `MapVector`'s key order, which is the order the walk first reached each representative.
+        let mut regions: Vec<uniform::LocalRegion> = Vec::new();
+        for (representative, units) in &equivalence_classes {
+            // `auto &block = new_uniform_op.getRegion(i).emplaceBlock();
+            //  auto block_arg = block.addArgument(builder.getIndexType(), ..);` (`:431-433`).
+            let block_arg = values.mint();
+            // `:435-445` — the old region to rebind is the one whose unit list holds this class's FIRST
+            // member, and `IRMapping arg_map` is fresh per region so a previous region's rebinding of
+            // the same argument cannot leak into this one.
+            //
+            // ⛔ THE REFERENCE INDEXES PAST ITS LAST REGION WHEN NOTHING HOLDS THAT UNIT — the search
+            // leaves `old_region_idx == size()` and `:445` calls `getRegion` on it. Mapping nothing is
+            // the same output for every input the reference does not read out of bounds on.
+            let mut arg_map = ValueMapping::new();
+            if let Some(old_local_region) = units_of_old_local_regions.iter().find(|old| {
+                units
+                    .first()
+                    .is_some_and(|first_unit| old.units.contains(first_unit))
+            }) {
+                arg_map.map(old_local_region.arg, block_arg);
+            }
+            // `cloneOpsForRegions(getRoot()->getFirstChild(), unit_to_ops[unit_rep_order.at(i)],
+            //  builder_region, 0, arg_map, block_arg);` (`:446-449`) — the representative's operation
+            // list decides what this region runs, and region 0 is where the walk's own stamping starts.
+            let op_list: Vec<&'p DfirOp> = self
+                .unit_to_ops
+                .entries()
+                .iter()
+                .find(|(unit, _)| unit == representative)
+                .map_or_else(Vec::new, |(_, ops)| ops.clone());
+            let mut region_body = Vec::new();
+            self.clone_ops_for_regions(
+                self.first_child(root),
+                &op_list,
+                &mut region_body,
+                RegionNum(0),
+                &mut arg_map,
+                block_arg,
+                values,
+            );
+            // `auto yield_op = mlir::uniform::YieldOp::create(builder_region, ..);` (`:450-451`) — the
+            // old terminators were skipped by `:229-232`, so every new region gets a fresh one.
+            region_body.push(DfirOp::Uniform(uniform::Op::Yield {
+                operands: Vec::new(),
+            }));
+            regions.push(uniform::LocalRegion {
+                arg: block_arg,
+                units: units.clone(),
+                body: region_body,
+            });
+        }
+
+        // `UniformizeRegionsOp::create(builder, op_.getLoc(), mlir::TypeRange(), new_unit_list,
+        //  ArrayAttr::get(.., new_list_sizes), nullptr, nullptr, num_of_regions)` (`:420-423`) — built
+        // LAST here and at `:420` there, because the regions it is created with are empty either way.
+        //
+        // ⭐ `mlir::TypeRange()` IS THE EMPTY `results`, and the two `nullptr`s are attributes this
+        // island's [`uniform::Op::UniformizeRegions`] does not carry at all.
+        Some(DfirOp::Uniform(uniform::Op::UniformizeRegions {
+            regions,
+            results: Vec::new(),
+        }))
+    }
 }
 
 impl<'p> Default for FlatteningLocalRegionsTree<'p> {
@@ -1202,8 +1313,6 @@ const _: () = {
 fn runs_the_same_operations(lhs: &[&DfirOp], rhs: &[&DfirOp]) -> bool {
     lhs.len() == rhs.len() && lhs.iter().zip(rhs).all(|(l, r)| core::ptr::eq(*l, *r))
 }
-
-
 
 /// `replaceUsesWithIf` WITH THIS PASS'S PREDICATE — one operation and everything nested inside it
 /// (`FlatteningLocalRegions.cpp:276-284`).
@@ -1258,8 +1367,14 @@ mod unit_tests {
         let conditional = tree.first_child(root).expect("the `scf.if`");
         let chain = tree.first_child(conditional);
 
-        assert!(!tree.in_region_empty(RegionNum(0), chain), "the `then` region");
-        assert!(!tree.in_region_empty(RegionNum(1), chain), "the `else` region");
+        assert!(
+            !tree.in_region_empty(RegionNum(0), chain),
+            "the `then` region"
+        );
+        assert!(
+            !tree.in_region_empty(RegionNum(1), chain),
+            "the `else` region"
+        );
         assert!(
             tree.in_region_empty(RegionNum(2), chain),
             "an `scf.if` has two regions, so nothing is stamped 2"
@@ -1613,27 +1728,30 @@ mod unit_tests {
         for op in &into {
             print::emit(&mut got, op, 0);
         }
-        assert_eq!(got, concat!(
-            // The same condition chain the first class got, cloned again for this region
-            // (`flatten_local_region4.mlir:361-369` against `:345-353`).
-            "%302 = arith.constant 0 : index\n",
-            "%303 = scf.if %302 -> (index) {\n",
-            "  %304 = arith.constant 1 : index\n",
-            "  scf.yield %304 : index\n",
-            "} else {\n",
-            "  scf.yield %4 : index\n",
-            "} {dbgName = \"condition__1\"}\n",
-            "%305 = arith.subi %303, %4 : index\n",
-            "scf.if %305 {\n",
-            // ⭐ `%11 -> %75`, NOT `%10 -> %74` — region ONE's mapping op, so `:233-234` really did
-            // select this class's list and reject the other region's (`:370` against `:354`).
-            "  %306 = uniform.def_immutable_mapping([%11 -> %75]):index\n",
-            // ⭐ AND `key:%301` AGAIN — this call was handed its own region's argument, exactly as
-            // `:371` reads `%VAL_358` where `:355` reads `%VAL_351`.
-            "  %307 = uniform.query_map(map:%306, key:%301) : index\n",
-            "  dataflow.sync_recv %307 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
-            "} {dbgName = \"condition__1\"}\n",
-        ));
+        assert_eq!(
+            got,
+            concat!(
+                // The same condition chain the first class got, cloned again for this region
+                // (`flatten_local_region4.mlir:361-369` against `:345-353`).
+                "%302 = arith.constant 0 : index\n",
+                "%303 = scf.if %302 -> (index) {\n",
+                "  %304 = arith.constant 1 : index\n",
+                "  scf.yield %304 : index\n",
+                "} else {\n",
+                "  scf.yield %4 : index\n",
+                "} {dbgName = \"condition__1\"}\n",
+                "%305 = arith.subi %303, %4 : index\n",
+                "scf.if %305 {\n",
+                // ⭐ `%11 -> %75`, NOT `%10 -> %74` — region ONE's mapping op, so `:233-234` really did
+                // select this class's list and reject the other region's (`:370` against `:354`).
+                "  %306 = uniform.def_immutable_mapping([%11 -> %75]):index\n",
+                // ⭐ AND `key:%301` AGAIN — this call was handed its own region's argument, exactly as
+                // `:371` reads `%VAL_358` where `:355` reads `%VAL_351`.
+                "  %307 = uniform.query_map(map:%306, key:%301) : index\n",
+                "  dataflow.sync_recv %307 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "} {dbgName = \"condition__1\"}\n",
+            )
+        );
     }
 
     /// The regions of a `uniform.uniformize_regions`, for reaching a nested one's unit lists.
@@ -1948,7 +2066,9 @@ mod unit_tests {
 
         tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
 
-        let conditional = tree.first_child(root).expect("the `scf.if` is the root's child");
+        let conditional = tree
+            .first_child(root)
+            .expect("the `scf.if` is the root's child");
         assert_eq!(
             tree.node(conditional).map(|node| node.is_in_region_num),
             Some(RegionNum(0)),
@@ -2017,7 +2137,9 @@ mod unit_tests {
     /// wires them in the pass, not by the test. THREE children rather than two so that
     /// [`FlatteningLocalRegionsTree::prev_sibling`] has a chain to walk instead of a first-child
     /// special case.
-    fn a_flattening_tree<'p>(ops: &'p [DfirOp]) -> (FlatteningLocalRegionsTree<'p>, Vec<LocalOpNodeId>) {
+    fn a_flattening_tree<'p>(
+        ops: &'p [DfirOp],
+    ) -> (FlatteningLocalRegionsTree<'p>, Vec<LocalOpNodeId>) {
         // `auto new_node = new LocalOpNode(&op_); root_ = new_node;` (`:392-393`).
         let mut base = OperationTreeBase::with_root(LocalOpNode::new(&ops[0]));
         let root = base.root();
@@ -2107,7 +2229,11 @@ mod unit_tests {
             &ops[0]
         ));
         assert_eq!(tree.parent_node(root), None, "`getParentNode() == nullptr`");
-        assert_eq!(tree.next_sibling(root), None, "`getNextSibling() == nullptr`");
+        assert_eq!(
+            tree.next_sibling(root),
+            None,
+            "`getNextSibling() == nullptr`"
+        );
     }
 
     /// 🎯 102/384 — EVERY OPERATION OF A REGION NAMES THE OPERATION THAT OWNS THE REGION.
@@ -2399,13 +2525,84 @@ mod unit_tests {
         assert_eq!(tree.root(), None);
         assert!(tree.unit_to_ops.entries().is_empty());
     }
+
+    /// 🎯 287/384 — THE VENDOR'S CASE 4 END TO END: ONE REGION OVER TWO CLASSES BECOMES TWO REGIONS,
+    /// EACH WITH ITS OWN BLOCK ARGUMENT AND THE NESTING GONE.
+    ///
+    /// `flatten_local_region4.mlir:737-765` in, `:344-374` out. The walk attributes the nested local
+    /// op's two regions to two different units, so `partitionUnits` returns two classes against the
+    /// op's one region — which is exactly what `:418` declines on when they already agree, asserted at
+    /// the end by re-flattening the result.
+    ///
+    /// ⭐ THE CLASS ORDER IS THE REGION ORDER: `%10`'s class comes out first because the walk reached
+    /// it first, not because it was the input's first region — the input's second region is the one
+    /// holding `%10`'s operations (`:344-359` against the input at `:755-760`).
+    #[test]
+    fn the_vendor_case_four_becomes_one_region_per_class_and_then_declines() {
+        let program = a_case_four_program();
+        let mut values = values_past(300);
+        let mut tree = FlatteningLocalRegionsTree::new();
+
+        let flat = tree
+            .flatten(&program, &mut values)
+            .expect("two classes against one region");
+
+        let mut got = String::new();
+        print::emit(&mut got, &flat, 0);
+        assert_eq!(
+            got,
+            concat!(
+                // `mlir::TypeRange()` (`:421`), so `-> ()`.
+                "uniform.uniformize_regions -> () {\n",
+                // `(%VAL_351 -> %VAL_10){` (`:344`) — a freshly minted block argument, and the class's
+                // members as the region's unit list.
+                "  (%301 -> %10){\n",
+                "    %302 = arith.constant 0 : index\n",
+                "    %303 = scf.if %302 -> (index) {\n",
+                "      %304 = arith.constant 1 : index\n",
+                "      scf.yield %304 : index\n",
+                "    } else {\n",
+                "      scf.yield %4 : index\n",
+                "    } {dbgName = \"condition__1\"}\n",
+                "    %305 = arith.subi %303, %4 : index\n",
+                "    scf.if %305 {\n",
+                // ⭐ THE NESTED LOCAL OP IS GONE AND `key:` IS THIS REGION'S ARGUMENT (`:354-356`).
+                "      %306 = uniform.def_immutable_mapping([%10 -> %74]):index\n",
+                "      %307 = uniform.query_map(map:%306, key:%301) : index\n",
+                "      dataflow.sync_recv %307 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "    } {dbgName = \"condition__1\"}\n",
+                // `uniform::YieldOp::create(builder_region, ..)` (`:450-451`) — `:358`.
+                "    uniform.yield\n",
+                "  }\n",
+                // The second class, over the other unit and the other nested region (`:360-374`).
+                "  (%308 -> %11){\n",
+                "    %309 = arith.constant 0 : index\n",
+                "    %310 = scf.if %309 -> (index) {\n",
+                "      %311 = arith.constant 1 : index\n",
+                "      scf.yield %311 : index\n",
+                "    } else {\n",
+                "      scf.yield %4 : index\n",
+                "    } {dbgName = \"condition__1\"}\n",
+                "    %312 = arith.subi %310, %4 : index\n",
+                "    scf.if %312 {\n",
+                "      %313 = uniform.def_immutable_mapping([%11 -> %75]):index\n",
+                "      %314 = uniform.query_map(map:%313, key:%308) : index\n",
+                "      dataflow.sync_recv %314 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "    } {dbgName = \"condition__1\"}\n",
+                "    uniform.yield\n",
+                "  }\n",
+                "}\n",
+            )
+        );
+
+        // `if (op_.getNumRegions() == num_of_regions) return false;` (`:418`) — the result is a fixpoint,
+        // and the pass would otherwise rebuild it on every run and never erase the original.
+        let mut again = FlatteningLocalRegionsTree::new();
+        assert_eq!(again.flatten(&flat, &mut values), None);
+    }
 }
 
-
-
-
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// ⛔ RE-CREATED ANCHOR. This unit's `crustify:todo:` marker was deleted without a
+// `/// Replaces:` ever appearing, which removed it from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e287_flatten
 // crustify:todo: e305_runOnOperation

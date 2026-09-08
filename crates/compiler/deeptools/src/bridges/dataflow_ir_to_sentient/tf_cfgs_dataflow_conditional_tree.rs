@@ -78,11 +78,15 @@
 //! Original files homed here: `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp`, `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp`
 
 use super::tf_program_units_reduction::HighPreference;
+use super::tf_utils::{CountedLoop, Iterations, create_for_op_with_additional_return_value};
+use super::vc_vector_chain_helper::ops_are_equivalent;
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::ProgramUnit;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
     self as dfir_op, Op as DfirOp, Val, affine, arith, scf, symbol,
 };
+use crate::islands::dataflow_ir::ty::ScalarTy;
 
 /// WHICH TRANSFORM MERGED THE OPERATIONS — the prefix a merged `dbgName` opens with.
 ///
@@ -647,10 +651,12 @@ impl<'u, A: Arch> CfgsDataflowConditionalTree<'u, A> {
 
 #[cfg(test)]
 mod unit_tests {
+    use super::super::tf_utils::{CountedBounds, LoopBound, LoopStep};
     use super::*;
     use crate::arch::Dd2;
     use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::dataflow_ir::print;
     use crate::islands::dataflow_ir::ty::{ElemType, IntegerSet, ScalarTy, Vector};
     use crate::units::{DfirUnit, Residency};
 
@@ -1372,7 +1378,11 @@ mod unit_tests {
         assert_eq!(
             arms_and_name(&third),
             (
-                [statement(20), DfirOp::Scf(scf::Op::Yield { operands: vec![c1] })].as_slice(),
+                [
+                    statement(20),
+                    DfirOp::Scf(scf::Op::Yield { operands: vec![c1] })
+                ]
+                .as_slice(),
                 [DfirOp::Scf(scf::Op::Yield { operands: vec![c2] })].as_slice(),
                 Some("CFGSM(SCF-If #2, SCF-If #3)"),
             ),
@@ -1428,13 +1438,7 @@ mod unit_tests {
             (Vec::new(), Vec::new()),
             "src",
         );
-        let mut dst = conditional(
-            Vec::new(),
-            vec![80],
-            None,
-            (Vec::new(), Vec::new()),
-            "dst",
-        );
+        let mut dst = conditional(Vec::new(), vec![80], None, (Vec::new(), Vec::new()), "dst");
 
         let mut before = String::new();
         crate::islands::dataflow_ir::print::emit(&mut before, &dst, 0);
@@ -1549,20 +1553,8 @@ mod unit_tests {
             (Some("src"), None, None),
             (Some("src"), Some("dst"), Some("CFGSM(src, dst)")),
         ] {
-            let mut src = conditional(
-                Vec::new(),
-                vec![70],
-                None,
-                (Vec::new(), Vec::new()),
-                "src",
-            );
-            let mut dst = conditional(
-                Vec::new(),
-                vec![80],
-                None,
-                (Vec::new(), Vec::new()),
-                "dst",
-            );
+            let mut src = conditional(Vec::new(), vec![70], None, (Vec::new(), Vec::new()), "src");
+            let mut dst = conditional(Vec::new(), vec![80], None, (Vec::new(), Vec::new()), "dst");
             *dfir_op::dbg_name_mut(&mut src).expect("an scf.if carries a name") =
                 src_name.map(str::to_owned);
             *dfir_op::dbg_name_mut(&mut dst).expect("an scf.if carries a name") =
@@ -1664,6 +1656,239 @@ mod unit_tests {
             dbg_name: None,
         })]);
         simplify_value_based_conditionals(&CfgsDataflowConditionalTree::new(&unit));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 284/384, 285/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 284/384 — THE PATTERN THE REFERENCE DRAWS AT `:98-104` REACHES THE HOIST: a conditional in the
+    /// then-arm and an equivalent one in the else-arm of the same parent, both side-effect-free and both
+    /// first in their block, so the legality triple at `:159-161` holds.
+    #[test]
+    #[should_panic(expected = "moveAncestorsToMaintainDominance")]
+    fn a_conditional_common_to_both_arms_reaches_the_hoist() {
+        let unit = unit_holding(vec![DfirOp::Scf(scf::Op::If {
+            cond: Val(0),
+            results: Vec::new(),
+            body: vec![if_on(Val(1))],
+            else_body: vec![if_on(Val(1))],
+            dbg_name: None,
+        })]);
+        let _ = hoist_common_conditionals(&CfgsDataflowConditionalTree::new(&unit), None);
+    }
+
+    /// 🎯 284/384 — AND TWO CONDITIONS THAT ARE DIFFERENT REGION ARGUMENTS ARE NOT COMMON. This is the
+    /// `/*all_block_args_are_equiv*/ false` entry 100 constructs the comparison with
+    /// (`.hpp:112-115`): with the default `true` these two `scf.if`s would compare EQUIVALENT and the
+    /// pass would hoist one conditional over another's condition.
+    #[test]
+    fn two_conditionals_on_different_conditions_are_not_common() {
+        let unit = unit_holding(vec![DfirOp::Scf(scf::Op::If {
+            cond: Val(0),
+            results: Vec::new(),
+            body: vec![if_on(Val(1))],
+            else_body: vec![if_on(Val(2))],
+            dbg_name: None,
+        })]);
+        assert!(
+            hoist_common_conditionals(&CfgsDataflowConditionalTree::new(&unit), None).is_none(),
+            "no pair is equivalent, so there is nothing to resume from"
+        );
+    }
+
+    /// ONE `simplify-conditional.mlir` CASE, AS THE LOOP AND THE CONDITIONAL ENTRY 285 IS HANDED.
+    ///
+    /// The conditional is `%16 = scf.if %12 -> (index)` (`:295-314`) with ONE level instead of four,
+    /// because `replaceIfOpByIterArg` never looks inside it — `parseConditional` did, and the sequence
+    /// it read is the [`YieldedSequence`] argument. ⚠️ The consumer `%17 =
+    /// dataflow.get_logical_memory_view %11, %16` (`:315`) spends a
+    /// [`Link`](crate::islands::dataflow_ir::link::Link) a unit test cannot mint (the limit
+    /// [`statement`] records), so what must be re-pointed at the iteration argument is an `arith` op
+    /// reading the same value.
+    fn a_sequence_yielding_loop(bounds: CountedBounds) -> (DfirOp, DfirOp) {
+        let conditional = DfirOp::Scf(scf::Op::If {
+            cond: Val(12),
+            results: vec![Val(16)],
+            body: vec![DfirOp::Scf(scf::Op::Yield {
+                operands: vec![Val(20)],
+            })],
+            else_body: vec![DfirOp::Scf(scf::Op::Yield {
+                operands: vec![Val(21)],
+            })],
+            dbg_name: None,
+        });
+        let consumer = DfirOp::Arith(arith::Op::MulI(arith::IntBinary {
+            result: Val(17),
+            lhs: Val(16),
+            rhs: Val(16),
+            ty: ScalarTy::Index,
+        }));
+        let body = |terminator| vec![conditional.clone(), consumer.clone(), terminator];
+        let loop_op = match bounds {
+            CountedBounds::Affine { lo, hi } => DfirOp::Affine(affine::Op::For {
+                iv: Val(29),
+                lo,
+                hi,
+                carried: Vec::new(),
+                body: body(DfirOp::Affine(affine::Op::Yield {
+                    operands: Vec::new(),
+                })),
+                dbg_name: None,
+            }),
+            CountedBounds::Scf { lo, hi, step } => DfirOp::Scf(scf::Op::For {
+                iv: Val(29),
+                lo,
+                hi,
+                step,
+                carried: Vec::new(),
+                body: body(DfirOp::Scf(scf::Op::Yield {
+                    operands: Vec::new(),
+                })),
+                dbg_name: None,
+            }),
+        };
+        (conditional, loop_op)
+    }
+
+    /// The three constants and the new loop, printed — everything entry 285 emits.
+    fn emitted(replacement: &IterArgReplacement) -> String {
+        let mut got = String::new();
+        if let IterArgReplacement::IterArg { before, op, .. } = replacement {
+            for one in before.iter().chain(core::iter::once(op)) {
+                print::emit(&mut got, one, 0);
+            }
+        }
+        got
+    }
+
+    /// 🎯 285/384 — THE VENDOR'S OWN OUTPUT FOR CASE 2, VERBATIM. `simplify-conditional.mlir:47-63`
+    /// freezes `%34 = arith.constant 0`, `%35 = arith.constant 1024`, `%36 = arith.constant 0` (entry
+    /// 264's now-dead affine fill), `%37 = affine.for %38 = 0 to 4 iter_args(%39 = %34) -> (index)`,
+    /// `%46 = arith.addi %39, %35` and `affine.yield %46` — and the values are minted from 34 so the
+    /// names line up with it. ⭐ THE GAP AT `%40` IS THE ERASED CONDITIONAL's clone: MLIR renumbers at
+    /// print time over live ops, this island prints the [`Val`] it was minted.
+    #[test]
+    fn the_vendor_affine_case_carries_the_sequence_in_a_new_iteration_argument() {
+        let (conditional, loop_op) = a_sequence_yielding_loop(CountedBounds::Affine {
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+        });
+        let mut vals = Values::default();
+        while vals.issued() < 34 {
+            vals.mint();
+        }
+
+        let replacement = replace_if_op_by_iter_arg(
+            ValueYieldingConditional::of(&conditional).expect("an scf.if binding one value"),
+            &CountedLoop::of(&loop_op).expect("an affine.for"),
+            Iterations::between(LoopBound(0), LoopBound(4), LoopStep::ONE),
+            YieldedSequence {
+                lb: YieldedIndex(0),
+                step: 1024,
+            },
+            &mut vals,
+        );
+
+        assert!(
+            matches!(&replacement, IterArgReplacement::IterArg { replacements, .. } if replacements.is_empty()),
+            "four iterations is not one, and the old loop bound no results"
+        );
+        assert_eq!(
+            emitted(&replacement),
+            concat!(
+                "%34 = arith.constant 0 : index\n",
+                "%35 = arith.constant 1024 : index\n",
+                "%36 = arith.constant 0 : index\n",
+                "%37 = affine.for %38 = 0 to 4 iter_args(%39 = %34) -> (index) {\n",
+                "  %41 = arith.muli %39, %39 : index\n",
+                "  %42 = arith.addi %39, %35 : index\n",
+                "  affine.yield %42 : index\n",
+                "}\n",
+            )
+        );
+    }
+
+    /// 🎯 285/384 — THE CORRECTED `scf.for` ARM, AND THE REGRESSION THE REFERENCE'S OWN EXPECTATION IS.
+    /// `simplify-conditional.mlir:73` freezes `scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49)`:
+    /// `start_val` landed in the LOWER BOUND and the iteration argument kept entry 264's fill of `1`,
+    /// which makes the sequence `1, 1025, 2049, 3073` where `seq_lb_` is 0. Here the bound stays `%4`
+    /// and the argument starts at `%47`; the dead fill `%49` is still emitted because entry 264 creates
+    /// it, so everything else about the print is the vendor's.
+    #[test]
+    fn the_scf_arm_initialises_the_argument_and_not_the_lower_bound() {
+        let (conditional, loop_op) = a_sequence_yielding_loop(CountedBounds::Scf {
+            lo: Val(4),
+            hi: Val(11),
+            step: Val(6),
+        });
+        let mut vals = Values::default();
+        while vals.issued() < 47 {
+            vals.mint();
+        }
+
+        let replacement = replace_if_op_by_iter_arg(
+            ValueYieldingConditional::of(&conditional).expect("an scf.if binding one value"),
+            &CountedLoop::of(&loop_op).expect("an scf.for"),
+            Iterations::between(LoopBound(0), LoopBound(4), LoopStep::ONE),
+            YieldedSequence {
+                lb: YieldedIndex(0),
+                step: 1024,
+            },
+            &mut vals,
+        );
+
+        assert_eq!(
+            emitted(&replacement),
+            concat!(
+                "%47 = arith.constant 0 : index\n",
+                "%48 = arith.constant 1024 : index\n",
+                "%49 = arith.constant 1 : index\n",
+                "%50 = scf.for %51 = %4 to %11 step %6 iter_args(%52 = %47) -> (index) {\n",
+                "  %54 = arith.muli %52, %52 : index\n",
+                "  %55 = arith.addi %52, %48 : index\n",
+                "  scf.yield %55 : index\n",
+                "}\n",
+            )
+        );
+    }
+
+    /// 🎯 285/384 — AND A ONE-TRIP LOOP TAKES A CONSTANT INSTEAD (`:622-630`), which is the vendor's
+    /// case 1: the `affine.for %29 = 0 to 1`'s conditional becomes `%31 = arith.constant 0 : index`
+    /// (`:42`) and the loop is left alone.
+    #[test]
+    fn a_one_trip_loop_takes_a_constant_instead() {
+        let (conditional, loop_op) = a_sequence_yielding_loop(CountedBounds::Affine {
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(1),
+        });
+        let mut vals = Values::default();
+        while vals.issued() < 31 {
+            vals.mint();
+        }
+
+        let replacement = replace_if_op_by_iter_arg(
+            ValueYieldingConditional::of(&conditional).expect("an scf.if binding one value"),
+            &CountedLoop::of(&loop_op).expect("an affine.for"),
+            Iterations::between(LoopBound(0), LoopBound(1), LoopStep::ONE),
+            YieldedSequence {
+                lb: YieldedIndex(0),
+                step: 1024,
+            },
+            &mut vals,
+        );
+
+        let IterArgReplacement::Constant { op, replacement } = replacement else {
+            panic!("one iteration is not four");
+        };
+        let mut got = String::new();
+        print::emit(&mut got, &op, 0);
+        assert_eq!(got, "%31 = arith.constant 0 : index\n");
+        assert_eq!(
+            replacement,
+            (Val(16), Val(31)),
+            "the conditional's own result, forwarded to the constant"
+        );
     }
 }
 
@@ -2549,8 +2774,6 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e284_hoistCommonConditionals
-// crustify:todo: e285_replaceIfOpByIterArg
 // crustify:todo: e347_topLevelConditionsMatch
 // crustify:todo: e348_singleOpBranchToYieldVal
 // crustify:todo: e349_isLoopInvariant
@@ -2621,5 +2844,349 @@ mod is_hoistable_tests {
 
         // `to_hoist->getBlock() != then_or_else_block` — the same op value, another block.
         assert!(!is_hoistable(&candidate, &clean));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 284/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE CONDITIONAL TREE'S REVERSE-BFS OVER CANDIDATE NODES — `CondNode::walk<kReverseBFS>(getRoot(),
+/// hoistCommon)` (`:184`).
+///
+/// ⛔ DEEPEST LEVEL FIRST, RIGHT-TO-LEFT WITHIN A LEVEL. `reverseBreadthFirstWalk` with
+/// `keep_order = false` pushes a BFS onto a stack and runs the action over that stack in reverse
+/// (`dcc/src/Analysis/OperationTree.cpp:200-237`), which is what lets one hoist expose a hoist out of
+/// the parent's parent (`:105-107`).
+/// ⛔ THE THEN- AND ELSE-NODES ARE LEVELS OF THEIR OWN, so a conditional's children sit TWO levels
+/// below it and one level holds `n1`'s then-group, `n1`'s else-group, `n2`'s two, in that order
+/// (`dcc/src/Analysis/ConditionalTree.cpp:195-198`). The walk rejects both node kinds and the root
+/// (`:120`), so dropping them from the level list keeps exactly the order they impose.
+fn reverse_bfs_candidates(body: &[DfirOp]) -> Vec<&DfirOp> {
+    let mut levels: Vec<Vec<&DfirOp>> = Vec::new();
+    // The root's own children — [`sibling_group`] is `findClosestParent`, so a conditional under an
+    // unselected loop is one of them.
+    let mut level: Vec<&DfirOp> = Vec::new();
+    sibling_group(body, &mut level);
+
+    while !level.is_empty() {
+        let mut next: Vec<&DfirOp> = Vec::new();
+        for n in &level {
+            // `then` before `else`, the order `getRegions()` indexes them in.
+            for region in dfir_op::regions(n) {
+                sibling_group(region, &mut next);
+            }
+        }
+        levels.push(level);
+        level = next;
+    }
+
+    levels
+        .iter()
+        .rev()
+        .flat_map(|level| level.iter().rev().copied())
+        .collect()
+}
+
+/// Replaces: e284_hoistCommonConditionals
+///
+/// `CFGSDataflowConditionalTree::hoistCommonConditionals` (`:94`) — find one conditional that occurs
+/// equivalently in BOTH arms of a parent conditional, hoist the then-copy out in front of the parent,
+/// point the else-copy's users at it, and return the parent so the next call resumes there.
+///
+/// ⛔ ONE HOIST PER CALL, AND `cur_parent_if_op_of_hoist` IS BOTH THE ANSWER AND THE GUARD — but it is
+/// tested only on NODE ENTRY (`:120`), so the `child_a` x `child_b` search that set it runs to
+/// completion and may hoist again out of the SAME node (`:107-109`, *"finish analyzing the current
+/// node"*).
+/// ⛔ `nodes_to_skip` IS DECLARED INSIDE THE `child_a` LOOP (`:139`): an else-child skipped for one
+/// then-child is offered again to the next, so the same op can be hoisted and queued for deletion
+/// twice. ⛔ `n->isLeaf()`, `isThenNode()` and `isElseNode()` are dead or absent here for the reasons
+/// entry 380 records; BOTH ARMS HOLDING A CONDITIONAL (`:125`) is the live part of that filter.
+/// ⭐ THE NODE IS NAMED BY THE BORROW, compared with `core::ptr::eq` — the reference compares
+/// `Operation *` by address (`:129`), and entry 244 already names a position that way.
+/// ⚠️ `moveAncestorsToMaintainDominance` (`:163`), `deleteAncestorsIfPossible` (`:187`), `recompute`
+/// and `clearCache` (`:188-190`) all live in `dcc/src/Analysis/` — outside bridge 2's 384 — so this
+/// stops at the first, as entries 380 and 381 stop at theirs.
+#[must_use]
+pub fn hoist_common_conditionals<'u, A: Arch>(
+    tree: &CfgsDataflowConditionalTree<'u, A>,
+    if_op_where_last_hoist_occurred: Option<&DfirOp>,
+) -> Option<&'u DfirOp> {
+    // `:96` — what a hoist leaves for the deletion pass, and `:115` the guard that is also the answer.
+    let ops_to_delete: Vec<&'u DfirOp> = Vec::new();
+    let cur_parent_if_op_of_hoist: Option<&'u DfirOp> = None;
+    // `:119` — `bool start_analysis = (if_op_where_last_hoist_occurred == nullptr);`
+    let mut start_analysis = if_op_where_last_hoist_occurred.is_none();
+
+    for n in reverse_bfs_candidates(&tree.unit.body) {
+        // `:120-122` — every LATER node is skipped once a hoist has happened.
+        if cur_parent_if_op_of_hoist.is_some() {
+            continue;
+        }
+
+        // `:123-125` — the then- and else-nodes, each of which must hold a conditional of its own.
+        let regions = dfir_op::regions(n);
+        let [then_block, else_block] = regions.as_slice() else {
+            continue;
+        };
+        let mut then_children: Vec<&DfirOp> = Vec::new();
+        sibling_group(then_block, &mut then_children);
+        let mut else_children: Vec<&DfirOp> = Vec::new();
+        sibling_group(else_block, &mut else_children);
+        if then_children.is_empty() || else_children.is_empty() {
+            continue;
+        }
+
+        // `:127-134` — `DT_CHECK_MSG(n_if_op, ..)` is discharged by the node BEING the op here; then
+        // resume at the node the previous call returned, and look at nothing before it.
+        if if_op_where_last_hoist_occurred.is_some_and(|prev| core::ptr::eq(prev, n)) {
+            start_analysis = true;
+        }
+        if !start_analysis {
+            continue;
+        }
+
+        // `:138-142` — every (then-child, else-child) pair, in order.
+        for child_a in &then_children {
+            // `:139` — ⛔ HERE, so it is empty again for every `child_a`.
+            let nodes_to_skip: Vec<&DfirOp> = Vec::new();
+            for child_b in &else_children {
+                // `:143`
+                if nodes_to_skip
+                    .iter()
+                    .any(|skip| core::ptr::eq(*skip, *child_b))
+                {
+                    continue;
+                }
+
+                // `:159-161` — the legality triple. `op_a && op_b` is vacuous in this representation,
+                // and the two blocks are `n`'s own then/else regions, not a nested loop's.
+                if ops_are_equivalent(
+                    child_a,
+                    child_b,
+                    &tree.unit.body,
+                    tree.oe.preference,
+                    tree.oe.block_args,
+                ) && is_hoistable(child_a, then_block)
+                    && is_hoistable(child_b, else_block)
+                {
+                    // `:163` — where the hoist begins, and with it `:166-176`.
+                    todo!(
+                        "moveAncestorsToMaintainDominance is unported \
+                         (dcc/src/Analysis/TransformationConditionalTree.cpp:141, outside bridge 2), \
+                         so the {:?} common to both arms of the {:?} on {:?} cannot be moved out; \
+                         {} op(s) already queued for deletion under {:?}",
+                        ConditionalKind::of(child_a),
+                        ConditionalKind::of(n),
+                        tree.unit.on.kind(),
+                        ops_to_delete.len(),
+                        tree.oe
+                    );
+                }
+            }
+        }
+    }
+
+    // `:187` — `for (auto *op : ops_to_delete) deleteAncestorsIfPossible(op);`, unported with the hoist
+    // that fills the list; `:188-191` recomputes the tree and clears the cache and returns the parent.
+    drop(ops_to_delete);
+    cur_parent_if_op_of_hoist
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 285/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE ARITHMETIC SEQUENCE A VALUE-BASED CONDITIONAL YIELDS — `seq_lb_` and `seq_step_`
+/// (`CFGSDataflowConditionalTree.hpp:49-52`), which `parseConditional` derives from `val_array_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YieldedSequence {
+    /// `seq_lb_` — what the loop's first iteration yields.
+    pub lb: YieldedIndex,
+    /// `seq_step_` — the difference between what consecutive iterations yield.
+    pub step: i64,
+}
+
+/// A CONDITIONAL THAT BINDS A VALUE.
+///
+/// ⛔ THE MANAGER'S CONSTRUCTOR REJECTS ONE THAT BINDS NONE (`.hpp:59-62`), which is what makes
+/// `if_op_->getResult(0)` (`:628`, `:668`) a read rather than a dereference of nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueYieldingConditional<'a> {
+    /// `if_op_` — `top_node_->getOperation()`.
+    pub op: &'a DfirOp,
+    /// `if_op_->getResult(0)`, the value every use of the conditional reads.
+    pub yielded: Val,
+}
+
+impl<'a> ValueYieldingConditional<'a> {
+    /// The conditional, or [`None`] where it is not one or binds nothing.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<ValueYieldingConditional<'a>> {
+        ConditionalKind::of(op)?;
+        let yielded = *dfir_op::results(op).first()?;
+        Some(ValueYieldingConditional { op, yielded })
+    }
+}
+
+/// WHAT ENTRY 285 PUTS IN PLACE OF THE CONDITIONAL — its two arms are two different rewrites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IterArgReplacement {
+    /// `num_iterations == 1` (`:622-630`): one `arith.constant seq_lb` stands where the conditional
+    /// stood.
+    Constant {
+        /// The constant, built at `OpBuilder(if_op_)` — immediately before the conditional it replaces.
+        op: DfirOp,
+        /// `if_op_->getResult(0).replaceAllUsesWith(replacement)` (`:628`), old then new.
+        replacement: (Val, Val),
+    },
+    /// Otherwise (`:631-673`): the loop one iteration argument wider, the conditional gone from its
+    /// body and its uses reading that argument.
+    IterArg {
+        /// `start_val`, `step_val` and entry 264's own fill, in creation order — they go where the
+        /// old loop stood (`:635-639`, `Utils.cpp:41-45`).
+        before: Vec<DfirOp>,
+        /// The new loop, which replaces the old one.
+        op: DfirOp,
+        /// `loop_op->getResult(i).replaceAllUsesWith(ret_op->getResult(i))` (`Utils.cpp:82-83`) — the
+        /// OLD loop's results, whose users are outside the body this rewrote.
+        replacements: Vec<(Val, Val)>,
+    },
+}
+
+/// `Value::replaceAllUsesWith` FOLLOWED BY `Operation::erase`, over a region tree — what `:667-669`
+/// does to the marked conditional once the walk has found it.
+fn erase_and_forward(scope: &mut Vec<DfirOp>, from: Val, to: Val) {
+    scope.retain(|op| !dfir_op::results(op).contains(&from));
+    for op in scope.iter_mut() {
+        dfir_op::replace_uses_of_with(op, from, to);
+        for region in dfir_op::regions_mut(op) {
+            erase_and_forward(region, from, to);
+        }
+    }
+}
+
+/// Replaces: e285_replaceIfOpByIterArg
+///
+/// `ConditionalSimplificationManager::replaceIfOpByIterArg` (`:619`) — replace a conditional that
+/// yields a fixed-stride sequence of its loop's induction variable by a new iteration argument of that
+/// loop carrying the same sequence.
+///
+/// ⛔ A ONE-TRIP LOOP TAKES NEITHER (`:622-630`): the sequence is one value, so an `arith.constant
+/// seq_lb_` replaces the conditional and the loop is left alone.
+/// ⛔⛔ THE REFERENCE MISWIRES THE `scf.for` ARM, AND ITS OWN FROZEN EXPECTATION SHOWS IT.
+/// `new_for_op->setOperand(num_iter_args - 1, start_val)` (`:659`) indexes the RAW operand list: an
+/// `affine.for` with constant bounds carries its inits first, so operand 0 IS the added init — but
+/// `scf.for`'s operands are `lb, ub, step, inits..`, so operand 0 is its LOWER BOUND.
+/// `simplify-conditional.mlir:73` prints `scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49)`:
+/// `%47` is `start_val` landed in the lower bound while the iteration argument still reads `%49`,
+/// entry 264's scf fill of **1**, so the sequence comes out `1, 1025, 2049, 3073` where `seq_lb_ = 0`.
+/// This port initialises the added argument with `seq_lb_` in both dialects and leaves the bounds
+/// alone; the affine arm stays byte-identical to `:52-53`.
+/// ⭐ THE MARKER ATTRIBUTE IS THE `ir_map`. `IF_OP_TO_BE_REPLACED_BY_ITER_ARG` (`:26`, `:633`, `:667`)
+/// exists only to find `if_op_`'s CLONE inside the new loop; entry 264's mapping names that
+/// correspondence directly, so `delete_op` is passed `false` to read it and no island attribute is
+/// invented. ⭐ `for_op` AND `iterations` ARE `std::get<0>` AND `std::get<4>` OF `for_op_tuple_`
+/// (`:620-621`), split because entry 264 takes a [`CountedLoop`] — which is also the `dyn_cast` pair
+/// at `:645-655` and makes `DT_ERROR("no matching for operation")` (`:656`) unwritable.
+#[must_use]
+pub fn replace_if_op_by_iter_arg(
+    if_op: ValueYieldingConditional<'_>,
+    for_op: &CountedLoop<'_>,
+    iterations: Iterations,
+    sequence: YieldedSequence,
+    vals: &mut Values,
+) -> IterArgReplacement {
+    // `:622` — `if (num_iterations == 1)`.
+    if iterations.get() == 1 {
+        let result = vals.mint();
+        return IterArgReplacement::Constant {
+            // `:625-626` — `arith::ConstantIndexOp::create(builder, if_op_->getLoc(), seq_lb_)`.
+            op: DfirOp::Arith(arith::Op::Constant {
+                result,
+                value: sequence.lb.0,
+            }),
+            // `:628-629` — the uses, then `if_op_->erase()`.
+            replacement: (if_op.yielded, result),
+        };
+    }
+
+    // `:635-639` — both constants at `OpBuilder(for_op)`, i.e. immediately before the loop. `:632-634`
+    // marks the conditional, which is the `ir_map` below.
+    let start_val = vals.mint();
+    let step_val = vals.mint();
+    let mut before = vec![
+        DfirOp::Arith(arith::Op::Constant {
+            result: start_val,
+            value: sequence.lb.0,
+        }),
+        DfirOp::Arith(arith::Op::Constant {
+            result: step_val,
+            value: sequence.step,
+        }),
+    ];
+
+    // `:641-643` — one more return value, and `delete_op` false so the mapping comes back.
+    let widened = create_for_op_with_additional_return_value(vals, for_op, 1, false);
+    before.extend(widened.consts);
+    let mut op = widened.op;
+    // `IRMapping ir_map;` — [`Some`] because `delete_op` was false; the empty default is unreachable.
+    let ir_map = widened.ir_map.unwrap_or_default();
+
+    match &mut op {
+        DfirOp::Affine(affine::Op::For { carried, body, .. })
+        | DfirOp::Scf(scf::Op::For { carried, body, .. }) => {
+            // `:659` — the added init. ⛔ THE REFERENCE WRITES OPERAND `num_iter_args - 1`; see the
+            // anchor for why that is `scf.for`'s lower bound and this is the argument it meant.
+            if let Some(added) = carried.last_mut() {
+                added.init = start_val;
+            }
+            // `:648`, `:653` — `getRegionIterArgs()[num_iter_args - 1]`; entry 264 appended exactly one.
+            let replacement = carried.last().map_or(start_val, |added| added.arg);
+
+            // `:666-673` — the walk that finds the marked conditional in the new body, re-points its
+            // uses at the iteration argument and erases it.
+            if let Some(cloned) = ir_map.lookup(if_op.yielded) {
+                erase_and_forward(body, cloned, replacement);
+            }
+
+            // `:661-663` — `AddIOp(replacement, step_val)` immediately before the terminator, whose
+            // last operand — `num_iter_args - 1` of a yield, which carries exactly those — becomes it.
+            let sum = vals.mint();
+            let at = body.len().saturating_sub(1);
+            body.insert(
+                at,
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: sum,
+                    lhs: replacement,
+                    rhs: step_val,
+                    ty: ScalarTy::Index,
+                })),
+            );
+            if let Some(
+                DfirOp::Affine(affine::Op::Yield { operands })
+                | DfirOp::Scf(scf::Op::Yield { operands }),
+            ) = body.last_mut()
+                && let Some(last) = operands.last_mut()
+            {
+                *last = sum;
+            }
+        }
+        // ⭐ UNREACHABLE BY CONSTRUCTION: entry 264 emits one of those two `for`s and nothing else.
+        DfirOp::Affine(_)
+        | DfirOp::Scf(_)
+        | DfirOp::Arith(_)
+        | DfirOp::Dataflow(_)
+        | DfirOp::Agen(_)
+        | DfirOp::Vector(_)
+        | DfirOp::VectorChain(_)
+        | DfirOp::Symbol(_)
+        | DfirOp::Uniform(_) => {}
+    }
+
+    IterArgReplacement::IterArg {
+        before,
+        op,
+        replacements: widened.replacements,
     }
 }

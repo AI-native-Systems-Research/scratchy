@@ -82,6 +82,7 @@
 //!
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp`
 
+use super::tf_cfgs_dataflow_conditional_tree::BlockArgEquivalence;
 use super::tf_program_units_reduction::HighPreference;
 use super::vc_operand_reuse::{DataId, DataOriginId, OperandReuse};
 use super::vc_vector_operands::VectorOperand;
@@ -369,6 +370,7 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             // data — see [`dfir_op::dataflow::Op::GetUnitCollection`].
             | dfir_op::dataflow::Op::GetUnitCollection { .. }
             | dfir_op::dataflow::Op::GetMyUnitInCollection { .. }
+            | dfir_op::dataflow::Op::GetTotalUnitsInCollection { .. }
             | dfir_op::dataflow::Op::ProgramCollection { .. }
             | dfir_op::dataflow::Op::SyncSend { .. }
             | dfir_op::dataflow::Op::SyncRecv { .. }
@@ -760,11 +762,13 @@ pub fn fuse_compare_and_select_into_min_or_max(
     // `dcc::OperationEquivalence oe;` — the three-argument constructor, which leaves `functor_`
     // default-constructed and so null.
     let no_functor = HighPreference::None;
-    let same_pair_matching = ops_are_equivalent(lhs_def, op1_def, scope, no_functor)
-        && ops_are_equivalent(rhs_def, op2_def, scope, no_functor);
+    // `all_block_args_are_equiv` is the same constructor's third default.
+    let any_block_arg = BlockArgEquivalence::AllEquivalent;
+    let same_pair_matching = ops_are_equivalent(lhs_def, op1_def, scope, no_functor, any_block_arg)
+        && ops_are_equivalent(rhs_def, op2_def, scope, no_functor, any_block_arg);
     let opposite_pair_matching = !same_pair_matching
-        && ops_are_equivalent(lhs_def, op2_def, scope, no_functor)
-        && ops_are_equivalent(rhs_def, op1_def, scope, no_functor);
+        && ops_are_equivalent(lhs_def, op2_def, scope, no_functor, any_block_arg)
+        && ops_are_equivalent(rhs_def, op1_def, scope, no_functor, any_block_arg);
 
     // `if (!same_pair_matching && !opposite_pair_matching) return;`
     if !same_pair_matching && !opposite_pair_matching {
@@ -800,6 +804,11 @@ pub fn fuse_compare_and_select_into_min_or_max(
 /// e065 and every other site but one. Entry 193 is the exception, and it is a second caller of this
 /// function: see [`HighPreference::prefers`].
 ///
+/// ⛔ `block_args` IS A PARAMETER AND NOT A DEFAULT, because one site overrides it: every conditional
+/// tree constructs its comparison with `/*all_block_args_are_equiv*/ false`
+/// (`CFGSDataflowConditionalTree.hpp:112-115`, entry 100), and entry 284 compares two `scf.if`s whose
+/// conditions are region arguments. Baking in the constructor default would merge two loops.
+///
 /// The reference's shape, in order: same pointer ⇒ true; dialect, name, result count, operand count,
 /// region count, successor count and result types must match; attribute dictionaries compared
 /// pairwise with `dbgName` filtered out and `AffineMapAttr`/`IntegerSetAttr` given value comparisons;
@@ -831,6 +840,7 @@ pub(crate) fn ops_are_equivalent(
     b: &DfirOp,
     scope: &[DfirOp],
     preference: HighPreference,
+    block_args: BlockArgEquivalence,
 ) -> bool {
     // `if (&op_a == &op_b) return true;` — also the recursion's cycle guard.
     if core::ptr::eq(a, b) {
@@ -860,13 +870,19 @@ pub(crate) fn ops_are_equivalent(
             // mismatch; otherwise ask whether the two definitions compute the same thing.
             (Some(def_a), Some(def_b)) => {
                 if core::ptr::eq(def_a, def_b)
-                    || !ops_are_equivalent(def_a, def_b, scope, preference)
+                    || !ops_are_equivalent(def_a, def_b, scope, preference, block_args)
                 {
                     return false;
                 }
             }
-            // Both are region arguments: equivalent, because `all_block_args_are_equiv_` is true.
-            (None, None) => {}
+            // Both are region arguments. `all_block_args_are_equiv_` accepts any pair (`:292-293`);
+            // ⛔ `false` DEMANDS THE SAME ARGUMENT OF THE SAME OWNER (`:294-300`) AND NO LOOKUP CAN
+            // SAY YES HERE: two distinct [`Val`]s are never one argument of one region, and the equal
+            // pair was taken by `read_a == read_b` above.
+            (None, None) => match block_args {
+                BlockArgEquivalence::AllEquivalent => {}
+                BlockArgEquivalence::SameOwnerAndIndex => return false,
+            },
             // One of each is a mismatch.
             (Some(_), None) | (None, Some(_)) => return false,
         }
@@ -879,7 +895,7 @@ pub(crate) fn ops_are_equivalent(
             return false;
         }
         for (inner_a, inner_b) in region_a.iter().zip(region_b.iter()) {
-            if !ops_are_equivalent(inner_a, inner_b, scope, preference) {
+            if !ops_are_equivalent(inner_a, inner_b, scope, preference, block_args) {
                 return false;
             }
         }

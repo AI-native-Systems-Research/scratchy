@@ -1064,9 +1064,58 @@ still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exact
 span is still open on paper while its Rust is landed. Ticking them is the reviewing pass's job for those
 spans, not this one's.
 
+## 281-288 — the reference's own `CHECK` line proves the `scf` arm sets the wrong operand
+
+Eight entries, 5 `/// Replaces:` anchors in this batch's own homes plus 3 more, 0 surviving
+`// crustify:todo:` for 281-288, 16/16 PORT/AUDIT boxes `[x]`.
+
+⛔⛔ **285 IS A CITED REFERENCE DEFECT, AND THE VENDOR'S EXPECTATION FILE IS THE PROOF.**
+`replaceIfOpByIterArg` writes the sequence's lower bound with
+`new_for_op->setOperand(num_iter_args - 1, start_val)` (`CFGSDataflowConditionalTree.cpp:659`), an index
+into the RAW operand list. For `affine::AffineForOp` that list is `[lbOperands…, ubOperands…,
+initArgs…]` and constant bounds contribute none, so `num_iter_args - 1` does land on the added iteration
+argument. For `scf::ForOp` it is `[lowerBound, upperBound, step, initArgs…]`, and with one iteration
+argument `num_iter_args - 1 == 0` — the **lower bound**. `simplify-conditional.mlir:73` freezes exactly
+that: `scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49)`, where `%47` is `start_val` sitting in the
+lower bound and `%49` is entry 264's fill of `1` still initialising the argument, so the sequence
+`seq_lb_ = 0, seq_step_ = 1024` comes out `1, 1025, 2049, 3073`. The affine expectation at `:52-53` has
+`iter_args(%39 = %34)` and is correct. Per the translator playbook's equivalence clause the port
+initialises the added argument in BOTH dialects and leaves the bounds alone; the affine arm stays
+byte-identical to the vendor and the `scf` arm has a regression test naming `:73`.
+
+⭐ **THE MARKER ATTRIBUTE IS MECHANISM.** `IF_OP_TO_BE_REPLACED_BY_ITER_ARG` (`:634-635`, walked at
+`:665-673`) exists only to find the conditional's CLONE in the new loop body. Entry 264 already returns
+an `ir_map` naming that correspondence, so the port looks the clone up and no island attribute was
+invented — the same reason `delete_op` is `false` there.
+
+⛔ **284's HOIST STOPS AT `moveAncestorsToMaintainDominance`** (`TransformationConditionalTree.cpp:141`),
+which is outside the 384. The traversal, the resume test, both legality triples and the delete list are
+ported; the move is a `todo!` naming it, as 380/381 already do. Three traps recorded: the
+`cur_parent_if_op_of_hoist` guard is tested on node ENTRY only, so the node that hoists finishes its
+whole `child_a` sweep and can hoist twice; `nodes_to_skip` is declared INSIDE the `child_a` loop
+(`:140`), so one `op_b` can be hoisted against two different `op_a`s; and `n->isLeaf()`,
+`isThenNode()`, `isElseNode()` are unrepresentable here because this island has no `CondThenNode`
+level — the reverse-BFS levels are built from `regions()` directly, then/else skipped exactly as the
+reference's own filter skips them.
+
+⭐ **`ops_are_equivalent` GREW A FIFTH PARAMETER, `block_args: BlockArgEquivalence`** — ten call sites,
+eight of which pass `AllEquivalent` and are unchanged in behaviour, because two distinct `Val`s are
+never one region's one argument and the equal case is taken by the `read_a == read_b` arm above it. It
+is what makes 284 reject two conditionals on different, externally-defined conditions, which with the
+default `true` would compare equivalent and hoist one conditional over another's condition.
+
+⛔ **286 AND 288 ARE BOTH IN `LLVM_OPTIONAL_SOURCES` AND NEITHER HAS EVER BUILT**
+(`Transform/Dataflow/CMakeLists.txt:5-7`). 288's `DT_CHECK` at `:143-146` proves it: it hands a
+`std::string` to `senCompToGenericComp.find`, whose key type is `SenComponents`
+(`sys-arch-spec/arch_enums.h:130`) — ill-formed. So there is no vendor expectation for either, and
+286's `if (!type) return;` (`:105`) is recorded as what it is: a return from the **pass**, not from a
+walk lambda, so one total-units op reading a non-collection abandons every later fold and the whole
+collection expansion with no diagnostic. `dataflow::Op::GetTotalUnitsInCollection` was added to the
+island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td` for the same reason).
+
 ## Progress
 
-`257/384 ported; 257/384 audited`
+`265/384 ported; 265/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -2732,22 +2781,22 @@ generation.
 - [ ] **AUDIT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, line by line against the C++
 - [ ] **PORT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, 7 lines
 - [ ] **AUDIT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, line by line against the C++
-- [ ] **PORT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, 2 lines
-- [ ] **AUDIT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, line by line against the C++
-- [ ] **PORT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, 4 lines
-- [ ] **AUDIT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, line by line against the C++
-- [ ] **PORT 283/384** `updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28`, 9 lines
-- [ ] **AUDIT 283/384** `updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28`, line by line against the C++
-- [ ] **PORT 284/384** `hoistCommonConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:94`, 96 lines
-- [ ] **AUDIT 284/384** `hoistCommonConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:94`, line by line against the C++
-- [ ] **PORT 285/384** `replaceIfOpByIterArg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:619`, 56 lines
-- [ ] **AUDIT 285/384** `replaceIfOpByIterArg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:619`, line by line against the C++
-- [ ] **PORT 286/384** `runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94`, 32 lines
-- [ ] **AUDIT 286/384** `runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94`, line by line against the C++
-- [ ] **PORT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, 70 lines
-- [ ] **AUDIT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, line by line against the C++
-- [ ] **PORT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, 22 lines
-- [ ] **AUDIT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, line by line against the C++
+- [x] **PORT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, 2 lines
+- [x] **AUDIT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, line by line against the C++
+- [x] **PORT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, 4 lines
+- [x] **AUDIT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, line by line against the C++
+- [x] **PORT 283/384** `updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28`, 9 lines
+- [x] **AUDIT 283/384** `updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28`, line by line against the C++
+- [x] **PORT 284/384** `hoistCommonConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:94`, 96 lines
+- [x] **AUDIT 284/384** `hoistCommonConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:94`, line by line against the C++
+- [x] **PORT 285/384** `replaceIfOpByIterArg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:619`, 56 lines
+- [x] **AUDIT 285/384** `replaceIfOpByIterArg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:619`, line by line against the C++
+- [x] **PORT 286/384** `runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94`, 32 lines
+- [x] **AUDIT 286/384** `runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94`, line by line against the C++
+- [x] **PORT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, 70 lines
+- [x] **AUDIT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, line by line against the C++
+- [x] **PORT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, 22 lines
+- [x] **AUDIT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, line by line against the C++
 - [ ] **PORT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, 8 lines
 - [ ] **AUDIT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, line by line against the C++
 - [ ] **PORT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, 10 lines

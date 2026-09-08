@@ -60,22 +60,15 @@
 //! | `e282_updateLoopMaskTreeForConstantMask` | 282/384 | 4 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20` |
 //! | `e283_updateLoopMaskTreeForDynamicMask` | 283/384 | 9 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28` |
 
-
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e282_updateLoopMaskTreeForConstantMask
-// crustify:todo: e283_updateLoopMaskTreeForDynamicMask
-
 use std::collections::VecDeque;
 
 use super::vc_loop_mask_tree::{
-    LoopMaskNode, LoopMaskNodeId, LoopMaskTree, MaskIncrement, MaskNodeId, MaskedColumns,
+    LoopMaskNode, LoopMaskNodeId, LoopMaskTree, MaskIncrement, MaskNode, MaskNodeId, MaskedColumns,
 };
 use super::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::dialects::{self as sen, sentient};
+use crate::islands::sentient::dialects::{self as sen, Val, sentient};
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 239/384
@@ -513,5 +506,185 @@ mod insert_pt_mask_ops_tests {
             &body[2],
             sen::Op::Sentient(sentient::Op::Yield { .. })
         ));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 282/384 · 283/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `op->getParentOfType<sentient::ForOp>()` OVER AN [`OpId`] — the innermost enclosing `sentient.for`,
+/// found by shortening the path rather than by following a parent pointer.
+fn parent_for_op(body: &[sen::Op], op: &OpId) -> Option<OpId> {
+    let path = op.path();
+    (1..path.len()).rev().find_map(|len| {
+        let candidate = OpId::at(&path[..len]);
+        matches!(
+            op_at(&candidate, body),
+            Some(sen::Op::Sentient(sentient::Op::For { .. }))
+        )
+        .then_some(candidate)
+    })
+}
+
+/// `val.getParentRegion()->getParentOp()` FOR A LOOP ITERATOR — the position of the `sentient.for`
+/// binding `val` as its induction variable, `prefix`/`first` numbering the block as [`OpId`] does.
+fn loop_owning_iterator(scope: &[sen::Op], val: Val, prefix: &[u32], first: u32) -> Option<OpId> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path: Vec<u32> = prefix.to_vec();
+        path.push(first + ordinal as u32);
+        let sen::Op::Sentient(inner) = op else {
+            continue;
+        };
+        if let sentient::Op::For { iv, .. } = inner
+            && *iv == val
+        {
+            return Some(OpId::at(&path));
+        }
+        let mut child = 0u32;
+        for region in sentient::regions(inner) {
+            if let Some(found) = loop_owning_iterator(region, val, &path, child) {
+                return Some(found);
+            }
+            child += region.len() as u32;
+        }
+    }
+    None
+}
+
+/// Replaces: e282_updateLoopMaskTreeForConstantMask
+///
+/// **282/384** `VectorChainToSentientPTLoweringPass::updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20` (4L).
+///
+/// A constant mask on `op` is recorded against the loop `op` sits in, or against the root when none
+/// encloses it — the reference's `parent_loop ? parent_loop.getOperation() : nullptr` (`:24-25`), whose
+/// null arm [`LoopMaskTree::add_mask_node`] already reads as *hang it off the root*.
+/// ⛔ `increment` IS THE LITERAL `0` AT THIS CALL, never a parameter — [`MaskIncrement::Constant`].
+pub fn update_loop_mask_tree_for_constant_mask(
+    pt_masking_tree: &mut LoopMaskTree,
+    body: &[sen::Op],
+    op: &OpId,
+    mac_op: OpId,
+    mask_val: MaskedColumns,
+) -> Option<MaskNodeId> {
+    let parent_loop = parent_for_op(body, op);
+    pt_masking_tree.add_mask_node(
+        parent_loop.as_ref(),
+        mac_op,
+        MaskNode {
+            start_val: mask_val,
+            increment: MaskIncrement::Constant,
+        },
+    )
+}
+
+/// Replaces: e283_updateLoopMaskTreeForDynamicMask
+///
+/// **283/384** `VectorChainToSentientPTLoweringPass::updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28` (9L).
+///
+/// A dynamic mask is recorded against the loop whose iterator drives it.
+/// ⛔ `None` OUT IS ALL THREE `DT_CHECK`s AT ONCE — *"expecting a block argument"*,
+/// *"expecting either no parent op or a sentient::ForOp"* and *"val should be the loop iterator"*
+/// (`:31-36`) are one question over this island: is `val` the induction variable of some
+/// `sentient.for` in this unit. ⚠️ THE `!parent_op ||` ARM IS DEAD in the reference — the very next
+/// line `cast<ForOp>(nullptr)`s — so an unparented `val` declines here rather than hanging off the root.
+pub fn update_loop_mask_tree_for_dynamic_mask(
+    pt_masking_tree: &mut LoopMaskTree,
+    body: &[sen::Op],
+    val: Val,
+    mac_op: OpId,
+    start_val: MaskedColumns,
+    increment: MaskIncrement,
+) -> Option<MaskNodeId> {
+    let parent_op = loop_owning_iterator(body, val, &[], 0)?;
+    pt_masking_tree.add_mask_node(
+        Some(&parent_op),
+        mac_op,
+        MaskNode {
+            start_val,
+            increment,
+        },
+    )
+}
+
+#[cfg(test)]
+mod update_loop_mask_tree_tests {
+    use super::*;
+
+    /// `dynamic_pt_masking.mlir:215-317`'s shape: a `sentient.vector_mac` inside a `sentient.for`,
+    /// masked once by a constant and once by that loop's own iterator.
+    #[test]
+    fn both_masks_hang_off_the_enclosing_loop_and_a_stray_iterator_declines() {
+        let mut vals = Values::default();
+        let iv = vals.mint();
+        let mac = sen::Op::Sentient(sentient::Op::VectorMac {
+            mask: None,
+            xrf_write_ptr: None,
+            xrf_read_ptr: None,
+            results: Vec::new(),
+            op_a: sentient::Operand::from(sentient::Port::Lx),
+            op_b: sentient::Operand::from(sentient::Port::Lx),
+            op_c: sentient::Operand::from(sentient::Port::Lx),
+            result: sentient::ResultPorts::default(),
+            mode: sentient::FmaMode::FusedMulAdd,
+            compute_precision: sentient::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            xrf_read_incr: 0,
+            xrf_write_incr: 0,
+            dbg_name: None,
+        });
+        let body = vec![sen::Op::Sentient(sentient::Op::For {
+            iv,
+            bound: vals.mint(),
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![mac],
+        })];
+        let mut tree = LoopMaskTree::new(&body);
+        let mac_id = OpId::at(&[0, 0]);
+
+        let constant = update_loop_mask_tree_for_constant_mask(
+            &mut tree,
+            &body,
+            &mac_id,
+            OpId::at(&[0, 0]),
+            MaskedColumns(3),
+        )
+        .expect("getParentOfType<ForOp> reaches the loop the mac sits in");
+        let dynamic = update_loop_mask_tree_for_dynamic_mask(
+            &mut tree,
+            &body,
+            iv,
+            OpId::at(&[0, 0]),
+            MaskedColumns(0),
+            MaskIncrement::PerParentLoopIteration,
+        )
+        .expect("getParentRegion()->getParentOp() reaches the loop binding the iterator");
+
+        // The two sides reach the SAME op: the loop node is both masks' parent, and each kept its
+        // own `increment`.
+        let loop_node = tree.first_child(tree.root()).expect("the loop node");
+        assert_eq!(tree.parent_node(constant.node()), Some(loop_node));
+        assert_eq!(tree.parent_node(dynamic.node()), Some(loop_node));
+        assert_eq!(constant.mask().increment, MaskIncrement::Constant);
+        assert_eq!(constant.mask().start_val, MaskedColumns(3));
+        assert_eq!(
+            dynamic.mask().increment,
+            MaskIncrement::PerParentLoopIteration
+        );
+
+        // A value no `sentient.for` binds as its iterator is all three `DT_CHECK`s at once.
+        assert_eq!(
+            update_loop_mask_tree_for_dynamic_mask(
+                &mut tree,
+                &body,
+                vals.mint(),
+                mac_id,
+                MaskedColumns(0),
+                MaskIncrement::PerParentLoopIteration,
+            ),
+            None
+        );
     }
 }
