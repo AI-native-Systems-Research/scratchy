@@ -143,9 +143,38 @@ pub fn stick_sizes(dims: &StickDims, part: StickPart) -> Vec<(PrimaryDim, Elemen
     result
 }
 
+/// Replaces: e071_getCumulativeStickSizes
+///
+/// [`stick_sizes`]' list folded to ONE extent per dim: a dim the stick names twice contributes the
+/// PRODUCT of its two extents, not the last one.
+///
+/// ⭐ THE `unordered_map` RETURN CARRIES NO ORDER, so the caller cannot have depended on one; this
+/// keeps first-appearance order, which is the stick's own dim order.
+///
+/// ⛔ AND THE PRODUCT IS THE ONE PLACE THIS CAN FAIL: the reference multiplies into an `int` and a
+/// split dim whose extents overflow it wraps silently. A width that cannot be counted is no answer
+/// at all.
+#[must_use]
+pub fn cumulative_stick_sizes(
+    dims: &StickDims,
+    part: StickPart,
+) -> Option<Vec<(PrimaryDim, Elements)>> {
+    let mut result: Vec<(PrimaryDim, Elements)> = Vec::new();
+    for (dim, extent) in stick_sizes(dims, part) {
+        if let Some(seen) = result.iter_mut().find(|(walked, _)| *walked == dim) {
+            seen.1 = Elements(seen.1.0.checked_mul(extent.0)?);
+        } else {
+            result.push((dim, extent));
+        }
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod unit_tests {
-    use super::{PrimaryDim, SliceElems, StickDims, StickPart, stick_sizes};
+    use super::{
+        PrimaryDim, SliceElems, StickDims, StickPart, cumulative_stick_sizes, stick_sizes,
+    };
     use crate::arch::{Dd2, Elements};
 
     /// THE PACKED fp8 KERNEL STICK — `[in:2, out:64]`, the one two-dim stick this bridge's own
@@ -183,5 +212,42 @@ mod unit_tests {
         // `numL0Slices` is `numPTRows`, 8 on this arch, so the L0 slice of this stick is the same 16.
         assert_eq!(SliceElems::per_l0_row::<Dd2>(&dims), Some(slice));
     }
+
+    /// ⛔ A SPLIT DIM IS A PRODUCT, NOT A REPLACEMENT — the only behaviour that distinguishes this
+    /// from `stick_sizes` at all.
+    #[test]
+    fn a_dim_the_stick_names_twice_folds_to_the_product_of_its_extents() {
+        // A stick blocked along `out`: the DDL is free to name one primary dim at two positions.
+        let split = StickDims(vec![
+            (PrimaryDim::Out, Elements(4)),
+            (PrimaryDim::In, Elements(3)),
+            (PrimaryDim::Out, Elements(8)),
+        ]);
+        assert_eq!(
+            cumulative_stick_sizes(&split, StickPart::Whole),
+            Some(vec![
+                (PrimaryDim::Out, Elements(32)),
+                (PrimaryDim::In, Elements(3)),
+            ])
+        );
+        // An unsplit stick is its own list.
+        let plain = StickDims(vec![
+            (PrimaryDim::In, Elements(2)),
+            (PrimaryDim::Out, Elements(64)),
+        ]);
+        assert_eq!(
+            cumulative_stick_sizes(&plain, StickPart::Whole),
+            Some(plain.0.clone())
+        );
+        assert_eq!(
+            cumulative_stick_sizes(&StickDims(Vec::new()), StickPart::Whole),
+            Some(Vec::new())
+        );
+        // ⛔ AND A PRODUCT THAT DOES NOT FIT IS NOT REPORTED AS A SMALL ONE.
+        let overflow = StickDims(vec![
+            (PrimaryDim::Out, Elements(u64::MAX)),
+            (PrimaryDim::Out, Elements(2)),
+        ]);
+        assert_eq!(cumulative_stick_sizes(&overflow, StickPart::Whole), None);
+    }
 }
-// crustify:todo: e071_getCumulativeStickSizes
