@@ -17,13 +17,16 @@
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
 use crate::arch::Arch;
-use crate::bridges::sentient_to_progir::state::{RegGraphs, UnitKey};
+use crate::bridges::sentient_to_progir::state::{Labels, OpSite, RegGraphs, UnitKey};
+use crate::bridges::sentient_to_progir::uniform::block::{InstrIndex, UniformInstrBlocks};
+use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
 use crate::bridges::sentient_to_progir::utils::{AddrSpace, addr_wraparounded};
 use crate::formats::Bits;
-use crate::islands::progir::RegInit;
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue, reg_file_of};
+use crate::islands::progir::{OpCode, OperandField, RegInit};
 use crate::islands::sentient::dialects::sentient::Reg;
 use crate::units::Core;
+use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::regfile::Component;
 use sys_arch_spec::values::OpUnit;
 
@@ -225,13 +228,100 @@ pub fn get_reg_imm_vals<A: Arch>(
     imm_vals
 }
 
-// crustify:todo: e093_AddToLabelsMap
-// crustify:todo: e094_updateLabelAndAddToCodeGraph
+/// WHICH INSTRUCTIONS JUMP TO EACH LABEL — the reference's
+/// `std::map<std::string, std::set<InstrIndex>>` (`LowerSentientHelper.cpp:34`), read back once every
+/// label's own instruction is known so each jump can be repointed at it.
+pub type LabelToJumps = BTreeMap<String, BTreeSet<InstrIndex>>;
+
+/// Replaces: e093_AddToLabelsMap
+///
+/// Records that the instruction about to be appended jumps to its `pc_target` label.
+///
+/// ⛔ NOTHING IS RECORDED WITHOUT A LABEL OR A BLOCK, where the reference's `asString` aborts on a
+/// jump carrying no `pc_target` and `getNextInstrIndex` reads `blocks_.back()` with no block at all.
+pub fn add_to_labels_map(
+    uniform_instr_region: &UniformInstrBlocks,
+    label_to_jumps: &mut LabelToJumps,
+    super_instr: &UniformInstrInfo,
+) {
+    let Some(label) = super_instr
+        .common_field(OperandField::PcTarget)
+        .and_then(|target| target.as_string(None))
+    else {
+        return;
+    };
+    let Some(index) = uniform_instr_region.next_instr_index() else {
+        return;
+    };
+    label_to_jumps
+        .entry(label.to_owned())
+        .or_default()
+        .insert(index);
+}
+
+/// WHETHER THE OP BEING LOWERED IS A `sentient.yield` — `isa<sentient::YieldOp>(op)`
+/// (`LowerSentientHelper.cpp:61`), half of the MVLOOP tail test.
+///
+/// ⛔ A TYPE RATHER THAN A SECOND `bool` beside `force_not_add_label`, which is one call away from
+/// silently swapping the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoweredOp {
+    /// `sentient.yield`.
+    Yield,
+    /// Any other op.
+    Other,
+}
+
+/// Replaces: e094_updateLabelAndAddToCodeGraph
+///
+/// Appends one instruction carrying the label its op claimed — except that an UNTAGGED NOP lowered
+/// from a `sentient.yield` merges into the instruction before it as that one's `be` (block end)
+/// instead, which is where an MVLOOP's tail goes.
+///
+/// ⛔ A TAG BLOCKS THE MERGE, and so does a predecessor that already has `be` or is the MVLOOPCNT
+/// holding the loop count. ⛔ AND THE MERGE READS THE LAST BLOCK'S **LAST** REGION, not its current.
+pub fn update_label_and_add_to_code_graph(
+    labels: &Labels,
+    uniform_instr_region: &mut UniformInstrBlocks,
+    at: OpSite,
+    op: LoweredOp,
+    mut super_instr: UniformInstrInfo,
+    force_not_add_label: bool,
+) {
+    let tag = if force_not_add_label {
+        None
+    } else {
+        labels.get(at).map(str::to_owned)
+    };
+    // Both conditions valid means it is coming from MVLOOP; a tag present means don't merge.
+    let is_instr_nop = super_instr.opcode == OpCode::NOP && op == LoweredOp::Yield;
+    if tag.is_none() && is_instr_nop {
+        let last_instr = uniform_instr_region
+            .blocks
+            .last_mut()
+            .and_then(|block| block.instr_lists_mut().last_mut())
+            .and_then(|region| region.last_mut());
+        if let Some(last_instr) = last_instr
+            && !last_instr.has_common_field(OperandField::Be)
+            && last_instr.opcode != OpCode::MVLOOPCNT
+        {
+            last_instr.set_common_field(
+                OperandField::Be,
+                Operand::every(OperandValue::Descriptive("be".to_owned())),
+            );
+            return;
+        }
+    }
+    super_instr.tag = tag;
+    uniform_instr_region.add_instruction_to_last_block(super_instr);
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
+    use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
+    use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlock;
     use crate::islands::progir::ty::PerFold;
     use crate::islands::sentient::dialects::sentient::RegIndex;
     use crate::islands::sentient::dialects::sentient::RegType;
@@ -387,5 +477,124 @@ mod unit_tests {
                 vec![(three, vec![(Some(FoldId(0)), expected)])]
             );
         }
+    }
+    /// e093: each jump is filed under the label it targets, at the index it will land on — and a jump
+    /// with no `pc_target` files nothing.
+    #[test]
+    fn every_jump_is_filed_under_the_label_it_targets() {
+        let mut blocks = UniformInstrBlocks::default();
+        let mut jump = UniformInstrInfo::of(OpCode::JCMP);
+        jump.set_common_field(
+            OperandField::PcTarget,
+            Operand::every(OperandValue::InstrTag("tgt_0".to_owned())),
+        );
+        let mut label_to_jumps = LabelToJumps::new();
+        add_to_labels_map(&blocks, &mut label_to_jumps, &jump);
+        assert!(label_to_jumps.is_empty(), "no block, no index to file");
+        blocks.add_instruction_to_last_block(UniformInstrInfo::of(OpCode::NOP));
+        add_to_labels_map(&blocks, &mut label_to_jumps, &jump);
+        blocks.add_instruction_to_last_block(jump.clone());
+        add_to_labels_map(&blocks, &mut label_to_jumps, &jump);
+        let at = |instr| InstrIndex {
+            block: 0,
+            region: RegionIndex(0),
+            instr,
+        };
+        assert_eq!(
+            label_to_jumps
+                .get("tgt_0")
+                .map(|jumps| jumps.iter().copied().collect::<Vec<_>>()),
+            Some(vec![at(1), at(2)])
+        );
+        add_to_labels_map(
+            &blocks,
+            &mut label_to_jumps,
+            &UniformInstrInfo::of(OpCode::JCMP),
+        );
+        assert_eq!(
+            label_to_jumps.len(),
+            1,
+            "a jump with no target files nothing"
+        );
+    }
+
+    /// e094: an untagged NOP from a yield becomes the previous instruction's `be`; a tagged one, or
+    /// one whose predecessor already ends its block, is appended instead.
+    #[test]
+    fn an_untagged_yield_nop_becomes_the_previous_instructions_block_end() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(1), "tgt_0".to_owned());
+        let nop = UniformInstrInfo::of(OpCode::NOP);
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.add_instruction_to_last_block(UniformInstrInfo::of(OpCode::MVLOOPCNT));
+        blocks.add_instruction_to_last_block(UniformInstrInfo::of(OpCode::LOGICAL));
+
+        // The MVLOOPCNT refuses the merge, so the NOP is appended after it.
+        let mut only_loop_count = blocks.clone();
+        only_loop_count.blocks[0] =
+            UniformInstrBlock::Regular(vec![UniformInstrInfo::of(OpCode::MVLOOPCNT)]);
+        update_label_and_add_to_code_graph(
+            &labels,
+            &mut only_loop_count,
+            OpSite(0),
+            LoweredOp::Yield,
+            nop.clone(),
+            false,
+        );
+        assert_eq!(only_loop_count.blocks[0].instr_lists()[0].len(), 2);
+
+        // The ADD takes it as `be`, and nothing is appended.
+        update_label_and_add_to_code_graph(
+            &labels,
+            &mut blocks,
+            OpSite(0),
+            LoweredOp::Yield,
+            nop.clone(),
+            false,
+        );
+        let merged = &blocks.blocks[0].instr_lists()[0];
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[1].common_field(OperandField::Be),
+            Some(&Operand::every(OperandValue::Descriptive("be".to_owned())))
+        );
+
+        // A second yield NOP cannot merge into an instruction that already has `be`.
+        update_label_and_add_to_code_graph(
+            &labels,
+            &mut blocks,
+            OpSite(0),
+            LoweredOp::Yield,
+            nop.clone(),
+            false,
+        );
+        assert_eq!(blocks.blocks[0].instr_lists()[0].len(), 3);
+
+        // A labelled op is appended with its tag, and `force_not_add_label` drops that tag.
+        update_label_and_add_to_code_graph(
+            &labels,
+            &mut blocks,
+            OpSite(1),
+            LoweredOp::Other,
+            nop.clone(),
+            false,
+        );
+        update_label_and_add_to_code_graph(
+            &labels,
+            &mut blocks,
+            OpSite(1),
+            LoweredOp::Other,
+            nop,
+            true,
+        );
+        let tags: Vec<Option<&str>> = blocks.blocks[0].instr_lists()[0]
+            .iter()
+            .map(|instr| instr.tag.as_deref())
+            .collect();
+        assert_eq!(
+            tags,
+            vec![None, None, None, Some("tgt_0"), None],
+            "only the labelled op that did not force the drop keeps a tag"
+        );
     }
 }

@@ -146,6 +146,25 @@ impl Operand {
         }
     }
 
+    /// `asString` (`progir.h:62-66`) — the string a VARIABLE, DESCRIPTIVE or INSTR_TAG operand holds.
+    ///
+    /// ⛔ `None` WHERE THE REFERENCE ABORTS: any other type is *"attribute not string"*, and a folded
+    /// operand asked without a fold id is *"folded but no SdscFoldId to access"* (`progir.h:247`).
+    #[must_use]
+    pub fn as_string(&self, id: Option<FoldId>) -> Option<&str> {
+        let value = match (&self.value, id) {
+            (PerFold::Every(value), _) => value,
+            (PerFold::ByFold(folds), Some(id)) => &folds.iter().find(|(at, _)| *at == id)?.1,
+            (PerFold::ByFold(_), None) => return None,
+        };
+        match value {
+            OperandValue::Variable(text)
+            | OperandValue::Descriptive(text)
+            | OperandValue::InstrTag(text) => Some(text),
+            _ => None,
+        }
+    }
+
     /// `setSenDataType` (`progir.h:180`).
     #[must_use]
     pub fn in_format(self, format: DataFormat) -> Operand {

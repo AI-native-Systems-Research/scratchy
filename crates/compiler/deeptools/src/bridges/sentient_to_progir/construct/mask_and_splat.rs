@@ -16,8 +16,11 @@
 //! | `e092_ConstructSplatInstrFromSplatOp` | 2 | 65 | `dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp:3719` |
 //! | `e098_ConstructSplatPadInstr` | 3 | 65 | `dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp:3792` |
 
-use super::{descriptive, int};
+use super::{boolean, descriptive, int};
 use crate::arch::{Arch, IsaGen};
+use crate::bridges::sentient_to_progir::construct::compute::{
+    ComputeComp, ComputePrecisions, ComputeSlot, UnsupportedComputeInput, set_compute_input_operand,
+};
 use crate::bridges::sentient_to_progir::state::UnitKey;
 use crate::bridges::sentient_to_progir::uniform::instr::{
     Comment, FoldConstant, MapMode, MappedEntry, MappedOp, OperandMapRefusal, UniformInstrInfo,
@@ -27,7 +30,8 @@ use crate::formats::DataFormat;
 use crate::islands::progir::ty::Operand;
 use crate::islands::progir::{OpCode, OperandField};
 use crate::islands::sentient::dialects::sentient::{
-    RawPrecision, RegIndex, SliceId, SplatPad, ValidEntries, WslLen,
+    LrfIndex, Port, Precision, RawPrecision, RegIndex, SliceId, SplatPad, UnrollFactor,
+    ValidEntries, WslLen,
 };
 use crate::units::DfirUnit;
 use sys_arch_spec::regfile::Component;
@@ -477,7 +481,126 @@ pub fn construct_set_mask_instr(mask_value: i64, dbg_name: Option<&str>) -> Unif
     instr
 }
 
-// crustify:todo: e092_ConstructSplatInstrFromSplatOp
+/// WHICH `tgt<port>` FIELD A NON-LRF SPLAT TARGET NAMES.
+///
+/// ⛔ THE REFERENCE CONCATENATES `"tgt" + <port>` (`:3742`), so only the ports whose own spelling
+/// completes a field name are reachable: a `north` output would name `tgtnorth`, which nothing has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplatPort {
+    /// `tgtl0`.
+    L0,
+    /// `tgtlx`.
+    Lx,
+    /// `tgtpe`.
+    Pe,
+    /// `tgtpt`.
+    Pt,
+    /// `tgtsfp`.
+    Sfp,
+}
+
+impl SplatPort {
+    /// The field this port's name completes.
+    #[must_use]
+    pub const fn field(self) -> OperandField {
+        match self {
+            Self::L0 => OperandField::Tgtl0,
+            Self::Lx => OperandField::Tgtlx,
+            Self::Pe => OperandField::Tgtpe,
+            Self::Pt => OperandField::Tgtpt,
+            Self::Sfp => OperandField::Tgtsfp,
+        }
+    }
+}
+
+/// WHERE A SPLAT'S RESULT GOES — `output.contains("lrf")` (`:3734`) as the two shapes it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplatTarget {
+    /// An `lrf<n>` port: `tgtrf` holding `R<n>`. ⛔ THE BOUND IS THE TYPE'S — *"invalid register
+    /// number"* (`:3739-3740`) cannot be written down.
+    Lrf(LrfIndex),
+    /// Any other port: `tgt<port>` holding `result`.
+    Port(SplatPort),
+}
+
+/// THE `sentient.splat` ATTRIBUTES THIS INSTRUCTION READS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Splat {
+    /// `$pad`.
+    pub pad: SplatPad,
+    /// The value of the constant `$mask` is defined by.
+    pub mask: i64,
+    /// `$unrollFactor`.
+    pub unroll: UnrollFactor,
+    /// `$unrollIncrResult`.
+    pub unroll_incr_result: bool,
+}
+
+/// WHAT A SPLAT CANNOT BE — the one refusal of `:3753-3754` plus its input operand's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplatRefusal {
+    /// *"Expecting fp16 or fp32 precision for splat"* — on a unit that carries a `mode` at all.
+    Precision(Precision),
+    /// What [`set_compute_input_operand`] refused for `src0`.
+    Input(UnsupportedComputeInput),
+}
+
+/// Replaces: e092_ConstructSplatInstrFromSplatOp
+///
+/// Splat one input across the vector: the mask inverted out of 255, the pad as the immediate, the
+/// unroll factor, and `result` in the field the output port names.
+///
+/// ⛔ `mode` ONLY WHERE THE UNIT HAS ONE — the SFP always and the PE from SEN1P5 (`:3752`) — and
+/// only fp16 or fp32 there. ⛔ AND `src2` IS THE STRING `"0.0"`, DESCRIPTIVE, not a float immediate.
+#[must_use]
+pub fn construct_splat_instr_from_splat_op<A: Arch>(
+    mut instr: UniformInstrInfo,
+    input: Port,
+    target: SplatTarget,
+    comp: ComputeComp,
+    splat: Splat,
+    precision: Precision,
+) -> (UniformInstrInfo, Vec<SplatRefusal>) {
+    let mut refused = Vec::new();
+    let (field_out, operand_out) = match target {
+        SplatTarget::Lrf(index) => (OperandField::Tgtrf, format!("R{}", index.get())),
+        SplatTarget::Port(port) => (port.field(), "result".to_owned()),
+    };
+    let padding = i64::from(matches!(splat.pad, SplatPad::None));
+    instr.opcode = OpCode::SPLAT;
+    if matches!(comp, ComputeComp::Sfp)
+        || (matches!(comp, ComputeComp::Pe) && matches!(A::GEN, IsaGen::Sen1p5))
+    {
+        if matches!(precision, Precision::Fp16 | Precision::Fp32) {
+            instr.set_common_field(OperandField::Mode, descriptive(precision.spelling()));
+        } else {
+            refused.push(SplatRefusal::Precision(precision));
+        }
+    }
+    instr.set_common_field(OperandField::Mask, int(255 - splat.mask));
+    let precisions = ComputePrecisions {
+        op: precision,
+        compute: precision,
+        result: precision,
+    };
+    refused.extend(
+        set_compute_input_operand::<A>(
+            comp,
+            &mut instr,
+            ComputeSlot::Src0,
+            input,
+            precisions,
+            false,
+        )
+        .map(SplatRefusal::Input),
+    );
+    instr.set_common_field(OperandField::Imm, int(padding));
+    instr.set_common_field(OperandField::Src2, descriptive("0.0"));
+    instr.set_common_field(field_out, descriptive(&operand_out));
+    instr.set_common_field(OperandField::Unroll, descriptive(splat.unroll.spelling()));
+    instr.set_common_field(OperandField::Unrlfldtgt, boolean(splat.unroll_incr_result));
+    (instr, refused)
+}
 // crustify:todo: e098_ConstructSplatPadInstr
 
 #[cfg(test)]
@@ -489,6 +612,10 @@ mod unit_tests {
         construct_incr_mask_instr, construct_samv_instr, construct_samv_reset_instruction,
         construct_set_dest_instr, construct_set_dst_mask_instr, construct_set_mask_instr,
         descriptive, int,
+    };
+    use super::{
+        ComputeComp, LrfIndex, Port, Precision, Splat, SplatRefusal, SplatTarget, UnrollFactor,
+        boolean, construct_splat_instr_from_splat_op,
     };
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::sentient_to_progir::uniform::instr::{Comment, UniformInstrInfo};
@@ -711,5 +838,74 @@ mod unit_tests {
             ]
         );
         assert_eq!(samv.comment, Comment::Common("samv #1".to_owned()));
+    }
+    /// e092: an SFP splat of an lx input into lrf3 — the field order the reference writes, the mask
+    /// inverted, and the pad as the immediate. A precision the mode cannot spell is an offender.
+    #[test]
+    fn a_splat_inverts_its_mask_and_carries_the_pad_as_the_immediate() {
+        let splat = Splat {
+            pad: SplatPad::None,
+            mask: 8,
+            unroll: UnrollFactor::X2,
+            unroll_incr_result: true,
+        };
+        let (instr, refused) = construct_splat_instr_from_splat_op::<Sen1p5>(
+            UniformInstrInfo::of(OpCode::NOP),
+            Port::Lx,
+            SplatTarget::Lrf(LrfIndex::L3),
+            ComputeComp::Sfp,
+            splat,
+            Precision::Fp16,
+        );
+        assert_eq!(instr.opcode, OpCode::SPLAT);
+        assert!(refused.is_empty());
+        assert_eq!(
+            instr.common_fields,
+            vec![
+                (OperandField::Imm, int(1)),
+                (OperandField::Mask, int(247)),
+                (OperandField::Mode, descriptive("fp16")),
+                (OperandField::Src0, descriptive("lxlu")),
+                (OperandField::Src2, descriptive("0.0")),
+                (OperandField::Tgtrf, descriptive("R3")),
+                (OperandField::Unrlfldtgt, boolean(true)),
+                (OperandField::Unroll, descriptive("x2")),
+            ]
+        );
+
+        // `left` padding is 0, a port target takes `result`, and a DD2 PE has no `mode` to refuse.
+        let (padded, refused) = construct_splat_instr_from_splat_op::<Dd2>(
+            UniformInstrInfo::of(OpCode::NOP),
+            Port::Sfp,
+            SplatTarget::Port(super::SplatPort::Lx),
+            ComputeComp::Pe,
+            Splat {
+                pad: SplatPad::Left,
+                ..splat
+            },
+            Precision::Int8,
+        );
+        assert!(
+            refused.is_empty(),
+            "a DD2 PE never reaches the precision check"
+        );
+        assert_eq!(padded.common_field(OperandField::Imm), Some(&int(0)));
+        assert_eq!(
+            padded.common_field(OperandField::Tgtlx),
+            Some(&descriptive("result"))
+        );
+        assert_eq!(padded.common_field(OperandField::Mode), None);
+
+        // An SFP does have a mode, and int8 is not one it spells.
+        let (int8, refused) = construct_splat_instr_from_splat_op::<Sen1p5>(
+            UniformInstrInfo::of(OpCode::NOP),
+            Port::Lx,
+            SplatTarget::Lrf(LrfIndex::L3),
+            ComputeComp::Sfp,
+            splat,
+            Precision::Int8,
+        );
+        assert_eq!(refused, vec![SplatRefusal::Precision(Precision::Int8)]);
+        assert_eq!(int8.common_field(OperandField::Mode), None);
     }
 }

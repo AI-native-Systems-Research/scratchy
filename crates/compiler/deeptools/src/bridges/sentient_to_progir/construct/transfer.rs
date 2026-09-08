@@ -83,7 +83,304 @@ pub const fn normalize_burst_size<A: Arch>(burst_size: Elements, comp: Component
     }
 }
 
-// crustify:todo: e091_ConstructStoreInstr
+/// HOW A COALESCING STORE PACKS — the four attributes only a `$coalesce` store reads (`:3447-3458`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreCoalesce {
+    /// `$stride`.
+    pub stride: u32,
+    /// `$subword_length`.
+    pub subword_length: u32,
+    /// `$drop_first` — `src2` where there is one (`:3452-3455`).
+    pub drop_first: Option<Reg>,
+    /// `$permute`.
+    pub permute: bool,
+}
+
+/// WHICH MX ARRAY A `$dst` NAMES — `findUnitType(getDst()) == "l0scale"` (`:3461-3467`).
+///
+/// ⛔ NO `$dst` AT ALL IS [`Self::Data`]: the reference leaves `dst_is_l0_scale` false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L0Array {
+    /// `data`.
+    Data,
+    /// `scale`.
+    Scale,
+}
+
+/// WHICH HALF OF A UNIT PAIR — the `is_any_of(comp, X_LU, X_SU)` pair tests (`:3446`, `:3474`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreHalf {
+    /// The load half.
+    Load,
+    /// The store half.
+    Store,
+}
+
+/// WHO SENDS A STORE ITS DATA — the two `dyn_cast_or_null`s of `$producer` (`:3488-3499`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreProducer<'a> {
+    /// A `dataflow.get_unit` — one common `producertag`.
+    Unit(DfirUnit),
+    /// A `uniform.query_map` — one tag per unit.
+    Mapped(&'a [MappedEntry]),
+    /// Neither, which writes no `producertag` at all.
+    Other,
+}
+
+/// THE UNIT A STORE COULD NOT BE LOWERED FOR — the else of `:3501-3503`, which only the three
+/// components that are neither L3, L0 nor LX can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlowerableStore {
+    /// `PT`.
+    Pt,
+    /// `PE`.
+    Pe,
+    /// `SFP`.
+    Sfp,
+}
+
+/// WHICH UNIT A NON-L3 STORE IS ON, carrying what only that unit reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreUnit<'a> {
+    /// `L0LU`/`L0SU`.
+    L0 {
+        /// Which half.
+        half: StoreHalf,
+        /// `$coalesce` and what it brings with it.
+        coalesce: Option<StoreCoalesce>,
+        /// Which MX array `$dst` names — read on SEN1P5 only.
+        dst: L0Array,
+    },
+    /// `LXLU`/`LXSU`.
+    Lx {
+        /// Which half.
+        half: StoreHalf,
+        /// `$shuffle_mode`, which overrides the computed `sttype`.
+        shuffle: Option<ShuffleMode>,
+        /// `$producer`.
+        producer: StoreProducer<'a>,
+    },
+    /// A compute unit, which has no store at all.
+    Unlowerable(UnlowerableStore),
+}
+
+impl StoreUnit<'_> {
+    /// The component this store is on.
+    #[must_use]
+    pub const fn component(&self) -> Component {
+        match self {
+            Self::L0 {
+                half: StoreHalf::Load,
+                ..
+            } => Component::L0lu,
+            Self::L0 {
+                half: StoreHalf::Store,
+                ..
+            } => Component::L0su,
+            Self::Lx {
+                half: StoreHalf::Load,
+                ..
+            } => Component::Lxlu,
+            Self::Lx {
+                half: StoreHalf::Store,
+                ..
+            } => Component::Lxsu,
+            Self::Unlowerable(UnlowerableStore::Pt) => Component::Pt,
+            Self::Unlowerable(UnlowerableStore::Pe) => Component::Pe,
+            Self::Unlowerable(UnlowerableStore::Sfp) => Component::Sfp,
+        }
+    }
+}
+
+/// ONE NON-L3 `sentient.receive_and_store` WITH ITS REGISTERS ALREADY RESOLVED — see [`L3Store`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitStore<'a> {
+    /// Which unit, and what only it reads.
+    pub unit: StoreUnit<'a>,
+    /// `$mutable_addr` — ⛔ NOT A FIELD OF THE INSTRUCTION; it is only initialised (`:3399`).
+    pub mutable_addr: Reg,
+    /// `$immutable_addr` — `src1`, unless it is the constant an `LDSTI` takes as its `imm`.
+    pub immutable_addr: Reg,
+    /// `$result` — which is `src0`.
+    pub result: Reg,
+    /// The constant `$immutable_addr` holds, where it holds one. ⛔ `None` IS THE REFERENCE'S
+    /// `!is_immutable_const` (`:3409-3412`) and forces the `LDST` form.
+    pub immutable_value: Option<i64>,
+    /// `$element_size` — ⛔ IN BITS.
+    pub element_size: Bits,
+    /// `$total_elements`.
+    pub total_elements: Elements,
+    /// `$burst_size`, before normalisation.
+    pub burst: Elements,
+    /// `$interleaved_group`.
+    pub interleaved_group: u32,
+    /// `isUpdateMode` — the `U` in the opcode.
+    pub update: bool,
+    /// `dbgName`.
+    pub dbg_name: Option<String>,
+}
+
+/// EITHER STORE CONTRACT — ⛔ THE L3 ARM DELEGATES and shares none of [`UnitStore`]'s fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Store<'a> {
+    /// An `L3LU`/`L3SU` store.
+    L3(L3Store),
+    /// Any other unit's.
+    Unit(UnitStore<'a>),
+}
+
+/// WHAT A STORE COULD NOT BE GIVEN — the `DT_CHECK`s and the `signalPassFailure`, as offenders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreRefusal {
+    /// *"Sentient ISA doesn't support this interleaving groups factor"* (`:3439-3441`) — 3, or above 4.
+    InterleavedGroups(u32),
+    /// *"Invalid sttype for LX unit!"* (`:3482-3483`) — a store size that is not 2, 16 or 128 bytes.
+    StoreType(u64),
+    /// *"L0Scale implicit in L0LU"* (`:3469`) — SEN1P5 has no L0LU store.
+    ScaleArrayOnL0Lu,
+    /// *"Unable to lower the store_op"* (`:3502`).
+    Unlowerable(UnlowerableStore),
+    /// What a mapped `producertag` refused.
+    OperandMap(OperandMapRefusal),
+}
+
+/// Replaces: e091_ConstructStoreInstr
+///
+/// Take a wire's data — or one immediate address — and write it into a unit's memory at LAR(+LBR).
+///
+/// ⛔ AN L3 COMPONENT DELEGATES to [`construct_l3_store_instr`] (`:3390`); the two contracts share no
+/// fields, which is why the store is [`Store`] rather than one struct.
+/// ⛔ `$element_size` IS IN **BITS**, by the reference's own two `/8`s (`:3418-3422`, `:3475-3476`).
+/// ⛔ AND EVERY REFUSAL STILL WRITES ITS FIELD: the `DT_CHECK`s are debug-only and release carries on.
+pub fn construct_store_instr<A: Arch>(
+    store: &Store<'_>,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> (UniformInstrInfo, Vec<StoreRefusal>) {
+    let store = match store {
+        Store::L3(l3) => {
+            return (
+                construct_l3_store_instr::<A>(l3, units, full_reg_init, regs_to_init),
+                Vec::new(),
+            );
+        }
+        Store::Unit(store) => store,
+    };
+    let comp = store.unit.component();
+    if full_reg_init {
+        add_to_regs_to_init(
+            units,
+            &[store.mutable_addr, store.immutable_addr, store.result],
+            regs_to_init,
+        );
+    }
+    let immediate = if store.burst.0 > 1 || store.interleaved_group > 0 {
+        None
+    } else {
+        store.immutable_value
+    };
+    let mut instr = UniformInstrInfo::of(match (immediate.is_some(), store.update) {
+        (false, false) => OpCode::LDST,
+        (false, true) => OpCode::LDSTU,
+        (true, false) => OpCode::LDSTI,
+        (true, true) => OpCode::LDSTIU,
+    });
+    if let Some(name) = &store.dbg_name {
+        instr = instr.with_common_comment(name);
+    }
+    if let Some(value) = immediate {
+        let scale = address_scale::<A>(comp).get();
+        let imm = value as f64 * f64::from(store.element_size.0) / 8.0 / f64::from(scale);
+        instr.set_common_field(OperandField::Imm, int(imm as i64));
+    } else {
+        instr.set_common_field(OperandField::Src1, reg_field(store.immutable_addr));
+    }
+    instr.set_common_field(OperandField::Src0, reg_field(store.result));
+    if store.burst.0 > 1 {
+        instr.set_common_field(OperandField::Burst, int(1));
+        instr.set_common_field(
+            OperandField::Burstsize,
+            int(normalize_burst_size::<A>(store.burst, comp).0 as i64),
+        );
+    }
+    let mut refused = Vec::new();
+    if store.interleaved_group > 0 {
+        let groups = store.interleaved_group;
+        if groups == 3 || groups > 4 {
+            refused.push(StoreRefusal::InterleavedGroups(groups));
+        }
+        // The ISA encoding of 4 groups is 3 — bits `11` (`:3442-3443`).
+        instr.set_common_field(
+            OperandField::Group,
+            int(i64::from(if groups == 4 { 3 } else { groups })),
+        );
+    }
+    match &store.unit {
+        StoreUnit::L0 {
+            half,
+            coalesce,
+            dst,
+        } => {
+            if let Some(coalesce) = coalesce {
+                instr.set_common_field(OperandField::Coalesce, int(1));
+                instr.set_common_field(OperandField::Stride, int(i64::from(coalesce.stride)));
+                instr.set_common_field(
+                    OperandField::Subwordlen,
+                    int(i64::from(coalesce.subword_length)),
+                );
+                if let Some(drop_first) = coalesce.drop_first {
+                    instr.set_common_field(OperandField::Src2, reg_field(drop_first));
+                }
+                if coalesce.permute {
+                    instr.set_common_field(OperandField::Permute, int(1));
+                }
+            }
+            if matches!(A::GEN, IsaGen::Sen1p5) {
+                if *half == StoreHalf::Load {
+                    refused.push(StoreRefusal::ScaleArrayOnL0Lu);
+                }
+                instr.set_common_field(
+                    OperandField::ScaleArray,
+                    descriptive(match dst {
+                        L0Array::Data => "data",
+                        L0Array::Scale => "scale",
+                    }),
+                );
+            }
+        }
+        StoreUnit::Lx {
+            shuffle, producer, ..
+        } => {
+            let store_size = match shuffle {
+                Some(ShuffleMode::Masked2B) => 2,
+                Some(ShuffleMode::Masked16B) => 16,
+                _ => store.total_elements.0 * u64::from(store.element_size.0) / 8,
+            };
+            if !matches!(store_size, 2 | 16 | 128) {
+                refused.push(StoreRefusal::StoreType(store_size));
+            }
+            instr.set_common_field(OperandField::Sttype, descriptive(&format!("{store_size}b")));
+            match producer {
+                StoreProducer::Unit(unit) => {
+                    instr.set_common_field(OperandField::Producertag, descriptive(unit.spelling()));
+                }
+                StoreProducer::Mapped(entries) => {
+                    let mapped = add_entry_to_operand_map(entries, MapMode::UnitName, 1.0);
+                    refused.extend(mapped.refused.into_iter().map(StoreRefusal::OperandMap));
+                    instr.operand_map = mapped
+                        .value
+                        .into_iter()
+                        .map(|per_unit| (OperandField::Producertag, per_unit))
+                        .collect();
+                }
+                StoreProducer::Other => {}
+            }
+        }
+        StoreUnit::Unlowerable(unit) => refused.push(StoreRefusal::Unlowerable(*unit)),
+    }
+    (instr, refused)
+}
 
 /// A REGISTER'S INDEX AS AN INSTRUCTION FIELD — ⛔ `-1` WHERE IT IS UNASSIGNED, which is the sentinel
 /// `getValueRegIndex` answers and what the reference then writes into `src0`/`src1`.
@@ -1403,9 +1700,10 @@ mod unit_tests {
         Bits, Component, Elements, ExtractScalarLoad, ImmSource, L3Half, L3Indirection, L3Load,
         L3LoadAndStore, L3Store, L3StoreSource, LdzConst, Load, LoadCompute, LoadComputeConsumer,
         LoadComputeShuffle, LoadDestination, LoadTarget, LoadUnit, LrfCopy, LrfCopyRefusal,
-        MappedEntry, Peer, ShuffleMode, UnitKey, construct_extract_scalar_load_instr,
-        construct_l3_load_and_store_instr, construct_l3_load_instr, construct_l3_store_instr,
-        construct_load_compute_instr, construct_load_instr, construct_lrf_copy_instr,
+        MappedEntry, Peer, ShuffleMode, Store, StoreHalf, StoreProducer, StoreUnit, UnitKey,
+        UnitStore, construct_extract_scalar_load_instr, construct_l3_load_and_store_instr,
+        construct_l3_load_instr, construct_l3_store_instr, construct_load_compute_instr,
+        construct_load_instr, construct_lrf_copy_instr, construct_store_instr,
         construct_zr_assign_instr, normalize_burst_size,
     };
     use crate::arch::{Arch, Bounded, Dd2, Sen1p5, Target};
@@ -1914,5 +2212,71 @@ mod unit_tests {
                 "the mapped address scaled by 16 bits / 8 / 1"
             );
         }
+    }
+
+    /// ⭐⭐ IBM'S OWN TWO LXSU STORE LINES, which differ only in how the address arrives:
+    /// `LX_LDSTU :: burst:1 burstsize:16 producertag:sfp src0:1 src1:0 sttype:128b` and
+    /// `LX_LDSTI :: imm:-8064 producertag:sfp src0:1 sttype:128b`
+    /// (`lx_indirect_loads_stores.mlir:67,70`, from the ops at `:248,251`).
+    ///
+    /// ⛔ AND `sttype:128b` OVER `total_elements = 128, element_size = 8` PROVES THE WIDTH IS BITS:
+    /// bytes would have made it `1024b`.
+    #[test]
+    fn the_lx_store_takes_a_constant_address_as_an_immediate_and_names_its_type_in_bytes() {
+        let lrf = |index| Reg {
+            locale: SenRegType::Lrf,
+            index: Some(index),
+        };
+        let store = |burst, immutable_value, update| UnitStore {
+            unit: StoreUnit::Lx {
+                half: StoreHalf::Store,
+                shuffle: None,
+                producer: StoreProducer::Unit(DfirUnit::Sfp),
+            },
+            mutable_addr: lrf(RegIndex::at::<1>()),
+            immutable_addr: lrf(RegIndex::at::<0>()),
+            result: lrf(RegIndex::at::<1>()),
+            immutable_value,
+            element_size: Bits(8),
+            total_elements: Elements(128),
+            burst,
+            interleaved_group: 0,
+            update,
+            dbg_name: None,
+        };
+        let emit = |unit_store| {
+            construct_store_instr::<Dd2>(
+                &Store::Unit(unit_store),
+                &[],
+                false,
+                &mut RegsToInit::new(),
+            )
+        };
+        let (bursted, refused) = emit(store(Elements(16), None, true));
+        assert_eq!(bursted.opcode, OpCode::LDSTU);
+        assert_eq!(
+            bursted.common_fields,
+            vec![
+                (OperandField::Burst, int(1)),
+                (OperandField::Burstsize, int(16)),
+                (OperandField::Producertag, descriptive("sfp")),
+                (OperandField::Src0, int(1)),
+                (OperandField::Src1, int(0)),
+                (OperandField::Sttype, descriptive("128b")),
+            ]
+        );
+        assert!(refused.is_empty());
+        let (immediate, refused) = emit(store(Elements(0), Some(-8064), false));
+        assert_eq!(immediate.opcode, OpCode::LDSTI);
+        assert_eq!(
+            immediate.common_fields,
+            vec![
+                (OperandField::Imm, int(-8064)),
+                (OperandField::Producertag, descriptive("sfp")),
+                (OperandField::Src0, int(1)),
+                (OperandField::Sttype, descriptive("128b")),
+            ]
+        );
+        assert!(refused.is_empty());
     }
 }

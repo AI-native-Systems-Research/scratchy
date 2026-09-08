@@ -36,7 +36,9 @@
 
 use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
 use crate::bridges::sentient_to_progir::state::UnitKey;
-use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
+use crate::bridges::sentient_to_progir::uniform::instr::{
+    UniformInstrInfo, UniformLabel, create_jmp_instr, create_nop_instr,
+};
 
 /// WHERE ONE INSTRUCTION IS — `InstrIndex`, a `std::tuple<int, int, int>`
 /// (`UniformInstrAndBlock.hpp:24`).
@@ -44,7 +46,7 @@ use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
 /// ⛔ NAMED FIELDS, NOT A TRIPLE. Three `int`s in a row is the transposition this crate's newtype
 /// rule exists to prevent, and the reference steps one of them by position: `std::get<2>(index)++`
 /// (`SentientToProgIR.cpp:344`), where the value stepped is `next_index`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InstrIndex {
     /// Which block of the unit's program.
     pub block: usize,
@@ -492,8 +494,79 @@ impl UniformInstrBlocks {
     }
 }
 
-// crustify:todo: e096_getUniformizedUnitInstrList
-// crustify:todo: e097_flattenIndex
+impl UniformInstrBlock {
+    /// Replaces: e096_getUniformizedUnitInstrList
+    ///
+    /// One unit's list for this block padded to the longest region: its own instructions, then a JCMP
+    /// over a copy of the longest region's tail marked dead — or a single NOP where that tail is
+    /// empty. The `usize` is where the jump landed, and `None` is the reference's `-1`.
+    ///
+    /// ⛔ ONLY A SHORTER OR UNMAPPED UNIT IS PADDED: one already on the longest region, or on a region
+    /// no shorter than it, is handed back untouched. ⛔ AND `num_padded_instrs` IS AN `int` OVER A
+    /// `size_t` DIFFERENCE (`:303`) — an empty longest region gives -1, not 0, so it takes the JCMP.
+    #[must_use]
+    pub fn uniformized_unit_instr_list(
+        &self,
+        unit: UnitKey,
+        label: UniformLabel,
+    ) -> (Vec<UniformInstrInfo>, Option<usize>) {
+        let block = match self {
+            UniformInstrBlock::Regular(instrs) => return (instrs.clone(), None),
+            UniformInstrBlock::Uniform(block) => block,
+        };
+        let max_region_idx = self.max_instr_region_index();
+        let max_region_list = block
+            .regions
+            .get(max_region_idx.0 as usize)
+            .map_or(&[][..], Vec::as_slice);
+        let region_of = block.region_of(unit);
+        let elsewhere = region_of.filter(|at| *at != max_region_idx);
+        let own = elsewhere.and_then(|region| block.regions.get(region.0 as usize));
+        let pads = region_of.is_none()
+            || (elsewhere.is_some() && own.map_or(0, Vec::len) < max_region_list.len());
+        if !pads {
+            let settled = region_of.and_then(|region| block.regions.get(region.0 as usize));
+            return (settled.cloned().unwrap_or_default(), None);
+        }
+        let mut ret_list = own.cloned().unwrap_or_default();
+        let jmp_pos = ret_list.len();
+        let num_padded_instrs = max_region_list.len() as i64 - jmp_pos as i64 - 1;
+        // An optimization to use NOP instruction instead of JCMP instruction to save the cycles.
+        if num_padded_instrs == 0 {
+            ret_list.push(create_nop_instr(label));
+        } else {
+            // Jump over the padding, then carry the padding itself as dead code.
+            ret_list.push(create_jmp_instr(label));
+            ret_list.extend(max_region_list.iter().skip(jmp_pos + 1).map(|instr| {
+                let mut padding = instr.clone();
+                padding.dead = true;
+                padding
+            }));
+        }
+        (ret_list, Some(jmp_pos))
+    }
+}
+
+impl UniformInstrBlocks {
+    /// Replaces: e097_flattenIndex
+    ///
+    /// Where an index lands in one unit's own flat program: what every earlier block costs that unit,
+    /// plus the offset inside its region.
+    ///
+    /// ⛔ THE REGION HALF OF THE INDEX IS NEVER READ — the reference unpacks it into an unused local
+    /// (`:488`), because [`UniformInstrBlock::region_instr_size`] resolves the unit's region itself.
+    /// ⛔ AND A BLOCK COUNT PAST THE END CONTRIBUTES NOTHING, where `blocks_.at()` throws.
+    #[must_use]
+    pub fn flatten_index(&self, index: InstrIndex, unit: UnitKey) -> usize {
+        self.blocks
+            .iter()
+            .take(index.block)
+            .map(|block| block.region_instr_size(unit))
+            .sum::<usize>()
+            + index.instr
+    }
+}
+
 // crustify:todo: e121_getUniformizedUnitUniformInstrList
 
 #[cfg(test)]
@@ -501,7 +574,7 @@ mod unit_tests {
     use super::{InstrIndex, UniformBlock, UniformInstrBlock, UniformInstrBlocks};
     use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
     use crate::bridges::sentient_to_progir::state::UnitKey;
-    use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
+    use crate::bridges::sentient_to_progir::uniform::instr::{UniformInstrInfo, UniformLabel};
     use crate::islands::progir::OpCode;
     use crate::units::{Core, DfirUnit, Residency};
 
@@ -867,6 +940,79 @@ mod unit_tests {
                 region: RegionIndex(1),
                 instr: 2
             })
+        );
+    }
+    /// e096: a unit on the shorter region gets its own instructions, a JCMP and the longest region's
+    /// tail as dead code — and one already on the longest region is not padded at all.
+    #[test]
+    fn a_shorter_region_is_padded_with_a_jump_over_dead_code() {
+        let short = unit(DfirUnit::Lxlu);
+        let long = unit(DfirUnit::L3su);
+        let block = UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop()], vec![nop(), nop(), ret()]],
+            unit_to_region: vec![(short, RegionIndex(0)), (long, RegionIndex(1))],
+            ..UniformBlock::default()
+        });
+        let (padded, jmp_pos) = block.uniformized_unit_instr_list(short, UniformLabel(7));
+        assert_eq!(jmp_pos, Some(1));
+        assert_eq!(
+            padded.len(),
+            3,
+            "its own NOP, the JCMP and one padding instr"
+        );
+        assert_eq!(padded[1].opcode, OpCode::JCMP);
+        assert_eq!(padded[2].opcode, OpCode::RETURN);
+        assert!(padded[2].dead && !padded[1].dead);
+        assert_eq!(
+            block.uniformized_unit_instr_list(long, UniformLabel(7)),
+            (vec![nop(), nop(), ret()], None)
+        );
+        // An unmapped unit is padded from nothing, and a tail of exactly one instruction is a NOP.
+        let one_short = UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop()], vec![nop(), ret()]],
+            unit_to_region: vec![(short, RegionIndex(0))],
+            ..UniformBlock::default()
+        });
+        let (nopped, jmp_pos) = one_short.uniformized_unit_instr_list(short, UniformLabel(7));
+        assert_eq!((nopped.len(), jmp_pos), (2, Some(1)));
+        assert_eq!(nopped[1].opcode, OpCode::NOP);
+    }
+
+    /// e097: the flat index sums the earlier blocks' cost for THAT unit — an unmapped unit pays the
+    /// longest region of each, a mapped one pays its own.
+    #[test]
+    fn the_flat_index_sums_the_earlier_blocks_for_that_unit() {
+        let lxlu = unit(DfirUnit::Lxlu);
+        let mut blocks = UniformInstrBlocks::default();
+        blocks
+            .blocks
+            .push(UniformInstrBlock::Regular(vec![nop(), ret()]));
+        blocks.blocks.push(UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop()], vec![nop(), nop(), ret()]],
+            unit_to_region: vec![(lxlu, RegionIndex(0))],
+            ..UniformBlock::default()
+        }));
+        blocks.blocks.push(UniformInstrBlock::Regular(vec![ret()]));
+        let at = |block, instr| InstrIndex {
+            block,
+            region: RegionIndex(1),
+            instr,
+        };
+        assert_eq!(blocks.flatten_index(at(0, 1), lxlu), 1);
+        assert_eq!(
+            blocks.flatten_index(at(2, 0), lxlu),
+            3,
+            "2 + its own region"
+        );
+        assert_eq!(
+            blocks.flatten_index(at(2, 0), unit(DfirUnit::L3su)),
+            5,
+            "an unmapped unit pays the longest region"
+        );
+        assert_eq!(
+            blocks.flatten_index(at(9, 4), lxlu),
+            8,
+            "a block count past the end sums only the blocks that exist"
         );
     }
 }
