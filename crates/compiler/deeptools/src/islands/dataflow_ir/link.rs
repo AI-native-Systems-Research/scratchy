@@ -98,10 +98,22 @@ pub struct L0lu;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossPtnLink;
 
+/// The PE — drains a wire, computes, drives another.
+///
+/// ⛔ ADDED FOR ENTRY 304'S FIXTURE: `mixed_precision.mlir:745` is a **PE** program unit receiving
+/// from a `ptrow7`, and with no marker for the PE that wire was not constructible — the receive
+/// whose precision the reference overrides had no input the test could state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pe;
+
 impl sealed::Sealed for L3lu {}
 impl sealed::Sealed for Lxlu {}
 impl sealed::Sealed for Sfp {}
 impl sealed::Sealed for Lxsu {}
+impl sealed::Sealed for Pe {}
+impl UnitKind for Pe {
+    const KIND: DfirUnit = DfirUnit::Pe;
+}
 impl UnitKind for L3lu {
     const KIND: DfirUnit = DfirUnit::L3lu;
 }

@@ -109,6 +109,7 @@ use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, FlatConstraints, In
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
 
+use super::tf_utils::constant_index;
 use super::vc_vector_operands::access_map;
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -3115,14 +3116,202 @@ impl<'a, T> VacantSlot<'a, T> {
     }
 }
 
+/// WHY `constructTimeStepsInfo` REFUSED — the three `failure()` paths of
+/// `agen::utils::calculateTimeBounds` (`dialect_utils/Agen/Utils.cpp:216-257`), each with the
+/// dimension that carried it.
+///
+/// ⛔ `calculateTimeOffsets`' OWN FAILURE HAS NO VARIANT: its only one is
+/// `getFlattenedAffineExpr(..).failed()` (`:104-109`), and [`AffineExpr::flatten`] is total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum TimeStepsInfo {
+    /// Every dimension's bound is a compile-time constant and both vectors are stored (`:695`).
+    Constructed,
+    /// *"Time set in the composite load/store is empty after simplification"* (`:221-227`) — also
+    /// the unset [`AccessDetailsAffineComposite::time_set`], which has no dimensions to bound.
+    EmptyTimeSet,
+    /// *"No support for lowering non-constant time symbol"* (`:243-247`) — the symbol bounding this
+    /// dimension is not an `arith::ConstantIndexOp`.
+    NonConstantTimeSymbol(TimeDim),
+    /// *"Not able to deduce the extents of time set"* (`:250-254`) — the dimension is neither pinned,
+    /// nor a constant range, nor a symbolic one.
+    ExtentsNotDeducible(TimeDim),
+}
+
+impl TimeStepsInfo {
+    /// `success()` only for [`Self::Constructed`].
+    #[must_use]
+    pub const fn constructed(self) -> bool {
+        matches!(self, TimeStepsInfo::Constructed)
+    }
+
+    /// What the reference prints to `llvm::errs()` on the way out (`Utils.cpp:222-226`, `:244-246`,
+    /// `:251-253`).
+    #[must_use]
+    pub const fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            TimeStepsInfo::Constructed => None,
+            TimeStepsInfo::EmptyTimeSet => Some(
+                "Time set in the composite load/store is empty after simplification. Expecting a \
+                 non-empty time set.",
+            ),
+            TimeStepsInfo::NonConstantTimeSymbol(_) => {
+                Some("No support for lowering non-constant time symbol")
+            }
+            TimeStepsInfo::ExtentsNotDeducible(_) => {
+                Some("Not able to deduce the extents of time set")
+            }
+        }
+    }
+}
+
+/// `agen::utils::calculateTimeBounds` (`dialect_utils/Agen/Utils.cpp:216-257`) — one bound per time
+/// dimension, in `time_order`'s order.
+///
+/// ⛔ THE THREE TESTS ARE ORDERED AND THE FIRST MATCH WINS: pinned to one value → 1, a constant
+/// range → its width, a symbolic range → that symbol's constant. ⛔ `scope` is what the reference
+/// reaches through `symbol.getDefiningOp<arith::ConstantIndexOp>()` (`:239`).
+fn calculate_time_bounds(
+    time_bounds: &mut Vec<TimeBound>,
+    time_set: &IntegerSet,
+    time_symbols: &[Val],
+    time_order: &AffineMap,
+    scope: &[DfirOp],
+) -> TimeStepsInfo {
+    let constraints = FlatConstraints::from_integer_set(time_set);
+    if constraints.is_empty() {
+        return TimeStepsInfo::EmptyTimeSet;
+    }
+    let mut widths: Vec<i64> = Vec::new();
+    for dim_pos in 0..constraints.num_dim_vars() {
+        let dim = TimeDim(dim_pos);
+        if constraints.is_dim_value_zero(dim_pos) {
+            widths.push(1);
+        } else if let Some(width) = constraints.is_dim_a_constant_range(dim_pos) {
+            widths.push(width);
+        } else if let Some(symbol_pos) = constraints.is_dim_a_symbolic_range(dim_pos) {
+            let symbol = time_symbols.get(symbol_pos as usize).copied();
+            match symbol.and_then(|symbol| constant_index(symbol, scope)) {
+                Some(value) => widths.push(value),
+                None => return TimeStepsInfo::NonConstantTimeSymbol(dim),
+            }
+        } else {
+            return TimeStepsInfo::ExtentsNotDeducible(dim);
+        }
+    }
+    // `time_bounds = time_order.compose(time_bounds)` (`:255`). A negative width cannot arrive from a
+    // non-empty set — it would be the `kInvalid` [`TimeBound::Variable`] the consumer already guards.
+    *time_bounds = time_order
+        .compose_constants(&widths)
+        .into_iter()
+        .map(|width| u64::try_from(width).map_or(TimeBound::Variable, TimeBound::Steps))
+        .collect();
+    TimeStepsInfo::Constructed
+}
+
+/// `agen::utils::calculateTimeOffsets` (`dialect_utils/Agen/Utils.cpp:97-127`) — the address step of
+/// each time dimension, in `time_order`'s order, plus the flattened constant.
+///
+/// ⛔ THE FLATTENED ROW'S LAST COLUMN IS THE CONSTANT AND IS HELD BACK FROM THE REORDERING (`:111-116`)
+/// — see [`TimeOffsets`]. ⛔ `simplifyAffineMap` (`:103`) is dropped: flattening folds the same
+/// expression to the same row either way.
+fn calculate_time_offsets(
+    mem_view_layout_map: &AffineMap,
+    time_addr_map: &AffineMap,
+    time_order: &AffineMap,
+) -> TimeOffsets {
+    let composed = mem_view_layout_map.compose(time_addr_map);
+    let Some(result) = composed.results.first() else {
+        return TimeOffsets::default();
+    };
+    let flat = result.flatten(composed.dims, composed.syms);
+    let per_column: Vec<i64> = flat
+        .dims
+        .iter()
+        .chain(flat.syms.iter())
+        .copied()
+        .chain(flat.locals.iter().map(|local| local.coeff))
+        .collect();
+    TimeOffsets {
+        per_dim: time_order.compose_constants(&per_column),
+        constant: flat.constant,
+    }
+}
+
+/// Replaces: e297_constructTimeStepsInfo
+///
+/// **297/384** `AccessDetailsAffineComposite::constructTimeStepsInfo` —
+/// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626` (42L). Gives every operand of a
+/// composite transfer its time bounds and time offsets, then optionally coalesces the nest and claims
+/// the burst and interleave-group dimensions.
+///
+/// ⛔ THE ORDER IS LOAD-BEARING and the reference says so at `:660-662`: coalescing sees ALL the
+/// operands and must precede the per-operand burst calculation. ⛔ IT STOPS AT THE FIRST REFUSAL, so
+/// neither of the two later steps runs on a half-built nest.
+pub fn construct_time_steps_info(
+    access_details: &mut AccessContainer<AccessDetailsAffineComposite<'_>>,
+    do_coalesce: bool,
+    do_burst_il_group_calc: bool,
+    scope: &[DfirOp],
+) -> TimeStepsInfo {
+    // ⛔ `DT_CHECK(size() > 0 && size() <= 4)` and the `isa<Composite…>` check (`:629-635`) are both
+    // structural: one slot per [`MemoryOperandIndex`], and the composite op is what
+    // [`AccessDetailsAffineComposite::new`] was handed.
+    for access in access_details.entries_mut() {
+        let Some(time_set) = access.time_set.clone() else {
+            return TimeStepsInfo::EmptyTimeSet;
+        };
+        // An unset `time_order` reorders nothing rather than null-dereferencing as MLIR would.
+        let time_order = access
+            .time_order
+            .clone()
+            .unwrap_or_else(|| AffineMap::identity(time_set.dims));
+        let mut time_bounds = Vec::new();
+        let bounded = calculate_time_bounds(
+            &mut time_bounds,
+            &time_set,
+            &access.time_symbols,
+            &time_order,
+            scope,
+        );
+        if !bounded.constructed() {
+            return bounded;
+        }
+        access.set_time_bounds(&time_bounds);
+
+        // get address offsets for time dimensions
+        let layout = access.affine.base.mem_view_layout_map.clone();
+        let addr = access.time_addr_map.clone();
+        // With either map unset there is no composition to flatten and every step is zero.
+        let offsets = match (layout, addr) {
+            (Some(layout), Some(addr)) => calculate_time_offsets(&layout, &addr, &time_order),
+            _ => TimeOffsets::default(),
+        };
+        access.set_time_offsets(offsets);
+    }
+
+    // Coalesce time dimensions. Note this step needs to be done considering all access_details for a
+    // given transfer and it must happen before burst and il group calculation.
+    if do_coalesce {
+        coalesce_time_dimensions(access_details);
+    }
+    if do_burst_il_group_calc {
+        for access in access_details.entries_mut() {
+            access.compute_burst_and_group();
+        }
+    }
+    TimeStepsInfo::Constructed
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
         AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase,
         AccessDetailsSymbolic, AffineInitialize, ChunkAndShuffleInfo, ConstructedDetails,
         ConstructedIndices, IndicesCoeffDict, LayoutCoeff, MemViewSource, MemoryOperandIndex,
-        SubscriptOperand, TimeBound, TimeDim, TimeOffsets, TransferDim, TransferExtents,
-        coalesce_time_dimensions, sen, set_coalesced_bound_values,
+        SubscriptOperand, TimeBound, TimeDim, TimeOffsets, TimeStepsInfo, TransferDim,
+        TransferExtents, coalesce_time_dimensions, construct_time_steps_info, sen,
+        set_coalesced_bound_values,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
@@ -5358,9 +5547,52 @@ mod unit_tests {
             "a merge is copied onto the destination (`:788-790`)"
         );
     }
-}
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  297/384 — `constructTimeStepsInfo`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e297_constructTimeStepsInfo
+    /// 🎯 297/384 — THE ORDER MAP REORDERS BOTH VECTORS AND THE CONSTANT STAYS PUT. A nest pinned at
+    /// `d0` with 4 steps at `d1` and 8 at `d2`, walked innermost-first, comes back as bounds
+    /// `[8, 4, 1]` beside offsets `[1, 64, 1024]` — and the layout map's `+ 7` is the flattened
+    /// constant, not a fourth dimension.
+    #[test]
+    fn the_time_order_reorders_the_bounds_and_the_offsets_together() {
+        let op = composite_load_and_store();
+        let mut details = AccessContainer::<AccessDetailsAffineComposite>::default();
+        let access = details
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("empty")
+            .emplace_insert(AccessDetailsAffineComposite::new(&op, DfirUnit::L3su));
+        access.time_set = Some(IntegerSet::from_sizes(&[1, 4, 8]));
+        access.time_order = Some(AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![AffineExpr::dim(2), AffineExpr::dim(1), AffineExpr::dim(0)],
+        });
+        access.time_addr_map = Some(AffineMap::linear(&[1024, 64, 1]));
+        access.affine.base.mem_view_layout_map = Some(AffineMap::unary(
+            AffineExpr::dim(0).plus(AffineExpr::Const(7)),
+        ));
+
+        assert_eq!(
+            construct_time_steps_info(&mut details, false, false, &[]),
+            TimeStepsInfo::Constructed
+        );
+        let access = details.get_first().expect("the source");
+        assert_eq!(
+            access.time_bounds,
+            [
+                TimeBound::Steps(8),
+                TimeBound::Steps(4),
+                TimeBound::Steps(1)
+            ]
+        );
+        assert_eq!(
+            access.time_offsets,
+            TimeOffsets {
+                per_dim: vec![1, 64, 1024],
+                constant: 7,
+            }
+        );
+    }
+}

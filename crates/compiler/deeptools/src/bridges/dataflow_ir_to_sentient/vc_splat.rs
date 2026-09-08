@@ -497,6 +497,7 @@ mod unit_tests {
             values: vec![value],
             orig_precision: Some(sentient::Precision::Fp16),
             on_the_fly_conv_precision: Some(sentient::Precision::Fp16),
+            splat: None,
         };
 
         let mut values = Values::default();

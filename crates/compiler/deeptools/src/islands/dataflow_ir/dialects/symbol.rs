@@ -14,10 +14,10 @@ use crate::islands::dataflow_ir::print;
 
 /// ONE `symbol` OPERATION.
 ///
-/// ⚠️ ONE OF `Symbol.td`'S FOUR. `symbol.create_id`, `symbol.symbol_immutable_mapping` and
-/// `symbol.query_map` are declared beside it and are absent here: no bridge-2 function this campaign
-/// has reached names any of the three, and an op nothing reads would be a variant every total match
-/// in this island has to answer for with nothing to say.
+/// ⚠️ THREE OF `Symbol.td`'S FOUR. `symbol.create_id` is declared beside them and is absent: no
+/// bridge-2 function this campaign has reached names it, and an op nothing reads would be a variant
+/// every total match in this island has to answer for with nothing to say. The other two arrived with
+/// entry 303, whose whole input they are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// `symbol.create_symbol {SymbolId = N : i32} : index` — an `index` standing for a quantity the
@@ -85,6 +85,48 @@ pub enum Op {
         /// rather than papered over, because a field is cheap to add the day a reader appears.
         max_value: Option<i64>,
     },
+
+    /// `%0 = symbol.symbol_immutable_mapping ([%c0 -> %s0],[%c1 -> %s1]) : index` — THE PER-KEY TABLE
+    /// A [`Op::QueryMap`] READS.
+    ///
+    /// *"This operation constructs a key-value dictionary to map arith.constant SSA values to
+    /// symbols."* (`Symbol.td:89-98`.)
+    ///
+    /// ⛔ NOT [`super::uniform::Op::DefImmutableMapping`], WHICH IS A DIFFERENT DIALECT'S OP. Both are
+    /// the scheduler's, both bind an `index` handle over paired variadic keys and values, and dcc
+    /// tells them apart by name everywhere: entries 275 and 303 lower `symbol::SymbolQueryMapOp`
+    /// (`SymbolToSentient.cpp:30`), while `uniform::QueryMapOp` is what `getUnitType` and
+    /// `ConstructProgIRHelper` read (`DccExtContext.cpp:140`). Reusing the uniform op here would make
+    /// entry 303 fire on ops its reference never touches.
+    ///
+    /// ⭐ ONE LIST, NOT TWO, for the reason [`super::uniform::Op::DefImmutableMapping::pairs`]
+    /// records: `SameVariadicOperandSize` (`Symbol.td:90`) makes the two ranges equal by construction
+    /// and the printer walks them by a single index.
+    ImmutableMapping {
+        /// `Index:$result` — the handle a query reads through.
+        result: Val,
+        /// `$keys` zipped with `$values` (`Symbol.td:96-97`), positionally.
+        pairs: Vec<(Val, Val)>,
+    },
+
+    /// `%1 = symbol.query_map (map: %0, key: %sub) : index` — ONE KEY'S VALUE OUT OF AN
+    /// [`Op::ImmutableMapping`].
+    ///
+    /// *"This operation querries a symbol_immutable_mapping based on an iter arg key."*
+    /// (`Symbol.td:107-116`.)
+    ///
+    /// ⭐ THE KEY IS ORDINARILY COMPUTED FROM A LOOP'S INDUCTION VARIABLE, which is what makes the
+    /// op a per-iterationchoice of  of a constant: `%sub = sentient.scalar_sub %c2, %arg0` then
+    /// `symbol.query_map (map: %0, key: %sub)`
+    /// (`dcc/test/Conversion/SymbolToSentient/symbols_query.mlir:138-140`).
+    QueryMap {
+        /// `Index:$result` — the value entry 275 re-points every use of.
+        result: Val,
+        /// `Index:$map` — the handle an [`Op::ImmutableMapping`] bound.
+        map: Val,
+        /// `Index:$key` — which entry to read.
+        key: Val,
+    },
 }
 
 /// ONE `symbol` OP AS TEXT. The caller has already indented.
@@ -117,6 +159,31 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 out,
                 "{} = symbol.create_symbol {{SymbolId = {symbol_id} : i32{max}}} : index",
                 print::val(*result)
+            );
+        }
+        // `custom<ImmutableMap>($keys, $values) attr-dict `:` type($result)` (`Symbol.td:101`) — one
+        // bracketed `[key -> value]` per pair, comma separated, exactly as the vendor's own input
+        // writes it (`symbols_query.mlir:139`).
+        Op::ImmutableMapping { result, pairs } => {
+            let table = pairs
+                .iter()
+                .map(|(key, value)| format!("[{} -> {}]", print::val(*key), print::val(*value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(
+                out,
+                "{} = symbol.symbol_immutable_mapping ({table}) : index",
+                print::val(*result)
+            );
+        }
+        // The operand names are part of the syntax (`Symbol.td:119`).
+        Op::QueryMap { result, map, key } => {
+            let _ = writeln!(
+                out,
+                "{} = symbol.query_map (map: {}, key: {}) : index",
+                print::val(*result),
+                print::val(*map),
+                print::val(*key)
             );
         }
     }
@@ -190,6 +257,33 @@ mod tests {
         assert_eq!(
             out,
             "%719 = symbol.create_symbol {SymbolId = -1476 : i32, maxValue = 8 : i64} : index\n"
+        );
+    }
+
+    /// ⭐⭐ THE VENDOR'S OWN MAPPING AND QUERY, REPRODUCED BYTE FOR BYTE —
+    /// `dcc/test/Conversion/SymbolToSentient/symbols_query.mlir:139-140`, entry 303's input.
+    #[test]
+    fn a_mapping_and_its_query_print_as_the_reference_writes_them() {
+        let mut out = String::new();
+        emit(
+            &mut out,
+            &Op::ImmutableMapping {
+                result: Val(0),
+                pairs: vec![(Val(2), Val(20)), (Val(3), Val(21))],
+            },
+        );
+        emit(
+            &mut out,
+            &Op::QueryMap {
+                result: Val(1),
+                map: Val(0),
+                key: Val(4),
+            },
+        );
+        assert_eq!(
+            out,
+            "%0 = symbol.symbol_immutable_mapping ([%2 -> %20],[%3 -> %21]) : index\n\
+             %1 = symbol.query_map (map: %0, key: %4) : index\n"
         );
     }
 }

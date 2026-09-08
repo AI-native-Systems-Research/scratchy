@@ -76,17 +76,18 @@
 //!
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp`
 
-
 use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
 use crate::islands::dataflow_ir::dialects::{
     Index, Op as DfirOp, Val, operands, regions, regions_mut, results, uses,
 };
-use crate::islands::dataflow_ir::dialects::{agen, arith, dataflow, vector};
+use crate::islands::dataflow_ir::dialects::{agen, arith, dataflow, uniform, vector};
 use crate::islands::dataflow_ir::link;
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
+
+use super::vc_vector_chain_helper::precision_in_string;
 
 /// AN OPERATION'S IDENTITY — the stand-in for `mlir::Operation *`.
 ///
@@ -186,15 +187,14 @@ pub enum VectorOperandType {
 /// ONE OPERAND OF A COMPUTE, AS THE VECTORCHAIN LOWERING SEES IT — `VectorOperand`
 /// (`VectorOperands.hpp:38-113`).
 ///
-/// # ⚠️ PARTIAL BY DESIGN — `splat_` IS NOT HERE YET
+/// # ⭐ `splat_` ARRIVED WITH ENTRY 304, WHICH IS ITS ONLY WRITER
 ///
-/// ⭐ THE MEMBER ARRIVES WITH THE UNIT THAT READS IT, AND THAT IS NOT THE UNIT THAT WRITES IT.
-/// `splat_` is *"to capture the select semantics"* (`VectorOperands.hpp:70`).
-/// `e304_getOperandWithPrecision` is its only writer and writes exactly one value — `"east"`, in its
-/// `SelectOp` arm (`VectorOperands.cpp:582`); its only reader is
-/// `e340_analyzeAndFillOperandForwarding`, which hands it to `symbolizeSentientComputePort` and keeps
-/// the result as a `SentientComputePortAttr` (`VectorChainHelper.cpp:544-547`). So the field is an
-/// `Option<`[`sen::Port`]`>` rather than a string, and neither of those entries is this wave's.
+/// `splat_` is *"to capture the select semantics"* (`VectorOperands.hpp:70`), and
+/// [`VectorOperand::with_precision`] writes exactly one value into it — `"east"`, in its `SelectOp`
+/// arm (`VectorOperands.cpp:582`). Its only reader is `e340_analyzeAndFillOperandForwarding`, which
+/// hands it to `symbolizeSentientComputePort` and keeps the answer as a `SentientComputePortAttr`
+/// (`VectorChainHelper.cpp:544-547`) — so the field is an `Option<`[`sen::Port`]`>` rather than a
+/// string, and `None` is the empty string that reader tests against.
 ///
 /// ⭐ `values_` IS HERE NOW, because `e071_getOperandFromReceiveOp` and `e072_getOperandFromSendOp`
 /// exist to WRITE it — the link a compute reads over is the operand's value and nothing else. See
@@ -231,6 +231,9 @@ pub struct VectorOperand {
     /// equal to [`Self::orig_precision`] (`VectorOperands.cpp:399-400`) and only differs where a
     /// `vectorchain.cast` folded into the operand.
     pub on_the_fly_conv_precision: Option<sen::Precision>,
+    /// `splat_` — see the type's own note. [`sen::Port::East`] where a `vectorchain.select` folded
+    /// into the operand from below, `None` everywhere else.
+    pub splat: Option<sen::Port>,
 }
 
 /// ONE ENTRY OF `values_` — an operand's value (`VectorOperands.hpp:44-46`).
@@ -376,6 +379,7 @@ impl VectorOperand {
             values: vec![value],
             orig_precision: None,
             on_the_fly_conv_precision: None,
+            splat: None,
         }
     }
 
@@ -988,8 +992,6 @@ pub fn erase_op(op: &OpId, scope: &mut Vec<DfirOp>) {
         remove_at(op.path(), scope);
     }
 }
-
-
 
 /// WHICH READING A CALLER WANTS OF A `vectorchain.constant_bitstream`'S FIRST ELEMENT — the
 /// `is_constant_splatted_vector` argument of `getOperandFromConstantBitstreamOp`
@@ -2140,16 +2142,65 @@ fn is_custom_vector_trivial_shuffle(
     }
 }
 
-/// WHICH UNIT A `dataflow.send` GOES TO — `findUnitType(send_op.getToUnit())`'s `get_unit` arm, which
-/// is what [`VectorOperand::from_send_op`] left to its caller.
-///
-/// ⛔ `findUnitType`'s `uniform::QueryMapOp` arm is not reachable from this island (see
-/// `vc_lowering_xrf.rs`'s note on the same call), and a register file is not a send destination, so
-/// both are the reference's *"Unit type is inconsistent in SendOp."*
+/// WHICH UNIT A `dataflow.send` GOES TO — `findUnitType(send_op.getToUnit())`, which is what
+/// [`VectorOperand::from_send_op`] left to its caller. `None` is *"Unit type is inconsistent in
+/// SendOp."*
 fn send_destination(to: link::SendEnd, scope: &[DfirOp]) -> Option<DfirUnit> {
-    match view_unit(to.val(), scope)? {
-        ViewUnit::Unit(unit) => Some(unit),
-        ViewUnit::Local(_) => None,
+    unit_behind(to.val(), scope)
+}
+
+/// WHICH UNIT A `dataflow.receive` COMES FROM — the twin [`VectorOperand::from_receive_op`] left to
+/// ITS caller, and how [`VectorOperand::with_precision`] reaches it. `None` is *"Unit type is
+/// inconsistent in ReceiveOp."*
+fn recv_source(from: link::RecvEnd, scope: &[DfirOp]) -> Option<DfirUnit> {
+    unit_behind(from.val(), scope)
+}
+
+/// `findUnitType` (`dcc/src/Dialect/Uniform/Utils.cpp:286-301`) — WHICH UNIT A VALUE NAMING A
+/// TRANSFER'S PEER STANDS FOR.
+///
+/// # ⛔⛔ THE `uniform.query_map` ARM IS THE UNIFORMIZED CASE AND DECLINING IT ANSWERS NOTHING
+///
+/// An earlier note here said that arm was unreachable from this island. It is not: a uniformized
+/// transfer's peer IS a `query_map`, and `mixed_precision.mlir:745` receives from
+/// `%195 = uniform.query_map(map:%194, key:%arg0)` rather than from a `get_unit`
+/// (`dcc/test/Conversion/VectorChainToSentientPESFP/mixed_precision.mlir:628-629`, `:745`). With the
+/// arm missing, every operand of every compute in that fixture — the vendor's own — was *"unit type
+/// is inconsistent"*.
+///
+/// ⛔ `getUnitTypeFromUniformMappingAsString` READS THE MAPPING'S **VALUES**, NOT ITS KEYS
+/// (`Utils.cpp:268`): the keys are the core handles a `query_map` is keyed BY, and the values are the
+/// peer units. And it reads `getValues()[0]` ONLY, on the strength of its own `TODO` that agreement
+/// between the entries *"should be left to canonicalization"* (`:260-261`) — so one entry decides the
+/// type for every core, and this port does not check the rest either.
+///
+/// ⛔ ITS `if (unit_type.empty())` GUARDS A STRING ASSIGNED `""` TWO LINES ABOVE — always true. What
+/// that makes reachable is the trailing `return unit_type` for a first value defined by NEITHER op,
+/// where the reference hands back an EMPTY name instead of `std::nullopt`; both miss
+/// `stringToSenComponents.find`, so `None` is the same answer.
+///
+/// ⛔ A REGISTER FILE IS NOT A TRANSFER PEER. The `get_local_unit` arm answers a name like `ptxrf`
+/// and no [`DfirUnit`] spells one, which is the reference's *"Unknown receiver"*/*"Unknown
+/// destination"* — see [`ViewUnit`], whose split is the same one from the memory-view side.
+fn unit_behind(val: Val, scope: &[DfirOp]) -> Option<DfirUnit> {
+    match op_at(&defining_position(val, scope)?, scope)? {
+        // `if (auto unit = getDefiningOp<dataflow::GetUnitOp>()) return unit.getType().str();`
+        DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. }) => Some(*unit),
+        DfirOp::Uniform(uniform::Op::QueryMap { map, .. }) => {
+            // `if (!def_map_op) return std::nullopt; if (def_map_op.getValues().empty()) ..`
+            let mapping = op_at(&defining_position(*map, scope)?, scope)?;
+            let DfirOp::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) = mapping else {
+                return None;
+            };
+            let (_, first_value) = pairs.first()?;
+            // ⛔ ONE LEVEL ONLY: the reference resolves that value as a `get_unit` or a
+            // `get_local_unit` and does not ask a second `query_map`.
+            match op_at(&defining_position(*first_value, scope)?, scope)? {
+                DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. }) => Some(*unit),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2241,6 +2292,340 @@ impl VectorOperand {
     }
 }
 
+/// `operand.orig_precision_ = getPrecisionInString(elem_type); operand.on_the_fly_conv_precision_ =
+/// operand.orig_precision_;` — the pair eleven of [`VectorOperand::with_precision`]'s arms write.
+fn set_both_precisions(operand: &mut VectorOperand, elem: ElemType) {
+    operand.orig_precision = Some(precision_in_string(elem));
+    operand.on_the_fly_conv_precision = operand.orig_precision;
+}
+
+/// THE PRECISION DATA OFF THE `pt` PORT ARRIVES AT — *"Input from PT is int16/fp16 in DD2 and
+/// int24/fp24 in Sen1p5"* (`VectorOperands.cpp:446-455`), which OVERRIDES the element type the
+/// receive itself carries.
+///
+/// ⛔ `isIntOrIndex()` IS TRUE FOR AN `IntegerType` ONLY, so an MX-int element takes the FLOAT arm:
+/// `CustomMXIntType` is not an integer type to MLIR and the reference's `else` is unconditional.
+const fn pt_receive_precision(elem: ElemType, isa: IsaGen) -> sen::Precision {
+    match (elem, isa) {
+        (ElemType::Int(_), IsaGen::Sen1p5) => sen::Precision::Int24,
+        (ElemType::Int(_), IsaGen::Rcudd1a) => sen::Precision::Int16,
+        (_, IsaGen::Sen1p5) => sen::Precision::Fp24,
+        (_, IsaGen::Rcudd1a) => sen::Precision::Fp16,
+    }
+}
+
+/// WHAT [`VectorOperand::with_precision`] ANSWERS — the operand AND the `bool&` beside it.
+///
+/// ⛔ THE OUT-PARAMETER IS NOT AN IMPLEMENTATION DETAIL OF THE CALL. Every caller copies it into an
+/// `is_precision_converted_global` and hands that to `patternAgnosticFuseNonComputeOpsHelper`
+/// (`VectorChainToSentientPESFP.cpp:47-54`, `:1213`), which is what erases the folded cast — so an
+/// answer that did not say whether a cast folded in would leave the cast in the program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct OperandWithPrecision {
+    /// The operand, or the reference's `std::nullopt`.
+    pub operand: Option<VectorOperand>,
+    /// `is_precision_converted` — set by the three arms that FOLD A CAST into their answer.
+    pub precision_converted: bool,
+}
+
+impl VectorOperand {
+    /// Replaces: e304_getOperandWithPrecision
+    ///
+    /// **304/384** `VectorOperand::getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389` (254L).
+    ///
+    /// WHICH OPERAND A COMPUTE READS AND AT WHAT PRECISION — the dispatch every other `from_*` in
+    /// this file is one arm of, plus the `bool&` beside its answer.
+    ///
+    /// ⛔ THE THREE CAST ARMS ANSWER WITH SOMEONE ELSE'S OPERAND and overwrite only
+    /// `on_the_fly_conv_precision_`; every other arm writes BOTH, and `NegOp` writes neither (`:566`).
+    /// ⛔ `traverse_upwards` PICKS WHICH END OF A FOLDED OP IS ASKED — its input's definition, same
+    /// block only (`:466`), or its single USER — but the RECURSION always takes the declaration's
+    /// default `true` (`:468`, `:551`), so a chain resolves upwards from the first hop on.
+    /// ⛔ THE `pt` ARM OVERRIDES THE TYPE THE IR CARRIES (`:446-455`), which is how an `f16` receive
+    /// becomes the vendor's `opAPrecision = #sentient<precision fp24>`.
+    /// ⛔ `Multiply`/`MultiplyAccumulate`/`Binary` ARE AN EXPLICIT `std::nullopt` (`:643-645`): a
+    /// compute is not an operand of a compute, and falling through would be right for a wrong reason.
+    pub fn with_precision<A: Arch>(
+        op: &OpId,
+        comp: ComputeComp,
+        traverse_upwards: bool,
+        scope: &[DfirOp],
+        get_operand: &mut impl FnMut(&OpId, ComputeComp) -> Option<VectorOperand>,
+    ) -> OperandWithPrecision {
+        // `is_precision_converted = false;`
+        let mut converted = false;
+        let Some(at) = op_at(op, scope) else {
+            return OperandWithPrecision {
+                operand: None,
+                precision_converted: converted,
+            };
+        };
+        let operand = match at {
+            // The four memory accesses. ⭐ EACH READS THE **VECTOR** IT MOVES, not the view: the
+            // loads take their result's type and the stores `getValueToStore()`'s (`:397`, `:405`,
+            // `:415`, `:425`) — one field here either way.
+            DfirOp::Vector(vector::Op::Load { ty, .. } | vector::Op::Store { ty, .. })
+            | DfirOp::Agen(agen::Op::VectorLoad { ty, .. } | agen::Op::VectorStore { ty, .. }) => {
+                VectorOperand::from_load_or_store_op(op, scope).map(|mut operand| {
+                    set_both_precisions(&mut operand, ty.elem);
+                    operand
+                })
+            }
+            // `getOperandFromSendOp(dcc_ext_ctx, send_op, comp)`.
+            DfirOp::Dataflow(dataflow::Op::Send { to, ty, .. }) => send_destination(*to, scope)
+                .map(|unit| {
+                    let mut operand = VectorOperand::from_send_op::<A>(unit, comp, op.clone());
+                    set_both_precisions(&mut operand, ty.elem);
+                    operand
+                }),
+            // `getOperandFromReceiveOp(dcc_ext_ctx, recv_op, comp)`, then the PT override.
+            DfirOp::Dataflow(dataflow::Op::Receive { from, ty, .. }) => {
+                recv_source(*from, scope).map(|unit| {
+                    let mut operand = VectorOperand::from_receive_op::<A>(unit, comp, op.clone());
+                    // `if (operand.value().getFirstValue() == "pt")`.
+                    if operand.values.first() == Some(&OperandValue::Port(sen::Port::Pt)) {
+                        operand.orig_precision = Some(pt_receive_precision(ty.elem, A::GEN));
+                        operand.on_the_fly_conv_precision = operand.orig_precision;
+                    } else {
+                        set_both_precisions(&mut operand, ty.elem);
+                    }
+                    operand
+                })
+            }
+            // `mlir::arith::FPToSIOp` and `mlir::arith::SIToFPOp` — ⛔ THE FLAG IS SET BEFORE THE
+            // `hasOneUse()` TEST (`:461`, `:487`), so a multiply-used conversion reports one anyway.
+            DfirOp::Arith(arith::Op::FpToSi(conv) | arith::Op::SiToFp(conv)) => {
+                converted = true;
+                folded_cast(
+                    op,
+                    conv.input,
+                    conv.to.elem,
+                    comp,
+                    traverse_upwards,
+                    scope,
+                    get_operand,
+                )
+            }
+            // `getOperandFromConstantOp(const_op)` — ⭐ the scalar `arith.constant`s the reference
+            // also reaches here abort inside it and inside `getElementType`; see entry 166's note.
+            DfirOp::Arith(const_op @ arith::Op::DenseConstant { ty, .. }) => {
+                VectorOperand::from_constant_op(const_op, op.clone()).map(|mut operand| {
+                    set_both_precisions(&mut operand, ty.elem);
+                    operand
+                })
+            }
+            // `getOperandFromConstantBitstreamOp(const_bit_op)` — ⛔ WITH ITS DEFAULTED
+            // `is_constant_splatted_vector = false` (`:300`), so the value is the raw immediate and
+            // NOT the pseudo-port spelling entry 278's trivial-shuffle arm asks for.
+            DfirOp::VectorChain(vc::Op::ConstantBitstream { value, ty, .. }) => {
+                // `op.getValue()[0]` — an unchecked index; an empty list is `None` here.
+                value.first().map(|const_val| {
+                    let mut operand = VectorOperand::from_constant_bitstream_op(
+                        BitstreamConstant::Immediate(*const_val),
+                        op.clone(),
+                    );
+                    set_both_precisions(&mut operand, ty.elem);
+                    operand
+                })
+            }
+            // `getOperandFromShuffleOp(dcc_ext_ctx, shuffle_op, comp)` — ⭐ THE PRECISIONS ARE SET
+            // ONLY IF IT ANSWERED (`:533-540`), and the `nullopt` is returned as it stands.
+            DfirOp::VectorChain(vc::Op::Shuffle { ty, .. }) => {
+                VectorOperand::from_shuffle_op::<A>(op, comp, scope, get_operand).map(
+                    |mut operand| {
+                        set_both_precisions(&mut operand, ty.elem);
+                        operand
+                    },
+                )
+            }
+            // `vectorchain::CastOp` — ⛔ HERE THE FLAG IS SET **INSIDE** `hasOneUse()` (`:542-543`),
+            // unlike the two `arith` conversions above. Entry 343 is this body reached from
+            // `getOperandFromCastOp`.
+            DfirOp::VectorChain(vc::Op::Cast { input, ty, .. }) => {
+                if use_positions(op, scope).len() == 1 {
+                    converted = true;
+                    folded_cast(
+                        op,
+                        *input,
+                        ty.elem,
+                        comp,
+                        traverse_upwards,
+                        scope,
+                        get_operand,
+                    )
+                } else {
+                    None
+                }
+            }
+            // `getOperandFromNegOp(..)` — *"The NegOp doesn't change the original precision"*.
+            DfirOp::VectorChain(vc::Op::Neg { .. }) => {
+                VectorOperand::from_neg_op(op, comp, scope, get_operand)
+            }
+            // `vectorchain::SelectOp` — the only writer of [`VectorOperand::splat`].
+            DfirOp::VectorChain(vc::Op::Select {
+                input,
+                input_ty,
+                ty,
+                ..
+            }) => {
+                if use_positions(op, scope).len() != 1 {
+                    None
+                } else if traverse_upwards {
+                    // ⛔ NO `has_value()` GUARD ON THIS BRANCH (`:576-584`): the reference
+                    // dereferences whatever came back, so a select whose input has no operand is a
+                    // null deref there and `None` here.
+                    defining_position(*input, scope)
+                        .and_then(|parent| get_operand(&parent, comp))
+                        .map(|mut operand| {
+                            // ⭐ THE INPUT'S ELEMENT TYPE, `getData().getType()` (`:578`).
+                            set_both_precisions(&mut operand, input_ty.elem);
+                            // `operand.value().splat_ = "east";`
+                            operand.splat = Some(sen::Port::East);
+                            operand
+                        })
+                } else {
+                    // ⭐ AND THE DOWNWARD BRANCH TAKES THE SELECT'S **OWN** TYPE (`:589`), not its
+                    // input's, and sets no splat.
+                    use_positions(op, scope)
+                        .into_iter()
+                        .next()
+                        .and_then(|user| get_operand(&user, comp))
+                        .map(|mut operand| {
+                            set_both_precisions(&mut operand, ty.elem);
+                            operand
+                        })
+                }
+            }
+            // `vectorchain::ElementWiseCompareOp` — ⛔ UPWARDS ONLY (`:598-600`); asked downwards it
+            // falls past every arm to the trailing `nullopt`.
+            DfirOp::VectorChain(vc::Op::ElementWiseCompare { ty, .. }) if traverse_upwards => {
+                // `for (auto user : ..getUsers()) if (isa<agen::VectorStoreOp>(user))`.
+                let store = use_positions(op, scope).into_iter().find(|user| {
+                    matches!(
+                        op_at(user, scope),
+                        Some(DfirOp::Agen(agen::Op::VectorStore { .. }))
+                    )
+                });
+                match store {
+                    Some(user) => {
+                        // ⛔ THE RECURSION SHARES THE ONE `bool&`, and it re-initialises it to
+                        // `false` on entry — so the store's answer REPLACES this call's flag rather
+                        // than adding to it. Reaching here it was still false either way.
+                        let answer = VectorOperand::with_precision::<A>(
+                            &user,
+                            comp,
+                            traverse_upwards,
+                            scope,
+                            get_operand,
+                        );
+                        converted = answer.precision_converted;
+                        answer.operand.map(|mut operand| {
+                            set_both_precisions(&mut operand, ty.elem);
+                            operand
+                        })
+                    }
+                    // `VectorOperand(ISTATE, "0", ew_compare_op)` — ⚠️ CARRYING THE REFERENCE'S OWN
+                    // `TODO`: *"set appropriate istate number once translator changes are
+                    // implemented"*, which is why the index is [`sen::IStateIndex::S0`] and not a
+                    // number this port chose.
+                    None => {
+                        let mut operand = VectorOperand::new(
+                            VectorOperandType::IState,
+                            OperandValue::Slice(RegisterSlice::IState(sen::IStateIndex::S0)),
+                            op.clone(),
+                        );
+                        set_both_precisions(&mut operand, ty.elem);
+                        Some(operand)
+                    }
+                }
+            }
+            // `mlir::uniform::QueryMapOp` — ONE OPERAND PER MAPPED VALUE, FOLDED INTO THE FIRST.
+            //
+            // ⛔ THE FOLD KEEPS ONLY `values_.front()` OF EACH LATER OPERAND (`:631-633`), so the
+            // uniformized operand is one kind and one position with one value per core — which is
+            // what [`VectorOperand::values`] is a list for.
+            // ⛔ AND THE REFERENCE DEREFERENCES EVERY ANSWER UNCHECKED (`:628-635`), the null
+            // `map_op`, each `operand.value()`, its `values_.front()` and the final
+            // `folded_operand.value()` among them; each is a `None` here.
+            DfirOp::Uniform(uniform::Op::QueryMap { map, .. }) => {
+                let mapping = defining_position(*map, scope).and_then(|at| op_at(&at, scope));
+                let Some(DfirOp::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = mapping
+                else {
+                    return OperandWithPrecision {
+                        operand: None,
+                        precision_converted: converted,
+                    };
+                };
+                let mut folded: Option<VectorOperand> = None;
+                for (_, value) in pairs {
+                    let operand = defining_position(*value, scope)
+                        .and_then(|position| get_operand(&position, comp));
+                    match (&mut folded, operand) {
+                        // `if (!folded_operand.has_value()) folded_operand = operand;` — ⭐ WHICH
+                        // RETRIES: a first value with no operand leaves the fold empty and the next
+                        // entry becomes the base.
+                        (None, operand) => folded = operand,
+                        (Some(folded), Some(operand)) => {
+                            folded.values.extend(operand.values.first().copied());
+                        }
+                        (Some(_), None) => {}
+                    }
+                }
+                // `folded_operand.value().op_ = query_op;` — the fold answers for the QUERY, not for
+                // whichever core's value seeded it.
+                folded.map(|mut operand| {
+                    operand.op = op.clone();
+                    operand
+                })
+            }
+            // `isa<MultiplyOp, MultiplyAndAccumulateOp, BinaryOp>(op) -> std::nullopt`, and the
+            // function's own trailing `return std::nullopt` for everything else.
+            _ => None,
+        };
+        OperandWithPrecision {
+            operand,
+            precision_converted: converted,
+        }
+    }
+}
+
+/// THE BODY THE THREE CAST ARMS SHARE — `arith.fptosi` (`:461-486`), `arith.sitofp` (`:487-512`) and
+/// `vectorchain.cast` (`:541-565`), which differ only in where the flag is set.
+///
+/// ⛔ ONLY `on_the_fly_conv_precision_` IS OVERWRITTEN: the cast folds INTO an operand that keeps its
+/// own origin, its own position and its own original precision.
+/// ⛔ THE UPWARD BRANCH REQUIRES THE SAME BLOCK AND THE DOWNWARD ONE DOES NOT — see [`same_block`],
+/// which is the same question asked of an operand already built.
+fn folded_cast(
+    op: &OpId,
+    input: Val,
+    result_elem: ElemType,
+    comp: ComputeComp,
+    traverse_upwards: bool,
+    scope: &[DfirOp],
+    get_operand: &mut impl FnMut(&OpId, ComputeComp) -> Option<VectorOperand>,
+) -> Option<VectorOperand> {
+    // `if (cast_op->hasOneUse())`.
+    if use_positions(op, scope).len() != 1 {
+        return None;
+    }
+    let asked = if traverse_upwards {
+        // `if (cast_op.getIn().getDefiningOp()->getBlock() == op->getBlock())`.
+        let parent = defining_position(input, scope)?;
+        if parent.block() != op.block() {
+            return None;
+        }
+        parent
+    } else {
+        // `Operation *user = (*cast_op->getUses().begin()).getOwner();`
+        use_positions(op, scope).into_iter().next()?
+    };
+    let mut operand = get_operand(&asked, comp)?;
+    operand.on_the_fly_conv_precision = Some(precision_in_string(result_elem));
+    Some(operand)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{BitstreamConstant, IrfIndex, LayoutAndIndices, RegisterSlice};
@@ -2250,13 +2635,13 @@ mod unit_tests {
         same_block,
     };
     use crate::arch::{Dd2, Sen1p5};
-    use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
-    use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Index, Op as DfirOp, Val};
-    use crate::islands::dataflow_ir::dialects::{affine, agen, arith, dataflow, vector};
+    use crate::islands::dataflow_ir::dialects::{affine, agen, arith, dataflow, uniform, vector};
+    use crate::islands::dataflow_ir::link::{Link, Lxsu, Pe, PtRowUnit, Sfp};
     use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
     use crate::islands::sentient::dialects::sentient as sen;
+    use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
 
     /// The vector every op in these fixtures is typed at — 128 lanes of bf16, the width
     /// `dcc/test/PESFP/*.mlir` computes at.
@@ -2321,6 +2706,7 @@ mod unit_tests {
             values: Vec::new(),
             orig_precision: None,
             on_the_fly_conv_precision: None,
+            splat: None,
         }
     }
 
@@ -3360,11 +3746,122 @@ mod unit_tests {
         assert_eq!(operand.op, OpId::at(&[4]));
     }
 
+    /// `getOperand` (entry 320) AS THE SCC CUT: `getOperandWithPrecision` with the declaration's
+    /// default `traverse_upwards = true` (`VectorOperands.hpp:85`), which is what every recursion
+    /// inside it passes.
+    fn resolved(op: &OpId, comp: ComputeComp, scope: &[DfirOp]) -> Option<VectorOperand> {
+        VectorOperand::with_precision::<Sen1p5>(op, comp, true, scope, &mut |inner, inner_comp| {
+            resolved(inner, inner_comp, scope)
+        })
+        .operand
+    }
+
+    /// 🎯 304/384 — THE VENDOR'S OWN CAST OVER A UNIFORMIZED PT RECEIVE, on `SENARCH=sen1p5`.
+    /// `Conversion/VectorChainToSentientPESFP/mixed_precision.mlir:628-629` maps 64 core handles to
+    /// `ptrow7` `get_unit`s and reads one back with `uniform.query_map`; `:745-747` is
+    /// `%270 = dataflow.receive %195 : vector<64xf16>`, `%271 = vectorchain.cast %270 :
+    /// vector<64xf16>, vector<64xf32>` and a MAC over `%271`. The PE's expectation is
+    /// `opA = #sentient<compute_port pt>, opAPrecision = #sentient<precision fp24>` (`:332`).
+    ///
+    /// ⛔ SO THE ANSWER CONTRADICTS THE IR TWICE: the original precision is `fp24` where the receive
+    /// says `f16`, and the on-the-fly precision is the CAST's `fp32` — while the operand's position
+    /// stays the RECEIVE's, which is what the golden's `opADataID` is counted from.
+    #[test]
+    fn a_cast_over_a_uniformized_pt_receive_reads_fp24_and_converts_to_fp32() {
+        let f16 = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let f32 = Vector {
+            len: 64,
+            elem: ElemType::F32,
+        };
+        let (_, from) = Link::<PtRowUnit<7>, Pe>::between(Val(195), Val(196)).ends();
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(193),
+                residency: Residency::Corelet {
+                    core: Core::checked(31).expect("the arch has core 31"),
+                    corelet: Corelet::checked(1).expect("the arch has corelet 1"),
+                },
+                unit: DfirUnit::PtRow(Row::checked(7).expect("this arch's PT has row seven")),
+                num_folds: None,
+            }),
+            DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(194),
+                pairs: vec![(Val(0), Val(193))],
+            }),
+            DfirOp::Uniform(uniform::Op::QueryMap {
+                result: Val(195),
+                map: Val(194),
+                key: Val(0),
+            }),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(270),
+                from,
+                ty: f16,
+            }),
+            DfirOp::VectorChain(vc::Op::Cast {
+                result: Val(271),
+                input: Val(270),
+                input_ty: f16,
+                ty: f32,
+            }),
+            // `%273 = vectorchain.multiply_and_accumulate %271, %cst, %cst_0[..]` — the cast's ONE
+            // use, and the compute that asks. Its reduction map is not consulted from here.
+            DfirOp::VectorChain(vc::Op::MultiplyAccumulate {
+                result: Val(273),
+                a: Val(271),
+                b: Val(300),
+                acc: Val(301),
+                reduction_map: AffineMap {
+                    dims: 1,
+                    syms: 0,
+                    results: vec![AffineExpr::dim(0)],
+                },
+                operand_ty: f32,
+                ty: f32,
+            }),
+        ];
+
+        let answer = VectorOperand::with_precision::<Sen1p5>(
+            &OpId::at(&[4]),
+            ComputeComp::Pe,
+            true,
+            &scope,
+            &mut |op: &OpId, comp| resolved(op, comp, &scope),
+        );
+
+        assert!(answer.precision_converted);
+        let operand = answer
+            .operand
+            .expect("the receive behind the cast resolves");
+        assert_eq!(operand.kind, VectorOperandType::Link);
+        assert_eq!(operand.name(), Some(sen::Port::Pt));
+        assert_eq!(operand.orig_precision, Some(sen::Precision::Fp24));
+        assert_eq!(
+            operand.on_the_fly_conv_precision,
+            Some(sen::Precision::Fp32)
+        );
+        assert_eq!(operand.op, OpId::at(&[3]));
+        assert_eq!(operand.splat, None);
+
+        // ⭐ AND THE COMPUTE ITSELF IS NOT AN OPERAND: `MultiplyAndAccumulateOp` is the explicit
+        // `std::nullopt` (`VectorOperands.cpp:643-645`).
+        let compute = VectorOperand::with_precision::<Sen1p5>(
+            &OpId::at(&[5]),
+            ComputeComp::Pe,
+            true,
+            &scope,
+            &mut |op: &OpId, comp| resolved(op, comp, &scope),
+        );
+        assert_eq!(compute.operand, None);
+        assert!(!compute.precision_converted);
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e304_getOperandWithPrecision
 // crustify:todo: e320_getOperand
 // crustify:todo: e343_getOperandFromCastOp

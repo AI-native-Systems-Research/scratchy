@@ -1287,6 +1287,41 @@ impl AffineMap {
         }
     }
 
+    /// THIS MAP APPLIED TO A VECTOR OF LITERALS — `AffineMap::compose(ArrayRef<int64_t> values)`,
+    /// which is how `calculateTimeBounds` and `calculateTimeOffsets` REORDER their vectors through
+    /// `time_order`: `time_bounds = time_order.compose(time_bounds)`
+    /// (`dialect_utils/Agen/Utils.cpp:255`), `time_offsets = time_order.compose(tmp_non_const)`
+    /// (`:115`).
+    ///
+    /// ⭐ FOR A PERMUTATION IT IS A GATHER: result `i` is `values[j]` where this map's result `i` is
+    /// `d<j>`. Nothing here assumes one, though — MLIR substitutes the literals and folds, so a map
+    /// with arithmetic in it evaluates.
+    ///
+    /// ⛔ MLIR'S `assert(getNumInputs() == values.size())` IS A MISSING INPUT READ AS ZERO HERE, and
+    /// a surplus one dropped, because this crate never runtime-refuses. A result that still mentions
+    /// a SYMBOL after the substitution has no literal value and comes back as 0 for the same reason;
+    /// [`Self::syms`] is zero for every map this is called on.
+    #[must_use]
+    pub fn compose_constants(&self, values: &[i64]) -> Vec<i64> {
+        let literals = AffineMap {
+            dims: 0,
+            syms: 0,
+            results: (0..self.dims as usize)
+                .map(|i| AffineExpr::Const(values.get(i).copied().unwrap_or(0)))
+                .collect(),
+        };
+        let composed = self.compose(&literals);
+        composed
+            .results
+            .iter()
+            .map(|r| {
+                r.flatten(composed.dims, composed.syms)
+                    .as_constant()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
     /// DROP THE SYMBOLS NOBODY MENTIONS AND RENUMBER THE REST DENSELY — `compressUnusedSymbols`.
     ///
     /// ⛔ IT IS `projectSymbols` WITH `compressSymbolsFlag=true` (`AffineMap.cpp:724-731`): each
@@ -2027,6 +2062,51 @@ impl FlatConstraints {
         match (min_value, max_value) {
             (Some(min_value), Some(max_value)) => Some(max_value - min_value + 1),
             _ => None,
+        }
+    }
+
+    /// WHICH SYMBOL BOUNDS DIMENSION `dim_pos` FROM ABOVE, when a symbol is what bounds it —
+    /// `agen::utils::isDimASymbolicRange(csts, dim_pos, symbol_pos)`
+    /// (`dialect_utils/Agen/Utils.cpp:171-208`). The out-parameter and the `bool` are one value, as
+    /// in [`Self::is_dim_a_constant_range`].
+    ///
+    /// ⛔ THE SHAPE IT RECOGNISES IS EXACTLY `d >= 0` AND `-d + s - 1 >= 0`: a lower bound is a
+    /// coefficient of +1 with NO symbol and a zero constant, an upper bound is -1 with exactly ONE
+    /// symbol and a constant of **-1**. So the extent is the symbol's own value, which is why
+    /// `calculateTimeBounds` pushes `time_symbols[symbol_pos]`'s constant unchanged (`:238-241`).
+    ///
+    /// ⛔ THE LAST SYMBOL-MENTIONING ROW WINS, whether or not that row is the one that matched — the
+    /// C++ assigns `symbol_pos` before it tests the coefficient. (Its `c != dim_pos` guard inside the
+    /// symbol loop is vacuous: `dim_pos` is a DIMENSION column and the loop runs over symbol ones.)
+    #[must_use]
+    pub fn is_dim_a_symbolic_range(&self, dim_pos: u32) -> Option<u32> {
+        let dims = self.dims as usize;
+        let constant = self.num_cols() - 1;
+        let (mut found_min, mut found_max) = (false, false);
+        let mut symbol_pos = None;
+        for row in &self.inequalities {
+            let names_only_this =
+                (0..dims).all(|column| column == dim_pos as usize || row[column] == 0);
+            if !names_only_this {
+                continue;
+            }
+            let mut symbols = 0;
+            for (offset, coeff) in row[dims..dims + self.syms as usize].iter().enumerate() {
+                if *coeff != 0 {
+                    symbols += 1;
+                    symbol_pos = u32::try_from(offset).ok();
+                }
+            }
+            match row[dim_pos as usize] {
+                1 if symbols == 0 && row[constant] == 0 => found_min = true,
+                -1 if symbols == 1 && row[constant] == -1 => found_max = true,
+                _ => {}
+            }
+        }
+        if found_min && found_max {
+            symbol_pos
+        } else {
+            None
         }
     }
 

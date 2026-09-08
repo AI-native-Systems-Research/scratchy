@@ -2180,8 +2180,11 @@ fn is_named_harmless(op: &DfirOp) -> bool {
             | affine::Op::VectorStore { .. },
         ) => false,
 
-        // `mlir::symbol::CreateSymbolOp` — the whole of that dialect here.
+        // `mlir::symbol::CreateSymbolOp` — the only member of that dialect the list names.
         DfirOp::Symbol(symbol::Op::CreateSymbol { .. }) => true,
+        // ⛔ AND THE OTHER TWO ARE NOT ON IT. `symbol.query_map` and its mapping fall past the nine,
+        // so a conditional does not move across one — the same answer `uniform.query_map` gets below.
+        DfirOp::Symbol(symbol::Op::ImmutableMapping { .. } | symbol::Op::QueryMap { .. }) => false,
 
         // ── dialects the list does not mention at all ────────────────────────────────────────────
         // ⭐ AND THIS IS THE ARM THAT DOES THE WORK: `dataflow.receive`, `dataflow.send`,

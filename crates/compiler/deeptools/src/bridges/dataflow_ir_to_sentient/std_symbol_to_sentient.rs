@@ -60,9 +60,12 @@
 //! | `e275_LowerSymbolQueryMap` | 275/384 | 68 | `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40` |
 //! | `e303_runOnOperation` | 303/384 | 15 | `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23` |
 
-use crate::islands::dataflow_ir::Values;
-use crate::islands::dataflow_ir::dialects::Val;
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, affine, defining_op, regions, scf, symbol, uses,
+};
 use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::dataflow_ir::{Program, Values};
 use crate::islands::sentient::dialects::Op as SenOp;
 use crate::islands::sentient::dialects::sentient as sen;
 
@@ -287,12 +290,155 @@ pub fn lower_symbol_query_map(
     // Back into `uses` order, the walk having run against it in reverse.
     replacements.reverse();
 
-    QueryMapLowering::Conditional { if_op, replacements }
+    QueryMapLowering::Conditional {
+        if_op,
+        replacements,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 303/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE `symbol.query_map` THE PASS LOWERED, AND THE TWO OPS THAT LEAVES DEAD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoweredQueryMap<'a> {
+    /// `to_be_deleted_list.push_back(query_map)` (`SymbolToSentient.cpp:46`).
+    pub query_map: &'a DfirOp,
+    /// `to_be_deleted_list.push_back(immutable_mapping)` (`:47`) — queued for BOTH shapes, since
+    /// both pushes precede the one-pair early return.
+    pub mapping: &'a DfirOp,
+    /// Entry 275's answer, its `replacements` aligned with `uses` as documented there.
+    pub lowering: QueryMapLowering,
+}
+
+/// WHAT ONE `dataflow.program_unit` CAME OUT OF THE PASS AS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitQueryMaps<'a> {
+    /// `getUnitType(unit.getUnits()[0].getDefiningOp<GetUnitOp>())` (`:26-27`) — see entry 196 for
+    /// why the island reads this off [`crate::islands::dataflow_ir::Units::kind`].
+    pub comp: GenericComp,
+    /// This unit's query maps in pre-order (`:29-32`), each with its lowering.
+    pub lowered: Vec<LoweredQueryMap<'a>>,
+}
+
+/// Replaces: e303_runOnOperation
+///
+/// **303/384** `SymbolToSentientLoweringPass::runOnOperation` —
+/// `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23` (15L). Entry 275 over every
+/// `symbol.query_map` of every program unit, under that unit's own component.
+///
+/// ⛔ THE ERASE LOOP'S `DT_CHECK_MSG(op->use_empty())` (`:33-35`) HOLDS BY CONSTRUCTION: entry 275
+/// re-points every use it was handed, and [`LoweredQueryMap`] carries the pair rather than erasing.
+/// ⛔ A query whose `map` is not a `symbol.symbol_immutable_mapping` is the `DT_CHECK` at `:44` — it
+/// is skipped here, so it is neither lowered nor queued.
+#[must_use]
+pub fn run_on_operation<'a, A: Arch>(
+    program: &'a Program<A>,
+    values: &mut Values,
+) -> Vec<UnitQueryMaps<'a>> {
+    let mut per_unit: Vec<UnitQueryMaps<'_>> = Vec::new();
+    // `module_op.walk<PreOrder>([&](dataflow::ProgramUnitOp unit) { .. })` — the units are a field of
+    // the program rather than ops among ops, exactly as entry 196 records.
+    for unit in program.units.iter() {
+        let comp = unit.on.kind().generic();
+        let mut sites: Vec<&DfirOp> = Vec::new();
+        query_maps(&unit.body, &mut sites);
+
+        let mut lowered: Vec<LoweredQueryMap<'_>> = Vec::new();
+        for site in sites {
+            let DfirOp::Symbol(symbol::Op::QueryMap { result, map, key }) = site else {
+                continue;
+            };
+            // `query_map.getMap().getDefiningOp<symbol::SymbolImmutableMappingOp>()`.
+            let Some(mapping) = defining_op(*map, &unit.body) else {
+                continue;
+            };
+            let DfirOp::Symbol(symbol::Op::ImmutableMapping { pairs, .. }) = mapping else {
+                continue;
+            };
+            // `immutable_mapping.getKeys().size() == 1` is [`SymbolMapping::Single`]; two or more is
+            // the chain. An empty table has no `getValues().back()` and cannot be built by the
+            // scheduler, so it is not a site.
+            let symbols = match pairs.as_slice() {
+                [] => continue,
+                [(_, value)] => SymbolMapping::Single(*value),
+                [first, .., (_, last_value)] => SymbolMapping::Chain(QueryMapping {
+                    key: *key,
+                    first: *first,
+                    middle: &pairs[1..pairs.len() - 1],
+                    last_value: *last_value,
+                }),
+            };
+            lowered.push(LoweredQueryMap {
+                query_map: site,
+                mapping,
+                lowering: lower_symbol_query_map(
+                    comp,
+                    symbols,
+                    &query_map_uses(*result, &unit.body),
+                    values,
+                ),
+            });
+        }
+        per_unit.push(UnitQueryMaps { comp, lowered });
+    }
+    per_unit
+}
+
+/// `unit.walk<WalkOrder::PreOrder>([&](Operation* op) { if (dyn_cast<SymbolQueryMapOp>(op)) .. })`
+/// (`SymbolToSentient.cpp:29-32`) — the op before the ops of its regions, which for this op is only
+/// the enclosing loops' order.
+fn query_maps<'a>(body: &'a [DfirOp], found: &mut Vec<&'a DfirOp>) {
+    for op in body {
+        if matches!(op, DfirOp::Symbol(symbol::Op::QueryMap { .. })) {
+            found.push(op);
+        }
+        for region in regions(op) {
+            query_maps(region, found);
+        }
+    }
+}
+
+/// EVERY USE OF THE QUERY'S RESULT, CLASSIFIED, IN MLIR USE-LIST ORDER — `for (auto& use :
+/// query_map.getResult().getUses())` (`SymbolToSentient.cpp:63-75`).
+///
+/// ⛔⛔ THE TEST IS ON THE **LOOP**, NOT ON THIS USE'S OPERAND NUMBER: `sentient_for.getBound()
+/// .getDefiningOp() == query_map` (`:68`) is asked once per use, so a loop that reads the query BOTH
+/// as its bound and as something else has BOTH uses counted as loop-bound uses. Classifying by
+/// operand number instead would inflate `num_non_loop_bound_uses` and, on L3, mint a result nothing
+/// reads.
+/// ⛔ THE BOUND IS THE **UPPER** ONE. `sentient.for %i = %bound` is a trip count and what lowers into
+/// it is the DataflowIR loop's `hi`; a use as `lo`, as `step` or as an `iter_args` init is an `Other`.
+/// ⛔ AND THE ORDER IS REVERSED, because MLIR's use list is reverse program order (`:90-92`) and
+/// entry 275 walks it backwards.
+fn query_map_uses(result: Val, body: &[DfirOp]) -> Vec<QueryMapUse> {
+    let mut classified: Vec<QueryMapUse> = uses(result, body)
+        .into_iter()
+        .map(|user| match user {
+            DfirOp::Scf(scf::Op::For { hi, .. }) if *hi == result => QueryMapUse::LoopBound,
+            DfirOp::Affine(affine::Op::For {
+                hi: affine::Bound::Val(hi),
+                ..
+            }) if *hi == result => QueryMapUse::LoopBound,
+            _ => QueryMapUse::Other,
+        })
+        .collect();
+    classified.reverse();
+    classified
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::dialects::arith;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+    };
+    use crate::units::DfirUnit;
 
     /// 🎯 226/384 — THE THREE-PAIR MAPPING OF THE REFERENCE'S OWN WORKED EXAMPLE
     /// (`SymbolToSentient.cpp:112-121`), with two results.
@@ -414,9 +560,117 @@ mod unit_tests {
         assert_eq!(lx_uses, vec![lx[0], lx[1], lx[0], lx[1]]);
     }
 
-}
+    /// 🎯 303/384 — THE VENDOR'S OWN `@basic`
+    /// (`dcc/test/Conversion/SymbolToSentient/symbols_query.mlir:128-147`): one `l3su` unit, a
+    /// two-pair mapping inside a loop, and a query used as the inner loop's bound AND as a subtract's
+    /// operand. Its expectation is `%[[VAL_9]]:2`, with `#0` the bound and `#1` the subtract
+    /// (`:19-24`).
+    ///
+    /// ⛔ THE MAPPING AND THE QUERY ARE BOTH INSIDE THE OUTER LOOP, so a walk that stopped at the
+    /// unit's top level would find neither.
+    #[test]
+    fn the_vendors_basic_case_numbers_the_bound_and_the_subtract_apart() {
+        let mut values = Values::default();
+        let symbol0 = values.mint();
+        let symbol1 = values.mint();
+        let (c0, c1, c2) = (values.mint(), values.mint(), values.mint());
+        let (arg0, sub, map, query, arg1, sub2) = (
+            values.mint(),
+            values.mint(),
+            values.mint(),
+            values.mint(),
+            values.mint(),
+            values.mint(),
+        );
+        let subtract = |result, lhs, rhs| {
+            DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                result,
+                lhs,
+                rhs,
+                ty: ScalarTy::Index,
+            }))
+        };
+        // `sentient.for` is a trip count, so the DataflowIR loop it lowers from carries the query as
+        // its `hi`.
+        let outer_body = vec![
+            subtract(sub, c2, arg0),
+            DfirOp::Symbol(symbol::Op::ImmutableMapping {
+                result: map,
+                pairs: vec![(c0, symbol0), (c1, symbol1)],
+            }),
+            DfirOp::Symbol(symbol::Op::QueryMap {
+                result: query,
+                map,
+                key: sub,
+            }),
+            DfirOp::Scf(scf::Op::For {
+                iv: arg1,
+                lo: c0,
+                hi: query,
+                step: c1,
+                carried: Vec::new(),
+                body: vec![subtract(sub2, query, arg1)],
+                dbg_name: None,
+            }),
+        ];
+        let unit = ProgramUnit {
+            on: Units::one(DfirUnit::L3su, Val(1)),
+            precision: None,
+            body: vec![DfirOp::Scf(scf::Op::For {
+                iv: arg0,
+                lo: c0,
+                hi: c2,
+                step: c1,
+                carried: Vec::new(),
+                body: outer_body,
+                dbg_name: None,
+            })],
+            arch: core::marker::PhantomData,
+        };
+        let program: Program<Dd2> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit, Vec::new()),
+            arch: core::marker::PhantomData,
+        };
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e303_runOnOperation
+        let per_unit = run_on_operation(&program, &mut values);
+        let [unit] = per_unit.as_slice() else {
+            panic!("one program unit")
+        };
+        assert_eq!(unit.comp, GenericComp::L3su);
+        let [site] = unit.lowered.as_slice() else {
+            panic!("one query map, found inside the outer loop")
+        };
+        // The pair the erase loop walks, in the order it was queued.
+        assert!(matches!(
+            site.query_map,
+            DfirOp::Symbol(symbol::Op::QueryMap { .. })
+        ));
+        assert!(matches!(
+            site.mapping,
+            DfirOp::Symbol(symbol::Op::ImmutableMapping { .. })
+        ));
+        let QueryMapLowering::Conditional {
+            if_op,
+            replacements,
+        } = &site.lowering
+        else {
+            panic!("two pairs is the chain")
+        };
+        let sen::Op::If { yielded, .. } = if_op else {
+            panic!("entry 226 emits a conditional")
+        };
+        let results: Vec<Val> = yielded.iter().map(|slot| slot.result).collect();
+        assert_eq!(results.len(), 2);
+        // `replacements` is in use-list order; program order is the loop bound then the subtract.
+        let mut in_program_order = replacements.clone();
+        in_program_order.reverse();
+        assert_eq!(in_program_order, vec![results[0], results[1]]);
+    }
+}

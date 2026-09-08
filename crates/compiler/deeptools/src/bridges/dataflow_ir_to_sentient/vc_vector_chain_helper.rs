@@ -277,7 +277,7 @@ pub fn compute_precision_of_op(op: &DfirOp) -> sen::Precision {
 /// ⭐ AND `bf16` IS RETURNED AS ITSELF, not pre-remapped. `getPrecisionInString` has no idea what
 /// its caller will do with it; [`compute_precision_of_op`] is the one that turns it into `fp16`, and
 /// other callers of the reference's function do not.
-fn precision_in_string(elem: ElemType) -> sen::Precision {
+pub(super) fn precision_in_string(elem: ElemType) -> sen::Precision {
     match elem {
         // ⭐ THE MX CHECK IS FIRST IN THE REFERENCE, before `isIntOrIndexOrFloat` is even asserted:
         // a `CustomMXFloatType` is not an int-or-float, so the order is load-bearing there. Here the
@@ -2650,6 +2650,7 @@ pub fn gcvt_or_fcvt_type_from_indices_and_cast_inputs(
 
 #[cfg(test)]
 mod unit_tests {
+    use super::{CastSource, CvtInst, gcvt_or_fcvt_type_from_indices_and_cast_inputs};
     use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
     use super::{
         MergeAndPack, MergeOrPack, MinOrMaxFusion, NonPtMask, OperandReuse, PackOrShuffle,
@@ -2664,7 +2665,6 @@ mod unit_tests {
         vector_element_wise_compare_operator_to_sentient_binary_operator,
         vector_ternary_to_sentient_ternary, vector_type_of,
     };
-    use super::{CastSource, CvtInst, gcvt_or_fcvt_type_from_indices_and_cast_inputs};
     use crate::arch::Dd2;
     use crate::formats::Bits;
     use crate::generated::OpFunc;
@@ -2696,6 +2696,7 @@ mod unit_tests {
             values: Vec::new(),
             orig_precision: orig,
             on_the_fly_conv_precision: on_the_fly,
+            splat: None,
         }
     }
 

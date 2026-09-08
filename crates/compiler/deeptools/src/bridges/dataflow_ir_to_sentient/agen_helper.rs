@@ -119,14 +119,15 @@
 
 use super::agen_access_details::{
     AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsSymbolic,
-    IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim,
+    ConstructedDetails, IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim,
 };
 use super::agen_agen_to_sentient::{StrideStep, TransferSpecialisation};
 use super::std_standard_to_sentient::lower_constant_index_to_sentient;
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
-    self as dfir_op, Index, Op as DfirOp, Val, affine, arith, dataflow, defining_op, results, uses,
+    self as dfir_op, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results,
+    uses,
 };
 use crate::islands::dataflow_ir::link::SendEnd;
 use crate::islands::dataflow_ir::ty::{
@@ -1615,7 +1616,7 @@ mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::agen_access_details::{
-        MemoryOperandIndex, TimeOffsets,
+        AffineInitialize, MemoryOperandIndex, TimeOffsets,
     };
     use crate::generated::SyncSignal;
     use crate::islands::dataflow_ir::Units;
@@ -4613,6 +4614,88 @@ mod unit_tests {
                 ],
                 addr: Val(1),
             }
+        );
+    }
+
+    // ─────────────────────────────── 298/384 ───────────────────────────────
+
+    /// 🎯 298/384 — AN UNRESOLVED MEMORY VIEW ON THE SOURCE STOPS THE WHOLE CALL, so the gather that
+    /// would mark the op never runs.
+    #[test]
+    fn the_source_record_is_what_the_call_refuses_on() {
+        let load = agen::Op::VectorLoad {
+            dbg_name: None,
+            result: Val(31),
+            view: Val(9),
+            indices: vec![Index::Const(0)],
+            view_ty: MemRef {
+                shape: vec![64],
+                elem: ElemType::F16,
+            },
+            ty: Vector {
+                len: 64,
+                elem: ElemType::F16,
+            },
+            multicast_info: None,
+        };
+        let mut details = AccessContainer::<AccessDetailsAffine>::default();
+        let mut mutable_addrs = AccessContainer::<Val>::default();
+        let mut immutable_addrs = AccessContainer::<Val>::default();
+        let mut marked = Marked::at([]);
+
+        assert_eq!(
+            construct_affine_details_and_addrs(
+                &load,
+                0,
+                None,
+                DfirUnit::Lx,
+                &mut details,
+                &mut mutable_addrs,
+                &mut immutable_addrs,
+                &mut marked,
+                &[],
+            ),
+            AffineDetailsAndAddrs::SrcDetailsFailed(ConstructedDetails::NotInitialized(
+                AffineInitialize::MemoryViewUnresolved
+            ))
+        );
+        assert!(
+            !marked.holds(0),
+            "the mark is entry 212's, and it never ran"
+        );
+    }
+
+    // ─────────────────────────────── 299/384 ───────────────────────────────
+
+    /// 🎯 299/384 — THE CANDIDATE IS RE-FOUND EVEN WHEN THE NEST FAILED, AND THE DELETE IS NOT
+    /// QUEUED. With no operand records at all entry 267 refuses, and the marked transfer is still
+    /// there to carry the error.
+    #[test]
+    fn a_refused_nest_still_finds_the_candidate_and_queues_no_delete() {
+        let unit = vec![DfirOp::Agen(composite_transfer())];
+        let mut to_be_deleted = Vec::new();
+        let mut values = Values::default();
+
+        let lowered = lower_affine_composite_helper(
+            AgenOpKind::CompositeLoadAndStore,
+            &Marked::at([0]),
+            &unit,
+            TransferOp::of(&unit[0]).expect("a composite transfer"),
+            DfirUnit::L3su,
+            &mut AccessContainer::<Val>::default(),
+            &AccessContainer::<Val>::default(),
+            &AccessContainer::<AccessDetailsAffineComposite>::default(),
+            &mut to_be_deleted,
+            &mut values,
+        );
+
+        assert_eq!(
+            lowered,
+            AffineCompositeLowering::Refused(TimeLoopsAndVectorOps::MissingOperandRecord)
+        );
+        assert!(
+            to_be_deleted.is_empty(),
+            "the delete is queued only on success"
         );
     }
 }
@@ -8278,11 +8361,142 @@ pub fn construct_time_loops_and_vector_operations(
     }))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 298/384, 299/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`construct_affine_details_and_addrs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum AffineDetailsAndAddrs {
+    /// The tail call to entry 212 succeeded (`Helper.cpp:2804-2805`).
+    Constructed,
+    /// *"unable to construct details for src"* (`:2794-2795`).
+    SrcDetailsFailed(ConstructedDetails),
+    /// *"unable to construct details for dst"* (`:2800-2801`).
+    DstDetailsFailed(ConstructedDetails),
+    /// `emplace_insert` ABORTS on a slot that is already taken; here the slot is a capability
+    /// ([`AccessContainer::vacancy`]) and a taken one refuses instead.
+    OperandSlotTaken(MemoryOperandIndex),
+    /// Entry 212 refused.
+    GatherFailed(GatheredDetails),
+}
+
+/// Replaces: e298_constructAffineDetailsAndAddrs
+///
+/// **298/384** `AgenToSentientLoweringPass::constructAffineDetailsAndAddrs` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787` (16L). One record per direct operand, then
+/// entry 212 over both.
+///
+/// ⛔ THE DESTINATION IS OPTIONAL AND THE SOURCE IS NOT (`:2791`, `:2797`) — a load has no `kDirDst`.
+/// ⛔ IT STOPS AT THE FIRST REFUSAL, so the gather never sees a half-built record.
+/// ⭐ `src_position` is what entry 212 MARKS (`:546`); the reference passes `src_op` itself.
+pub fn construct_affine_details_and_addrs<'a>(
+    src_op: &'a agen::Op,
+    src_position: usize,
+    dst_op: Option<&'a agen::Op>,
+    comp: DfirUnit,
+    access_details: &mut AccessContainer<AccessDetailsAffine<'a>>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &mut AccessContainer<Val>,
+    marked: &mut Marked,
+    scope: &[DfirOp],
+) -> AffineDetailsAndAddrs {
+    // `DT_CHECK(src_op)` (`:2791`) — a `&agen::Op` cannot be null.
+    let Some(slot) = access_details.vacancy(MemoryOperandIndex::DirSrc) else {
+        return AffineDetailsAndAddrs::OperandSlotTaken(MemoryOperandIndex::DirSrc);
+    };
+    let src_ad = slot.emplace_insert(AccessDetailsAffine::new(src_op, comp));
+    let constructed = src_ad.construct_details(MemoryOperandIndex::DirSrc, scope);
+    if !matches!(constructed, ConstructedDetails::Complete) {
+        return AffineDetailsAndAddrs::SrcDetailsFailed(constructed);
+    }
+
+    if let Some(dst_op) = dst_op {
+        let Some(slot) = access_details.vacancy(MemoryOperandIndex::DirDst) else {
+            return AffineDetailsAndAddrs::OperandSlotTaken(MemoryOperandIndex::DirDst);
+        };
+        let dst_ad = slot.emplace_insert(AccessDetailsAffine::new(dst_op, comp));
+        let constructed = dst_ad.construct_details(MemoryOperandIndex::DirDst, scope);
+        if !matches!(constructed, ConstructedDetails::Complete) {
+            return AffineDetailsAndAddrs::DstDetailsFailed(constructed);
+        }
+    }
+
+    match gather_affine_load_store_details(
+        src_position,
+        marked,
+        comp,
+        access_details,
+        mutable_addrs,
+        immutable_addrs,
+    ) {
+        GatheredDetails::Gathered => AffineDetailsAndAddrs::Constructed,
+        refused => AffineDetailsAndAddrs::GatherFailed(refused),
+    }
+}
+
+/// THE OUTCOME OF [`lower_affine_composite_helper`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum AffineCompositeLowering {
+    /// The nest entry 267 built, and the candidate is queued for deletion (`Helper.cpp:2967`).
+    Lowered(Box<TimeLoopsAndTransfer>),
+    /// *"Unable to generate loops and sentient statements for the composite vector operations"*
+    /// (`:2962-2965`) — reported ON THE RE-FOUND op, not the one that came in.
+    Refused(TimeLoopsAndVectorOps),
+    /// `DT_CHECK(candidate_op)` inside entry 037 (`:1483`): nothing in the unit carries the mark.
+    NoCandidate,
+}
+
+/// Replaces: e299_lowerAffineCompositeHelper
+///
+/// **299/384** `AgenToSentientLoweringPass::lowerAffineCompositeHelper` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953` (15L). Entry 267's nest, then the op it
+/// replaced queued for deletion.
+///
+/// ⛔⛔ THE CANDIDATE IS RE-FOUND AFTER THE NEST IS BUILT AND BEFORE THE FAILURE IS TESTED
+/// (`:2958-2965`): *"The op may have changed due to loop cloning"*, so the incoming op may be gone
+/// and both the error and the delete name the re-found one.
+/// ⛔ THE DELETE IS QUEUED ONLY ON SUCCESS (`:2967`).
+pub fn lower_affine_composite_helper<'a>(
+    kind: AgenOpKind,
+    marked: &Marked,
+    unit: &'a [DfirOp],
+    composite: TransferOp<'_>,
+    comp: DfirUnit,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &AccessContainer<Val>,
+    access_details: &AccessContainer<AccessDetailsAffineComposite<'_>>,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> AffineCompositeLowering {
+    let result = construct_time_loops_and_vector_operations(
+        composite,
+        comp,
+        mutable_addrs,
+        immutable_addrs,
+        access_details,
+        unit,
+        values,
+    );
+
+    // The op may have changed due to loop cloning.
+    let Some(candidate) = find_candidate_for_lowering(kind, marked, unit) else {
+        return AffineCompositeLowering::NoCandidate;
+    };
+    match result {
+        TimeLoopsAndVectorOps::Constructed(built) => {
+            to_be_deleted.push(candidate.op);
+            AffineCompositeLowering::Lowered(built)
+        }
+        refused => AffineCompositeLowering::Refused(refused),
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e298_constructAffineDetailsAndAddrs
-// crustify:todo: e299_lowerAffineCompositeHelper
 // crustify:todo: e311_constructAffineCompDetailsAndAddrs
 // crustify:todo: e312_lowerExtractVectorLoadOp
 // crustify:todo: e313_lowerExtractVectorStoreOp

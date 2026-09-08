@@ -78,6 +78,7 @@
 //! | `e337_lowerSyncOperation` | 337/384 | 80 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901` |
 //! | `e361_runOnOperation` | 361/384 | 33 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` |
 
+use super::vc_vector_operands::defining_position;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow, defining_op, uniform};
 use crate::islands::dataflow_ir::ty::GenericComp;
@@ -1300,9 +1301,11 @@ mod unit_tests {
         ];
         let mut values = Values::default();
         let peers = |op: &sen::Op| match op {
-            sen::Op::Sync { peers, .. } => {
-                peers.iter().copied().map(sen::SyncHalf::peer).collect::<Vec<_>>()
-            }
+            sen::Op::Sync { peers, .. } => peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
             other => panic!("entry 274 emits sentient.sync: {other:?}"),
         };
 
@@ -1350,6 +1353,164 @@ mod unit_tests {
         ]);
         // Divergence (2): no L3 destination in the group, so no third sync naming nobody.
         assert!(l3.is_none());
+    }
+
+    /// 🎯 300/384 — THE SOURCE'S FIRST TWO CHARACTERS PICK THE LOWERING, AND THE TWO NAME ONE
+    /// DESTINATION DIFFERENTLY.
+    ///
+    /// ⛔ An `l3su` source syncing to `lxlu` on corelet 1 names `lxlu1`, the EXTENDED spelling; an
+    /// `lxlu` source whose own units sit on corelet 0 names `lxluN`, the NEIGHBOUR. A dispatch on the
+    /// wrong prefix emits a peer that is on neither end of the sync.
+    #[test]
+    fn the_source_prefix_picks_the_l3_lowering_or_the_lx_one() {
+        let corelet1 = Corelet::checked(1).expect("Target::CORELETS_PER_CORE is 2");
+        let dst = L0LxSyncDst::Lx(LxHalf::Load, corelet1);
+        let mut values = Values::default();
+        let peers = |lowered: Option<L0LxLowering>| match lowered {
+            Some(L0LxLowering::One(sen::Op::Sync { peers, .. })) => peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
+            other => panic!("entry 300 emits one sentient.sync: {other:?}"),
+        };
+
+        assert_eq!(
+            peers(lower_sync_for_a_unit(
+                SyncSrc::L3(L3Half::Store),
+                L0LxSyncToLower::Recv,
+                &[],
+                &[],
+                dst,
+                None,
+                &mut values,
+            )),
+            vec![sen::Consumer::Lxlu1]
+        );
+        assert_eq!(
+            peers(lower_sync_for_a_unit(
+                SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Load)),
+                L0LxSyncToLower::Recv,
+                &[Val(0)],
+                &[],
+                dst,
+                None,
+                &mut values,
+            )),
+            vec![sen::Consumer::LxluN]
+        );
+    }
+
+    /// 🎯 301/384 — THE SAME DISPATCH OVER A GROUP, WHERE THE TWO ARMS DEDUPLICATE ON DIFFERENT
+    /// SPELLINGS.
+    ///
+    /// ⛔ The L3 arm names the group's two corelets `lxsu0`/`lxsu1` — the corelet is in the NAME —
+    /// while the LX arm names them `lxsu`/`lxsuN`, relative to its own corelet. Both lists have two
+    /// entries, so a dispatch that picked the wrong one would still emit a two-peer sync.
+    #[test]
+    fn the_group_dispatch_deduplicates_on_the_arms_own_spelling() {
+        let corelet0 = Corelet::checked(0).expect("every arch has corelet 0");
+        let corelet1 = Corelet::checked(1).expect("Target::CORELETS_PER_CORE is 2");
+        let group = [
+            L0LxSyncDst::Lx(LxHalf::Store, corelet0),
+            L0LxSyncDst::Lx(LxHalf::Store, corelet1),
+        ];
+        let mut values = Values::default();
+        let peers = |lowered: Option<L0LxLowering>| match lowered {
+            Some(L0LxLowering::One(sen::Op::Sync { peers, .. })) => peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
+            other => panic!("entry 301 emits one sentient.sync: {other:?}"),
+        };
+
+        assert_eq!(
+            peers(lower_sync_for_a_group(
+                SyncSrc::L3(L3Half::Load),
+                L0LxSyncToLower::Recv,
+                &[],
+                &[],
+                &group,
+                None,
+                &mut values,
+            )),
+            vec![sen::Consumer::Lxsu0, sen::Consumer::Lxsu1]
+        );
+        assert_eq!(
+            peers(lower_sync_for_a_group(
+                SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Load)),
+                L0LxSyncToLower::Recv,
+                &[Val(0)],
+                &[],
+                &group,
+                None,
+                &mut values,
+            )),
+            vec![sen::Consumer::Lxsu, sen::Consumer::LxsuN]
+        );
+    }
+
+    /// 🎯 302/384 — TWO DESTINATION CORELETS ARE TWO REGIONS, EACH CARRYING ITS BUCKET'S SOURCES AND
+    /// ONE SYNC.
+    ///
+    /// ⛔ REGION ORDER IS BUCKET ORDER AND THE NEIGHBOUR SUFFIX IS PER REGION: with the source on
+    /// corelet 0, region 0's corelet-0 destination is the local `lxsu` and region 1's corelet-1
+    /// destination is `lxsuN`. One region per DESTINATION corelet, not per source.
+    #[test]
+    fn the_two_destination_corelets_take_a_region_each() {
+        let corelet0 = Corelet::checked(0).expect("every arch has corelet 0");
+        let corelet1 = Corelet::checked(1).expect("Target::CORELETS_PER_CORE is 2");
+        let unit = |result: u32, unit: DfirUnit, corelet: Corelet| {
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(result),
+                residency: Residency::Corelet {
+                    core: Core::checked(0).expect("every arch has core 0"),
+                    corelet,
+                },
+                unit,
+                num_folds: None,
+            })
+        };
+        let scope = vec![
+            unit(0, DfirUnit::Lxlu, corelet0),
+            unit(1, DfirUnit::Lxlu, corelet1),
+            unit(2, DfirUnit::Lxsu, corelet0),
+            unit(3, DfirUnit::Lxsu, corelet1),
+        ];
+        let mut values = Values::default();
+
+        let lowered = lower_sync_lx_l3_to_lx_l3(
+            SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Load)),
+            L0LxSyncToLower::Recv,
+            &[(Val(0), Val(2)), (Val(1), Val(3))],
+            corelet0,
+            &scope,
+            None,
+            &mut values,
+        );
+
+        let Some(LxL3Lowering::Regions { regions, syncs }) = lowered else {
+            panic!("two destination corelets uniformize: {lowered:?}");
+        };
+        let uniform::Op::UniformizeRegions { regions, results } = regions else {
+            panic!("entry 302 emits uniform.uniformize_regions: {regions:?}");
+        };
+        assert!(results.is_empty());
+        assert_eq!(
+            regions.iter().map(|r| r.units.clone()).collect::<Vec<_>>(),
+            vec![vec![Val(0)], vec![Val(1)]]
+        );
+        let peers = |sync: &sen::Op| match sync {
+            sen::Op::Sync { peers, .. } => peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
+            other => panic!("a region holds one sentient.sync: {other:?}"),
+        };
+        assert_eq!(peers(&syncs[0]), vec![sen::Consumer::Lxsu]);
+        assert_eq!(peers(&syncs[1]), vec![sen::Consumer::LxsuN]);
     }
 }
 
@@ -1915,7 +2076,6 @@ pub fn push_back_the_unit_to_list_if_doesnot_exist(
     }
 }
 
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 273/384 + 274/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2353,12 +2513,443 @@ impl L0LxSrc {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 300/384 + 301/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH FAMILY OF UNIT A SYNC LEAVES FROM — `src_unit_name.substr(0, 2) != "l3"`, which is the whole
+/// body of both dispatchers.
+///
+/// ⛔ THE NAME IS NOT CARRIED, THE CHOICE IS. `src_unit_name` reaches them from
+/// [`unit_name_from_a_list_of_get_unit_op`] and is read for nothing but those two characters; WHICH
+/// half of the L3 (resp. which L0/LX component) the source is, the callee derives from `src_unit_ops`
+/// for itself (`DataflowToSentient.cpp:400`, `:247`). Both facts come off one `get_unit`, so they are
+/// one value here — and `src_unit_ops` disappears with the name, being the list [`L3Half`] already
+/// stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSrc {
+    /// A source whose `type` does not begin `l3`.
+    L0Lx(L0LxSrc),
+    /// `l3lu`/`l3su`.
+    L3(L3Half),
+}
+
+/// The L3 twins' view of the sync being lowered — ⛔ [`None`] IS THEIR `DT_CHECK(send_op || recv_op)`:
+/// an implicit sync on a streaming buffer is an input the L0/LX pair has and they abort on.
+const fn l3_sync_to_lower(op: L0LxSyncToLower) -> Option<SyncToLower> {
+    match op {
+        L0LxSyncToLower::Send(wait) => Some(SyncToLower::Send(wait)),
+        L0LxSyncToLower::Recv => Some(SyncToLower::Recv),
+        L0LxSyncToLower::ImplicitSync(_) => None,
+    }
+}
+
+/// The L3 twins' view of one destination — ⛔ [`None`] IS `emitError("Unknown lowering of the L3 sync
+/// operation")`, whose input is an L0 destination; and for a group it is the `break` [`L3SyncDst`]
+/// made unrepresentable, so the caller refuses where the reference emits a truncated peer list.
+const fn l3_sync_dst(dst: L0LxSyncDst) -> Option<L3SyncDst> {
+    match dst {
+        L0LxSyncDst::L3(L3Half::Load) => Some(L3SyncDst::L3lu),
+        L0LxSyncDst::L3(L3Half::Store) => Some(L3SyncDst::L3su),
+        L0LxSyncDst::Lx(half, corelet) => Some(L3SyncDst::Lx(half, corelet)),
+        L0LxSyncDst::L0(..) => None,
+    }
+}
+
+/// Replaces: e300_lowerSyncForAUnit
+///
+/// **300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733` (7L).
+///
+/// The per-unit L3 or L0/LX sync lowering, chosen by the source's family.
+///
+/// ⛔ THE L3 ARM TAKES A NARROWER INPUT THAN THE L0/LX ONE — an implicit sync and an L0 destination
+/// are aborts there — so the one [`Option`] covers both arms' refusals.
+#[must_use]
+pub fn lower_sync_for_a_unit(
+    src: SyncSrc,
+    op: L0LxSyncToLower,
+    src_units_corelet0: &[Val],
+    src_units_corelet1: &[Val],
+    dst: L0LxSyncDst,
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<L0LxLowering> {
+    match src {
+        // `:740-742`.
+        SyncSrc::L0Lx(src) => src.lower_l0lx_sync_operation_for_a_unit(
+            op,
+            src_units_corelet0,
+            src_units_corelet1,
+            dst,
+            dbg_name,
+            values,
+        ),
+        // `:744` — ⭐ WHICH CORELETS HOLD A SOURCE IS NOT READ on this side: an L3 sync names its
+        // destination outright.
+        SyncSrc::L3(half) => Some(L0LxLowering::One(half.lower_l3_sync_operation_for_a_unit(
+            l3_sync_to_lower(op)?,
+            l3_sync_dst(dst)?,
+            dbg_name,
+        ))),
+    }
+}
+
+/// Replaces: e301_lowerSyncForAGroup
+///
+/// **301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746` (8L).
+///
+/// [`lower_sync_for_a_unit`]'s dispatch over a whole `dataflow.create_group`.
+///
+/// ⛔ THE GROUP IS RESOLVED ONCE FOR BOTH ARMS. The reference hands each callee the `CreateGroupOp`
+/// and each walks `getUnitIds()` itself, so a destination neither accepts is refused per arm.
+#[must_use]
+pub fn lower_sync_for_a_group(
+    src: SyncSrc,
+    op: L0LxSyncToLower,
+    src_units_corelet0: &[Val],
+    src_units_corelet1: &[Val],
+    dst_unit_group: &[L0LxSyncDst],
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<L0LxLowering> {
+    match src {
+        // `:753-756`.
+        SyncSrc::L0Lx(src) => src.lower_l0lx_sync_operation_for_a_group_of_units(
+            op,
+            src_units_corelet0,
+            src_units_corelet1,
+            dst_unit_group,
+            dbg_name,
+            values,
+        ),
+        // `:757-758`.
+        SyncSrc::L3(half) => {
+            let mut group = Vec::with_capacity(dst_unit_group.len());
+            for dst in dst_unit_group {
+                group.push(l3_sync_dst(*dst)?);
+            }
+            Some(L0LxLowering::One(
+                half.lower_l3_sync_operation_for_a_group_of_units(
+                    l3_sync_to_lower(op)?,
+                    &group,
+                    dbg_name,
+                ),
+            ))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 302/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT `lowerSyncLXL3ToLXL3` EMITS.
+///
+/// ⛔ N REGIONS, NOT [`L0LxLowering::TwoRegions`]'S TWO: the group arms open one region per
+/// `create_group` destination, so the count is an input's length. ⭐ AND THE SYNCS SIT BESIDE THE
+/// REGIONS for the reason [`L0LxLowering`] gives — a `sentient.sync` is not a [`DfirOp`], so region
+/// `i`'s sync is `syncs[i]` and [`uniformized`] is the only thing that builds the pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LxL3Lowering {
+    /// One `sentient.sync` where the lowered op stood, with nothing uniformized.
+    One(sen::Op),
+    /// One region per bucket, each holding exactly one sync.
+    Regions {
+        /// The result-less `uniform.uniformize_regions`, whose regions carry only their yields.
+        regions: uniform::Op,
+        /// Region `i`'s `sentient.sync`.
+        syncs: Vec<sen::Op>,
+    },
+}
+
+/// `UniformizeRegionsOp::create(.., sorted_units, list_sizes, .., num_of_regions)` — the N-region
+/// form of [`create_uniform_regions_with_two_regions_no_result`], whose `sorted_units` is the
+/// concatenation of the per-region unit lists and whose `list_sizes` are their lengths.
+fn uniformized(per_region: Vec<(Vec<Val>, sen::Op)>, values: &mut Values) -> LxL3Lowering {
+    let mut regions = Vec::with_capacity(per_region.len());
+    let mut syncs = Vec::with_capacity(per_region.len());
+    for (units, sync) in per_region {
+        regions.push(uniform::LocalRegion {
+            arg: values.mint(),
+            units,
+            body: vec![DfirOp::Uniform(uniform::Op::Yield {
+                operands: Vec::new(),
+            })],
+        });
+        syncs.push(sync);
+    }
+    LxL3Lowering::Regions {
+        regions: uniform::Op::UniformizeRegions {
+            regions,
+            results: Vec::new(),
+        },
+        syncs,
+    }
+}
+
+/// `llvm::dyn_cast<dataflow::GetUnitOp>(v.getDefiningOp())` and the `type`/`corelet` the sync
+/// lowerings read off it. ⛔ [`None`] IS BOTH `DT_CHECK(dst_op)` — a destination that is not a
+/// `get_unit` — and *"Unknown corelet information for sentient"*.
+fn sync_destination(v: Val, scope: &[DfirOp]) -> Option<L0LxSyncDst> {
+    let Some(DfirOp::Dataflow(dataflow::Op::GetUnit {
+        residency, unit, ..
+    })) = defining_op(v, scope)
+    else {
+        return None;
+    };
+    // `dst_unit->hasAttr("corelet")` — and `CoreWide` prints `corelet = 0`, as
+    // [`are_corelets_different`] says.
+    let corelet = match residency {
+        Residency::Corelet { corelet, .. } => Some(*corelet),
+        Residency::CoreWide { .. } => Corelet::checked(0),
+        Residency::Scratchpad { .. } | Residency::Global => None,
+    };
+    match unit {
+        DfirUnit::L0lu => Some(L0LxSyncDst::L0(L0Half::Load, corelet?)),
+        DfirUnit::L0su => Some(L0LxSyncDst::L0(L0Half::Store, corelet?)),
+        DfirUnit::Lxlu => Some(L0LxSyncDst::Lx(LxHalf::Load, corelet?)),
+        DfirUnit::Lxsu => Some(L0LxSyncDst::Lx(LxHalf::Store, corelet?)),
+        DfirUnit::L3lu => Some(L0LxSyncDst::L3(L3Half::Load)),
+        DfirUnit::L3su => Some(L0LxSyncDst::L3(L3Half::Store)),
+        // Every other spelling is `emitError("Unknown lowering of the … sync operation")`, spelled
+        // out so that a new unit cannot join the refusal side unlooked-at.
+        DfirUnit::Sfp
+        | DfirUnit::Pe
+        | DfirUnit::PtRow(_)
+        | DfirUnit::Lx
+        | DfirUnit::Hbm
+        | DfirUnit::L0
+        | DfirUnit::Constant
+        | DfirUnit::SfpState
+        | DfirUnit::PeState
+        | DfirUnit::SfpRing
+        | DfirUnit::LxVirtualIbr
+        | DfirUnit::L3Ibr
+        | DfirUnit::CrossPtnLink => None,
+    }
+}
+
+/// `group_op.getUnitIds()` with every member's `dyn_cast` resolved — ⛔ [`None`] IS THE NULL
+/// `group_op` THE REFERENCE PASSES ON WITHOUT A CHECK, which is a destination the bucketing sorted as
+/// a group and this walk finds is not one.
+fn sync_group_destinations(v: Val, scope: &[DfirOp]) -> Option<Vec<L0LxSyncDst>> {
+    let Some(DfirOp::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) = defining_op(v, scope)
+    else {
+        return None;
+    };
+    let mut group = Vec::with_capacity(unit_ids.len());
+    for member in unit_ids {
+        group.push(sync_destination(*member, scope)?);
+    }
+    Some(group)
+}
+
+/// `sameGroup` — ⛔⛔ THE TEST IS INVERTED, SO A NON-EMPTY LIST ALWAYS ANSWERS `false`:
+/// `if (u.getDefiningOp() == dst_vs[0].getDefiningOp()) sameGroup = false;` compares the first
+/// destination with ITSELF on the first iteration where `!=` was plainly meant. Reproduced — its arm
+/// is reachable only through [`all_keys_folds`], and in the two mixed-with-group arms, which have no
+/// such override, not at all.
+fn same_group(dsts: &[Val], scope: &[DfirOp]) -> bool {
+    let mut same = true;
+    // An empty list never enters the loop; the reference would read `dst_vs[0]` out of bounds.
+    let Some(first) = dsts.first() else {
+        return same;
+    };
+    let first = defining_position(*first, scope);
+    for dst in dsts {
+        if defining_position(*dst, scope) == first {
+            same = false;
+        }
+    }
+    same
+}
+
+/// `all_keys_folds` — every source is a result of ONE `get_unit`, so the map's keys are folds of one
+/// unit and one instance of the fold stands for all of them.
+fn all_keys_folds(srcs: &[Val], scope: &[DfirOp]) -> bool {
+    let Some(first) = srcs.first() else {
+        return true;
+    };
+    let first = defining_position(*first, scope);
+    srcs.iter()
+        .all(|src| defining_position(*src, scope) == first)
+}
+
+/// The reference's `is_src_l3`/`corelet_id` three-way at each of this function's per-unit call sites,
+/// which is [`lower_sync_for_a_unit`] with the source list picked by `corelet_id`. ⛔ ONE SOURCE SITS
+/// ON ONE CORELET, so [`OccupiedCorelets::Both`] and its two regions have no input here.
+fn one_unit_sync(
+    src: SyncSrc,
+    op: L0LxSyncToLower,
+    corelet_id: Corelet,
+    pair: (Val, Val),
+    scope: &[DfirOp],
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<sen::Op> {
+    let (src_v, dst_v) = pair;
+    let one = [src_v];
+    let (corelet0, corelet1): (&[Val], &[Val]) = if corelet_id.get() == 0 {
+        (&one, &[])
+    } else {
+        (&[], &one)
+    };
+    match lower_sync_for_a_unit(
+        src,
+        op,
+        corelet0,
+        corelet1,
+        sync_destination(dst_v, scope)?,
+        dbg_name,
+        values,
+    )? {
+        L0LxLowering::One(sync) => Some(sync),
+        L0LxLowering::TwoRegions { .. } => None,
+    }
+}
+
+/// [`one_unit_sync`] for a `create_group` destination — the same dispatch, through
+/// [`lower_sync_for_a_group`].
+fn one_group_sync(
+    src: SyncSrc,
+    op: L0LxSyncToLower,
+    corelet_id: Corelet,
+    pair: (Val, Val),
+    scope: &[DfirOp],
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<sen::Op> {
+    let (src_v, dst_v) = pair;
+    let one = [src_v];
+    let (corelet0, corelet1): (&[Val], &[Val]) = if corelet_id.get() == 0 {
+        (&one, &[])
+    } else {
+        (&[], &one)
+    };
+    match lower_sync_for_a_group(
+        src,
+        op,
+        corelet0,
+        corelet1,
+        &sync_group_destinations(dst_v, scope)?,
+        dbg_name,
+        values,
+    )? {
+        L0LxLowering::One(sync) => Some(sync),
+        L0LxLowering::TwoRegions { .. } => None,
+    }
+}
+
+/// Replaces: e302_lowerSyncLXL3ToLXL3
+///
+/// **302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787` (928L).
+///
+/// One sync when the destinations share a bucket of [`separate_based_on_destination_units`], else one
+/// `uniform.uniformize_regions` region per non-empty bucket — LX-corelet-0, LX-corelet-1, L3, then
+/// the groups — each holding ONE sync lowered from that bucket's first pair alone.
+///
+/// ⛔ TRAP: `corelet_id` IS THE SOURCE'S CORELET AND IS THE SAME IN EVERY REGION, so whether a region
+/// names its destination `lxlu` or `lxluN` is that destination's corelet against `corelet_id`.
+#[must_use]
+pub fn lower_sync_lx_l3_to_lx_l3(
+    src: SyncSrc,
+    op: L0LxSyncToLower,
+    src_dst: &[(Val, Val)],
+    corelet_id: Corelet,
+    scope: &[DfirOp],
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<LxL3Lowering> {
+    let separated = separate_based_on_destination_units(src_dst, scope);
+    let buckets: Vec<&[(Val, Val)]> = [
+        separated.lx_corelet0.as_slice(),
+        separated.lx_corelet1.as_slice(),
+        separated.l3.as_slice(),
+    ]
+    .into_iter()
+    .filter(|bucket| !bucket.is_empty())
+    .collect();
+    let group = separated.group.as_slice();
+
+    // `DT_CHECK(src_dst_lx_corelet0.size() != 0 || …)` — every destination was dropped.
+    if buckets.is_empty() && group.is_empty() {
+        return None;
+    }
+
+    // The three-way disjunction that is "exactly one unit bucket, and no group". ⛔ IT LOWERS
+    // `src_vs[0]`/`dst_vs[0]`, THE GLOBAL FIRST PAIR — the bucket's own first only because a dropped
+    // pair would have left the reference's `dst_op` null under a `DT_CHECK`. So a bucket of eight
+    // destinations emits ONE sync naming the first of them.
+    if group.is_empty() && buckets.len() == 1 {
+        let pair = *src_dst.first()?;
+        return Some(LxL3Lowering::One(one_unit_sync(
+            src, op, corelet_id, pair, scope, dbg_name, values,
+        )?));
+    }
+
+    // The chain's final `return LogicalResult::failure()`: all four buckets non-empty is the one
+    // arrangement no arm claims.
+    if !group.is_empty() && buckets.len() == 3 {
+        return None;
+    }
+
+    // ⭐ THE GROUP-ONLY ARM READS THE GLOBAL LISTS, both for `sameGroup` and for the region it
+    // lowers, where the mixed arms read the group bucket's own pairs.
+    let group_only = buckets.is_empty();
+    let group_pairs = if group_only { src_dst } else { group };
+    let group_dsts: Vec<Val> = group_pairs.iter().map(|(_, dst_v)| *dst_v).collect();
+    let mut same = same_group(&group_dsts, scope);
+    // `if (all_keys_folds) sameGroup = true;` — the override exists in the group-only arm alone, and
+    // is the only path into a same-group lowering anywhere in this function.
+    if group_only {
+        let srcs: Vec<Val> = src_dst.iter().map(|(src_v, _)| *src_v).collect();
+        if all_keys_folds(&srcs, scope) {
+            same = true;
+        }
+    }
+
+    // One group sync where the op stood: one fold instance stands for all of them, so nothing is
+    // uniformized and no nested uniform regions are introduced.
+    if group_only && same {
+        let pair = *src_dst.first()?;
+        return Some(LxL3Lowering::One(one_group_sync(
+            src, op, corelet_id, pair, scope, dbg_name, values,
+        )?));
+    }
+
+    let mut per_region: Vec<(Vec<Val>, sen::Op)> = Vec::new();
+    for bucket in buckets {
+        let pair = *bucket.first()?;
+        per_region.push((
+            bucket.iter().map(|(src_v, _)| *src_v).collect(),
+            one_unit_sync(src, op, corelet_id, pair, scope, dbg_name.clone(), values)?,
+        ));
+    }
+    if !group.is_empty() {
+        if same {
+            // ⚠️ THE REFERENCE'S DEAD ARM, KEPT: `sameGroup` gives every group destination ONE
+            // shared region lowered from the first pair, and no arm that reaches here can set it.
+            let pair = *group_pairs.first()?;
+            per_region.push((
+                group_pairs.iter().map(|(src_v, _)| *src_v).collect(),
+                one_group_sync(src, op, corelet_id, pair, scope, dbg_name.clone(), values)?,
+            ));
+        } else {
+            for pair in group_pairs {
+                per_region.push((
+                    vec![pair.0],
+                    one_group_sync(src, op, corelet_id, *pair, scope, dbg_name.clone(), values)?,
+                ));
+            }
+        }
+    }
+
+    Some(uniformized(per_region, values))
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e300_lowerSyncForAUnit
-// crustify:todo: e301_lowerSyncForAGroup
-// crustify:todo: e302_lowerSyncLXL3ToLXL3
 // crustify:todo: e319_lowerSyncForAQueryMap
 // crustify:todo: e337_lowerSyncOperation
 // crustify:todo: e361_runOnOperation

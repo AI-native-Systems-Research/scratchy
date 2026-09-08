@@ -139,6 +139,14 @@ pub fn operands(op: &Op) -> Vec<Val> {
         },
         // ⭐ A SYMBOL READS NOTHING — its id is an attribute, not an operand (`Symbol.td:59`).
         Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
+        // ⭐ ARM FOR ARM WITH THE `uniform` PAIR BELOW — both halves of every mapping pair, then the
+        // query's handle and key.
+        Op::Symbol(symbol::Op::ImmutableMapping { pairs, .. }) => {
+            for (key, value) in pairs {
+                reads.extend([*key, *value]);
+            }
+        }
+        Op::Symbol(symbol::Op::QueryMap { map, key, .. }) => reads.extend([*map, *key]),
         Op::Uniform(op) => match op {
             // ⛔⛔ THE UNITS ARE ONE FLAT OPERAND RANGE IN REGION ORDER, and this is where the
             // reference's `$units` / `$list_sizes` pair is put back together.
@@ -471,6 +479,11 @@ pub fn results(op: &Op) -> Vec<Val> {
         // a lowered loop's bound ends at either an `arith.constant` or this op
         // (`LoweringXRF.cpp:278-288`), which it can only do if this walk answers for it.
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![*result],
+        // ⛔ BOTH BIND AN `index`, and entry 303 finds the mapping by `defining_op` of the query's
+        // `map` — a census that answered "none" would leave every query unresolvable.
+        Op::Symbol(
+            symbol::Op::ImmutableMapping { result, .. } | symbol::Op::QueryMap { result, .. },
+        ) => vec![*result],
         // ⭐ A LOAD BINDS ITS VECTOR AND A STORE BINDS NOTHING — `results = (outs
         // AnyVectorOfAnyRank:$result)` on `Vector_LoadOp`, and no `results` block at all on
         // `Vector_StoreOp`.
@@ -848,6 +861,12 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         // ⛔ A SYMBOL READS NOTHING. `symbol.create_symbol` names an extent that is not yet a value;
         // entry 091's backward walk stops AT it, never through it.
         Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
+        Op::Symbol(symbol::Op::ImmutableMapping { pairs, .. }) => {
+            for (key, value) in pairs {
+                places.extend([key, value]);
+            }
+        }
+        Op::Symbol(symbol::Op::QueryMap { map, key, .. }) => places.extend([map, key]),
         // ⭐ ARM FOR ARM WITH [`operands`] — the units flattened in region order, and both halves of
         // every mapping pair.
         Op::Uniform(op) => match op {
@@ -892,6 +911,9 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => vec![&mut conv.result],
         },
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![result],
+        Op::Symbol(
+            symbol::Op::ImmutableMapping { result, .. } | symbol::Op::QueryMap { result, .. },
+        ) => vec![result],
         Op::Vector(vector::Op::Load { result, .. }) => vec![result],
         Op::Vector(vector::Op::Store { .. }) => Vec::new(),
         Op::Uniform(uniform::Op::UniformizeRegions { results, .. }) => results.iter_mut().collect(),
@@ -1755,6 +1777,16 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
         },
         // ⛔ A SYMBOL READS NOTHING AND HOLDS NOTHING; it binds the extent entry 091's walk stops at.
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => results.push(result),
+        Op::Symbol(symbol::Op::ImmutableMapping { result, pairs }) => {
+            for (key, value) in pairs {
+                operands.extend([key, value]);
+            }
+            results.push(result);
+        }
+        Op::Symbol(symbol::Op::QueryMap { result, map, key }) => {
+            operands.extend([map, key]);
+            results.push(result);
+        }
         // ⛔⛔ FOUR GROUPS FOR ONE OP, AND ENTRY 182 USES THREE OF THEM. `cloneWithoutRegions`
         // (`FlatteningLocalRegions.cpp:258`) rewrites the OPERANDS through its mapping, takes fresh
         // RESULTS, and leaves the regions empty for the recursion to fill — so `units` must land in
@@ -2392,6 +2424,18 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
         },
         // ⛔ A SYMBOL BINDS ITS EXTENT AND READS NOTHING — see [`operands_mut`].
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => {
+            vals.push((Role::Result, result));
+        }
+        Op::Symbol(symbol::Op::ImmutableMapping { result, pairs }) => {
+            for (key, value) in pairs {
+                vals.push((Role::Operand, key));
+                vals.push((Role::Operand, value));
+            }
+            vals.push((Role::Result, result));
+        }
+        Op::Symbol(symbol::Op::QueryMap { result, map, key }) => {
+            vals.push((Role::Operand, map));
+            vals.push((Role::Operand, key));
             vals.push((Role::Result, result));
         }
         // ⭐ THE UNITS ARE READ, THE REGION ARGUMENT IS BOUND, AND THE RESULTS ARE DEFINED — the

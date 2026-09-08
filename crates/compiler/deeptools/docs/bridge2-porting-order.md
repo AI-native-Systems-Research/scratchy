@@ -1058,7 +1058,8 @@ second site above, not the path.
 
 ⛔ **AND THE TICK COUNT UNDERSTATES THE LANDED PORTS BY 18.** Measured after the 230-253 review landed:
 257 `[x]` PORT and 257 `[x]` AUDIT boxes, 127 unticked each (257 + 127 = 384), which is what the
-Progress counter read then — it now reads 289/289, with 265-272, 273-280 and 281-288 ticked by their
+Progress counter read then — it now reads 297/297, with 265-272, 273-280, 281-288, 289-296 and
+297-304 ticked by their
 own porting batches. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
 still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exactly that state and
 `801187bde` and `edfa7b2bb`'s review passes ticked them; `2c70786a4`'s review of 167-190 did not, so its
@@ -1116,7 +1117,67 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`289/384 ported; 289/384 audited`
+`297/384 ported; 297/384 audited`
+
+⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
+COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
+DISPATCH. 297 is in `agen_access_details.rs`, 298/299 in `agen_helper.rs`, 300-302 in
+`dfs_dataflow_to_sentient.rs`, 303 in `std_symbol_to_sentient.rs` and 304 in `vc_vector_operands.rs`.
+
+⛔ 297's ORDER IS LOAD-BEARING AND THE REFERENCE SAYS SO (`AccessDetails.cpp:660-662`): coalescing
+sees ALL the operands and must precede the per-operand burst and interleave-group calculation, and the
+whole thing stops at the first refusal so neither later step runs on a half-built nest.
+`calculateTimeOffsets`'s own failure arm (`dialect_utils/Agen/Utils.cpp:104-109`) is the flattening of
+a non-affine expression, which this island cannot spell — the port is total there.
+
+⛔ 299 RE-FINDS THE CANDIDATE **AFTER** THE NEST IS BUILT AND **BEFORE** THE FAILURE IS TESTED
+(`Helper.cpp:2958-2965`) — *"The op may have changed due to loop cloning"* — so the incoming op may
+already be gone and both the diagnostic and the delete name the re-found one. The delete is queued only
+on success (`:2967`).
+
+⛔ 300's L3 ARM TAKES A NARROWER INPUT THAN ITS L0/LX ONE: an implicit sync on a streaming buffer is
+its `DT_CHECK(send_op || recv_op)` and an L0 destination is *"Unknown lowering of the L3 sync
+operation"*, so one `Option` covers both arms. The `substr(0, 2) != "l3"` test has no third case in
+this pass — `l3ibr` never appears in `DataflowToSentient.cpp`, so `L3Half` is complete.
+
+⛔⛔ 302's `sameGroup` TEST IS INVERTED, so a non-empty destination list always answers `false`:
+`if (u.getDefiningOp() == dst_vs[0].getDefiningOp()) sameGroup = false;` compares the first destination
+with ITSELF on the first iteration where `!=` was plainly meant (`:829-831`). Its arm is reachable only
+through the group-only path's `all_keys_folds` override (`:846-848`) and, in the two mixed-with-group
+arms, not at all — so those arms always emit one region per group destination. The single-bucket arm
+lowers `src_vs[0]`/`dst_vs[0]`, the GLOBAL first pair, not the bucket's own; the group-only arm reads
+the global lists where the mixed arms read the group bucket's pairs; and all four buckets non-empty is
+the one arrangement no arm claims (`:1717`).
+
+⛔⛔ 303's USE CLASSIFICATION TESTS THE **LOOP**, NOT THE USE'S OPERAND NUMBER
+(`SymbolToSentient.cpp:68`): `sentient_for.getBound().getDefiningOp() == query_map` is asked once per
+use, so a loop reading the query both as its bound and as something else has BOTH uses counted as
+loop-bound uses. Classifying by operand number instead would inflate `num_non_loop_bound_uses` and, on
+L3, mint a result nothing reads. Its erase loop's `DT_CHECK_MSG(op->use_empty())` (`:33-35`) holds by
+construction, and a query whose map is not a `symbol.symbol_immutable_mapping` is skipped rather than
+lowered.
+
+⛔⛔ 304's THREE CAST ARMS SET THE `bool&` IN TWO DIFFERENT PLACES: `arith.fptosi` and `arith.sitofp`
+set it BEFORE the `hasOneUse()` test (`VectorOperands.cpp:461`, `:487`) and `vectorchain.cast` sets it
+INSIDE (`:542-543`), so a multiply-used conversion still reports a conversion where a multiply-used
+`vectorchain.cast` does not. `traverse_upwards` picks which end of a folded op is asked, but the
+RECURSION always takes the declaration's default `true` (`:468`, `:551`), so a chain resolves upwards
+from the first hop on. A `pt` receive OVERRIDES the type the IR carries — int24/fp24 on Sen1p5,
+int16/fp16 before it (`:446-455`) — which is how an `f16` receive prints the vendor's
+`opAPrecision = #sentient<precision fp24>`. The upward `vectorchain.select` arm takes its INPUT's
+element type and stamps `splat_ = "east"`; the downward one takes the select's OWN type and stamps no
+splat (`:576-596`). `Multiply`/`MultiplyAndAccumulate`/`Binary` are an EXPLICIT `std::nullopt`
+(`:643-645`) — a compute is not an operand of a compute — and the extract's `}}` balancer had turned
+that arm into an empty block, so the refusal reads as an acceptance there.
+
+⛔ ISLAND GROWTH FOR 302 AND 304, per AGENT-BRIEF §3, each because a port had no input to read:
+`islands/dataflow_ir/link.rs` gained the `Pe` unit marker — `mixed_precision.mlir:745` is a **PE**
+program unit receiving from a `ptrow7`, and with no marker for the PE that wire is not constructible;
+`VectorOperand` gained the `splat` field 304 is the only writer of; and `findUnitType`'s third arm
+(`dcc/src/Dialect/Uniform/Utils.cpp:286-301`) is now resolved rather than declared unreachable — a
+transfer peer can sit behind a `uniform.query_map`, and `getUnitTypeFromUniformMappingAsString`
+(`:258-284`) reads the mapping's `getValues()[0]`, the VALUES and not the keys, with an
+`if (unit_type.empty())` test that is a tautology.
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -2980,22 +3041,22 @@ loop unnamed. The clone now inherits, and its golden prints `dbgName = ""`.
 
 ## Level 4
 
-- [ ] **PORT 297/384** `constructTimeStepsInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626`, 42 lines
-- [ ] **AUDIT 297/384** `constructTimeStepsInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626`, line by line against the C++
-- [ ] **PORT 298/384** `constructAffineDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787`, 16 lines
-- [ ] **AUDIT 298/384** `constructAffineDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787`, line by line against the C++
-- [ ] **PORT 299/384** `lowerAffineCompositeHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953`, 15 lines
-- [ ] **AUDIT 299/384** `lowerAffineCompositeHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953`, line by line against the C++
-- [ ] **PORT 300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733`, 7 lines
-- [ ] **AUDIT 300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733`, line by line against the C++
-- [ ] **PORT 301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746`, 8 lines
-- [ ] **AUDIT 301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746`, line by line against the C++
-- [ ] **PORT 302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787`, 928 lines
-- [ ] **AUDIT 302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787`, line by line against the C++
-- [ ] **PORT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, 15 lines
-- [ ] **AUDIT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, line by line against the C++
-- [ ] **PORT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, 254 lines
-- [ ] **AUDIT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, line by line against the C++
+- [x] **PORT 297/384** `constructTimeStepsInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626`, 42 lines
+- [x] **AUDIT 297/384** `constructTimeStepsInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626`, line by line against the C++
+- [x] **PORT 298/384** `constructAffineDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787`, 16 lines
+- [x] **AUDIT 298/384** `constructAffineDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787`, line by line against the C++
+- [x] **PORT 299/384** `lowerAffineCompositeHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953`, 15 lines
+- [x] **AUDIT 299/384** `lowerAffineCompositeHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953`, line by line against the C++
+- [x] **PORT 300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733`, 7 lines
+- [x] **AUDIT 300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733`, line by line against the C++
+- [x] **PORT 301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746`, 8 lines
+- [x] **AUDIT 301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746`, line by line against the C++
+- [x] **PORT 302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787`, 928 lines
+- [x] **AUDIT 302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787`, line by line against the C++
+- [x] **PORT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, 15 lines
+- [x] **AUDIT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, line by line against the C++
+- [x] **PORT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, 254 lines
+- [x] **AUDIT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, line by line against the C++
 - [ ] **PORT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, 17 lines
 - [ ] **AUDIT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, line by line against the C++
 - [ ] **PORT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, 75 lines

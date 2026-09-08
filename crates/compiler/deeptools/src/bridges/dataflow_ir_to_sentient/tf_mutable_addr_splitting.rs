@@ -4813,7 +4813,10 @@ pub fn get_loop_trip_count(loop_op: &DfirOp, scope: &[DfirOp]) -> LoopTripCount 
                 | DfirOp::Agen(_)
                 | DfirOp::VectorChain(_)
                 | DfirOp::Vector(_)
-                | DfirOp::Uniform(_) => return LoopTripCount::UnsupportedScfUpperBound(*hi),
+                | DfirOp::Uniform(_)
+                | DfirOp::Symbol(
+                    symbol::Op::ImmutableMapping { .. } | symbol::Op::QueryMap { .. },
+                ) => return LoopTripCount::UnsupportedScfUpperBound(*hi),
             };
             (LoopBound(lo_value), step, ub)
         }
