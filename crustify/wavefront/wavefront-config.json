@@ -1,39 +1,59 @@
 {
-  "_comment": [
-    "Campaign-wide inventory for bridge 2 (DataflowIR -> SentientIR, the D1-D28 span).",
-    "",
-    "⛔ THERE IS NO CODEQL DATABASE AND NO WAVEFRONT EXTRACTION FOR THIS CAMPAIGN, and that is a",
-    "decision, not an omission:",
-    "  1. The campaign's C++ surface is ONE self-contained translation unit",
-    "     crustify-bridge2/source/bridge2.cpp, whose 384 function bodies call names that exist only",
-    "     as SEMANTICALLY EMPTY stand-ins in source/prelude.inc. A CodeQL call graph over stand-ins",
-    "     yields edges through a stub type, so it cannot order this work.",
-    "  2. The dependency order is already AUTHORITATIVE and machine-readable: bridge2.cpp is emitted",
-    "     in dependency order with LEVEL banners (level 0 calls nothing else in the span, level N",
-    "     only levels below), and every entry carries its original dcc/src/<file>:<line> citation.",
-    "     crates/compiler/deeptools/docs/bridge2-porting-order.md lists all 384 in that order.",
-    "  3. prelude.inc does not compile cleanly (523 clang -fsyntax-only errors, all name-resolution",
-    "     in the generated stand-ins), so a database built from it would drop bodies anyway.",
-    "The wave plans under crustify/campaigns/*/ are therefore authored from those level banners; the",
-    "batch caps recorded in each schedule are wavefront's own documented defaults (translation) and",
-    "3x them (review).",
-    "",
-    "This file is the provenance the schedules record and hash. Keep it byte-stable while a wave is",
-    "in flight: `crustify translate` rejects a schedule whose oracle config changed since planning."
+ "_comment": [
+  "CAMPAIGN-WIDE inventory for BRIDGE 4 — ProgIR -> SenProg.",
+  "",
+  "⛔⛔ THIS FILE WAS BRIDGE 2's UNTIL NOW, and it is one of only two documents the translator prompt",
+  "names (the other is crustify/build.json). A worktree branched from another campaign's branch",
+  "inherits its copy, so agents were being handed a config declaring",
+  "`impl_files: crustify-bridge2/source/bridge2.cpp` — a different campaign's extract, of a different",
+  "rung, whose bodies are truncated. Measured on the bridge-3 campaign, where two agents ran a whole",
+  "batch against the sibling campaign's instructions before it was caught.",
+  "",
+  "The per-sub-campaign narrowing lives beside its schedules at",
+  "crustify/campaigns/bridge4/progir-to-senprog/wavefront-config.json; this file is the campaign's",
+  "whole scope."
+ ],
+ "campaign_objective": "port",
+ "impl_files": [
+  "crustify-bridge4/cpp/bridge4.cpp"
+ ],
+ "api_headers": [],
+ "out_of_scope": {
+  "paths": [
+   "crustify-bridge4/cpp/prelude.inc"
   ],
-  "campaign_objective": "port",
-  "impl_files": ["crustify-bridge2/source/bridge2.cpp"],
-  "api_headers": [],
-  "out_of_scope": { "paths": ["crustify-bridge2/source/prelude.inc"], "features": [] },
-  "_comment_authority": [
-    "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
-    "  /Users/nickm/git/deeptools-src   (repo_info.txt: deeptools|master|a0d29abbedfa2dd44ec7255e59440b06a429118c)",
-    "which is exactly the revision the banners cite. ⛔ MEASURED: the extract in bridge2.cpp is",
-    "TRUNCATED AT THE TAIL OF EVERY BODY — 366 of 384 bodies end in a blank line followed by bare",
-    "closing braces, and a 48-entry sample against the authority found 21 with real trailing",
-    "statements dropped (`return success();`, `return rhs;`, a whole `} else { ... }` branch in",
-    "e217_lowerVectorLoadHelper, `initMASData(...)` in e289_initialize). PORT FROM THE AUTHORITY FILE",
-    "AT THE CITED LINE; use bridge2.cpp only to know WHICH function and in WHAT ORDER.",
-    "⛔ /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
-  ]
+  "features": []
+ },
+ "_comment_scope": [
+  "33 units — the transitive closure of the SenProg EMISSION, across FOUR authority files:",
+  "  sys-arch-spec/dpc/dpc.cpp        3   (entry point Dpc::convertIr2Senprog at :615)",
+  "  sys-arch-spec/progir/progir.cpp  6   (the operand text: OperandAttr::print at :25-62)",
+  "  sys-arch-spec/progir/progir.h   18   ALL IN-CLASS definitions — a .cpp-only scan misses these",
+  "  sys-arch-spec/isa/isa.cpp        6",
+  "",
+  "The emission also indexes six declared-data tables: typeToFieldEncoding, typeToFieldBitShift,",
+  "senComponentsToString, regTypeToString, progFormatFeaturesMap, typeToFieldName.",
+  "",
+  "OUT OF SCOPE, with reasons: dpc_standalone.cpp is a 236-line `main` — getopt_long, a format-name",
+  "table, ifstream/ofstream and dispatch — carrying no conversion rule; ProgIrGraph::print and",
+  "traverseGraphDFS are the ProgIR DUMPER, reached only from `dpc_standalone --ir`, and entered the",
+  "closure only as name collisions on a bare `print`."
+ ],
+ "_comment_authority": [
+  "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
+  "  /Users/nickm/git/deeptools-src   (repo_info.txt: deeptools|master|a0d29abbed…)",
+  "which is exactly the revision every banner in the extract cites.",
+  "",
+  "✅ THIS EXTRACT IS VERIFIED VERBATIM — 33 of 33. tools/verify_extract.py shares no code with the",
+  "extractor: it re-derives each body's end with its own scanner and compares length AND content,",
+  "asserts brace depth reaches zero at the body's last character, and never appends a brace. Both",
+  "negative controls fail as required (drop 3 lines; append a brace). It caught a real defect en",
+  "route: 24 of the header in-class bodies had lost their leading indentation.",
+  "",
+  "⛔ Bridge 2's extract was NOT checked this way and 366 of its 384 bodies were truncated at the",
+  "tail — its check re-sliced the source using the same length the extractor used, so it compared",
+  "what was copied against what was copied. Never trust an extract whose verification could not fail.",
+  "",
+  "⛔ /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+ ]
 }
