@@ -695,6 +695,18 @@ pub enum Op {
         result: Val,
         /// What is widened.
         input: Val,
+        /// `$variable` — THE VALUES A **NEGATIVE** INDEX NAMES, starting at `-1`.
+        ///
+        /// ⛔⛔ ADDED FOR `LoopUnrollForShuffleOp`'s `runOnOperation` (entry 248), whose ONLY job is
+        /// to find a shuffle with a loop induction variable in this list and unroll that loop
+        /// (`:88-112`). Without the field the pass had no domain: `getVariable()` was a shape this
+        /// island could not state, and the `indices` list already carried the negative entries that
+        /// refer to it (`VectorChain.td:445`, `getVariableOrPadOperand`).
+        ///
+        /// ⭐ `$pad` AND `$mask` ARE NOT HERE. They are the other two variadic segments of the same
+        /// op (`VectorChain.td:460-461`), and nothing in bridge 2's 384 reads either — an operand
+        /// list added for no unit is a list every construction site has to get right for no reason.
+        variable: Vec<Val>,
         /// One index per element of the input.
         indices: Vec<i32>,
         /// How many times the pattern repeats to fill the result.
@@ -1148,6 +1160,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::Shuffle {
             result,
             input,
+            variable,
             indices,
             repetition,
             input_ty,
@@ -1158,9 +1171,25 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 .map(|index| format!("{index} : i32"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // ⛔ `, variable(..)` IS WRITTEN ONLY WHEN THE SEGMENT IS NON-EMPTY, and one `index`
+            // joins the type list per entry — `if (numVariable > 0)` in both halves of
+            // `ShuffleOp::print` (`VectorChain.cpp:365-372, 388-390`).
+            let vars = if variable.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", variable({})",
+                    variable
+                        .iter()
+                        .map(|val| print::val(*val))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let var_tys = ", index".repeat(variable.len());
             let _ = writeln!(
                 out,
-                "{} = vectorchain.shuffle input({}) {{indices = [{indices}], repetition = {repetition} : i32}} : {}, {}",
+                "{} = vectorchain.shuffle input({}){vars} {{indices = [{indices}], repetition = {repetition} : i32}} : {}{var_tys}, {}",
                 print::val(*result),
                 print::val(*input),
                 print::vector(*input_ty),

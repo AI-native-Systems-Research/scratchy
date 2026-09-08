@@ -162,6 +162,7 @@ mod unit_tests {
         let shuffle = vectorchain::Op::Shuffle {
             result: Val(3),
             input: Val(2),
+            variable: Vec::new(),
             indices: vec![0, 1, 1, 1, 1, 1, 1, 1],
             repetition: 8,
             input_ty: f16(2),

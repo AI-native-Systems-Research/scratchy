@@ -181,7 +181,7 @@ pub struct DataflowForLoopInfo<'a> {
 ///
 /// ⛔ IT DESCENDS INTO REGIONS, because a loop inside a `program_unit` inside a loop is the ordinary
 /// case and the argument of an inner loop is bound arbitrarily deep.
-fn owner_of_block_arg(val: Val, scope: &[DfirOp]) -> Option<&DfirOp> {
+pub(super) fn owner_of_block_arg(val: Val, scope: &[DfirOp]) -> Option<&DfirOp> {
     for op in scope {
         if block_args(op).contains(&val) {
             return Some(op);

@@ -61,11 +61,14 @@
 //! | `e183_expandAffineApplyOps` | 183/384 | 53 | `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:183` |
 //! | `e248_runOnOperation` | 248/384 | 68 | `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:70` |
 
-use crate::islands::dataflow_ir::Values;
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, arith, defining_op, regions_mut, replace_uses_of_with, scf, uniform,
+    Op as DfirOp, Val, affine, arith, defining_op, region_owner, regions, regions_mut,
+    replace_uses_of_with, scf, uniform, vectorchain as vc,
 };
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ScalarTy};
+use crate::islands::dataflow_ir::{self as dfir, Values};
+use crate::units::DfirUnit;
 
 /// A LOOP THIS PASS MAY UNROLL — the closed set `performFullUnroll` dispatches over.
 ///
@@ -1172,18 +1175,150 @@ fn replace_all_uses(scope: &mut [DfirOp], from: Val, to: Val) {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// 248/384  runOnOperation  —  dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:70
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE CANDIDATE THE WALK INTERRUPTED ON, AND WHAT [`perform_full_unroll`] SAID ABOUT IT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShuffleUnroll {
+    /// `candidate` (`:100`, `:107`), named by the induction variable that reached it — the loop the
+    /// `vectorchain.shuffle`'s `variable` operand indexes.
+    pub iv: Val,
+    /// `performFullUnroll(candidate)`; `Unroll::failed()` is `emitError("Cannot unroll candidate")`.
+    pub unroll: Unroll,
+}
+
+/// WHAT THE PASS DID TO ONE `lxlu` UNIT — the two module walks of `:75-137`, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitUnrolling {
+    /// `dcc::getUnitType(unit.getUnits()[0].getDefiningOp<GetUnitOp>())` (`:76-77`) — always
+    /// [`DfirUnit::Lxlu`], since `comp != LXLU` is the filter that let the unit through.
+    pub on: DfirUnit,
+    /// The first walk: one entry per candidate, in the pre-order the reference interrupts on. A
+    /// failed entry is last, because `signalPassFailure(); return;` (`:121-124`) ends this unit.
+    pub unrolls: Vec<ShuffleUnroll>,
+    /// The second walk (`:130-137`), which runs on every `lxlu` unit whatever the first walk did.
+    pub applies: ExpandAffineApplyOps,
+}
+
+/// THE LOOP A VALUE IS THE INDUCTION VARIABLE OF — `block_arg == for_op.getInductionVar()` for both
+/// kinds (`:96-108`).
+///
+/// ⛔ `None` COVERS ALL THREE OF THE REFERENCE'S NON-CANDIDATES AT ONCE: a `variable` that is not a
+/// block argument, an `scf.for` `iter_args` argument (`block_arg != getInductionVar()`), and the
+/// `llvm_unreachable("unsupported loop type")` arm — see [`Loop::of`] for why the last is
+/// unobservable rather than merely unlikely.
+fn loop_of_induction_var(val: Val, scope: &[DfirOp]) -> Option<Loop> {
+    let owner = region_owner(val, scope)?;
+    match owner {
+        DfirOp::Scf(scf::Op::For { iv, .. }) | DfirOp::Affine(affine::Op::For { iv, .. })
+            if *iv == val =>
+        {
+            Loop::of(owner)
+        }
+        _ => None,
+    }
+}
+
+/// EVERY CANDIDATE IN A UNIT, PRE-ORDER, FIRST OCCURRENCE ONLY — `unit.walk<WalkOrder::PreOrder>`
+/// over `vectorchain::ShuffleOp` and the `for (auto variable : shuffle_op.getVariable())` inside it.
+fn shuffle_candidates(scope: &[DfirOp], unit: &[DfirOp], into: &mut Vec<Val>) {
+    for op in scope {
+        if let DfirOp::VectorChain(vc::Op::Shuffle { variable, .. }) = op {
+            for val in variable {
+                // `WalkResult::interrupt()` on the first hit — one candidate per walk, so a second
+                // `variable` of the same shuffle is only reached on a later walk.
+                if loop_of_induction_var(*val, unit).is_some() && !into.contains(val) {
+                    into.push(*val);
+                }
+            }
+        }
+        for region in regions(op) {
+            shuffle_candidates(region, unit, into);
+        }
+    }
+}
+
+/// Replaces: e248_runOnOperation
+///
+/// **248/384** `LoopUnrollForShuffleOpPass::runOnOperation` —
+/// `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:70` (68L): a `vectorchain.shuffle`'s lane
+/// selector must be a constant by lowering, so every loop whose induction variable feeds one is fully
+/// unrolled, and then every `affine.apply` the unrolling left behind is expanded.
+///
+/// ⛔ THE `while (true)` RE-WALK BECOMES ONE REQUEST PER DISTINCT CANDIDATE, and it must: the
+/// reference re-walks because `loopUnrollFull` mutates the unit under it, and that utility is upstream
+/// MLIR, so nothing here has performed the unroll the next walk would observe. An unrolled loop is
+/// gone and its shuffles read constants, so no candidate recurs — but an inner loop nested in one is
+/// duplicated per iteration, and the reference issues one request per COPY where this issues one for
+/// the original. See [`Unroll`], which names the request for the same reason.
+///
+/// ⛔ BOTH WALKS ARE FUSED INTO ONE PASS OVER THE UNITS. A unit's values are defined inside its own
+/// region, so neither walk can observe another unit's body, and a failed unroll ends only its own
+/// unit's `while (true)` — the second walk runs regardless (`:130-137`).
+///
+/// ⛔ `DisableThisPass` (`:43-46`, read at `:71`) IS DROPPED — the same
+/// [`cl::opt`](super::tf_canonicalize_toggle::run_on_operation) reason: a flag of `dcc-opt`, not a
+/// program property, and which pass runs here is a call in [`super::program`].
+pub fn run_on_operation<A: Arch>(
+    program: &mut dfir::Program<A>,
+    vals: &mut Values,
+) -> Vec<UnitUnrolling> {
+    let mut per_unit = Vec::new();
+
+    // `module_op.walk([&](dataflow::ProgramUnitOp unit) { .. })` — the units are a field of the
+    // program, so the walk for them is an iteration (see entry 356's note on the same point).
+    for unit in program.units.iter_mut() {
+        let on = unit.on.kind();
+        // `if (comp != LXLU) return;` (`:78`).
+        if !matches!(on, DfirUnit::Lxlu) {
+            continue;
+        }
+
+        let mut candidates = Vec::new();
+        shuffle_candidates(&unit.body, &unit.body, &mut candidates);
+        let mut unrolls = Vec::new();
+        for iv in candidates {
+            // `if (!candidate) break;` (`:115-116`) is the empty list; a candidate always classifies,
+            // because that classification is what made it one.
+            let Some(candidate) = loop_of_induction_var(iv, &unit.body) else {
+                continue;
+            };
+            let unroll = perform_full_unroll(candidate, &unit.body);
+            unrolls.push(ShuffleUnroll { iv, unroll });
+            // `if (performFullUnroll(candidate).failed()) { .. signalPassFailure(); return; }`
+            if unroll.failed() {
+                break;
+            }
+        }
+
+        // `expandAffineApplyOps(unit);` — the second walk, entry 183.
+        let applies = expand_affine_apply_ops(vals, &mut unit.body);
+        per_unit.push(UnitUnrolling {
+            on,
+            unrolls,
+            applies,
+        });
+    }
+
+    per_unit
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ExpandAffineApplyOps, FailedToExpand, Loop, TripCount, Unroll, constant_trip_count,
-        expand_affine_apply_ops, fold_to_constant, is_arith_constant, perform_full_unroll,
+        ExpandAffineApplyOps, FailedToExpand, Loop, ShuffleUnroll, TripCount, UnitUnrolling, Unroll,
+        constant_trip_count, expand_affine_apply_ops, fold_to_constant, is_arith_constant,
+        perform_full_unroll, run_on_operation,
     };
-    use crate::islands::dataflow_ir::Values;
+    use crate::arch::Target;
     use crate::islands::dataflow_ir::dialects::{
         Op as DfirOp, Val, affine, arith, block_args, dataflow, operands, regions, results, scf,
-        symbol, uniform,
+        symbol, uniform, vectorchain as vc,
     };
-    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ScalarTy};
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, ScalarTy, Vector};
+    use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units, Values};
     use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
 
     /// `%v = arith.constant N : i32` — the signless-integer constant `ConstantIntOp` accepts.
@@ -2216,9 +2351,112 @@ scf.for %1 = %2 to %3 step %4 {
             "the use reads the query, and the apply is gone"
         );
     }
-}
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e248_runOnOperation
+    /// 🎯 248/384 — THE VENDOR'S OWN CASE:
+    /// `dcc/test/Transform/LoopUnrolForShuffleOp/ldcvti_pattern.mlir`. Three nested `affine.for`s —
+    /// `%arg7 = 0 to 2`, `%arg8 = 0 to 4`, `%arg9 = 0 to 4` — and two `vectorchain.shuffle`s whose
+    /// `variable` reads `%arg7` and `%arg9`. Its `CHECK-SENT-IR` output keeps exactly
+    /// `affine.for %VAL_12 = 0 to 4` (`%arg8`, whose iv no shuffle reads) and has unrolled the other
+    /// two away.
+    ///
+    /// ⛔ THE EXPECTATION IS TWO REQUESTS WHERE THE REFERENCE MAKES THREE, and this case is what
+    /// shows it: re-walking after `%arg7`'s unroll finds `%arg9`'s loop **twice**, once per copy of
+    /// the outer body, which is why the output holds 8 shuffled bodies rather than 2 + 4. See
+    /// [`run_on_operation`] — the duplication is `loopUnrollFull`'s, and that is upstream MLIR.
+    ///
+    /// ⭐ AND `applies: 0`: the input carries no `affine.apply`. The reference's output holds three
+    /// (`arith.addi` + a folded constant per unrolled iteration, `:34-36` of the CHECK) because the
+    /// unroll it performed created them.
+    #[test]
+    fn the_two_loops_a_shuffle_variable_reads_are_asked_for_and_the_third_is_not() {
+        const V128: Vector = Vector {
+            len: 128,
+            elem: ElemType::F8E4M3Fn,
+        };
+        const V64: Vector = Vector {
+            len: 64,
+            elem: ElemType::F8E4M3Fn,
+        };
+
+        let mut vals = Values::default();
+        let (arg7, arg8, arg9) = (vals.mint(), vals.mint(), vals.mint());
+        let scale = vals.mint();
+        let stick = vals.mint();
+
+        // `%910 = vectorchain.shuffle input(%909), variable(%arg7) { indices = [-1], repetition = 64 }`
+        let shuffle = |result: Val, input: Val, variable: Val| {
+            DfirOp::VectorChain(vc::Op::Shuffle {
+                result,
+                input,
+                variable: vec![variable],
+                indices: vec![-1],
+                repetition: 64,
+                input_ty: V128,
+                ty: V64,
+            })
+        };
+        let a_for = |iv: Val, hi: i64, body: Vec<DfirOp>| {
+            DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(hi),
+                carried: Vec::new(),
+                body,
+                dbg_name: None,
+            })
+        };
+        let body = vec![
+            shuffle(vals.mint(), scale, arg7),
+            shuffle(vals.mint(), stick, arg9),
+        ];
+        let unit = vec![a_for(arg7, 2, vec![a_for(arg8, 4, vec![a_for(arg9, 4, body)])])];
+
+        let program_on = |on: DfirUnit, body: Vec<DfirOp>| {
+            use crate::generated::OpFunc;
+            use crate::islands::dataflow_ir::{Grid, GroupId, OpIndex, ProgramName, ProgramUnits};
+            dfir::Program::<Target> {
+                name: ProgramName {
+                    group: GroupId(0),
+                    index: OpIndex(0),
+                    func: OpFunc::Add,
+                },
+                grid: Grid::single(),
+                preamble: Vec::new(),
+                units: ProgramUnits::of(
+                    ProgramUnit {
+                        on: Units::one(on, Val(0)),
+                        precision: None,
+                        body,
+                        arch: core::marker::PhantomData,
+                    },
+                    Vec::new(),
+                ),
+                arch: core::marker::PhantomData,
+            }
+        };
+
+        let mut program = program_on(DfirUnit::Lxlu, unit.clone());
+        assert_eq!(
+            run_on_operation(&mut program, &mut vals),
+            vec![UnitUnrolling {
+                on: DfirUnit::Lxlu,
+                unrolls: vec![
+                    ShuffleUnroll {
+                        iv: arg7,
+                        unroll: Unroll::Fully,
+                    },
+                    ShuffleUnroll {
+                        iv: arg9,
+                        unroll: Unroll::Fully,
+                    },
+                ],
+                applies: ExpandAffineApplyOps::Expanded { applies: 0 },
+            }],
+            "`%arg8`'s loop is the one the vendor's output keeps"
+        );
+
+        // ⛔ `if (comp != LXLU) return;` — the same program on the PT row is not this pass's.
+        let mut elsewhere = program_on(DfirUnit::PtRow(Row::checked(0).expect("every PT has a row 0")), unit);
+        assert_eq!(run_on_operation(&mut elsewhere, &mut vals), Vec::new());
+    }
+}

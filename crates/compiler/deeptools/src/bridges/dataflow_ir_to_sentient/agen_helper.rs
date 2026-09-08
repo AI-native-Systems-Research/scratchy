@@ -2033,6 +2033,7 @@ mod unit_tests {
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 result: Val(41),
                 input: Val(31),
+                variable: Vec::new(),
                 indices: vec![0, 1],
                 repetition: 64,
                 input_ty: Vector {
@@ -2186,6 +2187,7 @@ mod unit_tests {
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 result: Val(41),
                 input: Val(31),
+                variable: Vec::new(),
                 indices,
                 repetition,
                 input_ty,
@@ -2255,6 +2257,7 @@ mod unit_tests {
         let half_stick = vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
             result: Val(41),
             input: Val(31),
+            variable: Vec::new(),
             indices: padded,
             repetition: 1,
             input_ty: Vector {
@@ -2772,6 +2775,7 @@ mod unit_tests {
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 result: Val(41),
                 input: Val(31),
+                variable: Vec::new(),
                 indices: vec![0, 1],
                 repetition: 64,
                 input_ty: Vector {
@@ -3114,6 +3118,7 @@ mod unit_tests {
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 result: Val(52),
                 input: Val(51),
+                variable: Vec::new(),
                 indices: vec![0],
                 repetition: 128,
                 input_ty: LANES,

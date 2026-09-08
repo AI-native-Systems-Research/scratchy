@@ -80,6 +80,7 @@
 //! | `e322_transformCompIndLoadAndStore` | 322/384 | 124 | `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546` |
 //! | `e351_runOnOperation` | 351/384 | 70 | `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226` |
 
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
 use crate::arch::{Arch, Bounded, Elements, IsaGen, Sticks};
@@ -91,8 +92,8 @@ use crate::islands::dataflow_ir::dialects::{
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, MemRef};
 use crate::units::DfirUnit;
 
-use super::agen_access_details::{AccessDetailsAffineComposite, TimeBound};
-use super::tf_utils::{LoopBound, LoopStep, constant_index};
+use super::agen_access_details::{AccessDetailsAffine, AccessDetailsAffineComposite, TimeBound};
+use super::tf_utils::{LoopBound, LoopStep, constant_index, owner_of_block_arg};
 
 
 /// WHICH HALF OF THE L3 — the `DT_CHECK(is_any_of(comp, L3LU, L3SU))` both range queries open with.
@@ -655,7 +656,7 @@ pub fn create_new_mem_view_with_mod(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::super::agen_access_details::TimeOffsets;
+    use super::super::agen_access_details::{IndicesCoeffDict, TimeOffsets};
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
     use crate::islands::dataflow_ir::dialects::{Index, agen};
@@ -4100,6 +4101,267 @@ mod unit_tests {
             ExplicitTimeLoops::NonTimeDimensionHasNoIterator { dim: 1 }
         );
     }
+    /// 🎯 250/384 — ⭐⭐ IBM'S `one_dim` ANSWER KEY, FROM THE OTHER END: THE `max_mutable` OF **12672**
+    /// THAT ENTRY 186 IS HANDED.
+    ///
+    /// `constant_start_addr_1` (`mutable_addr_splitting_one_dim.mlir:239-263`) —
+    /// `affine.for %arg1 = 0 to 4` around `scf.for %arg2 = %c0 to %719 step %c1` (`maxValue = 8`),
+    /// subscripts `[0, %arg1 * 3, %arg2 * 8]` over `d2 * 256 + d1 * 64 + d0`, so coefficients 192 and
+    /// 2048. ⛔ WEIGHT IS `num_iters - 2`, NOT `- 1`: `(4-2)*192 = 384` and `(8-2)*2048 = 12288`, and
+    /// `0 + 384 + 12288` is the span [`the_one_dim_answer_key_splits_the_symbolic_dim_into_partitions_of_four`]
+    /// splits. The `agen::Op` is not read by this function — only the indices and their coefficients.
+    #[test]
+    fn the_one_dim_answer_key_weighs_both_loops_at_num_iters_less_two() {
+        let mut vals = Values::default();
+        let (lo_op, lo) = index_const(&mut vals, 0);
+        let (step_op, step) = index_const(&mut vals, 1);
+        let hi = vals.mint();
+        let arg2 = vals.mint();
+        let arg1 = vals.mint();
+        let scope = vec![
+            lo_op,
+            step_op,
+            DfirOp::Symbol(symbol::Op::CreateSymbol {
+                result: hi,
+                symbol_id: -1476,
+                max_value: Some(8),
+            }),
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Scf(scf::Op::For {
+                    iv: arg2,
+                    lo,
+                    hi,
+                    step,
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+        ];
+
+        let op = time_dims_transfer();
+        let mut ad = AccessDetailsAffine::new(&op, DfirUnit::L3lu);
+        ad.base.indices = vec![arg1, arg2];
+        ad.indices_coeff_dict = IndicesCoeffDict {
+            per_index: vec![(arg1, 192), (arg2, 2048)],
+            constant: 0,
+        };
+
+        assert_eq!(
+            init_mas_data(&ad, &scope),
+            MasDataInit::Initialized {
+                mas_data: vec![
+                    MasData {
+                        iter_arg: Some(arg1),
+                        dim: 0,
+                        composed_coeff: 192,
+                        num_iters: 4,
+                        weight: 384,
+                    },
+                    MasData {
+                        iter_arg: Some(arg2),
+                        dim: 1,
+                        composed_coeff: 2048,
+                        num_iters: 8,
+                        weight: 12_288,
+                    },
+                ],
+                max_mutable: MutableAddr(12_672),
+            }
+        );
+    }
+    /// 🎯 251/384 — ⛔ THE MIDDLE STATEMENT IS LOAD-BEARING: THE `one_dim` KEY IS UNREACHABLE FROM
+    /// `initMASData` ORDER.
+    ///
+    /// The same case fed in the order entry 250 builds it — 384 before 12288 — cuts the LIGHT
+    /// dimension to 1 first and then sizes the heavy one against a reduced overflow, `[1, 4]`.
+    /// `sortDataBasedOnWeight` (`:826`) is what turns it back into the vendor's single
+    /// `arith.constant 4`.
+    #[test]
+    fn the_setup_sorts_before_it_sizes_and_the_one_dim_key_needs_that() {
+        let mut vals = Values::default();
+        let start = vals.mint();
+        let (scope, mem_view) = view_with_start(
+            &mut vals,
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 3072,
+            }),
+        );
+        let (layout, ty) = answer_key_memref();
+        let view = ConstStartMemView {
+            from: Val(0),
+            start: 3072,
+            layout: &layout,
+            ty: &ty,
+        };
+        let mut mas_data = [iterator(0, 192, 4, 384), iterator(1, 2048, 8, 12_288)];
+        let mut conditionals = Conditionals::default();
+
+        assert_eq!(
+            setup_for_partitioning::<Dd2>(
+                &mut mas_data,
+                &[mem_view],
+                L3Half::Load,
+                &view,
+                span_overflowing_by::<Dd2>(6972, DataType::Sen169Fp16),
+                DataType::Sen169Fp16,
+                &mut conditionals,
+                &scope,
+            ),
+            SetupForPartitioning::Sized(Partitioning::Split(PartitionSizes {
+                sizes: vec![4],
+                total_partitions: 2,
+                shifted_mutable: 8192,
+                remaining_overflow: -1220,
+            }))
+        );
+        // The sort ran in place, so `partition_sizes[0]` belongs to the heavy dimension.
+        assert_eq!(mas_data[0].dim, 1);
+    }
+    /// 🎯 253/384 — ⭐⭐ IBM'S `one_dim_sen1p5` KEY: THE `[0, …]` SUBSCRIPT COMES BACK AS `[64, …]`.
+    ///
+    /// `mutable_addr_splitting_one_dim_sen1p5.mlir:39` — the start address 2112 is an ODD 33 sticks and
+    /// the shift is even, so one stick of `f16` (128 bytes = 64 elements) leaves the immutable address
+    /// and lands on `d0`'s subscript. ⛔ AND DD2 NEVER ASKS: the same input is untouched there, which is
+    /// why the vendor keeps two copies of this file.
+    #[test]
+    fn the_sen1p5_answer_key_moves_a_stick_into_the_innermost_subscript() {
+        let op = time_dims_transfer();
+        let mut ad = AccessDetailsAffine::new(&op, DfirUnit::L3lu);
+        ad.base.transfer_order = AffineMap::identity(3);
+        ad.base.extents = vec![Elements(64), Elements(1), Elements(1)];
+
+        // `%src_mem_view[0, %arg1 * 16, %arg2 * 8]`.
+        let subscripts = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(0).times(16),
+                AffineExpr::dim(1).times(8),
+            ],
+        };
+
+        let mut map = subscripts.clone();
+        let mut addr_mod = 0;
+        assert_eq!(
+            adjust_for_even_immutable_addr::<Sen1p5>(
+                2112,
+                &mut map,
+                &ad,
+                &mut addr_mod,
+                DataType::Sen169Fp16,
+            ),
+            EvenImmutableAdjustment::ShiftedByAStick {
+                result: 0,
+                elems_in_stick: 64,
+            }
+        );
+        assert_eq!(addr_mod, -64, "the stick came out of the immutable address");
+        assert_eq!(map.results[0], AffineExpr::Const(64), "the vendor's `[64, ..`");
+        assert_eq!(&map.results[1..], &subscripts.results[1..]);
+        assert_eq!((map.dims, map.syms), (2, 0), "the symbol count is preserved");
+
+        let mut untouched = subscripts.clone();
+        let mut no_mod = 0;
+        assert_eq!(
+            adjust_for_even_immutable_addr::<Dd2>(
+                2112,
+                &mut untouched,
+                &ad,
+                &mut no_mod,
+                DataType::Sen169Fp16,
+            ),
+            EvenImmutableAdjustment::NotOnThisArch
+        );
+        assert_eq!((untouched, no_mod), (subscripts, 0));
+    }
+
+    /// 🎯 252/384 — ⭐⭐ THE `sen1p5` KEY'S TWO PARTITIONS, IN THE ORDER THE WALK FILLS THEM.
+    ///
+    /// `mutable_addr_splitting_one_dim_sen1p5.mlir:19-50` splits eight iterations of `d1` in halves,
+    /// so the boundary is **4** and the `else` arm's load is `[64, %VAL_11 * 16, %VAL_12 * 8 - 32]`
+    /// against the `then` arm's `[64, %VAL_11 * 16, %VAL_12 * 8]` — `8 * prev_iters(4)`, with
+    /// `4 * 2048` of start address to match.
+    ///
+    /// ⛔ AND THE `else` IS FILLED FIRST: `kReverseBFS` pops a breadth-first stack, so the deepest
+    /// level comes first and `else` precedes `then` within one.
+    #[test]
+    fn the_sen1p5_answer_key_fills_the_else_partition_first_and_shifts_its_subscript() {
+        let mut vals = Values::default();
+        let iv = vals.mint();
+        let mas_data = [split_dim(iv, 1, 2048, 8)];
+        let mut tree = construct_conditionals(&mut vals, &mas_data, &[4])
+            .ops()
+            .unwrap_or_default()
+            .to_vec();
+        let subscripts_map = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(0).scaled(16),
+                AffineExpr::dim(1).scaled(8),
+            ],
+        };
+
+        let mut filled: Vec<(String, i64)> = Vec::new();
+        let mut creator = |map: &AffineMap, start_addr_mod: i64| {
+            filled.push((print::affine_map(map), start_addr_mod));
+            vec![DfirOp::Arith(arith::Op::Constant {
+                result: vals.mint(),
+                value: start_addr_mod,
+            })]
+        };
+        let done = fill_partitions(&mut tree, &mas_data, &[4], &subscripts_map, &mut creator);
+
+        assert_eq!(done, FilledPartitions::Filled { partitions: 2 });
+        assert_eq!(
+            filled,
+            vec![
+                (
+                    "affine_map<(d0, d1) -> (0, d0 * 16, d1 * 8 - 32)>".to_owned(),
+                    8192,
+                ),
+                ("affine_map<(d0, d1) -> (0, d0 * 16, d1 * 8)>".to_owned(), 0),
+            ],
+            "the else partition first, carrying 4 iterations of both the address and the subscript"
+        );
+        assert_eq!(
+            printed(&tree),
+            concat!(
+                "%1 = arith.constant 4 : index\n",
+                "%2 = arith.cmpi slt, %0, %1 : index\n",
+                "scf.if %2 {\n",
+                "  %4 = arith.constant 0 : index\n",
+                "} else {\n",
+                "  %3 = arith.constant 8192 : index\n",
+                "}\n",
+            ),
+            "each partition's ops land inside its own arm, before that region's terminator"
+        );
+
+        // ⛔ AND THE REBUILT MAP DROPS THE SYMBOLS THE ORIGINAL DECLARED (`:1170`).
+        let symbolic = AffineMap {
+            dims: 1,
+            syms: 1,
+            results: vec![AffineExpr::dim(0).added(AffineExpr::sym(0))],
+        };
+        let mut shapes: Vec<(u32, u32)> = Vec::new();
+        let dim0 = [split_dim(iv, 0, 2048, 8)];
+        fill_partitions(&mut tree, &dim0, &[4], &symbolic, &mut |map: &AffineMap, _| {
+            shapes.push((map.dims, map.syms));
+            Vec::new()
+        });
+        assert_eq!(shapes, vec![(1, 0), (1, 0)], "`s0` is still in the results");
+    }
+
 }
 
 /// WHAT A LOOP ANSWERS WHEN ASKED HOW MANY TIMES IT RUNS — every value the reference's one `int64_t`
@@ -6622,13 +6884,589 @@ fn update_subscripts_and_indices_for_explicit_time_loops(
     Some((subscripts_map, new_indices))
 }
 
+/// WHAT [`init_mas_data`] LEAVES ITS CALLER — the filled list and the span, or the reason there is
+/// neither. The two `DT_CHECK`s are variants: nothing here refuses at run time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasDataInit {
+    /// One entry per index, outermost first, plus `max_mutable`.
+    Initialized {
+        /// `mas_data` — the reference's out-parameter, in `ad.getIndices()` order.
+        mas_data: Vec<MasData>,
+        /// `max_mutable` — `iter_coeff_dict[nullptr]` plus every weight.
+        max_mutable: MutableAddr,
+    },
+    /// `if (indices.size() == 0) return;` — the caller keeps the `max_mutable` it already had.
+    NoIndices,
+    /// `DT_CHECK(iter_coeff_dict.size() == indices.size() + 1)` (`:717`).
+    CoefficientCountDoesNotMatchTheIndices {
+        /// `indices.size()`.
+        indices: usize,
+        /// `iter_coeff_dict.size() - 1`, which is the coefficient vector's length.
+        coefficients: usize,
+    },
+    /// `cast<BlockArgument>(index)` plus `DT_CHECK(loop)` (`:727-728`) — no region binds this index.
+    IndexIsNotALoopIterator(Val),
+    /// `DT_CHECK(num_iters >= 0)` (`:730`).
+    LoopTripCountIsNotUsable {
+        /// The index whose loop was asked.
+        index: Val,
+        /// What [`get_loop_trip_count`] answered.
+        count: LoopTripCount,
+    },
+}
+
+/// Replaces: e250_initMASData
+///
+/// **250/384** `MutableAddrSplittingPass::initMASData` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:707` (31L): one [`MasData`] per subscript
+/// index, and `max_mutable` as the subscripts' constant offset plus every weight.
+///
+/// ⛔ `weight = num_iters < 2 ? 0 : (num_iters - 2) * composed_coeff` (`:736`) — MINUS TWO, because
+/// the iterator peaks at `num_iters - 1` and no transfer follows the last iteration, so
+/// `num_iters - 2` is the last mutable address actually used.
+#[must_use]
+pub fn init_mas_data(ad: &AccessDetailsAffine<'_>, scope: &[DfirOp]) -> MasDataInit {
+    // `auto indices = ad.getIndices(); if (indices.size() == 0) return;`
+    let indices = &ad.base.indices;
+    if indices.is_empty() {
+        return MasDataInit::NoIndices;
+    }
+
+    // `auto iter_coeff_dict = ad.getIndicesCoeffDict();` — `per_index[i]` pairs `indices[i]`, so the
+    // `+ 1` of the reference's length check is the dict's named constant and this is the rest.
+    let dict = &ad.indices_coeff_dict;
+    if dict.per_index.len() != indices.len() {
+        return MasDataInit::CoefficientCountDoesNotMatchTheIndices {
+            indices: indices.len(),
+            coefficients: dict.per_index.len(),
+        };
+    }
+
+    // `max_mutable = iter_coeff_dict[nullptr];` — the span starts at the constant offset.
+    let mut max_mutable = MutableAddr(dict.constant);
+    let mut mas_data = Vec::with_capacity(indices.len());
+
+    for (i, (&index, &(_, composed_coeff))) in indices.iter().zip(&dict.per_index).enumerate() {
+        // `auto loop = cast<BlockArgument>(index).getOwner()->getParentOp(); DT_CHECK(loop);`
+        let Some(loop_op) = owner_of_block_arg(index, scope) else {
+            return MasDataInit::IndexIsNotALoopIterator(index);
+        };
+
+        // `auto num_iters = getLoopTripCount(loop); DT_CHECK(num_iters >= 0);`
+        let count = get_loop_trip_count(loop_op, scope);
+        let Some(num_iters) = count.iterations().filter(|iters| *iters >= 0) else {
+            return MasDataInit::LoopTripCountIsNotUsable { index, count };
+        };
+
+        let weight = if num_iters < 2 {
+            0
+        } else {
+            (num_iters - 2).saturating_mul(composed_coeff)
+        };
+
+        // `mas_data.emplace_back(index, i, composed_coeff, num_iters, weight);`
+        mas_data.push(MasData {
+            iter_arg: Some(index),
+            dim: u32::try_from(i).unwrap_or(u32::MAX),
+            composed_coeff,
+            num_iters,
+            weight,
+        });
+        // `max_mutable += weight;`
+        max_mutable.add_weight(weight);
+    }
+
+    MasDataInit::Initialized {
+        mas_data,
+        max_mutable,
+    }
+}
+
+/// WHAT THE THREE-STATEMENT SETUP ANSWERS — the sizes, or the eligibility check that stopped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupForPartitioning {
+    /// `calculatePartitionSizes(...)`'s answer, over a `mas_data` now sorted by weight.
+    Sized(Partitioning),
+    /// `DT_CHECK(isEligibleForSplitting(all_mem_views))` (`:825`) — and nothing is sorted.
+    NotEligibleForSplitting(SplittingEligibility),
+}
+
+/// Replaces: e251_setupForPartitioning
+///
+/// **251/384** `MutableAddrSplittingPass::setupForPartitioning` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:819` (6L): the three statements that stand
+/// between an overflow and a partition plan — eligibility, sort, size.
+///
+/// ⛔ THE SORT IS THE MIDDLE STATEMENT AND IT MUTATES THE CALLER'S `mas_data` (`:826`), which is what
+/// lets [`calculate_partition_sizes`] stop at the heaviest dimension; the ineligible arm returns
+/// having sorted nothing.
+pub fn setup_for_partitioning<A: Arch>(
+    mas_data: &mut [MasData],
+    all_mem_views: &[Val],
+    half: L3Half,
+    view: &ConstStartMemView<'_>,
+    max_mutable: MutableAddr,
+    elem: DataType,
+    num_conditionals: &mut Conditionals,
+    scope: &[DfirOp],
+) -> SetupForPartitioning {
+    // `DT_CHECK(isEligibleForSplitting(all_mem_views));`
+    let eligibility = is_eligible_for_splitting(all_mem_views, scope);
+    if !eligibility.eligible() {
+        return SetupForPartitioning::NotEligibleForSplitting(eligibility);
+    }
+
+    // `sortDataBasedOnWeight(mas_data);`
+    sort_data_based_on_weight(mas_data);
+
+    // `calculatePartitionSizes(evaluator, mas_data, partition_sizes, comp, mem_view_op,
+    //                          max_mutable, elem_size_in_bits);`
+    SetupForPartitioning::Sized(calculate_partition_sizes::<A>(
+        mas_data,
+        half,
+        view,
+        max_mutable,
+        elem,
+        num_conditionals,
+    ))
+}
+
+/// WHAT THE PARITY REALIGNMENT DID — and every state the reference reaches instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvenImmutableAdjustment {
+    /// `if (dcc_ext_ctx_.getArch() < IsaCoreGen::SEN1P5_ISA) return;` (`:1208`).
+    NotOnThisArch,
+    /// `is_even == is_even_mod` — nothing to move.
+    ParitiesAlreadyAgree,
+    /// A stick left `immutable_addr_mod` and joined the subscript at this result.
+    ShiftedByAStick {
+        /// The `transfer_order` result that is a function of `d0`.
+        result: usize,
+        /// `num_elems_in_stick`.
+        elems_in_stick: u64,
+    },
+    /// `DT_CHECK(res < num_res)` (`:1232`) — no `transfer_order` result mentions `d0`.
+    NoTransferOrderResultUsesTheInnermostDim,
+    /// `DT_CHECK_MSG(ad.getExtents()[res] >= num_elems_in_stick, "Innermost dimension extend must fit
+    /// a full stick.")` (`:1240`).
+    InnermostExtentIsSmallerThanAStick {
+        /// `ad.getExtents()[res]`.
+        extent: Elements,
+        /// `num_elems_in_stick`.
+        elems_in_stick: u64,
+    },
+    /// The same subscript, with no extent recorded for it — `getExtents()` and `getTransferOrder()`
+    /// are built together (`AccessDetailsBase::constructExtentAndTotalElements`) and disagree here.
+    ExtentsDoNotCoverTheTransferOrder {
+        /// `transfer_order.getNumResults()`.
+        results: usize,
+        /// `ad.getExtents().size()`.
+        extents: usize,
+    },
+}
+
+/// Replaces: e253_adjustForEvenImmutableAddr
+///
+/// **253/384** `MutableAddrSplittingPass::adjustForEvenImmutableAddr` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1204` (47L): from SEN1P5 on, a partition whose
+/// shift has the opposite stick parity to the immutable address gives one stick back and adds those
+/// elements to the `d0` subscript instead.
+///
+/// ⛔ THE STICK MOVES TO THE FIRST `transfer_order` RESULT THAT IS A FUNCTION OF `d0`, NOT TO RESULT 0
+/// (`:1229-1232`) — `d0`'s coefficient is always 1, which is what makes the addition a plain one.
+/// ⭐ AND THIS ONE KEEPS `getNumSymbols()` (`:1252`), unlike [`fill_partitions`].
+/// ⚠️ The `is_even ? true : isL3ImmutableAddrAllOdd(...)` check cannot fire on a constant start — the
+/// two predicates are exact complements there; see [`calculate_partition_sizes`] for the full reason.
+pub fn adjust_for_even_immutable_addr<A: Arch>(
+    immutable_addr: i64,
+    subscripts_map: &mut AffineMap,
+    ad: &AccessDetailsAffine<'_>,
+    immutable_addr_mod: &mut i64,
+    elem: DataType,
+) -> EvenImmutableAdjustment {
+    if A::GEN < IsaGen::Sen1p5 {
+        return EvenImmutableAdjustment::NotOnThisArch;
+    }
+
+    // `int num_elems_in_stick = dcc_ext_ctx_.getBytesPerStick() * 8 / elem_size_in_bits;`
+    let stick = elems_in_stick::<A>(elem);
+    let elems_in_stick = stick.get();
+
+    // `isL3ImmutableAddrEven(evaluator, immutable_addr, num_elems_in_stick)` —
+    // `evaluateDivideByConst(ev, n).isDivisibleBy(2)` over the single constant address.
+    let is_even = (immutable_addr / elems_in_stick.cast_signed()) % 2 == 0;
+    // `bool is_even_mod = immutable_addr_mod % 2 == 0;`
+    let is_even_mod = *immutable_addr_mod % 2 == 0;
+    if is_even == is_even_mod {
+        return EvenImmutableAdjustment::ParitiesAlreadyAgree;
+    }
+
+    // `auto transfer_order = ad.getTransferOrder();` then the first result naming `d0`.
+    let transfer_order = &ad.base.transfer_order;
+    let num_res = transfer_order.results.len();
+    let Some(res) = (0..num_res).find(|&res| {
+        transfer_order.results[res].is_function_of_dim(0)
+    }) else {
+        // `DT_CHECK(res < num_res);`
+        return EvenImmutableAdjustment::NoTransferOrderResultUsesTheInnermostDim;
+    };
+
+    // `DT_CHECK_MSG(ad.getExtents()[res] >= num_elems_in_stick, …);`
+    let Some(&extent) = ad.base.extents.get(res) else {
+        return EvenImmutableAdjustment::ExtentsDoNotCoverTheTransferOrder {
+            results: num_res,
+            extents: ad.base.extents.len(),
+        };
+    };
+    if extent.0 < elems_in_stick {
+        return EvenImmutableAdjustment::InnermostExtentIsSmallerThanAStick {
+            extent,
+            elems_in_stick,
+        };
+    }
+
+    // `immutable_addr_mod -= num_elems_in_stick;` — ⛔ AFTER both checks in the reference's order but
+    // before the map is rebuilt, and only on this path.
+    *immutable_addr_mod = immutable_addr_mod.saturating_sub(elems_in_stick.cast_signed());
+
+    // `if (i == res) expr = expr + num_elems_in_stick;` over every result, then
+    // `AffineMap::get(getNumDims(), getNumSymbols(), new_exprs, getContext())`.
+    let stick_elems = elems_in_stick.cast_signed();
+    for (i, expr) in subscripts_map.results.iter_mut().enumerate() {
+        if i == res {
+            *expr = expr.clone().added(AffineExpr::Const(stick_elems));
+        }
+    }
+
+    EvenImmutableAdjustment::ShiftedByAStick {
+        result: res,
+        elems_in_stick,
+    }
+}
+
+/// WHICH ARM OF AN `scf.if` A NODE IS — `CondNode::isThenNode()` / `isElseNode()`
+/// (`dcc/src/Analysis/ConditionalTree.hpp:87-88`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// The `then` region.
+    Then,
+    /// The `else` region.
+    Else,
+}
+
+/// ONE `CondNode` HOP: the `scf.if` a node hangs under, and which of its two arms.
+///
+/// ⭐ THE PAIR IS THE REFERENCE'S TWO `getParentNode()` CALLS. `curr_node->getParentNode()` is the
+/// `if` node and its parent again is the arm node above it (`MutableAddrSplitting.cpp:1166`), so one
+/// [`Step`] is one partitioned dimension's worth of walking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Step {
+    /// Where the `scf.if` sits in the region that holds it.
+    at: usize,
+    /// Which of its regions this node is.
+    arm: Arm,
+    /// `curr_if_op.getCondition()` — the `arith.cmpi` result.
+    cond: Val,
+}
+
+/// A `CondNode` DURING THE BREADTH-FIRST WALK — an `scf.if` node or one of its two arm nodes.
+#[derive(Debug, Clone)]
+enum CondNode {
+    /// An `if` node: the path to the region holding it, and where in that region it is.
+    If {
+        /// The arms walked through to reach it.
+        path: Vec<Step>,
+        /// Its index in that region.
+        at: usize,
+        /// Its condition.
+        cond: Val,
+    },
+    /// A `then` or `else` node, addressed by the whole path to it.
+    Arm(Vec<Step>),
+}
+
+/// THE REGION A PATH OF ARMS LEADS TO.
+fn region_at<'a>(tree: &'a [DfirOp], path: &[Step]) -> Option<&'a [DfirOp]> {
+    let mut region = tree;
+    for step in path {
+        let DfirOp::Scf(scf::Op::If {
+            body, else_body, ..
+        }) = region.get(step.at)?
+        else {
+            return None;
+        };
+        region = match step.arm {
+            Arm::Then => body,
+            Arm::Else => else_body,
+        };
+    }
+    Some(region)
+}
+
+/// The same walk, for the region a partition's ops are inserted into.
+fn region_at_mut<'a>(tree: &'a mut Vec<DfirOp>, path: &[Step]) -> Option<&'a mut Vec<DfirOp>> {
+    let mut region = tree;
+    for step in path {
+        let DfirOp::Scf(scf::Op::If {
+            body, else_body, ..
+        }) = region.get_mut(step.at)?
+        else {
+            return None;
+        };
+        region = match step.arm {
+            Arm::Then => body,
+            Arm::Else => else_body,
+        };
+    }
+    Some(region)
+}
+
+/// The `scf.if`s a region holds, in syntactic order — one arm node's children.
+fn conditionals_in(region: &[DfirOp]) -> Vec<(usize, Val)> {
+    region
+        .iter()
+        .enumerate()
+        .filter_map(|(at, op)| match op {
+            DfirOp::Scf(scf::Op::If { cond, .. }) => Some((at, *cond)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `CondNode::walk<kReverseBFS>` OVER THE LEAVES — `isLeafNode()` is an arm node with no `scf.if` in
+/// it (`ConditionalTree.hpp:90`).
+///
+/// ⛔⛔ BREADTH-FIRST, COLLECTED INTO A STACK AND THEN POPPED (`OperationTree.cpp:200-236`, with
+/// `keep_order = false`), so the DEEPEST partition is filled FIRST and same-depth siblings run
+/// `else` before `then`. The order is what decides which partition's ops are built first, so it is
+/// part of the answer rather than a detail of the walk.
+fn reverse_bfs_leaves(tree: &[DfirOp], root: (usize, Val)) -> Vec<Vec<Step>> {
+    let mut order: Vec<CondNode> = Vec::new();
+    let mut queue: VecDeque<CondNode> = VecDeque::new();
+    queue.push_back(CondNode::If {
+        path: Vec::new(),
+        at: root.0,
+        cond: root.1,
+    });
+
+    while let Some(node) = queue.pop_front() {
+        match &node {
+            // `Every CondNode corresponding to an If op has two children - a ThenNode and an
+            // ElseNode` (`ConditionalTree.hpp:28-29`), in that order.
+            CondNode::If { path, at, cond } => {
+                for arm in [Arm::Then, Arm::Else] {
+                    let mut child = path.clone();
+                    child.push(Step {
+                        at: *at,
+                        arm,
+                        cond: *cond,
+                    });
+                    queue.push_back(CondNode::Arm(child));
+                }
+            }
+            CondNode::Arm(path) => {
+                let children = region_at(tree, path).map(conditionals_in).unwrap_or_default();
+                for (at, cond) in children {
+                    queue.push_back(CondNode::If {
+                        path: path.clone(),
+                        at,
+                        cond,
+                    });
+                }
+            }
+        }
+        order.push(node);
+    }
+
+    order.reverse();
+    order
+        .into_iter()
+        .filter_map(|node| match node {
+            CondNode::Arm(path) => region_at(tree, &path)
+                .filter(|region| conditionals_in(region).is_empty())
+                .map(|_| path),
+            CondNode::If { .. } => None,
+        })
+        .collect()
+}
+
+/// WHAT `fillPartitions` DID TO THE TREE, OR THE `DT_CHECK` THAT STOPPED IT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilledPartitions {
+    /// Every leaf received `op_creator`'s ops.
+    Filled {
+        /// How many leaves were filled — the tree's partitions.
+        partitions: usize,
+    },
+    /// `calculateSubscriptsCoefficients`'s refusal, passed through unchanged.
+    CoefficientsNotExtracted(SubscriptsCoefficients),
+    /// `DT_CHECK(coeffs.size() == subscripts_map.getNumResults())` (`:1149`) — ⭐ hoisted out of the
+    /// leaf walk, which reads the same rows for every partition, so it fires before any leaf is
+    /// filled rather than part-way through.
+    CoefficientRowDoesNotCoverTheSubscripts {
+        /// `mas_data[p].dim_`.
+        dim: u32,
+        /// `coeffs.size()`.
+        coefficients: usize,
+        /// `subscripts_map.getNumResults()`.
+        results: usize,
+    },
+    /// `mas_data[p]` for a `partition_sizes` position with no iterator.
+    MorePartitionsThanIterators {
+        /// `partition_sizes.size()`.
+        sizes: usize,
+        /// `mas_data.size()`.
+        iterators: usize,
+    },
+    /// A LEAF NESTED LESS DEEPLY THAN THERE ARE PARTITIONED DIMENSIONS.
+    ///
+    /// ⛔⛔ THE OTHER HALF OF [`construct_conditionals`]'S `prev_partitions` DEFECT. The walk takes
+    /// exactly `partition_sizes.size()` steps up from every leaf (`:1119-1167`), and the branches
+    /// that lost their inner dimensions are shallower than that — where the reference calls
+    /// `getParentNode()` on the root and dereferences null.
+    PartitionIsShallowerThanThePlan {
+        /// How many arms this leaf sits under.
+        depth: usize,
+        /// `partition_sizes.size()`.
+        dimensions: usize,
+    },
+    /// `cast<arith::CmpIOp>` on the condition, or `cast<arith::ConstantOp>` on its right-hand side
+    /// (`:1136-1143`).
+    ConditionIsNotACompareAgainstAConstant(Val),
+    /// The tree holds no `scf.if` at all, so `cond_tree.getRoot()` is not an `if` node.
+    TreeHasNoRootConditional,
+}
+
+/// Replaces: e252_fillPartitions
+///
+/// **252/384** `MutableAddrSplittingPass::fillPartitions` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1063` (117L): every leaf of the conditional
+/// tree is one partition, and its address is recovered by reading the conditionals above it — one per
+/// partitioned dimension, innermost first.
+///
+/// ⛔ `prev_iters` IS `demarkation - partition_sizes[p]` IN A `then` ARM AND `demarkation` IN AN
+/// `else` (`:1145`); it scales BOTH the start address (`* composed_coeff_`) and, negated, every
+/// subscript (`* coeffs[r]`). ⛔⛔ AND THE REBUILT MAP HARD-CODES **ZERO SYMBOLS** (`:1170-1171`),
+/// dropping any the original declared — unlike [`adjust_for_even_immutable_addr`], which preserves
+/// them at `:1252`.
+pub fn fill_partitions(
+    cond_tree: &mut Vec<DfirOp>,
+    mas_data: &[MasData],
+    partition_sizes: &[i64],
+    subscripts_map: &AffineMap,
+    op_creator: &mut impl FnMut(&AffineMap, i64) -> Vec<DfirOp>,
+) -> FilledPartitions {
+    if partition_sizes.len() > mas_data.len() {
+        return FilledPartitions::MorePartitionsThanIterators {
+            sizes: partition_sizes.len(),
+            iterators: mas_data.len(),
+        };
+    }
+
+    // `auto subscripts_coeffs = calculateSubscriptsCoefficients(mas_data, partition_sizes,
+    //                                                           subscripts_map);`
+    let rows = match calculate_subscripts_coefficients(mas_data, partition_sizes, subscripts_map) {
+        SubscriptsCoefficients::Extracted(rows) => rows,
+        refusal => return FilledPartitions::CoefficientsNotExtracted(refusal),
+    };
+    let results = subscripts_map.results.len();
+    for row in &rows {
+        // `DT_CHECK(coeffs.size() == subscripts_map.getNumResults());`
+        if row.coeffs.len() != results {
+            return FilledPartitions::CoefficientRowDoesNotCoverTheSubscripts {
+                dim: row.dim,
+                coefficients: row.coeffs.len(),
+                results,
+            };
+        }
+    }
+
+    let Some(&root) = conditionals_in(cond_tree).first() else {
+        return FilledPartitions::TreeHasNoRootConditional;
+    };
+    let leaves = reverse_bfs_leaves(cond_tree, root);
+    let mut partitions = 0usize;
+
+    for path in leaves {
+        // The walk takes one [`Step`] per partitioned dimension, from the leaf outward.
+        if path.len() < partition_sizes.len() {
+            return FilledPartitions::PartitionIsShallowerThanThePlan {
+                depth: path.len(),
+                dimensions: partition_sizes.len(),
+            };
+        }
+
+        // `SmallVector<AffineExpr> new_exprs; for (auto &res : subscripts_map.getResults()) ..`
+        let mut new_exprs = subscripts_map.results.clone();
+        let mut start_addr_mod = 0i64;
+
+        // `for (int p = partition_sizes.size() - 1; p >= 0; --p)` — and `curr_node` climbs two
+        // `CondNode`s per dimension, which is one [`Step`] per dimension here.
+        for (up, p) in (0..partition_sizes.len()).rev().enumerate() {
+            let step = path[path.len() - 1 - up];
+
+            // `cast<arith::CmpIOp>(curr_if_op.getCondition().getDefiningOp())`. ⚠️ `cond.getLhs()` is
+            // bound to `iter` there and never read; the predicate is not checked either.
+            let Some(DfirOp::Arith(arith::Op::Compare { rhs, .. })) =
+                defining_op(step.cond, cond_tree)
+            else {
+                return FilledPartitions::ConditionIsNotACompareAgainstAConstant(step.cond);
+            };
+            // `cast<IntegerAttr>(cast<arith::ConstantOp>(cond.getRhs().getDefiningOp()).getValue())`.
+            let Some(DfirOp::Arith(arith::Op::Constant { value, .. })) =
+                defining_op(*rhs, cond_tree)
+            else {
+                return FilledPartitions::ConditionIsNotACompareAgainstAConstant(step.cond);
+            };
+            let demarkation = *value;
+
+            // `prev_iters = is_then_node ? demarkation - partition_sizes[p] : demarkation;`
+            let prev_iters = match step.arm {
+                Arm::Then => demarkation.saturating_sub(partition_sizes[p]),
+                Arm::Else => demarkation,
+            };
+
+            // `start_addr_mod += prev_iters * mas_data[p].composed_coeff_;`
+            start_addr_mod =
+                start_addr_mod.saturating_add(prev_iters.saturating_mul(mas_data[p].composed_coeff));
+
+            // `new_exprs[r] = new_exprs[r] - (coeffs[r] * prev_iters);` — MLIR's `operator-(int64_t)`
+            // is `*this + (-v)`, so this is the same `simplifyAdd` [`AffineExpr::added`] performs.
+            for (expr, &coeff) in new_exprs.iter_mut().zip(&rows[p].coeffs) {
+                let shift = coeff.saturating_mul(prev_iters);
+                *expr = expr.clone().added(AffineExpr::Const(-shift));
+            }
+        }
+
+        // `AffineMap::get(subscripts_map.getNumDims(), 0, new_exprs, ..)` — the symbol count is a
+        // literal `0`, not `subscripts_map.getNumSymbols()`.
+        let new_subscripts_map = AffineMap {
+            dims: subscripts_map.dims,
+            syms: 0,
+            results: new_exprs,
+        };
+
+        // `op_creator(partition_builder, new_subscripts_map, start_addr_mod)`, where the builder is
+        // `getThenBodyBuilder()` or `getElseBodyBuilder()` — `atBlockTerminator` for a resultless
+        // `scf.if`, so the ops land before the region's `scf.yield`.
+        let created = op_creator(&new_subscripts_map, start_addr_mod);
+        let Some(region) = region_at_mut(cond_tree, &path) else {
+            return FilledPartitions::TreeHasNoRootConditional;
+        };
+        let at = region
+            .iter()
+            .position(|op| matches!(op, DfirOp::Scf(scf::Op::Yield { .. })))
+            .unwrap_or(region.len());
+        region.splice(at..at, created);
+        partitions += 1;
+    }
+
+    FilledPartitions::Filled { partitions }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e250_initMASData
-// crustify:todo: e251_setupForPartitioning
-// crustify:todo: e252_fillPartitions
-// crustify:todo: e253_adjustForEvenImmutableAddr
 // crustify:todo: e289_initialize
 // crustify:todo: e290_createPartitions
 // crustify:todo: e306_transformVectorLoad

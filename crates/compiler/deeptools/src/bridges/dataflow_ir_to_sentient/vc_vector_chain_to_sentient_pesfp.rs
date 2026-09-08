@@ -732,6 +732,7 @@ mod unit_tests {
         ops.push(DfirOp::VectorChain(vc::Op::Shuffle {
             result: Val(0),
             input: Val(1),
+            variable: Vec::new(),
             indices: vec![0, 1],
             repetition: 1,
             input_ty: V,
@@ -935,6 +936,7 @@ mod unit_tests {
         let unit = unit_holding(vec![DfirOp::VectorChain(vc::Op::Shuffle {
             result: Val(0),
             input: Val(1),
+            variable: Vec::new(),
             indices: vec![0, 1],
             repetition: 1,
             input_ty: V,

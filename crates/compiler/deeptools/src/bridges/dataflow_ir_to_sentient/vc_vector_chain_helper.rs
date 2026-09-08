@@ -2630,6 +2630,7 @@ mod unit_tests {
         DfirOp::VectorChain(vc::Op::Shuffle {
             result: Val(44),
             input: Val(43),
+            variable: Vec::new(),
             indices: (0..16).collect(),
             repetition: 4,
             input_ty: ty,
@@ -3945,6 +3946,7 @@ mod unit_tests {
         let shuffle = vc::Op::Shuffle {
             result: Val(44),
             input: Val(43),
+            variable: Vec::new(),
             indices: (0..16).collect(),
             repetition: 4,
             input_ty: ty,

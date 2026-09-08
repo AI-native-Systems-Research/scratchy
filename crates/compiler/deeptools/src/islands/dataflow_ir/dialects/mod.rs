@@ -346,8 +346,12 @@ pub fn operands(op: &Op) -> Vec<Val> {
             | vectorchain::Op::Floor { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
-            | vectorchain::Op::Shuffle { input, .. }
             | vectorchain::Op::Cast { input, .. } => reads.push(*input),
+            // ⛔ AND THE `variable` SEGMENT, which is what entry 248 walks uses for.
+            vectorchain::Op::Shuffle { input, variable, .. } => {
+                reads.push(*input);
+                reads.extend(variable.iter().copied());
+            }
             vectorchain::Op::Rotate {
                 input, position, ..
             } => reads.extend([*input, *position]),
@@ -720,8 +724,11 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | vectorchain::Op::Neg { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
-            | vectorchain::Op::Shuffle { input, .. }
             | vectorchain::Op::Cast { input, .. } => places.push(input),
+            vectorchain::Op::Shuffle { input, variable, .. } => {
+                places.push(input);
+                places.extend(variable.iter_mut());
+            }
             vectorchain::Op::Rotate {
                 input, position, ..
             } => places.extend([input, position]),
@@ -1476,9 +1483,18 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             | vectorchain::Op::Neg { result, input, .. }
             | vectorchain::Op::ScanWithGap { result, input, .. }
             | vectorchain::Op::Select { result, input, .. }
-            | vectorchain::Op::Shuffle { result, input, .. }
             | vectorchain::Op::Cast { result, input, .. } => {
                 operands.push(input);
+                results.push(result);
+            }
+            vectorchain::Op::Shuffle {
+                result,
+                input,
+                variable,
+                ..
+            } => {
+                operands.push(input);
+                operands.extend(variable.iter_mut());
                 results.push(result);
             }
             vectorchain::Op::Rotate {
@@ -2039,12 +2055,21 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             vectorchain::Op::Estimate { result, input, .. }
             | vectorchain::Op::ScanWithGap { result, input, .. }
             | vectorchain::Op::Select { result, input, .. }
-            | vectorchain::Op::Shuffle { result, input, .. }
             | vectorchain::Op::FastExp { result, input, .. }
             | vectorchain::Op::Floor { result, input, .. }
             | vectorchain::Op::Neg { result, input, .. }
             | vectorchain::Op::Cast { result, input, .. } => {
                 vals.push((Role::Operand, input));
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::Shuffle {
+                result,
+                input,
+                variable,
+                ..
+            } => {
+                vals.push((Role::Operand, input));
+                vals.extend(variable.iter_mut().map(|val| (Role::Operand, val)));
                 vals.push((Role::Result, result));
             }
             vectorchain::Op::Rotate {

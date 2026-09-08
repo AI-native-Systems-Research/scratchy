@@ -778,13 +778,9 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
             };
             let new_node = LocalOpNodeId(base.push_child(parent_node.0, new_node));
             if uniformizes {
-                // `compute(new_node);` (`:138`) — entry 247/384, level 2.
-                todo!(
-                    "e247_compute: a nested `uniform.uniformize_regions` in region {} of its parent \
-                     needs its own unit list per region, from `getUnitsPerRegionsAsVectorOfVector` \
-                     (`FlatteningLocalRegions.cpp:151-166`)",
-                    is_in_region_num.0
-                );
+                // `compute(new_node);` (`:138`) — the nested local op's own regions, each walked with
+                // its own unit list. ⭐ MUTUAL RECURSION, as in the reference.
+                self.compute(new_node);
             } else {
                 // `for (int region_num = 0; region_num < op.getNumRegions(); region_num++)
                 //    traverseRegion(op.getRegion(region_num), new_node, units, region_num);`
@@ -799,6 +795,41 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
                     self.traverse_region(inner, new_node, units, RegionNum(region_num));
                 }
             }
+        }
+    }
+
+    /// Replaces: e247_compute
+    ///
+    /// **247/384** `FlatteningLocalRegionsTree::compute` — `FlatteningLocalRegions.cpp:151` (15L):
+    /// the per-region unit lists of a NESTED `uniform.uniformize_regions`, walked back into the tree.
+    ///
+    /// ⛔ EVERY REGION IS STAMPED REGION 0 — `traverseRegion(.., /*is_in_region_num=*/false)` for all
+    /// of them (`:164`), which is why [`Self::clone_ops_for_regions`] recovers the real region by
+    /// pointer comparison (`:246-256`). ⭐ `DT_CHECK(units_for_each_region.size() == getNumRegions())`
+    /// (`:161`) is unwritable: [`uniform::LocalRegion`] pairs each region's ops with its own units.
+    pub fn compute(&mut self, node: LocalOpNodeId) {
+        // `auto uniform_op = dyn_cast<uniform::UniformizeRegionsOp>(node->getOperation());
+        //  if (!uniform_op) return;` (`:152-154`) — the only caller has already asked the same
+        // question (`:137`), so the null arm is the reference's own belt and braces.
+        let op: &'p DfirOp = match self.node(node) {
+            Some(payload) => payload.op,
+            // ⚠️ A NODE THAT IS NOT IN THIS TREE, which the reference cannot spell: `node` is a
+            // pointer there and an id here. Same answer as a failed `dyn_cast` — nothing to walk.
+            None => return,
+        };
+        let DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) = op else {
+            return;
+        };
+
+        // `getUnitsPerRegionsAsVectorOfVector(uniform_op, units_for_each_region);` (`:157-158`) is
+        // this iteration: one [`uniform::LocalRegion`] per region, carrying its own unit list.
+        //
+        // `for (int idx = 0; idx < getNumRegions(); idx++)
+        //    traverseRegion(getRegion(idx), node, units_for_each_region.at(idx), false);` (`:162-165`)
+        // — the node is the PARENT of every region's children, so all of them become its siblings in
+        // one chain, and `false` is region 0 for every one of them.
+        for region in regions {
+            self.traverse_region(&region.body, node, &region.units, RegionNum(0));
         }
     }
 
@@ -1131,6 +1162,22 @@ impl<'p> Default for FlatteningLocalRegionsTree<'p> {
         Self::new()
     }
 }
+
+/// Replaces: e246_FlatteningLocalRegionsTree
+///
+/// **246/384** `~FlatteningLocalRegionsTree() { clear(); }` — `FlatteningLocalRegions.cpp:79` (0L).
+///
+/// ⛔ THE PORT IS THE ABSENCE OF A `Drop` IMPL, AND LOSING THAT ABSENCE IS A BUILD ERROR. Both of
+/// [`FlatteningLocalRegionsTree`]'s fields OWN what `clear()` frees (`:112-127`), so drop glue frees
+/// the same nodes and the same map, and `root_ = nullptr` is unobservable on a dying object. The
+/// destructuring below is legal only while no `Drop` impl exists (E0509) — entries 086/087's shape.
+const _: () = {
+    let _the_tree_adds_nothing_to_its_fields = |tree: FlatteningLocalRegionsTree<'_>| {
+        let FlatteningLocalRegionsTree { unit_to_ops, base } = tree;
+        drop(unit_to_ops);
+        drop(base);
+    };
+};
 
 /// DO TWO UNITS RUN THE SAME OPERATIONS — `unit_to_op0.second == unit_to_op1.second`
 /// (`FlatteningLocalRegions.cpp:181`).
@@ -1682,6 +1729,82 @@ mod unit_tests {
         );
     }
 
+    /// 🎯 247/384 — THE VENDOR'S `@diff_groups`: A NESTED LOCAL OP RE-DERIVES THE UNIT LIST PER REGION,
+    /// AND THAT IS WHAT SPLITS TWO UNITS THAT WERE IN ONE REGION.
+    ///
+    /// The outer region runs on `%0, %2` together; its nested `uniform.uniformize_regions` gives `%0`
+    /// one region and `%2` another (`flatten_local_region.mlir:90-119`). `compute` walks each with its
+    /// OWN list, so the two units are attributed DIFFERENT operation objects and
+    /// [`FlatteningLocalRegionsTree::partition_units`] returns two classes — which is why the vendor's
+    /// four units come out as four regions and not two (`CHECK-SENT-IR` `:19`, `:31`, `:43`, `:55`).
+    /// ⭐ AND THE NESTED OP'S OWN NODE CARRIES NO UNITS, since `traverseRegion` skips the push for it.
+    #[test]
+    fn a_nested_local_op_splits_the_units_its_parent_shared() {
+        let nested = DfirOp::Uniform(uniform::Op::UniformizeRegions {
+            regions: vec![
+                uniform::LocalRegion {
+                    arg: Val(48),
+                    units: vec![Val(0)],
+                    body: vec![
+                        DfirOp::Arith(arith::Op::Constant {
+                            result: Val(9),
+                            value: 0,
+                        }),
+                        DfirOp::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        }),
+                    ],
+                },
+                uniform::LocalRegion {
+                    arg: Val(48),
+                    units: vec![Val(2)],
+                    body: vec![
+                        DfirOp::Arith(arith::Op::Constant {
+                            result: Val(19),
+                            value: 0,
+                        }),
+                        DfirOp::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        }),
+                    ],
+                },
+            ],
+            results: Vec::new(),
+        });
+        let program = a_uniformize_over(vec![Val(0), Val(2)], vec![nested]);
+        let region = the_region(&program);
+        let (mut tree, root) = a_rooted_tree(&program);
+
+        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
+
+        let inner_node = tree.first_child(root).expect("the nested local op");
+        assert!(
+            tree.node(inner_node).expect("its payload").units.is_empty(),
+            "`traverseRegion` pushes no unit for a `uniform.uniformize_regions` (`:137-139`)"
+        );
+        assert_eq!(
+            tree.partition_units(),
+            vec![(Val(0), vec![Val(0)]), (Val(2), vec![Val(2)])],
+            "each nested region attributed its own operations to its own unit"
+        );
+        let attributed: Vec<usize> = tree
+            .unit_to_ops
+            .entries()
+            .iter()
+            .map(|(_, ops)| ops.len())
+            .collect();
+        assert_eq!(
+            attributed,
+            vec![2, 2],
+            "the constant and the `uniform.yield` of one region each — `compute` walked both (`:162-165`)"
+        );
+        // `traverseRegion(.., false)` for BOTH regions (`:164`), so nothing is stamped region 1.
+        assert!(
+            tree.in_region_empty(RegionNum(1), tree.first_child(inner_node)),
+            "every child of a uniformized op is stamped region 0"
+        );
+    }
+
     /// A `uniform.uniformize_regions` OVER ONE REGION — the shape `compute` hands to
     /// [`FlatteningLocalRegionsTree::traverse_region`].
     ///
@@ -1852,33 +1975,6 @@ mod unit_tests {
             tree.node(else_op).map(|node| node.units.as_slice()),
             Some([Val(10)].as_slice())
         );
-    }
-
-    /// 🎯 180/384 — A NESTED `uniform.uniformize_regions` STOPS AT ENTRY 247, WHICH IS NOT IN THIS WAVE.
-    ///
-    /// `compute(new_node)` (`:138`) re-derives a unit list per region from the nested op's own
-    /// `$units`/`$list_sizes` (`:151-166`); that is `e247_compute`, level 2 of the campaign
-    /// (`crustify-bridge2/UNITS.tsv`). ⛔ THE GATE IS THE REFERENCE'S OWN `isa<>`, so a region with no
-    /// nested local region — every region of the vendor's cases 1-3, and the outer region of case 4 —
-    /// walks completely; only the case that genuinely needs 247 reaches the `todo!`.
-    #[test]
-    #[should_panic(expected = "e247_compute")]
-    fn a_nested_local_region_needs_entry_247() {
-        let program = a_uniformize_over(
-            vec![Val(10)],
-            vec![DfirOp::Uniform(uniform::Op::UniformizeRegions {
-                regions: vec![uniform::LocalRegion {
-                    arg: Val(48),
-                    units: vec![Val(10)],
-                    body: Vec::new(),
-                }],
-                results: Vec::new(),
-            })],
-        );
-        let region = the_region(&program);
-        let (mut tree, root) = a_rooted_tree(&program);
-
-        tree.traverse_region(&region.body, root, &region.units, RegionNum(0));
     }
 
     /// ONE OPERATION PER LINE OF A REGION — the ops the nodes below stand for.
@@ -2312,7 +2408,5 @@ mod unit_tests {
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e246_FlatteningLocalRegionsTree
-// crustify:todo: e247_compute
 // crustify:todo: e287_flatten
 // crustify:todo: e305_runOnOperation
