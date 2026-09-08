@@ -193,17 +193,60 @@ impl OperandValue {
     }
 }
 
-// crustify:todo: e025_isInt
-//   authority: sys-arch-spec/progir/progir.h:106  (1 lines)  `isInt`
+impl OperandValue {
+    /// Replaces: e025_isInt
+    ///
+    /// `type_ == Type::INT` — the plain integer immediate, which senprog prints as
+    /// `to_string(asInt(id))` (`progir.cpp:43-45`).
+    #[must_use]
+    pub const fn is_int(&self) -> bool {
+        matches!(self, Self::Int(_))
+    }
 
-// crustify:todo: e026_isInt128
-//   authority: sys-arch-spec/progir/progir.h:109  (1 lines)  `isInt128`
+    /// Replaces: e026_isInt128
+    ///
+    /// `type_ == Type::INT128` — the four-word vector immediate.
+    ///
+    /// ⛔ TRAP: IT IS **NOT** AN INT, so [`Self::as_int`] refuses it: `print` writes all four words
+    /// as `%08x%08x%08x%08x` from `asInt128`, high word first (`progir.cpp:56-60`).
+    #[must_use]
+    pub const fn is_int128(&self) -> bool {
+        matches!(self, Self::Int128(_))
+    }
 
-// crustify:todo: e027_isVariableSymbol
-//   authority: sys-arch-spec/progir/progir.h:105  (1 lines)  `isVariableSymbol`
+    /// Replaces: e027_isVariableSymbol
+    ///
+    /// `type_ == Type::VARIABLE_SYMBOL` — a variable *id*, not its name, which senprog prints
+    /// between `%` delimiters as `"%" + to_string(asInt(id)) + "%"` (`progir.cpp:52-54`).
+    #[must_use]
+    pub const fn is_variable_symbol(&self) -> bool {
+        matches!(self, Self::VariableSymbol(_))
+    }
 
-// crustify:todo: e029_asInt
-//   authority: sys-arch-spec/progir/progir.h:68  (5 lines)  `asInt`
+    /// Replaces: e029_asInt
+    ///
+    /// The integer of the three kinds stored as one — the reference's guard is
+    /// `!isInt() && !isBool() && !isVariableSymbol()`, so BOOLEAN and VARIABLE_SYMBOL read through
+    /// here and INT128 does not.
+    ///
+    /// ⛔ A BOOLEAN IS AN `int64_t` UNDERNEATH: `setOperand(bool)` stores
+    /// `static_cast<int64_t>(input)` (`progir.h:171`), which is why `print` writes a BOOLEAN as
+    /// `0`/`1` rather than `false`/`true`.
+    #[must_use]
+    pub const fn as_int(&self) -> Option<i64> {
+        match self {
+            Self::Int(value) | Self::VariableSymbol(value) => Some(*value),
+            Self::Boolean(set) => Some(*set as i64),
+            // ⛔ ENUMERATED, NOT `_`: INT128 is four words and must not read as one of them.
+            Self::Variable(_)
+            | Self::Descriptive(_)
+            | Self::InstrTag(_)
+            | Self::Float(_)
+            | Self::Unknown
+            | Self::Int128(_) => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -330,5 +373,29 @@ mod unit_tests {
         assert!(boolean.is_bool() && !boolean.is_float());
         assert!(float.is_float() && !float.is_bool());
         assert!(!OperandValue::Int(1).is_bool() && !OperandValue::Int128([0; 4]).is_float());
+    }
+
+    /// e025/e026/e027: three disjoint numeric tags, and INT128 is not the INT its name suggests.
+    #[test]
+    fn each_numeric_kind_answers_to_exactly_its_own_predicate() {
+        let int = OperandValue::Int(-1);
+        let wide = OperandValue::Int128([1, 2, 3, 4]);
+        let symbol = OperandValue::VariableSymbol(9);
+
+        assert!(int.is_int() && !int.is_int128() && !int.is_variable_symbol());
+        assert!(wide.is_int128() && !wide.is_int() && !wide.is_variable_symbol());
+        assert!(symbol.is_variable_symbol() && !symbol.is_int() && !symbol.is_int128());
+    }
+
+    /// e029: the reference's guard admits exactly INT, BOOLEAN and VARIABLE_SYMBOL — a BOOLEAN as
+    /// `0`/`1`, and INT128 (the near miss) as no integer at all.
+    #[test]
+    fn as_int_admits_the_three_kinds_stored_as_one_integer() {
+        assert_eq!(OperandValue::Int(-7).as_int(), Some(-7));
+        assert_eq!(OperandValue::VariableSymbol(3).as_int(), Some(3));
+        assert_eq!(OperandValue::Boolean(true).as_int(), Some(1));
+        assert_eq!(OperandValue::Boolean(false).as_int(), Some(0));
+        assert_eq!(OperandValue::Int128([0, 0, 0, 5]).as_int(), None);
+        assert_eq!(OperandValue::Float(1.5).as_int(), None);
     }
 }

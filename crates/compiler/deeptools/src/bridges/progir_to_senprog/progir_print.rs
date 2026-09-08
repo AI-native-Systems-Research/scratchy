@@ -5,11 +5,16 @@
 //! spelling and separators. A predicate that decides what to write, without writing it, is not
 //! a port. The authority is `/Users/nickm/git/deeptools-src/<file>:<line>` per unit below.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use sys_arch_spec::arch_enums::SenComponent;
+use sys_arch_spec::operand::Operand as OperandField;
+use sys_arch_spec::regfile::Component;
+use sys_arch_spec::InstOpCode;
 
 use crate::arch::Arch;
 use crate::islands::progir::ty::OperandValue;
-use crate::islands::progir::{Block, BlockKind, Program, UnitProgram};
+use crate::islands::progir::{Block, BlockKind, Instruction, Program, UnitProgram};
 use crate::model::Model;
 use crate::workload::Workload;
 
@@ -105,7 +110,98 @@ pub enum UnitName {
     L3su,
 }
 
+/// WHICH COMPUTE HALF A PROGRAM'S KEY NAMES — the `corelet` string `dpc.cpp:635-639` prints, which
+/// is always a digit: the L3 halves are forced to `"0"` and every other key ends in one.
+///
+/// ⛔ SEPARATE FROM [`Corelet`] BECAUSE `-1` CANNOT OCCUR HERE — a `senCompProgram_` key is
+/// corelet-resolved, so the generic arm of the lookup is not one of this decomposition's answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramCorelet {
+    /// `0`.
+    C0,
+    /// `1`.
+    C1,
+}
+
+impl ProgramCorelet {
+    /// The digit as the header line and the reg-init line both print it.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::C0 => "0",
+            Self::C1 => "1",
+        }
+    }
+
+    /// The same half as [`sen_component`]'s argument.
+    #[must_use]
+    pub const fn as_corelet(self) -> Corelet {
+        match self {
+            Self::C0 => Corelet::C0,
+            Self::C1 => Corelet::C1,
+        }
+    }
+}
+
 impl UnitName {
+    /// Every key half, in `senCompMap`'s own order.
+    pub const ALL: [Self; 17] = [
+        Self::Sfp,
+        Self::Pt,
+        Self::PtRow(PtRow::Row0),
+        Self::PtRow(PtRow::Row1),
+        Self::PtRow(PtRow::Row2),
+        Self::PtRow(PtRow::Row3),
+        Self::PtRow(PtRow::Row4),
+        Self::PtRow(PtRow::Row5),
+        Self::PtRow(PtRow::Row6),
+        Self::PtRow(PtRow::Row7),
+        Self::Pe,
+        Self::Lxlu,
+        Self::Lxsu,
+        Self::L0lu,
+        Self::L0su,
+        Self::L3lu,
+        Self::L3su,
+    ];
+
+    /// `senComponentsToString.at(unit)` AND THE SURGERY THAT FOLLOWS IT — `corelet = name.back()`,
+    /// `name.pop_back()`, then `insert(2, '_')` for a `row` (`dpc.cpp:635-645`), read as the INVERSE
+    /// of [`sen_component`] so the two tables cannot disagree.
+    ///
+    /// ⛔ A GENERIC KEY HAS NO DECOMPOSITION: `"pt"` loses its `t` to the corelet and
+    /// `getSenComponent("p")` then aborts, so `Pt`, `Pe`, `Sfp`, `Lxlu`… and every non-unit
+    /// component — `Hbm`, `Ring`, `Zero` — refuse here exactly as they do there.
+    #[must_use]
+    pub fn of(unit: SenComponent) -> Option<(Self, ProgramCorelet)> {
+        // ⭐ THE L3 HALVES ARE THE SPECIAL CASE AND THEY LAND ON `0` EITHER WAY: `dpc.cpp:635-636`
+        // assigns `"0"` outright, and their `C1` row is one of `senCompMap`'s three holes.
+        [ProgramCorelet::C0, ProgramCorelet::C1]
+            .into_iter()
+            .flat_map(|corelet| Self::ALL.map(|name| (name, corelet)))
+            .find(|&(name, corelet)| sen_component(name, corelet.as_corelet()) == Some(unit))
+    }
+
+    /// THE ISA TABLE THIS UNIT READS — `isaPerUnit.at(getSenComponent(unitName))`, whose corelet
+    /// argument defaults to `-1` (`dpc.cpp:646-647`), so a PT row and the whole PT share one table.
+    ///
+    /// ⭐ TOTAL, because [`Component`] is exactly the nine units the reference's generic lookup can
+    /// land on — the memories, links and register files that make it `DT_ERROR` are not in it.
+    #[must_use]
+    pub const fn component(self) -> Component {
+        match self {
+            Self::Sfp => Component::Sfp,
+            Self::Pt | Self::PtRow(_) => Component::Pt,
+            Self::Pe => Component::Pe,
+            Self::Lxlu => Component::Lxlu,
+            Self::Lxsu => Component::Lxsu,
+            Self::L0lu => Component::L0lu,
+            Self::L0su => Component::L0su,
+            Self::L3lu => Component::L3lu,
+            Self::L3su => Component::L3su,
+        }
+    }
+
     /// The key as `senCompMap` writes it.
     #[must_use]
     pub const fn spelling(self) -> &'static str {
@@ -226,11 +322,208 @@ impl UnitProgram {
     }
 }
 
-// crustify:todo: e030_tagToLCCR
-//   authority: sys-arch-spec/progir/progir.cpp:720  (88 lines)  `ProgramAndStateInfo::tagToLCCR`
+/// AN INSTRUCTION'S POSITION IN ITS UNIT'S PROGRAM — the `pc` `tagToPC` returns, which senprog
+/// writes as the value of every tagged operand that is not a `JCMP`'s `src0` (`dpc.cpp:702-705`).
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pc(usize);
 
-// crustify:todo: e031_tagToPC
-//   authority: sys-arch-spec/progir/progir.cpp:696  (23 lines)  `ProgramAndStateInfo::tagToPC`
+impl Pc {
+    /// The line number.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// WHICH LOOP COUNTER A TAG NAMES — the `int` `tagToLCCR` returns, which senprog writes as the
+/// `src0` of a `JCMP`/`JCMPI` (`dpc.cpp:698-700`).
+///
+/// ⛔ SIGNED, AND NOT BOUNDED BY `numLCCRs`: it is `loopNesting` after an unbalanced `be` has taken
+/// it below zero, which is why the reference's own closing test is `lccrIdx < 0` and not `== -1`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LccrIndex(i32);
+
+impl LccrIndex {
+    /// The index as the text carries it.
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// WHERE A TAG RESOLVED, OR WHY IT DID NOT — `tagToPC`'s `int` together with its two `DT_ERROR`s.
+///
+/// ⭐ `allowNotFound` IS NOT A PARAMETER: it only chooses between `pc = 0` and an abort AFTER the
+/// scan, so the verdict carries both and `convertIr2Senprog` reads it against the instruction's own
+/// `deadCode_`, which is what it passes (`dpc.cpp:702-705`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagPc {
+    /// The line that carries the tag.
+    At(Pc),
+    /// *"Tag: %s found in lines %d and %d"* — ⛔ NO FALLBACK: `allowNotFound` does not excuse this.
+    Twice(Pc, Pc),
+    /// *"No instruction found with tag"* — `allowNotFound` returns `0` instead.
+    NotFound,
+}
+
+/// THE SAME FOR `tagToLCCR`, whose three abort sites do NOT share one fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagLccr {
+    /// The `lccrIdx` the tag's `MVLOOPCNT` fixed.
+    At(LccrIndex),
+    /// *"found after JCMP that could alter LCCR index"* — `allowNotFound` returns `0`.
+    AfterAlteringJump,
+    /// *"found on op different from MVLOOPCNT"* — `allowNotFound` returns `shadowLccrIdx + 1`,
+    /// which is carried here because it is not the other arms' zero.
+    NotOnLoop(LccrIndex),
+    /// *"found in multiple lines"* — ⛔ NO FALLBACK.
+    Twice,
+    /// *"No loop found with tag"* — `allowNotFound` returns `0`.
+    NoLoop,
+}
+
+/// Replaces: e031_tagToPC
+///
+/// Which line of `prog` carries `tag` — the reference's `getSimpleInstrVect()` is the slice.
+///
+/// ⛔ TRAP: A DEAD FIRST MATCH IS REPLACED, NOT REPORTED AS A DUPLICATE. The test is
+/// `pc == -1 || tagFoundOnDeadCode`, so live code silently wins over dead code that came first, and
+/// only two LIVE carriers are *"found in lines %d and %d"*.
+#[must_use]
+pub fn tag_to_pc(prog: &[Instruction], tag: &str) -> TagPc {
+    let mut tag_found_on_dead_code = false;
+    let mut pc: Option<usize> = None;
+    for (line, instr) in prog.iter().enumerate() {
+        if instr.tag_str() == tag {
+            match pc {
+                Some(first) if !tag_found_on_dead_code => {
+                    return TagPc::Twice(Pc(first), Pc(line));
+                }
+                _ => {
+                    pc = Some(line);
+                    tag_found_on_dead_code = instr.dead;
+                }
+            }
+        }
+    }
+    match pc {
+        Some(line) => TagPc::At(Pc(line)),
+        None => TagPc::NotFound,
+    }
+}
+
+/// Replaces: e030_tagToLCCR
+///
+/// Which loop counter `tag`'s `MVLOOPCNT` was given, by walking the nesting the program opens and
+/// closes: `MVLOOPCNT` deepens it, a set `be` closes one, and a jump over either unbalances both.
+///
+/// ⛔ TRAP: DEAD CODE MOVES THE **SHADOW** INDEX ONLY, so a tag on a dead loop still reports the
+/// slot that loop would have taken while `loopNesting` — the live nesting — never sees it.
+/// ⛔ TRAP: A DEAD DUPLICATE IS SILENTLY IGNORED. The reference's inner `if (!deadCode_)` has no
+/// `else`, so a second dead carrier neither aborts nor overwrites the index already found.
+/// ⛔ AND A `pc_target` THAT IS NOT A STRING REGISTERS NO JUMP HERE, where `asString` aborts.
+#[must_use]
+pub fn tag_to_lccr(prog: &[Instruction], tag: &str) -> TagLccr {
+    let mut lccr_idx: i32 = -1;
+    let mut loop_nesting: i32 = -1;
+    let mut shadow_lccr_idx: i32 = -1;
+    let mut tags: BTreeSet<&str> = BTreeSet::new();
+    let mut pending_jumps: BTreeMap<&str, i32> = BTreeMap::new();
+    let mut disable_loop_tag = false;
+    let mut tag_found_on_dead_code = false;
+
+    for instr in prog {
+        if instr.has_tag() {
+            tags.insert(instr.tag_str());
+            // ⭐ A JUMP LANDING HERE HAVING CROSSED AN UNBALANCED LOOP IS WHAT DISABLES THE TAG:
+            // the pending depth is the nesting the jump straddled, and only a non-zero one counts.
+            if let Some(straddled) = pending_jumps.remove(instr.tag_str()) {
+                if straddled != 0 {
+                    disable_loop_tag = true;
+                }
+            }
+        }
+        if instr.opcode == InstOpCode::MVLOOPCNT {
+            if instr.dead {
+                shadow_lccr_idx += 1;
+            } else {
+                loop_nesting += 1;
+                shadow_lccr_idx = loop_nesting;
+                for straddled in pending_jumps.values_mut() {
+                    *straddled += 1;
+                }
+            }
+            if instr.tag_str() == tag {
+                if lccr_idx != -1 && !tag_found_on_dead_code {
+                    if !instr.dead {
+                        return TagLccr::Twice;
+                    }
+                } else if disable_loop_tag {
+                    return TagLccr::AfterAlteringJump;
+                } else {
+                    lccr_idx = shadow_lccr_idx;
+                    tag_found_on_dead_code = instr.dead;
+                }
+            }
+        } else if instr.tag_str() == tag {
+            // Most likely a loop that progpatch turned into a JCMP.
+            return TagLccr::NotOnLoop(LccrIndex(shadow_lccr_idx + 1));
+        } else if instr.opcode == InstOpCode::RETURN && !instr.dead {
+            if let Some(field) = instr.field(OperandField::Subroutine) {
+                if is_set(field, "yes") {
+                    disable_loop_tag = true;
+                }
+            }
+        }
+
+        // A jump can leave `MVLOOPCNT`/`be` unbalanced, so its target is remembered at depth 0.
+        // ⛔ `MVLOOPCNT`'s OWN `imm` IS A TARGET WHEN IT HOLDS A TAG — one position, two names.
+        let target = instr
+            .field(OperandField::PcTarget)
+            .or_else(|| {
+                (instr.opcode == InstOpCode::MVLOOPCNT)
+                    .then(|| instr.field(OperandField::Imm).filter(|imm| imm.is_tag()))
+                    .flatten()
+            })
+            .and_then(OperandValue::as_string);
+        if let Some(target) = target {
+            if tags.contains(target) {
+                disable_loop_tag = true;
+            }
+            pending_jumps.insert(target, 0);
+        }
+
+        if let Some(be) = instr.field(OperandField::Be) {
+            if is_set(be, "be") {
+                if instr.dead {
+                    shadow_lccr_idx -= 1;
+                } else {
+                    loop_nesting -= 1;
+                    shadow_lccr_idx = loop_nesting;
+                    for straddled in pending_jumps.values_mut() {
+                        *straddled -= 1;
+                    }
+                }
+            }
+        }
+    }
+    if lccr_idx < 0 {
+        TagLccr::NoLoop
+    } else {
+        TagLccr::At(LccrIndex(lccr_idx))
+    }
+}
+
+/// A FLAG FIELD THAT IS ON — `((isBool() || isInt()) && asInt() == 1) || (isDescriptive() && asString() == name)`,
+/// the shape both `be` and `subroutine` are tested with (`progir.cpp:773-777`, `:798-800`).
+///
+/// ⛔ THE ENUM SPELLING IS THE FIELD'S OWN NAME, not a shared `"yes"`: `be` reads `"be"`.
+fn is_set(field: &OperandValue, spelling: &str) -> bool {
+    ((field.is_bool() || field.is_int()) && field.as_int() == Some(1))
+        || (field.is_descriptive() && field.as_string() == Some(spelling))
+}
 
 /// WHETHER A VALUE IS DELIMITED — `print`'s `prettyPrint` (`progir.cpp:25`), as the closed set it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +720,61 @@ mod unit_tests {
         assert_eq!(
             OperandValue::Float(1e32).print(Pretty::Off),
             Some("100000003318135351409612647563264.000000".to_owned())
+        );
+    }
+
+    /// A tagged instruction, `dead` or not, with no other field.
+    fn tagged(opcode: InstOpCode, tag: Option<&str>, dead: bool) -> Instruction {
+        Instruction {
+            opcode,
+            tag: tag.map(str::to_owned),
+            dead,
+            ..instr(Vec::new())
+        }
+    }
+
+    /// e031: a DEAD first carrier is replaced by the live one rather than reported as a duplicate,
+    /// and only two LIVE carriers are the *"found in lines"* refusal.
+    #[test]
+    fn a_dead_carrier_yields_to_a_live_one_and_two_live_ones_collide() {
+        let dead_then_live = [
+            tagged(InstOpCode::NOP, Some("t"), true),
+            tagged(InstOpCode::NOP, None, false),
+            tagged(InstOpCode::NOP, Some("t"), false),
+        ];
+        assert_eq!(tag_to_pc(&dead_then_live, "t"), TagPc::At(Pc(2)));
+        assert_eq!(tag_to_pc(&dead_then_live, "u"), TagPc::NotFound);
+
+        let twice = [
+            tagged(InstOpCode::NOP, Some("t"), false),
+            tagged(InstOpCode::NOP, Some("t"), false),
+        ];
+        assert_eq!(tag_to_pc(&twice, "t"), TagPc::Twice(Pc(0), Pc(1)));
+    }
+
+    /// e030: nesting is what fixes the index — and a DEAD loop moves only the shadow, so it does not
+    /// consume the slot the live loop after it takes.
+    #[test]
+    fn a_dead_loop_does_not_consume_the_slot_the_live_one_takes() {
+        let nested = [
+            tagged(InstOpCode::MVLOOPCNT, None, false),
+            tagged(InstOpCode::MVLOOPCNT, Some("inner"), false),
+        ];
+        assert_eq!(tag_to_lccr(&nested, "inner"), TagLccr::At(LccrIndex(1)));
+        assert_eq!(tag_to_lccr(&nested, "absent"), TagLccr::NoLoop);
+
+        let after_dead = [
+            tagged(InstOpCode::MVLOOPCNT, None, true),
+            tagged(InstOpCode::MVLOOPCNT, Some("t"), false),
+        ];
+        // ⛔ `At(0)`, NOT `At(1)`: the dead loop never touched `loopNesting`.
+        assert_eq!(tag_to_lccr(&after_dead, "t"), TagLccr::At(LccrIndex(0)));
+
+        // A tag on anything but an `MVLOOPCNT` reports the slot the NEXT loop would take.
+        let not_a_loop = [tagged(InstOpCode::NOP, Some("t"), false)];
+        assert_eq!(
+            tag_to_lccr(&not_a_loop, "t"),
+            TagLccr::NotOnLoop(LccrIndex(0))
         );
     }
 }

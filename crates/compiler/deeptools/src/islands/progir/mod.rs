@@ -105,6 +105,20 @@ pub struct Instruction {
     pub comment: Option<String>,
 }
 
+impl Instruction {
+    /// ONE OPERAND BY NAME — `instFields_.count(f) ? &instFields_.at(f) : nullptr`, the pair the
+    /// reference writes as a `count` then an `at` at every one of its lookup sites.
+    ///
+    /// ⭐ ADDED FOR BRIDGE 4: [`Self::fields`] is a `Vec` because the emission walks it in operand
+    /// order, so a keyed read needed a name of its own rather than an open-coded `iter().find`.
+    #[must_use]
+    pub fn field(&self, name: OperandField) -> Option<&OperandValue> {
+        self.fields
+            .iter()
+            .find_map(|(field, value)| (*field == name).then_some(value))
+    }
+}
+
 /// ONE BLOCK OF A UNIT'S PROGRAM — `ProgIrBlock` and its five subclasses
 /// (`progir.h:364-405`).
 ///
