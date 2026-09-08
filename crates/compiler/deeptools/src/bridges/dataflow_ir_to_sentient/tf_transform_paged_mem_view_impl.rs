@@ -4850,7 +4850,7 @@ pub fn update_tpmv_info<'p>(info: &mut TpmvInfo<'p>, ir_map: &ValueMapping, scop
 /// ⛔ A KEY, NOT A COMPARATOR: `isProperAncestor` answers false BOTH ways for two sibling loops, which
 /// is not a strict weak ordering and is unspecified input to Rust's sort. A loop's ancestry IS its
 /// region path and an ancestor's path is a PREFIX, so lexicographic order on that path is the
-/// reference's own answer — outermost first (`:433`, "Loops are updated from outermost to innermost").
+/// reference's own answer — outermost first (`:443`, "Loops are updated from outermost to innermost").
 #[must_use]
 pub fn set_loop_iterator_order(indices: &[Val], scope: &[DfirOp]) -> Vec<usize> {
     // "Initialize the ordered_indices_idxs vector to prepare for sorting."

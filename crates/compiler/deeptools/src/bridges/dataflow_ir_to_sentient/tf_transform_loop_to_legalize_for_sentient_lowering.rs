@@ -131,7 +131,7 @@ impl<'a> ScfForOp<'a> {
 /// THE BOUNDS AND STEP THE CALLER RESOLVED — `int lbound, int ubound, int step`.
 ///
 /// ⛔ NAMED FIELDS BECAUSE THREE POSITIONAL `int`s TRANSPOSE SILENTLY. `transformSCFToAffineLoop(builder,
-/// scf_for, 0, then_ub, 1, affine_for)` (`:222`) is three integers in a row and getting them out of
+/// scf_for, 0, then_ub, 1, affine_for)` (`:207-209`) is three integers in a row and getting them out of
 /// order builds a loop that counts to the step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticBounds {
@@ -147,7 +147,8 @@ pub struct StaticBounds {
 ///
 /// ⛔ NOT A `Result`, AND NOT A REFUSAL. `LogicalResult::failure()` here is *"we currently support
 /// lbound being 0, step being 1"* — a statement about the loop, which the caller answers by leaving
-/// the `scf.for` alone and reporting *"Unable to transform SCF loop into Affine loop"* (`:255`). The
+/// the `scf.for` alone and reporting *"Unable to transform SCF loop into Affine loop"* (`:210`, and
+/// `:230` for the else arm). The
 /// bounds that failed are named because a caller that has to explain itself should not have to
 /// re-derive them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1418,7 +1419,7 @@ mod unit_tests {
     ///
     /// *"we currently support lbound being 0, step being 1, non-constant ubound."* (`:105`.) The
     /// caller answers a failure with `if_op->emitError("Unable to transform SCF loop into Affine
-    /// loop")` (`:255`) and leaves the `scf.for` where it was.
+    /// loop")` (`:210` for the then arm, `:230` for the else) and leaves the `scf.for` where it was.
     #[test]
     fn only_a_zero_lower_bound_and_a_unit_step_are_supported() {
         let mut vals = Values::default();

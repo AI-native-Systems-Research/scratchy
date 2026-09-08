@@ -58,6 +58,38 @@ makes the function have an effect:
 Benign: 232, 233, 245 and 249 lose only a nested `}` / `});` that the extractor's brace-balancer put
 back. Identical to the authority: 231, 234, 237, 238, 240, 242, 246, 247, 248.
 
+## ⛔ MEASURED FOR ENTRIES 289-296: WHAT THE EXTRACT DROPS, AND WHY THE `calls` COLUMN IS NOT THE CALL GRAPH
+
+Brace-matched from the authority at each unit's cited line (a0d29abbed) and diffed against
+`source/bridge2.cpp`'s body. All eight `UNITS.tsv` citations land exactly on the named definition, and
+the recorded `loc` is 1-6 lines short of the real body in all eight. **6 of the 8 extract bodies lose a
+real statement, and in five of them it is the statement that gives the function its effect:**
+
+| unit | dropped from the extract's body |
+|---|---|
+| **289 `initialize`** (`:694-705`) | `initMASData(mas_data, ad, max_mutable);` (`:703-704`) — the extract only `DT_CHECK`s |
+| **290 `createPartitions`** (`:983-998`) | `dcc::ConditionalTree cond_tree(*root_op); cond_tree.compute();` and `fillPartitions(..)` (`:993-997`) — it computes `root_op` and throws it away |
+| **291 `calculatePartialShift`** (`:490-558`) | `if (remainder != 0) offsetShifts(shifts, ad, -remainder);` and `return total_shift;` (`:556-557`) — an `int64_t` function left with no return, minus the stick-remainder correction |
+| **293 `runOn`** (`:447-453`) | the walk's whole lambda, `[&](LoopLikeOpInterface loop_op) { analyzeAndTransform(loop_op); });` (`:452`) — `unit.walk<WalkOrder::PostOrder>(` is left with no argument: it walks and calls nothing |
+| **294 `getPageValidity`** (`:114-148`) | `return page_sel_constraints;` (`:147`) — the VALID-page return; both invalid-page returns survive |
+| **295 `createIterArgsForConditionals`** (`:401-524`) | `curr_loop->erase();` (`:522`), with the balancer emitting `}}` — clone-and-erase becomes clone-only, doubling the nest |
+| 292 `transformSCFLoopWithNonConstantUpperBound` (`:169-263`) | body IDENTICAL — but the extract starts at the CONTINUATION line and lost `LogicalResult TransformLoopToLegalizeForSentientLowering::` (`:168`), so it carries neither a return type nor an `e292_` name |
+| 296 `runOnOperation` (`:362-489`) | nothing: identical to the authority |
+
+⛔ AND THE `calls` COLUMN IS SHORT FOR SEVEN OF THE EIGHT, including callees the truncation did NOT
+take: 290 omits `e187_constructConditionals` (`:990`, present in the extract) as well as the truncated
+`e252_fillPartitions`/`e247_compute`; 291 omits `e192_calculateDimWeights` (`:520`) and
+`e254_offsetShifts`; 292 and 293 omit `e257_analyzeAndTransform` (`:245`/`:250`, `:452`); 294 omits
+`e258_addConstraintsForIVRanges` (`:135`); 295 omits `e201_setLoopIteratorOrder` (`:421`) and
+`e200_updateTPMVInfo` (`:519`); 296 lists 2 of its 8, missing `e140`, `e203`, `e204`, `e205`, `e262` and
+`e263`; 289's one in-span callee, `e250_initMASData`, is the line the truncation took. Across all 384,
+**172 columns omit a name that appears in their own extract body.**
+
+⭐ THE `level` COLUMN IS UNAFFECTED, AND IT IS THE ONE THE WAVES USE. For all eight, level 3 is exactly
+1 + the highest level among the TRUE callees (e250, e252/e247, e254, e257, e258, e264, e262/e263 — all
+level 2), which the recorded `calls` column could not have produced: from it, 289 would be level 1 and
+290/293 level 0. Order the work by `level`; take the callees from the authority.
+
 ## Progress
 
 `200/384 ported; 200/384 audited`

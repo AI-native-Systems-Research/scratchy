@@ -1253,9 +1253,15 @@ mod unit_tests {
         let mut shifts = vec![0; weights.len()];
         for dim_weight in &weights {
             let stride = VENDOR_COEFFS[dim_weight.dim.index()].0;
-            let constant_shift = (curr_space / stride).min(dim_weight.offset.0);
+            // `:534-536` THEN `:541-542`, IN THAT ORDER: the skip tests the quotient and the clamp to
+            // the dimension's own offset comes after, which is what makes a NEGATIVE offset a
+            // negative shift rather than a skipped dimension.
+            let mut constant_shift = curr_space / stride;
             if constant_shift <= 0 {
                 continue;
+            }
+            if constant_shift > dim_weight.offset.0 {
+                constant_shift = dim_weight.offset.0;
             }
             curr_space -= constant_shift * stride;
             shifts[dim_weight.dim.index()] = constant_shift;
