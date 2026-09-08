@@ -157,9 +157,9 @@ fn candidate_units<A: Arch>(program: &dfir::Program<A>) -> Vec<&ProgramUnit<A>> 
 /// ⛔⛔ NOT ENTRY 350'S PORT. `DuplicateReusedTogglePattern::matchAndRewrite`
 /// (`dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, entry 350/384, level 6) is 170 lines
 /// that clone a loop nest and add an `iter_args` chain per reuse. What is here is only its MATCH
-/// condition (`:36-57`), and it is here because THE DRIVER CANNOT BE WRITTEN WITHOUT IT: `:82` reads
-/// `succeeded(...)` to decide whether the IR changed, and that answer is what ends the convergence
-/// loop.
+/// condition (`:36-57`), and it is here because THE DRIVER CANNOT BE WRITTEN WITHOUT IT:
+/// `CanonicalizeToggle.cpp:82` reads `succeeded(...)` to decide whether the IR changed, and that
+/// answer is what ends the convergence loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReusedToggle {
     /// The `arith.subi` binding the view's start address — `toggle_op` (`:36-37`).

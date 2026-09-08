@@ -1091,7 +1091,7 @@ mod unit_tests {
 
     /// 🎯 184/384 — A SYMBOLIC AFFINE BOUND IS `-1`, WHICH ITS CALLER'S `DT_CHECK` REJECTS.
     ///
-    /// `if (!affine_for.hasConstantBounds()) return -1;` (`:751`), and
+    /// `if (!affine_for.hasConstantBounds()) return -1;` (`:752`), and
     /// `DT_CHECK(num_iters >= 0)` in `initMASData` (`:730`) is what that `-1` reaches — so
     /// [`LoopTripCount::iterations`] answers [`None`] rather than a number.
     #[test]
@@ -1287,7 +1287,7 @@ mod unit_tests {
 
     /// 🎯 184/384 — THE `arith.divsi` BOUND THE SCHEDULER WRITES IS UNSUPPORTED HERE.
     ///
-    /// `llvm_unreachable("unsupported upper loop bound operation")` (`:789`). The scheduler spells a
+    /// `llvm_unreachable("unsupported upper loop bound operation")` (`:790`). The scheduler spells a
     /// dynamic trip count `(%hi - %lo) / %step`
     /// (`dcc/test/Conversion/VectorChainToSentientPT/dynamic_pt_masking.mlir:226-228`), and this pass
     /// has no worst case for it at all — unlike a symbol's `maxValue` or a select's arms.
@@ -1352,7 +1352,7 @@ mod unit_tests {
 
     /// 🎯 184/384 — A NON-CONSTANT STEP IS `-1`, AND IT IS TESTED BEFORE EITHER BOUND.
     ///
-    /// `if (!const_step.has_value()) return -1;` (`:757`) precedes both `getDefiningOp()` walks, so a
+    /// `if (!const_step.has_value()) return -1;` (`:759`) precedes both `getDefiningOp()` walks, so a
     /// loop with a symbolic step and a symbolic lower bound reports the STEP.
     #[test]
     fn a_non_constant_step_is_reported_before_the_bounds() {
@@ -1406,7 +1406,7 @@ mod unit_tests {
         );
     }
 
-    /// 🎯 184/384 — A STRIDED LOOP THAT DOES NOT START AT ZERO IS THE `DT_CHECK_MSG` (`:794-795`).
+    /// 🎯 184/384 — A STRIDED LOOP THAT DOES NOT START AT ZERO IS THE `DT_CHECK_MSG` (`:795-796`).
     ///
     /// ⚠️ IT TAKES BOTH. `lb = 4, step = 8` fails; either alone is fine — see
     /// [`an_scf_for_over_constants_counts_its_span`] for `lb = 0` with a step of 4, and
@@ -1429,10 +1429,10 @@ mod unit_tests {
         );
     }
 
-    /// 🎯 184/384 — AN OPERATION THAT IS NOT A LOOP IS THE OUTER `llvm_unreachable` (`:792`).
+    /// 🎯 184/384 — AN OPERATION THAT IS NOT A LOOP IS THE OUTER `llvm_unreachable` (`:793`).
     ///
     /// The `// TODO: Remove the DT_CHECK safely and make this a broader utility` above the function
-    /// (`:741`) is about exactly this arm.
+    /// (`:742`) is about exactly this arm.
     #[test]
     fn an_operation_that_is_not_a_loop_has_no_trip_count() {
         let mut vals = Values::default();
@@ -4370,7 +4370,7 @@ mod unit_tests {
 /// # ⛔⛔ ONE `int64_t` WITH THREE SENTINELS AND FOUR ABORTS
 ///
 /// `getLoopTripCount` returns a count, `-1` twice, `false` once, and stops the compiler four times
-/// (`MutableAddrSplitting.cpp:741-798`). Its only caller reads the number back through
+/// (`MutableAddrSplitting.cpp:743-798`). Its only caller reads the number back through
 /// `DT_CHECK(num_iters >= 0)` (`initMASData`, `:730`) — so `-1` aborts THERE while `return false`,
 /// which is **0** in an `int64_t` function, walks straight past it and becomes a dimension of zero
 /// iterations. That asymmetry is not a rounding of the same idea: it is two different outcomes from
@@ -4397,11 +4397,11 @@ pub enum LoopTripCount {
     /// empty dimension, so the quotient is kept as it comes out.
     Iterations(i64),
 
-    /// `if (!affine_for.hasConstantBounds()) return -1;` (`:751`) — an `affine.for` whose lower or
+    /// `if (!affine_for.hasConstantBounds()) return -1;` (`:752`) — an `affine.for` whose lower or
     /// upper bound is an [`affine::Bound::Val`].
     AffineBoundsAreNotConstant,
 
-    /// `if (!const_step.has_value()) return -1;` (`:757`) — an `scf.for` whose step operand is not an
+    /// `if (!const_step.has_value()) return -1;` (`:759`) — an `scf.for` whose step operand is not an
     /// `arith.constant`.
     ScfStepIsNotConstant(Val),
 
@@ -4415,13 +4415,13 @@ pub enum LoopTripCount {
     /// between the two sentinels.
     SymbolUpperBoundHasNoMaxValue(Val),
 
-    /// `DT_CHECK(lb_op)` (`:764`) — an `scf.for` whose lower bound is not an `arith.constant`.
+    /// `DT_CHECK(lb_op)` (`:766`) — an `scf.for` whose lower bound is not an `arith.constant`.
     ///
     /// ⚠️ `dyn_cast_or_null`, SO A REGION ARGUMENT LANDS HERE TOO: the reference tolerates a null
     /// defining op in the cast and then rejects the null result, which is one state, not two.
     ScfLowerBoundIsNotConstant(Val),
 
-    /// `DT_CHECK(ub_op)` (`:768`) — the upper bound is bound by no operation at all.
+    /// `DT_CHECK(ub_op)` (`:770`) — the upper bound is bound by no operation at all.
     ///
     /// ⭐ SEPARATE FROM [`LoopTripCount::UnsupportedScfUpperBound`] BECAUSE THE REFERENCE SEPARATES THEM:
     /// a plain `dyn_cast` on the null would have fallen into the `llvm_unreachable`, and the
@@ -4432,7 +4432,7 @@ pub enum LoopTripCount {
     /// values.")` (`:783-785`) — an `arith.select` upper bound with a non-constant arm.
     SelectUpperBoundArmsAreNotConstant(Val),
 
-    /// `llvm_unreachable("unsupported upper loop bound operation")` (`:789`) — the upper bound is
+    /// `llvm_unreachable("unsupported upper loop bound operation")` (`:790`) — the upper bound is
     /// bound by an operation that is none of the three the function knows.
     ///
     /// ⭐ THE `arith.divsi` BOUND THE SCHEDULER ACTUALLY WRITES IS THIS ONE.
@@ -4440,12 +4440,12 @@ pub enum LoopTripCount {
     /// neither a constant, a symbol nor a select, so this pass cannot count such a loop at all.
     UnsupportedScfUpperBound(Val),
 
-    /// `llvm_unreachable("Unsupported operation.")` (`:792`) — the operation is neither an
+    /// `llvm_unreachable("Unsupported operation.")` (`:793`) — the operation is neither an
     /// `affine.for` nor an `scf.for`.
     NotALoop,
 
     /// `DT_CHECK_MSG(lb == 0 || step == 1, "Expecting a lower bound of 0 and a step of 1 for the
-    /// loop.")` (`:794-795`).
+    /// loop.")` (`:795-796`).
     ///
     /// ⚠️ AN `||`, SO IT TAKES BOTH TO FAIL: a lower bound of 4 with a step of 1 is fine, and so is a
     /// lower bound of 0 with a step of 8. What the reference will not divide is a strided loop that
@@ -4572,7 +4572,7 @@ impl LoopTripCount {
 /// ⭐ AND THE VENDOR EXERCISES TWO OF THE THREE.
 /// `mutable_addr_splitting_one_dim.mlir` has `constant_start_addr_1` bound by
 /// `symbol.create_symbol {SymbolId = -1476 : i64, granularity = 8 : i64, maxValue = 8 : i64}`
-/// (`:251`) and `select_ub` bound by `arith.select %904, %c8, %c4 : index` (`:290`) — and expects a
+/// (`:251`) and `select_ub` bound by `arith.select %904, %c8, %c4 : index` (`:387`) — and expects a
 /// trip count of **8** from each, which is what makes both cases partition identically on that
 /// dimension. ⛔ `ub = true_val > false_val ? true_val : false_val` is a strict `>`, so equal arms
 /// take the true one; the same number either way, which is why the tie is not observable.
@@ -5563,9 +5563,13 @@ struct Level {
 ///
 /// // Create the partitions for the remaining dims in each previous partition.
 /// for (int d = 1, e = partition_sizes.size(); d < e; ++d) {
-///   int num_prev_partitions = prev_partitions.size();
 ///   SmallVector<scf::IfOp, 32> curr_partitions;
-///   for (int p = 0; p < num_prev_partitions; ++p) { .. }
+///   for (int p = 0, num_prev_partitions = prev_partitions.size();
+///        p < num_prev_partitions; ++p) {
+///     auto curr_partition = prev_partitions[p];
+///     cond_builder = curr_partition.getThenBodyBuilder();
+///     curr_partitions = createConditionalsForPartition(d);   // ⛔ ASSIGNS, NOT APPENDS
+///   }
 ///   cond_builder = prev_partitions.back().getElseBodyBuilder();
 ///   auto last_partition = createConditionalsForPartition(d);
 ///   prev_partitions = curr_partitions;
@@ -5601,7 +5605,7 @@ struct Level {
 ///   }
 /// }
 /// ```
-/// (`dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_one_dim.mlir:210-230`)
+/// (`dcc/test/Transform/MutableAddrSplitting/mutable_addr_splitting_one_dim.mlir:210-231`)
 ///
 /// ⛔ THE BOUND IS AN OPERAND, NOT A LITERAL. `arith.cmpi` takes two SSA values, so each boundary is
 /// an `arith.constant` of its own — see [`arith::Op::Compare`]. Both ops land in the same region as
@@ -6440,14 +6444,15 @@ impl ExplicitTimeLoops {
 /// (`dialect_utils/Agen/Utils.cpp:115`, `:254`). `constructExplicitTimeLoops` therefore builds
 /// `for_ops[dim]` with `time_bounds[dim]`, i.e. in that same outermost-first order. ⛔ But
 /// `updateSubscriptsAndIndicesForExplicitTimeLoops` reaches for `for_ops[i - num_orig_dims]`
-/// (`Agen/Utils.cpp:472`) where `i` is a dimension of the TIME ADDRESS MAP — the transfer's own
+/// (`dcc/src/Dialect/Agen/Utils.cpp:472`) where `i` is a dimension of the TIME ADDRESS MAP — its own
 /// dimension numbering, which `time_order` exists precisely to permute. The two agree only when
 /// `time_order` is the identity.
 ///
 /// ⛔ THE VENDOR'S OWN KEY IS A CASE WHERE THEY DISAGREE AND IT DOES NOT SHOW.
-/// `time_order = affine_map<(d0, d1, d2) -> (d2, d1, d0)>` is a reversal, so outermost is `d2` while
-/// `for_ops[0]` gets looked up for time-address dimension `d0`. It goes unnoticed because exactly ONE
-/// loop is created: `for_ops[0]` is the only entry there is, and the `i > actual_preserve_dim` test
+/// `time_order = affine_map<(d0, d1, d2) -> (d2, d1, d0)>` is a reversal
+/// (`mutable_addr_splitting_time_dims.mlir:137`), so outermost is `d2` while `for_ops[0]` gets looked
+/// up for time-address dimension `d0`. It goes unnoticed because exactly ONE loop is created:
+/// `for_ops[0]` is the only entry there is, and the `i > actual_preserve_dim` test
 /// drops every other dimension before it can index anything. ⭐ PORTED AS WRITTEN — the numbering is
 /// the reference's, and a port that permuted here would emit a different `indices` list from `dcc`
 /// for a transfer neither of them is tested on.

@@ -1166,10 +1166,10 @@ impl VectorOperand {
     /// `latch` and there is no spelling to concatenate.
     ///
     /// ⭐ THE `XRF` ARM IS REDUNDANT WITH THE `else`, AND SAYING SO IS THE POINT. An `XRF` operand is
-    /// constructed as `VectorOperand(operand_type, "xrf", op)` (`VectorOperands.cpp:218-220`) — the
+    /// constructed as `VectorOperand(operand_type, "xrf", op)` (`VectorOperands.cpp:219-220`) — the
     /// only place one is built — so its first value already IS `"xrf"` and the `else` would return the
     /// same string. It is also the only kind with no slice index, because the XRF is one register and
-    /// the arm above it skips the whole slice computation for exactly that reason (`:208`, `:218`).
+    /// the arm above it skips the whole slice computation for exactly that reason (`:209`, `:219`).
     /// [`OperandValue::Port`] covers it with no arm of its own.
     ///
     /// ⛔ THE RESULT IS A [`sen::Port`], NOT A `String`, BECAUSE ITS READERS ARE A CLOSED SET.
@@ -1621,7 +1621,7 @@ fn view_unit(from: Val, scope: &[DfirOp]) -> Option<ViewUnit> {
 ///
 /// ⛔ THE XRF IS SPLIT OFF BECAUSE IT HAS NO SLICE INDEX: the reference returns
 /// `VectorOperand(XRF, "xrf", op)` before the slice arithmetic and skips the single-constant check
-/// with it (`:208`, `:218`).
+/// with it (`:209`, `:219`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemoryFile {
     /// `PTXRF → XRF`.
@@ -2571,7 +2571,7 @@ mod unit_tests {
 
     /// ⭐ THE `XRF` ARM IS REDUNDANT WITH THE `else`, AND THIS SHOWS IT RATHER THAN ASSERTING IT. An
     /// XRF operand is built exactly once in the whole reference, as
-    /// `VectorOperand(operand_type, "xrf", op)` (`VectorOperands.cpp:218-220`), so its value already
+    /// `VectorOperand(operand_type, "xrf", op)` (`VectorOperands.cpp:219-220`), so its value already
     /// IS the string that arm returns — and the `else` therefore answers identically.
     #[test]
     fn an_xrf_operand_names_the_xrf_from_its_value_alone() {

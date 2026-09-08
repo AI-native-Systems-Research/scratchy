@@ -165,7 +165,7 @@ pub struct LocalOpNode<'p> {
     /// `int is_in_region_num = 0` — see [`RegionNum`].
     ///
     /// ⚠️ ITS ONLY READER IN THE REFERENCE IS NEVER CALLED: `inRegionEmpty` (`:214-221`, entry 181)
-    /// walks a sibling chain looking for this value, and the three mentions of it in the whole file
+    /// walks a sibling chain looking for this value, and the two mentions of it in the whole file
     /// are its declaration, its definition and nothing else.
     pub is_in_region_num: RegionNum,
 }
@@ -724,14 +724,13 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
     /// against the parent's region list, and [`Self::clone_ops_for_regions`] does it at `:246-256`
     /// because this walk did not.
     ///
-    /// # ⛔ `compute` IS ENTRY 247/384 AND IS NOT MINE TO FILL
+    /// # ⭐ `compute` IS ENTRY 247/384 AND THE RECURSION THROUGH IT IS MUTUAL
     ///
-    /// It is level 2 of the campaign (`crustify-bridge2/UNITS.tsv`), a later wave, and the same file's
-    /// `flatten` (287) and `runOnOperation` (305) with it. So the recursion through a NESTED
-    /// `uniform.uniformize_regions` ends at a `todo!` naming that entry, gated on the reference's own
-    /// `isa<>` — the shape entry 178 already uses for its unported rewrite
-    /// (`super::tf_canonicalize_toggle`). ⚠️ A region with no nested local region walks completely,
-    /// which is every region of the vendor's cases 1-3 and the outer region of case 4.
+    /// A NESTED `uniform.uniformize_regions` is handed to [`Self::compute`] — ported in this file —
+    /// which walks each of its regions back into this function with that region's own unit list. The
+    /// same file's `flatten` (287) and `runOnOperation` (305) are still open. ⚠️ A region with no
+    /// nested local region never reaches it, which is every region of the vendor's cases 1-3 and the
+    /// outer region of case 4.
     ///
     /// ⚠️ `region` IS A SLICE, NOT AN `mlir::Region`. A region here is the block's operation list
     /// (`islands/dataflow_ir/dialects` has no block type), and `region.getOps()` is iterating it —
@@ -768,7 +767,7 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
                 }
             }
             // `parent_node->insertChildNode(new_node);` (`:136`) — appended after the parent's last
-            // child (`dcc/src/Analysis/OperationTree.hpp:118-131`), so the chain keeps program order.
+            // child (`dcc/src/Analysis/OperationTree.cpp:239-254`), so the chain keeps program order.
             //
             // ⛔ NO BASE MEANS NO TREE, so there is no parent for a child to be inserted under and
             // nothing to walk — the state `clear()` leaves and `flatten` returns early from
@@ -790,7 +789,7 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
                 // ⛔ INSIDE THE `else`, AND THAT IS NOT COSMETIC: the reference does NOT walk a nested
                 // `uniform.uniformize_regions`' own regions from here, because `compute` walks them
                 // with the per-region unit lists instead. Nesting the loop is what keeps that true
-                // when entry 247 replaces the `todo!` above with a call.
+                // now that the other arm calls `compute`.
                 for (region_num, inner) in (0u32..).zip(dialects::regions(op)) {
                     self.traverse_region(inner, new_node, units, RegionNum(region_num));
                 }
@@ -866,7 +865,7 @@ impl<'p> FlatteningLocalRegionsTree<'p> {
     ///
     /// # ⛔⛔ IT HAS NO CALLER ANYWHERE IN THE AUTHORITY TREE, AND THE REASON IS INSTRUCTIVE
     ///
-    /// The three mentions of `inRegionEmpty` in `dcc/` are its declaration (`:88`), this definition and
+    /// The two mentions of `inRegionEmpty` in `dcc/` are its declaration (`:88`), this definition and
     /// nothing else. ⭐ THE PLACE THAT WANTS IT IS `cloneOpsForRegions` AT `:269`, which needs to know
     /// whether region `rn` of a cloned op came out empty — and it answers that by BUILDING the block
     /// and calling `block.erase()` when it is still empty afterwards, a test on the RESULT rather than
@@ -1489,9 +1488,9 @@ mod unit_tests {
     /// THE TREE `traverseRegion` AND `compute` BUILD OVER [`a_case_four_program`], SPELLED OUT, WITH
     /// `unit_to_ops` AS THE WALK WOULD LEAVE IT.
     ///
-    /// ⚠️ BUILT BY HAND BECAUSE `compute` IS ENTRY 247/384 AND UNPORTED —
-    /// [`FlatteningLocalRegionsTree::traverse_region`] stops at a `todo!` on a nested
-    /// `uniform.uniformize_regions`. What is written here is exactly what the two together produce:
+    /// ⚠️ BUILT BY HAND, NOT WALKED: this states the expectation independently of
+    /// [`FlatteningLocalRegionsTree::traverse_region`] and [`FlatteningLocalRegionsTree::compute`],
+    /// which are the two it is used to check. What they together produce is exactly this:
     /// `is_in_region_num` is the parent's region index for ordinary nesting (`:145`) and **0 for both**
     /// of the nested op's regions, because `compute` passes `false` (`:164`); `units` is the enclosing
     /// region's list, except on the uniformize node itself, which gets none (`:137-139`).

@@ -854,7 +854,7 @@ impl LoopMaskTree {
     ///
     /// ⛔ `None` IS THE SYNTHETIC ROOT AND ONLY THE ROOT. The insert gives every other node a
     /// parent, so `nullptr` here is not a "not found" — the C++ readers rely on that:
-    /// `isMaskEquivalentToNode` compares two parents without a null test (`:124`) and
+    /// `isMaskEquivalentToNode` compares two parents without a null test (`LoopMaskTree.cpp:124`) and
     /// `insertMaskOps` dereferences the result directly (`LoweringPTMasks.cpp:74`).
     pub fn parent_node(&self, n: LoopMaskNodeId) -> Option<LoopMaskNodeId> {
         self.base.parent_node(n.0).map(LoopMaskNodeId)
@@ -1107,7 +1107,7 @@ impl LoopMaskTree {
     /// ⭐ AND THE CASE IT *DOES* ALLOW IS THE VENDOR'S OWN. `dynamic_pt_masking.mlir` has two macs
     /// under `for %arg4`, both masked by `%arg4` and so both `{0, 1}` with the SAME parent node — the
     /// reason the golden output brackets that loop once (`:38`, `:53`, `:56`) rather than twice. That is
-    /// what *"If the mask is equivalent, it is allowed"* (`:124`) is for.
+    /// what *"If the mask is equivalent, it is allowed"* (`LoweringPTMasks.cpp:124`) is for.
     ///
     /// ⛔ THE PARENTS ARE COMPARED AS IDENTITIES, NOT AS VALUES. The C++ `==` is on
     /// `LoopMaskNode *` — pointer equality — so two DIFFERENT loop nodes standing for the same
@@ -1998,7 +1998,7 @@ mod unit_tests {
     /// E and F carry `{0, 1}` each — equal on both of the fields `LoopMaskTree.cpp:125-126` compares —
     /// and the comment above the diagram still says the program is unsupported: *"We find another mask
     /// node so the program is not supported and we signal pass failure"* (`LoweringPTMasks.cpp:160-163`).
-    /// Only `:124` can produce that answer.
+    /// Only `LoopMaskTree.cpp:124` can produce that answer.
     #[test]
     fn the_worked_examples_two_identical_masks_are_not_equivalent_across_nests() {
         let d = Diagram::build();
