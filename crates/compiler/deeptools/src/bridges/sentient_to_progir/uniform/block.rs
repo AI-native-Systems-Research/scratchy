@@ -242,19 +242,23 @@ impl UniformInstrBlock {
     /// The FIRST region as long as the longest — the region every other one is padded up to, and
     /// whose instructions the padding copies as dead code (`cpp:311-314`).
     ///
-    /// ⛔ ONE LIST OR NONE ANSWERS 0 WITHOUT LOOKING (`:343`), which is also every REGULAR block.
+    /// ⛔ ONE LIST OR NONE ANSWERS REGION 0 WITHOUT LOOKING (`:343`), which is also every REGULAR
+    /// block — and this is a REGION INDEX, the value `getUniformizedUnitInstrList` compares against
+    /// `unit_to_region_idx_map_` (`:288`), never an instruction count.
     #[must_use]
-    pub fn max_instr_region_index(&self) -> usize {
+    pub fn max_instr_region_index(&self) -> RegionIndex {
         let lists = self.instr_lists();
         if lists.len() <= 1 {
-            return 0;
+            return RegionIndex(0);
         }
         let longest = self.max_instr_size();
-        // Unreachable: some region has the maximum. 0 rather than the reference's uninitialised read.
+        // The fallback is unreachable, some region holding the maximum, and it is the reference's own
+        // answer either way: its `index` stays at the 0 it was initialised to (`:341`).
         lists
             .iter()
-            .position(|list| list.len() == longest)
-            .unwrap_or(0)
+            .zip(0u32..)
+            .find(|(list, _)| list.len() == longest)
+            .map_or(RegionIndex(0), |(_, at)| RegionIndex(at))
     }
 
     /// Replaces: e075_getRegionInstrSize
@@ -738,14 +742,18 @@ mod unit_tests {
             regions: vec![vec![nop()], vec![nop(), ret()], vec![ret(), nop()]],
             ..UniformBlock::default()
         });
-        assert_eq!(block.max_instr_region_index(), 1, "the first of the two");
+        assert_eq!(
+            block.max_instr_region_index(),
+            RegionIndex(1),
+            "the first of the two"
+        );
         assert_eq!(
             UniformInstrBlock::Regular(vec![nop(), ret()]).max_instr_region_index(),
-            0
+            RegionIndex(0)
         );
         assert_eq!(
             UniformInstrBlock::Uniform(UniformBlock::default()).max_instr_region_index(),
-            0
+            RegionIndex(0)
         );
     }
 

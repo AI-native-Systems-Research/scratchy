@@ -262,8 +262,8 @@ impl UniformInstrInfo {
     /// in the format the field is in.
     /// ⛔⛔ NO FOLD ID IS EVER WRITTEN, so a unit's LAST fold wins, and the units whose folds disagree
     /// come back instead of `DT_CHECK_MSG(!folding_needed, "Folding in instruction fields are not
-    /// supported")` (`cpp:212`) — whose `folding_needed` is dead either way: this overload sets
-    /// `values_same` to `true` on a difference where its 121-line twin sets `false` (`:100`).
+    /// supported")` (`cpp:208`) — whose `folding_needed` is dead either way: this overload sets
+    /// `values_same` to `true` on a difference where its 121-line twin sets `false` (`:96`, `:99`).
     pub fn add_const_entries_to_operand_map(
         &mut self,
         field: OperandField,
@@ -271,7 +271,7 @@ impl UniformInstrInfo {
         scale: f64,
         format: Option<DataFormat>,
     ) -> Vec<UnitKey> {
-        // `:180-197` — the per-unit agreement pass, and the only thing it decides.
+        // `:184-198` — the per-unit agreement pass, and the only thing it decides.
         let mut seen: Vec<(UnitKey, i64)> = Vec::new();
         let mut disagreeing: Vec<UnitKey> = Vec::new();
         for entry in entries {
@@ -284,11 +284,11 @@ impl UniformInstrInfo {
             }
         }
         for entry in entries {
-            // `:216` — `int64_t(pair.second * scale)`, truncated toward zero as that cast is.
+            // `:210` — `int64_t(pair.second * scale)`, truncated toward zero as that cast is.
             let scaled = (entry.value as f64 * scale) as i64;
             if let Some(operand) = self.per_unit_operand_mut(field, entry.unit) {
                 operand.set(None, OperandValue::Int(scaled));
-                // `:219-221` — `INVALID` is the absence, so only a real format is written.
+                // `:212-214` — `INVALID` is the absence, so only a real format is written.
                 if let Some(format) = format {
                     operand.format = Some(format);
                 }
@@ -328,8 +328,8 @@ impl UniformInstrInfo {
 pub struct FoldConstant {
     /// `getUnitName(key)`.
     pub unit: UnitKey,
-    /// `unit_foldid_map_.at(key)` — ⛔ READ ONLY TO COMPARE, never written into the operand; see
-    /// [`UniformInstrInfo::add_const_entries_to_operand_map`].
+    /// `unit_foldid_map_.at(key)` — ⛔ NEVER READ, because the reference's own lookup (`:204`) is
+    /// dead: the id it fetches is attached only when `folding_needed`, which cannot be true here.
     pub fold: Option<FoldId>,
     /// The `sentient.constant` this key maps to.
     pub value: i64,
