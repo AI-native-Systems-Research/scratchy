@@ -2463,6 +2463,188 @@ pub const fn convert_type_to_string(ty: ElemType) -> Option<TypeSpelling> {
     }
 }
 
+// ═══════════════════════════════════════════ 277/384 ═══════════════════════════════════════════
+
+/// WHICH CVT INSTRUCTION A NAME IS, WITH ITS ARITY DERIVED FROM THE NAME.
+///
+/// ⛔⛔ `num_inputs_` AND THE NAME CANNOT DISAGREE HERE. The reference's row carries both as
+/// independent fields (`VectorChainHelper.cpp:193-208`) and the scan compares `num_inputs_` with
+/// `sources.size()`; the four `sen` sets are already disjoint by arity — binary gcvt is 0/4/24/28
+/// against unary 1/2/5/6/8/16/17 — so the variant IS the arity, and the caller's `symbolizeSentientUnary`
+/// / `symbolizeSentientBinary` on the returned string is discharged too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CvtInst {
+    /// A `gcvt_imm<n>` a `sentient.vector_unary` takes — one cast source.
+    Gcvt1(sen::UnaryGcvt),
+    /// An `fcvt_imm<n>` a `sentient.vector_unary` takes — one cast source.
+    Fcvt1(sen::UnaryFcvt),
+    /// A `gcvt_imm<n>` a `sentient.vector_binary` takes — two cast sources.
+    Gcvt2(sen::BinaryGcvt),
+    /// An `fcvt_imm<n>` a `sentient.vector_binary` takes — two cast sources.
+    Fcvt2(sen::BinaryFcvt),
+}
+
+impl CvtInst {
+    /// `num_inputs_` — how many `vectorchain.cast` sources feed it.
+    #[must_use]
+    pub const fn inputs(self) -> usize {
+        match self {
+            CvtInst::Gcvt1(_) | CvtInst::Fcvt1(_) => 1,
+            CvtInst::Gcvt2(_) | CvtInst::Fcvt2(_) => 2,
+        }
+    }
+}
+
+/// THE ONE THING THE SCAN READS OFF A `vectorchain.cast` — its input and result element types.
+///
+/// ⛔ `llvm::dyn_cast<vectorchain::CastOp>` IS THE CALLER'S, and both call sites do it before
+/// building the list (`VectorChainToSentientPESFP.cpp:632`, `:694-696`). `OpBuilder builder(src)`
+/// (`VectorChainHelper.cpp:274`) is only `convertTypeToString`'s context and is dropped with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastSource {
+    /// `getElementType(src.getInput().getType())`.
+    input: ElemType,
+    /// `getElementType(src.getResult().getType())`.
+    output: ElemType,
+}
+
+impl CastSource {
+    /// A cast, or `None` for any other op — the caller's `dyn_cast`.
+    #[must_use]
+    pub const fn of(op: &vc::Op) -> Option<CastSource> {
+        match op {
+            vc::Op::Cast { input_ty, ty, .. } => Some(CastSource {
+                input: input_ty.elem,
+                output: ty.elem,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// ONE ROW OF `gcvt_fcvt_insts`.
+struct GcvtFcvt {
+    /// `name_`, already symbolized — and with it `num_inputs_`.
+    name: CvtInst,
+    /// `vec_`; `size_` is its length.
+    vec: &'static [i32],
+    /// `repetition_` — ⭐ every row states it, and `gcvt_imm16`/`17` are the two that are not eight.
+    repetition: PackRepetition,
+    /// `src_input_type_str_` — the element type EVERY source must convert FROM.
+    src_input: TypeSpelling,
+    /// `src_output_type_str_` — and TO.
+    src_output: TypeSpelling,
+}
+
+/// THE EIGHTEEN CVT INSTRUCTIONS, IN THE ORDER THE SCAN WALKS THEM
+/// (`VectorChainHelper.cpp:211-266`).
+///
+/// ⛔⛔ `fcvt_imm4` IS COMMENTED OUT IN THE REFERENCE AND IS THEREFORE ABSENT HERE:
+/// *"TODO: Add FCVT mode 4. Need a way to differentiate it from mode 2."* (`:257-259`) — it would
+/// have been `{"fcvt_imm4", 2, 8, {0,1,2,3,4,5,6,7}, "fp32", "fp16"}`, row-for-row identical to
+/// `fcvt_imm2`, so the scan would never reach it. [`sen::BinaryFcvt::Imm4`] exists and nothing here
+/// produces it.
+fn gcvt_fcvt_insts() -> [GcvtFcvt; 18] {
+    use PackRepetition::{Eight, Four};
+    use TypeSpelling::{Bf16, F8E4M3Fn, F8E5M2, Fp16, Fp32, I4, I16};
+
+    const IDENTITY16: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    const LOW8: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7];
+    const HIGH8: &[i32] = &[8, 9, 10, 11, 12, 13, 14, 15];
+    const INTERLEAVE16: &[i32] = &[0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+    const LOW4: &[i32] = &[0, 1, 2, 3];
+    const HIGH4: &[i32] = &[4, 5, 6, 7];
+    // ⭐ `fcvt_imm3` IS THE ONE PADDED ROW: eight lanes written, eight left alone.
+    const LOW8_PADDED: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1];
+
+    let row = |name, repetition, vec, src_input, src_output| GcvtFcvt {
+        name,
+        vec,
+        repetition,
+        src_input,
+        src_output,
+    };
+    [
+        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm0), Eight, IDENTITY16, Fp16, F8E5M2),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm1), Eight, LOW8, F8E5M2, Fp16),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm2), Eight, HIGH8, F8E5M2, Fp16),
+        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm4), Eight, IDENTITY16, Fp16, F8E4M3Fn),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm5), Eight, LOW8, F8E4M3Fn, Fp16),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm6), Eight, HIGH8, F8E4M3Fn, Fp16),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm8), Eight, LOW8, I4, I16),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm16), Four, IDENTITY16, Fp16, Bf16),
+        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm17), Four, IDENTITY16, Bf16, Fp16),
+        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm24), Eight, INTERLEAVE16, Fp16, F8E5M2),
+        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm28), Eight, INTERLEAVE16, Fp16, F8E4M3Fn),
+        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm0), Eight, LOW4, Fp16, Fp32),
+        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm1), Eight, HIGH4, Fp16, Fp32),
+        row(CvtInst::Fcvt2(sen::BinaryFcvt::Imm2), Eight, LOW8, Fp32, Fp16),
+        row(CvtInst::Fcvt2(sen::BinaryFcvt::Imm3), Eight, LOW8_PADDED, Fp32, F8E5M2),
+        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm5), Eight, LOW4, Bf16, Fp32),
+        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm6), Eight, HIGH4, Bf16, Fp32),
+        row(CvtInst::Fcvt2(sen::BinaryFcvt::Imm7), Eight, LOW8, Fp32, Bf16),
+    ]
+}
+
+/// Replaces: e277_getGCVTorFCVTTypeFromIndicesAndCastInputs
+///
+/// **277/384** `vectorchain::getGCVTorFCVTTypeFromIndicesAndCastInputs` —
+/// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188` (108L).
+///
+/// Which CVT a permutation over cast sources is, or `None` for the caller's *"There is no GCVT
+/// instruction corresponding to the following operation"* (`VectorChainToSentientPESFP.cpp:642`).
+///
+/// ⛔ THE TYPE PAIR IS THE ROW'S, NOT THE SOURCE'S: the loop at `:272-292` compares EVERY source
+/// against the SAME `src_input_type_str_`/`src_output_type_str_`, so a two-source pack whose casts
+/// convert differently matches nothing. ⛔ AND AN EMPTY `sources` MATCHES NO ROW — arity is 1 or 2.
+/// ⭐ `dcc_ext_ctx` is a dropped parameter; the body never reads it.
+#[must_use]
+pub fn gcvt_or_fcvt_type_from_indices_and_cast_inputs(
+    indices: &ValidPackIndices<'_>,
+    sources: &[CastSource],
+) -> Option<CvtInst> {
+    let repetition = indices.repetition();
+    let indices = indices.indices();
+
+    for instr in gcvt_fcvt_insts() {
+        // `bool found = true;` and the three `continue`s.
+        let mut found = true;
+        if indices.len() != instr.vec.len() {
+            continue;
+        }
+        if repetition != instr.repetition {
+            continue;
+        }
+        if instr.name.inputs() != sources.len() {
+            continue;
+        }
+
+        // `for (int i = 0; i < indices.size() && found; i++) if (indices[i] != instr.vec_[i])` —
+        // the lengths are equal by the test above, so this is elementwise equality.
+        if indices != instr.vec {
+            found = false;
+        }
+
+        // ⛔ NO `&& found` GUARD ON THIS LOOP in the reference either — it runs over every source
+        // and can only clear `found`.
+        for src in sources {
+            if convert_type_to_string(src.input) != Some(instr.src_input)
+                || convert_type_to_string(src.output) != Some(instr.src_output)
+            {
+                found = false;
+            }
+        }
+
+        // `if (found) return instr.name_;`
+        if found {
+            return Some(instr.name);
+        }
+    }
+
+    // `return "";`
+    None
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
@@ -2479,6 +2661,7 @@ mod unit_tests {
         vector_element_wise_compare_operator_to_sentient_binary_operator,
         vector_ternary_to_sentient_ternary, vector_type_of,
     };
+    use super::{CastSource, CvtInst, gcvt_or_fcvt_type_from_indices_and_cast_inputs};
     use crate::arch::Dd2;
     use crate::formats::Bits;
     use crate::generated::OpFunc;
@@ -2654,6 +2837,8 @@ mod unit_tests {
             result: Val(44),
             input: Val(43),
             variable: Vec::new(),
+            pad: Vec::new(),
+            mask: None,
             indices: (0..16).collect(),
             repetition: 4,
             input_ty: ty,
@@ -3970,6 +4155,8 @@ mod unit_tests {
             result: Val(44),
             input: Val(43),
             variable: Vec::new(),
+            pad: Vec::new(),
+            mask: None,
             indices: (0..16).collect(),
             repetition: 4,
             input_ty: ty,
@@ -4153,12 +4340,121 @@ mod unit_tests {
             Some(TypeSpelling::F8E5M2)
         );
     }
+
+    /// The vendor's own GCVT table, `dcc/test/Conversion/VectorChainToSentientPESFP/gcvt_sen1p5.mlir`
+    /// — its `imm = 0` pack (two casts), its `imm = 1` shuffle (one cast) and its `imm = 16`
+    /// shuffle, which is the repetition-four row.
+    #[test]
+    fn the_vendor_gcvt_table_names_its_own_three_shapes() {
+        let f8 = |len| Vector {
+            len,
+            elem: ElemType::F8E5M2,
+        };
+        let f16 = |len| Vector {
+            len,
+            elem: ElemType::F16,
+        };
+        let bf16 = |len| Vector {
+            len,
+            elem: ElemType::Bf16,
+        };
+
+        // `%9 = vectorchain.cast %7 : vector<128xf16>, vector<128xf8E5M2>` — twice, then
+        // `%11 = vectorchain.pack %9, %10 {indices = [0..15], repetition = 8}`.
+        let to_f8 = CastSource::of(&vc::Op::Cast {
+            result: Val(9),
+            input: Val(7),
+            input_ty: f16(128),
+            ty: f8(128),
+        })
+        .unwrap();
+        let pack = vc::Op::Pack {
+            result: Val(11),
+            op1: Val(9),
+            op2: Val(10),
+            mask: None,
+            indices: (0..16).collect(),
+            repetition: 8,
+            sign_extend: false,
+            operand_ty: f8(128),
+            ty: f8(128),
+        };
+        let checked =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&pack).unwrap()).unwrap();
+        assert_eq!(
+            gcvt_or_fcvt_type_from_indices_and_cast_inputs(&checked, &[to_f8, to_f8]),
+            Some(CvtInst::Gcvt2(sen::BinaryGcvt::Imm0))
+        );
+        // ⛔ THE SAME PERMUTATION WITH ONE SOURCE IS NOT `gcvt_imm0` — arity is part of the row.
+        assert_eq!(
+            gcvt_or_fcvt_type_from_indices_and_cast_inputs(&checked, &[to_f8]),
+            None
+        );
+
+        // `%28 = vectorchain.cast %27 : vector<128xf8E5M2>, vector<128xf16>` then
+        // `%29 = vectorchain.shuffle input(%28) {indices = [0..7], repetition = 8}`.
+        let from_f8 = CastSource::of(&vc::Op::Cast {
+            result: Val(28),
+            input: Val(27),
+            input_ty: f8(128),
+            ty: f16(128),
+        })
+        .unwrap();
+        let shuffle = vc::Op::Shuffle {
+            result: Val(29),
+            input: Val(28),
+            variable: Vec::new(),
+            pad: Vec::new(),
+            mask: None,
+            indices: (0..8).collect(),
+            repetition: 8,
+            input_ty: f16(128),
+            ty: f16(64),
+        };
+        let checked = check_validity_of_pack_and_shuffle_lowering(
+            PackOrShuffle::of(&shuffle).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            gcvt_or_fcvt_type_from_indices_and_cast_inputs(&checked, &[from_f8]),
+            Some(CvtInst::Gcvt1(sen::UnaryGcvt::Imm1))
+        );
+
+        // `%43 = vectorchain.cast %42 : vector<64xf16>, vector<64xbf16>` then
+        // `%44 = vectorchain.shuffle input(%43) {indices = [0..15], repetition = 4}`.
+        let to_bf16 = CastSource::of(&vc::Op::Cast {
+            result: Val(43),
+            input: Val(42),
+            input_ty: f16(64),
+            ty: bf16(64),
+        })
+        .unwrap();
+        let shuffle = vc::Op::Shuffle {
+            result: Val(44),
+            input: Val(43),
+            variable: Vec::new(),
+            pad: Vec::new(),
+            mask: None,
+            indices: (0..16).collect(),
+            repetition: 4,
+            input_ty: bf16(64),
+            ty: bf16(64),
+        };
+        let checked = check_validity_of_pack_and_shuffle_lowering(
+            PackOrShuffle::of(&shuffle).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            gcvt_or_fcvt_type_from_indices_and_cast_inputs(&checked, &[to_bf16]),
+            Some(CvtInst::Gcvt1(sen::UnaryGcvt::Imm16))
+        );
+    }
+
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e277_getGCVTorFCVTTypeFromIndicesAndCastInputs
 // crustify:todo: e340_analyzeAndFillOperandForwarding
 // crustify:todo: e341_analyzeNonComputeOpsForFusion
 // crustify:todo: e342_analyzeAndFillResultForwarding

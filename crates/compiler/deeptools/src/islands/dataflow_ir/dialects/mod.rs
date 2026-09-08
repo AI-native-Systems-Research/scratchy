@@ -371,12 +371,19 @@ pub fn operands(op: &Op) -> Vec<Val> {
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Cast { input, .. } => reads.push(*input),
-            // ⛔ AND THE `variable` SEGMENT, which is what entry 248 walks uses for.
+            // ⛔ AND THE `variable` SEGMENT, which is what entry 248 walks uses for, AND THE `pad`
+            // SEGMENT — both are plain variadic operands in the reference's own order (input,
+            // variable, pad, mask: `VectorChain.td:449-463`). ⭐ THE MASK IS THE ONE EXCLUSION, for
+            // the reason the elementwise family's is; see the note above.
             vectorchain::Op::Shuffle {
-                input, variable, ..
+                input,
+                variable,
+                pad,
+                ..
             } => {
                 reads.push(*input);
                 reads.extend(variable.iter().copied());
+                reads.extend(pad.iter().copied());
             }
             vectorchain::Op::Rotate {
                 input, position, ..
@@ -773,9 +780,15 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Cast { input, .. } => places.push(input),
-            vectorchain::Op::Shuffle { input, variable, .. } => {
+            vectorchain::Op::Shuffle {
+                input,
+                variable,
+                pad,
+                ..
+            } => {
                 places.push(input);
                 places.extend(variable.iter_mut());
+                places.extend(pad.iter_mut());
             }
             vectorchain::Op::Rotate {
                 input, position, ..
@@ -1570,10 +1583,12 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 result,
                 input,
                 variable,
+                pad,
                 ..
             } => {
                 operands.push(input);
                 operands.extend(variable.iter_mut());
+                operands.extend(pad.iter_mut());
                 results.push(result);
             }
             vectorchain::Op::Rotate {
@@ -2171,10 +2186,12 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 result,
                 input,
                 variable,
+                pad,
                 ..
             } => {
                 vals.push((Role::Operand, input));
                 vals.extend(variable.iter_mut().map(|val| (Role::Operand, val)));
+                vals.extend(pad.iter_mut().map(|val| (Role::Operand, val)));
                 vals.push((Role::Result, result));
             }
             vectorchain::Op::Rotate {

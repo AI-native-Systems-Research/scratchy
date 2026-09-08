@@ -2389,6 +2389,8 @@ scf.for %1 = %2 to %3 step %4 {
                 result,
                 input,
                 variable: vec![variable],
+                pad: Vec::new(),
+                mask: None,
                 indices: vec![-1],
                 repetition: 64,
                 input_ty: V128,

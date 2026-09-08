@@ -83,7 +83,8 @@ use crate::islands::dataflow_ir::dialects::{
     Index, Op as DfirOp, Val, operands, regions, regions_mut, results, uses,
 };
 use crate::islands::dataflow_ir::dialects::{agen, arith, dataflow, vector};
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, MemRef};
+use crate::islands::dataflow_ir::link;
+use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::DfirUnit;
 
@@ -1444,6 +1445,18 @@ fn dim_of(val: Val, operands: &mut Vec<Val>) -> u32 {
     }
 }
 
+/// THE `Val` THE REUSE TABLE KEYS AN OPERAND'S PRODUCER BY — [`defining_position`]'s inverse.
+///
+/// ⭐ `OperandReuse::data_origins_` is keyed by `Operation *` in the reference and by [`Val`] here
+/// (see [`OperandReuse::id`](super::vc_operand_reuse::OperandReuse::id)), so a [`VectorOperand`]'s
+/// [`OpId`] has to be resolved to the value its op defines before the table can be asked about it.
+///
+/// ⛔ `None` FOR A POSITION THAT NAMES NO OP, OR AN OP THAT DEFINES NOTHING. The reference's `op_` is
+/// always a live `Operation *` with a result, so neither is a case it has.
+pub(super) fn origin_val(op: &OpId, scope: &[DfirOp]) -> Option<Val> {
+    results(op_at(op, scope)?).first().copied()
+}
+
 /// WHERE THE OP THAT PRODUCES A VALUE LIVES — `Value::getDefiningOp()`.
 ///
 /// ⛔ IT DESCENDS INTO REGIONS, for the reason [`use_positions`] gives in the other direction: a
@@ -1929,6 +1942,301 @@ pub fn erase_operands(operands: &[Option<VectorOperand>], scope: &mut Vec<DfirOp
     }
 }
 
+/// EVERY USE OF AN OP'S RESULTS THAT AN ALREADY-CLAIMED OP DOES NOT ACCOUNT FOR — `setOperands({})`
+/// on each op the rewriter is about to erase (`VectorOperands.cpp:782-789`, `:848-852`).
+///
+/// ⛔⛔ THIS IS WHY THE REFERENCE CLEARS OPERANDS AND NOT AN OPTIMISATION OF IT. Its own note says
+/// so: *"Since the rewriter does not immediately erase operations, then the uses of the operands in
+/// an operation to be deleted persist. We circumvent this problem by deleting the operands of any
+/// operation to be deleted."* A phase that could still see a claimed op's uses would decide the op
+/// feeding it still has readers and leave the whole source chain in the unit.
+fn live_use_positions(of: &OpId, scope: &[DfirOp], erased: &[OpId]) -> Vec<OpId> {
+    use_positions(of, scope)
+        .into_iter()
+        .filter(|user| !erased.contains(user))
+        .collect()
+}
+
+/// [`has_no_uses`] over the uses [`live_use_positions`] leaves — `user->getUses().empty()` after the
+/// claimed ops dropped theirs. ⛔ `false` FOR A POSITION THAT NAMES NO OP, as [`has_no_uses`].
+fn has_no_live_uses(id: &OpId, scope: &[DfirOp], erased: &[OpId]) -> bool {
+    op_at(id, scope).is_some() && live_use_positions(id, scope, erased).is_empty()
+}
+
+/// THE `erased_list` OVERLOAD OF `VectorOperand::eraseOperands` (`VectorOperands.cpp:742-800`) —
+/// [`erase_operands`]'s walk, with every skip test taken against a list its CALLER owns.
+///
+/// ⛔ NOT AN ANCHORED UNIT: this is one of the scope holes `docs/bridge2-porting-order.md` records,
+/// and the overload `e280_cleanup` (`VectorChainToSentientPESFP.cpp:1062`) actually calls.
+/// ⛔ IT RECORDS AND DOES NOT REMOVE, because an [`OpId`] is a POSITION: a caller running three
+/// phases over one scope cannot let phase one renumber what phases two and three name. The claimed
+/// ops stop being readers all the same — see [`live_use_positions`].
+pub(super) fn erase_operands_recording(
+    operands: &[Option<VectorOperand>],
+    scope: &[DfirOp],
+    erased_list: &mut Vec<OpId>,
+) {
+    // `for (auto &operand : operands)` — ⛔ the reference reads `operand.value().op_` in the
+    // `std::find` BEFORE its own `has_value()` test (`:747-749`); the `Option` is taken first here.
+    for operand in operands.iter().flatten() {
+        // `if (std::find(erased_list.begin(), erased_list.end(), operand.value().op_) == end())`
+        if erased_list.contains(&operand.op) {
+            continue;
+        }
+
+        let mut all_uses_deleted = true;
+        let mut to_be_erased: Vec<OpId> = Vec::new();
+
+        for mut user in live_use_positions(&operand.op, scope, erased_list) {
+            // ⚠️ DELIBERATE DIVERGENCE, as in [`erase_operands`]: the reference declares
+            // `intermediate_ops` outside this loop (`:756`) and never clears it.
+            let mut intermediate_ops: Vec<OpId> = Vec::new();
+
+            // `while (user && isa<..>(user) && user->hasOneUse()) { .. }`
+            while is_intermediate(&user, scope) {
+                let mut users = live_use_positions(&user, scope, erased_list);
+                if users.len() != 1 {
+                    break;
+                }
+                intermediate_ops.push(user);
+                user = users.remove(0);
+            }
+
+            if has_no_live_uses(&user, scope, erased_list) {
+                // ⛔ THE EXTRA TEST THIS OVERLOAD HAS: a user another phase already claimed is not
+                // claimed again (`:768-769`) — ⭐ and its intermediates are then not claimed either,
+                // which is the reference's behaviour and not a shortcut. `all_uses_deleted` stays
+                // true for it, since the `else` is only for a user that still has readers.
+                if !erased_list.contains(&user) {
+                    to_be_erased.push(user);
+                    to_be_erased.extend(intermediate_ops);
+                }
+            } else {
+                all_uses_deleted = false;
+            }
+        }
+
+        // `for (auto e : to_be_erased) { e->setOperands({}); erased_list.push_back(e); .. }` — ⭐
+        // AFTER the user loop, so a user decided earlier in this operand's loop did not see them.
+        erased_list.extend(to_be_erased);
+
+        // `if (all_uses_deleted) { if (operand.value().getName() != "latch") { .. } }`
+        if all_uses_deleted && operand.name() != Some(sen::Port::Latch) {
+            erased_list.push(operand.op.clone());
+        }
+    }
+}
+
+/// THE `erased_list` OVERLOAD OF `VectorOperand::eraseOp` (`VectorOperands.cpp:825-857`) —
+/// [`erase_op`]'s walk, recording instead of removing, for the reason above.
+///
+/// ⛔ NOT AN ANCHORED UNIT, same scope hole. ⭐ THIS ONE IS WHERE THE REFERENCE DEDUPLICATES — the
+/// `std::find` against BOTH `to_be_erased` and `erased_list` (`:837-841`) that [`erase_op`] had to
+/// decide for itself. ⛔ AND `op` GOES IN UNCONDITIONALLY WHEN EVERY USE WAS ERASABLE: no latch test
+/// and no dedup test on `op` itself, unlike the operand case.
+pub(super) fn erase_op_recording(op: &OpId, scope: &[DfirOp], erased_list: &mut Vec<OpId>) {
+    let mut all_uses_deleted = true;
+    let mut to_be_erased: Vec<OpId> = Vec::new();
+
+    for user in live_use_positions(op, scope, erased_list) {
+        if has_no_live_uses(&user, scope, erased_list) {
+            if !to_be_erased.contains(&user) && !erased_list.contains(&user) {
+                to_be_erased.push(user);
+            }
+        } else {
+            all_uses_deleted = false;
+        }
+    }
+
+    erased_list.extend(to_be_erased);
+
+    if all_uses_deleted {
+        erased_list.push(op.clone());
+    }
+}
+
+/// `getExpandedVector(getShuffleIndicesAsVector(op), repetition)` — the index list repeated
+/// `repetition` times (`dialect_utils/VectorChain/Utils.cpp:50-73`).
+///
+/// ⛔ NOT ONE OF THE 384, and the three classifiers below are not either — they are
+/// `dialect_utils`, which bridge 2's list excludes. They are here because entry 278 is only its three
+/// branch tests, so a port without them would be the predicate-shaped non-port `TASK.md` forbids.
+///
+/// ⛔ AN INVALID INDEX LIST IS **EMPTY**, NOT REJECTED (`:52`), which makes every classifier's loop
+/// vacuous and answers `true`. This island's `indices` is a `Vec<i32>` and `isShuffleIndicesValid`'s
+/// only real test is `index >= -(vars + pads)` (`:28-31`) — ⛔ BOTH SEGMENTS, which is why entry 279
+/// adding [`vc::Op::Shuffle::pad`](vc::Op::Shuffle) widens the bound here rather than leaving it.
+pub(super) fn expanded_shuffle_indices(
+    indices: &[i32],
+    repetition: u32,
+    variables: usize,
+    pads: usize,
+) -> Vec<i32> {
+    let max_negative = -i32::try_from(variables + pads).unwrap_or(i32::MAX);
+    if indices.iter().any(|index| *index < max_negative) {
+        return Vec::new();
+    }
+    indices.repeat(repetition as usize)
+}
+
+/// `isShuffleNFWDVersion0` (`dialect_utils/VectorChain/Utils.cpp:135-152`) — ⛔ THE 32-LANE LIST IS
+/// THE FP32 PATTERN AND EVERY OTHER LENGTH IS TREATED AS FP16, including an empty one, which passes.
+fn is_shuffle_nfwd_version_0(expanded: &[i32]) -> bool {
+    let pattern: &[i32] = if expanded.len() == 32 {
+        &[1, 0, 3, 3]
+    } else {
+        &[2, 3, 0, 1, 6, 7, 6, 7]
+    };
+    expanded
+        .iter()
+        .enumerate()
+        .all(|(i, index)| *index == pattern[i % pattern.len()])
+}
+
+/// `isShuffleNFWDVersion2` (`dialect_utils/VectorChain/Utils.cpp:155-172`) — the same shape with the
+/// other two patterns.
+fn is_shuffle_nfwd_version_2(expanded: &[i32]) -> bool {
+    let pattern: &[i32] = if expanded.len() == 32 {
+        &[2, 0, 1, 3]
+    } else {
+        &[4, 5, 3, 3, 5, 5, 6, 7]
+    };
+    expanded
+        .iter()
+        .enumerate()
+        .all(|(i, index)| *index == pattern[i % pattern.len()])
+}
+
+/// `isCustomVectorTrivialShuffle` (`dialect_utils/VectorChain/Utils.cpp:126-133`) — one index, zero,
+/// a custom-vector result, and a constant bitstream feeding it.
+///
+/// ⛔ `isa<dataflow::CustomVectorType>` IS THE ELEMENT TYPE HERE. This island states a vector as
+/// [`crate::islands::dataflow_ir::ty::Vector`] and carries the custom-ness on the ELEMENT
+/// ([`ElemType::MxFloat`], [`ElemType::MxInt`]) rather than as a distinct type constructor; every
+/// `!dataflow.custom_vector` in the authority tree's 825 cases has an MX element, and MLIR's builtin
+/// `VectorType` cannot hold one (`DataflowTypes.td:30`), so the two spellings coincide.
+fn is_custom_vector_trivial_shuffle(
+    indices: &[i32],
+    ty: Vector,
+    input: Val,
+    scope: &[DfirOp],
+) -> Option<OpId> {
+    // `if (indices.size() != 1 || indices[0] != 0) return false;` — ⛔ THE UNEXPANDED LIST.
+    if indices != [0] {
+        return None;
+    }
+    if !matches!(ty.elem, ElemType::MxFloat(_) | ElemType::MxInt(_)) {
+        return None;
+    }
+    // `return isa<vectorchain::ConstantBitstreamOp>(parent);` — and the caller's `DT_CHECK` with it.
+    let parent = defining_position(input, scope)?;
+    match op_at(&parent, scope)? {
+        DfirOp::VectorChain(vc::Op::ConstantBitstream { .. }) => Some(parent),
+        _ => None,
+    }
+}
+
+/// WHICH UNIT A `dataflow.send` GOES TO — `findUnitType(send_op.getToUnit())`'s `get_unit` arm, which
+/// is what [`VectorOperand::from_send_op`] left to its caller.
+///
+/// ⛔ `findUnitType`'s `uniform::QueryMapOp` arm is not reachable from this island (see
+/// `vc_lowering_xrf.rs`'s note on the same call), and a register file is not a send destination, so
+/// both are the reference's *"Unit type is inconsistent in SendOp."*
+fn send_destination(to: link::SendEnd, scope: &[DfirOp]) -> Option<DfirUnit> {
+    match view_unit(to.val(), scope)? {
+        ViewUnit::Unit(unit) => Some(unit),
+        ViewUnit::Local(_) => None,
+    }
+}
+
+impl VectorOperand {
+    /// Replaces: e278_getOperandFromShuffleOp
+    ///
+    /// **278/384** `VectorOperand::getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311` (36L).
+    ///
+    /// Three recognised shuffle shapes answer with the operand of what the shuffle READS, re-tagged;
+    /// anything else answers with the operand of the shuffle's single USER.
+    ///
+    /// ⛔ THE RE-TAG IS AN OVERWRITE OF AN ANSWER ALREADY BUILT (`:317-319`), so the NFWD operand
+    /// keeps the parent's position and precisions and loses only its value and kind.
+    /// ⛔ THE TRIVIAL-SHUFFLE ARM TAKES `is_constant_splatted_vector = true` — the only caller that
+    /// does — and then overwrites `Constant` with `ConstantBitstream` (`:333-335`).
+    /// ⛔ ONLY THE **FIRST** USER IS INSPECTED (`:338-339`); program order is the order here.
+    /// ⭐ `get_operand` IS THE SAME SCC CUT [`Self::from_neg_op`] takes, `traverse_upwards = true`.
+    #[must_use]
+    pub fn from_shuffle_op<A: Arch>(
+        op: &OpId,
+        comp: ComputeComp,
+        scope: &[DfirOp],
+        get_operand: &mut impl FnMut(&OpId, ComputeComp) -> Option<VectorOperand>,
+    ) -> Option<VectorOperand> {
+        // `DT_CHECK(isa<vectorchain::ShuffleOp>(op));`
+        let Some(DfirOp::VectorChain(vc::Op::Shuffle {
+            input,
+            variable,
+            pad,
+            indices,
+            repetition,
+            ty,
+            ..
+        })) = op_at(op, scope)
+        else {
+            return None;
+        };
+        let expanded = expanded_shuffle_indices(indices, *repetition, variable.len(), pad.len());
+
+        // The two NFWD arms, which differ only in the port they re-value to.
+        let nfwd = if is_shuffle_nfwd_version_0(&expanded) {
+            Some(sen::Port::Nfwd0)
+        } else if is_shuffle_nfwd_version_2(&expanded) {
+            Some(sen::Port::Nfwd2)
+        } else {
+            None
+        };
+        if let Some(port) = nfwd {
+            // `auto *parent = op.getOperand(0).getDefiningOp();`
+            let parent = defining_position(*input, scope)?;
+            let mut operand = get_operand(&parent, comp)?;
+            operand.kind = VectorOperandType::Nfwd;
+            operand.set_value(OperandValue::Port(port));
+            return Some(operand);
+        }
+
+        // `} else if (vectorchain::utils::isCustomVectorTrivialShuffle(op)) {`
+        if let Some(parent) = is_custom_vector_trivial_shuffle(indices, *ty, *input, scope) {
+            let Some(DfirOp::VectorChain(vc::Op::ConstantBitstream { value, .. })) =
+                op_at(&parent, scope)
+            else {
+                return None;
+            };
+            // `getOperandFromConstantBitstreamOp(const_bit_op, /*splatted*/ true)`, whose
+            // `getValue()[0]` is element zero.
+            let splat = ConstantOperandValue::of(*value.first()?)?;
+            let mut operand = VectorOperand::from_constant_bitstream_op(
+                BitstreamConstant::SplattedVector(splat),
+                parent,
+            );
+            operand.kind = VectorOperandType::ConstantBitstream;
+            return Some(operand);
+        }
+
+        // `if (op.getOperation()->user_begin() != op.getOperation()->user_end())`
+        let user = use_positions(op, scope).into_iter().next()?;
+        match op_at(&user, scope)? {
+            // `if (auto send_op = llvm::dyn_cast<dataflow::SendOp>(use))`
+            DfirOp::Dataflow(dataflow::Op::Send { to, .. }) => Some(
+                VectorOperand::from_send_op::<A>(send_destination(*to, scope)?, comp, user),
+            ),
+            // `else if (auto store_op = llvm::dyn_cast<agen::VectorStoreOp>(use))`
+            DfirOp::Agen(agen::Op::VectorStore { .. }) => {
+                VectorOperand::from_load_or_store_op(&user, scope)
+            }
+            // `return std::nullopt;` — both of them.
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{BitstreamConstant, IrfIndex, LayoutAndIndices, RegisterSlice};
@@ -1938,7 +2246,8 @@ mod unit_tests {
         same_block,
     };
     use crate::arch::{Dd2, Sen1p5};
-    use crate::units::{DfirUnit, Row};
+    use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
+    use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Index, Op as DfirOp, Val};
     use crate::islands::dataflow_ir::dialects::{affine, agen, arith, dataflow, vector};
@@ -2960,12 +3269,94 @@ mod unit_tests {
         erase_operands(&[Some(latched)], &mut scope);
         assert_eq!(scope, vec![dense(Val(0))]);
     }
+
+    /// 🎯 278/384 — THE VENDOR'S OWN TWO NFWD SHUFFLES, RE-TAGGED OVER THE PARENT'S ANSWER.
+    /// `Conversion/VectorChainToSentientPESFP/nfwd_for_binary_op.mlir:155-159` is
+    /// `shuffle {indices = [2,3,0,1,6,7,6,7]}` and `{indices = [4,5,3,3,5,5,6,7]}` feeding one binary,
+    /// whose expectation is `opA = nfwd0, opADataID = 1` beside `opB = nfwd2, opBDataID = 2` (`:48`) —
+    /// the ports come from here and the data IDs from the parent, which is why the parent's position
+    /// has to survive the re-tag. The third shuffle is neither pattern and falls through to its send.
+    #[test]
+    fn the_two_vendor_nfwd_patterns_re_tag_the_parents_operand() {
+        let (to, from) = Link::<Sfp, Lxsu>::between(Val(20), Val(21)).ends();
+        let shuffle = |result: Val, indices: Vec<i32>| {
+            DfirOp::VectorChain(vc::Op::Shuffle {
+                result,
+                input: Val(1),
+                variable: Vec::new(),
+                pad: Vec::new(),
+                mask: None,
+                indices,
+                repetition: 8,
+                input_ty: V64,
+                ty: V64,
+            })
+        };
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(1),
+                from,
+                ty: V64,
+            }),
+            shuffle(Val(2), vec![2, 3, 0, 1, 6, 7, 6, 7]),
+            shuffle(Val(3), vec![4, 5, 3, 3, 5, 5, 6, 7]),
+            shuffle(Val(4), vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: Val(4),
+                ty: V64,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(21),
+                residency: Residency::Corelet {
+                    core: Core::checked(0).expect("the arch has core 0"),
+                    corelet: Corelet::checked(0).expect("the arch has corelet 0"),
+                },
+                unit: DfirUnit::Lxsu,
+                num_folds: None,
+            }),
+        ];
+        // The parent's answer, which the reference builds and then overwrites two fields of.
+        let mut parent_operand = |at: &OpId, _comp: ComputeComp| {
+            Some(VectorOperand::new(
+                VectorOperandType::Lrf,
+                OperandValue::Slice(RegisterSlice::Lrf(sen::LrfIndex::L0)),
+                at.clone(),
+            ))
+        };
+
+        for (path, port) in [(1u32, sen::Port::Nfwd0), (2, sen::Port::Nfwd2)] {
+            let operand = VectorOperand::from_shuffle_op::<Dd2>(
+                &OpId::at(&[path]),
+                ComputeComp::Pe,
+                &scope,
+                &mut parent_operand,
+            )
+            .expect("the parent resolves");
+            assert_eq!(operand.kind, VectorOperandType::Nfwd);
+            assert_eq!(operand.name(), Some(port));
+            // ⭐ THE PARENT'S POSITION, NOT THE SHUFFLE'S — this is `opADataID = 1`.
+            assert_eq!(operand.op, OpId::at(&[0]));
+        }
+
+        // Neither pattern: the answer comes from the shuffle's single user, a send to the LXSU.
+        let operand = VectorOperand::from_shuffle_op::<Dd2>(
+            &OpId::at(&[3]),
+            ComputeComp::Pe,
+            &scope,
+            &mut parent_operand,
+        )
+        .expect("the send resolves");
+        assert_eq!(operand.kind, VectorOperandType::Link);
+        assert_eq!(operand.name(), Some(sen::Port::Lx));
+        assert_eq!(operand.op, OpId::at(&[4]));
+    }
+
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e278_getOperandFromShuffleOp
 // crustify:todo: e304_getOperandWithPrecision
 // crustify:todo: e320_getOperand
 // crustify:todo: e343_getOperandFromCastOp

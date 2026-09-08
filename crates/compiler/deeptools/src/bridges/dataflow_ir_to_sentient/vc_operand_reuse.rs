@@ -68,8 +68,11 @@
 
 use std::collections::HashMap;
 
-use super::vc_vector_operands::OpId;
-use crate::islands::dataflow_ir::dialects::Val;
+use super::vc_vector_operands::{
+    OpId, OperandValue, VectorOperand, VectorOperandType, origin_val, same_block,
+};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val};
+use crate::islands::sentient::dialects::sentient as sen;
 
 /// WHICH DATA ORIGIN AN OPERAND READS, AS THE EMITTED OP SPELLS IT.
 ///
@@ -281,16 +284,6 @@ impl OperandReuse {
     /// every key that gets here is present. ⛔ THE PORT STILL MODELS `operator[]` AND NOT THE COMMENT:
     /// the reference's *code* default-inserts, `e276_setReuseInformation` is not yet ported, and a
     /// port that answered the comment instead would diverge the moment a second caller appears.
-    // ⭐ DEAD IN A LIBRARY BUILD, LIVE UNDER TEST. Its only caller is `e276_setReuseInformation`,
-    // which is not scheduled in this wave; `expect` rather than `allow` so the attribute has to come
-    // off when that unit lands.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "its only caller is e276_setReuseInformation, not scheduled in this wave"
-        )
-    )]
     fn set_reuse_flag(&mut self, op: Val) {
         self.data_origins.entry(op).or_default().absorbed = true;
     }
@@ -414,16 +407,6 @@ impl OperandReuse {
     /// Not absorbed yet — which is exactly the `Some(false)` that
     /// `VectorChainToSentientPESFP.cpp:1289-1290` waits for before it emits the mask constant and the
     /// consuming compute. An entry born absorbed would silence its own consumer.
-    // ⭐ DEAD IN A LIBRARY BUILD, LIVE UNDER TEST — private in the reference too
-    // (`OperandReuse.hpp:51`), with `e276_setReuseInformation` its sole caller, unscheduled in this
-    // wave. Same `expect` as [`Self::set_reuse_flag`], so both attributes have to come off together.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "its only caller is e276_setReuseInformation, not scheduled in this wave"
-        )
-    )]
     fn insert_if_not_exists(&mut self, op: Val) -> bool {
         // ⭐ THE SIZE IS READ FIRST, exactly as the reference reads it: on the line before the
         // insertion, so `new_id` is the position this origin takes in first-seen order.
@@ -447,6 +430,105 @@ impl OperandReuse {
             std::collections::hash_map::Entry::Occupied(_) => false,
         }
     }
+
+    /// Replaces: e276_setReuseInformation
+    ///
+    /// **276/384** `OperandReuse::setReuseInformation` —
+    /// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17` (44L).
+    ///
+    /// REGISTER EVERY NON-CONSTANT OPERAND AS A DATA ORIGIN, RE-VALUE TO [`sen::Port::Latch`] THE
+    /// ONES THAT MUST RE-READ WHAT IS ALREADY LATCHED, THEN MARK THE REST ABSORBED.
+    ///
+    /// ⛔ `name_i` IS RE-READ INSIDE THE `j` LOOP: the reference holds a reference, so latching
+    /// operand `i` changes what later `j`s compare against.
+    /// ⛔ THE `LRF` TEST IS ON `i` ONLY (`:37`), and the inner loop skips no kind — a `Constant` `j`
+    /// is compared, and cannot match (see [`VectorOperand::name`]).
+    /// ⛔ THE UNDECIDABLE-DOMINANCE ARM RETURNS EARLY, skipping the rest of loop one AND all of loop
+    /// two, which is observable even though all 20 callers discard the answer — hence
+    /// [`ReuseInformation`] rather than `()`.
+    pub fn set_reuse_information(
+        &mut self,
+        user: &OpId,
+        operands: &mut [VectorOperand],
+        scope: &[DfirOp],
+    ) -> ReuseInformation {
+        const LATCH: OperandValue = OperandValue::Port(sen::Port::Latch);
+
+        // `for (int i = 0; i < operands.size(); i++)` — ⛔ the reference's `if (!operands[i]
+        // .has_value()) return std::nullopt;` is gone with the `Option`: the slice is operands.
+        for i in 0..operands.len() {
+            // `if (operand_i.type_ != Constant) {`
+            if operands[i].kind == VectorOperandType::Constant {
+                continue;
+            }
+
+            // ⛔ NOT A REFERENCE CASE: `op_` there is always a live `Operation *` with a result. An
+            // operand whose producer cannot be named cannot be shown distinct from another, and
+            // latching is what all three arms below do with exactly that.
+            let Some(key_i) = origin_val(&operands[i].op, scope) else {
+                operands[i].set_value(LATCH);
+                continue;
+            };
+
+            if !self.insert_if_not_exists(key_i) {
+                // `if (!this->insertIfNotExists(operand_i.op_)) operand_i.setValue("latch");`
+                operands[i].set_value(LATCH);
+            } else if self.absorbtion_flag(key_i) == Some(true) {
+                // `else if (this->getAbsorbtionFlag(operand_i.op_).value())` — ⭐ the unguarded
+                // `.value()` is safe because the line above just inserted the entry; `Some(true)`
+                // keeps that ordering instead of unwrapping.
+                operands[i].set_value(LATCH);
+            } else if !same_block(user, Some(&operands[i]), scope) {
+                // `else if (VectorOperand::sameBlock(user, operands[i]).failed())`
+                operands[i].set_value(LATCH);
+            } else {
+                // `for (int j = 0; j < i; j++)`
+                for j in 0..i {
+                    let name_i = operands[i].name();
+                    if operands[j].name() == name_i && operands[i].kind != VectorOperandType::Lrf {
+                        if self.dominates(&operands[j].op, &operands[i].op) {
+                            operands[j].set_value(LATCH);
+                        } else if self.dominates(&operands[i].op, &operands[j].op) {
+                            operands[i].set_value(LATCH);
+                        } else {
+                            // `user->emitError("Impossible to determine dominance among operands");
+                            //  return std::nullopt;`
+                            return ReuseInformation::DominanceUndecidable;
+                        }
+                    }
+                }
+            }
+        }
+
+        // `for (auto &operand : operands) { if (from.type_ != Constant && from.getName() != "latch")
+        //  this->setReuseFlag(from.op_); }`
+        for operand in operands.iter() {
+            if operand.kind != VectorOperandType::Constant
+                && operand.name() != Some(sen::Port::Latch)
+                && let Some(key) = origin_val(&operand.op, scope)
+            {
+                self.set_reuse_flag(key);
+            }
+        }
+
+        // `return true;`
+        ReuseInformation::Set
+    }
+}
+
+/// WHAT `setReuseInformation` ANSWERS — `std::optional<bool>` with no `false` case
+/// (`OperandReuse.cpp:17-62`).
+///
+/// ⭐ TWO CASES, NOT THREE AND NOT AN `Option<bool>`. The reference returns `true` or `nullopt`, never
+/// `false`, and two of its three `nullopt` arms are absent operands the slice cannot hold. What is
+/// left is the one real refusal: two operands reading the same name with neither dominating the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseInformation {
+    /// `return true;` — every operand registered, the reuse flags set.
+    Set,
+    /// `emitError("Impossible to determine dominance among operands"); return std::nullopt;` — the
+    /// walk stopped where it was, so the operands after it are untouched and no flag was set.
+    DominanceUndecidable,
 }
 
 #[cfg(test)]
@@ -779,6 +861,57 @@ mod unit_tests {
 
         assert!(core::mem::needs_drop::<OperandReuse>());
     }
+
+    /// 🎯⛔ 276/384 — TWO OPERANDS READING THE SAME LINK, AND THE DOMINATED ONE IS THE ONE THAT
+    /// LATCHES. Both receives bind `north`, so the `j` loop fires; `[0]` dominates `[1]`, so the
+    /// reference latches **`j`** — the earlier operand re-reads what the later one leaves in the
+    /// latch — and only the survivor is marked absorbed.
+    #[test]
+    fn the_dominating_operand_is_the_one_re_valued_to_latch() {
+        use crate::islands::dataflow_ir::dialects::dataflow;
+        use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
+        use crate::islands::dataflow_ir::ty::{ElemType, Vector};
+
+        let v = Vector {
+            len: 128,
+            elem: ElemType::Bf16,
+        };
+        let (_, first) = Link::<Lxsu, Sfp>::between(Val(20), Val(21)).ends();
+        let (_, second) = Link::<Lxsu, Sfp>::between(Val(22), Val(23)).ends();
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(0),
+                from: first,
+                ty: v,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(1),
+                from: second,
+                ty: v,
+            }),
+        ];
+        let read = |result: Val, path: &[u32]| {
+            let _ = result;
+            VectorOperand::new(
+                VectorOperandType::Link,
+                OperandValue::Port(sen::Port::North),
+                OpId::at(path),
+            )
+        };
+        let mut operands = vec![read(Val(0), &[0]), read(Val(1), &[1])];
+
+        let mut reuse = OperandReuse::default();
+        assert_eq!(
+            reuse.set_reuse_information(&OpId::at(&[2]), &mut operands, &scope),
+            ReuseInformation::Set
+        );
+        assert_eq!(operands[0].name(), Some(sen::Port::Latch));
+        assert_eq!(operands[1].name(), Some(sen::Port::North));
+        // Loop two skips the latched operand and absorbs the other.
+        assert_eq!(reuse.absorbtion_flag(Val(0)), Some(false));
+        assert_eq!(reuse.absorbtion_flag(Val(1)), Some(true));
+    }
+
 }
 
 /// Replaces: e227_OperandReuse
@@ -796,6 +929,7 @@ impl Drop for OperandReuse {
         // `data_origins_.clear();`
         self.data_origins.clear();
     }
+
 }
 
 // ⛔ AND IT MUST STAY ONE. `needs_drop::<OperandReuse>()` is `true` exactly when destroying one runs
@@ -807,4 +941,3 @@ const _: [(); 1] = [(); core::mem::needs_drop::<OperandReuse>() as usize];
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e276_setReuseInformation

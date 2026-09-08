@@ -1204,6 +1204,153 @@ mod unit_tests {
         push_back_the_unit_to_list_if_doesnot_exist(sen::Consumer::Lxlu0, &mut list);
         assert_eq!(list, vec![sen::Consumer::Lxlu0, sen::Consumer::Sfp]);
     }
+    /// 🎯 273/384 — THE `N` SAYS THE DESTINATION IS ON THE OTHER CORELET, AND BOTH CORELETS SPLIT.
+    ///
+    /// ⛔ THE VENDOR'S OWN PAIR: `@same_corelet` expects `units = [lxsu]` and `@diff_corelet`
+    /// `units = [lxsuN]` for the same `lxlu`→`lxsu` sync
+    /// (`Conversion/DataflowToSentient/uniform_sync.mlir:25` and `:43`). With a source on EACH
+    /// corelet the sync uniformizes and the two regions name opposite spellings.
+    #[test]
+    fn an_lx_sync_names_the_neighbour_only_across_corelets() {
+        let corelet0 = Corelet::checked(0).expect("every arch has corelet 0");
+        let corelet1 = Corelet::checked(1).expect("Target::CORELETS_PER_CORE is 2");
+        let src = L0LxSrc::Lx(LxHalf::Load);
+        let mut values = Values::default();
+
+        let peers = |lowered: Option<L0LxLowering>| -> Vec<sen::Consumer> {
+            match lowered {
+                Some(L0LxLowering::One(sen::Op::Sync { peers, .. })) => {
+                    peers.iter().copied().map(sen::SyncHalf::peer).collect()
+                }
+                other => panic!("entry 273 emits one sentient.sync here: {other:?}"),
+            }
+        };
+
+        // `@same_corelet` — src on corelet 0, dst `lxsu` on corelet 0.
+        assert_eq!(
+            peers(src.lower_l0lx_sync_operation_for_a_unit(
+                L0LxSyncToLower::Send(dataflow::AsyncTransferWait::Immediately),
+                &[Val(0)],
+                &[],
+                L0LxSyncDst::Lx(LxHalf::Store, corelet0),
+                None,
+                &mut values,
+            )),
+            vec![sen::Consumer::Lxsu]
+        );
+        // `@diff_corelet` — the same source, the destination now on corelet 1.
+        assert_eq!(
+            peers(src.lower_l0lx_sync_operation_for_a_unit(
+                L0LxSyncToLower::Recv,
+                &[Val(0)],
+                &[],
+                L0LxSyncDst::Lx(LxHalf::Store, corelet1),
+                None,
+                &mut values,
+            )),
+            vec![sen::Consumer::LxsuN]
+        );
+
+        // Both corelets hold a source: two regions, and region 1 sees the same destination as its
+        // OWN unit where region 0 saw the neighbour (`:337-340`).
+        let Some(L0LxLowering::TwoRegions {
+            regions,
+            region0,
+            region1,
+            l3,
+        }) = src.lower_l0lx_sync_operation_for_a_unit(
+            L0LxSyncToLower::Recv,
+            &[Val(0)],
+            &[Val(1)],
+            L0LxSyncDst::Lx(LxHalf::Store, corelet1),
+            None,
+            &mut values,
+        ) else {
+            panic!("both corelets occupied uniformizes the sync");
+        };
+        assert!(l3.is_none(), "the per-unit lowering has no third create");
+        let uniform::Op::UniformizeRegions { regions, .. } = &regions else {
+            panic!("entry 222 builds a uniformize_regions: {regions:?}");
+        };
+        assert_eq!(regions[0].units, vec![Val(0)]);
+        assert_eq!(regions[1].units, vec![Val(1)]);
+        assert_eq!(peers(Some(L0LxLowering::One(region0))), vec![
+            sen::Consumer::LxsuN
+        ]);
+        assert_eq!(peers(Some(L0LxLowering::One(region1))), vec![
+            sen::Consumer::Lxsu
+        ]);
+    }
+
+    /// 🎯 274/384 — THE GROUP'S TWO LISTS ARE REVERSED IMAGES, AND REGION 1 GETS ITS OWN.
+    ///
+    /// ⛔⛔ THIS PINS DELIBERATE DIVERGENCE (1). The vendor's `@same_group` syncs one `lxlu` source at
+    /// a time to the group `{lxsu@corelet0, lxsu@corelet1}` and prints
+    /// `[lxsu, lxsuN]` for a corelet-0 source and `[lxsuN, lxsu]` for a corelet-1 one
+    /// (`Conversion/DataflowToSentient/uniform_sync.mlir:247` against `:255`). `:645` hands region 1
+    /// the FIRST of those two lists; region 1 here gets the second.
+    #[test]
+    fn a_group_sync_gives_each_corelet_its_own_reversed_list() {
+        let corelet0 = Corelet::checked(0).expect("every arch has corelet 0");
+        let corelet1 = Corelet::checked(1).expect("Target::CORELETS_PER_CORE is 2");
+        let src = L0LxSrc::Lx(LxHalf::Load);
+        let group = [
+            L0LxSyncDst::Lx(LxHalf::Store, corelet0),
+            L0LxSyncDst::Lx(LxHalf::Store, corelet1),
+        ];
+        let mut values = Values::default();
+        let peers = |op: &sen::Op| match op {
+            sen::Op::Sync { peers, .. } => {
+                peers.iter().copied().map(sen::SyncHalf::peer).collect::<Vec<_>>()
+            }
+            other => panic!("entry 274 emits sentient.sync: {other:?}"),
+        };
+
+        // `@same_group`, source on corelet 0 — the list the vendor prints at `:247`.
+        let Some(L0LxLowering::One(from_corelet0)) = src
+            .lower_l0lx_sync_operation_for_a_group_of_units(
+                L0LxSyncToLower::Send(dataflow::AsyncTransferWait::Immediately),
+                &[Val(0)],
+                &[],
+                &group,
+                None,
+                &mut values,
+            )
+        else {
+            panic!("a single-corelet source emits one sync");
+        };
+        assert_eq!(peers(&from_corelet0), vec![
+            sen::Consumer::Lxsu,
+            sen::Consumer::LxsuN
+        ]);
+
+        // Both corelets occupied: region 0 gets that list and region 1 the reversed one.
+        let Some(L0LxLowering::TwoRegions {
+            region0,
+            region1,
+            l3,
+            ..
+        }) = src.lower_l0lx_sync_operation_for_a_group_of_units(
+            L0LxSyncToLower::Send(dataflow::AsyncTransferWait::Immediately),
+            &[Val(0)],
+            &[Val(1)],
+            &group,
+            None,
+            &mut values,
+        ) else {
+            panic!("both corelets occupied uniformizes the group sync");
+        };
+        assert_eq!(peers(&region0), vec![
+            sen::Consumer::Lxsu,
+            sen::Consumer::LxsuN
+        ]);
+        assert_eq!(peers(&region1), vec![
+            sen::Consumer::LxsuN,
+            sen::Consumer::Lxsu
+        ]);
+        // Divergence (2): no L3 destination in the group, so no third sync naming nobody.
+        assert!(l3.is_none());
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1768,11 +1915,447 @@ pub fn push_back_the_unit_to_list_if_doesnot_exist(
     }
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 273/384 + 274/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH HALF OF THE L0 A SYNC NAMES — the two components [`is_sen_component_l0lu`] and
+/// [`is_sen_component_l0su`] tell apart, as one type.
+///
+/// ⛔ THE CROSS-HALF GUARD IS THE ONLY THING EITHER FUNCTION ASKS OF IT. Both lowerings accept a
+/// destination only when `(isSenComponentL0LU(src) && isSenComponentL0SU(dst)) ||
+/// (isSenComponentL0SU(src) && isSenComponentL0LU(dst))` (`DataflowToSentient.cpp:253-255`,
+/// negated per destination at `:507-510`) — an L0 load unit syncs with an L0 store unit and with
+/// nothing else — and the emitted name is then read off the DESTINATION's half alone (`:256-257`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum L0Half {
+    /// `l0lu` — `SenComponents::L0LU`.
+    Load,
+    /// `l0su` — `SenComponents::L0SU`.
+    Store,
+}
+
+/// WHICH UNIT AN L0/LX SYNC LEAVES FROM — the `switch (gen_comp)`'s four accepted cases.
+///
+/// ⛔ THE `default:` ARM IS `emitError("Unknown lowering of the sync operation")` (`:365-367`,
+/// `:657-659`), so naming the four is what removes it. The source's own corelet is NOT here: which
+/// corelets hold a source is the pair of lists, i.e. [`OccupiedCorelets`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L0LxSrc {
+    /// Generic `L0LU`/`L0SU`.
+    L0(L0Half),
+    /// Generic `LXLU`/`LXSU` — ⭐ WHICH HALF IS NEVER READ on this side: the LX arms derive the
+    /// emitted name from the destination, so the source half only picks the `case` label.
+    Lx(LxHalf),
+}
+
+/// WHICH `dataflow` SYNC AN L0/LX LOWERING IS GIVEN — `DT_CHECK(send_op || recv_op ||
+/// implicit_sync_op)` (`:196`, `:445`) as a type.
+///
+/// ⛔ NOT [`SyncToLower`], AND THE THIRD CASE IS WHY. The L3 twins accept only a send or a recv
+/// (`DT_CHECK(send_op || recv_op)`, `:381`), so giving them an implicit-sync input would offer them
+/// the one op they abort on. ⭐ AND `soft` IS NOT A FIELD OF THE ANSWER HERE: all nine
+/// `sentient.sync` creates in these two functions pass `false` (`:262`, `:283`, `:309`, `:350`,
+/// `:361`, `:523`, `:603`, `:618`, `:640`, `:646`, `:652`) — a deferred send is a REFUSAL on the L0
+/// and LX→LX paths rather than a soft sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L0LxSyncToLower {
+    /// `dataflow.sync_send`, carrying its `$wait_immediately_for_async_transfers`.
+    Send(dataflow::AsyncTransferWait),
+    /// `dataflow.sync_recv`.
+    Recv,
+    /// `dataflow.implicit_sync_on_streaming_buffer` — lowered as `sendrecv` (`:454`), carrying its
+    /// already-resolved `$buffer_size`.
+    ///
+    /// ⛔⛔ RESOLVED BY THE CALLER, BECAUSE NO SINGLE-ISLAND WALK CAN ANSWER IT. The reference reads
+    /// the size off the defining op and accepts TWO (`:206-215`, `:451-462`): an
+    /// `arith.constant_index` — a [`DfirOp`] — or a `sentient.scalar_constant`, which is not one.
+    /// [`crate::islands::dataflow_ir::dialects::defining_op`] walks a `&[DfirOp]` scope and so cannot
+    /// see the second, and the `DT_ERROR("sync buffer size has to be a constant op")` on anything
+    /// else is an abort. Reaching the operand is the mechanism a port may drop; the size is the input.
+    ImplicitSync(i32),
+}
+
+impl L0LxSyncToLower {
+    /// `sync_tag` — `send`, `recv` for a `sync_recv`, and `sendrecv` for an implicit sync.
+    #[must_use]
+    pub const fn mode(self) -> sen::SyncMode {
+        match self {
+            Self::Send(_) => sen::SyncMode::Send,
+            Self::Recv => sen::SyncMode::Recv,
+            Self::ImplicitSync(_) => sen::SyncMode::SendRecv,
+        }
+    }
+
+    /// `send_op && !send_op.getWaitImmediatelyForAsyncTransfers().value()` — *"Unsuported sync
+    /// operation for L0"* / *"for LX"*.
+    #[must_use]
+    pub const fn deferred(self) -> bool {
+        matches!(self, Self::Send(dataflow::AsyncTransferWait::Deferred))
+    }
+
+    /// `implicit_sync_tile_size` — ⛔ [`None`] IS THE REFERENCE'S `-1`, both as its initial value
+    /// (`:203`, `:450`) and as the `si32` every non-implicit sync writes.
+    #[must_use]
+    pub const fn tile_size(self) -> Option<i32> {
+        match self {
+            Self::Send(_) | Self::Recv => None,
+            Self::ImplicitSync(size) => Some(size),
+        }
+    }
+}
+
+/// A DESTINATION AN L0/LX SYNC MAY NAME — the `type` and the `corelet` of the destination
+/// `dataflow.get_unit`, which are the only two things either function reads it for.
+///
+/// ⛔⛔ THE CORELET IS MANDATORY ON EVERYTHING BUT L3, AND THAT GUARD IS THIS TYPE.
+/// `dst_comp != L3LU && dst_comp != L3SU && !dst_unit->hasAttr("corelet")` is
+/// *"Unknown corelet information for sentient"* (`:224-229`, per destination at `:500-505` and
+/// `:557-560`), so [`Corelet`] sits on the two non-L3 cases and on neither L3 one — the refusal has
+/// no input rather than an arm.
+///
+/// ⛔ AND THE NUMBERED SPELLINGS COLLAPSE INTO THE CORELET. `SenComponents::LXLU0`/`LXLU1`/`LXSU0`/
+/// `LXSU1` reach `dst_unit_name.pop_back()` in the group lowering (`:565-567`) to strip the digit
+/// back off; this island's [`DfirUnit`] has no numbered LX unit at all — the corelet is
+/// [`crate::units::Residency`]'s, never the name's — so the digit is never on. In the per-unit
+/// lowering those four spellings instead fall through to
+/// `emitError("Unknown lowering of the LXLU/LXSU sync operation")` (`:369`), which is the same
+/// answer this type gives for a destination that is neither an L0 half, an LX half nor an L3 half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L0LxSyncDst {
+    /// An `l0lu`/`l0su` destination, with the `corelet` `:224` demands it carry — ⭐ WHOSE VALUE IS
+    /// NEVER READ: only its presence is, and the emitted consumer is the half.
+    L0(L0Half, Corelet),
+    /// An `lxlu`/`lxsu` destination, with the corelet whose difference from the source's is what
+    /// appends the `N`.
+    Lx(LxHalf, Corelet),
+    /// An `l3lu`/`l3su` destination — the one case exempt from carrying a corelet.
+    L3(L3Half),
+}
+
+/// WHAT ONE L0/LX SYNC LOWERING EMITS.
+///
+/// ⛔⛔ THE TWO-REGION FORM HANDS ITS SYNCS BACK BESIDE THE REGIONS, NOT INSIDE THEM.
+/// [`uniform::LocalRegion::body`](crate::islands::dataflow_ir::dialects::uniform::LocalRegion) is a
+/// `Vec<`[`DfirOp`]`>` — the shared dialects are re-exported onto the Sentient rung, so one
+/// `uniform.uniformize_regions` value is a DataflowIR op whichever rung holds it — and a
+/// `sentient.sync` is not a [`DfirOp`]. The reference reaches the same place with two `OpBuilder`s
+/// aimed into the regions (`:330-334`, `:632-636`); positioning a builder is exactly the mechanism a
+/// port may drop, so the placement is the caller's and the ops are all here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L0LxLowering {
+    /// One `sentient.sync` where the lowered op stood.
+    One(sen::Op),
+    /// A result-less `uniform.uniformize_regions` and the syncs its two regions hold.
+    TwoRegions {
+        /// [`create_uniform_regions_with_two_regions_no_result`]'s op, carrying only its two yields.
+        regions: uniform::Op,
+        /// The sync `builder_region0` writes — corelet 0's sources.
+        region0: sen::Op,
+        /// The sync `builder_region1` writes — corelet 1's sources.
+        region1: sen::Op,
+        /// The sync the OUTER builder writes for the group's L3 destinations (`:648-653`) — ⭐ ALWAYS
+        /// [`None`] from the per-unit lowering, which has no third create.
+        l3: Option<sen::Op>,
+    },
+}
+
+/// `symbolizeSentientLoadConsumer("l0lu"/"l0su")` — `:256-257` and `:514-515`.
+const fn l0_consumer(half: L0Half) -> sen::Consumer {
+    match half {
+        L0Half::Load => sen::Consumer::L0lu,
+        L0Half::Store => sen::Consumer::L0su,
+    }
+}
+
+/// `symbolizeSentientLoadConsumer("l3lu"/"l3su")` — the unextended L3 name both arms pass through.
+const fn l3_consumer(half: L3Half) -> sen::Consumer {
+    match half {
+        L3Half::Load => sen::Consumer::L3lu,
+        L3Half::Store => sen::Consumer::L3su,
+    }
+}
+
+/// `dst_unit_name` for an LX destination, with the `"N"` a cross-corelet sync appends (`:300`,
+/// `:337-340`, `:568`).
+const fn lx_consumer(half: LxHalf, neighbour: bool) -> sen::Consumer {
+    match (half, neighbour) {
+        (LxHalf::Load, false) => sen::Consumer::Lxlu,
+        (LxHalf::Load, true) => sen::Consumer::LxluN,
+        (LxHalf::Store, false) => sen::Consumer::Lxsu,
+        (LxHalf::Store, true) => sen::Consumer::LxsuN,
+    }
+}
+
+/// `sentient::SyncOp::create(..)` — ⭐ `soft` IS `false` AT EVERY CREATE IN BOTH UNITS.
+fn sync(
+    mode: sen::SyncMode,
+    peers: Vec<sen::Consumer>,
+    implicit_sync_memory_boundary: Option<i32>,
+    dbg_name: Option<String>,
+) -> sen::Op {
+    sen::Op::Sync {
+        mode,
+        peers: peers
+            .into_iter()
+            .map(sen::SyncHalf::of_lowered_destination)
+            .collect(),
+        soft: false,
+        implicit_sync_memory_boundary,
+        dbg_name,
+    }
+}
+
+impl L0LxSrc {
+    /// Replaces: e273_lowerL0LXSyncOperationForAUnit
+    ///
+    /// **273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189` (180L).
+    ///
+    /// One `sentient.sync` naming one destination — two of them, split into a
+    /// `uniform.uniformize_regions`, when both of the source core's corelets hold a source unit.
+    ///
+    /// ⛔ EVERY REFUSAL IS AN `emitError`, WHICH FAILS THE PASS, so [`None`] is what each of the
+    /// reference's diagnostic arms means — including the ones that `break` past a create.
+    /// ⛔ TRAP: THE LX→L3 ARM NEVER READS THE WAIT FLAG (`:275-287` sits before the `:289` check), so
+    /// a DEFERRED send from an LX to an L3 still emits `soft = false`; only the L0 and LX→LX arms
+    /// refuse one.
+    #[must_use]
+    pub fn lower_l0lx_sync_operation_for_a_unit(
+        self,
+        op: L0LxSyncToLower,
+        src_units_corelet0: &[Val],
+        src_units_corelet1: &[Val],
+        dst: L0LxSyncDst,
+        dbg_name: Option<String>,
+        values: &mut Values,
+    ) -> Option<L0LxLowering> {
+        // `:237-247` — "List of src units cannot be empty", and the `DT_CHECK` that the two lists
+        // name one component, which taking `self` instead of the lists discharges.
+        let occupied = OccupiedCorelets::of(src_units_corelet0, src_units_corelet1)?;
+        let mode = op.mode();
+
+        match self {
+            L0LxSrc::L0(src_half) => {
+                // `:249-252` — "Unsuported sync operation for L0".
+                if op.deferred() {
+                    return None;
+                }
+                // `:253-258` — the cross-half guard, then the name off the DESTINATION's half.
+                // Anything else is `emitError("Unknown lowering of the L0 sync operation")` (`:271`).
+                let L0LxSyncDst::L0(dst_half, _) = dst else {
+                    return None;
+                };
+                if dst_half == src_half {
+                    return None;
+                }
+                Some(L0LxLowering::One(sync(
+                    mode,
+                    vec![l0_consumer(dst_half)],
+                    op.tile_size(),
+                    dbg_name,
+                )))
+            }
+            L0LxSrc::Lx(_) => {
+                // `DT_CHECK_MSG(implicit_sync_tile_size == -1, "LX doesn't have implicit sync")`
+                // (`:275-276`).
+                if op.tile_size().is_some() {
+                    return None;
+                }
+                match dst {
+                    // `:277-287` — the L3 destination keeps its bare name and its `-1` boundary.
+                    L0LxSyncDst::L3(half) => Some(L0LxLowering::One(sync(
+                        mode,
+                        vec![l3_consumer(half)],
+                        None,
+                        dbg_name,
+                    ))),
+                    L0LxSyncDst::Lx(dst_half, dst_corelet) => {
+                        // `:289-293` — "Unsuported sync operation for LX".
+                        if op.deferred() {
+                            return None;
+                        }
+                        match occupied {
+                            // `:295-300` — one corelet holds every source, so the sync is one op and
+                            // the `N` says whether the destination sits on the OTHER corelet.
+                            OccupiedCorelets::Corelet0 | OccupiedCorelets::Corelet1 => {
+                                let neighbour = (occupied.holds_corelet_0()
+                                    && dst_corelet.get() == 1)
+                                    || (occupied.holds_corelet_1() && dst_corelet.get() == 0);
+                                Some(L0LxLowering::One(sync(
+                                    mode,
+                                    vec![lx_consumer(dst_half, neighbour)],
+                                    None,
+                                    dbg_name,
+                                )))
+                            }
+                            // `:315-365` — both corelets have sources, so the sync is uniformized
+                            // and each region names the destination from ITS corelet's point of view.
+                            OccupiedCorelets::Both => {
+                                let regions = create_uniform_regions_with_two_regions_no_result(
+                                    src_units_corelet0,
+                                    src_units_corelet1,
+                                    values,
+                                );
+                                // `:337-340` — a corelet-1 destination is the neighbour of region 0's
+                                // sources and the local unit of region 1's; a corelet-0 destination
+                                // is the mirror (the reference's bare `else`).
+                                let dst_on_corelet1 = dst_corelet.get() == 1;
+                                Some(L0LxLowering::TwoRegions {
+                                    regions,
+                                    region0: sync(
+                                        mode,
+                                        vec![lx_consumer(dst_half, dst_on_corelet1)],
+                                        None,
+                                        dbg_name.clone(),
+                                    ),
+                                    region1: sync(
+                                        mode,
+                                        vec![lx_consumer(dst_half, !dst_on_corelet1)],
+                                        None,
+                                        dbg_name,
+                                    ),
+                                    l3: None,
+                                })
+                            }
+                        }
+                    }
+                    // `:369` — "Unknown lowering of the LXLU/LXSU sync operation".
+                    L0LxSyncDst::L0(..) => None,
+                }
+            }
+        }
+    }
+
+    /// Replaces: e274_lowerL0LXSyncOperationForAGroupOfUnits
+    ///
+    /// **274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438` (222L).
+    ///
+    /// The same lowering over a whole `dataflow.create_group`, deduplicated in first-occurrence order
+    /// ([`push_back_the_unit_to_list_if_doesnot_exist`]) into one peer list per source corelet.
+    ///
+    /// ⛔⛔ DELIBERATE DIVERGENCE (1): `:645` GIVES REGION 1 CORELET **0**'S LIST. The two-region arm
+    /// builds `dst_unit_names_for_src_corelet1` at `:572`/`:580` and then never reads it — both
+    /// `SyncOp::create`s pass `dst_unit_names_for_src_corelet0` — so every corelet-1 source syncs with
+    /// the units its NEIGHBOUR should. The per-unit twin does this correctly (`:342-362`), and the
+    /// vendor's own key prints the two lists as distinct and reversed
+    /// (`Conversion/DataflowToSentient/uniform_sync.mlir:247` against `:255`). Region 1 gets its own
+    /// list here; the test pins both.
+    ///
+    /// ⛔ DELIBERATE DIVERGENCE (2): the third create (`:648-653`) is unconditional, so a group with
+    /// no L3 destination emits a `sentient.sync` naming NOBODY. It is [`None`] here.
+    #[must_use]
+    pub fn lower_l0lx_sync_operation_for_a_group_of_units(
+        self,
+        op: L0LxSyncToLower,
+        src_units_corelet0: &[Val],
+        src_units_corelet1: &[Val],
+        dst_unit_group: &[L0LxSyncDst],
+        dbg_name: Option<String>,
+        values: &mut Values,
+    ) -> Option<L0LxLowering> {
+        // `:473-483` — "List of src units cannot be empty" and the two-list `DT_CHECK`.
+        let occupied = OccupiedCorelets::of(src_units_corelet0, src_units_corelet1)?;
+        let mode = op.mode();
+
+        match self {
+            L0LxSrc::L0(src_half) => {
+                // `:493-497` — "Unsuported sync operation for L0".
+                if op.deferred() {
+                    return None;
+                }
+                let mut peers = Vec::new();
+                for dst in dst_unit_group {
+                    // `:507-512` — "Unknown lowering of the L0 sync operation", which an L3 or LX
+                    // destination takes too: neither is the other L0 half.
+                    let L0LxSyncDst::L0(dst_half, _) = dst else {
+                        return None;
+                    };
+                    if *dst_half == src_half {
+                        return None;
+                    }
+                    // `:516-522`.
+                    push_back_the_unit_to_list_if_doesnot_exist(l0_consumer(*dst_half), &mut peers);
+                }
+                // `:524-531` — ⭐ ONE sync for the whole group, carrying the implicit-sync boundary.
+                Some(L0LxLowering::One(sync(mode, peers, op.tile_size(), dbg_name)))
+            }
+            L0LxSrc::Lx(_) => {
+                // `:539-544` — the `DT_CHECK_MSG` then "Unsuported sync operation for LX".
+                if op.tile_size().is_some() || op.deferred() {
+                    return None;
+                }
+                let mut for_corelet0 = Vec::new();
+                let mut for_corelet1 = Vec::new();
+                let mut for_l3 = Vec::new();
+                for dst in dst_unit_group {
+                    match dst {
+                        // `:561-583` — each LX destination joins BOTH lists, local on its own
+                        // corelet's and neighbour on the other's.
+                        L0LxSyncDst::Lx(half, corelet) => {
+                            let local = lx_consumer(*half, false);
+                            let neighbour = lx_consumer(*half, true);
+                            let (in_corelet0, in_corelet1) = if corelet.get() == 0 {
+                                (local, neighbour)
+                            } else {
+                                (neighbour, local)
+                            };
+                            push_back_the_unit_to_list_if_doesnot_exist(
+                                in_corelet0,
+                                &mut for_corelet0,
+                            );
+                            push_back_the_unit_to_list_if_doesnot_exist(
+                                in_corelet1,
+                                &mut for_corelet1,
+                            );
+                        }
+                        // `:584-587`.
+                        L0LxSyncDst::L3(half) => push_back_the_unit_to_list_if_doesnot_exist(
+                            l3_consumer(*half),
+                            &mut for_l3,
+                        ),
+                        // `:588-590` — "Unknown lowering of the LX sync operation".
+                        L0LxSyncDst::L0(..) => return None,
+                    }
+                }
+                match occupied {
+                    // `:593-607` and `:608-624` — one corelet's list, then the L3 destinations, in
+                    // that order.
+                    OccupiedCorelets::Corelet0 | OccupiedCorelets::Corelet1 => {
+                        let mut peers = if occupied.holds_corelet_0() {
+                            for_corelet0
+                        } else {
+                            for_corelet1
+                        };
+                        peers.extend(for_l3);
+                        Some(L0LxLowering::One(sync(mode, peers, None, dbg_name)))
+                    }
+                    // `:625-655` — two regions plus one outer sync for the L3 destinations, which
+                    // stay OUTSIDE the uniformization because they are the same unit from both
+                    // corelets.
+                    OccupiedCorelets::Both => {
+                        let regions = create_uniform_regions_with_two_regions_no_result(
+                            src_units_corelet0,
+                            src_units_corelet1,
+                            values,
+                        );
+                        Some(L0LxLowering::TwoRegions {
+                            regions,
+                            region0: sync(mode, for_corelet0, None, dbg_name.clone()),
+                            region1: sync(mode, for_corelet1, None, dbg_name.clone()),
+                            l3: (!for_l3.is_empty())
+                                .then(|| sync(mode, for_l3, None, dbg_name)),
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e273_lowerL0LXSyncOperationForAUnit
-// crustify:todo: e274_lowerL0LXSyncOperationForAGroupOfUnits
 // crustify:todo: e300_lowerSyncForAUnit
 // crustify:todo: e301_lowerSyncForAGroup
 // crustify:todo: e302_lowerSyncLXL3ToLXL3

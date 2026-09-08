@@ -1058,7 +1058,8 @@ second site above, not the path.
 
 ⛔ **AND THE TICK COUNT UNDERSTATES THE LANDED PORTS BY 18.** Measured after the 230-253 review landed:
 257 `[x]` PORT and 257 `[x]` AUDIT boxes, 127 unticked each (257 + 127 = 384), which is what the
-Progress counter now reads. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
+Progress counter read then — it now reads 273/273, with 273-280 and 281-288 ticked by their own
+porting batches. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
 still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exactly that state and
 `801187bde` and `edfa7b2bb`'s review passes ticked them; `2c70786a4`'s review of 167-190 did not, so its
 span is still open on paper while its Rust is landed. Ticking them is the reviewing pass's job for those
@@ -1115,7 +1116,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`265/384 ported; 265/384 audited`
+`273/384 ported; 273/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -2765,22 +2766,22 @@ generation.
 - [ ] **AUDIT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, line by line against the C++
 - [ ] **PORT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, 13 lines
 - [ ] **AUDIT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, line by line against the C++
-- [ ] **PORT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, 180 lines
-- [ ] **AUDIT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, line by line against the C++
-- [ ] **PORT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, 222 lines
-- [ ] **AUDIT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, line by line against the C++
-- [ ] **PORT 275/384** `LowerSymbolQueryMap` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40`, 68 lines
-- [ ] **AUDIT 275/384** `LowerSymbolQueryMap` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40`, line by line against the C++
-- [ ] **PORT 276/384** `setReuseInformation` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17`, 44 lines
-- [ ] **AUDIT 276/384** `setReuseInformation` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17`, line by line against the C++
-- [ ] **PORT 277/384** `getGCVTorFCVTTypeFromIndicesAndCastInputs` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188`, 108 lines
-- [ ] **AUDIT 277/384** `getGCVTorFCVTTypeFromIndicesAndCastInputs` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188`, line by line against the C++
-- [ ] **PORT 278/384** `getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311`, 36 lines
-- [ ] **AUDIT 278/384** `getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311`, line by line against the C++
-- [ ] **PORT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, 110 lines
-- [ ] **AUDIT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, line by line against the C++
-- [ ] **PORT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, 7 lines
-- [ ] **AUDIT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, line by line against the C++
+- [x] **PORT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, 180 lines
+- [x] **AUDIT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, line by line against the C++
+- [x] **PORT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, 222 lines
+- [x] **AUDIT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, line by line against the C++
+- [x] **PORT 275/384** `LowerSymbolQueryMap` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40`, 68 lines
+- [x] **AUDIT 275/384** `LowerSymbolQueryMap` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40`, line by line against the C++
+- [x] **PORT 276/384** `setReuseInformation` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17`, 44 lines
+- [x] **AUDIT 276/384** `setReuseInformation` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17`, line by line against the C++
+- [x] **PORT 277/384** `getGCVTorFCVTTypeFromIndicesAndCastInputs` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188`, 108 lines
+- [x] **AUDIT 277/384** `getGCVTorFCVTTypeFromIndicesAndCastInputs` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188`, line by line against the C++
+- [x] **PORT 278/384** `getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311`, 36 lines
+- [x] **AUDIT 278/384** `getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311`, line by line against the C++
+- [x] **PORT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, 110 lines
+- [x] **AUDIT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, line by line against the C++
+- [x] **PORT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, 7 lines
+- [x] **AUDIT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, line by line against the C++
 - [x] **PORT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, 2 lines
 - [x] **AUDIT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, line by line against the C++
 - [x] **PORT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, 4 lines

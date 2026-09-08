@@ -72,6 +72,9 @@ use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::units::DfirUnit;
 use super::vc_operand_reuse::OperandReuse;
 use super::vc_vector_chain_helper::redefine_constant_vectors;
+use super::vc_vector_operands::{
+    OpId, VectorOperand, erase_op_recording, erase_operands_recording, remove_at,
+};
 
 /// ONE OF THE SIXTEEN COMPUTE LOWERING PATTERNS `fuseComputeOps` INSTALLS —
 /// `compute_ops_patterns.insert<…>` (`VectorChainToSentientPESFP.cpp:1246-1254`).
@@ -540,13 +543,52 @@ pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Va
     }
 }
 
+/// Replaces: e280_cleanup
+///
+/// **280/384** `ComputeOpPatternBase<OpTy>::cleanup` —
+/// `VectorChainToSentientPESFP.cpp:1056` (7L).
+///
+/// DELETE WHAT A LOWERED COMPUTE CONSUMED — the destination operands, then the compute itself, then
+/// the source operands, in that order.
+///
+/// ⛔ ONE `erased_list` SPANS ALL THREE PHASES (`:1059`), which is why the `_recording` overloads
+/// exist: an op reached from both the `to` and the `from` side is claimed once, not twice.
+/// ⛔ AND NOTHING IS REMOVED UNTIL THE END, DESCENDING — an [`OpId`] is a POSITION, so erasing the
+/// `to` side first would renumber the `op` and `from` positions the next two phases name.
+pub fn cleanup(
+    op: &OpId,
+    to_operands: &[Option<VectorOperand>],
+    from_operands: &[Option<VectorOperand>],
+    scope: &mut Vec<DfirOp>,
+) {
+    // `std::vector<mlir::Operation *> erased_list;`
+    let mut erased_list: Vec<OpId> = Vec::new();
+
+    // `VectorOperand::eraseOperands(op_info.to_operands_, rewriter, erased_list);`
+    erase_operands_recording(to_operands, scope, &mut erased_list);
+    // `VectorOperand::eraseOp(op, rewriter, erased_list);`
+    erase_op_recording(op, scope, &mut erased_list);
+    // `VectorOperand::eraseOperands(op_info.from_operands_, rewriter, erased_list);`
+    erase_operands_recording(from_operands, scope, &mut erased_list);
+
+    erased_list.sort_unstable();
+    erased_list.dedup();
+    for position in erased_list.iter().rev() {
+        remove_at(position.path(), scope);
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        COMPUTE_OPS_PATTERNS, ComputePattern, LEGAL_DIALECTS, Legality, Unlowered,
-        compute_ops_to_fuse, fuse_compute_ops, installed_pattern, legality, match_and_rewrite,
-        run_on_operation,
+        COMPUTE_OPS_PATTERNS, ComputePattern, LEGAL_DIALECTS, Legality, OpId, Unlowered,
+        VectorOperand, cleanup, compute_ops_to_fuse, fuse_compute_ops, installed_pattern, legality,
+        match_and_rewrite, run_on_operation,
     };
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::{
+        OperandValue, VectorOperandType,
+    };
+    use crate::islands::sentient::dialects::sentient as sen;
     use crate::arch::Target;
     use crate::bridges::dataflow_ir_to_sentient::vc_operand_reuse::OperandReuse;
     use crate::islands::dataflow_ir::Values;
@@ -733,6 +775,8 @@ mod unit_tests {
             result: Val(0),
             input: Val(1),
             variable: Vec::new(),
+            pad: Vec::new(),
+            mask: None,
             indices: vec![0, 1],
             repetition: 1,
             input_ty: V,
@@ -937,6 +981,8 @@ mod unit_tests {
             result: Val(0),
             input: Val(1),
             variable: Vec::new(),
+            pad: Vec::new(),
+            mask: None,
             indices: vec![0, 1],
             repetition: 1,
             input_ty: V,
@@ -993,12 +1039,53 @@ mod unit_tests {
         })]);
         run_on_operation(&mut program, &mut Values::default());
     }
+
+    /// 🎯⛔ 280/384 — THE WHOLE LOWERED CHAIN GOES, AND ONLY BECAUSE THE THREE PHASES SHARE ONE LIST.
+    /// The `to` send at `[3]` is claimed first, which leaves the compute at `[2]` unread, which leaves
+    /// the cast at `[1]` unread, which lets the `from` receive at `[0]` go. A phase that could still
+    /// see a claimed op's uses would stop at `[2]` and leave the source chain in the unit.
+    #[test]
+    fn the_to_side_being_claimed_first_is_what_frees_the_from_side() {
+        let (to, from) = Link::<Sfp, Lxsu>::between(Val(7), Val(8)).ends();
+        let mut scope = vec![
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(0),
+                from,
+                ty: V,
+            }),
+            DfirOp::VectorChain(vc::Op::Cast {
+                result: Val(1),
+                input: Val(0),
+                input_ty: V,
+                ty: V,
+            }),
+            DfirOp::VectorChain(vc::Op::FastExp {
+                result: Val(2),
+                input: Val(1),
+                input_ty: V,
+                ty: V,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: Val(2),
+                ty: V,
+            }),
+        ];
+        let at = |path: &[u32]| {
+            Some(VectorOperand::new(
+                VectorOperandType::Link,
+                OperandValue::Port(sen::Port::North),
+                OpId::at(path),
+            ))
+        };
+        cleanup(&OpId::at(&[2]), &[at(&[3])], &[at(&[0])], &mut scope);
+        assert_eq!(scope, Vec::new());
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e280_cleanup
 // crustify:todo: e344_lowerDanglingNonComputeOpsPESFP
 // crustify:todo: e364_patternAgnosticFuseNonComputeOpsHelper
 // crustify:todo: e365_fillOpInfo

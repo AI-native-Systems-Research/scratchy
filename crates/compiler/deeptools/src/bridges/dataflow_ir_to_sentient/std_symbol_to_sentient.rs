@@ -62,6 +62,7 @@
 
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::Val;
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::Op as SenOp;
 use crate::islands::sentient::dialects::sentient as sen;
 
@@ -168,6 +169,127 @@ fn nest(
     (op, results)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 275/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE MAPPING A `symbol.query_map` READS, IN THE TWO SHAPES `LowerSymbolQueryMap` DISTINGUISHES.
+///
+/// ⛔ THE ONE-PAIR CASE IS A DIFFERENT ANSWER, NOT A DEGENERATE CHAIN
+/// (`SymbolToSentient.cpp:50-53`), and [`QueryMapping`] cannot hold one pair — so the split is the
+/// input type rather than a size test, and `createIfOpFromMapping`'s
+/// `DT_CHECK_MSG(key_list.size() >= 2)` has no reachable input.
+#[derive(Debug, Clone, Copy)]
+pub enum SymbolMapping<'a> {
+    /// `immutable_mapping.getKeys().size() == 1` — its only value.
+    Single(Val),
+    /// Two or more pairs.
+    Chain(QueryMapping<'a>),
+}
+
+/// WHAT ONE USE OF THE `symbol.query_map` RESULT IS — the classification the replacement loop
+/// repeats (`SymbolToSentient.cpp:67-73`, `:98-103`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryMapUse {
+    /// The `bound` operand of a `sentient.for` —
+    /// `sentient_for.getBound().getDefiningOp() == query_map`.
+    LoopBound,
+    /// Every other operand of every other op, including a `sentient.for` operand that is not its
+    /// bound.
+    Other,
+}
+
+/// WHAT `LowerSymbolQueryMap` LEAVES BEHIND.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryMapLowering {
+    /// `query_map.replaceAllUsesWith(immutable_mapping.getValues().back())` — every use takes this
+    /// value and no conditional is emitted.
+    Replaced(Val),
+    /// The conditional, and the value each use is re-pointed at, one per entry of the `uses` slice
+    /// and in the same order.
+    Conditional {
+        /// `sentient::IfOp if_op = createIfOpFromMapping(query_map, num_results);`
+        if_op: sen::Op,
+        /// `owner_op->setOperand(operand_num, if_op.getResults()[..])`, per use.
+        replacements: Vec<Val>,
+    },
+}
+
+/// Replaces: e275_LowerSymbolQueryMap
+///
+/// **275/384** `SymbolToSentientLoweringPass::LowerSymbolQueryMap` —
+/// `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40` (68L).
+///
+/// THE MAPPING AS ONE `sentient.if` CHAIN, AND WHICH OF ITS RESULTS EACH USE READS.
+///
+/// ⛔ THE RESULT COUNT IS NOT THE USE COUNT: one JCR result for the loop-bound uses TOGETHER, then
+/// one LRF result for all non-loop-bound uses — except on L3, which gets one PER non-loop-bound use
+/// (`:80-84`).
+/// ⛔ `uses` IS IN MLIR USE-LIST ORDER, WHICH IS REVERSE PROGRAM ORDER, and the reference walks it
+/// backwards (`:93-95`) — so the L3 result indices ascend in PROGRAM order. `replacements` comes
+/// back aligned with `uses`, not with the walk.
+#[must_use]
+pub fn lower_symbol_query_map(
+    comp: GenericComp,
+    mapping: SymbolMapping<'_>,
+    uses: &[QueryMapUse],
+    values: &mut Values,
+) -> QueryMapLowering {
+    let chain = match mapping {
+        // `if (immutable_mapping.getKeys().size() == 1) { .. return; }`
+        SymbolMapping::Single(value) => return QueryMapLowering::Replaced(value),
+        SymbolMapping::Chain(chain) => chain,
+    };
+
+    // The use walk, which only ever asked these two questions of it.
+    let found_loop_bound_use = uses.contains(&QueryMapUse::LoopBound);
+    let num_non_loop_bound_uses = uses.iter().filter(|u| **u == QueryMapUse::Other).count();
+
+    // `is_any_of(comp, L3LU, L3SU)`.
+    let is_l3 = matches!(comp, GenericComp::L3lu | GenericComp::L3su);
+
+    // `int num_results = (found_loop_bound_use ? 1 : 0) + ((num_non_loop_bound_uses > 0) ?
+    //  (is_any_of(comp, L3LU, L3SU) ? num_non_loop_bound_uses : 1) : 0);`
+    let num_results = usize::from(found_loop_bound_use)
+        + if num_non_loop_bound_uses == 0 {
+            0
+        } else if is_l3 {
+            num_non_loop_bound_uses
+        } else {
+            1
+        };
+
+    let if_op = create_if_op_from_mapping(chain, num_results, values);
+    // `if_op.getResults()` — the values [`create_if_op_from_mapping`] minted. The `_` arm is
+    // unreachable: entry 226 builds a [`sen::Op::If`] and nothing else.
+    let results: Vec<Val> = match &if_op {
+        sen::Op::If { yielded, .. } => yielded.iter().map(|slot| slot.result).collect(),
+        _ => Vec::new(),
+    };
+
+    // `int if_op_result_num_to_use_for_replacement = (found_loop_bound_use ? 1 : 0);`
+    let mut next = usize::from(found_loop_bound_use);
+    let mut replacements: Vec<Val> = Vec::with_capacity(uses.len());
+    // `for (auto it = ..rbegin(); it != ..rend(); ++it)`.
+    for use_kind in uses.iter().rev() {
+        match use_kind {
+            // `sentient_for.setOperand(operand_num, if_op.getResults()[0]); continue;`
+            QueryMapUse::LoopBound => replacements.extend(results.first().copied()),
+            QueryMapUse::Other => {
+                replacements.extend(results.get(next).copied());
+                // `if (is_any_of(comp, L3LU, L3SU)) ++if_op_result_num_to_use_for_replacement;`
+                if is_l3 {
+                    next += 1;
+                }
+            }
+        }
+    }
+    // Back into `uses` order, the walk having run against it in reverse.
+    replacements.reverse();
+
+    QueryMapLowering::Conditional { if_op, replacements }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -241,10 +363,60 @@ mod unit_tests {
             }
         );
     }
+
+    /// 🎯 275/384 — THE VENDOR'S OWN `@multiple_uses` AND `@multiple_uses_lx_or_below`
+    /// (`dcc/test/Conversion/SymbolToSentient/symbols_query.mlir`), which differ only in `comp`.
+    ///
+    /// Four pairs, and four uses in program order: two `sentient.for` bounds and two `scalar_sub`
+    /// operands. ⛔ L3 GETS `:3` AND BOTH BOUNDS STILL SHARE `#0` — `%12#0, %12#1` then
+    /// `%12#0, %12#2`; LX gets `:2` and both subs collapse onto `#1`.
+    #[test]
+    fn the_l3_case_numbers_each_non_loop_bound_use_and_lx_reuses_one() {
+        let case = |comp: GenericComp| {
+            let mut values = Values::default();
+            let key = values.mint();
+            let pairs: Vec<(Val, Val)> = (0..4)
+                .map(|_| (values.mint(), values.mint()))
+                .collect();
+            let mapping = SymbolMapping::Chain(QueryMapping {
+                key,
+                first: pairs[0],
+                middle: &pairs[1..3],
+                last_value: pairs[3].1,
+            });
+            // Use-list order is reverse program order; program order is bound, sub, bound, sub.
+            let uses = [
+                QueryMapUse::Other,
+                QueryMapUse::LoopBound,
+                QueryMapUse::Other,
+                QueryMapUse::LoopBound,
+            ];
+            let lowered = lower_symbol_query_map(comp, mapping, &uses, &mut values);
+            let QueryMapLowering::Conditional { if_op, replacements } = lowered else {
+                unreachable!("four pairs is not the one-pair case")
+            };
+            let sen::Op::If { yielded, .. } = &if_op else {
+                unreachable!("entry 226 emits a conditional")
+            };
+            let results: Vec<Val> = yielded.iter().map(|slot| slot.result).collect();
+            // Back to program order for the comparison.
+            let mut in_program_order = replacements;
+            in_program_order.reverse();
+            (results, in_program_order)
+        };
+
+        let (l3, l3_uses) = case(GenericComp::L3su);
+        assert_eq!(l3.len(), 3);
+        assert_eq!(l3_uses, vec![l3[0], l3[1], l3[0], l3[2]]);
+
+        let (lx, lx_uses) = case(GenericComp::Lxsu);
+        assert_eq!(lx.len(), 2);
+        assert_eq!(lx_uses, vec![lx[0], lx[1], lx[0], lx[1]]);
+    }
+
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e275_LowerSymbolQueryMap
 // crustify:todo: e303_runOnOperation

@@ -703,10 +703,27 @@ pub enum Op {
         /// island could not state, and the `indices` list already carried the negative entries that
         /// refer to it (`VectorChain.td:445`, `getVariableOrPadOperand`).
         ///
-        /// ⭐ `$pad` AND `$mask` ARE NOT HERE. They are the other two variadic segments of the same
-        /// op (`VectorChain.td:460-461`), and nothing in bridge 2's 384 reads either — an operand
-        /// list added for no unit is a list every construction site has to get right for no reason.
         variable: Vec<Val>,
+        /// `$pad` — THE VALUES A NEGATIVE INDEX NAMES **AFTER** THE VARIABLES, so the first of them
+        /// is `-(variable.len() + 1)` and `-1` when there are no variables
+        /// (`VectorChain.td:487-492`, `getFirstPadIndex`).
+        ///
+        /// ⛔⛔ ADDED FOR `createSplatOperation` (entry 279), WHOSE ONLY BEHAVIOURALLY DISTINCT ARM
+        /// CANNOT FIRE WITHOUT IT. `isPadLeftFor8FirstElemSplat` compares each expanded index against
+        /// `getFirstPadIndex()` — an `int` against a `std::optional`, which C++ answers `!=` for
+        /// whenever the optional is empty (`dialect_utils/VectorChain/Utils.cpp:113-119`) — so with no
+        /// pad segment the classifier is false and `SentientSplatPad::left` is unreachable, while the
+        /// other two arms both emit `none`. ⭐ AND IT IS THE VENDOR'S OWN CASE:
+        /// `splat_const_bit.mlir:87` writes `shuffle input(%c25), pad(%c0)` and expects
+        /// `pad = #sentient<splat_pad left>` at `:22`. 24 of the authority's shuffles carry one.
+        pad: Vec<Val>,
+        /// `$mask`, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
+        /// (`VectorChain.td:463`).
+        ///
+        /// ⛔ ADDED FOR THE SAME UNIT: entry 279 reads `shuffle_op.getMask()` and, off the PT, hands
+        /// its defining op to `getMaskValueForNonPT` (entry 229) to REPLACE the splat's default mask
+        /// operand (`Splat.cpp:106-113`).
+        mask: Option<Predicate>,
         /// One index per element of the input.
         indices: Vec<i32>,
         /// How many times the pattern repeats to fill the result.
@@ -1161,6 +1178,8 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             input,
             variable,
+            pad,
+            mask,
             indices,
             repetition,
             input_ty,
@@ -1186,10 +1205,34 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                         .join(", ")
                 )
             };
-            let var_tys = ", index".repeat(variable.len());
+            // ⛔ SAME RULE FOR `pad`, AND IT PRINTS AFTER `variable` — `if (numPad > 0)` between the
+            // two segments in both halves of `ShuffleOp::print` (`VectorChain.cpp:373-382, 391-393`).
+            let pads = if pad.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", pad({})",
+                    pad.iter()
+                        .map(|val| print::val(*val))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            // ⛔ AND THE MASK IS LAST, WITH ITS OWN TYPE — `if (numMask > 0)` at `:391` and `:394`.
+            let mask_operand = match mask {
+                Some(mask) => format!(", mask({})", print::val(mask.val())),
+                None => String::new(),
+            };
+            // ⭐ EVERY VARIABLE AND EVERY PAD IS AN `index` in the authority's own cases
+            // (`splat_const_bit.mlir:87`, `VectorChain.td:449-455`); the mask carries its width.
+            let var_tys = ", index".repeat(variable.len() + pad.len());
+            let mask_ty = match mask {
+                Some(mask) => format!(", {}", print::vector(mask.ty())),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.shuffle input({}){vars} {{indices = [{indices}], repetition = {repetition} : i32}} : {}{var_tys}, {}",
+                "{} = vectorchain.shuffle input({}){vars}{pads}{mask_operand} {{indices = [{indices}], repetition = {repetition} : i32}} : {}{var_tys}{mask_ty}, {}",
                 print::val(*result),
                 print::val(*input),
                 print::vector(*input_ty),
