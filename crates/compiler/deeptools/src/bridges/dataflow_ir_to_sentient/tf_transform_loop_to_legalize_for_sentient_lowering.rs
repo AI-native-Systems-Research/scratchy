@@ -473,8 +473,14 @@ fn is_memory_op(op: &DfirOp) -> bool {
             | agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
-        // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else.
-        DfirOp::Agen(agen::Op::Yield)
+        // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else — the
+        // symbolic pair included: it is in entry 141's nineteen classes but NOT in these five, so an
+        // induction variable reaching a symbolic access does not make its loop a candidate.
+        DfirOp::Agen(
+            agen::Op::Yield
+            | agen::Op::SymbolicVectorLoad { .. }
+            | agen::Op::SymbolicVectorStore { .. },
+        )
         | DfirOp::Arith(_)
         | DfirOp::Scf(_)
         | DfirOp::Affine(_)

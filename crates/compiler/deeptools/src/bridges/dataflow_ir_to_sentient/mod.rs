@@ -392,9 +392,9 @@ fn statement<A: Arch>(
         // [`agen_agen_to_sentient::fuse_load_or_store_chain_ops`].
         // ⛔ NO PER-KIND ARM HERE. Splitting the twelve across two files is how the branch ORDER — a
         // real part of a `dyn_cast` chain — gets lost.
-        [DfirOp::Agen(op), ..] => {
+        [stmt @ DfirOp::Agen(op), ..] => {
             agen_agen_to_sentient::fuse_load_or_store_chain_ops(
-                op, unit, extract, bound, consts, out,
+                stmt, op, unit, extract, bound, consts, out,
             )
             .ops()
         }

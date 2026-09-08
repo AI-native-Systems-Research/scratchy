@@ -1557,9 +1557,15 @@ impl<'a> AccessDetailsBase<'a> {
         // `:207-218` — the users of the loaded vector.
         let users = match self.op {
             agen::Op::VectorLoad { result, .. } => uses(*result, scope),
-            agen::Op::VectorStore { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield => {
-                Vec::new()
-            }
+            // ⛔ A SYMBOLIC ACCESS HAS NO USER WALK. The gate is
+            // `isa<VectorLoadOp, IndirectVectorLoadOp, CompositeLoadOp, CompositeIndirectLoadOp>`
+            // (`:207-208`) and the symbolic pair is in none of it, so a symbolic load's users never
+            // reach the shuffle search however much its result looks like a plain load's.
+            agen::Op::SymbolicVectorLoad { .. }
+            | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::VectorStore { .. }
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::Yield => Vec::new(),
         };
         for user in users {
             match user {
@@ -1865,7 +1871,13 @@ impl<'a> AccessDetailsAffine<'a> {
                 ty,
                 ..
             } => (view, view_ty, indices, ty),
-            agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield => {
+            // ⛔ AND THE SYMBOLIC PAIR IS NOT AFFINE AT ALL — its subscript is a runtime value, so
+            // `AccessDetailsSymbolic::initialize` (`:855-897`) reads it and this `dyn_cast` chain
+            // does not.
+            agen::Op::SymbolicVectorLoad { .. }
+            | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::Yield => {
                 return AffineInitialize::UnsupportedOperation;
             }
         };

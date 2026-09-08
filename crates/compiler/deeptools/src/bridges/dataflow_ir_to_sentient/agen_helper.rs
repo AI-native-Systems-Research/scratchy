@@ -129,7 +129,7 @@ use crate::islands::dataflow_ir::link::SendEnd;
 use crate::islands::dataflow_ir::ty::{
     AffineMap, FlatConstraints, GenericComp, IntegerSet, MemRef, Vector,
 };
-use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::dataflow_ir::{ProgramUnit, ValueMapping, Values};
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
 use crate::units::DfirUnit;
 use core::num::NonZeroU32;
@@ -634,6 +634,8 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
         DfirOp::Agen(op) => match op {
             dfir_op::agen::Op::VectorLoad { .. } => Some(AgenOpKind::VectorLoad),
             dfir_op::agen::Op::VectorStore { .. } => Some(AgenOpKind::VectorStore),
+            dfir_op::agen::Op::SymbolicVectorLoad { .. } => Some(AgenOpKind::SymbolicVectorLoad),
+            dfir_op::agen::Op::SymbolicVectorStore { .. } => Some(AgenOpKind::SymbolicVectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
             // The region terminator is not a transfer.
             dfir_op::agen::Op::Yield => None,
@@ -713,7 +715,7 @@ impl AgenLoad {
 
     /// WHICH LOAD CLASS ONE STATEMENT IS, or `None` if it is not one of the five.
     ///
-    /// ⛔ THREE OF THE FIVE HAVE NO ISLAND OP YET (the indirect and symbolic families), and
+    /// ⛔ TWO OF THE FIVE HAVE NO ISLAND OP YET (the indirect family), and
     /// `agen.composite_load_and_store` is **not** `CompositeLoadOp` — the reference's `isa<>` list
     /// does not include it, so it answers `None` here too rather than borrowing the composite arm.
     #[must_use]
@@ -722,8 +724,14 @@ impl AgenLoad {
             DfirOp::Agen(dfir_op::agen::Op::VectorLoad { result, .. }) => {
                 Some(AgenLoad::Vector { result: *result })
             }
+            // ⭐ AND THE SYMBOLIC LOAD ROOTS AT ITS RESULT LIKE THE OTHER TWO VECTOR LOADS — one
+            // `isa<>` arm, one root (`Helper.cpp:1245-1247`).
+            DfirOp::Agen(dfir_op::agen::Op::SymbolicVectorLoad { result, .. }) => {
+                Some(AgenLoad::SymbolicVector { result: *result })
+            }
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
+                | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
                 | dfir_op::agen::Op::Yield,
             )
@@ -1588,6 +1596,7 @@ mod unit_tests {
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::agen_access_details::MemoryOperandIndex;
     use crate::generated::SyncSignal;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::dialects::{
         Index, affine, agen, arith, dataflow, uniform, vectorchain,
     };
@@ -3540,6 +3549,52 @@ mod unit_tests {
             ImmutableAddresses::SizeMismatch
         );
     }
+
+    /// One `dataflow.program_unit` on `comp`, holding `body`.
+    fn unit_holding(comp: DfirUnit, body: Vec<DfirOp>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(comp, VIEW),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// ⭐ 374's REACHABLE HALF IS THE STORE SEARCH, and this is the load-and-store pattern it finds:
+    /// the symbolic store is the load result's ONE use, so entry 036 answers with it and the walk
+    /// stops where entry 360 is missing.
+    #[test]
+    #[should_panic(expected = "e360_constructSymbolicDetailsAndAddrs")]
+    fn a_symbolic_load_that_feeds_a_symbolic_store_reaches_the_details_gap() {
+        let load = DfirOp::Agen(agen::Op::SymbolicVectorLoad {
+            result: Val(31),
+            view: VIEW,
+            indices: indices(Val(30)),
+            strides: vec![Val(40)],
+            multicast: None,
+            view_ty: view_ty(),
+            ty: LANES,
+        });
+        let store = DfirOp::Agen(agen::Op::SymbolicVectorStore {
+            value: Val(31),
+            view: VIEW,
+            indices: indices(Val(30)),
+            strides: vec![Val(40)],
+            view_ty: view_ty(),
+            ty: LANES,
+        });
+        let body = vec![load, store];
+        let unit = unit_holding(DfirUnit::Lxlu, body.clone());
+        lower_symbolic_vector_load_op(&body[0], &unit, DfirUnit::Lxlu, &body);
+    }
+
+    /// A lone symbolic store passes `nullptr` for the load, and stops at the same gap.
+    #[test]
+    #[should_panic(expected = "e360_constructSymbolicDetailsAndAddrs")]
+    fn a_lone_symbolic_store_reaches_the_details_gap() {
+        let unit = unit_holding(DfirUnit::Lxsu, Vec::new());
+        lower_symbolic_vector_store_op(&unit, DfirUnit::Lxsu);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -5236,4 +5291,73 @@ pub fn construct_immutable_address<T: AccessRecord>(
         }
     }
     ImmutableAddresses::Constructed
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// 374/384
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e374_lowerSymbolicVectorLoadOp
+///
+/// **374/384** `AgenToSentientLoweringPass::lowerSymbolicVectorLoadOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380` (26L). A symbolic load, and the symbolic store
+/// it feeds when it feeds one, lowered as one load-and-send pair.
+///
+/// ⭐ THE STORE IS FOUND TWICE ON PURPOSE (`:3384`, then `:3397-3402`): entry 360 may CLONE the ops it
+/// gathers, so the second read takes the store out of `kDirDst` rather than trusting the first.
+/// ⛔ `has(kDirDst)` IS THE PATTERN TEST AFTER THE FACT — a load with no store reaches
+/// `lowerVectorLoadHelper` with a null `store_op`, which is the plain-load half of that helper.
+/// ⛔ THE RETURN TYPE IS `!` BECAUSE NO OUTCOME EXISTS YET. `LogicalResult` has no counterpart here
+/// (the crate forbids `Result`) and the statement count its caller advances by cannot be answered
+/// before entry 360 says whether the store came with it. It becomes a real type with 360.
+pub fn lower_symbolic_vector_load_op<A: Arch>(
+    op: &DfirOp,
+    unit: &ProgramUnit<A>,
+    comp: DfirUnit,
+    scope: &[DfirOp],
+) -> ! {
+    // `:3383-3384` — entry 036 at its `SymbolicVectorStoreOp` instantiation.
+    let store_op = store_op_from_load_store_pattern(AgenOpKind::SymbolicVectorStore, op, scope);
+
+    // `:3386-3393` — `constructSymbolicDetailsAndAddrs` fills all three containers, and every line
+    // below reads one of them: `:3395` takes the candidate out of `kDirSrc`, `:3399` asks
+    // `has(kDirDst)`, and `:3405-3407` hands all three to entry 217.
+    todo!(
+        "e360_constructSymbolicDetailsAndAddrs is unported, so e217_lowerVectorLoadHelper cannot \
+         lower the agen.symbolic_vector_load on {:?} of {:?} (store {:?})",
+        comp,
+        unit.on.kind(),
+        store_op
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// 375/384
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e375_lowerSymbolicVectorStoreOp
+///
+/// **375/384** `AgenToSentientLoweringPass::lowerSymbolicVectorStoreOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410` (30L). A symbolic store on its own, lowered to
+/// one `sentient.receive_and_store`.
+///
+/// ⛔ IT PASSES `nullptr` FOR THE STORE (`:3415`), which is what makes entry 360 gather ONE record —
+/// hence `DT_CHECK(size == 1)` on all three containers (`:3418-3419`) and the `[0]` indexing at
+/// `:3427-3428`.
+/// ⛔ THE ELEMENT TYPE COMES FROM THE **MEMREF**, not from the stored vector (`:3424`), unlike
+/// `AccessDetailsSymbolic::initialize`, which takes the WIDTH from the value (`:874-878`).
+/// ⛔ AND THE DELETE LIST GETS TWO THINGS: the store itself (`:3434`) and, through entry 270, the op
+/// that produced the value it stored (`:3436-3437`).
+/// ⛔ `!` FOR THE SAME REASON AS ENTRY 374 — see its note.
+pub fn lower_symbolic_vector_store_op<A: Arch>(unit: &ProgramUnit<A>, comp: DfirUnit) -> ! {
+    // `:3413-3417` — `constructSymbolicDetailsAndAddrs(op, nullptr, ...)`. The single record it
+    // gathers is the only route to `access_details[0]`, `mutable_addrs[0]` and `immutable_addrs[0]`,
+    // which are exactly the three arguments entry 028 needs at `:3425-3429`.
+    todo!(
+        "e360_constructSymbolicDetailsAndAddrs is unported, so e028_constructReceiveAndStoreStmt \
+         cannot lower the agen.symbolic_vector_store on {:?} of {:?} (e270_addStoreInputToDeleteList \
+         is unported too)",
+        comp,
+        unit.on.kind()
+    );
 }

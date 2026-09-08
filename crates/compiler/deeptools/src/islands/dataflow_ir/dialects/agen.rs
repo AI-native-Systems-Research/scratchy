@@ -1,6 +1,9 @@
 //! `Agen.td` — THE ADDRESS GENERATOR'S ACCESSES AND COMPOSITE TRANSFERS.
 //!
-//! The dialect declares fifteen operations; the four here are the ones an emitted program contains.
+//! The dialect declares fifteen operations. Four of the six here are the ones an emitted program
+//! contains; the two symbolic accesses are the input of the `AgenToSentient` lowerings that this
+//! crate ports (entries 374 and 375), which is why they are spelled even though our own producer
+//! emits the affine pair — see [`Op::SymbolicVectorLoad`].
 
 use std::fmt::Write as _;
 
@@ -121,6 +124,60 @@ pub enum Op {
         /// The vector's type.
         ty: Vector,
     },
+    /// `agen.symbolic_vector_load %view[indices:(..), strides:(..)] {load_order, load_set} :
+    /// memref<..>, vector<..>`.
+    ///
+    /// ⭐⭐ THE ADDRESS IS A RUNTIME VALUE, WHICH IS THE WHOLE DIFFERENCE. A plain
+    /// [`Op::VectorLoad`] carries an affine subscript the lowering folds into a constant offset; this
+    /// one carries a subscript AND A STRIDE PER DIMENSION, both `Value`s, so the offset is
+    /// accumulated at run time — `sentient.load_and_send mutable_addr(%acc)` with an `arith.addi` of
+    /// the stride per iteration (`dcc/test/Conversion/AgenToSentient/symbolic_vector_load_store.mlir:47-49`).
+    ///
+    /// ⛔ `num_indices` AND `num_strides` ARE NOT FIELDS. The reference packs subscript, strides and
+    /// the optional multicast handle into one `Variadic<Index>:$operands1` and stores the two counts
+    /// as `I32Attr`s so `getIndices()`/`getStrides()` can slice it
+    /// (`Agen.td:1128-1130`, `:1155-1172`). Three typed fields say the same thing and cannot
+    /// disagree with the counts.
+    SymbolicVectorLoad {
+        /// The vector it binds.
+        result: Val,
+        /// The view read.
+        view: Val,
+        /// `getIndices()` — `operands1.slice(0, num_indices)`.
+        indices: Vec<Index>,
+        /// `getStrides()` — `operands1.slice(num_indices, num_strides)`, one per subscript, and
+        /// values rather than constants: that is what makes this access symbolic.
+        strides: Vec<Val>,
+        /// `getMulticastInfo()` — the one trailing operand, when there is one
+        /// (`Agen.td:1163-1172`: one or none, and anything else is `llvm_unreachable`).
+        multicast: Option<Val>,
+        /// The view's type.
+        view_ty: MemRef,
+        /// The vector's type.
+        ty: Vector,
+    },
+
+    /// `agen.symbolic_vector_store %value, %view[indices:(..), strides:(..)] {store_order,
+    /// store_set} : memref<..>, vector<..>`
+    /// (`dcc/test/Conversion/AgenToSentient/symbolic_vector_load_store.mlir:302`).
+    ///
+    /// See [`Op::SymbolicVectorLoad`] for why the strides are operands. ⛔ AND IT HAS NO MULTICAST
+    /// HANDLE — `Agen.td:1194-1225` declares `getIndices`/`getStrides` and no `getMulticastInfo`,
+    /// because a store has one destination.
+    SymbolicVectorStore {
+        /// The vector stored — `$value_to_store`, operand 0.
+        value: Val,
+        /// The view written — `$memref`, operand 1.
+        view: Val,
+        /// `getIndices()`.
+        indices: Vec<Index>,
+        /// `getStrides()`.
+        strides: Vec<Val>,
+        /// The view's type.
+        view_ty: MemRef,
+        /// The vector's type.
+        ty: Vector,
+    },
 }
 
 /// ONE `agen` OP AS TEXT. The caller has already indented the opening line.
@@ -231,7 +288,64 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::vector(*ty)
             );
         }
+        Op::SymbolicVectorLoad {
+            result,
+            view,
+            indices,
+            strides,
+            multicast,
+            view_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = agen.symbolic_vector_load {}[indices:({}), strides:({})]{} {{load_order = {}, \
+                 load_set = {}}} : {}, {}",
+                print::val(*result),
+                print::val(*view),
+                print::index_list(indices),
+                val_list(strides),
+                multicast.map_or(String::new(), |group| format!(
+                    ", multicast_info({})",
+                    print::val(group)
+                )),
+                print::affine_map(&access_order(view_ty.shape.len())),
+                print::integer_set(&access_set(view_ty, ty.len)),
+                print::memref(view_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::SymbolicVectorStore {
+            value,
+            view,
+            indices,
+            strides,
+            view_ty,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "agen.symbolic_vector_store {}, {}[indices:({}), strides:({})] {{store_order = {}, \
+                 store_set = {}}} : {}, {}",
+                print::val(*value),
+                print::val(*view),
+                print::index_list(indices),
+                val_list(strides),
+                print::affine_map(&access_order(view_ty.shape.len())),
+                print::integer_set(&access_set(view_ty, ty.len)),
+                print::memref(view_ty),
+                print::vector(*ty)
+            );
+        }
     }
+}
+
+/// `%a, %b` — a symbolic access's strides, which are plain values rather than affine subscripts.
+fn val_list(vals: &[Val]) -> String {
+    vals.iter()
+        .map(|val| print::val(*val))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `affine_map<(d0, .., dn) -> (d0, .., dn)>` — the `load_order`/`store_order` of a vector access.
@@ -375,6 +489,70 @@ time_set = affine_set<(d0) : (d0 == 0)>}
 
         for (at, (want_line, got_line)) in want.lines().zip(got.lines()).enumerate() {
             assert_eq!(want_line, got_line, "transfer line {at} diverges");
+        }
+        assert_eq!(want.lines().count(), got.lines().count());
+    }
+
+    /// ⭐⭐ THE VENDOR'S OWN SYMBOLIC PAIR, from the input module of
+    /// `dcc/test/Conversion/AgenToSentient/symbolic_vector_load_store.mlir:224` and `:302`.
+    ///
+    /// ⛔ TWO INDICES OVER A ONE-DIMENSIONAL MEMREF, and the order/set are still over `d0` alone
+    /// (`:184-185`): the subscript count is the loop nest's, the map's arity is the view's.
+    /// ⛔ AND THE ATTRIBUTES ARE INLINED rather than aliased, for the reason the transfer test above
+    /// records.
+    #[test]
+    fn prints_the_vendors_symbolic_access_pair() {
+        use crate::islands::dataflow_ir::ty::{ElemType, MemRef, Vector};
+
+        let view_ty = MemRef {
+            shape: vec![128],
+            elem: ElemType::Int(8),
+        };
+        let ty = Vector {
+            len: 128,
+            elem: ElemType::Int(8),
+        };
+        let indices = vec![Index::Val(Val(6)), Index::Val(Val(5))];
+        let strides = vec![Val(64), Val(1)];
+
+        let mut got = String::new();
+        emit(
+            &mut got,
+            &dialects::Op::Agen(Op::SymbolicVectorLoad {
+                result: Val(30),
+                view: Val(20),
+                indices: indices.clone(),
+                strides: strides.clone(),
+                multicast: None,
+                view_ty: view_ty.clone(),
+                ty,
+            }),
+            0,
+        );
+        emit(
+            &mut got,
+            &dialects::Op::Agen(Op::SymbolicVectorStore {
+                value: Val(30),
+                view: Val(22),
+                indices,
+                strides,
+                view_ty,
+                ty,
+            }),
+            0,
+        );
+
+        let want = "\
+%30 = agen.symbolic_vector_load %20[indices:(%6, %5), strides:(%64, %1)] \
+{load_order = affine_map<(d0) -> (d0)>, \
+load_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>} : memref<128xi8>, vector<128xi8>
+agen.symbolic_vector_store %30, %22[indices:(%6, %5), strides:(%64, %1)] \
+{store_order = affine_map<(d0) -> (d0)>, \
+store_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>} : memref<128xi8>, vector<128xi8>
+";
+
+        for (at, (want_line, got_line)) in want.lines().zip(got.lines()).enumerate() {
+            assert_eq!(want_line, got_line, "symbolic access line {at} diverges");
         }
         assert_eq!(want.lines().count(), got.lines().count());
     }

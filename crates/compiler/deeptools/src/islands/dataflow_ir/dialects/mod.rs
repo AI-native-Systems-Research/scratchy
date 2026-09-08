@@ -272,6 +272,33 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend([*value, *view]);
                 index_operands(indices, &mut reads);
             }
+            // ⛔ THE STRIDES AND THE MULTICAST HANDLE ARE OPERANDS TOO — `operands1` holds the
+            // subscript, then the strides, then at most one multicast group (`Agen.td:1128-1130`),
+            // and a use-chain walk that missed them would treat a symbolic access as reading
+            // nothing but its view.
+            agen::Op::SymbolicVectorLoad {
+                view,
+                indices,
+                strides,
+                multicast,
+                ..
+            } => {
+                reads.push(*view);
+                index_operands(indices, &mut reads);
+                reads.extend(strides.iter().copied());
+                reads.extend(*multicast);
+            }
+            agen::Op::SymbolicVectorStore {
+                value,
+                view,
+                indices,
+                strides,
+                ..
+            } => {
+                reads.extend([*value, *view]);
+                index_operands(indices, &mut reads);
+                reads.extend(strides.iter().copied());
+            }
             // ⛔ `load_iv` IS THE REGION'S ARGUMENT, not an operand — see [`block_args`].
             agen::Op::CompositeLoadAndStore(transfer) => {
                 reads.push(transfer.src);
@@ -445,10 +472,13 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::Opaque(_) => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. } => vec![*result],
-            agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
-                Vec::new()
+            agen::Op::VectorLoad { result, .. } | agen::Op::SymbolicVectorLoad { result, .. } => {
+                vec![*result]
             }
+            agen::Op::VectorStore { .. }
+            | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::Yield
+            | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::Estimate { result, .. }
@@ -613,6 +643,29 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 places.extend([value, view]);
                 index_operands_mut(indices, &mut places);
             }
+            agen::Op::SymbolicVectorLoad {
+                view,
+                indices,
+                strides,
+                multicast,
+                ..
+            } => {
+                places.push(view);
+                index_operands_mut(indices, &mut places);
+                places.extend(strides.iter_mut());
+                places.extend(multicast.as_mut());
+            }
+            agen::Op::SymbolicVectorStore {
+                value,
+                view,
+                indices,
+                strides,
+                ..
+            } => {
+                places.extend([value, view]);
+                index_operands_mut(indices, &mut places);
+                places.extend(strides.iter_mut());
+            }
             agen::Op::CompositeLoadAndStore(transfer) => {
                 places.push(&mut transfer.src);
                 index_operands_mut(&mut transfer.src_indices, &mut places);
@@ -762,10 +815,13 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::Opaque { .. } => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. } => vec![result],
-            agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
-                Vec::new()
+            agen::Op::VectorLoad { result, .. } | agen::Op::SymbolicVectorLoad { result, .. } => {
+                vec![result]
             }
+            agen::Op::VectorStore { .. }
+            | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::Yield
+            | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::CreateAffineMaskSet { result, .. } => vec![result],
@@ -1311,6 +1367,31 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 operands.extend([value, view]);
                 index_operands_mut(indices, &mut operands);
             }
+            agen::Op::SymbolicVectorLoad {
+                result,
+                view,
+                indices,
+                strides,
+                multicast,
+                ..
+            } => {
+                operands.push(view);
+                index_operands_mut(indices, &mut operands);
+                operands.extend(strides.iter_mut());
+                operands.extend(multicast.as_mut());
+                results.push(result);
+            }
+            agen::Op::SymbolicVectorStore {
+                value,
+                view,
+                indices,
+                strides,
+                ..
+            } => {
+                operands.extend([value, view]);
+                index_operands_mut(indices, &mut operands);
+                operands.extend(strides.iter_mut());
+            }
             agen::Op::CompositeLoadAndStore(transfer) => {
                 let transfer = transfer.as_mut();
                 operands.push(&mut transfer.src);
@@ -1836,6 +1917,32 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, value));
                 vals.push((Role::Operand, view));
                 index_vals_mut(indices, &mut vals);
+            }
+            agen::Op::SymbolicVectorLoad {
+                result,
+                view,
+                indices,
+                strides,
+                multicast,
+                ..
+            } => {
+                vals.push((Role::Operand, view));
+                index_vals_mut(indices, &mut vals);
+                vals.extend(strides.iter_mut().map(|val| (Role::Operand, val)));
+                vals.extend(multicast.as_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
+            }
+            agen::Op::SymbolicVectorStore {
+                value,
+                view,
+                indices,
+                strides,
+                ..
+            } => {
+                vals.push((Role::Operand, value));
+                vals.push((Role::Operand, view));
+                index_vals_mut(indices, &mut vals);
+                vals.extend(strides.iter_mut().map(|val| (Role::Operand, val)));
             }
             agen::Op::CompositeLoadAndStore(transfer) => {
                 let transfer = transfer.as_mut();

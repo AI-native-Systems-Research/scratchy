@@ -67,9 +67,11 @@
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, regions};
-use crate::islands::dataflow_ir::{self as dfir};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, dataflow, defining_op, regions};
+use crate::islands::dataflow_ir::{self as dfir, Values};
+use crate::units::DfirUnit;
 use super::vc_operand_reuse::OperandReuse;
+use super::vc_vector_chain_helper::redefine_constant_vectors;
 
 /// ONE OF THE SIXTEEN COMPUTE LOWERING PATTERNS `fuseComputeOps` INSTALLS —
 /// `compute_ops_patterns.insert<…>` (`VectorChainToSentientPESFP.cpp:1246-1254`).
@@ -455,22 +457,107 @@ pub fn fuse_compute_ops<A: Arch>(unit: &dfir::ProgramUnit<A>, reuse_info: &Opera
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 377/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 
+/// Replaces: e377_matchAndRewrite
+///
+/// `SendOpLowering::matchAndRewrite` (`VectorChainToSentientPESFP.cpp:44`) — the non-compute fusion
+/// pattern for a `dataflow.send`: read the operand that PRODUCES the sent vector, then hand the send
+/// and that operand to the pattern-agnostic fusion helper.
+///
+/// ⛔ THE OPERAND IS THE SEND'S PRODUCER, NOT THE SEND (`:48-50`): `getSendData().getDefiningOp()`.
+/// Passing the send itself would classify the wrong op — `patternAgnosticFuseNonComputeOpsHelper`
+/// fuses only when `from` is a `dataflow.receive`, a `vector.load`, an `agen.vector_load` or an
+/// `arith.constant` (`:100-102`), and a send is none of them.
+/// ⛔ `is_precision_converted_global` IS BY VALUE (`:98`), so the helper's copy is what the helper
+/// reads; nothing here observes a write back, and the local it was copied from (`:47`, set by entry
+/// 304) is never read again.
+/// ⛔ IT EMITS NOTHING ITSELF — both of its statements are calls, and the rewrite is entry 364's.
+pub fn match_and_rewrite<A: Arch>(
+    send: &dataflow::Op,
+    unit: &dfir::ProgramUnit<A>,
+    comp: DfirUnit,
+) {
+    // `:48-50` — `send_op.getSendData().getDefiningOp()`.
+    let dataflow::Op::Send { data, .. } = send else {
+        return;
+    };
+    let from = defining_op(*data, &unit.body);
+
+    // `:53-55` — `patternAgnosticFuseNonComputeOpsHelper`, whose first act is to ask entry 304 what
+    // the producer is at which precision.
+    todo!(
+        "e304_getOperandWithPrecision is unported, so e364_patternAgnosticFuseNonComputeOpsHelper \
+         cannot fuse the dataflow.send of {:?} on {:?} (producer {:?})",
+        data,
+        comp,
+        from
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 378/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e378_runOnOperation
+///
+/// `VectorChainToSentientPESFPLoweringPass::runOnOperation` (`VectorChainToSentientPESFP.cpp:1374`)
+/// — for every PE or SFP unit, and in the order the reference calls *"Order of these operations is
+/// important!"* (`:1387`): redefine the module's constant vectors, build the reuse analysis, reset
+/// any existing sentient FMAs, fuse the non-compute ops, fuse the compute ops, then lower the
+/// dangling non-compute ops and validate.
+///
+/// ⛔ `redefineConstantVectors(module_op)` TAKES THE WHOLE MODULE AND SITS INSIDE THE WALK (`:1385`)
+/// — it is redone once per PE/SFP unit, not once per pass, and it is the ONE step here that is ported.
+/// ⛔ THE GATE IS THE FIRST UNIT HANDLE'S TYPE (`:1379-1383`), and a unit that is neither PE nor SFP
+/// is left untouched by this pass — the PT pass (entry 379) is the one that claims it.
+/// ⛔ THE REUSE ANALYSIS IS SHARED BY ALL FOUR STEPS BELOW IT, so an `OperandReuse::default()` here
+/// would hand the fusions an empty reuse map: every operand would look unreused and the lowering
+/// would allocate a fresh register for values the reference reuses.
+pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Values) {
+    // `:1378` — the walk's order over the module's units. Read first because the steps below take the
+    // whole module.
+    let comps: Vec<DfirUnit> = program.units.iter().map(|unit| unit.on.kind()).collect();
+    for comp in comps {
+        // `:1383` — `is_any_of(unit_comp, PE, SFP)`.
+        if !matches!(comp, DfirUnit::Pe | DfirUnit::Sfp) {
+            continue;
+        }
+
+        // `:1385` — entry 067.
+        redefine_constant_vectors(program, values);
+
+        // `:1388` — `OperandReuse reuse_info(unit_op)`, which is what `:1389`, `:1391`, `:1393` and
+        // `:1396`-`:1398` all read.
+        todo!(
+            "e227_OperandReuse is unported, so e066_resetSentientFMAsIfExists, \
+             e366_fuseNonComputeOps, e076_fuseComputeOps, e344_lowerDanglingNonComputeOpsPESFP and \
+             e228_validateLoweringAndSetMissingParameters cannot run on the {:?} unit",
+            comp
+        );
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         COMPUTE_OPS_PATTERNS, ComputePattern, LEGAL_DIALECTS, Legality, Unlowered,
-        compute_ops_to_fuse, fuse_compute_ops, installed_pattern, legality,
+        compute_ops_to_fuse, fuse_compute_ops, installed_pattern, legality, match_and_rewrite,
+        run_on_operation,
     };
     use crate::arch::Target;
     use crate::bridges::dataflow_ir_to_sentient::vc_operand_reuse::OperandReuse;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::dialects::dataflow;
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
+    use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, AffineMap, ElemType, IntegerSet, Vector,
     };
-    use crate::islands::dataflow_ir::{ProgramUnit, Units};
+    use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units};
     use crate::units::DfirUnit;
 
     /// The vector every op in these fixtures is typed at.
@@ -486,6 +573,23 @@ mod unit_tests {
             on: Units::one(DfirUnit::Sfp, Val(0)),
             precision: None,
             body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// One program holding one SFP unit — what this pass walks.
+    fn program_of(body: Vec<DfirOp>) -> dfir::Program<Target> {
+        use crate::generated::OpFunc;
+        use crate::islands::dataflow_ir::{Grid, GroupId, OpIndex, ProgramName, ProgramUnits};
+        dfir::Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble: Vec::new(),
+            units: ProgramUnits::of(unit_holding(body), Vec::new()),
             arch: core::marker::PhantomData,
         }
     }
@@ -848,5 +952,42 @@ mod unit_tests {
     #[should_panic(expected = "BinaryOpLowering")]
     fn a_binary_reaches_the_unported_lowering() {
         fuse_compute_ops(&unit_holding(vec![binary()]), &OperandReuse::default());
+    }
+
+    /// 🎯 377/384 — THE PATTERN READS THE SEND'S PRODUCER. The unit holds a `dataflow.receive`
+    /// binding the value the send spends, so the producer this reaches is that receive — one of the
+    /// four ops `patternAgnosticFuseNonComputeOpsHelper` fuses (`:100-102`) — and the panic proves
+    /// the fusion was attempted rather than the send silently left in the IR.
+    #[test]
+    #[should_panic(expected = "e304_getOperandWithPrecision")]
+    fn a_send_reaches_the_fusion_helper_with_its_producer() {
+        let (to, from) = Link::<Sfp, Lxsu>::between(Val(2), Val(3)).ends();
+        let unit = unit_holding(vec![
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(5),
+                from,
+                ty: V,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: Val(5),
+                ty: V,
+            }),
+        ]);
+        let DfirOp::Dataflow(send) = &unit.body[1] else {
+            unreachable!()
+        };
+        match_and_rewrite(send, &unit, DfirUnit::Sfp);
+    }
+
+    /// 🎯 378/384 — THE PASS CLAIMS THE SFP AND STOPS AT THE SHARED REUSE ANALYSIS. `redefine_constant_vectors`
+    /// (entry 067) runs first, inside the walk, before anything asks for the reuse map (`:1385`-`:1388`).
+    #[test]
+    #[should_panic(expected = "e227_OperandReuse")]
+    fn a_pe_or_sfp_unit_is_claimed_by_this_pass() {
+        let mut program = program_of(vec![DfirOp::Affine(affine::Op::Yield {
+            operands: Vec::new(),
+        })]);
+        run_on_operation(&mut program, &mut Values::default());
     }
 }

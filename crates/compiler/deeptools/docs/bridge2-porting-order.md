@@ -732,7 +732,7 @@ than the 8-parameter `e028`, on `e358`'s optional `extract_op` test (`:2006`) ag
 
 ## Progress
 
-`200/384 ported; 200/384 audited`
+`208/384 ported; 208/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -1613,6 +1613,27 @@ access details, `generateAffineAddressManipulationStmts`' own `DT_CHECK` holds t
 loops (`Helper.cpp:698`, `:771`) run zero times and it returns `success()`. Every other input reaches
 statements this port does not have, and no stand-in op is substituted for them.
 
+⭐ LEVEL 8, ENTRIES 374-381. Every one of the eight sits on an unported callee, so each is the
+faithful control flow plus every reachable ported callee, stopping at a `todo!` that names the first
+gap: 374 reaches entry 036's store search then `e360_constructSymbolicDetailsAndAddrs`; 375 goes
+straight to 360; 376 lowers the four `arith` kinds it has and names `e339`/`e362`/`e363`; 377 finds
+the send's producer then names `e304`; 378 runs entry 067 per PE/SFP unit then names `e227`; 379 runs
+067 ONCE for the module (`:983`, OUTSIDE the walk — unlike 378's, which is inside it) then names
+`e367`; 380 walks the sibling groups to the first candidate pair and names `e370`; 381 loops the root
+children and names `parseConditional`. 374 and 375 return `!`: no outcome type exists before 360.
+
+⛔ THE ISLAND GREW TWO OPS FOR 374/375. `agen.symbolic_vector_load` and `agen.symbolic_vector_store`
+(`Agen.td:1119-1229`) had no island variant, which would have made both entries inputless — the
+brief's rule is to add the op, not to declare the function unneeded. They carry their strides as
+operands and the load carries a one-or-none multicast handle (`Agen.td:1163-1172`), and every total
+match over `agen::Op` now answers for them: `is_data_transfer` says TRUE (they are two of the
+nineteen `isa<>` classes), `AgenLoad::of` roots the load at its result (`Helper.cpp:1245-1247`),
+`getVectorType` says None (no `SymbolicVector*Op` appears in `Utils.cpp` at all),
+`constructChunkAndShuffleInfo` walks no users (its gate is the four non-symbolic loads, `:207-208`)
+and `AccessDetailsAffine::initialize` refuses them (a symbolic subscript is a runtime value, which is
+what `AccessDetailsSymbolic::initialize` at `:855-897` exists for). Entry 382's dispatch grew rows 11
+and 12, and took the enclosing statement as a parameter so entry 036 can ask about the operation.
+
 ⛔ NINE OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES AND `agen.composite_memory_interleave` HAVE
 NO ISLAND OP. 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
 `sentient.receive_and_store` whose only readable state is the mark) and 211 a `MemoryInterleave` (the
@@ -2395,22 +2416,22 @@ the maximum and is never checked, so `l3BurstSize` itself is legal and 0 is not.
 
 ## Level 8
 
-- [ ] **PORT 374/384** `lowerSymbolicVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380`, 26 lines
-- [ ] **AUDIT 374/384** `lowerSymbolicVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380`, line by line against the C++
-- [ ] **PORT 375/384** `lowerSymbolicVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410`, 30 lines
-- [ ] **AUDIT 375/384** `lowerSymbolicVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410`, line by line against the C++
-- [ ] **PORT 376/384** `runOnOperation` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439`, 34 lines
-- [ ] **AUDIT 376/384** `runOnOperation` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439`, line by line against the C++
-- [ ] **PORT 377/384** `matchAndRewrite` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44`, 12 lines
-- [ ] **AUDIT 377/384** `matchAndRewrite` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44`, line by line against the C++
-- [ ] **PORT 378/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374`, 30 lines
-- [ ] **AUDIT 378/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374`, line by line against the C++
-- [ ] **PORT 379/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975`, 54 lines
-- [ ] **AUDIT 379/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975`, line by line against the C++
-- [ ] **PORT 380/384** `shallowlyMergeConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:198`, 76 lines
-- [ ] **AUDIT 380/384** `shallowlyMergeConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:198`, line by line against the C++
-- [ ] **PORT 381/384** `simplifyValueBasedConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:466`, 30 lines
-- [ ] **AUDIT 381/384** `simplifyValueBasedConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:466`, line by line against the C++
+- [x] **PORT 374/384** `lowerSymbolicVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380`, 26 lines
+- [x] **AUDIT 374/384** `lowerSymbolicVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380`, line by line against the C++
+- [x] **PORT 375/384** `lowerSymbolicVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410`, 30 lines
+- [x] **AUDIT 375/384** `lowerSymbolicVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410`, line by line against the C++
+- [x] **PORT 376/384** `runOnOperation` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439`, 34 lines
+- [x] **AUDIT 376/384** `runOnOperation` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439`, line by line against the C++
+- [x] **PORT 377/384** `matchAndRewrite` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44`, 12 lines
+- [x] **AUDIT 377/384** `matchAndRewrite` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44`, line by line against the C++
+- [x] **PORT 378/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374`, 30 lines
+- [x] **AUDIT 378/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374`, line by line against the C++
+- [x] **PORT 379/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975`, 54 lines
+- [x] **AUDIT 379/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975`, line by line against the C++
+- [x] **PORT 380/384** `shallowlyMergeConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:198`, 76 lines
+- [x] **AUDIT 380/384** `shallowlyMergeConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:198`, line by line against the C++
+- [x] **PORT 381/384** `simplifyValueBasedConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:466`, 30 lines
+- [x] **AUDIT 381/384** `simplifyValueBasedConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:466`, line by line against the C++
 
 ## Level 9
 

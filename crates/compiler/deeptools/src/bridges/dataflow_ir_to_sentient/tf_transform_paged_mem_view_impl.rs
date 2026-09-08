@@ -901,7 +901,11 @@ impl<'a> VectorLoadOp<'a> {
                 ty: *ty,
             }),
             DfirOp::Agen(
-                agen::Op::VectorStore { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield,
+                agen::Op::VectorStore { .. }
+                | agen::Op::SymbolicVectorLoad { .. }
+                | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::Yield,
             )
             | DfirOp::Arith(_)
             | DfirOp::Scf(_)
@@ -1130,7 +1134,11 @@ impl<'a> VectorStoreOp<'a> {
                 Some(VectorStoreOp { op, value: *value })
             }
             DfirOp::Agen(
-                agen::Op::VectorLoad { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield,
+                agen::Op::VectorLoad { .. }
+                | agen::Op::SymbolicVectorLoad { .. }
+                | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::Yield,
             )
             | DfirOp::Arith(_)
             | DfirOp::Scf(_)

@@ -371,7 +371,16 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         // `agen::VectorLoadOp` and `agen::VectorStoreOp`.
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad { ty, .. }) => Some(*ty),
         DfirOp::Agen(dfir_op::agen::Op::VectorStore { ty, .. }) => Some(*ty),
-        DfirOp::Agen(dfir_op::agen::Op::CompositeLoadAndStore(_) | dfir_op::agen::Op::Yield) => None,
+        // ⛔ AND THE SYMBOLIC PAIR IS NOT ON THE LIST. `getVectorType`'s `dyn_cast` chain names
+        // `agen::VectorLoadOp` and `agen::VectorStoreOp` only (`Utils.cpp:551-556`); no
+        // `SymbolicVector*Op` appears in `Utils.cpp` at all, so it aborts on one exactly as it does
+        // on a `RotateOp`.
+        DfirOp::Agen(
+            dfir_op::agen::Op::SymbolicVectorLoad { .. }
+            | dfir_op::agen::Op::SymbolicVectorStore { .. }
+            | dfir_op::agen::Op::CompositeLoadAndStore(_)
+            | dfir_op::agen::Op::Yield,
+        ) => None,
         // `vector::LoadOp` and `vector::StoreOp` (`Utils.cpp:548-553`).
         DfirOp::Vector(dfir_op::vector::Op::Load { ty, .. }) => Some(*ty),
         DfirOp::Vector(dfir_op::vector::Op::Store { ty, .. }) => Some(*ty),

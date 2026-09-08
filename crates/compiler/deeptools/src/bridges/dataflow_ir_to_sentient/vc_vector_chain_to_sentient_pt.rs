@@ -62,8 +62,12 @@
 //! | `e369_fuseComputeOps` | 369/384 | 628 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245` |
 //! | `e379_runOnOperation` | 379/384 | 54 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975` |
 
+use crate::arch::Arch;
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_chain_helper::redefine_constant_vectors;
 use crate::islands::dataflow_ir::dialects::dataflow;
+use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::sentient::dialects::sentient;
+use crate::units::DfirUnit;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 094/384
@@ -137,11 +141,90 @@ pub const fn compute_unit_precision(precision: dataflow::Precision) -> sentient:
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 379/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e379_runOnOperation
+///
+/// `VectorChainToSentientPTLoweringPass::runOnOperation` (`VectorChainToSentientPT.cpp:975`) —
+/// redefine the module's constant vectors once, then for each PT row unit: create the XRF index
+/// modification ops, build the loop mask tree, build the reuse analysis, reset any existing sentient
+/// FMAs, fuse non-compute then compute then dangling non-compute ops, validate, and finally insert
+/// the PT mask ops.
+///
+/// ⛔ `redefineConstantVectors` IS OUTSIDE THE WALK HERE (`:983`) — the PESFP pass calls the same
+/// helper from INSIDE its walk (`VectorChainToSentientPESFP.cpp:1385`), so this one runs once per
+/// module and that one runs once per PE/SFP unit.
+/// ⛔ `WalkResult::interrupt()` AT `:1019` IS A DISCARDED TEMPORARY — it is not returned, so a
+/// failed validation signals pass failure and then STILL falls through to `insertPTMaskOps(:1024)`
+/// and returns `skip()`. Treating it as a `break` would drop the mask ops of the failing unit.
+/// ⛔ THE XRF MAP AND THE MASK TREE ARE BUILT BEFORE THE REUSE ANALYSIS (`:995-1003` before `:1006`)
+/// and all three fusion steps take all three, so none of them can be defaulted away.
+/// ⭐ THE MASK TREE IS POPULATED HERE, NOT IN THE FUSIONS — *"PT masking relies on loops being
+/// stable"* (`:1000-1001`): it is read during fusion and only spent by `insertPTMaskOps`.
+pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Values) {
+    // `:983` — entry 067, once for the whole module.
+    redefine_constant_vectors(program, values);
+
+    // `:985` — the walk over the module's program units.
+    for unit in program.units.iter() {
+        // `:990` — `if (unit_comp != PT) return WalkResult::skip();`. A PT unit is one PT ROW here:
+        // the island names the row the unit runs on, which is what `getUnitType` returns for each of
+        // the rows the reference walks.
+        let comp = unit.on.kind();
+        if !matches!(comp, DfirUnit::PtRow(_)) {
+            continue;
+        }
+
+        // `:995-997` — `LoweringXRF::createXrfIndexModifOps(unit, unit_comp)`, whose map every step
+        // below takes.
+        todo!(
+            "e367_createXrfIndexModifOps is unported, so e368_fuseNonComputeOps, \
+             e369_fuseComputeOps, e346_lowerDanglingNonComputeOps, \
+             e228_validateLoweringAndSetMissingParameters and e239_insertPTMaskOps cannot run on the \
+             {:?} unit (e227_OperandReuse and the LoopMaskTree of `:1003` are unported too)",
+            comp
+        );
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
-    use super::compute_unit_precision;
+    use super::{compute_unit_precision, run_on_operation};
+    use crate::arch::Target;
+    use crate::islands::dataflow_ir::dialects::Val;
     use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::dataflow_ir::{self as dfir, Values};
     use crate::islands::sentient::dialects::sentient;
+    use crate::units::{DfirUnit, Row};
+
+    /// One program holding one unit on `on` — what this pass walks.
+    fn program_of(on: DfirUnit) -> dfir::Program<Target> {
+        use crate::generated::OpFunc;
+        use crate::islands::dataflow_ir::{
+            Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+        };
+        dfir::Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(on, Val(0)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            arch: core::marker::PhantomData,
+        }
+    }
 
     /// 🎯 094/384 — THE ONE NON-IDENTITY ENTRY.
     ///
@@ -181,5 +264,24 @@ mod unit_tests {
             assert_eq!(from.spelling(), to.spelling(), "{}", from.spelling());
         }
     }
-}
 
+    /// 🎯 379/384 — A PT ROW UNIT IS CLAIMED AND REACHES THE XRF PREPROCESSING. `redefine_constant_vectors`
+    /// (entry 067) has already run for the whole module by then (`:983`), before the walk starts.
+    #[test]
+    #[should_panic(expected = "e367_createXrfIndexModifOps")]
+    fn a_pt_row_unit_is_claimed_by_this_pass() {
+        let Some(row) = Row::checked(0) else {
+            unreachable!()
+        };
+        let mut program = program_of(DfirUnit::PtRow(row));
+        run_on_operation(&mut program, &mut Values::default());
+    }
+
+    /// 🎯⛔ AND A NON-PT UNIT IS SKIPPED (`:990`) — the SFP is the PESFP pass's (entry 378), and a
+    /// gate that let it through would lower it twice.
+    #[test]
+    fn a_non_pt_unit_is_left_to_the_pesfp_pass() {
+        let mut program = program_of(DfirUnit::Sfp);
+        run_on_operation(&mut program, &mut Values::default());
+    }
+}

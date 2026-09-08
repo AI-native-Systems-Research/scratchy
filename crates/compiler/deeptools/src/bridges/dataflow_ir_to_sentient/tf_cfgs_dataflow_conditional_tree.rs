@@ -1585,6 +1585,85 @@ mod unit_tests {
             );
         }
     }
+
+    /// One unit holding `body` — the operation the conditional tree indexes.
+    fn unit_holding(body: Vec<DfirOp>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            on: Units::one(DfirUnit::Pe, Val(8)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// An `scf.if` on `cond` with an empty `then` and no `else`.
+    fn if_on(cond: Val) -> DfirOp {
+        DfirOp::Scf(scf::Op::If {
+            cond,
+            results: Vec::new(),
+            body: Vec::new(),
+            else_body: Vec::new(),
+            dbg_name: None,
+        })
+    }
+
+    /// 🎯 380/384 — A CONDITIONAL WITH A LATER SIBLING IS OFFERED TO THE MERGE PREDICATE, AND A LONE
+    /// ONE IS NOT. The second `scf.if` in the same block is the first one's next sibling (`:229`), so
+    /// the pair reaches entry 370; ⛔ THE SIBLING NESTED IN THE `affine.for` IS ALSO A SIBLING —
+    /// `findClosestParent` skips the unselected loop (`ConditionalTree.cpp:200`) — which is what the
+    /// same-block rejection at `:346-349` exists for and what a same-list walk would never offer.
+    #[test]
+    #[should_panic(expected = "e370_areShallowlyMergeable")]
+    fn a_conditional_and_its_next_sibling_reach_the_merge_predicate() {
+        let unit = unit_holding(vec![
+            if_on(Val(0)),
+            DfirOp::Affine(affine::Op::For {
+                iv: Val(1),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![if_on(Val(0))],
+                dbg_name: None,
+            }),
+        ]);
+        shallowly_merge_conditionals(&CfgsDataflowConditionalTree::new(&unit), None);
+    }
+
+    /// 🎯⛔ AND A SINGLE CONDITIONAL HAS NO SIBLING TO MERGE WITH, so the walk completes and the
+    /// answer is "no more merge opportunities" (`:209-210`) rather than a merge of one.
+    #[test]
+    fn a_lone_conditional_yields_no_merge() {
+        let unit = unit_holding(vec![if_on(Val(0))]);
+        assert_eq!(
+            shallowly_merge_conditionals(&CfgsDataflowConditionalTree::new(&unit), None),
+            None
+        );
+    }
+
+    /// 🎯 381/384 — A TOP-LEVEL CONDITIONAL REACHES THE CANDIDATE QUESTION, AND A NESTED ONE DOES NOT.
+    /// The `scf.if` inside the `affine.for` is not a child of the root (`:473-474`), so a unit holding
+    /// only that one runs the do/while to completion and marks nothing.
+    #[test]
+    #[should_panic(expected = "parseConditional")]
+    fn a_top_level_conditional_reaches_the_candidate_question() {
+        let unit = unit_holding(vec![if_on(Val(0))]);
+        simplify_value_based_conditionals(&CfgsDataflowConditionalTree::new(&unit));
+    }
+
+    /// 🎯⛔ AND A CONDITIONAL NESTED BELOW THE ROOT IS NOT THIS STEP'S (`:473-474`) — reaching the end
+    /// of the call is the assertion.
+    #[test]
+    fn a_nested_conditional_is_not_a_root_child() {
+        let unit = unit_holding(vec![DfirOp::Affine(affine::Op::For {
+            iv: Val(1),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: Vec::new(),
+            body: vec![if_on(Val(0))],
+            dbg_name: None,
+        })]);
+        simplify_value_based_conditionals(&CfgsDataflowConditionalTree::new(&unit));
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2266,4 +2345,197 @@ pub fn merge_shallow(src: &mut DfirOp, dst: &mut DfirOp, order: MergeOrder) {
             *slot = Some(new_dbg_name);
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 380/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH CONDITIONAL A MERGE PASS RESUMED FROM, BY ITS POSITION IN THE TREE'S PREORDER.
+///
+/// ⛔ THE REFERENCE PASSES AN `Operation *` BACK IN AND COMPARES IT BY ADDRESS (`:222`), which is a
+/// name for a node that no `usize` gives. Nothing else about the previous merge is read, so what the
+/// parameter carries is *"where in this traversal to start"* — and that is an index into the same
+/// preorder the walk produces.
+///
+/// ⚠️ IT NAMES THE TREE AS IT STANDS AT RETURN. The reference's pointer survives its `recompute()`
+/// (`:271`) because the merged conditional is the op that STAYS; an index does not survive ops being
+/// deleted before it. No caller can observe that yet — the merge below is unported — and this becomes
+/// a path or a handle in the changeset that lands entry 370.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CondNodeIndex(usize);
+
+/// ONE TREE SIBLING GROUP — every conditional whose closest SELECTED ancestor is the one owning
+/// `ops`, in program order.
+///
+/// ⛔ SIBLINGHOOD IS NOT "THE SAME STATEMENT LIST". `ConditionalTree::compute` parents each selected
+/// op at `findClosestParent(op)` and skips everything unselected on the way up
+/// (`dcc/src/Analysis/ConditionalTree.cpp:200-221`), so a conditional directly in a `then` region and
+/// one nested inside an `affine.for` in that same region are SIBLINGS. They are in different blocks,
+/// which is what `areShallowlyMergeable` rejects them for (`:346-349`) — the tree offers the pair and
+/// the predicate refuses it, and a same-list walk would never have offered it.
+fn sibling_group<'a>(ops: &'a [DfirOp], out: &mut Vec<&'a DfirOp>) {
+    for op in ops {
+        if ConditionalKind::of(op).is_some() {
+            // A selected op ends the group here — its regions open groups of their own.
+            out.push(op);
+        } else {
+            for region in dfir_op::regions(op) {
+                sibling_group(region, out);
+            }
+        }
+    }
+}
+
+/// THE TREE'S PREORDER OVER CANDIDATE NODES, each with the sibling group it sits in and its position
+/// in it — `CondNode::walk<kPreOrder>(getRoot(), …)` (`:265`).
+fn walk_candidates<'a>(ops: &'a [DfirOp], visit: &mut impl FnMut(&[&'a DfirOp], usize)) {
+    let mut group: Vec<&DfirOp> = Vec::new();
+    sibling_group(ops, &mut group);
+    for at in 0..group.len() {
+        visit(&group, at);
+        // The node's own subtrees, `then` before `else`, before its next sibling.
+        for region in dfir_op::regions(group[at]) {
+            walk_candidates(region, visit);
+        }
+    }
+}
+
+/// Replaces: e380_shallowlyMergeConditionals
+///
+/// `CFGSDataflowConditionalTree::shallowlyMergeConditionals` (`:198`) — find the first conditional
+/// that can be merged with a later sibling, merge them, delete what that left dead, recompute the
+/// tree and return the surviving conditional so the next call resumes from it.
+///
+/// ⛔ ONE MERGE PER CALL, AND `cur_merged_if_op` IS BOTH THE ANSWER AND THE GUARD (`:217-218`):
+/// *"once a merge has occurred the tree below is clobbered"*, so the walk runs to completion but
+/// every later candidate is skipped. A loop that merged every candidate would rewrite through stale
+/// nodes.
+/// ⛔ `n->isLeaf()` IN THE FILTER IS DEAD (`:217`). `compute` gives every selected conditional a
+/// `CondThenNode` and a `CondElseNode` child the moment it makes the node
+/// (`dcc/src/Analysis/ConditionalTree.cpp:195-198`), so `getFirstChild()` is never null for an
+/// if-node, and the root — the only childless node — is excluded by the test before it.
+/// ⛔ `isThenNode() || isElseNode()` HAS NO COUNTERPART HERE: those two nodes carry no operation of
+/// their own (they name a region of their parent), and only conditionals are nodes in this
+/// representation. Dropping them from the walk is not dropping a filter.
+/// ⛔ THE MERGE DIRECTION IS DECIDED BY WHICH ONE BINDS A RESULT (`:237`), never by which is first —
+/// see [`MergeOrder`] — and `areShallowlyMergeable` guarantees at most one of the pair does
+/// (`:347-348`). The sibling is then MOVED right after `n` (`:249`) and, for an `scf.if`, made to
+/// share `n`'s condition with the old one erased if unused (`:252-256`).
+/// ⚠️ `deleteAncestorsIfPossible` (`:269`), `recompute` (`:271`) and `OperationEquivalence::clearCache`
+/// (`:272`) are all outside bridge 2's 384 — the first two live in `dcc/src/Analysis/`.
+pub fn shallowly_merge_conditionals<A: Arch>(
+    tree: &CfgsDataflowConditionalTree<'_, A>,
+    prev_merged_if_op: Option<CondNodeIndex>,
+) -> Option<CondNodeIndex> {
+    // `:211` — the merged conditional, and the guard that stops at one merge.
+    let cur_merged_if_op: Option<CondNodeIndex> = None;
+    // `:215` — `bool start_analysis = (prev_merged_if_op == nullptr);`
+    let mut start_analysis = prev_merged_if_op.is_none();
+    let mut next = CondNodeIndex(0);
+
+    walk_candidates(&tree.unit.body, &mut |siblings, at| {
+        let n = next;
+        next = CondNodeIndex(n.0 + 1);
+
+        // `:217-219` — a candidate is a conditional node, and only until one merge has happened.
+        if cur_merged_if_op.is_some() {
+            return;
+        }
+
+        // `:222-225` — resume at the node the previous call returned; before it, look at nothing.
+        if Some(n) == prev_merged_if_op {
+            start_analysis = true;
+        }
+        if !start_analysis {
+            return;
+        }
+
+        // `:229-230` — `for (sibling = n->getNextSibling(); sibling; sibling = ...->getNextSibling())`.
+        for sibling in &siblings[at + 1..] {
+            // `:233` — the predicate that decides the pair, and with it the merge at `:237-259`.
+            todo!(
+                "e370_areShallowlyMergeable is unported, so e177_mergeShallow cannot be aimed: \
+                 candidate {:?} and sibling {:?} on {:?} under {:?}",
+                siblings[at],
+                sibling,
+                tree.unit.on.kind(),
+                tree.oe
+            );
+        }
+    });
+
+    // `:270-273` — a merge invalidates the tree and the equivalence cache; `:274` returns the survivor.
+    cur_merged_if_op
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 381/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e381_simplifyValueBasedConditionals
+///
+/// `CFGSDataflowConditionalTree::simplifyValueBasedConditionals` (`:466`) — for each top-level
+/// conditional not yet rejected, ask whether it is a candidate; if it is, replace it by an iteration
+/// argument and restart, and if it is not, mark it so it is not asked twice.
+///
+/// ⛔ ONE SIMPLIFICATION PER PASS, THEN `break` AND RESTART (`:481`): *"we have cloned a loop so the
+/// IfOp pointers are clobbered"*. `recompute()` runs at the end of EVERY pass (`:489`), including the
+/// one that changed nothing, which is why it sits outside the `for` rather than beside the `break`.
+/// ⛔ THE MARKER IS CALL-LOCAL, AND THE REFERENCE'S OWN TAIL PROVES IT: `:491-495` removes
+/// `PROCESSED_SIMPLIFICATIONS` from every child before returning. It is set on `:486` and read on
+/// `:476` only, so it is a set of conditionals rejected DURING THIS CALL — a local set here, not a
+/// new island attribute, and the removal pass is discharged by that set dying with the call.
+/// ⛔ ONLY ROOT'S CHILDREN ARE CONSIDERED (`:473-474`) — a conditional nested inside another is not
+/// reached by this step at all, which is what makes `getFirstChild()`/`getNextSibling()` here a walk
+/// over the unit's TOP-LEVEL conditionals and nothing deeper.
+/// ⚠️ `parseConditional`, `replaceIfOpByIterArg` (entry 285) and `recompute` are unported; only
+/// `parseConditional` is outside the 384 entirely.
+pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditionalTree<'_, A>) {
+    // `:486` — the `PROCESSED_SIMPLIFICATIONS` attribute, by position among root's children.
+    let processed: Vec<usize> = Vec::new();
+
+    // `:471` — `do { … } while (tree_updated);`
+    loop {
+        // `:472`
+        let tree_updated = false;
+
+        // `:473-474` — root's children, which are the unit's top-level conditionals.
+        for (at, if_op) in tree
+            .unit
+            .body
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| ConditionalKind::of(op).is_some())
+        {
+            // `:476` — `if (if_op->hasAttr(PROCESSED_SIMPLIFICATIONS)) continue;`
+            if processed.contains(&at) {
+                continue;
+            }
+
+            // `:477` — the manager, whose `val_array_` starts absent.
+            let instance = ConditionalSimplificationManager::default();
+
+            // `:478` — the question. Its `false` arm is `processed.push(at)` (`:485-486`) and its
+            // `true` arm is entry 285 followed by `tree_updated = true; break;` (`:479-481`).
+            todo!(
+                "ConditionalSimplificationManager::parseConditional is unported, so \
+                 e285_replaceIfOpByIterArg cannot run on the {:?} at index {} of {:?} ({:?})",
+                ConditionalKind::of(if_op),
+                at,
+                tree.unit.on.kind(),
+                instance
+            );
+        }
+
+        // `:489` — recompute, unported: the tree here is derived from the unit on every question.
+
+        // `:490`
+        if !tree_updated {
+            break;
+        }
+    }
+
+    // `:491-495` — the marker's removal, which is this set going out of scope.
+    drop(processed);
 }

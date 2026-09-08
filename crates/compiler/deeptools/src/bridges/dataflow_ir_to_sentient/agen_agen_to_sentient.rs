@@ -66,7 +66,7 @@
 
 
 use crate::arch::Arch;
-use crate::islands::dataflow_ir::dialects::agen;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, agen};
 use crate::islands::dataflow_ir::{self as dfir};
 use crate::islands::sentient::dialects::Op as SenOp;
 
@@ -164,14 +164,13 @@ impl Consumed {
 /// | 8 | `agen.composite_indirect_load` | `e332` | — |
 /// | 9 | `agen.composite_indirect_store` | `e333` | — |
 /// | 10 | `agen.composite_indirect_load_and_store` | `e334` | — |
-/// | 11 | `agen.symbolic_vector_load` | `e374` | — |
-/// | 12 | `agen.symbolic_vector_store` | `e375` | — |
+/// | 11 | `agen.symbolic_vector_load` | `e374` | [`agen::Op::SymbolicVectorLoad`] |
+/// | 12 | `agen.symbolic_vector_store` | `e375` | [`agen::Op::SymbolicVectorStore`] |
 ///
-/// ⛔ NINE OF THE TWELVE HAVE NO ISLAND VARIANT and so cannot be a candidate here at all: the
-/// DataflowIR island declares four `agen` ops, and a kind this crate cannot construct is a kind this
-/// dispatch cannot meet. The `match` below is therefore exhaustive over
-/// [`agen::Op`] rather than over the twelve — which makes ADDING the tenth op to the island a
-/// build error here, in the one place that has to grow an arm for it.
+/// ⛔ SEVEN OF THE TWELVE HAVE NO ISLAND VARIANT and so cannot be a candidate here at all: a kind
+/// this crate cannot construct is a kind this dispatch cannot meet. The `match` below is therefore
+/// exhaustive over [`agen::Op`] rather than over the twelve — which is why declaring the symbolic
+/// pair for entries 374/375 grew arms 11 and 12 here, in the one place that has to have them.
 ///
 /// # ⛔⛔ TWO ARMS ARE `todo!` AND THAT IS THE POINT
 ///
@@ -213,8 +212,12 @@ impl Consumed {
 /// gets emitted, because the only emitting arm is the transfer and a transfer is a transfer on any
 /// component. The gate goes in with `e384`, in `e384`'s own anchor.
 ///
+/// ⭐ `stmt` IS `op`'s ENCLOSING STATEMENT, and it is here because entry 036 asks a question about
+/// the OPERATION — `op->getResult(0)` and its users — which an `agen::Op` alone cannot answer.
+///
 /// Replaces: e382_fuseLoadOrStoreChainOps
 pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
+    stmt: &DfirOp,
     op: &agen::Op,
     unit: &dfir::ProgramUnit<A>,
     extract: &mut ExtractIdx,
@@ -252,6 +255,23 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
         agen::Op::CompositeLoadAndStore(transfer) => {
             out.push(super::load_and_store(transfer, bound, consts));
             Consumed(1)
+        }
+
+        // ── 11. `agen.symbolic_vector_load` (`AgenToSentient.cpp:146-153`) ───────────────────────
+        //
+        // ⛔ THE STORE SEARCH NEEDS THE WHOLE UNIT BODY, not the window: entry 036 counts the load
+        // result's uses, and a census over the remaining statements alone would find one use where
+        // there are two.
+        agen::Op::SymbolicVectorLoad { .. } => super::agen_helper::lower_symbolic_vector_load_op(
+            stmt,
+            unit,
+            unit.on.kind(),
+            &unit.body,
+        ),
+
+        // ── 12. `agen.symbolic_vector_store` (`AgenToSentient.cpp:154-161`) ──────────────────────
+        agen::Op::SymbolicVectorStore { .. } => {
+            super::agen_helper::lower_symbolic_vector_store_op(unit, unit.on.kind())
         }
 
         // ── not a candidate: a terminator (`agen.yield`) ─────────────────────────────────────────

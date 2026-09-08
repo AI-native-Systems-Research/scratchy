@@ -69,9 +69,12 @@
 //! | `e363_LowerLogicalOpToSentient` | 363/384 | 19 | `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264` |
 //! | `e376_runOnOperation` | 376/384 | 34 | `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439` |
 
-use crate::islands::dataflow_ir::dialects::Val;
-use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst};
+use super::SenOp;
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst, LogicKind};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith, regions};
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{self as dfir};
 use crate::islands::sentient::dialects::sentient as sen;
 
 /// Replaces: e049_LowerAddIOpToSentient
@@ -555,6 +558,131 @@ pub const fn get_sentient_cmp_i_predicate(condop: CmpIPredicate) -> sen::CmpPred
         CmpIPredicate::Sgt => sen::CmpPredicate::Sgt,
         CmpIPredicate::Sge => sen::CmpPredicate::Sge,
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 376/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// PREORDER OVER THE WHOLE MODULE — `module_op.walk(..)` visits the preamble and every unit body,
+/// descending into every region.
+fn walk_module<A: Arch>(program: &dfir::Program<A>, visit: &mut impl FnMut(&DfirOp)) {
+    fn walk(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
+        for op in ops {
+            visit(op);
+            for region in regions(op) {
+                walk(region, visit);
+            }
+        }
+    }
+    walk(&program.preamble, visit);
+    for unit in program.units.iter() {
+        walk(&unit.body, visit);
+    }
+}
+
+/// Replaces: e376_runOnOperation
+///
+/// `StandardToSentientLoweringPass::runOnOperation` (`StandardToSentient.cpp:439`) — TWO module
+/// walks: the first simplifies every `arith.ori`, the second lowers the ten `arith` classes it
+/// recognises, in the reference's own `dyn_cast` order (`:447-471`).
+///
+/// ⛔ `arith.muli` IS A REFUSAL, NOT A GAP — `LowerMulIOpToSentient(op)` is COMMENTED OUT at `:454`
+/// under `emitError("Cannot lower mul expressions to sentient")`, so the ported entry 051
+/// [`lower_muli_op_to_sentient`] must NOT be called from here.
+/// ⛔ AND SO IS THE TRAILING `arith.constant` (`:467-470`, `op->dump(); signalPassFailure();`): an
+/// index constant went to `:457` and an integer one to `:465`, so what reaches it is a constant of
+/// some OTHER type — a dense vector one included, and this pass runs after both VectorChain
+/// lowerings have consumed those (`dcc/tools/dcc-standalone/dcc-standalone-main.cpp:277-287`).
+/// ⛔ `arith.divsi`, `arith.remsi` AND `arith.not` HAVE NO ARM and fall through untouched.
+/// ⛔ THE `arith.ori` WALK RUNS TO COMPLETION FIRST (`:441-445`) — entry 339 folds an `ori` chain into
+/// one op, so lowering an `ori` before that simplification lowers a shape entry 363 never sees.
+pub fn run_on_operation<A: Arch>(program: &dfir::Program<A>) -> Vec<SenOp> {
+    // `:441-445` — the first walk, `SimplifyOrIOp` on every `arith.ori`.
+    walk_module(program, &mut |op| {
+        if let DfirOp::Arith(arith::Op::Logic {
+            kind: LogicKind::Or,
+            result,
+            operands,
+            ..
+        }) = op
+        {
+            todo!(
+                "e339_SimplifyOrIOp is unported: {:?} = arith.ori {:?} reached StandardToSentient",
+                result,
+                operands
+            );
+        }
+    });
+
+    // `:447-471` — the second walk, one arm per recognised class.
+    let mut out: Vec<SenOp> = Vec::new();
+    walk_module(program, &mut |op| {
+        let DfirOp::Arith(arith_op) = op else {
+            return;
+        };
+        match arith_op {
+            // `:447-448`
+            arith::Op::AddI(binary) => out.push(SenOp::Sentient(lower_addi_op_to_sentient(binary))),
+            // `:449-450`
+            arith::Op::SubI(binary) => out.push(SenOp::Sentient(lower_subi_op_to_sentient(binary))),
+            // `:451-454` — the reference's own refusal.
+            arith::Op::MulI(binary) => todo!(
+                "Cannot lower mul expressions to sentient: {:?} = arith.muli {:?}, {:?} \
+                 (LowerMulIOpToSentient is commented out at StandardToSentient.cpp:454)",
+                binary.result,
+                binary.lhs,
+                binary.rhs
+            ),
+            // `:455-456`
+            arith::Op::Select { result, .. } => todo!(
+                "e362_LowerSelectOpToSentient is unported: {:?} = arith.select",
+                result
+            ),
+            // `:457-458` — `isa<ConstantIndexOp>`.
+            arith::Op::Constant { result, value } => {
+                out.push(SenOp::Sentient(lower_constant_index_to_sentient(
+                    *result, *value,
+                )));
+            }
+            // `:459-464` — `AndIOp`, `OrIOp` and `CmpIOp` all take entry 363. The `ori` arm is
+            // unreachable behind the first walk; it is spelled out because the reference spells it.
+            arith::Op::Logic {
+                result,
+                kind: kind @ (LogicKind::And | LogicKind::Or),
+                ..
+            } => todo!(
+                "e363_LowerLogicalOpToSentient is unported: {:?} = arith.{:?}",
+                result,
+                kind
+            ),
+            arith::Op::Compare { result, .. } => todo!(
+                "e363_LowerLogicalOpToSentient is unported: {:?} = arith.cmpi",
+                result
+            ),
+            // `:465-466` — `isa<ConstantIntOp>`.
+            arith::Op::ConstantInt { result, value } => {
+                out.push(SenOp::Sentient(lower_constant_int_to_sentient(
+                    *result, *value,
+                )));
+            }
+            // `:467-470` — the catch-all `arith::ConstantOp`, which is a pass failure.
+            arith::Op::DenseConstant { result, ty, .. } => todo!(
+                "StandardToSentient cannot lower {:?} = arith.constant : {:?} — the reference dumps \
+                 it and signals pass failure (StandardToSentient.cpp:468-469)",
+                result,
+                ty
+            ),
+            // No arm in the reference: left exactly as they are.
+            arith::Op::DivSI(_)
+            | arith::Op::RemSI(_)
+            | arith::Op::Logic {
+                kind: LogicKind::Not,
+                ..
+            } => {}
+        }
+    });
+    out
 }
 
 #[cfg(test)]
@@ -1092,5 +1220,106 @@ mod unit_tests {
                 })],
             })]
         );
+    }
+    /// A program whose one unit holds `body` — this pass reads no machine fact.
+    fn program_of(body: Vec<DfirOp>) -> dfir::Program<crate::arch::Target> {
+        use crate::generated::OpFunc;
+        use crate::islands::dataflow_ir::{
+            Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+        };
+        use crate::units::DfirUnit;
+        dfir::Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// 🎯 376/384 — THE FOUR CLASSES THE WALK CAN LOWER, IN THE ORDER IT MEETS THEM.
+    ///
+    /// The dispatch is `:447-471`; the expectations are the three ported lowerings' own emissions
+    /// (`sentient.scalar_add`, `sentient.scalar_sub`, two `sentient.scalar_constant`s), written out
+    /// rather than recomputed so a change in either side shows up here.
+    #[test]
+    fn the_walk_lowers_the_classes_the_reference_has_an_arm_for() {
+        let program = program_of(vec![
+            DfirOp::Arith(arith::Op::AddI(IntBinary {
+                result: Val(29),
+                lhs: Val(18),
+                rhs: Val(1),
+                ty: ScalarTy::Index,
+            })),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 2048,
+            }),
+            DfirOp::Arith(arith::Op::ConstantInt {
+                result: Val(2),
+                value: IntConst::Bool(true),
+            }),
+            // ⭐ NO ARM: left exactly as it is, and it must not add an op to the output.
+            DfirOp::Arith(arith::Op::DivSI(IntBinary {
+                result: Val(3),
+                lhs: Val(1),
+                rhs: Val(2),
+                ty: ScalarTy::Int(32),
+            })),
+        ]);
+        assert_eq!(
+            run_on_operation(&program),
+            vec![
+                SenOp::Sentient(sen::Op::ScalarAdd {
+                    lhs: Val(18),
+                    rhs: Val(1),
+                    result: Val(29),
+                    reg: None,
+                    ty: ScalarTy::Index,
+                }),
+                SenOp::Sentient(sen::Op::ScalarConstant {
+                    value: 2048,
+                    result: Val(1),
+                    reg_locale: sen::RegType::Imm,
+                    ty: ScalarTy::Index,
+                }),
+                SenOp::Sentient(sen::Op::ScalarConstant {
+                    value: 1,
+                    result: Val(2),
+                    reg_locale: sen::RegType::Imm,
+                    ty: ScalarTy::Int(1),
+                }),
+            ]
+        );
+    }
+
+    /// 🎯⛔ 376/384 — AND AN `arith.muli` STOPS THE BUILD, BECAUSE THE REFERENCE REFUSES IT.
+    ///
+    /// `:451-454` emits an error and signals pass failure with `LowerMulIOpToSentient(op)` commented
+    /// out beneath it. Entry 051 IS ported, so the trap this test guards is a future edit "completing"
+    /// the dispatch by calling it: that would emit a `sentient.scalar_mul` the reference never emits.
+    #[test]
+    #[should_panic(expected = "Cannot lower mul expressions to sentient")]
+    fn a_muli_is_refused_rather_than_lowered() {
+        run_on_operation(&program_of(vec![DfirOp::Arith(arith::Op::MulI(
+            IntBinary {
+                result: Val(4),
+                lhs: Val(1),
+                rhs: Val(2),
+                ty: ScalarTy::Index,
+            },
+        ))]));
     }
 }

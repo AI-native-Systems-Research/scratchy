@@ -350,15 +350,14 @@ pub fn remove_cores_corelets_folds_from_program_unit(
 /// }
 /// ```
 ///
-/// # ⭐ NINETEEN CLASSES, NINE OF WHICH THIS ISLAND DECLARES
+/// # ⭐ NINETEEN CLASSES, ELEVEN OF WHICH THIS ISLAND DECLARES
 ///
 /// The six `dataflow` ones all exist here. Of the thirteen `agen` ones, the island declares
-/// `vector_load`, `vector_store` and `composite_load_and_store` — "the four here are the ones an
-/// emitted program contains" ([`agen`]) — and the other ten (`composite_load`, `composite_store`,
-/// the four indirect composites, the two indirect vectors, `composite_memory_interleave` and the two
-/// symbolic vectors) are not declared. They are listed in the match below as comments rather than
-/// invented: the brief's rule to grow the island is about a function's *input*
-/// (`AGENT-BRIEF.md:57`), and this function's input is any op at all.
+/// `vector_load`, `vector_store`, `composite_load_and_store` and — since entries 374/375 needed an
+/// input — the two symbolic vectors. The other eight (`composite_load`, `composite_store`, the four
+/// indirect composites, the two indirect vectors and `composite_memory_interleave`) are listed in
+/// the match below as comments rather than invented: the brief's rule to grow the island is about a
+/// function's *input* (`AGENT-BRIEF.md:57`), and this function's input is any op at all.
 ///
 /// # ⛔ NO WILDCARD, SO A NEW ISLAND OP CANNOT DEFAULT TO "NOT A TRANSFER"
 ///
@@ -379,14 +378,16 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::Receive { .. }
             | dataflow::Op::Opaque(_),
         ) => true,
-        // Three of the thirteen `agen` classes. The ten the island does not declare —
+        // Five of the thirteen `agen` classes. The eight the island does not declare —
         // `composite_load`, `composite_store`, `composite_indirect_load_and_store`,
         // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load`,
-        // `indirect_vector_store`, `composite_memory_interleave`, `symbolic_vector_load`,
-        // `symbolic_vector_store` — belong on this side of the answer when they land.
+        // `indirect_vector_store`, `composite_memory_interleave` — belong on this side of the answer
+        // when they land.
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::SymbolicVectorLoad { .. }
+            | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
         // `agen.yield` terminates a transfer's region and is not one; the view and unit binders,

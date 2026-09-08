@@ -340,7 +340,13 @@ impl<'a> TpmvManager<'a> {
             ),
             // `else { llvm_unreachable("memory operation is not supported for static paged
             // tensors"); }` — no wildcard, so an eleventh `agen` op cannot land here silently.
-            DfirOp::Agen(agen::Op::Yield)
+            // ⛔ AND A SYMBOLIC ACCESS IS THAT ARM TOO. Its address is a runtime value, which is the
+            // opposite of what a STATIC paged tensor is; none of the reference's `dyn_cast`s names it.
+            DfirOp::Agen(
+                agen::Op::Yield
+                | agen::Op::SymbolicVectorLoad { .. }
+                | agen::Op::SymbolicVectorStore { .. },
+            )
             | DfirOp::Arith(_)
             | DfirOp::Affine(_)
             | DfirOp::Scf(_)
