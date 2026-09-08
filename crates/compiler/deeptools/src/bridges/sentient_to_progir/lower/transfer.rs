@@ -97,11 +97,11 @@ pub enum TransferRefusal {
     /// header's input is a register, or a query map of mixed kinds.
     NotAnImmediate,
     /// The sen1p5 EBR's `DT_CHECK` that its input is a `sentient.constant` or a `uniform.query_map`
-    /// (`:434-437`) — nothing else has a value to shift.
+    /// (`:431-433`) — nothing else has a value to shift.
     EbrInputNotEvaluable,
-    /// *"sen1p5 EBR requires element size to initialize reg"* (`:439-440`).
+    /// *"sen1p5 EBR requires element size to initialize reg"* (`:436-437`).
     EbrElementSize,
-    /// *"EBR is not divisible by an even number of sticks"* (`:443-444`), and by what it was not.
+    /// *"EBR is not divisible by an even number of sticks"* (`:440-441`), and by what it was not.
     EbrNotEvenSticks(i64),
 }
 
@@ -568,7 +568,7 @@ pub enum CopyInput<'a> {
     Imm(&'a RegImmSource),
     /// A register, which is none of those — ⛔ A PROGRAM HEADER REFUSES IT (`:466`).
     Reg,
-    /// `isa<BlockArgument>` — ⛔ IT TAKES THE ASSIGN ROUTE EVEN IN A PROGRAM HEADER (`:464`).
+    /// `isa<BlockArgument>` — ⛔ IT TAKES THE ASSIGN ROUTE EVEN IN A PROGRAM HEADER (`:463`).
     BlockArg,
 }
 
@@ -636,7 +636,7 @@ impl InputKinds {
     }
 }
 
-/// `evaluateShift(ev, 1, /*shift_right*/ true)` and the two `DT_CHECK`s around it (`:427-457`).
+/// `evaluateShift(ev, 1, /*shift_right*/ true)` and the two `DT_CHECK`s around it (`:427-452`).
 ///
 /// ⭐ ONLY A CONSTANT SHIFTS — a symbol id or a multicast id is not an address the evaluator halves,
 /// and `None` back means nothing shifted because one of the checks named an offender.
@@ -660,7 +660,9 @@ fn halve_for_sen1p5_ebr<A: Arch>(
         refused.push(TransferRefusal::EbrElementSize);
         return None;
     };
-    let two_sticks = 2 * A::BYTES_PER_STICK.get() * 8 / width;
+    // ⛔ TRUNCATE THEN DOUBLE, in that order: `2 * num_elems_in_stick` over a stick's element
+    // count (`:438-441`), which is not `2 * bits / width` when the width does not divide the stick.
+    let two_sticks = 2 * (A::BYTES_PER_STICK.get() * 8 / width);
     let mut halve = |value: i64| {
         // ⛔ AND A WIDTH WIDER THAN TWO STICKS DIVIDES BY NOTHING, which is that check failing.
         if value.unsigned_abs().checked_rem(two_sticks) != Some(0) {
@@ -693,9 +695,9 @@ fn halve_for_sen1p5_ebr<A: Arch>(
 /// One `sentient.scalar_copy`: a program header's immediate initialises the register, and an assign
 /// instruction carries everything else.
 ///
-/// ⛔ `element_size` `None` IS THE ABSENT ATTRIBUTE **AND** THE `-1` (`:497-501`), worth `8 * scale`
-/// — the identity scaling — since no width is negative, and that is where the `DT_CHECK` went.
-/// ⛔ A REFUSED ASSIGN EMITS NOTHING, where the reference's unchecked `.value()` (`:508`) aborts; and
+/// ⛔ `element_size` `None` IS THE ABSENT ATTRIBUTE **AND** THE `-1` (`:418-422,456-460`), worth
+/// `8 * scale` — the identity scaling — since no width is negative, and that is where the check went.
+/// ⛔ A REFUSED ASSIGN EMITS NOTHING, where the reference's unchecked `.value()` (`:498`) aborts; and
 /// the parent-region walk's two checks are the caller's, because the units arrive as a parameter.
 #[must_use]
 pub fn lower_copy_operation<A: Arch>(
@@ -1216,5 +1218,17 @@ mod unit_tests {
             copied.lowered.refused,
             vec![TransferRefusal::EbrNotEvenSticks(64)]
         );
+        // ⛔ AND THE DIVISOR TRUNCATES BEFORE IT DOUBLES: 1024 b a stick over a 96 b element is 10
+        // elements, so 60 clears two sticks' 20 where a `2 * 1024 / 96` of 21 would have refused it.
+        let mut refused = Vec::new();
+        assert_eq!(
+            halve_for_sen1p5_ebr::<Sen1p5>(
+                Some(&RegImmSource::Common(RegImm::Constant(60))),
+                Some(Bits(96)),
+                &mut refused,
+            ),
+            Some(RegImmSource::Common(RegImm::Constant(30)))
+        );
+        assert!(refused.is_empty(), "60 is twenty elements times three");
     }
 }

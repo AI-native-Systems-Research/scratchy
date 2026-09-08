@@ -56,7 +56,7 @@ use sys_arch_spec::regfile::Component;
 
 /// WHAT FOLLOWS AN OP WHOSE LABEL HAS TO GO SOMEWHERE — the `getNextNode` walk's three answers.
 ///
-/// ⛔ A `uniform.yield`'s SUCCESSOR IS ITS PARENT'S, NOT ITS OWN (`:544-547`) — the caller resolves
+/// ⛔ A `uniform.yield`'s SUCCESSOR IS ITS PARENT'S, NOT ITS OWN (`:547-551`) — the caller resolves
 /// that, because the parent link is the mechanism this port supplies rather than stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Successor {
@@ -594,9 +594,9 @@ pub struct Splatted<'a> {
 /// One `sentient.splat` appended as whichever of `SPLAT` and `IMMCOPY` its input and its
 /// `$programHeader` pick.
 ///
-/// ⛔ THE REGISTER-INITIALISER ROUTE APPENDS NOTHING AND SO CARRIES NO LABEL: `has_value()` (`:935`)
+/// ⛔ THE REGISTER-INITIALISER ROUTE APPENDS NOTHING AND SO CARRIES NO LABEL: `has_value()` (`:934`)
 /// is the whole of the reference's guard, and an unpadded constant in a program header takes it
-/// ([`construct_splat_pad_instr`], `:3843`).
+/// ([`construct_splat_pad_instr`], `ConstructProgIRHelper.cpp:3834-3837`).
 #[must_use]
 pub fn lower_splat_operation<A: Arch>(
     comp: ComputeUnit,

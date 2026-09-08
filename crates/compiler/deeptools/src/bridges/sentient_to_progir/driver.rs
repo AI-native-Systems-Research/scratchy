@@ -699,7 +699,9 @@ pub fn generate_prog_ir<A: Arch>(
     lowering: &mut Lowering<'_>,
 ) -> Generated {
     let OpToLower { at, reg_defs, kind } = op;
-    if REG_DEF_CHECKING && let Some(defs) = lowering.reg_defs.as_deref_mut() {
+    // ⭐ `regDefTracker_.enabled()` IS THE SET BEING THERE AT ALL (`cpp:129`) — prog-stitch turns
+    // recording on with [`REG_DEF_CHECKING`] false, so see [`PassState::reg_defs`], not the const.
+    if let Some(defs) = lowering.reg_defs.as_deref_mut() {
         record_op_reg_defs(defs, &reg_defs);
     }
     let mut walk = Walk::Advance;
@@ -1133,7 +1135,8 @@ pub fn generate_prog_ir<A: Arch>(
 ///
 /// ⛔ THE BOUND IS PER COMPONENT (`DccExtContext.cpp:267-281`), never `kMaxCompIBuff`, and exceeding
 /// it ABANDONS THE UNIT — `signalPassFailure(); return;` lowers nothing.
-/// ⭐ THE XRF ANALYZER IS DROPPED — `ConstructFMAInstr` never reads it (`…Helper.cpp:1425`).
+/// ⭐ THE XRF ANALYZER IS DROPPED — `ConstructFMAInstr` never reads it
+/// (`ConstructProgIRHelper.cpp:1423-1425`).
 #[must_use]
 pub fn generate_unit_prog_ir<A: Arch>(
     unit: UnitProgramToLower<'_>,
@@ -1180,7 +1183,7 @@ pub fn generate_unit_prog_ir<A: Arch>(
 pub const COLLECT_CODE_QUALITY_STATS: bool = false;
 
 /// WHICH RESULT OF ITS `dataflow.get_unit` ONE HANDLE IS — `getResultNum(unit.getDefiningOp(), unit)`
-/// (`cpp:340`).
+/// (`cpp:258`).
 ///
 /// ⭐ A `get_unit`'s RESULT NUMBER *IS* THE FOLD — `Dataflow.td:48,56-58`, the reading
 /// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::FoldId`] already states. It is still
@@ -1198,7 +1201,7 @@ pub struct UnitHandle {
 }
 
 /// `unit_op.getUnits()` — ⛔ NON-EMPTY BY CONSTRUCTION, which is what
-/// `DT_CHECK(unit_op.getUnits().size() >= 1)` (`cpp:236`) had to say at run time, and what
+/// `DT_CHECK(unit_op.getUnits().size() >= 1)` (`cpp:241`) had to say at run time, and what
 /// [`crate::islands::sentient::ProgramUnits`] says for the rung above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitHandles {
@@ -1236,7 +1239,7 @@ pub struct ProgramUnitToLower<'a> {
 /// EVERY WAY ONE PROGRAM UNIT CAN REFUSE.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProgramUnitRefusal {
-    /// `DT_CHECK_MSG(record != …end(), "unexpected unit")` (`cpp:239-241`) — the program unit's own
+    /// `DT_CHECK_MSG(record != …end(), "unexpected unit")` (`cpp:248-249`) — the program unit's own
     /// type has no component, so nothing of it is lowered at all.
     UnexpectedUnit(DfirUnit),
     /// `getSenComponentForProgramStateInfo`'s `DT_ERROR` (`DccExtContext.cpp:210-238`) — this handle
@@ -1331,7 +1334,7 @@ pub fn generate_prog_ir_for_program_unit<A: Arch, M: Model, W: Workload>(
     if let Some(mut stats) = cq_stats {
         // The `llvm::dbgs()` dump is every number this value already holds, so it is the port of it.
         // ⭐ AND THE COUNTS ARE FILED WITH THE STATS: the reference writes them into its dying local
-        // one line too late (`cpp:934`), and nothing in the tree reads `comp_to_code_quality_stats_`,
+        // one line too late (`cpp:274,305`), and nothing reads `comp_to_code_quality_stats_` at all,
         // so neither ordering is observable and this one is the value the dump names.
         let mut reg_num_per_type: BTreeMap<RegType, u32> = BTreeMap::new();
         for (unit, reg_map) in pass.regs_to_init.iter() {
@@ -1499,7 +1502,7 @@ pub fn generate_prog_ir_for_program_unit<A: Arch, M: Model, W: Workload>(
     }
     refused
 }
-/// `ReplaceModuleWithSmc` (`SentientToProgIR.cpp:41-47`), a `cl::opt<bool>` defaulting to **true** —
+/// `ReplaceModuleWithSmc` (`SentientToProgIR.cpp:42-47`), a `cl::opt<bool>` defaulting to **true** —
 /// a const the way [`CHECK_PROG_IR`] is.
 pub const REPLACE_MODULE_WITH_SMC: bool = true;
 
@@ -1523,7 +1526,7 @@ pub struct ModuleToLower<'a, A: Arch, M: Model, W: Workload> {
     pub reg_refs: &'a [((Core, Component), RegSet)],
 }
 
-/// ONE CORE'S PROGRAM THAT `checkProgramValidity` REFUSES (`cpp:664-673`).
+/// ONE CORE'S PROGRAM THAT `checkProgramValidity` REFUSES (`cpp:642-659`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramInvalidity {
     /// Which core.
@@ -1542,7 +1545,7 @@ pub struct PassRefusals {
     pub lowering: Vec<ProgramUnitRefusal>,
     /// What could not be padded to the longest core.
     pub program_length: Vec<ProgramLengthOffender>,
-    /// `validity_failed` — the one condition that reaches `signalPassFailure()` (`cpp:190-193`).
+    /// `validity_failed` — the one condition that reaches `signalPassFailure()` (`cpp:740-742`).
     pub invalid: Vec<ProgramInvalidity>,
     /// A register a unit claims to define that nothing reads, per core.
     pub reg_ref: Vec<(Core, RegRefDiscrepancy)>,
@@ -1712,6 +1715,7 @@ mod unit_tests {
     use crate::islands::progir::ty::RegType;
     use crate::islands::progir::{OpCode, UnitProgram};
     use crate::islands::sentient::dialects::sentient::RegIndex;
+    use crate::islands::sentient::dialects::sentient::RegType as Locale;
     use crate::islands::sentient::dialects::sentient::{
         RawPrecision, SliceId, ValidEntries, WslLen,
     };
@@ -1950,6 +1954,9 @@ mod unit_tests {
         labels_ctr: LabelCounter,
         cq_stats: Option<CodeQualityStats>,
         has_samv: Option<ActiveMaskValue>,
+        /// `regDefTracker_`'s set — `Some` is `enabled()`, which prog-stitch reaches with
+        /// [`REG_DEF_CHECKING`] false.
+        reg_defs: Option<RegSet>,
     }
 
     impl State {
@@ -1962,7 +1969,7 @@ mod unit_tests {
                 label_to_jumps: &mut self.label_to_jumps,
                 nop_for_labels: &mut self.nop_for_labels,
                 labels_ctr: &mut self.labels_ctr,
-                reg_defs: None,
+                reg_defs: self.reg_defs.as_mut(),
                 cq_stats: &mut self.cq_stats,
                 has_samv: &mut self.has_samv,
                 units: &[],
@@ -2125,7 +2132,33 @@ mod unit_tests {
                 refused: vec![LoweringRefusal::Unlowerable(OpSite(2))],
             }
         );
-        assert_eq!(state.cq_stats.expect("collecting").conditional_jcmps, 1);
+        let stats = state.cq_stats.as_ref().expect("collecting");
+        assert_eq!(stats.conditional_jcmps, 1);
+
+        // ⛔ AND THE RECORDING GATE IS THE SET BEING THERE, NOT `REG_DEF_CHECKING` (false here):
+        // prog-stitch has `enabled()` true with it off (`RegDefTracker.hpp:48`). Recorded before the
+        // dispatch, so even the op that interrupts contributes its defs.
+        state.reg_defs = Some(RegSet::empty());
+        let tracked = generate_prog_ir::<Target>(
+            OpToLower {
+                at: OpSite(3),
+                reg_defs: OpRegDefs::One(Reg {
+                    locale: Locale::Lrf,
+                    index: Some(RegIndex::at::<4>()),
+                }),
+                kind: OpKind::Unlowerable,
+            },
+            Component::L3su,
+            &mut state.lowering(),
+        );
+        assert_eq!(tracked.walk, Walk::Interrupt);
+        assert!(
+            state
+                .reg_defs
+                .expect("tracking")
+                .get(RegType::Lrf)
+                .holds(RegIndex::at::<4>())
+        );
     }
 
     /// e129: the NOP a label alone earned hands its tag to the RETURN and vanishes; both cores of a

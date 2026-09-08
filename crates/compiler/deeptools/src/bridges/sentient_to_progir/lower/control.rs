@@ -411,11 +411,11 @@ pub fn lower_sync_operation<A: Arch>(
 #[derive(Debug, Clone, PartialEq)]
 pub struct YieldedValue {
     /// `symbolizeSentientRegType(getValueRegLocaleAsString(getOperand(i)))` — ⛔ THE TWO XRF POINTERS
-    /// ARE SKIPPED: one address register means there is nothing to assign (`:801-806`).
+    /// ARE SKIPPED: one address register means there is nothing to assign (`:800-804`).
     pub locale: SenRegType,
     /// `ConstructAssignInstr`'s view of `getOperand(i) -> (getRegionIterArgs | getResult)[i]`.
     pub assign: Assign,
-    /// `element_sizes[i]`, ⛔ SHIFTED BY ONE UNDER A `sentient.for` (`:815-820`) because entry 0 is the
+    /// `element_sizes[i]`, ⛔ SHIFTED BY ONE UNDER A `sentient.for` (`:805-811`) because entry 0 is the
     /// loop bound's, which is the caller's index to resolve.
     pub element_size: Option<Bits>,
 }
@@ -433,14 +433,14 @@ pub struct CarriedResult {
 /// (`:874`), and an `if` without one is [`YieldParent::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IfSide {
-    /// The THEN region's terminator (`:875`).
+    /// The THEN region's terminator (`:876`).
     Then {
         /// The else region's first op — ⛔ THE JUMP IS EMITTED ONLY IF IT CARRIES A LABEL (`:878`).
         else_first: OpSite,
         /// `if_op->getNextNode()`, whose label the jump targets.
         after_if: OpSite,
     },
-    /// The ELSE region's terminator — ⛔ IT EMITS ONLY FOR AN XRF YIELD (`:886-893`).
+    /// The ELSE region's terminator — ⛔ IT EMITS ONLY FOR AN XRF YIELD (`:887-894`).
     Else,
 }
 
@@ -449,7 +449,7 @@ pub enum IfSide {
 pub enum YieldParent<'a> {
     /// `sentient.for` — a `BE`, then one assignment per used result.
     For {
-        /// ⛔ `None` IS `use_empty()`: an unused result is assigned nowhere (`:864`).
+        /// ⛔ `None` IS `use_empty()`: an unused result is assigned nowhere (`:856`).
         results: &'a [Option<CarriedResult>],
     },
     /// `sentient.if` with a non-empty else region.
@@ -478,7 +478,7 @@ pub const fn nops_of(placement: LabelPlacement) -> Nops {
     }
 }
 
-/// `!uniform_instr_region.getBlocks().back().getLastInstr().getTag().empty()` (`:832-838`) —
+/// `!uniform_instr_region.getBlocks().back().getLastInstr().getTag().empty()` (`:831-835`) —
 /// ⛔ AN EMPTY REGION HAS NO LAST INSTRUCTION, where the reference reads one back regardless.
 fn last_instr_tagged(region: &mut UniformInstrBlocks) -> bool {
     region
@@ -489,7 +489,7 @@ fn last_instr_tagged(region: &mut UniformInstrBlocks) -> bool {
 }
 
 /// `ConstructAssignInstr` + `updateLabelAndAddToCodeGraph` + the tag read both yields run per operand
-/// (`:823-841`) — ⛔ `None` BACK IS AN ASSIGNMENT THAT WAS NOT NEEDED, which is the caller's NOP case.
+/// (`:816-841`) — ⛔ `None` BACK IS AN ASSIGNMENT THAT WAS NOT NEEDED, which is the caller's NOP case.
 fn assign_yielded<A: Arch>(
     comp: Component,
     assign: &Assign,
@@ -521,7 +521,7 @@ fn assign_yielded<A: Arch>(
 ///
 /// ⭐ NO SUCCESSOR PARAMETER: a `sentient.yield` is a terminator, so `getNextNode()` is null and a
 /// label it carries can only be taken by a `NOP` (`:544-556`).
-/// ⛔ `element_size` `None` IS THE ABSENT `element_sizes` **AND** THE `-1` (`:815-822`), worth the
+/// ⛔ `element_size` `None` IS THE ABSENT `element_sizes` **AND** THE `-1` (`:805-811`), worth the
 /// identity `8 * scale` — only an assign's immediate arms read the width, and a yield assigns register
 /// to register.
 #[must_use]
@@ -584,7 +584,7 @@ pub fn lower_yield_operation<A: Arch>(
                 added_label,
             );
             for result in results.iter().flatten() {
-                // ⛔ `added_label` IS NOT UPDATED IN THIS LOOP (`:869-871`), so a `BE` that took the
+                // ⛔ `added_label` IS NOT UPDATED IN THIS LOOP (`:855-871`), so a `BE` that took the
                 // tag can hand the same tag to a result assignment.
                 let _took = assign_yielded::<A>(
                     comp,
@@ -652,9 +652,9 @@ pub struct UniformRegionSite {
 /// One assignment per value a uniform region yields, then the empty region a bare yield stands for and
 /// the regular block the last region closes.
 ///
-/// ⛔ NO NOP FOR AN UNNEEDED ASSIGNMENT, unlike [`lower_yield_operation`] (`:1088`): only a yield with
-/// no operands at all reaches `LowerCommonOperations` here.
-/// ⛔ AND ITS SUCCESSOR IS THE PARENT'S (`:544-547`), which is why `next` is a parameter.
+/// ⛔ NO NOP FOR AN UNNEEDED ASSIGNMENT, unlike [`lower_yield_operation`] (`:1086-1098`): only a yield
+/// with no operands at all reaches `LowerCommonOperations` here.
+/// ⛔ AND ITS SUCCESSOR IS THE PARENT'S (`:547-551`), which is why `next` is a parameter.
 /// ⭐ `is_xrf` IS SET AND NEVER READ THERE, so nothing here answers for it.
 #[must_use]
 pub fn lower_uniform_yield_operation<A: Arch>(
@@ -1205,7 +1205,7 @@ mod unit_tests {
     }
 
     /// e125 — a uniform region whose only op is the yield contributes an EMPTY region, and the last
-    /// region of the op closes the uniform block with a regular one (`:1105-1115`).
+    /// region of the op closes the uniform block with a regular one (`:1113-1114`).
     #[test]
     fn a_bare_uniform_yield_contributes_an_empty_region_and_the_last_one_closes_the_block() {
         let mut labels = Labels::default();
