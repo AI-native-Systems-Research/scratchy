@@ -18,17 +18,121 @@
 //! | `e093_initializeUniformizedUnit` | 4 | 47 | `dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:663` |
 
 use super::dsc_lowering::Retrieved;
-use crate::islands::dataflow_ir::Values;
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::{Val, dataflow};
-use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
+use crate::islands::dataflow_ir::{ProgramUnit, Values};
 use crate::units::{DfirUnit, NumFolds, Residency};
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e006_getTranslatorVersion
-// crustify:todo: e007_createGetLocalUnitOp
-// crustify:todo: e008_setPrecisionInUnitOp
+/// WHAT ONE DSC OF A SUPERDSC IS, as far as the version choice is concerned — `computeOp_.empty()`
+/// and `isDSC2()` (`DSC2ToDataflowIRUtils.hpp:26,30`) as the three states they enumerate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DscKind {
+    /// `dsc.computeOp_.empty()` — a DSC with no compute op at all.
+    NoComputeOp,
+    /// `!dsc.isDSC2()` — a DSC1.0 schedule.
+    Dsc1,
+    /// A DSC2.0 schedule with a compute op.
+    Dsc2,
+}
+
+/// WHICH TRANSLATOR A SUPERDSC NEEDS — the `int &version` out-parameter and the `LogicalResult`
+/// read as ONE answer.
+///
+/// ⛔⛔ THE TWO V1 ARMS ARE INDISTINGUISHABLE AT THE ONLY CALLER, AND THEY ARE STILL BOTH HERE.
+/// `runTranslator` returns `failure()` both on `failed(getTranslatorVersion(..))`
+/// (`DSC2ToDataflowIR.cpp:546-548`) and from its own trailing `else` for any version but 3
+/// (`:558-560`) — and both arms set `version = 1`. So the `success()`/`failure()` distinction reaches
+/// nothing; collapsing it would still be dropping a value the reference computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslatorVersion {
+    /// `version = 3`, `success()` — every DSC is a DSC2.0 with a compute op.
+    V3,
+    /// `version = 1`, `success()` — a DSC1.0 was found.
+    V1,
+    /// `version = 1`, `failure()` — a DSC with no compute op was found first.
+    V1NoComputeOp,
+}
+
+/// Replaces: e006_getTranslatorVersion
+///
+/// WHICH TRANSLATOR THE SUPERDSC NEEDS — `DSC2ToDataflowIRUtils.hpp:22`.
+///
+/// ⛔ FIRST TRIP WINS AND THE LOOP STOPS: a compute-less DSC standing AFTER a DSC1.0 answers
+/// [`TranslatorVersion::V1`], not [`TranslatorVersion::V1NoComputeOp`] (`:25-33`).
+///
+/// ⭐ AND AN EMPTY `dscs_` IS [`TranslatorVersion::V3`] — the initial `version = 3` with nothing to
+/// lower it.
+#[must_use]
+pub fn translator_version(dscs: &[DscKind]) -> TranslatorVersion {
+    for dsc in dscs {
+        match dsc {
+            DscKind::NoComputeOp => return TranslatorVersion::V1NoComputeOp,
+            DscKind::Dsc1 => return TranslatorVersion::V1,
+            DscKind::Dsc2 => {}
+        }
+    }
+    TranslatorVersion::V3
+}
+
+/// Replaces: e007_createGetLocalUnitOp
+///
+/// THE HANDLE FOR A REGISTER FILE OF A UNIT ALREADY HELD — `DSC2ToDataflowIRUtils.hpp:44`.
+///
+/// ⛔⛔ THE REUSE ARM IS UNREACHABLE FROM EVERY CALLER IN THE TREE, AND IT IS STILL EMITTED.
+/// `component_to_handler_` never keys the three LRFREGs — `buildNeighborUnits` files their results
+/// under the generic `LRFREG` (`:177-179`) — and `PTXRF`, `PTARF` and `L0_SCALE` are each asked for
+/// exactly once per unit, after `initializeUnit`'s `component_to_handler_.clear()` (`:628`). So
+/// `count(comp)` is 0 at every call site; deleting the else arm would be a port that could not state
+/// which arm its callers take.
+///
+/// ⭐ THE RESULT TYPE IS `index`, NOT THE FILE'S (`:48`): it is a HANDLE to the file, the same shape a
+/// `get_unit` binds, and [`dataflow::LocalUnit::spelling`] is the `name=` the reference reads out of
+/// `senComponentsToString`.
+pub fn create_get_local_unit_op(
+    vals: &mut Values,
+    held: Option<Val>,
+    which: dataflow::LocalUnit,
+    of: Val,
+) -> Retrieved {
+    match held {
+        Some(handle) => Retrieved::Reused(handle),
+        None => Retrieved::Created(dataflow::Op::GetLocalUnit {
+            result: vals.mint(),
+            of,
+            which,
+        }),
+    }
+}
+
+/// Replaces: e008_setPrecisionInUnitOp
+///
+/// PUTS `precision =` ON A COMPUTE UNIT'S PROGRAM AND ON NO OTHER — `DSC2ToDataflowIRUtils.hpp:143`.
+///
+/// ⛔⛔ THE PARTIAL-MAP `find` AND THE `is_any_of(PT, PE, SFP)` ARE ONE TEST. The `find != end()`
+/// guard (`:146-147`) covers a map that lacks `L0`, `CONSTANT` and `SFPRING`
+/// (`arch_enums.cpp:124-211`), none of which is PT, PE or SFP — so [`DfirUnit::generic`], which is
+/// total where that map throws, answers both halves.
+///
+/// ⛔ THE COMPONENT IS THE UNIT'S OWN. `unit_op.on.kind()` is what `comp` names, so taking them
+/// separately would be a pair that could disagree about which unit is being written.
+///
+/// ⛔ AND `DT_CHECK_MSG(precision != "", "Invalid compute precision")` (`:150`) IS
+/// [`dataflow::Precision`] — an empty spelling is not one of its arms.
+pub fn set_precision_in_unit_op<A: Arch>(
+    unit_op: &mut ProgramUnit<A>,
+    precision: dataflow::Precision,
+) {
+    if matches!(
+        unit_op.on.kind().generic(),
+        GenericComp::Pt | GenericComp::Pe | GenericComp::Sfp
+    ) {
+        unit_op.precision = Some(precision);
+    }
+}
 
 /// Replaces: e009_constructAVectorOfIndexType
 ///
@@ -125,11 +229,15 @@ pub fn create_get_unit_op(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{append_index_types, create_get_unit_op, error_diagnostic};
+    use super::{
+        DscKind, TranslatorVersion, append_index_types, create_get_local_unit_op,
+        create_get_unit_op, error_diagnostic, set_precision_in_unit_op, translator_version,
+    };
+    use crate::arch::Dd2;
     use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::Retrieved;
-    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::{Val, dataflow};
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{ProgramUnit, Units, Values};
     use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency, Row};
 
     /// ⛔ IT APPENDS, THOUGH NOTHING IN THE TREE DEPENDS ON THAT: both call sites hand it a fresh
@@ -209,5 +317,78 @@ mod unit_tests {
             Retrieved::Reused(handle)
         );
         assert_eq!(vals.issued(), 1, "the reuse arm creates no value");
+    }
+    /// 🎯 006/110 — ⛔ FIRST TRIP WINS: the compute-less DSC behind a DSC1.0 is never reached, and an
+    /// empty SuperDSC is the initial `version = 3`.
+    #[test]
+    fn the_version_is_decided_by_the_first_dsc_that_is_not_a_dsc2() {
+        assert_eq!(
+            translator_version(&[DscKind::Dsc2, DscKind::Dsc2]),
+            TranslatorVersion::V3
+        );
+        assert_eq!(translator_version(&[]), TranslatorVersion::V3);
+        assert_eq!(
+            translator_version(&[DscKind::Dsc2, DscKind::NoComputeOp, DscKind::Dsc1]),
+            TranslatorVersion::V1NoComputeOp
+        );
+        // ⛔ ORDER, NOT PRESENCE: the same two DSCs the other way round answer differently.
+        assert_eq!(
+            translator_version(&[DscKind::Dsc1, DscKind::NoComputeOp]),
+            TranslatorVersion::V1
+        );
+    }
+
+    /// 🎯 007/110 — ⛔⛔ THE REUSE ARM IS UNREACHABLE FROM EVERY CALLER, so this is the only place it
+    /// is ever taken; the created arm is what the translator actually emits.
+    #[test]
+    fn an_unheld_register_file_creates_a_get_local_unit_on_the_unit_it_belongs_to() {
+        let mut vals = Values::default();
+        let unit = vals.mint();
+        assert_eq!(
+            create_get_local_unit_op(&mut vals, None, dataflow::LocalUnit::PtXrf, unit),
+            Retrieved::Created(dataflow::Op::GetLocalUnit {
+                result: Val(1),
+                of: unit,
+                which: dataflow::LocalUnit::PtXrf,
+            })
+        );
+        let held = vals.mint();
+        assert_eq!(
+            create_get_local_unit_op(&mut vals, Some(held), dataflow::LocalUnit::PtXrf, unit),
+            Retrieved::Reused(held)
+        );
+        assert_eq!(vals.issued(), 3, "the reuse arm mints nothing");
+    }
+
+    /// 🎯 008/110 — ⛔ THE PT, PE AND SFP TAKE IT AND NOTHING ELSE DOES: a mover's program unit is
+    /// left without the attribute, which is what `find != end()` plus `is_any_of(PT, PE, SFP)` says.
+    #[test]
+    fn only_a_compute_unit_takes_the_precision_attribute() {
+        let unit_of = |kind| ProgramUnit::<Dd2> {
+            on: Units::one(kind, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        };
+        for kind in [
+            DfirUnit::PtRow(Row::checked(3).expect("row 3")),
+            DfirUnit::Pe,
+            DfirUnit::Sfp,
+        ] {
+            let mut unit = unit_of(kind);
+            set_precision_in_unit_op(&mut unit, dataflow::Precision::Fp8);
+            assert_eq!(unit.precision, Some(dataflow::Precision::Fp8), "{kind:?}");
+        }
+        // ⛔ AND THE THREE THE REFERENCE'S MAP THROWS ON ARE AMONG THE ONES IT SKIPS.
+        for kind in [
+            DfirUnit::Lxlu,
+            DfirUnit::L0,
+            DfirUnit::Constant,
+            DfirUnit::SfpRing,
+        ] {
+            let mut unit = unit_of(kind);
+            set_precision_in_unit_op(&mut unit, dataflow::Precision::Fp8);
+            assert_eq!(unit.precision, None, "{kind:?}");
+        }
     }
 }

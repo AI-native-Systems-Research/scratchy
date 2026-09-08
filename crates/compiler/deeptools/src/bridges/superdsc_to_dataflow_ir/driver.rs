@@ -18,14 +18,159 @@
 //! | `e110_runTranslator` | 10 | 32 | `dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:534` |
 
 use super::dsc_lowering::Component;
-use crate::units::Corelet;
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::dialects::Op;
+use crate::islands::dataflow_ir::{Grid, Program, ProgramName, ProgramUnits};
+use crate::units::{Core, Corelet, NumFolds};
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e003_startDataflowIRGeneration
-// crustify:todo: e004_stopDataflowIRGeneration
-// crustify:todo: e005_areFoldedAddressesSameAcrossFoldsAndCoresForGivenCorelet
+/// THE MODULE AND ITS ONE FUNCTION, BEFORE ANYTHING IS PUSHED INTO THEM — `module_op_` and
+/// `dataflow_func_op_` between entry 003 and entry 004.
+///
+/// ⛔ NOTHING TO TEST FOR EMPTINESS, WHICH IS THE POINT. `if (module_op_) { emitRemark("Module op is
+/// already created"); return; }` (`DSC2ToDataflowIR.cpp:21-24`) guards a FIELD that may or may not
+/// have been filled; a value handed back by the call that makes it cannot be made twice, so
+/// "already created" is not a state that exists here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scaffold {
+    /// The module's symbol, which is also its function's name.
+    pub name: ProgramName,
+    /// `attributes {grid = [N]}` on the function.
+    pub grid: Grid,
+}
+
+/// Replaces: e003_startDataflowIRGeneration
+///
+/// OPENS THE MODULE, ITS `func.func` AND ITS ONE EMPTY ENTRY BLOCK — `DSC2ToDataflowIR.cpp:20`.
+///
+/// ⛔ THE SYMBOL IS NOT THE LITERAL `"dataflowProgram"`, AND THAT IS DELIBERATE. The reference builds
+/// ONE module per translator instance and names its function by that literal (`:29-31`); this island
+/// emits one named module per program and its printer writes the same symbol on the module and the
+/// function, so a fixed literal would make every program in a run collide.
+///
+/// ⭐ AND `auto &entry_block = *dataflow_func_op_.addEntryBlock()` (`:214`) IS UNUSED ON THE NEXT
+/// LINE: the block is the function's, and what goes into it is entry 004's argument.
+#[must_use]
+pub fn start_dataflow_ir_generation(name: ProgramName, grid: Grid) -> Scaffold {
+    Scaffold { name, grid }
+}
+
+/// Replaces: e004_stopDataflowIRGeneration
+///
+/// CLOSES THE FUNCTION AND HANDS BACK THE MODULE — `DSC2ToDataflowIR.cpp:39`.
+///
+/// ⛔ THE TWO INSERTION POINTS ARE ONE BEHAVIOUR. `setInsertionPointToStart(&front())` on an empty
+/// block and `setInsertionPointAfter(&front().back())` otherwise (`:41-45`) both mean APPEND, so the
+/// `func.return` lands last either way — which is where `print.rs` writes it, unconditionally.
+///
+/// ⛔ AND `mlir::verify(module_op_)` (`:50-52`) HAS NOTHING LEFT TO REFUSE. It checks a mutable op
+/// graph; here the structure is in the types — [`ProgramUnits`] is non-empty, `Units` is non-empty
+/// and every operand is a minted `Val` — so the ill-formed module it exists to catch is not
+/// constructible, and the check is not a runtime one to reproduce.
+#[must_use]
+pub fn stop_dataflow_ir_generation<A: Arch>(
+    scaffold: Scaffold,
+    preamble: Vec<Op>,
+    units: ProgramUnits<A>,
+) -> Program<A> {
+    Program {
+        name: scaffold.name,
+        grid: scaffold.grid,
+        preamble,
+        units,
+        arch: core::marker::PhantomData,
+    }
+}
+
+/// A NON-EMPTY LIST OF THE IDS A DSC SAYS IT USES — `core_ids_used` and `corelet_ids_used`
+/// (`DSC2ToDataflowIR.cpp:227-228`).
+///
+/// ⛔⛔ THE TWO `DT_CHECK(!…empty())` (`:230-231`) ARE THIS TYPE, AND THEY MATTER BECAUSE THE
+/// FUNCTION IS A CONJUNCTION. An empty list never enters the nested loop and falls straight to
+/// `return true` — "the address is the same at every fold" asserted over no address at all, which is
+/// the answer that makes folding look unnecessary.
+///
+/// ⭐ [`corelets_used`] ALWAYS YIELDS AT LEAST CORELET 0, so its head is always there to hand over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Used<T> {
+    head: T,
+    rest: Vec<T>,
+}
+
+impl<T: Copy> Used<T> {
+    /// The list, its first entry being what makes it a list.
+    #[must_use]
+    pub fn of(head: T, rest: Vec<T>) -> Self {
+        Self { head, rest }
+    }
+
+    /// Every id, head first.
+    pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        core::iter::once(self.head).chain(self.rest.iter().copied())
+    }
+}
+
+/// HOW MANY ADDRESSES ONE (core, corelet) PAIR'S UNROLLED FOLD MAP YIELDS —
+/// `getAllDataWithMapUnrolled({{0, core_id}, {1, corelet_id}})`'s size, which is all entry 005 reads
+/// of it (`DSC2ToDataflowIR.cpp:232-235`).
+///
+/// ⛔ `DT_CHECK_MSG(is_any_of(foldedAddresses.size(), 1, num_folds_), "Fold addresses can either be
+/// constant or should be available for each fold")` (`:236-238`) IS THIS ENUM: two sizes and nothing
+/// between them, so a third is not a case to reject after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldedAddresses {
+    /// One address for the whole map — `size == 1`.
+    Constant,
+    /// One address per fold — `size == num_folds_`.
+    PerFold(NumFolds),
+}
+
+impl FoldedAddresses {
+    /// The size the reference tests.
+    ///
+    /// ⭐ SO `PerFold(NumFolds(1))` READS AS CONSTANT, exactly as `is_any_of(1, 1, 1)` does: with one
+    /// fold the two states are the same state.
+    #[must_use]
+    pub fn count(self) -> u32 {
+        match self {
+            Self::Constant => 1,
+            Self::PerFold(folds) => folds.0,
+        }
+    }
+}
+
+/// Replaces: e005_areFoldedAddressesSameAcrossFoldsAndCoresForGivenCorelet
+///
+/// WHETHER ONE START ADDRESS IS THE SAME AT EVERY FOLD OF EVERY (core, corelet) —
+/// `DSC2ToDataflowIR.cpp:226`.
+///
+/// ⛔ THE TEST IS `size != 1`, NOT `size != num_folds_` (`:240-242`) — so the answer is *"there is
+/// only one address"* and not *"the addresses agree"*, and [`FoldedAddresses::count`] is what keeps
+/// the one-fold case answering the way the reference's `is_any_of` lets it.
+///
+/// ⭐ THE UNROLLED MAP IS THE CALLER'S. This crate has no `FoldManager` to unroll, so the lookup
+/// arrives as a closure over the pair the loops name — the same seam [`folds_are_needed`] takes this
+/// whole answer through.
+pub fn folded_addresses_are_same<F>(
+    cores: &Used<Core>,
+    corelets: &Used<Corelet>,
+    addresses: F,
+) -> bool
+where
+    F: Fn(Core, Corelet) -> FoldedAddresses,
+{
+    for core in cores.iter() {
+        for corelet in corelets.iter() {
+            if addresses(core, corelet).count() != 1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Replaces: e042_terminate
 ///
 /// THE TRANSLATOR'S GIVE-UP MESSAGE — `DSC2ToDataflowIR.cpp:221`.
@@ -205,9 +350,17 @@ pub fn folds_are_needed(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Component, FoldDimFunc, StartAddrOf, Transfer, corelets_used, folds_are_needed, terminate,
+        Component, FoldDimFunc, FoldedAddresses, StartAddrOf, Transfer, Used, corelets_used,
+        folded_addresses_are_same, folds_are_needed, start_dataflow_ir_generation,
+        stop_dataflow_ir_generation, terminate,
     };
-    use crate::units::{Corelet, DfirUnit, Row};
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::dialects::Val;
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+    };
+    use crate::units::{Core, Corelet, DfirUnit, NumFolds, Row};
     use std::cell::RefCell;
 
     /// The component under test and one that is not it.
@@ -378,5 +531,75 @@ mod unit_tests {
         assert!(!folds_are_needed(2, &[], &transfers, comp, |_, _| {
             unreachable!("no end names this component")
         }));
+    }
+    /// 🎯 003/110 · 🎯 004/110 — ⭐ THE PAIR IS ONE MODULE: the scaffold carries the symbol and the
+    /// grid, and closing it over a non-empty unit list is what makes a program.
+    #[test]
+    fn the_scaffold_and_its_close_make_one_named_module() {
+        let name = ProgramName {
+            group: GroupId(4),
+            index: OpIndex(2),
+            func: OpFunc::Add,
+        };
+        let scaffold = start_dataflow_ir_generation(name, Grid::single());
+        assert_eq!(scaffold.name, name);
+        assert_eq!(scaffold.grid, Grid::single());
+
+        let unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Sfp, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        };
+        let program = stop_dataflow_ir_generation(
+            scaffold,
+            Vec::new(),
+            ProgramUnits::of(unit.clone(), vec![]),
+        );
+        assert_eq!(program.name, name);
+        assert_eq!(program.grid, Grid::single());
+        assert!(program.preamble.is_empty());
+        assert_eq!(program.units.iter().collect::<Vec<_>>(), vec![&unit]);
+        // ⛔ THE SYMBOL IS THE PROGRAM'S, NOT THE LITERAL THE REFERENCE HARDCODES.
+        assert_eq!(program.name.to_string(), "g4_2_add");
+        assert_ne!(program.name.to_string(), "dataflowProgram");
+    }
+
+    /// 🎯 005/110 — ⛔ THE TEST IS `size != 1`, so one fold reads as constant from either variant and
+    /// the first pair with more than one address ends the walk.
+    #[test]
+    fn one_address_per_pair_is_the_whole_question() {
+        let cores = Used::of(
+            Core::checked(0).expect("core 0"),
+            vec![Core::checked(1).expect("core 1")],
+        );
+        let corelets = Used::of(
+            Corelet::checked(0).expect("corelet 0"),
+            vec![Corelet::checked(1).expect("corelet 1")],
+        );
+
+        let asked = RefCell::new(Vec::new());
+        assert!(folded_addresses_are_same(
+            &cores,
+            &corelets,
+            |core, corelet| {
+                asked.borrow_mut().push((core.get(), corelet.get()));
+                FoldedAddresses::Constant
+            }
+        ));
+        assert_eq!(*asked.borrow(), vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+
+        // ⭐ ONE FOLD IS THE SAME STATE TWICE — `is_any_of(1, 1, num_folds_)` with `num_folds_ == 1`.
+        assert!(folded_addresses_are_same(&cores, &corelets, |_, _| {
+            FoldedAddresses::PerFold(NumFolds::ONE)
+        }));
+
+        // ⛔ AND ELEVEN ADDRESSES IS NOT ONE ADDRESS: the walk stops on the first such pair.
+        let count = RefCell::new(0_u32);
+        assert!(!folded_addresses_are_same(&cores, &corelets, |_, _| {
+            *count.borrow_mut() += 1;
+            FoldedAddresses::PerFold(NumFolds(11))
+        }));
+        assert_eq!(*count.borrow(), 1);
     }
 }
