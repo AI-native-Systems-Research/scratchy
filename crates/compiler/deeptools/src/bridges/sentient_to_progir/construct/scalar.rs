@@ -918,7 +918,7 @@ pub fn construct_xrf_add_instr<A: Arch>(ptr: XrfPtr, val: i64) -> UniformInstrIn
     instr
 }
 
-/// WHAT A `JADD` ADDS OR A `JSUB` SUBTRACTS — the four locale pairs of `:695-708` and `:971-985`,
+/// WHAT A `JADD` ADDS OR A `JSUB` SUBTRACTS — the four locale pairs of `:695-708` and `:973-986`,
 /// of which only two outcomes differ, and identically in both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JcrOperands {
@@ -942,7 +942,7 @@ pub enum JcrOperands {
 ///
 /// The jump-counter subtract: a loop counter or a jump counter, less an immediate.
 ///
-/// ⛔ THE REFERENCE DOES NOT DISTINGUISH `a - imm` FROM `imm - a` (`:971-985`) — both orders read the
+/// ⛔ THE REFERENCE DOES NOT DISTINGUISH `a - imm` FROM `imm - a` (`:973-986`) — both orders read the
 /// register into `src0` and the constant into `imm`, so the operand order is lost there and here.
 #[must_use]
 pub fn construct_jsub_instr(operands: JcrOperands, target: RegIndex) -> UniformInstrInfo {

@@ -74,7 +74,7 @@ impl LxHalf {
     }
 }
 
-/// WHERE A SET-DEST-MASK MAY POINT — the three spellings its `DT_CHECK` admits (`:3571-3574`).
+/// WHERE A SET-DEST-MASK MAY POINT — the three spellings its `DT_CHECK` admits (`:3570-3572`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskDest {
     /// `sfp`.
@@ -98,7 +98,7 @@ impl MaskDest {
 
     /// The destination a unit is, and `None` where the reference's `DT_CHECK` aborts.
     ///
-    /// ⛔ `pt` IS A SUBSTRING TEST, NOT A UNIT (`:3566-3567`): every `ptrow<N>` answers `pt`, and so
+    /// ⛔ `pt` IS A SUBSTRING TEST, NOT A UNIT (`:3569`): every `ptrow<N>` answers `pt`, and so
     /// does `crossptnlink`, whose spelling contains it too.
     #[must_use]
     pub fn of_unit(unit: DfirUnit) -> Option<MaskDest> {
@@ -114,7 +114,7 @@ impl MaskDest {
 }
 
 /// WHAT NAMES A SET-DEST-MASK'S DESTINATION — the reference's `get_unit` / `query_map` pair
-/// (`:3565,3577`).
+/// (`:3567,3578`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetDstMaskTarget<'a> {
     /// `dataflow.get_unit` — one destination for every unit.
@@ -128,7 +128,7 @@ pub enum SetDstMaskTarget<'a> {
 pub enum SetDstMaskRefusal {
     /// The mapping itself — [`add_entry_to_operand_map`]'s own offenders.
     Mapped(OperandMapRefusal),
-    /// *"unexpected destination unit"* (`:3574`), keyed by the unit whose destination it is.
+    /// *"unexpected destination unit"* (`:3572,3591`), keyed by the unit whose destination it is.
     UnexpectedDestination(UnitKey),
 }
 
@@ -136,7 +136,7 @@ pub enum SetDstMaskRefusal {
 ///
 /// Point an LX half's transfer at the unit that consumes it, via the SFP.
 ///
-/// ⛔ THE MAPPED PATH REWRITES THE MAP IT JUST BUILT (`:3577-3588`): mode `none` writes each value
+/// ⛔ THE MAPPED PATH REWRITES THE MAP IT JUST BUILT (`:3582-3596`): mode `none` writes each value
 /// unit's own spelling, and the loop replaces it with the collapsed [`MaskDest`] — so a unit whose
 /// destination is unusable keeps no value at all here, where the reference aborts.
 #[must_use]
@@ -196,7 +196,7 @@ pub fn construct_set_dst_mask_instr(
     }
 }
 
-/// WHAT NAMES A SET-DEST'S TARGET — the reference's `get_unit` / `query_map` pair (`:3609,3685`).
+/// WHAT NAMES A SET-DEST'S TARGET — the reference's `get_unit` / `query_map` pair (`:3609,3643`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetDestTarget<'a> {
     /// `dataflow.get_unit` — this unit, and the one it sends to.
@@ -214,10 +214,10 @@ pub enum SetDestTarget<'a> {
 ///
 /// Aim the SFP's send at another core's SFP — a one-hot core mask.
 ///
-/// ⛔ THE `get_unit` PATH IS ONE ENTRY OF THE MAPPED ONE (`:3612-3629` against `cpp:170-176`): the
+/// ⛔ THE `get_unit` PATH IS ONE ENTRY OF THE MAPPED ONE (`:3612-3635` against `cpp:143-151`): the
 /// same SFP-to-SFP and same-corelet checks, the same `1 << core`, so both go through
 /// [`add_entry_to_operand_map`] and only the destination of the value differs.
-/// ⛔ SFP ONLY (`:3606-3608`), and the trailing `llvm_unreachable` is unreachable by the type.
+/// ⛔ SFP ONLY (`:3605-3607`), and the trailing `llvm_unreachable` is unreachable by the type.
 #[must_use]
 pub fn construct_set_dest_instr(
     target: SetDestTarget<'_>,
@@ -252,7 +252,7 @@ pub fn construct_set_dest_instr(
     }
 }
 
-/// THE ONE VALUE AN IMMCOPY SPLATS — the reference's `constant` / `query_map` pair (`:3667-3669`).
+/// THE ONE VALUE AN IMMCOPY SPLATS — the reference's `constant` / `query_map` pair (`:3661-3662`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImmCopyValue<'a> {
     /// `sentient.constant` — one immediate for every unit.
@@ -262,7 +262,7 @@ pub enum ImmCopyValue<'a> {
 }
 
 /// WHICH PRECISION AN IMMCOPY'S `mode` BIT SPELLS — *"expected fp16 or fp32 precision as per the
-/// ISA"* (`:3684-3686`), so the other twelve have no spelling here.
+/// ISA"* (`:3680-3682`), so the other twelve have no spelling here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImmCopyPrecision {
     /// `fp16`.
@@ -298,7 +298,7 @@ pub struct ImmCopySplat<'a> {
 /// WHAT AN IMMCOPY COULD NOT BE GIVEN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImmCopyRefusal {
-    /// *"fp32 precision only valid in SFP in DD2"* (`:3688-3690`).
+    /// *"fp32 precision only valid in SFP in DD2"* (`:3684-3686`).
     Fp32OnPe,
     /// One unit's folds carry different constants — the disagreement
     /// [`UniformInstrInfo::add_const_entries_to_operand_map`] hands back.
@@ -310,7 +310,7 @@ pub enum ImmCopyRefusal {
 /// Turn a splat of a constant into an IMMCOPY: the immediate in the op's format, the mask inverted
 /// out of 255, and the target register.
 ///
-/// ⛔ `unrollIncrResult` IS OMITTED, NOT DEFAULTED (`:3697-3699`): the reference refuses an unrolled
+/// ⛔ `unrollIncrResult` IS OMITTED, NOT DEFAULTED (`:3693-3695`): the reference refuses an unrolled
 /// target here, so no field carries it.
 /// ⛔ AND A DD2 PE SETS NO `mode` AT ALL — that branch is the fp32 refusal, not a mode of its own.
 #[must_use]
@@ -463,9 +463,9 @@ pub fn construct_samv_reset_instruction(
 /// Replaces: e066_ConstructSetMaskInstr
 ///
 /// Load the PT's mask register with a constant.
-/// ⛔ PT ONLY, SO THERE IS NO COMPONENT PARAMETER (`:4097-4098`).
+/// ⛔ PT ONLY, SO THERE IS NO COMPONENT PARAMETER (`:4098-4099`).
 /// ⛔ AND THE MASK VALUE IS A CONSTANT BY THE TYPE: `llvm_unreachable("expecting ConstantOp from
-/// mask_value operand")` (`:4111`) is unreachable when a non-constant cannot be written down.
+/// mask_value operand")` (`:4109`) is unreachable when a non-constant cannot be written down.
 #[must_use]
 pub fn construct_set_mask_instr(mask_value: i64, dbg_name: Option<&str>) -> UniformInstrInfo {
     let instr = UniformInstrInfo::of(OpCode::SETMASK);
@@ -504,8 +504,9 @@ mod unit_tests {
         }
     }
 
-    /// IBM'S OWN `setmask_incrmask.mlir:13` — `PTOP_INCRMASK ::  // incr_mask #1`: the opcode, the
-    /// dbgName as the comment, and NO operand fields.
+    /// IBM'S OWN `setmask_incrmask.mlir:13` — `PTOP_INCRMASK :: be:be  // incr_mask #1`: the opcode,
+    /// the dbgName as the comment, and NO operand field of its own — `be` is the block-end marker a
+    /// later pass adds (`LowerSentientHelper.cpp:75-78`).
     #[test]
     fn incr_mask_carries_only_the_dbg_name() {
         let named = construct_incr_mask_instr(Some("incr_mask #1"));
@@ -536,7 +537,7 @@ mod unit_tests {
         assert_eq!(reset.comment, Comment::None);
     }
 
-    /// IBM'S OWN `setmask_incrmask.mlir:11,17` — `PTOP_SETMASK :: imm:0  // set_mask #1` and
+    /// IBM'S OWN `setmask_incrmask.mlir:9,17` — `PTOP_SETMASK :: imm:0  // set_mask #1` and
     /// `imm:2  // set_mask #2`.
     #[test]
     fn set_mask_carries_the_constant_as_its_immediate() {
@@ -549,8 +550,8 @@ mod unit_tests {
         assert_eq!(second.comment, Comment::None);
     }
 
-    /// IBM'S OWN `setdstmask.mlir` — `LX_SETDSTMASK :: mode:pt  // set dest for transfer from lxlu
-    /// to pt, via sfp`, and the `l0su` line beside it.
+    /// IBM'S OWN `uniform-nop-incorrect-label.mlir:9,15` — `LX_SETDSTMASK :: mode:pt  // set dest
+    /// for transfer from lxlu to pt, via sfp`, and the `l0su` line beside it.
     #[test]
     fn set_dst_mask_names_the_destination_and_repeats_it_in_the_comment() {
         let (pt, refused) =
@@ -580,7 +581,7 @@ mod unit_tests {
         assert_eq!(MaskDest::of_unit(DfirUnit::Pe), None);
     }
 
-    /// IBM'S OWN `setdest.mlir` — `SFP_SETDEST :: imm:2  // set dest for transfer from SFP of core 0
+    /// IBM'S OWN `sfp-ring.mlir:9,25` — `SFP_SETDEST :: imm:2  // set dest for transfer from SFP of core 0
     /// to SFP of core 1`, and the core 30 → 31 line, whose mask is the top bit.
     #[test]
     fn set_dest_masks_the_target_core_one_hot() {
@@ -605,9 +606,10 @@ mod unit_tests {
         );
     }
 
-    /// IBM'S OWN `splat.mlir` — `PE_IMMCOPY :: imm:12121 mask:255 replica:1 tgtrf:R0  // splat/pad
-    /// to create vector` (a DD2 PE, so NO `mode`) and `SFP_IMMCOPY :: imm:25256 mask:255 mode:fp32
-    /// replica:0 tgtrf:R0  // splat #2 splat/pad to create vector`.
+    /// IBM'S OWN TWO IMMCOPY LINES — `PE_IMMCOPY :: imm:12121 mask:255 replica:1 tgtrf:R0  //
+    /// splat/pad to create vector` (a DD2 PE, so NO `mode`, `splat-vector-reg-init.mlir:17`) and
+    /// `SFP_IMMCOPY :: imm:25256 mask:255 mode:fp32 replica:0 tgtrf:R0  // splat #2 splat/pad to
+    /// create vector` (`splat_constant.mlir:9`).
     #[test]
     fn imm_copy_carries_the_constant_the_inverted_mask_and_the_target_register() {
         let mut copy_ops = 0;
@@ -679,7 +681,7 @@ mod unit_tests {
         assert!(refused.is_empty());
     }
 
-    /// IBM'S OWN `samv.mlir` — `LX_SAMV :: maskall:no mvridx:MVR0 numvalidentry:12 precision:8b
+    /// IBM'S OWN `samv.mlir:8` — `LX_SAMV :: maskall:no mvridx:MVR0 numvalidentry:12 precision:8b
     /// sliceidxsl:5 wsllen:8b xslinner:yes  // samv #1`.
     #[test]
     fn samv_carries_all_seven_of_the_ops_own_fields() {

@@ -426,7 +426,7 @@ pub enum MapMode {
 }
 
 /// ONE DEFINING OP A UNIFORM MAPPING'S VALUE CAN BE — the three `dyn_cast`s of the value arm
-/// (`cpp:150,153,196`).
+/// (`cpp:117,122,164`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappedOp {
     /// `sentient.constant`, scaled by the caller's factor.
@@ -437,7 +437,7 @@ pub enum MappedOp {
     /// campaign's 130.
     Multicast(i64),
     /// ⛔ ANY OTHER OP, AND IT IS LOAD-BEARING: `operand_map_[name][unit]` default-constructs the
-    /// entry before the dispatch (`cpp:147`), so a fourth kind leaves an UNKNOWN value behind rather
+    /// entry before the dispatch (`cpp:116`), so a fourth kind leaves an UNKNOWN value behind rather
     /// than no entry at all.
     Other,
 }
@@ -457,9 +457,9 @@ pub struct MappedEntry {
 /// WHAT A MAPPED FIELD COULD NOT BE GIVEN — the `DT_CHECK`s of the value arm, as offenders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperandMapRefusal {
-    /// One unit's folds disagree — *"Folding in instruction fields are not supported"* (`cpp:145`).
+    /// One unit's folds disagree — *"Folding in instruction fields are not supported"* (`cpp:114-115`).
     FoldingNeeded(UnitKey),
-    /// `set_dest_tgt` between anything but two SFPs (`cpp:170-173`).
+    /// `set_dest_tgt` between anything but two SFPs (`cpp:143-146`).
     SetDestNotSfp {
         /// The key unit.
         key: UnitKey,
@@ -467,7 +467,7 @@ pub enum OperandMapRefusal {
         value: UnitKey,
     },
     /// `set_dest_tgt` across corelets, or from a unit with none — the reference's `corelet_id >= 0`
-    /// and its *"Currently SFP can only send data to the same corelet of another core"* (`cpp:167,174`).
+    /// and its *"Currently SFP can only send data to the same corelet of another core"* (`cpp:137,147-149`).
     SetDestCorelet {
         /// The key unit.
         key: UnitKey,
@@ -475,7 +475,7 @@ pub enum OperandMapRefusal {
         value: UnitKey,
     },
     /// `unit_name` for a unit that is no load consumer — `updateProperConsumer`'s own `DT_CHECK`
-    /// (`Utils.cpp:104`), reached through this mode's generic-component lookup.
+    /// (`Utils.cpp:106`), reached through this mode's generic-component lookup.
     NotAConsumer(UnitKey),
 }
 
@@ -490,7 +490,7 @@ pub struct MappedField {
 }
 
 /// WHICH LOAD CONSUMER A UNIT IS — `senCompToGenericComp` then the four-set `updateProperConsumer`
-/// admits (`cpp:157-163`, `Utils.cpp:104`).
+/// admits (`cpp:125-129`, `Utils.cpp:106`).
 fn consumer_unit(unit: DfirUnit) -> Option<ConsumerUnit> {
     match unit.generic() {
         GenericComp::Pe => Some(ConsumerUnit::Pe),
@@ -516,8 +516,8 @@ fn entry_of<'map>(per_unit: &'map mut Vec<(UnitKey, Operand)>, unit: UnitKey) ->
 ///
 /// One field's value on every unit of a uniform mapping, read out of each key's mapped op.
 /// ⛔ THE FOLD ID IS DEAD BY THE CHECK ABOVE IT: every `folding_needed ? … , id : …` writes the common
-/// operand, because the branch is only taken where the `DT_CHECK` has already aborted (`cpp:145`).
-/// ⛔ AND AGREEMENT IS TESTED PER UNIT NAME, NOT PER ENTRY (`cpp:69-104`) — value equality here, where
+/// operand, because the branch is only taken where the `DT_CHECK` has already aborted (`cpp:114-115`).
+/// ⛔ AND AGREEMENT IS TESTED PER UNIT NAME, NOT PER ENTRY (`cpp:64-105`) — value equality here, where
 /// the reference compares SSA identity and then structural equivalence, allowing two multicast ops
 /// with the same producer to differ.
 #[must_use]
@@ -589,7 +589,7 @@ pub fn add_entry_to_operand_map(entries: &[MappedEntry], mode: MapMode, scale: f
                 }
             },
             MappedOp::Multicast(encoded) => {
-                // ⚠️ NARROWED TO `int` THERE (`cpp:199`) and kept whole here.
+                // ⚠️ NARROWED TO `int` THERE (`cpp:167`) and kept whole here.
                 entry_of(&mut per_unit, entry.key).set(None, OperandValue::Int(encoded));
             }
             // The default-constructed entry, and nothing written into it.

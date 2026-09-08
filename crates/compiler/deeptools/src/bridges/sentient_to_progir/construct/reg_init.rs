@@ -377,8 +377,8 @@ pub enum ImmSource {
 /// mapping becomes the instruction's own per-unit map.
 /// ⛔ `setOperandMap` REPLACES THE MAP (`UniformInstrAndBlock.hpp:133`) — every per-unit field the
 /// instruction already carried is dropped, not merged.
-/// ⚠️ AND THE SCALING IS FLOATING POINT HERE against integer in [`get_reg_imm_vals`] (`:4133` vs
-/// `LowerSentientHelper.cpp:1147`), so one immediate can round two ways.
+/// ⚠️ AND THE SCALING IS FLOATING POINT HERE against integer in [`get_reg_imm_vals`] (`:4136-4137` vs
+/// `LowerSentientHelper.cpp:1146`), so one immediate can round two ways.
 pub fn fill_imm_field<A: Arch>(
     instr: &mut UniformInstrInfo,
     field: OperandField,
@@ -390,7 +390,7 @@ pub fn fill_imm_field<A: Arch>(
     match source {
         ImmSource::Constant(value) => {
             let imm = *value as f64 * f64::from(element_size.0) / 8.0 / f64::from(scale.get());
-            // The L0's MODLRF immediate is 10 bits and its addressing is cyclic (`:4134-4137`).
+            // The L0's MODLRF immediate is 10 bits and its addressing is cyclic (`:4138-4141`).
             let imm = addr_wraparounded::<A>(imm as i64, AddrSpace::Unit(comp));
             instr.set_common_field(field, int(imm));
             Vec::new()

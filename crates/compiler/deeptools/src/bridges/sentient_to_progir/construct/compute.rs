@@ -31,7 +31,7 @@ use crate::islands::sentient::dialects::sentient::{Port, Precision};
 // crustify:todo: e087_ConstructUnaryInstr
 // crustify:todo: e088_ConstructTernaryInstr
 
-/// WHICH COMPUTE UNIT — `SenComponents` narrowed to the three an FMA runs on (`:1191`, `:1329`).
+/// WHICH COMPUTE UNIT — `SenComponents` narrowed to the three an FMA runs on (`:1213,1234,1248`, `:1329`).
 ///
 /// ⛔ THE PT IS ONE OF THEM HERE, so this is NOT
 /// [`crate::bridges::sentient_to_progir::utils::ComputeUnit`], which is the PE/SFP-only pair the
@@ -47,7 +47,7 @@ pub enum ComputeComp {
     Sfp,
 }
 
-/// WHICH SOURCE FIELD AN INPUT LANDS IN — the `port_name` every callsite passes (`:1580-1596`).
+/// WHICH SOURCE FIELD AN INPUT LANDS IN — the `port_name` every callsite passes (`:1572-1583`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeSlot {
     /// `src0`.
@@ -78,11 +78,11 @@ pub struct ComputePrecisions {
     pub op: Precision,
     /// What the unit computes in.
     pub compute: Precision,
-    /// ⛔ [`Precision::None`] IS A DANGLING MAC and suppresses the conversion (`:1279`).
+    /// ⛔ [`Precision::None`] IS A DANGLING MAC and suppresses the conversion (`:1278`).
     pub result: Precision,
 }
 
-/// WHAT AN INPUT OPERAND CANNOT BE — the three refusals of `:1213-1268` and `:1287-1291`.
+/// WHAT AN INPUT OPERAND CANNOT BE — the three refusals of `:1222,1245,1264` and `:1282-1288`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedComputeInput {
     /// *"Unsupported operand for `<unit>` FMA"* — this unit has no such input.
@@ -108,14 +108,14 @@ pub enum UnsupportedComputeInput {
     },
 }
 
-/// The ISA's name for one input port on one unit — `:1191-1268`, in the reference's own order.
+/// The ISA's name for one input port on one unit — `:1192-1270`, in the reference's own order.
 fn compute_input_value<A: Arch>(
     unit: ComputeComp,
     port: Port,
     precisions: ComputePrecisions,
 ) -> Option<String> {
     match port {
-        // ⛔ THE PT PAIRS ITS LOW FOUR REGISTERS at sub-byte compute precision (`:1191-1199`).
+        // ⛔ THE PT PAIRS ITS LOW FOUR REGISTERS at sub-byte compute precision (`:1193-1201`).
         Port::Lrf(index) => {
             let index = u32::from(index.get());
             let paired = matches!(unit, ComputeComp::Pt)
@@ -140,14 +140,14 @@ fn compute_input_value<A: Arch>(
                 Port::West => Some("w-link".to_owned()),
                 _ => None,
             },
-            // Shared by the PE and the SFP (`:1225-1233`), then each unit's own.
+            // Shared by the PE and the SFP (`:1226-1233`), then each unit's own.
             ComputeComp::Pe | ComputeComp::Sfp => match (port, unit) {
                 (Port::Lx, _) => Some("lxlu".to_owned()),
                 (Port::NbrSlice, _) => Some("nbrslice".to_owned()),
                 (Port::Two, _) => Some("2.0".to_owned()),
                 (Port::Three, _) => Some("3.0".to_owned()),
                 // ⭐ BOTH NEIGHBOUR-FORWARD PORTS SPELL `nfwd`; the reference's third `"nfwd"` arm
-                // (`:1227`) is dead, as no port is spelled that.
+                // (`:1228`) is dead, as no port is spelled that.
                 (Port::Nfwd0 | Port::Nfwd2, _) => Some("nfwd".to_owned()),
                 (Port::Pe, ComputeComp::Sfp) => Some("pe".to_owned()),
                 (Port::SfpRing, ComputeComp::Sfp) => Some("datafifo".to_owned()),
@@ -170,11 +170,11 @@ fn compute_input_value<A: Arch>(
 ///
 /// Name one input port in the ISA's own vocabulary and put it in `src0`/`src1`/`src2`.
 ///
-/// ⛔ THE FIRST WRITER WINS (`:1305`) — a slot already filled is left alone.
+/// ⛔ THE FIRST WRITER WINS (`:1303`) — a slot already filled is left alone.
 /// ⛔ THE `fold` SUFFIX IS UNCONDITIONAL: every fold mode other than `fold_AB_Both`, INCLUDING NO
 /// FOLD MODE AT ALL, is a `DT_ERROR` there (`:1294-1298`), so reaching a conversion at all proves it.
 /// ⭐ `is_operand_forwarded` IS PASSED WITH OPPOSITE POLARITY BY THE FMA AND BINARY CALLSITES
-/// (`:1590`, `:2121`) AND NEVER READ, so it is not a parameter here.
+/// (`:1575`, `:2114`) AND NEVER READ, so it is not a parameter here.
 pub fn set_compute_input_operand<A: Arch>(
     unit: ComputeComp,
     instr: &mut UniformInstrInfo,
@@ -228,7 +228,7 @@ pub fn set_compute_input_operand<A: Arch>(
 }
 
 /// WHICH VALUE A FORWARDING FIELD CARRIES — the `port_name` the output callsites pass, either one
-/// source slot or the op's own result (`:1600`, `:2126`).
+/// source slot or the op's own result (`:1585-1596`, `:2121-2129`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeSource {
     /// One of the inputs.
@@ -273,7 +273,7 @@ pub enum UnsupportedComputeOutput {
 /// Point every one of this op's outputs at the field that forwards it.
 ///
 /// ⛔ SEN1P5 DROPS THE PT'S `tgte` ENTIRELY (`:1322-1326`) — *"either always west data or stale"*.
-/// ⛔ THE SELF-FORWARD REFUSAL IS DEAD CODE: `(comp == SFP && …) && (comp == PE && …)` (`:1377-1378`)
+/// ⛔ THE SELF-FORWARD REFUSAL IS DEAD CODE: `(comp == SFP && …) && (comp == PE && …)` (`:1374-1375`)
 /// is one component being two at once, so no arm is emitted for it.
 /// ⭐ EVERY REFUSAL HERE FALLS THROUGH AND STILL WRITES ITS FIELD, so the offenders are COLLECTED
 /// rather than returned at the first one. Its two precision parameters are never read.
@@ -406,7 +406,7 @@ mod unit_tests {
                 (OperandField::Src2, descriptive("lxlu")),
             ]
         );
-        // ⛔ AND THE FIRST WRITER WINS — a filled slot is left alone (`:1305`).
+        // ⛔ AND THE FIRST WRITER WINS — a filled slot is left alone (`:1303`).
         set_compute_input_operand::<Dd2>(
             ComputeComp::Pe,
             &mut instr,

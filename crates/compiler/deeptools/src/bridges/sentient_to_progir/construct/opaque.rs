@@ -42,7 +42,7 @@ pub fn rtrim(s: &str) -> &str {
 /// splice into a `MVLOOPCNT`.
 ///
 /// ⛔ NOT A [`ParamValue`], AND THE REFERENCE SAYS SO BY CALLING `stoi` ON IT
-/// (`ConstructProgIRHelper.cpp:3796`): `ParamValue` is a closed set of SPELLINGS and this is an
+/// (`ConstructProgIRHelper.cpp:3955`): `ParamValue` is a closed set of SPELLINGS and this is an
 /// arbitrary count, so a `params` entry could not hold it without opening that set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LoopCount(pub u32);
@@ -86,7 +86,7 @@ pub fn construct_opaque_instr(
 ) -> (Vec<UniformInstrInfo>, Vec<OpaqueRefusal>) {
     let mut refused = Vec::new();
     // SETMASK wraps after every increment of 8, so a count that is a multiple of 8 leaves the
-    // state-resetting one at the tail redundant (`:3946-3954`).
+    // state-resetting one at the tail redundant (`:3945-3956`).
     let drop_reset = op.loop_count.is_some_and(|count| count.0 % 8 == 0);
     let mut instrs = Vec::new();
     for instruction in op.template.body() {
@@ -127,7 +127,7 @@ fn fill(op: &OpaqueInvocation<'_>, slot: &OpaqueSlot, refused: &mut Vec<OpaqueRe
 }
 
 /// THE THREE DICTIONARIES IN THE REFERENCE'S ORDER — read-only, then read-write, then the params
-/// (`:3993-4008`).
+/// (`:3999-4009`).
 ///
 /// ⛔⛔ THE `R` IS THE VALUE. `insertReg` writes `"R" + startAddress` and the consumer strips it back
 /// off BY POSITION (`dcc/src/Dialect/Sentient/Utils.cpp:157`), so a substituted register is the
@@ -164,9 +164,9 @@ fn bind(
     let spelling = value.spelling();
     match field {
         // `unroll` TAKES ITS `x` BACK: `params={"unroll"="2"}` names the file `reciprocalx2.smc` and
-        // the field wants `x2` (`:4014-4016`).
+        // the field wants `x2` (`:4016-4019`).
         OperandField::Unroll if !spelling.starts_with('x') => descriptive(&format!("x{spelling}")),
-        // An `imm` is a NUMBER, which is the reference's `stoi` on the same string (`:4012`).
+        // An `imm` is a NUMBER, which is the reference's `stoi` on the same string (`:4014-4015`).
         OperandField::Imm => match spelling.parse::<i64>() {
             Ok(value) => int(value),
             Err(_) => Operand::every(OperandValue::Unknown),

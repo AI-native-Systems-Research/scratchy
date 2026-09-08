@@ -493,13 +493,13 @@ pub enum L3Half {
     /// `L3LU` — an `LD…`.
     Load {
         /// The GTR holding the multicast group, where a `sentient.copy` names one — ⛔ `gtr` BY THE
-        /// REFERENCE'S OWN DT_CHECK on the locale (`:2851-2854`).
+        /// REFERENCE'S OWN DT_CHECK on the locale (`:2850-2852`).
         multicast: Option<RegIndex>,
     },
     /// `L3SU` — an `ST…`.
     ///
     /// ⛔⛔ NO MULTICAST ARM HERE, AND THAT IS A GUARD: the reference appends `G` on either half
-    /// (`:2299`), but the vendored ISA has no `STGM`/`STGMU`/`STIGM`/`STIGMU`, so
+    /// (`:2928`), but the vendored ISA has no `STGM`/`STGMU`/`STIGM`/`STIGMU`, so
     /// `Isa::to_instopcode` could not answer for one. A store multicast cannot be written down, and
     /// with it go this half's `gtr` reg-init and its non-zero `group`.
     Store {
@@ -555,7 +555,7 @@ pub struct L3LoadAndStore {
     /// Both results.
     pub results: [Reg; 2],
     /// `isLXUnit(src)` — ⛔ ON SEN1P5 AN LX ADDRESS HAS NO LBR, and the reference DT_CHECKs that its
-    /// immutable address is the constant 0 (`:2243-2251`).
+    /// immutable address is the constant 0 (`:2872-2883`).
     pub src_is_lx: bool,
     /// `isLXUnit(dst)`.
     pub dst_is_lx: bool,
@@ -564,7 +564,7 @@ pub struct L3LoadAndStore {
     /// `burst_size`, before normalisation.
     pub burst: Elements,
     /// `src_inc != 0` — ⛔ ONE INCREMENT FOR BOTH SIDES BY THE ISA, which the reference DT_CHECKs
-    /// (`:2311-2313`), so this is the pair's single shared answer.
+    /// (`:2937-2941`), so this is the pair's single shared answer.
     pub update: bool,
     /// `dbgName`.
     pub dbg_name: Option<String>,
@@ -576,9 +576,9 @@ pub struct L3LoadAndStore {
 /// indirection they index through.
 ///
 /// ⛔ `STZ` TAKES NO `U`, NO `burst` AND NO `group` — the update suffix and both fields sit inside the
-/// `else` (`:2295-2312`, `:2385-2390`).
-/// ⛔ THE `readibr` GUARD IS ASYMMETRIC: the LAR-side arm tests `comp == L3LU` (`:2340`), the EAR-side
-/// one does not (`:2371`), so an EAR-side STORE still writes `readibr:1`.
+/// `else` (`:2923-2942`, `:3012-3019`).
+/// ⛔ THE `readibr` GUARD IS ASYMMETRIC: the LAR-side arm tests `comp == L3LU` (`:2972`), the EAR-side
+/// one does not (`:2997`), so an EAR-side STORE still writes `readibr:1`.
 /// ⛔ `src1` IS SKIPPED, NOT ZEROED, wherever the LBR is gone — and the reg-init list drops it too.
 #[must_use]
 pub fn construct_l3_load_and_store_instr<A: Arch>(
@@ -638,7 +638,7 @@ pub fn construct_l3_load_and_store_instr<A: Arch>(
             );
         }
     }
-    // `is_stz` AND THE `ibr` BIT IT SETS ARE ONE FACT (`:2286-2290`, `:2333-2335`): an IBR write
+    // `is_stz` AND THE `ibr` BIT IT SETS ARE ONE FACT (`:2916-2921`, `:2958-2960`): an IBR write
     // pushes `ibr:1`, an LX->QGI transfer `ibr:0`, and the QGI wins where both hold.
     let stz_ibr = match ls.half {
         L3Half::Store { dst_is_qgi: true } => Some(0),
@@ -669,7 +669,7 @@ pub fn construct_l3_load_and_store_instr<A: Arch>(
         instr = instr.with_common_comment(name);
     }
     if !store && matches!(ls.indirection, L3Indirection::IbrWrite) {
-        // The LAR and LBR are unused, but the senulator treats the LAR as updated (`:2320-2331`).
+        // The LAR and LBR are unused, but the senulator treats the LAR as updated (`:2949-2957`).
         instr.set_common_field(OperandField::Readibr, int(0));
         instr.set_common_field(OperandField::Src0, reg_field(ls.dst_mutable_addr));
         instr.set_common_field(OperandField::Src2, reg_field(ls.src_mutable_addr));
@@ -682,7 +682,7 @@ pub fn construct_l3_load_and_store_instr<A: Arch>(
         }
     } else {
         // The LAR side is `src0`+`src1` and the EAR side `src2`+`src3`, whichever end holds which
-        // (`:2337-2381`) — the reference's two arms differ in nothing else.
+        // (`:2964-3010`) — the reference's two arms differ in nothing else.
         let lar_is_src = matches!(ls.src_mutable_addr.locale, SenRegType::Lar);
         let (lar, lbr, ear, ebr, skip_lbr) = if lar_is_src {
             (
@@ -706,7 +706,7 @@ pub fn construct_l3_load_and_store_instr<A: Arch>(
         }
         instr.set_common_field(OperandField::Src0, reg_field(lar));
         if skip_lbr {
-            // For SEN1P5 the routing direction is the DRM (`:2347-2352`).
+            // For SEN1P5 the routing direction is the DRM (`:2977-2981`).
             if let Some(dir) = ls.dir {
                 instr.set_common_field(OperandField::Drm, int(i64::from(dir.encoding())));
             }
@@ -736,7 +736,7 @@ pub fn construct_l3_load_and_store_instr<A: Arch>(
     instr
 }
 
-/// `shuffle_mode` — the four an `LDCVTI` spells (`:2464-2478`).
+/// `shuffle_mode` — the four an `LDCVTI` spells (`:3348-3368`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadComputeShuffle {
     /// `noshuffle` — a plain 128-bit beat.
@@ -762,7 +762,7 @@ impl LoadComputeShuffle {
     }
 }
 
-/// WHO AN `LDCVTI` SENDS TO — the two `dyn_cast`s of its consumer (`:2480-2492`).
+/// WHO AN `LDCVTI` SENDS TO — the two `dyn_cast`s of its consumer (`:3370-3382`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadComputeConsumer<'a> {
     /// A `dataflow.get_unit` consumer — one common `consumertag`.
@@ -774,7 +774,7 @@ pub enum LoadComputeConsumer<'a> {
 /// ONE `sentient.load_compute_and_send` WITH ITS REGISTERS ALREADY RESOLVED — see [`L3Load`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadCompute<'a> {
-    /// `mutable_addr` — ⛔ `lrf` BY DT_CHECK (`:2405-2408`), and it is NOT a field of the instruction.
+    /// `mutable_addr` — ⛔ `lrf` BY DT_CHECK (`:3298-3301`), and it is NOT a field of the instruction.
     pub mutable_addr: Reg,
     /// `immutable_addr` — `imm` by the same DT_CHECK; its value becomes `imm`.
     pub immutable_addr: Reg,
@@ -782,9 +782,9 @@ pub struct LoadCompute<'a> {
     pub result: Reg,
     /// The constant `immutable_addr` holds, in source elements.
     pub immutable_value: i64,
-    /// `element_index` — ⛔ FOUR BY THE TYPE (`:2447-2450`).
+    /// `element_index` — ⛔ FOUR BY THE TYPE (`:3336-3338`).
     pub element_index: Bounded<4>,
-    /// `scale_index` — two by the type (`:2457`).
+    /// `scale_index` — two by the type (`:3345`).
     pub scale_index: Bounded<2>,
     /// `shuffle_mode`.
     pub shuffle: LoadComputeShuffle,
@@ -796,7 +796,7 @@ pub struct LoadCompute<'a> {
     pub dbg_name: Option<String>,
 }
 
-/// `src_element_size` — ⛔ FOUR BY DT_CHECK (`:2447-2449`), together with a 16-bit destination: *"current
+/// `src_element_size` — ⛔ FOUR BY DT_CHECK (`:3335-3338`), together with a 16-bit destination: *"current
 /// support is only for 4 bit/256 elems to 16 bit/64 elems"*. So it is stated here, not passed.
 const LDCVTI_SRC_BITS: u32 = 4;
 
@@ -804,8 +804,8 @@ const LDCVTI_SRC_BITS: u32 = 4;
 ///
 /// Read 4-bit elements out of the LX, convert them to 16-bit ones and send them to one consumer.
 ///
-/// ⛔ SEN1P5 AND `LXLU` ONLY, both DT_CHECKed (`:2398`), so neither is an argument.
-/// ⛔ THE `imm` IS IN **DESTINATION** UNITS: the source's 4 bits over 8 halve it (`:2436-2441`), which
+/// ⛔ SEN1P5 AND `LXLU` ONLY, both DT_CHECKed (`:3290`), so neither is an argument.
+/// ⛔ THE `imm` IS IN **DESTINATION** UNITS: the source's 4 bits over 8 halve it (`:3324-3328`), which
 /// is why IBM's own 256-element load writes `imm:128`.
 /// ⛔ AND A MAPPED CONSUMER **ASSIGNS** THE WHOLE OPERAND MAP (`UniformInstrAndBlock.hpp:133`) rather
 /// than adding to it.
@@ -874,7 +874,7 @@ pub struct LrfCopy {
     pub dbg_name: Option<String>,
 }
 
-/// WHAT AN LRF COPY COULD NOT BE GIVEN — the two `signalPassFailure`s (`:2523`, `:2535`), as offenders.
+/// WHAT AN LRF COPY COULD NOT BE GIVEN — the two `signalPassFailure`s (`:3533`, `:3544`), as offenders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LrfCopyRefusal {
     /// A producer outside `{SFP, PE, LXLU}`.
@@ -887,7 +887,7 @@ pub enum LrfCopyRefusal {
 ///
 /// Copy one lane of an arriving vector into the LX store unit's LRF.
 ///
-/// ⛔ THE UNIT IS DT_CHECKED `LXSU` (`:2500`), so the component is a constant here.
+/// ⛔ THE UNIT IS DT_CHECKED `LXSU` (`:3512`), so the component is a constant here.
 /// ⛔ THE REFERENCE CARRIES ON PAST BOTH FAILURES and still writes a `producertag` for the producer it
 /// just rejected; only the three admitted units have a spelling here, so an unsupported one leaves the
 /// field unset rather than naming something the ISA does not accept.

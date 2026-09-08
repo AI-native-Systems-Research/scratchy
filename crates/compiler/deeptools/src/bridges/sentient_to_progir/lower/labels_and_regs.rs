@@ -119,7 +119,7 @@ pub fn add_to_reg_init(
 }
 
 /// ONE IMMEDIATE A REGISTER CAN START WITH — the four defining ops `getRegImmVals` reads a value out
-/// of (`:1141,1153,1161,1170`).
+/// of (`:1144,1154,1162,1171`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegImm {
     /// `sentient.constant` — ⛔ THE ONLY ONE THAT IS SCALED OR WRAPPED.
@@ -136,11 +136,11 @@ pub enum RegImm {
 /// WHERE A REGISTER'S IMMEDIATES COME FROM — one value for every unit, or one per unit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegImmSource {
-    /// One defining op, whose value every unit takes (`:1141-1176`).
+    /// One defining op, whose value every unit takes (`:1144-1178`).
     Common(RegImm),
     /// `uniform.query_map` — `None` is a unit the mapping does not cover, which the reference gets
     /// from `getValuesFromKeys` positionally.
-    /// ⚠️ THE KIND IS PER ENTRY HERE and read off the query op once there (`:1179-1186`), so a mixed
+    /// ⚠️ THE KIND IS PER ENTRY HERE and read off the query op once there (`:1181-1186`), so a mixed
     /// mapping is representable rather than being a null cast.
     Mapped(Vec<(UnitKey, Option<FoldId>, Option<RegImm>)>),
 }
@@ -168,11 +168,11 @@ fn set_imm(
 /// Replaces: e068_getRegImmVals
 ///
 /// Every unit's immediate for one register, per fold — exactly what [`add_to_reg_init`] then files.
-/// ⛔ ONLY A CONSTANT IS SCALED, AND AN MVR ONE IS NOT (`:1147`): a mask value is not an address.
-/// ⚠️ THE MAPPED ARM SCALES ANYWAY, `isMVRReg` and all (`:1204`), and in integers where
+/// ⛔ ONLY A CONSTANT IS SCALED, AND AN MVR ONE IS NOT (`:1146`): a mask value is not an address.
+/// ⚠️ THE MAPPED ARM SCALES ANYWAY, `isMVRReg` and all (`:1205`), and in integers where
 /// [`crate::bridges::sentient_to_progir::construct::reg_init::fill_imm_field`] uses floats.
 /// ⛔ A UNIT THE MAPPING MISSES TAKES THE FIRST COVERED UNIT'S WHOLE FOLD MAP — the reference's own
-/// *"use a random value for this unit"* (`:1216`); with none covered it takes nothing, where its
+/// *"use a random value for this unit"* (`:1230-1236`); with none covered it takes nothing, where its
 /// `DT_CHECK(!imm_vals.empty())` aborts.
 #[must_use]
 pub fn get_reg_imm_vals<A: Arch>(
