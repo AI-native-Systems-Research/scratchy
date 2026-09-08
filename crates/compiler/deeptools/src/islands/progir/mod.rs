@@ -24,11 +24,12 @@ pub mod print;
 pub mod ty;
 
 use crate::arch::Arch;
+use crate::generated::DataType;
+use crate::islands::sentient::dialects::sentient::RegIndex;
 use crate::model::Model;
 use crate::workload::Workload;
 use sys_arch_spec::progir::{MAX_INSTRUCTIONS_PER_UNIT, MAX_REGISTERS_PER_UNIT};
 use sys_arch_spec::regfile::{Component, max_ibuff_entries};
-use crate::islands::sentient::dialects::sentient::RegIndex;
 use ty::{Invalid, OperandValue, RegType};
 
 /// ONE REGISTER'S INITIAL CONTENT — one entry of a unit's register state.
@@ -51,6 +52,13 @@ pub struct RegInit {
     pub index: RegIndex,
     /// What it starts as.
     pub value: OperandValue,
+    /// `senDataType_` — the format the content is in (`progir.h:271`), which the senprog reg-init
+    /// line prints as a `datatype:<name> ` prefix when it is set (`dpc.cpp:748-751`).
+    ///
+    /// ⛔ `None` IS THE REFERENCE'S `DataFormats::INVALID` DEFAULT rather than a missing field: that
+    /// sentinel is precisely what `hasSenDataType` tests (`progir.h:119`), so an `Option` here
+    /// deletes the sentinel instead of carrying it.
+    pub sen_data_type: Option<DataType>,
 }
 
 /// WHAT ONE UNIT'S REGISTERS START AS — the reference's own `UnitRegState`

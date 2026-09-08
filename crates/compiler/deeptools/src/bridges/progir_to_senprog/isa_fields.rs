@@ -163,11 +163,71 @@ impl<A: Arch> Isa<A> {
     }
 }
 
-// crustify:todo: e012_getOpCodePrefix
-//   authority: sys-arch-spec/isa/isa.cpp:1480  (22 lines)  `Isa::getOpCodePrefix`
+/// A MNEMONIC'S UNIT PREFIX — the six `op_code` strings `getOpCodePrefix` can return.
+///
+/// ⛔ `PTOP`, NOT `PT`: the PT's prefix is the one that is not its unit's own spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpCodePrefix {
+    /// `PTOP`.
+    Ptop,
+    /// `SFP`.
+    Sfp,
+    /// `PE`.
+    Pe,
+    /// `L0`.
+    L0,
+    /// `LX`.
+    Lx,
+    /// `L3`.
+    L3,
+}
 
-// crustify:todo: e013_getOpCodeWithPrefix
-//   authority: sys-arch-spec/isa/isa.cpp:1503  (4 lines)  `Isa::getOpCodeWithPrefix`
+impl OpCodePrefix {
+    /// The prefix as it reaches the senprog text.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Ptop => "PTOP",
+            Self::Sfp => "SFP",
+            Self::Pe => "PE",
+            Self::L0 => "L0",
+            Self::Lx => "LX",
+            Self::L3 => "L3",
+        }
+    }
+}
+
+/// Replaces: e012_getOpCodePrefix
+///
+/// ⭐ TOTAL, BECAUSE [`Component`] IS ALREADY THE GENERIC UNIT. The reference maps its argument
+/// through `senCompToGenericComp` and `DT_ERROR`s on what is left — a memory, a link, a register
+/// file. `Component`'s nine executing units are exactly the arms that succeed, so the error arm is
+/// unreachable rather than handled.
+///
+/// ⛔ AND THE LOAD AND STORE HALVES SHARE A PREFIX: `L0LU` and `L0SU` both give `L0`.
+#[must_use]
+pub const fn op_code_prefix(unit: Component) -> OpCodePrefix {
+    match unit {
+        Component::Pt => OpCodePrefix::Ptop,
+        Component::Sfp => OpCodePrefix::Sfp,
+        Component::Pe => OpCodePrefix::Pe,
+        Component::L0lu | Component::L0su => OpCodePrefix::L0,
+        Component::Lxlu | Component::Lxsu => OpCodePrefix::Lx,
+        Component::L3lu | Component::L3su => OpCodePrefix::L3,
+    }
+}
+
+/// Replaces: e013_getOpCodeWithPrefix
+///
+/// The prefix, `_`, and the mnemonic — the whole opcode token a senprog line opens with
+/// (`dpc.cpp:668-675`).
+///
+/// ⛔ THE MNEMONIC IS `instOpCodeToStr`'s (`isa.cpp:1360`), which is what [`InstOpCode::spelling`]
+/// carries — `PTOP_IMA8`, not `PTOP_Ima8`.
+#[must_use]
+pub fn op_code_with_prefix(unit: Component, opcode: InstOpCode) -> String {
+    format!("{}_{}", op_code_prefix(unit).spelling(), opcode.spelling())
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -189,7 +249,8 @@ mod unit_tests {
             Some(FieldPos(0))
         );
         assert_eq!(
-            pt.field_pos_for_name(InstrType::T10, Operand::Src0).map(FieldPos::get),
+            pt.field_pos_for_name(InstrType::T10, Operand::Src0)
+                .map(FieldPos::get),
             Some(1)
         );
         assert_eq!(pt.field_pos_for_name(InstrType::T10, Operand::Mode), None);
@@ -229,10 +290,31 @@ mod unit_tests {
     fn a_field_exists_only_for_an_opcode_this_unit_and_generation_has() {
         let pt = Isa::<Dd2>::of(Component::Pt);
         assert_eq!(
-            pt.field_pos(InstOpCode::FMA, Operand::Src0).map(FieldPos::get),
+            pt.field_pos(InstOpCode::FMA, Operand::Src0)
+                .map(FieldPos::get),
             Some(0)
         );
         assert_eq!(pt.field_pos(InstOpCode::FMA, Operand::Mode), None);
         assert_eq!(pt.field_pos(InstOpCode::FMA4, Operand::Src0), None);
+    }
+
+    /// e012: the PT's prefix is not its unit's spelling, and the load/store halves share theirs.
+    #[test]
+    fn the_pt_prefix_is_ptop_and_the_halves_share_theirs() {
+        assert_eq!(op_code_prefix(Component::Pt), OpCodePrefix::Ptop);
+        assert_eq!(
+            op_code_prefix(Component::L0lu),
+            op_code_prefix(Component::L0su)
+        );
+        assert_eq!(op_code_prefix(Component::Sfp).spelling(), "SFP");
+    }
+
+    /// e013: the whole opcode token, uppercase on both sides of the `_`.
+    #[test]
+    fn the_opcode_token_joins_prefix_and_mnemonic() {
+        assert_eq!(
+            op_code_with_prefix(Component::Pt, InstOpCode::IMA8),
+            "PTOP_IMA8"
+        );
     }
 }

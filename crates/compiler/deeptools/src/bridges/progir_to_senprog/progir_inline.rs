@@ -5,7 +5,9 @@
 //! spelling and separators. A predicate that decides what to write, without writing it, is not
 //! a port. The authority is `/Users/nickm/git/deeptools-src/<file>:<line>` per unit below.
 
+use crate::generated::DataType;
 use crate::islands::progir::ty::OperandValue;
+use crate::islands::progir::{Instruction, RegInit};
 
 impl OperandValue {
     /// Replaces: e001_isDescriptive
@@ -61,14 +63,42 @@ impl OperandValue {
     }
 }
 
-// crustify:todo: e011_getCommentStr
-//   authority: sys-arch-spec/progir/progir.h:347  (3 lines)  `getCommentStr`
+impl Instruction {
+    /// Replaces: e011_getCommentStr
+    ///
+    /// The instruction's comment, or the reference's shared `empty` when it has none.
+    ///
+    /// ⛔ `""` IS ABSENT, NOT PRESENT-AND-BLANK: `hasComment` is `(bool)comment_ && !empty()`
+    /// (`progir.h:335`), so the senprog writer suppresses its `  // ` for a comment set to `""`.
+    #[must_use]
+    pub fn comment_str(&self) -> &str {
+        self.comment.as_deref().unwrap_or("")
+    }
+}
 
-// crustify:todo: e015_hasSenDataType
-//   authority: sys-arch-spec/progir/progir.h:119  (1 lines)  `hasSenDataType`
+impl RegInit {
+    /// Replaces: e015_hasSenDataType
+    ///
+    /// `senDataType_ != INVALID`.
+    ///
+    /// ⛔ `INVALID` IS `None` HERE, so the sentinel is gone from the type and the test is `is_some`.
+    #[must_use]
+    pub const fn has_sen_data_type(&self) -> bool {
+        self.sen_data_type.is_some()
+    }
 
-// crustify:todo: e016_getSenDataType
-//   authority: sys-arch-spec/progir/progir.h:95  (5 lines)  `getSenDataType`
+    /// Replaces: e016_getSenDataType
+    ///
+    /// The format this register's content is in, which the reg-init line prints as
+    /// `datatype:<name> ` (`dpc.cpp:748-751`) — its only callsite.
+    ///
+    /// ⛔ THE REFERENCE `DT_ERROR`s WHEN ABSENT; here the absence IS the return, so the prefix is
+    /// gated by the very value it prints instead of by a separate predicate.
+    #[must_use]
+    pub const fn sen_data_type(&self) -> Option<DataType> {
+        self.sen_data_type
+    }
+}
 
 // crustify:todo: e018_getSimpleInstrVect
 //   authority: sys-arch-spec/progir/progir.h:464  (4 lines)  `getSimpleInstrVect`
@@ -116,7 +146,9 @@ mod unit_tests {
         let tag = OperandValue::InstrTag("L3_loop_end".to_owned());
         let variable = OperandValue::Variable("weight_base".to_owned());
 
-        assert!(descriptive.is_descriptive() && !descriptive.is_tag() && !descriptive.is_variable());
+        assert!(
+            descriptive.is_descriptive() && !descriptive.is_tag() && !descriptive.is_variable()
+        );
         assert!(tag.is_tag() && !tag.is_descriptive() && !tag.is_variable());
         assert!(variable.is_variable() && !variable.is_descriptive() && !variable.is_tag());
     }
@@ -140,5 +172,39 @@ mod unit_tests {
         assert_eq!(OperandValue::Int(7).as_string(), None);
         assert_eq!(OperandValue::Boolean(true).as_string(), None);
         assert_eq!(OperandValue::VariableSymbol(3).as_string(), None);
+    }
+
+    /// e011: a comment is the text, and its absence is the empty string.
+    #[test]
+    fn a_missing_comment_reads_as_empty() {
+        use crate::bridges::progir_to_senprog::test_fixtures::instr;
+
+        let mut with = instr(Vec::new());
+        with.comment = Some("spill".to_owned());
+        assert_eq!(with.comment_str(), "spill");
+        assert_eq!(instr(Vec::new()).comment_str(), "");
+    }
+
+    /// e015 and e016: `DataFormats::INVALID` is the absence of a format, and a present one is
+    /// returned as it stands.
+    #[test]
+    fn a_register_format_is_present_or_absent_and_never_a_sentinel() {
+        use crate::islands::progir::ty::RegType;
+        use crate::islands::sentient::dialects::sentient::RegIndex;
+
+        let reg = |data_type| RegInit {
+            file: RegType::Lrf,
+            index: RegIndex::at::<0>(),
+            value: OperandValue::Int(7),
+            sen_data_type: data_type,
+        };
+
+        assert!(!reg(None).has_sen_data_type());
+        assert_eq!(reg(None).sen_data_type(), None);
+        assert!(reg(Some(DataType::Sen169Fp16)).has_sen_data_type());
+        assert_eq!(
+            reg(Some(DataType::Sen169Fp16)).sen_data_type(),
+            Some(DataType::Sen169Fp16)
+        );
     }
 }
