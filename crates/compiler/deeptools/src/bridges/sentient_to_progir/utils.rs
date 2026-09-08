@@ -25,11 +25,12 @@ use crate::islands::progir::ty::{FoldId, Operand, OperandValue};
 use crate::islands::sentient::dialects::sentient::{FoldMode, Precision};
 use sys_arch_spec::regfile::Component;
 
-/// WHICH COMPUTE UNIT AN FMA/FMUL/FNMS RUNS ON — the two `is_any_of(comp, PE, SFP)` admits at every
-/// callsite (`ConstructProgIRHelper.cpp:1449`, `:1795`, `:1804`).
+/// WHICH COMPUTE UNIT AN FMA/FMUL/FNMS RUNS ON — what each of the three callsites admits: two
+/// `is_any_of(comp, PE, SFP)` guards (`ConstructProgIRHelper.cpp:1450`, `:1802`) and one `} else {
+/// // PE/SFP` arm the PT has already left (`:1774`), calling at `:1452`, `:1796` and `:1805`.
 ///
-/// ⛔ THE PT IS NOT ONE OF THEM: `ConstructBinaryInstr` errors out for it (`:1815`), so there is no
-/// on-the-fly conversion question to ask about the matrix unit.
+/// ⛔ THE PT IS NOT ONE OF THEM: `ConstructBinaryInstr` errors out for it (`:1813-1815`), so there is
+/// no on-the-fly conversion question to ask about the matrix unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeUnit {
     /// `PE`.
@@ -39,7 +40,7 @@ pub enum ComputeUnit {
 }
 
 /// WHICH OF THE THREE OPERANDS — `opA`, `opB` or `opC`, which is what `src0_operand_idx`'s 0/1/2
-/// names (`Utils.hpp:31-36`).
+/// names (`Utils.hpp:33-36`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrcOperand {
     /// `opA`, `src0_operand_idx == 0`.
@@ -59,7 +60,7 @@ pub struct InputPrecisions {
     /// `opBPrecision`.
     pub op_b: Precision,
     /// `opCPrecision` — ⭐ THE COMPUTE PRECISION AT THE TWO BINARY CALLSITES, which have no third
-    /// operand and pass it deliberately (`:1797`, `:1807`), so the opC test never fires there.
+    /// operand and pass it deliberately (`:1798`, `:1807`), so the opC test never fires there.
     pub op_c: Precision,
 }
 
@@ -67,14 +68,14 @@ pub struct InputPrecisions {
 /// `verifyOnTheFlyConversions`' four refusals (`Utils.cpp:27-82`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedConversion {
-    /// *"Unsupported result precision conversion in DD2"* (`:33-35`).
+    /// *"Unsupported result precision conversion in DD2"* (`:33-36`).
     ResultOnRcudd1a {
         /// `$ComputePrecision`.
         compute: Precision,
         /// `ResultPrecision`.
         result: Precision,
     },
-    /// *"Unsupported input on the fly conversion for FMA/FMUL/FNMS"* (`:39-49`).
+    /// *"Unsupported input on the fly conversion for FMA/FMUL/FNMS"* (`:39-68`).
     Input {
         /// Which of `opA`/`opB`/`opC`.
         operand: SrcOperand,
@@ -83,12 +84,12 @@ pub enum UnsupportedConversion {
         /// What the unit computes in.
         compute: Precision,
     },
-    /// *"Unsupported compute precision for FMA/FMUL/FNMS"* (`:72-74`).
+    /// *"Unsupported compute precision for FMA/FMUL/FNMS"* (`:69-71`).
     ComputePrecision {
         /// What the unit computes in.
         compute: Precision,
     },
-    /// *"Unsupported output on the fly conversion for FMA/FMUL/FNMS"* (`:75-82`).
+    /// *"Unsupported output on the fly conversion for FMA/FMUL/FNMS"* (`:72-79`).
     Output {
         /// What the unit computes in.
         compute: Precision,
@@ -115,13 +116,13 @@ pub fn unsupported_on_the_fly_conversions<A: Arch>(
 ) -> Vec<UnsupportedConversion> {
     let mut offenders = Vec::new();
     if matches!(A::GEN, IsaGen::Rcudd1a) {
-        // `:32-36` — DD2 converts a result on the way out only by narrowing it to an integer.
+        // `:33-36` — DD2 converts a result on the way out only by narrowing it to an integer.
         if result != compute && !matches!(result, Precision::Int4 | Precision::Int8) {
             offenders.push(UnsupportedConversion::ResultOnRcudd1a { compute, result });
         }
         return offenders;
     }
-    // `:37-62` — Sentient 1.5, one arm per input operand, in operand order.
+    // `:37-68` — Sentient 1.5, one arm per input operand, in operand order.
     for (operand, precision) in [
         (SrcOperand::OpA, inputs.op_a),
         (SrcOperand::OpB, inputs.op_b),
@@ -144,11 +145,11 @@ pub fn unsupported_on_the_fly_conversions<A: Arch>(
         }
     }
     if compute != result {
-        // `:71-74` — the compute precision itself, checked before what it converts to.
+        // `:69-71` — the compute precision itself, checked before what it converts to.
         if !matches!(compute, Precision::Fp16 | Precision::Fp32) {
             offenders.push(UnsupportedConversion::ComputePrecision { compute });
         }
-        // `:75-82` — a half result must come out of an fp32 compute; anything else must be an
+        // `:72-79` — a half result must come out of an fp32 compute; anything else must be an
         // integer narrowing.
         let converts = if matches!(result, Precision::Fp16 | Precision::Bf16) {
             compute == Precision::Fp32
@@ -163,7 +164,7 @@ pub fn unsupported_on_the_fly_conversions<A: Arch>(
 }
 
 /// WHICH UNIT CONSUMES A TRANSFER — the four `updateProperConsumer`'s DT_CHECK admits
-/// (`Utils.cpp:104`).
+/// (`Utils.cpp:106`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerUnit {
     /// `PE`.
@@ -178,7 +179,7 @@ pub enum ConsumerUnit {
 
 impl ConsumerUnit {
     /// The `consumertag` this unit is named by — `senComponentsToString` over its generic component
-    /// (`sys-arch-spec/arch_enums.cpp:20-23`, `:16`).
+    /// (`sys-arch-spec/arch_enums.cpp:21-24`).
     #[must_use]
     pub const fn spelling(self) -> &'static str {
         match self {
@@ -194,7 +195,7 @@ impl ConsumerUnit {
 ///
 /// ⛔⛔ THE TWO PATHS ADMIT DIFFERENT SETS, AND THAT IS WHY THIS TYPE IS SEPARATE.
 /// `getProperConsumer` accepts the link and folds it into the SFP on SEN1P5 (`Utils.cpp:90`);
-/// `updateProperConsumer`'s DT_CHECK does not accept it on either generation (`:104`), so the
+/// `updateProperConsumer`'s DT_CHECK does not accept it on either generation (`:106`), so the
 /// per-fold path takes the four-set and a link there is an E0308.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadConsumer {
@@ -220,7 +221,7 @@ impl LoadConsumer {
 ///
 /// The `consumertag` a load writes: the PT and the L0SU take their data THROUGH the SFP, and so does
 /// the cross-partition link from SEN1P5 — every other consumer names itself.
-/// ⛔ RCUDD1A HAS NO CROSS LINK. The reference's fallthrough DT_CHECKs `{PE, SFP}` (`:94`), so a link
+/// ⛔ RCUDD1A HAS NO CROSS LINK. The reference's fallthrough DT_CHECKs `{PE, SFP}` (`:93`), so a link
 /// there is an abort; it names itself here, and no RCUDD1A program binds one to ask about.
 /// ⛔ THE `< RCUDD1A` ARM IS MPW4's, a generation [`IsaGen`] deliberately does not model.
 #[must_use]
@@ -241,11 +242,11 @@ pub fn proper_consumer<A: Arch>(consumer: LoadConsumer) -> Operand {
 /// Replaces: e040_updateProperConsumer
 ///
 /// The same substitution, written into an operand that may already hold one value per fold —
-/// `addEntryToOperandMap`'s `unit_name` mode (`UniformInstrAndBlock.cpp:126-132`).
+/// `addEntryToOperandMap`'s `unit_name` mode (`UniformInstrAndBlock.cpp:124-132`).
 /// ⛔ NO CROSS LINK HERE AT ALL — see [`LoadConsumer`], and note that this makes the arch irrelevant:
 /// both generations this crate models are `>= RCUDD1A`, and the four-set's rule is the same on each.
 /// ⛔ AND A COMMON WRITE THROWS AN EXISTING PER-FOLD MAP AWAY — that is [`Operand::set`]'s asymmetry,
-/// which the reference's `fold_id ? id : std::nullopt` (`:130`) reaches deliberately.
+/// which the reference's `folding_needed ? id : std::nullopt` (`:130`) reaches deliberately.
 pub fn update_proper_consumer(value: &mut Operand, consumer: ConsumerUnit, fold: Option<FoldId>) {
     let tag = match consumer {
         // `:106-108`.
@@ -261,7 +262,8 @@ pub fn update_proper_consumer(value: &mut Operand, consumer: ConsumerUnit, fold:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrSpace {
     /// A unit's own component. ⭐ `L0LUROW0` AND `L0LU` ARE ONE VARIANT HERE — the reference lists
-    /// both spellings because its enum keeps every L0 load row apart; the generic map does not.
+    /// both spellings because its enum keeps every L0 load row apart, and `senCompToGenericComp` maps
+    /// the row onto the unit (`sys-arch-spec/arch_enums.cpp:177`).
     Unit(Component),
     /// `PTXRF` — the PT's transposed register file, addressed within one PT row.
     PtXrf,
@@ -283,7 +285,7 @@ const fn num_xrf_per_pt_row<A: Arch>() -> Sticks {
 /// Replaces: e041_getAddrWraparounded
 ///
 /// Fold an address immediate into the file it addresses: L0 addressing is cyclic over one slice
-/// (its `MODLRF` immediate is 10 bits, `ConstructProgIRHelper.cpp:4137-4139`), and the XRF biases by
+/// (its `MODLRF` immediate is 10 bits, `ConstructProgIRHelper.cpp:4138-4140`), and the XRF biases by
 /// a row's register count first, so a small negative pointer lands at the top of the row.
 /// ⛔ A ZERO `PT_ROWS` IS A BUILD ERROR HERE, where the reference has a `DT_CHECK` — both divisors
 /// are evaluated in a `const` block, so nothing can divide by zero at run time.
@@ -302,7 +304,7 @@ pub fn addr_wraparounded<A: Arch>(val: i64, space: AddrSpace) -> i64 {
 }
 
 /// WHAT THE `foldctrl` FIELD SAYS — the four values `setFCValueFromFoldMode` writes
-/// (`Utils.cpp:135-147`), which are exactly that field's encoding
+/// (`Utils.cpp:136-147`), which are exactly that field's encoding
 /// (`sys-arch-spec/src/fields.rs:237`, `ENC_FOLDA_FOLDB_2FOLD2INSTR_2FOLD1INSTR`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldControl {
@@ -392,7 +394,7 @@ mod unit_tests {
             op_b: Precision::Fp16,
             op_c: Precision::Fp16,
         };
-        // `:32-36` — DD2, where int8 out of an fp16 compute is the one conversion allowed.
+        // `:33-36` — DD2, where int8 out of an fp16 compute is the one conversion allowed.
         assert!(
             unsupported_on_the_fly_conversions::<Dd2>(
                 ComputeUnit::Pe,
@@ -471,7 +473,7 @@ mod unit_tests {
                 compute: Precision::Fp32,
             }]
         );
-        // `:71-74` — the compute precision itself, with every input already in it.
+        // `:69-71` — the compute precision itself, with every input already in it.
         let fp8 = InputPrecisions {
             op_a: Precision::Fp8,
             op_b: Precision::Fp8,
@@ -489,7 +491,7 @@ mod unit_tests {
                 compute: Precision::Fp8
             }]
         );
-        // `:75-82` — a bf16 result needs an fp32 compute, not an fp16 one.
+        // `:72-79` — a bf16 result needs an fp32 compute, not an fp16 one.
         assert_eq!(
             unsupported_on_the_fly_conversions::<Sen1p5>(
                 ComputeUnit::Pe,

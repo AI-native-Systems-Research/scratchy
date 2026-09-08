@@ -82,7 +82,7 @@ fn index_field(index: Option<RegIndex>) -> Operand {
     int(index.map_or(-1, |at| i64::from(at.get())))
 }
 
-/// `setOperandMap(OperandMap(…))` — ⛔ IT REPLACES THE MAP (`UniformInstrAndBlock.hpp:132`): every
+/// `setOperandMap(OperandMap(…))` — ⛔ IT REPLACES THE MAP (`UniformInstrAndBlock.hpp:133`): every
 /// per-unit field the instruction already carried is dropped rather than merged.
 fn map_into(
     instr: &mut UniformInstrInfo,
@@ -98,13 +98,13 @@ fn map_into(
     mapped.refused
 }
 
-/// WHAT A `sentient.for`'s TRIP COUNT IS — the four defining ops of `:57-107`.
+/// WHAT A `sentient.for`'s TRIP COUNT IS — the four defining ops of `:58-107`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopBound {
     /// `sentient.constant` — one trip count for every unit.
     Constant(i64),
     /// `uniform.query_map` — one per unit; ⛔ MODE `none` AND SCALE 1, `OperandMap`'s own defaults
-    /// (`UniformInstrAndBlock.hpp:31-34`), which this call site leaves unstated.
+    /// (`UniformInstrAndBlock.hpp:38-39`), which this call site leaves unstated.
     Mapped(Vec<MappedEntry>),
     /// `symbol.create_symbol` — ⛔ *"No symbol id present in the loop bound"* IS UNREPRESENTABLE: the
     /// id is this variant's payload.
@@ -133,7 +133,7 @@ pub struct MvLoop {
 /// The loop-count move that opens a `sentient.for`: a trip count in `imm`, or a dynamic bound in a
 /// `jcr` plus the exit label to jump to.
 ///
-/// ⛔ THE DYNAMIC ARM READS THE LABEL MAP BACK (`:104-107`) — a loop whose successor is already
+/// ⛔ THE DYNAMIC ARM READS THE LABEL MAP BACK (`:101-104`) — a loop whose successor is already
 /// labelled jumps to THAT label, and mints its own only as a fallback.
 /// ⭐ AND ITS `dbgName` GOES INSIDE THE LABEL, where the other three arms put it in the comment.
 #[must_use]
@@ -188,7 +188,7 @@ pub enum AddrFile {
     Ear,
 }
 
-/// WHAT A `JIMMCOPY`'s IMMEDIATE IS (`:142-151`).
+/// WHAT A `JIMMCOPY`'s IMMEDIATE IS (`:134-151`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum JcrImm {
     /// `sentient.constant`.
@@ -214,7 +214,7 @@ pub enum LrfImm {
     Symbol(i64),
 }
 
-/// WHAT A `LARIMM`/`EARIMM`'s IMMEDIATE IS (`:243-288`).
+/// WHAT A `LARIMM`/`EARIMM`'s IMMEDIATE IS (`:239-275`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AddrImm {
     /// `sentient.constant`, scaled.
@@ -229,7 +229,7 @@ pub enum AddrImm {
     Symbol(i64),
 }
 
-/// WHAT A `GTRIMM`'s IMMEDIATE IS (`:303-314`).
+/// WHAT A `GTRIMM`'s IMMEDIATE IS (`:288-299`).
 ///
 /// ⭐ THE REFERENCE HAS NO `else` HERE: a third kind of source leaves the `GTRIMM` carrying no
 /// immediate at all, which this enum makes unwritable.
@@ -247,9 +247,9 @@ pub enum GtrImm {
     },
 }
 
-/// WHICH TWO FILES AN ASSIGNMENT COPIES BETWEEN — the arms of `:131-315`.
+/// WHICH TWO FILES AN ASSIGNMENT COPIES BETWEEN — the arms of `:130-308`.
 ///
-/// ⛔ `LBR`/`EBR <- IMM` IS UNREPRESENTABLE, which is the reference's own `DT_CHECK` (`:128-130`).
+/// ⛔ `LBR`/`EBR <- IMM` IS UNREPRESENTABLE, which is the reference's own `DT_CHECK` (`:127-129`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignKind {
     /// `imm -> jcr`: `JIMMCOPY`.
@@ -298,7 +298,7 @@ pub struct Assigned {
     /// ⛔ `None` WHERE THE REFERENCE ANSWERS `std::nullopt`: a copy into the register the value is
     /// already in, or an immediate the program header will carry instead.
     pub instr: Option<UniformInstrInfo>,
-    /// `++num_copy_ops_` — 1 for each of the six copy opcodes (`:317-321`).
+    /// `++num_copy_ops_` — 1 for each of the six copy opcodes (`:309-313`).
     pub copy_ops: CopyOps,
     /// The offenders, in entry order.
     pub refused: Vec<OperandMapRefusal>,
@@ -319,10 +319,11 @@ impl Assigned {
 ///
 /// The copy between two register files, with the immediate scaled into the target's granularity.
 ///
-/// ⛔ A COPY INTO THE REGISTER THE VALUE IS ALREADY IN IS NO INSTRUCTION (`:126`), which also makes
-/// the reference's same-locale arm (`:229-231`) dead code.
-/// ⛔ `program_header` DIVERTS ONLY THE TWO IMMEDIATE ARMS (`:159,232`).
-/// ⛔ AND THE LAR/EAR IMMEDIATE WRITES `imm` WHERE ITS MAPPED TWIN WRITES `lrfimm` (`:246,264`).
+/// ⛔ A COPY INTO THE REGISTER THE VALUE IS ALREADY IN IS NO INSTRUCTION (`:125`), which also makes
+/// the reference's same-locale arm (`:226-227`) dead code.
+/// ⛔ `program_header` DIVERTS ONLY THE TWO IMMEDIATE ARMS (`:160,230`).
+/// ⛔ AND A DIRECT LAR/EAR IMMEDIATE WRITES `imm` LITERALLY WHERE ITS MAPPED TWIN WRITES
+/// `imm_field_name` — `lrfimm` on an LX component (`:242,252`).
 #[must_use]
 pub fn construct_assign_instr<A: Arch>(
     assign: &Assign,
@@ -463,7 +464,7 @@ pub fn construct_assign_instr<A: Arch>(
             instr
         }
         AssignKind::GtrFromImm(imm) => {
-            // ⛔ THE TRAILING SPACE IS THE REFERENCE'S (`:302`), and only the mapped arm keeps it.
+            // ⛔ THE TRAILING SPACE IS THE REFERENCE'S (`:287`), and only the mapped arm keeps it.
             let mut instr = UniformInstrInfo::of(OpCode::GTRIMM).with_common_comment("GTR <- IMM ");
             instr.set_common_field(OperandField::Src0, index_field(assign.tgt_index));
             match imm {
@@ -478,7 +479,7 @@ pub fn construct_assign_instr<A: Arch>(
             instr
         }
     };
-    // `:317-321` — ⭐ `LRFCOPY` IS IN THE SET AND NO ARM HERE EMITS IT.
+    // `:309-313` — ⭐ `LRFCOPY` IS IN THE SET AND NO ARM HERE EMITS IT.
     let counted = matches!(
         instr.opcode,
         OpCode::EARREGCOPY
@@ -510,7 +511,7 @@ pub fn construct_branch_exit_instr() -> UniformInstrInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundaryTile(pub i32);
 
-/// `lx_consumer_map` (`:355-357`) — ⛔ A CONSUMER THE MAP DOES NOT NAME CONTRIBUTES 0, which is what
+/// `lx_consumer_map` (`:356-358`) — ⛔ A CONSUMER THE MAP DOES NOT NAME CONTRIBUTES 0, which is what
 /// `std::map::operator[]` default-inserts for it.
 const fn lx_bit(peer: Consumer) -> i64 {
     match peer {
@@ -524,7 +525,7 @@ const fn lx_bit(peer: Consumer) -> i64 {
     }
 }
 
-/// `l3_consumer_map` (`:358-360`) — ⭐ THE SAME FOUR BITS NAME THE PER-CORELET LX UNITS HERE.
+/// `l3_consumer_map` (`:359-361`) — ⭐ THE SAME FOUR BITS NAME THE PER-CORELET LX UNITS HERE.
 const fn l3_bit(peer: Consumer) -> i64 {
     match peer {
         Consumer::L3lu => 4,
@@ -553,7 +554,7 @@ pub enum Sync {
         /// `$units`.
         peers: Vec<Consumer>,
     },
-    /// An `L3LU` sync — [`l3_bit`], and ⛔ THE ONLY COMPONENT A SOFT SYNC IS ALLOWED ON (`:391`).
+    /// An `L3LU` sync — [`l3_bit`], and ⛔ THE ONLY COMPONENT A SOFT SYNC IS ALLOWED ON (`:392`).
     L3lu {
         /// `$mode`.
         mode: SyncMode,
@@ -575,7 +576,7 @@ pub enum Sync {
         mode: SyncMode,
     },
     /// An `L0LU`/`L0SU` sync that sets the implicit memory boundary — ⛔ ITS MODE IS `sendrecv` BY
-    /// CONSTRUCTION (`:404`) and ⛔ IT WRITES NO `synctag` AT ALL (`:421`).
+    /// CONSTRUCTION (`:404`) and ⛔ IT WRITES NO `synctag` AT ALL (`:423-424`).
     L0Implicit {
         /// `implicit_sync_memory_boundary`.
         tile: BoundaryTile,
@@ -586,7 +587,7 @@ pub enum Sync {
 ///
 /// The rendezvous: a mode and one bit per peer in `synctag`, or the L0's implicit tile boundary.
 ///
-/// ⛔ AN IMPLICIT SYNC RETURNS BEFORE `synctag` IS SET (`:421`) — its tag is the tile, not the peers.
+/// ⛔ AN IMPLICIT SYNC RETURNS BEFORE `synctag` IS SET (`:424`) — its tag is the tile, not the peers.
 /// ⭐ THE `soft` ARCH GATE IS VACUOUS HERE: `RCUDD1A` is the oldest generation this crate models.
 #[must_use]
 pub fn construct_sync_instr<A: Arch>(
@@ -608,7 +609,7 @@ pub fn construct_sync_instr<A: Arch>(
         SyncMode::SendRecv => 3,
     };
     let mut comment = mode.spelling().to_owned();
-    // `:412-419` — ⭐ SEN1P5 NEEDS A DESTINATION ON EVERY L0 SYNC, implicit or not.
+    // `:410-417,426-433` — ⭐ SEN1P5 NEEDS A DESTINATION ON EVERY L0 SYNC, implicit or not.
     let syncdest = |instr: &mut UniformInstrInfo| {
         if A::GEN >= IsaGen::Sen1p5 {
             let dest = if l0_tethered { "both" } else { "self" };
@@ -669,21 +670,21 @@ pub fn construct_jmp_instr(target: &str) -> UniformInstrInfo {
     instr
 }
 
-/// WHAT A `sentient.if` COMPARES ITS REGISTER AGAINST (`:610-625,663-677`).
+/// WHAT A `sentient.if` COMPARES ITS REGISTER AGAINST (`:608-624,667-675`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpImm {
     /// `sentient.constant` — the value, into `src1`.
     Constant(i64),
     /// `symbol.create_symbol` — ⛔ ITS ID INTO `src1` AS A `VARIABLE_SYMBOL`, and the id's absence is
-    /// unrepresentable where the reference reports it (`:667-670`).
+    /// unrepresentable where the reference reports it (`:616-619`).
     Symbol(i64),
 }
 
-/// WHICH REGISTERS A `sentient.if` COMPARES — the seven operand arms of `:625-660`.
+/// WHICH REGISTERS A `sentient.if` COMPARES — the seven operand arms of `:627-662`.
 ///
 /// ⛔ WHICH SIDE THE IMMEDIATE IS ON IS LOAD-BEARING: it decides the inverted mode, and only an
 /// immediate on the RIGHT changes it — ⭐ the reference's `lhs == imm` and neither-is-imm branches
-/// agree in all four signed predicates (`:487-544`).
+/// agree in all four signed predicates (`:493-545`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOperands {
     /// `imm CMP jcr`.
@@ -715,7 +716,7 @@ pub enum CmpOperands {
         imm: CmpImm,
     },
     /// An `lccr` against a `jcr`, EITHER WAY ROUND — ⭐ THE REFERENCE'S TWO ARMS EMIT THE SAME
-    /// INSTRUCTION (`:645-653`): `src0` is the LCCR and `src1` the JCR whichever side each was on,
+    /// INSTRUCTION (`:645-652`): `src0` is the LCCR and `src1` the JCR whichever side each was on,
     /// and with no immediate the mode does not move either.
     LccrAndJcr {
         /// `src0`.
@@ -723,7 +724,7 @@ pub enum CmpOperands {
         /// `src1`.
         jcr: RegIndex,
     },
-    /// `jcr CMP jcr` — ⛔ `src0` IS THE RIGHT-HAND ONE (`:655-659`).
+    /// `jcr CMP jcr` — ⛔ `src0` IS THE RIGHT-HAND ONE (`:653-657`).
     JcrVsJcr {
         /// The left-hand `jcr`, which becomes `src1`.
         lhs: RegIndex,
@@ -735,13 +736,13 @@ pub enum CmpOperands {
 /// WHAT A `sentient.if` DOES WHEN THE CONDITION FAILS — its `else` region, as the jump sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElseRegion {
-    /// No `else` region at all (`:600`).
+    /// No `else` region at all (`:603-606`).
     None,
     /// An `else` region and its first op.
     Head {
         /// The op the `-else` label would be claimed for.
         at: OpSite,
-        /// ⛔ `Some` ONLY WHERE THAT FIRST OP IS A `sentient.yield` (`:571`), carrying the registers it
+        /// ⛔ `Some` ONLY WHERE THAT FIRST OP IS A `sentient.yield` (`:566`), carrying the registers it
         /// yields: an else that only yields what the `if` already holds needs no label at all.
         yields: Option<Vec<Reg>>,
     },
@@ -752,9 +753,9 @@ pub enum ElseRegion {
 /// The conditional jump a `sentient.if` becomes: the INVERTED predicate, because the branch is taken
 /// when the condition fails, and the label of the `else` body or of the op after the `if`.
 ///
-/// ⛔ THE END LABEL IS NOT READ BACK (`:559-562`), unlike [`construct_mv_loop_instr`]'s: a successor
+/// ⛔ THE END LABEL IS NOT READ BACK (`:558-560`), unlike [`construct_mv_loop_instr`]'s: a successor
 /// that already carries a label keeps it, and `pc_target` still names the one minted here.
-/// ⛔ AN `else` THAT YIELDS EXACTLY THE `if`'s OWN RESULTS IS JUMPED PAST, not into (`:568-598`).
+/// ⛔ AN `else` THAT YIELDS EXACTLY THE `if`'s OWN RESULTS IS JUMPED PAST, not into (`:566-598`).
 #[must_use]
 pub fn construct_jcmp_instr(
     predicate: CmpPredicate,
@@ -770,7 +771,7 @@ pub fn construct_jcmp_instr(
         operands,
         CmpOperands::JcrVsImm { .. } | CmpOperands::LccrVsImm { .. }
     );
-    // `:487-544` — the inversion, which the immediate's side flips back for.
+    // `:487-549` — the inversion, which the immediate's side flips back for.
     let mode = match predicate {
         CmpPredicate::Eq => "ne",
         CmpPredicate::Ne => "eq",
@@ -791,7 +792,7 @@ pub fn construct_jcmp_instr(
     let target = match else_region {
         ElseRegion::None => end_label,
         ElseRegion::Head { at, yields } => {
-            // `:571-596` — a yield of the `if`'s own results generates no instructions to jump to.
+            // `:567-586` — a yield of the `if`'s own results generates no instructions to jump to.
             let set_else_tag = match yields {
                 None => true,
                 Some(yielded) if yielded.is_empty() => false,
@@ -926,7 +927,7 @@ pub fn construct_xrf_add_instr<A: Arch>(ptr: XrfPtr, val: i64) -> UniformInstrIn
     instr
 }
 
-/// WHAT A `JADD` ADDS OR A `JSUB` SUBTRACTS — the four locale pairs of `:693-708` and `:971-985`,
+/// WHAT A `JADD` ADDS OR A `JSUB` SUBTRACTS — the four locale pairs of `:695-708` and `:971-985`,
 /// of which only two outcomes differ, and identically in both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JcrOperands {
@@ -1096,7 +1097,7 @@ mod unit_tests {
     }
 
     /// IBM'S OWN `MVLOOPCNT`s: `PE_MVLOOPCNT :: imm:1792  // for-loop-imm-lccr-0` and
-    /// `imm:7  // LR loop #1` (`test/Conversion/SentientToProgIR/PE/conditional-2and3-nested-if.mlir:8,12`)
+    /// `imm:7  // LR loop #1` (`test/PE/conditional-2and3-nested-if.mlir:8,12`)
     /// against the dynamic `dyn_loop:1 pc_target:(for-loop-jcr-10-end) src0:jcr1
     /// // for-loop-jcr-10-begin` (`if_else_label5.mlir:60`) — ⛔ THE DYNAMIC ARM'S dbgName GOES IN THE
     /// LABEL, the counted arms' in the comment.
@@ -1349,7 +1350,7 @@ mod unit_tests {
         );
     }
 
-    /// `SFP_NOP :: be:be  // Branch End` (`test/Conversion/SentientToProgIR/SFP/merge_and_pack.mlir:111`).
+    /// `SFP_NOP :: be:be  // Branch End` (`test/SFP/merge_and_pack.mlir:111`).
     #[test]
     fn a_branch_ends_on_a_nop_that_says_so() {
         let exit = construct_branch_exit_instr();

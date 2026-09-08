@@ -42,7 +42,7 @@ use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
 ///
 /// ⛔ NAMED FIELDS, NOT A TRIPLE. Three `int`s in a row is the transposition this crate's newtype
 /// rule exists to prevent, and the reference steps one of them by position: `std::get<2>(index)++`
-/// (`SentientToProgIR.cpp:344`).
+/// (`SentientToProgIR.cpp:344`), where the value stepped is `next_index`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstrIndex {
     /// Which block of the unit's program.
@@ -57,7 +57,7 @@ pub struct InstrIndex {
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
 /// ONE BLOCK OF A PROGRAM UNIT'S INSTRUCTIONS — `UniformInstrBlock`
-/// (`UniformInstrAndBlock.hpp:172-230`).
+/// (`UniformInstrAndBlock.hpp:175-230`).
 ///
 /// ⛔⛔ THE TWO BLOCK TYPES ARE TWO VARIANTS, AND THAT IS WHERE THIS CLASS' DT_CHECKs WENT.
 /// `block_type_` decides what the other three fields mean, and each check restates that decision: a
@@ -72,7 +72,7 @@ pub enum UniformInstrBlock {
     Uniform(UniformBlock),
 }
 
-/// THE UNIFORM SHAPE — the state only a `Type::UNIFORM` block has (`hpp:216-228`).
+/// THE UNIFORM SHAPE — the state only a `Type::UNIFORM` block has (`hpp:218-223`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniformBlock {
     /// `instr_lists_` — one instruction list per uniform region, grown as regions are reached.
@@ -119,7 +119,7 @@ impl UniformInstrBlock {
     }
 
     /// `empty()` (`hpp:179`) — no instruction list at all, which is what makes
-    /// `LowerUniformOperations` pop a leftover block (`LowerSentientHelper.cpp:1006-1008`).
+    /// `LowerUniformOperations` pop a leftover block (`LowerSentientHelper.cpp:1004-1006`).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -161,15 +161,11 @@ impl UniformInstrBlock {
     /// The `idx`-th instruction of the region this unit reads.
     ///
     /// ⛔ AN UNMAPPED UNIT READS REGION 0, not its max region — the reference's own
-    /// `TODO need to change to use MAX region` (`:367`), and NOT what `getUnitRegionIndex` answers.
+    /// `TODO need to change to use MAX region` (`:368`), and NOT what `getUnitRegionIndex` answers.
     pub fn instr_mut(&mut self, idx: usize, unit: UnitKey) -> Option<&mut UniformInstrInfo> {
         let region = match self {
             UniformInstrBlock::Regular(_) => RegionIndex(0),
-            UniformInstrBlock::Uniform(block) => block
-                .unit_to_region
-                .iter()
-                .find(|(at, _)| *at == unit)
-                .map_or(RegionIndex(0), |(_, region)| *region),
+            UniformInstrBlock::Uniform(block) => block.region_of(unit).unwrap_or(RegionIndex(0)),
         };
         self.instr_lists_mut()
             .get_mut(region.0 as usize)?
@@ -190,25 +186,21 @@ impl UniformInstrBlock {
     ///
     /// Which region of this block a unit reads.
     ///
-    /// ⛔ `None` IS THE REFERENCE'S `return -1` (`hpp:210`), NOT REGION 0 — and a REGULAR block
+    /// ⛔ `None` IS THE REFERENCE'S `return -1` (`hpp:210-211`), NOT REGION 0 — and a REGULAR block
     /// answers 0 for every unit, because its one list is everyone's.
     /// ⛔ NOT WHAT [`Self::instr_mut`] USES: that one falls back to region 0 for an unmapped unit.
     #[must_use]
     pub fn unit_region_index(&self, unit: UnitKey) -> Option<RegionIndex> {
         match self {
             UniformInstrBlock::Regular(_) => Some(RegionIndex(0)),
-            UniformInstrBlock::Uniform(block) => block
-                .unit_to_region
-                .iter()
-                .find(|(at, _)| *at == unit)
-                .map(|(_, region)| *region),
+            UniformInstrBlock::Uniform(block) => block.region_of(unit),
         }
     }
 
     /// Replaces: e029_getLastInstr
     ///
-    /// The instruction the current region ended on — how a caller retags what it just inserted
-    /// (`LowerSentientHelper.cpp:1092-1095`).
+    /// The instruction the current region ended on — how a caller learns whether the instruction it
+    /// just inserted already carries a label (`LowerSentientHelper.cpp:242-246`, `:1092-1096`).
     pub fn last_instr_mut(&mut self) -> Option<&mut UniformInstrInfo> {
         let region = self.current_region().0 as usize;
         self.instr_lists_mut().get_mut(region)?.last_mut()
@@ -227,11 +219,8 @@ impl UniformInstrBlock {
         match self {
             UniformInstrBlock::Regular(instrs) => instrs,
             UniformInstrBlock::Uniform(block) => block
-                .unit_to_region
-                .iter()
-                .rev()
-                .find(|(at, _)| *at == unit)
-                .and_then(|(_, region)| block.regions.get(region.0 as usize))
+                .region_of(unit)
+                .and_then(|region| block.regions.get(region.0 as usize))
                 .map_or(&[][..], Vec::as_slice),
         }
     }
@@ -249,7 +238,7 @@ impl UniformInstrBlock {
     /// Replaces: e074_getMaxInstrRegionIndex
     ///
     /// The FIRST region as long as the longest — the region every other one is padded up to, and
-    /// whose instructions the padding copies as dead code (`cpp:298-306`).
+    /// whose instructions the padding copies as dead code (`cpp:311-314`).
     ///
     /// ⛔ ONE LIST OR NONE ANSWERS 0 WITHOUT LOOKING (`:343`), which is also every REGULAR block.
     #[must_use]
@@ -278,12 +267,7 @@ impl UniformInstrBlock {
     pub fn region_instr_size(&self, unit: UnitKey) -> usize {
         let region = match self {
             UniformInstrBlock::Regular(_) => None,
-            UniformInstrBlock::Uniform(block) => block
-                .unit_to_region
-                .iter()
-                .rev()
-                .find(|(at, _)| *at == unit)
-                .map(|(_, region)| *region),
+            UniformInstrBlock::Uniform(block) => block.region_of(unit),
         };
         region
             .and_then(|region| self.instr_lists().get(region.0 as usize))
@@ -292,6 +276,20 @@ impl UniformInstrBlock {
 }
 
 impl UniformBlock {
+    /// `unit_to_region_idx_map_.at(unit)` (`hpp:212`, `cpp:276`, `:356`, `:371`) — the one lookup all
+    /// four of this class' map readers make.
+    ///
+    /// ⛔ THE LAST ENTRY FOR A UNIT WINS: the map is filled by `map_[unit] = idx` (`hpp:205-207`), so
+    /// a repeated unit keeps the newest region, which a `Vec` of pairs only reproduces from the back.
+    #[must_use]
+    pub fn region_of(&self, unit: UnitKey) -> Option<RegionIndex> {
+        self.unit_to_region
+            .iter()
+            .rev()
+            .find(|(at, _)| *at == unit)
+            .map(|(_, region)| *region)
+    }
+
     /// Replaces: e025_setCurrentRegion
     ///
     /// Which region the instructions lowered next belong to — `LowerUniformOperations` sets it once
@@ -356,8 +354,9 @@ impl UniformInstrBlocks {
 
     /// Replaces: e032_appendRegularBlock
     ///
-    /// Opens a REGULAR block for the run of ops that follows a uniform one; an unused one is popped
-    /// again when the next op is also uniform (`LowerSentientHelper.cpp:1006-1008`).
+    /// Opens a REGULAR block for the run of ops that follows a uniform one
+    /// (`LowerSentientHelper.cpp:1113-1114`); an unused one is popped again when the next op is also
+    /// uniform (`:1004-1006`).
     ///
     /// ⭐ ITS ONLY CALLER `(void)`-CASTS THE REFERENCE IT RETURNS (`:1114`), so this answers nothing
     /// rather than a handle no caller reads.
@@ -471,7 +470,8 @@ impl UniformInstrBlocks {
     ///
     /// Where the next instruction lands IF it joins the block and region currently open — ⛔ THE
     /// CALLER OWNS THE OTHER CASE: a following uniform op opens block `blocks_.len()` instead, and
-    /// only the caller knows which op comes next (`SentientToProgIR.cpp:333-346`).
+    /// only the caller knows which op comes next — the reference's own four cases (`cpp:465-477`),
+    /// read by `AddToLabelsMap` and the NOP-for-label path (`LowerSentientHelper.cpp:37`, `:558`).
     ///
     /// ⛔ `None` WITH NO BLOCK, where the reference answers block `-1` and then reads `back()`.
     #[must_use]
@@ -699,7 +699,7 @@ mod unit_tests {
     }
 
     /// e037: a mapped unit's own region, `None` for an unmapped one — ⛔ AND 0 FOR EVERY UNIT OF A
-    /// REGULAR BLOCK, whose one list is everyone's.
+    /// REGULAR BLOCK, whose one list is everyone's. Also pins the shared lookup's last-entry-wins.
     #[test]
     fn an_unmapped_unit_has_no_region_index() {
         let lxlu = unit(DfirUnit::Lxlu);
@@ -713,6 +713,23 @@ mod unit_tests {
         assert_eq!(
             UniformInstrBlock::Regular(vec![nop()]).unit_region_index(unit(DfirUnit::L3su)),
             Some(RegionIndex(0))
+        );
+        let rewritten = UniformBlock {
+            regions: vec![vec![nop()], vec![ret()]],
+            unit_to_region: vec![(lxlu, RegionIndex(1)), (lxlu, RegionIndex(0))],
+            ..UniformBlock::default()
+        };
+        assert_eq!(
+            rewritten.region_of(lxlu),
+            Some(RegionIndex(0)),
+            "`map[unit] = idx` left the second entry"
+        );
+        let mut rewritten = UniformInstrBlock::Uniform(rewritten);
+        assert_eq!(rewritten.unit_region_index(lxlu), Some(RegionIndex(0)));
+        assert_eq!(
+            rewritten.instr_mut(0, lxlu).map(|instr| instr.opcode),
+            Some(OpCode::NOP),
+            "`getInstr` reads the same entry the region index answers"
         );
     }
 
