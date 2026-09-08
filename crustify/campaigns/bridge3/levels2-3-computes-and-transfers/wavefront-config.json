@@ -1,0 +1,43 @@
+{
+ "_comment": [
+  "Narrow inventory for sub-campaign `levels2-3-computes-and-transfers`: bridge3.cpp LEVEL(S) [2, 3] \u2014 41 of the span's 130 functions (L2=17, L3=24).",
+  "the computes and transfers: FMA, binary, unary and ternary instruction construction, the L3 and non-L3 load/store instructions, and the Lower* operation handlers that call them",
+  "impl_files is the same single translation unit as the campaign-wide config (the campaign has exactly one); the NARROWING is the level range above, which is what the schedules beside this file select. Every producer level lands before this one starts."
+ ],
+ "campaign_objective": "port",
+ "impl_files": [
+  "crustify-bridge3/cpp/bridge3.cpp"
+ ],
+ "api_headers": [],
+ "out_of_scope": {
+  "paths": [
+   "crustify-bridge3/cpp/prelude.inc"
+  ],
+  "features": []
+ },
+ "_comment_authority": [
+  "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
+  "  /Users/nickm/git/deeptools-src   (repo_info.txt: deeptools|master|a0d29abbedfa2dd44ec7255e59440b06a429118c)",
+  "which is exactly the revision every banner cites.",
+  "",
+  "\u2705 THIS EXTRACT IS VERIFIED UNTRUNCATED: 130 of 130. An INDEPENDENT verifier",
+  "(tools/verify_extract3.py) re-derives each function's end from the authority with its own",
+  "character-state-machine brace matcher and compares LINE COUNTS, non-whitespace CHARACTER counts",
+  "and then full CONTENT; it never re-slices with the extractor's own (file, line, length), which",
+  "is the tautology that hid bridge 2's truncation of 366 of 384 bodies. It also asserts each",
+  "body's last non-blank line closes its function and was not brace-padded. TWO NEGATIVE CONTROLS",
+  "confirm it bites: a tail cut re-balanced with a bare `}` and a brace-neutral 4-line cut from the",
+  "middle of a body were both CAUGHT.",
+  "",
+  "\u26d4 /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it.",
+  "\u26d4 dcc/src/Transform/Sentient/ (32,766 lines, passes D29-D75) IS NOT IN THIS CAMPAIGN. Those",
+  "   passes rewrite SentientIR IN PLACE before D76 runs. If a function you port depends on state",
+  "   they establish -- register assignments, pinned addresses, rerolled loops -- port the",
+  "   conversion AS THE REFERENCE WRITES IT and record the dependency in the commit message. Do",
+  "   NOT port the pass, and do NOT invent the state."
+ ],
+ "_comment_levels": [
+  2,
+  3
+ ]
+}

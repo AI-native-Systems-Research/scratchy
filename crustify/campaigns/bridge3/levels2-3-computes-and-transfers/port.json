@@ -1,0 +1,934 @@
+{
+  "schema_version": 3,
+  "oracle_config": {
+    "path": "crustify/campaigns/bridge3/levels2-3-computes-and-transfers/wavefront-config.json",
+    "sha256": "bd4da3e9cbd732f79b05feafe5681f6f25dbdfa07cc0ec3e4e54a8ff9524c16b"
+  },
+  "api_headers_only": false,
+  "budgets": {
+    "max_syms": 8,
+    "max_loc": 700,
+    "max_types": 5,
+    "min_fields": 20
+  },
+  "summary": {
+    "unit_count": 41,
+    "layer_count": 2,
+    "batch_count": 7,
+    "file_count": 1
+  },
+  "waves": [
+    {
+      "unit_count": 17,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e081_ConstructLRFADDInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 88,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e082_ConstructLARorEARADDInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 81,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e083_ConstructLRFSUBInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 136,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e084_ConstructLARorEARSUBInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 46,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e085_ConstructFMAInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 291,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        },
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e086_ConstructBinaryInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 485,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        },
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e087_ConstructUnaryInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 237,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e088_ConstructTernaryInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 122,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e089_ConstructLoadInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 201,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e090_ConstructLoadInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 60,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        },
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e091_ConstructStoreInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 121,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e092_ConstructSplatInstrFromSplatOp",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 65,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e093_AddToLabelsMap",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 8,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e094_updateLabelAndAddToCodeGraph",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 40,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e095_equalizeProgramLength",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 90,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e096_getUniformizedUnitInstrList",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 42,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e097_flattenIndex",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 12,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unit_count": 24,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e098_ConstructSplatPadInstr",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 65,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e092_ConstructSplatInstrFromSplatOp",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e099_LowerLoadAndSendOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 29,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e090_ConstructLoadInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e100_LowerReceiveAndStoreOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 49,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e091_ConstructStoreInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e101_LowerLoadAndStoreOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 55,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e102_LowerLoadAndExtractScalarOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 24,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e090_ConstructLoadInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e103_LowerReceiveAndExtractScalarOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 13,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e104_LowerLoadComputeAndSendOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 33,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e105_LowerSyncOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 37,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        },
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e106_LowerNOPOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 14,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e107_LowerCommonOperations",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 26,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e108_LowerBinaryOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 8,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e086_ConstructBinaryInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e109_LowerUnaryOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 7,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e087_ConstructUnaryInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e110_LowerTernaryOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 8,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e088_ConstructTernaryInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e111_LowerForOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 66,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e093_AddToLabelsMap",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e112_LowerMACOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 31,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e085_ConstructFMAInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e113_LowerSubOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 40,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e084_ConstructLARorEARSUBInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e083_ConstructLRFSUBInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        },
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e114_LowerAddOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 50,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e082_ConstructLARorEARADDInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e081_ConstructLRFADDInstr",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e115_LowerReturnOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 7,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e116_LowerSetSendDestinationOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 18,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e117_LowerOpaqueOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 12,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e118_LowerSAMVOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 14,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e119_LowerSetMaskOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 10,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e120_LowerIncrMaskOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 10,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e094_updateLabelAndAddToCodeGraph",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e121_getUniformizedUnitUniformInstrList",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 32,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e096_getUniformizedUnitInstrList",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

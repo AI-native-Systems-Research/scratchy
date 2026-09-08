@@ -1,0 +1,55 @@
+{
+  "_comment": [
+    "PORT campaign: bridge 3 of IBM Spyre deeptools — SentientIR -> ProgIR, dcc pass D76.",
+    "The scope is ONE self-contained translation unit, cpp/bridge3.cpp, holding the 130 function",
+    "bodies to port, extracted verbatim from dcc/src/Conversion/SentientToProgIR/ and each preceded",
+    "by a banner giving its entry number and its ORIGINAL dcc/src/<file>:<line>.",
+    "",
+    "There is no MLIR, LLVM or dcc header anywhere in this campaign. cpp/prelude.inc catalogues the",
+    "45 qualified scopes and 378 external calls the bodies reach so the unit is self-describing.",
+    "It carries names only — the behaviour to port lives in the bodies."
+  ],
+  "campaign_objective": "port",
+  "impl_files": ["cpp/bridge3.cpp"],
+  "api_headers": [],
+  "_comment_verified": [
+    "✅ THE EXTRACTION IS VERIFIED UNTRUNCATED: 130 of 130. tools/verify_extract3.py re-derives every",
+    "function's end from the authority with its OWN brace matcher (it does not import the",
+    "extractor's) and compares line counts, non-whitespace character counts and full content; it also",
+    "asserts each body's last line closes its function and matches the authority's, so no body was",
+    "brace-padded. Two negative controls are caught: a tail cut re-balanced with a bare `}` and a",
+    "brace-neutral 4-line cut from a body's middle.",
+    "",
+    "This is the check bridge 2 did not have: its extract truncated 366 of 384 bodies while reporting",
+    "'verbatim, 12 sampled, none differed', because it re-sliced the source with the SAME",
+    "(file, line, length) the extractor used."
+  ],
+  "_comment_excluded": [
+    "36 of the conversion directory's 166 definitions are NOT in bridge3.cpp, listed with a reason",
+    "each in EXCLUSIONS.tsv. The criterion is what a Rust struct field or a const already is, NOT",
+    "what is hard:",
+    "  33  header inlines of 1-4 lines over a member — a struct field in Rust, not a function.",
+    "      Two of those 33 are comment bookkeeping, and a comment is debug-only in the reference",
+    "      (setComment drops the text unless enable_debug_flag, progir.h:322-330).",
+    "   1  regDefChecking — `return false;`, a compile-time debug constant, a `const bool` in Rust",
+    "   1  initializeOutputStream — ostream copyfmt/rdbuf plumbing; this crate never configures a",
+    "      C++ stream",
+    "   2  createSentientToProgIRPass (both overloads) — MLIR pass-registry factories. scratchy's",
+    "      #[forward] runs the whole pipeline at macro expansion: no pass manager exists at run time",
+    "",
+    "Nothing is excluded for being hard. getUnitRegionIndex is KEPT despite living in a header,",
+    "because its body is a real decision rule with a -1 sentinel."
+  ],
+  "_comment_not_this_campaign": [
+    "⛔⛔ dcc/src/Transform/Sentient/ — 32,766 lines of D29-D75 passes — IS A SEPARATE, LARGER BODY OF",
+    "WORK AND MUST NOT BE PULLED IN. Those passes rewrite SentientIR IN PLACE before D76 runs:",
+    "RegisterAllocation, SmartRegisterAllocation, RegisterTypeAssignment, AddressPinningAndToggle,",
+    "LiveRangeReduction, OpRerolling, LoopRolling, and forty more. A ported function that depends on",
+    "state they establish is ported AS THE REFERENCE WRITES IT, with the dependency recorded in the",
+    "commit message. Do not port the pass, and do not invent the state."
+  ],
+  "out_of_scope": {
+    "paths": ["cpp/prelude.inc"],
+    "features": []
+  }
+}

@@ -1,0 +1,221 @@
+{
+  "schema_version": 3,
+  "oracle_config": {
+    "path": "crustify/campaigns/bridge3/levels4-7-uniform-regions-and-the-driver/wavefront-config.json",
+    "sha256": "7b5d25646371747a8ce498d3b040c2a4b62b4e51e40593fb999869220e28cf6a"
+  },
+  "api_headers_only": false,
+  "budgets": {
+    "max_syms": 24,
+    "max_loc": 3000,
+    "max_types": 5,
+    "min_fields": 20
+  },
+  "summary": {
+    "unit_count": 9,
+    "layer_count": 1,
+    "batch_count": 1,
+    "file_count": 1
+  },
+  "waves": [
+    {
+      "unit_count": 9,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge3/cpp/bridge3.cpp",
+          "items": [
+            {
+              "name": "e122_LowerCopyOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 95,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e123_LowerYieldOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 117,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e124_LowerSplatOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 11,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e125_LowerUniformYieldOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 61,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e126_LowerUniformOperations",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 70,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e128_GenerateProgIR",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e127_GenerateProgIR",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 65,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e128_GenerateProgIR",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 111,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e122_LowerCopyOperation",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e124_LowerSplatOperation",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e126_LowerUniformOperations",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e125_LowerUniformYieldOperation",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e123_LowerYieldOperation",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e129_GenerateProgIRForProgramUnit",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 6,
+              "loc": 186,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e128_GenerateProgIR",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e130_runOnOperation",
+              "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 7,
+              "loc": 135,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e129_GenerateProgIRForProgramUnit",
+                    "defined_in": "crustify-bridge3/cpp/bridge3.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

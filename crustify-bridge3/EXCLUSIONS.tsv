@@ -1,0 +1,37 @@
+definition	authority	loc	reason
+regDefChecking	dcc/src/Conversion/SentientToProgIR/RegDefTracker.hpp:25	8	`return false;` -- a compile-time debug constant, a `const bool` in Rust
+enabled	dcc/src/Conversion/SentientToProgIR/RegDefTracker.hpp:48	1	1-line accessor over two flags
+dccExtContext	dcc/src/Conversion/SentientToProgIR/RegDefTracker.hpp:49	1	1-line field accessor
+progStateInfo	dcc/src/Conversion/SentientToProgIR/RegDefTracker.hpp:50	1	1-line field accessor
+regs	dcc/src/Conversion/SentientToProgIR/RegDefTracker.hpp:69	4	context-chain lookup guarded by DT_CHECK_MSG -- the operand-reaching mechanism the brief allows dropping, and a runtime abort this crate forbids
+regs	dcc/src/Conversion/SentientToProgIR/RegDefTracker.hpp:73	4	the const overload of the same
+initializeOutputStream	dcc/src/Conversion/SentientToProgIR/SentientToProgIR.cpp:421	7	ostream plumbing (copyfmt/rdbuf); this crate emits and never configures a C++ stream
+mlir::sentient::createSentientToProgIRPass	dcc/src/Conversion/SentientToProgIR/SentientToProgIR.cpp:746	12	MLIR pass factory -- #[forward] runs the pipeline at expansion, there is no pass manager
+mlir::sentient::createSentientToProgIRPass	dcc/src/Conversion/SentientToProgIR/SentientToProgIR.cpp:759	8	MLIR pass-registry factory over a dummy context; same reason
+dccExtContext	dcc/src/Conversion/SentientToProgIR/SentientToProgIR.hpp:107	1	1-line field accessor -- a struct field in Rust, not a function
+GetAddressScale	dcc/src/Conversion/SentientToProgIR/SentientToProgIR.hpp:438	3	3-line overload that stringifies its operand and forwards to the .cpp GetAddressScale (entry kept)
+begin	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:54	1	1-line header inline over a member -- a struct field in Rust, not a function
+end	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:55	1	1-line header inline over a member -- a struct field in Rust, not a function
+empty	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:56	1	1-line header inline over a member -- a struct field in Rust, not a function
+find	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:57	3	3-line header inline over a member -- a struct field in Rust, not a function
+getInstn	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:120	1	1-line header inline over a member -- a struct field in Rust, not a function
+setInstn	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:121	1	1-line header inline over a member -- a struct field in Rust, not a function
+getTag	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:122	1	1-line header inline over a member -- a struct field in Rust, not a function
+setTag	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:123	1	1-line header inline over a member -- a struct field in Rust, not a function
+setUniformizedComment	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:124	4	comment bookkeeping; setComment drops the text unless enable_debug_flag (progir.h:322-330) so a comment is never load-bearing
+setCommonComment	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:128	4	the same, for the common comment
+getOperandMap	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:132	1	1-line header inline over a member -- a struct field in Rust, not a function
+setOperandMap	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:133	1	1-line header inline over a member -- a struct field in Rust, not a function
+getDeadCode	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:134	1	1-line header inline over a member -- a struct field in Rust, not a function
+setDeadCode	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:135	1	1-line header inline over a member -- a struct field in Rust, not a function
+getCommonFields	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:159	3	3-line header inline over a member -- a struct field in Rust, not a function
+getUnitToComment	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:162	3	3-line header inline over a member -- a struct field in Rust, not a function
+getCommonComment	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:165	1	1-line header inline over a member -- a struct field in Rust, not a function
+block_type_	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:178	1	1-line header inline over a member -- a struct field in Rust, not a function
+empty	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:179	1	1-line header inline over a member -- a struct field in Rust, not a function
+getInstrLists	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:194	3	3-line header inline over a member -- a struct field in Rust, not a function
+getCurrentRegion	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:197	1	1-line header inline over a member -- a struct field in Rust, not a function
+getType	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:200	1	1-line header inline over a member -- a struct field in Rust, not a function
+setUnitRegionIndex	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:205	3	3-line header inline over a member -- a struct field in Rust, not a function
+getBlocks	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:267	1	1-line header inline over a member -- a struct field in Rust, not a function
+empty	dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp:268	1	1-line header inline over a member -- a struct field in Rust, not a function

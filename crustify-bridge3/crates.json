@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "The port lands in the existing scratchy crate, not a new one:",
+    "crates/compiler/deeptools/src/bridges/sentient_to_progir/.",
+    "",
+    "It consumes islands::sentient::Run<A, M, W> and produces islands::progir::Program<A, M, W>.",
+    "There is no MLIR text on either side and no parser in this crate: the input is a typed value and",
+    "the output is a typed value plus the twelve-line init.smc module.",
+    "",
+    "⭐ REAL NESTED SUBMODULES, not `construct_*`/`lower_*` prefixed flat filenames. Bridge 2's homes",
+    "are flat agen_*/tf_*/vc_* files and that is on the record as the thing to not repeat.",
+    "",
+    "No -sys crate: this is a complete port with no C interop boundary."
+  ],
+  "crates": {
+    "deeptools": {
+      "path": "../crates/compiler/deeptools",
+      "kind": "lib",
+      "_comment_target_module": "All ported code goes under src/bridges/sentient_to_progir/.",
+      "modules": {
+        "construct": {
+          "_comment": "ConstructProgIRHelper.cpp (46 units) — one submodule per instruction family: scalar (jumps, compares, adds, subs, sync), compute (FMA, binary, unary, ternary), transfer (L3 and non-L3 loads and stores), mask_and_splat, opaque, reg_init.",
+          "symbols": ["Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"]
+        },
+        "lower": {
+          "_comment": "LowerSentientHelper.cpp (34 units) — the per-operation handlers: transfer, compute, control (for/yield/sync/uniform), labels_and_regs.",
+          "symbols": ["Conversion/SentientToProgIR/LowerSentientHelper.cpp"]
+        },
+        "uniform": {
+          "_comment": "UniformInstrAndBlock.cpp and .hpp (33 units) — the operand map, one instruction's fields, and the block/region machinery with its flattened index.",
+          "symbols": ["Conversion/SentientToProgIR/UniformInstrAndBlock.cpp", "Conversion/SentientToProgIR/UniformInstrAndBlock.hpp"]
+        },
+        "driver": {
+          "_comment": "SentientToProgIR.cpp (7 units) — runOnOperation, both GenerateProgIR overloads, GenerateProgIRForProgramUnit, initializeUtilizedRegisters, equalizeProgramLength, replaceProgramBodyWithSmcOp.",
+          "symbols": ["Conversion/SentientToProgIR/SentientToProgIR.cpp"]
+        },
+        "reg_def_tracker": {
+          "_comment": "RegDefTracker.cpp (5 units) — which registers are defined, and whether anything reads one that is not. ⛔ A CHECK: returns the offenders, never refuses.",
+          "symbols": ["Conversion/SentientToProgIR/RegDefTracker.cpp"]
+        },
+        "utils": {
+          "_comment": "Utils.cpp (5 units) — the on-the-fly conversion check, the proper-consumer walk, the address wraparound, the fold-mode value.",
+          "symbols": ["Conversion/SentientToProgIR/Utils.cpp"]
+        }
+      }
+    }
+  }
+}

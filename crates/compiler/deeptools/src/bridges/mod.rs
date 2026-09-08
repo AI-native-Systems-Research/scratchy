@@ -9,3 +9,6 @@ pub mod subtile_to_dataflow_ir;
 
 /// `DataflowIR -> SentientIR` — the D1-D28 span.
 pub mod dataflow_ir_to_sentient;
+
+/// `SentientIR -> ProgIR` — dcc pass D76, the last MLIR rung.
+pub mod sentient_to_progir;
