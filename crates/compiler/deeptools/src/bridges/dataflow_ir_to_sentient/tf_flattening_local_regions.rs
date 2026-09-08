@@ -1181,6 +1181,7 @@ fn replace_uses_at_or_below(op: &mut DfirOp, from: Val, to: Val) {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
 
     /// 🎯 181/384 — AN OPERATION STAMPED WITH THE REGION MEANS IT IS NOT EMPTY.
     ///
@@ -1347,11 +1348,13 @@ mod unit_tests {
                         DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                             result: Val(285),
                             pairs: vec![(Val(10), Val(74))],
+                            values_ty: MappedTy::Index,
                         }),
                         DfirOp::Uniform(uniform::Op::QueryMap {
                             result: Val(286),
                             map: Val(285),
                             key: Val(48),
+                            ty: MappedTy::Index,
                         }),
                         DfirOp::Dataflow(dataflow::Op::SyncRecv {
                             from: Val(286),
@@ -1377,11 +1380,13 @@ mod unit_tests {
                         DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                             result: Val(295),
                             pairs: vec![(Val(11), Val(75))],
+                            values_ty: MappedTy::Index,
                         }),
                         DfirOp::Uniform(uniform::Op::QueryMap {
                             result: Val(296),
                             map: Val(295),
                             key: Val(49),
+                            ty: MappedTy::Index,
                         }),
                         DfirOp::Dataflow(dataflow::Op::SyncRecv {
                             from: Val(296),

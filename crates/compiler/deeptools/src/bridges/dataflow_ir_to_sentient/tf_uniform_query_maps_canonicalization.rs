@@ -222,6 +222,7 @@ pub fn run_on_operation(module: &[DfirOp]) -> CanonicalizedQueryMaps<'_> {
         let DfirOp::Uniform(uniform::Op::DefImmutableMapping {
             result: handle,
             pairs,
+            ..
         }) = def_map_op
         else {
             continue;
@@ -260,6 +261,7 @@ mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::uniform::LocalRegion;
+    use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
     use crate::islands::dataflow_ir::dialects::{arith, results};
     use crate::islands::dataflow_ir::ty::ScalarTy;
 
@@ -288,6 +290,7 @@ mod unit_tests {
             DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                 result: handle,
                 pairs: vec![(k0, v0), (k1, v1)],
+                values_ty: MappedTy::Index,
             }),
             DfirOp::Uniform(uniform::Op::UniformizeRegions {
                 regions: vec![LocalRegion {
@@ -298,6 +301,7 @@ mod unit_tests {
                             result: queried,
                             map: handle,
                             key: arg,
+                            ty: MappedTy::Index,
                         }),
                         DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
                             result: sum,

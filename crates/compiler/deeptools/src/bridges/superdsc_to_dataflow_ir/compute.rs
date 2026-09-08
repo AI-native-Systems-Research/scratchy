@@ -149,6 +149,10 @@ pub const fn is_integer(elem: ElemType) -> bool {
 /// bitstream to the data and divides (`SNTransferLowering.cpp:2505-2506`).
 ///
 /// ⛔ `indices` IS `{0}` — one index, so every lane reads element 0.
+///
+/// ⛔ AND THE BITSTREAM IS NOT SYMBOLIC. `is_symbol` is a discardable attribute the reference only
+/// ever `setAttr`s (`SNDSCLowering.cpp:479-481`, `Splat.cpp:50-51`); this `create` does not, so the
+/// op prints `{value = [..]}` with hex values rather than the `i64`-suffixed dictionary.
 pub fn single_val_custom_vector(
     vals: &mut Values,
     into: &mut Vec<Op>,
@@ -160,6 +164,7 @@ pub fn single_val_custom_vector(
         result: bitstream,
         value: vec![value],
         ty,
+        is_symbol: false,
     }));
     let result = vals.mint();
     into.push(Op::VectorChain(vectorchain::Op::Shuffle {
@@ -313,6 +318,7 @@ mod unit_tests {
                     result: Val(0),
                     value: vec![7],
                     ty,
+                    is_symbol: false,
                 }),
                 Op::VectorChain(vectorchain::Op::Shuffle {
                     result: Val(1),

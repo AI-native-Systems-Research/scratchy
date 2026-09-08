@@ -73,6 +73,8 @@ use crate::islands::dataflow_ir::dialects::{
     uniform, uses,
 };
 
+use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
+
 use super::vc_vector_operands::{OpId, defining_position, op_at, remove_at, use_positions};
 use crate::units::{Core, Corelet, NumFolds, Residency};
 
@@ -771,6 +773,7 @@ mod unit_tests {
             &mut vals,
             Val(50),
             &pairs,
+            MappedTy::Index,
             &scope,
             &filters,
         )
@@ -780,6 +783,7 @@ mod unit_tests {
             DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                 result: reduced.map,
                 pairs: vec![(Val(100), Val(200))],
+                values_ty: MappedTy::Index,
             }),
             reduced.op
         );
@@ -790,6 +794,7 @@ mod unit_tests {
                 &mut vals,
                 Val(50),
                 &pairs,
+                MappedTy::Index,
                 &scope,
                 &no_filters()
             )
@@ -804,6 +809,7 @@ mod unit_tests {
                 &mut vals,
                 Val(50),
                 &pairs,
+                MappedTy::Index,
                 &scope,
                 &no_core
             )
@@ -986,11 +992,13 @@ mod unit_tests {
             DfirOp::Uniform(uniform::Op::DefImmutableMapping {
                 result: Val(469),
                 pairs: vec![(Val(260), Val(430))],
+                values_ty: MappedTy::Index,
             }),
             DfirOp::Uniform(uniform::Op::QueryMap {
                 result: Val(470),
                 map: Val(469),
                 key: Val(5),
+                ty: MappedTy::Index,
             }),
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(470),
@@ -1031,11 +1039,16 @@ pub struct ReducedDefImmutMap {
 /// EVERYTHING was — "If all keys are to be filtered out, do not modify the map. Instead, the entire
 /// region should be deleted at the last step of this pass" (`:126-128`). ⚠️ `DT_CHECK(!values.empty())`
 /// has no counterpart: an empty map reduces nothing and takes the same [`None`].
+///
+/// ⚠️ `values_ty` IS CARRIED THROUGH, NOT RE-DERIVED. Filtering drops pairs; it does not change what
+/// the surviving values are, and the reference's `builder.getIndexType()` (`:132`) is the mapping's
+/// RESULT type, which is `index` for a bitstream map too.
 #[must_use]
 pub fn remove_cores_corelets_folds_from_def_immut_map(
     vals: &mut Values,
     map: Val,
     pairs: &[(Val, Val)],
+    values_ty: MappedTy,
     scope: &[DfirOp],
     filters: &UnitFilters,
 ) -> Option<ReducedDefImmutMap> {
@@ -1065,6 +1078,7 @@ pub fn remove_cores_corelets_folds_from_def_immut_map(
         op: DfirOp::Uniform(uniform::Op::DefImmutableMapping {
             result: new_map,
             pairs: new_pairs,
+            values_ty,
         }),
         map: new_map,
         to_delete: map,
