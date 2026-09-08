@@ -187,6 +187,10 @@ pub enum Precision {
     Mxfp4,
     /// `mxfp8` — 4 occurrences.
     Mxfp8,
+    /// `mxint4` — ⛔ NOT IN `dcc/test` EITHER, AND STILL PRODUCIBLE: entry 103 prefixes `mx` onto
+    /// `stringifyComputePrecision`'s spelling for a scaled `IMA4`, and `SentientTypes.td:56-58`
+    /// carries `mxint4` for it to lower to.
+    Mxint4,
 
     /// `fp80` — ⛔⛔ **AN ALIAS FOR `fp8`, AND THE ONLY REASON ENTRY 094 IS NOT THE IDENTITY.**
     ///
@@ -217,6 +221,7 @@ impl Precision {
             Self::Bf16 => "bf16",
             Self::Mxfp4 => "mxfp4",
             Self::Mxfp8 => "mxfp8",
+            Self::Mxint4 => "mxint4",
             Self::Fp80 => "fp80",
         }
     }

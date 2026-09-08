@@ -39,8 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e104_constructDataTransfer
-
 use super::compute::{VectorWidth, precision_conversion, type_from_format};
 use super::control_flow::{PrimaryDim, SamvLoop, conditionals_for_samv};
 use super::dsc_lowering::{
@@ -4919,6 +4917,411 @@ pub fn generate_data_transfer_for_dst(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 104/110 — ONE TRANSFER STATEMENT, FROM THIS UNIT'S SIDE
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE FORMAT ONE END OF A TRANSFER STATES — `myLdsIdx_`'s labeled DS, or the constant it must
+/// otherwise be.
+///
+/// ⛔ [`EndFormat::Constant`] IS `DT_CHECK_MSG(constantId_ >= 0, "transfer src should either have
+/// labeled ds or it has to be a constant")` (`:2683-2686`) HOISTED INTO THE TYPE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndFormat {
+    /// `labeledDs_[myLdsIdx_]`'s `dataFormat_` and `scaledLdsCategory_`.
+    Labeled(DataType, TensorCategory),
+    /// `constantInfo_.at(constantId_).dataFormat_`, which states no category — the reference leaves
+    /// `src_category` at its `REGULAR_TENSOR` initialiser (`:2679-2680`).
+    Constant(DataType),
+}
+
+impl EndFormat {
+    /// `{src,dst}_prec_` and the category beside it.
+    const fn parts(self) -> (DataType, TensorCategory) {
+        match self {
+            EndFormat::Labeled(format, category) => (format, category),
+            EndFormat::Constant(format) => (format, TensorCategory::Regular),
+        }
+    }
+}
+
+/// THE DESTINATIONS' FORMATS — `dstLdsAndLoopOffsets_`, split because only the LAST one survives.
+///
+/// ⛔⛔ `dst_result_type` IS OVERWRITTEN PER ENTRY AND READ AFTER THE LOOP (`:2716-2720`, `:2780`), so
+/// the last destination types every load and store below and an empty list would leave it null —
+/// which is why the last one is a field and not the tail of a slice.
+///
+/// ⚠️ THE CATEGORY IS NOT READ ON THIS SIDE: every entry is typed `REGULAR_TENSOR` (`:2717-2718`), so
+/// a leading destination contributes nothing but entry 063's refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DstFormats<'d> {
+    /// Every entry but the last.
+    pub leading: &'d [EndFormat],
+    /// The last, which is `dst_result_type` when the loop ends.
+    pub last: EndFormat,
+}
+
+/// `uniformization_enabled_`, AND THE ONE THING IT DECIDES HERE — the reference's own "Temporary fix
+/// to get blocks" (`:2723-2728`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uniformization {
+    /// A unit with no corelet asks for corelet 0's block sizes.
+    Enabled,
+    /// `corelet_id_` stands.
+    Disabled,
+}
+
+impl Uniformization {
+    /// `int corelet_id = corelet_id_; if (uniformization_enabled_ && corelet_id == -1) corelet_id = 0;`
+    #[must_use]
+    pub fn blocks_corelet(self, corelet: Option<Corelet>) -> Option<Corelet> {
+        match (self, corelet) {
+            (Uniformization::Enabled, None) => Corelet::checked(0),
+            (_, held) => held,
+        }
+    }
+}
+
+/// ONE DESTINATION OF A TRANSFER — `transfer_->dstVias_[i]`, with the fusable parent loop that is
+/// indexed by the same `i` (`:2809-2816`).
+#[derive(Debug, Clone, Copy)]
+pub struct DstVia<'d> {
+    /// `loc_.unit_`.
+    pub unit: Component,
+    /// `loc_.storage_`.
+    pub storage: Component,
+    /// `via_`, in route order.
+    pub vias: &'d [Component],
+    /// `dsc_loops_to_mlir_loops_map_->at(lastFusableParentLoopDst_[i]).front()`, and [`None`] both
+    /// for an empty list and for a null entry.
+    pub fusable_parent: Option<&'d DfirOp>,
+}
+
+/// WHERE ONE END'S OPS GO — `OpBuilder tmp_builder = builder`, moved to the fusable parent loop where
+/// there is one (`:2751-2761`, `:2807-2818`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndPlace<'p> {
+    /// The caller's own insertion point.
+    Here,
+    /// `tmp_builder.setInsertionPoint(loop_op)` — BEFORE this loop, and not in its body.
+    BeforeLoop(&'p DfirOp),
+}
+
+/// `lastFusableParentLoop{Src,Dst}_ != nullptr && is_memory && !areEpiloguesInTransferSizes()`.
+///
+/// ⛔ THE EPILOGUE TEST IS ASKED PER END, AFTER THE ENDS BEFORE IT RAN: entry 090 decrements the
+/// per-dim counts this reads (see [`ContiguousSticks`]), so the second destination of a transfer can
+/// place itself differently from the first.
+fn fusable_place<'p>(
+    comp: Component,
+    fusable: Option<&'p DfirOp>,
+    sticks: &ContiguousSticks,
+) -> EndPlace<'p> {
+    // `is_any_of(comp_, LXLU, LXSU, L0LUROW0, L0SU)` — with the `L0LUROW0` widening entry 090 notes.
+    let is_memory = matches!(
+        comp,
+        Component::Unit(unit)
+            if matches!(
+                unit.generic(),
+                GenericComp::Lxlu | GenericComp::Lxsu | GenericComp::L0lu | GenericComp::L0su
+            )
+    );
+    match fusable {
+        Some(loop_op) if is_memory && !epilogues_in_transfer_sizes(sticks) => {
+            EndPlace::BeforeLoop(loop_op)
+        }
+        _ => EndPlace::Here,
+    }
+}
+
+/// EVERYTHING ONE TRANSFER STATEMENT READS OFF ITS NODE.
+#[derive(Debug, Clone, Copy)]
+pub struct DataTransfer<'t> {
+    /// `comp_` — the unit this program is lowered FOR.
+    pub comp: Component,
+    /// `transfer_->src_.unit_`.
+    pub src_unit: Component,
+    /// `srcLdsAndLoopOffsets_`.
+    pub src: EndFormat,
+    /// `dstLdsAndLoopOffsets_`.
+    pub dsts: DstFormats<'t>,
+    /// `unitTimeTransferChunkSize_`'s per-dim sizes, as entry 063 reads them.
+    pub chunks: &'t [Elements],
+    /// `unitTimeTransferNumChunks_`.
+    pub num_chunks: i64,
+    /// `transfer_->dstVias_`, in order.
+    pub vias: &'t [DstVia<'t>],
+    /// `lastFusableParentLoopSrc_`, resolved as [`DstVia::fusable_parent`] is.
+    pub fusable_src: Option<&'t DfirOp>,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_`, and [`None`] for the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `uniformization_enabled_`.
+    pub uniformized: Uniformization,
+    /// `dsc_->name_`.
+    pub node: &'t str,
+    /// `transfer_->name_`.
+    pub name: &'t str,
+    /// `*view_sizes_core_specific`.
+    pub view_sizes: &'t [ViewSize],
+    /// `transfer_->replicationFactor_`.
+    pub replication: Replication,
+}
+
+/// ONE SOURCE END AND THE INSERTION POINT IT WAS BUILT AT.
+#[derive(Debug)]
+pub struct PlacedSrc<'p> {
+    /// `tmp_builder`.
+    pub at: EndPlace<'p>,
+    /// Entry 098's answer.
+    pub sent: SrcTransfer,
+}
+
+/// THE DESTINATION END AND THE INSERTION POINT IT WAS BUILT AT.
+#[derive(Debug)]
+pub struct PlacedDst<'p> {
+    /// `tmp_builder`.
+    pub at: EndPlace<'p>,
+    /// Entry 102's answer.
+    pub received: DstTransfer,
+}
+
+/// WHAT ONE TRANSFER STATEMENT EMITS, AND THE TWO TYPES IT LEAVES ON THE LOWERING.
+#[derive(Debug)]
+pub struct ConstructedTransfer<'t> {
+    /// `src_result_type` — the source end's type, at the scaled category only the L0 lookup keeps.
+    pub src_result_ty: Vector,
+    /// `result_type` after `result_type = dst_result_type` (`:2780`).
+    pub result_ty: Vector,
+    /// One per DISTINCT unit the source end reached, in `dstVias_` order.
+    pub sends: Vec<PlacedSrc<'t>>,
+    /// The FIRST destination that is this unit, and [`None`] where none is or where the one that is
+    /// hears from this unit itself — entry 102's own no-op.
+    pub dst: Option<PlacedDst<'t>>,
+    /// One per via chain this unit is only a hop of.
+    pub hops: Vec<ReceiveAndSend>,
+    /// The counts, after every end walked and decremented them.
+    pub sticks: ContiguousSticks,
+}
+
+/// Replaces: e104_constructDataTransfer
+///
+/// **104/110** `SNTransferLowering::constructDataTransfer` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2676` (164L).
+///
+/// ONE TRANSFER STATEMENT FROM THIS UNIT'S SIDE: its two types, one source end per DISTINCT unit it
+/// reaches, the FIRST destination end that is this unit, and one pass-through per via chain.
+///
+/// ⛔⛔ THE SCALED CATEGORY SURVIVES ON `L0LUROW0` ALONE (`:2693-2697`) — every other unit reads a
+/// scaled labeled DS as a REGULAR tensor, so its `src_result_type` carries no `mx` element type.
+/// ⛔ `result_type = dst_result_type` (`:2778-2780`): the LAST destination's format types every load
+/// and store from there down, and the source ends above were built against the SOURCE's.
+/// ⚠️ `sticks_src_ss != sticks_src_el` (`:2822`) HAS NOWHERE TO GO — entry 102 never reads that
+/// argument.
+/// ⛔ [`None`] IS ENTRY 063'S `failure()`, a `BOOL`-formatted end, and the only refusal here: both
+/// `emitError`s raise, as do both callees' own.
+#[must_use]
+pub fn construct_data_transfer<'t>(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    transfer: &DataTransfer<'t>,
+    own: Val,
+    blocks: impl Fn(Option<Corelet>) -> Vec<(PrimaryDim, StickCounts)>,
+    send: &dyn Fn(&mut Values, &mut Vec<DfirOp>, &mut ContiguousSticks, Val) -> Option<LoadAndSend>,
+    store: &dyn Fn(&mut Values, &mut Vec<DfirOp>, Component) -> LoadAndStore,
+    receive: &dyn Fn(
+        &mut Values,
+        &mut Vec<DfirOp>,
+        &mut ContiguousSticks,
+        usize,
+        RecvEnd,
+    ) -> Option<ReceiveAndStore>,
+) -> Option<ConstructedTransfer<'t>> {
+    // `getLabeledDsType(src_prec_, src_category, builder, result_type)`, over the category the
+    // `transfer_->src_.unit_ != L0LUROW0` test has already flattened.
+    let (src_format, stated) = transfer.src.parts();
+    let src_category = if transfer.src_unit == Component::Unit(DfirUnit::L0lu) {
+        stated
+    } else {
+        TensorCategory::Regular
+    };
+    let src_result_ty = labeled_ds_type(
+        transfer.chunks,
+        transfer.num_chunks,
+        src_format,
+        src_category,
+    )?;
+
+    // `for (dst_lds : dstLdsAndLoopOffsets_)` — every entry is typed and only the last is kept.
+    for leading in transfer.dsts.leading {
+        labeled_ds_type(
+            transfer.chunks,
+            transfer.num_chunks,
+            leading.parts().0,
+            TensorCategory::Regular,
+        )?;
+    }
+    let dst_result_ty = labeled_ds_type(
+        transfer.chunks,
+        transfer.num_chunks,
+        transfer.dsts.last.parts().0,
+        TensorCategory::Regular,
+    )?;
+
+    // `getBlockTransferSizePerDim(*transfer_, comp_, corelet_id, {false,true}, true)` — one call per
+    // half of the pair, over the corelet the uniformized fix-up supplies.
+    let per_dim = blocks(transfer.uniformized.blocks_corelet(transfer.corelet));
+    // `for (it : src_sticks_ss_per_dim) sticks_src_ss *= it.second;` and its `_el` twin, both from `1`.
+    let whole = StickCounts {
+        steady: per_dim.iter().map(|(_, counts)| counts.steady).product(),
+        epilogue: per_dim.iter().map(|(_, counts)| counts.epilogue).product(),
+    };
+    if whole.steady <= 0 || whole.epilogue <= 0 {
+        emit_error(transfer.node, "Negative number of block transfers");
+    }
+    let mut sticks = ContiguousSticks::new(whole, per_dim);
+
+    // `if (transfer_->src_.unit_ == comp_)` — this unit is the one sending.
+    let mut sends = Vec::new();
+    if transfer.src_unit == transfer.comp {
+        let mut explored_dst_units: Vec<Component> = Vec::new();
+        for dst in transfer.vias {
+            let at = fusable_place(transfer.comp, transfer.fusable_src, &sticks);
+            // ⛔ THE DEDUPE IS ON THE UNIT REACHED, `via_.front()` and not the destination
+            // (`:2762-2769`): two destinations behind one hop are sent to once.
+            let to_unit = dst.vias.first().copied().unwrap_or(dst.unit);
+            if explored_dst_units.contains(&to_unit) {
+                continue;
+            }
+            explored_dst_units.push(to_unit);
+
+            let route = match dst.vias.first() {
+                Some(head) => SrcRoute::via(transfer.comp, *head).unwrap_or_else(|| {
+                    todo!("a via'd route whose first hop is comp_ names no storage to store into")
+                }),
+                None => SrcRoute::direct(transfer.comp, dst.unit, dst.storage),
+            };
+            let sent = generate_data_transfer_for_src(
+                vals,
+                ops,
+                handlers,
+                route,
+                transfer.core,
+                transfer.corelet,
+                transfer.node,
+                |vals: &mut Values, ops: &mut Vec<DfirOp>, unit: Val| {
+                    send(vals, ops, &mut sticks, unit)
+                },
+                store,
+            );
+            sends.push(PlacedSrc { at, sent });
+        }
+    }
+
+    // ⛔ `result_type = dst_result_type` — see this function's note.
+    let result_ty = dst_result_ty;
+
+    // `dst_forward_map[comp_]` — the units this one passes what it stores on to.
+    let mut forward_to: Vec<Component> = Vec::new();
+    for dst in transfer.vias {
+        if dst.unit != transfer.comp {
+            continue;
+        }
+        // `DT_CHECK(transfer_->src_.unit_ != comp_ || dst.loc_.storage_ == LXLUSCALEREG)` (`:2786-2787`),
+        // under the reference's own "TODO: What if the src is destination comp_ itself?".
+        if transfer.src_unit == transfer.comp && dst.storage != Component::LxluScaleReg {
+            todo!("comp_ is its own destination and does not store into the LX scale register");
+        }
+        for dst_fwd in transfer.vias {
+            for (i, via) in dst_fwd.vias.iter().enumerate() {
+                if *via != transfer.comp {
+                    continue;
+                }
+                // `i < via_.size() - 1 ? via_[i + 1] : dst_fwd.loc_.unit_`, into a set.
+                let next = dst_fwd.vias.get(i + 1).copied().unwrap_or(dst_fwd.unit);
+                if !forward_to.contains(&next) {
+                    forward_to.push(next);
+                }
+            }
+        }
+    }
+
+    // `for (dst_idx ..) if (dst.loc_.unit_ == comp_) { .. break; }` — ⛔ THE FIRST ONE AND NO OTHER,
+    // even where a later destination is this unit too.
+    let mut explored_pairs: Vec<(Component, Component)> = Vec::new();
+    let mut dst_end = None;
+    for (dst_idx, dst) in transfer.vias.iter().enumerate() {
+        if dst.unit != transfer.comp {
+            continue;
+        }
+        let at = fusable_place(transfer.comp, dst.fusable_parent, &sticks);
+        // `from = dst.via_.empty() ? transfer_->src_.unit_ : dst.via_.back()`.
+        let from = match dst.vias.last() {
+            Some(last) => DstFrom::via(transfer.comp, *last),
+            None => DstFrom::direct(transfer.comp, transfer.src_unit),
+        };
+        if let Some(from) = from {
+            let received = generate_data_transfer_for_dst(
+                vals,
+                ops,
+                handlers,
+                from,
+                transfer.core,
+                transfer.corelet,
+                transfer.node,
+                own,
+                &forward_to,
+                &mut explored_pairs,
+                |vals: &mut Values, ops: &mut Vec<DfirOp>, end: RecvEnd| {
+                    receive(vals, ops, &mut sticks, dst_idx, end)
+                },
+            );
+            dst_end = Some(PlacedDst { at, received });
+        }
+        break;
+    }
+
+    // `for (dst : dstVias_) GenerateDataTransfersForViaIfSo(transfer_->src_, dst, ..)`.
+    let mut hops = Vec::new();
+    for dst in transfer.vias {
+        let hop = generate_data_transfers_for_via_if_so(
+            vals,
+            ops,
+            handlers,
+            &ViaTransfer {
+                comp: transfer.comp,
+                src: transfer.src_unit,
+                dst: dst.unit,
+                vias: dst.vias,
+                core: transfer.core,
+                corelet: transfer.corelet,
+                node: transfer.node,
+                name: transfer.name,
+                view_sizes: transfer.view_sizes,
+                unit_time_dims: transfer.chunks.len(),
+                replication: transfer.replication,
+                result_ty,
+            },
+            &mut sticks,
+            &mut explored_pairs,
+        );
+        if let Some(hop) = hop {
+            hops.push(hop);
+        }
+    }
+
+    Some(ConstructedTransfer {
+        src_result_ty,
+        result_ty,
+        sends,
+        dst: dst_end,
+        hops,
+        sticks,
+    })
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -7870,5 +8273,127 @@ mod unit_tests {
         );
         // ⚠️ `from == comp_` — this unit is the sender and there is nothing to receive.
         assert!(DstFrom::direct(l3lu, l3lu).is_none());
+    }
+    // ─────────────────────────────── 104/110 ───────────────────────────────
+
+    /// 🎯 104/110 — ⛔⛔ TWO DESTINATIONS BEHIND ONE HOP ARE SENT TO ONCE (`:2762-2769`), the source
+    /// reads its SCALED labeled DS as a regular tensor off the L0 lookup (`:2694-2697`), and what
+    /// follows is typed by the LAST destination and never by the source (`:2780`).
+    #[test]
+    fn one_hop_serving_two_destinations_sends_once_and_the_last_dst_types_the_rest() {
+        use std::cell::Cell;
+
+        let comp = Component::Unit(DfirUnit::Lxlu);
+        let sfp = Component::Unit(DfirUnit::Sfp);
+        let vias = [
+            DstVia {
+                unit: Component::Unit(DfirUnit::Pe),
+                storage: Component::PeLrf,
+                vias: &[sfp],
+                fusable_parent: None,
+            },
+            DstVia {
+                unit: sfp,
+                storage: Component::SfpLrf,
+                vias: &[],
+                fusable_parent: None,
+            },
+        ];
+        let transfer = DataTransfer {
+            comp,
+            src_unit: comp,
+            src: EndFormat::Labeled(DataType::Sen143Fp8, TensorCategory::Scaled),
+            dsts: DstFormats {
+                leading: &[EndFormat::Constant(DataType::Senint8)],
+                last: EndFormat::Labeled(DataType::Bfloat16, TensorCategory::Scaled),
+            },
+            chunks: &[Elements(4), Elements(8)],
+            num_chunks: 0,
+            vias: &vias,
+            fusable_src: None,
+            core: Core::checked(0).expect("core 0"),
+            corelet: None,
+            uniformized: Uniformization::Enabled,
+            node: "N",
+            name: "T",
+            view_sizes: &[],
+            replication: Replication::checked(1).expect("the default factor"),
+        };
+
+        let asked = Cell::new(None);
+        let sent = Cell::new(0);
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let built = construct_data_transfer(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &transfer,
+            Val(9),
+            |corelet: Option<Corelet>| {
+                asked.set(Some(corelet));
+                vec![
+                    (PrimaryDim::Out, StickCounts { steady: 2, epilogue: 2 }),
+                    (PrimaryDim::In, StickCounts { steady: 3, epilogue: 3 }),
+                ]
+            },
+            &|_: &mut Values, _: &mut Vec<DfirOp>, _: &mut ContiguousSticks, _: Val| {
+                sent.set(sent.get() + 1);
+                Some(LoadAndSend {
+                    emitted: Emitted::Chain {
+                        ops: Vec::new(),
+                        at: ChainPlace::Here,
+                    },
+                    switch: None,
+                })
+            },
+            &|_: &mut Values, _: &mut Vec<DfirOp>, _: Component| {
+                panic!("nothing on this transfer stays on this unit")
+            },
+            &|_: &mut Values,
+              _: &mut Vec<DfirOp>,
+              _: &mut ContiguousSticks,
+              _: usize,
+              _: RecvEnd| { panic!("this unit is no destination of this transfer") },
+        )
+        .expect("both ends have a type");
+
+        // ⛔ ONE SEND, AND ONE `get_unit` — for the hop the two destinations share.
+        assert_eq!(sent.get(), 1);
+        assert_eq!(built.sends.len(), 1);
+        assert!(matches!(built.sends[0].at, EndPlace::Here));
+        assert!(matches!(
+            ops.as_slice(),
+            [DfirOp::Dataflow(dataflow::Op::GetUnit {
+                unit: DfirUnit::Sfp,
+                ..
+            })]
+        ));
+        // ⛔ THE SOURCE'S SCALED CATEGORY IS DROPPED, and the last destination types the rest.
+        assert_eq!(
+            built.src_result_ty,
+            Vector {
+                len: 32,
+                elem: ElemType::F8E4M3Fn,
+            }
+        );
+        assert_eq!(
+            built.result_ty,
+            Vector {
+                len: 32,
+                elem: ElemType::Bf16,
+            }
+        );
+        // ⚠️ THE UNIFORMIZED FIX-UP ASKS CORELET 0 FOR ITS BLOCKS, never `-1`.
+        assert_eq!(asked.get(), Some(Corelet::checked(0)));
+        assert_eq!(
+            built.sticks.whole(),
+            StickCounts {
+                steady: 6,
+                epilogue: 6,
+            }
+        );
+        assert!(built.dst.is_none());
+        assert!(built.hops.is_empty());
     }
 }

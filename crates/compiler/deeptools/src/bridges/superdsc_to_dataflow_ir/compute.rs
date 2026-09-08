@@ -429,6 +429,34 @@ impl MacOp {
         })
     }
 
+    /// `stringifyComputePrecision(type_)` (`DSC2ToDataflowIR.hpp:54-71`), prefixed `mx` where any
+    /// operand's labelled data structure is a scaled tensor (`SNComputeLowering.cpp:1579-1591`).
+    ///
+    /// ⛔ THREE OF THE SEVEN `mx` PRODUCTS HAVE NO SPELLING ON THE MACHINE. The reference builds them
+    /// by string concatenation; `SentientTypes.td:56-58` carries `mxfp4`, `mxfp8` and `mxint4` and no
+    /// `mxint8`/`mxfp16`/`mxfp32`, and `ConstructProgIRHelper.cpp:1469-1488` refuses what it is handed.
+    #[must_use]
+    pub fn precision(self, category: TensorCategory) -> dataflow::Precision {
+        match (self, category) {
+            (MacOp::Ima8, TensorCategory::Regular) => dataflow::Precision::Int8,
+            (MacOp::Ima4, TensorCategory::Regular) => dataflow::Precision::Int4,
+            (MacOp::Fma4, TensorCategory::Regular) => dataflow::Precision::Fp4,
+            (MacOp::Fma8, TensorCategory::Regular) => dataflow::Precision::Fp8,
+            (MacOp::Fma16, TensorCategory::Regular) => dataflow::Precision::Fp16,
+            // ⭐ `FNMS` IS `fp32` TOO (`:67-68`), which is the one arm that is not a name match.
+            (MacOp::Fma32 | MacOp::Fnms, TensorCategory::Regular) => dataflow::Precision::Fp32,
+
+            (MacOp::Ima4, TensorCategory::Scaled) => dataflow::Precision::Mxint4,
+            (MacOp::Fma4, TensorCategory::Scaled) => dataflow::Precision::Mxfp4,
+            (MacOp::Fma8, TensorCategory::Scaled) => dataflow::Precision::Mxfp8,
+            (MacOp::Ima8, TensorCategory::Scaled) => todo!("precision \"mxint8\" is not a spelling"),
+            (MacOp::Fma16, TensorCategory::Scaled) => todo!("precision \"mxfp16\" is not a spelling"),
+            (MacOp::Fma32 | MacOp::Fnms, TensorCategory::Scaled) => {
+                todo!("precision \"mxfp32\" is not a spelling")
+            }
+        }
+    }
+
     /// Replaces: e051_getSelectionMapForMACOperandFromL0
     ///
     /// HOW L0LU DATA IS SPLATTED ACROSS THE MAC'S LANES — the `(d0) -> (d0 mod factor)` a
@@ -2009,18 +2037,219 @@ pub fn unary_operation<A: Arch>(
         )
     })
 }
-// crustify:todo: e103_constructComputeOperation
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 103/110 — ONE COMPUTE STATEMENT, ROUTED TO ITS FAMILY
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH OF THE FIVE FAMILIES ONE COMPUTE'S `type_` ROUTES TO — the five `is_any_of` chains of
+/// `constructComputeOperation` (`:1570-1635`), each carrying exactly its constructor's arguments.
+///
+/// ⛔ A SIXTH CHAIN IS ABSENT BY CONSTRUCTION: the `else` is
+/// `emitError("Unknown compute operation in constructComputeOperation")` (`:1643`).
+///
+/// ⚠️ [`BinaryOrTernary::Fmax`] AND `Fmin` ARE UNREACHABLE THROUGH IT — `FMAX` and `FMIN` are claimed
+/// by the third chain (`:1605-1606`), so entry 100's own arms for them are dead here.
+pub enum ComputeFamily<'f> {
+    /// `IMA8`|`IMA4`|`FMA4`|`FMA8`|`FMA16`|`FMA32`|`FNMS` → entry 099, and the only arm that writes
+    /// `precision`.
+    Mac {
+        /// `compute_op.type_`.
+        mac: MacOp,
+        /// The three operands, whose `lds` categories decide the `mx` prefix.
+        inputs: &'f [(ComputeInput<'f>, MacInputFormat); 3],
+        /// `compute_mask_`, or the dynamic map a PT may carry.
+        mask: ComputeMask<'f>,
+        /// `compute_op.outputs_`.
+        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+    },
+    /// `FMUL`|`FSUB`|`PACKMERGE`|`FABSMAX`|the six comparisons|`SELECT`|`OR`|`AND` → entry 100.
+    BinaryOrTernary {
+        /// `compute_op.type_`, with `FMUL`'s `mode_` folded in.
+        which: &'f BinaryOrTernary<'f>,
+        /// Two operands, or three where the `SELECT`'s condition is one of them.
+        inputs: &'f [(ComputeInput<'f>, OutputFormat)],
+        /// `getComputeOperandFormats(*dsc_).back()`.
+        result_format: DataType,
+        /// `compute_mask_`.
+        mask: MaskValue,
+        /// `compute_op.outputs_`.
+        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+    },
+    /// `FMAX`|`FMIN` → entry 095.
+    MinOrMax {
+        /// Which of the pair.
+        which: MinOrMax,
+        /// The two operands it compares and then selects between.
+        inputs: &'f [(ComputeInput<'f>, OutputFormat); 2],
+        /// `getComputeOperandFormats(*dsc_).back()`.
+        result_format: DataType,
+        /// `compute_mask_`.
+        mask: MaskValue,
+        /// `compute_op.outputs_`.
+        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+    },
+    /// `FEST`|`ICVT`|`SPLAT`|`REDUCE`|`SHUFFLE`|`FLOOR` → entry 101.
+    Unary {
+        /// `compute_op.type_`, with the `mode_` each arm dispatches on folded in.
+        which: &'f UnaryOp<'f>,
+        /// The one operand and the format it is converted to.
+        input: (&'f ComputeInput<'f>, OutputFormat),
+        /// `compute_mask_`.
+        mask: MaskValue,
+        /// `compute_op.outputs_`.
+        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+    },
+    /// The 29 opaque types → entry 053, which stores nothing and cannot refuse.
+    Opaque {
+        /// `getOpaqueFunctionName(type_)`.
+        func: OpaqueFunc,
+        /// `read_write_registers`.
+        read_write: &'f [(RegName, RegAddr)],
+        /// `read_only_registers`.
+        read_only: &'f [(RegName, RegAddr)],
+        /// `parameters`.
+        params: &'f [(ParamKey, ParamValue)],
+    },
+}
+
+/// WHAT ONE COMPUTE STATEMENT LEAVES BEHIND.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeOperation {
+    /// The output operands the family's constructor stored, and empty for the opaque call.
+    pub stored: Vec<Stored>,
+    /// `precision`, which only the MAC chain writes (`:1579-1580`) — [`None`] is the reference's `""`,
+    /// which entry 008 refuses.
+    pub precision: Option<dataflow::Precision>,
+}
+
+/// Replaces: e103_constructComputeOperation
+///
+/// **103/110** `SNComputeLowering.cpp:1567` — one compute statement, routed to its family's
+/// constructor, plus the `precision` a MAC leaves on the unit for entry 008.
+///
+/// ⛔ [`None`] IS NOT A REFUSAL: `comp_ != compute->exUnit_` emits nothing and succeeds (`:1568`) —
+/// every unit but the execution unit skips the whole body.
+/// ⛔ AND NO `failure()` HERE IS REACHABLE: all six are preceded by an `emitError` that raises.
+#[must_use]
+pub fn compute_operation<A: Arch>(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    family: ComputeFamily<'_>,
+) -> Option<ComputeOperation> {
+    // `if (comp_ == compute->exUnit_)` — the whole body is inside it.
+    if ctx.comp != ctx.ex_unit {
+        return None;
+    }
+    Some(match family {
+        ComputeFamily::Mac {
+            mac,
+            inputs,
+            mask,
+            outputs,
+        } => {
+            let stored = mac_operation::<A>(vals, into, ctx, mac, inputs, mask, outputs)
+                .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct MAC operation"));
+            // `for (i) { category = REGULAR_TENSOR; if (myLdsIdx_ != -1) { category = ..; if
+            //  (category != REGULAR_TENSOR) { precision = "mx" + precision; break; } } }` — an
+            // operand with no labelled data structure leaves the default and does not break.
+            let category = inputs
+                .iter()
+                .find_map(|(_, format)| match format.lds {
+                    Some((_, TensorCategory::Scaled)) => Some(TensorCategory::Scaled),
+                    _ => None,
+                })
+                .unwrap_or(TensorCategory::Regular);
+            ComputeOperation {
+                stored,
+                precision: Some(mac.precision(category)),
+            }
+        }
+        ComputeFamily::BinaryOrTernary {
+            which,
+            inputs,
+            result_format,
+            mask,
+            outputs,
+        } => ComputeOperation {
+            stored: binary_or_ternary_operation::<A>(
+                vals,
+                into,
+                ctx,
+                which,
+                inputs,
+                result_format,
+                mask,
+                outputs,
+            )
+            .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct binary operation")),
+            precision: None,
+        },
+        ComputeFamily::MinOrMax {
+            which,
+            inputs,
+            result_format,
+            mask,
+            outputs,
+        } => ComputeOperation {
+            // ⚠️ THE SAME SENTENCE AS THE CHAIN ABOVE — "binary operation" (`:1608`).
+            stored: fmin_or_fmax_operation::<A>(
+                vals,
+                into,
+                ctx,
+                which,
+                inputs,
+                result_format,
+                mask,
+                outputs,
+            )
+            .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct binary operation")),
+            precision: None,
+        },
+        ComputeFamily::Unary {
+            which,
+            input,
+            mask,
+            outputs,
+        } => ComputeOperation {
+            stored: unary_operation::<A>(vals, into, ctx, which, input, mask, outputs)
+                .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct unary operation")),
+            precision: None,
+        },
+        // ⚠️ `emitError("Unable to construct operation for Opaque function")` (`:1637-1639`) IS
+        // UNREACHABLE: entry 053 builds the op with no way to fail.
+        ComputeFamily::Opaque {
+            func,
+            read_write,
+            read_only,
+            params,
+        } => {
+            into.push(opaque_operation(
+                ctx.name,
+                func,
+                read_write,
+                read_only,
+                params,
+            ));
+            ComputeOperation {
+                stored: Vec::new(),
+                precision: None,
+            }
+        }
+    })
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        BinaryOrTernary, ComputeInput, ComputeMask, ComputeOutput, DynamicMask, Handlers,
-        Latch, MacInputFormat, MacOp, MaskValue, MinOrMax, MulMode, OperandContext, OutputFormat,
-        SignExtend, StickWidth, Stored, UnaryOp, VectorWidth, binary_or_ternary_operation,
-        compute_input_operand, compute_output_operand, compute_output_operands, dictionary_order,
-        dynamic_masking, fmin_or_fmax_operation, is_integer, mac_operation, opaque_operation,
-        precision_conversion, single_val_custom_vector, static_mask_for_result,
-        type_from_compute_type, type_from_format, unary_operation,
+        BinaryOrTernary, ComputeFamily, ComputeInput, ComputeMask, ComputeOutput, DynamicMask,
+        Handlers, Latch, MacInputFormat, MacOp, MaskValue, MinOrMax, MulMode, OperandContext,
+        OutputFormat, SignExtend, StickWidth, Stored, UnaryOp, VectorWidth,
+        binary_or_ternary_operation, compute_input_operand, compute_operation,
+        compute_output_operand, compute_output_operands, dictionary_order, dynamic_masking,
+        fmin_or_fmax_operation, is_integer, mac_operation, opaque_operation, precision_conversion,
+        single_val_custom_vector, static_mask_for_result, type_from_compute_type, type_from_format,
+        unary_operation,
     };
     use crate::arch::{Dd2, Elements, Sen1p5};
     use crate::bridges::dataflow_ir_to_sentient::vc_helper::{
@@ -3287,5 +3516,81 @@ mod unit_tests {
         );
         // ⛔ NEITHER `if` HAS AN `else` — a `bf16` splat leaves the reference's op null.
         assert_eq!(SignExtend::Yes.splat_indices(ElemType::Bf16), None);
+    }
+
+    // ─────────────────────────────── 103/110 ───────────────────────────────
+
+    /// 🎯 103/110 — ⛔ ONE SCALED OPERAND PREFIXES THE WHOLE UNIT'S PRECISION, and a unit that is not
+    /// the compute's execution unit lowers the statement to nothing at all.
+    ///
+    /// A bystander unit that emitted the MAC anyway would run the same multiply on every unit of the
+    /// core; a scaled MAC whose precision stayed `fp8` names the wrong MAC opcode in the backend.
+    #[test]
+    fn a_scaled_mac_operand_prefixes_the_precision_and_a_bystander_emits_nothing() {
+        let handlers = operand_handlers();
+        let ctx = |comp| OperandContext {
+            name: "fma8_0",
+            comp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty: Vector {
+                len: 64,
+                elem: ElemType::F16,
+            },
+        };
+        let format = |elements, lds| MacInputFormat {
+            lds,
+            operand: DataType::Sen169Fp16,
+            elements: Elements(elements),
+        };
+        let scaled = Some((DataType::Sen143Fp8, TensorCategory::Scaled));
+        let inputs = [
+            (ComputeInput::One, format(64, scaled)),
+            (ComputeInput::One, format(128, None)),
+            (ComputeInput::Zero, format(32, None)),
+        ];
+        let outputs = [(
+            ComputeOutput::Latch(Latch::new(3).expect("latch 3")),
+            OutputFormat {
+                lds: None,
+                operand: DataType::Sen169Fp16,
+            },
+        )];
+        let mac = |mask| ComputeFamily::Mac {
+            mac: MacOp::Fma8,
+            inputs: &inputs,
+            mask,
+            outputs: &outputs,
+        };
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let computed = compute_operation::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &ctx(GenericComp::Sfp),
+            mac(ComputeMask::Static(MaskValue::Live8)),
+        )
+        .expect("the SFP is the execution unit");
+        assert_eq!(computed.precision, Some(dataflow::Precision::Mxfp8));
+        assert!(!ops.is_empty());
+
+        let mut bystander = Vec::new();
+        assert_eq!(
+            compute_operation::<Dd2>(
+                &mut vals,
+                &mut bystander,
+                &ctx(GenericComp::Lxlu),
+                mac(ComputeMask::Static(MaskValue::Live8)),
+            ),
+            None
+        );
+        assert!(bystander.is_empty());
+
+        // ⛔ THE ONE `mx` SPELLING THE ISLAND GAINED FOR THIS ENTRY.
+        assert_eq!(
+            MacOp::Ima4.precision(TensorCategory::Scaled),
+            dataflow::Precision::Mxint4
+        );
     }
 }
