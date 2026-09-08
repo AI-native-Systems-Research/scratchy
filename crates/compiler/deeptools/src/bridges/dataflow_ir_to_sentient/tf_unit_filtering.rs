@@ -381,14 +381,15 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::Receive { .. }
             | dataflow::Op::Opaque(_),
         ) => true,
-        // Three of the thirteen `agen` classes. The ten the island does not declare —
-        // `composite_load`, `composite_store`, `composite_indirect_load_and_store`,
+        // Four of the thirteen `agen` classes. The nine the island does not declare —
+        // `composite_store`, `composite_indirect_load_and_store`,
         // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load`,
         // `indirect_vector_store`, `composite_memory_interleave`, `symbolic_vector_load`,
         // `symbolic_vector_store` — belong on this side of the answer when they land.
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::CompositeLoad(_)
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
         // `agen.yield` terminates a transfer's region and is not one; the view and unit binders,
@@ -709,6 +710,8 @@ mod unit_tests {
             elem: ElemType::F16,
         };
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(20),
             view: Val(10),
             indices: vec![Index::Const(0), Index::Const(0)],
@@ -898,6 +901,8 @@ mod unit_tests {
         assert!(!is_data_transfer_to_keep(&named, None));
         // ⛔ AND A TRANSFER WITH NO `dbgName` IS NEVER KEPT — every `agen` access in this island.
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(30),
             view: Val(10),
             indices: vec![Index::Const(0)],

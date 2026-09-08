@@ -404,6 +404,8 @@ mod unit_tests {
     /// `%load = agen.vector_load %view[..] : memref<?x64x4xf16>, vector<64xf16>`.
     fn load(result: Val, view: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result,
             view,
             indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],

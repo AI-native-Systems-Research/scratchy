@@ -1557,6 +1557,9 @@ impl<'a> AccessDetailsBase<'a> {
         // `:207-218` — the users of the loaded vector.
         let users = match self.op {
             agen::Op::VectorLoad { result, .. } => uses(*result, scope),
+            // ⛔ A COMPOSITE LOAD'S USERS ARE ITS REGION ARGUMENT'S — `for (auto* user :
+            // load_op.getLoadInductionVar().getUsers())` (`:212-214`), because it binds no result.
+            agen::Op::CompositeLoad(load) => uses(load.load_iv, scope),
             agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
             | agen::Op::Yield
@@ -1850,22 +1853,31 @@ impl<'a> AccessDetailsAffine<'a> {
             return AffineInitialize::MemoryIndexUnset;
         }
 
-        let (view, view_ty, indices, vector_ty) = match self.base.op {
+        let (view, view_ty, indices, access, vector_ty) = match self.base.op {
             agen::Op::VectorLoad {
                 view,
                 view_ty,
                 indices,
+                access,
                 ty,
                 ..
-            }
-            | agen::Op::VectorStore {
+            } => (view, view_ty, indices, Some(access), ty),
+            // ⚠️ [`None`] IS `getStoreSet()` NOT YET BEING A FIELD, and not a store having no set.
+            // [`agen::Op::VectorStore`] still derives it from the view, which is right for every
+            // store this island emits and wrong for the day a transfer's STORE side lands one — see
+            // [`agen::Access`], whose load counterpart is exactly that.
+            agen::Op::VectorStore {
                 view,
                 view_ty,
                 indices,
                 ty,
                 ..
-            } => (view, view_ty, indices, ty),
+            } => (view, view_ty, indices, None, ty),
+            // ⛔ AND A COMPOSITE LOAD IS `emitError("unsupported operation")` HERE, however much it
+            // has a view and a subscript: `initialize`'s four `dyn_cast`s are the two vector
+            // accesses and the two indirect ones (`AccessDetails.cpp:315-345`).
             agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeLoad(_)
             | agen::Op::Yield
             // ⭐ A SAMV CARRIES NO VIEW AND NO SUBSCRIPTS.
             | agen::Op::SetTransferMaskState { .. } => {
@@ -1874,8 +1886,13 @@ impl<'a> AccessDetailsAffine<'a> {
         };
         let (subscripts_map, map_indices) = access_map(indices);
         self.base.mem_ref = Some(*view);
-        self.base
-            .set_transfer_set(agen::access_set(view_ty, vector_ty.len));
+        // ⭐ `setTransferSet(load_op.getLoadSet())` / `getStoreSet()` (`AccessDetails.cpp:301`,
+        // `:311`) — the set the op CARRIES, which for a transfer's access is not the one its view
+        // implies. See [`agen::Access`].
+        self.base.set_transfer_set(access.map_or_else(
+            || agen::access_set(view_ty, vector_ty.len),
+            |stated| stated.set(view_ty, vector_ty.len),
+        ));
         self.base
             .set_transfer_order(agen::access_order(view_ty.shape.len()));
         self.set_subscripts_map(subscripts_map);
@@ -2885,6 +2902,8 @@ mod unit_tests {
     /// `AccessDetailsAffine` is built from (`AccessDetails.cpp:299`).
     fn vector_load() -> agen::Op {
         agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(2),
             view: Val(1),
             indices: vec![Index::Const(0), Index::Const(0)],
@@ -4883,6 +4902,8 @@ mod unit_tests {
     #[test]
     fn the_chunk_is_the_contiguous_row_and_the_stride_is_the_plane_below_it() {
         let op = agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(2),
             view: Val(1),
             indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],

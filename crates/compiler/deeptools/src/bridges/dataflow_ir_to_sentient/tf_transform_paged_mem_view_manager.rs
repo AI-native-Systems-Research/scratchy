@@ -332,9 +332,14 @@ impl<'a> TpmvManager<'a> {
                 }
                 Selection::Selected(Tpmv::VectorStore(TpmvVectorStore::new(op, self.comp)))
             }
+            // `else if (auto comp_load_op = dyn_cast<agen::CompositeLoadOp>(op))` — the FIRST of the
+            // three composite arms (`:51-54`).
+            DfirOp::Agen(agen::Op::CompositeLoad(_)) => Selection::Selected(Tpmv::CompositeLoad(
+                TpmvCompositeLoad::new(op, self.comp),
+            )),
             // `else if (auto comp_load_store_op = dyn_cast<agen::CompositeLoadAndStoreOp>(op))` —
-            // the LAST of the three composite arms in the reference. The two before it,
-            // `CompositeLoadOp` and `CompositeStoreOp`, have no island op; see the note above.
+            // the LAST of the three composite arms in the reference. The one between them,
+            // `CompositeStoreOp`, has no island op; see the note above.
             DfirOp::Agen(agen::Op::CompositeLoadAndStore(_)) => Selection::Selected(
                 Tpmv::CompositeLoadStore(TpmvCompositeLoadStore::new(op, self.comp)),
             ),
@@ -426,6 +431,8 @@ mod unit_tests {
     /// `%load = agen.vector_load %view[..] : memref<?x64x4xf16>, vector<64xf16>`.
     fn load(result: Val, view: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result,
             view,
             indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],

@@ -789,6 +789,9 @@ fn load_and_send(
             result: loaded,
             view: *view,
             indices: vec![Index::Const(0), Index::Const(0)],
+            // This bridge names no access and reads whole sticks — see [`agen::Access`].
+            dbg_name: None,
+            access: agen::Access::OfView,
             view_ty: MemRef {
                 shape: vec![operand.rows(), operand.cols()],
                 elem: ElemType::F16,

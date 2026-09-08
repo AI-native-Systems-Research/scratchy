@@ -2308,6 +2308,8 @@ mod unit_tests {
         let scope = vec![
             row_view(),
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(53),
                 view: Val(52),
                 indices: row_subscripts(),
@@ -2468,6 +2470,8 @@ mod unit_tests {
         let scope = vec![
             dense(Val(52)),
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(53),
                 view: Val(52),
                 indices: row_subscripts(),

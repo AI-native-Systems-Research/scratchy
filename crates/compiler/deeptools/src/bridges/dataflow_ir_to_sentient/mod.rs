@@ -81,8 +81,8 @@ pub mod vc_vector_operands;
 use crate::arch::{Arch, Bytes, Elements};
 use crate::bridges::dataflow_ir_to_sentient::agen_agen_to_sentient::ExtractIdx;
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
-use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
 use crate::islands::sentient::{self, ProgramUnit, ProgramUnits};
 use crate::model::Model;
@@ -99,9 +99,7 @@ use std_affine_to_standard::{Parent, YieldRewrite, lower_affine_yield};
 /// ⭐ THE KERNEL NAME AND EVERY PROGRAM NAME SURVIVE, because a program keeps its symbol as it is
 /// lowered — see [`sentient::Program::name`].
 #[must_use]
-pub fn lower<A: Arch, M: Model, W: Workload>(
-    run: &dfir::Run<A>,
-) -> sentient::Run<A, M, W> {
+pub fn lower<A: Arch, M: Model, W: Workload>(run: &dfir::Run<A>) -> sentient::Run<A, M, W> {
     sentient::Run {
         kernel: run.kernel,
         programs: run.programs.iter().map(program).collect(),
@@ -160,9 +158,7 @@ struct Consts {
 }
 
 /// LOWER ONE PROGRAM.
-fn program<A: Arch, M: Model, W: Workload>(
-    input: &dfir::Program<A>,
-) -> sentient::Program<A, M, W> {
+fn program<A: Arch, M: Model, W: Workload>(input: &dfir::Program<A>) -> sentient::Program<A, M, W> {
     // ── the dataflow-level rewrites run first, over the INPUT rung ────────────────────────────────
     // ⭐⭐ A `Transform/Dataflow/` PASS IS NOT PART OF THE LOWERING, IT PRECEDES IT. `dcc` runs the CFG
     // simplification on the DataflowIR module and hands the RESULT to `AgenToSentient`, so the walk
@@ -303,7 +299,9 @@ fn mint_constants<A: Arch>(
             match op {
                 // ⛔ A NON-L3 TRANSFER'S `immutable_addr` AND `increment` ARE ZERO, and the compute's
                 // mask is zero. One zero serves all of them.
-                DfirOp::Agen(dfir_op::agen::Op::VectorLoad { .. } | dfir_op::agen::Op::VectorStore { .. })
+                DfirOp::Agen(
+                    dfir_op::agen::Op::VectorLoad { .. } | dfir_op::agen::Op::VectorStore { .. },
+                )
                 | DfirOp::VectorChain(_) => want.push(0),
                 // ⛔⛔ AND AN L3 TRANSFER'S INCREMENT IS `total_elements * burst`, WHICH IS NOT ZERO.
                 // The golden's third constant is 2048 = 64 * 32 — the value level 2 read out of
@@ -378,7 +376,15 @@ fn statement<A: Arch>(
     match rest {
         // ── bookkeeping the body carries but the rung does not emit ──────────────────────────────
         [DfirOp::Arith(dfir_op::arith::Op::Constant { .. }), ..] => 1,
-        [DfirOp::Dataflow(dfir_op::dataflow::Op::GetLogicalMemoryView { result, from, start, .. }), ..] => {
+        [
+            DfirOp::Dataflow(dfir_op::dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                ..
+            }),
+            ..,
+        ] => {
             bound.view_of.insert(*result, *from);
             bound.view_start.insert(*result, *start);
             1
@@ -392,12 +398,10 @@ fn statement<A: Arch>(
         // [`agen_agen_to_sentient::fuse_load_or_store_chain_ops`].
         // ⛔ NO PER-KIND ARM HERE. Splitting the twelve across two files is how the branch ORDER — a
         // real part of a `dyn_cast` chain — gets lost.
-        [DfirOp::Agen(op), ..] => {
-            agen_agen_to_sentient::fuse_load_or_store_chain_ops(
-                op, unit, extract, bound, consts, out,
-            )
-            .ops()
-        }
+        [DfirOp::Agen(op), ..] => agen_agen_to_sentient::fuse_load_or_store_chain_ops(
+            op, unit, extract, bound, consts, out,
+        )
+        .ops(),
 
         // ── the `affine` ops ─────────────────────────────────────────────────────────────────────
         // ⛔ NO WILDCARD: a fifth `affine` op must be a build error, not an inherited default.
@@ -467,8 +471,14 @@ fn load_and_store(
         stride: 0,
         rotate_val: None,
         shuffle_mode: sen::ShuffleMode::NoShuffle,
-        src_reg: sen::Reg { locale: sen::RegType::Unknown, index: None },
-        dst_reg: sen::Reg { locale: sen::RegType::Unknown, index: None },
+        src_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        dst_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
         dir: None,
         dbg_name: None,
     })

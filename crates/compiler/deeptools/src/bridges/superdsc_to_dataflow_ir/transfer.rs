@@ -39,9 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e080_constructStreamingOrDoubleBufferingLoad
-// crustify:todo: e081_GenerateReceiveAndSendFromDataTransferNode
-// crustify:todo: e082_ConstructSAMVOperation
 // crustify:todo: e089_constructStreamingOrDoubleBufferingStore
 // crustify:todo: e090_GenerateLoadAndSendFromDataTransferNode
 // crustify:todo: e091_GenerateLoadAndStoreFromDataTransferNode
@@ -51,19 +48,24 @@
 // crustify:todo: e102_GenerateDataTranferForDst
 // crustify:todo: e104_constructDataTransfer
 
-use super::compute::{VectorWidth, type_from_format};
-use super::control_flow::PrimaryDim;
+use super::compute::{VectorWidth, precision_conversion, type_from_format};
+use super::control_flow::{PrimaryDim, SamvLoop, conditionals_for_samv};
 use super::dsc_lowering::{
-    BitstreamValues, Component, Handlers, Handles, constant_index, mlir_type_from_dsc_data_format,
-    retrieve_get_unit_op_in_same_core, uniformized_folded_constant_bitstream,
+    BitstreamValues, Component, DataLocation, Factor, Handlers, Handles, Retrieved,
+    address_granularity_multiply_factor, constant_index, emit_error,
+    mlir_type_from_dsc_data_format, retrieve_get_unit_op_in_same_core,
+    uniformized_folded_constant_bitstream,
 };
 use crate::arch::Elements;
 use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary};
+use crate::islands::dataflow_ir::dialects::dataflow::Received;
+use crate::islands::dataflow_ir::dialects::vectorchain::Computed;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, arith, dataflow, defining_op, scf, vectorchain,
+    Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results, scf, vectorchain,
 };
+use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, MemRef, ScalarTy,
     TensorCategory, Vector,
@@ -229,6 +231,21 @@ pub struct BaseAddress {
     pub map: AffineMap,
     /// `base_address_args`, one per dim of the map.
     pub args: Vec<Val>,
+    /// ⭐⭐ THE SAME ADDRESS IN THE SPELLING AN `agen` ACCESS IS WRITTEN IN — one [`Index`] per view
+    /// dimension, which is what `printAffineMapOfSSAIds(map, args)` puts between the brackets.
+    ///
+    /// ⛔⛔ IT IS DERIVED HERE AND NOT REPARSED LATER, because reparsing is not total: [`AffineMap`]
+    /// admits `mod` and `floordiv` results that [`Index`] cannot spell, so a function from map back to
+    /// index list would have to refuse. The walk that knows each term is this one — an operand and its
+    /// element offset — so it emits both spellings from the one source.
+    ///
+    /// ⭐ THE CONSTANT ADDEND PRINTS LAST, which is the island's canonical order for a subscript
+    /// sum — [`Index::Strided`] appends it and `access_map` re-adds it last when it rebuilds the
+    /// attribute. ⚠️ [`add_stride`] transcribes the reference's fold literally, so a dim whose FIRST
+    /// stride is a constant one builds the map result `7 + d0 * 4` while this list writes
+    /// `%iv * 4 + 7`. The address is the same; only the two spellings' term order differs, and the
+    /// bracketed list is the one a program is printed from.
+    pub indices: Vec<Index>,
 }
 
 /// `base_address_expr + mul_expr` WITH THE TWO FOLDS MLIR'S OWN BUILDER APPLIES HERE — the additive
@@ -271,8 +288,13 @@ pub fn construct_base_address(
             let mut unique_variables: u32 = 0;
             let mut results = Vec::with_capacity(ndims);
             let mut args = Vec::new();
+            let mut indices = Vec::with_capacity(ndims);
             for dim in 0..ndims {
                 let mut expr: Option<AffineExpr> = None;
+                // The same sum, term by term: the strided operands in the order the filter meets
+                // them, and every constant contribution folded into one addend.
+                let mut terms: Vec<(Val, i64)> = Vec::new();
+                let mut addend: i64 = 0;
                 for stride in loop_strides.iter().filter(|stride| stride.size_idx == dim) {
                     let term = match stride.iv {
                         // `auto iv_expr = getAffineDimExpr(unique_variables++, context);
@@ -282,13 +304,25 @@ pub fn construct_base_address(
                             unique_variables = unique_variables.saturating_add(1);
                             args.push(iv);
                             match stride.elem_offset {
+                                // ⛔ A ZERO OFFSET DROPS THE VARIABLE, NOT THE OPERAND: the term is
+                                // the constant 0, so the operand stays in `args` and its `d<n>` is
+                                // never read — by the map or by the bracketed list.
                                 0 => AffineExpr::Const(0),
-                                1 => iv_expr,
-                                offset => iv_expr.times(offset),
+                                1 => {
+                                    terms.push((iv, 1));
+                                    iv_expr
+                                }
+                                offset => {
+                                    terms.push((iv, offset));
+                                    iv_expr.times(offset)
+                                }
                             }
                         }
                         // `mul_expr = getAffineConstantExpr(loop_strides[i].elemOffset_, context);`
-                        None => AffineExpr::Const(stride.elem_offset),
+                        None => {
+                            addend = addend.saturating_add(stride.elem_offset);
+                            AffineExpr::Const(stride.elem_offset)
+                        }
                     };
                     expr = add_stride(expr, term);
                 }
@@ -299,6 +333,14 @@ pub fn construct_base_address(
                     args.push(constant_index(vals, ops, 0));
                 }
                 results.push(expr.unwrap_or(AffineExpr::Const(0)));
+                indices.push(match terms.len() {
+                    // No operand moves this dim: an unstrided one prints `0`, and a constant-only
+                    // sum prints its total.
+                    0 => Index::Const(addend),
+                    // `%arg3` — one unit-strided operand with nothing added is written bare.
+                    1 if addend == 0 && terms[0].1 == 1 => Index::Val(terms[0].0),
+                    _ => Index::Strided(terms, addend),
+                });
             }
 
             BaseAddress {
@@ -308,15 +350,20 @@ pub fn construct_base_address(
                     results,
                 },
                 args,
+                indices,
             }
         }
         AddressForm::ScaleReg => BaseAddress {
             map: AffineMap::constants(u32::try_from(ndims).unwrap_or(u32::MAX), &vec![0; ndims]),
             args: (0..ndims).map(|_| constant_index(vals, ops, 0)).collect(),
+            // `ndims` zero results, so `ndims` literal zeros — the operands are all unread.
+            indices: vec![Index::Const(0); ndims],
         },
         AddressForm::Bypass => BaseAddress {
             map: AffineMap::constants(0, &[0]),
             args: Vec::new(),
+            // `getConstantMap(0)` is ONE zero result, whatever `ndims` is.
+            indices: vec![Index::Const(0)],
         },
     }
 }
@@ -1922,6 +1969,908 @@ pub fn elements_of_affine_data_transfer_via_agen_transfer(
     })
 }
 
+// 080/110 — THE STREAMING OR DOUBLE-BUFFERED LOAD
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A LATCH A LOAD'S RESULT IS ENTERED IN — `dstLdsAndLoopOffsets_.at(i).latchDataId_`.
+///
+/// ⛔ `-1` IS NOT AN ID, AND THE REFERENCE SAYS SO WITH AN ABORT:
+/// `DT_CHECK_MSG(latch_id != -1, "latch id cannot be negative")` (`SNTransferLowering.cpp:1014`).
+/// [`Latch::new`]'s [`None`] is that check moved to where the id is read, so a negative one never
+/// reaches the latch map at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Latch(u32);
+
+impl Latch {
+    /// `latchDataId_`, which must not be the unset `-1`.
+    #[must_use]
+    pub fn new(id: i64) -> Option<Latch> {
+        // ⭐ THE NEGATIVE TEST IS THE CONVERSION'S OWN: `-1` HAS NO `u32`.
+        u32::try_from(id).ok().map(Latch)
+    }
+
+    /// The id itself.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// A ROTATION APPLIED BETWEEN A LOAD AND ITS SEND — `transfer_->rotateNumElements_`.
+///
+/// ⛔⛔ THE UNIT IS IN THE CONSTRUCTOR'S NAME BECAUSE THE REFERENCE'S TEST IS AN ABORT:
+/// `DT_CHECK_MSG(comp_ == LXLU, "Rotation is allowed only in LXLU")` (`:1029`, `:1155`). [`None`] is
+/// *"no rotation asked for"* — the reference's `rotateNumElements_ > 0` being false — while a
+/// rotation on any other unit has no spelling here at all, rather than one that is refused when it
+/// runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rotation(i64);
+
+impl Rotation {
+    /// `rotateNumElements_` on the LX load unit, or [`None`] where the reference's `> 0` is false.
+    #[must_use]
+    pub const fn on_lxlu(elements: i64) -> Option<Rotation> {
+        if elements > 0 {
+            Some(Rotation(elements))
+        } else {
+            None
+        }
+    }
+
+    /// How many elements it rotates by.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// WHICH OF THE TWO LOAD OPS A TRANSFER IS — the reference's `perform_composite_load`, carrying the
+/// `composite_loops` that only the arm reading them can see.
+///
+/// ⛔⛔ THE BOOLEAN AND THE VECTOR ARE ONE FACT. `composite_loops` is untouched on the vector path and
+/// indispensable on the composite one (`:4218-4247`), so a `bool` beside a separately-passed vector
+/// would admit both halves of a contradiction: a composite load with no time loops, and a vector load
+/// carrying some.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadForm<'l> {
+    /// `agen.vector_load` — one load per unit of time, sent as it lands.
+    Vector,
+    /// `agen.composite_load` — one op walking its own time axis, with the chain in its region.
+    Composite(&'l [CompositeTimeLoop]),
+}
+
+/// THE BUFFER-SWITCH LOOP A TRANSFER'S ADDRESS RIDES IN — the `iter_arg` it reads inside the loop,
+/// and the terminator operand its increment replaces.
+///
+/// ⛔⛔ HOLDING BOTH IS THE TYPE GUARD ON `iter_arg_index == -1`. The reference searches
+/// `dsc_all_parent_loops_to_buffers_switch_map_` for this transfer and returns `failure()` when it is
+/// absent (`:3937-3948`), then indexes the region arguments AND the terminator's operands by the
+/// position it found. A caller that has not found the transfer cannot build this, and one that has
+/// cannot read the two lists at different positions.
+///
+/// ⛔ AND THE THIRD REFUSAL GOES WITH IT: a buffer-switch loop that is neither an `affine.for` nor an
+/// `scf.for` (`:3953-3955`) has no `iter_arg` to name here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferSwitchLoop {
+    /// `getRegionIterArgs()[iter_arg_index]` — the address the view starts at, read INSIDE the loop.
+    pub start_address: Val,
+    /// `terminator->getOperand(iter_arg_index)` — what the loop yields for this transfer today, and
+    /// one operand of the arithmetic that replaces it.
+    pub carried: Val,
+}
+
+/// WHICH WAY A BUFFER SWITCH MOVES ITS ADDRESS, AND THE OFFSET THAT ARM ADVANCES BY.
+///
+/// ⛔⛔ THE MODE AND THE INCREMENT ARE ONE VALUE, WHICH IS WHAT REMOVES
+/// `llvm_unreachable("Unknown buffering mode")` (`:4252`) *and* the mismatch behind it. The two arms
+/// read DIFFERENT fold-space quantities — streaming advances by `bufferAddrOffset_` alone
+/// (`:4021-4041`), double buffering by `bufferAddrOffset_ + 2 * startAddr_` (`:4042-4069`) — so a
+/// `mode` integer beside a separately-chosen increment can state a streaming loop advancing by a
+/// toggle, which is an address neither scheme ever produces.
+///
+/// ⛔ AND THE OPERAND ORDER IS REVERSED BETWEEN THEM. Streaming is `addi(carried, increment)` — the
+/// address WALKS. Double buffering is `subi(increment, carried)` — the address TOGGLES, because
+/// subtracting the current value from a constant returns the other buffer every second iteration.
+/// Writing either one the other way round produces a monotonic address for a two-buffer transfer, or
+/// a toggle for a streaming one.
+///
+/// ⭐ THE CLOSURE EMITS INTO A LIST THIS FUNCTION OWNS, not into the load's own. See
+/// [`BufferSwitchUpdate::ops`].
+pub enum BufferStep<F> {
+    /// `mode == 2` — streaming. The closure is `constructUniformizedAddress` over
+    /// `srcLdsAndLoopOffsets_.bufferAddrOffset_`, or the single scaled constant its non-uniformized
+    /// `else` emits.
+    Streaming(F),
+    /// `mode == 1` — double buffering. The closure is
+    /// `constructUniformizedFoldedDoubleBufferToggling` over `bufferAddrOffset_` and `startAddr_`, or
+    /// the single scaled constant its `else` emits.
+    Buffering(F),
+}
+
+/// THE NEXT ITERATION'S ADDRESS — the ops that compute it, and the value the terminator must yield.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferSwitchUpdate {
+    /// The increment and the `arith.addi`/`arith.subi`, in emission order.
+    ///
+    /// ⛔⛔ THESE OPS DO **NOT** BELONG WITH THE LOAD. They are built by
+    /// `OpBuilder local_builder(buffer_switch_loop_terminator)` (`:4198`), which inserts them just
+    /// before the buffer-switch loop's terminator — a different block from the one the load was
+    /// emitted into, and usually several loops further out. Appending them to the load's own list
+    /// would move the increment inside the loop it is supposed to advance, so the address would step
+    /// once per element instead of once per buffer.
+    pub ops: Vec<DfirOp>,
+    /// `terminator->setOperand(iter_arg_index, ..)` — the value that replaces
+    /// [`BufferSwitchLoop::carried`].
+    pub operand: Val,
+}
+
+/// WHAT ONE STREAMING OR DOUBLE-BUFFERED LOAD LEAVES ITS CALLER TO RECORD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchedLoad {
+    /// `addToLatchMap(latch_id, load_op_wo_repl->getResult(0))` (`:4015`) — every destination via on
+    /// `LXLUVALUE`, against the ONE **UNREPLICATED** load result they all share.
+    ///
+    /// ⛔ THE VALUE IS THE `agen.vector_load`'S OWN, taken before the replication, the rotation and
+    /// the conversion. Recording the end of the chain instead would latch a vector of another width.
+    ///
+    /// ⭐ EMPTY FOR A COMPOSITE LOAD, because the reference's latch walk is in the vector arm only
+    /// (`:4005-4018`) — a composite load binds no result to latch (see
+    /// [`agen::Op::CompositeLoad`]).
+    pub latches: Vec<(Latch, Val)>,
+    /// The buffer-switch loop's new yield operand, and the ops behind it.
+    pub update: BufferSwitchUpdate,
+}
+
+/// EVERYTHING ONE STREAMING OR DOUBLE-BUFFERED LOAD READS OFF ITS TRANSFER NODE.
+///
+/// ⭐ A STRUCT BECAUSE THE REFERENCE READS TWENTY MEMBERS OF `transfer_`, `dsc_` and `this`, and a
+/// positional argument list that wide is one whose order is load-bearing and unstated.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamingLoad<'i> {
+    /// `src_storage` — the component the view is addressed through.
+    pub storage: Component,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_`, and [`None`] for the reference's `-1` — see
+    /// [`retrieve_get_unit_op_in_same_core`].
+    pub corelet: Option<Corelet>,
+    /// `comp_` — the unit this program is lowered FOR, which picks the replication arm and the
+    /// conversion's target width.
+    pub comp: GenericComp,
+    /// `{comp_, src_storage}` as the address-granularity table keys it.
+    pub location: DataLocation,
+    /// `transfer_->name_` — the `dbgName` of every op that has one.
+    pub name: &'i str,
+    /// `dsc_->name_` — the node an error names.
+    pub node: &'i str,
+    /// `*view_sizes_core_specific` — the view's extents, already resolved for this core.
+    pub view_sizes: &'i [ViewSize],
+    /// The view's element type.
+    pub elem: ElemType,
+    /// `outer_loops` — the strides the base address sums.
+    pub outer_loops: &'i [LoopStride],
+    /// `transfer_->unitTimeTransferChunkSize_`.
+    pub chunk_sizes: &'i [ChunkDim],
+    /// `transfer_->unitTimeTransferChunkStride_`.
+    pub chunk_stride: Option<ChunkDim>,
+    /// `transfer_->unitTimeTransferNumChunks_`.
+    pub num_chunks: i64,
+    /// `result_type` — the vector ONE unit of time moves.
+    pub result_ty: Vector,
+    /// `dst_result_type` — what the DESTINATION reads, which is what can make a conversion necessary.
+    pub dst_result_ty: Vector,
+    /// `dst_prec_` — the format that conversion targets.
+    pub dst_prec: DataType,
+    /// The DSC format [`StreamingLoad::result_ty`] was built from.
+    ///
+    /// ⛔ IT MUST BE THAT SAME FORMAT. The reference reads the granularity factor's width off
+    /// `getElementType(result_type)` (`:4192-4195`), so this and `result_ty.elem` are two spellings of
+    /// ONE precision; a caller that answers a third scales the buffer offset by the wrong step.
+    pub precision: DataType,
+    /// `transfer_->replicationFactor_`.
+    pub replication: Replication,
+    /// `transfer_->rotateNumElements_`, on the one unit allowed it.
+    pub rotate: Option<Rotation>,
+    /// Every destination via on `LXLUVALUE` — the reference's `use_latch` is this being non-empty.
+    ///
+    /// ⛔ `DT_CHECK(dst_via.loc_.storage_ == LATCH)` (`:1010`) IS THE FILTER, NOT A CHECK HERE: a via
+    /// on `LXLUVALUE` whose storage is not the latch has no [`Latch`] to name, so it never enters
+    /// this list.
+    pub latches: &'i [Latch],
+    /// `to` — the destination the send spends.
+    pub to: SendEnd,
+    /// Vector or composite, with the composite's time loops.
+    pub form: LoadForm<'i>,
+    /// The buffer-switch loop this transfer's address rides in.
+    pub switch: BufferSwitchLoop,
+}
+
+/// A STICK, IN BITS — the reference's `auto stick_size = 1024;  // bits` (`:4062`, `:4168`).
+const STICK_BITS: u64 = 1024;
+
+/// THE HANDLE FOR A COMPONENT, EMITTING THE `dataflow.get_unit` WHERE THERE WAS NOT ONE ALREADY.
+///
+/// ⚠️ [`None`] IS "THE CREATED OP BINDS NOTHING", which `dataflow.get_unit` never does —
+/// [`Retrieved::Created`]'s only producer builds exactly that op, with a freshly minted result.
+fn storage_handle(ops: &mut Vec<DfirOp>, retrieved: Retrieved) -> Option<Val> {
+    match retrieved {
+        Retrieved::Reused(handle) => Some(handle),
+        Retrieved::Created(created) => {
+            let op = DfirOp::Dataflow(created);
+            let handle = results(&op).first().copied();
+            ops.push(op);
+            handle
+        }
+    }
+}
+
+/// THE 2B/16B SHUFFLE, OR `vectorchain.select` OVER `(d0) -> (d0 mod rf)` — the replication arm both
+/// halves of entry 080 share (`:4019-4038` and `:4124-4151`), and the type it widens to.
+///
+/// ⛔ THE `LXLU && rf > 1` TEST IS JUST `LXLU` HERE, and that is arithmetic rather than a liberty:
+/// the arm is only entered when `replicationFactor_ != 1` and [`Replication::checked`] has already
+/// refused everything below `1`, so `rf > 1` holds on entry.
+///
+/// ⚠️ THE `select` ARM IS THE REFERENCE'S OWN `// TODO: will have to be deprecated.` (`:4033`).
+fn replicate(
+    vals: &mut Values,
+    into: &mut Vec<DfirOp>,
+    input: Val,
+    load: &StreamingLoad<'_>,
+) -> (Val, Vector) {
+    // ⭐ `unsigned_abs` IS EXACT HERE: [`Replication::checked`] refused everything below 1, so the
+    // magnitude IS the factor. `getNumElements(result_type) * replicationFactor_`.
+    let widened = Vector {
+        len: load.result_ty.len * load.replication.get().unsigned_abs(),
+        elem: load.result_ty.elem,
+    };
+    if load.comp == GenericComp::Lxlu {
+        // `if (auto shuffle_op = construct2B16BLoadShuffle(..)) .. else emitError("Unsupported load
+        //  type.")` — and [`construct_2b16b_load_shuffle`] states the widened type itself.
+        let shuffled =
+            construct_2b16b_load_shuffle(vals, into, input, load.result_ty, load.replication)
+                .unwrap_or_else(|| emit_error(load.node, "Unsupported load type."));
+        return (shuffled, widened);
+    }
+    // `AffineMap::get(1, 0, dim % transfer_->replicationFactor_)`.
+    let result = vals.mint();
+    into.push(DfirOp::VectorChain(vectorchain::Op::Select {
+        result,
+        input,
+        selection_map: AffineMap::unary(AffineExpr::dim(0).modulo(load.replication.get())),
+        input_ty: load.result_ty,
+        ty: widened,
+    }));
+    (result, widened)
+}
+
+/// `vectorchain.rotate` OVER AN `arith.constant` POSITION — the same three lines in both arms
+/// (`:4041-4051`, `:4152-4162`).
+///
+/// ⚠️ THE RESULT IS STATED AT `result_type` EVEN AFTER A REPLICATION WIDENED THE INPUT. Both arms
+/// pass `result_type` to `RotateOp::create` while handing it the replicated value (`:4046-4048`,
+/// `:4157-4159`), so a transfer with BOTH a replication and a rotation builds an op whose operand is
+/// wider than its result — which `vectorchain.rotate` verifies against. Transcribed rather than
+/// repaired: nothing here shows the two are ever set together, and silently restating the result at
+/// the input's width would change the emitted type of every rotate that is correct today.
+fn rotate(
+    vals: &mut Values,
+    into: &mut Vec<DfirOp>,
+    input: Val,
+    input_ty: Vector,
+    load: &StreamingLoad<'_>,
+    rotation: Rotation,
+) -> (Val, Vector) {
+    let position = constant_index(vals, into, rotation.get());
+    let result = vals.mint();
+    into.push(DfirOp::VectorChain(vectorchain::Op::Rotate {
+        result,
+        input,
+        position,
+        // ⛔ THE REFERENCE PASSES NO `right_shift`, and the `.td` defaults it to true.
+        right_shift: true,
+        input_ty,
+        ty: load.result_ty,
+    }));
+    (result, load.result_ty)
+}
+
+/// THE CONVERSION A MISMATCHED DESTINATION PRECISION ASKS FOR — `dst_result_type != result_type &&
+/// input_size != stick_size` (`:4060-4076`, `:4166-4182`).
+///
+/// ⭐ A STICK'S WORTH IS LEFT ALONE, which is the reference's own worked example: an LX load of
+/// `<64xfp16>` feeding a PE that reads `<64xfp32>` needs no cast, because 64 × 16 bits IS a stick and
+/// the widening happens on the way in; a PE `<64xfp32>` feeding an SFP `<64xfp16>` does, because
+/// 64 × 32 bits is not.
+fn convert(
+    vals: &mut Values,
+    into: &mut Vec<DfirOp>,
+    value: Val,
+    value_ty: Vector,
+    load: &StreamingLoad<'_>,
+) -> (Val, Vector) {
+    // `getDimSize(result_type, 0) * getElementTypeBitWidth(result_type)`.
+    let input_bits = load.result_ty.len * u64::from(load.result_ty.elem.bits());
+    if load.dst_result_ty == load.result_ty || input_bits == STICK_BITS {
+        return (value, value_ty);
+    }
+    // ⛔ `tmp_data` IS THE SOURCE AND `load_op_result` IS THE OUT-PARAMETER, both spelling the same
+    // value (`:4064-4069`) — so the conversion reads what the chain has produced so far, at its own
+    // type, and replaces it.
+    let converted = precision_conversion(
+        vals,
+        into,
+        Computed::of(value, value_ty),
+        load.dst_prec,
+        load.comp,
+    )
+    .unwrap_or_else(|| {
+        emit_error(
+            load.node,
+            "Unable to construct precision conversion in a transfer operation",
+        )
+    });
+    (converted.val(), converted.ty())
+}
+
+/// Replaces: e080_constructStreamingOrDoubleBufferingLoad
+///
+/// **080/110** `SNTransferLowering::constructStreamingOrDoubleBufferingLoad` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:851` (347L).
+///
+/// THE LOAD HALF OF A TRANSFER WHOSE ADDRESS IS CARRIED BY A LOOP: a logical view over the
+/// buffer-switch loop's `iter_arg`, one `agen.vector_load` or `agen.composite_load` through it, the
+/// replicate/rotate/convert chain, the `dataflow.send` that spends the wire, and the arithmetic that
+/// hands the next buffer's address back to the loop.
+///
+/// # ⛔⛔ THE COMPOSITE ARM'S CONVERSION IS EMITTED IN THE REGION — A DELIBERATE DIVERGENCE
+///
+/// `:4176` calls `constructPrecisionConversionOperation(builder, ..)` with the **outer** builder
+/// while every other op of that arm is built with `local_builder`, which is positioned inside
+/// `composite_load`'s region (`:4121-4122`). The converted value's operand is the region's own
+/// `load_iv`, and the `dataflow.send` at `:4184` — inside the region — reads the conversion's result.
+/// So the reference emits a `vectorchain.cast` AFTER the `agen.composite_load`, taking an operand
+/// that only exists inside it and feeding a user that is also inside it: a definition that dominates
+/// neither its operand nor its use, which MLIR refuses outright. The vector arm three lines earlier
+/// does the same thing correctly, with the one builder it has. This port emits the conversion where
+/// its operand and its consumer both live, and
+/// `the_composite_arms_conversion_is_emitted_inside_the_region` is the regression test.
+///
+/// # ⭐ WHAT THE REFERENCE'S OWN CALL SHAPE ALREADY SETTLES
+///
+/// `constructBaseAddress` is the 5-argument overload, so the form is always
+/// [`AddressForm::Strided`]; `constructLogicalMemoryViewOp` is the 4-argument one, so
+/// `bypass_view_sizes` is false; the inline `getPermutationMap([n-1 .. 0])` at `:4089-4095` is
+/// [`time_order`] (a reversal is its own inverse, so MLIR's documented/implemented disagreement about
+/// which direction that map goes cannot separate them); and `time_set.getNumSymbols()` is 0 for every
+/// set [`time_set`] builds, so `map_operands` is EVERY base-address argument and `time_symbols` is
+/// empty (`:4113-4116`).
+///
+/// ⚠️ THE `load_op` OUT-PARAMETER IS DEAD. Both arms assign it and nothing reads it afterwards; the
+/// chain's value travels in a local (`load_op_result`, `load`) in both.
+///
+/// ⚠️ `OpBuilder factor_builder(*this->unit_op_)` (`:4187`) IS CREATED AND NEVER USED.
+///
+/// ⚠️ `dataflow.send` CARRIES NO `dbgName` FIELD, so this transfer's name is dropped from the send —
+/// the same gap [`constant_bitstream_and_shuffle`] records for `vectorchain.shuffle`, and it belongs
+/// to whoever ports `DebugNameOpInterface` for those ops.
+///
+/// ⛔ [`None`] IS ONLY THE THREE SILENT `failure()`s — the logical view's, the time set's and the time
+/// address map's (`:3968`, `:4100`, `:4109`). Every other refusal in the reference goes through
+/// `emitError`, which always raises: see [`emit_error`].
+pub fn construct_streaming_or_double_buffering_load<F>(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    load: &StreamingLoad<'_>,
+    step: BufferStep<F>,
+) -> Option<SwitchedLoad>
+where
+    F: FnOnce(&mut Values, &mut Vec<DfirOp>, Factor) -> Val,
+{
+    // `retrieveGetUnitOpInSameCore(builder, src_storage, core_id_, corelet_id_)`.
+    let storage_unit = storage_handle(
+        ops,
+        retrieve_get_unit_op_in_same_core(vals, handlers, load.storage, load.core, load.corelet),
+    )?;
+
+    // `constructLogicalMemoryViewOp(builder, *view_sizes_core_specific, storage_unit_op,
+    //  start_address, view)` — over the buffer-switch loop's `iter_arg`, so the view moves with it.
+    let view = logical_memory_view(
+        vals,
+        ops,
+        load.view_sizes,
+        storage_unit,
+        load.switch.start_address,
+        load.elem,
+        false,
+    )?;
+    let rank = view.layout.dims;
+
+    // `constructBaseAddress(builder, view.getLayoutMap().getNumDims(), .., outer_loops)`.
+    let base = construct_base_address(
+        vals,
+        ops,
+        usize::try_from(rank).ok()?,
+        load.outer_loops,
+        AddressForm::Strided,
+    );
+
+    // `constructLoadOrStoreSet(builder, unitTimeTransferChunkSize_, unitTimeTransferChunkStride_,
+    //  *view_sizes_core_specific, /*is_load*/ true, load_set, unitTimeTransferNumChunks_)`.
+    let load_set = load_or_store_set(
+        load.chunk_sizes,
+        load.chunk_stride.as_ref(),
+        rank,
+        TransferSide::Load,
+        load.num_chunks,
+    )
+    .unwrap_or_else(|| emit_error(load.node, "Unable to construct load set"));
+
+    // ⚠️ `load_order_map = getMultiDimIdentityMap(view.getLayoutMap().getNumDims())` (`:3994`) IS THE
+    // SET THE ISLAND DERIVES rather than stores — [`agen::Access`] says why, and the view's rank is
+    // the same number on both sides.
+    let mut latches = Vec::new();
+
+    match load.form {
+        LoadForm::Vector => {
+            // `agen::VectorLoadOp::create(builder, loc, result_type, view.getResult(),
+            //  getStringAttr(transfer_->name_), base_address_map, base_address_args, load_set,
+            //  load_order_map)`
+            let loaded = vals.mint();
+            ops.push(DfirOp::Agen(agen::Op::VectorLoad {
+                result: loaded,
+                view: view.result,
+                indices: base.indices.clone(),
+                dbg_name: Some(load.name.to_owned()),
+                access: agen::Access::Stated(load_set),
+                view_ty: view.ty.clone(),
+                ty: load.result_ty,
+            }));
+
+            // `for (dst_idx) if (dst_via.loc_.unit_ == LXLUVALUE) addToLatchMap(latch_id, ..)`.
+            latches = load.latches.iter().map(|latch| (*latch, loaded)).collect();
+
+            // `if (transfer_->replicationFactor_ != 1) .. else load_op = load_op_wo_repl;`
+            let (mut value, mut value_ty) = if load.replication.get() == 1 {
+                (loaded, load.result_ty)
+            } else {
+                replicate(vals, ops, loaded, load)
+            };
+            if let Some(rotation) = load.rotate {
+                (value, value_ty) = rotate(vals, ops, value, value_ty, load, rotation);
+            }
+            (value, value_ty) = convert(vals, ops, value, value_ty, load);
+
+            // `if (!use_latch) SendOp::create(builder, loc, to, load_op_result, nullptr, name)`.
+            if load.latches.is_empty() {
+                ops.push(DfirOp::Dataflow(dataflow::Op::Send {
+                    to: load.to,
+                    data: value,
+                    ty: value_ty,
+                }));
+            }
+        }
+        LoadForm::Composite(time_loops) => {
+            // `getPermutationMap([composite_loops.size()-1 .. 0])` — see [`time_order`].
+            let time_order = time_order(time_loops.len())?;
+            // `constructTimeSet(builder, base_address_args, composite_loops, time_set)`.
+            let bounds: Vec<LoopBound> = time_loops.iter().map(|loop_| loop_.bound).collect();
+            let set = time_set(&bounds)?;
+            // `constructTimeAddressMap(builder, time_set.getNumDims(),
+            //  view.getLayoutMap().getNumDims(), time_address_map, composite_loops)`.
+            let walks: Vec<CompositeLoop> = time_loops.iter().map(|loop_| loop_.walk).collect();
+            let time_addr_map = time_address_map(set.dims, usize::try_from(rank).ok()?, &walks)?;
+
+            // ⛔ THE BLOCK ARGUMENT IS MINTED BEFORE THE REGION IS BUILT, because
+            // `CompositeLoadOp::create` precedes `local_builder` (`:4118-4122`) and every op of the
+            // region names `getLoadInductionVar()`.
+            let load_iv = vals.mint();
+            let mut body = Vec::new();
+
+            // `if (replicationFactor_ != 1) .. else load = composite_load.getLoadInductionVar();`
+            let (mut value, mut value_ty) = if load.replication.get() == 1 {
+                (load_iv, load.result_ty)
+            } else {
+                replicate(vals, &mut body, load_iv, load)
+            };
+            if let Some(rotation) = load.rotate {
+                (value, value_ty) = rotate(vals, &mut body, value, value_ty, load, rotation);
+            }
+            // ⛔⛔ IN THE REGION, NOT AFTER IT — the divergence this function's own note explains.
+            (value, value_ty) = convert(vals, &mut body, value, value_ty, load);
+
+            // `SendOp::create(local_builder, loc, to, load, nullptr, name)` — ⭐ UNCONDITIONAL here:
+            // the composite arm has no latch walk and so no `use_latch` to test.
+            body.push(DfirOp::Dataflow(dataflow::Op::Send {
+                to: load.to,
+                data: value,
+                ty: value_ty,
+            }));
+            body.push(DfirOp::Agen(agen::Op::Yield));
+
+            ops.push(DfirOp::Agen(agen::Op::CompositeLoad(Box::new(
+                agen::CompositeLoad {
+                    view: view.result,
+                    dbg_name: Some(load.name.to_owned()),
+                    indices: base.indices.clone(),
+                    view_ty: view.ty.clone(),
+                    load_iv,
+                    load_iv_ty: load.result_ty,
+                    load_set,
+                    load_order: AffineMap::identity(rank),
+                    // ⭐ `drop_back(0)` AND `take_back(0)`: see this function's note on
+                    // `time_set.getNumSymbols()`.
+                    time_symbols: Vec::new(),
+                    time_set: set,
+                    time_order,
+                    time_addr_map,
+                    body,
+                },
+            ))));
+        }
+    }
+
+    // `getAddressGranularityMultiplyFactor(comp_, src_storage, getElementType(result_type))`.
+    let factor = address_granularity_multiply_factor(load.location, load.precision);
+
+    // ⛔ A LIST OF ITS OWN — see [`BufferSwitchUpdate::ops`].
+    let mut update = Vec::new();
+    let carried = load.switch.carried;
+    // ⛔ THE INCREMENT IS BUILT BEFORE THE ARITHMETIC IN BOTH ARMS (`:4021-4041`, `:4042-4069`), and
+    // that is what the printed `%N` are: minting the sum's result up front would number it below its
+    // own operand.
+    let operand = match step {
+        BufferStep::Streaming(increment) => {
+            let increment = increment(vals, &mut update, factor);
+            // ⛔ `AddIOp(getIndexType(), terminator->getOperand(iter_arg_index), buffer_increment)` —
+            // the address WALKS.
+            let result = vals.mint();
+            update.push(DfirOp::Arith(arith::Op::AddI(IntBinary {
+                result,
+                lhs: carried,
+                rhs: increment,
+                ty: ScalarTy::Index,
+            })));
+            result
+        }
+        BufferStep::Buffering(increment) => {
+            let increment = increment(vals, &mut update, factor);
+            // ⛔ `SubIOp(getIndexType(), buffer_increment, terminator->getOperand(iter_arg_index))` —
+            // REVERSED, and the address TOGGLES.
+            let result = vals.mint();
+            update.push(DfirOp::Arith(arith::Op::SubI(IntBinary {
+                result,
+                lhs: increment,
+                rhs: carried,
+                ty: ScalarTy::Index,
+            })));
+            result
+        }
+    };
+
+    Some(SwitchedLoad {
+        latches,
+        update: BufferSwitchUpdate {
+            ops: update,
+            operand,
+        },
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 081/110 — THE RECEIVE-AND-SEND PASS-THROUGH
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHERE A RECEIVE-AND-SEND PAIR GOES — the reference's two insertion points (`:4288-4312`).
+///
+/// ⛔⛔ IT IS NOT A `Vec<DfirOp>` PLUS A COMMENT. One arm puts the two ops at the START of a loop the
+/// caller has ALREADY emitted, and the other brings its own `affine.for` for the caller to place. A
+/// single op list cannot say which, and a caller that guesses appends the pair after a loop that was
+/// supposed to contain it — a receive that runs once for a transfer of `count` vectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiveAndSend {
+    /// The implicit loops were non-empty: these two ops go at the START of the body of the ONE
+    /// emitted loop `(*dsc_loops_to_mlir_loops_map_)[implicit_loops.front().loop_]` holds.
+    ///
+    /// ⭐ THE WHOLE [`ImplicitLoop`] TRAVELS, not just its `dim`: the caller recorded its emitted
+    /// loops in [`ImplicitNest::ivs`] against this list's order, so the record is the lookup key.
+    InLoopFor {
+        /// `implicit_loops.front()`.
+        implicit: ImplicitLoop,
+        /// The receive and the send, in that order.
+        body: Vec<DfirOp>,
+    },
+    /// There were none: one `affine.for 0 to count` named `SingleImplicitLoopForTransfer(<name>)`,
+    /// with the pair already inside it.
+    InNewLoop(DfirOp),
+}
+
+/// Replaces: e081_GenerateReceiveAndSendFromDataTransferNode
+///
+/// **081/110** `SNTransferLowering::GenerateReceiveAndSendFromDataTransferNode` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1395` (66L).
+///
+/// A UNIT THAT ONLY FORWARDS: one `dataflow.receive` and one `dataflow.send` of the same vector,
+/// inside the loop that walks the transfer's contiguous sticks.
+///
+/// ⛔⛔ THE COUNTED LOOP IS THE FALLBACK, NOT THE NORM. When
+/// [`implicit_loops_for_contiguous_transfer`] finds a dimension to walk, the pair joins THAT loop;
+/// only when the whole transfer is one contiguous run does this build its own `affine.for 0 to
+/// count`. See [`ReceiveAndSend`], which is what keeps the two apart.
+///
+/// ⛔ THE LOOP'S INDUCTION VARIABLE IS MINTED **BEFORE** THE RECEIVE, because `AffineForOp::create`
+/// precedes `ReceiveOp::create` (`:4308-4315`) — and mint order is what the printed `%N` are.
+///
+/// ⚠️ `outer_loop` AND `inner_loop` ARE THE SAME OP IN THE REFERENCE — both are
+/// `(..)[implicit_loops.front().loop_].front()` (`:4293-4297`), and only the second is read for the
+/// insertion point. The first exists to move `builder` past the loop, which is the caller's placement
+/// and not part of what this emits.
+///
+/// ⚠️ NEITHER `dataflow.send` NOR `dataflow.receive` CARRIES A `dbgName` FIELD, so the transfer's name
+/// is dropped from both — see [`construct_streaming_or_double_buffering_load`].
+///
+/// ⭐ NO [`Option`]: the one failure is `constructImplicitLoopsForContiguousTransfer`'s, and the
+/// reference answers it with `emitError`, which always raises.
+#[must_use]
+pub fn generate_receive_and_send_from_data_transfer_node(
+    vals: &mut Values,
+    node: &str,
+    name: &str,
+    view_sizes: &[ViewSize],
+    unit_time_dims: usize,
+    sticks: &mut ContiguousSticks,
+    replication: Replication,
+    from: RecvEnd,
+    to: SendEnd,
+    count: i64,
+    result_ty: Vector,
+) -> ReceiveAndSend {
+    // `constructImplicitLoopsForContiguousTransfer(loop_builder, *view_sizes_core_specific,
+    //  unitTimeTransferChunkSize_, implicit_loops, ctgs_transfer_sizes)`
+    let implicit_loops =
+        implicit_loops_for_contiguous_transfer(view_sizes, unit_time_dims, sticks, replication)
+            .unwrap_or_else(|| {
+                emit_error(
+                    node,
+                    "Unable to construct implicit loops for contiguous transfer",
+                )
+            });
+
+    match implicit_loops.first() {
+        // `if (!implicit_loops.empty())` — the pair joins the loop already emitted for it.
+        Some(&implicit) => ReceiveAndSend::InLoopFor {
+            implicit,
+            body: receive_then_send(vals, from, to, result_ty),
+        },
+        // `else { AffineForOp::create(loop_builder, loc, 0, count, 1); setDbgName(..) }`
+        None => {
+            let iv = vals.mint();
+            ReceiveAndSend::InNewLoop(DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(count),
+                carried: Vec::new(),
+                body: receive_then_send(vals, from, to, result_ty),
+                dbg_name: Some(format!("SingleImplicitLoopForTransfer({name})")),
+            }))
+        }
+    }
+}
+
+/// THE PAIR ITSELF — `ReceiveOp::create` then `SendOp::create` over its result (`:4314-4319`).
+///
+/// ⭐ THE WIRE IS SPENT ONCE, BY CONSTRUCTION: [`Received::operand`] consumes the receive, so this
+/// cannot forward a value it did not receive, nor receive one it does not forward.
+fn receive_then_send(
+    vals: &mut Values,
+    from: RecvEnd,
+    to: SendEnd,
+    result_ty: Vector,
+) -> Vec<DfirOp> {
+    let mut body = Vec::new();
+    let received = Received::receive(&mut body, vals.mint(), from, result_ty);
+    body.push(DfirOp::Dataflow(dataflow::Op::Send {
+        to,
+        data: received.operand(),
+        ty: result_ty,
+    }));
+    body
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 082/110 — THE SAMV MASK
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// HOW MANY SLICES A STICK HAS — `int num_slices = 8;  // 2B` (`:4364`).
+///
+/// ⚠️ THE REFERENCE HAS TWO NAMES FOR THIS 8 AND USES THEM ACROSS EACH OTHER: it builds the slice map
+/// by iterating `entries_per_slice` (`:4382`) while attributing the count as `num_slices` (`:4409`).
+/// Both are literally 8, so the program is right; the island states the fact once, because
+/// [`agen::Op::SetTransferMaskState`] derives `num_slices` from the map's own length.
+const SAMV_SLICES: usize = 8;
+
+/// HOW MANY ENTRIES ONE SLICE HOLDS — `int entries_per_slice = 8;  // (16B/FP16)` (`:4363`).
+const ENTRIES_PER_SLICE: i32 = 8;
+
+/// THE WSL MASK'S LENGTH — `dsc_->computeOp_.at(0).opConsts.at("samv-wsllen")[0]`.
+///
+/// ⛔⛔ ZERO IS THE ONLY VALUE, AND THE REFERENCE ABORTS ON ANY OTHER:
+/// `DT_CHECK_MSG(wsllen == 0, "WSL length should be zero")` (`:4374`). A one-variant enum is that
+/// check as a type — the mask whose WSL length is 3 has no spelling to reach the emission with,
+/// instead of one that gets there and stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslLen {
+    /// `0`.
+    Zero,
+}
+
+impl WslLen {
+    /// The length, as the `maskA` attribute writes it.
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        match self {
+            WslLen::Zero => 0,
+        }
+    }
+}
+
+/// HOW MANY ENTRIES OF THE STICK ARE LIVE — `opConsts.at("samv-numvalidentry")[0]`.
+///
+/// ⛔⛔ THE REFERENCE DIVIDES IT AS A `float` AND CEILS: `ceil((float)n / entries_per_slice) - 1`
+/// (`:4368-4372`). For a NEGATIVE count that rounds the other way — `ceil` of a negative quotient
+/// moves TOWARD zero — and `n % entries_per_slice` is negative too, so `entries_per_slice - (n % 8)`
+/// exceeds a slice and the emitted `maskB` claims more masked elements than the slice has. [`None`]
+/// is where that count is refused, and the two accessors below are then exact integer arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidEntries(i32);
+
+impl ValidEntries {
+    /// `samv-numvalidentry`, which must be a count.
+    #[must_use]
+    pub fn checked(entries: i64) -> Option<ValidEntries> {
+        if entries < 0 {
+            return None;
+        }
+        i32::try_from(entries).ok().map(ValidEntries)
+    }
+
+    /// `slice_idx_xsl` — the LAST slice holding a live entry, `ceil(n / 8.0) - 1`.
+    ///
+    /// ⭐ THE QUOTIENT PLUS ONE FOR ANY REMAINDER, which is `ceil` without the float and without the
+    /// overflow an `n + 7` would risk at the top of the range.
+    ///
+    /// ⚠️ `-1` FOR ZERO LIVE ENTRIES, which is the reference's own answer: `ceil(0.0) - 1`. Every
+    /// slice then compares GREATER and the map is eight `(1)`s — the whole stick masked.
+    #[must_use]
+    pub const fn transition_slice(self) -> i32 {
+        self.0 / ENTRIES_PER_SLICE
+            + if self.0 % ENTRIES_PER_SLICE == 0 {
+                0
+            } else {
+                1
+            }
+            - 1
+    }
+
+    /// `num_valid_entries` — how many live entries the LAST slice holds, `n % 8` (`:4376-4378`).
+    #[must_use]
+    pub const fn in_last_slice(self) -> i32 {
+        self.0 % ENTRIES_PER_SLICE
+    }
+}
+
+/// Replaces: e082_ConstructSAMVOperation
+///
+/// **082/110** `SNTransferLowering::ConstructSAMVOperation` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1957` (96L).
+///
+/// THE MASK A SUM/MAX-ACROSS-VECTOR TRANSFER IS ARMED WITH, UNDER THE GUARD THAT EVERY `OUT` LOOP IS
+/// ON ITS LAST ITERATION: one `agen.set_transfer_mask_state` in the `then` arm and the RESET in the
+/// `else` arm, so the mask is armed exactly for the step that writes the accumulated stick out.
+///
+/// ⛔⛔ BOTH ARMS OF ONE `scf.if`, WHICH IS WHAT THE REFERENCE BUILDS: `IfOp::create(.., /*withElse*/
+/// true)` (`:4351`), then `getThenBodyBuilder()` (`:4406`) and `getElseBodyBuilder()` (`:4419`). The
+/// `else` is not optional cleanup — a stick whose mask stayed armed would mask the NEXT transfer too.
+///
+/// ⛔ THE PREDICATE IS `if_op->getResult(0)`, entry 055's `i1`, and this op's own results are EMPTY:
+/// `yield_samv_results` is a hard-coded `false` (`:4358`), so both `scf::YieldOp::create` calls and
+/// the result-typed `IfOp` overload are dead code (`:4360-4362`, `:4414-4416`, `:4427-4429`).
+///
+/// ⛔ AND SO IS THE ALL-MASKED MAP. `mask_all` is `int mask_all = false;` with its real source
+/// commented out — `// dsc_->computeOp_.at(0).opConsts.at("samv-maskall")[0]` (`:4365-4366`) — so the
+/// `"(1)(1)(1)(1)(1)(1)(1)(1)"` branch and the empty `masks` that go with it are unreachable, and the
+/// two mask records are always written.
+///
+/// ⭐ NO [`Option`]: the one failure is `constructConditionalsForSAMV`'s, and [`emit_error`] raises.
+/// ⭐ THE OPS COME BACK AS A LIST because they belong at the caller's insertion point, which is
+/// `setInsertionPointAfter(if_op)` — after entry 055's guard chain (`:4345-4348`).
+#[must_use]
+pub fn construct_samv_operation(
+    vals: &mut Values,
+    node: &str,
+    name: &str,
+    loops: &[SamvLoop<'_>],
+    entries: ValidEntries,
+    wsl_len: WslLen,
+    result_ty: Vector,
+) -> Vec<DfirOp> {
+    // `constructConditionalsForSAMV(loop_builder, dsc_loops_to_mlir_loops_map_, outer_loops, if_op)`
+    let (mut ops, cond) = conditionals_for_samv(vals, loops)
+        .unwrap_or_else(|| emit_error(node, "Unable to construct conditionals for SAMV operation"));
+
+    // `val_false = ConstantIndexOp::create(samv_builder, loc, 0)` — ⛔ AFTER the guard chain and
+    // BEFORE the conditional, which is the order the printed `%N` follow.
+    let val_false = constant_index(vals, &mut ops, 0);
+
+    // `for (i < entries_per_slice) { i < xsl ? "(A)" : i == xsl ? "(A|B)" : "(1)" }`
+    let transition = entries.transition_slice();
+    let slice_mask_map: Vec<agen::SliceMask> = (0..SAMV_SLICES)
+        .map(|slice| {
+            match i32::try_from(slice)
+                .map(|slice| slice.cmp(&transition))
+                .unwrap_or(core::cmp::Ordering::Greater)
+            {
+                core::cmp::Ordering::Less => agen::SliceMask::A,
+                core::cmp::Ordering::Equal => agen::SliceMask::AOrB,
+                core::cmp::Ordering::Greater => agen::SliceMask::Full,
+            }
+        })
+        .collect();
+
+    // `unmasked_offsets = {wsllen, num_valid_entries}` against
+    // `masked_offsets = {1, entries_per_slice - num_valid_entries}` — ⛔ ZIPPED BY COLUMN, and
+    // [`agen::MaskCounts`] is what keeps the two halves of one mask together.
+    let live = entries.in_last_slice();
+    let masks = vec![
+        // "unmask-0, mask-1 for MaskA (WSL masking)".
+        agen::MaskCounts {
+            unmasked: wsl_len.get(),
+            masked: 1,
+        },
+        // "unmask-valid entries, mask-(entries - num valid entries) (XSL masking)".
+        agen::MaskCounts {
+            unmasked: live,
+            masked: ENTRIES_PER_SLICE - live,
+        },
+    ];
+
+    // `samv_op = SetTransferMaskStateOp::create(samv_builder, .., result_type, val_false, name,
+    //  num_slices, slice_mask_map, unmasked_offsets, masked_offsets)`
+    let armed = vals.mint();
+    let body = vec![DfirOp::Agen(agen::Op::SetTransferMaskState {
+        result: armed,
+        mask_value: val_false,
+        dbg_name: Some(name.to_owned()),
+        slice_mask_map,
+        masks,
+        ty: result_ty,
+    })];
+
+    // `samv_reset = SetTransferMaskStateOp::create(.., "(0)(0)(0)(0)(0)(0)(0)(0)", nullptr, nullptr)`
+    // — ⭐ THE TWO NULL ATTRIBUTE ARRAYS ARE AN EMPTY `masks`: a reset names no element counts.
+    let reset = vals.mint();
+    let else_body = vec![DfirOp::Agen(agen::Op::SetTransferMaskState {
+        result: reset,
+        mask_value: val_false,
+        dbg_name: Some(name.to_owned()),
+        slice_mask_map: vec![agen::SliceMask::Unmasked; SAMV_SLICES],
+        masks: Vec::new(),
+        ty: result_ty,
+    })];
+
+    ops.push(DfirOp::Scf(scf::Op::If {
+        cond,
+        // ⛔ EMPTY, so `result_ty` below is never printed — see the note on `yield_samv_results`.
+        results: Vec::new(),
+        result_ty: ScalarTy::Index,
+        body,
+        else_body,
+        dbg_name: None,
+    }));
+    ops
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1929,8 +2878,11 @@ mod unit_tests {
     use crate::islands::dataflow_ir::ty::ElemType;
     use crate::units::{DfirUnit, NumFolds};
 
-    use super::super::control_flow::mlir_loop_from_sn_loop_node;
+    use super::super::control_flow::{StagePair, mlir_loop_from_sn_loop_node};
     use super::super::dsc_lowering::Bound;
+    use crate::islands::dataflow_ir::link::Link;
+    use crate::islands::dataflow_ir::link::{L0lu, L3lu};
+    use crate::islands::dataflow_ir::print::emit;
 
     /// 🎯 063/110 — ⛔ A ZERO CHUNK COUNT DOES NOT MULTIPLY, and `BOOL` has no type at all.
     ///
@@ -2074,6 +3026,11 @@ mod unit_tests {
                     ],
                 },
                 args: vec![Val(80), Val(0), Val(81)],
+                indices: vec![
+                    Index::Strided(vec![(Val(80), 4)], 7),
+                    Index::Const(0),
+                    Index::Val(Val(81)),
+                ],
             }
         );
         assert_eq!(
@@ -2094,6 +3051,7 @@ mod unit_tests {
             BaseAddress {
                 map: AffineMap::constants(2, &[0, 0]),
                 args: vec![Val(0), Val(1)],
+                indices: vec![Index::Const(0), Index::Const(0)],
             }
         );
 
@@ -2106,6 +3064,7 @@ mod unit_tests {
             BaseAddress {
                 map: AffineMap::constants(0, &[0]),
                 args: Vec::new(),
+                indices: vec![Index::Const(0)],
             }
         );
         assert!(ops.is_empty());
@@ -3230,6 +4189,7 @@ mod unit_tests {
                     },
                     // ⛔ The unstrided dim 1 takes the zero constant, not the induction variable.
                     args: vec![Val(81), Val(1)],
+                    indices: vec![Index::Strided(vec![(Val(81), 4)], 0), Index::Const(0)],
                 },
                 transfer_set: IntegerSet {
                     dims: 2,
@@ -3285,6 +4245,7 @@ mod unit_tests {
             BaseAddress {
                 map: AffineMap::constants(0, &[0]),
                 args: Vec::new(),
+                indices: vec![Index::Const(0)],
             }
         );
         assert_eq!(constant.transfer_set, flat_element_set(4));
@@ -3451,6 +4412,11 @@ mod unit_tests {
                     ],
                 },
                 args: vec![Val(1), Val(82), Val(81)],
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(Val(82), 4)], 0),
+                    Index::Val(Val(81)),
+                ],
             }
         );
         assert_eq!(elements.transfer_order, AffineMap::identity(3));
@@ -3467,5 +4433,593 @@ mod unit_tests {
         .expect("a constant plane needs no chunks");
         assert_eq!(constant.transfer_set, flat_element_set(64));
         assert_eq!(constant.transfer_order, AffineMap::identity(1));
+    }
+
+    // ─────────────────────────────── 080-082/110 ───────────────────────────────
+
+    fn l3lu_handlers() -> Handlers {
+        Handlers {
+            units: vec![(
+                DfirUnit::L3lu,
+                Bound::Unit {
+                    handle: Val(50),
+                    corelet: None,
+                },
+            )],
+            own_lrf: Val(51),
+            pt_xrf: Val(52),
+        }
+    }
+
+    fn switched_load_fixture<'i>(
+        view_sizes: &'i [ViewSize],
+        outer_loops: &'i [LoopStride],
+        chunk_sizes: &'i [ChunkDim],
+        latches: &'i [Latch],
+        to: SendEnd,
+        form: LoadForm<'i>,
+    ) -> StreamingLoad<'i> {
+        StreamingLoad {
+            storage: Component::Unit(DfirUnit::L3lu),
+            core: Core::checked(0).expect("core 0"),
+            corelet: None,
+            comp: GenericComp::L0lu,
+            location: DataLocation::L3luHbm,
+            name: "T",
+            node: "N",
+            view_sizes,
+            elem: ElemType::F16,
+            outer_loops,
+            chunk_sizes,
+            chunk_stride: None,
+            num_chunks: 1,
+            result_ty: Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+            // ⭐ EQUAL BY DEFAULT, so no conversion unless a test asks for one.
+            dst_result_ty: Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+            dst_prec: DataType::IeeeFp32,
+            precision: DataType::Sen169Fp16,
+            replication: Replication::checked(1).expect("no replication"),
+            rotate: None,
+            latches,
+            to,
+            form,
+            switch: BufferSwitchLoop {
+                start_address: Val(60),
+                carried: Val(61),
+            },
+        }
+    }
+
+    fn printed(ops: &[DfirOp]) -> String {
+        let mut text = String::new();
+        for op in ops {
+            emit(&mut text, op, 0);
+        }
+        text
+    }
+
+    /// A view of `4x8xf16` whose outer dim is strided by 8 and whose unit-time chunk is the inner 8.
+    fn view_fixture() -> ([ViewSize; 2], [LoopStride; 1], [ChunkDim; 1]) {
+        (
+            [
+                ViewSize {
+                    dim: PrimaryDim::Out,
+                    size: 4,
+                },
+                ViewSize {
+                    dim: PrimaryDim::In,
+                    size: 8,
+                },
+            ],
+            [LoopStride {
+                size_idx: 0,
+                elem_offset: 8,
+                iv: Some(Val(80)),
+            }],
+            [ChunkDim {
+                size: 8,
+                src_index: Some(1),
+                dst_index: None,
+            }],
+        )
+    }
+
+    /// 🎯 080/110 — ⛔⛔ THE LATCH HOLDS `%2`, THE **UNREPLICATED** LOAD, AND THE SEND IS GONE.
+    ///
+    /// `addToLatchMap(latch_id, load_op_wo_repl->getResult(0))` (`:4015`) is taken before the
+    /// `vectorchain.select` widens the vector, so recording the end of the chain would enter a
+    /// `vector<32xf16>` where the latch's consumer reads a `vector<8xf16>`; and `if (!use_latch)`
+    /// (`:4078`) is what stops a latched load from also spending the wire — a load that did both would
+    /// send a stick nobody is receiving.
+    #[test]
+    fn a_latched_vector_load_records_the_unreplicated_result_and_sends_nothing() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let (to, _) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let latch = Latch::new(3).expect("a bound latch");
+        let mut load = switched_load_fixture(
+            &view_sizes,
+            &outer_loops,
+            &chunk_sizes,
+            core::slice::from_ref(&latch),
+            to,
+            LoadForm::Vector,
+        );
+        load.replication = Replication::checked(4).expect("four destinations");
+        load.rotate = Rotation::on_lxlu(2);
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let got = construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Streaming(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+
+        assert_eq!(
+            printed(&ops),
+            concat!(
+                "%0 = dataflow.get_logical_memory_view %50, %60 {layout_map = affine_map<(d0, d1) -> (d1 * 4 + d0)>} : index, index, memref<4x8xf16>\n",
+                "%1 = arith.constant 0 : index\n",
+                "%2 = agen.vector_load %0[%80 * 8, 0] {dbgName = \"T\", load_order = affine_map<(d0, d1) -> (d0, d1)>, load_set = affine_set<(d0, d1) : (d1 >= 0, -d1 + 7 >= 0, d0 == 0)>} : memref<4x8xf16>, vector<8xf16>\n",
+                "%3 = vectorchain.select %2 {selection_map = affine_map<(d0) -> (d0 mod 4)>} : vector<8xf16>, vector<32xf16>\n",
+                "%4 = arith.constant 2 : index\n",
+                "%5 = vectorchain.rotate %3, %4 {right_shift = true} : vector<32xf16>, index, vector<8xf16>\n",
+            ),
+            "the view rides the iter_arg, and no `dataflow.send` follows a latched load",
+        );
+        assert_eq!(
+            got.latches,
+            vec![(latch, Val(2))],
+            "the `agen.vector_load`'s own result, not the rotate's",
+        );
+    }
+
+    /// 🎯 080/110 — ⛔ 128 BITS IS NOT A STICK, SO THE MISMATCHED DESTINATION GETS ITS CAST, AND AN
+    /// EQUAL ONE GETS NOTHING.
+    ///
+    /// `dst_result_type != result_type && input_size != stick_size` (`:4060`): dropping the second
+    /// half would insert a `vectorchain.cast` on the LX-to-PE path the reference deliberately leaves
+    /// alone, and dropping the first would cast a value to its own type.
+    #[test]
+    fn a_stick_wide_load_is_never_converted_and_an_equal_destination_needs_no_cast() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let (to, _) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let mut load = switched_load_fixture(
+            &view_sizes,
+            &outer_loops,
+            &chunk_sizes,
+            &[],
+            to,
+            LoadForm::Vector,
+        );
+
+        // ⭐ EQUAL TYPES: the send takes the load's own result.
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Streaming(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+        assert_eq!(
+            printed(&ops).lines().last(),
+            Some("dataflow.send %53, %2 : vector<8xf16>"),
+            "no cast, and an unlatched load DOES send",
+        );
+
+        // ⛔ A STICK'S WORTH — `64 * 16 == 1024` — with a MISMATCHED destination: still no cast.
+        load.result_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        load.dst_result_ty = Vector {
+            len: 64,
+            elem: ElemType::F32,
+        };
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Streaming(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+        assert_eq!(
+            printed(&ops).lines().last(),
+            Some("dataflow.send %53, %2 : vector<64xf16>"),
+            "a stick is left alone whatever the destination reads",
+        );
+
+        // ⭐ AND HALF A STICK WITH THE SAME MISMATCH IS CONVERTED.
+        load.result_ty = Vector {
+            len: 32,
+            elem: ElemType::F16,
+        };
+        load.dst_result_ty = Vector {
+            len: 32,
+            elem: ElemType::F32,
+        };
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Streaming(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+        assert_eq!(
+            printed(&ops).lines().last(),
+            Some("dataflow.send %53, %3 : vector<32xf32>"),
+            "the send spends the CONVERTED value",
+        );
+    }
+
+    /// 🎯 080/110 — ⛔⛔ THE DELIBERATE DIVERGENCE: THE CONVERSION IS **INSIDE** THE REGION.
+    ///
+    /// `:4176` builds it with the OUTER `builder` while its operand is the region's `load_iv` and its
+    /// consumer is the region's `dataflow.send` (`:4184`) — a `vectorchain.cast` after the
+    /// `agen.composite_load` that dominates neither. Emitting it where the reference does would print
+    /// the cast at depth 0 after the closing brace, and MLIR refuses that module outright.
+    ///
+    /// ⭐ AND THE SEND IS UNCONDITIONAL HERE, because the composite arm has no latch walk at all.
+    #[test]
+    fn the_composite_arms_conversion_is_emitted_inside_the_region() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let time_loops = [CompositeTimeLoop {
+            bound: LoopBound::Constant(4),
+            walk: CompositeLoop {
+                size_idx: Some(0),
+                elem_offset: 8,
+            },
+        }];
+        let (to, _) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let latch = Latch::new(3).expect("a bound latch");
+        let mut load = switched_load_fixture(
+            &view_sizes,
+            &outer_loops,
+            &chunk_sizes,
+            core::slice::from_ref(&latch),
+            to,
+            LoadForm::Composite(&time_loops),
+        );
+        load.dst_result_ty = Vector {
+            len: 8,
+            elem: ElemType::F32,
+        };
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let got = construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Buffering(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the time set and both maps resolve");
+
+        assert_eq!(
+            printed(&ops),
+            concat!(
+                "%0 = dataflow.get_logical_memory_view %50, %60 {layout_map = affine_map<(d0, d1) -> (d1 * 4 + d0)>} : index, index, memref<4x8xf16>\n",
+                "%1 = arith.constant 0 : index\n",
+                "agen.composite_load %0[%80 * 8, 0]\n",
+                " time_symbols()(%2:vector<8xf16>)\n",
+                " {dbgName = \"T\", load_order = affine_map<(d0, d1) -> (d0, d1)>, load_set = affine_set<(d0, d1) : (d1 >= 0, -d1 + 7 >= 0, d0 == 0)>, time_addr_map = affine_map<(d0) -> (d0 * 8, 0)>, time_order = affine_map<(d0) -> (d0)>, time_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>}\n",
+                "{\n",
+                "  %3 = vectorchain.cast %2 : vector<8xf16>, vector<8xf32>\n",
+                "  dataflow.send %53, %3 : vector<8xf32>\n",
+                "  agen.yield\n",
+                "} : memref<4x8xf16>\n",
+            ),
+            "the cast sits between the block argument and the send, both of which are in the region",
+        );
+        assert!(
+            got.latches.is_empty(),
+            "the composite arm latches nothing even with a via on LXLUVALUE",
+        );
+    }
+
+    /// 🎯 080/110 — ⛔⛔ STREAMING **WALKS** AND DOUBLE BUFFERING **TOGGLES**, AND THE INCREMENT IS
+    /// NUMBERED BELOW THE SUM.
+    ///
+    /// `AddIOp(.., terminator->getOperand(i), buffer_increment)` against
+    /// `SubIOp(.., buffer_increment, terminator->getOperand(i))` (`:4038` against `:4066`) — the
+    /// reversal is the toggle: `k - x` returns the other buffer every second iteration where `x + k`
+    /// never comes back. And these ops are the buffer-switch loop's, not the load's:
+    /// `OpBuilder local_builder(buffer_switch_loop_terminator)` (`:4198`).
+    #[test]
+    fn the_streaming_step_walks_and_the_double_buffer_step_toggles_outside_the_load() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let (to, _) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let load = switched_load_fixture(
+            &view_sizes,
+            &outer_loops,
+            &chunk_sizes,
+            &[],
+            to,
+            LoadForm::Vector,
+        );
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let streaming = construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Streaming(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    // ⭐ THE FACTOR IS THE ADDRESS GRANULARITY OF `{L0LU, L3LU-HBM, f16}`.
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+        assert_eq!(
+            printed(&streaming.update.ops),
+            concat!(
+                "%3 = arith.constant 4096 : index\n",
+                "%4 = arith.addi %61, %3 : index\n",
+            ),
+        );
+        assert_eq!(streaming.update.operand, Val(4));
+        assert_eq!(
+            printed(&ops).lines().count(),
+            4,
+            "the increment and the sum are NOT among the load's own ops",
+        );
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let buffering = construct_streaming_or_double_buffering_load(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &load,
+            BufferStep::Buffering(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+        assert_eq!(
+            printed(&buffering.update.ops),
+            concat!(
+                "%3 = arith.constant 4096 : index\n",
+                "%4 = arith.subi %3, %61 : index\n",
+            ),
+            "REVERSED: the constant is the minuend",
+        );
+        assert_eq!(buffering.update.operand, Val(4));
+    }
+
+    /// 🎯 080/110 — ⛔ A NEGATIVE LATCH ID AND A ZERO ROTATION ARE UNSTATEABLE.
+    ///
+    /// `DT_CHECK_MSG(latch_id != -1, "latch id cannot be negative")` (`:1014`) and
+    /// `if (rotateNumElements_ > 0)` (`:4041`) — the unset latch id would otherwise index a map and
+    /// the zero rotation would emit a `vectorchain.rotate` by nothing.
+    #[test]
+    fn an_unset_latch_id_and_an_absent_rotation_have_no_spelling() {
+        assert_eq!(Latch::new(-1), None);
+        assert_eq!(Latch::new(0).map(Latch::get), Some(0));
+        assert_eq!(Rotation::on_lxlu(0), None);
+        assert_eq!(Rotation::on_lxlu(-4), None);
+        assert_eq!(Rotation::on_lxlu(2).map(Rotation::get), Some(2));
+    }
+
+    /// 🎯 081/110 — ⛔⛔ THE PAIR JOINS THE IMPLICIT LOOP, OR BRINGS A COUNTED ONE.
+    ///
+    /// `if (!implicit_loops.empty())` (`:4288`) inserts the two ops at the START of the loop already
+    /// emitted for `implicit_loops.front()`; the `else` builds `affine.for 0 to count` and names it.
+    /// A port that always brought its own loop would nest a second walk inside the first, forwarding
+    /// `count * extent` sticks.
+    #[test]
+    fn a_contiguous_transfer_joins_its_implicit_loop_or_brings_a_counted_one() {
+        let (to, from) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let ty = Vector {
+            len: 8,
+            elem: ElemType::F16,
+        };
+        let one = Replication::checked(1).expect("no replication");
+        let (view_sizes, _, _) = view_fixture();
+
+        // ⭐ THE INNER DIM CARRIES 8 CONTIGUOUS TRANSFERS, so entry 068 hands back a loop for it.
+        let mut sticks = ContiguousSticks::new(
+            StickCounts {
+                steady: 8,
+                epilogue: 8,
+            },
+            vec![(
+                PrimaryDim::In,
+                StickCounts {
+                    steady: 8,
+                    epilogue: 8,
+                },
+            )],
+        );
+        let mut vals = Values::default();
+        let joined = generate_receive_and_send_from_data_transfer_node(
+            &mut vals,
+            "N",
+            "T",
+            &view_sizes,
+            1,
+            &mut sticks,
+            one,
+            from,
+            to,
+            7,
+            ty,
+        );
+        match &joined {
+            ReceiveAndSend::InLoopFor { implicit, body } => {
+                assert_eq!(
+                    *implicit,
+                    ImplicitLoop {
+                        size_index: Some(1),
+                        dim: Some(PrimaryDim::In),
+                        extents: StickCounts {
+                            steady: 8,
+                            epilogue: 8,
+                        },
+                    },
+                );
+                assert_eq!(
+                    printed(body),
+                    concat!(
+                        "%0 = dataflow.receive %50 : vector<8xf16>\n",
+                        "dataflow.send %53, %0 : vector<8xf16>\n",
+                    ),
+                    "the wire is spent once, and neither op carries the transfer's name",
+                );
+            }
+            ReceiveAndSend::InNewLoop(_) => panic!("an implicit loop was available"),
+        }
+
+        // ⛔ A WHOLE TRANSFER IN ONE BURST: no implicit loop, so the counted fallback is built — and
+        // its induction variable is minted BEFORE the receive.
+        let mut sticks = ContiguousSticks::new(
+            StickCounts {
+                steady: 1,
+                epilogue: 1,
+            },
+            Vec::new(),
+        );
+        let mut vals = Values::default();
+        let counted = generate_receive_and_send_from_data_transfer_node(
+            &mut vals,
+            "N",
+            "T",
+            &[],
+            0,
+            &mut sticks,
+            one,
+            from,
+            to,
+            7,
+            ty,
+        );
+        match &counted {
+            ReceiveAndSend::InNewLoop(op) => assert_eq!(
+                printed(core::slice::from_ref(op)),
+                concat!(
+                    "affine.for %0 = 0 to 7 {\n",
+                    "  %1 = dataflow.receive %50 : vector<8xf16>\n",
+                    "  dataflow.send %53, %1 : vector<8xf16>\n",
+                    "} {dbgName = \"SingleImplicitLoopForTransfer(T)\"}\n",
+                ),
+                "%0 is the loop's, not the receive's",
+            ),
+            ReceiveAndSend::InLoopFor { .. } => panic!("there was no implicit loop to join"),
+        }
+    }
+
+    /// 🎯 082/110 — ⛔⛔ THE MASK MAP TURNS OVER AT THE TRANSITION SLICE, AND THE `else` ARM RESETS.
+    ///
+    /// 35 valid entries is four full slices plus three, so slices 0-3 are `(A)`, slice 4 is `(A|B)`
+    /// and 5-7 are `(1)` — and `maskB` is `unmask 3, mask 5`. A map that turned over one slice early
+    /// would mask three live entries; one that never reset in the `else` would leave the mask armed
+    /// for the next transfer.
+    #[test]
+    fn the_samv_mask_turns_over_at_the_transition_slice_and_the_else_arm_resets() {
+        let by_four = affine_for(Val(100), 4);
+        let loops = [SamvLoop {
+            dim: Some(PrimaryDim::Out),
+            stage: StagePair { num: 1, den: 2 },
+            loop_op: &by_four,
+        }];
+        let mut vals = Values::default();
+        let ops = construct_samv_operation(
+            &mut vals,
+            "N",
+            "T",
+            &loops,
+            ValidEntries::checked(35).expect("a count"),
+            WslLen::Zero,
+            Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+        );
+
+        assert_eq!(
+            printed(&ops),
+            concat!(
+                "%0 = arith.constant true\n",
+                "%1 = arith.constant false\n",
+                "%2 = arith.constant 3 : index\n",
+                "%3 = arith.cmpi eq, %100, %2 : index\n",
+                "%4 = scf.if %3 -> (i1) {\n",
+                "  scf.yield %0 : i1\n",
+                "} else {\n",
+                "  scf.yield %1 : i1\n",
+                "}\n",
+                "%5 = arith.constant 0 : index\n",
+                "scf.if %4 {\n",
+                "  %6 = agen.set_transfer_mask_state mask_value(%5) { num_slices = 8 : i32, slice_mask_map = \"(A)(A)(A)(A)(A|B)(1)(1)(1)\", maskA = \"(unmasked = 0 : i32, masked = 1 : i32)\", maskB = \"(unmasked = 3 : i32, masked = 5 : i32)\" } :  index , vector<8xf16>\n",
+                "} else {\n",
+                "  %7 = agen.set_transfer_mask_state mask_value(%5) { num_slices = 8 : i32, slice_mask_map = \"(0)(0)(0)(0)(0)(0)(0)(0)\" } :  index , vector<8xf16>\n",
+                "}\n",
+            ),
+            "the guard chain, the shared `false` mask value, and no results on the `scf.if`",
+        );
+    }
+
+    /// 🎯 082/110 — ⛔⛔ A NEGATIVE ENTRY COUNT IS REFUSED, WHICH IS WHERE THE `float` CEIL DIVERGES.
+    ///
+    /// `ceil((float)-3 / 8) - 1` is `-1`, so every slice would compare GREATER and the whole stick
+    /// would be masked — while `-3 % 8` is `-3`, making `maskB`'s masked count `11` for a slice that
+    /// holds `8`. And an exact multiple lands on the slice BELOW: 32 entries transition at slice 3,
+    /// not 4.
+    #[test]
+    fn a_negative_valid_entry_count_is_unstateable_and_an_exact_multiple_ends_a_slice_early() {
+        assert_eq!(ValidEntries::checked(-3), None);
+        let exact = ValidEntries::checked(32).expect("a count");
+        assert_eq!(exact.transition_slice(), 3);
+        assert_eq!(exact.in_last_slice(), 0);
+        let none = ValidEntries::checked(0).expect("a count");
+        assert_eq!(none.transition_slice(), -1, "every slice is fully masked");
+        let one = ValidEntries::checked(1).expect("a count");
+        assert_eq!(one.transition_slice(), 0);
+        assert_eq!(one.in_last_slice(), 1);
+        assert_eq!(WslLen::Zero.get(), 0);
     }
 }
