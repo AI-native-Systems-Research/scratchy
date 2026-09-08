@@ -143,7 +143,7 @@ impl<T: Ord> Only<T> {
 ///
 /// ⭐ ONE STRUCT BECAUSE THREE ENTRIES READ THE SAME TRIPLE, character for character: entry 140
 /// (`:250-255`), entry 262 (`:155-160`) and entry 203 (`:186-191`). The pass member `opts_` that
-/// supplies them is an excluded data member (`docs/bridge2-porting-order.md:1120`).
+/// supplies them is an excluded data member (`docs/bridge2-porting-order.md:2964`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnitFilters {
     /// Keep only these folds. [`None`] keeps every fold.

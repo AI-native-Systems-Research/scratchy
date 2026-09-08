@@ -269,7 +269,7 @@ fn paged_views<'p>(ops: &'p [DfirOp], found: &mut Vec<PagedMemView<'p>>) {
 ///
 /// ⚠️ `opts_` (`:34`, `:38`) IS READ BY NOTHING IN THIS FUNCTION. The pass takes a
 /// `dcc::CommonPassOptions` in its constructor and stores it; `runOnOperation` never mentions it. It
-/// is one of the campaign's 106 exclusions (`docs/bridge2-porting-order.md:1565`), and the two
+/// is one of the campaign's 106 exclusions (`docs/bridge2-porting-order.md:2958`), and the two
 /// `createTransformPagedMemViewPass` factories that hand it over (`:70-78`) are pass registration,
 /// which no entry covers.
 ///

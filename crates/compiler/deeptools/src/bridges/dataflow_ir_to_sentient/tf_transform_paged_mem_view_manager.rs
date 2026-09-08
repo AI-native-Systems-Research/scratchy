@@ -174,7 +174,7 @@ impl<'a> TpmvManager<'a> {
     ///
     /// ⭐ NOT A SCHEDULED UNIT: the extractor caught it as the data member `comp_`
     /// (`TransformPagedMemViewManager.hpp:24`) and it is among the excluded *"C++ data MEMBER, not a
-    /// function"* entries (`docs/bridge2-porting-order.md:1119`), so it carries no anchor. Written
+    /// function"* entries (`docs/bridge2-porting-order.md:2963`), so it carries no anchor. Written
     /// here because entry 139 is a method on it.
     #[must_use]
     pub fn new(paged_mem_view: PagedMemView<'a>, comp: DfirUnit) -> TpmvManager<'a> {

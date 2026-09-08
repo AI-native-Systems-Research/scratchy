@@ -37,6 +37,45 @@ are ported when tiling lands and the corpus is regenerated.
 - ⛔ `cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel` is the
   acceptance gate. E2E when bridge 1 lands.
 
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT ENTRIES 191-205 — ALL FIFTEEN PORTS HOLD, 4 CITATIONS AND 1 COUNT FIXED IN THIS COMMIT
+
+15 `/// Replaces:` anchors, 0 surviving `// crustify:todo:`, 30/30 boxes `[x]`, and every body re-read
+statement by statement against the authority at its cited line. **No implementation is wrong.** The
+things a review of this range is for all survive contact with the tree: e198's `num_dim_vars++` fires
+BEFORE the whole-range `continue` (`:321` then `:325-327`) and the port has that order; its value
+numbering is dimension-major and access-minor, and the port's loop nesting matches; e200 keeps
+`lookupOrNull` for the indices and `lookupOrDefault` for the view; e201 substitutes a sort KEY for
+`isProperAncestor`, which is not a strict weak ordering, and outermost-first is the reference's own
+direction (`:443`); e203's "do not modify the map" covers both *nothing filtered* and *everything
+filtered* (`:129`); and e205 really has no `!empty()` guard, so an empty `filter_transfers_except_`
+keeps NOTHING where every other filter in that file keeps everything.
+
+The vendored expectations reproduce independently too. `mixed.mlir`'s four `l0lurow0` units reduce to
+two exactly as e193's table says — the reverse walk (`ProgramUnitsReduction.cpp:184`) makes `(1, 1)`
+the first base, `(0, 1)` fails on an `l0` at `(0, 0)` (`:290`) and opens the second group — and
+`paged_mem_view_loads.mlir`'s first three pages emit `cmpi eq, %arg1, 0` (`:46`), the
+`sge 2`/`sle 3` pair (`:66`, `:69`) and the folded subscript `[0, 1, ..]` (`:90`), which is the proof
+that `replaceDimsAndSymbols` folds constant-over-constant as the port's `replace_dims` does.
+
+**4 citations and 1 count corrected.** One citation names the wrong line in a vendored `.mlir`; the
+other three are a line number INTO THIS FILE, which is why the note below the table exists at all:
+
+| where | said | is |
+|---|---|---|
+| e193's `mixed.mlir` grouping (`tf_program_units_reduction.rs:435`) | `:206` | `:205` — `:206` is `affine.for %arg0 = 0 to 1`; `:205` is the `l0` `get_unit`, matching the three sites (`:290`, `:375`, `:460`) it is compared against |
+| e202's header (`tf_transform_paged_mem_view_impl.rs:4921`) | "THE THREE `DT_CHECK`s" | two `DT_CHECK`s and a `cast` (`:659`, `:661`, `:663-664`) — all three abort, but only two are spelled `DT_CHECK` |
+| e196's `opts_` exclusion (`tf_transform_paged_mem_view.rs:272`) | `bridge2-porting-order.md:1565` | `:2958` — `:1565` was entry 139's dispatch-asymmetry note |
+| entry 140/203's `opts_` (`tf_unit_filtering.rs:146`) | `bridge2-porting-order.md:1120` | `:2964` |
+| entry 139's `comp_` (`tf_transform_paged_mem_view_manager.rs:177`) | `bridge2-porting-order.md:1119` | `:2963` |
+
+⛔ THE LAST THREE ROWS ARE ONE DEFECT WITH A SHARED CAUSE, AND THIS SECTION IS ITS THIRD OCCURRENCE
+(entry 384's `AGENT-BRIEF.md:57` was the second). **A line number into a file that grows at the top is
+drifted by the next section anyone prepends** — these three were already wrong at `bde0a005c`, and the
+39 lines added here would have moved them again. Cite an exclusion by the `file:line` in the C++ tree
+that names it, which is stable; the line it occupies in this document is not. The last two rows are
+entries 139/140/262 rather than this worklist, fixed here because leaving them would have made this
+commit the thing that broke them.
+
 ## ⛔ MEASURED FOR ENTRIES 230-253: THE EXTRACT DROPS THE STATEMENT THAT DOES THE WORK
 
 Brace-matched from the authority at each unit's cited line and diffed against `source/bridge2.cpp`'s

@@ -4918,10 +4918,10 @@ impl<'p> TpmvVectorLoad<'p> {
     /// **202/384** `TPMVVectorLoad::initialize` —
     /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:658` (13L).
     ///
-    /// ⛔ THE THREE `DT_CHECK`s ARE THE THREE `let … else`: exactly one mem op, an `agen.vector_load`,
-    /// and a paged view behind its `getMemRef()`. ⭐ `getAffineMapAttr()` + `getMapIndices()` are this
-    /// island's inline indices split by [`access_map`]; `context_` has no counterpart and the
-    /// `LogicalResult` is unconditionally success, so nothing is returned.
+    /// ⛔ TWO `DT_CHECK`s AND A `cast` ARE THE THREE `let … else`: exactly one mem op, an
+    /// `agen.vector_load`, and a paged view behind its `getMemRef()`. ⭐ `getAffineMapAttr()` +
+    /// `getMapIndices()` are this island's inline indices split by [`access_map`]; `context_` has no
+    /// counterpart and the `LogicalResult` is unconditionally success, so nothing is returned.
     pub fn initialize(&mut self, scope: &'p [DfirOp]) {
         // `DT_CHECK(mem_ops_.size() == 1);` then `dyn_cast<agen::VectorLoadOp>(mem_ops_[0])` and
         // `DT_CHECK(op)`.

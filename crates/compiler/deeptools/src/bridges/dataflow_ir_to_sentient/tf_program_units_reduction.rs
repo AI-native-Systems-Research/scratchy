@@ -432,7 +432,7 @@ fn regions_are_equivalent(
 /// `l0lurow0` units — `(core 0, corelet 0)`, `(0, 1)`, `(1, 0)`, `(1, 1)` at `:201`, `:286`, `:371`,
 /// `:456` — whose bodies bind an `l0su`, a `ptrow0` and an `l0` each. Three of them bind all three at
 /// their own `(core, corelet)`; the odd one out is `(core 0, corelet 1)`, whose `l0` is at
-/// `{core = 0, corelet = 0}` (`:290` against `:206`, `:375`, `:460`).
+/// `{core = 0, corelet = 0}` (`:290` against `:205`, `:375`, `:460`).
 ///
 /// Entry 256 walks the units in REVERSE (`:181-184`), so `(1, 1)` becomes the first group's base:
 ///
