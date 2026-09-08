@@ -997,11 +997,11 @@ pub fn erase_op(op: &OpId, scope: &mut Vec<DfirOp>) {
 /// signature can be transposed at a call site; these cannot.
 ///
 /// ⭐ AND THE CLASSIFICATION IS THE CALLER'S, WHICH IS WHY THE SPLATTED CASE CARRIES A
-/// [`ConstantOperandValue`]. `constValToField` has no answer for a fifth value — its `default:` is an
-/// unconditional throw (see [`const_val_to_field`]) — and entry 073 already made that domain a type
-/// rather than a runtime refusal. The only caller that passes `true` is
-/// `getOperandFromShuffleOp`'s trivial-shuffle branch (`VectorOperands.cpp:333-334`, entry 278), which
-/// is exactly the one that has established the shuffle is a recognised splat.
+/// [`ConstantOperandValue`]. `constValToField` has no answer for a fifth value — its four `==` tests
+/// fall through to an unconditional throw (`VectorOperands.cpp:260`, see [`const_val_to_field`]) —
+/// and entry 073 already made that domain a type rather than a runtime refusal. The only caller that
+/// passes `true` is `getOperandFromShuffleOp`'s trivial-shuffle branch (`VectorOperands.cpp:333-334`,
+/// entry 278), which is exactly the one that has established the shuffle is a recognised splat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BitstreamConstant {
     /// `is_constant_splatted_vector == true` — the element names a pseudo-unit.
