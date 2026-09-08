@@ -393,6 +393,7 @@ pub fn initialize_unit(
     }));
     into.push(Op::Dataflow(dataflow::Op::ProgramUnit {
         units: vec![handle],
+        iter_arg: None,
         precision: None,
         body: Vec::new(),
     }));
@@ -441,6 +442,7 @@ mod unit_tests {
                 }),
                 Op::Dataflow(dataflow::Op::ProgramUnit {
                     units: vec![handle],
+                    iter_arg: None,
                     precision: None,
                     body: Vec::new(),
                 }),

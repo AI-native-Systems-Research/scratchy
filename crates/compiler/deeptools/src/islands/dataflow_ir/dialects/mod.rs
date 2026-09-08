@@ -916,6 +916,12 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
             regions.iter().map(|region| region.arg).collect()
         }
+        // ⭐ AND A UNIFORMIZED PROGRAM UNIT BINDS ITS `iter_arg` — see
+        // [`dataflow::Op::ProgramUnit`]. Every `uniform.query_map` inside the region reads it, so a
+        // census that missed it would let a clone keep reading the original unit's handler.
+        Op::Dataflow(dataflow::Op::ProgramUnit { iter_arg, .. }) => {
+            iter_arg.iter().copied().collect()
+        }
         Op::Uniform(
             uniform::Op::Yield { .. }
             | uniform::Op::DefImmutableMapping { .. }
@@ -1069,7 +1075,13 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
         Op::Agen(agen::Op::CompositeStore(store)) => store.dbg_name.as_deref(),
         // ⭐ `Dataflow_DebugNameOpInterface` IS ON `vectorchain.shuffle` (`VectorChain.td:435`), so
         // it takes the interface path rather than the discardable-attribute one.
-        Op::VectorChain(vectorchain::Op::Shuffle { dbg_name, .. }) => dbg_name.as_deref(),
+        // ⭐ AND THE SAME INTERFACE IS ON BOTH ELEMENT-WISE OPS AN FMIN/FMAX EMITS
+        // (`VectorChain.td:148`, `:394`), which is where their name comes from.
+        Op::VectorChain(
+            vectorchain::Op::Shuffle { dbg_name, .. }
+            | vectorchain::Op::ElementWiseCompare { dbg_name, .. }
+            | vectorchain::Op::ElementWiseSelection { dbg_name, .. },
+        ) => dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1137,7 +1149,11 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
         ) => Some(dbg_name),
         Op::Agen(agen::Op::CompositeLoad(load)) => Some(&mut load.dbg_name),
         Op::Agen(agen::Op::CompositeStore(store)) => Some(&mut store.dbg_name),
-        Op::VectorChain(vectorchain::Op::Shuffle { dbg_name, .. }) => Some(dbg_name),
+        Op::VectorChain(
+            vectorchain::Op::Shuffle { dbg_name, .. }
+            | vectorchain::Op::ElementWiseCompare { dbg_name, .. }
+            | vectorchain::Op::ElementWiseSelection { dbg_name, .. },
+        ) => Some(dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
             affine::Op::Apply { .. }
@@ -1366,8 +1382,14 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 operands.extend(view.pages.iter_mut().map(|page| &mut page.start_addr));
                 results.push(&mut view.result);
             }
-            dataflow::Op::ProgramUnit { units, body, .. } => {
+            dataflow::Op::ProgramUnit {
+                units,
+                iter_arg,
+                body,
+                ..
+            } => {
                 operands.extend(units.iter_mut());
+                block_args.extend(iter_arg.iter_mut());
                 regions.push(body);
             }
             dataflow::Op::Send { to, data, .. } => operands.extend([to.val_mut(), data]),
@@ -1922,8 +1944,11 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, start));
                 vals.push((Role::Result, result));
             }
-            dataflow::Op::ProgramUnit { units, .. } => {
+            dataflow::Op::ProgramUnit {
+                units, iter_arg, ..
+            } => {
                 vals.extend(units.iter_mut().map(|val| (Role::Operand, val)));
+                vals.extend(iter_arg.iter_mut().map(|arg| (Role::BlockArg, arg)));
             }
             dataflow::Op::Send { to, data, .. } => {
                 vals.push((Role::Operand, to.val_mut()));
@@ -2289,6 +2314,7 @@ mod unit_tests {
                 cond: predicate(40),
                 lhs: Val(41),
                 rhs: Val(42),
+                dbg_name: None,
                 mask: Some(predicate(43)),
                 ty: vector(),
             }),
@@ -2403,6 +2429,7 @@ mod unit_tests {
             cond: predicate(40),
             lhs: Val(41),
             rhs: Val(42),
+            dbg_name: None,
             mask: None,
             ty: vector(),
         });

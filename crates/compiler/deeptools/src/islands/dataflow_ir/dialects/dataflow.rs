@@ -465,11 +465,18 @@ pub enum Op {
     /// — see [`PagedMemView`], which is the whole of it.
     GetPagedLogicalMemoryView(Box<PagedMemView>),
 
-    /// `dataflow.program_unit %unit {precision} : { .. }` — one unit's whole program.
+    /// `dataflow.program_unit iter_arg : %arg -> (%unit) {precision} : { .. }` — one unit's whole
+    /// program.
     ProgramUnit {
         /// The units this program runs on. More than one where the same program is bound across
         /// program time steps (`Dataflow.td:99-104`).
         units: Vec<Val>,
+        /// The region's own block argument, which `build` gives it the type of `units[0]`
+        /// (`DataflowOps.cpp:74`) and the printer spells `iter_arg : %arg -> (..)`
+        /// (`DataflowOps.cpp:146-157`). This is what a uniformized unit's `uniform.query_map`
+        /// reads: `component_to_handler_[comp] = unit_op.getRegion().getArguments().front()`.
+        /// `None` prints no `iter_arg` clause at all.
+        iter_arg: Option<Val>,
         /// `precision=`, which selects the MAC opcode. Absent on a unit that computes nothing.
         precision: Option<Precision>,
         /// The body.
@@ -734,6 +741,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         }
         Op::ProgramUnit {
             units,
+            iter_arg,
             precision,
             body,
         } => {
@@ -741,11 +749,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 Some(p) => format!(" {{precision = \"{}\"}}", Precision::spelling(*p)),
                 None => String::new(),
             };
-            let _ = writeln!(
-                out,
-                "dataflow.program_unit {}{precision} : {{",
-                print::vals(units)
-            );
+            let units = match iter_arg {
+                Some(arg) => format!(
+                    "iter_arg : {} -> ({})",
+                    print::val(*arg),
+                    print::vals(units)
+                ),
+                None => print::vals(units),
+            };
+            let _ = writeln!(out, "dataflow.program_unit {units}{precision} : {{");
             for inner in body {
                 print::emit(out, inner, depth + 1);
             }

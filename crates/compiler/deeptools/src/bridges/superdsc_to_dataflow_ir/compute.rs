@@ -30,7 +30,7 @@ use super::construction::{MaskValue, static_continuous_mask};
 use super::control_flow::{PrimaryDim, StartAddresses};
 use super::dsc_lowering::{
     Component, DataLocation, Handlers, Handles, address_granularity_multiply_factor,
-    constant_index, create_get_unit_op_in_different_core, mlir_loop_from_loop_node,
+    constant_index, create_get_unit_op_in_different_core, emit_error, mlir_loop_from_loop_node,
     uniformized_folded_address, uniformized_folded_destination_core,
 };
 use super::transfer::{
@@ -742,6 +742,7 @@ pub enum ComputeInput<'i> {
 }
 
 /// WHAT BOTH SIDES OF A COMPUTE OPERAND ARE LOWERED AGAINST.
+#[derive(Clone, Copy)]
 pub struct OperandContext<'c> {
     /// `compute_op.name_` — the `dbgName` of every op here that carries one.
     pub name: &'c str,
@@ -1133,8 +1134,165 @@ pub fn compute_output_operand(
     Some(Stored::Emitted)
 }
 
-// crustify:todo: e094_constructComputeOutputOperands
-// crustify:todo: e095_constructFMINorFMAXOperation
+/// Replaces: e094_constructComputeOutputOperands
+///
+/// **094/110** `SNComputeLowering.cpp:921` — [`compute_output_operand`] once per `outputs_[i]`,
+/// stopping at the first refusal.
+///
+/// ⛔ EVERY OUTPUT STARTS FROM THE SAME UNCONVERTED RESULT: `Value compute_result = result` is
+/// declared once and never reassigned (`:925`), and entry 087 takes its `result` BY VALUE — so a
+/// second output does not inherit the first's precision conversion.
+pub fn compute_output_operands(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    outputs: &[(ComputeOutput<'_>, OutputFormat)],
+    result: Computed,
+) -> Option<Vec<Stored>> {
+    outputs
+        .iter()
+        .map(|(output, format)| compute_output_operand(vals, into, ctx, output, result, *format))
+        .collect()
+}
+
+/// WHICH OF THE PAIR IS BEING LOWERED — `compute_op.type_`, and the only two values that reach
+/// `constructFMINorFMAXOperation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinOrMax {
+    /// `FMAX`.
+    Fmax,
+    /// `FMIN` — the `else` of that one ternary.
+    Fmin,
+}
+
+impl MinOrMax {
+    /// `compute_op.type_ == FMAX ? compare_gt : compare_le` (`SNComputeLowering.cpp:1252-1255`).
+    #[must_use]
+    pub const fn comparison(self) -> vectorchain::CompareOp {
+        match self {
+            MinOrMax::Fmax => vectorchain::CompareOp::Gt,
+            MinOrMax::Fmin => vectorchain::CompareOp::Le,
+        }
+    }
+}
+
+/// Replaces: e095_constructFMINorFMAXOperation
+///
+/// **095/110** `SNComputeLowering.cpp:1189` — two input operands, one `element_wise_compare` and one
+/// `element_wise_selection` over them under the same lane mask, then every output operand.
+///
+/// ⛔⛔ THE STATE FILES TAKE THE **COMPARISON**, NOT THE SELECTION: a `PESTATE`/`SFPSTATE` output is
+/// handed the `i1` vector at `bool_type` and every other output the selection at `result_type`
+/// (`:1268-1281`), and `result_type` is entry 087's own conversion target — so the two arms differ in
+/// the value AND in the type it is written at.
+/// ⛔ EXACTLY TWO INPUTS IS THE TYPE: the reference builds every `inputs_[i]` but only `[0]` and
+/// `[1]` reach either op. ⭐ An input's format rule is [`OutputFormat`]'s verbatim (`:1201-1206`),
+/// where `get()` states the operand's type and entry 086 converts to `.operand`.
+pub fn fmin_or_fmax_operation<A: Arch>(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    which: MinOrMax,
+    inputs: &[(ComputeInput<'_>, OutputFormat); 2],
+    result_format: DataType,
+    mask: MaskValue,
+    outputs: &[(ComputeOutput<'_>, OutputFormat)],
+) -> Option<Vec<Stored>> {
+    let mut input_operand = |source: &ComputeInput<'_>, format: OutputFormat| -> Option<Computed> {
+        let ty = type_from_compute_type(format.get(), ctx.comp)?;
+        Some(
+            compute_input_operand::<A>(
+                vals,
+                into,
+                &OperandContext {
+                    result_ty: ty,
+                    ..*ctx
+                },
+                source,
+                format.operand,
+            )
+            .unwrap_or_else(|| {
+                emit_error(
+                    ctx.name,
+                    "Unable to construct Binary operation input operand",
+                )
+            }),
+        )
+    };
+    let [(lhs_source, lhs_format), (rhs_source, rhs_format)] = inputs;
+    let lhs = input_operand(lhs_source, *lhs_format)?;
+    let rhs = input_operand(rhs_source, *rhs_format)?;
+
+    // `getComputeOperandFormats(*dsc_).back()`, and `bool_type` is its lane count in `i1`.
+    let result_ty = type_from_compute_type(result_format, ctx.comp)?;
+    let bool_ty = Vector {
+        len: result_ty.len,
+        elem: ElemType::Int(1),
+    };
+    // ⛔ `DT_CHECK_MSG(mask_op, "Could not create valid mask")` CANNOT FIRE HERE: a [`Predicate`] has
+    // no null, which is the guard entry 047 moved into the type.
+    let lanes = static_mask_for_result(vals, into, result_ty, mask);
+
+    let compared = vals.mint();
+    let compare = vectorchain::Op::ElementWiseCompare {
+        result: compared,
+        op1: lhs.val(),
+        op2: rhs.val(),
+        mask: Some(lanes),
+        compare_op: which.comparison(),
+        dbg_name: Some(ctx.name.to_owned()),
+        operand_ty: lhs.ty(),
+        ty: bool_ty,
+    };
+    let cond = compare.binds_predicate()?;
+    into.push(Op::VectorChain(compare));
+
+    let selected = vals.mint();
+    into.push(Op::VectorChain(vectorchain::Op::ElementWiseSelection {
+        result: selected,
+        cond,
+        lhs: lhs.val(),
+        rhs: rhs.val(),
+        dbg_name: Some(ctx.name.to_owned()),
+        mask: Some(lanes),
+        ty: result_ty,
+    }));
+
+    Some(
+        outputs
+            .iter()
+            .map(|(output, format)| {
+                // `is_any_of(compute_op.outputs_[i], PESTATE, SFPSTATE)`.
+                let state = matches!(
+                    output,
+                    ComputeOutput::Memory(memory) if matches!(memory.file, MemoryFile::State)
+                );
+                let (ty, data) = if state {
+                    (bool_ty, compared)
+                } else {
+                    (result_ty, selected)
+                };
+                compute_output_operand(
+                    vals,
+                    into,
+                    &OperandContext {
+                        result_ty: ty,
+                        ..*ctx
+                    },
+                    output,
+                    Computed::of(data, ty),
+                    *format,
+                )
+                .unwrap_or_else(|| {
+                    emit_error(
+                        ctx.name,
+                        "Unable to construct FMIN/FMAX operation output operand",
+                    )
+                })
+            })
+            .collect(),
+    )
+}
 // crustify:todo: e099_constructMACOperation
 // crustify:todo: e100_constructBinaryOrTernaryOperation
 // crustify:todo: e101_constructUnaryOperation
@@ -1143,11 +1301,11 @@ pub fn compute_output_operand(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ComputeInput, ComputeOutput, DynamicMask, Handlers, Latch, MacOp, MaskValue, OperandContext,
-        OutputFormat, StickWidth, Stored, VectorWidth, compute_input_operand,
-        compute_output_operand, dictionary_order, dynamic_masking, is_integer, opaque_operation,
-        precision_conversion, single_val_custom_vector, static_mask_for_result,
-        type_from_compute_type, type_from_format,
+        ComputeInput, ComputeOutput, DynamicMask, Handlers, Latch, MacOp, MaskValue, MinOrMax,
+        OperandContext, OutputFormat, StickWidth, Stored, VectorWidth, compute_input_operand,
+        compute_output_operand, compute_output_operands, dictionary_order, dynamic_masking,
+        fmin_or_fmax_operation, is_integer, opaque_operation, precision_conversion,
+        single_val_custom_vector, static_mask_for_result, type_from_compute_type, type_from_format,
     };
     use crate::arch::{Dd2, Elements, Sen1p5};
     use crate::bridges::dataflow_ir_to_sentient::vc_helper::{
@@ -1838,6 +1996,171 @@ mod unit_tests {
         assert_eq!(
             type_from_compute_type(DataType::Senint24, GenericComp::Pt),
             None
+        );
+    }
+
+    /// 🎯 094/110 — ⛔ BOTH OUTPUTS CONVERT THE SAME UNCONVERTED RESULT: `compute_result` is declared
+    /// once and never reassigned, so the second conversion reads `%9` and not the first's answer.
+    #[test]
+    fn every_output_operand_converts_the_result_the_compute_bound() {
+        let ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let handlers = operand_handlers();
+        let ctx = OperandContext {
+            name: "c0",
+            comp: GenericComp::Sfp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty: ty,
+        };
+        let (first, second) = (
+            Latch::new(3).expect("latch 3"),
+            Latch::new(4).expect("latch 4"),
+        );
+        let outputs = [
+            (
+                ComputeOutput::Latch(first),
+                OutputFormat {
+                    lds: Some(DataType::Senint8),
+                    operand: DataType::Sen169Fp16,
+                },
+            ),
+            (
+                ComputeOutput::Latch(second),
+                OutputFormat {
+                    lds: None,
+                    operand: DataType::Senint4,
+                },
+            ),
+        ];
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = compute_output_operands(
+            &mut vals,
+            &mut ops,
+            &ctx,
+            &outputs,
+            Computed::of(Val(9), ty),
+        )
+        .expect("two latches take two conversions");
+        assert_eq!(
+            ops.iter()
+                .filter_map(|op| match op {
+                    Op::Arith(arith::Op::Convert { input, ty, .. }) => Some((*input, *ty)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Val(9),
+                    Vector {
+                        len: 64,
+                        elem: ElemType::Int(8)
+                    }
+                ),
+                (
+                    Val(9),
+                    Vector {
+                        len: 64,
+                        elem: ElemType::Int(4)
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            stored,
+            vec![
+                Stored::Latched {
+                    latch: first,
+                    data: Val(0),
+                },
+                Stored::Latched {
+                    latch: second,
+                    data: Val(1),
+                },
+            ]
+        );
+    }
+
+    /// 🎯 095/110 — ⛔ ONE COMPARISON AND ONE SELECTION OVER THE SAME MASK, both carrying the node's
+    /// name, and ⭐ `compare_le` is the FMIN arm of that ternary.
+    #[test]
+    fn the_pair_compares_under_the_mask_and_selects_under_it_again() {
+        let ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let bool_ty = Vector {
+            len: 64,
+            elem: ElemType::Int(1),
+        };
+        let handlers = operand_handlers();
+        let ctx = OperandContext {
+            name: "fmin_0",
+            comp: GenericComp::Sfp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty: ty,
+        };
+        let format = OutputFormat {
+            lds: None,
+            operand: DataType::Sen169Fp16,
+        };
+        let latch = Latch::new(3).expect("latch 3");
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = fmin_or_fmax_operation::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &ctx,
+            MinOrMax::Fmin,
+            &[(ComputeInput::Zero, format), (ComputeInput::One, format)],
+            DataType::Sen169Fp16,
+            MaskValue::Live6,
+            &[(ComputeOutput::Latch(latch), format)],
+        )
+        .expect("both operands are splats at the compute's own format");
+
+        let mask = LaneMask::prefix_of(48, bool_ty);
+        assert_eq!(
+            ops[2..],
+            [
+                Op::VectorChain(vectorchain::Op::CreateAffineMask {
+                    result: Val(2),
+                    mask,
+                }),
+                Op::VectorChain(vectorchain::Op::ElementWiseCompare {
+                    result: Val(3),
+                    op1: Val(0),
+                    op2: Val(1),
+                    mask: Some(mask.binds(Val(2))),
+                    compare_op: vectorchain::CompareOp::Le,
+                    dbg_name: Some("fmin_0".to_owned()),
+                    operand_ty: ty,
+                    ty: bool_ty,
+                }),
+                Op::VectorChain(vectorchain::Op::ElementWiseSelection {
+                    result: Val(4),
+                    cond: mask.binds(Val(3)),
+                    lhs: Val(0),
+                    rhs: Val(1),
+                    dbg_name: Some("fmin_0".to_owned()),
+                    mask: Some(mask.binds(Val(2))),
+                    ty,
+                }),
+            ]
+        );
+        // ⛔ AND A NON-STATE OUTPUT TAKES THE SELECTION, at `result_type` and so unconverted here.
+        assert_eq!(
+            stored,
+            vec![Stored::Latched {
+                latch,
+                data: Val(4),
+            }]
         );
     }
 

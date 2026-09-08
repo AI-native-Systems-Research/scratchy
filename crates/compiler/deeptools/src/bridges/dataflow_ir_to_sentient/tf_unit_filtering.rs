@@ -742,6 +742,7 @@ mod unit_tests {
             lxlu_of_core(Val(100), 0),
             DfirOp::Dataflow(dataflow::Op::ProgramUnit {
                 units: vec![Val(100)],
+                iter_arg: None,
                 precision: None,
                 body: Vec::new(),
             }),
@@ -845,6 +846,7 @@ mod unit_tests {
             }),
             DfirOp::Dataflow(dataflow::Op::ProgramUnit {
                 units: vec![Val(102)],
+                iter_arg: None,
                 precision: None,
                 body: Vec::new(),
             }),
@@ -875,6 +877,7 @@ mod unit_tests {
                 }),
                 DfirOp::Dataflow(dataflow::Op::ProgramUnit {
                     units: vec![Val(102)],
+                    iter_arg: None,
                     precision: None,
                     body: Vec::new(),
                 }),

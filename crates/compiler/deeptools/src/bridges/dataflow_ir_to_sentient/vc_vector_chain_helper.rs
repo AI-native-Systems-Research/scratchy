@@ -2773,6 +2773,7 @@ mod unit_tests {
             op2: Val(op2),
             mask: Some(pred(56)),
             compare_op,
+            dbg_name: None,
             operand_ty: f16x64(),
             ty: mask_ty(),
         })
@@ -3334,6 +3335,7 @@ mod unit_tests {
             cond: pred(62),
             lhs: Val(64),
             rhs: Val(65),
+            dbg_name: None,
             mask: Some(pred(66)),
             ty: f16x64(),
         };

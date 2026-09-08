@@ -1806,6 +1806,7 @@ mod unit_tests {
             }),
             DfirOp::Dataflow(dataflow::Op::ProgramUnit {
                 units: vec![LXLU],
+                iter_arg: None,
                 precision: None,
                 body: vec![DfirOp::Affine(affine::Op::For {
                     iv: Val(20),

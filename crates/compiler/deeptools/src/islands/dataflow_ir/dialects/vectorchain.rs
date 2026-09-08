@@ -536,6 +536,9 @@ pub enum Op {
         mask: Option<Predicate>,
         /// Which comparison.
         compare_op: CompareOp,
+        /// `dbgName=` — `OptionalAttr<StrAttr>:$dbgName` (`VectorChain.td:145-158`), which
+        /// `constructFMINorFMAXOperation` fills with the node's name.
+        dbg_name: Option<String>,
         /// The operands' type.
         operand_ty: Vector,
         /// The i1 result's type.
@@ -555,6 +558,9 @@ pub enum Op {
         lhs: Val,
         /// Taken otherwise.
         rhs: Val,
+        /// `dbgName=` — `OptionalAttr<StrAttr>:$dbgName` (`VectorChain.td:395-407`), filled from
+        /// the node's name by `constructFMINorFMAXOperation`.
+        dbg_name: Option<String>,
         /// The lane mask, IF THIS OP CARRIES ONE. `Optional` in the dialect
         /// (`VectorChain.td:402`), and the condition is a SEPARATE operand from it.
         mask: Option<Predicate>,
@@ -849,6 +855,13 @@ impl Op {
                 val: *result,
                 ty: *ty,
             }),
+            // ⭐ AND A COMPARISON BINDS ONE TOO: its result IS the `$cond` of the
+            // `element_wise_selection` an FMIN/FMAX emits next
+            // (`SNComputeLowering.cpp:6238-6323`), and `ty` is the i1 vector it was defined over.
+            Op::ElementWiseCompare { result, ty, .. } => Some(Predicate {
+                val: *result,
+                ty: *ty,
+            }),
             _ => None,
         }
     }
@@ -1014,12 +1027,19 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             op2,
             mask,
             compare_op,
+            dbg_name,
             operand_ty,
             ty,
         } => {
+            // ⭐ ALPHABETICAL, `printOptionalAttrDict`'s order — `compare_op` sorts ahead of
+            // `dbgName`, which is the only one of the two that can be absent.
+            let name = match dbg_name {
+                Some(name) => format!(", dbgName = \"{name}\""),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.element_wise_compare {}, {}{} {{compare_op = #vectorchain<element_wise_compare_operator {}>}} : {}, {}, {}",
+                "{} = vectorchain.element_wise_compare {}, {}{} {{compare_op = #vectorchain<element_wise_compare_operator {}>{name}}} : {}, {}, {}",
                 print::val(*result),
                 print::val(*op1),
                 print::val(*op2),
@@ -1035,14 +1055,21 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             cond,
             lhs,
             rhs,
+            dbg_name,
             mask,
             ty,
         } => {
+            // `attr-dict` sits between the mask bracket and the types, and `dbgName` is the only
+            // attribute this op has.
+            let name = match dbg_name {
+                Some(name) => format!(" {{dbgName = \"{name}\"}}"),
+                None => String::new(),
+            };
             // ⭐ THE CONDITION'S TYPE IS THE CONDITION'S OWN — it was `cond_ty`, a field the
             // emitter filled in beside the value, which is the same two-records shape.
             let _ = writeln!(
                 out,
-                "{} = vectorchain.element_wise_selection {} ? {} : {} {} : {}, {}, {}, {}",
+                "{} = vectorchain.element_wise_selection {} ? {} : {} {}{name} : {}, {}, {}, {}",
                 print::val(*result),
                 print::val(cond.val()),
                 print::val(*lhs),

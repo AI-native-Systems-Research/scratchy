@@ -974,6 +974,7 @@ fn tail<const STICK_ALIGNED: bool>(
             // (`VectorChain.td:401-402`); reusing the predicate as both would be one value doing
             // two jobs, and the dialect makes the mask optional precisely so it can be absent.
             mask: None,
+            dbg_name: None,
             ty,
         }));
         produced = Computed::of(selected, ty);

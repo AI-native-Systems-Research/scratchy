@@ -1731,7 +1731,62 @@ fn construct_condition(vals: &mut Values, cond: &Cond<'_>) -> Option<Lowered> {
         }
     }
 }
-// crustify:todo: e096_constructLoops
+/// ONE UNIT'S WHOLE LOOP NEST — what `constructLoops` left on `this` and in the unit's region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructedLoops<'t, L> {
+    /// `dsc_loops_to_buffers_switch_map_` — entry 074's pairs, EMPTY for a component the gate below
+    /// excludes.
+    pub switch_locations: Vec<(&'t L, TransferId)>,
+    /// The hoisted symbols, then the `synthetic_root` with every root subtree inside it.
+    pub ops: Vec<DfirOp>,
+}
+
+/// Replaces: e096_constructLoops
+///
+/// **096/110** `SNControlFlowLowering.cpp:1191` — the buffer-switch scan for a component that has
+/// files to switch, then every root subtree of the schedule under ONE synthetic `affine.for`.
+///
+/// ⛔ THE SYNTHETIC ROOT IS A COUNT OF ONE AND IT IS NAMED (`:1196-1199`): the whole nest hangs
+/// inside it, while [`Lowered::hoisted`] stays ahead of it.
+/// ⛔ AND THE SCAN IS GATED ON `is_any_of(comp_, L0LUROW0, L0SU, LXLU, LXSU)` — where `L0LUROW0` is
+/// [`DfirUnit::L0lu`], which widens the gate to every L0LU row.
+/// ⚠️ `SmallVector<mlir::Value, 2> results` IS DECLARED, HANDED DOWN AND NEVER READ.
+pub fn construct_loops<'t, L, M, T: Clone>(
+    vals: &mut Values,
+    comp: DfirUnit,
+    switching: &'t [SwitchingTransfer<'t, L, M>],
+    head_children: &mut [SwitchNode<T>],
+    roots: &[SchedNode<'_>],
+) -> Option<ConstructedLoops<'t, L>> {
+    // ⭐ THE LOOP IS CREATED FIRST, so its induction variable is minted ahead of the whole subtree's.
+    let iv = vals.mint();
+    let switch_locations = if matches!(
+        comp,
+        DfirUnit::L0lu | DfirUnit::L0su | DfirUnit::Lxlu | DfirUnit::Lxsu
+    ) {
+        let located = blocking_or_streaming_buffer_loop_locations(comp, switching);
+        propagate_buffer_switch_loops_to_root(head_children);
+        located
+    } else {
+        Vec::new()
+    };
+    // ⭐ `nullptr` AS THE PARENT NODE IS THE ROOT ARM ITSELF: entry 075 keys on
+    // `parent_node == nullptr`, never on the `[nullptr]` map entry the synthetic root is recorded in.
+    let nest = construct_loops_recursive(vals, roots, None)?;
+    let mut ops = nest.hoisted;
+    ops.push(DfirOp::Affine(affine::Op::For {
+        iv,
+        lo: affine::Bound::Const(0),
+        hi: affine::Bound::Const(1),
+        carried: Vec::new(),
+        body: nest.ops,
+        dbg_name: Some("synthetic_root".to_owned()),
+    }));
+    Some(ConstructedLoops {
+        switch_locations,
+        ops,
+    })
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1739,14 +1794,14 @@ mod unit_tests {
 
     use super::super::dsc_lowering::{DataLocation, address_granularity_multiply_factor};
     use super::{
-        Ancestor, BufferSwitch, CondComposite, CondOp, CondValType, DimSlice, DimStages,
-        LoopCondition, LoopIterArgs, NodeKind, NumBuffers, ParentLoop, PrimaryDim, RootIterArg,
-        SamvLoop, StagePair, StartAddresses, SwitchMode, SwitchNode, SwitchSide, SwitchingTransfer,
-        TransferId, blocking_or_streaming_buffer_loop_locations, buffering_or_streaming_mode,
-        conditional_operation, conditionals_for_samv, construct_loop_for_a_dim,
-        construct_loop_iter_args, mlir_loop_from_sn_loop_node, parent_loop,
-        propagate_buffer_switch_loops_to_root, propagate_buffer_switch_loops_to_root_recursively,
-        reset_iter_arguments,
+        Ancestor, BufferSwitch, CondComposite, CondOp, CondValType, ConstructedLoops, DimSlice,
+        DimStages, LoopCondition, LoopIterArgs, NodeKind, NumBuffers, ParentLoop, PrimaryDim,
+        RootIterArg, SamvLoop, SchedNode, StagePair, StartAddresses, SwitchMode, SwitchNode,
+        SwitchSide, SwitchingTransfer, TransferId, blocking_or_streaming_buffer_loop_locations,
+        buffering_or_streaming_mode, conditional_operation, conditionals_for_samv,
+        construct_loop_for_a_dim, construct_loop_iter_args, construct_loops,
+        mlir_loop_from_sn_loop_node, parent_loop, propagate_buffer_switch_loops_to_root,
+        propagate_buffer_switch_loops_to_root_recursively, reset_iter_arguments,
     };
     use crate::generated::DataType;
     use crate::islands::dataflow_ir::Values;
@@ -1755,6 +1810,90 @@ mod unit_tests {
     use crate::islands::dataflow_ir::print::emit;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::units::{Core, Corelet, DfirUnit};
+
+    /// 🎯 096/110 — ⛔ ONE NAMED COUNT OF ONE OVER THE WHOLE NEST, and ⛔ the buffer-switch scan runs
+    /// for the four file-holding components only.
+    #[test]
+    fn the_nest_hangs_under_a_named_count_of_one_and_the_scan_is_gated() {
+        let side = |unit| SwitchSide {
+            unit,
+            loc: DataLocation::LxluLx,
+            switches: Some(NumBuffers::Count(2)),
+            start_addresses: &"lxlu",
+        };
+        let switching = [SwitchingTransfer {
+            precision: DataType::Sen169Fp16,
+            src: side(DfirUnit::Lxlu),
+            src_position: Some(&"outer"),
+            dsts: vec![side(DfirUnit::L3lu)],
+            dst_position: Some(&"inner"),
+        }];
+        let head = || {
+            vec![SwitchNode {
+                kind: NodeKind::Loop,
+                children: Vec::new(),
+                own: vec!["the loop's own"],
+                all: Vec::new(),
+            }]
+        };
+        // ⭐ A BLOCK NODE WITH NO CHILDREN IS THE SMALLEST SUBTREE THAT EMITS: its dummy loop.
+        let roots = || {
+            vec![SchedNode::Block {
+                children: Vec::new(),
+            }]
+        };
+        let block = |iv| {
+            DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(1),
+                carried: Vec::new(),
+                body: Vec::new(),
+                dbg_name: Some("block node".to_owned()),
+            })
+        };
+
+        let mut vals = Values::default();
+        let mut children = head();
+        let lowered = construct_loops(
+            &mut vals,
+            DfirUnit::Lxlu,
+            &switching,
+            &mut children,
+            &roots(),
+        )
+        .expect("a block node lowers");
+        assert_eq!(
+            lowered,
+            ConstructedLoops {
+                switch_locations: vec![(&"outer", TransferId(0))],
+                ops: vec![DfirOp::Affine(affine::Op::For {
+                    iv: Val(0),
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(1),
+                    carried: Vec::new(),
+                    body: vec![block(Val(1))],
+                    dbg_name: Some("synthetic_root".to_owned()),
+                })],
+            }
+        );
+        assert_eq!(children[0].all, vec!["the loop's own"]);
+
+        // ⛔ A COMPONENT OUTSIDE THE FOUR SCANS NOTHING AND PROPAGATES NOTHING.
+        let mut vals = Values::default();
+        let mut children = head();
+        let lowered = construct_loops(
+            &mut vals,
+            DfirUnit::L3lu,
+            &switching,
+            &mut children,
+            &roots(),
+        )
+        .expect("a block node lowers");
+        assert!(lowered.switch_locations.is_empty());
+        assert!(children[0].all.is_empty());
+        assert_eq!(lowered.ops.len(), 1);
+    }
 
     /// 🎯 074/110 — ⛔⛔ A SOURCE ON THIS COMPONENT CONTRIBUTES ITS OWN POSITION EVEN WHEN A VIA IS
     /// WHAT SWITCHES: the mode comes from entry 056's first switching end, the POSITION from a plain
