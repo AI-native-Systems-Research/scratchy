@@ -905,6 +905,8 @@ impl<'a> VectorLoadOp<'a> {
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
                 | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::CompositeMemoryInterleave { .. }
+                | agen::Op::SetTransferMaskState { .. }
                 | agen::Op::Yield,
             )
             | DfirOp::Arith(_)
@@ -1138,6 +1140,8 @@ impl<'a> VectorStoreOp<'a> {
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
                 | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::CompositeMemoryInterleave { .. }
+                | agen::Op::SetTransferMaskState { .. }
                 | agen::Op::Yield,
             )
             | DfirOp::Arith(_)

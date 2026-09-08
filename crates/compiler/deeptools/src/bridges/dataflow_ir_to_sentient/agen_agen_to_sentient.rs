@@ -202,15 +202,14 @@ impl Consumed {
 /// - `llvm_unreachable("unsupported operation")` becomes the absence of a wildcard arm: unreachable
 ///   by the type rather than at runtime.
 ///
-/// # ⛔⛔ THE COMPONENT GATE IS `e384`'s AND IS NOT PORTED, SO THIS DISPATCH SEES EVERY UNIT
+/// # ⭐ THE COMPONENT GATE IS `e384`'s AND IT IS IN
 ///
 /// The reference reaches this function only for a unit whose component is one of
 /// `L0LU, L0SU, LXLU, LXSU, L3SU, L3LU` — `if (!is_any_of(comp, ...)) return;`
-/// (`AgenToSentient.cpp:174-176`), inside `e384_runOnOperation`, which is scheduled separately and
-/// unported. Until it lands, [`super::body`] hands this dispatch the `agen` ops of EVERY unit,
-/// including a compute one. That widens what the two `todo!` arms can fire on; it cannot widen what
-/// gets emitted, because the only emitting arm is the transfer and a transfer is a transfer on any
-/// component. The gate goes in with `e384`, in `e384`'s own anchor.
+/// (`AgenToSentient.cpp:174-176`). That gate is [`TransferComp::of`], applied by
+/// [`run_on_operation`] and carried to [`super::statement`], so this dispatch now sees the `agen` ops
+/// of a transfer unit only; an `agen` access on a compute unit is
+/// `VectorChainToSentientPESFP`'s and says so there.
 ///
 /// ⭐ `stmt` IS `op`'s ENCLOSING STATEMENT, and it is here because entry 036 asks a question about
 /// the OPERATION — `op->getResult(0)` and its users — which an `agen::Op` alone cannot answer.
@@ -272,6 +271,17 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
         // ── 12. `agen.symbolic_vector_store` (`AgenToSentient.cpp:154-161`) ──────────────────────
         agen::Op::SymbolicVectorStore { .. } => {
             super::agen_helper::lower_symbolic_vector_store_op(unit, unit.on.kind())
+        }
+
+        // ── not a candidate: the interleave and the mask state ───────────────────────────────────
+        //
+        // ⛔ NOT AMONG THE TWELVE THIS DISPATCH WALKS FOR (`AgenToSentient.cpp:29-52`) — the fusion
+        // passes over both, and `e384`'s steps after it are what lower them. This arm consumes the
+        // statement so the cursor advances; the transfers inside an interleave's REGION are not
+        // reached either, and `e271`'s `todo!` in [`run_on_operation`] fires before anything the
+        // region holds could be dropped.
+        agen::Op::CompositeMemoryInterleave { .. } | agen::Op::SetTransferMaskState { .. } => {
+            Consumed(1)
         }
 
         // ── not a candidate: a terminator (`agen.yield`) ─────────────────────────────────────────
@@ -686,7 +696,8 @@ pub fn insert_copy_and_add_stmts_helper<O: LoopBodyOp>(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Consumed, ExtractIdx};
+    use super::{Consumed, ExtractIdx, TransferComp};
+    use crate::units::DfirUnit;
 
     /// 🎯 `extract_idx` STARTS AT ZERO AND THE FIRST ISSUE HANDS OUT ZERO.
     ///
@@ -729,6 +740,23 @@ mod unit_tests {
     #[test]
     fn one_transfer_consumes_one_op() {
         assert_eq!(Consumed(1).ops(), 1);
+    }
+
+    /// 🎯 SIX COMPONENTS ARE THIS PASS'S AND NOBODY ELSE IS — `is_any_of(comp, L0LU, L0SU, LXLU,
+    /// LXSU, L3SU, L3LU)` (`AgenToSentient.cpp:174-176`). A compute unit answering `Some` would have
+    /// its `agen` accesses lowered twice, here and in `VectorChainToSentientPESFP`.
+    #[test]
+    fn only_the_six_transfer_components_belong_to_this_pass() {
+        assert_eq!(TransferComp::of(DfirUnit::Lxlu), Some(TransferComp::Lxlu));
+        assert_eq!(TransferComp::of(DfirUnit::L0lu), Some(TransferComp::L0lu));
+        assert_eq!(TransferComp::of(DfirUnit::L0su), Some(TransferComp::L0su));
+        assert_eq!(TransferComp::of(DfirUnit::Lxsu), Some(TransferComp::Lxsu));
+        assert_eq!(TransferComp::of(DfirUnit::L3lu), Some(TransferComp::L3lu));
+        assert_eq!(TransferComp::of(DfirUnit::L3su), Some(TransferComp::L3su));
+        assert_eq!(TransferComp::of(DfirUnit::Pe), None);
+        assert_eq!(TransferComp::of(DfirUnit::Sfp), None);
+        assert_eq!(TransferComp::of(DfirUnit::Lx), None);
+        assert_eq!(TransferComp::of(DfirUnit::Hbm), None);
     }
 }
 
@@ -1064,4 +1092,171 @@ mod transfer_tests {
              }\n"
         );
     }
+}
+
+use crate::arch::IsaGen;
+use crate::islands::dataflow_ir::dialects::{regions, vectorchain};
+use crate::islands::sentient::ProgramUnits;
+use crate::islands::sentient::dialects::sentient as sen;
+use crate::units::DfirUnit;
+
+/// THE SIX COMPONENTS THIS PASS LOWERS FOR AT ALL — `is_any_of(comp, L0LU, L0SU, LXLU, LXSU, L3SU,
+/// L3LU)` (`AgenToSentient.cpp:174-176`), over the GENERIC component `getUnitType` collapses a
+/// `SenComponents` to. Anything else is the walk's `return`, which is why [`TransferComp::of`]
+/// answers with an `Option` rather than a bool: the LDCVTI step needs to know it is `LXLU`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransferComp {
+    /// `L0LU`.
+    L0lu,
+    /// `L0SU`.
+    L0su,
+    /// `LXLU`.
+    Lxlu,
+    /// `LXSU`.
+    Lxsu,
+    /// `L3LU`.
+    L3lu,
+    /// `L3SU`.
+    L3su,
+}
+
+impl TransferComp {
+    /// `getUnitType(unit.getUnits()[0].getDefiningOp<GetUnitOp>())`, gated — ⛔ NO WILDCARD, so a
+    /// component added to [`DfirUnit`] must say whether this pass owns its transfers.
+    pub(super) const fn of(unit: DfirUnit) -> Option<Self> {
+        match unit {
+            DfirUnit::L0lu => Some(Self::L0lu),
+            DfirUnit::L0su => Some(Self::L0su),
+            DfirUnit::Lxlu => Some(Self::Lxlu),
+            DfirUnit::Lxsu => Some(Self::Lxsu),
+            DfirUnit::L3lu => Some(Self::L3lu),
+            DfirUnit::L3su => Some(Self::L3su),
+            DfirUnit::Sfp
+            | DfirUnit::Pe
+            | DfirUnit::PtRow(_)
+            | DfirUnit::Lx
+            | DfirUnit::Hbm
+            | DfirUnit::L0
+            | DfirUnit::Constant
+            | DfirUnit::SfpState
+            | DfirUnit::PeState
+            | DfirUnit::SfpRing
+            | DfirUnit::LxVirtualIbr
+            | DfirUnit::CrossPtnLink => None,
+        }
+    }
+}
+
+/// THE PASS ITSELF: gate, LDCVTI, fuse, interleave, mask state, `set_send_dst` cleanup — per unit.
+///
+/// ⛔⛔ FOUR OF THE SIX STEPS HAVE UNPORTED CALLEES (e318, e271, e218, e220) — one `todo!` each over
+/// the counted input that would reach it. The step that lowers today is the fusion, e382.
+///
+/// ⛔ THE GATE REACHES [`super::body`] RATHER THAN SKIPPING THE UNIT: the reference's `return` skips
+/// one pass of seventy-six, while this spine lowers every dialect of a unit in one walk.
+///
+/// Replaces: e384_runOnOperation
+pub(super) fn run_on_operation<A: Arch>(
+    input: &dfir::Program<A>,
+    bound: &Bound,
+    consts: &Consts,
+) -> ProgramUnits<A> {
+    let mut lowered = input.units.iter().map(|unit| {
+        let comp = TransferComp::of(unit.on.kind());
+
+        // ── the LDCVTI pre-pass, LXLU at SEN1P5 and above (`:178-198`) ───────────────────────────
+        //
+        // ⛔ THE ANCHOR IS A `vectorchain.binary` WHOSE OPERATOR IS `mul`, NOT THE ISLAND'S
+        // `vectorchain.multiply` — *"LDCVTI patterns are currently the only patterns involving
+        // vectorchain.multiply"* names the operator, and the walk is over `BinaryOp` (`:183-189`).
+        // ⛔ AND THE CONVERGENCE LOOP RE-WALKS FROM THE TOP after each rewrite, so a count of
+        // candidates is what it converges on, not the one it found first.
+        if matches!(comp, Some(TransferComp::Lxlu)) && A::GEN >= IsaGen::Sen1p5 {
+            let muls = count(&unit.body, &|op| {
+                matches!(
+                    op,
+                    DfirOp::VectorChain(vectorchain::Op::Binary {
+                        binary_op: vectorchain::BinaryOp::Mul,
+                        ..
+                    })
+                )
+            });
+            if muls > 0 {
+                todo!(
+                    "e318_lowerLDCVTIPattern: {muls} vectorchain.binary mul anchor(s) on an LXLU \
+                     unit at {:?}",
+                    A::GEN
+                );
+            }
+        }
+
+        // ── the load/store fusion, e382 (`:213-216`) ────────────────────────────────────────────
+        let mut local = bound.clone();
+        let out = super::body(unit, &mut local, consts, comp);
+
+        // ⛔ THE THREE STEPS BELOW ARE INSIDE THE GATE, so a unit this pass does not own reaches
+        // none of them — `comp.is_some()` is the reference's `return` restated.
+        if comp.is_some() {
+            // ── the interleaves (`:218-231`), which need the transfers already lowered ──────────
+            let interleaves = count(&unit.body, &|op| {
+                matches!(op, DfirOp::Agen(agen::Op::CompositeMemoryInterleave { .. }))
+            });
+            if interleaves > 0 {
+                todo!(
+                    "e271_lowerCompositeMemoryInterleaveOp: {interleaves} \
+                     agen.composite_memory_interleave on {:?}",
+                    unit.on.kind()
+                );
+            }
+
+            // ── the mask states (`:233-244`) ────────────────────────────────────────────────────
+            let masks = count(&unit.body, &|op| {
+                matches!(op, DfirOp::Agen(agen::Op::SetTransferMaskState { .. }))
+            });
+            if masks > 0 {
+                todo!(
+                    "e218_lowerSetTransferMaskStateOp: {masks} agen.set_transfer_mask_state -> \
+                     sentient.samv on {:?}",
+                    unit.on.kind()
+                );
+            }
+
+            // ── the redundant `set_send_dst` cleanup (`:246-247`) ───────────────────────────────
+            //
+            // ⛔ OVER THE LOWERED OPS, NOT THE INPUT — `set_send_dst` is a `sentient` op this pass
+            // emitted, and the cleanup collapses a unit's identical ones into one at the top
+            // (`Helper.cpp:4084-4123`). Its own `getArch() < RCUDD1A_ISA` guard is vacuous here:
+            // [`IsaGen`] has no generation below it.
+            if out
+                .body
+                .iter()
+                .any(|op| matches!(op, SenOp::Sentient(sen::Op::SetSendDst { .. })))
+            {
+                todo!(
+                    "e220_cleanupTriviallyRedundantSetSendDestination: sentient.set_send_dst on {:?}",
+                    unit.on.kind()
+                );
+            }
+        }
+        out
+    });
+    // ⛔ NON-EMPTY BY THE TYPE on both rungs — see [`ProgramUnits`].
+    let head = lowered
+        .next()
+        .expect("the rung below's units are non-empty");
+    ProgramUnits::of(head, lowered.collect())
+}
+
+/// HOW MANY OPS OF A KIND ONE UNIT HOLDS, PREORDER AND DESCENDING INTO EVERY REGION —
+/// `unit.walk<WalkOrder::PreOrder>`.
+fn count(ops: &[DfirOp], pick: &impl Fn(&DfirOp) -> bool) -> usize {
+    ops.iter()
+        .map(|op| {
+            usize::from(pick(op))
+                + regions(op)
+                    .iter()
+                    .map(|region| count(region, pick))
+                    .sum::<usize>()
+        })
+        .sum()
 }

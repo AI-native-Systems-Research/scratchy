@@ -637,8 +637,12 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             dfir_op::agen::Op::SymbolicVectorLoad { .. } => Some(AgenOpKind::SymbolicVectorLoad),
             dfir_op::agen::Op::SymbolicVectorStore { .. } => Some(AgenOpKind::SymbolicVectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
-            // The region terminator is not a transfer.
-            dfir_op::agen::Op::Yield => None,
+            // The region terminator is not a transfer, and neither the interleave nor the mask
+            // state is one of the twelve classes `findCandidateForLowering` is instantiated with —
+            // `e384_runOnOperation` finds those two with its own walks.
+            dfir_op::agen::Op::Yield
+            | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
+            | dfir_op::agen::Op::SetTransferMaskState { .. } => None,
         },
         DfirOp::Arith(_)
         | DfirOp::Scf(_)
@@ -733,6 +737,8 @@ impl AgenLoad {
                 dfir_op::agen::Op::VectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
+                | dfir_op::agen::Op::SetTransferMaskState { .. }
                 | dfir_op::agen::Op::Yield,
             )
             | DfirOp::Arith(_)
@@ -4855,9 +4861,10 @@ pub fn check_basic_conditions(op: CheckedOp<'_>) -> BasicConditions {
 /// AN `agen.composite_memory_interleave`, AS THE CHECK READS IT — its `granularity` attribute and the
 /// operations in its region.
 ///
-/// ⭐ A STRUCT FOR THE SAME REASON AS [`IndirectMemView`]: the op is not in either island — the region
-/// it carries holds SentientIR transfers by the time this runs, while the op itself is `agen` — and
-/// what the check reads off it is exactly these two things.
+/// ⭐ A STRUCT FOR THE SAME REASON AS [`IndirectMemView`]: the region it carries holds SentientIR
+/// transfers by the time this runs, while the DataflowIR op
+/// ([`agen::Op::CompositeMemoryInterleave`](crate::islands::dataflow_ir::dialects::agen::Op::CompositeMemoryInterleave))
+/// holds DataflowIR ones — and what the check reads off it is exactly these two things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryInterleave<'a> {
     /// `getGranularity()` — [`None`] when the op carries no `granularity` attribute, which is the

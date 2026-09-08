@@ -732,7 +732,7 @@ than the 8-parameter `e028`, on `e358`'s optional `extract_op` test (`:2006`) ag
 
 ## Progress
 
-`208/384 ported; 208/384 audited`
+`209/384 ported; 209/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -1634,14 +1634,53 @@ and `AccessDetailsAffine::initialize` refuses them (a symbolic subscript is a ru
 what `AccessDetailsSymbolic::initialize` at `:855-897` exists for). Entry 382's dispatch grew rows 11
 and 12, and took the enclosing statement as a parameter so entry 036 can ask about the operation.
 
-⛔ NINE OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES AND `agen.composite_memory_interleave` HAVE
-NO ISLAND OP. 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
+⛔ NINE OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES HAVE NO ISLAND OP (the interleave since
+gained one, with entry 384). 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
 `sentient.receive_and_store` whose only readable state is the mark) and 211 a `MemoryInterleave` (the
 `granularity` attribute and the region's ops), on the precedent of `IndirectMemView` and
 `UniformizeSource`; both matches are total and neither invents an op. 211'S IDENTITY TEST IS THE OP
 **NAME** (`:361`, `:380-381`), not the attributes, so a region holding a `load_and_send` beside a
 `receive_and_store` with matching burst and count is still refused — and its granularity default is
 the maximum and is never checked, so `l3BurstSize` itself is legal and 0 is not.
+
+⭐ LEVEL 10, ENTRY 384 — THE PASS ITSELF, and it is the first unit that puts the component gate in.
+`AgenToSentient.cpp:174-176` returns for any unit outside `L0LU, L0SU, LXLU, LXSU, L3SU, L3LU`, and
+`agen_agen_to_sentient::run_on_operation` is now what `program()` calls for the per-unit walk, so
+entry 382's dispatch sees the `agen` ops of a transfer unit only. The gate is a PARAMETER of
+`body`/`statement` rather than a `continue`, because the reference's `return` skips one pass of
+seventy-six while this spine lowers every dialect of a unit in one walk; an `agen` access on a PE or
+SFP unit now reaches a `todo!` naming `VectorChainToSentientPESFP`'s `VectorLoadOpLowering`, which
+owns it. Measured against the golden corpus, no unit outside `l3lu`/`lxlu`/`lxsu` carries an `agen`
+op, so the gate changes nothing that is emitted today.
+
+⛔ FOUR OF ITS SEVEN STEPS SIT ON UNPORTED CALLEES, each a counted `todo!` over the input that would
+reach it: the LDCVTI pre-pass (`:178-198`, `e318`, LXLU at SEN1P5 and above, anchored on a
+`vectorchain.binary` whose operator is `mul` — NOT `vectorchain.multiply`, which is what the comment
+at `:180` says and the walk at `:183-189` contradicts), the interleave sweep (`:218-231`, `e271`), the
+mask-state sweep (`:233-244`, `e218`) and the `set_send_dst` cleanup (`:246-247`, `e220`, whose own
+`getArch() < RCUDD1A_ISA` early return is vacuous here — `IsaGen` has no lower generation). Only the
+fusion (`e382`) lowers. The LDCVTI arm is inert in production today because the one caller of
+`lower()` is `Dd2`.
+
+⛔ THE ISLAND GREW TWO MORE OPS, for steps 5 and 6. `agen.composite_memory_interleave`
+(`Agen.td:982-1039`) and `agen.set_transfer_mask_state` (`:1041-1116`) had no island variant, which
+would have made both sweeps inputless. The interleave carries `granularity: Option<Elements>` (absent
+is the hardware maximum, not zero) and a region of DataflowIR transfers — distinct from
+`agen_helper::MemoryInterleave`, whose region is the LOWERED SentientIR the check reads. The mask
+state carries `slices: Vec<SliceMask>` for `slice_mask_map`, so `(0)`, `(1)`, `(A)` and `(A|B)` are the
+four productions the grammar has (`:1060-1073`) and a fifth is unspellable, with `num_slices` derived
+as `slices.len()` rather than an attribute that could disagree; its `maskA`/`maskB` patterns are the
+two optional `i32` arrays zipped into `MaskPattern`, and `MaskId` derives the letter rather than
+storing it. Both `emit` arms reproduce the vendor's rendered text
+(`comp_mem_interleave.mlir:309`, `set_transfer_mask_state.mlir:24`). Declaring them forced an answer
+out of nine total matches: `is_data_transfer` (interleave TRUE, mask state FALSE — the fourteenth
+class, outside the nineteen), `agen_op_kind`/`AgenLoad::of`/`VectorLoadOp::of`/`VectorStoreOp::of`
+None, `is_memory_op` false, `TpmvManager::run` unsupported, `vector_type_of` None (the chain names the
+two accesses only), `constructChunkAndShuffleInfo` no user walk, and
+`AccessDetailsAffine::initialize` `UnsupportedOperation`. Entry 382's dispatch consumes both without
+lowering: they are not among the twelve classes `findCandidateForLowering` walks for
+(`AgenToSentient.cpp:29-52`), and `e271`'s `todo!` fires before anything an interleave's region holds
+could be dropped.
 
 
 ## Level 0
@@ -2442,8 +2481,8 @@ the maximum and is never checked, so `l3BurstSize` itself is legal and 0 is not.
 
 ## Level 10
 
-- [ ] **PORT 384/384** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, 81 lines
-- [ ] **AUDIT 384/384** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, line by line against the C++
+- [x] **PORT 384/384** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, 81 lines
+- [x] **AUDIT 384/384** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, line by line against the C++
 
 ## Excluded — 106 definitions, with the reason for each
 

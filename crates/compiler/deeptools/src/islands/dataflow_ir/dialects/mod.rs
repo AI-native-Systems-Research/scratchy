@@ -306,6 +306,11 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.push(transfer.dst);
                 index_operands(&transfer.dst_indices, &mut reads);
             }
+            // ⛔ THE INTERLEAVE HAS NO OPERANDS AT ALL — granularity is an attribute and the
+            // transfers it splits are in its region (`Agen.td:1030-1031`).
+            agen::Op::CompositeMemoryInterleave { .. } => {}
+            // ⭐ ONE OPERAND, THE MASK VALUE. The slice map and the patterns are attributes.
+            agen::Op::SetTransferMaskState { mask_value, .. } => reads.push(*mask_value),
         },
         // ⭐ `$base` AND `$indices`, WHICH IS ALL A PLAIN ACCESS HAS. Same operand list as the
         // `agen` pair above; what it lacks is the two attributes, not the operands.
@@ -472,12 +477,15 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::Opaque(_) => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. } | agen::Op::SymbolicVectorLoad { result, .. } => {
+            agen::Op::VectorLoad { result, .. }
+            | agen::Op::SymbolicVectorLoad { result, .. }
+            | agen::Op::SetTransferMaskState { result, .. } => {
                 vec![*result]
             }
             agen::Op::VectorStore { .. }
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::Yield
+            | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
@@ -672,6 +680,9 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 places.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut places);
             }
+            // ⛔ ARM FOR ARM WITH [`operands`]: the interleave names no value, the mask state names one.
+            agen::Op::CompositeMemoryInterleave { .. } => {}
+            agen::Op::SetTransferMaskState { mask_value, .. } => places.push(mask_value),
         },
         // ⭐ ARM FOR ARM WITH [`operands`] — see the note there.
         Op::Vector(op) => match op {
@@ -815,12 +826,15 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::Opaque { .. } => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. } | agen::Op::SymbolicVectorLoad { result, .. } => {
+            agen::Op::VectorLoad { result, .. }
+            | agen::Op::SymbolicVectorLoad { result, .. }
+            | agen::Op::SetTransferMaskState { result, .. } => {
                 vec![result]
             }
             agen::Op::VectorStore { .. }
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::Yield
+            | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
@@ -949,6 +963,7 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         }) => vec![body.as_slice(), else_body.as_slice()],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
+        Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body.as_slice()],
         // ⛔⛔ AS MANY REGIONS AS IT HAS UNIT LISTS — `VariadicRegion<AnyRegion>:$regions`
         // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
         // `flatten` declines when `op_.getNumRegions() == num_of_regions`
@@ -998,6 +1013,7 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         }) => vec![body, else_body],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
+        Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body],
         // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
         Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
             regions.iter_mut().map(|region| &mut region.body).collect()
@@ -1400,6 +1416,15 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 index_operands_mut(&mut transfer.dst_indices, &mut operands);
                 block_args.push(&mut transfer.load_iv);
                 regions.push(&mut transfer.body);
+            }
+            // ⛔ A REGION AND NOTHING ELSE, and it binds NO block argument: the transfers inside carry
+            // their own `load_iv` (`Agen.td:1031` — a bare `SizedRegion<1>`).
+            agen::Op::CompositeMemoryInterleave { body, .. } => regions.push(body),
+            agen::Op::SetTransferMaskState {
+                result, mask_value, ..
+            } => {
+                operands.push(mask_value);
+                results.push(result);
             }
         },
         // ⭐ NO REGION AND NO BLOCK ARGUMENT — arm for arm with [`operands_mut`] and [`results_mut`].
@@ -1951,6 +1976,14 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, &mut transfer.dst));
                 index_vals_mut(&mut transfer.dst_indices, &mut vals);
                 vals.push((Role::BlockArg, &mut transfer.load_iv));
+            }
+            // ⭐ ARM FOR ARM WITH [`parts_mut`], minus the region this one does not visit.
+            agen::Op::CompositeMemoryInterleave { .. } => {}
+            agen::Op::SetTransferMaskState {
+                result, mask_value, ..
+            } => {
+                vals.push((Role::Operand, mask_value));
+                vals.push((Role::Result, result));
             }
         },
         // ⭐ ARM FOR ARM WITH [`parts_mut`]; a plain access binds no block argument.

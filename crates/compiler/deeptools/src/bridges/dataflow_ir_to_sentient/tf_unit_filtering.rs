@@ -353,11 +353,12 @@ pub fn remove_cores_corelets_folds_from_program_unit(
 /// # ⭐ NINETEEN CLASSES, ELEVEN OF WHICH THIS ISLAND DECLARES
 ///
 /// The six `dataflow` ones all exist here. Of the thirteen `agen` ones, the island declares
-/// `vector_load`, `vector_store`, `composite_load_and_store` and — since entries 374/375 needed an
-/// input — the two symbolic vectors. The other eight (`composite_load`, `composite_store`, the four
-/// indirect composites, the two indirect vectors and `composite_memory_interleave`) are listed in
-/// the match below as comments rather than invented: the brief's rule to grow the island is about a
-/// function's *input* (`AGENT-BRIEF.md:57`), and this function's input is any op at all.
+/// `vector_load`, `vector_store`, `composite_load_and_store`, the two symbolic vectors (entries
+/// 374/375) and `composite_memory_interleave` (entry 384's sweep). The other seven
+/// (`composite_load`, `composite_store`, the four indirect composites and the two indirect vectors)
+/// are listed in the match below as comments rather than invented: the brief's rule to grow the
+/// island is about a function's *input* (`AGENT-BRIEF.md:57`), and this function's input is any op at
+/// all.
 ///
 /// # ⛔ NO WILDCARD, SO A NEW ISLAND OP CANNOT DEFAULT TO "NOT A TRANSFER"
 ///
@@ -378,21 +379,22 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::Receive { .. }
             | dataflow::Op::Opaque(_),
         ) => true,
-        // Five of the thirteen `agen` classes. The eight the island does not declare —
+        // Six of the thirteen `agen` classes. The seven the island does not declare —
         // `composite_load`, `composite_store`, `composite_indirect_load_and_store`,
         // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load`,
-        // `indirect_vector_store`, `composite_memory_interleave` — belong on this side of the answer
-        // when they land.
+        // `indirect_vector_store` — belong on this side of the answer when they land.
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
             | agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
-        // `agen.yield` terminates a transfer's region and is not one; the view and unit binders,
-        // `program_unit` and every arith/affine/scf/vectorchain op are not in the `isa<>` list.
-        DfirOp::Agen(agen::Op::Yield)
+        // `agen.yield` terminates a transfer's region and is not one; `agen.set_transfer_mask_state`
+        // writes a unit's mask state and is the fourteenth class, outside the `isa<>` list; the view
+        // and unit binders, `program_unit` and every arith/affine/scf/vectorchain op are not in it.
+        DfirOp::Agen(agen::Op::Yield | agen::Op::SetTransferMaskState { .. })
         | DfirOp::Dataflow(
             dataflow::Op::GetUnit { .. }
             | dataflow::Op::GetLocalUnit { .. }

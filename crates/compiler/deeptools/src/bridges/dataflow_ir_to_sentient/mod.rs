@@ -84,7 +84,7 @@ use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
-use crate::islands::sentient::{self, ProgramUnit, ProgramUnits};
+use crate::islands::sentient::{self, ProgramUnit};
 use crate::model::Model;
 use crate::units::DfirUnit;
 use crate::workload::Workload;
@@ -115,7 +115,7 @@ pub fn lower<A: Arch, M: Model, W: Workload>(
 /// view's own SSA value has no counterpart at this rung — what survives is WHICH MEMORY it viewed
 /// and WHERE it started. Keeping a `view -> view` map would leave the emitter reaching for a value
 /// that is never bound.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Bound {
     /// Old `get_unit` value -> the renumbered one.
     units: HashMap<Val, Val>,
@@ -235,29 +235,20 @@ fn program<A: Arch, M: Model, W: Workload>(
         }
     }
 
-    let mut units = input.units.iter().map(|unit| {
-        // ⛔ VIEWS AND CONSTANTS BOUND INSIDE A UNIT'S BODY TOO. The smallest program puts an
-        // `arith.constant` and a `get_logical_memory_view` inside three of its four units, not in
-        // the program preamble, so the walk has to record them per unit as well.
-        let mut local = Bound {
-            units: bound.units.clone(),
-            view_of: bound.view_of.clone(),
-            view_start: bound.view_start.clone(),
-            carried: bound.carried.clone(),
-            folded: bound.folded.clone(),
-        };
-        body(unit, &mut local, &consts)
-    });
+    // ⭐⭐ THE PER-UNIT WALK IS THE PASS'S OWN — `AgenToSentient`'s `runOnOperation` walks the module
+    // for `dataflow.program_unit`s, gates on the component and runs its six steps over each. It
+    // clones [`Bound`] per unit because views and constants are bound INSIDE a unit's body too: the
+    // smallest program puts an `arith.constant` and a `get_logical_memory_view` inside three of its
+    // four units, not in the program preamble.
     // ⛔ NON-EMPTY BY THE TYPE, and the input's is too — `ProgramUnits` on both rungs makes "a
     // program with no units" unconstructible, which is what `dbo-adapt-scheduler-dfir found no
     // program to compile` was.
-    let head = units.next().expect("the rung below's units are non-empty");
-    let rest: Vec<_> = units.collect();
+    let units = agen_agen_to_sentient::run_on_operation(input, &bound, &consts);
 
     sentient::Program {
         name: input.name,
         preamble,
-        units: ProgramUnits::of(head, rest),
+        units,
         bound: core::marker::PhantomData,
     }
 }
@@ -342,10 +333,14 @@ fn mint_constants<A: Arch>(
 /// `dataflow.send` is ONE `sentient.load_and_send`; a `dataflow.receive` followed by an
 /// `agen.vector_store` is ONE `sentient.receive_and_store`. So the walk consumes a window, not an op,
 /// and an op-by-op `match` would emit a load with no destination and a send with no source.
+/// ⛔ `comp` IS `e384`'s COMPONENT GATE, and it is a parameter because this walk lowers EVERY dialect
+/// of a unit while the reference's gate skips one pass of seventy-six — see
+/// [`agen_agen_to_sentient::run_on_operation`].
 fn body<A: Arch>(
     unit: &dfir::ProgramUnit<A>,
     bound: &mut Bound,
     consts: &Consts,
+    comp: Option<agen_agen_to_sentient::TransferComp>,
 ) -> ProgramUnit<A> {
     let mut out: Vec<SenOp> = Vec::new();
     // ⛔ ONE COUNTER PER UNIT, minted here because that is the scope the reference gives it — a local
@@ -354,7 +349,7 @@ fn body<A: Arch>(
     let mut extract = ExtractIdx::default();
     let mut i = 0;
     while i < unit.body.len() {
-        i += statement(&unit.body[i..], unit, &mut extract, bound, consts, &mut out);
+        i += statement(&unit.body[i..], unit, &mut extract, bound, consts, comp, &mut out);
     }
     ProgramUnit {
         on: unit.on.clone(),
@@ -373,6 +368,7 @@ fn statement<A: Arch>(
     extract: &mut ExtractIdx,
     bound: &mut Bound,
     consts: &Consts,
+    comp: Option<agen_agen_to_sentient::TransferComp>,
     out: &mut Vec<SenOp>,
 ) -> usize {
     match rest {
@@ -392,12 +388,21 @@ fn statement<A: Arch>(
         // [`agen_agen_to_sentient::fuse_load_or_store_chain_ops`].
         // ⛔ NO PER-KIND ARM HERE. Splitting the twelve across two files is how the branch ORDER — a
         // real part of a `dyn_cast` chain — gets lost.
-        [stmt @ DfirOp::Agen(op), ..] => {
-            agen_agen_to_sentient::fuse_load_or_store_chain_ops(
+        // ⛔⛔ AND THE GATE DECIDES WHETHER THIS PASS OWNS THE ACCESS AT ALL. `AgenToSentient`
+        // returns before its dispatch for anything outside the six transfer components
+        // (`AgenToSentient.cpp:174-176`), which leaves an `agen.vector_load` on a PE or SFP unit to
+        // `VectorChainToSentientPESFP`'s own `VectorLoadOpLowering` — a different pass, unported.
+        [stmt @ DfirOp::Agen(op), ..] => match comp {
+            Some(_) => agen_agen_to_sentient::fuse_load_or_store_chain_ops(
                 stmt, op, unit, extract, bound, consts, out,
             )
-            .ops()
-        }
+            .ops(),
+            None => todo!(
+                "VectorChainToSentientPESFP's VectorLoadOpLowering/VectorStoreOpLowering: an \
+                 `agen` access on {:?}, which AgenToSentient's component gate does not own",
+                unit.on.kind()
+            ),
+        },
 
         // ── the `affine` ops ─────────────────────────────────────────────────────────────────────
         // ⛔ NO WILDCARD: a fifth `affine` op must be a build error, not an inherited default.

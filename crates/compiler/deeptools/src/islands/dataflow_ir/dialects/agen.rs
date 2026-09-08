@@ -1,12 +1,14 @@
 //! `Agen.td` — THE ADDRESS GENERATOR'S ACCESSES AND COMPOSITE TRANSFERS.
 //!
-//! The dialect declares fifteen operations. Four of the six here are the ones an emitted program
+//! The dialect declares fifteen operations. Four of the eight here are the ones an emitted program
 //! contains; the two symbolic accesses are the input of the `AgenToSentient` lowerings that this
 //! crate ports (entries 374 and 375), which is why they are spelled even though our own producer
-//! emits the affine pair — see [`Op::SymbolicVectorLoad`].
+//! emits the affine pair — see [`Op::SymbolicVectorLoad`]. The interleave and the mask state are the
+//! input of the two sweeps `e384_runOnOperation` runs after the fusion (entries 271 and 218).
 
 use std::fmt::Write as _;
 
+use crate::arch::Elements;
 use crate::islands::dataflow_ir::dialects::{Index, Val};
 use crate::islands::dataflow_ir::print;
 use crate::islands::dataflow_ir::ty::{
@@ -53,6 +55,63 @@ pub struct CompositeTransfer {
     pub store_time_addr_map: AffineMap,
     /// The region, entered once per time step.
     pub body: Vec<super::Op>,
+}
+
+/// ONE MASK PATTERN — `(unmasked = N, masked = M)`, repeated to fill the slice it is applied to.
+///
+/// ⛔ THE SUM MUST DIVIDE THE SLICE. *"The sum of num_unmasked_elements and num_masked elements at a
+/// given index must evenly divide into the number of elements in a slice"* (`Agen.td:1085-1086`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskPattern {
+    /// `num_unmasked_elements[i]` — consecutive elements the mask leaves alone.
+    pub unmasked: Elements,
+    /// `num_masked_elements[i]` — consecutive elements it masks.
+    pub masked: Elements,
+}
+
+/// WHICH MASK — `A` IS THE FIRST ONE. *"Lettering starts with A and continues sequentially for each
+/// mask thereafter"* (`Agen.td:1064-1065`), so this is an index into
+/// [`Op::SetTransferMaskState::masks`] and the letter is derived from it, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MaskId(pub u8);
+
+impl MaskId {
+    /// `A`, `B`, … — the spelling `slice_mask_map` and the `maskX` attribute names share.
+    #[must_use]
+    pub const fn letter(self) -> char {
+        b'A'.saturating_add(self.0) as char
+    }
+}
+
+/// WHAT ONE SLICE OF `slice_mask_map` CARRIES — `(0)`, `(1)`, `(A)` or `(A|B)`.
+///
+/// ⛔⛔ A STRING IS WHAT THE REFERENCE CARRIES AND IT IS NOT WHAT THIS ISLAND MAY CARRY.
+/// `slice_mask_map = "(A)(A)(A)(A)(A)(A|B)(1)(1)"` is a closed grammar with four productions
+/// (`Agen.td:1060-1073`); as an `enum` a slice cannot spell a fifth, and the slice COUNT is
+/// `slices.len()` rather than a `num_slices` attribute that could disagree with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceMask {
+    /// `(0)` — no masking.
+    Unmasked,
+    /// `(1)` — fully masked.
+    Full,
+    /// `(A)` — masked by one pattern.
+    By(MaskId),
+    /// `(A|B)` — masked by the OR of two. The only combination the reference supports.
+    Or(MaskId, MaskId),
+}
+
+impl SliceMask {
+    /// This slice as `slice_mask_map` spells it, parentheses included.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        match self {
+            Self::Unmasked => "(0)".to_owned(),
+            Self::Full => "(1)".to_owned(),
+            Self::By(mask) => format!("({})", mask.letter()),
+            Self::Or(lhs, rhs) => format!("({}|{})", lhs.letter(), rhs.letter()),
+        }
+    }
 }
 
 /// ONE `agen` OPERATION.
@@ -176,6 +235,47 @@ pub enum Op {
         /// The view's type.
         view_ty: MemRef,
         /// The vector's type.
+        ty: Vector,
+    },
+
+    /// `agen.composite_memory_interleave {granularity = 64 : i32} { .. }`
+    /// (`Agen.td:982-1039`, `dcc/test/Conversion/AgenToSentient/comp_mem_interleave.mlir:309`).
+    ///
+    /// ⭐ IT SPLITS THE BURST OF EVERY TRANSFER IN ITS REGION so the region's transfers alternate:
+    /// A@64, B@64, A@16, B@16 out of two A@80/B@80. `e271_lowerCompositeMemoryInterleaveOp` is the
+    /// lowering and `e384_runOnOperation`'s fourth step is the sweep that finds these.
+    ///
+    /// ⛔ `granularity` ABSENT IS THE HARDWARE MAXIMUM, NOT ZERO, and a granularity above the
+    /// region's own burst is read DOWN to that burst — *"because some of the upstream components may
+    /// insert CompositeMemoryInterleaveOps without knowing the burst of the contained operations"*.
+    CompositeMemoryInterleave {
+        /// `granularity` — how much of each transfer's burst goes before the next transfer's.
+        granularity: Option<Elements>,
+        /// The composite transfers it interleaves. Its terminator is implicit
+        /// (`ImplicitAgenTerminator`), so no [`Op::Yield`] is written here.
+        body: Vec<super::Op>,
+    },
+
+    /// `%m = agen.set_transfer_mask_state mask_value(%c0) {num_slices = 8 : i32, slice_mask_map =
+    /// "(A)(A)(A)(A)(A)(A|B)(1)(1)", maskA = "(unmasked = 8 : i32, masked = 8 : i32)", ..} : index,
+    /// vector<128xi8>` (`Agen.td:1041-1116`,
+    /// `dcc/test/Conversion/AgenToSentient/set_transfer_mask_state.mlir:24`).
+    ///
+    /// ⭐ IT IS THE UNIT'S MASK STATE, NOT A VALUE A COMPUTE READS: *"collects information from
+    /// various mask patterns and forms one final mask that will be applied to transfers for the given
+    /// unit"*. `e218_lowerSetTransferMaskStateOp` turns it into `sentient.samv`.
+    SetTransferMaskState {
+        /// The vector it binds.
+        result: Val,
+        /// `mask_value` — the value written over the masked elements. An `index` operand.
+        mask_value: Val,
+        /// `slice_mask_map`, one entry per slice; `num_slices` IS this length.
+        slices: Vec<SliceMask>,
+        /// The `maskA`, `maskB`, … patterns in order — the two optional `i32` arrays zipped, since
+        /// *"the number of consecutive unmasked elements for each mask is provided in an ordered
+        /// list"* and a `MaskId` indexes this.
+        masks: Vec<MaskPattern>,
+        /// The result's type.
         ty: Vector,
     },
 }
@@ -334,6 +434,58 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::affine_map(&access_order(view_ty.shape.len())),
                 print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
+                print::vector(*ty)
+            );
+        }
+        // ⛔ THE ATTRIBUTE DICTIONARY IS PRINTED EVEN WHEN EMPTY — `agen.composite_memory_interleave
+        // { } {` is how the vendor's own IR writes an absent granularity
+        // (`comp_mem_interleave.mlir:309`), and the region follows it as a second brace pair.
+        Op::CompositeMemoryInterleave { granularity, body } => {
+            let _ = writeln!(
+                out,
+                "agen.composite_memory_interleave {} {{",
+                granularity.map_or_else(
+                    || "{}".to_owned(),
+                    |grain| format!("{{granularity = {} : i32}}", grain.0)
+                )
+            );
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            out.push_str("}\n");
+        }
+        Op::SetTransferMaskState {
+            result,
+            mask_value,
+            slices,
+            masks,
+            ty,
+        } => {
+            let map: String = slices.iter().map(|slice| slice.spelling()).collect();
+            // ⭐ ONE `maskX` ATTRIBUTE PER PATTERN, NAMED BY ITS LETTER — the prefix the op's own
+            // `getMaskPrefixAttrStrName()` returns (`Agen.td:1110`).
+            let patterns: String = masks
+                .iter()
+                .enumerate()
+                .map(|(i, pattern)| {
+                    format!(
+                        ", mask{} = \"(unmasked = {} : i32, masked = {} : i32)\"",
+                        MaskId(u8::try_from(i).unwrap_or(u8::MAX)).letter(),
+                        pattern.unmasked.0,
+                        pattern.masked.0
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "{} = agen.set_transfer_mask_state mask_value({}) {{num_slices = {} : i32, \
+                 slice_mask_map = \"{}\"{}}} : index, {}",
+                print::val(*result),
+                print::val(*mask_value),
+                slices.len(),
+                map,
+                patterns,
                 print::vector(*ty)
             );
         }

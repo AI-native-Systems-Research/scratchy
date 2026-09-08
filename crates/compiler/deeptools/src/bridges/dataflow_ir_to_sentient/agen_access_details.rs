@@ -1565,6 +1565,10 @@ impl<'a> AccessDetailsBase<'a> {
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
+            // ⛔ AND NEITHER IS THE INTERLEAVE OR THE MASK STATE: one holds transfers rather than
+            // being one, the other writes a unit's mask state and loads no vector at all.
+            | agen::Op::CompositeMemoryInterleave { .. }
+            | agen::Op::SetTransferMaskState { .. }
             | agen::Op::Yield => Vec::new(),
         };
         for user in users {
@@ -1877,6 +1881,8 @@ impl<'a> AccessDetailsAffine<'a> {
             agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeMemoryInterleave { .. }
+            | agen::Op::SetTransferMaskState { .. }
             | agen::Op::Yield => {
                 return AffineInitialize::UnsupportedOperation;
             }

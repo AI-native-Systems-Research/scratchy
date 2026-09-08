@@ -345,7 +345,9 @@ impl<'a> TpmvManager<'a> {
             DfirOp::Agen(
                 agen::Op::Yield
                 | agen::Op::SymbolicVectorLoad { .. }
-                | agen::Op::SymbolicVectorStore { .. },
+                | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::CompositeMemoryInterleave { .. }
+                | agen::Op::SetTransferMaskState { .. },
             )
             | DfirOp::Arith(_)
             | DfirOp::Affine(_)
