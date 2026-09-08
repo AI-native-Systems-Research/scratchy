@@ -232,8 +232,63 @@ impl UnitProgram {
 // crustify:todo: e031_tagToPC
 //   authority: sys-arch-spec/progir/progir.cpp:696  (23 lines)  `ProgramAndStateInfo::tagToPC`
 
-// crustify:todo: e033_print
-//   authority: sys-arch-spec/progir/progir.cpp:25  (38 lines)  `OperandAttr::print`
+/// WHETHER A VALUE IS DELIMITED — `print`'s `prettyPrint` (`progir.cpp:25`), as the closed set it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pretty {
+    /// `false` — bare text, and a `BOOLEAN` as `0`/`1`. What senprog's operand list takes.
+    Off,
+    /// `true` — a `VARIABLE` quoted, an `INSTR_TAG` parenthesised, a `BOOLEAN` as `true`/`false`
+    /// and an `INT128` prefixed `0x`. ⛔ INERT FOR EVERY OTHER KIND, including `VARIABLE_SYMBOL`,
+    /// which `dpc.cpp:690` and `:762` nonetheless pass `true`.
+    On,
+}
+
+impl OperandValue {
+    /// Replaces: e033_print
+    ///
+    /// ONE OPERAND AS TEXT; `UNKNOWN`'s `DT_ERROR("Uexpected OperandAttr type to print")` is `None`.
+    ///
+    /// ⛔ THE `ostream` OVERLOAD DROPS ITS OWN FLAG: `progir.h:187-190` defaults `prettyPrint` to
+    /// `false` and then calls `print(id, true)`, so every stream caller is pretty regardless.
+    /// ⛔ AND `char buff[40]` TRUNCATES `%.6f` — measured, `-3.4e38` loses a real digit and prints
+    /// as a tenth of itself. ⭐ WE WRITE THE FULL TEXT; see `a_big_float_is_not_truncated`.
+    #[must_use]
+    pub fn print(&self, pretty: Pretty) -> Option<String> {
+        Some(match self {
+            Self::Variable(text) => match pretty {
+                Pretty::On => format!("\"{text}\""),
+                Pretty::Off => text.clone(),
+            },
+            Self::InstrTag(text) => match pretty {
+                Pretty::On => format!("({text})"),
+                Pretty::Off => text.clone(),
+            },
+            Self::Descriptive(text) => text.clone(),
+            // ⛔ NOT `as_int` (e029): that accessor only re-checks the tag this arm already matched,
+            // and `getValueImpl` then reads the one value this island carries inline.
+            Self::Int(value) => value.to_string(),
+            Self::VariableSymbol(id) => format!("%{id}%"),
+            // `%.6f` of the varargs promotion to `double`, which `f64::from` is exactly. ⛔ NaN
+            // prints `NaN` here against the reference's `nan`; no finite operand differs.
+            Self::Float(value) => format!("{:.6}", f64::from(*value)),
+            Self::Boolean(flag) => match pretty {
+                Pretty::On => (if *flag { "true" } else { "false" }).to_owned(),
+                // `to_string(asBool(id))` — there is no `bool` overload, so it promotes to `int`.
+                Pretty::Off => u8::from(*flag).to_string(),
+            },
+            Self::Int128(words) => {
+                // ⛔ WORD 0 IS LEFTMOST: `at(0)` is the first `%08x` of the four.
+                let [w0, w1, w2, w3] = words;
+                let prefix = match pretty {
+                    Pretty::On => "0x",
+                    Pretty::Off => "",
+                };
+                format!("{prefix}{w0:08x}{w1:08x}{w2:08x}{w3:08x}")
+            }
+            Self::Unknown => return None,
+        })
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -320,5 +375,58 @@ mod unit_tests {
             blocks: vec![Block::Code(Vec::new()), Block::Code(Vec::new())],
         };
         assert_eq!(two.simplicity(BlockKind::Code), Simplicity::ManyBlocks);
+    }
+
+    /// e033: every kind's text, and the five `prettyPrint` moves — `progir.cpp:29-58`. There is no
+    /// vendor case to port: `dsc/test/operandattr_unit_test.cpp` never calls `print`, and the
+    /// `senulator/progs/*/senprog.txt` goldens are unfetched git-lfs pointers on this host.
+    #[test]
+    fn every_kind_prints_the_reference_text_and_pretty_moves_five_of_them() {
+        let both = |value: &OperandValue| (value.print(Pretty::Off), value.print(Pretty::On));
+        let text = |plain: &str, pretty: &str| (Some(plain.to_owned()), Some(pretty.to_owned()));
+        let same = |plain: &str| text(plain, plain);
+
+        assert_eq!(
+            both(&OperandValue::Variable("act_addr".to_owned())),
+            text("act_addr", "\"act_addr\"")
+        );
+        assert_eq!(
+            both(&OperandValue::InstrTag("L3_loop_end".to_owned())),
+            text("L3_loop_end", "(L3_loop_end)")
+        );
+        assert_eq!(
+            both(&OperandValue::Descriptive("uselccr".to_owned())),
+            same("uselccr")
+        );
+        assert_eq!(both(&OperandValue::Int(-7)), same("-7"));
+        // ⛔ THE ONE KIND `dpc.cpp:690` ASKS PRETTY OF AND THAT IGNORES IT.
+        assert_eq!(both(&OperandValue::VariableSymbol(3)), same("%3%"));
+        assert_eq!(both(&OperandValue::Float(1.5)), same("1.500000"));
+        assert_eq!(both(&OperandValue::Boolean(true)), text("1", "true"));
+        assert_eq!(both(&OperandValue::Boolean(false)), text("0", "false"));
+        assert_eq!(
+            both(&OperandValue::Int128([0xdead_beef, 0, 1, 0xffff_ffff])),
+            text(
+                "deadbeef0000000000000001ffffffff",
+                "0xdeadbeef0000000000000001ffffffff"
+            )
+        );
+        // The `DT_ERROR` arm, which is an absent string rather than a stop.
+        assert_eq!(both(&OperandValue::Unknown), (None, None));
+    }
+
+    /// ⛔ DELIBERATE DIVERGENCE, MEASURED: `snprintf(buff, 40, "%.6f", -3.4e38f)` wants 47 bytes and
+    /// keeps 39, so the reference emits `-33999999521443642490773241379936429670` — a real digit
+    /// short, one tenth of the value. Truncation starts at `1e32`, where the fraction goes first.
+    #[test]
+    fn a_big_float_is_not_truncated() {
+        assert_eq!(
+            OperandValue::Float(-3.4e38).print(Pretty::Off),
+            Some("-339999995214436424907732413799364296704.000000".to_owned())
+        );
+        assert_eq!(
+            OperandValue::Float(1e32).print(Pretty::Off),
+            Some("100000003318135351409612647563264.000000".to_owned())
+        );
     }
 }
