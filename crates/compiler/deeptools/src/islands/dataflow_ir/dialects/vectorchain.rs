@@ -10,7 +10,23 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, Constraint, IntegerSet, ScalarTy, Vector,
+};
+
+/// ONE SCALAR A SHUFFLE'S NEGATIVE INDEX REACHES, WITH THE TYPE THE OP PRINTS FOR IT.
+///
+/// ⭐ THE TYPE IS THE OPERAND'S, NOT THE RESULT ELEMENT'S. `Variadic<AnyTypeOf<[Index, AnyInteger,
+/// AnyFloat]>>:$variable` (`VectorChain.td:459`) and `ShuffleOp::print` writes each one out beside
+/// the input's (`VectorChain.cpp:389-390`), so a loop counter prints `index` inside an op whose
+/// result is a `vector<64xf16>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShuffleVariable {
+    /// The scalar.
+    pub val: Val,
+    /// How it is typed.
+    pub ty: ScalarTy,
+}
 
 /// WHICH COMPARISON — `VectorChainElementWiseCompareOperator` (`VectorChainEnums.td`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -700,7 +716,17 @@ pub enum Op {
         result: Val,
         /// What is widened.
         input: Val,
-        /// One index per element of the input.
+        /// The SCALARS a negative index reaches — `variable(%iv)`, indexed from `-1`
+        /// (`VectorChain.td:445`).
+        ///
+        /// ⛔⛔ A NEGATIVE INDEX IS NOT A REORDERING, IT IS A DIFFERENT OPERAND. `indices = [-1]`
+        /// broadcasts `variable`'s first scalar over the whole result and reads NOTHING out of
+        /// `input`, so an empty list here with a negative index is an op whose elements have no
+        /// source. That is what makes this a field rather than an attribute: the value travels.
+        variable: Vec<ShuffleVariable>,
+        /// `dbgName`.
+        dbg_name: Option<String>,
+        /// One index per element of the input, or a negative one per [`Op::Shuffle::variable`].
         indices: Vec<i32>,
         /// How many times the pattern repeats to fill the result.
         repetition: u32,
@@ -1167,6 +1193,8 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::Shuffle {
             result,
             input,
+            variable,
+            dbg_name,
             indices,
             repetition,
             input_ty,
@@ -1177,12 +1205,35 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 .map(|index| format!("{index} : i32"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // `if (numVariable > 0) p << ", variable(" .. ")"` (`VectorChain.cpp:365-372`) — the
+            // group is absent, not empty, when there is none.
+            let variables = if variable.is_empty() {
+                String::new()
+            } else {
+                let vals = variable
+                    .iter()
+                    .map(|scalar| print::val(scalar.val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", variable({vals})")
+            };
+            // ⭐ ALPHABETICAL, WHICH IS `printOptionalAttrDict`'s ORDER (`:385`) — `dbgName` sorts
+            // ahead of `indices` and `repetition`, and it is the only one that can be absent.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
+            // `p << " : " << input; for (variable) p << ", " << type; p << ", " << result`
+            // (`:387-395`) — one type per operand, in operand order, result last.
+            let mut types = print::vector(*input_ty);
+            for scalar in variable {
+                let _ = write!(types, ", {}", scalar.ty.spelling());
+            }
             let _ = writeln!(
                 out,
-                "{} = vectorchain.shuffle input({}) {{indices = [{indices}], repetition = {repetition} : i32}} : {}, {}",
+                "{} = vectorchain.shuffle input({}){variables} {{{name}indices = [{indices}], repetition = {repetition} : i32}} : {types}, {}",
                 print::val(*result),
                 print::val(*input),
-                print::vector(*input_ty),
                 print::vector(*ty)
             );
         }

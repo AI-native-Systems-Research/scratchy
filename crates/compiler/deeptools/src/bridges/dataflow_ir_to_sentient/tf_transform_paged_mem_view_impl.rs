@@ -919,8 +919,9 @@ impl<'a> VectorLoadOp<'a> {
             DfirOp::Agen(
                 agen::Op::VectorStore { .. }
                     | agen::Op::CompositeLoad(_)
+                    | agen::Op::CompositeStore(_)
                     | agen::Op::CompositeLoadAndStore(_)
-                    | agen::Op::Yield
+                    | agen::Op::Yield { .. }
                     | agen::Op::SetTransferMaskState { .. },
             )
             | DfirOp::Arith(_)
@@ -1152,8 +1153,9 @@ impl<'a> VectorStoreOp<'a> {
             DfirOp::Agen(
                 agen::Op::VectorLoad { .. }
                     | agen::Op::CompositeLoad(_)
+                    | agen::Op::CompositeStore(_)
                     | agen::Op::CompositeLoadAndStore(_)
-                    | agen::Op::Yield
+                    | agen::Op::Yield { .. }
                     | agen::Op::SetTransferMaskState { .. },
             )
             | DfirOp::Arith(_)
@@ -1968,8 +1970,9 @@ impl<'p> TpmvCompositeStore<'p> {
     /// (`TransformPagedMemViewImpl.hpp:533-534`).
     ///
     /// ⭐ NO ANCHOR: deduplicated against entry 138. Its input, `agen.composite_store`
-    /// (`paged_mem_view_stores.mlir:361`), is absent from the island for the reason
-    /// [`TpmvCompositeLoad::new`] records.
+    /// (`paged_mem_view_stores.mlir:361`), is
+    /// [`crate::islands::dataflow_ir::dialects::agen::Op::CompositeStore`] since the transfer
+    /// bridge's composite store side landed.
     #[must_use]
     pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvCompositeStore<'p> {
         TpmvCompositeStore {

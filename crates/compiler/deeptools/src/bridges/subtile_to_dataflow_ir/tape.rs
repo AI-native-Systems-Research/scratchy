@@ -409,7 +409,7 @@ fn node_program<
                 time_order: plan.time_order,
                 load_time_addr_map: plan.load_time_addr_map,
                 store_time_addr_map: plan.store_time_addr_map,
-                body: vec![Op::Agen(agen::Op::Yield)],
+                body: vec![Op::Agen(agen::Op::Yield { values: Vec::new() })],
             },
         ))));
         // ⛔⛔ THE PLACEMENT, NOT THE VIEW HANDLE. `dst` is bound inside the L3 unit's region and is
@@ -577,11 +577,11 @@ fn node_program<
             // spending, because `operand` takes `self`.
             let stored_ty = received.ty();
             ops.push(Op::Agen(agen::Op::VectorStore {
-                dbg_name: None,
-                access: agen::Access::OfView,
                 value: received.operand(),
                 view: out_view,
                 indices: vec![Index::Const(0), Index::Const(0)],
+                dbg_name: None,
+                access: agen::Access::OfView,
                 view_ty: MemRef {
                     shape: vec![out_rows, out_cols],
                     elem: ElemType::F16,

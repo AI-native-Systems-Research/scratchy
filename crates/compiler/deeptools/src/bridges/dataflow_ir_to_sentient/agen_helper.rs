@@ -570,8 +570,9 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             dfir_op::agen::Op::VectorStore { .. } => Some(AgenOpKind::VectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
             dfir_op::agen::Op::CompositeLoad(_) => Some(AgenOpKind::CompositeLoad),
+            dfir_op::agen::Op::CompositeStore(_) => Some(AgenOpKind::CompositeStore),
             // The region terminator is not a transfer, and neither is a mask-state write.
-            dfir_op::agen::Op::Yield | dfir_op::agen::Op::SetTransferMaskState { .. } => None,
+            dfir_op::agen::Op::Yield { .. } | dfir_op::agen::Op::SetTransferMaskState { .. } => None,
         },
         DfirOp::Arith(_)
         | DfirOp::Scf(_)
@@ -664,8 +665,9 @@ impl AgenLoad {
             }),
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
+                | dfir_op::agen::Op::CompositeStore(_)
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
-                | dfir_op::agen::Op::Yield
+                | dfir_op::agen::Op::Yield { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. },
             )
             | DfirOp::Arith(_)
@@ -1961,6 +1963,8 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let shuffled = || {
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                dbg_name: None,
+                variable: Vec::new(),
                 result: Val(41),
                 input: Val(31),
                 indices: vec![0, 1],
@@ -2120,6 +2124,8 @@ mod unit_tests {
         };
         let shuffle = |indices: Vec<i32>, repetition: u32, input_ty: Vector, ty: Vector| {
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                dbg_name: None,
+                variable: Vec::new(),
                 result: Val(41),
                 input: Val(31),
                 indices,
@@ -2189,6 +2195,8 @@ mod unit_tests {
         let mut padded: Vec<i32> = (0..16).collect();
         padded.extend(std::iter::repeat_n(-1, 48));
         let half_stick = vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+            dbg_name: None,
+            variable: Vec::new(),
             result: Val(41),
             input: Val(31),
             indices: padded,
@@ -2697,6 +2705,8 @@ mod unit_tests {
                 ty: LANES,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                dbg_name: None,
+                variable: Vec::new(),
                 result: Val(41),
                 input: Val(31),
                 indices: vec![0, 1],
@@ -2768,7 +2778,7 @@ mod unit_tests {
                 data: Val(31),
                 ty: LANES,
             }),
-            DfirOp::Agen(agen::Op::Yield),
+            DfirOp::Agen(agen::Op::Yield { values: Vec::new() }),
         ];
         assert!(check_composite_region(CompositeFamily::Load, &load_body, &[]).admissible());
 
@@ -2785,7 +2795,7 @@ mod unit_tests {
                 from,
                 ty: LANES,
             }),
-            DfirOp::Agen(agen::Op::Yield),
+            DfirOp::Agen(agen::Op::Yield { values: Vec::new() }),
         ];
         assert!(
             check_composite_region(CompositeFamily::Store, &store_body, &[Val(41)]).admissible()
@@ -3053,6 +3063,8 @@ mod unit_tests {
                 is_symbol: false,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                dbg_name: None,
+                variable: Vec::new(),
                 result: Val(52),
                 input: Val(51),
                 indices: vec![0],
@@ -3294,7 +3306,7 @@ mod unit_tests {
             time_order: planned.time_order,
             load_time_addr_map: planned.load_time_addr_map,
             store_time_addr_map: planned.store_time_addr_map,
-            body: vec![DfirOp::Agen(agen::Op::Yield)],
+            body: vec![DfirOp::Agen(agen::Op::Yield { values: Vec::new() })],
         }))
     }
 
@@ -3357,7 +3369,7 @@ mod unit_tests {
         let region = [
             sent_load_and_send(extent),
             sent_load_and_send(extent),
-            SenOp::Agen(agen::Op::Yield),
+            SenOp::Agen(agen::Op::Yield { values: Vec::new() }),
         ];
         let interleave = MemoryInterleave {
             granularity: Some(Elements(8)),
@@ -3379,7 +3391,7 @@ mod unit_tests {
         let region = [
             sent_load_and_send(extent),
             sent_load_and_send(louder),
-            SenOp::Agen(agen::Op::Yield),
+            SenOp::Agen(agen::Op::Yield { values: Vec::new() }),
         ];
         assert_eq!(
             process_interleave_op::<Dd2>(
@@ -4185,7 +4197,7 @@ pub fn get_store_producer<'a>(store: &AgenStore<'a>, scope: &'a [DfirOp]) -> Sto
             let next = body.get(1);
             match front {
                 DfirOp::Dataflow(dataflow::Op::Receive { .. }) => match next {
-                    Some(DfirOp::Agen(dfir_op::agen::Op::Yield)) => front,
+                    Some(DfirOp::Agen(dfir_op::agen::Op::Yield { .. })) => front,
                     Some(
                         shuffle @ DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle { .. }),
                     ) => shuffle,
@@ -4882,7 +4894,7 @@ pub fn process_interleave_op<A: Arch>(
 
     for region_op in interleave.region {
         // `:363` — `if (isa<agen::YieldOp>(region_op)) continue;`.
-        if matches!(region_op, SenOp::Agen(dfir_op::agen::Op::Yield)) {
+        if matches!(region_op, SenOp::Agen(dfir_op::agen::Op::Yield { .. })) {
             continue;
         }
         // `:364-368` — `isa<LoadAndSendOp, ReceiveAndStoreOp, LoadAndStoreOp>`.

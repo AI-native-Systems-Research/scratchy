@@ -32,7 +32,9 @@ use super::dsc_lowering::{
 use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst};
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, affine, arith, scf, symbol, uniform,
+};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::units::{Core, Corelet, DfirUnit};
 
@@ -67,6 +69,30 @@ pub enum PrimaryDim {
     Kj,
     /// `X1` — a second repeat dim.
     X1,
+}
+
+impl PrimaryDim {
+    /// `EnumsConversion::primaryDimToString` (`dsc/dims.cpp:22-35`) — what a loop over this dim is
+    /// CALLED, which entry 088 writes into every band loop's `dbgName` and the reference's own
+    /// fixtures print back: `{dbgName = "y-cw/cwt"}`
+    /// (`dcc/test/L3LU/l3lu_load_send_recv_store.mlir:34`).
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            PrimaryDim::In => "in",
+            PrimaryDim::Out => "out",
+            PrimaryDim::I => "i",
+            PrimaryDim::J => "j",
+            PrimaryDim::Ij => "ij",
+            PrimaryDim::Mb => "mb",
+            PrimaryDim::Ki => "ki",
+            PrimaryDim::Kj => "kj",
+            PrimaryDim::Kij => "kij",
+            PrimaryDim::X => "x",
+            PrimaryDim::X1 => "x1",
+            PrimaryDim::Y => "y",
+        }
+    }
 }
 
 /// WHICH COMPARISON A SCHEDULE CONDITION MAKES — `CondOp` (`dsc/dscdefn.h:95-107`).
@@ -999,6 +1025,7 @@ pub fn blocking_or_streaming_buffer_loop_locations<'a, L, M>(
 
 /// THE START ADDRESSES ONE SWITCHING TRANSFER CONTRIBUTES — `*start_address_map`, read the two ways
 /// entry 075 reads it (`:613-627`).
+#[derive(Clone, Copy)]
 pub struct StartAddresses<'a> {
     /// Every `(core, corelet, fold)`'s address, for the all-the-same test entry 030 makes.
     pub all: &'a [i64],
@@ -1010,6 +1037,7 @@ pub struct StartAddresses<'a> {
 }
 
 /// ONE SWITCHING TRANSFER OF A ROOT LOOP, AS ITS ITER ARG IS BUILT.
+#[derive(Clone, Copy)]
 pub struct RootIterArg<'a> {
     /// `mode` — [`None`] is the reference's `llvm_unreachable("Unknown buffering mode")`.
     pub mode: Option<SwitchMode>,
@@ -1112,7 +1140,597 @@ pub fn construct_loop_iter_args(
     iter_args
 }
 
-// crustify:todo: e088_constructLoopsRecursive
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 088/110 — THE WHOLE SCHEDULE SUBTREE, AS NESTED LOOPS
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A PARAMETRIC LOOP'S TRIP COUNT — `parametricIterCount(dsc_, corelet, comp_)`, once per corelet.
+///
+/// ⛔⛔ THE `DT_CHECK` IS THIS CONSTRUCTOR. *"DCC does not currently support imbalanced corelet
+/// split"* (`SNControlFlowLowering.cpp:869-872`) compares corelet 0's count with corelet 1's and
+/// aborts where they differ — and the loop it goes on to build carries ONE count, so a disagreeing
+/// pair has no loop to be. Asking every corelet at once is what makes the count unforgeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParametricIters(i64);
+
+impl ParametricIters {
+    /// One count per corelet used — `numCoreletsUsed_DSC2_` of them, which the reference reads as
+    /// corelet 0's answer plus a check on corelet 1's.
+    #[must_use]
+    pub fn balanced(per_corelet: &[i64]) -> Option<ParametricIters> {
+        let (first, rest) = per_corelet.split_first()?;
+        rest.iter()
+            .all(|count| count == first)
+            .then_some(ParametricIters(*first))
+    }
+
+    /// The count itself.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// HOW ONE DIM'S TRIP COUNT IS STATED — schedule-fixed, or a symbol resolved after this bridge.
+///
+/// ⭐ `node->isDimSymbolic(dim)` IS THE WHOLE SPLIT (`:947`), and the two sides build different
+/// LOOPS: entry 058's `affine.for`/`scf.for` pair against an `scf.for` whose upper bound is a
+/// [`symbol::Op::CreateSymbol`] hoisted out to the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimBound {
+    /// `!isDimSymbolic(dim)` — entry 058 builds it.
+    Counted {
+        /// The four staging values its trip count divides out of.
+        stages: DimStages,
+        /// The enclosing loop its epilogue compare is made against.
+        parent: ParentLoop,
+    },
+    /// `isDimSymbolic(dim)` — `loopCountSymbolIds_.at(dim)`.
+    ///
+    /// ⛔ ONE SYMBOL, WHICH IS `DT_CHECK(dimLoopCountSymbols.size() == 1 && "Only one symbol for a
+    /// loop bound")` (`:952-953`) written as a single field.
+    Symbolic {
+        /// `dimLoopCountSymbols.front()`.
+        symbol_id: i64,
+        /// `sym_info_.getMax(..)`.
+        max_value: i64,
+        /// `sym_info_.getGranularity(..)`.
+        ///
+        /// ⚠️ CARRIED AND NOT EMITTED. The reference writes a third attribute `granularity` onto the
+        /// symbol op (`:963-966`) and nothing in the authority tree reads one back, which is why
+        /// [`symbol::Op::CreateSymbol`] has no field for it — kept here so the day a reader appears,
+        /// the value is already standing at the emission site.
+        granularity: i64,
+    },
+}
+
+/// ONE DIM OF A LOOP BAND — `node->dims_[dim_idx]`, with the bound its loop takes.
+///
+/// ⭐ PADDING IS ALREADY INSIDE [`DimBound::Counted`]'s stages. The reference builds a
+/// `PaddingFormType` here and hands it to the reader that produces those four values (`:939-941`),
+/// so a `padded` flag beside them would be one fact recorded twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandDim {
+    /// `dims_[dim_idx].dim_`.
+    pub dim: PrimaryDim,
+    /// How its trip count is stated.
+    pub bound: DimBound,
+}
+
+/// THE ROOT ARM'S INGREDIENTS — what entry 075 needs when a band has no enclosing loop.
+#[derive(Clone, Copy)]
+pub struct RootArgs<'a> {
+    /// `needsUniform()`.
+    pub uniform: Option<&'a Handles>,
+    /// `(*dsc_all_parent_loops_to_buffers_switch_map_)[node]`, with entry 056 already asked.
+    pub transfers: &'a [RootIterArg<'a>],
+}
+
+/// ONE LOOP BAND — a `LoopNode` that is not parametric, and every dim it walks.
+pub struct Band<'n> {
+    /// `node->dims_`, IN THE ORDER THE NODE DECLARES THEM. Loop `i` of the emitted band walks dim
+    /// `len - i - 1`, which is what [`mlir_loop_from_sn_loop_node`] indexes and why the reference
+    /// counts `dim_idx` DOWN while `dim_idx_front` counts up (`:926-928`).
+    pub dims: Vec<BandDim>,
+    /// `(*dsc_all_parent_loops_to_buffers_switch_map_)[node]` — this band's switching transfers, in
+    /// the order that IS each one's iter-arg position.
+    pub transfers: &'n [TransferId],
+    /// What its OUTERMOST loop's iter args are built from where nothing encloses it.
+    pub root: RootArgs<'n>,
+    /// `dataStageParam_.at(numId_).name()` and `.at(denId_).name()` — the two halves of every loop
+    /// name this band writes (`:979-982`).
+    pub stages: (&'n str, &'n str),
+    /// `getNextView(comp_, corelet_id_, core_id_)`.
+    pub children: Vec<SchedNode<'n>>,
+}
+
+/// WHERE A CONDITION NODE'S CONDITION LIVES — `hasCoreClCond()`, and then whether uniformization is
+/// on (`:5378`, `:5407-5416`).
+///
+/// ⛔ THE TWO CORE/CORELET ARMS CARRY NO CONDITION AT ALL, and that is
+/// `DT_CHECK(cond_node->loopCond_.twoLevelOrOfAnds_.empty())` (`:5408`): a condition on the core or
+/// the corelet is not a comparison of loop iterators, so there is nothing for entry 054 to build.
+pub enum CondPlace<'n> {
+    /// `!hasCoreClCond()` — entry 054's `scf` chain over loop iterators.
+    Loops(CondComposite<'n>),
+    /// `hasCoreClCond() && !uniformization_enabled_` — the one child runs UNGUARDED.
+    ///
+    /// ⛔ `DT_CHECK(children.size() == 1)` (`:5410`) IS WHY ONLY THE FIRST IS TAKEN.
+    CoreCl,
+    /// `hasCoreClCond() && uniformization_enabled_` — one `uniform.uniformize_regions` region per
+    /// branch that has any unit at all.
+    UniformCoreCl {
+        /// `getThenCoreCl(comp_)`'s units, as `unit_to_value_map_` resolves them (`:5425-5434`).
+        then_units: &'n [Val],
+        /// `getElseCoreCl(comp_)`'s, read only where the node has two branches.
+        else_units: &'n [Val],
+    },
+}
+
+/// ONE CONDITION NODE.
+pub struct Cond<'n> {
+    /// `sched_node->name_`.
+    pub name: &'n str,
+    /// Where its condition lives.
+    pub place: CondPlace<'n>,
+    /// `getNextView(..)` — one child is a `then` alone and two is a `then`/`else` pair.
+    pub children: Vec<SchedNode<'n>>,
+}
+
+/// A SCHEDULE NODE AS THE LOOP WALK SEES IT — the reference's four `dynamic_cast` arms, and what a
+/// node of any other kind contributes.
+///
+/// ⛔⛔ A LEAF CARRIES ITS OWN OPS, WHICH IS WHERE THIS PORT DIVERGES. The reference emits nothing
+/// for a transfer, compute or sync node here: it records each loop in `dsc_loops_to_mlir_loops_map_`
+/// and a LATER walk sets a builder back inside one and writes there (`:5212`, `:5288`). A value tree
+/// has no insertion point to come back to, so the ops that walk would have written arrive as
+/// [`SchedNode::Leaf`] at the position they belong to. Nothing else changes: the maps are the
+/// mechanism, the nesting is the meaning.
+pub enum SchedNode<'n> {
+    /// `loopNode->isParametricLoop()` — one `affine.for` over a corelet-balanced count.
+    Parametric {
+        /// `parametricIterCount(..)`.
+        iters: ParametricIters,
+        /// `getNextView(..)`.
+        children: Vec<SchedNode<'n>>,
+    },
+    /// A `LoopNode` that is not parametric.
+    Band(Band<'n>),
+    /// A `ConditionNode`.
+    Condition(Cond<'n>),
+    /// A `BlockNode`.
+    Block {
+        /// `getNextView(..)`.
+        children: Vec<SchedNode<'n>>,
+    },
+    /// Any other node kind — what the later walks wrote inside this position's loops.
+    Leaf {
+        /// The ops themselves.
+        ops: Vec<DfirOp>,
+        /// What they bind and hand upward — the streaming and double-buffering stores' results.
+        results: Vec<Val>,
+    },
+}
+
+/// THE ENCLOSING LOOP BAND A CHILD'S ITER ARGS ARE TAKEN FROM.
+///
+/// ⛔⛔ EMPTY `loops` IS A PARENT THAT IS NOT A LOOP BAND, and it is NOT the same as no parent. A
+/// block or condition node is passed as `parent_node` all the same, and entry 075's
+/// `if (parent_node_loop)` then finds nothing to read, so the child's args come out empty — where no
+/// parent at all takes the ROOT arm and EMITS a fresh start address per switching transfer.
+#[derive(Debug, Clone, Copy)]
+pub struct Enclosing<'e> {
+    /// `(*dsc_loops_to_mlir_loops_map_)[parent_node_loop]`, outermost first.
+    pub loops: &'e [DfirOp],
+    /// `(*dsc_all_parent_loops_to_buffers_switch_map_)[parent_node_loop]`.
+    pub transfers: &'e [TransferId],
+}
+
+/// WHAT ONE SUBTREE LOWERED TO.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lowered {
+    /// The ops the reference wrote through a builder aimed at the ROOT — a symbolic dim's
+    /// `symbol.create_symbol` and its two bounds (`:955-970`). They belong ahead of every loop, and
+    /// they travel apart from the rest because the band that needed them is nested inside those.
+    pub hoisted: Vec<DfirOp>,
+    /// The ops, in emission order.
+    pub ops: Vec<DfirOp>,
+    /// `sched_nodes_results` — what the children bound and handed up.
+    pub results: Vec<Val>,
+}
+
+/// Replaces: e088_constructLoopsRecursive
+///
+/// **088/110** `SNControlFlowLowering.cpp:862` — every loop, condition and block of a schedule
+/// subtree, nested as the schedule nests them.
+///
+/// ⛔ THE NODES ARRIVE IN TIE ORDER (*"Assumptions: nodes are sorted in the tie-order"*, `:5197`)
+/// and are emitted in it.
+/// ⛔ [`None`] IS EVERY `failure()` AND EVERY REACHABLE `DT_CHECK`: a condition node with no child
+/// or more than two, entry 054's own refusals, and the terminator's *"translator still needs support
+/// in scenarios of a loop with streaming/double buffer transfer with siblings of loops having again
+/// transfers"* (`:5344-5348`).
+pub fn construct_loops_recursive(
+    vals: &mut Values,
+    nodes: &[SchedNode<'_>],
+    enclosing: Option<Enclosing<'_>>,
+) -> Option<Lowered> {
+    let mut out = Lowered::default();
+    for node in nodes {
+        let lowered = match node {
+            SchedNode::Parametric { iters, children } => {
+                let iv = vals.mint();
+                // ⭐ THE PARAMETRIC LOOP CARRIES NOTHING — `SmallVector<Value, 8> iter_args;  // TO
+                // DO:` (`:5207`) — so it is its child's parent with no arg to hand down, which is the
+                // same answer an empty band gives.
+                let mut inner = construct_loops_recursive(
+                    vals,
+                    children,
+                    Some(Enclosing {
+                        loops: &[],
+                        transfers: &[],
+                    }),
+                )?;
+                Lowered {
+                    hoisted: core::mem::take(&mut inner.hoisted),
+                    ops: vec![DfirOp::Affine(affine::Op::For {
+                        iv,
+                        lo: affine::Bound::Const(0),
+                        hi: affine::Bound::Const(iters.get()),
+                        carried: Vec::new(),
+                        body: inner.ops,
+                        // ⭐ UNNAMED, ALONE AMONG THE LOOPS HERE: this arm sets no `dbgName`.
+                        dbg_name: None,
+                    })],
+                    results: inner.results,
+                }
+            }
+            SchedNode::Band(band) => construct_band(vals, band, enclosing)?,
+            SchedNode::Condition(cond) => construct_condition(vals, cond)?,
+            SchedNode::Block { children } => {
+                let mut inner = construct_loops_recursive(
+                    vals,
+                    children,
+                    Some(Enclosing {
+                        loops: &[],
+                        transfers: &[],
+                    }),
+                )?;
+                // ⛔⛔ THE CHILDREN GO **BEFORE** THE DUMMY LOOP, NOT INSIDE IT.
+                // `builder.setInsertionPoint(dummy_loop)` inserts AT that op, so everything the
+                // block's children emit lands ahead of it and the loop itself stays empty — it is
+                // there *"to hold for a reference while inserting operations"* (`:5495-5500`).
+                let iv = vals.mint();
+                inner.ops.push(DfirOp::Affine(affine::Op::For {
+                    iv,
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(1),
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: Some("block node".to_owned()),
+                }));
+                inner
+            }
+            SchedNode::Leaf { ops, results } => Lowered {
+                hoisted: Vec::new(),
+                ops: ops.clone(),
+                results: results.clone(),
+            },
+        };
+        out.hoisted.extend(lowered.hoisted);
+        out.ops.extend(lowered.ops);
+        out.results.extend(lowered.results);
+    }
+    Some(out)
+}
+
+/// ONE BAND — a loop per dim, outermost first, and the terminator each one closes with.
+fn construct_band(
+    vals: &mut Values,
+    band: &Band<'_>,
+    enclosing: Option<Enclosing<'_>>,
+) -> Option<Lowered> {
+    let mut hoisted: Vec<DfirOp> = Vec::new();
+    // What precedes each loop AT ITS OWN LEVEL: level 0's ops sit before the band and every other
+    // level's inside the loop above it, because that is where the builder is left standing.
+    let mut prologues: Vec<Vec<DfirOp>> = Vec::new();
+    let mut loops: Vec<DfirOp> = Vec::new();
+    let mut args_present = false;
+
+    for (level, dim) in band.dims.iter().rev().enumerate() {
+        let mut prologue: Vec<DfirOp> = Vec::new();
+        let iter_args = {
+            let args = match (level, enclosing) {
+                // `parent_node == nullptr && dim_idx_band == 0`.
+                (0, None) => LoopIterArgs::Root {
+                    uniform: band.root.uniform,
+                    transfers: band.root.transfers.to_vec(),
+                },
+                (0, Some(parent)) => LoopIterArgs::Enclosing {
+                    own: band.transfers,
+                    parent_transfers: parent.transfers,
+                    parent_loops: parent.loops,
+                    dim_idx_band: 0,
+                },
+                // ⭐ ANY LEVEL BELOW THE FIRST IS ITS OWN PARENT, so the band it reads is this one
+                // and the loop it reads is the one just built.
+                (band_index, _) => LoopIterArgs::Enclosing {
+                    own: band.transfers,
+                    parent_transfers: band.transfers,
+                    parent_loops: &loops,
+                    dim_idx_band: band_index,
+                },
+            };
+            construct_loop_iter_args(vals, &mut prologue, &args)
+        };
+        // `iterator_args_present = !iterator_args_present ? !iter_args.empty() : true`.
+        args_present = args_present || !iter_args.is_empty();
+
+        let loop_op = match dim.bound {
+            DimBound::Counted { stages, parent } => {
+                construct_loop_for_a_dim(vals, &mut prologue, stages, parent, &iter_args).loop_op
+            }
+            DimBound::Symbolic {
+                symbol_id,
+                max_value,
+                granularity: _,
+            } => {
+                // ⛔ THE SYMBOL AND ITS BOUNDS ARE BUILT AT THE **ROOT**:
+                // `OpBuilder global_builder(root_loop)` (`:5254-5269`), so they hoist past every loop
+                // this band sits inside, and nothing in the emitted text says they were needed here.
+                let symbol = vals.mint();
+                hoisted.push(DfirOp::Symbol(symbol::Op::CreateSymbol {
+                    result: symbol,
+                    symbol_id,
+                    max_value: Some(max_value),
+                }));
+                let lo = constant_index(vals, &mut hoisted, 0);
+                let step = constant_index(vals, &mut hoisted, 1);
+                let iv = vals.mint();
+                DfirOp::Scf(scf::Op::For {
+                    iv,
+                    lo,
+                    hi: symbol,
+                    step,
+                    carried: carried_from(vals, &iter_args),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })
+            }
+        };
+        prologues.push(prologue);
+        loops.push(named_loop(loop_op, dim.dim, band.stages));
+    }
+
+    // `constructLoopsRecursive(children, node, builder, node_results)`, with the builder standing
+    // inside the innermost loop.
+    let mut inner = construct_loops_recursive(
+        vals,
+        &band.children,
+        Some(Enclosing {
+            loops: &loops,
+            transfers: band.transfers,
+        }),
+    )?;
+    hoisted.append(&mut inner.hoisted);
+
+    // Fold the levels together, innermost first, closing each block as it goes.
+    let mut body = inner.ops;
+    while let Some(mut loop_op) = loops.pop() {
+        if args_present {
+            let terminator = loop_terminator(&loop_op, &body, &inner.results)?;
+            body.push(terminator);
+        }
+        set_loop_body(&mut loop_op, body);
+        let mut level = prologues.pop().unwrap_or_default();
+        level.push(loop_op);
+        body = level;
+    }
+
+    Some(Lowered {
+        hoisted,
+        ops: body,
+        results: inner.results,
+    })
+}
+
+/// `primaryDimToString.at(dim) + "-" + num.name() + "/" + den.name()`, as `setDbgName` writes it onto
+/// every loop of a band (`:5279-5283`).
+fn named_loop(loop_op: DfirOp, dim: PrimaryDim, stages: (&str, &str)) -> DfirOp {
+    let name = Some(format!("{}-{}/{}", dim.spelling(), stages.0, stages.1));
+    match loop_op {
+        DfirOp::Affine(affine::Op::For {
+            iv,
+            lo,
+            hi,
+            carried,
+            body,
+            dbg_name: _,
+        }) => DfirOp::Affine(affine::Op::For {
+            iv,
+            lo,
+            hi,
+            carried,
+            body,
+            dbg_name: name,
+        }),
+        DfirOp::Scf(scf::Op::For {
+            iv,
+            lo,
+            hi,
+            step,
+            carried,
+            body,
+            dbg_name: _,
+        }) => DfirOp::Scf(scf::Op::For {
+            iv,
+            lo,
+            hi,
+            step,
+            carried,
+            body,
+            dbg_name: name,
+        }),
+        // ⛔ UNREACHABLE: entry 058 and the symbolic arm build those two ops and nothing else.
+        other => other,
+    }
+}
+
+/// The body of a loop this function built — [`named_loop`] says why the other arms cannot arrive.
+fn set_loop_body(loop_op: &mut DfirOp, body: Vec<DfirOp>) {
+    match loop_op {
+        DfirOp::Affine(affine::Op::For { body: slot, .. })
+        | DfirOp::Scf(scf::Op::For { body: slot, .. }) => *slot = body,
+        _ => {}
+    }
+}
+
+/// ONE LOOP'S TERMINATOR — the inner loop's RESULTS where the block holds nothing but that loop, and
+/// the loop's own region arguments otherwise (`:5296-5361`).
+///
+/// ⛔⛔ `use_return_values` IS A TEST ON THE BLOCK'S SHAPE, and it is read BEFORE the terminator goes
+/// in — *"The yield operation should be after the above use_return_values computation because it
+/// would influence the size of operations in the block"* (`:5310-5313`). A level whose prologue
+/// emitted so much as one address therefore falls to the other arm and carries its arguments
+/// straight through.
+///
+/// ⛔ [`None`] IS THE `DT_CHECK_MSG` ON THAT ARM: a loop that forwards no inner loop's results
+/// cannot also be standing beside children that bound some (`:5344-5348`).
+fn loop_terminator(loop_op: &DfirOp, body: &[DfirOp], node_results: &[Val]) -> Option<DfirOp> {
+    let carried = loop_carried(loop_op);
+    // `is_any_of(block.getOperations().size(), 1, 2) && isa<AffineForOp, ForOp>(block.front()) &&
+    //  block.front().getNumResults() > 0`.
+    let inner = match body.len() {
+        1 | 2 => body
+            .first()
+            .map(loop_carried)
+            .filter(|inner| !inner.is_empty()),
+        _ => None,
+    };
+    let operands = match inner {
+        Some(inner) => {
+            let mut operands: Vec<Val> = inner.iter().map(|value| value.result).collect();
+            // The arguments past the ones the inner loop answers for — *"happens when multiple
+            // transfers are at different locations"* (`:5334-5341`). Argument 0 is the induction
+            // variable, which is why the reference's index is `idx + 1`.
+            operands.extend(carried.iter().skip(operands.len()).map(|value| value.arg));
+            operands
+        }
+        None => {
+            if !node_results.is_empty() {
+                return None;
+            }
+            carried.iter().map(|value| value.arg).collect()
+        }
+    };
+    Some(match loop_op {
+        DfirOp::Scf(_) => DfirOp::Scf(scf::Op::Yield { operands }),
+        _ => DfirOp::Affine(affine::Op::Yield { operands }),
+    })
+}
+
+/// What a loop carries, and nothing at all for an op that is not one.
+fn loop_carried(op: &DfirOp) -> &[affine::Carried] {
+    match op {
+        DfirOp::Affine(affine::Op::For { carried, .. })
+        | DfirOp::Scf(scf::Op::For { carried, .. }) => carried,
+        _ => &[],
+    }
+}
+
+/// ONE CONDITION NODE — a guarded pair of regions, one unguarded child, or a uniformized region per
+/// branch.
+///
+/// ⛔⛔ THE CORE/CORELET ARMS PASS A **NULL** PARENT, AND THAT IS THE REFERENCE'S OWN SLIP. Both of
+/// them recurse with `node` (`:5411`, `:5445`) — the `LoopNode*` whose `dynamic_cast` is exactly what
+/// failed to reach this arm, so it is null — where the non-core arm passes `cond_node`. A child of a
+/// core/corelet condition therefore takes entry 075's ROOT arm and MINTS fresh start addresses, even
+/// with a band standing above it; a child of any other condition gets none. Ported as written.
+fn construct_condition(vals: &mut Values, cond: &Cond<'_>) -> Option<Lowered> {
+    // `DT_CHECK_MSG(!children.empty(), "if-regions should not be empty")` (`:5372`), and
+    // `DT_CHECK_MSG(1 <= max_num_regions && max_num_regions <= 2, "either true/false on
+    // coreClConditions")` (`:5418`).
+    if cond.children.is_empty() || cond.children.len() > 2 {
+        return None;
+    }
+    let first = cond.children.first()?;
+    // A parent that exists and is not a loop band.
+    let not_a_band = Some(Enclosing {
+        loops: &[],
+        transfers: &[],
+    });
+    match &cond.place {
+        CondPlace::Loops(composite) => {
+            let then = construct_loops_recursive(vals, core::slice::from_ref(first), not_a_band)?;
+            let mut hoisted = then.hoisted;
+            let mut results = then.results;
+            // `bool has_else_branch = children.size() == 2`.
+            let else_body = match cond.children.get(1) {
+                Some(second) => {
+                    let mut built =
+                        construct_loops_recursive(vals, core::slice::from_ref(second), not_a_band)?;
+                    hoisted.append(&mut built.hoisted);
+                    results.append(&mut built.results);
+                    Some(built.ops)
+                }
+                None => None,
+            };
+            Some(Lowered {
+                hoisted,
+                ops: conditional_operation(vals, cond.name, composite, then.ops, else_body)?,
+                results,
+            })
+        }
+        CondPlace::CoreCl => construct_loops_recursive(vals, core::slice::from_ref(first), None),
+        CondPlace::UniformCoreCl {
+            then_units,
+            else_units,
+        } => {
+            let mut hoisted = Vec::new();
+            let mut results = Vec::new();
+            let mut regions = Vec::new();
+            // `if (max_num_regions == 2)` — a single-child node never reads the else units.
+            let else_units: &[Val] = if cond.children.len() == 2 {
+                else_units
+            } else {
+                &[]
+            };
+            // `int child_index = i; if (!has_then_region && has_else_region) child_index = i + 1;`
+            // — a branch with no unit of its own gets NO REGION, and the child index shifts up by one
+            // where it is the `then` branch that has none (`:5477-5479`).
+            let shift = usize::from(then_units.is_empty());
+            for units in [*then_units, else_units] {
+                if units.is_empty() {
+                    continue;
+                }
+                let child = cond.children.get(regions.len() + shift)?;
+                let mut built =
+                    construct_loops_recursive(vals, core::slice::from_ref(child), None)?;
+                hoisted.append(&mut built.hoisted);
+                results.append(&mut built.results);
+                // `uniform::YieldOp::create(builder_region, ..)` (`:5482-5483`).
+                built.ops.push(DfirOp::Uniform(uniform::Op::Yield {
+                    operands: Vec::new(),
+                }));
+                regions.push(uniform::LocalRegion {
+                    // `block.addArgument(builder.getIndexType(), ..)` (`:5474`).
+                    arg: vals.mint(),
+                    units: units.to_vec(),
+                    body: built.ops,
+                });
+            }
+            Some(Lowered {
+                hoisted,
+                ops: vec![DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                    regions,
+                    // ⛔ `mlir::TypeRange()` — the op binds nothing (`:5468`).
+                    results: Vec::new(),
+                })],
+                results,
+            })
+        }
+    }
+}
 // crustify:todo: e096_constructLoops
 
 #[cfg(test)]

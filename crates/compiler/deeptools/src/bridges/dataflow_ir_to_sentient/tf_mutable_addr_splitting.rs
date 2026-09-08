@@ -3404,7 +3404,7 @@ mod unit_tests {
                     AffineExpr::dim(2).times(8),
                 ],
             },
-            body: vec![DfirOp::Agen(agen::Op::Yield)],
+            body: vec![DfirOp::Agen(agen::Op::Yield { values: Vec::new() })],
         }))
     }
 

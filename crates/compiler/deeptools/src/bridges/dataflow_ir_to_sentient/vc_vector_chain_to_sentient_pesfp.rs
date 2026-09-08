@@ -626,6 +626,8 @@ mod unit_tests {
             is_symbol: false,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::Shuffle {
+            dbg_name: None,
+            variable: Vec::new(),
             result: Val(0),
             input: Val(1),
             indices: vec![0, 1],
@@ -829,6 +831,8 @@ mod unit_tests {
     #[test]
     fn a_shuffle_is_reported_as_best_effort() {
         let unit = unit_holding(vec![DfirOp::VectorChain(vc::Op::Shuffle {
+            dbg_name: None,
+            variable: Vec::new(),
             result: Val(0),
             input: Val(1),
             indices: vec![0, 1],

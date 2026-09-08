@@ -52,6 +52,19 @@ pub struct CompositeTransfer {
     pub body: Vec<super::Op>,
 }
 
+/// ONE VALUE AN `agen.yield` HANDS BACK, and the type its assembly format prints beside it.
+///
+/// ⛔ THE OPERAND LIST AND THE TYPE LIST ARE ONE GROUP: `attr-dict ($operands^ `:`
+/// type($operands))?` (`Agen.td:91`) prints the values with their types or prints neither, so a
+/// value here cannot arrive without the type it is stated at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Yielded {
+    /// The value.
+    pub val: Val,
+    /// Its type.
+    pub ty: Vector,
+}
+
 /// WHICH ELEMENTS ONE ACCESS TOUCHES — the `load_set`/`store_set` an `agen` access carries.
 ///
 /// ⛔⛔ TWO PRODUCERS ANSWER THIS QUESTION AND ONLY ONE OF THEM CAN DERIVE IT. A whole-stick access
@@ -163,6 +176,43 @@ pub struct CompositeLoad {
     pub body: Vec<super::Op>,
 }
 
+/// A `composite_store`'s operands and attributes — [`CompositeLoad`] with the direction reversed.
+///
+/// ⛔⛔ NO BLOCK ARGUMENT, AND THAT IS WHY ITS REGION YIELDS. `CompositeStoreOp`'s region is built
+/// from a bare `Block` (`Agen.cpp:735`), so the vector it writes cannot arrive as an argument the
+/// way a load's does: the producing op is CLONED into the region and its result becomes the
+/// terminator's operand (`SNTransferLowering.cpp:1313-1319`). See [`Op::Yield`].
+///
+/// ⛔ THE `input_vector` FORM IS THE OTHER HALF OF ONE `verify()`, and it is not this one. The op
+/// takes EXACTLY one of `input_vector` or (`store_set` + `store_order`) (`Agen.cpp:782-800`); the
+/// region form is what entry 089 builds, so the operand has no field here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeStore {
+    /// `$mem_ref` — the view written to.
+    pub view: Val,
+    /// `dbgName`.
+    pub dbg_name: Option<String>,
+    /// `$affine_map` applied to `$map_operands` — the base address, printed as the subscript.
+    pub indices: Vec<Index>,
+    /// The view's type.
+    pub view_ty: MemRef,
+    /// `store_set` — which elements each stored vector covers.
+    pub store_set: IntegerSet,
+    /// `store_order` — how those elements are packed.
+    pub store_order: AffineMap,
+    /// `$time_symbols` — the symbols `time_set` is parameterised by.
+    pub time_symbols: Vec<Val>,
+    /// `time_set` — the time steps the store takes.
+    pub time_set: IntegerSet,
+    /// `time_order` — the order among them.
+    pub time_order: AffineMap,
+    /// `time_addr_map` — the destination offset at each time step, one result per view dimension.
+    pub time_addr_map: AffineMap,
+    /// The region, entered once per time step. Its terminator is [`Op::Yield`], and it is what
+    /// carries the stored vector.
+    pub body: Vec<super::Op>,
+}
+
 /// ONE `agen` OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -233,8 +283,27 @@ pub enum Op {
     /// and a subscript, in an enum as large as its largest variant.
     CompositeLoad(Box<CompositeLoad>),
 
-    /// `agen.yield` — the terminator of a composite transfer's region.
-    Yield,
+    /// `agen.composite_store %view[..] time_symbols() {..} { .. } : memref<..>` — the store half of
+    /// a composite transfer, walking its own time axis with the chain that produces each vector in
+    /// its region.
+    ///
+    /// ⛔ IT BINDS NOTHING, like [`Op::CompositeLoad`], and unlike the load it takes nothing from
+    /// its region either — see [`CompositeStore`].
+    ///
+    /// ⛔ BOXED for the reason [`Op::CompositeLoad`] is.
+    CompositeStore(Box<CompositeStore>),
+
+    /// `agen.yield` — the terminator of a composite transfer's region, carrying the values that
+    /// region hands back to its parent.
+    ///
+    /// ⛔ EMPTY FOR EVERY LOAD-SIDE REGION AND NOT FOR THE STORE'S. A composite load's region
+    /// reads its vector from the op's own block argument and yields nothing; a
+    /// [`composite_store`](Op::CompositeStore)'s region has no block argument, so the vector it
+    /// writes reaches the op through this terminator (`SNTransferLowering.cpp:1316-1319`).
+    Yield {
+        /// `$operands`.
+        values: Vec<Yielded>,
+    },
 
     /// `agen.vector_store %value, %view[..] {store_order, store_set} : memref<..>, vector<..>`.
     ///
@@ -440,8 +509,79 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             print::indent(out, depth);
             let _ = writeln!(out, "}} : {}", print::memref(view_ty));
         }
-        Op::Yield => {
-            out.push_str("agen.yield\n");
+        Op::CompositeStore(store) => {
+            let CompositeStore {
+                view,
+                dbg_name,
+                indices,
+                view_ty,
+                store_set,
+                store_order,
+                time_symbols,
+                time_set,
+                time_order,
+                time_addr_map,
+                body,
+            } = store.as_ref();
+            let _ = writeln!(
+                out,
+                "agen.composite_store {}[{}]",
+                print::val(*view),
+                print::index_list(indices),
+            );
+            print::indent(out, depth);
+            // ⛔ NO `(iv:type)` GROUP: the store has no block argument to name, so its printer stops
+            // at the closing paren (`Agen.cpp:815-817`).
+            let _ = writeln!(
+                out,
+                " time_symbols({})",
+                time_symbols
+                    .iter()
+                    .map(|sym| print::val(*sym))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                " {{{}store_order = {}, store_set = {}, time_addr_map = {}, time_order = {}, \
+                 time_set = {}}}",
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
+                print::affine_map(store_order),
+                print::integer_set(store_set),
+                print::affine_map(time_addr_map),
+                print::affine_map(time_order),
+                print::integer_set(time_set),
+            );
+            print::indent(out, depth);
+            out.push_str("{\n");
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            let _ = writeln!(out, "}} : {}", print::memref(view_ty));
+        }
+        Op::Yield { values } => {
+            if values.is_empty() {
+                out.push_str("agen.yield\n");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "agen.yield {} : {}",
+                    values
+                        .iter()
+                        .map(|yielded| print::val(yielded.val))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    values
+                        .iter()
+                        .map(|yielded| print::vector(yielded.ty))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
         Op::VectorStore {
             value,
@@ -625,7 +765,7 @@ mod tests {
             time_order: planned.time_order,
             load_time_addr_map: planned.load_time_addr_map,
             store_time_addr_map: planned.store_time_addr_map,
-            body: vec![dialects::Op::Agen(Op::Yield)],
+            body: vec![dialects::Op::Agen(Op::Yield { values: Vec::new() })],
         })));
 
         let mut got = String::new();
@@ -782,7 +922,7 @@ time_set = affine_set<(d0) : (d0 == 0)>}
                     data: selected,
                     ty: sent,
                 }),
-                dialects::Op::Agen(Op::Yield),
+                dialects::Op::Agen(Op::Yield { values: Vec::new() }),
             ],
         })));
 

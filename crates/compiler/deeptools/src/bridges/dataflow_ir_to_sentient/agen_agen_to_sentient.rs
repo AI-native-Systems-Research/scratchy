@@ -241,6 +241,12 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             unit.on.kind()
         ),
 
+        // ── 4. `agen.composite_store` (`AgenToSentient.cpp:96-101`) ──────────────────────────────
+        agen::Op::CompositeStore(_) => todo!(
+            "e330_lowerCompositeStoreOp: agen.composite_store on {:?}",
+            unit.on.kind()
+        ),
+
         // ── 5. `agen.composite_load_and_store` (`AgenToSentient.cpp:102-109`) ────────────────────
         //
         // ⭐ THE EMISSION IS `e331_lowerCompositeLoadAndStoreOp`'s AND IT ALREADY EXISTS. The spine's
@@ -257,7 +263,7 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
         // ⛔ NOT REACHABLE FROM A UNIT'S STATEMENT LIST. `agen.yield` terminates a composite
         // transfer's REGION and is walked as part of it, never as the head of a unit body. It gets an
         // arm because the `match` is exhaustive by design, not because the reference has one.
-        agen::Op::Yield => todo!(
+        agen::Op::Yield { .. } => todo!(
             "agen.yield reached a unit's statement list on {:?} — it terminates a composite \
              transfer's region",
             unit.on.kind()

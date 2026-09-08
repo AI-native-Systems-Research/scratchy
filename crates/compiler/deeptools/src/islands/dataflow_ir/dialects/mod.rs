@@ -260,7 +260,11 @@ pub fn operands(op: &Op) -> Vec<Val> {
             } => reads.extend([*view, *dst, *size]),
         },
         Op::Agen(op) => match op {
-            agen::Op::Yield => {}
+            // ⭐ A YIELD'S VALUES ARE OPERANDS: the composite store's region hands its vector back
+            // through them (see [`agen::Op::Yield`]), and an empty list is the load-side terminator.
+            agen::Op::Yield { values } => {
+                reads.extend(values.iter().map(|yielded| yielded.val));
+            }
             agen::Op::VectorLoad { view, indices, .. } => {
                 reads.push(*view);
                 index_operands(indices, &mut reads);
@@ -287,6 +291,13 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.push(load.view);
                 index_operands(&load.indices, &mut reads);
                 reads.extend(load.time_symbols.iter().copied());
+            }
+            // ⭐ THE STORE'S OPERANDS, MINUS THE VECTOR: what it stores comes out of the region's
+            // [`agen::Op::Yield`], not an operand list.
+            agen::Op::CompositeStore(store) => {
+                reads.push(store.view);
+                index_operands(&store.indices, &mut reads);
+                reads.extend(store.time_symbols.iter().copied());
             }
             // ⭐ ONE OPERAND — `(ins Index:$mask_value, ..)` (`Agen.td:1094`); the slice map and the
             // element counts beside it are attributes.
@@ -324,8 +335,13 @@ pub fn operands(op: &Op) -> Vec<Val> {
             | vectorchain::Op::Floor { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
-            | vectorchain::Op::Shuffle { input, .. }
             | vectorchain::Op::Cast { input, .. } => reads.push(*input),
+            // ⭐ A SHUFFLE'S `variable` SCALARS ARE OPERANDS TOO, and the ONLY source of the
+            // elements a negative index selects — see [`vectorchain::Op::Shuffle::variable`].
+            vectorchain::Op::Shuffle { input, variable, .. } => {
+                reads.push(*input);
+                reads.extend(variable.iter().map(|scalar| scalar.val));
+            }
             vectorchain::Op::Rotate {
                 input, position, ..
             } => reads.extend([*input, *position]),
@@ -461,9 +477,10 @@ pub fn results(op: &Op) -> Vec<Val> {
             }
             // ⛔ A COMPOSITE LOAD BINDS NOTHING EITHER — see [`agen::Op::CompositeLoad`].
             agen::Op::VectorStore { .. }
-            | agen::Op::Yield
+            | agen::Op::Yield { .. }
             | agen::Op::CompositeLoadAndStore(_)
-            | agen::Op::CompositeLoad(_) => Vec::new(),
+            | agen::Op::CompositeLoad(_)
+            | agen::Op::CompositeStore(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::Estimate { result, .. }
@@ -615,7 +632,9 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             } => places.extend([view, dst, size]),
         },
         Op::Agen(op) => match op {
-            agen::Op::Yield => {}
+            agen::Op::Yield { values } => {
+                places.extend(values.iter_mut().map(|yielded| &mut yielded.val));
+            }
             agen::Op::VectorLoad { view, indices, .. } => {
                 places.push(view);
                 index_operands_mut(indices, &mut places);
@@ -639,6 +658,11 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 places.push(&mut load.view);
                 index_operands_mut(&mut load.indices, &mut places);
                 places.extend(load.time_symbols.iter_mut());
+            }
+            agen::Op::CompositeStore(store) => {
+                places.push(&mut store.view);
+                index_operands_mut(&mut store.indices, &mut places);
+                places.extend(store.time_symbols.iter_mut());
             }
             agen::Op::SetTransferMaskState { mask_value, .. } => places.push(mask_value),
         },
@@ -674,8 +698,12 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | vectorchain::Op::Neg { input, .. }
             | vectorchain::Op::ScanWithGap { input, .. }
             | vectorchain::Op::Select { input, .. }
-            | vectorchain::Op::Shuffle { input, .. }
             | vectorchain::Op::Cast { input, .. } => places.push(input),
+            // ⭐ AND THEY ARE RE-POINTABLE USES — see the read side.
+            vectorchain::Op::Shuffle { input, variable, .. } => {
+                places.push(input);
+                places.extend(variable.iter_mut().map(|scalar| &mut scalar.val));
+            }
             vectorchain::Op::Rotate {
                 input, position, ..
             } => places.extend([input, position]),
@@ -789,9 +817,10 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
                 vec![result]
             }
             agen::Op::VectorStore { .. }
-            | agen::Op::Yield
+            | agen::Op::Yield { .. }
             | agen::Op::CompositeLoadAndStore(_)
-            | agen::Op::CompositeLoad(_) => Vec::new(),
+            | agen::Op::CompositeLoad(_)
+            | agen::Op::CompositeStore(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::CreateAffineMaskSet { result, .. } => vec![result],
@@ -923,6 +952,7 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
         Op::Agen(agen::Op::CompositeLoad(load)) => vec![load.body.as_slice()],
+        Op::Agen(agen::Op::CompositeStore(store)) => vec![store.body.as_slice()],
         // ⛔⛔ AS MANY REGIONS AS IT HAS UNIT LISTS — `VariadicRegion<AnyRegion>:$regions`
         // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
         // `flatten` declines when `op_.getNumRegions() == num_of_regions`
@@ -974,6 +1004,7 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
         Op::Agen(agen::Op::CompositeLoad(load)) => vec![&mut load.body],
+        Op::Agen(agen::Op::CompositeStore(store)) => vec![&mut store.body],
         // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
         Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
             regions.iter_mut().map(|region| &mut region.body).collect()
@@ -1035,6 +1066,10 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
         // ⭐ AND THE BOXED ONE NEEDS ITS OWN ARM, because a `Box` field cannot join a pattern
         // alternation that binds the same name at a different depth.
         Op::Agen(agen::Op::CompositeLoad(load)) => load.dbg_name.as_deref(),
+        Op::Agen(agen::Op::CompositeStore(store)) => store.dbg_name.as_deref(),
+        // ⭐ `Dataflow_DebugNameOpInterface` IS ON `vectorchain.shuffle` (`VectorChain.td:435`), so
+        // it takes the interface path rather than the discardable-attribute one.
+        Op::VectorChain(vectorchain::Op::Shuffle { dbg_name, .. }) => dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1101,6 +1136,8 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
             | agen::Op::VectorLoad { dbg_name, .. },
         ) => Some(dbg_name),
         Op::Agen(agen::Op::CompositeLoad(load)) => Some(&mut load.dbg_name),
+        Op::Agen(agen::Op::CompositeStore(store)) => Some(&mut store.dbg_name),
+        Op::VectorChain(vectorchain::Op::Shuffle { dbg_name, .. }) => Some(dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
             affine::Op::Apply { .. }
@@ -1345,7 +1382,9 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             } => operands.extend([view, dst, size]),
         },
         Op::Agen(op) => match op {
-            agen::Op::Yield => {}
+            agen::Op::Yield { values } => {
+                operands.extend(values.iter_mut().map(|yielded| &mut yielded.val));
+            }
             agen::Op::VectorLoad {
                 result,
                 view,
@@ -1381,6 +1420,13 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 operands.extend(load.time_symbols.iter_mut());
                 block_args.push(&mut load.load_iv);
                 regions.push(&mut load.body);
+            }
+            agen::Op::CompositeStore(store) => {
+                let store = store.as_mut();
+                operands.push(&mut store.view);
+                index_operands_mut(&mut store.indices, &mut operands);
+                operands.extend(store.time_symbols.iter_mut());
+                regions.push(&mut store.body);
             }
             agen::Op::SetTransferMaskState {
                 result, mask_value, ..
@@ -1429,9 +1475,18 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             | vectorchain::Op::Neg { result, input, .. }
             | vectorchain::Op::ScanWithGap { result, input, .. }
             | vectorchain::Op::Select { result, input, .. }
-            | vectorchain::Op::Shuffle { result, input, .. }
             | vectorchain::Op::Cast { result, input, .. } => {
                 operands.push(input);
+                results.push(result);
+            }
+            vectorchain::Op::Shuffle {
+                result,
+                input,
+                variable,
+                ..
+            } => {
+                operands.push(input);
+                operands.extend(variable.iter_mut().map(|scalar| &mut scalar.val));
                 results.push(result);
             }
             vectorchain::Op::Rotate {
@@ -1889,7 +1944,13 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             }
         },
         Op::Agen(op) => match op {
-            agen::Op::Yield => {}
+            agen::Op::Yield { values } => {
+                vals.extend(
+                    values
+                        .iter_mut()
+                        .map(|yielded| (Role::Operand, &mut yielded.val)),
+                );
+            }
             agen::Op::VectorLoad {
                 result,
                 view,
@@ -1924,6 +1985,12 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 index_vals_mut(&mut load.indices, &mut vals);
                 vals.extend(load.time_symbols.iter_mut().map(|sym| (Role::Operand, sym)));
                 vals.push((Role::BlockArg, &mut load.load_iv));
+            }
+            agen::Op::CompositeStore(store) => {
+                let store = store.as_mut();
+                vals.push((Role::Operand, &mut store.view));
+                index_vals_mut(&mut store.indices, &mut vals);
+                vals.extend(store.time_symbols.iter_mut().map(|sym| (Role::Operand, sym)));
             }
             agen::Op::SetTransferMaskState {
                 result, mask_value, ..
@@ -1972,12 +2039,21 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             vectorchain::Op::Estimate { result, input, .. }
             | vectorchain::Op::ScanWithGap { result, input, .. }
             | vectorchain::Op::Select { result, input, .. }
-            | vectorchain::Op::Shuffle { result, input, .. }
             | vectorchain::Op::FastExp { result, input, .. }
             | vectorchain::Op::Floor { result, input, .. }
             | vectorchain::Op::Neg { result, input, .. }
             | vectorchain::Op::Cast { result, input, .. } => {
                 vals.push((Role::Operand, input));
+                vals.push((Role::Result, result));
+            }
+            vectorchain::Op::Shuffle {
+                result,
+                input,
+                variable,
+                ..
+            } => {
+                vals.push((Role::Operand, input));
+                vals.extend(variable.iter_mut().map(|scalar| (Role::Operand, &mut scalar.val)));
                 vals.push((Role::Result, result));
             }
             vectorchain::Op::Rotate {
@@ -2235,7 +2311,7 @@ mod unit_tests {
                     time_order: AffineMap::identity(1),
                     load_time_addr_map: AffineMap::identity(1),
                     store_time_addr_map: AffineMap::identity(1),
-                    body: vec![Op::Agen(agen::Op::Yield)],
+                    body: vec![Op::Agen(agen::Op::Yield { values: Vec::new() })],
                 },
             ))),
             // Two regions.
@@ -2243,7 +2319,7 @@ mod unit_tests {
                 cond: Val(60),
                 results: Vec::new(),
                 result_ty: ScalarTy::Index,
-                body: vec![Op::Agen(agen::Op::Yield)],
+                body: vec![Op::Agen(agen::Op::Yield { values: Vec::new() })],
                 else_body: Vec::new(),
                 dbg_name: None,
             }),

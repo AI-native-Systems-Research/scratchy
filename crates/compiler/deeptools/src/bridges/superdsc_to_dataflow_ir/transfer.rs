@@ -39,8 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e089_constructStreamingOrDoubleBufferingStore
-// crustify:todo: e090_GenerateLoadAndSendFromDataTransferNode
 // crustify:todo: e097_GenerateReceiveAndStoreFromDataTransferNode
 // crustify:todo: e098_GenerateDataTranferForSrc
 // crustify:todo: e102_GenerateDataTranferForDst
@@ -1256,7 +1254,7 @@ pub fn emit_implicit_loops_for_contiguous_transfer<'s>(
     implicit_loops: &[ImplicitLoop],
     transfer_name: &str,
     parent_loop: impl Fn(PrimaryDim) -> Option<&'s DfirOp>,
-    body: Vec<DfirOp>,
+    body: impl FnOnce(&mut Values, &[Val]) -> Vec<DfirOp>,
 ) -> Option<ImplicitNest> {
     /// One level of the nest, with everything it needs already minted.
     enum Level {
@@ -1375,13 +1373,19 @@ pub fn emit_implicit_loops_for_contiguous_transfer<'s>(
         ));
     }
 
-    // ── PASS TWO: fold the nest together from the innermost end ──
-    let mut ivs = Vec::with_capacity(implicit_loops.len());
-    let mut current = body;
+    // ── THE BODY, BETWEEN THE PASSES, WITH THE NEST'S OWN INDUCTION VARIABLES ──
+    // ⛔ THAT IS BOTH THE REFERENCE'S MINT ORDER AND ITS DATA FLOW: its builder descends through the
+    // loops it has just created, so whatever is emitted inside them is minted after every `iv` — and
+    // those `iv`s are read there, because a caller that prefixes these loops onto its `outer_loops`
+    // strides its base address against them (`:5768-5770`).
+    //
     // `levels` was pushed with `i` descending, so reversing it walks innermost outward — which is
     // also `i` ASCENDING, so `ivs` comes out in `implicit_loops` order by construction.
+    let ivs: Vec<Val> = levels.iter().rev().map(|(_, iv, _)| *iv).collect();
+
+    // ── PASS TWO: fold the nest together from the innermost end ──
+    let mut current = body(vals, &ivs);
     for (_, iv, level) in levels.into_iter().rev() {
-        ivs.push(iv);
         let (mut ops, loop_op) = match level {
             Level::Affine { extent } => (
                 Vec::new(),
@@ -1452,12 +1456,12 @@ fn is_2b16b_arm(elem: ElemType, width: u64, replication: i64) -> bool {
 /// which is exactly the relation `ShuffleOp::verify` enforces — `num_elements == indices.size() *
 /// repetition` (`dataflow-scheduler/lib/Dialect/VectorChain/IR/VectorChain.cpp:198-211`).
 ///
-/// ⚠️ THE `dbgName` SET FROM `transfer_->name_` HAS NO FIELD ON [`vectorchain::Op::Shuffle`] — the
-/// same gap entry 070 records.
+/// ⭐ `dbgName` IS `transfer_->name_` ON ALL NINE ARMS (`:1792` and its eight twins).
 #[must_use]
 pub fn construct_2b16b_load_shuffle(
     vals: &mut Values,
     ops: &mut Vec<DfirOp>,
+    name: &str,
     load_result: Val,
     result_ty: Vector,
     replication: Replication,
@@ -1470,6 +1474,8 @@ pub fn construct_2b16b_load_shuffle(
     ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
         result,
         input: load_result,
+        variable: Vec::new(),
+        dbg_name: Some(name.to_owned()),
         indices: (0..i32::try_from(elements_total).ok()?).collect(),
         repetition: u32::try_from(replication.get()).ok()?,
         input_ty: result_ty,
@@ -1499,6 +1505,7 @@ pub fn construct_2b16b_load_shuffle(
 pub fn construct_2b16b_store_shuffle(
     vals: &mut Values,
     ops: &mut Vec<DfirOp>,
+    name: &str,
     data: Val,
     result_ty: Vector,
     replication: Replication,
@@ -1511,6 +1518,8 @@ pub fn construct_2b16b_store_shuffle(
     ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
         result,
         input: data,
+        variable: Vec::new(),
+        dbg_name: Some(name.to_owned()),
         indices: (0..i32::try_from(element_size).ok()?).collect(),
         repetition: 1,
         input_ty: result_ty,
@@ -1629,14 +1638,13 @@ impl ConstantData {
 /// the one it calls is not, so the reference casts the constness away; nothing about the value being
 /// built depends on it.
 ///
-/// ⚠️ `ShuffleOp::create` ALSO PASSES `getStringAttr(transfer_->name_)`, which is the op's
-/// `OptionalAttr<StrAttr>:$dbgName` (`VectorChain.td:462`), and [`vectorchain::Op::Shuffle`] has no
-/// field for it — so the transfer's name is dropped from this one op. Recorded rather than papered
-/// over: adding the field touches every `Shuffle` construction in bridge 2 and belongs to whoever
-/// ports that op's `DebugNameOpInterface`, not to this entry.
+/// ⭐ `ShuffleOp::create` ALSO PASSES `getStringAttr(transfer_->name_)` into the op's
+/// `OptionalAttr<StrAttr>:$dbgName` (`VectorChain.td:462`), which entry 086 gave
+/// [`vectorchain::Op::Shuffle`] a field for.
 pub fn constant_bitstream_and_shuffle(
     vals: &mut Values,
     ops: &mut Vec<DfirOp>,
+    name: &str,
     handles: &Handles,
     data: &ConstantData,
     values: BitstreamValues,
@@ -1671,6 +1679,8 @@ pub fn constant_bitstream_and_shuffle(
     ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
         result,
         input,
+        variable: Vec::new(),
+        dbg_name: Some(name.to_owned()),
         indices,
         repetition,
         input_ty: bitstream_ty,
@@ -2119,14 +2129,26 @@ pub struct SwitchedLoad {
     pub update: BufferSwitchUpdate,
 }
 
-/// EVERYTHING ONE STREAMING OR DOUBLE-BUFFERED LOAD READS OFF ITS TRANSFER NODE.
+/// EVERYTHING A LOAD READS OFF ITS TRANSFER NODE, whichever of the two entries emits it.
 ///
 /// ⭐ A STRUCT BECAUSE THE REFERENCE READS TWENTY MEMBERS OF `transfer_`, `dsc_` and `this`, and a
 /// positional argument list that wide is one whose order is load-bearing and unstated.
+///
+/// ⛔ THE FOUR THINGS THAT ARE **NOT** HERE ARE THE FOUR ENTRY 090 COMPUTES AND PASSES: the outer
+/// loops, the form, the buffer-switch loop and the mode. They are entry 080's own arguments
+/// (`:5819-5822`) precisely because they are not reads — see [`StreamingLoad`] and [`LoadSource`].
 #[derive(Debug, Clone, Copy)]
-pub struct StreamingLoad<'i> {
+pub struct TransferRead<'i> {
     /// `src_storage` — the component the view is addressed through.
     pub storage: Component,
+    /// `src` — the component the data comes FROM, which is what the 2B/16B arm tests.
+    ///
+    /// ⚠️ NOT THE SAME MEMBER AS [`TransferRead::comp`], and entry 090 reads BOTH: the replication
+    /// shuffle is gated on `src == LXLU` (`:5938`) and the rotation's check on `comp_ == LXLU`
+    /// (`:5882`). Entry 080 tests `comp_` for the same shuffle (`:4023`), so on the streaming path a
+    /// transfer FROM the LX loaded BY another unit replicates through `vectorchain.select` while the
+    /// same transfer on the non-switched path replicates through the shuffle. Transcribed both ways.
+    pub src: GenericComp,
     /// `core_id_`.
     pub core: Core,
     /// `corelet_id_`, and [`None`] for the reference's `-1` — see
@@ -2135,8 +2157,16 @@ pub struct StreamingLoad<'i> {
     /// `comp_` — the unit this program is lowered FOR, which picks the replication arm and the
     /// conversion's target width.
     pub comp: GenericComp,
-    /// `{comp_, src_storage}` as the address-granularity table keys it.
+    /// `{comp_, src_storage}` as the address-granularity table keys it, for entry 080.
     pub location: DataLocation,
+    /// `{src, src_storage}` — the same table, for entry 090's own memory arm.
+    ///
+    /// ⚠️⚠️ TWO ROWS FOR ONE TRANSFER, AND THE PATH DECIDES WHICH. `:5951-5952` reads the factor for
+    /// the component the data comes FROM and `:4192-4194` reads it for the unit being lowered, so a
+    /// transfer whose `src` and `comp_` differ scales its start address by one row on the switched
+    /// path and by another on the unswitched one. Two fields because it is two reads; a single
+    /// [`DataLocation`] here would silently pick one of them for both.
+    pub src_location: DataLocation,
     /// `transfer_->name_` — the `dbgName` of every op that has one.
     pub name: &'i str,
     /// `dsc_->name_` — the node an error names.
@@ -2145,8 +2175,6 @@ pub struct StreamingLoad<'i> {
     pub view_sizes: &'i [ViewSize],
     /// The view's element type.
     pub elem: ElemType,
-    /// `outer_loops` — the strides the base address sums.
-    pub outer_loops: &'i [LoopStride],
     /// `transfer_->unitTimeTransferChunkSize_`.
     pub chunk_sizes: &'i [ChunkDim],
     /// `transfer_->unitTimeTransferChunkStride_`.
@@ -2159,7 +2187,7 @@ pub struct StreamingLoad<'i> {
     pub dst_result_ty: Vector,
     /// `dst_prec_` — the format that conversion targets.
     pub dst_prec: DataType,
-    /// The DSC format [`StreamingLoad::result_ty`] was built from.
+    /// The DSC format [`TransferRead::result_ty`] was built from.
     ///
     /// ⛔ IT MUST BE THAT SAME FORMAT. The reference reads the granularity factor's width off
     /// `getElementType(result_type)` (`:4192-4195`), so this and `result_ty.elem` are two spellings of
@@ -2177,6 +2205,16 @@ pub struct StreamingLoad<'i> {
     pub latches: &'i [Latch],
     /// `to` — the destination the send spends.
     pub to: SendEnd,
+}
+
+/// EVERYTHING ONE STREAMING OR DOUBLE-BUFFERED LOAD IS — the transfer's own reads, plus the three
+/// things entry 090 hands entry 080.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamingLoad<'i> {
+    /// What the transfer node says.
+    pub read: TransferRead<'i>,
+    /// `outer_loops` — the strides the base address sums, as entry 090 assembled them.
+    pub outer_loops: &'i [LoopStride],
     /// Vector or composite, with the composite's time loops.
     pub form: LoadForm<'i>,
     /// The buffer-switch loop this transfer's address rides in.
@@ -2214,20 +2252,26 @@ fn replicate(
     vals: &mut Values,
     into: &mut Vec<DfirOp>,
     input: Val,
-    load: &StreamingLoad<'_>,
+    read: &TransferRead<'_>,
 ) -> (Val, Vector) {
     // ⭐ `unsigned_abs` IS EXACT HERE: [`Replication::checked`] refused everything below 1, so the
     // magnitude IS the factor. `getNumElements(result_type) * replicationFactor_`.
     let widened = Vector {
-        len: load.result_ty.len * load.replication.get().unsigned_abs(),
-        elem: load.result_ty.elem,
+        len: read.result_ty.len * read.replication.get().unsigned_abs(),
+        elem: read.result_ty.elem,
     };
-    if load.comp == GenericComp::Lxlu {
+    if read.comp == GenericComp::Lxlu {
         // `if (auto shuffle_op = construct2B16BLoadShuffle(..)) .. else emitError("Unsupported load
         //  type.")` — and [`construct_2b16b_load_shuffle`] states the widened type itself.
-        let shuffled =
-            construct_2b16b_load_shuffle(vals, into, input, load.result_ty, load.replication)
-                .unwrap_or_else(|| emit_error(load.node, "Unsupported load type."));
+        let shuffled = construct_2b16b_load_shuffle(
+            vals,
+            into,
+            read.name,
+            input,
+            read.result_ty,
+            read.replication,
+        )
+        .unwrap_or_else(|| emit_error(read.node, "Unsupported load type."));
         return (shuffled, widened);
     }
     // `AffineMap::get(1, 0, dim % transfer_->replicationFactor_)`.
@@ -2235,8 +2279,8 @@ fn replicate(
     into.push(DfirOp::VectorChain(vectorchain::Op::Select {
         result,
         input,
-        selection_map: AffineMap::unary(AffineExpr::dim(0).modulo(load.replication.get())),
-        input_ty: load.result_ty,
+        selection_map: AffineMap::unary(AffineExpr::dim(0).modulo(read.replication.get())),
+        input_ty: read.result_ty,
         ty: widened,
     }));
     (result, widened)
@@ -2256,7 +2300,7 @@ fn rotate(
     into: &mut Vec<DfirOp>,
     input: Val,
     input_ty: Vector,
-    load: &StreamingLoad<'_>,
+    read: &TransferRead<'_>,
     rotation: Rotation,
 ) -> (Val, Vector) {
     let position = constant_index(vals, into, rotation.get());
@@ -2268,9 +2312,9 @@ fn rotate(
         // ⛔ THE REFERENCE PASSES NO `right_shift`, and the `.td` defaults it to true.
         right_shift: true,
         input_ty,
-        ty: load.result_ty,
+        ty: read.result_ty,
     }));
-    (result, load.result_ty)
+    (result, read.result_ty)
 }
 
 /// THE CONVERSION A MISMATCHED DESTINATION PRECISION ASKS FOR — `dst_result_type != result_type &&
@@ -2285,11 +2329,11 @@ fn convert(
     into: &mut Vec<DfirOp>,
     value: Val,
     value_ty: Vector,
-    load: &StreamingLoad<'_>,
+    read: &TransferRead<'_>,
 ) -> (Val, Vector) {
     // `getDimSize(result_type, 0) * getElementTypeBitWidth(result_type)`.
-    let input_bits = load.result_ty.len * u64::from(load.result_ty.elem.bits());
-    if load.dst_result_ty == load.result_ty || input_bits == STICK_BITS {
+    let input_bits = read.result_ty.len * u64::from(read.result_ty.elem.bits());
+    if read.dst_result_ty == read.result_ty || input_bits == STICK_BITS {
         return (value, value_ty);
     }
     // ⛔ `tmp_data` IS THE SOURCE AND `load_op_result` IS THE OUT-PARAMETER, both spelling the same
@@ -2299,12 +2343,12 @@ fn convert(
         vals,
         into,
         Computed::of(value, value_ty),
-        load.dst_prec,
-        load.comp,
+        read.dst_prec,
+        read.comp,
     )
     .unwrap_or_else(|| {
         emit_error(
-            load.node,
+            read.node,
             "Unable to construct precision conversion in a transfer operation",
         )
     });
@@ -2349,9 +2393,9 @@ fn convert(
 ///
 /// ⚠️ `OpBuilder factor_builder(*this->unit_op_)` (`:4187`) IS CREATED AND NEVER USED.
 ///
-/// ⚠️ `dataflow.send` CARRIES NO `dbgName` FIELD, so this transfer's name is dropped from the send —
-/// the same gap [`constant_bitstream_and_shuffle`] records for `vectorchain.shuffle`, and it belongs
-/// to whoever ports `DebugNameOpInterface` for those ops.
+/// ⚠️ `dataflow.send` CARRIES NO `dbgName` FIELD, so this transfer's name is dropped from the send.
+/// It belongs to whoever ports `DebugNameOpInterface` for that op — `vectorchain.shuffle`, which
+/// used to be recorded here beside it, has the field as of entry 086.
 ///
 /// ⛔ [`None`] IS ONLY THE THREE SILENT `failure()`s — the logical view's, the time set's and the time
 /// address map's (`:3968`, `:4100`, `:4109`). Every other refusal in the reference goes through
@@ -2369,7 +2413,7 @@ where
     // `retrieveGetUnitOpInSameCore(builder, src_storage, core_id_, corelet_id_)`.
     let storage_unit = storage_handle(
         ops,
-        retrieve_get_unit_op_in_same_core(vals, handlers, load.storage, load.core, load.corelet),
+        retrieve_get_unit_op_in_same_core(vals, handlers, load.read.storage, load.read.core, load.read.corelet),
     )?;
 
     // `constructLogicalMemoryViewOp(builder, *view_sizes_core_specific, storage_unit_op,
@@ -2377,10 +2421,10 @@ where
     let view = logical_memory_view(
         vals,
         ops,
-        load.view_sizes,
+        load.read.view_sizes,
         storage_unit,
         load.switch.start_address,
-        load.elem,
+        load.read.elem,
         false,
     )?;
     let rank = view.layout.dims;
@@ -2397,13 +2441,13 @@ where
     // `constructLoadOrStoreSet(builder, unitTimeTransferChunkSize_, unitTimeTransferChunkStride_,
     //  *view_sizes_core_specific, /*is_load*/ true, load_set, unitTimeTransferNumChunks_)`.
     let load_set = load_or_store_set(
-        load.chunk_sizes,
-        load.chunk_stride.as_ref(),
+        load.read.chunk_sizes,
+        load.read.chunk_stride.as_ref(),
         rank,
         TransferSide::Load,
-        load.num_chunks,
+        load.read.num_chunks,
     )
-    .unwrap_or_else(|| emit_error(load.node, "Unable to construct load set"));
+    .unwrap_or_else(|| emit_error(load.read.node, "Unable to construct load set"));
 
     // ⚠️ `load_order_map = getMultiDimIdentityMap(view.getLayoutMap().getNumDims())` (`:3994`) IS THE
     // SET THE ISLAND DERIVES rather than stores — [`agen::Access`] says why, and the view's rank is
@@ -2420,30 +2464,30 @@ where
                 result: loaded,
                 view: view.result,
                 indices: base.indices.clone(),
-                dbg_name: Some(load.name.to_owned()),
+                dbg_name: Some(load.read.name.to_owned()),
                 access: agen::Access::Stated(load_set),
                 view_ty: view.ty.clone(),
-                ty: load.result_ty,
+                ty: load.read.result_ty,
             }));
 
             // `for (dst_idx) if (dst_via.loc_.unit_ == LXLUVALUE) addToLatchMap(latch_id, ..)`.
-            latches = load.latches.iter().map(|latch| (*latch, loaded)).collect();
+            latches = load.read.latches.iter().map(|latch| (*latch, loaded)).collect();
 
             // `if (transfer_->replicationFactor_ != 1) .. else load_op = load_op_wo_repl;`
-            let (mut value, mut value_ty) = if load.replication.get() == 1 {
-                (loaded, load.result_ty)
+            let (mut value, mut value_ty) = if load.read.replication.get() == 1 {
+                (loaded, load.read.result_ty)
             } else {
-                replicate(vals, ops, loaded, load)
+                replicate(vals, ops, loaded, &load.read)
             };
-            if let Some(rotation) = load.rotate {
-                (value, value_ty) = rotate(vals, ops, value, value_ty, load, rotation);
+            if let Some(rotation) = load.read.rotate {
+                (value, value_ty) = rotate(vals, ops, value, value_ty, &load.read, rotation);
             }
-            (value, value_ty) = convert(vals, ops, value, value_ty, load);
+            (value, value_ty) = convert(vals, ops, value, value_ty, &load.read);
 
             // `if (!use_latch) SendOp::create(builder, loc, to, load_op_result, nullptr, name)`.
-            if load.latches.is_empty() {
+            if load.read.latches.is_empty() {
                 ops.push(DfirOp::Dataflow(dataflow::Op::Send {
-                    to: load.to,
+                    to: load.read.to,
                     data: value,
                     ty: value_ty,
                 }));
@@ -2467,34 +2511,34 @@ where
             let mut body = Vec::new();
 
             // `if (replicationFactor_ != 1) .. else load = composite_load.getLoadInductionVar();`
-            let (mut value, mut value_ty) = if load.replication.get() == 1 {
-                (load_iv, load.result_ty)
+            let (mut value, mut value_ty) = if load.read.replication.get() == 1 {
+                (load_iv, load.read.result_ty)
             } else {
-                replicate(vals, &mut body, load_iv, load)
+                replicate(vals, &mut body, load_iv, &load.read)
             };
-            if let Some(rotation) = load.rotate {
-                (value, value_ty) = rotate(vals, &mut body, value, value_ty, load, rotation);
+            if let Some(rotation) = load.read.rotate {
+                (value, value_ty) = rotate(vals, &mut body, value, value_ty, &load.read, rotation);
             }
             // ⛔⛔ IN THE REGION, NOT AFTER IT — the divergence this function's own note explains.
-            (value, value_ty) = convert(vals, &mut body, value, value_ty, load);
+            (value, value_ty) = convert(vals, &mut body, value, value_ty, &load.read);
 
             // `SendOp::create(local_builder, loc, to, load, nullptr, name)` — ⭐ UNCONDITIONAL here:
             // the composite arm has no latch walk and so no `use_latch` to test.
             body.push(DfirOp::Dataflow(dataflow::Op::Send {
-                to: load.to,
+                to: load.read.to,
                 data: value,
                 ty: value_ty,
             }));
-            body.push(DfirOp::Agen(agen::Op::Yield));
+            body.push(DfirOp::Agen(agen::Op::Yield { values: Vec::new() }));
 
             ops.push(DfirOp::Agen(agen::Op::CompositeLoad(Box::new(
                 agen::CompositeLoad {
                     view: view.result,
-                    dbg_name: Some(load.name.to_owned()),
+                    dbg_name: Some(load.read.name.to_owned()),
                     indices: base.indices.clone(),
                     view_ty: view.ty.clone(),
                     load_iv,
-                    load_iv_ty: load.result_ty,
+                    load_iv_ty: load.read.result_ty,
                     load_set,
                     load_order: AffineMap::identity(rank),
                     // ⭐ `drop_back(0)` AND `take_back(0)`: see this function's note on
@@ -2510,49 +2554,11 @@ where
     }
 
     // `getAddressGranularityMultiplyFactor(comp_, src_storage, getElementType(result_type))`.
-    let factor = address_granularity_multiply_factor(load.location, load.precision);
-
-    // ⛔ A LIST OF ITS OWN — see [`BufferSwitchUpdate::ops`].
-    let mut update = Vec::new();
-    let carried = load.switch.carried;
-    // ⛔ THE INCREMENT IS BUILT BEFORE THE ARITHMETIC IN BOTH ARMS (`:4021-4041`, `:4042-4069`), and
-    // that is what the printed `%N` are: minting the sum's result up front would number it below its
-    // own operand.
-    let operand = match step {
-        BufferStep::Streaming(increment) => {
-            let increment = increment(vals, &mut update, factor);
-            // ⛔ `AddIOp(getIndexType(), terminator->getOperand(iter_arg_index), buffer_increment)` —
-            // the address WALKS.
-            let result = vals.mint();
-            update.push(DfirOp::Arith(arith::Op::AddI(IntBinary {
-                result,
-                lhs: carried,
-                rhs: increment,
-                ty: ScalarTy::Index,
-            })));
-            result
-        }
-        BufferStep::Buffering(increment) => {
-            let increment = increment(vals, &mut update, factor);
-            // ⛔ `SubIOp(getIndexType(), buffer_increment, terminator->getOperand(iter_arg_index))` —
-            // REVERSED, and the address TOGGLES.
-            let result = vals.mint();
-            update.push(DfirOp::Arith(arith::Op::SubI(IntBinary {
-                result,
-                lhs: increment,
-                rhs: carried,
-                ty: ScalarTy::Index,
-            })));
-            result
-        }
-    };
+    let factor = address_granularity_multiply_factor(load.read.location, load.read.precision);
 
     Some(SwitchedLoad {
         latches,
-        update: BufferSwitchUpdate {
-            ops: update,
-            operand,
-        },
+        update: buffer_switch_update(vals, factor, load.switch, step),
     })
 }
 
@@ -2993,6 +2999,7 @@ pub fn generate_load_and_store_from_data_transfer_node(
         } => constant_bitstream_and_shuffle(
             vals,
             &mut ops,
+            transfer.name,
             handles,
             data,
             values,
@@ -3154,6 +3161,930 @@ pub fn generate_data_transfers_for_via_if_so(
         count,
         transfer.result_ty,
     ))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 089/110 — THE STORE HALF OF A BUFFER-SWITCHED TRANSFER
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH STORE ONE BUFFER-SWITCHED TRANSFER WRITES — `perform_composite_store` (`:5588`).
+///
+/// ⛔⛔ THE COMPOSITE ARM'S PRODUCER MOVES INTO THE REGION, WHICH IS WHY IT TRAVELS HERE. The
+/// reference clones `result_to_store.getDefiningOp()` to the start of the store's body and then
+/// ERASES the original (`:5630-5636`), so the op that computes the stored vector must not still be
+/// standing in the caller's list — and no `Vec<DfirOp>` of already-emitted ops can say that.
+pub enum StoreForm<'s> {
+    /// `agen.vector_store` of a value the caller has already emitted where it stands.
+    Vector,
+    /// `agen.composite_store`, walking its own time axis with the producer inside it.
+    Composite {
+        /// `composite_loops` — the time axis, read for the order map, the set and the address map.
+        loops: &'s [CompositeTimeLoop],
+        /// The ONE op that defines the stored vector, MOVED in from where the caller built it.
+        ///
+        /// ⛔ ITS FIRST RESULT IS THE STORED VECTOR: `insertOperands(0, {cloned_op->getResult(0)})`
+        /// (`:5634-5635`) puts that result on the region's terminator, so the `data` this function is
+        /// handed and this op's result are one value.
+        producer: DfirOp,
+    },
+}
+
+/// EVERYTHING ONE STREAMING OR DOUBLE-BUFFERED STORE READS OFF ITS TRANSFER NODE.
+///
+/// ⭐ THE MIRROR OF [`StreamingLoad`], MINUS THE CHAIN: a store has no replication, no rotation and
+/// no conversion of its own — its value arrives finished, because the compute or receive that
+/// produced it already answered for the width.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamingStore<'i> {
+    /// `dst_storage` — the component the view is addressed through.
+    pub storage: Component,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_`, and [`None`] for the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `{comp_, dst_storage}` as the address-granularity table keys it.
+    pub location: DataLocation,
+    /// `transfer_->name_` — the store's `dbgName`.
+    pub name: &'i str,
+    /// `dsc_->name_` — the node an error names.
+    pub node: &'i str,
+    /// `*view_sizes_core_specific` — `dstLoopsAndSizes_[0]`, already resolved for this core.
+    pub view_sizes: &'i [ViewSize],
+    /// The view's element type.
+    pub elem: ElemType,
+    /// `outer_loops` — the strides the base address sums.
+    pub outer_loops: &'i [LoopStride],
+    /// `unitTimeTransferChunkSize_` and `unitTimeTransferChunkStride_`.
+    ///
+    /// ⚠️ `unitTimeTransferNumChunks_` IS NOT PASSED HERE, so entry 077's own default stands
+    /// (`:5579-5583`) — a caller mirroring the load must not carry the load's chunk count in.
+    pub chunks: UnitTimeChunks<'i>,
+    /// `result_type`'s format — what the granularity factor is read at.
+    pub precision: DataType,
+    /// The buffer-switch loop this transfer's address rides in.
+    pub switch: BufferSwitchLoop,
+}
+
+/// Replaces: e089_constructStreamingOrDoubleBufferingStore
+///
+/// **089/110** `SNTransferLowering::constructStreamingOrDoubleBufferingStore` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1205` (185L).
+///
+/// THE STORE HALF OF A TRANSFER WHOSE ADDRESS IS CARRIED BY A LOOP: a logical view over the
+/// buffer-switch loop's `iter_arg`, one `agen.vector_store` or `agen.composite_store` through it, and
+/// the arithmetic that hands the next buffer's address back to the loop.
+///
+/// ⛔⛔ IT ASKS ENTRY 077 FOR A **LOAD**. `constructElementsOfAgenDataTransfer(builder, dst_storage,
+/// /*is_load*/ true, ..)` (`:5579-5580`) — on the store side, so the `transfer_set` this store carries
+/// is built by entry 067's LOAD arm. Transcribed, not repaired: the two arms differ in which
+/// dimension the chunk stride is applied to, and every buffer-switched store in the tree is emitted
+/// with the load's answer today.
+///
+/// ⚠️ THE `store_op` OUT-PARAMETER IS NEVER ASSIGNED. Both arms bind their store to a local
+/// (`agen_store_op`, `composite_store`), so nothing the caller passes comes back.
+///
+/// ⛔ [`None`] IS THE TIME ORDER'S ABSENCE ALONE — `getPermutationMap({})` asserts inside MLIR where
+/// a composite store has no time loop (`:5605-5607`); entry 077's own failure is reported through
+/// [`emit_error`], as the reference reports it.
+pub fn construct_streaming_or_double_buffering_store<F>(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    store: &StreamingStore<'_>,
+    data: Computed,
+    form: StoreForm<'_>,
+    step: BufferStep<F>,
+) -> Option<BufferSwitchUpdate>
+where
+    F: FnOnce(&mut Values, &mut Vec<DfirOp>, Factor) -> Val,
+{
+    let transfer = AgenStorage {
+        storage: store.storage,
+        core: store.core,
+        corelet: store.corelet,
+        // ⛔ THE REFERENCE'S OWN `true` — see this function's note.
+        side: TransferSide::Load,
+        // `start_address` — the buffer-switch loop's `iter_arg`, so the view moves with it.
+        start_address: store.switch.start_address,
+        view_sizes: store.view_sizes,
+        elem: store.elem,
+        outer_loops: store.outer_loops,
+        // `is_constant_read_write` is left at its default.
+        addressed_as: AddressedAs::Schedule,
+    };
+
+    match form {
+        StoreForm::Vector => {
+            let elements =
+                elements_of_agen_data_transfer(vals, ops, handlers, &transfer, &store.chunks)
+                    .unwrap_or_else(|| {
+                        emit_error(
+                            store.node,
+                            "Unable to construct elements of agen data transfer",
+                        )
+                    });
+            // `agen::VectorStoreOp::create(builder, loc, result_to_store, view.getResult(),
+            //  getStringAttr(transfer_->name_), base_address_map, base_address_args, transfer_set,
+            //  transfer_order)`.
+            ops.push(DfirOp::Agen(agen::Op::VectorStore {
+                value: data.val(),
+                view: elements.view.result,
+                indices: elements.base_address.indices.clone(),
+                dbg_name: Some(store.name.to_owned()),
+                access: agen::Access::Stated(elements.transfer_set),
+                view_ty: elements.view.ty,
+                ty: data.ty(),
+            }));
+        }
+        StoreForm::Composite { loops, producer } => {
+            // ⭐ ENTRY 078 IS EXACTLY THIS ARM'S FOUR STEPS. The reference calls entry 077 and then
+            // repeats `getPermutationMap`, `constructTimeSet` and `constructTimeAddressMap` inline
+            // (`:5596-5620`) — the same three, over the same `composite_loops`, against the same
+            // view rank.
+            let composite = elements_of_agen_composite_data_transfer(
+                vals,
+                ops,
+                handlers,
+                &transfer,
+                &store.chunks,
+                loops,
+            )
+            .unwrap_or_else(|| {
+                emit_error(
+                    store.node,
+                    "Unable to construct elements of agen data transfer",
+                )
+            });
+            let elements = composite.elements;
+            ops.push(DfirOp::Agen(agen::Op::CompositeStore(Box::new(
+                agen::CompositeStore {
+                    view: elements.view.result,
+                    dbg_name: Some(store.name.to_owned()),
+                    indices: elements.base_address.indices.clone(),
+                    view_ty: elements.view.ty,
+                    store_set: elements.transfer_set,
+                    store_order: elements.transfer_order,
+                    // ⭐ `{}` — the reference passes no time symbols (`:5626`).
+                    time_symbols: Vec::new(),
+                    time_set: composite.time_set,
+                    time_order: composite.time_order?,
+                    time_addr_map: composite.time_address_map,
+                    // The moved producer, then the terminator that carries its result.
+                    body: vec![
+                        producer,
+                        DfirOp::Agen(agen::Op::Yield {
+                            values: vec![agen::Yielded {
+                                val: data.val(),
+                                ty: data.ty(),
+                            }],
+                        }),
+                    ],
+                },
+            ))));
+        }
+    }
+
+    // `getAddressGranularityMultiplyFactor(comp_, dst_storage, getElementType(result_type))`.
+    let factor = address_granularity_multiply_factor(store.location, store.precision);
+    Some(buffer_switch_update(vals, factor, store.switch, step))
+}
+
+/// THE NEXT BUFFER'S ADDRESS — the increment, then the one arithmetic op each mode writes
+/// (`:5641-5697`, and entry 080's `:4198-4252`).
+///
+/// ⛔ ONE FUNCTION FOR BOTH ENTRIES BECAUSE THE TWO TAILS ARE THE SAME TEXT: the load's reads
+/// `srcLdsAndLoopOffsets_[0]` and the store's `dstLdsAndLoopOffsets_[0]`, which is the caller's
+/// closure either way, and everything after that — the operand order, the index type and the
+/// terminator operand replaced — is character-for-character identical.
+fn buffer_switch_update<F>(
+    vals: &mut Values,
+    factor: Factor,
+    switch: BufferSwitchLoop,
+    step: BufferStep<F>,
+) -> BufferSwitchUpdate
+where
+    F: FnOnce(&mut Values, &mut Vec<DfirOp>, Factor) -> Val,
+{
+    // ⛔ A LIST OF ITS OWN — see [`BufferSwitchUpdate::ops`].
+    let mut update = Vec::new();
+    // ⛔ THE INCREMENT IS BUILT BEFORE THE ARITHMETIC IN BOTH ARMS (`:4021-4041`, `:4042-4069`), and
+    // that is what the printed `%N` are: minting the sum's result up front would number it below its
+    // own operand.
+    let operand = match step {
+        BufferStep::Streaming(increment) => {
+            let increment = increment(vals, &mut update, factor);
+            // ⛔ `AddIOp(getIndexType(), terminator->getOperand(iter_arg_index), buffer_increment)` —
+            // the address WALKS.
+            let result = vals.mint();
+            update.push(DfirOp::Arith(arith::Op::AddI(IntBinary {
+                result,
+                lhs: switch.carried,
+                rhs: increment,
+                ty: ScalarTy::Index,
+            })));
+            result
+        }
+        BufferStep::Buffering(increment) => {
+            let increment = increment(vals, &mut update, factor);
+            // ⛔ `SubIOp(getIndexType(), buffer_increment, terminator->getOperand(iter_arg_index))` —
+            // REVERSED, and the address TOGGLES.
+            let result = vals.mint();
+            update.push(DfirOp::Arith(arith::Op::SubI(IntBinary {
+                result,
+                lhs: increment,
+                rhs: switch.carried,
+                ty: ScalarTy::Index,
+            })));
+            result
+        }
+    };
+    BufferSwitchUpdate {
+        ops: update,
+        operand,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 090/110 — THE LOAD AND THE SEND
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE TWO LOOP LISTS ONE CORELET VIEW CARRIES, before this entry merges them (`:5717-5782`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewLoops<'v> {
+    /// `view_sizes.outerLoops_` — the TAIL of the merged `outer_loops` list on every path.
+    pub outer: &'v [LoopStride],
+    /// `view_sizes.compositeLoops_`.
+    pub composite: &'v [CompositeView],
+}
+
+/// ONE COMPOSITE LOOP IN THE THREE READINGS THIS ENTRY TAKES OF IT.
+///
+/// ⛔⛔ THE SAME LIST IS A TIME AXIS OR A SET OF ADDRESS STRIDES, decided AFTER it is built:
+/// `composite_loops` feeds the time set and the time address map when `perform_composite_load`
+/// survives (`:5768`) and is spliced into `outer_loops` for [`construct_base_address`] when it does
+/// not (`:5770-5772`). An entry that could answer only one of the two questions would make half the
+/// reference's paths unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeView {
+    /// Its bound, as [`time_set`] and [`epilogues_in_loops`] read it.
+    pub bound: LoopBound,
+    /// Its `sizeIdx_` and `elemOffset_`, as [`time_address_map`] reads them.
+    pub walk: CompositeLoop,
+    /// The induction variable of the loop the schedule emitted for it — see [`LoopStride::iv`].
+    pub iv: Option<Val>,
+}
+
+impl CompositeView {
+    /// The time-axis reading.
+    const fn time(self) -> CompositeTimeLoop {
+        CompositeTimeLoop {
+            bound: self.bound,
+            walk: self.walk,
+        }
+    }
+
+    /// The address-stride reading, and [`None`] for the reference's `sizeIdx_ == -1` — which
+    /// [`construct_base_address`] would index `dims[-1]` with.
+    fn stride(self) -> Option<LoopStride> {
+        Some(LoopStride {
+            size_idx: self.walk.size_idx?,
+            elem_offset: self.walk.elem_offset,
+            iv: self.iv,
+        })
+    }
+}
+
+/// `ctgs_transfer_sizes` AS THE REFERENCE ACTUALLY READS IT — `.empty()`, once (`:5754`).
+///
+/// ⛔ IT IS NOT THE COUNTS. Entry 068's own note records that the map is a dead parameter inside it:
+/// every count it reads and writes is a MEMBER, which is [`ContiguousSticks`]. So the map's single
+/// contribution to this lowering is whether it has any entry at all, and passing the counts again
+/// here would give a caller two places to state them and one to be believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContiguousTransfer {
+    /// `ctgs_transfer_sizes.empty()` — no implicit loops, and the composite loops fall back into
+    /// `outer_loops` whenever this is not a composite load.
+    Absent,
+    /// Non-empty — entry 068 is asked which loops the contiguous transfer still needs.
+    Sized,
+}
+
+/// WHERE ONE LOAD'S DATA COMES FROM — `src_storage`, and the closure each arm needs (`:5798-5949`).
+///
+/// ⛔⛔ THE MODE PREEMPTS THE STORAGE, WHICH IS WHY THESE ARE ONE ENUM. `mode == 2 || mode == 1` is
+/// tested BEFORE `src_storage` is looked at (`:5816-5824`), so a ZERO or CONSTANT source on a
+/// streaming or double-buffered transfer goes through entry 080 and is loaded from a memory view like
+/// any other — the constant is never read. Two flags would let a caller state a switched constant
+/// and expect the constant to win.
+///
+/// ⛔ AND `LATCH` PREEMPTS BOTH: it is tested before the mode is even asked for (`:5798`), so a
+/// latched transfer never reaches [`buffering_or_streaming_mode`] and its own refusal.
+pub enum LoadSource<'s> {
+    /// `LATCH` — `getFromLatchMap(latchDataId_)`, already bound by the load that filled it.
+    ///
+    /// ⛔ THE TWO `DT_CHECK`s ARE THIS VARIANT'S ARGUMENT: `latch_id != -1` and a non-empty map hit
+    /// (`:5800-5803`) are both absences of a [`Val`], so a caller that has neither cannot build this.
+    Latch(Val),
+    /// `mode == 2 || mode == 1` — entry 080 emits the whole chain, including its own send.
+    Switched {
+        /// The buffer-switch loop the address rides in.
+        switch: BufferSwitchLoop,
+        /// Which way it moves, and the fold read that gives the step.
+        step: BufferStep<&'s dyn Fn(&mut Values, &mut Vec<DfirOp>, Factor) -> Val>,
+    },
+    /// `ZERO` — `arith.constant dense<0>`, with no view and no address at all.
+    Zero,
+    /// `CONSTANT` — entry 070 over `dsc_->constantInfo_.at(constantId_)`.
+    ///
+    /// ⚠️ THE REFERENCE'S `DT_CHECK(cst_idx >= 0)` IS DEAD (`:5834-5836`): it runs AFTER the
+    /// `.at(cst_idx)` that would already have thrown. The absence is [`ConstantData`]'s to state.
+    Constant {
+        /// The unit handles entry 032's fold query is asked over.
+        handles: &'s Handles,
+        /// `cst_info` — the folds, their format and the component they are bound on.
+        data: &'s ConstantData,
+        /// Whether the elements are bit patterns or symbol ids.
+        values: BitstreamValues,
+        /// The per-fold read of the constant's data.
+        bitstream: &'s dyn Fn(Core, Corelet, u32) -> Vec<i64>,
+    },
+    /// Anything else — a logical memory view over the transfer's own start address.
+    Memory {
+        /// `constructUniformizedFoldedAddress(startAddr_, factor)`, or the single scaled constant its
+        /// non-uniformized `else` emits (`:5952-5966` of the extract).
+        address: &'s dyn Fn(&mut Values, &mut Vec<DfirOp>, Factor) -> Val,
+        /// `constantId_ != -1` — the flag entries 077 and 078 shape all three of their answers from.
+        addressed_as: AddressedAs,
+    },
+}
+
+/// WHERE THE IMPLICIT NEST GOES — the reference's `builder` (`:5742-5749`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestPlace {
+    /// The caller's own insertion point.
+    Here,
+    /// The START of the body of the **FIRST** loop recorded for this composite loop —
+    /// `(*dsc_loops_to_mlir_loops_map_)[composite_loops.front().loop_].front()` (`:5744`).
+    InFirstLoopFor(CompositeView),
+}
+
+/// WHERE THE LOAD AND ITS SEND GO — the reference's `loop_builder` (`:5784-5795`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainPlace {
+    /// The caller's own point, which `loop_builder` was set to before anything moved (`:5727-5729`).
+    Here,
+    /// The START of the body of the **LAST** loop recorded for this composite loop —
+    /// `(*dsc_loops_to_mlir_loops_map_)[outer_loops.front().loop_].back()` (`:5787`).
+    ///
+    /// ⛔ `.back()`, WHERE [`NestPlace::InFirstLoopFor`] READS `.front()` OF THE SAME RECORD. A
+    /// composite loop node whose band was split holds several emitted loops, so the nest goes in the
+    /// outermost of them and the chain in the innermost.
+    InLastLoopFor(CompositeView),
+}
+
+/// WHAT ENTRY 090 EMITS, AND HOW ITS PIECES NEST.
+///
+/// ⛔⛔ THE REFERENCE HAS **TWO** BUILDERS THAT MOVE INDEPENDENTLY, and the three shapes below are
+/// every combination they reach. A single op list plus an insertion point cannot say which: a caller
+/// that appended the chain after the nest instead of inside it would load once per transfer where the
+/// implicit loops exist to load once per contiguous run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Emitted {
+    /// NO IMPLICIT LOOPS — one list, at one point.
+    Chain {
+        /// The load, whatever it needed, and the send.
+        ops: Vec<DfirOp>,
+        /// `update_insertion_loc`.
+        at: ChainPlace,
+    },
+    /// IMPLICIT LOOPS, WITH THE CHAIN INSIDE THE INNERMOST OF THEM — `outer_loops.front()` is one of
+    /// them, so `loop_builder` lands in the loop entry 068 has just built (`:5787`).
+    Nest {
+        /// The nest, chain and all.
+        nest: ImplicitNest,
+        /// Where the nest itself goes: still [`NestPlace::InFirstLoopFor`] when the composite load
+        /// was given up only after the implicit loops were weighed.
+        at: NestPlace,
+    },
+    /// A COMPOSITE LOAD WITH IMPLICIT LOOPS — the nest joins the composite loop and its body is
+    /// EMPTY, because the implicit loops became TIME loops of the composite load rather than a place
+    /// to put it (`:5768-5769`), and the chain stays at the caller's own point.
+    NestAndChain {
+        /// The nest, with nothing inside it.
+        nest: ImplicitNest,
+        /// `composite_loops.front()` — always, since a composite load has one.
+        at: CompositeView,
+        /// The load and the send.
+        ops: Vec<DfirOp>,
+    },
+}
+
+/// EVERYTHING ONE LOAD-AND-SEND LEAVES ITS CALLER TO PLACE AND RECORD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadAndSend {
+    /// The ops, and how they nest.
+    pub emitted: Emitted,
+    /// [`Some`] only for [`LoadSource::Switched`] — the latch bindings and the buffer-switch loop's
+    /// new yield operand, which belongs several loops further out. See [`SwitchedLoad`].
+    pub switch: Option<SwitchedLoad>,
+}
+
+/// WHICH LOOP KIND ENTRY 068 WILL EMIT FOR ONE IMPLICIT LOOP, AS [`epilogues_in_loops`] READS IT.
+///
+/// ⛔⛔ THE REFERENCE ASKS THE MAP AND THIS IS THE ANSWER IT GETS. `areEpiloguesInLoops` looks each
+/// loop up in `dsc_loops_to_mlir_loops_map_` and tests `hasConstantUpperBound` — against loops entry
+/// 068 built one line earlier, whose kind IS `steady == epilogue`: the equal arm is an `affine.for 0
+/// to steady` and the unequal one an `scf.for` bounded by an `arith.select`, which no
+/// `arith.constant` defines. So an implicit loop has an epilogue exactly when its two counts differ,
+/// and the map round-trip cannot say anything else.
+fn implicit_bound(implicit: &ImplicitLoop) -> LoopBound {
+    let StickCounts { steady, epilogue } = implicit.extents;
+    if steady == epilogue {
+        LoopBound::Constant(steady)
+    } else {
+        LoopBound::Dynamic
+    }
+}
+
+/// AN IMPLICIT LOOP AS A TIME LOOP OF THE COMPOSITE LOAD (`:5768-5769`).
+fn implicit_time(implicit: &ImplicitLoop) -> CompositeTimeLoop {
+    CompositeTimeLoop {
+        bound: implicit_bound(implicit),
+        walk: CompositeLoop {
+            size_idx: implicit.size_index,
+            // ⭐ THE CONSTANT `1` — see [`ImplicitLoop`], which has no field for it.
+            elem_offset: 1,
+        },
+    }
+}
+
+/// AN IMPLICIT LOOP AS AN ADDRESS STRIDE (`:5773-5774`), against the loop entry 068 emitted for it.
+///
+/// ⚠️ THE `iv` IS THE NEST'S OWN. `constructBaseAddress` reaches it through
+/// `getMLIRLoopFromLoopNode(loop_, dim_)`, which takes the `.front()` of that node's record — and the
+/// record for a FRESH `LoopInfo::loop_` holds exactly the one loop entry 068 pushed into it (`:781`,
+/// `:838`). That is also why the chain's own place reads `.back()`: see [`ChainPlace`].
+///
+/// ⛔ [`None`] IS THE DUMMY LOOP OF THE EMPTY-VIEW BRANCH, whose `sizeIdx_` is the reference's `-1`.
+fn implicit_stride(implicit: &ImplicitLoop, iv: Val) -> Option<LoopStride> {
+    Some(LoopStride {
+        size_idx: implicit.size_index?,
+        elem_offset: 1,
+        iv: Some(iv),
+    })
+}
+
+/// Replaces: e090_GenerateLoadAndSendFromDataTransferNode
+///
+/// **090/110** `SNTransferLowering::GenerateLoadAndSendFromDataTransferNode` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2058` (274L).
+///
+/// A UNIT THAT READS AND FORWARDS: the implicit loops a contiguous transfer needs, the load its
+/// source calls for, the rotate/replicate/convert chain and the `dataflow.send` that spends the wire.
+///
+/// ⛔⛔ `L0LUROW0` IS WIDENED TO EVERY `L0LU` ROW. `is_any_of(comp_, LXLU, LXSU, L0LUROW0, L0SU)`
+/// (`:5734`) names ONE row of the L0 lookup, and [`GenericComp`] folds all of them to `L0lu` — so a
+/// program lowered for `L0LUROW1` answers `is_memory` here where the reference answers false, and
+/// takes the composite-load path. Bounded, not repaired: `sync.rs`'s handler table shows `L0LUROW0`
+/// is the only row ever bound, so no input in the tree separates them.
+///
+/// ⛔ THE ROTATE COMES **BEFORE** THE REPLICATION HERE AND AFTER IT IN ENTRY 080. `:5882-5895`
+/// rotates the raw load and shuffles the rotated value; `:4019-4051` replicates first and rotates the
+/// widened one. Both are transcribed as they stand — see [`rotate`]'s note on the type it states.
+///
+/// ⛔ AND THE REPLICATION ARM IS GATED ON A DIFFERENT MEMBER: `src` here, `comp_` there. See
+/// [`TransferRead::src`].
+///
+/// ⚠️ `OpBuilder local_builder(composite_load)` (`:5920`) IS CREATED AND NEVER USED, as entry 080's
+/// `factor_builder` is.
+///
+/// ⛔ [`None`] IS A LOOP WITH NO `sizeIdx_` THAT MUST BE READ AS AN ADDRESS STRIDE — see
+/// [`CompositeView::stride`] and [`implicit_stride`]. Every other refusal in the reference goes
+/// through `emitError`, which always raises: see [`emit_error`].
+#[must_use]
+pub fn generate_load_and_send_from_data_transfer_node<'p>(
+    vals: &mut Values,
+    handlers: &Handlers,
+    read: &TransferRead<'_>,
+    loops: &ViewLoops<'_>,
+    sticks: &mut ContiguousSticks,
+    transfer_sizes: ContiguousTransfer,
+    parent_loop: impl Fn(PrimaryDim) -> Option<&'p DfirOp>,
+    source: LoadSource<'_>,
+) -> Option<LoadAndSend> {
+    // `is_any_of(comp_, LXLU, LXSU, L0LUROW0, L0SU)` — see this function's note.
+    let is_memory = matches!(
+        read.comp,
+        GenericComp::Lxlu | GenericComp::Lxsu | GenericComp::L0lu | GenericComp::L0su
+    );
+    let composite_bounds: Vec<LoopBound> = loops.composite.iter().map(|view| view.bound).collect();
+
+    // ⭐ `perform_composite_load` CARRIES THE LOOP IT NEEDS. Its second conjunct is
+    // `!compositeLoops_.empty()` and the insertion point it moves to is that list's `front()`
+    // (`:5735-5744`), so the flag's truth and the existence of the front loop are one fact.
+    let mut composite_load = if is_memory
+        && !epilogues_in_loops(&composite_bounds)
+        && !epilogues_in_transfer_sizes(sticks)
+    {
+        loops.composite.first().copied()
+    } else {
+        None
+    };
+    // ⛔ THE NEST'S PLACE IS DECIDED HERE AND NEVER REVISITED: the reference moves `builder` before
+    // it asks entry 068 for anything (`:5742` precedes `:5755`) and never moves it back, so a
+    // composite load given up at `:5762` still emitted its implicit loops inside the composite loop.
+    let nest_at = match composite_load {
+        Some(front) => NestPlace::InFirstLoopFor(front),
+        None => NestPlace::Here,
+    };
+
+    let implicit_loops = match transfer_sizes {
+        ContiguousTransfer::Sized => {
+            let derived = implicit_loops_for_contiguous_transfer(
+                read.view_sizes,
+                // `int unit_time_dims = unit_time_transfer.size()`.
+                read.chunk_sizes.len(),
+                sticks,
+                read.replication,
+            )
+            .unwrap_or_else(|| {
+                emit_error(
+                    read.node,
+                    "Unable to construct implicit loops for contiguous transfer",
+                )
+            });
+            // `perform_composite_load && !areEpiloguesInLoops(implicit_loops)`.
+            let bounds: Vec<LoopBound> = derived.iter().map(implicit_bound).collect();
+            if epilogues_in_loops(&bounds) {
+                composite_load = None;
+            }
+            derived
+        }
+        ContiguousTransfer::Absent => Vec::new(),
+    };
+
+    // `composite_loops`, and the part of `outer_loops` that does not depend on the nest's own
+    // induction variables. The reference splices the composite loops into ONE of the two lists and
+    // never both (`:5764-5782`).
+    let mut composite: Vec<CompositeTimeLoop> = Vec::new();
+    let mut outer: Vec<LoopStride> = Vec::new();
+    if composite_load.is_some() {
+        composite.extend(implicit_loops.iter().map(implicit_time));
+        composite.extend(loops.composite.iter().map(|view| view.time()));
+    } else {
+        for view in loops.composite {
+            outer.push(view.stride()?);
+        }
+    }
+    outer.extend_from_slice(loops.outer);
+    let form = if composite_load.is_some() {
+        LoadForm::Composite(&composite)
+    } else {
+        LoadForm::Vector
+    };
+
+    // `update_insertion_loc = !perform_composite_load && !outer_loops.empty() &&
+    //  (!implicit_loops.empty() || !composite_loops.empty())`, on the MERGED lists.
+    let update_insertion_loc = composite_load.is_none()
+        && !(outer.is_empty() && implicit_loops.is_empty())
+        && !(implicit_loops.is_empty() && loops.composite.is_empty());
+
+    if implicit_loops.is_empty() {
+        // No nest at all: `outer_loops.front()` is the composite front, or `loop_builder` never moved.
+        let mut ops = Vec::new();
+        let switch = switched(load_and_send(
+            vals, &mut ops, handlers, read, &outer, form, source,
+        )?);
+        let at = match loops.composite.first() {
+            Some(&front) if update_insertion_loc => ChainPlace::InLastLoopFor(front),
+            _ => ChainPlace::Here,
+        };
+        return Some(LoadAndSend {
+            emitted: Emitted::Chain { ops, at },
+            switch,
+        });
+    }
+
+    if let Some(front) = composite_load {
+        // ⭐ THE NEST IS EMITTED FIRST, AND EMPTY: `constructImplicitLoopsForContiguousTransfer`
+        // precedes the load (`:5755` before `:5798`) and its loops carry the earlier SSA names, while
+        // `loop_builder` — which the load is built with — never entered them.
+        let nest = emit_implicit_loops_for_contiguous_transfer(
+            vals,
+            &implicit_loops,
+            read.name,
+            parent_loop,
+            |_, _| Vec::new(),
+        )
+        .unwrap_or_else(|| {
+            emit_error(
+                read.node,
+                "Unable to construct implicit loops for contiguous transfer",
+            )
+        });
+        let mut ops = Vec::new();
+        let switch = switched(load_and_send(
+            vals, &mut ops, handlers, read, &outer, form, source,
+        )?);
+        return Some(LoadAndSend {
+            emitted: Emitted::NestAndChain {
+                nest,
+                at: front,
+                ops,
+            },
+            switch,
+        });
+    }
+
+    // The chain goes INSIDE the innermost implicit loop, and strides its base address against all of
+    // them — which is why it is built from within the nest's own body.
+    let mut switch = None;
+    let mut refused = false;
+    let nest = emit_implicit_loops_for_contiguous_transfer(
+        vals,
+        &implicit_loops,
+        read.name,
+        parent_loop,
+        |vals, ivs| {
+            let mut strides = Vec::with_capacity(implicit_loops.len() + outer.len());
+            for (implicit, iv) in implicit_loops.iter().zip(ivs) {
+                match implicit_stride(implicit, *iv) {
+                    Some(stride) => strides.push(stride),
+                    None => {
+                        refused = true;
+                        return Vec::new();
+                    }
+                }
+            }
+            strides.extend_from_slice(&outer);
+            let mut ops = Vec::new();
+            match load_and_send(vals, &mut ops, handlers, read, &strides, form, source) {
+                Some(chain) => switch = switched(chain),
+                None => refused = true,
+            }
+            ops
+        },
+    )
+    .unwrap_or_else(|| {
+        emit_error(
+            read.node,
+            "Unable to construct implicit loops for contiguous transfer",
+        )
+    });
+    if refused {
+        return None;
+    }
+
+    Some(LoadAndSend {
+        emitted: Emitted::Nest { nest, at: nest_at },
+        switch,
+    })
+}
+
+/// WHAT ONE CHAIN LEAVES BEHIND — so that [`load_and_send`]'s own [`Option`] can mean refusal.
+enum Chain {
+    /// The LATCH, ZERO, CONSTANT and memory arms, none of which rides a buffer-switch loop.
+    Plain,
+    /// Entry 080's answer, which the caller has to record several loops further out.
+    Switched(SwitchedLoad),
+}
+
+/// THE LOAD AND THE SEND THEMSELVES — everything after both builders are placed (`:5798-5975`).
+///
+/// ⛔ THE CONVERSION AND THE SEND ARE SHARED BY THREE OF THE FIVE ARMS. `data` is assigned by the
+/// ZERO, CONSTANT and memory arms and converted and sent once, below them (`:5951-5975`); the LATCH
+/// arm sends and returns before the mode is even read (`:5798-5807`), and entry 080 sends its own.
+///
+/// ⛔ [`None`] IS THE COMPOSITE ARM'S TIME ORDER — see
+/// [`elements_of_agen_composite_data_transfer`], and [`LoadForm::Composite`] is only built here over
+/// a non-empty list, so nothing reaches it.
+fn load_and_send(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    read: &TransferRead<'_>,
+    outer_loops: &[LoopStride],
+    form: LoadForm<'_>,
+    source: LoadSource<'_>,
+) -> Option<Chain> {
+    let (data, data_ty) = match source {
+        LoadSource::Latch(latched) => {
+            // ⛔ NO CONVERSION AND NO CHAIN — the reference returns success from inside this arm.
+            ops.push(DfirOp::Dataflow(dataflow::Op::Send {
+                to: read.to,
+                data: latched,
+                ty: read.result_ty,
+            }));
+            return Some(Chain::Plain);
+        }
+        LoadSource::Switched { switch, step } => {
+            let load = StreamingLoad {
+                read: *read,
+                outer_loops,
+                form,
+                switch,
+            };
+            // ⛔ ENTRY 080's THREE SILENT `failure()`s BECOME A RAISE HERE: the reference answers
+            // them with `emitError("Unable to construct streaming load")` (`:5819-5822`).
+            return Some(Chain::Switched(
+                construct_streaming_or_double_buffering_load(vals, ops, handlers, &load, step)
+                    .unwrap_or_else(|| emit_error(read.node, "Unable to construct streaming load")),
+            ));
+        }
+        // `arith::ConstantOp::create(.., result_type, builder.getZeroAttr(result_type))`.
+        LoadSource::Zero => {
+            let result = vals.mint();
+            ops.push(DfirOp::Arith(arith::Op::DenseConstant {
+                result,
+                splat: 0,
+                ty: read.result_ty,
+            }));
+            (result, read.result_ty)
+        }
+        LoadSource::Constant {
+            handles,
+            data,
+            values,
+            bitstream,
+        } => {
+            let stream = constant_bitstream_and_shuffle(
+                vals,
+                ops,
+                read.name,
+                handles,
+                data,
+                values,
+                bitstream,
+                read.result_ty,
+            )
+            .unwrap_or_else(|| {
+                emit_error(read.node, "Unable to create constant bitstream and shuffle")
+            });
+            (stream, read.result_ty)
+        }
+        LoadSource::Memory {
+            address,
+            addressed_as,
+        } => {
+            // `getAddressGranularityMultiplyFactor(src, src_storage, getElementType(result_type))`
+            // — ⚠️ `src`, not `comp_`: see [`TransferRead::src_location`].
+            let factor = address_granularity_multiply_factor(read.src_location, read.precision);
+            let start_address = address(vals, ops, factor);
+            let transfer = AgenStorage {
+                storage: read.storage,
+                core: read.core,
+                corelet: read.corelet,
+                side: TransferSide::Load,
+                start_address,
+                view_sizes: read.view_sizes,
+                elem: read.elem,
+                outer_loops,
+                addressed_as,
+            };
+            let chunks = UnitTimeChunks {
+                sizes: read.chunk_sizes,
+                stride: read.chunk_stride.as_ref(),
+                // ⚠️ `unitTimeTransferNumChunks_` IS NOT PASSED HERE (`:5771-5778` of the extract), so
+                // entry 067's own default stands — see [`StreamingStore::chunks`].
+                num_strides: read.num_chunks,
+            };
+
+            match form {
+                LoadForm::Vector => {
+                    let elements =
+                        elements_of_agen_data_transfer(vals, ops, handlers, &transfer, &chunks)
+                            .unwrap_or_else(|| {
+                                emit_error(
+                                    read.node,
+                                    "Unable to construct elements of agen data transfer",
+                                )
+                            });
+                    let loaded = vals.mint();
+                    ops.push(DfirOp::Agen(agen::Op::VectorLoad {
+                        result: loaded,
+                        view: elements.view.result,
+                        indices: elements.base_address.indices.clone(),
+                        dbg_name: Some(read.name.to_owned()),
+                        access: agen::Access::Stated(elements.transfer_set),
+                        view_ty: elements.view.ty,
+                        ty: read.result_ty,
+                    }));
+                    // `if (rotateNumElements_ > 0) { DT_CHECK_MSG(comp_ == LXLU, ..) .. }` — the check
+                    // is [`Rotation::on_lxlu`], so an unrotatable unit has nothing to state here.
+                    let rotated = match read.rotate {
+                        Some(rotation) => {
+                            rotate(vals, ops, loaded, read.result_ty, read, rotation).0
+                        }
+                        None => loaded,
+                    };
+                    replicated(vals, ops, read, rotated)
+                }
+                LoadForm::Composite(time_loops) => {
+                    let composite = elements_of_agen_composite_data_transfer(
+                        vals,
+                        ops,
+                        handlers,
+                        &transfer,
+                        &chunks,
+                        time_loops,
+                    )
+                    .unwrap_or_else(|| {
+                        emit_error(
+                            read.node,
+                            "Unable to construct elements of agen data transfer",
+                        )
+                    });
+                    let elements = composite.elements;
+                    // ⛔ EVERYTHING FROM HERE IS IN THE REGION: `loop_builder` is moved to the start
+                    // of the composite load's body (`:5921`) and never moved back, so the rotate, the
+                    // shuffle, the conversion and the SEND are all inside it.
+                    let load_iv = vals.mint();
+                    let mut body = Vec::new();
+                    let rotated = match read.rotate {
+                        Some(rotation) => {
+                            rotate(vals, &mut body, load_iv, read.result_ty, read, rotation).0
+                        }
+                        None => load_iv,
+                    };
+                    let (data, data_ty) = replicated(vals, &mut body, read, rotated);
+                    let (data, data_ty) = convert(vals, &mut body, data, data_ty, read);
+                    body.push(DfirOp::Dataflow(dataflow::Op::Send {
+                        to: read.to,
+                        data,
+                        ty: data_ty,
+                    }));
+                    body.push(DfirOp::Agen(agen::Op::Yield {
+                        values: Vec::new(),
+                    }));
+                    ops.push(DfirOp::Agen(agen::Op::CompositeLoad(Box::new(
+                        agen::CompositeLoad {
+                            view: elements.view.result,
+                            dbg_name: Some(read.name.to_owned()),
+                            indices: elements.base_address.indices.clone(),
+                            view_ty: elements.view.ty,
+                            load_iv,
+                            load_iv_ty: read.result_ty,
+                            load_set: elements.transfer_set,
+                            load_order: elements.transfer_order,
+                            // ⭐ `drop_back(0)` AND `take_back(0)`: no time set this bridge builds has
+                            // symbols — see [`construct_streaming_or_double_buffering_load`].
+                            time_symbols: Vec::new(),
+                            time_set: composite.time_set,
+                            time_order: composite.time_order?,
+                            time_addr_map: composite.time_address_map,
+                            body,
+                        },
+                    ))));
+                    return Some(Chain::Plain);
+                }
+            }
+        }
+    };
+
+    let (data, data_ty) = convert(vals, ops, data, data_ty, read);
+    // `SendOp::create(loop_builder, loc, to, data, nullptr, getStringAttr(transfer_->name_))` —
+    // ⭐ UNCONDITIONAL: this entry has no latch walk and so no `use_latch` to test.
+    ops.push(DfirOp::Dataflow(dataflow::Op::Send {
+        to: read.to,
+        data,
+        ty: data_ty,
+    }));
+    Some(Chain::Plain)
+}
+
+/// `if (src == LXLU && replicationFactor_ > 1)` — the 2B/16B splat, or the value untouched
+/// (`:5938-5949`).
+///
+/// ⛔ NOT [`replicate`]: entry 080's arm falls back to a `vectorchain.select` for every other
+/// component, and this one has NO `else` branch at all — a replicated transfer from anywhere but the
+/// LX is sent at the unreplicated width.
+fn replicated(
+    vals: &mut Values,
+    into: &mut Vec<DfirOp>,
+    read: &TransferRead<'_>,
+    value: Val,
+) -> (Val, Vector) {
+    if read.src != GenericComp::Lxlu || read.replication.get() <= 1 {
+        return (value, read.result_ty);
+    }
+    let shuffled =
+        construct_2b16b_load_shuffle(vals, into, read.name, value, read.result_ty, read.replication)
+            .unwrap_or_else(|| emit_error(read.node, "Unsupported load type."));
+    (
+        shuffled,
+        Vector {
+            len: read.result_ty.len * read.replication.get().unsigned_abs(),
+            elem: read.result_ty.elem,
+        },
+    )
+}
+
+/// The switched arm's record, and nothing for the other four.
+fn switched(chain: Chain) -> Option<SwitchedLoad> {
+    match chain {
+        Chain::Switched(load) => Some(load),
+        Chain::Plain => None,
+    }
 }
 
 #[cfg(test)]
@@ -3762,7 +4693,7 @@ mod unit_tests {
             &loops,
             "load0",
             |_| Some(&parent),
-            Vec::new(),
+            |_, _| Vec::new(),
         )
         .expect("an affine.for parent with constant bounds");
 
@@ -3854,7 +4785,7 @@ mod unit_tests {
             &ss_el,
             "s",
             |_| Some(&scf_parent),
-            Vec::new(),
+            |_, _| Vec::new(),
         )
         .expect("an scf.for parent");
         assert!(matches!(
@@ -3882,7 +4813,7 @@ mod unit_tests {
                 &ss_el,
                 "s",
                 |_| Some(&dynamic),
-                Vec::new(),
+                |_, _| Vec::new(),
             )
             .is_none()
         );
@@ -3898,7 +4829,7 @@ mod unit_tests {
                 &ss_el,
                 "s",
                 |_| Some(&not_a_loop),
-                Vec::new(),
+                |_, _| Vec::new(),
             )
             .is_none()
         );
@@ -3910,7 +4841,7 @@ mod unit_tests {
                 &ss_el,
                 "s",
                 |_| None,
-                Vec::new(),
+                |_, _| Vec::new(),
             )
             .is_none()
         );
@@ -3930,7 +4861,7 @@ mod unit_tests {
                 &dummy,
                 "s",
                 |_| Some(&scf_parent),
-                Vec::new(),
+                |_, _| Vec::new(),
             )
             .is_none()
         );
@@ -3998,6 +4929,7 @@ mod unit_tests {
         let got = constant_bitstream_and_shuffle(
             &mut vals,
             &mut ops,
+            "c0",
             &handles,
             &data,
             BitstreamValues::BitPatterns,
@@ -4014,6 +4946,8 @@ mod unit_tests {
                 is_symbol: false,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                variable,
+                dbg_name,
                 result,
                 input,
                 indices,
@@ -4026,6 +4960,9 @@ mod unit_tests {
             panic!("a single-fold bitstream then the shuffle, got {ops:?}")
         };
         assert_eq!(value, &vec![0x00, 0x01]);
+        // ⭐ THE SHUFFLE ONLY REPEATS: no variable operands, and the transfer's own name.
+        assert!(variable.is_empty());
+        assert_eq!(dbg_name.as_deref(), Some("c0"));
         // The width is `all_data.front().size()`, and the element the format's own.
         assert_eq!(
             *stream_ty,
@@ -4048,6 +4985,7 @@ mod unit_tests {
             constant_bitstream_and_shuffle(
                 &mut vals,
                 &mut refused,
+                "c0",
                 &handles,
                 &data,
                 BitstreamValues::BitPatterns,
@@ -4316,12 +5254,15 @@ mod unit_tests {
         };
 
         assert_eq!(
-            construct_2b16b_load_shuffle(&mut vals, &mut ops, Val(70), ty, rf),
+            construct_2b16b_load_shuffle(&mut vals, &mut ops, "s", Val(70), ty, rf),
             Some(Val(0))
         );
         assert_eq!(
             ops,
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                variable: Vec::new(),
+                // ⭐ `getStringAttr(transfer_->name_)` — see [`construct_2b16b_load_shuffle`].
+                dbg_name: Some("s".to_owned()),
                 result: Val(0),
                 input: Val(70),
                 indices: vec![0, 1, 2, 3, 4, 5, 6, 7],
@@ -4337,6 +5278,7 @@ mod unit_tests {
             construct_2b16b_load_shuffle(
                 &mut vals,
                 &mut ops,
+                "s",
                 Val(70),
                 Vector {
                     len: 8,
@@ -4361,12 +5303,15 @@ mod unit_tests {
         };
 
         assert_eq!(
-            construct_2b16b_store_shuffle(&mut vals, &mut ops, Val(80), input_ty, rf),
+            construct_2b16b_store_shuffle(&mut vals, &mut ops, "s", Val(80), input_ty, rf),
             Some(Val(0))
         );
         assert_eq!(
             ops,
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                variable: Vec::new(),
+                // ⭐ `getStringAttr(transfer_->name_)` — see [`construct_2b16b_load_shuffle`].
+                dbg_name: Some("s".to_owned()),
                 result: Val(0),
                 input: Val(80),
                 indices: vec![0, 1, 2, 3],
@@ -4960,16 +5905,34 @@ mod unit_tests {
         form: LoadForm<'i>,
     ) -> StreamingLoad<'i> {
         StreamingLoad {
+            read: transfer_read_fixture(view_sizes, chunk_sizes, latches, to),
+            outer_loops,
+            form,
+            switch: BufferSwitchLoop {
+                start_address: Val(60),
+                carried: Val(61),
+            },
+        }
+    }
+
+    fn transfer_read_fixture<'i>(
+        view_sizes: &'i [ViewSize],
+        chunk_sizes: &'i [ChunkDim],
+        latches: &'i [Latch],
+        to: SendEnd,
+    ) -> TransferRead<'i> {
+        TransferRead {
             storage: Component::Unit(DfirUnit::L3lu),
+            src: GenericComp::L3lu,
             core: Core::checked(0).expect("core 0"),
             corelet: None,
             comp: GenericComp::L0lu,
             location: DataLocation::L3luHbm,
+            src_location: DataLocation::L3luHbm,
             name: "T",
             node: "N",
             view_sizes,
             elem: ElemType::F16,
-            outer_loops,
             chunk_sizes,
             chunk_stride: None,
             num_chunks: 1,
@@ -4988,11 +5951,6 @@ mod unit_tests {
             rotate: None,
             latches,
             to,
-            form,
-            switch: BufferSwitchLoop {
-                start_address: Val(60),
-                carried: Val(61),
-            },
         }
     }
 
@@ -5050,8 +6008,8 @@ mod unit_tests {
             to,
             LoadForm::Vector,
         );
-        load.replication = Replication::checked(4).expect("four destinations");
-        load.rotate = Rotation::on_lxlu(2);
+        load.read.replication = Replication::checked(4).expect("four destinations");
+        load.read.rotate = Rotation::on_lxlu(2);
 
         let mut vals = Values::default();
         let mut ops: Vec<DfirOp> = Vec::new();
@@ -5128,11 +6086,11 @@ mod unit_tests {
         );
 
         // ⛔ A STICK'S WORTH — `64 * 16 == 1024` — with a MISMATCHED destination: still no cast.
-        load.result_ty = Vector {
+        load.read.result_ty = Vector {
             len: 64,
             elem: ElemType::F16,
         };
-        load.dst_result_ty = Vector {
+        load.read.dst_result_ty = Vector {
             len: 64,
             elem: ElemType::F32,
         };
@@ -5157,11 +6115,11 @@ mod unit_tests {
         );
 
         // ⭐ AND HALF A STICK WITH THE SAME MISMATCH IS CONVERTED.
-        load.result_ty = Vector {
+        load.read.result_ty = Vector {
             len: 32,
             elem: ElemType::F16,
         };
-        load.dst_result_ty = Vector {
+        load.read.dst_result_ty = Vector {
             len: 32,
             elem: ElemType::F32,
         };
@@ -5214,7 +6172,7 @@ mod unit_tests {
             to,
             LoadForm::Composite(&time_loops),
         );
-        load.dst_result_ty = Vector {
+        load.read.dst_result_ty = Vector {
             len: 8,
             elem: ElemType::F32,
         };
@@ -5521,5 +6479,269 @@ mod unit_tests {
         assert_eq!(one.transition_slice(), 0);
         assert_eq!(one.in_last_slice(), 1);
         assert_eq!(WslLen::Zero.get(), 0);
+    }
+
+    // ─────────────────────────────── 089-090/110 ───────────────────────────────
+
+    fn streaming_store_fixture<'i>(
+        view_sizes: &'i [ViewSize],
+        outer_loops: &'i [LoopStride],
+        chunks: UnitTimeChunks<'i>,
+    ) -> StreamingStore<'i> {
+        StreamingStore {
+            storage: Component::Unit(DfirUnit::L3lu),
+            core: Core::checked(0).expect("core 0"),
+            corelet: None,
+            location: DataLocation::L3luHbm,
+            name: "T",
+            node: "N",
+            view_sizes,
+            elem: ElemType::F16,
+            outer_loops,
+            chunks,
+            precision: DataType::Sen169Fp16,
+            switch: BufferSwitchLoop {
+                start_address: Val(60),
+                carried: Val(61),
+            },
+        }
+    }
+
+    /// 🎯 089/110 — ⛔⛔ THE STORE ITSELF AND THE ADDRESS UPDATE ARE TWO LISTS. The
+    /// `agen.vector_store` goes where the caller stands, while the subtraction that hands the next
+    /// buffer back belongs to the switch loop's terminator several loops further out — and a
+    /// composite store with no time loop has no permutation map and refuses.
+    #[test]
+    fn the_store_stays_put_and_the_toggle_travels_to_its_loop() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let chunks = UnitTimeChunks {
+            sizes: &chunk_sizes,
+            stride: None,
+            num_strides: 1,
+        };
+        let store = streaming_store_fixture(&view_sizes, &outer_loops, chunks);
+        let stored = Computed::of(
+            Val(70),
+            Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+        );
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let update = construct_streaming_or_double_buffering_store(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &store,
+            stored,
+            StoreForm::Vector,
+            BufferStep::Buffering(
+                |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(64))
+                },
+            ),
+        )
+        .expect("the view resolves");
+
+        assert_eq!(
+            printed(&ops),
+            concat!(
+                "%0 = dataflow.get_logical_memory_view %50, %60 {layout_map = affine_map<(d0, d1) -> (d1 * 4 + d0)>} : index, index, memref<4x8xf16>\n",
+                "%1 = arith.constant 0 : index\n",
+                "agen.vector_store %70, %0[%80 * 8, 0] {dbgName = \"T\", store_order = affine_map<(d0, d1) -> (d0, d1)>, store_set = affine_set<(d0, d1) : (d1 >= 0, -d1 + 7 >= 0, d0 == 0)>} : memref<4x8xf16>, vector<8xf16>\n",
+            ),
+            "the view rides the iter_arg and NOTHING of the update is in the caller's list",
+        );
+        // ⛔ DOUBLE BUFFERING TOGGLES: `increment - iter_arg`, not the other way round.
+        assert_eq!(
+            printed(&update.ops),
+            concat!(
+                "%2 = arith.constant 4096 : index\n",
+                "%3 = arith.subi %2, %61 : index\n",
+            ),
+        );
+        assert_eq!(update.operand, Val(3));
+
+        // ⛔ AND THE ONE REFUSAL: `getPermutationMap({})` has nothing to permute.
+        assert_eq!(time_order(0), None);
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        assert_eq!(
+            construct_streaming_or_double_buffering_store(
+                &mut vals,
+                &mut ops,
+                &l3lu_handlers(),
+                &store,
+                stored,
+                StoreForm::Composite {
+                    loops: &[],
+                    producer: DfirOp::Arith(arith::Op::Constant {
+                        result: Val(70),
+                        value: 0,
+                    }),
+                },
+                BufferStep::Streaming(
+                    |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                        constant_index(vals, into, factor.scale(64))
+                    },
+                ),
+            ),
+            None,
+        );
+    }
+
+    /// One composite loop of four steps, strided by 8 elements over the view's outer dim.
+    fn composite_view_fixture() -> CompositeView {
+        CompositeView {
+            bound: LoopBound::Constant(4),
+            walk: CompositeLoop {
+                size_idx: Some(0),
+                elem_offset: 8,
+            },
+            iv: Some(Val(81)),
+        }
+    }
+
+    /// 🎯 090/110 — ⛔⛔ A COMPOSITE LOAD LEAVES THE CHAIN AT THE CALLER'S OWN POINT, and the send
+    /// goes INSIDE the region with it. `update_insertion_loc` is `!perform_composite_load && ..`
+    /// (`:5784`), so the one arm that builds a region is also the one arm that never moves
+    /// `loop_builder` — the load's own body is where its consumer already is.
+    #[test]
+    fn a_composite_load_keeps_its_send_in_the_region_and_the_chain_where_it_stood() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let (to, _) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let read = transfer_read_fixture(&view_sizes, &chunk_sizes, &[], to);
+        let composite = [composite_view_fixture()];
+        let loops = ViewLoops {
+            outer: &outer_loops,
+            composite: &composite,
+        };
+        let mut sticks = ContiguousSticks::new(
+            StickCounts {
+                steady: 1,
+                epilogue: 1,
+            },
+            Vec::new(),
+        );
+
+        let mut vals = Values::default();
+        let got = generate_load_and_send_from_data_transfer_node(
+            &mut vals,
+            &l3lu_handlers(),
+            &read,
+            &loops,
+            &mut sticks,
+            ContiguousTransfer::Absent,
+            |_| None,
+            LoadSource::Memory {
+                address: &|vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(1))
+                },
+                addressed_as: AddressedAs::Schedule,
+            },
+        )
+        .expect("the time set and both maps resolve");
+
+        let Emitted::Chain { ops, at } = got.emitted else {
+            panic!("no implicit loops means no nest");
+        };
+        assert_eq!(at, ChainPlace::Here);
+        assert_eq!(got.switch, None, "only entry 080's arm rides a switch loop");
+        assert_eq!(
+            printed(&ops),
+            concat!(
+                "%0 = arith.constant 64 : index\n",
+                "%1 = dataflow.get_logical_memory_view %50, %0 {layout_map = affine_map<(d0, d1) -> (d1 * 4 + d0)>} : index, index, memref<4x8xf16>\n",
+                "%2 = arith.constant 0 : index\n",
+                "agen.composite_load %1[%80 * 8, 0]\n",
+                " time_symbols()(%3:vector<8xf16>)\n",
+                " {dbgName = \"T\", load_order = affine_map<(d0, d1) -> (d0, d1)>, load_set = affine_set<(d0, d1) : (d1 >= 0, -d1 + 7 >= 0, d0 == 0)>, time_addr_map = affine_map<(d0) -> (d0 * 8, 0)>, time_order = affine_map<(d0) -> (d0)>, time_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>}\n",
+                "{\n",
+                "  dataflow.send %53, %3 : vector<8xf16>\n",
+                "  agen.yield\n",
+                "} : memref<4x8xf16>\n",
+            ),
+            "the send spends the region's own block argument, ahead of the terminator",
+        );
+    }
+
+    /// 🎯 090/110 — ⛔⛔ A UNIT THAT IS NOT AN L0 OR LX FILE READS ITS COMPOSITE LOOPS AS **ADDRESS
+    /// STRIDES**, and then the chain moves into the LAST loop emitted for the front one (`:5787`) —
+    /// `.back()` of the record whose `.front()` a composite load's nest would have taken.
+    ///
+    /// ⛔ AND THAT IS WHERE THE ONE [`None`] LIVES: a loop with no `sizeIdx_` has no stride to be,
+    /// and `dims[-1]` is what the reference would index.
+    #[test]
+    fn a_non_memory_unit_strides_by_its_composite_loop_or_refuses_it() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let (to, _) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let mut read = transfer_read_fixture(&view_sizes, &chunk_sizes, &[], to);
+        // ⛔ THE SFP IS NEITHER AN L0 NOR AN LX FILE: `is_memory` is false.
+        read.comp = GenericComp::Sfp;
+        let mut composite = [composite_view_fixture()];
+        let mut sticks = ContiguousSticks::new(
+            StickCounts {
+                steady: 1,
+                epilogue: 1,
+            },
+            Vec::new(),
+        );
+
+        let mut vals = Values::default();
+        let got = generate_load_and_send_from_data_transfer_node(
+            &mut vals,
+            &l3lu_handlers(),
+            &read,
+            &ViewLoops {
+                outer: &outer_loops,
+                composite: &composite,
+            },
+            &mut sticks,
+            ContiguousTransfer::Absent,
+            |_| None,
+            LoadSource::Zero,
+        )
+        .expect("the composite loop reads as a stride");
+        assert_eq!(
+            got.emitted,
+            Emitted::Chain {
+                ops: vec![
+                    DfirOp::Arith(arith::Op::DenseConstant {
+                        result: Val(0),
+                        splat: 0,
+                        ty: read.result_ty,
+                    }),
+                    DfirOp::Dataflow(dataflow::Op::Send {
+                        to,
+                        data: Val(0),
+                        ty: read.result_ty,
+                    }),
+                ],
+                at: ChainPlace::InLastLoopFor(composite[0]),
+            },
+        );
+
+        // ⛔ THE REFUSAL: `sizeIdx_ == -1` cannot be an address stride.
+        composite[0].walk.size_idx = None;
+        assert_eq!(composite[0].stride(), None);
+        let mut vals = Values::default();
+        assert_eq!(
+            generate_load_and_send_from_data_transfer_node(
+                &mut vals,
+                &l3lu_handlers(),
+                &read,
+                &ViewLoops {
+                    outer: &outer_loops,
+                    composite: &composite,
+                },
+                &mut sticks,
+                ContiguousTransfer::Absent,
+                |_| None,
+                LoadSource::Zero,
+            ),
+            None,
+        );
     }
 }
