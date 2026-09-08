@@ -1936,7 +1936,7 @@ impl<'p> TpmvCompositeLoad<'p> {
     /// only `composite_load_and_store` is present. So this constructor is reachable from a vendor test
     /// and from nothing this crate emits, the same position
     /// [`super::agen_helper::AgenLoad`] documents for three of its five load classes. The campaign's
-    /// *add the op to the island* rule (`AGENT-BRIEF.md:57`) was applied to entry 139's actual input,
+    /// *add the op to the island* rule (`AGENT-BRIEF.md:87`) was applied to entry 139's actual input,
     /// `dataflow.get_paged_logical_memory_view`, which without it could not be spelled at all; a
     /// branch of a `dyn_cast` chain that no emitter can reach is a different case, and minting two
     /// composite ops nothing produces would be the stand-in the crate rules forbid.

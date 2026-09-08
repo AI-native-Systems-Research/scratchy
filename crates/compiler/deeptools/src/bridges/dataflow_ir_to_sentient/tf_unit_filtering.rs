@@ -350,19 +350,19 @@ pub fn remove_cores_corelets_folds_from_program_unit(
 /// }
 /// ```
 ///
-/// # ⭐ NINETEEN CLASSES, ELEVEN OF WHICH THIS ISLAND DECLARES
+/// # ⭐ NINETEEN CLASSES, TWELVE OF WHICH THIS ISLAND DECLARES
 ///
 /// The six `dataflow` ones all exist here. Of the thirteen `agen` ones, the island declares
 /// `vector_load`, `vector_store`, `composite_load_and_store`, the two symbolic vectors (entries
 /// 374/375) and `composite_memory_interleave` (entry 384's sweep). The other seven
-/// (`composite_load`, `composite_store`, the four indirect composites and the two indirect vectors)
+/// (`composite_load`, `composite_store`, the three indirect composites and the two indirect vectors)
 /// are listed in the match below as comments rather than invented: the brief's rule to grow the
-/// island is about a function's *input* (`AGENT-BRIEF.md:57`), and this function's input is any op at
+/// island is about a function's *input* (`AGENT-BRIEF.md:87`), and this function's input is any op at
 /// all.
 ///
 /// # ⛔ NO WILDCARD, SO A NEW ISLAND OP CANNOT DEFAULT TO "NOT A TRANSFER"
 ///
-/// A `_ => false` would make the tenth `agen` op silently non-transferring the day it is declared,
+/// A `_ => false` would make the next `agen` op silently non-transferring the day it is declared,
 /// and entry 205 (`isDataTransferToKeep`, `:327`) is the only caller: it decides whether a transfer
 /// SURVIVES unit filtering. Getting a `false` for a real transfer deletes data movement from the
 /// program. Every arm below is spelled out, so declaring an op is a compile error until this

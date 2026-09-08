@@ -251,7 +251,7 @@ fn owner_of_block_arg(val: Val, scope: &[DfirOp]) -> Option<&DfirOp> {
 /// (`:319`). This island had no `scf.for`, so that arm had no expressible input —
 /// [`scf::Op::For`] was added for it, which is the campaign's rule and not a licence taken:
 /// *"If the target IR cannot express a function's input, add the operation to the island"*
-/// (`AGENT-BRIEF.md:57`). Answering [`None`] there instead would have been a port that declines the
+/// (`AGENT-BRIEF.md:87`). Answering [`None`] there instead would have been a port that declines the
 /// vendor's own test.
 ///
 /// # ⭐ THE TWO ARMS ASK THE SAME QUESTION OF DIFFERENT THINGS

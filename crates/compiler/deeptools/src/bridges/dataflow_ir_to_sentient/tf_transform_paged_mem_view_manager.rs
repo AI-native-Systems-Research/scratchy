@@ -244,7 +244,7 @@ impl<'a> TpmvManager<'a> {
     ///
     /// `dataflow.get_paged_logical_memory_view` is this function's ONLY input and the island did not
     /// have it, so it is now [`dataflow::Op::GetPagedLogicalMemoryView`] — the brief's *"if the target
-    /// IR cannot express a function's input, add the operation to the island"* (`AGENT-BRIEF.md:57`).
+    /// IR cannot express a function's input, add the operation to the island"* (`AGENT-BRIEF.md:87`).
     /// The op is `Dataflow.td:267-299`; its verifier's *"there should be a start address and idx_set
     /// for every page"* (`DataflowOps.cpp:277-279`) became one vector of
     /// [`dataflow::Page`] pairs rather than two lists that can disagree.

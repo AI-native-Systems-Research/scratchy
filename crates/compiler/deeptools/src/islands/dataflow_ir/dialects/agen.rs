@@ -87,7 +87,7 @@ impl MaskId {
 ///
 /// ⛔⛔ A STRING IS WHAT THE REFERENCE CARRIES AND IT IS NOT WHAT THIS ISLAND MAY CARRY.
 /// `slice_mask_map = "(A)(A)(A)(A)(A)(A|B)(1)(1)"` is a closed grammar with four productions
-/// (`Agen.td:1060-1073`); as an `enum` a slice cannot spell a fifth, and the slice COUNT is
+/// (`Agen.td:1058-1072`); as an `enum` a slice cannot spell a fifth, and the slice COUNT is
 /// `slices.len()` rather than a `num_slices` attribute that could disagree with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceMask {

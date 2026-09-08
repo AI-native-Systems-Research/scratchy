@@ -873,6 +873,68 @@ Two more claims were narrowed rather than corrected: `AccessDetailsSymbolic::ini
 `dcc/src/Analysis/`"* when **all three** do (`TransformationConditionalTree.cpp:155`,
 `ConditionalTree.hpp:151`, `OperationEquivalence.hpp:71`).
 
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT ENTRY 384 — THE PORT HOLDS, 8 CITATIONS AND 7 COUNTS FIXED IN THIS COMMIT
+
+1 `/// Replaces:` anchor, 0 surviving `// crustify:todo:`, 2/2 boxes `[x]`. ⭐ **THE SIX-STEP SPINE AND
+ITS GATE ARE EXACT**, each re-derived from `AgenToSentient.cpp:169-250` (81 lines, as `UNITS.tsv`
+says): the gate at `:174-176`, the LDCVTI pre-pass `:178-210`, the fusion `:213-216`, the interleave
+sweep `:218-231`, the mask-state sweep `:233-245` and the cleanup at `:248`, in that order. So is the
+gate's membership test — `getUnitType` runs `stringToSenComponents` then `senCompToGenericComp`
+(`sys-arch-spec/arch_enums.cpp:124+`) and no specific component outside the six collapses into one, so
+`TransferComp::of`'s twelve `None` arms are the reference's `return`. ⭐ **AND THE PORT IS RIGHT ABOUT
+THE ONE PLACE THE REFERENCE'S OWN COMMENT IS WRONG**: `:183`/`:185` call the LDCVTI anchor a
+`vectorchain.multiply`, and the walk at `:192-198` matches `vectorchain::BinaryOp` with
+`getBinaryOp() == mul`. Both island additions answer their ten-way fan-out correctly —
+`isDataTransfer`'s nineteen classes include `CompositeMemoryInterleaveOp` and do NOT include
+`SetTransferMaskStateOp` (`UnitFiltering.cpp:314-325`) — and both `emit` arms match
+`comp_mem_interleave.mlir:309` and `set_transfer_mask_state.mlir:24` attribute for attribute, over
+`Agen.td:982-1039` and `:1041-1116`.
+
+⭐ THE CORPUS MEASUREMENT REPRODUCES INDEPENDENTLY, and says more than the port claimed: over
+`tests/sentient_corpus/`'s 18 pairs the `agen` ops sit on `l3lu` (72), `lxlu` (36) and `lxsu` (18) and
+nowhere else, so the gate emits nothing new; and every `vectorchain.binary` with operator `mul` sits
+on `sfp` (9 of them, none anywhere else), which the gate excludes — so **the LDCVTI arm cannot fire on
+a staged program even at `Sen1p5`**, on top of being inert because `lower()`'s one caller is `Dd2`. The
+`set_send_dst` `todo!` is unreachable for a second reason: e035 `generate_set_send_destination_stmts`
+(`agen_helper.rs:1325`) has no caller outside its own `#[cfg(test)]` module.
+
+⚠️ ONE DELIBERATE DIVERGENCE, CONFIRMED UNOBSERVABLE. Entry 382's dispatch grew a `Consumed(1)` arm
+for the two new ops, which DROPS them (and the mask state's result binding) from the lowered body
+where the reference leaves them in place for steps 4 and 5. Nothing can see it: `run_on_operation`
+counts them over the INPUT, including regions, and `todo!`s whenever the count is non-zero, so no
+program reaches the fusion with one present.
+
+**8 citations corrected** — the four step spans were each short by the reference's closing brace or
+its comment, and two claims named the wrong function entirely:
+
+| where | said | is |
+|---|---|---|
+| the LDCVTI candidate walk (2 sites) | `:183-189` | `:192-198` |
+| the LDCVTI pre-pass block (2 sites) | `:178-198` | `:178-210` |
+| the mask-state sweep (2 sites) | `:233-244` | `:233-245` |
+| the `set_send_dst` cleanup (2 sites) | `:246-247` | `:247-248` |
+| the "multiply" comment | `:180` | `:183`/`:185`; `:180` reads "agen.vector_load operations" |
+| the twelve transfer classes (2 sites) | `findCandidateForLowering`, `:29-52` | `fuseLoadOrStoreChainOps`'s candidate walk, `:33-37` — `findCandidateForLowering` (`Helper.cpp:2884`) is instantiated with ten distinct classes at twelve sites, which is what `:275` above already measured |
+| the `slice_mask_map` grammar (2 sites) | `Agen.td:1060-1073` | `:1058-1072` |
+| the *add the op to the island* rule (5 sites, all pre-existing) | `AGENT-BRIEF.md:57` | `:87` — correct when written, drifted by `ba46ed418` inserting the budget section |
+
+**7 counts corrected**, each a number the tree contradicts: *"FOUR OF ITS SEVEN STEPS"* → **SIX** (the
+gate and the five steps it guards, which is what the module doc and this entry's own list name); *"for steps 5
+and 6"* → **steps 4 and 5**; *"nine total matches"* → **TEN** (`construct_chunk_and_shuffle_info` and
+`AccessDetailsAffine::initialize` are two sites in one file); *"NINE OF THE REFERENCE'S TWELVE `agen`
+TRANSFER CLASSES HAVE NO ISLAND OP"* → **SEVEN** (the symbolic pair landed with 374/375);
+`is_data_transfer`'s header *"NINETEEN CLASSES, ELEVEN OF WHICH THIS ISLAND DECLARES"* → **TWELVE**
+(its own body says six `dataflow` and six `agen`); *"the four indirect composites"* → **three**
+(`composite_indirect_load`, `_store`, `_load_and_store`); and *"a `_ => false` would make the tenth
+`agen` op silently non-transferring"* is now count-free — the island declares eight and the sentence
+was stale the moment it was written.
+
+⛔ ONE CLAIM WAS INCOMPLETE, NOT DRIFTED. The cleanup comment said e220 *"collapses a unit's identical
+ones into one at the top"*. It also erases them ALL and emits NONE when the shared destination unit's
+type is `"sfp"` — *"if the mode is only ever set to the default (sfp), then we don't even need to
+generate any setdstmask instructions"* (`Helper.cpp:4110-4112`) — which is the case a port of e220 is
+most likely to get wrong, since every other arch level emits the one survivor.
+
 ## Progress
 
 `209/384 ported; 209/384 audited`
@@ -1777,8 +1839,8 @@ and `AccessDetailsAffine::initialize` refuses them (a symbolic subscript is a ru
 what `AccessDetailsSymbolic::initialize` at `:855-897` exists for). Entry 382's dispatch grew rows 11
 and 12, and took the enclosing statement as a parameter so entry 036 can ask about the operation.
 
-⛔ NINE OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES HAVE NO ISLAND OP (the interleave since
-gained one, with entry 384). 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
+⛔ SEVEN OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES HAVE NO ISLAND OP (the symbolic pair
+gained one with entries 374/375, the interleave with entry 384). 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
 `sentient.receive_and_store` whose only readable state is the mark) and 211 a `MemoryInterleave` (the
 `granularity` attribute and the region's ops), on the precedent of `IndirectMemView` and
 `UniformizeSource`; both matches are total and neither invents an op. 211'S IDENTITY TEST IS THE OP
@@ -1796,33 +1858,33 @@ SFP unit now reaches a `todo!` naming `VectorChainToSentientPESFP`'s `VectorLoad
 owns it. Measured against the golden corpus, no unit outside `l3lu`/`lxlu`/`lxsu` carries an `agen`
 op, so the gate changes nothing that is emitted today.
 
-⛔ FOUR OF ITS SEVEN STEPS SIT ON UNPORTED CALLEES, each a counted `todo!` over the input that would
-reach it: the LDCVTI pre-pass (`:178-198`, `e318`, LXLU at SEN1P5 and above, anchored on a
+⛔ FOUR OF ITS SIX STEPS SIT ON UNPORTED CALLEES, each a counted `todo!` over the input that would
+reach it: the LDCVTI pre-pass (`:178-210`, `e318`, LXLU at SEN1P5 and above, anchored on a
 `vectorchain.binary` whose operator is `mul` — NOT `vectorchain.multiply`, which is what the comment
-at `:180` says and the walk at `:183-189` contradicts), the interleave sweep (`:218-231`, `e271`), the
-mask-state sweep (`:233-244`, `e218`) and the `set_send_dst` cleanup (`:246-247`, `e220`, whose own
+at `:183`/`:185` says and the walk at `:192-198` contradicts), the interleave sweep (`:218-231`, `e271`), the
+mask-state sweep (`:233-245`, `e218`) and the `set_send_dst` cleanup (`:247-248`, `e220`, whose own
 `getArch() < RCUDD1A_ISA` early return is vacuous here — `IsaGen` has no lower generation). Only the
 fusion (`e382`) lowers. The LDCVTI arm is inert in production today because the one caller of
 `lower()` is `Dd2`.
 
-⛔ THE ISLAND GREW TWO MORE OPS, for steps 5 and 6. `agen.composite_memory_interleave`
+⛔ THE ISLAND GREW TWO MORE OPS, for steps 4 and 5. `agen.composite_memory_interleave`
 (`Agen.td:982-1039`) and `agen.set_transfer_mask_state` (`:1041-1116`) had no island variant, which
 would have made both sweeps inputless. The interleave carries `granularity: Option<Elements>` (absent
 is the hardware maximum, not zero) and a region of DataflowIR transfers — distinct from
 `agen_helper::MemoryInterleave`, whose region is the LOWERED SentientIR the check reads. The mask
 state carries `slices: Vec<SliceMask>` for `slice_mask_map`, so `(0)`, `(1)`, `(A)` and `(A|B)` are the
-four productions the grammar has (`:1060-1073`) and a fifth is unspellable, with `num_slices` derived
+four productions the grammar has (`:1058-1072`) and a fifth is unspellable, with `num_slices` derived
 as `slices.len()` rather than an attribute that could disagree; its `maskA`/`maskB` patterns are the
 two optional `i32` arrays zipped into `MaskPattern`, and `MaskId` derives the letter rather than
 storing it. Both `emit` arms reproduce the vendor's rendered text
 (`comp_mem_interleave.mlir:309`, `set_transfer_mask_state.mlir:24`). Declaring them forced an answer
-out of nine total matches: `is_data_transfer` (interleave TRUE, mask state FALSE — the fourteenth
+out of ten total matches: `is_data_transfer` (interleave TRUE, mask state FALSE — the fourteenth
 class, outside the nineteen), `agen_op_kind`/`AgenLoad::of`/`VectorLoadOp::of`/`VectorStoreOp::of`
 None, `is_memory_op` false, `TpmvManager::run` unsupported, `vector_type_of` None (the chain names the
 two accesses only), `constructChunkAndShuffleInfo` no user walk, and
 `AccessDetailsAffine::initialize` `UnsupportedOperation`. Entry 382's dispatch consumes both without
-lowering: they are not among the twelve classes `findCandidateForLowering` walks for
-(`AgenToSentient.cpp:29-52`), and `e271`'s `todo!` fires before anything an interleave's region holds
+lowering: they are not among the twelve classes `fuseLoadOrStoreChainOps`'s candidate walk looks for
+(`AgenToSentient.cpp:33-37`), and `e271`'s `todo!` fires before anything an interleave's region holds
 could be dropped.
 
 

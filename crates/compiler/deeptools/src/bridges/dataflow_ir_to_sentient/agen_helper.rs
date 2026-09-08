@@ -638,8 +638,8 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             dfir_op::agen::Op::SymbolicVectorStore { .. } => Some(AgenOpKind::SymbolicVectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
             // The region terminator is not a transfer, and neither the interleave nor the mask
-            // state is one of the twelve classes `findCandidateForLowering` is instantiated with —
-            // `e384_runOnOperation` finds those two with its own walks.
+            // state is one of the twelve classes `fuseLoadOrStoreChainOps`'s candidate walk looks
+            // for (`AgenToSentient.cpp:33-37`) — `e384_runOnOperation` finds those two itself.
             dfir_op::agen::Op::Yield
             | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
             | dfir_op::agen::Op::SetTransferMaskState { .. } => None,

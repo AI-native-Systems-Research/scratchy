@@ -460,7 +460,7 @@ const REGISTER_FILE_UNITS: [GenericComp; 3] = [GenericComp::Pt, GenericComp::Sfp
 /// ⚠️ THREE OF THE FIVE, for the reason entry 141 already records: the island declares
 /// `vector_load`, `vector_store` and `composite_load_and_store` and not `composite_load` or
 /// `composite_store`, and the brief's rule to grow the island is about a function's *input*
-/// (`AGENT-BRIEF.md:57`) — this predicate's input is any op at all. See
+/// (`AGENT-BRIEF.md:87`) — this predicate's input is any op at all. See
 /// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::is_data_transfer`], which lists the
 /// same absences.
 ///

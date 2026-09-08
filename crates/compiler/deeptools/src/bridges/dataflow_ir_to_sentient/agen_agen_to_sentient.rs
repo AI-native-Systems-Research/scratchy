@@ -1236,11 +1236,11 @@ pub(super) fn run_on_operation<A: Arch>(
     let mut lowered = input.units.iter().map(|unit| {
         let comp = TransferComp::of(unit.on.kind());
 
-        // ── the LDCVTI pre-pass, LXLU at SEN1P5 and above (`:178-198`) ───────────────────────────
+        // ── the LDCVTI pre-pass, LXLU at SEN1P5 and above (`:178-210`) ───────────────────────────
         //
         // ⛔ THE ANCHOR IS A `vectorchain.binary` WHOSE OPERATOR IS `mul`, NOT THE ISLAND'S
         // `vectorchain.multiply` — *"LDCVTI patterns are currently the only patterns involving
-        // vectorchain.multiply"* names the operator, and the walk is over `BinaryOp` (`:183-189`).
+        // vectorchain.multiply"* names the operator, and the walk is over `BinaryOp` (`:192-198`).
         // ⛔ AND THE CONVERGENCE LOOP RE-WALKS FROM THE TOP after each rewrite, so a count of
         // candidates is what it converges on, not the one it found first.
         if matches!(comp, Some(TransferComp::Lxlu)) && A::GEN >= IsaGen::Sen1p5 {
@@ -1281,7 +1281,7 @@ pub(super) fn run_on_operation<A: Arch>(
                 );
             }
 
-            // ── the mask states (`:233-244`) ────────────────────────────────────────────────────
+            // ── the mask states (`:233-245`) ────────────────────────────────────────────────────
             let masks = count(&unit.body, &|op| {
                 matches!(op, DfirOp::Agen(agen::Op::SetTransferMaskState { .. }))
             });
@@ -1293,12 +1293,13 @@ pub(super) fn run_on_operation<A: Arch>(
                 );
             }
 
-            // ── the redundant `set_send_dst` cleanup (`:246-247`) ───────────────────────────────
+            // ── the redundant `set_send_dst` cleanup (`:247-248`) ───────────────────────────────
             //
             // ⛔ OVER THE LOWERED OPS, NOT THE INPUT — `set_send_dst` is a `sentient` op this pass
-            // emitted, and the cleanup collapses a unit's identical ones into one at the top
-            // (`Helper.cpp:4084-4123`). Its own `getArch() < RCUDD1A_ISA` guard is vacuous here:
-            // [`IsaGen`] has no generation below it.
+            // emitted, and the cleanup collapses a unit's identical ones into one at the top —
+            // or, when that shared destination unit's type is `"sfp"`, erases them ALL and emits
+            // none (`Helper.cpp:4110-4112`). Its own `getArch() < RCUDD1A_ISA` guard is vacuous
+            // here: [`IsaGen`] has no generation below it.
             if out
                 .body
                 .iter()
