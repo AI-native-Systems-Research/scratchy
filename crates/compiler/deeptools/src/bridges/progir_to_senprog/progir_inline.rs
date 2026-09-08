@@ -5,9 +5,10 @@
 //! spelling and separators. A predicate that decides what to write, without writing it, is not
 //! a port. The authority is `/Users/nickm/git/deeptools-src/<file>:<line>` per unit below.
 
+use super::progir_print::Simplicity;
 use crate::generated::DataType;
 use crate::islands::progir::ty::OperandValue;
-use crate::islands::progir::{Instruction, RegInit};
+use crate::islands::progir::{Block, BlockKind, Instruction, RegInit, UnitProgram, UnitRegState};
 
 impl OperandValue {
     /// Replaces: e001_isDescriptive
@@ -100,26 +101,97 @@ impl RegInit {
     }
 }
 
-// crustify:todo: e018_getSimpleInstrVect
-//   authority: sys-arch-spec/progir/progir.h:464  (4 lines)  `getSimpleInstrVect`
+impl UnitProgram {
+    /// Replaces: e018_getSimpleInstrVect
+    ///
+    /// The instructions of a simple CODE graph — `isGraphSimple(true)`, then the
+    /// `static_cast<ProgIrCodeBlock *>(head)` that the abort licenses.
+    ///
+    /// ⛔ TRAP: THE REFERENCE HANDS A **MUTABLE** VECTOR OUT OF A `const` METHOD, and callers assign
+    /// through it (`dpc.cpp:221`, `getSimpleInstrVect() = sencomp_instrVec;`). Every reader in the
+    /// senprog closure — `dpc.cpp:662`, `progir.cpp:698` and `:726` — only reads, so this is shared.
+    #[must_use]
+    pub fn simple_instr_vect(&self) -> Option<&[Instruction]> {
+        // ⭐ THE VERDICT IS THE GATE AND THE PATTERN IS THE CAST. Any other pair is a graph the
+        // reference aborts on, which here is the absence of a vector rather than a stop.
+        match (self.simplicity(BlockKind::Code), self.blocks.first()) {
+            (Simplicity::Simple, Some(Block::Code(instrs))) => Some(instrs),
+            _ => None,
+        }
+    }
 
-// crustify:todo: e019_getSimpleRegInit
-//   authority: sys-arch-spec/progir/progir.h:497  (4 lines)  `getSimpleRegInit`
+    /// Replaces: e019_getSimpleRegInit
+    ///
+    /// The same gate one kind over, for a `ProgIrRegGraph` — `static_cast<ProgIrRegBlock *>(head)`.
+    ///
+    /// ⭐ `Program::reg_state` ALREADY HOLDS THIS FLATTENED, one [`UnitRegState`] per unit, so
+    /// `dpc.cpp:730`'s reader takes it from there; this answers for a graph that carries the block.
+    #[must_use]
+    pub fn simple_reg_init(&self) -> Option<&UnitRegState> {
+        match (self.simplicity(BlockKind::RegInit), self.blocks.first()) {
+            (Simplicity::Simple, Some(Block::RegInit(state))) => Some(state),
+            _ => None,
+        }
+    }
+}
 
-// crustify:todo: e020_getTagStr
-//   authority: sys-arch-spec/progir/progir.h:345  (1 lines)  `getTagStr`
+impl Instruction {
+    /// Replaces: e020_getTagStr
+    ///
+    /// The branch label, or `""` — the reference returns a reference to one shared `static empty`
+    /// string when `tag_` is null (`progir.h:358`), so a missing tag reads as an empty one.
+    #[must_use]
+    pub fn tag_str(&self) -> &str {
+        self.tag.as_deref().unwrap_or("")
+    }
 
-// crustify:todo: e021_hasComment
-//   authority: sys-arch-spec/progir/progir.h:335  (1 lines)  `hasComment`
+    /// Replaces: e021_hasComment
+    ///
+    /// `(bool)comment_ && !getCommentStr().empty()` — [`Self::comment_str`] (e011) already reads a
+    /// null comment as `""`, so both halves are this one test.
+    ///
+    /// ⛔ TRAP: A COMMENT IS NEVER LOAD-BEARING — `setComment` drops the text unless
+    /// `enable_debug_flag` (`progir.h:323-330`), and senprog trails it as `"  // "` on the
+    /// instruction's line when this or `deadCode_` holds (`dpc.cpp:716-717`).
+    #[must_use]
+    pub fn has_comment(&self) -> bool {
+        !self.comment_str().is_empty()
+    }
 
-// crustify:todo: e022_hasTag
-//   authority: sys-arch-spec/progir/progir.h:333  (1 lines)  `hasTag`
+    /// Replaces: e022_hasTag
+    ///
+    /// ⭐ THIS IS WHAT SENPROG WRITES A LABEL FOR: `if (instr.hasTag()) out << "///" << getTagStr()`
+    /// on its own line, before the opcode (`dpc.cpp:663`).
+    ///
+    /// ⛔ TRAP: AN EMPTY TAG IS NO TAG. `setTag` returns on an empty string (`progir.h:315`), so
+    /// `Some(String::new())` is a state only a hand-built instruction reaches — and it answers
+    /// `false`, exactly as the reference's `!getTagStr().empty()` does.
+    #[must_use]
+    pub fn has_tag(&self) -> bool {
+        !self.tag_str().is_empty()
+    }
+}
 
-// crustify:todo: e023_isBool
-//   authority: sys-arch-spec/progir/progir.h:108  (1 lines)  `isBool`
+impl OperandValue {
+    /// Replaces: e023_isBool
+    ///
+    /// `type_ == Type::BOOLEAN` — ⛔ NOT AN INT, though `asBool` delegates to `asInt`
+    /// (`progir.h:90-93`): `print` writes a BOOLEAN as `to_string(asBool(id))`, i.e. `0`/`1`
+    /// (`progir.cpp:47-51`), and `isInt` still says no.
+    #[must_use]
+    pub const fn is_bool(&self) -> bool {
+        matches!(self, Self::Boolean(_))
+    }
 
-// crustify:todo: e024_isFloat
-//   authority: sys-arch-spec/progir/progir.h:107  (1 lines)  `isFloat`
+    /// Replaces: e024_isFloat
+    ///
+    /// `type_ == Type::FLOAT` — a 32-bit float, and the only kind `asFloat` admits
+    /// (`progir.h:74-77`). ⛔ INT128 is the four-word vector immediate, not a wide float.
+    #[must_use]
+    pub const fn is_float(&self) -> bool {
+        matches!(self, Self::Float(_))
+    }
+}
 
 // crustify:todo: e025_isInt
 //   authority: sys-arch-spec/progir/progir.h:106  (1 lines)  `isInt`
@@ -206,5 +278,57 @@ mod unit_tests {
             reg(Some(DataType::Sen169Fp16)).sen_data_type(),
             Some(DataType::Sen169Fp16)
         );
+    }
+
+    /// `getSimpleInstrVect` and `getSimpleRegInit` are one gate two kinds apart: each answers for a
+    /// graph of its own kind and, where the reference aborts, for neither.
+    #[test]
+    fn each_simple_accessor_answers_only_for_its_own_kind_of_graph() {
+        use crate::bridges::progir_to_senprog::test_fixtures::instr;
+
+        let one = instr(Vec::new());
+        let code = UnitProgram {
+            blocks: vec![Block::Code(vec![one.clone()])],
+        };
+        assert_eq!(code.simple_instr_vect(), Some(&[one][..]));
+        assert_eq!(code.simple_reg_init(), None);
+
+        let regs = UnitProgram {
+            blocks: vec![Block::RegInit(UnitRegState::new())],
+        };
+        assert_eq!(regs.simple_reg_init(), Some(&UnitRegState::new()));
+        assert_eq!(regs.simple_instr_vect(), None);
+    }
+
+    /// ⭐ THE NEGATIVE IS THE EMPTY STRING, NOT THE ABSENCE: `setTag`/`setComment` both refuse an
+    /// empty one, so `Some(String::new())` is reachable only by hand and must read as "none".
+    #[test]
+    fn an_empty_tag_or_comment_is_no_tag_and_no_comment() {
+        use crate::bridges::progir_to_senprog::test_fixtures::instr;
+
+        let mut instr = instr(Vec::new());
+        assert_eq!(instr.tag_str(), "");
+        assert!(!instr.has_tag() && !instr.has_comment());
+
+        instr.tag = Some(String::new());
+        instr.comment = Some(String::new());
+        assert_eq!(instr.tag_str(), "");
+        assert!(!instr.has_tag() && !instr.has_comment());
+
+        instr.tag = Some("L3_loop_end".to_owned());
+        instr.comment = Some("row 0 tail".to_owned());
+        assert_eq!(instr.tag_str(), "L3_loop_end");
+        assert!(instr.has_tag() && instr.has_comment());
+    }
+
+    /// A BOOLEAN and a FLOAT are distinct tags, and neither is the INT that `asBool` reads through.
+    #[test]
+    fn bool_and_float_answer_only_to_their_own_kind() {
+        let boolean = OperandValue::Boolean(true);
+        let float = OperandValue::Float(1.5);
+
+        assert!(boolean.is_bool() && !boolean.is_float());
+        assert!(float.is_float() && !float.is_bool());
+        assert!(!OperandValue::Int(1).is_bool() && !OperandValue::Int128([0; 4]).is_float());
     }
 }

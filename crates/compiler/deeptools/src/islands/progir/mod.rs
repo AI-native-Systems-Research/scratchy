@@ -151,7 +151,38 @@ pub enum Block {
     VarDef(Vec<(String, String)>),
 }
 
+/// WHICH KIND OF BLOCK — `ProgIrBlock::Type` (`progir.h:365-374`), which is also what a graph fixes
+/// as its own `graphType` to say which kind its single block must be (`progir.h:418`).
+///
+/// ⛔ FIVE, NOT EIGHT: `CONDITION_END`, `FORLOOP_END` and `DUMMY` are not [`Block`] variants — see
+/// there for why nesting states what the reference's end markers and default do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// `CODE`.
+    Code,
+    /// `FORLOOP`.
+    ForLoop,
+    /// `CONDITION`.
+    Condition,
+    /// `REGINIT`.
+    RegInit,
+    /// `VARDEF`.
+    VarDef,
+}
+
 impl Block {
+    /// WHICH KIND THIS IS — the reference's `type` field, which its subclass constructor fixes.
+    #[must_use]
+    pub const fn kind(&self) -> BlockKind {
+        match self {
+            Block::Code(_) => BlockKind::Code,
+            Block::ForLoop { .. } => BlockKind::ForLoop,
+            Block::Condition { .. } => BlockKind::Condition,
+            Block::RegInit(_) => BlockKind::RegInit,
+            Block::VarDef(_) => BlockKind::VarDef,
+        }
+    }
+
     /// HOW MANY INSTRUCTIONS THIS BLOCK AND EVERYTHING IT ENCLOSES HOLD.
     ///
     /// ⛔ COUNTS THE LOOP BODY **ONCE**, NOT ONCE PER TRIP. The instruction buffer holds the program,

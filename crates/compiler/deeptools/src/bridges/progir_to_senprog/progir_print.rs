@@ -9,7 +9,7 @@ use sys_arch_spec::arch_enums::SenComponent;
 
 use crate::arch::Arch;
 use crate::islands::progir::ty::OperandValue;
-use crate::islands::progir::{Block, Program};
+use crate::islands::progir::{Block, BlockKind, Program, UnitProgram};
 use crate::model::Model;
 use crate::workload::Workload;
 
@@ -190,8 +190,41 @@ pub const fn sen_component(unit: UnitName, corelet: Corelet) -> Option<SenCompon
     })
 }
 
-// crustify:todo: e017_isGraphSimple
-//   authority: sys-arch-spec/progir/progir.cpp:532  (14 lines)  `ProgIrGraph::isGraphSimple`
+/// WHETHER A GRAPH IS THE ONE BLOCK ITS `getSimple*` ACCESSORS CAST — `isGraphSimple`'s answer as a
+/// value, because its `blocking` arm is a `DT_ERROR` and this crate never refuses at runtime.
+///
+/// ⛔ TRAP: THE REFERENCE CALLS A WRONG-KIND HEAD *"Graph has multiple blocks"* — one message for
+/// both causes of `blocks.size() > 1 || head->type != graphType`. They are separate here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Simplicity {
+    /// `blocks.empty()` — *"Graph is empty, cannot proceed"*.
+    Empty,
+    /// More than one block: a `simplifyGraph` is owed before anything reads it.
+    ManyBlocks,
+    /// The single block is not the kind this graph is read as, carrying what it is instead.
+    WrongKind(BlockKind),
+    /// One block, of the graph's own kind.
+    Simple,
+}
+
+impl UnitProgram {
+    /// Replaces: e017_isGraphSimple
+    ///
+    /// ⭐ `graph_type` IS THE SUBCLASS. `ProgIrCodeGraph`, `ProgIrRegGraph` and `ProgIrVarGraph`
+    /// differ only in the `graphType` their constructor fixes (`progir.h:455-501`), so one Rust
+    /// graph plus this argument is all three of them.
+    #[must_use]
+    pub fn simplicity(&self, graph_type: BlockKind) -> Simplicity {
+        match self.blocks.as_slice() {
+            [] => Simplicity::Empty,
+            // ⛔ THE HEAD'S KIND IS CHECKED ONLY AT ONE BLOCK: `size() > 1` short-circuits it in the
+            // reference, so a two-block graph is `ManyBlocks` whatever its head is.
+            [head] if head.kind() == graph_type => Simplicity::Simple,
+            [head] => Simplicity::WrongKind(head.kind()),
+            _ => Simplicity::ManyBlocks,
+        }
+    }
+}
 
 // crustify:todo: e030_tagToLCCR
 //   authority: sys-arch-spec/progir/progir.cpp:720  (88 lines)  `ProgramAndStateInfo::tagToLCCR`
@@ -263,5 +296,29 @@ mod unit_tests {
         assert_eq!(sen_component(UnitName::Pt, Corelet::C0), None);
         assert_eq!(sen_component(UnitName::Pt, Corelet::C1), None);
         assert_eq!(sen_component(UnitName::L3lu, Corelet::C1), None);
+    }
+
+    /// The reference's three failing shapes and its one passing one: empty, more than one block, a
+    /// head of the wrong kind, and a single block of the graph's own kind (`progir.cpp:533-544`).
+    #[test]
+    fn a_graph_is_simple_only_as_one_block_of_its_own_kind() {
+        assert_eq!(
+            UnitProgram::default().simplicity(BlockKind::Code),
+            Simplicity::Empty
+        );
+
+        let code = UnitProgram {
+            blocks: vec![Block::Code(Vec::new())],
+        };
+        assert_eq!(code.simplicity(BlockKind::Code), Simplicity::Simple);
+        assert_eq!(
+            code.simplicity(BlockKind::RegInit),
+            Simplicity::WrongKind(BlockKind::Code)
+        );
+
+        let two = UnitProgram {
+            blocks: vec![Block::Code(Vec::new()), Block::Code(Vec::new())],
+        };
+        assert_eq!(two.simplicity(BlockKind::Code), Simplicity::ManyBlocks);
     }
 }
