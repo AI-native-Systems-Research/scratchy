@@ -574,10 +574,10 @@ pub enum TransferExtents {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkAndShuffleInfo {
-    /// `success()` (`:265`) — chunk size, chunk stride and any shuffle or rotation are set.
+    /// `success()` (`:264`) — chunk size, chunk stride and any shuffle or rotation are set.
     Chunked,
 
-    /// `failure()` with NO message (`:126-130`): the coefficients are not one longer than the extents,
+    /// `failure()` with NO message (`:127-130`): the coefficients are not one longer than the extents,
     /// or the innermost stride is not 1.
     ///
     /// ⛔ IT SUBSUMES `DT_CHECK(layout_coeffs.size() >= extents.size())` (`:110`) and it is where an
@@ -585,7 +585,7 @@ pub enum ChunkAndShuffleInfo {
     LayoutDoesNotMatchExtents,
 
     /// *"Extent in load/store set is larger than from the layout"* — the SAME message from both loops
-    /// (`:154-156`, `:177-179`), so the dimension names which.
+    /// (`:154-155`, `:179-180`), so the dimension names which.
     ExtentLargerThanLayout {
         /// Row-major dimension index, innermost first.
         dim: usize,
@@ -594,27 +594,27 @@ pub enum ChunkAndShuffleInfo {
     /// *"Chunk starting offset from load/store set are not supported in lowering"* (`:194-197`).
     ChunkStartingOffsetUnsupported,
 
-    /// *"Variable chunk strides cannot be lowered"* (`:200-203`) — a second, outer chunk stride.
+    /// *"Variable chunk strides cannot be lowered"* (`:200-202`) — a second, outer chunk stride.
     VariableChunkStride {
         /// Row-major dimension index carrying it.
         dim: usize,
     },
 
-    /// *"Abort due to invalid select map"* (`:239`), after one
-    /// *"Non-supported select map for VectorLoadOp!"* (`:234`) per offending expression.
+    /// *"Abort due to invalid select map"* (`:241`), after one
+    /// *"Non-supported select map for VectorLoadOp!"* (`:236`) per offending expression.
     InvalidSelectMap,
 
-    /// `DT_CHECK_MSG(getRotationPosition() <= getTotalElements(), …)` (`:250-253`).
+    /// `DT_CHECK_MSG(getRotationPosition() <= getTotalElements(), …)` (`:249-252`).
     RotationPositionOverTotalElements,
 
-    /// `DT_CHECK_MSG(rotate_op.getRightShift(), …)` (`:256-257`).
+    /// `DT_CHECK_MSG(rotate_op.getRightShift(), …)` (`:255-256`).
     LeftRotationUnsupported,
 
-    /// A negative rotation constant — the reference's `getRotationPosition() >= 0` (`:254-255`), which
+    /// A negative rotation constant — the reference's `getRotationPosition() >= 0` (`:253-254`), which
     /// only an `int` field could ever fail; ⛔ A COUNT CANNOT HOLD IT, so it is refused on the way in.
     RotationPositionNegative,
 
-    /// `DT_ERROR("index position to rotation op has to be a constant")` (`:259-260`).
+    /// `DT_ERROR("index position to rotation op has to be a constant")` (`:258`).
     RotationPositionNotConstant,
 }
 
@@ -625,7 +625,7 @@ impl ChunkAndShuffleInfo {
         matches!(self, ChunkAndShuffleInfo::Chunked)
     }
 
-    /// The diagnostic the C++ emits, verbatim (`AccessDetails.cpp:126-260`).
+    /// The diagnostic the C++ emits, verbatim (`AccessDetails.cpp:155-258`).
     #[must_use]
     pub const fn diagnostic(self) -> Option<&'static str> {
         match self {
@@ -1429,15 +1429,15 @@ impl<'a> AccessDetailsBase<'a> {
     ///
     /// ⛔ IT WORKS ON A ROW-MAJOR **COPY**: a column-major layout is reversed all but its trailing
     /// constant term, and the extents with it (`:111-123`); the members keep their own order.
-    /// ⛔ THE TWO `dim_idx` CURSORS START AT `-1` AND THE REFERENCE THEN INDEXES WITH ONE (`:191`) —
+    /// ⛔ THE TWO `dim_idx` CURSORS START AT `-1` AND THE REFERENCE THEN INDEXES WITH ONE (`:194`) —
     /// [`None`] here, and the legality test it guards is skipped, which is observably the same because
     /// `chunk_stride` is 0 in exactly that case and the `&&` fails.
-    /// ⛔ `dim == 0`'S MULTIPLIER IS `INT32_MAX`, VERBATIM (`:147-149`): the outermost dimension has no
+    /// ⛔ `dim == 0`'S MULTIPLIER IS `INT32_MAX`, VERBATIM (`:149-151`): the outermost dimension has no
     /// stride above it, so nothing can match and the loop always breaks there. Its `*=` overflows an
     /// `int` in the reference and is unobservable, because no later loop reads the product.
     /// ⛔ A ZERO STRIDE IS A DIVISION BY ZERO THERE; with no ratio there is no multiplier for the
     /// extent to fit under, so [`ChunkAndShuffleInfo::ExtentLargerThanLayout`] refuses it.
-    /// ⛔ ONLY `agen.vector_load` REACHES THE SHUFFLE HALF: the reference's `isa<>` (`:205-206`) lists
+    /// ⛔ ONLY `agen.vector_load` REACHES THE SHUFFLE HALF: the reference's `isa<>` (`:207-208`) lists
     /// the two vector loads and the two composite LOADS, and of those four the island has one —
     /// `CompositeLoadAndStore` is deliberately NOT in that list.
     pub fn construct_chunk_and_shuffle_info(&mut self, scope: &[DfirOp]) -> ChunkAndShuffleInfo {
@@ -1455,7 +1455,7 @@ impl<'a> AccessDetailsBase<'a> {
         };
         let (tmp_layout_coeffs, tmp_extents): (Vec<LayoutCoeff>, Vec<Elements>) = if is_column_major
         {
-            // `:112-122` — the strides reversed with the constant term put back on the end.
+            // `:112-118` — the strides reversed with the constant term put back on the end.
             let mut coeffs: Vec<LayoutCoeff> = Vec::new();
             if let Some((constant, strides)) = self.layout_coeffs.split_last() {
                 coeffs.extend(strides.iter().rev().copied());
@@ -1478,7 +1478,7 @@ impl<'a> AccessDetailsBase<'a> {
             return ChunkAndShuffleInfo::LayoutDoesNotMatchExtents;
         }
 
-        // `int multiplier = dim == 0 ? INT32_MAX : coeffs[dim - 1] / coeffs[dim];` (`:147-149`, `:173-175`)
+        // `int multiplier = dim == 0 ? INT32_MAX : coeffs[dim - 1] / coeffs[dim];` (`:149-151`, `:174-176`)
         let multiplier = |dim: usize| {
             if dim == 0 {
                 Some(i64::from(i32::MAX))
@@ -1491,7 +1491,7 @@ impl<'a> AccessDetailsBase<'a> {
         };
         let extent_at = |dim: usize| tmp_extents.get(dim).copied().unwrap_or(Elements(0));
 
-        // `:138-165` — the contiguous run, innermost dimension outward.
+        // `:148-166` — the contiguous run, innermost dimension outward.
         let mut chunk_dim_idx: Option<usize> = None;
         let mut layout_extent_multiplier = Elements(1);
         let mut chunk_size = Elements(0);
@@ -1516,7 +1516,7 @@ impl<'a> AccessDetailsBase<'a> {
         }
         self.chunk_size = chunk_size;
 
-        // `:169-188` — the chunk stride is the running extent product at the first non-unit extent
+        // `:171-188` — the chunk stride is the running extent product at the first non-unit extent
         // ABOVE the chunk dimension.
         let mut chunk_stride = Elements(0);
         let mut chunk_stride_dim_idx: Option<usize> = None;
@@ -1539,7 +1539,7 @@ impl<'a> AccessDetailsBase<'a> {
         }
         self.chunk_stride = chunk_stride;
 
-        // `:191-197` — a chunk that sits at the innermost stride and yet is one of several.
+        // `:194-197` — a chunk that sits at the innermost stride and yet is one of several.
         if let Some(chunk_dim) = chunk_dim_idx
             && tmp_layout_coeffs.get(chunk_dim) == Some(&LayoutCoeff(1))
             && chunk_stride != Elements(0)
@@ -1563,14 +1563,14 @@ impl<'a> AccessDetailsBase<'a> {
         };
         for user in users {
             match user {
-                // `:220-241` — the selection map decides the shuffle mode.
+                // `:222-242` — the selection map decides the shuffle mode.
                 DfirOp::VectorChain(vectorchain::Op::Select { selection_map, .. }) => {
                     let mut splat = false;
                     let mut valid_select_map = true;
                     selection_map.walk_exprs(&mut |expr| match expr {
                         AffineExpr::Mod(..) => splat = true,
                         // The constant arm's `DT_CHECK(input_size == modulo)` is commented out
-                        // (`:232`), and a bare `d<n>` is the map's own identity.
+                        // (`:234`), and a bare `d<n>` is the map's own identity.
                         AffineExpr::Const(_) | AffineExpr::Dim(_) => {}
                         _ => valid_select_map = false,
                     });
@@ -1581,7 +1581,7 @@ impl<'a> AccessDetailsBase<'a> {
                         return ChunkAndShuffleInfo::InvalidSelectMap;
                     }
                 }
-                // `:242-261` — the rotation amount has to be a constant, forward, and in range.
+                // `:243-260` — the rotation amount has to be a constant, forward, and in range.
                 DfirOp::VectorChain(vectorchain::Op::Rotate {
                     position,
                     right_shift,
@@ -1717,17 +1717,20 @@ pub struct AccessDetailsAffine<'a> {
 
 /// THE OUTCOME OF [`AccessDetailsAffine::initialize`] — initialized, or WHY the op said nothing.
 ///
-/// ⛔ NONE OF THE THREE IS A DIAGNOSTIC. The reference's `initialize()` returns `void` and reaches
-/// `DT_ERROR("unsupported operation")` (`AccessDetails.cpp:346`) — an ABORT — on an op outside its
-/// chain, and reads `getMemoryIndex()` with the memory index already set by `insert`'s caller.
+/// ⛔ TWO ARE DIAGNOSTICS AND ONE IS AN ABORT. `initialize()` returns `LogicalResult`: an op
+/// outside its `dyn_cast` chain gets `op->emitError("unsupported operation")`
+/// (`AccessDetails.cpp:344`) and a failed `initializeMemViewInfo()` a bare `failure()` (`:349`),
+/// while an unset memory index is `DT_CHECK_MSG(getMemoryIndex() != kMax, "uninitialized
+/// memory_index_ detected")` (`:296-297`) — an ABORT, because `insert`'s caller is expected to have
+/// set it already.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum AffineInitialize {
-    /// Every field is set and the memory view is resolved (`:349`).
+    /// Every field is set and the memory view is resolved (`:351`).
     Initialized,
-    /// `memory_index_` was never set, so the record does not know which operand it is.
+    /// `memory_index_` was never set (`:296-297`), so the record does not know which operand it is.
     MemoryIndexUnset,
-    /// `DT_ERROR("unsupported operation")` (`:346`) — a composite, a yield, or one of the two
+    /// `op->emitError("unsupported operation")` (`:344`) — a composite, a yield, or one of the two
     /// `indirect_` twins the island has no op for.
     UnsupportedOperation,
     /// `mem_ref_` does not trace back to a `dataflow.get_*_memory_view` in this scope.
@@ -1741,13 +1744,12 @@ impl AffineInitialize {
         matches!(self, AffineInitialize::Initialized)
     }
 
-    /// The reference's abort message, verbatim (`AccessDetails.cpp:346`).
+    /// What the reference says on the way out, verbatim (`AccessDetails.cpp:297`, `:344`).
     #[must_use]
     pub const fn diagnostic(self) -> Option<&'static str> {
         match self {
-            AffineInitialize::Initialized
-            | AffineInitialize::MemoryIndexUnset
-            | AffineInitialize::MemoryViewUnresolved => None,
+            AffineInitialize::Initialized | AffineInitialize::MemoryViewUnresolved => None,
+            AffineInitialize::MemoryIndexUnset => Some("uninitialized memory_index_ detected"),
             AffineInitialize::UnsupportedOperation => Some("unsupported operation"),
         }
     }
@@ -1840,7 +1842,7 @@ impl<'a> AccessDetailsAffine<'a> {
     /// only in reading `getDirectMemref()`/`getDirectAffineMapAttr()` and has no island op yet, so it
     /// lands on [`AffineInitialize::UnsupportedOperation`] with the composite and the yield.
     /// ⛔ THE WIDTH AND THE COUNT COME FROM THE **VECTOR** OPERAND, not from the memref: the loaded
-    /// result on a load, the stored value on a store (`:305-310`, `:316-321`).
+    /// result on a load, the stored value on a store (`:306-309`, `:316-319`).
     /// ⛔ AND `getMapIndices()`/`getMapOperands()` ARE THE MAP'S OPERANDS, so [`access_map`] hands back
     /// both the subscripts map and the index list in one pass — one `d<i>` per DISTINCT operand.
     pub fn initialize(&mut self, scope: &[DfirOp]) -> AffineInitialize {
@@ -2833,9 +2835,10 @@ impl<'a, T> VacantSlot<'a, T> {
     /// `emplace_back` is C++'s way to build the entry in place; the caller builds it here and moves
     /// it, which is what a `T` by value already is.
     ///
-    /// ⛔ AND THE RETURN IS **EXCLUSIVE**, unlike [`AccessContainer::get`]: `gatherAffineLoadStoreDetails`
-    /// keeps writing through it (`Helper.cpp:566`), so this is the one place the non-const lookup is
-    /// needed and the [`VacantSlot`] hands out its own borrow rather than a second one.
+    /// ⛔ AND THE RETURN IS **EXCLUSIVE**, unlike [`AccessContainer::get`]:
+    /// `constructAffineDetailsAndAddrs` calls `constructDetails` through it (`Helper.cpp:2793-2795`),
+    /// so this is the one place the non-const lookup is needed and the [`VacantSlot`] hands out its
+    /// own borrow rather than a second one.
     pub fn emplace_insert(self, access: T) -> &'a mut T {
         let at = self.container.entries.len();
         self.container.slots[self.moi.slot()] = Some(at);
@@ -4874,7 +4877,7 @@ mod unit_tests {
     /// (64 == 64) so the chunk grows to a whole row, the middle dimension stops it (8 != 1) and the
     /// outer non-unit extent seats the stride at the running product 512. The chunk dimension's own
     /// stride is 64 and not 1, which is what keeps
-    /// [`ChunkAndShuffleInfo::ChunkStartingOffsetUnsupported`] off it (`:191-197`).
+    /// [`ChunkAndShuffleInfo::ChunkStartingOffsetUnsupported`] off it (`:194-197`).
     #[test]
     fn the_chunk_is_the_contiguous_row_and_the_stride_is_the_plane_below_it() {
         let op = agen::Op::VectorLoad {
@@ -4954,8 +4957,8 @@ mod unit_tests {
 
     /// 🎯 208/384 — THE RETURNED ENTRY IS THE ONE IN THE CONTAINER, AND IT IS WRITABLE.
     ///
-    /// ⭐ `return get(moi)` (`:385`) IS WHAT THE CALLER USES: `gatherAffineLoadStoreDetails` inserts a
-    /// record and then keeps writing into it, so a copy would drop every later write.
+    /// ⭐ `return get(moi)` (`:385`) IS WHAT THE CALLER USES: `constructAffineDetailsAndAddrs`
+    /// inserts a record and then constructs into it, so a copy would drop every later write.
     #[test]
     fn the_inserted_entry_is_handed_back_for_writing_at_the_slot_it_took() {
         let mut container = AccessContainer::<Val>::default();

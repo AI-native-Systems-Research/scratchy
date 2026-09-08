@@ -60,11 +60,11 @@ back. Identical to the authority: 231, 234, 237, 238, 240, 242, 246, 247, 248.
 
 ## Progress
 
-`201/384 ported; 201/384 audited`
+`200/384 ported; 200/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
-`src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
-(entry 214), and entries 002-024 — `setCoalescedBoundValues`, the six `AccessDetailsBase` setters
+`src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
+`setCoalescedBoundValues`, the six `AccessDetailsBase` setters
 that establish its access state and the seven that establish its transfer state, the
 `AccessDetailsAffine` constructor and its two setters (`setSubscriptsMap`, `setIndicesCoeffDict`),
 and `AccessDetailsAffineComposite`'s constructor plus its time setters (`setTimeAddrMap`,
@@ -1378,8 +1378,8 @@ the maximum and is never checked, so `l3BurstSize` itself is legal and 0 is not.
 - [x] **AUDIT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, line by line against the C++
 - [x] **PORT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, 16 lines
 - [x] **AUDIT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, line by line against the C++
-- [x] **PORT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
-- [x] **AUDIT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
+- [ ] **PORT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
+- [ ] **AUDIT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
 - [ ] **PORT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, 50 lines
 - [ ] **AUDIT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, line by line against the C++
 - [ ] **PORT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, 91 lines

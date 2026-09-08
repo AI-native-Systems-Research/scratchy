@@ -38,6 +38,10 @@ pub struct Addressing {
 
 /// **316/490** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581` (43L).
 ///
+/// ⚠️ NOT A PORTED UNIT. Entry 214/384's home is `agen_helper.rs` (UNITS.tsv) and it carries no
+/// `/// Replaces:` anchor; this is the pre-campaign predicate, with the emission and the newtypes
+/// still missing. The PORT/AUDIT ticks for 214 were removed on that ground.
+///
 /// # 🛑 FOUR CASES, NOT TWO, AND THE TWO AXES ARE INDEPENDENT
 ///
 /// ⛔⛔ THE FORK IS `is_l3` **CROSSED WITH** `perform_burst_or_groups`, and reading it as one fork gets
@@ -48,7 +52,7 @@ pub struct Addressing {
 /// | **L3** | immutable = mem-view start; increment = `total_elements * burst_size` | immutable = mem-view start; increment = **0** |
 /// | **other** | immutable = `stride_size`; increment = **`stride_size` TOO** | immutable = **0**; increment = **0** |
 ///
-/// ⛔⛔ THE NON-L3 BURST ARM SETS **BOTH** FIELDS TO `stride_size` (`:1606-1612`) — two separate
+/// ⛔⛔ THE NON-L3 BURST ARM SETS **BOTH** FIELDS TO `stride_size` (`:1604-1610`) — two separate
 /// `sentient::ConstantOp`s of the same value. An earlier reading of this function recorded only the
 /// immutable address and left the increment alone, which leaves a bursting LX transfer advancing by
 /// whatever the default was.
@@ -58,14 +62,14 @@ pub struct Addressing {
 /// address at all, in either column.
 ///
 /// ⭐⭐ WHY THE CONSTANTS APPEAR ABOVE THE PROGRAM UNITS: this function moves the builder to
-/// `setInsertionPoint(unit_op)` before creating them (`:1592-1594`) and restores it after. That is the
+/// `setInsertionPoint(unit_op)` before creating them (`:1593-1594`) and restores it after. That is the
 /// mechanism behind the hoisted `sentient.scalar_constant`s in the reference's output, and it is why
 /// they are the caller's to mint here rather than pushed into a unit's body.
 ///
 /// ⛔ THE ZERO INCREMENT IS DELIBERATE AND DOCUMENTED, not a missing case: *"If there is no burst size
 /// or IL groups, the increment is always zero in the AgenToSentient lowering. The later passes will
 /// modify increment value to non-zero values depending on possibilities. This is a statement
-/// irrespective of L3/LX/L0 LU/SU units."* (`:1614-1618`).
+/// irrespective of L3/LX/L0 LU/SU units."* (`:1613-1616`).
 #[must_use]
 pub const fn set_immutable_addr_and_increments(
     unit: DfirUnit,
@@ -77,7 +81,7 @@ pub const fn set_immutable_addr_and_increments(
     if perform_burst_or_groups {
         if is_l3(unit) {
             // ⭐ THE REFERENCE LEAVES AN UNPROVEN ASSUMPTION HERE, as a comment:
-            // *"TODO: assert that stride_size x precision = stick size"* (`:1597`).
+            // *"TODO: assert that stride_size x precision = stick size"* (`:1598`).
             Addressing {
                 immutable_addr: ImmutableAddr::MemoryStart,
                 increment: total_elements * burst_size,
