@@ -18,9 +18,10 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-use crate::arch::{Arch, IsaGen};
+use crate::arch::{Arch, Bytes, IsaGen, Sticks};
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue};
 use crate::islands::sentient::dialects::sentient::Precision;
+use sys_arch_spec::regfile::Component;
 
 /// WHICH COMPUTE UNIT AN FMA/FMUL/FNMS RUNS ON — the two `is_any_of(comp, PE, SFP)` admits at every
 /// callsite (`ConstructProgIRHelper.cpp:1449`, `:1795`, `:1804`).
@@ -252,15 +253,60 @@ pub fn update_proper_consumer(value: &mut Operand, consumer: ConsumerUnit, fold:
     value.set(fold, OperandValue::Descriptive(tag.spelling().to_owned()));
 }
 
-// crustify:todo: e041_getAddrWraparounded
+/// WHOSE ADDRESS SPACE AN IMMEDIATE COUNTS IN — the `SenComponents` [`addr_wraparounded`] is keyed
+/// by, which spans a unit component and one register file: every callsite that names a file names
+/// `PTXRF` (`ConstructProgIRHelper.cpp:214,225,907-931,951,958`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrSpace {
+    /// A unit's own component. ⭐ `L0LUROW0` AND `L0LU` ARE ONE VARIANT HERE — the reference lists
+    /// both spellings because its enum keeps every L0 load row apart; the generic map does not.
+    Unit(Component),
+    /// `PTXRF` — the PT's transposed register file, addressed within one PT row.
+    PtXrf,
+}
+
+/// `getL0CapacityPerSlice` (`Utils/DccExtContext.cpp:376-379`) — the whole L0 over the PT row count.
+/// ⛔ THE NAME SAYS SLICE AND THE CODE DIVIDES BY `numPTRows`: both 8 on DD2, but 4 rows against 8
+/// slices on SEN1P5, where this is twice what the name claims.
+const fn l0_capacity_per_slice<A: Arch>() -> Bytes {
+    Bytes(A::L0_CAPACITY.0 * A::BYTES_PER_STICK.get() / A::PT_ROWS as u64)
+}
+
+/// `getNumXRFPerPTRow` (`Utils/DccExtContext.cpp:369-374`) — the 64 KiB XRF array in sticks, shared
+/// out over the PT's rows. (The reference divides by a literal 128, which is `BYTES_PER_STICK`.)
+const fn num_xrf_per_pt_row<A: Arch>() -> Sticks {
+    Sticks(A::XRF_CAPACITY.0 / A::BYTES_PER_STICK.get() / A::PT_ROWS as u64)
+}
+
+/// Replaces: e041_getAddrWraparounded
+///
+/// Fold an address immediate into the file it addresses: L0 addressing is cyclic over one slice
+/// (its `MODLRF` immediate is 10 bits, `ConstructProgIRHelper.cpp:4137-4139`), and the XRF biases by
+/// a row's register count first, so a small negative pointer lands at the top of the row.
+/// ⛔ A ZERO `PT_ROWS` IS A BUILD ERROR HERE, where the reference has a `DT_CHECK` — both divisors
+/// are evaluated in a `const` block, so nothing can divide by zero at run time.
+#[must_use]
+pub fn addr_wraparounded<A: Arch>(val: i64, space: AddrSpace) -> i64 {
+    match space {
+        AddrSpace::Unit(Component::L0lu | Component::L0su) => {
+            val % const { l0_capacity_per_slice::<A>().0 as i64 }
+        }
+        AddrSpace::PtXrf => {
+            let num_xrf_per_ptrow = const { num_xrf_per_pt_row::<A>().0 as i64 };
+            (val + num_xrf_per_ptrow) % num_xrf_per_ptrow
+        }
+        AddrSpace::Unit(_) => val,
+    }
+}
+
 // crustify:todo: e080_setFCValueFromFoldMode
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ComputeUnit, ConsumerUnit, InputPrecisions, LoadConsumer, SrcOperand,
-        UnsupportedConversion, proper_consumer, unsupported_on_the_fly_conversions,
-        update_proper_consumer,
+        AddrSpace, Component, ComputeUnit, ConsumerUnit, InputPrecisions, LoadConsumer, SrcOperand,
+        UnsupportedConversion, addr_wraparounded, proper_consumer,
+        unsupported_on_the_fly_conversions, update_proper_consumer,
     };
     use crate::arch::{Dd2, Sen1p5};
     use crate::islands::progir::ty::{FoldId, Operand, OperandValue, PerFold};
@@ -442,6 +488,41 @@ mod unit_tests {
         assert_eq!(
             value.value,
             PerFold::Every(OperandValue::Descriptive("sfp".to_owned()))
+        );
+    }
+
+    /// The L0 wraps at one slice — 1024 bytes on DD2, 4096 on SEN1P5 — and the XRF biases a negative
+    /// pointer into its registers per row: 64 on DD2, 128 on SEN1P5.
+    #[test]
+    fn the_l0_wraps_at_a_slice_and_the_xrf_biases_into_its_row() {
+        assert_eq!(
+            addr_wraparounded::<Dd2>(1024 + 7, AddrSpace::Unit(Component::L0lu)),
+            7
+        );
+        assert_eq!(
+            addr_wraparounded::<Dd2>(1023, AddrSpace::Unit(Component::L0su)),
+            1023
+        );
+        assert_eq!(
+            addr_wraparounded::<Sen1p5>(1024 + 7, AddrSpace::Unit(Component::L0lu)),
+            1031,
+            "SEN1P5's L0 is twice as large over half the rows"
+        );
+        assert_eq!(
+            addr_wraparounded::<Sen1p5>(4096 + 7, AddrSpace::Unit(Component::L0lu)),
+            7
+        );
+        assert_eq!(addr_wraparounded::<Dd2>(-1, AddrSpace::PtXrf), 63);
+        assert_eq!(addr_wraparounded::<Dd2>(70, AddrSpace::PtXrf), 6);
+        assert_eq!(addr_wraparounded::<Sen1p5>(-1, AddrSpace::PtXrf), 127);
+        // Every other component hands the immediate straight back.
+        assert_eq!(
+            addr_wraparounded::<Dd2>(9999, AddrSpace::Unit(Component::Pt)),
+            9999
+        );
+        assert_eq!(
+            addr_wraparounded::<Dd2>(9999, AddrSpace::Unit(Component::Lxlu)),
+            9999
         );
     }
 }
