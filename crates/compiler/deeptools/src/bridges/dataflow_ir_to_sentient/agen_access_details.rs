@@ -421,6 +421,153 @@ pub fn set_coalesced_bound_values(
     }
 }
 
+/// Replaces: e266_coalesceTimeDimensions
+///
+/// **266/384** `AccessDetailsAffineComposite::coalesceTimeDimensions` —
+/// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681` (112L). Cuts the time nest where source
+/// and destination offsets start to differ, then merges every run of dimensions whose offsets are
+/// contiguous into its innermost dimension.
+///
+/// ⛔ ONLY `time_bounds` IS WRITTEN BACK (`:786`, `:790`). The coalesced `time_offsets` drive the scan
+/// and are then dropped, which is why the cut has to be recomputed by whoever wants the offsets.
+pub fn coalesce_time_dimensions(
+    access_details: &mut AccessContainer<AccessDetailsAffineComposite<'_>>,
+) {
+    // ⛔ `DT_CHECK(size() > 0 …)` IS THIS `let else` — with no first operand there is no nest to read.
+    // The `size() <= 4` half is structural: one slot per [`MemoryOperandIndex`].
+    let Some(first) = access_details.get_first() else {
+        return;
+    };
+    // time_bounds and time_offsets are already ordered based on time_order.
+    let mut time_bounds = first.time_bounds.clone();
+    let mut time_offsets = first.time_offsets.clone();
+    let mut time_bounds_remaining: Vec<TimeBound> = Vec::new();
+
+    // When we have more than one access detail, only the mandatory operands (ie kDirSrc and kDirDst)
+    // are used for the actual time steps.
+    // ⛔ THE SRC-EQUALS-DST BOUNDS `DT_CHECK` (`:703-709`) IS DROPPED, NOT TRANSLATED. It reads both
+    // lists and writes nothing; the branch below already takes the source's bounds, so there is no
+    // behaviour behind it and a runtime assert is what this crate forbids.
+    // ⛔ AND A CONTAINER OF TWO THAT IS NOT THE MANDATORY PAIR — `kIndSrc` beside `kDirDst`, which
+    // `composite_indirect_load_and_store` builds — aborts in the reference's `get`; here the cut is
+    // simply not made and the first operand's own nest stands.
+    let mandatory = access_details.entries().len() >= 2;
+    if mandatory
+        && let Some(src) = access_details.get(MemoryOperandIndex::DirSrc)
+        && let Some(dst) = access_details.get(MemoryOperandIndex::DirDst)
+    {
+        let time_bounds_src = src.time_bounds.clone();
+        let time_offsets_src = src.time_offsets.clone();
+        let time_offsets_dst = dst.time_offsets.clone();
+
+        let mut skip = false;
+        time_bounds.clear();
+        time_offsets.per_dim.clear();
+        // `time_offsets.emplace_back(time_offsets_src.back())` (`:722`) — the trailing term is the
+        // constant, and it is the one entry the cut always keeps. See [`TimeOffsets`].
+        time_offsets.constant = time_offsets_src.constant;
+
+        // Ordering is outer to innermost, so the scan runs INWARD-OUT to find the cut where the
+        // offsets start differing, and re-inserts at the front to restore outer-to-inner.
+        // ⛔ ZIPPED RATHER THAN SUBSCRIPTED: the reference's two `DT_CHECK`s (`:684`, `:696`) assert
+        // all three lists are one length, and where they were not it would read past one.
+        for (bound, (off_src, off_dst)) in time_bounds_src
+            .iter()
+            .zip(time_offsets_src.per_dim.iter().zip(&time_offsets_dst.per_dim))
+            .rev()
+        {
+            if !skip && (*bound == TimeBound::Steps(1) || off_src == off_dst) {
+                time_offsets.per_dim.insert(0, *off_src);
+                time_bounds.insert(0, *bound);
+            } else {
+                skip = true;
+                time_bounds_remaining.insert(0, *bound);
+            }
+        }
+    }
+
+    // `DT_CHECK_MSG(time_bounds.size() + 1 == time_offsets.size(), "expected same number of
+    // dimensions for time_addr map and time_set")` (`:742`) is structural — see [`TimeOffsets`].
+    let mut time_bound_coalesced = false;
+    let num_of_dim = time_bounds.len();
+    let offset = |dim: usize| time_offsets.per_dim.get(dim).copied().unwrap_or(0);
+    // ⛔ AN EMPTY NEST HAS NOTHING TO SCAN. The reference opens on `time_bounds[num_of_dim - 1]`
+    // (`:748`), which for no time dimensions is `time_bounds[-1]`.
+    if let Some(innermost) = num_of_dim.checked_sub(1) {
+        //  scan from innermost loop
+        let mut time_index_inner = innermost;
+        let mut total_dist_inner = steps_of(time_bounds[innermost]).saturating_mul(offset(innermost));
+        let mut coalesced_bound = steps_of(time_bounds[innermost]);
+        // time_index_outer goes down to -1 to catch the outermost time dim; `None` IS that -1.
+        let outers = (0..innermost).rev().map(Some).chain(core::iter::once(None));
+        for time_index_outer in outers {
+            if time_index_outer.is_none_or(|outer| offset(outer) != total_dist_inner) {
+                // `(time_index_inner - time_index_outer) > 1`, with -1 read as one before dim 0.
+                let run = time_index_inner + 1 - time_index_outer.map_or(0, |outer| outer + 1);
+                if run > 1 {
+                    set_coalesced_bound_values(
+                        &mut time_bounds,
+                        time_index_outer.map(|outer| TimeDim(outer as u32)),
+                        TimeDim(time_index_inner as u32),
+                        bound_of(coalesced_bound),
+                    );
+                    time_bound_coalesced = true;
+                }
+                if let Some(outer) = time_index_outer {
+                    time_index_inner = outer;
+                    total_dist_inner = steps_of(time_bounds[outer]).saturating_mul(offset(outer));
+                    coalesced_bound = steps_of(time_bounds[outer]);
+                }
+            } else if let Some(outer) = time_index_outer {
+                coalesced_bound = coalesced_bound.saturating_mul(steps_of(time_bounds[outer]));
+                total_dist_inner = steps_of(time_bounds[outer]).saturating_mul(offset(outer));
+            }
+        }
+    }
+
+    // If the cut has happened, then those remaining time dimensions from the cut to the outermost
+    // have to be added back — at the FRONT, in their own order (`:784`).
+    time_bounds_remaining.extend(time_bounds);
+    let time_bounds = time_bounds_remaining;
+    if let Some(first) = access_details.get_first_mut() {
+        first.set_time_bounds(&time_bounds);
+    }
+    // Copy assignment, to make sure time_bounds of both access details objects are the same.
+    if time_bound_coalesced
+        && mandatory
+        && let Some(dst) = access_details.get_mut(MemoryOperandIndex::DirDst)
+    {
+        dst.set_time_bounds(&time_bounds);
+    }
+}
+
+/// A TIME BOUND AS THE `int64_t` THE MERGE SCAN MULTIPLIES — sentinels included, as their own values.
+///
+/// ⛔ NEITHER SENTINEL CAN REACH IT, AND BOTH ARE SPELLED ANYWAY. `calculateTimeBounds` aborts rather
+/// than pushing `kInvalid` (see [`TimeBound::Variable`]), and `kCoalesced` is written only by
+/// [`set_coalesced_bound_values`] over dimensions strictly inside a finished run — every later read
+/// in [`coalesce_time_dimensions`] is at a dimension OUTSIDE every run written so far. Giving them
+/// the reference's own -1 and -2 means the arithmetic is identical if one ever did.
+const fn steps_of(bound: TimeBound) -> i64 {
+    match bound {
+        #[expect(clippy::cast_possible_wrap, reason = "a trip count, not a bit pattern")]
+        TimeBound::Steps(n) => n as i64,
+        TimeBound::Coalesced => -2,
+        TimeBound::Variable => -1,
+    }
+}
+
+/// THE INVERSE OF [`steps_of`], so the merged product goes back as a bound with no arbitrary
+/// fallback for a value the reference would have kept as a sentinel.
+const fn bound_of(steps: i64) -> TimeBound {
+    match steps {
+        -2 => TimeBound::Coalesced,
+        -1 => TimeBound::Variable,
+        #[expect(clippy::cast_sign_loss, reason = "the two negative values are the arms above")]
+        n => TimeBound::Steps(n as u64),
+    }
+}
+
 /// THE MEMORY VIEW AN ACCESS ADDRESSES THROUGH — the two facts `initializeMemViewInfo` narrows
 /// `mem_ref_` down to, plus the unit they belong to.
 ///
@@ -1556,7 +1703,10 @@ impl<'a> AccessDetailsBase<'a> {
 
         // `:207-218` — the users of the loaded vector.
         let users = match self.op {
-            agen::Op::VectorLoad { result, .. } => uses(*result, scope),
+            // `:210-211` — `isa<VectorLoadOp, IndirectVectorLoadOp>` walks `getResult(0)`'s users.
+            agen::Op::VectorLoad { result, .. } | agen::Op::IndirectVectorLoad { result, .. } => {
+                uses(*result, scope)
+            }
             // ⛔ A SYMBOLIC ACCESS HAS NO USER WALK. The gate is
             // `isa<VectorLoadOp, IndirectVectorLoadOp, CompositeLoadOp, CompositeIndirectLoadOp>`
             // (`:207-208`) and the symbolic pair is in none of it, so a symbolic load's users never
@@ -1848,10 +1998,9 @@ impl<'a> AccessDetailsAffine<'a> {
     /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295` (57L). Everything one affine load or
     /// store says about itself, read off the op and into the record, then the memory view.
     ///
-    /// ⛔ FOUR ARMS, THREE ISLAND OPS. The reference's `dyn_cast` chain (`:301-344`) takes
+    /// ⛔ FOUR ARMS, FOUR ISLAND OPS. The reference's `dyn_cast` chain (`:301-344`) takes
     /// `agen.vector_load`/`agen.vector_store` and their `indirect_` twins; the indirect ones differ
-    /// only in reading `getDirectMemref()`/`getDirectAffineMapAttr()`, and `indirect_vector_load` is
-    /// the one still without an island op, so it lands on `UnsupportedOperation` with the composite.
+    /// only in reading `getDirectMemref()`/`getDirectAffineMapAttr()` (`:321-331`, `:332-342`).
     /// ⛔ THE WIDTH AND THE COUNT COME FROM THE **VECTOR** OPERAND, not from the memref: the loaded
     /// result on a load, the stored value on a store (`:306-309`, `:316-319`).
     /// ⛔ AND `getMapIndices()`/`getMapOperands()` ARE THE MAP'S OPERANDS, so [`access_map`] hands back
@@ -1876,9 +2025,16 @@ impl<'a> AccessDetailsAffine<'a> {
                 ty,
                 ..
             } => (view, view_ty, indices, ty),
-            // ⭐ AND THE INDIRECT STORE READS THE **DIRECT** VIEW AND ITS MAP (`:332-342`), never the
+            // ⭐ AND THE INDIRECT PAIR READS THE **DIRECT** VIEW AND ITS MAP (`:321-342`), never the
             // indirect view the address is fetched out of.
-            agen::Op::IndirectVectorStore {
+            agen::Op::IndirectVectorLoad {
+                direct_view,
+                direct_view_ty,
+                direct_indices,
+                ty,
+                ..
+            }
+            | agen::Op::IndirectVectorStore {
                 direct_view,
                 direct_view_ty,
                 direct_indices,
@@ -2074,6 +2230,67 @@ impl<'a> AccessDetailsAffine<'a> {
         };
         self.set_indices_coeff_dict(indices_coeff_dict);
     }
+
+    /// Replaces: e265_constructDetails
+    ///
+    /// **265/384** `AccessDetailsAffine::constructDetails` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418` (18L). The whole record, in the
+    /// reference's order: memory index, initialize, indices, extents, chunk/shuffle, ld-or-st size,
+    /// iterator coefficients.
+    ///
+    /// ⛔ IT STOPS AT THE FIRST REFUSAL, so a later step never runs on a half-built record — which is
+    /// what makes the "unresolved memory view" arms of [`TransferExtents`] and [`AffineInitialize`]
+    /// unreachable from here.
+    ///
+    /// ⛔ THE `constructIteratorCoefficients().failed()` TEST (`:435`) IS DEAD: entry 147 returns
+    /// `success()` unconditionally. Its call stays; the branch has nothing to carry.
+    pub fn construct_details(
+        &mut self,
+        memory_index: MemoryOperandIndex,
+        scope: &[DfirOp],
+    ) -> ConstructedDetails {
+        // Memory index is used to identify src/dest in composite_load_and_store.
+        self.base.set_memory_index(memory_index);
+        let initialized = self.initialize(scope);
+        if !initialized.admissible() {
+            return ConstructedDetails::NotInitialized(initialized);
+        }
+        let indices = self.construct_indices(scope);
+        if !matches!(indices, ConstructedIndices::Affine) {
+            return ConstructedDetails::IndicesRefused(indices);
+        }
+        let extents = self.base.construct_extent_and_total_elements();
+        if !matches!(extents, TransferExtents::Rectangular) {
+            return ConstructedDetails::ExtentsRefused(extents);
+        }
+        let chunked = self.base.construct_chunk_and_shuffle_info(scope);
+        if !chunked.admissible() {
+            return ConstructedDetails::ChunkRefused(chunked);
+        }
+        self.base.construct_ld_or_st_type();
+        self.construct_iterator_coefficients();
+        ConstructedDetails::Complete
+    }
+}
+
+/// THE OUTCOME OF [`AccessDetailsAffine::construct_details`] — WHICH STEP REFUSED, AND WITH WHAT.
+///
+/// ⭐ FIVE OUTCOMES, NOT TWO. The reference collapses four distinct `failure()`s into one
+/// `LogicalResult` and leaves the caller to re-run the step to learn why; keeping the step's own
+/// outcome means the diagnostic the step already computed survives to the caller.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructedDetails {
+    /// `success()` (`:437`) — every field of the record is set.
+    Complete,
+    /// `initialize()` refused (`:422`).
+    NotInitialized(AffineInitialize),
+    /// `constructIndices()` refused (`:424`).
+    IndicesRefused(ConstructedIndices),
+    /// `constructExtentAndTotalElements()` refused (`:426-427`).
+    ExtentsRefused(TransferExtents),
+    /// `constructChunkAndShuffleInfo()` refused (`:429`).
+    ChunkRefused(ChunkAndShuffleInfo),
 }
 
 /// WHAT ONE SUBSCRIPT OF AN AFFINE ACCESS IS — the four cases `constructIndices` distinguishes
@@ -2803,6 +3020,25 @@ impl<T> AccessContainer<T> {
         self.get(MemoryOperandIndex::DirSrc)
             .or_else(|| self.get(MemoryOperandIndex::DirDst))
     }
+
+    /// [`Self::get`] FOR A WRITE — the reference's non-const overload (`AccessDetails.hpp:406`).
+    ///
+    /// ⚠️ NOT A UNIT OF ITS OWN; see the note on [`Self::get`].
+    #[must_use]
+    pub fn get_mut(&mut self, moi: MemoryOperandIndex) -> Option<&mut T> {
+        let at = self.slots[moi.slot()]?;
+        self.entries.get_mut(at)
+    }
+
+    /// [`Self::get_first`] FOR A WRITE — the reference's non-const overload (`AccessDetails.hpp:420`).
+    #[must_use]
+    pub fn get_first_mut(&mut self) -> Option<&mut T> {
+        if self.has(MemoryOperandIndex::DirSrc) {
+            self.get_mut(MemoryOperandIndex::DirSrc)
+        } else {
+            self.get_mut(MemoryOperandIndex::DirDst)
+        }
+    }
 }
 
 /// PROOF THAT ONE MEMORY OPERAND'S SLOT IS EMPTY, AND THE RIGHT TO FILL IT ONCE.
@@ -2883,10 +3119,10 @@ impl<'a, T> VacantSlot<'a, T> {
 mod unit_tests {
     use super::{
         AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsBase,
-        AccessDetailsSymbolic, AffineInitialize, ChunkAndShuffleInfo, ConstructedIndices,
-        IndicesCoeffDict, LayoutCoeff, MemViewSource, MemoryOperandIndex, SubscriptOperand,
-        TimeBound, TimeDim, TimeOffsets, TransferDim, TransferExtents, sen,
-        set_coalesced_bound_values,
+        AccessDetailsSymbolic, AffineInitialize, ChunkAndShuffleInfo, ConstructedDetails,
+        ConstructedIndices, IndicesCoeffDict, LayoutCoeff, MemViewSource, MemoryOperandIndex,
+        SubscriptOperand, TimeBound, TimeDim, TimeOffsets, TransferDim, TransferExtents,
+        coalesce_time_dimensions, sen, set_coalesced_bound_values,
     };
     use crate::arch::Elements;
     use crate::formats::Bits;
@@ -2915,6 +3151,7 @@ mod unit_tests {
     /// `AccessDetailsAffine` is built from (`AccessDetails.cpp:299`).
     fn vector_load() -> agen::Op {
         agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(2),
             view: Val(1),
             indices: vec![Index::Const(0), Index::Const(0)],
@@ -2923,6 +3160,7 @@ mod unit_tests {
                 elem: ElemType::F16,
             },
             ty: LOADED,
+            multicast_info: None,
         }
     }
 
@@ -3152,6 +3390,9 @@ mod unit_tests {
             load_time_addr_map: planned.load_time_addr_map,
             store_time_addr_map: planned.store_time_addr_map,
             body: vec![DfirOp::Agen(agen::Op::Yield)],
+            dir: None,
+            multicast_info: None,
+            dbg_name: None,
         }))
     }
 
@@ -4913,6 +5154,7 @@ mod unit_tests {
     #[test]
     fn the_chunk_is_the_contiguous_row_and_the_stride_is_the_plane_below_it() {
         let op = agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(2),
             view: Val(1),
             indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
@@ -4921,6 +5163,7 @@ mod unit_tests {
                 elem: ElemType::F16,
             },
             ty: LOADED,
+            multicast_info: None,
         };
         // `vectorchain.rotate %loaded, %c8 : vector<64xf16>` — a right rotation by a constant.
         let scope = vec![
@@ -5035,11 +5278,89 @@ mod unit_tests {
             .fill(Val(6));
         assert_eq!(only_indirect.get_first(), None);
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  265/384 — `constructDetails`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 265/384 — THE SEVEN STEPS RUN IN ORDER AND THE RECORD COMES OUT COMPLETE, on the same
+    /// `vector_load` entry 207 initializes.
+    #[test]
+    fn the_seven_steps_build_the_whole_record() {
+        let op = vector_load();
+        let scope = vec![logical_view()];
+        let mut ad = AccessDetailsAffine::new(&op, DfirUnit::Lxlu);
+
+        assert_eq!(
+            ad.construct_details(MemoryOperandIndex::DirSrc, &scope),
+            ConstructedDetails::Complete
+        );
+        // Step one is the memory index, and steps two to seven are what it lets run.
+        assert_eq!(ad.base.memory_index, Some(MemoryOperandIndex::DirSrc));
+        assert_eq!(ad.base.element_width, Bits(16));
+        assert_eq!(ad.base.total_elements, Elements(64));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  266/384 — `coalesceTimeDimensions`
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 266/384 — THE CUT IS WHAT STOPS THE MERGE. The vendor's L3SU transfer steps its source by
+    /// `[65536, 2048, 64]` and its destination by `[4194304, 65536, 64]`, so the scan cuts at
+    /// dimension 1 and the single dimension left of it has no run to merge — the nest comes back as
+    /// `[1, 32, 32]`, which is the two loops and the burst of 32 the lowering then builds
+    /// (`l3-burst-calc.mlir:357-364`). Give the destination the source's offsets and the whole run
+    /// collapses onto its innermost dimension instead.
+    #[test]
+    fn the_cut_where_the_offsets_diverge_leaves_the_run_unmerged() {
+        let op = composite_load_and_store();
+        let bounds = [TimeBound::Steps(1), TimeBound::Steps(32), TimeBound::Steps(32)];
+        let src_offsets = [65536, 2048, 64];
+        let pair = |dst_offsets: &[i64]| {
+            let mut details = AccessContainer::<AccessDetailsAffineComposite>::default();
+            details
+                .vacancy(MemoryOperandIndex::DirSrc)
+                .expect("empty")
+                .fill(burst_case(&op, DfirUnit::L3su, &bounds, &src_offsets, Elements(64)));
+            details
+                .vacancy(MemoryOperandIndex::DirDst)
+                .expect("empty")
+                .fill(burst_case(&op, DfirUnit::L3su, &bounds, dst_offsets, Elements(64)));
+            details
+        };
+
+        let mut divergent = pair(&[4_194_304, 65536, 64]);
+        coalesce_time_dimensions(&mut divergent);
+        assert_eq!(
+            divergent.get_first().expect("the source").time_bounds,
+            bounds,
+            "the cut dimensions come back at the front, in their own order"
+        );
+
+        let mut identical = pair(&src_offsets);
+        coalesce_time_dimensions(&mut identical);
+        // 32 × 32 × 1, on the innermost dimension of the run.
+        let merged = vec![
+            TimeBound::Coalesced,
+            TimeBound::Coalesced,
+            TimeBound::Steps(1024),
+        ];
+        assert_eq!(
+            identical.get_first().expect("the source").time_bounds,
+            merged
+        );
+        assert_eq!(
+            identical
+                .get(MemoryOperandIndex::DirDst)
+                .expect("the destination")
+                .time_bounds,
+            merged,
+            "a merge is copied onto the destination (`:788-790`)"
+        );
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e265_constructDetails
-// crustify:todo: e266_coalesceTimeDimensions
 // crustify:todo: e297_constructTimeStepsInfo

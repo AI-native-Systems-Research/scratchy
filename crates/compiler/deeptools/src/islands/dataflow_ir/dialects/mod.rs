@@ -268,9 +268,15 @@ pub fn operands(op: &Op) -> Vec<Val> {
         },
         Op::Agen(op) => match op {
             agen::Op::Yield => {}
-            agen::Op::VectorLoad { view, indices, .. } => {
+            agen::Op::VectorLoad {
+                view,
+                indices,
+                multicast_info,
+                ..
+            } => {
                 reads.push(*view);
                 index_operands(indices, &mut reads);
+                reads.extend(*multicast_info);
             }
             agen::Op::VectorStore {
                 value,
@@ -280,6 +286,21 @@ pub fn operands(op: &Op) -> Vec<Val> {
             } => {
                 reads.extend([*value, *view]);
                 index_operands(indices, &mut reads);
+            }
+            // ⭐ THE GATHER READS BOTH VIEWS AND BOTH SUBSCRIPTS (`Agen.td:857-862`) and binds one
+            // result; only the store twin below also reads a value.
+            agen::Op::IndirectVectorLoad {
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                reads.extend([*indirect_view, *direct_view]);
+                index_operands(indirect_indices, &mut reads);
+                index_operands(direct_indices, &mut reads);
+                reads.extend(*multicast_info);
             }
             // ⭐ BOTH VIEWS AND BOTH SUBSCRIPTS, in the reference's own operand order
             // (`Agen.td:930-935`): the value, the indirect view, the direct view, the two subscripts
@@ -331,6 +352,7 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 index_operands(&transfer.src_indices, &mut reads);
                 reads.push(transfer.dst);
                 index_operands(&transfer.dst_indices, &mut reads);
+                reads.extend(transfer.multicast_info);
             }
             // ⛔ THE INTERLEAVE HAS NO OPERANDS AT ALL — granularity is an attribute and the
             // transfers it splits are in its region (`Agen.td:1030-1031`).
@@ -520,6 +542,7 @@ pub fn results(op: &Op) -> Vec<Val> {
         },
         Op::Agen(op) => match op {
             agen::Op::VectorLoad { result, .. }
+            | agen::Op::IndirectVectorLoad { result, .. }
             | agen::Op::SymbolicVectorLoad { result, .. }
             | agen::Op::SetTransferMaskState { result, .. } => {
                 vec![*result]
@@ -687,9 +710,15 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         },
         Op::Agen(op) => match op {
             agen::Op::Yield => {}
-            agen::Op::VectorLoad { view, indices, .. } => {
+            agen::Op::VectorLoad {
+                view,
+                indices,
+                multicast_info,
+                ..
+            } => {
                 places.push(view);
                 index_operands_mut(indices, &mut places);
+                places.extend(multicast_info.as_mut());
             }
             agen::Op::VectorStore {
                 value,
@@ -699,6 +728,19 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             } => {
                 places.extend([value, view]);
                 index_operands_mut(indices, &mut places);
+            }
+            agen::Op::IndirectVectorLoad {
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                places.extend([indirect_view, direct_view]);
+                index_operands_mut(indirect_indices, &mut places);
+                index_operands_mut(direct_indices, &mut places);
+                places.extend(multicast_info.as_mut());
             }
             agen::Op::IndirectVectorStore {
                 value,
@@ -742,6 +784,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 index_operands_mut(&mut transfer.src_indices, &mut places);
                 places.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut places);
+                places.extend(transfer.multicast_info.as_mut());
             }
             // ⛔ ARM FOR ARM WITH [`operands`]: the interleave names no value, the mask state names one.
             agen::Op::CompositeMemoryInterleave { .. } => {}
@@ -904,6 +947,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
         },
         Op::Agen(op) => match op {
             agen::Op::VectorLoad { result, .. }
+            | agen::Op::IndirectVectorLoad { result, .. }
             | agen::Op::SymbolicVectorLoad { result, .. }
             | agen::Op::SetTransferMaskState { result, .. } => {
                 vec![result]
@@ -1169,6 +1213,10 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
         // ⛔ AND AN `arith.select` CARRIES ONE TOO — a DISCARDABLE attribute, not an interface, and
         // entry 292 moves it onto the `scf.if` it builds. See [`arith::Op::Select::dbg_name`].
         Op::Arith(arith::Op::Select { dbg_name, .. }) => dbg_name.as_deref(),
+        // ⭐ THE ONE `agen` OP THAT CARRIES ONE, and two ports read it — see
+        // [`agen::CompositeTransfer::dbg_name`].
+        Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => transfer.dbg_name.as_deref(),
+        Op::Agen(agen::Op::VectorLoad { dbg_name, .. }) => dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1229,6 +1277,8 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
         | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => Some(dbg_name),
         // The discardable one — see [`dbg_name`].
         Op::Arith(arith::Op::Select { dbg_name, .. }) => Some(dbg_name),
+        Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => Some(&mut transfer.dbg_name),
+        Op::Agen(agen::Op::VectorLoad { dbg_name, .. }) => Some(dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
             affine::Op::Apply { .. }
@@ -1483,10 +1533,12 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 result,
                 view,
                 indices,
+                multicast_info,
                 ..
             } => {
                 operands.push(view);
                 index_operands_mut(indices, &mut operands);
+                operands.extend(multicast_info.as_mut());
                 results.push(result);
             }
             agen::Op::VectorStore {
@@ -1497,6 +1549,21 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             } => {
                 operands.extend([value, view]);
                 index_operands_mut(indices, &mut operands);
+            }
+            agen::Op::IndirectVectorLoad {
+                result,
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                operands.extend([indirect_view, direct_view]);
+                index_operands_mut(indirect_indices, &mut operands);
+                index_operands_mut(direct_indices, &mut operands);
+                operands.extend(multicast_info.as_mut());
+                results.push(result);
             }
             agen::Op::IndirectVectorStore {
                 value,
@@ -1543,6 +1610,7 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 index_operands_mut(&mut transfer.src_indices, &mut operands);
                 operands.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut operands);
+                operands.extend(transfer.multicast_info.as_mut());
                 block_args.push(&mut transfer.load_iv);
                 regions.push(&mut transfer.body);
             }
@@ -2081,10 +2149,12 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 result,
                 view,
                 indices,
+                multicast_info,
                 ..
             } => {
                 vals.push((Role::Operand, view));
                 index_vals_mut(indices, &mut vals);
+                vals.extend(multicast_info.as_mut().map(|val| (Role::Operand, val)));
                 vals.push((Role::Result, result));
             }
             agen::Op::VectorStore {
@@ -2096,6 +2166,22 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, value));
                 vals.push((Role::Operand, view));
                 index_vals_mut(indices, &mut vals);
+            }
+            agen::Op::IndirectVectorLoad {
+                result,
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                vals.push((Role::Operand, indirect_view));
+                index_vals_mut(indirect_indices, &mut vals);
+                vals.push((Role::Operand, direct_view));
+                index_vals_mut(direct_indices, &mut vals);
+                vals.extend(multicast_info.as_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
             }
             agen::Op::IndirectVectorStore {
                 value,
@@ -2145,6 +2231,12 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 index_vals_mut(&mut transfer.src_indices, &mut vals);
                 vals.push((Role::Operand, &mut transfer.dst));
                 index_vals_mut(&mut transfer.dst_indices, &mut vals);
+                vals.extend(
+                    transfer
+                        .multicast_info
+                        .as_mut()
+                        .map(|val| (Role::Operand, val)),
+                );
                 vals.push((Role::BlockArg, &mut transfer.load_iv));
             }
             // ⭐ ARM FOR ARM WITH [`parts_mut`], minus the region this one does not visit.
@@ -2417,6 +2509,7 @@ mod unit_tests {
             }),
             // An index list holding a strided sum and a literal.
             Op::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(20),
                 view: Val(13),
                 indices: vec![
@@ -2426,6 +2519,7 @@ mod unit_tests {
                 ],
                 view_ty: memref(),
                 ty: vector(),
+                multicast_info: None,
             }),
             // The private link ends.
             Op::Dataflow(dataflow::Op::Send {
@@ -2467,6 +2561,9 @@ mod unit_tests {
                     load_time_addr_map: AffineMap::identity(1),
                     store_time_addr_map: AffineMap::identity(1),
                     body: vec![Op::Agen(agen::Op::Yield)],
+                    dir: None,
+                    multicast_info: None,
+                    dbg_name: None,
                 },
             ))),
             // Two regions.

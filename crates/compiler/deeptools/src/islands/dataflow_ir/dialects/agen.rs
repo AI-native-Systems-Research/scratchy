@@ -53,8 +53,53 @@ pub struct CompositeTransfer {
     pub load_time_addr_map: AffineMap,
     /// The destination offset at each time step, one result per destination dimension.
     pub store_time_addr_map: AffineMap,
+    /// `$dir` — *"`$dir` and `$multicast_info`, when present, carry routing information for the
+    /// transfer"* (`Agen.td:306-307`, `:340`).
+    pub dir: Option<RoutingDirection>,
+    /// `$multicast_info` — the group this transfer's destinations form (`Agen.td:341`).
+    ///
+    /// ⛔ IT IS WHAT MAKES A MULTICAST A MULTICAST. `constructLoadAndStoreStmt` copies it straight
+    /// onto the `sentient.load_and_store` (`Helper.cpp:2293-2295`), so a transfer that loses it here
+    /// is emitted as a transfer to ONE destination.
+    pub multicast_info: Option<Val>,
+    /// `dbgName` — the scheduler's name for this transfer.
+    ///
+    /// ⛔ TWO PORTS READ IT: `e268_constructLoadAndStoreStmt` copies it onto the
+    /// `sentient.load_and_store`, and `e267_constructTimeLoopsAndVectorOperations` builds each time
+    /// loop's `Time-Loop(<name>, t-dim N)` out of it (`l3-burst-calc.mlir:759`, `:364`, `:370`).
+    pub dbg_name: Option<String>,
     /// The region, entered once per time step.
     pub body: Vec<super::Op>,
+}
+
+/// WHICH WAY ROUND THE RING A TRANSFER IS ROUTED — `AgenRoutingDirection`
+/// (`AgenEnums.td:29-42`), whose four cases and their order are the four
+/// [`sentient::RoutingDirection`](crate::islands::sentient::dialects::sentient::RoutingDirection)
+/// cases and theirs. `e268_constructLoadAndStoreStmt` is the map between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingDirection {
+    /// `PseudoRandom` — case 0.
+    PseudoRandom,
+    /// `CounterClockwise` — case 1.
+    CounterClockwise,
+    /// `Clockwise` — case 2.
+    Clockwise,
+    /// `BothWays` — case 3.
+    BothWays,
+}
+
+impl RoutingDirection {
+    /// The spelling inside `#agen<direction ..>`
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_load_and_store.mlir:101`).
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::PseudoRandom => "PseudoRandom",
+            Self::CounterClockwise => "CounterClockwise",
+            Self::Clockwise => "Clockwise",
+            Self::BothWays => "BothWays",
+        }
+    }
 }
 
 /// ONE MASK PATTERN — `(unmasked = N, masked = M)`, repeated to fill the slice it is applied to.
@@ -136,6 +181,19 @@ pub enum Op {
         view: Val,
         /// The indices.
         indices: Vec<Index>,
+        /// `$multicast_info` — *"when present, carries routing information for transfers"*
+        /// (`Agen.td:111`, `:129`), printed `multicast_info = %g`
+        /// (`dcc/test/Conversion/AgenToSentient/mem2core-multicast.mlir:86`).
+        ///
+        /// ⛔ `constructLoadAndStoreStmt` READS IT (`Helper.cpp:2290-2292`) and hands it to the
+        /// `sentient.load_and_store`, so with no field here a multicast load lowered to a transfer
+        /// with a single destination.
+        multicast_info: Option<Val>,
+        /// `dbgName` — 101 of the corpus's loads carry one (`PT/fp8-bmm.mlir:1080`).
+        ///
+        /// ⛔ `constructLoadAndExtractScalarOp` COPIES IT onto the `sentient.load_and_extract_scalar`
+        /// (`Helper.cpp:2444`, `lx_indirect_loads_stores_composite.mlir:75`).
+        dbg_name: Option<String>,
         /// The view's type. Its INNERMOST extent is the lane count.
         view_ty: MemRef,
         /// The vector's type.
@@ -167,6 +225,37 @@ pub enum Op {
 
     /// `agen.yield` — the terminator of a composite transfer's region.
     Yield,
+
+    /// `agen.indirect_vector_load indirect:%iv[..] direct:%dv[..] {load_order, load_set} :
+    /// memref<..>, memref<..>, vector<..>` (`Agen.td:838`).
+    ///
+    /// ⭐⭐ THE GATHER ITSELF — the address comes out of the INDIRECT view (the virtual IBR, written
+    /// by the extract pattern) and the data out of the DIRECT one. `constructLoadAndExtractScalarOp`
+    /// (entry 269) matches the indirect view's TWO users, this op and the `agen.vector_store` that
+    /// fed it, and without this op in the island that pattern has no second user to find.
+    ///
+    /// ⛔ THE `load_set`/`load_order` ARE OVER THE **DIRECT** VIEW, as the store twin's are
+    /// (`Agen.cpp:2198-2201` elides `indirect_map`/`direct_map` from the printed dict).
+    IndirectVectorLoad {
+        /// The vector it binds.
+        result: Val,
+        /// `$indirect_memref` — the view the address is READ from.
+        indirect_view: Val,
+        /// `$indirect_map_indices`.
+        indirect_indices: Vec<Index>,
+        /// The indirect view's type.
+        indirect_view_ty: MemRef,
+        /// `$direct_memref` — the view the DATA is read from, and the one every access record reads.
+        direct_view: Val,
+        /// `$direct_map_indices`.
+        direct_indices: Vec<Index>,
+        /// The direct view's type.
+        direct_view_ty: MemRef,
+        /// `$multicast_info` — optional (`Agen.td:862`), and nothing in this island fills it yet.
+        multicast_info: Option<Val>,
+        /// The vector's type.
+        ty: Vector,
+    },
 
     /// `agen.vector_store %value, %view[..] {store_order, store_set} : memref<..>, vector<..>`.
     ///
@@ -320,15 +409,25 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             result,
             view,
             indices,
+            multicast_info,
+            dbg_name,
             view_ty,
             ty,
         } => {
             let _ = writeln!(
                 out,
-                "{} = agen.vector_load {}[{}] {{load_order = {}, load_set = {}}} : {}, {}",
+                "{} = agen.vector_load {}[{}]{} {{{}load_order = {}, load_set = {}}} : {}, {}",
                 print::val(*result),
                 print::val(*view),
                 print::index_list(indices),
+                multicast_info.map_or(String::new(), |group| format!(
+                    " multicast_info = {}",
+                    print::val(group)
+                )),
+                // `dbgName` sorts ahead of `load_order` (`PT/fp8-bmm.mlir:1080`).
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
                 print::affine_map(&access_order(view_ty.shape.len())),
                 print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
@@ -353,6 +452,9 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 time_order,
                 load_time_addr_map,
                 store_time_addr_map,
+                dir,
+                multicast_info,
+                dbg_name,
                 body,
             } = transfer.as_ref();
             // Three lines, as the scheduler writes it: the two accesses, then the induction
@@ -368,15 +470,33 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             print::indent(out, depth);
             let _ = writeln!(
                 out,
-                " time_symbols(), load_iv({}:{})",
+                " time_symbols(), load_iv({}:{}){}",
                 print::val(*load_iv),
-                print::vector(*load_iv_ty)
+                print::vector(*load_iv_ty),
+                // `p << ", multicast_info = " << multicast_info` (`Agen.cpp:358-359`), which is an
+                // OPERAND and so prints outside the attribute dictionary
+                // (`mem2core-composite-multicast.mlir:83`).
+                multicast_info.map_or(String::new(), |group| format!(
+                    ", multicast_info = {}",
+                    print::val(group)
+                ))
             );
             print::indent(out, depth);
             let _ = writeln!(
                 out,
-                " {{load_order = {}, load_set = {}, load_time_addr_map = {}, store_order = {}, \
+                " {{{}{}load_order = {}, load_set = {}, load_time_addr_map = {}, store_order = {}, \
                  store_set = {}, store_time_addr_map = {}, time_order = {}, time_set = {}}}",
+                // `dbgName` sorts ahead of `dir` (`l3-burst-calc.mlir:759`).
+                dbg_name.as_ref().map_or(String::new(), |name| format!(
+                    "dbgName = \"{name}\", "
+                )),
+                // ⭐ `dir` IS AN ATTRIBUTE AND SORTS ALPHABETICALLY, which puts it ahead of every
+                // other one this op carries
+                // (`paged_mem_view_load_and_store.mlir:101`).
+                dir.map_or(String::new(), |dir| format!(
+                    "dir = #agen<direction {}>, ",
+                    dir.spelling()
+                )),
                 print::affine_map(load_order),
                 print::integer_set(load_set),
                 print::affine_map(load_time_addr_map),
@@ -418,6 +538,39 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::affine_map(&access_order(view_ty.shape.len())),
                 print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
+                print::vector(*ty)
+            );
+        }
+        // ⭐ SAME SHAPE AS THE STORE BELOW, and the result's vector type prints LAST of the three
+        // (`dcc/test/Conversion/AgenToSentient/lx_indirect_loads_stores.mlir:344-346`).
+        Op::IndirectVectorLoad {
+            result,
+            indirect_view,
+            indirect_indices,
+            indirect_view_ty,
+            direct_view,
+            direct_indices,
+            direct_view_ty,
+            multicast_info,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "{} = agen.indirect_vector_load indirect:{}[{}] direct:{}[{}]{} {{load_order = {}, \
+                 load_set = {}}} : {}, {}, {}",
+                print::val(*result),
+                print::val(*indirect_view),
+                print::index_list(indirect_indices),
+                print::val(*direct_view),
+                print::index_list(direct_indices),
+                multicast_info.map_or(String::new(), |group| format!(
+                    " multicast_info = {}",
+                    print::val(group)
+                )),
+                print::affine_map(&access_order(direct_view_ty.shape.len())),
+                print::integer_set(&access_set(direct_view_ty, ty.len)),
+                print::memref(indirect_view_ty),
+                print::memref(direct_view_ty),
                 print::vector(*ty)
             );
         }
@@ -683,6 +836,9 @@ mod tests {
             load_time_addr_map: planned.load_time_addr_map,
             store_time_addr_map: planned.store_time_addr_map,
             body: vec![dialects::Op::Agen(Op::Yield)],
+            dir: None,
+            multicast_info: None,
+            dbg_name: None,
         })));
 
         let mut got = String::new();

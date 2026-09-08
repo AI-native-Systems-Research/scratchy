@@ -108,6 +108,19 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::Arith(op) => arith::emit(out, op),
         Op::Scf(op) => scf::emit(out, op, depth),
         Op::Affine(op) => affine::emit(out, op, depth),
+        Op::AffineFor(loop_op) => {
+            out.push_str(&affine::for_header(
+                loop_op.iv,
+                loop_op.lo,
+                loop_op.hi,
+                &loop_op.carried,
+            ));
+            for inner in &loop_op.body {
+                emit(out, inner, depth + 1);
+            }
+            indent(out, depth);
+            out.push_str(&affine::for_footer(loop_op.dbg_name.as_deref()));
+        }
         Op::Vector(op) => vector::emit(out, op),
         Op::Dataflow(op) => dataflow::emit(out, op, depth),
         Op::Agen(op) => agen::emit(out, op, depth),

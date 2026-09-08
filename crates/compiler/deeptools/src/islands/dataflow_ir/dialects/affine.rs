@@ -216,48 +216,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             body,
             dbg_name,
         } => {
-            // ⭐ THE THREE RENDERINGS OF ONE LIST. A loop that carries nothing prints exactly what
-            // it printed before this field existed — no results, no `iter_args`, no `-> (..)`.
-            let (results, iter_args, result_tys) = if carried.is_empty() {
-                (String::new(), String::new(), String::new())
-            } else {
-                (
-                    format!(
-                        "{} = ",
-                        carried
-                            .iter()
-                            .map(|c| print::val(c.result))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    format!(
-                        " iter_args({})",
-                        carried
-                            .iter()
-                            .map(|c| format!("{} = {}", print::val(c.arg), print::val(c.init)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    format!(" -> ({})", vec!["index"; carried.len()].join(", ")),
-                )
-            };
-            let _ = writeln!(
-                out,
-                "{results}affine.for {} = {} to {}{iter_args}{result_tys} {{",
-                print::val(*iv),
-                bound(*lo),
-                bound(*hi)
-            );
+            out.push_str(&for_header(*iv, *lo, *hi, carried));
             for inner in body {
                 print::emit(out, inner, depth + 1);
             }
             print::indent(out, depth);
-            match dbg_name {
-                None => out.push_str("}\n"),
-                Some(name) => {
-                    let _ = writeln!(out, "}} {{dbgName = \"{name}\"}}");
-                }
-            }
+            out.push_str(&for_footer(dbg_name.as_deref()));
         }
         Op::If {
             set,
@@ -387,6 +351,56 @@ fn region(out: &mut String, ops: &[super::Op], depth: usize, print_terminator: b
             continue;
         }
         print::emit(out, inner, depth + 1);
+    }
+}
+
+/// AN `affine.for`'S OPENING LINE, up to and including the `{` and its newline.
+///
+/// ⭐ SHARED WITH THE RUNG ABOVE. A time loop whose body has reached SentientIR is a
+/// [`crate::islands::sentient::dialects::Op::AffineFor`] — the same loop with a different body type
+/// — and one rendering is what keeps the two printers from drifting apart.
+pub(crate) fn for_header(iv: Val, lo: Bound, hi: Bound, carried: &[Carried]) -> String {
+    // ⭐ THE THREE RENDERINGS OF ONE LIST. A loop that carries nothing prints exactly what it
+    // printed before this field existed — no results, no `iter_args`, no `-> (..)`.
+    let (results, iter_args, result_tys) = if carried.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            format!(
+                "{} = ",
+                carried
+                    .iter()
+                    .map(|c| print::val(c.result))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!(
+                " iter_args({})",
+                carried
+                    .iter()
+                    .map(|c| format!("{} = {}", print::val(c.arg), print::val(c.init)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!(" -> ({})", vec!["index"; carried.len()].join(", ")),
+        )
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{results}affine.for {} = {} to {}{iter_args}{result_tys} {{",
+        print::val(iv),
+        bound(lo),
+        bound(hi)
+    );
+    out
+}
+
+/// AN `affine.for`'S CLOSING BRACE AND THE `dbgName` THAT FOLLOWS IT. The caller has indented.
+pub(crate) fn for_footer(dbg_name: Option<&str>) -> String {
+    match dbg_name {
+        None => "}\n".to_owned(),
+        Some(name) => format!("}} {{dbgName = \"{name}\"}}\n"),
     }
 }
 

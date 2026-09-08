@@ -387,6 +387,7 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         DfirOp::Agen(
             dfir_op::agen::Op::SymbolicVectorLoad { .. }
             | dfir_op::agen::Op::SymbolicVectorStore { .. }
+            | dfir_op::agen::Op::IndirectVectorLoad { .. }
             | dfir_op::agen::Op::IndirectVectorStore { .. }
             | dfir_op::agen::Op::CompositeLoadAndStore(_)
             // ⛔ AND THE MASK STATE IS NOT ON IT EITHER, THOUGH IT DOES BIND A VECTOR: the chain
@@ -1015,8 +1016,10 @@ fn reset_data_ids(ops: &mut [SenOp]) {
                 | sen::Op::IncrMask { .. }
                 | sen::Op::Opaque { .. } => {}
             },
-            // The shared dialects' nested bodies are `Vec<DfirOp>` — no compute can be in one, and
-            // `symbol.create_symbol` has no body at all.
+            // A time loop's body IS at this rung, so it is walked; the other shared dialects' nested
+            // bodies are `Vec<DfirOp>` — no compute can be in one — and `symbol.create_symbol` has
+            // no body at all.
+            SenOp::AffineFor(loop_op) => reset_data_ids(&mut loop_op.body),
             SenOp::Dataflow(_)
             | SenOp::Agen(_)
             | SenOp::VectorChain(_)
@@ -3192,6 +3195,7 @@ mod unit_tests {
     /// `agen.vector_load %view[0] … : vector<64xf16>` binding `result` — `fmax.mlir:116`.
     fn vector_load(result: u32) -> DfirOp {
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(result),
             view: Val(92),
             indices: std::vec![dfir_op::Index::Const(0)],
@@ -3200,6 +3204,7 @@ mod unit_tests {
                 elem: ElemType::F16,
             },
             ty: f16x64(),
+            multicast_info: None,
         })
     }
 

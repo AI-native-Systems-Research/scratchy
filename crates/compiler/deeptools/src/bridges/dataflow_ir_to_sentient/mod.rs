@@ -78,7 +78,8 @@ pub mod vc_vector_chain_to_sentient_pesfp;
 pub mod vc_vector_chain_to_sentient_pt;
 pub mod vc_vector_operands;
 
-use crate::arch::{Arch, Bytes, Elements};
+use crate::arch::{Arch, Elements};
+use crate::formats::Bits;
 use crate::bridges::dataflow_ir_to_sentient::agen_agen_to_sentient::ExtractIdx;
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
 use crate::islands::dataflow_ir::{self as dfir, Values};
@@ -477,6 +478,9 @@ fn load_and_store(
         src_reg: sen::Reg { locale: sen::RegType::Unknown, index: None },
         dst_reg: sen::Reg { locale: sen::RegType::Unknown, index: None },
         dir: None,
+        // ⚠️ THE SPINE DOES NOT DECIDE THIS. `construct_load_and_store_stmt` reads the store
+        // memory's unit type for it; this path has no access details to read.
+        is_ibr_write: false,
         dbg_name: None,
     })
 }
@@ -524,11 +528,7 @@ fn extent_of(transfer: &dfir_op::agen::CompositeTransfer) -> sen::Extent {
     let trips: u64 = rectangle(&transfer.time_set).iter().product();
     sen::Extent {
         total_elements: Elements(elements),
-        // ⚠️ THE WIDTH IS IN **BITS** in every `element_size` attribute (`SentientOps.td:443-456`
-        // walks *"64 16 bit elements"* at `element_size = 16`), and this island types the field as
-        // `Bytes`. The number emitted is right and the TYPE is wrong; retyping it is a separate
-        // change from wiring this bridge.
-        element_size: Bytes(u64::from(transfer.load_iv_ty.elem.bits())),
+        element_size: Bits(transfer.load_iv_ty.elem.bits()),
         chunk_size: Elements(elements),
         chunk_stride: Elements(0),
         // ⛔ THE BURST IS THE INNERMOST TIME BOUND — `computeBurstAndGroup` scans the time dims

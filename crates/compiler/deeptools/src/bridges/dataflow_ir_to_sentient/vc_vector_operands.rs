@@ -481,7 +481,8 @@ impl VectorOperand {
                 | DfirUnit::SfpState
                 | DfirUnit::PeState
                 | DfirUnit::SfpRing
-                | DfirUnit::LxVirtualIbr => todo!(
+                | DfirUnit::LxVirtualIbr
+                | DfirUnit::L3Ibr => todo!(
                     "PT cannot expect data other than L0-LU, N-link, CROSS-PT-N-LINK (VectorOperands.cpp:59-63)"
                 ),
             },
@@ -512,6 +513,7 @@ impl VectorOperand {
                 | DfirUnit::PeState
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
+                | DfirUnit::L3Ibr
                 | DfirUnit::CrossPtnLink => {
                     todo!("Unsupported receive unit for PE/SFP (VectorOperands.cpp:76)")
                 }
@@ -602,6 +604,7 @@ impl VectorOperand {
                 | DfirUnit::PeState
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
+                | DfirUnit::L3Ibr
                 | DfirUnit::CrossPtnLink => todo!(
                     "Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139, reached from the PT branch)"
                 ),
@@ -629,6 +632,7 @@ impl VectorOperand {
                 | DfirUnit::PeState
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
+                | DfirUnit::L3Ibr
                 | DfirUnit::CrossPtnLink => todo!(
                     "Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139)"
                 ),
@@ -2972,11 +2976,13 @@ mod unit_tests {
         let scope = vec![
             row_view(),
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(53),
                 view: Val(52),
                 indices: row_subscripts(),
                 view_ty: row_view_ty(),
                 ty: V64,
+                multicast_info: None,
             }),
         ];
         assert_eq!(
@@ -3132,11 +3138,13 @@ mod unit_tests {
         let scope = vec![
             dense(Val(52)),
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(53),
                 view: Val(52),
                 indices: row_subscripts(),
                 view_ty: row_view_ty(),
                 ty: V64,
+                multicast_info: None,
             }),
         ];
         assert_eq!(layout_map_and_indices(&OpId::at(&[1]), &scope), None);

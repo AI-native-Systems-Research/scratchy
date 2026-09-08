@@ -812,11 +812,12 @@ pub struct NewMemOp {
 /// see that variant, which records why this island writes the sum inline and what `dbo-opt` says
 /// about the alternative. Entry 259 produces the page-relative form.
 ///
-/// ⚠️ AND TWO ATTRIBUTES HAVE NOTHING TO INHERIT: `dbgName` is discardable and this island's
-/// `agen.vector_load` carries none, and `load_set`/`load_order` are DERIVED at print time from the
-/// view's shape and the vector's length (`agen.rs`) rather than stored — so "keep the original's"
-/// is automatic for as long as the view's shape is inherited, which [`create_non_paged_mem_view`]
-/// guarantees. `getMulticastInfo()` has no island field either.
+/// ⛔ AND THE CLONE SUBSTITUTES AN **EMPTY** `dbgName` FOR AN ABSENT ONE (`Agen.cpp:166`), which is
+/// not the same as absent: a later `getDbgNameAttr()` on the clone is non-null, so
+/// `getNewDbgNameFromOp` names a loop after it rather than leaving it unnamed. `load_set`/`load_order`
+/// are DERIVED at print time from the view's shape and the vector's length (`agen.rs`) rather than
+/// stored, so "keep the original's" is automatic for as long as the view's shape is inherited, which
+/// [`create_non_paged_mem_view`] guarantees. `getMulticastInfo()` has no island field either.
 ///
 /// ⭐ `TPMVInfo &info` IS UNUSED IN THE BODY. It is in the signature because the composite manager's
 /// override needs it (`TransformPagedMemViewImpl.hpp:519`, entry 138), so nothing is dropped by its
@@ -838,6 +839,9 @@ pub fn create_new_mem_op<'s>(
         view_ty,
         // `getResult().getType()` — the vector the original load bound.
         ty: mem_op.ty,
+        multicast_info: None,
+        // `getDbgNameAttr() ? getDbgNameAttr() : builder.getStringAttr("")` (`Agen.cpp:166`).
+        dbg_name: Some(mem_op.dbg_name.unwrap_or_default().to_owned()),
     });
 
     // `builder.setInsertionPointAfter(new_load_op)`, then the chain — hence the order of the list.
@@ -883,6 +887,8 @@ pub struct VectorLoadOp<'a> {
     /// load keeps the original's result type and replaces only the access. On a typed
     /// `VectorLoadOp` that read is infallible, which is the same reason `result` is here.
     pub ty: Vector,
+    /// `getDbgNameAttr()` — read by the same clone, which is why it is here.
+    pub dbg_name: Option<&'a str>,
 }
 
 impl<'a> VectorLoadOp<'a> {
@@ -895,6 +901,7 @@ impl<'a> VectorLoadOp<'a> {
                 view,
                 indices,
                 ty,
+                dbg_name,
                 ..
             }) => Some(VectorLoadOp {
                 op,
@@ -902,11 +909,13 @@ impl<'a> VectorLoadOp<'a> {
                 view: *view,
                 indices,
                 ty: *ty,
+                dbg_name: dbg_name.as_deref(),
             }),
             DfirOp::Agen(
                 agen::Op::VectorStore { .. }
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
@@ -1143,6 +1152,7 @@ impl<'a> VectorStoreOp<'a> {
                 agen::Op::VectorLoad { .. }
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
@@ -3110,11 +3120,13 @@ scf.if %2 {
         let estimated = vals.mint();
         let ops = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: loaded,
                 view,
                 indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
                 view_ty: paged_view_ty(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::VectorChain(vectorchain::Op::Estimate {
                 result: estimated,
@@ -3185,11 +3197,13 @@ scf.if %2 {
         // The new load entry 128 creates; only its result is used here.
         let new_result = vals.mint();
         let new_load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: new_result,
             view,
             indices: vec![Index::Const(0), Index::Const(2), Index::Const(0)],
             view_ty: paged_view_ty(),
             ty: LANES,
+            multicast_info: None,
         });
         let new_mem_op = VectorLoadOp::of(&new_load).expect("it is a load");
 
@@ -3229,11 +3243,13 @@ agen.vector_store %4, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
         let (to, _) = Link::<LxluUnit, SfpUnit>::between(producer, consumer).ends();
         let ops = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: loaded,
                 view,
                 indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
                 view_ty: paged_view_ty(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::VectorChain(vectorchain::Op::Estimate {
                 result: estimated,
@@ -3252,11 +3268,13 @@ agen.vector_store %4, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
         let mem_op = VectorLoadOp::of(&ops[0]).expect("the first op is the load");
         let new_result = vals.mint();
         let new_load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: new_result,
             view,
             indices: vec![Index::Const(0), Index::Const(2), Index::Const(0)],
             view_ty: paged_view_ty(),
             ty: LANES,
+            multicast_info: None,
         });
         let new_mem_op = VectorLoadOp::of(&new_load).expect("it is a load");
 
@@ -3279,7 +3297,8 @@ dataflow.send %2, %6 : vector<64xf16>
     ///
     /// ⛔ AND THE NEW LOAD IS THE ORIGINAL IN EVERY RESPECT BUT THE ACCESS — the same
     /// `vector<64xf16>`, the same `memref<64x4x64xf16>`, hence the same derived `load_set` and
-    /// `load_order`; only the view and the page-relative indices differ.
+    /// `load_order`; only the view, the page-relative indices and the `dbgName` the clone
+    /// substitutes for the nameless original (`Agen.cpp:166`) differ.
     #[test]
     fn the_new_access_is_the_load_then_its_cloned_chain() {
         let mut vals = Values::default();
@@ -3301,7 +3320,8 @@ dataflow.send %2, %6 : vector<64xf16>
         assert_eq!(
             text(&made.ops),
             "\
-%4 = agen.vector_load %3[0, 0, 0] {load_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, \
+%4 = agen.vector_load %3[0, 0, 0] {dbgName = \"\", \
+             load_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, \
              load_set = affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>} \
              : memref<64x4x64xf16>, vector<64xf16>
 %5 = vectorchain.rec_estimate %4 : vector<64xf16>, vector<64xf16>
@@ -3347,11 +3367,13 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// (`paged_mem_view_loads.mlir:297`).
     fn vector_load(result: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result,
             view: VIEW,
             indices: indices(),
             view_ty: view_ty(),
             ty: LANES,
+            multicast_info: None,
         })
     }
 

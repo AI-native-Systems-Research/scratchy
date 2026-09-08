@@ -483,6 +483,7 @@ fn is_memory_op(op: &DfirOp) -> bool {
             agen::Op::Yield
             | agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::IndirectVectorLoad { .. }
             | agen::Op::IndirectVectorStore { .. }
             // ⛔ THE INTERLEAVE IS NOT ONE EITHER, and it is the one to say so about: it CONTAINS
             // composite transfers, and the induction variable reaching it reaches them — the ops
@@ -1467,6 +1468,9 @@ mod unit_tests {
                 ],
             },
             body: vec![DfirOp::Agen(agen::Op::Yield)],
+            dir: None,
+            multicast_info: None,
+            dbg_name: None,
         }));
 
         let innermost = DfirOp::Affine(affine::Op::For {
@@ -2010,6 +2014,9 @@ mod unit_tests {
                 load_time_addr_map: AffineMap::identity(4),
                 store_time_addr_map: AffineMap::identity(4),
                 body: vec![DfirOp::Agen(agen::Op::Yield)],
+                dir: None,
+                multicast_info: None,
+                dbg_name: None,
             },
         )))
     }
@@ -2112,6 +2119,7 @@ mod unit_tests {
         let read = vals.mint();
         let reader = match case.reader {
             Reader::VectorLoad => DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: read,
                 view,
                 // `[%arg27 * 4, %arg28 * 2 + %arg26, %arg25, 0, 0]` — the induction variable is the
@@ -2128,6 +2136,7 @@ mod unit_tests {
                     len: 4,
                     elem: ElemType::Int(8),
                 },
+                multicast_info: None,
             }),
             Reader::CompositeTransfer => transfer_reading(vals, iv, view),
             Reader::Arithmetic => DfirOp::Arith(arith::Op::AddI(arith::IntBinary {

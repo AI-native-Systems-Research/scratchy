@@ -371,6 +371,7 @@ impl Units {
             // ⛔ A VIEWED MEMORY, NOT A MOVER. The virtual IBR is what an indirect access INDEXES
             // THROUGH (`Helper.cpp:388-431`); the L3 halves still do the moving.
             | DfirUnit::LxVirtualIbr
+            | DfirUnit::L3Ibr
             // ⛔ AND THE CROSS-PARTITION LINK MOVES NOTHING OF ITS OWN either: it is a send
             // destination the LXLU routes to, not a memory a transfer reads or writes.
             | DfirUnit::CrossPtnLink => false,

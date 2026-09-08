@@ -148,6 +148,7 @@ impl L3Half {
             | DfirUnit::PeState
             | DfirUnit::SfpRing
             | DfirUnit::LxVirtualIbr
+            | DfirUnit::L3Ibr
             | DfirUnit::CrossPtnLink => None,
         }
     }
@@ -3408,6 +3409,9 @@ mod unit_tests {
                 ],
             },
             body: vec![DfirOp::Agen(agen::Op::Yield)],
+            dir: None,
+            multicast_info: None,
+            dbg_name: None,
         }))
     }
 

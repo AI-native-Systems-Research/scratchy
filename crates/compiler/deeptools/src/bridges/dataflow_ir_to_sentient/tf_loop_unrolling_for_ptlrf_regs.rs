@@ -295,6 +295,7 @@ mod unit_tests {
     fn a_loop_subscripting_an_lrf_is_marked_and_a_loop_over_the_xrf_is_not() {
         let load_view = |view: Val, iv: Val, result: Val| {
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result,
                 view,
                 indices: vec![Index::Val(iv)],
@@ -306,6 +307,7 @@ mod unit_tests {
                     len: 128,
                     elem: ElemType::F16,
                 },
+                multicast_info: None,
             })
         };
         let program = |which: LocalUnit| {

@@ -119,22 +119,22 @@
 
 use super::agen_access_details::{
     AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsSymbolic,
-    IndicesCoeffDict, MemoryOperandIndex,
+    IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim,
 };
-use super::agen_agen_to_sentient::StrideStep;
+use super::agen_agen_to_sentient::{StrideStep, TransferSpecialisation};
 use super::std_standard_to_sentient::lower_constant_index_to_sentient;
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
-    self as dfir_op, Index, Op as DfirOp, Val, arith, dataflow, defining_op, results, uses,
+    self as dfir_op, Index, Op as DfirOp, Val, affine, arith, dataflow, defining_op, results, uses,
 };
 use crate::islands::dataflow_ir::link::SendEnd;
 use crate::islands::dataflow_ir::ty::{
-    AffineMap, FlatConstraints, GenericComp, IntegerSet, MemRef, Vector,
+    AffineMap, FlatConstraints, GenericComp, IntegerSet, MemRef, ScalarTy, Vector,
 };
 use crate::islands::dataflow_ir::{ProgramUnit, ValueMapping, Values};
 use crate::islands::sentient::dialects::{
-    Op as SenOp, defining_op as sen_defining_op, sentient as sen,
+    AffineFor, Op as SenOp, defining_op as sen_defining_op, sentient as sen,
 };
 use crate::units::{DfirUnit, NumFolds, Residency};
 use core::num::NonZeroU32;
@@ -639,6 +639,7 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
         DfirOp::Agen(op) => match op {
             dfir_op::agen::Op::VectorLoad { .. } => Some(AgenOpKind::VectorLoad),
             dfir_op::agen::Op::VectorStore { .. } => Some(AgenOpKind::VectorStore),
+            dfir_op::agen::Op::IndirectVectorLoad { .. } => Some(AgenOpKind::IndirectVectorLoad),
             dfir_op::agen::Op::IndirectVectorStore { .. } => {
                 Some(AgenOpKind::IndirectVectorStore)
             }
@@ -727,7 +728,7 @@ impl AgenLoad {
 
     /// WHICH LOAD CLASS ONE STATEMENT IS, or `None` if it is not one of the five.
     ///
-    /// ⛔ TWO OF THE FIVE HAVE NO ISLAND OP YET (`indirect_vector_load` and the composite pair), and
+    /// ⛔ THE COMPOSITE PAIR HAS NO ISLAND OP YET (`composite_load`/`composite_indirect_load`), and
     /// `agen.composite_load_and_store` is **not** `CompositeLoadOp` — the reference's `isa<>` list
     /// does not include it, so it answers `None` here too rather than borrowing the composite arm.
     #[must_use]
@@ -735,6 +736,10 @@ impl AgenLoad {
         match op {
             DfirOp::Agen(dfir_op::agen::Op::VectorLoad { result, .. }) => {
                 Some(AgenLoad::Vector { result: *result })
+            }
+            // ⭐ THE GATHER ROOTS AT ITS RESULT TOO (`:1245-1247`).
+            DfirOp::Agen(dfir_op::agen::Op::IndirectVectorLoad { result, .. }) => {
+                Some(AgenLoad::IndirectVector { result: *result })
             }
             // ⭐ AND THE SYMBOLIC LOAD ROOTS AT ITS RESULT LIKE THE OTHER TWO VECTOR LOADS — one
             // `isa<>` arm, one root (`Helper.cpp:1245-1247`).
@@ -1609,7 +1614,9 @@ pub fn add_load_chain_to_delete_list<'a>(
 mod unit_tests {
     use super::*;
     use crate::arch::Dd2;
-    use crate::bridges::dataflow_ir_to_sentient::agen_access_details::MemoryOperandIndex;
+    use crate::bridges::dataflow_ir_to_sentient::agen_access_details::{
+        MemoryOperandIndex, TimeOffsets,
+    };
     use crate::generated::SyncSignal;
     use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::dialects::{
@@ -1824,11 +1831,13 @@ mod unit_tests {
             carried: Vec::new(),
             body: vec![
                 DfirOp::Agen(agen::Op::VectorLoad {
+                    dbg_name: None,
                     result: loaded,
                     view: VIEW,
                     indices: indices(iv),
                     view_ty: view_ty(),
                     ty: LANES,
+                    multicast_info: None,
                 }),
                 DfirOp::Dataflow(dataflow::Op::Send {
                     to,
@@ -1991,11 +2000,13 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let program = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(31),
                 view: VIEW,
                 indices: indices(Val(30)),
                 view_ty: view_ty(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Send {
                 to: to_pt,
@@ -2055,11 +2066,13 @@ mod unit_tests {
             })
         };
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(31),
             view: VIEW,
             indices: indices(Val(30)),
             view_ty: view_ty(),
             ty: LANES,
+            multicast_info: None,
         });
         let pt = DfirOp::Dataflow(dataflow::Op::GetUnit {
             result: PT,
@@ -2132,11 +2145,13 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, Val(99)).ends();
         let program = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(31),
                 view: VIEW,
                 indices: indices(Val(30)),
                 view_ty: view_ty(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Send {
                 to: to_pt,
@@ -2651,11 +2666,13 @@ mod unit_tests {
     #[test]
     fn a_load_whose_single_user_is_a_store_of_that_class_is_the_pattern() {
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(31),
             view: VIEW,
             indices: indices(Val(30)),
             view_ty: view_ty(),
             ty: LANES,
+            multicast_info: None,
         });
         let store = DfirOp::Agen(agen::Op::VectorStore {
             value: Val(31),
@@ -2781,11 +2798,13 @@ mod unit_tests {
         let (to, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let program = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(31),
                 view: VIEW,
                 indices: indices(Val(30)),
                 view_ty: view_ty(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 result: Val(41),
@@ -2849,11 +2868,13 @@ mod unit_tests {
         let (_, from) = Link::<PtRowUnit<0>, LxluUnit>::between(PT, LXLU).ends();
         let load_body = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(31),
                 view: VIEW,
                 indices: vec![Index::Const(0)],
                 view_ty: stick_view(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Send {
                 to,
@@ -2982,11 +3003,13 @@ mod unit_tests {
                 ty: ty.clone(),
             }),
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
                 result: Val(31),
                 view: Val(21),
                 indices: vec![Index::Const(0)],
                 view_ty: ty.clone(),
                 ty: LANES,
+                multicast_info: None,
             }),
             DfirOp::Agen(agen::Op::VectorStore {
                 value: Val(31),
@@ -3008,11 +3031,13 @@ mod unit_tests {
         assert!(!is_load_and_extract_scalar_pattern(&scope[5], &scope));
         let mut from_the_ibr = scope.clone();
         from_the_ibr[4] = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(31),
             view: Val(23),
             indices: vec![Index::Const(0)],
             view_ty: stick_view(),
             ty: LANES,
+            multicast_info: None,
         });
         assert!(!is_load_and_extract_scalar_pattern(
             &from_the_ibr[4],
@@ -3045,18 +3070,22 @@ mod unit_tests {
     #[test]
     fn a_symbolic_access_follows_the_clone() {
         let original = agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(31),
             view: Val(21),
             indices: vec![Index::Val(Val(5))],
             view_ty: stick_view(),
             ty: LANES,
+            multicast_info: None,
         };
         let cloned = agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(131),
             view: Val(121),
             indices: vec![Index::Val(Val(105))],
             view_ty: stick_view(),
             ty: LANES,
+            multicast_info: None,
         };
 
         let mut details = AccessDetailsSymbolic::new(&original, DfirUnit::Lxlu);
@@ -3378,6 +3407,9 @@ mod unit_tests {
             load_time_addr_map: planned.load_time_addr_map,
             store_time_addr_map: planned.store_time_addr_map,
             body: vec![DfirOp::Agen(agen::Op::Yield)],
+            dir: None,
+            multicast_info: None,
+            dbg_name: None,
         }))
     }
 
@@ -3435,7 +3467,7 @@ mod unit_tests {
     /// burst refuses the whole interleave.
     #[test]
     fn an_interleaved_region_agrees_on_the_burst_or_is_refused() {
-        let mut extent = sen::Extent::of(Elements(64), Bytes(2));
+        let mut extent = sen::Extent::of(Elements(64), Bits(16));
         extent.burst_size = Elements(8);
         let region = [
             sent_load_and_send(extent),
@@ -3852,15 +3884,27 @@ mod unit_tests {
         };
 
         let store = DfirOp::Agen(op.clone());
+        let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            result: Val(80),
+            view: VIEW,
+            indices: indices(Val(81)),
+            multicast_info: None,
+            view_ty: view_ty(),
+            ty: LANES,
+        });
         let unit = unit_holding(DfirUnit::Lxlu, Vec::new());
+        let mut values = Values::default();
         assert_eq!(
             lower_vector_load_helper::<Dd2, AccessDetailsAffine<'_>>(
-                &store,
+                TransferOp::of(&load).expect("an agen.vector_load is a transfer"),
                 Some(&store),
                 &unit,
                 &details,
                 &addrs(),
                 &addrs(),
+                &[],
+                &mut values,
             ),
             VectorLoadHelper::AccessDetailsDiffer
         );
@@ -3988,6 +4032,587 @@ mod unit_tests {
                 get_unit(Val(90)),
             ],
             "the clone leads, and the original get_unit is left where it was"
+        );
+    }
+
+    // ─────────────────────────────── 267/384 ───────────────────────────────
+
+    /// 🎯 267/384 — THE VENDOR'S L3SU TRANSFER: three time dimensions with the burst on the last
+    /// build a TWO-deep named nest, each level stepping every address by that level's own offset
+    /// (`l3-burst-calc.mlir:357-374`).
+    #[test]
+    fn the_vendors_time_dimensions_become_a_named_nest_around_the_transfer() {
+        const NAME: &str = "c0-l3su-transfer-lds5-src:lx-dst:hbm";
+        let mut mc = composite_transfer();
+        if let agen::Op::CompositeLoadAndStore(transfer) = &mut mc {
+            transfer.dbg_name = Some(NAME.to_owned());
+        }
+        let body = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(329),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lx,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(328),
+                residency: Residency::Global,
+                unit: DfirUnit::Hbm,
+                num_folds: None,
+            }),
+            DfirOp::Agen(mc),
+        ];
+        let DfirOp::Agen(mc_agen) = &body[2] else {
+            panic!("body[2] is the transfer");
+        };
+        // `time_bounds = [1, 32, 32]` with the burst on dimension 2, so `stride = 64` is that
+        // dimension's own offset and `burst_size = 32` its bound.
+        let end = |memory, moi, per_dim: Vec<i64>| {
+            let mut record = AccessDetailsAffineComposite::new(mc_agen, DfirUnit::L3su);
+            record.affine.base.total_elements = Elements(64);
+            record.affine.base.set_element_width(Bits(16));
+            record.affine.base.chunk_size = Elements(64);
+            record.affine.base.chunk_stride = Elements(0);
+            record.affine.base.memory = Some(memory);
+            record.affine.base.set_memory_index(moi);
+            record.time_bounds = vec![
+                TimeBound::Steps(1),
+                TimeBound::Steps(32),
+                TimeBound::Steps(32),
+            ];
+            record.burst_index = Some(TimeDim(2));
+            record.time_offsets = TimeOffsets {
+                per_dim,
+                constant: 0,
+            };
+            record
+        };
+        let mut details = AccessContainer::<AccessDetailsAffineComposite>::default();
+        details
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("empty")
+            .fill(end(Val(329), MemoryOperandIndex::DirSrc, vec![65536, 2048, 64]));
+        details
+            .vacancy(MemoryOperandIndex::DirDst)
+            .expect("empty")
+            .fill(end(
+                Val(328),
+                MemoryOperandIndex::DirDst,
+                vec![4_194_304, 65536, 64],
+            ));
+        let pair = |src, dst| {
+            let mut container = AccessContainer::<Val>::default();
+            container
+                .vacancy(MemoryOperandIndex::DirSrc)
+                .expect("empty")
+                .fill(src);
+            container
+                .vacancy(MemoryOperandIndex::DirDst)
+                .expect("empty")
+                .fill(dst);
+            container
+        };
+        let mut mutable_addrs = pair(Val(347), Val(346));
+
+        let mut values = Values::default();
+        let outcome = construct_time_loops_and_vector_operations(
+            TransferOp::of(&body[2]).expect("a composite transfer"),
+            DfirUnit::L3su,
+            &mut mutable_addrs,
+            // `src_immutable_addr(%348)`, `dst_immutable_addr(%3)`.
+            &pair(Val(348), Val(3)),
+            &details,
+            &body,
+            &mut values,
+        );
+
+        let TimeLoopsAndVectorOps::Constructed(built) = outcome else {
+            panic!("the vendor's own transfer must build, got {outcome:?}");
+        };
+        assert!(
+            built.hoisted.len() == 2
+                && built.hoisted.iter().all(|op| matches!(
+                    op,
+                    SenOp::Sentient(sen::Op::ScalarConstant { value: 2048, .. })
+                )),
+            "64 elements × a burst of 32, once per side: {:?}",
+            built.hoisted
+        );
+        let SenOp::AffineFor(outer) = &built.emitted else {
+            panic!("the t-dim 0 loop is the whole emission, got {:?}", built.emitted);
+        };
+        let [SenOp::AffineFor(inner), outer_steps @ ..] = outer.body.as_slice() else {
+            panic!("the child leads its parent's body, got {:?}", outer.body);
+        };
+        assert_eq!(
+            (
+                outer.hi,
+                outer.dbg_name.as_deref(),
+                inner.hi,
+                inner.dbg_name.as_deref()
+            ),
+            (
+                affine::Bound::Const(1),
+                Some(format!("Time-Loop({NAME}, t-dim 0)").as_str()),
+                affine::Bound::Const(32),
+                Some(format!("Time-Loop({NAME}, t-dim 1)").as_str())
+            )
+        );
+        // Each level steps BOTH addresses, source first, by that level's own offset.
+        let steps = |ops: &[SenOp]| {
+            ops.iter()
+                .filter_map(|op| match op {
+                    SenOp::Arith(arith::Op::Constant { value, .. }) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (steps(outer_steps), steps(&inner.body)),
+            (vec![65536, 4_194_304], vec![2048, 65536])
+        );
+        let SenOp::Sentient(sen::Op::LoadAndStore {
+            src_mutable_addr,
+            dst_mutable_addr,
+            extent,
+            stride,
+            dbg_name,
+            ..
+        }) = &inner.body[0]
+        else {
+            panic!("the transfer sits at the bottom, got {:?}", inner.body[0]);
+        };
+        assert_eq!(
+            (
+                *src_mutable_addr,
+                *dst_mutable_addr,
+                extent.burst_size,
+                *stride,
+                dbg_name.as_deref()
+            ),
+            (
+                inner.carried[0].arg,
+                inner.carried[1].arg,
+                Elements(32),
+                64,
+                Some(NAME)
+            ),
+            "the innermost region arguments are what the transfer reads"
+        );
+        assert_eq!(
+            mutable_addrs.entries(),
+            &[inner.carried[0].arg, inner.carried[1].arg],
+            "the container is left reseated on the innermost arguments"
+        );
+    }
+
+    // ─────────────────────────────── 268/384 ───────────────────────────────
+
+    /// 🎯 268/384 — THE VENDOR'S MULTICAST COMPOSITE: HBM to LX off an L3LU, bursted by three, is one
+    /// `sentient.load_and_store` behind two hoisted 384s
+    /// (`mem2core-composite-multicast.mlir:31`, and its increments at `:20-21`).
+    #[test]
+    fn the_vendors_multicast_composite_becomes_one_bursted_load_and_store() {
+        let mut mc = composite_transfer();
+        if let agen::Op::CompositeLoadAndStore(transfer) = &mut mc {
+            transfer.multicast_info = Some(Val(19));
+        }
+        let body = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(12),
+                residency: Residency::Global,
+                unit: DfirUnit::Hbm,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(11),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lx,
+                num_folds: None,
+            }),
+            DfirOp::Agen(mc),
+        ];
+        let DfirOp::Agen(mc_agen) = &body[2] else {
+            panic!("body[2] is the transfer");
+        };
+
+        let end = |memory| {
+            let mut record = AccessDetailsAffine::new(mc_agen, DfirUnit::L3lu);
+            record.base.total_elements = Elements(128);
+            record.base.set_element_width(Bits(8));
+            record.base.chunk_size = Elements(128);
+            record.base.chunk_stride = Elements(0);
+            record.base.memory = Some(memory);
+            record
+        };
+        let mut details = AccessContainer::<AccessDetailsAffine>::default();
+        details
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("empty")
+            .fill(end(Val(12)));
+        details
+            .vacancy(MemoryOperandIndex::DirDst)
+            .expect("empty")
+            .fill(end(Val(11)));
+        let pair = |src, dst| {
+            let mut container = AccessContainer::<Val>::default();
+            container
+                .vacancy(MemoryOperandIndex::DirSrc)
+                .expect("empty")
+                .fill(src);
+            container
+                .vacancy(MemoryOperandIndex::DirDst)
+                .expect("empty")
+                .fill(dst);
+            container
+        };
+
+        let mut values = Values::default();
+        let outcome = construct_load_and_store_stmt(
+            TransferOp::of(&body[2]).expect("a composite transfer"),
+            DfirUnit::L3lu,
+            &details,
+            &pair(Val(33), Val(32)),
+            // `%c256` and `%c16`, the two views' start addresses.
+            &pair(Val(5), Val(4)),
+            TransferSpecialisation {
+                burst_size: Elements(3),
+                stride_step: StrideStep(128),
+                ..TransferSpecialisation::UNSPECIALISED
+            },
+            &body,
+            &mut values,
+        );
+
+        let LoadAndStoreStmt::Constructed(built) = outcome else {
+            panic!("the vendor's own transfer must build, got {outcome:?}");
+        };
+        assert!(
+            built.hoisted.len() == 2
+                && built.hoisted.iter().all(|op| matches!(
+                    op,
+                    SenOp::Sentient(sen::Op::ScalarConstant { value: 384, .. })
+                )),
+            "128 elements × a burst of 3, once per side: {:?}",
+            built.hoisted
+        );
+        assert_eq!(
+            built.transfer,
+            SenOp::Sentient(sen::Op::LoadAndStore {
+                src: Val(12),
+                dst: Val(11),
+                src_mutable_addr: Val(33),
+                src_immutable_addr: Val(5),
+                src_inc: Val(0),
+                dst_mutable_addr: Val(32),
+                dst_immutable_addr: Val(4),
+                dst_inc: Val(1),
+                multicast_info: Some(Val(19)),
+                results: (Val(2), Val(3)),
+                extent: sen::Extent {
+                    total_elements: Elements(128),
+                    element_size: Bits(8),
+                    chunk_size: Elements(128),
+                    chunk_stride: Elements(0),
+                    burst_size: Elements(3),
+                },
+                stride: 128,
+                rotate_val: None,
+                shuffle_mode: sen::ShuffleMode::NoShuffle,
+                src_reg: sen::Reg {
+                    locale: sen::RegType::Unknown,
+                    index: None,
+                },
+                dst_reg: sen::Reg {
+                    locale: sen::RegType::Unknown,
+                    index: None,
+                },
+                dir: None,
+                // ⛔ THE LX IS NOT THE IBR, and the flag is decided rather than defaulted.
+                is_ibr_write: false,
+                dbg_name: None,
+            })
+        );
+    }
+
+    // ─────────────────────────────── 269/384 ───────────────────────────────
+
+    /// 🎯 269/384 — THE VENDOR'S `lxlu_extract_op`: a `vector_load` off the LX, stored into the
+    /// virtual IBR and gathered from, becomes ONE `sentient.load_and_extract_scalar`
+    /// (`lx_indirect_loads_stores.mlir:335-346`, expected at `:52`).
+    #[test]
+    fn the_vendors_load_and_extract_pattern_builds_the_statement_and_pairs_it() {
+        let lx_ty = MemRef {
+            shape: vec![128],
+            elem: ElemType::Int(8),
+        };
+        let ibr_ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(8),
+        };
+        let body = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(60),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lx,
+                num_folds: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(61),
+                value: 0,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(62),
+                from: Val(60),
+                start: Val(61),
+                layout: identity_1d(),
+                ty: lx_ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: Val(63),
+                view: Val(62),
+                indices: vec![Index::Const(0)],
+                view_ty: lx_ty,
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(64),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::LxVirtualIbr,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(65),
+                from: Val(64),
+                start: Val(61),
+                layout: identity_1d(),
+                ty: ibr_ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                value: Val(63),
+                view: Val(65),
+                indices: vec![Index::Const(0)],
+                view_ty: ibr_ty.clone(),
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::IndirectVectorLoad {
+                result: Val(66),
+                indirect_view: Val(65),
+                indirect_indices: vec![Index::Const(0)],
+                indirect_view_ty: ibr_ty,
+                direct_view: VIEW,
+                direct_indices: indices(Val(67)),
+                direct_view_ty: view_ty(),
+                multicast_info: None,
+                ty: LANES,
+            }),
+        ];
+
+        let load = ExtractVectorLoad::of(&body[3]).expect("an agen.vector_load");
+        let DfirOp::Agen(load_agen) = &body[3] else {
+            panic!("body[3] is the load");
+        };
+        let mut details = AccessDetailsAffine::new(load_agen, DfirUnit::Lxlu);
+        details.base.total_elements = Elements(128);
+        details.base.set_element_width(Bits(8));
+
+        let unit = unit_holding(DfirUnit::Lxlu, Vec::new());
+        let mut values = Values::default();
+        let mut extract_ops = ExtractScalarOps::default();
+        let outcome = construct_load_and_extract_scalar_op(
+            load,
+            &unit,
+            DfirUnit::Lxlu,
+            &details,
+            Val(61),
+            Val(61),
+            &body,
+            &mut values,
+            &mut extract_ops,
+        );
+
+        let LoadAndExtractScalar::Constructed(built) = outcome else {
+            panic!("the vendor's own pattern must be admissible, got {outcome:?}");
+        };
+        assert!(
+            built.hoisted.iter().all(|op| matches!(
+                op,
+                SenOp::Sentient(sen::Op::ScalarConstant { value: 0, .. })
+            )) && built.hoisted.len() == 2,
+            "a zero immutable_addr and a zero increment, off L3: {:?}",
+            built.hoisted
+        );
+        assert_eq!(
+            built.extract,
+            SenOp::Sentient(sen::Op::LoadAndExtractScalar {
+                mutable_addr: Val(61),
+                immutable_addr: Val(0),
+                increment: Val(1),
+                consumer: SendEnd::to_self(VIEW),
+                addr_result: Val(2),
+                data_result: Val(3),
+                total_elements: Elements(128),
+                element_size: Bits(8),
+                addr_reg: sen::Reg {
+                    locale: sen::RegType::Unknown,
+                    index: None,
+                },
+                data_reg: sen::Reg {
+                    locale: sen::RegType::Unknown,
+                    index: None,
+                },
+                dbg_name: None,
+            })
+        );
+        assert_eq!(built.paired.kind(), ExtractScalarKind::LoadAndExtractScalar);
+        assert_eq!(built.paired.data(), Val(3), "result 1 is the scalar");
+        assert_eq!(built.indirect_load, &body[7], "the gather it pairs with");
+        assert_eq!(
+            built.to_be_deleted,
+            [&body[6], &body[3]],
+            "the store then the load"
+        );
+    }
+
+    // ─────────────────────────────── 270/384 ───────────────────────────────
+
+    /// 🎯 270/384 — ⛔ ONLY A SHUFFLE REACHES BACK ONE FURTHER, and the list is appended to, never
+    /// cleared.
+    #[test]
+    fn a_shuffle_takes_its_producer_with_it_and_anything_else_goes_alone() {
+        let scope = vec![
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: Val(1),
+                view: Val(0),
+                indices: vec![Index::Const(0)],
+                multicast_info: None,
+                view_ty: MemRef {
+                    shape: vec![128],
+                    elem: ElemType::Int(8),
+                },
+                ty: LANES,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                result: Val(2),
+                input: Val(1),
+                variable: Vec::new(),
+                pad: Vec::new(),
+                mask: None,
+                indices: vec![0; 128],
+                repetition: 1,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+        ];
+        let mut to_be_deleted = Vec::new();
+
+        add_store_input_to_delete_list(&scope[1], &scope, &mut to_be_deleted);
+        assert_eq!(to_be_deleted, [&scope[1], &scope[0]], "the shuffle, then what fed it");
+
+        add_store_input_to_delete_list(&scope[0], &scope, &mut to_be_deleted);
+        assert_eq!(
+            to_be_deleted,
+            [&scope[1], &scope[0], &scope[0]],
+            "a load is deleted alone, and appended to the same list"
+        );
+    }
+
+    // ─────────────────────────────── 271/384 ───────────────────────────────
+
+    /// 🎯 271/384 — ⛔ THE TRANSFERS LEAVE THE REGION WITH NOTHING INTERLEAVED, and an absent
+    /// `granularity` is the unit's whole burst rather than zero.
+    #[test]
+    fn the_regions_transfers_move_out_and_the_granularity_defaults_to_the_burst() {
+        let mut extent = sen::Extent::of(Elements(64), Bits(16));
+        extent.burst_size = Elements(8);
+        let region = [
+            sent_load_and_send(extent),
+            sent_load_and_send(extent),
+            SenOp::Agen(agen::Op::Yield),
+        ];
+
+        assert_eq!(
+            lower_composite_memory_interleave_op::<Dd2>(
+                DfirUnit::L3lu,
+                &MemoryInterleave {
+                    granularity: Some(Elements(16)),
+                    region: &region,
+                }
+            ),
+            CompositeMemoryInterleaveLowering::Moved {
+                moved: vec![region[0].clone(), region[1].clone()],
+                granularity: Elements(16),
+            },
+            "the yield stays behind"
+        );
+        assert_eq!(
+            lower_composite_memory_interleave_op::<Dd2>(
+                DfirUnit::L3lu,
+                &MemoryInterleave {
+                    granularity: None,
+                    region: &region,
+                }
+            ),
+            CompositeMemoryInterleaveLowering::Moved {
+                moved: vec![region[0].clone(), region[1].clone()],
+                granularity: Elements(32),
+            }
+        );
+    }
+
+    // ─────────────────────────────── 272/384 ───────────────────────────────
+
+    /// 🎯 272/384 — ⛔⛔ L3 HANDS BACK THE CONSTANT ALONE; every other unit adds the view's start
+    /// address to it, in the operand order `(start_addr, const)`.
+    #[test]
+    fn the_l3_pointer_starts_at_the_constant_and_every_other_unit_at_the_view() {
+        let l3 = insert_initialization_stmt(
+            &mut Values::default(),
+            DfirUnit::L3su,
+            256,
+            Val(96),
+            &StartAddrDef::Outside,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            l3,
+            InitializationStmt::Placed {
+                ops: vec![DfirOp::Arith(arith::Op::Constant {
+                    result: Val(0),
+                    value: 256,
+                })],
+                addr: Val(0),
+            }
+        );
+
+        let lx = insert_initialization_stmt(
+            &mut Values::default(),
+            DfirUnit::Lxsu,
+            256,
+            Val(96),
+            &StartAddrDef::Outside,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            lx,
+            InitializationStmt::Placed {
+                ops: vec![
+                    DfirOp::Arith(arith::Op::Constant {
+                        result: Val(0),
+                        value: 256,
+                    }),
+                    DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                        result: Val(1),
+                        lhs: Val(96),
+                        rhs: Val(0),
+                        ty: ScalarTy::Index,
+                    })),
+                ],
+                addr: Val(1),
+            }
         );
     }
 }
@@ -5974,6 +6599,7 @@ impl<'a> ExtractVectorStore<'a> {
             }),
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorLoad { .. }
+                | dfir_op::agen::Op::IndirectVectorLoad { .. }
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorLoad { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
@@ -6204,11 +6830,21 @@ impl HasTransferShape for AccessDetailsSymbolic<'_> {
     }
 }
 
-/// THE OUTCOME OF [`lower_vector_load_helper`] — its three refusals. Every success path emits, and
-/// both emitters are unported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// THE OUTCOME OF [`lower_vector_load_helper`] — the transfer it built, or which check refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
-pub enum VectorLoadHelper {
+pub enum VectorLoadHelper<'a> {
+    /// The `sentient.load_and_store` entry 268 built, and `to_be_deleted` — the STORE then the LOAD
+    /// (`:2944-2948`).
+    Constructed {
+        /// Entry 268's transfer and its hoisted constants.
+        stmt: Box<ConstructedLoadAndStore>,
+        /// `to_be_deleted`, in push order.
+        to_be_deleted: [&'a DfirOp; 2],
+    },
+    /// `emitError("Unable to generate load_and_store statement for the agen.vector_load operation")`
+    /// (`:2941-2944`) — ⭐ CARRYING WHICH OF ENTRY 268's CHECKS REFUSED, including its non-L3 gate.
+    UnableToGenerateLoadAndStore(LoadAndStoreStmt),
     /// `DT_CHECK_MSG(.. == 1, "single access info needed")` — a load with no store came with more
     /// than one record.
     SingleAccessInfoNeeded,
@@ -6229,14 +6865,16 @@ pub enum VectorLoadHelper {
 /// one `sentient.load_and_store`.
 /// ⛔ THE DELETE LIST IS NOT A PARAMETER because the reference fills it only after the emission
 /// succeeded (`:2945-2947`), which is behind both `todo!`s.
-pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
-    load_op: &DfirOp,
-    store_op: Option<&DfirOp>,
+pub fn lower_vector_load_helper<'a, A: Arch, T: HasTransferMemory>(
+    load: TransferOp<'a>,
+    store_op: Option<&'a DfirOp>,
     unit: &ProgramUnit<A>,
     access_details: &AccessContainer<T>,
     mutable_addrs: &AccessContainer<Val>,
     immutable_addrs: &AccessContainer<Val>,
-) -> VectorLoadHelper {
+    scope: &[DfirOp],
+    values: &mut Values,
+) -> VectorLoadHelper<'a> {
     let Some(store_op) = store_op else {
         // `:2906-2909`.
         if access_details.entries().len() != 1
@@ -6247,8 +6885,9 @@ pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
         }
         // `:2910-2917`.
         todo!(
-            "e358_constructLoadAndSendStmt is unported, so {load_op:?} on {:?} cannot become a \
+            "e358_constructLoadAndSendStmt is unported, so {:?} on {:?} cannot become a \
              sentient.load_and_send",
+            load.op,
             unit.on.kind()
         );
     };
@@ -6271,12 +6910,24 @@ pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
         return VectorLoadHelper::AccessDetailsDiffer;
     }
 
-    // `:2937-2947`.
-    todo!(
-        "e268_constructLoadAndStoreStmt is unported, so {load_op:?} and {store_op:?} on {:?} cannot \
-         become a sentient.load_and_store",
-        unit.on.kind()
-    );
+    // `:2937-2948` — entry 268 with all three trailing arguments defaulted (`:2910`), and the
+    // delete list only afterwards.
+    match construct_load_and_store_stmt(
+        load,
+        unit.on.kind(),
+        access_details,
+        mutable_addrs,
+        immutable_addrs,
+        TransferSpecialisation::UNSPECIALISED,
+        scope,
+        values,
+    ) {
+        LoadAndStoreStmt::Constructed(stmt) => VectorLoadHelper::Constructed {
+            stmt,
+            to_be_deleted: [store_op, load.op],
+        },
+        refused => VectorLoadHelper::UnableToGenerateLoadAndStore(refused),
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -6632,15 +7283,1004 @@ pub fn cleanup_trivially_redundant_set_send_destination<A: Arch>(
     SetSendDestinationCleanup::Replaced { get_unit, erased }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 270/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e270_addStoreInputToDeleteList
+///
+/// **270/384** `AgenToSentientLoweringPass::addStoreInputToDeleteList` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987` (8L). The op that produced a store's value
+/// goes on the delete list, and a shuffle takes ITS producer with it.
+///
+/// ⛔ ONLY A SHUFFLE REACHES BACK ONE FURTHER (`:2994-2995`): a receive or a bare
+/// `constant_bitstream` is deleted alone, because a shuffle is the only accepted pattern that has a
+/// producer of its own (`checkBasicConditions`, entry 210).
+/// ⛔ IT APPENDS AND DOES NOT CLEAR — one list is filled across a whole lowering. `DT_CHECK(input_op)`
+/// (`:2989`) is the reference asserting what this signature's `&DfirOp` already states.
+pub fn add_store_input_to_delete_list<'a>(
+    input_op: &'a DfirOp,
+    scope: &'a [DfirOp],
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+) {
+    // `:2993`.
+    to_be_deleted.push(input_op);
+    // `:2994-2995` — `shuffle_op.getInput().getDefiningOp()`, which is null for a block argument.
+    if let DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle { input, .. }) = input_op
+        && let Some(producer) = defining_op(*input, scope)
+    {
+        to_be_deleted.push(producer);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 271/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT AN `agen.composite_memory_interleave` BECOMES.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum CompositeMemoryInterleaveLowering {
+    /// Entry 211 refused the region (`:3777`), and the pass fails without moving anything.
+    Refused(InterleaveCheck),
+    /// The region's transfers, now standing where the interleave op did, and the granularity the
+    /// burst split runs at.
+    Moved {
+        /// `interleave_ops` after `moveBefore(op)`, in region order.
+        moved: Vec<SenOp>,
+        /// `getGranularity().value()`, defaulted to `sysDef.l3BurstSize` (`:3783-3786`).
+        granularity: Elements,
+    },
+}
+
+/// Replaces: e271_lowerCompositeMemoryInterleaveOp
+///
+/// **271/384** `AgenToSentientLoweringPass::lowerCompositeMemoryInterleaveOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775` (37L).
+///
+/// ⛔⛔ THE TRANSFERS LEAVE THE REGION EVEN WHEN NOTHING IS INTERLEAVED (`:3797-3801`) — the
+/// interleave op is deleted later, so a transfer still inside it would go with it.
+/// ⛔ THE DEFAULT GRANULARITY IS THE MAXIMUM BURST, NOT ZERO (`:3783-3786`).
+/// ⛔ ONLY THE THREE TRANSFER CLASSES ARE COLLECTED (`:3791-3795`); anything else the region holds,
+/// the yield included, stays behind.
+pub fn lower_composite_memory_interleave_op<A: Arch>(
+    comp: DfirUnit,
+    interleave: &MemoryInterleave<'_>,
+) -> CompositeMemoryInterleaveLowering {
+    // `:3777`.
+    let check = process_interleave_op::<A>(comp, interleave);
+    if !check.admissible() {
+        return CompositeMemoryInterleaveLowering::Refused(check);
+    }
+
+    // `:3783-3786` — `SenSystemDef sysDef; granularity = sysDef.l3BurstSize`, overridden only when
+    // the attribute is there.
+    let granularity = interleave
+        .granularity
+        .unwrap_or(Elements(u64::from(A::L3_BURST)));
+
+    // `:3789-3801` — collect the three classes, then move them all before the interleave op.
+    let moved: Vec<SenOp> = interleave
+        .region
+        .iter()
+        .filter(|region_op| interleaved_transfer_extent(region_op).is_some())
+        .cloned()
+        .collect();
+
+    // `:3803-3810` — `dcc::burst_utils::processBurstSplitOrInterleave`, which is NOT one of bridge
+    // 2's 384: it is `dcc/src/Transform/Sentient/Analyses/BurstUtils.cpp:84`. It emits nothing and
+    // returns `success()` when `burst / granularity == 0` (`:96-99`), so a burst under the
+    // granularity needs it for nothing — and above it, it rewrites `burst_size`, the increments and
+    // possibly a `sentient.for`, none of which this campaign owns.
+    if let Some(extent) = moved.first().and_then(transfer_extent)
+        && extent.burst_size >= granularity
+    {
+        todo!(
+            "dcc::burst_utils::processBurstSplitOrInterleave (BurstUtils.cpp:84) is outside bridge 2, \
+             so a burst of {:?} at granularity {granularity:?} on {comp:?} cannot be split or \
+             interleaved",
+            extent.burst_size
+        );
+    }
+
+    CompositeMemoryInterleaveLowering::Moved { moved, granularity }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 272/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT AN ADDRESS POINTER IS INITIALISED TO, and the ops placed before the loop for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum InitializationStmt {
+    /// Placed before the loop in build order — the `arith.constant`, then entry 219's clones, then
+    /// the `arith.addi` on everything but L3.
+    Placed {
+        /// In build order.
+        ops: Vec<DfirOp>,
+        /// `const_op.getResult()` on L3, else `add_op.getResult()`.
+        addr: Val,
+    },
+    /// Entry 219 could not place the view's start address, so there is no `addi` to build.
+    StartAddrRefused(ClonedStartAddr),
+}
+
+/// Replaces: e272_insertInitializationStmt
+///
+/// **272/384** `AgenToSentientLoweringPass::insertInitializationStmt` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834` (13L).
+///
+/// ⛔⛔ L3 RETURNS THE CONSTANT ALONE (`:3841`) — its mutable address counts from 0, where every other
+/// unit counts from the memory view's own start address, so a shared arm would offset L3 twice.
+/// ⛔ THE OPERAND ORDER IS `(new_start_addr, const_op)` (`:3845-3847`).
+pub fn insert_initialization_stmt(
+    values: &mut Values,
+    comp: DfirUnit,
+    imm_val: i64,
+    memory_view_start_addr: Val,
+    start_addr_def: &StartAddrDef<'_>,
+    preceding: &mut Vec<Uniformized>,
+) -> InitializationStmt {
+    // `:3837-3839` — `OpBuilder builder(loop_op)`, so it lands immediately before the loop.
+    let constant = values.mint();
+    let mut ops = vec![DfirOp::Arith(arith::Op::Constant {
+        result: constant,
+        value: imm_val,
+    })];
+
+    // `:3841` — `is_any_of(comp, L3LU, L3SU)`.
+    if matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+        return InitializationStmt::Placed {
+            ops,
+            addr: constant,
+        };
+    }
+
+    // `:3843-3844` — entry 219, whose clones go after the constant and before the sum: both
+    // builders insert immediately before the loop, so the earlier op stays earlier.
+    let cloned = clone_start_addr_outside_loop(
+        values,
+        memory_view_start_addr,
+        start_addr_def,
+        preceding,
+    );
+    let start_addr = match cloned {
+        ClonedStartAddr::AsItStands(addr)
+        // ⭐ The clones went inside a preceding `uniform.uniformize_regions`, not here.
+        | ClonedStartAddr::InUniformizeRegion { start_addr: addr, .. } => addr,
+        ClonedStartAddr::Hoisted {
+            ops: hoisted,
+            start_addr,
+        } => {
+            ops.extend(hoisted);
+            start_addr
+        }
+        refused @ (ClonedStartAddr::UnsupportedKeyType
+        | ClonedStartAddr::UnsupportedOperation
+        | ClonedStartAddr::NoActiveUniformizeOp) => {
+            return InitializationStmt::StartAddrRefused(refused);
+        }
+    };
+
+    // `:3845-3848`.
+    let sum = values.mint();
+    ops.push(DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+        result: sum,
+        lhs: start_addr,
+        rhs: constant,
+        ty: ScalarTy::Index,
+    })));
+    InitializationStmt::Placed { ops, addr: sum }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 269/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE `agen.vector_load` THE EXTRACT PATTERN IS ANCHORED ON — `VectorLoadOp&`'s fields, and the op
+/// itself for the delete list. The mirror of [`ExtractVectorStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractVectorLoad<'a> {
+    /// The statement itself.
+    pub op: &'a DfirOp,
+    /// `getResult(0)` — the vector, whose one user is the store into the virtual IBR.
+    pub result: Val,
+    /// `getMemRef()` — the LX view read.
+    pub view: Val,
+    /// `getMapOperands()`.
+    pub indices: &'a [Index],
+    /// The view's type.
+    pub view_ty: &'a MemRef,
+}
+
+impl<'a> ExtractVectorLoad<'a> {
+    /// `dyn_cast<agen::VectorLoadOp>` — `None` for anything else.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<ExtractVectorLoad<'a>> {
+        match op {
+            DfirOp::Agen(dfir_op::agen::Op::VectorLoad {
+                result,
+                view,
+                indices,
+                view_ty,
+                ..
+            }) => Some(ExtractVectorLoad {
+                op,
+                result: *result,
+                view: *view,
+                indices,
+                view_ty,
+            }),
+            DfirOp::Agen(
+                dfir_op::agen::Op::VectorStore { .. }
+                | dfir_op::agen::Op::IndirectVectorLoad { .. }
+                | dfir_op::agen::Op::IndirectVectorStore { .. }
+                | dfir_op::agen::Op::SymbolicVectorLoad { .. }
+                | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
+                | dfir_op::agen::Op::SetTransferMaskState { .. }
+                | dfir_op::agen::Op::Yield,
+            )
+            | DfirOp::Arith(_)
+            | DfirOp::Scf(_)
+            | DfirOp::Affine(_)
+            | DfirOp::Dataflow(_)
+            | DfirOp::Vector(_)
+            | DfirOp::VectorChain(_)
+            | DfirOp::Uniform(_)
+            | DfirOp::Symbol(_) => None,
+        }
+    }
+}
+
+/// THE `sentient.load_and_extract_scalar` PATTERN, BUILT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructedLoadAndExtract<'a> {
+    /// Entry 214's constants. ⭐ THEY GO BEFORE THE `dataflow.program_unit`, as
+    /// [`AddressIncrements::hoisted`] records.
+    pub hoisted: Vec<SenOp>,
+    /// The extract statement (`:2446-2450`) — it binds an address AND a datum.
+    pub extract: SenOp,
+    /// The `extract_idx` stamped on BOTH it and [`Self::indirect_load`] (`:2461-2462`).
+    pub paired: ExtractScalarOp,
+    /// The gather that pairing points at, so its lowering can find this extract.
+    pub indirect_load: &'a DfirOp,
+    /// `ops_to_be_deleted` — the store then the load (`:2465-2466`).
+    pub to_be_deleted: [&'a DfirOp; 2],
+}
+
+/// THE OUTCOME OF [`construct_load_and_extract_scalar_op`] — the pattern, or which check refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LoadAndExtractScalar<'a> {
+    /// Boxed: the built pattern is many words wide and the eleven refusals are none.
+    Constructed(Box<ConstructedLoadAndExtract<'a>>),
+    /// `emitError("expecting 1D load_set")`.
+    ExpectingOneDimLoadSet,
+    /// `emitError("expecting 1D identity map for load_map")`.
+    ExpectingOneDimIdentityLoadMap,
+    /// `emitError("expecting indices size 1")`.
+    ExpectingIndicesSizeOne,
+    /// The LOADED view is not a `dataflow.get_logical_memory_view` — the reference's unguarded `cast`
+    /// (`:2389-2390`), which crashes there.
+    LoadViewIsNotALogicalMemoryView,
+    /// `emitError("expecting 1D identity map for layout_map")`.
+    ExpectingOneDimIdentityLayoutMap,
+    /// `cast<VectorStoreOp>(*load_op->getUsers().begin())` (`:2397`) — a load with no user at all
+    /// dereferences the end iterator there, and one whose user is anything else fails the cast.
+    UserIsNotAVectorStore,
+    /// `emitError("store_op failed checks")`.
+    StoreOpFailedChecks(StoreFromExtractCheck),
+    /// The STORED-INTO view is not a `dataflow.get_logical_memory_view` — the unguarded `cast` at
+    /// `:2403-2404`.
+    IndirectViewIsNotALogicalMemoryView,
+    /// `emitError("indirect memory view does not pass checks")`.
+    IndirectMemViewFailedChecks(IndirectMemViewCheck),
+    /// `emitError("invalid user of indirect memory view")`.
+    InvalidUserOfIndirectMemView,
+    /// `emitError("indirect memory view should only have 2 users")`.
+    NotExactlyTwoUsers,
+    /// `emitError("indirect memory view is not feeding an indirect load operation")`.
+    NoIndirectLoadUser,
+}
+
+/// Replaces: e269_constructLoadAndExtractScalarOp
+///
+/// **269/384** `AgenToSentientLoweringPass::constructLoadAndExtractScalarOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351` (119L). The gather's index, loaded off the LX
+/// and stored into the virtual IBR, becomes one statement that leaves it in a scalar register.
+///
+/// ⛔ THE COUNT IS CHECKED **BEFORE** THE GATHER IS FOUND (`:2420-2426`) — the opposite order to its
+/// receive twin (entry 216), so a view with one user reports the count and not the missing gather.
+/// ⛔ AND THE CONSUMER IS THE UNIT ITSELF (`:2437-2442`): `getUnits()[0]`, because this island's
+/// `dataflow.program_unit` binds no region argument — the form all 18 corpus programs print. The
+/// `args[0]` arm belongs to `dcc-opt`'s own `iter_arg` fixtures.
+/// ⛔ NO BURST AND NO GROUP: entry 214 is called with `false, 0, 0` (`:2432-2434`), so both addresses
+/// come from hoisted zeros on everything but L3.
+pub fn construct_load_and_extract_scalar_op<'a, A: Arch>(
+    load: ExtractVectorLoad<'a>,
+    unit: &ProgramUnit<A>,
+    comp: DfirUnit,
+    access_details: &AccessDetailsAffine<'_>,
+    mutable_addr: Val,
+    immutable_addr: Val,
+    scope: &'a [DfirOp],
+    values: &mut Values,
+    extract_ops: &mut ExtractScalarOps,
+) -> LoadAndExtractScalar<'a> {
+    // `:2377-2379` — `getLoadSet().getValue().getNumDims()`. The island synthesises the set over the
+    // view's dimensions (`dialects/agen.rs:258-270`), so its dim count IS the view's rank.
+    if load.view_ty.shape.len() != 1 {
+        return LoadAndExtractScalar::ExpectingOneDimLoadSet;
+    }
+    // `:2381-2383` — and `load_order` is `identity_map(rank)` (`:241-244`), so only that same rank
+    // can refuse; kept as its own check because the reference reports it with its own message.
+    if load.view_ty.shape.len() != 1 {
+        return LoadAndExtractScalar::ExpectingOneDimIdentityLoadMap;
+    }
+    // `:2385-2386`.
+    if load.indices.len() != 1 {
+        return LoadAndExtractScalar::ExpectingIndicesSizeOne;
+    }
+
+    // `:2388-2393` — the LOADED view's own `layout_map`, which is a real field and can refuse both
+    // ways.
+    let Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+        layout: load_layout,
+        ..
+    })) = defining_op(load.view, scope)
+    else {
+        return LoadAndExtractScalar::LoadViewIsNotALogicalMemoryView;
+    };
+    if load_layout.dims != 1 || !load_layout.is_identity() {
+        return LoadAndExtractScalar::ExpectingOneDimIdentityLayoutMap;
+    }
+
+    // `:2395-2399` — the FIRST user (`*getUsers().begin()`), which entry 153's `hasOneUse` has
+    // already established is the only one and is a store into the virtual IBR.
+    let users = uses(load.result, scope);
+    let Some(store) = users.first().and_then(|user| ExtractVectorStore::of(user)) else {
+        return LoadAndExtractScalar::UserIsNotAVectorStore;
+    };
+    let store_check = check_store_op_from_extract_pattern(store.indices, store.view_ty, scope);
+    if !store_check.admissible() {
+        return LoadAndExtractScalar::StoreOpFailedChecks(store_check);
+    }
+
+    // `:2401-2406`.
+    let Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+        from,
+        start,
+        layout,
+        ..
+    })) = defining_op(store.view, scope)
+    else {
+        return LoadAndExtractScalar::IndirectViewIsNotALogicalMemoryView;
+    };
+    let view_check = check_indirect_mem_view_for_extract_op(&IndirectMemView::resolve(
+        scope, *from, *start, layout,
+    ));
+    if !view_check.admissible() {
+        return LoadAndExtractScalar::IndirectMemViewFailedChecks(view_check);
+    }
+
+    // `:2408-2419` — the gather among the indirect view's users. ⭐ `user != store_op` is a POINTER
+    // comparison in the reference, so a SECOND `agen.vector_store` into the same view is the invalid
+    // user rather than a second copy of this one.
+    let mut ind_load_op: Option<&'a DfirOp> = None;
+    let mut num_users = 0_usize;
+    for user in uses(store.view, scope) {
+        num_users += 1;
+        match agen_op_kind(user) {
+            Some(AgenOpKind::IndirectVectorLoad | AgenOpKind::CompositeIndirectLoad) => {
+                ind_load_op = Some(user);
+            }
+            _ if core::ptr::eq(user, store.op) => {}
+            _ => return LoadAndExtractScalar::InvalidUserOfIndirectMemView,
+        }
+    }
+    // `:2420-2426` — the count, and only then the gather.
+    if num_users != 2 {
+        return LoadAndExtractScalar::NotExactlyTwoUsers;
+    }
+    let Some(indirect_load) = ind_load_op else {
+        return LoadAndExtractScalar::NoIndirectLoadUser;
+    };
+
+    // `:2428-2435` — no burst, no interleaved group, and both sizes zero.
+    let total_elements = access_details.base.total_elements;
+    let addresses = set_immutable_addr_and_increments(
+        values,
+        comp,
+        false,
+        StrideStep(0),
+        Elements(0),
+        total_elements,
+        immutable_addr,
+    );
+
+    // `:2437-2450` — the statement, on the unit it is itself running on.
+    let addr_result = values.mint();
+    let data_result = values.mint();
+    let extract = SenOp::Sentient(sen::Op::LoadAndExtractScalar {
+        mutable_addr,
+        immutable_addr: addresses.immutable_addr,
+        increment: addresses.increment,
+        consumer: SendEnd::to_self(unit.on.first()),
+        addr_result,
+        data_result,
+        total_elements,
+        element_size: access_details.base.element_width,
+        addr_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        data_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        // `:2444` — `getDbgNameAttr(load_op)`.
+        dbg_name: dfir_op::dbg_name(load.op).map(str::to_owned),
+    });
+
+    // `:2452-2466` — the `!extract_op` guard has no representation (construction cannot fail), and
+    // the two `setAttr("extract_idx", ..)` calls are this one minting.
+    LoadAndExtractScalar::Constructed(Box::new(ConstructedLoadAndExtract {
+        hoisted: addresses.hoisted,
+        extract,
+        paired: extract_ops.mint(ExtractScalarResults::LoadAndExtractScalar {
+            addr: addr_result,
+            data: data_result,
+        }),
+        indirect_load,
+        to_be_deleted: [store.op, load.op],
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 268/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT A **TRANSFER** ASKS ITS `AccessDetailsTy` FOR — [`HasTransferShape`]'s four extents plus the
+/// two entry 268 reads off the records themselves (`Helper.cpp:2212-2230`).
+pub trait HasTransferMemory: HasTransferShape {
+    /// `getMemory()` — the UNIT the accessed view was cut from, not the view. `None` is the
+    /// reference's null `Value`.
+    fn memory(&self) -> Option<Val>;
+    /// `getShuffleMode()`.
+    fn shuffle_mode(&self) -> sen::ShuffleMode;
+}
+
+impl HasTransferMemory for AccessDetailsAffine<'_> {
+    fn memory(&self) -> Option<Val> {
+        self.base.memory
+    }
+    fn shuffle_mode(&self) -> sen::ShuffleMode {
+        self.base.shuffle_mode
+    }
+}
+
+impl HasTransferMemory for AccessDetailsAffineComposite<'_> {
+    fn memory(&self) -> Option<Val> {
+        self.affine.memory()
+    }
+    fn shuffle_mode(&self) -> sen::ShuffleMode {
+        self.affine.shuffle_mode()
+    }
+}
+
+impl HasTransferMemory for AccessDetailsSymbolic<'_> {
+    fn memory(&self) -> Option<Val> {
+        self.base.memory
+    }
+    fn shuffle_mode(&self) -> sen::ShuffleMode {
+        self.base.shuffle_mode
+    }
+}
+
+/// THE OP A TRANSFER IS BEING BUILT FROM — the four `dyn_cast`s at `:2290-2303` and the `getDir()`
+/// at `:2307-2322`, as the door that retires their `llvm_unreachable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferOp<'a> {
+    /// The op itself, for `getDbgNameAttr(op)` (`:2305`).
+    pub op: &'a DfirOp,
+    /// `getMulticastInfo()` — ⛔ WHAT MAKES A MULTICAST A MULTICAST; dropped, the transfer reaches
+    /// one destination.
+    pub multicast_info: Option<Val>,
+    /// `getDir()`, which ONLY `agen.composite_load_and_store` carries (`:2307-2308`).
+    pub dir: Option<dfir_op::agen::RoutingDirection>,
+}
+
+impl<'a> TransferOp<'a> {
+    /// `None` exactly where the reference reaches
+    /// `llvm_unreachable("Expecting a VectorLoadOp or Composite[Indirect]LoadAndStoreOp!")` — ⭐ AND
+    /// THE ISLAND HAS NO `agen.composite_indirect_load_and_store`, so the third `dyn_cast` has no
+    /// arm here rather than a wrong one.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<TransferOp<'a>> {
+        match op {
+            DfirOp::Agen(dfir_op::agen::Op::VectorLoad {
+                multicast_info: mc, ..
+            }) => Some(TransferOp {
+                op,
+                multicast_info: *mc,
+                dir: None,
+            }),
+            DfirOp::Agen(dfir_op::agen::Op::CompositeLoadAndStore(transfer)) => Some(TransferOp {
+                op,
+                multicast_info: transfer.multicast_info,
+                dir: transfer.dir,
+            }),
+            DfirOp::Agen(dfir_op::agen::Op::SymbolicVectorLoad { multicast, .. }) => {
+                Some(TransferOp {
+                    op,
+                    multicast_info: *multicast,
+                    dir: None,
+                })
+            }
+            DfirOp::Agen(
+                dfir_op::agen::Op::VectorStore { .. }
+                | dfir_op::agen::Op::IndirectVectorLoad { .. }
+                | dfir_op::agen::Op::IndirectVectorStore { .. }
+                | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
+                | dfir_op::agen::Op::SetTransferMaskState { .. }
+                | dfir_op::agen::Op::Yield,
+            )
+            | DfirOp::Arith(_)
+            | DfirOp::Scf(_)
+            | DfirOp::Affine(_)
+            | DfirOp::Dataflow(_)
+            | DfirOp::Vector(_)
+            | DfirOp::VectorChain(_)
+            | DfirOp::Uniform(_)
+            | DfirOp::Symbol(_) => None,
+        }
+    }
+}
+
+/// THE `sentient.load_and_store` PATTERN, BUILT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructedLoadAndStore {
+    /// Entry 214's constants, the LOAD side's then the STORE side's. ⭐ THEY GO BEFORE THE
+    /// `dataflow.program_unit`, as [`AddressIncrements::hoisted`] records.
+    pub hoisted: Vec<SenOp>,
+    /// The transfer (`:2323-2331`), with `is-ibr-write` already stamped (`:2337-2342`).
+    pub transfer: SenOp,
+}
+
+/// THE OUTCOME OF [`construct_load_and_store_stmt`] — the transfer, or which check refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LoadAndStoreStmt {
+    /// Boxed: the transfer is many words wide and the four refusals are none.
+    Constructed(Box<ConstructedLoadAndStore>),
+    /// `LogicalResult::failure()` for `!is_any_of(comp, L3LU, L3SU)` (`:2177-2179`) — ⭐ NOT AN
+    /// ERROR: the caller's other lowerings own the non-L3 units.
+    NotAnL3Unit,
+    /// `emitError("Memory view index of direct src must be zero.")`.
+    DirectSrcIndexNotZero,
+    /// `emitError("Memory view index of direct dst must be zero.")`.
+    DirectDstIndexNotZero,
+    /// The aborts inside the container reads: `get`'s *"no entry exists for the requested memory
+    /// operand index"* (`AccessDetails.hpp:401-405`), `getFirst`'s `llvm_unreachable` (`:417`), and a
+    /// record whose `memory_` is still the null `Value`.
+    MissingOperandRecord,
+}
+
+/// `dyn_cast_or_null<arith::ConstantOp>(v.getDefiningOp())` AND ITS INTEGER IS ZERO (`:2189-2191`).
+fn is_zero_index_constant(val: Val, scope: &[DfirOp]) -> bool {
+    matches!(
+        defining_op(val, scope),
+        Some(DfirOp::Arith(arith::Op::Constant { value: 0, .. }))
+    )
+}
+
+/// Replaces: e268_constructLoadAndStoreStmt
+///
+/// **268/384** `AgenToSentientLoweringPass::constructLoadAndStoreStmt` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167` (177L). An L3 transfer with both ends in one
+/// op.
+///
+/// ⛔⛔ THE INDIRECT MUTABLE ADDRESS **OVERWRITES** THE IMMUTABLE ONE entry 214 just computed
+/// (`:2257-2260`): for a gather the IBR IS the base address, so the hoisted constant is built and
+/// then thrown away.
+/// ⛔ THE TWO OFFSETS ARE DEAD AND THEIR REFUSALS ARE NOT. `indirect_src_offset`/`indirect_dst_offset`
+/// are read only inside `#if !defined(TOGGLE_INDIRECT_IMPL1)` (`:2272-2285`), which `Helper.cpp:34`
+/// defines out — but the two `emitError`s beside them still run.
+pub fn construct_load_and_store_stmt<D: HasTransferMemory>(
+    transfer_op: TransferOp<'_>,
+    comp: DfirUnit,
+    access_details: &AccessContainer<D>,
+    mutable_addrs: &AccessContainer<Val>,
+    immutable_addrs: &AccessContainer<Val>,
+    spec: TransferSpecialisation,
+    scope: &[DfirOp],
+    values: &mut Values,
+) -> LoadAndStoreStmt {
+    // `:2175-2179` — the component of `getUnits()[0]`, and the gate.
+    if !matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+        return LoadAndStoreStmt::NotAnL3Unit;
+    }
+
+    // `:2186-2199` — the indirect source's own immutable address is read (for the dead block) and the
+    // DIRECT source's must be zero, because the IBR is the base.
+    if access_details.has(MemoryOperandIndex::IndSrc) {
+        let (Some(_ind), Some(direct)) = (
+            immutable_addrs.get(MemoryOperandIndex::IndSrc),
+            immutable_addrs.get(MemoryOperandIndex::DirSrc),
+        ) else {
+            return LoadAndStoreStmt::MissingOperandRecord;
+        };
+        if !is_zero_index_constant(*direct, scope) {
+            return LoadAndStoreStmt::DirectSrcIndexNotZero;
+        }
+    }
+    // `:2200-2211` — the destination twin.
+    if access_details.has(MemoryOperandIndex::IndDst) {
+        let (Some(_ind), Some(direct)) = (
+            immutable_addrs.get(MemoryOperandIndex::IndDst),
+            immutable_addrs.get(MemoryOperandIndex::DirDst),
+        ) else {
+            return LoadAndStoreStmt::MissingOperandRecord;
+        };
+        if !is_zero_index_constant(*direct, scope) {
+            return LoadAndStoreStmt::DirectDstIndexNotZero;
+        }
+    }
+
+    // `:2212-2230` — the two memories come from the INDIRECT record when there is one, and both
+    // address pairs from the DIRECT ones; the extents and the shuffle mode from `getFirst()`.
+    let ends = |ind, dir| {
+        access_details
+            .get(if access_details.has(ind) { ind } else { dir })
+            .and_then(HasTransferMemory::memory)
+    };
+    let (
+        Some(load_memory),
+        Some(store_memory),
+        Some(&load_mutable_addr),
+        Some(&load_mem_view_start_addr),
+        Some(&store_mutable_addr),
+        Some(&store_mem_view_start_addr),
+        Some(first),
+    ) = (
+        ends(MemoryOperandIndex::IndSrc, MemoryOperandIndex::DirSrc),
+        ends(MemoryOperandIndex::IndDst, MemoryOperandIndex::DirDst),
+        mutable_addrs.get(MemoryOperandIndex::DirSrc),
+        immutable_addrs.get(MemoryOperandIndex::DirSrc),
+        mutable_addrs.get(MemoryOperandIndex::DirDst),
+        immutable_addrs.get(MemoryOperandIndex::DirDst),
+        access_details.get_first(),
+    )
+    else {
+        return LoadAndStoreStmt::MissingOperandRecord;
+    };
+    let shape = first.transfer_shape();
+    let shuffle_mode = first.shuffle_mode();
+
+    // `:2232-2251` — entry 214 twice, load side first. ⭐ ITS `failed()` ARMS ARE UNREACHABLE:
+    // `setImmutableAddrAndIncrements` returns `success()` on every path (`:1581-1627`).
+    let perform_burst_or_group = spec.performs_burst_or_group();
+    let load = set_immutable_addr_and_increments(
+        values,
+        comp,
+        perform_burst_or_group,
+        spec.stride_step,
+        spec.burst_size,
+        shape.total_elements,
+        load_mem_view_start_addr,
+    );
+    let store = set_immutable_addr_and_increments(
+        values,
+        comp,
+        perform_burst_or_group,
+        spec.stride_step,
+        spec.burst_size,
+        shape.total_elements,
+        store_mem_view_start_addr,
+    );
+    let mut hoisted = load.hoisted;
+    hoisted.extend(store.hoisted);
+
+    // `:2253-2260` — and the indirect MUTABLE address replaces the immutable one.
+    let load_immutable_addr = match mutable_addrs.get(MemoryOperandIndex::IndSrc) {
+        Some(&ibr) if access_details.has(MemoryOperandIndex::IndSrc) => ibr,
+        _ => load.immutable_addr,
+    };
+    let store_immutable_addr = match mutable_addrs.get(MemoryOperandIndex::IndDst) {
+        Some(&ibr) if access_details.has(MemoryOperandIndex::IndDst) => ibr,
+        _ => store.immutable_addr,
+    };
+
+    // `:2262-2270` — the insertion-point shift onto the `agen.vector_store` is builder mechanics with
+    // nothing to represent: the pair goes on the delete list either way (`:2944-2947`).
+
+    // `:2333-2342` — the flag is set AFTER the op is built, and only when the destination is not
+    // itself indirect: a scatter writes the IBR through `kIndDst` and is not an IBR write.
+    let is_ibr_write = !access_details.has(MemoryOperandIndex::IndDst)
+        && matches!(
+            defining_op(store_memory, scope),
+            Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. }))
+                if unit.generic() == GenericComp::L3Ibr
+        );
+
+    // `:2305-2331` — the four extents, the burst, the stride and the routing direction.
+    let src_result = values.mint();
+    let dst_result = values.mint();
+    let transfer = SenOp::Sentient(sen::Op::LoadAndStore {
+        src: load_memory,
+        dst: store_memory,
+        src_mutable_addr: load_mutable_addr,
+        src_immutable_addr: load_immutable_addr,
+        src_inc: load.increment,
+        dst_mutable_addr: store_mutable_addr,
+        dst_immutable_addr: store_immutable_addr,
+        dst_inc: store.increment,
+        multicast_info: transfer_op.multicast_info,
+        results: (src_result, dst_result),
+        extent: sen::Extent {
+            total_elements: shape.total_elements,
+            element_size: shape.element_width,
+            chunk_size: shape.chunk_size,
+            chunk_stride: shape.chunk_stride,
+            burst_size: spec.burst_size,
+        },
+        stride: spec.stride_step.0,
+        // `nullptr` for `$rotate_val` (`:2328`, `SentientOps.td:735`).
+        rotate_val: None,
+        shuffle_mode,
+        src_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        dst_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        // `:2307-2321` — the agen direction renamed onto the sentient one, arm for arm.
+        dir: transfer_op.dir.map(|direction| match direction {
+            dfir_op::agen::RoutingDirection::BothWays => sen::RoutingDirection::BothWays,
+            dfir_op::agen::RoutingDirection::Clockwise => sen::RoutingDirection::Clockwise,
+            dfir_op::agen::RoutingDirection::CounterClockwise => {
+                sen::RoutingDirection::CounterClockwise
+            }
+            dfir_op::agen::RoutingDirection::PseudoRandom => sen::RoutingDirection::PseudoRandom,
+        }),
+        is_ibr_write,
+        dbg_name: dfir_op::dbg_name(transfer_op.op).map(str::to_owned),
+    });
+
+    LoadAndStoreStmt::Constructed(Box::new(ConstructedLoadAndStore { hoisted, transfer }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 267/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE LEVEL OF THE TIME NEST, held until the nest can be built from the inside out.
+struct TimeLoopLevel {
+    iv: Val,
+    bound: i64,
+    carried: Vec<affine::Carried>,
+    /// The `arith.constant`/`arith.addi` pair per operand, in operand order.
+    steps: Vec<SenOp>,
+    yield_args: Vec<Val>,
+    dbg_name: Option<String>,
+}
+
+/// THE TIME NEST WITH ITS TRANSFER AT THE BOTTOM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeLoopsAndTransfer {
+    /// Entry 214's constants, which belong OUTSIDE the whole nest.
+    pub hoisted: Vec<SenOp>,
+    /// The outermost `affine.for`, or the transfer alone when the burst claimed dimension 0.
+    pub emitted: SenOp,
+}
+
+/// THE OUTCOME OF [`construct_time_loops_and_vector_operations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum TimeLoopsAndVectorOps {
+    /// Boxed: the nest is many words wide and the four refusals are none.
+    Constructed(Box<TimeLoopsAndTransfer>),
+    /// `DT_CHECK(loop_bound > 0)` (`:1820`) — a time dimension with no steps at all.
+    LoopBoundNotPositive,
+    /// ⭐ THE ONE DELIBERATE DIVERGENCE: [`TimeBound::Variable`] is the reference's `-1`, and
+    /// `size_t loop_bound = -1` PASSES its own `> 0` check (`:1815-1820`), giving a loop of
+    /// `SIZE_MAX` trips. A bound that is not a compile-time constant is refused here instead.
+    LoopBoundNotConstant,
+    /// `getFirst`'s `llvm_unreachable` (`:1797`) and the two size `DT_CHECK`s (`:1795-1796`).
+    MissingOperandRecord,
+    /// Entry 268 refused (`:1882`).
+    UnableToGenerateLoadAndStore(LoadAndStoreStmt),
+}
+
+/// Replaces: e267_constructTimeLoopsAndVectorOperations
+///
+/// **267/384** `Helper.cpp:1789` (109L) — the time loops, with the transfer at the bottom of them.
+///
+/// ⛔⛔ THE BURST DIMENSION ENDS THE NEST (`:1807`): a burst on dimension 0 builds NO loop, and its
+/// trip count becomes the transfer's own `burst_size` (`:1860`).
+/// ⛔ EACH CHILD GOES AT THE **START** of its parent's body (`:1855`) — `[child, const+addi per
+/// operand, yield]`, not creation order — and `mutable_addrs` is RESEATED in place onto the
+/// innermost region arguments (`:1831-1834`), which is what entry 268 reads.
+/// ⛔ AN INDIRECT OPERAND STEPS BY ZERO, not by its own offset (`:1842-1844`).
+/// ⭐ NO `extract_op` PARAMETER: it feeds only the four `composite_[indirect_]load`/`store` arms
+/// (`:1868-1897`), whose ops this island does not carry.
+pub fn construct_time_loops_and_vector_operations(
+    composite: TransferOp<'_>,
+    comp: DfirUnit,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &AccessContainer<Val>,
+    access_details: &AccessContainer<AccessDetailsAffineComposite<'_>>,
+    scope: &[DfirOp],
+    values: &mut Values,
+) -> TimeLoopsAndVectorOps {
+    // `:1795-1801`.
+    if mutable_addrs.entries().len() != immutable_addrs.entries().len()
+        || mutable_addrs.entries().len() != access_details.entries().len()
+    {
+        return TimeLoopsAndVectorOps::MissingOperandRecord;
+    }
+    let Some(front) = access_details.get_first() else {
+        return TimeLoopsAndVectorOps::MissingOperandRecord;
+    };
+    let time_bounds = front.time_bounds.clone();
+    let time_offsets = front.time_offsets.clone();
+    let burst_index = front.burst_index;
+    let group_index = front.interleave_group_index;
+
+    // `:1806-1857` — `loop_num` levels, outermost first.
+    let loop_num = burst_index.map_or(time_bounds.len(), TimeDim::index);
+    let mut levels: Vec<TimeLoopLevel> = Vec::with_capacity(loop_num);
+    for (idx, time_bound) in time_bounds.iter().take(loop_num).enumerate() {
+        // `:1815-1820`.
+        let bound = match *time_bound {
+            TimeBound::Steps(0) => return TimeLoopsAndVectorOps::LoopBoundNotPositive,
+            TimeBound::Variable => return TimeLoopsAndVectorOps::LoopBoundNotConstant,
+            TimeBound::Coalesced => 1,
+            #[expect(clippy::cast_possible_wrap, reason = "a trip count, not a bit pattern")]
+            TimeBound::Steps(steps) => steps as i64,
+        };
+
+        // `:1811-1814` and `:1830-1834` — the addresses go in as `iter_args` and come back out as the
+        // region arguments the body must use.
+        let iv = values.mint();
+        let carried: Vec<affine::Carried> = mutable_addrs
+            .entries()
+            .iter()
+            .map(|init| affine::Carried {
+                init: *init,
+                arg: values.mint(),
+                result: values.mint(),
+            })
+            .collect();
+        for (addr, seat) in mutable_addrs.entries_mut().iter_mut().zip(&carried) {
+            *addr = seat.arg;
+        }
+
+        // `:1836-1852` — one `arith.constant` and one `arith.addi` per operand, in operand order.
+        let mut steps: Vec<SenOp> = Vec::with_capacity(access_details.entries().len() * 2);
+        let mut yield_args: Vec<Val> = Vec::with_capacity(access_details.entries().len());
+        for (record, addr) in access_details.entries().iter().zip(mutable_addrs.entries()) {
+            let time_offset = if matches!(
+                record.affine.base.memory_index,
+                Some(MemoryOperandIndex::DirSrc | MemoryOperandIndex::DirDst)
+            ) {
+                record.time_offsets.per_dim.get(idx).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let constant = values.mint();
+            let sum = values.mint();
+            steps.push(SenOp::Arith(arith::Op::Constant {
+                result: constant,
+                value: time_offset,
+            }));
+            steps.push(SenOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: sum,
+                lhs: *addr,
+                rhs: constant,
+                ty: ScalarTy::Index,
+            })));
+            yield_args.push(sum);
+        }
+
+        levels.push(TimeLoopLevel {
+            iv,
+            bound,
+            carried,
+            steps,
+            yield_args,
+            // `:1823-1826` — named only when the composite itself carries a name.
+            dbg_name: dfir_op::dbg_name(composite.op)
+                .map(|name| format!("Time-Loop({name}, t-dim {idx})")),
+        });
+    }
+
+    // `:1860-1865` — the burst and group counts are the bounds of the dimensions that claimed them,
+    // and the stride step is the offset of the innermost claimed one.
+    let claimed = |dim: Option<TimeDim>| {
+        dim.and_then(|d| time_bounds.get(d.index()).copied())
+            .map_or(Elements(0), |bound| match bound {
+                TimeBound::Steps(steps) => Elements(steps),
+                // A sentinel bound cannot be claimed as a burst or a group — see [`TimeBound`].
+                TimeBound::Coalesced | TimeBound::Variable => Elements(0),
+            })
+    };
+    let stride_step = group_index.or(burst_index).map_or_else(
+        // `time_offsets.front()` with no time dimension left is the flattened CONSTANT term.
+        || {
+            time_offsets
+                .per_dim
+                .first()
+                .copied()
+                .unwrap_or(time_offsets.constant)
+        },
+        |dim| {
+            time_offsets
+                .per_dim
+                .get(dim.index())
+                .copied()
+                .unwrap_or(time_offsets.constant)
+        },
+    );
+
+    // The reference's parameter is `int stride_step` taking an `int64_t` offset, so the narrowing is
+    // the reference's own (see [`StrideStep`]).
+    #[expect(clippy::cast_possible_truncation, reason = "`int stride_step` narrows too")]
+    let stride_step = StrideStep(stride_step as i32);
+
+    // `:1867-1900` — five arms, and this island carries the input of exactly one of them.
+    let stmt = match construct_load_and_store_stmt(
+        composite,
+        comp,
+        access_details,
+        mutable_addrs,
+        immutable_addrs,
+        TransferSpecialisation {
+            burst_size: claimed(burst_index),
+            group_size: claimed(group_index),
+            stride_step,
+            ..TransferSpecialisation::UNSPECIALISED
+        },
+        scope,
+        values,
+    ) {
+        LoadAndStoreStmt::Constructed(stmt) => stmt,
+        refused => return TimeLoopsAndVectorOps::UnableToGenerateLoadAndStore(refused),
+    };
+
+    // The nest closes from the inside out, which is the only order its bodies can be filled in.
+    let mut emitted = stmt.transfer;
+    for level in levels.into_iter().rev() {
+        let mut body = vec![emitted];
+        body.extend(level.steps);
+        body.push(SenOp::Affine(affine::Op::Yield {
+            operands: level.yield_args,
+        }));
+        emitted = SenOp::AffineFor(AffineFor {
+            iv: level.iv,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(level.bound),
+            carried: level.carried,
+            body,
+            dbg_name: level.dbg_name,
+        });
+    }
+
+    TimeLoopsAndVectorOps::Constructed(Box::new(TimeLoopsAndTransfer {
+        hoisted: stmt.hoisted,
+        emitted,
+    }))
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e267_constructTimeLoopsAndVectorOperations
-// crustify:todo: e268_constructLoadAndStoreStmt
-// crustify:todo: e269_constructLoadAndExtractScalarOp
-// crustify:todo: e270_addStoreInputToDeleteList
-// crustify:todo: e271_lowerCompositeMemoryInterleaveOp
-// crustify:todo: e272_insertInitializationStmt
 // crustify:todo: e298_constructAffineDetailsAndAddrs
 // crustify:todo: e299_lowerAffineCompositeHelper
 // crustify:todo: e311_constructAffineCompDetailsAndAddrs

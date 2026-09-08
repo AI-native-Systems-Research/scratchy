@@ -410,6 +410,9 @@ fn node_program<
                 load_time_addr_map: plan.load_time_addr_map,
                 store_time_addr_map: plan.store_time_addr_map,
                 body: vec![Op::Agen(agen::Op::Yield)],
+                dir: None,
+                multicast_info: None,
+                dbg_name: None,
             },
         ))));
         // ⛔⛔ THE PLACEMENT, NOT THE VIEW HANDLE. `dst` is bound inside the L3 unit's region and is
@@ -792,11 +795,13 @@ fn load_and_send(
             result: loaded,
             view: *view,
             indices: vec![Index::Const(0), Index::Const(0)],
+            dbg_name: None,
             view_ty: MemRef {
                 shape: vec![operand.rows(), operand.cols()],
                 elem: ElemType::F16,
             },
             ty,
+            multicast_info: None,
         }));
         ops.push(Op::Dataflow(dataflow::Op::Send {
             to,

@@ -346,6 +346,7 @@ impl<'a> TpmvManager<'a> {
                 agen::Op::Yield
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. },
@@ -435,11 +436,13 @@ mod unit_tests {
     /// `%load = agen.vector_load %view[..] : memref<?x64x4xf16>, vector<64xf16>`.
     fn load(result: Val, view: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result,
             view,
             indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
             view_ty: view_ty(),
             ty: LANES,
+            multicast_info: None,
         })
     }
 
@@ -671,6 +674,9 @@ mod unit_tests {
                 load_time_addr_map: planned.load_time_addr_map,
                 store_time_addr_map: planned.store_time_addr_map,
                 body: vec![DfirOp::Agen(agen::Op::Yield)],
+                dir: None,
+                multicast_info: None,
+                dbg_name: None,
             },
         )));
         let scope = vec![paged_view(Val(10)), paged_view(Val(11)), transfer];

@@ -262,6 +262,7 @@ pub fn local_units(of: Unit) -> Vec<crate::islands::dataflow_ir::dialects::dataf
         | GenericComp::L3su
         | GenericComp::Hbm
         | GenericComp::LxVirtualIbr
+        | GenericComp::L3Ibr
         | GenericComp::CrossPtnLink
         | GenericComp::SfpState
         | GenericComp::PeState
@@ -347,6 +348,19 @@ pub enum DfirUnit {
     /// from [`neighbours`].
     LxVirtualIbr,
 
+    /// `l3ibr` — THE L3's INDIRECTION BASE REGISTER, the memory a gather's index list is written
+    /// into and read back from. `SenComponents::L3IBR = 44` (`sys-arch-spec/arch_enums.h:59`) spells
+    /// `"l3ibr"` (`sys-arch-spec/arch_enums.cpp:106`) and is its own generic component (`:208`).
+    ///
+    /// ⛔ WITHOUT IT `constructLoadAndStoreStmt` CANNOT SET `is_ibr_write`: the flag is
+    /// `!access_details.has(kIndDst) && dcc::getUnitType(store_memory.getDefiningOp()) == L3IBR`
+    /// (`Helper.cpp:2337-2342`), so a store into the IBR would be emitted as an ordinary transfer.
+    ///
+    /// ⭐ BOUND LIKE THE HBM, NOT LIKE A MOVER: `dataflow.get_unit {name = "l3ibr", type = "l3ibr"}`
+    /// with no `core` and no `corelet` (`dcc/test/Conversion/AgenToSentient/l3-gather.mlir:255`),
+    /// and with `num_folds` when the L3 is folded (`l3-burst-calc-1.mlir:816`).
+    L3Ibr,
+
     /// `crossptnlink` — the link that carries data OUT OF THIS PARTITION.
     ///
     /// ⛔⛔ IT IS A REAL DATAFLOWIR UNIT AND THIS VOCABULARY COULD NOT NAME IT. The authority tree's
@@ -409,6 +423,7 @@ impl DfirUnit {
             Self::PeState => "pestate",
             Self::SfpRing => "sfpring",
             Self::LxVirtualIbr => "lxvirtualibr",
+            Self::L3Ibr => "l3ibr",
             Self::CrossPtnLink => "crossptnlink",
         }
     }
@@ -446,6 +461,8 @@ impl DfirUnit {
             Self::Hbm => GenericComp::Hbm,
             // `:209` — the virtual IBR is its own image, like the memories above it.
             Self::LxVirtualIbr => GenericComp::LxVirtualIbr,
+            // `:208` — and so is the L3 indirection base register.
+            Self::L3Ibr => GenericComp::L3Ibr,
             Self::CrossPtnLink => GenericComp::CrossPtnLink,
             Self::SfpState => GenericComp::SfpState,
             Self::PeState => GenericComp::PeState,
@@ -527,6 +544,7 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
         // access takes a VIEW over it (`Helper.cpp:388-431`).
         DfirUnit::Hbm
         | DfirUnit::LxVirtualIbr
+        | DfirUnit::L3Ibr
         | DfirUnit::Lx
         | DfirUnit::L0
         | DfirUnit::L3lu
@@ -571,7 +589,7 @@ pub fn residency_of(unit: DfirUnit, core: Core, corelet: Corelet) -> Residency {
         // carries NO `core` and NO `corelet`, on the same unit as an `lxlu` bound with both
         // (`dcc/test/Conversion/AgenToSentient/lx_indirect_loads_stores_composite.mlir:20,30`).
         // The `name` has no residency prefix for the same reason.
-        DfirUnit::Hbm | DfirUnit::LxVirtualIbr => Residency::Global,
+        DfirUnit::Hbm | DfirUnit::LxVirtualIbr | DfirUnit::L3Ibr => Residency::Global,
         // Depth one: one per core, `core` and no `corelet`.
         DfirUnit::Lx => Residency::Scratchpad { core },
         // Declared in the core group, so shared across its corelets: `corelet = 0`.

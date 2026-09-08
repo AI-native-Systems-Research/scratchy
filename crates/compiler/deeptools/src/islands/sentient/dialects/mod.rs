@@ -59,6 +59,30 @@ pub mod sentient;
 /// held one value type while `Op::Sentient` held another, and no printer could take both.
 pub use crate::islands::dataflow_ir::dialects::Val;
 
+/// AN `affine.for` WHOSE BODY HAS REACHED THIS RUNG — the loop [`Op::Affine`] cannot hold.
+///
+/// ⛔⛔ THE VENDOR'S OWN OUTPUT PUTS A `sentient.load_and_store` INSIDE AN `affine.for` BODY
+/// (`dcc/test/Conversion/AgenToSentient/l3-gather.mlir:33-40`), and the shared `affine::Op::For`
+/// carries `Vec<`[`crate::islands::dataflow_ir::dialects::Op`]`>` — the rung below, which has no
+/// `Sentient` arm. So [`Op::Affine`] is a loop still entirely below this rung and this is one the
+/// conversion has written a transfer statement into. The two print identically, through the one
+/// rendering in [`affine::for_header`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffineFor {
+    /// The induction variable — a region argument, so nothing defines it.
+    pub iv: Val,
+    /// The lower bound; always `0` for a time loop.
+    pub lo: affine::Bound,
+    /// The trip count.
+    pub hi: affine::Bound,
+    /// The addresses the loop carries — its `iter_args`, one per access detail.
+    pub carried: Vec<affine::Carried>,
+    /// The body, at THIS rung.
+    pub body: Vec<Op>,
+    /// `dbgName`, printed after the closing brace.
+    pub dbg_name: Option<String>,
+}
+
 /// ONE SENTIENTIR OPERATION, under the dialect that declares it.
 ///
 /// ⛔ NO `_` ARM WHERE THIS IS MATCHED. A new dialect reaching this rung must be a build error.
@@ -72,8 +96,10 @@ pub enum Op {
     Agen(agen::Op),
     /// `VectorChain.td` — computes still awaiting a `sentient.vector_*`.
     VectorChain(vectorchain::Op),
-    /// Upstream `affine` — the loop nest and the applied maps.
+    /// Upstream `affine` — the loop nest and the applied maps, body and all below this rung.
     Affine(affine::Op),
+    /// Upstream `affine` — a loop whose body holds ops of THIS rung. See [`AffineFor`].
+    AffineFor(AffineFor),
     /// Upstream `vector` — a plain access still awaiting its `sentient` form.
     Vector(vector::Op),
     /// Upstream `arith` — constants and predicates.
@@ -135,7 +161,7 @@ pub enum Op {
 fn lowered(op: &Op) -> Option<crate::islands::dataflow_ir::dialects::Op> {
     use crate::islands::dataflow_ir::dialects::Op as LowerOp;
     match op {
-        Op::Sentient(_) => None,
+        Op::Sentient(_) | Op::AffineFor(_) => None,
         Op::Dataflow(op) => Some(LowerOp::Dataflow(op.clone())),
         Op::Agen(op) => Some(LowerOp::Agen(op.clone())),
         Op::VectorChain(op) => Some(LowerOp::VectorChain(op.clone())),
@@ -179,6 +205,9 @@ pub fn raised(op: crate::islands::dataflow_ir::dialects::Op) -> Op {
 pub fn results(op: &Op) -> Vec<Val> {
     match op {
         Op::Sentient(op) => sentient::results(op),
+        // ⭐ AN `iter_args` LOOP BINDS ONE RESULT PER CARRIED ADDRESS — the same answer
+        // `affine::Op::For` gets from the rung below.
+        Op::AffineFor(loop_op) => loop_op.carried.iter().map(|c| c.result).collect(),
         other => lowered(other).map_or_else(Vec::new, |op| {
             crate::islands::dataflow_ir::dialects::results(&op)
         }),
@@ -208,6 +237,11 @@ pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
                     if let Some(found) = defining_op(val, region) {
                         return Some(found);
                     }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if let Some(found) = defining_op(val, &loop_op.body) {
+                    return Some(found);
                 }
             }
             // ⛔ A DEFINITION INSIDE A LOWER-RUNG REGION IS PROVED ABSENT, NOT ASSUMED ABSENT. The
@@ -257,6 +291,21 @@ pub fn replace_all_uses_with(scope: &mut [Op], of: Val, with: Val) {
                     replace_all_uses_with(region, of, with);
                 }
             }
+            Op::AffineFor(loop_op) => {
+                for bound in [&mut loop_op.lo, &mut loop_op.hi] {
+                    if let affine::Bound::Val(v) = bound
+                        && *v == of
+                    {
+                        *bound = affine::Bound::Val(with);
+                    }
+                }
+                for carried in &mut loop_op.carried {
+                    if carried.init == of {
+                        carried.init = with;
+                    }
+                }
+                replace_all_uses_with(&mut loop_op.body, of, with);
+            }
             other => {
                 if let Some(mut lower) = lowered(other) {
                     replace_all_uses_in_lower(&mut lower, of, with);
@@ -303,6 +352,7 @@ pub fn erase_defining_op(scope: &mut Vec<Op>, val: Val) {
                     erase_defining_op(region, val);
                 }
             }
+            Op::AffineFor(loop_op) => erase_defining_op(&mut loop_op.body, val),
             // ⛔ PROVED ABSENT, as in [`defining_op`].
             other => {
                 if let Some(op) = lowered(other)

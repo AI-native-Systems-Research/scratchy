@@ -33,6 +33,7 @@
 use std::fmt::Write as _;
 
 use crate::arch::{Bounded, Bytes, Elements};
+use crate::formats::Bits;
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
 use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
@@ -1657,8 +1658,16 @@ impl Default for ResultPorts {
 pub struct Extent {
     /// `total_elements` — HOW MANY.
     pub total_elements: Elements,
-    /// `element_size` — HOW WIDE ONE IS. ⛔ A width in bytes, not a count.
-    pub element_size: Bytes,
+    /// `element_size` — HOW WIDE ONE IS.
+    ///
+    /// ⛔⛔ **BITS**, AND IT WAS TYPED `Bytes` UNTIL THIS BATCH. Every `element_size` the reference
+    /// prints is a bit width — `memref<32xi32>` gives `element_size = 32` and `memref<64xf16>` gives
+    /// `element_size = 16` in one function (`dcc/test/Conversion/AgenToSentient/l3-gather.mlir:37`,
+    /// `:56`) — and `constructLoadAndStoreStmt` hands it `getElementWidth()`, which
+    /// [`AccessDetailsBase`](crate::bridges::dataflow_ir_to_sentient::agen_access_details::AccessDetailsBase)
+    /// already types [`Bits`]. A bit width in a `Bytes` field is exactly the confusion this island's
+    /// newtypes exist to make an E0308.
+    pub element_size: Bits,
     /// `chunk_size` — defaults to one element.
     pub chunk_size: Elements,
     /// `chunk_stride` — defaults to one element.
@@ -1671,7 +1680,7 @@ impl Extent {
     /// A TRANSFER OF `total_elements` ELEMENTS EACH `element_size` WIDE, unchunked and unbursted —
     /// the `.td`'s own defaults (`SentientOps.td:504-520`).
     #[must_use]
-    pub const fn of(total_elements: Elements, element_size: Bytes) -> Extent {
+    pub const fn of(total_elements: Elements, element_size: Bits) -> Extent {
         Extent {
             total_elements,
             element_size,
@@ -1973,8 +1982,12 @@ pub enum Op {
         results: (Val, Val),
         /// The extents.
         extent: Extent,
-        /// `$stride`.
-        stride: u32,
+        /// `$stride` — ⛔ **SIGNED**, AND IT WAS `u32` UNTIL THIS BATCH. The `.td` declares
+        /// `DefaultValuedAttr<I32Attr, "1">:$stride` and the builder takes `"int":$stride`
+        /// (`SentientOps.td:739`, `:756`), and `constructLoadAndStoreStmt` hands it `stride_step`,
+        /// whose sign IS the direction of the adjustment
+        /// ([`StrideStep`](crate::bridges::dataflow_ir_to_sentient::agen_agen_to_sentient::StrideStep)).
+        stride: i32,
         /// `$rotate_val`.
         rotate_val: Option<u32>,
         /// `$shuffle_mode`.
@@ -1987,6 +2000,13 @@ pub enum Op {
         dst_reg: Reg,
         /// `$dir`.
         dir: Option<RoutingDirection>,
+        /// `"is-ibr-write"` — the DESTINATION is an L3 image-buffer-read unit.
+        ///
+        /// ⛔ NOT AN OPERAND AND NOT IN THE `.td` ARGUMENT LIST: a discardable attribute the
+        /// conversion stamps on afterwards, named by `getIsIBRWriteAttrStrName()`
+        /// (`SentientOps.td:796`) and printed hyphenated and therefore quoted
+        /// (`dcc/test/Conversion/AgenToSentient/l3-gather.mlir:37`).
+        is_ibr_write: bool,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -2047,8 +2067,8 @@ pub enum Op {
         data_result: Val,
         /// `$total_elements` — ⛔ A COUNT.
         total_elements: Elements,
-        /// `$element_size` — ⛔ A WIDTH IN BYTES.
-        element_size: Bytes,
+        /// `$element_size` — ⛔ A WIDTH IN **BITS**; see [`Extent::element_size`].
+        element_size: Bits,
         /// The register the ADDRESS lands in — ⛔ named, not an array position.
         addr_reg: Reg,
         /// The register the DATUM lands in.
@@ -3156,6 +3176,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             src_reg,
             dst_reg,
             dir,
+            is_ibr_write,
             dbg_name,
         } => {
             let mut attrs = extent_attrs(extent);
@@ -3174,10 +3195,17 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             if let Some(direction) = dir {
                 attrs.push(attr("dir", &quoted(direction.spelling())));
             }
+            if *is_ibr_write {
+                attrs.push(attr("\"is-ibr-write\"", "1 : i8"));
+            }
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
             }
-            attrs.sort();
+            // ⛔ MLIR SORTS BY THE ATTRIBUTE'S NAME, NOT BY ITS PRINTED FORM. `"is-ibr-write"` is
+            // quoted because it is hyphenated, and a plain sort would put the quote before every
+            // letter — the vendor prints it between `element_size` and `regIndices`
+            // (`l3-gather.mlir:37`).
+            attrs.sort_by(|a, b| a.trim_start_matches('"').cmp(b.trim_start_matches('"')));
             let mut operands = format!(
                 " src({}), dst({}), src_mutable_addr({}), src_immutable_addr({}), src_inc({}), \
                  dst_mutable_addr({}), dst_immutable_addr({}), dst_inc({})",

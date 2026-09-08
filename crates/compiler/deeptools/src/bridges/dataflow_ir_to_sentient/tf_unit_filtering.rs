@@ -350,13 +350,13 @@ pub fn remove_cores_corelets_folds_from_program_unit(
 /// }
 /// ```
 ///
-/// # ⭐ NINETEEN CLASSES, TWELVE OF WHICH THIS ISLAND DECLARES
+/// # ⭐ NINETEEN CLASSES, FOURTEEN OF WHICH THIS ISLAND DECLARES
 ///
 /// The six `dataflow` ones all exist here. Of the thirteen `agen` ones, the island declares
 /// `vector_load`, `vector_store`, `composite_load_and_store`, the two symbolic vectors (entries
-/// 374/375) and `composite_memory_interleave` (entry 384's sweep). The other seven
-/// (`composite_load`, `composite_store`, the three indirect composites and the two indirect vectors)
-/// are listed in the match below as comments rather than invented: the brief's rule to grow the
+/// 374/375), `composite_memory_interleave` (entry 384's sweep) and both indirect vectors (entry 269's
+/// gather pattern). The other five (`composite_load`, `composite_store` and the three indirect
+/// composites) are listed in the match below as comments rather than invented: the brief's rule to grow the
 /// island is about a function's *input* (`AGENT-BRIEF.md:87`), and this function's input is any op at
 /// all.
 ///
@@ -379,13 +379,14 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::Receive { .. }
             | dataflow::Op::Opaque(_),
         ) => true,
-        // Seven of the thirteen `agen` classes. The six the island does not declare —
+        // Eight of the thirteen `agen` classes. The five the island does not declare —
         // `composite_load`, `composite_store`, `composite_indirect_load_and_store`,
-        // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load` —
-        // belong on this side of the answer when they land.
+        // `composite_indirect_load`, `composite_indirect_store` — belong on this side of the answer
+        // when they land.
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::IndirectVectorLoad { .. }
             | agen::Op::IndirectVectorStore { .. }
             | agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
@@ -717,11 +718,13 @@ mod unit_tests {
             elem: ElemType::F16,
         };
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(20),
             view: Val(10),
             indices: vec![Index::Const(0), Index::Const(0)],
             view_ty: view_ty.clone(),
             ty: LANES,
+            multicast_info: None,
         });
         let store = DfirOp::Agen(agen::Op::VectorStore {
             value: Val(20),
@@ -902,6 +905,7 @@ mod unit_tests {
         assert!(!is_data_transfer_to_keep(&named, None));
         // ⛔ AND A TRANSFER WITH NO `dbgName` IS NEVER KEPT — every `agen` access in this island.
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(30),
             view: Val(10),
             indices: vec![Index::Const(0)],
@@ -910,6 +914,7 @@ mod unit_tests {
                 elem: ElemType::F16,
             },
             ty: LANES,
+            multicast_info: None,
         });
         assert!(is_data_transfer(&load) && !is_data_transfer_to_keep(&load, filter.as_ref()));
     }

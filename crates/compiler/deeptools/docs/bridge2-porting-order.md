@@ -1058,8 +1058,8 @@ second site above, not the path.
 
 ⛔ **AND THE TICK COUNT UNDERSTATES THE LANDED PORTS BY 18.** Measured after the 230-253 review landed:
 257 `[x]` PORT and 257 `[x]` AUDIT boxes, 127 unticked each (257 + 127 = 384), which is what the
-Progress counter read then — it now reads 273/273, with 273-280 and 281-288 ticked by their own
-porting batches. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
+Progress counter read then — it now reads 289/289, with 265-272, 273-280 and 281-288 ticked by their
+own porting batches. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
 still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exactly that state and
 `801187bde` and `edfa7b2bb`'s review passes ticked them; `2c70786a4`'s review of 167-190 did not, so its
 span is still open on paper while its Rust is landed. Ticking them is the reviewing pass's job for those
@@ -1116,7 +1116,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`281/384 ported; 281/384 audited`
+`289/384 ported; 289/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -2304,6 +2304,76 @@ do here: it caches parent/child links of ops already built, and `ConditionalTree
 by value for `fill_partitions` to walk.
 
 
+⭐ ENTRIES 265-272 — THE AFFINE RECORD'S OWN CONSTRUCTOR, THE TIME-DIMENSION COALESCER, THE TIME
+NEST, THE `load_and_store` AND `load_and_extract_scalar` EMITTERS, THE DELETE-LIST REACH-BACK, THE
+INTERLEAVE LOWERING AND THE ADDRESS INITIALISER. 265/266 are in `agen_access_details.rs` and the other
+six in `agen_helper.rs`. 268 is one of the two emitters entry 217's `todo!` named, so the load/store
+arity gate now reaches an op instead of a hole.
+
+⛔ 265 STOPS AT THE FIRST REFUSAL (`AccessDetails.cpp:418-437`), which is what makes the
+"unresolved memory view" arms of `TransferExtents` and `AffineInitialize` unreachable from it; and its
+`constructIteratorCoefficients().failed()` test (`:435`) is dead, because entry 147 returns
+`success()` on every path. The call stays and the branch carries nothing.
+
+⛔⛔ 266 WRITES BACK **ONLY** `time_bounds` (`:786`, `:790`). The coalesced `time_offsets` drive
+the scan and are then dropped, so whoever wants the offsets has to recompute the cut. The cut is where
+source and destination offsets start to differ, and a dimension left alone by the cut has no run to
+merge — which is why the vendor's `l3-burst-calc.mlir` case still prints `[1, 32, 32]` after the pass
+rather than a single coalesced bound. Merging writes the whole run's product onto the run's INNERMOST
+dimension and `Coalesced` onto the rest, on BOTH records.
+
+⛔⛔ 267's BURST DIMENSION ENDS THE NEST (`Helper.cpp:1807`): a burst claiming dimension 0 builds
+no `affine.for` at all and its trip count becomes the transfer's own `burst_size` (`:1860`). Each child
+goes at the **start** of its parent's body (`:1855`) — `[child, const+addi per operand, yield]`, not
+creation order — and `mutable_addrs` is RESEATED IN PLACE onto the innermost region arguments
+(`:1831-1834`), which is exactly the container entry 268 then reads. An indirect operand steps by ZERO
+rather than by its own offset (`:1842-1844`). Its `int stride_step` parameter narrows an `int64_t`, so
+the port narrows too rather than clamping. `LoopBoundNotConstant` is a deliberate divergence: the
+reference's `size_t loop_bound = -1` passes its own `> 0` check.
+
+⛔⛔ 268 OVERWRITES THE IMMUTABLE ADDRESS ENTRY 214 JUST HOISTED (`:2257-2260`): for a gather the
+IBR *is* the base address, so the constant is built and then thrown away. Its two indirect offsets are
+dead — read only inside `#if !defined(TOGGLE_INDIRECT_IMPL1)`, which `Helper.cpp:34` defines out — but
+the two `emitError("Memory view index of direct src/dst must be zero.")` beside them still run, so the
+refusals are live where the values are not. `is-ibr-write` is stamped AFTER the op is built and only
+when the destination is not itself indirect (`:2337-2342`): a scatter writes the IBR through `kIndDst`
+and is not an IBR write. The insertion-point shift onto the `agen.vector_store` (`:2262-2270`) has
+nothing to represent — the pair reaches the delete list either way (`:2944-2947`).
+
+⛔ 269 CHECKS THE USER COUNT **BEFORE** IT FINDS THE GATHER (`:2420-2426`), the opposite order to its
+receive twin (entry 216), so a one-user view reports the count and not the missing gather. Entry 214 is
+called with `false, 0, 0` (`:2432-2434`) — no burst, no group — and the consumer is the unit itself
+(`getUnits()[0]`, `:2437-2442`), the form all 18 corpus programs print.
+
+⛔ 270 REACHES BACK ONE FURTHER ONLY FOR A SHUFFLE (`:2994-2995`); a receive or a bare
+`constant_bitstream` is deleted alone. It appends and never clears — one list spans a whole lowering.
+
+⛔⛔ 271 MOVES THE TRANSFERS OUT OF THE REGION EVEN WHEN NOTHING IS INTERLEAVED (`:3797-3801`),
+because the interleave op is deleted later and anything still inside would go with it. Its default
+granularity is the MAXIMUM burst, not zero (`:3783-3786`), and only the three transfer classes are
+collected (`:3791-3795`) — the yield included, everything else stays behind.
+
+⛔⛔ 272 RETURNS THE CONSTANT ALONE ON L3 (`:3841`): an L3 mutable address counts from 0 where
+every other unit counts from the memory view's own start address, so one shared arm would offset L3
+twice. The `sentient.add` operand order is `(new_start_addr, const_op)` (`:3845-3847`).
+
+⛔⛔ THE ISLAND GREW A `dbgName` TWICE, BOTH TIMES ON AGENT-BRIEF.md:87 AND BOTH TIMES WITH CORPUS
+EVIDENCE. `agen::CompositeTransfer` had no name field, so 268's `getDbgNameAttr(op)` (`:2305`) had
+nothing to copy onto the `sentient.load_and_store` and 267's `Time-Loop(<name>, t-dim N)` had nothing
+to build a loop name from (`l3-burst-calc.mlir:759`, `:364`, `:370`); and `agen::Op::VectorLoad` had
+none, so 269's copy onto the `sentient.load_and_extract_scalar` (`:2444`,
+`lx_indirect_loads_stores_composite.mlir:75`) had nothing either — 101 of the corpus's loads carry one.
+Both printers sort `dbgName` ahead of the rest of the dict, and `dbg_name`/`dbg_name_mut` gained an arm
+each ahead of the `Op::Agen(_) => None` catch-all.
+
+⛔ AND THAT SECOND WIDENING SURFACED A LANDED DEFECT: `create_new_mem_op` (entry 259) dropped the
+name its reference carries over, and its doc asserted there was nothing to inherit.
+`VectorLoadOp::cloneWithNewAccessInfo` substitutes `builder.getStringAttr("")` for an ABSENT name
+(`Agen.cpp:166`), and an empty name is not an absent one: a later `getDbgNameAttr()` on the clone is
+non-null, so `getNewDbgNameFromOp` (`Utils.cpp:492-501`) names a loop after it instead of leaving the
+loop unnamed. The clone now inherits, and its golden prints `dbgName = ""`.
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -2843,22 +2913,22 @@ by value for `fill_partitions` to walk.
 
 ## Level 3
 
-- [ ] **PORT 265/384** `constructDetails` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418`, 18 lines
-- [ ] **AUDIT 265/384** `constructDetails` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418`, line by line against the C++
-- [ ] **PORT 266/384** `coalesceTimeDimensions` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681`, 112 lines
-- [ ] **AUDIT 266/384** `coalesceTimeDimensions` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681`, line by line against the C++
-- [ ] **PORT 267/384** `constructTimeLoopsAndVectorOperations` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1789`, 109 lines
-- [ ] **AUDIT 267/384** `constructTimeLoopsAndVectorOperations` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1789`, line by line against the C++
-- [ ] **PORT 268/384** `constructLoadAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167`, 177 lines
-- [ ] **AUDIT 268/384** `constructLoadAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167`, line by line against the C++
-- [ ] **PORT 269/384** `constructLoadAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351`, 114 lines
-- [ ] **AUDIT 269/384** `constructLoadAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351`, line by line against the C++
-- [ ] **PORT 270/384** `addStoreInputToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987`, 8 lines
-- [ ] **AUDIT 270/384** `addStoreInputToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987`, line by line against the C++
-- [ ] **PORT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, 37 lines
-- [ ] **AUDIT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, line by line against the C++
-- [ ] **PORT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, 13 lines
-- [ ] **AUDIT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, line by line against the C++
+- [x] **PORT 265/384** `constructDetails` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418`, 18 lines
+- [x] **AUDIT 265/384** `constructDetails` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418`, line by line against the C++
+- [x] **PORT 266/384** `coalesceTimeDimensions` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681`, 112 lines
+- [x] **AUDIT 266/384** `coalesceTimeDimensions` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681`, line by line against the C++
+- [x] **PORT 267/384** `constructTimeLoopsAndVectorOperations` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1789`, 109 lines
+- [x] **AUDIT 267/384** `constructTimeLoopsAndVectorOperations` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1789`, line by line against the C++
+- [x] **PORT 268/384** `constructLoadAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167`, 177 lines
+- [x] **AUDIT 268/384** `constructLoadAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167`, line by line against the C++
+- [x] **PORT 269/384** `constructLoadAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351`, 114 lines
+- [x] **AUDIT 269/384** `constructLoadAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351`, line by line against the C++
+- [x] **PORT 270/384** `addStoreInputToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987`, 8 lines
+- [x] **AUDIT 270/384** `addStoreInputToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987`, line by line against the C++
+- [x] **PORT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, 37 lines
+- [x] **AUDIT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, line by line against the C++
+- [x] **PORT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, 13 lines
+- [x] **AUDIT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, line by line against the C++
 - [x] **PORT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, 180 lines
 - [x] **AUDIT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, line by line against the C++
 - [x] **PORT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, 222 lines

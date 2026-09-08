@@ -151,6 +151,23 @@ impl SendEnd {
         self.0
     }
 
+    /// THE DEGENERATE WIRE A UNIT DRIVES TO ITSELF — *"Consumer for LoadAndExtractScalarOp is
+    /// self"* (`Helper.cpp:2437-2442`).
+    ///
+    /// ⛔⛔ NOT EXPRESSIBLE AS A [`Link`], AND DELIBERATELY SO. A `Link<A, B>` joins two units and
+    /// hands out one send and one receive; `sentient.load_and_extract_scalar` names the unit it is
+    /// ITSELF running on as its `$consumer` and there is no receive anywhere to pair with. The
+    /// vendor prints exactly that — `consumer(%arg0)` inside the program unit bound by `%arg0`
+    /// (`dcc/test/Conversion/AgenToSentient/lx_indirect_loads_stores_composite.mlir:34`).
+    ///
+    /// ⛔ SO IT IS A NAMED CONSTRUCTOR AND NOT `SendEnd(val)`: the only two ways to obtain an end
+    /// stay [`Link::ends`] and this, and reaching for this one says in the source that the wire is a
+    /// self-loop rather than a pairing someone forgot to make.
+    #[must_use]
+    pub const fn to_self(unit: Val) -> SendEnd {
+        SendEnd(unit)
+    }
+
     /// THE END'S VALUE, MUTABLY — for RENUMBERING ONLY.
     ///
     /// ⛔ THIS DOES NOT REPAIR THE WIRE, AND IT IS NOT A PUBLIC SETTER. A clone rewrites every value

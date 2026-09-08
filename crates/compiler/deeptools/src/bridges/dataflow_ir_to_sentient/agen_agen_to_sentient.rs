@@ -307,6 +307,16 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             Consumed(1)
         }
 
+        // ── 6. `agen.indirect_vector_load` (`AgenToSentient.cpp:109-115`) ───────────────────────
+        //
+        // ⛔ NO EXTRACT PREDICATE HERE EITHER, and the pairing is why: the gather reads the address
+        // `e269`'s `sentient.load_and_extract_scalar` put in a register, found by the `extract_idx`
+        // the two of them share.
+        agen::Op::IndirectVectorLoad { .. } => todo!(
+            "e316_lowerIndirectVectorLoadOp: an agen.indirect_vector_load on {:?}",
+            unit.on.kind()
+        ),
+
         // ── 7. `agen.indirect_vector_store` (`AgenToSentient.cpp:116-122`) ──────────────────────
         //
         // ⛔ NO PREDICATE ON THIS ARM. Unlike the plain store it is not asked whether it is an extract
@@ -369,6 +379,7 @@ fn is_candidate(op: &agen::Op) -> bool {
     match op {
         agen::Op::VectorLoad { .. }
         | agen::Op::VectorStore { .. }
+        | agen::Op::IndirectVectorLoad { .. }
         | agen::Op::IndirectVectorStore { .. }
         | agen::Op::CompositeLoadAndStore(_)
         | agen::Op::SymbolicVectorLoad { .. }
@@ -1226,6 +1237,7 @@ impl TransferComp {
             | DfirUnit::PeState
             | DfirUnit::SfpRing
             | DfirUnit::LxVirtualIbr
+            | DfirUnit::L3Ibr
             | DfirUnit::CrossPtnLink => None,
         }
     }

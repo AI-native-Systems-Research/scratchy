@@ -1261,6 +1261,7 @@ mod unit_tests {
     /// takes one because the reference's constructor does.
     fn fixture_load() -> agen::Op {
         agen::Op::VectorLoad {
+            dbg_name: None,
             result: Val(2),
             view: Val(1),
             indices: vec![Index::Const(64), Index::Val(Val(3)), Index::Val(Val(4))],
@@ -1272,6 +1273,7 @@ mod unit_tests {
                 len: 64,
                 elem: ElemType::F16,
             },
+            multicast_info: None,
         }
     }
 

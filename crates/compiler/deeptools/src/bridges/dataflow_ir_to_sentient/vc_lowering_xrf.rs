@@ -1255,6 +1255,7 @@ fn viewed_unit_is_xrf(from_unit: Val, scope: &[DfirOp]) -> bool {
             | DfirUnit::PeState
             | DfirUnit::SfpRing
             | DfirUnit::LxVirtualIbr
+            | DfirUnit::L3Ibr
             | DfirUnit::CrossPtnLink => false,
         },
 

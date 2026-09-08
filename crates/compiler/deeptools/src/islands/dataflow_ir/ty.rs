@@ -56,6 +56,8 @@ pub enum GenericComp {
     /// `LXVIRTUALIBR` — the LX virtual indirection base register, its own image
     /// (`arch_enums.cpp:209`): the map sends `LXVIRTUALIBR` to `LXVIRTUALIBR`.
     LxVirtualIbr,
+    /// `L3IBR` — the L3 indirection base register, its own image (`arch_enums.cpp:208`).
+    L3Ibr,
     /// `CROSSPTNLINK` — the link out of this partition.
     CrossPtnLink,
     /// `SFPSTATE`.
@@ -229,6 +231,7 @@ impl ElemType {
                 | GenericComp::L3su
                 | GenericComp::Hbm
                 | GenericComp::LxVirtualIbr
+                | GenericComp::L3Ibr
                 | GenericComp::CrossPtnLink
                 | GenericComp::SfpState
                 | GenericComp::PeState
