@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "PORT campaign: bridge 1 of IBM Spyre deeptools — SuperDSC -> DataflowIR.",
+    "The scope is ONE self-contained translation unit, cpp/bridge1.cpp, holding the 110 function",
+    "bodies to port, extracted verbatim from the authority tree and each preceded by a banner",
+    "giving its entry number and its ORIGINAL <file>:<line>.",
+    "",
+    "There is no MLIR, LLVM or dcc header anywhere in this campaign. cpp/prelude.inc catalogues the",
+    "names the bodies reach so the unit stands alone; it carries names and shapes only — the",
+    "behaviour to port lives in the bodies."
+  ],
+  "campaign_objective": "port",
+  "impl_files": ["crustify-bridge1/cpp/bridge1.cpp"],
+  "api_headers": [],
+  "_comment_scope": [
+    "TWO COMPONENTS, 110 units, 7633 declaration lines:",
+    "",
+    "  106  dsc-based-utils/DSC2ToDataflowIR — THE conversion. Its header guard is literally",
+    "       SUPERDSCTODATAFLOWIR and its constructor is",
+    "       DSC2ToDataflowIR(SuperDsc*, MLIRContext&, bool uniformization, const DesignSpaceConfigGlobal&).",
+    "       Per file: SNTransferLowering.cpp 29, SNComputeLowering.cpp 18, SNControlFlowLowering.cpp 14,",
+    "       DSC2ToDataflowIRUtils.hpp 11, DSC2ToDataflowIR.cpp 11, SNDSCLowering.cpp 12,",
+    "       SNSyncLowering.cpp 4, DataflowIRConstructionUtils.hpp 6, SNStickMaskLowering.cpp 1.",
+    "",
+    "    4  the DDL compiler's DERIVATIONS, which the conversion does NOT call — in the reference they",
+    "       run before a SuperDsc exists, so a call graph rooted at the conversion is blind to them.",
+    "       They are named explicitly because scratchy currently INVENTS them in",
+    "       crates/compiler/deeptools/src/islands/.../shape.rs, and removing that is why this",
+    "       campaign exists:",
+    "         checkConstraints            ddc/ddcv1.cpp:792   130L  — a LAMBDA nested in",
+    "                                     Ddc::exploreAssignDataStages, and it lexically CONTAINS",
+    "                                     checkConstraintsImpl (:825, 82L), so one unit covers both.",
+    "                                     Called at :967, :1191, :1194, :1377.",
+    "         createDataConnectMetadata   ddc/ddcv1.cpp:3283   45L  — the PORT IDENTITY.",
+    "         getCumulativeStickSizes     dsc/dsc2.cpp:4109    16L",
+    "         getStickSizes               dsc/dsc2.cpp:4066    23L"
+  ],
+  "_comment_scope_correction": [
+    "⚠ A CORRECTION TO THE CAMPAIGN BRIEF, MEASURED. The brief lists getCumulativeStickSizes as",
+    "'verified present' in ddc/ddcv1.cpp at :789 and :1723. Those are CALL SITES on a `currDsc`",
+    "object. The DEFINITION is DesignSpaceConfig::getCumulativeStickSizes at dsc/dsc2.cpp:4109",
+    "(declared dsc/designSpaceConfig.h:260), and its body is a 6-line fold over getStickSizes —",
+    "so getStickSizes at dsc/dsc2.cpp:4066 carries the actual per-dim stick arithmetic and is in",
+    "scope with it. That is 2 units from `dsc/`, which the brief otherwise declares out of scope;",
+    "the rest of the 39,440-line dsc data model stays out.",
+    "",
+    "Also measured: ddc/ddcv1.cpp holds 25 top-level definitions totalling 3,705 of its 3,818 lines,",
+    "and 21 named lambdas nested inside them. Only the 2 named above are in scope; the other 23",
+    "top-level functions are the DDL compiler's own allocation and scheduling passes, which run",
+    "before a SuperDsc exists and which scratchy does not reimplement."
+  ],
+  "out_of_scope": {
+    "paths": ["crustify-bridge1/cpp/prelude.inc"],
+    "features": []
+  },
+  "_comment_excluded": [
+    "19 further inline definitions live in the conversion's headers and are NOT units, by the same",
+    "criterion bridge 2 used — what scratchy's architecture will never need, not what is unfinished:",
+    "  16  1-3 line field accessors over a member (getCoreId, getUnitOp, getComponent, ...) — a",
+    "      struct field in Rust, not a function.",
+    "   1  stringifyComputePrecision (DSC2ToDataflowIR.hpp:54, 18L) — a ComputeOpType -> string",
+    "      table. In this crate a closed set is an enum and NEVER a string.",
+    "   1  cloneSNDSCLoweringObject (V3/SNDSCLowering.hpp:71, 10L) — copies the lowering object; the",
+    "      Rust port threads a value and there is no object to clone.",
+    "   1  getFromLatchMap (V3/SNDSCLowering.hpp:134, 8L) — a map lookup; the operand-reaching",
+    "      mechanism the campaign brief explicitly allows dropping.",
+    "",
+    "Nothing is excluded for being hard. The 844-line fillLoopOffsetsAndAddresses-style bodies of",
+    "the conversion are all IN scope."
+  ]
+}

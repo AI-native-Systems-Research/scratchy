@@ -1,0 +1,596 @@
+{
+  "schema_version": 3,
+  "oracle_config": {
+    "path": "crustify/campaigns/bridge1/levels2-4-transfer-and-compute/wavefront-config.json",
+    "sha256": "f364aa69e2ce998d8e7942f84d2427ab196024d56fa118f6e43dc3678e74ca79"
+  },
+  "api_headers_only": false,
+  "budgets": {
+    "max_syms": 24,
+    "max_loc": 960,
+    "max_types": 5,
+    "min_fields": 20
+  },
+  "summary": {
+    "unit_count": 27,
+    "layer_count": 1,
+    "batch_count": 2,
+    "file_count": 1
+  },
+  "waves": [
+    {
+      "unit_count": 27,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e072_createUniformizedGetUnitOp",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 42,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e073_buildNeighborUnits",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 213,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e074_getBlockingOrStreamingBufferLoopLocations",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 46,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e075_constructLoopIterArgs",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 91,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e076_constructSyncOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 69,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e077_constructElementsOfAgenDataTransfer",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 68,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e078_constructElementsOfAgenCompositeDataTransfer",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 94,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e079_constructElementsOfAffineDataTransferViaAgenTransfer",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 77,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e080_constructStreamingOrDoubleBufferingLoad",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 347,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e081_GenerateReceiveAndSendFromDataTransferNode",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 66,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e082_ConstructSAMVOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 2,
+              "loc": 96,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e083_buildUniformizedNeighborUnits",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 239,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e072_createUniformizedGetUnitOp",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e084_initializeUnit",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 33,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e073_buildNeighborUnits",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e085_initializeUnit",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 22,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e086_constructComputeInputOperandAndAddToList",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 320,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e079_constructElementsOfAffineDataTransferViaAgenTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e087_constructComputeOutputOperand",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 139,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e079_constructElementsOfAffineDataTransferViaAgenTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e088_constructLoopsRecursive",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 324,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e075_constructLoopIterArgs",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e089_constructStreamingOrDoubleBufferingStore",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 185,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e077_constructElementsOfAgenDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e090_GenerateLoadAndSendFromDataTransferNode",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 274,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e078_constructElementsOfAgenCompositeDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e077_constructElementsOfAgenDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e080_constructStreamingOrDoubleBufferingLoad",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e091_GenerateLoadAndStoreFromDataTransferNode",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 132,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e077_constructElementsOfAgenDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e092_GenerateDataTransfersForViaIfSo",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 3,
+              "loc": 52,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e081_GenerateReceiveAndSendFromDataTransferNode",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e093_initializeUniformizedUnit",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 47,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e083_buildUniformizedNeighborUnits",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e094_constructComputeOutputOperands",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 14,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e087_constructComputeOutputOperand",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e095_constructFMINorFMAXOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 86,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e086_constructComputeInputOperandAndAddToList",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e087_constructComputeOutputOperand",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        },
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e096_constructLoops",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 27,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e088_constructLoopsRecursive",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e074_getBlockingOrStreamingBufferLoopLocations",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e097_GenerateReceiveAndStoreFromDataTransferNode",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 269,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e078_constructElementsOfAgenCompositeDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e077_constructElementsOfAgenDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e089_constructStreamingOrDoubleBufferingStore",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e098_GenerateDataTranferForSrc",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 4,
+              "loc": 34,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e090_GenerateLoadAndSendFromDataTransferNode",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e091_GenerateLoadAndStoreFromDataTransferNode",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

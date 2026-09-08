@@ -1,0 +1,38 @@
+{
+ "_comment": [
+  "Narrow inventory for sub-campaign `levels2-4-transfer-and-compute`: bridge1.cpp LEVEL(S) [2, 3, 4] -- 27 of the span's 110 functions (L2=11, L3=10, L4=6).",
+  "the transfer and compute statements: the load/store/send shuffles, the bit-stream constants, the vector chains",
+  "impl_files is the same single translation unit as the campaign-wide config (the campaign has exactly one); the NARROWING is the level range above, which is what the schedules beside this file select. Every producer level lands before this one starts."
+ ],
+ "campaign_objective": "port",
+ "impl_files": [
+  "crustify-bridge1/cpp/bridge1.cpp"
+ ],
+ "api_headers": [],
+ "out_of_scope": {
+  "paths": [
+   "crustify-bridge1/cpp/prelude.inc"
+  ],
+  "features": []
+ },
+ "_comment_authority": [
+  "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
+  "  /Users/nickm/git/deeptools-src   (repo_info.txt: deeptools|master|a0d29abbedfa2dd44ec7255e59440b06a429118c)",
+  "which is exactly the revision every banner cites.",
+  "",
+  "\u2705 THIS EXTRACT IS VERIFIED UNTRUNCATED. All 110 bodies were checked by an INDEPENDENT",
+  "verifier (tools/verify_extract.py) that re-derives each function's end from the authority by",
+  "its own brace matcher and compares LENGTHS and CONTENT -- it never re-slices with the",
+  "extractor's own (file, line, length), which is the tautology that hid bridge 2's truncation of",
+  "366 of 384 bodies. Two negative controls confirm the check fails when a body IS truncated:",
+  "a tail cut re-balanced with a bare `}` (caught: 'extract body never closes') and a",
+  "brace-balanced 4-line cut from the middle (caught: LENGTH MISMATCH 85 vs 81 lines).",
+  "",
+  "\u26d4 /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+ ],
+ "_comment_levels": [
+  2,
+  3,
+  4
+ ]
+}
