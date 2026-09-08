@@ -39,13 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e034_constructLogicalMemoryViewOp
-// crustify:todo: e035_constructTimeOrder
-// crustify:todo: e036_constructTimeAddressMap
-// crustify:todo: e037_getImmediateParentWithMatchingDim
-// crustify:todo: e038_areEpiloguesInTransferSizes
-// crustify:todo: e039_construct2B16BLoadShuffle
-// crustify:todo: e040_construct2B16BStoreShuffle
 // crustify:todo: e077_constructElementsOfAgenDataTransfer
 // crustify:todo: e078_constructElementsOfAgenCompositeDataTransfer
 // crustify:todo: e079_constructElementsOfAffineDataTransferViaAgenTransfer
@@ -72,10 +65,11 @@ use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary};
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, arith, defining_op, scf, vectorchain,
+    Op as DfirOp, Val, affine, arith, dataflow, defining_op, scf, vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{
-    AffineExpr, AffineMap, Constraint, GenericComp, IntegerSet, ScalarTy, TensorCategory, Vector,
+    AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, MemRef, ScalarTy,
+    TensorCategory, Vector,
 };
 use crate::units::{Core, Corelet};
 
@@ -331,6 +325,96 @@ pub fn construct_base_address(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+// 034/110 — THE VIEW A TRANSFER ADDRESSES THROUGH
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE VIEW ENTRY 034 EMITTED, PLUS THE TWO FACTS ITS CALLERS READ BACK OFF THE OP
+/// (`view.getLayoutMap().getNumDims()` at `SNTransferLowering.cpp:436`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalMemoryView {
+    /// The `get_logical_memory_view` result.
+    pub result: Val,
+    /// `view.getLayoutMap()`.
+    pub layout: AffineMap,
+    /// `view.getType()`.
+    pub ty: MemRef,
+}
+
+/// Replaces: e034_constructLogicalMemoryViewOp
+///
+/// THE `dataflow.get_logical_memory_view` A TRANSFER ADDRESSES THROUGH — the view sizes as extents,
+/// linearised with the FIRST dim fastest (`SNTransferLowering.cpp:94-125`).
+///
+/// ⛔⛔ THE STRIDE OF `d0` IS 1 AND EVERY LATER DIM IS SLOWER, because `size` multiplies AFTER dim
+/// `i`'s term (`:1204` of the extract): a `(4, 8)` view is `(d0, d1) -> (d1 * 4 + d0)`, NOT the
+/// `(d0 * 8 + d1)` that [`AffineMap::linear`]'s ascending stride list builds from the same extents.
+///
+/// ⛔ THE NEW TERM GOES ON THE **LEFT** OF THE ACCUMULATOR, so the printed sum descends and nests to
+/// the right: `d2 * 32 + (d1 * 4 + d0)`.
+///
+/// ⛔ `bypass_viewsizes` KEEPS THE EXTENTS AND REPLACES ONLY THE LAYOUT (`:1210`) — a rank-`n` memref
+/// carrying the rank-1 identity map, which is what `:436` then counts.
+///
+/// ⚠️ [`None`] IS AN EXTENT THAT IS NOT A COUNT: the reference's `int size` accumulator overflows
+/// where this one stops, and a negative `size_` is a dynamic-extent sentinel to `MemRefType`.
+#[must_use]
+pub fn logical_memory_view(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    view_sizes: &[ViewSize],
+    storage_unit: Val,
+    start_address: Val,
+    elem: ElemType,
+    bypass_view_sizes: bool,
+) -> Option<LogicalMemoryView> {
+    let mut stride: i64 = 1;
+    let mut extents = Vec::with_capacity(view_sizes.len());
+    let mut layout_expr = AffineExpr::Const(0);
+    for (i, view) in view_sizes.iter().enumerate() {
+        let dim = AffineExpr::dim(u32::try_from(i).ok()?);
+        // `getAffineBinaryOpExpr(Mul, getAffineConstantExpr(size), dim)` — `simplifyMul` moves the
+        // constant to the right and folds `* 1` and `* 0`.
+        let term = match stride {
+            0 => AffineExpr::Const(0),
+            1 => dim,
+            _ => dim.times(stride),
+        };
+        // `getAffineBinaryOpExpr(Add, mul_expr, layout_expr)`, whose only fold here is `x + 0`.
+        layout_expr = match (term, layout_expr) {
+            (AffineExpr::Const(0), acc) => acc,
+            (new, AffineExpr::Const(0)) => new,
+            (new, acc) => new.plus(acc),
+        };
+        stride = stride.checked_mul(view.size)?;
+        extents.push(u64::try_from(view.size).ok()?);
+    }
+
+    let layout = if bypass_view_sizes {
+        // `AffineMap::getMultiDimIdentityMap(1, ..)`.
+        AffineMap::identity(1)
+    } else {
+        AffineMap {
+            dims: u32::try_from(view_sizes.len()).ok()?,
+            syms: 0,
+            results: vec![layout_expr],
+        }
+    };
+    let ty = MemRef {
+        shape: extents,
+        elem,
+    };
+    let result = vals.mint();
+    ops.push(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+        result,
+        from: storage_unit,
+        start: start_address,
+        layout: layout.clone(),
+        ty: ty.clone(),
+    }));
+    Some(LogicalMemoryView { result, layout, ty })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 // 066 + 069/110 — THE ONE FACT BOTH FUNCTIONS READ OFF AN ALREADY-EMITTED LOOP
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -487,6 +571,93 @@ pub fn time_set(loops: &[LoopBound]) -> Option<IntegerSet> {
 #[must_use]
 pub fn epilogues_in_loops(loops: &[LoopBound]) -> bool {
     loops.contains(&LoopBound::Dynamic)
+}
+
+/// Replaces: e035_constructTimeOrder
+///
+/// THE TIME ORDER OF A COMPOSITE TRANSFER — the REVERSAL permutation over its loops,
+/// `(d0, .., dn) -> (dn, .., d0)` (`SNTransferLowering.cpp:206-217`).
+///
+/// ⛔⛔ IT RETURNS `LogicalResult::failure()` UNCONDITIONALLY (`:216`) AND HAS NO CALLER IN THE TREE.
+/// The map it writes to its out-parameter is therefore the whole of its behaviour; answering [`None`]
+/// to mirror the failure would leave it with none at all.
+///
+/// ⚠️ AN EMPTY LOOP LIST IS [`None`] — `AffineMap::getPermutationMap({})` asserts on an empty
+/// permutation vector (`mlir/lib/IR/AffineMap.cpp:262`), so a zero-loop transfer has no time order
+/// rather than the zero-dim map. The loop list is read for its LENGTH only.
+#[must_use]
+pub fn time_order(composite_loops: usize) -> Option<AffineMap> {
+    if composite_loops == 0 {
+        return None;
+    }
+    let dims = u32::try_from(composite_loops).ok()?;
+    Some(AffineMap {
+        // `getMultiDimMapWithTargets(*max_element(permutation) + 1, ..)`.
+        dims,
+        syms: 0,
+        results: (0..dims).rev().map(AffineExpr::dim).collect(),
+    })
+}
+
+/// ONE ENTRY OF `TransferNode::UnitView::LoopInfo` AS THE TIME ADDRESS MAP READS IT
+/// (`dsc/dsc2.h:500-505`).
+///
+/// ⛔ NOT [`LoopStride`], WHOSE `size_idx` CANNOT BE `-1` AND WHOSE `iv` IS A VALUE: here the loop's
+/// dimension is POSITIONAL — `dims[i]`, the map's own `d<i>` — and `-1` is a loop that addresses
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeLoop {
+    /// `sizeIdx_` — [`None`] is the reference's `-1`.
+    pub size_idx: Option<usize>,
+    /// `elemOffset_`, in elements.
+    pub elem_offset: i64,
+}
+
+/// Replaces: e036_constructTimeAddressMap
+///
+/// THE ADDRESS ONE TIME STEP LANDS AT — one result per OUTPUT dim, summing each composite loop's own
+/// `d<i>` times its element offset (`SNTransferLowering.cpp:224-252`).
+///
+/// ⛔⛔ THE DIMENSION IS THE LOOP'S POSITION, NOT ITS `sizeIdx_` (`:1261` of the extract):
+/// `base_address_exprs[idx] + elemOffset * dims[i]` reads `i` for the variable and `idx` only for
+/// which result it lands in, so two loops addressing one dim accumulate into one result.
+///
+/// ⛔ A RESULT NO LOOP ADDRESSES STAYS THE CONSTANT `0` (`:1250-1252`) — the map's arity is
+/// `output_dims`, never the loop count.
+///
+/// ⚠️ [`None`] IS THE REFERENCE'S OUT-OF-BOUNDS READ: `dims[i]` for `i >= input_dims` and
+/// `base_address_exprs[idx]` for `idx >= output_dims` are both unchecked there.
+#[must_use]
+pub fn time_address_map(
+    input_dims: u32,
+    output_dims: usize,
+    composite_loops: &[CompositeLoop],
+) -> Option<AffineMap> {
+    let mut results = vec![AffineExpr::Const(0); output_dims];
+    for (i, walk) in composite_loops.iter().enumerate() {
+        let Some(idx) = walk.size_idx else {
+            continue;
+        };
+        let dim = AffineExpr::dim(u32::try_from(i).ok().filter(|at| *at < input_dims)?);
+        let term = match walk.elem_offset {
+            0 => AffineExpr::Const(0),
+            1 => dim,
+            offset => dim.times(offset),
+        };
+        let slot = results.get_mut(idx)?;
+        // `expr + term`, with `simplifyAdd`'s constant-lhs canonicalisation: `0 + t` is `t`.
+        *slot = match (slot.clone(), term) {
+            (AffineExpr::Const(0), new) => new,
+            (acc, AffineExpr::Const(0)) => acc,
+            (acc, new) => acc.plus(new),
+        };
+    }
+    Some(AffineMap {
+        // `AffineMap::get(input_dims, 0, base_address_exprs, context)`.
+        dims: input_dims,
+        syms: 0,
+        results,
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -647,6 +818,70 @@ pub fn load_or_store_set(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+// 037/110 — THE NEAREST LOOP WALKING A DIM AT THE STAGE THIS TRANSFER NEEDS
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE FOUR `dataStageDimToVal_compView_st(dim, comp_)` READINGS ONE LOOP NODE ANSWERS FOR ONE DIM —
+/// its `denId_` stage's start and end slice, and its `numId_` stage's.
+///
+/// ⛔ [`None`] IS THE REFERENCE'S `-1`, and on the QUERYING node it means *matches anything*:
+/// `is_any_of(ss_val, -1, p_den_ss_val)` (`SNTransferLowering.cpp:694`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DimStageVals {
+    /// `ss_` of `denId_`.
+    pub den_ss: Option<i32>,
+    /// `el_` of `denId_`.
+    pub den_el: Option<i32>,
+    /// `ss_` of `numId_`.
+    pub num_ss: Option<i32>,
+    /// `el_` of `numId_`.
+    pub num_el: Option<i32>,
+}
+
+/// ONE NODE OF THE `getOwnerLoop()` CHAIN, as far as entry 037 reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DimChainNode<'a, N> {
+    /// The node itself — what the reference returns.
+    pub node: &'a N,
+    /// `dims_`, where MEMBERSHIP is the whole test — unlike
+    /// [`super::control_flow::parent_loop`]'s slice equality.
+    pub dims: &'a [PrimaryDim],
+    /// The four readings, for the dim being asked about.
+    pub stages: DimStageVals,
+}
+
+/// Replaces: e037_getImmediateParentWithMatchingDim
+///
+/// THE NEAREST NODE THAT WALKS `dim` AT THE QUERY'S OWN `denId_` SLICE AND WHOSE `numId_` STAGE DOES
+/// NOT SPLIT (`SNTransferLowering.cpp:670-702`).
+///
+/// ⛔⛔ THE QUERY IS THE CHAIN HEAD'S OWN `denId_` READING (`:676-680`) — which is why it is not a
+/// separate argument. `auto *parent = node` starts the walk AT the node, so a node that walks the dim
+/// itself is its own answer and the name *parent* is not a claim about the result.
+///
+/// ⛔ THE `numId_` TEST IS ON THE **CANDIDATE**, NOT THE QUERY (`:695`): `p_num_ss == p_num_el` rejects
+/// an ancestor whose numerator stage differs between start and end, however well its `denId_` matches.
+///
+/// The chain is mechanism — `getOwnerLoop()`'s null root — so `chain` IS it, NEAREST FIRST, and empty
+/// for the reference's null node (`:672`).
+#[must_use]
+pub fn immediate_parent_with_matching_dim<'c, N>(
+    chain: &'c [DimChainNode<'c, N>],
+    dim: PrimaryDim,
+) -> Option<&'c N> {
+    let query = chain.first()?.stages;
+    chain
+        .iter()
+        .find(|candidate| {
+            candidate.dims.contains(&dim)
+                && (query.den_ss.is_none() || query.den_ss == candidate.stages.den_ss)
+                && (query.den_el.is_none() || query.den_el == candidate.stages.den_el)
+                && candidate.stages.num_ss == candidate.stages.num_el
+        })
+        .map(|candidate| candidate.node)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 // 068/110 — THE LOOPS A CONTIGUOUS TRANSFER NEEDS THAT NO SCHEDULE LOOP SUPPLIES
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -745,6 +980,23 @@ impl ContiguousSticks {
             .find(|(walked, _)| *walked == dim)
             .map(|(_, counts)| counts)
     }
+}
+
+/// Replaces: e038_areEpiloguesInTransferSizes
+///
+/// DOES ANY DIM'S STEADY-STATE STICK COUNT DISAGREE WITH ITS EPILOGUE'S — the per-dim twin of
+/// [`epilogues_in_loops`] (`SNTransferLowering.cpp:1491-1502`).
+///
+/// ⛔⛔ A DIM WHERE NEITHER COUNT EXCEEDS ONE CANNOT REPORT AN EPILOGUE: the outer test is
+/// `ss_val > 1 || el_val > 1` (`:1497`), so `(1, 0)` — one steady stick and none in the epilogue — is
+/// skipped before the inequality is asked. Testing `ss != el` alone would answer `true` there.
+///
+/// ⚠️ THE WHOLE-TRANSFER PAIR IS NOT READ, only `src_sticks_ss_per_dim` and its `_el` twin.
+#[must_use]
+pub fn epilogues_in_transfer_sizes(sticks: &ContiguousSticks) -> bool {
+    sticks.per_dim.iter().any(|(_, counts)| {
+        (counts.steady > 1 || counts.epilogue > 1) && counts.steady != counts.epilogue
+    })
 }
 
 /// ONE LOOP ENTRY 068 DECIDED TO BUILD — `ScheduleNode::UnitView::LoopInfo` (`dsc/dsc2.h:500`)
@@ -1125,6 +1377,108 @@ pub fn emit_implicit_loops_for_contiguous_transfer<'s>(
     }
 
     Some(ImplicitNest { ops: current, ivs })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 039 + 040/110 — THE 2B/16B SHUFFLES, WHOSE ARM TABLE IS THE SAME IN BOTH DIRECTIONS
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH `(element type, width, replication)` TRIPLES THE 2B/16B TABLE ADMITS — the nine arms both
+/// directions list, identically (`SNTransferLowering.cpp:1786-1861` and `:1873-1948`), read against
+/// the RESULT's element count for a load and against the quotient for a store.
+///
+/// ⛔⛔ `isF16()` IS NOT `bf16` (`:1786`): a bf16 transfer matches no arm at all and gets no shuffle,
+/// which is the reference's default-constructed — null — `ShuffleOp` and [`None`] here.
+fn is_2b16b_arm(elem: ElemType, width: u64, replication: i64) -> bool {
+    match elem {
+        ElemType::F16 | ElemType::Int(16) => {
+            matches!((width, replication), (1, 64) | (16, 8) | (8, 8))
+        }
+        ElemType::Int(8) => matches!((width, replication), (2, 64) | (32, 8)),
+        ElemType::Int(4) => matches!((width, replication), (4, 64) | (64, 8)),
+        ElemType::F32 => matches!((width, replication), (4, 8) | (32, 1)),
+        _ => false,
+    }
+}
+
+/// Replaces: e039_construct2B16BLoadShuffle
+///
+/// THE SPLAT THAT WIDENS A LOAD TO ITS REPLICATED WIDTH — `indices = [0 .. elements_total)` and
+/// `repetition = replicationFactor` on every one of the nine arms (`SNTransferLowering.cpp:1778-1863`).
+///
+/// ⛔⛔ THE INDEX LIST IS THE INPUT'S WHOLE WIDTH AND THE RESULT IS `rf` TIMES IT (`:1783-1785`),
+/// which is exactly the relation `ShuffleOp::verify` enforces — `num_elements == indices.size() *
+/// repetition` (`dataflow-scheduler/lib/Dialect/VectorChain/IR/VectorChain.cpp:198-211`).
+///
+/// ⚠️ THE `dbgName` SET FROM `transfer_->name_` HAS NO FIELD ON [`vectorchain::Op::Shuffle`] — the
+/// same gap entry 070 records.
+#[must_use]
+pub fn construct_2b16b_load_shuffle(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    load_result: Val,
+    result_ty: Vector,
+    replication: Replication,
+) -> Option<Val> {
+    let elements_total = result_ty.len;
+    if !is_2b16b_arm(result_ty.elem, elements_total, replication.get()) {
+        return None;
+    }
+    let result = vals.mint();
+    ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
+        result,
+        input: load_result,
+        indices: (0..i32::try_from(elements_total).ok()?).collect(),
+        repetition: u32::try_from(replication.get()).ok()?,
+        input_ty: result_ty,
+        // `constructVectorType(element_type, replicationFactor * elements_total)`.
+        ty: Vector {
+            len: elements_total.checked_mul(u64::try_from(replication.get()).ok()?)?,
+            elem: result_ty.elem,
+        },
+    }));
+    Some(result)
+}
+
+/// Replaces: e040_construct2B16BStoreShuffle
+///
+/// THE SHUFFLE THAT NARROWS REPLICATED DATA BACK TO ONE STORE'S WIDTH — `element_size =
+/// getNumElements(result_type) / replicationFactor` indices, and `repetition = 1`
+/// (`SNTransferLowering.cpp:1865-1949`).
+///
+/// ⛔⛔ DELIBERATE DIVERGENCE, ONE ARM OF NINE: the f32 `element_size == 4 && rf == 8` arm writes
+/// `repetition = 8` (`:1937`) where the other eight write 1, and `4 != 4 * 8` is precisely what
+/// `ShuffleOp::verify` rejects (`VectorChain.cpp:198-211`) — an op the reference cannot round-trip
+/// through its own verifier. This emits 1, as every other arm does.
+///
+/// ⚠️ THE DIVISION IS THE REFERENCE'S TRUNCATING ONE, and it is the QUOTIENT — not the input width —
+/// that the arm table is read against.
+#[must_use]
+pub fn construct_2b16b_store_shuffle(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    data: Val,
+    result_ty: Vector,
+    replication: Replication,
+) -> Option<Val> {
+    let element_size = result_ty.len / u64::try_from(replication.get()).ok()?;
+    if !is_2b16b_arm(result_ty.elem, element_size, replication.get()) {
+        return None;
+    }
+    let result = vals.mint();
+    ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
+        result,
+        input: data,
+        indices: (0..i32::try_from(element_size).ok()?).collect(),
+        repetition: 1,
+        input_ty: result_ty,
+        // `constructVectorType(element_type, element_size)`.
+        ty: Vector {
+            len: element_size,
+            elem: result_ty.elem,
+        },
+    }));
+    Some(result)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2182,5 +2536,317 @@ mod unit_tests {
         assert_eq!(fp16(Vec::new()), None);
         assert_eq!(fp16(vec![Vec::new()]), None);
         assert_eq!(fp16(vec![vec![1], vec![1, 2]]), None);
+    }
+
+    /// 🎯 034/110 — ⛔ THE FIRST DIM IS THE FASTEST, and a bypassed layout keeps the extents.
+    ///
+    /// A `(4, 8, 2)` view whose `d0` strided by 8 or 32 instead of 1 addresses the wrong element of
+    /// every transfer that reaches this view.
+    #[test]
+    fn the_view_layout_strides_the_first_dim_by_one_and_nests_to_the_right() {
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let sizes = [
+            ViewSize {
+                dim: PrimaryDim::Out,
+                size: 4,
+            },
+            ViewSize {
+                dim: PrimaryDim::Y,
+                size: 8,
+            },
+            ViewSize {
+                dim: PrimaryDim::X,
+                size: 2,
+            },
+        ];
+
+        let got = logical_memory_view(
+            &mut vals,
+            &mut ops,
+            &sizes,
+            Val(50),
+            Val(51),
+            ElemType::F16,
+            false,
+        )
+        .expect("three positive extents");
+
+        assert_eq!(
+            got.ty,
+            MemRef {
+                shape: vec![4, 8, 2],
+                elem: ElemType::F16,
+            }
+        );
+        assert_eq!(
+            got.layout,
+            AffineMap {
+                dims: 3,
+                syms: 0,
+                results: vec![
+                    AffineExpr::dim(2)
+                        .times(32)
+                        .plus(AffineExpr::dim(1).times(4).plus(AffineExpr::dim(0)))
+                ],
+            }
+        );
+        assert_eq!(
+            ops,
+            vec![DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(0),
+                from: Val(50),
+                start: Val(51),
+                layout: got.layout.clone(),
+                ty: got.ty.clone(),
+            })]
+        );
+
+        let bypassed = logical_memory_view(
+            &mut vals,
+            &mut ops,
+            &sizes,
+            Val(50),
+            Val(51),
+            ElemType::F16,
+            true,
+        )
+        .expect("three positive extents");
+        assert_eq!(bypassed.layout, AffineMap::identity(1));
+        assert_eq!(bypassed.ty, got.ty);
+    }
+
+    /// 🎯 035/110 — ⛔ THE PERMUTATION IS THE REVERSAL, and an empty nest has no time order.
+    #[test]
+    fn the_time_order_reverses_every_loop() {
+        assert_eq!(
+            time_order(3),
+            Some(AffineMap {
+                dims: 3,
+                syms: 0,
+                results: vec![AffineExpr::dim(2), AffineExpr::dim(1), AffineExpr::dim(0)],
+            })
+        );
+        assert_eq!(time_order(0), None);
+    }
+
+    /// 🎯 036/110 — ⛔ THE VARIABLE IS THE LOOP'S POSITION AND `sizeIdx_` IS ONLY THE RESULT SLOT.
+    ///
+    /// Reading `d<sizeIdx_>` instead of `d<i>` would address the third loop's time step with the
+    /// first loop's iterator, and every result no loop names would still have to be zero.
+    #[test]
+    fn the_time_address_map_indexes_by_loop_position() {
+        let got = time_address_map(
+            3,
+            3,
+            &[
+                CompositeLoop {
+                    size_idx: Some(1),
+                    elem_offset: 4,
+                },
+                CompositeLoop {
+                    size_idx: None,
+                    elem_offset: 9,
+                },
+                CompositeLoop {
+                    size_idx: Some(0),
+                    elem_offset: 1,
+                },
+            ],
+        )
+        .expect("every loop inside the input arity");
+
+        assert_eq!(
+            got,
+            AffineMap {
+                dims: 3,
+                syms: 0,
+                results: vec![
+                    AffineExpr::dim(2),
+                    AffineExpr::dim(0).times(4),
+                    AffineExpr::Const(0),
+                ],
+            }
+        );
+        // `dims[i]` past the input arity is the reference's out-of-bounds read.
+        assert_eq!(
+            time_address_map(
+                1,
+                3,
+                &[
+                    CompositeLoop {
+                        size_idx: Some(0),
+                        elem_offset: 1,
+                    },
+                    CompositeLoop {
+                        size_idx: Some(1),
+                        elem_offset: 1,
+                    },
+                ],
+            ),
+            None
+        );
+    }
+
+    /// 🎯 037/110 — ⛔ THE QUERIED NODE IS ITS OWN ANSWER, and a split numerator stage is passed over.
+    ///
+    /// Starting the walk at `getOwnerLoop()` would skip the node that already walks the dim, and
+    /// accepting a candidate whose `numId_` stage differs between start and end picks a loop whose
+    /// trip count is not the one the transfer was sized for.
+    #[test]
+    fn the_node_itself_can_answer_and_a_split_numerator_stage_is_passed_over() {
+        let (node, split, outer) = (1i32, 2i32, 3i32);
+        let query = DimStageVals {
+            den_ss: Some(7),
+            den_el: Some(7),
+            num_ss: Some(0),
+            num_el: Some(0),
+        };
+        let walks = [PrimaryDim::Y];
+        let walks_nothing: [PrimaryDim; 0] = [];
+
+        assert_eq!(
+            immediate_parent_with_matching_dim(
+                &[
+                    DimChainNode {
+                        node: &node,
+                        dims: &walks,
+                        stages: query,
+                    },
+                    DimChainNode {
+                        node: &outer,
+                        dims: &walks,
+                        stages: query,
+                    },
+                ],
+                PrimaryDim::Y,
+            ),
+            Some(&node)
+        );
+
+        assert_eq!(
+            immediate_parent_with_matching_dim(
+                &[
+                    DimChainNode {
+                        node: &node,
+                        dims: &walks_nothing,
+                        stages: query,
+                    },
+                    DimChainNode {
+                        node: &split,
+                        dims: &walks,
+                        stages: DimStageVals {
+                            num_el: Some(1),
+                            ..query
+                        },
+                    },
+                    DimChainNode {
+                        node: &outer,
+                        dims: &walks,
+                        stages: query,
+                    },
+                ],
+                PrimaryDim::Y,
+            ),
+            Some(&outer)
+        );
+        assert_eq!(
+            immediate_parent_with_matching_dim::<i32>(&[], PrimaryDim::Y),
+            None
+        );
+    }
+
+    /// 🎯 038/110 — ⛔ NEITHER COUNT ABOVE ONE MEANS NO EPILOGUE, however unequal the two are.
+    #[test]
+    fn one_steady_stick_against_an_empty_epilogue_is_not_an_epilogue() {
+        let whole = StickCounts {
+            steady: 1,
+            epilogue: 0,
+        };
+        let of = |steady, epilogue| {
+            ContiguousSticks::new(
+                whole,
+                vec![(PrimaryDim::Out, StickCounts { steady, epilogue })],
+            )
+        };
+        assert!(!epilogues_in_transfer_sizes(&of(1, 0)));
+        assert!(epilogues_in_transfer_sizes(&of(4, 3)));
+        assert!(!epilogues_in_transfer_sizes(&of(4, 4)));
+    }
+
+    /// 🎯 039/110 — ⛔ THE INDICES ARE THE INPUT'S WHOLE WIDTH AND `bf16` MATCHES NO ARM.
+    #[test]
+    fn the_load_shuffle_repeats_the_whole_input_rf_times() {
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let rf = Replication::checked(8).expect("a positive factor");
+        let ty = Vector {
+            len: 8,
+            elem: ElemType::F16,
+        };
+
+        assert_eq!(
+            construct_2b16b_load_shuffle(&mut vals, &mut ops, Val(70), ty, rf),
+            Some(Val(0))
+        );
+        assert_eq!(
+            ops,
+            vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                result: Val(0),
+                input: Val(70),
+                indices: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                repetition: 8,
+                input_ty: ty,
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            })]
+        );
+        assert_eq!(
+            construct_2b16b_load_shuffle(
+                &mut vals,
+                &mut ops,
+                Val(70),
+                Vector {
+                    len: 8,
+                    elem: ElemType::Bf16,
+                },
+                rf,
+            ),
+            None
+        );
+    }
+
+    /// 🎯 040/110 — ⛔ THE DELIBERATE DIVERGENCE: `repetition = 1` on the f32 arm the reference wrote
+    /// `8` on, because `4 != 4 * 8` is what `ShuffleOp::verify` rejects.
+    #[test]
+    fn the_store_shuffle_narrows_to_the_quotient_and_repeats_once() {
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let rf = Replication::checked(8).expect("a positive factor");
+        let input_ty = Vector {
+            len: 32,
+            elem: ElemType::F32,
+        };
+
+        assert_eq!(
+            construct_2b16b_store_shuffle(&mut vals, &mut ops, Val(80), input_ty, rf),
+            Some(Val(0))
+        );
+        assert_eq!(
+            ops,
+            vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                result: Val(0),
+                input: Val(80),
+                indices: vec![0, 1, 2, 3],
+                repetition: 1,
+                input_ty,
+                ty: Vector {
+                    len: 4,
+                    elem: ElemType::F32,
+                },
+            })]
+        );
     }
 }

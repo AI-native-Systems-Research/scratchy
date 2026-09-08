@@ -711,12 +711,13 @@ impl Handles {
 }
 
 /// `DefImmutableMappingOp::create(..)` THEN `QueryMapOp::create(..)` — the tail all four
-/// `constructUniformized*` functions share.
+/// `constructUniformized*` functions share, and [`super::sync::construct_units_for_uniformization`]
+/// with them.
 ///
 /// ⛔ THE QUERY'S RESULT TYPE AND THE MAPPING'S VALUE TYPE ARE THE SAME `ty` AT EVERY CALL SITE, and
 /// both are `index` for the three address functions and the bitstream's vector type for entry 032
 /// (`:530-537`). The mapping's own RESULT type is `index` in all four — see [`MappedTy`].
-fn query_over_handles(
+pub(super) fn query_over_handles(
     vals: &mut Values,
     ops: &mut Vec<DfirOp>,
     iterator: Val,
