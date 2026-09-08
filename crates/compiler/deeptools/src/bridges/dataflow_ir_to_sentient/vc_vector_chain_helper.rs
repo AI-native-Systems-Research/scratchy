@@ -3789,3 +3789,15 @@ mod unit_tests {
         assert_eq!(merge_type_from_indices(&valid, false, Bits(0)), None);
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e228_validateLoweringAndSetMissingParameters
+// crustify:todo: e229_getMaskValueForNonPT
+// crustify:todo: e230_convertStringToType
+// crustify:todo: e231_convertTypeToString
+// crustify:todo: e277_getGCVTorFCVTTypeFromIndicesAndCastInputs
+// crustify:todo: e340_analyzeAndFillOperandForwarding
+// crustify:todo: e341_analyzeNonComputeOpsForFusion
+// crustify:todo: e342_analyzeAndFillResultForwarding

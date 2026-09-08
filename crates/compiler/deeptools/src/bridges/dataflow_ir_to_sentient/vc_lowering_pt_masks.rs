@@ -60,3 +60,10 @@
 //! | `e282_updateLoopMaskTreeForConstantMask` | 282/384 | 4 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20` |
 //! | `e283_updateLoopMaskTreeForDynamicMask` | 283/384 | 9 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28` |
 
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e239_insertPTMaskOps
+// crustify:todo: e282_updateLoopMaskTreeForConstantMask
+// crustify:todo: e283_updateLoopMaskTreeForDynamicMask

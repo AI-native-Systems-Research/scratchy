@@ -60,3 +60,10 @@
 //! | `e275_LowerSymbolQueryMap` | 275/384 | 68 | `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40` |
 //! | `e303_runOnOperation` | 303/384 | 15 | `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23` |
 
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e226_createIfOpFromMapping
+// crustify:todo: e275_LowerSymbolQueryMap
+// crustify:todo: e303_runOnOperation

@@ -5369,3 +5369,44 @@ pub fn lower_symbolic_vector_store_op<A: Arch>(unit: &ProgramUnit<A>, comp: Dfir
         unit.on.kind()
     );
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e214_setImmutableAddrAndIncrements
+// crustify:todo: e215_setsttype
+// crustify:todo: e216_constructReceiveAndExtractScalarOp
+// crustify:todo: e217_lowerVectorLoadHelper
+// crustify:todo: e218_lowerSetTransferMaskStateOp
+// crustify:todo: e219_cloneStartAddrOutsideLoop
+// crustify:todo: e220_cleanupTriviallyRedundantSetSendDestination
+// crustify:todo: e267_constructTimeLoopsAndVectorOperations
+// crustify:todo: e268_constructLoadAndStoreStmt
+// crustify:todo: e269_constructLoadAndExtractScalarOp
+// crustify:todo: e270_addStoreInputToDeleteList
+// crustify:todo: e271_lowerCompositeMemoryInterleaveOp
+// crustify:todo: e272_insertInitializationStmt
+// crustify:todo: e298_constructAffineDetailsAndAddrs
+// crustify:todo: e299_lowerAffineCompositeHelper
+// crustify:todo: e311_constructAffineCompDetailsAndAddrs
+// crustify:todo: e312_lowerExtractVectorLoadOp
+// crustify:todo: e313_lowerExtractVectorStoreOp
+// crustify:todo: e314_lowerVectorLoadOp
+// crustify:todo: e315_lowerVectorStoreOp
+// crustify:todo: e316_lowerIndirectVectorLoadOp
+// crustify:todo: e317_lowerIndirectVectorStoreOp
+// crustify:todo: e318_lowerLDCVTIPattern
+// crustify:todo: e327_gatherSymbolicLoadStoreDetails
+// crustify:todo: e328_adjustMutableAddrInitForIndirect
+// crustify:todo: e329_lowerCompositeLoadOp
+// crustify:todo: e330_lowerCompositeStoreOp
+// crustify:todo: e331_lowerCompositeLoadAndStoreOp
+// crustify:todo: e332_lowerCompositeIndirectLoadOp
+// crustify:todo: e333_lowerCompositeIndirectStoreOp
+// crustify:todo: e334_lowerCompositeIndirectLoadAndStoreOp
+// crustify:todo: e335_insertCopyAndAddStmts
+// crustify:todo: e336_adjustMutableAddrInitForStride
+// crustify:todo: e357_generateAffineAddressManipulationStmts
+// crustify:todo: e358_constructLoadAndSendStmt
+// crustify:todo: e359_constructReceiveAndStoreStmt
+// crustify:todo: e360_constructSymbolicDetailsAndAddrs

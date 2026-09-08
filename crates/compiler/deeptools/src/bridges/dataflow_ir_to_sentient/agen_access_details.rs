@@ -5026,3 +5026,10 @@ mod unit_tests {
         assert_eq!(only_indirect.get_first(), None);
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e265_constructDetails
+// crustify:todo: e266_coalesceTimeDimensions
+// crustify:todo: e297_constructTimeStepsInfo

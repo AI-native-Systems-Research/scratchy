@@ -1450,3 +1450,19 @@ const fn is_corelet_0_attribute(residency: Residency) -> bool {
         Residency::Scratchpad { .. } | Residency::Global => false,
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e221_pushBackTheUnitToListIfDoesnotExist
+// crustify:todo: e222_createUniformRegionsWithTwoRegionsNoResult
+// crustify:todo: e223_lowerL3SyncOperationForAUnit
+// crustify:todo: e224_lowerL3SyncOperationForAGroupOfUnits
+// crustify:todo: e273_lowerL0LXSyncOperationForAUnit
+// crustify:todo: e274_lowerL0LXSyncOperationForAGroupOfUnits
+// crustify:todo: e300_lowerSyncForAUnit
+// crustify:todo: e301_lowerSyncForAGroup
+// crustify:todo: e302_lowerSyncLXL3ToLXL3
+// crustify:todo: e319_lowerSyncForAQueryMap
+// crustify:todo: e337_lowerSyncOperation
+// crustify:todo: e361_runOnOperation

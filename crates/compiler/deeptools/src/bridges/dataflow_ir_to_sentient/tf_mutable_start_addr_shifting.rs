@@ -1538,3 +1538,15 @@ mod unit_tests {
         );
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e291_calculatePartialShift
+// crustify:todo: e308_calculateShifts
+// crustify:todo: e323_shiftMutableAddr
+// crustify:todo: e352_transformVectorLoad
+// crustify:todo: e353_transformVectorStore
+// crustify:todo: e354_transformCompLoadAndStore
+// crustify:todo: e355_transformCompIndLoadAndStore
+// crustify:todo: e372_runOnOperation

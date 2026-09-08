@@ -1364,3 +1364,8 @@ pub fn remove_ancestors(
         remove_at(position.path(), module);
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e296_runOnOperation

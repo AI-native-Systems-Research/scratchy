@@ -59,3 +59,9 @@
 //! | `e249_processComputeUnit` | 249/384 | 91 | `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:37` |
 //! | `e288_runOnOperation` | 288/384 | 22 | `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131` |
 
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e249_processComputeUnit
+// crustify:todo: e288_runOnOperation

@@ -5068,3 +5068,16 @@ pub fn gather_page_dependent_dims_for_page(
         }
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e294_getPageValidity
+// crustify:todo: e295_createIterArgsForConditionals
+// crustify:todo: e309_constructValidPage
+// crustify:todo: e310_analyzeValidPages
+// crustify:todo: e324_analyzeAndConstructValidPages
+// crustify:todo: e325_transform_time
+// crustify:todo: e326_initialize_time
+// crustify:todo: e356_transform
+// crustify:todo: e373_run

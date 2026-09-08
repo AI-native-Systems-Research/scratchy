@@ -991,3 +991,12 @@ mod unit_tests {
         run_on_operation(&mut program, &mut Values::default());
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e280_cleanup
+// crustify:todo: e344_lowerDanglingNonComputeOpsPESFP
+// crustify:todo: e364_patternAgnosticFuseNonComputeOpsHelper
+// crustify:todo: e365_fillOpInfo
+// crustify:todo: e366_fuseNonComputeOps

@@ -13,6 +13,12 @@ say() { echo "[$(date +%H:%M:%S)] $*" >> $TRACE; }
 # reads the session branch out of that log. On 2026-09-07 the older driver promoted a branch the
 # younger one owned, which moved HEAD sideways, and the younger driver's own promote then failed
 # "not a fast-forward" and stopped the campaign with nine batches of finished work stranded.
+# ⛔⛔ NEVER `rm -f` THIS FILE TO CLEAR A "STALE" LOCK. On 2026-09-07 at 16:31 I did exactly that while
+# pid 17581 was still alive, which let a second driver start; both then wrote the same
+# logs/driver-sc2-port.log, and each `promote` read the OTHER's session branch out of it. The check
+# below already handles a genuinely stale lock — `kill -0` fails and the driver starts. If a live
+# driver holds it, KILL THE DRIVER and let its EXIT trap release the lock. And kill its `crustify`
+# child too: killing the bash script alone reparents the child to init, which keeps spawning agents.
 LOCK=$ROOT/crustify/campaigns/.driver.lock
 if [ -e "$LOCK" ] && kill -0 "$(cat $LOCK 2>/dev/null)" 2>/dev/null; then
   echo "driver already running as pid $(cat $LOCK) — refusing to start a second" >&2
@@ -24,10 +30,26 @@ trap 'rm -f "$LOCK"' EXIT INT TERM
 say "LOCK acquired by pid $$"
 
 
+# ⛔⛔ THE UNIVERSE IS UNITS.tsv, NOT THE SOURCE TREE. This function used to report `openTodo` by
+# counting `crustify:todo:` markers and the driver treated 0 as completion. An agent that DELETES an
+# anchor without porting it therefore removed the unit from every later schedule AND satisfied the
+# completion test: on 2026-09-08 this campaign printed CAMPAIGN DRIVER DONE having ported 235 of 384,
+# with the 149 lost running consecutively from e214 to e384 — setImmutableAddrAndIncrements, setsttype,
+# lowerVectorLoadHelper, lowerL3SyncOperationForAUnit, createUniformRegionsWithTwoRegionsNoResult, the
+# biggest functions in the span. A deleted anchor was indistinguishable from a finished one.
+#
+# `unported` is now scheduled-minus-filled, read from UNITS.tsv, and it is what the campaign's
+# completion is judged on. `openTodo` is still reported, but only as a diagnostic: a gap between it and
+# `unported` means anchors have gone missing again.
 count() {
   filled=$(grep -rhoE '/// Replaces: e[0-9]{3}_[A-Za-z0-9_]+' $ROOT/crates/compiler/deeptools/src | sort -u | wc -l | tr -d ' ')
   open=$(grep -rhoE 'crustify:todo: e[0-9]{3}_[A-Za-z0-9_]+' $ROOT/crates/compiler/deeptools/src | sort -u | wc -l | tr -d ' ')
-  say "ANCHORS: filled=$filled openTodo=$open"
+  scheduled=$(tail -n +2 $ROOT/crustify-bridge2/UNITS.tsv | grep -c . )
+  unported=$(( scheduled - filled ))
+  say "ANCHORS: filled=$filled/$scheduled  unported=$unported  openTodo=$open"
+  if [ "$unported" -gt 0 ] && [ "$open" -lt "$unported" ]; then
+    say "⛔ ANCHOR LOSS: $unported units unported but only $open TODO markers — $(( unported - open )) anchors were deleted without a port. Run /tmp/fix-campaign.py to re-anchor and rebuild the schedules."
+  fi
 }
 
 promote() {
@@ -62,6 +84,12 @@ disk() {
 }
 
 stage() { # $1 wave json  $2 objective  $3 tag
+  # ⭐ SKIP AN EMPTY SCHEDULE. regen-remainders.py rewrites port-remainder.json after every promote
+  # with only the units still lacking a filled anchor, so a finished level leaves 0. Without this
+  # check the driver hands crustify an empty wave list — or worse re-runs a REVIEW over a level
+  # already reviewed: the 16:29 restart started 9 agents re-reviewing level 0's 142 done functions.
+  n=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" "$CAMP/$1" 2>/dev/null || echo 1)
+  if [ "$n" = "0" ]; then say "STAGE $3 SKIPPED (0 units left in $1)"; return 0; fi
   disk
   # ⭐ RETRY, BECAUSE THE FAILURES ARE THE NETWORK AND NOT THE WORK. Every batch lost so far died
   # with `API Error: Can't reach the API server (ENOTFOUND)` after 120-180 turns — 9 of 18 in the
@@ -101,12 +129,9 @@ gate() { # $1 tag
 # waited on it (WAIT_PID) before going to review. That wave died with 0 units landed — all three
 # translator agents hit `API Error: ENOTFOUND` after ~35 min / 123 turns and `claude` exited 1 — so
 # this run must PORT level 0 rather than review nothing.
-say "RESUME: sc1 port wave died with filled=0 (agent API ENOTFOUND); restarting from sc1-port"
+say "RESUME after machine crash: 192/384 anchors landed. Level 0 is ported AND reviewed (promoted 11:46, 17 files changed) — its stages are dropped rather than left to the empty-schedule skip, because review.json is not a remainder and would re-review all 142."
 count
 
-stage level0-accessors-and-leaves/port-remainder.json     port   sc1-port
-stage level0-accessors-and-leaves/review.json            review sc1-review
-gate sc1
 stage levels1-2-transfer-and-compute/port-remainder.json port   sc2-port
 stage levels1-2-transfer-and-compute/review.json         review sc2-review
 gate sc2

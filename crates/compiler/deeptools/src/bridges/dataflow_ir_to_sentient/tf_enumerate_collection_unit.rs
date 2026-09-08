@@ -59,3 +59,9 @@
 //! | `e245_enumerateCollectionUnit` | 245/384 | 57 | `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:34` |
 //! | `e286_runOnOperation` | 286/384 | 32 | `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94` |
 
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e245_enumerateCollectionUnit
+// crustify:todo: e286_runOnOperation

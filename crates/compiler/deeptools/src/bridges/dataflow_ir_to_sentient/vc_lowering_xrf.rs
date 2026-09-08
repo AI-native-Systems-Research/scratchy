@@ -2568,3 +2568,13 @@ mod unit_tests {
         assert!(yielded_operands(&if_op, YieldRegion::BodyOrThen).is_empty());
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e240_getLayoutExpr
+// crustify:todo: e241_createForOpWithReturnValue
+// crustify:todo: e242_createIfOpWithReturnValue
+// crustify:todo: e243_insertDummyMacOp
+// crustify:todo: e345_processXrfPtrPerUnit
+// crustify:todo: e367_createXrfIndexModifOps

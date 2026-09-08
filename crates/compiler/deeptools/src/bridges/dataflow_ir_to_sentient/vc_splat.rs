@@ -59,3 +59,9 @@
 //! | `e235_createSentientConstants` | 235/384 | 31 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:34` |
 //! | `e279_createSplatOperation` | 279/384 | 110 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70` |
 
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e235_createSentientConstants
+// crustify:todo: e279_createSplatOperation

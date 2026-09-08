@@ -2487,3 +2487,14 @@ mod unit_tests {
         assert_eq!(layout_map_and_indices(&OpId::at(&[0]), &scope), None);
     }
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e232_getOperandFromLoadOrStoreOp
+// crustify:todo: e233_eraseOperands
+// crustify:todo: e234_setValue
+// crustify:todo: e278_getOperandFromShuffleOp
+// crustify:todo: e304_getOperandWithPrecision
+// crustify:todo: e320_getOperand
+// crustify:todo: e343_getOperandFromCastOp

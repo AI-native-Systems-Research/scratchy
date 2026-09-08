@@ -2541,3 +2541,15 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
     // `:491-495` — the marker's removal, which is this set going out of scope.
     drop(processed);
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e244_isHoistable
+// crustify:todo: e284_hoistCommonConditionals
+// crustify:todo: e285_replaceIfOpByIterArg
+// crustify:todo: e347_topLevelConditionsMatch
+// crustify:todo: e348_singleOpBranchToYieldVal
+// crustify:todo: e349_isLoopInvariant
+// crustify:todo: e370_areShallowlyMergeable
+// crustify:todo: e371_hoistLoopInvariantConditionals

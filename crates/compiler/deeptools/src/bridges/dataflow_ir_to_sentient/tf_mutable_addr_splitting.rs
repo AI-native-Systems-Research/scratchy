@@ -6621,3 +6621,18 @@ fn update_subscripts_and_indices_for_explicit_time_loops(
         subscripts_map_time.replace_dims_and_symbols(&replace_dims, &[], dim_num, 0);
     Some((subscripts_map, new_indices))
 }
+
+// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
+// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
+// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
+// crustify:todo: e250_initMASData
+// crustify:todo: e251_setupForPartitioning
+// crustify:todo: e252_fillPartitions
+// crustify:todo: e253_adjustForEvenImmutableAddr
+// crustify:todo: e289_initialize
+// crustify:todo: e290_createPartitions
+// crustify:todo: e306_transformVectorLoad
+// crustify:todo: e307_transformVectorStore
+// crustify:todo: e321_transformCompLoadAndStore
+// crustify:todo: e322_transformCompIndLoadAndStore
+// crustify:todo: e351_runOnOperation
