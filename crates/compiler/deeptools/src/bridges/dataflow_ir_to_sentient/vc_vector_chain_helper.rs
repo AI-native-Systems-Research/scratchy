@@ -298,7 +298,7 @@ fn precision_in_string(elem: ElemType) -> sen::Precision {
         ElemType::F32 => sen::Precision::Fp32,
         // ⭐ BOTH FP8 FLAVOURS ARE `fp8`. The width is all the reference reads, so `f8E4M3FN` and
         // `f8E8M0FNU` are one precision — which is also why `SEN053_FP8` can borrow E4M3's type.
-        ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu => sen::Precision::Fp8,
+        ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu | ElemType::F8E5M2 => sen::Precision::Fp8,
         ElemType::F4E2M1Fn => sen::Precision::Fp4,
         // ⛔ NO SUCH PRECISION EXISTS TO NAME. `SentientPrecisionAttr` has nineteen cases and none of
         // them is an `int<n>` or `mxfp<n>` for any other `n`; the reference would build the string
