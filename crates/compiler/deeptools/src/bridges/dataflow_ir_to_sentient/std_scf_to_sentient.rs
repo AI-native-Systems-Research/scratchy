@@ -442,7 +442,7 @@ mod unit_tests {
     use crate::arch::Target;
     use crate::generated::{OpFunc, SyncSignal};
     use crate::islands::dataflow_ir::dialects::{Val, affine, arith, dataflow};
-    use crate::islands::dataflow_ir::ty::IntegerSet;
+    use crate::islands::dataflow_ir::ty::{IntegerSet, ScalarTy};
     use crate::islands::dataflow_ir::{
         Grid, GroupId, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Units,
     };
@@ -565,6 +565,7 @@ mod unit_tests {
                 predicate: CmpIPredicate::Eq,
                 lhs: Val(2),
                 rhs: Val(3),
+                ty: ScalarTy::Index,
             })),
             Legality::Legal
         );
@@ -595,6 +596,7 @@ mod unit_tests {
             pattern_for(&scf::Op::If {
                 cond: Val(0),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: Vec::new(),
                 else_body: Vec::new(),
                 dbg_name: None,
@@ -657,6 +659,7 @@ mod unit_tests {
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(0),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: Vec::new(),
                 else_body: Vec::new(),
                 dbg_name: None,
@@ -740,6 +743,7 @@ mod unit_tests {
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(0),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: Vec::new(),
                 else_body: Vec::new(),
                 dbg_name: None,

@@ -349,6 +349,7 @@ mod unit_tests {
     use crate::arch::Target;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+    use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::dataflow_ir::{
         Grid, GroupId, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Units,
     };
@@ -369,6 +370,7 @@ mod unit_tests {
         DfirOp::Scf(scf::Op::If {
             cond: Val(cond),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body,
             else_body,
             dbg_name: None,

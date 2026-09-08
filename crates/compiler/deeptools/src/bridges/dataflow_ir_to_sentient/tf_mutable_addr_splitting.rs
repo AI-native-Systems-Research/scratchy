@@ -88,7 +88,9 @@ use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
     Op as DfirOp, Val, affine, arith, dataflow, defining_op, scf, symbol,
 };
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, MemRef};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, Constraint, IntegerSet, MemRef, ScalarTy,
+};
 use crate::units::DfirUnit;
 
 use super::agen_access_details::{AccessDetailsAffineComposite, TimeBound};
@@ -5496,6 +5498,7 @@ fn assemble_conditionals(levels: &[Level], level: usize, chain: usize) -> Vec<Df
                 predicate: arith::CmpIPredicate::Slt,
                 lhs: here.iter_arg,
                 rhs: cond.bound,
+                ty: ScalarTy::Index,
             }),
             DfirOp::Scf(scf::Op::If {
                 cond: cond.cond,
@@ -5503,6 +5506,7 @@ fn assemble_conditionals(levels: &[Level], level: usize, chain: usize) -> Vec<Df
                 // three-argument overload, which is the RESULTLESS one. A partition's two arms
                 // rewrite the transfer's operands in place; neither yields a value.
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: with_terminator(then_body),
                 else_body: with_terminator(else_body),
                 // ⭐ `dbg_name` IS SET BY THE CONDITIONAL-TREE PASS, NOT BY THIS ONE.

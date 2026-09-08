@@ -1036,6 +1036,7 @@ pub fn emit_implicit_loops_for_contiguous_transfer<'s>(
             predicate: CmpIPredicate::Slt,
             lhs: parent_iv,
             rhs: parent_last,
+            ty: ScalarTy::Index,
         }));
 
         let ss_val = vals.mint();

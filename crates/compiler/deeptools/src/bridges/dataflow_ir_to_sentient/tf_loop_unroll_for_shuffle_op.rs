@@ -466,6 +466,7 @@ impl AffineApplyExpander<'_> {
             predicate: arith::CmpIPredicate::Slt,
             lhs,
             rhs,
+            ty: ScalarTy::Index,
         }));
         result
     }
@@ -754,7 +755,10 @@ fn fold_to_constant(op: &DfirOp, built: &[DfirOp], unit: &[DfirOp]) -> Option<i6
             arith::Op::ConstantInt { .. }
             | arith::Op::DenseConstant { .. }
             | arith::Op::Compare { .. }
-            | arith::Op::Logic { .. },
+            | arith::Op::Logic { .. }
+            // ⛔ AND A CONVERSION IS NEVER AN EXPANSION'S ROOT: every value the expander builds is an
+            // `index`, and `arith.sitofp`/`arith.fptosi` convert VECTORS.
+            | arith::Op::Convert { .. },
         )
         | DfirOp::Affine(_)
         | DfirOp::Scf(_)
@@ -1253,6 +1257,7 @@ mod unit_tests {
             DfirOp::Scf(scf::Op::If {
                 cond: Val(1),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: Vec::new(),
                 else_body: Vec::new(),
                 dbg_name: None,

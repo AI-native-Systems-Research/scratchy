@@ -29,13 +29,14 @@
 use super::construction::{MaskValue, static_continuous_mask};
 use super::control_flow::PrimaryDim;
 use super::dsc_lowering::mlir_loop_from_loop_node;
-use crate::arch::Elements;
-use crate::generated::DataType;
+use crate::arch::{Arch, Elements, IsaGen};
+use crate::generated::{DataType, OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::dataflow::{Opaque, RegAddr};
 use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, Predicate};
-use crate::islands::dataflow_ir::dialects::{Op, Val, vectorchain};
+use crate::islands::dataflow_ir::dialects::{Op, Val, arith, dataflow, vectorchain};
 use crate::islands::dataflow_ir::ty::{
-    AffineExpr, Constraint, ElemType, GenericComp, IntegerSet, TensorCategory, Vector,
+    AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, TensorCategory, Vector,
 };
 
 /// ⛔ A STICK IN **BITS** — 128 bytes, and the reference divides by it in bits (`(128 * 8) / width`,
@@ -356,11 +357,214 @@ pub const fn type_from_compute_type(format: DataType, on: GenericComp) -> Option
         VectorWidth::OneStick(width),
     ))
 }
+/// A MAC THE COMPUTE PATH ACCEPTS — the seven `ComputeOpType`s `constructComputeOperation` routes to
+/// `constructMACOperation` (`SNComputeLowering.cpp:1570-1573`).
+///
+/// ⛔ NOT THE GENERATED [`ComputeType`](crate::generated::ComputeType), whose `.ddl` census spells
+/// `MACC` and never `FMA8`/`FMA4`/`IMA8`/`IMA4`: the two map-selecting chains below cannot state
+/// their own input from it, and the `else` both end in is an `emitError` this crate may not be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacOp {
+    /// `FMA16`.
+    Fma16,
+    /// `FNMS` — the negated-multiply form, which shares FMA16's reduction (`:131`).
+    Fnms,
+    /// `FMA32`.
+    Fma32,
+    /// `FMA8`.
+    Fma8,
+    /// `FMA4` — ⛔ SEN1P5 ONLY (`DT_CHECK(arch == SEN1P5_ISA)`, `:152`).
+    Fma4,
+    /// `IMA8`.
+    Ima8,
+    /// `IMA4`.
+    Ima4,
+}
 
-// crustify:todo: e050_getReductionMapForMACOperation
-// crustify:todo: e051_getSelectionMapForMACOperandFromL0
-// crustify:todo: e052_constructPrecisionConversionOperation
-// crustify:todo: e053_constructOpaqueOperation
+impl MacOp {
+    /// Replaces: e050_getReductionMapForMACOperation
+    ///
+    /// WHICH LANES ONE MAC ACCUMULATES TOGETHER — the `reduction_map` a
+    /// `vectorchain.multiply_and_accumulate` carries (`SNComputeLowering.cpp:126`).
+    ///
+    /// ⛔⛔ IMA8 AND IMA4 OFF SEN1P5 ARE NOT A PLAIN FLOORDIV: they wrap at 128 lanes,
+    /// `((d0 mod 128) floordiv k)`, and the reference's own examples say why — `0, 1, 128, 129 -> 0`
+    /// (`:165`, `:182`). A bare floordiv would accumulate lane 128 into group 64.
+    ///
+    /// ⭐ THE GENERATION IS `A::GEN`, so which factor this is, is a COMPILE-TIME fact.
+    #[must_use]
+    pub fn reduction_map<A: Arch>(self) -> AffineMap {
+        let sen1p5 = matches!(A::GEN, IsaGen::Sen1p5);
+        let i = || AffineExpr::dim(0);
+        AffineMap::unary(match self {
+            // `is_any_of(type, FMA16, FNMS)` — one arm for the two (`:131`).
+            MacOp::Fma16 | MacOp::Fnms => i().floordiv(if sen1p5 { 4 } else { 1 }),
+            // ⭐ `floordiv 1` ON BOTH GENERATIONS, which the reference writes out rather than
+            // returning the identity (`:139-142`) — and the printed map says `d0 floordiv 1`.
+            MacOp::Fma32 => i().floordiv(1),
+            MacOp::Fma8 => i().floordiv(if sen1p5 { 16 } else { 2 }),
+            // ⛔ ONE FACTOR, NOT TWO: the `DT_CHECK` says the older generation has no FMA4 at all,
+            // so there is no second value for an arm to choose between.
+            MacOp::Fma4 => i().floordiv(32),
+            MacOp::Ima8 if sen1p5 => i().floordiv(16),
+            MacOp::Ima8 => i().modulo(128).floordiv(2),
+            MacOp::Ima4 if sen1p5 => i().floordiv(32),
+            MacOp::Ima4 => i().modulo(128).floordiv(4),
+        })
+    }
+
+    /// Replaces: e051_getSelectionMapForMACOperandFromL0
+    ///
+    /// HOW L0LU DATA IS SPLATTED ACROSS THE MAC'S LANES — the `(d0) -> (d0 mod factor)` a
+    /// `vectorchain.select` carries, and the vector the splat is stated over
+    /// (`SNComputeLowering.cpp:200`).
+    ///
+    /// ⛔⛔ THE SELECTION FACTOR IS NOT THE REDUCTION FACTOR off SEN1P5: IMA8 selects `mod 4` while
+    /// reducing `floordiv 2`, and IMA4 selects `mod 8` against `floordiv 4` (`:246`, `:255` versus
+    /// `:165`, `:182`) — the two chains agree on SEN1P5 and on nothing else.
+    ///
+    /// ⛔ [`None`] IS REACHABLE: `constructComputeInputOperandAndAddToList` passes `compute_op.type_`
+    /// straight in for every `PTWEST`/`L0LU`/`L0LUROW0` operand (`:504`), so FMA32 and FNMS — which
+    /// have no arm here — reach the `emitError` at `:270`.
+    #[must_use]
+    pub fn selection_map_from_l0<A: Arch>(
+        self,
+        format: DataType,
+        original: ElemType,
+    ) -> Option<(AffineMap, Vector)> {
+        let sen1p5 = matches!(A::GEN, IsaGen::Sen1p5);
+        // `mlir::isa<VectorType>(original_data_type)` is false exactly for the MX custom vector,
+        // whose element is a `CustomMXFloatType` — see [`type_from_format`].
+        let mx = matches!(original, ElemType::MxFloat(_));
+        let (factor, elem): (u32, ElemType) = match self {
+            MacOp::Fma16 => (
+                if sen1p5 { 4 } else { 1 },
+                if matches!(format, DataType::Bfloat16) {
+                    ElemType::Bf16
+                } else {
+                    ElemType::F16
+                },
+            ),
+            MacOp::Fma8 => (
+                if sen1p5 { 16 } else { 2 },
+                if mx {
+                    ElemType::MxFloat(8)
+                } else {
+                    ElemType::F8E4M3Fn
+                },
+            ),
+            MacOp::Fma4 => (
+                32,
+                if mx {
+                    ElemType::MxFloat(4)
+                } else {
+                    ElemType::F4E2M1Fn
+                },
+            ),
+            // ⛔ AN INTEGER MAC IGNORES `original`: `builder.getIntegerType(8)` unconditionally
+            // (`:249`, `:258`), so there is no MX spelling of an IMA operand.
+            MacOp::Ima8 => (if sen1p5 { 16 } else { 4 }, ElemType::Int(8)),
+            MacOp::Ima4 => (if sen1p5 { 32 } else { 8 }, ElemType::Int(4)),
+            MacOp::Fma32 | MacOp::Fnms => return None,
+        };
+        Some((
+            AffineMap::unary(AffineExpr::dim(0).modulo(i64::from(factor))),
+            Vector {
+                len: 64 * u64::from(factor),
+                elem,
+            },
+        ))
+    }
+}
+
+/// Replaces: e052_constructPrecisionConversionOperation
+///
+/// THE SOURCE VALUE AT THE RESULT FORMAT'S PRECISION — `SNComputeLowering.cpp:375`.
+///
+/// ⛔⛔ AN MX SOURCE IS RETURNED UNCONVERTED. That arm reports success with `result` never assigned
+/// (`:389-391`), and all four call sites initialise `result` to the SOURCE — so it means the input
+/// value, not an empty one: *"MX format is a logical format .. no precision conversion on those
+/// units."*
+///
+/// ⛔ [`None`] IS THE INTEGER-TO-INTEGER ARM, the one `failure()` the chain falls through to
+/// (`:429`): `vectorchain.cast` is float-to-float and there is no integer-width conversion to emit.
+pub fn precision_conversion(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    src: Computed,
+    result_format: DataType,
+    on: GenericComp,
+) -> Option<Computed> {
+    if matches!(src.ty().elem, ElemType::MxFloat(_)) {
+        return Some(src);
+    }
+    // ⛔ THE SOURCE'S OWN ELEMENT COUNT, not a stick's: `num_elements` is read off `src.getType()`
+    // (`:395`, `:400`), so the `-1` sentinel cannot arise here and neither can its abort.
+    let ty = type_from_format(
+        result_format,
+        on,
+        TensorCategory::Regular,
+        VectorWidth::Given(Elements(src.ty().len)),
+    );
+    if src.ty() == ty {
+        return Some(src);
+    }
+    let result = vals.mint();
+    let input_ty = src.ty();
+    into.push(match (is_integer(input_ty.elem), is_integer(ty.elem)) {
+        (true, false) => Op::Arith(arith::Op::Convert {
+            result,
+            kind: arith::ConvertKind::SiToFp,
+            input: src.val(),
+            input_ty,
+            ty,
+        }),
+        (false, true) => Op::Arith(arith::Op::Convert {
+            result,
+            kind: arith::ConvertKind::FpToSi,
+            input: src.val(),
+            input_ty,
+            ty,
+        }),
+        (false, false) => Op::VectorChain(vectorchain::Op::Cast {
+            result,
+            input: src.val(),
+            input_ty,
+            ty,
+        }),
+        (true, true) => return None,
+    });
+    Some(Computed::of(result, ty))
+}
+
+/// Replaces: e053_constructOpaqueOperation
+///
+/// A WHOLE `.smc` BODY AS ONE OP — `SNComputeLowering.cpp:1534`.
+///
+/// ⛔ THE FIRST `StringAttr` IS THE `dbgName`, NOT THE FUNCTION: `compute_op.name_` goes into
+/// `OpaqueOp::create`'s `dbgName` slot and `computeTypeToString(type_)` into `func_name` (`:1552`),
+/// which is [`OpaqueFunc`] here.
+///
+/// ⭐ NO SORT OF THE THREE DICTIONARIES, AND THAT IS DELIBERATE: `mapToDicAttr` walks a
+/// `std::map<std::string, std::string>` in key order (entry 016), and this island's printer already
+/// emits every dictionary in key-spelling order — sorting again would be one fact stated twice.
+#[must_use]
+pub fn opaque_operation(
+    name: &str,
+    func: OpaqueFunc,
+    read_write: &[(RegName, RegAddr)],
+    read_only: &[(RegName, RegAddr)],
+    params: &[(ParamKey, ParamValue)],
+) -> Op {
+    Op::Dataflow(dataflow::Op::Opaque(Opaque {
+        func,
+        read_write: read_write.to_vec(),
+        read_only: read_only.to_vec(),
+        params: params.to_vec(),
+        dbg_name: Some(name.to_owned()),
+    }))
+}
+
 // crustify:todo: e086_constructComputeInputOperandAndAddToList
 // crustify:todo: e087_constructComputeOutputOperand
 // crustify:todo: e094_constructComputeOutputOperands
@@ -373,21 +577,24 @@ pub const fn type_from_compute_type(format: DataType, on: GenericComp) -> Option
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        DynamicMask, MaskValue, StickWidth, VectorWidth, dictionary_order, dynamic_masking,
-        is_integer, single_val_custom_vector, static_mask_for_result, type_from_compute_type,
-        type_from_format,
+        DynamicMask, MacOp, MaskValue, StickWidth, VectorWidth, dictionary_order, dynamic_masking,
+        is_integer, opaque_operation, precision_conversion, single_val_custom_vector,
+        static_mask_for_result, type_from_compute_type, type_from_format,
     };
-    use crate::arch::{Dd2, Elements};
+    use crate::arch::{Dd2, Elements, Sen1p5};
     use crate::bridges::dataflow_ir_to_sentient::vc_helper::{
         EnclosingLoop, MaskValue as PtMaskValue, PtUnit, get_mask_value_for_pt,
     };
     use crate::bridges::superdsc_to_dataflow_ir::control_flow::PrimaryDim;
-    use crate::generated::{DataType, ParamKey, ParamValue};
+    use crate::generated::{DataType, OpaqueFunc, ParamKey, ParamValue, RegName};
     use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::dialects::dataflow::{Opaque, RegAddr};
     use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, LaneMask};
-    use crate::islands::dataflow_ir::dialects::{Op, Val, vectorchain};
+    use crate::islands::dataflow_ir::dialects::{Op, Val, arith, dataflow, vectorchain};
+    use crate::islands::dataflow_ir::print::emit;
     use crate::islands::dataflow_ir::ty::{
-        AffineExpr, Constraint, ElemType, GenericComp, IntegerSet, TensorCategory, Vector,
+        AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, TensorCategory,
+        Vector,
     };
     use crate::islands::sentient::dialects::{self as sen, Definitions, sentient};
 
@@ -497,6 +704,276 @@ mod unit_tests {
             ]
         );
         assert_eq!(out, Computed::of(Val(1), ty));
+    }
+
+    /// ⛔ THE TWO GENERATIONS, ARM BY ARM — including the `mod 128` the older one needs and the
+    /// `floordiv 1` FMA32 writes on both.
+    #[test]
+    fn the_reduction_factor_is_the_generations_and_ima_wraps_at_a_hundred_and_twenty_eight() {
+        let i = || AffineExpr::dim(0);
+        for (op, dd2, sen) in [
+            (MacOp::Fma16, i().floordiv(1), i().floordiv(4)),
+            (MacOp::Fnms, i().floordiv(1), i().floordiv(4)),
+            (MacOp::Fma32, i().floordiv(1), i().floordiv(1)),
+            (MacOp::Fma8, i().floordiv(2), i().floordiv(16)),
+            (MacOp::Ima8, i().modulo(128).floordiv(2), i().floordiv(16)),
+            (MacOp::Ima4, i().modulo(128).floordiv(4), i().floordiv(32)),
+        ] {
+            assert_eq!(
+                op.reduction_map::<Dd2>(),
+                AffineMap::unary(dd2),
+                "{op:?} on dd2"
+            );
+            assert_eq!(
+                op.reduction_map::<Sen1p5>(),
+                AffineMap::unary(sen),
+                "{op:?} on sen1p5"
+            );
+        }
+        // ⛔ FMA4 HAS ONE FACTOR BECAUSE IT HAS ONE GENERATION.
+        assert_eq!(
+            MacOp::Fma4.reduction_map::<Sen1p5>(),
+            AffineMap::unary(i().floordiv(32))
+        );
+    }
+
+    /// ⛔ THE SELECTION FACTOR DIVERGES FROM THE REDUCTION FACTOR off SEN1P5, and FMA32/FNMS have no
+    /// selection at all.
+    #[test]
+    fn the_l0_splat_is_a_mod_and_the_two_float_arms_turn_on_the_original_type() {
+        assert_eq!(
+            MacOp::Ima8.selection_map_from_l0::<Dd2>(DataType::Senint8, ElemType::Int(8)),
+            Some((
+                AffineMap::unary(AffineExpr::dim(0).modulo(4)),
+                Vector {
+                    len: 256,
+                    elem: ElemType::Int(8),
+                },
+            ))
+        );
+        // ⛔ AND ITS REDUCTION IS `floordiv 2` OVER THE SAME OP ON THE SAME ARCH.
+        assert_eq!(
+            MacOp::Ima8.reduction_map::<Dd2>(),
+            AffineMap::unary(AffineExpr::dim(0).modulo(128).floordiv(2))
+        );
+        assert_eq!(
+            MacOp::Ima4.selection_map_from_l0::<Sen1p5>(DataType::Senint4, ElemType::Int(4)),
+            Some((
+                AffineMap::unary(AffineExpr::dim(0).modulo(32)),
+                Vector {
+                    len: 2048,
+                    elem: ElemType::Int(4),
+                },
+            ))
+        );
+        // ⭐ `BFLOAT16` IS THE ONLY FORMAT THAT PICKS `bf16`.
+        for (format, elem) in [
+            (DataType::Bfloat16, ElemType::Bf16),
+            (DataType::Sen169Fp16, ElemType::F16),
+        ] {
+            assert_eq!(
+                MacOp::Fma16.selection_map_from_l0::<Sen1p5>(format, ElemType::F16),
+                Some((
+                    AffineMap::unary(AffineExpr::dim(0).modulo(4)),
+                    Vector { len: 256, elem },
+                ))
+            );
+        }
+        // ⛔ AN MX ORIGINAL MAKES THE SPLAT A CUSTOM VECTOR.
+        assert_eq!(
+            MacOp::Fma8
+                .selection_map_from_l0::<Dd2>(DataType::Sen143Fp8, ElemType::MxFloat(8))
+                .map(|(_, ty)| ty),
+            Some(Vector {
+                len: 128,
+                elem: ElemType::MxFloat(8),
+            })
+        );
+        assert_eq!(
+            MacOp::Fma8
+                .selection_map_from_l0::<Dd2>(DataType::Sen143Fp8, ElemType::F8E4M3Fn)
+                .map(|(_, ty)| ty),
+            Some(Vector {
+                len: 128,
+                elem: ElemType::F8E4M3Fn,
+            })
+        );
+        // ⛔ THE TWO THE REFERENCE REFUSES.
+        for op in [MacOp::Fma32, MacOp::Fnms] {
+            assert_eq!(
+                op.selection_map_from_l0::<Sen1p5>(DataType::Sen169Fp16, ElemType::F16),
+                None
+            );
+        }
+    }
+
+    /// ⛔ ALL FOUR ARMS PLUS THE TWO PASS-THROUGHS — and nothing is emitted for either of those.
+    #[test]
+    fn a_conversion_is_emitted_only_where_the_two_types_differ() {
+        let int16 = Vector {
+            len: 64,
+            elem: ElemType::Int(16),
+        };
+        let mut vals = Values::default();
+        let mut body = Vec::new();
+        // ⛔ MX IN, THE SAME VALUE OUT.
+        let mx = Computed::of(
+            Val(9),
+            Vector {
+                len: 128,
+                elem: ElemType::MxFloat(8),
+            },
+        );
+        assert_eq!(
+            precision_conversion(
+                &mut vals,
+                &mut body,
+                mx,
+                DataType::Sen169Fp16,
+                GenericComp::Sfp
+            ),
+            Some(mx)
+        );
+        // ⛔ AND THE EQUAL-TYPE ARM TOO — `vector<64xi16>` is what `SENINT24` is off the PT.
+        let same = Computed::of(Val(9), int16);
+        assert_eq!(
+            precision_conversion(
+                &mut vals,
+                &mut body,
+                same,
+                DataType::Senint24,
+                GenericComp::Sfp
+            ),
+            Some(same)
+        );
+        assert!(body.is_empty(), "neither pass-through emits an op");
+        // ⭐ THE PE'S OWN int8 RESULT, PROMOTED: `vector<64xi16>` to `vector<64xf16>`
+        // (`dcc/test/PE/int8-kg3-pe.mlir:98`).
+        let fp16 = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        assert_eq!(
+            precision_conversion(
+                &mut vals,
+                &mut body,
+                same,
+                DataType::Sen169Fp16,
+                GenericComp::Sfp
+            ),
+            Some(Computed::of(Val(0), fp16))
+        );
+        assert_eq!(
+            body,
+            vec![Op::Arith(arith::Op::Convert {
+                result: Val(0),
+                kind: arith::ConvertKind::SiToFp,
+                input: Val(9),
+                input_ty: int16,
+                ty: fp16,
+            })]
+        );
+        // ⭐ AND BACK DOWN, WHICH IS THE SFP FIXTURE'S OWN `fptosi` (`dcc/test/SFP/csqint8-sfp.mlir:112`).
+        body.clear();
+        let from_fp16 = Computed::of(Val(9), fp16);
+        let int8 = Vector {
+            len: 64,
+            elem: ElemType::Int(8),
+        };
+        assert_eq!(
+            precision_conversion(
+                &mut vals,
+                &mut body,
+                from_fp16,
+                DataType::Senint8,
+                GenericComp::Pt
+            ),
+            Some(Computed::of(Val(1), int8))
+        );
+        assert_eq!(
+            body,
+            vec![Op::Arith(arith::Op::Convert {
+                result: Val(1),
+                kind: arith::ConvertKind::FpToSi,
+                input: Val(9),
+                input_ty: fp16,
+                ty: int8,
+            })]
+        );
+        // ⭐ FLOAT TO FLOAT IS THE CAST.
+        body.clear();
+        let bf16 = Vector {
+            len: 64,
+            elem: ElemType::Bf16,
+        };
+        assert_eq!(
+            precision_conversion(
+                &mut vals,
+                &mut body,
+                from_fp16,
+                DataType::Bfloat16,
+                GenericComp::Sfp
+            ),
+            Some(Computed::of(Val(2), bf16))
+        );
+        assert_eq!(
+            body,
+            vec![Op::VectorChain(vectorchain::Op::Cast {
+                result: Val(2),
+                input: Val(9),
+                input_ty: fp16,
+                ty: bf16,
+            })]
+        );
+        // ⛔ INTEGER TO INTEGER IS THE REFERENCE'S `failure()`.
+        body.clear();
+        assert_eq!(
+            precision_conversion(
+                &mut vals,
+                &mut body,
+                same,
+                DataType::Senint8,
+                GenericComp::Pt
+            ),
+            None
+        );
+    }
+
+    /// ⛔ THE NAME IS THE `dbgName` AND THE DICTIONARIES ARE HANDED OVER UNSORTED — the printer's
+    /// key order is what `std::map` was.
+    #[test]
+    fn the_opaque_carries_the_compute_name_as_its_debug_name() {
+        let params = [
+            (ParamKey::Prec, ParamValue::Fp16),
+            (ParamKey::In0, ParamValue::Fp16),
+        ];
+        let read_only = [(RegName::A00, RegAddr(0))];
+        let op = opaque_operation(
+            "opaque_op #1",
+            OpaqueFunc::Reciprocal,
+            &[],
+            &read_only,
+            &params,
+        );
+        assert_eq!(
+            op,
+            Op::Dataflow(dataflow::Op::Opaque(Opaque {
+                func: OpaqueFunc::Reciprocal,
+                read_write: vec![],
+                read_only: read_only.to_vec(),
+                params: params.to_vec(),
+                dbg_name: Some("opaque_op #1".to_owned()),
+            }))
+        );
+        // ⭐ AND IT PRINTS IN KEY ORDER WITHOUT THIS FUNCTION SORTING ANYTHING.
+        let mut text = String::new();
+        emit(&mut text, &op, 0);
+        assert!(text.contains("dbgName = \"opaque_op #1\""), "{text}");
+        let dic = text
+            .split("parameter_dictionary = ")
+            .nth(1)
+            .expect("the op prints a parameter dictionary");
+        assert!(dic.starts_with("{in0 = "), "{dic}");
     }
 
     /// ⛔ KEY ORDER, NOT INSERTION ORDER.

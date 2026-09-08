@@ -383,7 +383,9 @@ pub(super) fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
             // Entry 184's `get_loop_trip_count` is the function that takes the larger arm instead of
             // declining it.
             | arith::Op::Select { .. }
-            | arith::Op::Logic { .. },
+            | arith::Op::Logic { .. }
+            // ⛔ A CONVERSION BINDS A VECTOR, so it cannot be an `index` bound at all.
+            | arith::Op::Convert { .. },
         ) => None,
         // ⭐ AND THE OTHER DIALECTS BY DIALECT, because no future op of theirs could be an
         // `arith.constant`: a bound defined by a loop result or a memory access is not a literal.

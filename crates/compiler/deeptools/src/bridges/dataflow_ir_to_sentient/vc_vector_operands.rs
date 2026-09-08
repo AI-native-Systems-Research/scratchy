@@ -1556,7 +1556,10 @@ impl VectorOperand {
             | arith::Op::RemSI(_)
             | arith::Op::Compare { .. }
             | arith::Op::Select { .. }
-            | arith::Op::Logic { .. } => return None,
+            | arith::Op::Logic { .. }
+            // ⛔ `arith.sitofp`/`arith.fptosi` BIND A VECTOR AND ARE STILL NOT CONSTANTS — the
+            // reference's parameter is an `mlir::arith::ConstantOp&`, which neither is.
+            | arith::Op::Convert { .. } => return None,
         };
 
         // `const_val` — either attribute kind reaches the same number — and

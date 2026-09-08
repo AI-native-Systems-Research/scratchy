@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::dialects::affine::Carried;
 use crate::islands::dataflow_ir::print;
+use crate::islands::dataflow_ir::ty::ScalarTy;
 
 /// ONE `scf` OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +31,8 @@ pub enum Op {
     If {
         /// The predicate.
         cond: Val,
-        /// THE VALUES IT BINDS — one per result, all `index`. Empty for a branch taken for effect.
+        /// THE VALUES IT BINDS — one per result, at [`Op::If::result_ty`]. Empty for a branch taken
+        /// for effect.
         ///
         /// ⛔⛔ THE VENDOR'S OWN INPUT BINDS ONE, so a conditional without a result list cannot hold
         /// the pass's input at all: `%13 = scf.if %12 -> (index) { scf.yield %c1 : index } else {
@@ -45,10 +47,26 @@ pub enum Op {
         /// `areShallowlyMergeable` declines outright when BOTH bind something (`:348`). A census that
         /// answered "none" for every `scf.if` would make all three of those decisions constant.
         ///
-        /// ⚠️ EVERY RESULT PRINTS AS `index`, as everywhere else in this island — see [`Carried`]. The
-        /// fixture's `-> (i1)` conditional is a condition-forwarding form this crate does not emit;
-        /// its own merged output binds an `index` (`merging.mlir:40`).
+        /// ⭐ AND BOTH OF THE FIXTURE'S TYPES ARE REACHABLE: `:117` binds an `i1` where `:129` binds
+        /// an `index`, and this crate emits both — see [`Op::If::result_ty`].
         results: Vec<Val>,
+        /// THE TYPE EVERY RESULT IS STATED AT — and the type its regions' `scf.yield`s print.
+        ///
+        /// ⛔⛔ NOT ALWAYS `index`, AND THE MAJORITY IS THE OTHER ONE. 447 result-binding `scf.if`s
+        /// in the authority tree's `dcc/test` write `-> (i1)` 257 times against `-> (index)` 159 —
+        /// and `constructConditionalOperation` (entry 054) is where the `i1` ones come from: it
+        /// builds each and-set as a chain of `scf.if %cmp -> (i1)` yielding an `arith.constant
+        /// true`/`false` (`SNControlFlowLowering.cpp:148-175`). A welded `index` made that whole
+        /// family unwritable — `scf.if %12 -> (index) { scf.yield %true : index }` uses an `i1` at a
+        /// type it was not defined with, which is "use of value expects different type".
+        ///
+        /// ⭐ ONE TYPE FOR THE WHOLE LIST, because MLIR's per-result list is not reachable at this
+        /// rung: not one of those 447 binds more than one result.
+        ///
+        /// ⭐ AND THE REGIONS' TERMINATORS TAKE IT FROM HERE rather than carrying it themselves —
+        /// `scf.yield`'s operand types ARE the parent's result types, which is what MLIR verifies,
+        /// so an [`Op::Yield`] holding its own copy would be two records of one fact.
+        result_ty: ScalarTy,
         /// The `then` region.
         body: Vec<super::Op>,
         /// The `else` region.
@@ -179,16 +197,37 @@ pub enum Op {
 ///
 /// ⭐ ELIDED, NOT DROPPED. The op stays in the region: [`super::regions`] and every walk still see
 /// it, and entry 096's whole job is to put one there.
-fn region(out: &mut String, ops: &[super::Op], depth: usize, print_terminator: bool) {
+fn region(out: &mut String, ops: &[super::Op], depth: usize, terminator: Option<ScalarTy>) {
     for (n, inner) in ops.iter().enumerate() {
         let last = n + 1 == ops.len();
         if last
-            && !print_terminator
+            && terminator.is_none()
             && matches!(inner, super::Op::Scf(Op::Yield { operands }) if operands.is_empty())
         {
             continue;
         }
-        print::emit(out, inner, depth + 1);
+        // ⭐ THE PARENT SUPPLIES THE TERMINATOR'S TYPE — see [`Op::If::result_ty`].
+        match (last, terminator, inner) {
+            (true, Some(ty), super::Op::Scf(Op::Yield { operands })) if !operands.is_empty() => {
+                print::indent(out, depth + 1);
+                yielded(out, operands, ty);
+            }
+            _ => print::emit(out, inner, depth + 1),
+        }
+    }
+}
+
+/// `scf.yield %operands : t, ..` — one terminator, at the type its parent binds.
+fn yielded(out: &mut String, operands: &[Val], ty: ScalarTy) {
+    if operands.is_empty() {
+        out.push_str("scf.yield\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "scf.yield {} : {}",
+            print::vals(operands),
+            vec![ty.spelling(); operands.len()].join(", ")
+        );
     }
 }
 
@@ -252,6 +291,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::If {
             cond,
             results,
+            result_ty,
             body,
             else_body,
             dbg_name,
@@ -264,16 +304,21 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             } else {
                 (
                     format!("{} = ", print::vals(results)),
-                    format!(" -> ({})", vec!["index"; results.len()].join(", ")),
+                    format!(
+                        " -> ({})",
+                        vec![result_ty.spelling(); results.len()].join(", ")
+                    ),
                 )
             };
             let _ = writeln!(out, "{bound}scf.if {}{result_tys} {{", print::val(*cond));
-            // ⭐ THE TERMINATORS PRINT ONLY WHERE MLIR PRINTS THEM — see [`Op::If::results`].
-            region(out, body, depth, !results.is_empty());
+            // ⭐ THE TERMINATORS PRINT ONLY WHERE MLIR PRINTS THEM, AT THIS OP'S OWN RESULT TYPE —
+            // see [`Op::If::results`] and [`Op::If::result_ty`].
+            let terminator = (!results.is_empty()).then_some(*result_ty);
+            region(out, body, depth, terminator);
             print::indent(out, depth);
             if !else_body.is_empty() {
                 out.push_str("} else {\n");
-                region(out, else_body, depth, !results.is_empty());
+                region(out, else_body, depth, terminator);
                 print::indent(out, depth);
             }
             // ⛔ AFTER THE REGIONS, NOT BEFORE THEM — a discardable attribute prints in the trailing
@@ -286,26 +331,18 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             }
         }
         Op::Yield { operands } => {
-            if operands.is_empty() {
-                out.push_str("scf.yield\n");
-            } else {
-                // ⛔ THE TYPE LIST IS NOT OPTIONAL ONCE THERE ARE OPERANDS, exactly as for
-                // `affine.yield` — the op this one is converted FROM (`AffineToStandard.cpp:48`), so
-                // the two print the same list. `ScfYieldOp`'s assembly format is
-                // `attr-dict ($results^ ':' type($results))?`, and the vendor's own text is
-                // `scf.yield %20 : index`
-                // (`dcc/test/Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:311`);
-                // EVERY `scf.yield` with operands under `dcc/test` carries its types.
-                // ⭐ ALWAYS `index`, ONE PER OPERAND — see [`super::affine::Carried`] for why every
-                // value a loop in this island carries is an address, the same assumption the
-                // `-> (..)` result list above already makes.
-                let _ = writeln!(
-                    out,
-                    "scf.yield {} : {}",
-                    print::vals(operands),
-                    vec!["index"; operands.len()].join(", ")
-                );
-            }
+            // ⛔ THE TYPE LIST IS NOT OPTIONAL ONCE THERE ARE OPERANDS, exactly as for
+            // `affine.yield` — the op this one is converted FROM (`AffineToStandard.cpp:48`), so the
+            // two print the same list. `ScfYieldOp`'s assembly format is
+            // `attr-dict ($results^ ':' type($results))?`, and the vendor's own text is
+            // `scf.yield %20 : index`
+            // (`dcc/test/Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:311`);
+            // EVERY `scf.yield` with operands under `dcc/test` carries its types.
+            // ⭐ `index` HERE IS THE **LOOP** TERMINATOR'S TYPE, which is every value a loop in this
+            // island carries (see [`super::affine::Carried`]). A CONDITIONAL's terminator is printed
+            // by [`region`] at the `scf.if`'s own [`Op::If::result_ty`] instead, so an `i1`-yielding
+            // chain does not pass through here.
+            yielded(out, operands, ScalarTy::Index);
         }
         Op::Parallel { ivs, body } => {
             let _ = writeln!(out, "scf.parallel ({}) {{", print::vals(ivs));
