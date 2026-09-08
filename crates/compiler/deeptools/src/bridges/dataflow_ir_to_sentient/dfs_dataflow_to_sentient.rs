@@ -1617,7 +1617,7 @@ pub fn create_uniform_regions_with_two_regions_no_result(
 
 /// WHICH HALF OF THE L3 A SYNC LEAVES FROM — the source guard of both L3 sync lowerings, as a type.
 ///
-/// ⛔ `gen_comp == L3LU || gen_comp == L3SU` (`DataflowToSentient.cpp:394` and `:688`) is the ONLY
+/// ⛔ `gen_comp == L3LU || gen_comp == L3SU` (`DataflowToSentient.cpp:400` and `:689`) is the ONLY
 /// thing either function reads the source unit for; every other component leaves through
 /// `emitError("Unknown lowering of the sync operation")`. Carried as the RECEIVER of the two
 /// lowerings because an unused `self` is silent where an unused named parameter is not.
@@ -1663,7 +1663,7 @@ impl SyncToLower {
 /// carrying the corelet that extends them.
 ///
 /// ⛔ EIGHT COMPONENTS, THREE CASES. `is_any_of(dst_comp, L3LU, L3SU, LXLU, LXSU, LXLU0, LXSU0,
-/// LXLU1, LXSU1)` (`:398-401`, negated at `:698-704`) is the whole accepted set, and `LXLU0` is
+/// LXLU1, LXSU1)` (`:405-408`, negated at `:699-704`) is the whole accepted set, and `LXLU0` is
 /// exactly `Lx(Load, corelet 0)` once [`extend_unit_name_to_corelet`] has run — so the two spellings
 /// collapse, and both `emitError("Unknown lowering of the L3 sync …")` arms lose their input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1718,7 +1718,7 @@ impl L3Half {
     /// **224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:666` (65L).
     ///
     /// The same op over a whole `dataflow.create_group`, deduplicated in first-occurrence order
-    /// (`std::find(..) == end()`, `:718-721`).
+    /// (`std::find(..) == end()`, `:718-720`).
     ///
     /// ⛔ THE REFERENCE'S `break` ON A BAD DESTINATION STILL EMITS THE SYNC, silently dropping every
     /// remaining unit of the group; [`L3SyncDst`] makes that input unrepresentable instead.

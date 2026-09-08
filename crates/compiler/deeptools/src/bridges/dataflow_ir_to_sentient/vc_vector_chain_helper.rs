@@ -2333,8 +2333,9 @@ pub struct NonPtMask {
 /// [`get_mask_value_constant_for_non_pt`]'s answer as a `sentient.constant` of type `index`, or
 /// nothing when there is no constant to be had.
 ///
-/// ⛔ `builder.setInsertionPoint(op)` IS THE DROPPED MECHANISM, and it is the only reason the
-/// reference takes a builder at all — [`NonPtMask::op`] is the obligation it leaves the caller.
+/// ⛔ `builder.setInsertionPoint(op)` IS THE DROPPED MECHANISM, and placing is the only use the
+/// reference has for `op` besides its location — [`NonPtMask::op`] is the obligation it leaves the
+/// caller. The builder itself is NOT dropped: `getIndexType()` is [`ScalarTy::Index`] below.
 #[must_use]
 pub fn get_mask_value_for_non_pt<A: Arch>(mask: &vc::Op, values: &mut Values) -> Option<NonPtMask> {
     let mask_val = get_mask_value_constant_for_non_pt::<A>(mask)?;

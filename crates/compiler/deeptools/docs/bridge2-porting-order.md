@@ -974,6 +974,96 @@ type is `"sfp"` — *"if the mode is only ever set to the default (sfp), then we
 generate any setdstmask instructions"* (`Helper.cpp:4110-4112`) — which is the case a port of e220 is
 most likely to get wrong, since every other arch level emits the one survivor.
 
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT ENTRIES 206-229 — ALL 24 PORTS HOLD, 60 CITATIONS AND 2 CLAIMS FIXED IN THIS COMMIT
+
+24 `/// Replaces:` anchors, 0 surviving `// crustify:todo:`, 48/48 PORT/AUDIT boxes `[x]`. ⭐ **EVERY
+SUBSTANTIVE CLAIM RE-DERIVED FROM THE AUTHORITY AND EVERY ONE HELD**: 214's two constants that are the
+same value and its unconditional `immutable_addr` init; 215's before/after `total_elements` rewrite and
+its three StType outcomes; 216's scatter-then-count order; 217's four-field agreement `cond`; 218's
+build-then-check order; 219's clones-inside-the-region and its uniformize-op result; 220's `!= "sfp"`
+polarity (correctly inverted in the Rust) and its erase-then-insert equivalence; 221, 222, 225 and 226
+clean throughout; 228's shared counter and its A/B/C order; and 229's `RegType::Imm`, which is exactly
+what the reference's 4-argument `ConstantOp::create` leaves in place —
+`DefaultValuedAttr<SentientRegTypeAttr,"SentientRegType::imm">:$regLocale` (`SentientOps.td:852`).
+
+⭐ **228'S REGION RECURSION IS COMPLETE, AND THAT IS A PROOF, NOT AN ASSUMPTION.** The reference's
+`unit.walk<WalkOrder::PreOrder>` descends into *every* nested region; the Rust recurses only into
+`sen::Op::For` and `sen::Op::If`. Three facts close the gap: `sentient.rs:2609`/`:2657` show `For` and
+`If` are the only sentient ops that carry a region, with no `_` arm to hide a third; the lower rungs'
+own carriers are enumerated by `dataflow_ir/dialects/mod.rs`'s `regions_mut()`; and by the time the
+vectorchain passes run there are no affine, scf or agen-composite regions left to walk —
+`dcc-standalone-main.cpp:265-296` fixes the pass order and `SCFToSentient.cpp:266`
+`target.addIllegalDialect<scf::SCFDialect>()` under `applyPartialConversion` (`:278`) is what removes
+the last of them. So the two arms are the whole walk.
+
+⛔ **THREE FACTS ABOUT THE REFERENCE THE PORTS GOT RIGHT WITHOUT SAYING WHY.**
+
+1. **215'S `unsigned& element_width` IS AN IN/OUT PARAMETER ITS OWN BODY NEVER WRITES.** The doc
+   comment says *"Also sets \p total_elements and \p element_width accordingly"* (`Helper.cpp:1714-1715`)
+   and the signature is `unsigned& element_width` (`:1733`), but the only assignments in the body are to
+   `total_elements` (`:1743`, `:1780`); `element_width` is read at `:1743`, `:1780` and nowhere written.
+   Taking it by value (`element_width: NonZeroU32`) is therefore right, and the reference's comment is
+   the thing that is wrong. ⛔ **THE SAME DEFECT SITS ON ENTRY 034 `setldtype`** (doc `:1631-1632`,
+   signature `:1650`, writes `:1664`/`:1707`), which landed with the same by-value choice.
+2. **227'S `OperandReuse` HAS TWO CONSTRUCTION SITES, NOT ONE.** `VectorChainToSentientPT.cpp:1006` is
+   the one the port cited; `VectorChainToSentientPESFP.cpp:1388` is the other side. Both are
+   per-`dataflow.program_unit`, so the *"one table per lowering of one program unit"* claim is not
+   weakened by the second site — it is what makes it a claim about the type rather than about one pass.
+3. **226 CARRIES A LATENT NULL DEREFERENCE THAT THE RUST'S SHAPE MAKES UNREPRESENTABLE.**
+   `Value last_map_key = key_list.back();` (`SymbolToSentient.cpp:141`) and
+   `if (rhs_val == last_map_key) break;` (`:153`) compare by SSA `Value` **identity**, so a
+   `query_map` whose first key *is* its last key breaks on the first iteration with
+   `sentient_ifop_tmp` still default-constructed — and `:182` then calls `sentient_ifop_tmp.getLoc()`
+   on it and returns a null `new_if_op`. `DT_CHECK_MSG(key_list.size() >= 2, …)` (`:134`) does not
+   exclude that input; it only counts. [`QueryMapping`]'s `first` / `middle` / `last_value` split
+   (`std_symbol_to_sentient.rs`) has no way to spell it.
+
+**60 citations corrected** — 53 in `agen_helper.rs` (214-220), 5 in `dfs_dataflow_to_sentient.rs`
+(223/224) and 2 in `agen_access_details.rs` (207). Every one of them was off by a line or two in the
+direction of the reference's own comments and closing braces, which is the drift a `review` pass exists
+to find; **none changed a behaviour, and no implementation needed a fix.** 210-213's citations were
+re-walked as well after the later batches edited the same file, including the awkward ones — `:761` is
+the bare `} else {`, and `:788`, `:795` and `:698` all still land on the construct they name.
+
+| where | said | is |
+|---|---|---|
+| 214's insertion-point save/restore | `:1593` | `:1593-1594` and `:1626` — it is two sites, not one |
+| 214's per-address increment values (2 sites) | `:1605-1613`, `:1604-1612` | `:1604-1610` |
+| 214's zero-increment arm | `:1618-1626` | `:1617-1624` |
+| 215's LX-only gate | `:1737` | `:1735-1736` |
+| 215's shuffle arm (2 sites) | `:1741`, `:1741-1757` | `:1743`, `:1741-1756` |
+| 215's receive arm (4 sites) | `:1766-1774`, `:1767`, `:1773`, `:1758-1774` | `:1775-1780`, `:1776`, `:1780`, `:1757-1780` |
+| 215's shuffle-arm error | `:1747` | `:1755` |
+| 215's neither-matched return | `:1776` | `:1783` |
+| 216's `cast` on the scatter (2 sites) | `:2486-2487` | `:2487-2488` |
+| 216's remaining seven spans | `:2489-2492`, `:2496-2506`, `:2507-2513`, `:2525-2527`, `:2529-2540`, `:2544-2560`, `:2547-2549` | `:2491-2493`, `:2497-2505`, `:2506-2513`, `:2524-2526`, `:2528-2540`, `:2544-2557`, `:2544-2546` |
+| 216's extract, index and delete list | `:2551-2553`, `:2558-2560`, `:2562-2563` | `:2548-2550`, `:2556-2557`, `:2560-2561` |
+| 217's four agreed fields | `Helper.cpp:2925-2933` | `:2922-2932` |
+| 217's remaining five spans | `:2947-2950`, `:2910-2918`, `:2920-2923`, `:2924-2939`, `:2941-2946` | `:2945-2947`, `:2910-2917`, `:2919-2921`, `:2922-2935`, `:2937-2947` |
+| 219's key/mapping/uniformize spans (14 sites) | `:3961-3992`, `:3966-3983`, `:3994-3998`, `:3943-3947`, `:4019-4021`, `:3953-3954`, `:4011`, `:3994-4004`, `:4006-4012`, `:3971-3974`, `:3975-3983`, `:4006-4011` | `:3962-3992`, `:3967-3983`, `:3993-3997`, `:3944-3948`, `:4018-4020`, `:3954-3955`, `:4010`, `:3994-4001`, `:4003-4010`, `:3973-3978`, `:3979-3983`, `:4003-4009` |
+| 220's "unit has none" arm | `:4098-4099` | `:4099` — one line, not two |
+| 220's `llvm::all_of` block | `:4109-4120` | `:4109-4121` |
+| 220's all-`sfp` arm (4 sites) | `:4111-4113` | `:4110-4112` |
+| 220's collapse and its clone | `:4104-4110`, `:4114-4120` | `:4104-4109`, `:4115-4120` |
+| 223/224's `L3LU \|\| L3SU` gate | `DataflowToSentient.cpp:394` and `:688` | `:400` and `:689` |
+| 223/224's accepted set | `:398-401`, negated at `:698-704` | `:405-408`, negated at `:699-704` |
+| 224's `std::find(..) == end()` | `:718-721` | `:718-720` |
+| 207's dropped simplifications | `Utils.cpp:38-39` | `:39-40` — `:38` is the signature |
+| 207's outermost-to-innermost sort | `Utils.cpp:78` | `:68` |
+
+⭐ **AND ONE CITATION THAT LOOKED WRONG AND IS NOT.** 227's `VectorChainToSentientPT.cpp:1006` names a
+basename rather than a nested path, which is the crate's majority convention (20 bare against 7
+nested), the basename is unique in the authority tree, and the line is exact. What was missing was the
+second site above, not the path.
+
+⛔ **AND THE TICK COUNT UNDERSTATES THE LANDED PORTS BY 18.** Measured after the 230-253 review landed:
+257 `[x]` PORT and 257 `[x]` AUDIT boxes, 127 unticked each (257 + 127 = 384), which is what the
+Progress counter now reads. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
+still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exactly that state and
+`801187bde` and `edfa7b2bb`'s review passes ticked them; `2c70786a4`'s review of 167-190 did not, so its
+span is still open on paper while its Rust is landed. Ticking them is the reviewing pass's job for those
+spans, not this one's.
+
 ## Progress
 
 `257/384 ported; 257/384 audited`

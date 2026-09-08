@@ -786,7 +786,8 @@ mod unit_tests {
 /// **227/384** `OperandReuse::~OperandReuse` — `OperandReuse.hpp:30` (0L): `data_origins_.clear();`.
 ///
 /// ⭐⭐ THE TABLE DIES WITH THE OBJECT, AND THAT IS THE FACT. One `OperandReuse` is constructed per
-/// lowering of one `dataflow.program_unit` (`VectorChainToSentientPT.cpp:1006`), so a table that
+/// lowering of one `dataflow.program_unit` (`VectorChainToSentientPT.cpp:1006`, and again on the
+/// other side at `VectorChainToSentientPESFP.cpp:1388`), so a table that
 /// outlived it would carry the previous unit's data origins into the next unit's numbering. Writing
 /// it as a real [`Drop`] rather than leaning on the field's own drop glue is what pins that: a
 /// `static`/shared table would still compile against every method here and silently fail this.

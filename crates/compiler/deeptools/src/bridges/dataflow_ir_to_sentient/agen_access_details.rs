@@ -2199,7 +2199,7 @@ pub enum ConstructedIndices {
 /// transcribe for it; `back()` on the row is the constant term, and it is 0 when the address has no
 /// constant offset, which is the same answer that arm would have given.
 ///
-/// ⛔ `compressUnusedSymbols` AND `simplifyAffineMap` (`Utils.cpp:38-39`) ARE DROPPED AS
+/// ⛔ `compressUnusedSymbols` AND `simplifyAffineMap` (`Utils.cpp:39-40`) ARE DROPPED AS
 /// CANONICALISATIONS. They exist so MLIR's flattener sees a minimal map; the island's flattener
 /// derives the coefficient row from the expression tree directly, and an unused symbol contributes a
 /// zero column either way. ⚠️ They are NOT dropped silently: had they changed `getNumDims()`, they
@@ -2227,7 +2227,7 @@ fn construct_iterator_coeff_dict(
     let composed_layout_map = mem_view_layout_map.compose(&composed_load_order_map);
     let composed_layout_coeffs = composed_layout_map.coefficients(0);
 
-    // Sort the indices from outermost to innnermost (`Utils.cpp:78`) — the walk is over `indices`,
+    // Sort the indices from outermost to innnermost (`Utils.cpp:68`) — the walk is over `indices`,
     // which is already in that order; see [`IndicesCoeffDict`] on why this is a vector.
     IndicesCoeffDict {
         per_index: indices

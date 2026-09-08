@@ -5762,7 +5762,7 @@ pub struct AddressIncrements {
     /// `increment` as the reference left it.
     pub increment: Val,
     /// The `sentient.scalar_constant`s, in build order. ⭐ THEY GO BEFORE THE
-    /// `dataflow.program_unit`, which is the whole of the insertion-point save/restore (`:1593`).
+    /// `dataflow.program_unit`, which is the whole of the insertion-point save/restore (`:1593-1594` and `:1626`).
     pub hoisted: Vec<SenOp>,
 }
 
@@ -5781,7 +5781,7 @@ fn hoisted_index_constant(values: &mut Values, into: &mut Vec<SenOp>, value: i64
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581` (43L).
 ///
 /// ⛔ THE NON-L3 BURST ARM BUILDS **TWO SEPARATE CONSTANTS** OF THE SAME `stride_size`
-/// (`:1605-1613`), one per address — a single shared value is a different program.
+/// (`:1604-1610`), one per address — a single shared value is a different program.
 /// ⛔ AND L3 KEEPS THE VIEW'S START ADDRESS AS `immutable_addr` ON EVERY PATH (`:1587-1589`), so its
 /// burst arm hoists the increment alone and its no-burst arm hoists the zero alone.
 pub fn set_immutable_addr_and_increments(
@@ -5806,13 +5806,13 @@ pub fn set_immutable_addr_and_increments(
                 i64::try_from(total_elements.0.saturating_mul(burst_size.0)).unwrap_or(i64::MAX);
             increment = hoisted_index_constant(values, &mut hoisted, elements);
         } else {
-            // `:1604-1612`.
+            // `:1604-1610`.
             let stride = i64::from(stride_size.0);
             immutable_addr = hoisted_index_constant(values, &mut hoisted, stride);
             increment = hoisted_index_constant(values, &mut hoisted, stride);
         }
     } else {
-        // `:1618-1626` — no burst and no IL groups means a zero increment on every unit, and a zero
+        // `:1617-1624` — no burst and no IL groups means a zero increment on every unit, and a zero
         // immutable address on everything but L3.
         if !is_l3 {
             immutable_addr = hoisted_index_constant(values, &mut hoisted, 0);
@@ -5846,12 +5846,12 @@ pub enum StType {
         total_elements: Elements,
     },
     /// ⭐ A 128-BYTE RECEIVE SETS **NO** `shuffle_mode` AND STILL REWRITES `total_elements`
-    /// (`:1766-1774`) — the one outcome [`LdType`] has no counterpart for.
+    /// (`:1775-1780`) — the one outcome [`LdType`] has no counterpart for.
     FullStick {
         /// The rewritten count.
         total_elements: Elements,
     },
-    /// `emitOpError("unsupported sttype")` — the shuffle arm (`:1747`) or the receive arm (`:1767`).
+    /// `emitOpError("unsupported sttype")` — the shuffle arm (`:1755`) or the receive arm (`:1776`).
     UnsupportedStType,
 }
 
@@ -5860,8 +5860,8 @@ pub enum StType {
 /// **215/384** `AgenToSentientLoweringPass::setsttype` —
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731` (50L).
 ///
-/// ⛔ THE SHUFFLE ARM REWRITES `total_elements` **BEFORE** IT CLASSIFIES (`:1741`) AND THE RECEIVE
-/// ARM **AFTER** (`:1773`) — so the shuffle's rejection clobbers the caller's variable and the
+/// ⛔ THE SHUFFLE ARM REWRITES `total_elements` **BEFORE** IT CLASSIFIES (`:1743`) AND THE RECEIVE
+/// ARM **AFTER** (`:1780`) — so the shuffle's rejection clobbers the caller's variable and the
 /// receive's leaves it alone. Both are invisible: the caller stops either way.
 /// ⛔ AND BOTH SHUFFLE MASKS WANT `repetition == 1`, unlike [`setldtype`]'s 64 and 8.
 pub fn setsttype<A: Arch>(
@@ -5869,7 +5869,7 @@ pub fn setsttype<A: Arch>(
     producer_input: &DfirOp,
     element_width: NonZeroU32,
 ) -> StType {
-    // `:1737` — non-default sttypes currently supported for LX only.
+    // `:1735-1736` — non-default sttypes currently supported for LX only.
     if !matches!(comp, GenericComp::Lxlu | GenericComp::Lxsu) {
         return StType::Default;
     }
@@ -5878,7 +5878,7 @@ pub fn setsttype<A: Arch>(
     let full_stick = Elements(A::BYTES_PER_STICK.get() * 8 / u64::from(element_width.get()));
 
     match producer_input {
-        // `:1741-1757`.
+        // `:1741-1756`.
         DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle {
             indices,
             repetition,
@@ -5899,7 +5899,7 @@ pub fn setsttype<A: Arch>(
                 StType::UnsupportedStType
             }
         }
-        // `:1758-1774` — the receive's own result type gives the byte count, and the reference's
+        // `:1757-1780` — the receive's own result type gives the byte count, and the reference's
         // `isIntOrFloatType` check is unspellable: [`crate::islands::dataflow_ir::ty::ElemType`] has
         // no other kind.
         DfirOp::Dataflow(dataflow::Op::Receive { ty, .. }) => {
@@ -5918,7 +5918,7 @@ pub fn setsttype<A: Arch>(
                 _ => StType::UnsupportedStType,
             }
         }
-        // `:1776` — neither `dyn_cast` matched, and the reference returns success having written
+        // `:1783` — neither `dyn_cast` matched, and the reference returns success having written
         // nothing.
         _ => StType::Default,
     }
@@ -5987,16 +5987,16 @@ impl<'a> ExtractVectorStore<'a> {
 /// THE `sentient.receive_and_extract_scalar` PATTERN, BUILT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstructedExtract<'a> {
-    /// The `position` operand's constant `0` (`:2547-2549`).
+    /// The `position` operand's constant `0` (`:2544-2546`).
     pub zero: SenOp,
-    /// The extract statement (`:2551-2553`).
+    /// The extract statement (`:2548-2550`).
     pub extract: SenOp,
-    /// The `extract_idx` stamped on BOTH it and [`Self::indirect_store`] (`:2558-2560`) — the pairing
+    /// The `extract_idx` stamped on BOTH it and [`Self::indirect_store`] (`:2556-2557`) — the pairing
     /// two `setAttr` calls made in the reference.
     pub paired: ExtractScalarOp,
     /// The scatter that pairing points at, so its lowering can find this extract.
     pub indirect_store: &'a DfirOp,
-    /// `ops_to_be_deleted` — the store then the receive (`:2562-2563`).
+    /// `ops_to_be_deleted` — the store then the receive (`:2560-2561`).
     pub to_be_deleted: [&'a DfirOp; 2],
 }
 
@@ -6007,7 +6007,7 @@ pub enum ReceiveAndExtractScalar<'a> {
     /// Boxed: the built pattern is many words wide and the ten refusals are none.
     Constructed(Box<ConstructedExtract<'a>>),
     /// The stored-into view is not a `dataflow.get_logical_memory_view` — the reference's unguarded
-    /// `cast` (`:2486-2487`), which crashes there.
+    /// `cast` (`:2487-2488`), which crashes there.
     ViewIsNotALogicalMemoryView,
     /// `emitError("indirect memory view does not match expected extract pattern")`.
     ViewIsNotTheExtractPattern(IndirectMemViewCheck),
@@ -6045,7 +6045,7 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
     values: &mut Values,
     extract_ops: &mut ExtractScalarOps,
 ) -> ReceiveAndExtractScalar<'a> {
-    // `:2486-2487`.
+    // `:2487-2488`.
     let Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
         from,
         start,
@@ -6056,7 +6056,7 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
         return ReceiveAndExtractScalar::ViewIsNotALogicalMemoryView;
     };
 
-    // `:2489-2492`.
+    // `:2491-2493`.
     let check = check_indirect_mem_view_for_extract_op(&IndirectMemView::resolve(
         scope, *from, *start, layout,
     ));
@@ -6064,7 +6064,7 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
         return ReceiveAndExtractScalar::ViewIsNotTheExtractPattern(check);
     }
 
-    // `:2496-2506`.
+    // `:2497-2505`.
     let mut ind_store_op: Option<&'a DfirOp> = None;
     let mut num_users = 0_usize;
     for user in uses(store.view, scope) {
@@ -6077,7 +6077,7 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
             _ => return ReceiveAndExtractScalar::InvalidUserOfIndirectMemView,
         }
     }
-    // `:2507-2513` — the scatter first, then the count.
+    // `:2506-2513` — the scatter first, then the count.
     let Some(indirect_store) = ind_store_op else {
         return ReceiveAndExtractScalar::NoIndirectStoreUser;
     };
@@ -6102,12 +6102,12 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
     else {
         return ReceiveAndExtractScalar::StoreDoesNotOperateOnAReceive;
     };
-    // `:2525-2527` — `hasOneUse`.
+    // `:2524-2526` — `hasOneUse`.
     if uses(*received, scope).len() != 1 {
         return ReceiveAndExtractScalar::ReceiveHasOtherUsers;
     }
 
-    // `:2529-2540` — the unit the receive drains, by its GENERIC component.
+    // `:2528-2540` — the unit the receive drains, by its GENERIC component.
     let Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) =
         defining_op(receive_from.val(), scope)
     else {
@@ -6120,7 +6120,7 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
         return ReceiveAndExtractScalar::ReceiveFromUnitIsNotPeOrPtOrLxlu;
     }
 
-    // `:2544-2560` — the zero, the extract, and the index that pairs it with the scatter. ⛔ NO
+    // `:2544-2557` — the zero, the extract, and the index that pairs it with the scatter. ⛔ NO
     // `dbgName`: the island's `get_logical_memory_view` carries none for `getDbgNameAttr` to copy.
     let position = values.mint();
     let result = values.mint();
@@ -6146,7 +6146,7 @@ pub fn construct_receive_and_extract_scalar_op<'a>(
 // 217/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE FOUR FIELDS A LOAD AND ITS STORE HAVE TO AGREE ON (`Helper.cpp:2925-2933`).
+/// THE FOUR FIELDS A LOAD AND ITS STORE HAVE TO AGREE ON (`Helper.cpp:2922-2932`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferShape {
     /// `getTotalElements()`.
@@ -6218,7 +6218,7 @@ pub enum VectorLoadHelper {
 /// `sentient.load_and_send`; present, two records must AGREE on all four extents before they become
 /// one `sentient.load_and_store`.
 /// ⛔ THE DELETE LIST IS NOT A PARAMETER because the reference fills it only after the emission
-/// succeeded (`:2947-2950`), which is behind both `todo!`s.
+/// succeeded (`:2945-2947`), which is behind both `todo!`s.
 pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
     load_op: &DfirOp,
     store_op: Option<&DfirOp>,
@@ -6235,7 +6235,7 @@ pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
         {
             return VectorLoadHelper::SingleAccessInfoNeeded;
         }
-        // `:2910-2918`.
+        // `:2910-2917`.
         todo!(
             "e358_constructLoadAndSendStmt is unported, so {load_op:?} on {:?} cannot become a \
              sentient.load_and_send",
@@ -6243,14 +6243,14 @@ pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
         );
     };
 
-    // `:2920-2923`.
+    // `:2919-2921`.
     if access_details.entries().len() != 2
         || mutable_addrs.entries().len() != 2
         || immutable_addrs.entries().len() != 2
     {
         return VectorLoadHelper::DoubleAccessInfoNeeded;
     }
-    // `:2924-2939`.
+    // `:2922-2935`.
     let (Some(src), Some(dst)) = (
         access_details.get(MemoryOperandIndex::DirSrc),
         access_details.get(MemoryOperandIndex::DirDst),
@@ -6261,7 +6261,7 @@ pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
         return VectorLoadHelper::AccessDetailsDiffer;
     }
 
-    // `:2941-2946`.
+    // `:2937-2947`.
     todo!(
         "e268_constructLoadAndStoreStmt is unported, so {load_op:?} and {store_op:?} on {:?} cannot \
          become a sentient.load_and_store",
@@ -6308,11 +6308,11 @@ pub fn lower_set_transfer_mask_state_op<A: Arch>(
 // 219/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// WHERE A `uniform.query_map`'s KEY COMES FROM (`:3961-3992`).
+/// WHERE A `uniform.query_map`'s KEY COMES FROM (`:3962-3992`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryKey<'a> {
     /// A region argument of a `uniformize_regions`/`equalize_pattern` that does NOT enclose the loop,
-    /// so a fresh uniformize op is built outside it (`:3966-3983`).
+    /// so a fresh uniformize op is built outside it (`:3967-3983`).
     RegionArg {
         /// The op the new one is rebuilt from, as entry 158 takes it.
         source: &'a UniformizeSource<'a>,
@@ -6325,7 +6325,7 @@ pub enum QueryKey<'a> {
     NotABlockArgument,
 }
 
-/// WHERE THE `def_immutable_mapping` BEHIND A `query_map`'s `map` OPERAND SITS (`:3994-3998`).
+/// WHERE THE `def_immutable_mapping` BEHIND A `query_map`'s `map` OPERAND SITS (`:3993-3997`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapDef<'a> {
     /// Already outside the loop — its result is read as it stands.
@@ -6337,11 +6337,11 @@ pub enum MapDef<'a> {
 /// WHERE THE VIEW'S START ADDRESS IS DEFINED, relative to the loop it is being lifted out of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartAddrDef<'a> {
-    /// A block argument whose owner properly encloses the loop (`:3943-3947`).
+    /// A block argument whose owner properly encloses the loop (`:3944-3948`).
     EnclosingBlockArgument,
-    /// Defined by an op already outside the loop (`:4019-4021`).
+    /// Defined by an op already outside the loop (`:4018-4020`).
     Outside,
-    /// An `arith.constant` inside the loop (`:3953-3954`).
+    /// An `arith.constant` inside the loop (`:3954-3955`).
     InLoopConstant(&'a DfirOp),
     /// A `uniform.query_map` inside the loop, whose key and map are placed separately.
     InLoopQueryMap {
@@ -6371,7 +6371,7 @@ pub enum ClonedStartAddr {
     InUniformizeRegion {
         /// Its position among the ops preceding the loop.
         at: usize,
-        /// ⛔ THE UNIFORMIZE OP'S OWN RESULT, not the `query_map`'s (`:4011`).
+        /// ⛔ THE UNIFORMIZE OP'S OWN RESULT, not the `query_map`'s (`:4010`).
         start_addr: Val,
     },
     /// `emitError("unsupported key type")`.
@@ -6382,7 +6382,7 @@ pub enum ClonedStartAddr {
     NoActiveUniformizeOp,
 }
 
-/// The mapping clone, if any, and the new `uniform.query_map` (`:3994-4004`).
+/// The mapping clone, if any, and the new `uniform.query_map` (`:3994-4001`).
 fn query_map_ops(values: &mut Values, map: &MapDef<'_>, key: Val) -> (Vec<DfirOp>, Val) {
     let mut ops: Vec<DfirOp> = Vec::new();
     let map = match map {
@@ -6409,7 +6409,7 @@ fn query_map_ops(values: &mut Values, map: &MapDef<'_>, key: Val) -> (Vec<DfirOp
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942` (79L).
 ///
 /// ⛔⛔ THE UNIFORMIZE PATH PLACES THE CLONES **INSIDE** REGION `region_idx` AND HANDS BACK THE
-/// UNIFORMIZE OP'S OWN RESULT (`:4006-4012`) — the region's `uniform.yield` carries the
+/// UNIFORMIZE OP'S OWN RESULT (`:4003-4010`) — the region's `uniform.yield` carries the
 /// `query_map`'s result out, and a caller reading the `query_map` directly would read a value
 /// defined inside a region it does not enter.
 /// ⛔ THE ENCLOSING-KEY PATH BUILDS NO UNIFORMIZE OP AT ALL, so the same `query_map` is simply
@@ -6421,11 +6421,11 @@ pub fn clone_start_addr_outside_loop(
     preceding: &mut Vec<Uniformized>,
 ) -> ClonedStartAddr {
     match def {
-        // `:3943-3947` and `:4019-4021`.
+        // `:3944-3948` and `:4018-4020`.
         StartAddrDef::EnclosingBlockArgument | StartAddrDef::Outside => {
             ClonedStartAddr::AsItStands(start_addr)
         }
-        // `:3953-3954`.
+        // `:3954-3955`.
         StartAddrDef::InLoopConstant(constant) => {
             let clone = values.clone_without_regions(constant, &mut ValueMapping::new());
             let cloned = results(&clone).first().copied().unwrap_or(start_addr);
@@ -6441,7 +6441,7 @@ pub fn clone_start_addr_outside_loop(
                 ClonedStartAddr::Hoisted { ops, start_addr }
             }
             QueryKey::RegionArg { source, region_idx } => {
-                // `:3971-3974`.
+                // `:3973-3978`.
                 let at = match create_uniformize_regions_op(
                     values,
                     source,
@@ -6467,11 +6467,11 @@ pub fn clone_start_addr_outside_loop(
                 let Some(region) = regions.get_mut(*region_idx) else {
                     return ClonedStartAddr::UnsupportedKeyType;
                 };
-                // `:3975-3983` — the key is that region's argument, and the insertion point is the
+                // `:3979-3983` — the key is that region's argument, and the insertion point is the
                 // start of its block.
                 let (ops, query_result) = query_map_ops(values, map, region.arg);
                 region.body.splice(0..0, ops);
-                // `:4006-4011`.
+                // `:4003-4009`.
                 if let Some(DfirOp::Uniform(dfir_op::uniform::Op::Yield { operands })) =
                     region.body.last_mut()
                 {
@@ -6498,14 +6498,14 @@ pub fn clone_start_addr_outside_loop(
 pub enum SetSendDestinationCleanup {
     /// `getArch() < RCUDD1A_ISA` — none is generated at this level, so none is removed (`:4086-4088`).
     NoSetDstMaskAtThisArchLevel,
-    /// The unit has none (`:4098-4099`).
+    /// The unit has none (`:4099`).
     Nothing,
     /// The first one's `$units` is not defined by a `dataflow.get_unit` (`:4101-4103`).
     LeadIsNotAGetUnit,
     /// They do not all name the same unit, so ⛔ NOTHING IS TOUCHED — the erasure is INSIDE the
-    /// `llvm::all_of` block (`:4109-4120`).
+    /// `llvm::all_of` block (`:4109-4121`).
     UnitsDiffer,
-    /// They all set the default `sfp`, so every one is erased and none replaces them (`:4111-4113`).
+    /// They all set the default `sfp`, so every one is erased and none replaces them (`:4110-4112`).
     ErasedAll {
         /// How many went.
         erased: usize,
@@ -6562,7 +6562,7 @@ fn get_unit_attrs(end: SendEnd, body: &[SenOp]) -> Option<(Residency, DfirUnit, 
 /// **220/384** `AgenToSentientLoweringPass::cleanupTriviallyRedundantSetSendDestination` —
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084` (38L).
 ///
-/// ⛔⛔ WHEN THEY ALL NAME `sfp` IT ERASES EVERY ONE AND EMITS NOTHING (`:4111-4113`) — the default
+/// ⛔⛔ WHEN THEY ALL NAME `sfp` IT ERASES EVERY ONE AND EMITS NOTHING (`:4110-4112`) — the default
 /// destination needs no `setdstmask` at all, so the pass's output for the common case is the
 /// ABSENCE of the op.
 /// ⛔ AND THE COMPARISON IS THE SPELLED UNIT, not its generic component: `getType() != "sfp"` reads
@@ -6587,7 +6587,7 @@ pub fn cleanup_trivially_redundant_set_send_destination<A: Arch>(
     let Some(lead_attrs) = get_unit_attrs(lead, body) else {
         return SetSendDestinationCleanup::LeadIsNotAGetUnit;
     };
-    // `:4104-4110`.
+    // `:4104-4109`.
     if !ends
         .iter()
         .all(|end| get_unit_attrs(*end, body) == Some(lead_attrs))
@@ -6597,13 +6597,13 @@ pub fn cleanup_trivially_redundant_set_send_destination<A: Arch>(
 
     let erased = ends.len();
     let (residency, unit, num_folds) = lead_attrs;
-    // `:4111-4113`.
+    // `:4110-4112`.
     if unit == DfirUnit::Sfp {
         erase_set_send_dsts(body);
         return SetSendDestinationCleanup::ErasedAll { erased };
     }
 
-    // `:4114-4120` — the clone, then its `set_send_dst`, then the originals go. ⭐ THE END IS
+    // `:4115-4120` — the clone, then its `set_send_dst`, then the originals go. ⭐ THE END IS
     // RENUMBERED ONTO THE CLONE rather than minted: the wire it names is the same one.
     erase_set_send_dsts(body);
     let get_unit = values.mint();
