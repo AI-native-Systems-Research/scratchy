@@ -168,6 +168,28 @@ impl UniformInstrBlock {
         let region = self.current_region().0 as usize;
         self.instr_lists_mut().get_mut(region)?.last_mut()
     }
+
+    /// Replaces: e023_getUnitInstrList
+    ///
+    /// The instructions one unit runs in this block — the whole list when the block is REGULAR, its
+    /// own region's when it is UNIFORM.
+    ///
+    /// ⛔ AN UNMAPPED UNIT RUNS NOTHING HERE, unlike `getInstr`, which reads region 0 for it
+    /// (`:367`) — the two disagree in the reference and this keeps both.
+    /// ⛔ THE LAST ENTRY FOR A UNIT WINS, as the `map[unit] = idx` that fills the map leaves.
+    #[must_use]
+    pub fn unit_instr_list(&self, unit: UnitKey) -> &[UniformInstrInfo] {
+        match self {
+            UniformInstrBlock::Regular(instrs) => instrs,
+            UniformInstrBlock::Uniform(block) => block
+                .unit_to_region
+                .iter()
+                .rev()
+                .find(|(at, _)| *at == unit)
+                .and_then(|(_, region)| block.regions.get(region.0 as usize))
+                .map_or(&[][..], Vec::as_slice),
+        }
+    }
 }
 
 impl UniformBlock {
@@ -180,6 +202,25 @@ impl UniformBlock {
     /// REGULAR block has no `UniformBlock` to set it on.
     pub fn set_current_region(&mut self, region: RegionIndex) {
         self.current = region;
+    }
+
+    /// Replaces: e024_insertInstruction
+    ///
+    /// Appends one instruction to the current region, opening that region if the lists have not
+    /// reached it yet.
+    ///
+    /// ⚠️ A REGION PAST ONE-BEYOND-THE-END IS OPENED EMPTY, where the reference's
+    /// `int(current_region_) - int(instr_lists_.size()) <= 0` aborts: `setCurrentRegion` takes any
+    /// index, so the two-regions-ahead state is reachable and this fills the gap rather than losing
+    /// the instruction.
+    pub fn insert_instruction(&mut self, instr: UniformInstrInfo) {
+        let region = self.current.0 as usize;
+        if let Some(list) = self.regions.get_mut(region) {
+            list.push(instr);
+        } else {
+            self.regions.resize_with(region, Vec::new);
+            self.regions.push(vec![instr]);
+        }
     }
 
     /// Replaces: e030_appendEmptyUniformRegion
@@ -226,8 +267,6 @@ impl UniformInstrBlocks {
     }
 }
 
-// crustify:todo: e023_getUnitInstrList
-// crustify:todo: e024_insertInstruction
 // crustify:todo: e033_appendUniformBlock
 // crustify:todo: e034_getUniformInstr
 // crustify:todo: e035_doesInstrWithThisIndexExist
@@ -365,5 +404,51 @@ mod unit_tests {
             ..UniformBlock::default()
         }));
         assert_eq!(blocks.max_instr_size(), 2 + 3);
+    }
+
+    /// e023: a mapped unit runs its own region, an unmapped one runs nothing, and a REGULAR block is
+    /// one list every unit runs.
+    #[test]
+    fn an_unmapped_unit_runs_nothing_and_a_regular_block_is_one_list() {
+        let lxlu = unit(DfirUnit::Lxlu);
+        let block = UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop()], vec![ret(), nop()]],
+            // The second entry is the one `map[unit] = idx` would have left.
+            unit_to_region: vec![(lxlu, RegionIndex(0)), (lxlu, RegionIndex(1))],
+            ..UniformBlock::default()
+        });
+        assert_eq!(
+            block
+                .unit_instr_list(lxlu)
+                .iter()
+                .map(|instr| instr.opcode)
+                .collect::<Vec<_>>(),
+            vec![OpCode::RETURN, OpCode::NOP]
+        );
+        assert!(block.unit_instr_list(unit(DfirUnit::L3su)).is_empty());
+        let regular = UniformInstrBlock::Regular(vec![nop(), ret()]);
+        assert_eq!(regular.unit_instr_list(unit(DfirUnit::Pe)).len(), 2);
+    }
+
+    /// e024: the instruction joins the current region, which is opened when the lists stop short of
+    /// it — including the skipped-region case the reference refuses.
+    #[test]
+    fn an_inserted_instruction_opens_the_current_region() {
+        let mut block = UniformBlock::default();
+        block.insert_instruction(nop());
+        block.insert_instruction(ret());
+        assert_eq!(block.regions.len(), 1);
+        assert_eq!(
+            block.regions[0]
+                .iter()
+                .map(|i| i.opcode)
+                .collect::<Vec<_>>(),
+            vec![OpCode::NOP, OpCode::RETURN]
+        );
+        block.set_current_region(RegionIndex(2));
+        block.insert_instruction(nop());
+        assert_eq!(block.regions.len(), 3, "the skipped region is opened empty");
+        assert!(block.regions[1].is_empty());
+        assert_eq!(block.regions[2].len(), 1);
     }
 }
