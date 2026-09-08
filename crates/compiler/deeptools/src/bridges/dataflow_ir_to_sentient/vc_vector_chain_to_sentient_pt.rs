@@ -134,6 +134,7 @@ pub const fn compute_unit_precision(precision: dataflow::Precision) -> sentient:
         dataflow::Precision::Bf16 => sentient::Precision::Bf16,
         dataflow::Precision::Mxfp4 => sentient::Precision::Mxfp4,
         dataflow::Precision::Mxfp8 => sentient::Precision::Mxfp8,
+        dataflow::Precision::Mxint4 => sentient::Precision::Mxint4,
     }
 }
 
