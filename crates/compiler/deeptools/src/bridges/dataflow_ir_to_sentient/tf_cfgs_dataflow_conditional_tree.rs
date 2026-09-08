@@ -2569,7 +2569,7 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
 /// block would have to move past — see [`op_has_side_effect`]'s three callers.
 /// ⛔ THE FIRST CLAUSE IS A DIFFERENT QUESTION FROM THE SECOND. `to_hoist->getBlock() !=
 /// then_or_else_block` asks whether the op is in THIS block *"as opposed to a for-loop's block"*
-/// (`:112-114`); here that is the position search, and an op from elsewhere is not hoistable.
+/// (`:151`); here that is the position search, and an op from elsewhere is not hoistable.
 #[must_use]
 pub fn is_hoistable(to_hoist: &DfirOp, then_or_else_block: &[DfirOp]) -> bool {
     // `to_hoist->getBlock() != then_or_else_block || opHasSideEffect(*to_hoist)`, in that order.

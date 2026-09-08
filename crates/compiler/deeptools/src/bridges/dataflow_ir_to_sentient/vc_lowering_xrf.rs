@@ -2592,7 +2592,7 @@ mod unit_tests {
 ///
 /// ⛔ THE PARENT LINK IS THE CALLER'S, AS EVERYWHERE IN THIS FILE — see [`Definitions`]. The
 /// reference reaches the loop twice, by `sub_op.getRhs().getParentRegion()->getParentOp()` and by
-/// walking `op->getParentRegion()` outwards (`LoweringXRF.cpp:54`, `:78-91`), and both answers are
+/// walking `op->getParentRegion()` outwards (`LoweringXRF.cpp:54`, `:79-92`), and both answers are
 /// in this list: the [`OpId`] is the `layout_map` key, the [`Val`] is `getInductionVar()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnclosingLoop {
@@ -2815,8 +2815,8 @@ pub fn create_for_op_with_return_value(for_op: &sen::Op, vals: &mut Values) -> O
 ///
 /// ⛔ TWO RESULTS, NOT OLD PLUS TWO: `TypeRange({index, index})` REPLACES the result list (`:192`),
 /// and the old `sentient.if` this runs on binds nothing.
-/// ⛔ THE ELSE REGION IS CREATED UNCONDITIONALLY (`withElseRegion = true`, `:198`) and only CLONED
-/// INTO when the original had one (`:222`) — so a one-armed `if` comes back with a bare
+/// ⛔ THE ELSE REGION IS CREATED UNCONDITIONALLY (`withElseRegion = true`, `:197`) and only CLONED
+/// INTO when the original had one (`:226`) — so a one-armed `if` comes back with a bare
 /// `sentient.yield` in its else, which in this island is what makes the region exist.
 #[must_use]
 pub fn create_if_op_with_return_value(if_op: &sen::Op, vals: &mut Values) -> Option<XrfCarryingOp> {
@@ -2897,7 +2897,7 @@ pub fn create_if_op_with_return_value(if_op: &sen::Op, vals: &mut Values) -> Opt
 /// ⛔ IT BINDS ONE INDEX RESULT AND CARRIES NO POINTERS: `TypeRange(IndexType)` with an empty
 /// `ValueRange()` (`:317-318`), which is what the xrf pointer is later threaded THROUGH.
 /// ⭐ THE FOUR EMPTY `ArrayAttr`s ARE THE FORWARDING LISTS, and the defaulted attributes below them
-/// are the `.td`'s own (`SentientOps.td:247-267`).
+/// are the `.td`'s own (`SentientOps.td:244-267`).
 #[must_use]
 pub fn insert_dummy_mac_op(vals: &mut Values) -> XrfPtrAdvance {
     let mask = vals.mint();
@@ -2948,9 +2948,10 @@ mod xrf_lowering_unit_tests {
 
     /// 🎯 240/384 — ONE SUBSCRIPT DRIVEN BY A LOOP, AND A BASE ADDRESS THAT IS NOT ZERO.
     ///
-    /// The shape of `dynamic_pt_masking.mlir:216-254`: a `vector.load` whose subscript is an
-    /// `arith.subi` on an enclosing loop's induction variable, over a view based at a constant. fp16
-    /// puts 64 elements in a stick, so a stride of 64 elements is ONE stick and a base of 128 is TWO.
+    /// The `arith.subi`-on-an-enclosing-loop's-induction-variable subscript of
+    /// `dynamic_pt_masking.mlir:226-256`; the vendor's case is a `vector.store` over a `%c0` base, so
+    /// the load and the non-zero base here are this test's own variation. fp16 puts 64 elements in a
+    /// stick, so a stride of 64 elements is ONE stick and a base of 128 is TWO.
     ///
     /// ⭐ AND THE SECOND ENCLOSING LOOP, WHICH NO SUBSCRIPT READS, COMES BACK ZERO — the second pass.
     #[test]

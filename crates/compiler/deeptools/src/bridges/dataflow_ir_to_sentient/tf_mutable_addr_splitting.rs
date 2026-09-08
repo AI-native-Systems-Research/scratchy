@@ -4180,7 +4180,7 @@ mod unit_tests {
     ///
     /// The same case fed in the order entry 250 builds it — 384 before 12288 — cuts the LIGHT
     /// dimension to 1 first and then sizes the heavy one against a reduced overflow, `[1, 4]`.
-    /// `sortDataBasedOnWeight` (`:826`) is what turns it back into the vendor's single
+    /// `sortDataBasedOnWeight` (`:827`) is what turns it back into the vendor's single
     /// `arith.constant 4`.
     #[test]
     fn the_setup_sorts_before_it_sizes_and_the_one_dim_key_needs_that() {
@@ -4347,7 +4347,7 @@ mod unit_tests {
             "each partition's ops land inside its own arm, before that region's terminator"
         );
 
-        // ⛔ AND THE REBUILT MAP DROPS THE SYMBOLS THE ORIGINAL DECLARED (`:1170`).
+        // ⛔ AND THE REBUILT MAP DROPS THE SYMBOLS THE ORIGINAL DECLARED (`:1171`).
         let symbolic = AffineMap {
             dims: 1,
             syms: 1,
@@ -6992,7 +6992,7 @@ pub fn init_mas_data(ad: &AccessDetailsAffine<'_>, scope: &[DfirOp]) -> MasDataI
 pub enum SetupForPartitioning {
     /// `calculatePartitionSizes(...)`'s answer, over a `mas_data` now sorted by weight.
     Sized(Partitioning),
-    /// `DT_CHECK(isEligibleForSplitting(all_mem_views))` (`:825`) — and nothing is sorted.
+    /// `DT_CHECK(isEligibleForSplitting(all_mem_views))` (`:826`) — and nothing is sorted.
     NotEligibleForSplitting(SplittingEligibility),
 }
 
@@ -7002,7 +7002,7 @@ pub enum SetupForPartitioning {
 /// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:819` (6L): the three statements that stand
 /// between an overflow and a partition plan — eligibility, sort, size.
 ///
-/// ⛔ THE SORT IS THE MIDDLE STATEMENT AND IT MUTATES THE CALLER'S `mas_data` (`:826`), which is what
+/// ⛔ THE SORT IS THE MIDDLE STATEMENT AND IT MUTATES THE CALLER'S `mas_data` (`:827`), which is what
 /// lets [`calculate_partition_sizes`] stop at the heaviest dimension; the ineligible arm returns
 /// having sorted nothing.
 pub fn setup_for_partitioning<A: Arch>(
@@ -7053,7 +7053,7 @@ pub enum EvenImmutableAdjustment {
     /// `DT_CHECK(res < num_res)` (`:1232`) — no `transfer_order` result mentions `d0`.
     NoTransferOrderResultUsesTheInnermostDim,
     /// `DT_CHECK_MSG(ad.getExtents()[res] >= num_elems_in_stick, "Innermost dimension extend must fit
-    /// a full stick.")` (`:1240`).
+    /// a full stick.")` (`:1241-1242`).
     InnermostExtentIsSmallerThanAStick {
         /// `ad.getExtents()[res]`.
         extent: Elements,
@@ -7079,7 +7079,7 @@ pub enum EvenImmutableAdjustment {
 ///
 /// ⛔ THE STICK MOVES TO THE FIRST `transfer_order` RESULT THAT IS A FUNCTION OF `d0`, NOT TO RESULT 0
 /// (`:1229-1232`) — `d0`'s coefficient is always 1, which is what makes the addition a plain one.
-/// ⭐ AND THIS ONE KEEPS `getNumSymbols()` (`:1252`), unlike [`fill_partitions`].
+/// ⭐ AND THIS ONE KEEPS `getNumSymbols()` (`:1251`), unlike [`fill_partitions`].
 /// ⚠️ The `is_even ? true : isL3ImmutableAddrAllOdd(...)` check cannot fire on a constant start — the
 /// two predicates are exact complements there; see [`calculate_partition_sizes`] for the full reason.
 pub fn adjust_for_even_immutable_addr<A: Arch>(
@@ -7130,8 +7130,9 @@ pub fn adjust_for_even_immutable_addr<A: Arch>(
         };
     }
 
-    // `immutable_addr_mod -= num_elems_in_stick;` — ⛔ AFTER both checks in the reference's order but
-    // before the map is rebuilt, and only on this path.
+    // `immutable_addr_mod -= num_elems_in_stick;` — ⚠️ DELIBERATE DIVERGENCE: the reference subtracts
+    // at `:1222`, BEFORE the `res` search and before both `DT_CHECK`s (`:1232`, `:1241-1242`), so it
+    // leaves the caller's `immutable_addr_mod` short of a stick on a path it then aborts. Moved after.
     *immutable_addr_mod = immutable_addr_mod.saturating_sub(elems_in_stick.cast_signed());
 
     // `if (i == res) expr = expr + num_elems_in_stick;` over every result, then
@@ -7150,7 +7151,7 @@ pub fn adjust_for_even_immutable_addr<A: Arch>(
 }
 
 /// WHICH ARM OF AN `scf.if` A NODE IS — `CondNode::isThenNode()` / `isElseNode()`
-/// (`dcc/src/Analysis/ConditionalTree.hpp:87-88`).
+/// (`dcc/src/Analysis/ConditionalTree.hpp:89-90`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arm {
     /// The `then` region.
@@ -7239,7 +7240,7 @@ fn conditionals_in(region: &[DfirOp]) -> Vec<(usize, Val)> {
 }
 
 /// `CondNode::walk<kReverseBFS>` OVER THE LEAVES — `isLeafNode()` is an arm node with no `scf.if` in
-/// it (`ConditionalTree.hpp:90`).
+/// it (`ConditionalTree.hpp:91`).
 ///
 /// ⛔⛔ BREADTH-FIRST, COLLECTED INTO A STACK AND THEN POPPED (`OperationTree.cpp:200-236`, with
 /// `keep_order = false`), so the DEEPEST partition is filled FIRST and same-depth siblings run
@@ -7305,7 +7306,7 @@ pub enum FilledPartitions {
     },
     /// `calculateSubscriptsCoefficients`'s refusal, passed through unchanged.
     CoefficientsNotExtracted(SubscriptsCoefficients),
-    /// `DT_CHECK(coeffs.size() == subscripts_map.getNumResults())` (`:1149`) — ⭐ hoisted out of the
+    /// `DT_CHECK(coeffs.size() == subscripts_map.getNumResults())` (`:1152`) — ⭐ hoisted out of the
     /// leaf walk, which reads the same rows for every partition, so it fires before any leaf is
     /// filled rather than part-way through.
     CoefficientRowDoesNotCoverTheSubscripts {
@@ -7336,7 +7337,7 @@ pub enum FilledPartitions {
         dimensions: usize,
     },
     /// `cast<arith::CmpIOp>` on the condition, or `cast<arith::ConstantOp>` on its right-hand side
-    /// (`:1136-1143`).
+    /// (`:1127-1136`).
     ConditionIsNotACompareAgainstAConstant(Val),
     /// The tree holds no `scf.if` at all, so `cond_tree.getRoot()` is not an `if` node.
     TreeHasNoRootConditional,
@@ -7350,10 +7351,10 @@ pub enum FilledPartitions {
 /// partitioned dimension, innermost first.
 ///
 /// ⛔ `prev_iters` IS `demarkation - partition_sizes[p]` IN A `then` ARM AND `demarkation` IN AN
-/// `else` (`:1145`); it scales BOTH the start address (`* composed_coeff_`) and, negated, every
-/// subscript (`* coeffs[r]`). ⛔⛔ AND THE REBUILT MAP HARD-CODES **ZERO SYMBOLS** (`:1170-1171`),
+/// `else` (`:1142-1143`); it scales BOTH the start address (`* composed_coeff_`) and, negated, every
+/// subscript (`* coeffs[r]`). ⛔⛔ AND THE REBUILT MAP HARD-CODES **ZERO SYMBOLS** (`:1171-1172`),
 /// dropping any the original declared — unlike [`adjust_for_even_immutable_addr`], which preserves
-/// them at `:1252`.
+/// them at `:1251`.
 pub fn fill_partitions(
     cond_tree: &mut Vec<DfirOp>,
     mas_data: &[MasData],

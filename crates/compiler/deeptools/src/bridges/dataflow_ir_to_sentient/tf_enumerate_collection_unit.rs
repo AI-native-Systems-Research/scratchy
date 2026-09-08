@@ -76,7 +76,7 @@ use crate::islands::dataflow_ir::dialects::{
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// `it.clone(operandMap)` OVER A WHOLE BLOCK — the mapping the reference accumulates across the loop
-/// (`EnumerateCollectionUnit.cpp:73-78`), which [`crate::islands::dataflow_ir::dialects::clone_with_fresh_results`]
+/// (`EnumerateCollectionUnit.cpp:76-80`), which [`crate::islands::dataflow_ir::dialects::clone_with_fresh_results`]
 /// deliberately does not do: one clone there, no remap, no regions.
 ///
 /// ⛔ ORDER IS THE WHOLE OF IT. An op's operands are remapped against the values cloned BEFORE it,
@@ -107,7 +107,7 @@ fn clone_block(body: &[DfirOp], vals: &mut Values, remap: &mut Vec<(Val, Val)>) 
 }
 
 /// `programUnitOp.walk(..)` COLLECTING EVERY `dataflow.get_my_unit_in_collection`, then
-/// `op.replaceAllUsesWith(constIntOp.getResult()); op->erase();` (`EnumerateCollectionUnit.cpp:81-88`).
+/// `op.replaceAllUsesWith(constIntOp.getResult()); op->erase();` (`EnumerateCollectionUnit.cpp:83-90`).
 ///
 /// ⛔ TWO PASSES BECAUSE THE ERASE TAKES THE RESULT WITH IT: the worklist is gathered AS the ops are
 /// dropped, and the rewire then runs over what remains. No erased op is itself a user, so the pairwise
@@ -150,11 +150,11 @@ fn repoint(block: &mut [DfirOp], from: Val, to: Val) {
 ///
 /// ⭐ ONE `dataflow.program_unit` PER MEMBER, each on its own `dataflow.get_unit`, each with the
 /// collection body cloned and its `get_my_unit_in_collection` folded to that member's index.
-/// ⛔ THE OPS GO WHERE THE COLLECTION STOOD — `OpBuilder builder(collectionDefinitionOp)` (`:51`) —
-/// and the collection op itself is erased by the CALLER (entry 286, `:120-121`).
+/// ⛔ THE OPS GO WHERE THE COLLECTION STOOD — `OpBuilder builder(collectionDefinitionOp)` (`:52`) —
+/// and the collection op itself is erased by the CALLER (entry 286, `:124`).
 /// ⛔ THREE OF ITS OPS ARE ABSENT FROM `Dataflow.td` AND THE FILE IS IN `LLVM_OPTIONAL_SOURCES`; they
 /// were added to the island for this port — see [`dataflow::Op::GetUnitCollection`].
-/// ⛔ AN EMPTY BODY EMITS NOTHING (`:44-48`): a `Vec` region carries no terminator, so the
+/// ⛔ AN EMPTY BODY EMITS NOTHING (`:45-49`): a `Vec` region carries no terminator, so the
 /// reference's *"body is one op and that op is the terminator"* second clause IS `is_empty`.
 #[must_use]
 pub fn enumerate_collection_unit(
@@ -191,7 +191,7 @@ pub fn enumerate_collection_unit(
         }));
 
         // `ConstantIntOp::create(builder, loc, i, intType)` — `intType` is `IntegerType::get(ctx, 32)`
-        // (`:52`).
+        // (`:53`).
         let index = vals.mint();
         out.push(DfirOp::Arith(arith::Op::ConstantInt {
             result: index,

@@ -2393,7 +2393,7 @@ pub enum TypeSpelling {
 /// **230/384** `convertStringToType` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:196` (24L).
 ///
 /// The eleven-armed `if`/`else if` chain, as a total function: `llvm_unreachable("unknown type
-/// string")` (`:218`) is unrepresentable once the argument is [`TypeSpelling`] rather than a
+/// string")` (`:220`) is unrepresentable once the argument is [`TypeSpelling`] rather than a
 /// `std::string`. ⚠️ DEAD IN THE REFERENCE — nothing calls it; its inverse
 /// [`convert_type_to_string`] has the one caller (entry 277).
 #[must_use]
@@ -2417,9 +2417,9 @@ pub const fn convert_string_to_type(type_string: TypeSpelling) -> ElemType {
 
 /// Replaces: e231_convertTypeToString
 ///
-/// **231/384** `convertTypeToString` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:222` (22L).
+/// **231/384** `convertTypeToString` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:223` (22L).
 ///
-/// ⛔⛔ TEN ARMS AGAINST ENTRY 230'S ELEVEN — `mxint4` IS MISSING (`:222-243`), so a type
+/// ⛔⛔ TEN ARMS AGAINST ENTRY 230'S ELEVEN — `mxint4` IS MISSING (`:223-244`), so a type
 /// [`convert_string_to_type`] produces reaches `llvm_unreachable("unknown type")` on the way back.
 /// ⛔ `None` IS THAT ABORT, and it composes: the one caller compares the answer with a table string
 /// and clears `found` on a mismatch (`VectorChainHelper.cpp:285-292`), which is what `None` does.

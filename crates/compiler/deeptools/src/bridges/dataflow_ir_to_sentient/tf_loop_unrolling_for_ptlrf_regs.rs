@@ -114,7 +114,7 @@ fn loops_post_order<'o>(scope: &'o [DfirOp], into: &mut Vec<(Val, &'o DfirOp)>) 
         }
         match op {
             // `LoopLikeOpInterface` in this island is exactly these three: the two for-loops and
-            // `scf.parallel`, which is the op the *"Unknown for-loop"* arm at `:118` is about.
+            // `scf.parallel`, which is the op the *"Unknown for-loop"* arm at `:123` is about.
             DfirOp::Affine(affine::Op::For { iv, .. }) | DfirOp::Scf(scf::Op::For { iv, .. }) => {
                 into.push((*iv, op));
             }
@@ -127,7 +127,7 @@ fn loops_post_order<'o>(scope: &'o [DfirOp], into: &mut Vec<(Val, &'o DfirOp)>) 
 }
 
 /// ONE MARKED LOOP AND THE UNROLL IT ASKS FOR — `loop_op->removeAttr("unroll")` and the utility call
-/// that follows it (`:88-121`).
+/// that follows it (`:90-128`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtLrfUnroll {
     /// The loop, named by the induction variable an LRF subscript read.
@@ -148,16 +148,16 @@ pub enum PtLrfUnrolling {
         /// The unroll requests, in the post-order the reference issues them.
         unrolls: Vec<PtLrfUnroll>,
     },
-    /// `view_op.getFromUnit().getDefiningOp<GetLocalUnitOp>()` is null and `:41` dereferences it.
+    /// `view_op.getFromUnit().getDefiningOp<GetLocalUnitOp>()` is null and `:43` dereferences it.
     ViewIsNotOfALocalUnit(Val),
-    /// `"Encountered an unknown use of memory view"` (`:57`) — the view named by this value.
+    /// `"Encountered an unknown use of memory view"` (`:56`) — the view named by this value.
     UnknownUseOfMemoryView(Val),
-    /// `"Support for unrolling loop-like op interfaces only"` (`:71-73`).
+    /// `"Support for unrolling loop-like op interfaces only"` (`:70-72`).
     IndexIsNotInALoopLikeOp(Val),
-    /// `"Support for unrolling of loop iterators only"` (`:78-80`) — an index that is neither a
+    /// `"Support for unrolling of loop iterators only"` (`:79-81`) — an index that is neither a
     /// region argument nor an `arith` constant.
     IndexIsNotALoopIterator(Val),
-    /// `"Unknown for-loop for unrolling"` (`:118`) — a marked `scf.parallel`.
+    /// `"Unknown for-loop for unrolling"` (`:123`) — a marked `scf.parallel`.
     UnknownForLoopForUnrolling(Val),
 }
 
@@ -184,7 +184,7 @@ impl PtLrfUnrolling {
 /// hardware, so every loop whose induction variable subscripts one must be gone by lowering. Step 1
 /// marks those loops; step 2 unrolls them innermost-first.
 ///
-/// ⛔⛔ THE `scf.for` ARM'S NULL TEST IS INVERTED (`:107-108`): `if (!lb_const || !ub_const ||
+/// ⛔⛔ THE `scf.for` ARM'S NULL TEST IS INVERTED (`:109`): `if (!lb_const || !ub_const ||
 /// !step_const)` guards the branch that reads `lb_const.value()`, so a constant-bounded loop takes
 /// the `else` and reports *"Non-Constant trip bound"* while a non-constant one dereferences null.
 /// ⭐ The polarity the body requires is the sibling pass's, verbatim, at
@@ -192,7 +192,7 @@ impl PtLrfUnrolling {
 /// same reconstruction already ported as entries 109/110.
 #[must_use]
 pub fn process_compute_unit(unit: &[DfirOp]) -> PtLrfUnrolling {
-    // ── Step 1: `// Collect loops meant for unrolling` (`:39-86`) ────────────────────────────────
+    // ── Step 1: `// Collect loops meant for unrolling` (`:39-88`) ────────────────────────────────
     let mut views: Vec<(Val, Val)> = Vec::new();
     memory_views(unit, &mut views);
     let mut marked: Vec<Val> = Vec::new();
@@ -256,7 +256,7 @@ pub fn process_compute_unit(unit: &[DfirOp]) -> PtLrfUnrolling {
         }
     }
 
-    // ── Step 2: `// Start unrolling the marked loops in reverse order` (`:88-121`) ───────────────
+    // ── Step 2: `// Start unrolling the marked loops in reverse order` (`:90-128`) ───────────────
     let mut ordered: Vec<(Val, &DfirOp)> = Vec::new();
     loops_post_order(unit, &mut ordered);
     let mut unrolls = Vec::new();
@@ -288,7 +288,7 @@ mod unit_tests {
     /// ⛔ THIS PASS IS NOT REGISTERED ANYWHERE IN THE AUTHORITY TREE — `LoopUnrollingForPTLRFRegs`
     /// appears only in its own file and `Transform/Dataflow/CMakeLists.txt`, with no `Passes.h`
     /// declaration, no pipeline entry and no `dcc/test` case. So there is no vendor expectation to
-    /// port, and its inverted null test at `:107-108` has never run.
+    /// port, and its inverted null test at `:109` has never run.
     #[test]
     fn a_loop_subscripting_an_lrf_is_marked_and_a_loop_over_the_xrf_is_not() {
         let load_view = |view: Val, iv: Val, result: Val| {

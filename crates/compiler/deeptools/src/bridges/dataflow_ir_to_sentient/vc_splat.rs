@@ -64,7 +64,7 @@ use crate::islands::dataflow_ir::ty::{ScalarTy, Vector};
 use crate::islands::sentient::dialects::{self as sen, Val, sentient, vectorchain};
 
 /// HOW WIDE THE BITSTREAM A SPLAT'S CONSTANT IS PACKED INTO IS — the literal `128` of
-/// `Splat.cpp:56`, and what fixes the emitted vector's length independently of how many values the
+/// `Splat.cpp:55`, and what fixes the emitted vector's length independently of how many values the
 /// `constant_bitstream` carries.
 const BITSTREAM_BITS: u32 = 128;
 

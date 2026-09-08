@@ -340,12 +340,12 @@ fn verify_loop_nest(
 ///
 /// ⭐ THE MASK OPS FOR A WHOLE PROGRAM UNIT, one breadth-first pass over the loop mask tree: constant
 /// masks bracket their compute, dynamic masks bracket the loop that drives them.
-/// ⛔ ONLY NON-DEFAULT CONSTANT MASKS EMIT ANYTHING (`if (start_val != 0)`, `:181`) — a dynamic mask
+/// ⛔ ONLY NON-DEFAULT CONSTANT MASKS EMIT ANYTHING (`if (start_val != 0)`, `:185`) — a dynamic mask
 /// emits even at `start_val == 0`, because the `incrmask` is the point.
 /// ⛔ THE COUNTER IS PRE-INCREMENTED ON EVERY OP THE PASS CREATES and is the PASS's, not this walk's:
 /// 2 bumps per constant mask, 3 per dynamic one, shared with every other unit it lowers.
 /// ⛔ THE UNSUPPORTED CASE IS A `todo!`, which is what `signalPassFailure()` plus
-/// `emitOpError("Unsupported: …")` (`:189-192`) leaves for a crate that never runtime-refuses.
+/// `emitOpError("Unsupported: …")` (`:193-196`) leaves for a crate that never runtime-refuses.
 pub fn insert_pt_mask_ops(
     pt_masking_tree: &LoopMaskTree,
     unit_body: &mut Vec<sen::Op>,

@@ -1138,12 +1138,12 @@ impl LoopMaskTree {
     /// **236/384** `LoopMaskTree::addMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:136` (16L).
     ///
     /// ⭐ `loop_op = None` IS THE REFERENCE'S `nullptr` ARM, not an error: a mask no `sentient.for`
-    /// encloses hangs off the root (`:145-147`), which is what its caller's
+    /// encloses hangs off the root (`:146-149`), which is what its caller's
     /// `parent_loop ? parent_loop.getOperation() : nullptr` reaches (`LoweringPTMasks.cpp:24-25`).
     /// ⛔ `None` OUT IS BOTH REMAINING `DT_CHECK_MSG`s AT ONCE — *"expecting a sentient::ForOp"* and
-    /// *"could not locate loop_op in tree"* (`:143-145`) are one question here: does this tree hold a
+    /// *"could not locate loop_op in tree"* (`:140`, `:144`) are one question here: does this tree hold a
     /// LOOP node naming that op. ⛔ The `op already in map` check and the dead `getFirstChild()` local
-    /// (`:141`) both go with `op_to_node_` — see [`LoopMaskTree`].
+    /// (`:142`) both go with `op_to_node_` — see [`LoopMaskTree`].
     pub fn add_mask_node(
         &mut self,
         loop_op: Option<&OpId>,
@@ -1177,9 +1177,9 @@ impl LoopMaskTree {
     /// **237/384** `LoopMaskTree::updateNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:155` (10L).
     ///
     /// Re-points the node naming `from` at `to`, so a rewritten compute keeps its mask.
-    /// ⛔ `None` IS *"could not find from op in LoopMaskTree"* (`:158-159`); `DT_CHECK_MSG(from && to)`
+    /// ⛔ `None` IS *"could not find from op in LoopMaskTree"* (`:157-158`); `DT_CHECK_MSG(from && to)`
     /// is unrepresentable over [`OpId`]. ⛔ THE MAP SURGERY IS THE WHOLE REST OF THE BODY — insert `to`,
-    /// erase `from` (`:162-163`) — and it disappears with `op_to_node_`: one node, one name, so
+    /// erase `from` (`:163-164`) — and it disappears with `op_to_node_`: one node, one name, so
     /// [`Self::find_node_from_op`] answers for `to` and stops answering for `from` in one write.
     /// ⚠️ DEAD IN THE REFERENCE TOO — nothing in the tree calls it.
     pub fn update_node(&mut self, from: &OpId, to: OpId) -> Option<LoopMaskNodeId> {

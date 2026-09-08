@@ -1768,7 +1768,7 @@ fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
 }
 
 /// HOW MANY BITS ONE SLICE OF A REGISTER FILE HOLDS — `int offset_per_slice = 1024; // bits`
-/// (`VectorOperands.cpp:222`).
+/// (`VectorOperands.cpp:223`).
 const SLICE_BITS: i64 = 1024;
 
 impl VectorOperand {
@@ -1780,7 +1780,7 @@ impl VectorOperand {
     /// ⛔ TRAP: the two `bit_width` workarounds are part of the address (80 → 8, 24 → 16), and the
     /// START ADDRESS IS IN BYTES yet is added to an ELEMENT offset before the scaling — the
     /// reference's own arithmetic, comment and all.
-    /// ⛔ `None` COVERS ITS FIVE `return std::nullopt` SITES AND ONE MORE: a slice index the file has
+    /// ⛔ `None` COVERS ITS SEVEN `return std::nullopt` SITES AND ONE MORE: a slice index the file has
     /// no case for, which is where the reference dies instead (see [`register_slice`]).
     #[must_use]
     pub fn from_load_or_store_op(op: &OpId, scope: &[DfirOp]) -> Option<VectorOperand> {
@@ -1883,6 +1883,9 @@ pub fn erase_operands(operands: &[Option<VectorOperand>], scope: &mut Vec<DfirOp
 
         // `for (auto user : operand.value().op_->getUsers())`
         for mut user in use_positions(&operand.op, scope) {
+            // ⚠️ DELIBERATE DIVERGENCE: the reference declares `intermediate_ops` OUTSIDE this loop
+            // (`:699`) and never clears it, so one user's chain is re-erased for every later user and
+            // the chain of a user that still has readers is erased anyway. Per-user is the intent.
             let mut intermediate_ops: Vec<OpId> = Vec::new();
 
             // `while (user && isa<..>(user) && user->hasOneUse()) { intermediate_ops.push_back(user);
@@ -1916,6 +1919,9 @@ pub fn erase_operands(operands: &[Option<VectorOperand>], scope: &mut Vec<DfirOp
         }
     }
 
+    // ⚠️ DELIBERATE DIVERGENCE: the reference erases inside the loop, so a later operand's
+    // `getUsers()` no longer sees a use from an already-erased op; here the scheduled positions are
+    // still visible, which can only make `has_no_uses` stricter — never erase more.
     erased_list.sort_unstable();
     erased_list.dedup();
     for position in erased_list.iter().rev() {
