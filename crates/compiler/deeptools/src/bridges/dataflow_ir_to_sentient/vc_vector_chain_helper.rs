@@ -2942,6 +2942,7 @@ mod unit_tests {
             compute_precision: sen::Precision::Fp16,
             fold_mode: None,
             unroll_factor: sen::UnrollFactor::X1,
+            unroll_incr_logical_result: false,
             dbg_name: None,
         })
     }

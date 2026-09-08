@@ -726,6 +726,7 @@ mod unit_tests {
                 compute_precision: Precision::Fp16,
                 unroll_factor: UnrollFactor::X8,
                 fold_mode: None,
+                unroll_incr_logical_result: false,
                 mask: 0,
                 dbg_name: None,
             },

@@ -34,8 +34,8 @@ use sys_arch_spec::regfile::Component;
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-/// WHICH COMPUTE PRECISION AN FMA IS IN — the five opcode arms of `:3840-3866`. ⭐ THE TRAILING
-/// `emitError` IS RETIRED BY THIS CLOSED SET, and its `"fp80"` (`:3845`) names no precision the
+/// WHICH COMPUTE PRECISION AN FMA IS IN — the five opcode arms of `:1469-1492`. ⭐ THE TRAILING
+/// `emitError` IS RETIRED BY THIS CLOSED SET, and its `"fp80"` (`:1473`) names no precision the
 /// attribute can carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacPrecision {
@@ -76,7 +76,7 @@ impl MacPrecision {
         }
     }
 
-    /// `setInstn` under `fused_mul_add` (`:3841-3857`).
+    /// `setInstn` under `fused_mul_add` (`:1468-1484`).
     #[must_use]
     pub const fn opcode(self) -> OpCode {
         match self {
@@ -88,7 +88,7 @@ impl MacPrecision {
         }
     }
 
-    /// ⭐ ONLY THE `FMA` ARM NAMES ITS OWN MODE (`:3857-3862`).
+    /// ⭐ ONLY THE `FMA` ARM NAMES ITS OWN MODE (`:1479-1484`).
     const fn writes_mode(self) -> bool {
         matches!(
             self,
@@ -102,7 +102,7 @@ impl MacPrecision {
 pub struct MacOperand {
     /// `op<X>`, with its precision and its forwarding.
     pub operand: SenOperand,
-    /// ⛔ A SLOT, NOT A PORT ID: `"src" + getOp<X>PortID()` (`:3889`) spells an unassigned `-1` as
+    /// ⛔ A SLOT, NOT A PORT ID: `"src" + getOp<X>PortID()` (`:1518-1520`) spells an unassigned `-1` as
     /// the field `src-1`.
     pub slot: ComputeSlot,
 }
@@ -117,7 +117,7 @@ pub struct Mac {
     /// `opC`.
     pub op_c: MacOperand,
     /// `ResultForwarding` and `ResultPrecision` — ⛔ A REQUIRED ATTRIBUTE, so the reference's
-    /// `!getResultForwarding()` (`:3823`) is dead and an empty forwarding is spelled `[none]`.
+    /// `!getResultForwarding()` (`:1450-1451`) is dead and an empty forwarding is spelled `[none]`.
     pub result: ResultPorts,
     /// `mode`.
     pub mode: FmaMode,
@@ -127,11 +127,11 @@ pub struct Mac {
     pub fold_mode: Option<FoldMode>,
     /// `unrollFactor`.
     pub unroll_factor: UnrollFactor,
-    /// The mask constant — ⛔ *"Mask constant value has to exist"* (`:3880`, `:4005`) is
+    /// The mask constant — ⛔ *"Mask constant value has to exist"* (`:1511`, `:1645`) is
     /// unrepresentable: the value is here, not an op to look through.
     pub mask: i64,
     /// `isDataWeight`, set by `AnnotateMacXRFWtRange` — ⛔ THE REFERENCE'S BACKWARD WALK TO THE
-    /// PREVIOUS MAC WITH XRF POINTERS (`:4041-4058`) READS THAT SAME PASS'S ANSWER, so it is one
+    /// PREVIOUS MAC WITH XRF POINTERS (`:1678-1698`) READS THAT SAME PASS'S ANSWER, so it is one
     /// field here rather than a search.
     pub is_data_weight: bool,
     /// `dbgName`.
@@ -141,19 +141,19 @@ pub struct Mac {
 /// WHAT AN FMA CANNOT DO — its own three refusals and the ones its operand plumbing hands back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FmaRefusal {
-    /// `verifyOnTheFlyConversions`' (`:3826`).
+    /// `verifyOnTheFlyConversions`' (`:1452-1454`).
     Conversion(UnsupportedConversion),
-    /// An input's (`:3944-3957`).
+    /// An input's (`:1572-1583`).
     Input(UnsupportedComputeInput),
-    /// An output's (`:3959-3970`).
+    /// An output's (`:1585-1596`).
     Output(UnsupportedComputeOutput),
-    /// *"FPUOP is not well defined for FMA32 in RCUDD1A"* (`:3832-3835`).
+    /// *"FPUOP is not well defined for FMA32 in RCUDD1A"* (`:1458-1460`).
     ResultFp32OnRcudd1a,
-    /// *"FNMS is supported only in PE and SFP"* (`:3868-3869`).
+    /// *"FNMS is supported only in PE and SFP"* (`:1494-1495`).
     FnmsOnThePt,
-    /// *"PT FMA/IMA does not support setting unrlfldsrc2, but it was requested"* (`:3991-3995`).
+    /// *"PT FMA/IMA does not support setting unrlfldsrc2, but it was requested"* (`:1632-1636`).
     UnrollOnPtSrc2,
-    /// *"N-link has to be in fp4/fp8 precision"* (`:4029-4031`).
+    /// *"N-link has to be in fp4/fp8 precision"* (`:1666-1668`).
     NLinkPrecision(Precision),
 }
 
@@ -171,11 +171,11 @@ pub struct Fma {
 /// The multiply-accumulate itself: its opcode from the compute precision, its three inputs in the
 /// slots their port ids named, every forwarding destination, the mask and the unroll flags.
 ///
-/// ⭐ THE MASK IS WRITTEN TWICE (`:3878`, `:4003`) — `{PE, SFP}` and `!= PT` are the same set of the
-/// three units, so the second write is the first's own value.
-/// ⚠️ `unroll_illegal` IS ASSIGNED, NOT ACCUMULATED (`:3971`, `:3978`, `:3985`), so only the last
+/// ⛔ THE MASK IS WRITTEN TWICE AND NEVER ON THE PT (`:1505`, `:1639`): `{PE, SFP}` and `!= PT` are
+/// the same set of the three units, so the second write only repeats the first's value.
+/// ⚠️ `unroll_illegal` IS ASSIGNED, NOT ACCUMULATED (`:1610`, `:1617`, `:1624`), so only the last
 /// PT-`src2` operand's flag is ever reported. ⛔ AND `SET_IFIFO_CONVERT` TAKES ITS DOCUMENTED
-/// DEFAULT (`:4014`): no env gate decides an instruction here.
+/// DEFAULT (`:1653`): no env gate decides an instruction here.
 #[must_use]
 pub fn construct_fma_instr<A: Arch>(mac: &Mac, comp: ComputeComp) -> Fma {
     let compute = mac.compute.precision();
@@ -183,7 +183,7 @@ pub fn construct_fma_instr<A: Arch>(mac: &Mac, comp: ComputeComp) -> Fma {
     let sen1p5 = matches!(A::GEN, IsaGen::Sen1p5);
     let mut refused = Vec::new();
     let operands = [&mac.op_a, &mac.op_b, &mac.op_c];
-    // `:3814-3821` — src0 carries constraints the other two slots do not.
+    // `:1440-1448` — src0 carries constraints the other two slots do not.
     let src0 = [SrcOperand::OpA, SrcOperand::OpB, SrcOperand::OpC]
         .into_iter()
         .zip(operands)
@@ -217,7 +217,7 @@ pub fn construct_fma_instr<A: Arch>(mac: &Mac, comp: ComputeComp) -> Fma {
         if result == Precision::Fp32 && !sen1p5 {
             refused.push(FmaRefusal::ResultFp32OnRcudd1a);
         }
-        // `:3838-3839` — fp16 out of a compute unit really means dlfp16.
+        // `:1461-1463` — fp16 out of a compute unit really means dlfp16.
         let fpuop = if result == Precision::Fp16 {
             "dlfp16"
         } else {
@@ -228,13 +228,15 @@ pub fn construct_fma_instr<A: Arch>(mac: &Mac, comp: ComputeComp) -> Fma {
     if mac.mode == FmaMode::FusedNegMulSub && comp == ComputeComp::Pt {
         refused.push(FmaRefusal::FnmsOnThePt);
     }
-    // `:3857-3861`, `:3870-3875` — the SFP always names its mode, the PE only on Sentient 1.5.
+    // `:1479-1484`, `:1497-1502` — the SFP always names its mode, the PE only on Sentient 1.5.
     if (mac.compute.writes_mode() || mac.mode == FmaMode::FusedNegMulSub)
         && (comp == ComputeComp::Sfp || (sen1p5 && comp == ComputeComp::Pe))
     {
         instr.set_common_field(OperandField::Mode, descriptive(compute.spelling()));
     }
-    instr.set_common_field(OperandField::Mask, int(255 - mac.mask));
+    if comp != ComputeComp::Pt {
+        instr.set_common_field(OperandField::Mask, int(255 - mac.mask));
+    }
     for held in operands {
         if let Some(refusal) = set_compute_input_operand::<A>(
             comp,
@@ -294,7 +296,7 @@ pub fn construct_fma_instr<A: Arch>(mac: &Mac, comp: ComputeComp) -> Fma {
     }
     if sen1p5 {
         set_fc_value_from_fold_mode(&mut instr, comp.component(), mac.fold_mode);
-        // `:4016-4022` — the PT's fp8 n-link input is converted to fp9 by an explicit bit, where DD2
+        // `:1659-1665` — the PT's fp8 n-link input is converted to fp9 by an explicit bit, where DD2
         // does it in hardware.
         let mx = matches!(
             mac.compute,
@@ -722,6 +724,8 @@ pub struct BinaryInstrOp<'a> {
     pub unroll_factor: UnrollFactor,
     /// `$fold_mode`.
     pub fold_mode: Option<FoldMode>,
+    /// `$unrollIncrLogicalResult` — ⛔ INDEPENDENT OF `binary_op` (`SentientOps.td:348`).
+    pub unroll_incr_logical_result: bool,
     /// `getMask()`'s constant — ⛔ THE FIELD TAKES `255 -` IT (`:2187`), and *"Mask constant value
     /// has to exist."* (`:2190`) is retired by this being a value rather than a defining op.
     pub mask: i64,
@@ -1317,12 +1321,12 @@ pub fn construct_binary_instr<A: Arch>(comp: ComputeComp, op: &BinaryInstrOp<'_>
         descriptive(op.unroll_factor.spelling()),
     );
     // `:2143-2158` — ⛔ THE PT'S `src2` IS THE PINNED CONSTANT, so it has no unroll field to set.
-    // ⭐ EITHER OPERAND ARMS THE REFUSAL: the reference's second assignment (`:2151`) would clear
-    // what the first requested, which is reachable only with both operands in that one slot.
+    // ⚠️ ASSIGNED, NOT ACCUMULATED (`:2151`, as in the FMA): a second PT-`src2` operand clears what
+    // the first requested, which is reachable only with both operands in that one slot.
     let mut unroll_illegal = false;
     for operand in [op.op_a, op.op_b] {
         if comp == ComputeComp::Pt && operand.slot == ComputeSlot::Src2 {
-            unroll_illegal |= operand.operand.unroll_incr;
+            unroll_illegal = operand.operand.unroll_incr;
         } else {
             instr.set_common_field(
                 operand.slot.unroll_field(),
@@ -1342,17 +1346,11 @@ pub fn construct_binary_instr<A: Arch>(comp: ComputeComp, op: &BinaryInstrOp<'_>
         refused.push(BinaryRefusal::LogicalOnPtInput);
     }
     // `:2168-2175` — ⛔ IN SEN1P5 `unrlfldsrc1` MOVES THE INTERNAL STATE REGISTER, overwriting
-    // whatever operand sits in that slot. ⭐ AND ONLY A FORWARDING OP CAN ASK FOR IT, which retires
-    // the `.td`'s independent `$unrollIncrLogicalResult`.
+    // whatever operand sits in that slot. ⛔ AND ANY OPERATOR MAY ASK FOR IT: the reference reads
+    // `$unrollIncrLogicalResult` alone, never the logical forward beside it.
     if matches!(comp, ComputeComp::Pe | ComputeComp::Sfp)
         && matches!(A::GEN, IsaGen::Sen1p5)
-        && matches!(
-            op.binary_op,
-            Binary::Forwarding {
-                unroll_incr: true,
-                ..
-            }
-        )
+        && op.unroll_incr_logical_result
     {
         instr.set_common_field(OperandField::Unrlfldsrc1, boolean(true));
     }
@@ -2073,6 +2071,7 @@ mod unit_tests {
                 compute_precision: Precision::Fp16,
                 unroll_factor: UnrollFactor::X8,
                 fold_mode: None,
+                unroll_incr_logical_result: false,
                 mask: 0,
                 dbg_name: None,
             },
@@ -2111,30 +2110,28 @@ mod unit_tests {
             forwarding: vec![Port::Lrf(LrfIndex::L0)],
             ..ResultPorts::default()
         };
-        let built = construct_binary_instr::<Sen1p5>(
-            ComputeComp::Sfp,
-            &BinaryInstrOp {
-                op_a: BinaryOperand {
-                    slot: ComputeSlot::Src0,
-                    operand: &op_a,
-                },
-                op_b: BinaryOperand {
-                    slot: ComputeSlot::Src2,
-                    operand: &op_b,
-                },
-                binary_op: Binary::Forwarding {
-                    op: ForwardingOp::Max,
-                    to: Port::IState(IStateIndex::S0),
-                    unroll_incr: false,
-                },
-                result: &result,
-                compute_precision: Precision::Fp16,
-                unroll_factor: UnrollFactor::X1,
-                fold_mode: None,
-                mask: 0,
-                dbg_name: None,
+        let op = BinaryInstrOp {
+            op_a: BinaryOperand {
+                slot: ComputeSlot::Src0,
+                operand: &op_a,
             },
-        );
+            op_b: BinaryOperand {
+                slot: ComputeSlot::Src2,
+                operand: &op_b,
+            },
+            binary_op: Binary::Forwarding {
+                op: ForwardingOp::Max,
+                to: Port::IState(IStateIndex::S0),
+            },
+            result: &result,
+            compute_precision: Precision::Fp16,
+            unroll_factor: UnrollFactor::X1,
+            fold_mode: None,
+            unroll_incr_logical_result: false,
+            mask: 0,
+            dbg_name: None,
+        };
+        let built = construct_binary_instr::<Sen1p5>(ComputeComp::Sfp, &op);
         let mut expected = UniformInstrInfo::of(OpCode::FMINMAX);
         expected.common_fields = vec![
             (OperandField::Foldctrl, descriptive("folda")),
@@ -2155,6 +2152,21 @@ mod unit_tests {
                 instr: Some(expected),
                 refused: vec![],
             }
+        );
+        // ⛔ AND A PLAIN OPERATOR ASKS FOR THE STATE ADVANCE TOO (`:2168-2175`).
+        let plain = construct_binary_instr::<Sen1p5>(
+            ComputeComp::Sfp,
+            &BinaryInstrOp {
+                binary_op: Binary::Plain(BinaryOp::Max),
+                unroll_incr_logical_result: true,
+                ..op
+            },
+        );
+        assert_eq!(
+            plain
+                .instr
+                .map(|instr| instr.has_common_field(OperandField::Unrlfldsrc1)),
+            Some(true)
         );
     }
 
@@ -2210,6 +2222,9 @@ mod unit_tests {
                 (OperandField::Unroll, descriptive("x1")),
             ]
         );
+        // ⛔ AND THE PT NAMES NO MASK — both write sites exclude it (`:1505`, `:1639`).
+        let pt = construct_fma_instr::<Dd2>(&mac, ComputeComp::Pt);
+        assert!(!pt.instr.has_common_field(OperandField::Mask));
     }
 
     /// ⭐⭐ IBM'S OWN LINES: `SFP_FEST :: imm:0 mask:255 mode:fp16 src0:lxlu src2:0.0 tgtlx:result

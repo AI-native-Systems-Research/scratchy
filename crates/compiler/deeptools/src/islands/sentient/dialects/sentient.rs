@@ -1024,9 +1024,14 @@ impl ForwardingOp {
 
 /// WHAT A `vector_binary` COMPUTES, AND WHETHER IT FORWARDS A LOGICAL RESULT.
 ///
-/// ⭐⭐ ONE VALUE, BECAUSE THE TWO FACTS ARE NOT INDEPENDENT. Holding the operator and an
+/// ⭐⭐ ONE VALUE, BECAUSE THE OPERATOR AND THE PORT ARE NOT INDEPENDENT. Holding the operator and an
 /// `Option<Port>` side by side let the pairing be wrong; holding them together means an illegal one
-/// cannot be written down.
+/// cannot be written down — `BinaryOp::verify()` (`SentientOps.cpp:2251-2262`) restricts exactly
+/// `$LogicalResultForwarding` and nothing else.
+///
+/// ⛔ `$unrollIncrLogicalResult` IS **NOT** PART OF IT — it is an independent
+/// `DefaultValuedAttr<BoolAttr,"false">` (`SentientOps.td:348`) that any operator may carry, so it
+/// lives on [`Op::VectorBinary`] the way it already does on [`Op::VectorTernary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binary {
     /// Any operator, forwarding no logical result — the common case.
@@ -1037,8 +1042,6 @@ pub enum Binary {
         op: ForwardingOp,
         /// `$LogicalResultForwarding`.
         to: Port,
-        /// `$unrollIncrLogicalResult`.
-        unroll_incr: bool,
     },
 }
 
@@ -1876,6 +1879,8 @@ pub enum Op {
         fold_mode: Option<FoldMode>,
         /// `$unrollFactor`.
         unroll_factor: UnrollFactor,
+        /// `$unrollIncrLogicalResult` — ⛔ INDEPENDENT OF `binary_op`; see [`Binary`].
+        unroll_incr_logical_result: bool,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -2960,16 +2965,17 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             compute_precision,
             fold_mode,
             unroll_factor,
+            unroll_incr_logical_result,
             dbg_name,
         } => {
             let mut specific = vec![attr("binaryOp", &quoted(&binary_op.op().spelling()))];
             // ⭐ NO CHECK NEEDED: only the forwarding arm carries a port, and only the seven legal
             // operators can be named in it.
-            if let Binary::Forwarding { to, unroll_incr, .. } = binary_op {
+            if let Binary::Forwarding { to, .. } = binary_op {
                 specific.push(attr("LogicalResultForwarding", &quoted(&to.spelling())));
-                if *unroll_incr {
-                    specific.push(attr("unrollIncrLogicalResult", "true"));
-                }
+            }
+            if *unroll_incr_logical_result {
+                specific.push(attr("unrollIncrLogicalResult", "true"));
             }
             let attrs = compute_attrs(
                 &[('A', op_a), ('B', op_b)],

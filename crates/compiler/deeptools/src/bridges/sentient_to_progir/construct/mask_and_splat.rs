@@ -742,6 +742,12 @@ pub fn construct_splat_pad_instr<A: Arch>(
         Some(name) => UniformInstrInfo::of(opcode).with_common_comment(name),
         None => UniformInstrInfo::of(opcode),
     };
+    // `:3798-3800` — ⛔ THE DATA FORMAT IS DERIVED BEFORE EITHER ROUTE IS CHOSEN, so an unsupported
+    // precision is the table's own `llvm_unreachable` on the SPLAT route too, not only the constant's.
+    let Some(format) = splat_pad_format(op.precision) else {
+        refused.push(SplatPadRefusal::Precision(op.precision));
+        return (None, refused);
+    };
     let constant = match input {
         SplatPadInput::Port(port) => {
             let (instr, splat_refused) = construct_splat_instr_from_splat_op::<A>(
@@ -763,10 +769,6 @@ pub fn construct_splat_pad_instr<A: Arch>(
             refused.push(SplatPadRefusal::ConstantIntoPort(port));
             return (None, refused);
         }
-    };
-    let Some(format) = splat_pad_format(op.precision) else {
-        refused.push(SplatPadRefusal::Precision(op.precision));
-        return (None, refused);
     };
     if op.program_header && matches!(op.splat.pad, SplatPad::None) {
         let Some(witness) = RegInitSplat::of(Some(op.splat.mask), op.splat.unroll_incr_result)
@@ -831,7 +833,8 @@ mod unit_tests {
         boolean, construct_splat_instr_from_splat_op,
     };
     use super::{
-        ComputeUnit, RegGraphs, SplatPadConst, SplatPadInput, SplatPadOp, construct_splat_pad_instr,
+        ComputeUnit, RegGraphs, SplatPadConst, SplatPadInput, SplatPadOp, SplatPadRefusal,
+        construct_splat_pad_instr,
     };
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::sentient_to_progir::uniform::instr::{Comment, UniformInstrInfo};
@@ -1180,6 +1183,23 @@ mod unit_tests {
             reg_graph.per_unit.is_empty(),
             "the SPLAT route initialises nothing"
         );
+        // ⛔ AND THE PORT ROUTE ANSWERS FOR THE DATA FORMAT TOO (`:3798-3800`).
+        let (none, refused) = construct_splat_pad_instr::<Dd2>(
+            ComputeUnit::Sfp,
+            SplatPadInput::Port(Port::Pe),
+            SplatTarget::Lrf(LrfIndex::L0),
+            &SplatPadOp {
+                splat: unpadded,
+                precision: Precision::Int16,
+                program_header: false,
+                dbg_name: None,
+            },
+            &[],
+            &mut reg_graph,
+            None,
+        );
+        assert_eq!(refused, vec![SplatPadRefusal::Precision(Precision::Int16)]);
+        assert!(none.is_none(), "an unsupported format splats nothing");
 
         let constant = SplatPadConst::Scalar {
             value: 23129,
