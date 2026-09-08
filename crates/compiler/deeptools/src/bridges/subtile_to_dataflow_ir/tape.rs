@@ -577,6 +577,8 @@ fn node_program<
             // spending, because `operand` takes `self`.
             let stored_ty = received.ty();
             ops.push(Op::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 value: received.operand(),
                 view: out_view,
                 indices: vec![Index::Const(0), Index::Const(0)],

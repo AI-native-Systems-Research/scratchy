@@ -2203,6 +2203,8 @@ mod unit_tests {
     ///  : memref<4x64x64x1xf4E2M1FN>, vector<256xf4E2M1FN>` (`xrf_increments.mlir:415`).
     fn xrf_store(view: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value: Val(44),
             view,
             indices: vec![

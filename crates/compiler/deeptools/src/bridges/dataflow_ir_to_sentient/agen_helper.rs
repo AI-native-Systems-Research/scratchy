@@ -2029,6 +2029,8 @@ mod unit_tests {
                     load,
                     shuffled(),
                     DfirOp::Agen(agen::Op::VectorStore {
+                        dbg_name: None,
+                        access: agen::Access::OfView,
                         value: Val(41),
                         view: VIEW,
                         indices: indices(Val(30)),
@@ -2561,6 +2563,8 @@ mod unit_tests {
             ty: LANES,
         });
         let store = DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value: Val(31),
             view: Val(11),
             indices: indices(Val(30)),
@@ -2895,6 +2899,8 @@ mod unit_tests {
                 ty: LANES,
             }),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 value: Val(31),
                 view: Val(23),
                 indices: vec![Index::Const(0)],
@@ -2936,6 +2942,8 @@ mod unit_tests {
 
         let mut into_the_lx = scope.clone();
         into_the_lx[5] = DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value: Val(31),
             view: Val(21),
             indices: vec![Index::Const(0)],

@@ -3126,6 +3126,8 @@ scf.if %2 {
                 ty: LANES,
             }),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 value: estimated,
                 view,
                 indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
@@ -3160,6 +3162,8 @@ scf.if %2 {
         let mut forked = ops.clone();
         let estimated = dialects::results(&ops[1])[0];
         forked.push(DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value: estimated,
             view,
             indices: vec![Index::Const(1), Index::Const(0), Index::Const(0)],
@@ -3372,6 +3376,8 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// (`paged_mem_view_load_and_store.mlir:1289`).
     fn vector_store(value: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value,
             view: Val(11),
             indices: indices(),

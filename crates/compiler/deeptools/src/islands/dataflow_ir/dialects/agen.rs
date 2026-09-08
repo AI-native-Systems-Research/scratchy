@@ -246,6 +246,10 @@ pub enum Op {
         view: Val,
         /// The indices.
         indices: Vec<Index>,
+        /// `dbgName` — the transfer's own name, and [`None`] for the accesses that carry none.
+        dbg_name: Option<String>,
+        /// `store_set` — see [`Access`], and [`Op::VectorLoad`] for the load half of the same pair.
+        access: Access,
         /// The view's type. Its INNERMOST extent is the lane count.
         view_ty: MemRef,
         /// The vector's type.
@@ -443,17 +447,24 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             value,
             view,
             indices,
+            dbg_name,
+            access,
             view_ty,
             ty,
         } => {
             let _ = writeln!(
                 out,
-                "agen.vector_store {}, {}[{}] {{store_order = {}, store_set = {}}} : {}, {}",
+                "agen.vector_store {}, {}[{}] {{{}store_order = {}, store_set = {}}} : {}, {}",
                 print::val(*value),
                 print::val(*view),
                 print::index_list(indices),
+                // ⛔ `dbgName` FIRST, for the reason [`Op::VectorLoad`]'s printer records: the op has
+                // no custom printer (`Agen.td:188-231`) and `d` precedes `s`.
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
                 print::affine_map(&access_order(view_ty.shape.len())),
-                print::integer_set(&access_set(view_ty, ty.len)),
+                print::integer_set(&access.set(view_ty, ty.len)),
                 print::memref(view_ty),
                 print::vector(*ty)
             );

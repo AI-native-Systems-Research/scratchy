@@ -2340,6 +2340,8 @@ mod unit_tests {
         let scope = vec![
             row_view(),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 value: Val(48),
                 view: Val(52),
                 indices: vec![
