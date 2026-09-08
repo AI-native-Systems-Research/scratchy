@@ -13,11 +13,20 @@
 //! | `e007_addPESFPLRFImmcopyToRegInit` | 0 | 228 | `dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp:4226` |
 //! | `e067_fillImmField` | 1 | 26 | `dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp:4130` |
 
+use super::int;
+use crate::arch::Arch;
+use crate::bridges::sentient_to_progir::lower::labels_and_regs::AddressScale;
 use crate::bridges::sentient_to_progir::state::{RegGraphs, RegsToInit, UnitKey};
-use crate::formats::DataFormat;
+use crate::bridges::sentient_to_progir::uniform::instr::{
+    MapMode, MappedEntry, OperandMapRefusal, UniformInstrInfo, add_entry_to_operand_map,
+};
+use crate::bridges::sentient_to_progir::utils::{AddrSpace, addr_wraparounded};
+use crate::formats::{Bits, DataFormat};
+use crate::islands::progir::OperandField;
 use crate::islands::progir::RegInit;
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue, RegType, reg_file_of};
 use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType as SenRegType};
+use sys_arch_spec::regfile::Component;
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
@@ -351,15 +360,73 @@ fn set_fold(
     }
 }
 
-// crustify:todo: e067_fillImmField
+/// WHERE ONE IMMEDIATE FIELD'S VALUE COMES FROM — the two defining ops `fillImmField` dispatches on
+/// (`:4131`, `:4141`). ⛔ AND THERE IS NO THIRD: any other op leaves the field UNSET, which is the
+/// reference's silent fallthrough.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImmSource {
+    /// `sentient.constant` — one value for every unit.
+    Constant(i64),
+    /// `uniform.query_map` — one value per unit; see [`add_entry_to_operand_map`].
+    Mapped(Vec<MappedEntry>),
+}
+
+/// Replaces: e067_fillImmField
+///
+/// Fill one immediate field: a constant is scaled into the unit's address granularity and shared, a
+/// mapping becomes the instruction's own per-unit map.
+/// ⛔ `setOperandMap` REPLACES THE MAP (`UniformInstrAndBlock.hpp:132`) — every per-unit field the
+/// instruction already carried is dropped, not merged.
+/// ⚠️ AND THE SCALING IS FLOATING POINT HERE against integer in [`get_reg_imm_vals`] (`:4133` vs
+/// `LowerSentientHelper.cpp:1147`), so one immediate can round two ways.
+pub fn fill_imm_field<A: Arch>(
+    instr: &mut UniformInstrInfo,
+    field: OperandField,
+    source: &ImmSource,
+    comp: Component,
+    element_size: Bits,
+    scale: AddressScale,
+) -> Vec<OperandMapRefusal> {
+    match source {
+        ImmSource::Constant(value) => {
+            let imm = *value as f64 * f64::from(element_size.0) / 8.0 / f64::from(scale.get());
+            // The L0's MODLRF immediate is 10 bits and its addressing is cyclic (`:4134-4137`).
+            let imm = addr_wraparounded::<A>(imm as i64, AddrSpace::Unit(comp));
+            instr.set_common_field(field, int(imm));
+            Vec::new()
+        }
+        ImmSource::Mapped(entries) => {
+            let mode = match comp {
+                Component::L0lu | Component::L0su => MapMode::L0WrapAround,
+                _ => MapMode::None,
+            };
+            let mapped = add_entry_to_operand_map(
+                entries,
+                mode,
+                f64::from(element_size.0) / 8.0 / f64::from(scale.get()),
+            );
+            instr.operand_map = mapped
+                .value
+                .map_or_else(Vec::new, |value| vec![(field, value)]);
+            mapped.refused
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ConstInput, RegInitFormat, RegInitSplat, UniformConst, UniformValue,
-        add_pe_sfp_lrf_immcopy_to_reg_init, add_to_regs_to_init,
+        Component, ConstInput, ImmSource, OperandField, RegInitFormat, RegInitSplat, UniformConst,
+        UniformValue, add_pe_sfp_lrf_immcopy_to_reg_init, add_to_regs_to_init, fill_imm_field, int,
     };
+    use crate::arch::Target;
+    use crate::bridges::sentient_to_progir::lower::labels_and_regs::address_scale;
     use crate::bridges::sentient_to_progir::state::{RegGraphs, RegsToInit, UnitKey};
+    use crate::bridges::sentient_to_progir::uniform::instr::{
+        MapMode, MappedEntry, MappedOp, UniformInstrInfo, add_entry_to_operand_map,
+    };
+    use crate::formats::Bits;
+    use crate::islands::progir::OpCode;
     use crate::islands::progir::ty::{OperandValue, RegType};
     use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType as SenRegType};
     use crate::units::{Core, Corelet, DfirUnit};
@@ -445,5 +512,75 @@ mod unit_tests {
                 Some(crate::formats::DataFormat::Sen169Fp16)
             );
         }
+    }
+
+    /// IBM'S OWN `uniformization_small_elem_size.mlir` — an `element_size = 4` LRF add of the
+    /// constant 128 on an LXLU prints `LX_MODLRFIMM :: lrfimm:64 src0:0  // lrf add`. The mapped arm
+    /// then REPLACES that field's map, dropping what the instruction already carried.
+    #[test]
+    fn a_constant_immediate_is_scaled_into_bytes_and_a_mapping_replaces_the_map() {
+        let scale = address_scale::<Target>(Component::Lxlu, SenRegType::Lrf);
+        let mut instr = UniformInstrInfo::of(OpCode::MODLRFIMM);
+        assert!(
+            fill_imm_field::<Target>(
+                &mut instr,
+                OperandField::Lrfimm,
+                &ImmSource::Constant(128),
+                Component::Lxlu,
+                Bits(4),
+                scale,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            instr.common_fields,
+            vec![(OperandField::Lrfimm, int(64))],
+            "128 * 4 bits / 8 / 1"
+        );
+        // A per-unit field this instruction already held, and the mapping that supersedes it.
+        let lxlu = UnitKey {
+            unit: DfirUnit::Lxlu,
+            core: Core::checked(3).expect("core 3"),
+            corelet: Corelet::checked(0),
+        };
+        instr.operand_map = add_entry_to_operand_map(
+            &[MappedEntry {
+                key: lxlu,
+                fold: None,
+                value: MappedOp::Constant(1),
+            }],
+            MapMode::None,
+            1.0,
+        )
+        .value
+        .map_or_else(Vec::new, |value| vec![(OperandField::Src0, value)]);
+        assert!(
+            fill_imm_field::<Target>(
+                &mut instr,
+                OperandField::Imm,
+                &ImmSource::Mapped(vec![MappedEntry {
+                    key: lxlu,
+                    fold: None,
+                    value: MappedOp::Constant(216),
+                }]),
+                Component::Lxlu,
+                Bits(4),
+                scale,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            instr
+                .operand_map
+                .iter()
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>(),
+            vec![OperandField::Imm],
+            "setOperandMap replaces the whole map"
+        );
+        assert_eq!(
+            instr.operand_map[0].1.get(lxlu),
+            &crate::islands::progir::ty::Operand::every(OperandValue::Int(108))
+        );
     }
 }

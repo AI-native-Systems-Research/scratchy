@@ -23,8 +23,9 @@
 use crate::arch::Arch;
 use crate::islands::progir::ty::RegType;
 use crate::islands::progir::{Program, RegBits, RegDefs};
-use crate::islands::sentient::dialects::sentient::{RegIndex, RegType as Locale};
+use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType as Locale};
 use crate::model::Model;
+use crate::units::Core;
 use crate::workload::Workload;
 use sys_arch_spec::regfile::Component;
 
@@ -209,8 +210,93 @@ pub fn check_reg_defs<A: Arch, M: Model, W: Workload>(
     }
     discrepancies
 }
-// crustify:todo: e069_recordOpRegDefs
-// crustify:todo: e070_dtor_UniformRegionContext
+
+/// WHICH REGISTERS ONE OP SAYS IT DEFINES — the singular `regLocale`/`regIndex` pair, or the
+/// `regLocales`/`regIndices` arrays (`:31,42`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpRegDefs {
+    /// `regIndex` is present — ⛔ AND IT WINS AND RETURNS: an op carrying both attribute shapes has
+    /// its arrays ignored (`:38`).
+    One(Reg),
+    /// `regIndices`, zipped with `regLocales`.
+    Many(Vec<Reg>),
+    /// Neither attribute — nothing is recorded, which the reference reaches by falling off the end.
+    None,
+}
+
+/// Replaces: e069_recordOpRegDefs
+///
+/// Record every register the op being visited defines.
+/// ⛔ AN INDEX WITHOUT A LOCALE IS UNREPRESENTABLE: [`Reg`] carries both, so `"op expected to have
+/// regLocale attr"` and its array twin (`:33,44`) have nothing to refuse — and see [`set_reg_def`]
+/// for the locale that names no file.
+/// ⛔ `enabled()` AND `reg_def_ctx_` ARE THE CALLER'S GATE, like [`REG_DEF_CHECKING`].
+pub fn record_op_reg_defs(regs: &mut RegSet, defs: &OpRegDefs) {
+    match defs {
+        OpRegDefs::One(reg) => set_reg_def(regs, reg.locale, reg.index),
+        OpRegDefs::Many(pairs) => {
+            for reg in pairs {
+                set_reg_def(regs, reg.locale, reg.index);
+            }
+        }
+        OpRegDefs::None => {}
+    }
+}
+
+/// ONE ENTRY OF A UNIFORM REGION'S UNIT LIST — a `get_unit`, or a `create_group` of them (`:81-88`).
+///
+/// ⭐ THE CORELET IS ALREADY FOLDED INTO THE COMPONENT: `getSenComponentForProgramStateInfo`
+/// (`Utils/DccExtContext.cpp:210-236`) keys the program state by `(type, corelet)`, so a unit arrives
+/// here as the pair `addRegDefsForUnit` writes under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionUnit {
+    /// One `dataflow.get_unit`.
+    One(Core, Component),
+    /// A `dataflow.create_group`, whose ids are each a `get_unit`.
+    ///
+    /// ⛔ A MEMBER THAT IS NOT ONE IS A NULL THERE (`:87`) — `subunit.getDefiningOp<GetUnitOp>()` is
+    /// handed straight to `addRegDefsForUnit`, which this cannot express.
+    Group(Vec<(Core, Component)>),
+}
+
+/// Replaces: e070_dtor_UniformRegionContext
+///
+/// Leaving a uniform region merges what it defined into every one of its units' programs.
+/// ⛔ THE TWO OP KINDS RUN THE SAME WALK (`:79,92`), so the op is not a parameter and the trailing
+/// `DT_ERROR("Unexpected operation for uniform region")` has no spelling.
+/// ⛔ AND `enable_ctx_` IS THE CALLER'S GATE (`:78`), the third of them in this file.
+pub fn close_uniform_region<A: Arch, M: Model, W: Workload>(
+    region_units: &[RegionUnit],
+    regs: &RegSet,
+    progstateinfo: &mut Vec<(Core, Program<A, M, W>)>,
+) {
+    for entry in region_units {
+        match entry {
+            RegionUnit::One(core, comp) => merge_unit_reg_defs(progstateinfo, *core, *comp, regs),
+            RegionUnit::Group(members) => {
+                for (core, comp) in members {
+                    merge_unit_reg_defs(progstateinfo, *core, *comp, regs);
+                }
+            }
+        }
+    }
+}
+
+/// `addRegDefsForUnit(get_unit)` — ⭐ `progStateInfo()[core]` DEFAULT-CONSTRUCTS (`:63`), so a core
+/// nothing has emitted for still gets its defs.
+fn merge_unit_reg_defs<A: Arch, M: Model, W: Workload>(
+    progstateinfo: &mut Vec<(Core, Program<A, M, W>)>,
+    core: Core,
+    comp: Component,
+    regs: &RegSet,
+) {
+    if !progstateinfo.iter().any(|(id, _)| *id == core) {
+        progstateinfo.push((core, Program::default()));
+    }
+    for (_, program) in progstateinfo.iter_mut().filter(|(id, _)| *id == core) {
+        add_reg_defs_for_unit(program, comp, regs);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -330,5 +416,79 @@ mod unit_tests {
             )
             .is_empty()
         );
+    }
+
+    /// e069: the singular attribute wins over the arrays, and an op with neither records nothing.
+    #[test]
+    fn the_singular_reg_def_attribute_wins_over_the_arrays() {
+        let mut regs = RegSet::empty();
+        record_op_reg_defs(
+            &mut regs,
+            &OpRegDefs::One(Reg {
+                locale: Locale::Lar,
+                index: Some(RegIndex::at::<3>()),
+            }),
+        );
+        assert_eq!(
+            regs.get(RegType::Lar),
+            RegBits::empty().with(RegIndex::at::<3>())
+        );
+        record_op_reg_defs(
+            &mut regs,
+            &OpRegDefs::Many(vec![
+                Reg {
+                    locale: Locale::Lrf,
+                    index: Some(RegIndex::at::<1>()),
+                },
+                Reg {
+                    locale: Locale::Ebr,
+                    index: None,
+                },
+            ]),
+        );
+        assert_eq!(
+            regs.get(RegType::Lrf),
+            RegBits::empty().with(RegIndex::at::<1>())
+        );
+        assert!(regs.get(RegType::Ebr).is_empty(), "an unassigned index");
+        let before = regs;
+        record_op_reg_defs(&mut regs, &OpRegDefs::None);
+        assert_eq!(regs, before);
+    }
+
+    /// e070: every unit of the region list — a bare unit and every member of a group — gets the
+    /// region's defs, on a core the pass has emitted nothing for yet.
+    #[test]
+    fn leaving_a_region_merges_its_defs_into_every_units_program() {
+        let mut regs = RegSet::empty();
+        regs.set(RegType::Lar, RegIndex::at::<2>());
+        let core = |id: u32| Core::checked(id).expect("every arch has 32 cores");
+        let mut progstateinfo: Vec<(Core, Program<Target, M, W>)> = Vec::new();
+        close_uniform_region(
+            &[
+                RegionUnit::One(core(0), Component::Lxlu),
+                RegionUnit::Group(vec![(core(1), Component::Sfp), (core(1), Component::Pe)]),
+            ],
+            &regs,
+            &mut progstateinfo,
+        );
+        assert_eq!(progstateinfo.len(), 2, "two cores, default-constructed");
+        for (core, comp) in [
+            (0, Component::Lxlu),
+            (1, Component::Sfp),
+            (1, Component::Pe),
+        ] {
+            let defs = progstateinfo
+                .iter()
+                .find(|(id, _)| id.get() == core)
+                .and_then(|(_, program)| program.reg_defs.as_ref())
+                .expect("the core was emplaced");
+            assert_eq!(
+                defs.iter()
+                    .find(|(key, _)| *key == (comp, RegType::Lar))
+                    .map(|(_, bits)| *bits),
+                Some(RegBits::empty().with(RegIndex::at::<2>()))
+            );
+        }
     }
 }
