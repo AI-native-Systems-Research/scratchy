@@ -1,18 +1,27 @@
 #!/bin/bash
-# ⭐ LESSON 7. Appends a line to driver.trace whenever a session branch gains a commit, so progress is
-# visible BETWEEN promotes. The driver only counts anchors at stage boundaries, which leaves the
+# ⭐ LESSON 7. Appends a line to driver.trace whenever OUR session branch gains a commit, so progress
+# is visible BETWEEN promotes. The driver only counts anchors at stage boundaries, which leaves the
 # campaign branch looking dead for ~3h per wave while batches are in fact landing on the session
 # branch. Bridge 2 spent hours believing a live wave was hung.
+#
+# ⛔ `refs/heads/crustify/session/*` IS REPO-WIDE AND THREE CAMPAIGNS SHARE THIS REPOSITORY. The first
+# version of this script took the most recently committed such ref and traced bridge 1's branch,
+# reporting "anchors filled=0 openTodo=0" about a tree with no bridge-3 module in it. A session branch
+# is OURS only if it descends from bridge3-campaign.
 ROOT=/Users/nickm/git/scratchy/.claude/worktrees/bridge3
+BASE=bridge3-campaign
 TRACE=$ROOT/crustify/campaigns/bridge3/logs/driver.trace
 mkdir -p "$(dirname "$TRACE")"
 last=-1
 lastbr=""
 while true; do
-  br=$(git -C "$ROOT" for-each-ref --sort=-committerdate \
-        --format='%(refname:short)' 'refs/heads/crustify/session/*' | head -1)
+  br=""
+  for cand in $(git -C "$ROOT" for-each-ref --sort=-committerdate \
+                  --format='%(refname:short)' 'refs/heads/crustify/session/*'); do
+    if git -C "$ROOT" merge-base --is-ancestor "$BASE" "$cand" 2>/dev/null; then br=$cand; break; fi
+  done
   if [ -z "$br" ]; then sleep 60; continue; fi
-  n=$(git -C "$ROOT" rev-list --count bridge3-campaign.."$br" 2>/dev/null)
+  n=$(git -C "$ROOT" rev-list --count "$BASE..$br" 2>/dev/null)
   if [ "$n" != "$last" ] || [ "$br" != "$lastbr" ]; then
     a=$(git -C "$ROOT" grep -hoE '/// Replaces: e[0-9]{3}_[A-Za-z0-9_]+' "$br" \
           -- crates/compiler/deeptools/src/bridges/sentient_to_progir 2>/dev/null | sort -u | wc -l | tr -d ' ')
