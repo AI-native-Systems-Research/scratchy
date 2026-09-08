@@ -60,7 +60,8 @@ use crate::bridges::sentient_to_progir::lower::transfer::{
     lower_receive_and_extract_scalar_operation, lower_receive_and_store_operation,
 };
 use crate::bridges::sentient_to_progir::reg_def_tracker::{
-    OpRegDefs, REG_DEF_CHECKING, RegSet, record_op_reg_defs,
+    OpRegDefs, REG_DEF_CHECKING, RegRefDiscrepancy, RegSet, check_reg_defs, merge_unit_reg_defs,
+    record_op_reg_defs,
 };
 use crate::bridges::sentient_to_progir::state::{
     CopyOps, LabelCounter, Labels, OpSite, RegGraphs, RegsToInit, UnitKey,
@@ -72,9 +73,10 @@ use crate::bridges::sentient_to_progir::uniform::instr::{
 use crate::bridges::sentient_to_progir::utils::ComputeUnit;
 use crate::formats::Bits;
 use crate::islands::progir::dialects::{Op as ProgIrOp, init};
-use crate::islands::progir::ty::{FoldId, Operand, OperandValue, RegType};
+use crate::islands::progir::ty::{FoldId, Invalid, Operand, OperandValue, RegType};
 use crate::islands::progir::{
-    Block, Instruction, OperandField, Program, RegInit, UnitProgram, UnitRegState, print,
+    Block, Instruction, OperandField, Overflow, Program, RegBits, RegDefs, RegInit, UnitProgram,
+    UnitRegState, print,
 };
 use crate::islands::sentient;
 use crate::islands::sentient::dialects::Op as SenOp;
@@ -1497,7 +1499,203 @@ pub fn generate_prog_ir_for_program_unit<A: Arch, M: Model, W: Workload>(
     }
     refused
 }
-// crustify:todo: e130_runOnOperation
+/// `ReplaceModuleWithSmc` (`SentientToProgIR.cpp:41-47`), a `cl::opt<bool>` defaulting to **true** —
+/// a const the way [`CHECK_PROG_IR`] is.
+pub const REPLACE_MODULE_WITH_SMC: bool = true;
+
+/// WHAT THE PASS READS OFF `DccExtContext` — the two facts this call needs from it.
+pub struct ExtContext<'a> {
+    /// `prog_name_`, which is the name `init.smc` carries.
+    pub prog_name: &'a str,
+    /// `getProgPatch()` — whether every core's program is padded out to the longest.
+    pub prog_patch: bool,
+}
+
+/// THE MODULE `getOperation()` HANDS THE PASS.
+pub struct ModuleToLower<'a, A: Arch, M: Model, W: Workload> {
+    /// The module itself — what `replaceProgramBodyWithSmcOp` rewrites, and where the name comes from.
+    pub program: &'a sentient::Program<A, M, W>,
+    /// `module_op.walk(dataflow::ProgramUnitOp)` in walk order — ⛔ EACH ANSWERS `WalkResult::skip()`,
+    /// so a nested program unit is not one of these.
+    pub units: Vec<ProgramUnitToLower<'a>>,
+    /// What `RegVisitor::visitInstrRegRefs` saw per unit — an ISA walk outside this campaign's 130,
+    /// read only under [`REG_DEF_CHECKING`].
+    pub reg_refs: &'a [((Core, Component), RegSet)],
+}
+
+/// ONE CORE'S PROGRAM THAT `checkProgramValidity` REFUSES (`cpp:664-673`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramInvalidity {
+    /// Which core.
+    pub core: Core,
+    /// Which of the reference's seven laws — ⛔ ONLY [`Invalid::IBuffOverflow`] IS DECIDABLE WITHOUT
+    /// THE ISA TABLES; see [`Program::size_verdict`].
+    pub law: Invalid,
+    /// The units that broke it.
+    pub overflowing: Vec<Overflow>,
+}
+
+/// EVERYTHING THE PASS WOULD HAVE REFUSED — ⛔ THE OFFENDERS, never a `signalPassFailure()`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PassRefusals {
+    /// What each program unit's lowering refused, in walk order.
+    pub lowering: Vec<ProgramUnitRefusal>,
+    /// What could not be padded to the longest core.
+    pub program_length: Vec<ProgramLengthOffender>,
+    /// `validity_failed` — the one condition that reaches `signalPassFailure()` (`cpp:190-193`).
+    pub invalid: Vec<ProgramInvalidity>,
+    /// A register a unit claims to define that nothing reads, per core.
+    pub reg_ref: Vec<(Core, RegRefDiscrepancy)>,
+}
+
+/// WHAT THE PASS LEAVES BEHIND.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PassOutcome {
+    /// The rewritten module — ⛔ `None` WHERE [`REPLACE_MODULE_WITH_SMC`] IS OFF, which leaves the
+    /// lowered IR standing rather than emitting an empty module.
+    pub module: Option<String>,
+    /// What it refuses.
+    pub refusals: PassRefusals,
+}
+
+/// Replaces: e130_runOnOperation
+///
+/// The whole pass: lower every program unit into `progstateinfo`, pad the cores to the longest, zero
+/// every used register, mark and check the register defs, then collapse the module to `init.smc`.
+/// ⛔ THE DUMPS ARE THE VALUE THIS FILLS IN. `psinfo.print`, `convertIr2Senprog` and `convertIr2SMC`
+/// are three renderings of `progstateinfo_`, and the two ISA ones are owed by [`print`] rather than by
+/// this pass — the same reading e129 applies to its `llvm::dbgs()` dump.
+/// ⛔ AND `signalPassFailure()` IS [`PassRefusals::invalid`]: the refusal is returned, and the work
+/// after the check still runs, exactly as the reference's late `return` does.
+#[must_use]
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(
+    module: ModuleToLower<'_, A, M, W>,
+    progstateinfo: &mut Vec<(Core, Program<A, M, W>)>,
+    pass: &mut PassState<'_>,
+    ext: &ExtContext<'_>,
+) -> PassOutcome {
+    let ModuleToLower {
+        program,
+        units,
+        reg_refs,
+    } = module;
+    let mut max_length_unit_core_map: Vec<(Component, Core)> = Vec::new();
+    let mut refusals = PassRefusals::default();
+    // Every handle the walk saw, in walk order — what the second walk below re-reaches.
+    let mut walked: Vec<UnitHandle> = Vec::new();
+
+    for unit_op in units {
+        let handles: Vec<UnitHandle> = unit_op.units.iter().collect();
+        // `RegDefTracker::ProgramUnitContext` — ⛔ A FRESH SET PER PROGRAM UNIT
+        // (`RegDefTracker.hpp:96-98`): the context's own `regs_` starts empty when tracking is on.
+        if let Some(regs) = pass.reg_defs.as_deref_mut() {
+            *regs = RegSet::empty();
+        }
+        refusals
+            .lowering
+            .extend(generate_prog_ir_for_program_unit::<A, M, W>(
+                unit_op,
+                progstateinfo,
+                &mut max_length_unit_core_map,
+                pass,
+            ));
+        // ...and its destructor merges what the unit defined into every one of its handles' programs.
+        if let Some(regs) = pass.reg_defs.as_deref().copied() {
+            for handle in &handles {
+                if let Some((core, comp)) = handle.key.program_key() {
+                    merge_unit_reg_defs(progstateinfo, core, comp, &regs);
+                }
+            }
+        }
+        walked.extend(handles);
+    }
+
+    // equalize program length for all cores
+    if ext.prog_patch {
+        // `uniformization_padding_counter_` — a pass member, and this is the pass, so its whole life
+        // is this call.
+        let mut padding_counter = PaddingCounter::default();
+        refusals.program_length = equalize_program_length(
+            &max_length_unit_core_map,
+            progstateinfo,
+            &mut padding_counter,
+        );
+    }
+
+    if CHECK_PROG_IR {
+        for (core, psinfo) in progstateinfo.iter() {
+            if let Err((law, overflowing)) = psinfo.size_verdict() {
+                refusals.invalid.push(ProgramInvalidity {
+                    core: *core,
+                    law,
+                    overflowing,
+                });
+            }
+        }
+    }
+
+    // Initialize all used regs.
+    if pass.full_reg_init {
+        initialize_utilized_registers(pass.regs_to_init, progstateinfo);
+    }
+
+    // ⭐ `regDefTracker_.enabled()` IS THE SET BEING THERE AT ALL — see [`PassState::reg_defs`].
+    if pass.reg_defs.is_some() {
+        for handle in &walked {
+            // Mark initialized registers as referenced.
+            let Some((core, comp)) = handle.key.program_key() else {
+                continue;
+            };
+            // `progstateinfo_[core]` — the subscript default-constructs.
+            if !progstateinfo.iter().any(|(at, _)| *at == core) {
+                progstateinfo.push((core, Program::default()));
+            }
+            if let Some((_, psinfo)) = progstateinfo.iter_mut().find(|(at, _)| *at == core) {
+                let inits = psinfo
+                    .reg_state
+                    .iter()
+                    .find(|(at, _)| *at == comp)
+                    .map_or(&[][..], |(_, state)| state.as_slice());
+                // ⛔ `.value()` ON A SET OPTIONAL: reaching here means tracking is on, and every
+                // handle's defs were emplaced above, so `Some` is what the merge left.
+                let defs = psinfo.reg_defs.get_or_insert_with(RegDefs::new);
+                for init in inits {
+                    // Reg defs will have been initialized during codegen.
+                    if init.file == RegType::Spr {
+                        continue;
+                    }
+                    match defs.iter_mut().find(|(key, _)| *key == (comp, init.file)) {
+                        Some((_, bits)) => *bits = bits.with(init.index),
+                        None => defs.push(((comp, init.file), RegBits::empty().with(init.index))),
+                    }
+                }
+            }
+            // ⛔ THE `regDefChecking()` GATE IS HERE, not inside the check — see
+            // [`REG_DEF_CHECKING`].
+            if REG_DEF_CHECKING
+                && let Some((_, psinfo)) = progstateinfo.iter().find(|(at, _)| *at == core)
+            {
+                let referenced = reg_refs
+                    .iter()
+                    .find(|(at, _)| *at == (core, comp))
+                    .map_or_else(RegSet::empty, |(_, regs)| *regs);
+                refusals.reg_ref.extend(
+                    check_reg_defs(psinfo, comp, &referenced)
+                        .into_iter()
+                        .map(|discrepancy| (core, discrepancy)),
+                );
+            }
+        }
+    }
+
+    // The prog. IR is fully created at this point; the lowered IR is no longer needed and is
+    // collapsed into a reference to the SMC artifact.
+    PassOutcome {
+        module: REPLACE_MODULE_WITH_SMC
+            .then(|| replace_program_body_with_smc_op(program, ext.prog_name)),
+        refusals,
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -2040,6 +2238,232 @@ mod unit_tests {
             max_length_unit_core_map,
             vec![(Component::Pe, at(0))],
             "the tie went to the lower core"
+        );
+    }
+
+    /// e130: the vendor's own `replace_module_with_smc` case — the SFP program unit's three NOPs
+    /// become the SFP program, the register defs are marked as tracked, and the module they came from
+    /// collapses to `init.smc` and a return. Their MAC is e084/e085's own case, so the NOPs stand for
+    /// the body here.
+    #[test]
+    fn the_units_are_lowered_and_the_module_collapses_to_the_smc_reference() {
+        let core = Core::checked(0).expect("core 0");
+        let program: sentient::Program<Target, M, W> = sentient::Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Sfp, Val(0)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let key = UnitKey::of(DfirUnit::Sfp, Residency::CoreWide { core }).expect("core 0 keys");
+        let mut regs = RegSet::empty();
+        let mut unit_folds = Vec::new();
+        let mut code_quality = Vec::new();
+        let mut padding_label = UniformLabel(0);
+        let mut regs_to_init = RegsToInit::new();
+        let mut pass = PassState {
+            regs_to_init: &mut regs_to_init,
+            unit_folds: &mut unit_folds,
+            code_quality: &mut code_quality,
+            // ⭐ TRACKING ON, which is what makes the reg-def marking walk run at all.
+            reg_defs: Some(&mut regs),
+            fold_ids: None,
+            full_reg_init: false,
+            padding_label: &mut padding_label,
+        };
+        let mut progstateinfo: Vec<(Core, Program<Target, M, W>)> = Vec::new();
+        let outcome = run_on_operation::<Target, M, W>(
+            ModuleToLower {
+                program: &program,
+                units: vec![ProgramUnitToLower {
+                    units: UnitHandles::of(
+                        UnitHandle {
+                            key,
+                            fold: FoldIndex(0),
+                        },
+                        Vec::new(),
+                    ),
+                    program: UnitProgramToLower {
+                        estimated_instructions: 4,
+                        body: vec![
+                            op(
+                                0,
+                                OpKind::Nop {
+                                    dbg_name: Some("NOP #1".to_owned()),
+                                },
+                            ),
+                            op(
+                                1,
+                                OpKind::Nop {
+                                    dbg_name: Some("NOP #2".to_owned()),
+                                },
+                            ),
+                            op(
+                                2,
+                                OpKind::Nop {
+                                    dbg_name: Some("NOP #3".to_owned()),
+                                },
+                            ),
+                        ],
+                    },
+                }],
+                reg_refs: &[],
+            },
+            &mut progstateinfo,
+            &mut pass,
+            &ExtContext {
+                prog_name: "default_prog_name",
+                prog_patch: false,
+            },
+        );
+        assert_eq!(outcome.refusals, PassRefusals::default());
+        assert_eq!(
+            outcome.module.as_deref(),
+            Some(concat!(
+                "module {\n",
+                "  func.func @g0_0_add() attributes {grid = [1]} {\n",
+                "    init.smc {name = \"default_prog_name\"}\n",
+                "    return\n",
+                "  }\n",
+                "}\n"
+            ))
+        );
+        assert_eq!(
+            first_code_block(&progstateinfo[0].1, Component::Sfp)
+                .expect("one CODE block")
+                .iter()
+                .map(|instr| instr.opcode)
+                .collect::<Vec<_>>(),
+            vec![OpCode::NOP, OpCode::NOP, OpCode::NOP]
+        );
+        // ⛔ `Some(empty)` IS "TRACKED", NOT "NOTHING DEFINED" — the fourteen files a
+        // `MAX_VALUE`-bounded loop reaches are keyed, and nothing this program did set a bit in one.
+        let defs = progstateinfo[0].1.reg_defs.as_ref().expect("tracked");
+        assert_eq!(defs.len(), RegType::ALL.len() - 1, "every file but `SCALE`");
+        assert!(
+            defs.iter()
+                .all(|((comp, _), bits)| *comp == Component::Sfp && bits.is_empty())
+        );
+    }
+
+    /// e130: a program longer than its unit's IBUFF comes back as an offender, and everything after
+    /// the check still runs — the `signalPassFailure()` path is the return value, not an abort.
+    #[test]
+    fn an_overflowing_program_is_an_offender_and_the_pass_still_finishes() {
+        let core = Core::checked(0).expect("core 0");
+        let program: sentient::Program<Target, M, W> = sentient::Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Sfp, Val(0)),
+                    precision: None,
+                    body: Vec::new(),
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        let key = UnitKey::of(DfirUnit::Sfp, Residency::CoreWide { core }).expect("core 0 keys");
+        let mut unit_folds = Vec::new();
+        let mut code_quality = Vec::new();
+        let mut padding_label = UniformLabel(0);
+        let mut regs_to_init = RegsToInit::from([(
+            key,
+            UtilizedRegisters::from([(RegType::Lrf, BTreeSet::from([RegIndex::at::<3>()]))]),
+        )]);
+        let mut pass = PassState {
+            regs_to_init: &mut regs_to_init,
+            unit_folds: &mut unit_folds,
+            code_quality: &mut code_quality,
+            reg_defs: None,
+            fold_ids: None,
+            // ⭐ ON, so the used registers are still zeroed after the refusal is recorded.
+            full_reg_init: true,
+            padding_label: &mut padding_label,
+        };
+        let mut progstateinfo: Vec<(Core, Program<Target, M, W>)> = Vec::new();
+        // ⛔ THE ESTIMATE IS UNDER THE BOUND AND THE BODY IS OVER IT: the estimate gates lowering
+        // (e127), the filed length is what `checkProgramValidity` measures.
+        let over = usize::from(max_ibuff_entries(Component::Sfp)) + 1;
+        let outcome = run_on_operation::<Target, M, W>(
+            ModuleToLower {
+                program: &program,
+                units: vec![ProgramUnitToLower {
+                    units: UnitHandles::of(
+                        UnitHandle {
+                            key,
+                            fold: FoldIndex(0),
+                        },
+                        Vec::new(),
+                    ),
+                    program: UnitProgramToLower {
+                        estimated_instructions: 1,
+                        body: (0..over)
+                            .map(|at| {
+                                op(
+                                    u32::try_from(at).expect("129 fits"),
+                                    OpKind::Nop { dbg_name: None },
+                                )
+                            })
+                            .collect(),
+                    },
+                }],
+                reg_refs: &[],
+            },
+            &mut progstateinfo,
+            &mut pass,
+            &ExtContext {
+                prog_name: "default_prog_name",
+                prog_patch: true,
+            },
+        );
+        assert_eq!(
+            outcome.refusals.invalid,
+            vec![ProgramInvalidity {
+                core,
+                law: Invalid::IBuffOverflow,
+                overflowing: vec![Overflow {
+                    unit: Component::Sfp,
+                    instructions: over,
+                    bound: max_ibuff_entries(Component::Sfp),
+                }],
+            }]
+        );
+        assert_eq!(outcome.refusals.lowering, Vec::new());
+        assert_eq!(
+            outcome.refusals.program_length,
+            Vec::new(),
+            "the only core is the longest one"
+        );
+        assert!(outcome.module.is_some(), "the module is still collapsed");
+        assert_eq!(
+            progstateinfo[0].1.reg_state,
+            vec![(
+                Component::Sfp,
+                vec![RegInit {
+                    file: RegType::Lrf,
+                    index: RegIndex::at::<3>(),
+                    value: Operand::every(OperandValue::Int(0)),
+                }],
+            )],
+            "the register initialisation after the check still ran"
         );
     }
 }

@@ -284,7 +284,7 @@ pub fn close_uniform_region<A: Arch, M: Model, W: Workload>(
 
 /// `addRegDefsForUnit(get_unit)` — ⭐ `progStateInfo()[core]` DEFAULT-CONSTRUCTS (`:64`), so a core
 /// nothing has emitted for still gets its defs.
-fn merge_unit_reg_defs<A: Arch, M: Model, W: Workload>(
+pub fn merge_unit_reg_defs<A: Arch, M: Model, W: Workload>(
     progstateinfo: &mut Vec<(Core, Program<A, M, W>)>,
     core: Core,
     comp: Component,
