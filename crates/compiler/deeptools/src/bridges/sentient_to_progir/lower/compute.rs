@@ -25,9 +25,17 @@ use crate::bridges::sentient_to_progir::construct::compute::{
     TernaryRefusal, UnaryInstrOp, UnaryRefusal, construct_binary_instr, construct_fma_instr,
     construct_ternary_instr, construct_unary_instr,
 };
+use crate::bridges::sentient_to_progir::construct::mask_and_splat::{
+    ActiveMaskValue, construct_incr_mask_instr, construct_samv_instr, construct_set_mask_instr,
+};
+use crate::bridges::sentient_to_progir::construct::opaque::{
+    OpaqueInvocation, OpaqueRefusal, construct_opaque_instr,
+};
 use crate::bridges::sentient_to_progir::construct::scalar::{
-    AddrSub, JcrOperands, LrfSub, XrfPtr, construct_jsub_instr, construct_lar_or_ear_sub_instr,
-    construct_lrf_sub_instr, construct_nop_instr, construct_xrf_add_instr,
+    AddrAdd, AddrSub, JcrOperands, LrfAdd, LrfSub, ScalarUpdate, XrfAdd, XrfPtr,
+    construct_jadd_instr, construct_jsub_instr, construct_lar_or_ear_add_instr,
+    construct_lar_or_ear_sub_instr, construct_lrf_add_instr, construct_lrf_sub_instr,
+    construct_nop_instr, construct_xrf_add_from_operands, construct_xrf_add_instr,
 };
 use crate::bridges::sentient_to_progir::lower::control::CodeGraph;
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
@@ -372,11 +380,200 @@ pub fn lower_sub_operation<A: Arch>(
         refused: update.refused.into_iter().map(SubRefusal::Map).collect(),
     }
 }
-// crustify:todo: e114_LowerAddOperation
-// crustify:todo: e117_LowerOpaqueOperation
-// crustify:todo: e118_LowerSAMVOperation
-// crustify:todo: e119_LowerSetMaskOperation
-// crustify:todo: e120_LowerIncrMaskOperation
+/// WHICH ADD A `sentient.add`'s TARGET REGISTER MAKES IT — `getRegLocale()`'s five arms and the
+/// locales that have no ProgIR at all.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarAddForm {
+    /// `jcr` — the jump-condition add, whose target register is its own operand.
+    Jcr {
+        /// `ConstructJADDInstr`'s operands.
+        operands: JcrOperands,
+        /// The register the sum lands in.
+        target: RegIndex,
+    },
+    /// `lrf`.
+    Lrf(LrfAdd),
+    /// `lar` or `ear` — one lowering, the file chosen inside it.
+    Addr(AddrAdd),
+    /// `xrfrdptr` or `xrfwrptr` — ⛔ TWO ARMS OF THE REFERENCE WITH ONE BODY EACH (`:773-781`), so
+    /// which pointer moves is [`XrfAdd::ptr`] and the arms collapse.
+    Xrf(XrfAdd),
+    /// Anything else — *"Unable to find Prog.IR for Sentient ADD"*, returned rather than signalled.
+    Unsupported(RegType),
+}
+
+/// A `sentient.add` AS THIS LOWERING READS IT.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarAdd {
+    /// Which add it is.
+    pub form: ScalarAddForm,
+    /// `element_size` — `None` when the attribute is absent, so the scaled default applies.
+    pub element_size: Option<Bits>,
+}
+
+/// WHAT AN ADD COULD NOT LOWER.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddRefusal {
+    /// The locale has no ProgIR add.
+    Locale(RegType),
+    /// A per-unit operand map could not hold its entries.
+    Map(OperandMapRefusal),
+}
+
+/// A LOWERED `sentient.add` — what it cost and what it could not express.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoweredAdd {
+    /// `++num_copy_ops_`.
+    pub copy_ops: CopyOps,
+    /// The offenders, in the order the reference reaches them.
+    pub refused: Vec<AddRefusal>,
+}
+
+/// Replaces: e114_LowerAddOperation
+///
+/// The scalar add: a `JADD` on the jump register, an `XRFACCESS` on a pointer, or a register-file add
+/// that may need a copy in front.
+///
+/// ⛔ ONLY `add_instr[0]` TAKES THE OP'S LABEL, and that is the `LARREGCOPY` when the source is not
+/// already the target — `add_instr[1]` is appended with `force_not_add_label` (`:770`).
+/// ⛔ `DT_CHECK_MSG(element_size != -1)` HAS NO SPELLING HERE: [`Bits`] is unsigned.
+#[must_use]
+pub fn lower_add_operation<A: Arch>(
+    comp: Component,
+    add: &ScalarAdd,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+    graph: CodeGraph<'_>,
+) -> LoweredAdd {
+    let element_size = add
+        .element_size
+        .unwrap_or(Bits(8 * address_scale::<A>(comp).get()));
+    let one = |instr| ScalarUpdate {
+        instrs: vec![instr],
+        copy_ops: CopyOps(0),
+        refused: Vec::new(),
+    };
+    let update = match &add.form {
+        ScalarAddForm::Unsupported(locale) => {
+            return LoweredAdd {
+                copy_ops: CopyOps(0),
+                refused: vec![AddRefusal::Locale(*locale)],
+            };
+        }
+        ScalarAddForm::Jcr { operands, target } => {
+            one(construct_jadd_instr(operands.clone(), *target))
+        }
+        ScalarAddForm::Xrf(xrf) => one(construct_xrf_add_from_operands::<A>(*xrf)),
+        ScalarAddForm::Lrf(lrf) => construct_lrf_add_instr::<A>(
+            lrf,
+            comp,
+            element_size,
+            units,
+            full_reg_init,
+            regs_to_init,
+        ),
+        ScalarAddForm::Addr(addr) => construct_lar_or_ear_add_instr::<A>(
+            addr,
+            comp,
+            element_size,
+            units,
+            full_reg_init,
+            regs_to_init,
+        ),
+    };
+    for (i, instr) in update.instrs.into_iter().enumerate() {
+        update_label_and_add_to_code_graph(
+            graph.labels,
+            graph.region,
+            graph.at,
+            LoweredOp::Other,
+            instr,
+            i > 0,
+        );
+    }
+    LoweredAdd {
+        copy_ops: update.copy_ops,
+        refused: update.refused.into_iter().map(AddRefusal::Map).collect(),
+    }
+}
+/// Replaces: e117_LowerOpaqueOperation
+///
+/// One `sentient.opaque` spliced out into the instructions its template states, all of them appended.
+///
+/// ⛔ NOT ONE OF THEM TAKES THE OP'S LABEL — `force_not_add_label` is `true` on every call (`:947`),
+/// so a labelled opaque drops its label; the reference's own `no_label` local is dead.
+/// ⛔ AND `reg_graph` IS NEVER READ by [`construct_opaque_instr`], so it is not a parameter here.
+#[must_use]
+pub fn lower_opaque_operation(
+    op: &OpaqueInvocation<'_>,
+    graph: CodeGraph<'_>,
+) -> Vec<OpaqueRefusal> {
+    let (opaque_expand, refused) = construct_opaque_instr(op);
+    for instr in opaque_expand {
+        update_label_and_add_to_code_graph(
+            graph.labels,
+            graph.region,
+            graph.at,
+            LoweredOp::Other,
+            instr,
+            true,
+        );
+    }
+    refused
+}
+/// Replaces: e118_LowerSAMVOperation
+///
+/// The LX load unit's active mask, and the SAMV a stitched program's tail has to reset.
+///
+/// ⛔ THE RESET IS NOT EMITTED HERE: `has_samv_ = samv_op` under prog-stitch or `-force-samv-reset`
+/// is state the caller holds until a `dataflow.return` (`:6716-6735`), so it comes back as a value.
+/// ⛔ LXLU ONLY, which [`construct_samv_instr`] has no component parameter to disagree with.
+#[must_use]
+pub fn lower_samv_operation(
+    samv: ActiveMaskValue,
+    dbg_name: Option<&str>,
+    reset_at_return: bool,
+    graph: CodeGraph<'_>,
+) -> Option<ActiveMaskValue> {
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        LoweredOp::Other,
+        construct_samv_instr(samv, dbg_name),
+        false,
+    );
+    reset_at_return.then_some(samv)
+}
+/// Replaces: e119_LowerSetMaskOperation
+///
+/// The PT's mask register loaded with a constant, under its op's label.
+/// ⛔ PT ONLY, which [`construct_set_mask_instr`] has no component parameter to disagree with.
+pub fn lower_set_mask_operation(mask_value: i64, dbg_name: Option<&str>, graph: CodeGraph<'_>) {
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        LoweredOp::Other,
+        construct_set_mask_instr(mask_value, dbg_name),
+        false,
+    );
+}
+/// Replaces: e120_LowerIncrMaskOperation
+///
+/// The PT's mask advanced by one, under its op's label.
+/// ⛔ PT ONLY, which [`construct_incr_mask_instr`] has no component parameter to disagree with.
+pub fn lower_incr_mask_operation(dbg_name: Option<&str>, graph: CodeGraph<'_>) {
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        LoweredOp::Other,
+        construct_incr_mask_instr(dbg_name),
+        false,
+    );
+}
 // crustify:todo: e124_LowerSplatOperation
 
 #[cfg(test)]
@@ -386,16 +583,19 @@ mod unit_tests {
     use crate::bridges::sentient_to_progir::construct::compute::{
         BinaryOperand, ComputeSlot, MacOperand,
     };
+    use crate::bridges::sentient_to_progir::construct::opaque::LoopCount;
     use crate::bridges::sentient_to_progir::construct::reg_init::ImmSource;
+    use crate::bridges::sentient_to_progir::construct::scalar::{AddrAddOperands, AddrFile};
     use crate::bridges::sentient_to_progir::construct::{descriptive, int};
     use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
     use crate::bridges::sentient_to_progir::state::Labels;
     use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlocks;
     use crate::bridges::sentient_to_progir::uniform::instr::Comment;
+    use crate::generated::OpaqueTemplate;
     use crate::islands::progir::{OpCode, OperandField};
     use crate::islands::sentient::dialects::sentient::{
         Binary, BinaryOp, FmaMode, IStateIndex, LrfIndex, Operand as SenOperand, Precision,
-        ResultPorts, UnaryOp, UnrollFactor,
+        RawPrecision, ResultPorts, SliceId, UnaryOp, UnrollFactor, ValidEntries, WslLen,
     };
 
     /// The op every lowering here appends to, and what came out: `(opcode, tag, comment)`.
@@ -800,6 +1000,223 @@ mod unit_tests {
                 copy_ops: CopyOps(0),
                 refused: vec![SubRefusal::Locale(RegType::Gtr)],
             }
+        );
+    }
+
+    /// e114 — IBM's `conditional-addr.mlir:19` `L3_ADDLARIMM :: be:be imm:10 src0:0  // lar add`,
+    /// whose `element_size = 16` against the L3's address scale of 128 turns 640 into 10.
+    #[test]
+    fn a_lar_adds_immediate_is_scaled_by_the_element_size_over_the_address_scale() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "add-0".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        let lowered = lower_add_operation::<Dd2>(
+            Component::L3lu,
+            &ScalarAdd {
+                form: ScalarAddForm::Addr(AddrAdd {
+                    file: AddrFile::Lar,
+                    tgt: Some(RegIndex::at::<0>()),
+                    operands: AddrAddOperands::RegImm {
+                        reg: Some(RegIndex::at::<0>()),
+                        imm: ImmSource::Constant(640),
+                    },
+                }),
+                element_size: Some(Bits(16)),
+            },
+            &[],
+            false,
+            &mut RegsToInit::new(),
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(
+            lowered,
+            LoweredAdd {
+                copy_ops: CopyOps(0),
+                refused: vec![],
+            },
+            "the source is already the target, so no LARREGCOPY"
+        );
+        assert_eq!(
+            emitted(&region),
+            vec![(
+                OpCode::ADDLARIMM,
+                Some("add-0".to_owned()),
+                Comment::Common("lar add".to_owned()),
+            )]
+        );
+        let fields = &region.blocks[0].instr_lists()[0][0].common_fields;
+        assert!(fields.contains(&(OperandField::Imm, int(10))));
+        assert!(fields.contains(&(OperandField::Src0, int(0))));
+        // A locale with no ProgIR add comes back as the offender.
+        assert_eq!(
+            lower_add_operation::<Dd2>(
+                Component::L3lu,
+                &ScalarAdd {
+                    form: ScalarAddForm::Unsupported(RegType::Gtr),
+                    element_size: None,
+                },
+                &[],
+                false,
+                &mut RegsToInit::new(),
+                CodeGraph {
+                    labels: &mut Labels::default(),
+                    region: &mut UniformInstrBlocks::default(),
+                    at: OpSite(0),
+                },
+            ),
+            LoweredAdd {
+                copy_ops: CopyOps(0),
+                refused: vec![AddRefusal::Locale(RegType::Gtr)],
+            }
+        );
+    }
+
+    /// e117 — `pt_slice_mask_arf_write` spliced out whole: ⛔ NOT ONE OF ITS SEVEN INSTRUCTIONS TAKES
+    /// THE OP'S LABEL, so a labelled opaque loses its label altogether.
+    #[test]
+    fn no_instruction_of_an_opaque_expansion_takes_the_ops_label() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "opaque-0".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        let refused = lower_opaque_operation(
+            &OpaqueInvocation {
+                template: OpaqueTemplate::PtSliceMaskArfWrite,
+                read_write: &[],
+                read_only: &[],
+                params: &[],
+                loop_count: Some(LoopCount(7)),
+                dbg_name: None,
+            },
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        // 📏 THE ONE NAME THE VENDORED BODIES ASK FOR THAT NO RCUDD1A TABLE HAS.
+        assert_eq!(refused, vec![OpaqueRefusal::UnboundVariable("u0")]);
+        let instrs = &region.blocks[0].instr_lists()[0];
+        assert_eq!(instrs.len(), 7);
+        assert!(instrs.iter().all(|instr| instr.tag.is_none()));
+    }
+
+    /// e118 — IBM's `samv.mlir:8` `LX_SAMV :: maskall:no mvridx:MVR0 numvalidentry:12 precision:8b
+    /// sliceidxsl:5 wsllen:8b xslinner:yes  // samv #1`, and the SAMV a stitched tail must reset.
+    #[test]
+    fn a_samv_comes_back_only_when_the_program_tail_has_to_reset_it() {
+        let samv = ActiveMaskValue {
+            maskall: false,
+            slice_id_xsl: SliceId(5),
+            valid_entries: ValidEntries(12),
+            mask_value: RegIndex::at::<0>(),
+            precision: RawPrecision(8),
+            xslinner: true,
+            wsl_len: WslLen(8),
+        };
+        let mut region = UniformInstrBlocks::default();
+        assert_eq!(
+            lower_samv_operation(
+                samv,
+                Some("samv #1"),
+                false,
+                CodeGraph {
+                    labels: &mut Labels::default(),
+                    region: &mut region,
+                    at: OpSite(0),
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            emitted(&region),
+            vec![(OpCode::SAMV, None, Comment::Common("samv #1".to_owned()))]
+        );
+        let fields = &region.blocks[0].instr_lists()[0][0].common_fields;
+        assert!(fields.contains(&(OperandField::Numvalidentry, int(12))));
+        assert!(fields.contains(&(OperandField::Mvridx, descriptive("MVR0"))));
+        assert!(fields.contains(&(OperandField::Xslinner, descriptive("yes"))));
+        // ⛔ UNDER PROG-STITCH THE OP IS KEPT, because the tail's reset reads two of its fields.
+        assert_eq!(
+            lower_samv_operation(
+                samv,
+                None,
+                true,
+                CodeGraph {
+                    labels: &mut Labels::default(),
+                    region: &mut UniformInstrBlocks::default(),
+                    at: OpSite(0),
+                },
+            ),
+            Some(samv)
+        );
+    }
+
+    /// e119 — IBM's `setmask_incrmask.mlir:9` `PTOP_SETMASK :: imm:0  // set_mask #1`, under its label.
+    #[test]
+    fn a_set_mask_carries_its_constant_and_its_own_label() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "set-mask-0".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        lower_set_mask_operation(
+            0,
+            Some("set_mask #1"),
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(
+            emitted(&region),
+            vec![(
+                OpCode::SETMASK,
+                Some("set-mask-0".to_owned()),
+                Comment::Common("set_mask #1".to_owned()),
+            )]
+        );
+        assert_eq!(
+            region.blocks[0].instr_lists()[0][0].common_fields,
+            vec![(OperandField::Imm, int(0))]
+        );
+    }
+
+    /// e120 — IBM's `setmask_incrmask.mlir:13` `PTOP_INCRMASK ::  // incr_mask #1` (its `be:be` is the
+    /// following yield's), under its own label; ⭐ AND AN UNNAMED ONE GETS NO COMMENT AT ALL.
+    #[test]
+    fn an_incr_mask_takes_its_label_and_only_a_named_op_gets_a_comment() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "incr-mask-0".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        lower_incr_mask_operation(
+            Some("incr_mask #1"),
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        lower_incr_mask_operation(
+            None,
+            CodeGraph {
+                labels: &mut Labels::default(),
+                region: &mut region,
+                at: OpSite(1),
+            },
+        );
+        assert_eq!(
+            emitted(&region),
+            vec![
+                (
+                    OpCode::INCRMASK,
+                    Some("incr-mask-0".to_owned()),
+                    Comment::Common("incr_mask #1".to_owned()),
+                ),
+                (OpCode::INCRMASK, None, Comment::None),
+            ]
         );
     }
 }

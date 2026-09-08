@@ -25,8 +25,13 @@
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
 use crate::arch::Arch;
+use crate::bridges::sentient_to_progir::construct::mask_and_splat::{
+    LxHalf, SetDestTarget, SetDstMaskRefusal, SetDstMaskTarget, construct_set_dest_instr,
+    construct_set_dst_mask_instr,
+};
 use crate::bridges::sentient_to_progir::construct::scalar::{
     Assign, LoopBound, construct_assign_instr, construct_mv_loop_instr, construct_nop_instr,
+    construct_return_instr,
 };
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
     LabelToJumps, LoweredOp, RegImmSource, add_to_labels_map, add_to_reg_init, address_scale,
@@ -36,7 +41,7 @@ use crate::bridges::sentient_to_progir::state::{
     CopyOps, LabelCounter, Labels, OpSite, RegGraphs, UnitKey,
 };
 use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlocks;
-use crate::bridges::sentient_to_progir::uniform::instr::OperandMapRefusal;
+use crate::bridges::sentient_to_progir::uniform::instr::{OperandMapRefusal, UniformInstrInfo};
 use crate::formats::Bits;
 use crate::islands::progir::OperandField;
 use crate::islands::progir::ty::FoldId;
@@ -259,8 +264,84 @@ pub fn lower_for_operation<A: Arch>(
     );
     LoweredFor { copy_ops, refused }
 }
-// crustify:todo: e115_LowerReturnOperation
-// crustify:todo: e116_LowerSetSendDestinationOperation
+/// Replaces: e115_LowerReturnOperation
+///
+/// The `RETURN` that ends a unit's program, under its op's label.
+/// ⭐ THE REFERENCE'S `comp` IS UNUSED — a RETURN is the same instruction on every unit.
+pub fn lower_return_operation(graph: CodeGraph<'_>) {
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        LoweredOp::Other,
+        construct_return_instr(),
+        false,
+    );
+}
+
+/// WHERE A `sentient.set_send_dst` SENDS, BY THE UNIT IT SITS IN — the three arms of `:909-923`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendDestination<'a> {
+    /// `is_any_of(comp, LXLU, LXSU)` — a `SETDSTMASK` naming the consumer, via the SFP.
+    LxMask {
+        /// Which half the transfer leaves.
+        from: LxHalf,
+        /// `op.getUnits().getDefiningOp()`.
+        dest: SetDstMaskTarget<'a>,
+    },
+    /// `is_any_of(comp, SFP)` — a `SETDEST` naming another core's SFP.
+    Sfp(SetDestTarget<'a>),
+    /// Any other unit — *"did not expect set_send_dst in this unit"*.
+    Elsewhere(Component),
+}
+
+/// WHAT A SET-SEND-DESTINATION COULD NOT LOWER.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendDestRefusal {
+    /// The unit itself has no send-destination instruction.
+    Unit(Component),
+    /// The `SETDSTMASK`'s own offenders.
+    Mask(SetDstMaskRefusal),
+    /// The `SETDEST`'s per-unit map.
+    Map(OperandMapRefusal),
+}
+
+/// Replaces: e116_LowerSetSendDestinationOperation
+///
+/// Where this unit's send goes: an LX half aims its transfer at the consumer, the SFP aims at another
+/// core's SFP, and every other unit is the offender rather than a `signalPassFailure`.
+#[must_use]
+pub fn lower_set_send_destination_operation(
+    dest: SendDestination<'_>,
+    graph: CodeGraph<'_>,
+) -> Vec<SendDestRefusal> {
+    let (instr, refused): (UniformInstrInfo, Vec<SendDestRefusal>) = match dest {
+        SendDestination::LxMask { from, dest } => {
+            let (instr, refused) = construct_set_dst_mask_instr(from, dest);
+            (
+                instr,
+                refused.into_iter().map(SendDestRefusal::Mask).collect(),
+            )
+        }
+        SendDestination::Sfp(target) => {
+            let (instr, refused) = construct_set_dest_instr(target);
+            (
+                instr,
+                refused.into_iter().map(SendDestRefusal::Map).collect(),
+            )
+        }
+        SendDestination::Elsewhere(comp) => return vec![SendDestRefusal::Unit(comp)],
+    };
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        LoweredOp::Other,
+        instr,
+        false,
+    );
+    refused
+}
 // crustify:todo: e123_LowerYieldOperation
 // crustify:todo: e125_LowerUniformYieldOperation
 // crustify:todo: e126_LowerUniformOperations
@@ -269,6 +350,7 @@ pub fn lower_for_operation<A: Arch>(
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
+    use crate::bridges::sentient_to_progir::construct::mask_and_splat::MaskDest;
     use crate::bridges::sentient_to_progir::construct::scalar::{AssignKind, LrfImm};
     use crate::bridges::sentient_to_progir::lower::labels_and_regs::RegImm;
     use crate::bridges::sentient_to_progir::uniform::instr::Comment;
@@ -405,5 +487,70 @@ mod unit_tests {
             PerFold::Every(OperandValue::Int(1920)),
             "960 at 16 bits an element is 1920 address units"
         );
+    }
+
+    /// e115 — IBM's `setmask_incrmask.mlir:22` `PTOP_RETURN ::  // end of the program`, under its label.
+    #[test]
+    fn a_return_ends_the_program_under_its_own_label() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "return-0".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        lower_return_operation(CodeGraph {
+            labels: &mut labels,
+            region: &mut region,
+            at: OpSite(0),
+        });
+        let instr = &region.blocks[0].instr_lists()[0][0];
+        assert_eq!(instr.opcode, OpCode::RETURN);
+        assert_eq!(instr.tag.as_deref(), Some("return-0"));
+        assert_eq!(
+            instr.comment,
+            Comment::Common("end of the program".to_owned())
+        );
+    }
+
+    /// e116 — IBM's `setdstmask-lxlu.mlir:9` `LX_SETDSTMASK :: mode:pt  // set dest for transfer from
+    /// lxlu to pt, via sfp`; ⛔ AND A UNIT THAT IS NEITHER AN LX HALF NOR THE SFP IS THE OFFENDER.
+    #[test]
+    fn an_lx_half_aims_its_transfer_and_any_other_unit_is_the_offender() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "set-dst-0".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        let refused = lower_set_send_destination_operation(
+            SendDestination::LxMask {
+                from: LxHalf::Lxlu,
+                dest: SetDstMaskTarget::Unit(MaskDest::Pt),
+            },
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(refused, vec![]);
+        let instr = &region.blocks[0].instr_lists()[0][0];
+        assert_eq!(instr.opcode, OpCode::SETDSTMASK);
+        assert_eq!(instr.tag.as_deref(), Some("set-dst-0"));
+        assert_eq!(
+            instr.comment,
+            Comment::Common("set dest for transfer from lxlu to pt, via sfp".to_owned())
+        );
+        assert_eq!(
+            instr.common_field(OperandField::Mode),
+            Some(&Operand::every(OperandValue::Descriptive("pt".to_owned())))
+        );
+        let mut empty = UniformInstrBlocks::default();
+        assert_eq!(
+            lower_set_send_destination_operation(
+                SendDestination::Elsewhere(Component::Pt),
+                CodeGraph {
+                    labels: &mut Labels::default(),
+                    region: &mut empty,
+                    at: OpSite(0),
+                },
+            ),
+            vec![SendDestRefusal::Unit(Component::Pt)]
+        );
+        assert!(empty.blocks.is_empty());
     }
 }

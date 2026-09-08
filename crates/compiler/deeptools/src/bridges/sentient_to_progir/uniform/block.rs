@@ -39,6 +39,8 @@ use crate::bridges::sentient_to_progir::state::UnitKey;
 use crate::bridges::sentient_to_progir::uniform::instr::{
     UniformInstrInfo, UniformLabel, create_jmp_instr, create_nop_instr,
 };
+use crate::islands::progir::ty::{Operand, OperandValue};
+use crate::islands::progir::{OpCode, OperandField};
 
 /// WHERE ONE INSTRUCTION IS — `InstrIndex`, a `std::tuple<int, int, int>`
 /// (`UniformInstrAndBlock.hpp:24`).
@@ -567,7 +569,55 @@ impl UniformInstrBlocks {
     }
 }
 
-// crustify:todo: e121_getUniformizedUnitUniformInstrList
+impl UniformInstrBlocks {
+    /// Replaces: e121_getUniformizedUnitUniformInstrList
+    ///
+    /// One unit's whole program: every block's uniformised list in order, with each padding jump
+    /// aimed at the instruction that follows it.
+    ///
+    /// ⛔ THE JUMP AND ITS TARGET MEET HALFWAY — an UNTAGGED first instruction takes the jump's
+    /// `pc_target` as its tag, and a TAGGED one replaces that `pc_target` instead.
+    /// ⛔ A JUMP POSITION IS RELATIVE TO ITS OWN BLOCK, so it is offset by everything emitted before
+    /// it; and only a `JCMP` there is padding — a block whose own tail is a jump is not retargeted.
+    #[must_use]
+    pub fn uniformized_unit_uniform_instr_list(
+        &self,
+        unit: UnitKey,
+        first_label: UniformLabel,
+    ) -> Vec<UniformInstrInfo> {
+        let mut ret: Vec<UniformInstrInfo> = Vec::new();
+        let mut prev_jmp_pos: Option<usize> = None;
+        let mut label = first_label;
+        for block in &self.blocks {
+            let (mut instr_list, new_jmp_pos) = block.uniformized_unit_instr_list(unit, label);
+            label = label.bump();
+            if let Some(jmp) = prev_jmp_pos.and_then(|at| ret.get_mut(at))
+                && jmp.opcode == OpCode::JCMP
+            {
+                match instr_list.first().and_then(|first| first.tag.clone()) {
+                    Some(tag) => {
+                        jmp.set_common_field(
+                            OperandField::PcTarget,
+                            Operand::every(OperandValue::InstrTag(tag)),
+                        );
+                    }
+                    None => {
+                        let target = jmp
+                            .common_field(OperandField::PcTarget)
+                            .and_then(|target| target.as_string(None))
+                            .map(str::to_owned);
+                        if let Some(first) = instr_list.first_mut() {
+                            first.tag = target;
+                        }
+                    }
+                }
+            }
+            prev_jmp_pos = new_jmp_pos.map(|at| at + ret.len());
+            ret.append(&mut instr_list);
+        }
+        ret
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -575,7 +625,7 @@ mod unit_tests {
     use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
     use crate::bridges::sentient_to_progir::state::UnitKey;
     use crate::bridges::sentient_to_progir::uniform::instr::{UniformInstrInfo, UniformLabel};
-    use crate::islands::progir::OpCode;
+    use crate::islands::progir::{OpCode, OperandField};
     use crate::units::{Core, DfirUnit, Residency};
 
     fn nop() -> UniformInstrInfo {
@@ -1014,5 +1064,53 @@ mod unit_tests {
             8,
             "a block count past the end sums only the blocks that exist"
         );
+    }
+
+    /// e121: the padding jump of one block finds its target in the next — an untagged first
+    /// instruction TAKES the jump's `pc_target`, and a tagged one REPLACES it.
+    #[test]
+    fn a_padding_jump_and_the_next_blocks_first_instruction_agree_on_one_tag() {
+        let short = unit(DfirUnit::Lxlu);
+        let long = unit(DfirUnit::L3su);
+        let padded = || {
+            UniformInstrBlock::Uniform(UniformBlock {
+                regions: vec![vec![nop()], vec![nop(), nop(), ret()]],
+                unit_to_region: vec![(short, RegionIndex(0)), (long, RegionIndex(1))],
+                ..UniformBlock::default()
+            })
+        };
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.blocks.push(padded());
+        blocks.blocks.push(UniformInstrBlock::Regular(vec![ret()]));
+        let list = blocks.uniformized_unit_uniform_instr_list(short, UniformLabel(7));
+        assert_eq!(
+            list.len(),
+            4,
+            "its NOP, the JCMP, one dead instr, then block 1"
+        );
+        assert_eq!(list[1].opcode, OpCode::JCMP);
+        assert_eq!(
+            list[3].tag.as_deref(),
+            Some("uniform_tgt_7"),
+            "the jump's own target became the next block's tag"
+        );
+        // A first instruction that already has a tag keeps it, and the jump is retargeted instead.
+        let mut tagged = ret();
+        tagged.tag = Some("if-label-0-end".to_owned());
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.blocks.push(padded());
+        blocks.blocks.push(UniformInstrBlock::Regular(vec![tagged]));
+        let list = blocks.uniformized_unit_uniform_instr_list(short, UniformLabel(7));
+        assert_eq!(list[3].tag.as_deref(), Some("if-label-0-end"));
+        assert_eq!(
+            list[1]
+                .common_field(OperandField::PcTarget)
+                .and_then(|target| target.as_string(None)),
+            Some("if-label-0-end")
+        );
+        // ⛔ THE UNIT ON THE LONGEST REGION IS NEVER PADDED, so nothing is retagged for it.
+        let list = blocks.uniformized_unit_uniform_instr_list(long, UniformLabel(7));
+        assert!(list.iter().all(|instr| instr.opcode != OpCode::JCMP));
+        assert_eq!(list[3].tag.as_deref(), Some("if-label-0-end"));
     }
 }

@@ -373,6 +373,13 @@ impl UniformLabel {
     pub fn name(self) -> String {
         format!("uniform_tgt_{}", self.0)
     }
+
+    /// THE NEXT DISTINCT LABEL — ⭐ WHAT REPLACES DRAWING A SECOND `rand()`, for a caller padding
+    /// more than one block.
+    #[must_use]
+    pub const fn bump(self) -> UniformLabel {
+        UniformLabel(self.0 + 1)
+    }
 }
 
 /// Replaces: e017_createNOPInstr
