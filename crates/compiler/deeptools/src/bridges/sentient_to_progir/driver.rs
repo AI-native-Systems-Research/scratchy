@@ -66,20 +66,23 @@ use crate::bridges::sentient_to_progir::state::{
     CopyOps, LabelCounter, Labels, OpSite, RegGraphs, RegsToInit, UnitKey,
 };
 use crate::bridges::sentient_to_progir::uniform::block::{InstrIndex, UniformInstrBlocks};
-use crate::bridges::sentient_to_progir::uniform::instr::OperandMapRefusal;
+use crate::bridges::sentient_to_progir::uniform::instr::{
+    OperandMapRefusal, UniformInstrInfo, UniformLabel,
+};
 use crate::bridges::sentient_to_progir::utils::ComputeUnit;
 use crate::formats::Bits;
 use crate::islands::progir::dialects::{Op as ProgIrOp, init};
-use crate::islands::progir::ty::{Operand, OperandValue, RegType};
+use crate::islands::progir::ty::{FoldId, Operand, OperandValue, RegType};
 use crate::islands::progir::{
-    Block, Instruction, OperandField, Program, RegInit, UnitRegState, print,
+    Block, Instruction, OperandField, Program, RegInit, UnitProgram, UnitRegState, print,
 };
 use crate::islands::sentient;
 use crate::islands::sentient::dialects::Op as SenOp;
 use crate::islands::sentient::dialects::sentient::{CmpPredicate, Reg};
 use crate::model::Model;
-use crate::units::Core;
+use crate::units::{Core, DfirUnit};
 use crate::workload::Workload;
+use std::collections::BTreeMap;
 use sys_arch_spec::regfile::{Component, max_ibuff_entries};
 
 /// Replaces: e015_initializeUtilizedRegisters
@@ -1170,7 +1173,330 @@ pub fn generate_unit_prog_ir<A: Arch>(
     }
     refused
 }
-// crustify:todo: e129_GenerateProgIRForProgramUnit
+/// `CollectCodeQualityStats` (`SentientToProgIR.cpp:36-40`), a `cl::opt<bool>` defaulting to false —
+/// a const the way [`REG_DEF_CHECKING`] is.
+pub const COLLECT_CODE_QUALITY_STATS: bool = false;
+
+/// WHICH RESULT OF ITS `dataflow.get_unit` ONE HANDLE IS — `getResultNum(unit.getDefiningOp(), unit)`
+/// (`cpp:340`).
+///
+/// ⭐ A `get_unit`'s RESULT NUMBER *IS* THE FOLD — `Dataflow.td:48,56-58`, the reading
+/// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::FoldId`] already states. It is still
+/// not the fold *id*: `foldIds_` maps this index to what the SDSC calls that fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FoldIndex(pub u32);
+
+/// ONE HANDLE OF THE SET — one unit at one fold, which is one `dataflow.get_unit` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitHandle {
+    /// The unit `getUnitName` names.
+    pub key: UnitKey,
+    /// Which of its folds.
+    pub fold: FoldIndex,
+}
+
+/// `unit_op.getUnits()` — ⛔ NON-EMPTY BY CONSTRUCTION, which is what
+/// `DT_CHECK(unit_op.getUnits().size() >= 1)` (`cpp:236`) had to say at run time, and what
+/// [`crate::islands::sentient::ProgramUnits`] says for the rung above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitHandles {
+    head: UnitHandle,
+    rest: Vec<UnitHandle>,
+}
+
+impl UnitHandles {
+    /// The handles, the first being the one whose type decides the program unit's component.
+    #[must_use]
+    pub fn of(head: UnitHandle, rest: Vec<UnitHandle>) -> UnitHandles {
+        UnitHandles { head, rest }
+    }
+
+    /// `getUnits()[0]` — the handle `getType()` is read off.
+    #[must_use]
+    pub const fn first(&self) -> UnitHandle {
+        self.head
+    }
+
+    /// Every handle, head first.
+    pub fn iter(&self) -> impl Iterator<Item = UnitHandle> + '_ {
+        core::iter::once(self.head).chain(self.rest.iter().copied())
+    }
+}
+
+/// ONE `dataflow::ProgramUnitOp` AS [`generate_prog_ir_for_program_unit`] READS IT.
+pub struct ProgramUnitToLower<'a> {
+    /// `getUnits()` — cores x corelets x folds of ONE unit type.
+    pub units: UnitHandles,
+    /// The body, lowered ONCE and filed under every fold-0 handle.
+    pub program: UnitProgramToLower<'a>,
+}
+
+/// EVERY WAY ONE PROGRAM UNIT CAN REFUSE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProgramUnitRefusal {
+    /// `DT_CHECK_MSG(record != …end(), "unexpected unit")` (`cpp:239-241`) — the program unit's own
+    /// type has no component, so nothing of it is lowered at all.
+    UnexpectedUnit(DfirUnit),
+    /// `getSenComponentForProgramStateInfo`'s `DT_ERROR` (`DccExtContext.cpp:210-238`) — this handle
+    /// has no program component, so its program and register state are not filed.
+    UnkeyableUnit(UnitKey),
+    /// What lowering the body refused.
+    Lowering(LoweringRefusal),
+}
+
+/// THE PASS MEMBERS ONE PROGRAM UNIT'S LOWERING OUTLIVES — everything on `SentientToProgIRPass` that
+/// is neither a local of this call nor part of its output.
+pub struct PassState<'a> {
+    /// `regs_to_init_`.
+    pub regs_to_init: &'a mut RegsToInit,
+    /// `unit_foldid_map_` — one entry per handle, in handle order, which is what a uniform operand
+    /// map reads a key unit's fold out of.
+    pub unit_folds: &'a mut Vec<(UnitKey, Option<FoldId>)>,
+    /// `comp_to_code_quality_stats_`.
+    pub code_quality: &'a mut Vec<(Component, CodeQualityStats)>,
+    /// `regDefTracker_`'s current set — `None` is `enabled()` answering false.
+    pub reg_defs: Option<&'a mut RegSet>,
+    /// `dcc_ext_ctx_.artifacts_->foldIds_` — ⛔ `None` IS NO SDSC AT ALL, which is one fold.
+    pub fold_ids: Option<&'a [FoldId]>,
+    /// `fullRegInit.getValue()`.
+    pub full_reg_init: bool,
+    /// The next padding-branch name — ⭐ A PASS COUNTER, not a local: the reference draws each with
+    /// `rand()` (see [`UniformLabel`]) and two handles' padding must not collide.
+    pub padding_label: &'a mut UniformLabel,
+}
+
+/// Replaces: e129_GenerateProgIRForProgramUnit
+///
+/// One `dataflow.program_unit`: lower its body once, fold away every NOP a label alone earned, then
+/// file that one program and its register state under each fold-0 handle's core.
+///
+/// ⛔ ONLY FOLD 0 IS FILED — a later fold's variations live in the operand map, not in a program.
+/// ⛔ A TAG IS NEVER `"be"` (`cpp:349`): that guard compares one against the `be` FIELD's value.
+#[must_use]
+pub fn generate_prog_ir_for_program_unit<A: Arch, M: Model, W: Workload>(
+    unit_op: ProgramUnitToLower<'_>,
+    psinfo_map: &mut Vec<(Core, Program<A, M, W>)>,
+    max_length_unit_core_map: &mut Vec<(Component, Core)>,
+    pass: &mut PassState<'_>,
+) -> Vec<ProgramUnitRefusal> {
+    let ProgramUnitToLower { units, program } = unit_op;
+    // `unit_foldid_map_[unit] = …` for every handle. The subscript ASSIGNS, so a second call for the
+    // same program unit replaces its entries rather than doubling them.
+    pass.unit_folds
+        .retain(|(held, _)| !units.iter().any(|handle| handle.key == *held));
+    for handle in units.iter() {
+        let fold = match pass.fold_ids {
+            Some(ids) => ids.get(handle.fold.0 as usize).copied(),
+            None => Some(FoldId(0)),
+        };
+        pass.unit_folds.push((handle.key, fold));
+    }
+    let Some((_, comp)) = units.first().key.program_key() else {
+        return vec![ProgramUnitRefusal::UnexpectedUnit(units.first().key.unit)];
+    };
+    let mut blocks = UniformInstrBlocks::default();
+    let mut reg_graph = RegGraphs::default();
+    let mut label_to_jumps = LabelToJumps::new();
+    let mut nop_for_labels: Vec<InstrIndex> = Vec::new();
+    let mut cq_stats = COLLECT_CODE_QUALITY_STATS.then(CodeQualityStats::default);
+    // `labels`, `labels_ctr` and `has_samv_` are per-unit and [`generate_unit_prog_ir`] resets each.
+    let mut labels = Labels::default();
+    let mut labels_ctr = LabelCounter(0);
+    let mut has_samv = None;
+    let keys: Vec<UnitKey> = units.iter().map(|handle| handle.key).collect();
+    let mut refused: Vec<ProgramUnitRefusal> = generate_unit_prog_ir::<A>(
+        program,
+        comp,
+        &mut Lowering {
+            labels: &mut labels,
+            blocks: &mut blocks,
+            reg_graph: &mut reg_graph,
+            regs_to_init: pass.regs_to_init,
+            label_to_jumps: &mut label_to_jumps,
+            nop_for_labels: &mut nop_for_labels,
+            labels_ctr: &mut labels_ctr,
+            reg_defs: pass.reg_defs.as_deref_mut(),
+            cq_stats: &mut cq_stats,
+            has_samv: &mut has_samv,
+            units: &keys,
+            full_reg_init: pass.full_reg_init,
+        },
+    )
+    .into_iter()
+    .map(ProgramUnitRefusal::Lowering)
+    .collect();
+
+    if let Some(mut stats) = cq_stats {
+        // The `llvm::dbgs()` dump is every number this value already holds, so it is the port of it.
+        // ⭐ AND THE COUNTS ARE FILED WITH THE STATS: the reference writes them into its dying local
+        // one line too late (`cpp:934`), and nothing in the tree reads `comp_to_code_quality_stats_`,
+        // so neither ordering is observable and this one is the value the dump names.
+        let mut reg_num_per_type: BTreeMap<RegType, u32> = BTreeMap::new();
+        for (unit, reg_map) in pass.regs_to_init.iter() {
+            if unit.program_key().map(|(_, gen_comp)| gen_comp) != Some(comp) {
+                continue;
+            }
+            for (reg_type, regs) in reg_map {
+                let held = reg_num_per_type.entry(*reg_type).or_default();
+                *held = (*held).max(u32::try_from(regs.len()).unwrap_or(u32::MAX));
+            }
+        }
+        stats.regs_per_comp = vec![(comp, reg_num_per_type.into_iter().collect())];
+        match pass.code_quality.iter().position(|(at, _)| *at == comp) {
+            Some(at) => pass.code_quality[at].1 = stats,
+            None => pass.code_quality.push((comp, stats)),
+        }
+    }
+
+    // ⛔ ONLY FOLD 0: `if (fold_idx > 0) continue;` — the later folds' variations are already in the
+    // operand map, so they file no program of their own.
+    for handle in units.iter().filter(|handle| handle.fold == FoldIndex(0)) {
+        let Some((core, my_comp)) = handle.key.program_key() else {
+            refused.push(ProgramUnitRefusal::UnkeyableUnit(handle.key));
+            continue;
+        };
+        // `psinfo_map[core]` — the subscript default-constructs, so a core nothing has emitted for
+        // still gets a program.
+        if !psinfo_map.iter().any(|(at, _)| *at == core) {
+            psinfo_map.push((core, Program::default()));
+        }
+
+        // Every NOP a label alone earned hands that label to the instruction after it, and every
+        // jump aimed at the NOP is re-aimed there.
+        let mut nop_to_be_deleted: Vec<UniformInstrInfo> = Vec::new();
+        if !blocks.blocks.is_empty() {
+            for index in nop_for_labels.clone() {
+                let Some(curr_label) = blocks
+                    .uniform_instr_mut(index)
+                    .map(|nop| nop.tag.clone().unwrap_or_default())
+                else {
+                    continue;
+                };
+                let next_index = InstrIndex {
+                    instr: index.instr + 1,
+                    ..index
+                };
+                if !blocks.does_instr_exist(next_index) {
+                    continue;
+                }
+                let next_label = blocks
+                    .uniform_instr_mut(next_index)
+                    .and_then(|next| next.tag.clone())
+                    .unwrap_or_default();
+                if curr_label == "be" || next_label == "be" {
+                    continue;
+                }
+                // A non-empty target is what `pc_target` needs, so an untagged successor takes the
+                // NOP's own label first.
+                let target = if next_label.is_empty() {
+                    if let Some(next) = blocks.uniform_instr_mut(next_index) {
+                        next.tag = (!curr_label.is_empty()).then(|| curr_label.clone());
+                    }
+                    curr_label.clone()
+                } else {
+                    next_label
+                };
+                for jump_index in label_to_jumps.get(&curr_label).cloned().unwrap_or_default() {
+                    if let Some(jump) = blocks.uniform_instr_mut(jump_index) {
+                        jump.set_common_field(
+                            OperandField::PcTarget,
+                            Operand::every(OperandValue::InstrTag(target.clone())),
+                        );
+                    }
+                    label_to_jumps
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(jump_index);
+                }
+                if let Some(nop) = blocks.uniform_instr_mut(index) {
+                    nop_to_be_deleted.push(nop.clone());
+                }
+            }
+        }
+
+        // `psinfo.senCompProgram_[my_comp].destroyGraph()` — the subscript creates and the call
+        // empties, so a unit that emitted nothing still files an EMPTY program.
+        // ⛔ `DT_CHECK(blocks.size() == 1)` IS STRUCTURAL HERE: `addInstruction` opens exactly one
+        // lazy CODE block (`progir.h:459-466`), which is the one block below.
+        let mut unit_program = UnitProgram::default();
+        let mut filed_size = None;
+        if !blocks.blocks.is_empty() {
+            let instrs =
+                blocks.uniformized_unit_uniform_instr_list(handle.key, *pass.padding_label);
+            for _ in &blocks.blocks {
+                *pass.padding_label = pass.padding_label.bump();
+            }
+            let kept: Vec<Instruction> = instrs
+                .iter()
+                .filter(|instr| !nop_to_be_deleted.contains(instr))
+                .map(|instr| instr.uniformized_instr(handle.key))
+                .collect();
+            filed_size = Some(kept.len());
+            unit_program.blocks.push(Block::Code(kept));
+        }
+        if let Some((_, held)) = psinfo_map.iter_mut().find(|(at, _)| *at == core) {
+            match held.per_unit.iter().position(|(at, _)| *at == my_comp) {
+                Some(at) => held.per_unit[at].1 = unit_program,
+                None => held.per_unit.push((my_comp, unit_program)),
+            }
+        }
+
+        // Which core holds the longest program for this unit — read AFTER the write above, because
+        // the core already recorded may be this one.
+        if let Some(instr_size) = filed_size {
+            let recorded = max_length_unit_core_map
+                .iter()
+                .find(|(at, _)| *at == my_comp)
+                .map(|(_, at)| *at);
+            let max_instr_size = recorded
+                .and_then(|at| psinfo_map.iter().find(|(core, _)| *core == at))
+                .and_then(|(_, held)| first_code_block(held, my_comp))
+                .map_or(0, Vec::len);
+            // ⭐ THE TIE GOES TO THE LOWER CORE, and only when the incumbent is non-empty.
+            let takes_it = match recorded {
+                None => true,
+                Some(at) => {
+                    max_instr_size < instr_size
+                        || (max_instr_size > 0 && max_instr_size == instr_size && at > core)
+                }
+            };
+            if takes_it {
+                match max_length_unit_core_map
+                    .iter()
+                    .position(|(at, _)| *at == my_comp)
+                {
+                    Some(at) => max_length_unit_core_map[at].1 = core,
+                    None => max_length_unit_core_map.push((my_comp, core)),
+                }
+            }
+        }
+
+        // `psinfo.regState_[my_comp].destroyGraph()`, then this unit's initialisers — and `head` being
+        // null is `blocks.empty()`, the same graph being empty, so an empty one is ERASED.
+        let state = reg_graph
+            .get(handle.key)
+            .filter(|state| !state.is_empty())
+            .map(|state| {
+                let mut sorted = state.clone();
+                // `regInfo` is `map<RegType, map<unsigned, …>>`, so the file orders and the index
+                // orders within it.
+                sorted.sort_by_key(|init| (init.file, init.index));
+                sorted
+            });
+        if let Some((_, held)) = psinfo_map.iter_mut().find(|(at, _)| *at == core) {
+            let at = held.reg_state.iter().position(|(at, _)| *at == my_comp);
+            match (state, at) {
+                (Some(state), Some(at)) => held.reg_state[at].1 = state,
+                (Some(state), None) => held.reg_state.push((my_comp, state)),
+                (None, Some(at)) => {
+                    held.reg_state.remove(at);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    refused
+}
 // crustify:todo: e130_runOnOperation
 
 #[cfg(test)]
@@ -1602,5 +1928,118 @@ mod unit_tests {
             }
         );
         assert_eq!(state.cq_stats.expect("collecting").conditional_jcmps, 1);
+    }
+
+    /// e129: the NOP a label alone earned hands its tag to the RETURN and vanishes; both cores of a
+    /// two-core set file the same program, only fold 0 files at all, and the length tie goes to the
+    /// lower core even though the higher one recorded it first.
+    #[test]
+    fn a_label_only_nop_is_folded_away_and_only_fold_zero_files_a_program() {
+        let at = |core: u32| Core::checked(core).expect("every arch has 32 cores");
+        let key = |core| UnitKey::of(DfirUnit::Pe, Residency::CoreWide { core }).expect("keys");
+        let handle = |core, fold| UnitHandle {
+            key: key(at(core)),
+            fold: FoldIndex(fold),
+        };
+        let mut unit_folds = Vec::new();
+        let mut code_quality = Vec::new();
+        let mut padding_label = UniformLabel(0);
+        let mut regs_to_init = RegsToInit::new();
+        let mut pass = PassState {
+            regs_to_init: &mut regs_to_init,
+            unit_folds: &mut unit_folds,
+            code_quality: &mut code_quality,
+            reg_defs: None,
+            fold_ids: Some(&[FoldId(0), FoldId(3)]),
+            full_reg_init: false,
+            padding_label: &mut padding_label,
+        };
+        let mut psinfo_map: Vec<(Core, Program<Target, M, W>)> = Vec::new();
+        let mut max_length_unit_core_map = Vec::new();
+        let refused = generate_prog_ir_for_program_unit::<Target, M, W>(
+            ProgramUnitToLower {
+                // ⛔ CORE 1 FIRST, so the tie-break has an incumbent to displace.
+                units: UnitHandles::of(handle(1, 0), vec![handle(0, 0), handle(1, 1)]),
+                program: UnitProgramToLower {
+                    estimated_instructions: 4,
+                    body: vec![
+                        op(0, OpKind::Nop { dbg_name: None }),
+                        op(
+                            1,
+                            OpKind::If {
+                                predicate: CmpPredicate::Eq,
+                                operands: CmpOperands::LccrVsImm {
+                                    lccr: RegIndex::at::<1>(),
+                                    imm: CmpImm::Constant(2),
+                                },
+                                else_region: ElseRegion::None,
+                                results: Vec::new(),
+                                next: OpSite(9),
+                            },
+                        ),
+                        // Labelled by the JCMP above and emitting nothing, so it earns a NOP.
+                        op(9, OpKind::Common { next: None }),
+                        op(10, OpKind::Return),
+                    ],
+                },
+            },
+            &mut psinfo_map,
+            &mut max_length_unit_core_map,
+            &mut pass,
+        );
+        assert_eq!(refused, Vec::new());
+        assert_eq!(
+            unit_folds,
+            vec![
+                (key(at(1)), Some(FoldId(0))),
+                (key(at(0)), Some(FoldId(0))),
+                (key(at(1)), Some(FoldId(3))),
+            ],
+            "every handle is cached, and fold 1 is the SDSC's third fold"
+        );
+        assert_eq!(
+            code_quality,
+            Vec::new(),
+            "`CollectCodeQualityStats` is off by default"
+        );
+        // ⛔ THE NOP IS GONE AND THE RETURN CARRIES ITS LABEL.
+        let filed = |core: u32| {
+            first_code_block(
+                &psinfo_map
+                    .iter()
+                    .find(|(held, _)| *held == at(core))
+                    .expect("the core files a program")
+                    .1,
+                Component::Pe,
+            )
+            .expect("one CODE block")
+            .iter()
+            .map(|instr| (instr.opcode, instr.tag.clone()))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            filed(1),
+            vec![
+                (OpCode::NOP, None),
+                (OpCode::JCMP, None),
+                (OpCode::RETURN, Some("if-label-0-end".to_owned())),
+            ]
+        );
+        assert_eq!(filed(0), filed(1), "one body, filed under both cores");
+        assert_eq!(
+            psinfo_map.len(),
+            2,
+            "fold 1 is core 1 again and files nothing new"
+        );
+        assert_eq!(
+            psinfo_map[0].1.reg_state,
+            Vec::new(),
+            "an empty register graph is erased, not filed empty"
+        );
+        assert_eq!(
+            max_length_unit_core_map,
+            vec![(Component::Pe, at(0))],
+            "the tie went to the lower core"
+        );
     }
 }
