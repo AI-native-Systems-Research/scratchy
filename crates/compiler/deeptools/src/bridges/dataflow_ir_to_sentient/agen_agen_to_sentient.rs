@@ -172,11 +172,16 @@ impl Consumed {
 /// exhaustive over [`agen::Op`] rather than over the twelve — which is why declaring the symbolic
 /// pair for entries 374/375 grew arms 11 and 12 here, in the one place that has to have them.
 ///
-/// # ⛔⛔ TWO ARMS ARE `todo!` AND THAT IS THE POINT
+/// # ⛔⛔ FOUR ARMS ARE `todo!` AND THAT IS THE POINT — AND THE PREDICATE THAT PICKS BETWEEN THEM RUNS
 ///
-/// `e314_lowerVectorLoadOp` and `e315_lowerVectorStoreOp` are unported (both level 5, this
-/// campaign), as are the two pattern predicates that choose between them and their extracting
-/// siblings. ⚠️ 315's recorded level is wrong in the schedule, not here: its 7-argument
+/// All four of `e312_lowerExtractVectorLoadOp`, `e313_lowerExtractVectorStoreOp`,
+/// `e314_lowerVectorLoadOp` and `e315_lowerVectorStoreOp` are unported (all level 5, this campaign).
+/// ⭐ BUT `e153_isLoadAndExtractScalarPattern` AND `e154_isReceiveAndExtractScalarPattern` ARE PORTED,
+/// so the `if (isLoadAndExtractScalarPattern(load_op))` at `:56` and the `if
+/// (isReceiveAndExtractScalarPattern(store_op))` at `:74` are asked here rather than elided — and this
+/// dispatch is the only caller the reference gives either of them. A single `todo!` per kind naming
+/// both alternatives would say *"one of these two"* where the reference already knows which.
+/// ⚠️ 315's recorded level is wrong in the schedule, not here: its 7-argument
 /// `constructReceiveAndStoreStmt` call (`Helper.cpp:3090-3092`) cannot bind the 8-parameter inline
 /// forwarder `e028` and resolves to the primary template `e359` (`Helper.cpp:2025`, level 7), so 315
 /// is scheduled two levels ahead of its own callee. Until they land, an `agen.vector_load` reaching
@@ -190,12 +195,12 @@ impl Consumed {
 ///
 /// # ⛔ WHAT THE PORT DROPS, AND WHY IT IS SOUND
 ///
-/// - `checkBasicConditions` (`e210`, `Helper.cpp:58`) refuses an access whose order is not a
-///   permutation or whose set is not hyper-rectangular. Every access this island can construct is
-///   built by [`crate::islands::dataflow_ir::dialects::agen`]'s own `identity_map`/`lane_set`, which
-///   produce exactly a permutation (the identity) and exactly a hyper-rectangle (outer dims pinned,
-///   the lane axis a range). The check is vacuous over constructible input, and a runtime re-check
-///   would be a refusal this crate does not have.
+/// - Nothing about `checkBasicConditions` (`e210`, `Helper.cpp:58`) — it is PORTED and it is CALLED,
+///   below, on every candidate before the dispatch, exactly where `:38` calls it. ⛔ IT IS NOT
+///   VACUOUS, and the earlier claim that it was covered only half the input: for the vector pair the
+///   set and order are the island's own derived `access_set`/`access_order`, so those two do pass by
+///   construction — but a `CompositeLoadAndStore` carries its OWN `load_order`, `store_order`,
+///   `load_set`, `store_set` and `time_order`, and that is the one arm this dispatch lowers today.
 /// - `signalPassFailure()` / `emitError` / `return failure()` have no counterpart: the ported
 ///   lowerings are total functions, and `crates/compiler/deeptools/CLAUDE.md` forbids a `Result` at
 ///   this seam. An input that cannot be lowered is a `todo!` at build-fail time, not an error value.
@@ -224,22 +229,67 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
     consts: &Consts,
     out: &mut Vec<SenOp>,
 ) -> Consumed {
+    // ── `if (checkBasicConditions(op).failed()) signalPassFailure();` (`:38-41`) ─────────────────
+    //
+    // ⛔ ON THE CANDIDATE SET ONLY, AND BEFORE THE DISPATCH. The reference asks it inside the walk's
+    // `isa<the twelve>` guard, so an interleave or a mask state is never asked — and a candidate that
+    // fails it leaves `vector_op` NULL, which breaks the `while (true)` and abandons every remaining
+    // candidate in the unit as well.
+    // ⛔ AND IT IS A REFUSAL THE REFERENCE MAKES, NOT AN UNPORTED CALLEE: `e210` answers, and what
+    // this bridge has no representation for is `signalPassFailure()`. Lowering the access anyway
+    // would emit a transfer `AgenToSentient` declines to emit.
+    if is_candidate(op) {
+        let conditions =
+            super::agen_helper::check_basic_conditions(super::agen_helper::CheckedOp::Dfir(stmt));
+        if !conditions.admissible() {
+            todo!(
+                "e210_checkBasicConditions refuses this access ({conditions:?}: {:?}), so \
+                 AgenToSentient signalPassFailure()s and abandons the fusion of {:?}",
+                conditions.diagnostic(),
+                unit.on.kind()
+            );
+        }
+    }
+
     match op {
         // ── 1. `agen.vector_load` (`AgenToSentient.cpp:55-72`) ───────────────────────────────────
-        agen::Op::VectorLoad { .. } => todo!(
-            "e153_isLoadAndExtractScalarPattern then e312_lowerExtractVectorLoadOp (extract {}) or \
-             e314_lowerVectorLoadOp: agen.vector_load on {:?}",
-            extract.issued(),
-            unit.on.kind()
-        ),
+        //
+        // ⛔ THE PREDICATE IS THE BRANCH, AND IT RUNS (`:56`) — `e153` is ported, so the `todo!` names
+        // the ONE lowering this load needs and not a pair. The scope is the whole unit body because
+        // the pattern is *"the load's single user is a store into the virtual IBR"*, a use census.
+        agen::Op::VectorLoad { .. } => {
+            if super::agen_helper::is_load_and_extract_scalar_pattern(stmt, &unit.body) {
+                todo!(
+                    "e312_lowerExtractVectorLoadOp: agen.vector_load with the \
+                     sentient.load_and_extract_scalar pattern, extract {}, on {:?}",
+                    extract.issued(),
+                    unit.on.kind()
+                )
+            }
+            todo!(
+                "e314_lowerVectorLoadOp: a plain agen.vector_load on {:?}",
+                unit.on.kind()
+            )
+        }
 
         // ── 2. `agen.vector_store` (`AgenToSentient.cpp:73-89`) ──────────────────────────────────
-        agen::Op::VectorStore { .. } => todo!(
-            "e154_isReceiveAndExtractScalarPattern then e313_lowerExtractVectorStoreOp (extract {}) \
-             or e315_lowerVectorStoreOp: agen.vector_store on {:?}",
-            extract.issued(),
-            unit.on.kind()
-        ),
+        //
+        // ⛔ `e154` IS THE WHOLE PATTERN — a store INTO the virtual IBR, asked of the store alone
+        // (`:74`), so it needs no use census of its own; the scope resolves the view to its unit.
+        agen::Op::VectorStore { .. } => {
+            if super::agen_helper::is_receive_and_extract_scalar_pattern(stmt, &unit.body) {
+                todo!(
+                    "e313_lowerExtractVectorStoreOp: agen.vector_store with the \
+                     sentient.receive_and_extract_scalar pattern, extract {}, on {:?}",
+                    extract.issued(),
+                    unit.on.kind()
+                )
+            }
+            todo!(
+                "e315_lowerVectorStoreOp: a plain agen.vector_store on {:?}",
+                unit.on.kind()
+            )
+        }
 
         // ── 5. `agen.composite_load_and_store` (`AgenToSentient.cpp:102-109`) ────────────────────
         //
@@ -256,7 +306,7 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             Consumed(1)
         }
 
-        // ── 11. `agen.symbolic_vector_load` (`AgenToSentient.cpp:146-153`) ───────────────────────
+        // ── 11. `agen.symbolic_vector_load` (`AgenToSentient.cpp:147-152`) ───────────────────────
         //
         // ⛔ THE STORE SEARCH NEEDS THE WHOLE UNIT BODY, not the window: entry 036 counts the load
         // result's uses, and a census over the remaining statements alone would find one use where
@@ -268,7 +318,7 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             &unit.body,
         ),
 
-        // ── 12. `agen.symbolic_vector_store` (`AgenToSentient.cpp:154-161`) ──────────────────────
+        // ── 12. `agen.symbolic_vector_store` (`AgenToSentient.cpp:153-159`) ──────────────────────
         agen::Op::SymbolicVectorStore { .. } => {
             super::agen_helper::lower_symbolic_vector_store_op(unit, unit.on.kind())
         }
@@ -297,6 +347,26 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
     }
 }
 
+/// WHETHER THIS OP IS ONE OF THE TWELVE THE FUSION WALKS FOR — `isa<VectorLoadOp, VectorStoreOp, …>`
+/// (`AgenToSentient.cpp:33-37`).
+///
+/// ⛔ IT IS THE WALK'S GUARD, NOT THE DISPATCH'S. `checkBasicConditions` sits inside it, so the
+/// interleave and the mask state — which the fusion passes over and `e384` lowers in its own later
+/// steps — are never asked. Written as an exhaustive `match` so a thirteenth island `agen` op has to
+/// state which side of the guard it is on.
+fn is_candidate(op: &agen::Op) -> bool {
+    match op {
+        agen::Op::VectorLoad { .. }
+        | agen::Op::VectorStore { .. }
+        | agen::Op::CompositeLoadAndStore(_)
+        | agen::Op::SymbolicVectorLoad { .. }
+        | agen::Op::SymbolicVectorStore { .. } => true,
+        agen::Op::CompositeMemoryInterleave { .. }
+        | agen::Op::SetTransferMaskState { .. }
+        | agen::Op::Yield => false,
+    }
+}
+
 use crate::arch::Elements;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::affine::Carried;
@@ -320,8 +390,10 @@ pub struct OutermostCompLoop(pub Val);
 /// ⛔ SIGNED, AND THE SIGN IS THE OFF SWITCH. The C++ declares `int stride_step` and both users
 /// guard with `stride_step > 0` (`Helper.cpp:1999`, `:2043`'s companion), so 0 means *no stride
 /// adjustment* while a negative value would mean *adjust backwards* — a distinction an `unsigned`
-/// would have thrown away. Its one producer computes
-/// `group_index >= 0 ? -(time_bounds[group_index] .. ) : 0` at `Helper.cpp:1862`.
+/// would have thrown away. Its one producer is `Helper.cpp:1862-1865` and it never yields a literal
+/// zero: `group_index >= 0 ? time_offsets[group_index] : (burst_index >= 0 ?
+/// time_offsets[burst_index] : time_offsets.front())` — a TIME OFFSET, three ways, and whether the
+/// adjustment happens is that offset's own sign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StrideStep(pub i32);
 

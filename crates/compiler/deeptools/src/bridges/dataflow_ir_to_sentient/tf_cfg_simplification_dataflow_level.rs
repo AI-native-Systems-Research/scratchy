@@ -60,9 +60,7 @@
 
 use crate::arch::Arch;
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::is_operation_selected;
-use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, affine, agen, dataflow, scf, uniform,
-};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, regions};
 use crate::islands::dataflow_ir::{self as dfir};
 
 /// HOW MANY TIMES ONE BOUNDED REWRITE MAY FIRE ON ONE UNIT.
@@ -151,7 +149,7 @@ pub const STEPS: &[Step] = &[
 /// locally, before that entry was ported. Two records of one fact, and the local one carried a note
 /// that the `affine.if` half had no island variant — which is now false. It delegates.
 ///
-/// ⭐ THE CALL SITE IS UNCHANGED. `count_conditionals` still asks the same question of the same ops;
+/// ⭐ THE CALL SITE IS UNCHANGED. [`conditional_tree`] still asks the same question of the same ops;
 /// the answer now comes from the one function the reference has.
 fn is_selected(op: &DfirOp) -> bool {
     is_operation_selected(op)
@@ -161,59 +159,20 @@ fn is_selected(op: &DfirOp) -> bool {
 ///
 /// ⛔ THIS IS A USE-WALK AND NOTHING ELSE, which is the one mechanism a port of this campaign may
 /// simplify: MLIR reaches nested ops through `Region`/`Block`, this island nests them in `Vec`s. The
-/// JUDGEMENT stays in [`is_selected`]; a leaf op falls through here because it has no region, not
-/// because it was decided about.
+/// JUDGEMENT stays in [`is_selected`]; a leaf op falls through here because it has no region.
+///
+/// ⛔⛔ WHICH OPS HAVE REGIONS IS [`regions`]'s FACT, NOT THIS WALK'S. This used to be a second
+/// `match` over [`DfirOp`] naming the region-carrying ops itself, and it had already fallen behind by
+/// one: `agen.composite_memory_interleave` carries a region ([`regions`] gives it one,
+/// `Agen.td`'s `$region`) and the local table put it under *no region*, so a conditional inside an
+/// interleave was invisible and `tree.empty()` answered TRUE for a unit whose tree the reference
+/// populates. That is the silent skip [`run_on_operation`] exists to prevent. `e384`'s own walk
+/// (`agen_agen_to_sentient::count`) already delegates; so does this one.
 fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
     for op in ops {
         visit(op);
-        match op {
-            DfirOp::Affine(affine::Op::For { body, .. })
-            | DfirOp::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. })
-            | DfirOp::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => {
-                walk_preorder(body, visit);
-            }
-            DfirOp::Scf(scf::Op::If {
-                body, else_body, ..
-            }) => {
-                walk_preorder(body, visit);
-                walk_preorder(else_body, visit);
-            }
-            DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
-                walk_preorder(&transfer.body, visit);
-            }
-            // ⭐ AN `affine.if` HAS TWO REGIONS TOO, and now that the island can hold one the walk
-            // has to descend into both — a preorder walk that skipped them would report a tree with
-            // no nodes for a program whose conditionals are all at the affine rung.
-            DfirOp::Affine(affine::Op::If {
-                body, else_body, ..
-            }) => {
-                walk_preorder(body, visit);
-                walk_preorder(else_body, visit);
-            }
-            // ⭐ AND A `uniform.uniformize_regions` HAS ONE REGION PER UNIT CLASS. Every conditional
-            // the scheduler wrote once and mapped onto many units lives inside them, so a walk that
-            // stopped at the op would count a tree with no nodes for exactly the programs this pass
-            // is run on.
-            DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
-                for region in regions {
-                    walk_preorder(&region.body, visit);
-                }
-            }
-            // no region.
-            DfirOp::Arith(_)
-            | DfirOp::Affine(_)
-            | DfirOp::Scf(_)
-            | DfirOp::Dataflow(_)
-            | DfirOp::Agen(_)
-            | DfirOp::Vector(_)
-            | DfirOp::VectorChain(_)
-            // `uniform.yield` terminates one of those regions; the two mapping ops carry none.
-            | DfirOp::Uniform(
-                uniform::Op::Yield { .. }
-                | uniform::Op::DefImmutableMapping { .. }
-                | uniform::Op::QueryMap { .. },
-            )
-            | DfirOp::Symbol(_) => {}
+        for region in regions(op) {
+            walk_preorder(region, visit);
         }
     }
 }
@@ -272,17 +231,18 @@ pub fn conditional_tree<A: Arch>(unit: &dfir::ProgramUnit<A>) -> Nodes {
 ///
 /// # ⛔⛔ TODAY EVERY TREE IN THIS CRATE IS EMPTY, AND THAT IS A CHECKED FACT NOT AN ASSUMPTION
 ///
-/// [`is_selected`] is `isa<affine.if, scf.if>`; the DataflowIR island has no `affine.if` at all, so
-/// the only node kind is [`scf::Op::If`]. Nothing this compiler currently emits constructs one — the
-/// undecided branches bridge 1 flattens are gone by the time a program reaches this rung. So this
-/// pass is provably a no-op over every program the pipeline can hand it, and wiring it in cannot
-/// change a single emitted byte.
+/// [`is_selected`] is `isa<affine.if, scf.if>`, and the island now holds BOTH — `affine::Op::If`
+/// arrived with entries 374-381, so this pass has two node kinds and not one. What is checked is that
+/// neither is CONSTRUCTED: `subtile_to_dataflow_ir`, the only producer of a `dfir::Program`, builds no
+/// `Op::If` of either flavour, because the undecided branches bridge 1 flattens are gone by the time a
+/// program reaches this rung. So the pass is a no-op over every program the pipeline can hand it
+/// today, and wiring it in cannot change a single emitted byte.
 ///
-/// ⛔ WHICH IS EXACTLY WHY IT IS WIRED IN ANYWAY. The day an `scf.if` DOES reach this rung, the
-/// program needs six rewrites that do not exist and the answer must be a BUILD FAILURE naming the
-/// first missing one — not a lowering that quietly skips the simplification and emits a conditional
-/// the Sentient rung mis-schedules. A pass that is only added once its input appears is a pass that
-/// is absent on the one run that needed it.
+/// ⛔ WHICH IS EXACTLY WHY IT IS WIRED IN ANYWAY. The day an `scf.if` or `affine.if` DOES reach this
+/// rung, the program needs six rewrites of which not one can run, and the answer must be a BUILD
+/// FAILURE naming the first missing one — not a lowering that quietly skips the simplification and
+/// emits a conditional the Sentient rung mis-schedules. A pass that is only added once its input
+/// appears is a pass that is absent on the one run that needed it.
 ///
 /// # ⛔ WHAT THE PORT DROPS, AND WHY
 ///
@@ -292,28 +252,34 @@ pub fn conditional_tree<A: Arch>(unit: &dfir::ProgramUnit<A>) -> Nodes {
 ///   parameter would make "did the compiler simplify" a runtime question with two answers.
 /// - The `LLVM_DEBUG` / `DEBUG_WITH_TYPE(VerboseDebug, tree.print(...))` tracing after every step
 ///   (`:86-155`) prints the tree; it has no effect on the IR.
-/// - The tree itself is not built. `compute()` populates a node graph that only the six unported
-///   rewrites read; what this port needs from it is `empty()`, which is exactly the node COUNT
+/// - The tree itself is not built. `compute()` populates a node graph that only the six rewrites
+///   read, and none of them runs; what this port needs from it is `empty()`, which is the node COUNT
 ///   ([`conditional_tree`]). The tree gets built in `tf_cfgs_dataflow_conditional_tree.rs`, its own
 ///   home, when its rewrites land.
 ///
-/// # ⛔⛔ FIVE OF THE SEVEN CALLS ARE OUTSIDE THIS CAMPAIGN'S 384
+/// # ⛔⛔ TWO OF THE SIX REWRITES — THREE OF THE SEVEN CALLS — ARE OUTSIDE THIS CAMPAIGN'S 384
 ///
-/// `e284_hoistCommonConditionals`, `e371_hoistLoopInvariantConditionals`,
-/// `e380_shallowlyMergeConditionals` and `e381_simplifyValueBasedConditionals` are scheduled units.
-/// But `removeDuplicateConditionals` and `removeConditionWhenThenElseBranchesMatch` live on the base
-/// class in `dcc/src/Analysis/TransformationConditionalTree.cpp:58` and `:181`, as do the tree's
-/// constructor, `compute()` and `empty()` — and none of those five is in the 384 or in the campaign's
-/// 106 documented exclusions. So this pass cannot be completed by this campaign as scheduled, and the
+/// FOUR of the seven calls are scheduled units: `e284_hoistCommonConditionals`,
+/// `e371_hoistLoopInvariantConditionals`, `e380_shallowlyMergeConditionals` and
+/// `e381_simplifyValueBasedConditionals`. The other three call sites are two functions that live on
+/// the base class — `removeDuplicateConditionals` and `removeConditionWhenThenElseBranchesMatch`,
+/// `dcc/src/Analysis/TransformationConditionalTree.cpp:58` and `:181` — and neither is in the 384 or
+/// in the campaign's 106 documented exclusions. Nor are the tree's constructor, `compute()`
+/// (`dcc/src/Analysis/ConditionalTree.cpp:185`) or `empty()`
+/// (`dcc/src/Analysis/OperationTree.hpp:214`), which makes FIVE definitions this pass needs and the
+/// schedule never names. So this pass cannot be completed by this campaign as scheduled, and the
 /// `todo!` below names the first step rather than pretending the list is reachable.
 ///
 /// # ⛔ AND IT TAKES A SHARED REFERENCE, WHICH IS A STATEMENT ABOUT WHAT IS PORTED
 ///
-/// The reference rewrites its module in place. Here all seven calls in [`STEPS`] are unported, so
-/// there is nothing to write back: the whole observable effect is the choice between leaving a
-/// program alone and failing the build. A `&mut` parameter would claim a capability nothing behind it
-/// has, and would make every caller clone a program in order to rewrite none of them. The parameter
-/// becomes `&mut` in the changeset that lands the first rewrite.
+/// The reference rewrites its module in place. Here NO step in [`STEPS`] can rewrite anything yet:
+/// five are unported, and the two that have landed — `e380_shallowlyMergeConditionals` and
+/// `e381_simplifyValueBasedConditionals` — take the tree by shared reference themselves and reach a
+/// `todo!` at their own unported callees (`e370_areShallowlyMergeable`, `parseConditional`) before any
+/// rewrite. So there is nothing to write back: the whole observable effect is the choice between
+/// leaving a program alone and failing the build. A `&mut` parameter would claim a capability nothing
+/// behind it has, and would make every caller clone a program in order to rewrite none of them. The
+/// parameter becomes `&mut` in the changeset that lands the first rewrite.
 ///
 /// Replaces: e383_runOnOperation
 pub fn run_on_operation<A: Arch>(program: &dfir::Program<A>) {
@@ -348,7 +314,7 @@ mod unit_tests {
     };
     use crate::arch::Target;
     use crate::generated::OpFunc;
-    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, agen, arith, scf};
     use crate::islands::dataflow_ir::{
         Grid, GroupId, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Units,
     };
@@ -448,6 +414,27 @@ mod unit_tests {
         assert_eq!(conditional_tree(&unit).count(), 3);
     }
 
+    /// 🎯 A CONDITIONAL INSIDE AN `agen.composite_memory_interleave` IS A TREE NODE.
+    ///
+    /// ⛔⛔ THIS IS THE ONE REGION A HAND-WRITTEN WALK TABLE MISSED. MLIR's `walk` descends into
+    /// EVERY region of every op, so a conditional nested in an interleave's region is a node the
+    /// reference's tree holds — and a walk that stopped at the interleave answered `empty()` TRUE for
+    /// that unit, which is the silent skip the whole pass is wired in to prevent. It counts two: the
+    /// interleave's own inner `if`, and one beside it.
+    #[test]
+    fn a_conditional_inside_an_interleave_region_is_a_tree_node() {
+        let unit = unit_holding(vec![
+            DfirOp::Agen(agen::Op::CompositeMemoryInterleave {
+                granularity: None,
+                body: vec![branch(0, vec![], vec![])],
+            }),
+            branch(1, vec![], vec![]),
+        ]);
+
+        assert!(!conditional_tree(&unit).empty());
+        assert_eq!(conditional_tree(&unit).count(), 2);
+    }
+
     /// A program of `units`, named so a failure says which case it was.
     fn program_of(units: Vec<ProgramUnit<Target>>) -> Program<Target> {
         let mut units = units.into_iter();
@@ -491,10 +478,11 @@ mod unit_tests {
     /// 🎯 A CONDITIONAL REACHING THIS RUNG NAMES THE FIRST MISSING REWRITE.
     ///
     /// ⛔⛔ THIS IS THE WHOLE REASON THE PASS IS WIRED IN WHILE IT IS A NO-OP. The alternative to
-    /// failing here is lowering an `scf.if` that six unported rewrites were supposed to have
-    /// simplified first — a program the Sentient rung then schedules against a control flow graph the
-    /// reference would never have handed it. The failure has to carry `e284_hoistCommonConditionals`,
-    /// because "the CFG simplification did not run" is not a diagnosis anybody can act on.
+    /// failing here is lowering an `scf.if` that six rewrites — not one of which can run — were
+    /// supposed to have simplified first, a program the Sentient rung then schedules against a control
+    /// flow graph the reference would never have handed it. The failure has to carry
+    /// `e284_hoistCommonConditionals`, because "the CFG simplification did not run" is not a
+    /// diagnosis anybody can act on.
     #[test]
     #[should_panic(expected = "e284_hoistCommonConditionals")]
     fn a_conditional_names_the_first_unported_rewrite() {
