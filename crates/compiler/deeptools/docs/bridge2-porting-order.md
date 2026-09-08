@@ -583,6 +583,153 @@ And entry 137 (`hpp:397`) is only `TPMVVectorLoad`'s constructor — cited at it
 named after the base, the same defect as `e019` above; the note no longer reads as if it covered all
 three vector classes.
 
+## ⛔ MEASURED FOR ENTRIES 357-373: TEN EXTRACT BODIES LOSE REAL CONTENT, AND 370 LOSES ITS ONLY `return true;`
+
+Brace-matched from the authority at each unit's cited line (`a0d29abbed`) and diffed line-by-line
+against `source/bridge2.cpp`'s body. ⭐ **`loc` IS EXACT FOR ALL 17** under the column's convention
+(body span minus signature lines): 387-6, 109-5, 136-5, 21-5, 34-1, 20-1, 21-2, 226-4, 88-5, 83-3,
+99-2, 195-4, 632-4, 36-2, 43-1, 70-1, 7-1. **Seven bodies are verbatim** — 361, 362, 371, 372, 373,
+plus 363 (two closing braces the extractor's balancer put back) and 366 (the `return;` of its
+`applyPartialConversion` failure guard, `:1239`, which is also its last statement, so nothing is lost).
+The other **ten lose real content, and in seven of them it is the statement that acts**:
+
+| unit | dropped from the extract's body |
+|---|---|
+| **370 `areShallowlyMergeable`** (`CFGSDataflowConditionalTree.cpp:343-378`) | **ITS ONLY `return true;`** (`:377`). Four `return false;` guards survive and the extract ends at the walk's closing braces (`bridge2.cpp:16366-16368`), so a `bool` predicate reads ALWAYS-FALSE — the same defect as 347, 348 and 349, and 370's one real callee IS `e347_topLevelConditionsMatch` (`:351`), which has it too. Two nested always-false predicates make the merge step unreachable |
+| **360 `constructSymbolicDetailsAndAddrs`** (`Helper.cpp:2849-2869`) | **ITS ENTIRE PAYLOAD** — `return gatherSymbolicLoadStoreDetails(comp, access_details, mutable_addrs, immutable_addrs);` (`:2867-2868`). A 16-line function whose whole point is to build two `AccessDetailsSymbolic` and hand them on; the extract ends `}}` after the dst error return (`bridge2.cpp:14931-14932`) and forwards nothing |
+| **367 `createXrfIndexModifOps`** (`LoweringXRF.cpp:564-662`) | **ITS RESULT** — `return vector_op_to_xrfptr_map;` (`:661`). 97 lines build the `XrfPtrMap` returned BY VALUE and the extract discards it, exactly as 345 discards the map it builds |
+| **369 `fuseComputeOps`** (`VectorChainToSentientPT.cpp:245-876`) | `VectorOperand::eraseOperands(from_operands);` (`:873`) AND `LoweringXRF::replaceAndEraseDummyMacOps(mac_op_to_xrfptr_map);` (`:875`). The 628-line body places every PT compute op and the extract drops both cleanups: the dummy MACs the XRF lowering left as placeholders are never replaced, and the from-side operands are never erased |
+| **368 `fuseNonComputeOps`** (`VectorChainToSentientPT.cpp:46-240`) | `LoweringXRF::replaceAndEraseDummyMacOps(mac_op_to_xrfptr_map);` (`:239`) — the same dummy-MAC replacement, the last line of this body too |
+| **365 `fillOpInfo`** (`VectorChainToSentientPESFP.cpp:1070-1157`) | THREE STATEMENTS, one of them leaving a **DANGLING `else`** — `op_info.opC_precision_ = op_info.compute_precision_;` (`:1153`) is gone while its `else` (`:1152`) stays, so the extract reads `else` / blank / `}` (`bridge2.cpp:15321-15323`); also `op_info.op_dbg_name_ = dataflow::getDbgNameAttr(op);` (`:1155`) and `return success();` (`:1156`). The opB pair above it survives intact, so a port from the extract gives opC no fallback and every op no debug name |
+| **358 `constructLoadAndSendStmt`** (`Helper.cpp:1910-2018`) | `builder->restoreInsertionPoint(insert_pt);` (`:2015`) **while KEEPING the comment that describes it** (`:2013-2014`), plus `return LogicalResult::success();` (`:2017`). The one statement that puts the builder back where it found it is the one dropped |
+| **357 `generateAffineAddressManipulationStmts`** (`Helper.cpp:625-1011`) | `return LogicalResult::success();` (`:1010`). Its `else` arm returns success at `:827` and survives; the 381-line `if` arm's own return does not, so the extract's last statement is the `LogicalResult::failure()` of the indirect warning path and then `#endif` / `}}}}` (`bridge2.cpp:14669-14672`) |
+| **359 `constructReceiveAndStoreStmt`** (`Helper.cpp:2025-2160`) | `return LogicalResult::success();` (`:2159`) |
+| **364 `patternAgnosticFuseNonComputeOpsHelper`** (`VectorChainToSentientPESFP.cpp:96-321`) | `return success();` (`:320`) **and the `const` member qualifier** — `bool is_precision_converted_global) const {` (`:99`) is rewritten without it, the same signature loss already recorded for 323, 350 and 352-355 |
+
+## ⛔ ENTRY 357'S `TOGGLE_INDIRECT_IMPL1` REGIONS READ DEAD IN THE EXTRACT — AND 268'S READS LIVE
+
+`TOGGLE_INDIRECT_IMPL1` is a file-local `#define … 1` at `Helper.cpp:34`. **The extract does not
+define it**: `prelude.inc:2348` declares `inline Any TOGGLE_INDIRECT_IMPL1;`, a VARIABLE, which does
+not satisfy `#if defined(…)`. The extract kept all four guarded regions verbatim, so the preprocessor
+inverts every one of them:
+
+- **80 of 357's 381 lines go dark.** `#if defined` at `Helper.cpp:906`/`:924`/`:954` (extract
+  `:14570`/`:14588`/`:14618`) guards `SmallVector<std::pair<int, Value>> post_process_list;`
+  (`:918`), the kIndSrc/kIndDst collection that fills it including its `llvm_unreachable("unexpected
+  mem_view_start addr index for kIndSrc/Dst")` (`:925-939`), and the 53-line `findInvariantLoop`
+  lambda plus the patch loop that inserts `mlir::arith::AddIOp` and rewrites the loop's iter-arg
+  INITIALISER — `loop->setOperand(loop->getNumOperands() - v.first - 1, new_init)` (`:999`), the same
+  index-from-the-end rule already recorded for `insertCopyAndAddStmtsHelper`. So an IBR access whose
+  `mem_view_start` addr is non-constant (a toggling JCR) gets no offset at all in the extract.
+- **And 268's 12-line region turns ON.** `#if !defined(TOGGLE_INDIRECT_IMPL1)` at `Helper.cpp:2272`
+  (extract `:7739`) guards two `sentient::AddOp::create` calls adding `indirect_src_offset` /
+  `indirect_dst_offset` straight to `load_immutable_addr` / `store_immutable_addr` (`:2277-2284`),
+  under a comment saying it *"depends on enhancements tracked in issue 2013"*.
+
+⛔ **THESE ARE THE TWO MUTUALLY EXCLUSIVE PLACEMENTS OF THE SAME OFFSET** — at the loop's iter-arg
+initialiser (the authority's choice) or on the immutable address at the transfer (the unshipped one) —
+and the extract picks the wrong one in BOTH directions. A port that reads the extract adds the indirect
+offset in the wrong place and drops the invariant-level hoist entirely.
+
+## ⛔ AND THE `calls` COLUMN FOR 357-373: 37 OF ITS 51 EDGES DO NOT NAME A REAL CALLEE
+
+Each declared edge was resolved against the brace-matched body and against the cited definition of the
+entry it names. **14 of 51 are real, 15 name the wrong definition of a shared name, and 22 are not
+calls at all.** 361 and 373 declare `-` and each has two real callees; 366 declares four edges and not
+one is a call.
+
+- **22 absent.** `e052_If` (357, 364, 365, 366, 368, 369, 371 — seven of the seventeen) is the comment
+  word *"If"*, already recorded. `e149_insert` (357, 358, 365, 366, 369) and `e026_has` (364, 366, 368,
+  370) match comment prose the same way. `e227_OperandReuse` (366, 368, 369) is a CONSTRUCTOR
+  (`OperandReuse.hpp:30`) and all three take `OperandReuse&` as a PARAMETER — the name is in the
+  signature, never in a call. 371 declares `e079` and `e101` `OperationNode`, matching only
+  `OperationNode::WalkOrder::kReverseBFS` in the template argument at `:790`.
+- **15 wrong-definition.** `e064_size` (357, 364, 365, 367, 368, 369) is
+  `VectorChainHelper.cpp:319`, which is `size(vec.size())` in `merge_and_pack_type`'s
+  member-initialiser list — a DATA MEMBER, not a callable, so no `.size()` call can be that edge.
+  `e150_get` (358, 359, 364, 368, 369) is `AccessContainer::get` (`AccessDetails.hpp:401`), while every
+  match is an MLIR static factory — `IndexType::get(context)`, `SentientComputePortAttr::get(…)`; 369
+  has 47 of them and no `AccessContainer::get` at all. `e149_insert` (367, 372) is a one-argument set
+  insert (`LoweringXRF.cpp:590`, `:600`; `MutableStartAddrShifting.cpp:178`) against
+  `insert(MemoryOperandIndex, T)`, the same inversion already recorded for 351. 371 declares BOTH
+  `e088` and `e107` `getRoot` for its two `getRoot()` calls (`:761`, `:790`) and both are wrong: the
+  receiver is the tree itself, whose `getRoot` is `dcc/src/Analysis/ConditionalTree.hpp:143`, outside
+  the span — the same defect as 349's `getFirstChild`.
+- **The 14 real edges** are `e004_setMemViewStartAddr`, `e030_getLoopNestLevel` and
+  `e264_createForOpWithAdditionalReturnValue` (357), `e208_emplace_insert` (360),
+  `e338_ConstructIFRecursively` (362, 363), `e279_createSplatOperation` (364),
+  `e229_getMaskValueForNonPT` + `e342_analyzeAndFillResultForwarding` (365), `e068`/`e069`/`e070` +
+  `e342` (369) and `e347_topLevelConditionsMatch` (370).
+- ⛔ **AND FOUR OMITTED CALLEES ARE EXACTLY THE LINES THE EXTRACT TRUNCATED.** 360 omits
+  `e327_gatherSymbolicLoadStoreDetails` (`Helper.cpp:1051`, level 6) — its lost `return`. 368 and 369
+  omit `e093_replaceAndEraseDummyMacOps` (`LoweringXRF.cpp:681`, level 0) and 369 also
+  `e233_eraseOperands` (level 2) — their lost cleanups. An agent working from the extract sees neither
+  the statement nor the edge.
+- ⛔ **372 DECLARES ONE EDGE AND OMITS ALL FOUR OF ITS ARMS** — `e352`-`e355`
+  (`MutableStartAddrShifting.cpp:189`, `:191`, `:193`, `:195`, all level 6), which is exactly what
+  makes 372 level 7; the sole declared edge is the set `insert` above. 371 omits
+  `e349_isLoopInvariant` (`:783`, level 6), its only in-set callee and the reason IT is level 7. 361
+  omits `e337_lowerSyncOperation` (level 6) and `e044_lowerOpaqueOperation` (level 0). 373 omits
+  `e356_transform` (`:650`, level 6). ⭐ So the `level` column is right for all 17 and derivable from
+  the `calls` column for none of them.
+
+## ⛔ THE SCHEDULE IS KEYED BY BARE METHOD NAME, SO 43 LATER OVERRIDES WERE SILENTLY DROPPED
+
+Mechanical, and it explains a class of missing work the 106 exclusions do not cover. Across every
+`.cpp` cited by the 384 there are **82 top-level `Class::name(` definitions that are not entries, and
+43 of them are a LATER definition of a name an EARLIER entry in the SAME FILE already took.** None of
+the 43 appears in the 106.
+
+- **13 are in `VectorChainToSentientPESFP.cpp`** (357-373's own file for 364/365/366) and they are the
+  per-op lowering bodies: `BinaryOpLowering` (`:328`), `MultiplyOpLowering` (`:569`),
+  `ShuffleOpLowering` (`:613`), `PackOpLowering` (`:675`), `ScanWithGapOpLowering` (`:743`),
+  `FastExpOpLowering` (`:804`), `ExpEstimateOpLowering` (`:835`), `FloorOpLowering` (`:869`),
+  `RecEstimateOpLowering` (`:899`), `LnEstimateOpLowering` (`:929`), `TanhEstimateOpLowering`
+  (`:1022`), `StoreOpLowering` (`:61`) and `VectorStoreOpLowering` (`:78`) — all
+  `matchAndRewrite`, all shadowed by `e377_matchAndRewrite` (`:44`, `SendOpLowering`). **The op a
+  function emits IS the function**, and for the PESFP component thirteen of those emissions are not in
+  the campaign at all.
+- **18 are in 373's own translation unit** (`TransformPagedMemViewImpl.cpp`): 51 definitions, 33
+  entries, and all 18 non-entries are later same-named overrides. `initialize()` has SIX overrides
+  (`:658`, `:706`, `:755`, `:1080`, `:1133`, `:1186`) and only `TPMVVectorLoad`'s is scheduled
+  (`e202`); `initialize_time()` has three (`:1095`, `:1148`, `:1211`) and only `e326`;
+  `createNewMemOp` six (`:684`, `:732`, `:779`, `:1120`, `:1173`, `:1242`) and only `e128`;
+  `eraseMemOpAndUseChain` four and only `e129`. ⛔ **So 373's
+  own two calls cannot both resolve**: `TPMVVector::run()` is `initialize()` then `transform()`
+  (`:648`, `:650`), and its `initialize()` is a pure virtual whose overrides are 1-of-6 present. Its
+  sibling `TPMVComposite::run()` (`:855`) is shadowed by 373 itself.
+- **2 are 363's own siblings.** `LowerLogicalOpToSentient` is THREE overloads —
+  `mlir::arith::AndIOp` (`StandardToSentient.cpp:264`, which is `e363`), `OrIOp` (`:286`) and
+  `CmpIOp` (`:308`) — declared at `:68-70` and all three called by `e376_runOnOperation`
+  (`:460`, `:462`, `:464`). Only the AndIOp body is in the 384. A port of `e363` alone lowers
+  `arith.andi` and leaves `arith.ori` and `arith.cmpi` to a pass that dispatches to nothing.
+
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT THESE 17 — 1 FIXED IN THIS COMMIT
+
+⭐ **NO PORTED SUBJECT.** 0 `/// Replaces:` anchors and 0 surviving `// crustify:todo:` for 357-373;
+all 34 PORT/AUDIT boxes are `[ ]`. All 17 module-doc citation rows measured exact, as did the
+`agen_helper.rs` `todo!` block for 357 — eight citations including the `:827`-versus-`:1010` pair of
+returns, the empty-coefficient-table walk through `:631-632` → `:761` → the zero-trip loop, and the
+non-L3 all-zeros row that takes neither arm at `:788`/`:795`. `tf_cfg_simplification_dataflow_level.rs`
+measured exact for 371 (`:107`, and the four scheduled versus two unscheduled steps of that pass), as
+did `agen_agen_to_sentient.rs` on 315's 7-argument call (`Helper.cpp:3090-3092`) binding `e359` rather
+than the 8-parameter `e028`, on `e358`'s optional `extract_op` test (`:2006`) against
+`lowerIndirectVectorLoadOp`'s own report (`:3196-3199`), and on both indirect callers (`:3202`,
+`:3251`). One claim was wrong:
+
+- **`agen_agen_to_sentient.rs` said `e028`'s extra `data_elem_type` exists because `setsttype` derives
+  `element_width` and the shuffle mode from it, citing `Helper.cpp:2124`.** Neither half holds.
+  `data_elem_type` occurs FOUR times in the whole authority — `AgenToSentient.hpp:242`, `:250`, `:253`
+  and the primary's own parameter list at `Helper.cpp:2027` — and **never in a body**: `e359` reads
+  `element_width` from `access_details.getElementWidth()` (`:2032`) and calls
+  `setsttype(builder, comp, producer_info.first, total_elements, element_width, shuffle_mode)`
+  (`:2092`), whose signature (`hpp:206-209`, body `:1731-1784`) takes no element type at all — it
+  derives the shuffle mode from the producer input OP (a `vectorchain::ShuffleOp`'s splat shape or a
+  `dataflow::ReceiveOp`'s result type) and WRITES `total_elements` from `element_width`. `:2124` is an
+  argument line of the `sentient::ReceiveAndStoreOp::create` call, not a `setsttype` use. The store
+  overload's extra parameter is DEAD in the reference, which is a stronger reason for the port to drop
+  it than the one the doc gave; the implementation was already right.
+
 ## Progress
 
 `200/384 ported; 200/384 audited`

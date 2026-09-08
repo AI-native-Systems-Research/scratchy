@@ -418,12 +418,12 @@ pub fn construct_load_and_send_stmt(extract_op: ExtractScalarOp) -> TransferSpec
 /// }
 /// ```
 ///
-/// ⛔ THE EXTRA PARAMETER IS `data_elem_type`, AND IT IS FORWARDED UNTOUCHED. The store side needs
-/// the element type because `setsttype` derives `element_width` and the shuffle mode from it
-/// (`AgenToSentient.hpp:206-209`, used at `Helper.cpp:2124`); the load side reads its width off the
-/// consumer instead. Its caller takes it from the op's own memref —
-/// `candidate_op.getDirectMemrefType().getElementType()` (`:3250`) — so it is the caller's value,
-/// like the other five pass-throughs, and this overload neither inspects nor changes it.
+/// ⛔ THE EXTRA PARAMETER IS `data_elem_type` AND THE CALLEE NEVER READS IT. `data_elem_type` occurs
+/// ONCE in all of `Helper.cpp` — the primary's own parameter list (`:2027`) — and never in its body:
+/// `element_width` comes from `access_details.getElementWidth()` (`:2032`) and the shuffle mode from
+/// `setsttype(builder, comp, producer_info.first, …)` (`:2092`), which takes the producer input OP and
+/// no element type at all (`:1731-1784`). The caller computes it anyway (`:3250`), so dropping it here
+/// drops a parameter that is dead in the reference, not one this port decided to ignore.
 ///
 /// ⭐ SAME REASON FOR EXISTING, SAME RESULT. See [`construct_load_and_send_stmt`]: without it,
 /// `extract_op` would bind to the general form's `unsigned burst_size`. Its one caller is
