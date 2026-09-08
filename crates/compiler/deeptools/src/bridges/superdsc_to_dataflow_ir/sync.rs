@@ -14,15 +14,16 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e033_constructUnitsForUniformization
 // crustify:todo: e076_constructSyncOperation
 
 use std::num::NonZeroI64;
 
 use super::dsc_lowering::{
-    Component, Handlers, Retrieved, constant_index, retrieve_get_unit_op_in_same_core,
+    Component, Handlers, Retrieved, constant_index, query_over_handles,
+    retrieve_get_unit_op_in_same_core,
 };
 use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
 use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef};
 use crate::units::{Core, Corelet, DfirUnit, Row};
@@ -85,6 +86,115 @@ pub fn construct_units(
         }
     }
     units
+}
+
+/// Replaces: e033_constructUnitsForUniformization
+///
+/// THE UNIT A UNIFORMIZED SYNC SYNCS AGAINST — every other end grouped per `(core, fold)`, mapped by
+/// this core's own fold handles and queried by the enclosing region's iterator
+/// (`SNSyncLowering.cpp:47-136`).
+///
+/// ⛔⛔ THE GROUP IS PER **FOLD RESULT INDEX**, NOT PER UNIT: `getResult(idx)` of each other end's
+/// defining `get_unit` puts fold `idx` of every corelet of a core into ONE group, and the key for that
+/// group is this core's own `idx`-th result. Grouping per unit would sync fold 0 against fold 1.
+///
+/// ⛔ ROWS 1-7 ARE SKIPPED HERE TOO AND THE L3 HALVES ASK WITH `-1` — as in [`construct_units`].
+///
+/// ⛔ A GROUP OF ONE IS THE MEMBER ITSELF, not a one-member `create_group`.
+///
+/// ⭐ THE QUERY KEY IS `uniform_region_iterator_` WHERE THERE IS ONE, ELSE `program_unit_iterator_`.
+///
+/// ⚠️ THE REFERENCE'S CORE ORDER IS AN `unordered_map`'s. The groups are emitted here in the order
+/// `ends` first names each core, which is the only order this port can state.
+#[must_use]
+pub fn construct_units_for_uniformization(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    ends: &[(SyncEnd, Vec<(Core, Vec<Corelet>)>)],
+    comp: Component,
+    relevant: &[(Core, Corelet)],
+    fold_results: impl Fn(Core, Option<Corelet>, Component) -> Option<Vec<Val>>,
+    region_iterator: Option<Val>,
+    program_unit_iterator: Val,
+) -> Option<Val> {
+    // `core_fold_specific_units[core_id][idx].push_back(to_unit_def_op->getResult(idx))`.
+    let mut per_core: Vec<(Core, Vec<Vec<Val>>)> = Vec::new();
+    for (end, cores) in ends {
+        let unit = match end {
+            SyncEnd::Unit(unit) => Component::Unit(*unit),
+            SyncEnd::L0luRow(row) if row.get() == 0 => Component::Unit(DfirUnit::L0lu),
+            SyncEnd::L0luRow(_) => continue,
+        };
+        let core_wide = matches!(end, SyncEnd::Unit(DfirUnit::L3lu | DfirUnit::L3su));
+        for (core, corelets) in cores {
+            let asked: Vec<Option<Corelet>> = if core_wide {
+                vec![None]
+            } else {
+                corelets.iter().copied().map(Some).collect()
+            };
+            for corelet in asked {
+                // `unit_to_value_map_->at(core_id).at(corelet).at(unit)` — a throw for an end this
+                // core never bound.
+                let results = fold_results(*core, corelet, unit)?;
+                let at = match per_core.iter().position(|(walked, _)| walked == core) {
+                    Some(at) => at,
+                    None => {
+                        per_core.push((*core, Vec::new()));
+                        per_core.len() - 1
+                    }
+                };
+                let folds = &mut per_core.get_mut(at)?.1;
+                for (idx, result) in results.into_iter().enumerate() {
+                    if folds.len() <= idx {
+                        folds.resize(idx + 1, Vec::new());
+                    }
+                    folds.get_mut(idx)?.push(result);
+                }
+            }
+        }
+    }
+
+    // `CreateGroupOp::create(..)` per `(core, fold)`, or the lone member itself.
+    let mut groups: Vec<(Core, Vec<Val>)> = Vec::new();
+    for (core, folds) in &per_core {
+        let mut per_fold = Vec::with_capacity(folds.len());
+        for members in folds {
+            if let [single] = members.as_slice() {
+                per_fold.push(*single);
+            } else {
+                let result = vals.mint();
+                ops.push(DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                    result,
+                    unit_ids: members.clone(),
+                }));
+                per_fold.push(result);
+            }
+        }
+        groups.push((*core, per_fold));
+    }
+
+    // `if (sync->isNodeRelevant(comp_, corelet_id, core_id))` over `coreIdsUsed_` × the corelets —
+    // the double loop is mechanism, the surviving pairs are the input.
+    let mut pairs = Vec::new();
+    for (core, corelet) in relevant {
+        let own = fold_results(*core, Some(*corelet), comp)?;
+        let per_fold = groups
+            .iter()
+            .find(|(walked, _)| walked == core)
+            .map(|(_, per_fold)| per_fold)?;
+        for (idx, key) in own.into_iter().enumerate() {
+            // `values.push_back(core_fold_specific_groups.at(core_id).at(idx))`.
+            pairs.push((key, *per_fold.get(idx)?));
+        }
+    }
+
+    Some(query_over_handles(
+        vals,
+        ops,
+        region_iterator.unwrap_or(program_unit_iterator),
+        pairs,
+        MappedTy::Index,
+    ))
 }
 
 /// WHICH SIDE OF THE L0 AN IMPLICIT SYNC IS BUILT ON.
@@ -188,11 +298,14 @@ pub fn construct_implicit_sync_operation(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ImplicitSyncSide, SyncEnd, TileSize, construct_implicit_sync_operation, construct_units,
+        ImplicitSyncSide, MappedTy, SyncEnd, TileSize, construct_implicit_sync_operation,
+        construct_units, construct_units_for_uniformization,
     };
-    use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::{Bound, Handlers, Retrieved};
+    use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::{
+        Bound, Component, Handlers, Retrieved,
+    };
     use crate::islands::dataflow_ir::Values;
-    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith, dataflow};
+    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith, dataflow, uniform};
     use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef};
     use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
 
@@ -304,6 +417,84 @@ mod unit_tests {
                     size: Val(0),
                     view_ty,
                     dbg_name: Some("sync_implicit_L0".to_owned()),
+                }),
+            ]
+        );
+    }
+
+    /// ⛔ ONE GROUP PER FOLD INDEX, AND THE KEY IS THIS CORE'S OWN RESULT FOR THAT FOLD.
+    ///
+    /// A port that grouped per unit would put fold 0 and fold 1 of the same corelet in one group and
+    /// sync every fold against every other.
+    #[test]
+    fn the_other_ends_are_grouped_per_fold_and_keyed_by_this_cores_own_folds() {
+        let core = Core::checked(0).expect("core 0");
+        let cl0 = Corelet::checked(0).expect("corelet 0");
+        let cl1 = Corelet::checked(1).expect("corelet 1");
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+
+        // Two folds per unit: the L0SU other end in both corelets, and this core's own L0LU.
+        let fold_results =
+            |_core: Core, corelet: Option<Corelet>, comp: Component| match (corelet, comp) {
+                (Some(cl), Component::Unit(DfirUnit::L0su)) if cl == cl0 => {
+                    Some(vec![Val(10), Val(11)])
+                }
+                (Some(_), Component::Unit(DfirUnit::L0su)) => Some(vec![Val(12), Val(13)]),
+                (Some(cl), Component::Unit(DfirUnit::L0lu)) if cl == cl0 => {
+                    Some(vec![Val(20), Val(21)])
+                }
+                (Some(_), Component::Unit(DfirUnit::L0lu)) => Some(vec![Val(22), Val(23)]),
+                _ => None,
+            };
+
+        let got = construct_units_for_uniformization(
+            &mut vals,
+            &mut ops,
+            &[
+                (SyncEnd::Unit(DfirUnit::L0su), vec![(core, vec![cl0, cl1])]),
+                // Row 3 contributes nothing at all — the `:57` filter.
+                (
+                    SyncEnd::L0luRow(Row::checked(3).expect("row 3")),
+                    vec![(core, vec![cl0])],
+                ),
+            ],
+            Component::Unit(DfirUnit::L0lu),
+            &[(core, cl0), (core, cl1)],
+            fold_results,
+            Some(Val(90)),
+            Val(91),
+        );
+
+        assert_eq!(got, Some(Val(3)));
+        assert_eq!(
+            ops,
+            vec![
+                // Fold 0 of both corelets, then fold 1 of both.
+                DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                    result: Val(0),
+                    unit_ids: vec![Val(10), Val(12)],
+                }),
+                DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                    result: Val(1),
+                    unit_ids: vec![Val(11), Val(13)],
+                }),
+                DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(2),
+                    pairs: vec![
+                        (Val(20), Val(0)),
+                        (Val(21), Val(1)),
+                        (Val(22), Val(0)),
+                        (Val(23), Val(1)),
+                    ],
+                    values_ty: MappedTy::Index,
+                }),
+                DfirOp::Uniform(uniform::Op::QueryMap {
+                    result: Val(3),
+                    map: Val(2),
+                    // The region's iterator, not the program unit's.
+                    key: Val(90),
+                    ty: MappedTy::Index,
                 }),
             ]
         );
