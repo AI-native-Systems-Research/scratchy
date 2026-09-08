@@ -256,6 +256,12 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
              transfer's region",
             unit.on.kind()
         ),
+
+        // ── 6. `agen.set_transfer_mask_state` — the lowering is not ported ───────────────────────
+        agen::Op::SetTransferMaskState { .. } => todo!(
+            "agen.set_transfer_mask_state not ported: SAMV on {:?}",
+            unit.on.kind()
+        ),
     }
 }
 

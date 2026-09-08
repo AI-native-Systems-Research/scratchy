@@ -158,6 +158,9 @@ pub enum Retrieved {
 /// answers, because the reference's `else` covers it; and only a `get_unit` naming a DIFFERENT
 /// corelet falls through to creation (`SNDSCLowering.cpp:43-58`).
 ///
+/// ⛔ [`None`] IS THE REFERENCE'S `corelet_id = -1`, WHICH ITS L3 CALLER PASSES (`SNSyncLowering.cpp:36`)
+/// — a core-wide residency here, because a `corelet = -1` attribute is not a corelet.
+///
 /// ⛔ THE CREATED OP CARRIES BOTH ATTRIBUTES AND THE ISLAND NAMES IT — the reference writes
 /// `name = type = senComponentsToString.at(comp)` while [`dataflow::Op::GetUnit`] writes the
 /// scheduler's `C{core}-{tag}-CL{corelet}`; that field's own note records why.
@@ -166,7 +169,7 @@ pub fn retrieve_get_unit_op_in_same_core(
     handlers: &Handlers,
     comp: Component,
     core: Core,
-    corelet: Corelet,
+    corelet: Option<Corelet>,
 ) -> Retrieved {
     match comp.key() {
         Key::Lrfreg => Retrieved::Reused(handlers.own_lrf),
@@ -179,14 +182,17 @@ pub fn retrieve_get_unit_op_in_same_core(
             Some(Bound::Unit {
                 handle,
                 corelet: Some(named),
-            }) if named == corelet => Retrieved::Reused(handle),
+            }) if Some(named) == corelet => Retrieved::Reused(handle),
             // ⛔ A BINDING THAT NAMES ANOTHER CORELET IS NOT AN ANSWER — it is a second unit.
             Some(Bound::Unit {
                 corelet: Some(_), ..
             })
             | None => Retrieved::Created(dataflow::Op::GetUnit {
                 result: vals.mint(),
-                residency: Residency::Corelet { core, corelet },
+                residency: match corelet {
+                    Some(corelet) => Residency::Corelet { core, corelet },
+                    None => Residency::CoreWide { core },
+                },
                 unit,
                 num_folds: None,
             }),
@@ -739,7 +745,7 @@ fn query_over_handles(
 }
 
 /// `mlir::arith::ConstantIndexOp::create(builder, builder.getUnknownLoc(), value)`.
-fn constant_index(vals: &mut Values, ops: &mut Vec<DfirOp>, value: i64) -> Val {
+pub(super) fn constant_index(vals: &mut Values, ops: &mut Vec<DfirOp>, value: i64) -> Val {
     let result = vals.mint();
     ops.push(DfirOp::Arith(arith::Op::Constant { result, value }));
     result
@@ -1000,7 +1006,60 @@ pub fn uniformized_folded_constant_bitstream(
     )
 }
 
-// crustify:todo: e059_constructUniformizedFoldedDestinationCore
+/// Replaces: e059_constructUniformizedFoldedDestinationCore
+///
+/// THE DESTINATION CORE'S HANDLE, PER PROGRAM-UNIT HANDLE — a `dataflow.get_unit` for `unit` in the
+/// core this handle's fold data names, mapped from the asking handle and queried once
+/// (`SNDSCLowering.cpp:425-460`). ⭐ NO ALL-SAME SHORTCUT: unlike entries 029-031 it always maps.
+///
+/// ⛔ THE ITERATOR IS `uniform_region_iterator_` WHERE THERE IS ONE, `program_unit_iterator_`
+/// OTHERWISE (`:456-457`) — the only one of these tails that chooses.
+///
+/// ⚠️ ONE PAIR PER FOLD IN THE REFERENCE, ONE HANDLE PER FOLD HERE: it pairs
+/// `unit_def_op->getResult(fold_id)` with `dst_unit_op.getResult(fold_id)`, and this island binds ONE
+/// result per `get_unit` — so a corelet's folds all name the same destination handle.
+#[must_use]
+pub fn uniformized_folded_destination_core(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handles: &Handles,
+    unit: DfirUnit,
+    num_folds: NumFolds,
+    region_iterator: Option<Val>,
+    dst_core: impl Fn(Core, Corelet) -> Core,
+) -> Val {
+    let mut pairs = Vec::new();
+    for group in handles.corelet_groups() {
+        let Some(first) = group.first() else {
+            // `num_folds_` is zero, so this corelet names no handle and asks for no destination.
+            continue;
+        };
+        // `createGetUnitOpInDifferentCore(builder, comp_, dst_core_id, corelet_id, num_folds_)`,
+        // where `dst_core_id` is `getSingleDataStrict(addresses, {{0, core_id}, {1, corelet_id}})`.
+        let dst_op = create_get_unit_op_in_different_core(
+            vals,
+            unit,
+            dst_core(first.core, first.corelet),
+            first.corelet,
+            num_folds,
+        );
+        let dataflow::Op::GetUnit { result: dst, .. } = &dst_op else {
+            // Entry 023 builds nothing else, so this corelet has no destination to name.
+            continue;
+        };
+        let dst = *dst;
+        ops.push(DfirOp::Dataflow(dst_op));
+        pairs.extend(group.iter().map(|handle| (handle.unit, dst)));
+    }
+
+    query_over_handles(
+        vals,
+        ops,
+        region_iterator.unwrap_or_else(|| handles.iterator()),
+        pairs,
+        MappedTy::Index,
+    )
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -1040,7 +1099,7 @@ mod unit_tests {
             &handlers,
             Component::Unit(DfirUnit::L3lu),
             core,
-            cl1,
+            Some(cl1),
         );
         assert_eq!(l3, Retrieved::Reused(Val(7)));
 
@@ -1050,7 +1109,7 @@ mod unit_tests {
             &handlers,
             Component::Unit(DfirUnit::Lxlu),
             core,
-            cl0,
+            Some(cl0),
         );
         assert_eq!(same, Retrieved::Reused(Val(8)));
         let other = retrieve_get_unit_op_in_same_core(
@@ -1058,7 +1117,7 @@ mod unit_tests {
             &handlers,
             Component::Unit(DfirUnit::Lxlu),
             core,
-            cl1,
+            Some(cl1),
         );
         assert_eq!(
             other,
@@ -1077,11 +1136,11 @@ mod unit_tests {
             Component::PeLrf,
             Component::SfpLrf,
         ] {
-            let got = retrieve_get_unit_op_in_same_core(&mut vals, &handlers, comp, core, cl1);
+            let got = retrieve_get_unit_op_in_same_core(&mut vals, &handlers, comp, core, Some(cl1));
             assert_eq!(got, Retrieved::Reused(Val(1)));
         }
         let xrf =
-            retrieve_get_unit_op_in_same_core(&mut vals, &handlers, Component::PtXrf, core, cl1);
+            retrieve_get_unit_op_in_same_core(&mut vals, &handlers, Component::PtXrf, core, Some(cl1));
         assert_eq!(xrf, Retrieved::Reused(Val(2)));
     }
 
@@ -1706,5 +1765,69 @@ mod unit_tests {
         );
         assert_eq!(handles.first().map(|first| first.unit), Some(Val(1000)));
         assert_eq!(handles.iterator(), Val(9));
+    }
+
+    /// 🎯 059/110 — ⛔ THE DESTINATION HANDLE IS PER `(core, corelet)` AND NAMED ONCE PER FOLD, and
+    /// the query reads the REGION iterator where the caller has one.
+    ///
+    /// A per-fold destination op would emit `num_folds_` identical `get_unit`s for one remote unit,
+    /// and querying `program_unit_iterator_` inside a uniform region asks the wrong index.
+    #[test]
+    fn every_fold_of_a_corelet_names_one_destination_and_the_region_iterator_wins() {
+        let handles = handles(2, 2);
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+
+        // The fold data sends each core's traffic to the other one.
+        let result = uniformized_folded_destination_core(
+            &mut vals,
+            &mut ops,
+            &handles,
+            DfirUnit::L3lu,
+            NumFolds(2),
+            Some(Val(77)),
+            |from, _corelet| core(1 - from.get()),
+        );
+
+        assert_eq!(
+            ops,
+            vec![
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(0),
+                    residency: Residency::Corelet {
+                        core: core(1),
+                        corelet: corelet(0),
+                    },
+                    unit: DfirUnit::L3lu,
+                    num_folds: Some(NumFolds(2)),
+                }),
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(1),
+                    residency: Residency::Corelet {
+                        core: core(0),
+                        corelet: corelet(0),
+                    },
+                    unit: DfirUnit::L3lu,
+                    num_folds: Some(NumFolds(2)),
+                }),
+                DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(2),
+                    pairs: vec![
+                        (Val(1000), Val(0)),
+                        (Val(1001), Val(0)),
+                        (Val(1100), Val(1)),
+                        (Val(1101), Val(1)),
+                    ],
+                    values_ty: MappedTy::Index,
+                }),
+                DfirOp::Uniform(uniform::Op::QueryMap {
+                    result: Val(3),
+                    map: Val(2),
+                    key: Val(77),
+                    ty: MappedTy::Index,
+                }),
+            ]
+        );
+        assert_eq!(result, Val(3));
     }
 }

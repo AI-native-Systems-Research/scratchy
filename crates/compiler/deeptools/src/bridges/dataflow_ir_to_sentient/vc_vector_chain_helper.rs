@@ -371,7 +371,13 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         // `agen::VectorLoadOp` and `agen::VectorStoreOp`.
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad { ty, .. }) => Some(*ty),
         DfirOp::Agen(dfir_op::agen::Op::VectorStore { ty, .. }) => Some(*ty),
-        DfirOp::Agen(dfir_op::agen::Op::CompositeLoadAndStore(_) | dfir_op::agen::Op::Yield) => None,
+        DfirOp::Agen(
+            dfir_op::agen::Op::CompositeLoadAndStore(_)
+            | dfir_op::agen::Op::Yield
+            // ⭐ A SAMV IS NOT IN `Utils.cpp:548-553`'s CLASS LIST, however much its result is a
+            // vector: the reference asks its two accesses and the two `dataflow` transfers only.
+            | dfir_op::agen::Op::SetTransferMaskState { .. },
+        ) => None,
         // `vector::LoadOp` and `vector::StoreOp` (`Utils.cpp:548-553`).
         DfirOp::Vector(dfir_op::vector::Op::Load { ty, .. }) => Some(*ty),
         DfirOp::Vector(dfir_op::vector::Op::Store { ty, .. }) => Some(*ty),

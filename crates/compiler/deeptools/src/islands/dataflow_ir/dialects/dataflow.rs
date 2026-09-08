@@ -527,6 +527,15 @@ pub enum Op {
         size: Val,
         /// The buffer's type.
         view_ty: MemRef,
+        /// `dbgName` — the sync's own name.
+        ///
+        /// ⛔ ADDED FOR BRIDGE 1, AND IT PRINTS. `constructImplicitSyncOperation` passes
+        /// `builder.getStringAttr(sync->name_)` as the op's fourth argument
+        /// (`SNSyncLowering.cpp:200-203`), and the authority's own IR carries it:
+        /// `%9, %0, %c4 {dbgName = "sync_implicit_L0"} : memref<1xf16>, index, index`
+        /// (`hcc/samples/Matmul_L0/matmul_l0.mlir:27`). Without a slot for it every implicit sync
+        /// this bridge emits would be anonymous where the reference's is named.
+        dbg_name: Option<String>,
     },
 
     /// `dataflow.opaque {func_name, read_write_register_dictionary, read_only_register_dictionary,
@@ -796,10 +805,17 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             dst,
             size,
             view_ty,
+            dbg_name,
         } => {
+            // ⭐ THE ATTRIBUTE DICTIONARY SITS BETWEEN THE OPERANDS AND THE TYPE LIST, and is absent
+            // altogether when there is no name (`implicit-sync.mlir:159` against
+            // `l0su_mx_precision.mlir:148`).
+            let named = dbg_name
+                .as_ref()
+                .map_or_else(String::new, |name| format!(" {{dbgName = \"{name}\"}}"));
             let _ = writeln!(
                 out,
-                "dataflow.implicit_sync_on_streaming_buffer {}, {}, {} : {}, index, index",
+                "dataflow.implicit_sync_on_streaming_buffer {}, {}, {}{named} : {}, index, index",
                 print::val(*view),
                 print::val(*dst),
                 print::val(*size),

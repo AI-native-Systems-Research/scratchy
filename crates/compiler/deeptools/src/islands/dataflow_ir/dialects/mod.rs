@@ -279,6 +279,9 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.push(transfer.dst);
                 index_operands(&transfer.dst_indices, &mut reads);
             }
+            // ⭐ ONE OPERAND — `(ins Index:$mask_value, ..)` (`Agen.td:1094`); the slice map and the
+            // element counts beside it are attributes.
+            agen::Op::SetTransferMaskState { mask_value, .. } => reads.push(*mask_value),
         },
         // ⭐ `$base` AND `$indices`, WHICH IS ALL A PLAIN ACCESS HAS. Same operand list as the
         // `agen` pair above; what it lacks is the two attributes, not the operands.
@@ -445,7 +448,8 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::Opaque(_) => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. } => vec![*result],
+            agen::Op::VectorLoad { result, .. }
+            | agen::Op::SetTransferMaskState { result, .. } => vec![*result],
             agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
                 Vec::new()
             }
@@ -619,6 +623,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 places.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut places);
             }
+            agen::Op::SetTransferMaskState { mask_value, .. } => places.push(mask_value),
         },
         // ⭐ ARM FOR ARM WITH [`operands`] — see the note there.
         Op::Vector(op) => match op {
@@ -762,7 +767,8 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::Opaque { .. } => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. } => vec![result],
+            agen::Op::VectorLoad { result, .. }
+            | agen::Op::SetTransferMaskState { result, .. } => vec![result],
             agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
                 Vec::new()
             }
@@ -992,9 +998,11 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
     match op {
         Op::Scf(scf::Op::For { dbg_name, .. } | scf::Op::If { dbg_name, .. })
         | Op::Affine(affine::Op::For { dbg_name, .. } | affine::Op::If { dbg_name, .. })
-        | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => {
-            dbg_name.as_deref()
-        }
+        | Op::Dataflow(
+            dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })
+            | dataflow::Op::ImplicitSync { dbg_name, .. },
+        )
+        | Op::Agen(agen::Op::SetTransferMaskState { dbg_name, .. }) => dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1052,7 +1060,11 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
     match op {
         Op::Scf(scf::Op::For { dbg_name, .. } | scf::Op::If { dbg_name, .. })
         | Op::Affine(affine::Op::For { dbg_name, .. } | affine::Op::If { dbg_name, .. })
-        | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => Some(dbg_name),
+        | Op::Dataflow(
+            dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })
+            | dataflow::Op::ImplicitSync { dbg_name, .. },
+        )
+        | Op::Agen(agen::Op::SetTransferMaskState { dbg_name, .. }) => Some(dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
             affine::Op::Apply { .. }
@@ -1319,6 +1331,14 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 index_operands_mut(&mut transfer.dst_indices, &mut operands);
                 block_args.push(&mut transfer.load_iv);
                 regions.push(&mut transfer.body);
+            }
+            agen::Op::SetTransferMaskState {
+                result,
+                mask_value,
+                ..
+            } => {
+                operands.push(mask_value);
+                results.push(result);
             }
         },
         // ⭐ NO REGION AND NO BLOCK ARGUMENT — arm for arm with [`operands_mut`] and [`results_mut`].
@@ -1844,6 +1864,14 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, &mut transfer.dst));
                 index_vals_mut(&mut transfer.dst_indices, &mut vals);
                 vals.push((Role::BlockArg, &mut transfer.load_iv));
+            }
+            agen::Op::SetTransferMaskState {
+                result,
+                mask_value,
+                ..
+            } => {
+                vals.push((Role::Operand, mask_value));
+                vals.push((Role::Result, result));
             }
         },
         // ⭐ ARM FOR ARM WITH [`parts_mut`]; a plain access binds no block argument.

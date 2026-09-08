@@ -340,7 +340,7 @@ impl<'a> TpmvManager<'a> {
             ),
             // `else { llvm_unreachable("memory operation is not supported for static paged
             // tensors"); }` — no wildcard, so an eleventh `agen` op cannot land here silently.
-            DfirOp::Agen(agen::Op::Yield)
+            DfirOp::Agen(agen::Op::Yield | agen::Op::SetTransferMaskState { .. })
             | DfirOp::Arith(_)
             | DfirOp::Affine(_)
             | DfirOp::Scf(_)
@@ -710,6 +710,7 @@ mod unit_tests {
                 dst: Val(4),
                 size: Val(5),
                 view_ty: view_ty(),
+                dbg_name: None,
             }),
         ];
 

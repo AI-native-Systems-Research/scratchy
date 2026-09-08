@@ -1,6 +1,6 @@
 //! `Agen.td` — THE ADDRESS GENERATOR'S ACCESSES AND COMPOSITE TRANSFERS.
 //!
-//! The dialect declares fifteen operations; the four here are the ones an emitted program contains.
+//! The dialect declares fifteen operations; the five here are the ones an emitted program contains.
 
 use std::fmt::Write as _;
 
@@ -50,6 +50,51 @@ pub struct CompositeTransfer {
     pub store_time_addr_map: AffineMap,
     /// The region, entered once per time step.
     pub body: Vec<super::Op>,
+}
+
+/// ONE SLICE'S ENTRY IN A `slice_mask_map` — which of a stick's masks covers that slice.
+///
+/// ⭐ FOUR SPELLINGS AND NOTHING ELSE, and the op's own predicates are what census them:
+/// `isUnmask()` matches `(0)` eight times over and `isFullMask()` `(1)` eight times over
+/// (`Agen.cpp:2726-2739`), while the stick-mask lowering writes `(A)` before its transition slice,
+/// `(A|B)` at it and `(1)` after (`SNStickMaskLowering.cpp:52-59`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceMask {
+    /// `(0)` — nothing is masked in this slice.
+    Unmasked,
+    /// `(A)` — mask A covers it.
+    A,
+    /// `(A|B)` — the TRANSITION slice, where both masks apply.
+    AOrB,
+    /// `(1)` — the whole slice is masked.
+    Full,
+}
+
+impl SliceMask {
+    /// How one entry prints inside the `slice_mask_map` string.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            SliceMask::Unmasked => "(0)",
+            SliceMask::A => "(A)",
+            SliceMask::AOrB => "(A|B)",
+            SliceMask::Full => "(1)",
+        }
+    }
+}
+
+/// HOW MANY ELEMENTS ONE MASK LEAVES AND HOW MANY IT TAKES — `maskA`/`maskB`'s
+/// `(unmasked = N : i32, masked = M : i32)`.
+///
+/// ⛔ THE PAIR IS ONE VALUE BECAUSE THE VERIFIER TREATS IT AS ONE: `num_unmasked_elements` without
+/// `num_masked_elements` and two arrays of different lengths are both refused
+/// (`Agen.cpp:2708-2723`), and neither is spellable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskCounts {
+    /// `num_unmasked_elements[i]` — the `first` of the view's `maskX_` pair.
+    pub unmasked: i32,
+    /// `num_masked_elements[i]` — its `second`.
+    pub masked: i32,
 }
 
 /// ONE `agen` OPERATION.
@@ -119,6 +164,36 @@ pub enum Op {
         /// The view's type. Its INNERMOST extent is the lane count.
         view_ty: MemRef,
         /// The vector's type.
+        ty: Vector,
+    },
+
+    /// `%m = agen.set_transfer_mask_state mask_value(%c) { num_slices, slice_mask_map, maskA, maskB }
+    /// :  index , vector<..>` — the SAMV that arms a stick's transfer mask.
+    ///
+    /// ⭐⭐ WITHOUT IT A PARTIAL STICK IS TRANSFERRED WHOLE. A stick whose live elements stop
+    /// part-way needs the masked tail suppressed, and this op is what states where that tail begins;
+    /// `constructStickMaskOperation` (`SNStickMaskLowering.cpp:21`) has no other emission.
+    ///
+    /// ⛔ `num_slices` IS NOT A FIELD — it is [`slice_mask_map`](Self::SetTransferMaskState::slice_mask_map)'s
+    /// length. The reference writes `8` beside an eight-entry map and every reader indexes one by the
+    /// other (`Agen.td:1041-1116`), so two fields would be two answers to one question.
+    SetTransferMaskState {
+        /// The vector this binds — the armed mask.
+        result: Val,
+        /// `$mask_value` — the constant the mask is programmed from.
+        mask_value: Val,
+        /// `dbgName`.
+        ///
+        /// ⚠️ CARRIED AND NEVER PRINTED. `constructStickMaskOperation` sets it from the stick mask's
+        /// own name (`SNStickMaskLowering.cpp:72`), and the op's custom printer emits the operand and
+        /// four attributes without it (`Agen.cpp:2677-2705`). [`emit`] does the same.
+        dbg_name: Option<String>,
+        /// `slice_mask_map`, one entry per slice, in slice order.
+        slice_mask_map: Vec<SliceMask>,
+        /// `maskA`, `maskB`, … — one per mask, and EMPTY for a reset or a full mask, which name no
+        /// element counts at all (`set_transfer_mask_state_rt.mlir:11-12`).
+        masks: Vec<MaskCounts>,
+        /// The result's type — 128 BYTES' WORTH of the element, which is what the mask covers.
         ty: Vector,
     },
 }
@@ -228,6 +303,43 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::affine_map(&access_order(view_ty.shape.len())),
                 print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
+                print::vector(*ty)
+            );
+        }
+        Op::SetTransferMaskState {
+            result,
+            mask_value,
+            dbg_name: _,
+            slice_mask_map,
+            masks,
+            ty,
+        } => {
+            // ⛔ THE MASKS ARE LETTERED FROM 'A' IN LIST ORDER — `char mask_id = 'A'; .. ++mask_id`
+            // over `llvm::zip(num_unmasked_elems, num_masked_elems)` (`Agen.cpp:2699-2703`), so the
+            // FIRST entry is `maskA` and position is the whole of its identity.
+            let mut elements = String::new();
+            for (at, counts) in masks.iter().enumerate() {
+                let id = char::from(b'A'.saturating_add(u8::try_from(at).unwrap_or(u8::MAX)));
+                let _ = write!(
+                    elements,
+                    ", mask{id} = \"(unmasked = {} : i32, masked = {} : i32)\"",
+                    counts.unmasked, counts.masked
+                );
+            }
+            // ⛔ TWO SPACES AFTER THE COLON AND ONE BEFORE THE COMMA — `" } :  " << getMaskValueType()
+            // << " , " << op.getType()` (`Agen.cpp:2705`), which is what the round-trip CHECK line
+            // compares against (`set_transfer_mask_state_rt.mlir:10`).
+            let _ = writeln!(
+                out,
+                "{} = agen.set_transfer_mask_state mask_value({}) {{ num_slices = {} : i32, \
+                 slice_mask_map = \"{}\"{elements} }} :  index , {}",
+                print::val(*result),
+                print::val(*mask_value),
+                slice_mask_map.len(),
+                slice_mask_map
+                    .iter()
+                    .map(|slice| slice.spelling())
+                    .collect::<String>(),
                 print::vector(*ty)
             );
         }

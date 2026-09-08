@@ -23,8 +23,13 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
+use std::num::NonZeroI32;
+
+use super::dsc_lowering::constant_index;
+use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, scf};
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+use crate::islands::dataflow_ir::ty::ScalarTy;
 
 /// A DIMENSION THE SCHEDULE IS WRITTEN OVER — `PrimaryDimTypes` (`dsc/dims.h:34-48`).
 ///
@@ -275,11 +280,203 @@ pub fn reset_iter_arguments(loop_op: &DfirOp) -> Option<Vec<Val>> {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 058/110
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE FOUR STAGING VALUES ONE DIM'S TRIP COUNT IS DIVIDED OUT OF — `ss_` and `el_` of the
+/// numerator and denominator data stages of one `LoopNode`, each read through the component with
+/// `dataStageDimToVal_compView_st(dim, comp_, corelet_id_, padInfo)`.
+///
+/// ⛔ ONLY `den_ss` EVER DIVIDES (`SNControlFlowLowering.cpp:774,785,794,798`), which is why it
+/// alone is a [`NonZeroI32`]; `den_el` is only ever subtracted and the numerators only divided.
+///
+/// ⛔ `std::ceil` IS DEAD CODE HERE: that reader returns `int` (`dsc/dims.h:277`), so every
+/// expression it appears in has already truncated before `ceil` sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DimStages {
+    /// The numerator stage's `ss_`.
+    pub num_ss: i32,
+    /// The numerator stage's `el_`.
+    pub num_el: i32,
+    /// The denominator stage's `ss_` — the divisor.
+    pub den_ss: NonZeroI32,
+    /// The denominator stage's `el_`.
+    pub den_el: i32,
+}
+
+/// THE ENCLOSING LOOP THE EPILOGUE COMPARE IS MADE AGAINST — [`parent_loop`]'s answer, in the two
+/// shapes a last iteration can be read out of.
+///
+/// ⛔⛔ THE TWO VARIANTS ARE THE TYPE GUARD ON TWO CHECKS THAT CANNOT FIRE. The reference's
+/// `DT_CHECK("Unexpected branch")` at `:809` and `:816` are handed a STRING LITERAL — always
+/// truthy — so an `affine.for` without constant bounds, and a parent that is neither loop, both
+/// fall through with a null induction variable and crash the builder later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentLoop {
+    /// An `affine.for` with constant bounds: the last iteration is the constant `upper_bound - 1`.
+    AffineConst {
+        /// `getInductionVar()`.
+        iv: Val,
+        /// `getConstantUpperBound()`.
+        upper_bound: i64,
+    },
+    /// An `scf.for`: the last iteration is an `arith.subi` of its upper bound and one.
+    Scf {
+        /// `getInductionVar()`.
+        iv: Val,
+        /// `getUpperBound()`, which is an operand and not a literal.
+        upper_bound: Val,
+    },
+}
+
+/// A DIM'S LOOP, AND THE ARGUMENTS ITS BODY READS THE CARRIED VALUES THROUGH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimLoop {
+    /// The `affine.for` or `scf.for`, body EMPTY — filling it is the reference's
+    /// `setInsertionPointToStart`, which is mechanism.
+    pub loop_op: DfirOp,
+    /// [`reset_iter_arguments`]' answer for it: the loop's own region arguments.
+    pub iter_args: Vec<Val>,
+}
+
+/// `iter_args(%arg = %init) -> (index)` — one [`affine::Carried`] per value passed in.
+fn carried_from(vals: &mut Values, iter_args: &[Val]) -> Vec<affine::Carried> {
+    iter_args
+        .iter()
+        .map(|init| affine::Carried {
+            init: *init,
+            arg: vals.mint(),
+            result: vals.mint(),
+        })
+        .collect()
+}
+
+/// `AffineForOp::create(builder, loc, 0, size, 1, iter_args)` then `resetIterArguments` — the tail
+/// three of the reference's four arms share.
+fn affine_dim_loop(vals: &mut Values, size: i64, iter_args: &[Val]) -> DimLoop {
+    let iv = vals.mint();
+    let carried = carried_from(vals, iter_args);
+    let args = carried.iter().map(|value| value.arg).collect();
+    DimLoop {
+        loop_op: DfirOp::Affine(affine::Op::For {
+            iv,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(size),
+            carried,
+            body: Vec::new(),
+            dbg_name: None,
+        }),
+        iter_args: args,
+    }
+}
+
+/// Replaces: e058_constructLoopForADim
+///
+/// ONE DIM'S LOOP — an `affine.for` over a constant trip count, or, where the steady-state and
+/// epilogue counts differ, an `scf.for` whose bound is an `arith.select` taking `ss_iters` while the
+/// parent is BELOW its last iteration (`slt`) and `el_iters` on it (`:804-828`).
+///
+/// ⛔ THE UNIFORM ARM'S EPILOGUE DIVIDES THE **NUMERATOR'S** `ss_` — `(num_ss - den_el) / den_ss + 1`
+/// (`:785`) — where the split arm's own epilogue count uses `num_el - den_el` (`:794`).
+///
+/// ⚠️ `parent` IS UNREAD WHERE `num_ss == num_el`: that is the only arm which never looks it up.
+pub fn construct_loop_for_a_dim(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    stages: DimStages,
+    parent: ParentLoop,
+    iter_args: &[Val],
+) -> DimLoop {
+    let num_ss = i64::from(stages.num_ss);
+    let num_el = i64::from(stages.num_el);
+    let den_ss = i64::from(stages.den_ss.get());
+    let den_el = i64::from(stages.den_el);
+
+    // `if (num_ss == num_el) { .. }` — one count for every iteration of the parent.
+    if num_ss == num_el {
+        let size = if den_ss == den_el {
+            num_ss / den_ss
+        } else {
+            (num_ss - den_el) / den_ss + 1
+        };
+        return affine_dim_loop(vals, size, iter_args);
+    }
+
+    // `int ss_iters = num_ss / den_ss;  // SS + SS`
+    let ss_iters = num_ss / den_ss;
+    // `EL + EL` where the denominators differ, `EL + SS` where they agree.
+    let el_iters = if den_ss == den_el {
+        num_el / den_ss
+    } else {
+        (num_el - den_el) / den_ss + 1
+    };
+
+    // `} else { loop = AffineForOp::create(builder, loc, 0, ss_iters, 1, iter_args); }` — the two
+    // counts agreed after all, so nothing is selected and the parent is not read.
+    if ss_iters == el_iters {
+        return affine_dim_loop(vals, ss_iters, iter_args);
+    }
+
+    let (parent_iv, parent_last) = match parent {
+        ParentLoop::AffineConst { iv, upper_bound } => {
+            (iv, constant_index(vals, ops, upper_bound - 1))
+        }
+        ParentLoop::Scf { iv, upper_bound } => {
+            let one = constant_index(vals, ops, 1);
+            let last = vals.mint();
+            ops.push(DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                result: last,
+                lhs: upper_bound,
+                rhs: one,
+                ty: ScalarTy::Index,
+            })));
+            (iv, last)
+        }
+    };
+
+    // `cond = CmpIOp::create(.., slt, parent_loop_iv, parent_loop_last_val)` and the select over it.
+    let cond = vals.mint();
+    ops.push(DfirOp::Arith(arith::Op::Compare {
+        result: cond,
+        predicate: CmpIPredicate::Slt,
+        lhs: parent_iv,
+        rhs: parent_last,
+    }));
+    let ss_val = constant_index(vals, ops, ss_iters);
+    let el_val = constant_index(vals, ops, el_iters);
+    let upper = vals.mint();
+    ops.push(DfirOp::Arith(arith::Op::Select {
+        result: upper,
+        condition: cond,
+        true_value: ss_val,
+        false_value: el_val,
+        ty: ScalarTy::Index,
+    }));
+    let lower = constant_index(vals, ops, 0);
+    let step = constant_index(vals, ops, 1);
+
+    let iv = vals.mint();
+    let carried = carried_from(vals, iter_args);
+    let args = carried.iter().map(|value| value.arg).collect();
+    DimLoop {
+        loop_op: DfirOp::Scf(scf::Op::For {
+            iv,
+            lo: lower,
+            hi: upper,
+            step,
+            carried,
+            body: Vec::new(),
+            dbg_name: None,
+        }),
+        iter_args: args,
+    }
+}
+
 // crustify:todo: e054_constructConditionalOperation
 // crustify:todo: e055_constructConditionalsForSAMV
 // crustify:todo: e056_getBufferingOrStreamingMode
 // crustify:todo: e057_propagateBufferSwitchLoopsToRoot
-// crustify:todo: e058_constructLoopForADim
 // crustify:todo: e074_getBlockingOrStreamingBufferLoopLocations
 // crustify:todo: e075_constructLoopIterArgs
 // crustify:todo: e088_constructLoopsRecursive
@@ -287,12 +484,17 @@ pub fn reset_iter_arguments(loop_op: &DfirOp) -> Option<Vec<Val>> {
 
 #[cfg(test)]
 mod unit_tests {
+    use std::num::NonZeroI32;
+
     use super::{
-        Ancestor, CondOp, DimSlice, NodeKind, PrimaryDim, SwitchNode, mlir_loop_from_sn_loop_node,
-        parent_loop, propagate_buffer_switch_loops_to_root_recursively, reset_iter_arguments,
+        Ancestor, CondOp, DimSlice, DimStages, NodeKind, ParentLoop, PrimaryDim, SwitchNode,
+        construct_loop_for_a_dim, mlir_loop_from_sn_loop_node, parent_loop,
+        propagate_buffer_switch_loops_to_root_recursively, reset_iter_arguments,
     };
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
-    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, scf};
+    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+    use crate::islands::dataflow_ir::ty::ScalarTy;
 
     /// ⛔⛔ SIGNED, AND THE FIVE NON-COMPARISONS ARE NOT PREDICATES AT ALL.
     ///
@@ -519,5 +721,127 @@ mod unit_tests {
         );
         assert_eq!(reset_iter_arguments(&scf_for), Some(vec![Val(2), Val(5)]));
         assert_eq!(reset_iter_arguments(&not_a_loop), None);
+    }
+
+    /// ⛔ THE EPILOGUE COUNT DIVIDES THE NUMERATOR'S `ss_` IN ONE ARM AND ITS `el_` IN THE OTHER,
+    /// and only the second arm selects between them.
+    ///
+    /// A uniform dim whose denominators differ is ONE `affine.for` sized `(num_ss - den_el)/den_ss + 1`
+    /// with no compare at all; a dim whose numerators differ is an `scf.for` whose bound is a select
+    /// taking the steady-state count while the parent is `slt` its last iteration.
+    #[test]
+    fn a_split_dim_selects_its_bound_and_a_uniform_one_is_a_constant_affine_loop() {
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let parent = ParentLoop::Scf {
+            iv: Val(100),
+            upper_bound: Val(101),
+        };
+
+        // `num_ss == num_el`, denominators differ: (9 - 3) / 2 + 1 = 4, and nothing is emitted.
+        let uniform = construct_loop_for_a_dim(
+            &mut vals,
+            &mut ops,
+            DimStages {
+                num_ss: 9,
+                num_el: 9,
+                den_ss: NonZeroI32::new(2).expect("two"),
+                den_el: 3,
+            },
+            parent,
+            &[Val(50)],
+        );
+        assert!(ops.is_empty());
+        assert_eq!(
+            uniform.loop_op,
+            DfirOp::Affine(affine::Op::For {
+                iv: Val(0),
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: vec![affine::Carried {
+                    init: Val(50),
+                    arg: Val(1),
+                    result: Val(2),
+                }],
+                body: Vec::new(),
+                dbg_name: None,
+            })
+        );
+        assert_eq!(uniform.iter_args, vec![Val(1)]);
+
+        // `num_ss != num_el` with equal denominators: 8/2 = 4 against 6/2 = 3, so a select.
+        let split = construct_loop_for_a_dim(
+            &mut vals,
+            &mut ops,
+            DimStages {
+                num_ss: 8,
+                num_el: 6,
+                den_ss: NonZeroI32::new(2).expect("two"),
+                den_el: 2,
+            },
+            parent,
+            &[Val(50)],
+        );
+        assert_eq!(
+            ops,
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(3),
+                    value: 1,
+                }),
+                DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                    result: Val(4),
+                    lhs: Val(101),
+                    rhs: Val(3),
+                    ty: ScalarTy::Index,
+                })),
+                DfirOp::Arith(arith::Op::Compare {
+                    result: Val(5),
+                    predicate: CmpIPredicate::Slt,
+                    lhs: Val(100),
+                    rhs: Val(4),
+                }),
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(6),
+                    value: 4,
+                }),
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(7),
+                    value: 3,
+                }),
+                DfirOp::Arith(arith::Op::Select {
+                    result: Val(8),
+                    condition: Val(5),
+                    true_value: Val(6),
+                    false_value: Val(7),
+                    ty: ScalarTy::Index,
+                }),
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(9),
+                    value: 0,
+                }),
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(10),
+                    value: 1,
+                }),
+            ]
+        );
+        assert_eq!(
+            split.loop_op,
+            DfirOp::Scf(scf::Op::For {
+                iv: Val(11),
+                lo: Val(9),
+                hi: Val(8),
+                step: Val(10),
+                carried: vec![affine::Carried {
+                    init: Val(50),
+                    arg: Val(12),
+                    result: Val(13),
+                }],
+                body: Vec::new(),
+                dbg_name: None,
+            })
+        );
+        assert_eq!(split.iter_args, vec![Val(12)]);
     }
 }
