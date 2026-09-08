@@ -1,20 +1,20 @@
 {
  "_comment": [
-  "Placement oracle for the bridge-2 port. Every unit lands in the EXISTING scratchy crate",
-  "`deeptools` under src/bridges/dataflow_ir_to_sentient/ — one .rs per original dcc translation",
-  "unit (conventions.md: one .rs home per C translation unit), grouped into the five modules the",
-  "campaign's own crates.json named.",
+  "🛑 TRANSLATOR: READ `crustify-bridge3/AGENT-BRIEF.md` IN FULL BEFORE YOU EDIT ANYTHING, then",
+  "`crustify-bridge3/TASK.md` and `crates/compiler/deeptools/CLAUDE.md`. Your prompt does not name",
+  "them; this file and crustify/wavefront/wavefront-config.json are where they are named.",
   "",
-  "UNIT NAMES are `e<NNN>_<cppName>` where NNN is the entry number in",
-  "crustify-bridge2/source/bridge2.cpp and in crates/compiler/deeptools/docs/bridge2-porting-order.md.",
-  "The 268 rewritten member definitions carry that exact symbol in the extract; the remaining 116",
-  "in-class definitions keep their bare C++ name there, so ALWAYS resolve a unit through",
-  "crustify-bridge2/UNITS.tsv, which gives its entry number, level, authority citation and the",
-  "extract's own line range.",
+  "This oracle now homes TWO campaigns in the one crate `deeptools`, and they are separate work:",
+  "  * bridge 2 — DataflowIR -> SentientIR, D1-D28, tu `crustify-bridge2/source/bridge2.cpp`,",
+  "    landing in src/bridges/dataflow_ir_to_sentient/ (modules agen_to_sentient,",
+  "    dataflow_to_sentient, vectorchain, transform, standard_and_scf). NOT YOUR WORK if your",
+  "    worklist items are defined_in crustify-bridge3/cpp/bridge3.cpp.",
+  "  * bridge 3 — SentientIR -> ProgIR, D76, tu `crustify-bridge3/cpp/bridge3.cpp`, landing in",
+  "    src/bridges/sentient_to_progir/ (modules construct, lower, uniform, driver, reg_def_tracker,",
+  "    utils).",
   "",
-  "`tu` is the extract for every entry because the extract is the campaign's declared impl_file;",
-  "`headers` names the ORIGINAL dcc file(s) the .rs homes, so `crates locate --file dcc/src/...`",
-  "resolves. There is no -sys surface: deeptools-sys is an empty placeholder (see its Cargo.toml)."
+  "⛔ NO -sys CRATE AND NO FFI BOUNDARY IN EITHER. Both are complete ports with no C left; the only",
+  "anchor either emits is `/// Replaces: eNNN_name`."
  ],
  "crates": {
   "deeptools": {

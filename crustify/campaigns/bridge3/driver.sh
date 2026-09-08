@@ -149,6 +149,22 @@ stage() { # $1 wave json (relative to $CAMP)  $2 objective  $3 tag
   fi
   count
   prune
+  # ⛔⛔ 9. A PORT STAGE THAT LANDED NOTHING MUST STOP THE CAMPAIGN, NOT FALL THROUGH TO THE NEXT ONE.
+  # On 2026-09-07 a port stage was killed mid-flight, landed 0 units and — correctly not retried, the
+  # failure was not the API — promoted nothing, skipped its own review, ran the gate and then ADVANCED
+  # a sub-campaign, so the driver began porting levels 2-3 while levels 0-1 were still entirely
+  # unported. The wave barrier only holds WITHIN a stage; between stages nothing stopped it. A stage
+  # that was ALREADY at zero returned early at the top of this function, so this cannot fire
+  # spuriously; `promote` on success re-runs regen(), which rewrites the count read here.
+  if [ "$2" = "port" ]; then
+    local left_after
+    left_after=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" \
+                 "$(dirname "$f")/port-remainder.json" 2>/dev/null || echo 0)
+    if [ "$left_after" != "0" ]; then
+      say "STAGE $3 LANDED TOO LITTLE: $left_after units still unported in $(dirname "$1") — refusing to advance to the next sub-campaign (that is what started levels 2-3 over unported levels 0-1); work already landed is SAFE on $BRANCH — STOPPING"
+      exit 5
+    fi
+  fi
 }
 
 gate() { # $1 tag
