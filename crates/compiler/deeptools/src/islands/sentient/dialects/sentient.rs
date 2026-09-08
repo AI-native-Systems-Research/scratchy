@@ -35,8 +35,8 @@ use std::fmt::Write as _;
 use crate::arch::{Bounded, Bytes, Elements};
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
-use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
+use crate::islands::dataflow_ir::ty::{ScalarTy, Vector};
 use crate::islands::sentient::dialects::Val;
 use crate::islands::sentient::print;
 
@@ -2175,6 +2175,13 @@ pub enum Op {
         /// `{value = 0 : si64} : i1` in one function
         /// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:6-8`).
         ty: ScalarTy,
+        /// The `is_symbol` UNIT ATTRIBUTE — ⛔ NOT DECLARED IN THE `.td`, AND STILL LOAD-BEARING.
+        /// `createSentientConstants` (entry 235) copies it off the `constant_bitstream` it
+        /// replaces (`Splat.cpp:50-51`), `ConstructProgIRHelper.cpp:4354` reads it to decide an
+        /// immediate is a symbol to be resolved later, and `ConstantOp::print` switches to the
+        /// whole attribute dictionary when it is set (`SentientOps.cpp:1700-1714`) — so it changes
+        /// what this op prints, not just what a later pass thinks.
+        is_symbol: bool,
     },
 
     /// `sentient.vector_constant` — a whole vector of immediates (`SentientOps.td:866`).
@@ -2183,6 +2190,10 @@ pub enum Op {
         value: Vec<i64>,
         /// `$out`.
         result: Val,
+        /// `$out`'s type — ⭐ PRINTED, AND IT IS NOT DERIVABLE FROM `value.len()` ALONE: the
+        /// element type decides the length (`128 / bitwidth`, `Splat.cpp:56`), and
+        /// `VectorConstantOp::print` writes it out (`SentientOps.cpp:1747`).
+        ty: Vector,
     },
 
     // ───────────────────────── masks, sync, ports ─────────────────────────
@@ -3376,27 +3387,49 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::ScalarConstant {
             value,
             result,
-            reg_locale: _,
+            reg_locale,
             ty,
+            is_symbol,
         } => {
-            // ⛔ THE VALUE AND THE TYPE, AND NOTHING ELSE. `ConstantOp::print` writes
-            // `" {value = " << int_val << " : si64} : " << resultTypes` and never the attribute
-            // dictionary (`SentientOps.cpp:1698-1715`), so the locale does not appear here even
-            // when it has been set.
+            // ⛔ TWO FORMS, AND `is_symbol` CHOOSES (`SentientOps.cpp:1698-1715`). Without it: the
+            // value and the result type only, so the locale does not appear even when set — and
+            // ⛔ HEX FOR A FLOAT RESULT, `0x` + `raw_ostream::write_hex`'s LOWERCASE digits, which
+            // is how `vector<1xf16>`'s bit pattern survives an `si64` attribute
+            // (`dcc/test/Conversion/VectorChainToSentientPESFP/splat_const_bit.mlir:20`). With it:
+            // the whole attribute dictionary, printed decimal because that is what an
+            // `IntegerAttr` prints as.
+            let attrs = if *is_symbol {
+                dict(&[
+                    attr("is_symbol", "true"),
+                    attr(
+                        "regLocale",
+                        &format!("#sentient<reg_type {}>", reg_locale.spelling()),
+                    ),
+                    attr("value", &format!("{value} : si64")),
+                ])
+            } else if ty.is_float() {
+                dict(&[attr("value", &format!("0x{:x} : si64", *value as u64))])
+            } else {
+                dict(&[attr("value", &format!("{value} : si64"))])
+            };
             let _ = writeln!(
                 out,
-                "{} = sentient.scalar_constant {{value = {value} : si64}} : {}",
+                "{} = sentient.scalar_constant{attrs} : {}",
                 print::val(*result),
                 ty.spelling()
             );
         }
-        Op::VectorConstant { value, result } => {
-            let elems: Vec<String> = value.iter().map(|v| format!("{v} : si64")).collect();
+        Op::VectorConstant { value, result, ty } => {
+            // ⛔ HEX, AND NO PER-ELEMENT TYPE. `VectorConstantOp::print` writes `0x` +
+            // `Twine::utohexstr` per element and the vector type once, at the end
+            // (`SentientOps.cpp:1735-1748`).
+            let elems: Vec<String> = value.iter().map(|v| format!("0x{:x}", *v as u64)).collect();
             let _ = writeln!(
                 out,
-                "{} = sentient.vector_constant {}",
+                "{} = sentient.vector_constant{} : {}",
                 print::val(*result),
-                dict(&[attr("value", &format!("[{}]", elems.join(", ")))])
+                dict(&[attr("value", &format!("[{}]", elems.join(", ")))]),
+                crate::islands::dataflow_ir::print::vector(*ty)
             );
         }
 

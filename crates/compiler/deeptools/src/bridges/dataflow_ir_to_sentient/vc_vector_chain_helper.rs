@@ -283,6 +283,7 @@ fn precision_in_string(elem: ElemType) -> sen::Precision {
         // element type already distinguishes them.
         ElemType::MxFloat(4) => sen::Precision::Mxfp4,
         ElemType::MxFloat(8) => sen::Precision::Mxfp8,
+        ElemType::MxInt(4) => sen::Precision::Mxint4,
         ElemType::Int(1) => sen::Precision::Int1,
         ElemType::Int(2) => sen::Precision::Int2,
         ElemType::Int(4) => sen::Precision::Int4,
@@ -299,13 +300,13 @@ fn precision_in_string(elem: ElemType) -> sen::Precision {
         ElemType::F32 => sen::Precision::Fp32,
         // ⭐ BOTH FP8 FLAVOURS ARE `fp8`. The width is all the reference reads, so `f8E4M3FN` and
         // `f8E8M0FNU` are one precision — which is also why `SEN053_FP8` can borrow E4M3's type.
-        ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu => sen::Precision::Fp8,
+        ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu | ElemType::F8E5M2 => sen::Precision::Fp8,
         ElemType::F4E2M1Fn => sen::Precision::Fp4,
         // ⛔ NO SUCH PRECISION EXISTS TO NAME. `SentientPrecisionAttr` has nineteen cases and none of
         // them is an `int<n>` or `mxfp<n>` for any other `n`; the reference would build the string
         // and then abort in `symbolizeSentientPrecision(..).value()`
         // (`VectorChainToSentientPESFP.cpp:362`).
-        ElemType::Int(bits) | ElemType::MxFloat(bits) => {
+        ElemType::Int(bits) | ElemType::MxFloat(bits) | ElemType::MxInt(bits) => {
             todo!("no sentient precision names a {bits}-bit element")
         }
     }
@@ -2340,9 +2341,103 @@ pub fn get_mask_value_for_non_pt<A: Arch>(mask: &vc::Op, values: &mut Values) ->
             // PT side mints exactly this op (`vc_helper::get_mask_value_for_pt`).
             reg_locale: sen::RegType::Imm,
             ty: ScalarTy::Index,
+            is_symbol: false,
         }),
         value,
     })
+}
+
+/// THE ELEVEN SPELLINGS THE CVT TABLES ARE WRITTEN IN — `convertStringToType`'s accepted strings
+/// (`VectorChainHelper.hpp:196-219`).
+///
+/// ⛔ NOT MLIR'S TYPE SPELLINGS, AND THE DIFFERENCE IS WHY THIS ENUM EXISTS RATHER THAN
+/// [`ElemType::spelling`]: the float widths are `fp16`/`fp32`, not `f16`/`f32`, while the fp8 and
+/// integer names ARE the MLIR ones. `getGCVTorFCVTTypeFromIndicesAndCastInputs`' table is written in
+/// these (`"fp32"`, `"f8E5M2"`, `"bf16"` at `VectorChainHelper.cpp:245-267`), and this crate's rule
+/// is that a closed set is an enum rather than a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeSpelling {
+    /// `fp16` — `f16`.
+    Fp16,
+    /// `bf16`.
+    Bf16,
+    /// `fp32` — `f32`.
+    Fp32,
+    /// `f8E4M3FN`.
+    F8E4M3Fn,
+    /// `f8E5M2`.
+    F8E5M2,
+    /// `mxfp4`.
+    Mxfp4,
+    /// `mxfp8`.
+    Mxfp8,
+    /// `mxint4` — ⛔ ACCEPTED BY ENTRY 230 AND UNPRODUCIBLE BY ENTRY 231. See
+    /// [`convert_type_to_string`].
+    Mxint4,
+    /// `i16`.
+    I16,
+    /// `i8`.
+    I8,
+    /// `i4`.
+    I4,
+}
+
+/// Replaces: e230_convertStringToType
+///
+/// **230/384** `convertStringToType` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:196` (24L).
+///
+/// The eleven-armed `if`/`else if` chain, as a total function: `llvm_unreachable("unknown type
+/// string")` (`:218`) is unrepresentable once the argument is [`TypeSpelling`] rather than a
+/// `std::string`. ⚠️ DEAD IN THE REFERENCE — nothing calls it; its inverse
+/// [`convert_type_to_string`] has the one caller (entry 277).
+#[must_use]
+pub const fn convert_string_to_type(type_string: TypeSpelling) -> ElemType {
+    match type_string {
+        TypeSpelling::Fp16 => ElemType::F16,
+        TypeSpelling::Bf16 => ElemType::Bf16,
+        TypeSpelling::Fp32 => ElemType::F32,
+        TypeSpelling::F8E4M3Fn => ElemType::F8E4M3Fn,
+        TypeSpelling::F8E5M2 => ElemType::F8E5M2,
+        // `dataflow::CustomMXFloatType::get(ctx, 4)` / `(ctx, 8)`.
+        TypeSpelling::Mxfp4 => ElemType::MxFloat(4),
+        TypeSpelling::Mxfp8 => ElemType::MxFloat(8),
+        // `dataflow::CustomMXIntType::get(ctx, 4)` — a DIFFERENT type from `mxfp4`, same width.
+        TypeSpelling::Mxint4 => ElemType::MxInt(4),
+        TypeSpelling::I16 => ElemType::Int(16),
+        TypeSpelling::I8 => ElemType::Int(8),
+        TypeSpelling::I4 => ElemType::Int(4),
+    }
+}
+
+/// Replaces: e231_convertTypeToString
+///
+/// **231/384** `convertTypeToString` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:222` (22L).
+///
+/// ⛔⛔ TEN ARMS AGAINST ENTRY 230'S ELEVEN — `mxint4` IS MISSING (`:222-243`), so a type
+/// [`convert_string_to_type`] produces reaches `llvm_unreachable("unknown type")` on the way back.
+/// ⛔ `None` IS THAT ABORT, and it composes: the one caller compares the answer with a table string
+/// and clears `found` on a mismatch (`VectorChainHelper.cpp:285-292`), which is what `None` does.
+#[must_use]
+pub const fn convert_type_to_string(ty: ElemType) -> Option<TypeSpelling> {
+    match ty {
+        ElemType::F16 => Some(TypeSpelling::Fp16),
+        ElemType::Bf16 => Some(TypeSpelling::Bf16),
+        ElemType::F32 => Some(TypeSpelling::Fp32),
+        ElemType::F8E4M3Fn => Some(TypeSpelling::F8E4M3Fn),
+        ElemType::F8E5M2 => Some(TypeSpelling::F8E5M2),
+        ElemType::MxFloat(4) => Some(TypeSpelling::Mxfp4),
+        ElemType::MxFloat(8) => Some(TypeSpelling::Mxfp8),
+        ElemType::Int(16) => Some(TypeSpelling::I16),
+        ElemType::Int(8) => Some(TypeSpelling::I8),
+        ElemType::Int(4) => Some(TypeSpelling::I4),
+        // `llvm_unreachable("unknown type")` — ⛔ `MxInt` IS IN HERE, and `f8E8M0FNU`, `f4E2M1FN`
+        // and every other integer width with it.
+        ElemType::Int(_)
+        | ElemType::F8E8M0Fnu
+        | ElemType::F4E2M1Fn
+        | ElemType::MxFloat(_)
+        | ElemType::MxInt(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -2350,13 +2445,14 @@ mod unit_tests {
     use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
     use super::{
         MergeAndPack, MergeOrPack, MinOrMaxFusion, NonPtMask, OperandReuse, PackOrShuffle,
-        PackRepetition, SliceMask, check_validity_of_pack_and_shuffle_lowering,
-        compute_precision_of_op, fuse_compare_and_select_into_min_or_max,
-        get_mask_value_constant_for_non_pt, get_mask_value_for_non_pt, has_constant_bounds,
-        input_precision_from_operand, is_sentient_binary_logical_op, merge_and_pack_insts,
-        merge_type_from_indices, precision_in_string, redefine_constant_vectors,
-        reset_sentient_fmas_if_exists, result_precision_from_operands,
-        validate_lowering_and_set_missing_parameters, vector_binary_to_sentient_binary,
+        PackRepetition, SliceMask, TypeSpelling, check_validity_of_pack_and_shuffle_lowering,
+        compute_precision_of_op, convert_string_to_type, convert_type_to_string,
+        fuse_compare_and_select_into_min_or_max, get_mask_value_constant_for_non_pt,
+        get_mask_value_for_non_pt, has_constant_bounds, input_precision_from_operand,
+        is_sentient_binary_logical_op, merge_and_pack_insts, merge_type_from_indices,
+        precision_in_string, redefine_constant_vectors, reset_sentient_fmas_if_exists,
+        result_precision_from_operands, validate_lowering_and_set_missing_parameters,
+        vector_binary_to_sentient_binary,
         vector_element_wise_compare_operator_to_sentient_binary_operator,
         vector_ternary_to_sentient_ternary, vector_type_of,
     };
@@ -3976,9 +4072,60 @@ mod unit_tests {
                     result: Val(0),
                     reg_locale: sen::RegType::Imm,
                     ty: ScalarTy::Index,
+                    is_symbol: false,
                 }),
                 value: Val(0),
             })
+        );
+    }
+
+    /// 🎯 230 + 231 — THE ROUND TRIP, AND THE ONE SPELLING THAT DOES NOT SURVIVE IT.
+    ///
+    /// The pair is written as inverses (`VectorChainHelper.hpp:196-243`) and is not one: entry 230
+    /// accepts `mxint4` and entry 231 has no arm for the type it produces.
+    #[test]
+    fn every_spelling_but_mxint4_round_trips_through_its_element_type() {
+        for spelling in [
+            TypeSpelling::Fp16,
+            TypeSpelling::Bf16,
+            TypeSpelling::Fp32,
+            TypeSpelling::F8E4M3Fn,
+            TypeSpelling::F8E5M2,
+            TypeSpelling::Mxfp4,
+            TypeSpelling::Mxfp8,
+            TypeSpelling::I16,
+            TypeSpelling::I8,
+            TypeSpelling::I4,
+        ] {
+            assert_eq!(
+                convert_type_to_string(convert_string_to_type(spelling)),
+                Some(spelling)
+            );
+        }
+
+        // ⛔ `mxint4` IN, `llvm_unreachable("unknown type")` BACK.
+        assert_eq!(
+            convert_string_to_type(TypeSpelling::Mxint4),
+            ElemType::MxInt(4)
+        );
+        assert_eq!(convert_type_to_string(ElemType::MxInt(4)), None);
+
+        // The four spellings entry 277's own table is written in (`VectorChainHelper.cpp:245-267`).
+        assert_eq!(
+            convert_type_to_string(ElemType::F32),
+            Some(TypeSpelling::Fp32)
+        );
+        assert_eq!(
+            convert_type_to_string(ElemType::F16),
+            Some(TypeSpelling::Fp16)
+        );
+        assert_eq!(
+            convert_type_to_string(ElemType::Bf16),
+            Some(TypeSpelling::Bf16)
+        );
+        assert_eq!(
+            convert_type_to_string(ElemType::F8E5M2),
+            Some(TypeSpelling::F8E5M2)
         );
     }
 }
@@ -3986,8 +4133,6 @@ mod unit_tests {
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e230_convertStringToType
-// crustify:todo: e231_convertTypeToString
 // crustify:todo: e277_getGCVTorFCVTTypeFromIndicesAndCastInputs
 // crustify:todo: e340_analyzeAndFillOperandForwarding
 // crustify:todo: e341_analyzeNonComputeOpsForFusion

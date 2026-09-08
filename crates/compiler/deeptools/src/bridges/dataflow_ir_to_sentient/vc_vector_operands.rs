@@ -378,6 +378,19 @@ impl VectorOperand {
         }
     }
 
+    /// Replaces: e234_setValue
+    ///
+    /// THE OPERAND'S ONE VALUE, REPLACING WHATEVER IT HELD — `values_.clear();
+    /// values_.emplace_back(val);` (`VectorOperands.hpp:72-75`).
+    ///
+    /// ⛔ IT CLEARS FIRST, which is what makes `OperandReuse`'s re-valuing to [`sen::Port::Latch`]
+    /// (`OperandReuse.cpp:28-43`) REPLACE a slice index rather than append a second entry to a member
+    /// whose reader is `values_.front()`.
+    pub fn set_value(&mut self, val: OperandValue) {
+        self.values.clear();
+        self.values.push(val);
+    }
+
     /// Replaces: e071_getOperandFromReceiveOp
     ///
     /// **071/384** `VectorOperand::getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34` (54L).
@@ -1559,6 +1572,10 @@ impl VectorOperand {
             | arith::Op::RemSI(_)
             | arith::Op::Compare { .. }
             | arith::Op::Select { .. }
+            // ⭐ THE TWO CONVERSIONS ARE HERE TOO: entry 343's `getOperandFromCastOp` is what reads
+            // one, and it forwards to its INPUT's operand rather than reading a splat.
+            | arith::Op::SiToFp(_)
+            | arith::Op::FpToSi(_)
             | arith::Op::Logic { .. } => return None,
         };
 
@@ -1575,12 +1592,344 @@ impl VectorOperand {
     }
 }
 
+/// WHICH UNIT A LOGICAL MEMORY VIEW IS TAKEN OVER — `findUnitType(logical_view_op.getFromUnit())`
+/// (`VectorOperands.cpp:174-175`), whose answer the reference keeps as a string.
+///
+/// ⛔ TWO OPS DEFINE ONE, and entry 232 reads both: a register file is a `dataflow.get_local_unit`
+/// ([`dataflow::LocalUnit`]) while `pestate` and `sfpstate` are `dataflow.get_unit`s in their own
+/// right ([`DfirUnit`]) — the split [`dataflow::LocalUnit`]'s closing note records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewUnit {
+    /// A `dataflow.get_local_unit` — one of the register files.
+    Local(dataflow::LocalUnit),
+    /// A `dataflow.get_unit` — a unit a transfer can address.
+    Unit(DfirUnit),
+}
+
+/// [`ViewUnit`] FOR THE VALUE A VIEW IS TAKEN FROM. `None` where the value is defined by neither op,
+/// which is the reference's *"Unit type is inconsistent in memory view"*.
+fn view_unit(from: Val, scope: &[DfirOp]) -> Option<ViewUnit> {
+    match op_at(&defining_position(from, scope)?, scope)? {
+        DfirOp::Dataflow(dataflow::Op::GetLocalUnit { which, .. }) => Some(ViewUnit::Local(*which)),
+        DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. }) => Some(ViewUnit::Unit(*unit)),
+        _ => None,
+    }
+}
+
+/// WHICH FILE AN ACCESS'S UNIT IS — entry 232's four `operand_type` assignments
+/// (`VectorOperands.cpp:186-198`).
+///
+/// ⛔ THE XRF IS SPLIT OFF BECAUSE IT HAS NO SLICE INDEX: the reference returns
+/// `VectorOperand(XRF, "xrf", op)` before the slice arithmetic and skips the single-constant check
+/// with it (`:208`, `:218`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryFile {
+    /// `PTXRF → XRF`.
+    Xrf,
+    /// The three files whose value is a slice index.
+    Sliced(SliceFile),
+}
+
+/// A FILE WHOSE OPERAND VALUE IS A SLICE INDEX — see [`RegisterSlice`], which is one of its slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliceFile {
+    /// Any of the three `*_lrfreg`s.
+    Lrf,
+    /// `ptirf`.
+    Irf,
+    /// `pestate` or `sfpstate`.
+    IState,
+}
+
+impl SliceFile {
+    /// The `operand_type` the reference assigns for it.
+    const fn kind(self) -> VectorOperandType {
+        match self {
+            SliceFile::Lrf => VectorOperandType::Lrf,
+            SliceFile::Irf => VectorOperandType::Irf,
+            SliceFile::IState => VectorOperandType::IState,
+        }
+    }
+}
+
+/// THE `stringToSenComponents` LOOKUP AND ITS FOUR ARMS. `None` is both *"Unknown memory type"*
+/// exits — the name that is in the table but is none of the four (`ptarf`, `l0scale`), and the one
+/// that is not in it at all.
+fn memory_file(unit: ViewUnit) -> Option<MemoryFile> {
+    match unit {
+        // `if (record->second == PTXRF) operand_type = XRF;`
+        ViewUnit::Local(dataflow::LocalUnit::PtXrf) => Some(MemoryFile::Xrf),
+        // `else if (record->second == PTIRF) operand_type = IRF;`
+        ViewUnit::Local(dataflow::LocalUnit::PtIrf) => Some(MemoryFile::Sliced(SliceFile::Irf)),
+        // `else if (dcc::utils::isLRFReg(memory_unit_name)) operand_type = LRF;` — ⭐ THE ONLY
+        // PREDICATE HERE THAT READS THE NAME AND NOT THE ENUMERATOR, and these three are what spell
+        // `lrf` in it (`pe_lrfreg`, `sfp_lrfreg`, `pt_lrfreg`).
+        ViewUnit::Local(
+            dataflow::LocalUnit::PeLrf | dataflow::LocalUnit::SfpLrf | dataflow::LocalUnit::PtLrf,
+        ) => Some(MemoryFile::Sliced(SliceFile::Lrf)),
+        // `else if (is_any_of(record->second, PESTATE, SFPSTATE)) operand_type = ISTATE;`
+        ViewUnit::Unit(DfirUnit::PeState | DfirUnit::SfpState) => {
+            Some(MemoryFile::Sliced(SliceFile::IState))
+        }
+        // `else { op->emitError("Unknown memory type"); return std::nullopt; }`
+        ViewUnit::Local(dataflow::LocalUnit::PtArf | dataflow::LocalUnit::L0Scale)
+        | ViewUnit::Unit(_) => None,
+    }
+}
+
+/// WHICH SLICE OF WHICH FILE A COMPUTED INDEX IS.
+///
+/// ⛔⛔ `None` IS THE REFERENCE'S OWN DEATH AND NOT A CHECK ADDED HERE. The value it builds is a
+/// decimal string, and every reader of it calls `symbolizeSentientComputePort("lrf" + value).value()`
+/// — which is `std::nullopt` for `lrf32` because the `.td` declares thirty-two cases
+/// (`SentientTypes.td:98-160`). ⭐ AND IT IS NOT [`sen::LrfIndex`]`::checked` REBORN: the bound
+/// belongs to the FILE, so it is stated once here, at the single site that computes an index, rather
+/// than on the type where every holder of one would have to re-handle it (see [`RegisterSlice`]).
+fn register_slice(file: SliceFile, access: i64) -> Option<RegisterSlice> {
+    match file {
+        SliceFile::Lrf => Some(RegisterSlice::Lrf(match access {
+            0 => sen::LrfIndex::L0,
+            1 => sen::LrfIndex::L1,
+            2 => sen::LrfIndex::L2,
+            3 => sen::LrfIndex::L3,
+            4 => sen::LrfIndex::L4,
+            5 => sen::LrfIndex::L5,
+            6 => sen::LrfIndex::L6,
+            7 => sen::LrfIndex::L7,
+            8 => sen::LrfIndex::L8,
+            9 => sen::LrfIndex::L9,
+            10 => sen::LrfIndex::L10,
+            11 => sen::LrfIndex::L11,
+            12 => sen::LrfIndex::L12,
+            13 => sen::LrfIndex::L13,
+            14 => sen::LrfIndex::L14,
+            15 => sen::LrfIndex::L15,
+            16 => sen::LrfIndex::L16,
+            17 => sen::LrfIndex::L17,
+            18 => sen::LrfIndex::L18,
+            19 => sen::LrfIndex::L19,
+            20 => sen::LrfIndex::L20,
+            21 => sen::LrfIndex::L21,
+            22 => sen::LrfIndex::L22,
+            23 => sen::LrfIndex::L23,
+            24 => sen::LrfIndex::L24,
+            25 => sen::LrfIndex::L25,
+            26 => sen::LrfIndex::L26,
+            27 => sen::LrfIndex::L27,
+            28 => sen::LrfIndex::L28,
+            29 => sen::LrfIndex::L29,
+            30 => sen::LrfIndex::L30,
+            31 => sen::LrfIndex::L31,
+            _ => return None,
+        })),
+        SliceFile::Irf => Some(RegisterSlice::Irf(match access {
+            0 => IrfIndex::I0,
+            1 => IrfIndex::I1,
+            _ => return None,
+        })),
+        SliceFile::IState => Some(RegisterSlice::IState(match access {
+            0 => sen::IStateIndex::S0,
+            1 => sen::IStateIndex::S1,
+            2 => sen::IStateIndex::S2,
+            3 => sen::IStateIndex::S3,
+            _ => return None,
+        })),
+    }
+}
+
+/// THE ACCESS'S OWN SUBSCRIPTS AS A MAP — what `fullyComposeAffineMapAndOperands` substitutes into
+/// the layout, and `None` for the two `agen` arms, where [`layout_map_and_indices`] has already
+/// composed them.
+///
+/// ⛔⛔ WITHOUT IT A LITERAL-SUBSCRIPTED `vector.load` HAS NO OFFSET AT ALL. [`plain_access`] hands
+/// back the VIEW's map and drops [`Index::Const`] subscripts, because the view's dimensions are entry
+/// 170's contract; in the reference those subscripts are `arith.constant` results and folding them in
+/// is exactly what makes `isSingleConstant()` true for `%lrf_memory_fp16[%c4, %c0]`
+/// (`sfp-to-sfp-ring.mlir:156`, `:171`).
+///
+/// ⭐ AND `canonicalizeMapAndOperands` NEEDS NOTHING BEHIND IT HERE: it drops unused dimensions and
+/// folds, and [`AffineMap::compose`] has already folded what this caller reads out of the map.
+fn subscript_map(op: &OpId, scope: &[DfirOp]) -> Option<AffineMap> {
+    match op_at(op, scope)? {
+        DfirOp::Vector(vector::Op::Load { indices, .. } | vector::Op::Store { indices, .. }) => {
+            Some(access_map(indices).0)
+        }
+        _ => None,
+    }
+}
+
+/// A CONSTANT INDEX'S VALUE — `dyn_cast<mlir::arith::ConstantIndexOp>(val.getDefiningOp()).value()`,
+/// with `None` for the null cast the reference dereferences.
+fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
+    match op_at(&defining_position(val, scope)?, scope)? {
+        DfirOp::Arith(arith::Op::Constant { value, .. }) => Some(*value),
+        _ => None,
+    }
+}
+
+/// HOW MANY BITS ONE SLICE OF A REGISTER FILE HOLDS — `int offset_per_slice = 1024; // bits`
+/// (`VectorOperands.cpp:222`).
+const SLICE_BITS: i64 = 1024;
+
+impl VectorOperand {
+    /// Replaces: e232_getOperandFromLoadOrStoreOp
+    ///
+    /// WHICH REGISTER-FILE SLICE A LOAD OR STORE TOUCHES — the access's constant-folded 1-D offset
+    /// scaled into 1024-bit slices, or `xrf`, which has no index.
+    ///
+    /// ⛔ TRAP: the two `bit_width` workarounds are part of the address (80 → 8, 24 → 16), and the
+    /// START ADDRESS IS IN BYTES yet is added to an ELEMENT offset before the scaling — the
+    /// reference's own arithmetic, comment and all.
+    /// ⛔ `None` COVERS ITS FIVE `return std::nullopt` SITES AND ONE MORE: a slice index the file has
+    /// no case for, which is where the reference dies instead (see [`register_slice`]).
+    #[must_use]
+    pub fn from_load_or_store_op(op: &OpId, scope: &[DfirOp]) -> Option<VectorOperand> {
+        // `if (failed(getLayoutMapAndIndices(op, layout_map, indices, logical_view_op)))` — "op needs
+        // to be either vector load or store".
+        let access = layout_map_and_indices(op, scope)?;
+        // `if (layout_map.getNumResults() != 1)` — "should map to a 1D view of memory for LRF/XRF/IRF".
+        if access.layout_map.results.len() != 1 {
+            return None;
+        }
+        let DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+            from, start, ty, ..
+        }) = op_at(&access.logical_view_op, scope)?
+        else {
+            return None;
+        };
+        // `findUnitType(logical_view_op.getFromUnit())`, else "Unit type is inconsistent".
+        let unit = view_unit(*from, scope)?;
+        // `affine::fullyComposeAffineMapAndOperands(&layout_map, &indices);` and the guarded
+        // `canonicalizeMapAndOperands` — see [`subscript_map`] for both.
+        let layout_map = match subscript_map(op, scope) {
+            Some(subscripts) => access.layout_map.compose(&subscripts),
+            None => access.layout_map,
+        };
+
+        // `// find regfile type` — the lookup and its four arms.
+        match memory_file(unit)? {
+            // `if (operand_type == XRF) return VectorOperand(operand_type, "xrf", op);`
+            MemoryFile::Xrf => Some(VectorOperand::new(
+                VectorOperandType::Xrf,
+                OperandValue::Port(sen::Port::Xrf),
+                op.clone(),
+            )),
+            MemoryFile::Sliced(file) => {
+                // `if (operand_type != XRF && !layout_map.isSingleConstant())` — "Store indices
+                // should lead to constant indices in the 1D memory for LRF/IRF".
+                let offset = layout_map.single_constant()?;
+                // `auto bit_width = getElementTypeBitWidth(logical_view_op.getResult().getType());`
+                let bit_width = match i64::from(ty.elem.bits()) {
+                    // `// TODO: this if statement must be dropped due to F80Type workaround`
+                    80 => 8,
+                    24 => 16,
+                    bits => bits,
+                };
+                // `if (auto const_start_address = dyn_cast<arith::ConstantIndexOp>(
+                //        logical_view_op.getStartAddress().getDefiningOp()))`, else "Only constant
+                // start address are supported for LRF/XRF/IRF/ISTATE in PT".
+                let start_address = constant_index(*start, scope)?;
+                // `auto total_address = (start_address + layout_map.getSingleConstantResult()) *
+                //  bit_width; auto access = (total_address) / offset_per_slice;`
+                let access = (start_address + offset) * bit_width / SLICE_BITS;
+                // `return VectorOperand(operand_type, std::to_string(access), op);`
+                Some(VectorOperand::new(
+                    file.kind(),
+                    OperandValue::Slice(register_slice(file, access)?),
+                    op.clone(),
+                ))
+            }
+        }
+    }
+}
+
+/// WHETHER AN OP IS ONE OF THE FIVE THAT CAN SIT BETWEEN AN OPERAND AND THE COMPUTE — the `isa<>`
+/// list of [`erase_operands`] (`VectorOperands.cpp:705-707`).
+fn is_intermediate(op: &OpId, scope: &[DfirOp]) -> bool {
+    matches!(
+        op_at(op, scope),
+        Some(
+            DfirOp::Arith(arith::Op::SiToFp(_) | arith::Op::FpToSi(_))
+                | DfirOp::VectorChain(
+                    vc::Op::Cast { .. } | vc::Op::Neg { .. } | vc::Op::Select { .. }
+                )
+        )
+    )
+}
+
+/// Replaces: e233_eraseOperands
+///
+/// ERASE THE OPS FEEDING EVERY OPERAND WHOSE CHAIN THIS LOWERING CONSUMED, STEPPING OVER THE
+/// CONVERSION, CAST, NEGATION OR SELECT THAT CAN SIT IN BETWEEN (see [`is_intermediate`]).
+///
+/// ⛔ A `latch` OPERAND IS NEVER ERASED (`getName() != "latch"`), one surviving reader anywhere keeps
+/// the definition, and an op already erased is skipped — so one op feeding two operands goes once.
+/// ⛔ THE REFERENCE READS `operand.value()` BEFORE ITS OWN `has_value()` TEST (`:693-696`), which is
+/// a null dereference; the `Option` is taken first here.
+/// ⛔ AND EVERY REMOVAL WAITS FOR THE END, DESCENDING: an [`OpId`] is a POSITION, so erasing one op
+/// renumbers the siblings that the remaining decisions name (see [`erase_op`]).
+pub fn erase_operands(operands: &[Option<VectorOperand>], scope: &mut Vec<DfirOp>) {
+    let mut erased_list: Vec<OpId> = Vec::new();
+
+    // `for (auto &operand : operands)`, with `if (!operand.has_value()) continue;` first.
+    for operand in operands.iter().flatten() {
+        // `if (std::find(erased_list.begin(), erased_list.end(), operand.value().op_) == end())`
+        if erased_list.contains(&operand.op) {
+            continue;
+        }
+
+        let mut all_uses_deleted = true;
+        let mut to_be_erased: Vec<OpId> = Vec::new();
+
+        // `for (auto user : operand.value().op_->getUsers())`
+        for mut user in use_positions(&operand.op, scope) {
+            let mut intermediate_ops: Vec<OpId> = Vec::new();
+
+            // `while (user && isa<..>(user) && user->hasOneUse()) { intermediate_ops.push_back(user);
+            //  user = *user->getUsers().begin(); }`
+            while is_intermediate(&user, scope) {
+                let mut users = use_positions(&user, scope);
+                if users.len() != 1 {
+                    break;
+                }
+                intermediate_ops.push(user);
+                user = users.remove(0);
+            }
+
+            // `if (user && user->getUses().empty()) { user->dropAllUses(); to_be_erased.push_back(
+            //  user); for (auto op : intermediate_ops) { .. } } else all_uses_deleted = false;`
+            if has_no_uses(&user, scope) {
+                to_be_erased.push(user);
+                to_be_erased.extend(intermediate_ops);
+            } else {
+                all_uses_deleted = false;
+            }
+        }
+
+        // `for (auto e : to_be_erased) { erased_list.push_back(e); e->erase(); }`
+        erased_list.extend(to_be_erased);
+
+        // `if (all_uses_deleted) { if (operand.value().getName() != "latch") { erased_list.push_back(
+        //  operand.value().op_); operand.value().op_->erase(); } }`
+        if all_uses_deleted && operand.name() != Some(sen::Port::Latch) {
+            erased_list.push(operand.op.clone());
+        }
+    }
+
+    erased_list.sort_unstable();
+    erased_list.dedup();
+    for position in erased_list.iter().rev() {
+        remove_at(position.path(), scope);
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{BitstreamConstant, IrfIndex, LayoutAndIndices, RegisterSlice};
     use super::{ComputeComp, ConstantOperandValue, OpId, OperandValue, VectorOperand};
     use super::{
-        VectorOperandType, const_val_to_field, erase_op, layout_map_and_indices, same_block,
+        VectorOperandType, const_val_to_field, erase_op, erase_operands, layout_map_and_indices,
+        same_block,
     };
     use crate::arch::{Dd2, Sen1p5};
     use crate::units::{DfirUnit, Row};
@@ -2486,14 +2835,130 @@ mod unit_tests {
         let scope = vec![row_view()];
         assert_eq!(layout_map_and_indices(&OpId::at(&[0]), &scope), None);
     }
+    // ── e232_getOperandFromLoadOrStoreOp / e233_eraseOperands / e234_setValue ──────────────────
+
+    /// `%c0 = arith.constant 0 : index` binding `result` — a view's start address.
+    fn const_index(result: Val, value: i64) -> DfirOp {
+        DfirOp::Arith(arith::Op::Constant { result, value })
+    }
+
+    /// ⭐ THE VENDOR'S TWO CASES, ONE PER FILE, AND THE SLICE INDEX IS COMPUTED NOT COPIED.
+    /// `sfp-to-sfp-ring.mlir:156`,`:167-171` loads `%lrf_memory_fp16[%c4, %c0]` where `%c4` holds
+    /// **3** and the view is `(i,j)->(64*i+j)` over `memref<8x64xf16>`: `(0 + 192) * 16 / 1024 = 3`,
+    /// and its CHECK is `opA = #sentient<compute_port lrf3>` (`:84`). `int8-genkg3-pt.mlir:123-133`
+    /// stores at `[1, 0]` of `(i,j)->(128*i+j)` over `memref<2x128xi8>`: `(0 + 128) * 8 / 1024 = 1`,
+    /// CHECKed as `ResultForwarding = [#sentient<compute_port irf1>]` (`:15`).
+    #[test]
+    fn a_load_and_a_store_name_the_slice_their_folded_address_lands_in() {
+        let lrf = vec![
+            const_index(Val(82), 0),
+            DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+                result: Val(81),
+                of: Val(90),
+                which: dataflow::LocalUnit::SfpLrf,
+            }),
+            lrf_view(),
+            DfirOp::Vector(vector::Op::Load {
+                result: Val(83),
+                base: Val(80),
+                indices: vec![Index::Const(3), Index::Const(0)],
+                base_ty: MemRef {
+                    shape: vec![8, 64],
+                    elem: ElemType::F16,
+                },
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            }),
+        ];
+        let loaded = VectorOperand::from_load_or_store_op(&OpId::at(&[3]), &lrf)
+            .expect("the vendor's LRF load lowers");
+        assert_eq!(loaded.kind, VectorOperandType::Lrf);
+        assert_eq!(
+            loaded.values,
+            vec![OperandValue::Slice(RegisterSlice::Lrf(sen::LrfIndex::L3))]
+        );
+
+        let irf_ty = MemRef {
+            shape: vec![2, 128],
+            elem: ElemType::Int(8),
+        };
+        let irf = vec![
+            const_index(Val(82), 0),
+            DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+                result: Val(81),
+                of: Val(90),
+                which: dataflow::LocalUnit::PtIrf,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(80),
+                from: Val(81),
+                start: Val(82),
+                layout: AffineMap {
+                    dims: 2,
+                    syms: 0,
+                    results: vec![AffineExpr::dim(0).times(128).plus(AffineExpr::dim(1))],
+                },
+                ty: irf_ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                value: Val(83),
+                view: Val(80),
+                indices: vec![Index::Const(1), Index::Const(0)],
+                view_ty: irf_ty,
+                ty: Vector {
+                    len: 128,
+                    elem: ElemType::Int(8),
+                },
+            }),
+        ];
+        let stored = VectorOperand::from_load_or_store_op(&OpId::at(&[3]), &irf)
+            .expect("the vendor's IRF store lowers");
+        assert_eq!(stored.kind, VectorOperandType::Irf);
+        assert_eq!(
+            stored.values,
+            vec![OperandValue::Slice(RegisterSlice::Irf(IrfIndex::I1))]
+        );
+    }
+
+    /// ⭐ IT REPLACES, WHICH IS WHY `OperandReuse` RE-VALUING TO `latch` LOSES THE SLICE INDEX.
+    #[test]
+    fn setting_a_value_drops_the_one_the_operand_held() {
+        let mut held = VectorOperand::new(
+            VectorOperandType::Lrf,
+            OperandValue::Slice(RegisterSlice::Lrf(sen::LrfIndex::L3)),
+            OpId::at(&[0]),
+        );
+        held.set_value(OperandValue::Port(sen::Port::Latch));
+        assert_eq!(held.values, vec![OperandValue::Port(sen::Port::Latch)]);
+    }
+
+    /// ⭐⭐ THE WHOLE CHAIN GOES, AND A `latch` KEEPS ITS DEFINITION. The dense constant at `[0]` is
+    /// read only through a `neg` whose own reader is an unused `fast_exp`, so all three are erased;
+    /// re-valued to [`sen::Port::Latch`] the same operand keeps `[0]` and loses only its consumers.
+    #[test]
+    fn an_operand_whose_only_readers_died_is_erased_unless_it_is_a_latch() {
+        let chain = || vec![dense(Val(0)), neg(Val(1), Val(0)), fast_exp(Val(2), Val(1))];
+
+        let mut scope = chain();
+        erase_operands(
+            &[Some(operand(VectorOperandType::Constant, &[0]))],
+            &mut scope,
+        );
+        assert_eq!(scope, Vec::new());
+
+        let mut latched = operand(VectorOperandType::Link, &[0]);
+        latched.set_value(OperandValue::Port(sen::Port::Latch));
+        let mut scope = chain();
+        erase_operands(&[Some(latched)], &mut scope);
+        assert_eq!(scope, vec![dense(Val(0))]);
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e232_getOperandFromLoadOrStoreOp
-// crustify:todo: e233_eraseOperands
-// crustify:todo: e234_setValue
 // crustify:todo: e278_getOperandFromShuffleOp
 // crustify:todo: e304_getOperandWithPrecision
 // crustify:todo: e320_getOperand

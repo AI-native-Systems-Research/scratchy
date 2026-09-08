@@ -135,6 +135,11 @@ pub enum ElemType {
     F4E2M1Fn,
     /// `dataflow.mxfloat<N>` — the MX element of a scaled tensor.
     MxFloat(u32),
+    /// `f8E5M2`.
+    F8E5M2,
+    /// `dataflow.mxint<N>` — the MX element of a scaled INTEGER tensor, `mxint4` being the only
+    /// width the reference's own string table names (`VectorChainHelper.hpp:196-221`).
+    MxInt(u32),
 }
 
 impl ElemType {
@@ -150,11 +155,51 @@ impl ElemType {
     #[must_use]
     pub const fn bits(self) -> u32 {
         match self {
-            ElemType::Int(bits) | ElemType::MxFloat(bits) => bits,
+            ElemType::Int(bits) | ElemType::MxFloat(bits) | ElemType::MxInt(bits) => bits,
             ElemType::F16 | ElemType::Bf16 => 16,
             ElemType::F32 => 32,
-            ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu => 8,
+            ElemType::F8E4M3Fn | ElemType::F8E8M0Fnu | ElemType::F8E5M2 => 8,
             ElemType::F4E2M1Fn => 4,
+        }
+    }
+
+    /// HOW MLIR SPELLS IT — the printer's form, and the one the reference's own string tables use
+    /// (`EnumsConversion` and `VectorChainHelper.hpp:196-244` both spell `fp16`/`bf16`/`fp32`
+    /// differently; those are DCC attribute spellings, not type spellings, and live at entry 231).
+    ///
+    /// ⛔ TOTAL OVER THE ENUM, NO WILDCARD.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        match self {
+            ElemType::Int(bits) => format!("i{bits}"),
+            ElemType::F16 => "f16".to_owned(),
+            ElemType::F32 => "f32".to_owned(),
+            ElemType::Bf16 => "bf16".to_owned(),
+            ElemType::F8E4M3Fn => "f8E4M3FN".to_owned(),
+            ElemType::F8E8M0Fnu => "f8E8M0FNU".to_owned(),
+            ElemType::F4E2M1Fn => "f4E2M1FN".to_owned(),
+            ElemType::F8E5M2 => "f8E5M2".to_owned(),
+            ElemType::MxFloat(bits) => format!("!dataflow.mxfloat<{bits}>"),
+            ElemType::MxInt(bits) => format!("!dataflow.mxint<{bits}>"),
+        }
+    }
+
+    /// WHETHER `isa<FloatType>` HOLDS OF IT, which decides whether a `sentient.scalar_constant`
+    /// prints its value as a hex bit pattern (`SentientOps.cpp:1704-1706`).
+    ///
+    /// ⛔ FALSE FOR THE TWO `Mx` ARMS. They are `!dataflow.mxfloat`/`!dataflow.mxint`, DCC's own
+    /// dialect types — `isa<FloatType>` is false of a custom type however float-like its name.
+    #[must_use]
+    pub const fn is_float(self) -> bool {
+        match self {
+            ElemType::F16
+            | ElemType::F32
+            | ElemType::Bf16
+            | ElemType::F8E4M3Fn
+            | ElemType::F8E8M0Fnu
+            | ElemType::F4E2M1Fn
+            | ElemType::F8E5M2 => true,
+            ElemType::Int(_) | ElemType::MxFloat(_) | ElemType::MxInt(_) => false,
         }
     }
 
@@ -229,15 +274,21 @@ impl ElemType {
 /// and the fp8 formats in it, and it has no `index` at all. A loop counter is not an element of
 /// anything, and the two sets meet only at `Int`.
 ///
-/// ⛔ NO `AnyFloat`. `scalar_constant`'s result admits one (`SentientOps.td:850`) and prints its
-/// value as a hex bit pattern when it is a float (`SentientOps.cpp:1704-1706`); nothing at this rung
-/// emits one, so the case is absent rather than guessed at.
+/// ⭐ AND IT ADMITS AN [`ElemType`] THROUGH [`ScalarTy::of_elem`], because `scalar_constant`'s
+/// result type is `AnyTypeOf<[AnyInteger, Index, AnyFloat]>` (`SentientOps.td:850`) and entry 235
+/// `createSentientConstants` passes a splat's ELEMENT type in as it: `vector<1xf16>` in,
+/// `sentient.scalar_constant {value = 0xff : si64} : f16` out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarTy {
     /// `index` — what every loop bound, address and induction variable is typed.
     Index,
     /// `i<bits>` — a signless integer. `i1` is the type of a predicate.
     Int(u32),
+    /// A tensor or vector ELEMENT type used as a scalar type — a float, in practice.
+    ///
+    /// ⛔ CONSTRUCT IT THROUGH [`ScalarTy::of_elem`], never directly: that is what keeps
+    /// `Int(8)` and `Elem(Int(8))` from both arising for one type and comparing unequal.
+    Elem(ElemType),
 }
 
 impl ScalarTy {
@@ -247,6 +298,27 @@ impl ScalarTy {
         match self {
             ScalarTy::Index => "index".to_owned(),
             ScalarTy::Int(bits) => format!("i{bits}"),
+            ScalarTy::Elem(elem) => elem.spelling(),
+        }
+    }
+
+    /// THE SCALAR TYPE ONE ELEMENT TYPE IS — the only way to build [`ScalarTy::Elem`], and the
+    /// reason an integer element cannot arrive spelled two ways.
+    #[must_use]
+    pub const fn of_elem(elem: ElemType) -> ScalarTy {
+        match elem {
+            ElemType::Int(bits) => ScalarTy::Int(bits),
+            other => ScalarTy::Elem(other),
+        }
+    }
+
+    /// WHETHER THE VALUE OF A CONSTANT OF THIS TYPE PRINTS AS A HEX BIT PATTERN
+    /// (`SentientOps.cpp:1704-1706` takes that branch for `isa<FloatType>`).
+    #[must_use]
+    pub const fn is_float(self) -> bool {
+        match self {
+            ScalarTy::Index | ScalarTy::Int(_) => false,
+            ScalarTy::Elem(elem) => elem.is_float(),
         }
     }
 }
@@ -1048,6 +1120,19 @@ impl AffineMap {
             dims: rank,
             syms: 0,
             results: (0..rank).map(AffineExpr::dim).collect(),
+        }
+    }
+
+    /// THE ONE LITERAL THIS MAP PRODUCES, if a literal is all it produces.
+    ///
+    /// ⭐ `isSingleConstant()` AND `getSingleConstantResult()` AS ONE CALL, because the reference
+    /// never asks the first without immediately taking the second — `getOperandFromLoadOrStoreOp`
+    /// (entry 232) canonicalizes a fully-composed access map and reads the offset out of it.
+    #[must_use]
+    pub fn single_constant(&self) -> Option<i64> {
+        match self.results.as_slice() {
+            [AffineExpr::Const(offset)] => Some(*offset),
+            _ => None,
         }
     }
 

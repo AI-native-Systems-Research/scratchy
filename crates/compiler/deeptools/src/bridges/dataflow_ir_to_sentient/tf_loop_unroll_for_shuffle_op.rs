@@ -754,6 +754,10 @@ fn fold_to_constant(op: &DfirOp, built: &[DfirOp], unit: &[DfirOp]) -> Option<i6
             arith::Op::ConstantInt { .. }
             | arith::Op::DenseConstant { .. }
             | arith::Op::Compare { .. }
+            // ⭐ AND THE TWO CONVERSIONS, WHICH NO EXPANSION BUILDS: every value in one is an
+            // `index`, and `sitofp`/`fptosi` change the element type of a vector.
+            | arith::Op::SiToFp(_)
+            | arith::Op::FpToSi(_)
             | arith::Op::Logic { .. },
         )
         | DfirOp::Affine(_)

@@ -383,6 +383,10 @@ pub(super) fn constant_index(val: Val, scope: &[DfirOp]) -> Option<i64> {
             // Entry 184's `get_loop_trip_count` is the function that takes the larger arm instead of
             // declining it.
             | arith::Op::Select { .. }
+            // ⛔ AND A CONVERSION IS NOT A LITERAL EITHER — `arith.sitofp` results are vectors, so
+            // one behind a bound is ill-typed as well as null under the `dyn_cast`.
+            | arith::Op::SiToFp(_)
+            | arith::Op::FpToSi(_)
             | arith::Op::Logic { .. },
         ) => None,
         // ⭐ AND THE OTHER DIALECTS BY DIALECT, because no future op of theirs could be an

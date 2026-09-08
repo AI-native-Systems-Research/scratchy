@@ -677,6 +677,11 @@ pub enum Op {
         value: Vec<i64>,
         /// Its type — as many elements as `value` has.
         ty: Vector,
+        /// The `is_symbol` UNIT ATTRIBUTE — a bit pattern that is really a symbol to be resolved
+        /// later. `SNDSCLowering.cpp:480,516` sets it and entry 235 `createSentientConstants`
+        /// copies it onto the `sentient.scalar_constant` it emits (`Splat.cpp:50-51`), where it
+        /// changes what the op prints.
+        is_symbol: bool,
     },
 
     /// `vectorchain.shuffle input(%c) {indices = [..], repetition = N} : tin, tout` — the splat that
@@ -1121,15 +1126,21 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::vector(*ty)
             );
         }
-        Op::ConstantBitstream { result, value, ty } => {
+        Op::ConstantBitstream {
+            result,
+            value,
+            ty,
+            is_symbol,
+        } => {
             let values = value
                 .iter()
                 .map(|bits| format!("{bits:#x}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let symbol = if *is_symbol { "is_symbol, " } else { "" };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.constant_bitstream {{value = [{values}]}} : {}",
+                "{} = vectorchain.constant_bitstream {{{symbol}value = [{values}]}} : {}",
                 print::val(*result),
                 print::vector(*ty)
             );

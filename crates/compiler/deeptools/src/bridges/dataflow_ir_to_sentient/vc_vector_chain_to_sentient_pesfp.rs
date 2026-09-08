@@ -727,6 +727,7 @@ mod unit_tests {
             result: Val(0),
             value: vec![0],
             ty: V,
+            is_symbol: false,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::Shuffle {
             result: Val(0),

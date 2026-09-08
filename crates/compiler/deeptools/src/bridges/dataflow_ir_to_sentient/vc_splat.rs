@@ -59,9 +59,155 @@
 //! | `e235_createSentientConstants` | 235/384 | 31 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:34` |
 //! | `e279_createSplatOperation` | 279/384 | 110 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70` |
 
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::{ScalarTy, Vector};
+use crate::islands::sentient::dialects::{self as sen, Val, sentient, vectorchain};
 
+/// HOW WIDE THE BITSTREAM A SPLAT'S CONSTANT IS PACKED INTO IS — the literal `128` of
+/// `Splat.cpp:56`, and what fixes the emitted vector's length independently of how many values the
+/// `constant_bitstream` carries.
+const BITSTREAM_BITS: u32 = 128;
+
+/// THE CONSTANT A SPLAT LOWERS TO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentientConstant {
+    /// The op that replaces the `vectorchain.constant_bitstream`.
+    pub op: sen::Op,
+    /// Its result — `sentient_const_op.getResult()`.
+    pub value: Val,
+}
+
+/// Replaces: e235_createSentientConstants
+///
+/// One value in the `constant_bitstream` becomes a `sentient.scalar_constant` carrying its
+/// `is_symbol`; more than one becomes a `sentient.vector_constant` whose elements are the shuffle's
+/// indices read off those values.
+///
+/// ⛔ TRAP: the vector's length is `128 / bitwidth` — NOT `value.len()` — and the reference
+/// `DT_CHECK`s the shuffle has exactly that many indices. That check is the `None` here, which its
+/// caller (entry 279) already returns a `LogicalResult` for.
+#[must_use]
+pub fn create_sentient_constants(
+    const_bit_op: &vectorchain::Op,
+    shuffle_op: &vectorchain::Op,
+    values: &mut Values,
+) -> Option<SentientConstant> {
+    let vectorchain::Op::ConstantBitstream {
+        value: vals,
+        ty,
+        is_symbol,
+        ..
+    } = const_bit_op
+    else {
+        return None;
+    };
+    if let [val] = vals.as_slice() {
+        let value = values.mint();
+        return Some(SentientConstant {
+            op: sen::Op::Sentient(sentient::Op::ScalarConstant {
+                value: *val,
+                result: value,
+                reg_locale: sentient::RegType::Imm,
+                ty: ScalarTy::of_elem(ty.elem),
+                is_symbol: *is_symbol,
+            }),
+            value,
+        });
+    }
+    let vectorchain::Op::Shuffle { indices, .. } = shuffle_op else {
+        return None;
+    };
+    let total_elements = BITSTREAM_BITS / ty.elem.bits();
+    if indices.len() != total_elements as usize {
+        return None;
+    }
+    let mut extended_vals = Vec::with_capacity(indices.len());
+    for idx in indices {
+        extended_vals.push(*vals.get(usize::try_from(*idx).ok()?)?);
+    }
+    let value = values.mint();
+    Some(SentientConstant {
+        op: sen::Op::Sentient(sentient::Op::VectorConstant {
+            value: extended_vals,
+            result: value,
+            ty: Vector {
+                len: u64::from(total_elements),
+                elem: ty.elem,
+            },
+        }),
+        value,
+    })
+}
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e235_createSentientConstants
 // crustify:todo: e279_createSplatOperation
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{SentientConstant, create_sentient_constants};
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::ty::{ElemType, ScalarTy, Vector};
+    use crate::islands::sentient::dialects::{self as sen, Val, sentient, vectorchain};
+
+    /// `dcc/test/.../splat_const_bit.mlir:20` takes the scalar arm and
+    /// `shuffle_splat_pattern.mlir:30` the vector one, from the same two-value bitstream.
+    #[test]
+    fn one_value_is_a_scalar_constant_and_two_are_a_shuffled_vector_of_eight() {
+        let f16 = |len| Vector {
+            len,
+            elem: ElemType::F16,
+        };
+        let mut values = Values::default();
+        let shuffle = vectorchain::Op::Shuffle {
+            result: Val(3),
+            input: Val(2),
+            indices: vec![0, 1, 1, 1, 1, 1, 1, 1],
+            repetition: 8,
+            input_ty: f16(2),
+            ty: f16(8),
+        };
+
+        let one = vectorchain::Op::ConstantBitstream {
+            result: Val(2),
+            value: vec![0xff],
+            ty: f16(1),
+            is_symbol: false,
+        };
+        let scalar = create_sentient_constants(&one, &shuffle, &mut values);
+        assert_eq!(
+            scalar,
+            Some(SentientConstant {
+                op: sen::Op::Sentient(sentient::Op::ScalarConstant {
+                    value: 0xff,
+                    result: Val(0),
+                    reg_locale: sentient::RegType::Imm,
+                    ty: ScalarTy::Elem(ElemType::F16),
+                    is_symbol: false,
+                }),
+                value: Val(0),
+            }),
+            "`%0 = sentient.scalar_constant {{value = 0xff : si64}} : f16`"
+        );
+
+        let two = vectorchain::Op::ConstantBitstream {
+            result: Val(2),
+            value: vec![0xffff, 0x0],
+            ty: f16(2),
+            is_symbol: false,
+        };
+        let vector = create_sentient_constants(&two, &shuffle, &mut values);
+        assert_eq!(
+            vector,
+            Some(SentientConstant {
+                op: sen::Op::Sentient(sentient::Op::VectorConstant {
+                    value: vec![0xffff, 0, 0, 0, 0, 0, 0, 0],
+                    result: Val(1),
+                    ty: f16(8),
+                }),
+                value: Val(1),
+            }),
+            "`sentient.vector_constant {{value = [0xffff, 0x0, …]}} : vector<8xf16>`"
+        );
+    }
+}

@@ -1054,6 +1054,7 @@ pub fn insert_const_and_add_ops(
         ops: vec![
             // `sentient::ConstantOp::create(*builder, loc, xrf_reg_type, val)`
             sen::Op::Sentient(sentient::Op::ScalarConstant {
+                is_symbol: false,
                 value: val.0,
                 result: const_offset,
                 // ⛔ THE DEFAULT, NOT A CHOICE — see this function's note on `name`.
@@ -1264,6 +1265,7 @@ fn viewed_unit_is_xrf(from_unit: Val, scope: &[DfirOp]) -> bool {
             | LocalUnit::SfpLrf
             | LocalUnit::PtLrf
             | LocalUnit::PtArf
+            | LocalUnit::PtIrf
             | LocalUnit::L0Scale => false,
         },
 
@@ -1539,6 +1541,7 @@ mod unit_tests {
     #[test]
     fn any_other_op_reads_its_first_result_for_either_pointer() {
         let producer = sen::Op::Sentient(sentient::Op::ScalarConstant {
+            is_symbol: false,
             value: 7,
             result: Val(11),
             reg_locale: sentient::RegType::Imm,
@@ -1847,12 +1850,14 @@ mod unit_tests {
         let mut body = vec![
             // The placeholder pair — `insertDummyMacOp`'s two results, standing in until now.
             sen::Op::Sentient(sentient::Op::ScalarConstant {
+                is_symbol: false,
                 value: 0,
                 result: Val(0),
                 reg_locale: sentient::RegType::Imm,
                 ty: ScalarTy::Index,
             }),
             sen::Op::Sentient(sentient::Op::ScalarConstant {
+                is_symbol: false,
                 value: 0,
                 result: Val(1),
                 reg_locale: sentient::RegType::Imm,
@@ -2086,6 +2091,7 @@ mod unit_tests {
             XrfPtrAdvance {
                 ops: vec![
                     sen::Op::Sentient(sentient::Op::ScalarConstant {
+                        is_symbol: false,
                         value: 63,
                         result: offset,
                         reg_locale: sentient::RegType::Imm,
@@ -2126,6 +2132,7 @@ mod unit_tests {
         assert_eq!(
             advance.ops.first(),
             Some(&sen::Op::Sentient(sentient::Op::ScalarConstant {
+                is_symbol: false,
                 value: -32,
                 result: Val(1),
                 reg_locale: sentient::RegType::Imm,
@@ -2355,6 +2362,7 @@ mod unit_tests {
             LocalUnit::PtLrf,
             LocalUnit::PtXrf,
             LocalUnit::PtArf,
+            LocalUnit::PtIrf,
             LocalUnit::L0Scale,
         ] {
             let scope = vec![local_unit(Val(15), which), xrf_view(Val(45), Val(15))];

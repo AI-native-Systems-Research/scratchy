@@ -406,6 +406,7 @@ impl NestedIf {
 #[must_use]
 pub fn lower_constant_index_to_sentient(result: Val, value: i64) -> sen::Op {
     sen::Op::ScalarConstant {
+        is_symbol: false,
         value,
         result,
         reg_locale: sen::RegType::Imm,
@@ -479,6 +480,7 @@ pub fn lower_constant_int_to_sentient(result: Val, value: IntConst) -> sen::Op {
         IntConst::Int { value, .. } => value,
     };
     sen::Op::ScalarConstant {
+        is_symbol: false,
         value: literal,
         result,
         reg_locale: sen::RegType::Imm,
@@ -676,6 +678,10 @@ pub fn run_on_operation<A: Arch>(program: &dfir::Program<A>) -> Vec<SenOp> {
             // No arm in the reference: left exactly as they are.
             arith::Op::DivSI(_)
             | arith::Op::RemSI(_)
+            // ⭐ AND THE TWO CONVERSIONS WITH THEM: `arith.sitofp` and `arith.fptosi` are named
+            // nowhere in the reference's walk either.
+            | arith::Op::SiToFp(_)
+            | arith::Op::FpToSi(_)
             | arith::Op::Logic {
                 kind: LogicKind::Not,
                 ..
@@ -989,6 +995,7 @@ mod unit_tests {
         assert_eq!(
             lower_constant_index_to_sentient(Val(0), 7),
             sen::Op::ScalarConstant {
+                is_symbol: false,
                 value: 7,
                 result: Val(0),
                 reg_locale: sen::RegType::Imm,
@@ -1030,6 +1037,7 @@ mod unit_tests {
         assert_ne!(
             lowered,
             sen::Op::ScalarConstant {
+                is_symbol: false,
                 value: -1,
                 result: Val(2),
                 reg_locale: sen::RegType::Imm,
@@ -1290,12 +1298,14 @@ mod unit_tests {
                     ty: ScalarTy::Index,
                 }),
                 SenOp::Sentient(sen::Op::ScalarConstant {
+                    is_symbol: false,
                     value: 2048,
                     result: Val(1),
                     reg_locale: sen::RegType::Imm,
                     ty: ScalarTy::Index,
                 }),
                 SenOp::Sentient(sen::Op::ScalarConstant {
+                    is_symbol: false,
                     value: 1,
                     result: Val(2),
                     reg_locale: sen::RegType::Imm,

@@ -269,6 +269,7 @@ fn inherit_constants<A: Arch>(
                 let fresh = vals.mint();
                 bound.folded.insert(*value, fresh);
                 preamble.push(SenOp::Sentient(sen::Op::ScalarConstant {
+                    is_symbol: false,
                     value: *value,
                     result: fresh,
                     reg_locale: sen::RegType::Unknown,
@@ -315,6 +316,7 @@ fn mint_constants<A: Arch>(
             let fresh = vals.mint();
             consts.minted.insert(value, fresh);
             preamble.push(SenOp::Sentient(sen::Op::ScalarConstant {
+                is_symbol: false,
                 value,
                 result: fresh,
                 reg_locale: sen::RegType::Unknown,

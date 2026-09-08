@@ -3109,6 +3109,7 @@ mod unit_tests {
                 result: Val(51),
                 value: vec![0],
                 ty: LANES,
+                is_symbol: false,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 result: Val(52),
@@ -3147,6 +3148,7 @@ mod unit_tests {
             result: Val(51),
             value: vec![0, 1],
             ty: LANES,
+            is_symbol: false,
         });
         assert_eq!(
             get_store_producer(&AgenStore::Vector { value: Val(52) }, &two_values),

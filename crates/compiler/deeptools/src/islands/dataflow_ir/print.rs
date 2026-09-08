@@ -187,16 +187,7 @@ pub(crate) fn vector(ty: Vector) -> String {
 }
 
 fn elem(ty: ElemType) -> String {
-    match ty {
-        ElemType::Int(bits) => format!("i{bits}"),
-        ElemType::F16 => "f16".to_owned(),
-        ElemType::F32 => "f32".to_owned(),
-        ElemType::Bf16 => "bf16".to_owned(),
-        ElemType::F8E4M3Fn => "f8E4M3FN".to_owned(),
-        ElemType::F8E8M0Fnu => "f8E8M0FNU".to_owned(),
-        ElemType::F4E2M1Fn => "f4E2M1FN".to_owned(),
-        ElemType::MxFloat(bits) => format!("!dataflow.mxfloat<{bits}>"),
-    }
+    ty.spelling()
 }
 
 pub(crate) fn affine_map(map: &AffineMap) -> String {

@@ -1922,6 +1922,10 @@ fn is_named_harmless(op: &DfirOp) -> bool {
             | arith::Op::MulI(_)
             | arith::Op::DivSI(_)
             | arith::Op::RemSI(_)
+            // ⛔ AND NEITHER CONVERSION IS ON THE LIST, so both answer *"has a side effect"* — the
+            // conservative direction, exactly as the arithmetic above does.
+            | arith::Op::SiToFp(_)
+            | arith::Op::FpToSi(_)
             | arith::Op::Logic { .. },
         ) => false,
 

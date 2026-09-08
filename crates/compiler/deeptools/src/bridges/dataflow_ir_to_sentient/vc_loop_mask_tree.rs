@@ -318,6 +318,16 @@ impl<N> OperationTreeBase<N> {
         self.nodes[n.0].op.as_ref()
     }
 
+    /// `OperationNode::setOperation(op)` — `OperationTree.hpp:38`, `operation_op_ = op;`.
+    ///
+    /// ⚠️ A FIELD SETTER ON THE EXCLUDED LIST, written because entry 237 [`LoopMaskTree::update_node`]
+    /// is the one unit that calls it. ⛔ IT CANNOT ERASE THE NAME: the reference's setter takes an
+    /// `Operation *` that could be null, which would make a named node unfindable; this takes an
+    /// [`OpId`], so re-pointing a node is all it can do.
+    fn set_operation(&mut self, n: OperationNodeId, op: OpId) {
+        self.nodes[n.0].op = Some(op);
+    }
+
     /// THE FIRST NODE NAMING `op` — the scan behind [`LoopMaskTree::find_node_from_op`] (entry 078).
     ///
     /// ⛔ THE ROOT CANNOT MATCH: its operation is `None` and this compares against `Some(op)`, which
@@ -1121,6 +1131,62 @@ impl LoopMaskTree {
             // `n->getIncrement() == getIncrement());`
             && other.mask.increment == this.mask.increment
     }
+
+    /// Replaces: e236_addMaskNode
+    ///
+    /// **236/384** `LoopMaskTree::addMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:136` (16L).
+    ///
+    /// ⭐ `loop_op = None` IS THE REFERENCE'S `nullptr` ARM, not an error: a mask no `sentient.for`
+    /// encloses hangs off the root (`:145-147`), which is what its caller's
+    /// `parent_loop ? parent_loop.getOperation() : nullptr` reaches (`LoweringPTMasks.cpp:24-25`).
+    /// ⛔ `None` OUT IS BOTH REMAINING `DT_CHECK_MSG`s AT ONCE — *"expecting a sentient::ForOp"* and
+    /// *"could not locate loop_op in tree"* (`:143-145`) are one question here: does this tree hold a
+    /// LOOP node naming that op. ⛔ The `op already in map` check and the dead `getFirstChild()` local
+    /// (`:141`) both go with `op_to_node_` — see [`LoopMaskTree`].
+    pub fn add_mask_node(
+        &mut self,
+        loop_op: Option<&OpId>,
+        mask_related_op: OpId,
+        mask: MaskNode,
+    ) -> Option<MaskNodeId> {
+        // `if (loop_op) { … LoopMaskNode *found_node = findNodeFromOp(loop_op); … }`
+        let parent = match loop_op {
+            Some(op) => {
+                let found = self.find_node_from_op(op)?;
+                match self.node(found) {
+                    LoopMaskNode::Loop(LMTLoopNode) => found,
+                    LoopMaskNode::SyntheticRoot | LoopMaskNode::Mask(_) => return None,
+                }
+            }
+            // `} else { LoopMaskNode *n = getRoot(); n->insertChildNode(mask_node); }`
+            None => self.root(),
+        };
+        // `MaskNode *mask_node = new MaskNode(mask_related_op, start_val, increment);` — minted by
+        // the insert, since the arena owns the node.
+        let node = LoopMaskNodeId(self.base.push_named_child(
+            parent.0,
+            mask_related_op,
+            LoopMaskNode::Mask(mask),
+        ));
+        Some(MaskNodeId { node, mask })
+    }
+
+    /// Replaces: e237_updateNode
+    ///
+    /// **237/384** `LoopMaskTree::updateNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:155` (10L).
+    ///
+    /// Re-points the node naming `from` at `to`, so a rewritten compute keeps its mask.
+    /// ⛔ `None` IS *"could not find from op in LoopMaskTree"* (`:158-159`); `DT_CHECK_MSG(from && to)`
+    /// is unrepresentable over [`OpId`]. ⛔ THE MAP SURGERY IS THE WHOLE REST OF THE BODY — insert `to`,
+    /// erase `from` (`:162-163`) — and it disappears with `op_to_node_`: one node, one name, so
+    /// [`Self::find_node_from_op`] answers for `to` and stops answering for `from` in one write.
+    /// ⚠️ DEAD IN THE REFERENCE TOO — nothing in the tree calls it.
+    pub fn update_node(&mut self, from: &OpId, to: OpId) -> Option<LoopMaskNodeId> {
+        // `auto from_node = op_to_node_[from]; from_node->setOperation(to);`
+        let node = self.find_node_from_op(from)?;
+        self.base.set_operation(node.0, to);
+        Some(node)
+    }
 }
 
 /// A NODE KNOWN TO CARRY A MASK — the `MaskNode *` that `isMaskEquivalentToNode` takes on both sides
@@ -1302,10 +1368,12 @@ mod unit_tests {
             let n1_m1 = base.push_named_child(n1_l4, OpId::at(&[2, 3, 3, 3, 12]), dynamic_mask());
             // ⭐ ITS MAC IS INSIDE `%arg5` (`:261`) WHILE ITS PARENT NODE IS `%arg4` — the mask is
             // driven by `%14`, which `%arg4` owns.
-            let n1_m2 = base.push_named_child(n1_l4, OpId::at(&[2, 3, 3, 3, 14, 5]), dynamic_mask());
+            let n1_m2 =
+                base.push_named_child(n1_l4, OpId::at(&[2, 3, 3, 3, 14, 5]), dynamic_mask());
             // ⭐ `#set2 = affine_set<(d0) : (d0 - 48 >= 0, -d0 + 63 >= 0)>` over `vector<64xf16>`:
             // `(64 - 48) / 8 = 2`, the `scalar_constant {value = 2}` the golden's `set_mask` takes.
-            let n2_m_const = base.push_named_child(n2_l5, OpId::at(&[5, 3, 3, 3, 8, 5]), constant_mask(2));
+            let n2_m_const =
+                base.push_named_child(n2_l5, OpId::at(&[5, 3, 3, 3, 8, 5]), constant_mask(2));
             let n2_m_dyn =
                 base.push_named_child(n2_l6, OpId::at(&[5, 3, 3, 3, 8, 9, 5]), dynamic_mask());
 
@@ -1706,9 +1774,9 @@ mod unit_tests {
         let v = Vendor::build();
 
         for path in [
-            &[2, 3, 3, 3, 13][..], // the `vector.store` after the mac
-            &[2, 3, 3, 3, 8][..],  // a `dataflow.receive`
-            &[0][..],              // the `arith.subi` that computes a loop bound
+            &[2, 3, 3, 3, 13][..],    // the `vector.store` after the mac
+            &[2, 3, 3, 3, 8][..],     // a `dataflow.receive`
+            &[0][..],                 // the `arith.subi` that computes a loop bound
             &[2, 3, 3, 3, 14, 4][..], // the `create_affine_mask`, not the mac
         ] {
             assert_eq!(
@@ -1832,10 +1900,7 @@ mod unit_tests {
         // ⭐ THREE LOOPS EMIT MASK OPS, and `n1_l4` is the one that emits for two masks at once — the
         // pair the vendor output collapses into a single `set_mask`/`incrmask` trio
         // (`dynamic_pt_masking.mlir:38`, `:53`, `:56`).
-        assert_eq!(
-            masked_loops,
-            vec![(v.n1_l4, 2), (v.n2_l5, 1), (v.n2_l6, 1)]
-        );
+        assert_eq!(masked_loops, vec![(v.n1_l4, 2), (v.n2_l5, 1), (v.n2_l6, 1)]);
     }
 
     /// 🎯 077 — THE ACTION'S RETURN IS DISCARDED, SO A BFS CANNOT BE STOPPED EARLY.
@@ -2068,13 +2133,84 @@ mod unit_tests {
             "the witness keeps the identity it was minted from"
         );
     }
-}
 
+    /// 🎯 236 — THE VENDOR'S OWN FIRST MASK, ADDED BY THE UNIT INSTEAD OF BY HAND.
+    ///
+    /// `updateLoopMaskTreeForDynamicMask` reaches `addMaskNode(parent_op, *mac_op, 0, 1)` for the mac
+    /// at `dynamic_pt_masking.mlir:253`, whose driving `%arg4` is `n1_l4`; the `None` arm is the same
+    /// call's `parent_loop ? … : nullptr` with no enclosing loop.
+    #[test]
+    fn a_mask_node_is_attached_under_the_loop_that_drives_it_or_under_the_root() {
+        let mut base = OperationTreeBase::with_root(LoopMaskNode::SyntheticRoot);
+        let root = base.root();
+        let l4 = base.push_named_child(root, OpId::at(&[2, 3, 3, 3]), loop_node());
+        let mut tree = LoopMaskTree { base };
+
+        let mac = OpId::at(&[2, 3, 3, 3, 12]);
+        let added = tree
+            .add_mask_node(
+                Some(&OpId::at(&[2, 3, 3, 3])),
+                mac.clone(),
+                MaskNode {
+                    start_val: MaskedColumns(0),
+                    increment: MaskIncrement::PerParentLoopIteration,
+                },
+            )
+            .expect("the tree holds a loop node for `%arg4`");
+        assert_eq!(tree.parent_node(added.node()), Some(LoopMaskNodeId(l4)));
+        assert_eq!(tree.operation(added.node()), Some(&mac));
+        assert_eq!(tree.mask_node(added.node()), Some(added));
+        assert_eq!(tree.find_node_from_op(&mac), Some(added.node()));
+
+        // `} else { LoopMaskNode *n = getRoot(); … }`
+        let unenclosed = tree
+            .add_mask_node(None, OpId::at(&[3]), constant_mask_of(2))
+            .expect("the root arm cannot fail");
+        assert_eq!(tree.parent_node(unenclosed.node()), Some(tree.root()));
+
+        // ⛔ *"could not locate loop_op in tree"* and *"expecting a sentient::ForOp"*: an op the tree
+        // does not name, and one it names with a MASK node.
+        assert_eq!(
+            tree.add_mask_node(Some(&OpId::at(&[9])), OpId::at(&[4]), constant_mask_of(2)),
+            None
+        );
+        assert_eq!(
+            tree.add_mask_node(Some(&mac), OpId::at(&[4]), constant_mask_of(2)),
+            None
+        );
+    }
+
+    /// 🎯 237 — A REWRITTEN COMPUTE KEEPS ITS MASK NODE, AND ITS OLD NAME STOPS ANSWERING.
+    ///
+    /// The reference states both halves as map surgery (`LoopMaskTree.cpp:161-163`); with one source
+    /// of truth they are one write.
+    #[test]
+    fn updating_a_node_moves_the_name_and_leaves_the_mask_where_it_hangs() {
+        let v = Vendor::build();
+        let mut tree = v.tree;
+        let from = OpId::at(&[2, 3, 3, 3, 12]);
+        let to = OpId::at(&[2, 3, 3, 3, 13]);
+
+        assert_eq!(tree.update_node(&from, to.clone()), Some(v.n1_m1));
+        assert_eq!(tree.find_node_from_op(&to), Some(v.n1_m1));
+        assert_eq!(tree.find_node_from_op(&from), None);
+        assert_eq!(tree.parent_node(v.n1_m1), Some(v.n1_l4));
+
+        // *"could not find from op in LoopMaskTree"*.
+        assert_eq!(tree.update_node(&from, to), None);
+    }
+
+    /// [`constant_mask`] as a [`MaskNode`] — the payload without its enum wrapper.
+    fn constant_mask_of(columns: u32) -> MaskNode {
+        MaskNode {
+            start_val: MaskedColumns(columns),
+            increment: MaskIncrement::Constant,
+        }
+    }
+}
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e236_addMaskNode
-// crustify:todo: e237_updateNode
 // crustify:todo: e238_computeLoops
 // crustify:todo: e281_OperationTreeBase

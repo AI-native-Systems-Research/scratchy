@@ -596,7 +596,7 @@ fn view_from_unit(view: Val, scope: &[DfirOp]) -> Option<Val> {
 ///
 /// ⚠️ `getUnitType` ALSO DEREFERENCES AN END ITERATOR for a name outside
 /// `stringToSenComponents`: `find(op.getName().lower())` is read as `record->second` with no check
-/// (`DccExtContext.cpp:133-138`). A [`dataflow::LocalUnit`] is a closed set of six, so this port has
+/// (`DccExtContext.cpp:133-138`). A [`dataflow::LocalUnit`] is a closed set, so this port has
 /// no unspellable name to reach it with.
 fn unit_is_lrf(unit: Val, scope: &[DfirOp]) -> bool {
     match defining_op(unit, scope) {
@@ -604,9 +604,10 @@ fn unit_is_lrf(unit: Val, scope: &[DfirOp]) -> bool {
             dataflow::LocalUnit::PeLrf
             | dataflow::LocalUnit::SfpLrf
             | dataflow::LocalUnit::PtLrf => true,
-            // `PTXRF`, `PTARF` and `L0SCALE` are each their own generic component.
+            // `PTXRF`, `PTIRF`, `PTARF` and `L0SCALE` are each their own generic component.
             dataflow::LocalUnit::PtXrf
             | dataflow::LocalUnit::PtArf
+            | dataflow::LocalUnit::PtIrf
             | dataflow::LocalUnit::L0Scale => false,
         },
         // A `get_unit` cannot name a register file; anything else is the `llvm_unreachable`.
@@ -1719,7 +1720,8 @@ mod unit_tests {
             dataflow::LocalUnit::SfpLrf => DfirUnit::Sfp,
             dataflow::LocalUnit::PtLrf
             | dataflow::LocalUnit::PtXrf
-            | dataflow::LocalUnit::PtArf => {
+            | dataflow::LocalUnit::PtArf
+            | dataflow::LocalUnit::PtIrf => {
                 DfirUnit::PtRow(Row::checked(0).expect("every arch's PT has a row 0"))
             }
             dataflow::LocalUnit::L0Scale => DfirUnit::L0,

@@ -44,6 +44,9 @@ pub enum LocalUnit {
     PtXrf,
     /// `ptarf` — the PT's accumulator register file.
     PtArf,
+    /// `ptirf` — the PT's INPUT register file, where an int8 matmul's activations land
+    /// (`dcc/test/PT/int8-genkg3-pt.mlir:123`).
+    PtIrf,
     /// `l0scale` — the L0's scale region.
     ///
     /// ⛔ A LOCAL UNIT OF A PT ROW, AND ONLY FROM SEN1P5. Each PT row's arm ends with
@@ -68,6 +71,7 @@ impl LocalUnit {
             Self::PtLrf => "pt_lrfreg",
             Self::PtXrf => "ptxrf",
             Self::PtArf => "ptarf",
+            Self::PtIrf => "ptirf",
             Self::L0Scale => "l0scale",
         }
     }

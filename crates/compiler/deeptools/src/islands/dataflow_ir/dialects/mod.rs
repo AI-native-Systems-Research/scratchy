@@ -122,6 +122,8 @@ pub fn operands(op: &Op) -> Vec<Val> {
             | arith::Op::RemSI(bin) => {
                 reads.extend([bin.lhs, bin.rhs]);
             }
+            // ⭐ ONE OPERAND — a conversion reads the vector it retypes. See [`arith::Convert`].
+            arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => reads.push(conv.input),
             // ⭐ ALL THREE, AND THE CONDITION FIRST — `arith.select`'s operand order is
             // `$condition, $true_value, $false_value`.
             arith::Op::Select {
@@ -406,6 +408,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             | arith::Op::MulI(bin)
             | arith::Op::DivSI(bin)
             | arith::Op::RemSI(bin) => vec![bin.result],
+            arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => vec![conv.result],
         },
         // ⛔ A `symbol.create_symbol` BINDS ITS EXTENT, and entry 091 reads it: the backward walk from
         // a lowered loop's bound ends at either an `arith.constant` or this op
@@ -548,6 +551,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | arith::Op::RemSI(bin) => {
                 places.extend([&mut bin.lhs, &mut bin.rhs]);
             }
+            arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => places.push(&mut conv.input),
             arith::Op::Compare { lhs, rhs, .. } => places.extend([lhs, rhs]),
             arith::Op::Select {
                 condition,
@@ -774,6 +778,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | arith::Op::RemSI(bin) => {
                 vec![&mut bin.result]
             }
+            arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => vec![&mut conv.result],
         },
         Op::Symbol(symbol::Op::CreateSymbol { result, .. }) => vec![result],
         Op::Vector(vector::Op::Load { result, .. }) => vec![result],
@@ -1191,6 +1196,10 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             | arith::Op::RemSI(bin) => {
                 operands.extend([&mut bin.lhs, &mut bin.rhs]);
                 results.push(&mut bin.result);
+            }
+            arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => {
+                operands.push(&mut conv.input);
+                results.push(&mut conv.result);
             }
             arith::Op::Compare {
                 result, lhs, rhs, ..
@@ -1735,6 +1744,10 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, &mut bin.lhs));
                 vals.push((Role::Operand, &mut bin.rhs));
                 vals.push((Role::Result, &mut bin.result));
+            }
+            arith::Op::SiToFp(conv) | arith::Op::FpToSi(conv) => {
+                vals.push((Role::Operand, &mut conv.input));
+                vals.push((Role::Result, &mut conv.result));
             }
             arith::Op::Compare {
                 result, lhs, rhs, ..

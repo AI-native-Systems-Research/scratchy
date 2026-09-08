@@ -130,6 +130,23 @@ pub struct IntBinary {
     pub ty: ScalarTy,
 }
 
+/// ONE VECTOR CONVERSION — `arith.sitofp` or `arith.fptosi`, which change the element type and
+/// nothing else.
+///
+/// ⛔ BOTH TYPES ARE FIELDS BECAUSE THE OP PRINTS BOTH:
+/// `%13 = arith.sitofp %12 : vector<64xi16> to vector<64xf16>` (`dcc/test/PE/test1.mlir:66`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Convert {
+    /// The value it binds.
+    pub result: Val,
+    /// What is converted.
+    pub input: Val,
+    /// `$in`'s type.
+    pub from: Vector,
+    /// `$out`'s type.
+    pub to: Vector,
+}
+
 /// ONE `arith` OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -210,6 +227,19 @@ pub enum Op {
     /// ⭐ SIGNED, LIKE [`Op::DivSI`], for the same reason: every quantity these maps compute is an
     /// `index`, which MLIR treats as signed.
     RemSI(IntBinary),
+
+    /// `arith.sitofp %12 : vector<64xi16> to vector<64xf16>` — the INT8 MACC's result rejoining the
+    /// float chain (`dcc/test/PE/int8-kg3-pe.mlir:98`).
+    ///
+    /// ⛔⛔ IN THE ISLAND BECAUSE `eraseOperands` (entry 233) WALKS PAST IT. Its `isa<>` list is
+    /// `arith::SIToFPOp, arith::FPToSIOp, vectorchain::CastOp, NegOp, SelectOp`
+    /// (`VectorOperands.cpp:705-707`): an intermediate op with one use is stepped over on the way to
+    /// the compute, and one this island could not name would instead read as a surviving user and
+    /// keep every int8 operand alive.
+    SiToFp(Convert),
+
+    /// `arith.fptosi` — the other direction, the same shape.
+    FpToSi(Convert),
 
     /// `arith.cmpi <predicate>, %lhs, %rhs : index` — one integer comparison.
     ///
@@ -352,6 +382,8 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::MulI(op) => int_binary(out, "arith.muli", op),
         Op::DivSI(op) => int_binary(out, "arith.divsi", op),
         Op::RemSI(op) => int_binary(out, "arith.remsi", op),
+        Op::SiToFp(op) => convert(out, "arith.sitofp", op),
+        Op::FpToSi(op) => convert(out, "arith.fptosi", op),
         Op::Compare {
             result,
             predicate,
@@ -407,13 +439,14 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             // MLIR prints a float splat in scientific form, which is what the vendored IR shows:
             // `arith.constant dense<0.000000e+00> : vector<64xf16>`.
             let literal = match ty.elem {
-                ElemType::Int(_) => splat.to_string(),
+                ElemType::Int(_) | ElemType::MxInt(_) => splat.to_string(),
                 ElemType::F16
                 | ElemType::F32
                 | ElemType::Bf16
                 | ElemType::F8E4M3Fn
                 | ElemType::F8E8M0Fnu
                 | ElemType::F4E2M1Fn
+                | ElemType::F8E5M2
                 | ElemType::MxFloat(_) => float_splat(*splat),
             };
             let _ = writeln!(
@@ -424,6 +457,19 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             );
         }
     }
+}
+
+/// `%r = arith.sitofp %in : <from> to <to>` — ⭐ TWO TYPES JOINED BY `to`, which is the whole
+/// difference from every other op in this file.
+fn convert(out: &mut String, mnemonic: &str, op: &Convert) {
+    let _ = writeln!(
+        out,
+        "{} = {mnemonic} {} : {} to {}",
+        print::val(op.result),
+        print::val(op.input),
+        print::vector(op.from),
+        print::vector(op.to)
+    );
 }
 
 /// A FLOAT SPLAT IN MLIR'S OWN `%e` FORM — one digit, a point, six digits, then a SIGNED TWO-DIGIT

@@ -683,6 +683,7 @@ pub fn get_mask_value_for_pt<A: Arch>(
         let value = values.mint();
         Some(MaskValue::Constant {
             op: sen::Op::Sentient(sentient::Op::ScalarConstant {
+                is_symbol: false,
                 value: i64::from(masked_columns),
                 result: value,
                 reg_locale: sentient::RegType::Imm,
@@ -841,6 +842,7 @@ mod unit_tests {
         assert_eq!(
             op,
             sen::Op::Sentient(sentient::Op::ScalarConstant {
+                is_symbol: false,
                 value: 2,
                 result: value,
                 reg_locale: sentient::RegType::Imm,
