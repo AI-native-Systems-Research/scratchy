@@ -1299,6 +1299,24 @@ impl SyncHalf {
     pub const fn peer(self) -> Consumer {
         self.0
     }
+
+    /// THE PEER A **LOWERED** `dataflow.sync_send`/`sync_recv` NAMES — the destination that op
+    /// already carried, not a new rendezvous.
+    ///
+    /// ⛔⛔ [`rendezvous`] CANNOT EXPRESS IT, AND THAT IS NOT A GAP IN THE PAIRING. It mints from
+    /// [`SyncPeer`], whose four kinds are the ones that terminate a wire — so `lxlu0`, `lxlu1`,
+    /// `lxsu0`, `lxsu1`, `l3lu` and `l3su` are unnameable through it, and those are exactly the
+    /// consumers `lowerL3SyncOperationForAUnit` derives from the destination `get_unit`'s type and
+    /// `corelet` (entries 223/224, via [`crate::bridges::dataflow_ir_to_sentient::dfs_dataflow_to_sentient::extend_unit_name_to_corelet`]).
+    ///
+    /// ⛔ AND "BOTH SIDES OR NEITHER" IS NOT A PROPERTY OF A LOWERED SYNC'S PEER LIST: the vendor's
+    /// own key has an `l3su` unit's sync naming `l3su` among its peers
+    /// (`dcc/test/L3SU/sync-op-l3su.mlir:13`). The pairing is established on the rung below, where
+    /// the `sync_send` and its `sync_recv` are two ops; this is that op's lowering.
+    #[must_use]
+    pub const fn of_lowered_destination(dst: Consumer) -> SyncHalf {
+        SyncHalf(dst)
+    }
 }
 
 /// THE TWO SIDES OF ONE SYNC, ONCE.

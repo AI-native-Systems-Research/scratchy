@@ -662,6 +662,7 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(5),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                wait: dataflow::AsyncTransferWait::Immediately,
             }),
             DfirOp::Dataflow(dataflow::Op::SyncRecv {
                 from: Val(4),
@@ -998,6 +999,7 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(470),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                wait: dataflow::AsyncTransferWait::Immediately,
             }),
             recv.clone(),
         ];

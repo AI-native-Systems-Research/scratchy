@@ -655,6 +655,7 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(first),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                wait: dataflow::AsyncTransferWait::Immediately,
             }),
             DfirOp::Dataflow(dataflow::Op::SyncRecv {
                 from: Val(first),
@@ -846,6 +847,7 @@ mod unit_tests {
         let not_a_unit = DfirOp::Dataflow(dataflow::Op::SyncSend {
             to: Val(0),
             signal: SyncSignal::InputToLxsuToLxluToSync,
+            wait: dataflow::AsyncTransferWait::Immediately,
         });
 
         assert!(

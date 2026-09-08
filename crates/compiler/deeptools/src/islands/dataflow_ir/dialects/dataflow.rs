@@ -360,6 +360,31 @@ pub struct PagedMemView {
     pub ty: MemRef,
 }
 
+/// WHETHER A SIGNALLING UNIT DRAINS ITS ASYNCHRONOUS TRANSFERS FIRST —
+/// `wait_immediately_for_async_transfers` (`Dataflow.td:191-200`).
+///
+/// ⛔⛔ THE `.td` DECLARES IT `OptionalAttr<BoolAttr>` AND EVERY LOWERING OF A SEND DEMANDS IT.
+/// `lowerL3SyncOperationForAUnit` and `lowerL3SyncOperationForAGroupOfUnits` both open with
+/// *"Unknown async transfers modes for sentient"* on a send that has none
+/// (`DataflowToSentient.cpp:385-388`, `:677-680`), and the flag then decides the emitted sync's
+/// `soft`. Making it mandatory is what makes that refusal unreachable — and it costs nothing:
+/// all 292 `dataflow.sync_send` ops under `dcc/test` carry the attribute and none omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AsyncTransferWait {
+    /// `= true` — wait for outstanding transfers before signalling. A HARD sync when lowered.
+    Immediately,
+    /// `= false` — signal without draining. A SOFT sync when lowered.
+    Deferred,
+}
+
+impl AsyncTransferWait {
+    /// The attribute's literal.
+    #[must_use]
+    pub const fn flag(self) -> bool {
+        matches!(self, AsyncTransferWait::Immediately)
+    }
+}
+
 /// ONE `dataflow` OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -506,6 +531,9 @@ pub enum Op {
         to: Val,
         /// Which signal, for the debug name.
         signal: SyncSignal,
+        /// `wait_immediately_for_async_transfers` — ⛔ MANDATORY HERE, `OptionalAttr<BoolAttr>` in
+        /// the `.td`. See [`AsyncTransferWait`].
+        wait: AsyncTransferWait,
     },
 
     /// `dataflow.sync_recv %unit : index` — blocking.
@@ -739,26 +767,18 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::vector(*ty)
             );
         }
-        Op::SyncSend { to, signal } => {
+        Op::SyncSend { to, signal, wait } => {
             let _ = writeln!(
                 out,
-                // ⛔⛔ THE WAIT MODE IS OPTIONAL IN THE DIALECT AND MANDATORY TO LOWER.
-                // `Dataflow.td:200` declares it `OptionalAttr<BoolAttr>`, but
-                // `DataflowToSentient.cpp:219-222` fails outright when a send has none: "Unknown
-                // async transfers modes for sentient".
-                //
-                // ⭐ `true` IS THE ONLY SAFE ANSWER HERE, and it is what the scheduler writes for
-                // every send in its own output. It "controls whether the sender waits for
-                // outstanding asynchronous transfers before signalling" (`:191-192`) — and a
-                // `ddl.sync` exists to say the data has ARRIVED, so a signal that does not wait can
-                // be observed before the transfer it is announcing lands. `false` is an
-                // optimisation that needs something else to order the transfers, and no vendored
-                // template states one: `ddl.sync` carries `units`, `signal_name` and `receive`, and
-                // nothing about async waits.
+                // ⛔⛔ THE WAIT MODE IS OPTIONAL IN THE DIALECT AND MANDATORY TO LOWER, so it is a
+                // FIELD and no longer a literal here — see [`AsyncTransferWait`]. It was hard-coded
+                // `true` while nothing read it; entry 223 does, and a send whose flag the printer
+                // invents would lower to a sync whose `soft` nobody chose.
                 "dataflow.sync_send {} {{dbgName = \"{}\", \
-                 wait_immediately_for_async_transfers = true}} : index",
+                 wait_immediately_for_async_transfers = {}}} : index",
                 print::val(*to),
-                signal.spelling()
+                signal.spelling(),
+                wait.flag()
             );
         }
         Op::SyncRecv { from, signal } => {

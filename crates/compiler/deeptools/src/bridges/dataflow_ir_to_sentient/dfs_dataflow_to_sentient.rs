@@ -78,7 +78,8 @@
 //! | `e337_lowerSyncOperation` | 337/384 | 80 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901` |
 //! | `e361_runOnOperation` | 361/384 | 33 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` |
 
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow, defining_op};
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow, defining_op, uniform};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::{Corelet, DfirUnit, Residency};
@@ -587,6 +588,7 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(3),
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
+                wait: dataflow::AsyncTransferWait::Immediately,
             }),
         ];
         assert!(!is_same_list_of_units(&keys, &[Val(3), Val(4)]));
@@ -1077,6 +1079,118 @@ mod unit_tests {
             vec![(Val(7), Val(51)), (Val(8), Val(50)), (Val(9), Val(51))]
         );
     }
+
+    /// 🎯 222/384 — TWO REGIONS, TWO DISTINCT `index` ARGUMENTS, AND A YIELD IN EACH.
+    ///
+    /// ⛔ THE ARGUMENTS MUST DIFFER: `getRegionArg(i)` is `getRegion(i).getArgument(0)`, so a shared
+    /// value would make entry 182's per-region remapping read the wrong region's unit.
+    #[test]
+    fn the_two_uniform_regions_split_the_units_and_bind_one_argument_each() {
+        let mut values = Values::default();
+        let op = create_uniform_regions_with_two_regions_no_result(
+            &[Val(0), Val(1)],
+            &[Val(2)],
+            &mut values,
+        );
+        let uniform::Op::UniformizeRegions { regions, results } = &op else {
+            panic!("entry 222 builds a uniformize_regions: {op:?}");
+        };
+        assert!(results.is_empty(), "created with mlir::TypeRange()");
+        assert_eq!(regions.len(), 2);
+        assert_ne!(regions[0].arg, regions[1].arg);
+        assert_eq!(regions[0].units, vec![Val(0), Val(1)]);
+        assert_eq!(regions[1].units, vec![Val(2)]);
+        for region in regions {
+            assert_eq!(
+                region.body,
+                vec![DfirOp::Uniform(uniform::Op::Yield {
+                    operands: Vec::new()
+                })]
+            );
+        }
+    }
+
+    /// 🎯 223/384 — `sentient.sync {.., mode = send, soft = false, units = [lxlu0]}`.
+    ///
+    /// The vendor's own line: `dcc/test/L3SU/sync-op-l3su.mlir:24`, an L3SU send naming one extended
+    /// LX load unit.
+    #[test]
+    fn an_l3_sync_for_one_unit_names_the_extended_destination() {
+        let op = L3Half::Store.lower_l3_sync_operation_for_a_unit(
+            SyncToLower::Send(dataflow::AsyncTransferWait::Immediately),
+            L3SyncDst::Lx(LxHalf::Load, corelet0()),
+            None,
+        );
+        let sen::Op::Sync {
+            mode,
+            peers,
+            soft,
+            implicit_sync_memory_boundary,
+            dbg_name,
+        } = op
+        else {
+            unreachable!("just built one")
+        };
+        assert_eq!(mode, sen::SyncMode::Send);
+        assert_eq!(
+            peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
+            vec![sen::Consumer::Lxlu0]
+        );
+        assert!(!soft, "`wait_immediately_for_async_transfers = true`");
+        assert_eq!(
+            implicit_sync_memory_boundary, None,
+            "`getSI32IntegerAttr(-1)`"
+        );
+        assert_eq!(dbg_name, None);
+    }
+
+    /// 🎯 224/384 — the six-unit group of `sync-op-l3su.mlir:14`, soft, and deduplicated.
+    ///
+    /// ⛔ ORDER IS FIRST OCCURRENCE, NOT SORTED: the key prints
+    /// `[lxlu0, lxlu1, lxsu0, lxsu1, l3lu, l3su]`, which is the group's own order.
+    #[test]
+    fn an_l3_sync_for_a_group_dedups_in_first_occurrence_order() {
+        let op = L3Half::Store.lower_l3_sync_operation_for_a_group_of_units(
+            SyncToLower::Send(dataflow::AsyncTransferWait::Deferred),
+            &[
+                L3SyncDst::Lx(LxHalf::Load, corelet0()),
+                L3SyncDst::Lx(LxHalf::Load, corelet1()),
+                L3SyncDst::Lx(LxHalf::Store, corelet0()),
+                L3SyncDst::Lx(LxHalf::Store, corelet1()),
+                L3SyncDst::L3lu,
+                L3SyncDst::L3su,
+                L3SyncDst::Lx(LxHalf::Load, corelet0()),
+            ],
+            None,
+        );
+        let sen::Op::Sync {
+            mode, peers, soft, ..
+        } = op
+        else {
+            unreachable!("just built one")
+        };
+        assert_eq!(mode, sen::SyncMode::Send);
+        assert!(soft, "`wait_immediately_for_async_transfers = false`");
+        assert_eq!(
+            peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
+            vec![
+                sen::Consumer::Lxlu0,
+                sen::Consumer::Lxlu1,
+                sen::Consumer::Lxsu0,
+                sen::Consumer::Lxsu1,
+                sen::Consumer::L3lu,
+                sen::Consumer::L3su,
+            ]
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1451,13 +1565,178 @@ const fn is_corelet_0_attribute(residency: Residency) -> bool {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 222/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e222_createUniformRegionsWithTwoRegionsNoResult
+///
+/// **222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:152` (22L).
+///
+/// A result-less `uniform.uniformize_regions` with two regions, each binding one `index` argument
+/// (`emplaceBlock()` + `addArgument`) and holding a bare `uniform.yield`. The returned op IS the pair
+/// of `OpBuilder`s: *"insert into region i"* is a push onto `regions[i].body` before that yield.
+/// ⛔ TWO SLICES, NOT `units` + `list_sizes` — the op's three prefix-sum `assert`s
+/// (`Uniform.cpp:125-136`) are unwritable once the split is the argument.
+#[must_use]
+pub fn create_uniform_regions_with_two_regions_no_result(
+    region0_units: &[Val],
+    region1_units: &[Val],
+    values: &mut Values,
+) -> uniform::Op {
+    let mut region = |units: &[Val]| uniform::LocalRegion {
+        arg: values.mint(),
+        units: units.to_vec(),
+        body: vec![DfirOp::Uniform(uniform::Op::Yield {
+            operands: Vec::new(),
+        })],
+    };
+    uniform::Op::UniformizeRegions {
+        regions: vec![region(region0_units), region(region1_units)],
+        // `mlir::TypeRange()`.
+        results: Vec::new(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 223/384 + 224/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH HALF OF THE L3 A SYNC LEAVES FROM — the source guard of both L3 sync lowerings, as a type.
+///
+/// ⛔ `gen_comp == L3LU || gen_comp == L3SU` (`DataflowToSentient.cpp:394` and `:688`) is the ONLY
+/// thing either function reads the source unit for; every other component leaves through
+/// `emitError("Unknown lowering of the sync operation")`. Carried as the RECEIVER of the two
+/// lowerings because an unused `self` is silent where an unused named parameter is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum L3Half {
+    /// `l3lu` — `SenComponents::L3LU`.
+    Load,
+    /// `l3su` — `SenComponents::L3SU`.
+    Store,
+}
+
+/// WHICH `dataflow` SYNC IS BEING LOWERED — `DT_CHECK(send_op || recv_op)` as a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncToLower {
+    /// `dataflow.sync_send`, carrying its `$wait_immediately_for_async_transfers`.
+    ///
+    /// ⛔ THE ATTRIBUTE'S ABSENCE IS THE OTHER REFUSAL (`:385-388`, `:677-680`). It is a mandatory
+    /// field of [`dataflow::Op::SyncSend`], so `!has_value()` has no input here.
+    Send(dataflow::AsyncTransferWait),
+    /// `dataflow.sync_recv` — never soft, and `wait_immediately_for_async_transfers` is not its
+    /// attribute.
+    Recv,
+}
+
+impl SyncToLower {
+    /// `sync_tag` — `send`, and `recv` only for a `sync_recv`.
+    #[must_use]
+    pub const fn mode(self) -> sen::SyncMode {
+        match self {
+            Self::Send(_) => sen::SyncMode::Send,
+            Self::Recv => sen::SyncMode::Recv,
+        }
+    }
+
+    /// `soft = send_op && !send_op.getWaitImmediatelyForAsyncTransfers().value()`.
+    #[must_use]
+    pub const fn soft(self) -> bool {
+        matches!(self, Self::Send(dataflow::AsyncTransferWait::Deferred))
+    }
+}
+
+/// A DESTINATION AN L3 SYNC MAY NAME — the eight accepted components, with `LXLU`/`LXSU` already
+/// carrying the corelet that extends them.
+///
+/// ⛔ EIGHT COMPONENTS, THREE CASES. `is_any_of(dst_comp, L3LU, L3SU, LXLU, LXSU, LXLU0, LXSU0,
+/// LXLU1, LXSU1)` (`:398-401`, negated at `:698-704`) is the whole accepted set, and `LXLU0` is
+/// exactly `Lx(Load, corelet 0)` once [`extend_unit_name_to_corelet`] has run — so the two spellings
+/// collapse, and both `emitError("Unknown lowering of the L3 sync …")` arms lose their input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L3SyncDst {
+    /// `l3lu`.
+    L3lu,
+    /// `l3su`.
+    L3su,
+    /// `lxlu`/`lxsu`, with the corelet whose number is appended to the name.
+    Lx(LxHalf, Corelet),
+}
+
+impl L3SyncDst {
+    /// `symbolizeSentientLoadConsumer(dst_unit_name).value()`.
+    #[must_use]
+    pub const fn consumer(self) -> sen::Consumer {
+        match self {
+            Self::L3lu => sen::Consumer::L3lu,
+            Self::L3su => sen::Consumer::L3su,
+            Self::Lx(half, corelet) => extend_unit_name_to_corelet(half, corelet),
+        }
+    }
+}
+
+impl L3Half {
+    /// Replaces: e223_lowerL3SyncOperationForAUnit
+    ///
+    /// **223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375` (60L).
+    ///
+    /// One `sentient.sync` naming one destination.
+    ///
+    /// ⛔ `implicit_sync_memory_boundary: None` IS `builder.getSI32IntegerAttr(-1)`, which the
+    /// vendor's key prints on every one of these (`dcc/test/L3SU/sync-op-l3su.mlir:24`).
+    #[must_use]
+    pub fn lower_l3_sync_operation_for_a_unit(
+        self,
+        op: SyncToLower,
+        dst: L3SyncDst,
+        dbg_name: Option<String>,
+    ) -> sen::Op {
+        sen::Op::Sync {
+            mode: op.mode(),
+            peers: vec![sen::SyncHalf::of_lowered_destination(dst.consumer())],
+            soft: op.soft(),
+            implicit_sync_memory_boundary: None,
+            dbg_name,
+        }
+    }
+
+    /// Replaces: e224_lowerL3SyncOperationForAGroupOfUnits
+    ///
+    /// **224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:666` (65L).
+    ///
+    /// The same op over a whole `dataflow.create_group`, deduplicated in first-occurrence order
+    /// (`std::find(..) == end()`, `:718-721`).
+    ///
+    /// ⛔ THE REFERENCE'S `break` ON A BAD DESTINATION STILL EMITS THE SYNC, silently dropping every
+    /// remaining unit of the group; [`L3SyncDst`] makes that input unrepresentable instead.
+    #[must_use]
+    pub fn lower_l3_sync_operation_for_a_group_of_units(
+        self,
+        op: SyncToLower,
+        dst_unit_group: &[L3SyncDst],
+        dbg_name: Option<String>,
+    ) -> sen::Op {
+        let mut peers: Vec<sen::SyncHalf> = Vec::new();
+        for dst in dst_unit_group {
+            let peer = sen::SyncHalf::of_lowered_destination(dst.consumer());
+            if !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+        sen::Op::Sync {
+            mode: op.mode(),
+            peers,
+            soft: op.soft(),
+            implicit_sync_memory_boundary: None,
+            dbg_name,
+        }
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
 // crustify:todo: e221_pushBackTheUnitToListIfDoesnotExist
-// crustify:todo: e222_createUniformRegionsWithTwoRegionsNoResult
-// crustify:todo: e223_lowerL3SyncOperationForAUnit
-// crustify:todo: e224_lowerL3SyncOperationForAGroupOfUnits
 // crustify:todo: e273_lowerL0LXSyncOperationForAUnit
 // crustify:todo: e274_lowerL0LXSyncOperationForAGroupOfUnits
 // crustify:todo: e300_lowerSyncForAUnit

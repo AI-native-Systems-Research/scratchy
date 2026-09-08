@@ -711,6 +711,9 @@ fn nest<
             step_body.push(Op::Dataflow(dataflow::Op::SyncSend {
                 to: mover,
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
+                // The step reads the slice it just asked for, so the transfer must have drained —
+                // the flag the printer used to hard-code.
+                wait: dataflow::AsyncTransferWait::Immediately,
             }));
             step_body.push(Op::Dataflow(dataflow::Op::SyncRecv {
                 from: mover,

@@ -141,8 +141,8 @@ pub struct OperandTag {
 /// `VectorOperand`'s `op_`), so its result [`Val`] identifies it exactly and this crate has no
 /// address to key on.
 ///
-/// ⛔ THE CLASS DECLARATION IS ENTRY 227'S, and [`Default`] stands in for the constructor's
-/// `data_origins_.clear()` (`OperandReuse.hpp:26-28`) until that unit lands.
+/// ⛔ [`Default`] IS THE CONSTRUCTOR'S `data_origins_.clear()` (`OperandReuse.hpp:26-28`); the
+/// DESTRUCTOR at `:30` is entry 227, below.
 ///
 /// ⭐ AND `dominance_info_` DOES NOT COME WITH IT. The reference builds a `mlir::DominanceInfo` from
 /// the `dataflow.program_unit` it is constructed with, and that member exists to cache the region
@@ -156,6 +156,16 @@ pub struct OperandReuse {
 }
 
 impl OperandReuse {
+    /// `int getTotalDataOriginsCount() { return data_origins_.size(); }` — `OperandReuse.hpp:33`.
+    ///
+    /// ⚠️ NOT A SCHEDULED UNIT and needed by one: entry 228 starts its fresh data ids at this count.
+    #[must_use]
+    pub fn total_data_origins_count(&self) -> u32 {
+        // `data_origins_.size()` — a count of table entries, which is what the ids are minted from
+        // ([`DataOriginId`]).
+        u32::try_from(self.data_origins.len()).unwrap_or(u32::MAX)
+    }
+
     /// Replaces: e055_getId
     ///
     /// **055/384** `OperandReuse::getId` —
@@ -749,10 +759,51 @@ mod unit_tests {
         assert!(reuse.insert_if_not_exists(Val(9)));
         assert_eq!(reuse.id(Val(9)), DataId::Assigned(DataOriginId(1)));
     }
+
+    /// 🎯 227/384 — THERE IS A TABLE TO RELEASE, AND DESTROYING ONE RUNS CODE.
+    ///
+    /// The runtime half of the guard beside [`Drop for OperandReuse`](OperandReuse#impl-Drop): a
+    /// table promoted to a `&'static` or to a `Copy` map would leave `needs_drop` `false` and take
+    /// the const guard with it.
+    #[test]
+    fn the_table_is_released_with_its_object() {
+        let reuse = table(&[(
+            Val(4),
+            OperandTag {
+                id: DataId::Assigned(DataOriginId(0)),
+                absorbed: false,
+            },
+        )]);
+        assert_eq!(reuse.total_data_origins_count(), 1);
+        drop(reuse);
+
+        assert!(core::mem::needs_drop::<OperandReuse>());
+    }
 }
+
+/// Replaces: e227_OperandReuse
+///
+/// **227/384** `OperandReuse::~OperandReuse` — `OperandReuse.hpp:30` (0L): `data_origins_.clear();`.
+///
+/// ⭐⭐ THE TABLE DIES WITH THE OBJECT, AND THAT IS THE FACT. One `OperandReuse` is constructed per
+/// lowering of one `dataflow.program_unit` (`VectorChainToSentientPT.cpp:1006`), so a table that
+/// outlived it would carry the previous unit's data origins into the next unit's numbering. Writing
+/// it as a real [`Drop`] rather than leaning on the field's own drop glue is what pins that: a
+/// `static`/shared table would still compile against every method here and silently fail this.
+impl Drop for OperandReuse {
+    fn drop(&mut self) {
+        // `data_origins_.clear();`
+        self.data_origins.clear();
+    }
+}
+
+// ⛔ AND IT MUST STAY ONE. `needs_drop::<OperandReuse>()` is `true` exactly when destroying one runs
+// code, so a table promoted to a `&'static` or to a `Copy` map stops the build here — `expected an
+// array with a size of 1, found one with a size of 0` — rather than carrying one unit's data origins
+// into the next.
+const _: [(); 1] = [(); core::mem::needs_drop::<OperandReuse>() as usize];
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e227_OperandReuse
 // crustify:todo: e276_setReuseInformation

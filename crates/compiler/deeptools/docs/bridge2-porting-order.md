@@ -937,7 +937,7 @@ most likely to get wrong, since every other arch level emits the one survivor.
 
 ## Progress
 
-`209/384 ported; 209/384 audited`
+`217/384 ported; 217/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -1888,6 +1888,71 @@ lowering: they are not among the twelve classes `fuseLoadOrStoreChainOps`'s cand
 could be dropped.
 
 
+⭐ LEVEL 5, ENTRIES 222-229 — THE L3 SYNC LOWERING, THE `scf.for` PATTERN, THE SYMBOL QUERY CHAIN AND
+THE VECTORCHAIN CLOSE-OUT. Eight units in five homes, and three of them needed the islands to grow.
+
+⛔ 223 AND 224 READ AN ATTRIBUTE THE ISLAND WAS INVENTING. Both derive the emitted `sentient.sync`'s
+`soft` from `wait_immediately_for_async_transfers` on the `dataflow.sync_send`
+(`DataflowToSentient.cpp:385-388`, `:677-680`), and `dataflow::Op::SyncSend` had no such field — the
+printer hard-coded `= true`. It is now a mandatory `wait: AsyncTransferWait`, which is what makes
+the reference's `DT_CHECK` on the attribute's presence unreachable rather than a runtime refusal;
+all 292 `dataflow.sync_send` ops under `dcc/test` carry it and none omits it. The SOURCE-component
+guard (`:377-380`, `:669-672`) is the receiver type `L3Half`, so a caller cannot reach either
+lowering from a non-L3 unit, and `L3SyncDst`'s three cases cover all eight accepted destination
+components — which leaves both `emitError("Unknown lowering of the L3 sync ...")` arms and 224's
+`break` with no input. 224 inlines 221's dedup rule (`:143-150`) without claiming that entry's
+anchor: its peer list keeps first-occurrence order, matched against the six-unit soft group at
+`dcc/test/L3SU/sync-op-l3su.mlir:14` and the single-peer hard sync at `:24`.
+`sen::SyncHalf::of_lowered_destination` is the constructor those two need: `rendezvous` mints from
+`SyncPeer`, whose four kinds cannot spell `lxlu0`/`l3su`, and "both sides or neither" is not a
+property of a LOWERED sync's peer list.
+
+⭐ 222 RETURNS THE OP THAT STANDS IN FOR TWO BUILDERS. `uniform.uniformize_regions` with two regions,
+one block argument each, `mlir::TypeRange()` results — and the two unit slices instead of a flat
+`units` plus `list_sizes` is what makes the op's three prefix-sum asserts unwritable. The sentient
+union gained a `Uniform` variant so a lowered program can hold one at all, which forced `raised()`
+(total, `dataflow_ir::dialects::Op` in) and turned `replace_all_uses_with`'s shared-dialect arm from
+a no-op into a real rewrite.
+
+⛔ 225'S INDUCTION VARIABLE IS INVERTED AND THE EXCEPTION LIST IS THE SUBTLETY.
+`SCFToSentient.cpp:130-139` builds `i' = nIterations - i` as the loop's FIRST op and then replaces
+every OTHER use of `i` with `i'`; skipping body index 0 IS that `exception_list`, and a port that
+rewrote the whole body would rewrite the definition into itself. `hasSingleElement` holds because
+one `Vec` is one block, so `emitError("expected scf.forop to have one block")` has no input; the
+LCCR `push_back` stays commented out (`:101-103`) and each result takes one
+`SentientRegTypeAttr(unknown)`. ⛔ AND 047 STILL CANNOT LOWER A MODULE: `match_and_rewrite` returns
+ops of the SENTIENT union, so an earlier note promising 047's parameter would become `&mut` when 225
+landed was wrong and is corrected in place.
+
+⭐ 226 IS A RIGHT-NESTED `sentient.if` CHAIN, and `QueryMapping`'s `{first, middle, last_value}`
+shape is what discharges `DT_CHECK_MSG(key_list.size() >= 2)` (`SymbolToSentient.cpp:134`) and
+encodes `if (rhs_val == last_map_key) break;` (`:153`) — the last pair contributes its VALUE and
+never a comparison. Results are minted before the recursion so the outermost `if` binds the lowest
+values, as the reference's builder order does; the intermediate `else` yields the nested `if`'s
+results (`:167-168`) and the innermost yields `val_list.back()` `num_results` times.
+
+⛔ 227 IS THE DESTRUCTOR, NOT THE CLASS DECLARATION — `data_origins_.clear()` at
+`OperandReuse.hpp:30`, written as a real `Drop` rather than left to the field's drop glue, because
+one `OperandReuse` is constructed per `dataflow.program_unit` lowering
+(`VectorChainToSentientPT.cpp:1006`) and a table that outlived it would carry the previous unit's
+origins into the next unit's numbering. A `static` table would still compile against every method on
+it and silently fail exactly this. The doc note that called 227 the class declaration is corrected.
+`total_data_origins_count` (`:33`) came with it: NOT a scheduled unit, and 228 starts its fresh ids
+at that count.
+
+⛔ 228'S COUNTER IS SHARED ACROSS THE WHOLE UNIT, which is why the walk order is the port. A, B then
+C of one `sentient.vector_mac`, then the next compute's — and an operand that already carries an id
+is left alone (`== -1` is `None` here, through `DataId`, so the sentinel is not restated). The nine
+op kinds the reference refuses with `emitError` + `WalkResult::interrupt()`
+(`VectorChainHelper.cpp:483-533`) are four `todo!` arms naming them: a build failure, not a runtime
+refusal, and none stood in for.
+
+⭐ 229 HANDS BACK THE OP AND THE VALUE, because `builder.setInsertionPoint(op)` is the dropped
+mechanism and the caller now owes the placement. `sentient.scalar_constant {value = 0 : si64} :
+index` for entry 163's all-lanes-live set is the vendor's own expectation
+(`dcc/test/Conversion/VectorChainToSentientPESFP/fnms_with_cast.mlir:11`); the shape mirrors
+`vc_helper::MaskValue::Constant`, the PT side of the same question.
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -2338,22 +2403,22 @@ could be dropped.
 - [ ] **AUDIT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, line by line against the C++
 - [ ] **PORT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, 5 lines
 - [ ] **AUDIT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, line by line against the C++
-- [ ] **PORT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, 18 lines
-- [ ] **AUDIT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, line by line against the C++
-- [ ] **PORT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, 57 lines
-- [ ] **AUDIT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, line by line against the C++
-- [ ] **PORT 224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:667`, 61 lines
-- [ ] **AUDIT 224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:667`, line by line against the C++
-- [ ] **PORT 225/384** `matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72`, 69 lines
-- [ ] **AUDIT 225/384** `matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72`, line by line against the C++
-- [ ] **PORT 226/384** `createIfOpFromMapping` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:123`, 61 lines
-- [ ] **AUDIT 226/384** `createIfOpFromMapping` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:123`, line by line against the C++
-- [ ] **PORT 227/384** `OperandReuse` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:30`, 0 lines
-- [ ] **AUDIT 227/384** `OperandReuse` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:30`, line by line against the C++
-- [ ] **PORT 228/384** `validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483`, 49 lines
-- [ ] **AUDIT 228/384** `validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483`, line by line against the C++
-- [ ] **PORT 229/384** `getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114`, 9 lines
-- [ ] **AUDIT 229/384** `getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114`, line by line against the C++
+- [x] **PORT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, 18 lines
+- [x] **AUDIT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, line by line against the C++
+- [x] **PORT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, 57 lines
+- [x] **AUDIT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, line by line against the C++
+- [x] **PORT 224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:667`, 61 lines
+- [x] **AUDIT 224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:667`, line by line against the C++
+- [x] **PORT 225/384** `matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72`, 69 lines
+- [x] **AUDIT 225/384** `matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72`, line by line against the C++
+- [x] **PORT 226/384** `createIfOpFromMapping` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:123`, 61 lines
+- [x] **AUDIT 226/384** `createIfOpFromMapping` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:123`, line by line against the C++
+- [x] **PORT 227/384** `OperandReuse` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:30`, 0 lines
+- [x] **AUDIT 227/384** `OperandReuse` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:30`, line by line against the C++
+- [x] **PORT 228/384** `validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483`, 49 lines
+- [x] **AUDIT 228/384** `validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483`, line by line against the C++
+- [x] **PORT 229/384** `getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114`, 9 lines
+- [x] **AUDIT 229/384** `getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114`, line by line against the C++
 - [ ] **PORT 230/384** `convertStringToType` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:196`, 24 lines
 - [ ] **AUDIT 230/384** `convertStringToType` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:196`, line by line against the C++
 - [ ] **PORT 231/384** `convertTypeToString` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:223`, 22 lines

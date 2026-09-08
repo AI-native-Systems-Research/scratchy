@@ -37,6 +37,8 @@ pub use crate::islands::dataflow_ir::dialects::dataflow;
 pub use crate::islands::dataflow_ir::dialects::scf;
 /// `Symbol.td` — re-exported; a symbolic loop bound survives into this rung. See [`Op::Symbol`].
 pub use crate::islands::dataflow_ir::dialects::symbol;
+/// `Uniform.td` — re-exported; a local region survives this rung. See [`Op::Uniform`].
+pub use crate::islands::dataflow_ir::dialects::uniform;
 /// Upstream `vector` — re-exported; the two plain accesses the vectorchain lowerings read.
 pub use crate::islands::dataflow_ir::dialects::vector;
 /// `VectorChain.td` — re-exported; what `VectorChainToSentientPE_SFP`/`_PT` consume.
@@ -105,6 +107,17 @@ pub enum Op {
     ///
     /// ⭐ RE-EXPORTED, NOT RE-DECLARED, like every other shared dialect here — see the module note.
     Symbol(symbol::Op),
+    /// `Uniform.td` — a local region, still unflattened at this rung.
+    ///
+    /// ⛔⛔ NEITHER OF `SCFToSentient`'S TWO LISTS MENTIONS `uniform`
+    /// (`SCFToSentient.cpp:261-266`), so a `uniform.uniformize_regions` is left exactly where it is
+    /// by that partial conversion — which entry 225 discovered the hard way: it lifts an
+    /// `scf.for`'s whole body onto this rung, and without this arm a loop with a local region in it
+    /// could not be lifted at all.
+    ///
+    /// ⭐ ITS REGIONS STAY `Vec<`[`crate::islands::dataflow_ir::dialects::Op`]`>`, like every other
+    /// shared dialect's — the op is the same op whichever rung holds it.
+    Uniform(uniform::Op),
 }
 
 /// ONE SHARED-DIALECT OP AS ITS LOWER-RUNG SELF — `None` for this rung's own dialect.
@@ -131,6 +144,30 @@ fn lowered(op: &Op) -> Option<crate::islands::dataflow_ir::dialects::Op> {
         Op::Arith(op) => Some(LowerOp::Arith(op.clone())),
         Op::Scf(op) => Some(LowerOp::Scf(op.clone())),
         Op::Symbol(op) => Some(LowerOp::Symbol(op.clone())),
+        Op::Uniform(op) => Some(LowerOp::Uniform(op.clone())),
+    }
+}
+
+/// ONE LOWER-RUNG OP AS A MEMBER OF THIS RUNG — the inverse of `lowered`, and TOTAL.
+///
+/// ⛔⛔ WHAT `inlineRegionBefore` NEEDS. Entry 225 moves an `scf.for`'s body into the
+/// `sentient.for` that replaces it, and that body is a `Vec` of the rung below's ops: without a
+/// total lift, lowering a loop would have to refuse one whose body holds a dialect this island's
+/// union had forgotten. Every one of the lower rung's nine dialects has an arm here, so a tenth is a
+/// build error rather than a refusal at that call site.
+#[must_use]
+pub fn raised(op: crate::islands::dataflow_ir::dialects::Op) -> Op {
+    use crate::islands::dataflow_ir::dialects::Op as LowerOp;
+    match op {
+        LowerOp::Dataflow(op) => Op::Dataflow(op),
+        LowerOp::Agen(op) => Op::Agen(op),
+        LowerOp::VectorChain(op) => Op::VectorChain(op),
+        LowerOp::Affine(op) => Op::Affine(op),
+        LowerOp::Vector(op) => Op::Vector(op),
+        LowerOp::Arith(op) => Op::Arith(op),
+        LowerOp::Scf(op) => Op::Scf(op),
+        LowerOp::Symbol(op) => Op::Symbol(op),
+        LowerOp::Uniform(op) => Op::Uniform(op),
     }
 }
 
@@ -201,12 +238,12 @@ pub fn defining_op(val: Val, scope: &[Op]) -> Option<&Op> {
 /// and then erases the placeholder (`:681-688`). A rewrite that missed one reader would leave that
 /// reader pointing at an op that no longer exists.
 ///
-/// ⛔ SO THE SHARED DIALECTS ARE **CHECKED, NOT SKIPPED**. A rewrite cannot be written through
-/// [`lowered`]'s clone, so instead the DataflowIR island's own total use-walk is asked whether the
-/// value is read anywhere in that op or its regions; a use found there is a shape this rung has not
-/// met and it says so by name. ⭐ THE CHECK IS THE SAME WALK THAT WOULD HAVE DONE THE REWRITE, so it
-/// cannot under-count what a rewrite would have had to touch — which is the failure mode a search
-/// restricted to the ops it expected has.
+/// ⛔ SO THE SHARED DIALECTS ARE **REWRITTEN, NOT SKIPPED**, and they were once a [`todo!`] that
+/// only said so. Entry 225 is the caller that needs them: it re-points every reader of a lowered
+/// loop's induction variable at `arith.subi %bound, %iv`, and the readers inside a lowered loop body
+/// ARE `agen`, `vector`, `arith` and `dataflow` ops — the check would have stopped the build on
+/// every real loop. The rewrite goes through the DataflowIR island's own [`raised`]/[`lowered`] pair
+/// and its total per-op walk, so it cannot reach fewer ops than the check did.
 pub fn replace_all_uses_with(scope: &mut [Op], of: Val, with: Val) {
     for op in scope {
         match op {
@@ -221,13 +258,26 @@ pub fn replace_all_uses_with(scope: &mut [Op], of: Val, with: Val) {
                 }
             }
             other => {
-                if let Some(op) = lowered(other)
-                    && !crate::islands::dataflow_ir::dialects::uses(of, core::slice::from_ref(&op))
-                        .is_empty()
-                {
-                    todo!("replaceAllUsesWith: a lower-rung op reads {of:?}: {op:?}");
+                if let Some(mut lower) = lowered(other) {
+                    replace_all_uses_in_lower(&mut lower, of, with);
+                    *other = raised(lower);
                 }
             }
+        }
+    }
+}
+
+/// [`replace_all_uses_with`] inside one shared-dialect op, regions included.
+fn replace_all_uses_in_lower(
+    op: &mut crate::islands::dataflow_ir::dialects::Op,
+    of: Val,
+    with: Val,
+) {
+    use crate::islands::dataflow_ir::dialects as lower;
+    lower::replace_uses_of_with(op, of, with);
+    for region in lower::regions_mut(op) {
+        for inner in region.iter_mut() {
+            replace_all_uses_in_lower(inner, of, with);
         }
     }
 }

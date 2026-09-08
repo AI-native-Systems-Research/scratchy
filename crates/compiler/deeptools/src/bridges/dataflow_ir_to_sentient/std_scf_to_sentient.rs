@@ -62,10 +62,14 @@
 //! | `e225_matchAndRewrite` | 225/384 | 69 | `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72` |
 
 use crate::arch::Arch;
-use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
-use crate::islands::dataflow_ir::dialects::{self as dfir_dialects, Op as DfirOp, scf};
-use crate::islands::dataflow_ir::{self as dfir};
+use crate::islands::dataflow_ir::dialects::arith::{self, CmpIPredicate, IntBinary};
+use crate::islands::dataflow_ir::dialects::{
+    self as dfir_dialects, Op as DfirOp, Val, affine, scf,
+};
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::sentient::dialects::sentient as sen;
+use crate::islands::sentient::dialects::{Op as SenOp, raised, replace_all_uses_with};
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 045/384
@@ -392,8 +396,10 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
 ///
 /// Every rewrite behind it is unported, so there is nothing to write back: the whole observable effect
 /// is the choice between leaving a module alone and stopping the build. `&mut` would claim a
-/// capability nothing behind it has; the parameter becomes `&mut` in the changeset that lands
-/// entry 225.
+/// capability nothing behind it has. ⚠️ AND ENTRY 225 DOES NOT CHANGE THAT, though an earlier draft of
+/// this comment said it would: [`match_and_rewrite`] returns ops of the SENTIENT union, so a lowered
+/// loop cannot be written back into a `dfir::Program` at all. This becomes `&mut` when the pass's
+/// output type does — not when one of its three patterns lands.
 pub fn run_on_operation<A: Arch>(program: &dfir::Program<A>) {
     // ⭐ THE WHOLE MODULE, PREAMBLE INCLUDED. `getOperation()` is the `ModuleOp`, so the units'
     // declarations are as much in scope as their bodies.
@@ -578,6 +584,7 @@ mod unit_tests {
             legality(&DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(0),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                wait: dataflow::AsyncTransferWait::Immediately,
             })),
             Legality::Unmentioned
         );
@@ -632,6 +639,7 @@ mod unit_tests {
             vec![DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(0),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                wait: dataflow::AsyncTransferWait::Immediately,
             })],
             vec![
                 DfirOp::Arith(arith::Op::Constant {
@@ -763,9 +771,219 @@ mod unit_tests {
             })],
         ));
     }
+
+    /// 🎯 225/384 — TRIP COUNT, THEN THE LOOP, AND THE BODY READS THE INVERTED ITERATOR.
+    ///
+    /// ⛔ THE ADDEND'S `lhs` IS WHAT THIS TEST IS FOR: it went in as `iv` and must come out as the
+    /// `i' = nIterations - i` the region now leads with, while that subtraction keeps reading `iv`.
+    #[test]
+    fn an_scf_for_lowers_to_a_trip_count_and_an_inverted_induction_variable() {
+        let mut values = Values::default();
+        let lo = values.mint();
+        let hi = values.mint();
+        let step = values.mint();
+        let iv = values.mint();
+        let addend = values.mint();
+        let sum = values.mint();
+        let init = values.mint();
+        let arg = values.mint();
+        let result = values.mint();
+        let body = vec![
+            DfirOp::Arith(arith::Op::AddI(IntBinary {
+                result: sum,
+                lhs: iv,
+                rhs: addend,
+                ty: ScalarTy::Index,
+            })),
+            DfirOp::Scf(scf::Op::Yield {
+                operands: vec![sum],
+            }),
+        ];
+
+        let lowered = match_and_rewrite(
+            ScfForLoop {
+                iv,
+                lo,
+                hi,
+                step,
+                carried: &[affine::Carried { init, arg, result }],
+                body: &body,
+                dbg_name: Some("loop"),
+            },
+            &mut values,
+        );
+
+        let range = Val(9);
+        let n_iterations = Val(10);
+        let new_iterator = Val(11);
+        assert_eq!(
+            lowered,
+            vec![
+                SenOp::Arith(arith::Op::SubI(IntBinary {
+                    result: range,
+                    lhs: hi,
+                    rhs: lo,
+                    ty: ScalarTy::Index,
+                })),
+                SenOp::Arith(arith::Op::DivSI(IntBinary {
+                    result: n_iterations,
+                    lhs: range,
+                    rhs: step,
+                    ty: ScalarTy::Index,
+                })),
+                SenOp::Sentient(sen::Op::For {
+                    iv,
+                    bound: n_iterations,
+                    carried: vec![sen::Carried {
+                        init,
+                        arg,
+                        result,
+                        reg: sen::Reg {
+                            locale: sen::RegType::Unknown,
+                            index: None,
+                        },
+                        program_header: false,
+                    }],
+                    dbg_name: Some("loop".to_owned()),
+                    body: vec![
+                        SenOp::Arith(arith::Op::SubI(IntBinary {
+                            result: new_iterator,
+                            lhs: n_iterations,
+                            rhs: iv,
+                            ty: ScalarTy::Index,
+                        })),
+                        SenOp::Arith(arith::Op::AddI(IntBinary {
+                            result: sum,
+                            lhs: new_iterator,
+                            rhs: addend,
+                            ty: ScalarTy::Index,
+                        })),
+                        SenOp::Sentient(sen::Op::Yield { results: vec![sum] }),
+                    ],
+                }),
+            ]
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 225/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE ROOT OP OF [`Pattern::ForOpLowering`], BORROWED — an `scf.for` and nothing else.
+///
+/// ⛔ `llvm::dyn_cast<mlir::scf::ForOp>(op)` (`SCFToSentient.cpp:77`) is used unchecked, because the
+/// pattern's registration under `scf.for` already guarantees the kind. Naming the fields IS that
+/// guarantee: there is no other op to be handed, so nothing here can be null.
+#[derive(Debug, Clone, Copy)]
+pub struct ScfForLoop<'a> {
+    /// `getInductionVar()` — the region's first block argument.
+    pub iv: Val,
+    /// `getLowerBound()`.
+    pub lo: Val,
+    /// `getUpperBound()`.
+    pub hi: Val,
+    /// `getStep()`.
+    pub step: Val,
+    /// `getInitArgs()`, with the region arguments and results they pair with.
+    pub carried: &'a [affine::Carried],
+    /// `getBody()`'s operations, terminator included.
+    pub body: &'a [DfirOp],
+    /// `dataflow::getDbgNameAttr(op)`.
+    pub dbg_name: Option<&'a str>,
+}
+
+/// Replaces: e225_matchAndRewrite
+///
+/// **225/384** `ForOpLowering::matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72` (72L).
+///
+/// `arith.subi` then `arith.divsi` for the trip count, then a `sentient.for` over it holding the
+/// inlined body with its `scf.yield` rewritten to a `sentient.yield`.
+///
+/// ⛔⛔ THE INDUCTION VARIABLE IS INVERTED. The loop counts DOWN in the reference's model: the body's
+/// first op becomes `i' = nIterations - i` and every other use of `i` is redirected to `i'`
+/// (`replaceAllUsesExcept`, with `i'` itself the sole exception). Dropping that reverses every
+/// address a lowered body computes.
+#[must_use]
+pub fn match_and_rewrite(scf_for_loop: ScfForLoop<'_>, values: &mut Values) -> Vec<SenOp> {
+    let range = values.mint();
+    let n_iterations = values.mint();
+    let new_iterator = values.mint();
+
+    // ⭐ `hasSingleElement(getRegion())` HOLDS BY CONSTRUCTION — one `Vec` is one block — so the
+    // `emitError("expected scf.forop to have one block")` arm has no input here.
+    let mut body: Vec<SenOp> = scf_for_loop.body.iter().cloned().map(raised).collect();
+
+    // `replaceOpWithNewOp<sentient::YieldOp>(terminator, terminator->getOperands())`. An absent
+    // terminator is MLIR's implicit one, whose operand list is empty.
+    let results = match body.last() {
+        Some(SenOp::Scf(scf::Op::Yield { operands })) => {
+            let operands = operands.clone();
+            body.pop();
+            operands
+        }
+        _ => Vec::new(),
+    };
+    body.push(SenOp::Sentient(sen::Op::Yield { results }));
+
+    // `setInsertionPointToStart(&loop.getRegion().front())` — `i' = nIterations - i` leads the region.
+    body.insert(
+        0,
+        SenOp::Arith(arith::Op::SubI(IntBinary {
+            result: new_iterator,
+            lhs: n_iterations,
+            rhs: scf_for_loop.iv,
+            ty: ScalarTy::Index,
+        })),
+    );
+    // ⛔ SKIPPING INDEX 0 IS THE `exception_list`, which holds exactly the op just inserted — without
+    // it the subtraction would read its own result.
+    replace_all_uses_with(&mut body[1..], scf_for_loop.iv, new_iterator);
+
+    let carried = scf_for_loop
+        .carried
+        .iter()
+        .map(|carried| sen::Carried {
+            // ⭐ THE SCF LOOP'S OWN THREE VALUES, REUSED: `getInitArgs()` passed straight through,
+            // the region argument surviving `inlineRegionBefore`, and the result kept because
+            // `scf_for_loop->replaceAllUsesWith(loop)` makes the new loop answer for the old one.
+            init: carried.init,
+            arg: carried.arg,
+            result: carried.result,
+            // `regLocales` — one `SentientRegTypeAttr::unknown` per result. ⭐ THE `lccr` PUSH-BACK IS
+            // COMMENTED OUT in the reference (`:101-103`): *"It should be set in the
+            // registerTypeAssignment"*.
+            reg: sen::Reg {
+                locale: sen::RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+        })
+        .collect();
+
+    vec![
+        SenOp::Arith(arith::Op::SubI(IntBinary {
+            result: range,
+            lhs: scf_for_loop.hi,
+            rhs: scf_for_loop.lo,
+            ty: ScalarTy::Index,
+        })),
+        SenOp::Arith(arith::Op::DivSI(IntBinary {
+            result: n_iterations,
+            lhs: range,
+            rhs: scf_for_loop.step,
+            ty: ScalarTy::Index,
+        })),
+        SenOp::Sentient(sen::Op::For {
+            iv: scf_for_loop.iv,
+            bound: n_iterations,
+            carried,
+            dbg_name: scf_for_loop.dbg_name.map(str::to_owned),
+            body,
+        }),
+    ]
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e225_matchAndRewrite

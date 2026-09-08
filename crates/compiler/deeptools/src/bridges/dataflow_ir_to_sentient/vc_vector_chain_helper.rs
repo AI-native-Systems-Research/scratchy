@@ -83,12 +83,13 @@
 //! Original files homed here: `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp`, `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp`
 
 use super::tf_program_units_reduction::HighPreference;
+use super::vc_operand_reuse::{DataId, DataOriginId, OperandReuse};
 use super::vc_vector_operands::VectorOperand;
 use crate::arch::Arch;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
-use crate::islands::dataflow_ir::ty::{BoundType, ElemType, IntegerSet, Vector};
+use crate::islands::dataflow_ir::ty::{BoundType, ElemType, IntegerSet, ScalarTy, Vector};
 use crate::islands::dataflow_ir::{Program as DfirProgram, Values};
 use crate::islands::sentient::ProgramUnit as SentientProgramUnit;
 use crate::islands::sentient::dialects::Op as SenOp;
@@ -1000,7 +1001,8 @@ fn reset_data_ids(ops: &mut [SenOp]) {
             | SenOp::Vector(_)
             | SenOp::Arith(_)
             | SenOp::Scf(_)
-            | SenOp::Symbol(_) => {}
+            | SenOp::Symbol(_)
+            | SenOp::Uniform(_) => {}
         }
     }
 }
@@ -2202,17 +2204,159 @@ pub fn merge_type_from_indices(
     None
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 228/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e228_validateLoweringAndSetMissingParameters
+///
+/// **228/384** `vectorchain::validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483` (49L).
+///
+/// The pre-order walk that closes the vectorchain lowering: nine op kinds must be GONE by now, and
+/// every compute operand still carrying `-1` gets the next data id, counting up from
+/// [`OperandReuse::total_data_origins_count`].
+///
+/// ⛔ THE COUNTER IS SHARED ACROSS THE WHOLE UNIT, not per op — A, B then C of one mac, then the next
+/// compute's — so a walk in another order renumbers every operand the reuse table already knows.
+pub fn validate_lowering_and_set_missing_parameters<A: Arch>(
+    unit: &mut SentientProgramUnit<A>,
+    reuse_info: &OperandReuse,
+) {
+    let mut total_reuse_ids = reuse_info.total_data_origins_count();
+    set_missing_data_ids(&mut unit.body, &mut total_reuse_ids);
+}
+
+/// The `unit.walk<WalkOrder::PreOrder>` of [`validate_lowering_and_set_missing_parameters`], over one
+/// block.
+fn set_missing_data_ids(ops: &mut [SenOp], total_reuse_ids: &mut u32) {
+    /// `if (mac_op.getOpADataID() == -1) { .. total_reuse_ids++; }` — ⛔ `None` IS that `-1`; a
+    /// [`DataId`] carries the sentinel so this line does not have to name it.
+    fn assign(operand: &mut sen::Operand, total_reuse_ids: &mut u32) {
+        if operand.data_id.is_none() {
+            operand.data_id = Some(DataId::Assigned(DataOriginId(*total_reuse_ids)).attribute());
+            *total_reuse_ids += 1;
+        }
+    }
+
+    for op in ops {
+        match op {
+            // ⛔⛔ THE NINE KINDS THE REFERENCE REFUSES, as a build failure rather than an
+            // `emitError` + `WalkResult::interrupt()`. Each names the op, and none may be stood in
+            // for: an unlowered `vectorchain.multiply_and_accumulate` left in a unit is a program
+            // dbo-opt accepts and mislowers.
+            SenOp::Dataflow(
+                dfir_op::dataflow::Op::Send { .. } | dfir_op::dataflow::Op::Receive { .. },
+            ) => todo!(
+                "dataflow.send/dataflow.receive: unable to lower the op into Sentient as part of \
+                 the vectorchain lowering"
+            ),
+            SenOp::Vector(dfir_op::vector::Op::Load { .. } | dfir_op::vector::Op::Store { .. }) => {
+                todo!(
+                    "vector.load/vector.store: unable to lower the op into Sentient as part of the \
+                     vectorchain lowering"
+                )
+            }
+            SenOp::Agen(
+                dfir_op::agen::Op::VectorLoad { .. } | dfir_op::agen::Op::VectorStore { .. },
+            ) => todo!(
+                "agen.vector_load/agen.vector_store: unable to lower the op into Sentient as part \
+                 of the vectorchain lowering"
+            ),
+            SenOp::VectorChain(
+                vc::Op::MultiplyAccumulate { .. } | vc::Op::Multiply { .. } | vc::Op::Binary { .. },
+            ) => todo!(
+                "vectorchain.multiply_and_accumulate/multiply/binary: unable to lower the op into \
+                 Sentient as part of the vectorchain lowering"
+            ),
+
+            // ⭐ A, B, THEN C, IN THAT ORDER — the reference's three `if`s, and the order is what the
+            // ids mean.
+            SenOp::Sentient(sen::Op::VectorMac {
+                op_a, op_b, op_c, ..
+            }) => {
+                assign(op_a, total_reuse_ids);
+                assign(op_b, total_reuse_ids);
+                assign(op_c, total_reuse_ids);
+            }
+            // `else if (auto bin_op = llvm::dyn_cast<sentient::BinaryOp>(op))` — A then B.
+            SenOp::Sentient(sen::Op::VectorBinary { op_a, op_b, .. }) => {
+                assign(op_a, total_reuse_ids);
+                assign(op_b, total_reuse_ids);
+            }
+            SenOp::Sentient(sen::Op::For { body, .. }) => {
+                set_missing_data_ids(body, total_reuse_ids);
+            }
+            SenOp::Sentient(sen::Op::If {
+                then_body,
+                else_body,
+                ..
+            }) => {
+                set_missing_data_ids(then_body, total_reuse_ids);
+                set_missing_data_ids(else_body, total_reuse_ids);
+            }
+            // `return WalkResult::advance();` — every other op, including the ternary and unary
+            // computes the reference's two `dyn_cast`s do not name.
+            _ => {}
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 229/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A NON-PT MASK CONSTANT AND THE VALUE IT BINDS — what [`get_mask_value_for_non_pt`] hands back.
+///
+/// ⛔ TWO FIELDS BECAUSE THE `Value` ALONE CANNOT BE PLACED. The reference returns the op AS a
+/// `Value`; here the caller must put [`Self::op`] where `builder.setInsertionPoint(op)` put it and use
+/// [`Self::value`] as the compute's mask operand. Same shape as
+/// [`super::vc_helper::MaskValue::Constant`], the PT side of the same question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonPtMask {
+    /// The `sentient.scalar_constant` to insert immediately before the masked compute.
+    pub op: SenOp,
+    /// The value it binds.
+    pub value: Val,
+}
+
+/// Replaces: e229_getMaskValueForNonPT
+///
+/// **229/384** `vectorchain::getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114` (9L).
+///
+/// [`get_mask_value_constant_for_non_pt`]'s answer as a `sentient.constant` of type `index`, or
+/// nothing when there is no constant to be had.
+///
+/// ⛔ `builder.setInsertionPoint(op)` IS THE DROPPED MECHANISM, and it is the only reason the
+/// reference takes a builder at all — [`NonPtMask::op`] is the obligation it leaves the caller.
+#[must_use]
+pub fn get_mask_value_for_non_pt<A: Arch>(mask: &vc::Op, values: &mut Values) -> Option<NonPtMask> {
+    let mask_val = get_mask_value_constant_for_non_pt::<A>(mask)?;
+    let value = values.mint();
+    Some(NonPtMask {
+        op: SenOp::Sentient(sen::Op::ScalarConstant {
+            value: i64::from(mask_val.bits()),
+            result: value,
+            // ⭐ `builder.getIndexType()`, and the immediate locale every mask constant takes — the
+            // PT side mints exactly this op (`vc_helper::get_mask_value_for_pt`).
+            reg_locale: sen::RegType::Imm,
+            ty: ScalarTy::Index,
+        }),
+        value,
+    })
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{DfirProgram, SenOp, SentientProgramUnit, Values};
     use super::{
-        MergeAndPack, MergeOrPack, MinOrMaxFusion, PackOrShuffle, PackRepetition, SliceMask,
-        check_validity_of_pack_and_shuffle_lowering, compute_precision_of_op,
-        fuse_compare_and_select_into_min_or_max, get_mask_value_constant_for_non_pt,
-        has_constant_bounds, input_precision_from_operand, is_sentient_binary_logical_op,
-        merge_and_pack_insts, merge_type_from_indices, precision_in_string,
-        redefine_constant_vectors, reset_sentient_fmas_if_exists, result_precision_from_operands,
-        vector_binary_to_sentient_binary,
+        MergeAndPack, MergeOrPack, MinOrMaxFusion, NonPtMask, OperandReuse, PackOrShuffle,
+        PackRepetition, SliceMask, check_validity_of_pack_and_shuffle_lowering,
+        compute_precision_of_op, fuse_compare_and_select_into_min_or_max,
+        get_mask_value_constant_for_non_pt, get_mask_value_for_non_pt, has_constant_bounds,
+        input_precision_from_operand, is_sentient_binary_logical_op, merge_and_pack_insts,
+        merge_type_from_indices, precision_in_string, redefine_constant_vectors,
+        reset_sentient_fmas_if_exists, result_precision_from_operands,
+        validate_lowering_and_set_missing_parameters, vector_binary_to_sentient_binary,
         vector_element_wise_compare_operator_to_sentient_binary_operator,
         vector_ternary_to_sentient_ternary, vector_type_of,
     };
@@ -2235,7 +2379,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp};
     use crate::islands::dataflow_ir::ty::{
-        AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, Vector,
+        AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, ScalarTy, Vector,
     };
     use crate::islands::sentient::dialects::sentient as sen;
 
@@ -3788,13 +3932,60 @@ mod unit_tests {
             check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&op).unwrap()).unwrap();
         assert_eq!(merge_type_from_indices(&valid, false, Bits(0)), None);
     }
+
+    // ═══════════════════════════════════════ 228 ═══════════════════════════════════════
+
+    /// ⭐ 228/384 — ONE COUNTER WALKS THE WHOLE UNIT, AND AN ID ALREADY THERE IS LEFT ALONE.
+    ///
+    /// `reset_sentient_fmas_if_exists` puts every operand back to `-1` (entry 156), so the mac takes
+    /// 0, 1, 2 in A-B-C order and the binary continues at 3 — except its A, which keeps the 41 it
+    /// came in with, exactly as the reference's `== -1` guard says.
+    #[test]
+    fn the_missing_data_ids_are_numbered_from_the_reuse_count() {
+        let mut unit = sentient_unit(vec![mac(1, 2, 3), binary(4, 5)]);
+        reset_sentient_fmas_if_exists(&mut unit);
+        if let SenOp::Sentient(sen::Op::VectorBinary { op_a, .. }) = &mut unit.body[1] {
+            op_a.data_id = Some(41);
+        }
+
+        validate_lowering_and_set_missing_parameters(&mut unit, &OperandReuse::default());
+
+        assert_eq!(
+            data_ids(&unit),
+            vec![Some(0), Some(1), Some(2), Some(41), Some(3)]
+        );
+    }
+
+    // ═══════════════════════════════════════ 229 ═══════════════════════════════════════
+
+    /// ⭐ 229/384 — THE MASK CONSTANT AS THE REFERENCE PRINTS IT: `sentient.scalar_constant
+    /// {value = 0 : si64} : index` (`fnms_with_cast.mlir:11`) for entry 163's all-lanes-live set.
+    #[test]
+    fn a_non_pt_mask_becomes_an_index_constant() {
+        let mut values = Values::default();
+        let mask = get_mask_value_for_non_pt::<Target>(
+            &mask_set_op(lane_span(64, 63), None, mask_ty()),
+            &mut values,
+        );
+
+        assert_eq!(
+            mask,
+            Some(NonPtMask {
+                op: SenOp::Sentient(sen::Op::ScalarConstant {
+                    value: 0,
+                    result: Val(0),
+                    reg_locale: sen::RegType::Imm,
+                    ty: ScalarTy::Index,
+                }),
+                value: Val(0),
+            })
+        );
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e228_validateLoweringAndSetMissingParameters
-// crustify:todo: e229_getMaskValueForNonPT
 // crustify:todo: e230_convertStringToType
 // crustify:todo: e231_convertTypeToString
 // crustify:todo: e277_getGCVTorFCVTTypeFromIndicesAndCastInputs
