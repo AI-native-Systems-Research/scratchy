@@ -344,7 +344,6 @@ impl Predicate {
     pub const fn ty(self) -> Vector {
         self.ty
     }
-
 }
 
 /// ONE `vectorchain` OPERATION.

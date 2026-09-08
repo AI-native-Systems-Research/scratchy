@@ -474,7 +474,12 @@ pub fn coalesce_time_dimensions(
         // all three lists are one length, and where they were not it would read past one.
         for (bound, (off_src, off_dst)) in time_bounds_src
             .iter()
-            .zip(time_offsets_src.per_dim.iter().zip(&time_offsets_dst.per_dim))
+            .zip(
+                time_offsets_src
+                    .per_dim
+                    .iter()
+                    .zip(&time_offsets_dst.per_dim),
+            )
             .rev()
         {
             if !skip && (*bound == TimeBound::Steps(1) || off_src == off_dst) {
@@ -497,7 +502,8 @@ pub fn coalesce_time_dimensions(
     if let Some(innermost) = num_of_dim.checked_sub(1) {
         //  scan from innermost loop
         let mut time_index_inner = innermost;
-        let mut total_dist_inner = steps_of(time_bounds[innermost]).saturating_mul(offset(innermost));
+        let mut total_dist_inner =
+            steps_of(time_bounds[innermost]).saturating_mul(offset(innermost));
         let mut coalesced_bound = steps_of(time_bounds[innermost]);
         // time_index_outer goes down to -1 to catch the outermost time dim; `None` IS that -1.
         let outers = (0..innermost).rev().map(Some).chain(core::iter::once(None));
@@ -564,7 +570,10 @@ const fn bound_of(steps: i64) -> TimeBound {
     match steps {
         -2 => TimeBound::Coalesced,
         -1 => TimeBound::Variable,
-        #[expect(clippy::cast_sign_loss, reason = "the two negative values are the arms above")]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "the two negative values are the arms above"
+        )]
         n => TimeBound::Steps(n as u64),
     }
 }
@@ -5503,18 +5512,34 @@ mod unit_tests {
     #[test]
     fn the_cut_where_the_offsets_diverge_leaves_the_run_unmerged() {
         let op = composite_load_and_store();
-        let bounds = [TimeBound::Steps(1), TimeBound::Steps(32), TimeBound::Steps(32)];
+        let bounds = [
+            TimeBound::Steps(1),
+            TimeBound::Steps(32),
+            TimeBound::Steps(32),
+        ];
         let src_offsets = [65536, 2048, 64];
         let pair = |dst_offsets: &[i64]| {
             let mut details = AccessContainer::<AccessDetailsAffineComposite>::default();
             details
                 .vacancy(MemoryOperandIndex::DirSrc)
                 .expect("empty")
-                .fill(burst_case(&op, DfirUnit::L3su, &bounds, &src_offsets, Elements(64)));
+                .fill(burst_case(
+                    &op,
+                    DfirUnit::L3su,
+                    &bounds,
+                    &src_offsets,
+                    Elements(64),
+                ));
             details
                 .vacancy(MemoryOperandIndex::DirDst)
                 .expect("empty")
-                .fill(burst_case(&op, DfirUnit::L3su, &bounds, dst_offsets, Elements(64)));
+                .fill(burst_case(
+                    &op,
+                    DfirUnit::L3su,
+                    &bounds,
+                    dst_offsets,
+                    Elements(64),
+                ));
             details
         };
 

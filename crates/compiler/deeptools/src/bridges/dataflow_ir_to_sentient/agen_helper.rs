@@ -2123,6 +2123,7 @@ mod unit_tests {
                     load,
                     shuffled(),
                     DfirOp::Agen(agen::Op::VectorStore {
+                        dbg_name: None,
                         value: Val(41),
                         view: VIEW,
                         indices: indices(Val(30)),
@@ -2676,6 +2677,7 @@ mod unit_tests {
             multicast_info: None,
         });
         let store = DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
             value: Val(31),
             view: Val(11),
             indices: indices(Val(30)),
@@ -3013,6 +3015,7 @@ mod unit_tests {
                 multicast_info: None,
             }),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
                 value: Val(31),
                 view: Val(23),
                 indices: vec![Index::Const(0)],
@@ -3054,6 +3057,7 @@ mod unit_tests {
 
         let mut into_the_lx = scope.clone();
         into_the_lx[5] = DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
             value: Val(31),
             view: Val(21),
             indices: vec![Index::Const(0)],
@@ -3786,6 +3790,7 @@ mod unit_tests {
                 ty: LANES,
             }),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
                 value: Val(73),
                 view: Val(70),
                 indices: vec![Index::Const(0)],
@@ -3851,6 +3856,7 @@ mod unit_tests {
     #[test]
     fn a_load_and_store_that_disagree_on_the_element_count_refuse() {
         let op = agen::Op::VectorStore {
+            dbg_name: None,
             value: Val(80),
             view: VIEW,
             indices: indices(Val(81)),
@@ -4092,7 +4098,11 @@ mod unit_tests {
         details
             .vacancy(MemoryOperandIndex::DirSrc)
             .expect("empty")
-            .fill(end(Val(329), MemoryOperandIndex::DirSrc, vec![65536, 2048, 64]));
+            .fill(end(
+                Val(329),
+                MemoryOperandIndex::DirSrc,
+                vec![65536, 2048, 64],
+            ));
         details
             .vacancy(MemoryOperandIndex::DirDst)
             .expect("empty")
@@ -4140,7 +4150,10 @@ mod unit_tests {
             built.hoisted
         );
         let SenOp::AffineFor(outer) = &built.emitted else {
-            panic!("the t-dim 0 loop is the whole emission, got {:?}", built.emitted);
+            panic!(
+                "the t-dim 0 loop is the whole emission, got {:?}",
+                built.emitted
+            );
         };
         let [SenOp::AffineFor(inner), outer_steps @ ..] = outer.body.as_slice() else {
             panic!("the child leads its parent's body, got {:?}", outer.body);
@@ -4392,6 +4405,7 @@ mod unit_tests {
                 ty: ibr_ty.clone(),
             }),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
                 value: Val(63),
                 view: Val(65),
                 indices: vec![Index::Const(0)],
@@ -4511,7 +4525,11 @@ mod unit_tests {
         let mut to_be_deleted = Vec::new();
 
         add_store_input_to_delete_list(&scope[1], &scope, &mut to_be_deleted);
-        assert_eq!(to_be_deleted, [&scope[1], &scope[0]], "the shuffle, then what fed it");
+        assert_eq!(
+            to_be_deleted,
+            [&scope[1], &scope[0]],
+            "the shuffle, then what fed it"
+        );
 
         add_store_input_to_delete_list(&scope[0], &scope, &mut to_be_deleted);
         assert_eq!(
@@ -7522,12 +7540,8 @@ pub fn insert_initialization_stmt(
 
     // `:3843-3844` — entry 219, whose clones go after the constant and before the sum: both
     // builders insert immediately before the loop, so the earlier op stays earlier.
-    let cloned = clone_start_addr_outside_loop(
-        values,
-        memory_view_start_addr,
-        start_addr_def,
-        preceding,
-    );
+    let cloned =
+        clone_start_addr_outside_loop(values, memory_view_start_addr, start_addr_def, preceding);
     let start_addr = match cloned {
         ClonedStartAddr::AsItStands(addr)
         // ⭐ The clones went inside a preceding `uniform.uniformize_regions`, not here.
@@ -8314,7 +8328,10 @@ pub fn construct_time_loops_and_vector_operations(
 
     // The reference's parameter is `int stride_step` taking an `int64_t` offset, so the narrowing is
     // the reference's own (see [`StrideStep`]).
-    #[expect(clippy::cast_possible_truncation, reason = "`int stride_step` narrows too")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`int stride_step` narrows too"
+    )]
     let stride_step = StrideStep(stride_step as i32);
 
     // `:1867-1900` — five arms, and this island carries the input of exactly one of them.

@@ -2568,24 +2568,126 @@ fn gcvt_fcvt_insts() -> [GcvtFcvt; 18] {
         src_output,
     };
     [
-        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm0), Eight, IDENTITY16, Fp16, F8E5M2),
-        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm1), Eight, LOW8, F8E5M2, Fp16),
-        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm2), Eight, HIGH8, F8E5M2, Fp16),
-        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm4), Eight, IDENTITY16, Fp16, F8E4M3Fn),
-        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm5), Eight, LOW8, F8E4M3Fn, Fp16),
-        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm6), Eight, HIGH8, F8E4M3Fn, Fp16),
+        row(
+            CvtInst::Gcvt2(sen::BinaryGcvt::Imm0),
+            Eight,
+            IDENTITY16,
+            Fp16,
+            F8E5M2,
+        ),
+        row(
+            CvtInst::Gcvt1(sen::UnaryGcvt::Imm1),
+            Eight,
+            LOW8,
+            F8E5M2,
+            Fp16,
+        ),
+        row(
+            CvtInst::Gcvt1(sen::UnaryGcvt::Imm2),
+            Eight,
+            HIGH8,
+            F8E5M2,
+            Fp16,
+        ),
+        row(
+            CvtInst::Gcvt2(sen::BinaryGcvt::Imm4),
+            Eight,
+            IDENTITY16,
+            Fp16,
+            F8E4M3Fn,
+        ),
+        row(
+            CvtInst::Gcvt1(sen::UnaryGcvt::Imm5),
+            Eight,
+            LOW8,
+            F8E4M3Fn,
+            Fp16,
+        ),
+        row(
+            CvtInst::Gcvt1(sen::UnaryGcvt::Imm6),
+            Eight,
+            HIGH8,
+            F8E4M3Fn,
+            Fp16,
+        ),
         row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm8), Eight, LOW8, I4, I16),
-        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm16), Four, IDENTITY16, Fp16, Bf16),
-        row(CvtInst::Gcvt1(sen::UnaryGcvt::Imm17), Four, IDENTITY16, Bf16, Fp16),
-        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm24), Eight, INTERLEAVE16, Fp16, F8E5M2),
-        row(CvtInst::Gcvt2(sen::BinaryGcvt::Imm28), Eight, INTERLEAVE16, Fp16, F8E4M3Fn),
-        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm0), Eight, LOW4, Fp16, Fp32),
-        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm1), Eight, HIGH4, Fp16, Fp32),
-        row(CvtInst::Fcvt2(sen::BinaryFcvt::Imm2), Eight, LOW8, Fp32, Fp16),
-        row(CvtInst::Fcvt2(sen::BinaryFcvt::Imm3), Eight, LOW8_PADDED, Fp32, F8E5M2),
-        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm5), Eight, LOW4, Bf16, Fp32),
-        row(CvtInst::Fcvt1(sen::UnaryFcvt::Imm6), Eight, HIGH4, Bf16, Fp32),
-        row(CvtInst::Fcvt2(sen::BinaryFcvt::Imm7), Eight, LOW8, Fp32, Bf16),
+        row(
+            CvtInst::Gcvt1(sen::UnaryGcvt::Imm16),
+            Four,
+            IDENTITY16,
+            Fp16,
+            Bf16,
+        ),
+        row(
+            CvtInst::Gcvt1(sen::UnaryGcvt::Imm17),
+            Four,
+            IDENTITY16,
+            Bf16,
+            Fp16,
+        ),
+        row(
+            CvtInst::Gcvt2(sen::BinaryGcvt::Imm24),
+            Eight,
+            INTERLEAVE16,
+            Fp16,
+            F8E5M2,
+        ),
+        row(
+            CvtInst::Gcvt2(sen::BinaryGcvt::Imm28),
+            Eight,
+            INTERLEAVE16,
+            Fp16,
+            F8E4M3Fn,
+        ),
+        row(
+            CvtInst::Fcvt1(sen::UnaryFcvt::Imm0),
+            Eight,
+            LOW4,
+            Fp16,
+            Fp32,
+        ),
+        row(
+            CvtInst::Fcvt1(sen::UnaryFcvt::Imm1),
+            Eight,
+            HIGH4,
+            Fp16,
+            Fp32,
+        ),
+        row(
+            CvtInst::Fcvt2(sen::BinaryFcvt::Imm2),
+            Eight,
+            LOW8,
+            Fp32,
+            Fp16,
+        ),
+        row(
+            CvtInst::Fcvt2(sen::BinaryFcvt::Imm3),
+            Eight,
+            LOW8_PADDED,
+            Fp32,
+            F8E5M2,
+        ),
+        row(
+            CvtInst::Fcvt1(sen::UnaryFcvt::Imm5),
+            Eight,
+            LOW4,
+            Bf16,
+            Fp32,
+        ),
+        row(
+            CvtInst::Fcvt1(sen::UnaryFcvt::Imm6),
+            Eight,
+            HIGH4,
+            Bf16,
+            Fp32,
+        ),
+        row(
+            CvtInst::Fcvt2(sen::BinaryFcvt::Imm7),
+            Eight,
+            LOW8,
+            Fp32,
+            Bf16,
+        ),
     ]
 }
 
@@ -4417,10 +4519,9 @@ mod unit_tests {
             input_ty: f16(128),
             ty: f16(64),
         };
-        let checked = check_validity_of_pack_and_shuffle_lowering(
-            PackOrShuffle::of(&shuffle).unwrap(),
-        )
-        .unwrap();
+        let checked =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&shuffle).unwrap())
+                .unwrap();
         assert_eq!(
             gcvt_or_fcvt_type_from_indices_and_cast_inputs(&checked, &[from_f8]),
             Some(CvtInst::Gcvt1(sen::UnaryGcvt::Imm1))
@@ -4446,16 +4547,14 @@ mod unit_tests {
             input_ty: bf16(64),
             ty: bf16(64),
         };
-        let checked = check_validity_of_pack_and_shuffle_lowering(
-            PackOrShuffle::of(&shuffle).unwrap(),
-        )
-        .unwrap();
+        let checked =
+            check_validity_of_pack_and_shuffle_lowering(PackOrShuffle::of(&shuffle).unwrap())
+                .unwrap();
         assert_eq!(
             gcvt_or_fcvt_type_from_indices_and_cast_inputs(&checked, &[to_bf16]),
             Some(CvtInst::Gcvt1(sen::UnaryGcvt::Imm16))
         );
     }
-
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a

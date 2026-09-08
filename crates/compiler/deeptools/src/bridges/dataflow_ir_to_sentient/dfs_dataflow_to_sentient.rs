@@ -673,10 +673,7 @@ mod unit_tests {
     fn ibms_opaque() -> dataflow::Opaque {
         dataflow::Opaque {
             func: OpaqueFunc::Reciprocal,
-            read_write: vec![
-                (RegName::A00, RegAddr(0)),
-                (RegName::A01, RegAddr(1)),
-            ],
+            read_write: vec![(RegName::A00, RegAddr(0)), (RegName::A01, RegAddr(1))],
             read_only: Vec::new(),
             params: vec![
                 (ParamKey::Prec, ParamValue::Fp16),
@@ -1266,7 +1263,8 @@ mod unit_tests {
             L0LxSyncDst::Lx(LxHalf::Store, corelet1),
             None,
             &mut values,
-        ) else {
+        )
+        else {
             panic!("both corelets occupied uniformizes the sync");
         };
         assert!(l3.is_none(), "the per-unit lowering has no third create");
@@ -1275,12 +1273,14 @@ mod unit_tests {
         };
         assert_eq!(regions[0].units, vec![Val(0)]);
         assert_eq!(regions[1].units, vec![Val(1)]);
-        assert_eq!(peers(Some(L0LxLowering::One(region0))), vec![
-            sen::Consumer::LxsuN
-        ]);
-        assert_eq!(peers(Some(L0LxLowering::One(region1))), vec![
-            sen::Consumer::Lxsu
-        ]);
+        assert_eq!(
+            peers(Some(L0LxLowering::One(region0))),
+            vec![sen::Consumer::LxsuN]
+        );
+        assert_eq!(
+            peers(Some(L0LxLowering::One(region1))),
+            vec![sen::Consumer::Lxsu]
+        );
     }
 
     /// 🎯 274/384 — THE GROUP'S TWO LISTS ARE REVERSED IMAGES, AND REGION 1 GETS ITS OWN.
@@ -1322,10 +1322,10 @@ mod unit_tests {
         else {
             panic!("a single-corelet source emits one sync");
         };
-        assert_eq!(peers(&from_corelet0), vec![
-            sen::Consumer::Lxsu,
-            sen::Consumer::LxsuN
-        ]);
+        assert_eq!(
+            peers(&from_corelet0),
+            vec![sen::Consumer::Lxsu, sen::Consumer::LxsuN]
+        );
 
         // Both corelets occupied: region 0 gets that list and region 1 the reversed one.
         let Some(L0LxLowering::TwoRegions {
@@ -1340,17 +1340,18 @@ mod unit_tests {
             &group,
             None,
             &mut values,
-        ) else {
+        )
+        else {
             panic!("both corelets occupied uniformizes the group sync");
         };
-        assert_eq!(peers(&region0), vec![
-            sen::Consumer::Lxsu,
-            sen::Consumer::LxsuN
-        ]);
-        assert_eq!(peers(&region1), vec![
-            sen::Consumer::LxsuN,
-            sen::Consumer::Lxsu
-        ]);
+        assert_eq!(
+            peers(&region0),
+            vec![sen::Consumer::Lxsu, sen::Consumer::LxsuN]
+        );
+        assert_eq!(
+            peers(&region1),
+            vec![sen::Consumer::LxsuN, sen::Consumer::Lxsu]
+        );
         // Divergence (2): no L3 destination in the group, so no third sync naming nobody.
         assert!(l3.is_none());
     }
@@ -2438,7 +2439,12 @@ impl L0LxSrc {
                     push_back_the_unit_to_list_if_doesnot_exist(l0_consumer(*dst_half), &mut peers);
                 }
                 // `:524-531` — ⭐ ONE sync for the whole group, carrying the implicit-sync boundary.
-                Some(L0LxLowering::One(sync(mode, peers, op.tile_size(), dbg_name)))
+                Some(L0LxLowering::One(sync(
+                    mode,
+                    peers,
+                    op.tile_size(),
+                    dbg_name,
+                )))
             }
             L0LxSrc::Lx(_) => {
                 // `:539-544` — the `DT_CHECK_MSG` then "Unsuported sync operation for LX".
@@ -2503,8 +2509,7 @@ impl L0LxSrc {
                             regions,
                             region0: sync(mode, for_corelet0, None, dbg_name.clone()),
                             region1: sync(mode, for_corelet1, None, dbg_name.clone()),
-                            l3: (!for_l3.is_empty())
-                                .then(|| sync(mode, for_l3, None, dbg_name)),
+                            l3: (!for_l3.is_empty()).then(|| sync(mode, for_l3, None, dbg_name)),
                         })
                     }
                 }

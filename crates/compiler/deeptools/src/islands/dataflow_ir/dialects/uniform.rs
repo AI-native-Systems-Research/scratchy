@@ -272,11 +272,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::val(*result),
                 pairs
                     .iter()
-                    .map(|(key, value)| format!(
-                        "[{} -> {}]",
-                        print::val(*key),
-                        print::val(*value)
-                    ))
+                    .map(|(key, value)| format!("[{} -> {}]", print::val(*key), print::val(*value)))
                     .collect::<Vec<_>>()
                     .join(", ")
             );

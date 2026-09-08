@@ -1216,10 +1216,8 @@ pub fn transform_scf_loop_with_non_constant_upper_bound(
             step: 1,
         },
     );
-    let (
-        LoopLegalization::Transformed(then_for),
-        LoopLegalization::Transformed(else_for),
-    ) = (then_arm, else_arm)
+    let (LoopLegalization::Transformed(then_for), LoopLegalization::Transformed(else_for)) =
+        (then_arm, else_arm)
     else {
         return ParentSplit::Unsupported;
     };

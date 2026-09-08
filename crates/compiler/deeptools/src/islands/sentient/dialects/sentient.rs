@@ -367,7 +367,6 @@ impl IStateIndex {
 }
 
 impl Port {
-
     /// The spelling the attribute carries.
     ///
     /// ⛔ RETURNS `String`, NOT `&'static str`, because `Lrf` and `IState` are parameterised. Every
@@ -927,7 +926,6 @@ impl BinaryOp {
             Self::CompareLe => "fcmp_le".to_owned(),
         }
     }
-
 }
 
 /// THE SEVEN OPERATORS THAT MAY FORWARD A LOGICAL RESULT — and there is no eighth.
@@ -2844,7 +2842,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             }
             if else_body.is_empty() {
                 indent(out, depth);
-            let _ = writeln!(out, "}}");
+                let _ = writeln!(out, "}}");
             } else {
                 indent(out, depth);
                 let _ = writeln!(out, "}} else {{");
@@ -2852,7 +2850,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                     crate::islands::sentient::print::emit(out, inner, depth + 1);
                 }
                 indent(out, depth);
-            let _ = writeln!(out, "}}");
+                let _ = writeln!(out, "}}");
             }
         }
 
@@ -2932,7 +2930,10 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             let mut specific = vec![attr("binaryOp", &quoted(&binary_op.op().spelling()))];
             // ⭐ NO CHECK NEEDED: only the forwarding arm carries a port, and only the seven legal
             // operators can be named in it.
-            if let Binary::Forwarding { to, unroll_incr, .. } = binary_op {
+            if let Binary::Forwarding {
+                to, unroll_incr, ..
+            } = binary_op
+            {
                 specific.push(attr("LogicalResultForwarding", &quoted(&to.spelling())));
                 if *unroll_incr {
                     specific.push(attr("unrollIncrLogicalResult", "true"));
@@ -3218,8 +3219,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::val(*dst_immutable_addr),
                 print::val(*dst_inc)
             );
-            let mut types =
-                String::from("index, index, index, index, index, index, index, index");
+            let mut types = String::from("index, index, index, index, index, index, index, index");
             if let Some(value) = multicast_info {
                 operands.push_str(&format!(", multicast_info({})", print::val(*value)));
                 types.push_str(", index");
@@ -3307,8 +3307,14 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             let mut attrs = vec![
                 attr("total_elements", &format!("{} : i32", total_elements.0)),
                 attr("element_size", &format!("{} : i32", element_size.0)),
-                attr("regLocales", &locale_array([*addr_reg, *data_reg].into_iter())),
-                attr("regIndices", &index_array([*addr_reg, *data_reg].into_iter())),
+                attr(
+                    "regLocales",
+                    &locale_array([*addr_reg, *data_reg].into_iter()),
+                ),
+                attr(
+                    "regIndices",
+                    &index_array([*addr_reg, *data_reg].into_iter()),
+                ),
             ];
             if let Some(name) = dbg_name {
                 attrs.push(attr("dbgName", &quoted(name)));
@@ -3469,10 +3475,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             implicit_sync_memory_boundary,
             dbg_name,
         } => {
-            let spelled: Vec<String> = peers
-                .iter()
-                .map(|p| quoted(p.peer().spelling()))
-                .collect();
+            let spelled: Vec<String> = peers.iter().map(|p| quoted(p.peer().spelling())).collect();
             let mut attrs = vec![
                 attr("mode", &quoted(mode.spelling())),
                 attr("units", &format!("[{}]", spelled.join(", "))),
@@ -3500,11 +3503,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             let _ = writeln!(out, "sentient.incrmask{}", dict(&[dbg(dbg_name)]));
         }
         Op::SetSendDst { units } => {
-            let _ = writeln!(
-                out,
-                "sentient.set_send_dst({})",
-                print::val(units.val())
-            );
+            let _ = writeln!(out, "sentient.set_send_dst({})", print::val(units.val()));
         }
         Op::LogicalPort { port_name, result } => {
             let _ = writeln!(
@@ -3608,10 +3607,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 // output is `func_name = "reciprocal"` too
                 // (`dcc/test/Conversion/DataflowToSentient/opaque.mlir:18`).
                 attr("func_name", &quoted(&func.spelling().to_lowercase())),
-                attr(
-                    "read_write_register_dictionary",
-                    &reg_dict(read_write),
-                ),
+                attr("read_write_register_dictionary", &reg_dict(read_write)),
                 attr("read_only_register_dictionary", &reg_dict(read_only)),
                 attr("parameter_dictionary", &param_dict(params)),
             ];
@@ -3756,7 +3752,10 @@ fn extent_attrs(extent: &Extent) -> Vec<String> {
     // ⭐ ONLY WHERE IT DIFFERS FROM THE `.td`'S DEFAULT, so a printed attribute always means a
     // decision was made. The defaults are one element of chunk and stride, and no burst.
     if extent.chunk_size != Elements(1) {
-        attrs.push(attr("chunk_size", &format!("{} : i32", extent.chunk_size.0)));
+        attrs.push(attr(
+            "chunk_size",
+            &format!("{} : i32", extent.chunk_size.0),
+        ));
     }
     if extent.chunk_stride != Elements(1) {
         attrs.push(attr(
@@ -3765,7 +3764,10 @@ fn extent_attrs(extent: &Extent) -> Vec<String> {
         ));
     }
     if extent.burst_size != Elements(0) {
-        attrs.push(attr("burst_size", &format!("{} : i32", extent.burst_size.0)));
+        attrs.push(attr(
+            "burst_size",
+            &format!("{} : i32", extent.burst_size.0),
+        ));
     }
     attrs
 }
@@ -3781,14 +3783,19 @@ fn locale_array(regs: impl Iterator<Item = Reg>) -> String {
 /// from an `Option` rather than stored as an integer.
 fn index_array(regs: impl Iterator<Item = Reg>) -> String {
     let rendered: Vec<String> = regs
-        .map(|r| r.index.map_or_else(|| "-1".to_owned(), |i| i.get().to_string()))
+        .map(|r| {
+            r.index
+                .map_or_else(|| "-1".to_owned(), |i| i.get().to_string())
+        })
         .collect();
     format!("[{}]", rendered.join(", "))
 }
 
 /// A `BoolArrayAttr`.
 fn bool_array(flags: impl Iterator<Item = bool>) -> String {
-    let rendered: Vec<&str> = flags.map(|flag| if flag { "true" } else { "false" }).collect();
+    let rendered: Vec<&str> = flags
+        .map(|flag| if flag { "true" } else { "false" })
+        .collect();
     format!("[{}]", rendered.join(", "))
 }
 
@@ -3802,9 +3809,11 @@ fn reg_dict(entries: &[(RegName, RegAddr)]) -> String {
     // (`dcc/test/Conversion/DataflowToSentient/opaque.mlir:18`); a bare `"0"` becomes `lrf`, which is
     // no port at all. `dataflow.opaque` prints it — `lowerOpaqueOperation` forwards the dictionary
     // unchanged, so `sentient.opaque` must print the same string.
-    sorted_dict(entries, |name: RegName| name.spelling(), |addr: RegAddr| {
-        format!("R{}", addr.0)
-    })
+    sorted_dict(
+        entries,
+        |name: RegName| name.spelling(),
+        |addr: RegAddr| format!("R{}", addr.0),
+    )
 }
 
 /// An opaque's parameter dictionary.

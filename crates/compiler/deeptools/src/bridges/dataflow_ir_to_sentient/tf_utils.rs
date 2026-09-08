@@ -934,10 +934,7 @@ mod unit_tests {
         // ⛔ AND THE MAPPING IS READABLE BECAUSE `delete_op` WAS FALSE (`Utils.hpp:36-37`).
         assert_eq!(
             Some(Val(3)),
-            grown
-                .ir_map
-                .expect("delete_op was false")
-                .lookup(Val(110))
+            grown.ir_map.expect("delete_op was false").lookup(Val(110))
         );
     }
 }
@@ -948,7 +945,10 @@ mod unit_tests {
 pub enum CountedBounds {
     /// `affine::AffineForOp`: `getLowerBoundOperands()`/`getLowerBoundMap()` and the upper pair,
     /// passed through unchanged.
-    Affine { lo: affine::Bound, hi: affine::Bound },
+    Affine {
+        lo: affine::Bound,
+        hi: affine::Bound,
+    },
     /// `scf::ForOp`: `getLowerBound()`, `getUpperBound()`, `getStep()`, passed through unchanged.
     Scf { lo: Val, hi: Val, step: Val },
 }

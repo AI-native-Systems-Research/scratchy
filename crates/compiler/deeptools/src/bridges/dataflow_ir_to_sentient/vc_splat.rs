@@ -237,7 +237,8 @@ pub fn create_splat_operation<A: Arch>(
     let mut emitted = vec![index_zero(mask_value)];
 
     // `if (auto const_op = llvm::dyn_cast<mlir::arith::ConstantOp>(from.op_))`
-    if let Some(DfirOp::Arith(arith::Op::DenseConstant { splat, ty, .. })) = op_at(&from.op, scope) {
+    if let Some(DfirOp::Arith(arith::Op::DenseConstant { splat, ty, .. })) = op_at(&from.op, scope)
+    {
         // `if (mlir::isa<IntegerAttr>(splat_value))` — a float splat is the reference's
         // `emitError("Unable to create the splat operation")` and its `failure()`.
         if ty.elem.is_float() {

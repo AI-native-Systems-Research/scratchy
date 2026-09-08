@@ -67,11 +67,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::dataflow_ir::dialects::{
     Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, operands, regions, regions_mut,
     replace_all_uses, uniform, uses,
 };
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 
 use super::vc_vector_operands::{OpId, defining_position, op_at, remove_at, use_positions};
 use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency};
@@ -727,6 +727,7 @@ mod unit_tests {
             multicast_info: None,
         });
         let store = DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
             value: Val(20),
             view: Val(11),
             indices: vec![Index::Const(0), Index::Const(0)],
@@ -1015,9 +1016,7 @@ mod unit_tests {
             }),
             recv.clone(),
         ];
-        let filter = Only::these(BTreeSet::from([
-            "c2-l3lu-sync-recv-lxlu0-lxlu1".to_owned(),
-        ]));
+        let filter = Only::these(BTreeSet::from(["c2-l3lu-sync-recv-lxlu0-lxlu1".to_owned()]));
 
         remove_ancestors(&OpId::at(&[3]), &mut module, filter.as_ref());
 
@@ -1556,7 +1555,9 @@ pub fn run_on_operation(
         // ⛔ THE REFERENCE NULL-DEREFERENCES WHERE THAT OPERAND IS NOT A `get_unit` RESULT
         // (`:428-432`, an unchecked `getDefiningOp<>()`); a component this island cannot read matches
         // no name, which is where the reference's own loop leaves `remove_unit` — set.
-        let component = units.first().and_then(|first| unit_component(*first, module));
+        let component = units
+            .first()
+            .and_then(|first| unit_component(*first, module));
         let remove_unit = options
             .components
             .as_ref()
@@ -1786,4 +1787,3 @@ fn erase_all(positions: &[OpId], module: &mut Vec<DfirOp>) {
         remove_at(id.path(), module);
     }
 }
-

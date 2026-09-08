@@ -119,7 +119,7 @@ use crate::units::DfirUnit;
 /// * `DT_CHECK_MSG(unit.getPrecision().has_value(), "Precision attribute for PT is expected")` —
 ///   ⛔ **DISCHARGED BY CONSTRUCTION.** The parameter is a [`dataflow::Precision`], not an
 ///   `Optional`. The island's `ProgramUnit::precision` IS an `Option` (a `dataflow.program_unit` may
-///   legitimately carry no attribute, and 
+///   legitimately carry no attribute, and
 ///   [`crate::islands::dataflow_ir::dialects::dataflow::Precision`] documents why), so the absent
 ///   case is a fact about the UNIT that its reader states — and this function is only reachable once
 ///   that reader has one, which is what taking the value rather than the option means.

@@ -88,7 +88,10 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             let operands = if symbol_definitions.is_empty() {
                 String::new()
             } else {
-                format!("({})", crate::islands::progir::print::vals(symbol_definitions))
+                format!(
+                    "({})",
+                    crate::islands::progir::print::vals(symbol_definitions)
+                )
             };
             // ⭐ THE RESULT'S TYPE RESTATES `size`, as the reference writes it:
             // `%bin = init.bin(%0) {name = "sdsc_0", size = 2688, symbol_ids = [-5]} : tensor<2688xi8>`

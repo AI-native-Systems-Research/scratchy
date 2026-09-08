@@ -846,11 +846,38 @@ impl IntegerSet {
     /// and only the ANSWERS are pinned by IBM's sets and their `CHECK-SENT-IR` lines.
     #[must_use]
     pub fn constant_bound(&self, bound: BoundType, pos: u32) -> Option<i64> {
+        self.bound_on(bound, Var::Dim(pos))
+    }
+
+    /// THE BOUND ON VARIABLE POSITION `pos` IN MLIR'S FLATTENED COLUMN ORDER, `[dims, symbols]` —
+    /// which is what `FlatLinearValueConstraints::getConstantBound`'s `pos` actually indexes.
+    ///
+    /// ⛔⛔ NOT A DIMENSION NUMBER, AND ENTRY 198 IS THE CALLER THAT PROVES IT.
+    /// `TPMVBase::getPageValidity` builds its page-selection system with ZERO dims and one SYMBOL
+    /// per loop iterator (`TransformPagedMemViewImpl.cpp:120-125`, `:122-124`), and
+    /// `createConditionsForHyperRectSubscripts` then reads `getConstantBound(LB, dim)` for `dim`
+    /// over the SUBSCRIPT map's dimensions (`:299-302`) — so position 0 is symbol 0 there.
+    /// [`Self::constant_bound`] asks about `d<pos>` and would answer `None` for every one of them,
+    /// which is `"expected constant lower and upper bounds"` on a system that has both.
+    #[must_use]
+    pub fn constant_bound_on_var(&self, bound: BoundType, pos: u32) -> Option<i64> {
+        self.bound_on(
+            bound,
+            if pos < self.dims {
+                Var::Dim(pos)
+            } else {
+                Var::Sym(pos - self.dims)
+            },
+        )
+    }
+
+    /// Both doors' shared body, over the variable each resolved `pos` to.
+    fn bound_on(&self, bound: BoundType, var: Var) -> Option<i64> {
         // `findEqualityToConstant(*this, 0, symbolic=false)`: a unit coefficient, and no other
         // dimension in the row. `-c / a` is exact because `a` is ±1.
         for constraint in &self.constraints {
             if let (true, Terms::OnPos { coeff, constant }) =
-                (constraint.is_equality, terms_in(&constraint.expr, pos))
+                (constraint.is_equality, terms_in(&constraint.expr, var))
                 && (coeff == 1 || coeff == -1)
             {
                 return Some(-constant / coeff);
@@ -859,7 +886,7 @@ impl IntegerSet {
 
         let mut tightest: Option<i64> = None;
         for constraint in &self.constraints {
-            let Terms::OnPos { coeff, constant } = terms_in(&constraint.expr, pos) else {
+            let Terms::OnPos { coeff, constant } = terms_in(&constraint.expr, var) else {
                 continue;
             };
             if constraint.is_equality {
@@ -997,6 +1024,18 @@ fn ceil_div(n: i64, d: i64) -> i64 {
     -((-n).div_euclid(d))
 }
 
+/// ONE VARIABLE OF A CONSTRAINT SYSTEM — a dimension or a symbol, told apart.
+///
+/// MLIR gives the two adjacent coefficient columns and indexes them by one position; this names
+/// which column that position landed in, so [`IntegerSet::bound_on`] can read either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Var {
+    /// `d<n>`.
+    Dim(u32),
+    /// `s<n>`.
+    Sym(u32),
+}
+
 /// WHAT ONE CONSTRAINT EXPRESSION SAYS ABOUT ONE DIMENSION.
 ///
 /// ⭐ THIS IS THE `FlatAffineValueConstraints` MATRIX, INLINED. MLIR flattens every constraint into
@@ -1007,8 +1046,9 @@ fn ceil_div(n: i64, d: i64) -> i64 {
 ///
 /// ⛔ A SYMBOL IS ANOTHER VARIABLE OF THAT ROW, NOT A CONSTANT. MLIR's flattening gives dimensions
 /// and symbols adjacent coefficient columns (`getNumDimAndSymbolVars()`), so an
-/// [`AffineExpr::Sym`] is [`Terms::OtherVars`] for every `pos` — never [`Terms::Const`], which
-/// would let a parameterised bound be read as a literal one.
+/// [`AffineExpr::Sym`] is [`Terms::OtherVars`] for every [`Var::Dim`] asked about — never
+/// [`Terms::Const`], which would let a parameterised bound be read as a literal one. It is
+/// [`Terms::OnPos`] only when the variable asked about is that very symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Terms {
     /// `c` — no dimension at all.
@@ -1041,9 +1081,13 @@ impl Terms {
 /// ⛔ MIXING `pos` WITH ANOTHER DIMENSION IS THE ONE SHAPE THIS CANNOT ANSWER, and answering
 /// "unbounded" for it would be a wrong answer rather than a missing one — eliminating the other
 /// variable combines the row with that variable's OPPOSING bounds, which needs the whole system.
-fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
+fn terms_in(expr: &AffineExpr, var: Var) -> Terms {
     match expr {
-        AffineExpr::Dim(n) if *n == pos => Terms::OnPos {
+        AffineExpr::Dim(n) if Var::Dim(*n) == var => Terms::OnPos {
+            coeff: 1,
+            constant: 0,
+        },
+        AffineExpr::Sym(n) if Var::Sym(*n) == var => Terms::OnPos {
             coeff: 1,
             constant: 0,
         },
@@ -1054,7 +1098,7 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
         // reads a bound, which is exactly why `replaceDimsAndSymbols` exists in that function.
         AffineExpr::Dim(_) | AffineExpr::Sym(_) => Terms::OtherVars,
         AffineExpr::Const(c) => Terms::Const(*c),
-        AffineExpr::Add(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+        AffineExpr::Add(a, b) => match (terms_in(a, var), terms_in(b, var)) {
             (Terms::Const(x), Terms::Const(y)) => Terms::Const(x + y),
             (Terms::Const(c), Terms::OnPos { coeff, constant })
             | (Terms::OnPos { coeff, constant }, Terms::Const(c)) => {
@@ -1074,13 +1118,12 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
             | (Terms::Const(_), Terms::OtherVars) => Terms::OtherVars,
             (Terms::OtherVars, Terms::OnPos { .. }) | (Terms::OnPos { .. }, Terms::OtherVars) => {
                 todo!(
-                    "a constant bound on d{pos} from a constraint that also mentions another \
-                     dimension needs the Fourier-Motzkin elimination \
-                     FlatAffineValueConstraints::projectOut runs"
+                    "a constant bound on {var:?} from a constraint that also mentions another variable needs \
+                     the Fourier-Motzkin elimination FlatAffineValueConstraints::projectOut runs"
                 )
             }
         },
-        AffineExpr::Mul(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+        AffineExpr::Mul(a, b) => match (terms_in(a, var), terms_in(b, var)) {
             (Terms::Const(x), Terms::Const(y)) => Terms::Const(x * y),
             (Terms::Const(k), Terms::OnPos { coeff, constant })
             | (Terms::OnPos { coeff, constant }, Terms::Const(k)) => {
@@ -1097,14 +1140,14 @@ fn terms_in(expr: &AffineExpr, pos: u32) -> Terms {
                 todo!("a constraint that multiplies two dimensions is not affine")
             }
         },
-        AffineExpr::Mod(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+        AffineExpr::Mod(a, b) => match (terms_in(a, var), terms_in(b, var)) {
             (Terms::Const(n), Terms::Const(d)) => Terms::Const(n.rem_euclid(d)),
             _ => todo!(
                 "a constant bound across a `mod` needs the local variable MLIR's affine flattening \
                  introduces for it"
             ),
         },
-        AffineExpr::FloorDiv(a, b) => match (terms_in(a, pos), terms_in(b, pos)) {
+        AffineExpr::FloorDiv(a, b) => match (terms_in(a, var), terms_in(b, var)) {
             (Terms::Const(n), Terms::Const(d)) => Terms::Const(n.div_euclid(d)),
             _ => todo!(
                 "a constant bound across a `floordiv` needs the local variable MLIR's affine \
@@ -2672,7 +2715,11 @@ mod tests {
     /// set excludes. This is the case that separates `div_euclid` from `/`.
     #[test]
     fn a_bound_rounds_toward_the_side_that_keeps_the_set() {
-        let scaled = |coeff: i64, c: i64| set(vec![ineq(AffineExpr::dim(0).times(coeff).plus(AffineExpr::Const(c)))]);
+        let scaled = |coeff: i64, c: i64| {
+            set(vec![ineq(
+                AffineExpr::dim(0).times(coeff).plus(AffineExpr::Const(c)),
+            )])
+        };
         assert_eq!(scaled(2, -5).constant_bound(BoundType::Lb, 0), Some(3));
         assert_eq!(scaled(-2, 5).constant_bound(BoundType::Ub, 0), Some(2));
         assert_eq!(scaled(2, 5).constant_bound(BoundType::Lb, 0), Some(-2));

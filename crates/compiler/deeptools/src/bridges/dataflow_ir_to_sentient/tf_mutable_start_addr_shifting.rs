@@ -72,7 +72,7 @@
 
 use super::agen_access_details::{AccessDetailsAffine, LayoutCoeff};
 use super::tf_mutable_addr_splitting::{AddrRange, ConstStartMemView, L3Half};
-use crate::arch::{Arch, Elements};
+use crate::arch::{Arch, Elements, IsaGen};
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith};
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap};
@@ -340,19 +340,27 @@ pub struct ShiftInputs<'a> {
     pub subscripts_map: &'a AffineMap,
     /// `dcc_ext_ctx_.getBytesPerStick() * 8 / ad.getElementWidth()`, resolved once.
     pub elements_per_stick: ElementsPerStick,
+    /// `ad.getElementWidth()` itself — the divisor `getMaxImmutableRange(comp)` crosses to become a
+    /// count of elements ([`calculate_shifts`], `:436`). [`ElementsPerStick`] is a quotient BY it and
+    /// cannot give it back.
+    pub element_width: NonZeroU32,
+    /// `ad.getIndicesCoeffDict()[nullptr]` — the whole composed constant offset of the access, which
+    /// is what `:412` tests against zero and `:439` against the immutable budget.
+    pub const_offset: i64,
 }
 
 impl<'a> ShiftInputs<'a> {
     /// THE FOUR FACTS, READ OFF ONE `AccessDetailsAffine`.
     #[must_use]
     pub fn of<A: Arch>(ad: &'a AccessDetailsAffine<'a>) -> Option<ShiftInputs<'a>> {
+        let element_width = NonZeroU32::new(ad.base.element_width.0)?;
         Some(ShiftInputs {
             layout_coeffs: &ad.base.layout_coeffs,
             transfer_order: &ad.base.transfer_order,
             subscripts_map: ad.subscripts_map.as_ref()?,
-            elements_per_stick: ElementsPerStick::of::<A>(NonZeroU32::new(
-                ad.base.element_width.0,
-            )?)?,
+            elements_per_stick: ElementsPerStick::of::<A>(element_width)?,
+            element_width,
+            const_offset: ad.indices_coeff_dict.constant,
         })
     }
 }
@@ -824,6 +832,96 @@ pub fn calculate_partial_shift(
     }
 }
 
+/// `isL3ImmutableAddrEven(evaluator, mem_view_op.getStartAddress(), num_elems_in_stick)` FOR A
+/// CONSTANT START — `evaluateDivideByConst(ev, n).isDivisibleBy(2)` over the one value that
+/// evaluation yields (`Dialect/Agen/Utils.cpp:218-288`), which is
+/// [`super::tf_mutable_addr_splitting::calculate_partition_sizes`]'s own reading of it.
+fn is_l3_immutable_addr_even(view: &ConstStartMemView<'_>, stick: ElementsPerStick) -> bool {
+    (view.start / stick.elements().0.cast_signed()) % 2 == 0
+}
+
+/// Replaces: e308_calculateShifts
+///
+/// **308/384** `MutableStartAddrShifting.cpp:396` (61L) — how much of each subscript's constant
+/// offset moves out into the immutable start address, one entry per subscripts-map result.
+///
+/// ⛔ THE `const_offset == 0` ARM STILL SHIFTS ON SEN1P5: an odd immutable address is realigned by
+/// [`offset_shifts`] of MINUS one stick, so the shifts come back NEGATIVE. ⚠️ And both
+/// `isL3ImmutableAddrAllOdd` aborts are unreachable on a constant start: it is even or it is all-odd.
+#[must_use]
+pub fn calculate_shifts<A: Arch>(
+    inputs: &ShiftInputs<'_>,
+    half: L3Half,
+    view: &ConstStartMemView<'_>,
+) -> Vec<Shift> {
+    // `int64_t num_elems_in_stick = dcc_ext_ctx_.getBytesPerStick() * 8 / ad.getElementWidth();`
+    let stick = inputs.elements_per_stick;
+    let one_stick = Shift(-stick.elements().0.cast_signed());
+
+    // *"If the constant offset is 0, there is no mutable address to shift."*
+    if inputs.const_offset == 0 {
+        // `for (int i = 0, e = subscripts_map.getNumResults(); i < e; ++i) shifts.push_back(0);`
+        let mut shifts = vec![Shift(0); inputs.subscripts_map.results.len()];
+        // *"If arch is sen1p5 up, immutable addresses need to contain even values only."*
+        // `if (dcc_ext_ctx_.getArch() < IsaCoreGen::SEN1P5_ISA) return;`
+        if A::GEN < IsaGen::Sen1p5 {
+            return shifts;
+        }
+        // `if (isL3ImmutableAddrEven(evaluator, getStartAddress(), num_elems_in_stick)) return;`
+        if is_l3_immutable_addr_even(view, stick) {
+            return shifts;
+        }
+        // `DT_CHECK_MSG(isL3ImmutableAddrAllOdd(...), "All immutable addrs must be odd to execute
+        // even shift.");` — see this function's doc for why a constant start cannot fail it.
+        //
+        // *"If the immutable address is odd, it needs to be shifted by one stick."*
+        // `offsetShifts(shifts, ad, -num_elems_in_stick);`
+        offset_shifts(&mut shifts, inputs.transfer_order, one_stick);
+        return shifts;
+    }
+
+    // *"If the constant offset is not 0, how much mutable address we can shift needs to be
+    // calculated based on immutable address space."*
+    //
+    // `auto max_immutable = getMaxImmutableAddress(evaluator, mem_view_op);` — the constant itself,
+    // for the reason [`super::tf_mutable_addr_splitting::calculate_partition_sizes`] records.
+    // `int64_t immutable_space = (getMaxImmutableRange(ad.getComp()) / ad.getElementWidth()) -
+    // max_immutable;`
+    let immutable_space = ImmutableSpace(
+        0i64.saturating_add_unsigned(
+            max_immutable_range::<A>(half).bits() / u64::from(inputs.element_width.get()),
+        )
+        .saturating_sub(view.start),
+    );
+
+    // `if (immutable_space >= const_offset) total_shift = calculateFullShift(shifts, ad); else
+    // total_shift = calculatePartialShift(shifts, ad, immutable_space);`
+    let (mut shifts, total) = if immutable_space.0 >= inputs.const_offset {
+        let full = calculate_full_shift(inputs);
+        (full.shifts, full.total)
+    } else {
+        let partial = calculate_partial_shift(inputs, immutable_space);
+        (partial.shifts, partial.total)
+    };
+
+    // `if (dcc_ext_ctx_.getArch() >= IsaCoreGen::SEN1P5_ISA)` — [`IsaGen`] is ordered.
+    if A::GEN >= IsaGen::Sen1p5 {
+        // *"The immutable addr and the shift amount must either both be even or both be odd to keep
+        // the immutable addr an even number of sticks."*
+        let is_even = is_l3_immutable_addr_even(view, stick);
+        // `bool is_even_shift = (total_shift / num_elems_in_stick) % 2 == 0;` — the TOTAL over the
+        // stick, not the total itself, and [`TotalShift::elements`] is the reference's `int64_t`.
+        let is_even_shift = (total.elements() / stick.elements().0.cast_signed()) % 2 == 0;
+        if is_even != is_even_shift {
+            // The `is_even ? true : isL3ImmutableAddrAllOdd(...)` abort sits here and cannot fire.
+            // `offsetShifts(shifts, ad, -num_elems_in_stick);`
+            offset_shifts(&mut shifts, inputs.transfer_order, one_stick);
+        }
+    }
+
+    shifts
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1252,6 +1350,8 @@ mod unit_tests {
                 NonZeroU32::new(element_width).expect("a width the fixture states"),
             )
             .expect("an element narrower than a stick"),
+            element_width: NonZeroU32::new(element_width).expect("a width the fixture states"),
+            const_offset: 0,
         }
     }
 
@@ -1693,12 +1793,75 @@ mod unit_tests {
         assert_eq!(nothing.shifts, vec![Shift(0); 3]);
         assert_eq!(nothing.total, TotalShift::WholeSticks(0));
     }
+
+    /// 🎯 308/384 — THE VENDOR'S `@full_shift_zero_const_start` MOVES `(64, 16, 128)` OUT AND ITS
+    /// VIEW START BECOMES `arith.constant 33856`
+    /// (`dcc/test/Transform/MutableStartAddrShifting/mutable_start_addr_shift_full.mlir:14-34`),
+    /// which is also the `const_offset` this access's coefficient dictionary carries.
+    ///
+    /// ⛔ AND THE `const_offset == 0` ARM IS NOT A NO-OP ON SEN1P5: an immutable address of an ODD
+    /// number of sticks takes a WHOLE STICK BACK, negative, on the first subscript the transfer order
+    /// visits along `d0` — while the same view below SEN1P5 shifts nothing at all.
+    #[test]
+    fn the_vendors_full_shift_moves_every_constant_offset_out() {
+        let subscripts = vendor_subscripts_map();
+        let order = AffineMap::identity(3);
+        let layout = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(256)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        let ty = MemRef {
+            shape: vec![8, 64, 4],
+            elem: ElemType::F16,
+        };
+        let view = ConstStartMemView {
+            from: Val(0),
+            start: 0,
+            layout: &layout,
+            ty: &ty,
+        };
+
+        // `immutable_space` is the whole EBR span in fp16 elements against a start of 0, so the
+        // `>= const_offset` arm is `calculateFullShift` and every offset moves.
+        let full = ShiftInputs {
+            const_offset: 33856,
+            ..shift_inputs(&VENDOR_COEFFS, &order, &subscripts, 16)
+        };
+        assert_eq!(
+            calculate_shifts::<Dd2>(&full, L3Half::Load, &view),
+            vec![Shift(64), Shift(16), Shift(128)],
+            "`[%c64, %arg1 * 3 + %c16, %arg2 * 2 + %c128]` becomes `[0, %arg1 * 3, %arg2 * 2]`"
+        );
+
+        // 65 sticks of fp16 — odd, so SEN1P5 realigns it by minus one stick and nothing else.
+        let odd = ConstStartMemView {
+            start: 64 * 65,
+            ..view
+        };
+        let zero = shift_inputs(&VENDOR_COEFFS, &order, &subscripts, 16);
+        assert_eq!(zero.const_offset, 0);
+        assert_eq!(
+            calculate_shifts::<Sen1p5>(&zero, L3Half::Load, &odd),
+            vec![Shift(-64), Shift(0), Shift(0)]
+        );
+        assert!(Dd2::GEN < IsaGen::Sen1p5);
+        assert_eq!(
+            calculate_shifts::<Dd2>(&zero, L3Half::Load, &odd),
+            vec![Shift(0); 3],
+            "below SEN1P5 the parity of the immutable address is not a constraint"
+        );
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e308_calculateShifts
 // crustify:todo: e323_shiftMutableAddr
 // crustify:todo: e352_transformVectorLoad
 // crustify:todo: e353_transformVectorStore

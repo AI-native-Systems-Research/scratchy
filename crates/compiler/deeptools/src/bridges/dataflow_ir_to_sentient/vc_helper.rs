@@ -183,10 +183,7 @@ impl<'a> EnclosingLoop<'a> {
     pub fn of(op: &'a sen::Op) -> Option<EnclosingLoop<'a>> {
         match op {
             sen::Op::Sentient(sentient::Op::For {
-                iv,
-                bound,
-                carried,
-                ..
+                iv, bound, carried, ..
             }) => Some(EnclosingLoop {
                 bound: *bound,
                 iv: *iv,
@@ -612,7 +609,10 @@ pub fn get_mask_value_for_pt<A: Arch>(
                     arith::IntConst::Bool(bit) => i64::from(*bit),
                     arith::IntConst::Int { value, .. } => *value,
                 };
-                (mask_set.replace_symbols(&[AffineExpr::Const(literal)], 0), true)
+                (
+                    mask_set.replace_symbols(&[AffineExpr::Const(literal)], 0),
+                    true,
+                )
             }
             // Anything else stays dynamic; the `else` branch judges what it is.
             Some(_) => (mask_set, false),
@@ -740,12 +740,9 @@ pub fn get_mask_value_for_pt<A: Arch>(
     }
 }
 
-
 #[cfg(test)]
 mod unit_tests {
-    use super::{
-        EnclosingLoop, MaskValue, PtLanes, PtUnit, get_mask_value_for_pt,
-    };
+    use super::{EnclosingLoop, MaskValue, PtLanes, PtUnit, get_mask_value_for_pt};
     use crate::arch::Dd2;
     use crate::bridges::dataflow_ir_to_sentient::vc_loop_mask_tree::MaskedColumns;
     use crate::islands::dataflow_ir::Values;
@@ -782,7 +779,11 @@ mod unit_tests {
             symbols: 0,
             constraints: vec![
                 ineq(AffineExpr::dim(0).plus(AffineExpr::Const(-first))),
-                ineq(AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(len - 1))),
+                ineq(
+                    AffineExpr::dim(0)
+                        .times(-1)
+                        .plus(AffineExpr::Const(len - 1)),
+                ),
             ],
         }
     }
@@ -800,7 +801,11 @@ mod unit_tests {
                         .plus(AffineExpr::sym(0).times(lanes_in_slice))
                         .plus(AffineExpr::Const(-len)),
                 ),
-                ineq(AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(len - 1))),
+                ineq(
+                    AffineExpr::dim(0)
+                        .times(-1)
+                        .plus(AffineExpr::Const(len - 1)),
+                ),
             ],
         }
     }

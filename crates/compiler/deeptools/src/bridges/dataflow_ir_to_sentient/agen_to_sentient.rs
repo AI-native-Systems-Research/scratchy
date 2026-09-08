@@ -281,22 +281,34 @@ mod tests {
         // L3 + burst: the increment is total_elements * burst; the address stays the view's.
         assert_eq!(
             set_immutable_addr_and_increments(DfirUnit::L3lu, true, 64, 32, 64),
-            Addressing { immutable_addr: ImmutableAddr::MemoryStart, increment: 2048 }
+            Addressing {
+                immutable_addr: ImmutableAddr::MemoryStart,
+                increment: 2048
+            }
         );
         // ⛔ non-L3 + burst: BOTH fields take stride_size. This is the case an earlier reading missed.
         assert_eq!(
             set_immutable_addr_and_increments(DfirUnit::Lxlu, true, 64, 32, 64),
-            Addressing { immutable_addr: ImmutableAddr::Constant(64), increment: 64 }
+            Addressing {
+                immutable_addr: ImmutableAddr::Constant(64),
+                increment: 64
+            }
         );
         // L3, no burst: the view's address, zero increment.
         assert_eq!(
             set_immutable_addr_and_increments(DfirUnit::L3su, false, 64, 0, 64),
-            Addressing { immutable_addr: ImmutableAddr::MemoryStart, increment: 0 }
+            Addressing {
+                immutable_addr: ImmutableAddr::MemoryStart,
+                increment: 0
+            }
         );
         // non-L3, no burst: both zero.
         assert_eq!(
             set_immutable_addr_and_increments(DfirUnit::Lxlu, false, 64, 0, 64),
-            Addressing { immutable_addr: ImmutableAddr::Constant(0), increment: 0 }
+            Addressing {
+                immutable_addr: ImmutableAddr::Constant(0),
+                increment: 0
+            }
         );
     }
 
@@ -327,13 +339,19 @@ mod tests {
     /// 🎯 130 — A MODE REWRITES `total_elements` TO THE FULL STICK; the default leaves it.
     #[test]
     fn choosing_a_mode_rewrites_the_element_count() {
-        assert_eq!(LoadType::default_mode(Elements(4)).total_elements, Elements(4));
+        assert_eq!(
+            LoadType::default_mode(Elements(4)).total_elements,
+            Elements(4)
+        );
         assert_eq!(
             LoadType::explicit::<Dd2>(Explicit::Splat2BAcross64, 16).total_elements,
             Elements(64),
             "a 128-byte stick holds 64 sixteen-bit elements"
         );
-        assert_eq!(LoadType::implicit::<Dd2>(SubStick::TwoBytes, 8).total_elements, Elements(128));
+        assert_eq!(
+            LoadType::implicit::<Dd2>(SubStick::TwoBytes, 8).total_elements,
+            Elements(128)
+        );
     }
 
     /// 🎯 130 — THE IMPLICIT ROUTE IS ASYMMETRIC: 2B splats, 16B pads.
@@ -373,7 +391,10 @@ mod tests {
     #[test]
     fn only_lxlu_sets_send_destinations() {
         assert!(sets_send_destination(DfirUnit::Lxlu));
-        assert!(!sets_send_destination(DfirUnit::Lxsu), "the store half is excluded");
+        assert!(
+            !sets_send_destination(DfirUnit::Lxsu),
+            "the store half is excluded"
+        );
         for unit in [DfirUnit::L3lu, DfirUnit::L0lu, DfirUnit::Pe, DfirUnit::Sfp] {
             assert!(!sets_send_destination(unit));
         }

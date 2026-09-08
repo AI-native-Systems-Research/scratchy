@@ -79,11 +79,11 @@ pub mod vc_vector_chain_to_sentient_pt;
 pub mod vc_vector_operands;
 
 use crate::arch::{Arch, Elements};
-use crate::formats::Bits;
 use crate::bridges::dataflow_ir_to_sentient::agen_agen_to_sentient::ExtractIdx;
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{self as dfir_op, Op as DfirOp, Val};
-use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
 use crate::islands::sentient::{self, ProgramUnit};
 use crate::model::Model;
@@ -100,9 +100,7 @@ use std_affine_to_standard::{Parent, YieldRewrite, lower_affine_yield};
 /// ⭐ THE KERNEL NAME AND EVERY PROGRAM NAME SURVIVE, because a program keeps its symbol as it is
 /// lowered — see [`sentient::Program::name`].
 #[must_use]
-pub fn lower<A: Arch, M: Model, W: Workload>(
-    run: &dfir::Run<A>,
-) -> sentient::Run<A, M, W> {
+pub fn lower<A: Arch, M: Model, W: Workload>(run: &dfir::Run<A>) -> sentient::Run<A, M, W> {
     sentient::Run {
         kernel: run.kernel,
         programs: run.programs.iter().map(program).collect(),
@@ -161,9 +159,7 @@ struct Consts {
 }
 
 /// LOWER ONE PROGRAM.
-fn program<A: Arch, M: Model, W: Workload>(
-    input: &dfir::Program<A>,
-) -> sentient::Program<A, M, W> {
+fn program<A: Arch, M: Model, W: Workload>(input: &dfir::Program<A>) -> sentient::Program<A, M, W> {
     // ── the dataflow-level rewrites run first, over the INPUT rung ────────────────────────────────
     // ⭐⭐ A `Transform/Dataflow/` PASS IS NOT PART OF THE LOWERING, IT PRECEDES IT. `dcc` runs the CFG
     // simplification on the DataflowIR module and hands the RESULT to `AgenToSentient`, so the walk
@@ -296,7 +292,9 @@ fn mint_constants<A: Arch>(
             match op {
                 // ⛔ A NON-L3 TRANSFER'S `immutable_addr` AND `increment` ARE ZERO, and the compute's
                 // mask is zero. One zero serves all of them.
-                DfirOp::Agen(dfir_op::agen::Op::VectorLoad { .. } | dfir_op::agen::Op::VectorStore { .. })
+                DfirOp::Agen(
+                    dfir_op::agen::Op::VectorLoad { .. } | dfir_op::agen::Op::VectorStore { .. },
+                )
                 | DfirOp::VectorChain(_) => want.push(0),
                 // ⛔⛔ AND AN L3 TRANSFER'S INCREMENT IS `total_elements * burst`, WHICH IS NOT ZERO.
                 // The golden's third constant is 2048 = 64 * 32 — the value level 2 read out of
@@ -352,7 +350,15 @@ fn body<A: Arch>(
     let mut extract = ExtractIdx::default();
     let mut i = 0;
     while i < unit.body.len() {
-        i += statement(&unit.body[i..], unit, &mut extract, bound, consts, comp, &mut out);
+        i += statement(
+            &unit.body[i..],
+            unit,
+            &mut extract,
+            bound,
+            consts,
+            comp,
+            &mut out,
+        );
     }
     ProgramUnit {
         on: unit.on.clone(),
@@ -377,7 +383,15 @@ fn statement<A: Arch>(
     match rest {
         // ── bookkeeping the body carries but the rung does not emit ──────────────────────────────
         [DfirOp::Arith(dfir_op::arith::Op::Constant { .. }), ..] => 1,
-        [DfirOp::Dataflow(dfir_op::dataflow::Op::GetLogicalMemoryView { result, from, start, .. }), ..] => {
+        [
+            DfirOp::Dataflow(dfir_op::dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                ..
+            }),
+            ..,
+        ] => {
             bound.view_of.insert(*result, *from);
             bound.view_start.insert(*result, *start);
             1
@@ -475,8 +489,14 @@ fn load_and_store(
         stride: 0,
         rotate_val: None,
         shuffle_mode: sen::ShuffleMode::NoShuffle,
-        src_reg: sen::Reg { locale: sen::RegType::Unknown, index: None },
-        dst_reg: sen::Reg { locale: sen::RegType::Unknown, index: None },
+        src_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        dst_reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
         dir: None,
         // ⚠️ THE SPINE DOES NOT DECIDE THIS. `construct_load_and_store_stmt` reads the store
         // memory's unit type for it; this path has no access details to read.

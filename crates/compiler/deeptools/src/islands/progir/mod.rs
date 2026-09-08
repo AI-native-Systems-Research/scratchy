@@ -24,11 +24,11 @@ pub mod print;
 pub mod ty;
 
 use crate::arch::Arch;
+use crate::islands::sentient::dialects::sentient::RegIndex;
 use crate::model::Model;
 use crate::workload::Workload;
 use sys_arch_spec::progir::{MAX_INSTRUCTIONS_PER_UNIT, MAX_REGISTERS_PER_UNIT};
 use sys_arch_spec::regfile::{Component, max_ibuff_entries};
-use crate::islands::sentient::dialects::sentient::RegIndex;
 use ty::{Invalid, OperandValue, RegType};
 
 /// ONE REGISTER'S INITIAL CONTENT — one entry of a unit's register state.

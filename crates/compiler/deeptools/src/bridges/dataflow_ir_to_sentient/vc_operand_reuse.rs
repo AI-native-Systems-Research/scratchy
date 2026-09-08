@@ -348,7 +348,11 @@ impl OperandReuse {
     #[must_use]
     pub fn dominates(&self, op1: &OpId, op2: &OpId) -> bool {
         let (a, b) = (op1.path(), op2.path());
-        match a.iter().zip(b).position(|(level_a, level_b)| level_a != level_b) {
+        match a
+            .iter()
+            .zip(b)
+            .position(|(level_a, level_b)| level_a != level_b)
+        {
             // (1) one path is a prefix of the other.
             None => a.len() <= b.len(),
             // (2) and (3).
@@ -911,7 +915,6 @@ mod unit_tests {
         assert_eq!(reuse.absorbtion_flag(Val(0)), Some(false));
         assert_eq!(reuse.absorbtion_flag(Val(1)), Some(true));
     }
-
 }
 
 /// Replaces: e227_OperandReuse
@@ -929,7 +932,6 @@ impl Drop for OperandReuse {
         // `data_origins_.clear();`
         self.data_origins.clear();
     }
-
 }
 
 // ⛔ AND IT MUST STAY ONE. `needs_drop::<OperandReuse>()` is `true` exactly when destroying one runs

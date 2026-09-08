@@ -1058,9 +1058,9 @@ second site above, not the path.
 
 ⛔ **AND THE TICK COUNT UNDERSTATES THE LANDED PORTS BY 18.** Measured after the 230-253 review landed:
 257 `[x]` PORT and 257 `[x]` AUDIT boxes, 127 unticked each (257 + 127 = 384), which is what the
-Progress counter read then — it now reads 297/297, with 265-272, 273-280, 281-288, 289-296 and
-297-304 ticked by their
-own porting batches. But 18 further entries carry a filled `/// Replaces:` anchor with both boxes
+Progress counter read then — it now reads 303/303, with 265-272, 273-280, 281-288, 289-296,
+297-304 and 305-310 ticked by their own porting batches. But 18 further entries carry a filled
+`/// Replaces:` anchor with both boxes
 still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exactly that state and
 `801187bde` and `edfa7b2bb`'s review passes ticked them; `2c70786a4`'s review of 167-190 did not, so its
 span is still open on paper while its Rust is landed. Ticking them is the reviewing pass's job for those
@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`297/384 ported; 297/384 audited`
+`303/384 ported; 303/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2435,6 +2435,113 @@ non-null, so `getNewDbgNameFromOp` (`Utils.cpp:492-501`) names a loop after it i
 loop unnamed. The clone now inherits, and its golden prints `dbgName = ""`.
 
 
+⭐ ENTRIES 305-310 — THE FLATTENING PASS'S TWO WALKS, THE MUTABLE-ADDRESS SPLIT OF A LOAD AND OF A
+STORE, THE START-ADDRESS SHIFT TABLE, ONE VALID PAGE AND THE PAGE ANALYSIS. 305 is in
+`tf_flattening_local_regions.rs`, 306/307 in `tf_mutable_addr_splitting.rs`, 308 in
+`tf_mutable_start_addr_shifting.rs`, 309/310 in `tf_transform_paged_mem_view_impl.rs`.
+
+⛔⛔ 305's TWO WALKS ARE COMPLEMENTARY, NOT ALTERNATIVES, AND THE `calls` COLUMN SAYS NOTHING ABOUT
+IT. `getOpToRegionMap` looks only at a region's DIRECT children (`Dialect/Uniform/Utils.cpp:75`), so
+walk 1 collapses `@diff_groups` — two regions of two units each, each holding a nested
+`uniform.uniformize_regions`, into four sibling regions of one unit — and is BLIND to a nested op
+wrapped in an `scf.if`; walk 2's `traverse_region` recurses through every region on the way down
+(`FlatteningLocalRegions.cpp:144-146`) and is what reaches the vendor's case 4. `Operation::walk` is
+POST-ORDER by default, and here that is load-bearing rather than incidental: `flattenUniformRegion`
+ERASES the op it was handed (`Utils.cpp:700`), which a pre-order walk would then descend into.
+
+⛔⛔ AND `to_be_deleted` IS SPENT AFTER THE WHOLE WALK (`:463`, `:475`), WHICH IS OBSERVABLE.
+`OpBuilder builder(&op_)` (`:406`) seats the insertion point BEFORE the operation being flattened — as
+`OpBuilder builder(uniform_op)` (`Utils.cpp:565`) does for the other walk — so a replacement precedes
+its original in the live IR and a parent reached later walks a region holding BOTH. The port models it
+with one `Flattened` per operation plus two projections, `as_the_walk_sees_them` and
+`after_the_erasures`; collapsing the two would either erase early or leak the original.
+`DisableThisPass` (`:29-32`) is dropped: `dcc-flatten-local-regions-disable` is a `dcc-opt`
+command-line flag, and which passes run is a call in this crate.
+
+⛔ 305 ALSO CLOSED A SCOPE HOLE. `flattenUniformRegion` (`Dialect/Uniform/Utils.cpp:563`, 140L) and
+its helpers `getOpToRegionMap` (`:67`), `allUnitsExistsInRegion` (`:51`) and the
+`getUnitsOfRegion`/`getUnitsPerRegionsAsVectorOfVector` pair (`:526`, `:490`) are in NEITHER the 384
+nor the 106 exclusions, and walk 1 is nothing but a call to the first of them. All five are written
+unanchored beside 305, on entry 261's precedent. Reading it line by line found four things:
+`units_for_each_region` (`:575-576`) is gathered and never read; the `j`-loop guard at `:675-677` is a
+TAUTOLOGY and its `else` at `:693-695` DEAD, because the counter is zeroed at `:673` and the only
+write inside the loop is that dead `else` zeroing it again; the region is taken as
+`getRegion(sub_region_index)` and NOT `getRegion(j.second)` (`:680-682`), which agree wherever the
+match is found in the group the index counts within — every case the four fixtures reach — and where
+they do not, the reference indexes past the matched op's last region; and two `DT_CHECK`s are
+unwritable here, `uniform_op_region_list.size() == op_per_region_list.size()` (`:570`) because the two
+lists are one record, and `getNumArguments() == 1` (`:683-685`) because a `LocalRegion` has one `arg`
+field. `sub_region_index = -1` is likewise a value the reference never reads at, so `enumerate()`
+inside the group replaces it, `itr` and `index_partial_sum` together.
+
+⛔⛔ 306 CLONES THE **STORE'S** VIEW PER PARTITION AND 307 THE **LOAD'S**, never shared —
+*"Every memory operand should have it's own unique mem view"* (`MutableAddrSplitting.cpp:359-364`) —
+and each is collected from the OTHER op's use chain (`:328-332`), because a load/store pattern is
+merged into one transfer later and both halves must be eligible before either is split. The parity
+adjustment runs INSIDE the lambda (`:344`), once per partition on that partition's own
+`start_addr_mod`; hoisting it would apply one leaf's correction to every leaf. The start-address
+constants are HOISTED out of the unit, which is why `TransferSplit::Split` carries them in a `hoisted`
+field of its own rather than in the partition's op list.
+
+⛔⛔ AND INSIDE 307's LAMBDA THE ORDER IS REVERSED, WITH THE PRODUCER RE-POINTED BEFORE IT IS
+CLONED. `setInsertionPoint(new_mem_op)` (`:428`) seats the builder before the NEW store; the loop then
+walks the new store's chain — which still reaches the ORIGINAL load, because `cloneWithNewAccessInfo`
+carries `getValueToStore()` over — and assigns each load the partition's own view clone (`:429-435`);
+only then is the chain cloned (`:436`), so the clone inherits that assignment and the new store is
+re-pointed at it last. 306's version emits its chain AFTER the new op and never touches the original.
+307's `use_chain.empty()` branch is live in this island and dead in the C++, and a shuffle input that
+is absent takes it.
+
+⛔ 308's `const_offset == 0` ARM STILL SHIFTS ON SEN1P5 (`MutableStartAddrShifting.cpp:396-456`): an
+odd immutable address is realigned by MINUS one stick, so a table of zeros comes back NEGATIVE. Both
+`isL3ImmutableAddrAllOdd` aborts are unreachable on a constant start — it is even or it is all-odd —
+and the two passes' `MAX_IMMUTABLE_SIZE` are two different `cl::opt`s that agree only while both sit
+at `cl::init(-1)`, which is the configuration this crate compiles.
+
+⛔ 309 RE-READS `insert_refs = mem_ops_` FOR EVERY PAGE (`TransformPagedMemViewImpl.cpp:201`, and
+again at `:219`): a previous page's conditions guard THAT page's copy, so no access ever arrives
+already wrapped. Its two arms read two different systems — hyper-rectangular bounds out of
+`page_sel_constraints`, which carries one SYMBOL per iterator, non-hyper-rectangular ones out of
+`page_set` itself, one dim per VIEW AXIS — and only the rebuild writes back to `info`.
+`subscripts_map_sym` is in the signature and unread in the body.
+
+⛔⛔ AND THAT SYMBOL/DIM SPLIT IS WHERE THE ISLAND WAS WRONG. `getConstantBound(LB, dim)`
+(`:299-302`) indexes MLIR's flattened `[dims, symbols]` column order, and entry 294 hands over a
+system with ZERO dims and one symbol per iterator (`:120-125`), so `IntegerSet::constant_bound` —
+which asks about `d<pos>` — answers `None` for every column and refuses a page whose bounds are both
+constant. `constant_bound_on_var` was added beside it as the door that resolves `pos` the way the
+reference does, and the 309 test is the caller that proves the difference.
+
+⛔ 310 SEEDS `compare_constraints` FROM THE FIRST VALID PAGE AND NEVER REPLACES IT (`:906-909`), so
+every later page is compared against page one rather than against its predecessor — which is what
+makes a symbol "differs across the pages" and not "differs from the page before it". Its two refusals
+are `emitOpError`s and so FAIL the pass (`:915-921`), and
+`page_set.getNumDims() == subscripts_map_.getNumResults()` needs no test here: a `PageRect` has one
+span per view axis and the map one result per view axis, which is the same fact twice.
+
+⛔ ISLAND GROWTH, ALL ON AGENT-BRIEF.md:87. `agen::Op::VectorStore` gained
+`dbg_name: Option<String>` with the printer emitting it first and 19 construction sites passing
+`None`, because `cloneWithNewAccessInfo` substitutes an EMPTY name for an absent one (`Agen.cpp:166`)
+and the vendor's 307 key prints `dbgName = ""` on the rebuilt store; `VectorStoreOp` gained
+`view`/`indices`/`view_ty`/`ty`/`dbg_name` and four store-side helpers written unanchored from
+`Agen.cpp:207-259` (`vector_store_use_chain`, `clone_use_chain_to_new_store`,
+`clone_store_with_new_access_info`, `erase_vector_store_and_use_chain`); `MasCandidate` was added
+unanchored (`MutableAddrSplitting.cpp:91-101`); `VectorLoadSplit` was renamed `TransferSplit` with
+`NotAVectorStore` added so 306 and 307 share one refusal enum; `TpmvComposite` gained
+`page_dependent_time_syms`, the manager handle a `view` field, and `ShiftInputs` the fields 308 reads;
+`indices_from_map` was promoted to `pub(super)`; and the `op_creator` callback of entries 252 and 290
+now takes `&mut Values` (four test call sites updated), because a page's rebuild mints values.
+
+⚠️ THREE PLACES THE PINNED TEXT IS THIS ISLAND'S AND NOT THE VENDOR'S, none of them a defect in these
+six: `MemRef` has no dynamic extent, so `memref<?x64x4xf16>` is written with its constant extent —
+which is also why 305's fixture drops the innermost `affine.for` with the `agen.vector_load` and the
+`dataflow.send` the vendor's `@diff_groups` carries; `right_shift = true` prints although the `.td`
+defaults it (`vectorchain.rs:1255`); and a derived `load_set`/`store_set` puts the contiguous axis
+LAST where the vendor's own attribute puts it on `d0`, which is why the two MAS answer keys are
+reproduced with the layout transposed and scaled — the overflow, the one quantity the arithmetic
+reads, unchanged, and each test stating the vendor's original pair beside it.
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3057,18 +3164,18 @@ loop unnamed. The clone now inherits, and its golden prints `dbgName = ""`.
 - [x] **AUDIT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, line by line against the C++
 - [x] **PORT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, 254 lines
 - [x] **AUDIT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, line by line against the C++
-- [ ] **PORT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, 17 lines
-- [ ] **AUDIT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, line by line against the C++
-- [ ] **PORT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, 75 lines
-- [ ] **AUDIT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, line by line against the C++
-- [ ] **PORT 307/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375`, 74 lines
-- [ ] **AUDIT 307/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375`, line by line against the C++
-- [ ] **PORT 308/384** `calculateShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:396`, 61 lines
-- [ ] **AUDIT 308/384** `calculateShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:396`, line by line against the C++
-- [ ] **PORT 309/384** `constructValidPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190`, 58 lines
-- [ ] **AUDIT 309/384** `constructValidPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190`, line by line against the C++
-- [ ] **PORT 310/384** `analyzeValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888`, 33 lines
-- [ ] **AUDIT 310/384** `analyzeValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888`, line by line against the C++
+- [x] **PORT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, 17 lines
+- [x] **AUDIT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, line by line against the C++
+- [x] **PORT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, 75 lines
+- [x] **AUDIT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, line by line against the C++
+- [x] **PORT 307/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375`, 74 lines
+- [x] **AUDIT 307/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375`, line by line against the C++
+- [x] **PORT 308/384** `calculateShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:396`, 61 lines
+- [x] **AUDIT 308/384** `calculateShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:396`, line by line against the C++
+- [x] **PORT 309/384** `constructValidPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190`, 58 lines
+- [x] **AUDIT 309/384** `constructValidPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190`, line by line against the C++
+- [x] **PORT 310/384** `analyzeValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888`, 33 lines
+- [x] **AUDIT 310/384** `analyzeValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888`, line by line against the C++
 
 ## Level 5
 

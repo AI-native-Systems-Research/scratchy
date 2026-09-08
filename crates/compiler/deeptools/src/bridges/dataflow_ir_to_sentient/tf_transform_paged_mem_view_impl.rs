@@ -112,9 +112,11 @@ use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
 use crate::islands::dataflow_ir::dialects::dataflow::{Page, PageRect, PagedMemView};
 use crate::islands::dataflow_ir::dialects::{
     self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results, scf, uses,
+    vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{
-    AffineExpr, AffineMap, Constraint, FlatConstraints, IntegerSet, MemRef, ScalarTy, Vector,
+    AffineExpr, AffineMap, BoundType, Constraint, FlatConstraints, IntegerSet, MemRef, ScalarTy,
+    Vector,
 };
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::units::DfirUnit;
@@ -981,10 +983,10 @@ pub enum UseChain<'a> {
     ///
     /// What `VectorStoreOp::getUseChain` returns. Its FIRST element binds no result.
     ///
-    /// ⚠️ NO UNIT IN THIS FILE PRODUCES ONE YET: `TPMVVectorStore::getUseChain`
+    /// ⚠️ NO SCHEDULED UNIT IN THIS FILE PRODUCES ONE: `TPMVVectorStore::getUseChain`
     /// (`TransformPagedMemViewImpl.cpp:721`) is not among the 384 and not among the 106 exclusions —
-    /// see the note on [`erase_vector_load_and_use_chain`]. The variant is here because
-    /// [`Self::consumer_first`] is only correct if it can tell the two apart.
+    /// see the note on [`erase_vector_load_and_use_chain`]. [`vector_store_use_chain`] is the DIALECT
+    /// method it would have wrapped, added unanchored for entry 307.
     ProducerWard(Vec<&'a DfirOp>),
 }
 
@@ -1138,6 +1140,16 @@ pub struct VectorStoreOp<'a> {
     /// ⭐ WHAT A STORE'S USE CHAIN ROOTS AT: `VectorStoreOp::getUseChain` takes
     /// `getValueToStore().getDefiningOp()` as the next link (`Agen.cpp:216`).
     pub value: Val,
+    /// `getMemRef()` — the view written.
+    pub view: Val,
+    /// `getAffineMapAttr()` AND `getMapIndices()` TOGETHER, as [`VectorLoadOp::indices`] holds them.
+    pub indices: &'a [Index],
+    /// The view's type, which `cloneWithNewAccessInfo` carries over unchanged.
+    pub view_ty: &'a MemRef,
+    /// The vector stored, likewise carried over.
+    pub ty: Vector,
+    /// `getDbgNameAttr()` — read by that same clone (`Agen.cpp:244`).
+    pub dbg_name: Option<&'a str>,
 }
 
 impl<'a> VectorStoreOp<'a> {
@@ -1145,9 +1157,22 @@ impl<'a> VectorStoreOp<'a> {
     #[must_use]
     pub fn of(op: &'a DfirOp) -> Option<VectorStoreOp<'a>> {
         match op {
-            DfirOp::Agen(agen::Op::VectorStore { value, .. }) => {
-                Some(VectorStoreOp { op, value: *value })
-            }
+            DfirOp::Agen(agen::Op::VectorStore {
+                value,
+                view,
+                indices,
+                dbg_name,
+                view_ty,
+                ty,
+            }) => Some(VectorStoreOp {
+                op,
+                value: *value,
+                view: *view,
+                indices,
+                view_ty,
+                ty: *ty,
+                dbg_name: dbg_name.as_deref(),
+            }),
             DfirOp::Agen(
                 agen::Op::VectorLoad { .. }
                 | agen::Op::SymbolicVectorLoad { .. }
@@ -1172,6 +1197,158 @@ impl<'a> VectorStoreOp<'a> {
             | DfirOp::Symbol(_) => None,
         }
     }
+}
+
+/// `agen::VectorStoreOp::getUseChain` (`Agen.cpp:207-222`) — the DIALECT method, and the
+/// producer-ward twin of [`vector_load_use_chain`]:
+///
+/// ```cpp
+/// SmallVector<Operation*> VectorStoreOp::getUseChain() {
+///   auto& op = *this;
+///   SmallVector<Operation*> use_chain;
+///   use_chain.push_back(op);
+///   //   receive + store / constant_bitstream + shuffle + store / vector_load + store
+///   auto input_op = getValueToStore().getDefiningOp();
+///   use_chain.push_back(input_op);
+///   if (auto shuffle_op = dyn_cast<vectorchain::ShuffleOp>(input_op))
+///     use_chain.push_back(shuffle_op.getInput().getDefiningOp());
+///   return use_chain;
+/// }
+/// ```
+///
+/// ⛔ NO ASSERTS AND NO WALK: the store's chain is a fixed two or three links read off the operand,
+/// where the load's is a loop over uses. That is also why it comes out store-first — the order
+/// [`UseChain::ProducerWard`] records and `eraseOpAndUseChain` consumes as-is.
+///
+/// ⛔ AND A VALUE WITH NO DEFINING OP MAKES IT [`UseChain::None`]. The reference pushes the null
+/// `input_op` and every later loop dereferences it; a store fed by a block argument is that, and the
+/// documented "no use chain" answer is what the load's side already returns for its own dead ends. A
+/// shuffle whose own input has no producer is the same null one link further out, and it stops the
+/// chain at the shuffle rather than extending it with nothing.
+pub(super) fn vector_store_use_chain<'a>(
+    store: VectorStoreOp<'a>,
+    scope: &'a [DfirOp],
+) -> UseChain<'a> {
+    let Some(input_op) = defining_op(store.value, scope) else {
+        return UseChain::None;
+    };
+    let mut chain = vec![store.op, input_op];
+    // `if (auto shuffle_op = dyn_cast<vectorchain::ShuffleOp>(input_op))` — the widened bitstream's
+    // producer is the third link, and only a shuffle has one.
+    if let DfirOp::VectorChain(vectorchain::Op::Shuffle { input, .. }) = input_op
+        && let Some(shuffle_input) = defining_op(*input, scope)
+    {
+        chain.push(shuffle_input);
+    }
+    UseChain::ProducerWard(chain)
+}
+
+/// `agen::VectorStoreOp::cloneUseChainToNewOp` (`Agen.cpp:224-238`):
+///
+/// ```cpp
+/// void VectorStoreOp::cloneUseChainToNewOp(OpBuilder& builder, Operation* new_op) {
+///   auto use_chain = getUseChain();
+///   Value prev_val = nullptr, prev_cloned_val = nullptr;
+///   for (int i = use_chain.size() - 1; i > 0; --i) {
+///     auto cloned_op = builder.clone(*use_chain[i]);
+///     if (prev_val && prev_cloned_val)
+///       cloned_op->replaceUsesOfWith(prev_val, prev_cloned_val);
+///     builder.setInsertionPointAfter(cloned_op);
+///     prev_val = use_chain[i]->getResult(0);
+///     prev_cloned_val = cloned_op->getResult(0);
+///   }
+///   new_op->replaceUsesOfWith(prev_val, prev_cloned_val);
+/// }
+/// ```
+///
+/// ⛔⛔ THE WALK RUNS **BACKWARDS** AND THE STORE IS RE-POINTED LAST. Cloning from the far producer
+/// down to the store's immediate input puts the clones out in dependency order — which is emission
+/// order, and therefore the order of the returned list — and only then does the new store stop
+/// reading the original's value. The load's version (`cloneUseChainToNewOp`, entries 127/128) starts
+/// from the new op's own result instead, because its chain runs the other way.
+///
+/// ⚠️ IT DEREFERENCES `prev_val` UNCONDITIONALLY (`:237`), so a chain of one — a store whose value has
+/// no producer — is a null `replaceUsesOfWith` in the reference. [`vector_store_use_chain`] answers
+/// [`UseChain::None`] for exactly that input, and this leaves the new store untouched.
+pub(super) fn clone_use_chain_to_new_store(
+    vals: &mut Values,
+    use_chain: &UseChain<'_>,
+    new_store: &mut DfirOp,
+) -> Vec<DfirOp> {
+    // ⛔ NOTHING TO CLONE UNLESS THE CHAIN RUNS PRODUCER-WARD FROM THE STORE — a consumer-ward chain
+    // belongs to a LOAD, and this is the store's method.
+    let UseChain::ProducerWard(use_chain) = use_chain else {
+        return Vec::new();
+    };
+    let mut cloned: Vec<DfirOp> = Vec::new();
+    let mut prev: Option<(Val, Val)> = None;
+    // `for (int i = use_chain.size() - 1; i > 0; --i)` — every link but the store itself.
+    for op in use_chain[1..].iter().rev() {
+        let mut cloned_op = dialects::clone_with_fresh_results(op, vals);
+        if let Some((prev_val, prev_cloned_val)) = prev {
+            dialects::replace_uses_of_with(&mut cloned_op, prev_val, prev_cloned_val);
+        }
+        // ⭐ AND THE PAIR MOVES ONLY WHEN BOTH HALVES EXIST, as the load's does: the reference reads
+        // `getResult(0)` on both and would keep its old pair for a producer that binds nothing.
+        if let Some(pair) = dialects::results(op)
+            .first()
+            .copied()
+            .zip(dialects::results(&cloned_op).first().copied())
+        {
+            prev = Some(pair);
+        }
+        cloned.push(cloned_op);
+    }
+    // `new_op->replaceUsesOfWith(prev_val, prev_cloned_val)`.
+    if let Some((prev_val, prev_cloned_val)) = prev {
+        dialects::replace_uses_of_with(new_store, prev_val, prev_cloned_val);
+    }
+    cloned
+}
+
+/// `agen::VectorStoreOp::cloneWithNewAccessInfo` (`Agen.cpp:240-248`) — the store twin of the clone
+/// inside [`create_new_mem_op`]: the view, the subscript map and the indices are replaced and
+/// everything else is carried over, `store_set` and `store_order` included.
+///
+/// ⛔ AND IT SUBSTITUTES AN **EMPTY** `dbgName` FOR AN ABSENT ONE (`:244`), which is why the vendor's
+/// rebuilt stores print `dbgName = ""` where the input printed no such attribute
+/// (`mutable_addr_splitting_one_dim_sen1p5.mlir:75`).
+pub(super) fn clone_store_with_new_access_info(
+    store: VectorStoreOp<'_>,
+    mem_view: Val,
+    indices: Vec<Index>,
+) -> DfirOp {
+    DfirOp::Agen(agen::Op::VectorStore {
+        // `getValueToStore()` — the ORIGINAL producer's result, which is what makes
+        // [`clone_use_chain_to_new_store`]'s final re-point necessary.
+        value: store.value,
+        view: mem_view,
+        indices,
+        dbg_name: Some(store.dbg_name.unwrap_or_default().to_owned()),
+        view_ty: store.view_ty.clone(),
+        ty: store.ty,
+    })
+}
+
+/// `agen::VectorStoreOp::eraseOpAndUseChain` (`Agen.cpp:250-259`) — the delete list, and it walks the
+/// chain **FORWARDS** (`for (auto& o : use_chain) o->erase();`) where the load's reverses it. Both
+/// mean the same thing: consumer before producer, which is the only order that erases nothing still
+/// in use. [`UseChain::consumer_first`] is where that agreement lives.
+///
+/// ⭐ AND ITS `use_chain.empty()` BRANCH IS LIVE HERE WHERE IT IS DEAD IN C++, exactly as the load's
+/// is (see [`erase_vector_load_and_use_chain`]): `getUseChain` always pushes the store itself, so the
+/// reference can only reach that line by never reaching it, and a store with no producer answers
+/// [`UseChain::None`] here instead of pushing a null.
+pub(super) fn erase_vector_store_and_use_chain<'a>(
+    store: VectorStoreOp<'a>,
+    scope: &'a [DfirOp],
+) -> Vec<&'a DfirOp> {
+    let to_be_erased = vector_store_use_chain(store, scope).consumer_first();
+    if to_be_erased.is_empty() {
+        // `if (use_chain.empty()) { auto& op = *this; op->erase(); }`.
+        return vec![store.op];
+    }
+    to_be_erased
 }
 
 /// Replaces: e130_getStoreOp
@@ -1896,14 +2073,18 @@ impl<'p> TpmvVectorLoadStore<'p> {
 /// against entry 373 (`TPMVVector::run`, `Impl.cpp:647`), so it appears in neither the 384 nor the
 /// exclusions.
 ///
-/// ⛔ ITS FOUR EXTRA MEMBERS ARE NOT DECLARED YET, for the reason [`TpmvBase`] gives: `time_set_`,
-/// `access_details_`, `page_dependent_time_syms_` and `tpmv_comp_info_` (`hpp:508-513`) are all
-/// *"Set during initialization"* and arrive with entries 326 (`initialize`), 310 (`analyzeValidPages`)
-/// and 260 (`gatherPageDependentDimsForPage`). The constructor writes none of them.
+/// ⛔ THREE OF ITS FOUR EXTRA MEMBERS ARE STILL NOT DECLARED, for the reason [`TpmvBase`] gives:
+/// `time_set_`, `access_details_` and `tpmv_comp_info_` (`hpp:508-513`) are *"Set during
+/// initialization"* and arrive with entry 326 (`initialize`). The fourth,
+/// `page_dependent_time_syms_`, is below — entry 310 is what fills it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TpmvComposite<'p> {
     /// The `TPMVBase` subobject.
     pub base: TpmvBase<'p>,
+    /// `page_dependent_time_syms_` — which loop iterators have a bearing on page selection, as
+    /// [`gather_page_dependent_dims_for_page`] adds them and [`identify_time_dim_for_explicit_loops`]
+    /// reads them. Empty until [`Self::analyze_valid_pages`] runs.
+    pub page_dependent_time_syms: BTreeSet<PageSelSym>,
 }
 
 impl<'p> TpmvComposite<'p> {
@@ -1917,6 +2098,7 @@ impl<'p> TpmvComposite<'p> {
     pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvComposite<'p> {
         TpmvComposite {
             base: TpmvBase::new(mem_op, comp),
+            page_dependent_time_syms: BTreeSet::new(),
         }
     }
 }
@@ -3137,6 +3319,7 @@ scf.if %2 {
                 ty: LANES,
             }),
             DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
                 value: estimated,
                 view,
                 indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],
@@ -3171,6 +3354,7 @@ scf.if %2 {
         let mut forked = ops.clone();
         let estimated = dialects::results(&ops[1])[0];
         forked.push(DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
             value: estimated,
             view,
             indices: vec![Index::Const(1), Index::Const(0), Index::Const(0)],
@@ -3381,6 +3565,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
     /// (`paged_mem_view_load_and_store.mlir:1289`).
     fn vector_store(value: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
             value,
             view: Val(11),
             indices: indices(),
@@ -4897,9 +5082,11 @@ scf.if %3 {
                 dbg_name: None,
             })
         };
-        let terminator = || DfirOp::Affine(affine::Op::Yield {
-            operands: Vec::new(),
-        });
+        let terminator = || {
+            DfirOp::Affine(affine::Op::Yield {
+                operands: Vec::new(),
+            })
+        };
         let mut scope = vec![counted(
             Val(100),
             4,
@@ -4963,6 +5150,262 @@ scf.if %3 {
 }
 ",
             text(&scope)
+        );
+    }
+
+    /// 🎯 309/384 — THE VENDOR'S FIRST PAGE, END TO END: THREE GUARDS, A PLAIN VIEW OVER THE PAGE'S
+    /// OWN START, AND THE ACCESS AND ITS CHAIN REBUILT INSIDE THEM.
+    ///
+    /// `paged_mem_view_loads.mlir:288-296` in, `:44-61` out, value for value.
+    ///
+    /// ⛔ THE BOUND DOOR IS THE DEFECT THIS CATCHES: entry 294 hands over a system with ZERO dims and
+    /// `[s0, s1]`, so reading column 0 as `d0` finds no bound and the page comes back
+    /// [`ValidPage::SubscriptBoundIsNotConstant`] with three conditions never emitted.
+    ///
+    /// ⚠️ THREE PLACES THE PRINTED TEXT IS THE ISLAND'S AND NOT THE VENDOR'S, none of them this
+    /// entry's: `memref<?x64x4xf16>` is written `8x64x4` ([`MemRef`] has no dynamic extent);
+    /// `right_shift = true` prints although the `.td` defaults it (`vectorchain.rs:1255`); and
+    /// `load_set` is DERIVED with the contiguous axis LAST, where the vendor CARRIES one whose
+    /// contiguous axis is `d0` (`#ATTR_7`, `:24`). The guards, the `addi`, the view and the
+    /// subscripts — everything `constructValidPage` decides — are the vendor's value for value.
+    #[test]
+    fn the_vendors_first_page_is_guarded_and_rebuilt_over_its_own_start() {
+        let mut vals = Values::default();
+        let lx = vals.mint();
+        let c0 = vals.mint();
+        let c16 = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let lxlu0 = vals.mint();
+        let sfp0 = vals.mint();
+        let mem_view = vals.mint();
+        let loaded = vals.mint();
+        let rotated = vals.mint();
+        let (to, _) = Link::<LxluUnit, SfpUnit>::between(lxlu0, sfp0).ends();
+
+        // `affine_map<(d0, d1, d2) -> (d2 * 256 + d1 * 64 + d0)>` (`:289`) over `memref<?x64x4xf16>`.
+        let view_ty = MemRef {
+            shape: vec![8, 64, 4],
+            elem: ElemType::F16,
+        };
+        let vendor_layout = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(256)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        // `page0` and `page1` (`:291-292`); only the first is constructed here.
+        let pages = vec![
+            Page {
+                idx_set: PageRect {
+                    spans: vec![
+                        PageSpan { lo: 0, hi: 63 },
+                        PageSpan { lo: 0, hi: 1 },
+                        PageSpan { lo: 0, hi: 4 },
+                    ],
+                },
+                start_addr: c0,
+            },
+            Page {
+                idx_set: PageRect {
+                    spans: vec![
+                        PageSpan { lo: 0, hi: 63 },
+                        PageSpan { lo: 0, hi: 1 },
+                        PageSpan { lo: 5, hi: 9 },
+                    ],
+                },
+                start_addr: c16,
+            },
+        ];
+        let view = PagedMemView {
+            result: mem_view,
+            unit: lx,
+            start_addr: c0,
+            pages,
+            layout: vendor_layout,
+            ty: view_ty.clone(),
+        };
+        // `%load = agen.vector_load %mem_view[%c0, %arg1 * 3, %arg2 * 2 + %c2]`, its rotate and its
+        // send (`:297-299`) — the whole chain the page's guards have to end up around.
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(view))),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: loaded,
+                view: mem_view,
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(arg1, 3)], 0),
+                    Index::Strided(vec![(arg2, 2)], 2),
+                ],
+                view_ty: view_ty.clone(),
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Rotate {
+                result: rotated,
+                input: loaded,
+                position: c16,
+                right_shift: true,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: rotated,
+                ty: LANES,
+            }),
+        ];
+
+        // `affine.for %arg1 = 0 to 2` and `%arg2 = 0 to 4` (`:285-286`) are the two iterator ranges.
+        let access = PagedAccess {
+            mem_ops: vec![loaded],
+            paged_mem_view: mem_view,
+            subscripts_map: vendor_subscripts(),
+            indices: vec![arg1, arg2],
+            indices_ranges: vec![IvRange { lb: 0, ub: 1 }, IvRange { lb: 0, ub: 3 }],
+            conditional_iter_args: Vec::new(),
+        };
+        let page = PagedMemViewHandle::of(&scope[0])
+            .expect("the first op is the paged view")
+            .view
+            .pages[0]
+            .clone();
+        let subscripts_map_sym = replace_dims_in_map_with_syms(&access.subscripts_map);
+        let info = TpmvInfo {
+            paged_mem_view: None,
+            subscripts_map: access.subscripts_map.clone(),
+            indices: access.indices.clone(),
+            indices_ranges: access.indices_ranges.clone(),
+            conditional_iter_args: Vec::new(),
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        let PageValidity::Valid(page_sel_constraints) =
+            get_page_validity(&info, &subscripts_map_sym, &page.idx_set.as_integer_set())
+        else {
+            panic!("the vendor's `arg1 * 3` and `arg2 * 2 + 2` both reach page0");
+        };
+
+        let mut emitted = scope.clone();
+        let ValidPage::Constructed(built) = construct_valid_page(
+            &mut vals,
+            &mut emitted,
+            &access,
+            &page,
+            &page_sel_constraints,
+        ) else {
+            panic!("page0 bounds both iterators with constants");
+        };
+
+        assert_eq!(
+            text(&built.placed[0]),
+            "\
+%10 = arith.constant 0 : index
+%11 = arith.cmpi eq, %3, %10 : index
+scf.if %11 {
+  %12 = arith.constant 0 : index
+  %13 = arith.cmpi sge, %4, %12 : index
+  scf.if %13 {
+    %14 = arith.constant 1 : index
+    %15 = arith.cmpi sle, %4, %14 : index
+    scf.if %15 {
+      %16 = arith.addi %1, %1 : index
+      %17 = dataflow.get_logical_memory_view %0, %16 {layout_map = affine_map<(d0, d1, d2) -> \
+             (d2 * 256 + d1 * 64 + d0)>} : index, index, memref<8x64x4xf16>
+      %18 = agen.vector_load %17[0, 0, %4 * 2 + 2] {dbgName = \"\", load_order = \
+             affine_map<(d0, d1, d2) -> (d0, d1, d2)>, load_set = affine_set<(d0, d1, d2) : \
+             (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>} : memref<8x64x4xf16>, vector<64xf16>
+      %19 = vectorchain.rotate %18, %2 {right_shift = true} : vector<64xf16>, index, vector<64xf16>
+      dataflow.send %6, %19 : vector<64xf16>
+    }
+  }
+}
+"
+        );
+        // The pinned iterator is gone from the access, and nothing took the iter_args arm.
+        assert_eq!(vec![loaded], built.access.mem_ops);
+        assert_eq!(Val(18), built.new_mem_ops[0].result);
+        assert!(built.access.conditional_iter_args.is_empty());
+        assert!(built.ir_maps.is_empty());
+    }
+
+    /// 🎯 310/384 — THE VENDOR'S SIX-PAGE VIEW IS REACHED ON FOUR PAGES, AND BOTH ITERATORS SELECT.
+    ///
+    /// `paged_mem_view_loads.mlir:288-296` in, and the expectation pins the COUNT: the first load is
+    /// rebuilt exactly four times, over start addends `%c0`, `%c1000`, `%c2000` and `%c3000`
+    /// (`:44-180`) — `%arg1 * 3` is 0 or 3 and never lands in page 4's or page 5's `d1` span `[4, 5]`.
+    ///
+    /// ⚠️ NOT THE COMPOSITE CASE (`:316-341`) THOUGH THIS IS THE COMPOSITE CLASS: its four pages are
+    /// selected by a TIME iterator that entry 326 substitutes into the subscripts, and
+    /// `agen.composite_load` has no island op. The analysis being run is the base's either way.
+    #[test]
+    fn the_vendors_six_pages_are_reached_four_times_and_both_iterators_bear_on_which() {
+        let mut vals = Values::default();
+        let lx = vals.mint();
+        let mem_view = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        // `page0`..`page5` (`:291-296`) — `d1` over three spans of two, `d2` over two spans of five.
+        let pages: Vec<Page> = [
+            ([0, 1], [0, 4]),
+            ([0, 1], [5, 9]),
+            ([2, 3], [0, 4]),
+            ([2, 3], [5, 9]),
+            ([4, 5], [0, 4]),
+            ([4, 5], [5, 9]),
+        ]
+        .into_iter()
+        .map(|([lo1, hi1], [lo2, hi2])| Page {
+            idx_set: PageRect {
+                spans: vec![
+                    PageSpan { lo: 0, hi: 63 },
+                    PageSpan { lo: lo1, hi: hi1 },
+                    PageSpan { lo: lo2, hi: hi2 },
+                ],
+            },
+            start_addr: vals.mint(),
+        })
+        .collect();
+        let scope = vec![DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(
+            Box::new(PagedMemView {
+                result: mem_view,
+                unit: lx,
+                start_addr: lx,
+                pages,
+                layout: AffineMap::identity(3),
+                ty: MemRef {
+                    shape: vec![8, 64, 4],
+                    elem: ElemType::F16,
+                },
+            }),
+        ))];
+        let info = TpmvInfo {
+            paged_mem_view: PagedMemViewHandle::of(&scope[0]),
+            subscripts_map: vendor_subscripts(),
+            indices: vec![arg1, arg2],
+            indices_ranges: vec![IvRange { lb: 0, ub: 1 }, IvRange { lb: 0, ub: 3 }],
+            conditional_iter_args: Vec::new(),
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        // `analyzeValidPages` never reads `mem_op_`, so the view op stands in for the absent
+        // `agen.composite_load`.
+        let mut composite = TpmvComposite::new(&scope[0], DfirUnit::Lxlu);
+
+        let reached = composite
+            .analyze_valid_pages(&info, &replace_dims_in_map_with_syms(&info.subscripts_map));
+
+        assert_eq!(
+            ValidPages::Found(NonZeroU32::new(4).expect("the vendor rebuilds the load four times")),
+            reached
+        );
+        // `d1`'s span moved for pages 2 and 3 and `d2`'s for pages 1 and 3, so both select.
+        assert_eq!(
+            BTreeSet::from([PageSelSym(0), PageSelSym(1)]),
+            composite.page_dependent_time_syms
         );
     }
 }
@@ -5408,8 +5851,12 @@ pub fn create_iter_args_for_conditionals(
         let grown = create_for_op_with_additional_return_value(vals, &counted, num_args, false);
         let mut new_loop = grown.op;
         let mut init_consts: Vec<DfirOp> = Vec::new();
-        let (DfirOp::Affine(affine::Op::For { iv, carried, body, .. })
-        | DfirOp::Scf(scf::Op::For { iv, carried, body, .. })) = &mut new_loop
+        let (DfirOp::Affine(affine::Op::For {
+            iv, carried, body, ..
+        })
+        | DfirOp::Scf(scf::Op::For {
+            iv, carried, body, ..
+        })) = &mut new_loop
         else {
             continue;
         };
@@ -5546,11 +5993,349 @@ fn ops_at_mut<'s>(
     ops_at_mut(region, rest)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 309/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// AN ACCESS'S INDEX LIST FROM THE `affine_map` AND OPERANDS MLIR KEEPS IT AS —
+/// [`super::vc_vector_operands::access_map`]'s inverse, which entry 128 needs because
+/// `cloneWithNewAccessInfo` is handed the two halves (`:246`) while this island writes the strided
+/// sum inline ([`Index::Strided`]).
+pub(super) fn indices_from_map(subscripts_map: &AffineMap, indices: &[Val]) -> Vec<Index> {
+    subscripts_map
+        .results
+        .iter()
+        .map(|result| {
+            let flat = result.flatten(subscripts_map.dims, subscripts_map.syms);
+            let terms: Vec<(Val, i64)> = flat
+                .dims
+                .iter()
+                .enumerate()
+                .filter(|&(_, &coeff)| coeff != 0)
+                .filter_map(|(dim, &coeff)| indices.get(dim).map(|&index| (index, coeff)))
+                .collect();
+            match terms.as_slice() {
+                // A pinned dimension — `%mem_view[4, ..]`, which is what entry 198 substituted in.
+                [] => Index::Const(flat.constant),
+                // ⭐ A UNIT STRIDE WITH NO ADDEND PRINTS BARE, per [`Index::Strided`].
+                [(index, 1)] if flat.constant == 0 => Index::Val(*index),
+                _ => Index::Strided(terms, flat.constant),
+            }
+        })
+        .collect()
+}
+
+/// THE `TPMVInfo` AND `mem_ops_` STATE ONE PAGE'S CONSTRUCTION READS AND REWRITES.
+///
+/// ⛔ EVERY HANDLE IS THE [`Val`] IT BINDS, NOT A `&'p` BORROW: `createIterArgsForConditionals`
+/// CLONES the whole loop nest and `:503-516` then re-points `mem_ops_` and `paged_mem_view_` into the
+/// clone. No borrow of the program being rewritten survives that, and re-resolving a value against
+/// the new scope is exactly what the reference's `ir_map` lookups do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagedAccess {
+    /// `mem_ops_`, each by the value it binds — `:503-506`.
+    pub mem_ops: Vec<Val>,
+    /// `info.paged_mem_view_`, by its result — `:511-514`.
+    pub paged_mem_view: Val,
+    /// `info.subscripts_map_`.
+    pub subscripts_map: AffineMap,
+    /// `info.indices_`.
+    pub indices: Vec<Val>,
+    /// `info.indices_ranges_`, as [`calculate_indices_ranges`] computed them.
+    pub indices_ranges: Vec<IvRange>,
+    /// `info.conditional_iter_args_` — non-empty once some page took the non-hyper-rectangular arm.
+    pub conditional_iter_args: Vec<Val>,
+}
+
+/// WHAT ONE PAGE'S CONSTRUCTION PRODUCED.
+#[derive(Debug, Clone)]
+pub struct ConstructedPage {
+    /// One entry per `mem_ops_`, in that order: this page's non-paged view, the access rebuilt
+    /// against it and its cloned use chain, wrapped in whatever guard the page needed.
+    pub placed: Vec<Vec<DfirOp>>,
+    /// `new_mem_ops` — appended in the same order, which is what entry 356 re-populates `mem_ops_`
+    /// with after erasing the originals.
+    pub new_mem_ops: Vec<NewMemOp>,
+    /// `mem_ops_`, `paged_mem_view_`, `indices_` and `conditional_iter_args_` on the way out.
+    pub access: PagedAccess,
+    /// One `IRMapping` per loop the nest rebuild cloned. ⛔ THE SIBLING-`TPMVInfo` RE-SYNC AT
+    /// `:518-521` IS THE CALLER'S, over [`update_tpmv_info`]: `tpmv_info_` is not this function's to
+    /// hold, for the reason [`PagedAccess`] gives.
+    pub ir_maps: Vec<ValueMapping>,
+}
+
+/// A PAGE, CONSTRUCTED OR REFUSED.
+#[derive(Debug, Clone)]
+pub enum ValidPage {
+    /// The page's accesses, emitted.
+    Constructed(ConstructedPage),
+    /// `DT_CHECK_MSG(lb.has_value() && ub.has_value(), "expected constant lower and upper bounds")`
+    /// (`:304-305`) — see [`SubscriptDim::of`], which is where that pair is taken.
+    SubscriptBoundIsNotConstant,
+}
+
+/// Replaces: e309_constructValidPage
+///
+/// **309/384** `TPMVBase::constructValidPage` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190` (58L).
+///
+/// ⛔ `insert_refs = mem_ops_` IS RE-READ EVERY PAGE (`:201`, and again at `:219`): a previous page's
+/// conditions guard THAT page's copy, so no access ever arrives already wrapped. ⛔ AND THE TWO ARMS
+/// READ DIFFERENT SYSTEMS — hyper-rectangular bounds come from `page_sel_constraints` (one symbol per
+/// ITERATOR), non-hyper-rectangular ones from `page_set` itself (one dim per VIEW AXIS), and only the
+/// rebuild writes back to `info`. ⚠️ `subscripts_map_sym` is in the signature and unread in the body.
+#[must_use]
+pub fn construct_valid_page(
+    vals: &mut Values,
+    scope: &mut Vec<DfirOp>,
+    access: &PagedAccess,
+    page: &Page,
+    page_sel_constraints: &IntegerSet,
+) -> ValidPage {
+    // "If conditionals are created, every page may require different subscripts/indices."
+    // `AffineMap subscripts_map = info.subscripts_map_;` / `SmallVector<Value> indices = info.indices_;`
+    let mut subscripts_map = access.subscripts_map.clone();
+    let mut indices = access.indices.clone();
+    let mut out = access.clone();
+    let mut ir_maps: Vec<ValueMapping> = Vec::new();
+
+    // `FlatLinearValueConstraints page_set_constraints(page_set);` — the page's own rectangle, whose
+    // `getConstantBound(LB/UB, res)` per dimension IS its span (entry 123 records why).
+    let page_set_bounds: Vec<IvRange> = page
+        .idx_set
+        .spans
+        .iter()
+        .map(|span| IvRange {
+            lb: span.lo,
+            ub: span.hi,
+        })
+        .collect();
+
+    // `SmallVector<Operation *, 16> insert_refs = mem_ops_;` — bare ops, on every page.
+    let mut nests: Vec<Condition> = vec![Condition::default(); access.mem_ops.len()];
+
+    // `if (!indices.empty())` — a constant access reaches one page and needs no guard at all.
+    if !indices.is_empty() {
+        let flat = FlatConstraints::from_integer_set(page_sel_constraints);
+        // `page_sel_constraints.isHyperRectangular(0, page_sel_constraints.getNumCols() - 1)`.
+        if flat.is_hyper_rectangular(0, flat.num_cols() - 1) {
+            // "Hyperrectangular subscripts - creating conditionals"
+            //
+            // ⛔ `constant_bound_ON_VAR`, NOT `constant_bound`: entry 294 hands this system over with
+            // ZERO dims and one SYMBOL per iterator, so `getConstantBound(LB, dim)`'s `dim` is a
+            // COLUMN and column 0 is `s0`. Reading it as `d0` answers `None` for every iterator.
+            let dims: Option<Vec<SubscriptDim>> = (0..subscripts_map.dims)
+                .map(|dim| {
+                    SubscriptDim::of(
+                        *indices.get(dim as usize)?,
+                        page_sel_constraints.constant_bound_on_var(BoundType::Lb, dim),
+                        page_sel_constraints.constant_bound_on_var(BoundType::Ub, dim),
+                        *out.indices_ranges.get(dim as usize)?,
+                    )
+                })
+                .collect();
+            let Some(dims) = dims else {
+                return ValidPage::SubscriptBoundIsNotConstant;
+            };
+
+            let created = create_conditions_for_hyper_rect_subscripts(
+                vals,
+                &vec![InsertRef::MemOp; nests.len()],
+                &subscripts_map,
+                &dims,
+            );
+            // ⭐ `removal` CANNOT REFUSE HERE: entry 198 deletes from the very list it built out of
+            // [`SubscriptDim::index`], so every request is present.
+            nests = created.insert_refs;
+            subscripts_map = created.subscripts_map;
+            indices = created.indices;
+        } else {
+            // `if (info.conditional_iter_args_.empty())` — at most once across the whole page loop.
+            if out.conditional_iter_args.is_empty() {
+                // "Non-hyperrectangular subscripts - creating iter_args"
+                let created =
+                    create_iter_args_for_conditionals(vals, scope, &subscripts_map, &indices);
+                out.conditional_iter_args = created.conditional_iter_args;
+                // `info.indices_ = indices;`
+                indices = created.indices;
+                out.indices = indices.clone();
+
+                // `:503-516` — `mem_ops_` and `paged_mem_view_` re-pointed into the clone, per loop.
+                for ir_map in &created.ir_maps {
+                    for mem_op in &mut out.mem_ops {
+                        if let Some(moved) = ir_map.lookup(*mem_op) {
+                            *mem_op = moved;
+                        }
+                    }
+                    out.paged_mem_view = ir_map.lookup_or_default(out.paged_mem_view);
+                }
+                ir_maps = created.ir_maps;
+
+                // `insert_refs = mem_ops_;  // Loop bodies may have been cloned.`
+                nests = vec![Condition::default(); out.mem_ops.len()];
+            }
+
+            // "Non-hyperrectangular subscripts - creating conditionals"
+            nests = create_conditions_for_non_hyper_rect_subscripts(
+                vals,
+                &vec![InsertRef::MemOp; nests.len()],
+                &subscripts_map,
+                &out.conditional_iter_args,
+                &page_set_bounds,
+            );
+        }
+    }
+
+    // `calculateStartElementsForPage(page_set_constraints)` then
+    // `createNewSubscriptsFromStartElements(subscripts_map, start_elements)`.
+    let start_elements = calculate_start_elements_for_page(&page.idx_set);
+    let new_subscripts_map =
+        create_new_subscripts_from_start_elements(&subscripts_map, &start_elements);
+    let new_indices = indices_from_map(&new_subscripts_map, &indices);
+
+    // The rewrite is finished, so the program is readable again — `OpBuilder builder(mem_ops_[0])`
+    // and the zip below need nothing but a look at it.
+    let scope: &[DfirOp] = scope;
+    let mut placed: Vec<Vec<DfirOp>> = Vec::new();
+    let mut new_mem_ops: Vec<NewMemOp> = Vec::new();
+
+    // `for (auto [insert_ref, mem_op] : zip(insert_refs, mem_ops_))`.
+    for (nest, &mem_op) in nests.iter().zip(&out.mem_ops) {
+        // `cast<agen::VectorLoadOp>(mem_op)` inside entry 128 — the class the manager already chose,
+        // so `None` belongs to one of the five unscheduled `createNewMemOp` overrides and to nothing
+        // a `TPMVVectorLoad` can hold.
+        let Some(load) = defining_op(mem_op, scope).and_then(VectorLoadOp::of) else {
+            continue;
+        };
+        let Some(paged) = defining_op(out.paged_mem_view, scope).and_then(PagedMemViewHandle::of)
+        else {
+            continue;
+        };
+
+        // `createNonPagedMemView(builder, info.paged_mem_view_, page_idx)`, then
+        // `createNewMemOp(builder, mem_op, info, mem_view_val, new_subscripts_map, indices)`.
+        let view = create_non_paged_mem_view(vals, paged.view, page);
+        let created = create_new_mem_op(
+            vals,
+            load,
+            view.view,
+            paged.view.ty.clone(),
+            new_indices.clone(),
+            scope,
+        );
+
+        // `setBuilderToInsertRef(builder, insert_ref)` — both ops go wherever it points.
+        let mut ops = view.ops;
+        ops.extend(created.ops.iter().cloned());
+        placed.push(set_builder_to_insert_ref(InsertRef::Conditional(nest), ops));
+        new_mem_ops.push(created);
+    }
+
+    ValidPage::Constructed(ConstructedPage {
+        placed,
+        new_mem_ops,
+        access: out,
+        ir_maps,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 310/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// HOW MANY PAGES AN ACCESS CAN REACH — [`TpmvComposite::analyze_valid_pages`]'s answer.
+///
+/// ⛔ THE TWO REFUSALS ARE `emitOpError`s, WHICH FAIL THE PASS (`:915-921`) — not diagnostics the
+/// caller may carry on past. The third is the `DT_CHECK_MSG` [`get_page_validity`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidPages {
+    /// `valid_pages` — how many of the view's pages the subscripts reach, at least one.
+    Found(NonZeroU32),
+    /// `"expecting only one active page when subscripts are constant"`.
+    ConstantSubscriptsReachSeveralPages,
+    /// `"no valid pages found"`.
+    NoValidPages,
+    /// `DT_CHECK_MSG(.., "idx_set should be hyper rectangular")`, naming the page that is not one.
+    PageIsNotHyperRectangular(PageIdx),
+}
+
+/// WHICH PAGE OF THE VIEW — `page_idx`, the loop variable of every `getIdxSets()` walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PageIdx(pub u32);
+
+impl TpmvComposite<'_> {
+    /// Replaces: e310_analyzeValidPages
+    ///
+    /// **310/384** `TPMVComposite::analyzeValidPages` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888` (33L).
+    ///
+    /// ⛔ `compare_constraints` IS SEEDED BY THE FIRST VALID PAGE AND NEVER REPLACED (`:906-909`), so
+    /// every later page is compared against page one and not against its predecessor — which is what
+    /// makes a symbol "differs across the pages" rather than "differs from the page before it".
+    /// ⚠️ AND `DT_CHECK(page_set.getNumDims() == subscripts_map_.getNumResults())` needs no test here:
+    /// a [`PageRect`] has one span per view axis and the subscript map has one result per view axis,
+    /// so the two counts are the same fact.
+    pub fn analyze_valid_pages(
+        &mut self,
+        info: &TpmvInfo<'_>,
+        subscripts_map_sym: &AffineMap,
+    ) -> ValidPages {
+        // `info.paged_mem_view_.getIdxSets()`, dereferenced unqualified: the view is erased only by
+        // `transform()`, which runs after this. A view already gone presents no pages.
+        let Some(handle) = info.paged_mem_view else {
+            return ValidPages::NoValidPages;
+        };
+
+        // `FlatLinearValueConstraints compare_constraints; bool do_compare = false;` — the `Option`
+        // IS `do_compare`, which the reference needs because its default-constructed system is
+        // indistinguishable from a real one.
+        let mut compare_constraints: Option<IntegerSet> = None;
+        let mut valid_pages = 0u32;
+
+        for (page_idx, page) in handle.view.pages.iter().enumerate() {
+            let page_set = page.idx_set.as_integer_set();
+            let page_sel_constraints = match get_page_validity(info, subscripts_map_sym, &page_set)
+            {
+                PageValidity::Valid(set) => set,
+                // `if (page_sel_constraints.isEmpty()) continue;` — both of entry 294's empty
+                // answers are that one test.
+                PageValidity::SubscriptsDoNotIntersectThePage
+                | PageValidity::IvBoundsDoNotIntersectThePage => continue,
+                PageValidity::PageIsNotHyperRectangular => {
+                    return ValidPages::PageIsNotHyperRectangular(PageIdx(
+                        u32::try_from(page_idx).expect("a page count fits a u32"),
+                    ));
+                }
+            };
+
+            valid_pages += 1;
+
+            match &compare_constraints {
+                Some(compare) => gather_page_dependent_dims_for_page(
+                    &page_sel_constraints,
+                    compare,
+                    &mut self.page_dependent_time_syms,
+                ),
+                None => compare_constraints = Some(page_sel_constraints),
+            }
+        }
+
+        // `if (subscripts_map_sym.getNumSymbols() == 0 && valid_pages > 1)` — constant subscripts
+        // name one element, so two pages holding it means the pages overlap.
+        if subscripts_map_sym.syms == 0 && valid_pages > 1 {
+            return ValidPages::ConstantSubscriptsReachSeveralPages;
+        }
+
+        match NonZeroU32::new(valid_pages) {
+            Some(found) => ValidPages::Found(found),
+            None => ValidPages::NoValidPages,
+        }
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e309_constructValidPage
-// crustify:todo: e310_analyzeValidPages
 // crustify:todo: e324_analyzeAndConstructValidPages
 // crustify:todo: e325_transform_time
 // crustify:todo: e326_initialize_time

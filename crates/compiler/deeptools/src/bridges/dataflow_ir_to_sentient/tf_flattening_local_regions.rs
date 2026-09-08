@@ -1333,6 +1333,387 @@ fn replace_uses_at_or_below(op: &mut DfirOp, from: Val, to: Val) {
     }
 }
 
+/// ONE `(uniform.uniformize_regions, region)` PAIR AND THAT REGION'S OPERATIONS —
+/// `uniform_op_region_list[i]` and `op_per_region_list[i]` as one record
+/// (`dcc/src/Dialect/Uniform/Utils.cpp:67-97`).
+///
+/// ⭐ ONE LIST, NOT TWO, which is what makes
+/// `DT_CHECK(uniform_op_region_list.size() == op_per_region_list.size())` (`:570`) unwritable.
+struct RegionOfUniformOp<'p> {
+    /// `.first`'s regions — the op the pair names, either the one being flattened or a nested one.
+    all_regions: &'p [uniform::LocalRegion],
+    /// `.first == uniform_op` (`:581`, `:633`, `:675`).
+    is_the_op_being_flattened: bool,
+    /// `.second`, read only to ask whether the pair names a NESTED op's first region (`:594`).
+    index: usize,
+    /// `.first.getRegion(.second)` — what `getUnitsOfRegion` (`:526`) reaches for.
+    region: &'p uniform::LocalRegion,
+    /// The region's operations with `uniform.yield` left out (`:82`, `:90`), and with a nested
+    /// `uniform.uniformize_regions` left out too because it contributes pairs of its own.
+    ops: Vec<&'p DfirOp>,
+}
+
+/// `getOpToRegionMap` — ONE LEVEL OF NESTING FLATTENED INTO A LIST OF PAIRS
+/// (`dcc/src/Dialect/Uniform/Utils.cpp:67-97`).
+///
+/// A nested op contributes one pair per region OF ITS OWN, and the enclosing region's pair comes
+/// after them (`:93-94`) — the order `:579-603` and `:661-699` both depend on.
+///
+/// ⛔⛔ `getRegion(i).getOps()` IS THE REGION'S DIRECT CHILDREN (`:75`), SO THE TWO WALKS OF ENTRY 305
+/// SEE DIFFERENT NESTING. A nested `uniform.uniformize_regions` wrapped in an `scf.if` — the vendor's
+/// case 4 (`flatten_local_region4.mlir:750`) — is invisible here and is
+/// [`FlatteningLocalRegionsTree::traverse_region`]'s business, which recurses through every region on
+/// the way down (`FlatteningLocalRegions.cpp:144-146`).
+fn op_to_region_map(regions: &[uniform::LocalRegion]) -> Vec<RegionOfUniformOp<'_>> {
+    let mut map: Vec<RegionOfUniformOp<'_>> = Vec::new();
+    for (i, region) in regions.iter().enumerate() {
+        let mut region_op_list: Vec<&DfirOp> = Vec::new();
+        for op in &region.body {
+            if let DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                regions: child_regions,
+                ..
+            }) = op
+            {
+                for (j, child_region) in child_regions.iter().enumerate() {
+                    map.push(RegionOfUniformOp {
+                        all_regions: child_regions,
+                        is_the_op_being_flattened: false,
+                        index: j,
+                        region: child_region,
+                        ops: child_region
+                            .body
+                            .iter()
+                            .filter(|op| !is_yield(op))
+                            .collect(),
+                    });
+                }
+            } else if !is_yield(op) {
+                region_op_list.push(op);
+            }
+        }
+        map.push(RegionOfUniformOp {
+            all_regions: regions,
+            is_the_op_being_flattened: true,
+            index: i,
+            region,
+            ops: region_op_list,
+        });
+    }
+    map
+}
+
+/// `isa<mlir::uniform::YieldOp>(op)` (`dcc/src/Dialect/Uniform/Utils.cpp:82`, `:90`) — the terminator
+/// `getOpToRegionMap` never carries over, because every region built at `:697-698` gets a fresh one.
+fn is_yield(op: &DfirOp) -> bool {
+    matches!(op, DfirOp::Uniform(uniform::Op::Yield { .. }))
+}
+
+/// `allUnitsExistsInRegion` (`dcc/src/Dialect/Uniform/Utils.cpp:51-63`) — every unit of the class,
+/// not merely one, so a region that covers half of it is not the region the class came from.
+///
+/// ⭐ `getUnitsOfRegion(pair.first, pair.second)` (`:55`) IS THE PAIR'S OWN REGION, which is why the
+/// record carries it rather than the index it would have to be looked up by.
+fn all_units_exist_in_region(units: &[Val], pair: &RegionOfUniformOp<'_>) -> bool {
+    units.iter().all(|unit| pair.region.units.contains(unit))
+}
+
+/// `dcc::uniform::utils::flattenUniformRegion` — `dcc/src/Dialect/Uniform/Utils.cpp:563` (140L),
+/// A SCOPE HOLE: entry 305 calls it and it is in neither the 384 nor the 106 exclusions.
+///
+/// ⛔ NESTED REGIONS BECOME SIBLINGS. An outer op whose regions each hold one nested op comes out as
+/// ONE op with a region per nested region, in outer-then-inner order — `flatten_local_region.mlir:88`
+/// in, `:19-67` out. `None` is every `return uniform_op` (`:573`, `:628`, `:637` and the recursion's
+/// fixpoint at `:701`), because handing the caller its own argument back means nothing changed.
+#[must_use]
+fn flatten_uniform_region(op: &DfirOp, values: &mut Values) -> Option<DfirOp> {
+    let DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) = op else {
+        return None;
+    };
+    // `getOpToRegionMap(..); if (uniform_op_region_list.size() == uniform_op.getNumRegions())`
+    // (`:569-573`) — one pair per region and no more is an op with nothing nested in it.
+    let region_list = op_to_region_map(regions);
+    if region_list.len() == regions.len() {
+        return None;
+    }
+
+    // `:577-603` — the units the new regions will carry, grouped by the op that owned them.
+    // ⭐ `getUnitsPerRegionsAsVectorOfVector` (`:490-505`) AND `getUnitsOfRegion` (`:526-543`) ARE
+    // BOTH `region.units` HERE: this island's [`uniform::LocalRegion`] holds the slice of the flat
+    // `$units` operand list that `$list_sizes` cuts out, so neither walk has anything to compute.
+    // ⚠️ WHICH ALSO MAKES `:575-576` VISIBLY DEAD — the reference gathers `units_for_each_region` and
+    // never reads it again; only `units_for_each_region_list` reaches `:615`.
+    let mut units_for_each_region_list: Vec<Vec<&[Val]>> = Vec::new();
+    let mut num_of_local_uniform_op_in_region = 0u32;
+    for pair in &region_list {
+        if pair.is_the_op_being_flattened {
+            if num_of_local_uniform_op_in_region == 0 {
+                units_for_each_region_list.push(vec![pair.region.units.as_slice()]);
+            } else {
+                num_of_local_uniform_op_in_region = 0;
+            }
+        } else if pair.index == 0 {
+            num_of_local_uniform_op_in_region += 1;
+            units_for_each_region_list.push(
+                pair.all_regions
+                    .iter()
+                    .map(|region| region.units.as_slice())
+                    .collect(),
+            );
+        }
+    }
+
+    // `if (sum == uniform_op.getUnits().size()) { .. } else { return uniform_op; }` (`:615-629`) —
+    // *"the union of units in local regions is not equal to the union of units in bigger regions"*
+    // is unsupported, and the reference says so by declining.
+    let sum: usize = units_for_each_region_list
+        .iter()
+        .flatten()
+        .map(|units| units.len())
+        .sum();
+    if sum != regions.iter().map(|region| region.units.len()).sum() {
+        return None;
+    }
+
+    // `new_list_of_units_per_region` (`:614-624`) PAIRED WITH `sub_region_index` (`:660-668`). The
+    // reference recovers that index from `itr`, `index_partial_sum` and `num_sub_regions`; it is the
+    // position WITHIN the group, so `enumerate()` inside the group states it and the reference's
+    // `sub_region_index = -1` start — a value it is never read at, since `num_sub_regions[itr] >= 1`
+    // sends `i == 0` down the `else` — becomes unwritable, and so does `itr` running off the end.
+    let new_list_of_units_per_region: Vec<(usize, &[Val])> = units_for_each_region_list
+        .iter()
+        .flat_map(|group| {
+            group
+                .iter()
+                .enumerate()
+                .map(|(sub_region_index, units)| (sub_region_index, *units))
+        })
+        .collect();
+
+    // `:631-642` — *"Non-perfectly nested uniform op is not supported"*: an enclosing region that
+    // held a nested op must hold NOTHING ELSE, and `op_per_region_list[j]` is what it held.
+    let mut num_of_local_uniform_op_in_region = 0u32;
+    for pair in &region_list {
+        if pair.is_the_op_being_flattened {
+            if num_of_local_uniform_op_in_region != 0 {
+                num_of_local_uniform_op_in_region = 0;
+                if !pair.ops.is_empty() {
+                    return None;
+                }
+            }
+        } else {
+            num_of_local_uniform_op_in_region += 1;
+        }
+    }
+
+    // `for (int i = 0; i < num_of_regions; i++)` (`:661-699`) — one region per new unit list.
+    // ⭐ THE NEW OP IS CREATED AT `:654-658`, BEFORE ANY OF THIS, and built last here for entry 287's
+    // reason: the regions it is created with are empty either way. `new_list_sizes` and
+    // `new_unit_list` (`:644-651`) are each region's own [`uniform::LocalRegion::units`].
+    let mut new_regions: Vec<uniform::LocalRegion> = Vec::new();
+    for (sub_region_index, units) in new_list_of_units_per_region {
+        // `block.addArgument(builder.getIndexType(), ..)` (`:669-671`).
+        let block_arg = values.mint();
+        // `for (int j = 0; ..)` (`:674-696`) — the first region that covers this class is where its
+        // operations come from, and the loop `break`s on it (`:691`).
+        //
+        // ⚠️ THE GUARD AT `:675-677` IS A TAUTOLOGY AND ITS `else` IS DEAD:
+        // `num_of_local_uniform_op_in_region` is set to 0 at `:673` and the only write inside this
+        // loop is that `else` setting it to 0 again, so `pair.first == uniform_op` always passes with
+        // the count still zero. Transcribing it would state a condition that cannot be false.
+        //
+        // ⛔ THE BLOCK ARGUMENT IT REBINDS IS `getRegion(sub_region_index)`'s, NOT `getRegion(j.second)`'s
+        // (`:680-682`). The two agree whenever the match is found at the group the index counts
+        // within — every case the vendor's four fixtures reach — and where they do not, the reference
+        // may index past the matched op's last region; mapping nothing is the same output for every
+        // input it does not (entry 287's `:445` has the same shape). ⭐ AND
+        // `DT_CHECK(..getNumArguments() == 1)` (`:683-685`) IS UNWRITABLE: a
+        // [`uniform::LocalRegion`] has one `arg` field.
+        let mut body = Vec::new();
+        for pair in &region_list {
+            if all_units_exist_in_region(units, pair) {
+                // `IRMapping bv_map;` (`:686`) — fresh per matched region, and the only thing put in
+                // it is the rebinding; `clone` adds each cloned result as it goes, so a later op of
+                // the list reads the copy's names.
+                let mut bv_map = ValueMapping::new();
+                if let Some(old_region) = pair.all_regions.get(sub_region_index) {
+                    bv_map.map(old_region.arg, block_arg);
+                }
+                // `for (auto p : op_per_region_list[j]) builder_region.clone(*p, bv_map);` (`:688-690`).
+                let source: Vec<DfirOp> = pair.ops.iter().map(|op| (*op).clone()).collect();
+                body = values.clone_ops(&source, &mut bv_map);
+                break;
+            }
+        }
+        // `uniform::YieldOp::create(builder_region, ..)` (`:697-698`).
+        body.push(DfirOp::Uniform(uniform::Op::Yield {
+            operands: Vec::new(),
+        }));
+        new_regions.push(uniform::LocalRegion {
+            arg: block_arg,
+            units: units.to_vec(),
+            body,
+        });
+    }
+
+    // `UniformizeRegionsOp::create(builder, .., mlir::TypeRange(), new_unit_list, ..)` (`:655-660`).
+    // ⭐ `new_list_sizes` IS EACH REGION'S OWN UNIT COUNT, so it is not a field; and the two
+    // attributes carried over, `getRegIndicesIfExist()` and `getRegLocalesIfExist()`, are ones this
+    // island's [`uniform::Op::UniformizeRegions`] does not hold at all — as entry 287 also records.
+    let new_op = DfirOp::Uniform(uniform::Op::UniformizeRegions {
+        regions: new_regions,
+        results: Vec::new(),
+    });
+    // `uniform_op.erase(); return flattenUniformRegion(new_uniform_op);` (`:700-701`) — the erasure is
+    // the caller taking this replacement, and the recursion strips the next level of nesting.
+    Some(flatten_uniform_region(&new_op, values).unwrap_or(new_op))
+}
+
+/// ONE OPERATION AS THE SECOND WALK OF ENTRY 305 LEAVES IT.
+///
+/// ⛔⛔ `to_be_deleted` IS A LIST ERASED AFTER THE WHOLE WALK (`FlatteningLocalRegions.cpp:463`,
+/// `:475`), and the delay is observable: `flatten` puts its replacement BESIDE the original, so a
+/// parent reached later walks a region holding both.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "`Replaced` carries the original beside the replacement; boxing either would only\
+ hide which one the walk keeps"
+)]
+enum Flattened {
+    /// Not a `uniform.uniformize_regions`, or one `flatten` declined — regions already walked.
+    Kept(DfirOp),
+    /// `if (tree.flatten(*op)) to_be_deleted.push_back(op);` (`:472`).
+    Replaced {
+        /// What `flatten` built (`:420-423`).
+        replacement: DfirOp,
+        /// The original, which the rest of the walk still sees.
+        original: DfirOp,
+    },
+}
+
+/// THE REGION AS THE REST OF THE WALK SEES IT — nothing has been erased yet.
+///
+/// ⭐ THE REPLACEMENT COMES FIRST because `OpBuilder builder(&op_)`
+/// (`FlatteningLocalRegions.cpp:406`) seats the builder BEFORE the operation being flattened, as
+/// `OpBuilder builder(uniform_op)` (`dcc/src/Dialect/Uniform/Utils.cpp:565`) does for the other walk.
+fn as_the_walk_sees_them(walked: &[Flattened]) -> Vec<DfirOp> {
+    let mut live = Vec::with_capacity(walked.len());
+    for op in walked {
+        match op {
+            Flattened::Kept(op) => live.push(op.clone()),
+            Flattened::Replaced {
+                replacement,
+                original,
+            } => {
+                live.push(replacement.clone());
+                live.push(original.clone());
+            }
+        }
+    }
+    live
+}
+
+/// `for (auto op : to_be_deleted) op->erase();` (`FlatteningLocalRegions.cpp:475`).
+fn after_the_erasures(walked: Vec<Flattened>) -> Vec<DfirOp> {
+    walked
+        .into_iter()
+        .map(|op| match op {
+            Flattened::Kept(op)
+            | Flattened::Replaced {
+                replacement: op, ..
+            } => op,
+        })
+        .collect()
+}
+
+/// THE FIRST WALK — `flattenUniformRegion` over every `uniform.uniformize_regions` in the module
+/// (`FlatteningLocalRegions.cpp:464-469`).
+fn flatten_uniform_regions_in(body: &[DfirOp], values: &mut Values) -> Vec<DfirOp> {
+    let mut out = Vec::with_capacity(body.len());
+    for op in body {
+        // `Operation::walk` is POST-ORDER by default, so a nested op is flattened first and the
+        // enclosing one then reads the result. ⛔ AND THE ORDER IS LOAD-BEARING, NOT INCIDENTAL:
+        // `flattenUniformRegion` ERASES the op it was handed (`Utils.cpp:700`), which a pre-order walk
+        // would then try to descend into.
+        //
+        // `llvm::dyn_cast<uniform::UniformizeRegionsOp>(op)` (`:465`) is the `let .. else` inside
+        // [`flatten_uniform_region`], so every operation is offered and only these ones take it.
+        let mut rewritten = op.clone();
+        for region in dialects::regions_mut(&mut rewritten) {
+            let source = core::mem::take(region);
+            *region = flatten_uniform_regions_in(&source, values);
+        }
+        let flat = flatten_uniform_region(&rewritten, values);
+        out.push(flat.unwrap_or(rewritten));
+    }
+    out
+}
+
+/// THE SECOND WALK — a fresh [`FlatteningLocalRegionsTree`] per operation
+/// (`FlatteningLocalRegions.cpp:469-474`), with the erasures it asks for still outstanding.
+fn flatten_local_regions_in(body: &[DfirOp], values: &mut Values) -> Vec<Flattened> {
+    let mut out = Vec::with_capacity(body.len());
+    for op in body {
+        // Post-order again, and here the order is what makes [`Flattened`] necessary.
+        let per_region: Vec<Vec<Flattened>> = dialects::regions(op)
+            .into_iter()
+            .map(|region| flatten_local_regions_in(region, values))
+            .collect();
+
+        let mut live = op.clone();
+        for (region, walked) in dialects::regions_mut(&mut live)
+            .into_iter()
+            .zip(&per_region)
+        {
+            *region = as_the_walk_sees_them(walked);
+        }
+        // `FlatteningLocalRegionsTree tree; if (tree.flatten(*op))` (`:471-472`) — a tree per
+        // operation, because `flatten` roots itself at the one it is given (`:392-393`).
+        let replacement = {
+            let mut tree = FlatteningLocalRegionsTree::new();
+            tree.flatten(&live, values)
+        };
+        if let Some(replacement) = replacement {
+            out.push(Flattened::Replaced {
+                replacement,
+                original: live,
+            });
+            continue;
+        }
+
+        let mut retained = op.clone();
+        for (region, walked) in dialects::regions_mut(&mut retained)
+            .into_iter()
+            .zip(per_region)
+        {
+            *region = after_the_erasures(walked);
+        }
+        out.push(Flattened::Kept(retained));
+    }
+    out
+}
+
+/// Replaces: e305_runOnOperation
+///
+/// **305/384** `FlatteningLocalRegionsPass::runOnOperation` —
+/// `FlatteningLocalRegions.cpp:459` (17L): two walks over the module, then the erasures the second
+/// one deferred.
+///
+/// ⛔ THE TWO ARE NOT ALTERNATIVES. The first sees only a region's DIRECT children
+/// (`Utils.cpp:75`), so it collapses `@diff_groups`; the second walks through every region on the way
+/// down, which is what reaches case 4's nested op inside an `scf.if`.
+#[must_use]
+pub fn run_on_operation(module: &[DfirOp], values: &mut Values) -> Vec<DfirOp> {
+    // ⛔ `if (DisableThisPass) return;` (`:460`) IS DROPPED: `dcc-flatten-local-regions-disable`
+    // (`:29-32`) is a `dcc-opt` command-line flag, and which passes run is a call in this crate.
+    // `ModuleOp module_op = getOperation();` (`:462`) — the pass is on the module, and `module` is its
+    // body. ⚠️ The reference's walk also visits the module op and the `func.func` in it; this island
+    // has neither, and a walk that offers them nothing is the same walk.
+    let flattened = flatten_uniform_regions_in(module, values);
+    // `std::vector<mlir::Operation *> to_be_deleted;` .. `for (auto op : to_be_deleted) op->erase();`
+    // (`:463`, `:475`) — the list is [`Flattened::Replaced`] and this is where it is spent.
+    after_the_erasures(flatten_local_regions_in(&flattened, values))
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1460,7 +1841,7 @@ mod unit_tests {
         );
     }
     use crate::generated::SyncSignal;
-    use crate::islands::dataflow_ir::dialects::{arith, dataflow, scf};
+    use crate::islands::dataflow_ir::dialects::{affine, arith, dataflow, scf};
     use crate::islands::dataflow_ir::print;
     use crate::islands::dataflow_ir::ty::ScalarTy;
 
@@ -2600,9 +2981,161 @@ mod unit_tests {
         let mut again = FlatteningLocalRegionsTree::new();
         assert_eq!(again.flatten(&flat, &mut values), None);
     }
-}
 
-// ⛔ RE-CREATED ANCHOR. This unit's `crustify:todo:` marker was deleted without a
-// `/// Replaces:` ever appearing, which removed it from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e305_runOnOperation
+    /// THE VENDOR'S `@diff_groups` END TO END: TWO NESTED LOCAL REGIONS OVER FOUR UNITS BECOME ONE
+    /// OP WITH FOUR SIBLING REGIONS, AND THE SECOND WALK THEN HAS NOTHING TO DO.
+    ///
+    /// `dcc/test/Transform/FlatteningLocalRegions/flatten_local_region.mlir:88-153` in, `:18-67` out.
+    /// The outer op's two regions each hold ONE nested op splitting that region's two units, so
+    /// `flattenUniformRegion` reaches `sum == getUnits().size()` and emits the four unit lists in
+    /// outer-then-inner order — `%0, %2, %1, %3`, which is NOT the outer op's own unit order — while
+    /// [`FlatteningLocalRegionsTree::flatten`] then finds four classes against four regions (`:418`).
+    ///
+    /// ⚠️ TWO SUBSTITUTIONS IN THE FIXTURE'S PAYLOAD, NEITHER READ BY THE PASS, whose only test of an
+    /// operation is the `isa<UniformizeRegionsOp>` at `:137` and `:82`. The vendor's innermost
+    /// `affine.for` holds an `agen.vector_load` off a `memref<?x?x?x128xi8>` and a `dataflow.send`;
+    /// this island's [`crate::islands::dataflow_ir::ty::MemRef`] has no dynamic extent, so that level
+    /// is dropped and the two remaining loops carry the region's `dataflow.sync_recv` — which prints a
+    /// `dbgName` the vendor's does not, [`SyncSignal`] being a closed set of named signals.
+    ///
+    /// ⭐ WHAT IS PINNED IS THE PASS, NOT THE PAYLOAD: the four regions, their unit lists and order,
+    /// a FRESH block argument each (`:671-673`), a fresh induction variable per cloned loop, and the
+    /// `uniform.yield` every new region gets (`:697-698`).
+    #[test]
+    fn the_vendor_diff_groups_case_becomes_one_op_with_a_region_per_unit() {
+        let module = vec![a_diff_groups_program_unit()];
+        let mut values = values_past(37);
+
+        let flat = run_on_operation(&module, &mut values);
+
+        // ⭐ THE OUTER `dataflow.program_unit` IS UNTOUCHED, which is the module walk descending.
+        let DfirOp::Dataflow(dataflow::Op::ProgramUnit { body, .. }) = &flat[0] else {
+            unreachable!("the fixture's one top-level operation")
+        };
+        let mut got = String::new();
+        print::emit(&mut got, &body[0], 0);
+        assert_eq!(
+            got,
+            concat!(
+                // The four sibling regions live where the outer op did, and the two nested
+                // ops are gone (`flatten_local_region.mlir:18-19`).
+                "uniform.uniformize_regions -> () {\n",
+                // `(%[[VAL_11]] -> %[[VAL_1]]){` (`:19-30`) — the first nested region of the FIRST outer region.
+                "  (%38 -> %1){\n",
+                "    affine.for %39 = 0 to 1 {\n",
+                "      affine.for %40 = 0 to 1 {\n",
+                "        dataflow.sync_recv %1 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "      }\n",
+                "    }\n",
+                "    uniform.yield\n",
+                "  }\n",
+                // `(%[[VAL_16]] -> %[[VAL_3]]){` (`:31-42`) — and its second, so `%2` precedes `%1`.
+                "  (%41 -> %3){\n",
+                "    affine.for %42 = 0 to 1 {\n",
+                "      affine.for %43 = 0 to 1 {\n",
+                "        dataflow.sync_recv %3 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "      }\n",
+                "    }\n",
+                "    uniform.yield\n",
+                "  }\n",
+                // `(%[[VAL_21]] -> %[[VAL_2]]){` (`:43-54`) — then the second outer region's two.
+                "  (%44 -> %2){\n",
+                "    affine.for %45 = 0 to 1 {\n",
+                "      affine.for %46 = 0 to 1 {\n",
+                "        dataflow.sync_recv %2 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "      }\n",
+                "    }\n",
+                "    uniform.yield\n",
+                "  }\n",
+                // `(%[[VAL_26]] -> %[[VAL_4]]){` (`:55-66`).
+                "  (%47 -> %4){\n",
+                "    affine.for %48 = 0 to 1 {\n",
+                "      affine.for %49 = 0 to 1 {\n",
+                "        dataflow.sync_recv %4 {dbgName = \"input-lxsu-lxlu-sync\"} : index\n",
+                "      }\n",
+                "    }\n",
+                "    uniform.yield\n",
+                "  }\n",
+                "}\n",
+            )
+        );
+    }
+
+    /// `@diff_groups`'s `dataflow.program_unit` (`flatten_local_region.mlir:87-149`) — an outer local
+    /// region over two units per region, each holding a nested one that splits them one apiece.
+    fn a_diff_groups_program_unit() -> DfirOp {
+        // `(%arg2 -> %unit){ affine.for { affine.for { dataflow.sync_recv %unit } } }` (`:90-99`).
+        let a_nested_region =
+            |arg: Val, unit: Val, outer_iv: Val, inner_iv: Val| uniform::LocalRegion {
+                arg,
+                units: vec![unit],
+                body: vec![
+                    DfirOp::Affine(affine::Op::For {
+                        iv: outer_iv,
+                        lo: affine::Bound::Const(0),
+                        hi: affine::Bound::Const(1),
+                        carried: Vec::new(),
+                        body: vec![DfirOp::Affine(affine::Op::For {
+                            iv: inner_iv,
+                            lo: affine::Bound::Const(0),
+                            hi: affine::Bound::Const(1),
+                            carried: Vec::new(),
+                            body: vec![DfirOp::Dataflow(dataflow::Op::SyncRecv {
+                                from: unit,
+                                signal: SyncSignal::InputToLxsuToLxluToSync,
+                            })],
+                            dbg_name: None,
+                        })],
+                        dbg_name: None,
+                    }),
+                    DfirOp::Uniform(uniform::Op::Yield {
+                        operands: Vec::new(),
+                    }),
+                ],
+            };
+        let an_outer_region = |arg: Val, nested: DfirOp, units: Vec<Val>| uniform::LocalRegion {
+            arg,
+            units,
+            body: vec![
+                nested,
+                DfirOp::Uniform(uniform::Op::Yield {
+                    operands: Vec::new(),
+                }),
+            ],
+        };
+        DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+            units: vec![Val(1), Val(2), Val(3), Val(4)],
+            precision: Some(dataflow::Precision::Fp16),
+            body: vec![DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                regions: vec![
+                    // `(%arg1 -> %0, %2){ uniform.uniformize_regions { (%arg2 -> %0) (%arg2 -> %2) } }`
+                    // (`:89-118`).
+                    an_outer_region(
+                        Val(20),
+                        DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                            regions: vec![
+                                a_nested_region(Val(22), Val(1), Val(30), Val(31)),
+                                a_nested_region(Val(23), Val(3), Val(32), Val(33)),
+                            ],
+                            results: Vec::new(),
+                        }),
+                        vec![Val(1), Val(3)],
+                    ),
+                    // `(%arg1 -> %1, %3){ .. }` (`:119-148`).
+                    an_outer_region(
+                        Val(21),
+                        DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                            regions: vec![
+                                a_nested_region(Val(24), Val(2), Val(34), Val(35)),
+                                a_nested_region(Val(25), Val(4), Val(36), Val(37)),
+                            ],
+                            results: Vec::new(),
+                        }),
+                        vec![Val(2), Val(4)],
+                    ),
+                ],
+                results: Vec::new(),
+            })],
+        })
+    }
+}

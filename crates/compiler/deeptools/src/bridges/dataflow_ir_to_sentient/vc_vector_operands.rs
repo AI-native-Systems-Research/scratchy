@@ -524,7 +524,11 @@ impl VectorOperand {
             },
         };
 
-        VectorOperand::new(VectorOperandType::Link, OperandValue::Port(link), receive_op)
+        VectorOperand::new(
+            VectorOperandType::Link,
+            OperandValue::Port(link),
+            receive_op,
+        )
     }
 
     /// Replaces: e072_getOperandFromSendOp
@@ -637,9 +641,9 @@ impl VectorOperand {
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
                 | DfirUnit::L3Ibr
-                | DfirUnit::CrossPtnLink => todo!(
-                    "Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139)"
-                ),
+                | DfirUnit::CrossPtnLink => {
+                    todo!("Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139)")
+                }
             },
         };
 
@@ -2781,8 +2785,11 @@ mod unit_tests {
         assert_eq!(port(&asked_by_sfp), sen::Port::SfpRing);
         assert_eq!(port(&asked_by_pe), sen::Port::Sfp);
         // ⭐ AND IT IS THE RING ON THE NEWER GENERATION TOO — `supports_sfp_ring` is total.
-        let on_sen1p5 =
-            VectorOperand::from_receive_op::<Sen1p5>(DfirUnit::Sfp, ComputeComp::Sfp, OpId::at(&[4]));
+        let on_sen1p5 = VectorOperand::from_receive_op::<Sen1p5>(
+            DfirUnit::Sfp,
+            ComputeComp::Sfp,
+            OpId::at(&[4]),
+        );
         assert_eq!(port(&on_sen1p5), sen::Port::SfpRing);
     }
 
@@ -2791,8 +2798,7 @@ mod unit_tests {
     #[test]
     fn a_pt_sends_to_the_rows_and_the_pe_over_south() {
         for peer in [row(1), row(0), DfirUnit::Pe] {
-            let operand =
-                VectorOperand::from_send_op::<Dd2>(peer, ComputeComp::Pt, OpId::at(&[5]));
+            let operand = VectorOperand::from_send_op::<Dd2>(peer, ComputeComp::Pt, OpId::at(&[5]));
             assert_eq!(port(&operand), sen::Port::South, "{peer:?}");
         }
     }
@@ -2809,8 +2815,7 @@ mod unit_tests {
             (row(0), sen::Port::Pt),
             (DfirUnit::Pe, sen::Port::Pe),
         ] {
-            let operand =
-                VectorOperand::from_send_op::<Dd2>(peer, ComputeComp::Pe, OpId::at(&[6]));
+            let operand = VectorOperand::from_send_op::<Dd2>(peer, ComputeComp::Pe, OpId::at(&[6]));
             assert_eq!(port(&operand), expected, "{peer:?}");
         }
     }
@@ -2852,8 +2857,14 @@ mod unit_tests {
             const_val_to_field(ConstantOperandValue::Zero),
             sen::Port::Zero
         );
-        assert_eq!(const_val_to_field(ConstantOperandValue::One), sen::Port::One);
-        assert_eq!(const_val_to_field(ConstantOperandValue::Two), sen::Port::Two);
+        assert_eq!(
+            const_val_to_field(ConstantOperandValue::One),
+            sen::Port::One
+        );
+        assert_eq!(
+            const_val_to_field(ConstantOperandValue::Two),
+            sen::Port::Two
+        );
         assert_eq!(
             const_val_to_field(ConstantOperandValue::Three),
             sen::Port::Three
@@ -3403,6 +3414,7 @@ mod unit_tests {
                 ],
                 view_ty: row_view_ty(),
                 ty: V64,
+                dbg_name: None,
             }),
         ];
         assert_eq!(
@@ -3620,6 +3632,7 @@ mod unit_tests {
                     len: 128,
                     elem: ElemType::Int(8),
                 },
+                dbg_name: None,
             }),
         ];
         let stored = VectorOperand::from_load_or_store_op(&OpId::at(&[3]), &irf)

@@ -267,6 +267,10 @@ pub enum Op {
         view: Val,
         /// The indices.
         indices: Vec<Index>,
+        /// `$dbgName` — optional, as the load's is, and `cloneWithNewAccessInfo` substitutes an EMPTY
+        /// one for an absent one (`Agen.cpp:240-248`), which is why a rebuilt store prints
+        /// `dbgName = ""` where the original printed nothing.
+        dbg_name: Option<String>,
         /// The view's type. Its INNERMOST extent is the lane count.
         view_ty: MemRef,
         /// The vector's type.
@@ -487,9 +491,9 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 " {{{}{}load_order = {}, load_set = {}, load_time_addr_map = {}, store_order = {}, \
                  store_set = {}, store_time_addr_map = {}, time_order = {}, time_set = {}}}",
                 // `dbgName` sorts ahead of `dir` (`l3-burst-calc.mlir:759`).
-                dbg_name.as_ref().map_or(String::new(), |name| format!(
-                    "dbgName = \"{name}\", "
-                )),
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
                 // ⭐ `dir` IS AN ATTRIBUTE AND SORTS ALPHABETICALLY, which puts it ahead of every
                 // other one this op carries
                 // (`paged_mem_view_load_and_store.mlir:101`).
@@ -526,15 +530,20 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             value,
             view,
             indices,
+            dbg_name,
             view_ty,
             ty,
         } => {
             let _ = writeln!(
                 out,
-                "agen.vector_store {}, {}[{}] {{store_order = {}, store_set = {}}} : {}, {}",
+                "agen.vector_store {}, {}[{}] {{{}store_order = {}, store_set = {}}} : {}, {}",
                 print::val(*value),
                 print::val(*view),
                 print::index_list(indices),
+                // `dbgName` sorts ahead of `store_order`, as it does ahead of `load_order`.
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
                 print::affine_map(&access_order(view_ty.shape.len())),
                 print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),

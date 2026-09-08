@@ -65,16 +65,16 @@
 //! | `e377_matchAndRewrite` | 377/384 | 12 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44` |
 //! | `e378_runOnOperation` | 378/384 | 30 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374` |
 
-use crate::arch::Arch;
-use crate::islands::dataflow_ir::dialects::vectorchain as vc;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, dataflow, defining_op, regions};
-use crate::islands::dataflow_ir::{self as dfir, Values};
-use crate::units::DfirUnit;
 use super::vc_operand_reuse::OperandReuse;
 use super::vc_vector_chain_helper::redefine_constant_vectors;
 use super::vc_vector_operands::{
     OpId, VectorOperand, erase_op_recording, erase_operands_recording, remove_at,
 };
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::dialects::vectorchain as vc;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, dataflow, defining_op, regions};
+use crate::islands::dataflow_ir::{self as dfir, Values};
+use crate::units::DfirUnit;
 
 /// ONE OF THE SIXTEEN COMPUTE LOWERING PATTERNS `fuseComputeOps` INSTALLS —
 /// `compute_ops_patterns.insert<…>` (`VectorChainToSentientPESFP.cpp:1246-1254`).
@@ -585,21 +585,19 @@ mod unit_tests {
         VectorOperand, cleanup, compute_ops_to_fuse, fuse_compute_ops, installed_pattern, legality,
         match_and_rewrite, run_on_operation,
     };
+    use crate::arch::Target;
+    use crate::bridges::dataflow_ir_to_sentient::vc_operand_reuse::OperandReuse;
     use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::{
         OperandValue, VectorOperandType,
     };
-    use crate::islands::sentient::dialects::sentient as sen;
-    use crate::arch::Target;
-    use crate::bridges::dataflow_ir_to_sentient::vc_operand_reuse::OperandReuse;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::dataflow;
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
     use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
-    use crate::islands::dataflow_ir::ty::{
-        AffineExpr, AffineMap, ElemType, IntegerSet, Vector,
-    };
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, IntegerSet, Vector};
     use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units};
+    use crate::islands::sentient::dialects::sentient as sen;
     use crate::units::DfirUnit;
 
     /// The vector every op in these fixtures is typed at.

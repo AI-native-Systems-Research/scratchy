@@ -1309,8 +1309,8 @@ pub fn run_on_operation<A: Arch>(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ExpandAffineApplyOps, FailedToExpand, Loop, ShuffleUnroll, TripCount, UnitUnrolling, Unroll,
-        constant_trip_count, expand_affine_apply_ops, fold_to_constant, is_arith_constant,
+        ExpandAffineApplyOps, FailedToExpand, Loop, ShuffleUnroll, TripCount, UnitUnrolling,
+        Unroll, constant_trip_count, expand_affine_apply_ops, fold_to_constant, is_arith_constant,
         perform_full_unroll, run_on_operation,
     };
     use crate::arch::Target;
@@ -1378,7 +1378,10 @@ mod unit_tests {
         assert_eq!(Loop::of(&candidate), Some(Loop::Affine));
         let unroll = perform_full_unroll(Loop::Affine, &[]);
         assert_eq!(unroll, Unroll::Fully);
-        assert!(!unroll.failed(), "the affine overload has no decline of its own");
+        assert!(
+            !unroll.failed(),
+            "the affine overload has no decline of its own"
+        );
     }
 
     /// 🎯 109/384 — AND AN OP THAT IS NOT A LOOP IS NOT A CANDIDATE.
@@ -1444,7 +1447,12 @@ mod unit_tests {
     /// without asking a type at run time.
     #[test]
     fn an_index_typed_bound_is_not_a_signless_integer_constant() {
-        let scope = [an_index(1, 0), an_index(2, 8), an_index(3, 1), an_scf_loop()];
+        let scope = [
+            an_index(1, 0),
+            an_index(2, 8),
+            an_index(3, 1),
+            an_scf_loop(),
+        ];
         let unroll = perform_full_unroll(Loop::of(&scope[3]).expect("a loop"), &scope);
         assert_eq!(unroll, Unroll::NonConstantTripBound);
         assert!(unroll.failed());
@@ -1463,7 +1471,14 @@ mod unit_tests {
             scope[spoiled] = an_index(1 + u32::try_from(spoiled).unwrap_or_default(), 4);
             scope.push(an_scf_loop());
             assert_eq!(
-                perform_full_unroll(Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) }, &scope),
+                perform_full_unroll(
+                    Loop::Scf {
+                        lo: Val(1),
+                        hi: Val(2),
+                        step: Val(3)
+                    },
+                    &scope
+                ),
                 Unroll::NonConstantTripBound,
                 "bound {spoiled} is not a signless integer constant"
             );
@@ -1471,7 +1486,11 @@ mod unit_tests {
         // ⭐ AND A BOUND NOTHING DEFINES — `getDefiningOp()` is null for a region argument.
         assert_eq!(
             perform_full_unroll(
-                Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) },
+                Loop::Scf {
+                    lo: Val(1),
+                    hi: Val(2),
+                    step: Val(3)
+                },
                 &[an_i32(1, 0), an_i32(3, 1)]
             ),
             Unroll::NonConstantTripBound
@@ -1495,7 +1514,14 @@ mod unit_tests {
             dbg_name: None,
         })];
         assert_eq!(
-            perform_full_unroll(Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) }, &scope),
+            perform_full_unroll(
+                Loop::Scf {
+                    lo: Val(1),
+                    hi: Val(2),
+                    step: Val(3)
+                },
+                &scope
+            ),
             Unroll::ByFactor(TripCount(2))
         );
     }
@@ -1516,7 +1542,14 @@ mod unit_tests {
         ] {
             let scope = [an_i32(1, 0), an_i32(2, 8), step];
             assert_eq!(
-                perform_full_unroll(Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) }, &scope),
+                perform_full_unroll(
+                    Loop::Scf {
+                        lo: Val(1),
+                        hi: Val(2),
+                        step: Val(3)
+                    },
+                    &scope
+                ),
                 Unroll::NonPositiveStep
             );
         }
@@ -1534,8 +1567,14 @@ mod unit_tests {
     fn an_empty_or_reversed_range_is_not_an_unroll_factor() {
         for (lo, hi) in [(0, 0), (8, 0), (i64::MIN, i64::MAX)] {
             let scope = [an_i32(1, lo), an_i32(2, hi), an_i32(3, 1)];
-            let unroll =
-                perform_full_unroll(Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) }, &scope);
+            let unroll = perform_full_unroll(
+                Loop::Scf {
+                    lo: Val(1),
+                    hi: Val(2),
+                    step: Val(3),
+                },
+                &scope,
+            );
             assert_eq!(
                 unroll,
                 Unroll::EmptyOrReversedRange,
@@ -1556,7 +1595,14 @@ mod unit_tests {
     fn a_step_that_does_not_divide_the_span_under_counts() {
         let scope = [an_i32(1, 0), an_i32(2, 7), an_i32(3, 2)];
         assert_eq!(
-            perform_full_unroll(Loop::Scf { lo: Val(1), hi: Val(2), step: Val(3) }, &scope),
+            perform_full_unroll(
+                Loop::Scf {
+                    lo: Val(1),
+                    hi: Val(2),
+                    step: Val(3)
+                },
+                &scope
+            ),
             Unroll::ByFactor(TripCount(3)),
             "four iterations, unrolled by three"
         );
@@ -1604,7 +1650,11 @@ mod unit_tests {
             dbg_name: None,
         });
         assert_eq!(operands(&loop_op), vec![Val(1), Val(2), Val(3)]);
-        assert_eq!(block_args(&loop_op), vec![Val(0)], "the iv is not an operand");
+        assert_eq!(
+            block_args(&loop_op),
+            vec![Val(0)],
+            "the iv is not an operand"
+        );
         assert_eq!(results(&loop_op), Vec::new(), "this loop carries nothing");
         assert_eq!(regions(&loop_op).len(), 1);
         assert_eq!(regions(&loop_op)[0].len(), 1);
@@ -2412,7 +2462,11 @@ scf.for %1 = %2 to %3 step %4 {
             shuffle(vals.mint(), scale, arg7),
             shuffle(vals.mint(), stick, arg9),
         ];
-        let unit = vec![a_for(arg7, 2, vec![a_for(arg8, 4, vec![a_for(arg9, 4, body)])])];
+        let unit = vec![a_for(
+            arg7,
+            2,
+            vec![a_for(arg8, 4, vec![a_for(arg9, 4, body)])],
+        )];
 
         let program_on = |on: DfirUnit, body: Vec<DfirOp>| {
             use crate::generated::OpFunc;
@@ -2459,7 +2513,10 @@ scf.for %1 = %2 to %3 step %4 {
         );
 
         // ⛔ `if (comp != LXLU) return;` — the same program on the PT row is not this pass's.
-        let mut elsewhere = program_on(DfirUnit::PtRow(Row::checked(0).expect("every PT has a row 0")), unit);
+        let mut elsewhere = program_on(
+            DfirUnit::PtRow(Row::checked(0).expect("every PT has a row 0")),
+            unit,
+        );
         assert_eq!(run_on_operation(&mut elsewhere, &mut vals), Vec::new());
     }
 }

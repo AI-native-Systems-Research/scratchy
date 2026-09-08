@@ -521,9 +521,7 @@ mod unit_tests {
         let case = |comp: GenericComp| {
             let mut values = Values::default();
             let key = values.mint();
-            let pairs: Vec<(Val, Val)> = (0..4)
-                .map(|_| (values.mint(), values.mint()))
-                .collect();
+            let pairs: Vec<(Val, Val)> = (0..4).map(|_| (values.mint(), values.mint())).collect();
             let mapping = SymbolMapping::Chain(QueryMapping {
                 key,
                 first: pairs[0],
@@ -538,7 +536,11 @@ mod unit_tests {
                 QueryMapUse::LoopBound,
             ];
             let lowered = lower_symbol_query_map(comp, mapping, &uses, &mut values);
-            let QueryMapLowering::Conditional { if_op, replacements } = lowered else {
+            let QueryMapLowering::Conditional {
+                if_op,
+                replacements,
+            } = lowered
+            else {
                 unreachable!("four pairs is not the one-pair case")
             };
             let sen::Op::If { yielded, .. } = &if_op else {

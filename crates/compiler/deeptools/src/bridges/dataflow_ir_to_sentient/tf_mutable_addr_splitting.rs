@@ -88,14 +88,21 @@ use crate::formats::Bits;
 use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, arith, dataflow, defining_op, scf, symbol,
+    self, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol,
 };
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, MemRef};
 use crate::units::DfirUnit;
 
-use super::agen_access_details::{AccessDetailsAffine, AccessDetailsAffineComposite, TimeBound};
+use super::agen_access_details::{
+    AccessDetailsAffine, AccessDetailsAffineComposite, ConstructedDetails, MemoryOperandIndex,
+    TimeBound,
+};
+use super::tf_transform_paged_mem_view_impl::{
+    UseChain, VectorLoadOp, VectorStoreOp, clone_store_with_new_access_info,
+    clone_use_chain_to_new_store, create_new_mem_op, erase_vector_load_and_use_chain,
+    erase_vector_store_and_use_chain, get_use_chain, indices_from_map, vector_store_use_chain,
+};
 use super::tf_utils::{LoopBound, LoopStep, constant_index, owner_of_block_arg};
-
 
 /// WHICH HALF OF THE L3 — the `DT_CHECK(is_any_of(comp, L3LU, L3SU))` both range queries open with.
 ///
@@ -298,7 +305,6 @@ pub fn max_immutable_range<A: Arch>(_half: L3Half) -> AddrRange {
         None => AddrRange::of_register::<A>(A::L3_EBR_BITS),
     }
 }
-
 
 /// A `dataflow.get_logical_memory_view` WHOSE START ADDRESS IS A CONSTANT — everything a clone of it
 /// needs, and the PROOF that [`is_eligible_for_splitting`] admitted it.
@@ -789,7 +795,10 @@ mod unit_tests {
     fn the_range_divides_by_the_element_width() {
         let mutable = max_mutable_range::<Dd2>(L3Half::Load);
         assert_eq!(mutable.elements(DataType::Senint8), Elements(268_435_456));
-        assert_eq!(mutable.elements(DataType::Sen169Fp16), Elements(134_217_728));
+        assert_eq!(
+            mutable.elements(DataType::Sen169Fp16),
+            Elements(134_217_728)
+        );
         assert_eq!(
             mutable.elements(DataType::Senint4),
             Elements(536_870_912),
@@ -4232,6 +4241,367 @@ mod unit_tests {
         // The sort ran in place, so `partition_sizes[0]` belongs to the heavy dimension.
         assert_eq!(mas_data[0].dim, 1);
     }
+    /// 🎯 307/384 — ⭐⭐ IBM'S `constant_start_addr_2` KEY END TO END: ONE `agen.vector_store`
+    /// BECOMES TWO PARTITIONS, EACH WITH ITS OWN CLONE OF THE **LOAD'S** VIEW, WHICH THE CLONED LOAD
+    /// READS.
+    ///
+    /// `mutable_addr_splitting_one_dim.mlir:267-288` in, `:49-82` out — the cut at `%arg2 < 6`, the
+    /// `else` arm's `* 2 - 4`, `dbgName = ""` on the rebuilt store and none on the cloned load, and
+    /// the per-arm order view/load-view/load/store. ⛔ THE LAYOUT IS THE VENDOR'S TRANSPOSED AND
+    /// SCALED BY 24000, for the two reasons the 306/384 test records; `4 + 6528 * 24000` overflows the
+    /// compiled EAR by 22454276, which two of `%arg2`'s eight iterations cover and one does not.
+    #[test]
+    fn the_one_dim_answer_keys_store_becomes_two_partitions_each_with_its_own_load_view() {
+        const K: i64 = 24000;
+        let mut vals = Values::default();
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let (lo_op, lo) = index_const(&mut vals, 0);
+        let (start_op, start) = index_const(&mut vals, 2048);
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let src_view = vals.mint();
+        let dst_view = vals.mint();
+        let data = vals.mint();
+
+        let layout = AffineMap::linear(&[256 * K, 64 * K, 1]);
+        let ty = MemRef {
+            shape: vec![4, 64, 1],
+            elem: ElemType::F16,
+        };
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let view = |result: Val, from: Val, start: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let scope = vec![
+            lo_op,
+            start_op,
+            // `affine.for %arg1 = 0 to 4 { affine.for %arg2 = 0 to 8 { .. } }`.
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Affine(affine::Op::For {
+                    iv: arg2,
+                    lo: affine::Bound::Const(0),
+                    hi: affine::Bound::Const(8),
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+            view(src_view, lx, lo),
+            view(dst_view, hbm, start),
+            // `%data = agen.vector_load %src_mem_view[0, 0, 0]`.
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: data,
+                view: src_view,
+                indices: vec![Index::Const(0); 3],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+                multicast_info: None,
+            }),
+            // `agen.vector_store %data, %dst_mem_view[%c4, %arg1 * 3 + %c16, %arg2 * 2 + 8]`,
+            // transposed.
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: data,
+                view: dst_view,
+                indices: vec![
+                    Index::Strided(vec![(arg2, 2)], 8),
+                    Index::Strided(vec![(arg1, 3)], 16),
+                    Index::Const(4),
+                ],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+            }),
+        ];
+
+        let candidate = MasCandidate {
+            op: &scope[6],
+            comp: DfirUnit::L3su,
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        let mut conditionals = Conditionals::default();
+        let split = transform_vector_store::<Dd2>(
+            &mut vals,
+            &candidate,
+            DataType::Sen169Fp16,
+            EarOverflowCorrection::Allowed,
+            &mut conditionals,
+            &scope,
+        );
+        let TransferSplit::Split {
+            ops,
+            hoisted,
+            erased,
+            partitions,
+            adjustments,
+        } = split
+        else {
+            panic!("the key overflows the EAR by 22454276 elements: {split:?}")
+        };
+        assert_eq!(partitions, 2);
+        assert_eq!(
+            adjustments,
+            [
+                EvenImmutableAdjustment::NotOnThisArch,
+                EvenImmutableAdjustment::NotOnThisArch
+            ]
+        );
+        // `op.eraseOpAndUseChain()` walks a producer-ward chain FORWARDS, which is the store before
+        // the load that feeds it — the same consumer-first order the load's reversed walk produces.
+        assert_eq!(erased, [&scope[6], &scope[5]]);
+        // The `else` partition is filled first, so its constant is minted first; both sit at
+        // function scope, as the vendor's `%c5120` and `%c2048` do.
+        assert_eq!(
+            printed(&hoisted),
+            concat!(
+                "%11 = arith.constant 73730048 : index\n",
+                "%15 = arith.constant 2048 : index\n",
+            ),
+            "2048 + 6 * 12288000, and the vendor's own 2048 + 6 * 512 = 5120"
+        );
+        let arm = |view: &str, start: &str, load_view: &str, load: &str, subscript: &str| {
+            format!(
+                concat!(
+                    "  {view} = dataflow.get_logical_memory_view %0, {start} {{layout_map = #MAP}} : index, index, memref<4x64x1xf16>\n",
+                    "  {load_view} = dataflow.get_logical_memory_view %1, %2 {{layout_map = #MAP}} : index, index, memref<4x64x1xf16>\n",
+                    "  {load} = agen.vector_load {load_view}[0, 0, 0] {{load_order = #ORDER, load_set = #SET}} : memref<4x64x1xf16>, vector<64xf16>\n",
+                    "  agen.vector_store {load}, {view}[{subscript}, %4 * 3 + 16, 4] {{dbgName = \"\", store_order = #ORDER, store_set = #SET}} : memref<4x64x1xf16>, vector<64xf16>\n",
+                ),
+                view = view,
+                start = start,
+                load_view = load_view,
+                load = load,
+                subscript = subscript,
+            )
+        };
+        let emitted = printed(&ops)
+            .replace(
+                "affine_map<(d0, d1, d2) -> (d0 * 6144000 + d1 * 1536000 + d2)>",
+                "#MAP",
+            )
+            .replace("affine_map<(d0, d1, d2) -> (d0, d1, d2)>", "#ORDER")
+            .replace(
+                "affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>",
+                "#SET",
+            );
+        assert_eq!(
+            emitted,
+            format!(
+                concat!(
+                    "%9 = arith.constant 6 : index\n",
+                    "%10 = arith.cmpi slt, %5, %9 : index\n",
+                    "scf.if %10 {{\n{then}}} else {{\n{else_}}}\n",
+                ),
+                // `agen.vector_store %VAL_19, %VAL_17[4, %VAL_11 * 3 + 16, %VAL_12 * 2 + 8]`.
+                then = arm("%16", "%15", "%17", "%18", "%5 * 2 + 8"),
+                // `agen.vector_store %VAL_22, %VAL_20[4, %VAL_11 * 3 + 16, %VAL_12 * 2 - 4]`.
+                else_ = arm("%12", "%11", "%13", "%14", "%5 * 2 + -4"),
+            ),
+            "four ops per arm, the load's view cloned into each and read by the cloned load, and \
+             `dbgName` on the rebuilt store where the plain clone above it has none"
+        );
+    }
+
+    /// 🎯 306/384 — ⭐⭐ IBM'S `one_dim` KEY END TO END: ONE `agen.vector_load` BECOMES TWO
+    /// PARTITIONS, EACH WITH ITS OWN CLONE OF THE **STORE'S** VIEW.
+    ///
+    /// `mutable_addr_splitting_one_dim.mlir:236-263` in, `:29-46` out — the cut at `%arg2 < 4`, the
+    /// `else` arm's `* 8 - 32`, four ops per arm in the vendor's order, and both start constants
+    /// HOISTED out of the unit. ⛔ THE LAYOUT IS THE VENDOR'S TRANSPOSED AND SCALED BY 24576: it runs
+    /// `--max-mutable-size=100000`, which is [`MAX_MUTABLE_SIZE`] = [`None`] here (see
+    /// [`span_overflowing_by`]), and [`agen::access_set`] derives the lane run on the LAST axis where
+    /// the key's `d2 * 256 + d1 * 64 + d0` puts it on `d0`. The start addresses scale; nothing else does.
+    #[test]
+    fn the_one_dim_answer_keys_load_becomes_two_partitions_each_with_its_own_store_view() {
+        const K: i64 = 24576;
+        let mut vals = Values::default();
+        let hbm = vals.mint();
+        let lx = vals.mint();
+        let (lo_op, lo) = index_const(&mut vals, 0);
+        let (step_op, step) = index_const(&mut vals, 1);
+        let (start_op, start) = index_const(&mut vals, 3072);
+        let hi = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let src_view = vals.mint();
+        let dst_view = vals.mint();
+        let data = vals.mint();
+
+        let layout = AffineMap::linear(&[256 * K, 64 * K, 1]);
+        let ty = MemRef {
+            shape: vec![4, 64, 1],
+            elem: ElemType::F16,
+        };
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let view = |result: Val, from: Val, start: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let scope = vec![
+            lo_op,
+            step_op,
+            start_op,
+            DfirOp::Symbol(symbol::Op::CreateSymbol {
+                result: hi,
+                symbol_id: -1476,
+                max_value: Some(8),
+            }),
+            // `affine.for %arg1 = 0 to 4 { scf.for %arg2 = %c0 to %719 step %c1 { .. } }`.
+            DfirOp::Affine(affine::Op::For {
+                iv: arg1,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(4),
+                carried: Vec::new(),
+                body: vec![DfirOp::Scf(scf::Op::For {
+                    iv: arg2,
+                    lo,
+                    hi,
+                    step,
+                    carried: Vec::new(),
+                    body: Vec::new(),
+                    dbg_name: None,
+                })],
+                dbg_name: None,
+            }),
+            view(src_view, hbm, start),
+            view(dst_view, lx, lo),
+            // `%data = agen.vector_load %src_mem_view[0, %arg1 * 3, %arg2 * 8]`, transposed.
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: data,
+                view: src_view,
+                indices: vec![
+                    Index::Strided(vec![(arg2, 8)], 0),
+                    Index::Strided(vec![(arg1, 3)], 0),
+                    Index::Const(0),
+                ],
+                view_ty: ty.clone(),
+                ty: vec_ty.clone(),
+                multicast_info: None,
+            }),
+            // `agen.vector_store %data, %dst_mem_view[0, 0, 0]`.
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: data,
+                view: dst_view,
+                indices: vec![Index::Const(0); 3],
+                view_ty: ty.clone(),
+                ty: vec_ty,
+            }),
+        ];
+
+        let candidate = MasCandidate {
+            op: &scope[7],
+            comp: DfirUnit::L3lu,
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        let mut conditionals = Conditionals::default();
+        let split = transform_vector_load::<Dd2>(
+            &mut vals,
+            &candidate,
+            DataType::Sen169Fp16,
+            EarOverflowCorrection::Allowed,
+            &mut conditionals,
+            &scope,
+        );
+        let TransferSplit::Split {
+            ops,
+            hoisted,
+            erased,
+            partitions,
+            adjustments,
+        } = split
+        else {
+            panic!("the key overflows the EAR by 177209344 elements: {split:?}")
+        };
+        assert_eq!(partitions, 2);
+        // Dd2 asks nothing of the parity, so no partition's subscripts moved for it.
+        assert_eq!(
+            adjustments,
+            [
+                EvenImmutableAdjustment::NotOnThisArch,
+                EvenImmutableAdjustment::NotOnThisArch
+            ]
+        );
+        // `op.eraseOpAndUseChain()` — the store BEFORE the load it consumes, which is the only order
+        // that erases nothing still in use.
+        assert_eq!(erased, [&scope[8], &scope[7]]);
+        // `%VAL_9` before `%VAL_10`: the `else` partition is filled first, so its constant is minted
+        // first, and both sit at function scope in the vendor's output.
+        assert_eq!(
+            printed(&hoisted),
+            concat!(
+                "%13 = arith.constant 201329664 : index\n",
+                "%17 = arith.constant 3072 : index\n",
+            ),
+            "3072 + 4 * 50331648, and the vendor's own 3072 + 4 * 2048 = 11264"
+        );
+        let arm = |view: &str, start: &str, store_view: &str, load: &str, subscript: &str| {
+            format!(
+                concat!(
+                    "  {view} = dataflow.get_logical_memory_view %0, {start} {{layout_map = #MAP}} : index, index, memref<4x64x1xf16>\n",
+                    "  {store_view} = dataflow.get_logical_memory_view %1, %2 {{layout_map = #MAP}} : index, index, memref<4x64x1xf16>\n",
+                    "  {load} = agen.vector_load {view}[{subscript}, %6 * 3, 0] {{dbgName = \"\", load_order = #ORDER, load_set = #SET}} : memref<4x64x1xf16>, vector<64xf16>\n",
+                    "  agen.vector_store {load}, {store_view}[0, 0, 0] {{store_order = #ORDER, store_set = #SET}} : memref<4x64x1xf16>, vector<64xf16>\n",
+                ),
+                view = view,
+                start = start,
+                store_view = store_view,
+                load = load,
+                subscript = subscript,
+            )
+        };
+        let emitted = printed(&ops)
+            .replace(
+                "affine_map<(d0, d1, d2) -> (d0 * 6291456 + d1 * 1572864 + d2)>",
+                "#MAP",
+            )
+            .replace("affine_map<(d0, d1, d2) -> (d0, d1, d2)>", "#ORDER")
+            .replace(
+                "affine_set<(d0, d1, d2) : (d0 == 0, d1 == 0, d2 >= 0, -d2 + 63 >= 0)>",
+                "#SET",
+            );
+        assert_eq!(
+            emitted,
+            format!(
+                concat!(
+                    "%11 = arith.constant 4 : index\n",
+                    "%12 = arith.cmpi slt, %7, %11 : index\n",
+                    "scf.if %12 {{\n{then}}} else {{\n{else_}}}\n",
+                ),
+                // `%VAL_21 = agen.vector_load %VAL_19[0, %VAL_13 * 3, %VAL_14 * 8]`.
+                then = arm("%18", "%17", "%20", "%19", "%7 * 8"),
+                // `%VAL_24 = agen.vector_load %VAL_22[0, %VAL_13 * 3, %VAL_14 * 8 - 32]`.
+                else_ = arm("%14", "%13", "%16", "%15", "%7 * 8 + -32"),
+            ),
+            "four ops per arm, the destination's view cloned into each, and only the shifted subscript \
+             and the start address differ"
+        );
+    }
+
     /// 🎯 253/384 — ⭐⭐ IBM'S `one_dim_sen1p5` KEY: THE `[0, …]` SUBSCRIPT COMES BACK AS `[64, …]`.
     ///
     /// `mutable_addr_splitting_one_dim_sen1p5.mlir:39` — the start address 2112 is an ODD 33 sticks and
@@ -4272,9 +4642,17 @@ mod unit_tests {
             }
         );
         assert_eq!(addr_mod, -64, "the stick came out of the immutable address");
-        assert_eq!(map.results[0], AffineExpr::Const(64), "the vendor's `[64, ..`");
+        assert_eq!(
+            map.results[0],
+            AffineExpr::Const(64),
+            "the vendor's `[64, ..`"
+        );
         assert_eq!(&map.results[1..], &subscripts.results[1..]);
-        assert_eq!((map.dims, map.syms), (2, 0), "the symbol count is preserved");
+        assert_eq!(
+            (map.dims, map.syms),
+            (2, 0),
+            "the symbol count is preserved"
+        );
 
         let mut untouched = subscripts.clone();
         let mut no_mod = 0;
@@ -4320,14 +4698,21 @@ mod unit_tests {
         };
 
         let mut filled: Vec<(String, i64)> = Vec::new();
-        let mut creator = |map: &AffineMap, start_addr_mod: i64| {
+        let mut creator = |vals: &mut Values, map: &AffineMap, start_addr_mod: i64| {
             filled.push((print::affine_map(map), start_addr_mod));
             vec![DfirOp::Arith(arith::Op::Constant {
                 result: vals.mint(),
                 value: start_addr_mod,
             })]
         };
-        let done = fill_partitions(&mut tree, &mas_data, &[4], &subscripts_map, &mut creator);
+        let done = fill_partitions(
+            &mut vals,
+            &mut tree,
+            &mas_data,
+            &[4],
+            &subscripts_map,
+            &mut creator,
+        );
 
         assert_eq!(done, FilledPartitions::Filled { partitions: 2 });
         assert_eq!(
@@ -4363,10 +4748,17 @@ mod unit_tests {
         };
         let mut shapes: Vec<(u32, u32)> = Vec::new();
         let dim0 = [split_dim(iv, 0, 2048, 8)];
-        fill_partitions(&mut tree, &dim0, &[4], &symbolic, &mut |map: &AffineMap, _| {
-            shapes.push((map.dims, map.syms));
-            Vec::new()
-        });
+        fill_partitions(
+            &mut vals,
+            &mut tree,
+            &dim0,
+            &[4],
+            &symbolic,
+            &mut |_: &mut Values, map: &AffineMap, _| {
+                shapes.push((map.dims, map.syms));
+                Vec::new()
+            },
+        );
         assert_eq!(shapes, vec![(1, 0), (1, 0)], "`s0` is still in the results");
     }
 
@@ -4476,7 +4868,7 @@ mod unit_tests {
 
         let mut mods: Vec<i64> = Vec::new();
         let created = {
-            let mut creator = |_: &AffineMap, start_addr_mod: i64| {
+            let mut creator = |_: &mut Values, _: &AffineMap, start_addr_mod: i64| {
                 mods.push(start_addr_mod);
                 Vec::new()
             };
@@ -4494,10 +4886,13 @@ mod unit_tests {
 
         // ⛔ AND NO PLAN IS NO TREE: `DT_CHECK(!partition_sizes.empty())` (`:989`).
         assert_eq!(
-            create_partitions(&mut vals, &mas_data, &[], &subscripts_map, &mut |_: &AffineMap,
-                                                                               _| {
-                Vec::new()
-            }),
+            create_partitions(
+                &mut vals,
+                &mas_data,
+                &[],
+                &subscripts_map,
+                &mut |_: &mut Values, _: &AffineMap, _| Vec::new()
+            ),
             Partitions::NoConditionalTree(ConditionalTree::NoPartitionsToBuild)
         );
     }
@@ -7251,9 +7646,8 @@ pub fn adjust_for_even_immutable_addr<A: Arch>(
     // `auto transfer_order = ad.getTransferOrder();` then the first result naming `d0`.
     let transfer_order = &ad.base.transfer_order;
     let num_res = transfer_order.results.len();
-    let Some(res) = (0..num_res).find(|&res| {
-        transfer_order.results[res].is_function_of_dim(0)
-    }) else {
+    let Some(res) = (0..num_res).find(|&res| transfer_order.results[res].is_function_of_dim(0))
+    else {
         // `DT_CHECK(res < num_res);`
         return EvenImmutableAdjustment::NoTransferOrderResultUsesTheInnermostDim;
     };
@@ -7413,7 +7807,9 @@ fn reverse_bfs_leaves(tree: &[DfirOp], root: (usize, Val)) -> Vec<Vec<Step>> {
                 }
             }
             CondNode::Arm(path) => {
-                let children = region_at(tree, path).map(conditionals_in).unwrap_or_default();
+                let children = region_at(tree, path)
+                    .map(conditionals_in)
+                    .unwrap_or_default();
                 for (at, cond) in children {
                     queue.push_back(CondNode::If {
                         path: path.clone(),
@@ -7498,11 +7894,12 @@ pub enum FilledPartitions {
 /// dropping any the original declared — unlike [`adjust_for_even_immutable_addr`], which preserves
 /// them at `:1251`.
 pub fn fill_partitions(
+    vals: &mut Values,
     cond_tree: &mut Vec<DfirOp>,
     mas_data: &[MasData],
     partition_sizes: &[i64],
     subscripts_map: &AffineMap,
-    op_creator: &mut impl FnMut(&AffineMap, i64) -> Vec<DfirOp>,
+    op_creator: &mut impl FnMut(&mut Values, &AffineMap, i64) -> Vec<DfirOp>,
 ) -> FilledPartitions {
     if partition_sizes.len() > mas_data.len() {
         return FilledPartitions::MorePartitionsThanIterators {
@@ -7575,8 +7972,8 @@ pub fn fill_partitions(
             };
 
             // `start_addr_mod += prev_iters * mas_data[p].composed_coeff_;`
-            start_addr_mod =
-                start_addr_mod.saturating_add(prev_iters.saturating_mul(mas_data[p].composed_coeff));
+            start_addr_mod = start_addr_mod
+                .saturating_add(prev_iters.saturating_mul(mas_data[p].composed_coeff));
 
             // `new_exprs[r] = new_exprs[r] - (coeffs[r] * prev_iters);` — MLIR's `operator-(int64_t)`
             // is `*this + (-v)`, so this is the same `simplifyAdd` [`AffineExpr::added`] performs.
@@ -7597,7 +7994,9 @@ pub fn fill_partitions(
         // `op_creator(partition_builder, new_subscripts_map, start_addr_mod)`, where the builder is
         // `getThenBodyBuilder()` or `getElseBodyBuilder()` — `atBlockTerminator` for a resultless
         // `scf.if`, so the ops land before the region's `scf.yield`.
-        let created = op_creator(&new_subscripts_map, start_addr_mod);
+        // ⚠️ `vals` IS THE `partition_builder` — the reference hands the creator a builder because
+        // that is what makes ops; here what a creator needs from its caller is the value minter.
+        let created = op_creator(vals, &new_subscripts_map, start_addr_mod);
         let Some(region) = region_at_mut(cond_tree, &path) else {
             return FilledPartitions::TreeHasNoRootConditional;
         };
@@ -7715,7 +8114,7 @@ pub fn create_partitions(
     mas_data: &[MasData],
     partition_sizes: &[i64],
     subscripts_map: &AffineMap,
-    op_creator: &mut impl FnMut(&AffineMap, i64) -> Vec<DfirOp>,
+    op_creator: &mut impl FnMut(&mut Values, &AffineMap, i64) -> Vec<DfirOp>,
 ) -> Partitions {
     // `DT_CHECK(!partition_sizes.empty()); auto root_op = constructConditionals(..);
     //  DT_CHECK_MSG(root_op, ..);` — [`construct_conditionals`] asks the emptiness itself, so both
@@ -7728,6 +8127,7 @@ pub fn create_partitions(
 
     // `fillPartitions(cond_tree, mas_data, partition_sizes, subscripts_map, op_creator);`
     match fill_partitions(
+        vals,
         &mut ops,
         mas_data,
         partition_sizes,
@@ -7739,11 +8139,443 @@ pub fn create_partitions(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 306/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE TRANSFER THE PASS DECIDED TO LOOK AT — `MutableAddrSplittingPass::MASCandidate`
+/// (`dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:91-101`).
+///
+/// ⚠️ UNANCHORED: the pass's nested data members are among the 106 excluded entries, and entry 306 is
+/// the first thing that needs one. ⭐ `dataflow::ProgramUnitOp unit_` IS ABSENT: its only use is
+/// `OpBuilder const_builder(unit)` (`:970`), an insertion point, which is mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasCandidate<'a> {
+    /// `op_` — the memory operation.
+    pub op: &'a DfirOp,
+    /// `comp_` — the unit it runs on. The two L3 halves are the only ones [`L3Half::of`] admits.
+    pub comp: DfirUnit,
+    /// `mem_index_` — which memory operand of it is under consideration.
+    pub mem_index: MemoryOperandIndex,
+}
+
+/// WHAT THE PASS LEFT WHERE THE TRANSFER WAS — and every precondition it stopped on instead.
+///
+/// ⛔ NOT AN ERROR TYPE. Six of these are `DT_CHECK`s or `cast<>`s that abort the compiler, and
+/// [`Self::AddressFits`] is the reference's own `return` for a transfer whose address does not
+/// overflow — by far the common case, and NOT a refusal.
+///
+/// ⭐ ONE ENUM FOR ENTRIES 306 AND 307: `transformVectorLoad` and `transformVectorStore` differ in
+/// their opening `dyn_cast` and in nothing else they can stop on, so the two casts are two variants
+/// and every other refusal is shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferSplit<'a> {
+    /// The conditional tree, one partition per leaf, and the chain it replaces.
+    Split {
+        /// [`create_partitions`]'s ops, to be placed where the load was.
+        ops: Vec<DfirOp>,
+        /// ⛔ THE PARTITIONS' START-ADDRESS CONSTANTS, WHICH DO **NOT** GO IN `ops`: `const_builder`
+        /// is seated at the `dataflow.program_unit` (`:970`), so they land OUTSIDE the unit's body —
+        /// in fill order, which is the vendor's `%c10240` before `%c2048`. See [`NewMemViewWithMod`].
+        hoisted: Vec<DfirOp>,
+        /// `op.eraseOpAndUseChain()` (`:369`) — the delete list, consumer first.
+        erased: Vec<&'a DfirOp>,
+        /// How many leaves were filled.
+        partitions: usize,
+        /// One [`adjust_for_even_immutable_addr`] answer per partition, in fill order. ⛔ THE
+        /// REFERENCE DISCARDS THESE (the call is `void`, `:344-346`) and its two `DT_CHECK`s abort
+        /// from inside the lambda; carried so the caller can see what the abort would have been.
+        adjustments: Vec<EvenImmutableAdjustment>,
+    },
+    /// `if (!hasMutableAddrOverflow(...)) return;` (`:317-319`) — the load is left exactly as it was.
+    ///
+    /// ⚠️ AND IT CARRIES THAT CALL'S TWO ABORTS TOO ([`MutableAddrOverflow::NoLoopsToSplit`],
+    /// [`MutableAddrOverflow::OverflowCorrectionForbidden`]), because the reference's `!` cannot tell
+    /// them from [`MutableAddrOverflow::InRange`] either. The payload is what distinguishes them.
+    AddressFits(MutableAddrOverflow),
+    /// `auto op = dyn_cast<agen::VectorLoadOp>(candidate.op_); DT_CHECK(op);` (`:299-300`).
+    NotAVectorLoad,
+    /// `auto op = dyn_cast<agen::VectorStoreOp>(candidate.op_); DT_CHECK(op);` (`:376-377`).
+    NotAVectorStore,
+    /// `DT_CHECK(succeeded(ad.constructDetails(candidate.mem_index_)));` (`:307-308`).
+    DetailsNotConstructed(ConstructedDetails),
+    /// `initialize()` left `subscripts_map_` null, which `ad.getSubscriptsMap()` (`:367`) dereferences.
+    ///
+    /// ⚠️ UNREACHABLE AFTER [`ConstructedDetails::Complete`] — `AccessDetails.cpp:305` sets it for
+    /// every vector load — which is why reading the map above the overflow gate rather than at
+    /// `:367` cannot turn the reference's plain `return` into this.
+    SubscriptsMapIsNotSet,
+    /// `cast<dataflow::GetLogicalMemoryViewOp>(op.getMemRef().getDefiningOp())` (`:313-314`).
+    MemRefIsNotAMemoryView,
+    /// The view's start address is not an `arith.constant`: `hasValidL3ImmutableAddr`'s other two arms
+    /// (`Dialect/Agen/Utils.cpp:152-163`), and `DT_CHECK(isEligibleForSplitting(..))` (`:826`).
+    MemViewStartIsNotConstant,
+    /// `DT_CHECK(is_any_of(comp, L3LU, L3SU))`, which both range queries open with.
+    CandidateIsNotOnAnL3Half(DfirUnit),
+    /// [`initialize`]'s refusal (`:316`).
+    NotInitialized(MasInitialization),
+    /// [`setup_for_partitioning`]'s refusal (`:334-336`).
+    NotSetUpForPartitioning(SetupForPartitioning),
+    /// [`create_partitions`]'s refusal (`:367-368`).
+    NotPartitioned(Partitions),
+}
+
+/// Replaces: e306_transformVectorLoad
+///
+/// **306/384** `MutableAddrSplittingPass::transformVectorLoad` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298` (75L): split one overflowing
+/// `agen.vector_load` into one partition per branch of a conditional tree.
+///
+/// ⛔ THE STORE'S VIEW IS CLONED **PER PARTITION** AND NOT SHARED (`:359-364`) — *"Every memory
+/// operand should have it's own unique mem view"* — and it is collected from the LOAD's use chain
+/// (`:328-332`) because a load/store pattern is merged into one transfer later, so both halves must be
+/// eligible before either is split.
+/// ⛔ AND THE ADJUSTMENT RUNS INSIDE THE LAMBDA (`:344`), once per partition, on that partition's own
+/// `start_addr_mod` — hoisting it would apply one leaf's parity correction to every leaf.
+#[must_use]
+pub fn transform_vector_load<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    elem: DataType,
+    correction: EarOverflowCorrection,
+    num_conditionals: &mut Conditionals,
+    scope: &'s [DfirOp],
+) -> TransferSplit<'s> {
+    // `auto op = dyn_cast<agen::VectorLoadOp>(candidate.op_); DT_CHECK(op);`
+    let (Some(op), DfirOp::Agen(agen_op)) = (VectorLoadOp::of(candidate.op), candidate.op) else {
+        return TransferSplit::NotAVectorLoad;
+    };
+
+    // "Collect the relevant access details." — `access_details.emplace_insert(mem_index, op, comp)`
+    // then `DT_CHECK(succeeded(ad.constructDetails(mem_index)))`. ⚠️ THE CONTAINER IS MECHANISM: it
+    // memoises one record per memory operand, and a vector load has exactly one.
+    let mut ad = AccessDetailsAffine::new(agen_op, candidate.comp);
+    let details = ad.construct_details(candidate.mem_index, scope);
+    if details != ConstructedDetails::Complete {
+        return TransferSplit::DetailsNotConstructed(details);
+    }
+    let Some(subscripts_map) = ad.subscripts_map.clone() else {
+        return TransferSplit::SubscriptsMapIsNotSet;
+    };
+
+    // `cast<dataflow::GetLogicalMemoryViewOp>(op.getMemRef().getDefiningOp())`.
+    let view = match SplitCandidateView::resolve(op.view, scope) {
+        SplitCandidateView::ConstantStart(view) => view,
+        SplitCandidateView::NonConstantStart => return TransferSplit::MemViewStartIsNotConstant,
+        SplitCandidateView::NotAMemoryView => return TransferSplit::MemRefIsNotAMemoryView,
+    };
+
+    // `int64_t max_mutable = 0; initialize(evaluator, mas_data, mem_view_op, ad, max_mutable);`
+    let initialized = initialize::<A>(&ad, &view, scope);
+    let (mut mas_data, max_mutable) = match initialized {
+        MasInitialization::Initialized(MasDataInit::Initialized {
+            mas_data,
+            max_mutable,
+        }) => (mas_data, max_mutable),
+        // `if (indices.size() == 0) return;` leaves the caller's `mas_data` empty and its
+        // `max_mutable` at the `0` it was initialised with, which no range is exceeded by.
+        MasInitialization::Initialized(MasDataInit::NoIndices) => (Vec::new(), MutableAddr(0)),
+        refusal => return TransferSplit::NotInitialized(refusal),
+    };
+
+    // `if (!hasMutableAddrOverflow(mas_data, candidate.comp_, max_mutable, ad.getElementWidth()))
+    //  return;` — ⚠️ `elem` where the reference passes the bare width: see [`AddrRange::elements`].
+    // ⭐ AND THE L3 GATE BELONGS HERE, NOT EARLIER: it is `getMaxMutableRange`'s own `DT_CHECK`, which
+    // the reference reaches only after `initialize` has had its say.
+    let Some(half) = L3Half::of(candidate.comp) else {
+        return TransferSplit::CandidateIsNotOnAnL3Half(candidate.comp);
+    };
+    let overflow = has_mutable_addr_overflow::<A>(&mas_data, half, max_mutable, elem, correction);
+    if overflow != MutableAddrOverflow::Overflow {
+        return TransferSplit::AddressFits(overflow);
+    }
+
+    // "Vector load and store patterns, despite being two separate operations, will be later merged
+    // into one. Collect mem views from load and store patterns, if any."
+    let mut all_mem_views = vec![op.view];
+    let mut store_mem_view: Option<Val> = None;
+    if let UseChain::ConsumerWard(chain) = get_use_chain(op, scope) {
+        for used_by in chain {
+            if let DfirOp::Agen(agen::Op::VectorStore { view, .. }) = used_by {
+                store_mem_view = Some(*view);
+                all_mem_views.push(*view);
+            }
+        }
+    }
+
+    let sized = setup_for_partitioning::<A>(
+        &mut mas_data,
+        &all_mem_views,
+        half,
+        &view,
+        max_mutable,
+        elem,
+        num_conditionals,
+        scope,
+    );
+    let SetupForPartitioning::Sized(Partitioning::Split(plan)) = &sized else {
+        return TransferSplit::NotSetUpForPartitioning(sized);
+    };
+    let sizes = plan.sizes.clone();
+
+    let mut adjustments: Vec<EvenImmutableAdjustment> = Vec::new();
+    let mut hoisted: Vec<DfirOp> = Vec::new();
+    let partitioned = {
+        let mut create_ops = |vals: &mut Values, map: &AffineMap, start_addr_mod: i64| {
+            // `adjustForEvenImmutableAddr(evaluator, mem_view_op.getStartAddress(),
+            //  new_subscripts_map, ad, start_addr_mod, ad.getElementWidth());` — ⭐ BOTH
+            // OUT-PARAMETERS ARE THE LEAF'S OWN LOCALS in [`fill_partitions`], reconstructed for the
+            // next leaf, so copying them here is the same storage the reference writes through.
+            let mut map = map.clone();
+            let mut start_addr_mod = start_addr_mod;
+            adjustments.push(adjust_for_even_immutable_addr::<A>(
+                view.start,
+                &mut map,
+                &ad,
+                &mut start_addr_mod,
+                elem,
+            ));
+
+            // `createNewMemViewWithMod(..)`, then `setInsertionPointAfter(new_mem_view_op)`.
+            let new_view = create_new_mem_view_with_mod(vals, &view, start_addr_mod);
+            hoisted.push(new_view.start_address);
+            let mut created = vec![new_view.mem_view];
+
+            // `op.cloneWithNewAccessInfo(partition_builder, new_mem_view_op, new_subscripts_map,
+            //  ad.getIndices())`, `setInsertionPointAfter`, then `op.cloneUseChainToNewOp(..)` —
+            // which is entry 128's body exactly, so it is called rather than written twice.
+            let new_mem_op = create_new_mem_op(
+                vals,
+                op,
+                new_view.result,
+                view.ty.clone(),
+                indices_from_map(&map, &ad.base.indices),
+                scope,
+            );
+            let mut chain = new_mem_op.ops;
+
+            // "Every memory operand should have it's own unique mem view. Clone the mem views for
+            // the other memory operands into the partition." — `setInsertionPoint(new_mem_op)` puts
+            // them BEFORE the new load, which is why they are spliced ahead of the chain here.
+            if let Some(store_view) = store_mem_view
+                && let Some(store_view_op) = defining_op(store_view, scope)
+            {
+                for cloned in &mut chain {
+                    if let DfirOp::Agen(agen::Op::VectorStore { view, .. }) = cloned {
+                        let new_store_view =
+                            dialects::clone_with_fresh_results(store_view_op, vals);
+                        if let Some(bound) = dialects::results(&new_store_view).first().copied() {
+                            *view = bound;
+                            created.push(new_store_view);
+                        }
+                    }
+                }
+            }
+
+            created.extend(chain);
+            created
+        };
+        // `createPartitions(mas_data, partition_sizes, op, ad.getSubscriptsMap(), createOps);` —
+        // ⚠️ `op` is the insertion anchor and has no other use.
+        create_partitions(vals, &mas_data, &sizes, &subscripts_map, &mut create_ops)
+    };
+    let Partitions::Created { ops, partitions } = partitioned else {
+        return TransferSplit::NotPartitioned(partitioned);
+    };
+
+    // `op.eraseOpAndUseChain();` — and the `LLVM_DEBUG` line below it is a diagnostic.
+    TransferSplit::Split {
+        ops,
+        hoisted,
+        erased: erase_vector_load_and_use_chain(op, scope),
+        partitions,
+        adjustments,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 307/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e307_transformVectorStore
+///
+/// **307/384** `MutableAddrSplittingPass::transformVectorStore` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375` (74L): [`transform_vector_load`]'s twin,
+/// and everything down to the lambda is that function with `agen::VectorStoreOp` in place of the load.
+///
+/// ⛔⛔ INSIDE THE LAMBDA THE ORDER IS THE OTHER WAY ROUND, AND THE PRODUCER IS RE-POINTED BEFORE IT
+/// IS CLONED. `setInsertionPoint(new_mem_op)` (`:428`) seats the builder BEFORE the new store, the
+/// loop walks the **new** store's chain — which still reaches the ORIGINAL load, because
+/// `cloneWithNewAccessInfo` carries `getValueToStore()` over — and assigns each load the partition's
+/// own view clone (`:429-435`); only then is the chain cloned (`:436`), so the clone inherits that
+/// assignment and the new store is re-pointed at it last. The load's version emits its chain AFTER
+/// the new op and never touches the original.
+#[must_use]
+pub fn transform_vector_store<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    elem: DataType,
+    correction: EarOverflowCorrection,
+    num_conditionals: &mut Conditionals,
+    scope: &'s [DfirOp],
+) -> TransferSplit<'s> {
+    // `auto op = dyn_cast<agen::VectorStoreOp>(candidate.op_); DT_CHECK(op);`
+    let (Some(op), DfirOp::Agen(agen_op)) = (VectorStoreOp::of(candidate.op), candidate.op) else {
+        return TransferSplit::NotAVectorStore;
+    };
+
+    // "Collect the relevant access details." — as entry 306, and a vector store has one operand too.
+    let mut ad = AccessDetailsAffine::new(agen_op, candidate.comp);
+    let details = ad.construct_details(candidate.mem_index, scope);
+    if details != ConstructedDetails::Complete {
+        return TransferSplit::DetailsNotConstructed(details);
+    }
+    let Some(subscripts_map) = ad.subscripts_map.clone() else {
+        return TransferSplit::SubscriptsMapIsNotSet;
+    };
+
+    // `cast<dataflow::GetLogicalMemoryViewOp>(op.getMemRef().getDefiningOp())`.
+    let view = match SplitCandidateView::resolve(op.view, scope) {
+        SplitCandidateView::ConstantStart(view) => view,
+        SplitCandidateView::NonConstantStart => return TransferSplit::MemViewStartIsNotConstant,
+        SplitCandidateView::NotAMemoryView => return TransferSplit::MemRefIsNotAMemoryView,
+    };
+
+    // `int64_t max_mutable = 0; initialize(evaluator, mas_data, mem_view_op, ad, max_mutable);`
+    let initialized = initialize::<A>(&ad, &view, scope);
+    let (mut mas_data, max_mutable) = match initialized {
+        MasInitialization::Initialized(MasDataInit::Initialized {
+            mas_data,
+            max_mutable,
+        }) => (mas_data, max_mutable),
+        MasInitialization::Initialized(MasDataInit::NoIndices) => (Vec::new(), MutableAddr(0)),
+        refusal => return TransferSplit::NotInitialized(refusal),
+    };
+
+    // `if (!hasMutableAddrOverflow(mas_data, candidate.comp_, max_mutable, ad.getElementWidth()))
+    //  return;`, and `getMaxMutableRange`'s own `DT_CHECK` with it — see entry 306 on its position.
+    let Some(half) = L3Half::of(candidate.comp) else {
+        return TransferSplit::CandidateIsNotOnAnL3Half(candidate.comp);
+    };
+    let overflow = has_mutable_addr_overflow::<A>(&mas_data, half, max_mutable, elem, correction);
+    if overflow != MutableAddrOverflow::Overflow {
+        return TransferSplit::AddressFits(overflow);
+    }
+
+    // "Vector load and store patterns … will be later merged into one. Collect mem views from load
+    // and store patterns, if any." — ⭐ THE STORE'S CHAIN RUNS PRODUCER-WARD, so what it finds is the
+    // LOAD that feeds it where entry 306 finds the store that drains it.
+    let chain = vector_store_use_chain(op, scope);
+    let mut all_mem_views = vec![op.view];
+    let mut load_mem_view: Option<Val> = None;
+    if let UseChain::ProducerWard(links) = &chain {
+        for used in links {
+            if let Some(load) = VectorLoadOp::of(used) {
+                load_mem_view = Some(load.view);
+                all_mem_views.push(load.view);
+            }
+        }
+    }
+
+    let sized = setup_for_partitioning::<A>(
+        &mut mas_data,
+        &all_mem_views,
+        half,
+        &view,
+        max_mutable,
+        elem,
+        num_conditionals,
+        scope,
+    );
+    let SetupForPartitioning::Sized(Partitioning::Split(plan)) = &sized else {
+        return TransferSplit::NotSetUpForPartitioning(sized);
+    };
+    let sizes = plan.sizes.clone();
+
+    let mut adjustments: Vec<EvenImmutableAdjustment> = Vec::new();
+    let mut hoisted: Vec<DfirOp> = Vec::new();
+    let partitioned = {
+        let mut create_ops = |vals: &mut Values, map: &AffineMap, start_addr_mod: i64| {
+            // `adjustForEvenImmutableAddr(..)` on this leaf's own map and modifier, as entry 306.
+            let mut map = map.clone();
+            let mut start_addr_mod = start_addr_mod;
+            adjustments.push(adjust_for_even_immutable_addr::<A>(
+                view.start,
+                &mut map,
+                &ad,
+                &mut start_addr_mod,
+                elem,
+            ));
+
+            // `createNewMemViewWithMod(..)`, then `setInsertionPointAfter(new_mem_view_op)`.
+            let new_view = create_new_mem_view_with_mod(vals, &view, start_addr_mod);
+            hoisted.push(new_view.start_address);
+            let mut created = vec![new_view.mem_view];
+
+            // `op.cloneWithNewAccessInfo(partition_builder, new_mem_view_op, new_subscripts_map,
+            //  ad.getIndices())` — the store, still reading the ORIGINAL producer's value.
+            let mut new_mem_op = clone_store_with_new_access_info(
+                op,
+                new_view.result,
+                indices_from_map(&map, &ad.base.indices),
+            );
+
+            // "Every memory operand should have it's own unique mem view. Clone the mem views for
+            // the other memory operands into the partition." — `setInsertionPoint(new_mem_op)` puts
+            // them BEFORE the new store, and the loop is over the NEW store's chain, which is the
+            // original's producers.
+            let mut view_clones: Vec<DfirOp> = Vec::new();
+            let mut partition_load_view: Option<Val> = None;
+            if let UseChain::ProducerWard(links) = &chain {
+                for used in links {
+                    if VectorLoadOp::of(used).is_some()
+                        && let Some(load_view_op) =
+                            load_mem_view.and_then(|mem_view| defining_op(mem_view, scope))
+                    {
+                        let cloned = dialects::clone_with_fresh_results(load_view_op, vals);
+                        partition_load_view = dialects::results(&cloned).first().copied();
+                        view_clones.push(cloned);
+                    }
+                }
+            }
+
+            // `op.cloneUseChainToNewOp(partition_builder, new_mem_op);` — ⭐ AND IT INHERITS THE
+            // ASSIGNMENT ABOVE, which the reference made on the original load itself (`:434`). The
+            // original is erased at the end, so re-pointing the clone is the same surviving program.
+            let mut cloned_chain = clone_use_chain_to_new_store(vals, &chain, &mut new_mem_op);
+            if let Some(partition_view) = partition_load_view {
+                for cloned in &mut cloned_chain {
+                    if let DfirOp::Agen(agen::Op::VectorLoad { view, .. }) = cloned {
+                        *view = partition_view;
+                    }
+                }
+            }
+
+            created.extend(view_clones);
+            created.extend(cloned_chain);
+            created.push(new_mem_op);
+            created
+        };
+        // `createPartitions(mas_data, partition_sizes, op, ad.getSubscriptsMap(), createOps);`
+        create_partitions(vals, &mas_data, &sizes, &subscripts_map, &mut create_ops)
+    };
+    let Partitions::Created { ops, partitions } = partitioned else {
+        return TransferSplit::NotPartitioned(partitioned);
+    };
+
+    // `op.eraseOpAndUseChain();` — FORWARDS over a producer-ward chain, which is still consumer first.
+    TransferSplit::Split {
+        ops,
+        hoisted,
+        erased: erase_vector_store_and_use_chain(op, scope),
+        partitions,
+        adjustments,
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e306_transformVectorLoad
-// crustify:todo: e307_transformVectorStore
 // crustify:todo: e321_transformCompLoadAndStore
 // crustify:todo: e322_transformCompIndLoadAndStore
 // crustify:todo: e351_runOnOperation

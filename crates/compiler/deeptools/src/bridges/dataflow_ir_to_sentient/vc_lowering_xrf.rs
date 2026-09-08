@@ -1498,10 +1498,7 @@ mod unit_tests {
         let enclosing = loop_carrying(
             Val(0),
             Val(1),
-            [
-                (Val(2), Val(3), Val(4)),
-                (Val(5), Val(6), Val(7)),
-            ],
+            [(Val(2), Val(3), Val(4)), (Val(5), Val(6), Val(7))],
         );
         let yield_op = sen::Op::Sentient(sentient::Op::Yield {
             results: vec![Val(8), Val(9)],
@@ -1527,10 +1524,7 @@ mod unit_tests {
         let for_op = loop_carrying(
             Val(0),
             Val(1),
-            [
-                (Val(2), Val(3), Val(4)),
-                (Val(5), Val(6), Val(7)),
-            ],
+            [(Val(2), Val(3), Val(4)), (Val(5), Val(6), Val(7))],
         );
 
         assert_eq!(xrf_value(&for_op, None, XrfPtr::Write), Some(Val(3)));
@@ -1561,10 +1555,11 @@ mod unit_tests {
             result: Val(0),
             value: 400,
         })];
-        let for_op = loop_carrying(Val(0), Val(1), [
-            (Val(2), Val(3), Val(4)),
-            (Val(5), Val(6), Val(7)),
-        ]);
+        let for_op = loop_carrying(
+            Val(0),
+            Val(1),
+            [(Val(2), Val(3), Val(4)), (Val(5), Val(6), Val(7))],
+        );
 
         assert_eq!(
             for_op_bound(&for_op, Definitions::from_innermost(&[&scope])),
@@ -1617,10 +1612,11 @@ mod unit_tests {
                 ty: ScalarTy::Index,
             })),
         ];
-        let for_op = loop_carrying(Val(4), Val(5), [
-            (Val(6), Val(7), Val(8)),
-            (Val(9), Val(10), Val(11)),
-        ]);
+        let for_op = loop_carrying(
+            Val(4),
+            Val(5),
+            [(Val(6), Val(7), Val(8)), (Val(9), Val(10), Val(11))],
+        );
 
         assert_eq!(
             for_op_bound(&for_op, Definitions::from_innermost(&[&inner, &outer])),
@@ -1663,10 +1659,11 @@ mod unit_tests {
                 ty: ScalarTy::Index,
             })),
         ];
-        let for_op = loop_carrying(Val(4), Val(5), [
-            (Val(6), Val(7), Val(8)),
-            (Val(9), Val(10), Val(11)),
-        ]);
+        let for_op = loop_carrying(
+            Val(4),
+            Val(5),
+            [(Val(6), Val(7), Val(8)), (Val(9), Val(10), Val(11))],
+        );
 
         assert_eq!(
             for_op_bound(&for_op, Definitions::from_innermost(&[&scope])),
@@ -1867,10 +1864,11 @@ mod unit_tests {
             }),
             sen::Op::Sentient(real.clone()),
             // The reader: a loop carrying both placeholders in.
-            loop_carrying(Val(2), Val(3), [
-                (Val(0), Val(4), Val(5)),
-                (Val(1), Val(6), Val(7)),
-            ]),
+            loop_carrying(
+                Val(2),
+                Val(3),
+                [(Val(0), Val(4), Val(5)), (Val(1), Val(6), Val(7))],
+            ),
         ];
 
         let entry = DummyMacPtrs::of(
@@ -2212,6 +2210,7 @@ mod unit_tests {
     ///  : memref<4x64x64x1xf4E2M1FN>, vector<256xf4E2M1FN>` (`xrf_increments.mlir:415`).
     fn xrf_store(view: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
             value: Val(44),
             view,
             indices: vec![
@@ -2718,7 +2717,10 @@ pub struct XrfCarryingOp {
 /// so every carried value comes back unassigned and off the program header, and the two new
 /// positions — past the end of the old array — are [`RegType::Unknown`].
 #[must_use]
-pub fn create_for_op_with_return_value(for_op: &sen::Op, vals: &mut Values) -> Option<XrfCarryingOp> {
+pub fn create_for_op_with_return_value(
+    for_op: &sen::Op,
+    vals: &mut Values,
+) -> Option<XrfCarryingOp> {
     let sen::Op::Sentient(sentient::Op::For {
         iv,
         bound,
@@ -3084,7 +3086,10 @@ mod xrf_lowering_unit_tests {
         );
         assert_eq!(
             (new_carried[1].init, new_carried[2].init),
-            (sen::results(&built.before[0])[0], sen::results(&built.before[1])[0])
+            (
+                sen::results(&built.before[0])[0],
+                sen::results(&built.before[1])[0]
+            )
         );
         assert_eq!(new_carried[2].reg.locale, sentient::RegType::Unknown);
         assert_eq!(dbg_name.as_deref(), Some("SCF-For #1"));
