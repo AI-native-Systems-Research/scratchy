@@ -30,6 +30,16 @@ sys-arch-spec = { path = "sys-arch-spec", default-features = false }
 # parser lives in `ddl/`, OUTSIDE `src/`, so its `String`s cannot reach the emitter.
 [build-dependencies]
 
+# ⛔⛔ THE ISA IS A BUILD INPUT BECAUSE `.smc` RIGHT-HAND SIDES ARE CLASSIFIED AGAINST IT.
+# `SMCLineToInstrInfo` types a field as a VARIABLE unless the value is a name the ISA gives THAT field
+# (`sys-arch-spec/dpc/dpc.cpp:811-849`), and `x1` is both — an `unroll` literal and a register
+# `exx2_32.ddl` declares — so a value-only test resolves `unroll=x1` to a register address. Doing the
+# lookup here means the emitted table already says which of the two each slot is.
+#
+# ⛔ `default-features = false` FOR THE SAME REASON AS THE `[dependencies]` EDGE, and the arch feature
+# forwards to BOTH kinds: `sys-arch-spec/arch-rcudd1a` names the dependency, not one of its uses.
+sys-arch-spec = { path = "sys-arch-spec", default-features = false }
+
 [features]
 # ⛔ THE TARGET ARCH IS A FEATURE, NOT AN ENV VAR, AND NOT A RUNTIME VALUE. Which `.ddl` template
 # serves an op-func depends on the ISA (`opFuncToDdlTemplate` tags `bmm.ddl` RCUDD1A and

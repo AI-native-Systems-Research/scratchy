@@ -25,6 +25,11 @@
 pub struct Instruction {
     pub mnemonic: String,
     pub slots: Vec<Slot>,
+    /// ⭐ THE STATE-RESETTING `SETMASK` AT A BODY'S TAIL, which the splicer DROPS when the loop count
+    /// is a multiple of 8 — `SETMASK` wraps after every increment of 8, so the reset is redundant
+    /// (`ConstructProgIRHelper.cpp:3949-3954`). It is marked by its COMMENT and nothing else, so the
+    /// flag is read here where the comment still exists.
+    pub resets_mask: bool,
 }
 
 /// One `key=value` on an instruction.
@@ -204,7 +209,12 @@ pub fn parse(src: &str) -> Result<Body, String> {
                 value: classify(key, value),
             });
         }
-        body.instructions.push(Instruction { mnemonic, slots });
+        let resets_mask = mnemonic == "SETMASK" && comment.contains("reset mask");
+        body.instructions.push(Instruction {
+            mnemonic,
+            slots,
+            resets_mask,
+        });
     }
     Ok(body)
 }

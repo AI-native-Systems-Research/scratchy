@@ -158,6 +158,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=ddl_templates");
     println!("cargo:rerun-if-changed=ddl");
+    // ⛔ AND THE `.smc` BODIES, which `codegen_opaque_bodies` turns into the instruction table.
+    println!("cargo:rerun-if-changed=opaque_templates");
 
     // Every template, parsed, in a stable order: the emitted tables are keyed by stem and a directory
     // read order would make the output depend on the filesystem.
@@ -357,6 +359,7 @@ fn main() {
     check_every_opaque_hole_is_filled(&programs);
     check_every_op_func_in_scope_has_a_program(&programs);
     codegen_op_func(&mut out, &programs);
+    codegen_opaque_bodies(&mut out, &programs, &census);
 
     // 🛑 THE LEDGER OF WHAT THE WALK FLATTENED. A `ddl.if` whose condition is a LOOP POSITION keeps
     // BOTH arms, because which one runs depends on an extent the walk does not have. Those arms are
@@ -403,6 +406,429 @@ fn main() {
         Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("generated.rs");
     std::fs::write(&dest, out).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
 }
+
+/// THE `.smc` BODIES AS A CONST TABLE, and the file-name chain that picks one.
+///
+/// ⛔⛔ THEY WERE VENDORED AND PARSED BUT NEVER EMITTED. `check_every_opaque_hole_is_filled` read the
+/// 36 files to check the parameter side and threw the parse away, so `ConstructOpaqueInstr` had no
+/// table to splice — and the body IS that function's output.
+///
+/// ⛔ EVERY RIGHT-HAND SIDE IS CLASSIFIED AGAINST THE FIELD'S OWN ENCODE LIST, which is
+/// `SMCLineToInstrInfo`'s rule (`sys-arch-spec/dpc/dpc.cpp:811-849`): a value is a name the ISA gives
+/// THAT field, a number, or a variable the invoking op must bind. `x1` is both — an `unroll` literal
+/// and a register `exx2_32.ddl` declares — so a value-only test binds `unroll=x1` to an address.
+fn codegen_opaque_bodies(out: &mut String, programs: &[Program], census: &Census) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("opaque_templates");
+    // WHICH UNIT A BODY'S INSTRUCTIONS BELONG TO — the `unit=` of the `ddl.opaque` that names it.
+    // ⛔ THE FIELD TABLES ARE PER COMPONENT, so classifying a slot needs this and not just the field.
+    let mut unit_of: BTreeMap<String, &str> = BTreeMap::new();
+    for program in programs {
+        for stmt in &program.stmts {
+            if let (Some(func), Some(unit)) = (attr_str(&stmt.op, "op"), attr_str(&stmt.op, "unit"))
+            {
+                unit_of.insert(func.to_lowercase(), unit);
+            }
+        }
+    }
+
+    let mut stems: BTreeSet<String> = BTreeSet::new();
+    let mut bodies = String::new();
+    let mut units: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut unbound: BTreeMap<String, usize> = BTreeMap::new();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("a readable dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "smc"))
+        .collect();
+    files.sort();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .expect("a .smc file has a stem")
+            .to_string_lossy()
+            .into_owned();
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let body = smc::parse(&src).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+        // ⭐ AN `x<n>` STEM IS THE SAME OP-FUNC AT ANOTHER UNROLL, so its unit is the base name's.
+        let trimmed = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+        let base = trimmed.strip_suffix('x').unwrap_or(&stem);
+        // ⛔ THE TWO `pt_slice_mask_*` BODIES HAVE NO `ddl.opaque`, and they are the PT's: `XRFACCESS`,
+        // `INCRMASK` and a `w-link` source are PT instructions and no other unit spells them.
+        let unit = unit_of.get(base).copied().unwrap_or("pt");
+        let (comp, variant) = match unit {
+            "pt" => (sys_arch_spec::fields::Comp::Pt, "Pt"),
+            "pe" => (sys_arch_spec::fields::Comp::Pe, "Pe"),
+            "sfp" => (sys_arch_spec::fields::Comp::Sfp, "Sfp"),
+            // 🛑 `ConstructOpaqueInstr`'s OWN `DT_CHECK`, MOVED TO BUILD TIME: "OPAQUE instruction is
+            // currently only available in PT, PE and SFP units" (`:3871-3874`). A fourth unit is a
+            // build failure rather than an abort inside a lowering.
+            other => panic!("{stem}: opaque bodies run on the PT, PE and SFP only, not `{other}`"),
+        };
+        let ident = ident_of(&stem);
+        let _ = writeln!(
+            bodies,
+            "const OPAQUE_BODY_{}: &[OpaqueInstruction] = &[",
+            ident.to_uppercase()
+        );
+        for instruction in &body.instructions {
+            let opcode = sys_arch_spec::InstOpCode::of_spelling(&instruction.mnemonic)
+                .unwrap_or_else(|| {
+                    panic!("{stem}: `{}` is not an ISA opcode", instruction.mnemonic)
+                });
+            let ty = instr_type(comp, &instruction.mnemonic).unwrap_or_else(|| {
+                panic!("{stem}: the {unit} defines no `{}`", instruction.mnemonic)
+            });
+            let mut fields: Vec<(sys_arch_spec::operand::Operand, &str, bool)> = instruction
+                .slots
+                .iter()
+                .map(|slot| {
+                    let field = sys_arch_spec::operand::Operand::of_spelling(&slot.key)
+                        .unwrap_or_else(|| {
+                            panic!("{stem}: `{}` is not an operand field", slot.key)
+                        });
+                    match &slot.value {
+                        smc::SlotValue::Stated(text) => (field, text.as_str(), false),
+                        smc::SlotValue::Hole(hole) => (field, hole_spelling(hole), true),
+                    }
+                })
+                .collect();
+            convert_arch_dependent_fields(&mut fields);
+            let mut slots = String::new();
+            for (field, spelling, is_hole) in fields {
+                let value = classify_slot(comp, ty, field, spelling, is_hole, census);
+                if value.starts_with("OpaqueSlotValue::Unbound") {
+                    *unbound
+                        .entry(format!("{unit} {}={spelling}", field.spelling()))
+                        .or_default() += 1;
+                }
+                let _ = write!(
+                    slots,
+                    "OpaqueSlot {{ field: OperandField::{field:?}, value: {value} }}, "
+                );
+            }
+            let _ = writeln!(
+                bodies,
+                "    OpaqueInstruction {{ opcode: OpCode::{opcode:?}, slots: &[{slots}], \
+                 resets_mask: {} }},",
+                instruction.resets_mask
+            );
+        }
+        bodies.push_str("];\n\n");
+        units.insert(ident, variant);
+        stems.insert(stem);
+    }
+
+    // 📏 THE NAMES NO DICTIONARY CAN SUPPLY — each reaches dcc as "OPAQUE was not provided with value
+    // for variable" (`ConstructProgIRHelper.cpp:4006`), so this is a property of the VENDORED
+    // TEMPLATES and not of this build. `mish_p1.smc:8`'s `src1=c7` is the one IBM's own backend hit.
+    println!(
+        "cargo:warning=opaque: {} slot values are names neither the ISA, the register census nor the \
+         params can supply{}",
+        unbound.values().sum::<usize>(),
+        unbound
+            .iter()
+            .map(|(what, n)| format!(" — {what} ×{n}"))
+            .collect::<String>()
+    );
+
+    out.push_str(OPAQUE_SUPPORT_TYPES);
+    out.push_str(&bodies);
+    check_no_ident_collisions("OpaqueTemplate", &stems);
+    let _ = writeln!(
+        out,
+        "/// WHICH `.smc` BODY — the census of `opaque_templates/`, {} files.\n///\n\
+         /// \u{26d4} A TEMPLATE IS NOT AN [`OpaqueFunc`]. Seven op-funcs have one body PER UNROLL\n\
+         /// FACTOR (`reciprocalx1` / `reciprocalx2`) and two bodies have no `ddl.opaque` naming\n\
+         /// them at all, so the two sets are joined by [`OpaqueTemplate::of`] rather than merged.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]\n\
+         pub enum OpaqueTemplate {{",
+        stems.len()
+    );
+    for stem in &stems {
+        let _ = writeln!(out, "    /// `{stem}.smc`.\n    {},", ident_of(stem));
+    }
+    out.push_str("}\n\nimpl OpaqueTemplate {\n");
+    out.push_str(
+        "    /// Its file stem, which is what the reference builds the path from.\n    \
+         #[must_use]\n    pub const fn spelling(self) -> &'static str {\n        match self {\n",
+    );
+    for stem in &stems {
+        let _ = writeln!(out, "            Self::{} => \"{stem}\",", ident_of(stem));
+    }
+    out.push_str(
+        "        }\n    }\n\n    /// The instructions it splices, in source order.\n    \
+         #[must_use]\n    pub const fn body(self) -> &'static [OpaqueInstruction] {\n        \
+         match self {\n",
+    );
+    for ident in units.keys() {
+        let _ = writeln!(
+            out,
+            "            Self::{ident} => OPAQUE_BODY_{},",
+            ident.to_uppercase()
+        );
+    }
+    out.push_str(
+        "        }\n    }\n\n    /// Which unit its instructions run on — the `unit=` of the \
+         `ddl.opaque` that names it.\n    #[must_use]\n    pub const fn unit(self) -> OpaqueUnit \
+         {\n        match self {\n",
+    );
+    for (ident, variant) in &units {
+        let _ = writeln!(out, "            Self::{ident} => OpaqueUnit::{variant},");
+    }
+    out.push_str("        }\n    }\n\n");
+
+    // ⭐ THE FILE-NAME CHAIN, DERIVED. `ConstructOpaqueInstr` names seven op-funcs that take an
+    // `x<unroll>` suffix and falls through to the bare name for the rest (`:3721-3795`); WHICH seven
+    // is a fact about which files exist, so it is read off the census instead of transcribed.
+    out.push_str(
+        "    /// THE BODY AN OP-FUNC SPLICES — `ConstructOpaqueInstr`'s file-name chain \
+         (`:3721-3795`).\n    ///\n    /// \u{26d4} `None` IS \"NO SUCH FILE\", which the reference \
+         reports as `signalPassFailure` on a\n    /// path it cannot open. `ARGMAX` has a \
+         `ddl.opaque` and no body, so that case is reachable.\n    #[must_use]\n    pub const fn \
+         of(func: OpaqueFunc, unroll: ParamValue) -> Option<OpaqueTemplate> {\n        match \
+         (func, unroll) {\n",
+    );
+    let mut arms = 0usize;
+    for func in &census.opaque_funcs {
+        let lower = func.to_lowercase();
+        let suffixed: Vec<&str> = ["1", "2", "4", "8"]
+            .into_iter()
+            .filter(|n| stems.contains(&format!("{lower}x{n}")))
+            .collect();
+        if suffixed.is_empty() {
+            if stems.contains(&lower) {
+                let _ = writeln!(
+                    out,
+                    "            (OpaqueFunc::{}, _) => Some(Self::{}),",
+                    ident_of(func),
+                    ident_of(&lower)
+                );
+                arms += 1;
+            }
+        } else {
+            for n in suffixed {
+                let _ = writeln!(
+                    out,
+                    "            (OpaqueFunc::{}, ParamValue::N{n}) => Some(Self::{}),",
+                    ident_of(func),
+                    ident_of(&format!("{lower}x{n}"))
+                );
+                arms += 1;
+            }
+        }
+    }
+    assert!(
+        arms > 0,
+        "no op-func resolves to a vendored body — the join between `op=` and `opaque_templates/` \
+         has broken"
+    );
+    out.push_str("            _ => None,\n        }\n    }\n}\n\n");
+}
+
+/// `Dpc::convertArchDependentFields` — THE ONE ARCH REWRITE THE TEMPLATES NEED
+/// (`sys-arch-spec/dpc/dpc.cpp:579-613`), applied here because the arch is a build-time fact.
+///
+/// ⛔⛔ THE TEMPLATES ARE WRITTEN IN THE SEN1P5 SPELLING AND RCUDD1A HAS NO SUCH FIELDS. Below
+/// SEN1P5 a `tgtencoding` / `fwdencoding` PAIR collapses into one field named after the
+/// destination — `tgtencoding=sfp fwdencoding=result` becomes `tgtsfp=result` — and both originals
+/// are erased. Skipping it left 51 of the 66 unbindable slots, every one of them a field the
+/// RCUDD1A table simply does not have; `dcc/test/Conversion/SentientToProgIR/fnms_instr.mlir:9`
+/// prints `tgtrf:no tgtsfp:result` for exactly this rewrite.
+fn convert_arch_dependent_fields(fields: &mut Vec<(sys_arch_spec::operand::Operand, &str, bool)>) {
+    use sys_arch_spec::operand::Operand;
+    if sys_arch_spec::fields::TABLE_ARCH >= sys_arch_spec::fields::Gen::Sen1p5 {
+        return;
+    }
+    let find = |want: Operand| fields.iter().position(|(field, ..)| *field == want);
+    let (Some(tgt), Some(fwd)) = (find(Operand::Tgtencoding), find(Operand::Fwdencoding)) else {
+        return;
+    };
+    // The reference's `tgt.isDescriptive() || tgt.isVariable()`: a number names no field.
+    if fields[tgt].1.parse::<i64>().is_ok() {
+        return;
+    }
+    let Some(renamed) = Operand::of_spelling(&format!("tgt{}", fields[tgt].1)) else {
+        return;
+    };
+    let (_, spelling, is_hole) = fields[fwd];
+    fields.retain(|(field, ..)| *field != Operand::Tgtencoding && *field != Operand::Fwdencoding);
+    fields.push((renamed, spelling, is_hole));
+}
+
+/// THE NAME A HOLE IS SPELLED AS — the text the body writes, which is what the reference looks up in
+/// `rReg`, then `rwReg`, then `param`.
+fn hole_spelling(hole: &smc::Hole) -> &'static str {
+    match hole {
+        smc::Hole::Precision => "prec",
+        smc::Hole::Unroll => "unroll",
+        smc::Hole::LoopCount => "l0",
+        smc::Hole::Input(smc::Input::In0) => "in0",
+        smc::Hole::Input(smc::Input::In1) => "in1",
+        smc::Hole::Input(smc::Input::In2) => "in2",
+        smc::Hole::Output => "out0",
+        smc::Hole::InputAtSlice { input, slice } => match (input, slice) {
+            (smc::Input::In0, smc::Slice::S0) => "in0_0",
+            (smc::Input::In0, smc::Slice::S1) => "in0_1",
+            (smc::Input::In1, smc::Slice::S0) => "in1_0",
+            (smc::Input::In1, smc::Slice::S1) => "in1_1",
+            (smc::Input::In2, smc::Slice::S0) => "in2_0",
+            (smc::Input::In2, smc::Slice::S1) => "in2_1",
+        },
+        smc::Hole::OutRegAtSlice { slice } => match slice {
+            smc::Slice::S0 => "outreg_0",
+            smc::Slice::S1 => "outreg_1",
+        },
+    }
+}
+
+/// WHICH FIELD LAYOUT AN OPCODE HAS ON THIS UNIT — `defineOpcode`'s `typeName`, with the row's
+/// `minArch` honoured: the RCUDD1A table carries SEN1P5-only rows this build must not read.
+fn instr_type(
+    comp: sys_arch_spec::fields::Comp,
+    mnemonic: &str,
+) -> Option<sys_arch_spec::fields::InstrType> {
+    comp.opcodes()
+        .iter()
+        .find(|def| def.op == mnemonic && def.min_arch <= sys_arch_spec::fields::TABLE_ARCH)
+        .map(|def| def.ty)
+}
+
+/// ONE SLOT'S RIGHT-HAND SIDE AS A CONST EXPRESSION — `SMCLineToInstrInfo`'s four classes.
+///
+/// ⛔ THE ORDER IS THE REFERENCE'S. A number is a number; then a name the FIELD's encode list gives
+/// (`unroll=x1`); then a name a dictionary can bind; and only then a variable nothing supplies.
+fn classify_slot(
+    comp: sys_arch_spec::fields::Comp,
+    ty: sys_arch_spec::fields::InstrType,
+    field: sys_arch_spec::operand::Operand,
+    spelling: &str,
+    is_hole: bool,
+    census: &Census,
+) -> String {
+    if is_hole && spelling == "l0" {
+        return "OpaqueSlotValue::LoopCount".to_owned();
+    }
+    if !is_hole {
+        if spelling.contains('.') {
+            if let Ok(value) = spelling.parse::<f32>() {
+                return format!("OpaqueSlotValue::Float({value:?})");
+            }
+        }
+        let (sign, digits) = match spelling.strip_prefix('-') {
+            Some(rest) => (-1i64, rest),
+            None => (1i64, spelling),
+        };
+        let parsed = match digits.strip_prefix("0x") {
+            Some(hex) => i64::from_str_radix(hex, 16).ok(),
+            None => digits.parse::<i64>().ok(),
+        };
+        if let Some(value) = parsed {
+            return format!("OpaqueSlotValue::Int({})", sign * value);
+        }
+        // ⭐ THIS FIELD'S OWN NAMES AND NO OTHER'S. One position may answer to two operand spellings,
+        // so membership is `answers_to` rather than an equality on the name.
+        let named = comp.fields().iter().any(|def| {
+            def.ty == ty
+                && def.name.answers_to(field)
+                && def.encode.iter().any(|enc| match enc {
+                    sys_arch_spec::fields::Enc::Lit(name, _)
+                    | sys_arch_spec::fields::Enc::LitSym(name, _) => *name == spelling,
+                    // A register FAMILY is numbered registers, which a template writes as a number.
+                    sys_arch_spec::fields::Enc::Family(..) => false,
+                })
+        });
+        if named {
+            return format!("OpaqueSlotValue::Literal({spelling:?})");
+        }
+    }
+    let reg = census
+        .reg_names
+        .contains(spelling)
+        .then(|| format!("Some(RegName::{})", ident_of(spelling)));
+    let param = census
+        .param_keys
+        .contains(spelling)
+        .then(|| format!("Some(ParamKey::{})", ident_of(spelling)));
+    if reg.is_none() && param.is_none() {
+        return format!("OpaqueSlotValue::Unbound({spelling:?})");
+    }
+    format!(
+        "OpaqueSlotValue::Bound {{ reg: {}, param: {} }}",
+        reg.as_deref().unwrap_or("None"),
+        param.as_deref().unwrap_or("None")
+    )
+}
+
+/// The support types the body table is written in.
+const OPAQUE_SUPPORT_TYPES: &str = r#"use crate::islands::progir::{OpCode, OperandField};
+
+/// ONE INSTRUCTION OF AN OPAQUE BODY.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpaqueInstruction {
+    pub opcode: OpCode,
+    /// Its `key=value` slots, in the order the body writes them.
+    pub slots: &'static [OpaqueSlot],
+    /// ⭐ THE TAIL `SETMASK` THE SPLICER MAY DROP — `SETMASK` wraps after every increment of 8, so a
+    /// loop count that is a multiple of 8 leaves the state-resetting one redundant
+    /// (`ConstructProgIRHelper.cpp:3949-3954`). Marked by its COMMENT in the body and nothing else.
+    pub resets_mask: bool,
+}
+
+/// ONE `key=value` of an opaque body.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpaqueSlot {
+    pub field: OperandField,
+    pub value: OpaqueSlotValue,
+}
+
+/// A SLOT'S RIGHT-HAND SIDE, CLASSIFIED AT BUILD TIME against the field's own ISA encode list —
+/// `SMCLineToInstrInfo`'s four classes (`sys-arch-spec/dpc/dpc.cpp:811-849`).
+///
+/// ⛔⛔ THE FIELD DECIDES, NOT THE SPELLING. `x1` is an `unroll` literal AND a register
+/// `exx2_32.ddl` declares, so `unroll=x1` is a name while `src0=x1` is an address — a value-only
+/// test gets one of the two wrong wherever it lands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpaqueSlotValue {
+    /// `mask=255`, `imm=0x1`, `tgts=0` — decimal or hex, signed.
+    Int(i64),
+    /// `src2=0.0`, `src1=1.0`.
+    Float(f32),
+    /// A name the ISA gives this field: `be=be`, `mode=fp32`, `tgtencoding=lx`, `unroll=x1`.
+    Literal(&'static str),
+    /// A name the invoking op must bind — as a register, as a parameter, or either.
+    ///
+    /// ⛔ THE REGISTER DICTIONARIES ARE SEARCHED FIRST AND THE PARAMS LAST, which is the reference's
+    /// order (`ConstructProgIRHelper.cpp:3993-4008`): `outreg_0` is in both censuses and the
+    /// ADDRESS wins.
+    Bound {
+        reg: Option<RegName>,
+        param: Option<ParamKey>,
+    },
+    /// `imm=l0` — a `MVLOOPCNT` trip count. ⛔ NOT A [`ParamValue`]: it is a COUNT and that set is
+    /// spellings, which is why it travels beside the params rather than inside them.
+    LoopCount,
+    /// ⛔ A NAME NOTHING CAN SUPPLY, which reaches the reference as "OPAQUE was not provided with
+    /// value for variable" (`ConstructProgIRHelper.cpp:4006`). The vendored bodies contain exactly
+    /// TWO — `pt_slice_mask_arf_write.smc:4`'s and `pt_slice_mask_xrf_write.smc:4`'s `unroll=u0`,
+    /// which is a spelling neither arch's `unroll` encode list has. A finding about the templates,
+    /// reported as an offender rather than emitted as a value.
+    Unbound(&'static str),
+}
+
+/// WHICH UNIT AN OPAQUE BODY RUNS ON.
+///
+/// ⛔ THREE, BECAUSE `ConstructOpaqueInstr` CHECKS FOR THREE: "OPAQUE instruction is currently only
+/// available in PT, PE and SFP units" (`ConstructProgIRHelper.cpp:3871-3874`). That check is a build
+/// error here — no fourth unit can be written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OpaqueUnit {
+    Pt,
+    Pe,
+    Sfp,
+}
+
+"#;
 
 fn collect_mnemonics(ops: &[ast::Operation], into: &mut BTreeSet<String>) {
     for op in ops {
