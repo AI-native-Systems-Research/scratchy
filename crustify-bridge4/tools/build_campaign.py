@@ -69,7 +69,16 @@ for home, us in sorted(by_home.items()):
         body.append("")
     (dst / home).write_text("\n".join(body) + "\n")
 
-mod = [
+# ⛔ mod.rs IS ALSO FINISHED WORK, and it has no `/// Replaces:` to protect it. The guard above saved
+# the four ported homes and this line still clobbered mod.rs — 66 lines down to 10, taking the
+# test_fixtures module (the Model and Workload impls this bridge's tests need, which exist nowhere else
+# in the crate) with it. Anything already holding more than the generated skeleton is left alone.
+mod_path = dst / "mod.rs"
+if mod_path.exists() and ("mod test_fixtures" in mod_path.read_text() or "impl Model" in mod_path.read_text()):
+    print("  ⛔ REFUSING to overwrite mod.rs: it holds test fixtures / trait impls")
+    mod = None
+else:
+    mod = [
     "// SPDX-License-Identifier: Apache-2.0",
     "//! `ProgIR -> SenProg` — bridge 4, ported from `sys-arch-spec/{dpc,progir,isa}`.",
     "//!",
@@ -77,9 +86,10 @@ mod = [
     "//! `progir.h` holds 18 as IN-CLASS definitions, which a `.cpp`-only scan would miss entirely.",
     "",
 ]
-for home in sorted(by_home):
-    mod.append(f"pub mod {home[:-3]};")
-(dst / "mod.rs").write_text("\n".join(mod) + "\n")
+if mod is not None:
+    for home in sorted(by_home):
+        mod.append(f"pub mod {home[:-3]};")
+    mod_path.write_text("\n".join(mod) + "\n")
 
 # ── the placement oracle, repo tier, in the schema crustify reads ──────────────────────────────────
 rs = {}
