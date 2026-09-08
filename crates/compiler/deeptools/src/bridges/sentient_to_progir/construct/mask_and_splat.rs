@@ -21,11 +21,16 @@ use crate::arch::{Arch, IsaGen};
 use crate::bridges::sentient_to_progir::construct::compute::{
     ComputeComp, ComputePrecisions, ComputeSlot, UnsupportedComputeInput, set_compute_input_operand,
 };
-use crate::bridges::sentient_to_progir::state::UnitKey;
+use crate::bridges::sentient_to_progir::construct::reg_init::{
+    ConstInput, RegInitFormat, RegInitSplat, UniformConst, VectorImm,
+    add_pe_sfp_lrf_immcopy_to_reg_init,
+};
+use crate::bridges::sentient_to_progir::state::{RegGraphs, UnitKey};
 use crate::bridges::sentient_to_progir::uniform::instr::{
     Comment, FoldConstant, MapMode, MappedEntry, MappedOp, OperandMapRefusal, UniformInstrInfo,
     add_entry_to_operand_map,
 };
+use crate::bridges::sentient_to_progir::utils::ComputeUnit;
 use crate::formats::DataFormat;
 use crate::islands::progir::ty::Operand;
 use crate::islands::progir::{OpCode, OperandField};
@@ -601,7 +606,215 @@ pub fn construct_splat_instr_from_splat_op<A: Arch>(
     instr.set_common_field(OperandField::Unrlfldtgt, boolean(splat.unroll_incr_result));
     (instr, refused)
 }
-// crustify:todo: e098_ConstructSplatPadInstr
+/// THE CONSTANT A SPLAT-PAD FILLS A REGISTER WITH — three of the reference's four probes on the
+/// input (`:3606-3611`).
+///
+/// ⛔ THE QUERY-MAP ARM CARRIES BOTH READINGS OF ONE OP, and that is not redundancy: the register
+/// initialiser walks the mapping's own value ops (`getValuesFromKeys`) while the IMMCOPY takes
+/// `getConstantTargetKeyValues`, and the two arms below hand the same op to those two helpers.
+/// Deriving either from the other would be an invention.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplatPadConst<'a> {
+    /// `sentient.constant`.
+    Scalar {
+        /// `getValue()`.
+        value: i64,
+        /// Whether the value is a symbol id rather than a number.
+        is_symbol: bool,
+    },
+    /// `sentient.vector_constant` — ⛔ NO IMMCOPY EXISTS FOR IT (`:3849`).
+    Vector(VectorImm),
+    /// `uniform.query_map` over constants.
+    QueryMap {
+        /// What [`add_pe_sfp_lrf_immcopy_to_reg_init`] reads.
+        init: &'a [UniformConst],
+        /// What [`construct_imm_copy_instr_from_splat_op`] reads.
+        folds: &'a [FoldConstant],
+    },
+}
+
+impl<'a> SplatPadConst<'a> {
+    /// The same constant as the register initialiser takes it.
+    fn reg_init(self) -> ConstInput {
+        match self {
+            Self::Scalar { value, is_symbol } => ConstInput::Scalar { value, is_symbol },
+            Self::Vector(imm) => ConstInput::Vector(imm),
+            Self::QueryMap { init, .. } => ConstInput::Uniform(init.to_vec()),
+        }
+    }
+
+    /// The same constant as an IMMCOPY takes it — ⛔ `None` IS *"PE/SFP IMMCOPY doesn't support
+    /// vector of constants"* (`:3849`).
+    const fn imm_copy(self) -> Option<ImmCopyValue<'a>> {
+        match self {
+            Self::Scalar { value, .. } => Some(ImmCopyValue::Constant(value)),
+            Self::QueryMap { folds, .. } => Some(ImmCopyValue::Mapped(folds)),
+            Self::Vector(_) => None,
+        }
+    }
+}
+
+/// WHAT A `sentient.splat`'s INPUT IS DEFINED BY — ⛔ TWO ARMS, WHICH IS THE
+/// `llvm_unreachable("Input to Splat Op is either a Constant or a LogicalPort Op")` (`:3860-3861`)
+/// made unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplatPadInput<'a> {
+    /// `sentient.logical_port` — the SPLAT route.
+    Port(Port),
+    /// A constant, a vector of constants or a query map — the IMMCOPY or register-initialiser route.
+    Const(SplatPadConst<'a>),
+}
+
+/// THE `sentient.splat` ATTRIBUTES THE OUTER LOWERING READS, on top of what its two routes read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplatPadOp<'a> {
+    /// `$pad`, `$mask`, `$unrollFactor`, `$unrollIncrResult`.
+    pub splat: Splat,
+    /// `$precision`.
+    pub precision: Precision,
+    /// `$programHeader`.
+    pub program_header: bool,
+    /// `$dbgName`.
+    pub dbg_name: Option<&'a str>,
+}
+
+/// WHAT A SPLAT-PAD COULD NOT BE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplatPadRefusal {
+    /// *"only LRF is currently supported"* (`:3828-3830`) — a constant aimed at a port.
+    ConstantIntoPort(SplatPort),
+    /// *"PE/SFP IMMCOPY doesn't support vector of constants."* (`:3849`).
+    VectorOfConstants,
+    /// *"No masking is supported in register initialization"* — what [`RegInitSplat::of`] refuses.
+    MaskedRegInit,
+    /// A precision `getDataFormatFromSentientPrecisionAttr` has no row for — its own
+    /// `llvm_unreachable` (`Dialect/Sentient/Utils.cpp:191-192`), int16 among them.
+    Precision(Precision),
+    /// What the IMMCOPY route refused.
+    ImmCopy(ImmCopyRefusal),
+    /// What the SPLAT route refused.
+    Splat(SplatRefusal),
+}
+
+/// `getDataFormatFromSentientPrecisionAttr` (`Dialect/Sentient/Utils.cpp:171-193`) — ⛔ SEVEN ROWS,
+/// AND `int16` IS COMMENTED OUT THERE (*"no hw support"*), so `None` is that function's own
+/// `llvm_unreachable` rather than a case this port dropped.
+const fn splat_pad_format(precision: Precision) -> Option<RegInitFormat> {
+    match precision {
+        Precision::Int2 => Some(RegInitFormat::Senint2),
+        Precision::Int4 => Some(RegInitFormat::Senint4),
+        Precision::Int8 => Some(RegInitFormat::Senint8),
+        Precision::Int32 => Some(RegInitFormat::IeeeInt32),
+        Precision::Fp8 => Some(RegInitFormat::Sen143Fp8),
+        Precision::Fp16 => Some(RegInitFormat::Sen169Fp16),
+        Precision::Fp32 => Some(RegInitFormat::IeeeFp32),
+        _ => None,
+    }
+}
+
+/// Replaces: e098_ConstructSplatPadInstr
+///
+/// Route one `sentient.splat`: a port input SPLATs, a constant IMMCOPYs into an LRF, and a program
+/// header's unpadded constant becomes that register's initial content and NO instruction.
+///
+/// ⛔ THE PROGRAM-HEADER TEST COMES BEFORE THE CONST-VS-VECTOR SPLIT (`:3841-3850`), so a vector of
+/// constants still reaches the register initialiser even though it has no IMMCOPY.
+/// ⛔ `None` IS THE REFERENCE'S OWN `std::nullopt` on that path — nothing was emitted, nothing failed.
+/// ⭐ THE LRF DEPTH IS THE TYPE'S: `reg_val < maxNum` (`:3837-3840`) is [`LrfIndex`]'s 32 cases.
+#[must_use]
+pub fn construct_splat_pad_instr<A: Arch>(
+    comp: ComputeUnit,
+    input: SplatPadInput<'_>,
+    output: SplatTarget,
+    op: &SplatPadOp<'_>,
+    units: &[UnitKey],
+    reg_graph: &mut RegGraphs,
+    copy_ops: Option<&mut u32>,
+) -> (Option<UniformInstrInfo>, Vec<SplatPadRefusal>) {
+    // `:3818-3822` — the PE/SFP `DT_CHECK` is this parameter's two cases.
+    let (component, compute) = match comp {
+        ComputeUnit::Pe => (Component::Pe, ComputeComp::Pe),
+        ComputeUnit::Sfp => (Component::Sfp, ComputeComp::Sfp),
+    };
+    let mut refused = Vec::new();
+    // `:3824-3825` — the comment is set before either route; the IMMCOPY route overwrites it.
+    let opened = |opcode| match op.dbg_name {
+        Some(name) => UniformInstrInfo::of(opcode).with_common_comment(name),
+        None => UniformInstrInfo::of(opcode),
+    };
+    let constant = match input {
+        SplatPadInput::Port(port) => {
+            let (instr, splat_refused) = construct_splat_instr_from_splat_op::<A>(
+                opened(OpCode::SPLAT),
+                port,
+                output,
+                compute,
+                op.splat,
+                op.precision,
+            );
+            refused.extend(splat_refused.into_iter().map(SplatPadRefusal::Splat));
+            return (Some(instr), refused);
+        }
+        SplatPadInput::Const(constant) => constant,
+    };
+    let reg_val = match output {
+        SplatTarget::Lrf(index) => index.reg_index(),
+        SplatTarget::Port(port) => {
+            refused.push(SplatPadRefusal::ConstantIntoPort(port));
+            return (None, refused);
+        }
+    };
+    let Some(format) = splat_pad_format(op.precision) else {
+        refused.push(SplatPadRefusal::Precision(op.precision));
+        return (None, refused);
+    };
+    if op.program_header && matches!(op.splat.pad, SplatPad::None) {
+        let Some(witness) = RegInitSplat::of(Some(op.splat.mask), op.splat.unroll_incr_result)
+        else {
+            refused.push(SplatPadRefusal::MaskedRegInit);
+            return (None, refused);
+        };
+        add_pe_sfp_lrf_immcopy_to_reg_init(
+            units,
+            &constant.reg_init(),
+            format,
+            reg_val,
+            witness,
+            reg_graph,
+        );
+        return (None, refused);
+    }
+    let Some(value) = constant.imm_copy() else {
+        refused.push(SplatPadRefusal::VectorOfConstants);
+        return (None, refused);
+    };
+    // `:3680-3682` — the IMMCOPY's `mode` has only these two spellings, so the other five formats
+    // this table holds are reachable only through the register initialiser above.
+    let mode = match op.precision {
+        Precision::Fp16 => ImmCopyPrecision::Fp16,
+        Precision::Fp32 => ImmCopyPrecision::Fp32,
+        other => {
+            refused.push(SplatPadRefusal::Precision(other));
+            return (None, refused);
+        }
+    };
+    let (instr, imm_refused) = construct_imm_copy_instr_from_splat_op::<A>(
+        opened(OpCode::IMMCOPY),
+        value,
+        component,
+        format.format(),
+        reg_val,
+        ImmCopySplat {
+            pad: op.splat.pad,
+            precision: mode,
+            mask: op.splat.mask,
+            dbg_name: op.dbg_name,
+        },
+        copy_ops,
+    );
+    refused.extend(imm_refused.into_iter().map(SplatPadRefusal::ImmCopy));
+    (Some(instr), refused)
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -617,10 +830,15 @@ mod unit_tests {
         ComputeComp, LrfIndex, Port, Precision, Splat, SplatRefusal, SplatTarget, UnrollFactor,
         boolean, construct_splat_instr_from_splat_op,
     };
+    use super::{
+        ComputeUnit, RegGraphs, SplatPadConst, SplatPadInput, SplatPadOp, construct_splat_pad_instr,
+    };
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::sentient_to_progir::uniform::instr::{Comment, UniformInstrInfo};
     use crate::formats::DataFormat;
     use crate::islands::progir::OpCode;
+    use crate::islands::progir::RegInit;
+    use crate::islands::progir::ty::{Operand, OperandValue, RegType};
     use crate::units::{Core, Corelet, Row};
 
     fn sfp(core: u32) -> UnitKey {
@@ -907,5 +1125,130 @@ mod unit_tests {
         );
         assert_eq!(refused, vec![SplatRefusal::Precision(Precision::Int8)]);
         assert_eq!(int8.common_field(OperandField::Mode), None);
+    }
+
+    /// e098: IBM'S THREE ROUTES, ONE PER `CHECK` LINE.
+    /// `SFP_SPLAT :: imm:0 mask:255 mode:fp16 src0:pe src2:0.0 tgtrf:R0 unrlfldtgt:false unroll:x1
+    /// // splat #1` (`splat_none_constant.mlir:7`); a program header's unpadded constant emitting NO
+    /// instruction and `LRF : 0 : #SEN169_FP16 : 0x5a59…` instead (`splat-vector-reg-init.mlir:8-11`,
+    /// 23129 packed twice per word); and the same constant PADDED, which stays an
+    /// `PE_IMMCOPY :: imm:23129 mask:255 replica:0 tgtrf:R0` (`splat-vector-reg-init.mlir:26`).
+    #[test]
+    fn a_program_headers_unpadded_constant_initialises_the_register_instead_of_copying_into_it() {
+        let unpadded = Splat {
+            pad: SplatPad::None,
+            mask: 0,
+            unroll: UnrollFactor::X1,
+            unroll_incr_result: false,
+        };
+        let mut reg_graph = RegGraphs::default();
+        let (splat, refused) = construct_splat_pad_instr::<Dd2>(
+            ComputeUnit::Sfp,
+            SplatPadInput::Port(Port::Pe),
+            SplatTarget::Lrf(LrfIndex::L0),
+            &SplatPadOp {
+                splat: Splat {
+                    pad: SplatPad::Left,
+                    ..unpadded
+                },
+                precision: Precision::Fp16,
+                program_header: false,
+                dbg_name: Some("splat #1"),
+            },
+            &[],
+            &mut reg_graph,
+            None,
+        );
+        assert!(refused.is_empty());
+        let splat = splat.expect("a port input splats");
+        assert_eq!(splat.opcode, OpCode::SPLAT);
+        assert_eq!(
+            splat.common_fields,
+            vec![
+                (OperandField::Imm, int(0)),
+                (OperandField::Mask, int(255)),
+                (OperandField::Mode, descriptive("fp16")),
+                (OperandField::Src0, descriptive("pe")),
+                (OperandField::Src2, descriptive("0.0")),
+                (OperandField::Tgtrf, descriptive("R0")),
+                (OperandField::Unrlfldtgt, boolean(false)),
+                (OperandField::Unroll, descriptive("x1")),
+            ]
+        );
+        assert_eq!(splat.comment, Comment::Common("splat #1".to_owned()));
+        assert!(
+            reg_graph.per_unit.is_empty(),
+            "the SPLAT route initialises nothing"
+        );
+
+        let constant = SplatPadConst::Scalar {
+            value: 23129,
+            is_symbol: false,
+        };
+        let header = SplatPadOp {
+            splat: unpadded,
+            precision: Precision::Fp16,
+            program_header: true,
+            dbg_name: None,
+        };
+        let pe = UnitKey {
+            unit: DfirUnit::Pe,
+            core: Core::checked(1).expect("every arch has core 1"),
+            corelet: Corelet::checked(0),
+        };
+        let (none, refused) = construct_splat_pad_instr::<Dd2>(
+            ComputeUnit::Pe,
+            SplatPadInput::Const(constant),
+            SplatTarget::Lrf(LrfIndex::L0),
+            &header,
+            &[pe],
+            &mut reg_graph,
+            None,
+        );
+        assert!(refused.is_empty());
+        assert!(none.is_none(), "a program header emits no instruction");
+        assert_eq!(
+            reg_graph.get(pe),
+            Some(&vec![RegInit {
+                file: RegType::Lrf,
+                index: RegIndex::at::<0>(),
+                value: Operand::every(OperandValue::Int128([0x5a59_5a59; 4]))
+                    .in_format(DataFormat::Sen169Fp16),
+            }])
+        );
+
+        // ⛔ THE PAD DECIDES, NOT THE HEADER: `left` keeps the IMMCOPY even in a program header.
+        let mut copy_ops = 0;
+        let (padded, refused) = construct_splat_pad_instr::<Dd2>(
+            ComputeUnit::Pe,
+            SplatPadInput::Const(constant),
+            SplatTarget::Lrf(LrfIndex::L0),
+            &SplatPadOp {
+                splat: Splat {
+                    pad: SplatPad::Left,
+                    ..unpadded
+                },
+                ..header
+            },
+            &[pe],
+            &mut reg_graph,
+            Some(&mut copy_ops),
+        );
+        assert!(refused.is_empty());
+        let padded = padded.expect("a padded constant copies");
+        assert_eq!(padded.opcode, OpCode::IMMCOPY);
+        assert_eq!(copy_ops, 1);
+        assert_eq!(
+            padded.common_fields,
+            vec![
+                (
+                    OperandField::Imm,
+                    int(23129).in_format(DataFormat::Sen169Fp16)
+                ),
+                (OperandField::Mask, int(255)),
+                (OperandField::Replica, int(0)),
+                (OperandField::Tgtrf, descriptive("R0")),
+            ]
+        );
     }
 }

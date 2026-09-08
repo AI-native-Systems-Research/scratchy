@@ -24,14 +24,14 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::bridges::sentient_to_progir::construct::mask_and_splat::{
     LxHalf, SetDestTarget, SetDstMaskRefusal, SetDstMaskTarget, construct_set_dest_instr,
     construct_set_dst_mask_instr,
 };
 use crate::bridges::sentient_to_progir::construct::scalar::{
-    Assign, LoopBound, construct_assign_instr, construct_mv_loop_instr, construct_nop_instr,
-    construct_return_instr,
+    Assign, LoopBound, Sync, construct_assign_instr, construct_mv_loop_instr, construct_nop_instr,
+    construct_return_instr, construct_sync_instr,
 };
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
     LabelToJumps, LoweredOp, RegImmSource, add_to_labels_map, add_to_reg_init, address_scale,
@@ -46,7 +46,7 @@ use crate::formats::Bits;
 use crate::islands::progir::OperandField;
 use crate::islands::progir::ty::FoldId;
 use crate::islands::sentient::dialects::sentient::{Reg, RegIndex};
-use crate::islands::sentient::dialects::{Op, Val, dataflow, defining_op};
+use crate::islands::sentient::dialects::{Op, Val, dataflow, defining_op, sentient};
 use sys_arch_spec::regfile::Component;
 
 /// WHICH REGION OF A UNIFORMIZED OP A UNIT TAKES ITS INSTRUCTIONS FROM — the value of
@@ -114,7 +114,6 @@ fn set_unit_region_index(
     }
 }
 
-// crustify:todo: e105_LowerSyncOperation
 /// WHERE A LOWERED INSTRUCTION GOES — `updateLabelAndAddToCodeGraph`'s own three parameters, less
 /// the instruction (`LowerSentientHelper.cpp:47-49`).
 ///
@@ -264,6 +263,7 @@ pub fn lower_for_operation<A: Arch>(
     );
     LoweredFor { copy_ops, refused }
 }
+
 /// Replaces: e115_LowerReturnOperation
 ///
 /// The `RETURN` that ends a unit's program, under its op's label.
@@ -342,6 +342,62 @@ pub fn lower_set_send_destination_operation(
     );
     refused
 }
+
+/// HOW MANY NOPS A LOWERING HAD TO INSERT — `cq_stats.num_nops_` (`:376`).
+///
+/// ⛔ A NEWTYPE BESIDE `CopyOps`, which is the other statistic these lowerings return, and the two are
+/// both counts of instructions nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Nops(pub u32);
+
+/// Replaces: e105_LowerSyncOperation
+///
+/// Lower a `sentient.sync`: the rendezvous, plus — on DD2 only — a dummy NOP when an implicit tile
+/// boundary is immediately followed by a transfer.
+///
+/// ⛔ THE NOP IS A HARDWARE WORKAROUND, NOT A SCHEDULING CHOICE (`:370-380`), and no vendor test
+/// carries one, so its three conditions are all that state it.
+/// ⛔ THE REFERENCE'S COMPONENT GATE IS UNREPRESENTABLE HERE: [`Sync`]'s arms ARE the six components
+/// it admits, so *"Unknown unit for sync operation"* has no input left to fire on.
+/// ⚠️ AND `getNextNode()` IS DEREFERENCED UNCHECKED THERE — `None` is the last-op case.
+pub fn lower_sync_operation<A: Arch>(
+    sync: &Sync,
+    l0_tethered: bool,
+    dbg_name: Option<&str>,
+    next: Option<&Op>,
+    graph: CodeGraph<'_>,
+) -> Nops {
+    let instr = construct_sync_instr::<A>(sync, l0_tethered, dbg_name);
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        LoweredOp::Other,
+        instr,
+        false,
+    );
+    // `implicit_sync_boundary_tile_size` is -1 unless the op sets the boundary (`:365-368`).
+    let tiled = match sync {
+        Sync::L0Implicit { tile } => tile.0 > 0,
+        Sync::Lx { .. } | Sync::L3lu { .. } | Sync::L3su { .. } | Sync::L0 { .. } => false,
+    };
+    let next_transfers = matches!(
+        next,
+        Some(Op::Sentient(
+            sentient::Op::LoadAndSend { .. } | sentient::Op::ReceiveAndStore { .. }
+        ))
+    );
+    if matches!(A::GEN, IsaGen::Rcudd1a) && tiled && next_transfers {
+        graph
+            .region
+            .add_instruction_to_last_block(construct_nop_instr(Some(
+                "dummy_nop_after_implicit_sync_set",
+            )));
+        return Nops(1);
+    }
+    Nops(0)
+}
+
 // crustify:todo: e123_LowerYieldOperation
 // crustify:todo: e125_LowerUniformYieldOperation
 // crustify:todo: e126_LowerUniformOperations
@@ -353,11 +409,89 @@ mod unit_tests {
     use crate::bridges::sentient_to_progir::construct::mask_and_splat::MaskDest;
     use crate::bridges::sentient_to_progir::construct::scalar::{AssignKind, LrfImm};
     use crate::bridges::sentient_to_progir::lower::labels_and_regs::RegImm;
+    use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlock;
     use crate::bridges::sentient_to_progir::uniform::instr::Comment;
     use crate::islands::progir::OpCode;
     use crate::islands::progir::ty::{Operand, OperandValue, PerFold};
     use crate::islands::sentient::dialects::sentient::RegType;
     use crate::units::{Core, Corelet, DfirUnit, Residency};
+
+    #[test]
+    fn an_implicit_tile_boundary_before_a_transfer_gets_a_dummy_nop_on_dd2() {
+        use crate::arch::{Bytes, Elements};
+        use crate::arch::{Dd2, Sen1p5 as Sen1p5Arch};
+        use crate::bridges::sentient_to_progir::construct::scalar::BoundaryTile;
+        use crate::islands::dataflow_ir::link::{Link, Lxlu, Sfp};
+        use crate::islands::progir::{OpCode, OperandField};
+        use crate::islands::sentient::dialects::sentient::{Extent, Reg, RegType, ShuffleMode};
+
+        let (consumer, _) = Link::<Lxlu, Sfp>::between(Val(0), Val(1)).ends();
+        let send = Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(2),
+            immutable_addr: Val(3),
+            increment: Val(4),
+            consumer,
+            result: Val(5),
+            extent: Extent::of(Elements(128), Bytes(1)),
+            interleaved_group: 0,
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        });
+        let sync = Sync::L0Implicit {
+            tile: BoundaryTile(32),
+        };
+        let mut labels = Labels::default();
+        let mut blocks = UniformInstrBlocks::default();
+        let nops = lower_sync_operation::<Dd2>(
+            &sync,
+            false,
+            Some("sync #1"),
+            Some(&send),
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut blocks,
+                at: OpSite(0),
+            },
+        );
+        let instrs = |blocks: &UniformInstrBlocks| match &blocks.blocks[0] {
+            UniformInstrBlock::Regular(instrs) => instrs.clone(),
+            UniformInstrBlock::Uniform(_) => panic!("a regular block"),
+        };
+        let emitted = instrs(&blocks);
+        // `implicit-sync.mlir:9` — `L0_SYNC :: implicit:yes tilesize:32  // sync #1`.
+        assert_eq!(emitted[0].opcode, OpCode::SYNC);
+        assert_eq!(
+            emitted[0].common_field(OperandField::Tilesize),
+            Some(&Operand::every(OperandValue::Int(32)))
+        );
+        assert!(
+            !emitted[0].has_common_field(OperandField::Synctag),
+            "an implicit sync writes none"
+        );
+        assert_eq!(emitted[1].opcode, OpCode::NOP);
+        assert_eq!(nops, Nops(1));
+        // ⛔ SEN1P5 DOES NOT NEED IT — same sync, same next op, one instruction.
+        let mut later = UniformInstrBlocks::default();
+        let nops = lower_sync_operation::<Sen1p5Arch>(
+            &sync,
+            false,
+            Some("sync #1"),
+            Some(&send),
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut later,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(instrs(&later).len(), 1);
+        assert_eq!(nops, Nops(0));
+    }
 
     #[test]
     fn a_group_files_every_unit_it_holds_under_one_region() {

@@ -337,6 +337,50 @@ impl LrfIndex {
             Self::L31 => 31,
         }
     }
+
+    /// THE SAME REGISTER AS AN INDEX INTO ITS FILE — what `std::stoi(portname.substr(3))` hands
+    /// `addRegInit` and the `tgtrf` field (`ConstructProgIRHelper.cpp:3826-3836`).
+    ///
+    /// ⛔ A TABLE, NOT `RegIndex::ALL[self.get()]`: indexing that array with a computed subscript
+    /// compiles a bounds panic for an index this type cannot hold. [`RegIndex::at`] is const-generic
+    /// on purpose, so the only total conversion is one arm per case.
+    #[must_use]
+    pub const fn reg_index(self) -> RegIndex {
+        match self {
+            Self::L0 => RegIndex::at::<0>(),
+            Self::L1 => RegIndex::at::<1>(),
+            Self::L2 => RegIndex::at::<2>(),
+            Self::L3 => RegIndex::at::<3>(),
+            Self::L4 => RegIndex::at::<4>(),
+            Self::L5 => RegIndex::at::<5>(),
+            Self::L6 => RegIndex::at::<6>(),
+            Self::L7 => RegIndex::at::<7>(),
+            Self::L8 => RegIndex::at::<8>(),
+            Self::L9 => RegIndex::at::<9>(),
+            Self::L10 => RegIndex::at::<10>(),
+            Self::L11 => RegIndex::at::<11>(),
+            Self::L12 => RegIndex::at::<12>(),
+            Self::L13 => RegIndex::at::<13>(),
+            Self::L14 => RegIndex::at::<14>(),
+            Self::L15 => RegIndex::at::<15>(),
+            Self::L16 => RegIndex::at::<16>(),
+            Self::L17 => RegIndex::at::<17>(),
+            Self::L18 => RegIndex::at::<18>(),
+            Self::L19 => RegIndex::at::<19>(),
+            Self::L20 => RegIndex::at::<20>(),
+            Self::L21 => RegIndex::at::<21>(),
+            Self::L22 => RegIndex::at::<22>(),
+            Self::L23 => RegIndex::at::<23>(),
+            Self::L24 => RegIndex::at::<24>(),
+            Self::L25 => RegIndex::at::<25>(),
+            Self::L26 => RegIndex::at::<26>(),
+            Self::L27 => RegIndex::at::<27>(),
+            Self::L28 => RegIndex::at::<28>(),
+            Self::L29 => RegIndex::at::<29>(),
+            Self::L30 => RegIndex::at::<30>(),
+            Self::L31 => RegIndex::at::<31>(),
+        }
+    }
 }
 
 /// WHICH `istate<n>` — ⛔ FOUR EXIST (`SentientTypes.td:143-146`), so four variants.
