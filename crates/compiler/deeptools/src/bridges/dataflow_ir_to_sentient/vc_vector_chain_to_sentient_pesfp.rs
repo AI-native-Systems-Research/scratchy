@@ -518,6 +518,8 @@ mod unit_tests {
             vc::EstimateKind::Tanh,
         ] {
             ops.push(DfirOp::VectorChain(vc::Op::Estimate {
+                mask: None,
+                dbg_name: None,
                 result: Val(0),
                 input: Val(1),
                 kind,
@@ -527,18 +529,23 @@ mod unit_tests {
             }));
         }
         ops.push(DfirOp::VectorChain(vc::Op::FastExp {
+            mask: None,
+            dbg_name: None,
             result: Val(0),
             input: Val(1),
             input_ty: V,
             ty: V,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::Floor {
+            mask: None,
+            dbg_name: None,
             result: Val(0),
             input: Val(1),
             input_ty: V,
             ty: V,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::ScanWithGap {
+            dbg_name: None,
             result: Val(0),
             input: Val(1),
             reduction_op: vc::BinaryOp::Add,
@@ -561,12 +568,15 @@ mod unit_tests {
             ty: V,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::MultiplyAccumulate {
+            mask: None,
+            dbg_name: None,
             result: Val(0),
             a: Val(1),
             b: Val(2),
             acc: Val(3),
             reduction_map: map(),
-            operand_ty: V,
+            a_ty: V,
+            b_ty: V,
             ty: V,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::ElementWiseCompare {
@@ -590,6 +600,7 @@ mod unit_tests {
         }));
         ops.push(binary());
         ops.push(DfirOp::VectorChain(vc::Op::Pack {
+            dbg_name: None,
             result: Val(0),
             op1: Val(1),
             op2: Val(2),
@@ -628,6 +639,7 @@ mod unit_tests {
             is_symbol: false,
         }));
         ops.push(DfirOp::VectorChain(vc::Op::Shuffle {
+            pad: Vec::new(),
             dbg_name: None,
             variable: Vec::new(),
             result: Val(0),
@@ -667,6 +679,7 @@ mod unit_tests {
     /// `vectorchain.binary` — an illegal op with a pattern, the ordinary compute.
     fn binary() -> DfirOp {
         DfirOp::VectorChain(vc::Op::Binary {
+            dbg_name: None,
             result: Val(0),
             op1: Val(1),
             op2: Val(2),
@@ -833,6 +846,7 @@ mod unit_tests {
     #[test]
     fn a_shuffle_is_reported_as_best_effort() {
         let unit = unit_holding(vec![DfirOp::VectorChain(vc::Op::Shuffle {
+            pad: Vec::new(),
             dbg_name: None,
             variable: Vec::new(),
             result: Val(0),

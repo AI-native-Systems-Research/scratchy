@@ -2386,6 +2386,7 @@ mod unit_tests {
     /// [`compute_precision_of_op`] through.
     fn shuffle(ty: Vector) -> DfirOp {
         DfirOp::VectorChain(vc::Op::Shuffle {
+            pad: Vec::new(),
             dbg_name: None,
             variable: Vec::new(),
             result: Val(44),
@@ -2409,6 +2410,7 @@ mod unit_tests {
     fn a_pack_computes_in_fp16_whatever_its_elements_are() {
         let fp8x128 = vec(128, ElemType::F8E4M3Fn);
         let pack = DfirOp::VectorChain(vc::Op::Pack {
+            dbg_name: None,
             result: Val(16),
             op1: Val(14),
             op2: Val(15),
@@ -3140,12 +3142,15 @@ mod unit_tests {
     /// `vectorchain.multiply_and_accumulate %a, %b, %acc[%mask]` — `const-vector-multiple-uses.mlir:241`.
     fn mac_reading(a: u32, b: u32, result: u32) -> DfirOp {
         DfirOp::VectorChain(vc::Op::MultiplyAccumulate {
+            mask: None,
+            dbg_name: None,
             result: Val(result),
             a: Val(a),
             b: Val(b),
             acc: Val(300),
             reduction_map: AffineMap::identity(1),
-            operand_ty: f16x64(),
+            a_ty: f16x64(),
+            b_ty: f16x64(),
             ty: f16x64(),
         })
     }
@@ -3587,6 +3592,7 @@ mod unit_tests {
     fn pack_op(indices: Vec<i32>, bits: u32, sign_extend: bool) -> vc::Op {
         let ty = vec(1024 / u64::from(bits), ElemType::Int(bits));
         vc::Op::Pack {
+            dbg_name: None,
             result: Val(50),
             op1: Val(48),
             op2: Val(49),
@@ -3707,6 +3713,7 @@ mod unit_tests {
     fn a_repetition_of_four_is_valid_and_matches_no_row() {
         let ty = f16x64();
         let shuffle = vc::Op::Shuffle {
+            pad: Vec::new(),
             dbg_name: None,
             variable: Vec::new(),
             result: Val(44),

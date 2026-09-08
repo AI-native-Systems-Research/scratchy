@@ -1964,6 +1964,7 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let shuffled = || {
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                pad: Vec::new(),
                 dbg_name: None,
                 variable: Vec::new(),
                 result: Val(41),
@@ -2125,6 +2126,7 @@ mod unit_tests {
         };
         let shuffle = |indices: Vec<i32>, repetition: u32, input_ty: Vector, ty: Vector| {
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                pad: Vec::new(),
                 dbg_name: None,
                 variable: Vec::new(),
                 result: Val(41),
@@ -2196,6 +2198,7 @@ mod unit_tests {
         let mut padded: Vec<i32> = (0..16).collect();
         padded.extend(std::iter::repeat_n(-1, 48));
         let half_stick = vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+            pad: Vec::new(),
             dbg_name: None,
             variable: Vec::new(),
             result: Val(41),
@@ -2706,6 +2709,7 @@ mod unit_tests {
                 ty: LANES,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                pad: Vec::new(),
                 dbg_name: None,
                 variable: Vec::new(),
                 result: Val(41),
@@ -3064,6 +3068,7 @@ mod unit_tests {
                 is_symbol: false,
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                pad: Vec::new(),
                 dbg_name: None,
                 variable: Vec::new(),
                 result: Val(52),

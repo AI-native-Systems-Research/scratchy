@@ -874,6 +874,7 @@ fn compute<const STICK_ALIGNED: bool>(
     // mask that masks nothing. `$mask` is `Optional` in the dialect, so an unmasked binary omits
     // the operand entirely.
     ops.push(Op::VectorChain(vectorchain::Op::Binary {
+        dbg_name: None,
         result,
         op1,
         op2,

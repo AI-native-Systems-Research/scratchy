@@ -361,6 +361,23 @@ impl Predicate {
         self.ty
     }
 
+    /// A CONDITION THAT **ARRIVED** RATHER THAN BEING MASKED HERE — the vector an operand already
+    /// carries, at the type its own definition stated.
+    ///
+    /// ⭐ ADDED FOR `e100_constructBinaryOrTernaryOperation`, whose `SELECT` hands
+    /// `ElementWiseSelectionOp` its `inputs[0]` (`SNComputeLowering.cpp:1168-1171`) — an input
+    /// operand entry 086 built, not a `create_affine_mask` this lowering minted. `$cond` is
+    /// `AnyVectorOfAnyRank` (`VectorChain.td:517`), so there is nothing to check.
+    ///
+    /// ⛔ IT STILL CANNOT DISAGREE WITH ITS DEFINITION: the type comes from the [`Computed`] the
+    /// producing op bound, which is the invariant this type exists for.
+    #[must_use]
+    pub const fn of_operand(operand: Computed) -> Predicate {
+        Predicate {
+            val: operand.val(),
+            ty: operand.ty(),
+        }
+    }
 }
 
 /// ONE `vectorchain` OPERATION.
@@ -378,6 +395,11 @@ pub enum Op {
         input: Val,
         /// Which estimate.
         kind: EstimateKind,
+        /// `$mask`, IF THIS OP CARRIES ONE — `Optional<VectorOfRankAndType<[1], [I1]>>`
+        /// (`VectorChain.td:255`), which every estimate in the family declares.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// Which version, where the op takes one. `rec` and `ln` do not.
         version: Option<EstimateVersion>,
         /// The input's type.
@@ -403,6 +425,10 @@ pub enum Op {
         result: Val,
         /// What is exponentiated.
         input: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `VectorChain.td:243`.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// The input's type.
         input_ty: Vector,
         /// The result's type.
@@ -419,6 +445,10 @@ pub enum Op {
         result: Val,
         /// What is rounded down.
         input: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `VectorChain.td:274`.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// The input's type.
         input_ty: Vector,
         /// The result's type.
@@ -462,6 +492,8 @@ pub enum Op {
         input: Val,
         /// Which reduction.
         reduction_op: BinaryOp,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// The input's type.
         input_ty: Vector,
         /// The result's type.
@@ -510,11 +542,23 @@ pub enum Op {
         b: Val,
         /// The accumulator read in.
         acc: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
+        /// (`VectorChain.td:384`). ⛔ [`Op::Multiply`] HAS NONE; only the accumulating form does.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// As [`Op::Multiply`].
         reduction_map: AffineMap,
-        /// The operands' type.
-        operand_ty: Vector,
-        /// The result's type.
+        /// `type($op1)`.
+        ///
+        /// ⛔⛔ THE TWO FACTORS ARE **TWO** TYPES, unlike [`Op::Multiply`]'s one. `FNMS` negates
+        /// `inputs[0]` AT THE ACCUMULATOR'S TYPE and feeds the negation in
+        /// (`SNComputeLowering.cpp:1013-1016`), so within one emitted MAC `op1` is the narrow type
+        /// and `op2` the wide one — a single `operand_ty` printed the wrong type for one of them.
+        a_ty: Vector,
+        /// `type($op2)`.
+        b_ty: Vector,
+        /// The result's type, which `$op3` is also printed at.
         ty: Vector,
     },
 
@@ -586,6 +630,9 @@ pub enum Op {
         mask: Option<Predicate>,
         /// Which operation.
         binary_op: BinaryOp,
+        /// `dbgName=` — the compute node's name, which every `BinaryOp::create` in the lowering
+        /// passes (`SNComputeLowering.cpp:1117-1119`).
+        dbg_name: Option<String>,
         /// `op_specific_map=` — REQUIRED, and dbo-opt says so: "'vectorchain.binary' op requires
         /// attribute 'op_specific_map'". IBM's own IR writes the identity, `affine_map<(d0) -> (d0)>`,
         /// which is lane `i` of each operand into lane `i` of the result.
@@ -629,6 +676,8 @@ pub enum Op {
         /// `[0, -1, 1, -1, 2, -1, …]` (`dcc/test/SFP/merge_and_pack.mlir:176`) — an `i32` list, not
         /// a `u32` one, and a `usize` here would refuse half the family.
         indices: Vec<i32>,
+        /// `dbgName=` — the compute node's name (`SNComputeLowering.cpp:1128-1131`).
+        dbg_name: Option<String>,
         /// How many times the index pattern repeats to fill the result — `IndexAttr`, printed
         /// `: index` and not `: i32`.
         ///
@@ -730,6 +779,13 @@ pub enum Op {
         /// `input`, so an empty list here with a negative index is an op whose elements have no
         /// source. That is what makes this a field rather than an attribute: the value travels.
         variable: Vec<ShuffleVariable>,
+        /// `pad(..)` — `Variadic<..>:$pad` (`VectorChain.td:462`), the SECOND scalar group, printed
+        /// after `variable(..)` and typed in the same operand order (`VectorChain.cpp:373-379`).
+        ///
+        /// ⛔ A NEGATIVE INDEX READS `variable` FIRST AND `pad` ONLY ONCE THAT IS EXHAUSTED, by the
+        /// offset arithmetic the op declares itself (`VectorChain.td:500-510`). So `variable` empty
+        /// with one `pad` scalar is how a SPLAT reaches its fill value.
+        pad: Vec<ShuffleVariable>,
         /// `dbgName`.
         dbg_name: Option<String>,
         /// One index per element of the input, or a negative one per [`Op::Shuffle::variable`].
@@ -874,24 +930,37 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             input,
             kind,
+            mask,
+            dbg_name,
             version,
             input_ty,
             ty,
         } => {
-            let version = match version {
-                Some(v) => format!(
-                    " {{version = #vectorchain<{} {}>}}",
+            // ⭐ ALPHABETICAL, `printOptionalAttrDict`'s order — `dbgName` ahead of `version`, and
+            // an estimate with neither prints no dictionary at all.
+            let mut attrs = Vec::new();
+            if let Some(name) = dbg_name {
+                attrs.push(format!("dbgName = \"{name}\""));
+            }
+            if let Some(v) = version {
+                attrs.push(format!(
+                    "version = #vectorchain<{} {}>",
                     kind.version_mnemonic(),
                     v.spelling()
-                ),
-                None => String::new(),
+                ));
+            }
+            let attrs = if attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" {{{}}}", attrs.join(", "))
             };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.{} {}{version} : {}, {}",
+                "{} = vectorchain.{} {}{}{attrs} : {}, {}",
                 print::val(*result),
                 kind.spelling(),
                 print::val(*input),
+                mask_bracket(*mask),
                 print::vector(*input_ty),
                 print::vector(*ty)
             );
@@ -901,12 +970,16 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::FastExp {
             result,
             input,
+            mask,
+            dbg_name,
             input_ty,
             ty,
         }
         | Op::Floor {
             result,
             input,
+            mask,
+            dbg_name,
             input_ty,
             ty,
         } => {
@@ -914,11 +987,16 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 Op::FastExp { .. } => "fast_exp",
                 _ => "floor",
             };
+            let name = match dbg_name {
+                Some(name) => format!(" {{dbgName = \"{name}\"}}"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.{mnemonic} {} : {}, {}",
+                "{} = vectorchain.{mnemonic} {}{}{name} : {}, {}",
                 print::val(*result),
                 print::val(*input),
+                mask_bracket(*mask),
                 print::vector(*input_ty),
                 print::vector(*ty)
             );
@@ -947,12 +1025,18 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             input,
             reduction_op,
+            dbg_name,
             input_ty,
             ty,
         } => {
+            // `dbgName` is declared first (`VectorChain.td:519`) and sorts first too.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.scan_with_gap {} {{reduction_op = #vectorchain<binary_operator {}>, \
+                "{} = vectorchain.scan_with_gap {} {{{name}reduction_op = #vectorchain<binary_operator {}>, \
                  gap = 8 : index, eval_order = #vectorchain<eval_order left_to_right>}} : {}, {}",
                 print::val(*result),
                 print::val(*input),
@@ -1003,20 +1087,31 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             a,
             b,
             acc,
+            mask,
+            dbg_name,
             reduction_map,
-            operand_ty,
+            a_ty,
+            b_ty,
             ty,
         } => {
+            // ⭐ ALPHABETICAL — `dbgName` sorts ahead of `reduction_map`, which is required.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
+            // ⛔ THE ACCUMULATOR'S TYPE IS THE RESULT'S, NOT THE OPERANDS' — `type($op3)` is the
+            // third of four, and a MAC reduces, so `op1`/`op2` are wider than `op3`/`data`.
             let _ = writeln!(
                 out,
-                "{} = vectorchain.multiply_and_accumulate {}, {}, {} {{reduction_map = {}}} : {}, {}, {}, {}",
+                "{} = vectorchain.multiply_and_accumulate {}, {}, {}{} {{{name}reduction_map = {}}} : {}, {}, {}, {}",
                 print::val(*result),
                 print::val(*a),
                 print::val(*b),
                 print::val(*acc),
+                mask_bracket(*mask),
                 print::affine_map(reduction_map),
-                print::vector(*operand_ty),
-                print::vector(*operand_ty),
+                print::vector(*a_ty),
+                print::vector(*b_ty),
                 print::vector(*ty),
                 print::vector(*ty)
             );
@@ -1087,13 +1182,19 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             op2,
             mask,
             binary_op,
+            dbg_name,
             op_specific_map,
             operand_ty,
             ty,
         } => {
+            // ⭐ BYTE-WISE NAME ORDER — `binary_op` ahead of `dbgName` ahead of `op_specific_map`.
+            let name = match dbg_name {
+                Some(name) => format!(", dbgName = \"{name}\""),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.binary {}, {}{} {{binary_op = #vectorchain<binary_operator {}>, op_specific_map = {}}} : {}, {}, {}",
+                "{} = vectorchain.binary {}, {}{} {{binary_op = #vectorchain<binary_operator {}>{name}, op_specific_map = {}}} : {}, {}, {}",
                 print::val(*result),
                 print::val(*op1),
                 print::val(*op2),
@@ -1111,6 +1212,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             op2,
             mask,
             indices,
+            dbg_name,
             repetition,
             sign_extend,
             operand_ty,
@@ -1135,9 +1237,14 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 .map(|index| format!("{index} : i32"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // `dbgName` sorts ahead of all three.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.pack {}, {}{} {{indices = [{indices}], repetition = {repetition} : index, sign_extend = {sign_extend}}} : {}, {}, {}",
+                "{} = vectorchain.pack {}, {}{} {{{name}indices = [{indices}], repetition = {repetition} : index, sign_extend = {sign_extend}}} : {}, {}, {}",
                 print::val(*result),
                 print::val(*op1),
                 print::val(*op2),
@@ -1221,6 +1328,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             input,
             variable,
+            pad,
             dbg_name,
             indices,
             repetition,
@@ -1244,6 +1352,17 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                     .join(", ");
                 format!(", variable({vals})")
             };
+            // `if (numPad > 0) p << ", pad(" .. ")"` (`VectorChain.cpp:373-379`) — same rule.
+            let pads = if pad.is_empty() {
+                String::new()
+            } else {
+                let vals = pad
+                    .iter()
+                    .map(|scalar| print::val(scalar.val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", pad({vals})")
+            };
             // ⭐ ALPHABETICAL, WHICH IS `printOptionalAttrDict`'s ORDER (`:385`) — `dbgName` sorts
             // ahead of `indices` and `repetition`, and it is the only one that can be absent.
             let name = match dbg_name {
@@ -1253,12 +1372,12 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             // `p << " : " << input; for (variable) p << ", " << type; p << ", " << result`
             // (`:387-395`) — one type per operand, in operand order, result last.
             let mut types = print::vector(*input_ty);
-            for scalar in variable {
+            for scalar in variable.iter().chain(pad) {
                 let _ = write!(types, ", {}", scalar.ty.spelling());
             }
             let _ = writeln!(
                 out,
-                "{} = vectorchain.shuffle input({}){variables} {{{name}indices = [{indices}], repetition = {repetition} : i32}} : {types}, {}",
+                "{} = vectorchain.shuffle input({}){variables}{pads} {{{name}indices = [{indices}], repetition = {repetition} : i32}} : {types}, {}",
                 print::val(*result),
                 print::val(*input),
                 print::vector(*ty)
@@ -1431,6 +1550,7 @@ mod tests {
         emit(
             &mut out,
             &Op::Pack {
+                dbg_name: None,
                 result: Val(29),
                 op1: Val(24),
                 op2: Val(27),

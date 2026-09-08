@@ -338,9 +338,14 @@ pub fn operands(op: &Op) -> Vec<Val> {
             | vectorchain::Op::Cast { input, .. } => reads.push(*input),
             // ⭐ A SHUFFLE'S `variable` SCALARS ARE OPERANDS TOO, and the ONLY source of the
             // elements a negative index selects — see [`vectorchain::Op::Shuffle::variable`].
-            vectorchain::Op::Shuffle { input, variable, .. } => {
+            vectorchain::Op::Shuffle {
+                input,
+                variable,
+                pad,
+                ..
+            } => {
                 reads.push(*input);
-                reads.extend(variable.iter().map(|scalar| scalar.val));
+                reads.extend(variable.iter().chain(pad).map(|scalar| scalar.val));
             }
             vectorchain::Op::Rotate {
                 input, position, ..
@@ -700,9 +705,19 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | vectorchain::Op::Select { input, .. }
             | vectorchain::Op::Cast { input, .. } => places.push(input),
             // ⭐ AND THEY ARE RE-POINTABLE USES — see the read side.
-            vectorchain::Op::Shuffle { input, variable, .. } => {
+            vectorchain::Op::Shuffle {
+                input,
+                variable,
+                pad,
+                ..
+            } => {
                 places.push(input);
-                places.extend(variable.iter_mut().map(|scalar| &mut scalar.val));
+                places.extend(
+                    variable
+                        .iter_mut()
+                        .chain(pad.iter_mut())
+                        .map(|scalar| &mut scalar.val),
+                );
             }
             vectorchain::Op::Rotate {
                 input, position, ..
@@ -1505,10 +1520,16 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 result,
                 input,
                 variable,
+                pad,
                 ..
             } => {
                 operands.push(input);
-                operands.extend(variable.iter_mut().map(|scalar| &mut scalar.val));
+                operands.extend(
+                    variable
+                        .iter_mut()
+                        .chain(pad.iter_mut())
+                        .map(|scalar| &mut scalar.val),
+                );
                 results.push(result);
             }
             vectorchain::Op::Rotate {
@@ -2075,10 +2096,16 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 result,
                 input,
                 variable,
+                pad,
                 ..
             } => {
                 vals.push((Role::Operand, input));
-                vals.extend(variable.iter_mut().map(|scalar| (Role::Operand, &mut scalar.val)));
+                vals.extend(
+                    variable
+                        .iter_mut()
+                        .chain(pad.iter_mut())
+                        .map(|scalar| (Role::Operand, &mut scalar.val)),
+                );
                 vals.push((Role::Result, result));
             }
             vectorchain::Op::Rotate {

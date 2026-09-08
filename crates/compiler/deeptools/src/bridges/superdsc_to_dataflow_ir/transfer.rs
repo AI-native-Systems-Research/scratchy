@@ -39,7 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e102_GenerateDataTranferForDst
 // crustify:todo: e104_constructDataTransfer
 
 use super::compute::{VectorWidth, precision_conversion, type_from_format};
@@ -1470,6 +1469,7 @@ pub fn construct_2b16b_load_shuffle(
     }
     let result = vals.mint();
     ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
+        pad: Vec::new(),
         result,
         input: load_result,
         variable: Vec::new(),
@@ -1514,6 +1514,7 @@ pub fn construct_2b16b_store_shuffle(
     }
     let result = vals.mint();
     ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
+        pad: Vec::new(),
         result,
         input: data,
         variable: Vec::new(),
@@ -1675,6 +1676,7 @@ pub fn constant_bitstream_and_shuffle(
 
     let result = vals.mint();
     ops.push(DfirOp::VectorChain(vectorchain::Op::Shuffle {
+        pad: Vec::new(),
         result,
         input,
         variable: Vec::new(),
@@ -4788,6 +4790,135 @@ pub fn generate_data_transfer_for_src(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 102/110 — THE DESTINATION END
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH NEIGHBOUR ONE DESTINATION HEARS FROM — `via_.empty() ? src_.unit_ : via_.back()` (`:2564-2569`).
+///
+/// ⛔ [`None`] IS `from == comp_`, WHICH EMITS NOTHING AND SUCCEEDS (`:2571`): this unit is the sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DstFrom(Component);
+
+impl DstFrom {
+    /// `dst.via_.empty()` — the transfer's own source sends.
+    #[must_use]
+    pub fn direct(comp: Component, src_unit: Component) -> Option<DstFrom> {
+        DstFrom::hearing(comp, src_unit)
+    }
+
+    /// `!dst.via_.empty()` — `from = dst.via_.back()`, the last hop.
+    #[must_use]
+    pub fn via(comp: Component, last_hop: Component) -> Option<DstFrom> {
+        DstFrom::hearing(comp, last_hop)
+    }
+
+    /// The component sending — which the explored pair names, not this unit.
+    #[must_use]
+    pub const fn component(self) -> Component {
+        self.0
+    }
+
+    fn hearing(comp: Component, from: Component) -> Option<DstFrom> {
+        (from != comp).then_some(DstFrom(from))
+    }
+}
+
+/// THE FORWARD SENDS OF ONE DESTINATION, AND THE VALUE THEY FOLLOW.
+#[derive(Debug)]
+pub struct Forwarded {
+    /// `final_store_data` — the reference positions a SECOND builder after its defining op
+    /// (`:6600-6602`), which the store's own loops may enclose, so the caller places these there.
+    pub after: Val,
+    /// One `dataflow.send` per `dst_forward_map[comp_]` entry, in that set's order.
+    pub sends: Vec<DfirOp>,
+}
+
+/// WHAT ONE DESTINATION END EMITS.
+#[derive(Debug)]
+pub struct DstTransfer {
+    /// Entry 097's answer.
+    pub received: ReceiveAndStore,
+    /// [`Some`] where `dst_forward_map` holds this component.
+    pub forwarded: Option<Forwarded>,
+}
+
+/// Replaces: e102_GenerateDataTranferForDst
+///
+/// **102/110** `SNTransferLowering::GenerateDataTranferForDst` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2563` (47L).
+///
+/// THE DESTINATION END OF ONE TRANSFER: a receive and store from whichever neighbour sends, then one
+/// `dataflow.send` per unit this one forwards the stored vector on to.
+///
+/// ⛔⛔ THE PAIR RECORDED IS `(from, dst_fwd)` AND THIS UNIT IS NEITHER END OF IT (`:2609`) — so what
+/// entry 092 will not re-emit is the hop the SENDER made, not the forward emitted here.
+/// ⛔ THE `DT_CHECK_MSG` IS THE LATCH ARM: [`Written::Latched`] never assigns `final_store_value`, so
+/// a latched destination that also forwards has no store op to follow.
+/// ⚠️ THE SENDS' `dbgName` IS DROPPED, as every ported send drops it — see [`ReceiveSource::Wire`].
+#[must_use]
+pub fn generate_data_transfer_for_dst(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    from: DstFrom,
+    core: Core,
+    corelet: Option<Corelet>,
+    node: &str,
+    own: Val,
+    forward_to: &[Component],
+    explored: &mut Vec<(Component, Component)>,
+    receive: impl FnOnce(&mut Values, &mut Vec<DfirOp>, RecvEnd) -> Option<ReceiveAndStore>,
+) -> DstTransfer {
+    // `retrieveGetUnitOpInSameCore(builder, from, core_id_, corelet_id_)`.
+    let src_unit =
+        retrieve_get_unit_op_in_same_core(vals, handlers, from.component(), core, corelet).bind(ops);
+    let (_, from_end) = DynLink::between(src_unit, own).ends();
+    // `GenerateReceiveAndStoreFromDataTransferNode(dst_idx, builder, src_unit_op, comp_,
+    //  dst.loc_.storage_, src_sticks_ss_per_dim, final_store_data)`.
+    let received = receive(vals, ops, from_end)
+        .unwrap_or_else(|| emit_error(node, "Unable to generate receive and store operations"));
+
+    // `auto forward_record = dst_forward_map.find(comp_); if (forward_record != end())`.
+    if forward_to.is_empty() {
+        return DstTransfer {
+            received,
+            forwarded: None,
+        };
+    }
+    let stored = match received.written {
+        Written::Switched(stored, _) | Written::Stored(stored) => stored,
+        Written::Latched(..) => emit_error(
+            node,
+            "store operation should be visible for forwarding to other units",
+        ),
+    };
+    let mut sends = Vec::with_capacity(forward_to.len());
+    for dst_fwd in forward_to {
+        // ⛔ THE OUTER BUILDER, NOT THE FORWARDING ONE (`:2603-2604`) — the handles stay out here.
+        let dst_unit =
+            retrieve_get_unit_op_in_same_core(vals, handlers, *dst_fwd, core, corelet).bind(ops);
+        let (to_end, _) = DynLink::between(own, dst_unit).ends();
+        sends.push(DfirOp::Dataflow(dataflow::Op::Send {
+            to: to_end,
+            data: stored.val(),
+            ty: stored.ty(),
+        }));
+        // `explored_pairs_for_via.emplace(from, dst_fwd)` — a set, so a pair already there stands.
+        let pair = (from.component(), *dst_fwd);
+        if !explored.contains(&pair) {
+            explored.push(pair);
+        }
+    }
+    DstTransfer {
+        received,
+        forwarded: Some(Forwarded {
+            after: stored.val(),
+            sends,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -5648,6 +5779,7 @@ mod unit_tests {
             }),
             DfirOp::VectorChain(vectorchain::Op::Shuffle {
                 variable,
+                pad,
                 dbg_name,
                 result,
                 input,
@@ -5662,7 +5794,7 @@ mod unit_tests {
         };
         assert_eq!(value, &vec![0x00, 0x01]);
         // ⭐ THE SHUFFLE ONLY REPEATS: no variable operands, and the transfer's own name.
-        assert!(variable.is_empty());
+        assert!(variable.is_empty() && pad.is_empty());
         assert_eq!(dbg_name.as_deref(), Some("c0"));
         // The width is `all_data.front().size()`, and the element the format's own.
         assert_eq!(
@@ -5961,6 +6093,7 @@ mod unit_tests {
         assert_eq!(
             ops,
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                pad: Vec::new(),
                 variable: Vec::new(),
                 // ⭐ `getStringAttr(transfer_->name_)` — see [`construct_2b16b_load_shuffle`].
                 dbg_name: Some("s".to_owned()),
@@ -6010,6 +6143,7 @@ mod unit_tests {
         assert_eq!(
             ops,
             vec![DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                pad: Vec::new(),
                 variable: Vec::new(),
                 // ⭐ `getStringAttr(transfer_->name_)` — see [`construct_2b16b_load_shuffle`].
                 dbg_name: Some("s".to_owned()),
@@ -7643,5 +7777,98 @@ mod unit_tests {
         assert!(matches!(stored, SrcTransfer::Stored(_)));
         assert!(ops.is_empty());
         assert_eq!(stored_in, Some(storage));
+    }
+
+    // ─────────────────────────────── 102/110 ───────────────────────────────
+
+    /// 🎯 102/110 — ⛔ EACH FORWARD SEND FOLLOWS THE STORED VALUE, NOT THIS CALL, and the pair it
+    /// records names the SENDER and that forward — never this unit. ⚠️ AND `from == comp_` IS NOTHING.
+    #[test]
+    fn a_forwarding_destination_records_the_senders_pair_and_sends_after_the_store() {
+        let ty = Vector {
+            len: 8,
+            elem: ElemType::F16,
+        };
+        let handlers = l3lu_handlers();
+        let core = Core::checked(0).expect("core 0");
+        let own = Val(9);
+        let stored = Computed::of(Val(7), ty);
+        let l3lu = Component::Unit(DfirUnit::L3lu);
+        let forward_to = [
+            Component::Unit(DfirUnit::L0su),
+            Component::Unit(DfirUnit::Lxsu),
+        ];
+        let mut explored = vec![(l3lu, Component::Unit(DfirUnit::L0su))];
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let dst = generate_data_transfer_for_dst(
+            &mut vals,
+            &mut ops,
+            &handlers,
+            DstFrom::direct(Component::Unit(DfirUnit::L0lu), l3lu)
+                .expect("the L3 half is not this unit"),
+            core,
+            None,
+            "N",
+            own,
+            &forward_to,
+            &mut explored,
+            |_, _, from| {
+                // ⛔ THE RECEIVE HEARS THE SENDER'S OWN HANDLE, which the core-wide L3 binding answered.
+                assert_eq!(from, DynLink::between(Val(50), own).ends().1);
+                Some(ReceiveAndStore {
+                    emitted: Emitted::Chain {
+                        ops: Vec::new(),
+                        at: ChainPlace::Here,
+                    },
+                    written: Written::Stored(stored),
+                })
+            },
+        );
+
+        // ⛔ THE HANDLES ARE RETRIEVED ON THE OUTER LIST; only the sends are held back.
+        let created = |result, unit| {
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result,
+                residency: Residency::CoreWide { core },
+                unit,
+                num_folds: None,
+            })
+        };
+        assert_eq!(
+            ops,
+            vec![
+                created(Val(0), DfirUnit::L0su),
+                created(Val(1), DfirUnit::Lxsu),
+            ]
+        );
+        let forwarded = dst.forwarded.expect("two units to forward to");
+        assert_eq!(forwarded.after, Val(7));
+        assert_eq!(
+            forwarded.sends,
+            vec![
+                DfirOp::Dataflow(dataflow::Op::Send {
+                    to: DynLink::between(own, Val(0)).ends().0,
+                    data: Val(7),
+                    ty,
+                }),
+                DfirOp::Dataflow(dataflow::Op::Send {
+                    to: DynLink::between(own, Val(1)).ends().0,
+                    data: Val(7),
+                    ty,
+                }),
+            ]
+        );
+        // ⛔ A PAIR ALREADY IN THE SET STANDS, and the one added names the SENDER, not this unit.
+        assert_eq!(
+            explored,
+            vec![
+                (l3lu, Component::Unit(DfirUnit::L0su)),
+                (l3lu, Component::Unit(DfirUnit::Lxsu)),
+            ]
+        );
+        // ⚠️ `from == comp_` — this unit is the sender and there is nothing to receive.
+        assert!(DstFrom::direct(l3lu, l3lu).is_none());
     }
 }
