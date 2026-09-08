@@ -8,6 +8,23 @@ pub(crate) fn descriptive(name: &str) -> Operand {
     Operand::every(OperandValue::Descriptive(name.to_owned()))
 }
 
+/// ONE FIELD'S VALUE AS A BRANCH TARGET'S NAME — `OperandAttr(text, INSTR_TAG)`, which `tagToPC`
+/// resolves to a program counter once every label's address is known.
+pub(crate) fn instr_tag(label: &str) -> Operand {
+    Operand::every(OperandValue::InstrTag(label.to_owned()))
+}
+
+/// ONE FIELD'S VALUE AS A SYMBOL'S ID — `OperandAttr(id, VARIABLE_SYMBOL)`, an integer the correction
+/// table later substitutes.
+pub(crate) const fn variable_symbol(id: i64) -> Operand {
+    Operand::every(OperandValue::VariableSymbol(id))
+}
+
+/// ONE FIELD'S VALUE AS A FLAG — the implicit `OperandAttr(bool)` behind `setCommonField("isimm", …)`.
+pub(crate) const fn boolean(flag: bool) -> Operand {
+    Operand::every(OperandValue::Boolean(flag))
+}
+
 /// ONE FIELD'S VALUE AS AN INTEGER — the implicit `OperandAttr(int)` behind the reference's
 /// `setCommonField("imm", 3)`.
 pub(crate) const fn int(value: i64) -> Operand {

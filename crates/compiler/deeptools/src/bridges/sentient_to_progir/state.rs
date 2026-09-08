@@ -85,3 +85,63 @@ pub type UtilizedRegisters = BTreeMap<RegType, BTreeSet<RegIndex>>;
 /// ⭐ THE REFERENCE'S KEY IS `pair<int, SenComponents>` WITH THE CORELET ENCODED INTO THE COMPONENT
 /// (`PE_CL1`, `PT_ROW3_CL0`); [`UnitKey`] carries the same three facts as three fields.
 pub type RegsToInit = BTreeMap<UnitKey, UtilizedRegisters>;
+
+/// WHICH OPERATION A BRANCH LABEL IS ATTACHED TO — the `Operation*` key of the reference's
+/// `std::map<Operation*, std::string> labels`, threaded through every jump lowering.
+///
+/// ⛔ A CALLER'S NUMBER, NOT A POINTER: the lowering only ever asks whether two ops are the same one,
+/// and a pointer is not a value this crate can compare. Same discipline as [`UniformLabel`].
+///
+/// [`UniformLabel`]: crate::bridges::sentient_to_progir::uniform::instr::UniformLabel
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpSite(pub u32);
+
+/// WHICH OPERATIONS CARRY A LABEL SOMETHING JUMPS TO — `std::map<Operation*, std::string>&`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Labels {
+    /// One entry per labelled op, in insertion order.
+    pub per_op: Vec<(OpSite, String)>,
+}
+
+impl Labels {
+    /// The label this op carries, if it has one.
+    #[must_use]
+    pub fn get(&self, at: OpSite) -> Option<&str> {
+        self.per_op
+            .iter()
+            .find(|(site, _)| *site == at)
+            .map(|(_, label)| label.as_str())
+    }
+
+    /// `if (labels.count(at) == 0) labels[at] = label;` — ⛔ THE FIRST CLAIM WINS, and the answer is
+    /// the label the op ends up carrying, which is NOT always the one offered.
+    pub fn claim(&mut self, at: OpSite, label: String) -> &str {
+        match self.per_op.iter().position(|(site, _)| *site == at) {
+            Some(held) => &self.per_op[held].1,
+            None => {
+                self.per_op.push((at, label));
+                &self.per_op.last().expect("just pushed").1
+            }
+        }
+    }
+}
+
+/// THE NUMBER THE NEXT MINTED LABEL TAKES — `int& labels_counter`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LabelCounter(pub u32);
+
+impl LabelCounter {
+    /// `labels_counter++` — the number to use, the counter left pointing past it.
+    pub fn bump(&mut self) -> u32 {
+        let now = self.0;
+        self.0 += 1;
+        now
+    }
+}
+
+/// HOW MANY COPY INSTRUCTIONS ONE LOWERING EMITTED — `CodeQualityStats::num_copy_ops_`.
+///
+/// ⭐ A COUNT COMING BACK, NOT AN `optional<CodeQualityStats>&` GOING IN: the reference threads the
+/// absence of statistics through every lowering, where a caller collecting none can just drop this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CopyOps(pub u32);
