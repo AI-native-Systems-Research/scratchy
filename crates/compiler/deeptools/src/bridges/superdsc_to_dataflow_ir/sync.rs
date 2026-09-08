@@ -14,14 +14,13 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e076_constructSyncOperation
-
 use std::num::NonZeroI64;
 
 use super::dsc_lowering::{
     Component, Handlers, Retrieved, constant_index, query_over_handles,
     retrieve_get_unit_op_in_same_core,
 };
+use crate::generated::SyncSignal;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
@@ -295,19 +294,199 @@ pub fn construct_implicit_sync_operation(
     }));
 }
 
+/// THE HANDLES A SYNC STATEMENT SIGNALS — the reference's `needsUniform()` branch, which is a choice
+/// between two functions that fill the SAME vector (`SNSyncLowering.cpp:216-220`, `:245-249`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncUnits {
+    /// `constructUnits(builder, units)` — one handle per other end, from entry 061.
+    Plain(Vec<Retrieved>),
+    /// `constructUnitsForUniformization(builder, units)` — ONE query result, from entry 033, and
+    /// [`None`] where it built none.
+    Uniform(Option<Val>),
+}
+
+/// WHICH OF THE THREE SYNC STATEMENTS THIS IS — `isReceive_` and `implicitSyncRefTransfer_` read as
+/// one answer, because the reference tests both in every arm (`SNSyncLowering.cpp:208,241,266`).
+pub enum SyncKind<'a> {
+    /// `!isReceive_ && implicitSyncRefTransfer_ == nullptr` — the producer.
+    Produce {
+        /// `sync->isSoft_ == 0` — see the TRAP on [`construct_sync_operation`].
+        wait_immediately: bool,
+        /// `to_units`.
+        units: SyncUnits,
+    },
+    /// `isReceive_ && implicitSyncRefTransfer_ == nullptr` — the consumer, and NO wait flag.
+    Receive {
+        /// `from_units`.
+        units: SyncUnits,
+    },
+    /// `implicitSyncRefTransfer_ != nullptr`, whichever way `isReceive_` reads.
+    Implicit {
+        /// Which side of the L0 this program is.
+        side: ImplicitSyncSide,
+        /// `getComponentHandler(..)` for the other side.
+        handler: &'a dyn Fn(ImplicitSyncSide) -> Val,
+        /// The L0 the view is taken over.
+        l0_memory: Val,
+        /// The tile size both stages agree on.
+        tile_size: TileSize,
+        /// The view's element type.
+        elem: ElemType,
+    },
+}
+
+/// `units.size() > 1` becomes a `create_group`, `== 1` names the handle itself, and `0` is the
+/// reference's trailing `return failure()` — no op at all.
+fn one_handle(vals: &mut Values, ops: &mut Vec<DfirOp>, units: SyncUnits) -> Option<Val> {
+    let handles: Vec<Val> = match units {
+        SyncUnits::Plain(retrieved) => retrieved
+            .into_iter()
+            .map(|unit| unit.bind(ops))
+            .collect(),
+        SyncUnits::Uniform(query) => query.into_iter().collect(),
+    };
+    match handles.len() {
+        0 => None,
+        1 => handles.first().copied(),
+        _ => {
+            let result = vals.mint();
+            ops.push(DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                result,
+                unit_ids: handles,
+            }));
+            Some(result)
+        }
+    }
+}
+
+/// Replaces: e076_constructSyncOperation
+///
+/// **076/110** `SNSyncLowering.cpp:205` — the `sync_send`, `sync_recv` or implicit sync itself, over
+/// one handle or over a `create_group` of every other end.
+///
+/// ⛔ `wait_immediately` REACHES NO ATTRIBUTE: [`dataflow::Op::SyncSend`]'s printer states
+/// `wait_immediately_for_async_transfers = true` for every send, with its own cited reason, and a
+/// `ddl.sync` carries no soft flag for this to disagree with.
+/// ⛔ THE IMPLICIT ARM'S `DT_CHECK_MSG(coreArch >= RCUDD1A_ISA)` IS A TYPE FACT: [`crate::arch::IsaGen`]
+/// has no generation below it, so there is no arch this can refuse on.
+pub fn construct_sync_operation(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    signal: SyncSignal,
+    kind: SyncKind<'_>,
+) {
+    match kind {
+        SyncKind::Produce {
+            wait_immediately: _,
+            units,
+        } => {
+            if let Some(to) = one_handle(vals, ops, units) {
+                ops.push(DfirOp::Dataflow(dataflow::Op::SyncSend { to, signal }));
+            }
+        }
+        SyncKind::Receive { units } => {
+            if let Some(from) = one_handle(vals, ops, units) {
+                ops.push(DfirOp::Dataflow(dataflow::Op::SyncRecv { from, signal }));
+            }
+        }
+        SyncKind::Implicit {
+            side,
+            handler,
+            l0_memory,
+            tile_size,
+            elem,
+        } => construct_implicit_sync_operation(
+            vals,
+            ops,
+            side,
+            handler,
+            l0_memory,
+            tile_size,
+            elem,
+            signal.spelling(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ImplicitSyncSide, MappedTy, SyncEnd, TileSize, construct_implicit_sync_operation,
-        construct_units, construct_units_for_uniformization,
+        ImplicitSyncSide, MappedTy, SyncEnd, SyncKind, SyncUnits, TileSize,
+        construct_implicit_sync_operation, construct_sync_operation, construct_units,
+        construct_units_for_uniformization,
     };
     use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::{
         Bound, Component, Handlers, Retrieved,
     };
+    use crate::generated::SyncSignal;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, arith, dataflow, uniform};
     use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef};
     use crate::units::{Core, Corelet, DfirUnit, Residency, Row};
+
+    /// 🎯 076/110 — ⭐ ONE OTHER END IS NAMED DIRECTLY AND TWO BECOME A `create_group`, and the
+    /// receive carries the signal with NO wait flag.
+    #[test]
+    fn a_send_groups_every_other_end_and_a_single_one_is_named_outright() {
+        let mut vals = Values::default();
+        let (first, second) = (vals.mint(), vals.mint());
+        let signal = SyncSignal::InputToLxsuToLxluToSync;
+        let mut ops = Vec::new();
+        construct_sync_operation(
+            &mut vals,
+            &mut ops,
+            signal,
+            SyncKind::Produce {
+                wait_immediately: true,
+                units: SyncUnits::Plain(vec![
+                    Retrieved::Reused(first),
+                    Retrieved::Reused(second),
+                ]),
+            },
+        );
+        assert_eq!(
+            ops,
+            vec![
+                DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                    result: Val(2),
+                    unit_ids: vec![first, second],
+                }),
+                DfirOp::Dataflow(dataflow::Op::SyncSend {
+                    to: Val(2),
+                    signal,
+                }),
+            ]
+        );
+        // ⭐ THE UNIFORMIZED ARM IS ONE QUERY RESULT, so it never groups.
+        let mut ops = Vec::new();
+        construct_sync_operation(
+            &mut vals,
+            &mut ops,
+            signal,
+            SyncKind::Receive {
+                units: SyncUnits::Uniform(Some(first)),
+            },
+        );
+        assert_eq!(
+            ops,
+            vec![DfirOp::Dataflow(dataflow::Op::SyncRecv {
+                from: first,
+                signal,
+            })]
+        );
+        // ⛔ AND NO OTHER END IS THE REFERENCE'S TRAILING `return failure()`: nothing is emitted.
+        let mut ops = Vec::new();
+        construct_sync_operation(
+            &mut vals,
+            &mut ops,
+            signal,
+            SyncKind::Produce {
+                wait_immediately: false,
+                units: SyncUnits::Uniform(None),
+            },
+        );
+        assert!(ops.is_empty());
+    }
 
     /// ⛔ ROWS 1-7 CONTRIBUTE NOTHING AND THE L3 HALVES ASK ONCE WITH NO CORELET.
     ///
