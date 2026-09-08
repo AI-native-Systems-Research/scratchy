@@ -9,3 +9,6 @@ pub mod subtile_to_dataflow_ir;
 
 /// `DataflowIR -> SentientIR` — the D1-D28 span.
 pub mod dataflow_ir_to_sentient;
+
+/// `ProgIR -> SenProg` — bridge 4, ported from sys-arch-spec/{dpc,progir,isa}.
+pub mod progir_to_senprog;

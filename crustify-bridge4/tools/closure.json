@@ -1,0 +1,312 @@
+{
+ "convertIr2Senprog": {
+  "file": "sys-arch-spec/dpc/dpc.cpp",
+  "start": 615,
+  "end": 777,
+  "qname": "Dpc::convertIr2Senprog",
+  "callees": [
+   "asString",
+   "checkIfFieldExists",
+   "checkProgFormatCompatibility",
+   "getCommentStr",
+   "getOpCodeWithPrefix",
+   "getOpcodeType",
+   "getSenComponent",
+   "getSenDataType",
+   "getSimpleInstrVect",
+   "getSimpleRegInit",
+   "getTagStr",
+   "hasComment",
+   "hasSenDataType",
+   "hasTag",
+   "isBool",
+   "isDescriptive",
+   "isFloat",
+   "isInt",
+   "isInt128",
+   "isTag",
+   "isVariable",
+   "isVariableSymbol",
+   "print",
+   "strToupper",
+   "tagToLCCR",
+   "tagToPC"
+  ]
+ },
+ "checkProgFormatCompatibility": {
+  "file": "sys-arch-spec/dpc/dpc.cpp",
+  "start": 87,
+  "end": 96,
+  "qname": "Dpc::checkProgFormatCompatibility",
+  "callees": [
+   "hasVariablesInInstr"
+  ]
+ },
+ "asString": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 62,
+  "end": 66,
+  "qname": "asString",
+  "callees": [
+   "isDescriptive",
+   "isTag",
+   "isVariable"
+  ]
+ },
+ "checkIfFieldExists": {
+  "file": "sys-arch-spec/isa/isa.cpp",
+  "start": 93,
+  "end": 100,
+  "qname": "Isa::checkIfFieldExists",
+  "callees": [
+   "getFieldPosForName",
+   "getOpcodeType",
+   "isValidOpcode"
+  ]
+ },
+ "getCommentStr": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 347,
+  "end": 349,
+  "qname": "getCommentStr",
+  "callees": []
+ },
+ "getOpCodeWithPrefix": {
+  "file": "sys-arch-spec/isa/isa.cpp",
+  "start": 1503,
+  "end": 1506,
+  "qname": "Isa::getOpCodeWithPrefix",
+  "callees": [
+   "getOpCodePrefix"
+  ]
+ },
+ "getOpcodeType": {
+  "file": "sys-arch-spec/isa/isa.cpp",
+  "start": 115,
+  "end": 115,
+  "qname": "Isa::getOpcodeType",
+  "callees": []
+ },
+ "getSenComponent": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 612,
+  "end": 618,
+  "qname": "ProgramAndStateInfo::getSenComponent",
+  "callees": []
+ },
+ "getSenDataType": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 95,
+  "end": 99,
+  "qname": "getSenDataType",
+  "callees": [
+   "hasSenDataType"
+  ]
+ },
+ "getSimpleInstrVect": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 464,
+  "end": 467,
+  "qname": "getSimpleInstrVect",
+  "callees": [
+   "isGraphSimple"
+  ]
+ },
+ "getSimpleRegInit": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 497,
+  "end": 500,
+  "qname": "getSimpleRegInit",
+  "callees": [
+   "isGraphSimple"
+  ]
+ },
+ "getTagStr": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 345,
+  "end": 345,
+  "qname": "getTagStr",
+  "callees": []
+ },
+ "hasComment": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 335,
+  "end": 335,
+  "qname": "hasComment",
+  "callees": [
+   "getCommentStr"
+  ]
+ },
+ "hasSenDataType": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 119,
+  "end": 119,
+  "qname": "hasSenDataType",
+  "callees": []
+ },
+ "hasTag": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 333,
+  "end": 333,
+  "qname": "hasTag",
+  "callees": [
+   "getTagStr"
+  ]
+ },
+ "isBool": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 108,
+  "end": 108,
+  "qname": "isBool",
+  "callees": []
+ },
+ "isDescriptive": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 103,
+  "end": 103,
+  "qname": "isDescriptive",
+  "callees": []
+ },
+ "isFloat": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 107,
+  "end": 107,
+  "qname": "isFloat",
+  "callees": []
+ },
+ "isInt": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 106,
+  "end": 106,
+  "qname": "isInt",
+  "callees": []
+ },
+ "isInt128": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 109,
+  "end": 109,
+  "qname": "isInt128",
+  "callees": []
+ },
+ "isTag": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 110,
+  "end": 110,
+  "qname": "isTag",
+  "callees": []
+ },
+ "isVariable": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 104,
+  "end": 104,
+  "qname": "isVariable",
+  "callees": []
+ },
+ "isVariableSymbol": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 105,
+  "end": 105,
+  "qname": "isVariableSymbol",
+  "callees": []
+ },
+ "print": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 452,
+  "end": 530,
+  "qname": "ProgIrGraph::print",
+  "callees": [
+   "getSenDataType",
+   "hasSenDataType",
+   "traverseGraphDFS"
+  ]
+ },
+ "strToupper": {
+  "file": "sys-arch-spec/dpc/dpc.cpp",
+  "start": 50,
+  "end": 53,
+  "qname": "strToupper",
+  "callees": []
+ },
+ "tagToLCCR": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 720,
+  "end": 807,
+  "qname": "ProgramAndStateInfo::tagToLCCR",
+  "callees": [
+   "asInt",
+   "asString",
+   "getSimpleInstrVect",
+   "getTagStr",
+   "hasTag",
+   "isBool",
+   "isDescriptive",
+   "isInt",
+   "isTag"
+  ]
+ },
+ "tagToPC": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 696,
+  "end": 718,
+  "qname": "ProgramAndStateInfo::tagToPC",
+  "callees": [
+   "getSimpleInstrVect",
+   "getTagStr"
+  ]
+ },
+ "hasVariablesInInstr": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 677,
+  "end": 694,
+  "qname": "ProgramAndStateInfo::hasVariablesInInstr",
+  "callees": [
+   "isVariable"
+  ]
+ },
+ "getFieldPosForName": {
+  "file": "sys-arch-spec/isa/isa.cpp",
+  "start": 68,
+  "end": 79,
+  "qname": "Isa::getFieldPosForName",
+  "callees": []
+ },
+ "isValidOpcode": {
+  "file": "sys-arch-spec/isa/isa.cpp",
+  "start": 102,
+  "end": 113,
+  "qname": "Isa::isValidOpcode",
+  "callees": []
+ },
+ "getOpCodePrefix": {
+  "file": "sys-arch-spec/isa/isa.cpp",
+  "start": 1480,
+  "end": 1501,
+  "qname": "Isa::getOpCodePrefix",
+  "callees": []
+ },
+ "isGraphSimple": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 532,
+  "end": 545,
+  "qname": "ProgIrGraph::isGraphSimple",
+  "callees": []
+ },
+ "traverseGraphDFS": {
+  "file": "sys-arch-spec/progir/progir.cpp",
+  "start": 416,
+  "end": 450,
+  "qname": "ProgIrGraph::traverseGraphDFS",
+  "callees": []
+ },
+ "asInt": {
+  "file": "sys-arch-spec/progir/progir.h",
+  "start": 68,
+  "end": 72,
+  "qname": "asInt",
+  "callees": [
+   "isBool",
+   "isInt",
+   "isVariableSymbol"
+  ]
+ }
+}

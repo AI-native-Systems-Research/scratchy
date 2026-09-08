@@ -1,0 +1,34 @@
+entry	unit	qname	authority_file	auth_start	auth_end	loc	extract_start	extract_end	callees
+1	e001_isDescriptive	isDescriptive	sys-arch-spec/progir/progir.h	103	103	1	8	8	
+2	e002_isTag	isTag	sys-arch-spec/progir/progir.h	110	110	1	15	15	
+3	e003_isVariable	isVariable	sys-arch-spec/progir/progir.h	104	104	1	22	22	
+4	e004_asString	asString	sys-arch-spec/progir/progir.h	62	66	5	29	33	isDescriptive,isTag,isVariable
+5	e005_getFieldPosForName	Isa::getFieldPosForName	sys-arch-spec/isa/isa.cpp	68	79	12	40	51	
+6	e006_getOpcodeType	Isa::getOpcodeType	sys-arch-spec/isa/isa.cpp	115	115	1	58	58	
+7	e007_isValidOpcode	Isa::isValidOpcode	sys-arch-spec/isa/isa.cpp	102	113	12	65	76	
+8	e008_checkIfFieldExists	Isa::checkIfFieldExists	sys-arch-spec/isa/isa.cpp	93	100	8	83	90	getFieldPosForName,getOpcodeType,isValidOpcode
+9	e009_hasVariablesInInstr	ProgramAndStateInfo::hasVariablesInInstr	sys-arch-spec/progir/progir.cpp	677	694	18	97	114	isVariable
+10	e010_checkProgFormatCompatibility	Dpc::checkProgFormatCompatibility	sys-arch-spec/dpc/dpc.cpp	87	96	10	121	130	hasVariablesInInstr
+11	e011_getCommentStr	getCommentStr	sys-arch-spec/progir/progir.h	347	349	3	137	139	
+12	e012_getOpCodePrefix	Isa::getOpCodePrefix	sys-arch-spec/isa/isa.cpp	1480	1501	22	146	167	
+13	e013_getOpCodeWithPrefix	Isa::getOpCodeWithPrefix	sys-arch-spec/isa/isa.cpp	1503	1506	4	174	177	getOpCodePrefix
+14	e014_getSenComponent	ProgramAndStateInfo::getSenComponent	sys-arch-spec/progir/progir.cpp	612	618	7	184	190	
+15	e015_hasSenDataType	hasSenDataType	sys-arch-spec/progir/progir.h	119	119	1	197	197	
+16	e016_getSenDataType	getSenDataType	sys-arch-spec/progir/progir.h	95	99	5	204	208	hasSenDataType
+17	e017_isGraphSimple	ProgIrGraph::isGraphSimple	sys-arch-spec/progir/progir.cpp	532	545	14	215	228	
+18	e018_getSimpleInstrVect	getSimpleInstrVect	sys-arch-spec/progir/progir.h	464	467	4	235	238	isGraphSimple
+19	e019_getSimpleRegInit	getSimpleRegInit	sys-arch-spec/progir/progir.h	497	500	4	245	248	isGraphSimple
+20	e020_getTagStr	getTagStr	sys-arch-spec/progir/progir.h	345	345	1	255	255	
+21	e021_hasComment	hasComment	sys-arch-spec/progir/progir.h	335	335	1	262	262	getCommentStr
+22	e022_hasTag	hasTag	sys-arch-spec/progir/progir.h	333	333	1	269	269	getTagStr
+23	e023_isBool	isBool	sys-arch-spec/progir/progir.h	108	108	1	276	276	
+24	e024_isFloat	isFloat	sys-arch-spec/progir/progir.h	107	107	1	283	283	
+25	e025_isInt	isInt	sys-arch-spec/progir/progir.h	106	106	1	290	290	
+26	e026_isInt128	isInt128	sys-arch-spec/progir/progir.h	109	109	1	297	297	
+27	e027_isVariableSymbol	isVariableSymbol	sys-arch-spec/progir/progir.h	105	105	1	304	304	
+28	e028_strToupper	strToupper	sys-arch-spec/dpc/dpc.cpp	50	53	4	311	314	
+29	e029_asInt	asInt	sys-arch-spec/progir/progir.h	68	72	5	321	325	isBool,isInt,isVariableSymbol
+30	e030_tagToLCCR	ProgramAndStateInfo::tagToLCCR	sys-arch-spec/progir/progir.cpp	720	807	88	332	419	asInt,asString,getSimpleInstrVect,getTagStr,hasTag,isBool,isDescriptive,isInt,isTag
+31	e031_tagToPC	ProgramAndStateInfo::tagToPC	sys-arch-spec/progir/progir.cpp	696	718	23	426	448	getSimpleInstrVect,getTagStr
+32	e032_convertIr2Senprog	Dpc::convertIr2Senprog	sys-arch-spec/dpc/dpc.cpp	615	777	163	455	617	asString,checkIfFieldExists,checkProgFormatCompatibility,getCommentStr,getOpCodeWithPrefix,getOpcodeType,getSenComponent,getSenDataType,getSimpleInstrVect,getSimpleRegInit,getTagStr,hasComment,hasSenDataType,hasTag,isBool,isDescriptive,isFloat,isInt,isInt128,isTag,isVariable,isVariableSymbol,print,strToupper,tagToLCCR,tagToPC
+33	e033_print	OperandAttr::print	sys-arch-spec/progir/progir.cpp	25	62	38	624	661	
