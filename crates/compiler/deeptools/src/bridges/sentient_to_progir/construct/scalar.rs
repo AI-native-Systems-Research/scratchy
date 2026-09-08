@@ -28,20 +28,26 @@
 //! | `e084_ConstructLARorEARSUBInstr` | 2 | 46 | `dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp:1136` |
 
 use crate::arch::{Arch, IsaGen};
+use crate::bridges::sentient_to_progir::construct::reg_init::{
+    ImmSource, add_to_regs_to_init, fill_imm_field,
+};
 use crate::bridges::sentient_to_progir::construct::{
     boolean, descriptive, instr_tag, int, variable_symbol,
 };
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::address_scale;
-use crate::bridges::sentient_to_progir::state::{CopyOps, LabelCounter, Labels, OpSite};
+use crate::bridges::sentient_to_progir::state::{
+    CopyOps, LabelCounter, Labels, OpSite, RegsToInit, UnitKey,
+};
 use crate::bridges::sentient_to_progir::uniform::instr::{
-    MapMode, MappedEntry, OperandMapRefusal, UniformInstrInfo, add_entry_to_operand_map,
+    FoldConstant, MapMode, MappedEntry, OperandMapRefusal, UniformInstrInfo,
+    add_entry_to_operand_map,
 };
 use crate::bridges::sentient_to_progir::utils::{AddrSpace, addr_wraparounded};
 use crate::formats::Bits;
 use crate::islands::progir::ty::Operand;
 use crate::islands::progir::{OpCode, OperandField};
 use crate::islands::sentient::dialects::sentient::{
-    CmpPredicate, Consumer, Reg, RegIndex, SyncMode,
+    CmpPredicate, Consumer, Reg, RegIndex, RegType as SenRegType, SyncMode,
 };
 use crate::units::Core;
 use sys_arch_spec::regfile::Component;
@@ -71,10 +77,512 @@ pub fn construct_return_instr() -> UniformInstrInfo {
     UniformInstrInfo::of(OpCode::RETURN).with_common_comment("end of the program")
 }
 
-// crustify:todo: e081_ConstructLRFADDInstr
-// crustify:todo: e082_ConstructLARorEARADDInstr
-// crustify:todo: e083_ConstructLRFSUBInstr
-// crustify:todo: e084_ConstructLARorEARSUBInstr
+/// `is_any_of(comp, LXLU, LXSU) ? "lrfimm" : "imm"` — the LX halves give the LRF's immediate a field
+/// of its own (`ConstructProgIRHelper.cpp:741`).
+const fn lrf_imm_field(comp: Component) -> OperandField {
+    match comp {
+        Component::Lxlu | Component::Lxsu => OperandField::Lrfimm,
+        _ => OperandField::Imm,
+    }
+}
+
+/// AN ADD OR SUB'S INSTRUCTIONS, THE COPIES THEY COST AND WHAT A PER-UNIT MAP COULD NOT HOLD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarUpdate {
+    /// ⛔ THE COPY COMES FIRST when there is one: the modify writes the register it reads.
+    pub instrs: Vec<UniformInstrInfo>,
+    /// `++num_copy_ops_` — counted for every caller, where the reference counts only under
+    /// `cq_stats`, which is one of the three things that also turn `full_reg_init` on.
+    pub copy_ops: CopyOps,
+    /// The offenders, in entry order.
+    pub refused: Vec<OperandMapRefusal>,
+}
+
+impl ScalarUpdate {
+    /// The instructions, and the copy that had to precede them.
+    fn of(
+        copy: Option<UniformInstrInfo>,
+        instrs: Vec<UniformInstrInfo>,
+        refused: Vec<OperandMapRefusal>,
+    ) -> ScalarUpdate {
+        ScalarUpdate {
+            copy_ops: CopyOps(u32::from(copy.is_some())),
+            instrs: copy.into_iter().chain(instrs).collect(),
+            refused,
+        }
+    }
+}
+
+/// The `*REGCOPY` that puts a source in the target register first — ⛔ THE TARGET IS `src0` (`:751-752`).
+fn reg_copy(
+    opcode: OpCode,
+    comment: &str,
+    tgt: Option<RegIndex>,
+    src: Option<RegIndex>,
+) -> UniformInstrInfo {
+    let mut copy = UniformInstrInfo::of(opcode).with_common_comment(comment);
+    copy.set_common_field(OperandField::Src0, index_field(tgt));
+    copy.set_common_field(OperandField::Src1, index_field(src));
+    copy
+}
+
+/// `LRFREGCOPY` (`:750-756`).
+fn lrf_copy(tgt: Option<RegIndex>, src: Option<RegIndex>) -> UniformInstrInfo {
+    reg_copy(OpCode::LRFREGCOPY, "LRF <- LRF", tgt, src)
+}
+
+/// The disagreeing units of a constant map, as offenders.
+fn folding_needed(units: Vec<UnitKey>) -> Vec<OperandMapRefusal> {
+    units
+        .into_iter()
+        .map(OperandMapRefusal::FoldingNeeded)
+        .collect()
+}
+
+impl AddrFile {
+    /// `getRegLocale()` — what `stringifySentientRegType` spells into the comment (`:813`).
+    const fn locale(self) -> SenRegType {
+        match self {
+            AddrFile::Lar => SenRegType::Lar,
+            AddrFile::Ear => SenRegType::Ear,
+        }
+    }
+
+    /// `is_ear ? EARREGCOPY : LARREGCOPY`, with its comment (`:842-848`).
+    const fn copy(self) -> (OpCode, &'static str) {
+        match self {
+            AddrFile::Lar => (OpCode::LARREGCOPY, "LAR <- LAR"),
+            AddrFile::Ear => (OpCode::EARREGCOPY, "EAR <- EAR"),
+        }
+    }
+}
+
+/// `src1` ON A `MOD*REG` — the target must be one of its own operands, so the OTHER operand goes in
+/// `src1` and a third register is reached by copying into the target first (`:786-800`).
+fn mod_reg_src1(
+    tgt: Option<RegIndex>,
+    src0: Option<RegIndex>,
+    src1: Option<RegIndex>,
+    copy: &mut Option<UniformInstrInfo>,
+    copy_of: (OpCode, &'static str),
+) -> Option<RegIndex> {
+    if src0 == tgt {
+        src1
+    } else if src1 == tgt {
+        src0
+    } else {
+        *copy = Some(reg_copy(copy_of.0, copy_of.1, tgt, src0));
+        src1
+    }
+}
+
+/// WHAT AN LRF ADD ADDS — the three locale pairs of `:743-801`, its `else` an `emitError`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LrfAddOperands {
+    /// `lrf + imm`.
+    RegImm {
+        /// `getValueRegIndex(inp1)`.
+        src0: Option<RegIndex>,
+        /// `inp2`'s defining op.
+        imm: ImmSource,
+    },
+    /// `imm + lrf`.
+    ImmReg {
+        /// `inp1`'s defining op.
+        imm: ImmSource,
+        /// `getValueRegIndex(inp2)`.
+        src1: Option<RegIndex>,
+    },
+    /// `lrf + lrf`.
+    RegReg {
+        /// `getValueRegIndex(inp1)`.
+        src0: Option<RegIndex>,
+        /// `getValueRegIndex(inp2)`.
+        src1: Option<RegIndex>,
+    },
+}
+
+/// AN LRF ADD — ⛔ `tgt` IS A REGISTER THE INSTRUCTION ITSELF NAMES, not a separate destination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LrfAdd {
+    /// `getValueRegIndex(getResult())`.
+    pub tgt: Option<RegIndex>,
+    /// The two operands.
+    pub operands: LrfAddOperands,
+}
+
+/// Replaces: e081_ConstructLRFADDInstr
+///
+/// The add that steps an LRF pointer, and the copy that first puts a source in the target register.
+///
+/// ⛔ `MODLRF*`'s TARGET MUST BE ONE OF ITS OWN OPERAND REGISTERS (`:748`), so a third register costs
+/// a `LRFREGCOPY` in front.
+/// ⚠️ AND THE `imm + lrf` ARM PUTS THE OPERAND'S REGISTER IN `src0`, NOT THE TARGET'S (`:780`) — with
+/// a copy in front it then modifies the source register and leaves the target holding the copy.
+#[must_use]
+pub fn construct_lrf_add_instr<A: Arch>(
+    add: &LrfAdd,
+    comp: Component,
+    element_size: Bits,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> ScalarUpdate {
+    let lrf = |index| Reg {
+        locale: SenRegType::Lrf,
+        index,
+    };
+    if full_reg_init {
+        let mut regs = match &add.operands {
+            LrfAddOperands::RegImm { src0, .. } => vec![lrf(*src0)],
+            LrfAddOperands::ImmReg { src1, .. } => vec![lrf(*src1)],
+            LrfAddOperands::RegReg { src0, src1 } => vec![lrf(*src0), lrf(*src1)],
+        };
+        regs.push(lrf(add.tgt));
+        add_to_regs_to_init(units, &regs, regs_to_init);
+    }
+    let scale = address_scale::<A>(comp);
+    let imm_field = lrf_imm_field(comp);
+    let mut refused = Vec::new();
+    let mut copy = None;
+    let instr = match &add.operands {
+        LrfAddOperands::RegImm { src0, imm } => {
+            let mut instr = UniformInstrInfo::of(OpCode::MODLRFIMM).with_common_comment("lrf add");
+            instr.set_common_field(OperandField::Src0, index_field(add.tgt));
+            refused = fill_imm_field::<A>(&mut instr, imm_field, imm, comp, element_size, scale);
+            if *src0 != add.tgt {
+                copy = Some(lrf_copy(add.tgt, *src0));
+            }
+            instr
+        }
+        LrfAddOperands::ImmReg { imm, src1 } => {
+            let mut instr = UniformInstrInfo::of(OpCode::MODLRFIMM).with_common_comment("lrf add");
+            instr.set_common_field(OperandField::Src0, index_field(*src1));
+            refused = fill_imm_field::<A>(&mut instr, imm_field, imm, comp, element_size, scale);
+            if *src1 != add.tgt {
+                copy = Some(lrf_copy(add.tgt, *src1));
+            }
+            instr
+        }
+        LrfAddOperands::RegReg { src0, src1 } => {
+            let mut instr = UniformInstrInfo::of(OpCode::MODLRFREG).with_common_comment("lrf add");
+            instr.set_common_field(OperandField::Src0, index_field(add.tgt));
+            let held = mod_reg_src1(
+                add.tgt,
+                *src0,
+                *src1,
+                &mut copy,
+                (OpCode::LRFREGCOPY, "LRF <- LRF"),
+            );
+            instr.set_common_field(OperandField::Src1, index_field(held));
+            instr
+        }
+    };
+    ScalarUpdate::of(copy, vec![instr], refused)
+}
+
+/// WHAT A LAR OR EAR ADD ADDS — the two arms of `:826-871`, its `else` an `emitError`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddrAddOperands {
+    /// A register and an immediate, in either order — ⭐ ONE ARM: the reference takes whichever
+    /// operand is not the immediate (`:827-830`).
+    RegImm {
+        /// `getValueRegIndex(reg_operand)`.
+        reg: Option<RegIndex>,
+        /// `imm_operand`'s defining op.
+        imm: ImmSource,
+    },
+    /// Both operands in the file.
+    RegReg {
+        /// `getValueRegIndex(inp1)`.
+        src0: Option<RegIndex>,
+        /// `getValueRegIndex(inp2)`.
+        src1: Option<RegIndex>,
+    },
+}
+
+/// A LAR OR EAR ADD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddrAdd {
+    /// `getRegLocale()` — ⛔ THE OPERANDS' OWN LOCALE IS THIS ONE (`DT_CHECK` `:819-821`), so it is
+    /// not stated a second time and cannot disagree.
+    pub file: AddrFile,
+    /// `getValueRegIndex(getResult())`.
+    pub tgt: Option<RegIndex>,
+    /// The two operands.
+    pub operands: AddrAddOperands,
+}
+
+/// Replaces: e082_ConstructLARorEARADDInstr
+///
+/// The add that steps a local or external address register, and the copy it may need in front.
+///
+/// ⛔ `ADD*IMM` AND `MOD*REG` BOTH WRITE THE REGISTER THEY READ (`:838-841`, `:865-868`), so a third
+/// target costs a `LARREGCOPY`/`EARREGCOPY`.
+/// ⭐ THE IMMEDIATE ARM'S SCALE IS THE NON-IMMEDIATE OPERAND'S (`:834-836`), which is the component's
+/// either way — the locale argument of `GetAddressScale` is dead.
+#[must_use]
+pub fn construct_lar_or_ear_add_instr<A: Arch>(
+    add: &AddrAdd,
+    comp: Component,
+    element_size: Bits,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> ScalarUpdate {
+    let held = |index| Reg {
+        locale: add.file.locale(),
+        index,
+    };
+    if full_reg_init {
+        let mut regs = match &add.operands {
+            AddrAddOperands::RegImm { reg, .. } => vec![held(*reg)],
+            AddrAddOperands::RegReg { src0, src1 } => vec![held(*src0), held(*src1)],
+        };
+        regs.push(held(add.tgt));
+        add_to_regs_to_init(units, &regs, regs_to_init);
+    }
+    let comment = format!("{} add", add.file.locale().spelling());
+    let mut refused = Vec::new();
+    let mut copy = None;
+    let instr = match &add.operands {
+        AddrAddOperands::RegImm { reg, imm } => {
+            let mut instr = UniformInstrInfo::of(match add.file {
+                AddrFile::Lar => OpCode::ADDLARIMM,
+                AddrFile::Ear => OpCode::ADDEARIMM,
+            })
+            .with_common_comment(&comment);
+            instr.set_common_field(OperandField::Src0, index_field(add.tgt));
+            refused = fill_imm_field::<A>(
+                &mut instr,
+                OperandField::Imm,
+                imm,
+                comp,
+                element_size,
+                address_scale::<A>(comp),
+            );
+            if *reg != add.tgt {
+                let (opcode, text) = add.file.copy();
+                copy = Some(reg_copy(opcode, text, add.tgt, *reg));
+            }
+            instr
+        }
+        AddrAddOperands::RegReg { src0, src1 } => {
+            let mut instr = UniformInstrInfo::of(match add.file {
+                AddrFile::Lar => OpCode::MODLARREG,
+                AddrFile::Ear => OpCode::MODEARREG,
+            })
+            .with_common_comment(&comment);
+            instr.set_common_field(OperandField::Src0, index_field(add.tgt));
+            let src1 = mod_reg_src1(add.tgt, *src0, *src1, &mut copy, add.file.copy());
+            instr.set_common_field(OperandField::Src1, index_field(src1));
+            instr
+        }
+    };
+    ScalarUpdate::of(copy, vec![instr], refused)
+}
+
+/// ⛔ 2 MB — THE WIDEST `lrfimm` THERE IS, and live-range reduction or const propagation can hand
+/// the sub up to 4 MB, which is why one op becomes two (`:1046-1049`).
+const MAX_LRF_IMM: i64 = 0x1F_FFFF;
+
+/// WHAT `imm - lrf` SUBTRACTS FROM — ⛔ A THIRD DEFINING OP EMITS NO SUB AT ALL (`:1039-1073` has no
+/// `else`), which this closed pair makes unrepresentable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubImm {
+    /// `sentient.constant`.
+    Constant(i64),
+    /// `uniform.query_map`'s constant target values, one per unit and fold.
+    Mapped(Vec<FoldConstant>),
+}
+
+/// WHAT AN LRF SUB SUBTRACTS — the two locale pairs of `:1029-1140`, its `else` an `emitError`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LrfSubOperands {
+    /// `lrf - imm`.
+    RegImm {
+        /// `getValueRegIndex(inp1)`.
+        src0: Option<RegIndex>,
+        /// `inp2`'s defining op.
+        imm: ImmSource,
+    },
+    /// `imm - lrf` — ⛔ LX-ONLY (`DT_CHECK_MSG` `:1042`), so its immediate field is always `lrfimm`.
+    ImmReg {
+        /// `inp1`'s defining op.
+        imm: SubImm,
+        /// `getValueRegIndex(inp2)`.
+        src1: Option<RegIndex>,
+    },
+}
+
+/// AN LRF SUB.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LrfSub {
+    /// `getValueRegIndex(getResult())`.
+    pub tgt: Option<RegIndex>,
+    /// The two operands.
+    pub operands: LrfSubOperands,
+}
+
+/// Replaces: e083_ConstructLRFSUBInstr
+///
+/// The sub that steps an LRF pointer, splitting an immediate too wide for one field into a sub and a
+/// following modify.
+///
+/// ⛔ THE SPLIT IS PER UNIT (`:1091-1101`): a map whose largest value is over range clamps only the
+/// units that are over and gives every other unit a remainder of ZERO, so they all run both ops.
+/// ⚠️ AND `imm - lrf`'s SCALING IS FLOATING POINT AND UNWRAPPED where the `lrf - imm` arm goes through
+/// [`fill_imm_field`] (`:1045` against `:4136-4141`), so one immediate can round two ways.
+#[must_use]
+pub fn construct_lrf_sub_instr<A: Arch>(
+    sub: &LrfSub,
+    comp: Component,
+    element_size: Bits,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> ScalarUpdate {
+    let lrf = |index| Reg {
+        locale: SenRegType::Lrf,
+        index,
+    };
+    if full_reg_init {
+        let mut regs = match &sub.operands {
+            LrfSubOperands::RegImm { src0, .. } => vec![lrf(*src0)],
+            LrfSubOperands::ImmReg { src1, .. } => vec![lrf(*src1)],
+        };
+        regs.push(lrf(sub.tgt));
+        add_to_regs_to_init(units, &regs, regs_to_init);
+    }
+    let scale = address_scale::<A>(comp);
+    let imm_field = lrf_imm_field(comp);
+    let mut refused = Vec::new();
+    let mut copy = None;
+    let instrs = match &sub.operands {
+        LrfSubOperands::RegImm { src0, imm } => {
+            let mut instr = UniformInstrInfo::of(OpCode::MODLRFIMM).with_common_comment("lrf sub");
+            refused = fill_imm_field::<A>(&mut instr, imm_field, imm, comp, element_size, scale);
+            instr.set_common_field(OperandField::Src0, index_field(sub.tgt));
+            if *src0 != sub.tgt {
+                copy = Some(lrf_copy(sub.tgt, *src0));
+            }
+            vec![instr]
+        }
+        LrfSubOperands::ImmReg { imm, src1 } => {
+            let mut instr = UniformInstrInfo::of(OpCode::SUBLRFIMM).with_common_comment("lrf sub");
+            instr.set_common_field(OperandField::Src0, index_field(sub.tgt));
+            // ⭐ THE MODIFY THAT CARRIES THE REMAINDER HAS NO COMMENT OF ITS OWN (`:1055-1058`).
+            let mut rest = UniformInstrInfo::of(OpCode::MODLRFIMM);
+            rest.set_common_field(OperandField::Src0, index_field(sub.tgt));
+            let widen = f64::from(element_size.0) / 8.0 / f64::from(scale.get());
+            let instrs = match imm {
+                SubImm::Constant(value) => {
+                    let imm = (*value as f64 * widen) as i64;
+                    if imm > MAX_LRF_IMM {
+                        instr.set_common_field(imm_field, int(MAX_LRF_IMM));
+                        rest.set_common_field(imm_field, int(imm - MAX_LRF_IMM));
+                        vec![instr, rest]
+                    } else {
+                        instr.set_common_field(imm_field, int(imm));
+                        vec![instr]
+                    }
+                }
+                SubImm::Mapped(entries) => {
+                    let scaled: Vec<FoldConstant> = entries
+                        .iter()
+                        .map(|entry| FoldConstant {
+                            value: (entry.value as f64 * widen) as i64,
+                            ..*entry
+                        })
+                        .collect();
+                    if scaled.iter().any(|entry| entry.value > MAX_LRF_IMM) {
+                        let remain: Vec<FoldConstant> = scaled
+                            .iter()
+                            .map(|entry| FoldConstant {
+                                value: (entry.value - MAX_LRF_IMM).max(0),
+                                ..*entry
+                            })
+                            .collect();
+                        let clamped: Vec<FoldConstant> = scaled
+                            .iter()
+                            .map(|entry| FoldConstant {
+                                value: entry.value.min(MAX_LRF_IMM),
+                                ..*entry
+                            })
+                            .collect();
+                        refused = folding_needed(
+                            instr.add_const_entries_to_operand_map(imm_field, &clamped, 1.0, None),
+                        );
+                        refused.extend(folding_needed(
+                            rest.add_const_entries_to_operand_map(imm_field, &remain, 1.0, None),
+                        ));
+                        vec![instr, rest]
+                    } else {
+                        refused = folding_needed(
+                            instr.add_const_entries_to_operand_map(imm_field, &scaled, 1.0, None),
+                        );
+                        vec![instr]
+                    }
+                }
+            };
+            if *src1 != sub.tgt {
+                copy = Some(lrf_copy(sub.tgt, *src1));
+            }
+            instrs
+        }
+    };
+    ScalarUpdate::of(copy, instrs, refused)
+}
+
+/// AN `imm - lar` — ⛔ THE ONLY SUB THIS FUNCTION EMITS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddrSub {
+    /// `getValueRegIndex(getResult())`.
+    pub tgt: Option<RegIndex>,
+    /// `inp1`'s defining op — the immediate is the LEFT operand.
+    pub imm: ImmSource,
+    /// `getValueRegIndex(inp2)`.
+    pub src1: Option<RegIndex>,
+}
+
+/// Replaces: e084_ConstructLARorEARSUBInstr
+///
+/// `imm - lar`, with the copy that puts the source in the target register first.
+///
+/// ⛔ DESPITE ITS NAME THERE IS NO EAR PATH (`:1153-1178`): `ear - imm`, `imm - ear` and every LAR
+/// order but this one reach the `emitError`, so `SUBLARIMM` and `LARREGCOPY` are the whole emission.
+/// ⭐ THE OPERAND'S LOCALE IS `getRegLocale()` BY ITS `DT_CHECK_MSG` (`:1147`), so `lar` is also the
+/// comment.
+#[must_use]
+pub fn construct_lar_or_ear_sub_instr<A: Arch>(
+    sub: &AddrSub,
+    comp: Component,
+    element_size: Bits,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> ScalarUpdate {
+    let lar = |index| Reg {
+        locale: SenRegType::Lar,
+        index,
+    };
+    if full_reg_init {
+        add_to_regs_to_init(units, &[lar(sub.src1), lar(sub.tgt)], regs_to_init);
+    }
+    let mut instr = UniformInstrInfo::of(OpCode::SUBLARIMM).with_common_comment("lar sub");
+    instr.set_common_field(OperandField::Src0, index_field(sub.tgt));
+    let refused = fill_imm_field::<A>(
+        &mut instr,
+        OperandField::Imm,
+        &sub.imm,
+        comp,
+        element_size,
+        address_scale::<A>(comp),
+    );
+    let copy = (sub.src1 != sub.tgt)
+        .then(|| reg_copy(OpCode::LARREGCOPY, "LAR <- LAR", sub.tgt, sub.src1));
+    ScalarUpdate::of(copy, vec![instr], refused)
+}
 
 /// `getValueRegIndex`'s answer as a field value — ⛔ THE REFERENCE WRITES ITS `-1` STRAIGHT INTO THE
 /// FIELD (`SentientOps.cpp:1886`), so an unassigned register is a negative index in the program.
@@ -963,18 +1471,24 @@ pub fn construct_jsub_instr(operands: JcrOperands, target: RegIndex) -> UniformI
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        AddrFile, AddrImm, Assign, AssignKind, Assigned, BoundaryTile, CmpImm, CmpOperands,
-        ElseRegion, GtrImm, JcrImm, JcrOperands, LoopBound, LrfImm, Sync, XrfAdd, XrfPtr,
-        construct_assign_instr, construct_branch_exit_instr, construct_jadd_instr,
-        construct_jcmp_instr, construct_jmp_instr, construct_jsub_instr, construct_mv_loop_instr,
-        construct_nop_instr, construct_return_instr, construct_sync_instr,
-        construct_xrf_add_from_operands, construct_xrf_add_instr,
+        AddrAdd, AddrAddOperands, AddrFile, AddrImm, AddrSub, Assign, AssignKind, Assigned,
+        BoundaryTile, CmpImm, CmpOperands, ElseRegion, GtrImm, ImmSource, JcrImm, JcrOperands,
+        LoopBound, LrfAdd, LrfAddOperands, LrfImm, LrfSub, LrfSubOperands, ScalarUpdate, SubImm,
+        Sync, XrfAdd, XrfPtr, construct_assign_instr, construct_branch_exit_instr,
+        construct_jadd_instr, construct_jcmp_instr, construct_jmp_instr, construct_jsub_instr,
+        construct_lar_or_ear_add_instr, construct_lar_or_ear_sub_instr, construct_lrf_add_instr,
+        construct_lrf_sub_instr, construct_mv_loop_instr, construct_nop_instr,
+        construct_return_instr, construct_sync_instr, construct_xrf_add_from_operands,
+        construct_xrf_add_instr,
     };
     use crate::arch::{Arch, Dd2, Target};
     use crate::bridges::sentient_to_progir::construct::{boolean, descriptive, instr_tag, int};
-    use crate::bridges::sentient_to_progir::state::{CopyOps, LabelCounter, Labels, OpSite};
+    use crate::bridges::sentient_to_progir::state::{
+        CopyOps, LabelCounter, Labels, OpSite, RegsToInit,
+    };
     use crate::bridges::sentient_to_progir::uniform::instr::Comment;
     use crate::formats::Bits;
+    use crate::islands::progir::ty::Operand;
     use crate::islands::progir::{OpCode, OperandField};
     use crate::islands::sentient::dialects::sentient::{
         CmpPredicate, Consumer, Reg, RegIndex, RegType, SyncMode,
@@ -1552,5 +2066,208 @@ mod unit_tests {
             ]
         );
         assert_eq!(add, construct_xrf_add_instr::<Dd2>(XrfPtr::Write, 16));
+    }
+
+    /// Each instruction as the dump prints it: opcode, fields in ISA order, comment.
+    fn emitted(out: &ScalarUpdate) -> Vec<(OpCode, Vec<(OperandField, Operand)>, String)> {
+        out.instrs
+            .iter()
+            .map(|instr| {
+                let comment = match &instr.comment {
+                    Comment::Common(text) => text.clone(),
+                    _ => String::new(),
+                };
+                (instr.opcode, instr.common_fields.clone(), comment)
+            })
+            .collect()
+    }
+
+    /// ⭐⭐ IBM'S OWN PAIR — `LX_LRFREGCOPY :: src0:3 src1:1  // LRF <- LRF` then
+    /// `LX_MODLRFREG :: src0:3 src1:0  // lrf add`
+    /// (`lx_indirect_loads_stores_composite.mlir:15-16`): a target that is neither operand.
+    #[test]
+    fn an_lrf_add_copies_when_the_target_is_neither_operand() {
+        let out = construct_lrf_add_instr::<Dd2>(
+            &LrfAdd {
+                tgt: Some(RegIndex::at::<3>()),
+                operands: LrfAddOperands::RegReg {
+                    src0: Some(RegIndex::at::<1>()),
+                    src1: Some(RegIndex::at::<0>()),
+                },
+            },
+            Component::Lxlu,
+            Bits(8),
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(out.copy_ops, CopyOps(1));
+        assert_eq!(out.refused, vec![]);
+        assert_eq!(
+            emitted(&out),
+            vec![
+                (
+                    OpCode::LRFREGCOPY,
+                    vec![(OperandField::Src0, int(3)), (OperandField::Src1, int(1))],
+                    "LRF <- LRF".to_owned()
+                ),
+                (
+                    OpCode::MODLRFREG,
+                    vec![(OperandField::Src0, int(3)), (OperandField::Src1, int(0))],
+                    "lrf add".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// ⭐⭐ IBM'S OWN LINES — `L3_MODLARREG :: src0:1 src1:0  // lar add` and
+    /// `L3_ADDLARIMM :: imm:10 src0:0  // lar add` (`conditional-addr.mlir:17,19`). ⛔ THE L3'S
+    /// ADDRESSES COUNT IN 128-BYTE UNITS, so `1280` bits of immediate is an `imm:10`.
+    #[test]
+    fn a_lar_add_scales_its_immediate_and_takes_the_other_operand() {
+        let of = |operands| AddrAdd {
+            file: AddrFile::Lar,
+            tgt: Some(RegIndex::at::<1>()),
+            operands,
+        };
+        let reg_reg = construct_lar_or_ear_add_instr::<Dd2>(
+            &of(AddrAddOperands::RegReg {
+                src0: Some(RegIndex::at::<1>()),
+                src1: Some(RegIndex::at::<0>()),
+            }),
+            Component::L3lu,
+            Bits(8),
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(reg_reg.copy_ops, CopyOps(0));
+        assert_eq!(
+            emitted(&reg_reg),
+            vec![(
+                OpCode::MODLARREG,
+                vec![(OperandField::Src0, int(1)), (OperandField::Src1, int(0))],
+                "lar add".to_owned()
+            )]
+        );
+        let reg_imm = construct_lar_or_ear_add_instr::<Dd2>(
+            &AddrAdd {
+                file: AddrFile::Lar,
+                tgt: Some(RegIndex::at::<0>()),
+                operands: AddrAddOperands::RegImm {
+                    reg: Some(RegIndex::at::<0>()),
+                    imm: ImmSource::Constant(1280),
+                },
+            },
+            Component::L3lu,
+            Bits(8),
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(
+            emitted(&reg_imm),
+            vec![(
+                OpCode::ADDLARIMM,
+                vec![(OperandField::Imm, int(10)), (OperandField::Src0, int(0))],
+                "lar add".to_owned()
+            )]
+        );
+    }
+
+    /// ⭐⭐ IBM'S OWN PAIR — `LX_LRFREGCOPY :: src0:0 src1:2  // LRF <- LRF` then
+    /// `LX_SUBLRFIMM :: lrfimm:12032 src0:0  // lrf sub` (`unordered_constant_map.mlir:44-45`), and
+    /// ⛔ THE 2 MB SPLIT: an immediate over `0x1FFFFF` leaves the remainder to a following modify.
+    #[test]
+    fn an_lrf_sub_copies_first_and_splits_an_immediate_over_two_megabytes() {
+        let of = |tgt, imm| LrfSub {
+            tgt,
+            operands: LrfSubOperands::ImmReg {
+                imm,
+                src1: Some(RegIndex::at::<2>()),
+            },
+        };
+        let out = construct_lrf_sub_instr::<Dd2>(
+            &of(Some(RegIndex::at::<0>()), SubImm::Constant(12032)),
+            Component::Lxlu,
+            Bits(8),
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(out.copy_ops, CopyOps(1));
+        assert_eq!(
+            emitted(&out),
+            vec![
+                (
+                    OpCode::LRFREGCOPY,
+                    vec![(OperandField::Src0, int(0)), (OperandField::Src1, int(2))],
+                    "LRF <- LRF".to_owned()
+                ),
+                (
+                    OpCode::SUBLRFIMM,
+                    vec![
+                        (OperandField::Lrfimm, int(12032)),
+                        (OperandField::Src0, int(0))
+                    ],
+                    "lrf sub".to_owned()
+                ),
+            ]
+        );
+        let split = construct_lrf_sub_instr::<Dd2>(
+            &of(Some(RegIndex::at::<2>()), SubImm::Constant(0x20_0000)),
+            Component::Lxlu,
+            Bits(8),
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(split.copy_ops, CopyOps(0));
+        assert_eq!(
+            emitted(&split),
+            vec![
+                (
+                    OpCode::SUBLRFIMM,
+                    vec![
+                        (OperandField::Lrfimm, int(0x1F_FFFF)),
+                        (OperandField::Src0, int(2))
+                    ],
+                    "lrf sub".to_owned()
+                ),
+                // ⭐ THE REMAINDER'S MODIFY CARRIES NO COMMENT OF ITS OWN.
+                (
+                    OpCode::MODLRFIMM,
+                    vec![(OperandField::Lrfimm, int(1)), (OperandField::Src0, int(2))],
+                    String::new()
+                ),
+            ]
+        );
+    }
+
+    /// ⭐⭐ IBM'S OWN LINE — `L3_SUBLARIMM :: imm:1824 src0:0  // lar sub`
+    /// (`uniform_scalar_sub.mlir:9`), the source already in the target register.
+    #[test]
+    fn a_lar_sub_needs_no_copy_when_the_source_is_the_target() {
+        let out = construct_lar_or_ear_sub_instr::<Dd2>(
+            &AddrSub {
+                tgt: Some(RegIndex::at::<0>()),
+                imm: ImmSource::Constant(233_472),
+                src1: Some(RegIndex::at::<0>()),
+            },
+            Component::L3lu,
+            Bits(8),
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(out.copy_ops, CopyOps(0));
+        assert_eq!(
+            emitted(&out),
+            vec![(
+                OpCode::SUBLARIMM,
+                vec![(OperandField::Imm, int(1824)), (OperandField::Src0, int(0))],
+                "lar sub".to_owned()
+            )]
+        );
     }
 }
