@@ -9,3 +9,6 @@ pub mod subtile_to_dataflow_ir;
 
 /// `DataflowIR -> SentientIR` — the D1-D28 span.
 pub mod dataflow_ir_to_sentient;
+
+/// `SuperDSC -> DataflowIR` — the ported conversion that replaces `subtile_to_dataflow_ir`.
+pub mod superdsc_to_dataflow_ir;
