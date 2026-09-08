@@ -1,0 +1,353 @@
+{
+  "schema_version": 3,
+  "oracle_config": {
+    "path": "crustify/campaigns/bridge1/levels5-10-statements-and-drivers/wavefront-config.json",
+    "sha256": "f52ff5eea640aef7ca40565fa9ca512f34008cb10927cb3df75c06796aa5362f"
+  },
+  "api_headers_only": false,
+  "budgets": {
+    "max_syms": 8,
+    "max_loc": 320,
+    "max_types": 5,
+    "min_fields": 20
+  },
+  "summary": {
+    "unit_count": 12,
+    "layer_count": 6,
+    "batch_count": 6,
+    "file_count": 1
+  },
+  "waves": [
+    {
+      "unit_count": 4,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e099_constructMACOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 87,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e100_constructBinaryOrTernaryOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 152,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e101_constructUnaryOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 247,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e102_GenerateDataTranferForDst",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 5,
+              "loc": 47,
+              "deps": {
+                "types": [],
+                "symbols": []
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unit_count": 2,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e103_constructComputeOperation",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 6,
+              "loc": 83,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e100_constructBinaryOrTernaryOperation",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e099_constructMACOperation",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e101_constructUnaryOperation",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e104_constructDataTransfer",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 6,
+              "loc": 164,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e102_GenerateDataTranferForDst",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unit_count": 1,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e105_constructOperationsRecursively",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 7,
+              "loc": 165,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e103_constructComputeOperation",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e104_constructDataTransfer",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unit_count": 2,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e106_ConstructAProgramUnit",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 8,
+              "loc": 81,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e105_constructOperationsRecursively",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e107_ConstructAUniformizedProgramUnit",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 8,
+              "loc": 84,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e105_constructOperationsRecursively",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unit_count": 2,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e108_convertV3",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 9,
+              "loc": 29,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e106_ConstructAProgramUnit",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            },
+            {
+              "name": "e109_convertV4",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 9,
+              "loc": 33,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e106_ConstructAProgramUnit",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e107_ConstructAUniformizedProgramUnit",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "unit_count": 1,
+      "batches": [
+        {
+          "kind": "symbol",
+          "source_file": "crustify-bridge1/cpp/bridge1.cpp",
+          "items": [
+            {
+              "name": "e110_runTranslator",
+              "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+              "kind": "symbol",
+              "source_kind": "function",
+              "layer": 10,
+              "loc": 32,
+              "deps": {
+                "types": [],
+                "symbols": [
+                  {
+                    "name": "e108_convertV3",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  },
+                  {
+                    "name": "e109_convertV4",
+                    "defined_in": "crustify-bridge1/cpp/bridge1.cpp",
+                    "scope": "port"
+                  }
+                ]
+              },
+              "fallback": [],
+              "back_fill": [],
+              "generates": [],
+              "field_anchors": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,269 @@
+{
+ "_comment": [
+  "The port lands in the existing scratchy crate, not a new one:",
+  "crates/compiler/deeptools/src/bridges/superdsc_to_dataflow_ir/.",
+  "",
+  "\u26d4 IT IS A NEW MODULE BESIDE THE OLD ONE, NOT A REWRITE OF IT. `bridges/subtile_to_dataflow_ir/`",
+  "(1,904 lines over node.rs / schedule.rs / tape.rs / transfer.rs) is the hand-written bridge this",
+  "port is intended to REPLACE. Do not delete or edit it in this campaign \u2014 switching the call site",
+  "is a separate, deliberate step after the port lands and the gate is green on both models.",
+  "",
+  "INPUT SIDE, already typed: scratchy's own SuperDSC in",
+  "crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs (12,597 lines), carrying SdscOp /",
+  "SdscFolds with C++-mirroring field names (opConsts, backGapCore_, coordinates_, constantInfo_).",
+  "It is validated against the vendor's dxp_standalone.",
+  "\u26a0 Several of its fields are untyped serde_json::Value escape hatches. A ported lowering that",
+  "reads one needs it TYPED, and tightening those is IN SCOPE for this campaign \u2014 say so in the",
+  "commit message when you do it.",
+  "",
+  "OUTPUT SIDE, already typed: crates/compiler/deeptools/src/islands/dataflow_ir/ (ops, types,",
+  "printer, ty.rs at 3,271 lines). There is no MLIR text on either side and no parser in this crate;",
+  "there must not be one.",
+  "",
+  "No -sys crate: this is a complete port with no C interop boundary. crustify/rust/deeptools-sys is",
+  "an empty placeholder that exists only to satisfy an executor gate.",
+  "",
+  "SCHEMA NOTE: this file was regenerated into the shape crustify reads. The first version used",
+  "`path` + `modules.<m>.symbols`, and crustify refused the port stage with '71 selected item(s)",
+  "have no home .rs on disk (no crates.json home)' even though every home existed and UNITS.tsv",
+  "named it. The placement oracle needs crate_path / rust_path / rs.<crate-relative path> /",
+  "members.functions, keyed exactly as the bridge-2 campaign's own crates.json keys them."
+ ],
+ "crates": {
+  "deeptools": {
+   "kind": "library",
+   "in_tree": true,
+   "crate_path": "crates/compiler/deeptools",
+   "sys_crate": "crustify/rust/deeptools-sys",
+   "depends_on": [],
+   "modules": {
+    "superdsc_to_dataflow_ir": {
+     "rust_path": "src/bridges/superdsc_to_dataflow_ir",
+     "rs": {
+      "src/bridges/superdsc_to_dataflow_ir/compute.rs": {
+       "_comment": "18 unit(s) from dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp (levels [0, 1, 3, 4, 5, 6]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e014_constructTypeFromFormat",
+         "e015_constructSingleValCustomVector",
+         "e016_mapToDicAttr",
+         "e047_getStaticContinuousMaskValue",
+         "e048_constructDynamicMasking",
+         "e049_getTypeBasedOnComputeType",
+         "e050_getReductionMapForMACOperation",
+         "e051_getSelectionMapForMACOperandFromL0",
+         "e052_constructPrecisionConversionOperation",
+         "e053_constructOpaqueOperation",
+         "e086_constructComputeInputOperandAndAddToList",
+         "e087_constructComputeOutputOperand",
+         "e094_constructComputeOutputOperands",
+         "e095_constructFMINorFMAXOperation",
+         "e099_constructMACOperation",
+         "e100_constructBinaryOrTernaryOperation",
+         "e101_constructUnaryOperation",
+         "e103_constructComputeOperation"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/construction.rs": {
+       "_comment": "6 unit(s) from dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp (levels [0, 1, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp"
+       ],
+       "members": {
+        "functions": [
+         "e011_constructLogicalMemoryViewOp",
+         "e012_convertPrecisionToType",
+         "e013_convertTypeToString",
+         "e045_getReductionMapForMACOperation",
+         "e046_getStaticContinuousMaskValue",
+         "e085_initializeUnit"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/control_flow.rs": {
+       "_comment": "14 unit(s) from dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp (levels [0, 1, 2, 3, 4]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e017_getCmpIPredicate_dup",
+         "e018_getMLIRLoopFromSNLoopNode",
+         "e019_getParentLoop",
+         "e020_propagateBufferSwitchLoopsToRootRecursively",
+         "e021_resetIterArguments",
+         "e054_constructConditionalOperation",
+         "e055_constructConditionalsForSAMV",
+         "e056_getBufferingOrStreamingMode",
+         "e057_propagateBufferSwitchLoopsToRoot",
+         "e058_constructLoopForADim",
+         "e074_getBlockingOrStreamingBufferLoopLocations",
+         "e075_constructLoopIterArgs",
+         "e088_constructLoopsRecursive",
+         "e096_constructLoops"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/driver.rs": {
+       "_comment": "11 unit(s) from dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp (levels [0, 1, 7, 8, 9, 10]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e003_startDataflowIRGeneration",
+         "e004_stopDataflowIRGeneration",
+         "e005_areFoldedAddressesSameAcrossFoldsAndCoresForGivenCorelet",
+         "e042_terminate",
+         "e043_areFoldsNeeded",
+         "e105_constructOperationsRecursively",
+         "e106_ConstructAProgramUnit",
+         "e107_ConstructAUniformizedProgramUnit",
+         "e108_convertV3",
+         "e109_convertV4",
+         "e110_runTranslator"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/dsc_lowering.rs": {
+       "_comment": "12 unit(s) from dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp (levels [0, 1]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e022_retrieveGetUnitOpInSameCore",
+         "e023_createGetUnitOpInDifferentCore",
+         "e024_getMLIRTypeFromDSCDataFormat",
+         "e025_getAddressGranularityMultiplyFactor",
+         "e026_emitError",
+         "e027_setBuilderForDataTransfer",
+         "e028_getMLIRLoopFromLoopNode",
+         "e029_constructUniformizedAddress",
+         "e030_constructUniformizedFoldedAddress",
+         "e031_constructUniformizedFoldedDoubleBufferToggling",
+         "e032_constructUniformizedFoldedConstantBitStream",
+         "e059_constructUniformizedFoldedDestinationCore"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/shape_constraints.rs": {
+       "_comment": "4 unit(s) from ddc/ddcv1.cpp, dsc/dsc2.cpp (levels [0, 1]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "ddc/ddcv1.cpp",
+        "dsc/dsc2.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e001_checkConstraints",
+         "e002_createDataConnectMetadata",
+         "e041_getStickSizes",
+         "e071_getCumulativeStickSizes"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/stick_mask.rs": {
+       "_comment": "1 unit(s) from dsc-based-utils/DSC2ToDataflowIR/V3/SNStickMaskLowering.cpp (levels [1]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/V3/SNStickMaskLowering.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e060_constructStickMaskOperation"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/sync.rs": {
+       "_comment": "4 unit(s) from dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp (levels [0, 1, 2]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e033_constructUnitsForUniformization",
+         "e061_constructUnits",
+         "e062_constructImplicitSyncOperation",
+         "e076_constructSyncOperation"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/transfer.rs": {
+       "_comment": "29 unit(s) from dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp (levels [0, 1, 2, 3, 4, 5, 6]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e034_constructLogicalMemoryViewOp",
+         "e035_constructTimeOrder",
+         "e036_constructTimeAddressMap",
+         "e037_getImmediateParentWithMatchingDim",
+         "e038_areEpiloguesInTransferSizes",
+         "e039_construct2B16BLoadShuffle",
+         "e040_construct2B16BStoreShuffle",
+         "e063_getLabeledDsType",
+         "e064_getBufferingOrStreamingMode",
+         "e065_constructBaseAddress",
+         "e066_constructTimeSet",
+         "e067_constructLoadOrStoreSet",
+         "e068_constructImplicitLoopsForContiguousTransfer",
+         "e069_areEpiloguesInLoops",
+         "e070_GenerateConstantBitStreamAndShuffle",
+         "e077_constructElementsOfAgenDataTransfer",
+         "e078_constructElementsOfAgenCompositeDataTransfer",
+         "e079_constructElementsOfAffineDataTransferViaAgenTransfer",
+         "e080_constructStreamingOrDoubleBufferingLoad",
+         "e081_GenerateReceiveAndSendFromDataTransferNode",
+         "e082_ConstructSAMVOperation",
+         "e089_constructStreamingOrDoubleBufferingStore",
+         "e090_GenerateLoadAndSendFromDataTransferNode",
+         "e091_GenerateLoadAndStoreFromDataTransferNode",
+         "e092_GenerateDataTransfersForViaIfSo",
+         "e097_GenerateReceiveAndStoreFromDataTransferNode",
+         "e098_GenerateDataTranferForSrc",
+         "e102_GenerateDataTranferForDst",
+         "e104_constructDataTransfer"
+        ]
+       }
+      },
+      "src/bridges/superdsc_to_dataflow_ir/utils.rs": {
+       "_comment": "11 unit(s) from dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp (levels [0, 1, 2, 3, 4]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge1/cpp/bridge1.cpp",
+       "headers": [
+        "dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp"
+       ],
+       "members": {
+        "functions": [
+         "e006_getTranslatorVersion",
+         "e007_createGetLocalUnitOp",
+         "e008_setPrecisionInUnitOp",
+         "e009_constructAVectorOfIndexType",
+         "e010_emitError",
+         "e044_createGetUnitOp",
+         "e072_createUniformizedGetUnitOp",
+         "e073_buildNeighborUnits",
+         "e083_buildUniformizedNeighborUnits",
+         "e084_initializeUnit",
+         "e093_initializeUniformizedUnit"
+        ]
+       }
+      }
+     }
+    }
+   }
+  }
+ }
+}
