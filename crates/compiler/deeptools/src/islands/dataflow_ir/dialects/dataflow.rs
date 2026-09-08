@@ -428,7 +428,7 @@ pub enum Op {
     /// `CreateGroupOp` (`DataflowToSentient.cpp:768-783`). With no variant for the second the group
     /// list could never be non-empty, so the port would have been the same function with one arm
     /// deleted — and `lowerSyncLXL3ToLXL3`, its only caller, branches on exactly that list being
-    /// non-empty (`:796-800`).
+    /// the non-empty one (`:825-826`).
     ///
     /// ⭐ THE VENDOR WRITES IT SIX UNITS WIDE: `%group0 = dataflow.create_group (%lx_lu_unit0,
     /// %lx_lu_unit1, %lx_su_unit0, %lx_su_unit1, %l3_lu_unit, %l3_su_unit : index, index, index,

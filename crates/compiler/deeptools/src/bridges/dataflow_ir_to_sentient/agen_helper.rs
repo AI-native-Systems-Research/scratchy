@@ -1350,7 +1350,7 @@ pub fn store_op_from_load_store_pattern<'a>(
 /// ⛔⛔ THE MARK IS A REAL PART OF THE ALGORITHM, NOT BOOKKEEPING. `gatherAffineLoadStoreDetails`
 /// sets it on the transfer it processed (`Helper.cpp:546`, and `:848` on the outermost loop), and
 /// `lowerAffineCompositeHelper` re-finds the marked op after building the loops *because* "The op
-/// may have changed due to loop cloning" (`Helper.cpp:2963`) — the mark is how an op survives its
+/// may have changed due to loop cloning" (`Helper.cpp:2962-2963`) — the mark is how an op survives its
 /// own pointer being invalidated.
 ///
 /// ⭐ SO THE IDENTITY IS THE PRE-ORDER POSITION, which is the identity the walk itself uses: the

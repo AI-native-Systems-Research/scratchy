@@ -300,8 +300,8 @@ pub fn create_inequality_condition(
 /// kind of thing.
 ///
 /// ⭐ `createConditionsFor*Subscripts` starts from `insert_refs = mem_ops_` and overwrites an entry
-/// with the conditional it created for that access (`TransformPagedMemViewImpl.cpp:190-196` and
-/// `:289-341`). So an entry is a conditional exactly when a condition was created for it, and the
+/// with the conditional it created for that access (`TransformPagedMemViewImpl.cpp:201` and
+/// `:329-333`). So an entry is a conditional exactly when a condition was created for it, and the
 /// `dyn_cast<scf::IfOp>` that [`set_builder_to_insert_ref`] does is asking which of those two
 /// happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

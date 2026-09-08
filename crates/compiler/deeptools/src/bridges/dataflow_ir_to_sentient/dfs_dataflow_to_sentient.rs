@@ -1294,8 +1294,9 @@ pub fn are_corelets_different(unit: Residency, occupied: OccupiedCorelets) -> bo
 /// of `separateBasedOnDestinationUnits`.
 ///
 /// ⛔ FOUR LISTS AND NOT A MAP, BECAUSE THE CALLER TESTS THEM AGAINST EACH OTHER. `lowerSyncLXL3ToLXL3`
-/// asks whether three of the four are empty while the fourth is not, three times over
-/// (`DataflowToSentient.cpp:798-803`), so each list is a named field rather than a bucket to look up.
+/// asks three times over whether a named three of the four are empty (`DataflowToSentient.cpp:798-803`,
+/// and `:825-826` for the fourth); that the remaining one is non-empty is not tested there but comes
+/// from the `DT_CHECK` that at least one of the four is (`:796-797`). So each list is a named field.
 ///
 /// ⭐ THE ORDER WITHIN EACH LIST IS THE DESTINATION ORDER, which is what makes `src_dst_l3[0]` mean
 /// anything: the reference walks `dst_vs` by index and pushes as it goes.

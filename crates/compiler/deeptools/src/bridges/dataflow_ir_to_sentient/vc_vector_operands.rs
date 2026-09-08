@@ -187,10 +187,13 @@ pub enum VectorOperandType {
 ///
 /// # ⚠️ PARTIAL BY DESIGN — `splat_` IS NOT HERE YET
 ///
-/// ⭐ THE MEMBER ARRIVES WITH THE UNIT THAT READS IT. `splat_` is *"to capture the select
-/// semantics"* (`VectorOperands.hpp:112`) and only `e304_getOperandWithPrecision` ever touches it;
-/// that entry is not this wave's, and what shape the field wants is a decision for its porter against
-/// its own callers rather than a guess made here.
+/// ⭐ THE MEMBER ARRIVES WITH THE UNIT THAT READS IT, AND THAT IS NOT THE UNIT THAT WRITES IT.
+/// `splat_` is *"to capture the select semantics"* (`VectorOperands.hpp:70`).
+/// `e304_getOperandWithPrecision` is its only writer and writes exactly one value — `"east"`, in its
+/// `SelectOp` arm (`VectorOperands.cpp:582`); its only reader is
+/// `e340_analyzeAndFillOperandForwarding`, which hands it to `symbolizeSentientComputePort` and keeps
+/// the result as a `SentientComputePortAttr` (`VectorChainHelper.cpp:544-547`). So the field is an
+/// `Option<`[`sen::Port`]`>` rather than a string, and neither of those entries is this wave's.
 ///
 /// ⭐ `values_` IS HERE NOW, because `e071_getOperandFromReceiveOp` and `e072_getOperandFromSendOp`
 /// exist to WRITE it — the link a compute reads over is the operand's value and nothing else. See

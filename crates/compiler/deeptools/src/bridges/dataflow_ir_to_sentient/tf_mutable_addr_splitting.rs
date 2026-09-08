@@ -6053,8 +6053,9 @@ pub enum ExplicitTimeLoops {
     /// (`Agen/Utils.cpp:497`).
     ///
     /// ⛔ `cast<AffineDimExpr>` — not `dyn_cast`, so this is an abort and not a `nullptr`. A
-    /// `time_order` is a permutation of the transfer's time dimensions by construction
-    /// (`constructTimeStepsInfo`); anything else has no dimension position to report.
+    /// `time_order` is the composite op's own attribute (`op.getTimeOrder()`), and it is a permutation
+    /// only because `checkBasicConditions` gates on `inversePermutation` succeeding, for four of the
+    /// six composite kinds (`AgenToSentient/Helper.cpp:166-175`); nothing constructs it.
     TimeOrderIsNotAPermutation {
         /// The `dim` whose result is not a dimension.
         time_dim: usize,

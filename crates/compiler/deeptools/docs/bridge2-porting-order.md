@@ -90,6 +90,94 @@ take: 290 omits `e187_constructConditionals` (`:990`, present in the extract) as
 level 2), which the recorded `calls` column could not have produced: from it, 289 would be level 1 and
 290/293 level 0. Order the work by `level`; take the callees from the authority.
 
+## ⛔ MEASURED FOR ENTRIES 297-310: THE EXTRACT DROPS BOTH DISPATCH ARMS OF TWO FUNCTIONS
+
+Brace-matched from the authority at each unit's cited line (a0d29abbed) and diffed against
+`source/bridge2.cpp`'s body. All 14 `UNITS.tsv` citations land exactly on the named definition, and the
+recorded `loc` is 1-6 lines short of the real body in all 14. **10 of the 14 extract bodies lose a real
+statement, and in five of them it is the statement that gives the function its effect:**
+
+| unit | dropped from the extract's body |
+|---|---|
+| **300 `lowerSyncForAUnit`** (`:733-745`) | **BOTH dispatch arms** — `if (src_unit_name.substr(0, 2) != "l3") return lowerL0LXSyncOperationForAUnit(..)` (`:740-742`) and `return lowerL3SyncOperationForAUnit(..)` (`:744`). The extract constructs an `OpBuilder` and ends |
+| **301 `lowerSyncForAGroup`** (`:746-759`) | the same two arms, group-flavoured (`:753-758`) — same defect, and this function IS the L3-vs-LX decision |
+| **298 `constructAffineDetailsAndAddrs`** (`:2787-2807`) | `return gatherAffineLoadStoreDetails<AccessDetailsAffine>(src_op, unit, comp, access_details, mutable_addrs, immutable_addrs);` (`:2805-2806`) — the tail call that gathers what the name promises |
+| **308 `calculateShifts`** (`:396-460`) | `offsetShifts(shifts, ad, -num_elems_in_stick);` (`:457`) — the odd-immutable-address correction. Its `DT_CHECK_MSG` guard survives, so the extract checks the precondition and then does not shift |
+| **299 `lowerAffineCompositeHelper`** (`:2953-2973`) | `to_be_deleted.push_back(candidate_op);` (`:2970`) and `return success();` (`:2972`) — the lowered op is never queued for deletion. It also loses the `"vector operations");` continuation, leaving the extract with an unterminated string literal |
+| 302 `lowerSyncLXL3ToLXL3` (`:787-1718`) | `return LogicalResult::success();` (`:1715`) AND the fallthrough `return LogicalResult::failure();` (`:1717`) |
+| 304 `getOperandWithPrecision` (`:389-646`) | both `return std::nullopt;` (`:643`, `:645`) — the balancer's `}}` leaves the `Multiply`/`MAC`/`Binary` arm an EMPTY block, so a case the reference explicitly refuses reads as a case it accepts |
+| 297 · 309 · 310 | `return LogicalResult::success();` (`:669` · `:250` · `:921`) |
+| 303, 305, 306, 307 | nothing: identical to the authority |
+
+## ⛔ ENTRIES 304 AND 320 ARE A CYCLE, AND THE `level` COLUMN PUTS THEM ON DIFFERENT LEVELS
+
+`e304_getOperandWithPrecision` (level 4, `VectorOperands.cpp:389`) and `e320_getOperand` (level **5**,
+`:378`) call each other. e320 is a forwarder whose whole body is
+`return getOperandWithPrecision(dcc_ext_ctx, op, comp, is_precision_converted, traverse_upwards);`
+(`:382-383`), and e304 calls e320 back **nine times** (`:468`, `:478`, `:494`, `:504`, `:547`, `:557`,
+`:575`, `:586`, `:630` — the recursion that walks a cast, a user or a select's operand). Both `calls`
+columns read `-`, which is why no level computation saw the edge. A strict level ordering cannot hold
+across a cycle: schedule the pair as one item, or cut the edge deliberately and say which way.
+
+## ⛔ AND THE `calls` COLUMN FOR 297-310: SHORT FOR ALL 14, PLUS SIX EDGES THAT ARE NOT CALLS
+
+Recomputed from the authority body with comments and string literals stripped and the signature skipped.
+**All 14 omit at least one true callee**, and only entry 302's declared list happens to imply its
+recorded level — for the other 13 the column implies level 0, 1 or 3 against a recorded 4. The level
+column is right and was not computed from this column; take callees from the authority.
+
+Omitted, by unit: 297 `e266_coalesceTimeDimensions`/`e148_computeBurstAndGroup`; 298
+`e265_constructDetails`/`e212_gatherAffineLoadStoreDetails`; 299 (declares nothing)
+`e267_constructTimeLoopsAndVectorOperations`/`e037_findCandidateForLowering`; 300 (nothing)
+`e273`/`e223`; 301 (nothing) `e274`/`e224`; 302 `e273_lowerL0LXSyncOperationForAUnit`/`e223`; 303
+(nothing) `e275_LowerSymbolQueryMap`/`e077_walk`; 304 (nothing) all eight of `e071`, `e072`, `e166`,
+`e167`, `e168`, `e232`, `e278` and `e320`; 305 `e287_flatten`/`e077_walk`; 306 and 307 `e290_createPartitions`,
+`e265_constructDetails`, `e251_setupForPartitioning`, `e253_adjustForEvenImmutableAddr`,
+`e185_hasMutableAddrOverflow`; 308 `e291_calculatePartialShift`, `e254_offsetShifts`,
+`e191_calculateFullShift`; 309 seven, including `e295_createIterArgsForConditionals`,
+`e198_createConditionsForHyperRectSubscripts` and `e199_createConditionsForNonHyperRectSubscripts`; 310
+`e294_getPageValidity`/`e260_gatherPageDependentDimsForPage`.
+
+⛔ **AND SIX DECLARED EDGES ARE NOT CALLS AT ALL**, three of them because the "callee" is not a function:
+
+- **`e052_If`** (declared by 308 and 309) — `StandardToSentient.cpp:159` is a COMMENT,
+  `// return If(lhs) {If(rhs) true_val; else false_val} else false_val;`. There is no function `If`, and
+  both citing bodies match only on `If` as the first word of an English comment sentence.
+- **`e064_size`** (297, 302, 310) — `VectorChainHelper.cpp:319` is `size(vec.size())`, a MEMBER
+  INITIALISER in a local struct's constructor. Every `.size()` in those bodies is a container's own.
+- **`e019_AccessDetailsAffine`** (298, 306, 307, 308) — `AccessDetails.hpp:259` is
+  `AccessDetailsAffineComposite`'s base-class mem-initialiser. Every match in those bodies is the TYPE
+  NAME in a declaration or a template argument (`AccessContainer<AccessDetailsAffine>`).
+- **`e133_getUseChain`** (306, 307) — `TransformPagedMemViewImpl.hpp:328` is
+  `virtual SmallVector<Operation *> getUseChain(Operation *mem_op) { return {}; }`, a `TPMVBase` virtual
+  taking ONE argument. 306/307 call `op.getUseChain()` with NO argument on an agen load/store op,
+  generated from `Agen.td:172`/`:265`. Different function, same name.
+- **`e150_get`** (297) — a real function (`AccessDetails.hpp:401`, `AccessContainer<T>::get`), but 297
+  never calls it; its only member call is `access_details.size()`.
+
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT THESE 14 — 7 FIXED IN THIS COMMIT
+
+35 in-span `.cpp` citations were re-measured against a0d29abbed (14 module-doc banner rows, all exact;
+21 in prose). Three claims were wrong about behaviour, not just about a line:
+
+- `vc_vector_operands.rs` said `splat_` is touched only by e304 and left its shape open. e304 is its
+  only WRITER and writes exactly one value, `"east"` (`VectorOperands.cpp:582`); the only READER is
+  `e340_analyzeAndFillOperandForwarding`, which feeds it to `symbolizeSentientComputePort` and keeps a
+  `SentientComputePortAttr` (`VectorChainHelper.cpp:544-547`). The field is a `sen::Port`, not a string.
+- `tf_mutable_addr_splitting.rs` justified `TimeOrderIsNotAPermutation` with "a permutation by
+  construction (`constructTimeStepsInfo`)". Nothing constructs it: `time_order` is the composite op's
+  own attribute (`op.getTimeOrder()`) and e297 only reads it (`AccessDetails.cpp:642`). The permutation
+  property is a GATE — `checkBasicConditions` requires `inversePermutation` to succeed, and only for
+  four of the six composite kinds (`AgenToSentient/Helper.cpp:166-175`).
+- `dfs_dataflow_to_sentient.rs` said the caller "asks whether three of the four are empty while the
+  fourth is not". `:798-803` tests only the three empties; that the remaining list is non-empty comes
+  from the `DT_CHECK` at `:796-797`, and the group case is a separate arm at `:825-826`.
+
+Four citations drifted: `VectorOperands.hpp:112` (a blank line) for `splat_`'s declaration at `:70`;
+`TransformPagedMemViewImpl.cpp:190-196` (the signature) for `insert_refs = mem_ops_` at `:201`;
+`DataflowToSentient.cpp:796-800` in `islands/dataflow_ir/dialects/dataflow.rs` for the group arm at
+`:825-826`; and `Helper.cpp:2963` for a quote that is the comment on `:2962`.
+
 ## Progress
 
 `200/384 ported; 200/384 audited`
