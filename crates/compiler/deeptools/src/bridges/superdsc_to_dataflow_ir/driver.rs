@@ -17,10 +17,21 @@
 //! | `e109_convertV4` | 9 | 33 | `dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:499` |
 //! | `e110_runTranslator` | 10 | 32 | `dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:534` |
 
-use super::dsc_lowering::Component;
+use super::compute::{ComputeFamily, ComputeOperation, OperandContext, compute_operation};
+use super::control_flow::PrimaryDim;
+use super::dsc_lowering::{Component, Handlers};
+use super::stick_mask::{StickMaskView, construct_stick_mask_operation};
+use super::sync::{SyncKind, construct_sync_operation};
+use super::transfer::{
+    ConstructedTransfer, ContiguousSticks, DataTransfer, LoadAndSend, LoadAndStore,
+    ReceiveAndStore, StickCounts, construct_data_transfer,
+};
+use super::utils::error_diagnostic;
 use crate::arch::Arch;
-use crate::islands::dataflow_ir::dialects::Op;
-use crate::islands::dataflow_ir::{Grid, Program, ProgramName, ProgramUnits};
+use crate::generated::{DataType, SyncSignal};
+use crate::islands::dataflow_ir::dialects::{Op, Val, dataflow};
+use crate::islands::dataflow_ir::link::RecvEnd;
+use crate::islands::dataflow_ir::{Grid, Program, ProgramName, ProgramUnits, Values};
 use crate::units::{Core, Corelet, NumFolds};
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
@@ -340,7 +351,405 @@ pub fn folds_are_needed(
     false
 }
 
-// crustify:todo: e105_constructOperationsRecursively
+/// THE `emitError` SENTENCES THIS WALK RAISES — a closed set, because a diagnostic here is a REPORT:
+/// entry 010 hands the text back and nothing is unwound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raised {
+    /// `:126` and `:159` — the SAME sentence from both coreCl arms.
+    ConditionalsOnConditionals,
+    /// `:173`. ⚠️ UNREACHABLE THROUGH ENTRY 103, whose [`None`] is a bystander unit, not a refusal.
+    Compute,
+    /// `:183` — entry 104's [`None`], a `BOOL`-formatted end.
+    Transfer,
+    /// `:190` — entry 076 signalling no one, which is its empty unit set.
+    Sync,
+    /// `:197` — entry 060's [`None`], a `BOOL` mask element.
+    StickMask,
+    /// `:208` — a child frame of a `BLOCK` that stopped.
+    Block,
+}
+
+impl Raised {
+    /// THE TEXT, PREFIXED AS ENTRY 010 PREFIXES IT.
+    #[must_use]
+    pub fn diagnostic(self) -> String {
+        error_diagnostic(match self {
+            Self::ConditionalsOnConditionals => "Unable to construct conditionals on conditionals.",
+            Self::Compute => "Unable to construct a compute operation.",
+            Self::Transfer => "Unable to construct a data transfer operation.",
+            Self::Sync => "Unable to construct a sync operation.",
+            Self::StickMask => "Unable to construct a stick mask operation.",
+            Self::Block => "Unable to construct a block of operations.",
+        })
+    }
+}
+
+/// ENTRY 104'S ARGUMENTS, WHICH ARE TOO MANY TO INLINE INTO A STATEMENT — the transfer, the handles
+/// it is lowered against, and the four seams it calls back into.
+pub struct TransferStatement<'s> {
+    /// `component_to_handler_`.
+    pub handlers: &'s Handlers,
+    /// The transfer as entry 104 reads it.
+    pub transfer: DataTransfer<'s>,
+    /// `getLocalUnitOp(comp_)`.
+    pub own: Val,
+    /// `getContiguousStickCounts(..)` per corelet.
+    pub blocks: &'s dyn Fn(Option<Corelet>) -> Vec<(PrimaryDim, StickCounts)>,
+    /// The source end, from entry 098.
+    pub send:
+        &'s dyn Fn(&mut Values, &mut Vec<Op>, &mut ContiguousSticks, Val) -> Option<LoadAndSend>,
+    /// The destination store, from entry 091.
+    pub store: &'s dyn Fn(&mut Values, &mut Vec<Op>, Component) -> LoadAndStore,
+    /// One receiving end, from entry 102.
+    pub receive: &'s dyn Fn(
+        &mut Values,
+        &mut Vec<Op>,
+        &mut ContiguousSticks,
+        usize,
+        RecvEnd,
+    ) -> Option<ReceiveAndStore>,
+}
+
+/// WHICH OF THE THREE CONDITION ARMS A `CONDITION` NODE TAKES — `hasCoreClCond()` and
+/// `uniformization_` read as one answer (`:91`, `:114`).
+///
+/// ⛔ THE THREE `DT_CHECK`s ON THE CHILD COUNT ARE THIS SHAPE: `!children.empty()` (`:90`),
+/// `children.size() == 1` (`:116`) and `1 <= num_regions <= 2` (`:134`) are a `then` that is always
+/// there and an `else` only where a second child can exist at all.
+pub enum CondStatement<'s> {
+    /// `!hasCoreClCond()` — the `scf.if` entry 054 built for this node.
+    Loops {
+        /// `children[0]`, into `getThenRegion()`.
+        then_: Box<Statement<'s>>,
+        /// `children[1]`, into `getElseRegion()`, and [`None`] for `children.size() != 2`.
+        otherwise: Option<Box<Statement<'s>>>,
+    },
+    /// `hasCoreClCond() && !uniformization_` — the one child, built where a dummy `arith.constant`
+    /// stood and left in its place when it is erased (`:120-131`).
+    CoreCl(Box<Statement<'s>>),
+    /// `hasCoreClCond() && uniformization_` — the `uniform.uniformize_regions` entry 054 built.
+    Uniform {
+        /// `getRegionArg(i)` per region, so its LENGTH is `getNumRegions()` and its order is the
+        /// region order.
+        ///
+        /// ⛔ `setUniformRegionArg(..)` (`:154`) REACHES THE LEAVES THROUGH THE STATEMENT, NOT
+        /// THROUGH THIS WALK: entries 059 and 076 take that argument as an operand, so a leaf built
+        /// for a region already holds it.
+        args: &'s [Val],
+        /// `getThenCoreCl(comp_)`, read for emptiness alone.
+        then_units: &'s [Val],
+        /// `getElseCoreCl(comp_)`, likewise.
+        else_units: &'s [Val],
+        /// `children[0]`.
+        then_: Box<Statement<'s>>,
+        /// `children[1]`, and [`None`] where the node has one branch.
+        otherwise: Option<Box<Statement<'s>>>,
+    },
+}
+
+/// ONE SCHEDULE NODE AS THE OPERATION WALK SEES IT — the seven `nodeType_` arms of `:63-214` and
+/// nothing else, because that chain has no `else`: a node of any other kind contributes no statement.
+///
+/// ⛔⛔ THE FOUR LEAVES CARRY THEIR OWN OPERANDS, WHICH IS WHERE THIS PORT DIVERGES. The reference
+/// hands each leaf `dsc_lowering` and the leaf reads its node back out of it; entries 060, 076, 103
+/// and 104 take arguments, so whoever builds a statement has already resolved them.
+pub enum Statement<'s> {
+    /// `LOOP` — the children go INSIDE the loops entry 088 already built for this node.
+    Loop(Vec<Statement<'s>>),
+    /// `CONDITION`.
+    Condition(CondStatement<'s>),
+    /// `BLOCK` — the children of a node whose dummy loop is erased once they are placed.
+    ///
+    /// ⚠️ AND IS NOT ERASED ON A STOP, because `:212-214` sits after the `return` — a fact this walk
+    /// cannot state, since the loop itself belongs to entry 088's tree.
+    Block(Vec<Statement<'s>>),
+    /// `COMPUTE` — entry 103's arguments.
+    Compute {
+        /// `SNComputeLowering(dsc_lowering, node, precision)`'s operand context.
+        ctx: &'s OperandContext<'s>,
+        /// Which of the five families `type_` routes to.
+        family: ComputeFamily<'s>,
+    },
+    /// `TRANSFER`.
+    Transfer(&'s TransferStatement<'s>),
+    /// `SYNC` — entry 076's arguments.
+    Sync {
+        /// `sync->signal_`.
+        signal: SyncSignal,
+        /// Which of the three sync statements this is.
+        kind: SyncKind<'s>,
+    },
+    /// `STICKMASK` — entry 060's arguments.
+    StickMask {
+        /// `stick_mask_->getView()`.
+        view: StickMaskView,
+        /// `dsc_->name_`.
+        name: &'s str,
+        /// `cst_info.dataFormat_`.
+        format: DataType,
+        /// `all_data.front()[0]`.
+        mask_value: i64,
+    },
+}
+
+/// WHAT ONE LEAF HANDED BACK, kept beside the ops it emitted because the ends of a transfer travel
+/// inside it.
+#[derive(Debug)]
+pub enum Made<'s> {
+    /// Entry 103's answer, and [`None`] for a unit that is not the execution unit.
+    Compute(Option<ComputeOperation>),
+    /// Entry 104's answer, and [`None`] for its one refusal.
+    Transfer(Option<ConstructedTransfer<'s>>),
+    /// Entry 076 hands nothing back.
+    Sync,
+    /// Entry 060's `agen.set_transfer_mask_state`, and [`None`] for its refusal.
+    StickMask(Option<Val>),
+}
+
+/// WHERE ONE STATEMENT'S OPS WENT — the insertion point each arm moves the builder to, as a position
+/// rather than as a mutation of one shared builder.
+///
+/// ⚠️ A POSITION IS NOT THE LOOP ITSELF: splicing these ops into the tree entry 088 built is entry
+/// 106's join, and it is still open — that walk mints its own region argument and keeps the `BLOCK`
+/// node this one erases.
+#[derive(Debug)]
+pub enum Placed<'s> {
+    /// A leaf, at the insertion point it was reached at.
+    Leaf {
+        /// What it emitted, which stays placed even where it refused.
+        ops: Vec<Op>,
+        /// What it handed back.
+        made: Made<'s>,
+    },
+    /// `tmp_builder.setInsertionPointToStart(<back()>.getBody())` — inside the INNERMOST loop entry
+    /// 088 built for the node, while the next sibling resumes after the OUTERMOST (`:73-83`).
+    InLoop(Vec<Placed<'s>>),
+    /// The `scf.if`'s two regions; the next sibling resumes at `endif_builder`, which is the node
+    /// AFTER the if (`:94`, `:111`).
+    InIf {
+        /// `getThenRegion().front()`.
+        then_: Vec<Placed<'s>>,
+        /// `getElseRegion().front()`, empty where there is no else branch.
+        otherwise: Vec<Placed<'s>>,
+    },
+    /// One `uniform.uniformize_regions` region each, paired with the `getRegionArg(i)` it was built
+    /// under and in region order.
+    InRegions(Vec<(Val, Vec<Placed<'s>>)>),
+}
+
+/// WHAT ONE FRAME OF THE WALK LEFT BEHIND.
+#[derive(Debug)]
+pub struct Constructed<'s> {
+    /// Every statement of this level, in order.
+    pub placed: Vec<Placed<'s>>,
+    /// `precision`, as the frame hands it back out through the reference's `std::string &`.
+    pub precision: Option<dataflow::Precision>,
+    /// Every sentence raised anywhere below, INCLUDING inside a frame whose answer was discarded.
+    pub raised: Vec<Raised>,
+    /// `return LogicalResult::failure()` — this frame ended early, so the siblings after the arm
+    /// that stopped it were never built.
+    pub stopped: bool,
+}
+
+/// A CHILD FRAME'S `precision` AND DIAGNOSTICS REACH THIS ONE WHETHER OR NOT ITS ANSWER IS READ —
+/// the parameter is a `std::string &` and the diagnostics went to the module.
+fn absorb<'s>(built: &mut Constructed<'s>, inner: Constructed<'s>) -> (Vec<Placed<'s>>, bool) {
+    built.precision = inner.precision;
+    built.raised.extend(inner.raised);
+    (inner.placed, inner.stopped)
+}
+
+/// Replaces: e105_constructOperationsRecursively
+///
+/// EVERY STATEMENT OF ONE SCHEDULE LEVEL, at the insertion point its node kind owns, plus the
+/// `precision` a MAC leaves for the caller's unit op (`DSC2ToDataflowIR.cpp:55-217`).
+///
+/// ⛔⛔ `LOOP` AND THE NON-CORECL `CONDITION` DISCARD THE ANSWER (`:80-81`, `:101-108`) — a refusal
+/// under either does not end this frame, while the two coreCl arms and `BLOCK` test it and stop with
+/// their own sentence (`:126`, `:159`, `:208`); and a stop is no rollback, because `emitError` RETURNS.
+/// ⛔ `precision = getPrecision()` (`:177`) KEEPS, IT DOES NOT CLEAR: the member is a by-value copy
+/// of this argument (`SNComputeLowering.hpp:59`) and only the MAC chain writes it.
+#[must_use]
+pub fn construct_operations_recursively<'s, A: Arch>(
+    vals: &mut Values,
+    statements: Vec<Statement<'s>>,
+    precision: Option<dataflow::Precision>,
+) -> Constructed<'s> {
+    let mut built = Constructed {
+        placed: Vec::new(),
+        precision,
+        raised: Vec::new(),
+        stopped: false,
+    };
+
+    for statement in statements {
+        match statement {
+            Statement::Loop(children) => {
+                let inner = construct_operations_recursively::<A>(vals, children, built.precision);
+                // ⛔ `auto result = ..` (`:80-81`) IS NEVER READ.
+                let (placed, _swallowed) = absorb(&mut built, inner);
+                built.placed.push(Placed::InLoop(placed));
+            }
+            Statement::Condition(CondStatement::Loops { then_, otherwise }) => {
+                // ⚠️ `LoopCondComposite condition = node->loopCond_` (`:98`) IS DEAD ON THE NEXT LINE.
+                let inner =
+                    construct_operations_recursively::<A>(vals, vec![*then_], built.precision);
+                let (then_placed, _swallowed) = absorb(&mut built, inner);
+                let mut else_placed = Vec::new();
+                if let Some(other) = otherwise {
+                    let inner =
+                        construct_operations_recursively::<A>(vals, vec![*other], built.precision);
+                    (else_placed, _) = absorb(&mut built, inner);
+                }
+                built.placed.push(Placed::InIf {
+                    then_: then_placed,
+                    otherwise: else_placed,
+                });
+            }
+            Statement::Condition(CondStatement::CoreCl(child)) => {
+                let inner =
+                    construct_operations_recursively::<A>(vals, vec![*child], built.precision);
+                let (placed, stopped) = absorb(&mut built, inner);
+                // The dummy op is erased (`:131`), so the child's ops stand where it stood.
+                built.placed.extend(placed);
+                if stopped {
+                    built.raised.push(Raised::ConditionalsOnConditionals);
+                    built.stopped = true;
+                    return built;
+                }
+            }
+            Statement::Condition(CondStatement::Uniform {
+                args,
+                then_units,
+                else_units,
+                then_,
+                otherwise,
+            }) => {
+                let mut children = vec![Some(*then_)];
+                if let Some(other) = otherwise {
+                    children.push(Some(*other));
+                }
+                // `if (uniform_region.getNumRegions() < children.size())` — a two-branch node with
+                // ONE region gives that region to the `else` only where the `then` has no unit at
+                // all (`:141-148`).
+                let index_offset = usize::from(
+                    args.len() < children.len() && then_units.is_empty() && !else_units.is_empty(),
+                );
+                let mut regions = Vec::new();
+                let mut stopped = false;
+                for (region, arg) in args.iter().enumerate() {
+                    // ⚠️ `children[i + index_offset]` PAST THE PAIR BUILDS NOTHING, where the
+                    // reference indexes a vector it has not checked.
+                    let Some(child) = children
+                        .get_mut(region + index_offset)
+                        .and_then(Option::take)
+                    else {
+                        continue;
+                    };
+                    let inner =
+                        construct_operations_recursively::<A>(vals, vec![child], built.precision);
+                    let (placed, region_stopped) = absorb(&mut built, inner);
+                    regions.push((*arg, placed));
+                    if region_stopped {
+                        stopped = true;
+                        break;
+                    }
+                }
+                built.placed.push(Placed::InRegions(regions));
+                if stopped {
+                    built.raised.push(Raised::ConditionalsOnConditionals);
+                    built.stopped = true;
+                    return built;
+                }
+            }
+            Statement::Block(children) => {
+                let inner = construct_operations_recursively::<A>(vals, children, built.precision);
+                let (placed, stopped) = absorb(&mut built, inner);
+                // `mlir_dummy_loop.erase()` (`:214`) — nothing wraps the children it held.
+                built.placed.extend(placed);
+                if stopped {
+                    built.raised.push(Raised::Block);
+                    built.stopped = true;
+                    return built;
+                }
+            }
+            Statement::Compute { ctx, family } => {
+                let mut ops = Vec::new();
+                let computed = compute_operation::<A>(vals, &mut ops, ctx, family);
+                if let Some(written) = computed.as_ref().and_then(|made| made.precision) {
+                    built.precision = Some(written);
+                }
+                built.placed.push(Placed::Leaf {
+                    ops,
+                    made: Made::Compute(computed),
+                });
+            }
+            Statement::Transfer(transfer) => {
+                let mut ops = Vec::new();
+                let made = construct_data_transfer(
+                    vals,
+                    &mut ops,
+                    transfer.handlers,
+                    &transfer.transfer,
+                    transfer.own,
+                    |corelet| (transfer.blocks)(corelet),
+                    transfer.send,
+                    transfer.store,
+                    transfer.receive,
+                );
+                let refused = made.is_none();
+                built.placed.push(Placed::Leaf {
+                    ops,
+                    made: Made::Transfer(made),
+                });
+                if refused {
+                    built.raised.push(Raised::Transfer);
+                    built.stopped = true;
+                    return built;
+                }
+            }
+            Statement::Sync { signal, kind } => {
+                let mut ops = Vec::new();
+                construct_sync_operation(vals, &mut ops, signal, kind);
+                // ⛔ ENTRY 076 HANDS BACK NOTHING, AND ITS ONE `failure()` IS AN EMPTY UNIT SET —
+                // which is exactly the case where it signals no one and emits no op.
+                let refused = ops.is_empty();
+                built.placed.push(Placed::Leaf {
+                    ops,
+                    made: Made::Sync,
+                });
+                if refused {
+                    built.raised.push(Raised::Sync);
+                    built.stopped = true;
+                    return built;
+                }
+            }
+            Statement::StickMask {
+                view,
+                name,
+                format,
+                mask_value,
+            } => {
+                let mut ops = Vec::new();
+                let made =
+                    construct_stick_mask_operation(vals, &mut ops, view, name, format, mask_value);
+                let refused = made.is_none();
+                built.placed.push(Placed::Leaf {
+                    ops,
+                    made: Made::StickMask(made),
+                });
+                if refused {
+                    built.raised.push(Raised::StickMask);
+                    built.stopped = true;
+                    return built;
+                }
+            }
+        }
+    }
+
+    built
+}
+
 // crustify:todo: e106_ConstructAProgramUnit
 // crustify:todo: e107_ConstructAUniformizedProgramUnit
 // crustify:todo: e108_convertV3
@@ -349,16 +758,28 @@ pub fn folds_are_needed(
 
 #[cfg(test)]
 mod unit_tests {
+    use super::super::compute::{
+        ComputeFamily, ComputeInput, ComputeMask, ComputeOutput, MacInputFormat, MacOp,
+        OperandContext, OutputFormat,
+    };
+    use super::super::construction::MaskValue;
+    use super::super::dsc_lowering::{Handlers, Retrieved};
+    use super::super::stick_mask::StickMaskView;
+    use super::super::sync::{SyncKind, SyncUnits};
+    use super::super::transfer::Latch;
     use super::{
-        Component, FoldDimFunc, FoldedAddresses, StartAddrOf, Transfer, Used, corelets_used,
+        Component, CondStatement, FoldDimFunc, FoldedAddresses, Made, Placed, Raised, StartAddrOf,
+        Statement, Transfer, Used, construct_operations_recursively, corelets_used,
         folded_addresses_are_same, folds_are_needed, start_dataflow_ir_generation,
         stop_dataflow_ir_generation, terminate,
     };
-    use crate::arch::Dd2;
-    use crate::generated::OpFunc;
-    use crate::islands::dataflow_ir::dialects::Val;
+    use crate::arch::{Dd2, Elements};
+    use crate::generated::{DataType, OpFunc, OpaqueFunc, SyncSignal};
+    use crate::islands::dataflow_ir::dialects::agen::MaskCounts;
+    use crate::islands::dataflow_ir::dialects::{Val, dataflow};
+    use crate::islands::dataflow_ir::ty::{ElemType, GenericComp, TensorCategory, Vector};
     use crate::islands::dataflow_ir::{
-        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units, Values,
     };
     use crate::units::{Core, Corelet, DfirUnit, NumFolds, Row};
     use std::cell::RefCell;
@@ -601,5 +1022,202 @@ mod unit_tests {
             FoldedAddresses::PerFold(NumFolds(11))
         }));
         assert_eq!(*count.borrow(), 1);
+    }
+
+    /// THE VIEW EVERY STICK MASK STATEMENT BELOW IS BUILT FROM.
+    fn mask_view() -> StickMaskView {
+        StickMaskView {
+            mask_a: MaskCounts {
+                unmasked: 8,
+                masked: 8,
+            },
+            mask_b: MaskCounts {
+                unmasked: 1,
+                masked: 1,
+            },
+            transition_slice: 5,
+        }
+    }
+
+    /// 🎯 105/110 — ⛔ EACH ARM'S OWN INSERTION POINT, and the `mxfp8` a MAC leaves outliving the
+    /// compute that follows it.
+    ///
+    /// A walk that assigned `getPrecision()` unconditionally would clear the unit's precision on the
+    /// next non-MAC compute; one that wrapped a `BLOCK`'s children would place them inside a loop the
+    /// reference erases.
+    #[test]
+    fn each_node_kind_lands_where_its_arm_puts_it_and_a_mac_precision_outlives_it() {
+        let handlers = Handlers {
+            units: Vec::new(),
+            own_lrf: Val(1),
+            pt_xrf: Val(2),
+        };
+        let result_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let ctx = |name| OperandContext {
+            name,
+            comp: GenericComp::Sfp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty,
+        };
+        let mac_ctx = ctx("fma8_0");
+        let opaque_ctx = ctx("recip_0");
+        let format = |elements, lds| MacInputFormat {
+            lds,
+            operand: DataType::Sen169Fp16,
+            elements: Elements(elements),
+        };
+        let inputs = [
+            (
+                ComputeInput::One,
+                format(64, Some((DataType::Sen143Fp8, TensorCategory::Scaled))),
+            ),
+            (ComputeInput::One, format(128, None)),
+            (ComputeInput::Zero, format(32, None)),
+        ];
+        let outputs = [(
+            ComputeOutput::Latch(Latch::new(3).expect("latch 3")),
+            OutputFormat {
+                lds: None,
+                operand: DataType::Sen169Fp16,
+            },
+        )];
+
+        let mut vals = Values::default();
+        let built = construct_operations_recursively::<Dd2>(
+            &mut vals,
+            vec![
+                Statement::Loop(vec![Statement::Compute {
+                    ctx: &mac_ctx,
+                    family: ComputeFamily::Mac {
+                        mac: MacOp::Fma8,
+                        inputs: &inputs,
+                        mask: ComputeMask::Static(MaskValue::Live8),
+                        outputs: &outputs,
+                    },
+                }]),
+                Statement::Compute {
+                    ctx: &opaque_ctx,
+                    family: ComputeFamily::Opaque {
+                        func: OpaqueFunc::Reciprocal,
+                        read_write: &[],
+                        read_only: &[],
+                        params: &[],
+                    },
+                },
+                Statement::Block(vec![Statement::StickMask {
+                    view: mask_view(),
+                    name: "samv_0",
+                    format: DataType::Senint8,
+                    mask_value: 3,
+                }]),
+                Statement::Condition(CondStatement::Loops {
+                    then_: Box::new(Statement::Sync {
+                        signal: SyncSignal::InputToLxsuToLxluToSync,
+                        kind: SyncKind::Receive {
+                            units: SyncUnits::Plain(vec![Retrieved::Reused(Val(9))]),
+                        },
+                    }),
+                    otherwise: None,
+                }),
+            ],
+            None,
+        );
+
+        assert!(!built.stopped);
+        assert!(built.raised.is_empty());
+        // ⛔ THE MAC'S PRECISION SURVIVES THE OPAQUE COMPUTE AFTER IT.
+        assert_eq!(built.precision, Some(dataflow::Precision::Mxfp8));
+
+        // The `BLOCK`'s child is spliced where its erased dummy loop stood; the loop and the `scf.if`
+        // hold theirs.
+        assert!(matches!(
+            built.placed.as_slice(),
+            [
+                Placed::InLoop(inner),
+                Placed::Leaf {
+                    made: Made::Compute(Some(_)),
+                    ..
+                },
+                Placed::Leaf {
+                    made: Made::StickMask(Some(_)),
+                    ..
+                },
+                Placed::InIf { then_, otherwise },
+            ] if inner.len() == 1 && then_.len() == 1 && otherwise.is_empty()
+        ));
+    }
+
+    /// 🎯 105/110 — ⛔⛔ A REFUSAL UNDER A LOOP IS SWALLOWED AND THE SAME ONE UNDER A `BLOCK` IS NOT,
+    /// which is the whole propagation rule of this walk.
+    ///
+    /// Stopping on the loop's child would drop every sibling after it; not stopping on the block's
+    /// would carry on emitting into a region whose contents are already wrong.
+    #[test]
+    fn a_refused_leaf_stops_a_block_frame_and_not_a_loop_frame() {
+        let good = || Statement::StickMask {
+            view: mask_view(),
+            name: "samv_0",
+            format: DataType::Senint8,
+            mask_value: 3,
+        };
+        // ⚠️ `BOOL` IS ENTRY 060'S ONE REFUSAL.
+        let bad = || Statement::StickMask {
+            view: mask_view(),
+            name: "samv_1",
+            format: DataType::Bool,
+            mask_value: 3,
+        };
+
+        let mut vals = Values::default();
+        let swallowed = construct_operations_recursively::<Dd2>(
+            &mut vals,
+            vec![Statement::Loop(vec![bad()]), good()],
+            None,
+        );
+        assert!(!swallowed.stopped);
+        // The child's diagnostic reached the module even though its answer was discarded.
+        assert_eq!(swallowed.raised, vec![Raised::StickMask]);
+        assert_eq!(swallowed.placed.len(), 2);
+
+        let stopped = construct_operations_recursively::<Dd2>(
+            &mut vals,
+            vec![Statement::Block(vec![good(), bad()]), good()],
+            None,
+        );
+        assert!(stopped.stopped);
+        assert_eq!(stopped.raised, vec![Raised::StickMask, Raised::Block]);
+        // ⛔ THE OPS BUILT BEFORE THE REFUSAL STAY PLACED, and the sibling after the block never is.
+        assert!(matches!(
+            stopped.placed.as_slice(),
+            [
+                Placed::Leaf {
+                    ops,
+                    made: Made::StickMask(Some(_)),
+                },
+                Placed::Leaf {
+                    made: Made::StickMask(None),
+                    ..
+                },
+            ] if ops.len() == 2
+        ));
+
+        let conditionals = construct_operations_recursively::<Dd2>(
+            &mut vals,
+            vec![Statement::Condition(CondStatement::CoreCl(Box::new(bad())))],
+            None,
+        );
+        assert!(conditionals.stopped);
+        assert_eq!(
+            conditionals.raised,
+            vec![Raised::StickMask, Raised::ConditionalsOnConditionals]
+        );
+        assert_eq!(
+            Raised::ConditionalsOnConditionals.diagnostic(),
+            "[DSC2.0 to Dataflow IR]: Unable to construct conditionals on conditionals."
+        );
     }
 }
