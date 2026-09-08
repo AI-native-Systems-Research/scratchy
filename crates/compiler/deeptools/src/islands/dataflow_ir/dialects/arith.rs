@@ -413,6 +413,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 | ElemType::Bf16
                 | ElemType::F8E4M3Fn
                 | ElemType::F8E8M0Fnu
+                | ElemType::F8E5M2
                 | ElemType::F4E2M1Fn
                 | ElemType::MxFloat(_) => float_splat(*splat),
             };
