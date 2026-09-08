@@ -351,9 +351,12 @@ impl IndirectMemViewCheck {
 ///
 /// ⭐ WHY A VIRTUAL IBR AT ALL: the index vector of a gather lives in the LX's Index Buffer Region,
 /// and the extract pattern is *load one index, then use it as the address of the real load*. The view
-/// being flat, unpermuted and based at 0 is what makes the extracted scalar usable as an address
-/// directly — `e328_adjustMutableAddrInitForIndirect` adds it to the mutable address with nothing in
-/// between.
+/// being flat, unpermuted and based at 0 is what makes the extracted scalar usable as an address with
+/// no scaling and no offset of its own — `e328_adjustMutableAddrInitForIndirect` adds it straight into
+/// the address chain with one `sentient.scalar_add`. WHERE that add goes is not one place: to the
+/// mutable address itself (`Helper.cpp:1496`), or to a loop's iter_arg INITIALISER when the extract
+/// sits outside that loop (`:1522`, `:1533`), or after whichever of the two ops comes last when the
+/// address is not an iter_arg (`:1569`).
 #[must_use]
 pub fn check_indirect_mem_view_for_extract_op(view: &IndirectMemView<'_>) -> IndirectMemViewCheck {
     // `:392-398` — the from-unit must be a get_unit before its type can be read.
@@ -417,24 +420,88 @@ impl ExtractIndex {
     }
 }
 
+/// WHAT AN EXTRACT STATEMENT BINDS — **the two kinds do not bind the same number of values.**
+///
+/// ⛔⛔ TWO RESULTS ON THE LOAD SIDE, ONE ON THE STORE SIDE. `Sentient_LoadAndExtractScalarOp` is
+/// `let results = (outs Index:$addr, Index:$data);` (`SentientOps.td:622`, with `getAddrResult()` =
+/// result 0 and `getDataResult()` = result 1); `Sentient_ReceiveAndExtractScalarOp` is
+/// `let results = (outs Index:$result);` (`:684`) — one value, and it is the DATUM. A shape with a
+/// mandatory address field makes a receive's result 0 an address, which is exactly the value the
+/// indirect access wants to ADD to an address.
+///
+/// ⭐ AND THE REFERENCE READS THEM BY DIFFERENT INDICES. `e328_adjustMutableAddrInitForIndirect` picks
+/// `load_and_extract_op.getDataResult()` for the load and `extract_op->getResult(0)` for the receive
+/// (`Helper.cpp:1467-1470`) — result 1 in one case, result 0 in the other. [`Self::data`] is that
+/// choice, made once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractScalarResults {
+    /// `sentient.load_and_extract_scalar` — `addr` then `data`
+    /// (`%21, %22 = sentient.load_and_extract_scalar ..`,
+    /// `lx_indirect_loads_stores_composite.mlir:34`).
+    LoadAndExtractScalar {
+        /// Result 0 — the address it advanced (`mutable_addr + increment`).
+        addr: Val,
+        /// Result 1 — the extracted scalar.
+        data: Val,
+    },
+    /// `sentient.receive_and_extract_scalar` — one result, the extracted scalar. There is no address
+    /// result to name.
+    ReceiveAndExtractScalar {
+        /// The sole result.
+        data: Val,
+    },
+}
+
+impl ExtractScalarResults {
+    /// Which of the two statements bound these.
+    #[must_use]
+    pub const fn kind(self) -> ExtractScalarKind {
+        match self {
+            Self::LoadAndExtractScalar { .. } => ExtractScalarKind::LoadAndExtractScalar,
+            Self::ReceiveAndExtractScalar { .. } => ExtractScalarKind::ReceiveAndExtractScalar,
+        }
+    }
+
+    /// THE EXTRACTED SCALAR — result 1 of a load, the sole result of a receive
+    /// (`Helper.cpp:1467-1470`).
+    #[must_use]
+    pub const fn data(self) -> Val {
+        match self {
+            Self::LoadAndExtractScalar { data, .. } | Self::ReceiveAndExtractScalar { data } => {
+                data
+            }
+        }
+    }
+}
+
 /// ONE EXTRACT STATEMENT, AS THE INDIRECT ACCESS THAT USES IT NEEDS TO SEE IT.
 ///
-/// ⭐ IT IS THE OP'S TWO RESULTS THAT MATTER. `sentient.load_and_extract_scalar` binds an ADDRESS and
-/// a DATUM (`%21, %22 = sentient.load_and_extract_scalar ..`,
-/// `lx_indirect_loads_stores_composite.mlir:34`), and what the indirect access does with the op it
-/// finds is take the datum — `e328_adjustMutableAddrInitForIndirect` adds it to the mutable address
-/// (`%34 = sentient.scalar_add %33, %22`, `:43`). Carrying the two results is what makes the found
-/// op usable without a second lookup.
+/// ⭐ IT IS THE OP'S RESULTS THAT MATTER, AND [`ExtractScalarResults`] IS HOW MANY THERE ARE. What the
+/// indirect access does with the op it finds is take the extracted scalar and add it to an address —
+/// `e328_adjustMutableAddrInitForIndirect` at `Helper.cpp:1496`, `:1522`, `:1533` or `:1569`
+/// (`%34 = sentient.scalar_add %33, %22`, `lx_indirect_loads_stores_composite.mlir:43`). Carrying the
+/// results is what makes the found op usable without a second lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractScalarOp {
     /// Its `extract_idx`.
     pub index: ExtractIndex,
+    /// What it bound — and which of the two statements it is, since only one of them has an address
+    /// result.
+    pub results: ExtractScalarResults,
+}
+
+impl ExtractScalarOp {
     /// Which of the two statements it is.
-    pub kind: ExtractScalarKind,
-    /// Its first result — the address it advanced.
-    pub addr: Val,
-    /// Its second result — the extracted scalar, which is the indirect access's own address.
-    pub data: Val,
+    #[must_use]
+    pub const fn kind(self) -> ExtractScalarKind {
+        self.results.kind()
+    }
+
+    /// The extracted scalar — the value the indirect access adds to its address.
+    #[must_use]
+    pub const fn data(self) -> Val {
+        self.results.data()
+    }
 }
 
 /// THE EXTRACT STATEMENTS ONE PROGRAM UNIT HAS BOUND, in mint order.
@@ -459,12 +526,10 @@ impl ExtractScalarOps {
     ///
     /// The op this stamps is built by `e269_constructLoadAndExtractScalarOp` and its store twin,
     /// which are other entries; this is the pairing they record.
-    pub fn mint(&mut self, kind: ExtractScalarKind, addr: Val, data: Val) -> ExtractScalarOp {
+    pub fn mint(&mut self, results: ExtractScalarResults) -> ExtractScalarOp {
         let op = ExtractScalarOp {
             index: ExtractIndex(u8::try_from(self.minted.len()).unwrap_or(u8::MAX)),
-            kind,
-            addr,
-            data,
+            results,
         };
         self.minted.push(op);
         op
@@ -508,7 +573,7 @@ impl ExtractScalarOps {
         self.minted
             .iter()
             .copied()
-            .find(|op| op.kind == of && op.index == index)
+            .find(|op| op.kind() == of && op.index == index)
     }
 }
 
@@ -2339,17 +2404,21 @@ mod unit_tests {
         );
     }
 
-    /// ⭐ THE PAIRING ROUND-TRIPS: the index a mint stamps is the one a lookup finds, and it carries
-    /// the two results the indirect access needs.
+    /// ⭐ THE PAIRING ROUND-TRIPS: the index a mint stamps is the one a lookup finds, and the datum it
+    /// carries is result 1 of the load — `%21, %22 = sentient.load_and_extract_scalar`
+    /// (`lx_indirect_loads_stores_composite.mlir:34`), consumed as `%22` at `:43`.
     #[test]
     fn a_minted_extract_statement_is_found_by_its_index() {
         let mut ops = ExtractScalarOps::default();
-        let first = ops.mint(ExtractScalarKind::LoadAndExtractScalar, Val(21), Val(22));
+        let first = ops.mint(ExtractScalarResults::LoadAndExtractScalar {
+            addr: Val(21),
+            data: Val(22),
+        });
         assert_eq!(first.index.get(), 0, "the counter opens at 0 per unit");
 
         let found = ops.find(ExtractScalarKind::LoadAndExtractScalar, first.index);
         assert_eq!(found, Some(first));
-        assert_eq!(found.map(|op| op.data), Some(Val(22)));
+        assert_eq!(found.map(ExtractScalarOp::data), Some(Val(22)));
     }
 
     /// ⭐ THE COUNTER IS SHARED BETWEEN THE TWO KINDS, so the second statement is index 1 whichever
@@ -2357,9 +2426,17 @@ mod unit_tests {
     #[test]
     fn the_counter_is_shared_and_the_kind_is_checked() {
         let mut ops = ExtractScalarOps::default();
-        let load = ops.mint(ExtractScalarKind::LoadAndExtractScalar, Val(21), Val(22));
-        let store = ops.mint(ExtractScalarKind::ReceiveAndExtractScalar, Val(31), Val(32));
+        let load = ops.mint(ExtractScalarResults::LoadAndExtractScalar {
+            addr: Val(21),
+            data: Val(22),
+        });
+        let store = ops.mint(ExtractScalarResults::ReceiveAndExtractScalar { data: Val(31) });
         assert_eq!(store.index.get(), 1);
+        assert_eq!(
+            store.data(),
+            Val(31),
+            "a receive binds ONE result and it is the datum (`SentientOps.td:684`)"
+        );
 
         assert_eq!(
             ops.find(ExtractScalarKind::ReceiveAndExtractScalar, store.index),
@@ -2377,7 +2454,10 @@ mod unit_tests {
     fn a_unit_with_no_extract_statement_finds_none() {
         let empty = ExtractScalarOps::default();
         let mut other = ExtractScalarOps::default();
-        let elsewhere = other.mint(ExtractScalarKind::LoadAndExtractScalar, Val(1), Val(2));
+        let elsewhere = other.mint(ExtractScalarResults::LoadAndExtractScalar {
+            addr: Val(1),
+            data: Val(2),
+        });
         assert_eq!(
             empty.find(ExtractScalarKind::LoadAndExtractScalar, elsewhere.index),
             None

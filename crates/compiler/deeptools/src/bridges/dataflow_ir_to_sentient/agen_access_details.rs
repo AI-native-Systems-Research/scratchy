@@ -2691,8 +2691,11 @@ impl<T> AccessContainer<T> {
     ///
     /// ⭐ THE ONE QUESTION EVERY CALLER OF `get` MUST ASK FIRST. `get` is `DT_CHECK`ed on it
     /// (*"no entry exists for the requested memory operand index"*, `:401-405`), and the lowerings
-    /// branch on it to decide what an op even is: `e374_lowerSymbolicVectorLoadOp` and
-    /// `e327_gatherSymbolicLoadStoreDetails` use it to tell an indirect access from a direct one.
+    /// branch on it to decide what an op even is. `e268_constructLoadAndStoreStmt` is where that
+    /// happens: `has(kIndSrc)`/`has(kIndDst)` at `Helper.cpp:2187`, `:2200`, `:2213`, `:2220`, `:2257`,
+    /// `:2259` and `:2337` — the only seven `kInd` sites in the tree — tell an indirect access from a
+    /// direct one. `e374_lowerSymbolicVectorLoadOp`'s single `has(kDirDst)` (`:3399`) asks a different
+    /// question: whether the load has a paired STORE to re-collect after loop cloning.
     ///
     /// ⛔ FILLED WITH ENTRY **0** IS FILLED. The C++ compares against `-1` rather than testing for
     /// zero, and the first insertion always maps to slot 0 — so a `has` written as "nonzero" would
@@ -2737,9 +2740,10 @@ impl<T> AccessContainer<T> {
     /// ⛔⛔ THE `DT_CHECK_MSG` IS THE RETURN TYPE. *"no entry exists for the requested memory operand
     /// index"* is precisely [`None`], and the reference's own callers already ask the question first —
     /// `if (has(kDirSrc)) return get(kDirSrc);` is how `getFirst` is written (`:411-418`), and
-    /// `e374_lowerSymbolicVectorLoadOp` and `e327_gatherSymbolicLoadStoreDetails` branch on `has` to
-    /// tell an indirect access from a direct one. An [`Option`] makes the pair one lookup instead of
-    /// two, and there is no path left on which the check can be forgotten.
+    /// `e268_constructLoadAndStoreStmt` branches on `has(kIndSrc)`/`has(kIndDst)` (`:2187`, `:2200`,
+    /// `:2213`, `:2220`, `:2257`, `:2259`, `:2337`) to tell an indirect access from a direct one before
+    /// each `get`. An [`Option`] makes the pair one lookup instead of two, and there is no path left on
+    /// which the check can be forgotten.
     ///
     /// ⛔ TWO INDIRECTIONS, AND BOTH ARE CHECKED BY THE SAME `?`. `index_mapping_[(int)moi]` is the
     /// slot and `at(...)` is the entry; the reference's `at` throws where a slot names an entry that

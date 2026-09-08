@@ -289,6 +289,184 @@ their four error-report ranges (`:3195`/`:3196-3199`, `:3243`/`:3244-3247`, `:32
 `getBytesPerStick() * 8 / ad.getElementWidth()` sites in `MutableStartAddrShifting.cpp`
 (`:373`, `:405`, `:485`, `:553`), and `DataflowToSentient.cpp:1838-1860` as the merged-versus-split pair.
 
+## ⛔ MEASURED FOR ENTRIES 327-350: THREE PREDICATES LOSE `return true;` AND FOUR LOSE THEIR DISPATCH TAIL
+
+Brace-matched from the authority at each unit's cited line (a0d29abbed) and diffed against
+`source/bridge2.cpp`'s body. **22 of the 24 extract bodies lose real content** (339 and 340 lose only
+nesting braces the extractor's balancer put back), and in ten of them what is lost is the statement
+that gives the function its effect:
+
+| unit | dropped from the extract's body |
+|---|---|
+| **343 `getOperandFromCastOp`** (`VectorOperands.cpp:354-361`) | **ITS ENTIRE COMPUTATION** — `auto operand = getOperand(dcc_ext_ctx, parent, comp); return operand;` (`:359-360`). An 8-line forwarder that walks to the cast's parent and re-asks for its operand reads as a function that finds the parent and returns nothing. Same defect as `e320_getOperand` above, and the same call it loses |
+| **341 `analyzeNonComputeOpsForFusion`** (`:610-702`) | **BOTH ASSIGNMENTS THAT REPORT THE ANSWER** — `is_fusion_respected = false;` at `:696` AND at `:699`, with the `} else if (!to.has_value()) {` that guards the second (`:698`). The extract keeps every `dominates` query and discards both verdicts, so the out-parameter is never written on the failing path |
+| **346 `lowerDanglingNonComputeOps`** (`:882-973`) | **THE WHOLE ERASE LOOP** — `for (auto op : tobe_deleted) { VectorOperand::eraseOp(op); }` (`:970-972`). The extract collects the dangling ops it lowered and never deletes them; the ops it replaced stay in the unit |
+| **335 `insertCopyAndAddStmts`** (`:3861-3877`) | ONE OF ITS TWO DISPATCH ARMS plus its fallthrough — `return insertCopyAndAddStmtsHelper<scf::ForOp>(scf_for, index, imm_val);`, the `} else` and `llvm_unreachable("unhandeled type of loop")` (`:3874-3876`). The `affine::AffineForOp` arm survives, so the extract reads as an affine-only helper |
+| **345 `processXrfPtrPerUnit`** (`:337-528`) | `return vector_op_to_xrfptr_map;` (`:527`) — 190 lines build the map from vector op to XRF pointer and the extract discards it |
+| **338 `ConstructIFRecursively`** (`:113-241`) | ITS FAILURE ARM — `signalPassFailure(); return nullptr;` (`:238-239`), after the *"CMPI/AND/OR operations or an op with one return value"* diagnosis. The extract reports and then falls off the end of a function returning `Operation *` |
+| **337 `lowerSyncOperation`** (`:1901-1982`) | `return LogicalResult::failure();` (`:1981`) — the fallthrough under all three `lowerSyncForA*` dispatch arms, so an unmatched sync reads as a success |
+| **347 · 348 · 349** | `return true;` (`:310` · `:516` · `:747`). All three are **predicates whose only `true` is the last line**: `topLevelConditionsMatch`, `singleOpBranchToYieldVal`, `isLoopInvariant`. In the extract each one falls off the end after its `return false;` guards, so all three read as always-false — and 349 is recursive, so a port from the extract makes its own recursion vacuous |
+| **342 `analyzeAndFillResultForwarding`** (`.hpp:162-194`) | the `else` half of its dispatch — `context, symbolizeSentientComputePort(dest).value());` closes the logical-port assignment, then `else result_forwarding.push_back(SentientComputePortAttr::get(context, symbolizeSentientComputePort(dest).value()));` (`:189-192`) is gone. The extract fills the logical port and never fills the vector |
+| **327 `gatherSymbolicLoadStoreDetails`** (`:1051-1207`) | its diagnosis string `"Unable to construct immutable addresses"` (`:1204`, leaving `emitError(` unterminated) and `return success();` (`:1206`) |
+| **344 `lowerDanglingNonComputeOpsPESFP`** (`:1273-1368`) | `return result;` (`:1368`) — **and its RETURN TYPE.** `UNITS.tsv` cites `:1274`, which is the qualified name; `mlir::LogicalResult` is alone on `:1273` and outside the span. Both ends of the signature-to-return contract are missing |
+| **350 `matchAndRewrite`** (`DuplicateReusedToggle.cpp:33-205`) | `return success();` (`:204`) and the `const` qualifier from `PatternRewriter &rewriter) const {` (`:35`) — the same `const` loss as 323 |
+| 328 · 332 · 333 · 336 | `return LogicalResult::success();` / `return success();` (`:1574` · `:3310` · `:3356` · `:4081`) |
+| 329 · 330 · 331 · 334 | the ARGUMENTS of the `lowerAffineCompositeHelper<…>` tail call — `candidate_op, unit, access_details, mutable_addrs, immutable_addrs, to_be_deleted);` (`:3123-3124` · `:3144-3145` · `:3165-3166` · `:3376-3377`). The template name survives with an empty argument list |
+| 339 · 340 | nothing that acts: 339 is identical to the authority plus a blank line, 340 loses four nesting `}` its balancer replaced with `}}}}` |
+
+⛔ **AND `loc` MEASURES THE EXTRACT, NOT THE FUNCTION.** For all 24, `loc` is exactly the recorded
+extract span minus 2, and so 2 to 7 lines short of the authority body (327: 153 vs 157; 341: 86 vs 93;
+342: 27 vs 33). All 24 landed banner rows mirror `loc`, so each states a length short by the amount the
+extract truncated — the numbers are consistent with `UNITS.tsv` and none is a length of the real
+function. Campaign-wide, `loc == span - 2` for **356 of 384**.
+
+## ⛔ FOUR OF THESE 24 ARE NOT IN THE EXTRACT UNDER THEIR OWN NAME — AND 118 OF 384 ARE NOT
+
+The extract rewrites each definition's name to `eNNN_<cppName>`, which is how a worklist item is found
+in it. **118 of 384 are never rewritten**, in four mechanically distinct classes; four of them are in
+this span, one per class:
+
+| class | count | in this span |
+|---|---|---|
+| the return type shares the line with `Class::name` | 7 | **338** — `Operation *StandardToSentientLoweringPass::ConstructIFRecursively(` (`:113`). The rewrite expects the qualified name to start the line |
+| the citation points one line PAST the return type | 11 | **344** — `UNITS.tsv` says `:1274`, and `mlir::LogicalResult` is on `:1273`. The extract's span starts inside the signature |
+| an unqualified free or `static` function | 29 | **347** — `static bool topLevelConditionsMatch(…)` (`:279`); nothing to strip a class from |
+| a template, whose `template <…>` header is above the cited line | 71 (indented in-class) + this | **342** — `VectorChainHelper.hpp:162` is `void analyzeAndFillResultForwarding(` and `template <typename BuilderType>` is on `:161`. The extract shows a plain function taking a `BuilderType&` that no longer has a declaration |
+
+⛔ **AND 17 OF 384 HAVE `loc=0` — THE ENTRY NAMES SOMETHING THAT IS NOT A FUNCTION.** Two of them
+matter to this span, because the `calls` column below declares them as callees — with a third that is
+not a function either, though its `loc` is not 0:
+
+- **`e052_If`** (`StandardToSentient.cpp:159`, level 0) is a **COMMENT LINE** —
+  `// return If(lhs) {If(rhs) true_val; else false_val} else false_val;` — and it sits INSIDE
+  `e338_ConstructIFRecursively`'s own body (`:113-241`), which is entry **338** of this batch. There is
+  no function `If`.
+- **`e064_size`** (`VectorChainHelper.cpp:319`, `loc` 6) is the member initialiser `size(vec.size()) {`;
+  its six lines are a constructor's tail.
+- **`e227_OperandReuse`** (`OperandReuse.hpp:30`, `loc` 0) is a constructor declaration, cited where the
+  previous batch found it named after the constructor and cited at the destructor.
+
+The other fifteen are base-class mem-initialisers (`e046_ConversionPattern` —
+`: mlir::ConversionPattern(mlir::scf::ForOp::getOperationName(), 1, ctx) {}`, `SCFToSentient.cpp:70`;
+`e079`, `e080`, `e086`, `e087`, `e101`, `e106`, `e136`-`e138`, `e246`, and `e016`/`e019` already
+recorded) and pure-virtual declarations with no body (`e134_cloneUseChain`, `e135_eraseMemOpAndUseChain`,
+`TransformPagedMemViewImpl.hpp:341`, `:364`).
+
+## ⛔ AND THE `calls` COLUMN FOR 327-350: 37 OF ITS 46 EDGES ARE NOT CALLS
+
+Recomputed from the authority body with comments and string literals stripped, the signature skipped and
+each name resolved against its receiver's type. Of the 46 declared edges, **6 are real calls, 3 name the
+wrong definition of a shared name, and 37 are not calls at all.** Only **5 of the 24** — 327, 335, 338,
+341, 350 — declare a single true callee; the other **19 declare none**.
+
+The 37 are the same substring classes the previous batches measured, plus two new ones:
+
+- **`e064_size`** (327, 329, 330, 331, 334, 336, 337, 345, 348, 349, 350 — 11 of the 24) — every match
+  is a container's own `.size()`: `access_details.size()`, `bb.getOperations().size()`,
+  `iter_arg_chain.size()`.
+- **`e052_If`** (327, 328, 336, 337, 338, 341, 350 — 7 of the 24) — the word "If" opening a comment, and
+  the entry is itself a comment (above). 328 alone has seven such matches (`Helper.cpp:1477`, `:1479`,
+  `:1482`, `:1489`, `:1541`, `:1543`, `:1545`).
+- **`e150_get`** (338, 340, 342, 344, 345, 346, 347 — 7) — MLIR static builders in six of them
+  (`SentientComputePortAttr::get`, `ArrayAttr::get`, `CmpIPredicateAttr::get`, `IndexType::get`), and in
+  **347** it is `std::get<0>(pair)` / `std::get<1>(pair)` (`:288-289`). Not one is
+  `AccessContainer<T>::get`.
+- **`e026_has`** (327, 328, 337, 344, 346, 350 — 6) — English in comments (*"has been updated"*,
+  *"it has been used but not absorbed"*) and in **337** and **344** a STRING LITERAL: *"Src unit types
+  has to be the same."* (`:1930`), *"Dangling non-compute op has no use\n"* (`:1344`).
+- **`e227_OperandReuse`** (341, 344, 346) — the PARAMETER TYPE `OperandReuse &reuse_info` (`:612`,
+  `:1276`, `:884`). Nothing in the three constructs one.
+- **`e149_insert`** (328, 345) — 🆕 comments only: *"insert an add op"* (`:1543`, `:1545`), *"insert xrf
+  offset ops"* (`:393`, `:438`, …). 345's real insertions are `insertConstAndAddOps` and
+  `insertDummyMacOp`, which are **e173** and **e243** and are not declared. 327's `e149_insert` IS real
+  (`mem_view_start_addrs.insert(…)`, `:1188`, `:1194`).
+- **`e058_dominates`** (328) — 🆕 the comment *"Note: The extract_op dominates the indirect op."*
+  (`:1476`). 341's `e058` is real (`reuse_info.dominates(left, right)`, `:656`).
+
+⛔ **AND THREE EDGES NAME THE WRONG DEFINITION OF A SHARED NAME** — the column is keyed on the name, so
+where two units share one it declares both or picks either:
+
+- **338** declares `e045_getSentientCmpIPredicate` AND `e048_getSentientCmpIPredicate` for the SINGLE
+  unqualified call at `:130`. e045 is `SCFToSentient.cpp:33`, e048 is `StandardToSentient.cpp:36`; 338 is
+  in `StandardToSentient.cpp`, so the call is **e048** and e045 is not reachable from it.
+- **349** declares `e082_getFirstChild` AND `e103_getFirstChild` — and **both are wrong.** e082 is
+  `LoopMaskNode::getFirstChild` and e103 is `LocalOpNode::getFirstChild`; 349's receivers are
+  `then_node`/`else_node` of type `CondNode*`, whose `getFirstChild` is `Analysis/ConditionalTree.hpp:49`
+  — **outside the D1-D28 span and not one of the 384.** 349's only in-span call is its own recursion.
+- **350** is one of FOUR units named `matchAndRewrite` (e001 L0, e225 L2, e350 L6, e377 L8). Its column
+  happens not to declare one; nothing in the column could tell them apart if it did.
+
+⭐ **WHAT THE LEVEL COLUMN GETS RIGHT, AND WHY IT IS NOT FROM THIS COLUMN.** Level 6 needs a level-5
+callee. **13 of the 24 have one** — 329-334 through `e311_constructAffineCompDetailsAndAddrs`
+(`Helper.cpp:3111`, `:3132`, `:3153`, `:3275`, `:3321`, `:3364`), 337 through
+`e319_lowerSyncForAQueryMap` (`:1977`), and 340, 341, 342, 343, 344, 346 through
+`e320_getOperand` — the `VectorOperand::getOperand(dcc_ext_ctx, …)` free function, distinguished from
+MLIR's `Operation::getOperand` by its first argument (`:554`, `:618`/`:667`, `:169`, `:359`, `:1288`,
+`:897`). **Every one of those 13 edges is omitted from the `calls` column**, whose deepest declared
+callee anywhere in the 24 is level 2. The remaining **11 are over-levelled**: 327 (deepest real callee
+`e213_constructImmutableAddress`, L2 ⇒ L3), 345 (`e243_insertDummyMacOp`, L2 ⇒ L3), 350 (`e264`, L2 ⇒ L3),
+335 (`e029`, L0 ⇒ L1), 338 (`e048`, L0 ⇒ L1), and 328, 336, 339, 347, 348, 349 with no in-span callee at
+all (⇒ L0). **This errs safe** — unlike 315 above, nothing in this batch is scheduled ahead of a callee;
+the 11 are merely scheduled later than they need to be.
+
+Omitted true callees, by unit: 327 `e155_updateSymbolicAccessDetails`/`e213_constructImmutableAddress`;
+329, 330, 331, 334 `e311`/`e037_findCandidateForLowering`/`e299_lowerAffineCompositeHelper`; 332 and 333
+`e311`/`e037`/`e032_findExtractScalarOp`/`e267_constructTimeLoopsAndVectorOperations`; 337
+`e300_lowerSyncForAUnit`/`e301_lowerSyncForAGroup`/`e319`; 340 and 342 `e320`/`e169_getName`; 341 and 343
+`e320`; 344 `e320`/`e169`/`e075_eraseOp`/`e055_getId`/`e056_getAbsorbtionFlag`/
+`e060_getInputPrecisionFromOperand`; 345 `e090_getXrfValue`/`e091_getForOpBound`/`e173_insertConstAndAddOps`/
+`e174_isXrfRelated`/`e175_updateYieldArgs`/`e243_insertDummyMacOp`; 346 those six of 344 plus
+`e094_computeUnitPrecision`/`e282_updateLoopMaskTreeForConstantMask`. 328, 335, 336, 338, 339, 347, 348,
+349 and 350 omit nothing — they have no undeclared in-span callee. **15 of 24 omit at least one.**
+
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT THESE 24 — 4 FIXED IN THIS COMMIT
+
+56 in-span `.cpp` citations were re-measured against a0d29abbed: the 24 module-doc banner rows and the
+48 checkbox rows below, all exact, plus 8 in prose. **No unit in this span is ported** — 0
+`/// Replaces:` anchors, 0 surviving `// crustify:todo:`, all 48 PORT/AUDIT boxes `[ ]`, which is what
+the schedule records. What the landed Rust claims ABOUT them, however, had four defects:
+
+- ⛔ **`ExtractScalarOp` GAVE THE RECEIVE FLAVOUR A RESULT IT DOES NOT HAVE.** `agen_helper.rs` carried
+  `pub addr: Val` and `pub data: Val` for both kinds under *"IT IS THE OP'S TWO RESULTS THAT MATTER"*.
+  `Sentient_LoadAndExtractScalarOp` has two (`let results = (outs Index:$addr, Index:$data);`,
+  `SentientOps.td:622`, with `getAddrResult()` = 0 and `getDataResult()` = 1) — but
+  `Sentient_ReceiveAndExtractScalarOp` has **one** (`let results = (outs Index:$result);`, `:684`), and
+  it is the DATUM. `e328_adjustMutableAddrInitForIndirect` is where the difference shows: it reads
+  `load_and_extract_op.getDataResult()` for the load and `extract_op->getResult(0)` for the receive
+  (`Helper.cpp:1467-1470`) — result **1** in one case and result **0** in the other. A mandatory `addr`
+  field made result 0 of a receive an address, which is the datum. The results are now an enum carrying
+  what each op actually binds, with one accessor for the value the indirect access consumes.
+- ⛔ **THE `agen.composite_load_and_store` EMISSION IS NOT `e331`'s.** `agen_agen_to_sentient.rs` said
+  *"THE EMISSION IS `e331_lowerCompositeLoadAndStoreOp`'s"*. `e331` (`Helper.cpp:3148-3167`) emits
+  nothing: it builds details, re-finds the candidate and tail-calls
+  `lowerAffineCompositeHelper<CompositeLoadAndStoreOp>` (`:3164-3166`) = **e299** (`:2953`, level 4),
+  which emits nothing either and calls `constructTimeLoopsAndVectorOperations` (`:2959`) = **e267**
+  (`:1789`), which dispatches `CompositeLoadAndStoreOp` to `constructLoadAndStoreStmt` (`:1882`) =
+  **e268** (`:2167`), where `sentient::LoadAndStoreOp::create` is (`:2323`). The emission is **e268's,
+  four calls below `e331`**.
+- ⛔ **NEITHER `e327` NOR `e374` BRANCHES ON `has` TO TELL AN INDIRECT ACCESS FROM A DIRECT ONE.**
+  `agen_access_details.rs` said so twice (on `has` and on `get`). `e327_gatherSymbolicLoadStoreDetails`
+  does not call `has` at all — its three matches are English in comments. `e374_lowerSymbolicVectorLoadOp`
+  calls it once, `has(kDirDst)` (`Helper.cpp:3399`), and what that asks is whether the load has a paired
+  STORE. The function that does branch indirect-vs-direct is **`e268_constructLoadAndStoreStmt`**, on
+  `has(kIndSrc)`/`has(kIndDst)` at `Helper.cpp:2187`, `:2200`, `:2213`, `:2220`, `:2257`, `:2259` and
+  `:2337` — the only seven `kInd` `has` sites in the tree.
+- ⚠️ **"WITH NOTHING IN BETWEEN" OVERSTATES `e328`.** `agen_helper.rs` justified the 1D-identity,
+  based-at-0 view by saying `e328` *"adds it to the mutable address with nothing in between"*. `e328`
+  inserts a `sentient::AddOp` at one of **four** sites, and only the first adds to the mutable address
+  itself (`:1496`); the iter_arg-chain walk adds the extracted scalar to the loop's INITIALISER instead
+  (`:1522`, `:1533`, then `curr_loop->setOperand(arg_idx, new_init)`), and the non-iter_arg case walks
+  back to whichever of the two ops comes last before inserting (`:1569`). What is unscaled and
+  unoffset is the extracted scalar, not the address it joins — the vendor's own output shows
+  `%34 = sentient.scalar_add %33, %22` where `%33` is an `arith.addi` from the address chain
+  (`lx_indirect_loads_stores_composite.mlir:42-43`).
+
+Everything else in prose measured exact, including both `lx_indirect_loads_stores_composite.mlir`
+citations (`:34` binds `%21, %22 = sentient.load_and_extract_scalar` and `:43` consumes `%22` — the
+`AgenToSentient/` copy, not the `SentientToProgIR/` one of the same basename), `e335`'s two
+`insertCopyAndAddStmtsHelper` instantiations (`Helper.cpp:3871`, `:3874`) and the index-from-the-end rule
+they carry, and the four `findExtractScalarOp` error ranges already re-measured for 311-326.
+
 ## ⛔ MEASURED FOR ENTRIES 351-356: ALL FOUR SHIFTING TRANSFORMS LOSE `op->erase();`, AND 351 IS 372
 
 Re-measured body-by-body against the authority at `a0d29abbed`. **351 and 356 are identical to it**

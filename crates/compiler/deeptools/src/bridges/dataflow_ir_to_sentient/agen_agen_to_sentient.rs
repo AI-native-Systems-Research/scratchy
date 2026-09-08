@@ -241,10 +241,14 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
 
         // ── 5. `agen.composite_load_and_store` (`AgenToSentient.cpp:102-109`) ────────────────────
         //
-        // ⭐ THE EMISSION IS `e331_lowerCompositeLoadAndStoreOp`'s AND IT ALREADY EXISTS. The spine's
+        // ⭐ THE EMISSION ALREADY EXISTS, AND IT IS `e268_constructLoadAndStoreStmt`'s. The spine's
         // [`super::load_and_store`] is the `sentient.load_and_store` this arm has to produce, byte
-        // compared against the reference's own output; `e331` is its anchored home and is scheduled
-        // separately. Emitting a second one here would be two answers to one question.
+        // compared against the reference's own output. `e331_lowerCompositeLoadAndStoreOp`
+        // (`Helper.cpp:3148`) is the entry this arm's dispatch belongs to and is scheduled separately,
+        // but it emits nothing itself: it tail-calls `lowerAffineCompositeHelper` (`:3164-3166`, e299,
+        // level 4) → `constructTimeLoopsAndVectorOperations` (`:2959`, e267) → `constructLoadAndStoreStmt`
+        // (`:1882`, e268), where `sentient::LoadAndStoreOp::create` is (`:2323`) — four calls below
+        // `e331`. Emitting a second one here would be two answers to one question.
         agen::Op::CompositeLoadAndStore(transfer) => {
             out.push(super::load_and_store(transfer, bound, consts));
             Consumed(1)
@@ -719,9 +723,12 @@ mod transfer_tests {
     /// The extract statement both overloads thread through, as the vendor's own pair of results
     /// (`lx_indirect_loads_stores_composite.mlir:34`: `%21, %22 = sentient.load_and_extract_scalar`).
     fn extract_op() -> ExtractScalarOp {
-        use super::super::agen_helper::{ExtractScalarKind, ExtractScalarOps};
+        use super::super::agen_helper::{ExtractScalarOps, ExtractScalarResults};
         let mut ops = ExtractScalarOps::default();
-        ops.mint(ExtractScalarKind::LoadAndExtractScalar, Val(21), Val(22))
+        ops.mint(ExtractScalarResults::LoadAndExtractScalar {
+            addr: Val(21),
+            data: Val(22),
+        })
     }
 
     /// ⭐ THE DEFAULTS ARE ALL OFF — the state three call sites get by writing nothing.
