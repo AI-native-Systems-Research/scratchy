@@ -175,11 +175,15 @@ impl Consumed {
 ///
 /// # ⛔⛔ TWO ARMS ARE `todo!` AND THAT IS THE POINT
 ///
-/// `e314_lowerVectorLoadOp` and `e315_lowerVectorStoreOp` are unported (level 8, this campaign), as
-/// are the two pattern predicates that choose between them and their extracting siblings. Until they
-/// land, an `agen.vector_load` reaching this dispatch is a named gap and not a wrong program. The
-/// gain over the generic *"lower a statement this bridge has not met"* this replaces is that the
-/// build now says WHICH unit is missing.
+/// `e314_lowerVectorLoadOp` and `e315_lowerVectorStoreOp` are unported (both level 5, this
+/// campaign), as are the two pattern predicates that choose between them and their extracting
+/// siblings. ⚠️ 315's recorded level is wrong in the schedule, not here: its 7-argument
+/// `constructReceiveAndStoreStmt` call (`Helper.cpp:3090-3092`) cannot bind the 8-parameter inline
+/// forwarder `e028` and resolves to the primary template `e359` (`Helper.cpp:2025`, level 7), so 315
+/// is scheduled two levels ahead of its own callee. Until they land, an `agen.vector_load` reaching
+/// this dispatch is a named gap and not a wrong program. The gain over the generic *"lower a
+/// statement this bridge has not met"* this replaces is that the build now says WHICH unit is
+/// missing.
 ///
 /// ⛔ AND NOT A STAND-IN. Lowering a `vector_load` as if it were the transfer below would emit a
 /// `load_and_store` for a program that asked for a load — the exact substitution the campaign

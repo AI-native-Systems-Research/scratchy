@@ -178,6 +178,117 @@ Four citations drifted: `VectorOperands.hpp:112` (a blank line) for `splat_`'s d
 `DataflowToSentient.cpp:796-800` in `islands/dataflow_ir/dialects/dataflow.rs` for the group arm at
 `:825-826`; and `Helper.cpp:2963` for a quote that is the comment on `:2962`.
 
+## ⛔ MEASURED FOR ENTRIES 311-326: ONE EXTRACT BODY IS EMPTY, AND ONE ENTRY IS SCHEDULED AHEAD OF ITS CALLEE
+
+Brace-matched from the authority at each unit's cited line (a0d29abbed) and diffed against
+`source/bridge2.cpp`'s body. All 16 `UNITS.tsv` citations land exactly on the named definition, and the
+recorded `loc` is 1-6 lines short of the real body in all 16. **14 of the 16 extract bodies lose a real
+statement, and in five it is the statement that gives the function its effect:**
+
+| unit | dropped from the extract's body |
+|---|---|
+| **320 `getOperand`** (`VectorOperands.cpp:378-384`) | **THE WHOLE BODY.** The function is `bool is_precision_converted; return getOperandWithPrecision(dcc_ext_ctx, op, comp, is_precision_converted, traverse_upwards);` and the extract keeps only the declaration, so a 7-line forwarder reads as a function that computes nothing. This is the second reason the 304↔320 cycle below is invisible: the extract of 320 contains no call at all |
+| **319 `lowerSyncForAQueryMap`** (`:1728-1899`) | **ITS FINAL DISPATCH ARM** — `DT_CHECK_MSG(implicit_sync_tile_size == -1, "L3 doesn't have implicit sync"); return lowerSyncLXL3ToLXL3(op, builder, src_vs, dst_vs, -1, /*is_src_l3 =*/true);` (`:1894-1897`). The src-is-L3 case, its precondition and its tail call are all gone; same defect as 300/301 |
+| **323 `shiftMutableAddr`** (`:366-388`) | BOTH returns — the all-shifts-zero early exit `return AffineMap::get(mem_view_op->getContext());` (`:385`, the empty map that reports "no shift") and `return applyShifts(evaluator, shifts, unit, op, mem_view_op, ad);` (`:387`). The extract calculates shifts and discards them. It also drops the `const` qualifier from the signature |
+| **311 `constructAffineCompDetailsAndAddrs`** (`:2809-2847`) | `.failed()) return failure();` (`:2842-2843`) and `return gatherAffineLoadStoreDetails<AccessDetailsAffineComposite>(src_op, unit, comp, access_details, mutable_addrs, immutable_addrs);` (`:2845-2846`) — same tail call 298 lost, composite-flavoured |
+| **314 `lowerVectorLoadOp`** (`:3050-3072`) | `return lowerVectorLoadHelper<AccessDetailsAffine, VectorLoadOp>(candidate_op, store_op, unit, access_details, mutable_addrs, immutable_addrs, to_be_deleted);` (`:3069-3071`) — the helper that does the lowering |
+| 318 `lowerLDCVTIPattern` (`:3444-3773`) | `to_be_deleted.push_back(element_shuffle_op);` and `to_be_deleted.push_back(element_load_op);` (`:3770-3771`) plus `return success();` — the fused ops are never queued for deletion |
+| 312 · 313 · 315 · 316 · 317 · 324 | `return success();` / `return LogicalResult::success();` (`Helper.cpp:3023` · `:3047` · `:3103` · `:3214` · `:3264`, and 324 at `TransformPagedMemViewImpl.cpp:185`) |
+| 321 · 322 | the `<< "\n");` tail of the closing `LLVM_DEBUG` (`:543` · `:670`), leaving an unterminated stream expression. Every statement that acts survives in both |
+| 325, 326 | nothing: identical to the authority |
+
+## ⛔ ENTRY 315 IS SCHEDULED TWO LEVELS AHEAD OF ITS OWN CALLEE — AN OVERLOAD, RESOLVED WRONG
+
+`constructReceiveAndStoreStmt` and `constructLoadAndSendStmt` each have TWO declarations in
+`AgenToSentient.hpp`: a primary template with five trailing defaults (`:221-227`, `:239-245` — defined in
+`Helper.cpp:1910` = **e358** and `Helper.cpp:2025` = **e359**, both level **7**), and an inline forwarder
+whose last parameter `Operation* extract_op` is REQUIRED (`:229-237`, `:247-255` — **e027**/**e028**, both
+level **0**). Which one a call binds is decided by its argument count:
+
+- **315** calls `constructReceiveAndStoreStmt<AccessDetailsAffine>(&builder, unit, candidate_op,
+  element_type, access_details[0], mutable_addrs[0], immutable_addrs[0])` — **seven** arguments
+  (`Helper.cpp:3090-3092`). The forwarder needs eight, so it is not viable; the call resolves to the
+  primary and therefore to **e359, level 7**. The `calls` column declares `e028` (level 0). **315 is
+  level 5 and calls a level-7 unit** — port it after 359, or the callee will not exist.
+- **316** passes `extract_op` as its seventh argument (`:3202-3204`) and **317** as its eighth
+  (`:3251-3253`); the primary's corresponding parameter is `unsigned burst_size`, which an `Operation*`
+  cannot convert to, so both DO bind the level-0 forwarders. `e027`/`e028` are correct for those two, and
+  the column simply copied 317's answer onto 315.
+
+`e320_getOperand` is the same 304↔320 cycle already recorded above, seen from the level-5 side: its
+declared `calls` is `-` because the extract left it with no body to read.
+
+## ⛔ AND THE `calls` COLUMN FOR 311-326: 26 OF ITS 39 EDGES ARE NOT CALLS
+
+Recomputed from the authority body with comments and string literals stripped and the signature skipped.
+**All 16 omit at least one true callee, and in every one of the 16 the omitted set contains the callee
+that fixes the level** — no declared list implies the recorded level 5; they imply 0, 1, 2 or 3. Three
+entries — **318, 323 and 324** — have NO true edge in their declared list at all. The `level` column is
+right for 15 of the 16 (315 is the exception above) and was not computed from this column; take callees
+from the authority.
+
+Of the 39 declared edges, 12 are real calls, one names the wrong overload (315's `e028`) and **26 are not
+calls**:
+
+- **`e019_AccessDetailsAffine`** (312, 313, 314, 315, 316, 317, 318, 323 — 8 of the 16, its worst run) —
+  and it is wrong twice over. `UNITS.tsv` gives it `loc` 0 and a one-line extract span, because
+  `AccessDetails.hpp:259` is a MEM-INITIALISER: `explicit AccessDetailsAffineComposite(Operation* op,
+  SenComponents comp) : AccessDetailsAffine(op, comp) {}`. So the entry is named after the BASE class in
+  a delegation while the entity is the DERIVED class's constructor — and in all 8 bodies the match is
+  only the type NAME as a template argument (`AccessContainer<AccessDetailsAffine>`,
+  `constructLoadAndSendStmt<AccessDetailsAffine>`) or a parameter type (323's `agen::AccessDetailsAffine
+  &ad`). Nothing in these 16 constructs an `AccessDetailsAffineComposite`; where one IS constructed it is
+  inside `e208_emplace_insert`.
+- **`e064_size`** (312, 313, 315, 316, 317, 318, 319, 324, 325, 326 — 10 of the 16) — `size(vec.size())`,
+  a member initialiser (`VectorChainHelper.cpp:319`). Every `size()` in these bodies is a container's own.
+- **`e052_If`** (318, 322, 323, 325) — the word "If" starting a comment: *"// on. If ldtype_shuffle
+  existed…"* (`Helper.cpp:3733`), *"// If the indirect part…"* (`MutableAddrSplitting.cpp:575`), *"// If
+  all the shifts are 0…"* (`MutableStartAddrShifting.cpp:381`), *"// If the TPMVInfo isn't for a paged mem
+  view…"* (`TransformPagedMemViewImpl.cpp:997`). There is no function `If`.
+- **`e026_has`** (318, 319) — a COMMENT in 318 (*"…that has a vector_load input"*, `:3516`) and two STRING
+  LITERALS in 319 (*"sync buffer size has to be a constant op"*, *"the target has to be a single unit."*).
+- **`e150_get`** (318, 319) — a real function (`AccessDetails.hpp:401`, `AccessContainer<T>::get`), but
+  neither body has a single member `get(`: every match is an MLIR static builder — `IndexType::get`,
+  `ArrayAttr::get`, `SentientSyncModeAttr::get`, `SentientLoadConsumerAttr::get`.
+
+Omitted true callees, by unit: 311 `e265_constructDetails`/`e297_constructTimeStepsInfo`/
+`e212_gatherAffineLoadStoreDetails`; 312 `e298_constructAffineDetailsAndAddrs`/`e037_findCandidateForLowering`/
+`e269_constructLoadAndExtractScalarOp`; 313 the same two plus `e216_constructReceiveAndExtractScalarOp`;
+314 `e298`/`e037`/`e036_getStoreOpFromLoadStorePattern`/`e217_lowerVectorLoadHelper`; 315 `e298`/`e037`/
+`e270_addStoreInputToDeleteList` (and `e359` for `e028`); 316 `e298`/`e037`/`e032_findExtractScalarOp`/
+`e038_addLoadChainToDeleteList`; 317 `e298`/`e037`/`e032`/`e270`; 318 `e298`/`e035_generateSetSendDestinationStmts`/
+`e214_setImmutableAddrAndIncrements`; 319 `e302_lowerSyncLXL3ToLXL3` — the only in-span callee it has, and
+the one that sets its level; 320 `e304_getOperandWithPrecision`; 321 and 322 `e289_initialize`/`e265`/`e297`/
+`e290_createPartitions`/`e251_setupForPartitioning`/`e189_synthesizeTimeInfo`/`e185_hasMutableAddrOverflow`/
+`e253_adjustForEvenImmutableAddr`/`e190_createExplicitTimeLoops`; 323 `e308_calculateShifts`/`e255_applyShifts`;
+324 `e309_constructValidPage`/`e294_getPageValidity`; 325 `e310_analyzeValidPages`/`e197_calculateIndicesRanges`/
+`e132_identifyTimeDimForExplicitLoops`/`e119_replaceDimsInMapWithSyms`/`e131_addTimeDimIndicesRanges`;
+326 `e265`/`e297`.
+
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT THESE 16 — 4 FIXED IN THIS COMMIT
+
+66 in-span `.cpp` citations were re-measured against a0d29abbed: 16 module-doc banner rows and the 32
+checkbox rows below, all exact, plus 18 in prose. Two claims were wrong, two citations drifted:
+
+- `agen_agen_to_sentient.rs` called 314 and 315 "level 8". `UNITS.tsv` records both at level **5**. The
+  note now says 5 and carries the 315 inversion above, which is the schedule's error and not the module's.
+- `agen_helper.rs` said `findCandidateForLowering` is "instantiated with **eleven** different classes" and
+  then cited **twelve** sites. The twelve carry **ten** distinct classes: `VectorLoadOp` appears at
+  `:3013` AND `:3063`, `VectorStoreOp` at `:3038` AND `:3086`. (The two symbolic lowerings use neither
+  template for their candidate — `lowerSymbolicVectorLoadOp` takes it off
+  `access_details.get(kDirSrc).getOp()` with a `dyn_cast_or_null`, `Helper.cpp:3393-3394`.)
+- `tf_mutable_addr_splitting.rs` cited `:451-546` for 321's `initialize` → `synthesizeTimeInfo` →
+  `hasMutableAddrOverflow` gate. 321's body ends at `:544` and `:546` is 322's first line; the sequence is
+  `:475-479`.
+- `tf_transform_paged_mem_view_impl.rs` quoted one comment for both of its callers. `:603-605` reads
+  *"…valid for mem_ops_."*; `:1002-1004` reads `mem_op_`, singular.
+
+Everything else in prose measured exact, including the four `findExtractScalarOp` instantiations and
+their four error-report ranges (`:3195`/`:3196-3199`, `:3243`/`:3244-3247`, `:3293`/`:3294-3297`,
+`:3339`/`:3340-3343`), 321's `:488-490`, `:512-515`, `:526-529` and `:533`, the four
+`getBytesPerStick() * 8 / ad.getElementWidth()` sites in `MutableStartAddrShifting.cpp`
+(`:373`, `:405`, `:485`, `:553`), and `DataflowToSentient.cpp:1838-1860` as the merged-versus-split pair.
+
 ## Progress
 
 `200/384 ported; 200/384 audited`

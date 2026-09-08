@@ -4594,7 +4594,7 @@ impl MutableAddrOverflow {
 /// # ⭐⭐ THE GATE FOR THE WHOLE PASS, AND IT IS ASKED ONCE PER TRANSFER
 ///
 /// `transformCompLoadAndStore` runs `initialize`, [`synthesize_time_info`], then
-/// `if (!hasMutableAddrOverflow(...)) return;` (`:451-546`) — so a transfer whose address fits is left
+/// `if (!hasMutableAddrOverflow(...)) return;` (`:475-479`) — so a transfer whose address fits is left
 /// exactly as it was, and everything downstream of here (the sort, the partition sizes, the
 /// conditional tree, the explicit time loops) happens only for one that does not.
 ///

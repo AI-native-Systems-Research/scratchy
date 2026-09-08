@@ -2077,8 +2077,9 @@ pub fn remove_values_from_indices(
 ///
 /// Both callers say so in a comment: *"Create a copy of the subscripts_map that represents loop
 /// iterators as symbols. This is used to form the constraints to determine which pages are valid for
-/// mem_ops_."* (`:603-605`, `:1002-1004`). In MLIR's presburger machinery a DIMENSION is a variable
-/// the system solves for and a SYMBOL is a parameter it treats as fixed-but-unknown, so a subscript
+/// mem_ops_."* (`:603-605`; `:1002-1004` is the same comment with `mem_op_` singular). In MLIR's
+/// presburger machinery a DIMENSION is a variable the system solves for and a SYMBOL is a parameter
+/// it treats as fixed-but-unknown, so a subscript
 /// whose loop iterators are dimensions asks "which iterations hit this page" while the same subscript
 /// with them as symbols asks "which pages can these iterators reach" — which is the question
 /// `analyzeAndConstructValidPages` puts to it.

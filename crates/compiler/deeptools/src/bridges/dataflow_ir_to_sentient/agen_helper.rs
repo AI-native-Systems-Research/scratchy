@@ -520,8 +520,9 @@ impl ExtractScalarOps {
 /// `getStoreOpFromLoadStorePattern<VectorStoreTy>` are instantiated with.
 ///
 /// ⭐⭐ THE TEMPLATE PARAMETER IS AN INPUT, SO IT HAS TO BE NAMABLE. `findCandidateForLowering` is
-/// instantiated with **eleven** different classes (`Helper.cpp:3013, 3038, 3063, 3086, 3120, 3141,
-/// 3162, 3184, 3232, 3282, 3328, 3373`) and `getStoreOpFromLoadStorePattern` with two
+/// instantiated at TWELVE sites with **ten** different classes (`Helper.cpp:3013, 3038, 3063, 3086,
+/// 3120, 3141, 3162, 3184, 3232, 3282, 3328, 3373` — `VectorLoadOp` at `:3013` and `:3063`,
+/// `VectorStoreOp` at `:3038` and `:3086`) and `getStoreOpFromLoadStorePattern` with two
 /// (`VectorStoreOp` at `:3053, :3067`, `SymbolicVectorStoreOp` at `:3384`). A port that hard-coded
 /// one class would be a port of one instantiation, not of the function.
 ///
