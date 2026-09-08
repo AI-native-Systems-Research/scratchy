@@ -160,17 +160,18 @@ impl Consumed {
 /// | 4 | `agen.composite_store` | `e330` | — |
 /// | 5 | `agen.composite_load_and_store` | `e331` | [`agen::Op::CompositeLoadAndStore`] |
 /// | 6 | `agen.indirect_vector_load` | `e316` | — |
-/// | 7 | `agen.indirect_vector_store` | `e317` | — |
+/// | 7 | `agen.indirect_vector_store` | `e317` | [`agen::Op::IndirectVectorStore`] |
 /// | 8 | `agen.composite_indirect_load` | `e332` | — |
 /// | 9 | `agen.composite_indirect_store` | `e333` | — |
 /// | 10 | `agen.composite_indirect_load_and_store` | `e334` | — |
 /// | 11 | `agen.symbolic_vector_load` | `e374` | [`agen::Op::SymbolicVectorLoad`] |
 /// | 12 | `agen.symbolic_vector_store` | `e375` | [`agen::Op::SymbolicVectorStore`] |
 ///
-/// ⛔ SEVEN OF THE TWELVE HAVE NO ISLAND VARIANT and so cannot be a candidate here at all: a kind
+/// ⛔ SIX OF THE TWELVE HAVE NO ISLAND VARIANT and so cannot be a candidate here at all: a kind
 /// this crate cannot construct is a kind this dispatch cannot meet. The `match` below is therefore
 /// exhaustive over [`agen::Op`] rather than over the twelve — which is why declaring the symbolic
-/// pair for entries 374/375 grew arms 11 and 12 here, in the one place that has to have them.
+/// pair for entries 374/375 grew arms 11 and 12 here, and `agen.indirect_vector_store` for entry 216
+/// grew arm 7, in the one place that has to have them.
 ///
 /// # ⛔⛔ FOUR ARMS ARE `todo!` AND THAT IS THE POINT — AND THE PREDICATE THAT PICKS BETWEEN THEM RUNS
 ///
@@ -306,6 +307,16 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             Consumed(1)
         }
 
+        // ── 7. `agen.indirect_vector_store` (`AgenToSentient.cpp:116-122`) ──────────────────────
+        //
+        // ⛔ NO PREDICATE ON THIS ARM. Unlike the plain store it is not asked whether it is an extract
+        // pattern — the scatter's OWN lowering handles the two-user pair that `e216` matches — so the
+        // one unported lowering is all this arm names.
+        agen::Op::IndirectVectorStore { .. } => todo!(
+            "e317_lowerIndirectVectorStoreOp: an agen.indirect_vector_store on {:?}",
+            unit.on.kind()
+        ),
+
         // ── 11. `agen.symbolic_vector_load` (`AgenToSentient.cpp:147-152`) ───────────────────────
         //
         // ⛔ THE STORE SEARCH NEEDS THE WHOLE UNIT BODY, not the window: entry 036 counts the load
@@ -358,6 +369,7 @@ fn is_candidate(op: &agen::Op) -> bool {
     match op {
         agen::Op::VectorLoad { .. }
         | agen::Op::VectorStore { .. }
+        | agen::Op::IndirectVectorStore { .. }
         | agen::Op::CompositeLoadAndStore(_)
         | agen::Op::SymbolicVectorLoad { .. }
         | agen::Op::SymbolicVectorStore { .. } => true,

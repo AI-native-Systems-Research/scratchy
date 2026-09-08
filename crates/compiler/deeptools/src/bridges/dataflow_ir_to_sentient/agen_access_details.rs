@@ -1564,6 +1564,7 @@ impl<'a> AccessDetailsBase<'a> {
             agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::IndirectVectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
             // ⛔ AND NEITHER IS THE INTERLEAVE OR THE MASK STATE: one holds transfers rather than
             // being one, the other writes a unit's mask state and loads no vector at all.
@@ -1847,10 +1848,10 @@ impl<'a> AccessDetailsAffine<'a> {
     /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295` (57L). Everything one affine load or
     /// store says about itself, read off the op and into the record, then the memory view.
     ///
-    /// ⛔ FOUR ARMS, TWO ISLAND OPS. The reference's `dyn_cast` chain (`:301-344`) takes
-    /// `agen.vector_load`/`agen.vector_store` and their `indirect_` twins; the indirect pair differs
-    /// only in reading `getDirectMemref()`/`getDirectAffineMapAttr()` and has no island op yet, so it
-    /// lands on [`AffineInitialize::UnsupportedOperation`] with the composite and the yield.
+    /// ⛔ FOUR ARMS, THREE ISLAND OPS. The reference's `dyn_cast` chain (`:301-344`) takes
+    /// `agen.vector_load`/`agen.vector_store` and their `indirect_` twins; the indirect ones differ
+    /// only in reading `getDirectMemref()`/`getDirectAffineMapAttr()`, and `indirect_vector_load` is
+    /// the one still without an island op, so it lands on `UnsupportedOperation` with the composite.
     /// ⛔ THE WIDTH AND THE COUNT COME FROM THE **VECTOR** OPERAND, not from the memref: the loaded
     /// result on a load, the stored value on a store (`:306-309`, `:316-319`).
     /// ⛔ AND `getMapIndices()`/`getMapOperands()` ARE THE MAP'S OPERANDS, so [`access_map`] hands back
@@ -1875,6 +1876,15 @@ impl<'a> AccessDetailsAffine<'a> {
                 ty,
                 ..
             } => (view, view_ty, indices, ty),
+            // ⭐ AND THE INDIRECT STORE READS THE **DIRECT** VIEW AND ITS MAP (`:332-342`), never the
+            // indirect view the address is fetched out of.
+            agen::Op::IndirectVectorStore {
+                direct_view,
+                direct_view_ty,
+                direct_indices,
+                ty,
+                ..
+            } => (direct_view, direct_view_ty, direct_indices, ty),
             // ⛔ AND THE SYMBOLIC PAIR IS NOT AFFINE AT ALL — its subscript is a runtime value, so
             // `AccessDetailsSymbolic::initialize` (`:858-896`) reads it and this `dyn_cast` chain
             // does not.

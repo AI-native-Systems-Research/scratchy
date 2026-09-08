@@ -280,6 +280,23 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend([*value, *view]);
                 index_operands(indices, &mut reads);
             }
+            // ⭐ BOTH VIEWS AND BOTH SUBSCRIPTS, in the reference's own operand order
+            // (`Agen.td:930-935`): the value, the indirect view, the direct view, the two subscripts
+            // and at most one multicast handle.
+            agen::Op::IndirectVectorStore {
+                value,
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                reads.extend([*value, *indirect_view, *direct_view]);
+                index_operands(indirect_indices, &mut reads);
+                index_operands(direct_indices, &mut reads);
+                reads.extend(*multicast_info);
+            }
             // ⛔ THE STRIDES AND THE MULTICAST HANDLE ARE OPERANDS TOO — `operands1` holds the
             // subscript, then the strides, then at most one multicast group (`Agen.td:1128-1130`),
             // and a use-chain walk that missed them would treat a symbolic access as reading
@@ -500,6 +517,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             }
             agen::Op::VectorStore { .. }
             | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::IndirectVectorStore { .. }
             | agen::Op::Yield
             | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
@@ -671,6 +689,20 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             } => {
                 places.extend([value, view]);
                 index_operands_mut(indices, &mut places);
+            }
+            agen::Op::IndirectVectorStore {
+                value,
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                places.extend([value, indirect_view, direct_view]);
+                index_operands_mut(indirect_indices, &mut places);
+                index_operands_mut(direct_indices, &mut places);
+                places.extend(multicast_info.as_mut());
             }
             agen::Op::SymbolicVectorLoad {
                 view,
@@ -861,6 +893,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             }
             agen::Op::VectorStore { .. }
             | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::IndirectVectorStore { .. }
             | agen::Op::Yield
             | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
@@ -1424,6 +1457,20 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             } => {
                 operands.extend([value, view]);
                 index_operands_mut(indices, &mut operands);
+            }
+            agen::Op::IndirectVectorStore {
+                value,
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                operands.extend([value, indirect_view, direct_view]);
+                index_operands_mut(indirect_indices, &mut operands);
+                index_operands_mut(direct_indices, &mut operands);
+                operands.extend(multicast_info.as_mut());
             }
             agen::Op::SymbolicVectorLoad {
                 result,
@@ -2007,6 +2054,22 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 vals.push((Role::Operand, value));
                 vals.push((Role::Operand, view));
                 index_vals_mut(indices, &mut vals);
+            }
+            agen::Op::IndirectVectorStore {
+                value,
+                indirect_view,
+                indirect_indices,
+                direct_view,
+                direct_indices,
+                multicast_info,
+                ..
+            } => {
+                vals.push((Role::Operand, value));
+                vals.push((Role::Operand, indirect_view));
+                index_vals_mut(indirect_indices, &mut vals);
+                vals.push((Role::Operand, direct_view));
+                index_vals_mut(direct_indices, &mut vals);
+                vals.extend(multicast_info.as_mut().map(|val| (Role::Operand, val)));
             }
             agen::Op::SymbolicVectorLoad {
                 result,

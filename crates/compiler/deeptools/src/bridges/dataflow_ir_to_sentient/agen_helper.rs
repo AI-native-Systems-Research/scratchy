@@ -121,7 +121,10 @@ use super::agen_access_details::{
     AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsSymbolic,
     IndicesCoeffDict, MemoryOperandIndex,
 };
+use super::agen_agen_to_sentient::StrideStep;
+use super::std_standard_to_sentient::lower_constant_index_to_sentient;
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
+use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
     self as dfir_op, Index, Op as DfirOp, Val, arith, dataflow, defining_op, results, uses,
 };
@@ -130,8 +133,10 @@ use crate::islands::dataflow_ir::ty::{
     AffineMap, FlatConstraints, GenericComp, IntegerSet, MemRef, Vector,
 };
 use crate::islands::dataflow_ir::{ProgramUnit, ValueMapping, Values};
-use crate::islands::sentient::dialects::{Op as SenOp, sentient as sen};
-use crate::units::DfirUnit;
+use crate::islands::sentient::dialects::{
+    Op as SenOp, defining_op as sen_defining_op, sentient as sen,
+};
+use crate::units::{DfirUnit, NumFolds, Residency};
 use core::num::NonZeroU32;
 use std::collections::BTreeSet;
 
@@ -634,6 +639,9 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
         DfirOp::Agen(op) => match op {
             dfir_op::agen::Op::VectorLoad { .. } => Some(AgenOpKind::VectorLoad),
             dfir_op::agen::Op::VectorStore { .. } => Some(AgenOpKind::VectorStore),
+            dfir_op::agen::Op::IndirectVectorStore { .. } => {
+                Some(AgenOpKind::IndirectVectorStore)
+            }
             dfir_op::agen::Op::SymbolicVectorLoad { .. } => Some(AgenOpKind::SymbolicVectorLoad),
             dfir_op::agen::Op::SymbolicVectorStore { .. } => Some(AgenOpKind::SymbolicVectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
@@ -719,7 +727,7 @@ impl AgenLoad {
 
     /// WHICH LOAD CLASS ONE STATEMENT IS, or `None` if it is not one of the five.
     ///
-    /// ⛔ TWO OF THE FIVE HAVE NO ISLAND OP YET (the indirect family), and
+    /// ⛔ TWO OF THE FIVE HAVE NO ISLAND OP YET (`indirect_vector_load` and the composite pair), and
     /// `agen.composite_load_and_store` is **not** `CompositeLoadOp` — the reference's `isa<>` list
     /// does not include it, so it answers `None` here too rather than borrowing the composite arm.
     #[must_use]
@@ -736,6 +744,7 @@ impl AgenLoad {
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
@@ -3608,6 +3617,369 @@ mod unit_tests {
         let unit = unit_holding(DfirUnit::Lxsu, Vec::new());
         lower_symbolic_vector_store_op(&unit, DfirUnit::Lxsu);
     }
+
+    // ─────────────────────────────── 214/384 ───────────────────────────────
+
+    /// 🎯 214/384 — THE NON-L3 BURST ARM HOISTS THE STRIDE **TWICE**, and L3 keeps the view's start.
+    #[test]
+    fn a_burst_hoists_two_stride_constants_and_l3_keeps_its_start() {
+        let mut values = Values::default();
+        let plain = set_immutable_addr_and_increments(
+            &mut values,
+            DfirUnit::Lxlu,
+            true,
+            StrideStep(8),
+            Elements(4),
+            Elements(64),
+            VIEW,
+        );
+        assert_eq!(plain.hoisted.len(), 2, "one constant per address");
+        assert_ne!(plain.immutable_addr, plain.increment);
+        assert_ne!(plain.immutable_addr, VIEW, "the view's start is replaced");
+        assert!(plain.hoisted.iter().all(|op| matches!(
+            op,
+            SenOp::Sentient(sen::Op::ScalarConstant { value: 8, .. })
+        )));
+
+        let l3 = set_immutable_addr_and_increments(
+            &mut values,
+            DfirUnit::L3su,
+            true,
+            StrideStep(8),
+            Elements(4),
+            Elements(64),
+            VIEW,
+        );
+        assert_eq!(l3.immutable_addr, VIEW, "L3 reads the view's own start");
+        assert!(matches!(
+            l3.hoisted.as_slice(),
+            [SenOp::Sentient(sen::Op::ScalarConstant { value: 256, .. })]
+        ));
+    }
+
+    // ─────────────────────────────── 215/384 ───────────────────────────────
+
+    /// 🎯 215/384 — A 2-BYTE RECEIVE MASKS, A FULL STICK ONLY REWRITES THE COUNT, AND A NON-LX HALF
+    /// WRITES NOTHING.
+    #[test]
+    fn a_two_byte_receive_masks_and_a_full_stick_only_rewrites_the_count() {
+        let eight_bit = NonZeroU32::new(8).expect("8 bits");
+        let receiving = |val: Val, ty: Vector| {
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: val,
+                from: Link::<LxluUnit, L0suUnit>::between(LXLU, L0SU).ends().1,
+                ty,
+            })
+        };
+
+        let narrow = receiving(
+            Val(60),
+            Vector {
+                len: 1,
+                elem: ElemType::Int(16),
+            },
+        );
+        assert_eq!(
+            setsttype::<Dd2>(GenericComp::Lxsu, &narrow, eight_bit),
+            StType::NonDefault {
+                shuffle_mode: sen::ShuffleMode::Masked2B,
+                total_elements: Elements(128),
+            }
+        );
+        assert_eq!(
+            setsttype::<Dd2>(GenericComp::Lxlu, &receiving(Val(61), LANES), eight_bit),
+            StType::FullStick {
+                total_elements: Elements(128),
+            },
+            "128 bytes sets no shuffle_mode"
+        );
+        assert_eq!(
+            setsttype::<Dd2>(GenericComp::L0su, &narrow, eight_bit),
+            StType::Default,
+            "non-default sttypes are LX-only"
+        );
+    }
+
+    // ─────────────────────────────── 216/384 ───────────────────────────────
+
+    /// 🎯 216/384 — THE VENDOR'S INDIRECT-VIEW PATTERN, whose scatter is the view's second user.
+    ///
+    /// `%13 = get_unit {type = "lxvirtualibr"}`, `%23 = get_logical_memory_view %13, %3` with `%3 = 0`,
+    /// then a `vector_store` of a receive into it and an `indirect_vector_store` off it
+    /// (`lx_indirect_loads_stores_composite.mlir:30-40`).
+    #[test]
+    fn the_vendors_indirect_view_pattern_builds_the_extract_and_pairs_it() {
+        let ibr_ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(8),
+        };
+        let body = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(71),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::LxVirtualIbr,
+                num_folds: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(72),
+                value: 0,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(70),
+                from: Val(71),
+                start: Val(72),
+                layout: identity_1d(),
+                ty: ibr_ty.clone(),
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(74),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lxlu,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(73),
+                from: Link::<LxluUnit, L0suUnit>::between(Val(74), L0SU).ends().1,
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                value: Val(73),
+                view: Val(70),
+                indices: vec![Index::Const(0)],
+                view_ty: ibr_ty.clone(),
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::IndirectVectorStore {
+                value: Val(76),
+                indirect_view: Val(70),
+                indirect_indices: vec![Index::Const(0)],
+                indirect_view_ty: ibr_ty,
+                direct_view: VIEW,
+                direct_indices: indices(Val(77)),
+                direct_view_ty: view_ty(),
+                multicast_info: None,
+                ty: LANES,
+            }),
+        ];
+
+        let store = ExtractVectorStore::of(&body[5]).expect("an agen.vector_store");
+        let mut values = Values::default();
+        let mut extract_ops = ExtractScalarOps::default();
+        let outcome =
+            construct_receive_and_extract_scalar_op(store, &body, &mut values, &mut extract_ops);
+
+        let ReceiveAndExtractScalar::Constructed(built) = outcome else {
+            panic!("the vendor's own pattern must be admissible, got {outcome:?}");
+        };
+        assert!(matches!(
+            built.zero,
+            SenOp::Sentient(sen::Op::ScalarConstant { value: 0, .. })
+        ));
+        assert_eq!(
+            built.extract,
+            SenOp::Sentient(sen::Op::ReceiveAndExtractScalar {
+                unit: Link::<LxluUnit, L0suUnit>::between(Val(74), L0SU).ends().1,
+                position: Val(0),
+                result: Val(1),
+                reg: sen::Reg {
+                    locale: sen::RegType::Unknown,
+                    index: None,
+                },
+                dbg_name: None,
+            })
+        );
+        assert_eq!(built.paired.data(), Val(1), "the extract's own result");
+        assert_eq!(
+            built.paired.kind(),
+            ExtractScalarKind::ReceiveAndExtractScalar
+        );
+        assert_eq!(built.indirect_store, &body[6], "the scatter it pairs with");
+        assert_eq!(
+            built.to_be_deleted,
+            [&body[5], &body[4]],
+            "the store then the receive"
+        );
+    }
+
+    // ─────────────────────────────── 217/384 ───────────────────────────────
+
+    /// 🎯 217/384 — TWO RECORDS THAT DISAGREE ON AN EXTENT REFUSE, and the reference's message names
+    /// exactly that.
+    #[test]
+    fn a_load_and_store_that_disagree_on_the_element_count_refuse() {
+        let op = agen::Op::VectorStore {
+            value: Val(80),
+            view: VIEW,
+            indices: indices(Val(81)),
+            view_ty: view_ty(),
+            ty: LANES,
+        };
+        let mut src = AccessDetailsAffine::new(&op, DfirUnit::Lxlu);
+        let mut dst = AccessDetailsAffine::new(&op, DfirUnit::Lxlu);
+        src.base.total_elements = Elements(128);
+        dst.base.total_elements = Elements(64);
+
+        let mut details = AccessContainer::<AccessDetailsAffine>::default();
+        details
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("empty")
+            .fill(src);
+        details
+            .vacancy(MemoryOperandIndex::DirDst)
+            .expect("empty")
+            .fill(dst);
+        let addrs = || {
+            let mut container = AccessContainer::<Val>::default();
+            container
+                .vacancy(MemoryOperandIndex::DirSrc)
+                .expect("empty")
+                .fill(Val(82));
+            container
+                .vacancy(MemoryOperandIndex::DirDst)
+                .expect("empty")
+                .fill(Val(83));
+            container
+        };
+
+        let store = DfirOp::Agen(op.clone());
+        let unit = unit_holding(DfirUnit::Lxlu, Vec::new());
+        assert_eq!(
+            lower_vector_load_helper::<Dd2, AccessDetailsAffine<'_>>(
+                &store,
+                Some(&store),
+                &unit,
+                &details,
+                &addrs(),
+                &addrs(),
+            ),
+            VectorLoadHelper::AccessDetailsDiffer
+        );
+    }
+
+    // ─────────────────────────────── 218/384 ───────────────────────────────
+
+    /// 🎯 218/384 — AN UNMASKED LXLU STICK BECOMES ONE `sentient.samv`, and the emptiness check is
+    /// carried beside it rather than gating it.
+    #[test]
+    fn an_unmasked_lxlu_stick_lowers_to_a_samv() {
+        let mask = SetTransferMaskState {
+            mask_value: Val(85),
+            num_slices: NonZeroU32::new(8).expect("8 slices"),
+            slice_mask_map: SliceMaskMap::Unmask,
+            ty: LANES,
+            dbg_name: None,
+        };
+        let lowered = lower_set_transfer_mask_state_op::<Dd2>(DfirUnit::Lxlu, &mask, false);
+        assert!(
+            matches!(lowered.samv, ActiveMaskValue::Samv(_)),
+            "got {:?}",
+            lowered.samv
+        );
+        assert!(!lowered.has_users);
+    }
+
+    // ─────────────────────────────── 219/384 ───────────────────────────────
+
+    /// 🎯 219/384 — THE REGION-KEY PATH PUTS THE `query_map` INSIDE THE REGION, YIELDS ITS RESULT, AND
+    /// HANDS BACK THE UNIFORMIZE OP'S OWN RESULT.
+    #[test]
+    fn a_region_argument_key_queries_inside_the_region_and_yields_its_result() {
+        let source = UniformizeSource {
+            kind: RegionOpKind::UniformizeRegions,
+            regions: vec![
+                vec![UnitOperand::Outside(LXLU)],
+                vec![UnitOperand::Outside(L0SU)],
+            ],
+        };
+        let def = StartAddrDef::InLoopQueryMap {
+            key: QueryKey::RegionArg {
+                source: &source,
+                region_idx: 0,
+            },
+            map: MapDef::Outside(Val(95)),
+        };
+
+        let mut values = Values::default();
+        let mut preceding: Vec<Uniformized> = Vec::new();
+        let outcome = clone_start_addr_outside_loop(&mut values, Val(96), &def, &mut preceding);
+
+        // The op's one `index` result is minted before its region arguments, and the query after both.
+        assert_eq!(
+            outcome,
+            ClonedStartAddr::InUniformizeRegion {
+                at: 0,
+                start_addr: Val(0),
+            }
+        );
+        let DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, results }) = &preceding[0].op
+        else {
+            panic!("entry 158 builds a uniformize_regions");
+        };
+        assert_eq!(results, &vec![Val(0)], "and that is what 219 returns");
+        assert_eq!(
+            regions[0].body,
+            vec![
+                DfirOp::Uniform(uniform::Op::QueryMap {
+                    result: Val(3),
+                    map: Val(95),
+                    key: regions[0].arg,
+                }),
+                DfirOp::Uniform(uniform::Op::Yield {
+                    operands: vec![Val(3)],
+                }),
+            ]
+        );
+        assert_eq!(
+            regions[1].body,
+            vec![DfirOp::Uniform(uniform::Op::Yield {
+                operands: vec![regions[1].arg],
+            })],
+            "the other region is untouched"
+        );
+    }
+
+    // ─────────────────────────────── 220/384 ───────────────────────────────
+
+    /// 🎯 220/384 — TWO `set_send_dst`s NAMING ONE NON-DEFAULT UNIT COLLAPSE TO ONE PAIR AT THE START.
+    #[test]
+    fn two_identical_non_default_set_send_dsts_collapse_to_one_pair() {
+        let to_l0su = Link::<LxluUnit, L0suUnit>::between(Val(99), Val(90))
+            .ends()
+            .0;
+        let get_unit = |result: Val| {
+            SenOp::Dataflow(dataflow::Op::GetUnit {
+                result,
+                residency: at_corelet_zero(),
+                unit: DfirUnit::L0su,
+                num_folds: None,
+            })
+        };
+        let mut body = vec![
+            get_unit(Val(90)),
+            SenOp::Sentient(sen::Op::SetSendDst { units: to_l0su }),
+            SenOp::Sentient(sen::Op::SetSendDst { units: to_l0su }),
+        ];
+
+        let mut values = Values::default();
+        assert_eq!(
+            cleanup_trivially_redundant_set_send_destination::<Dd2>(&mut values, &mut body),
+            SetSendDestinationCleanup::Replaced {
+                get_unit: Val(0),
+                erased: 2,
+            }
+        );
+        let mut replacement = to_l0su;
+        *replacement.val_mut() = Val(0);
+        assert_eq!(
+            body,
+            vec![
+                get_unit(Val(0)),
+                SenOp::Sentient(sen::Op::SetSendDst { units: replacement }),
+                get_unit(Val(90)),
+            ],
+            "the clone leads, and the original get_unit is left where it was"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -5377,16 +5749,882 @@ pub fn lower_symbolic_vector_store_op<A: Arch>(unit: &ProgramUnit<A>, comp: Dfir
     );
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 214/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The two addresses a transfer starts from, and the constants hoisted for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct AddressIncrements {
+    /// `immutable_addr` as the reference left it.
+    pub immutable_addr: Val,
+    /// `increment` as the reference left it.
+    pub increment: Val,
+    /// The `sentient.scalar_constant`s, in build order. ⭐ THEY GO BEFORE THE
+    /// `dataflow.program_unit`, which is the whole of the insertion-point save/restore (`:1593`).
+    pub hoisted: Vec<SenOp>,
+}
+
+/// One hoisted index constant, appended to `into`.
+fn hoisted_index_constant(values: &mut Values, into: &mut Vec<SenOp>, value: i64) -> Val {
+    let result = values.mint();
+    into.push(SenOp::Sentient(lower_constant_index_to_sentient(
+        result, value,
+    )));
+    result
+}
+
+/// Replaces: e214_setImmutableAddrAndIncrements
+///
+/// **214/384** `AgenToSentientLoweringPass::setImmutableAddrAndIncrements` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581` (43L).
+///
+/// ⛔ THE NON-L3 BURST ARM BUILDS **TWO SEPARATE CONSTANTS** OF THE SAME `stride_size`
+/// (`:1605-1613`), one per address — a single shared value is a different program.
+/// ⛔ AND L3 KEEPS THE VIEW'S START ADDRESS AS `immutable_addr` ON EVERY PATH (`:1587-1589`), so its
+/// burst arm hoists the increment alone and its no-burst arm hoists the zero alone.
+pub fn set_immutable_addr_and_increments(
+    values: &mut Values,
+    comp: DfirUnit,
+    perform_burst_or_groups: bool,
+    stride_size: StrideStep,
+    burst_size: Elements,
+    total_elements: Elements,
+    memory_start_addr: Val,
+) -> AddressIncrements {
+    let is_l3 = matches!(comp, DfirUnit::L3lu | DfirUnit::L3su);
+    let mut hoisted: Vec<SenOp> = Vec::new();
+    // `:1587-1589`.
+    let mut immutable_addr = memory_start_addr;
+    let increment;
+
+    if perform_burst_or_groups {
+        if is_l3 {
+            // `:1598-1602` — `total_elements * burst_size`, one constant.
+            let elements =
+                i64::try_from(total_elements.0.saturating_mul(burst_size.0)).unwrap_or(i64::MAX);
+            increment = hoisted_index_constant(values, &mut hoisted, elements);
+        } else {
+            // `:1604-1612`.
+            let stride = i64::from(stride_size.0);
+            immutable_addr = hoisted_index_constant(values, &mut hoisted, stride);
+            increment = hoisted_index_constant(values, &mut hoisted, stride);
+        }
+    } else {
+        // `:1618-1626` — no burst and no IL groups means a zero increment on every unit, and a zero
+        // immutable address on everything but L3.
+        if !is_l3 {
+            immutable_addr = hoisted_index_constant(values, &mut hoisted, 0);
+        }
+        increment = hoisted_index_constant(values, &mut hoisted, 0);
+    }
+
+    AddressIncrements {
+        immutable_addr,
+        increment,
+        hoisted,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 215/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE `sttype` `setsttype` WRITES — the store-side twin of [`LdType`], and it has one variant more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum StType {
+    /// `LogicalResult::success()` with nothing written: not an LX half, or a producer that is
+    /// neither a shuffle nor a receive.
+    Default,
+    /// The non-default `sttype`, and the FULL-STICK `total_elements` the reference rewrote to.
+    NonDefault {
+        /// What the `shuffle_mode` attribute becomes.
+        shuffle_mode: sen::ShuffleMode,
+        /// `total_elements = sysDef.bytesPerStick * 8 / element_width`.
+        total_elements: Elements,
+    },
+    /// ⭐ A 128-BYTE RECEIVE SETS **NO** `shuffle_mode` AND STILL REWRITES `total_elements`
+    /// (`:1766-1774`) — the one outcome [`LdType`] has no counterpart for.
+    FullStick {
+        /// The rewritten count.
+        total_elements: Elements,
+    },
+    /// `emitOpError("unsupported sttype")` — the shuffle arm (`:1747`) or the receive arm (`:1767`).
+    UnsupportedStType,
+}
+
+/// Replaces: e215_setsttype
+///
+/// **215/384** `AgenToSentientLoweringPass::setsttype` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731` (50L).
+///
+/// ⛔ THE SHUFFLE ARM REWRITES `total_elements` **BEFORE** IT CLASSIFIES (`:1741`) AND THE RECEIVE
+/// ARM **AFTER** (`:1773`) — so the shuffle's rejection clobbers the caller's variable and the
+/// receive's leaves it alone. Both are invisible: the caller stops either way.
+/// ⛔ AND BOTH SHUFFLE MASKS WANT `repetition == 1`, unlike [`setldtype`]'s 64 and 8.
+pub fn setsttype<A: Arch>(
+    comp: GenericComp,
+    producer_input: &DfirOp,
+    element_width: NonZeroU32,
+) -> StType {
+    // `:1737` — non-default sttypes currently supported for LX only.
+    if !matches!(comp, GenericComp::Lxlu | GenericComp::Lxsu) {
+        return StType::Default;
+    }
+
+    // `total_elements should reflect full stick. element_width is in bits.`
+    let full_stick = Elements(A::BYTES_PER_STICK.get() * 8 / u64::from(element_width.get()));
+
+    match producer_input {
+        // `:1741-1757`.
+        DfirOp::VectorChain(dfir_op::vectorchain::Op::Shuffle {
+            indices,
+            repetition,
+            input_ty,
+            ..
+        }) => {
+            if is_splat_from_first_elem(indices, *input_ty, Bytes(2)) && *repetition == 1 {
+                StType::NonDefault {
+                    shuffle_mode: sen::ShuffleMode::Masked2B,
+                    total_elements: full_stick,
+                }
+            } else if is_splat_from_first_elem(indices, *input_ty, Bytes(16)) && *repetition == 1 {
+                StType::NonDefault {
+                    shuffle_mode: sen::ShuffleMode::Masked16B,
+                    total_elements: full_stick,
+                }
+            } else {
+                StType::UnsupportedStType
+            }
+        }
+        // `:1758-1774` — the receive's own result type gives the byte count, and the reference's
+        // `isIntOrFloatType` check is unspellable: [`crate::islands::dataflow_ir::ty::ElemType`] has
+        // no other kind.
+        DfirOp::Dataflow(dataflow::Op::Receive { ty, .. }) => {
+            match u64::from(ty.elem.bits()) * ty.len / 8 {
+                2 => StType::NonDefault {
+                    shuffle_mode: sen::ShuffleMode::Masked2B,
+                    total_elements: full_stick,
+                },
+                16 => StType::NonDefault {
+                    shuffle_mode: sen::ShuffleMode::Masked16B,
+                    total_elements: full_stick,
+                },
+                128 => StType::FullStick {
+                    total_elements: full_stick,
+                },
+                _ => StType::UnsupportedStType,
+            }
+        }
+        // `:1776` — neither `dyn_cast` matched, and the reference returns success having written
+        // nothing.
+        _ => StType::Default,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 216/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE `agen.vector_store` THE EXTRACT PATTERN IS ANCHORED ON — `cast<VectorStoreOp>`'s fields, and
+/// the op itself for the delete list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractVectorStore<'a> {
+    /// The statement itself.
+    pub op: &'a DfirOp,
+    /// `getValueToStore()` — must come from a `dataflow.receive`.
+    pub value: Val,
+    /// `getMemRef()` — the indirect view.
+    pub view: Val,
+    /// `getMapOperands()`.
+    pub indices: &'a [Index],
+    /// The view's type.
+    pub view_ty: &'a MemRef,
+}
+
+impl<'a> ExtractVectorStore<'a> {
+    /// `dyn_cast<agen::VectorStoreOp>` — `None` for anything else.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<ExtractVectorStore<'a>> {
+        match op {
+            DfirOp::Agen(dfir_op::agen::Op::VectorStore {
+                value,
+                view,
+                indices,
+                view_ty,
+                ..
+            }) => Some(ExtractVectorStore {
+                op,
+                value: *value,
+                view: *view,
+                indices,
+                view_ty,
+            }),
+            DfirOp::Agen(
+                dfir_op::agen::Op::VectorLoad { .. }
+                | dfir_op::agen::Op::IndirectVectorStore { .. }
+                | dfir_op::agen::Op::SymbolicVectorLoad { .. }
+                | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
+                | dfir_op::agen::Op::SetTransferMaskState { .. }
+                | dfir_op::agen::Op::Yield,
+            )
+            | DfirOp::Arith(_)
+            | DfirOp::Scf(_)
+            | DfirOp::Affine(_)
+            | DfirOp::Dataflow(_)
+            | DfirOp::Vector(_)
+            | DfirOp::VectorChain(_)
+            | DfirOp::Uniform(_)
+            | DfirOp::Symbol(_) => None,
+        }
+    }
+}
+
+/// THE `sentient.receive_and_extract_scalar` PATTERN, BUILT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructedExtract<'a> {
+    /// The `position` operand's constant `0` (`:2547-2549`).
+    pub zero: SenOp,
+    /// The extract statement (`:2551-2553`).
+    pub extract: SenOp,
+    /// The `extract_idx` stamped on BOTH it and [`Self::indirect_store`] (`:2558-2560`) — the pairing
+    /// two `setAttr` calls made in the reference.
+    pub paired: ExtractScalarOp,
+    /// The scatter that pairing points at, so its lowering can find this extract.
+    pub indirect_store: &'a DfirOp,
+    /// `ops_to_be_deleted` — the store then the receive (`:2562-2563`).
+    pub to_be_deleted: [&'a DfirOp; 2],
+}
+
+/// THE OUTCOME OF [`construct_receive_and_extract_scalar_op`] — the pattern, or which check refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ReceiveAndExtractScalar<'a> {
+    /// Boxed: the built pattern is many words wide and the ten refusals are none.
+    Constructed(Box<ConstructedExtract<'a>>),
+    /// The stored-into view is not a `dataflow.get_logical_memory_view` — the reference's unguarded
+    /// `cast` (`:2486-2487`), which crashes there.
+    ViewIsNotALogicalMemoryView,
+    /// `emitError("indirect memory view does not match expected extract pattern")`.
+    ViewIsNotTheExtractPattern(IndirectMemViewCheck),
+    /// `emitError("invalid user of indirect memory view")`.
+    InvalidUserOfIndirectMemView,
+    /// `emitError("indirect memory view should have an IndirectVectorStoreOp/CompositeIndirectStoreOp
+    /// user")`.
+    NoIndirectStoreUser,
+    /// `emitError("indirect memory view should only have 2 users")`.
+    NotExactlyTwoUsers,
+    /// `emitError("store_op failed checks")`.
+    StoreOpFailedChecks(StoreFromExtractCheck),
+    /// `DT_CHECK_MSG(receive_op, "store op should operate on a receive op")`.
+    StoreDoesNotOperateOnAReceive,
+    /// `emitError("receive op should only be used by the store_op")`.
+    ReceiveHasOtherUsers,
+    /// `DT_CHECK_MSG(receive_from_unit, "from_unit of receiveOp should be GetUnitOp")`.
+    ReceiveFromUnitIsNotAGetUnit,
+    /// `emitError("from unit of receive op should be PE/PT/LXLU")`.
+    ReceiveFromUnitIsNotPeOrPtOrLxlu,
+}
+
+/// Replaces: e216_constructReceiveAndExtractScalarOp
+///
+/// **216/384** `AgenToSentientLoweringPass::constructReceiveAndExtractScalarOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471` (91L).
+///
+/// ⛔ THE USER COUNT IS CHECKED **AFTER** THE SCATTER IS FOUND (`:2506-2513`), so a view with one
+/// user and no scatter reports the missing scatter rather than the count.
+/// ⛔ AND THE `extract_idx` REPLACES BOTH `setAttr("extract_idx", ..)` CALLS AT ONCE: minting it here
+/// is what pairs this extract with that scatter, and no attribute survives to be read.
+pub fn construct_receive_and_extract_scalar_op<'a>(
+    store: ExtractVectorStore<'a>,
+    scope: &'a [DfirOp],
+    values: &mut Values,
+    extract_ops: &mut ExtractScalarOps,
+) -> ReceiveAndExtractScalar<'a> {
+    // `:2486-2487`.
+    let Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+        from,
+        start,
+        layout,
+        ..
+    })) = defining_op(store.view, scope)
+    else {
+        return ReceiveAndExtractScalar::ViewIsNotALogicalMemoryView;
+    };
+
+    // `:2489-2492`.
+    let check = check_indirect_mem_view_for_extract_op(&IndirectMemView::resolve(
+        scope, *from, *start, layout,
+    ));
+    if !check.admissible() {
+        return ReceiveAndExtractScalar::ViewIsNotTheExtractPattern(check);
+    }
+
+    // `:2496-2506`.
+    let mut ind_store_op: Option<&'a DfirOp> = None;
+    let mut num_users = 0_usize;
+    for user in uses(store.view, scope) {
+        num_users += 1;
+        match agen_op_kind(user) {
+            Some(AgenOpKind::IndirectVectorStore | AgenOpKind::CompositeIndirectStore) => {
+                ind_store_op = Some(user);
+            }
+            Some(AgenOpKind::VectorStore) => {}
+            _ => return ReceiveAndExtractScalar::InvalidUserOfIndirectMemView,
+        }
+    }
+    // `:2507-2513` — the scatter first, then the count.
+    let Some(indirect_store) = ind_store_op else {
+        return ReceiveAndExtractScalar::NoIndirectStoreUser;
+    };
+    if num_users != 2 {
+        return ReceiveAndExtractScalar::NotExactlyTwoUsers;
+    }
+
+    // `:2515-2516`.
+    let store_check = check_store_op_from_extract_pattern(store.indices, store.view_ty, scope);
+    if !store_check.admissible() {
+        return ReceiveAndExtractScalar::StoreOpFailedChecks(store_check);
+    }
+
+    // `:2520-2523`.
+    let Some(
+        receive_op @ DfirOp::Dataflow(dataflow::Op::Receive {
+            result: received,
+            from: receive_from,
+            ..
+        }),
+    ) = defining_op(store.value, scope)
+    else {
+        return ReceiveAndExtractScalar::StoreDoesNotOperateOnAReceive;
+    };
+    // `:2525-2527` — `hasOneUse`.
+    if uses(*received, scope).len() != 1 {
+        return ReceiveAndExtractScalar::ReceiveHasOtherUsers;
+    }
+
+    // `:2529-2540` — the unit the receive drains, by its GENERIC component.
+    let Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) =
+        defining_op(receive_from.val(), scope)
+    else {
+        return ReceiveAndExtractScalar::ReceiveFromUnitIsNotAGetUnit;
+    };
+    if !matches!(
+        unit.generic(),
+        GenericComp::Pe | GenericComp::Pt | GenericComp::Lxlu
+    ) {
+        return ReceiveAndExtractScalar::ReceiveFromUnitIsNotPeOrPtOrLxlu;
+    }
+
+    // `:2544-2560` — the zero, the extract, and the index that pairs it with the scatter. ⛔ NO
+    // `dbgName`: the island's `get_logical_memory_view` carries none for `getDbgNameAttr` to copy.
+    let position = values.mint();
+    let result = values.mint();
+    ReceiveAndExtractScalar::Constructed(Box::new(ConstructedExtract {
+        zero: SenOp::Sentient(lower_constant_index_to_sentient(position, 0)),
+        extract: SenOp::Sentient(sen::Op::ReceiveAndExtractScalar {
+            unit: *receive_from,
+            position,
+            result,
+            reg: sen::Reg {
+                locale: sen::RegType::Unknown,
+                index: None,
+            },
+            dbg_name: None,
+        }),
+        paired: extract_ops.mint(ExtractScalarResults::ReceiveAndExtractScalar { data: result }),
+        indirect_store,
+        to_be_deleted: [store.op, receive_op],
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 217/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE FOUR FIELDS A LOAD AND ITS STORE HAVE TO AGREE ON (`Helper.cpp:2925-2933`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferShape {
+    /// `getTotalElements()`.
+    pub total_elements: Elements,
+    /// `getElementWidth()`.
+    pub element_width: Bits,
+    /// `getChunkSize()`.
+    pub chunk_size: Elements,
+    /// `getChunkStride()`.
+    pub chunk_stride: Elements,
+}
+
+/// WHAT THE `AccessDetailsTy` TEMPLATE PARAMETER IS ASKED FOR — the four getters entry 217 reads,
+/// which is all three subclasses have in common here.
+pub trait HasTransferShape {
+    /// The four fields, as one comparable value.
+    fn transfer_shape(&self) -> TransferShape;
+}
+
+impl HasTransferShape for AccessDetailsAffine<'_> {
+    fn transfer_shape(&self) -> TransferShape {
+        TransferShape {
+            total_elements: self.base.total_elements,
+            element_width: self.base.element_width,
+            chunk_size: self.base.chunk_size,
+            chunk_stride: self.base.chunk_stride,
+        }
+    }
+}
+
+impl HasTransferShape for AccessDetailsAffineComposite<'_> {
+    fn transfer_shape(&self) -> TransferShape {
+        self.affine.transfer_shape()
+    }
+}
+
+impl HasTransferShape for AccessDetailsSymbolic<'_> {
+    fn transfer_shape(&self) -> TransferShape {
+        TransferShape {
+            total_elements: self.base.total_elements,
+            element_width: self.base.element_width,
+            chunk_size: self.base.chunk_size,
+            chunk_stride: self.base.chunk_stride,
+        }
+    }
+}
+
+/// THE OUTCOME OF [`lower_vector_load_helper`] — its three refusals. Every success path emits, and
+/// both emitters are unported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum VectorLoadHelper {
+    /// `DT_CHECK_MSG(.. == 1, "single access info needed")` — a load with no store came with more
+    /// than one record.
+    SingleAccessInfoNeeded,
+    /// `DT_CHECK_MSG(.. == 2, "double access info needed")`, and also the `get(kDirSrc)`/`get(kDirDst)`
+    /// that follows it: two records filed under the INDIRECT operands are the same malformed input.
+    DoubleAccessInfoNeeded,
+    /// `emitError("Access details of load and store operations are different")`.
+    AccessDetailsDiffer,
+}
+
+/// Replaces: e217_lowerVectorLoadHelper
+///
+/// **217/384** `AgenToSentientLoweringPass::lowerVectorLoadHelper` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899` (46L).
+///
+/// ⛔ THE `store_op` IS THE SWITCH, NOT AN EXTRA: absent, one record becomes a
+/// `sentient.load_and_send`; present, two records must AGREE on all four extents before they become
+/// one `sentient.load_and_store`.
+/// ⛔ THE DELETE LIST IS NOT A PARAMETER because the reference fills it only after the emission
+/// succeeded (`:2947-2950`), which is behind both `todo!`s.
+pub fn lower_vector_load_helper<A: Arch, T: HasTransferShape>(
+    load_op: &DfirOp,
+    store_op: Option<&DfirOp>,
+    unit: &ProgramUnit<A>,
+    access_details: &AccessContainer<T>,
+    mutable_addrs: &AccessContainer<Val>,
+    immutable_addrs: &AccessContainer<Val>,
+) -> VectorLoadHelper {
+    let Some(store_op) = store_op else {
+        // `:2906-2909`.
+        if access_details.entries().len() != 1
+            || mutable_addrs.entries().len() != 1
+            || immutable_addrs.entries().len() != 1
+        {
+            return VectorLoadHelper::SingleAccessInfoNeeded;
+        }
+        // `:2910-2918`.
+        todo!(
+            "e358_constructLoadAndSendStmt is unported, so {load_op:?} on {:?} cannot become a \
+             sentient.load_and_send",
+            unit.on.kind()
+        );
+    };
+
+    // `:2920-2923`.
+    if access_details.entries().len() != 2
+        || mutable_addrs.entries().len() != 2
+        || immutable_addrs.entries().len() != 2
+    {
+        return VectorLoadHelper::DoubleAccessInfoNeeded;
+    }
+    // `:2924-2939`.
+    let (Some(src), Some(dst)) = (
+        access_details.get(MemoryOperandIndex::DirSrc),
+        access_details.get(MemoryOperandIndex::DirDst),
+    ) else {
+        return VectorLoadHelper::DoubleAccessInfoNeeded;
+    };
+    if src.transfer_shape() != dst.transfer_shape() {
+        return VectorLoadHelper::AccessDetailsDiffer;
+    }
+
+    // `:2941-2946`.
+    todo!(
+        "e268_constructLoadAndStoreStmt is unported, so {load_op:?} and {store_op:?} on {:?} cannot \
+         become a sentient.load_and_store",
+        unit.on.kind()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 218/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT AN `agen.set_transfer_mask_state` BECOMES, and whether it was really dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct SetTransferMaskLowering {
+    /// The `sentient.samv` entry 157 built, or why it could not.
+    pub samv: ActiveMaskValue,
+    /// `DT_CHECK_MSG(mask_op.use_empty(), "SetTransferMaskStateOps should not have users")`.
+    pub has_users: bool,
+}
+
+/// Replaces: e218_lowerSetTransferMaskStateOp
+///
+/// **218/384** `AgenToSentientLoweringPass::lowerSetTransferMaskStateOp` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815` (9L).
+///
+/// ⛔ THE ORDER IS THE REFERENCE'S: the SAMV is built FIRST and the emptiness check comes AFTER
+/// (`:3821-3824`), so a masked op with users still produces its op before anything complains.
+/// ⛔ ITS `DT_CHECK_MSG(mask_op, "expecting a SetTransferMaskStateOp")` IS THE PARAMETER TYPE — a
+/// `dyn_cast_or_null` of the wrong op is not a call this signature accepts.
+pub fn lower_set_transfer_mask_state_op<A: Arch>(
+    unit: DfirUnit,
+    mask_op: &SetTransferMaskState,
+    has_users: bool,
+) -> SetTransferMaskLowering {
+    SetTransferMaskLowering {
+        // `:3820-3821` — *"Current support is only for SAMV."*
+        samv: construct_set_active_mask_value_op::<A>(unit, mask_op),
+        has_users,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 219/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHERE A `uniform.query_map`'s KEY COMES FROM (`:3961-3992`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryKey<'a> {
+    /// A region argument of a `uniformize_regions`/`equalize_pattern` that does NOT enclose the loop,
+    /// so a fresh uniformize op is built outside it (`:3966-3983`).
+    RegionArg {
+        /// The op the new one is rebuilt from, as entry 158 takes it.
+        source: &'a UniformizeSource<'a>,
+        /// `getRegionNumber()`.
+        region_idx: usize,
+    },
+    /// The program unit's own iter_arg — used as it stands (`:3984-3986`).
+    Enclosing(Val),
+    /// `emitError("unsupported key type")` (`:3988-3992`).
+    NotABlockArgument,
+}
+
+/// WHERE THE `def_immutable_mapping` BEHIND A `query_map`'s `map` OPERAND SITS (`:3994-3998`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapDef<'a> {
+    /// Already outside the loop — its result is read as it stands.
+    Outside(Val),
+    /// Inside the loop, so it is cloned out.
+    InsideLoop(&'a DfirOp),
+}
+
+/// WHERE THE VIEW'S START ADDRESS IS DEFINED, relative to the loop it is being lifted out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartAddrDef<'a> {
+    /// A block argument whose owner properly encloses the loop (`:3943-3947`).
+    EnclosingBlockArgument,
+    /// Defined by an op already outside the loop (`:4019-4021`).
+    Outside,
+    /// An `arith.constant` inside the loop (`:3953-3954`).
+    InLoopConstant(&'a DfirOp),
+    /// A `uniform.query_map` inside the loop, whose key and map are placed separately.
+    InLoopQueryMap {
+        /// `getKey()`.
+        key: QueryKey<'a>,
+        /// `getMap()`.
+        map: MapDef<'a>,
+    },
+    /// Anything else inside the loop (`:4013-4017`).
+    InLoopOther,
+}
+
+/// THE OUTCOME OF [`clone_start_addr_outside_loop`] — the address to read, and where its clones went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ClonedStartAddr {
+    /// Usable where it is; nothing was cloned.
+    AsItStands(Val),
+    /// The ops to place before the loop, and the address to read.
+    Hoisted {
+        /// In build order.
+        ops: Vec<DfirOp>,
+        /// The value the transfer's start address becomes.
+        start_addr: Val,
+    },
+    /// The clones went INSIDE region `at` of a preceding `uniform.uniformize_regions`.
+    InUniformizeRegion {
+        /// Its position among the ops preceding the loop.
+        at: usize,
+        /// ⛔ THE UNIFORMIZE OP'S OWN RESULT, not the `query_map`'s (`:4011`).
+        start_addr: Val,
+    },
+    /// `emitError("unsupported key type")`.
+    UnsupportedKeyType,
+    /// `emitOpError("unsupported operation for start address.")`.
+    UnsupportedOperation,
+    /// Entry 158 found nothing `"active"` before the loop.
+    NoActiveUniformizeOp,
+}
+
+/// The mapping clone, if any, and the new `uniform.query_map` (`:3994-4004`).
+fn query_map_ops(values: &mut Values, map: &MapDef<'_>, key: Val) -> (Vec<DfirOp>, Val) {
+    let mut ops: Vec<DfirOp> = Vec::new();
+    let map = match map {
+        MapDef::Outside(map) => *map,
+        MapDef::InsideLoop(def) => {
+            let clone = values.clone_without_regions(def, &mut ValueMapping::new());
+            let cloned = results(&clone).first().copied().unwrap_or(key);
+            ops.push(clone);
+            cloned
+        }
+    };
+    let result = values.mint();
+    ops.push(DfirOp::Uniform(dfir_op::uniform::Op::QueryMap {
+        result,
+        map,
+        key,
+    }));
+    (ops, result)
+}
+
+/// Replaces: e219_cloneStartAddrOutsideLoop
+///
+/// **219/384** `AgenToSentientLoweringPass::cloneStartAddrOutsideLoop` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942` (79L).
+///
+/// ⛔⛔ THE UNIFORMIZE PATH PLACES THE CLONES **INSIDE** REGION `region_idx` AND HANDS BACK THE
+/// UNIFORMIZE OP'S OWN RESULT (`:4006-4012`) — the region's `uniform.yield` carries the
+/// `query_map`'s result out, and a caller reading the `query_map` directly would read a value
+/// defined inside a region it does not enter.
+/// ⛔ THE ENCLOSING-KEY PATH BUILDS NO UNIFORMIZE OP AT ALL, so the same `query_map` is simply
+/// hoisted (`:3984-3986`).
+pub fn clone_start_addr_outside_loop(
+    values: &mut Values,
+    start_addr: Val,
+    def: &StartAddrDef<'_>,
+    preceding: &mut Vec<Uniformized>,
+) -> ClonedStartAddr {
+    match def {
+        // `:3943-3947` and `:4019-4021`.
+        StartAddrDef::EnclosingBlockArgument | StartAddrDef::Outside => {
+            ClonedStartAddr::AsItStands(start_addr)
+        }
+        // `:3953-3954`.
+        StartAddrDef::InLoopConstant(constant) => {
+            let clone = values.clone_without_regions(constant, &mut ValueMapping::new());
+            let cloned = results(&clone).first().copied().unwrap_or(start_addr);
+            ClonedStartAddr::Hoisted {
+                ops: vec![clone],
+                start_addr: cloned,
+            }
+        }
+        StartAddrDef::InLoopQueryMap { key, map } => match key {
+            QueryKey::NotABlockArgument => ClonedStartAddr::UnsupportedKeyType,
+            QueryKey::Enclosing(key) => {
+                let (ops, start_addr) = query_map_ops(values, map, *key);
+                ClonedStartAddr::Hoisted { ops, start_addr }
+            }
+            QueryKey::RegionArg { source, region_idx } => {
+                // `:3971-3974`.
+                let at = match create_uniformize_regions_op(
+                    values,
+                    source,
+                    *region_idx,
+                    preceding.as_mut_slice(),
+                ) {
+                    CreatedUniformize::NoActiveOp => {
+                        return ClonedStartAddr::NoActiveUniformizeOp;
+                    }
+                    CreatedUniformize::Created(created) => {
+                        preceding.push(*created);
+                        preceding.len() - 1
+                    }
+                    CreatedUniformize::Existing(at) => at,
+                };
+                let DfirOp::Uniform(dfir_op::uniform::Op::UniformizeRegions {
+                    regions,
+                    results: op_results,
+                }) = &mut preceding[at].op
+                else {
+                    return ClonedStartAddr::UnsupportedKeyType;
+                };
+                let Some(region) = regions.get_mut(*region_idx) else {
+                    return ClonedStartAddr::UnsupportedKeyType;
+                };
+                // `:3975-3983` — the key is that region's argument, and the insertion point is the
+                // start of its block.
+                let (ops, query_result) = query_map_ops(values, map, region.arg);
+                region.body.splice(0..0, ops);
+                // `:4006-4011`.
+                if let Some(DfirOp::Uniform(dfir_op::uniform::Op::Yield { operands })) =
+                    region.body.last_mut()
+                {
+                    *operands = vec![query_result];
+                }
+                ClonedStartAddr::InUniformizeRegion {
+                    at,
+                    start_addr: op_results.first().copied().unwrap_or(query_result),
+                }
+            }
+        },
+        // `:4013-4017`.
+        StartAddrDef::InLoopOther => ClonedStartAddr::UnsupportedOperation,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 220/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`cleanup_trivially_redundant_set_send_destination`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum SetSendDestinationCleanup {
+    /// `getArch() < RCUDD1A_ISA` — none is generated at this level, so none is removed (`:4086-4088`).
+    NoSetDstMaskAtThisArchLevel,
+    /// The unit has none (`:4098-4099`).
+    Nothing,
+    /// The first one's `$units` is not defined by a `dataflow.get_unit` (`:4101-4103`).
+    LeadIsNotAGetUnit,
+    /// They do not all name the same unit, so ⛔ NOTHING IS TOUCHED — the erasure is INSIDE the
+    /// `llvm::all_of` block (`:4109-4120`).
+    UnitsDiffer,
+    /// They all set the default `sfp`, so every one is erased and none replaces them (`:4111-4113`).
+    ErasedAll {
+        /// How many went.
+        erased: usize,
+    },
+    /// All erased, and one `get_unit` + `set_send_dst` inserted at the START of the unit.
+    Replaced {
+        /// The cloned `dataflow.get_unit`'s result.
+        get_unit: Val,
+        /// How many went.
+        erased: usize,
+    },
+}
+
+/// Every `sentient.set_send_dst`'s `$units`, in walk order (`:4092-4095`).
+fn collect_set_send_dsts(body: &[SenOp], into: &mut Vec<SendEnd>) {
+    for op in body {
+        let SenOp::Sentient(inner) = op else { continue };
+        if let sen::Op::SetSendDst { units } = inner {
+            into.push(*units);
+        }
+        for region in sen::regions(inner) {
+            collect_set_send_dsts(region, into);
+        }
+    }
+}
+
+/// `for (auto op : set_send_dst_ops) op.erase();` (`:4120`).
+fn erase_set_send_dsts(body: &mut Vec<SenOp>) {
+    body.retain(|op| !matches!(op, SenOp::Sentient(sen::Op::SetSendDst { .. })));
+    for op in body.iter_mut() {
+        let SenOp::Sentient(inner) = op else { continue };
+        for region in sen::regions_mut(inner) {
+            erase_set_send_dsts(region);
+        }
+    }
+}
+
+/// The `dataflow.get_unit` behind one `$units`, as the three things `getAttrs()` compares — the
+/// `result` is the op's BINDING and not an attribute, so it is excluded.
+fn get_unit_attrs(end: SendEnd, body: &[SenOp]) -> Option<(Residency, DfirUnit, Option<NumFolds>)> {
+    match sen_defining_op(end.val(), body) {
+        Some(SenOp::Dataflow(dataflow::Op::GetUnit {
+            residency,
+            unit,
+            num_folds,
+            ..
+        })) => Some((*residency, *unit, *num_folds)),
+        _ => None,
+    }
+}
+
+/// Replaces: e220_cleanupTriviallyRedundantSetSendDestination
+///
+/// **220/384** `AgenToSentientLoweringPass::cleanupTriviallyRedundantSetSendDestination` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084` (38L).
+///
+/// ⛔⛔ WHEN THEY ALL NAME `sfp` IT ERASES EVERY ONE AND EMITS NOTHING (`:4111-4113`) — the default
+/// destination needs no `setdstmask` at all, so the pass's output for the common case is the
+/// ABSENCE of the op.
+/// ⛔ AND THE COMPARISON IS THE SPELLED UNIT, not its generic component: `getType() != "sfp"` reads
+/// the `type=` attribute the clone carries.
+pub fn cleanup_trivially_redundant_set_send_destination<A: Arch>(
+    values: &mut Values,
+    body: &mut Vec<SenOp>,
+) -> SetSendDestinationCleanup {
+    // `:4086-4088`.
+    if !supports_set_dst_mask(A::GEN) {
+        return SetSendDestinationCleanup::NoSetDstMaskAtThisArchLevel;
+    }
+
+    // `:4092-4099`.
+    let mut ends: Vec<SendEnd> = Vec::new();
+    collect_set_send_dsts(body, &mut ends);
+    let Some(&lead) = ends.first() else {
+        return SetSendDestinationCleanup::Nothing;
+    };
+
+    // `:4100-4103`.
+    let Some(lead_attrs) = get_unit_attrs(lead, body) else {
+        return SetSendDestinationCleanup::LeadIsNotAGetUnit;
+    };
+    // `:4104-4110`.
+    if !ends
+        .iter()
+        .all(|end| get_unit_attrs(*end, body) == Some(lead_attrs))
+    {
+        return SetSendDestinationCleanup::UnitsDiffer;
+    }
+
+    let erased = ends.len();
+    let (residency, unit, num_folds) = lead_attrs;
+    // `:4111-4113`.
+    if unit == DfirUnit::Sfp {
+        erase_set_send_dsts(body);
+        return SetSendDestinationCleanup::ErasedAll { erased };
+    }
+
+    // `:4114-4120` — the clone, then its `set_send_dst`, then the originals go. ⭐ THE END IS
+    // RENUMBERED ONTO THE CLONE rather than minted: the wire it names is the same one.
+    erase_set_send_dsts(body);
+    let get_unit = values.mint();
+    let mut units = lead;
+    *units.val_mut() = get_unit;
+    body.insert(0, SenOp::Sentient(sen::Op::SetSendDst { units }));
+    body.insert(
+        0,
+        SenOp::Dataflow(dataflow::Op::GetUnit {
+            result: get_unit,
+            residency,
+            unit,
+            num_folds,
+        }),
+    );
+    SetSendDestinationCleanup::Replaced { get_unit, erased }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e214_setImmutableAddrAndIncrements
-// crustify:todo: e215_setsttype
-// crustify:todo: e216_constructReceiveAndExtractScalarOp
-// crustify:todo: e217_lowerVectorLoadHelper
-// crustify:todo: e218_lowerSetTransferMaskStateOp
-// crustify:todo: e219_cloneStartAddrOutsideLoop
-// crustify:todo: e220_cleanupTriviallyRedundantSetSendDestination
 // crustify:todo: e267_constructTimeLoopsAndVectorOperations
 // crustify:todo: e268_constructLoadAndStoreStmt
 // crustify:todo: e269_constructLoadAndExtractScalarOp

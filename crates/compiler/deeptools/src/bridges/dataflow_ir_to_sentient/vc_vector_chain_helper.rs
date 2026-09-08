@@ -385,6 +385,7 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         DfirOp::Agen(
             dfir_op::agen::Op::SymbolicVectorLoad { .. }
             | dfir_op::agen::Op::SymbolicVectorStore { .. }
+            | dfir_op::agen::Op::IndirectVectorStore { .. }
             | dfir_op::agen::Op::CompositeLoadAndStore(_)
             // ⛔ AND THE MASK STATE IS NOT ON IT EITHER, THOUGH IT DOES BIND A VECTOR: the chain
             // names the two accesses only, so a mask state aborts exactly as a symbolic one does.

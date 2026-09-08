@@ -183,6 +183,39 @@ pub enum Op {
         /// The vector's type.
         ty: Vector,
     },
+    /// `agen.indirect_vector_store %value, %indirect_view[..], %direct_view[..] {store_order,
+    /// store_set} : memref<..>, memref<..>, vector<..>` — A SCATTER: the address written is the one
+    /// the INDIRECT view holds, applied to the DIRECT view being written.
+    ///
+    /// ⛔⛔ TWO DEREFERENCED MEMREFS, AND THE REFERENCE SAYS SO ITSELF (`Agen.td:911-922`): that is
+    /// why it cannot carry `AffineMapAccessInterface`. Every consumer that reads "the" view of an
+    /// access reads the DIRECT one — `AccessDetailsAffine::initialize` takes `getDirectMemref()` and
+    /// `getDirectMapIndices()` (`AccessDetails.cpp:332-342`).
+    /// ⭐ THE INDIRECT VIEW IS A VIRTUAL IBR SHARED WITH AN `agen.vector_store` THAT WRITES THE INDEX
+    /// INTO IT. That two-user pair is the extract pattern `constructReceiveAndExtractScalarOp`
+    /// matches (`Helper.cpp:2471-2512`), and it is why this op is in the island: without it the
+    /// pattern has no second user to find.
+    IndirectVectorStore {
+        /// `$value` — the vector stored.
+        value: Val,
+        /// `$indirect_memref` — the view the address is READ from.
+        indirect_view: Val,
+        /// `$indirect_map_indices`.
+        indirect_indices: Vec<Index>,
+        /// The indirect view's type.
+        indirect_view_ty: MemRef,
+        /// `$direct_memref` — the view WRITTEN, and the one every access record reads.
+        direct_view: Val,
+        /// `$direct_map_indices`.
+        direct_indices: Vec<Index>,
+        /// The direct view's type.
+        direct_view_ty: MemRef,
+        /// `$multicast_info` — optional (`Agen.td:934`), and nothing in this island fills it yet.
+        multicast_info: Option<Val>,
+        /// The vector's type.
+        ty: Vector,
+    },
+
     /// `agen.symbolic_vector_load %view[indices:(..), strides:(..)] {load_order, load_set} :
     /// memref<..>, vector<..>`.
     ///
@@ -386,6 +419,39 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::integer_set(&access_set(view_ty, ty.len)),
                 print::memref(view_ty),
                 print::vector(*ty)
+            );
+        }
+        // ⭐ THE ORDER AND SET ARE OVER THE **DIRECT** VIEW, and `indirect_map`/`direct_map` are
+        // elided from the dict (`Agen.cpp:2198-2201`), which is why only two attributes print.
+        Op::IndirectVectorStore {
+            value,
+            indirect_view,
+            indirect_indices,
+            indirect_view_ty,
+            direct_view,
+            direct_indices,
+            direct_view_ty,
+            multicast_info,
+            ty,
+        } => {
+            let _ = writeln!(
+                out,
+                "agen.indirect_vector_store {} indirect:{}[{}] direct:{}[{}]{} {{store_order = {}, \
+                 store_set = {}}} : {}, {}, {}",
+                print::val(*value),
+                print::val(*indirect_view),
+                print::index_list(indirect_indices),
+                print::val(*direct_view),
+                print::index_list(direct_indices),
+                multicast_info.map_or(String::new(), |group| format!(
+                    " multicast_info = {}",
+                    print::val(group)
+                )),
+                print::affine_map(&access_order(direct_view_ty.shape.len())),
+                print::integer_set(&access_set(direct_view_ty, ty.len)),
+                print::vector(*ty),
+                print::memref(indirect_view_ty),
+                print::memref(direct_view_ty)
             );
         }
         Op::SymbolicVectorLoad {

@@ -937,7 +937,7 @@ most likely to get wrong, since every other arch level emits the one survivor.
 
 ## Progress
 
-`233/384 ported; 233/384 audited`
+`241/384 ported; 241/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -1953,6 +1953,85 @@ index` for entry 163's all-lanes-live set is the vendor's own expectation
 (`dcc/test/Conversion/VectorChainToSentientPESFP/fnms_with_cast.mlir:11`); the shape mirrors
 `vc_helper::MaskValue::Constant`, the PT side of the same question.
 
+⭐ ENTRIES 214-221 — THE ADDRESS PAIR, THE STORE-SIDE `sttype`, THE RECEIVE-EXTRACT PATTERN, THE
+LOAD/STORE ARITY GATE, THE MASK-STATE LOWERING, THE START-ADDRESS HOIST AND THE TWO ONE-LINERS. All
+seven of the `agen_helper.rs` units are in, and 221 (`dfs_dataflow_to_sentient.rs`) was already
+written and is now audited.
+
+⛔ 214 HOISTS THE STRIDE **TWICE** ON EVERY NON-L3 BURST (`Helper.cpp:1604-1612`): one
+`sentient.scalar_constant` for `immutable_addr` and a second, identical one for `increment`. L3 instead
+keeps the memory view's own start address as `immutable_addr` on all four paths (`:1587-1589`) and its
+burst arm hoists `total_elements * burst_size` alone. The `saveInsertionPoint`/`setInsertionPoint(unit_op)`
+pair is the whole reason `AddressIncrements::hoisted` is a list the caller places BEFORE the
+`dataflow.program_unit` rather than ops appended in line.
+
+⛔ 215's TWO ARMS REWRITE `total_elements` ON OPPOSITE SIDES OF THE CLASSIFICATION. The shuffle arm
+writes it first (`:1741`) and can then refuse, clobbering the caller's variable; the receive arm writes
+it last (`:1773`), so its refusal leaves it alone. Both are invisible because the caller stops either
+way, and the outcome enum carries the count only on the paths that set it. `StType::FullStick` is the
+variant `LdType` has no twin for: a 128-byte receive sets NO `shuffle_mode` and still rewrites the
+count (`:1766-1774`). Both shuffle masks want `repetition == 1`, unlike `setldtype`'s 64 and 8.
+
+⛔⛔ THE ISLAND GREW `agen.indirect_vector_store` FOR 216 (AGENT-BRIEF.md:87). Without it
+`agen_op_kind` could never answer `IndirectVectorStore`, the scatter search at `:2496-2506` would
+have no input and the whole unit would be dead code. The variant is region-free, mirroring
+`Agen.td:911-942`: `value`, `indirect_view`/`indirect_indices`/`indirect_view_ty`,
+`direct_view`/`direct_indices`/`direct_view_ty` and `multicast_info`, with `indirect_map`/`direct_map`
+elided from the printed dict and `store_order`/`store_set` derived over the **direct** view
+(`Agen.cpp:2180-2211`, reproduced against `lx_indirect_loads_stores_rt.mlir:476`). Its sibling
+`CompositeIndirectStoreOp` is deliberately NOT added — it is region-bearing and belongs with entries
+330-334 — and because `agen_op_kind` is total with no wildcard, that arm becomes correct the moment the
+composite lands. Declaring the op forced an answer out of nine further total matches, each taken from
+the reference: `operands`/`parts_mut`/`vals_mut` read the six operand groups in the builder's order
+(`Agen.td:929-935`); `results` count 2 alongside `SymbolicVectorStore`; `is_data_transfer` and
+`is_candidate` TRUE; `AgenLoad::of` and `VectorStoreOp::of` None (it is neither);
+`constructChunkAndShuffleInfo`'s user walk gathers nothing from it; `AccessDetailsAffine::initialize`
+grew a THIRD arm reading `direct_view`/`direct_view_ty`/`direct_indices` (`AccessDetails.cpp:332-342`);
+`TpmvManager` and the loop legalizer leave it alone; and `agen_agen_to_sentient`'s dispatch gained a
+seventh row whose `todo!` names `e317_lowerIndirectVectorStoreOp` (`AgenToSentient.cpp:116-122`), which
+owns the lowering.
+
+⛔ 216 CHECKS THE USER COUNT **AFTER** IT HAS FOUND THE SCATTER (`:2506-2513`), so a view with one user
+and no scatter reports the missing scatter rather than the count. And the `extract_idx` is not an
+attribute that survives: minting one through `ExtractScalarOps` IS the pairing the reference's two
+`setAttr` calls made, and `ConstructedExtract` carries the scatter it pairs with.
+
+⛔ 217's `store_op` IS THE SWITCH, NOT AN EXTRA. Absent, one record becomes a `sentient.load_and_send`;
+present, two records must agree on `total_elements`, `element_width`, `chunk_size` and `chunk_stride`
+before becoming one `sentient.load_and_store`. `HasTransferShape` is exactly the four getters the
+`AccessDetailsTy` template parameter is asked for, implemented for all three subclasses, and
+`TransferShape`'s derived `PartialEq` is the reference's four-way `&&`. Both emitters are unported, so
+the two success paths are `todo!`s naming `e358_constructLoadAndSendStmt` and
+`e268_constructLoadAndStoreStmt`; the delete list is therefore not a parameter, since the reference
+fills it only after the emission succeeded.
+
+⛔ 218 BUILDS THE SAMV **BEFORE** IT CHECKS `use_empty()` (`:3821-3824`), so a masked op with users
+still produces its op before anything complains — `SetTransferMaskLowering` carries both. Its
+`DT_CHECK_MSG(mask_op, ..)` is the parameter type: a `dyn_cast_or_null` of the wrong op is not a call
+this signature accepts.
+
+⛔⛔ 219's UNIFORMIZE PATH PLACES THE CLONES **INSIDE** REGION `region_idx` AND HANDS BACK THE
+UNIFORMIZE OP'S OWN RESULT (`:4006-4012`). The region's `uniform.yield` is rewritten to carry the new
+`uniform.query_map`'s result out, and a caller reading the `query_map` directly would be reading a value
+defined inside a region it does not enter — which is why `ClonedStartAddr::InUniformizeRegion` names the
+position among the preceding ops and the op's result rather than the query's. The enclosing-key path
+(`:3984-3986`) builds no uniformize op at all and simply hoists the same pair before the loop, and the
+`arith.constant` path hoists one clone. `StartAddrDef` is how the reference's four `isProperAncestor`
+questions are asked without a parent pointer, and `QueryKey::NotABlockArgument` is its
+`"unsupported key type"`.
+
+⛔⛔ 220 ERASES EVERY `set_send_dst` AND EMITS NOTHING WHEN THEY ALL NAME `sfp` (`:4111-4113`): the
+default destination needs no `setdstmask`, so the pass's output for the common case is the ABSENCE of
+the op. The comparison is the spelled unit and not its generic component — `getType() != "sfp"` reads
+the `type=` attribute the clone carries. When they name a non-default unit, the erasure and the
+replacement are both INSIDE the `llvm::all_of` block, so units that disagree leave the body untouched;
+`get_unit_attrs` compares `residency`/`unit`/`num_folds` because `result` is a binding rather than an
+attribute, and the replacement end is RENUMBERED onto the clone rather than minted, since the wire it
+names is the same one. The `getArch() < RCUDD1A_ISA` early return stays as
+`SetSendDestinationCleanup::NoSetDstMaskAtThisArchLevel` and is vacuous: `IsaGen` has no lower
+generation.
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -2387,22 +2466,22 @@ index` for entry 163's all-lanes-live set is the vendor's own expectation
 - [x] **AUDIT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, line by line against the C++
 - [x] **PORT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, 16 lines
 - [x] **AUDIT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, line by line against the C++
-- [ ] **PORT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
-- [ ] **AUDIT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
-- [ ] **PORT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, 50 lines
-- [ ] **AUDIT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, line by line against the C++
-- [ ] **PORT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, 91 lines
-- [ ] **AUDIT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, line by line against the C++
-- [ ] **PORT 217/384** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, 46 lines
-- [ ] **AUDIT 217/384** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, line by line against the C++
-- [ ] **PORT 218/384** `lowerSetTransferMaskStateOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815`, 9 lines
-- [ ] **AUDIT 218/384** `lowerSetTransferMaskStateOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815`, line by line against the C++
-- [ ] **PORT 219/384** `cloneStartAddrOutsideLoop` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942`, 79 lines
-- [ ] **AUDIT 219/384** `cloneStartAddrOutsideLoop` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942`, line by line against the C++
-- [ ] **PORT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, 38 lines
-- [ ] **AUDIT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, line by line against the C++
-- [ ] **PORT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, 5 lines
-- [ ] **AUDIT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, line by line against the C++
+- [x] **PORT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
+- [x] **AUDIT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
+- [x] **PORT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, 50 lines
+- [x] **AUDIT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, line by line against the C++
+- [x] **PORT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, 91 lines
+- [x] **AUDIT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, line by line against the C++
+- [x] **PORT 217/384** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, 46 lines
+- [x] **AUDIT 217/384** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, line by line against the C++
+- [x] **PORT 218/384** `lowerSetTransferMaskStateOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815`, 9 lines
+- [x] **AUDIT 218/384** `lowerSetTransferMaskStateOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815`, line by line against the C++
+- [x] **PORT 219/384** `cloneStartAddrOutsideLoop` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942`, 79 lines
+- [x] **AUDIT 219/384** `cloneStartAddrOutsideLoop` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942`, line by line against the C++
+- [x] **PORT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, 38 lines
+- [x] **AUDIT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, line by line against the C++
+- [x] **PORT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, 5 lines
+- [x] **AUDIT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, line by line against the C++
 - [x] **PORT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, 18 lines
 - [x] **AUDIT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, line by line against the C++
 - [x] **PORT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, 57 lines

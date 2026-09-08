@@ -1191,6 +1191,19 @@ mod unit_tests {
             ]
         );
     }
+
+    /// 🎯 221/384 — THE LIST IS A SET, AND IT KEEPS INSERTION ORDER.
+    ///
+    /// ⛔ THE DUPLICATE IS THE WHOLE FUNCTION. Its callers push the same consumer once per sync pair
+    /// they walk, and a list naming `lxlu0` twice emits the sync to it twice.
+    #[test]
+    fn a_consumer_is_appended_once_and_in_order() {
+        let mut list = Vec::new();
+        push_back_the_unit_to_list_if_doesnot_exist(sen::Consumer::Lxlu0, &mut list);
+        push_back_the_unit_to_list_if_doesnot_exist(sen::Consumer::Sfp, &mut list);
+        push_back_the_unit_to_list_if_doesnot_exist(sen::Consumer::Lxlu0, &mut list);
+        assert_eq!(list, vec![sen::Consumer::Lxlu0, sen::Consumer::Sfp]);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1733,10 +1746,31 @@ impl L3Half {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// 221/384
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e221_pushBackTheUnitToListIfDoesnotExist
+///
+/// `pushBackTheUnitToListIfDoesnotExist` (`DataflowToSentient.cpp:143`) — appends one consumer to a
+/// sync's unit list unless the list already names it.
+///
+/// ⛔ THE REFERENCE ABORTS ON AN UNKNOWN NAME, and that is what the enum parameter removes: it takes
+/// a `std::string` and calls `symbolizeSentientLoadConsumer(unit_name).value()` (`:146-147`), which
+/// throws for anything outside the sixteen. There is no name here to fail to symbolize.
+pub fn push_back_the_unit_to_list_if_doesnot_exist(
+    unit: sen::Consumer,
+    list: &mut Vec<sen::Consumer>,
+) {
+    // `:148-149` — `std::find(list.begin(), list.end(), unit_attr) == list.end()`.
+    if !list.contains(&unit) {
+        list.push(unit);
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e221_pushBackTheUnitToListIfDoesnotExist
 // crustify:todo: e273_lowerL0LXSyncOperationForAUnit
 // crustify:todo: e274_lowerL0LXSyncOperationForAGroupOfUnits
 // crustify:todo: e300_lowerSyncForAUnit

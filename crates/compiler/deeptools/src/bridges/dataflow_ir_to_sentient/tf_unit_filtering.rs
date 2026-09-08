@@ -379,13 +379,14 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::Receive { .. }
             | dataflow::Op::Opaque(_),
         ) => true,
-        // Six of the thirteen `agen` classes. The seven the island does not declare —
+        // Seven of the thirteen `agen` classes. The six the island does not declare —
         // `composite_load`, `composite_store`, `composite_indirect_load_and_store`,
-        // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load`,
-        // `indirect_vector_store` — belong on this side of the answer when they land.
+        // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load` —
+        // belong on this side of the answer when they land.
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::IndirectVectorStore { .. }
             | agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::CompositeMemoryInterleave { .. }

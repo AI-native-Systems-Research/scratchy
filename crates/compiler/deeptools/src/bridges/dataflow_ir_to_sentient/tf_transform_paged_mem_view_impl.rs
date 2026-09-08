@@ -904,6 +904,7 @@ impl<'a> VectorLoadOp<'a> {
                 agen::Op::VectorStore { .. }
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. }
@@ -1139,6 +1140,7 @@ impl<'a> VectorStoreOp<'a> {
                 agen::Op::VectorLoad { .. }
                 | agen::Op::SymbolicVectorLoad { .. }
                 | agen::Op::SymbolicVectorStore { .. }
+                | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. }

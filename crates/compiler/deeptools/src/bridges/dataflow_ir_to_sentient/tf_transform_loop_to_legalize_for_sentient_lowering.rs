@@ -480,6 +480,7 @@ fn is_memory_op(op: &DfirOp) -> bool {
             agen::Op::Yield
             | agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::IndirectVectorStore { .. }
             // ⛔ THE INTERLEAVE IS NOT ONE EITHER, and it is the one to say so about: it CONTAINS
             // composite transfers, and the induction variable reaching it reaches them — the ops
             // inside its region answer for themselves.
