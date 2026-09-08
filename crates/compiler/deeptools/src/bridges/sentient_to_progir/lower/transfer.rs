@@ -20,7 +20,7 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::bridges::sentient_to_progir::construct::scalar::{
     AddrFile, Assign, AssignKind, construct_assign_instr,
 };
@@ -31,13 +31,23 @@ use crate::bridges::sentient_to_progir::construct::transfer::{
     construct_l3_load_instr, construct_load_compute_instr, construct_load_instr,
     construct_lrf_copy_instr, construct_store_instr, construct_zr_assign_instr,
 };
-use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
-    LoweredOp, update_label_and_add_to_code_graph,
+use crate::bridges::sentient_to_progir::lower::compute::{
+    LabelPlacement, Successor, lower_common_operations,
 };
-use crate::bridges::sentient_to_progir::state::{CopyOps, Labels, OpSite, RegsToInit, UnitKey};
-use crate::bridges::sentient_to_progir::uniform::block::{UniformInstrBlock, UniformInstrBlocks};
+use crate::bridges::sentient_to_progir::lower::control::CodeGraph;
+use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
+    AddressScale, LoweredOp, RegImm, RegImmSource, add_to_reg_init, address_scale,
+    get_reg_imm_vals, update_label_and_add_to_code_graph,
+};
+use crate::bridges::sentient_to_progir::state::{
+    CopyOps, Labels, OpSite, RegGraphs, RegsToInit, UnitKey,
+};
+use crate::bridges::sentient_to_progir::uniform::block::{
+    InstrIndex, UniformInstrBlock, UniformInstrBlocks,
+};
 use crate::bridges::sentient_to_progir::uniform::instr::{OperandMapRefusal, UniformInstrInfo};
 use crate::formats::Bits;
+use crate::islands::progir::ty::FoldId;
 use crate::islands::sentient::dialects::sentient::{Reg, RegType as SenRegType};
 use sys_arch_spec::regfile::Component;
 
@@ -83,6 +93,16 @@ pub enum TransferRefusal {
     LrfCopy(LrfCopyRefusal),
     /// What the load-compute refused.
     LoadCompute(OperandMapRefusal),
+    /// `DT_CHECK(is_constant || is_symbol || is_multicast || is_get_unit)` (`:466`): a program
+    /// header's input is a register, or a query map of mixed kinds.
+    NotAnImmediate,
+    /// The sen1p5 EBR's `DT_CHECK` that its input is a `sentient.constant` or a `uniform.query_map`
+    /// (`:434-437`) — nothing else has a value to shift.
+    EbrInputNotEvaluable,
+    /// *"sen1p5 EBR requires element size to initialize reg"* (`:439-440`).
+    EbrElementSize,
+    /// *"EBR is not divisible by an even number of sticks"* (`:443-444`), and by what it was not.
+    EbrNotEvenSticks(i64),
 }
 
 /// WHAT ONE TRANSFER LOWERING COST AND WHAT IT COULD NOT DO.
@@ -541,22 +561,234 @@ pub fn lower_load_compute_and_send_operation<A: Arch>(
     lowered
 }
 
-// crustify:todo: e122_LowerCopyOperation
+/// WHAT A `sentient.scalar_copy`'s INPUT IS — the three shapes its two routes turn on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CopyInput<'a> {
+    /// A constant, a symbol, a multicast, a `dataflow.get_unit`, or a `uniform.query_map` over them.
+    Imm(&'a RegImmSource),
+    /// A register, which is none of those — ⛔ A PROGRAM HEADER REFUSES IT (`:466`).
+    Reg,
+    /// `isa<BlockArgument>` — ⛔ IT TAKES THE ASSIGN ROUTE EVEN IN A PROGRAM HEADER (`:464`).
+    BlockArg,
+}
+
+/// THE `sentient.scalar_copy` FIELDS ITS LOWERING READS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarCopy<'a> {
+    /// `getInp()`.
+    pub input: CopyInput<'a>,
+    /// `ConstructAssignInstr`'s view of `getInp() -> getOut()`, for the route that emits one.
+    pub assign: Assign,
+    /// `getRegLocale()`/`getRegIndex()` — the register `getOut()` names.
+    pub reg: Reg,
+    /// The `element_size` attribute.
+    pub element_size: Option<Bits>,
+    /// `getProgramHeader()`.
+    pub program_header: bool,
+    /// `getQueryKeyAndUnitsFromParentRegion`'s units, each with the fold it stands for.
+    pub units: &'a [(UnitKey, Option<FoldId>)],
+}
+
+/// WHAT LOWERING ONE `sentient.scalar_copy` COST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copied {
+    /// The copies materialised, and the offenders.
+    pub lowered: Lowered,
+    /// ⛔ `None` IS THE ASSIGN ROUTE, which places the label itself rather than moving it on.
+    pub label: Option<LabelPlacement>,
+}
+
+/// WHICH OF THE FOUR DEFINING OPS ONE INPUT IS — `isConstant` (`Utils/Utils.cpp:423-443`), `isSymbol`,
+/// `isMulticast` and `isGetUnit` (`Transform/Sentient/Analyses/Utils.cpp:141,221,240`).
+///
+/// ⛔ ALL-OF FOR THREE OF THEM AND ANY-OF FOR THE SYMBOL, which is what makes a query map mixing
+/// symbols with constants a symbol rather than nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputKinds {
+    /// Every value is a `dataflow.create_multicast_group`.
+    is_multicast: bool,
+    /// Any value is a `symbol.create_symbol`.
+    is_symbol: bool,
+    /// The input is one of the four kinds at all.
+    is_one_kind: bool,
+}
+
+impl InputKinds {
+    /// The four predicates over one input's values.
+    fn of(source: &RegImmSource) -> InputKinds {
+        let held: Vec<RegImm> = match source {
+            RegImmSource::Common(imm) => vec![*imm],
+            // ⛔ A UNIT THE MAPPING MISSES IS NOT A VALUE: the reference reads the mapping's own
+            // values, not one per unit, so an uncovered unit cannot vote on the kind.
+            RegImmSource::Mapped(entries) => {
+                entries.iter().filter_map(|(_, _, held)| *held).collect()
+            }
+        };
+        let all = |kind: fn(&RegImm) -> bool| !held.is_empty() && held.iter().all(kind);
+        InputKinds {
+            is_multicast: all(|imm| matches!(imm, RegImm::Multicast(_))),
+            is_symbol: held.iter().any(|imm| matches!(imm, RegImm::Symbol(_))),
+            is_one_kind: all(|imm| matches!(imm, RegImm::Constant(_)))
+                || all(|imm| matches!(imm, RegImm::Multicast(_)))
+                || all(|imm| matches!(imm, RegImm::Unit(_)))
+                || held.iter().any(|imm| matches!(imm, RegImm::Symbol(_))),
+        }
+    }
+}
+
+/// `evaluateShift(ev, 1, /*shift_right*/ true)` and the two `DT_CHECK`s around it (`:427-457`).
+///
+/// ⭐ ONLY A CONSTANT SHIFTS — a symbol id or a multicast id is not an address the evaluator halves,
+/// and `None` back means nothing shifted because one of the checks named an offender.
+fn halve_for_sen1p5_ebr<A: Arch>(
+    source: Option<&RegImmSource>,
+    element_size: Option<Bits>,
+    refused: &mut Vec<TransferRefusal>,
+) -> Option<RegImmSource> {
+    let evaluable = matches!(
+        source,
+        Some(RegImmSource::Common(RegImm::Constant(_)) | RegImmSource::Mapped(_))
+    );
+    if !evaluable {
+        refused.push(TransferRefusal::EbrInputNotEvaluable);
+        return None;
+    }
+    let Some(width) = element_size
+        .map(|bits| u64::from(bits.0))
+        .filter(|width| *width > 0)
+    else {
+        refused.push(TransferRefusal::EbrElementSize);
+        return None;
+    };
+    let two_sticks = 2 * A::BYTES_PER_STICK.get() * 8 / width;
+    let mut halve = |value: i64| {
+        // ⛔ AND A WIDTH WIDER THAN TWO STICKS DIVIDES BY NOTHING, which is that check failing.
+        if value.unsigned_abs().checked_rem(two_sticks) != Some(0) {
+            refused.push(TransferRefusal::EbrNotEvenSticks(value));
+        }
+        value >> 1
+    };
+    Some(match source? {
+        RegImmSource::Common(RegImm::Constant(value)) => {
+            RegImmSource::Common(RegImm::Constant(halve(*value)))
+        }
+        RegImmSource::Mapped(entries) => RegImmSource::Mapped(
+            entries
+                .iter()
+                .map(|(unit, fold, held)| {
+                    let held = match *held {
+                        Some(RegImm::Constant(value)) => Some(RegImm::Constant(halve(value))),
+                        held => held,
+                    };
+                    (*unit, *fold, held)
+                })
+                .collect(),
+        ),
+        common => common.clone(),
+    })
+}
+
+/// Replaces: e122_LowerCopyOperation
+///
+/// One `sentient.scalar_copy`: a program header's immediate initialises the register, and an assign
+/// instruction carries everything else.
+///
+/// ⛔ `element_size` `None` IS THE ABSENT ATTRIBUTE **AND** THE `-1` (`:497-501`), worth `8 * scale`
+/// — the identity scaling — since no width is negative, and that is where the `DT_CHECK` went.
+/// ⛔ A REFUSED ASSIGN EMITS NOTHING, where the reference's unchecked `.value()` (`:508`) aborts; and
+/// the parent-region walk's two checks are the caller's, because the units arrive as a parameter.
+#[must_use]
+pub fn lower_copy_operation<A: Arch>(
+    comp: Component,
+    copy: &ScalarCopy<'_>,
+    next: Option<Successor>,
+    graph: CodeGraph<'_>,
+    reg_graph: &mut RegGraphs,
+    nop_for_labels: &mut Vec<InstrIndex>,
+) -> Copied {
+    let mut lowered = Lowered::default();
+    let source = match copy.input {
+        CopyInput::Imm(source) => Some(source),
+        CopyInput::Reg | CopyInput::BlockArg => None,
+    };
+    let kinds = source.map(InputKinds::of);
+    let scale = if kinds.is_some_and(|kinds| kinds.is_multicast) {
+        AddressScale::unscaled()
+    } else {
+        address_scale::<A>(comp)
+    };
+    let element_size = copy.element_size.unwrap_or(Bits(8 * scale.get()));
+    let shifted = (A::GEN >= IsaGen::Sen1p5 && copy.reg.locale == SenRegType::Ebr)
+        .then(|| halve_for_sen1p5_ebr::<A>(source, copy.element_size, &mut lowered.refused))
+        .flatten();
+    let source = shifted.as_ref().or(source);
+    if copy.program_header && !matches!(copy.input, CopyInput::BlockArg) {
+        let (Some(source), Some(kinds)) = (source, kinds) else {
+            lowered.refused.push(TransferRefusal::NotAnImmediate);
+            return Copied {
+                lowered,
+                label: None,
+            };
+        };
+        if !kinds.is_one_kind {
+            lowered.refused.push(TransferRefusal::NotAnImmediate);
+            return Copied {
+                lowered,
+                label: None,
+            };
+        }
+        let imm_vals = get_reg_imm_vals::<A>(
+            source,
+            copy.units,
+            comp,
+            element_size,
+            scale,
+            copy.reg.locale == SenRegType::Mvr,
+        );
+        add_to_reg_init(copy.reg, &imm_vals, reg_graph, kinds.is_symbol);
+        Copied {
+            lowered,
+            label: Some(lower_common_operations(graph, next, nop_for_labels)),
+        }
+    } else {
+        let assigned =
+            construct_assign_instr::<A>(&copy.assign, comp, element_size, copy.program_header);
+        lowered.copy_ops.0 += assigned.copy_ops.0;
+        lowered
+            .refused
+            .extend(assigned.refused.into_iter().map(TransferRefusal::Copy));
+        if let Some(instr) = assigned.instr {
+            update_label_and_add_to_code_graph(
+                graph.labels,
+                graph.region,
+                graph.at,
+                LoweredOp::Other,
+                instr,
+                false,
+            );
+        }
+        Copied {
+            lowered,
+            label: None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Sen1p5;
     use crate::arch::{Bounded, Dd2, Elements};
     use crate::bridges::sentient_to_progir::construct::transfer::{
         L3Half, LdzConst, LoadComputeConsumer, LoadComputeShuffle, LoadTarget, Peer,
     };
     use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlock;
     use crate::bridges::sentient_to_progir::utils::LoadConsumer;
-    use crate::islands::progir::ty::{Operand, OperandValue};
-    use crate::islands::progir::{OpCode, OperandField};
+    use crate::islands::progir::ty::{Operand, OperandValue, RegType};
+    use crate::islands::progir::{OpCode, OperandField, RegInit};
     use crate::islands::sentient::dialects::sentient::RegIndex;
     use crate::units::Core;
-    use crate::units::{DfirUnit, Residency};
+    use crate::units::{Corelet, DfirUnit, Residency};
 
     fn at(index: usize) -> Option<RegIndex> {
         Some(RegIndex::ALL[index])
@@ -879,5 +1111,110 @@ mod unit_tests {
         assert_eq!(load.mutable_addr, reg(SenRegType::Lrf, 0));
         assert_eq!(lowered.copy_ops, CopyOps(1));
         assert!(lowered.refused.is_empty());
+    }
+
+    /// e122 — ⭐ IBM'S OWN HEADER COPY: `if_else_label.mlir` copies 131072 into `lbr0` with
+    /// `element_size = 16` on the L3 store unit, and its `LBR : 0 : 2048` is 131072 × 16 / 8 / 128
+    /// with no instruction emitted at all.
+    #[test]
+    fn a_program_headers_constant_scales_into_a_register_initialiser_and_emits_nothing() {
+        let l3su = UnitKey {
+            unit: DfirUnit::L3su,
+            core: Core::checked(1).expect("every arch has core 1"),
+            corelet: Corelet::checked(0),
+        };
+        let units = [(l3su, None)];
+        fn header<'a>(
+            source: &'a RegImmSource,
+            locale: SenRegType,
+            units: &'a [(UnitKey, Option<FoldId>)],
+        ) -> ScalarCopy<'a> {
+            ScalarCopy {
+                input: CopyInput::Imm(source),
+                assign: Assign {
+                    src_index: None,
+                    tgt_index: at(0),
+                    kind: AssignKind::LrfFromLrf,
+                },
+                reg: reg(locale, 0),
+                element_size: Some(Bits(16)),
+                program_header: true,
+                units,
+            }
+        }
+        let mut labels = Labels::default();
+        let mut blocks = UniformInstrBlocks::default();
+        let mut reg_graph = RegGraphs::default();
+        let mut nop_for_labels = Vec::new();
+        let lbr = RegImmSource::Common(RegImm::Constant(131_072));
+        let copied = lower_copy_operation::<Dd2>(
+            Component::L3su,
+            &header(&lbr, SenRegType::Lbr, &units),
+            None,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut blocks,
+                at: OpSite(0),
+            },
+            &mut reg_graph,
+            &mut nop_for_labels,
+        );
+        assert_eq!(copied.lowered, Lowered::default());
+        assert_eq!(copied.label, Some(LabelPlacement::Unlabelled));
+        assert!(
+            blocks.blocks.is_empty(),
+            "a register initialiser is not an instruction"
+        );
+        assert_eq!(
+            reg_graph.get(l3su),
+            Some(&vec![RegInit {
+                file: RegType::Lbr,
+                index: RegIndex::ALL[0],
+                value: Operand::every(OperandValue::Int(2048)),
+            }])
+        );
+        // ⛔ AND A SEN1P5 EBR IS HALVED FIRST, but only where it is an even number of sticks:
+        // 128 B × 8 / 16 b is 64 elements a stick, so 256 divides by two of them and 64 does not.
+        let mut halved = RegGraphs::default();
+        let aligned = RegImmSource::Common(RegImm::Constant(256));
+        let copied = lower_copy_operation::<Sen1p5>(
+            Component::L3su,
+            &header(&aligned, SenRegType::Ebr, &units),
+            None,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut blocks,
+                at: OpSite(0),
+            },
+            &mut halved,
+            &mut nop_for_labels,
+        );
+        assert_eq!(copied.lowered, Lowered::default());
+        assert_eq!(
+            halved.get(l3su),
+            Some(&vec![RegInit {
+                file: RegType::Ebr,
+                index: RegIndex::ALL[0],
+                value: Operand::every(OperandValue::Int(2)),
+            }]),
+            "128 × 16 / 8 / 128"
+        );
+        let odd = RegImmSource::Common(RegImm::Constant(64));
+        let copied = lower_copy_operation::<Sen1p5>(
+            Component::L3su,
+            &header(&odd, SenRegType::Ebr, &units),
+            None,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut blocks,
+                at: OpSite(0),
+            },
+            &mut halved,
+            &mut nop_for_labels,
+        );
+        assert_eq!(
+            copied.lowered.refused,
+            vec![TransferRefusal::EbrNotEvenSticks(64)]
+        );
     }
 }

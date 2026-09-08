@@ -30,8 +30,12 @@ use crate::bridges::sentient_to_progir::construct::mask_and_splat::{
     construct_set_dst_mask_instr,
 };
 use crate::bridges::sentient_to_progir::construct::scalar::{
-    Assign, LoopBound, Sync, construct_assign_instr, construct_mv_loop_instr, construct_nop_instr,
-    construct_return_instr, construct_sync_instr,
+    Assign, LoopBound, Sync, construct_assign_instr, construct_branch_exit_instr,
+    construct_jmp_instr, construct_mv_loop_instr, construct_nop_instr, construct_return_instr,
+    construct_sync_instr,
+};
+use crate::bridges::sentient_to_progir::lower::compute::{
+    LabelPlacement, Successor, lower_common_operations,
 };
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
     LabelToJumps, LoweredOp, RegImmSource, add_to_labels_map, add_to_reg_init, address_scale,
@@ -40,12 +44,14 @@ use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
 use crate::bridges::sentient_to_progir::state::{
     CopyOps, LabelCounter, Labels, OpSite, RegGraphs, UnitKey,
 };
-use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlocks;
+use crate::bridges::sentient_to_progir::uniform::block::{
+    InstrIndex, UniformInstrBlock, UniformInstrBlocks,
+};
 use crate::bridges::sentient_to_progir::uniform::instr::{OperandMapRefusal, UniformInstrInfo};
 use crate::formats::Bits;
 use crate::islands::progir::OperandField;
 use crate::islands::progir::ty::FoldId;
-use crate::islands::sentient::dialects::sentient::{Reg, RegIndex};
+use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType as SenRegType};
 use crate::islands::sentient::dialects::{Op, Val, dataflow, defining_op, sentient};
 use sys_arch_spec::regfile::Component;
 
@@ -398,18 +404,317 @@ pub fn lower_sync_operation<A: Arch>(
     Nops(0)
 }
 
-// crustify:todo: e123_LowerYieldOperation
-// crustify:todo: e125_LowerUniformYieldOperation
+/// ONE VALUE A YIELD HANDS BACK — what both yields read off `getOperand(i)` and its target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YieldedValue {
+    /// `symbolizeSentientRegType(getValueRegLocaleAsString(getOperand(i)))` — ⛔ THE TWO XRF POINTERS
+    /// ARE SKIPPED: one address register means there is nothing to assign (`:801-806`).
+    pub locale: SenRegType,
+    /// `ConstructAssignInstr`'s view of `getOperand(i) -> (getRegionIterArgs | getResult)[i]`.
+    pub assign: Assign,
+    /// `element_sizes[i]`, ⛔ SHIFTED BY ONE UNDER A `sentient.for` (`:815-820`) because entry 0 is the
+    /// loop bound's, which is the caller's index to resolve.
+    pub element_size: Option<Bits>,
+}
+
+/// ONE RESULT A `sentient.for` HANDS OUT OF ITS LOOP — `getRegionIterArgs()[i] -> getResult(i)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarriedResult {
+    /// The assignment out of the iteration argument.
+    pub assign: Assign,
+    /// `element_sizes[i + 1]`.
+    pub element_size: Option<Bits>,
+}
+
+/// WHICH TERMINATOR OF A `sentient.if` A YIELD IS — ⛔ ONLY REACHED WHEN THE ELSE REGION IS NON-EMPTY
+/// (`:874`), and an `if` without one is [`YieldParent::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfSide {
+    /// The THEN region's terminator (`:875`).
+    Then {
+        /// The else region's first op — ⛔ THE JUMP IS EMITTED ONLY IF IT CARRIES A LABEL (`:878`).
+        else_first: OpSite,
+        /// `if_op->getNextNode()`, whose label the jump targets.
+        after_if: OpSite,
+    },
+    /// The ELSE region's terminator — ⛔ IT EMITS ONLY FOR AN XRF YIELD (`:886-893`).
+    Else,
+}
+
+/// WHAT A `sentient.yield` TERMINATES, which decides what follows its operands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum YieldParent<'a> {
+    /// `sentient.for` — a `BE`, then one assignment per used result.
+    For {
+        /// ⛔ `None` IS `use_empty()`: an unused result is assigned nowhere (`:864`).
+        results: &'a [Option<CarriedResult>],
+    },
+    /// `sentient.if` with a non-empty else region.
+    If(IfSide),
+    /// Anything else — ⭐ NOTHING FOLLOWS THE OPERANDS.
+    Other,
+}
+
+/// WHAT LOWERING ONE YIELD COST AND WHAT IT COULD NOT DO.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoweredYield {
+    /// `++num_copy_ops_` over every assignment it emitted.
+    pub copy_ops: CopyOps,
+    /// `++num_nops_` over every `LowerCommonOperations` that had to carry a label.
+    pub nops: Nops,
+    /// What the assignments' per-unit maps refused.
+    pub refused: Vec<OperandMapRefusal>,
+}
+
+/// `++num_nops_` — the one placement that emits an instruction (`:557-561`).
+const fn nops_of(placement: LabelPlacement) -> Nops {
+    match placement {
+        LabelPlacement::Nop => Nops(1),
+        LabelPlacement::Unlabelled | LabelPlacement::MovedToNext => Nops(0),
+    }
+}
+
+/// `!uniform_instr_region.getBlocks().back().getLastInstr().getTag().empty()` (`:832-838`) —
+/// ⛔ AN EMPTY REGION HAS NO LAST INSTRUCTION, where the reference reads one back regardless.
+fn last_instr_tagged(region: &mut UniformInstrBlocks) -> bool {
+    region
+        .blocks
+        .last_mut()
+        .and_then(UniformInstrBlock::last_instr_mut)
+        .is_some_and(|last| last.tag.is_some())
+}
+
+/// `ConstructAssignInstr` + `updateLabelAndAddToCodeGraph` + the tag read both yields run per operand
+/// (`:823-841`) — ⛔ `None` BACK IS AN ASSIGNMENT THAT WAS NOT NEEDED, which is the caller's NOP case.
+fn assign_yielded<A: Arch>(
+    comp: Component,
+    assign: &Assign,
+    element_size: Bits,
+    added_label: bool,
+    op: LoweredOp,
+    graph: CodeGraph<'_>,
+    lowered: &mut LoweredYield,
+) -> Option<bool> {
+    let assigned = construct_assign_instr::<A>(assign, comp, element_size, false);
+    lowered.copy_ops.0 += assigned.copy_ops.0;
+    lowered.refused.extend(assigned.refused);
+    let instr = assigned.instr?;
+    update_label_and_add_to_code_graph(
+        graph.labels,
+        graph.region,
+        graph.at,
+        op,
+        instr,
+        added_label,
+    );
+    Some(added_label || last_instr_tagged(graph.region))
+}
+
+/// Replaces: e123_LowerYieldOperation
+///
+/// One assignment per yielded value, then what the parent needs: a `sentient.for`'s `BE` and its
+/// results, or a `sentient.if`'s jump over the else region.
+///
+/// ⭐ NO SUCCESSOR PARAMETER: a `sentient.yield` is a terminator, so `getNextNode()` is null and a
+/// label it carries can only be taken by a `NOP` (`:544-556`).
+/// ⛔ `element_size` `None` IS THE ABSENT `element_sizes` **AND** THE `-1` (`:815-822`), worth the
+/// identity `8 * scale` — only an assign's immediate arms read the width, and a yield assigns register
+/// to register.
+#[must_use]
+pub fn lower_yield_operation<A: Arch>(
+    comp: Component,
+    yielded: &[YieldedValue],
+    parent: &YieldParent<'_>,
+    label_to_jumps: &mut LabelToJumps,
+    nop_for_labels: &mut Vec<InstrIndex>,
+    graph: CodeGraph<'_>,
+) -> LoweredYield {
+    let CodeGraph { labels, region, at } = graph;
+    let identity = Bits(8 * address_scale::<A>(comp).get());
+    let mut lowered = LoweredYield::default();
+    let mut added_label = false;
+    let mut is_xrf = false;
+    let mut nop =
+        |labels: &mut Labels, region: &mut UniformInstrBlocks, lowered: &mut LoweredYield| {
+            lowered.nops.0 += nops_of(lower_common_operations(
+                CodeGraph { labels, region, at },
+                None,
+                nop_for_labels,
+            ))
+            .0;
+        };
+    if yielded.is_empty() {
+        nop(labels, region, &mut lowered);
+    }
+    for value in yielded {
+        if matches!(value.locale, SenRegType::XrfRdPtr | SenRegType::XrfWrPtr) {
+            is_xrf = true;
+            continue;
+        }
+        let assigned = assign_yielded::<A>(
+            comp,
+            &value.assign,
+            value.element_size.unwrap_or(identity),
+            added_label,
+            LoweredOp::Yield,
+            CodeGraph {
+                labels: &mut *labels,
+                region: &mut *region,
+                at,
+            },
+            &mut lowered,
+        );
+        match assigned {
+            Some(now) => added_label = now,
+            None => nop(labels, region, &mut lowered),
+        }
+    }
+    match parent {
+        YieldParent::For { results } => {
+            update_label_and_add_to_code_graph(
+                labels,
+                region,
+                at,
+                LoweredOp::Yield,
+                construct_branch_exit_instr(),
+                added_label,
+            );
+            for result in results.iter().flatten() {
+                // ⛔ `added_label` IS NOT UPDATED IN THIS LOOP (`:869-871`), so a `BE` that took the
+                // tag can hand the same tag to a result assignment.
+                let _took = assign_yielded::<A>(
+                    comp,
+                    &result.assign,
+                    result.element_size.unwrap_or(identity),
+                    added_label,
+                    LoweredOp::Yield,
+                    CodeGraph {
+                        labels: &mut *labels,
+                        region: &mut *region,
+                        at,
+                    },
+                    &mut lowered,
+                );
+            }
+        }
+        YieldParent::If(IfSide::Then {
+            else_first,
+            after_if,
+        }) => {
+            if labels.get(*else_first).is_some() {
+                // ⛔ `labels[if_op->getNextNode()]` DEFAULT-INSERTS AN EMPTY LABEL for an op with
+                // none, and the jump then targets `""` until the label map is replayed.
+                let target = labels.claim(*after_if, String::new()).to_owned();
+                let instr = construct_jmp_instr(&target);
+                add_to_labels_map(region, label_to_jumps, &instr);
+                update_label_and_add_to_code_graph(
+                    labels,
+                    region,
+                    at,
+                    LoweredOp::Yield,
+                    instr,
+                    added_label,
+                );
+            } else {
+                nop(labels, region, &mut lowered);
+            }
+        }
+        YieldParent::If(IfSide::Else) => {
+            if is_xrf {
+                nop(labels, region, &mut lowered);
+            }
+        }
+        YieldParent::Other => {}
+    }
+    lowered
+}
+
+/// WHERE A UNIFORM REGION SITS IN ITS OP — `region_idx`, `op->getNumRegions()` and whether the yield is
+/// the region's only op.
+///
+/// ⭐ ONE SITE RATHER THAN THREE ARGUMENTS, the grouping this crate makes instead of permitting
+/// `#[allow(clippy::too_many_arguments)]`.
+pub struct UniformRegionSite {
+    /// `region_idx` — which region of the op is being closed.
+    pub index: RegionIndex,
+    /// `op->getNumRegions()`.
+    pub regions: u32,
+    /// Whether the yield is alone in its block, which contributes an EMPTY region.
+    pub alone_in_block: bool,
+}
+
+/// Replaces: e125_LowerUniformYieldOperation
+///
+/// One assignment per value a uniform region yields, then the empty region a bare yield stands for and
+/// the regular block the last region closes.
+///
+/// ⛔ NO NOP FOR AN UNNEEDED ASSIGNMENT, unlike [`lower_yield_operation`] (`:1088`): only a yield with
+/// no operands at all reaches `LowerCommonOperations` here.
+/// ⛔ AND ITS SUCCESSOR IS THE PARENT'S (`:544-547`), which is why `next` is a parameter.
+/// ⭐ `is_xrf` IS SET AND NEVER READ THERE, so nothing here answers for it.
+#[must_use]
+pub fn lower_uniform_yield_operation<A: Arch>(
+    comp: Component,
+    yielded: &[YieldedValue],
+    site: &UniformRegionSite,
+    next: Option<Successor>,
+    nop_for_labels: &mut Vec<InstrIndex>,
+    graph: CodeGraph<'_>,
+) -> LoweredYield {
+    let CodeGraph { labels, region, at } = graph;
+    let identity = Bits(8 * address_scale::<A>(comp).get());
+    let mut lowered = LoweredYield::default();
+    let mut added_label = false;
+    if yielded.is_empty() {
+        lowered.nops.0 += nops_of(lower_common_operations(
+            CodeGraph {
+                labels: &mut *labels,
+                region: &mut *region,
+                at,
+            },
+            next,
+            nop_for_labels,
+        ))
+        .0;
+    }
+    for value in yielded {
+        if matches!(value.locale, SenRegType::XrfRdPtr | SenRegType::XrfWrPtr) {
+            continue;
+        }
+        if let Some(now) = assign_yielded::<A>(
+            comp,
+            &value.assign,
+            value.element_size.unwrap_or(identity),
+            added_label,
+            LoweredOp::Other,
+            CodeGraph {
+                labels: &mut *labels,
+                region: &mut *region,
+                at,
+            },
+            &mut lowered,
+        ) {
+            added_label = now;
+        }
+    }
+    if site.alone_in_block {
+        region.append_empty_uniform_region();
+    }
+    if site.index.0 + 1 == site.regions {
+        region.append_regular_block();
+    }
+    lowered
+}
 // crustify:todo: e126_LowerUniformOperations
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
+    use crate::bridges::sentient_to_progir::construct::descriptive;
     use crate::bridges::sentient_to_progir::construct::mask_and_splat::MaskDest;
     use crate::bridges::sentient_to_progir::construct::scalar::{AssignKind, LrfImm};
     use crate::bridges::sentient_to_progir::lower::labels_and_regs::RegImm;
-    use crate::bridges::sentient_to_progir::uniform::block::UniformInstrBlock;
     use crate::bridges::sentient_to_progir::uniform::instr::Comment;
     use crate::islands::progir::OpCode;
     use crate::islands::progir::ty::{Operand, OperandValue, PerFold};
@@ -686,5 +991,167 @@ mod unit_tests {
             vec![SendDestRefusal::Unit(Component::Pt)]
         );
         assert!(empty.blocks.is_empty());
+    }
+
+    /// The instructions one regular block holds.
+    fn instrs_of(region: &UniformInstrBlocks) -> Vec<UniformInstrInfo> {
+        match &region.blocks[0] {
+            UniformInstrBlock::Regular(instrs) => instrs.clone(),
+            UniformInstrBlock::Uniform(_) => panic!("a regular block"),
+        }
+    }
+
+    /// e123 — ⭐ IBM'S OWN `empty-loop.mlir`: the first loop yields the register it already holds, so
+    /// nothing is assigned and the `BE` MERGES into the transfer before it
+    /// (`LX_LDSTI :: be:be consumertag:pe imm:3456`), while an `MVLOOPCNT` blocks that merge and
+    /// `LX_NOP :: be:be  // Branch End` stands alone. ⭐ AND `if_else_label.mlir`'s then-region yield
+    /// jumps over the else region: `L3_JCMP :: mode:always pc_target:(if-label-1-end)`.
+    #[test]
+    fn a_branch_exit_merges_into_the_transfer_but_not_into_the_loop_count() {
+        let held = YieldedValue {
+            locale: RegType::Lrf,
+            assign: Assign {
+                src_index: Some(RegIndex::ALL[0]),
+                tgt_index: Some(RegIndex::ALL[0]),
+                kind: AssignKind::LrfFromLrf,
+            },
+            element_size: None,
+        };
+        let mut labels = Labels::default();
+        let mut label_to_jumps = LabelToJumps::new();
+        let mut nop_for_labels = Vec::new();
+        let mut region = UniformInstrBlocks::default();
+        region.add_instruction_to_last_block(UniformInstrInfo::of(OpCode::LDSTI));
+        let lowered = lower_yield_operation::<Target>(
+            Component::Lxsu,
+            std::slice::from_ref(&held),
+            &YieldParent::For { results: &[None] },
+            &mut label_to_jumps,
+            &mut nop_for_labels,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(lowered, LoweredYield::default());
+        let instrs = instrs_of(&region);
+        assert_eq!(instrs.len(), 1, "the branch exit merged");
+        assert_eq!(instrs[0].opcode, OpCode::LDSTI);
+        assert_eq!(
+            instrs[0].common_field(OperandField::Be),
+            Some(&descriptive("be"))
+        );
+        // ⛔ THE LOOP COUNT BLOCKS THE MERGE, and an operand-free yield assigns nothing either way.
+        let mut counted = UniformInstrBlocks::default();
+        counted.add_instruction_to_last_block(UniformInstrInfo::of(OpCode::MVLOOPCNT));
+        let lowered = lower_yield_operation::<Target>(
+            Component::Lxsu,
+            &[],
+            &YieldParent::For { results: &[] },
+            &mut label_to_jumps,
+            &mut nop_for_labels,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut counted,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(lowered, LoweredYield::default());
+        let instrs = instrs_of(&counted);
+        assert_eq!(instrs.len(), 2);
+        assert_eq!(instrs[1].opcode, OpCode::NOP);
+        assert_eq!(instrs[1].comment, Comment::Common("Branch End".to_owned()));
+        assert_eq!(
+            instrs[1].common_field(OperandField::Be),
+            Some(&descriptive("be"))
+        );
+        // ⭐ AND THE THEN REGION JUMPS PAST A LABELLED ELSE REGION, the jump filed under its target.
+        let mut labels = Labels::default();
+        labels.claim(OpSite(1), "if-label-1-else".to_owned());
+        labels.claim(OpSite(2), "if-label-1-end".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        region.append_regular_block();
+        let lowered = lower_yield_operation::<Target>(
+            Component::L3su,
+            &[],
+            &YieldParent::If(IfSide::Then {
+                else_first: OpSite(1),
+                after_if: OpSite(2),
+            }),
+            &mut label_to_jumps,
+            &mut nop_for_labels,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(lowered, LoweredYield::default());
+        let instrs = instrs_of(&region);
+        assert_eq!(instrs[0].opcode, OpCode::JCMP);
+        assert_eq!(
+            instrs[0].common_field(OperandField::Mode),
+            Some(&descriptive("always"))
+        );
+        assert_eq!(
+            label_to_jumps
+                .get("if-label-1-end")
+                .map(|jumps| jumps.len()),
+            Some(1),
+            "the jump is filed so its target can be repointed"
+        );
+    }
+
+    /// e125 — a uniform region whose only op is the yield contributes an EMPTY region, and the last
+    /// region of the op closes the uniform block with a regular one (`:1105-1115`).
+    #[test]
+    fn a_bare_uniform_yield_contributes_an_empty_region_and_the_last_one_closes_the_block() {
+        let mut labels = Labels::default();
+        let mut nop_for_labels = Vec::new();
+        let mut region = UniformInstrBlocks::default();
+        region.append_uniform_block();
+        let lowered = lower_uniform_yield_operation::<Target>(
+            Component::Lxsu,
+            &[],
+            &UniformRegionSite {
+                index: RegionIndex(0),
+                regions: 2,
+                alone_in_block: true,
+            },
+            None,
+            &mut nop_for_labels,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(lowered, LoweredYield::default());
+        assert_eq!(region.blocks.len(), 1, "region 0 of 2 closes nothing");
+        match &region.blocks[0] {
+            UniformInstrBlock::Uniform(block) => assert_eq!(block.regions, vec![Vec::new()]),
+            UniformInstrBlock::Regular(_) => panic!("a uniform block"),
+        }
+        // ⛔ AND THE LAST REGION APPENDS A REGULAR BLOCK, which is what the next op writes into.
+        let lowered = lower_uniform_yield_operation::<Target>(
+            Component::Lxsu,
+            &[],
+            &UniformRegionSite {
+                index: RegionIndex(1),
+                regions: 2,
+                alone_in_block: true,
+            },
+            None,
+            &mut nop_for_labels,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+        );
+        assert_eq!(lowered, LoweredYield::default());
+        assert_eq!(region.blocks.len(), 2);
+        assert!(matches!(region.blocks[1], UniformInstrBlock::Regular(_)));
     }
 }

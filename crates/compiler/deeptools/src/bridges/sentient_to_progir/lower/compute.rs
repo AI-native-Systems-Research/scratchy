@@ -26,7 +26,9 @@ use crate::bridges::sentient_to_progir::construct::compute::{
     construct_ternary_instr, construct_unary_instr,
 };
 use crate::bridges::sentient_to_progir::construct::mask_and_splat::{
-    ActiveMaskValue, construct_incr_mask_instr, construct_samv_instr, construct_set_mask_instr,
+    ActiveMaskValue, SplatPadInput, SplatPadOp, SplatPadRefusal, SplatTarget,
+    construct_incr_mask_instr, construct_samv_instr, construct_set_mask_instr,
+    construct_splat_pad_instr,
 };
 use crate::bridges::sentient_to_progir::construct::opaque::{
     OpaqueInvocation, OpaqueRefusal, construct_opaque_instr,
@@ -41,7 +43,7 @@ use crate::bridges::sentient_to_progir::lower::control::CodeGraph;
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::{
     LoweredOp, address_scale, update_label_and_add_to_code_graph,
 };
-use crate::bridges::sentient_to_progir::state::{CopyOps, OpSite, RegsToInit, UnitKey};
+use crate::bridges::sentient_to_progir::state::{CopyOps, OpSite, RegGraphs, RegsToInit, UnitKey};
 use crate::bridges::sentient_to_progir::uniform::block::InstrIndex;
 use crate::bridges::sentient_to_progir::uniform::instr::OperandMapRefusal;
 use crate::bridges::sentient_to_progir::utils::ComputeUnit;
@@ -574,7 +576,57 @@ pub fn lower_incr_mask_operation(dbg_name: Option<&str>, graph: CodeGraph<'_>) {
         false,
     );
 }
-// crustify:todo: e124_LowerSplatOperation
+/// ONE `sentient.splat`'s OPERANDS — [`construct_splat_pad_instr`]'s input, target and attributes.
+///
+/// ⭐ ONE STRUCT RATHER THAN THREE ARGUMENTS, the grouping this crate makes instead of permitting
+/// `#[allow(clippy::too_many_arguments)]`.
+pub struct Splatted<'a> {
+    /// What is splatted: a port, or the constants an IMMCOPY carries.
+    pub input: SplatPadInput<'a>,
+    /// Where it lands.
+    pub output: SplatTarget,
+    /// The op's own attributes.
+    pub op: &'a SplatPadOp<'a>,
+}
+
+/// Replaces: e124_LowerSplatOperation
+///
+/// One `sentient.splat` appended as whichever of `SPLAT` and `IMMCOPY` its input and its
+/// `$programHeader` pick.
+///
+/// ⛔ THE REGISTER-INITIALISER ROUTE APPENDS NOTHING AND SO CARRIES NO LABEL: `has_value()` (`:935`)
+/// is the whole of the reference's guard, and an unpadded constant in a program header takes it
+/// ([`construct_splat_pad_instr`], `:3843`).
+#[must_use]
+pub fn lower_splat_operation<A: Arch>(
+    comp: ComputeUnit,
+    splatted: Splatted<'_>,
+    units: &[UnitKey],
+    reg_graph: &mut RegGraphs,
+    graph: CodeGraph<'_>,
+    copy_ops: Option<&mut u32>,
+) -> Vec<SplatPadRefusal> {
+    let (splat_or_immcopy_instr, refused) = construct_splat_pad_instr::<A>(
+        comp,
+        splatted.input,
+        splatted.output,
+        splatted.op,
+        units,
+        reg_graph,
+        copy_ops,
+    );
+    if let Some(instr) = splat_or_immcopy_instr {
+        update_label_and_add_to_code_graph(
+            graph.labels,
+            graph.region,
+            graph.at,
+            LoweredOp::Other,
+            instr,
+            false,
+        );
+    }
+    refused
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -583,6 +635,7 @@ mod unit_tests {
     use crate::bridges::sentient_to_progir::construct::compute::{
         BinaryOperand, ComputeSlot, MacOperand,
     };
+    use crate::bridges::sentient_to_progir::construct::mask_and_splat::{Splat, SplatPadConst};
     use crate::bridges::sentient_to_progir::construct::opaque::LoopCount;
     use crate::bridges::sentient_to_progir::construct::reg_init::ImmSource;
     use crate::bridges::sentient_to_progir::construct::scalar::{AddrAddOperands, AddrFile};
@@ -595,8 +648,9 @@ mod unit_tests {
     use crate::islands::progir::{OpCode, OperandField};
     use crate::islands::sentient::dialects::sentient::{
         Binary, BinaryOp, FmaMode, IStateIndex, LrfIndex, Operand as SenOperand, Precision,
-        RawPrecision, ResultPorts, SliceId, UnaryOp, UnrollFactor, ValidEntries, WslLen,
+        RawPrecision, ResultPorts, SliceId, SplatPad, UnaryOp, UnrollFactor, ValidEntries, WslLen,
     };
+    use crate::units::{Core, Corelet, DfirUnit};
 
     /// The op every lowering here appends to, and what came out: `(opcode, tag, comment)`.
     fn emitted(region: &UniformInstrBlocks) -> Vec<(OpCode, Option<String>, Comment)> {
@@ -1218,6 +1272,93 @@ mod unit_tests {
                 ),
                 (OpCode::INCRMASK, None, Comment::None),
             ]
+        );
+    }
+
+    /// e124 — ⭐ IBM'S OWN TWO SPLATS: `splat_none_constant.mlir:7`'s
+    /// `SFP_SPLAT :: … tgtrf:R0  // splat #1` is appended and takes the op's label, while
+    /// `splat-vector-reg-init.mlir:8-11`'s unpadded constant in a program header appends nothing.
+    #[test]
+    fn a_port_splat_is_appended_under_its_label_and_a_header_constant_is_not() {
+        let mut labels = Labels::default();
+        labels.claim(OpSite(0), "splat-label".to_owned());
+        let mut region = UniformInstrBlocks::default();
+        let mut reg_graph = RegGraphs::default();
+        let unpadded = Splat {
+            pad: SplatPad::None,
+            mask: 0,
+            unroll: UnrollFactor::X1,
+            unroll_incr_result: false,
+        };
+        let refused = lower_splat_operation::<Dd2>(
+            ComputeUnit::Sfp,
+            Splatted {
+                input: SplatPadInput::Port(Port::Pe),
+                output: SplatTarget::Lrf(LrfIndex::L0),
+                op: &SplatPadOp {
+                    splat: Splat {
+                        pad: SplatPad::Left,
+                        ..unpadded
+                    },
+                    precision: Precision::Fp16,
+                    program_header: false,
+                    dbg_name: Some("splat #1"),
+                },
+            },
+            &[],
+            &mut reg_graph,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut region,
+                at: OpSite(0),
+            },
+            None,
+        );
+        assert!(refused.is_empty());
+        assert_eq!(
+            emitted(&region),
+            vec![(
+                OpCode::SPLAT,
+                Some("splat-label".to_owned()),
+                Comment::Common("splat #1".to_owned()),
+            )]
+        );
+        // ⛔ AND THE HEADER'S UNPADDED CONSTANT INITIALISES THE REGISTER INSTEAD, LABEL AND ALL.
+        let pe = UnitKey {
+            unit: DfirUnit::Pe,
+            core: Core::checked(1).expect("every arch has core 1"),
+            corelet: Corelet::checked(0),
+        };
+        let mut header_region = UniformInstrBlocks::default();
+        let refused = lower_splat_operation::<Dd2>(
+            ComputeUnit::Pe,
+            Splatted {
+                input: SplatPadInput::Const(SplatPadConst::Scalar {
+                    value: 23129,
+                    is_symbol: false,
+                }),
+                output: SplatTarget::Lrf(LrfIndex::L0),
+                op: &SplatPadOp {
+                    splat: unpadded,
+                    precision: Precision::Fp16,
+                    program_header: true,
+                    dbg_name: None,
+                },
+            },
+            &[pe],
+            &mut reg_graph,
+            CodeGraph {
+                labels: &mut labels,
+                region: &mut header_region,
+                at: OpSite(0),
+            },
+            None,
+        );
+        assert!(refused.is_empty());
+        assert!(header_region.blocks.is_empty());
+        assert!(
+            reg_graph.get(pe).is_some(),
+            "the register was initialised instead"
         );
     }
 }

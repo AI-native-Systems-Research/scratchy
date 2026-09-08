@@ -41,6 +41,13 @@ impl AddressScale {
     pub const fn get(self) -> u32 {
         self.0
     }
+
+    /// `is_multicast ? 1 : GetAddressScale(comp, op)` (`LowerSentientHelper.cpp:415`) — the one scale
+    /// nothing looks up, because a multicast id is not an address.
+    #[must_use]
+    pub const fn unscaled() -> AddressScale {
+        AddressScale(1)
+    }
 }
 
 /// Replaces: e009_GetAddressScale
