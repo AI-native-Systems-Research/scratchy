@@ -444,6 +444,8 @@ mod unit_tests {
     /// `agen.vector_store %value, %view[..] : memref<?x64x4xf16>, vector<64xf16>`.
     fn store(value: Val, view: Val) -> DfirOp {
         DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value,
             view,
             indices: vec![Index::Const(0), Index::Const(0), Index::Const(0)],

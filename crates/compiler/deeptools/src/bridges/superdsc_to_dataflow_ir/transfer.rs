@@ -41,8 +41,6 @@
 
 // crustify:todo: e089_constructStreamingOrDoubleBufferingStore
 // crustify:todo: e090_GenerateLoadAndSendFromDataTransferNode
-// crustify:todo: e091_GenerateLoadAndStoreFromDataTransferNode
-// crustify:todo: e092_GenerateDataTransfersForViaIfSo
 // crustify:todo: e097_GenerateReceiveAndStoreFromDataTransferNode
 // crustify:todo: e098_GenerateDataTranferForSrc
 // crustify:todo: e102_GenerateDataTranferForDst
@@ -65,7 +63,7 @@ use crate::islands::dataflow_ir::dialects::vectorchain::Computed;
 use crate::islands::dataflow_ir::dialects::{
     Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results, scf, vectorchain,
 };
-use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
+use crate::islands::dataflow_ir::link::{DynLink, RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, MemRef, ScalarTy,
     TensorCategory, Vector,
@@ -2871,6 +2869,293 @@ pub fn construct_samv_operation(
     ops
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 091 + 092/110 — THE TRANSFER WITH NO SOURCE TO LOAD, AND THE HOP THAT ONLY PASSES ONE ON
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT A LOAD-AND-STORE STORES — the reference's `src_storage == ZERO` and `== CONSTANT` arms.
+///
+/// ⛔⛔ TWO VARIANTS IS `emitError("Unknown source storage for load_and_store operation")` GONE. The
+/// reference tests two `SenComponents` out of a hundred and stops on every other (`:2415-2417`); a
+/// storage this transfer cannot read has no spelling here.
+pub enum LoadAndStoreSource<'c> {
+    /// `ZERO` — `builder.getZeroAttr(result_type)`, which for a vector is a splat dense constant.
+    Zero,
+    /// `CONSTANT` — `dsc_->constantInfo_.at(srcLdsAndLoopOffsets_.constantId_)`, widened by
+    /// [`constant_bitstream_and_shuffle`].
+    ///
+    /// ⛔ THE REFERENCE'S `DT_CHECK(cst_idx >= 0)` IS DEAD: `constantInfo_.at(cst_idx)` runs on the
+    /// line ABOVE it (`:2402-2406`), so a negative id throws out of the map lookup first. Resolving
+    /// the constant before it can be named removes both.
+    Constant {
+        /// `cst_info` — the fold space, its one width and its format.
+        data: &'c ConstantData,
+        /// The `(core, corelet, fold)` handles entry 032 keys the fold space by.
+        handles: &'c Handles,
+        /// `is_symbolic`.
+        values: BitstreamValues,
+        /// `cst_info.data_` per handle, as entry 032 reads it.
+        bitstream: &'c dyn Fn(Core, Corelet, u32) -> Vec<i64>,
+    },
+}
+
+/// WHERE A LOAD-AND-STORE'S OPS GO — the insertion point the reference moves `loop_builder` to.
+///
+/// ⛔⛔ NOT A BARE `Vec<DfirOp>`, for the reason [`ReceiveAndSend`] is not one: `if
+/// (!outer_loops.empty())` re-points the builder at the START of a loop body (`:2385-2394`), so a
+/// caller that appends the list where it stands stores ONCE for a transfer of the whole nest.
+pub enum LoadAndStore {
+    /// `outer_loops` was non-empty: these ops go at the START of the body of the loop
+    /// `(*dsc_loops_to_mlir_loops_map_)[outer_loops.front().loop_].front()` holds.
+    ///
+    /// ⛔ THAT IS THE **OUTERMOST** MLIR LOOP OF THAT DSC NODE, not the dim-matched one
+    /// [`LoopStride::iv`] carries: the reference reads the record with `.front()` and entry 028's
+    /// mirrored index is not applied (`:2387`). The whole record travels, so the caller resolves it.
+    InLoopFor {
+        /// `outer_loops.front()`.
+        outer: LoopStride,
+        /// The input, the destination's view and address, and the `agen.vector_store`.
+        body: Vec<DfirOp>,
+    },
+    /// There were none: at the builder's own insertion point.
+    AtInsertionPoint(Vec<DfirOp>),
+}
+
+/// EVERYTHING ONE LOAD-AND-STORE READS OFF ITS TRANSFER NODE — the DESTINATION side, the source
+/// being [`LoadAndStoreSource`].
+#[derive(Debug, Clone, Copy)]
+pub struct LoadAndStoreTransfer<'i> {
+    /// `dst_storage` — the component the destination view is addressed through.
+    pub storage: Component,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_`, and [`None`] for the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `{comp_, dst_storage}` as the address-granularity table keys it.
+    pub location: DataLocation,
+    /// `getElementType(result_type)` — the precision the granularity factor divides by.
+    pub precision: DataType,
+    /// `transfer_->name_` — the store's `dbgName`.
+    pub name: &'i str,
+    /// `dsc_->name_` — the node an error names.
+    pub node: &'i str,
+    /// `*dst_view_sizes_core_specific` — `dstLoopsAndSizes_[dst_idx]`, resolved for this core.
+    pub view_sizes: &'i [ViewSize],
+    /// The destination view's element type.
+    pub elem: ElemType,
+    /// `view_sizes.outerLoops_` of the SOURCE corelet view, which is all `outer_loops` ever holds.
+    pub outer_loops: &'i [LoopStride],
+    /// `unitTimeTransferChunkSize_`, `unitTimeTransferChunkStride_` and `unitTimeTransferNumChunks_`.
+    pub chunks: UnitTimeChunks<'i>,
+    /// `result_type` — the vector one unit of time stores.
+    pub result_ty: Vector,
+}
+
+/// Replaces: e091_GenerateLoadAndStoreFromDataTransferNode
+///
+/// **091/110** `SNTransferLowering::GenerateLoadAndStoreFromDataTransferNode` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2337` (132L).
+///
+/// A TRANSFER WITH NOTHING TO LOAD — a zero or a constant vector, stored into the destination's view.
+///
+/// ⛔⛔ `is_load = true` ON A STORE (`:2451-2457`), so the set is read from the chunks' `src_index`.
+///
+/// ⛔⛔ THE IMPLICIT-LOOP BRANCH IS UNREACHABLE: `implicit_loops` is declared EMPTY one line above
+/// `if (!ctgs_transfer_sizes.empty() && !implicit_loops.empty())` (`:2379-2381`), so `outer_loops` is
+/// always `view_sizes.outerLoops_` — synthesising the nest emits a program the reference never emits.
+#[must_use]
+pub fn generate_load_and_store_from_data_transfer_node(
+    vals: &mut Values,
+    handlers: &Handlers,
+    transfer: &LoadAndStoreTransfer<'_>,
+    source: LoadAndStoreSource<'_>,
+    address: impl FnOnce(&mut Values, &mut Vec<DfirOp>, Factor) -> Val,
+) -> LoadAndStore {
+    let mut ops: Vec<DfirOp> = Vec::new();
+
+    let input = match source {
+        // `arith::ConstantOp::create(.., result_type, builder.getZeroAttr(result_type))`.
+        LoadAndStoreSource::Zero => {
+            let result = vals.mint();
+            ops.push(DfirOp::Arith(arith::Op::DenseConstant {
+                result,
+                splat: 0,
+                ty: transfer.result_ty,
+            }));
+            result
+        }
+        // `GenerateConstantBitStreamAndShuffle(cst_info, loop_builder, input)`.
+        LoadAndStoreSource::Constant {
+            data,
+            handles,
+            values,
+            bitstream,
+        } => constant_bitstream_and_shuffle(
+            vals,
+            &mut ops,
+            handles,
+            data,
+            values,
+            bitstream,
+            transfer.result_ty,
+        )
+        .unwrap_or_else(|| {
+            emit_error(
+                transfer.node,
+                "Unable to create constant bitstream and shuffle",
+            )
+        }),
+    };
+
+    // `getAddressGranularityMultiplyFactor(comp_, dst_storage, getElementType(result_type))`.
+    let factor = address_granularity_multiply_factor(transfer.location, transfer.precision);
+    // `needsUniform() ? constructUniformizedFoldedAddress(..) : ConstantIndexOp(int(start * factor))`.
+    let start_address = address(vals, &mut ops, factor);
+
+    // `constructElementsOfAgenDataTransfer(loop_builder, dst_storage, /*is_load*/ true, address, ..)`.
+    let elements = elements_of_agen_data_transfer(
+        vals,
+        &mut ops,
+        handlers,
+        &AgenStorage {
+            storage: transfer.storage,
+            core: transfer.core,
+            corelet: transfer.corelet,
+            side: TransferSide::Load,
+            start_address,
+            view_sizes: transfer.view_sizes,
+            elem: transfer.elem,
+            outer_loops: transfer.outer_loops,
+            addressed_as: AddressedAs::Schedule,
+        },
+        &transfer.chunks,
+    )
+    .unwrap_or_else(|| {
+        emit_error(
+            transfer.node,
+            "Unable to construct elements of agen data transfer",
+        )
+    });
+
+    // `agen::VectorStoreOp::create(loop_builder, loc, input, view.getResult(),
+    //  getStringAttr(transfer_->name_), base_address_map, base_address_args, transfer_set,
+    //  transfer_order)`. ⚠️ `transfer_order` is dropped because `store_order` is DERIVED — see
+    // [`agen::Access`] — and `AddressedAs::Schedule` keeps the layout at the rank the printer counts.
+    ops.push(DfirOp::Agen(agen::Op::VectorStore {
+        value: input,
+        view: elements.view.result,
+        indices: elements.base_address.indices,
+        dbg_name: Some(transfer.name.to_owned()),
+        access: agen::Access::Stated(elements.transfer_set),
+        view_ty: elements.view.ty,
+        ty: transfer.result_ty,
+    }));
+
+    // `if (!outer_loops.empty()) loop_builder.setInsertionPointToStart(<that loop's body>)`.
+    match transfer.outer_loops.first() {
+        Some(&outer) => LoadAndStore::InLoopFor { outer, body: ops },
+        None => LoadAndStore::AtInsertionPoint(ops),
+    }
+}
+
+/// THE ROUTE ONE DESTINATION TAKES, AND THE PASS-THROUGH ENTRY 081 EMITS ALONG IT.
+#[derive(Debug, Clone, Copy)]
+pub struct ViaTransfer<'i> {
+    /// `comp_` — the unit this program is lowered FOR, and the one looked for in the chain.
+    pub comp: Component,
+    /// `src.unit_` — the default `from`.
+    pub src: Component,
+    /// `dst_via.loc_.unit_` — the default `to`.
+    pub dst: Component,
+    /// `dst_via.via_`, in route order.
+    pub vias: &'i [Component],
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_`, and [`None`] for the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `dsc_->name_`.
+    pub node: &'i str,
+    /// `transfer_->name_`.
+    pub name: &'i str,
+    /// `*view_sizes_core_specific`.
+    pub view_sizes: &'i [ViewSize],
+    /// `unitTimeTransferChunkSize_.size()`.
+    pub unit_time_dims: usize,
+    /// `transfer_->replicationFactor_`.
+    pub replication: Replication,
+    /// `result_type`.
+    pub result_ty: Vector,
+}
+
+/// Replaces: e092_GenerateDataTransfersForViaIfSo
+///
+/// **092/110** `SNTransferLowering::GenerateDataTransfersForViaIfSo` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2617` (52L).
+///
+/// A UNIT THAT IS ONLY A HOP — one receive-and-send between its two neighbours in a via chain.
+///
+/// ⛔⛔ THE ENDS DEFAULT TO THE ROUTE'S: only a position that EXISTS replaces one, so the LAST via
+/// keeps the destination as its `to` and the FIRST keeps the source as its `from` (`:2634-2646`).
+///
+/// ⛔ FIRST MATCH WINS, THE DEDUP IS PER `(from, to)` PAIR, AND [`None`] IS NOT A REFUSAL — all four
+/// of the reference's early returns are `success()` (`:2637`, `:2655-2661`).
+#[must_use]
+pub fn generate_data_transfers_for_via_if_so(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    transfer: &ViaTransfer<'_>,
+    sticks: &mut ContiguousSticks,
+    explored: &mut Vec<(Component, Component)>,
+) -> Option<ReceiveAndSend> {
+    // `if (src.unit_ == comp_) return success();` and the same for `dst_via.loc_.unit_`.
+    if transfer.src == transfer.comp || transfer.dst == transfer.comp {
+        return None;
+    }
+
+    // `for (i) if (dst_via.via_[i] == comp_) { .. part_of_via = true; break; }`, and
+    // `if (!part_of_via) return success();`
+    let hop = transfer.vias.iter().position(|via| *via == transfer.comp)?;
+    // `if (i < via_.size() - 1) to = via_[i + 1];` — otherwise the destination stands.
+    let to = transfer.vias.get(hop + 1).copied().unwrap_or(transfer.dst);
+    // `if (i > 0) from = via_[i - 1];` — otherwise the source stands.
+    let from = hop
+        .checked_sub(1)
+        .and_then(|before| transfer.vias.get(before).copied())
+        .unwrap_or(transfer.src);
+
+    // `if (explored_pairs.find(from_to_pair) == end()) emplace; else return success();`
+    if explored.contains(&(from, to)) {
+        return None;
+    }
+    explored.push((from, to));
+
+    // `retrieveGetUnitOpInSameCore(builder, from, core_id_, corelet_id_)` and its `to` twin.
+    let src_unit =
+        retrieve_get_unit_op_in_same_core(vals, handlers, from, transfer.core, transfer.corelet)
+            .bind(ops);
+    let dst_unit =
+        retrieve_get_unit_op_in_same_core(vals, handlers, to, transfer.core, transfer.corelet)
+            .bind(ops);
+    let (to_end, from_end) = DynLink::between(src_unit, dst_unit).ends();
+
+    // `GenerateReceiveAndSendFromDataTransferNode(builder, src_unit_op, dst_unit_op, sticks_src_ss)`.
+    let count = sticks.whole().steady;
+    Some(generate_receive_and_send_from_data_transfer_node(
+        vals,
+        transfer.node,
+        transfer.name,
+        transfer.view_sizes,
+        transfer.unit_time_dims,
+        sticks,
+        transfer.replication,
+        from_end,
+        to_end,
+        count,
+        transfer.result_ty,
+    ))
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -4100,6 +4385,221 @@ mod unit_tests {
     }
 
     /// The storage handle the three entries retrieve, and a program unit that has already bound it.
+    /// 🎯 091/110 — ⛔ THE STORE FOLLOWS ITS OUTER LOOP, AND `is_load = true` ON A STORE.
+    ///
+    /// `if (!outer_loops.empty())` re-points the builder at that loop's body (`:2385-2394`), so a
+    /// caller appending the list where it stands stores once for a whole nest; and the 13-argument
+    /// `constructElementsOfAgenDataTransfer` call passes `/*is_load*/ true` (`:2451-2457`), so the
+    /// set is read from the chunks' `src_index` though the op emitted is `agen.vector_store`.
+    #[test]
+    fn a_zero_load_and_store_rides_its_outer_loop_and_reads_the_load_side_chunks() {
+        let ty = Vector {
+            len: 4,
+            elem: ElemType::F32,
+        };
+        let view_sizes = [view_size(PrimaryDim::In, 4), view_size(PrimaryDim::Out, 8)];
+        let outer_loops = [LoopStride {
+            size_idx: 0,
+            elem_offset: 4,
+            iv: Some(Val(81)),
+        }];
+        let chunk = ChunkDim {
+            size: 4,
+            src_index: Some(0),
+            dst_index: None,
+        };
+        let mut transfer = LoadAndStoreTransfer {
+            storage: Component::Unit(DfirUnit::Lx),
+            core: Core::checked(0).expect("core 0"),
+            corelet: Some(Corelet::checked(0).expect("corelet 0")),
+            location: DataLocation::LxluLx,
+            precision: DataType::IeeeFp32,
+            name: "T",
+            node: "N",
+            view_sizes: &view_sizes,
+            elem: ElemType::F32,
+            outer_loops: &outer_loops,
+            chunks: UnitTimeChunks {
+                sizes: core::slice::from_ref(&chunk),
+                stride: None,
+                num_strides: 0,
+            },
+            result_ty: ty,
+        };
+
+        let mut vals = Values::default();
+        let placed = generate_load_and_store_from_data_transfer_node(
+            &mut vals,
+            &agen_handlers(),
+            &transfer,
+            LoadAndStoreSource::Zero,
+            |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                constant_index(vals, into, factor.scale(64))
+            },
+        );
+        match &placed {
+            LoadAndStore::InLoopFor { outer, body } => {
+                assert_eq!(
+                    *outer, outer_loops[0],
+                    "the record travels, not just its dim"
+                );
+                assert_eq!(
+                    printed(body),
+                    concat!(
+                        "%0 = arith.constant dense<0.000000e+00> : vector<4xf32>\n",
+                        "%1 = arith.constant 16 : index\n",
+                        "%2 = dataflow.get_logical_memory_view %9, %1 {layout_map = affine_map<(d0, d1) -> (d1 * 4 + d0)>} : index, index, memref<4x8xf32>\n",
+                        "%3 = arith.constant 0 : index\n",
+                        // ⛔ `store_set` is the LOAD side's: `d0` walks the chunk, `d1` is pinned.
+                        "agen.vector_store %0, %2[%81 * 4, 0] {dbgName = \"T\", store_order = affine_map<(d0, d1) -> (d0, d1)>, store_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 == 0)>} : memref<4x8xf32>, vector<4xf32>\n",
+                    ),
+                    "the zero, then the address, then the view, then the store",
+                );
+            }
+            LoadAndStore::AtInsertionPoint(_) => panic!("an outer loop was available"),
+        }
+
+        // ⛔ NO OUTER LOOP: the same ops, but the caller must NOT look for a body to enter.
+        transfer.outer_loops = &[];
+        let mut vals = Values::default();
+        let standing = generate_load_and_store_from_data_transfer_node(
+            &mut vals,
+            &agen_handlers(),
+            &transfer,
+            LoadAndStoreSource::Zero,
+            |vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                constant_index(vals, into, factor.scale(64))
+            },
+        );
+        match &standing {
+            // ⭐ THE SAME STORE, WITH BOTH SUBSCRIPTS CONSTANT — nothing strides it now.
+            LoadAndStore::AtInsertionPoint(ops) => assert_eq!(
+                printed(ops).lines().last(),
+                Some(concat!(
+                    "agen.vector_store %0, %2[0, 0] {dbgName = \"T\", ",
+                    "store_order = affine_map<(d0, d1) -> (d0, d1)>, ",
+                    "store_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 == 0)>} ",
+                    ": memref<4x8xf32>, vector<4xf32>",
+                )),
+            ),
+            LoadAndStore::InLoopFor { .. } => panic!("there is no outer loop to join"),
+        }
+    }
+
+    /// 🎯 092/110 — ⛔ THE ENDS DEFAULT TO THE ROUTE'S, AND A PAIR IS FORWARDED ONCE.
+    ///
+    /// The last via keeps the destination as its `to` and the first keeps the source as its `from`
+    /// (`:2634-2646`), so a lone via reads NEITHER neighbour out of `via_`; and `explored_pairs`
+    /// suppresses the second sighting of a pair (`:2655-2661`), which is what stops one hop from
+    /// forwarding the same wire twice.
+    #[test]
+    fn a_lone_via_takes_the_routes_own_ends_and_a_repeated_pair_forwards_nothing() {
+        let hop = Component::Unit(DfirUnit::L0lu);
+        let src = Component::Unit(DfirUnit::L3lu);
+        let dst = Component::Unit(DfirUnit::Lx);
+        let vias = [hop];
+        let view_sizes = [view_size(PrimaryDim::In, 4)];
+        let transfer = ViaTransfer {
+            comp: hop,
+            src,
+            dst,
+            vias: &vias,
+            core: Core::checked(0).expect("core 0"),
+            corelet: None,
+            node: "N",
+            name: "T",
+            view_sizes: &view_sizes,
+            unit_time_dims: 0,
+            replication: Replication::checked(1).expect("no replication"),
+            result_ty: Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+        };
+        // `sticks_src_ss` — the bound of the loop the pair gets when no view dim carries a walk.
+        let counts = StickCounts {
+            steady: 3,
+            epilogue: 3,
+        };
+        fn one_stick_per_dim() -> Vec<(PrimaryDim, StickCounts)> {
+            vec![(
+                PrimaryDim::In,
+                StickCounts {
+                    steady: 1,
+                    epilogue: 1,
+                },
+            )]
+        }
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let mut sticks = ContiguousSticks::new(counts, one_stick_per_dim());
+        let mut explored: Vec<(Component, Component)> = Vec::new();
+        let forwarded = generate_data_transfers_for_via_if_so(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            &transfer,
+            &mut sticks,
+            &mut explored,
+        )
+        .expect("the hop is a via");
+        // ⛔ THE SOURCE IS REUSED AND ONLY THE DESTINATION IS CREATED — `from` never came from `via_`.
+        assert_eq!(
+            printed(&ops),
+            "%0 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = \"C0-lx\", type = \"lx\"} : index\n",
+            "L3LU was already bound, so only the destination's `get_unit` is emitted",
+        );
+        match &forwarded {
+            ReceiveAndSend::InNewLoop(op) => assert_eq!(
+                printed(core::slice::from_ref(op)),
+                concat!(
+                    "affine.for %1 = 0 to 3 {\n",
+                    "  %2 = dataflow.receive %50 : vector<8xf16>\n",
+                    "  dataflow.send %0, %2 : vector<8xf16>\n",
+                    "} {dbgName = \"SingleImplicitLoopForTransfer(T)\"}\n",
+                ),
+                "receive from the SOURCE, send to the DESTINATION, `sticks_src_ss` times",
+            ),
+            ReceiveAndSend::InLoopFor { .. } => panic!("no dim carries contiguous transfers"),
+        }
+        assert_eq!(explored, vec![(src, dst)]);
+
+        // ⛔ THE SAME PAIR AGAIN: nothing, and no second `get_unit`.
+        let mut again: Vec<DfirOp> = Vec::new();
+        assert!(
+            generate_data_transfers_for_via_if_so(
+                &mut vals,
+                &mut again,
+                &l3lu_handlers(),
+                &transfer,
+                &mut ContiguousSticks::new(counts, one_stick_per_dim()),
+                &mut explored,
+            )
+            .is_none()
+                && again.is_empty(),
+            "an explored pair is already forwarded",
+        );
+
+        // ⛔ AN ENDPOINT IS NOT A VIA, even though it appears in `via_`.
+        let endpoint = ViaTransfer {
+            comp: src,
+            ..transfer
+        };
+        assert!(
+            generate_data_transfers_for_via_if_so(
+                &mut vals,
+                &mut Vec::new(),
+                &l3lu_handlers(),
+                &endpoint,
+                &mut ContiguousSticks::new(counts, one_stick_per_dim()),
+                &mut Vec::new(),
+            )
+            .is_none(),
+            "`src.unit_ == comp_` returns before the chain is walked",
+        );
+    }
+
     fn agen_handlers() -> Handlers {
         Handlers {
             units: vec![(

@@ -719,6 +719,8 @@ mod unit_tests {
             ty: LANES,
         });
         let store = DfirOp::Agen(agen::Op::VectorStore {
+            dbg_name: None,
+            access: agen::Access::OfView,
             value: Val(20),
             view: Val(11),
             indices: vec![Index::Const(0), Index::Const(0)],
