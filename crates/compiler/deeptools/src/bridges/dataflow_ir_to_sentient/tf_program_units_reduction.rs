@@ -583,8 +583,12 @@ pub fn run_on_operation<'p, A: Arch>(
         }
     }
 
+    // The reference erases a matched unit and leaves each survivor where it stood, so the module's
+    // remaining `program_unit` ops are in MODULE order — `mixed.mlir` prints `%1`'s unit (`:11`)
+    // before `%3`'s (`:97`). Bases are met in the reverse walk, so `.rev()` restores that order.
     reducible_groups
         .into_iter()
+        .rev()
         .map(|group| {
             // `for (auto tmp_unit : group.units_list_) for (auto fold : tmp_unit.getResults())
             // units_list.push_back(fold);` — one result per `get_unit` here, so one push per unit.
@@ -1064,15 +1068,15 @@ mod unit_tests {
                 .iter()
                 .map(|unit| unit.on.vals())
                 .collect::<Vec<_>>(),
-            vec![vec![Val(3), Val(2), Val(0)], vec![Val(1)]],
-            "the group order is the reverse walk's, not the module's"
+            vec![vec![Val(1)], vec![Val(3), Val(2), Val(0)]],
+            "the survivors come back in module order, as `mixed.mlir:11` then `:97` print them"
         );
         assert_eq!(
             reduced
                 .iter()
                 .map(|unit| unit.base.on.first())
                 .collect::<Vec<_>>(),
-            vec![Val(3), Val(1)],
+            vec![Val(1), Val(3)],
             "each group's base is the unit that survives in place"
         );
         // Each region binds its OWN argument — `getRegionArg` is per region, never per op.
