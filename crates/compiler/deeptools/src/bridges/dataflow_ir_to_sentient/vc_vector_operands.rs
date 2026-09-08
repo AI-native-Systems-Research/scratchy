@@ -1616,6 +1616,8 @@ mod unit_tests {
     /// `vectorchain.fast_exp %input : vector<128xbf16>` binding `result`.
     fn fast_exp(result: Val, input: Val) -> DfirOp {
         DfirOp::VectorChain(vc::Op::FastExp {
+            mask: None,
+            dbg_name: None,
             result,
             input,
             input_ty: V,
@@ -1626,6 +1628,8 @@ mod unit_tests {
     /// `vectorchain.floor %input` binding `result`.
     fn floor(result: Val, input: Val) -> DfirOp {
         DfirOp::VectorChain(vc::Op::Floor {
+            mask: None,
+            dbg_name: None,
             result,
             input,
             input_ty: V,
@@ -1965,6 +1969,7 @@ mod unit_tests {
         let mut scope = vec![
             dense(Val(0)),
             DfirOp::VectorChain(vc::Op::Binary {
+                dbg_name: None,
                 result: Val(1),
                 op1: Val(0),
                 op2: Val(0),

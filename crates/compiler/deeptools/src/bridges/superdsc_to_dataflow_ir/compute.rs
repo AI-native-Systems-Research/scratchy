@@ -186,6 +186,7 @@ pub fn single_val_custom_vector(
     }));
     let result = vals.mint();
     into.push(Op::VectorChain(vectorchain::Op::Shuffle {
+        pad: Vec::new(),
         result,
         input: bitstream,
         variable: Vec::new(),
@@ -821,6 +822,7 @@ pub fn compute_input_operand<A: Arch>(
                 MemoryFile::Forward(forward) => {
                     let result = vals.mint();
                     into.push(Op::VectorChain(vectorchain::Op::Shuffle {
+                        pad: Vec::new(),
                         result,
                         input: loaded.val(),
                         variable: Vec::new(),
@@ -948,6 +950,7 @@ fn broadcast_over_lanes(
     };
     let result = vals.mint();
     into.push(Op::VectorChain(vectorchain::Op::Shuffle {
+        pad: Vec::new(),
         result,
         input,
         variable: vec![vectorchain::ShuffleVariable {
@@ -1293,19 +1296,731 @@ pub fn fmin_or_fmax_operation<A: Arch>(
             .collect(),
     )
 }
-// crustify:todo: e099_constructMACOperation
-// crustify:todo: e100_constructBinaryOrTernaryOperation
-// crustify:todo: e101_constructUnaryOperation
+/// WHICH LANE MASK A COMPUTE CARRIES — `computeMaskLoopOffsets_.empty()` picks
+/// (`SNComputeLowering.cpp:997-1009`), and only the MAC reads the second arm.
+pub enum ComputeMask<'m> {
+    /// The map is empty: `getStaticContinuousMaskValue(.., compute_mask_)`.
+    Static(MaskValue),
+    /// It is not: `constructDynamicMasking(.., computeMaskLoopOffsets_.at(corelet_id))`.
+    Dynamic(PtDynamicMask<'m>),
+}
+
+/// A DYNAMIC COMPUTE MASK, WHICH ONLY A PT MAY HAVE.
+///
+/// ⛔ `DT_CHECK_MSG(gen_comp == PT, "Dynamic masking allowed only in PT units")` (`:1002-1003`) IS
+/// THIS TYPE: [`PtDynamicMask::on`] is the only way to build one and no other component yields it.
+pub struct PtDynamicMask<'m> {
+    /// `computeMaskLoopOffsets_.at(corelet_id_ == -1 ? 0 : corelet_id_)` — which corelet is the
+    /// lowering's own state, so the entry arrives already chosen.
+    pub mask: DynamicMask,
+    /// Entry 028's inputs, for the induction variable the mask's symbol is.
+    pub dims: &'m [PrimaryDim],
+    /// ditto.
+    pub mlir_loops: &'m [Val],
+}
+
+impl<'m> PtDynamicMask<'m> {
+    /// ⛔ [`None`] IS THE `DT_CHECK`, and it is the whole check.
+    #[must_use]
+    pub fn on(
+        comp: GenericComp,
+        mask: DynamicMask,
+        dims: &'m [PrimaryDim],
+        mlir_loops: &'m [Val],
+    ) -> Option<PtDynamicMask<'m>> {
+        matches!(comp, GenericComp::Pt).then_some(PtDynamicMask {
+            mask,
+            dims,
+            mlir_loops,
+        })
+    }
+}
+
+/// ONE MAC INPUT'S TYPE INPUTS — `formats[i]`, `elements[i]`, and the labelled data structure's
+/// override of BOTH the format AND the category (`:964-979`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacInputFormat {
+    /// `{dataFormat_, scaledLdsCategory_}` of `labeledDs_[myLdsIdx_]`; [`None`] is `myLdsIdx_ == -1`.
+    ///
+    /// ⛔ THE CATEGORY COMES FROM THE LDS TOO, which no other compute in this file reads — a
+    /// scaled operand's element is an MX type and the plain `REGULAR_TENSOR` default would print
+    /// the wrong element for it.
+    pub lds: Option<(DataType, TensorCategory)>,
+    /// `getComputeOperandFormats(*dsc_)[i]` — also entry 086's conversion target.
+    pub operand: DataType,
+    /// `getComputeOperandSizes(dsc_global_.sysDef)[i]`.
+    pub elements: Elements,
+}
+
+/// Replaces: e099_constructMACOperation
+///
+/// **099/110** `SNComputeLowering.cpp:942` — three input operands at their own widths, one
+/// `multiply_and_accumulate` under the compute's lane mask, then every output operand.
+///
+/// ⛔⛔ THE RESULT TYPE IS THE **ACCUMULATOR'S**, `inputs[2].getType()` (`:996`): not a format's and
+/// not the first operand's, because a MAC reduces and `op1`/`op2` are the wide pair.
+/// ⛔ `FNMS` NEGATES `inputs[0]` AT THAT RESULT TYPE, not at its own (`:1013-1016`), which is why
+/// the emitted MAC prints two different operand types — see [`vectorchain::Op::MultiplyAccumulate`].
+/// ⭐ `constructTypeFromFormat`'s own failure cannot arise here: `elements[i]` is a stated count, so
+/// [`VectorWidth::Given`] never consults [`StickWidth::of`].
+pub fn mac_operation<A: Arch>(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    mac: MacOp,
+    inputs: &[(ComputeInput<'_>, MacInputFormat); 3],
+    mask: ComputeMask<'_>,
+    outputs: &[(ComputeOutput<'_>, OutputFormat)],
+) -> Option<Vec<Stored>> {
+    let mut input_operand = |source: &ComputeInput<'_>, format: MacInputFormat| -> Computed {
+        let (format_of, category) = match format.lds {
+            Some(pair) => pair,
+            None => (format.operand, TensorCategory::Regular),
+        };
+        let result_ty = type_from_format(
+            format_of,
+            ctx.comp,
+            category,
+            VectorWidth::Given(format.elements),
+        );
+        compute_input_operand::<A>(
+            vals,
+            into,
+            &OperandContext {
+                result_ty,
+                ..*ctx
+            },
+            source,
+            format.operand,
+        )
+        .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct MAC operation input operand"))
+    };
+    let [(a_source, a_format), (b_source, b_format), (acc_source, acc_format)] = inputs;
+    let a = input_operand(a_source, *a_format);
+    let b = input_operand(b_source, *b_format);
+    let acc = input_operand(acc_source, *acc_format);
+
+    let reduction_map = mac.reduction_map::<A>();
+    let result_ty = acc.ty();
+    let lanes = match mask {
+        ComputeMask::Static(mask) => static_mask_for_result(vals, into, result_ty, mask),
+        ComputeMask::Dynamic(dynamic) => dynamic_masking(
+            vals,
+            into,
+            result_ty,
+            dynamic.dims,
+            dynamic.mlir_loops,
+            dynamic.mask,
+        )?,
+    };
+
+    // `if (type_ == FNMS) input0 = NegOp::create(builder, loc, result_type, input0)`.
+    let a = if matches!(mac, MacOp::Fnms) {
+        let negated = vals.mint();
+        into.push(Op::VectorChain(vectorchain::Op::Neg {
+            result: negated,
+            input: a.val(),
+            mask: None,
+            input_ty: a.ty(),
+            ty: result_ty,
+        }));
+        Computed::of(negated, result_ty)
+    } else {
+        a
+    };
+
+    let result = vals.mint();
+    into.push(Op::VectorChain(vectorchain::Op::MultiplyAccumulate {
+        result,
+        a: a.val(),
+        b: b.val(),
+        acc: acc.val(),
+        mask: Some(lanes),
+        dbg_name: Some(ctx.name.to_owned()),
+        reduction_map,
+        a_ty: a.ty(),
+        b_ty: b.ty(),
+        ty: result_ty,
+    }));
+
+    compute_output_operands(
+        vals,
+        into,
+        &OperandContext {
+            result_ty,
+            ..*ctx
+        },
+        outputs,
+        Computed::of(result, result_ty),
+    )
+    .or_else(|| emit_error(ctx.name, "Unable to construct MAC operation output operand"))
+}
+
+/// `FMUL`'s two products — `instrAttribute_.mode_` (`SNComputeLowering.cpp:1099-1106`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MulMode {
+    /// Any mode but 11 — `X*Y`, `mul`.
+    Mul,
+    /// `mode_ == 11` — `X*Y/2`, `mul_div2`.
+    MulDiv2,
+}
+
+/// THE SIX `ComputeOpType`s THAT BECOME AN `element_wise_compare` (`:1136-1167`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    /// `GREATERTHAN`.
+    GreaterThan,
+    /// `GREATEREQUAL`.
+    GreaterEqual,
+    /// `LESSERTHAN`.
+    LesserThan,
+    /// `LESSEREQUAL`.
+    LesserEqual,
+    /// `EQUALTO`.
+    EqualTo,
+    /// `NOTEQUAL`.
+    NotEqual,
+}
+
+impl Comparison {
+    /// ⛔ THE REFERENCE'S OWN TWO LOCAL NAMES ARE SWAPPED — `LESSERTHAN` binds `le_operation` at
+    /// `compare_lt` and `LESSEREQUAL` binds `lt_operation` at `compare_le` (`:1148-1159`). The
+    /// ATTRIBUTE is what matters and this follows it, not the variable.
+    #[must_use]
+    pub const fn operator(self) -> vectorchain::CompareOp {
+        match self {
+            Comparison::GreaterThan => vectorchain::CompareOp::Gt,
+            Comparison::GreaterEqual => vectorchain::CompareOp::Ge,
+            Comparison::LesserThan => vectorchain::CompareOp::Lt,
+            Comparison::LesserEqual => vectorchain::CompareOp::Le,
+            Comparison::EqualTo => vectorchain::CompareOp::Eq,
+            Comparison::NotEqual => vectorchain::CompareOp::Neq,
+        }
+    }
+}
+
+/// WHICH BINARY OR TERNARY COMPUTE — `compute_op.type_`, with `FMUL`'s `mode_` folded in.
+///
+/// ⛔ THE UNMATCHED `else` IS ABSENT RATHER THAN AN ARM: it is a `failure()` (`:1176`), so no
+/// variant is the one thing this crate may not represent.
+pub enum BinaryOrTernary<'b> {
+    /// `FMAX` → `max`.
+    Fmax,
+    /// `FMIN` → `min`.
+    Fmin,
+    /// `FABSMAX` → `abs_max`.
+    Fabsmax,
+    /// `FMUL` → `mul` or `mul_div2`.
+    Fmul(MulMode),
+    /// `FSUB` → `sub`.
+    Fsub,
+    /// `OR` → `or0`.
+    Or,
+    /// `AND` → `and0`.
+    And,
+    /// `PACKMERGE` → a `pack`.
+    PackMerge {
+        /// `instrAttribute_.indices_`.
+        indices: &'b [i32],
+        /// `instrAttribute_.repetition_`, an `IndexAttr` on this op alone.
+        repetition: u32,
+        /// `instrAttribute_.sign_extend_`, as a `BoolAttr` here.
+        sign_extend: bool,
+    },
+    /// One of the six comparisons.
+    Compare(Comparison),
+    /// `SELECT` → an `element_wise_selection`. ⛔ THE ONLY TERNARY.
+    Select,
+}
+
+impl BinaryOrTernary<'_> {
+    /// `is_any_of(type_, FMAX, FABSMAX, FMIN, FMUL, FSUB, OR, AND)` and the chain inside it
+    /// (`:1090-1119`) — [`None`] for the arms that emit some other op.
+    #[must_use]
+    pub const fn binary_operator(&self) -> Option<vectorchain::BinaryOp> {
+        match self {
+            BinaryOrTernary::Fmax => Some(vectorchain::BinaryOp::Max),
+            BinaryOrTernary::Fmin => Some(vectorchain::BinaryOp::Min),
+            BinaryOrTernary::Fabsmax => Some(vectorchain::BinaryOp::AbsMax),
+            BinaryOrTernary::Fmul(MulMode::MulDiv2) => Some(vectorchain::BinaryOp::MulDiv2),
+            BinaryOrTernary::Fmul(MulMode::Mul) => Some(vectorchain::BinaryOp::Mul),
+            BinaryOrTernary::Fsub => Some(vectorchain::BinaryOp::Sub),
+            BinaryOrTernary::Or => Some(vectorchain::BinaryOp::Or),
+            BinaryOrTernary::And => Some(vectorchain::BinaryOp::And),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces: e100_constructBinaryOrTernaryOperation
+///
+/// **100/110** `SNComputeLowering.cpp:1036` — two or three input operands, one of four `vectorchain`
+/// ops under a static lane mask, then every output operand.
+///
+/// ⛔⛔ EVERY OP HERE IS BUILT AT `result_type`, WHICH IS `getComputeOperandFormats(..).back()` —
+/// NOT `inputs[0].getType()`, as the reference's own commented-out line at `:1077` once had it. The
+/// comparison arms therefore print a result of that format and not a `vector<Nxi1>`.
+/// ⛔ THE `SELECT`'s CONDITION IS `inputs[0]` (`:1168-1171`) — an arriving operand, so the third
+/// input is the one that needs three inputs to exist.
+/// ⭐ `DT_CHECK_MSG(mask_op, "Could not create valid mask")` cannot fire: a [`Predicate`] has no null.
+pub fn binary_or_ternary_operation<A: Arch>(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    which: &BinaryOrTernary<'_>,
+    inputs: &[(ComputeInput<'_>, OutputFormat)],
+    result_format: DataType,
+    mask: MaskValue,
+    outputs: &[(ComputeOutput<'_>, OutputFormat)],
+) -> Option<Vec<Stored>> {
+    // `if (!is_any_of(compute_op.inputs_.size(), 2, 3)) return failure()`.
+    let ([_, _] | [_, _, _]) = inputs else {
+        return None;
+    };
+    let mut operands = Vec::with_capacity(inputs.len());
+    for (source, format) in inputs {
+        let result_ty = type_from_compute_type(format.get(), ctx.comp)?;
+        operands.push(
+            compute_input_operand::<A>(
+                vals,
+                into,
+                &OperandContext {
+                    result_ty,
+                    ..*ctx
+                },
+                source,
+                format.operand,
+            )
+            .unwrap_or_else(|| {
+                emit_error(
+                    ctx.name,
+                    "Unable to construct Binary operation input operand",
+                )
+            }),
+        );
+    }
+    let [op1, op2, rest @ ..] = operands.as_slice() else {
+        return None;
+    };
+
+    let result_ty = type_from_compute_type(result_format, ctx.comp)?;
+    let lanes = static_mask_for_result(vals, into, result_ty, mask);
+    let result = vals.mint();
+    let dbg_name = Some(ctx.name.to_owned());
+    let op = match (which.binary_operator(), which) {
+        (Some(binary_op), _) => vectorchain::Op::Binary {
+            result,
+            op1: op1.val(),
+            op2: op2.val(),
+            mask: Some(lanes),
+            binary_op,
+            dbg_name,
+            // `builder.getDimIdentityMap()` — `(d0) -> (d0)`.
+            op_specific_map: AffineMap::unary(AffineExpr::dim(0)),
+            operand_ty: op1.ty(),
+            ty: result_ty,
+        },
+        (
+            None,
+            BinaryOrTernary::PackMerge {
+                indices,
+                repetition,
+                sign_extend,
+            },
+        ) => vectorchain::Op::Pack {
+            result,
+            op1: op1.val(),
+            op2: op2.val(),
+            mask: Some(lanes),
+            indices: indices.to_vec(),
+            dbg_name,
+            repetition: *repetition,
+            sign_extend: *sign_extend,
+            operand_ty: op1.ty(),
+            ty: result_ty,
+        },
+        (None, BinaryOrTernary::Compare(comparison)) => vectorchain::Op::ElementWiseCompare {
+            result,
+            op1: op1.val(),
+            op2: op2.val(),
+            mask: Some(lanes),
+            compare_op: comparison.operator(),
+            dbg_name,
+            operand_ty: op1.ty(),
+            ty: result_ty,
+        },
+        (None, BinaryOrTernary::Select) => {
+            // ⛔ A TWO-INPUT `SELECT` READS `inputs[2]` IN THE REFERENCE AND IS OUT OF BOUNDS
+            // (`:1170`); the arity that op needs is stated here instead.
+            let [rhs] = rest else { return None };
+            vectorchain::Op::ElementWiseSelection {
+                result,
+                cond: Predicate::of_operand(*op1),
+                lhs: op2.val(),
+                rhs: rhs.val(),
+                dbg_name,
+                mask: Some(lanes),
+                ty: result_ty,
+            }
+        }
+        (None, _) => return None,
+    };
+    into.push(Op::VectorChain(op));
+
+    compute_output_operands(
+        vals,
+        into,
+        &OperandContext {
+            result_ty,
+            ..*ctx
+        },
+        outputs,
+        Computed::of(result, result_ty),
+    )
+    .or_else(|| {
+        emit_error(
+            ctx.name,
+            "Unable to construct Binary operation output operand",
+        )
+    })
+}
+
+/// `FEST`'s TEN MODES — `instrAttribute_.mode_` (`SNComputeLowering.cpp:1316-1372`).
+///
+/// ⛔ 4 AND EVERYTHING ABOVE 9 ARE ABSENT: they are the *"Unknown estimate instruction."*
+/// `emitError`, so no variant names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FestMode {
+    /// `0` — `exp_estimate {version = a}`.
+    ExpA,
+    /// `1` — `exp_estimate {version = b}`.
+    ExpB,
+    /// `2` — `rec_estimate`, which takes no version.
+    Rec,
+    /// `3` — `ln_estimate`, likewise.
+    Ln,
+    /// `5` — `rsqrt_estimate`, likewise. ⛔ AND 4 IS NOT A MODE.
+    Rsqrt,
+    /// `6` — `sigmoid_estimate {version = slope}`.
+    SigmoidSlope,
+    /// `7` — `sigmoid_estimate {version = offset}`.
+    SigmoidOffset,
+    /// `8` — `tanh_estimate {version = slope}`.
+    TanhSlope,
+    /// `9` — `tanh_estimate {version = offset}`.
+    TanhOffset,
+}
+
+impl FestMode {
+    /// WHICH ESTIMATE AND WHICH VERSION — ⛔ `rec`, `ln` AND `rsqrt` TAKE NO `version` ATTRIBUTE AT
+    /// ALL, where the other six pass one explicitly.
+    #[must_use]
+    pub const fn estimate(
+        self,
+    ) -> (
+        vectorchain::EstimateKind,
+        Option<vectorchain::EstimateVersion>,
+    ) {
+        use vectorchain::EstimateKind as Kind;
+        use vectorchain::EstimateVersion as Version;
+        match self {
+            FestMode::ExpA => (Kind::Exp, Some(Version::A)),
+            FestMode::ExpB => (Kind::Exp, Some(Version::B)),
+            FestMode::Rec => (Kind::Rec, None),
+            FestMode::Ln => (Kind::Ln, None),
+            FestMode::Rsqrt => (Kind::Rsqrt, None),
+            FestMode::SigmoidSlope => (Kind::Sigmoid, Some(Version::Slope)),
+            FestMode::SigmoidOffset => (Kind::Sigmoid, Some(Version::Offset)),
+            FestMode::TanhSlope => (Kind::Tanh, Some(Version::Slope)),
+            FestMode::TanhOffset => (Kind::Tanh, Some(Version::Offset)),
+        }
+    }
+}
+
+/// `REDUCE`'s FIVE MODES — `mode_` 1, 8, 10, 12, 14 (`:1444-1459`); every other value is the
+/// *"Unknown binary operation for reduction."* `emitError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceMode {
+    /// `1` → `add`.
+    Add,
+    /// `8` → `max`.
+    Max,
+    /// `10` → `abs_max`.
+    AbsMax,
+    /// `12` → `min`.
+    Min,
+    /// `14` → `abs_min`.
+    AbsMin,
+}
+
+impl ReduceMode {
+    /// The `reduction_op` a `scan_with_gap` carries.
+    #[must_use]
+    pub const fn reduction(self) -> vectorchain::BinaryOp {
+        match self {
+            ReduceMode::Add => vectorchain::BinaryOp::Add,
+            ReduceMode::Max => vectorchain::BinaryOp::Max,
+            ReduceMode::AbsMax => vectorchain::BinaryOp::AbsMax,
+            ReduceMode::Min => vectorchain::BinaryOp::Min,
+            ReduceMode::AbsMin => vectorchain::BinaryOp::AbsMin,
+        }
+    }
+}
+
+/// `SPLAT`'s `instrAttribute_.sign_extend_` — ⛔ TWO VALUES, AND A THIRD IS THE `emitError`
+/// *"sign_extend has to be either 0 or 1."* (`:1435-1437`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignExtend {
+    /// `0` — every lane reads element 0 and the op has no `pad` operand.
+    No,
+    /// `1` — lane 0 reads element 0 and every other lane reads a `pad` zero.
+    Yes,
+}
+
+impl SignExtend {
+    /// THE `indices` TABLE, WHICH IS THE ELEMENT'S AS WELL AS THIS FLAG'S — eight entries for an
+    /// `f16` and four for an `f32` (`:1409-1434`).
+    ///
+    /// ⛔ [`None`] IS THE REFERENCE'S NULL OP: neither `if` has an `else`, so any other element
+    /// leaves `unary_op` unset and `getResult()` reads it anyway. The refusal moves to the one line
+    /// that can still name the element.
+    #[must_use]
+    pub fn splat_indices(self, elem: ElemType) -> Option<Vec<i32>> {
+        let lanes = match elem {
+            ElemType::F16 => 8,
+            ElemType::F32 => 4,
+            _ => return None,
+        };
+        Some(match self {
+            SignExtend::No => vec![0; lanes],
+            SignExtend::Yes => std::iter::once(0)
+                .chain(std::iter::repeat_n(-1, lanes - 1))
+                .collect(),
+        })
+    }
+}
+
+/// WHICH UNARY COMPUTE — `compute_op.type_`, with the `mode_` each arm dispatches on folded in.
+pub enum UnaryOp<'u> {
+    /// `FEST`.
+    Fest(FestMode),
+    /// `ICVT` `mode_ == 7` → a `fast_exp`. ⛔ NO OTHER ICVT MODE IS AN OP (`:1394-1402`).
+    IcvtFastExp,
+    /// `FLOOR` → a `floor`.
+    Floor,
+    /// `SPLAT` → a `shuffle` over one element.
+    Splat {
+        /// `instrAttribute_.sign_extend_`.
+        sign_extend: SignExtend,
+        /// `instrAttribute_.repetition_`.
+        repetition: u32,
+    },
+    /// `REDUCE` → a `scan_with_gap`.
+    Reduce(ReduceMode),
+    /// `SHUFFLE` → a `shuffle`, and ⛔ THE ONLY ARM THAT CHANGES THE RESULT TYPE.
+    Shuffle {
+        /// `outputsLdsAndLoopOffsets_[0].myLdsIdx_`, else `getComputeOperandFormats(*dsc_)[1]`.
+        output: OutputFormat,
+        /// `instrAttribute_.indices_`.
+        indices: &'u [i32],
+        /// `instrAttribute_.repetition_`.
+        repetition: u32,
+    },
+}
+
+/// Replaces: e101_constructUnaryOperation
+///
+/// **101/110** `SNComputeLowering.cpp:1276` — one input operand, one of six `vectorchain` ops under
+/// a static lane mask, then every output operand.
+///
+/// ⛔⛔ THE RESULT TYPE IS THE **INPUT FORMAT'S**, `unary_op_result_type = input_type` (`:1310`),
+/// and `SHUFFLE` is the one arm that reassigns it — to its own output format (`:1490`). The mask is
+/// built BEFORE that reassignment, so a shuffle's mask is stated over the INPUT's width.
+/// ⛔ AND THE ELEMENT THE SPLAT TABLE IS CHOSEN BY IS THAT FORMAT'S TOO, not the operand's: entry
+/// 086 may have converted the value to a different precision on the way in.
+/// ⭐ `scan_with_gap` AND BOTH SHUFFLES TAKE NO MASK, yet the `create_affine_mask` is still emitted.
+pub fn unary_operation<A: Arch>(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    which: &UnaryOp<'_>,
+    input: (&ComputeInput<'_>, OutputFormat),
+    mask: MaskValue,
+    outputs: &[(ComputeOutput<'_>, OutputFormat)],
+) -> Option<Vec<Stored>> {
+    let (source, format) = input;
+    let input_ty = type_from_compute_type(format.get(), ctx.comp)?;
+    let operand = compute_input_operand::<A>(
+        vals,
+        into,
+        &OperandContext {
+            result_ty: input_ty,
+            ..*ctx
+        },
+        source,
+        format.operand,
+    )
+    .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct unary operation input operand"));
+
+    let lanes = static_mask_for_result(vals, into, input_ty, mask);
+    let dbg_name = Some(ctx.name.to_owned());
+    // ⛔ EACH ARM MINTS ITS RESULT AFTER ITS OWN OPERANDS — a `pad` zero is an `arith.constant` the
+    // reference creates BEFORE the shuffle that reads it (`:1414-1416`).
+    let (result, result_ty, op) = match which {
+        UnaryOp::Fest(mode) => {
+            let (kind, version) = mode.estimate();
+            let result = vals.mint();
+            (
+                result,
+                input_ty,
+                vectorchain::Op::Estimate {
+                    result,
+                    input: operand.val(),
+                    kind,
+                    mask: Some(lanes),
+                    dbg_name,
+                    version,
+                    input_ty: operand.ty(),
+                    ty: input_ty,
+                },
+            )
+        }
+        UnaryOp::IcvtFastExp => {
+            let result = vals.mint();
+            (
+                result,
+                input_ty,
+                vectorchain::Op::FastExp {
+                    result,
+                    input: operand.val(),
+                    mask: Some(lanes),
+                    dbg_name,
+                    input_ty: operand.ty(),
+                    ty: input_ty,
+                },
+            )
+        }
+        UnaryOp::Floor => {
+            let result = vals.mint();
+            (
+                result,
+                input_ty,
+                vectorchain::Op::Floor {
+                    result,
+                    input: operand.val(),
+                    mask: Some(lanes),
+                    dbg_name,
+                    input_ty: operand.ty(),
+                    ty: input_ty,
+                },
+            )
+        }
+        UnaryOp::Splat {
+            sign_extend,
+            repetition,
+        } => {
+            let indices = sign_extend.splat_indices(input_ty.elem)?;
+            // `ValueRange{zero.getResult()}` into the `pad` group, and only when sign-extending.
+            let pad = match sign_extend {
+                SignExtend::No => Vec::new(),
+                SignExtend::Yes => vec![vectorchain::ShuffleVariable {
+                    val: constant_index(vals, into, 0),
+                    ty: ScalarTy::Index,
+                }],
+            };
+            let result = vals.mint();
+            (
+                result,
+                input_ty,
+                vectorchain::Op::Shuffle {
+                    result,
+                    input: operand.val(),
+                    variable: Vec::new(),
+                    pad,
+                    dbg_name,
+                    indices,
+                    repetition: *repetition,
+                    input_ty: operand.ty(),
+                    ty: input_ty,
+                },
+            )
+        }
+        UnaryOp::Reduce(mode) => {
+            let result = vals.mint();
+            (
+                result,
+                input_ty,
+                vectorchain::Op::ScanWithGap {
+                    result,
+                    input: operand.val(),
+                    reduction_op: mode.reduction(),
+                    dbg_name,
+                    input_ty: operand.ty(),
+                    ty: input_ty,
+                },
+            )
+        }
+        UnaryOp::Shuffle {
+            output,
+            indices,
+            repetition,
+        } => {
+            let output_ty = type_from_compute_type(output.get(), ctx.comp)?;
+            // "In case there is zero padding in the pattern, pass in zero constant to pad operand"
+            // (`:1495-1499`) — unconditionally, whatever the pattern.
+            let pad = vec![vectorchain::ShuffleVariable {
+                val: constant_index(vals, into, 0),
+                ty: ScalarTy::Index,
+            }];
+            let result = vals.mint();
+            (
+                result,
+                output_ty,
+                vectorchain::Op::Shuffle {
+                    result,
+                    input: operand.val(),
+                    variable: Vec::new(),
+                    pad,
+                    dbg_name,
+                    indices: indices.to_vec(),
+                    repetition: *repetition,
+                    input_ty: operand.ty(),
+                    ty: output_ty,
+                },
+            )
+        }
+    };
+    into.push(Op::VectorChain(op));
+
+    compute_output_operands(
+        vals,
+        into,
+        &OperandContext {
+            result_ty,
+            ..*ctx
+        },
+        outputs,
+        Computed::of(result, result_ty),
+    )
+    .or_else(|| {
+        emit_error(
+            ctx.name,
+            "Unable to construct Unary operation output operand",
+        )
+    })
+}
 // crustify:todo: e103_constructComputeOperation
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ComputeInput, ComputeOutput, DynamicMask, Handlers, Latch, MacOp, MaskValue, MinOrMax,
-        OperandContext, OutputFormat, StickWidth, Stored, VectorWidth, compute_input_operand,
-        compute_output_operand, compute_output_operands, dictionary_order, dynamic_masking,
-        fmin_or_fmax_operation, is_integer, opaque_operation, precision_conversion,
-        single_val_custom_vector, static_mask_for_result, type_from_compute_type, type_from_format,
+        BinaryOrTernary, ComputeInput, ComputeMask, ComputeOutput, DynamicMask, Handlers,
+        Latch, MacInputFormat, MacOp, MaskValue, MinOrMax, MulMode, OperandContext, OutputFormat,
+        SignExtend, StickWidth, Stored, UnaryOp, VectorWidth, binary_or_ternary_operation,
+        compute_input_operand, compute_output_operand, compute_output_operands, dictionary_order,
+        dynamic_masking, fmin_or_fmax_operation, is_integer, mac_operation, opaque_operation,
+        precision_conversion, single_val_custom_vector, static_mask_for_result,
+        type_from_compute_type, type_from_format, unary_operation,
     };
     use crate::arch::{Dd2, Elements, Sen1p5};
     use crate::bridges::dataflow_ir_to_sentient::vc_helper::{
@@ -1315,12 +2030,12 @@ mod unit_tests {
     use crate::generated::{DataType, OpaqueFunc, ParamKey, ParamValue, RegName};
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::dataflow::{Opaque, RegAddr};
-    use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, LaneMask};
+    use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, LaneMask, Predicate};
     use crate::islands::dataflow_ir::dialects::{Op, Val, arith, dataflow, vectorchain};
     use crate::islands::dataflow_ir::print::emit;
     use crate::islands::dataflow_ir::ty::{
-        AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, TensorCategory,
-        Vector,
+        AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, ScalarTy,
+        TensorCategory, Vector,
     };
     use crate::islands::sentient::dialects::{self as sen, Definitions, sentient};
 
@@ -1420,6 +2135,7 @@ mod unit_tests {
                     is_symbol: false,
                 }),
                 Op::VectorChain(vectorchain::Op::Shuffle {
+                    pad: Vec::new(),
                     variable: Vec::new(),
                     dbg_name: Some("v".to_owned()),
                     result: Val(1),
@@ -2317,5 +3033,259 @@ mod unit_tests {
                 data: Val(9),
             }
         );
+    }
+
+    // ─────────────────────────────── 099-101/110 ───────────────────────────────
+
+    /// 🎯 099/110 — ⛔ THE MAC RUNS AT THE ACCUMULATOR'S TYPE and `FNMS` NEGATES `inputs[0]` AT IT, so
+    /// the emitted op states three widths: the negated 32, the wide 128 and its own 32.
+    #[test]
+    fn the_mac_negates_its_first_factor_at_the_accumulators_own_type() {
+        let f16 = |len| Vector {
+            len,
+            elem: ElemType::F16,
+        };
+        let handlers = operand_handlers();
+        let ctx = OperandContext {
+            name: "fnms_0",
+            comp: GenericComp::Sfp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty: f16(64),
+        };
+        let format = |elements| MacInputFormat {
+            lds: None,
+            operand: DataType::Sen169Fp16,
+            elements: Elements(elements),
+        };
+        let latch = Latch::new(3).expect("latch 3");
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = mac_operation::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &ctx,
+            MacOp::Fnms,
+            &[
+                (ComputeInput::One, format(64)),
+                (ComputeInput::One, format(128)),
+                (ComputeInput::Zero, format(32)),
+            ],
+            ComputeMask::Static(MaskValue::Live8),
+            &[(
+                ComputeOutput::Latch(latch),
+                OutputFormat {
+                    lds: None,
+                    operand: DataType::Sen169Fp16,
+                },
+            )],
+        )
+        .expect("three splats at the compute's own format");
+
+        let mask = LaneMask::prefix_of(
+            32,
+            Vector {
+                len: 32,
+                elem: ElemType::Int(1),
+            },
+        );
+        assert_eq!(
+            ops[3..],
+            [
+                Op::VectorChain(vectorchain::Op::CreateAffineMask {
+                    result: Val(3),
+                    mask,
+                }),
+                Op::VectorChain(vectorchain::Op::Neg {
+                    result: Val(4),
+                    input: Val(0),
+                    mask: None,
+                    input_ty: f16(64),
+                    ty: f16(32),
+                }),
+                Op::VectorChain(vectorchain::Op::MultiplyAccumulate {
+                    result: Val(5),
+                    a: Val(4),
+                    b: Val(1),
+                    acc: Val(2),
+                    mask: Some(mask.binds(Val(3))),
+                    dbg_name: Some("fnms_0".to_owned()),
+                    reduction_map: AffineMap::unary(AffineExpr::dim(0).floordiv(1)),
+                    a_ty: f16(32),
+                    b_ty: f16(128),
+                    ty: f16(32),
+                }),
+            ]
+        );
+        assert_eq!(
+            stored,
+            vec![Stored::Latched {
+                latch,
+                data: Val(5),
+            }]
+        );
+    }
+
+    /// 🎯 100/110 — ⛔ THE SELECTION'S CONDITION IS `inputs[0]`, an arriving operand and not a
+    /// comparison's result, and every op is stated at the LAST format's type. ⚠️ A ONE-INPUT COMPUTE
+    /// is the reference's `failure()`.
+    #[test]
+    fn the_selection_takes_its_condition_from_the_first_operand() {
+        let ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let handlers = operand_handlers();
+        let ctx = OperandContext {
+            name: "select_0",
+            comp: GenericComp::Sfp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty: ty,
+        };
+        let format = OutputFormat {
+            lds: None,
+            operand: DataType::Sen169Fp16,
+        };
+        let latch = Latch::new(2).expect("latch 2");
+        let inputs = [
+            (ComputeInput::One, format),
+            (ComputeInput::Zero, format),
+            (ComputeInput::One, format),
+        ];
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = binary_or_ternary_operation::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &ctx,
+            &BinaryOrTernary::Select,
+            &inputs,
+            DataType::Sen169Fp16,
+            MaskValue::Live8,
+            &[(ComputeOutput::Latch(latch), format)],
+        )
+        .expect("three splats at the compute's own format");
+
+        let mask = LaneMask::prefix_of(
+            64,
+            Vector {
+                len: 64,
+                elem: ElemType::Int(1),
+            },
+        );
+        assert_eq!(
+            ops[3..],
+            [
+                Op::VectorChain(vectorchain::Op::CreateAffineMask {
+                    result: Val(3),
+                    mask,
+                }),
+                Op::VectorChain(vectorchain::Op::ElementWiseSelection {
+                    result: Val(4),
+                    cond: Predicate::of_operand(Computed::of(Val(0), ty)),
+                    lhs: Val(1),
+                    rhs: Val(2),
+                    dbg_name: Some("select_0".to_owned()),
+                    mask: Some(mask.binds(Val(3))),
+                    ty,
+                }),
+            ]
+        );
+        assert_eq!(
+            stored,
+            vec![Stored::Latched {
+                latch,
+                data: Val(4),
+            }]
+        );
+        // ⛔ `!is_any_of(compute_op.inputs_.size(), 2, 3)`.
+        assert!(
+            binary_or_ternary_operation::<Dd2>(
+                &mut vals,
+                &mut ops,
+                &ctx,
+                &BinaryOrTernary::Fmul(MulMode::MulDiv2),
+                &inputs[..1],
+                DataType::Sen169Fp16,
+                MaskValue::Live8,
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    /// 🎯 101/110 — ⛔ A SIGN-EXTENDING SPLAT READS ELEMENT 0 ONCE AND A `pad` ZERO IN EVERY OTHER
+    /// LANE, and that constant is emitted BEFORE the shuffle. ⚠️ THE TABLE HAS NO OTHER ELEMENT.
+    #[test]
+    fn the_sign_extending_splat_pads_every_lane_but_the_first() {
+        let ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let handlers = operand_handlers();
+        let ctx = OperandContext {
+            name: "splat_0",
+            comp: GenericComp::Sfp,
+            ex_unit: GenericComp::Sfp,
+            handlers: &handlers,
+            result_ty: ty,
+        };
+        let format = OutputFormat {
+            lds: None,
+            operand: DataType::Sen169Fp16,
+        };
+        let latch = Latch::new(1).expect("latch 1");
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = unary_operation::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &ctx,
+            &UnaryOp::Splat {
+                sign_extend: SignExtend::Yes,
+                repetition: 8,
+            },
+            (&ComputeInput::One, format),
+            MaskValue::Live8,
+            &[(ComputeOutput::Latch(latch), format)],
+        )
+        .expect("a splat at the compute's own format");
+
+        assert_eq!(
+            ops[2..],
+            [
+                Op::Arith(arith::Op::Constant {
+                    result: Val(2),
+                    value: 0,
+                }),
+                Op::VectorChain(vectorchain::Op::Shuffle {
+                    result: Val(3),
+                    input: Val(0),
+                    variable: Vec::new(),
+                    pad: vec![vectorchain::ShuffleVariable {
+                        val: Val(2),
+                        ty: ScalarTy::Index,
+                    }],
+                    dbg_name: Some("splat_0".to_owned()),
+                    indices: vec![0, -1, -1, -1, -1, -1, -1, -1],
+                    repetition: 8,
+                    input_ty: ty,
+                    ty,
+                }),
+            ]
+        );
+        assert_eq!(
+            stored,
+            vec![Stored::Latched {
+                latch,
+                data: Val(3),
+            }]
+        );
+        // ⛔ NEITHER `if` HAS AN `else` — a `bf16` splat leaves the reference's op null.
+        assert_eq!(SignExtend::Yes.splat_indices(ElemType::Bf16), None);
     }
 }

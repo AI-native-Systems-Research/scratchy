@@ -3121,6 +3121,8 @@ scf.if %2 {
                 ty: LANES,
             }),
             DfirOp::VectorChain(vectorchain::Op::Estimate {
+                mask: None,
+                dbg_name: None,
                 result: estimated,
                 input: loaded,
                 kind: vectorchain::EstimateKind::Rec,
@@ -3248,6 +3250,8 @@ agen.vector_store %4, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
                 ty: LANES,
             }),
             DfirOp::VectorChain(vectorchain::Op::Estimate {
+                mask: None,
+                dbg_name: None,
                 result: estimated,
                 input: loaded,
                 kind: vectorchain::EstimateKind::Rec,
