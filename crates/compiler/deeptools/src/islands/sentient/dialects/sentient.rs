@@ -1423,6 +1423,22 @@ impl RoutingDirection {
             Self::BothWays => "BothWays",
         }
     }
+
+    /// THE WIRE VALUE — `SentientTypes.td:676-679`, declaration order from zero.
+    ///
+    /// ⭐ IBM'S OWN CHECK LINE CONFIRMS IT, AND THAT IS WHY IT IS A NUMBER HERE AND NOT A SPELLING: a
+    /// multicast `load_and_send` carrying `dir = CounterClockwise` prints `node:1`
+    /// (`test/Conversion/SentientToProgIR/L3/core2core-multicast-simple-e2e.mlir:10,51`), because the
+    /// direction IS the `node` field of a multicast ST.
+    #[must_use]
+    pub const fn encoding(self) -> u32 {
+        match self {
+            Self::PseudoRandom => 0,
+            Self::CounterClockwise => 1,
+            Self::Clockwise => 2,
+            Self::BothWays => 3,
+        }
+    }
 }
 
 /// WHICH REGISTER WITHIN ITS FILE — `regIndex`.

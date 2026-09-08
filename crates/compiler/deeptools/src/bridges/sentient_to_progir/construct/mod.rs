@@ -1,5 +1,19 @@
 //! `ConstructProgIRHelper.cpp` — 46 units, one submodule per family.
 
+use crate::islands::progir::ty::{Operand, OperandValue};
+
+/// ONE FIELD'S VALUE AS AN ISA FIELD NAME — `OperandAttr(text, DESCRIPTIVE)`, which is what every
+/// `setCommonField` in this file that takes a string builds.
+pub(crate) fn descriptive(name: &str) -> Operand {
+    Operand::every(OperandValue::Descriptive(name.to_owned()))
+}
+
+/// ONE FIELD'S VALUE AS AN INTEGER — the implicit `OperandAttr(int)` behind the reference's
+/// `setCommonField("imm", 3)`.
+pub(crate) const fn int(value: i64) -> Operand {
+    Operand::every(OperandValue::Int(value))
+}
+
 /// THE COMPUTE INSTRUCTIONS — FMA, binary, unary and ternary, and the operand plumbing that
 pub mod compute;
 

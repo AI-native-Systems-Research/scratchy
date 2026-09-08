@@ -101,6 +101,39 @@ pub enum DataFormat {
     Bool,
 }
 
+impl DataFormat {
+    /// THE WIRE VALUE — `DataFormats`' declaration order (`util/sendefs/sendefs.h:30-53`), which is
+    /// what `datatype_virtual` shifts a one by and what an `OperandAttr`'s format records.
+    ///
+    /// ⛔⛔ **`INVALID` IS THE THIRD ENUMERATOR AND ITS SLOT IS STILL THERE.** This enum deliberately
+    /// has no `Invalid` variant, so a discriminant taken from Rust's own ordering is one too small for
+    /// every format past `IEEE_FP32` — `SENINT8` would encode as 7 instead of 8 and an int8 LDZ would
+    /// tell the senulator `datatype_virtual:128` where IBM's own CHECK line says **256**
+    /// (`test/Conversion/SentientToProgIR/L3/ldz.mlir:36`). Hence a table, never `as u32`.
+    #[must_use]
+    pub const fn encoding(self) -> u32 {
+        match self {
+            Self::Sen169Fp16 => 0,
+            Self::IeeeFp32 => 1,
+            // ⛔ 2 IS `INVALID`, which has no variant here.
+            Self::Sen143Fp8 => 3,
+            Self::Sen152Fp8 => 4,
+            Self::Sen153Fp9 => 5,
+            Self::Senint2 => 6,
+            Self::Senint4 => 7,
+            Self::Senint8 => 8,
+            Self::Senint16 => 9,
+            Self::Senint24 => 10,
+            Self::IeeeInt64 => 11,
+            Self::IeeeInt32 => 12,
+            Self::Senuint32 => 13,
+            Self::Senuint2 => 14,
+            // ⛔ 15 IS `IEEE_FP16`, which this enum also lacks; `BOOL` is 16.
+            Self::Bool => 16,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Bits;
