@@ -56,6 +56,51 @@ impl DataType {
     }
 }
 
+/// WHICH FORMAT A VALUE IS ON THE WIRE — `DataFormats` (`util/sendefs/sendefs.h:22-40`).
+///
+/// ⛔⛔ NOT [`DataType`], AND THE TWO ARE EASY TO MISTAKE FOR ONE ENUM. [`DataType`] is censused by
+/// `build.rs` from the formats the `.ddl` templates actually name; this is `util/sendefs`' own closed
+/// set, which is what `OperandAttr::senDataType_` records (`progir.h:271`) and what
+/// `addPESFPLRFImmcopyToRegInit` dispatches its bit packing on. This one has `SENINT2` and
+/// `IEEE_INT32`, which the census does not; the census has `Bfloat16`, two more fp8 spellings and
+/// `Sen121Fp4`, which this does not. Neither is a superset, so neither can stand in for the other.
+///
+/// ⛔ `INVALID` IS NOT A VARIANT. It is what `hasSenDataType` tests for (`progir.h:119`), so it is
+/// `Option::None` at the use site and cannot be recorded as if it were a format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DataFormat {
+    /// `SEN169_FP16` — the 1/6/9 half the compute units run on.
+    Sen169Fp16,
+    /// `IEEE_FP32`.
+    IeeeFp32,
+    /// `SEN143_FP8`.
+    Sen143Fp8,
+    /// `SEN152_FP8`.
+    Sen152Fp8,
+    /// `SEN153_FP9`.
+    Sen153Fp9,
+    /// `SENINT2`.
+    Senint2,
+    /// `SENINT4`.
+    Senint4,
+    /// `SENINT8`.
+    Senint8,
+    /// `SENINT16`.
+    Senint16,
+    /// `SENINT24` — ⛔ SIXTEEN BITS WIDE, not twenty-four; see [`DataType::bits`].
+    Senint24,
+    /// `IEEE_INT64`.
+    IeeeInt64,
+    /// `IEEE_INT32`.
+    IeeeInt32,
+    /// `SENUINT32`.
+    Senuint32,
+    /// `SENUINT2`.
+    Senuint2,
+    /// `BOOL`.
+    Bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::Bits;

@@ -3,6 +3,9 @@
 //!
 //! Authority: `sys-arch-spec/progir/progir.h` and `sys-arch-spec/arch_enums.h` on the pod.
 
+use crate::formats::DataFormat;
+use crate::islands::sentient::dialects::sentient::RegType as SenRegType;
+
 /// WHICH REGISTER FILE — ⭐ THE VENDORED ENUM, re-exported.
 ///
 /// ⛔⛔ THIS WAS HAND-TRANSCRIBED HERE AND IS NOW DELETED. `sys-arch-spec` ports `arch_enums.h`'s own
@@ -90,4 +93,112 @@ pub enum Invalid {
     Immediate,
     /// `REG_INIT` — a register read before anything initialised it.
     RegInit,
+}
+
+/// WHICH FOLD OF A FOLDED PROGRAM — `SdscFoldId` (`util/sendefs/sendefs.h:197`).
+///
+/// ⛔ NOT [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::FoldId`], which bridge 2
+/// deliberately narrowed to the single fold its span could reach. An `OperandAttr` genuinely holds
+/// one value PER FOLD (`progir.h:266-269`), so this one is the whole index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FoldId(pub u32);
+
+/// WHETHER AN OPERAND IS ONE VALUE OR ONE VALUE PER FOLD — `OperandAttr`'s `std::variant`
+/// (`progir.h:262-269`), whose eight alternatives are four scalars and the same four keyed by fold.
+///
+/// ⭐ TWO ALTERNATIVES, NOT EIGHT. The variant's scalar/map split is the only distinction that
+/// changes what gets emitted; which of the four payload types it is, is already [`OperandValue`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum PerFold {
+    /// One value, on every fold.
+    Every(OperandValue),
+    /// One value per fold, in fold order.
+    ByFold(Vec<(FoldId, OperandValue)>),
+}
+
+/// ONE OPERAND — `OperandAttr` whole (`progir.h:43-270`): the value, and the format it is in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Operand {
+    /// The value, common or per-fold.
+    pub value: PerFold,
+    /// `senDataType_` — ⛔ `None` IS `DataFormats::INVALID`, which is what `hasSenDataType` tests
+    /// for (`progir.h:119`), so the absence has no spelling of its own.
+    pub format: Option<DataFormat>,
+}
+
+impl Default for Operand {
+    /// `OperandAttr()` — ⛔ `type_ = UNKNOWN` AND NO FORMAT (`progir.h:257-271`), not a zero.
+    fn default() -> Self {
+        Operand {
+            value: PerFold::Every(OperandValue::Unknown),
+            format: None,
+        }
+    }
+}
+
+impl Operand {
+    /// ONE VALUE ON EVERY FOLD — `OperandAttr(input)` with no fold id.
+    #[must_use]
+    pub const fn every(value: OperandValue) -> Operand {
+        Operand {
+            value: PerFold::Every(value),
+            format: None,
+        }
+    }
+
+    /// `setSenDataType` (`progir.h:180`).
+    #[must_use]
+    pub fn in_format(self, format: DataFormat) -> Operand {
+        Operand {
+            value: self.value,
+            format: Some(format),
+        }
+    }
+
+    /// `setOperand(input, id)` — `setOperandImpl` (`progir.h:212-234`).
+    ///
+    /// ⛔⛔ THE TWO DIRECTIONS ARE NOT SYMMETRIC. With a fold id it MERGES into the per-fold map, and
+    /// a fold id arriving at a common value DISCARDS that value; without one it REPLACES everything,
+    /// so a common write after per-fold writes throws the whole map away.
+    pub fn set(&mut self, id: Option<FoldId>, value: OperandValue) {
+        match id {
+            None => self.value = PerFold::Every(value),
+            Some(id) => match &mut self.value {
+                PerFold::ByFold(folds) => match folds.iter_mut().find(|(at, _)| *at == id) {
+                    Some(entry) => entry.1 = value,
+                    None => folds.push((id, value)),
+                },
+                PerFold::Every(_) => self.value = PerFold::ByFold(vec![(id, value)]),
+            },
+        }
+    }
+}
+
+/// WHICH REGISTER FILE A SENTIENT LOCALE NAMES — `ProgramAndStateInfo::stringToRegType`
+/// (`progir.cpp:670-675`), which is `regTypeToString` flipped, applied to the uppercased locale.
+///
+/// ⛔ `None` IS WHERE THE REFERENCE ABORTS: `.at()` throws for a locale with no row — `unknown` and
+/// `unrelated` (unassigned), `imm` (an instruction field, not a file), `lccr`, and the two XRF
+/// POINTERS, which are not the `XRF` the table names.
+///
+/// ⛔⛔ AND `SCALE` HAS NO ROW EITHER — the table stops at `STATE`, the same off-by-one
+/// [`sys_arch_spec::arch_enums::MAX_VALUE_IS_NOT_THE_MAXIMUM`] records, leaking into the strings.
+#[must_use]
+pub const fn reg_file_of(locale: SenRegType) -> Option<RegType> {
+    match locale {
+        SenRegType::Lrf => Some(RegType::Lrf),
+        SenRegType::Lar => Some(RegType::Lar),
+        SenRegType::Lbr => Some(RegType::Lbr),
+        SenRegType::Ear => Some(RegType::Ear),
+        SenRegType::Ebr => Some(RegType::Ebr),
+        SenRegType::Gtr => Some(RegType::Gtr),
+        SenRegType::Mvr => Some(RegType::Mvr),
+        SenRegType::Jcr => Some(RegType::Jcr),
+        SenRegType::Unknown
+        | SenRegType::Imm
+        | SenRegType::Lccr
+        | SenRegType::XrfRdPtr
+        | SenRegType::XrfWrPtr
+        | SenRegType::Unrelated => None,
+    }
 }

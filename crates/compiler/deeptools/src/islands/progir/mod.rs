@@ -29,7 +29,7 @@ use crate::model::Model;
 use crate::workload::Workload;
 use sys_arch_spec::progir::{MAX_INSTRUCTIONS_PER_UNIT, MAX_REGISTERS_PER_UNIT};
 use sys_arch_spec::regfile::{Component, max_ibuff_entries};
-use ty::{Invalid, OperandValue, RegType};
+use ty::{Invalid, Operand, OperandValue, RegType};
 
 /// ONE REGISTER'S INITIAL CONTENT — one entry of a unit's register state.
 ///
@@ -49,8 +49,9 @@ pub struct RegInit {
     /// bitset. [`RegIndex`] is the Sentient rung's type, reused here because it is the same field with
     /// the same cap, one rung further down.
     pub index: RegIndex,
-    /// What it starts as.
-    pub value: OperandValue,
+    /// What it starts as — ⭐ THE WHOLE `OperandAttr`, because a register initialiser can hold one
+    /// value per FOLD (`addPESFPLRFImmcopyToRegInit`'s query-map arm) and a format alongside it.
+    pub value: Operand,
 }
 
 /// WHICH REGISTERS OF ONE FILE ARE SPOKEN FOR — a `std::bitset<kMaxCompRegs>` (`progir.h:534`).
@@ -140,7 +141,7 @@ pub struct Instruction {
     /// only its operands (`progir.h:281`).
     pub symbolic_opcode: Option<i64>,
     /// `instFields_` — the operand fields, in field order.
-    pub fields: Vec<(OperandField, OperandValue)>,
+    pub fields: Vec<(OperandField, Operand)>,
     /// `deadCode_`.
     pub dead: bool,
     /// `tag_` — a branch label, which `tagToPC` resolves (`progir.h:290`).

@@ -216,7 +216,7 @@ pub fn check_reg_defs<A: Arch, M: Model, W: Workload>(
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
-    use crate::islands::progir::{RegInit, ty::OperandValue};
+    use crate::islands::progir::{RegInit, ty::Operand, ty::OperandValue};
 
     struct M;
     impl Model for M {
@@ -307,7 +307,7 @@ mod unit_tests {
             vec![RegInit {
                 file: RegType::Ear,
                 index: RegIndex::at::<1>(),
-                value: OperandValue::Int(0),
+                value: Operand::every(OperandValue::Int(0)),
             }],
         ));
         let mut referenced = RegSet::empty();

@@ -17,11 +17,12 @@
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
 use crate::arch::Arch;
-use crate::islands::sentient::dialects::sentient::RegType;
+use crate::bridges::sentient_to_progir::state::{RegGraphs, UnitKey};
+use crate::islands::progir::RegInit;
+use crate::islands::progir::ty::{FoldId, Operand, OperandValue, reg_file_of};
+use crate::islands::sentient::dialects::sentient::{Reg, RegType};
 use sys_arch_spec::regfile::Component;
 use sys_arch_spec::values::OpUnit;
-
-// crustify:todo: e008_addToRegInit
 
 /// HOW MUCH ONE ADDRESS UNIT IS WORTH — an entry of `addressGranularityScalePerUnit`
 /// (`sysdef.cpp:531-556`), which `getAddressGranularityScale` looks up by `{component, storage}`.
@@ -73,6 +74,48 @@ pub fn op_code_prefix(comp: Component) -> OpUnit {
     OpUnit::of_component(comp)
 }
 
+/// Replaces: e008_addToRegInit
+///
+/// Record one SSA value's immediates as a register's initial contents on every unit.
+///
+/// ⭐ ONE OPERAND WHEN EVERY FOLD AGREES, per-fold otherwise (`:120-131`) — `all_same` collapses the
+/// fold map so an unfolded program carries no fold ids at all.
+///
+/// ⚠️ A LOCALE WITH NO REGISTER FILE, OR NO INDEX, WRITES NOTHING, where the reference has no guard
+/// and would turn `-1` into a huge `unsigned`; its own sibling `addToRegsToInit` reads `-1` as
+/// nothing to track.
+pub fn add_to_reg_init(
+    reg: Reg,
+    imm_vals: &[(UnitKey, Vec<(Option<FoldId>, i64)>)],
+    reg_graph: &mut RegGraphs,
+    is_symbolic: bool,
+) {
+    let (Some(index), Some(file)) = (reg.index, reg_file_of(reg.locale)) else {
+        return;
+    };
+    for (unit, folds) in imm_vals {
+        let Some((_, front)) = folds.first() else {
+            continue;
+        };
+        let held = |value: i64| {
+            if is_symbolic {
+                OperandValue::VariableSymbol(value)
+            } else {
+                OperandValue::Int(value)
+            }
+        };
+        let mut value = Operand::default();
+        if folds.iter().all(|(_, held)| held == front) {
+            value.set(None, held(*front));
+        } else {
+            for (fold, imm) in folds {
+                value.set(*fold, held(*imm));
+            }
+        }
+        reg_graph.add_reg_init(*unit, RegInit { file, index, value });
+    }
+}
+
 // crustify:todo: e068_getRegImmVals
 // crustify:todo: e093_AddToLabelsMap
 // crustify:todo: e094_updateLabelAndAddToCodeGraph
@@ -81,6 +124,9 @@ pub fn op_code_prefix(comp: Component) -> OpUnit {
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
+    use crate::islands::progir::ty::PerFold;
+    use crate::islands::sentient::dialects::sentient::RegIndex;
+    use crate::units::{Core, Corelet, DfirUnit};
 
     #[test]
     fn the_l0_store_unit_scales_by_the_pt_row_count() {
@@ -123,5 +169,44 @@ mod unit_tests {
         assert_eq!(op_code_prefix(Component::Lxsu), OpUnit::Lx);
         assert_eq!(op_code_prefix(Component::L3lu), OpUnit::L3);
         assert_eq!(op_code_prefix(Component::L3su), OpUnit::L3);
+    }
+
+    fn pe(core: u32) -> UnitKey {
+        UnitKey {
+            unit: DfirUnit::Pe,
+            core: Core::checked(core).expect("every arch has core 0"),
+            corelet: Corelet::checked(0),
+        }
+    }
+
+    /// Agreeing folds collapse to one operand; disagreeing ones stay per fold.
+    #[test]
+    fn agreeing_folds_collapse_to_a_single_operand() {
+        let reg = Reg {
+            locale: RegType::Lar,
+            index: Some(RegIndex::at::<2>()),
+        };
+        let mut reg_graph = RegGraphs::default();
+        add_to_reg_init(
+            reg,
+            &[
+                (pe(0), vec![(Some(FoldId(0)), 7), (Some(FoldId(1)), 7)]),
+                (pe(1), vec![(Some(FoldId(0)), 7), (Some(FoldId(1)), 9)]),
+            ],
+            &mut reg_graph,
+            false,
+        );
+        let zero = reg_graph.get(pe(0)).expect("core 0 was initialised");
+        assert_eq!(zero[0].file, crate::islands::progir::ty::RegType::Lar);
+        assert_eq!(zero[0].index, RegIndex::at::<2>());
+        assert_eq!(zero[0].value.value, PerFold::Every(OperandValue::Int(7)));
+        let one = reg_graph.get(pe(1)).expect("core 1 was initialised");
+        assert_eq!(
+            one[0].value.value,
+            PerFold::ByFold(vec![
+                (FoldId(0), OperandValue::Int(7)),
+                (FoldId(1), OperandValue::Int(9)),
+            ])
+        );
     }
 }

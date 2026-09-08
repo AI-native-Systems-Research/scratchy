@@ -23,7 +23,7 @@
 
 use crate::arch::Arch;
 use crate::islands::progir::dialects::{Op as ProgIrOp, init};
-use crate::islands::progir::ty::{OperandValue, RegType};
+use crate::islands::progir::ty::{Operand, OperandValue, RegType};
 use crate::islands::progir::{Program, RegBits, RegInit, UnitRegState, print};
 use crate::islands::sentient;
 use crate::model::Model;
@@ -79,7 +79,7 @@ pub fn initialize_utilized_registers<A: Arch, M: Model, W: Workload>(
                         state.push(RegInit {
                             file: *file,
                             index,
-                            value: OperandValue::Int(0),
+                            value: Operand::every(OperandValue::Int(0)),
                         });
                     }
                 }
@@ -154,7 +154,7 @@ mod unit_tests {
             vec![RegInit {
                 file: RegType::Lrf,
                 index: RegIndex::at::<1>(),
-                value: OperandValue::Int(7),
+                value: Operand::every(OperandValue::Int(7)),
             }],
         ));
         let regs_to_init = vec![(
@@ -173,12 +173,12 @@ mod unit_tests {
                     RegInit {
                         file: RegType::Lrf,
                         index: RegIndex::at::<1>(),
-                        value: OperandValue::Int(7),
+                        value: Operand::every(OperandValue::Int(7)),
                     },
                     RegInit {
                         file: RegType::Lar,
                         index: RegIndex::at::<2>(),
-                        value: OperandValue::Int(0),
+                        value: Operand::every(OperandValue::Int(0)),
                     },
                 ],
             )]
@@ -199,7 +199,7 @@ mod unit_tests {
                 vec![RegInit {
                     file: RegType::Lrf,
                     index: RegIndex::at::<0>(),
-                    value: OperandValue::Int(0),
+                    value: Operand::every(OperandValue::Int(0)),
                 }],
             )]
         );

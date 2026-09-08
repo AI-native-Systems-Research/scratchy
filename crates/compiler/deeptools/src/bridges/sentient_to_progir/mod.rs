@@ -33,7 +33,6 @@
 //! Ported from the authority tree `/Users/nickm/git/deeptools-src` at revision `a0d29abbed`;
 //! every function carries a `/// Replaces: eNNN_name` anchor citing its original.
 
-
 /// `construct` — 46 units.
 pub mod construct;
 
@@ -45,6 +44,9 @@ pub mod uniform;
 
 /// THE D76 PASS ITSELF — `runOnOperation`, `GenerateProgIR`, `GenerateProgIRForProgramUnit`,
 pub mod driver;
+
+/// WHAT THE PASS ACCUMULATES WHILE IT LOWERS — the register graph and the registers to initialise.
+pub mod state;
 
 /// WHICH REGISTERS ARE DEFINED, AND WHETHER ANYTHING READS ONE THAT IS NOT.
 pub mod reg_def_tracker;
