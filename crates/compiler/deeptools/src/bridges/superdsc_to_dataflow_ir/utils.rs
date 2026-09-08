@@ -17,12 +17,13 @@
 //! | `e084_initializeUnit` | 3 | 33 | `dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:624` |
 //! | `e093_initializeUniformizedUnit` | 4 | 47 | `dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:663` |
 
-use super::dsc_lowering::Retrieved;
-use crate::arch::Arch;
-use crate::islands::dataflow_ir::dialects::{Val, dataflow};
+use super::dsc_lowering::{Bound, Handles, Retrieved, query_over_handles};
+use crate::arch::{Arch, IsaGen, Target};
+use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
 use crate::islands::dataflow_ir::ty::{GenericComp, ScalarTy};
 use crate::islands::dataflow_ir::{ProgramUnit, Values};
-use crate::units::{DfirUnit, NumFolds, Residency};
+use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency, Row, adjacent, residency_of};
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
@@ -221,8 +222,285 @@ pub fn create_get_unit_op(
     }
 }
 
-// crustify:todo: e072_createUniformizedGetUnitOp
-// crustify:todo: e073_buildNeighborUnits
+/// Replaces: e072_createUniformizedGetUnitOp
+///
+/// **072/110** `DSC2ToDataflowIRUtils.hpp:95` — ONE `get_unit` per `(core, corelet)`, or per CORE for
+/// the L3 halves so both LXLUs point at the same L3, every fold of it paired with the key that asks
+/// for it, mapped and queried by `program_unit_iterator_`.
+///
+/// ⛔ A FOLD RESULT CANNOT BE NAMED: the reference pairs `get_unit.getResult(i)` and [`Val`] spells
+/// `%28`, not `%28#3`, so each of a group's folds is paired with the group's own value — exact at
+/// `NumFolds::ONE` and an island gap above it. The size `DT_CHECK` is structural: `keys` builds both.
+pub fn create_uniformized_get_unit_op(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    held: Option<Val>,
+    keys: &Handles,
+    comp: DfirUnit,
+    folds: NumFolds,
+) -> Val {
+    // `if (component_to_handler_.count(comp) == 0)` — a held component answers with no op at all.
+    if let Some(handle) = held {
+        return handle;
+    }
+
+    // `is_any_of(comp, L3LU, L3SU)`, whose arm creates the op OUTSIDE the corelet loop.
+    let core_wide = matches!(comp, DfirUnit::L3lu | DfirUnit::L3su);
+    let mut pairs = Vec::new();
+    let mut created: Option<(Core, Val)> = None;
+    for group in keys.corelet_groups() {
+        let Some(first) = group.first() else { continue };
+        let value = match created {
+            Some((core, value)) if core_wide && core == first.core => value,
+            _ => {
+                let residency = residency_of(comp, first.core, first.corelet);
+                let value = create_get_unit_op(vals, None, comp, residency, folds).bind(ops);
+                created = Some((first.core, value));
+                value
+            }
+        };
+        // `for (corelet_ids) for (i < num_folds_) units.emplace_back(get_unit.getResult(i))`.
+        for handle in group {
+            pairs.push((handle.unit, value));
+        }
+    }
+
+    query_over_handles(vals, ops, keys.iterator(), pairs, MappedTy::Index)
+}
+
+/// `PTSOUTH`, `PTNORTH` and `PTWEST` — the RELATIVE keys a PT row's arm binds beside the absolute
+/// ones (`DSC2ToDataflowIRUtils.hpp:164-172`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtDirection {
+    /// The next row, or the PE at the last one.
+    South,
+    /// The row above, or the SFP at row 0.
+    North,
+    /// The L0 load unit — bound under THIS key only.
+    West,
+}
+
+/// THE REGISTER FILES AND SCALE REGION ONE UNIT'S OWN PREAMBLE BINDS with `get_local_unit`, which is
+/// a different set per unit kind and empty for most of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnFiles {
+    /// A PT row: `PT_LRFREG` as `LRFREG`, `PTXRF`, and `L0_SCALE` from SEN1P5.
+    PtRow {
+        /// `LRFREG`.
+        lrf: Val,
+        /// `PTXRF`.
+        xrf: Val,
+        /// `L0_SCALE`, from SEN1P5 only.
+        l0_scale: Option<Val>,
+    },
+    /// The PE: `PE_LRFREG` as `LRFREG`.
+    Pe {
+        /// `LRFREG`.
+        lrf: Val,
+    },
+    /// The SFP: `SFP_LRFREG` as `LRFREG`.
+    Sfp {
+        /// `LRFREG`.
+        lrf: Val,
+    },
+    /// The L0 store unit: no register file, and `L0_SCALE` from SEN1P5.
+    L0su {
+        /// `L0_SCALE`, from SEN1P5 only.
+        l0_scale: Option<Val>,
+    },
+    /// Every other arm, the reference's empty trailing `else` among them.
+    None,
+}
+
+/// WHAT ONE UNIT'S PREAMBLE BINDS — the ops it emits and the `component_to_handler_` entries they
+/// fill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Neighbourhood {
+    /// The `get_unit` and `get_local_unit` ops, in the reference's binding order.
+    pub ops: Vec<DfirOp>,
+    /// The absolute keys — `component_to_handler_[<unit>]`.
+    pub units: Vec<(DfirUnit, Bound)>,
+    /// The relative keys, whose handles are all in `units` too EXCEPT [`PtDirection::West`]'s.
+    pub directions: Vec<(PtDirection, Val)>,
+    /// This unit's own register files.
+    pub own: OwnFiles,
+}
+
+/// A PT row by index, or `fallback` where this arch has no such row.
+fn pt_row(index: u32, fallback: DfirUnit) -> DfirUnit {
+    Row::checked(index).map_or(fallback, DfirUnit::PtRow)
+}
+
+/// `createGetUnitOp(builder, which, core_id, corelet_id).getResult(0)`, bound under `which`.
+fn bind_unit(
+    vals: &mut Values,
+    n: &mut Neighbourhood,
+    which: DfirUnit,
+    core: Core,
+    corelet: Corelet,
+) -> Val {
+    let residency = residency_of(which, core, corelet);
+    let handle = create_get_unit_op(vals, None, which, residency, NumFolds::ONE).bind(&mut n.ops);
+    let corelet = match residency {
+        Residency::Corelet { corelet, .. } => Some(corelet),
+        Residency::Global | Residency::Scratchpad { .. } | Residency::CoreWide { .. } => None,
+    };
+    n.units.push((which, Bound::Unit { handle, corelet }));
+    handle
+}
+
+/// `createGetLocalUnitOp(builder, which, unit_op)`, which fills no absolute key.
+fn bind_local(
+    vals: &mut Values,
+    n: &mut Neighbourhood,
+    which: dataflow::LocalUnit,
+    of: Val,
+) -> Val {
+    create_get_local_unit_op(vals, None, which, of).bind(&mut n.ops)
+}
+
+/// `if (dsc_global_.sysDef.coreArch >= SEN1P5_ISA) component_to_handler_[L0_SCALE] = ..`.
+fn bind_l0_scale(vals: &mut Values, n: &mut Neighbourhood, of: Val) -> Option<Val> {
+    matches!(Target::GEN, IsaGen::Sen1p5)
+        .then(|| bind_local(vals, n, dataflow::LocalUnit::L0Scale, of))
+}
+
+/// Replaces: e073_buildNeighborUnits
+///
+/// **073/110** `DSC2ToDataflowIRUtils.hpp:161` — one unit's preamble: a `get_unit` per neighbour in
+/// the reference's own order, the PT's relative keys, and its own register files. `own` is the handle
+/// `initializeUnit` bound for `of` before the call (`:628-630`), which the first retrieval reuses.
+///
+/// ⛔ `PTWEST` IS THE L0 LOAD UNIT'S ONLY KEY on a PT row, so `units` does not carry it — a body
+/// naming `L0LU` there creates a second `get_unit`, exactly as in the reference.
+/// ⛔ THE L3 HALVES ARE ASKED FOR WITH A CORELET (`:377-386`) and bound core-wide by [`residency_of`].
+/// ⛔ [`crate::units::local_units`] OMITS THE L0 STORE UNIT'S `L0_SCALE` (`:301-303`); this binds it.
+pub fn build_neighbor_units(
+    vals: &mut Values,
+    of: DfirUnit,
+    own: Val,
+    core: Core,
+    corelet: Corelet,
+) -> Neighbourhood {
+    let mut n = Neighbourhood {
+        ops: Vec::new(),
+        units: Vec::new(),
+        directions: Vec::new(),
+        own: OwnFiles::None,
+    };
+    match of {
+        // `:164-231` — eight arms that are one rule: south, north, the LX load unit at row 0, west,
+        // then the row's own files.
+        DfirUnit::PtRow(row) => {
+            let south = bind_unit(vals, &mut n, adjacent(row.south()), core, corelet);
+            n.directions.push((PtDirection::South, south));
+            let north = bind_unit(vals, &mut n, adjacent(row.north()), core, corelet);
+            n.directions.push((PtDirection::North, north));
+            if row.get() == 0 {
+                bind_unit(vals, &mut n, DfirUnit::Lxlu, core, corelet);
+            }
+            let residency = residency_of(DfirUnit::L0lu, core, corelet);
+            let west = create_get_unit_op(vals, None, DfirUnit::L0lu, residency, NumFolds::ONE)
+                .bind(&mut n.ops);
+            n.directions.push((PtDirection::West, west));
+            let lrf = bind_local(vals, &mut n, dataflow::LocalUnit::PtLrf, own);
+            let xrf = bind_local(vals, &mut n, dataflow::LocalUnit::PtXrf, own);
+            let l0_scale = bind_l0_scale(vals, &mut n, own);
+            n.own = OwnFiles::PtRow { lrf, xrf, l0_scale };
+        }
+        // `:285-290` — `L0LUROW0`.
+        DfirUnit::L0lu => {
+            for which in [DfirUnit::L0su, pt_row(0, DfirUnit::Sfp), DfirUnit::L0] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+        }
+        // `:291-304`.
+        DfirUnit::L0su => {
+            for which in [DfirUnit::Sfp, DfirUnit::L0lu, DfirUnit::L0, DfirUnit::Lxlu] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+            n.own = OwnFiles::L0su {
+                l0_scale: bind_l0_scale(vals, &mut n, own),
+            };
+        }
+        // `:369-386` — the hub: EIGHT, both L3 halves and PT row 0 among them.
+        DfirUnit::Lxlu => {
+            for which in [
+                DfirUnit::Lxsu,
+                DfirUnit::Sfp,
+                DfirUnit::Lx,
+                DfirUnit::Pe,
+                DfirUnit::L3lu,
+                DfirUnit::L3su,
+                pt_row(0, DfirUnit::Sfp),
+                DfirUnit::L0su,
+            ] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+        }
+        // `:387-398`.
+        DfirUnit::Lxsu => {
+            for which in [
+                DfirUnit::Lxlu,
+                DfirUnit::Sfp,
+                DfirUnit::Lx,
+                DfirUnit::Pe,
+                DfirUnit::L3lu,
+                DfirUnit::L3su,
+            ] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+        }
+        // `:399-410` — the PE, whose north is the LAST row, and whose `LRFREG` is bound in the
+        // MIDDLE of the sequence.
+        DfirUnit::Pe => {
+            for which in [
+                DfirUnit::Lxlu,
+                DfirUnit::Lxsu,
+                pt_row(Target::PT_ROWS - 1, DfirUnit::Sfp),
+            ] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+            n.own = OwnFiles::Pe {
+                lrf: bind_local(vals, &mut n, dataflow::LocalUnit::PeLrf, own),
+            };
+            for which in [DfirUnit::Sfp, DfirUnit::Constant, DfirUnit::PeState] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+        }
+        // `:354-368` — the SFP, `LRFREG` in the middle again.
+        DfirUnit::Sfp => {
+            for which in [
+                DfirUnit::Lxlu,
+                DfirUnit::Lxsu,
+                DfirUnit::L0su,
+                pt_row(0, DfirUnit::Pe),
+            ] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+            n.own = OwnFiles::Sfp {
+                lrf: bind_local(vals, &mut n, dataflow::LocalUnit::SfpLrf, own),
+            };
+            for which in [DfirUnit::Pe, DfirUnit::Constant, DfirUnit::SfpState] {
+                bind_unit(vals, &mut n, which, core, corelet);
+            }
+        }
+        // `} else {}` — the memories and sources bind nothing.
+        DfirUnit::Lx
+        | DfirUnit::L0
+        | DfirUnit::Hbm
+        | DfirUnit::L3lu
+        | DfirUnit::L3su
+        | DfirUnit::Constant
+        | DfirUnit::SfpState
+        | DfirUnit::PeState
+        | DfirUnit::SfpRing
+        | DfirUnit::LxVirtualIbr
+        | DfirUnit::CrossPtnLink => {}
+    }
+    n
+}
+
 // crustify:todo: e083_buildUniformizedNeighborUnits
 // crustify:todo: e084_initializeUnit
 // crustify:todo: e093_initializeUniformizedUnit
@@ -230,15 +508,184 @@ pub fn create_get_unit_op(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        DscKind, TranslatorVersion, append_index_types, create_get_local_unit_op,
-        create_get_unit_op, error_diagnostic, set_precision_in_unit_op, translator_version,
+        DscKind, Neighbourhood, OwnFiles, PtDirection, TranslatorVersion, append_index_types,
+        build_neighbor_units, create_get_local_unit_op, create_get_unit_op,
+        create_uniformized_get_unit_op, error_diagnostic, set_precision_in_unit_op,
+        translator_version,
     };
-    use crate::arch::Dd2;
-    use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::Retrieved;
-    use crate::islands::dataflow_ir::dialects::{Val, dataflow};
+    use crate::arch::{Arch, Dd2, IsaGen, Target};
+    use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::{Bound, Handles, Retrieved};
+    use crate::islands::dataflow_ir::dialects::uniform::{self, MappedTy};
+    use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow};
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::dataflow_ir::{ProgramUnit, Units, Values};
     use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency, Row};
+
+    /// 🎯 072/110 — ⭐ ONE `get_unit` PER CORELET, then the mapping and the query the whole set is
+    /// read through; and the L3 arm's ONE op named twice, which is the reference's own comment.
+    #[test]
+    fn each_corelet_gets_its_own_unit_and_the_l3_pair_share_one() {
+        let mut vals = Values::default();
+        let (first, second, iterator) = (vals.mint(), vals.mint(), vals.mint());
+        let core = Core::checked(0).expect("core 0");
+        let corelets = [
+            Corelet::checked(0).expect("corelet 0"),
+            Corelet::checked(1).expect("corelet 1"),
+        ];
+        let keys = Handles::new(
+            &[core],
+            &corelets,
+            NumFolds::ONE,
+            iterator,
+            |_, corelet, _| {
+                if corelet == corelets[0] {
+                    first
+                } else {
+                    second
+                }
+            },
+        );
+
+        let mut ops = Vec::new();
+        let answer = create_uniformized_get_unit_op(
+            &mut vals,
+            &mut ops,
+            None,
+            &keys,
+            DfirUnit::Lxlu,
+            NumFolds::ONE,
+        );
+        assert_eq!(answer, Val(6));
+        assert_eq!(
+            ops,
+            vec![
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(3),
+                    residency: Residency::Corelet {
+                        core,
+                        corelet: corelets[0]
+                    },
+                    unit: DfirUnit::Lxlu,
+                    num_folds: Some(NumFolds::ONE),
+                }),
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(4),
+                    residency: Residency::Corelet {
+                        core,
+                        corelet: corelets[1]
+                    },
+                    unit: DfirUnit::Lxlu,
+                    num_folds: Some(NumFolds::ONE),
+                }),
+                DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(5),
+                    pairs: vec![(first, Val(3)), (second, Val(4))],
+                    values_ty: MappedTy::Index,
+                }),
+                DfirOp::Uniform(uniform::Op::QueryMap {
+                    result: Val(6),
+                    map: Val(5),
+                    key: iterator,
+                    ty: MappedTy::Index,
+                }),
+            ]
+        );
+
+        // ⛔ THE L3 HALF IS CREATED ONCE FOR THE CORE and paired with BOTH corelets' keys.
+        let mut ops = Vec::new();
+        create_uniformized_get_unit_op(
+            &mut vals,
+            &mut ops,
+            None,
+            &keys,
+            DfirUnit::L3lu,
+            NumFolds::ONE,
+        );
+        assert_eq!(
+            ops[..1],
+            [DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(7),
+                residency: Residency::CoreWide { core },
+                unit: DfirUnit::L3lu,
+                num_folds: Some(NumFolds::ONE),
+            })]
+        );
+        assert!(matches!(
+            &ops[1],
+            DfirOp::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })
+                if pairs == &vec![(first, Val(7)), (second, Val(7))]
+        ));
+        // ⛔ AND A HELD COMPONENT EMITS NOTHING AT ALL.
+        let mut ops = Vec::new();
+        assert_eq!(
+            create_uniformized_get_unit_op(
+                &mut vals,
+                &mut ops,
+                Some(first),
+                &keys,
+                DfirUnit::L3lu,
+                NumFolds::ONE
+            ),
+            first
+        );
+        assert!(ops.is_empty());
+    }
+
+    /// 🎯 073/110 — ⛔ THE L0 LOAD UNIT IS BOUND UNDER `PTWEST` AND NOWHERE ELSE, so `units` holds
+    /// three entries for a row that emits four `get_unit`s.
+    #[test]
+    fn a_pt_row_binds_south_north_and_west_plus_its_own_files() {
+        let mut vals = Values::default();
+        let own = vals.mint();
+        let core = Core::checked(0).expect("core 0");
+        let corelet = Corelet::checked(1).expect("corelet 1");
+        let row0 = Row::checked(0).expect("row 0");
+        let row1 = Row::checked(1).expect("row 1");
+        let Neighbourhood {
+            ops,
+            units,
+            directions,
+            own: files,
+        } = build_neighbor_units(&mut vals, DfirUnit::PtRow(row0), own, core, corelet);
+        let bound = |handle| Bound::Unit {
+            handle,
+            corelet: Some(corelet),
+        };
+        assert_eq!(
+            units,
+            vec![
+                (DfirUnit::PtRow(row1), bound(Val(1))),
+                (DfirUnit::Sfp, bound(Val(2))),
+                (DfirUnit::Lxlu, bound(Val(3))),
+            ]
+        );
+        assert_eq!(
+            directions,
+            vec![
+                (PtDirection::South, Val(1)),
+                (PtDirection::North, Val(2)),
+                (PtDirection::West, Val(4)),
+            ]
+        );
+        let scaled = matches!(Target::GEN, IsaGen::Sen1p5);
+        assert_eq!(
+            files,
+            OwnFiles::PtRow {
+                lrf: Val(5),
+                xrf: Val(6),
+                l0_scale: scaled.then_some(Val(7)),
+            }
+        );
+        assert_eq!(ops.len(), if scaled { 7 } else { 6 });
+        assert_eq!(
+            ops[5],
+            DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+                result: Val(6),
+                of: own,
+                which: dataflow::LocalUnit::PtXrf,
+            })
+        );
+    }
 
     /// ⛔ IT APPENDS, THOUGH NOTHING IN THE TREE DEPENDS ON THAT: both call sites hand it a fresh
     /// empty vector, so this pins the reference's shape rather than a caller's requirement.

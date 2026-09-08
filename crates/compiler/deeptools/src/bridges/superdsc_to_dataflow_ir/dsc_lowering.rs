@@ -56,6 +56,10 @@ pub enum Component {
     SfpLrf,
     /// `PTXRF` — the PT's transposed register file.
     PtXrf,
+    /// `LXLUSCALEREG` — the LXLU's scale-register region (`arch_enums.h:118`, spelled
+    /// `"lxluscalereg"` at `arch_enums.cpp:117`), which entry 079 both retrieves as a storage and
+    /// tests for (`SNTransferLowering.cpp:615`, `:628`).
+    LxluScaleReg,
 }
 
 /// THE KEY A COMPONENT IS LOOKED UP UNDER — [`Component`] with the register-file collapse applied,
@@ -68,6 +72,8 @@ enum Key {
     Lrfreg,
     /// `PTXRF`.
     PtXrf,
+    /// `LXLUSCALEREG`, which no neighbour arm binds — so every lookup of it creates.
+    LxluScaleReg,
 }
 
 impl Component {
@@ -83,6 +89,7 @@ impl Component {
                 Key::Lrfreg
             }
             Component::PtXrf => Key::PtXrf,
+            Component::LxluScaleReg => Key::LxluScaleReg,
         }
     }
 }
@@ -148,6 +155,28 @@ pub enum Retrieved {
     Created(dataflow::Op),
 }
 
+impl Retrieved {
+    /// THE HANDLE, WITH ANY OP THIS RETRIEVAL CREATED PUSHED FIRST — the two lines every caller of a
+    /// retrieval helper writes (`SNDSCLowering.cpp:57-66`).
+    #[must_use]
+    pub fn bind(self, ops: &mut Vec<DfirOp>) -> Val {
+        match self {
+            Retrieved::Reused(handle) => handle,
+            Retrieved::Created(op) => {
+                let handle = match &op {
+                    dataflow::Op::GetUnit { result, .. }
+                    | dataflow::Op::GetLocalUnit { result, .. } => *result,
+                    // ⛔ NOT REACHABLE BY CONSTRUCTION: entries 007, 022 and 044 are the only
+                    // builders of this variant and each builds one of the two above.
+                    other => todo!("Retrieved::Created holds {other:?}, which no retrieval builds"),
+                };
+                ops.push(DfirOp::Dataflow(op));
+                handle
+            }
+        }
+    }
+}
+
 /// Replaces: e022_retrieveGetUnitOpInSameCore
 ///
 /// THE HANDLE FOR A COMPONENT OF **THIS** CORE, reusing what the program unit bound where that
@@ -174,6 +203,11 @@ pub fn retrieve_get_unit_op_in_same_core(
     match comp.key() {
         Key::Lrfreg => Retrieved::Reused(handlers.own_lrf),
         Key::PtXrf => Retrieved::Reused(handlers.pt_xrf),
+        // ⛔ THE ISLAND CANNOT NAME THIS UNIT. `component_to_handler_` never binds it, so the
+        // reference always CREATES here, and what it creates is a `get_unit` typed
+        // `"lxluscalereg"` — a spelling [`DfirUnit`] does not carry. Entry 079 needs the KEY
+        // regardless, because it is what selects its scale-register address form.
+        Key::LxluScaleReg => todo!("get_unit type=\"lxluscalereg\" is not a DfirUnit"),
         Key::Unit(unit) => match handlers.unit(unit) {
             // ⛔ THE L3 HALVES ARE CORE-WIDE: the corelet is not compared for them at all.
             Some(Bound::Unit { handle, .. }) if matches!(unit, DfirUnit::L3lu | DfirUnit::L3su) => {

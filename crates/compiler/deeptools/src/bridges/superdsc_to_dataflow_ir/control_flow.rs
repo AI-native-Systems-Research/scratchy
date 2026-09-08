@@ -26,14 +26,15 @@
 use std::num::NonZeroI32;
 
 use super::dsc_lowering::{
-    DataLocation, Factor, address_granularity_multiply_factor, constant_index,
+    DataLocation, Factor, Handles, address_granularity_multiply_factor, constant_index,
+    uniformized_folded_address,
 };
 use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst};
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::units::DfirUnit;
+use crate::units::{Core, Corelet, DfirUnit};
 
 /// A DIMENSION THE SCHEDULE IS WRITTEN OVER — `PrimaryDimTypes` (`dsc/dims.h:34-48`).
 ///
@@ -938,8 +939,179 @@ pub fn propagate_buffer_switch_loops_to_root<T: Clone>(head_children: &mut [Swit
         }
     }
 }
-// crustify:todo: e074_getBlockingOrStreamingBufferLoopLocations
-// crustify:todo: e075_constructLoopIterArgs
+/// WHICH TRANSFER — the identity a `const dsc2::TransferNode *` is compared by (`:657`), which is its
+/// position in the component's own transfer list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferId(pub usize);
+
+/// A TRANSFER AS THE BUFFER-LOOP SCAN READS IT — what entry 056 needs, plus the two
+/// `bufferSwitchPosition_` a match on this component reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchingTransfer<'a, L, M> {
+    /// The source lds's `dataFormat_`, which entry 056 reads the granularity factor at.
+    pub precision: DataType,
+    /// `src_`.
+    pub src: SwitchSide<'a, M>,
+    /// `srcLdsAndLoopOffsets_.bufferSwitchPosition_` — the loop whose iteration switches its buffers.
+    pub src_position: Option<&'a L>,
+    /// `dstVias_`, in index order.
+    pub dsts: Vec<SwitchSide<'a, M>>,
+    /// `dstLdsAndLoopOffsets_[0].bufferSwitchPosition_` — index ZERO, for every via.
+    pub dst_position: Option<&'a L>,
+}
+
+/// Replaces: e074_getBlockingOrStreamingBufferLoopLocations
+///
+/// **074/110** `SNControlFlowLowering.cpp:467` — `dsc_loops_to_buffers_switch_map_`'s pairs: which
+/// loop switches which of this component's transfers, in the DFS order the walk produces them.
+///
+/// ⛔ THE SIDE TEST HERE IS `unit_ == comp_` ALONE, not entry 056's "and switches" — a source on this
+/// component that does NOT switch still contributes the SOURCE's position (`:485-487`).
+/// ⛔ AND EVERY MATCHING VIA READS `dstLdsAndLoopOffsets_[0]`: the `dst_idx++` sits outside its own
+/// loop and is never read (`:488-497`), so via *n* takes via 0's position.
+pub fn blocking_or_streaming_buffer_loop_locations<'a, L, M>(
+    comp: DfirUnit,
+    transfers: &'a [SwitchingTransfer<'a, L, M>],
+) -> Vec<(&'a L, TransferId)> {
+    let mut located = Vec::new();
+    for (index, transfer) in transfers.iter().enumerate() {
+        // `if (mode == 1 || mode == 2)` — entry 056's [`None`] is the reference's `mode = -1`, whose
+        // `failed(..)` arm cannot be taken because the mode is an answer and not a refusal.
+        if buffering_or_streaming_mode(comp, transfer.precision, &transfer.src, &transfer.dsts)
+            .is_none()
+        {
+            continue;
+        }
+        // `consider_transfer` and `buffer_position`, which are set together or not at all.
+        let position = if transfer.src.unit == comp {
+            transfer.src_position
+        } else if transfer.dsts.iter().any(|via| via.unit == comp) {
+            transfer.dst_position
+        } else {
+            None
+        };
+        if let Some(position) = position {
+            located.push((position, TransferId(index)));
+        }
+    }
+    located
+}
+
+/// THE START ADDRESSES ONE SWITCHING TRANSFER CONTRIBUTES — `*start_address_map`, read the two ways
+/// entry 075 reads it (`:613-627`).
+pub struct StartAddresses<'a> {
+    /// Every `(core, corelet, fold)`'s address, for the all-the-same test entry 030 makes.
+    pub all: &'a [i64],
+    /// `startAddr_` at one `(core, corelet, fold)`, which the uniform arm names once per handle.
+    pub at: &'a dyn Fn(Core, Corelet, u32) -> i64,
+    /// `getSingleDataStrict(*start_address_map, {{0, core_id_}, {1, corelet_id_}})` — this core and
+    /// corelet's one address across folds, which is what the non-uniform arm scales.
+    pub single: i64,
+}
+
+/// ONE SWITCHING TRANSFER OF A ROOT LOOP, AS ITS ITER ARG IS BUILT.
+pub struct RootIterArg<'a> {
+    /// `mode` — [`None`] is the reference's `llvm_unreachable("Unknown buffering mode")`.
+    pub mode: Option<SwitchMode>,
+    /// `factor`.
+    pub factor: Factor,
+    /// `*start_address_map`.
+    pub addresses: StartAddresses<'a>,
+}
+
+/// WHICH ITER ARGS A LOOP TAKES — the reference's `parent_node == nullptr && dim_idx_band == 0`
+/// against everything else (`:600`), which are two different answers and not two paths to one.
+pub enum LoopIterArgs<'a> {
+    /// The outermost loop of a band with no enclosing loop: its iter args are FRESH start addresses.
+    Root {
+        /// `needsUniform()` — the handle set the uniform arm maps over, or [`None`] for the constant.
+        uniform: Option<&'a Handles>,
+        /// `(*dsc_all_parent_loops_to_buffers_switch_map_)[node]`, with entry 056 already asked.
+        transfers: Vec<RootIterArg<'a>>,
+    },
+    /// Every other loop: its iter args are the ENCLOSING loop's, at each transfer's index there.
+    Enclosing {
+        /// `(*dsc_all_parent_loops_to_buffers_switch_map_)[node]`.
+        own: &'a [TransferId],
+        /// `(*dsc_all_parent_loops_to_buffers_switch_map_)[parent_node_loop]`, whose INDEX of a
+        /// transfer is that transfer's iter arg position.
+        parent_transfers: &'a [TransferId],
+        /// `(*dsc_loops_to_mlir_loops_map_)[parent_node_loop]` — the band, indexed as
+        /// [`mlir_loop_from_sn_loop_node`] indexes it.
+        parent_loops: &'a [DfirOp],
+        /// `dim_idx_band`: `0` takes the band's LAST loop, and any other takes `dim_idx_band - 1`
+        /// because the node is then its own parent (`:640-673`).
+        dim_idx_band: usize,
+    },
+}
+
+/// Replaces: e075_constructLoopIterArgs
+///
+/// **075/110** `SNControlFlowLowering.cpp:595` — a loop's `iter_args`: one start address per switching
+/// transfer at the root, and the enclosing loop's own region iter args below it.
+///
+/// ⛔ THE ROOT ARM EMITS, THE OTHER ARM ONLY NAMES — a root loop's args are new `arith.constant`s or a
+/// new uniform mapping, so calling it twice for one loop emits the addresses twice.
+/// ⛔ THE `index == -1` FAILURE AND THE `llvm_unreachable` ARE BOTH SKIPS HERE: entry 020 appends a
+/// child's transfers to its parent's list, and this map holds only switching transfers.
+pub fn construct_loop_iter_args(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    args: &LoopIterArgs<'_>,
+) -> Vec<Val> {
+    let mut iter_args = Vec::new();
+    match args {
+        LoopIterArgs::Root { uniform, transfers } => {
+            for transfer in transfers {
+                if transfer.mode.is_none() {
+                    continue;
+                }
+                let address = match uniform {
+                    // `constructUniformizedFoldedAddress(builder, *start_address_map, factor)`.
+                    Some(handles) => uniformized_folded_address(
+                        vals,
+                        ops,
+                        handles,
+                        transfer.addresses.all,
+                        transfer.addresses.at,
+                        transfer.factor,
+                    ),
+                    // `int(getSingleDataStrict(..) * factor)` — "expecting constant value across
+                    // sdsc folds".
+                    None => {
+                        constant_index(vals, ops, transfer.factor.scale(transfer.addresses.single))
+                    }
+                };
+                iter_args.push(address);
+            }
+        }
+        LoopIterArgs::Enclosing {
+            own,
+            parent_transfers,
+            parent_loops,
+            dim_idx_band,
+        } => {
+            let parent_for = match dim_idx_band.checked_sub(1) {
+                Some(previous) => parent_loops.get(previous),
+                None => parent_loops.last(),
+            };
+            // `if (parent_node_loop)` — and `getRegionIterArgs()` of whichever loop op it is.
+            let Some(carried) = parent_for.and_then(reset_iter_arguments) else {
+                return iter_args;
+            };
+            for id in *own {
+                let Some(index) = parent_transfers.iter().position(|other| other == id) else {
+                    continue;
+                };
+                if let Some(&arg) = carried.get(index) {
+                    iter_args.push(arg);
+                }
+            }
+        }
+    }
+    iter_args
+}
+
 // crustify:todo: e088_constructLoopsRecursive
 // crustify:todo: e096_constructLoops
 
@@ -950,9 +1122,11 @@ mod unit_tests {
     use super::super::dsc_lowering::{DataLocation, address_granularity_multiply_factor};
     use super::{
         Ancestor, BufferSwitch, CondComposite, CondOp, CondValType, DimSlice, DimStages,
-        LoopCondition, NodeKind, NumBuffers, ParentLoop, PrimaryDim, SamvLoop, StagePair,
-        SwitchMode, SwitchNode, SwitchSide, buffering_or_streaming_mode, conditional_operation,
-        conditionals_for_samv, construct_loop_for_a_dim, mlir_loop_from_sn_loop_node, parent_loop,
+        LoopCondition, LoopIterArgs, NodeKind, NumBuffers, ParentLoop, PrimaryDim, RootIterArg,
+        SamvLoop, StagePair, StartAddresses, SwitchMode, SwitchNode, SwitchSide, SwitchingTransfer,
+        TransferId, blocking_or_streaming_buffer_loop_locations, buffering_or_streaming_mode,
+        conditional_operation, conditionals_for_samv, construct_loop_for_a_dim,
+        construct_loop_iter_args, mlir_loop_from_sn_loop_node, parent_loop,
         propagate_buffer_switch_loops_to_root, propagate_buffer_switch_loops_to_root_recursively,
         reset_iter_arguments,
     };
@@ -962,7 +1136,166 @@ mod unit_tests {
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
     use crate::islands::dataflow_ir::print::emit;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::units::DfirUnit;
+    use crate::units::{Core, Corelet, DfirUnit};
+
+    /// 🎯 074/110 — ⛔⛔ A SOURCE ON THIS COMPONENT CONTRIBUTES ITS OWN POSITION EVEN WHEN A VIA IS
+    /// WHAT SWITCHES: the mode comes from entry 056's first switching end, the POSITION from a plain
+    /// `unit_ == comp_`, and reading the two off one end would key the map by the wrong loop.
+    #[test]
+    fn the_position_follows_the_unit_test_and_a_via_reads_index_zero() {
+        let precision = DataType::Sen169Fp16;
+        let comp = DfirUnit::Lxlu;
+        let on_comp = |switches| SwitchSide {
+            unit: comp,
+            loc: DataLocation::LxluLx,
+            switches,
+            start_addresses: &"lxlu",
+        };
+        let elsewhere = SwitchSide {
+            unit: DfirUnit::L3lu,
+            loc: DataLocation::L3luHbm,
+            switches: Some(NumBuffers::Count(4)),
+            start_addresses: &"l3lu",
+        };
+        let transfers = vec![
+            SwitchingTransfer {
+                precision,
+                src: on_comp(Some(NumBuffers::Count(2))),
+                src_position: Some(&"outer"),
+                dsts: vec![elsewhere],
+                dst_position: Some(&"inner"),
+            },
+            SwitchingTransfer {
+                precision,
+                src: on_comp(None),
+                src_position: Some(&"outer"),
+                dsts: vec![on_comp(Some(NumBuffers::Count(2)))],
+                dst_position: Some(&"inner"),
+            },
+            SwitchingTransfer {
+                precision,
+                src: elsewhere,
+                src_position: Some(&"never read"),
+                dsts: vec![elsewhere, on_comp(Some(NumBuffers::Streaming))],
+                dst_position: Some(&"inner"),
+            },
+            // ⛔ NOTHING ON THIS COMPONENT SWITCHES — no entry at all, and the reference's
+            // `emitError` arm is unreachable because `mode = -1` is an answer.
+            SwitchingTransfer {
+                precision,
+                src: on_comp(None),
+                src_position: Some(&"outer"),
+                dsts: vec![elsewhere],
+                dst_position: None,
+            },
+        ];
+        assert_eq!(
+            blocking_or_streaming_buffer_loop_locations(comp, &transfers),
+            vec![
+                (&"outer", TransferId(0)),
+                (&"outer", TransferId(1)),
+                (&"inner", TransferId(2)),
+            ]
+        );
+    }
+
+    /// 🎯 075/110 — ⭐ THE ROOT ARM EMITS ONE ADDRESS PER SWITCHING TRANSFER while every other loop
+    /// only NAMES its parent's region iter args at that transfer's index in the PARENT's list.
+    #[test]
+    fn a_root_loop_emits_its_addresses_and_an_inner_loop_names_its_parents() {
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        // ⭐ FOUR BYTES PER STEP OVER A 16-BIT ELEMENT IS A FACTOR OF TWO.
+        let factor =
+            address_granularity_multiply_factor(DataLocation::L3luIbr, DataType::Sen169Fp16);
+        let all = [1000_i64];
+        let at = |_: Core, _: Corelet, _: u32| 1000;
+        let arg = |mode, single| RootIterArg {
+            mode,
+            factor,
+            addresses: StartAddresses {
+                all: &all,
+                at: &at,
+                single,
+            },
+        };
+        let root = LoopIterArgs::Root {
+            uniform: None,
+            transfers: vec![
+                arg(Some(SwitchMode::Buffering), 1000),
+                arg(Some(SwitchMode::Streaming), 7),
+                // ⛔ THE `llvm_unreachable("Unknown buffering mode")`, as a skip.
+                arg(None, 5),
+            ],
+        };
+        assert_eq!(
+            construct_loop_iter_args(&mut vals, &mut ops, &root),
+            vec![Val(0), Val(1)]
+        );
+        assert_eq!(
+            ops,
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(0),
+                    value: 2000,
+                }),
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(1),
+                    value: 14,
+                }),
+            ]
+        );
+
+        // ⛔ THE BAND'S LAST LOOP AT `dim_idx_band == 0`, AND `dim_idx_band - 1` ABOVE IT.
+        let band = |iv, arg| {
+            DfirOp::Scf(scf::Op::For {
+                iv,
+                lo: Val(30),
+                hi: Val(31),
+                step: Val(32),
+                carried: vec![
+                    affine::Carried {
+                        init: Val(40),
+                        arg,
+                        result: Val(42),
+                    },
+                    affine::Carried {
+                        init: Val(43),
+                        arg: Val(44),
+                        result: Val(45),
+                    },
+                ],
+                body: Vec::new(),
+                dbg_name: None,
+            })
+        };
+        let parent_loops = [band(Val(20), Val(21)), band(Val(22), Val(23))];
+        let mut ops = Vec::new();
+        let inner = LoopIterArgs::Enclosing {
+            // ⛔ TRANSFER 9 IS NOT IN THE PARENT'S LIST, and the reference's `index == -1` refusal
+            // for it is unreachable by construction — a child's transfers are appended to its
+            // parent's (entry 020), so here it is a skip.
+            own: &[TransferId(7), TransferId(9), TransferId(4)],
+            parent_transfers: &[TransferId(4), TransferId(7)],
+            parent_loops: &parent_loops,
+            dim_idx_band: 0,
+        };
+        assert_eq!(
+            construct_loop_iter_args(&mut vals, &mut ops, &inner),
+            vec![Val(44), Val(23)]
+        );
+        let banded = LoopIterArgs::Enclosing {
+            own: &[TransferId(4)],
+            parent_transfers: &[TransferId(4)],
+            parent_loops: &parent_loops,
+            dim_idx_band: 1,
+        };
+        assert_eq!(
+            construct_loop_iter_args(&mut vals, &mut ops, &banded),
+            vec![Val(21)]
+        );
+        assert!(ops.is_empty(), "this arm names values and emits nothing");
+    }
 
     /// ⛔⛔ SIGNED, AND THE FIVE NON-COMPARISONS ARE NOT PREDICATES AT ALL.
     ///

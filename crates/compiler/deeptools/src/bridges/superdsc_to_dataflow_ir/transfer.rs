@@ -39,9 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e077_constructElementsOfAgenDataTransfer
-// crustify:todo: e078_constructElementsOfAgenCompositeDataTransfer
-// crustify:todo: e079_constructElementsOfAffineDataTransferViaAgenTransfer
 // crustify:todo: e080_constructStreamingOrDoubleBufferingLoad
 // crustify:todo: e081_GenerateReceiveAndSendFromDataTransferNode
 // crustify:todo: e082_ConstructSAMVOperation
@@ -57,8 +54,8 @@
 use super::compute::{VectorWidth, type_from_format};
 use super::control_flow::PrimaryDim;
 use super::dsc_lowering::{
-    BitstreamValues, Component, Handles, constant_index, mlir_type_from_dsc_data_format,
-    uniformized_folded_constant_bitstream,
+    BitstreamValues, Component, Handlers, Handles, constant_index, mlir_type_from_dsc_data_format,
+    retrieve_get_unit_op_in_same_core, uniformized_folded_constant_bitstream,
 };
 use crate::arch::Elements;
 use crate::generated::DataType;
@@ -1637,6 +1634,294 @@ pub fn constant_bitstream_and_shuffle(
     Some(result)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 077 + 078 + 079/110 — THE ELEMENTS EVERY AGEN TRANSFER IS BUILT FROM
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `is_constant_read_write` — the ONE flag that decides all three of a transfer's shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressedAs {
+    /// `false` — the view's own extents and layout, a strided base address, and a set built from the
+    /// chunk records.
+    Schedule,
+    /// `true` — the rank-1 identity layout, a bypassed base address, and a flat element range.
+    ConstantPlane,
+}
+
+/// WHAT ALL THREE ENTRIES ASK FOR BEFORE THEY DIFFER — the storage handle, the view over it and the
+/// base address into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgenStorage<'a> {
+    /// `storage` — what [`retrieve_get_unit_op_in_same_core`] is asked for.
+    pub storage: Component,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_` — [`None`] is the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `is_load`.
+    pub side: TransferSide,
+    /// `start_address`.
+    pub start_address: Val,
+    /// `view_sizes` — the corelet view's `{src,dst}LoopsAndSize_`.
+    pub view_sizes: &'a [ViewSize],
+    /// The element type the view's memref carries.
+    pub elem: ElemType,
+    /// `outer_loops`, as [`construct_base_address`] reads them.
+    pub outer_loops: &'a [LoopStride],
+    /// `is_constant_read_write`.
+    pub addressed_as: AddressedAs,
+}
+
+/// `unitTimeTransferChunkSize_` AND `unitTimeTransferChunkStride_`, which entries 077 and 078 are
+/// handed and entry 079 synthesises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitTimeChunks<'a> {
+    /// `unit_time_transfer_chunk_size`.
+    pub sizes: &'a [ChunkDim],
+    /// `unit_time_transfer_chunk_stride`, which may hold at most one record — see
+    /// [`load_or_store_set`].
+    pub stride: Option<&'a ChunkDim>,
+    /// The chunk count a strided dimension spans.
+    pub num_strides: i64,
+}
+
+impl UnitTimeChunks<'_> {
+    /// `num_elements *= entry.sizeDim_.size_` over the chunk SIZES — the constant arm's flat extent,
+    /// and [`None`] where the reference's `int` product overflows.
+    fn element_product(&self) -> Option<i64> {
+        self.sizes
+            .iter()
+            .try_fold(1_i64, |acc, chunk| acc.checked_mul(chunk.size))
+    }
+}
+
+/// THE OUT-PARAMETERS ENTRIES 077-079 FILL — the view a transfer addresses through, the base address
+/// into it, the elements one unit of time touches and the order they are walked in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferElements {
+    /// `view`.
+    pub view: LogicalMemoryView,
+    /// `base_address_map` and `base_address_args`.
+    pub base_address: BaseAddress,
+    /// `transfer_set`.
+    pub transfer_set: IntegerSet,
+    /// `transfer_order`.
+    pub transfer_order: AffineMap,
+}
+
+/// ONE COMPOSITE LOOP IN THE TWO READINGS ENTRY 078 TAKES OF THE SAME LIST — its bound for the time
+/// set and its stride for the time address map.
+///
+/// ⛔ ONE LIST, NOT TWO: the address map's dim count is the time set's, so two lists of different
+/// lengths would give the map more dims than the set has positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeTimeLoop {
+    /// The loop's upper bound, as [`time_set`] reads it.
+    pub bound: LoopBound,
+    /// Its `sizeIdx_` and `elemOffset_`, as [`time_address_map`] reads them.
+    pub walk: CompositeLoop,
+}
+
+/// ENTRY 078's OUT-PARAMETERS — entry 077's four, plus the three that place the transfer in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeTransferElements {
+    /// Everything entry 077 fills.
+    pub elements: TransferElements,
+    /// `time_order_map` — [`None`] where there are no composite loops.
+    pub time_order: Option<AffineMap>,
+    /// `time_set`.
+    pub time_set: IntegerSet,
+    /// `time_address_map`.
+    pub time_address_map: AffineMap,
+}
+
+/// `IntegerSet::get(1, 0, {id, num_elements - id - 1}, {false, false})` — the flat element range a
+/// constant read-write's transfer set is in all three entries, spelled as [`time_set`] spells its own.
+fn flat_element_set(num_elements: i64) -> IntegerSet {
+    let id = AffineExpr::dim(0);
+    IntegerSet {
+        dims: 1,
+        symbols: 0,
+        constraints: vec![
+            Constraint {
+                expr: id.clone(),
+                is_equality: false,
+            },
+            Constraint {
+                expr: id
+                    .times(-1)
+                    .plus(AffineExpr::Const(num_elements.saturating_sub(1))),
+                is_equality: false,
+            },
+        ],
+    }
+}
+
+/// THE TWO STEPS ALL THREE ENTRIES OPEN WITH, IN THEIR ORDER: the storage handle and the view over
+/// it, then the base address over the VIEW's own dim count.
+fn agen_view_and_base_address(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    transfer: &AgenStorage<'_>,
+    is_scalereg: bool,
+) -> Option<(LogicalMemoryView, BaseAddress)> {
+    let bypass = matches!(transfer.addressed_as, AddressedAs::ConstantPlane);
+    let storage_unit = retrieve_get_unit_op_in_same_core(
+        vals,
+        handlers,
+        transfer.storage,
+        transfer.core,
+        transfer.corelet,
+    )
+    .bind(ops);
+    let view = logical_memory_view(
+        vals,
+        ops,
+        transfer.view_sizes,
+        storage_unit,
+        transfer.start_address,
+        transfer.elem,
+        bypass,
+    )?;
+    let base_address = construct_base_address(
+        vals,
+        ops,
+        usize::try_from(view.layout.dims).ok()?,
+        transfer.outer_loops,
+        AddressForm::of(bypass, is_scalereg),
+    );
+    Some((view, base_address))
+}
+
+/// Replaces: e077_constructElementsOfAgenDataTransfer
+///
+/// THE VIEW, BASE ADDRESS, TRANSFER SET AND TRANSFER ORDER OF ONE AGEN TRANSFER
+/// (`SNTransferLowering.cpp:412-479`).
+///
+/// ⛔ THE ORDER'S RANK IS THE VIEW'S LAYOUT, NOT THE SET'S: a constant read-write collapses the
+/// layout to the rank-1 identity (`:436`), so its order is `(d0) -> (d0)` while its set spans the
+/// chunk product — and the identity is over `getNumDims()` of the map the view actually carries.
+#[must_use]
+pub fn elements_of_agen_data_transfer(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    transfer: &AgenStorage<'_>,
+    chunks: &UnitTimeChunks<'_>,
+) -> Option<TransferElements> {
+    let (view, base_address) = agen_view_and_base_address(vals, ops, handlers, transfer, false)?;
+    let transfer_set = match transfer.addressed_as {
+        AddressedAs::Schedule => load_or_store_set(
+            chunks.sizes,
+            chunks.stride,
+            u32::try_from(transfer.view_sizes.len()).ok()?,
+            transfer.side,
+            chunks.num_strides,
+        )?,
+        AddressedAs::ConstantPlane => flat_element_set(chunks.element_product()?),
+    };
+    Some(TransferElements {
+        transfer_order: AffineMap::identity(view.layout.dims),
+        view,
+        base_address,
+        transfer_set,
+    })
+}
+
+/// Replaces: e078_constructElementsOfAgenCompositeDataTransfer
+///
+/// ENTRY 077 PLUS THE TIME AXIS — the reversal time order, the time set over the composite loops and
+/// the address one time step lands at (`SNTransferLowering.cpp:488-568`).
+///
+/// ⛔ THE TIME ORDER IS ENTRY 035's MAP: `getPermutationMap([n-1, .., 0])` puts `d<perm[i]>` in
+/// result `i`, so both spell `(d0, .., dn) -> (dn, .., d0)`, and both are [`None`] for no loops —
+/// where the reference's `getPermutationMap({})` asserts instead.
+#[must_use]
+pub fn elements_of_agen_composite_data_transfer(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    transfer: &AgenStorage<'_>,
+    chunks: &UnitTimeChunks<'_>,
+    composite_loops: &[CompositeTimeLoop],
+) -> Option<CompositeTransferElements> {
+    let elements = elements_of_agen_data_transfer(vals, ops, handlers, transfer, chunks)?;
+    let order = time_order(composite_loops.len());
+    let bounds: Vec<LoopBound> = composite_loops.iter().map(|loop_| loop_.bound).collect();
+    let set = time_set(&bounds)?;
+    let walks: Vec<CompositeLoop> = composite_loops.iter().map(|loop_| loop_.walk).collect();
+    let address_map = time_address_map(
+        set.dims,
+        usize::try_from(elements.view.layout.dims).ok()?,
+        &walks,
+    )?;
+    Some(CompositeTransferElements {
+        elements,
+        time_order: order,
+        time_set: set,
+        time_address_map: address_map,
+    })
+}
+
+/// Replaces: e079_constructElementsOfAffineDataTransferViaAgenTransfer
+///
+/// ENTRY 077 FOR A TRANSFER THAT CARRIES NO CHUNK RECORDS — its unit-time transfer is the view's OWN
+/// leading `min_dim` dims, `min_dim` being the smallest `sizeIdx_` any outer loop strides
+/// (`SNTransferLowering.cpp:590-666`).
+///
+/// ⛔ NO OUTER LOOPS MEANS ONE DIM, NOT NONE: `min_dim` starts at `outer_loops.size() + 1`, so an
+/// empty list leaves it at `1`; the scale register then forces exactly `2` (`:628`) and also takes
+/// the scale-register base address (`:615`).
+/// ⛔ THE CONSTANT ARM'S EXTENT IS THE LITERAL `64` (`:645`) — no product of anything.
+#[must_use]
+pub fn elements_of_affine_data_transfer_via_agen_transfer(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    transfer: &AgenStorage<'_>,
+) -> Option<TransferElements> {
+    let is_scalereg = matches!(transfer.storage, Component::LxluScaleReg);
+    let (view, base_address) =
+        agen_view_and_base_address(vals, ops, handlers, transfer, is_scalereg)?;
+    let transfer_set = match transfer.addressed_as {
+        AddressedAs::Schedule => {
+            let mut min_dim = transfer.outer_loops.len().saturating_add(1);
+            for stride in transfer.outer_loops {
+                min_dim = min_dim.min(stride.size_idx);
+            }
+            if is_scalereg {
+                min_dim = 2;
+            }
+            // `dim.srcSizeIdx_ = dim.dstSizeIdx_ = i` — one chunk per leading dim, matched on both
+            // sides, so the set is the same whichever side is asked about.
+            let mut unit_time_transfer = Vec::with_capacity(min_dim);
+            for i in 0..min_dim {
+                let at = u32::try_from(i).ok()?;
+                unit_time_transfer.push(ChunkDim {
+                    size: transfer.view_sizes.get(i)?.size,
+                    src_index: Some(at),
+                    dst_index: Some(at),
+                });
+            }
+            load_or_store_set(
+                &unit_time_transfer,
+                None,
+                u32::try_from(transfer.view_sizes.len()).ok()?,
+                transfer.side,
+                0,
+            )?
+        }
+        AddressedAs::ConstantPlane => flat_element_set(64),
+    };
+    Some(TransferElements {
+        transfer_order: AffineMap::identity(view.layout.dims),
+        view,
+        base_address,
+        transfer_set,
+    })
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1645,6 +1930,7 @@ mod unit_tests {
     use crate::units::{DfirUnit, NumFolds};
 
     use super::super::control_flow::mlir_loop_from_sn_loop_node;
+    use super::super::dsc_lowering::Bound;
 
     /// 🎯 063/110 — ⛔ A ZERO CHUNK COUNT DOES NOT MULTIPLY, and `BOOL` has no type at all.
     ///
@@ -2848,5 +3134,338 @@ mod unit_tests {
                 },
             })]
         );
+    }
+
+    fn view_size(dim: PrimaryDim, size: i64) -> ViewSize {
+        ViewSize { dim, size }
+    }
+
+    /// The storage handle the three entries retrieve, and a program unit that has already bound it.
+    fn agen_handlers() -> Handlers {
+        Handlers {
+            units: vec![(
+                DfirUnit::Lx,
+                Bound::Unit {
+                    handle: Val(9),
+                    corelet: Some(Corelet::checked(0).expect("corelet 0")),
+                },
+            )],
+            own_lrf: Val(1),
+            pt_xrf: Val(2),
+        }
+    }
+
+    fn agen_storage<'a>(
+        view_sizes: &'a [ViewSize],
+        outer_loops: &'a [LoopStride],
+        addressed_as: AddressedAs,
+    ) -> AgenStorage<'a> {
+        AgenStorage {
+            storage: Component::Unit(DfirUnit::Lx),
+            core: Core::checked(0).expect("core 0"),
+            corelet: Some(Corelet::checked(0).expect("corelet 0")),
+            side: TransferSide::Load,
+            start_address: Val(80),
+            view_sizes,
+            elem: ElemType::F32,
+            outer_loops,
+            addressed_as,
+        }
+    }
+
+    /// 🎯 077/110 — ⛔ THE ORDER'S RANK IS THE VIEW'S LAYOUT, NOT THE SET'S.
+    ///
+    /// A constant read-write keeps its `4x8` extents but collapses the layout to the rank-1 identity,
+    /// so its order is `(d0) -> (d0)` over a flat `[0, 4)` while the scheduled transfer orders two
+    /// dims. Taking the rank from the set or the extents would order the wrong number of dims.
+    #[test]
+    fn an_agen_transfer_orders_by_its_view_rank_and_a_constant_plane_collapses_it() {
+        let handlers = agen_handlers();
+        let view_sizes = [view_size(PrimaryDim::In, 4), view_size(PrimaryDim::Out, 8)];
+        let outer_loops = [LoopStride {
+            size_idx: 0,
+            elem_offset: 4,
+            iv: Some(Val(81)),
+        }];
+        let chunk = ChunkDim {
+            size: 4,
+            src_index: Some(0),
+            dst_index: None,
+        };
+        let chunks = UnitTimeChunks {
+            sizes: std::slice::from_ref(&chunk),
+            stride: None,
+            num_strides: 0,
+        };
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let scheduled = elements_of_agen_data_transfer(
+            &mut vals,
+            &mut ops,
+            &handlers,
+            &agen_storage(&view_sizes, &outer_loops, AddressedAs::Schedule),
+            &chunks,
+        );
+        assert_eq!(
+            scheduled,
+            Some(TransferElements {
+                view: LogicalMemoryView {
+                    result: Val(0),
+                    layout: AffineMap {
+                        dims: 2,
+                        syms: 0,
+                        results: vec![AffineExpr::dim(1).times(4).plus(AffineExpr::dim(0))],
+                    },
+                    ty: MemRef {
+                        shape: vec![4, 8],
+                        elem: ElemType::F32,
+                    },
+                },
+                base_address: BaseAddress {
+                    map: AffineMap {
+                        dims: 2,
+                        syms: 0,
+                        results: vec![AffineExpr::dim(0).times(4), AffineExpr::Const(0)],
+                    },
+                    // ⛔ The unstrided dim 1 takes the zero constant, not the induction variable.
+                    args: vec![Val(81), Val(1)],
+                },
+                transfer_set: IntegerSet {
+                    dims: 2,
+                    symbols: 0,
+                    constraints: vec![
+                        Constraint {
+                            expr: AffineExpr::dim(0),
+                            is_equality: false,
+                        },
+                        Constraint {
+                            expr: AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(3)),
+                            is_equality: false,
+                        },
+                        Constraint {
+                            expr: AffineExpr::dim(1),
+                            is_equality: true,
+                        },
+                    ],
+                },
+                transfer_order: AffineMap::identity(2),
+            })
+        );
+        // The storage was already bound, so the only ops are the view and the zero operand.
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            ops[1],
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 0,
+            })
+        );
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let constant = elements_of_agen_data_transfer(
+            &mut vals,
+            &mut ops,
+            &handlers,
+            &agen_storage(&view_sizes, &outer_loops, AddressedAs::ConstantPlane),
+            &chunks,
+        )
+        .expect("a constant plane has a flat set");
+        assert_eq!(constant.view.layout, AffineMap::identity(1));
+        assert_eq!(
+            constant.view.ty,
+            MemRef {
+                shape: vec![4, 8],
+                elem: ElemType::F32,
+            }
+        );
+        assert_eq!(
+            constant.base_address,
+            BaseAddress {
+                map: AffineMap::constants(0, &[0]),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(constant.transfer_set, flat_element_set(4));
+        assert_eq!(constant.transfer_order, AffineMap::identity(1));
+        assert_eq!(ops.len(), 1);
+    }
+
+    /// 🎯 078/110 — ⛔ THE TIME ADDRESS MAP READS THE LOOP'S POSITION AND SKIPS A LOOP WITH NO
+    /// `sizeIdx_`, while the time ORDER counts every loop.
+    ///
+    /// Loop 1 addresses nothing, so result 1 stays `0` — but it is still `d1` in the reversal and
+    /// still a dim of the time set. Dropping it from either would misalign the other two.
+    #[test]
+    fn a_composite_transfer_reverses_every_loop_and_addresses_only_the_ones_with_a_size_idx() {
+        let handlers = agen_handlers();
+        let view_sizes = [view_size(PrimaryDim::In, 4), view_size(PrimaryDim::Out, 8)];
+        let chunk = ChunkDim {
+            size: 4,
+            src_index: Some(0),
+            dst_index: None,
+        };
+        let chunks = UnitTimeChunks {
+            sizes: std::slice::from_ref(&chunk),
+            stride: None,
+            num_strides: 0,
+        };
+        let composite_loops = [
+            CompositeTimeLoop {
+                bound: LoopBound::Constant(2),
+                walk: CompositeLoop {
+                    size_idx: Some(0),
+                    elem_offset: 8,
+                },
+            },
+            CompositeTimeLoop {
+                bound: LoopBound::Constant(3),
+                walk: CompositeLoop {
+                    size_idx: None,
+                    elem_offset: 1,
+                },
+            },
+        ];
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let composite = elements_of_agen_composite_data_transfer(
+            &mut vals,
+            &mut ops,
+            &handlers,
+            &agen_storage(&view_sizes, &[], AddressedAs::Schedule),
+            &chunks,
+            &composite_loops,
+        )
+        .expect("two constant bounds make a time set");
+
+        assert_eq!(composite.time_order, time_order(2));
+        assert_eq!(
+            composite.time_set,
+            time_set(&[LoopBound::Constant(2), LoopBound::Constant(3)]).expect("two bounds")
+        );
+        assert_eq!(
+            composite.time_address_map,
+            AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![AffineExpr::dim(0).times(8), AffineExpr::Const(0)],
+            }
+        );
+        assert_eq!(composite.elements.transfer_order, AffineMap::identity(2));
+
+        // ⛔ A DYNAMIC BOUND HAS NO TIME SET, and the whole transfer falls through with it.
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        assert_eq!(
+            elements_of_agen_composite_data_transfer(
+                &mut vals,
+                &mut ops,
+                &handlers,
+                &agen_storage(&view_sizes, &[], AddressedAs::Schedule),
+                &chunks,
+                &[CompositeTimeLoop {
+                    bound: LoopBound::Dynamic,
+                    walk: CompositeLoop {
+                        size_idx: Some(0),
+                        elem_offset: 8,
+                    },
+                }],
+            ),
+            None
+        );
+    }
+
+    /// 🎯 079/110 — ⛔ THE UNIT-TIME TRANSFER IS THE VIEW'S LEADING `min_dim` DIMS, AND `min_dim` IS
+    /// THE SMALLEST `sizeIdx_` ANY OUTER LOOP STRIDES.
+    ///
+    /// Two loops striding dims 2 and 1 leave `min_dim = 1`, so only dim 0 spans and the other two are
+    /// pinned. Reading the LARGEST, or the loop count, would span dims the outer loops already walk.
+    #[test]
+    fn the_unit_time_transfer_is_the_smallest_strided_dim_of_the_view() {
+        let handlers = agen_handlers();
+        let view_sizes = [
+            view_size(PrimaryDim::In, 4),
+            view_size(PrimaryDim::Out, 8),
+            view_size(PrimaryDim::Y, 2),
+        ];
+        let outer_loops = [
+            LoopStride {
+                size_idx: 2,
+                elem_offset: 1,
+                iv: Some(Val(81)),
+            },
+            LoopStride {
+                size_idx: 1,
+                elem_offset: 4,
+                iv: Some(Val(82)),
+            },
+        ];
+
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let elements = elements_of_affine_data_transfer_via_agen_transfer(
+            &mut vals,
+            &mut ops,
+            &handlers,
+            &agen_storage(&view_sizes, &outer_loops, AddressedAs::Schedule),
+        )
+        .expect("three dims and a leading chunk");
+
+        assert_eq!(
+            elements.transfer_set,
+            IntegerSet {
+                dims: 3,
+                symbols: 0,
+                constraints: vec![
+                    Constraint {
+                        expr: AffineExpr::dim(0),
+                        is_equality: false,
+                    },
+                    Constraint {
+                        expr: AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(3)),
+                        is_equality: false,
+                    },
+                    Constraint {
+                        expr: AffineExpr::dim(1),
+                        is_equality: true,
+                    },
+                    Constraint {
+                        expr: AffineExpr::dim(2),
+                        is_equality: true,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            elements.base_address,
+            BaseAddress {
+                map: AffineMap {
+                    dims: 3,
+                    syms: 0,
+                    results: vec![
+                        AffineExpr::Const(0),
+                        AffineExpr::dim(1).times(4),
+                        AffineExpr::dim(2),
+                    ],
+                },
+                args: vec![Val(1), Val(82), Val(81)],
+            }
+        );
+        assert_eq!(elements.transfer_order, AffineMap::identity(3));
+
+        // ⛔ THE CONSTANT ARM'S EXTENT IS THE LITERAL 64, whatever the view says.
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let constant = elements_of_affine_data_transfer_via_agen_transfer(
+            &mut vals,
+            &mut ops,
+            &handlers,
+            &agen_storage(&view_sizes, &outer_loops, AddressedAs::ConstantPlane),
+        )
+        .expect("a constant plane needs no chunks");
+        assert_eq!(constant.transfer_set, flat_element_set(64));
+        assert_eq!(constant.transfer_order, AffineMap::identity(1));
     }
 }
