@@ -393,7 +393,7 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
         ) => true,
         // `agen.yield` terminates a transfer's region and is not one; the view and unit binders,
         // `program_unit` and every arith/affine/scf/vectorchain op are not in the `isa<>` list.
-        DfirOp::Agen(agen::Op::Yield)
+        DfirOp::Agen(agen::Op::Yield | agen::Op::SetTransferMaskState { .. })
         | DfirOp::Dataflow(
             dataflow::Op::GetUnit { .. }
             | dataflow::Op::GetLocalUnit { .. }
@@ -674,6 +674,7 @@ mod unit_tests {
                     shape: vec![1, 64],
                     elem: ElemType::F16,
                 },
+                dbg_name: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Send {
                 to: send_end,

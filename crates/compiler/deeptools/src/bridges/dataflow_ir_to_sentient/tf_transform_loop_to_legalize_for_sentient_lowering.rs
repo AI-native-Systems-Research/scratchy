@@ -472,8 +472,9 @@ fn is_memory_op(op: &DfirOp) -> bool {
             | agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
-        // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else.
-        DfirOp::Agen(agen::Op::Yield)
+        // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else — the
+        // mask-state write among them, which reads no view and so strides against no loop.
+        DfirOp::Agen(agen::Op::Yield | agen::Op::SetTransferMaskState { .. })
         | DfirOp::Arith(_)
         | DfirOp::Scf(_)
         | DfirOp::Affine(_)

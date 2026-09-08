@@ -1557,9 +1557,11 @@ impl<'a> AccessDetailsBase<'a> {
         // `:207-218` — the users of the loaded vector.
         let users = match self.op {
             agen::Op::VectorLoad { result, .. } => uses(*result, scope),
-            agen::Op::VectorStore { .. } | agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield => {
-                Vec::new()
-            }
+            agen::Op::VectorStore { .. }
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::Yield
+            // ⭐ A SAMV BINDS A VECTOR BUT LOADS NOTHING, so it has no loaded value to have users of.
+            | agen::Op::SetTransferMaskState { .. } => Vec::new(),
         };
         for user in users {
             match user {
@@ -1863,7 +1865,10 @@ impl<'a> AccessDetailsAffine<'a> {
                 ty,
                 ..
             } => (view, view_ty, indices, ty),
-            agen::Op::CompositeLoadAndStore(_) | agen::Op::Yield => {
+            agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::Yield
+            // ⭐ A SAMV CARRIES NO VIEW AND NO SUBSCRIPTS.
+            | agen::Op::SetTransferMaskState { .. } => {
                 return AffineInitialize::UnsupportedOperation;
             }
         };

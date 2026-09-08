@@ -569,8 +569,8 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             dfir_op::agen::Op::VectorLoad { .. } => Some(AgenOpKind::VectorLoad),
             dfir_op::agen::Op::VectorStore { .. } => Some(AgenOpKind::VectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
-            // The region terminator is not a transfer.
-            dfir_op::agen::Op::Yield => None,
+            // The region terminator is not a transfer, and neither is a mask-state write.
+            dfir_op::agen::Op::Yield | dfir_op::agen::Op::SetTransferMaskState { .. } => None,
         },
         DfirOp::Arith(_)
         | DfirOp::Scf(_)
@@ -659,7 +659,8 @@ impl AgenLoad {
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
-                | dfir_op::agen::Op::Yield,
+                | dfir_op::agen::Op::Yield
+                | dfir_op::agen::Op::SetTransferMaskState { .. },
             )
             | DfirOp::Arith(_)
             | DfirOp::Scf(_)
