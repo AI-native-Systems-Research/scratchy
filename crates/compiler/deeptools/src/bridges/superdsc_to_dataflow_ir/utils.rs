@@ -691,6 +691,7 @@ pub fn initialize_unit(
     let neighbours = build_neighbor_units(vals, comp, own, core, corelet);
     ops.push(DfirOp::Dataflow(dataflow::Op::ProgramUnit {
         units: vec![own],
+        iter_arg: None,
         precision: None,
         body: neighbours.ops.clone(),
     }));
@@ -701,15 +702,87 @@ pub fn initialize_unit(
     }
 }
 
-// crustify:todo: e093_initializeUniformizedUnit
+/// ONE UNIFORMIZED PROGRAM UNIT AND EVERYTHING ITS PREAMBLE BOUND — [`InitializedUnit`]'s uniformized
+/// twin, whose own handle is the region's `iter_arg` and whose `(core, corelet)` table IS
+/// `unit_to_value_map_[core][corelet][comp]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InitializedUniformizedUnit {
+    /// Every `(core, corelet)`'s `dataflow.get_unit`, then the `dataflow.program_unit` over them.
+    pub ops: Vec<DfirOp>,
+    /// `program_unit_iterator` — `component_to_handler_[comp]` after the `clear()`.
+    pub iterator: Val,
+    /// `unit_to_value_map_` and `*units_involved_` as one table, keyed on that iterator.
+    pub handles: Handles,
+    /// What the preamble inside the region bound.
+    pub neighbours: Neighbourhood,
+}
+
+/// Replaces: e093_initializeUniformizedUnit
+///
+/// **093/110** `DSC2ToDataflowIRUtils.hpp:663` — a `get_unit` per `(core, corelet)`, the
+/// `program_unit` over EVERY FOLD of all of them, then [`build_uniformized_neighbor_units`] inside.
+///
+/// ⛔ THE UNIT'S OWN HANDLE IS THE REGION ARGUMENT: `component_to_handler_.clear()` then
+/// `[comp] = program_unit_iterator = unit_op.getRegion().getArguments().front()`, so every neighbour
+/// query in the body is keyed on `iter_arg` and no `get_unit` names this unit.
+/// ⛔ AND EVERY COMPONENT IS NAMED `type + "-CL" + corelet_id` HERE, L3 included — unlike
+/// [`create_uniformized_get_unit_op`], whose L3 halves are ONE core-wide op.
+/// ⚠️ ONE `Val` PER GROUP, REPEATED PER FOLD — `getResult(i)` is unnameable, as in entry 072.
+pub fn initialize_uniformized_unit(
+    vals: &mut Values,
+    comp: DfirUnit,
+    cores: &[Core],
+    corelets: &[Corelet],
+    folds: NumFolds,
+    units: &mut Vec<Val>,
+) -> InitializedUniformizedUnit {
+    let mut ops = Vec::new();
+    let appended_at = units.len();
+    for &core in cores {
+        for &corelet in corelets {
+            let unit = create_get_unit_op(
+                vals,
+                None,
+                comp,
+                Residency::Corelet { core, corelet },
+                folds,
+            )
+            .bind(&mut ops);
+            for _ in 0..folds.0 {
+                units.push(unit);
+            }
+        }
+    }
+    let iterator = vals.mint();
+    // ⭐ THE TWO WALKS ARE ONE WALK: this tail was filled by the same `for (core) for (corelet) for
+    // (fold)` nesting [`Handles::new`] walks, so it holds exactly one entry per handle asked for.
+    let mut walk = units[appended_at..].iter().copied();
+    let handles = Handles::new(cores, corelets, folds, iterator, |_, _, _| {
+        walk.next().unwrap_or(iterator)
+    });
+    let neighbours = build_uniformized_neighbor_units(vals, comp, &handles, folds);
+    ops.push(DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+        units: units.clone(),
+        iter_arg: Some(iterator),
+        precision: None,
+        body: neighbours.ops.clone(),
+    }));
+    InitializedUniformizedUnit {
+        ops,
+        iterator,
+        handles,
+        neighbours,
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        DscKind, InitializedUnit, Neighbourhood, OwnFiles, PtDirection, TranslatorVersion,
-        append_index_types, build_neighbor_units, build_uniformized_neighbor_units,
-        create_get_local_unit_op, create_get_unit_op, create_uniformized_get_unit_op,
-        error_diagnostic, initialize_unit, set_precision_in_unit_op, translator_version,
+        DscKind, InitializedUniformizedUnit, InitializedUnit, Neighbourhood, OwnFiles, PtDirection,
+        TranslatorVersion, append_index_types, build_neighbor_units,
+        build_uniformized_neighbor_units, create_get_local_unit_op, create_get_unit_op,
+        create_uniformized_get_unit_op, error_diagnostic, initialize_uniformized_unit,
+        initialize_unit, set_precision_in_unit_op, translator_version,
     };
     use crate::arch::{Arch, Dd2, IsaGen, Target};
     use crate::bridges::superdsc_to_dataflow_ir::dsc_lowering::{Bound, Handles, Retrieved};
@@ -961,6 +1034,7 @@ mod unit_tests {
                 }),
                 DfirOp::Dataflow(dataflow::Op::ProgramUnit {
                     units: vec![own],
+                    iter_arg: None,
                     precision: None,
                     body: neighbours.ops.clone(),
                 }),
@@ -969,6 +1043,77 @@ mod unit_tests {
         // `L0LUROW0` binds three neighbours, and all three `get_unit`s are inside the region.
         assert_eq!(neighbours.units.len(), 3);
         assert_eq!(neighbours.ops.len(), 3);
+    }
+
+    /// 🎯 093/110 — ⛔ EVERY FOLD OF EVERY PAIR IS AN OPERAND, and the handle the body queries on is
+    /// the region argument, which no `get_unit` produced.
+    #[test]
+    fn the_uniformized_unit_names_each_corelet_once_and_every_fold_as_an_operand() {
+        let mut vals = Values::default();
+        let core = Core::checked(0).expect("core 0");
+        let corelets = [
+            Corelet::checked(0).expect("corelet 0"),
+            Corelet::checked(1).expect("corelet 1"),
+        ];
+        let mut units = Vec::new();
+        let InitializedUniformizedUnit {
+            ops,
+            iterator,
+            handles,
+            neighbours,
+        } = initialize_uniformized_unit(
+            &mut vals,
+            DfirUnit::Lxlu,
+            &[core],
+            &corelets,
+            NumFolds(2),
+            &mut units,
+        );
+
+        assert_eq!(units, vec![Val(0), Val(0), Val(1), Val(1)]);
+        assert_eq!(
+            ops[..2],
+            [
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(0),
+                    residency: Residency::Corelet {
+                        core,
+                        corelet: corelets[0]
+                    },
+                    unit: DfirUnit::Lxlu,
+                    num_folds: Some(NumFolds(2)),
+                }),
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: Val(1),
+                    residency: Residency::Corelet {
+                        core,
+                        corelet: corelets[1]
+                    },
+                    unit: DfirUnit::Lxlu,
+                    num_folds: Some(NumFolds(2)),
+                }),
+            ]
+        );
+        assert_eq!(ops.len(), 3);
+        assert_eq!(
+            ops[2],
+            DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+                units: units.clone(),
+                iter_arg: Some(iterator),
+                precision: None,
+                body: neighbours.ops.clone(),
+            })
+        );
+        // ⭐ THE ITERATOR IS MINTED AFTER THE UNITS and is what every neighbour query reads.
+        assert_eq!(iterator, Val(2));
+        assert_eq!(
+            handles.iter().map(|handle| handle.unit).collect::<Vec<_>>(),
+            units
+        );
+        assert!(neighbours.ops.iter().any(|op| matches!(
+            op,
+            DfirOp::Uniform(uniform::Op::QueryMap { key, .. }) if *key == iterator
+        )));
     }
 
     /// ⛔ IT APPENDS, THOUGH NOTHING IN THE TREE DEPENDS ON THAT: both call sites hand it a fresh

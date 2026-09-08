@@ -575,6 +575,7 @@ mod unit_tests {
             op2: Val(2),
             mask: None,
             compare_op: vc::CompareOp::Eq,
+            dbg_name: None,
             operand_ty: V,
             ty: V,
         }));
@@ -583,6 +584,7 @@ mod unit_tests {
             cond: mask(),
             lhs: Val(1),
             rhs: Val(2),
+            dbg_name: None,
             mask: None,
             ty: V,
         }));

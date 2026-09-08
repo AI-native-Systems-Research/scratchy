@@ -526,6 +526,7 @@ mod unit_tests {
         let inner = counted(Val(27), 0, 3);
         let scope = vec![DfirOp::Dataflow(dataflow::Op::ProgramUnit {
             units: vec![Val(12)],
+            iter_arg: None,
             precision: None,
             body: vec![DfirOp::Affine(affine::Op::For {
                 iv: Val(25),
@@ -617,6 +618,7 @@ mod unit_tests {
     fn a_value_bound_by_no_loop_answers_nothing() {
         let scope = vec![DfirOp::Dataflow(dataflow::Op::ProgramUnit {
             units: vec![Val(12)],
+            iter_arg: None,
             precision: None,
             body: vec![counted(Val(38), 0, 4)],
         })];

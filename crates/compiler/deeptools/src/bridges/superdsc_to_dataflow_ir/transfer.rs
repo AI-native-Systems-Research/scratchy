@@ -39,8 +39,6 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e097_GenerateReceiveAndStoreFromDataTransferNode
-// crustify:todo: e098_GenerateDataTranferForSrc
 // crustify:todo: e102_GenerateDataTranferForDst
 // crustify:todo: e104_constructDataTransfer
 
@@ -66,7 +64,7 @@ use crate::islands::dataflow_ir::ty::{
     AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, MemRef, ScalarTy,
     TensorCategory, Vector,
 };
-use crate::units::{Core, Corelet};
+use crate::units::{Core, Corelet, DfirUnit};
 
 /// Replaces: e063_getLabeledDsType
 ///
@@ -2910,6 +2908,7 @@ pub enum LoadAndStoreSource<'c> {
 /// ⛔⛔ NOT A BARE `Vec<DfirOp>`, for the reason [`ReceiveAndSend`] is not one: `if
 /// (!outer_loops.empty())` re-points the builder at the START of a loop body (`:2385-2394`), so a
 /// caller that appends the list where it stands stores ONCE for a transfer of the whole nest.
+#[derive(Debug)]
 pub enum LoadAndStore {
     /// `outer_loops` was non-empty: these ops go at the START of the body of the loop
     /// `(*dsc_loops_to_mlir_loops_map_)[outer_loops.front().loop_].front()` holds.
@@ -4087,12 +4086,714 @@ fn switched(chain: Chain) -> Option<SwitchedLoad> {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 097/110 — THE RECEIVE AND THE STORE
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// EVERYTHING A STORE READS OFF ITS TRANSFER NODE — the mirror of [`TransferRead`].
+///
+/// ⛔ `unitTimeTransferNumChunks_` IS ABSENT ON PURPOSE: neither agen call this entry makes passes a
+/// chunk count (`:6555-6584`), so entry 067's own `num_chunk_strides = 1` stands — see
+/// [`StreamingStore::chunks`].
+#[derive(Debug, Clone, Copy)]
+pub struct TransferWrite<'i> {
+    /// `dst_storage` — the component the view is addressed through.
+    pub storage: Component,
+    /// `dst` — the component the data lands IN, which is what the 2B/16B arm tests.
+    pub dst: GenericComp,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_`, and [`None`] for the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `comp_` — the unit this program is lowered FOR: `is_memory`, and the conversion's target.
+    pub comp: GenericComp,
+    /// `{comp_, dst_storage}` as the address-granularity table keys it, for entry 089.
+    pub location: DataLocation,
+    /// `{dst, dst_storage}` — the same table, for this entry's own memory arm.
+    ///
+    /// ⚠️⚠️ TWO ROWS FOR ONE TRANSFER, exactly as on the load side: `:6533` reads the factor for the
+    /// component the data lands IN while entry 089 reads it for the unit being lowered. See
+    /// [`TransferRead::src_location`].
+    pub dst_location: DataLocation,
+    /// `transfer_->name_` — the `dbgName` of every op that has one.
+    pub name: &'i str,
+    /// `dsc_->name_` — the node an error names.
+    pub node: &'i str,
+    /// `*view_sizes_core_specific` — `dstLoopsAndSizes_[dst_idx]`, resolved for this core.
+    pub view_sizes: &'i [ViewSize],
+    /// The view's element type.
+    pub elem: ElemType,
+    /// `transfer_->unitTimeTransferChunkSize_`.
+    pub chunk_sizes: &'i [ChunkDim],
+    /// `transfer_->unitTimeTransferChunkStride_`.
+    pub chunk_stride: Option<ChunkDim>,
+    /// `result_type` — the vector this end STORES, before [`TransferWrite::widened`].
+    pub result_ty: Vector,
+    /// `src_result_type` — what arrives off the wire, which is what can make a conversion necessary.
+    pub src_result_ty: Vector,
+    /// `dst_prec_` — the format that conversion targets.
+    pub dst_prec: DataType,
+    /// The DSC format [`TransferWrite::result_ty`] was built from, which the granularity factor is
+    /// read at — see [`TransferRead::precision`].
+    pub precision: DataType,
+    /// `transfer_->replicationFactor_`.
+    pub replication: Replication,
+}
+
+impl TransferWrite<'_> {
+    /// `if (transfer_->replicationFactor_ > 1)` — BOTH types widen (`:6449-6459`).
+    ///
+    /// ⛔⛔ THEY ARE MEMBERS, SO THE WIDENING OUTLIVES THE `if`: the receive, the conversion test, the
+    /// granularity factor and the store all read the WIDENED pair, and the 2B/16B shuffle then
+    /// narrows back by the same factor. Widening only at the store would receive a stick's worth off
+    /// a wire carrying `rf` of them.
+    #[must_use]
+    fn widened(mut self) -> Self {
+        if self.replication.get() > 1 {
+            let factor = self.replication.get().unsigned_abs();
+            self.result_ty = Vector {
+                len: self.result_ty.len * factor,
+                elem: self.result_ty.elem,
+            };
+            self.src_result_ty = Vector {
+                len: self.src_result_ty.len * factor,
+                elem: self.src_result_ty.elem,
+            };
+        }
+        self
+    }
+
+    /// `unitTimeTransferChunkSize_` and `unitTimeTransferChunkStride_`, with the count left at entry
+    /// 067's default — see this struct's note.
+    fn chunks(&self) -> UnitTimeChunks<'_> {
+        UnitTimeChunks {
+            sizes: self.chunk_sizes,
+            stride: self.chunk_stride.as_ref(),
+            num_strides: 1,
+        }
+    }
+
+    /// `dst == SenComponents::LXSU && transfer_->replicationFactor_ > 1` (`:6588`).
+    const fn narrows(&self) -> bool {
+        matches!(self.dst, GenericComp::Lxsu) && self.replication.get() > 1
+    }
+}
+
+/// WHERE ONE RECEIVE'S DATA COMES FROM — `transfer_->src_.unit_ == CONSTANT` (`:6462`).
+///
+/// ⛔⛔ IT ALSO DECIDES THE ADDRESSING, WHICH IS WHY [`StoreDest::Memory`] CARRIES NO FLAG FOR IT:
+/// `is_constant_read` is handed to entries 077 and 078 as their `is_constant_read_write` (`:6560`,
+/// `:6572`), so a constant source is addressed as a flat plane — see [`AddressedAs`].
+pub enum ReceiveSource<'s> {
+    /// `CONSTANT` — entry 070 over `dsc_->constantInfo_.at(constantId_)`, and NO `dataflow.receive`.
+    Constant {
+        /// The unit handles entry 032's fold query is asked over.
+        handles: &'s Handles,
+        /// `cst_info` — the folds, their format and the component they are bound on.
+        data: &'s ConstantData,
+        /// Whether the elements are bit patterns or symbol ids.
+        values: BitstreamValues,
+        /// The per-fold read of the constant's data.
+        bitstream: &'s dyn Fn(Core, Corelet, u32) -> Vec<i64>,
+    },
+    /// Anything else — `dataflow.receive` of `src_result_type`, converted where the precisions differ.
+    ///
+    /// ⚠️ `ReceiveOp::create` ALSO PASSES `getStringAttr(transfer_->name_)`, and
+    /// [`dataflow::Op::Receive`] has no `dbgName` field — the same gap entry 080 records for
+    /// `dataflow.send`.
+    Wire(RecvEnd),
+}
+
+impl ReceiveSource<'_> {
+    /// `is_constant_read`, as entries 077 and 078 read it.
+    const fn addressed_as(&self) -> AddressedAs {
+        match self {
+            ReceiveSource::Constant { .. } => AddressedAs::ConstantPlane,
+            ReceiveSource::Wire(_) => AddressedAs::Schedule,
+        }
+    }
+}
+
+/// WHERE ONE RECEIVED VECTOR LANDS, in the reference's own test order (`:6504`, `:6519`, `:6528`).
+///
+/// ⛔⛔ `LATCH` PREEMPTS THE MODE, WHICH IS WHY THESE ARE ONE ENUM: `dst_storage == LATCH` returns
+/// before `getBufferingOrStreamingMode` is asked (`:6504-6510`), so a latched end never reaches
+/// entry 089 and never reaches that call's own refusal.
+///
+/// ⚠️ `emitError("Unable to get buffering or streaming mode")` (`:6513`) IS THE CALLER'S: the mode is
+/// read off the transfer node, and it is what picks between these variants — see
+/// [`buffering_or_streaming_mode`].
+pub enum StoreDest<'s> {
+    /// `LATCH` — `addToLatchMap(latchDataId_, data)`, and no store at all.
+    ///
+    /// ⛔ `DT_CHECK_MSG(latch_id != -1, "latch id cannot be negative")` (`:6507`) IS THIS VARIANT'S
+    /// ARGUMENT — see [`Latch`].
+    Latch(Latch),
+    /// `mode == 2 || mode == 1` — entry 089 emits the store and the address arithmetic.
+    Switched {
+        /// The buffer-switch loop this transfer's address rides in.
+        switch: BufferSwitchLoop,
+        /// Which way it moves, and the fold read that gives the step.
+        step: BufferStep<&'s dyn Fn(&mut Values, &mut Vec<DfirOp>, Factor) -> Val>,
+    },
+    /// Neither — a logical memory view over the destination's own start address.
+    Memory {
+        /// `constructUniformizedFoldedAddress(dstLdsAndLoopOffsets_[dst_idx].startAddr_, factor)`, or
+        /// the single scaled constant its non-uniformized `else` emits (`:6535-6550`).
+        address: &'s dyn Fn(&mut Values, &mut Vec<DfirOp>, Factor) -> Val,
+    },
+}
+
+/// WHICH STORE THE MERGED LOOP LISTS CALL FOR — `perform_composite_store`.
+///
+/// ⛔ IT IS NOT [`StoreForm`]: entry 089 takes the producer op with it, while on this entry's own
+/// memory path the producer is only reached once the store is being built — see [`take_producer`].
+#[derive(Debug, Clone, Copy)]
+enum StoreShape<'s> {
+    /// `agen.vector_store`.
+    Vector,
+    /// `agen.composite_store`, over these time loops.
+    Composite(&'s [CompositeTimeLoop]),
+}
+
+/// WHAT ONE RECEIVE-AND-STORE LEFT BEHIND — the reference's `final_store_value` out-parameter, and
+/// the one arm that never assigns it.
+#[derive(Debug)]
+pub enum Written {
+    /// `dst_storage == LATCH` — `addToLatchMap(latch_id, data)` and a return, so `final_store_value`
+    /// is never assigned (`:6504-6510`).
+    Latched(Latch, Val),
+    /// `mode == 2 || mode == 1` — entry 089 emitted the store, and its buffer-switch update belongs
+    /// several loops further out. See [`BufferSwitchUpdate::ops`].
+    Switched(Computed, BufferSwitchUpdate),
+    /// The memory arm's own `agen.vector_store` or `agen.composite_store`.
+    ///
+    /// ⚠️ `final_store_value = data` IS TAKEN BEFORE THE 2B/16B SHUFFLE (`:6518` against `:6590`), so
+    /// on an LXSU store with replication the value recorded here is NOT the value stored.
+    Stored(Computed),
+}
+
+/// EVERYTHING ONE RECEIVE-AND-STORE LEAVES ITS CALLER TO PLACE AND RECORD.
+#[derive(Debug)]
+pub struct ReceiveAndStore {
+    /// The ops, and how they nest — the same three shapes entry 090 reaches.
+    pub emitted: Emitted,
+    /// Which arm wrote, and what it left behind.
+    pub written: Written,
+}
+
+/// THE OP THAT DEFINES THE STORED VECTOR, TAKEN OUT OF THE CALLER'S LIST — `data.getDefiningOp()`,
+/// cloned into the store's region and then `erase()`d (`:6608-6614`).
+///
+/// ⚠️ THE CLONE MINTS A NEW RESULT IN THE REFERENCE AND THIS MOVES THE OP INSTEAD, so the value the
+/// terminator carries keeps its name. Same program, one fewer name — as entry 089 does it.
+fn take_producer(ops: &mut Vec<DfirOp>, data: Val) -> Option<DfirOp> {
+    let at = ops.iter().position(|op| results(op).contains(&data))?;
+    Some(ops.remove(at))
+}
+
+/// `if (dst == LXSU && replicationFactor_ > 1)` — the shuffle that narrows the replicated vector back
+/// to one store's width (`:6588-6604`).
+fn narrowed(
+    vals: &mut Values,
+    into: &mut Vec<DfirOp>,
+    write: &TransferWrite<'_>,
+    data: Computed,
+) -> Computed {
+    let shuffled = construct_2b16b_store_shuffle(
+        vals,
+        into,
+        write.name,
+        data.val(),
+        write.result_ty,
+        write.replication,
+    )
+    .unwrap_or_else(|| emit_error(write.node, "Unsupported store type."));
+    Computed::of(
+        shuffled,
+        Vector {
+            len: write.result_ty.len / write.replication.get().unsigned_abs(),
+            elem: write.result_ty.elem,
+        },
+    )
+}
+
+/// Replaces: e097_GenerateReceiveAndStoreFromDataTransferNode
+///
+/// **097/110** `SNTransferLowering::GenerateReceiveAndStoreFromDataTransferNode` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1508` (269L).
+///
+/// A UNIT THAT RECEIVES AND WRITES: the implicit loops a contiguous transfer needs, the
+/// `dataflow.receive` (or the constant bit stream), the precision conversion the destination asks
+/// for, and the latch, the buffer-switched store or the `agen` store the data lands in.
+///
+/// ⛔⛔ THE LOAD SIDE'S MIRROR, LOOP MERGE AND ALL — `is_memory`, `perform_composite_store`, the
+/// splice into ONE of the two lists and `update_insertion_loc` are the same text as entry 090's
+/// (`:6386-6446`), including `L0LUROW0` widening to every `L0LU` row. See
+/// [`generate_load_and_send_from_data_transfer_node`].
+///
+/// ⛔ AND IT ASKS ENTRY 077 FOR A **LOAD** ON BOTH PATHS (`:6557`, `:6569`), so the set is read from
+/// the chunks' `src_index` — as entries 089 and 091 do.
+///
+/// ⚠️ THE CONVERSION'S FAILURE DOES NOT RETURN: `emitError` at `:6494` falls through with `data`
+/// still null (`:6492-6497`), which [`emit_error`] raises on instead.
+///
+/// ⛔ [`None`] IS A LOOP WITH NO `sizeIdx_` READ AS AN ADDRESS STRIDE, the composite store's absent
+/// time order, or a stored vector no op in the caller's list defines — see [`take_producer`].
+#[must_use]
+pub fn generate_receive_and_store_from_data_transfer_node<'p>(
+    vals: &mut Values,
+    handlers: &Handlers,
+    write: &TransferWrite<'_>,
+    loops: &ViewLoops<'_>,
+    sticks: &mut ContiguousSticks,
+    transfer_sizes: ContiguousTransfer,
+    parent_loop: impl Fn(PrimaryDim) -> Option<&'p DfirOp>,
+    source: ReceiveSource<'_>,
+    dest: StoreDest<'_>,
+) -> Option<ReceiveAndStore> {
+    let widened = write.widened();
+    let write = &widened;
+
+    // `is_any_of(comp_, LXLU, LXSU, L0LUROW0, L0SU)`.
+    let is_memory = matches!(
+        write.comp,
+        GenericComp::Lxlu | GenericComp::Lxsu | GenericComp::L0lu | GenericComp::L0su
+    );
+    let composite_bounds: Vec<LoopBound> = loops.composite.iter().map(|view| view.bound).collect();
+    // `perform_composite_store`, carrying the loop its second conjunct proves exists (`:6394-6405`).
+    let mut composite_store = if is_memory
+        && !epilogues_in_loops(&composite_bounds)
+        && !epilogues_in_transfer_sizes(sticks)
+    {
+        loops.composite.first().copied()
+    } else {
+        None
+    };
+    // ⛔ DECIDED BEFORE ENTRY 068 IS ASKED ANYTHING, and never revisited (`:6403` precedes `:6410`).
+    let nest_at = match composite_store {
+        Some(front) => NestPlace::InFirstLoopFor(front),
+        None => NestPlace::Here,
+    };
+
+    let implicit_loops = match transfer_sizes {
+        ContiguousTransfer::Sized => {
+            let derived = implicit_loops_for_contiguous_transfer(
+                write.view_sizes,
+                write.chunk_sizes.len(),
+                sticks,
+                write.replication,
+            )
+            .unwrap_or_else(|| {
+                emit_error(
+                    write.node,
+                    "Unable to construct implicit loops for contiguous transfer",
+                )
+            });
+            let bounds: Vec<LoopBound> = derived.iter().map(implicit_bound).collect();
+            if epilogues_in_loops(&bounds) {
+                composite_store = None;
+            }
+            derived
+        }
+        ContiguousTransfer::Absent => Vec::new(),
+    };
+
+    // The composite loops go into ONE of the two lists and never both (`:6417-6435`).
+    let mut composite: Vec<CompositeTimeLoop> = Vec::new();
+    let mut outer: Vec<LoopStride> = Vec::new();
+    if composite_store.is_some() {
+        composite.extend(implicit_loops.iter().map(implicit_time));
+        composite.extend(loops.composite.iter().map(|view| view.time()));
+    } else {
+        for view in loops.composite {
+            outer.push(view.stride()?);
+        }
+    }
+    outer.extend_from_slice(loops.outer);
+    let form = if composite_store.is_some() {
+        StoreShape::Composite(&composite)
+    } else {
+        StoreShape::Vector
+    };
+
+    // `update_insertion_loc = !perform_composite_store && !outer_loops.empty() &&
+    //  (!implicit_loops.empty() || !composite_loops.empty())`, on the MERGED lists.
+    let update_insertion_loc = composite_store.is_none()
+        && !(outer.is_empty() && implicit_loops.is_empty())
+        && !(implicit_loops.is_empty() && loops.composite.is_empty());
+
+    if implicit_loops.is_empty() {
+        let mut ops = Vec::new();
+        let written =
+            receive_and_store(vals, &mut ops, handlers, write, &outer, form, source, dest)?;
+        let at = match loops.composite.first() {
+            Some(&front) if update_insertion_loc => ChainPlace::InLastLoopFor(front),
+            _ => ChainPlace::Here,
+        };
+        return Some(ReceiveAndStore {
+            emitted: Emitted::Chain { ops, at },
+            written,
+        });
+    }
+
+    if let Some(front) = composite_store {
+        // ⭐ THE NEST IS EMITTED FIRST, AND EMPTY: its loops became TIME loops of the composite store
+        // rather than a place to put the chain, and `loop_builder` never entered them.
+        let nest = emit_implicit_loops_for_contiguous_transfer(
+            vals,
+            &implicit_loops,
+            write.name,
+            parent_loop,
+            |_, _| Vec::new(),
+        )
+        .unwrap_or_else(|| {
+            emit_error(
+                write.node,
+                "Unable to construct implicit loops for contiguous transfer",
+            )
+        });
+        let mut ops = Vec::new();
+        let written =
+            receive_and_store(vals, &mut ops, handlers, write, &outer, form, source, dest)?;
+        return Some(ReceiveAndStore {
+            emitted: Emitted::NestAndChain {
+                nest,
+                at: front,
+                ops,
+            },
+            written,
+        });
+    }
+
+    // The chain goes INSIDE the innermost implicit loop and strides its base address against all of
+    // them, which is why it is built from within the nest's own body.
+    let mut written = None;
+    let nest = emit_implicit_loops_for_contiguous_transfer(
+        vals,
+        &implicit_loops,
+        write.name,
+        parent_loop,
+        |vals, ivs| {
+            let mut strides = Vec::with_capacity(implicit_loops.len() + outer.len());
+            for (implicit, iv) in implicit_loops.iter().zip(ivs) {
+                match implicit_stride(implicit, *iv) {
+                    Some(stride) => strides.push(stride),
+                    None => return Vec::new(),
+                }
+            }
+            strides.extend_from_slice(&outer);
+            let mut ops = Vec::new();
+            written = receive_and_store(
+                vals, &mut ops, handlers, write, &strides, form, source, dest,
+            );
+            ops
+        },
+    )
+    .unwrap_or_else(|| {
+        emit_error(
+            write.node,
+            "Unable to construct implicit loops for contiguous transfer",
+        )
+    });
+
+    Some(ReceiveAndStore {
+        emitted: Emitted::Nest { nest, at: nest_at },
+        written: written?,
+    })
+}
+
+/// THE RECEIVE, THE CONVERSION AND THE STORE THEMSELVES — everything after both builders are placed
+/// (`:6461-6617`).
+fn receive_and_store(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    write: &TransferWrite<'_>,
+    outer_loops: &[LoopStride],
+    form: StoreShape<'_>,
+    source: ReceiveSource<'_>,
+    dest: StoreDest<'_>,
+) -> Option<Written> {
+    let addressed_as = source.addressed_as();
+    let data = match source {
+        ReceiveSource::Constant {
+            handles,
+            data,
+            values,
+            bitstream,
+        } => Computed::of(
+            constant_bitstream_and_shuffle(
+                vals,
+                ops,
+                write.name,
+                handles,
+                data,
+                values,
+                bitstream,
+                write.result_ty,
+            )
+            .unwrap_or_else(|| {
+                emit_error(
+                    write.node,
+                    "Unable to create constant bitstream and shuffle",
+                )
+            }),
+            write.result_ty,
+        ),
+        ReceiveSource::Wire(from) => {
+            let received = Received::receive(ops, vals.mint(), from, write.src_result_ty);
+            let value = Computed::of(received.operand(), write.src_result_ty);
+            // ⚠️ `getDimSize(result_type, 0) * getElementTypeBitWidth(result_type)` — the width is
+            // read off the DESTINATION's type and the inequality is against the SOURCE's, so a stick's
+            // worth on the way in is left alone. See [`convert`].
+            let input_bits = write.result_ty.len * u64::from(write.result_ty.elem.bits());
+            if write.src_result_ty != write.result_ty && input_bits != STICK_BITS {
+                precision_conversion(vals, ops, value, write.dst_prec, write.comp).unwrap_or_else(
+                    || {
+                        emit_error(
+                            write.node,
+                            "Unable to construct precision conversion in a transfer operation",
+                        )
+                    },
+                )
+            } else {
+                value
+            }
+        }
+    };
+
+    match dest {
+        // `addToLatchMap(latch_id, data); return success();` — before the mode is even read.
+        StoreDest::Latch(latch) => Some(Written::Latched(latch, data.val())),
+        StoreDest::Switched { switch, step } => {
+            let store = StreamingStore {
+                storage: write.storage,
+                core: write.core,
+                corelet: write.corelet,
+                location: write.location,
+                name: write.name,
+                node: write.node,
+                view_sizes: write.view_sizes,
+                elem: write.elem,
+                outer_loops,
+                chunks: write.chunks(),
+                precision: write.precision,
+                switch,
+            };
+            let form = match form {
+                StoreShape::Vector => StoreForm::Vector,
+                StoreShape::Composite(loops) => StoreForm::Composite {
+                    loops,
+                    producer: take_producer(ops, data.val())?,
+                },
+            };
+            // ⛔ ENTRY 089's SILENT `failure()`s BECOME A RAISE HERE, as the reference raises them:
+            // `emitError("Unable to construct streaming store")` (`:6524`).
+            let update = construct_streaming_or_double_buffering_store(
+                vals, ops, handlers, &store, data, form, step,
+            )
+            .unwrap_or_else(|| emit_error(write.node, "Unable to construct streaming store"));
+            Some(Written::Switched(data, update))
+        }
+        StoreDest::Memory { address } => {
+            // `getAddressGranularityMultiplyFactor(dst, dst_storage, getElementType(result_type))`.
+            let factor = address_granularity_multiply_factor(write.dst_location, write.precision);
+            let start_address = address(vals, ops, factor);
+            let transfer = AgenStorage {
+                storage: write.storage,
+                core: write.core,
+                corelet: write.corelet,
+                // ⛔ THE REFERENCE'S OWN `true` ON A STORE — see this entry's note.
+                side: TransferSide::Load,
+                start_address,
+                view_sizes: write.view_sizes,
+                elem: write.elem,
+                outer_loops,
+                addressed_as,
+            };
+            let chunks = write.chunks();
+            match form {
+                StoreShape::Vector => {
+                    let elements =
+                        elements_of_agen_data_transfer(vals, ops, handlers, &transfer, &chunks)
+                            .unwrap_or_else(|| {
+                                emit_error(
+                                    write.node,
+                                    "Unable to construct elements of agen data transfer",
+                                )
+                            });
+                    let stored = if write.narrows() {
+                        narrowed(vals, ops, write, data)
+                    } else {
+                        data
+                    };
+                    // ⚠️ `transfer_order` IS DROPPED because `store_order` is DERIVED — see
+                    // [`agen::Access`] and entry 091.
+                    ops.push(DfirOp::Agen(agen::Op::VectorStore {
+                        value: stored.val(),
+                        view: elements.view.result,
+                        indices: elements.base_address.indices.clone(),
+                        dbg_name: Some(write.name.to_owned()),
+                        access: agen::Access::Stated(elements.transfer_set),
+                        view_ty: elements.view.ty,
+                        ty: stored.ty(),
+                    }));
+                }
+                StoreShape::Composite(time_loops) => {
+                    let composite = elements_of_agen_composite_data_transfer(
+                        vals, ops, handlers, &transfer, &chunks, time_loops,
+                    )
+                    .unwrap_or_else(|| {
+                        emit_error(
+                            write.node,
+                            "Unable to construct elements of agen data transfer",
+                        )
+                    });
+                    let elements = composite.elements;
+                    // ⛔ THE SHUFFLE IS BUILT WITH `composite_store_builder`, INSIDE THE REGION
+                    // (`:6582-6590`), and where there is no shuffle it is the PRODUCER that moves in.
+                    let mut body = Vec::new();
+                    let yielded = if write.narrows() {
+                        narrowed(vals, &mut body, write, data)
+                    } else {
+                        body.push(take_producer(ops, data.val())?);
+                        data
+                    };
+                    body.push(DfirOp::Agen(agen::Op::Yield {
+                        values: vec![agen::Yielded {
+                            val: yielded.val(),
+                            ty: yielded.ty(),
+                        }],
+                    }));
+                    ops.push(DfirOp::Agen(agen::Op::CompositeStore(Box::new(
+                        agen::CompositeStore {
+                            view: elements.view.result,
+                            dbg_name: Some(write.name.to_owned()),
+                            indices: elements.base_address.indices.clone(),
+                            view_ty: elements.view.ty,
+                            store_set: elements.transfer_set,
+                            store_order: elements.transfer_order,
+                            // ⭐ `{}` — no time symbols (`:6580`).
+                            time_symbols: Vec::new(),
+                            time_set: composite.time_set,
+                            time_order: composite.time_order?,
+                            time_addr_map: composite.time_address_map,
+                            body,
+                        },
+                    ))));
+                }
+            }
+            Some(Written::Stored(data))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 098/110 — THE SOURCE END OF ONE TRANSFER
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHERE ONE TRANSFER'S SOURCE SENDS, AND WHETHER THE DATA LEAVES THIS UNIT AT ALL — `dst.via_` and
+/// the `comp_ != to_unit || to_unit == LXLU` test (`:2525-2534`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrcRoute {
+    /// A load and a send to this component, which is `LXLUSCALEREG` where the destination is this
+    /// unit's own LX (`:2535`).
+    Sends(Component),
+    /// `comp_ == to_unit` and not the LX — a load and a store into this storage.
+    Stores(Component),
+}
+
+impl SrcRoute {
+    /// `via_.empty()` — the destination states both its unit and its storage.
+    #[must_use]
+    pub fn direct(comp: Component, unit: Component, storage: Component) -> SrcRoute {
+        SrcRoute::sends(comp, unit).unwrap_or(SrcRoute::Stores(storage))
+    }
+
+    /// `!via_.empty()` — `to_unit = via_.front()`, and `to_storage` stays `NO_COMPONENT`.
+    ///
+    /// ⛔ [`None`] IS `DT_CHECK(to_storage != NO_COMPONENT)` (`:2548`) HOISTED INTO THE TYPE: a via'd
+    /// route whose first hop is this unit and is not the LX would take the store arm with no storage
+    /// to name, and the reference aborts there.
+    #[must_use]
+    pub fn via(comp: Component, head: Component) -> Option<SrcRoute> {
+        SrcRoute::sends(comp, head)
+    }
+
+    /// `comp_ != to_unit || to_unit == LXLU`, with the substitution the arm applies to its own unit.
+    fn sends(comp: Component, to_unit: Component) -> Option<SrcRoute> {
+        if comp != to_unit {
+            return Some(SrcRoute::Sends(to_unit));
+        }
+        // `comp_ == to_unit && to_unit == LXLU ? LXLUSCALEREG : to_unit`.
+        if to_unit == Component::Unit(DfirUnit::Lxlu) {
+            return Some(SrcRoute::Sends(Component::LxluScaleReg));
+        }
+        None
+    }
+}
+
+/// WHAT ONE SOURCE END EMITS — one of the two callees' answers, and never both.
+#[derive(Debug)]
+pub enum SrcTransfer {
+    /// [`SrcRoute::Sends`] — entry 090's load, chain and send.
+    Sent(LoadAndSend),
+    /// [`SrcRoute::Stores`] — entry 091's zero or constant, stored locally.
+    Stored(LoadAndStore),
+}
+
+/// Replaces: e098_GenerateDataTranferForSrc
+///
+/// **098/110** `SNTransferLowering::GenerateDataTranferForSrc` —
+/// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2522` (34L).
+///
+/// THE SOURCE END OF ONE TRANSFER: the `dataflow.get_unit` for wherever the data goes next and a load
+/// and send to it, or a load and store where it never leaves this unit.
+///
+/// ⚠️ BOTH ARMS REPORT THE SAME SENTENCE — the store arm's failure is also
+/// `emitError("Unable to generate load and send operations")` (`:2554`) — and entry 091 cannot
+/// refuse, so that copy is unreachable.
+///
+/// ⛔ [`None`] IS ENTRY 090'S OWN, RAISED AS THE REFERENCE RAISES IT — see
+/// [`generate_load_and_send_from_data_transfer_node`].
+#[must_use]
+pub fn generate_data_transfer_for_src(
+    vals: &mut Values,
+    ops: &mut Vec<DfirOp>,
+    handlers: &Handlers,
+    route: SrcRoute,
+    core: Core,
+    corelet: Option<Corelet>,
+    node: &str,
+    send: impl FnOnce(&mut Values, &mut Vec<DfirOp>, Val) -> Option<LoadAndSend>,
+    store: impl FnOnce(&mut Values, &mut Vec<DfirOp>, Component) -> LoadAndStore,
+) -> SrcTransfer {
+    match route {
+        SrcRoute::Sends(unit) => {
+            // `retrieveGetUnitOpInSameCore(builder, unit, core_id_, corelet_id_)`.
+            let dst_unit =
+                retrieve_get_unit_op_in_same_core(vals, handlers, unit, core, corelet).bind(ops);
+            // `GenerateLoadAndSendFromDataTransferNode(builder, dst_unit_op, comp_, src_.storage_,
+            //  src_sticks_ss_per_dim)` — the twenty reads that call takes are the caller's.
+            SrcTransfer::Sent(
+                send(vals, ops, dst_unit).unwrap_or_else(|| {
+                    emit_error(node, "Unable to generate load and send operations")
+                }),
+            )
+        }
+        // `GenerateLoadAndStoreFromDataTransferNode(builder, src_.storage_, to_storage, 0, ..)` —
+        // ⚠️ `int dst_idx = 0` is declared and the literal `0` is passed instead (`:2549-2551`).
+        SrcRoute::Stores(to_storage) => SrcTransfer::Stored(store(vals, ops, to_storage)),
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::dialects::symbol;
     use crate::islands::dataflow_ir::ty::ElemType;
-    use crate::units::{DfirUnit, NumFolds};
+    use crate::units::{DfirUnit, NumFolds, Residency};
 
     use super::super::control_flow::{StagePair, mlir_loop_from_sn_loop_node};
     use super::super::dsc_lowering::Bound;
@@ -6743,5 +7444,204 @@ mod unit_tests {
             ),
             None,
         );
+    }
+
+    // ─────────────────────────────── 097-098/110 ───────────────────────────────
+
+    fn transfer_write_fixture<'i>(
+        view_sizes: &'i [ViewSize],
+        chunk_sizes: &'i [ChunkDim],
+    ) -> TransferWrite<'i> {
+        TransferWrite {
+            storage: Component::Unit(DfirUnit::L3lu),
+            dst: GenericComp::L3lu,
+            core: Core::checked(0).expect("core 0"),
+            corelet: None,
+            comp: GenericComp::L0lu,
+            location: DataLocation::L3luHbm,
+            dst_location: DataLocation::L3luHbm,
+            name: "T",
+            node: "N",
+            view_sizes,
+            elem: ElemType::F16,
+            chunk_sizes,
+            chunk_stride: None,
+            result_ty: Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+            // ⭐ EQUAL BY DEFAULT, so no precision conversion unless a test asks for one.
+            src_result_ty: Vector {
+                len: 8,
+                elem: ElemType::F16,
+            },
+            dst_prec: DataType::IeeeFp32,
+            precision: DataType::Sen169Fp16,
+            replication: Replication::checked(1).expect("no replication"),
+        }
+    }
+
+    /// 🎯 097/110 — ⛔⛔ A LATCHED END RECEIVES AND STOPS. `dst_storage == LATCH` returns before the
+    /// buffering mode is read (`:6504-6510`), so the wire is spent and no view, no address and no
+    /// store are built at all — while the memory arm off the same receive stores through the
+    /// destination's own view.
+    #[test]
+    fn the_received_vector_reaches_the_store_or_stops_at_the_latch() {
+        let (view_sizes, outer_loops, chunk_sizes) = view_fixture();
+        let (_, from) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let write = transfer_write_fixture(&view_sizes, &chunk_sizes);
+        let loops = ViewLoops {
+            outer: &outer_loops,
+            composite: &[],
+        };
+        let mut sticks = ContiguousSticks::new(
+            StickCounts {
+                steady: 1,
+                epilogue: 1,
+            },
+            Vec::new(),
+        );
+
+        let mut vals = Values::default();
+        let got = generate_receive_and_store_from_data_transfer_node(
+            &mut vals,
+            &l3lu_handlers(),
+            &write,
+            &loops,
+            &mut sticks,
+            ContiguousTransfer::Absent,
+            |_| None,
+            ReceiveSource::Wire(from),
+            StoreDest::Memory {
+                address: &|vals: &mut Values, into: &mut Vec<DfirOp>, factor: Factor| {
+                    constant_index(vals, into, factor.scale(1))
+                },
+            },
+        )
+        .expect("the view and the transfer set resolve");
+
+        let Emitted::Chain { ops, at } = got.emitted else {
+            panic!("no implicit loops means no nest");
+        };
+        assert_eq!(at, ChainPlace::Here);
+        assert_eq!(
+            printed(&ops),
+            concat!(
+                "%0 = dataflow.receive %50 : vector<8xf16>\n",
+                "%1 = arith.constant 64 : index\n",
+                "%2 = dataflow.get_logical_memory_view %50, %1 {layout_map = affine_map<(d0, d1) -> (d1 * 4 + d0)>} : index, index, memref<4x8xf16>\n",
+                "%3 = arith.constant 0 : index\n",
+                "agen.vector_store %0, %2[%80 * 8, 0] {dbgName = \"T\", store_order = affine_map<(d0, d1) -> (d0, d1)>, store_set = affine_set<(d0, d1) : (d1 >= 0, -d1 + 7 >= 0, d0 == 0)>} : memref<4x8xf16>, vector<8xf16>\n",
+            ),
+            "the received vector is what the store spends, unconverted",
+        );
+        let Written::Stored(data) = got.written else {
+            panic!("the memory arm stores");
+        };
+        assert_eq!(data.val(), Val(0));
+
+        // ⛔ THE LATCH PREEMPTS ALL OF IT.
+        let latch = Latch::new(3).expect("a bound latch");
+        let mut vals = Values::default();
+        let (_, from) = Link::<L3lu, L0lu>::between(Val(50), Val(53)).ends();
+        let got = generate_receive_and_store_from_data_transfer_node(
+            &mut vals,
+            &l3lu_handlers(),
+            &write,
+            &loops,
+            &mut sticks,
+            ContiguousTransfer::Absent,
+            |_| None,
+            ReceiveSource::Wire(from),
+            StoreDest::Latch(latch),
+        )
+        .expect("a latched end cannot refuse");
+        let Emitted::Chain { ops, .. } = got.emitted else {
+            panic!("no implicit loops means no nest");
+        };
+        assert_eq!(printed(&ops), "%0 = dataflow.receive %50 : vector<8xf16>\n");
+        let Written::Latched(got_latch, data) = got.written else {
+            panic!("a latched end latches");
+        };
+        assert_eq!((got_latch, data), (latch, Val(0)));
+    }
+
+    /// 🎯 098/110 — ⛔⛔ A ROUTE THAT ENDS IN THIS UNIT'S OWN LX STILL SENDS, to the scale register
+    /// (`:2535`); only `comp_ == to_unit` off the LX stores locally, and a via'd route that does that
+    /// has no `to_storage` to name — `DT_CHECK(to_storage != NO_COMPONENT)` (`:2548`).
+    #[test]
+    fn the_source_end_sends_to_its_own_lx_and_stores_only_where_the_data_stays() {
+        let lxlu = Component::Unit(DfirUnit::Lxlu);
+        let l3lu = Component::Unit(DfirUnit::L3lu);
+        let storage = Component::Unit(DfirUnit::L0su);
+        assert_eq!(
+            SrcRoute::direct(lxlu, lxlu, storage),
+            SrcRoute::Sends(Component::LxluScaleReg),
+        );
+        assert_eq!(
+            SrcRoute::direct(l3lu, l3lu, storage),
+            SrcRoute::Stores(storage),
+        );
+        assert_eq!(SrcRoute::direct(l3lu, lxlu, storage), SrcRoute::Sends(lxlu));
+        assert_eq!(SrcRoute::via(l3lu, l3lu), None);
+        assert_eq!(SrcRoute::via(l3lu, lxlu), Some(SrcRoute::Sends(lxlu)));
+
+        let core = Core::checked(0).expect("core 0");
+        let mut vals = Values::default();
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let mut sent_to = None;
+        let sent = generate_data_transfer_for_src(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            SrcRoute::Sends(storage),
+            core,
+            None,
+            "N",
+            |_: &mut Values, _: &mut Vec<DfirOp>, dst_unit: Val| {
+                sent_to = Some(dst_unit);
+                Some(LoadAndSend {
+                    emitted: Emitted::Chain {
+                        ops: Vec::new(),
+                        at: ChainPlace::Here,
+                    },
+                    switch: None,
+                })
+            },
+            |_: &mut Values, _: &mut Vec<DfirOp>, _: Component| panic!("the send arm was taken"),
+        );
+        assert!(matches!(sent, SrcTransfer::Sent(_)));
+        // The `get_unit` for wherever the data goes next, and the send spends its result.
+        assert_eq!(
+            ops,
+            vec![DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(0),
+                residency: Residency::CoreWide { core },
+                unit: DfirUnit::L0su,
+                num_folds: None,
+            })],
+        );
+        assert_eq!(sent_to, Some(Val(0)));
+
+        // ⛔ AND THE STORE ARM ASKS FOR NO UNIT AT ALL — it hands entry 091 the storage.
+        let mut ops: Vec<DfirOp> = Vec::new();
+        let mut stored_in = None;
+        let stored = generate_data_transfer_for_src(
+            &mut vals,
+            &mut ops,
+            &l3lu_handlers(),
+            SrcRoute::Stores(storage),
+            core,
+            None,
+            "N",
+            |_: &mut Values, _: &mut Vec<DfirOp>, _: Val| panic!("the store arm was taken"),
+            |_: &mut Values, _: &mut Vec<DfirOp>, to_storage: Component| {
+                stored_in = Some(to_storage);
+                LoadAndStore::AtInsertionPoint(Vec::new())
+            },
+        );
+        assert!(matches!(stored, SrcTransfer::Stored(_)));
+        assert!(ops.is_empty());
+        assert_eq!(stored_in, Some(storage));
     }
 }
