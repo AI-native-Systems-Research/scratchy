@@ -98,11 +98,17 @@ pub enum Op {
     /// loops so agen iterators are affine"* (`:8-16`), because the address generator can only walk
     /// an affine iteration space.
     ///
-    /// ⛔ SO THIS IS AN **INPUT** OP, NOT ONE THE BRIDGE EMITS. It is here because the pass's input
-    /// contains it — `dcc/test/Transform/TransformLoopToLegalizeForSentientLowering/scf_loop_with_result.mlir:32`
+    /// ⛔ SO THIS IS AN **INPUT** OP TO BRIDGE 2, NOT ONE THAT BRIDGE EMITS. It is here because the
+    /// pass's input contains it — `dcc/test/Transform/TransformLoopToLegalizeForSentientLowering/scf_loop_with_result.mlir:32`
     /// is `%11 = scf.for %arg4 = %c0 to %10 step %c1 iter_args(%arg5 = %arg3) -> (index)` with `%10`
     /// an `arith.select` — and without it `transformSCFToAffineLoop` has no argument to be given and
     /// the pass could not be ported at all.
+    ///
+    /// ⭐ AND **BRIDGE 1 IS WHERE THAT INPUT COMES FROM**: `constructImplicitLoopsForContiguousTransfer`
+    /// emits exactly this op, with exactly that `arith.select` for its upper bound, whenever a
+    /// contiguous transfer's steady-state and epilogue stick counts differ — see
+    /// [`crate::bridges::superdsc_to_dataflow_ir::transfer::emit_implicit_loops_for_contiguous_transfer`].
+    /// The two bridges' claims are consistent: one produces the conditional bound, the next removes it.
     ///
     /// ⭐ THE STEP IS A FIELD BECAUSE THE PASS BRANCHES ON IT. `transformSCFToAffineLoop` transforms
     /// only `lbound == 0 && step == 1` (`:105`) and reports failure otherwise, so a representation
