@@ -24,7 +24,78 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
-// crustify:todo: e011_fillUnitToIdMap
+use crate::islands::sentient::dialects::{Op, Val, dataflow, defining_op};
+use crate::units::{DfirUnit, Residency};
+
+/// WHICH UNIT — `getUnitName`'s `type + "core" + N + "corelet" + M` (`dcc/src/Utils/Utils.cpp:264`)
+/// as the pair it stringifies.
+///
+/// ⛔ THE PARTS, NOT THE SPELLING. The reference keys its unit-to-region map by that string, so two
+/// units collide exactly when their names do and nothing can be read back out of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitKey {
+    /// `type=` — which unit.
+    pub unit: DfirUnit,
+    /// Which core and corelet it lives on.
+    pub residency: Residency,
+}
+
+/// WHICH REGION OF A UNIFORMIZED OP A UNIT TAKES ITS INSTRUCTIONS FROM — the value of
+/// `unit_to_region_idx_map_` (`UniformInstrAndBlock.hpp:187-205`).
+///
+/// ⛔ ABSENCE IS AN `Option<RegionIndex>`, NEVER `(size_t)-1`, which is what `getUnitRegionIndex`
+/// answers for a unit the map does not hold. A REGULAR block always answers 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionIndex(pub u32);
+
+/// Replaces: e011_fillUnitToIdMap
+///
+/// Which region each unit of a uniformized op draws its instructions from; a group contributes every
+/// unit it holds, under the same region.
+/// ⛔ THE REFERENCE DEREFERENCES A GROUP MEMBER'S `GetUnitOp` UNCHECKED — `getDefiningOp<GetUnitOp>()`
+/// with no null test — so a group holding anything else crashes there and is skipped here.
+/// ⭐ `getNumRegions`/`getRegionUnitList` ARE THE MECHANISM, not the decision: the unit lists arrive
+/// already partitioned, one per region, because `list_sizes` is what partitions them.
+#[must_use]
+pub fn fill_unit_to_id_map(region_units: &[Vec<Val>], scope: &[Op]) -> Vec<(UnitKey, RegionIndex)> {
+    let mut map = Vec::new();
+    let mut index = RegionIndex(0);
+    for units in region_units {
+        for unit in units {
+            match defining_op(*unit, scope) {
+                Some(Op::Dataflow(dataflow::Op::GetUnit {
+                    residency, unit, ..
+                })) => map.push((
+                    UnitKey {
+                        unit: *unit,
+                        residency: *residency,
+                    },
+                    index,
+                )),
+                Some(Op::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) => {
+                    for member in unit_ids {
+                        if let Some(Op::Dataflow(dataflow::Op::GetUnit {
+                            residency, unit, ..
+                        })) = defining_op(*member, scope)
+                        {
+                            map.push((
+                                UnitKey {
+                                    unit: *unit,
+                                    residency: *residency,
+                                },
+                                index,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        index = RegionIndex(index.0 + 1);
+    }
+    map
+}
+
 // crustify:todo: e105_LowerSyncOperation
 // crustify:todo: e106_LowerNOPOperation
 // crustify:todo: e111_LowerForOperation
@@ -33,3 +104,59 @@
 // crustify:todo: e123_LowerYieldOperation
 // crustify:todo: e125_LowerUniformYieldOperation
 // crustify:todo: e126_LowerUniformOperations
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::units::Core;
+
+    #[test]
+    fn a_group_files_every_unit_it_holds_under_one_region() {
+        let core = Core::checked(0).expect("core 0");
+        let l3su = dataflow::Op::GetUnit {
+            result: Val(0),
+            residency: Residency::CoreWide { core },
+            unit: DfirUnit::L3su,
+            num_folds: None,
+        };
+        let lxlu = dataflow::Op::GetUnit {
+            result: Val(1),
+            residency: Residency::CoreWide { core },
+            unit: DfirUnit::Lxlu,
+            num_folds: None,
+        };
+        let group = dataflow::Op::CreateGroup {
+            result: Val(2),
+            unit_ids: vec![Val(0), Val(1)],
+        };
+        let scope = vec![Op::Dataflow(l3su), Op::Dataflow(lxlu), Op::Dataflow(group)];
+        // Region 0 lists the group; region 1 lists one unit directly.
+        let map = fill_unit_to_id_map(&[vec![Val(2)], vec![Val(1)]], &scope);
+        assert_eq!(
+            map,
+            vec![
+                (
+                    UnitKey {
+                        unit: DfirUnit::L3su,
+                        residency: Residency::CoreWide { core }
+                    },
+                    RegionIndex(0)
+                ),
+                (
+                    UnitKey {
+                        unit: DfirUnit::Lxlu,
+                        residency: Residency::CoreWide { core }
+                    },
+                    RegionIndex(0)
+                ),
+                (
+                    UnitKey {
+                        unit: DfirUnit::Lxlu,
+                        residency: Residency::CoreWide { core }
+                    },
+                    RegionIndex(1)
+                ),
+            ]
+        );
+    }
+}

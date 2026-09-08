@@ -24,11 +24,11 @@ pub mod print;
 pub mod ty;
 
 use crate::arch::Arch;
+use crate::islands::sentient::dialects::sentient::RegIndex;
 use crate::model::Model;
 use crate::workload::Workload;
 use sys_arch_spec::progir::{MAX_INSTRUCTIONS_PER_UNIT, MAX_REGISTERS_PER_UNIT};
 use sys_arch_spec::regfile::{Component, max_ibuff_entries};
-use crate::islands::sentient::dialects::sentient::RegIndex;
 use ty::{Invalid, OperandValue, RegType};
 
 /// ONE REGISTER'S INITIAL CONTENT — one entry of a unit's register state.
@@ -52,6 +52,59 @@ pub struct RegInit {
     /// What it starts as.
     pub value: OperandValue,
 }
+
+/// WHICH REGISTERS OF ONE FILE ARE SPOKEN FOR — a `std::bitset<kMaxCompRegs>` (`progir.h:534`).
+///
+/// ⭐ A `u128` IS EXACTLY THAT WIDE, so the bitset's width is the integer's and there is no index it
+/// can hold that [`RegIndex`] cannot carry, nor one it can carry that this cannot hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RegBits(u128);
+
+impl RegBits {
+    /// No register.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// `set(index)`.
+    #[must_use]
+    pub const fn with(self, index: RegIndex) -> Self {
+        // ⛔ `wrapping_shl`, WHICH IS TOTAL. `RegIndex` is bounded by the width, so the mask it
+        // applies never bites — while a plain `<<` would compile a panic path for a shift amount
+        // that cannot occur.
+        Self(self.0 | 1u128.wrapping_shl(index.get()))
+    }
+
+    /// `test(index)`.
+    #[must_use]
+    pub const fn holds(self, index: RegIndex) -> bool {
+        self.0 & 1u128.wrapping_shl(index.get()) != 0
+    }
+
+    /// `|=`.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether nothing is set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The registers it holds, low index first.
+    pub fn iter(self) -> impl Iterator<Item = RegIndex> {
+        RegIndex::ALL
+            .into_iter()
+            .filter(move |index| self.holds(*index))
+    }
+}
+
+/// WHICH REGISTERS DCC SAYS EACH UNIT DEFINES — `ProgramAndStateInfo::RegDefs`,
+/// `std::map<std::pair<SenComponents, RegType>, std::bitset<kMaxCompRegs>>` (`progir.h:534-536`).
+pub type RegDefs = Vec<((Component, RegType), RegBits)>;
 
 /// WHAT ONE UNIT'S REGISTERS START AS — the reference's own `UnitRegState`
 /// (`typedef std::map<RegType, std::map<unsigned int, OperandAttr>>`, `progir.h:361`).
@@ -225,8 +278,31 @@ pub struct Program<A: Arch, M: Model, W: Workload> {
     pub reg_state: Vec<(Component, UnitRegState)>,
     /// `variableDefinitions_` — a `ProgIrVarGraph` (`progir.h:306`).
     pub variable_definitions: Vec<(String, String)>,
+    /// `regDefs_` — a `std::optional<RegDefs>` (`progir.h:536`).
+    ///
+    /// ⛔⛔ THE `Option` IS THE REFERENCE'S OWN AND IT MEANS "TRACKED", NOT "EMPTY".
+    /// `addRegDefsForUnit` emplaces an EMPTY map first, whose own comment is *"RegDef data is
+    /// initialized empty to indicate it is set"*, and `checkRegDefs` refuses to compare when the data
+    /// is not set. So `Some(vec![])` and `None` are different states and collapsing them would turn
+    /// "nothing was recorded" into "every def is a discrepancy".
+    pub reg_defs: Option<RegDefs>,
     /// The arch, model and rung this was compiled for.
     pub bound: core::marker::PhantomData<(A, M, W)>,
+}
+
+/// ⭐ `std::map::operator[]` DEFAULT-CONSTRUCTS, AND A PORTED FUNCTION RELIES ON IT:
+/// `initializeUtilizedRegisters` reaches `progstateinfo_[core]` for a core the map may not hold, and
+/// what it gets is an empty program rather than a refusal.
+impl<A: Arch, M: Model, W: Workload> Default for Program<A, M, W> {
+    fn default() -> Self {
+        Self {
+            per_unit: Vec::new(),
+            reg_state: Vec::new(),
+            variable_definitions: Vec::new(),
+            reg_defs: None,
+            bound: core::marker::PhantomData,
+        }
+    }
 }
 
 impl<A: Arch, M: Model, W: Workload> Program<A, M, W> {

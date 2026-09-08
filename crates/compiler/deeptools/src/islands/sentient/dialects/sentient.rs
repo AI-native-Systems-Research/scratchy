@@ -1460,6 +1460,28 @@ impl RegIndex {
         RegIndex(Bounded::at::<I>())
     }
 
+    /// EVERY INDEX THERE IS, in declaration order — the 128 a `std::bitset<kMaxCompRegs>` bit can
+    /// name.
+    ///
+    /// ⛔ A TABLE, NOT THE `checked(u32)` THAT WAS REMOVED. A bit position of a
+    /// [`crate::islands::progir::RegBits`] is below `MAX_REGISTERS_PER_UNIT` by the bitset's own
+    /// width, so iterating THIS and testing the bit needs neither a runtime check nor an `Option` —
+    /// see [`RegIndex::at`].
+    pub const ALL: [RegIndex; sys_arch_spec::progir::MAX_REGISTERS_PER_UNIT] = {
+        let mut all = [RegIndex::at::<0>(); sys_arch_spec::progir::MAX_REGISTERS_PER_UNIT];
+        let mut index = 1;
+        while index < all.len() {
+            all[index] = match Bounded::checked(index as u32) {
+                Some(bounded) => RegIndex(bounded),
+                // ⛔ UNREACHABLE BY THE ARRAY'S OWN LENGTH — the bound and the length are the same
+                // constant, so this arm is evaluated at build time or not at all.
+                None => panic!("the table is exactly as long as the bound"),
+            };
+            index += 1;
+        }
+        all
+    };
+
     /// The index.
     #[must_use]
     pub const fn get(self) -> u32 {
