@@ -289,6 +289,122 @@ their four error-report ranges (`:3195`/`:3196-3199`, `:3243`/`:3244-3247`, `:32
 `getBytesPerStick() * 8 / ad.getElementWidth()` sites in `MutableStartAddrShifting.cpp`
 (`:373`, `:405`, `:485`, `:553`), and `DataflowToSentient.cpp:1838-1860` as the merged-versus-split pair.
 
+## ⛔ MEASURED FOR ENTRIES 351-356: ALL FOUR SHIFTING TRANSFORMS LOSE `op->erase();`, AND 351 IS 372
+
+Re-measured body-by-body against the authority at `a0d29abbed`. **351 and 356 are identical to it**
+modulo the `eNNN_` rename. The other four each lose exactly one statement and it is the SAME statement:
+`op->erase();` — `MutableStartAddrShifting.cpp:226` (352), `:253` (353), `:295` (354), `:352` (355) —
+the last line of each body and the only one that removes the operation being replaced. In 353, 354 and
+355 the clone is `(void)`-discarded, so that erase was the ONLY mutation of the existing IR those three
+perform: as extracted they compute a shifted subscripts map, build a clone nothing reads, and leave the
+original transfer in place. All four also drop the `const` member qualifier (`:201-202`, `:229-230`,
+`:256-257`, `:298-299`), the same drop already recorded for 323.
+
+⭐ `loc` IS EXACT FOR ALL SIX under the column's own convention — authority body lines minus the
+signature lines: 71-1=70 (351), 27-2=25, 26-2=24, 41-2=39, 56-2=54, 40-1=39 (356). All six cited
+`file:line`s land on the first line of the signature.
+
+⭐ **351 AND 372 ARE THE SAME FUNCTION.** Diffed whole (`MutableAddrSplitting.cpp:226-296` against
+`MutableStartAddrShifting.cpp:130-198`) they differ in four things and nothing else: the candidate type
+(`MASCandidate` `:91-100` versus `MSASCandidate` `:68-77` — field-for-field identical, same
+constructor), 351's per-unit `num_conditionals_ = 0` reset (`:244-246`, which the shifting pass has no
+counterpart for because it has no conditional budget), the one-use check's form (`DT_CHECK` at
+MAS`:255` versus `DT_CHECK_MSG(…, "Expecting L3 memory views to be used in one memory operand.")` at
+MSAS`:156-158`), and the four dispatch targets. ⛔ AND `DisableThisPass` IS A SEPARATE `cl::opt` IN
+EACH FILE — `-dcc-mutable-addr-splitting-disable` (MAS`:51-54`) versus
+`-dcc-mutable-start-addr-shifting-disable` (MSAS`:41-45`), the same trap already recorded for
+`MaxImmutableSize`. One shared Rust collector must take the flag, the reset and the message as
+parameters, or one flag will disable both passes. ⭐ AND THE ONE BODY SITS AT TWO LEVELS — 351 is 6
+(arms 306/307 at 4, 321/322 at 5) and 372 is 7 (arms 352-355 at 6, because 352 and 353 reach
+`e323_shiftMutableAddr` at 5). Both are right; the depth is the arms', not the dispatcher's.
+
+⛔ **AND THE EXTRACT SENDS 351'S DISPATCH NOWHERE.** Its four calls are bare
+`transformVectorLoad(candidate)` … `transformCompIndLoadAndStore(candidate)`, and
+`prelude.inc:2263-2268` declares empty stand-ins under exactly those four names while the extract's
+eight real bodies all carry `eNNN_` prefixes. So in the extract 351 dispatches to no-ops, and nothing
+in it says WHICH four it means: they are 306/307/321/322 in `tf_mutable_addr_splitting.rs` (MAS`:286`,
+`:288`, `:290`, `:292`), not the identically named 352-355 of this worklist, which belong to 372
+(MSAS`:189`, `:191`, `:193`, `:195`).
+
+## ⛔ ENTRY 351 COLLECTS CANDIDATES ITS OWN CALLEES `DT_CHECK` ON
+
+`isCandidateMemView` (351's lambda, `MutableAddrSplitting.cpp:229-238`) admits a view when the unit is
+`HBM` and the start address is not bound by `symbol::CreateSymbolOp`/`SymbolQueryMapOp` — and because
+`isa_and_nonnull` is false for a null defining op, `!isa_and_nonnull<…>` also ADMITS a start with no
+defining op at all. Entry 113 `isEligibleForSplitting` (`:832-853`) requires strictly more: every view
+in the chain is a `GetLogicalMemoryViewOp` whose start is an `arith::ConstantOp`. Entry 251
+`setupForPartitioning` opens with `DT_CHECK(isEligibleForSplitting(all_mem_views))` (`:826`), and all
+four callees reach it directly once `hasMutableAddrOverflow` is true (`:315`→`:333`, `:392`→`:410`,
+`:477`→`:484`, `:571`→`:589`). So a toggled or region-argument start on an overflowing HBM transfer is
+a candidate 351 collects and its own callee aborts on. In Rust that gap cannot be a runtime refusal:
+351's collector has to hand its callees the constant-start proof `SplitCandidateView::ConstantStart`
+already carries — and 372's collector must NOT, because 352-355 have no such precondition.
+
+## ⛔ AND THE `calls` COLUMN FOR 351-356: 8 OF ITS 13 EDGES ARE NOT CALLS
+
+The `level` column is right for all six and derivable from none of them. Every one omits the callee
+that sets its level, and the declared lists imply 2, 3, 3, 3, 3 and 2 against a recorded 6.
+
+- **8 of 13 declared edges are not calls.** `e052_If` (352, 353, 354, 355) is the word "If" opening the
+  comment *"If the new subscripts map is empty…"* (`:217`, `:245`, `:274`, `:325`); there is no
+  function `If`. `e150_get` (356) is the word "get" opening *"get cloned into multiple conditional
+  branches."* (`TransformPagedMemViewImpl.cpp:626`) — the body has no `get` call of any kind.
+  `e149_insert` (351) is `analyzed_candidates.insert(mem_op)` (`MutableAddrSplitting.cpp:275`), a
+  one-argument `std::unordered_set::insert`, against `AccessContainer::insert(MemoryOperandIndex, T)`
+  (`AccessDetails.hpp:388`). `e019_AccessDetailsAffine` (352, 353) matches only the type NAME in a
+  declaration and a template argument — and is inverted twice over: `AccessDetails.hpp:259` is a
+  MEM-INITIALISER, so the entry denotes `AccessDetailsAffineComposite`'s constructor, which is what
+  354 and 355 construct and neither declares, while 352 and 353 construct plain `AccessDetailsAffine`
+  and both do.
+- **The 5 real edges are `e208_emplace_insert` (352-355) and `e135_eraseMemOpAndUseChain` (356).** 135
+  is the static edge only: it is `virtual` (`hpp:364`) with four `override final`s, of which just
+  `TPMVVectorLoad`'s (129, `cpp:698`) is scheduled — `:747`, `:817` and `:1266` are not.
+- **Omitted true callees.** 351: `e306`/`e307` (level 4) and `e321`/`e322` (level 5) — its own four
+  dispatch arms, which is exactly why 6 is right. 352, 353: `e265_constructDetails` (3) and
+  `e323_shiftMutableAddr` (5). 354, 355: `e323_shiftMutableAddr` (5). 356: `e119` (0), `e197` (1),
+  `e324_analyzeAndConstructValidPages` (5) and `agen::utils::replaceConstOpsInSubscriptsMap`
+  (`Dialect/Agen/Utils.cpp:46`), which is in neither the 384 nor the 106.
+- ⛔ **354 AND 355'S `constructDetails` IS UNSCHEDULED AND UNEXCLUDED.** `ad` is an
+  `AccessDetailsAffineComposite&`, so `ad.constructDetails(…)` binds
+  `AccessDetailsAffineComposite::constructDetails` (`AccessDetails.cpp:834-853`) — a distinct 20-line
+  body sequencing six virtuals, not a delegation to entry 265 (`:418`, the `AccessDetailsAffine`
+  override that 352 and 353 bind). It appears in neither the 384 nor the 106.
+
+## ⛔ AND 356'S OTHER CALLER IS OUTSIDE THE CAMPAIGN
+
+`TPMVBase::transform` is not virtual (`hpp:72`) and is called exactly twice: `TPMVVector::run`
+(`cpp:650`, entry 373, level 7) and `TPMVComposite::run` (`cpp:871`), which is scheduled nowhere. The
+composite path is also the one that reaches 356 with re-initialised state — `initialize()` `:857`,
+`initialize_time()` `:859`, `transform_time()` `:862` (entry 325), then `tpmv_info_.clear()` `:864`
+and `initialize()` AGAIN at `:867` before `transform()` at `:871`. A port that treats 356's input as
+whatever the first `initialize()` left will be wrong on every composite.
+
+⚠️ AND 356'S ERASE LOOP RUNS OVER THE PREVIOUS ITERATION'S OUTPUT. `for (auto &mem_op : mem_ops_)
+eraseMemOpAndUseChain(mem_op);` (`:618`) sits inside `for (auto &info : tpmv_info_)`, whose last
+statement is `mem_ops_ = new_mem_ops;` (`:627`). With two `TPMVInfo` entries — what
+`TPMVCompositeLoadStore::initialize` produces (`:1193`, `:1200`) — the second pass erases the clones
+the first one built, which is the intent the comment states and not a leak.
+
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT THESE 6 — 3 FIXED IN THIS COMMIT
+
+All six module-doc banner rows (entry, `loc`, path:line) measured EXACT, as did every in-span prose
+citation in `tf_mutable_addr_splitting.rs` — `num_conditionals_` at `:222`, its reset at `:244-246`,
+`MaxNumConditionals` at `:70-75`, the *"value of -1 indicates no maximum"* comment at `:956` and the
+`int`/`int64_t` comparison at `:960`. Fixed, all in `tf_transform_paged_mem_view_impl.rs`, all about
+who fills the `tpmv_info_` vector 356 loops over:
+
+- **Entry 326 does not write `tpmv_info_`.** It is `TPMVCompositeLoad::initialize_time` (`cpp:1095`),
+  an override of a DIFFERENT pure virtual (`hpp:468`), and it writes `access_details_`, `time_order_`,
+  `time_set_` and `tpmv_comp_info_`. The composites' `tpmv_info_` is written by their `initialize()`
+  (`cpp:1080`, `:1133`, `:1186`), none of which is scheduled.
+- **Entry 202 is one override, not "the vector classes".** `TPMVVectorStore::initialize` (`cpp:706`)
+  and `TPMVVectorLoadStore::initialize` (`cpp:755`) are separate `override final`s.
+- **The one that fills TWO is `TPMVCompositeLoadStore::initialize`** (`cpp:1193`, `:1200`), not 326.
+
+And entry 137 (`hpp:397`) is only `TPMVVectorLoad`'s constructor — cited at its mem-initialiser and so
+named after the base, the same defect as `e019` above; the note no longer reads as if it covered all
+three vector classes.
+
 ## Progress
 
 `200/384 ported; 200/384 audited`
@@ -704,8 +820,8 @@ classes (`:659`, `:707`, `:756`, `:1081`, `:1134`, `:1187`), so the singleton is
 constructor establishes. Entry 136 delegates to it, so `TpmvBase::new` exists and carries NO anchor;
 the exclusion is reported rather than overruled.
 
-⛔ **AND THE EXTRACTOR KEPT ONLY TWO DEFINITIONS PER OVERRIDDEN NAME, so ten `TPMV*` overrides are in
-neither the 384 nor the 106 exclusions.** Counted in the authority: this file defines
+⛔ **AND THE EXTRACTOR KEPT ONLY TWO DEFINITIONS PER OVERRIDDEN NAME, so EIGHTEEN `TPMV*` member
+definitions are in neither the 384 nor the 106 exclusions.** Counted in the authority: this file defines
 `eraseMemOpAndUseChain` five times (`hpp:364`, `cpp:698`, `cpp:747`, `cpp:817`, `cpp:1266`) and the
 campaign scheduled two (135 and 129); `getUseChain` three times (`hpp:328`, `cpp:673`, `cpp:721`) and
 scheduled two (133 and 126); `cloneUseChain` three times (`hpp:341`, `cpp:678`, `cpp:726`) and
@@ -716,6 +832,13 @@ unexcluded:
 `TPMVVectorLoadStore::{createNewMemOp, eraseMemOpAndUseChain}` (`cpp:779`, `:817`),
 `TPMVVectorStore::createNewMemOp` (`cpp:732`) and the three composite `createNewMemOp` overrides
 (`cpp:1120`, `:1173`, `:1242`) plus `TPMVCompositeLoadStore::eraseMemOpAndUseChain` (`cpp:1266`).
+⛔ RE-COUNTED FOR ENTRY 356, EIGHT MORE: `initialize()` is a pure virtual (`hpp:66`) with SIX
+`override final`s (`cpp:658` = 202, `:706`, `:755`, `:1080`, `:1133`, `:1186`) and only 202 is
+scheduled; `initialize_time()` is a second pure virtual (`hpp:468`) with three (`cpp:1095` = 326,
+`:1148`, `:1211`) and only 326 is; and `TPMVComposite::run` (`cpp:855`) is unscheduled while its twin
+`TPMVVector::run` (`cpp:647`) is entry 373. Totals: 51 `TPMV*` member definitions in the `.cpp`, 33 of
+them scheduled, and the exclusions carry four `TPMV*` items — all `hpp` fields (`:30`, `:45`, `:50`,
+`:458`).
 Reported, not filled — a `Replaces:` anchor on an entry nothing scheduled would count as coverage no
 worklist asked for.
 

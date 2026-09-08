@@ -1499,8 +1499,10 @@ impl<'p> TpmvInfo<'p> {
 /// MLIRContext *context_;
 /// SmallVector<TPMVInfo, 2> tpmv_info_;
 /// ```
-/// (`hpp:375-384`). The second group is written by `initialize()` — entry 202 for the vector
-/// classes, entry 326 for the composites — and `context_` is an `MLIRContext *`, which this crate
+/// (`hpp:375-384`). The second group is written by `initialize()`, a pure virtual (`hpp:66`) with SIX
+/// `override final`s of which entry 202 is one — `TPMVVectorLoad`'s (`cpp:658`). `TPMVVectorStore`'s
+/// (`:706`), `TPMVVectorLoadStore`'s (`:755`) and the three composites' (`:1080`, `:1133`, `:1186`)
+/// are in neither the 384 nor the 106 exclusions. `context_` is an `MLIRContext *`, which this crate
 /// has no counterpart for at all. ⭐ `tpmv_info_` IS HERE AS OF ENTRY 202, its first writer
 /// ([`TpmvVectorLoad::initialize`]) — see [`TpmvInfo`].
 ///
@@ -1520,8 +1522,11 @@ pub struct TpmvBase<'p> {
     /// this crate's programs name, as [`super::agen_access_details::AccessDetailsAffineComposite`]
     /// already established.
     pub comp: DfirUnit,
-    /// `tpmv_info_` — one entry per memory operand, written by `initialize()`: entry 202 for the
-    /// vector classes, entry 326 for the composites (which fill TWO).
+    /// `tpmv_info_` — one entry per memory operand, written by `initialize()`: entry 202 is
+    /// `TPMVVectorLoad`'s (`cpp:658`), and `TPMVCompositeLoadStore`'s (`:1186`) is the one that fills
+    /// TWO (`:1193`, `:1200`) — it is unscheduled, as is every `initialize()` but 202.
+    /// ⛔ NOT entry 326: that is `initialize_time` (`:1095`), which writes `access_details_`,
+    /// `time_order_`, `time_set_` and `tpmv_comp_info_` and never touches this vector.
     pub tpmv_info: Vec<TpmvInfo<'p>>,
 }
 
@@ -1680,8 +1685,10 @@ impl<'p> TpmvBase<'p> {
 /// `Deref`: `TPMVVector` adds no state, so `base` holds all of it, and the one thing it does add —
 /// `run() override final`, entry 373 (`:647`) — is a method that will sit on this type.
 ///
-/// ⚠️ `TPMVVectorLoad`, `TPMVVectorStore` and `TPMVVectorLoadStore` compose over this in turn
-/// (entry 137, `hpp:397`); their `initialize()`/`transform()` bodies are entries 202 and 356.
+/// ⚠️ `TPMVVectorLoad`, `TPMVVectorStore` and `TPMVVectorLoadStore` compose over this in turn —
+/// and entry 137 (`hpp:397`) is only the FIRST one's constructor, cited at its mem-initialiser and so
+/// named after the base. `transform()` is NOT virtual (`hpp:72`), so all three do share entry 356;
+/// `initialize()` is one `override final` each and only `TPMVVectorLoad`'s is entry 202.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TpmvVector<'p> {
     /// The `TPMVBase` subobject.
