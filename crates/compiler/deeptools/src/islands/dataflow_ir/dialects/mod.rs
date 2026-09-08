@@ -951,6 +951,22 @@ pub fn replace_uses_of_with(op: &mut Op, from: Val, to: Val) {
     }
 }
 
+/// RE-POINT EVERY USE OF `from` AT `to` THROUGHOUT A BLOCK AND EVERYTHING NESTED UNDER IT —
+/// `Value::replaceAllUsesWith` over a scope.
+///
+/// ⛔ [`replace_uses_of_with`] REACHES ONE OP'S OWN OPERANDS AND NOTHING ELSE. A value bound at
+/// module level is read by ops inside a `dataflow.program_unit`'s body, a loop's body and a
+/// `uniform.uniformize_regions`' regions; a caller that re-pointed only its own block would leave the
+/// old handle live in every nested reader — and MLIR's own `replaceAllUsesWith` reaches all of them.
+pub fn replace_all_uses(scope: &mut [Op], from: Val, to: Val) {
+    for op in scope.iter_mut() {
+        replace_uses_of_with(op, from, to);
+        for region in regions_mut(op) {
+            replace_all_uses(region, from, to);
+        }
+    }
+}
+
 /// A COPY OF ONE OP BINDING ITS OWN VALUES — `OpBuilder::clone`.
 ///
 /// The operands are the original's; every result is freshly minted, because two ops binding one
@@ -1150,6 +1166,9 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
         | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => {
             dbg_name.as_deref()
         }
+        // ⛔ AND AN `arith.select` CARRIES ONE TOO — a DISCARDABLE attribute, not an interface, and
+        // entry 292 moves it onto the `scf.if` it builds. See [`arith::Op::Select::dbg_name`].
+        Op::Arith(arith::Op::Select { dbg_name, .. }) => dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1208,6 +1227,8 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
         Op::Scf(scf::Op::For { dbg_name, .. } | scf::Op::If { dbg_name, .. })
         | Op::Affine(affine::Op::For { dbg_name, .. } | affine::Op::If { dbg_name, .. })
         | Op::Dataflow(dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })) => Some(dbg_name),
+        // The discardable one — see [`dbg_name`].
+        Op::Arith(arith::Op::Select { dbg_name, .. }) => Some(dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
             affine::Op::Apply { .. }

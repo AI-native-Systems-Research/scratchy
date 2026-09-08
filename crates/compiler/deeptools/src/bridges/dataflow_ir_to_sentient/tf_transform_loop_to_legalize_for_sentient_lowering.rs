@@ -64,11 +64,14 @@
 //! | `e293_runOn` | 293/384 | 5 | `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447` |
 
 use super::tf_loop_unroll_for_shuffle_op::TripCount;
+use super::vc_vector_operands::OpId;
+use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol, uses,
+    Op as DfirOp, Val, affine, agen, arith, dataflow, dbg_name, defining_op, regions, results, scf,
+    symbol, uses,
 };
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::dataflow_ir::{ProgramUnit, ValueMapping, Values};
 
 /// AN `scf.for` AS THIS REWRITE READS IT — the `dyn_cast`, and only the fields it touches.
 ///
@@ -1064,9 +1067,253 @@ pub fn analyze_and_transform(
     transform_loop(loop_op, analyze_loop(loop_op, curr_unit, scope), scope)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 292/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT `:187-256` DID TO THE MODULE — the `scf.if` that replaced the `scf.for`, and the erasures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalSplit {
+    /// The `scf.if` (`:190-192`), both arms filled. The `scf.for` it replaces is erased (`:253`).
+    pub if_op: DfirOp,
+    /// `scf_for->replaceAllUsesWith(if_op.getResults())` (`:197`) — each erased result of the loop
+    /// beside the conditional result that takes its place.
+    pub replaced: Vec<(Val, Val)>,
+    /// `if (cmpi_op->use_empty()) { cmpi_op.erase(); }` (`:254-256`), asked after the loop is gone —
+    /// so it is *"was the erased loop the select's only user?"*.
+    pub erase_select: bool,
+    /// `analyzeAndTransform(then_loop)` (`:243-245`) over the arm's brand-new `affine.for`.
+    pub then_rewrite: LoopRewrite,
+    /// `analyzeAndTransform(else_loop)` (`:247-250`).
+    pub else_rewrite: LoopRewrite,
+}
+
+/// `LogicalResult` FROM `transformSCFLoopWithNonConstantUpperBound`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ParentSplit {
+    /// `LogicalResult::failure()` — the loop is not `lb 0` / `step 1` / non-constant `ub` (`:177`),
+    /// its bound is not an `arith.select` (`:179-182`), or an arm of that select is not a constant
+    /// index (`:185-186`). Entry 195 answers it with
+    /// `emitError("Doesn't support this loops for transformation")` (`:432`).
+    Unsupported,
+    /// `LogicalResult::success()` (`:258`), with the rewrite it performed.
+    Split(Box<ConditionalSplit>),
+}
+
+/// ONE ARM OF THE CONDITIONAL — the `affine.for`, and the `scf.yield` that forwards its results.
+///
+/// ⛔ THE YIELD IS CONDITIONAL ON THE LOOP CARRYING SOMETHING (`:216`, `:236`), and an `scf.if` WITH
+/// results whose arm yields nothing is what the reference builds when it does not — a state its own
+/// verifier rejects, reproduced rather than papered over.
+fn arm_of(affine_for: DfirOp) -> Vec<DfirOp> {
+    let yielded = results(&affine_for);
+    let mut arm = vec![affine_for];
+    if !yielded.is_empty() {
+        arm.push(DfirOp::Scf(scf::Op::Yield { operands: yielded }));
+    }
+    arm
+}
+
+/// `dyn_cast<LoopLikeOpInterface>(if_op.get{Then,Else}Region().front().front())` then
+/// `analyzeAndTransform` (`:243-250`) — the arm's first op is the loop entry 117 just built.
+///
+/// ⛔ THE ARM HAS TO BE IN THE SCOPE IT IS ANALYSED IN. Entry 117 mints fresh names for everything
+/// the body defines, so the cloned `dataflow.get_logical_memory_view` behind the loop's memory op is
+/// reachable only from inside the new `affine.for` — and that view is what decides `KUnroll`.
+fn rewrite_of_arm(affine_for: &DfirOp, curr_unit: GenericComp, scope: &[DfirOp]) -> LoopRewrite {
+    let mut with_arm = scope.to_vec();
+    with_arm.push(affine_for.clone());
+    LoopUnderAnalysis::of(affine_for).map_or(LoopRewrite::Nothing, |loop_op| {
+        analyze_and_transform(&loop_op, curr_unit, &with_arm)
+    })
+}
+
+/// Replaces: e292_transformSCFLoopWithNonConstantUpperBound
+///
+/// **292/384** `TransformLoopToLegalizeForSentientLowering.cpp:169` (94L) — lifts an `arith.select`
+/// upper bound out into an `scf.if` holding one [`transform_scf_to_affine_loop`] per arm.
+///
+/// ⛔ THE `dbgName` PUT ON THE `scf.if` IS THE **SELECT'S** (`:193-194`): the local is misnamed
+/// `cmpi_op`, but `getDefiningOp<arith::SelectOp>()` is what bound it, and the vendor's expectation
+/// carries `"c0-l3lu-loop-ibr-chunk-y-bound"` — the select's name — on the conditional.
+#[must_use]
+pub fn transform_scf_loop_with_non_constant_upper_bound(
+    vals: &mut Values,
+    scf_for: &DfirOp,
+    curr_unit: GenericComp,
+    scope: &[DfirOp],
+) -> ParentSplit {
+    // The reference's parameter is a typed `scf::ForOp`, so no other op is this call.
+    let (Some(for_op), DfirOp::Scf(scf::Op::For { lo, hi, step, .. })) =
+        (ScfForOp::of(scf_for), scf_for)
+    else {
+        return ParentSplit::Unsupported;
+    };
+
+    // `if (lb_const.value() == 0 && step_const.value() == 1 && !ub_const)` — *"we currently support
+    // lb being 0, step being 1, non-constant ub."*
+    //
+    // ⚠️ `lb_const.value()` AND `step_const.value()` DEREFERENCE A NULL where that bound is not a
+    // constant at all — a loop carrying its bound from its parent. `Some(0)`/`Some(1)` is the same
+    // decision without the crash.
+    if index_constant(*lo, scope) != Some(0)
+        || index_constant(*step, scope) != Some(1)
+        || index_constant(*hi, scope).is_some()
+    {
+        return ParentSplit::Unsupported;
+    }
+
+    // `auto cmpi_op = scf_for.getUpperBound().getDefiningOp<arith::SelectOp>(); if (!cmpi_op) ..`
+    let Some(select_op) = defining_op(*hi, scope) else {
+        return ParentSplit::Unsupported;
+    };
+    let DfirOp::Arith(arith::Op::Select {
+        condition,
+        true_value,
+        false_value,
+        ..
+    }) = select_op
+    else {
+        return ParentSplit::Unsupported;
+    };
+
+    // *"Both operands of cmpi has to be constant values."* ⚠️ AND `getDefiningOp()` IS DEREFERENCED
+    // BY THE `isa<>` (`:185-186`) — a select over two region arguments is a null there.
+    let (Some(then_ub), Some(else_ub)) = (
+        index_constant(*true_value, scope),
+        index_constant(*false_value, scope),
+    ) else {
+        return ParentSplit::Unsupported;
+    };
+
+    // `scf::IfOp::create(builder, cmpi_op.getLoc(), scf_for->getResultTypes(), ..)` — BEFORE either
+    // arm, so the conditional's results are the next names minted, as MLIR numbers them.
+    let results: Vec<Val> = for_op.carried.iter().map(|_| vals.mint()).collect();
+
+    // `transformSCFToAffineLoop(if_op.getThenBodyBuilder(), scf_for, lb_const.value(), then_ub,
+    // step_const.value(), then_forop)` (`:207-209`), then the else arm's at `:227-229`.
+    //
+    // ⛔ THE TWO `emitError("Unable to transform SCF loop into Affine loop")` ARMS (`:210`, `:230`)
+    // ARE UNREACHABLE FROM HERE: entry 117 declines only a non-zero `lbound` or a step that is not
+    // 1, and the guard above established both.
+    let then_arm = transform_scf_to_affine_loop(
+        vals,
+        &for_op,
+        StaticBounds {
+            lbound: 0,
+            ubound: then_ub,
+            step: 1,
+        },
+    );
+    let else_arm = transform_scf_to_affine_loop(
+        vals,
+        &for_op,
+        StaticBounds {
+            lbound: 0,
+            ubound: else_ub,
+            step: 1,
+        },
+    );
+    let (
+        LoopLegalization::Transformed(then_for),
+        LoopLegalization::Transformed(else_for),
+    ) = (then_arm, else_arm)
+    else {
+        return ParentSplit::Unsupported;
+    };
+
+    // `analyzeAndTransform(then_loop)` then `analyzeAndTransform(else_loop)`, both AFTER the two
+    // arms and their yields are in place.
+    let then_rewrite = rewrite_of_arm(&then_for, curr_unit, scope);
+    let else_rewrite = rewrite_of_arm(&else_for, curr_unit, scope);
+
+    ParentSplit::Split(Box::new(ConditionalSplit {
+        if_op: DfirOp::Scf(scf::Op::If {
+            cond: *condition,
+            results: results.clone(),
+            body: arm_of(then_for),
+            else_body: arm_of(else_for),
+            // `if (auto dbg_name_attr = getDbgNameAttr(cmpi_op)) setDbgNameAttr(if_op, ..)`.
+            dbg_name: dbg_name(select_op).map(str::to_owned),
+        }),
+        replaced: for_op
+            .carried
+            .iter()
+            .map(|carried| carried.result)
+            .zip(results)
+            .collect(),
+        // `scf_for->erase(); if (cmpi_op->use_empty()) { cmpi_op.erase(); }` — the loop being erased
+        // was a user of the select, so what is left is whether anything else was.
+        erase_select: uses(*hi, scope)
+            .into_iter()
+            .all(|user| core::ptr::eq(user, scf_for)),
+        then_rewrite,
+        else_rewrite,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 293/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e293_runOn
+///
+/// **293/384** `TransformLoopToLegalizeForSentientLowering.cpp:447` (5L) — the unit's `curr_unit_`,
+/// then one [`analyze_and_transform`] per loop in a POST-ORDER walk of its body.
+///
+/// ⛔ POST-ORDER IS LOAD-BEARING: every loop nested in one entry 292 is about to split has already
+/// been asked, which is why the reference can rewrite as it walks. ⚠️ `getUnits()[0]` is an
+/// unguarded index; [`Units`](crate::islands::dataflow_ir::Units) has no empty state to hit it with.
+#[must_use]
+pub fn run_on<A: Arch>(unit: &ProgramUnit<A>) -> Vec<(OpId, LoopRewrite)> {
+    // `curr_unit_ = dcc::getUnitType(unit.getUnits()[0].getDefiningOp<dataflow::GetUnitOp>());` —
+    // the kind is the unit list's own, and `getUnitType` is what [`DfirUnit::generic`] answers.
+    let curr_unit = unit.on.kind().generic();
+    let mut requests: Vec<(OpId, LoopRewrite)> = Vec::new();
+    walk_loops(&unit.body, &[], 0, curr_unit, &unit.body, &mut requests);
+    requests
+}
+
+/// `unit.walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop_op) { analyzeAndTransform(..); })`.
+///
+/// `prefix` and `base` number a position exactly as
+/// [`op_at`](super::vc_vector_operands::OpId) reads one back — one ordinal per level, with a
+/// multi-region op's regions concatenated.
+fn walk_loops(
+    block: &[DfirOp],
+    prefix: &[u32],
+    base: u32,
+    curr_unit: GenericComp,
+    scope: &[DfirOp],
+    found: &mut Vec<(OpId, LoopRewrite)>,
+) {
+    for (ordinal, op) in block.iter().enumerate() {
+        let mut path: Vec<u32> = prefix.to_vec();
+        path.push(base + ordinal as u32);
+
+        // Post-order: whatever is nested answers before the op that holds it.
+        let mut child = 0u32;
+        for region in regions(op) {
+            walk_loops(region, &path, child, curr_unit, scope, found);
+            child += region.len() as u32;
+        }
+
+        // The walk's lambda takes `LoopLikeOpInterface`, so it is called for the loops only.
+        if let Some(loop_op) = LoopUnderAnalysis::of(op) {
+            found.push((
+                OpId::at(&path),
+                analyze_and_transform(&loop_op, curr_unit, scope),
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::dataflow_ir::dialects::{Index, agen, arith, dataflow};
     use crate::islands::dataflow_ir::print;
     use crate::islands::dataflow_ir::ty::{
@@ -2492,10 +2739,185 @@ mod unit_tests {
             );
         }
     }
-}
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 292/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e292_transformSCFLoopWithNonConstantUpperBound
-// crustify:todo: e293_runOn
+    /// THE VENDOR'S CONDITIONALLY BOUNDED LOOP, ITS BODY REDUCED TO ONE OP.
+    ///
+    /// `scf_loop_with_result.mlir:127-129` — `%9 = arith.cmpi eq, %arg2, %c1`, `%10 = arith.select
+    /// %9, %c16, %c32 {dbgName = "c0-l3lu-loop-ibr-chunk-y-bound"}`, `%11 = scf.for %arg4 = %c0 to
+    /// %10 step %c1 iter_args(%arg5 = %arg3)`. The four nested `affine.for`s of its body are entry
+    /// 117's case ([`VENDOR_THEN_ARM`]); what this one needs of a body is that it be cloned twice.
+    fn vendor_conditional_bound(vals: &mut Values) -> Vec<DfirOp> {
+        let c0 = vals.mint();
+        let c1 = vals.mint();
+        let c16 = vals.mint();
+        let c32 = vals.mint();
+        let outer_iv = vals.mint(); // %arg2, which nothing in this block defines
+        let outer_arg = vals.mint(); // %arg3, the value the loop starts from
+        let cond = vals.mint(); // %9
+        let bound = vals.mint(); // %10
+        let result = vals.mint(); // %11
+        let iv = vals.mint(); // %arg4
+        let arg = vals.mint(); // %arg5
+        let addr = vals.mint(); // the body's one op
+
+        vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: c0,
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: c1,
+                value: 1,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: c16,
+                value: 16,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: c32,
+                value: 32,
+            }),
+            DfirOp::Arith(arith::Op::Compare {
+                result: cond,
+                predicate: arith::CmpIPredicate::Eq,
+                lhs: outer_iv,
+                rhs: c1,
+            }),
+            DfirOp::Arith(arith::Op::Select {
+                result: bound,
+                condition: cond,
+                true_value: c16,
+                false_value: c32,
+                ty: ScalarTy::Index,
+                dbg_name: Some("c0-l3lu-loop-ibr-chunk-y-bound".to_owned()),
+            }),
+            DfirOp::Scf(scf::Op::For {
+                iv,
+                lo: c0,
+                hi: bound,
+                step: c1,
+                carried: vec![affine::Carried {
+                    init: outer_arg,
+                    arg,
+                    result,
+                }],
+                body: vec![
+                    DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                        result: addr,
+                        lhs: c0,
+                        rhs: arg,
+                        ty: ScalarTy::Index,
+                    })),
+                    DfirOp::Scf(scf::Op::Yield {
+                        operands: vec![addr],
+                    }),
+                ],
+                dbg_name: Some("c0-l3lu-loop-ibr-chunk-y".to_owned()),
+            }),
+        ]
+    }
+
+    /// 🎯 292/384 — THE VENDOR'S CASE: THE `arith.select` BOUND BECOMES THE `scf.if`, ARM PER ARM.
+    ///
+    /// `scf_loop_with_result.mlir:40-86` — one conditional on the comparison, `to 16` in the then
+    /// arm and `to 32` in the else, an `scf.yield` per arm because the loop carried a value, the
+    /// select's `dbgName` now on the conditional and the select itself dead.
+    #[test]
+    fn the_vendors_conditional_bound_becomes_a_conditional_over_two_affine_loops() {
+        let mut vals = Values::default();
+        let scope = vendor_conditional_bound(&mut vals);
+        let scf_for = scope.last().expect("the fixture's loop is last");
+
+        let ParentSplit::Split(split) = transform_scf_loop_with_non_constant_upper_bound(
+            &mut vals,
+            scf_for,
+            GenericComp::Lxlu,
+            &scope,
+        ) else {
+            unreachable!("the vendor's own input is the supported shape");
+        };
+
+        assert_eq!(
+            printed(&split.if_op),
+            r#"%12 = scf.if %6 -> (index) {
+  %13 = affine.for %14 = 0 to 16 iter_args(%15 = %5) -> (index) {
+    %16 = arith.subi %0, %15 : index
+    affine.yield %16 : index
+  } {dbgName = "c0-l3lu-loop-ibr-chunk-y"}
+  scf.yield %13 : index
+} else {
+  %17 = affine.for %18 = 0 to 32 iter_args(%19 = %5) -> (index) {
+    %20 = arith.subi %0, %19 : index
+    affine.yield %20 : index
+  } {dbgName = "c0-l3lu-loop-ibr-chunk-y"}
+  scf.yield %17 : index
+} {dbgName = "c0-l3lu-loop-ibr-chunk-y-bound"}
+"#
+        );
+
+        // `scf_for->replaceAllUsesWith(if_op.getResults())` (`:197`) — one pair, the loop's result
+        // for the conditional's.
+        assert_eq!(
+            split.replaced,
+            vec![(results(scf_for)[0], results(&split.if_op)[0])]
+        );
+
+        // `if (cmpi_op->use_empty()) { cmpi_op.erase(); }` (`:254-256`) — the erased loop was its
+        // only reader.
+        assert!(split.erase_select);
+
+        // ⭐ AND NEITHER ARM IS TOUCHED AGAIN. Both are constant-bounded loops on a store/load unit,
+        // which entry 194 answers `kNone` for — which is why the vendor's expectation reproduces
+        // them (`:41-61`, `:64-84`) rather than unrolling or splitting either.
+        assert_eq!(
+            (split.then_rewrite, split.else_rewrite),
+            (LoopRewrite::Nothing, LoopRewrite::Nothing)
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 293/384
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 293/384 — THE UNIT'S LOOPS, INNERMOST FIRST, EACH WITH THE REWRITE ITS COMPONENT ASKS FOR.
+    ///
+    /// ⛔ THE ORDER IS THE ASSERTION. `WalkOrder::PostOrder` (`:451`) reaches the nested `scf.for`
+    /// before the `affine.for` holding it, which is what lets the reference rewrite as it walks —
+    /// entry 292 splits a loop whose children have all already answered.
+    #[test]
+    fn every_loop_of_the_unit_answers_innermost_first() {
+        let mut vals = Values::default();
+        let mut body = program(&mut vals, Case::VENDOR);
+        let inner = body.pop().expect("the fixture's loop is last");
+        let outer_iv = vals.mint();
+        body.push(DfirOp::Affine(affine::Op::For {
+            iv: outer_iv,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(2),
+            carried: vec![],
+            body: vec![inner],
+            dbg_name: None,
+        }));
+
+        let unit: ProgramUnit<Dd2> = ProgramUnit {
+            on: Units::one(DfirUnit::L0lu, vals.mint()),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+
+        assert_eq!(
+            run_on(&unit),
+            vec![
+                // The `arith.select`-bounded `scf.for`, nested in the loop above it.
+                (OpId::at(&[4, 0]), LoopRewrite::SplitParent),
+                // ⭐ AND THE PARENT IS ASKED TOO, AFTER IT: a constant-bounded loop on a load unit,
+                // which entry 194 leaves alone.
+                (OpId::at(&[4]), LoopRewrite::Nothing),
+            ]
+        );
+    }
+}

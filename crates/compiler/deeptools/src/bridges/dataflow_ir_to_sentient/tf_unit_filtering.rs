@@ -70,11 +70,11 @@ use std::collections::BTreeSet;
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::dataflow_ir::dialects::{
     Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, operands, regions, regions_mut,
-    uniform, uses,
+    replace_all_uses, uniform, uses,
 };
 
 use super::vc_vector_operands::{OpId, defining_position, op_at, remove_at, use_positions};
-use crate::units::{Core, Corelet, NumFolds, Residency};
+use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency};
 
 /// WHICH FOLD A UNIT HANDLE IS THE INSTANCE OF — `dyn_cast<OpResult>(unit).getResultNumber()`
 /// (`UnitFiltering.cpp:245`).
@@ -1018,6 +1018,116 @@ mod unit_tests {
 
         assert_eq!(module, vec![group, recv]);
     }
+
+    /// 🎯 296/384 — ALL FOUR PHASES OVER ONE MODULE under the vendor's own two options,
+    /// `filter-components-except=lxlu` and `filter-cores-except=0`
+    /// (`core_filtering_edge_case.mlir:2`): the `sfp` program unit goes by COMPONENT, core 1's handle
+    /// leaves the surviving unit list, the map pair, and the `uniformize_regions` region that held
+    /// only it, and then nothing reads either dead `get_unit`.
+    ///
+    /// ⛔ THE `query_map` IS WHAT PROVES THE PHASE-2 `replaceAllUsesWith` RAN: the reduced mapping
+    /// binds a NEW handle, and a port that only swapped the op would leave `%200` behind, dangling.
+    #[test]
+    fn every_phase_fires_and_the_reduced_map_is_re_read_through_its_new_handle() {
+        let yield_nothing = || {
+            vec![DfirOp::Uniform(uniform::Op::Yield {
+                operands: Vec::new(),
+            })]
+        };
+        let mut module = vec![
+            lxlu_of_core(Val(100), 0),
+            lxlu_of_core(Val(101), 1),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(102),
+                residency: Residency::Corelet {
+                    core: core(0),
+                    corelet: corelet(0),
+                },
+                unit: DfirUnit::Sfp,
+                num_folds: None,
+            }),
+            DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(200),
+                pairs: vec![(Val(100), Val(50)), (Val(101), Val(51))],
+            }),
+            DfirOp::Uniform(uniform::Op::QueryMap {
+                result: Val(201),
+                map: Val(200),
+                key: Val(100),
+            }),
+            DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                regions: vec![
+                    uniform::LocalRegion {
+                        arg: Val(60),
+                        units: vec![Val(101)],
+                        body: yield_nothing(),
+                    },
+                    uniform::LocalRegion {
+                        arg: Val(61),
+                        units: vec![Val(100)],
+                        body: yield_nothing(),
+                    },
+                ],
+                results: Vec::new(),
+            }),
+            DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+                units: vec![Val(100), Val(101)],
+                precision: None,
+                body: Vec::new(),
+            }),
+            DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+                units: vec![Val(102)],
+                precision: None,
+                body: Vec::new(),
+            }),
+        ];
+        let options = UnitFilteringOptions {
+            components: Only::these(BTreeSet::from([DfirUnit::Lxlu])),
+            units: UnitFilters {
+                cores: Only::these(BTreeSet::from([core(0)])),
+                ..no_filters()
+            },
+            transfers: None,
+        };
+        let mut vals = Values::default();
+
+        run_on_operation(&mut vals, &mut module, &options);
+
+        assert_eq!(
+            vec![
+                // ⭐ `%101` and `%102` are gone: [`cleanup`] erases a `get_unit` nothing reads, and
+                // `num_folds` is NOT written because no fold filter is set.
+                lxlu_of_core(Val(100), 0),
+                // The reduced mapping, binding the first value this pass minted.
+                DfirOp::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(0),
+                    pairs: vec![(Val(100), Val(50))],
+                }),
+                DfirOp::Uniform(uniform::Op::QueryMap {
+                    result: Val(201),
+                    map: Val(0),
+                    key: Val(100),
+                }),
+                // ONE region, its argument reminted by the rebuild (`:212-215`, entry 262).
+                DfirOp::Uniform(uniform::Op::UniformizeRegions {
+                    regions: vec![uniform::LocalRegion {
+                        arg: Val(1),
+                        units: vec![Val(100)],
+                        body: vec![DfirOp::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        })],
+                    }],
+                    results: Vec::new(),
+                }),
+                DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+                    units: vec![Val(100)],
+                    precision: None,
+                    body: Vec::new(),
+                }),
+            ],
+            module
+        );
+    }
 }
 
 /// THE MAP THIS PASS PUTS IN PLACE OF A FILTERED ONE — the `DefImmutableMappingOp::create` at
@@ -1374,7 +1484,301 @@ pub fn remove_ancestors(
     }
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e296_runOnOperation
+/// THE PASS'S FIVE OPTION SETS — `filter_components_except_`, `filter_folds_except_`,
+/// `filter_cores_except_`, `filter_corelets_except_` and `filter_transfers_except_` as
+/// [`run_on_operation`] has them once `:365-414` has merged the command line with `opts_`.
+///
+/// ⛔ THE FOUR `DT_CHECK_MSG("Should not use both .. command line option(s) ..")` ABORTS ARE THIS
+/// TYPE. Each one guards a set against being written from two sources at once — a pass-specific
+/// `-filter-x-except` and the pipeline's `opts_` — and that merge is the whole of `:365-414`. One
+/// field per set is one source per set, so there is nothing left to refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnitFilteringOptions {
+    /// `filter_components_except_` — keep only program units of these components.
+    ///
+    /// ⭐ THE REFERENCE SPELLS A `SenComponents` BACK TO A STRING and compares it against the
+    /// `get_unit`'s `type=` (`:427-437`); [`DfirUnit`] *is* that enumeration on this side
+    /// (`units.rs:287`), so the comparison is an equality between two enum values and
+    /// `EnumsConversion::stringToSenComponents` is the parse of the option, not of the IR.
+    pub components: Option<Only<DfirUnit>>,
+    /// `filter_folds_except_`, `filter_cores_except_` and `filter_corelets_except_` — the triple
+    /// entries 140, 203 and 262 read.
+    pub units: UnitFilters,
+    /// `filter_transfers_except_` — keep only data transfers carrying these `dbgName`s.
+    pub transfers: Option<Only<String>>,
+}
+
+/// Replaces: e296_runOnOperation
+///
+/// **296/384** `UnitFilteringPass::runOnOperation` — the four phases in order: program units by
+/// component and then by core/corelet/fold, `def_immutable_mapping`s plus the data transfers to drop,
+/// `uniformize_regions`, and [`cleanup`].
+///
+/// ⛔ THE TWO EARLY `return`s AT `:449` AND `:470` ARE LOAD-BEARING: with only a component filter the
+/// pass stops after phase 1, and with only a transfer filter after phase 2. Running phase 3 or
+/// [`cleanup`] anyway would filter nothing and yet rebuild `num_folds` on every surviving unit.
+/// ⛔ `if (DisableThisPass) return;` (`:363`) is a `dcc-opt` flag — which pass runs is a call in
+/// [`super::program`] here. ⛔ The fold-0 `DT_CHECK_MSG` (`:383-385`) is [`FoldId`]'s type.
+pub fn run_on_operation(
+    vals: &mut Values,
+    module: &mut Vec<DfirOp>,
+    options: &UnitFilteringOptions,
+) {
+    let filters = &options.units;
+    // `bool filter_transfers = !filter_transfers_except_.empty();` and the three beside it — the
+    // `!empty()` that [`Only`] makes a type. The three fold/core/corelet flags are only ever read
+    // together, so they are one flag here.
+    let filter_transfers = options.transfers.is_some();
+    let filter_units =
+        filters.folds.is_some() || filters.cores.is_some() || filters.corelets.is_some();
+
+    // ── 1. Filter out program units, remove folds from program unit arguments ────────────────────
+    // `module_op.walk([&](dataflow::ProgramUnitOp unit_op) { .. return WalkResult::skip(); })` — the
+    // `skip` is this `descend`: nothing inside a program unit's body is a program unit.
+    let mut to_delete: Vec<OpId> = Vec::new();
+    let mut reduced_units: Vec<(OpId, Vec<Val>)> = Vec::new();
+    for id in walk(module, &|op| {
+        !matches!(op, DfirOp::Dataflow(dataflow::Op::ProgramUnit { .. }))
+    }) {
+        let Some(DfirOp::Dataflow(dataflow::Op::ProgramUnit { units, .. })) = op_at(&id, module)
+        else {
+            continue;
+        };
+
+        // `bool remove_unit = !filter_components_except_.empty();` then the loop over the named
+        // components against `getUnits().front().getDefiningOp<GetUnitOp>().getType().str()`.
+        //
+        // ⛔ THE REFERENCE NULL-DEREFERENCES WHERE THAT OPERAND IS NOT A `get_unit` RESULT
+        // (`:428-432`, an unchecked `getDefiningOp<>()`); a component this island cannot read matches
+        // no name, which is where the reference's own loop leaves `remove_unit` — set.
+        let component = units.first().and_then(|first| unit_component(*first, module));
+        let remove_unit = options
+            .components
+            .as_ref()
+            .is_some_and(|only| !component.is_some_and(|kind| only.keeps(&kind)));
+
+        if remove_unit {
+            // `to_delete_.push_back(unit_op);`
+            to_delete.push(id);
+        } else if filter_units {
+            // `removeCoresCoreletsFoldsFromProgramUnit(unit_op)` — entry 140. ⭐ The clause it applies
+            // reads `dataflow.get_unit`s at module level, which nothing in this phase touches, so the
+            // decisions may all be taken before any of them is written back.
+            let mut kept = units.clone();
+            remove_cores_corelets_folds_from_program_unit(&mut kept, module, filters);
+            reduced_units.push((id, kept));
+        }
+    }
+    for (id, kept) in reduced_units {
+        if let Some(DfirOp::Dataflow(dataflow::Op::ProgramUnit { units, .. })) =
+            op_at_mut(id.path(), module)
+        {
+            *units = kept;
+        }
+    }
+    // `for (Operation *op : to_delete_) op->erase(); to_delete_.clear();`
+    erase_all(&to_delete, module);
+
+    // `if (!filter_folds && !filter_cores && !filter_corelets && !filter_transfers) return;`
+    if !filter_units && !filter_transfers {
+        return;
+    }
+
+    // ── 2. Filter DefImmutableMaps; collect the data transfers to be filtered out ────────────────
+    // `module_op.walk([&](Operation *op) { .. })` — every op, this time.
+    let mut transfers_to_filter_out: Vec<DfirOp> = Vec::new();
+    for id in walk(module, &|_| true) {
+        let Some(op) = op_at(&id, module) else {
+            continue;
+        };
+
+        // `if (filter_transfers && isDataTransfer(op) && !isDataTransferToKeep(op))` — entries 141
+        // and 205. ⭐ Collected as VALUES: the erasures below renumber positions, and a transfer is
+        // then found again by what it is.
+        //
+        // ⛔ THE REFERENCE ASKS ABOUT THE MAPPING FIRST (`:456-459`). The two arms are disjoint — no
+        // `uniform.` op is a data transfer (entry 141) — so the order is unobservable, and asking
+        // this one first is what lets a single immutable borrow of the op answer both.
+        if filter_transfers
+            && is_data_transfer(op)
+            && !is_data_transfer_to_keep(op, options.transfers.as_ref())
+        {
+            transfers_to_filter_out.push(op.clone());
+        }
+
+        if !filter_units {
+            continue;
+        }
+        let DfirOp::Uniform(uniform::Op::DefImmutableMapping { result, pairs }) = op else {
+            continue;
+        };
+        // `removeCoresCoreletsFoldsFromDefImmutMap(def_immutable_map)` — entry 203.
+        let Some(reduced) =
+            remove_cores_corelets_folds_from_def_immut_map(vals, *result, pairs, module, filters)
+        else {
+            continue;
+        };
+        // `OpBuilder builder(immutable_map)` puts the new map exactly where the old one stood and
+        // `to_delete_` erases the old at the end of the phase — one op REPLACED IN PLACE, which is
+        // also what keeps every position this walk collected valid.
+        let to_replace = reduced.to_delete;
+        let with = reduced.map;
+        if let Some(place) = op_at_mut(id.path(), module) {
+            *place = reduced.op;
+        }
+        // `immutable_map.replaceAllUsesWith(new_immutable_map)`, module-wide: a `uniform.query_map`
+        // reading this mapping sits inside a `uniformize_regions` region.
+        replace_all_uses(module, to_replace, with);
+    }
+
+    // `for (Operation *op : transfers_to_filter_out) removeAncestors(op);` — entry 263.
+    //
+    // ⛔ RE-FOUND BY VALUE, NOT BY POSITION. `removeAncestors` erases the ops feeding the transfer,
+    // which are DEFINED BEFORE IT, so every position collected above may name a different op by the
+    // time it is reached. A seed an earlier seed's cascade has already taken is simply not found —
+    // and that cascade is the reference's own (`:339-357`).
+    for transfer in transfers_to_filter_out {
+        let Some(id) = find_op(&transfer, module) else {
+            continue;
+        };
+        remove_ancestors(&id, module, options.transfers.as_ref());
+    }
+
+    // `if (!filter_folds && !filter_cores && !filter_corelets) return;`
+    if !filter_units {
+        return;
+    }
+
+    // ── 3. Filter out folds/cores/corelets in UniformizeRegions ─────────────────────────────────
+    // *"NOTE: Must be done in a separate walk from 2 as we are cloning UniformizeRegionsOps and do
+    // not want stale immutable ops to persist in the cloned regions."*
+    //
+    // ⛔ DEEPEST-FIRST, AND THAT IS NOT AN OPTIMISATION: these ops NEST — three deep in
+    // `flatten_local_region.mlir:86-88` — and a rebuild CLONES the body the inner one sits in
+    // ([`remove_cores_corelets_folds_from_uniformize_region`]), so filtering the inner op first is
+    // what keeps the clone from carrying a unit list this pass has already ruled out. Descending
+    // order is also what keeps the remaining positions valid: only a later sibling is renumbered by a
+    // deletion, and those have been done.
+    let mut uniformize_ops: Vec<OpId> = walk(module, &|_| true)
+        .into_iter()
+        .filter(|id| {
+            matches!(
+                op_at(id, module),
+                Some(DfirOp::Uniform(uniform::Op::UniformizeRegions { .. }))
+            )
+        })
+        .collect();
+    uniformize_ops.sort_unstable();
+    for id in uniformize_ops.into_iter().rev() {
+        let Some(DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, results })) =
+            op_at(&id, module)
+        else {
+            continue;
+        };
+        let filtered = remove_cores_corelets_folds_from_uniformize_region(
+            vals, regions, results, module, filters,
+        );
+        match filtered {
+            // `if (!unit_list_is_reduced) return;`
+            FilteredUniformizeRegions::Unchanged => {}
+            // `uniformize_op->erase()` with nothing in its place.
+            FilteredUniformizeRegions::Deleted => remove_at(id.path(), module),
+            FilteredUniformizeRegions::Rebuilt { op, replacements } => {
+                if let Some(place) = op_at_mut(id.path(), module) {
+                    *place = op;
+                }
+                for (old, new) in replacements {
+                    replace_all_uses(module, old, new);
+                }
+            }
+        }
+    }
+
+    // ── 4. Remove dead GetUnitOps and CreateGroupOps, and update the fold number ─────────────────
+    // `cleanup(module_op)` — entry 204.
+    cleanup(module, filters);
+}
+
+/// WHICH COMPONENT A UNIT HANDLE IS — `unit.getDefiningOp<dataflow::GetUnitOp>().getType()`.
+fn unit_component(unit: Val, scope: &[DfirOp]) -> Option<DfirUnit> {
+    match defining_op(unit, scope) {
+        Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) => Some(*unit),
+        _ => None,
+    }
+}
+
+/// PRE-ORDER POSITIONS OF EVERY OP — `Operation::walk`, whose `WalkResult::skip()` is `descend`
+/// answering false.
+fn walk(scope: &[DfirOp], descend: &impl Fn(&DfirOp) -> bool) -> Vec<OpId> {
+    let mut out: Vec<OpId> = Vec::new();
+    collect_positions(scope, &[], 0, descend, &mut out);
+    out
+}
+
+/// The walk itself — ⭐ ONE ORDINAL PER LEVEL WITH THE REGIONS CONCATENATED, which is how [`op_at`]
+/// and [`remove_at`] read a path back.
+fn collect_positions(
+    scope: &[DfirOp],
+    prefix: &[u32],
+    base: u32,
+    descend: &impl Fn(&DfirOp) -> bool,
+    out: &mut Vec<OpId>,
+) {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(base + ordinal as u32);
+        out.push(OpId::at(&path));
+
+        if !descend(op) {
+            continue;
+        }
+        let mut region_base = 0;
+        for region in regions(op) {
+            collect_positions(region, &path, region_base, descend, out);
+            region_base += region.len() as u32;
+        }
+    }
+}
+
+/// THE OP AT A POSITION, MUTABLY — [`op_at`]'s arm, descending through [`regions_mut`] and re-basing
+/// each ordinal onto the region that holds it exactly as [`remove_at`] does.
+fn op_at_mut<'s>(path: &[u32], scope: &'s mut [DfirOp]) -> Option<&'s mut DfirOp> {
+    let (first, rest) = path.split_first()?;
+    let op = scope.get_mut(*first as usize)?;
+    if rest.is_empty() {
+        return Some(op);
+    }
+
+    let mut wanted = rest[0] as usize;
+    for region in regions_mut(op) {
+        if wanted < region.len() {
+            let mut rebased: Vec<u32> = vec![wanted as u32];
+            rebased.extend_from_slice(&rest[1..]);
+            return op_at_mut(&rebased, region);
+        }
+        wanted -= region.len();
+    }
+
+    None
+}
+
+/// WHERE AN OP EQUAL TO THIS ONE SITS — how a collected `Operation *` is found again after an
+/// erasure has renumbered the positions around it.
+fn find_op(wanted: &DfirOp, module: &[DfirOp]) -> Option<OpId> {
+    walk(module, &|_| true)
+        .into_iter()
+        .find(|id| op_at(id, module) == Some(wanted))
+}
+
+/// `for (Operation *op : to_delete_) op->erase();`
+///
+/// ⛔ DESCENDING, because a POSITION is invalidated by an earlier sibling's removal where an
+/// `Operation *` is not (see [`remove_ancestors`]).
+fn erase_all(positions: &[OpId], module: &mut Vec<DfirOp>) {
+    let mut ordered: Vec<&OpId> = positions.iter().collect();
+    ordered.sort_unstable();
+    for id in ordered.into_iter().rev() {
+        remove_at(id.path(), module);
+    }
+}
+

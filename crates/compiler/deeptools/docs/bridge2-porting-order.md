@@ -1116,7 +1116,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`273/384 ported; 273/384 audited`
+`281/384 ported; 281/384 audited`
 
 Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
 `src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), and entries 002-024 —
@@ -2210,6 +2210,99 @@ names is the same one. The `getArch() < RCUDD1A_ISA` early return stays as
 `SetSendDestinationCleanup::NoSetDstMaskAtThisArchLevel` and is vacuous: `IsaGen` has no lower
 generation.
 
+⭐ AND ENTRIES 289-296, LEVEL 3 — the four passes' own entry points plus the three helpers underneath
+them: `MutableAddrSplittingPass::initialize` and `createPartitions` in
+`src/bridges/dataflow_ir_to_sentient/tf_mutable_addr_splitting.rs`;
+`MutableStartAddrShiftingPass::calculatePartialShift` in `tf_mutable_start_addr_shifting.rs`;
+`transformSCFLoopWithNonConstantUpperBound` and `TransformLoopToLegalizeForSentientLowering::runOn` in
+`tf_transform_loop_to_legalize_for_sentient_lowering.rs`; `TPMVBase::getPageValidity` and
+`createIterArgsForConditionals` in `tf_transform_paged_mem_view_impl.rs`; and
+`UnitFilteringPass::runOnOperation` in `tf_unit_filtering.rs`.
+
+⛔ 292'S `dbgName` COMES OFF THE **SELECT**, NOT A COMPARE. The local is spelled `cmpi_op`, but
+`getDefiningOp<arith::SelectOp>()` is what bound it (`:179`) and `setDbgNameAttr(if_op, ..)` copies from
+that (`:193-194`) — the vendor's own expectation carries `"c0-l3lu-loop-ibr-chunk-y-bound"`, the
+select's name, on the `scf.if`. That required `arith::Op::Select` to carry a `dbg_name` in the island at
+all, which it did not. Both of its `emitError("Unable to transform SCF loop into Affine loop")` arms
+(`:210`, `:230`) are unreachable from here: entry 117 declines only a non-zero `lbound` or a step that
+is not 1, and `:177`'s guard has already established both. Three `getDefiningOp()` results are
+dereferenced unchecked at `:177` and `:185-186`, so a loop or a select carrying a bound from its parent
+region null-derefs there; `Option` asks the same question without the crash.
+
+⛔ 293'S WALK IS POST-ORDER AND THAT IS LOAD-BEARING — every loop nested inside one 292 is about to
+split has already been asked, which is why the reference can rewrite as it walks. It is also the whole
+of the body `bridge2.cpp` truncated: the extract left `unit.walk<WalkOrder::PostOrder>(` with no lambda,
+i.e. a walk that calls nothing.
+
+⛔ 291 CAN HAND BUDGET **BACK**. `if (constant_shift > dim_weight.offset_) constant_shift =
+dim_weight.offset_` clamps downward only (`:541-542`), so a negative `offset_` yields a negative shift —
+and that is the one way `DT_CHECK(total_shift >= 0)` (`:552`) can fail, which is why
+`ImmutableSpace` and `TotalShift` are both signed. `dim_order` (`:511-517`) is written and never read.
+The part-stick remainder is subtracted from the total and handed to the mutable side through
+`offsetShifts` — the statement the extract dropped, along with the `return total_shift;` that left an
+`int64_t` function with no return at all.
+
+⛔ 294 BUILDS TWO CONSTRAINT SYSTEMS AND RETURNS THE SECOND. `page_set_constraints` exists solely to be
+checked hyper-rectangular; `page_sel_constraints` is the page's rectangle with the access's SUBSCRIPTS
+substituted for its dimensions (`replaceDimsAndSymbols(.., 0, getNumSymbols())` leaves it zero-dim, so
+what was "page dimension `d`" becomes the subscript indexing it), then the iterators' ranges added, with
+emptiness tested after each. The reference returns an empty system for both refusals and its caller
+reads only `isEmpty()` (`:168`); `PageValidity` keeps the reason. The VALID return (`:147`) is what the
+extract dropped — both invalid arms survived it. `IntegerSet::replace_dims` and
+`FlatConstraints::is_empty` did not exist in the island and now do.
+
+⛔⛔ 295 SCATTERS ITS COEFFICIENTS AND READS THEM GATHERED, AND THIS PORT GATHERS. `:435` writes
+`ordered[perm[i]] = coeffs[i]` while `:481` reads `ordered_coeffs[c][i]` as *"the coefficient of the
+loop at POSITION `i`"* — the two agree only where the permutation is its own inverse, i.e. the identity
+or any two-loop nest, which is every case in `dcc/test/`. The divergence is deliberate and named on the
+function. Its `curr_loop->erase()` (`:522`) is the line the extract dropped, and dropping it turns
+clone-and-erase into clone-only, doubling the nest. Entry 264's own fill constant is left DEAD by the
+outermost loop's `setOperand` over the added init, exactly as in the reference. The `mem_ops_` /
+`paged_mem_view_` / sibling-`TPMVInfo` re-syncs at `:497-514` are the caller's here, and that is a
+type-level fact rather than a shortcut: they are `&'p` borrows of the very program this function
+rewrites, so the `IRMapping`s are handed back for `updateTPMVInfo` to replay in order.
+
+⛔ AND 296'S THREE PHASES INVALIDATE POSITIONS THREE DIFFERENT WAYS. `OpId` is a path of per-level
+ordinals, so erasing `[3]` renumbers `[4]`: phase 1 decides everything against the pre-mutation module,
+writes the reduced unit lists back, and erases in DESCENDING order; phase 2 replaces the reduced
+`def_immutable_mapping` IN PLACE — no renumbering, so its pre-collected walk stays valid — and re-finds
+each data-transfer seed BY VALUE, because `removeAncestors` erases ops defined *before* the seed; phase
+3 iterates descending and recomputes each `uniformize_regions` from the current module, which is also
+what makes a nested one get filtered before its ancestor's rebuild clones it. The reference's own NOTE
+at `:472-473` says the third walk must be separate, and the two early returns at `:449` and `:470` are
+the reason the first two phases can run with no filters set at all.
+
+⛔ AND ITS FOUR `DT_CHECK_MSG("Should not use both .. command line option(s) ..")` ABORTS ARE A TYPE.
+Each guards one option set against being written from a pass flag and from the pipeline's `opts_` at
+once, and that merge is the whole of `:365-414`; one field per set on `UnitFilteringOptions` is one
+source per set, so there is nothing left to refuse. The fold-0 `DT_CHECK_MSG` (`:383-385`) is `FoldId`'s
+type, and the reference's four `filter_*` booleans are only ever read as their three-way `||` or its
+negation, so one `filter_units` flag is faithful. Its component test compares a `SenComponents` spelled
+back to a string against `get_unit`'s `type=` (`:427-437`); `DfirUnit` equality is that comparison, and
+an operand that is no `get_unit` — a null deref in the reference's unchecked `getDefiningOp<GetUnitOp>()`
+— matches no name, which is where its loop leaves `remove_unit` set anyway. One order divergence is
+recorded: the reference asks about the mapping before the transfer in phase 2 and this asks the
+transfer first, which is unobservable because the arms are disjoint (no `uniform.` op is a data
+transfer, entry 141) and lets one immutable borrow answer both.
+
+⛔ AND THE ISLAND GREW A `replaceAllUsesWith` THAT REACHES A SCOPE. `replace_uses_of_with` touches one
+op's own operands and nothing else, but 295 and 296 both re-point a value read from inside a
+`program_unit` body, a loop body and a `uniformize_regions`' regions — which MLIR's own
+`replaceAllUsesWith` does reach. `dialects::replace_all_uses(scope, from, to)` recurses through
+`regions_mut`, and it replaced a private helper each of the two files would otherwise have duplicated.
+
+⛔ 289 AND 290 ARE THE OTHER TWO TRUNCATIONS. 289's whole effect is the `initMASData(mas_data, ad,
+max_mutable)` the extract dropped — without it `mas_data` reaches `synthesizeTimeInfo` empty and no
+candidate is ever split — and its `hasValidL3ImmutableAddr` reduces, for a constant-start view, to the
+stick divisibility (`Dialect/Agen/Utils.cpp:147-151`). `getBytesPerStick() * 8 / ad.getElementWidth()`
+is a divisor twice over: the `element_width_ = 0` an unpopulated record carries traps, and a width wider
+than a stick makes the quotient zero, which `isDivisibleBy` then divides by
+(`ExpressionEvaluatorUtils.cpp:115`) — `MasInitialization::NoElementsFitInAStick` is that arm.
+290 dropped `dcc::ConditionalTree cond_tree(*root_op); cond_tree.compute();` plus the whole
+`fillPartitions(..)` call, i.e. it computed `root_op` and threw it away. The `compute()` has nothing to
+do here: it caches parent/child links of ops already built, and `ConditionalTree::Built` holds those ops
+by value for `fill_partitions` to walk.
+
 
 ## Level 0
 
@@ -2798,22 +2891,22 @@ generation.
 - [x] **AUDIT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, line by line against the C++
 - [x] **PORT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, 22 lines
 - [x] **AUDIT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, line by line against the C++
-- [ ] **PORT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, 8 lines
-- [ ] **AUDIT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, line by line against the C++
-- [ ] **PORT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, 10 lines
-- [ ] **AUDIT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, line by line against the C++
-- [ ] **PORT 291/384** `calculatePartialShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490`, 66 lines
-- [ ] **AUDIT 291/384** `calculatePartialShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490`, line by line against the C++
-- [ ] **PORT 292/384** `transformSCFLoopWithNonConstantUpperBound` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169`, 94 lines
-- [ ] **AUDIT 292/384** `transformSCFLoopWithNonConstantUpperBound` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169`, line by line against the C++
-- [ ] **PORT 293/384** `runOn` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447`, 5 lines
-- [ ] **AUDIT 293/384** `runOn` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447`, line by line against the C++
-- [ ] **PORT 294/384** `getPageValidity` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:114`, 33 lines
-- [ ] **AUDIT 294/384** `getPageValidity` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:114`, line by line against the C++
-- [ ] **PORT 295/384** `createIterArgsForConditionals` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:401`, 121 lines
-- [ ] **AUDIT 295/384** `createIterArgsForConditionals` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:401`, line by line against the C++
-- [ ] **PORT 296/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:362`, 127 lines
-- [ ] **AUDIT 296/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:362`, line by line against the C++
+- [x] **PORT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, 8 lines
+- [x] **AUDIT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, line by line against the C++
+- [x] **PORT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, 10 lines
+- [x] **AUDIT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, line by line against the C++
+- [x] **PORT 291/384** `calculatePartialShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490`, 66 lines
+- [x] **AUDIT 291/384** `calculatePartialShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490`, line by line against the C++
+- [x] **PORT 292/384** `transformSCFLoopWithNonConstantUpperBound` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169`, 94 lines
+- [x] **AUDIT 292/384** `transformSCFLoopWithNonConstantUpperBound` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169`, line by line against the C++
+- [x] **PORT 293/384** `runOn` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447`, 5 lines
+- [x] **AUDIT 293/384** `runOn` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447`, line by line against the C++
+- [x] **PORT 294/384** `getPageValidity` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:114`, 33 lines
+- [x] **AUDIT 294/384** `getPageValidity` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:114`, line by line against the C++
+- [x] **PORT 295/384** `createIterArgsForConditionals` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:401`, 121 lines
+- [x] **AUDIT 295/384** `createIterArgsForConditionals` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:401`, line by line against the C++
+- [x] **PORT 296/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:362`, 127 lines
+- [x] **AUDIT 296/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:362`, line by line against the C++
 
 ## Level 4
 

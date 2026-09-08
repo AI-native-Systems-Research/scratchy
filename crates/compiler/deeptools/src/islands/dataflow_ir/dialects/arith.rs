@@ -313,6 +313,18 @@ pub enum Op {
         /// over the arms). Every site this island can reach chooses between two `index` values — a
         /// loop bound and an expanded subscript — so the field records which rather than assuming it.
         ty: ScalarTy,
+        /// `{dbgName = ".."}` — the DISCARDABLE attribute `getDbgNameAttr` falls back to for an op
+        /// that implements no `DebugNameOpInterface` (`DataflowOpInterfaces.cpp:29-33`), which every
+        /// `arith` op is.
+        ///
+        /// ⛔⛔ IN THE ISLAND BECAUSE ENTRY 292 MOVES IT ONTO THE `scf.if` IT BUILDS.
+        /// `transformSCFLoopWithNonConstantUpperBound` reads `getDbgNameAttr(cmpi_op)` off the
+        /// SELECT and sets it on the conditional
+        /// (`TransformLoopToLegalizeForSentientLowering.cpp:193-194`); the vendor's input writes
+        /// `%10 = arith.select %9, %c16, %c32 {dbgName = "c0-l3lu-loop-ibr-chunk-y-bound"}` and its
+        /// expected output carries that same name on the produced `scf.if`
+        /// (`scf_loop_with_result.mlir:128`, `:81`). Without the field the rewrite drops it.
+        dbg_name: Option<String>,
     },
 
     /// `arith.andi` / `arith.ori` / `arith.xori %c, true` - the connectives of a predicate.
@@ -405,16 +417,26 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             true_value,
             false_value,
             ty,
+            dbg_name,
         } => {
             // ⭐ THE CONDITION IS NOT PART OF THE PRINTED TYPE. `arith.select` prints one type, the
             // one the arms and the result share; the condition's `i1` is implied.
+            //
+            // ⛔ AND THE ATTRIBUTE DICTIONARY COMES BEFORE THE TYPE, unlike `scf.for`'s, which
+            // follows its region: `arith.select %9, %c16, %c32 {dbgName = ".."} : index`
+            // (`scf_loop_with_result.mlir:128`).
+            let attrs = match dbg_name {
+                Some(name) => format!(" {{dbgName = \"{name}\"}}"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = arith.select {}, {}, {} : {}",
+                "{} = arith.select {}, {}, {}{} : {}",
                 print::val(*result),
                 print::val(*condition),
                 print::val(*true_value),
                 print::val(*false_value),
+                attrs,
                 ty.spelling()
             );
         }

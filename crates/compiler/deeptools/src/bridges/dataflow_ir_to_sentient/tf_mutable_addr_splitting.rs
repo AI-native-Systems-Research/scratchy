@@ -84,6 +84,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
 use crate::arch::{Arch, Bounded, Elements, IsaGen, Sticks};
+use crate::formats::Bits;
 use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
@@ -1220,6 +1221,7 @@ mod unit_tests {
             true_value,
             false_value,
             ty: ScalarTy::Index,
+            dbg_name: None,
         });
         let loop_op = scf_for(&mut vals, lo, hi, step);
         let scope = vec![lo_op, step_op, true_op, false_op, select];
@@ -1249,6 +1251,7 @@ mod unit_tests {
             true_value,
             false_value,
             ty: ScalarTy::Index,
+            dbg_name: None,
         });
         let loop_op = scf_for(&mut vals, lo, hi, step);
         let scope = vec![lo_op, step_op, true_op, false_op, select];
@@ -1275,6 +1278,7 @@ mod unit_tests {
             true_value,
             false_value,
             ty: ScalarTy::Index,
+            dbg_name: None,
         });
         let loop_op = scf_for(&mut vals, lo, hi, step);
         let scope = vec![lo_op, step_op, true_op, select];
@@ -4362,6 +4366,137 @@ mod unit_tests {
         assert_eq!(shapes, vec![(1, 0), (1, 0)], "`s0` is still in the results");
     }
 
+    /// 🎯 289/384 — THE VENDOR'S `constant_start_addr_1`: **3072 IS 48 WHOLE STICKS OF fp16**.
+    ///
+    /// `mutable_addr_splitting_one_dim.mlir:239-257` — `%c3072` is the immutable start address of the
+    /// candidate's view and the program unit's `precision = "fp16"` makes `num_elems_in_stick`
+    /// `128 * 8 / 16 = 64`. ⛔ AND THE CHECK IS ONLY HALF THE FUNCTION: the initialized list is what
+    /// the truncated tail produces.
+    #[test]
+    fn the_one_dim_answer_keys_immutable_address_is_a_whole_number_of_fp16_sticks() {
+        let (layout, ty) = answer_key_memref();
+        let mut vals = Values::default();
+        let arg1 = vals.mint();
+        let scope = vec![DfirOp::Affine(affine::Op::For {
+            iv: arg1,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        })];
+
+        let op = time_dims_transfer();
+        let mut ad = AccessDetailsAffine::new(&op, DfirUnit::L3lu);
+        ad.base.element_width = Bits(16);
+        ad.base.indices = vec![arg1];
+        ad.indices_coeff_dict = IndicesCoeffDict {
+            per_index: vec![(arg1, 192)],
+            constant: 0,
+        };
+
+        let view = ConstStartMemView {
+            from: vals.mint(),
+            start: 3072,
+            layout: &layout,
+            ty: &ty,
+        };
+        assert_eq!(
+            initialize::<Dd2>(&ad, &view, &scope),
+            MasInitialization::Initialized(MasDataInit::Initialized {
+                mas_data: vec![MasData {
+                    iter_arg: Some(arg1),
+                    dim: 0,
+                    composed_coeff: 192,
+                    num_iters: 4,
+                    // `(4 - 2) * 192`.
+                    weight: 384,
+                }],
+                max_mutable: MutableAddr(384),
+            })
+        );
+
+        // ⛔ AND EIGHT ELEMENTS PAST IT IS NOT A STICK BOUNDARY, which is what the `DT_CHECK` aborts
+        // on: an immutable address the EBR cannot name in sticks.
+        assert_eq!(
+            initialize::<Dd2>(
+                &ad,
+                &ConstStartMemView {
+                    start: 3080,
+                    ..view
+                },
+                &scope,
+            ),
+            MasInitialization::ImmutableAddrIsNotAWholeNumberOfSticks {
+                start: 3080,
+                elems_in_stick: NonZeroU64::new(64).expect("64 fp16 elements fill a stick"),
+            }
+        );
+
+        // ⛔ AND AN UNPOPULATED RECORD IS THE DIVISION BY ZERO (`element_width_ = 0`).
+        ad.base.element_width = Bits(0);
+        assert_eq!(
+            initialize::<Dd2>(&ad, &view, &scope),
+            MasInitialization::NoElementsFitInAStick { width: Bits(0) }
+        );
+    }
+
+    /// 🎯 290/384 — THE `sen1p5` ANSWER KEY, BUILT AND FILLED BY THE ONE CALL THAT DOES BOTH.
+    ///
+    /// `mutable_addr_splitting_one_dim_sen1p5.mlir:19-50` — entry 187's tree and entry 252's two
+    /// partitions, `else` first, from one `createPartitions`.
+    #[test]
+    fn the_sen1p5_answer_key_is_built_and_filled_by_one_call() {
+        let mut vals = Values::default();
+        let iv = vals.mint();
+        let mas_data = [split_dim(iv, 1, 2048, 8)];
+        let subscripts_map = AffineMap {
+            dims: 2,
+            syms: 0,
+            results: vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(0).scaled(16),
+                AffineExpr::dim(1).scaled(8),
+            ],
+        };
+
+        // Entry 187's tree, from a `Values` seeded exactly as `create_partitions` finds it.
+        let expected_tree = {
+            let mut same = Values::default();
+            let _ = same.mint();
+            construct_conditionals(&mut same, &mas_data, &[4])
+                .ops()
+                .unwrap_or_default()
+                .to_vec()
+        };
+
+        let mut mods: Vec<i64> = Vec::new();
+        let created = {
+            let mut creator = |_: &AffineMap, start_addr_mod: i64| {
+                mods.push(start_addr_mod);
+                Vec::new()
+            };
+            create_partitions(&mut vals, &mas_data, &[4], &subscripts_map, &mut creator)
+        };
+        assert_eq!(
+            created,
+            Partitions::Created {
+                ops: expected_tree,
+                partitions: 2,
+            },
+            "the tree is entry 187's, and both of its leaves were filled"
+        );
+        assert_eq!(mods, vec![8192, 0], "the else partition first");
+
+        // ⛔ AND NO PLAN IS NO TREE: `DT_CHECK(!partition_sizes.empty())` (`:989`).
+        assert_eq!(
+            create_partitions(&mut vals, &mas_data, &[], &subscripts_map, &mut |_: &AffineMap,
+                                                                               _| {
+                Vec::new()
+            }),
+            Partitions::NoConditionalTree(ConditionalTree::NoPartitionsToBuild)
+        );
+    }
 }
 
 /// WHAT A LOOP ANSWERS WHEN ASKED HOW MANY TIMES IT RUNS — every value the reference's one `int64_t`
@@ -7470,11 +7605,136 @@ pub fn fill_partitions(
     FilledPartitions::Filled { partitions }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 289/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT THE PASS'S PER-CANDIDATE SETUP LEAVES BEHIND — the initialized list, or the precondition it
+/// stopped on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasInitialization {
+    /// [`init_mas_data`]'s answer, passed through unchanged.
+    Initialized(MasDataInit),
+    /// `DT_CHECK(dcc::agen::utils::hasValidL3ImmutableAddr(evaluator, mem_view_op,
+    /// num_elems_in_stick))` (`:701-702`).
+    ImmutableAddrIsNotAWholeNumberOfSticks {
+        /// The view's constant start address, in elements.
+        start: i64,
+        /// `num_elems_in_stick`.
+        elems_in_stick: NonZeroU64,
+    },
+    /// ⛔ THE WIDTH IS A DIVISOR TWICE OVER: `getBytesPerStick() * 8 / ad.getElementWidth()` traps on
+    /// the `element_width_ = 0` an unpopulated record still carries, and a width wider than a stick
+    /// makes the quotient zero — which `isDivisibleBy` then divides by
+    /// (`ExpressionEvaluatorUtils.cpp:115`).
+    NoElementsFitInAStick {
+        /// `ad.getElementWidth()`.
+        width: Bits,
+    },
+}
+
+/// Replaces: e289_initialize
+///
+/// **289/384** `MutableAddrSplittingPass::initialize` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694` (8L): the immutable address must be a
+/// whole number of sticks, and then [`init_mas_data`] collects the iterators and the mutable span.
+///
+/// ⛔ THE `initMASData` CALL IS THE TAIL `bridge2.cpp` TRUNCATED (AGENT-BRIEF §1); without it
+/// `mas_data` reaches `synthesizeTimeInfo` empty and no candidate is ever split.
+/// ⭐ A [`ConstStartMemView`] PINS ARM ONE of `hasValidL3ImmutableAddr`
+/// (`Dialect/Agen/Utils.cpp:147-151`), whose whole content there is the divisibility.
+#[must_use]
+pub fn initialize<A: Arch>(
+    ad: &AccessDetailsAffine<'_>,
+    view: &ConstStartMemView<'_>,
+    scope: &[DfirOp],
+) -> MasInitialization {
+    // `int64_t num_elems_in_stick = dcc_ext_ctx_.getBytesPerStick() * 8 / ad.getElementWidth();`
+    let width = ad.base.element_width;
+    let Some(elems_in_stick) = (width.0 > 0)
+        .then(|| A::BYTES_PER_STICK.get() * 8 / u64::from(width.0))
+        .and_then(NonZeroU64::new)
+    else {
+        return MasInitialization::NoElementsFitInAStick { width };
+    };
+
+    // `DT_CHECK(hasValidL3ImmutableAddr(evaluator, mem_view_op, num_elems_in_stick));` — the helper's
+    // constant-start arm is `ev.isDivisibleBy(num_elems_in_stick)`, i.e. `offsetValue() % divisor == 0`.
+    let stick = i64::try_from(elems_in_stick.get()).unwrap_or(i64::MAX);
+    if view.start.rem_euclid(stick) != 0 {
+        return MasInitialization::ImmutableAddrIsNotAWholeNumberOfSticks {
+            start: view.start,
+            elems_in_stick,
+        };
+    }
+
+    // *"Initialize MASData which also collects the max mutable address."*
+    MasInitialization::Initialized(init_mas_data(ad, scope))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 290/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT GOES WHERE THE TRANSFER WAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Partitions {
+    /// The conditional tree with every leaf filled.
+    Created {
+        /// [`construct_conditionals`]'s ops, now holding one partition per leaf.
+        ops: Vec<DfirOp>,
+        /// How many leaves [`fill_partitions`] filled.
+        partitions: usize,
+    },
+    /// `DT_CHECK(!partition_sizes.empty())` (`:989`) and `DT_CHECK_MSG(root_op, "Root op of
+    /// conditional tree could not be determined")` (`:991`) — both are the tree not being built.
+    NoConditionalTree(ConditionalTree),
+    /// [`fill_partitions`]'s refusal, with the partly filled tree dropped as the abort drops it.
+    NotFilled(FilledPartitions),
+}
+
+/// Replaces: e290_createPartitions
+///
+/// **290/384** `MutableAddrSplittingPass::createPartitions` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983` (10L): build the conditional tree, then
+/// fill each of its leaves with one partition of the transfer.
+///
+/// ⛔ `dcc::ConditionalTree cond_tree(*root_op); cond_tree.compute();` (`:993-994`) HAS NOTHING TO DO
+/// HERE: it caches the parent/child links of ops already built, and [`ConditionalTree::Built`] holds
+/// those ops by value — [`fill_partitions`] walks them and reads the conditionals above each leaf.
+#[must_use]
+pub fn create_partitions(
+    vals: &mut Values,
+    mas_data: &[MasData],
+    partition_sizes: &[i64],
+    subscripts_map: &AffineMap,
+    op_creator: &mut impl FnMut(&AffineMap, i64) -> Vec<DfirOp>,
+) -> Partitions {
+    // `DT_CHECK(!partition_sizes.empty()); auto root_op = constructConditionals(..);
+    //  DT_CHECK_MSG(root_op, ..);` — [`construct_conditionals`] asks the emptiness itself, so both
+    // checks are one absent tree.
+    let tree = construct_conditionals(vals, mas_data, partition_sizes);
+    let Some(ops) = tree.ops() else {
+        return Partitions::NoConditionalTree(tree);
+    };
+    let mut ops = ops.to_vec();
+
+    // `fillPartitions(cond_tree, mas_data, partition_sizes, subscripts_map, op_creator);`
+    match fill_partitions(
+        &mut ops,
+        mas_data,
+        partition_sizes,
+        subscripts_map,
+        op_creator,
+    ) {
+        FilledPartitions::Filled { partitions } => Partitions::Created { ops, partitions },
+        refusal => Partitions::NotFilled(refusal),
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e289_initialize
-// crustify:todo: e290_createPartitions
 // crustify:todo: e306_transformVectorLoad
 // crustify:todo: e307_transformVectorStore
 // crustify:todo: e321_transformCompLoadAndStore

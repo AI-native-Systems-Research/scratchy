@@ -733,6 +733,97 @@ pub fn apply_shifts(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 291/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// HOW MANY ELEMENTS OF IMMUTABLE ADDRESS SPACE ARE STILL FREE — `(max_immutable_range /
+/// ad.getElementWidth()) - max_immutable` (`:436-437`).
+///
+/// ⛔ SIGNED, BECAUSE IT CAN BE NEGATIVE: the view's own maximum immutable address may already exceed
+/// the range the EBR can name, and the reference then divides a negative budget by every stride
+/// (`:534`) and takes the `constant_shift <= 0` arm on all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImmutableSpace(pub i64);
+
+/// WHAT `calculatePartialShift` HANDS BACK — the out-parameter and the return value together, as
+/// [`FullShift`] does. The total is stick-aligned by construction here: the remainder is subtracted
+/// off and handed back to the mutable side through [`offset_shifts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialShift {
+    /// One per result of the ORIGINAL subscripts map, zero where nothing moved — see
+    /// [`SubscriptResult`].
+    pub shifts: Vec<Shift>,
+    /// What those shifts add up to, in elements, less the part-stick remainder.
+    pub total: TotalShift,
+}
+
+/// Replaces: e291_calculatePartialShift
+///
+/// **291/384** `MutableStartAddrShiftingPass::calculatePartialShift` —
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490` (66L): spend a limited immutable
+/// budget on the heaviest dimensions first, then give back what does not fill a whole stick.
+///
+/// ⛔ A NEGATIVE `offset_` PRODUCES A NEGATIVE SHIFT AND HANDS BUDGET BACK, because
+/// `if (constant_shift > dim_weight.offset_) constant_shift = dim_weight.offset_` clamps DOWNWARD
+/// only (`:541-542`) — which is also the one way `DT_CHECK(total_shift >= 0)` (`:552`) can fail, and
+/// [`TotalShift`] is signed already.
+/// ⚠️ `dim_order` (`:511-517`) IS WRITTEN AND NEVER READ; see [`SubscriptResult`].
+#[must_use]
+pub fn calculate_partial_shift(
+    inputs: &ShiftInputs<'_>,
+    immutable_space: ImmutableSpace,
+) -> PartialShift {
+    // `calculateDimWeights(dim_weights, ad);` — heaviest first, which is steps 1-3 of the plan the
+    // reference states at `:497-503`.
+    let dim_weights = calculate_dim_weights(inputs);
+
+    // *"Initialize all shifts to zero as the shifts may not be analyzed in order."* (`:521-523`).
+    let mut shifts = vec![Shift(0); inputs.subscripts_map.results.len()];
+
+    let mut curr_immutable_space = immutable_space;
+    for dim_weight in &dim_weights {
+        // `DT_CHECK(layout_coeffs.size() > dim_weight.dim_);` — and a stride of zero is the
+        // reference's own division by zero, which buys no space either way.
+        let Some(&layout_coeff) = inputs.layout_coeffs.get(dim_weight.dim.index()) else {
+            continue;
+        };
+        if layout_coeff.0 == 0 {
+            continue;
+        }
+
+        // `int64_t constant_shift = curr_immutable_space / layout_coeffs[dim_weight.dim_];`
+        // *"If there isn't enough space to fit even 1*<layout coeff>, move the the next dim."*
+        let mut constant_shift = curr_immutable_space.0 / layout_coeff.0;
+        if constant_shift <= 0 {
+            continue;
+        }
+        // `if (constant_shift > dim_weight.offset_) constant_shift = dim_weight.offset_;`
+        constant_shift = constant_shift.min(dim_weight.offset.0);
+
+        // `curr_immutable_space -= constant_shift * layout_coeffs[dim_weight.dim_];`
+        curr_immutable_space.0 -= constant_shift * layout_coeff.0;
+        // `DT_CHECK(shifts.size() > dim_weight.dim_); shifts[dim_weight.dim_] = constant_shift;`
+        if let Some(slot) = shifts.get_mut(dim_weight.dim.index()) {
+            *slot = Shift(constant_shift);
+        }
+    }
+
+    // `int64_t total_shift = immutable_space - curr_immutable_space;`
+    let total_shift = immutable_space.0 - curr_immutable_space.0;
+    // `int64_t remainder = total_shift % num_elems_in_stick; total_shift -= remainder;`
+    let stick = i64::try_from(inputs.elements_per_stick.elements().0).unwrap_or(i64::MAX);
+    let remainder = total_shift % stick;
+    // `if (remainder != 0) offsetShifts(shifts, ad, -remainder);` — the guard is [`offset_shifts`]'s
+    // own first line.
+    offset_shifts(&mut shifts, inputs.transfer_order, Shift(-remainder));
+
+    PartialShift {
+        shifts,
+        total: inputs.elements_per_stick.total(total_shift - remainder),
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1537,12 +1628,74 @@ mod unit_tests {
             })
         );
     }
+    /// 🎯 291/384 — THE VENDOR'S PARTIAL CASE: A BUDGET OF **12952** BUYS `[0, 2, 50]` AND MOVES THE
+    /// IMMUTABLE START TO **14976**.
+    ///
+    /// `mutable_start_addr_shift_partial.mlir:23`, `:29` — the same access as the full-shift fixture
+    /// under `-dcc-mutable-start-addr-shifting-max-immutable-size=240000`, so the budget is
+    /// `240000 / 16 - 2048`. ⭐ AND DIMENSION 0's 24 ELEMENTS ARE THE PART-STICK REMAINDER,
+    /// handed straight back: `12952 % 64 = 24`, and `2048 + 12928 = 14976`.
+    #[test]
+    fn the_vendors_partial_shift_spends_twelve_thousand_nine_hundred_and_twenty_eight() {
+        let subscripts = vendor_subscripts_map();
+        let layout = AffineMap::identity(3);
+        let inputs = shift_inputs(&VENDOR_COEFFS, &layout, &subscripts, 16);
+        let partial = calculate_partial_shift(&inputs, ImmutableSpace(240_000 / 16 - 2048));
+
+        assert_eq!(
+            partial.shifts,
+            vec![Shift(0), Shift(2), Shift(50)],
+            "50 of d2's 128 and 2 of d1's 16, with d0's 24 given back as the remainder"
+        );
+        assert_eq!(partial.total, TotalShift::WholeSticks(12928));
+        assert_eq!(
+            apply_shifts(
+                &mut Values::default(),
+                &partial.shifts,
+                &inputs,
+                &ConstStartMemView {
+                    from: Val(0),
+                    start: 2048,
+                    layout: &AffineMap {
+                        dims: 3,
+                        syms: 0,
+                        results: vec![
+                            AffineExpr::dim(2)
+                                .times(256)
+                                .plus(AffineExpr::dim(1).times(64))
+                                .plus(AffineExpr::dim(0)),
+                        ],
+                    },
+                    ty: &MemRef {
+                        shape: vec![8, 64, 4],
+                        elem: ElemType::F16,
+                    },
+                },
+            )
+            .subscripts_map,
+            AffineMap {
+                dims: 2,
+                syms: 0,
+                results: vec![
+                    AffineExpr::Const(64),
+                    AffineExpr::dim(0).times(3).plus(AffineExpr::Const(14)),
+                    AffineExpr::dim(1).times(2).plus(AffineExpr::Const(78)),
+                ],
+            },
+            "the CHECK's own subscripts: `[64, %arg1 * 3 + 14, %arg2 * 2 + 78]`"
+        );
+
+        // ⛔ AND A BUDGET SMALLER THAN EVERY STRIDE BUYS NOTHING, which is where a negative one lands
+        // too (`:534-539`).
+        let nothing = calculate_partial_shift(&inputs, ImmutableSpace(-4096));
+        assert_eq!(nothing.shifts, vec![Shift(0); 3]);
+        assert_eq!(nothing.total, TotalShift::WholeSticks(0));
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e291_calculatePartialShift
 // crustify:todo: e308_calculateShifts
 // crustify:todo: e323_shiftMutableAddr
 // crustify:todo: e352_transformVectorLoad

@@ -896,6 +896,44 @@ impl IntegerSet {
     /// ⭐ TOTAL, AND FAITHFUL ABOUT WHAT IT LEAVES ALONE. A symbol beyond `replacements` keeps its own
     /// position, exactly as MLIR's does — the caller states the resulting symbol count, so a partial
     /// substitution is expressible rather than silently completed.
+    /// DIMENSIONS SUBSTITUTED AWAY — `IntegerSet::replaceDimsAndSymbols(dimReplacements, {}, dims,
+    /// syms)` with the SYMBOL list left empty, which is how `getPageValidity` calls it:
+    ///
+    /// ```text
+    /// subscripts_in_page = subscripts_in_page.replaceDimsAndSymbols(
+    ///     subscripts_map_sym.getResults(), {}, 0, subscripts_map_sym.getNumSymbols());
+    /// ```
+    /// (`Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:122-125`)
+    ///
+    /// ⭐⭐ IT IS WHAT PUTS THE ACCESS AND THE PAGE IN ONE SPACE. The page's set is written over the
+    /// view's dimensions; substituting each one by the SUBSCRIPT that indexes it leaves a set over the
+    /// loop iterators alone, which is why [`super::super::super::bridges::dataflow_ir_to_sentient::tf_transform_paged_mem_view_impl::add_constraints_for_iv_ranges`]
+    /// can then bound them as symbols.
+    ///
+    /// ⭐ TOTAL, AND FAITHFUL ABOUT WHAT IT LEAVES ALONE, exactly as [`Self::replace_symbols`] is: a
+    /// dimension beyond `replacements` keeps its own position and the caller states both resulting
+    /// counts.
+    #[must_use]
+    pub fn replace_dims(
+        &self,
+        replacements: &[AffineExpr],
+        result_dims: u32,
+        result_symbols: u32,
+    ) -> IntegerSet {
+        IntegerSet {
+            dims: result_dims,
+            symbols: result_symbols,
+            constraints: self
+                .constraints
+                .iter()
+                .map(|constraint| Constraint {
+                    expr: constraint.expr.replace_dims_and_symbols(replacements, &[]),
+                    is_equality: constraint.is_equality,
+                })
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub fn replace_symbols(&self, replacements: &[AffineExpr], result_symbols: u32) -> IntegerSet {
         IntegerSet {
@@ -2009,6 +2047,47 @@ impl FlatConstraints {
                     .count()
                     <= 1
             })
+    }
+
+    /// WHETHER THE SYSTEM ADMITS NOTHING AT ALL — `isEmpty()`, which `getPageValidity` asks twice
+    /// (`TransformPagedMemViewImpl.cpp:127`, `:132`) to decide whether a page is reachable.
+    ///
+    /// ⭐⭐ ELIMINATE EVERY VARIABLE, THEN READ THE ROWS THAT ARE LEFT. A system with no variables is
+    /// a list of constant claims, and one that says `c >= 0` for a negative `c` or `c == 0` for a
+    /// nonzero one is unsatisfiable. [`Self::project_out`] is already the elimination MLIR's own
+    /// `IntegerRelation::isEmpty` runs (Gaussian where an equality pins a variable, Fourier–Motzkin
+    /// otherwise), and it keeps a trivially false row rather than dropping it — which is what makes
+    /// the contradiction observable here.
+    ///
+    /// ⭐ THE GCD TEST COMES FIRST, as `isEmptyByGCDTest` does: an equality whose variable
+    /// coefficients share a divisor the constant does not have has no INTEGER solution, whatever the
+    /// rationals say.
+    ///
+    /// ⚠️ AND WHAT REMAINS IS RATIONAL. Fourier–Motzkin computes the rational shadow (see
+    /// [`Self::project_out`]), so a system with rational but no integer points is reported NON-empty
+    /// where MLIR's Simplex would find it empty. For `getPageValidity` that direction is the safe one:
+    /// it keeps a page conditional that never fires, rather than dropping a page that does.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        // `isEmptyByGCDTest()` — `gcd(coeffs) | constant` must hold for every equality.
+        let gcd_refutes = self.equalities.iter().any(|row| {
+            let (coeffs, constant) = row.split_at(row.len().saturating_sub(1));
+            let divisor = coeffs.iter().fold(0i64, |acc, term| gcd(acc, term.abs()));
+            divisor > 1 && constant.first().is_some_and(|term| term % divisor != 0)
+        });
+        if gcd_refutes {
+            return true;
+        }
+
+        let constants = self.project_out(0, self.dims + self.syms);
+        constants
+            .equalities
+            .iter()
+            .any(|row| row.first().is_some_and(|term| *term != 0))
+            || constants
+                .inequalities
+                .iter()
+                .any(|row| row.first().is_some_and(|term| *term < 0))
     }
 }
 

@@ -100,7 +100,10 @@
 
 use super::agen_access_details::{MemoryOperandIndex, TimeBound, TimeDim};
 use super::agen_helper::{AgenOpKind, store_op_from_load_store_pattern};
-use super::tf_utils::{LoopBound, get_dataflow_for_loop_info_if_iv};
+use super::tf_utils::{
+    CountedLoop, LoopBound, create_for_op_with_additional_return_value,
+    get_dataflow_for_loop_info_if_iv,
+};
 // ⭐ THE MANAGER'S `dyn_cast` HANDLE, aliased because this file's `PagedMemView` is the island op it
 // wraps — `cast<GetPagedLogicalMemoryViewOp>` at `:396` and `:663` is [`PagedMemViewHandle::of`].
 use super::tf_transform_paged_mem_view_manager::PagedMemView as PagedMemViewHandle;
@@ -111,7 +114,7 @@ use crate::islands::dataflow_ir::dialects::{
     self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results, scf, uses,
 };
 use crate::islands::dataflow_ir::ty::{
-    AffineExpr, AffineMap, Constraint, IntegerSet, MemRef, ScalarTy, Vector,
+    AffineExpr, AffineMap, Constraint, FlatConstraints, IntegerSet, MemRef, ScalarTy, Vector,
 };
 use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::units::DfirUnit;
@@ -4764,6 +4767,182 @@ scf.if %3 {
             page_dependent_time_syms
         );
     }
+
+    /// 🎯 294/384 — A PAGE THE SUBSCRIPTS REACH, AND THE THREE WAYS ONE IS REFUSED.
+    #[test]
+    fn a_page_is_valid_where_both_the_subscripts_and_their_ranges_reach_it() {
+        let ineq = |expr: AffineExpr| Constraint {
+            expr,
+            is_equality: false,
+        };
+        // The page rectangle — `d0` in [0, 63] and `d1` in [0, 127].
+        let page_rect = |extra: Vec<Constraint>| IntegerSet {
+            dims: 2,
+            symbols: 0,
+            constraints: [
+                vec![
+                    ineq(AffineExpr::dim(0)),
+                    ineq(AffineExpr::dim(0).scaled(-1).plus(AffineExpr::Const(63))),
+                    ineq(AffineExpr::dim(1)),
+                    ineq(AffineExpr::dim(1).scaled(-1).plus(AffineExpr::Const(127))),
+                ],
+                extra,
+            ]
+            .concat(),
+        };
+        let info = |lb, ub| TpmvInfo {
+            paged_mem_view: None,
+            subscripts_map: AffineMap::identity(1),
+            indices: Vec::new(),
+            indices_ranges: vec![IvRange { lb, ub }],
+            conditional_iter_args: Vec::new(),
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        // `(s0) -> (s0, 64)` — the access walks the first span and sits inside the second.
+        let reaching = AffineMap {
+            dims: 0,
+            syms: 1,
+            results: vec![AffineExpr::sym(0), AffineExpr::Const(64)],
+        };
+        // Only a valid page has rows at all; the refusals are asserted on the variant below.
+        let rows = |validity: PageValidity| match validity {
+            PageValidity::Valid(set) => FlatConstraints::from_integer_set(&set).inequalities,
+            _ => Vec::new(),
+        };
+
+        // Both page bounds, in order, then the iterator's own two — one symbol column and a constant.
+        assert_eq!(
+            vec![
+                vec![1, 0],
+                vec![-1, 63],
+                vec![0, 64],
+                vec![0, 63],
+                vec![1, 0],
+                vec![-1, 31],
+            ],
+            rows(get_page_validity(
+                &info(0, 31),
+                &reaching,
+                &page_rect(Vec::new())
+            ))
+        );
+
+        // `(s0) -> (s0, s0 * 2 + 200)` leaves the second span behind whatever `s0` is.
+        let past_the_page = AffineMap {
+            dims: 0,
+            syms: 1,
+            results: vec![
+                AffineExpr::sym(0),
+                AffineExpr::sym(0).scaled(2).plus(AffineExpr::Const(200)),
+            ],
+        };
+        assert_eq!(
+            PageValidity::SubscriptsDoNotIntersectThePage,
+            get_page_validity(&info(0, 31), &past_the_page, &page_rect(Vec::new()))
+        );
+
+        // The subscript reaches the page, but never while the iterator is in [100, 200].
+        assert_eq!(
+            PageValidity::IvBoundsDoNotIntersectThePage,
+            get_page_validity(&info(100, 200), &reaching, &page_rect(Vec::new()))
+        );
+
+        // `-d0 - d1 + 63 >= 0` names two dimensions in one row, so the page is no rectangle.
+        let diagonal = vec![ineq(
+            AffineExpr::dim(0)
+                .scaled(-1)
+                .plus(AffineExpr::dim(1).scaled(-1))
+                .plus(AffineExpr::Const(63)),
+        )];
+        assert_eq!(
+            PageValidity::PageIsNotHyperRectangular,
+            get_page_validity(&info(0, 31), &reaching, &page_rect(diagonal))
+        );
+    }
+
+    /// 🎯 295/384 — THREE LOOPS, ONE ACCUMULATOR, AND THE COEFFICIENTS READ THE WAY `:481` READS THEM.
+    /// ⚠️ `%0`, `%9` and `%16` ARE ENTRY 264'S FILL CONSTANTS, left dead by the `setOperand` that
+    /// re-initialises each added iter_arg (`:461-462`, `:468-469`) — the reference leaves them too.
+    #[test]
+    fn every_loop_of_the_nest_adds_its_own_coefficient_to_the_carried_subscript() {
+        let counted = |iv: Val, hi: i64, body: Vec<DfirOp>| {
+            DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(hi),
+                carried: Vec::new(),
+                body,
+                dbg_name: None,
+            })
+        };
+        let terminator = || DfirOp::Affine(affine::Op::Yield {
+            operands: Vec::new(),
+        });
+        let mut scope = vec![counted(
+            Val(100),
+            4,
+            vec![
+                counted(
+                    Val(101),
+                    8,
+                    vec![counted(Val(102), 16, vec![terminator()]), terminator()],
+                ),
+                terminator(),
+            ],
+        )];
+        // `(d0, d1, d2) -> (d0 * 10 + d1 * 100 + d2 * 1000 + 5, 7)`, whose dims are `indices`' own
+        // order — mid, inner, outer. ⭐ THE LOOP ORDER IS THEREFORE [2, 0, 1], WHICH IS NOT ITS OWN
+        // INVERSE: the outermost loop must add 1000, and the reference's scatter would add 100 there.
+        let subscripts_map = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(0)
+                    .scaled(10)
+                    .plus(AffineExpr::dim(1).scaled(100))
+                    .plus(AffineExpr::dim(2).scaled(1000))
+                    .plus(AffineExpr::Const(5)),
+                AffineExpr::Const(7),
+            ],
+        };
+        let mut vals = Values::default();
+
+        let created = create_iter_args_for_conditionals(
+            &mut vals,
+            &mut scope,
+            &subscripts_map,
+            &[Val(101), Val(102), Val(100)],
+        );
+
+        // The INNERMOST arg of the one non-constant result, and every index its new induction variable.
+        assert_eq!(vec![Val(19)], created.conditional_iter_args);
+        assert_eq!(vec![Val(11), Val(18), Val(2)], created.indices);
+        assert_eq!(3, created.ir_maps.len());
+        assert_eq!(
+            "\
+%0 = arith.constant 0 : index
+%6 = arith.constant 5 : index
+%1 = affine.for %2 = 0 to 4 iter_args(%3 = %6) -> (index) {
+  %9 = arith.constant 0 : index
+  %10 = affine.for %11 = 0 to 8 iter_args(%12 = %3) -> (index) {
+    %16 = arith.constant 0 : index
+    %17 = affine.for %18 = 0 to 16 iter_args(%19 = %12) -> (index) {
+      %20 = arith.constant 100 : index
+      %21 = arith.addi %19, %20 : index
+      affine.yield %21 : index
+    }
+    %14 = arith.constant 10 : index
+    %15 = arith.addi %12, %14 : index
+    affine.yield %15 : index
+  }
+  %7 = arith.constant 1000 : index
+  %8 = arith.addi %3, %7 : index
+  affine.yield %8 : index
+}
+",
+            text(&scope)
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -5071,11 +5250,283 @@ pub fn gather_page_dependent_dims_for_page(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 294/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHETHER ONE PAGE CAN BE THE ONE AN ACCESS READS — [`get_page_validity`]'s answer.
+///
+/// ⛔ THE REFERENCE HANDS BACK AN EMPTY CONSTRAINT SYSTEM FOR BOTH REFUSALS and its caller reads
+/// only `isEmpty()` (`:168`); the two variants below are that emptiness with its reason kept, and the
+/// third is the `DT_CHECK_MSG` at `:117-119`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageValidity {
+    /// The page selection constraints, non-empty — the system entries 199/260/309 read.
+    Valid(IntegerSet),
+    /// `"Invalid page - subscripts and page do not intersect"`.
+    SubscriptsDoNotIntersectThePage,
+    /// `"Invalid page - IV subscripts have bounds that do not intersect the page"`.
+    IvBoundsDoNotIntersectThePage,
+    /// `DT_CHECK_MSG(.., "idx_set should be hyper rectangular")`.
+    PageIsNotHyperRectangular,
+}
+
+/// Replaces: e294_getPageValidity
+///
+/// **294/384** `TPMVBase::getPageValidity` — the page's own rectangle with the access's SUBSCRIPTS
+/// substituted for its dimensions, then the iterators' ranges, emptiness tested after each.
+///
+/// ⭐ TWO SYSTEMS, AND ONLY THE SECOND IS RETURNED: `page_set_constraints` exists solely to be
+/// checked hyper-rectangular, while `page_sel_constraints` is built from `subscripts_in_page`.
+pub fn get_page_validity(
+    info: &TpmvInfo<'_>,
+    subscripts_map_sym: &AffineMap,
+    page_set: &IntegerSet,
+) -> PageValidity {
+    let page_set_constraints = FlatConstraints::from_integer_set(page_set);
+    if !page_set_constraints.is_hyper_rectangular(0, page_set_constraints.num_cols() - 1) {
+        return PageValidity::PageIsNotHyperRectangular;
+    }
+
+    // `replaceDimsAndSymbols(subscripts_map_sym.getResults(), {}, 0, getNumSymbols())` — ZERO dims
+    // out, so what was "page dimension `d`" is now the subscript that indexes it.
+    let mut page_sel_constraints =
+        page_set.replace_dims(&subscripts_map_sym.results, 0, subscripts_map_sym.syms);
+    if FlatConstraints::from_integer_set(&page_sel_constraints).is_empty() {
+        return PageValidity::SubscriptsDoNotIntersectThePage;
+    }
+
+    add_constraints_for_iv_ranges(&mut page_sel_constraints, &info.indices_ranges);
+    if FlatConstraints::from_integer_set(&page_sel_constraints).is_empty() {
+        return PageValidity::IvBoundsDoNotIntersectThePage;
+    }
+
+    PageValidity::Valid(page_sel_constraints)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 295/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT REBUILDING THE NEST HANDS BACK — [`create_iter_args_for_conditionals`]'s three outputs.
+#[derive(Debug, Clone)]
+pub struct IterArgsForConditionals {
+    /// `info.conditional_iter_args_` — the INNERMOST arg of each non-constant map result, in result
+    /// order, which is the order entries 198/199 index with their `arg_idx`.
+    pub conditional_iter_args: Vec<Val>,
+    /// `indices`, each now the induction variable of the loop that binds it after the rebuild.
+    pub indices: Vec<Val>,
+    /// One `IRMapping` per rebuilt loop, outermost first.
+    ///
+    /// ⛔ THE `mem_ops_` / `paged_mem_view_` / SIBLING-`TPMVInfo` RE-SYNCS AT `:497-514` ARE THE
+    /// CALLER'S, and that is a type-level fact rather than a shortcut: they are `&'p` borrows of the
+    /// very program this function rewrites, and Rust cannot hold one across the rewrite. Replaying
+    /// them in this order over the new scope — [`update_tpmv_info`] per mapping — is those lines.
+    pub ir_maps: Vec<ValueMapping>,
+}
+
+/// Replaces: e295_createIterArgsForConditionals
+///
+/// **295/384** `TPMVBase::createIterArgsForConditionals` — one iter_arg per non-constant subscript on
+/// every loop of the nest: initialised to that subscript's constant term at the outermost loop and to
+/// the enclosing loop's arg below it, each loop yielding `arg + its own coefficient`.
+///
+/// ⛔ ONE DELIBERATE DIVERGENCE: `:435` SCATTERS the coefficients through the loop-order permutation
+/// (`ordered[perm[i]] = coeffs[i]`) while `:481` reads them GATHERED, `ordered_coeffs[c][i]` being
+/// "the coefficient of the loop at POSITION `i`". The two agree only where the permutation is its own
+/// inverse — the identity, or any two-loop nest. ⭐ This gathers. `DT_CHECK(..empty())` is structural.
+#[must_use]
+pub fn create_iter_args_for_conditionals(
+    vals: &mut Values,
+    scope: &mut Vec<DfirOp>,
+    subscripts_map: &AffineMap,
+    indices: &[Val],
+) -> IterArgsForConditionals {
+    let mut indices = indices.to_vec();
+    let mut conditional_iter_args: Vec<Val> = Vec::new();
+    let mut ir_maps: Vec<ValueMapping> = Vec::new();
+
+    // `setLoopIteratorOrder(indices)` — position → which entry of `indices`, outermost first.
+    let ordered_indices_idxs = set_loop_iterator_order(&indices, scope);
+
+    // `for (auto &res : subscripts_map.getResults()) { if (isa<AffineConstantExpr>(res)) continue; ..`
+    // — `getFlattenedAffineExpr` per remaining result, its DIM coefficients read by loop position and
+    // its constant (`coeffs.back()`) kept aside. ⛔ The reference's permutation covers `coeffs.size()`
+    // slots, so a symbol or a local would index `ordered_indices_idxs` out of range: dims only.
+    let ordered_coeffs: Vec<(Vec<i64>, i64)> = subscripts_map
+        .results
+        .iter()
+        .filter(|result| !matches!(result, AffineExpr::Const(_)))
+        .map(|result| {
+            let flat = result.flatten(subscripts_map.dims, subscripts_map.syms);
+            let per_loop = ordered_indices_idxs
+                .iter()
+                .map(|&idx| flat.dims.get(idx).copied().unwrap_or_default())
+                .collect();
+            (per_loop, flat.constant)
+        })
+        .collect();
+    let num_args = ordered_coeffs.len();
+
+    // "Each loop will get one iter_arg per map result involving loop iterators", outermost first.
+    for (position, &indices_idx) in ordered_indices_idxs.iter().enumerate() {
+        // `cast<BlockArgument>(indices[indices_idx]).getOwner()->getParentOp()`, reached mutably —
+        // ⛔ where that `cast` aborts, and where the op it lands on is no counted loop, nothing moves.
+        let Some(path) = binding_path(indices[indices_idx], scope) else {
+            continue;
+        };
+        let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+            continue;
+        };
+        let Some(counted) = ops.get(ordinal).and_then(CountedLoop::of) else {
+            continue;
+        };
+
+        // `createForOpWithAdditionalReturnValue(curr_loop, ordered_coeffs.size(), ir_map, false)`.
+        let grown = create_for_op_with_additional_return_value(vals, &counted, num_args, false);
+        let mut new_loop = grown.op;
+        let mut init_consts: Vec<DfirOp> = Vec::new();
+        let (DfirOp::Affine(affine::Op::For { iv, carried, body, .. })
+        | DfirOp::Scf(scf::Op::For { iv, carried, body, .. })) = &mut new_loop
+        else {
+            continue;
+        };
+        let new_iv = *iv;
+        // `region_iter_args[region_iter_args.size() - num_args + c]` — the added args are the last.
+        let first_added = carried.len().saturating_sub(num_args);
+
+        for (c, (per_loop, constant)) in ordered_coeffs.iter().enumerate() {
+            let added = &mut carried[first_added + c];
+            if conditional_iter_args.len() < num_args {
+                // Outermost: an `arith::ConstantIndexOp(ordered_coeffs[c].back())` before the loop, and
+                // `setOperand` over the added init. ⚠️ Entry 264's own fill constant is left DEAD by
+                // that overwrite, exactly as it is in the reference.
+                let result = vals.mint();
+                init_consts.push(DfirOp::Arith(arith::Op::Constant {
+                    result,
+                    value: *constant,
+                }));
+                added.init = result;
+                conditional_iter_args.push(added.arg);
+            } else {
+                // An inner loop initialises to the arg the enclosing loop just contributed.
+                added.init = conditional_iter_args[c];
+                conditional_iter_args[c] = added.arg;
+            }
+
+            // "For each subscript involving the iterator of the current loop, create an addOp of the
+            // new loop iterator and its coefficient" — ⭐ THE LHS IS THIS LOOP'S OWN NEW ARG, which
+            // both branches above have just put in `conditional_iter_args[c]`.
+            let coeff = per_loop.get(position).copied().unwrap_or_default();
+            if coeff == 0 {
+                continue;
+            }
+            let coeff_val = vals.mint();
+            let sum = vals.mint();
+            // `builder.setInsertionPoint(terminator)` — the two ops go before the yield.
+            let at = body.len().saturating_sub(1);
+            body.insert(
+                at,
+                DfirOp::Arith(arith::Op::Constant {
+                    result: coeff_val,
+                    value: coeff,
+                }),
+            );
+            body.insert(
+                at + 1,
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: sum,
+                    lhs: conditional_iter_args[c],
+                    rhs: coeff_val,
+                    ty: ScalarTy::Index,
+                })),
+            );
+            // `terminator->setOperand(terminator->getNumOperands() - num_args + c, add_op)`.
+            if let Some(
+                DfirOp::Affine(affine::Op::Yield { operands })
+                | DfirOp::Scf(scf::Op::Yield { operands }),
+            ) = body.last_mut()
+            {
+                let yielded = operands.len().saturating_sub(num_args) + c;
+                if let Some(place) = operands.get_mut(yielded) {
+                    *place = sum;
+                }
+            }
+        }
+
+        // `curr_loop->erase()` — the new loop takes its place, both sets of constants before it.
+        let mut replacement = grown.consts;
+        replacement.extend(init_consts);
+        replacement.push(new_loop);
+        ops.splice(ordinal..ordinal + 1, replacement);
+
+        // The `replaceAllUsesWith` entry 264 hands back for its caller to apply (`Utils.cpp:82-83`).
+        for (old, new) in &grown.replacements {
+            dialects::replace_all_uses(scope, *old, *new);
+        }
+
+        // "Update the indices to keep them in sync as we clone the loops."
+        indices[indices_idx] = new_iv;
+        let ir_map = grown.ir_map.unwrap_or_default();
+        for &later in &ordered_indices_idxs[position + 1..] {
+            // ⭐ `cast<BlockArgument>(new_index).getOwner()->getParentOp().getInductionVar()` IS the
+            // mapped value: an induction variable maps to the clone's own induction variable, so that
+            // walk back out to the owning loop is the identity. `DT_CHECK(new_index)` is the `if`.
+            if let Some(new_index) = ir_map.lookup(indices[later]) {
+                indices[later] = new_index;
+            }
+        }
+        ir_maps.push(ir_map);
+    }
+
+    IterArgsForConditionals {
+        conditional_iter_args,
+        indices,
+        ir_maps,
+    }
+}
+
+/// THE REGION PATH TO THE OP WHOSE REGION BINDS `val` — `getOwner()->getParentOp()` as a route
+/// through this island's `Vec<DfirOp>` tree, one (op ordinal, region ordinal) pair per level.
+///
+/// ⭐ THE REGION ORDINAL IS WHAT [`loop_path_of`] DROPS, and a mutable descent needs it: an
+/// `scf.if` has two regions and only one of them holds the loop.
+fn binding_path(val: Val, scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        if dialects::block_args(op).contains(&val) {
+            return Some(vec![(ordinal, 0)]);
+        }
+        for (region_ordinal, region) in dialects::regions(op).into_iter().enumerate() {
+            if let Some(rest) = binding_path(val, region) {
+                let mut path = vec![(ordinal, region_ordinal)];
+                path.extend(rest);
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+/// The list an op sits in and where in it — [`binding_path`] followed mutably.
+fn ops_at_mut<'s>(
+    scope: &'s mut Vec<DfirOp>,
+    path: &[(usize, usize)],
+) -> Option<(&'s mut Vec<DfirOp>, usize)> {
+    let (&(ordinal, region_ordinal), rest) = path.split_first()?;
+    if rest.is_empty() {
+        return Some((scope, ordinal));
+    }
+    let region = dialects::regions_mut(scope.get_mut(ordinal)?)
+        .into_iter()
+        .nth(region_ordinal)?;
+
+    ops_at_mut(region, rest)
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e294_getPageValidity
-// crustify:todo: e295_createIterArgsForConditionals
 // crustify:todo: e309_constructValidPage
 // crustify:todo: e310_analyzeValidPages
 // crustify:todo: e324_analyzeAndConstructValidPages

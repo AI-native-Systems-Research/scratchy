@@ -482,6 +482,7 @@ impl AffineApplyExpander<'_> {
             true_value,
             false_value,
             ty: ScalarTy::Index,
+            dbg_name: None,
         }));
         result
     }
