@@ -765,6 +765,7 @@ mod unit_tests {
         let if_op = DfirOp::Scf(scf::Op::If {
             cond: Val(30),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: Vec::new(),
             else_body: Vec::new(),
             dbg_name: None,
@@ -779,6 +780,7 @@ mod unit_tests {
                 predicate: arith::CmpIPredicate::Eq,
                 lhs: Val(26),
                 rhs: Val(0),
+                ty: ScalarTy::Index,
             }),
         ];
         (if_op, scope)
@@ -811,6 +813,7 @@ mod unit_tests {
             predicate: arith::CmpIPredicate::Ne,
             lhs: Val(26),
             rhs: Val(0),
+            ty: ScalarTy::Index,
         });
         assert_eq!(
             lhs_rhs_of_eq_predicate(&if_op, &scope),
@@ -957,6 +960,7 @@ mod unit_tests {
         let scf_if = DfirOp::Scf(scf::Op::If {
             cond: Val(0),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: Vec::new(),
             else_body: Vec::new(),
             dbg_name: None,
@@ -999,6 +1003,7 @@ mod unit_tests {
         let mut op = DfirOp::Scf(scf::Op::If {
             cond: Val(0),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: vec![DfirOp::Scf(scf::Op::Yield {
                 operands: Vec::new(),
             })],
@@ -1047,6 +1052,7 @@ mod unit_tests {
         let mut populated = DfirOp::Scf(scf::Op::If {
             cond: Val(0),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: Vec::new(),
             else_body: vec![DfirOp::Scf(scf::Op::Yield {
                 operands: Vec::new(),
@@ -1072,6 +1078,7 @@ mod unit_tests {
         let mut scf_yields_a_value = DfirOp::Scf(scf::Op::If {
             cond: Val(12),
             results: vec![Val(13)],
+            result_ty: ScalarTy::Index,
             body: Vec::new(),
             else_body: Vec::new(),
             dbg_name: None,
@@ -1135,6 +1142,7 @@ mod unit_tests {
                 predicate: arith::CmpIPredicate::Eq,
                 lhs: Val(21),
                 rhs: Val(8),
+                ty: ScalarTy::Index,
             }),
             // `scf.yield %1 : i1` (`:37`).
             DfirOp::Scf(scf::Op::Yield {
@@ -1173,6 +1181,7 @@ mod unit_tests {
             DfirOp::Scf(scf::Op::If {
                 cond: Val(23),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: Vec::new(),
                 else_body: Vec::new(),
                 dbg_name: None,
@@ -1227,6 +1236,7 @@ mod unit_tests {
         let with_a_dataflow_op_inside = DfirOp::Scf(scf::Op::If {
             cond: Val(23),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: vec![a_dataflow_op()],
             else_body: Vec::new(),
             dbg_name: None,
@@ -1238,6 +1248,7 @@ mod unit_tests {
         let only_in_the_else = DfirOp::Scf(scf::Op::If {
             cond: Val(23),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: Vec::new(),
             else_body: vec![a_dataflow_op()],
             dbg_name: None,
@@ -1253,6 +1264,7 @@ mod unit_tests {
             body: vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(23),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: vec![DfirOp::Scf(scf::Op::Yield {
                     operands: vec![Val(1)],
                 })],
@@ -1303,6 +1315,7 @@ mod unit_tests {
         DfirOp::Scf(scf::Op::If {
             cond: Val(12),
             results,
+            result_ty: ScalarTy::Index,
             body: arm(body, yields.0),
             else_body: else_body.map_or_else(Vec::new, |ops| arm(ops, yields.1)),
             dbg_name: Some(dbg_name.to_owned()),
@@ -1850,6 +1863,11 @@ fn is_named_harmless(op: &DfirOp) -> bool {
         // neither. It is `Pure` in MLIR (`Arith.td`, `SelectOp`) exactly as the arithmetic above is,
         // and this still answers *"has a side effect"* for it — the conservative direction.
         DfirOp::Arith(arith::Op::Select { .. }) => false,
+
+        // ⛔ A NUMERIC CONVERSION IS NOT ON THE LIST EITHER. `arith.sitofp` and `arith.fptosi` are
+        // `Pure` in MLIR like the arithmetic above and the reference's `isa<>` names neither, so a
+        // conditional does not merge across one.
+        DfirOp::Arith(arith::Op::Convert { .. }) => false,
 
         // `scf::YieldOp, scf::ForOp`.
         DfirOp::Scf(scf::Op::Yield { .. } | scf::Op::For { .. }) => true,

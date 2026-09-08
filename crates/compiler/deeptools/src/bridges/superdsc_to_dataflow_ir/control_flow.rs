@@ -25,11 +25,15 @@
 
 use std::num::NonZeroI32;
 
-use super::dsc_lowering::constant_index;
+use super::dsc_lowering::{
+    DataLocation, Factor, address_granularity_multiply_factor, constant_index,
+};
+use crate::generated::DataType;
 use crate::islands::dataflow_ir::Values;
-use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
+use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst};
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::units::DfirUnit;
 
 /// A DIMENSION THE SCHEDULE IS WRITTEN OVER — `PrimaryDimTypes` (`dsc/dims.h:34-48`).
 ///
@@ -442,6 +446,7 @@ pub fn construct_loop_for_a_dim(
         predicate: CmpIPredicate::Slt,
         lhs: parent_iv,
         rhs: parent_last,
+        ty: ScalarTy::Index,
     }));
     let ss_val = constant_index(vals, ops, ss_iters);
     let el_val = constant_index(vals, ops, el_iters);
@@ -472,11 +477,467 @@ pub fn construct_loop_for_a_dim(
         iter_args: args,
     }
 }
+/// WHAT A CONDITION COMPARES A LOOP'S ITERATOR AGAINST — `LoopCond::CondValType` (`dsc/dsc2.h:655`),
+/// carrying the `condValInt_` that only means anything for the first (`:663`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondValType {
+    /// `INT` — this literal.
+    Int(i64),
+    /// `FIRST` — the loop's lower bound.
+    First,
+    /// `LAST` — its upper bound MINUS ONE, which is the last value the iterator takes.
+    Last,
+}
 
-// crustify:todo: e054_constructConditionalOperation
-// crustify:todo: e055_constructConditionalsForSAMV
-// crustify:todo: e056_getBufferingOrStreamingMode
-// crustify:todo: e057_propagateBufferSwitchLoopsToRoot
+/// ONE `AND` TERM OF A SCHEDULE CONDITION — `LoopCond` (`dsc/dsc2.h:654-673`).
+///
+/// ⭐ `loopComp_` AND `dim_` ARE A LOOKUP, and [`mlir_loop_from_sn_loop_node`] is that lookup
+/// (`SNControlFlowLowering.cpp:92-94`), so what is carried here is its ANSWER: a term whose loop was
+/// never emitted has no iterator to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopCondition<'l> {
+    /// `condOp_` — which comparison.
+    pub op: CondOp,
+    /// `condValType_` and `condValInt_` — what it compares against.
+    pub against: CondValType,
+    /// The `affine.for` or `scf.for` whose induction variable is compared.
+    pub loop_op: &'l DfirOp,
+}
+
+/// A WHOLE SCHEDULE CONDITION — `LoopCondComposite` (`dsc/dsc2.h:675-677`): an OR of ANDs, with one
+/// negation over the lot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondComposite<'l> {
+    /// `twoLevelOrOfAnds_` — each inner list is one AND set, and the sets are OR-ed.
+    pub or_of_ands: Vec<Vec<LoopCondition<'l>>>,
+    /// `negated_`.
+    pub negated: bool,
+}
+
+/// THE ITERATOR AND THE VALUE ONE TERM COMPARES IT AGAINST, with whatever ops that value needs
+/// APPENDED to `into`.
+///
+/// ⛔ [`None`] IS BOTH REFUSALS: an `affine.for` whose bounds are not constant ("Unsupported dynamic
+/// affine loop!", `SNControlFlowLowering.cpp:116-119`) and an op that is neither loop (`:134-136`).
+///
+/// ⭐ `FIRST` ON AN `scf.for` MINTS NOTHING — its lower bound is already a value (`:128`), where an
+/// `affine.for`'s is a literal that needs an `arith.constant`; and `LAST` there is an `arith.subi`
+/// off the upper bound rather than a fold, because that bound is an SSA value (`:122-126`).
+fn compared_position(
+    vals: &mut Values,
+    into: &mut Vec<DfirOp>,
+    loop_op: &DfirOp,
+    against: CondValType,
+) -> Option<(Val, Val)> {
+    fn index_const(vals: &mut Values, into: &mut Vec<DfirOp>, value: i64) -> Val {
+        let result = vals.mint();
+        into.push(DfirOp::Arith(arith::Op::Constant { result, value }));
+        result
+    }
+
+    match *loop_op {
+        DfirOp::Affine(affine::Op::For { iv, lo, hi, .. }) => {
+            let (affine::Bound::Const(lo), affine::Bound::Const(hi)) = (lo, hi) else {
+                return None;
+            };
+            let value = match against {
+                CondValType::Int(value) => value,
+                CondValType::First => lo,
+                CondValType::Last => hi - 1,
+            };
+            Some((iv, index_const(vals, into, value)))
+        }
+        DfirOp::Scf(scf::Op::For { iv, lo, hi, .. }) => match against {
+            CondValType::Int(value) => Some((iv, index_const(vals, into, value))),
+            CondValType::First => Some((iv, lo)),
+            CondValType::Last => {
+                let one = index_const(vals, into, 1);
+                let result = vals.mint();
+                into.push(DfirOp::Arith(arith::Op::SubI(IntBinary {
+                    result,
+                    lhs: hi,
+                    rhs: one,
+                    ty: ScalarTy::Index,
+                })));
+                Some((iv, result))
+            }
+        },
+        DfirOp::Affine(_)
+        | DfirOp::Scf(_)
+        | DfirOp::Arith(_)
+        | DfirOp::Dataflow(_)
+        | DfirOp::Agen(_)
+        | DfirOp::Vector(_)
+        | DfirOp::VectorChain(_)
+        | DfirOp::Uniform(_)
+        | DfirOp::Symbol(_) => None,
+    }
+}
+
+/// ONE AND SET AS A CHAIN OF `scf.if %cmp -> (i1)`, AND THE `i1` ITS TOP BINDS.
+///
+/// ⛔⛔ THE CHAIN IS THE `AND`, AND THE INNERMOST LEVEL IS THE ONLY ONE THAT YIELDS `on_true`: every
+/// level's `then` yields the level below it and every level's `else` yields `on_false`
+/// (`SNControlFlowLowering.cpp:152-172`), so one failing term answers for the whole set.
+///
+/// ⭐ AND `on_false` IS WHERE THE `OR` LIVES — see [`conditional_operation`].
+fn and_chain(
+    vals: &mut Values,
+    conditions: &[LoopCondition<'_>],
+    name: Option<&str>,
+    on_true: Val,
+    on_false: Val,
+) -> Option<(Vec<DfirOp>, Val)> {
+    let (term, rest) = conditions.split_first()?;
+    let mut ops = Vec::new();
+    let (iterator, against) = compared_position(vals, &mut ops, term.loop_op, term.against)?;
+    let cmp = vals.mint();
+    ops.push(DfirOp::Arith(arith::Op::Compare {
+        result: cmp,
+        // ⛔ A CONDITION THAT IS NOT A COMPARISON IS "Unsupported CondOp!" (`:140-144`).
+        predicate: term.op.cmp_predicate()?,
+        lhs: iterator,
+        rhs: against,
+        ty: ScalarTy::Index,
+    }));
+    // ⭐ THE RESULT IS MINTED BEFORE THE LEVEL BELOW IS BUILT, which is the reference's creation
+    // order: this level's constant, its compare, its `scf.if`, then everything inside it.
+    let result = vals.mint();
+    let body = if rest.is_empty() {
+        vec![DfirOp::Scf(scf::Op::Yield {
+            operands: vec![on_true],
+        })]
+    } else {
+        let (inner, forwarded) = and_chain(vals, rest, name, on_true, on_false)?;
+        let mut body = inner;
+        body.push(DfirOp::Scf(scf::Op::Yield {
+            operands: vec![forwarded],
+        }));
+        body
+    };
+    ops.push(DfirOp::Scf(scf::Op::If {
+        cond: cmp,
+        results: vec![result],
+        // ⛔ `builder.getI1Type()` (`:148-150`) — NOT `index`. See [`scf::Op::If::result_ty`].
+        result_ty: ScalarTy::Int(1),
+        body,
+        else_body: vec![DfirOp::Scf(scf::Op::Yield {
+            operands: vec![on_false],
+        })],
+        dbg_name: name.map(str::to_owned),
+    }));
+    Some((ops, result))
+}
+
+/// ONE AND SET AS NESTED RESULT-LESS `scf.if`s, `body` INNERMOST.
+///
+/// ⛔ NO `else` AND NOTHING BOUND: the reference builds these with `withElseRegion = false` and
+/// keeps descending into the `then` region (`SNControlFlowLowering.cpp:255-274`), so the guarded body
+/// runs only where every term held — the same `AND` [`and_chain`] spells with results.
+fn nested_guards(
+    vals: &mut Values,
+    conditions: &[LoopCondition<'_>],
+    name: &str,
+    body: Vec<DfirOp>,
+) -> Option<Vec<DfirOp>> {
+    let (term, rest) = conditions.split_first()?;
+    let mut ops = Vec::new();
+    let (iterator, against) = compared_position(vals, &mut ops, term.loop_op, term.against)?;
+    let cmp = vals.mint();
+    ops.push(DfirOp::Arith(arith::Op::Compare {
+        result: cmp,
+        predicate: term.op.cmp_predicate()?,
+        lhs: iterator,
+        rhs: against,
+        ty: ScalarTy::Index,
+    }));
+    let inner = if rest.is_empty() {
+        body
+    } else {
+        nested_guards(vals, rest, name, body)?
+    };
+    ops.push(DfirOp::Scf(scf::Op::If {
+        cond: cmp,
+        // ⛔ RESULT-LESS, so `result_ty` is never printed for this one.
+        results: Vec::new(),
+        result_ty: ScalarTy::Index,
+        body: inner,
+        else_body: Vec::new(),
+        dbg_name: Some(name.to_owned()),
+    }));
+    Some(ops)
+}
+
+/// Replaces: e054_constructConditionalOperation
+///
+/// A SCHEDULE CONDITION AS `scf` OPS, with `then_body` and `else_body` already in the arms of the one
+/// conditional the reference hands its caller a builder for — [`None`] where it fails.
+///
+/// ⛔⛔ TWO SHAPES, AND AN ELSE BRANCH ALONE PICKS THE FIRST. An OR, a negation or an else region
+/// makes every AND set an `i1`-yielding [`and_chain`] under a final guard `scf.if`; a bare single AND
+/// set becomes [`nested_guards`] instead (`SNControlFlowLowering.cpp:80`, `:197`). The bodies land in
+/// the innermost `then` either way, which is why one function returns both.
+pub fn conditional_operation(
+    vals: &mut Values,
+    name: &str,
+    cond: &CondComposite<'_>,
+    then_body: Vec<DfirOp>,
+    else_body: Option<Vec<DfirOp>>,
+) -> Option<Vec<DfirOp>> {
+    if cond.or_of_ands.len() > 1 || cond.negated || else_body.is_some() {
+        let mut ops = Vec::new();
+        // The two `i1` constants, minted at the OUTER level before any chain (`:73-78`).
+        let val_true = vals.mint();
+        ops.push(DfirOp::Arith(arith::Op::ConstantInt {
+            result: val_true,
+            value: IntConst::Bool(true),
+        }));
+        let val_false = vals.mint();
+        ops.push(DfirOp::Arith(arith::Op::ConstantInt {
+            result: val_false,
+            value: IntConst::Bool(false),
+        }));
+        // ⭐⭐ THE `OR` IS THE `else` OPERAND AND THERE IS NO `arith.ori` ANYWHERE. Set 0's levels
+        // yield `val_false` when they fail and every later set's yield the PREVIOUS set's top result
+        // — `cmp_list[cmp_list.size() - 2]` (`:165-171`) — so a set that fails hands the reader back
+        // to the set before it. The tops are SIBLINGS at this level, not nested (`:87`, `:174`).
+        let mut top = None;
+        for and_set in &cond.or_of_ands {
+            let (chain, result) = and_chain(
+                vals,
+                and_set,
+                Some(name),
+                val_true,
+                top.unwrap_or(val_false),
+            )?;
+            ops.extend(chain);
+            top = Some(result);
+        }
+        // ⛔ AN EMPTY OR IS THE REFERENCE'S `cmp_list[cmp_list.size() - 1]` ON AN EMPTY VECTOR
+        // (`:176-177`), and so is an OR of empty AND sets.
+        let top = top?;
+        let guard = if cond.negated {
+            // ⛔ THE NEGATION IS A COMPARE AGAINST `val_false`, not an `arith.xori` (`:179-183`).
+            let negated = vals.mint();
+            ops.push(DfirOp::Arith(arith::Op::Compare {
+                result: negated,
+                predicate: CmpIPredicate::Eq,
+                lhs: top,
+                rhs: val_false,
+                // ⛔ `i1`, NOT `index` — both operands are the `i1`s this function built.
+                ty: ScalarTy::Int(1),
+            }));
+            negated
+        } else {
+            top
+        };
+        ops.push(DfirOp::Scf(scf::Op::If {
+            cond: guard,
+            // ⛔ THE GUARD BINDS NOTHING — `IfOp::create(builder, loc, cond, has_else_branch)` is the
+            // result-less overload (`:184-190`).
+            results: Vec::new(),
+            result_ty: ScalarTy::Index,
+            body: then_body,
+            // ⛔ AN ELSE BRANCH ASKED FOR AND LEFT EMPTY IS A BLOCK, NOT AN ABSENT REGION: the
+            // reference creates the region and hands its builder back (`:194-196`), so `Some(vec![])`
+            // becomes a region holding only its terminator — see [`scf::Op::If::else_body`].
+            else_body: match else_body {
+                None => Vec::new(),
+                Some(body) if body.is_empty() => vec![DfirOp::Scf(scf::Op::Yield {
+                    operands: Vec::new(),
+                })],
+                Some(body) => body,
+            },
+            dbg_name: Some(name.to_owned()),
+        }));
+        Some(ops)
+    } else {
+        // ⛔ AND THE TWO CONSTANTS ARE NOT EMITTED HERE, WHICH IS A DELIBERATE DIVERGENCE. The
+        // reference mints them before it knows which shape it is building (`:73-78`) and this shape
+        // reads neither, leaving two dangling `arith.constant`s in the region — the class of op
+        // `dbo-opt` refuses with "Dangling non-compute op has no use".
+        nested_guards(vals, cond.or_of_ands.first()?, name, then_body)
+    }
+}
+
+/// THE NUMERATOR AND DENOMINATOR DATA STAGES OF A LOOP — `numId_` and `denId_`
+/// (`dsc/dsc2.h:573-574`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagePair {
+    /// `numId_`.
+    pub num: i32,
+    /// `denId_`.
+    pub den: i32,
+}
+
+/// ONE LOOP OF A UNIT VIEW — `ScheduleNode::UnitView::LoopInfo` (`dsc/dsc2.h:500-505`) as far as the
+/// SAMV filter reads it, with its emitted loop resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamvLoop<'l> {
+    /// `dim_` — [`None`] for the reference's unset `PrimaryDimTypesCount`, as in [`PrimaryDim`].
+    pub dim: Option<PrimaryDim>,
+    /// `loop_->numId_` and `loop_->denId_`.
+    pub stage: StagePair,
+    /// The loop emitted for this node's `OUT` dim.
+    pub loop_op: &'l DfirOp,
+}
+
+/// Replaces: e055_constructConditionalsForSAMV
+///
+/// THE `AND` OF EVERY `OUT` LOOP BEING ON ITS LAST ITERATION, and the `i1` the OUTERMOST if binds —
+/// the guard a SUM/MAX stick's accumulated value is written out under.
+///
+/// ⛔⛔ [`None`] COVERS THE REFERENCE'S NULL `if_op` AS WELL AS ITS FAILURES. With no `OUT` loop it
+/// reports SUCCESS having assigned `if_op = nullptr` (`SNControlFlowLowering.cpp:299-302`), and its
+/// caller dereferences `if_op->getResult(0)` on both paths (`SNTransferLowering.cpp:1957-1982`) — so
+/// the null is a crash there and not a conditional-free transfer.
+pub fn conditionals_for_samv(
+    vals: &mut Values,
+    loops: &[SamvLoop<'_>],
+) -> Option<(Vec<DfirOp>, Val)> {
+    // ⭐ THE FILTER IS THE `OUT` DIM MINUS ONE STAGE PAIR, which the reference excludes by hand and
+    // without a word (`:292-296`).
+    let out_loops: Vec<LoopCondition<'_>> = loops
+        .iter()
+        .filter(|walked| {
+            walked.dim == Some(PrimaryDim::Out) && !(walked.stage.num == 0 && walked.stage.den == 1)
+        })
+        .map(|walked| LoopCondition {
+            // ⭐ ALWAYS `eq` AGAINST `LAST`: "create AND condition covering for all the last
+            // iterations" (`:303-304`).
+            op: CondOp::Eq,
+            against: CondValType::Last,
+            loop_op: walked.loop_op,
+        })
+        .collect();
+    // ⛔ THE EMPTY TEST COMES BEFORE THE TWO CONSTANTS (`:299`), so a stick with no `OUT` loop of its
+    // own mints nothing at all.
+    if out_loops.is_empty() {
+        return None;
+    }
+
+    let mut ops = Vec::new();
+    let val_true = vals.mint();
+    ops.push(DfirOp::Arith(arith::Op::ConstantInt {
+        result: val_true,
+        value: IntConst::Bool(true),
+    }));
+    let val_false = vals.mint();
+    ops.push(DfirOp::Arith(arith::Op::ConstantInt {
+        result: val_false,
+        value: IntConst::Bool(false),
+    }));
+    // ⛔ ONE AND SET, NO `dbgName`, AND NO GUARD `scf.if` AROUND IT — every `else` yields `val_false`
+    // because there is no earlier set to fall back to (`:365-367`), and the value the caller wants is
+    // the OUTERMOST if's (`:352-354`), not an innermost one.
+    let (chain, top) = and_chain(vals, &out_loops, None, val_true, val_false)?;
+    ops.extend(chain);
+    Some((ops, top))
+}
+
+/// HOW MANY BUFFERS AN ALLOCATION HAS — `AllocateNode::numBuffers_`, whose `-1` is not a count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumBuffers {
+    /// `-1` — the allocation STREAMS instead of switching between buffers.
+    Streaming,
+    /// Any other value — that many buffers to switch between.
+    Count(i32),
+}
+
+/// WHICH OF THE TWO A TRANSFER'S BUFFERS DO — the reference's `mode`, minus its `-1`, which is the
+/// [`None`] of [`buffering_or_streaming_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchMode {
+    /// `mode = 1`.
+    Buffering,
+    /// `mode = 2`.
+    Streaming,
+}
+
+/// ONE END OF A TRANSFER, AS THE BUFFER-SWITCH TEST READS IT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchSide<'a, M> {
+    /// `src_.unit_` / `via.loc_.unit_` — the unit this end sits on, which is what `comp_` is compared
+    /// against (`SNControlFlowLowering.cpp:416`, `:438`).
+    pub unit: DfirUnit,
+    /// `{comp_, storage_}` as the granularity table keys it. ⛔ NOT DERIVABLE FROM `unit`: the table
+    /// has ONE `PT` row against eight PT rows here, so the pair and the unit are two reads of one
+    /// fact and neither implies the other.
+    pub loc: DataLocation,
+    /// `bufferSwitchPosition_`, and the `numBuffers_` of the allocation behind it — [`None`] for an
+    /// end whose buffers do not switch, which is the whole test (`:417`, `:441`).
+    pub switches: Option<NumBuffers>,
+    /// `startAddr_` — the fold manager this end's addresses come out of.
+    pub start_addresses: &'a M,
+}
+
+/// WHAT A SWITCHING END ANSWERS WITH — the reference's `mode`, `start_address_map` and `factor`, set
+/// together or not at all (`SNControlFlowLowering.cpp:421-430`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BufferSwitch<'a, M> {
+    /// Buffering or streaming.
+    pub mode: SwitchMode,
+    /// The fold manager the switching end's start addresses come out of.
+    pub start_addresses: &'a M,
+    /// What a DSC address of that end is multiplied by.
+    pub factor: Factor,
+}
+
+/// Replaces: e056_getBufferingOrStreamingMode
+///
+/// THE FIRST END OF A TRANSFER ON THIS COMPONENT WHOSE BUFFERS SWITCH, or [`None`] for "neither
+/// buffering or streaming" — the reference's `mode = -1` (`SNControlFlowLowering.cpp:409`).
+///
+/// ⛔⛔ THE SOURCE IS ASKED FIRST AND A SOURCE ON THIS COMPONENT THAT DOES NOT SWITCH FALLS THROUGH
+/// to the destinations (`:415-435`), so the answer is the first SWITCHING end and not the first end
+/// found here. `precision` is the SOURCE lds's `dataFormat_` at BOTH — the reference reads its
+/// element type once, above the branch, and the destination loop reuses it (`:411-419`).
+pub fn buffering_or_streaming_mode<'a, M>(
+    comp: DfirUnit,
+    precision: DataType,
+    src: &SwitchSide<'a, M>,
+    dsts: &[SwitchSide<'a, M>],
+) -> Option<BufferSwitch<'a, M>> {
+    // ⭐ ONE SIDE PER `dstVias_` INDEX: the reference reads `dstVias_[i]` and
+    // `dstLdsAndLoopOffsets_[i]` at one index (`:437-448`), and a pairing that can slip is one a type
+    // should hold instead.
+    for side in std::iter::once(src).chain(dsts) {
+        if side.unit != comp {
+            continue;
+        }
+        let Some(buffers) = side.switches else {
+            continue;
+        };
+        return Some(BufferSwitch {
+            mode: match buffers {
+                NumBuffers::Streaming => SwitchMode::Streaming,
+                NumBuffers::Count(_) => SwitchMode::Buffering,
+            },
+            start_addresses: side.start_addresses,
+            factor: address_granularity_multiply_factor(side.loc, precision),
+        });
+    }
+    None
+}
+
+/// Replaces: e057_propagateBufferSwitchLoopsToRoot
+///
+/// EVERY SCHEDULE NODE'S SWITCHING TRANSFERS, WRITTEN ONTO IT — the driver over the schedule head's
+/// own children, whose returned vectors are DISCARDED because the result is each node's
+/// [`SwitchNode::all`] (`SNControlFlowLowering.cpp:575-589`).
+///
+/// ⛔ LOOPS ONLY AT THE TOP, unlike the three kinds the recursion descends through: the head's
+/// `dynamic_cast<const dsc2::LoopNode *>` (`:578`) skips a `CONDITION` or `BLOCK` child of the head
+/// outright, and with it everything below it. The head itself is never visited, which is why this
+/// takes the children.
+pub fn propagate_buffer_switch_loops_to_root<T: Clone>(head_children: &mut [SwitchNode<T>]) {
+    for child in head_children {
+        if child.kind == NodeKind::Loop {
+            let mut discarded: Vec<T> = Vec::new();
+            propagate_buffer_switch_loops_to_root_recursively(child, &mut discarded);
+        }
+    }
+}
 // crustify:todo: e074_getBlockingOrStreamingBufferLoopLocations
 // crustify:todo: e075_constructLoopIterArgs
 // crustify:todo: e088_constructLoopsRecursive
@@ -486,15 +947,22 @@ pub fn construct_loop_for_a_dim(
 mod unit_tests {
     use std::num::NonZeroI32;
 
+    use super::super::dsc_lowering::{DataLocation, address_granularity_multiply_factor};
     use super::{
-        Ancestor, CondOp, DimSlice, DimStages, NodeKind, ParentLoop, PrimaryDim, SwitchNode,
-        construct_loop_for_a_dim, mlir_loop_from_sn_loop_node, parent_loop,
-        propagate_buffer_switch_loops_to_root_recursively, reset_iter_arguments,
+        Ancestor, BufferSwitch, CondComposite, CondOp, CondValType, DimSlice, DimStages,
+        LoopCondition, NodeKind, NumBuffers, ParentLoop, PrimaryDim, SamvLoop, StagePair,
+        SwitchMode, SwitchNode, SwitchSide, buffering_or_streaming_mode, conditional_operation,
+        conditionals_for_samv, construct_loop_for_a_dim, mlir_loop_from_sn_loop_node, parent_loop,
+        propagate_buffer_switch_loops_to_root, propagate_buffer_switch_loops_to_root_recursively,
+        reset_iter_arguments,
     };
+    use crate::generated::DataType;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, scf};
+    use crate::islands::dataflow_ir::print::emit;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::units::DfirUnit;
 
     /// ⛔⛔ SIGNED, AND THE FIVE NON-COMPARISONS ARE NOT PREDICATES AT ALL.
     ///
@@ -800,6 +1268,7 @@ mod unit_tests {
                     predicate: CmpIPredicate::Slt,
                     lhs: Val(100),
                     rhs: Val(4),
+                    ty: ScalarTy::Index,
                 }),
                 DfirOp::Arith(arith::Op::Constant {
                     result: Val(6),
@@ -843,5 +1312,384 @@ mod unit_tests {
             })
         );
         assert_eq!(split.iter_args, vec![Val(12)]);
+    }
+
+    /// ⛔⛔ THE OR IS THE `else` OPERAND, THE NEGATION IS A COMPARE, AND THE `i1` CHAIN IS TYPED `i1`.
+    ///
+    /// Every value here is load-bearing: set 1's `else` yielding `%1` instead of set 0's top `%4`
+    /// would make the two sets an AND; the negation printed on `index` operands is "use of value
+    /// expects different type"; and a chain stated `-> (index)` while yielding `arith.constant true`
+    /// is the same refusal one rung down. The bare single set takes the OTHER shape entirely — nested
+    /// result-less ifs, and NOT the two dangling constants the reference leaves there.
+    #[test]
+    fn an_or_chains_through_the_else_and_a_bare_and_set_nests_instead() {
+        let by_four = DfirOp::Affine(affine::Op::For {
+            iv: Val(100),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        });
+        let dynamic = DfirOp::Scf(scf::Op::For {
+            iv: Val(200),
+            lo: Val(201),
+            hi: Val(202),
+            step: Val(203),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        });
+        let marker = || {
+            vec![DfirOp::Arith(arith::Op::Constant {
+                result: Val(300),
+                value: 7,
+            })]
+        };
+        let text = |ops: &[DfirOp]| {
+            let mut out = String::new();
+            for op in ops {
+                emit(&mut out, op, 0);
+            }
+            out
+        };
+
+        let mut vals = Values::default();
+        let or_of_two = CondComposite {
+            or_of_ands: vec![
+                vec![
+                    LoopCondition {
+                        op: CondOp::Eq,
+                        against: CondValType::Last,
+                        loop_op: &by_four,
+                    },
+                    LoopCondition {
+                        op: CondOp::Lt,
+                        against: CondValType::First,
+                        loop_op: &dynamic,
+                    },
+                ],
+                vec![LoopCondition {
+                    op: CondOp::Ne,
+                    against: CondValType::Int(2),
+                    loop_op: &by_four,
+                }],
+            ],
+            negated: true,
+        };
+        let ops = conditional_operation(&mut vals, "cond", &or_of_two, marker(), None)
+            .expect("two constant-bound loops and three comparisons");
+        assert_eq!(
+            text(&ops),
+            concat!(
+                "%0 = arith.constant true\n",
+                "%1 = arith.constant false\n",
+                "%2 = arith.constant 3 : index\n",
+                "%3 = arith.cmpi eq, %100, %2 : index\n",
+                "%4 = scf.if %3 -> (i1) {\n",
+                "  %5 = arith.cmpi slt, %200, %201 : index\n",
+                "  %6 = scf.if %5 -> (i1) {\n",
+                "    scf.yield %0 : i1\n",
+                "  } else {\n",
+                "    scf.yield %1 : i1\n",
+                "  } {dbgName = \"cond\"}\n",
+                "  scf.yield %6 : i1\n",
+                "} else {\n",
+                "  scf.yield %1 : i1\n",
+                "} {dbgName = \"cond\"}\n",
+                "%7 = arith.constant 2 : index\n",
+                "%8 = arith.cmpi ne, %100, %7 : index\n",
+                "%9 = scf.if %8 -> (i1) {\n",
+                "  scf.yield %0 : i1\n",
+                "} else {\n",
+                "  scf.yield %4 : i1\n",
+                "} {dbgName = \"cond\"}\n",
+                "%10 = arith.cmpi eq, %9, %1 : i1\n",
+                "scf.if %10 {\n",
+                "  %300 = arith.constant 7 : index\n",
+                "} {dbgName = \"cond\"}\n",
+            ),
+        );
+
+        // ⭐ ONE AND SET, NOT NEGATED, NO ELSE — the other shape, and the `scf.for`'s LAST is a
+        // `subi` off its upper bound where the `affine.for`'s folds to a literal.
+        let mut vals = Values::default();
+        let bare = CondComposite {
+            or_of_ands: vec![vec![
+                LoopCondition {
+                    op: CondOp::Eq,
+                    against: CondValType::Last,
+                    loop_op: &by_four,
+                },
+                LoopCondition {
+                    op: CondOp::Ge,
+                    against: CondValType::Last,
+                    loop_op: &dynamic,
+                },
+            ]],
+            negated: false,
+        };
+        let ops = conditional_operation(&mut vals, "guard", &bare, marker(), None)
+            .expect("both loops are comparable");
+        assert_eq!(
+            text(&ops),
+            concat!(
+                "%0 = arith.constant 3 : index\n",
+                "%1 = arith.cmpi eq, %100, %0 : index\n",
+                "scf.if %1 {\n",
+                "  %2 = arith.constant 1 : index\n",
+                "  %3 = arith.subi %202, %2 : index\n",
+                "  %4 = arith.cmpi sge, %200, %3 : index\n",
+                "  scf.if %4 {\n",
+                "    %300 = arith.constant 7 : index\n",
+                "  } {dbgName = \"guard\"}\n",
+                "} {dbgName = \"guard\"}\n",
+            ),
+            "no `arith.constant true`/`false` at all, and the body innermost",
+        );
+
+        // ⛔ AN ELSE BRANCH ASKED FOR AND LEFT EMPTY IS A BLOCK: `Some(vec![])` prints `} else {` and
+        // an empty pair of braces, which is a different op from no else region at all.
+        let mut vals = Values::default();
+        let ops = conditional_operation(&mut vals, "e", &bare, marker(), Some(Vec::new()))
+            .expect("an else branch alone takes the chained shape");
+        assert!(
+            text(&ops).ends_with(concat!(
+                "scf.if %4 {\n",
+                "  %300 = arith.constant 7 : index\n",
+                "} else {\n",
+                "} {dbgName = \"e\"}\n",
+            )),
+            "{}",
+            text(&ops),
+        );
+
+        // ⛔ THE THREE REFUSALS.
+        let mut vals = Values::default();
+        let open_ended = DfirOp::Affine(affine::Op::For {
+            iv: Val(100),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Val(Val(400)),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        });
+        for refused in [
+            CondComposite {
+                or_of_ands: vec![vec![LoopCondition {
+                    op: CondOp::Eq,
+                    against: CondValType::Last,
+                    loop_op: &open_ended,
+                }]],
+                negated: false,
+            },
+            CondComposite {
+                or_of_ands: vec![vec![LoopCondition {
+                    op: CondOp::Always,
+                    against: CondValType::Last,
+                    loop_op: &by_four,
+                }]],
+                negated: false,
+            },
+            CondComposite {
+                or_of_ands: Vec::new(),
+                negated: true,
+            },
+        ] {
+            assert_eq!(
+                conditional_operation(&mut vals, "no", &refused, marker(), None),
+                None,
+            );
+        }
+    }
+
+    /// ⛔⛔ THE `OUT` DIM MINUS THE `{0, 1}` STAGE PAIR, AND THE VALUE HANDED BACK IS THE OUTERMOST.
+    ///
+    /// A SAMV stick writes its accumulated value out under this guard: answering with the INNERMOST
+    /// if's result would gate the write on the innermost loop alone, and letting the `{0, 1}` loop in
+    /// would gate it on a stage the reference excludes by hand. With no `OUT` loop of its own the
+    /// reference leaves `if_op` null for a caller that dereferences it either way, which is [`None`]
+    /// here — and nothing is minted on that path.
+    #[test]
+    fn every_out_loop_but_the_excluded_stage_and_the_outermost_result() {
+        let by_four = DfirOp::Affine(affine::Op::For {
+            iv: Val(100),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        });
+        let dynamic = DfirOp::Scf(scf::Op::For {
+            iv: Val(200),
+            lo: Val(201),
+            hi: Val(202),
+            step: Val(203),
+            carried: Vec::new(),
+            body: Vec::new(),
+            dbg_name: None,
+        });
+        let loops = [
+            SamvLoop {
+                dim: Some(PrimaryDim::In),
+                stage: StagePair { num: 1, den: 2 },
+                loop_op: &by_four,
+            },
+            SamvLoop {
+                dim: Some(PrimaryDim::Out),
+                stage: StagePair { num: 0, den: 1 },
+                loop_op: &by_four,
+            },
+            SamvLoop {
+                dim: Some(PrimaryDim::Out),
+                stage: StagePair { num: 1, den: 2 },
+                loop_op: &by_four,
+            },
+            SamvLoop {
+                dim: None,
+                stage: StagePair { num: 1, den: 2 },
+                loop_op: &by_four,
+            },
+            SamvLoop {
+                dim: Some(PrimaryDim::Out),
+                stage: StagePair { num: 2, den: 3 },
+                loop_op: &dynamic,
+            },
+        ];
+
+        let mut vals = Values::default();
+        let (ops, top) = conditionals_for_samv(&mut vals, &loops).expect("two OUT loops remain");
+        let mut text = String::new();
+        for op in &ops {
+            emit(&mut text, op, 0);
+        }
+        assert_eq!(
+            text,
+            concat!(
+                "%0 = arith.constant true\n",
+                "%1 = arith.constant false\n",
+                "%2 = arith.constant 3 : index\n",
+                "%3 = arith.cmpi eq, %100, %2 : index\n",
+                "%4 = scf.if %3 -> (i1) {\n",
+                "  %5 = arith.constant 1 : index\n",
+                "  %6 = arith.subi %202, %5 : index\n",
+                "  %7 = arith.cmpi eq, %200, %6 : index\n",
+                "  %8 = scf.if %7 -> (i1) {\n",
+                "    scf.yield %0 : i1\n",
+                "  } else {\n",
+                "    scf.yield %1 : i1\n",
+                "  }\n",
+                "  scf.yield %8 : i1\n",
+                "} else {\n",
+                "  scf.yield %1 : i1\n",
+                "}\n",
+            ),
+            "no dbgName, no guard `scf.if`, and every `else` yields false",
+        );
+        assert_eq!(top, Val(4), "the OUTERMOST if, not %8");
+
+        // ⛔ AND THE REFUSAL MINTS NOTHING.
+        let issued = vals.issued();
+        assert_eq!(conditionals_for_samv(&mut vals, &loops[..2]), None);
+        assert_eq!(conditionals_for_samv(&mut vals, &[]), None);
+        assert_eq!(vals.issued(), issued);
+    }
+
+    /// ⛔⛔ THE SOURCE IS ASKED FIRST, AND A SOURCE ON THIS COMPONENT THAT DOES NOT SWITCH FALLS
+    /// THROUGH.
+    ///
+    /// Stopping at the first end found on the component would answer "neither" for a transfer whose
+    /// destination switches — no buffer switch emitted, and every iteration writing the same buffer.
+    /// `numBuffers_ == -1` is streaming and not a count, and the factor comes from the SWITCHING
+    /// end's own granularity row.
+    #[test]
+    fn the_source_is_asked_first_and_a_non_switching_one_falls_through() {
+        let precision = DataType::Sen169Fp16;
+        let src = SwitchSide {
+            unit: DfirUnit::Lxlu,
+            loc: DataLocation::LxluLx,
+            switches: None,
+            start_addresses: &"src",
+        };
+        let elsewhere = SwitchSide {
+            unit: DfirUnit::L3lu,
+            loc: DataLocation::L3luHbm,
+            switches: Some(NumBuffers::Count(4)),
+            start_addresses: &"another unit's",
+        };
+        let on_comp = SwitchSide {
+            unit: DfirUnit::Lxlu,
+            loc: DataLocation::LxluScaleReg,
+            switches: Some(NumBuffers::Count(2)),
+            start_addresses: &"dst",
+        };
+
+        let dsts = [elsewhere, on_comp];
+        assert_eq!(
+            buffering_or_streaming_mode(DfirUnit::Lxlu, precision, &src, &dsts),
+            Some(BufferSwitch {
+                mode: SwitchMode::Buffering,
+                start_addresses: &"dst",
+                factor: address_granularity_multiply_factor(DataLocation::LxluScaleReg, precision),
+            }),
+        );
+        // ⭐ A SWITCHING SOURCE WINS OVER BOTH, AND `-1` IS STREAMING.
+        let streaming = SwitchSide {
+            switches: Some(NumBuffers::Streaming),
+            ..src
+        };
+        assert_eq!(
+            buffering_or_streaming_mode(DfirUnit::Lxlu, precision, &streaming, &dsts),
+            Some(BufferSwitch {
+                mode: SwitchMode::Streaming,
+                start_addresses: &"src",
+                factor: address_granularity_multiply_factor(DataLocation::LxluLx, precision),
+            }),
+        );
+        // ⛔ AND NEITHER IS THE `mode = -1` THE REFERENCE RETURNS SUCCESS WITH.
+        assert_eq!(
+            buffering_or_streaming_mode(DfirUnit::L0lu, precision, &src, &dsts),
+            None,
+        );
+    }
+
+    /// ⛔⛔ A `CONDITION` OR `BLOCK` CHILD OF THE HEAD IS SKIPPED WITH EVERYTHING BELOW IT.
+    ///
+    /// The head's own cast admits loops only, where the recursion descends through all three kinds —
+    /// so a switching transfer under a top-level condition never reaches any node's map. Reading the
+    /// recursion's three arms as the driver's would write entries the reference does not have.
+    #[test]
+    fn only_a_loop_child_of_the_head_is_descended_into() {
+        let switching_loop = |own: &'static str| SwitchNode {
+            kind: NodeKind::Loop,
+            children: Vec::new(),
+            own: vec![own],
+            all: Vec::new(),
+        };
+        let mut children = vec![
+            SwitchNode {
+                kind: NodeKind::Loop,
+                children: vec![switching_loop("under a loop")],
+                own: vec!["the loop's own"],
+                all: Vec::new(),
+            },
+            SwitchNode {
+                kind: NodeKind::Condition,
+                children: vec![switching_loop("under a condition")],
+                own: Vec::new(),
+                all: Vec::new(),
+            },
+        ];
+
+        propagate_buffer_switch_loops_to_root(&mut children);
+
+        assert_eq!(children[0].all, vec!["under a loop", "the loop's own"]);
+        assert_eq!(children[0].children[0].all, vec!["under a loop"]);
+        assert_eq!(
+            children[1].all,
+            Vec::<&str>::new(),
+            "the head admits loops only",
+        );
+        assert_eq!(children[1].children[0].all, Vec::<&str>::new());
     }
 }

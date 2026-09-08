@@ -134,6 +134,8 @@ pub fn operands(op: &Op) -> Vec<Val> {
             // attribute. Both compared values are uses; which comparison it is, is not.
             arith::Op::Compare { lhs, rhs, .. } => reads.extend([*lhs, *rhs]),
             arith::Op::Logic { operands, .. } => reads.extend(operands.iter().copied()),
+            // ⭐ ONE OPERAND. Both printed types are the op's own; the conversion reads the input.
+            arith::Op::Convert { input, .. } => reads.push(*input),
         },
         // ⭐ A SYMBOL READS NOTHING — its id is an attribute, not an operand (`Symbol.td:59`).
         Op::Symbol(symbol::Op::CreateSymbol { .. }) => {}
@@ -371,6 +373,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             | arith::Op::Compare { result, .. }
             | arith::Op::Select { result, .. }
             | arith::Op::Logic { result, .. }
+            | arith::Op::Convert { result, .. }
             | arith::Op::DenseConstant { result, .. } => vec![*result],
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
@@ -515,6 +518,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 places.extend([&mut bin.lhs, &mut bin.rhs]);
             }
             arith::Op::Compare { lhs, rhs, .. } => places.extend([lhs, rhs]),
+            arith::Op::Convert { input, .. } => places.push(input),
             arith::Op::Select {
                 condition,
                 true_value,
@@ -707,6 +711,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | arith::Op::Compare { result, .. }
             | arith::Op::Select { result, .. }
             | arith::Op::Logic { result, .. }
+            | arith::Op::Convert { result, .. }
             | arith::Op::DenseConstant { result, .. } => vec![result],
             arith::Op::AddI(bin)
             | arith::Op::SubI(bin)
@@ -1156,6 +1161,10 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 operands.extend(reads.iter_mut());
                 results.push(result);
             }
+            arith::Op::Convert { result, input, .. } => {
+                operands.push(input);
+                results.push(result);
+            }
         },
         Op::Scf(op) => match op {
             scf::Op::Parallel { ivs, body } => {
@@ -1185,6 +1194,8 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             scf::Op::If {
                 cond,
                 results: binds,
+                // ⛔ NOT A VALUE EITHER — a type, and the walk rewrites values only.
+                result_ty: _,
                 body,
                 else_body,
                 // ⛔ NOT A VALUE, exactly as on the loop above.
@@ -1673,6 +1684,10 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 result, operands, ..
             } => {
                 vals.extend(operands.iter_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
+            }
+            arith::Op::Convert { result, input, .. } => {
+                vals.push((Role::Operand, input));
                 vals.push((Role::Result, result));
             }
         },
@@ -2180,6 +2195,7 @@ mod unit_tests {
             Op::Scf(scf::Op::If {
                 cond: Val(60),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: vec![Op::Agen(agen::Op::Yield)],
                 else_body: Vec::new(),
                 dbg_name: None,

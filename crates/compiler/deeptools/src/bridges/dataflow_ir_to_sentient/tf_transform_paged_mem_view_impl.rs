@@ -185,10 +185,12 @@ impl Condition {
                     predicate: guard.predicate,
                     lhs: guard.lhs,
                     rhs: guard.constant,
+                    ty: ScalarTy::Index,
                 }),
                 DfirOp::Scf(scf::Op::If {
                     cond: guard.cond,
                     results: Vec::new(),
+                    result_ty: ScalarTy::Index,
                     body: ops,
                     // ⛔ ONE-ARMED, WHICH IS THE `false` LAST ARGUMENT OF EVERY `scf::IfOp::create`
                     // in this file. A page a subscript cannot reach has nothing to do, not something

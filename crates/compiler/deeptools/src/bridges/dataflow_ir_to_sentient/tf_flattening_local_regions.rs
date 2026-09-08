@@ -1196,6 +1196,7 @@ mod unit_tests {
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(282),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: vec![DfirOp::Arith(arith::Op::Constant {
                     result: Val(285),
                     value: 1,
@@ -1237,6 +1238,7 @@ mod unit_tests {
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(282),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: vec![DfirOp::Arith(arith::Op::Constant {
                     result: Val(285),
                     value: 1,
@@ -1410,6 +1412,7 @@ mod unit_tests {
                 DfirOp::Scf(scf::Op::If {
                     cond: Val(282),
                     results: vec![Val(283)],
+                    result_ty: ScalarTy::Index,
                     body: vec![
                         DfirOp::Arith(arith::Op::Constant {
                             result: Val(284),
@@ -1433,6 +1436,7 @@ mod unit_tests {
                 DfirOp::Scf(scf::Op::If {
                     cond: Val(290),
                     results: Vec::new(),
+                    result_ty: ScalarTy::Index,
                     body: vec![nested],
                     else_body: Vec::new(),
                     dbg_name: Some("condition__1".to_owned()),
@@ -1748,6 +1752,7 @@ mod unit_tests {
                 DfirOp::Scf(scf::Op::If {
                     cond: Val(282),
                     results: vec![Val(283)],
+                    result_ty: ScalarTy::Index,
                     body: vec![DfirOp::Scf(scf::Op::Yield {
                         operands: vec![Val(285)],
                     })],
@@ -1815,6 +1820,7 @@ mod unit_tests {
             vec![DfirOp::Scf(scf::Op::If {
                 cond: Val(282),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: vec![DfirOp::Arith(arith::Op::Constant {
                     result: Val(285),
                     value: 1,
@@ -1896,6 +1902,7 @@ mod unit_tests {
             DfirOp::Scf(scf::Op::If {
                 cond: Val(30),
                 results: Vec::new(),
+                result_ty: ScalarTy::Index,
                 body: Vec::new(),
                 else_body: Vec::new(),
                 dbg_name: None,
@@ -1983,6 +1990,7 @@ mod unit_tests {
         let op = DfirOp::Scf(scf::Op::If {
             cond: Val(30),
             results: Vec::new(),
+            result_ty: ScalarTy::Index,
             body: Vec::new(),
             else_body: Vec::new(),
             dbg_name: None,
