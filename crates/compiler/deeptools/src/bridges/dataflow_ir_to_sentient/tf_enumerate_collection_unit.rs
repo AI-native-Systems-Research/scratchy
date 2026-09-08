@@ -63,5 +63,217 @@
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e245_enumerateCollectionUnit
 // crustify:todo: e286_runOnOperation
+
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, arith, dataflow, defining_op, regions_mut, replace_uses_of_with, results,
+    results_mut,
+};
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 245/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `it.clone(operandMap)` OVER A WHOLE BLOCK — the mapping the reference accumulates across the loop
+/// (`EnumerateCollectionUnit.cpp:73-78`), which [`crate::islands::dataflow_ir::dialects::clone_with_fresh_results`]
+/// deliberately does not do: one clone there, no remap, no regions.
+///
+/// ⛔ ORDER IS THE WHOLE OF IT. An op's operands are remapped against the values cloned BEFORE it,
+/// then its own fresh results join the map — so a body of N ops that read each other comes out
+/// self-consistent and shares nothing with the original.
+///
+/// ⚠️ A REGION'S BLOCK ARGUMENTS ARE NOT REMINTED, only the results inside it. The collection bodies
+/// this runs on carry `dataflow.program_unit`-style regions that bind none.
+fn clone_block(body: &[DfirOp], vals: &mut Values, remap: &mut Vec<(Val, Val)>) -> Vec<DfirOp> {
+    let mut out = Vec::with_capacity(body.len());
+    for op in body {
+        let mut clone = op.clone();
+        for (from, to) in remap.iter() {
+            replace_uses_of_with(&mut clone, *from, *to);
+        }
+        for region in regions_mut(&mut clone) {
+            let original = core::mem::take(region);
+            *region = clone_block(&original, vals, remap);
+        }
+        let olds = results(op);
+        for place in results_mut(&mut clone) {
+            *place = vals.mint();
+        }
+        remap.extend(olds.into_iter().zip(results(&clone)));
+        out.push(clone);
+    }
+    out
+}
+
+/// `programUnitOp.walk(..)` COLLECTING EVERY `dataflow.get_my_unit_in_collection`, then
+/// `op.replaceAllUsesWith(constIntOp.getResult()); op->erase();` (`EnumerateCollectionUnit.cpp:81-88`).
+///
+/// ⛔ TWO PASSES BECAUSE THE ERASE TAKES THE RESULT WITH IT: the worklist is gathered AS the ops are
+/// dropped, and the rewire then runs over what remains. No erased op is itself a user, so the pairwise
+/// `replaceAllUsesWith`-then-`erase` and this are the same program.
+fn replace_and_erase_my_unit(block: &mut Vec<DfirOp>, index: Val) {
+    let mut erased: Vec<Val> = Vec::new();
+    collect_and_erase_my_unit(block, &mut erased);
+    for from in erased {
+        repoint(block, from, index);
+    }
+}
+
+/// The `workList` of [`replace_and_erase_my_unit`], gathered as the ops are dropped.
+fn collect_and_erase_my_unit(block: &mut Vec<DfirOp>, erased: &mut Vec<Val>) {
+    block.retain_mut(|op| {
+        if let DfirOp::Dataflow(dataflow::Op::GetMyUnitInCollection { result, .. }) = op {
+            erased.push(*result);
+            return false;
+        }
+        for region in regions_mut(op) {
+            collect_and_erase_my_unit(region, erased);
+        }
+        true
+    });
+}
+
+/// `Value::replaceAllUsesWith` over a block and its regions.
+fn repoint(block: &mut [DfirOp], from: Val, to: Val) {
+    for op in block.iter_mut() {
+        replace_uses_of_with(op, from, to);
+        for region in regions_mut(op) {
+            repoint(region, from, to);
+        }
+    }
+}
+
+/// Replaces: e245_enumerateCollectionUnit
+///
+/// **245/384** `EnumerateCollectionUnitPass::enumerateCollectionUnit` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:34` (57L).
+///
+/// ⭐ ONE `dataflow.program_unit` PER MEMBER, each on its own `dataflow.get_unit`, each with the
+/// collection body cloned and its `get_my_unit_in_collection` folded to that member's index.
+/// ⛔ THE OPS GO WHERE THE COLLECTION STOOD — `OpBuilder builder(collectionDefinitionOp)` (`:51`) —
+/// and the collection op itself is erased by the CALLER (entry 286, `:120-121`).
+/// ⛔ THREE OF ITS OPS ARE ABSENT FROM `Dataflow.td` AND THE FILE IS IN `LLVM_OPTIONAL_SOURCES`; they
+/// were added to the island for this port — see [`dataflow::Op::GetUnitCollection`].
+/// ⛔ AN EMPTY BODY EMITS NOTHING (`:44-48`): a `Vec` region carries no terminator, so the
+/// reference's *"body is one op and that op is the terminator"* second clause IS `is_empty`.
+#[must_use]
+pub fn enumerate_collection_unit(
+    collection_definition_op: &dataflow::Op,
+    scope: &[DfirOp],
+    vals: &mut Values,
+) -> Vec<DfirOp> {
+    let dataflow::Op::ProgramCollection { unit, body } = collection_definition_op else {
+        return Vec::new();
+    };
+    // `auto type = dyn_cast<VectorType>(collectionDefinitionOp.unit().getType()); if (!type) return;`
+    // then `int nUnits = type.getShape()[0];` — the width, and the member list is what carries it.
+    let Some(DfirOp::Dataflow(dataflow::Op::GetUnitCollection { members, .. })) =
+        defining_op(*unit, scope)
+    else {
+        return Vec::new();
+    };
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    // ⛔ A COUNTED ZIP, NOT `enumerate` — `usize -> i64` wants `try_from` and `Err(` is frozen at
+    // zero in this crate (`AGENT-BRIEF.md:110`).
+    for (i, member) in (0_i64..).zip(members) {
+        // `GetUnitOp::create(builder, loc, intType, unitName)` with `name = collectionName + "-" + i`
+        // — ⛔ THE NAME IS STRUCTURAL HERE, derived from the residency and the unit by the printer.
+        let unit_val = vals.mint();
+        out.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result: unit_val,
+            residency: member.residency,
+            unit: member.unit,
+            num_folds: None,
+        }));
+
+        // `ConstantIntOp::create(builder, loc, i, intType)` — `intType` is `IntegerType::get(ctx, 32)`
+        // (`:52`).
+        let index = vals.mint();
+        out.push(DfirOp::Arith(arith::Op::ConstantInt {
+            result: index,
+            value: arith::IntConst::Int { value: i, bits: 32 },
+        }));
+
+        let mut unit_body = clone_block(body, vals, &mut Vec::new());
+        replace_and_erase_my_unit(&mut unit_body, index);
+        out.push(DfirOp::Dataflow(dataflow::Op::ProgramUnit {
+            units: vec![unit_val],
+            // The reference's `ProgramUnitOp::create` overload takes no precision.
+            precision: None,
+            body: unit_body,
+        }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod enumerate_collection_unit_tests {
+    use super::*;
+    use crate::units::{DfirUnit, Residency};
+
+    /// Two members, a body that reads its own index: each copy gets its own unit, its own literal and
+    /// its own values, and no `get_my_unit_in_collection` survives.
+    #[test]
+    fn each_member_gets_a_program_unit_whose_index_is_a_literal() {
+        let mut vals = Values::default();
+        let collection = vals.mint();
+        let my_unit = vals.mint();
+        let sum = vals.mint();
+        let scope = vec![DfirOp::Dataflow(dataflow::Op::GetUnitCollection {
+            result: collection,
+            members: vec![
+                dataflow::CollectionMember {
+                    residency: Residency::Global,
+                    unit: DfirUnit::Hbm,
+                },
+                dataflow::CollectionMember {
+                    residency: Residency::Global,
+                    unit: DfirUnit::L3lu,
+                },
+            ],
+        })];
+        let program = dataflow::Op::ProgramCollection {
+            unit: collection,
+            body: vec![
+                DfirOp::Dataflow(dataflow::Op::GetMyUnitInCollection {
+                    result: my_unit,
+                    of: collection,
+                }),
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: sum,
+                    lhs: my_unit,
+                    rhs: my_unit,
+                    ty: crate::islands::dataflow_ir::ty::ScalarTy::Int(32),
+                })),
+            ],
+        };
+
+        let out = enumerate_collection_unit(&program, &scope, &mut vals);
+        assert_eq!(out.len(), 6);
+
+        for (member, chunk) in [DfirUnit::Hbm, DfirUnit::L3lu].into_iter().zip(out.chunks(3)) {
+            let DfirOp::Dataflow(dataflow::Op::GetUnit { result, unit, .. }) = &chunk[0] else {
+                panic!("the member's unit");
+            };
+            assert_eq!(*unit, member);
+            let DfirOp::Arith(arith::Op::ConstantInt { result: index, .. }) = &chunk[1] else {
+                panic!("the member's index");
+            };
+            let DfirOp::Dataflow(dataflow::Op::ProgramUnit { units, body, .. }) = &chunk[2] else {
+                panic!("the member's program");
+            };
+            assert_eq!(units, &vec![*result]);
+            // The `get_my_unit_in_collection` is gone and the add reads the literal twice.
+            assert_eq!(body.len(), 1);
+            let DfirOp::Arith(arith::Op::AddI(add)) = &body[0] else {
+                panic!("the cloned add");
+            };
+            assert_eq!((add.lhs, add.rhs), (*index, *index));
+            assert_ne!(add.result, sum);
+        }
+    }
+}

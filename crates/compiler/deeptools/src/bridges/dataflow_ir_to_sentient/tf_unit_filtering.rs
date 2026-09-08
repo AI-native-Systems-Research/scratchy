@@ -401,7 +401,12 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::CreateGroup { .. }
             | dataflow::Op::GetLogicalMemoryView { .. }
             | dataflow::Op::GetPagedLogicalMemoryView { .. }
-            | dataflow::Op::ProgramUnit { .. },
+            | dataflow::Op::ProgramUnit { .. }
+            // ⭐ THE COLLECTION BINDERS ARE ENUMERATED AWAY BEFORE ANY FILTERING RUNS (entry 245),
+            // and none of the nineteen `isa<>` classes is one of them.
+            | dataflow::Op::GetUnitCollection { .. }
+            | dataflow::Op::GetMyUnitInCollection { .. }
+            | dataflow::Op::ProgramCollection { .. },
         )
         | DfirOp::Arith(_)
         | DfirOp::Affine(_)

@@ -2549,7 +2549,6 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e244_isHoistable
 // crustify:todo: e284_hoistCommonConditionals
 // crustify:todo: e285_replaceIfOpByIterArg
 // crustify:todo: e347_topLevelConditionsMatch
@@ -2557,3 +2556,70 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
 // crustify:todo: e349_isLoopInvariant
 // crustify:todo: e370_areShallowlyMergeable
 // crustify:todo: e371_hoistLoopInvariantConditionals
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 244/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e244_isHoistable
+///
+/// **244/384** `CFGSDataflowConditionalTree::isHoistable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:82` (9L).
+///
+/// ⛔ IT IS THE WHOLE PREFIX, NOT JUST THE OP: an op is hoistable only when nothing before it in the
+/// block would have to move past — see [`op_has_side_effect`]'s three callers.
+/// ⛔ THE FIRST CLAUSE IS A DIFFERENT QUESTION FROM THE SECOND. `to_hoist->getBlock() !=
+/// then_or_else_block` asks whether the op is in THIS block *"as opposed to a for-loop's block"*
+/// (`:112-114`); here that is the position search, and an op from elsewhere is not hoistable.
+#[must_use]
+pub fn is_hoistable(to_hoist: &DfirOp, then_or_else_block: &[DfirOp]) -> bool {
+    // `to_hoist->getBlock() != then_or_else_block || opHasSideEffect(*to_hoist)`, in that order.
+    let Some(at) = then_or_else_block
+        .iter()
+        .position(|op| core::ptr::eq(op, to_hoist))
+    else {
+        return false;
+    };
+    if op_has_side_effect(to_hoist) {
+        return false;
+    }
+
+    // `for (auto &op : ...) { if (&op == to_hoist) break; if (opHasSideEffect(op)) return false; }`
+    then_or_else_block[..at]
+        .iter()
+        .all(|op| !op_has_side_effect(op))
+}
+
+#[cfg(test)]
+mod is_hoistable_tests {
+    use super::*;
+    use crate::generated::SyncSignal;
+    use crate::islands::dataflow_ir::dialects::{Val, dataflow};
+
+    /// The vendor's own contrast, from `merging-shallow-skip.mlir`: a `dataflow.receive` standing
+    /// between the block's start and the candidate is what stops the movement (`:55-59`), while a
+    /// block of `arith.constant`s does not (`merging.mlir`).
+    #[test]
+    fn a_listed_prefix_hoists_and_an_unlisted_op_before_it_does_not() {
+        let candidate = DfirOp::Arith(arith::Op::Constant {
+            result: Val(2),
+            value: 7,
+        });
+        let harmless = DfirOp::Arith(arith::Op::Constant {
+            result: Val(0),
+            value: 1,
+        });
+        let effectful = DfirOp::Dataflow(dataflow::Op::SyncRecv {
+            from: Val(1),
+            signal: SyncSignal::InputToLxsuToLxluToSync,
+        });
+
+        let clean = vec![harmless.clone(), candidate.clone()];
+        assert!(is_hoistable(&clean[1], &clean));
+
+        let blocked = vec![effectful, candidate.clone()];
+        assert!(!is_hoistable(&blocked[1], &blocked));
+
+        // `to_hoist->getBlock() != then_or_else_block` — the same op value, another block.
+        assert!(!is_hoistable(&candidate, &clean));
+    }
+}

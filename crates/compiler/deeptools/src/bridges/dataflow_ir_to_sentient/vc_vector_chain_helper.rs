@@ -365,6 +365,11 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             | dfir_op::dataflow::Op::GetLogicalMemoryView { .. }
             | dfir_op::dataflow::Op::GetPagedLogicalMemoryView(_)
             | dfir_op::dataflow::Op::ProgramUnit { .. }
+            // The collection binders bind an `index` and a `vector<Nxindex>`, never a vector of
+            // data — see [`dfir_op::dataflow::Op::GetUnitCollection`].
+            | dfir_op::dataflow::Op::GetUnitCollection { .. }
+            | dfir_op::dataflow::Op::GetMyUnitInCollection { .. }
+            | dfir_op::dataflow::Op::ProgramCollection { .. }
             | dfir_op::dataflow::Op::SyncSend { .. }
             | dfir_op::dataflow::Op::SyncRecv { .. }
             | dfir_op::dataflow::Op::ImplicitSync { .. }

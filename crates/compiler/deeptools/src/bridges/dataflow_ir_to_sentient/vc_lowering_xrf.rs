@@ -73,7 +73,8 @@
 
 use std::collections::BTreeMap;
 
-use super::vc_vector_operands::OpId;
+use super::tf_mutable_start_addr_shifting::ElementsPerStick;
+use super::vc_vector_operands::{OpId, layout_map_and_indices, op_at};
 use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::dataflow::LocalUnit;
@@ -2580,9 +2581,604 @@ mod unit_tests {
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e240_getLayoutExpr
-// crustify:todo: e241_createForOpWithReturnValue
-// crustify:todo: e242_createIfOpWithReturnValue
-// crustify:todo: e243_insertDummyMacOp
 // crustify:todo: e345_processXrfPtrPerUnit
 // crustify:todo: e367_createXrfIndexModifOps
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 240/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE ENCLOSING `sentient.for`, AS THE TWO THINGS `getLayoutExpr` ASKS OF IT.
+///
+/// ⛔ THE PARENT LINK IS THE CALLER'S, AS EVERYWHERE IN THIS FILE — see [`Definitions`]. The
+/// reference reaches the loop twice, by `sub_op.getRhs().getParentRegion()->getParentOp()` and by
+/// walking `op->getParentRegion()` outwards (`LoweringXRF.cpp:54`, `:78-91`), and both answers are
+/// in this list: the [`OpId`] is the `layout_map` key, the [`Val`] is `getInductionVar()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnclosingLoop {
+    /// The loop's position — the `Operation *` `layout_map` is keyed by.
+    pub op: OpId,
+    /// `getInductionVar()` — what an `arith.subi`'s rhs is matched against.
+    pub iv: Val,
+}
+
+/// `layout_coeffs[i] / stick_elem_num` — *"converted to stick number"* (`LoweringXRF.cpp:61`).
+///
+/// ⭐ THE DIVISOR CANNOT BE ZERO, which is what [`ElementsPerStick`] is for, and `cast_signed` on a
+/// stick's element count is exact: a stick is 1024 bits and the widest format is 32.
+fn in_sticks(elements: i64, stick_elem_num: ElementsPerStick) -> StickOffset {
+    StickOffset(elements / stick_elem_num.elements().0.cast_signed())
+}
+
+/// Replaces: e240_getLayoutExpr
+///
+/// **240/384** `LoweringXRF::getLayoutExpr` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:28` (67L).
+///
+/// ⛔ TWO PASSES, AND THE SECOND IS WHAT MAKES THE COMPARISON TOTAL: the flattened map names only
+/// the loops the subscripts read, then EVERY enclosing loop gets a zero — see [`LayoutExpr`].
+/// ⛔ A SUBSCRIPT IS A LOOP ITERATOR ONLY THROUGH AN `arith.subi`, whose RHS is the induction
+/// variable; the reference's own TODO says the `sub_op` is a pass-ordering artefact (`:53`).
+/// ⚠️ `fullyComposeAffineMapAndOperands`/`simplifyAffineMap`/`canonicalizeMapAndOperands` are
+/// dropped as canonicalisations, with `agen_access_details.rs:2192-2205`' precedent.
+#[must_use]
+pub fn layout_expr(
+    op: &OpId,
+    scope: &[DfirOp],
+    enclosing: &[EnclosingLoop],
+    stick_elem_num: ElementsPerStick,
+) -> LayoutExpr {
+    let mut layout_expr = LayoutExpr::default();
+
+    // `auto result = getLayoutMapAndIndices(op, logical_view_map, operands, logical_view_op);` —
+    // ⛔ THE REFERENCE DISCARDS `result`, so a map it could not read leaves the default behind.
+    let Some(view) = layout_map_and_indices(op, scope) else {
+        return layout_expr;
+    };
+
+    // `getFlattenedAffineExpr(expr, operands.size(), map.getNumSymbols(), &layout_coeffs, ..)` with
+    // `DT_CHECK(layout_coeffs.size() == operands.size() + 1)` — [`AffineMap::coefficients`] is that
+    // row, dims then symbols then the constant.
+    let layout_coeffs = view.layout_map.coefficients(0);
+
+    for (i, operand) in view.operands.iter().enumerate() {
+        // `operands[i].getDefiningOp<mlir::arith::SubIOp>()`
+        let Some(DfirOp::Arith(arith::Op::SubI(sub_op))) = defining_op(*operand, scope) else {
+            continue;
+        };
+        // `auto for_op = sub_op.getRhs().getParentRegion()->getParentOp();` and the
+        // `DT_CHECK_MSG(isa<sentient::ForOp>(for_op), "indices must be constant or for loop
+        // iterator")` beside it.
+        let Some(driving) = enclosing.iter().find(|loop_| loop_.iv == sub_op.rhs) else {
+            todo!("getLayoutExpr: subscript {operand:?} is neither a constant nor a loop iterator");
+        };
+        let Some(coeff) = layout_coeffs.get(i) else {
+            continue;
+        };
+        layout_expr
+            .layout_map
+            .insert(driving.op.clone(), in_sticks(*coeff, stick_elem_num));
+    }
+
+    // `int const_val = layout_coeffs.back();`
+    let mut const_val = layout_coeffs.last().copied().unwrap_or(0);
+
+    // `logical_view_op.getStartAddress().getDefiningOp()` as an `arith::ConstantIndexOp`, with the
+    // `DT_CHECK_MSG(false, "the base address .. should be constants for lowering")` `else`.
+    let start = match op_at(&view.logical_view_op, scope) {
+        Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { start, .. })) => *start,
+        other => todo!("getLayoutExpr: {other:?} is not the logical memory view of an xrf access"),
+    };
+    match defining_op(start, scope) {
+        Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => const_val += *value,
+        other => todo!("getLayoutExpr: an xrf view's base address must be constant, not {other:?}"),
+    }
+
+    // `layout_expr.constant_val += const_val / stick_elem_num;`
+    layout_expr.constant_val.0 += in_sticks(const_val, stick_elem_num).0;
+
+    // The outward region walk: *"loop iterator var that is not in layout expression has zero for
+    // coefficient"* (`:86-87`).
+    for loop_ in enclosing {
+        layout_expr.layout_map.entry(loop_.op.clone()).or_default();
+    }
+
+    layout_expr
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 241/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A LOOP OR CONDITIONAL REBUILT TO CARRY THE TWO XRF POINTERS — what entries 241 and 242 return.
+///
+/// ⭐ THE `OpBuilder` IS THE CALLER'S, so the ops the reference creates *around* the replacement
+/// come back beside it: `OpBuilder builder(for_op)` inserts before the loop
+/// (`LoweringXRF.cpp:131`), and [`Self::before`] is what goes there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrfCarryingOp {
+    /// The ops to splice in FRONT of the replacement — the two `sentient.scalar_constant`s of
+    /// entry 241, and nothing at all for entry 242.
+    pub before: Vec<sen::Op>,
+    /// The replacement itself, which the caller puts where the original stood.
+    pub op: sen::Op,
+    /// The two results it now binds, write pointer first (`Dataflow.td`'s pointer order).
+    pub pointers: XrfPtrPair,
+}
+
+/// Replaces: e241_createForOpWithReturnValue
+///
+/// **241/384** `LoweringXRF::createForOpWithReturnValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:129` (56L).
+///
+/// ⛔ THE TWO POINTERS ARE APPENDED, SO THEY ARE THE **LAST** TWO CARRIED VALUES — which is what
+/// makes entry 175's `idx` name both a yield operand and a result (`:145-146`).
+/// ⛔ THE BODY LOSES ITS `sentient.yield` AND GAINS A BARE ONE: the reference inserts an empty
+/// terminator and clones every non-yield op in front of it (`:157-176`).
+/// ⛔ THE LOCALE ARRAY IS THE OLD OP'S BUT `regIndices`/`programHeader` ARE **EMPTY** (`:151-153`),
+/// so every carried value comes back unassigned and off the program header, and the two new
+/// positions — past the end of the old array — are [`RegType::Unknown`].
+#[must_use]
+pub fn create_for_op_with_return_value(for_op: &sen::Op, vals: &mut Values) -> Option<XrfCarryingOp> {
+    let sen::Op::Sentient(sentient::Op::For {
+        iv,
+        bound,
+        carried,
+        dbg_name,
+        body,
+    }) = for_op
+    else {
+        return None;
+    };
+
+    // `sentient::ConstantOp::create(builder, loc, xrf_reg_type, 0, xrf_wr_ptr_name)` then the same
+    // for `xrfrdptr` — ⛔ THE LOCALE IS THE ONE THING THAT DISTINGUISHES THEM.
+    let mut before = Vec::new();
+    let mut inits = Vec::new();
+    for locale in [sentient::RegType::XrfWrPtr, sentient::RegType::XrfRdPtr] {
+        let result = vals.mint();
+        before.push(sen::Op::Sentient(sentient::Op::ScalarConstant {
+            value: 0,
+            result,
+            reg_locale: locale,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        }));
+        inits.push(result);
+    }
+
+    // `iter_args` is the old operand list with the two constants pushed on, and `ArrayRef<int32_t>()`
+    // / `ArrayRef<bool>()` are what drop every index and header flag.
+    let mut new_carried: Vec<sentient::Carried> = carried
+        .iter()
+        .map(|carried| sentient::Carried {
+            reg: sentient::Reg {
+                locale: carried.reg.locale,
+                index: None,
+            },
+            program_header: false,
+            ..*carried
+        })
+        .collect();
+    let mut pointers = Vec::new();
+    for init in inits {
+        let result = vals.mint();
+        new_carried.push(sentient::Carried {
+            init,
+            arg: vals.mint(),
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+        });
+        pointers.push(result);
+    }
+
+    // `for (auto &it : for_op.getBody()->getOperations()) if (!isa<sentient::YieldOp>(&it)) clone`,
+    // in front of the bare `sentient::YieldOp` the builder put there first.
+    let mut new_body: Vec<sen::Op> = body
+        .iter()
+        .filter(|op| !matches!(op, sen::Op::Sentient(sentient::Op::Yield { .. })))
+        .cloned()
+        .collect();
+    new_body.push(sen::Op::Sentient(sentient::Op::Yield {
+        results: Vec::new(),
+    }));
+
+    Some(XrfCarryingOp {
+        before,
+        // ⭐ THE `IRMapping` IS THE ONE MECHANISM DROPPED HERE. The clone exists to give the new
+        // loop fresh block arguments; reusing the originals keeps every
+        // `for_op.getResult(i).replaceAllUsesWith(new_for_op.getResult(i))` (`:180-182`) a no-op,
+        // and the old loop is erased on the next line either way.
+        op: sen::Op::Sentient(sentient::Op::For {
+            iv: *iv,
+            bound: *bound,
+            carried: new_carried,
+            dbg_name: dbg_name.clone(),
+            body: new_body,
+        }),
+        pointers: XrfPtrPair {
+            write: pointers[0],
+            read: pointers[1],
+        },
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 242/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e242_createIfOpWithReturnValue
+///
+/// **242/384** `LoweringXRF::createIfOpWithReturnValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:189` (56L).
+///
+/// ⛔ TWO RESULTS, NOT OLD PLUS TWO: `TypeRange({index, index})` REPLACES the result list (`:192`),
+/// and the old `sentient.if` this runs on binds nothing.
+/// ⛔ THE ELSE REGION IS CREATED UNCONDITIONALLY (`withElseRegion = true`, `:198`) and only CLONED
+/// INTO when the original had one (`:222`) — so a one-armed `if` comes back with a bare
+/// `sentient.yield` in its else, which in this island is what makes the region exist.
+#[must_use]
+pub fn create_if_op_with_return_value(if_op: &sen::Op, vals: &mut Values) -> Option<XrfCarryingOp> {
+    let sen::Op::Sentient(sentient::Op::If {
+        predicate,
+        lhs,
+        rhs,
+        yielded,
+        dbg_name,
+        then_body,
+        else_body,
+    }) = if_op
+    else {
+        return None;
+    };
+
+    // `TypeRange({IndexType, IndexType})` with `if_op.getRegLocales()` and an EMPTY `regIndices` —
+    // the OLD locale array read against the NEW two positions, so a locale the old op stated at that
+    // position survives and anything past its end is [`RegType::Unknown`].
+    let write = vals.mint();
+    let read = vals.mint();
+    let yielded = [write, read]
+        .into_iter()
+        .enumerate()
+        .map(|(at, result)| sentient::Yielded {
+            result,
+            reg: sentient::Reg {
+                locale: yielded
+                    .get(at)
+                    .map_or(sentient::RegType::Unknown, |old: &sentient::Yielded| {
+                        old.reg.locale
+                    }),
+                index: None,
+            },
+        })
+        .collect();
+
+    // Both regions: the non-yield ops cloned in front of a bare terminator.
+    let rebuild = |region: &[sen::Op]| {
+        let mut ops: Vec<sen::Op> = region
+            .iter()
+            .filter(|op| !matches!(op, sen::Op::Sentient(sentient::Op::Yield { .. })))
+            .cloned()
+            .collect();
+        ops.push(sen::Op::Sentient(sentient::Op::Yield {
+            results: Vec::new(),
+        }));
+        ops
+    };
+
+    Some(XrfCarryingOp {
+        // `OpBuilder builder(if_op)` creates nothing but the op itself.
+        before: Vec::new(),
+        op: sen::Op::Sentient(sentient::Op::If {
+            predicate: *predicate,
+            lhs: *lhs,
+            rhs: *rhs,
+            yielded,
+            // `if (auto orig_dbg_name = dataflow::getDbgNameAttr(if_op)) setDbgNameAttr(..)`.
+            dbg_name: dbg_name.clone(),
+            then_body: rebuild(then_body),
+            else_body: rebuild(else_body),
+        }),
+        pointers: XrfPtrPair { write, read },
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 243/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e243_insertDummyMacOp
+///
+/// **243/384** `LoweringXRF::insertDummyMacOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:312` (15L).
+///
+/// ⛔ A PLACEHOLDER THAT MUST BE ERASED — [`replace_and_erase_dummy_mac_ops`] is the other half; a
+/// surviving dummy would lower as a real MAC with all three operands on `lrf0`.
+/// ⛔ IT BINDS ONE INDEX RESULT AND CARRIES NO POINTERS: `TypeRange(IndexType)` with an empty
+/// `ValueRange()` (`:317-318`), which is what the xrf pointer is later threaded THROUGH.
+/// ⭐ THE FOUR EMPTY `ArrayAttr`s ARE THE FORWARDING LISTS, and the defaulted attributes below them
+/// are the `.td`'s own (`SentientOps.td:247-267`).
+#[must_use]
+pub fn insert_dummy_mac_op(vals: &mut Values) -> XrfPtrAdvance {
+    let mask = vals.mint();
+    let result = vals.mint();
+    let lrf0 = sentient::Port::Lrf(sentient::LrfIndex::L0);
+
+    XrfPtrAdvance {
+        ops: vec![
+            // `sentient::ConstantOp::create(*builder, loc, builder->getIndexType(), 0)` — no
+            // locale, so the `.td`'s `imm` default.
+            sen::Op::Sentient(sentient::Op::ScalarConstant {
+                value: 0,
+                result: mask,
+                reg_locale: sentient::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            sen::Op::Sentient(sentient::Op::VectorMac {
+                mask: Some(mask),
+                xrf_write_ptr: None,
+                xrf_read_ptr: None,
+                results: vec![result],
+                op_a: sentient::Operand::from(lrf0),
+                op_b: sentient::Operand::from(lrf0),
+                op_c: sentient::Operand::from(lrf0),
+                result: sentient::ResultPorts::default(),
+                mode: sentient::FmaMode::FusedMulAdd,
+                compute_precision: sentient::Precision::Fp16,
+                fold_mode: None,
+                unroll_factor: sentient::UnrollFactor::X1,
+                xrf_read_incr: 0,
+                xrf_write_incr: 0,
+                dbg_name: Some("LoweringXRF dummy Mac".to_owned()),
+            }),
+        ],
+        // `return ret.getResult(0);`
+        value: result,
+    }
+}
+
+#[cfg(test)]
+mod xrf_lowering_unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::dialects::Index;
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
+    use core::num::NonZeroU32;
+
+    /// 🎯 240/384 — ONE SUBSCRIPT DRIVEN BY A LOOP, AND A BASE ADDRESS THAT IS NOT ZERO.
+    ///
+    /// The shape of `dynamic_pt_masking.mlir:216-254`: a `vector.load` whose subscript is an
+    /// `arith.subi` on an enclosing loop's induction variable, over a view based at a constant. fp16
+    /// puts 64 elements in a stick, so a stride of 64 elements is ONE stick and a base of 128 is TWO.
+    ///
+    /// ⭐ AND THE SECOND ENCLOSING LOOP, WHICH NO SUBSCRIPT READS, COMES BACK ZERO — the second pass.
+    #[test]
+    fn a_loop_driven_subscript_is_one_stick_and_an_unread_loop_is_zero() {
+        let per_stick = ElementsPerStick::of::<Dd2>(NonZeroU32::new(16).unwrap()).unwrap();
+        let flat = MemRef {
+            shape: vec![256],
+            elem: ElemType::F16,
+        };
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 128,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(2),
+                from: Val(0),
+                start: Val(1),
+                layout: AffineMap {
+                    dims: 1,
+                    syms: 0,
+                    results: vec![AffineExpr::dim(0).times(64)],
+                },
+                ty: flat.clone(),
+            }),
+            DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                result: Val(3),
+                lhs: Val(4),
+                rhs: Val(5),
+                ty: ScalarTy::Index,
+            })),
+            DfirOp::Vector(vector::Op::Load {
+                result: Val(6),
+                base: Val(2),
+                indices: vec![Index::Val(Val(3))],
+                base_ty: flat,
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            }),
+        ];
+        let enclosing = [
+            EnclosingLoop {
+                op: OpId::at(&[0]),
+                iv: Val(5),
+            },
+            EnclosingLoop {
+                op: OpId::at(&[1]),
+                iv: Val(9),
+            },
+        ];
+
+        assert_eq!(
+            layout_expr(&OpId::at(&[3]), &scope, &enclosing, per_stick),
+            LayoutExpr {
+                layout_map: BTreeMap::from([
+                    (OpId::at(&[0]), StickOffset(1)),
+                    (OpId::at(&[1]), StickOffset(0)),
+                ]),
+                constant_val: StickOffset(2),
+            }
+        );
+    }
+
+    /// 🎯 241/384 — THE TWO POINTERS ARE APPENDED, THE INITS ARE THE TWO NEW CONSTANTS, THE BODY'S
+    /// OWN `sentient.yield` IS GONE, AND THE SURVIVING CARRIED VALUE KEEPS ONLY ITS LOCALE — the
+    /// empty `regIndices`/`programHeader` arrays.
+    #[test]
+    fn a_for_carries_two_more_values_initialised_by_the_two_locale_constants() {
+        let mut vals = Values::default();
+        let carried = sentient::Carried {
+            init: Val(1),
+            arg: Val(2),
+            result: Val(3),
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lrf,
+                index: Some(sentient::RegIndex::at::<3>()),
+            },
+            program_header: true,
+        };
+        let for_op = sen::Op::Sentient(sentient::Op::For {
+            iv: Val(4),
+            bound: Val(5),
+            carried: vec![carried],
+            dbg_name: Some("SCF-For #1".to_owned()),
+            body: vec![sen::Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(3)],
+            })],
+        });
+
+        let built = create_for_op_with_return_value(&for_op, &mut vals).expect("a `sentient.for`");
+        let locales: Vec<sentient::RegType> = built
+            .before
+            .iter()
+            .map(|op| match op {
+                sen::Op::Sentient(sentient::Op::ScalarConstant { reg_locale, .. }) => *reg_locale,
+                other => panic!("the two pointer constants, not {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            locales,
+            vec![sentient::RegType::XrfWrPtr, sentient::RegType::XrfRdPtr]
+        );
+
+        let sen::Op::Sentient(sentient::Op::For {
+            carried: new_carried,
+            dbg_name,
+            body,
+            ..
+        }) = &built.op
+        else {
+            panic!("a `sentient.for` comes back")
+        };
+        assert_eq!(
+            new_carried[0],
+            sentient::Carried {
+                reg: sentient::Reg {
+                    locale: sentient::RegType::Lrf,
+                    index: None,
+                },
+                program_header: false,
+                ..carried
+            }
+        );
+        assert_eq!(
+            (new_carried[1].result, new_carried[2].result),
+            (built.pointers.write, built.pointers.read)
+        );
+        assert_eq!(
+            (new_carried[1].init, new_carried[2].init),
+            (sen::results(&built.before[0])[0], sen::results(&built.before[1])[0])
+        );
+        assert_eq!(new_carried[2].reg.locale, sentient::RegType::Unknown);
+        assert_eq!(dbg_name.as_deref(), Some("SCF-For #1"));
+        assert_eq!(
+            body,
+            &vec![sen::Op::Sentient(sentient::Op::Yield {
+                results: Vec::new()
+            })]
+        );
+    }
+
+    /// 🎯 242/384 — THE RESULT LIST IS **REPLACED** BY THE TWO POINTERS, THE OLD LOCALE ARRAY IS READ
+    /// AGAINST THE NEW POSITIONS, AND THE ELSE REGION EXISTS EVEN THOUGH THE ORIGINAL HAD NONE.
+    #[test]
+    fn an_if_binds_exactly_the_two_pointers_and_always_gains_an_else() {
+        let mut vals = Values::default();
+        let if_op = sen::Op::Sentient(sentient::Op::If {
+            predicate: sentient::CmpPredicate::Eq,
+            lhs: Val(1),
+            rhs: Val(2),
+            yielded: vec![sentient::Yielded {
+                result: Val(3),
+                reg: sentient::Reg {
+                    locale: sentient::RegType::Lrf,
+                    index: None,
+                },
+            }],
+            dbg_name: Some("SCF-If #2".to_owned()),
+            then_body: vec![sen::Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(3)],
+            })],
+            else_body: Vec::new(),
+        });
+
+        let built = create_if_op_with_return_value(&if_op, &mut vals).expect("a `sentient.if`");
+        assert_eq!(built.before, Vec::new());
+        let sen::Op::Sentient(sentient::Op::If {
+            yielded,
+            dbg_name,
+            then_body,
+            else_body,
+            ..
+        }) = &built.op
+        else {
+            panic!("a `sentient.if` comes back")
+        };
+        let bare = vec![sen::Op::Sentient(sentient::Op::Yield {
+            results: Vec::new(),
+        })];
+        assert_eq!(
+            yielded.iter().map(|y| y.result).collect::<Vec<_>>(),
+            vec![built.pointers.write, built.pointers.read]
+        );
+        assert_eq!(
+            (yielded[0].reg.locale, yielded[1].reg.locale),
+            (sentient::RegType::Lrf, sentient::RegType::Unknown)
+        );
+        assert_eq!(dbg_name.as_deref(), Some("SCF-If #2"));
+        assert_eq!((then_body, else_body), (&bare, &bare));
+    }
+
+    /// 🎯 243/384 — A MAC ON `lrf0` THREE TIMES OVER, MASKED BY A ZERO IMMEDIATE, AND THE VALUE
+    /// HANDED BACK IS ITS RESULT.
+    #[test]
+    fn the_dummy_mac_reads_lrf0_three_times_and_yields_its_own_result() {
+        let mut vals = Values::default();
+        let advance = insert_dummy_mac_op(&mut vals);
+        let [
+            sen::Op::Sentient(sentient::Op::ScalarConstant {
+                value,
+                result: mask,
+                reg_locale,
+                ty,
+                is_symbol,
+            }),
+            sen::Op::Sentient(sentient::Op::VectorMac {
+                mask: mac_mask,
+                results,
+                op_a,
+                op_b,
+                op_c,
+                dbg_name,
+                ..
+            }),
+        ] = advance.ops.as_slice()
+        else {
+            panic!("a constant then a mac, not {:?}", advance.ops)
+        };
+        assert_eq!(
+            (*value, *reg_locale, *ty, *is_symbol),
+            (0, sentient::RegType::Imm, ScalarTy::Index, false)
+        );
+        assert_eq!(*mac_mask, Some(*mask));
+        let lrf0 = sentient::Operand::from(sentient::Port::Lrf(sentient::LrfIndex::L0));
+        assert_eq!((op_a, op_b, op_c), (&lrf0, &lrf0, &lrf0));
+        assert_eq!(dbg_name.as_deref(), Some("LoweringXRF dummy Mac"));
+        assert_eq!(results, &vec![advance.value]);
+    }
+}

@@ -389,6 +389,18 @@ impl AsyncTransferWait {
     }
 }
 
+/// ONE UNIT OF A COLLECTION — what [`Op::GetUnitCollection`] stands for, member by member.
+///
+/// ⭐ THE SAME TWO FIELDS A [`Op::GetUnit`] CARRIES, because enumerating the collection emits
+/// exactly that op per member (`EnumerateCollectionUnit.cpp:64-66`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionMember {
+    /// Where the member sits — `Op::GetUnit`'s `residency`.
+    pub residency: crate::units::Residency,
+    /// Which unit it is — `Op::GetUnit`'s `unit`.
+    pub unit: crate::units::DfirUnit,
+}
+
 /// ONE `dataflow` OPERATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -472,6 +484,55 @@ pub enum Op {
         result: Val,
         /// `$unit_ids` — the members, in the order they were named.
         unit_ids: Vec<Val>,
+    },
+
+    /// `dataflow.get_unit_collection {name} : vector<Nxindex>` — ONE HANDLE FOR N UNITS THAT RUN
+    /// ONE PROGRAM, which `EnumerateCollectionUnit` expands into N of them (entry 245).
+    ///
+    /// # ⛔⛔ ADDED FOR ENTRY 245, WHOSE THREE OPS ARE ABSENT FROM `Dataflow.td` AT THIS REVISION
+    ///
+    /// `EnumerateCollectionUnit.cpp` reads `ProgramCollectionOp`, `GetUnitCollectionOp` and
+    /// `GetMyUnitInCollectionOp`; `Dataflow.td` declares none of the three, and the pass file itself
+    /// sits in `LLVM_OPTIONAL_SOURCES` in its own `CMakeLists.txt` — it is not built. The campaign's
+    /// rule for an input the target IR cannot express is to ADD the operation rather than declare the
+    /// function unnecessary, so the shape here is taken from the pass's own uses of it.
+    ///
+    /// ⛔ THE MEMBERS, NOT A COUNT AND A NAME. The reference gets `nUnits` from
+    /// `type.getShape()[0]` and names member `i` `"<collection name>-<i>"`
+    /// (`EnumerateCollectionUnit.cpp:40`, `:63`), then hands that string to `GetUnitOp::create`. A
+    /// [`Op::GetUnit`] in this island carries no name — [`emit`] DERIVES it from the residency and
+    /// the unit — so a width alone could not produce the member units. The list is both facts.
+    GetUnitCollection {
+        /// The handle the collection is addressed by.
+        result: Val,
+        /// The units it stands for, in enumeration order: member `i` is the `i`th.
+        members: Vec<CollectionMember>,
+    },
+
+    /// `dataflow.get_my_unit_in_collection %collection : i32` — WHICH MEMBER IS RUNNING THIS BODY.
+    ///
+    /// ⭐ THE ONE OP ENTRY 245 ERASES: enumerating the collection makes the answer a literal, so
+    /// every use is re-pointed at an `arith.constant i : i32` and the op removed
+    /// (`EnumerateCollectionUnit.cpp:81-88`). See [`Op::GetUnitCollection`] on the absence from
+    /// `Dataflow.td`.
+    GetMyUnitInCollection {
+        /// The index it binds.
+        result: Val,
+        /// The collection asked about.
+        of: Val,
+    },
+
+    /// `dataflow.program_collection %collection : { .. }` — ONE BODY, N UNITS.
+    ///
+    /// ⭐ WHAT ENTRY 245 CLONES: the body is copied once per member into a [`Op::ProgramUnit`] on
+    /// that member's own unit, and the collection op is then erased by the caller
+    /// (`EnumerateCollectionUnit.cpp:69-79`, `:120-121`). See [`Op::GetUnitCollection`] on the
+    /// absence from `Dataflow.td`.
+    ProgramCollection {
+        /// The collection this program runs on — a [`Op::GetUnitCollection`] result.
+        unit: Val,
+        /// The body every member runs.
+        body: Vec<super::Op>,
     },
 
     /// `dataflow.get_logical_memory_view %unit, %start {layout_map} : index, index, memref<..>`.
@@ -645,6 +706,42 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}type = \"{spelling}\"}} : index",
                 print::val(*result),
             );
+        }
+        // ⭐ THE MEMBERS PRINT AS THE VECTOR WIDTH THE REFERENCE READS THEM BACK FROM
+        // (`type.getShape()[0]`, `EnumerateCollectionUnit.cpp:40`), with each member's derived
+        // `get_unit` name in the list — see [`Op::GetUnitCollection`] on the `Dataflow.td` absence.
+        Op::GetUnitCollection { result, members } => {
+            let names = members
+                .iter()
+                .map(|member| member.unit.spelling())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "{} = dataflow.get_unit_collection {{names = [{names}]}} : vector<{}xindex>",
+                print::val(*result),
+                members.len(),
+            );
+        }
+        Op::GetMyUnitInCollection { result, of } => {
+            let _ = writeln!(
+                out,
+                "{} = dataflow.get_my_unit_in_collection {} : i32",
+                print::val(*result),
+                print::val(*of),
+            );
+        }
+        Op::ProgramCollection { unit, body } => {
+            let _ = writeln!(
+                out,
+                "dataflow.program_collection {} : {{",
+                print::val(*unit)
+            );
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            out.push_str("}\n");
         }
         Op::GetLocalUnit { result, of, which } => {
             let _ = writeln!(

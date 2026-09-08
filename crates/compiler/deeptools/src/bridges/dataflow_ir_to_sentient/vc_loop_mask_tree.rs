@@ -79,6 +79,7 @@
 use std::collections::VecDeque;
 
 use super::vc_vector_operands::OpId;
+use crate::islands::sentient::dialects::{self as sen, sentient};
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 // THE BASE LAYER — `mlir::OperationNode` AND `mlir::OperationTreeBase`
@@ -2212,5 +2213,118 @@ mod unit_tests {
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e238_computeLoops
 // crustify:todo: e281_OperationTreeBase
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 238/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e238_computeLoops
+///
+/// **238/384** `LoopMaskTree::computeLoops` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:173` (18L).
+///
+/// ⭐ THE TREE'S ONLY CONSTRUCTOR: one node per `sentient.for`, parented by the nearest enclosing
+/// one, the top-level nests siblings under the synthetic root.
+/// ⛔ THE `op_to_node_` LOOKUP THE REFERENCE ASSERTS ON IS THE THREADED `parent` ARGUMENT — a
+/// pre-order walk already holds the enclosing loop's node, so there is nothing to look up.
+/// ⛔ ONLY `sentient::regions` IS DESCENDED, AND THAT IS TOTAL: a shared-dialect op at this rung
+/// carries a region of LOWER-rung ops, so no `sentient.for` can sit behind an `scf.if` here.
+#[must_use]
+pub fn compute_loops(unit_body: &[sen::Op]) -> LoopMaskTree {
+    // `DT_CHECK_MSG(!root_ && op_to_node_.empty())` then `root_ = new LoopMaskNode(nullptr)`: the
+    // emptiness the check asks about is this function returning a tree rather than filling one.
+    let mut base = OperationTreeBase::with_root(LoopMaskNode::SyntheticRoot);
+    let root = base.root();
+    add_loop_nodes(&mut base, unit_body, &[], 0, root);
+    LoopMaskTree { base }
+}
+
+/// [`compute_loops`]'s pre-order walk. `prefix` and `first` number the block exactly as
+/// [`OpId`] does — see `vc_vector_operands`' own recursion — and `parent` is
+/// `op->getParentOfType<sentient::ForOp>()`'s node, carried down instead of looked up.
+fn add_loop_nodes(
+    base: &mut OperationTreeBase<LoopMaskNode>,
+    scope: &[sen::Op],
+    prefix: &[u32],
+    first: u32,
+    parent: OperationNodeId,
+) {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path: Vec<u32> = prefix.to_vec();
+        path.push(first + ordinal as u32);
+
+        // `if (!isa<sentient::ForOp>(op)) return;` — a `WalkResult::advance()`, so a non-loop op is
+        // walked THROUGH and only the parenting skips it.
+        let enclosing = match op {
+            sen::Op::Sentient(sentient::Op::For { .. }) => {
+                base.push_named_child(parent, OpId::at(&path), LoopMaskNode::Loop(LMTLoopNode))
+            }
+            _ => parent,
+        };
+
+        if let sen::Op::Sentient(inner) = op {
+            let mut child = 0u32;
+            for region in sentient::regions(inner) {
+                add_loop_nodes(base, region, &path, child, enclosing);
+                child += region.len() as u32;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compute_loops_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+
+    fn a_loop(vals: &mut Values, body: Vec<sen::Op>) -> sen::Op {
+        sen::Op::Sentient(sentient::Op::For {
+            iv: vals.mint(),
+            bound: vals.mint(),
+            carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
+
+    fn a_constant(vals: &mut Values) -> sen::Op {
+        sen::Op::Sentient(sentient::Op::ScalarConstant {
+            value: 0,
+            result: vals.mint(),
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// The vendor's own shape: `dynamic_pt_masking.mlir:215-317` is two top-level `sentient.for`
+    /// nests in one program unit, the first of them holding a nested loop.
+    #[test]
+    fn the_top_level_loops_are_siblings_under_the_root_and_a_nested_loop_is_their_child() {
+        let mut vals = Values::default();
+        let body = vec![a_constant(&mut vals)];
+        let inner = a_loop(&mut vals, body);
+        let body = vec![a_constant(&mut vals), inner];
+        let outer = a_loop(&mut vals, body);
+        let second = a_loop(&mut vals, Vec::new());
+        let unit_body = vec![a_constant(&mut vals), outer, second];
+
+        let tree = compute_loops(&unit_body);
+        let root = tree.root();
+        assert_eq!(*tree.node(root), LoopMaskNode::SyntheticRoot);
+
+        let first = tree.first_child(root).expect("the first top-level loop");
+        let next = tree.next_sibling(first).expect("the second top-level loop");
+        assert_eq!(tree.operation(first), Some(&OpId::at(&[1])));
+        assert_eq!(tree.operation(next), Some(&OpId::at(&[2])));
+        assert_eq!(tree.next_sibling(next), None);
+
+        // `[1, 1]` — the second op of the outer loop's region, which is the nested loop.
+        let nested = tree.first_child(first).expect("the nested loop");
+        assert_eq!(tree.operation(nested), Some(&OpId::at(&[1, 1])));
+        assert_eq!(tree.find_node_from_op(&OpId::at(&[1, 1])), Some(nested));
+        assert_eq!(tree.first_child(nested), None);
+        assert_eq!(tree.first_child(next), None);
+    }
+}

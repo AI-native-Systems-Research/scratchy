@@ -237,8 +237,14 @@ pub fn operands(op: &Op) -> Vec<Val> {
             }
         },
         Op::Dataflow(op) => match op {
-            dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque(_) => {}
+            dataflow::Op::GetUnit { .. }
+            | dataflow::Op::Opaque(_)
+            // ⭐ A COLLECTION NAMES ITS MEMBERS AS ATTRIBUTES, NOT OPERANDS — see
+            // [`dataflow::Op::GetUnitCollection`].
+            | dataflow::Op::GetUnitCollection { .. } => {}
             dataflow::Op::GetLocalUnit { of, .. } => reads.push(*of),
+            dataflow::Op::GetMyUnitInCollection { of, .. } => reads.push(*of),
+            dataflow::Op::ProgramCollection { unit, .. } => reads.push(*unit),
             // ⭐ EVERY MEMBER IS AN OPERAND — `Variadic<Index>:$unit_ids` (`Dataflow.td:152`).
             dataflow::Op::CreateGroup { unit_ids, .. } => reads.extend(unit_ids.iter().copied()),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => reads.extend([*from, *start]),
@@ -472,11 +478,14 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::GetLocalUnit { result, .. }
             | dataflow::Op::CreateGroup { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
+            | dataflow::Op::GetUnitCollection { result, .. }
+            | dataflow::Op::GetMyUnitInCollection { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![*result],
             dataflow::Op::GetPagedLogicalMemoryView(view) => vec![view.result],
             // ⛔ `dataflow.send` HAS NO RESULT (`Dataflow.td`), which is why `getLoadConsumer`
             // returns the send op itself rather than a value.
             dataflow::Op::ProgramUnit { .. }
+            | dataflow::Op::ProgramCollection { .. }
             | dataflow::Op::Send { .. }
             | dataflow::Op::SyncSend { .. }
             | dataflow::Op::SyncRecv { .. }
@@ -625,8 +634,12 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             }
         },
         Op::Dataflow(op) => match op {
-            dataflow::Op::GetUnit { .. } | dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetUnit { .. }
+            | dataflow::Op::Opaque { .. }
+            | dataflow::Op::GetUnitCollection { .. } => {}
             dataflow::Op::GetLocalUnit { of, .. } => places.push(of),
+            dataflow::Op::GetMyUnitInCollection { of, .. } => places.push(of),
+            dataflow::Op::ProgramCollection { unit, .. } => places.push(unit),
             dataflow::Op::CreateGroup { unit_ids, .. } => places.extend(unit_ids.iter_mut()),
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => places.extend([from, start]),
             dataflow::Op::GetPagedLogicalMemoryView(view) => {
@@ -828,9 +841,12 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::GetLocalUnit { result, .. }
             | dataflow::Op::CreateGroup { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
+            | dataflow::Op::GetUnitCollection { result, .. }
+            | dataflow::Op::GetMyUnitInCollection { result, .. }
             | dataflow::Op::Receive { result, .. } => vec![result],
             dataflow::Op::GetPagedLogicalMemoryView(view) => vec![&mut view.result],
             dataflow::Op::ProgramUnit { .. }
+            | dataflow::Op::ProgramCollection { .. }
             | dataflow::Op::Send { .. }
             | dataflow::Op::SyncSend { .. }
             | dataflow::Op::SyncRecv { .. }
@@ -973,7 +989,9 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         | Op::Affine(affine::Op::If {
             body, else_body, ..
         }) => vec![body.as_slice(), else_body.as_slice()],
-        Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
+        Op::Dataflow(
+            dataflow::Op::ProgramUnit { body, .. } | dataflow::Op::ProgramCollection { body, .. },
+        ) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
         Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body.as_slice()],
         // ⛔⛔ AS MANY REGIONS AS IT HAS UNIT LISTS — `VariadicRegion<AnyRegion>:$regions`
@@ -1023,7 +1041,9 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         | Op::Affine(affine::Op::If {
             body, else_body, ..
         }) => vec![body, else_body],
-        Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
+        Op::Dataflow(
+            dataflow::Op::ProgramUnit { body, .. } | dataflow::Op::ProgramCollection { body, .. },
+        ) => vec![body],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
         Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body],
         // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
@@ -1337,8 +1357,14 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             }
         },
         Op::Dataflow(op) => match op {
-            dataflow::Op::GetUnit { result, .. } => results.push(result),
+            dataflow::Op::GetUnit { result, .. }
+            | dataflow::Op::GetUnitCollection { result, .. } => results.push(result),
             dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetMyUnitInCollection { result, of } => {
+                operands.push(of);
+                results.push(result);
+            }
+            dataflow::Op::ProgramCollection { unit, .. } => operands.push(unit),
             dataflow::Op::GetLocalUnit { result, of, .. } => {
                 operands.push(of);
                 results.push(result);
@@ -1899,8 +1925,18 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             }
         },
         Op::Dataflow(op) => match op {
-            dataflow::Op::GetUnit { result, .. } => vals.push((Role::Result, result)),
+            dataflow::Op::GetUnit { result, .. }
+            | dataflow::Op::GetUnitCollection { result, .. } => {
+                vals.push((Role::Result, result));
+            }
             dataflow::Op::Opaque { .. } => {}
+            dataflow::Op::GetMyUnitInCollection { result, of } => {
+                vals.push((Role::Operand, of));
+                vals.push((Role::Result, result));
+            }
+            dataflow::Op::ProgramCollection { unit, .. } => {
+                vals.push((Role::Operand, unit));
+            }
             dataflow::Op::GetPagedLogicalMemoryView(view) => {
                 vals.push((Role::Operand, &mut view.unit));
                 vals.push((Role::Operand, &mut view.start_addr));
