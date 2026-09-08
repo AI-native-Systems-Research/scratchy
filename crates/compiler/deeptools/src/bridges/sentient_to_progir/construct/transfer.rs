@@ -21,7 +21,9 @@
 //! | `e091_ConstructStoreInstr` | 2 | 121 | `dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp:3387` |
 
 use crate::arch::{Arch, Bounded, Elements, IsaGen};
-use crate::bridges::sentient_to_progir::construct::reg_init::add_to_regs_to_init;
+use crate::bridges::sentient_to_progir::construct::reg_init::{
+    ImmSource, add_to_regs_to_init, fill_imm_field,
+};
 use crate::bridges::sentient_to_progir::construct::{descriptive, int};
 use crate::bridges::sentient_to_progir::lower::labels_and_regs::address_scale;
 use crate::bridges::sentient_to_progir::state::{RegsToInit, UnitKey};
@@ -30,12 +32,12 @@ use crate::bridges::sentient_to_progir::uniform::instr::{
     add_entry_to_operand_map,
 };
 use crate::bridges::sentient_to_progir::utils::{LoadConsumer, proper_consumer};
-use crate::formats::DataFormat;
+use crate::formats::{Bits, DataFormat};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::progir::ty::Operand;
 use crate::islands::progir::{OpCode, OperandField};
 use crate::islands::sentient::dialects::sentient::{
-    Reg, RegIndex, RegType as SenRegType, RoutingDirection,
+    Reg, RegIndex, RegType as SenRegType, RoutingDirection, ShuffleMode,
 };
 use crate::units::{Core, DfirUnit};
 use sys_arch_spec::regfile::Component;
@@ -81,8 +83,6 @@ pub const fn normalize_burst_size<A: Arch>(burst_size: Elements, comp: Component
     }
 }
 
-// crustify:todo: e089_ConstructLoadInstr
-// crustify:todo: e090_ConstructLoadInstr
 // crustify:todo: e091_ConstructStoreInstr
 
 /// A REGISTER'S INDEX AS AN INSTRUCTION FIELD — ⛔ `-1` WHERE IT IS UNASSIGNED, which is the sentinel
@@ -924,25 +924,501 @@ pub fn construct_lrf_copy_instr(
     (instr, refused)
 }
 
+/// WHICH UNIT A NON-L3 LOAD RUNS ON — ⛔ THE L3 HALVES ARE NOT HERE, which is what retires the
+/// reference's own first line: `is_any_of(comp, L3LU, L3SU)` hands the op to
+/// [`construct_l3_load_instr`] (`:3028-3029`), so the choice belongs to the caller and cannot be
+/// re-asked inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadUnit {
+    /// `L0LU`.
+    L0lu,
+    /// `L0SU`.
+    L0su,
+    /// `LXLU`.
+    Lxlu,
+    /// `LXSU`.
+    Lxsu,
+}
+
+impl LoadUnit {
+    /// The component the shared helpers take.
+    #[must_use]
+    pub const fn component(self) -> Component {
+        match self {
+            LoadUnit::L0lu => Component::L0lu,
+            LoadUnit::L0su => Component::L0su,
+            LoadUnit::Lxlu => Component::Lxlu,
+            LoadUnit::Lxsu => Component::Lxsu,
+        }
+    }
+
+    /// Either L0 half — the `is_any_of(comp, L0LU, L0SU)` of `:3105` and `:3152`.
+    #[must_use]
+    pub const fn is_l0(self) -> bool {
+        matches!(self, LoadUnit::L0lu | LoadUnit::L0su)
+    }
+}
+
+/// HOW MANY INTERLEAVED GROUPS — ⭐ THE TYPE IS THE REFERENCE'S CHECK: *"Sentient ISA doesn't support
+/// this interleaving groups factor"* rejects 3 and anything above 4 (`:3145-3147`), so only these
+/// three factors exist. Absent is `None`, not a zero group count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterleavedGroups {
+    /// One group.
+    One,
+    /// Two groups.
+    Two,
+    /// Four groups.
+    Four,
+}
+
+impl InterleavedGroups {
+    /// ⛔ THE `group` FIELD IS AN ENCODING, NOT A COUNT: four groups is written 3 (`:3148-3149`).
+    #[must_use]
+    pub const fn encoding(self) -> i64 {
+        match self {
+            InterleavedGroups::One => 1,
+            InterleavedGroups::Two => 2,
+            InterleavedGroups::Four => 3,
+        }
+    }
+}
+
+/// WHO A NON-L3 LOAD SENDS TO — the reference's three consumer shapes (`:3193-3216`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadDestination<'a> {
+    /// The LX's own scale register — the self load. ⭐ THE REFERENCE GATES THE `self` TAG ON
+    /// `comp == LXLU` (`:3099`), and `getUnitType` reaching `LXLUSCALEREG` at all is what makes it
+    /// one, so an LXSU carrying this destination has no reference behaviour to match.
+    SelfScaleReg,
+    /// A `dataflow.get_unit` consumer — one common `consumertag`.
+    Unit(LoadConsumer),
+    /// A `uniform.query_map` consumer — one tag per unit.
+    Mapped(&'a [MappedEntry]),
+}
+
+/// ONE `sentient.load_and_send` WITH ITS REGISTERS ALREADY RESOLVED — see [`L3Load`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Load<'a> {
+    /// `mutable_addr` — ⛔ NOT A FIELD of the instruction, only a register to initialise.
+    pub mutable_addr: Reg,
+    /// `immutable_addr` — `src1` when the address is indexed rather than immediate.
+    pub immutable_addr: Reg,
+    /// `result` — which is `src0`.
+    pub result: Reg,
+    /// The constant `immutable_addr` holds, where it is a `sentient.constant` at all — ⛔ `None` IS
+    /// WHAT FORCES THE INDEXED FORM (`:3085-3087`, `:3106`), and a `uniform.query_map` immutable
+    /// address is `None` here, unlike [`construct_extract_scalar_load_instr`]'s.
+    pub immutable_const: Option<i64>,
+    /// `element_size`.
+    pub element_size: Bits,
+    /// `total_elements`.
+    pub total_elements: Elements,
+    /// `chunk_size`.
+    pub chunk_size: Elements,
+    /// `chunk_stride`.
+    pub chunk_stride: Elements,
+    /// `burst_size`.
+    pub burst: Elements,
+    /// `interleaved_group`.
+    pub groups: Option<InterleavedGroups>,
+    /// `shuffle_mode`.
+    pub shuffle: ShuffleMode,
+    /// `rotate_val`, in elements.
+    pub rotate: Option<Elements>,
+    /// `consumer`.
+    pub destination: LoadDestination<'a>,
+    /// `isUpdateMode` — the `U` in the opcode.
+    pub update: bool,
+    /// `dbgName`.
+    pub dbg_name: Option<String>,
+}
+
+/// HOW THE ADDRESS REACHES THE INSTRUCTION — the three-way branch of `:3102-3128`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadForm {
+    /// `LDST` — the immutable address is a register index in `src1`.
+    Indexed,
+    /// `LDSTI` — a scaled immediate.
+    Immediate(i64),
+    /// `LDCVTI` — the LX loading its own scale register, which borrows the convert opcode.
+    SelfConvert(i64),
+}
+
+/// WHAT A `load_and_send` COULD NOT ASK FOR — every `DT_CHECK` of `ConstructLoadInstr`, in the order
+/// the reference reaches them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadRefusal {
+    /// *"Invalid ldtype for LX unit!"* (`:3074-3075`) and the L0LU load-type switch (`:3050-3058`).
+    Ldtype {
+        /// The unit that asked.
+        unit: LoadUnit,
+        /// The load width in bytes.
+        bytes: u64,
+    },
+    /// A chunk wider than the load itself (`:3101`).
+    ChunkOverLoad {
+        /// The chunk width in bytes.
+        chunk_bytes: u64,
+        /// The load width in bytes.
+        load_bytes: u64,
+    },
+    /// A self load that a burst, an interleaving, a chunk or a non-constant address forced into the
+    /// indexed form (`:3106`).
+    SelfLoadNeedsImmediate,
+    /// A self load before SEN1P5 (`:3113`).
+    SelfLoadGeneration,
+    /// *"ldtype mode 00 only supported in LDCVTI self load"* (`:3114-3115`).
+    SelfLoadLdtype {
+        /// The load width in bytes.
+        bytes: u64,
+    },
+    /// *"Invalid chunk size for L0LU"* (`:3163`, `:3172`).
+    ChunkSize {
+        /// The chunk width in bytes.
+        bytes: u64,
+    },
+    /// *"Invalid chunk stride for L0LU"* (`:3165-3167`, `:3174`).
+    ChunkStride {
+        /// The stride in bytes.
+        bytes: u64,
+    },
+    /// A rotated self load (`:3189`).
+    SelfLoadRotated,
+    /// *"rotation size should be a multiple of 16 Bytes"* (`:3193-3194`).
+    Rotation {
+        /// The rotation in bits.
+        bits: u64,
+    },
+    /// The consumer map refused an entry.
+    Map(OperandMapRefusal),
+}
+
+/// Replaces: e089_ConstructLoadInstr
+///
+/// One `load_and_send` on an L0 or LX unit: the addressing form its immutable address and its
+/// burst/chunk/interleaving choose, then the shape fields and the consumer it sends to.
+///
+/// ⛔ THE LX SHUFFLE MODES **REWRITE** `load_type`, not just `ldtype` (`:3059-3078`) — a `2bsplat`
+/// load is two bytes wide for every check downstream, whatever its elements say.
+/// ⛔ AND A SELF LOAD BORROWS `LDCVTI` (`:3116`) with `elemidx`/`scaleidx` pinned to 0, because that
+/// opcode's own indices are unused here.
+pub fn construct_load_instr<A: Arch>(
+    unit: LoadUnit,
+    load: &Load<'_>,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> (UniformInstrInfo, Vec<LoadRefusal>) {
+    let mut refused = Vec::new();
+    if full_reg_init {
+        add_to_regs_to_init(
+            units,
+            &[load.mutable_addr, load.immutable_addr, load.result],
+            regs_to_init,
+        );
+    }
+    // `:3048-3049`.
+    let mut load_bytes = u64::from(load.element_size.0) * load.total_elements.0 / 8;
+    let mut ldtype = format!("{load_bytes}b");
+    match unit {
+        // `:3050-3058`.
+        LoadUnit::L0lu => {
+            let legal: &[u64] = match A::GEN {
+                IsaGen::Sen1p5 => &[8, 16, 32, 64],
+                IsaGen::Rcudd1a => &[2, 4, 8, 16],
+            };
+            if !legal.contains(&load_bytes) {
+                refused.push(LoadRefusal::Ldtype {
+                    unit,
+                    bytes: load_bytes,
+                });
+            }
+        }
+        // `:3059-3078` — ⛔ EACH OVERRIDE SETS BOTH.
+        LoadUnit::Lxlu => match load.shuffle {
+            ShuffleMode::Splat2B => {
+                ldtype = "2bsplat".to_owned();
+                load_bytes = 2;
+            }
+            ShuffleMode::ZeroPad16B => {
+                ldtype = "16bzpad".to_owned();
+                load_bytes = 16;
+            }
+            ShuffleMode::Splat16B => {
+                ldtype = "16bsplat".to_owned();
+                load_bytes = 16;
+            }
+            _ => {
+                if !matches!(load_bytes, 2 | 16 | 128) {
+                    refused.push(LoadRefusal::Ldtype {
+                        unit,
+                        bytes: load_bytes,
+                    });
+                }
+            }
+        },
+        LoadUnit::L0su | LoadUnit::Lxsu => {}
+    }
+    // `:3099`.
+    let self_load = unit == LoadUnit::Lxlu && load.destination == LoadDestination::SelfScaleReg;
+    // `:3101`.
+    let chunk_bytes = u64::from(load.element_size.0) * load.chunk_size.0 / 8;
+    if chunk_bytes > load_bytes {
+        refused.push(LoadRefusal::ChunkOverLoad {
+            chunk_bytes,
+            load_bytes,
+        });
+    }
+    // `:3102-3128`.
+    let indexed = load.burst.0 > 1
+        || load.groups.is_some()
+        || (unit.is_l0() && load.chunk_size != load.total_elements)
+        || load.immutable_const.is_none();
+    let scale = f64::from(address_scale::<A>(unit.component()).get());
+    let immediate =
+        |value: i64| (value as f64 * f64::from(load.element_size.0) / 8.0 / scale) as i64;
+    let form = if indexed {
+        if self_load {
+            refused.push(LoadRefusal::SelfLoadNeedsImmediate);
+        }
+        LoadForm::Indexed
+    } else {
+        let value = immediate(load.immutable_const.unwrap_or_default());
+        if self_load {
+            if !matches!(A::GEN, IsaGen::Sen1p5) {
+                refused.push(LoadRefusal::SelfLoadGeneration);
+            }
+            if load_bytes != 128 {
+                refused.push(LoadRefusal::SelfLoadLdtype { bytes: load_bytes });
+            }
+            LoadForm::SelfConvert(value)
+        } else {
+            LoadForm::Immediate(value)
+        }
+    };
+    let mut instr = UniformInstrInfo::of(match (form, load.update) {
+        (LoadForm::Indexed, false) => OpCode::LDST,
+        (LoadForm::Indexed, true) => OpCode::LDSTU,
+        (LoadForm::Immediate(_), false) => OpCode::LDSTI,
+        (LoadForm::Immediate(_), true) => OpCode::LDSTIU,
+        (LoadForm::SelfConvert(_), false) => OpCode::LDCVTI,
+        (LoadForm::SelfConvert(_), true) => OpCode::LDCVTIU,
+    });
+    // `:3082-3083`.
+    if let Some(name) = &load.dbg_name {
+        instr = instr.with_common_comment(name);
+    }
+    match form {
+        LoadForm::Indexed => {
+            instr.set_common_field(OperandField::Src1, reg_field(load.immutable_addr));
+        }
+        LoadForm::Immediate(value) => {
+            instr.set_common_field(OperandField::Imm, int(value));
+        }
+        LoadForm::SelfConvert(value) => {
+            instr.set_common_field(OperandField::Elemidx, int(0));
+            instr.set_common_field(OperandField::Scaleidx, int(0));
+            instr.set_common_field(OperandField::Imm, int(value));
+        }
+    }
+    // `:3132-3136`.
+    instr.set_common_field(OperandField::Src0, reg_field(load.result));
+    instr.set_common_field(OperandField::Ldtype, descriptive(&ldtype));
+    // `:3137-3140` — the field says "bursting", the size says how far.
+    if load.burst.0 > 1 {
+        instr.set_common_field(OperandField::Burst, int(1));
+        instr.set_common_field(
+            OperandField::Burstsize,
+            int(normalize_burst_size::<A>(load.burst, unit.component()).0 as i64),
+        );
+    }
+    // `:3142-3150`.
+    if let Some(groups) = load.groups {
+        instr.set_common_field(OperandField::Group, int(groups.encoding()));
+    }
+    if unit.is_l0() {
+        // `:3153-3156`.
+        if load.shuffle == ShuffleMode::Splat {
+            instr.set_common_field(OperandField::Splat, descriptive("splat"));
+        }
+        // `:3159-3186` — a chunked load carries its own width and stride, in bytes.
+        if load.chunk_size != load.total_elements {
+            let stride_bytes = u64::from(load.element_size.0) * load.chunk_stride.0 / 8;
+            let (sizes, strides): (&[u64], &[u64]) = match A::GEN {
+                IsaGen::Sen1p5 => (&[8, 16, 32, 64], &[8, 16, 32, 64, 96, 128, 192, 256]),
+                IsaGen::Rcudd1a => (&[2, 4], &[4, 8, 16, 32, 64]),
+            };
+            if !sizes.contains(&chunk_bytes) {
+                refused.push(LoadRefusal::ChunkSize { bytes: chunk_bytes });
+            }
+            if !strides.contains(&stride_bytes) {
+                refused.push(LoadRefusal::ChunkStride {
+                    bytes: stride_bytes,
+                });
+            }
+            instr.set_common_field(
+                OperandField::Chunksize,
+                descriptive(&format!("{chunk_bytes}b")),
+            );
+            instr.set_common_field(
+                OperandField::Chunkstride,
+                descriptive(&format!("{stride_bytes}b")),
+            );
+        }
+    } else {
+        // `:3188-3196` — the rotation arrives in elements and the field counts 16-byte steps.
+        if let Some(rotate) = load.rotate {
+            if self_load {
+                refused.push(LoadRefusal::SelfLoadRotated);
+            }
+            let bits = rotate.0 * u64::from(load.element_size.0);
+            if bits % 128 == 0 {
+                instr.set_common_field(OperandField::Rottype, int((bits / 128) as i64));
+            } else {
+                refused.push(LoadRefusal::Rotation { bits });
+            }
+        }
+        // `:3198-3216`.
+        match &load.destination {
+            LoadDestination::SelfScaleReg => {
+                instr.set_common_field(OperandField::Consumertag, descriptive("self"));
+            }
+            LoadDestination::Unit(consumer) => {
+                instr.set_common_field(OperandField::Consumertag, proper_consumer::<A>(*consumer));
+            }
+            LoadDestination::Mapped(entries) => {
+                let mapped = add_entry_to_operand_map(entries, MapMode::UnitName, 1.0);
+                refused.extend(mapped.refused.into_iter().map(LoadRefusal::Map));
+                instr.operand_map = mapped
+                    .value
+                    .into_iter()
+                    .map(|per_unit| (OperandField::Consumertag, per_unit))
+                    .collect();
+            }
+        }
+    }
+    (instr, refused)
+}
+
+/// ONE `sentient.load_and_extract_scalar` WITH ITS REGISTERS ALREADY RESOLVED.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractScalarLoad {
+    /// `mutable_addr` — a register to initialise, not a field.
+    pub mutable_addr: Reg,
+    /// `immutable_addr` — `src1` when it is not a constant at all.
+    pub immutable_addr: Reg,
+    /// `addr_result` — which is `src0`.
+    pub addr_result: Reg,
+    /// What `immutable_addr` holds where it is constant — ⭐ A `uniform.query_map` OF CONSTANTS
+    /// COUNTS AS ONE HERE (`Utils.cpp:423-443`), and it becomes the per-unit `imm` map.
+    pub immutable: Option<ImmSource>,
+    /// `element_size`.
+    pub element_size: Bits,
+    /// `total_elements`.
+    pub total_elements: Elements,
+    /// `isUpdateMode` — the `U` in the opcode.
+    pub update: bool,
+    /// `dbgName`.
+    pub dbg_name: Option<String>,
+}
+
+/// WHAT A `load_and_extract_scalar` COULD NOT ASK FOR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractScalarRefusal {
+    /// *"Invalid ldtype from load_and_extract_scalar op"* (`:3243-3245`).
+    Ldtype {
+        /// The load width in bytes.
+        bytes: u64,
+    },
+    /// The immediate map refused an entry.
+    Map(OperandMapRefusal),
+}
+
+/// Replaces: e090_ConstructLoadInstr
+///
+/// The LX loading 16 bytes and extracting one scalar from them into its own scale register.
+///
+/// ⛔ `LXLU` BY DT_CHECK (`:3229-3232`), so the component is a constant here — which is also why
+/// [`fill_imm_field`] reproduces the immediate exactly: its L0 wraparound cannot fire on the LX.
+/// ⛔ AND THE `consumertag` IS ALWAYS `self` (`:3281`), whatever the op's consumer is.
+pub fn construct_extract_scalar_load_instr<A: Arch>(
+    load: &ExtractScalarLoad,
+    units: &[UnitKey],
+    full_reg_init: bool,
+    regs_to_init: &mut RegsToInit,
+) -> (UniformInstrInfo, Vec<ExtractScalarRefusal>) {
+    let mut refused = Vec::new();
+    // `:3234-3240` — ⛔ THE ADDRESS RESULT IS NOT INITIALISED, unlike every other load's.
+    if full_reg_init {
+        add_to_regs_to_init(
+            units,
+            &[load.mutable_addr, load.immutable_addr],
+            regs_to_init,
+        );
+    }
+    // `:3242-3246`.
+    let load_bytes = u64::from(load.element_size.0) * load.total_elements.0 / 8;
+    if load_bytes != 128 {
+        refused.push(ExtractScalarRefusal::Ldtype { bytes: load_bytes });
+    }
+    let mut instr = UniformInstrInfo::of(match (load.immutable.is_some(), load.update) {
+        (true, false) => OpCode::LDSTI,
+        (true, true) => OpCode::LDSTIU,
+        (false, false) => OpCode::LDST,
+        (false, true) => OpCode::LDSTU,
+    });
+    // `:3248-3250`.
+    if let Some(name) = &load.dbg_name {
+        instr = instr.with_common_comment(name);
+    }
+    // `:3252-3271`.
+    match &load.immutable {
+        Some(source) => refused.extend(
+            fill_imm_field::<A>(
+                &mut instr,
+                OperandField::Imm,
+                source,
+                Component::Lxlu,
+                load.element_size,
+                address_scale::<A>(Component::Lxlu),
+            )
+            .into_iter()
+            .map(ExtractScalarRefusal::Map),
+        ),
+        None => {
+            instr.set_common_field(OperandField::Src1, reg_field(load.immutable_addr));
+        }
+    }
+    // `:3276-3282`.
+    instr.set_common_field(OperandField::Src0, reg_field(load.addr_result));
+    instr.set_common_field(OperandField::Ldtype, descriptive(&format!("{load_bytes}b")));
+    instr.set_common_field(OperandField::Consumertag, descriptive("self"));
+    (instr, refused)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Component, Elements, L3Half, L3Indirection, L3Load, L3LoadAndStore, L3Store, L3StoreSource,
-        LdzConst, LoadCompute, LoadComputeConsumer, LoadComputeShuffle, LoadTarget, LrfCopy,
-        LrfCopyRefusal, Peer, construct_l3_load_and_store_instr, construct_l3_load_instr,
-        construct_l3_store_instr, construct_load_compute_instr, construct_lrf_copy_instr,
+        Bits, Component, Elements, ExtractScalarLoad, ImmSource, L3Half, L3Indirection, L3Load,
+        L3LoadAndStore, L3Store, L3StoreSource, LdzConst, Load, LoadCompute, LoadComputeConsumer,
+        LoadComputeShuffle, LoadDestination, LoadTarget, LoadUnit, LrfCopy, LrfCopyRefusal,
+        MappedEntry, Peer, ShuffleMode, UnitKey, construct_extract_scalar_load_instr,
+        construct_l3_load_and_store_instr, construct_l3_load_instr, construct_l3_store_instr,
+        construct_load_compute_instr, construct_load_instr, construct_lrf_copy_instr,
         construct_zr_assign_instr, normalize_burst_size,
     };
     use crate::arch::{Arch, Bounded, Dd2, Sen1p5, Target};
     use crate::bridges::sentient_to_progir::construct::{descriptive, int};
     use crate::bridges::sentient_to_progir::state::RegsToInit;
+    use crate::bridges::sentient_to_progir::uniform::instr::MappedOp;
     use crate::bridges::sentient_to_progir::utils::{ConsumerUnit, LoadConsumer};
     use crate::islands::dataflow_ir::ty::GenericComp;
     use crate::islands::progir::{OpCode, OperandField};
     use crate::islands::sentient::dialects::sentient::{
         Reg, RegIndex, RegType as SenRegType, RoutingDirection,
     };
-    use crate::units::{Core, DfirUnit};
+    use crate::units::{Core, Corelet, DfirUnit};
 
     /// The LAR/LBR pair and the unassigned result every L3 transfer in IBM's tests carries.
     fn addrs() -> (Reg, Reg, Reg) {
@@ -1296,5 +1772,147 @@ mod unit_tests {
                 LrfCopyRefusal::UnsupportedPosition(1),
             ]
         );
+    }
+
+    /// ⭐⭐ IBM'S OWN TWO LINES: `LX_LDSTU :: burst:1 burstsize:4 consumertag:sfp ldtype:128b src0:3
+    /// src1:2` (`lx_indirect_loads_stores_composite.mlir:17`) and `LX_LDCVTI :: consumertag:self
+    /// elemidx:0 imm:256 ldtype:128b scaleidx:0 src0:0` (`sen1p5/ldcvti_self_load.mlir:8`) — ⛔ A
+    /// BURST FORCES THE INDEXED FORM even though both loads are 128 bytes wide, and the self load
+    /// borrows `LDCVTI` with both of that opcode's own indices pinned to 0.
+    #[test]
+    fn a_burst_indexes_its_address_and_a_self_load_borrows_the_convert_opcode() {
+        let at = |index| Reg {
+            locale: SenRegType::Lrf,
+            index: Some(index),
+        };
+        let sent = Load {
+            mutable_addr: at(RegIndex::at::<3>()),
+            immutable_addr: at(RegIndex::at::<2>()),
+            result: at(RegIndex::at::<3>()),
+            immutable_const: None,
+            element_size: Bits(16),
+            total_elements: Elements(64),
+            chunk_size: Elements(64),
+            chunk_stride: Elements(0),
+            burst: Elements(4),
+            groups: None,
+            shuffle: ShuffleMode::NoShuffle,
+            rotate: None,
+            destination: LoadDestination::Unit(LoadConsumer::Unit(ConsumerUnit::Pt)),
+            update: true,
+            dbg_name: None,
+        };
+        let (instr, refused) =
+            construct_load_instr::<Dd2>(LoadUnit::Lxlu, &sent, &[], false, &mut RegsToInit::new());
+        assert_eq!(refused, vec![]);
+        assert_eq!(instr.opcode, OpCode::LDSTU);
+        assert_eq!(
+            instr.common_fields,
+            vec![
+                (OperandField::Burst, int(1)),
+                (OperandField::Burstsize, int(4)),
+                (OperandField::Consumertag, descriptive("sfp")),
+                (OperandField::Ldtype, descriptive("128b")),
+                (OperandField::Src0, int(3)),
+                (OperandField::Src1, int(2)),
+            ]
+        );
+        let scale_reg = Load {
+            mutable_addr: at(RegIndex::at::<0>()),
+            immutable_addr: at(RegIndex::at::<0>()),
+            result: at(RegIndex::at::<0>()),
+            immutable_const: Some(256),
+            element_size: Bits(8),
+            total_elements: Elements(128),
+            chunk_size: Elements(0),
+            burst: Elements(0),
+            destination: LoadDestination::SelfScaleReg,
+            update: false,
+            ..sent
+        };
+        let (instr, refused) = construct_load_instr::<Sen1p5>(
+            LoadUnit::Lxlu,
+            &scale_reg,
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(refused, vec![]);
+        assert_eq!(instr.opcode, OpCode::LDCVTI);
+        assert_eq!(
+            instr.common_fields,
+            vec![
+                (OperandField::Consumertag, descriptive("self")),
+                (OperandField::Elemidx, int(0)),
+                (OperandField::Imm, int(256)),
+                (OperandField::Ldtype, descriptive("128b")),
+                (OperandField::Scaleidx, int(0)),
+                (OperandField::Src0, int(0)),
+            ],
+            "256 * 8 bits / 8 / 1"
+        );
+    }
+
+    /// ⭐⭐ IBM'S OWN LINE: `LX_LDSTI :: consumertag:self imm:4 ldtype:128b src0:0`
+    /// (`lx_indirect_loads_stores_composite.mlir:13`) with `imm:2` on the next core (`:30`) — a
+    /// `def_immutable_mapping` of `[lxlu2 -> 2, lxlu3 -> 1]` scaled by the 16-bit element size, which
+    /// ⛔ MAKES A QUERY MAP A CONSTANT HERE and puts the immediate in the operand map, not a common
+    /// field.
+    #[test]
+    fn an_extracted_scalar_load_maps_one_immediate_per_unit() {
+        let lxlu = |core| UnitKey {
+            unit: DfirUnit::Lxlu,
+            core: Core::checked(core).expect("this arch has cores 2 and 3"),
+            corelet: Corelet::checked(0),
+        };
+        let mapped = |core, value| MappedEntry {
+            key: lxlu(core),
+            fold: None,
+            value: MappedOp::Constant(value),
+        };
+        let at0 = Reg {
+            locale: SenRegType::Lrf,
+            index: Some(RegIndex::at::<0>()),
+        };
+        let (instr, refused) = construct_extract_scalar_load_instr::<Dd2>(
+            &ExtractScalarLoad {
+                mutable_addr: at0,
+                immutable_addr: at0,
+                addr_result: at0,
+                immutable: Some(ImmSource::Mapped(vec![mapped(2, 2), mapped(3, 1)])),
+                element_size: Bits(16),
+                total_elements: Elements(64),
+                update: false,
+                dbg_name: None,
+            },
+            &[],
+            false,
+            &mut RegsToInit::new(),
+        );
+        assert_eq!(refused, vec![]);
+        assert_eq!(instr.opcode, OpCode::LDSTI);
+        assert_eq!(
+            instr.common_fields,
+            vec![
+                (OperandField::Consumertag, descriptive("self")),
+                (OperandField::Ldtype, descriptive("128b")),
+                (OperandField::Src0, int(0)),
+            ]
+        );
+        assert_eq!(
+            instr
+                .operand_map
+                .iter()
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>(),
+            vec![OperandField::Imm]
+        );
+        for (core, imm) in [(2, 4), (3, 2)] {
+            assert_eq!(
+                instr.operand_map[0].1.get(lxlu(core)),
+                &int(imm),
+                "the mapped address scaled by 16 bits / 8 / 1"
+            );
+        }
     }
 }

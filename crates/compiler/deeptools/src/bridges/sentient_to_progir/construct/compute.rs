@@ -27,7 +27,7 @@ use crate::bridges::sentient_to_progir::utils::{
 use crate::islands::progir::{OpCode, OperandField};
 use crate::islands::sentient::dialects::sentient::{
     Binary, BinaryFcvt, BinaryOp, FmaMode, FoldMode, MergeWidth, Operand as SenOperand, Port,
-    Precision, ResultPorts, UnrollFactor,
+    Precision, ResultPorts, UnaryFcvt, UnaryGcvt, UnaryOp, UnrollFactor,
 };
 use sys_arch_spec::regfile::Component;
 
@@ -322,8 +322,6 @@ pub fn construct_fma_instr<A: Arch>(mac: &Mac, comp: ComputeComp) -> Fma {
     }
     Fma { instr, refused }
 }
-// crustify:todo: e087_ConstructUnaryInstr
-// crustify:todo: e088_ConstructTernaryInstr
 
 /// WHICH COMPUTE UNIT — `SenComponents` narrowed to the three an FMA runs on (`:1213,1234,1248`, `:1329`).
 ///
@@ -671,6 +669,15 @@ impl ComputeComp {
             ComputeComp::Pt => None,
             ComputeComp::Pe => Some(ComputeUnit::Pe),
             ComputeComp::Sfp => Some(ComputeUnit::Sfp),
+        }
+    }
+
+    /// The other direction — the pair a ternary instruction is already narrowed to.
+    #[must_use]
+    pub const fn of_compute_unit(unit: ComputeUnit) -> Self {
+        match unit {
+            ComputeUnit::Pe => ComputeComp::Pe,
+            ComputeUnit::Sfp => ComputeComp::Sfp,
         }
     }
 }
@@ -1365,21 +1372,573 @@ pub fn construct_binary_instr<A: Arch>(comp: ComputeComp, op: &BinaryInstrOp<'_>
     }
 }
 
+/// WHAT THE `mode` BIT REFUSED — the pair every non-FMA compute asks of its compute precision
+/// (`:2237-2246`, `:2401-2409`, `:2461-2470`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeRefusal {
+    /// *"fp32 precision only valid in SFP in DD2"*.
+    Fp32OnPe,
+    /// *"Expecting fp16 or fp32 precision in SFP or Sen1p5 PE"*.
+    Precision(Precision),
+}
+
+/// The `mode` bit, or the reason it went unwritten — ⛔ NO fp16 SUBSTITUTION HERE, unlike the binary
+/// instruction's (`:2049`): a unary or ternary op carrying no compute precision is refused instead.
+fn set_mode_bit<A: Arch>(
+    comp: ComputeComp,
+    compute: Precision,
+    instr: &mut UniformInstrInfo,
+) -> Option<ModeRefusal> {
+    if matches!(A::GEN, IsaGen::Rcudd1a) && comp == ComputeComp::Pe {
+        return (compute == Precision::Fp32).then_some(ModeRefusal::Fp32OnPe);
+    }
+    if !matches!(compute, Precision::Fp16 | Precision::Fp32) {
+        return Some(ModeRefusal::Precision(compute));
+    }
+    instr.set_common_field(OperandField::Mode, descriptive(compute.spelling()));
+    None
+}
+
+/// WHICH UNARY OPERATOR, AND WHAT IT PUTS IN `imm` — the six string tests of `:2228-2234`, resolved
+/// once. ⭐ AND THEY COVER ALL 18 [`UnaryOp`] VARIANTS, which is what retires *"Unknown unary
+/// function."* (`:2429`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnaryForm {
+    /// Everything but a reduce — the arm that plumbs operands and writes a mask (`:2236-2394`).
+    Modal(ModalUnary),
+    /// `reduction_map` — `REDUCE`, and the number it puts in `rsm_src1` (`:2219-2223`).
+    Reduce(i64),
+}
+
+/// The five families that share the operand-plumbing arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModalUnary {
+    /// `func_est_map` — `FEST`, and the estimate number (`:2214-2217`).
+    Fest(i64),
+    /// `gcvt_imm<n>`.
+    Gcvt(UnaryGcvt),
+    /// `fcvt_imm<n>`.
+    Fcvt(UnaryFcvt),
+    /// `floor` — an `ICVT` whose `imm` is chosen by the INPUT precision (`:2338`).
+    Floor,
+    /// `fast_exp` — `icvt_map`, whose only entry is 7 (`:2226`).
+    FastExp,
+}
+
+/// Which family an operator belongs to, and its number where it has one.
+const fn unary_form(unary_op: UnaryOp) -> UnaryForm {
+    match unary_op {
+        UnaryOp::ExpA => UnaryForm::Modal(ModalUnary::Fest(0)),
+        UnaryOp::ExpB => UnaryForm::Modal(ModalUnary::Fest(1)),
+        UnaryOp::Rec => UnaryForm::Modal(ModalUnary::Fest(2)),
+        UnaryOp::Ln => UnaryForm::Modal(ModalUnary::Fest(3)),
+        UnaryOp::Rsqrt => UnaryForm::Modal(ModalUnary::Fest(5)),
+        UnaryOp::SigmSlope => UnaryForm::Modal(ModalUnary::Fest(6)),
+        UnaryOp::SigmOffset => UnaryForm::Modal(ModalUnary::Fest(7)),
+        UnaryOp::TanhSlope => UnaryForm::Modal(ModalUnary::Fest(8)),
+        UnaryOp::TanhOffset => UnaryForm::Modal(ModalUnary::Fest(9)),
+        UnaryOp::GcvtImm(mode) => UnaryForm::Modal(ModalUnary::Gcvt(mode)),
+        UnaryOp::FcvtImm(mode) => UnaryForm::Modal(ModalUnary::Fcvt(mode)),
+        UnaryOp::Floor => UnaryForm::Modal(ModalUnary::Floor),
+        UnaryOp::FastExp => UnaryForm::Modal(ModalUnary::FastExp),
+        UnaryOp::ReductionAdd => UnaryForm::Reduce(1),
+        UnaryOp::ReductionMax => UnaryForm::Reduce(8),
+        UnaryOp::ReductionAbsMax => UnaryForm::Reduce(10),
+        UnaryOp::ReductionMin => UnaryForm::Reduce(12),
+        UnaryOp::ReductionAbsMin => UnaryForm::Reduce(14),
+    }
+}
+
+/// THE `sentient.vector_unary` A UNARY INSTRUCTION IS BUILT FROM — every attribute it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnaryInstrOp<'a> {
+    /// `opA`, and where it lands — [`BinaryOperand`] is the shared (slot, operand) pair.
+    pub op_a: BinaryOperand<'a>,
+    /// `$unary_op`.
+    pub unary_op: UnaryOp,
+    /// `ResultForwarding`, `ResultPrecision` and `unrollIncrResult`.
+    pub result: &'a ResultPorts,
+    /// `$ComputePrecision`.
+    pub compute_precision: Precision,
+    /// `$unrollFactor`.
+    pub unroll_factor: UnrollFactor,
+    /// `$fold_mode`.
+    pub fold_mode: Option<FoldMode>,
+    /// `getMask()`'s constant — ⛔ THE FIELD TAKES `255 -` IT (`:2391`), and the reduce arm writes no
+    /// mask at all.
+    pub mask: i64,
+    /// `$dbgName`.
+    pub dbg_name: Option<&'a str>,
+}
+
+/// WHAT A `vector_unary` COULD NOT ASK FOR — every `DT_CHECK_MSG` of `ConstructUnaryInstr`, in the
+/// order the reference reaches them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryRefusal {
+    /// The `mode` bit (`:2237-2246`, `:2401-2409`).
+    Mode(ModeRefusal),
+    /// *"`<op>` does not support input on the fly conversions"* (`:2250`, `:2333`, `:2345`, `:2398`).
+    InputConversion {
+        /// Which instruction asked.
+        opcode: OpCode,
+        /// `opAPrecision`.
+        op_a: Precision,
+        /// `$ComputePrecision`.
+        compute: Precision,
+    },
+    /// *"`<op>` does not support output on the fly conversions"* (`:2252`, `:2335`, `:2347`, `:2400`).
+    OutputConversion {
+        /// Which instruction asked.
+        opcode: OpCode,
+        /// `ResultPrecision`.
+        result: Precision,
+        /// `$ComputePrecision`.
+        compute: Precision,
+    },
+    /// *"GCVT instruction precision expected to be fp16/int16"* (`:2262-2263`).
+    GcvtComputePrecision {
+        /// `$ComputePrecision`.
+        compute: Precision,
+    },
+    /// *"Unexpected input/result precisions for GCVT mode …"* (`:2272-2287`).
+    GcvtPrecisions {
+        /// Which mode.
+        mode: UnaryGcvt,
+        /// `opAPrecision`.
+        op_a: Precision,
+        /// `ResultPrecision`.
+        result: Precision,
+    },
+    /// *"FCVT instructions only supported in SFP or in Sen1p5 PE"* (`:2296-2298`).
+    FcvtUnit {
+        /// The unit that asked.
+        unit: ComputeComp,
+    },
+    /// *"FCVT mode 5/6 only supported in Sentient1p5"* (`:2316-2317`).
+    FcvtGeneration {
+        /// Which mode.
+        mode: UnaryFcvt,
+    },
+    /// *"FCVT imm`<n>` compute precision expected to be fp32"* (`:2305-2306`, `:2318-2319`).
+    FcvtComputePrecision {
+        /// Which mode.
+        mode: UnaryFcvt,
+        /// `$ComputePrecision`.
+        compute: Precision,
+    },
+    /// *"FCVT imm`<n>` result precision expected to be fp32"* (`:2307-2308`, `:2320-2321`).
+    FcvtResultPrecision {
+        /// Which mode.
+        mode: UnaryFcvt,
+        /// `ResultPrecision`.
+        result: Precision,
+    },
+    /// *"Unexpected input precision for FCVT imm`<n>`"* (`:2309-2312`, `:2322-2323`).
+    FcvtInputPrecision {
+        /// Which mode.
+        mode: UnaryFcvt,
+        /// `opAPrecision`.
+        op_a: Precision,
+    },
+    /// The `REDUCE` source names no register — see [`construct_unary_instr`] (`:2413-2415`).
+    ReduceSource {
+        /// `opA`.
+        port: Port,
+    },
+    /// [`set_compute_input_operand`] refused the input.
+    Input(UnsupportedComputeInput),
+    /// [`set_compute_output_operands`] refused an output.
+    Output(UnsupportedComputeOutput),
+}
+
+/// A UNARY INSTRUCTION AND WHAT ITS OP COULD NOT ASK FOR — ⛔ ALWAYS AN INSTRUCTION, because every
+/// operator has an opcode here (unlike [`BinaryInstr`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnaryInstr {
+    /// The instruction.
+    pub instr: UniformInstrInfo,
+    /// The offenders, in the order the reference reaches them.
+    pub refused: Vec<UnaryRefusal>,
+}
+
+/// The pair of on-the-fly conversion checks FEST, both ICVTs and REDUCE each make word for word.
+fn unary_conversions(
+    opcode: OpCode,
+    op_a: Precision,
+    compute: Precision,
+    result: Precision,
+    refused: &mut Vec<UnaryRefusal>,
+) {
+    if op_a != compute {
+        refused.push(UnaryRefusal::InputConversion {
+            opcode,
+            op_a,
+            compute,
+        });
+    }
+    if result != compute {
+        refused.push(UnaryRefusal::OutputConversion {
+            opcode,
+            result,
+            compute,
+        });
+    }
+}
+
+/// Replaces: e087_ConstructUnaryInstr
+///
+/// One unary operator on the PE or SFP — an estimate, a convert, a floor, a fast exp or a reduce.
+///
+/// ⛔ THE REDUCE ARM SHARES NOTHING WITH THE OTHER FIVE: no operands, no mask, no `tgtrf` (`:2396-2427`).
+/// ⛔ `"R" + spelling(opA).substr(3)` NAMES NO REGISTER FOR A NON-LRF PORT — and `irf0` would collide
+/// with `lrf0` — so anything but an LRF comes back as an offender rather than a field.
+/// ⛔ AND A PINNED CONSTANT WINS ITS SLOT: `src2:0.0` and `src0:icvtconst` are written BEFORE the
+/// input operand, which leaves a filled field alone (`:2258`, `:2340`, `:2353`).
+#[must_use]
+pub fn construct_unary_instr<A: Arch>(comp: ComputeComp, op: &UnaryInstrOp<'_>) -> UnaryInstr {
+    let mut refused = Vec::new();
+    let compute = op.compute_precision;
+    let result = op.result.precision;
+    let op_a = op.op_a.operand.precision;
+    let form = unary_form(op.unary_op);
+    let mut instr = UniformInstrInfo::of(match form {
+        UnaryForm::Modal(ModalUnary::Fest(_)) => OpCode::FEST,
+        UnaryForm::Modal(ModalUnary::Gcvt(_)) => OpCode::GCVT,
+        UnaryForm::Modal(ModalUnary::Fcvt(_)) => OpCode::FCVT,
+        UnaryForm::Modal(ModalUnary::Floor | ModalUnary::FastExp) => OpCode::ICVT,
+        UnaryForm::Reduce(_) => OpCode::REDUCE,
+    });
+    // `:2209-2210`.
+    if let Some(name) = op.dbg_name {
+        instr = instr.with_common_comment(name);
+    }
+    match form {
+        // `:2396-2427` — the reduce asks its two conversion questions BEFORE the mode bit.
+        UnaryForm::Reduce(number) => {
+            unary_conversions(OpCode::REDUCE, op_a, compute, result, &mut refused);
+            refused.extend(set_mode_bit::<A>(comp, compute, &mut instr).map(UnaryRefusal::Mode));
+            // `:2413-2415` — the register is named after `opA`, and only a register file has a name.
+            match op.op_a.operand.port {
+                Port::Lrf(index) => {
+                    let reg = format!("R{}", index.get());
+                    instr.set_common_field(OperandField::RsmSrc0, descriptive(&reg));
+                    instr.set_common_field(OperandField::RsmTgtrf, descriptive(&reg));
+                }
+                port => refused.push(UnaryRefusal::ReduceSource { port }),
+            }
+            instr.set_common_field(OperandField::RsmSrc1, int(number));
+            instr.set_common_field(
+                OperandField::RsmUnroll,
+                descriptive(op.unroll_factor.spelling()),
+            );
+        }
+        UnaryForm::Modal(modal) => {
+            refused.extend(set_mode_bit::<A>(comp, compute, &mut instr).map(UnaryRefusal::Mode));
+            match modal {
+                // `:2249-2259`.
+                ModalUnary::Fest(number) => {
+                    unary_conversions(OpCode::FEST, op_a, compute, result, &mut refused);
+                    instr.set_common_field(OperandField::Imm, int(number));
+                    instr.set_common_field(OperandField::Src2, descriptive("0.0"));
+                }
+                // `:2261-2294` — ⭐ THE `default:` ARM IS UNREACHABLE: [`UnaryGcvt`] is exactly the
+                // seven modes the switch names.
+                ModalUnary::Gcvt(mode) => {
+                    if !matches!(compute, Precision::Fp16 | Precision::Int16) {
+                        refused.push(UnaryRefusal::GcvtComputePrecision { compute });
+                    }
+                    let expected = match mode {
+                        UnaryGcvt::Imm1 | UnaryGcvt::Imm2 | UnaryGcvt::Imm5 | UnaryGcvt::Imm6 => {
+                            (Precision::Fp8, Precision::Fp16)
+                        }
+                        UnaryGcvt::Imm8 => (Precision::Int4, Precision::Int16),
+                        UnaryGcvt::Imm16 => (Precision::Fp16, Precision::Bf16),
+                        UnaryGcvt::Imm17 => (Precision::Bf16, Precision::Fp16),
+                    };
+                    if (op_a, result) != expected {
+                        refused.push(UnaryRefusal::GcvtPrecisions { mode, op_a, result });
+                    }
+                    instr.set_common_field(OperandField::Imm, int(i64::from(mode.get())));
+                    instr.set_common_field(OperandField::Src2, descriptive("0.0"));
+                }
+                // `:2295-2329` — ⛔ AND NO `src2` HERE, unlike FEST and GCVT.
+                ModalUnary::Fcvt(mode) => {
+                    let sen1p5 = matches!(A::GEN, IsaGen::Sen1p5);
+                    if !(comp == ComputeComp::Sfp || (comp == ComputeComp::Pe && sen1p5)) {
+                        refused.push(UnaryRefusal::FcvtUnit { unit: comp });
+                    }
+                    // `:2314-2317` — modes 5/6 are Sen1p5 only, and they read bf16 rather than fp16.
+                    let input = match mode {
+                        UnaryFcvt::Imm0 | UnaryFcvt::Imm1 => Precision::Fp16,
+                        UnaryFcvt::Imm5 | UnaryFcvt::Imm6 => {
+                            if !sen1p5 {
+                                refused.push(UnaryRefusal::FcvtGeneration { mode });
+                            }
+                            Precision::Bf16
+                        }
+                    };
+                    if compute != Precision::Fp32 {
+                        refused.push(UnaryRefusal::FcvtComputePrecision { mode, compute });
+                    }
+                    if result != Precision::Fp32 {
+                        refused.push(UnaryRefusal::FcvtResultPrecision { mode, result });
+                    }
+                    if op_a != input {
+                        refused.push(UnaryRefusal::FcvtInputPrecision { mode, op_a });
+                    }
+                    instr.set_common_field(OperandField::Imm, int(i64::from(mode.get())));
+                }
+                // `:2331-2342` — ⭐ THE `imm` IS THE INPUT PRECISION: 1 for fp16, 9 otherwise.
+                ModalUnary::Floor => {
+                    unary_conversions(OpCode::ICVT, op_a, compute, result, &mut refused);
+                    let imm = if op_a == Precision::Fp16 { 1 } else { 9 };
+                    instr.set_common_field(OperandField::Imm, int(imm));
+                    instr.set_common_field(OperandField::Src0, descriptive("icvtconst"));
+                }
+                // `:2343-2358`.
+                ModalUnary::FastExp => {
+                    unary_conversions(OpCode::ICVT, op_a, compute, result, &mut refused);
+                    instr.set_common_field(OperandField::Imm, int(7));
+                    instr.set_common_field(OperandField::Src0, descriptive("icvtconst"));
+                }
+            }
+            // `:2360-2368` — the input, in the slot its port id names.
+            if let Some(refusal) = set_compute_input_operand::<A>(
+                comp,
+                &mut instr,
+                op.op_a.slot,
+                op.op_a.operand.port,
+                ComputePrecisions {
+                    op: op_a,
+                    compute,
+                    result,
+                },
+                matches!(modal, ModalUnary::Gcvt(_) | ModalUnary::Fcvt(_)),
+            ) {
+                refused.push(UnaryRefusal::Input(refusal));
+            }
+            // `:2369-2371` — the input may be forwarded on as well as read, and the result always is.
+            for (outputs, source) in [
+                (
+                    op.op_a.operand.forwarding.as_slice(),
+                    ComputeSource::Slot(op.op_a.slot),
+                ),
+                (op.result.forwarding.as_slice(), ComputeSource::Result),
+            ] {
+                refused.extend(
+                    set_compute_output_operands::<A>(comp, &mut instr, outputs, source)
+                        .into_iter()
+                        .map(UnaryRefusal::Output),
+                );
+            }
+            // `:2373-2386` — no register file written is a written `no`.
+            if !instr.has_common_field(OperandField::Tgtrf) {
+                instr.set_common_field(OperandField::Tgtrf, descriptive("no"));
+            }
+            instr.set_common_field(
+                OperandField::Unroll,
+                descriptive(op.unroll_factor.spelling()),
+            );
+            instr.set_common_field(
+                op.op_a.slot.unroll_field(),
+                boolean(op.op_a.operand.unroll_incr),
+            );
+            instr.set_common_field(OperandField::Unrlfldtgt, boolean(op.result.unroll_incr));
+            // `:2388-2391`.
+            instr.set_common_field(OperandField::Mask, int(255 - op.mask));
+        }
+    }
+    // `:2433-2434` — and the fold control is asked of BOTH arms.
+    if matches!(A::GEN, IsaGen::Sen1p5) {
+        set_fc_value_from_fold_mode(&mut instr, comp.component(), op.fold_mode);
+    }
+    UnaryInstr { instr, refused }
+}
+
+/// THE `sentient.vector_ternary` A SELECT IS BUILT FROM — every attribute it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TernaryInstrOp<'a> {
+    /// `opA` — ⛔ THE PREDICATE, AND IT IS NOT AN INPUT OPERAND: only its `istate` index reaches the
+    /// instruction, folded into `imm` three bits up (`:2481-2495`).
+    pub op_a: &'a SenOperand,
+    /// `opB`, and where it lands.
+    pub op_b: BinaryOperand<'a>,
+    /// `opC`.
+    pub op_c: BinaryOperand<'a>,
+    /// `ResultForwarding`, `ResultPrecision` and `unrollIncrResult`.
+    pub result: &'a ResultPorts,
+    /// `$ComputePrecision`.
+    pub compute_precision: Precision,
+    /// `$unrollFactor`.
+    pub unroll_factor: UnrollFactor,
+    /// `$unrollIncrLogicalResult` — SEN1P5's internal-state advance (`:2532-2539`).
+    pub unroll_incr_logical_result: bool,
+    /// `getMask()`'s constant — ⛔ THE FIELD TAKES `255 -` IT (`:2553`).
+    pub mask: i64,
+    /// `$dbgName`.
+    pub dbg_name: Option<&'a str>,
+}
+
+/// WHAT A `vector_ternary` COULD NOT ASK FOR — the two conversion checks and the shared `mode` bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TernaryRefusal {
+    /// *"Ternary instructions do not support input on the fly conversions"* (`:2452-2455`) — ⭐ THE
+    /// PREDICATE IS `int1` AND THE TWO DATA OPERANDS ARE ALREADY IN COMPUTE PRECISION.
+    InputConversion {
+        /// `opAPrecision`.
+        op_a: Precision,
+        /// `opBPrecision`.
+        op_b: Precision,
+        /// `opCPrecision`.
+        op_c: Precision,
+        /// `$ComputePrecision`.
+        compute: Precision,
+    },
+    /// *"Ternary instructions do not support output on the fly conversions"* (`:2456-2458`).
+    OutputConversion {
+        /// `$ComputePrecision`.
+        compute: Precision,
+        /// `ResultPrecision`.
+        result: Precision,
+    },
+    /// The `mode` bit (`:2461-2470`).
+    Mode(ModeRefusal),
+    /// [`set_compute_input_operand`] refused an input.
+    Input(UnsupportedComputeInput),
+    /// [`set_compute_output_operands`] refused an output.
+    Output(UnsupportedComputeOutput),
+}
+
+/// A SELECT AND WHAT ITS OP COULD NOT ASK FOR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TernaryInstr {
+    /// The instruction.
+    pub instr: UniformInstrInfo,
+    /// The offenders, in the order the reference reaches them.
+    pub refused: Vec<TernaryRefusal>,
+}
+
+/// Replaces: e088_ConstructTernaryInstr
+///
+/// A `select` between two operands under a predicate held in an internal state register.
+///
+/// ⛔⛔ THE UNROLL FIELDS ARE SHIFTED BY ONE SLOT IN THE REFERENCE (`:2541-2546`): `unrlfld<opB>`
+/// takes the PREDICATE's `unrollIncrOpA`, `unrlfld<opC>` takes `unrollIncrOpB`, and
+/// `$unrollIncrOpC` is never read. Ported as written.
+/// ⛔ AND SEN1P5's `unrlfldsrc1` IS WRITTEN FIRST (`:2532-2539`), so an operand in that slot
+/// overwrites the state-register request. [`ComputeUnit`] retires both DT_CHECKs (`:2473-2477`).
+#[must_use]
+pub fn construct_ternary_instr<A: Arch>(
+    unit: ComputeUnit,
+    op: &TernaryInstrOp<'_>,
+) -> TernaryInstr {
+    let comp = ComputeComp::of_compute_unit(unit);
+    let mut refused = Vec::new();
+    let compute = op.compute_precision;
+    let result = op.result.precision;
+    // `:2452-2458`.
+    if op.op_a.precision != Precision::Int1
+        || op.op_b.operand.precision != compute
+        || op.op_c.operand.precision != compute
+    {
+        refused.push(TernaryRefusal::InputConversion {
+            op_a: op.op_a.precision,
+            op_b: op.op_b.operand.precision,
+            op_c: op.op_c.operand.precision,
+            compute,
+        });
+    }
+    if compute != result {
+        refused.push(TernaryRefusal::OutputConversion { compute, result });
+    }
+    let mut instr = UniformInstrInfo::of(OpCode::SELECT);
+    // `:2459-2460`.
+    if let Some(name) = op.dbg_name {
+        instr = instr.with_common_comment(name);
+    }
+    refused.extend(set_mode_bit::<A>(comp, compute, &mut instr).map(TernaryRefusal::Mode));
+    // `:2481-2495` — SEN1P5 folds the predicate's state register into the second opcode.
+    let imm = match (A::GEN, op.op_a.port) {
+        (IsaGen::Sen1p5, Port::IState(index)) => i64::from(index.get()) << 3,
+        _ => 0,
+    };
+    instr.set_common_field(OperandField::Imm, int(imm));
+    // `:2500-2509` — ⛔ TWO INPUTS, NOT THREE: the predicate is not plumbed into a slot.
+    for operand in [op.op_b, op.op_c] {
+        if let Some(refusal) = set_compute_input_operand::<A>(
+            comp,
+            &mut instr,
+            operand.slot,
+            operand.operand.port,
+            ComputePrecisions {
+                op: operand.operand.precision,
+                compute,
+                result,
+            },
+            false,
+        ) {
+            refused.push(TernaryRefusal::Input(refusal));
+        }
+    }
+    // `:2511-2519`.
+    for (outputs, source) in [
+        (
+            op.op_b.operand.forwarding.as_slice(),
+            ComputeSource::Slot(op.op_b.slot),
+        ),
+        (
+            op.op_c.operand.forwarding.as_slice(),
+            ComputeSource::Slot(op.op_c.slot),
+        ),
+        (op.result.forwarding.as_slice(), ComputeSource::Result),
+    ] {
+        refused.extend(
+            set_compute_output_operands::<A>(comp, &mut instr, outputs, source)
+                .into_iter()
+                .map(TernaryRefusal::Output),
+        );
+    }
+    // `:2521-2529`.
+    if !instr.has_common_field(OperandField::Tgtrf) {
+        instr.set_common_field(OperandField::Tgtrf, descriptive("no"));
+    }
+    instr.set_common_field(
+        OperandField::Unroll,
+        descriptive(op.unroll_factor.spelling()),
+    );
+    // `:2532-2539` — written only when asked, so the slot keeps its own value otherwise.
+    if matches!(A::GEN, IsaGen::Sen1p5) && op.unroll_incr_logical_result {
+        instr.set_common_field(OperandField::Unrlfldsrc1, boolean(true));
+    }
+    // `:2541-2548` — ⛔⛔ THE ONE-SLOT SHIFT, ported as written.
+    instr.set_common_field(op.op_b.slot.unroll_field(), boolean(op.op_a.unroll_incr));
+    instr.set_common_field(
+        op.op_c.slot.unroll_field(),
+        boolean(op.op_b.operand.unroll_incr),
+    );
+    instr.set_common_field(OperandField::Unrlfldtgt, boolean(op.result.unroll_incr));
+    // `:2550-2553`.
+    instr.set_common_field(OperandField::Mask, int(255 - op.mask));
+    TernaryInstr { instr, refused }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
         BinaryInstr, BinaryInstrOp, BinaryOperand, ComputeComp, ComputePrecisions, ComputeSlot,
-        ComputeSource, Mac, MacOperand, MacPrecision, UnsupportedComputeInput,
-        construct_binary_instr, construct_fma_instr, set_compute_input_operand,
+        ComputeSource, Mac, MacOperand, MacPrecision, TernaryInstr, TernaryInstrOp, UnaryInstr,
+        UnaryInstrOp, UnsupportedComputeInput, construct_binary_instr, construct_fma_instr,
+        construct_ternary_instr, construct_unary_instr, set_compute_input_operand,
         set_compute_output_operands,
     };
     use crate::arch::{Dd2, Sen1p5};
     use crate::bridges::sentient_to_progir::construct::{boolean, descriptive, int};
     use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
+    use crate::bridges::sentient_to_progir::utils::ComputeUnit;
     use crate::islands::progir::{OpCode, OperandField};
     use crate::islands::sentient::dialects::sentient::{
         Binary, BinaryOp, FmaMode, ForwardingOp, IStateIndex, LrfIndex, Operand as SenOperand,
-        Port, Precision, ResultPorts, UnrollFactor,
+        Port, Precision, ResultPorts, UnaryOp, UnrollFactor,
     };
 
     /// All three fp16 — IBM's `vector_binary` carries no other precision in this test.
@@ -1650,6 +2209,179 @@ mod unit_tests {
                 (OperandField::Unrlfldtgt, boolean(false)),
                 (OperandField::Unroll, descriptive("x1")),
             ]
+        );
+    }
+
+    /// ⭐⭐ IBM'S OWN LINES: `SFP_FEST :: imm:0 mask:255 mode:fp16 src0:lxlu src2:0.0 tgtlx:result
+    /// tgtrf:no unrlfldsrc0:false unrlfldtgt:false unroll:x1` (`unary_op.mlir:8`), `PE_ICVT ::
+    /// imm:7 mask:255 src0:icvtconst src2:R0 tgtrf:R0 unrlfldsrc2:false unrlfldtgt:false unroll:x1`
+    /// (`:13`, and `imm:1` for the floor at `:14`), `SFP_REDUCE :: mode:fp16 rsm_src0:R0 rsm_src1:1
+    /// rsm_tgtrf:R0 rsm_unroll:x1` (`reduction.mlir:6`) and `PE_REDUCE` without a `mode` (`:14`).
+    #[test]
+    fn an_estimate_an_integer_convert_and_a_reduce() {
+        let from_lx = SenOperand::from(Port::Lx);
+        let from_r0 = SenOperand::from(Port::Lrf(LrfIndex::L0));
+        let to_lx = ResultPorts {
+            forwarding: vec![Port::Lx],
+            ..ResultPorts::default()
+        };
+        let to_r0 = ResultPorts {
+            forwarding: vec![Port::Lrf(LrfIndex::L0)],
+            ..ResultPorts::default()
+        };
+        fn op<'a>(
+            operand: &'a SenOperand,
+            slot: ComputeSlot,
+            result: &'a ResultPorts,
+            unary_op: UnaryOp,
+        ) -> UnaryInstrOp<'a> {
+            UnaryInstrOp {
+                op_a: BinaryOperand { slot, operand },
+                unary_op,
+                result,
+                compute_precision: Precision::Fp16,
+                unroll_factor: UnrollFactor::X1,
+                fold_mode: None,
+                mask: 0,
+                dbg_name: None,
+            }
+        }
+        let mut fest = UniformInstrInfo::of(OpCode::FEST);
+        fest.common_fields = vec![
+            (OperandField::Imm, int(0)),
+            (OperandField::Mask, int(255)),
+            (OperandField::Mode, descriptive("fp16")),
+            (OperandField::Src0, descriptive("lxlu")),
+            (OperandField::Src2, descriptive("0.0")),
+            (OperandField::Tgtlx, descriptive("result")),
+            (OperandField::Tgtrf, descriptive("no")),
+            (OperandField::Unrlfldsrc0, boolean(false)),
+            (OperandField::Unrlfldtgt, boolean(false)),
+            (OperandField::Unroll, descriptive("x1")),
+        ];
+        assert_eq!(
+            construct_unary_instr::<Dd2>(
+                ComputeComp::Sfp,
+                &op(&from_lx, ComputeSlot::Src0, &to_lx, UnaryOp::ExpA)
+            ),
+            UnaryInstr {
+                instr: fest,
+                refused: vec![]
+            }
+        );
+        // ⛔ `src0` IS THE PINNED CONVERT CONSTANT, so the operand lands in the slot its port id
+        // names and the DD2 PE gets no `mode` at all.
+        for (unary_op, imm) in [(UnaryOp::FastExp, 7), (UnaryOp::Floor, 1)] {
+            let mut icvt = UniformInstrInfo::of(OpCode::ICVT);
+            icvt.common_fields = vec![
+                (OperandField::Imm, int(imm)),
+                (OperandField::Mask, int(255)),
+                (OperandField::Src0, descriptive("icvtconst")),
+                (OperandField::Src2, descriptive("R0")),
+                (OperandField::Tgtrf, descriptive("R0")),
+                (OperandField::Unrlfldsrc2, boolean(false)),
+                (OperandField::Unrlfldtgt, boolean(false)),
+                (OperandField::Unroll, descriptive("x1")),
+            ];
+            assert_eq!(
+                construct_unary_instr::<Dd2>(
+                    ComputeComp::Pe,
+                    &op(&from_r0, ComputeSlot::Src2, &to_r0, unary_op)
+                ),
+                UnaryInstr {
+                    instr: icvt,
+                    refused: vec![]
+                }
+            );
+        }
+        // ⛔ AND THE REDUCE PLUMBS NO OPERANDS: five fields of its own, no mask and no `tgtrf`.
+        let mut reduce = UniformInstrInfo::of(OpCode::REDUCE);
+        reduce.common_fields = vec![
+            (OperandField::Mode, descriptive("fp16")),
+            (OperandField::RsmSrc0, descriptive("R0")),
+            (OperandField::RsmSrc1, int(1)),
+            (OperandField::RsmTgtrf, descriptive("R0")),
+            (OperandField::RsmUnroll, descriptive("x1")),
+        ];
+        assert_eq!(
+            construct_unary_instr::<Dd2>(
+                ComputeComp::Sfp,
+                &op(&from_r0, ComputeSlot::Src0, &to_r0, UnaryOp::ReductionAdd)
+            ),
+            UnaryInstr {
+                instr: reduce.clone(),
+                refused: vec![]
+            }
+        );
+        reduce.common_fields.remove(0);
+        assert_eq!(
+            construct_unary_instr::<Dd2>(
+                ComputeComp::Pe,
+                &op(&from_r0, ComputeSlot::Src0, &to_r0, UnaryOp::ReductionAdd)
+            ),
+            UnaryInstr {
+                instr: reduce,
+                refused: vec![]
+            }
+        );
+    }
+
+    /// ⭐⭐ IBM'S OWN LINE: `SFP_SELECT :: be:be imm:0 mask:255 mode:fp16 src0:R2 src2:lxlu
+    /// tgtlx:result tgtrf:no unrlfldsrc0:false unrlfldsrc2:false unrlfldtgt:false unroll:x1`
+    /// (`ternary.mlir:13`) — ⛔ `be:be` IS THE BRANCH MACHINERY'S, not this instruction's, and the
+    /// `istate0` predicate reaches no `src` field at all.
+    #[test]
+    fn a_select_plumbs_its_two_data_operands_and_not_its_predicate() {
+        let predicate = SenOperand {
+            precision: Precision::Int1,
+            ..SenOperand::from(Port::IState(IStateIndex::S0))
+        };
+        let op_b = SenOperand::from(Port::Lx);
+        let op_c = SenOperand::from(Port::Lrf(LrfIndex::L2));
+        let result = ResultPorts {
+            forwarding: vec![Port::Lx],
+            ..ResultPorts::default()
+        };
+        let built = construct_ternary_instr::<Dd2>(
+            ComputeUnit::Sfp,
+            &TernaryInstrOp {
+                op_a: &predicate,
+                op_b: BinaryOperand {
+                    slot: ComputeSlot::Src2,
+                    operand: &op_b,
+                },
+                op_c: BinaryOperand {
+                    slot: ComputeSlot::Src0,
+                    operand: &op_c,
+                },
+                result: &result,
+                compute_precision: Precision::Fp16,
+                unroll_factor: UnrollFactor::X1,
+                unroll_incr_logical_result: false,
+                mask: 0,
+                dbg_name: None,
+            },
+        );
+        let mut expected = UniformInstrInfo::of(OpCode::SELECT);
+        expected.common_fields = vec![
+            (OperandField::Imm, int(0)),
+            (OperandField::Mask, int(255)),
+            (OperandField::Mode, descriptive("fp16")),
+            (OperandField::Src0, descriptive("R2")),
+            (OperandField::Src2, descriptive("lxlu")),
+            (OperandField::Tgtlx, descriptive("result")),
+            (OperandField::Tgtrf, descriptive("no")),
+            (OperandField::Unrlfldsrc0, boolean(false)),
+            (OperandField::Unrlfldsrc2, boolean(false)),
+            (OperandField::Unrlfldtgt, boolean(false)),
+            (OperandField::Unroll, descriptive("x1")),
+        ];
+        assert_eq!(
+            built,
+            TernaryInstr {
+                instr: expected,
+                refused: vec![]
+            }
         );
     }
 }
