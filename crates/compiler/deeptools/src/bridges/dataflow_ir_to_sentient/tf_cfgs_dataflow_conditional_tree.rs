@@ -1640,9 +1640,8 @@ mod unit_tests {
         );
     }
 
-    /// 🎯 381/384 — A TOP-LEVEL CONDITIONAL REACHES THE CANDIDATE QUESTION, AND A NESTED ONE DOES NOT.
-    /// The `scf.if` inside the `affine.for` is not a child of the root (`:473-474`), so a unit holding
-    /// only that one runs the do/while to completion and marks nothing.
+    /// 🎯 381/384 — A ROOT-CHILD CONDITIONAL REACHES THE CANDIDATE QUESTION. One `scf.if` at the top
+    /// of the unit is a child of the root (`:473-474`), so it is offered to `parseConditional` (`:478`).
     #[test]
     #[should_panic(expected = "parseConditional")]
     fn a_top_level_conditional_reaches_the_candidate_question() {
@@ -1650,10 +1649,12 @@ mod unit_tests {
         simplify_value_based_conditionals(&CfgsDataflowConditionalTree::new(&unit));
     }
 
-    /// 🎯⛔ AND A CONDITIONAL NESTED BELOW THE ROOT IS NOT THIS STEP'S (`:473-474`) — reaching the end
-    /// of the call is the assertion.
+    /// 🎯⛔ AND A CONDITIONAL UNDER A LOOP IS A ROOT CHILD TOO — `findClosestParent` skips the
+    /// unselected `affine.for` (`dcc/src/Analysis/ConditionalTree.hpp:165-169`), exactly as entry
+    /// 380's own sibling walk has it, so this one is offered to the question as well.
     #[test]
-    fn a_nested_conditional_is_not_a_root_child() {
+    #[should_panic(expected = "parseConditional")]
+    fn a_conditional_under_a_loop_is_a_root_child() {
         let unit = unit_holding(vec![DfirOp::Affine(affine::Op::For {
             iv: Val(1),
             lo: affine::Bound::Const(0),
@@ -2423,7 +2424,8 @@ fn walk_candidates<'a>(ops: &'a [DfirOp], visit: &mut impl FnMut(&[&'a DfirOp], 
 /// (`:347-348`). The sibling is then MOVED right after `n` (`:249`) and, for an `scf.if`, made to
 /// share `n`'s condition with the old one erased if unused (`:252-256`).
 /// ⚠️ `deleteAncestorsIfPossible` (`:269`), `recompute` (`:271`) and `OperationEquivalence::clearCache`
-/// (`:272`) are all outside bridge 2's 384 — the first two live in `dcc/src/Analysis/`.
+/// (`:272`) are all outside bridge 2's 384 — all three live in `dcc/src/Analysis/`
+/// (`TransformationConditionalTree.cpp:155`, `ConditionalTree.hpp:151`, `OperationEquivalence.hpp:71`).
 pub fn shallowly_merge_conditionals<A: Arch>(
     tree: &CfgsDataflowConditionalTree<'_, A>,
     prev_merged_if_op: Option<CondNodeIndex>,
@@ -2486,11 +2488,13 @@ pub fn shallowly_merge_conditionals<A: Arch>(
 /// `PROCESSED_SIMPLIFICATIONS` from every child before returning. It is set on `:486` and read on
 /// `:476` only, so it is a set of conditionals rejected DURING THIS CALL — a local set here, not a
 /// new island attribute, and the removal pass is discharged by that set dying with the call.
-/// ⛔ ONLY ROOT'S CHILDREN ARE CONSIDERED (`:473-474`) — a conditional nested inside another is not
-/// reached by this step at all, which is what makes `getFirstChild()`/`getNextSibling()` here a walk
-/// over the unit's TOP-LEVEL conditionals and nothing deeper.
-/// ⚠️ `parseConditional`, `replaceIfOpByIterArg` (entry 285) and `recompute` are unported; only
-/// `parseConditional` is outside the 384 entirely.
+/// ⛔ ONLY ROOT'S CHILDREN ARE CONSIDERED (`:473-474`) — a conditional nested inside ANOTHER
+/// CONDITIONAL is not this step's. ⛔ BUT THAT IS NOT THE TOP-LEVEL STATEMENT LIST:
+/// `findClosestParent` skips unselected ancestors (`dcc/src/Analysis/ConditionalTree.hpp:165-169`),
+/// so an `scf.if` inside a top-level `affine.for` IS a root child — the group [`sibling_group`]
+/// already walks, and entry 380 reads the same tree.
+/// ⚠️ `parseConditional`, `replaceIfOpByIterArg` (entry 285), `recompute` and the manager's
+/// CONSTRUCTOR (`.hpp:55-76`, which is what sets `is_candidate_`) are unported; only 285 is a unit.
 pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditionalTree<'_, A>) {
     // `:486` — the `PROCESSED_SIMPLIFICATIONS` attribute, by position among root's children.
     let processed: Vec<usize> = Vec::new();
@@ -2500,14 +2504,12 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
         // `:472`
         let tree_updated = false;
 
-        // `:473-474` — root's children, which are the unit's top-level conditionals.
-        for (at, if_op) in tree
-            .unit
-            .body
-            .iter()
-            .enumerate()
-            .filter(|(_, op)| ConditionalKind::of(op).is_some())
-        {
+        // `:473-474` — root's children: every conditional whose closest SELECTED ancestor is none,
+        // which is NOT every top-level statement that is one.
+        let mut root_children: Vec<&DfirOp> = Vec::new();
+        sibling_group(&tree.unit.body, &mut root_children);
+
+        for (at, if_op) in root_children.iter().copied().enumerate() {
             // `:476` — `if (if_op->hasAttr(PROCESSED_SIMPLIFICATIONS)) continue;`
             if processed.contains(&at) {
                 continue;

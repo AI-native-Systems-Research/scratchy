@@ -1876,7 +1876,7 @@ impl<'a> AccessDetailsAffine<'a> {
                 ..
             } => (view, view_ty, indices, ty),
             // ⛔ AND THE SYMBOLIC PAIR IS NOT AFFINE AT ALL — its subscript is a runtime value, so
-            // `AccessDetailsSymbolic::initialize` (`:855-897`) reads it and this `dyn_cast` chain
+            // `AccessDetailsSymbolic::initialize` (`:858-896`) reads it and this `dyn_cast` chain
             // does not.
             agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }

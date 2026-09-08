@@ -730,6 +730,149 @@ than the 8-parameter `e028`, on `e358`'s optional `extract_op` test (`:2006`) ag
   overload's extra parameter is DEAD in the reference, which is a stronger reason for the port to drop
   it than the one the doc gave; the implementation was already right.
 
+## ⛔ MEASURED FOR ENTRIES 374-381: 374'S EXTRACT KEEPS ITS RETURN AND DROPS THE ARGUMENTS, AND 380 LOSES ITS ONLY `return`
+
+Brace-matched from the authority at each unit's cited line (`a0d29abbed`) and diffed line-by-line
+against `source/bridge2.cpp`'s body. ⭐ **`loc` IS EXACT FOR ALL 8** under the column's convention
+(body span minus signature lines): 29-3, 33-3, 35-1, 15-3, 31-1, 55-1, 78-2, 31-1. **Four bodies are
+verbatim** — 376, 378, 379 and 381, each differing only in the renamed signature and trailing blank
+lines. The other four lose content, and two of them lose the statement that answers:
+
+| unit | dropped from the extract's body |
+|---|---|
+| **374 `lowerSymbolicVectorLoadOp`** (`Helper.cpp:3380-3408`) | ⛔ **THE ARGUMENTS OF ITS ONLY RETURN, WITH THE RETURN LEFT STANDING** — a shape not seen before in this corpus. `return lowerVectorLoadHelper<AccessDetailsSymbolic, SymbolicVectorLoadOp>(` survives and `candidate_op, store_op, unit, access_details, mutable_addrs, immutable_addrs, to_be_deleted);` (`:3406-3407`) does not, so the extract reads `return lowerVectorLoadHelper<…>(` / blank / `}`. A truncation that drops a whole statement at least reads as missing; this one reads as a CALL WITH NO ARGUMENTS, and the three containers entry 360 filled are exactly what it fails to name |
+| **380 `shallowlyMergeConditionals`** (`CFGSDataflowConditionalTree.cpp:198-275`) | ⛔ **ITS ONLY `return cur_merged_if_op;`** (`:274`). The function's whole contract is *"return the merged if-op so we may resume merging from there, or nullptr to indicate there are no more merge opportunities"* (`:207-210`); the extract ends after the `if (cur_merged_if_op) { recompute(); getOE().clearCache(); }` block, so an `Operation *`-returning function reads as returning nothing at all — the same defect class as 370's lost `return true;`, one rung up: 370 reads always-false and its only caller, 380, reads always-null |
+| **375 `lowerSymbolicVectorStoreOp`** (`Helper.cpp:3410-3442`) | `return success();` (`:3441`) |
+| **377 `matchAndRewrite`** (`VectorChainToSentientPESFP.cpp:44-58`) | `return success();` (`:57`) **and the `const` member qualifier** — `mlir::ConversionPatternRewriter &rewriter) const {` (`:46`) is rewritten without it, the same signature loss already recorded for 323, 350, 352-355 and 364 |
+
+## ⭐ AND THE `level` COLUMN IS RIGHT FOR ALL 8 — WHAT RAN OUT OF ORDER IS THE CAMPAIGN, NOT THE SCHEDULE
+
+The port commit for these eight reported *"all eight are scheduled ahead of a callee they need —
+reported as a schedule violation"*. ⛔ **THAT IS THE WRONG DIAGNOSIS, AND IT MATTERS BECAUSE IT BLAMES
+THE COLUMN INSTEAD OF THE WAVE ORDER.** Every unported callee the eight stop at sits STRICTLY BELOW
+level 8, which is exactly the order a topological schedule promises:
+
+`e217` L2 · `e227` L2 · `e228` L2 · `e239` L2 · `e270` L3 · `e285` L3 · `e304` L4 · `e339` L6 ·
+`e344` L6 · `e346` L6 · `e347` L6 · `e360` L7 · `e362` L7 · `e363` L7 · `e364` L7 · `e366` L7 ·
+`e367` L7 · `e368` L7 · `e369` L7 · `e370` L7
+
+All twenty are `[ ]` PORT. So the schedule put them first and **the campaign ported level 8 while
+level 7 (357-373) has zero ported entries** — 17 unported units directly below eight that need nine of
+them. The corpus convention of stopping at a `todo!` naming the first gap is the right response to
+that, but the finding to record is an EXECUTION-ORDER one: level 7 must land before level 8 stops
+being a wall of `todo!`.
+
+## ⛔ AND THE `calls` COLUMN FOR 374-381: 19 OF ITS 27 EDGES DO NOT NAME A REAL CALLEE, AND 29 REAL ONES ARE MISSING
+
+Each declared edge was resolved against the brace-matched body and against the cited definition of the
+entry it names. **8 of 27 are real.** Four failure shapes:
+
+- **`e052_If` — a COMMENT LINE, declared by 379, 380 and 381.** `StandardToSentient.cpp:159` is
+  `// return If(lhs) {If(rhs) true_val; else false_val} else false_val;`, and the column gives it
+  `0L`. Nothing in any of the three calls anything named `If`; the extractor matched prose.
+- **`e064_size` — a CONSTRUCTOR MEMBER-INITIALISER, declared by 375 and 379.**
+  `VectorChainHelper.cpp:319` is `size(vec.size()) {` inside an init list — a data member being set,
+  not a callable. 375's real `access_details.size() == 1` (`:3419-3420`) is `AccessContainer::size` in
+  `AccessDetails.hpp`, and 379 calls no `size()` of ours at all (`unit.getUnits().size()` at `:993` is
+  MLIR's).
+- **THE NODE ACCESSORS NAME THE WRONG TREE, TWICE OVER — 12 edges across 380 and 381.**
+  `getFirstChild`/`getNextSibling`/`getRoot`/`OperationNode` are declared as `e082`/`e083`/`e088`/`e079`
+  (`.../VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:39`/`:42`/`:109`/`:32`) AND as
+  `e103`/`e104`/`e107`/`e101` (`.../FlatteningLocalRegions.cpp:56`/`:59`/`:81`/`:51`) — two unrelated
+  trees' same-named accessors, each listed once per row. The accessors these two actually walk are
+  `CondNode`'s, at `dcc/src/Analysis/ConditionalTree.hpp:49`/`:52`/`:143`, which are **not among the
+  384** because `dcc/src/Analysis/` is outside the D1-D28 span. Also `e026_has` in 380: real for 374
+  (`:3399`), a non-call there.
+- ⛔ **`e099` NAMES THE DESTRUCTOR AND 381 CALLS THE CONSTRUCTOR.**
+  `CFGSDataflowConditionalTree.hpp:78` is `~ConditionalSimplificationManager() { if (val_array_)
+  delete[] val_array_; }` — 2L, which is why the column matched it. `:477`'s
+  `ConditionalSimplificationManager instance(child);` calls the CONSTRUCTOR at `.hpp:55-76`, 22 lines
+  that decide `is_candidate_` from `getLhsRhsOfEQPredicate` and `getDataflowForLoopInfoIfIV` and
+  allocate `val_array_[num_iterations]`. **That constructor is not one of the 384 under any entry**,
+  and it is not optional: `parseConditional`'s very first test is `if (!is_candidate_ || …) return
+  false;` (`:537`), and `is_candidate_` is written NOWHERE ELSE — default `true` at `.hpp:30`, set
+  `false` only at `.hpp:61` and `.hpp:69`, both inside that constructor. So the answer 381 branches on
+  is decided by a function the schedule cannot see.
+
+And the omissions run the other way in every row — **29 real in-set callees are undeclared**, including
+all seven of 376's (`e339` `:443`, `e049` `:448`, `e050` `:450`, `e362` `:456`, `e053` `:458`, `e363`
+`:460`/`:462`/`:464`, `e054` `:466`) against a declared `-`, eight of 379's nine, five of 378's seven,
+`e360` in both 374 and 375, `e370`+`e177` in 380 and `e285` in 381. ⭐ 376's four undeclared-but-PORTED
+callees (`e049`, `e050`, `e053`, `e054`) are all called by the landed Rust anyway, as is `e036` by 374
+and `e067` by 378/379 — the implementations found them; only the column did not.
+
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT THESE 8 — 1 IMPLEMENTATION AND 13 CITATIONS FIXED IN THIS COMMIT
+
+8 `/// Replaces:` anchors, 0 surviving `// crustify:todo:`, 16/16 boxes `[x]`. ⭐ **376, 378, 379 AND
+380 MEASURED EXACT — every citation, all 34 of them**, including 376's fifteen (`:439`, `:441-445`,
+`:447-471` and one per arm), 378's six, 379's ten (the `WalkResult::interrupt()`-is-a-discarded-
+temporary catch at `:1019` and the `insertPTMaskOps` that still runs after it at `:1024`) and 380's
+twenty. So did every claim the island growth forced, each re-derived from the reference:
+`isDataTransfer`'s nineteen classes DO include both symbolic ops (`UnitFiltering.cpp:314-325`);
+`getLoadConsumer` roots a `SymbolicVectorLoadOp` at `getResult(0)` (`Helper.cpp:1245-1246`);
+`constructChunkAndShuffleInfo`'s gate excludes them (`AccessDetails.cpp:207-208`);
+`AccessDetailsAffine::initialize` (`:295`) drops them into
+`return op->emitError("unsupported operation")` (`:343-345`); `is_memory_op`'s `isa<>` names five ops and no symbolic one
+(`TransformLoopToLegalizeForSentientLowering.cpp:329-331`); `TpmvManager`'s `dyn_cast` chain ends in
+`llvm_unreachable("memory operation is not supported for static paged tensors")`
+(`TransformPagedMemViewManager.cpp:64-66`); no `SymbolicVector*` appears in any `Utils.cpp`; and the
+emission test's expected text is `symbolic_vector_load_store.mlir:224`/`:302` verbatim, over
+`#map`/`#set` from `:184-185`, with two indices on a one-dimensional memref exactly as the vendor
+writes it. **One implementation was wrong and is fixed here:**
+
+- ⛔ **381 ENUMERATED ROOT'S CHILDREN AS THE UNIT'S TOP-LEVEL STATEMENT LIST, AND THE SAME FILE
+  ALREADY SAYS WHY THAT IS WRONG.** The landed loop was
+  `tree.unit.body.iter().enumerate().filter(|(_, op)| ConditionalKind::of(op).is_some())`, with a doc
+  bullet calling `:473-474` *"a walk over the unit's TOP-LEVEL conditionals and nothing deeper"* and a
+  test, `a_nested_conditional_is_not_a_root_child`, asserting that an `scf.if` inside a top-level
+  `affine.for` is NOT reached. `ConditionalTree::compute` parents every selected op at
+  `findClosestParent(op)`, which **skips every UNSELECTED ancestor** —
+  `while ((curr_op = curr_op->getParentOp())) if (isOperationSelected(*curr_op)) return curr_op;`
+  (`dcc/src/Analysis/ConditionalTree.hpp:165-169`) — and `isOperationSelected` is
+  `isa<AffineIfOp, scf::IfOp, sentient::IfOp>` (`ConditionalTree.cpp:226`), which names no loop. A
+  conditional under a top-level `affine.for` therefore has NO selected ancestor, so its parent node is
+  the root (`ConditionalTree.cpp:200-208`) and it IS a root child. ⛔ **380, forty lines above it in
+  the same file, gets this right and says so**: its `sibling_group` helper recurses through unselected
+  ops and its doc reads *"a conditional directly in a `then` region and one nested inside an
+  `affine.for` in that same region are SIBLINGS"* — the two ports disagreed about one tree. 381 now
+  calls `sibling_group` for root's children, and the test is inverted to assert the conditional under
+  the loop DOES reach `parseConditional`.
+
+⚠️ And two counts in the port commit's own message do not match the tree, both by one and neither
+affecting code: it reported *"208/384 ported and audited"* where the boxes are **209/209** (`e001`
+plus 002-024 and the rest), and *"839 passed"* where `cargo test -p deeptools --lib` reports **840**
+(unchanged by this commit — `#[test]` count is 840 at `ec81458b0` and 840 here; one test is renamed
+and inverted, none added).
+
+⭐ AND THE ONLY THING 381 GETS FROM THE ROOT IS ITS CHILD LIST, so the fix is contained: nothing else
+in the body reads `at` except the call-local `PROCESSED_SIMPLIFICATIONS` set, which is now keyed by
+position in the root sibling group rather than by position in the statement list.
+
+**13 drifted citations re-measured and corrected** (small offsets are the norm; these were rewritten
+rather than merely noted because each names the wrong line's content):
+
+| where | said | is |
+|---|---|---|
+| 374, the container fill | `:3386-3393` | `:3386-3391` — `:3393` starts the next statement |
+| 374, taking the candidate from `kDirSrc` | `:3395` | `:3393-3394`; `:3395` is the `DT_CHECK` on it |
+| 374, the second store read | `:3397-3402` | `:3399-3402` — `:3397-3398` are its comment |
+| 375, `DT_CHECK(size == 1)` on all three | `:3418-3419` | `:3419-3420` |
+| 375, the `[0]` indexing | `:3427-3428` | `:3429-3430` |
+| 375, element type from the memref | `:3424` | `:3427`; `:3424` is the `DT_CHECK` |
+| 375, the width taken from the VALUE instead | `:874-878` (no file) | `AccessDetails.cpp:879-880` — a different file from the one the block cites throughout |
+| 375, `constructSymbolicDetailsAndAddrs(op, nullptr, …)` | `:3413-3417` | `:3413-3418` |
+| 375, entry 028's three arguments | `:3425-3429` | `:3428-3431` |
+| 375, the store pushed to the delete list | `:3434` | `:3436`; `:3434` is inside the error string |
+| 375, entry 270 on the value's producer | `:3436-3437` | `:3438-3439` |
+| 377, the four fusible producer classes | `:100-102` | `:101-103` |
+| 377, `is_precision_converted_global` by value | `:98` | `:99` |
+
+Two more claims were narrowed rather than corrected: `AccessDetailsSymbolic::initialize` spans
+`:858-896`, not `:855-897` (the cited range opens on the file's banner comment), and 380's
+`deleteAncestorsIfPossible`/`recompute`/`clearCache` note said *"the first two live in
+`dcc/src/Analysis/`"* when **all three** do (`TransformationConditionalTree.cpp:155`,
+`ConditionalTree.hpp:151`, `OperationEquivalence.hpp:71`).
+
 ## Progress
 
 `209/384 ported; 209/384 audited`

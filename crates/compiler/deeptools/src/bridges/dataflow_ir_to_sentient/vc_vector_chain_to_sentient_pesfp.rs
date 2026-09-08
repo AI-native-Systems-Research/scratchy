@@ -470,8 +470,8 @@ pub fn fuse_compute_ops<A: Arch>(unit: &dfir::ProgramUnit<A>, reuse_info: &Opera
 /// ⛔ THE OPERAND IS THE SEND'S PRODUCER, NOT THE SEND (`:48-50`): `getSendData().getDefiningOp()`.
 /// Passing the send itself would classify the wrong op — `patternAgnosticFuseNonComputeOpsHelper`
 /// fuses only when `from` is a `dataflow.receive`, a `vector.load`, an `agen.vector_load` or an
-/// `arith.constant` (`:100-102`), and a send is none of them.
-/// ⛔ `is_precision_converted_global` IS BY VALUE (`:98`), so the helper's copy is what the helper
+/// `arith.constant` (`:101-103`), and a send is none of them.
+/// ⛔ `is_precision_converted_global` IS BY VALUE (`:99`), so the helper's copy is what the helper
 /// reads; nothing here observes a write back, and the local it was copied from (`:47`, set by entry
 /// 304) is never read again.
 /// ⛔ IT EMITS NOTHING ITSELF — both of its statements are calls, and the rewrite is entry 364's.

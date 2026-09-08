@@ -5310,7 +5310,7 @@ pub fn construct_immutable_address<T: AccessRecord>(
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380` (26L). A symbolic load, and the symbolic store
 /// it feeds when it feeds one, lowered as one load-and-send pair.
 ///
-/// ⭐ THE STORE IS FOUND TWICE ON PURPOSE (`:3384`, then `:3397-3402`): entry 360 may CLONE the ops it
+/// ⭐ THE STORE IS FOUND TWICE ON PURPOSE (`:3384`, then `:3399-3402`): entry 360 may CLONE the ops it
 /// gathers, so the second read takes the store out of `kDirDst` rather than trusting the first.
 /// ⛔ `has(kDirDst)` IS THE PATTERN TEST AFTER THE FACT — a load with no store reaches
 /// `lowerVectorLoadHelper` with a null `store_op`, which is the plain-load half of that helper.
@@ -5326,8 +5326,8 @@ pub fn lower_symbolic_vector_load_op<A: Arch>(
     // `:3383-3384` — entry 036 at its `SymbolicVectorStoreOp` instantiation.
     let store_op = store_op_from_load_store_pattern(AgenOpKind::SymbolicVectorStore, op, scope);
 
-    // `:3386-3393` — `constructSymbolicDetailsAndAddrs` fills all three containers, and every line
-    // below reads one of them: `:3395` takes the candidate out of `kDirSrc`, `:3399` asks
+    // `:3386-3391` — `constructSymbolicDetailsAndAddrs` fills all three containers, and every line
+    // below reads one of them: `:3393-3394` takes the candidate out of `kDirSrc`, `:3399` asks
     // `has(kDirDst)`, and `:3405-3407` hands all three to entry 217.
     todo!(
         "e360_constructSymbolicDetailsAndAddrs is unported, so e217_lowerVectorLoadHelper cannot \
@@ -5349,17 +5349,18 @@ pub fn lower_symbolic_vector_load_op<A: Arch>(
 /// one `sentient.receive_and_store`.
 ///
 /// ⛔ IT PASSES `nullptr` FOR THE STORE (`:3415`), which is what makes entry 360 gather ONE record —
-/// hence `DT_CHECK(size == 1)` on all three containers (`:3418-3419`) and the `[0]` indexing at
-/// `:3427-3428`.
-/// ⛔ THE ELEMENT TYPE COMES FROM THE **MEMREF**, not from the stored vector (`:3424`), unlike
-/// `AccessDetailsSymbolic::initialize`, which takes the WIDTH from the value (`:874-878`).
-/// ⛔ AND THE DELETE LIST GETS TWO THINGS: the store itself (`:3434`) and, through entry 270, the op
-/// that produced the value it stored (`:3436-3437`).
+/// hence `DT_CHECK(size == 1)` on all three containers (`:3419-3420`) and the `[0]` indexing at
+/// `:3429-3430`.
+/// ⛔ THE ELEMENT TYPE COMES FROM THE **MEMREF**, not from the stored vector (`:3427`), unlike
+/// `AccessDetailsSymbolic::initialize`, which takes the WIDTH from the value
+/// (`AccessDetails.cpp:879-880`).
+/// ⛔ AND THE DELETE LIST GETS TWO THINGS: the store itself (`:3436`) and, through entry 270, the op
+/// that produced the value it stored (`:3438-3439`).
 /// ⛔ `!` FOR THE SAME REASON AS ENTRY 374 — see its note.
 pub fn lower_symbolic_vector_store_op<A: Arch>(unit: &ProgramUnit<A>, comp: DfirUnit) -> ! {
-    // `:3413-3417` — `constructSymbolicDetailsAndAddrs(op, nullptr, ...)`. The single record it
+    // `:3413-3418` — `constructSymbolicDetailsAndAddrs(op, nullptr, ...)`. The single record it
     // gathers is the only route to `access_details[0]`, `mutable_addrs[0]` and `immutable_addrs[0]`,
-    // which are exactly the three arguments entry 028 needs at `:3425-3429`.
+    // which are exactly the three arguments entry 028 needs at `:3428-3431`.
     todo!(
         "e360_constructSymbolicDetailsAndAddrs is unported, so e028_constructReceiveAndStoreStmt \
          cannot lower the agen.symbolic_vector_store on {:?} of {:?} (e270_addStoreInputToDeleteList \
