@@ -34,6 +34,9 @@ use crate::bridges::sentient_to_progir::construct::scalar::{
     construct_jmp_instr, construct_mv_loop_instr, construct_nop_instr, construct_return_instr,
     construct_sync_instr,
 };
+use crate::bridges::sentient_to_progir::driver::{
+    CodeQualityStats, Lowering, LoweringRefusal, OpToLower, Walk, generate_prog_ir,
+};
 use crate::bridges::sentient_to_progir::lower::compute::{
     LabelPlacement, Successor, lower_common_operations,
 };
@@ -467,7 +470,8 @@ pub struct LoweredYield {
 }
 
 /// `++num_nops_` — the one placement that emits an instruction (`:557-561`).
-const fn nops_of(placement: LabelPlacement) -> Nops {
+#[must_use]
+pub const fn nops_of(placement: LabelPlacement) -> Nops {
     match placement {
         LabelPlacement::Nop => Nops(1),
         LabelPlacement::Unlabelled | LabelPlacement::MovedToNext => Nops(0),
@@ -705,16 +709,113 @@ pub fn lower_uniform_yield_operation<A: Arch>(
     }
     lowered
 }
-// crustify:todo: e126_LowerUniformOperations
+/// ONE `uniform.uniformize_regions` OR `uniform.equalize_pattern` AS ITS LOWERING READS IT.
+pub struct UniformizedOp<'a> {
+    /// `getEstimatedInstructionCount(dccExtContext(), uniform_op)` — zero lowers no block at all.
+    pub estimated_instructions: u32,
+    /// `getRegionUnitList(idx)` per region, and the ops those unit values are defined by —
+    /// [`fill_unit_to_id_map`]'s two arguments.
+    pub region_units: Vec<Vec<Val>>,
+    /// The scope the unit values resolve in.
+    pub scope: Vec<Op>,
+    /// Each region's own ops, in pre-order.
+    pub regions: Vec<Vec<OpToLower<'a>>>,
+}
+
+/// Replaces: e126_LowerUniformOperations
+///
+/// Each region of a uniformized op into its own region of ONE uniform block, and the statistics the
+/// widest region of the set contributes.
+///
+/// ⛔ AN EMPTY ESTIMATE LOWERS NO BLOCK AT ALL — the op is only a label carrier.
+/// ⛔ THE MAXIMA COVER THREE COUNTERS, NOT FOUR: a region's `num_nops_` is dropped on the floor.
+/// ⭐ AND `UniformRegionContext` IS STATICALLY DEAD — its base takes `regDefChecking()`, a `false`.
+#[must_use]
+pub fn lower_uniform_operations<A: Arch>(
+    comp: Component,
+    uniform_op: UniformizedOp<'_>,
+    at: OpSite,
+    next: Option<Successor>,
+    lowering: &mut Lowering<'_>,
+) -> Vec<LoweringRefusal> {
+    if uniform_op.estimated_instructions == 0 {
+        let placement = lower_common_operations(
+            CodeGraph {
+                labels: &mut *lowering.labels,
+                region: &mut *lowering.blocks,
+                at,
+            },
+            next,
+            lowering.nop_for_labels,
+        );
+        if let Some(stats) = lowering.cq_stats.as_mut() {
+            stats.nops.0 += nops_of(placement).0;
+        }
+        return Vec::new();
+    }
+    if lowering
+        .blocks
+        .blocks
+        .last()
+        .is_some_and(UniformInstrBlock::is_empty)
+    {
+        lowering.blocks.blocks.pop();
+    }
+    // The reference's two `dyn_cast` arms collapse: `fillUnitToIdMap` is one template body, and this
+    // takes the region unit lists rather than either op.
+    let unit_to_region = fill_unit_to_id_map(&uniform_op.region_units, &uniform_op.scope);
+    // ⛔ THE BLOCK IS HELD BY INDEX, not by `last()`: a nested uniformized op appends its own block,
+    // and the reference keeps setting the region on the one IT opened.
+    let block_at = lowering.blocks.blocks.len();
+    let block = lowering.blocks.append_uniform_block();
+    block.unit_to_region = unit_to_region;
+    let collecting = lowering.cq_stats.is_some();
+    let mut widest = CodeQualityStats::default();
+    let mut refused = Vec::new();
+    for (index, region) in (0..).zip(uniform_op.regions) {
+        if let Some(block) = lowering
+            .blocks
+            .blocks
+            .get_mut(block_at)
+            .and_then(UniformInstrBlock::uniform_mut)
+        {
+            block.set_current_region(RegionIndex(index));
+        }
+        let mut region_stats = collecting.then(CodeQualityStats::default);
+        {
+            let mut region_lowering = lowering.with_stats(&mut region_stats);
+            for op in region {
+                let generated = generate_prog_ir::<A>(op, comp, &mut region_lowering);
+                refused.extend(generated.refused);
+                if generated.walk == Walk::Interrupt {
+                    break;
+                }
+            }
+        }
+        if let Some(stats) = region_stats {
+            widest.conditional_jcmps = widest.conditional_jcmps.max(stats.conditional_jcmps);
+            widest.ibuff_usage = widest.ibuff_usage.max(stats.ibuff_usage);
+            widest.copy_ops = widest.copy_ops.max(stats.copy_ops);
+        }
+    }
+    if let Some(stats) = lowering.cq_stats.as_mut() {
+        stats.conditional_jcmps += widest.conditional_jcmps;
+        stats.ibuff_usage.0 += widest.ibuff_usage.0;
+        stats.copy_ops.0 += widest.copy_ops.0;
+    }
+    refused
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
     use crate::bridges::sentient_to_progir::construct::descriptive;
+    use crate::bridges::sentient_to_progir::construct::mask_and_splat::ActiveMaskValue;
     use crate::bridges::sentient_to_progir::construct::mask_and_splat::MaskDest;
     use crate::bridges::sentient_to_progir::construct::scalar::{AssignKind, LrfImm};
     use crate::bridges::sentient_to_progir::lower::labels_and_regs::RegImm;
+    use crate::bridges::sentient_to_progir::state::RegsToInit;
     use crate::bridges::sentient_to_progir::uniform::instr::Comment;
     use crate::islands::progir::OpCode;
     use crate::islands::progir::ty::{Operand, OperandValue, PerFold};
@@ -1153,5 +1254,102 @@ mod unit_tests {
         assert_eq!(lowered, LoweredYield::default());
         assert_eq!(region.blocks.len(), 2);
         assert!(matches!(region.blocks[1], UniformInstrBlock::Regular(_)));
+    }
+    /// The pass state one lowering call reads, owned by the test so each call takes a fresh borrow.
+    #[derive(Default)]
+    struct State {
+        labels: Labels,
+        blocks: UniformInstrBlocks,
+        reg_graph: RegGraphs,
+        regs_to_init: RegsToInit,
+        label_to_jumps: LabelToJumps,
+        nop_for_labels: Vec<InstrIndex>,
+        labels_ctr: LabelCounter,
+        cq_stats: Option<CodeQualityStats>,
+        has_samv: Option<ActiveMaskValue>,
+    }
+
+    impl State {
+        fn lowering(&mut self) -> Lowering<'_> {
+            Lowering {
+                labels: &mut self.labels,
+                blocks: &mut self.blocks,
+                reg_graph: &mut self.reg_graph,
+                regs_to_init: &mut self.regs_to_init,
+                label_to_jumps: &mut self.label_to_jumps,
+                nop_for_labels: &mut self.nop_for_labels,
+                labels_ctr: &mut self.labels_ctr,
+                reg_defs: None,
+                cq_stats: &mut self.cq_stats,
+                has_samv: &mut self.has_samv,
+                units: &[],
+                full_reg_init: false,
+            }
+        }
+    }
+
+    /// e126: an estimate of zero carries the label onto the next op and opens NO block; two regions of
+    /// one NOP each take two regions of ONE uniform block, and the empty regular block ahead of them is
+    /// popped. ⛔ THE PROGRAM IS CHARGED FOR NEITHER NOP — the maxima cover three counters, not four.
+    #[test]
+    fn each_uniformized_region_takes_its_own_region_of_one_block() {
+        use crate::bridges::sentient_to_progir::driver::{OpKind, OpToLower};
+        use crate::bridges::sentient_to_progir::reg_def_tracker::OpRegDefs;
+
+        let mut state = State {
+            cq_stats: Some(CodeQualityStats::default()),
+            ..State::default()
+        };
+        state.blocks.append_regular_block();
+        state.labels.claim(OpSite(9), "uniform-label".to_owned());
+        let carrier = lower_uniform_operations::<Target>(
+            Component::Pt,
+            UniformizedOp {
+                estimated_instructions: 0,
+                region_units: Vec::new(),
+                scope: Vec::new(),
+                regions: Vec::new(),
+            },
+            OpSite(9),
+            Some(Successor::Labelable(OpSite(5))),
+            &mut state.lowering(),
+        );
+        assert_eq!(carrier, Vec::new());
+        assert_eq!(state.labels.get(OpSite(5)), Some("uniform-label"));
+
+        let nop = |at: u32| OpToLower {
+            at: OpSite(at),
+            reg_defs: OpRegDefs::None,
+            kind: OpKind::Nop { dbg_name: None },
+        };
+        let refused = lower_uniform_operations::<Target>(
+            Component::Pt,
+            UniformizedOp {
+                estimated_instructions: 2,
+                region_units: Vec::new(),
+                scope: Vec::new(),
+                regions: vec![vec![nop(1)], vec![nop(2)]],
+            },
+            OpSite(0),
+            None,
+            &mut state.lowering(),
+        );
+        assert_eq!(refused, Vec::new());
+        assert_eq!(
+            state.blocks.blocks.len(),
+            1,
+            "the empty regular block was popped"
+        );
+        let regions = state.blocks.blocks[0].instr_lists();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions
+                .iter()
+                .map(|instrs| instrs.iter().map(|instr| instr.opcode).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![OpCode::NOP], vec![OpCode::NOP]]
+        );
+        assert_eq!(state.blocks.blocks[0].current_region(), RegionIndex(1));
+        assert_eq!(state.cq_stats, Some(CodeQualityStats::default()));
     }
 }

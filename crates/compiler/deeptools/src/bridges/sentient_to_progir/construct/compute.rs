@@ -674,6 +674,25 @@ impl ComputeComp {
         }
     }
 
+    /// The compute component a unit's own component narrows to.
+    ///
+    /// ⛔ `None` FOR A UNIT WITH NO COMPUTE INSTRUCTION, where the reference passes its `comp`
+    /// straight through and `ConstructFMAInstr` writes an FMA for a load unit.
+    #[must_use]
+    pub const fn of_component(comp: Component) -> Option<ComputeComp> {
+        match comp {
+            Component::Pt => Some(ComputeComp::Pt),
+            Component::Pe => Some(ComputeComp::Pe),
+            Component::Sfp => Some(ComputeComp::Sfp),
+            Component::L0lu
+            | Component::L0su
+            | Component::Lxlu
+            | Component::Lxsu
+            | Component::L3lu
+            | Component::L3su => None,
+        }
+    }
+
     /// The other direction — the pair a ternary instruction is already narrowed to.
     #[must_use]
     pub const fn of_compute_unit(unit: ComputeUnit) -> Self {

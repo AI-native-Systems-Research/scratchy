@@ -39,6 +39,28 @@ pub enum ComputeUnit {
     Sfp,
 }
 
+impl ComputeUnit {
+    /// The PE/SFP pair a unit's own component narrows to.
+    ///
+    /// ⛔ `None` FOR THE PT AND FOR EVERY TRANSFER UNIT — the PT because `ConstructTernaryInstr`
+    /// reaches this pair only after the matrix unit has left (`:1774`), the rest because they have no
+    /// compute instruction at all.
+    #[must_use]
+    pub const fn of_component(comp: Component) -> Option<ComputeUnit> {
+        match comp {
+            Component::Pe => Some(ComputeUnit::Pe),
+            Component::Sfp => Some(ComputeUnit::Sfp),
+            Component::Pt
+            | Component::L0lu
+            | Component::L0su
+            | Component::Lxlu
+            | Component::Lxsu
+            | Component::L3lu
+            | Component::L3su => None,
+        }
+    }
+}
+
 /// WHICH OF THE THREE OPERANDS — `opA`, `opB` or `opC`, which is what `src0_operand_idx`'s 0/1/2
 /// names (`Utils.hpp:33-36`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
