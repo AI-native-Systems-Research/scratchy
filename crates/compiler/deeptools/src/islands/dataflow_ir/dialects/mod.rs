@@ -1459,13 +1459,13 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 results.extend(bound.iter_mut());
             }
             uniform::Op::Yield { operands: yielded } => operands.extend(yielded.iter_mut()),
-            uniform::Op::DefImmutableMapping { result, pairs } => {
+            uniform::Op::DefImmutableMapping { result, pairs, .. } => {
                 for (key, value) in pairs {
                     operands.extend([key, value]);
                 }
                 results.push(result);
             }
-            uniform::Op::QueryMap { result, map, key } => {
+            uniform::Op::QueryMap { result, map, key, .. } => {
                 operands.extend([map, key]);
                 results.push(result);
             }
@@ -1994,14 +1994,14 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             uniform::Op::Yield { operands } => {
                 vals.extend(operands.iter_mut().map(|read| (Role::Operand, read)));
             }
-            uniform::Op::DefImmutableMapping { result, pairs } => {
+            uniform::Op::DefImmutableMapping { result, pairs, .. } => {
                 for (key, value) in pairs {
                     vals.push((Role::Operand, key));
                     vals.push((Role::Operand, value));
                 }
                 vals.push((Role::Result, result));
             }
-            uniform::Op::QueryMap { result, map, key } => {
+            uniform::Op::QueryMap { result, map, key, .. } => {
                 vals.push((Role::Operand, map));
                 vals.push((Role::Operand, key));
                 vals.push((Role::Result, result));

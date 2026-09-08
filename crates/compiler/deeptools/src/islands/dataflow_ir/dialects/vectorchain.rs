@@ -677,6 +677,16 @@ pub enum Op {
         value: Vec<i64>,
         /// Its type — as many elements as `value` has.
         ty: Vector,
+        /// `is_symbol` — the values are SYMBOL IDS a later pass resolves, not bit patterns.
+        ///
+        /// ⛔⛔ IT CHANGES THE WHOLE PRINTED FORM, not just one attribute.
+        /// `ConstantBitstreamOp::print` reads `is_symbol` FIRST and prints the hand-rolled
+        /// `{value = [0x..]}` only when it is absent or false; when it is true the op prints its
+        /// generic attribute dictionary instead — decimal `N : i64` values, `is_symbol` before
+        /// `value` (`VectorChain.cpp:78-105`). `constructUniformizedFoldedConstantBitStream` sets it
+        /// on every bitstream it builds when its `is_symbolic` argument is set
+        /// (`SNDSCLowering.cpp:479-481, 519-521`).
+        is_symbol: bool,
     },
 
     /// `vectorchain.shuffle input(%c) {indices = [..], repetition = N} : tin, tout` — the splat that
@@ -1121,15 +1131,35 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::vector(*ty)
             );
         }
-        Op::ConstantBitstream { result, value, ty } => {
-            let values = value
-                .iter()
-                .map(|bits| format!("{bits:#x}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+        Op::ConstantBitstream {
+            result,
+            value,
+            ty,
+            is_symbol,
+        } => {
+            // ⛔ TWO FORMS, PICKED BY `is_symbol` (`VectorChain.cpp:80-101`): the custom one prints
+            // the values as hex with no type suffix, the generic attribute dictionary prints them
+            // decimal with one — and puts `is_symbol` first, because a `DictionaryAttr` is sorted by
+            // name. Not a cosmetic difference: `0x2a` and `42 : i64` are different attributes to the
+            // parser on the far side.
+            let attrs = if *is_symbol {
+                let values = value
+                    .iter()
+                    .map(|v| format!("{v} : i64"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{is_symbol = true, value = [{values}]}}")
+            } else {
+                let values = value
+                    .iter()
+                    .map(|bits| format!("{bits:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{value = [{values}]}}")
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.constant_bitstream {{value = [{values}]}} : {}",
+                "{} = vectorchain.constant_bitstream {attrs} : {}",
                 print::val(*result),
                 print::vector(*ty)
             );
@@ -1250,6 +1280,56 @@ mod tests {
     use crate::islands::dataflow_ir::dialects::Val;
     use crate::islands::dataflow_ir::dialects::vectorchain::{Op, emit};
     use crate::islands::dataflow_ir::ty::{ElemType, Vector};
+
+    /// ⭐⭐ A BITSTREAM'S TWO PRINTED FORMS, AND `is_symbol` IS WHAT PICKS BETWEEN THEM.
+    ///
+    /// `ConstantBitstreamOp::print` reads the attribute FIRST and takes the hand-rolled hex form only
+    /// when it is absent or false; when it is true the op prints its generic attribute dictionary
+    /// instead (`VectorChain.cpp:80-101`). So the same values print as `0x2a` in one case and
+    /// `42 : i64` in the other, with `is_symbol` ahead of `value` because a `DictionaryAttr` is sorted
+    /// by name.
+    ///
+    /// ⛔ A SHAPE ASSERTION PASSES ON BOTH. "It names the op and carries the value" holds for
+    /// `{value = [0x2a]}` and `{is_symbol = true, value = [42 : i64]}` alike, and the far side parses
+    /// exactly one of them for a given op — which is why this is checked as bytes.
+    #[test]
+    fn a_symbolic_bitstream_prints_its_attribute_dictionary() {
+        let f16x64 = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+
+        let mut literal = String::new();
+        emit(
+            &mut literal,
+            &Op::ConstantBitstream {
+                result: Val(3),
+                value: vec![42, 1],
+                ty: f16x64,
+                is_symbol: false,
+            },
+        );
+        assert_eq!(
+            literal,
+            "%3 = vectorchain.constant_bitstream {value = [0x2a, 0x1]} : vector<64xf16>\n"
+        );
+
+        let mut symbolic = String::new();
+        emit(
+            &mut symbolic,
+            &Op::ConstantBitstream {
+                result: Val(3),
+                value: vec![42, 1],
+                ty: f16x64,
+                is_symbol: true,
+            },
+        );
+        assert_eq!(
+            symbolic,
+            "%3 = vectorchain.constant_bitstream {is_symbol = true, value = [42 : i64, 1 : i64]} : \
+             vector<64xf16>\n"
+        );
+    }
 
     /// ⭐⭐ IBM'S OWN PACK LINE, REPRODUCED BYTE FOR BYTE.
     ///

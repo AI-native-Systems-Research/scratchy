@@ -1175,6 +1175,7 @@ mod unit_tests {
         expand_affine_apply_ops, fold_to_constant, is_arith_constant, perform_full_unroll,
     };
     use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::dialects::uniform::MappedTy;
     use crate::islands::dataflow_ir::dialects::{
         Op as DfirOp, Val, affine, arith, block_args, dataflow, operands, regions, results, scf,
         symbol, uniform,
@@ -2078,13 +2079,19 @@ scf.for %1 = %2 to %3 step %4 {
         ops.push(DfirOp::Uniform(uniform::Op::DefImmutableMapping {
             result,
             pairs,
+            values_ty: MappedTy::Index,
         }));
         ops
     }
 
     /// `%q = uniform.query_map(map:%m, key:%k) : index`.
     fn a_query(result: Val, map: Val, key: Val) -> DfirOp {
-        DfirOp::Uniform(uniform::Op::QueryMap { result, map, key })
+        DfirOp::Uniform(uniform::Op::QueryMap {
+            result,
+            map,
+            key,
+            ty: MappedTy::Index,
+        })
     }
 
     /// 🎯 183/384 — ⭐⭐ `isConstant`'S SECOND ACCEPTING BRANCH: A `uniform.query_map` WHOSE MAPPING
