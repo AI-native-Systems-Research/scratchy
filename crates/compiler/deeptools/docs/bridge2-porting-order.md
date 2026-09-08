@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`303/384 ported; 303/384 audited`
+`311/384 ported; 311/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2542,6 +2542,67 @@ reproduced with the layout transposed and scaled — the overflow, the one quant
 reads, unchanged, and each test stating the vendor's original pair beside it.
 
 
+⭐ ENTRIES 311-318 — THE COMPOSITE RECORD PAIR, THE FOUR AFFINE LOWERING ENTRY POINTS, THE TWO
+INDIRECT ONES AND THE LDCVTI COLLAPSE. All eight are in `agen_helper.rs`.
+
+⛔ 311 IS BLOCKED AT ITS FIRST STATEMENT. `AccessDetailsAffineComposite::constructDetails`
+(`AccessDetails.cpp:833`) is unported, so every one of the four requested operand records ends in a
+private `todo!` and the entry has no reachable outcome to test — the entry 374/375 precedent. What IS
+written is the part that outlives the blocker: the operand order `kDirSrc, kDirDst, kIndSrc, kIndDst`
+with a distinct diagnostic each, `constructTimeStepsInfo` taking the declaration's own defaults
+`do_coalesce = true, do_burst_il_group_calc = true` (`AccessDetails.hpp:275-276`), and the tail into
+entry 212. `has_ind_dst` with no `dst_op` is a typed arm: the reference inserts a record over a null
+operand there (`:2836`) and crashes inside it.
+
+⛔⛔ 312 AND 314 DIFFER IN ONE ARGUMENT AND IT IS OBSERVABLE. 312 passes `nullptr` for the
+destination (`:3006`) where 314 passes the store its load feeds (`:3059`), so on the SAME vendor body
+the extract path builds ONE record and the plain load path builds TWO — which is why 314 alone has no
+`DT_CHECK(access_details.size() == 1)` and why the two tests read one shared fixture and separate on
+the record count. 314 also RE-COLLECTS the store off the re-found candidate (`:3067`) because
+building the records may have cloned or deleted operations, and its `bool is_load_store` (`:3052`) is
+never read.
+
+⛔ 315, 316 AND 317 END AT ENTRIES 359 AND 358, unported, and every refusal ahead of them is real:
+the component gate is 316's and 317's FIRST statement (*"only supported in LXLU"* / *"in LXSU"*,
+`:3172-3174`, `:3220-3222`), decided before any record exists. Each reads its element type off the
+CANDIDATE's own memref and not off the record — 315 `candidate_op.getMemRef()` (`:3089`), 317
+`getDirectMemrefType()` (`:3283`) — and the deletes are queued only after the statement is built, so
+none of them is reachable here either.
+
+⛔⛔ 318's `isSplatOfFirstVar` IS "EVERY INDEX IS -1", NOT THE PAD-SPLAT TEST BESIDE IT.
+`getFirstVariableIndex()` returns -1 whenever the variable list is non-empty
+(`VectorChain.td:485-489`), so the check is `getShuffleIndicesAsVector` against that constant
+(`dialect_utils/VectorChain/Utils.cpp:94-101`). And the `DT_CHECK_MSG(!ldtype_shuffle, "ldtype for
+LDCVTI not currently supported")` at `:3536-3538` runs BEFORE `identifyLoads` is ever called, so it
+is vacuous and a nested ldtype shuffle between the splat and its load IS accepted — the load behind
+it is what goes on the delete list, exactly as the reference does.
+
+⛔ 318's MASK IS IBM'S OWN ALL-LANES-OFF SET. *"BinaryOp mask should not mask anything"* (`:3485`) is
+`FlatLinearValueConstraints(mask_set).isEmpty()`, and the set that satisfies it is
+`affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` (`mixed_precision.mlir:747-895`) — a contradiction,
+not an absent mask. The one C++ `CreateAffineMaskOp` is two variants in this island, so both answer.
+The scale index constant is hoisted BEFORE the element's (`:3676-3695`), the `set_send_dst` is emitted
+before the statement (`:3739-3745`), and the delete list is send, multiply, scale shuffle, scale load,
+element shuffle, element load in that order (`:3765-3770`).
+
+⛔ ISLAND GROWTH, ALL ON AGENT-BRIEF.md:87. `DfirUnit::LxluScaleReg` and
+`GenericComp::LxluScaleReg` were added across eight files: without a variant for the LXLU's scale
+register file `setScaleLoadIfFound` (`Helper.cpp:3600`) is unstatable, because the LDCVTI pattern
+tells its element load from its scale load by asking which unit the loaded view sits on
+(`sys-arch-spec/arch_enums.cpp:117`, `:169`; `sysdef.cpp:539` pairs it with one LXLU, so it is per
+corelet). `sentient::Op::LoadComputeAndSend`'s `src_element_size` and `dst_element_size` were retyped
+`Bytes` → `Bits`, because `getElementTypeBitWidth()` is what fills them (`:3702-3709`) and
+`SentientOps.td`'s own example spells `src_element_size = 4` for a four-bit view. And
+`construct_iterator_coeff_dict` was promoted to `pub(super)` for 318's scale-coefficient test.
+
+⛔⛔ AND ENTRY 357's `todo!` GATE WAS RATCHETED DOWN, which is what makes six of these eight
+reachable at all. It stood at "no access records", and every one of these entries builds one; the
+reference's `else` branch at `:761` is taken whenever NO subscript is a loop iterator, and there a
+non-L3 unit whose `init_value` is 0 takes neither arm at `:788` nor `:795` and leaves
+`mutable_addrs[i]` as it found it (`:823`). That second provable no-op is now in the gate. An L3 half,
+a non-zero constant offset, or an iterator subscript at all still stops at the `todo!`.
+
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3179,22 +3240,22 @@ reads, unchanged, and each test stating the vendor's original pair beside it.
 
 ## Level 5
 
-- [ ] **PORT 311/384** `constructAffineCompDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2809`, 33 lines
-- [ ] **AUDIT 311/384** `constructAffineCompDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2809`, line by line against the C++
-- [ ] **PORT 312/384** `lowerExtractVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3001`, 21 lines
-- [ ] **AUDIT 312/384** `lowerExtractVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3001`, line by line against the C++
-- [ ] **PORT 313/384** `lowerExtractVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3026`, 20 lines
-- [ ] **AUDIT 313/384** `lowerExtractVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3026`, line by line against the C++
-- [ ] **PORT 314/384** `lowerVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3050`, 20 lines
-- [ ] **AUDIT 314/384** `lowerVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3050`, line by line against the C++
-- [ ] **PORT 315/384** `lowerVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3074`, 28 lines
-- [ ] **AUDIT 315/384** `lowerVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3074`, line by line against the C++
-- [ ] **PORT 316/384** `lowerIndirectVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3169`, 44 lines
-- [ ] **AUDIT 316/384** `lowerIndirectVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3169`, line by line against the C++
-- [ ] **PORT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, 46 lines
-- [ ] **AUDIT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, line by line against the C++
-- [ ] **PORT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, 326 lines
-- [ ] **AUDIT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, line by line against the C++
+- [x] **PORT 311/384** `constructAffineCompDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2809`, 33 lines
+- [x] **AUDIT 311/384** `constructAffineCompDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2809`, line by line against the C++
+- [x] **PORT 312/384** `lowerExtractVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3001`, 21 lines
+- [x] **AUDIT 312/384** `lowerExtractVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3001`, line by line against the C++
+- [x] **PORT 313/384** `lowerExtractVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3026`, 20 lines
+- [x] **AUDIT 313/384** `lowerExtractVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3026`, line by line against the C++
+- [x] **PORT 314/384** `lowerVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3050`, 20 lines
+- [x] **AUDIT 314/384** `lowerVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3050`, line by line against the C++
+- [x] **PORT 315/384** `lowerVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3074`, 28 lines
+- [x] **AUDIT 315/384** `lowerVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3074`, line by line against the C++
+- [x] **PORT 316/384** `lowerIndirectVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3169`, 44 lines
+- [x] **AUDIT 316/384** `lowerIndirectVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3169`, line by line against the C++
+- [x] **PORT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, 46 lines
+- [x] **AUDIT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, line by line against the C++
+- [x] **PORT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, 326 lines
+- [x] **AUDIT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, line by line against the C++
 - [ ] **PORT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, 166 lines
 - [ ] **AUDIT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, line by line against the C++
 - [ ] **PORT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, 4 lines

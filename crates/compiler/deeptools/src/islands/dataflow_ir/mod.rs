@@ -374,7 +374,10 @@ impl Units {
             | DfirUnit::L3Ibr
             // ⛔ AND THE CROSS-PARTITION LINK MOVES NOTHING OF ITS OWN either: it is a send
             // destination the LXLU routes to, not a memory a transfer reads or writes.
-            | DfirUnit::CrossPtnLink => false,
+            | DfirUnit::CrossPtnLink
+            // ⛔ AND NEITHER DOES THE LXLU'S SCALE REGISTER FILE — it is read THROUGH A VIEW by the
+            // LDCVTI pattern's scale load, and the LXLU is what moves.
+            | DfirUnit::LxluScaleReg => false,
         }
     }
 }

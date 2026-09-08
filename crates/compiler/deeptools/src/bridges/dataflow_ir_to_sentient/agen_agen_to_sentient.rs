@@ -1237,7 +1237,8 @@ impl TransferComp {
             | DfirUnit::SfpRing
             | DfirUnit::LxVirtualIbr
             | DfirUnit::L3Ibr
-            | DfirUnit::CrossPtnLink => None,
+            | DfirUnit::CrossPtnLink
+            | DfirUnit::LxluScaleReg => None,
         }
     }
 }

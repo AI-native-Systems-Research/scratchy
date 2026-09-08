@@ -32,7 +32,7 @@
 
 use std::fmt::Write as _;
 
-use crate::arch::{Bounded, Bytes, Elements};
+use crate::arch::{Bounded, Elements};
 use crate::formats::Bits;
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::dialects::dataflow::RegAddr;
@@ -2034,10 +2034,13 @@ pub enum Op {
         /// `$dst_total_elements` — ⛔ SEPARATE FROM THE SOURCE'S, because the compute may change the
         /// width.
         dst_total_elements: Elements,
-        /// `$src_element_size` — ⛔ A WIDTH IN BYTES, not a count.
-        src_element_size: Bytes,
-        /// `$dst_element_size` — ⛔ a width in bytes.
-        dst_element_size: Bytes,
+        /// `$src_element_size` — ⛔ A WIDTH IN **BITS**, not a count and not bytes; see
+        /// [`Extent::element_size`]. `getElementTypeBitWidth()` is what fills it
+        /// (`Helper.cpp:3735`), and `SentientOps.td`'s own example spells `src_element_size = 4`
+        /// for a four-bit view.
+        src_element_size: Bits,
+        /// `$dst_element_size` — ⛔ a width in **bits**, from the compute result's element type.
+        dst_element_size: Bits,
         /// `$dir`.
         dir: Option<RoutingDirection>,
         /// `$shuffle_mode`.

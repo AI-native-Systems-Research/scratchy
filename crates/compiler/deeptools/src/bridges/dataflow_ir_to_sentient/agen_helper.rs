@@ -119,15 +119,18 @@
 
 use super::agen_access_details::{
     AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsSymbolic,
-    ConstructedDetails, IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim,
+    ConstructedDetails, IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim, TimeStepsInfo,
+    construct_iterator_coeff_dict, construct_time_steps_info,
 };
 use super::agen_agen_to_sentient::{StrideStep, TransferSpecialisation};
 use super::std_standard_to_sentient::lower_constant_index_to_sentient;
+use super::tf_utils::constant_index;
+use super::vc_vector_operands::access_map;
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
     self as dfir_op, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results,
-    uses,
+    uniform, uses, vectorchain as vc,
 };
 use crate::islands::dataflow_ir::link::SendEnd;
 use crate::islands::dataflow_ir::ty::{
@@ -1627,7 +1630,7 @@ mod unit_tests {
         CrossPtnLink as CrossPtnLinkUnit, L0su as L0suUnit, Link, Lxlu as LxluUnit, PtRowUnit,
         Sfp as SfpUnit,
     };
-    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef};
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, ElemType, MemRef};
     use crate::units::{Core, Corelet, Residency, Row};
 
     /// ⭐ AN OUTERMOST LOOP IS LEVEL 0 — the `level = -1` start, which is easy to lose.
@@ -3756,59 +3759,7 @@ mod unit_tests {
     /// (`lx_indirect_loads_stores_composite.mlir:30-40`).
     #[test]
     fn the_vendors_indirect_view_pattern_builds_the_extract_and_pairs_it() {
-        let ibr_ty = MemRef {
-            shape: vec![32],
-            elem: ElemType::Int(8),
-        };
-        let body = vec![
-            DfirOp::Dataflow(dataflow::Op::GetUnit {
-                result: Val(71),
-                residency: at_corelet_zero(),
-                unit: DfirUnit::LxVirtualIbr,
-                num_folds: None,
-            }),
-            DfirOp::Arith(arith::Op::Constant {
-                result: Val(72),
-                value: 0,
-            }),
-            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
-                result: Val(70),
-                from: Val(71),
-                start: Val(72),
-                layout: identity_1d(),
-                ty: ibr_ty.clone(),
-            }),
-            DfirOp::Dataflow(dataflow::Op::GetUnit {
-                result: Val(74),
-                residency: at_corelet_zero(),
-                unit: DfirUnit::Lxlu,
-                num_folds: None,
-            }),
-            DfirOp::Dataflow(dataflow::Op::Receive {
-                result: Val(73),
-                from: Link::<LxluUnit, L0suUnit>::between(Val(74), L0SU).ends().1,
-                ty: LANES,
-            }),
-            DfirOp::Agen(agen::Op::VectorStore {
-                dbg_name: None,
-                value: Val(73),
-                view: Val(70),
-                indices: vec![Index::Const(0)],
-                view_ty: ibr_ty.clone(),
-                ty: LANES,
-            }),
-            DfirOp::Agen(agen::Op::IndirectVectorStore {
-                value: Val(76),
-                indirect_view: Val(70),
-                indirect_indices: vec![Index::Const(0)],
-                indirect_view_ty: ibr_ty,
-                direct_view: VIEW,
-                direct_indices: indices(Val(77)),
-                direct_view_ty: view_ty(),
-                multicast_info: None,
-                ty: LANES,
-            }),
-        ];
+        let body = extract_store_body();
 
         let store = ExtractVectorStore::of(&body[5]).expect("an agen.vector_store");
         let mut values = Values::default();
@@ -4356,74 +4307,7 @@ mod unit_tests {
     /// (`lx_indirect_loads_stores.mlir:335-346`, expected at `:52`).
     #[test]
     fn the_vendors_load_and_extract_pattern_builds_the_statement_and_pairs_it() {
-        let lx_ty = MemRef {
-            shape: vec![128],
-            elem: ElemType::Int(8),
-        };
-        let ibr_ty = MemRef {
-            shape: vec![32],
-            elem: ElemType::Int(8),
-        };
-        let body = vec![
-            DfirOp::Dataflow(dataflow::Op::GetUnit {
-                result: Val(60),
-                residency: at_corelet_zero(),
-                unit: DfirUnit::Lx,
-                num_folds: None,
-            }),
-            DfirOp::Arith(arith::Op::Constant {
-                result: Val(61),
-                value: 0,
-            }),
-            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
-                result: Val(62),
-                from: Val(60),
-                start: Val(61),
-                layout: identity_1d(),
-                ty: lx_ty.clone(),
-            }),
-            DfirOp::Agen(agen::Op::VectorLoad {
-                dbg_name: None,
-                result: Val(63),
-                view: Val(62),
-                indices: vec![Index::Const(0)],
-                view_ty: lx_ty,
-                ty: LANES,
-                multicast_info: None,
-            }),
-            DfirOp::Dataflow(dataflow::Op::GetUnit {
-                result: Val(64),
-                residency: at_corelet_zero(),
-                unit: DfirUnit::LxVirtualIbr,
-                num_folds: None,
-            }),
-            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
-                result: Val(65),
-                from: Val(64),
-                start: Val(61),
-                layout: identity_1d(),
-                ty: ibr_ty.clone(),
-            }),
-            DfirOp::Agen(agen::Op::VectorStore {
-                dbg_name: None,
-                value: Val(63),
-                view: Val(65),
-                indices: vec![Index::Const(0)],
-                view_ty: ibr_ty.clone(),
-                ty: LANES,
-            }),
-            DfirOp::Agen(agen::Op::IndirectVectorLoad {
-                result: Val(66),
-                indirect_view: Val(65),
-                indirect_indices: vec![Index::Const(0)],
-                indirect_view_ty: ibr_ty,
-                direct_view: VIEW,
-                direct_indices: indices(Val(67)),
-                direct_view_ty: view_ty(),
-                multicast_info: None,
-                ty: LANES,
-            }),
-        ];
+        let body = extract_load_body();
 
         let load = ExtractVectorLoad::of(&body[3]).expect("an agen.vector_load");
         let DfirOp::Agen(load_agen) = &body[3] else {
@@ -4714,6 +4598,522 @@ mod unit_tests {
         assert!(
             to_be_deleted.is_empty(),
             "the delete is queued only on success"
+        );
+    }
+
+    /// ⭐ THE VENDOR'S `lxlu_extract_op`: an LX `vector_load`, stored into a virtual-IBR view that an
+    /// `indirect_vector_load` then gathers from (`lx_indirect_loads_stores.mlir:335-346`).
+    fn extract_load_body() -> Vec<DfirOp> {
+        let lx_ty = MemRef {
+            shape: vec![128],
+            elem: ElemType::Int(8),
+        };
+        let ibr_ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(8),
+        };
+        vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(60),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lx,
+                num_folds: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(61),
+                value: 0,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(62),
+                from: Val(60),
+                start: Val(61),
+                layout: identity_1d(),
+                ty: lx_ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: Val(63),
+                view: Val(62),
+                indices: vec![Index::Const(0)],
+                view_ty: lx_ty,
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(64),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::LxVirtualIbr,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(65),
+                from: Val(64),
+                start: Val(61),
+                layout: identity_1d(),
+                ty: ibr_ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: Val(63),
+                view: Val(65),
+                indices: vec![Index::Const(0)],
+                view_ty: ibr_ty.clone(),
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::IndirectVectorLoad {
+                result: Val(66),
+                indirect_view: Val(65),
+                indirect_indices: vec![Index::Const(0)],
+                indirect_view_ty: ibr_ty,
+                direct_view: VIEW,
+                direct_indices: indices(Val(67)),
+                direct_view_ty: view_ty(),
+                multicast_info: None,
+                ty: LANES,
+            }),
+        ]
+    }
+
+    /// ⭐ THE VENDOR'S INDIRECT-VIEW PATTERN, whose scatter is the view's second user:
+    /// `%13 = get_unit {type = "lxvirtualibr"}`, `%23 = get_logical_memory_view %13, %3` with `%3 = 0`,
+    /// then a `vector_store` of a receive into it and an `indirect_vector_store` off it
+    /// (`lx_indirect_loads_stores_composite.mlir:30-40`).
+    fn extract_store_body() -> Vec<DfirOp> {
+        let ibr_ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(8),
+        };
+        vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(71),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::LxVirtualIbr,
+                num_folds: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(72),
+                value: 0,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(70),
+                from: Val(71),
+                start: Val(72),
+                layout: identity_1d(),
+                ty: ibr_ty.clone(),
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(74),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lxlu,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(73),
+                from: Link::<LxluUnit, L0suUnit>::between(Val(74), L0SU).ends().1,
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: Val(73),
+                view: Val(70),
+                indices: vec![Index::Const(0)],
+                view_ty: ibr_ty.clone(),
+                ty: LANES,
+            }),
+            DfirOp::Agen(agen::Op::IndirectVectorStore {
+                value: Val(76),
+                indirect_view: Val(70),
+                indirect_indices: vec![Index::Const(0)],
+                indirect_view_ty: ibr_ty,
+                direct_view: VIEW,
+                direct_indices: indices(Val(77)),
+                direct_view_ty: view_ty(),
+                multicast_info: None,
+                ty: LANES,
+            }),
+        ]
+    }
+
+    // ─────────────────────────────── 312/384 ───────────────────────────────
+
+    /// 🎯 312/384 — THE VENDOR'S OWN EXTRACT LOAD, FROM THE OPERATION THE WALK HANDED IT: entry 298
+    /// marks position 3, the re-find answers with it, and entry 269 builds the statement.
+    #[test]
+    fn the_extract_load_lowers_from_the_op_the_walk_handed_it() {
+        let unit = unit_holding(DfirUnit::Lxlu, extract_load_body());
+        let mut marked = Marked::at([]);
+        let mut values = Values::default();
+        let mut extract_ops = ExtractScalarOps::default();
+
+        let lowered = lower_extract_vector_load_op(
+            &unit.body[3],
+            3,
+            &unit,
+            DfirUnit::Lxlu,
+            &mut marked,
+            &mut values,
+            &mut extract_ops,
+        );
+
+        let ExtractVectorLoadLowering::Lowered(built) = lowered else {
+            panic!("the vendor's own pattern must lower, got {lowered:?}");
+        };
+        assert!(marked.holds(3), "entry 298's gather marked the load");
+        assert_eq!(built.paired.kind(), ExtractScalarKind::LoadAndExtractScalar);
+        assert_eq!(
+            built.to_be_deleted,
+            [&unit.body[6], &unit.body[3]],
+            "the store then the load"
+        );
+    }
+
+    // ─────────────────────────────── 313/384 ───────────────────────────────
+
+    /// 🎯 313/384 — THE VENDOR'S OWN EXTRACT STORE, and ⛔ WHAT CARRIES FROM ENTRY 298 TO ENTRY 216 IS
+    /// THE MARK: the records and addresses built on the way are never read.
+    #[test]
+    fn the_extract_store_lowers_on_the_mark_and_not_on_the_records() {
+        let scope = extract_store_body();
+        let mut marked = Marked::at([]);
+        let mut values = Values::default();
+        let mut extract_ops = ExtractScalarOps::default();
+
+        let lowered = lower_extract_vector_store_op(
+            &scope[5],
+            5,
+            DfirUnit::Lxlu,
+            &mut marked,
+            &scope,
+            &mut values,
+            &mut extract_ops,
+        );
+
+        let ExtractVectorStoreLowering::Lowered(built) = lowered else {
+            panic!("the vendor's own pattern must lower, got {lowered:?}");
+        };
+        assert!(marked.holds(5), "entry 298's gather marked the store");
+        assert_eq!(built.indirect_store, &scope[6], "the scatter it pairs with");
+    }
+
+    // ─────────────────────────────── 314/384 ───────────────────────────────
+
+    /// 🎯 314/384 — A LOAD WITH NOTHING STORING ITS RESULT IS A LOAD-AND-SEND, and ⛔ THAT STATEMENT
+    /// IS ENTRY 358, unported — so entry 217's single-access arm is where the reachable half ends.
+    #[test]
+    #[should_panic(expected = "e358_constructLoadAndSendStmt")]
+    fn a_lone_vector_load_reaches_the_load_and_send_gap() {
+        let unit = unit_holding(DfirUnit::Lxlu, extract_load_body()[..4].to_vec());
+        let mut marked = Marked::at([]);
+        let mut values = Values::default();
+        let _ = lower_vector_load_op(
+            &unit.body[3],
+            3,
+            &unit,
+            DfirUnit::Lxlu,
+            &mut marked,
+            &mut values,
+        );
+    }
+
+    // ─────────────────────────────── 315/384 ───────────────────────────────
+
+    /// 🎯 315/384 — ⛔ THE STORE'S STATEMENT IS ENTRY 359, unported, and the element type the reference
+    /// reads for it comes off the candidate's OWN memref rather than off the record.
+    #[test]
+    #[should_panic(expected = "e359_constructReceiveAndStoreStmt")]
+    fn a_vector_store_reaches_the_receive_and_store_gap() {
+        let scope = extract_store_body();
+        let mut marked = Marked::at([]);
+        let _ = lower_vector_store_op(&scope[5], 5, DfirUnit::Lxlu, &mut marked, &scope);
+    }
+
+    // ─────────────────────────────── 316/384 ───────────────────────────────
+
+    /// 🎯 316/384 — ⛔ THE COMPONENT GATE IS THE FIRST STATEMENT: *"IndirectVectorLoadOp only supported
+    /// in LXLU"* is decided before any record is built, and on the LXLU the records come first.
+    #[test]
+    fn the_indirect_load_is_gated_on_the_lxlu_before_anything_else() {
+        let body = extract_load_body();
+        let mut marked = Marked::at([]);
+        assert_eq!(
+            lower_indirect_vector_load_op(
+                &body[7],
+                0,
+                DfirUnit::Lxsu,
+                None,
+                &ExtractScalarOps::default(),
+                &mut marked,
+                &[],
+            ),
+            IndirectVectorLoadLowering::OnlySupportedInLxlu
+        );
+        assert!(
+            matches!(
+                lower_indirect_vector_load_op(
+                    &body[7],
+                    0,
+                    DfirUnit::Lxlu,
+                    None,
+                    &ExtractScalarOps::default(),
+                    &mut marked,
+                    &[],
+                ),
+                IndirectVectorLoadLowering::DetailsFailed(_)
+            ),
+            "with no scope the gather's own records cannot be built"
+        );
+    }
+
+    // ─────────────────────────────── 317/384 ───────────────────────────────
+
+    /// 🎯 317/384 — THE SCATTER'S TWIN GATE, on the LXSU: *"IndirectVectorStoreOp only supported in
+    /// LXSU"* before any record, and the records before the unported statement.
+    #[test]
+    fn the_indirect_store_is_gated_on_the_lxsu_before_anything_else() {
+        let body = extract_store_body();
+        let mut marked = Marked::at([]);
+        assert_eq!(
+            lower_indirect_vector_store_op(
+                &body[6],
+                0,
+                DfirUnit::Lxlu,
+                None,
+                &ExtractScalarOps::default(),
+                &mut marked,
+                &[],
+            ),
+            IndirectVectorStoreLowering::OnlySupportedInLxsu
+        );
+        assert!(
+            matches!(
+                lower_indirect_vector_store_op(
+                    &body[6],
+                    0,
+                    DfirUnit::Lxsu,
+                    None,
+                    &ExtractScalarOps::default(),
+                    &mut marked,
+                    &[],
+                ),
+                IndirectVectorStoreLowering::DetailsFailed(_)
+            ),
+            "with no scope the scatter's own records cannot be built"
+        );
+    }
+
+    // ─────────────────────────────── 318/384 ───────────────────────────────
+
+    /// 🎯 318/384 — THE LDCVTI PATTERN COLLAPSES TO ONE STATEMENT: a scale splat off the LXLU's scale
+    /// register file times an element splat off the LX, masked by a set that admits no lane and read
+    /// by one send, becomes `sentient.load_compute_and_send`.
+    ///
+    /// The mask is IBM's own all-lanes-off set, `affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>`
+    /// (`mixed_precision.mlir:747-895`), which is what *"should not mask anything"* means.
+    #[test]
+    fn the_ldcvti_pattern_becomes_one_load_compute_and_send() {
+        let lx_ty = MemRef {
+            shape: vec![128],
+            elem: ElemType::Int(8),
+        };
+        let scale_ty = MemRef {
+            shape: vec![4],
+            elem: ElemType::Int(8),
+        };
+        let mask = vectorchain::Op::CreateAffineMaskSet {
+            result: Val(91),
+            mask_set: IntegerSet {
+                dims: 1,
+                symbols: 0,
+                constraints: vec![
+                    Constraint {
+                        expr: AffineExpr::dim(0).plus(AffineExpr::Const(-64)),
+                        is_equality: false,
+                    },
+                    Constraint {
+                        expr: AffineExpr::dim(0).times(-1).plus(AffineExpr::Const(63)),
+                        is_equality: false,
+                    },
+                ],
+            },
+            mask_parameter: None,
+            ty: LANES,
+        };
+        let predicate = mask.binds_predicate().expect("the mask binds one");
+        let body = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(80),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::Lx,
+                num_folds: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(81),
+                value: 0,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(82),
+                from: Val(80),
+                start: Val(81),
+                layout: identity_1d(),
+                ty: lx_ty.clone(),
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(83),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::LxluScaleReg,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: Val(84),
+                from: Val(83),
+                start: Val(81),
+                layout: identity_1d(),
+                ty: scale_ty.clone(),
+            }),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: Val(85),
+                view: Val(82),
+                indices: vec![Index::Const(0)],
+                view_ty: lx_ty,
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: Val(86),
+                view: Val(84),
+                indices: vec![Index::Const(0)],
+                view_ty: scale_ty,
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(87),
+                value: 3,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                result: Val(89),
+                input: Val(85),
+                variable: vec![Val(81)],
+                pad: Vec::new(),
+                mask: None,
+                indices: vec![-1],
+                repetition: 1,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Shuffle {
+                result: Val(90),
+                input: Val(86),
+                variable: vec![Val(87)],
+                pad: Vec::new(),
+                mask: None,
+                indices: vec![-1],
+                repetition: 1,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::VectorChain(mask),
+            DfirOp::VectorChain(vectorchain::Op::Binary {
+                result: Val(92),
+                op1: Val(89),
+                op2: Val(90),
+                mask: Some(predicate),
+                binary_op: vectorchain::BinaryOp::Mul,
+                op_specific_map: identity_1d(),
+                operand_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(93),
+                residency: at_corelet_zero(),
+                unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to: SendEnd::to_self(Val(93)),
+                data: Val(92),
+                ty: LANES,
+            }),
+        ];
+        let unit = unit_holding(DfirUnit::Lxlu, body);
+        let mut marked = Marked::at([]);
+        let mut values = Values::default();
+
+        let lowered = lower_ldcvti_pattern(
+            &unit.body[11],
+            &unit,
+            DfirUnit::Lxlu,
+            &mut marked,
+            &mut values,
+        );
+        let LdcvtiPattern::Lowered(built) = lowered else {
+            panic!("the LDCVTI pattern must lower, got {lowered:?}");
+        };
+        assert_eq!(
+            built.to_be_deleted,
+            [
+                &unit.body[13],
+                &unit.body[11],
+                &unit.body[9],
+                &unit.body[6],
+                &unit.body[8],
+                &unit.body[5]
+            ],
+            "the send, the multiply, then scale shuffle, scale load, element shuffle, element load"
+        );
+        assert!(
+            matches!(
+                built.set_send_destination,
+                SetSendDestination::Emit(ref emitted)
+                    if **emitted == SenOp::Sentient(sen::Op::SetSendDst {
+                        units: SendEnd::to_self(Val(93)),
+                    })
+            ),
+            "the PT consumer bypasses, so this path emits the SETDSTMASK itself: {:?}",
+            built.set_send_destination
+        );
+        let SenOp::Sentient(sen::Op::LoadComputeAndSend {
+            src_total_elements,
+            dst_total_elements,
+            src_element_size,
+            dst_element_size,
+            shuffle_mode,
+            scale_index,
+            element_index,
+            consumer,
+            ..
+        }) = built.load_compute_and_send
+        else {
+            panic!(
+                "one load_compute_and_send, got {:?}",
+                built.load_compute_and_send
+            );
+        };
+        assert_eq!(
+            (src_element_size, dst_element_size),
+            (Bits(8), Bits(8)),
+            "the two element sizes are widths in BITS"
+        );
+        assert_eq!(
+            (src_total_elements, dst_total_elements),
+            (Elements(128), Elements(128))
+        );
+        assert_eq!(shuffle_mode, sen::ShuffleMode::NoShuffle);
+        assert_eq!(consumer, SendEnd::to_self(Val(93)));
+        assert!(
+            matches!(
+                built.hoisted[0],
+                SenOp::Sentient(sen::Op::ScalarConstant { value: 3, result, .. })
+                    if result == scale_index
+            ) && matches!(
+                built.hoisted[1],
+                SenOp::Sentient(sen::Op::ScalarConstant { value: 0, result, .. })
+                    if result == element_index
+            ),
+            "the scale's index constant is hoisted before the element's: {:?}",
+            built.hoisted
         );
     }
 }
@@ -6331,13 +6731,23 @@ pub fn gather_affine_load_store_details<T: AccessRecord>(
 
     // `generateAffineAddressManipulationStmts(...)` (`:597-603`) — entry 357/384, unported.
     //
-    // ⛔ THE GATE IS AN INPUT ON WHICH IT PROVABLY WRITES NOTHING: with no access details its
-    // `DT_CHECK` on the three sizes holds trivially (`:631-632`), the coefficient table is empty so it
-    // takes the `else` at `:761`, whose loop over `mutable_addrs_base` — empty too — runs zero times,
-    // and it returns `success()` (`:827`). ⛔ THE `:698` LOOP IS THE OTHER BRANCH's AND IS NOT REACHED,
-    // and this is not the only such input: a non-L3 unit whose constant row is all zeros takes neither
-    // arm at `:788`/`:795` and writes nothing either.
-    if !records.is_empty() {
+    // ⛔ THE GATE IS THE SET OF INPUTS ON WHICH IT PROVABLY WRITES NOTHING, and there are two. With no
+    // access details its `DT_CHECK` on the three sizes holds trivially (`:631-632`), the coefficient
+    // table is empty so it takes the `else` at `:761`, whose loop over `mutable_addrs_base` — empty
+    // too — runs zero times, and it returns `success()` (`:827`). ⛔ THE `:698` LOOP IS THE OTHER
+    // BRANCH's AND IS NOT REACHED. The second input reaches that same `else` with records in hand:
+    // `sorted_indices_coeff_pair` is empty exactly when no subscript is a loop iterator, and there a
+    // non-L3 unit whose `init_value` is 0 takes neither arm at `:788` nor `:795`, leaving
+    // `mutable_addrs[i]` as it found it. Anything else — an L3 half, a non-zero constant offset, or an
+    // iterator subscript at all — is real work no gate can stand in for.
+    let writes_nothing = records.is_empty()
+        || (coefficients.per_index.is_empty()
+            && !matches!(comp, DfirUnit::L3lu | DfirUnit::L3su)
+            && coefficients
+                .constant
+                .iter()
+                .all(|init_value| *init_value == 0));
+    if !writes_nothing {
         todo!(
             "e357_generateAffineAddressManipulationStmts not ported: {} access record(s) need their \
              mutable address registers assigned and advanced across the loop nest \
@@ -8511,17 +8921,1112 @@ pub fn lower_affine_composite_helper<'a>(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 311/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `AccessDetailsAffineComposite::constructDetails` (`AccessDetails.cpp:833`) — ⛔ UNPORTED AND
+/// UNSCHEDULED, and its `initialize` (`:442`, six composite op classes) with it. The affine base
+/// class's override is a DIFFERENT function that answers
+/// [`ConstructedDetails::NotInitialized`] for every composite op, so standing in with it would turn
+/// every valid composite transfer into a silent refusal.
+fn composite_construct_details(memory_index: MemoryOperandIndex) -> ConstructedDetails {
+    todo!(
+        "AccessDetailsAffineComposite::constructDetails (AccessDetails.cpp:833) is unported, so the \
+         {memory_index:?} record of a composite transfer cannot be built"
+    );
+}
+
+/// THE OUTCOME OF [`construct_affine_comp_details_and_addrs`] — every requested record built and its
+/// addresses placed, or WHICH of the reference's diagnostics refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum AffineCompDetailsAndAddrs {
+    /// `LogicalResult::success()`.
+    Constructed,
+    /// *"unable to construct details for src"*.
+    SrcDetailsFailed(ConstructedDetails),
+    /// *"unable to construct details for dst"*.
+    DstDetailsFailed(ConstructedDetails),
+    /// *"unable to construct details for indirect src"*.
+    IndSrcDetailsFailed(ConstructedDetails),
+    /// *"unable to construct details for indirect src"* — ⛔ the message is the src one again
+    /// (`Helper.cpp:2840`).
+    DstIndDetailsFailed(ConstructedDetails),
+    /// A record was already bound to that operand slot.
+    OperandSlotTaken(MemoryOperandIndex),
+    /// ⛔ `has_ind_dst` WITHOUT A `dst_op` — the reference builds the indirect destination's record
+    /// FROM `dst_op` without testing it (`:2836`).
+    IndirectDstWithoutDst,
+    /// `constructTimeStepsInfo` refused.
+    TimeStepsFailed(TimeStepsInfo),
+    /// The address gather refused.
+    GatherFailed(GatheredDetails),
+}
+
+/// Replaces: e311_constructAffineCompDetailsAndAddrs
+///
+/// The composite twin of [`construct_affine_details_and_addrs`]: up to FOUR records — direct src,
+/// direct dst, indirect src (⛔ built from `src_op`, not from any indirect operand) and indirect dst
+/// — then the shared time-step deduction and the addresses.
+pub fn construct_affine_comp_details_and_addrs<'a>(
+    src_op: &'a agen::Op,
+    src_position: usize,
+    dst_op: Option<&'a agen::Op>,
+    comp: DfirUnit,
+    has_ind_src: bool,
+    has_ind_dst: bool,
+    access_details: &mut AccessContainer<AccessDetailsAffineComposite<'a>>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &mut AccessContainer<Val>,
+    marked: &mut Marked,
+    scope: &[DfirOp],
+) -> AffineCompDetailsAndAddrs {
+    // `DT_CHECK(src_op)` (`:2816`) — a `&agen::Op` cannot be null. `dst_op`'s can.
+    if has_ind_dst && dst_op.is_none() {
+        return AffineCompDetailsAndAddrs::IndirectDstWithoutDst;
+    }
+    let requested = [
+        (MemoryOperandIndex::DirSrc, Some(src_op)),
+        (MemoryOperandIndex::DirDst, dst_op),
+        (MemoryOperandIndex::IndSrc, has_ind_src.then_some(src_op)),
+        (
+            MemoryOperandIndex::IndDst,
+            if has_ind_dst { dst_op } else { None },
+        ),
+    ];
+    for (memory_index, op) in requested {
+        let Some(op) = op else { continue };
+        let Some(slot) = access_details.vacancy(memory_index) else {
+            return AffineCompDetailsAndAddrs::OperandSlotTaken(memory_index);
+        };
+        slot.emplace_insert(AccessDetailsAffineComposite::new(op, comp));
+        let constructed = composite_construct_details(memory_index);
+        if !matches!(constructed, ConstructedDetails::Complete) {
+            return match memory_index {
+                MemoryOperandIndex::DirSrc => {
+                    AffineCompDetailsAndAddrs::SrcDetailsFailed(constructed)
+                }
+                MemoryOperandIndex::DirDst => {
+                    AffineCompDetailsAndAddrs::DstDetailsFailed(constructed)
+                }
+                MemoryOperandIndex::IndSrc => {
+                    AffineCompDetailsAndAddrs::IndSrcDetailsFailed(constructed)
+                }
+                MemoryOperandIndex::IndDst => {
+                    AffineCompDetailsAndAddrs::DstIndDetailsFailed(constructed)
+                }
+            };
+        }
+    }
+
+    // `:2841` — with the declaration's own defaults, `do_coalesce` and `do_burst_il_group_calc`
+    // both true (`AccessDetails.hpp:275-276`).
+    let steps = construct_time_steps_info(access_details, true, true, scope);
+    if !steps.constructed() {
+        return AffineCompDetailsAndAddrs::TimeStepsFailed(steps);
+    }
+
+    match gather_affine_load_store_details(
+        src_position,
+        marked,
+        comp,
+        access_details,
+        mutable_addrs,
+        immutable_addrs,
+    ) {
+        GatheredDetails::Gathered => AffineCompDetailsAndAddrs::Constructed,
+        refused => AffineCompDetailsAndAddrs::GatherFailed(refused),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 312/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`lower_extract_vector_load_op`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ExtractVectorLoadLowering<'a> {
+    /// The `sentient.load_and_extract_scalar` and the gather it pairs with.
+    Lowered(Box<ConstructedLoadAndExtract<'a>>),
+    /// The operation this was called over is not an `agen.vector_load`.
+    NotAVectorLoad,
+    /// Entry 298 refused.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3009`).
+    SingleAccessInfoNeeded,
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+    /// *"Unable to generate load_and_extract_scalar operation for the agen.vector_load op"*.
+    Refused(LoadAndExtractScalar<'a>),
+}
+
+/// Replaces: e312_lowerExtractVectorLoadOp
+///
+/// One affine record for the load, then the marked candidate is re-found and turned into a
+/// `sentient.load_and_extract_scalar`.
+pub fn lower_extract_vector_load_op<'a, A: Arch>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a ProgramUnit<A>,
+    comp: DfirUnit,
+    marked: &mut Marked,
+    values: &mut Values,
+    extract_ops: &mut ExtractScalarOps,
+) -> ExtractVectorLoadLowering<'a> {
+    let scope = unit.body.as_slice();
+    let DfirOp::Agen(src_op) = op else {
+        return ExtractVectorLoadLowering::NotAVectorLoad;
+    };
+    if !matches!(src_op, agen::Op::VectorLoad { .. }) {
+        return ExtractVectorLoadLowering::NotAVectorLoad;
+    }
+
+    let mut access_details = AccessContainer::<AccessDetailsAffine<'a>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        src_op,
+        position,
+        None,
+        comp,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return ExtractVectorLoadLowering::DetailsFailed(details);
+    }
+    let (Some(access), Some(&mutable_addr), Some(&immutable_addr)) = (
+        access_details.get_first(),
+        mutable_addrs.get_first(),
+        immutable_addrs.get_first(),
+    ) else {
+        return ExtractVectorLoadLowering::SingleAccessInfoNeeded;
+    };
+
+    let Some(candidate) = find_candidate_for_lowering(AgenOpKind::VectorLoad, marked, scope) else {
+        return ExtractVectorLoadLowering::NoCandidate;
+    };
+    let Some(load) = ExtractVectorLoad::of(candidate.op) else {
+        return ExtractVectorLoadLowering::NotAVectorLoad;
+    };
+    match construct_load_and_extract_scalar_op(
+        load,
+        unit,
+        comp,
+        access,
+        mutable_addr,
+        immutable_addr,
+        scope,
+        values,
+        extract_ops,
+    ) {
+        LoadAndExtractScalar::Constructed(built) => ExtractVectorLoadLowering::Lowered(built),
+        refused => ExtractVectorLoadLowering::Refused(refused),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 313/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`lower_extract_vector_store_op`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ExtractVectorStoreLowering<'a> {
+    /// The `sentient.receive_and_extract_scalar` and the scatter it pairs with.
+    Lowered(Box<ConstructedExtract<'a>>),
+    /// The operation this was called over is not an `agen.vector_store`.
+    NotAVectorStore,
+    /// Entry 298 refused.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3036`).
+    SingleAccessInfoNeeded,
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+    /// *"Unable to generate load_and_extract_scalar operation for the agen.vector_load op"* — ⛔ the
+    /// store's diagnostic names the LOAD (`:3043-3045`).
+    Refused(ReceiveAndExtractScalar<'a>),
+}
+
+/// Replaces: e313_lowerExtractVectorStoreOp
+///
+/// ⛔ THE RECORDS AND ADDRESSES IT BUILDS ARE NEVER READ. Entry 216 takes none of them; the
+/// construction is here because it MARKS the store, which is what the re-find then answers with.
+pub fn lower_extract_vector_store_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    comp: DfirUnit,
+    marked: &mut Marked,
+    scope: &'a [DfirOp],
+    values: &mut Values,
+    extract_ops: &mut ExtractScalarOps,
+) -> ExtractVectorStoreLowering<'a> {
+    let DfirOp::Agen(src_op) = op else {
+        return ExtractVectorStoreLowering::NotAVectorStore;
+    };
+    if !matches!(src_op, agen::Op::VectorStore { .. }) {
+        return ExtractVectorStoreLowering::NotAVectorStore;
+    }
+
+    let mut access_details = AccessContainer::<AccessDetailsAffine<'a>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        src_op,
+        position,
+        None,
+        comp,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return ExtractVectorStoreLowering::DetailsFailed(details);
+    }
+    let (Some(_), Some(_), Some(_)) = (
+        access_details.get_first(),
+        mutable_addrs.get_first(),
+        immutable_addrs.get_first(),
+    ) else {
+        return ExtractVectorStoreLowering::SingleAccessInfoNeeded;
+    };
+
+    let Some(candidate) = find_candidate_for_lowering(AgenOpKind::VectorStore, marked, scope)
+    else {
+        return ExtractVectorStoreLowering::NoCandidate;
+    };
+    let Some(store) = ExtractVectorStore::of(candidate.op) else {
+        return ExtractVectorStoreLowering::NotAVectorStore;
+    };
+    match construct_receive_and_extract_scalar_op(store, scope, values, extract_ops) {
+        ReceiveAndExtractScalar::Constructed(built) => ExtractVectorStoreLowering::Lowered(built),
+        refused => ExtractVectorStoreLowering::Refused(refused),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 314/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`lower_vector_load_op`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum VectorLoadLowering<'a> {
+    /// What entry 217 answered, admissible or not — this entry adds no diagnostic of its own to it.
+    Helper(VectorLoadHelper<'a>),
+    /// The operation this was called over is not an `agen.vector_load`.
+    NotAVectorLoad,
+    /// Entry 298 refused.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+}
+
+/// Replaces: e314_lowerVectorLoadOp
+///
+/// ⛔ NO SIZE CHECK HERE, unlike its three siblings: a load-and-store pattern legitimately holds two
+/// records. The store is RE-COLLECTED off the re-found candidate, because building the records may
+/// have cloned or deleted operations, and `bool is_load_store` (`:3052`) is never read.
+pub fn lower_vector_load_op<'a, A: Arch>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a ProgramUnit<A>,
+    comp: DfirUnit,
+    marked: &mut Marked,
+    values: &mut Values,
+) -> VectorLoadLowering<'a> {
+    let scope = unit.body.as_slice();
+    let DfirOp::Agen(src_op) = op else {
+        return VectorLoadLowering::NotAVectorLoad;
+    };
+    if !matches!(src_op, agen::Op::VectorLoad { .. }) {
+        return VectorLoadLowering::NotAVectorLoad;
+    }
+    let dst_op = match store_op_from_load_store_pattern(AgenOpKind::VectorStore, op, scope) {
+        Some(DfirOp::Agen(store)) => Some(store),
+        _ => None,
+    };
+
+    let mut access_details = AccessContainer::<AccessDetailsAffine<'a>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        src_op,
+        position,
+        dst_op,
+        comp,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return VectorLoadLowering::DetailsFailed(details);
+    }
+
+    let Some(candidate) = find_candidate_for_lowering(AgenOpKind::VectorLoad, marked, scope) else {
+        return VectorLoadLowering::NoCandidate;
+    };
+    let store_op = store_op_from_load_store_pattern(AgenOpKind::VectorStore, candidate.op, scope);
+    let Some(load) = TransferOp::of(candidate.op) else {
+        return VectorLoadLowering::NotAVectorLoad;
+    };
+    VectorLoadLowering::Helper(lower_vector_load_helper(
+        load,
+        store_op,
+        unit,
+        &access_details,
+        &mutable_addrs,
+        &immutable_addrs,
+        scope,
+        values,
+    ))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 315/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`lower_vector_store_op`] — every arm a refusal, because the statement it exists to
+/// build is entry 359 and that is unported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum VectorStoreLowering {
+    /// The operation this was called over is not an `agen.vector_store`.
+    NotAVectorStore,
+    /// Entry 298 refused.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3084`).
+    SingleAccessInfoNeeded,
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+}
+
+/// Replaces: e315_lowerVectorStoreOp
+///
+/// The element type comes off the candidate's OWN memref, not off the record. ⛔ THE STATEMENT AND
+/// BOTH DELETES ARE BEHIND `e359_constructReceiveAndStoreStmt`, which is unported — the candidate and
+/// the input chain behind its stored value are what the reference queues once the statement is built.
+pub fn lower_vector_store_op(
+    op: &DfirOp,
+    position: usize,
+    comp: DfirUnit,
+    marked: &mut Marked,
+    scope: &[DfirOp],
+) -> VectorStoreLowering {
+    let DfirOp::Agen(src_op) = op else {
+        return VectorStoreLowering::NotAVectorStore;
+    };
+    if !matches!(src_op, agen::Op::VectorStore { .. }) {
+        return VectorStoreLowering::NotAVectorStore;
+    }
+
+    let mut access_details = AccessContainer::<AccessDetailsAffine<'_>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        src_op,
+        position,
+        None,
+        comp,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return VectorStoreLowering::DetailsFailed(details);
+    }
+    let (Some(_), Some(_), Some(_)) = (
+        access_details.get_first(),
+        mutable_addrs.get_first(),
+        immutable_addrs.get_first(),
+    ) else {
+        return VectorStoreLowering::SingleAccessInfoNeeded;
+    };
+
+    let Some(candidate) = find_candidate_for_lowering(AgenOpKind::VectorStore, marked, scope)
+    else {
+        return VectorStoreLowering::NoCandidate;
+    };
+    let element_type = match candidate.op {
+        DfirOp::Agen(agen::Op::VectorStore { view_ty, .. }) => view_ty.elem,
+        _ => return VectorStoreLowering::NotAVectorStore,
+    };
+    todo!(
+        "e359_constructReceiveAndStoreStmt is unported, so the {element_type:?} store {:?} on \
+         {comp:?} cannot become a sentient.receive_and_store",
+        candidate.op
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 316/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`lower_indirect_vector_load_op`] — every arm a refusal, because the statement it
+/// exists to build is entry 358 and that is unported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum IndirectVectorLoadLowering {
+    /// *"IndirectVectorLoadOp only supported in LXLU"* (`:3172-3174`).
+    OnlySupportedInLxlu,
+    /// The operation this was called over is not an `agen.indirect_vector_load`.
+    NotAnIndirectVectorLoad,
+    /// Entry 298 refused.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3183`).
+    SingleAccessInfoNeeded,
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+    /// *"agen.indirect_vector_load op does not have extract_idx attribute"* (`:3187-3190`).
+    NoExtractIndex,
+    /// *"could not locate a load_and_extract_scalar operation matching the extract_idx used by op"*.
+    NoMatchingExtractOp,
+}
+
+/// Replaces: e316_lowerIndirectVectorLoadOp
+///
+/// ⛔ `extract_idx` IS A PAIRING, NOT AN OPERAND. The reference reads an attribute entry 269 stamped
+/// on this gather when it built the extract; here that pairing is carried in and looked up, so a
+/// gather that never went through entry 269 answers [`IndirectVectorLoadLowering::NoExtractIndex`].
+pub fn lower_indirect_vector_load_op(
+    op: &DfirOp,
+    position: usize,
+    comp: DfirUnit,
+    extract_idx: Option<ExtractIndex>,
+    extract_ops: &ExtractScalarOps,
+    marked: &mut Marked,
+    scope: &[DfirOp],
+) -> IndirectVectorLoadLowering {
+    if comp != DfirUnit::Lxlu {
+        return IndirectVectorLoadLowering::OnlySupportedInLxlu;
+    }
+    let DfirOp::Agen(src_op) = op else {
+        return IndirectVectorLoadLowering::NotAnIndirectVectorLoad;
+    };
+    if !matches!(src_op, agen::Op::IndirectVectorLoad { .. }) {
+        return IndirectVectorLoadLowering::NotAnIndirectVectorLoad;
+    }
+
+    let mut access_details = AccessContainer::<AccessDetailsAffine<'_>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        src_op,
+        position,
+        None,
+        comp,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return IndirectVectorLoadLowering::DetailsFailed(details);
+    }
+    let (Some(_), Some(_), Some(_)) = (
+        access_details.get_first(),
+        mutable_addrs.get_first(),
+        immutable_addrs.get_first(),
+    ) else {
+        return IndirectVectorLoadLowering::SingleAccessInfoNeeded;
+    };
+
+    let Some(candidate) =
+        find_candidate_for_lowering(AgenOpKind::IndirectVectorLoad, marked, scope)
+    else {
+        return IndirectVectorLoadLowering::NoCandidate;
+    };
+    let Some(extract_idx) = extract_idx else {
+        return IndirectVectorLoadLowering::NoExtractIndex;
+    };
+    let Some(extract) = extract_ops.find(ExtractScalarKind::LoadAndExtractScalar, extract_idx)
+    else {
+        return IndirectVectorLoadLowering::NoMatchingExtractOp;
+    };
+    todo!(
+        "e358_constructLoadAndSendStmt is unported, so the gather {:?} pairing with extract_idx {} \
+         on {comp:?} cannot become a sentient.load_and_send",
+        candidate.op,
+        extract.index.get()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 317/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`lower_indirect_vector_store_op`] — every arm a refusal, because the statement it
+/// exists to build is entry 359 and that is unported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum IndirectVectorStoreLowering {
+    /// *"IndirectVectorStoreOp only supported in LXSU"* (`:3220-3222`).
+    OnlySupportedInLxsu,
+    /// The operation this was called over is not an `agen.indirect_vector_store`.
+    NotAnIndirectVectorStore,
+    /// Entry 298 refused.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3231`).
+    SingleAccessInfoNeeded,
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+    /// *"agen.indirect_vector_store op does not have extract_idx attribute"* (`:3235-3238`).
+    NoExtractIndex,
+    /// *"could not locate a receive_and_extract_scalar operation matching the extract_idx used by
+    /// op"*.
+    NoMatchingExtractOp,
+}
+
+/// Replaces: e317_lowerIndirectVectorStoreOp
+///
+/// The scatter's twin of entry 316, on the LXSU and against the RECEIVE side of the extract counter.
+/// Its element type comes off the DIRECT memref, and the statement, the candidate's delete and the
+/// input chain behind its stored value are all behind `e359_constructReceiveAndStoreStmt`.
+pub fn lower_indirect_vector_store_op(
+    op: &DfirOp,
+    position: usize,
+    comp: DfirUnit,
+    extract_idx: Option<ExtractIndex>,
+    extract_ops: &ExtractScalarOps,
+    marked: &mut Marked,
+    scope: &[DfirOp],
+) -> IndirectVectorStoreLowering {
+    if comp != DfirUnit::Lxsu {
+        return IndirectVectorStoreLowering::OnlySupportedInLxsu;
+    }
+    let DfirOp::Agen(src_op) = op else {
+        return IndirectVectorStoreLowering::NotAnIndirectVectorStore;
+    };
+    if !matches!(src_op, agen::Op::IndirectVectorStore { .. }) {
+        return IndirectVectorStoreLowering::NotAnIndirectVectorStore;
+    }
+
+    let mut access_details = AccessContainer::<AccessDetailsAffine<'_>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        src_op,
+        position,
+        None,
+        comp,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return IndirectVectorStoreLowering::DetailsFailed(details);
+    }
+    let (Some(_), Some(_), Some(_)) = (
+        access_details.get_first(),
+        mutable_addrs.get_first(),
+        immutable_addrs.get_first(),
+    ) else {
+        return IndirectVectorStoreLowering::SingleAccessInfoNeeded;
+    };
+
+    let Some(candidate) =
+        find_candidate_for_lowering(AgenOpKind::IndirectVectorStore, marked, scope)
+    else {
+        return IndirectVectorStoreLowering::NoCandidate;
+    };
+    let Some(extract_idx) = extract_idx else {
+        return IndirectVectorStoreLowering::NoExtractIndex;
+    };
+    let Some(extract) = extract_ops.find(ExtractScalarKind::ReceiveAndExtractScalar, extract_idx)
+    else {
+        return IndirectVectorStoreLowering::NoMatchingExtractOp;
+    };
+    let element_type = match candidate.op {
+        DfirOp::Agen(agen::Op::IndirectVectorStore { direct_view_ty, .. }) => direct_view_ty.elem,
+        _ => return IndirectVectorStoreLowering::NotAnIndirectVectorStore,
+    };
+    todo!(
+        "e359_constructReceiveAndStoreStmt is unported, so the {element_type:?} scatter {:?} \
+         pairing with extract_idx {} on {comp:?} cannot become a sentient.receive_and_store",
+        candidate.op,
+        extract.index.get()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 318/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE SHUFFLE OF THE LDCVTI PATTERN — the operand it splats, and the constant index that operand is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LdcvtiShuffle<'a> {
+    /// The `vectorchain.shuffle` itself, for the delete list.
+    op: &'a DfirOp,
+    /// Its shuffled input — a `agen.vector_load`, or one behind an ldtype shuffle.
+    input: Val,
+    /// The `arith.constant` its one variable operand is.
+    index: i64,
+}
+
+/// `checkShuffle` (`Helper.cpp:3498-3506`): no pad, no mask, ONE `arith.constant` variable operand,
+/// and every shuffle index naming it.
+///
+/// ⛔ `isSplatOfFirstVar`, NOT `isFirstElemSplat`. `getFirstVariableIndex()` is **-1** for any
+/// non-empty `variable` (`VectorChain.td:485-490`), so the splat is of the first VARIABLE operand and
+/// not of element 0 — [`is_first_elem_splat`] is a different test and would admit the wrong shuffles.
+fn ldcvti_shuffle<'a>(op: &'a DfirOp, scope: &[DfirOp]) -> Option<LdcvtiShuffle<'a>> {
+    let DfirOp::VectorChain(vc::Op::Shuffle {
+        input,
+        variable,
+        pad,
+        mask,
+        indices,
+        ..
+    }) = op
+    else {
+        return None;
+    };
+    if !pad.is_empty() || mask.is_some() {
+        return None;
+    }
+    let [variable] = variable.as_slice() else {
+        return None;
+    };
+    let index = constant_index(*variable, scope)?;
+    if indices.iter().any(|shuffled| *shuffled != -1) {
+        return None;
+    }
+    Some(LdcvtiShuffle {
+        op,
+        input: *input,
+        index,
+    })
+}
+
+/// THE `agen.vector_load` BEHIND ONE OF THE PATTERN'S SHUFFLES, and the three things read off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LdcvtiLoad<'a> {
+    /// The load itself, for the delete list and for its `dbgName`.
+    op: &'a DfirOp,
+    /// The same operation as its agen class, for the record construction.
+    agen: &'a agen::Op,
+    /// `getMemRef()`.
+    view: Val,
+    /// `getMapOperands()`.
+    indices: &'a [Index],
+    /// The view's own type, whose rank is the load order's.
+    view_ty: &'a MemRef,
+    /// `getVectorType()`.
+    ty: Vector,
+}
+
+/// `identifyLoads` (`Helper.cpp:3520-3535`) — the shuffle's input is the `agen.vector_load`, or a
+/// nested ldtype shuffle whose input is one.
+///
+/// ⛔ THE ldtype DT_CHECK NEVER FIRES: `DT_CHECK_MSG(!ldtype_shuffle, "ldtype for LDCVTI not
+/// currently supported")` (`:3536-3538`) runs BEFORE this is ever called, so a nested shuffle is
+/// accepted here and only the future work behind it is missing.
+fn ldcvti_load<'a>(input: Val, scope: &'a [DfirOp]) -> Option<LdcvtiLoad<'a>> {
+    let input_op = defining_op(input, scope)?;
+    let load_op = match input_op {
+        DfirOp::Agen(agen::Op::VectorLoad { .. }) => input_op,
+        DfirOp::VectorChain(vc::Op::Shuffle { input: nested, .. }) => defining_op(*nested, scope)?,
+        _ => return None,
+    };
+    let DfirOp::Agen(agen) = load_op else {
+        return None;
+    };
+    let agen::Op::VectorLoad {
+        view,
+        indices,
+        view_ty,
+        ty,
+        ..
+    } = agen
+    else {
+        return None;
+    };
+    Some(LdcvtiLoad {
+        op: load_op,
+        agen,
+        view: *view,
+        indices,
+        view_ty,
+        ty: *ty,
+    })
+}
+
+/// `setElementLoadIfFound` (`Helper.cpp:3577-3589`) — the element load is the one whose view was cut
+/// from the LX.
+fn is_ldcvti_element_load(load: &LdcvtiLoad<'_>, scope: &[DfirOp]) -> bool {
+    viewed_unit(load.view, scope) == Some(DfirUnit::Lx)
+}
+
+/// `setScaleLoadIfFound` (`:3548-3576`) — a view on the LXLU's scale register file, starting at
+/// address 0, whose every iterator coefficient is 0.
+fn is_ldcvti_scale_load(load: &LdcvtiLoad<'_>, scope: &[DfirOp]) -> bool {
+    if viewed_unit(load.view, scope) != Some(DfirUnit::LxluScaleReg) {
+        return false;
+    }
+    let Some(DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { start, layout, .. })) =
+        defining_op(load.view, scope)
+    else {
+        return false;
+    };
+    if !is_zero_index_constant(*start, scope) {
+        return false;
+    }
+    let (subscripts, operands) = access_map(load.indices);
+    let coeffs = construct_iterator_coeff_dict(
+        &subscripts,
+        &agen::access_order(load.view_ty.shape.len()),
+        layout,
+        &operands,
+    );
+    coeffs.per_index.iter().all(|(_, coeff)| *coeff == 0)
+}
+
+/// The pre-order position entry 037 assigns to `needle`, which is what [`Marked`] is keyed by. The
+/// operations this pattern reaches through operands carry no position of their own.
+fn position_of(needle: &DfirOp, scope: &[DfirOp]) -> Option<usize> {
+    let mut position = 0;
+    walk_pre_order(scope, &mut position, &mut |at, op| {
+        core::ptr::eq(op, needle).then_some(at)
+    })
+}
+
+/// The consumer entry 035 reads its components off (`Helper.cpp:2748-2761`) — a bound unit, or every
+/// unit a `uniform.query_map`'s mapping names.
+///
+/// [`None`] is *"vector_loadOp's consumer is not a getUnitOp."*, which the reference reports from
+/// inside that entry; neither op class at all leaves its component list EMPTY, which is
+/// [`ConsumerUnits::Neither`] and emits nothing.
+fn ldcvti_consumer(to: Val, scope: &[DfirOp]) -> Option<ConsumerUnits> {
+    match defining_op(to, scope) {
+        Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) => {
+            Some(ConsumerUnits::Bound(*unit))
+        }
+        Some(DfirOp::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let Some(DfirOp::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) =
+                defining_op(*map, scope)
+            else {
+                return Some(ConsumerUnits::Neither);
+            };
+            let mut units = Vec::new();
+            for (_, queried) in pairs {
+                let Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) =
+                    defining_op(*queried, scope)
+                else {
+                    return None;
+                };
+                units.push(*unit);
+            }
+            Some(ConsumerUnits::Queried(units))
+        }
+        _ => Some(ConsumerUnits::Neither),
+    }
+}
+
+/// `evaluateValue(increment).getUniqueConstant() == 0` (`Helper.cpp:3723-3728`), over the constants
+/// entry 214 just hoisted — the only thing that can define an increment it just minted.
+fn is_hoisted_zero(hoisted: &[SenOp], increment: Val) -> bool {
+    hoisted.iter().any(|op| {
+        matches!(
+            op,
+            SenOp::Sentient(sen::Op::ScalarConstant { result, value: 0, .. }) if *result == increment
+        )
+    })
+}
+
+/// THE ONE STATEMENT THE LDCVTI PATTERN COLLAPSES TO, and what goes with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoweredLdcvti<'a> {
+    /// The scale index, the element index and whatever entry 214 hoisted, in that order.
+    pub hoisted: Vec<SenOp>,
+    /// The `LX_SETDSTMASK` the conventional load path emits and this one must emit itself.
+    pub set_send_destination: SetSendDestination,
+    /// The `sentient.load_compute_and_send`.
+    pub load_compute_and_send: SenOp,
+    /// The send, the multiply, the scale shuffle, the scale load, the element shuffle and the
+    /// element load — ⛔ in that order (`:3765-3770`).
+    pub to_be_deleted: [&'a DfirOp; 6],
+}
+
+/// THE OUTCOME OF [`lower_ldcvti_pattern`] — the statement, or WHICH of the reference's diagnostics
+/// refused the pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LdcvtiPattern<'a> {
+    /// The pattern matched and collapsed.
+    Lowered(Box<LoweredLdcvti<'a>>),
+    /// The operation this was called over is not a `vectorchain.binary`.
+    NotABinaryOp,
+    /// *"MultiplyOp expected to have one use"*.
+    MultiplyHasNotExactlyOneUse,
+    /// ⛔ The reference `dyn_cast`s that one use to a `dataflow.send` WITHOUT a null test and then
+    /// writes an attribute through it (`:3451-3457`).
+    UserIsNotASend,
+    /// *"BinaryOp expected to have two ShuffleOp operands"*.
+    OperandsAreNotTwoShuffles,
+    /// *"BinaryOp expected to have identity reduction map"*.
+    ReductionMapIsNotIdentity,
+    /// *"BinaryOp expected to have a mask operand"* — absent, or not a `create_affine_mask`.
+    NoMaskOperand,
+    /// *"BinaryOp mask should not mask anything"* — ⛔ stated as a CONTRADICTORY affine set, so an
+    /// empty constraint system is the ADMISSIBLE answer.
+    MaskMasksSomething,
+    /// *"Inputs to BinaryOp do not match LDCVTI pattern"*.
+    InputsDoNotMatchThePattern,
+    /// *"Unable to identify element and scale load operations"*.
+    LoadsNotIdentified,
+    /// `DT_CHECK(element_load_op && scale_load_op)` (`:3595`) — the two loads are there but one is
+    /// on neither the LX nor the scale register file.
+    NoElementOrScaleLoad,
+    /// The element load is not reachable by the walk that assigns positions.
+    ElementLoadNotInScope,
+    /// *"Cannot set access details for element load op"*.
+    DetailsFailed(AffineDetailsAndAddrs),
+    /// `DT_CHECK(element_ad.size() == 1 && …)` (`:3641`).
+    SingleAccessInfoNeeded,
+    /// *"vector_loadOp's consumer is not a getUnitOp."*.
+    ConsumerIsNotAGetUnit,
+    /// `DT_CHECK(shuffle_mode == SentientShuffleMode::noshuffle)` (`:3715`).
+    ShuffleModeIsNotNoShuffle(sen::ShuffleMode),
+    /// *"Expected increment to be 0"*.
+    IncrementIsNotZero,
+    /// *"Failed to generate set_send_destination op"*.
+    SetSendDestinationRefused(SetSendDestination),
+}
+
+/// Replaces: e318_lowerLDCVTIPattern
+///
+/// A masked-by-nothing `vectorchain.binary` of two splat shuffles, one loading a per-transfer scale
+/// off the LXLU's scale register file and one loading the stick off the LX, feeding one
+/// `dataflow.send`, becomes ONE `sentient.load_compute_and_send`.
+///
+/// ⛔ THE REFERENCE'S ATTRIBUTE-MARK-AND-RE-FIND WALK IS THE MECHANISM, NOT THE MEANING: it stamps
+/// six ops so it can recover them after the record construction rebuilds loops. Here the values are
+/// held directly and the marking is what entry 298 does to the element load's position.
+pub fn lower_ldcvti_pattern<'a, A: Arch>(
+    bin_op: &'a DfirOp,
+    unit: &'a ProgramUnit<A>,
+    comp: DfirUnit,
+    marked: &mut Marked,
+    values: &mut Values,
+) -> LdcvtiPattern<'a> {
+    let scope = unit.body.as_slice();
+    let DfirOp::VectorChain(vc::Op::Binary {
+        result: bin_result,
+        op1,
+        op2,
+        mask,
+        op_specific_map,
+        ty: bin_ty,
+        ..
+    }) = bin_op
+    else {
+        return LdcvtiPattern::NotABinaryOp;
+    };
+
+    // `:3448-3451`.
+    let users = uses(*bin_result, scope);
+    let [user] = users.as_slice() else {
+        return LdcvtiPattern::MultiplyHasNotExactlyOneUse;
+    };
+    let DfirOp::Dataflow(dataflow::Op::Send { to, .. }) = user else {
+        return LdcvtiPattern::UserIsNotASend;
+    };
+
+    // `:3461-3468`.
+    let (Some(op1_op), Some(op2_op)) = (defining_op(*op1, scope), defining_op(*op2, scope)) else {
+        return LdcvtiPattern::OperandsAreNotTwoShuffles;
+    };
+    if !matches!(op1_op, DfirOp::VectorChain(vc::Op::Shuffle { .. }))
+        || !matches!(op2_op, DfirOp::VectorChain(vc::Op::Shuffle { .. }))
+    {
+        return LdcvtiPattern::OperandsAreNotTwoShuffles;
+    }
+
+    // `:3469-3472`.
+    if !op_specific_map.is_identity() {
+        return LdcvtiPattern::ReductionMapIsNotIdentity;
+    }
+
+    // `:3474-3486` — ⛔ ONE C++ op that this island splits in two, so both variants answer.
+    let mask_set = match mask.and_then(|mask| defining_op(mask.val(), scope)) {
+        Some(DfirOp::VectorChain(vc::Op::CreateAffineMask { mask, .. })) => mask.as_set(),
+        Some(DfirOp::VectorChain(vc::Op::CreateAffineMaskSet { mask_set, .. })) => {
+            Some(mask_set.clone())
+        }
+        _ => None,
+    };
+    let Some(mask_set) = mask_set else {
+        return LdcvtiPattern::NoMaskOperand;
+    };
+    if !FlatConstraints::from_integer_set(&mask_set).is_empty() {
+        return LdcvtiPattern::MaskMasksSomething;
+    }
+
+    // `:3507-3509`.
+    let (Some(shuffle_1), Some(shuffle_2)) =
+        (ldcvti_shuffle(op1_op, scope), ldcvti_shuffle(op2_op, scope))
+    else {
+        return LdcvtiPattern::InputsDoNotMatchThePattern;
+    };
+
+    // `:3540-3546`.
+    let (Some(load_1), Some(load_2)) = (
+        ldcvti_load(shuffle_1.input, scope),
+        ldcvti_load(shuffle_2.input, scope),
+    ) else {
+        return LdcvtiPattern::LoadsNotIdentified;
+    };
+
+    // `:3591-3595` — each `setXIfFound` keeps the FIRST of the two loads that answers it.
+    let loads = [&load_1, &load_2];
+    let (Some(element_load), Some(scale_load)) = (
+        loads
+            .into_iter()
+            .find(|load| is_ldcvti_element_load(load, scope)),
+        loads
+            .into_iter()
+            .find(|load| is_ldcvti_scale_load(load, scope)),
+    ) else {
+        return LdcvtiPattern::NoElementOrScaleLoad;
+    };
+
+    // `:3606-3616`.
+    let (scale_shuffle, element_shuffle) = if core::ptr::eq(scale_load.op, load_1.op) {
+        (&shuffle_1, &shuffle_2)
+    } else {
+        (&shuffle_2, &shuffle_1)
+    };
+
+    // `:3632-3641`.
+    let Some(position) = position_of(element_load.op, scope) else {
+        return LdcvtiPattern::ElementLoadNotInScope;
+    };
+    let mut element_ad = AccessContainer::<AccessDetailsAffine<'a>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_details_and_addrs(
+        element_load.agen,
+        position,
+        None,
+        comp,
+        &mut element_ad,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        scope,
+    );
+    if !matches!(details, AffineDetailsAndAddrs::Constructed) {
+        return LdcvtiPattern::DetailsFailed(details);
+    }
+    let (Some(access), Some(&mutable_addr), Some(&immutable_addr)) = (
+        element_ad.get_first(),
+        mutable_addrs.get_first(),
+        immutable_addrs.get_first(),
+    ) else {
+        return LdcvtiPattern::SingleAccessInfoNeeded;
+    };
+
+    // `:3675-3695` — the scale's index constant, then the element's.
+    let mut hoisted = Vec::new();
+    let scale_index = hoisted_index_constant(values, &mut hoisted, scale_shuffle.index);
+    let element_index = hoisted_index_constant(values, &mut hoisted, element_shuffle.index);
+
+    // `:3697-3699`.
+    let Some(consumer) = ldcvti_consumer(to.val(), scope) else {
+        return LdcvtiPattern::ConsumerIsNotAGetUnit;
+    };
+
+    // `:3701-3710` — the source extents off the element load, the destination's off the multiply.
+    let src_total_elements = Elements(element_load.ty.len);
+    let src_element_size = Bits(element_load.ty.elem.bits());
+    let dst_total_elements = Elements(bin_ty.len);
+    let dst_element_size = Bits(bin_ty.elem.bits());
+
+    // `:3712-3715`.
+    let shuffle_mode = access.base.shuffle_mode;
+    if shuffle_mode != sen::ShuffleMode::NoShuffle {
+        return LdcvtiPattern::ShuffleModeIsNotNoShuffle(shuffle_mode);
+    }
+
+    // `:3717-3728` — no burst, no stride, and the increment it produces must be the constant 0.
+    let addresses = set_immutable_addr_and_increments(
+        values,
+        comp,
+        false,
+        StrideStep(0),
+        Elements(0),
+        src_total_elements,
+        immutable_addr,
+    );
+    if !is_hoisted_zero(&addresses.hoisted, addresses.increment) {
+        return LdcvtiPattern::IncrementIsNotZero;
+    }
+    hoisted.extend(addresses.hoisted);
+
+    // `:3739-3745`.
+    let set_send_destination =
+        generate_set_send_destination_stmts::<A>(unit.on.kind().generic(), &consumer, *to);
+    if matches!(
+        set_send_destination,
+        SetSendDestination::NoSetDstMaskAtThisArchLevel
+    ) {
+        return LdcvtiPattern::SetSendDestinationRefused(set_send_destination);
+    }
+
+    // `:3747-3762`.
+    let load_compute_and_send = SenOp::Sentient(sen::Op::LoadComputeAndSend {
+        mutable_addr,
+        immutable_addr: addresses.immutable_addr,
+        increment: addresses.increment,
+        element_index,
+        scale_index,
+        consumer: *to,
+        result: values.mint(),
+        src_total_elements,
+        dst_total_elements,
+        src_element_size,
+        dst_element_size,
+        dir: None,
+        shuffle_mode,
+        reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        dbg_name: dfir_op::dbg_name(element_load.op).map(str::to_owned),
+    });
+
+    LdcvtiPattern::Lowered(Box::new(LoweredLdcvti {
+        hoisted,
+        set_send_destination,
+        load_compute_and_send,
+        to_be_deleted: [
+            user,
+            bin_op,
+            scale_shuffle.op,
+            scale_load.op,
+            element_shuffle.op,
+            element_load.op,
+        ],
+    }))
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e311_constructAffineCompDetailsAndAddrs
-// crustify:todo: e312_lowerExtractVectorLoadOp
-// crustify:todo: e313_lowerExtractVectorStoreOp
-// crustify:todo: e314_lowerVectorLoadOp
-// crustify:todo: e315_lowerVectorStoreOp
-// crustify:todo: e316_lowerIndirectVectorLoadOp
-// crustify:todo: e317_lowerIndirectVectorStoreOp
-// crustify:todo: e318_lowerLDCVTIPattern
 // crustify:todo: e327_gatherSymbolicLoadStoreDetails
 // crustify:todo: e328_adjustMutableAddrInitForIndirect
 // crustify:todo: e329_lowerCompositeLoadOp

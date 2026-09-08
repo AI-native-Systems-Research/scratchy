@@ -267,7 +267,8 @@ pub fn local_units(of: Unit) -> Vec<crate::islands::dataflow_ir::dialects::dataf
         | GenericComp::SfpState
         | GenericComp::PeState
         | GenericComp::Constant
-        | GenericComp::SfpRing => Vec::new(),
+        | GenericComp::SfpRing
+        | GenericComp::LxluScaleReg => Vec::new(),
     };
     if matches!(of.generic(), GenericComp::Pt) && matches!(Target::GEN, IsaGen::Sen1p5) {
         files.push(LocalUnit::L0Scale);
@@ -374,6 +375,15 @@ pub enum DfirUnit {
     /// (`Helper.cpp:2764-2765`); with no variant for the fourth, the test could only ever be
     /// written over three of them.
     CrossPtnLink,
+
+    /// `lxluscalereg` — THE REGISTER FILE THE LXLU READS A PER-TRANSFER SCALE OUT OF.
+    ///
+    /// ⛔ IT IS A UNIT A VIEW IS TAKEN OVER, and its absence made `setScaleLoadIfFound`
+    /// (`Helper.cpp:3600`) unstatable: the LDCVTI pattern tells its element load from its scale load
+    /// by asking which unit the loaded view sits on, and with no variant for the second the test had
+    /// no answer to compare against. `SenComponents::LXLUSCALEREG` spells `"lxluscalereg"`
+    /// (`sys-arch-spec/arch_enums.cpp:117`) and is its own generic component (`:169`).
+    LxluScaleReg,
 }
 
 impl DfirUnit {
@@ -425,6 +435,7 @@ impl DfirUnit {
             Self::LxVirtualIbr => "lxvirtualibr",
             Self::L3Ibr => "l3ibr",
             Self::CrossPtnLink => "crossptnlink",
+            Self::LxluScaleReg => "lxluscalereg",
         }
     }
 
@@ -464,6 +475,8 @@ impl DfirUnit {
             // `:208` — and so is the L3 indirection base register.
             Self::L3Ibr => GenericComp::L3Ibr,
             Self::CrossPtnLink => GenericComp::CrossPtnLink,
+            // `:169` — its own image, like the memories and the IBRs.
+            Self::LxluScaleReg => GenericComp::LxluScaleReg,
             Self::SfpState => GenericComp::SfpState,
             Self::PeState => GenericComp::PeState,
             // The three the reference's `.at()` throws on.
@@ -556,7 +569,10 @@ pub fn neighbours(of: DfirUnit) -> Vec<DfirUnit> {
         // ⛔ THE CROSS-PARTITION LINK IS A DESTINATION, NOT A PROGRAMMED UNIT — `buildNeighborUnits`
         // has no arm for it, and the golden that binds it does so as a send target
         // (`int8-kg3-sen1_5-lxlu.mlir:203`).
-        | DfirUnit::CrossPtnLink => Vec::new(),
+        | DfirUnit::CrossPtnLink
+        // The LXLU's scale register file is read through a view, exactly like the virtual IBR above
+        // it, so `buildNeighborUnits` has no arm for it either.
+        | DfirUnit::LxluScaleReg => Vec::new(),
     }
 }
 
@@ -609,7 +625,10 @@ pub fn residency_of(unit: DfirUnit, core: Core, corelet: Corelet) -> Residency {
         | DfirUnit::SfpRing
         // `CROSS-PT-N-LINK-CL0` carries the `-CL0` suffix, which is what a per-corelet name is
         // (`int8-kg3-sen1_5-lxlu.mlir:203` against `UnitMaterializer.cpp:82-115`).
-        | DfirUnit::CrossPtnLink => Residency::Corelet { core, corelet },
+        | DfirUnit::CrossPtnLink
+        // `addressGranularityScalePerUnit[{LXLU, LXLUSCALEREG}]` pairs it with ONE LXLU
+        // (`sys-arch-spec/sysdef.cpp:539`), and the LXLU is per corelet.
+        | DfirUnit::LxluScaleReg => Residency::Corelet { core, corelet },
     }
 }
 

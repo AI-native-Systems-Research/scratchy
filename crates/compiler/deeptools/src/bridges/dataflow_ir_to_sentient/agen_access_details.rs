@@ -2444,7 +2444,7 @@ pub enum ConstructedIndices {
 /// index — which [`AccessDetailsAffine::construct_indices`] is what establishes. A dimension the
 /// address does not read has coefficient 0, and that is the only meaning available for a column that
 /// is not there.
-fn construct_iterator_coeff_dict(
+pub(super) fn construct_iterator_coeff_dict(
     subscripts_map: &AffineMap,
     transfer_order: &AffineMap,
     mem_view_layout_map: &AffineMap,

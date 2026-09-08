@@ -2730,7 +2730,8 @@ fn sync_destination(v: Val, scope: &[DfirOp]) -> Option<L0LxSyncDst> {
         | DfirUnit::SfpRing
         | DfirUnit::LxVirtualIbr
         | DfirUnit::L3Ibr
-        | DfirUnit::CrossPtnLink => None,
+        | DfirUnit::CrossPtnLink
+        | DfirUnit::LxluScaleReg => None,
     }
 }
 

@@ -70,6 +70,10 @@ pub enum GenericComp {
     Constant,
     /// The SFP ring. ⛔ NOT A KEY.
     SfpRing,
+    /// `LXLUSCALEREG` — the LXLU's scale register file, its own image (`arch_enums.cpp:169`). ⛔ THE
+    /// UNIT `setScaleLoadIfFound` COMPARES AGAINST (`Helper.cpp:3600`); see
+    /// [`crate::units::DfirUnit::LxluScaleReg`].
+    LxluScaleReg,
 }
 
 impl Unit {
@@ -236,7 +240,8 @@ impl ElemType {
                 | GenericComp::SfpState
                 | GenericComp::PeState
                 | GenericComp::Constant
-                | GenericComp::SfpRing => ElemType::Int(16),
+                | GenericComp::SfpRing
+                | GenericComp::LxluScaleReg => ElemType::Int(16),
             },
             DataType::Sen169Fp16 => ElemType::F16,
             DataType::Bfloat16 => ElemType::Bf16,

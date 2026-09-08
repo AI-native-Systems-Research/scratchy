@@ -486,7 +486,8 @@ impl VectorOperand {
                 | DfirUnit::PeState
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
-                | DfirUnit::L3Ibr => todo!(
+                | DfirUnit::L3Ibr
+                | DfirUnit::LxluScaleReg => todo!(
                     "PT cannot expect data other than L0-LU, N-link, CROSS-PT-N-LINK (VectorOperands.cpp:59-63)"
                 ),
             },
@@ -518,7 +519,8 @@ impl VectorOperand {
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
                 | DfirUnit::L3Ibr
-                | DfirUnit::CrossPtnLink => {
+                | DfirUnit::CrossPtnLink
+                | DfirUnit::LxluScaleReg => {
                     todo!("Unsupported receive unit for PE/SFP (VectorOperands.cpp:76)")
                 }
             },
@@ -613,7 +615,8 @@ impl VectorOperand {
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
                 | DfirUnit::L3Ibr
-                | DfirUnit::CrossPtnLink => todo!(
+                | DfirUnit::CrossPtnLink
+                | DfirUnit::LxluScaleReg => todo!(
                     "Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139, reached from the PT branch)"
                 ),
             },
@@ -641,7 +644,8 @@ impl VectorOperand {
                 | DfirUnit::SfpRing
                 | DfirUnit::LxVirtualIbr
                 | DfirUnit::L3Ibr
-                | DfirUnit::CrossPtnLink => {
+                | DfirUnit::CrossPtnLink
+                | DfirUnit::LxluScaleReg => {
                     todo!("Unsupported destination for PE/SFP FMA (VectorOperands.cpp:136-139)")
                 }
             },

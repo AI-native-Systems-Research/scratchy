@@ -1256,7 +1256,8 @@ fn viewed_unit_is_xrf(from_unit: Val, scope: &[DfirOp]) -> bool {
             | DfirUnit::SfpRing
             | DfirUnit::LxVirtualIbr
             | DfirUnit::L3Ibr
-            | DfirUnit::CrossPtnLink => false,
+            | DfirUnit::CrossPtnLink
+            | DfirUnit::LxluScaleReg => false,
         },
 
         // `getDefiningOp<dataflow::GetLocalUnitOp>()` → `memory_unit.getName().str()`, and `"ptxrf"`
