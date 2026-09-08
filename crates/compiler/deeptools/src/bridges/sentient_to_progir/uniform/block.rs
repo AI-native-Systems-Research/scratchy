@@ -37,6 +37,22 @@
 use crate::bridges::sentient_to_progir::lower::control::{RegionIndex, UnitKey};
 use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
 
+/// WHERE ONE INSTRUCTION IS — `InstrIndex`, a `std::tuple<int, int, int>`
+/// (`UniformInstrAndBlock.hpp:24`).
+///
+/// ⛔ NAMED FIELDS, NOT A TRIPLE. Three `int`s in a row is the transposition this crate's newtype
+/// rule exists to prevent, and the reference steps one of them by position: `std::get<2>(index)++`
+/// (`SentientToProgIR.cpp:344`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstrIndex {
+    /// Which block of the unit's program.
+    pub block: usize,
+    /// Which region of that block.
+    pub region: RegionIndex,
+    /// Which instruction of that region.
+    pub instr: usize,
+}
+
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
@@ -160,6 +176,35 @@ impl UniformInstrBlock {
             .get_mut(idx)
     }
 
+    /// The UNIFORM shape, or `None` for a REGULAR block — the `Type::UNIFORM` DT_CHECK
+    /// (`:379`, `:498`) as a pattern the caller cannot skip.
+    #[must_use]
+    pub fn uniform_mut(&mut self) -> Option<&mut UniformBlock> {
+        match self {
+            UniformInstrBlock::Regular(_) => None,
+            UniformInstrBlock::Uniform(block) => Some(block),
+        }
+    }
+
+    /// Replaces: e037_getUnitRegionIndex
+    ///
+    /// Which region of this block a unit reads.
+    ///
+    /// ⛔ `None` IS THE REFERENCE'S `return -1` (`hpp:210`), NOT REGION 0 — and a REGULAR block
+    /// answers 0 for every unit, because its one list is everyone's.
+    /// ⛔ NOT WHAT [`Self::instr_mut`] USES: that one falls back to region 0 for an unmapped unit.
+    #[must_use]
+    pub fn unit_region_index(&self, unit: UnitKey) -> Option<RegionIndex> {
+        match self {
+            UniformInstrBlock::Regular(_) => Some(RegionIndex(0)),
+            UniformInstrBlock::Uniform(block) => block
+                .unit_to_region
+                .iter()
+                .find(|(at, _)| *at == unit)
+                .map(|(_, region)| *region),
+        }
+    }
+
     /// Replaces: e029_getLastInstr
     ///
     /// The instruction the current region ended on — how a caller retags what it just inserted
@@ -265,13 +310,69 @@ impl UniformInstrBlocks {
     pub fn append_regular_block(&mut self) {
         self.blocks.push(UniformInstrBlock::Regular(Vec::new()));
     }
+
+    /// Replaces: e033_appendUniformBlock
+    ///
+    /// Opens a UNIFORM block for one `uniformizeRegionsOp` or `equalizePatternOp` and hands it back,
+    /// because its caller fills the unit-to-region map and walks the regions through it
+    /// (`LowerSentientHelper.cpp:1007-1023`).
+    pub fn append_uniform_block(&mut self) -> &mut UniformBlock {
+        self.blocks
+            .push(UniformInstrBlock::Uniform(UniformBlock::default()));
+        self.blocks
+            .last_mut()
+            .and_then(UniformInstrBlock::uniform_mut)
+            .expect("just pushed a uniform block")
+    }
+
+    /// Replaces: e036_appendEmptyUniformRegion
+    ///
+    /// One more region on the block currently open — what a region whose only op is a
+    /// `uniform.yield` contributes (`LowerSentientHelper.cpp:1109`).
+    ///
+    /// ⛔ THE PATTERN IS THE DT_CHECK (`:498`): only a UNIFORM last block takes a region, and a
+    /// REGULAR one — or none at all, where the reference's `back()` is undefined — takes nothing.
+    pub fn append_empty_uniform_region(&mut self) {
+        if let Some(block) = self
+            .blocks
+            .last_mut()
+            .and_then(UniformInstrBlock::uniform_mut)
+        {
+            block.append_empty_region();
+        }
+    }
+
+    /// Replaces: e034_getUniformInstr
+    ///
+    /// The instruction at one flat index, for reading its tag and for retagging it — both of which
+    /// its caller does through the same reference (`SentientToProgIR.cpp:342-366`).
+    ///
+    /// ⛔ `None` WHERE THE REFERENCE'S THREE `.at()`s THROW; [`Self::does_instr_exist`] is the test
+    /// its caller uses before stepping the index.
+    pub fn uniform_instr_mut(&mut self, index: InstrIndex) -> Option<&mut UniformInstrInfo> {
+        self.blocks
+            .get_mut(index.block)?
+            .instr_lists_mut()
+            .get_mut(index.region.0 as usize)?
+            .get_mut(index.instr)
+    }
+
+    /// Replaces: e035_doesInstrWithThisIndexExist
+    ///
+    /// Whether the index names an instruction — the guard on stepping to the NEXT one, which is how
+    /// a label finds the instruction it must land on (`SentientToProgIR.cpp:343-346`).
+    ///
+    /// ⛔ THE REFERENCE ONLY BOUNDS THE INSTRUCTION: its block and region `.at()`s throw rather than
+    /// answering false, so this is false for all three where that one is only false for the last.
+    #[must_use]
+    pub fn does_instr_exist(&self, index: InstrIndex) -> bool {
+        self.blocks
+            .get(index.block)
+            .and_then(|block| block.instr_lists().get(index.region.0 as usize))
+            .is_some_and(|region| index.instr < region.len())
+    }
 }
 
-// crustify:todo: e033_appendUniformBlock
-// crustify:todo: e034_getUniformInstr
-// crustify:todo: e035_doesInstrWithThisIndexExist
-// crustify:todo: e036_appendEmptyUniformRegion
-// crustify:todo: e037_getUnitRegionIndex
 // crustify:todo: e074_getMaxInstrRegionIndex
 // crustify:todo: e075_getRegionInstrSize
 // crustify:todo: e076_getUnitUniformInstrList
@@ -284,7 +385,7 @@ impl UniformInstrBlocks {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{UniformBlock, UniformInstrBlock, UniformInstrBlocks};
+    use super::{InstrIndex, UniformBlock, UniformInstrBlock, UniformInstrBlocks};
     use crate::bridges::sentient_to_progir::lower::control::{RegionIndex, UnitKey};
     use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
     use crate::islands::progir::OpCode;
@@ -450,5 +551,61 @@ mod unit_tests {
         assert_eq!(block.regions.len(), 3, "the skipped region is opened empty");
         assert!(block.regions[1].is_empty());
         assert_eq!(block.regions[2].len(), 1);
+    }
+
+    /// e033 + e036: the appended block is the UNIFORM shape, and the empty region lands in it —
+    /// ⛔ A REGULAR LAST BLOCK TAKES NO REGION, which is the reference's `Type::UNIFORM` DT_CHECK.
+    #[test]
+    fn an_empty_uniform_region_lands_in_a_uniform_last_block_only() {
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.append_uniform_block().unit_to_region = vec![(unit(DfirUnit::Lxlu), RegionIndex(0))];
+        blocks.append_empty_uniform_region();
+        blocks.append_empty_uniform_region();
+        assert_eq!(blocks.blocks[0].instr_lists().len(), 2);
+        blocks.append_regular_block();
+        blocks.append_empty_uniform_region();
+        assert!(matches!(blocks.blocks[1], UniformInstrBlock::Regular(_)));
+        // ⛔ AND IT DID NOT FALL BACK TO THE UNIFORM BLOCK BEHIND IT either.
+        assert_eq!(blocks.blocks[0].instr_lists().len(), 2);
+    }
+
+    /// e034 + e035: an index reads back the instruction it names, and every index past a block, a
+    /// region or a region's length answers absent instead of throwing.
+    #[test]
+    fn only_an_index_the_lists_reach_holds_an_instruction() {
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.append_uniform_block().regions = vec![vec![nop()], vec![nop(), ret()]];
+        let at = |block, region, instr| InstrIndex {
+            block,
+            region: RegionIndex(region),
+            instr,
+        };
+        assert!(blocks.does_instr_exist(at(0, 1, 1)));
+        assert_eq!(
+            blocks.uniform_instr_mut(at(0, 1, 1)).map(|i| i.opcode),
+            Some(OpCode::RETURN)
+        );
+        for index in [at(0, 0, 1), at(0, 2, 0), at(1, 0, 0)] {
+            assert!(!blocks.does_instr_exist(index));
+            assert_eq!(blocks.uniform_instr_mut(index), None);
+        }
+    }
+
+    /// e037: a mapped unit's own region, `None` for an unmapped one — ⛔ AND 0 FOR EVERY UNIT OF A
+    /// REGULAR BLOCK, whose one list is everyone's.
+    #[test]
+    fn an_unmapped_unit_has_no_region_index() {
+        let lxlu = unit(DfirUnit::Lxlu);
+        let block = UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop()], vec![ret()]],
+            unit_to_region: vec![(lxlu, RegionIndex(1))],
+            ..UniformBlock::default()
+        });
+        assert_eq!(block.unit_region_index(lxlu), Some(RegionIndex(1)));
+        assert_eq!(block.unit_region_index(unit(DfirUnit::L3su)), None);
+        assert_eq!(
+            UniformInstrBlock::Regular(vec![nop()]).unit_region_index(unit(DfirUnit::L3su)),
+            Some(RegionIndex(0))
+        );
     }
 }
