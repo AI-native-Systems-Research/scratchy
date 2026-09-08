@@ -61,7 +61,7 @@ pub fn add_to_regs_to_init(units: &[UnitKey], regs: &[Reg], regs_to_init: &mut R
 }
 
 /// A FORMAT A REGISTER INITIALISER CAN BE PACKED IN — the seven arms `scalar_const_val` accepts
-/// (`:4280-4293`), its `DT_ERROR` else being every other [`DataFormat`].
+/// (`:4248-4267`), its `DT_ERROR` else being every other [`DataFormat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegInitFormat {
     /// `SEN169_FP16` — two per word.
@@ -81,7 +81,7 @@ pub enum RegInitFormat {
 }
 
 impl RegInitFormat {
-    /// What `setSenDataType` records (`:4359`).
+    /// What `setSenDataType` records (`:4362`).
     #[must_use]
     pub const fn format(self) -> DataFormat {
         match self {
@@ -95,7 +95,7 @@ impl RegInitFormat {
         }
     }
 
-    /// ONE SCALAR ACROSS ALL 128 BITS — `scalar_const_val` (`:4278-4297`).
+    /// ONE SCALAR ACROSS ALL 128 BITS — `scalar_const_val` (`:4244-4271`).
     ///
     /// ⭐ THE SAME WORD FOUR TIMES, always: the LRF holds 128 bits per slice and a scalar fills every
     /// one of them.
@@ -120,11 +120,11 @@ impl RegInitFormat {
 }
 
 /// A VECTOR CONSTANT'S ELEMENTS AT THE WIDTH THAT FILLS 128 BITS — `vector_const_val`'s four
-/// `DT_CHECK_MSG(values.size() == N)` arms (`:4301-4330`) as four types, so a miscounted vector is an
+/// `DT_CHECK_MSG(values.size() == N)` arms (`:4282-4312`) as four types, so a miscounted vector is an
 /// E0308 rather than an abort.
 ///
 /// ⛔ NO 2-BIT VARIANT, AND THAT IS THE REFERENCE'S OWN GAP: the scalar path packs `SENINT2` and the
-/// vector path `DT_ERROR`s it (`:4331-4332`), so a 64-element vector constant has no spelling.
+/// vector path `DT_ERROR`s it (`:4328-4330`), so a 64-element vector constant has no spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorImm {
     /// `IEEE_FP32` — four 32-bit values.
@@ -138,10 +138,10 @@ pub enum VectorImm {
 }
 
 impl VectorImm {
-    /// THE 128 BITS THESE ELEMENTS MAKE — `vector_const_val` (`:4299-4335`).
+    /// THE 128 BITS THESE ELEMENTS MAKE — `vector_const_val` (`:4273-4334`).
     ///
     /// ⛔⛔ THE VECTOR PATH PUTS ELEMENT 0 IN THE **HIGH** BITS AND THE SCALAR PATH IN THE LOW ONES:
-    /// `v0 << 16 | v1` (`:4315`) against `input | input << 16` (`:4282`). Identical for a repeated
+    /// `v0 << 16 | v1` (`:4294`) against `input | input << 16` (`:4249`). Identical for a repeated
     /// value, reversed for a real vector — so a fp16 pair read the scalar way lands swapped.
     #[must_use]
     pub const fn pack(&self) -> [u32; 4] {
@@ -169,17 +169,17 @@ impl VectorImm {
     }
 }
 
-/// `fillInt32(v0, v1)` (`:4315`).
+/// `fillInt32(v0, v1)` (`:4294`).
 const fn pack16(v0: i64, v1: i64) -> u32 {
     (v0 as u32) << 16 | v1 as u32
 }
 
-/// `fillInt32(v0..v3)` (`:4324-4326`).
+/// `fillInt32(v0..v3)` (`:4304-4306`).
 const fn pack8(v0: i64, v1: i64, v2: i64, v3: i64) -> u32 {
     (v0 as u32) << 24 | (v1 as u32) << 16 | (v2 as u32) << 8 | v3 as u32
 }
 
-/// `fillInt32(v0..v7)` (`:4335-4339`).
+/// `fillInt32(v0..v7)` (`:4315-4319`).
 const fn pack4(v: &[i64; 8]) -> u32 {
     (v[0] as u32) << 28
         | (v[1] as u32) << 24
@@ -192,7 +192,7 @@ const fn pack4(v: &[i64; 8]) -> u32 {
 }
 
 /// WHAT A REGISTER INITIALISER'S CONSTANT IS — the three op kinds
-/// `addPESFPLRFImmcopyToRegInit` dispatches on (`:4339-4341`), its `DT_ERROR` else being every other
+/// `addPESFPLRFImmcopyToRegInit` dispatches on (`:4238-4242`), its `DT_ERROR` else being every other
 /// op, which has no variant here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstInput {
@@ -200,7 +200,7 @@ pub enum ConstInput {
     Scalar {
         /// `getValue()`.
         value: i64,
-        /// ⛔ `is_symbol` MAKES THE VALUE A SYMBOL ID rather than a number to pack (`:4345-4347`).
+        /// ⛔ `is_symbol` MAKES THE VALUE A SYMBOL ID rather than a number to pack (`:4354-4356`).
         is_symbol: bool,
     },
     /// `sentient::VectorConstantOp` — the register written out element by element.
@@ -210,7 +210,7 @@ pub enum ConstInput {
 }
 
 /// ONE UNIT'S CONSTANT UNDER A QUERY MAP — `getValuesFromKeys(units)` zipped with `unit_foldid_map_`
-/// (`:4374-4378`).
+/// (`:4382-4386`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniformConst {
     /// Which unit the key resolved to.
@@ -222,7 +222,7 @@ pub struct UniformConst {
 }
 
 /// A QUERY MAP'S MAPPED CONSTANT — ⛔ NO SYMBOL ARM, because the reference refuses a symbolic
-/// `sentient::ConstantOp` inside a uniform operation (`:4381-4383`).
+/// `sentient::ConstantOp` inside a uniform operation (`:4394-4396`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UniformValue {
     /// A `sentient::ConstantOp` the map holds.
@@ -232,7 +232,7 @@ pub enum UniformValue {
 }
 
 /// THE SPLAT A REGISTER INITIALISER MAY COME FROM — the witness for the three head checks
-/// (`:4229-4237`).
+/// (`:4229-4236`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegInitSplat;
 
@@ -253,10 +253,10 @@ impl RegInitSplat {
 /// Put a PE or SFP LRF's initial 128 bits into every unit's register graph.
 ///
 /// ⛔ ALWAYS `RegType::LRF` AND ALWAYS `reg_val` — all three arms write the same file and index; only
-/// the value differs (`:4360`, `:4370`, `:4426`).
+/// the value differs (`:4365`, `:4375`, `:4447`).
 ///
 /// ⛔ AN UNCOVERED UNIT TAKES ANOTHER UNIT'S WHOLE FOLD MAP — *"use a random value for this unit"*
-/// (`:4409-4417`). Kept: the register must be initialised or the program reads it undefined.
+/// (`:4413-4421`). Kept: the register must be initialised or the program reads it undefined.
 pub fn add_pe_sfp_lrf_immcopy_to_reg_init(
     units: &[UnitKey],
     input: &ConstInput,
@@ -375,7 +375,7 @@ pub enum ImmSource {
 ///
 /// Fill one immediate field: a constant is scaled into the unit's address granularity and shared, a
 /// mapping becomes the instruction's own per-unit map.
-/// ⛔ `setOperandMap` REPLACES THE MAP (`UniformInstrAndBlock.hpp:132`) — every per-unit field the
+/// ⛔ `setOperandMap` REPLACES THE MAP (`UniformInstrAndBlock.hpp:133`) — every per-unit field the
 /// instruction already carried is dropped, not merged.
 /// ⚠️ AND THE SCALING IS FLOATING POINT HERE against integer in [`get_reg_imm_vals`] (`:4133` vs
 /// `LowerSentientHelper.cpp:1147`), so one immediate can round two ways.
@@ -519,7 +519,7 @@ mod unit_tests {
     /// then REPLACES that field's map, dropping what the instruction already carried.
     #[test]
     fn a_constant_immediate_is_scaled_into_bytes_and_a_mapping_replaces_the_map() {
-        let scale = address_scale::<Target>(Component::Lxlu, SenRegType::Lrf);
+        let scale = address_scale::<Target>(Component::Lxlu);
         let mut instr = UniformInstrInfo::of(OpCode::MODLRFIMM);
         assert!(
             fill_imm_field::<Target>(

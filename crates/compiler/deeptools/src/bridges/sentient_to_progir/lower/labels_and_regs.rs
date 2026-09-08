@@ -22,13 +22,13 @@ use crate::bridges::sentient_to_progir::utils::{AddrSpace, addr_wraparounded};
 use crate::formats::Bits;
 use crate::islands::progir::RegInit;
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue, reg_file_of};
-use crate::islands::sentient::dialects::sentient::{Reg, RegType};
+use crate::islands::sentient::dialects::sentient::Reg;
 use crate::units::Core;
 use sys_arch_spec::regfile::Component;
 use sys_arch_spec::values::OpUnit;
 
 /// HOW MUCH ONE ADDRESS UNIT IS WORTH — an entry of `addressGranularityScalePerUnit`
-/// (`sysdef.cpp:531-556`), which `getAddressGranularityScale` looks up by `{component, storage}`.
+/// (`sysdef.cpp:531-554`), which `getAddressGranularityScale` looks up by `{component, storage}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AddressScale(u32);
 
@@ -42,25 +42,24 @@ impl AddressScale {
 
 /// Replaces: e009_GetAddressScale
 ///
-/// The granularity an address operand of `comp` counts in, keyed by the file it came out of.
-/// ⛔ THE L0 STORE UNIT SCALES BY `numPTRows` AND THE LOAD UNIT BY 1 (`sysdef.cpp:544-545`) — the one
+/// The granularity an address operand of `comp` counts in.
+/// ⛔ THE L0 STORE UNIT SCALES BY `numPTRows` AND THE LOAD UNIT BY 1 (`sysdef.cpp:542-543`) — the one
 /// asymmetry in the table, and an arch fact rather than a constant.
 /// ⛔ EVERY OTHER COMPONENT ANSWERS 1 THROUGH HERE. The PT/PE/SFP LRF-family entries are 128, but the
 /// reference's fallthrough `return 1` reaches them first, so this function never reads them.
+/// ⛔⛔ AND THE `locale` PARAMETER IS DEAD, so it is gone: it only ever chooses between `{L3*, HBM}`
+/// and `{L3*, LX}`, which are the same 128 — see the body.
 #[must_use]
-pub fn address_scale<A: Arch>(comp: Component, locale: RegType) -> AddressScale {
+pub fn address_scale<A: Arch>(comp: Component) -> AddressScale {
     match comp {
         Component::L0lu => AddressScale(1),
         Component::L0su => AddressScale(A::PT_ROWS),
         Component::Lxlu | Component::Lxsu => AddressScale(1),
-        Component::L3lu | Component::L3su => match locale {
-            // ⭐ BOTH KEYS ANSWER 128: `{L3*, HBM}` and `{L3*, LX}` carry the same scale, so the
-            // locale decides which entry is read rather than what comes back.
-            RegType::Ear | RegType::Ebr | RegType::Jcr => AddressScale(128),
-            RegType::Lar | RegType::Lbr => AddressScale(128),
-            // ⛔ `llvm_unreachable` THERE, ITS OWN MESSAGE HERE.
-            _ => panic!("expected locale info to calculate scale in L3"),
-        },
+        // ⭐ BOTH DEFINED KEYS ANSWER 128 AND SO THE LOCALE CANNOT BE READ OFF THE ANSWER:
+        // `{L3*, HBM}` (ear/ebr/jcr) and `{L3*, LX}` (lar/lbr) carry the same scale
+        // (`sysdef.cpp:532-536`). ⛔ THAT IS ALSO WHY THE REFERENCE'S `llvm_unreachable` FOR ANY
+        // OTHER LOCALE IS GONE RATHER THAN TRANSLATED: there is no third value it could have given.
+        Component::L3lu | Component::L3su => AddressScale(128),
         Component::Pt | Component::Pe | Component::Sfp => AddressScale(1),
     }
 }
@@ -81,7 +80,7 @@ pub fn op_code_prefix(comp: Component) -> OpUnit {
 ///
 /// Record one SSA value's immediates as a register's initial contents on every unit.
 ///
-/// ⭐ ONE OPERAND WHEN EVERY FOLD AGREES, per-fold otherwise (`:120-131`) — `all_same` collapses the
+/// ⭐ ONE OPERAND WHEN EVERY FOLD AGREES, per-fold otherwise (`:111-131`) — `all_same` collapses the
 /// fold map so an unfolded program carries no fold ids at all.
 ///
 /// ⚠️ A LOCALE WITH NO REGISTER FILE, OR NO INDEX, WRITES NOTHING, where the reference has no guard
@@ -235,36 +234,22 @@ mod unit_tests {
     use crate::arch::Target;
     use crate::islands::progir::ty::PerFold;
     use crate::islands::sentient::dialects::sentient::RegIndex;
+    use crate::islands::sentient::dialects::sentient::RegType;
     use crate::units::{Core, Corelet, DfirUnit};
 
     #[test]
     fn the_l0_store_unit_scales_by_the_pt_row_count() {
         assert_eq!(
-            address_scale::<Target>(Component::L0su, RegType::Lrf).get(),
+            address_scale::<Target>(Component::L0su).get(),
             Target::PT_ROWS,
-            "{{L0SU, L0}} is numPTRows (sysdef.cpp:544)"
+            "{{L0SU, L0}} is numPTRows (sysdef.cpp:543)"
         );
-        assert_eq!(
-            address_scale::<Target>(Component::L0lu, RegType::Lrf).get(),
-            1
-        );
-        assert_eq!(
-            address_scale::<Target>(Component::L3su, RegType::Ear).get(),
-            128
-        );
-        assert_eq!(
-            address_scale::<Target>(Component::L3lu, RegType::Lbr).get(),
-            128
-        );
-        assert_eq!(
-            address_scale::<Target>(Component::Lxsu, RegType::Lar).get(),
-            1
-        );
+        assert_eq!(address_scale::<Target>(Component::L0lu).get(), 1);
+        assert_eq!(address_scale::<Target>(Component::L3su).get(), 128);
+        assert_eq!(address_scale::<Target>(Component::L3lu).get(), 128);
+        assert_eq!(address_scale::<Target>(Component::Lxsu).get(), 1);
         // The fallthrough: a component the lookup is never reached for.
-        assert_eq!(
-            address_scale::<Target>(Component::Pt, RegType::Lrf).get(),
-            1
-        );
+        assert_eq!(address_scale::<Target>(Component::Pt).get(), 1);
     }
 
     #[test]
@@ -335,7 +320,7 @@ mod unit_tests {
         let three = lxlu(3);
         let nineteen = lxlu(19);
         let missed = lxlu(0);
-        let scale = address_scale::<Target>(Component::Lxlu, RegType::Lrf);
+        let scale = address_scale::<Target>(Component::Lxlu);
         let mapped = get_reg_imm_vals::<Target>(
             &RegImmSource::Mapped(vec![
                 (three, None, Some(RegImm::Constant(215_552))),
@@ -396,7 +381,7 @@ mod unit_tests {
                     &units[..1],
                     Component::L0su,
                     Bits(8),
-                    address_scale::<Target>(Component::L0su, RegType::Lar),
+                    address_scale::<Target>(Component::L0su),
                     false,
                 ),
                 vec![(three, vec![(Some(FoldId(0)), expected)])]

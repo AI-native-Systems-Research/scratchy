@@ -39,7 +39,7 @@ use sys_arch_spec::regfile::Component;
 ///
 /// Advance the PT's mask by one.
 ///
-/// ⛔ PT ONLY — the reference aborts on any other unit (`:4121-4122`). There is no component
+/// ⛔ PT ONLY — the reference aborts on any other unit (`:4120-4121`). There is no component
 /// parameter here, so a call for the SFP or a load unit cannot be written rather than being refused.
 ///
 /// ⭐ AN UNNAMED OP GETS NO COMMENT AT ALL, not an empty one: the reference only calls

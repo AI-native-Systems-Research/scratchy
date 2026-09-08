@@ -34,7 +34,8 @@
 //! | `e097_flattenIndex` | 2 | 12 | `dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.cpp:484` |
 //! | `e121_getUniformizedUnitUniformInstrList` | 3 | 32 | `dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.cpp:393` |
 
-use crate::bridges::sentient_to_progir::lower::control::{RegionIndex, UnitKey};
+use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
+use crate::bridges::sentient_to_progir::state::UnitKey;
 use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
 
 /// WHERE ONE INSTRUCTION IS — `InstrIndex`, a `std::tuple<int, int, int>`
@@ -212,8 +213,9 @@ impl UniformInstrBlock {
     /// own region's when it is UNIFORM.
     ///
     /// ⛔ AN UNMAPPED UNIT RUNS NOTHING HERE, unlike `getInstr`, which reads region 0 for it
-    /// (`:367`) — the two disagree in the reference and this keeps both.
-    /// ⛔ THE LAST ENTRY FOR A UNIT WINS, as the `map[unit] = idx` that fills the map leaves.
+    /// (`:369`) — the two disagree in the reference and this keeps both.
+    /// ⭐ THE PRODUCER LEAVES NO REPEAT TO PREFER: `setUnitRegionIndex` ASSIGNS
+    /// (`UniformInstrAndBlock.hpp:205-207`), so [`UniformBlock::region_of`]'s last-wins is slack here.
     #[must_use]
     pub fn unit_instr_list(&self, unit: UnitKey) -> &[UniformInstrInfo] {
         match self {
@@ -493,7 +495,8 @@ impl UniformInstrBlocks {
 #[cfg(test)]
 mod unit_tests {
     use super::{InstrIndex, UniformBlock, UniformInstrBlock, UniformInstrBlocks};
-    use crate::bridges::sentient_to_progir::lower::control::{RegionIndex, UnitKey};
+    use crate::bridges::sentient_to_progir::lower::control::RegionIndex;
+    use crate::bridges::sentient_to_progir::state::UnitKey;
     use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
     use crate::islands::progir::OpCode;
     use crate::units::{Core, DfirUnit, Residency};
@@ -507,12 +510,8 @@ mod unit_tests {
     }
 
     fn unit(unit: DfirUnit) -> UnitKey {
-        UnitKey {
-            unit,
-            residency: Residency::CoreWide {
-                core: Core::checked(0).expect("core 0"),
-            },
-        }
+        let core = Core::checked(0).expect("core 0");
+        UnitKey::of(unit, Residency::CoreWide { core }).expect("core 0 keys")
     }
 
     /// e025 + e027 + e029: the current region selects both what is counted and what is read back,
@@ -621,8 +620,7 @@ mod unit_tests {
         let lxlu = unit(DfirUnit::Lxlu);
         let block = UniformInstrBlock::Uniform(UniformBlock {
             regions: vec![vec![nop()], vec![ret(), nop()]],
-            // The second entry is the one `map[unit] = idx` would have left.
-            unit_to_region: vec![(lxlu, RegionIndex(0)), (lxlu, RegionIndex(1))],
+            unit_to_region: vec![(lxlu, RegionIndex(1))],
             ..UniformBlock::default()
         });
         assert_eq!(

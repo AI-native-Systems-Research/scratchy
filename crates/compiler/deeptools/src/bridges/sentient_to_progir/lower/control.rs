@@ -24,24 +24,11 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
+use crate::bridges::sentient_to_progir::state::UnitKey;
 use crate::islands::sentient::dialects::{Op, Val, dataflow, defining_op};
-use crate::units::{DfirUnit, Residency};
-
-/// WHICH UNIT — `getUnitName`'s `type + "core" + N + "corelet" + M` (`dcc/src/Utils/Utils.cpp:264`)
-/// as the pair it stringifies.
-///
-/// ⛔ THE PARTS, NOT THE SPELLING. The reference keys its unit-to-region map by that string, so two
-/// units collide exactly when their names do and nothing can be read back out of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnitKey {
-    /// `type=` — which unit.
-    pub unit: DfirUnit,
-    /// Which core and corelet it lives on.
-    pub residency: Residency,
-}
 
 /// WHICH REGION OF A UNIFORMIZED OP A UNIT TAKES ITS INSTRUCTIONS FROM — the value of
-/// `unit_to_region_idx_map_` (`UniformInstrAndBlock.hpp:187-205`).
+/// `unit_to_region_idx_map_` (`UniformInstrAndBlock.hpp:223`).
 ///
 /// ⛔ ABSENCE IS AN `Option<RegionIndex>`, NEVER `(size_t)-1`, which is what `getUnitRegionIndex`
 /// answers for a unit the map does not hold. A REGULAR block always answers 0.
@@ -56,6 +43,8 @@ pub struct RegionIndex(pub u32);
 /// with no null test — so a group holding anything else crashes there and is skipped here.
 /// ⭐ `getNumRegions`/`getRegionUnitList` ARE THE MECHANISM, not the decision: the unit lists arrive
 /// already partitioned, one per region, because `list_sizes` is what partitions them.
+/// ⛔ A UNIT WITH NO CORE HAS NO KEY (see [`UnitKey::of`]) and is dropped, as `getUnitName` would
+/// file it under `…core-1corelet-1`.
 #[must_use]
 pub fn fill_unit_to_id_map(region_units: &[Vec<Val>], scope: &[Op]) -> Vec<(UnitKey, RegionIndex)> {
     let mut map = Vec::new();
@@ -65,26 +54,14 @@ pub fn fill_unit_to_id_map(region_units: &[Vec<Val>], scope: &[Op]) -> Vec<(Unit
             match defining_op(*unit, scope) {
                 Some(Op::Dataflow(dataflow::Op::GetUnit {
                     residency, unit, ..
-                })) => map.push((
-                    UnitKey {
-                        unit: *unit,
-                        residency: *residency,
-                    },
-                    index,
-                )),
+                })) => set_unit_region_index(&mut map, UnitKey::of(*unit, *residency), index),
                 Some(Op::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) => {
                     for member in unit_ids {
                         if let Some(Op::Dataflow(dataflow::Op::GetUnit {
                             residency, unit, ..
                         })) = defining_op(*member, scope)
                         {
-                            map.push((
-                                UnitKey {
-                                    unit: *unit,
-                                    residency: *residency,
-                                },
-                                index,
-                            ));
+                            set_unit_region_index(&mut map, UnitKey::of(*unit, *residency), index);
                         }
                     }
                 }
@@ -94,6 +71,25 @@ pub fn fill_unit_to_id_map(region_units: &[Vec<Val>], scope: &[Op]) -> Vec<(Unit
         index = RegionIndex(index.0 + 1);
     }
     map
+}
+
+/// `setUnitRegionIndex` (`UniformInstrAndBlock.hpp:205-207`).
+///
+/// ⛔⛔ `unit_to_region_idx_map_[unit] = idx` ASSIGNS, so a unit listed in two regions keeps only the
+/// LAST and this vector holds ONE entry per unit. Appending both left the readers of that map
+/// disagreeing: `getUnitInstrList` would have answered the first region and `getInstr` the second.
+fn set_unit_region_index(
+    map: &mut Vec<(UnitKey, RegionIndex)>,
+    key: Option<UnitKey>,
+    index: RegionIndex,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    match map.iter_mut().find(|(at, _)| *at == key) {
+        Some(entry) => entry.1 = index,
+        None => map.push((key, index)),
+    }
 }
 
 // crustify:todo: e105_LowerSyncOperation
@@ -108,7 +104,7 @@ pub fn fill_unit_to_id_map(region_units: &[Vec<Val>], scope: &[Op]) -> Vec<(Unit
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::units::Core;
+    use crate::units::{Core, DfirUnit, Residency};
 
     #[test]
     fn a_group_files_every_unit_it_holds_under_one_region() {
@@ -132,30 +128,13 @@ mod unit_tests {
         let scope = vec![Op::Dataflow(l3su), Op::Dataflow(lxlu), Op::Dataflow(group)];
         // Region 0 lists the group; region 1 lists one unit directly.
         let map = fill_unit_to_id_map(&[vec![Val(2)], vec![Val(1)]], &scope);
+        let key = |unit| UnitKey::of(unit, Residency::CoreWide { core }).expect("core 0 keys");
+        // ⛔ `lxlu` IS IN BOTH REGIONS AND KEEPS THE LAST — `setUnitRegionIndex` assigns.
         assert_eq!(
             map,
             vec![
-                (
-                    UnitKey {
-                        unit: DfirUnit::L3su,
-                        residency: Residency::CoreWide { core }
-                    },
-                    RegionIndex(0)
-                ),
-                (
-                    UnitKey {
-                        unit: DfirUnit::Lxlu,
-                        residency: Residency::CoreWide { core }
-                    },
-                    RegionIndex(0)
-                ),
-                (
-                    UnitKey {
-                        unit: DfirUnit::Lxlu,
-                        residency: Residency::CoreWide { core }
-                    },
-                    RegionIndex(1)
-                ),
+                (key(DfirUnit::L3su), RegionIndex(0)),
+                (key(DfirUnit::Lxlu), RegionIndex(1)),
             ]
         );
     }

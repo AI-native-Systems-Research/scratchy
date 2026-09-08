@@ -41,7 +41,7 @@ use crate::formats::Bits;
 use crate::islands::progir::ty::Operand;
 use crate::islands::progir::{OpCode, OperandField};
 use crate::islands::sentient::dialects::sentient::{
-    CmpPredicate, Consumer, Reg, RegIndex, RegType, SyncMode,
+    CmpPredicate, Consumer, Reg, RegIndex, SyncMode,
 };
 use crate::units::Core;
 use sys_arch_spec::regfile::Component;
@@ -338,9 +338,7 @@ pub fn construct_assign_instr<A: Arch>(
         Component::Lxlu | Component::Lxsu => OperandField::Lrfimm,
         _ => OperandField::Imm,
     };
-    let scale = |locale: RegType| {
-        f64::from(element_size.0) / 8.0 / f64::from(address_scale::<A>(comp, locale).get())
-    };
+    let scale = f64::from(element_size.0) / 8.0 / f64::from(address_scale::<A>(comp).get());
     let mut refused = Vec::new();
     let instr = match &assign.kind {
         AssignKind::JcrFromImm(imm) => {
@@ -376,17 +374,11 @@ pub fn construct_assign_instr<A: Arch>(
             instr.set_common_field(OperandField::Src0, index_field(assign.tgt_index));
             match imm {
                 LrfImm::Constant(value) => {
-                    let imm = (*value as f64 * scale(RegType::Lrf)) as i64;
+                    let imm = (*value as f64 * scale) as i64;
                     instr.set_common_field(imm_field, int(imm));
                 }
                 LrfImm::Mapped(entries) => {
-                    refused = map_into(
-                        &mut instr,
-                        imm_field,
-                        entries,
-                        MapMode::None,
-                        scale(RegType::Lrf),
-                    );
+                    refused = map_into(&mut instr, imm_field, entries, MapMode::None, scale);
                 }
                 LrfImm::Symbol(id) => {
                     instr.set_common_field(imm_field, variable_symbol(*id));
@@ -426,23 +418,22 @@ pub fn construct_assign_instr<A: Arch>(
             if program_header {
                 return Assigned::none();
             }
-            let (opcode, comment, locale) = match file {
-                AddrFile::Lar => (OpCode::LARIMM, "LAR <- IMM", RegType::Lar),
-                AddrFile::Ear => (OpCode::EARIMM, "EAR <- IMM", RegType::Ear),
+            let (opcode, comment) = match file {
+                AddrFile::Lar => (OpCode::LARIMM, "LAR <- IMM"),
+                AddrFile::Ear => (OpCode::EARIMM, "EAR <- IMM"),
             };
             let mut instr = UniformInstrInfo::of(opcode).with_common_comment(comment);
             instr.set_common_field(OperandField::Src0, index_field(assign.tgt_index));
             match imm {
                 AddrImm::Constant(value) => {
-                    let imm = (*value as f64 * scale(locale)) as i64;
+                    let imm = (*value as f64 * scale) as i64;
                     instr.set_common_field(OperandField::Imm, int(imm));
                 }
                 AddrImm::Core(core) => {
                     instr.set_common_field(OperandField::Imm, int(i64::from(core.get())));
                 }
                 AddrImm::MappedConstants(entries) => {
-                    refused =
-                        map_into(&mut instr, imm_field, entries, MapMode::None, scale(locale));
+                    refused = map_into(&mut instr, imm_field, entries, MapMode::None, scale);
                 }
                 AddrImm::MappedUnits(entries) => {
                     refused = map_into(&mut instr, imm_field, entries, MapMode::UnitId, 1.0);

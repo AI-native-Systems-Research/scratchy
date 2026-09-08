@@ -39,7 +39,7 @@ use sys_arch_spec::regfile::Component;
 pub const REG_DEF_CHECKING: bool = false;
 
 /// WHICH REGISTERS OF WHICH FILES ONE UNIT TOUCHES — `RegDefTracker::RegDefContext::RegSet`,
-/// `std::array<std::bitset<kMaxCompRegs>, RegType::MAX_VALUE + 1>` (`RegDefTracker.hpp:67-68`).
+/// `std::array<std::bitset<kMaxCompRegs>, RegType::MAX_VALUE + 1>` (`RegDefTracker.hpp:66-67`).
 ///
 /// ⛔⛔ FIFTEEN FILES WIDE, NOT THE REFERENCE'S FOURTEEN, so a scale-file def is representable rather
 /// than one past the end of the array — see
@@ -142,7 +142,7 @@ pub fn add_reg_defs_for_unit<A: Arch, M: Model, W: Workload>(
 }
 
 /// ONE REGISTER A UNIT IS SAID TO DEFINE THAT NOTHING REFERENCES — what `checkRegDefs` prints as a
-/// *"Reg ref discrepancy"* (`RegDefTracker.cpp:106`).
+/// *"Reg ref discrepancy"* (`RegDefTracker.cpp:148`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegRefDiscrepancy {
     /// Which unit.
@@ -212,11 +212,11 @@ pub fn check_reg_defs<A: Arch, M: Model, W: Workload>(
 }
 
 /// WHICH REGISTERS ONE OP SAYS IT DEFINES — the singular `regLocale`/`regIndex` pair, or the
-/// `regLocales`/`regIndices` arrays (`:31,42`).
+/// `regLocales`/`regIndices` arrays (`:30,41`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpRegDefs {
     /// `regIndex` is present — ⛔ AND IT WINS AND RETURNS: an op carrying both attribute shapes has
-    /// its arrays ignored (`:38`).
+    /// its arrays ignored (`:37`).
     One(Reg),
     /// `regIndices`, zipped with `regLocales`.
     Many(Vec<Reg>),
@@ -228,7 +228,7 @@ pub enum OpRegDefs {
 ///
 /// Record every register the op being visited defines.
 /// ⛔ AN INDEX WITHOUT A LOCALE IS UNREPRESENTABLE: [`Reg`] carries both, so `"op expected to have
-/// regLocale attr"` and its array twin (`:33,44`) have nothing to refuse — and see [`set_reg_def`]
+/// regLocale attr"` and its array twin (`:32,43`) have nothing to refuse — and see [`set_reg_def`]
 /// for the locale that names no file.
 /// ⛔ `enabled()` AND `reg_def_ctx_` ARE THE CALLER'S GATE, like [`REG_DEF_CHECKING`].
 pub fn record_op_reg_defs(regs: &mut RegSet, defs: &OpRegDefs) {
@@ -246,7 +246,7 @@ pub fn record_op_reg_defs(regs: &mut RegSet, defs: &OpRegDefs) {
 /// ONE ENTRY OF A UNIFORM REGION'S UNIT LIST — a `get_unit`, or a `create_group` of them (`:81-88`).
 ///
 /// ⭐ THE CORELET IS ALREADY FOLDED INTO THE COMPONENT: `getSenComponentForProgramStateInfo`
-/// (`Utils/DccExtContext.cpp:210-236`) keys the program state by `(type, corelet)`, so a unit arrives
+/// (`Utils/DccExtContext.cpp:210-238`) keys the program state by `(type, corelet)`, so a unit arrives
 /// here as the pair `addRegDefsForUnit` writes under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionUnit {
@@ -254,7 +254,7 @@ pub enum RegionUnit {
     One(Core, Component),
     /// A `dataflow.create_group`, whose ids are each a `get_unit`.
     ///
-    /// ⛔ A MEMBER THAT IS NOT ONE IS A NULL THERE (`:87`) — `subunit.getDefiningOp<GetUnitOp>()` is
+    /// ⛔ A MEMBER THAT IS NOT ONE IS A NULL THERE (`:86`) — `subunit.getDefiningOp<GetUnitOp>()` is
     /// handed straight to `addRegDefsForUnit`, which this cannot express.
     Group(Vec<(Core, Component)>),
 }
@@ -262,7 +262,7 @@ pub enum RegionUnit {
 /// Replaces: e070_dtor_UniformRegionContext
 ///
 /// Leaving a uniform region merges what it defined into every one of its units' programs.
-/// ⛔ THE TWO OP KINDS RUN THE SAME WALK (`:79,92`), so the op is not a parameter and the trailing
+/// ⛔ THE TWO OP KINDS RUN THE SAME WALK (`:79,91`), so the op is not a parameter and the trailing
 /// `DT_ERROR("Unexpected operation for uniform region")` has no spelling.
 /// ⛔ AND `enable_ctx_` IS THE CALLER'S GATE (`:78`), the third of them in this file.
 pub fn close_uniform_region<A: Arch, M: Model, W: Workload>(
@@ -282,7 +282,7 @@ pub fn close_uniform_region<A: Arch, M: Model, W: Workload>(
     }
 }
 
-/// `addRegDefsForUnit(get_unit)` — ⭐ `progStateInfo()[core]` DEFAULT-CONSTRUCTS (`:63`), so a core
+/// `addRegDefsForUnit(get_unit)` — ⭐ `progStateInfo()[core]` DEFAULT-CONSTRUCTS (`:64`), so a core
 /// nothing has emitted for still gets its defs.
 fn merge_unit_reg_defs<A: Arch, M: Model, W: Workload>(
     progstateinfo: &mut Vec<(Core, Program<A, M, W>)>,

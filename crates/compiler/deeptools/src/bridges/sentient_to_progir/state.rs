@@ -13,27 +13,92 @@
 use crate::islands::progir::UnitRegState;
 use crate::islands::progir::ty::RegType;
 use crate::islands::sentient::dialects::sentient::RegIndex;
-use crate::units::{Core, Corelet, DfirUnit};
+use crate::units::{Core, Corelet, DfirUnit, Residency};
 use std::collections::{BTreeMap, BTreeSet};
+use sys_arch_spec::regfile::Component;
 
 /// WHICH UNIT — the typed form of `getUnitName`'s string (`Utils.cpp:264-270`).
 ///
 /// ⛔ THE PT ROW IS PART OF THE IDENTITY, not a detail the component collapses.
 /// `sys_arch_spec::regfile::Component` answers `Pt` for all eight rows, so keying by it would merge
 /// eight units' register state into one; the reference's string carries `ptrow3` and so does this.
+///
+/// ⛔⛔ THIS IS THE BRIDGE'S ONLY UNIT KEY. A second one keyed by
+/// [`crate::units::Residency`] used to live in `lower::control`, which meant the unit a uniform
+/// block routed to a region and the unit an instruction's operand map answered for were different
+/// types, and the two halves of the port could not be joined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnitKey {
     /// The `type=` the unit was bound with.
     pub unit: DfirUnit,
     /// Which core — `getCoreId` (`DccExtContext.cpp:78-87`).
     pub core: Core,
-    /// Which corelet of it — ⛔ `None` FOR AN L3 UNIT, which is shared across a core's corelets and
-    /// whose `getCoreletId` answers -1 (`DccExtContext.cpp:116-124`).
+    /// Which corelet of it — ⛔ `None` IS A MISSING `corelet` ATTRIBUTE, which is what
+    /// `getCoreletId`'s -1 means (`DccExtContext.cpp:115-127`), and it is a MEMORY unit's case,
+    /// NOT an L3's: a non-parallel component is materialised with `corelet = 0`
+    /// (`UnitMaterializer.cpp:72-73`), so `getUnitName` spells the L3 halves `…corelet0`.
     pub corelet: Option<Corelet>,
 }
 
+impl UnitKey {
+    /// THE THREE FACTS `getUnitName` STRINGIFIES, from the `dataflow.get_unit` it reads them off —
+    /// `type`, `getCoreId`, `getCoreletId`.
+    ///
+    /// ⛔ `None` WHERE `getCoreId` ANSWERS -1, which is a unit with no `core` attribute: the
+    /// reference keys it under the literal name `…core-1corelet-1` and no compute unit is one.
+    #[must_use]
+    pub fn of(unit: DfirUnit, residency: Residency) -> Option<UnitKey> {
+        let (core, corelet) = match residency {
+            Residency::Global => return None,
+            Residency::Scratchpad { core } => (core, None),
+            Residency::CoreWide { core } => (core, Some(Corelet::checked(0)?)),
+            Residency::Corelet { core, corelet } => (core, Some(corelet)),
+        };
+        Some(UnitKey {
+            unit,
+            core,
+            corelet,
+        })
+    }
+
+    /// `getSenComponentForProgramStateInfo(get_unit, corelet)` (`DccExtContext.cpp:210-238`), reduced
+    /// to what [`crate::islands::progir::Program`] keys by.
+    ///
+    /// ⛔ `None` IS THAT SWITCH'S `DT_ERROR` ARM — *"Unrecognized unit name in lowering to progir"*
+    /// for anything but the nine compute units, so a memory, a state, a ring or a link has no key.
+    /// ⛔⛔ AND THE CORELET AND THE PT ROW ARE DROPPED HERE, because the island keys by the
+    /// nine-variant generic component while the reference keys `PE_CL1` / `PT_ROW3_CL0`: two corelets'
+    /// register sets MERGE, which over-initialises rather than mis-initialises. The qualified
+    /// vocabulary is already vendored as [`sys_arch_spec::arch_enums::SenComponent`] — re-keying the
+    /// island onto it is the fix, and it is island work, not this seam's.
+    #[must_use]
+    pub const fn program_key(&self) -> Option<(Core, Component)> {
+        let comp = match self.unit {
+            DfirUnit::Sfp => Component::Sfp,
+            DfirUnit::Pe => Component::Pe,
+            DfirUnit::PtRow(_) => Component::Pt,
+            DfirUnit::L0lu => Component::L0lu,
+            DfirUnit::L0su => Component::L0su,
+            DfirUnit::Lxlu => Component::Lxlu,
+            DfirUnit::Lxsu => Component::Lxsu,
+            DfirUnit::L3lu => Component::L3lu,
+            DfirUnit::L3su => Component::L3su,
+            DfirUnit::Lx
+            | DfirUnit::Hbm
+            | DfirUnit::L0
+            | DfirUnit::Constant
+            | DfirUnit::SfpState
+            | DfirUnit::PeState
+            | DfirUnit::SfpRing
+            | DfirUnit::LxVirtualIbr
+            | DfirUnit::CrossPtnLink => return None,
+        };
+        Some((self.core, comp))
+    }
+}
+
 /// WHAT EVERY UNIT'S REGISTERS START AS — `ProgIrGraphMap`
-/// (`SentientToProgIR.hpp`, `unordered_map<std::string, ProgIrRegGraph>`).
+/// (`SentientToProgIR.hpp:37`, `unordered_map<std::string, ProgIrRegGraph>`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RegGraphs {
     /// One entry per unit that has any register initialiser, in insertion order.
@@ -44,7 +109,7 @@ impl RegGraphs {
     /// `reg_graph[unit].addRegInit(...)` — the two operations the reference spells as one subscript.
     ///
     /// ⛔⛔ `addRegInit` ASSIGNS, IT DOES NOT APPEND: `regInfo[regType][regNum] = regContent`
-    /// (`progir.h:486-501`), so initialising the same register twice keeps the LAST write and the
+    /// (`progir.h:491-496`), so initialising the same register twice keeps the LAST write and the
     /// first is lost without trace. A `push` here would keep both and print two initialisers.
     ///
     /// ⭐ AND THE SUBSCRIPT DEFAULT-CONSTRUCTS: a unit with no graph yet gets an empty one rather
@@ -77,10 +142,11 @@ impl RegGraphs {
 }
 
 /// WHICH REGISTERS OF WHICH FILES ONE UNIT MUST INITIALISE — `UtilizedRegisters`
-/// (`progir.h`, `std::map<RegType, std::set<unsigned>>`).
+/// (`SentientToProgIR.hpp:53`, `std::map<RegType, std::set<unsigned>>`).
 pub type UtilizedRegisters = BTreeMap<RegType, BTreeSet<RegIndex>>;
 
-/// THE SAME, FOR EVERY UNIT — `regs_to_init_`, keyed by the reference's `CoreAndComponent`.
+/// THE SAME, FOR EVERY UNIT — `regs_to_init_` (`SentientToProgIR.hpp:122`), keyed by the
+/// reference's `CoreAndComponent` (`:63`).
 ///
 /// ⭐ THE REFERENCE'S KEY IS `pair<int, SenComponents>` WITH THE CORELET ENCODED INTO THE COMPONENT
 /// (`PE_CL1`, `PT_ROW3_CL0`); [`UnitKey`] carries the same three facts as three fields.

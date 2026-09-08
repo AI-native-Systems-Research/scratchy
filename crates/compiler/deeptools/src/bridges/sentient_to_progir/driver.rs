@@ -22,63 +22,65 @@
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
 use crate::arch::Arch;
+use crate::bridges::sentient_to_progir::state::RegsToInit;
 use crate::islands::progir::dialects::{Op as ProgIrOp, init};
-use crate::islands::progir::ty::{Operand, OperandValue, RegType};
-use crate::islands::progir::{Program, RegBits, RegInit, UnitRegState, print};
+use crate::islands::progir::ty::{Operand, OperandValue};
+use crate::islands::progir::{Program, RegInit, UnitRegState, print};
 use crate::islands::sentient;
 use crate::model::Model;
 use crate::units::Core;
 use crate::workload::Workload;
-use sys_arch_spec::regfile::Component;
-
-/// WHICH REGISTERS ONE UNIT WAS SEEN TO USE — `regs_to_init_`'s value, a
-/// `std::map<RegType, std::set<int>>` (`SentientToProgIR.h:118`).
-pub type UtilizedRegisters = Vec<(RegType, RegBits)>;
 
 /// Replaces: e015_initializeUtilizedRegisters
 ///
 /// Give every register a unit uses a zero start, except those the header already initialises.
-/// ⛔ THE SNAPSHOT IS TAKEN BEFORE ANY ADD — `getSimpleRegInit()` returns BY VALUE, so a register
-/// this loop adds does not suppress a later add of the same one, and a duplicate init is the
-/// reference's own output.
 /// ⭐ THE TWO BRANCHES COLLAPSE: a component with no register state is an empty snapshot, which is
 /// exactly what the reference's else-branch does with one.
+/// ⛔ THE SNAPSHOT CANNOT GO STALE OBSERVABLY. `auto reg_init = ...getSimpleRegInit()` copies the
+/// header (`progir.h:497` returns a reference; the `auto` drops it), and each `(file, index)` occurs
+/// once in a `UtilizedRegisters`, so nothing this loop adds could have suppressed a later add.
+/// The reference's `addRegInit` ASSIGNS (`progir.h:491-496`) where our island's state is a `Vec`.
 pub fn initialize_utilized_registers<A: Arch, M: Model, W: Workload>(
-    regs_to_init: &[((Core, Component), UtilizedRegisters)],
+    regs_to_init: &RegsToInit,
     progstateinfo: &mut Vec<(Core, Program<A, M, W>)>,
 ) {
-    for ((core, comp), reg_map) in regs_to_init {
+    for (unit, reg_map) in regs_to_init {
+        // ⛔ A UNIT WITH NO PROGRAM COMPONENT IS THE REFERENCE'S `DT_ERROR` (see
+        // [`UnitKey::program_key`]), and `regs_to_init_` only ever holds the nine compute units.
+        let Some((core, comp)) = unit.program_key() else {
+            continue;
+        };
         // ⭐ `progstateinfo_[core]` — `operator[]` on a `std::map`, so a core nothing has emitted for
         // gets an empty program rather than nothing at all.
-        if !progstateinfo.iter().any(|(id, _)| id == core) {
-            progstateinfo.push((*core, Program::default()));
+        if !progstateinfo.iter().any(|(id, _)| *id == core) {
+            progstateinfo.push((core, Program::default()));
         }
-        for (_, program) in progstateinfo.iter_mut().filter(|(id, _)| id == core) {
+        for (_, program) in progstateinfo.iter_mut().filter(|(id, _)| *id == core) {
             let already: Vec<RegInit> = program
                 .reg_state
                 .iter()
-                .find(|(unit, _)| unit == comp)
+                .find(|(unit, _)| *unit == comp)
                 .map(|(_, state)| state.clone())
                 .unwrap_or_default();
-            if !program.reg_state.iter().any(|(unit, _)| unit == comp) {
-                program.reg_state.push((*comp, UnitRegState::new()));
+            if !program.reg_state.iter().any(|(unit, _)| *unit == comp) {
+                program.reg_state.push((comp, UnitRegState::new()));
             }
             for (_, state) in program
                 .reg_state
                 .iter_mut()
-                .filter(|(unit, _)| unit == comp)
+                .filter(|(unit, _)| *unit == comp)
             {
                 for (file, regs) in reg_map {
-                    for index in regs.iter() {
+                    for index in regs {
                         if already
                             .iter()
-                            .any(|init| init.file == *file && init.index == index)
+                            .any(|init| init.file == *file && init.index == *index)
                         {
                             continue;
                         }
                         state.push(RegInit {
                             file: *file,
-                            index,
+                            index: *index,
                             value: Operand::every(OperandValue::Int(0)),
                         });
                     }
@@ -119,12 +121,16 @@ pub fn replace_program_body_with_smc_op<A: Arch, M: Model, W: Workload>(
 mod unit_tests {
     use super::*;
     use crate::arch::Target;
+    use crate::bridges::sentient_to_progir::state::{UnitKey, UtilizedRegisters};
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::Val;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::progir::ty::RegType;
     use crate::islands::sentient::dialects::sentient::RegIndex;
     use crate::islands::sentient::{ProgramUnit, ProgramUnits};
-    use crate::units::DfirUnit;
+    use crate::units::{DfirUnit, Residency};
+    use std::collections::BTreeSet;
+    use sys_arch_spec::regfile::Component;
 
     struct M;
     impl Model for M {
@@ -146,6 +152,7 @@ mod unit_tests {
     #[test]
     fn only_a_register_the_header_does_not_already_initialise_is_zeroed() {
         let core = Core::checked(0).expect("core 0");
+        let key = |unit| UnitKey::of(unit, Residency::CoreWide { core }).expect("core 0 keys");
         let mut progstateinfo: Vec<(Core, Program<Target, M, W>)> = Vec::new();
         // The header already starts `lrf1`; `lrf1` and `lar2` are both used.
         progstateinfo.push((core, Program::default()));
@@ -157,13 +164,15 @@ mod unit_tests {
                 value: Operand::every(OperandValue::Int(7)),
             }],
         ));
-        let regs_to_init = vec![(
-            (core, Component::Pe),
-            vec![
-                (RegType::Lrf, RegBits::empty().with(RegIndex::at::<1>())),
-                (RegType::Lar, RegBits::empty().with(RegIndex::at::<2>())),
-            ],
-        )];
+        let used = |file, index| UtilizedRegisters::from([(file, BTreeSet::from([index]))]);
+        let mut regs_to_init = RegsToInit::new();
+        regs_to_init.insert(
+            key(DfirUnit::Pe),
+            UtilizedRegisters::from([
+                (RegType::Lrf, BTreeSet::from([RegIndex::at::<1>()])),
+                (RegType::Lar, BTreeSet::from([RegIndex::at::<2>()])),
+            ]),
+        );
         initialize_utilized_registers(&regs_to_init, &mut progstateinfo);
         assert_eq!(
             progstateinfo[0].1.reg_state,
@@ -185,11 +194,10 @@ mod unit_tests {
         );
         // ⛔ A core with no program at all still gets one, and everything it uses is zeroed.
         let other = Core::checked(1).expect("core 1");
+        let elsewhere =
+            UnitKey::of(DfirUnit::Sfp, Residency::CoreWide { core: other }).expect("core 1 keys");
         initialize_utilized_registers(
-            &[(
-                (other, Component::Sfp),
-                vec![(RegType::Lrf, RegBits::empty().with(RegIndex::at::<0>()))],
-            )],
+            &RegsToInit::from([(elsewhere, used(RegType::Lrf, RegIndex::at::<0>()))]),
             &mut progstateinfo,
         );
         assert_eq!(

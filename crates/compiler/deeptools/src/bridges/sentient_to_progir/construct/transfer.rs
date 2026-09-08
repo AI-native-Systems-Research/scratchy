@@ -807,7 +807,7 @@ const LDCVTI_SRC_BITS: u32 = 4;
 /// ⛔ SEN1P5 AND `LXLU` ONLY, both DT_CHECKed (`:2398`), so neither is an argument.
 /// ⛔ THE `imm` IS IN **DESTINATION** UNITS: the source's 4 bits over 8 halve it (`:2436-2441`), which
 /// is why IBM's own 256-element load writes `imm:128`.
-/// ⛔ AND A MAPPED CONSUMER **ASSIGNS** THE WHOLE OPERAND MAP (`UniformInstrAndBlock.hpp:118`) rather
+/// ⛔ AND A MAPPED CONSUMER **ASSIGNS** THE WHOLE OPERAND MAP (`UniformInstrAndBlock.hpp:133`) rather
 /// than adding to it.
 pub fn construct_load_compute_instr<A: Arch>(
     load: &LoadCompute<'_>,
@@ -830,7 +830,7 @@ pub fn construct_load_compute_instr<A: Arch>(
     if let Some(name) = &load.dbg_name {
         instr = instr.with_common_comment(name);
     }
-    let scale = address_scale::<A>(Component::Lxlu, SenRegType::Lrf).get();
+    let scale = address_scale::<A>(Component::Lxlu).get();
     let imm = load.immutable_value as f64 * f64::from(LDCVTI_SRC_BITS) / 8.0 / f64::from(scale);
     instr.set_common_field(OperandField::Imm, int(imm as i64));
     instr.set_common_field(OperandField::Src0, reg_field(load.result));

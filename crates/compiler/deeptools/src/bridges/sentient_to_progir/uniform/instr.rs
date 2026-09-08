@@ -19,8 +19,8 @@
 
 use crate::bridges::sentient_to_progir::state::UnitKey;
 use crate::bridges::sentient_to_progir::utils::{ConsumerUnit, update_proper_consumer};
-use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::formats::DataFormat;
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue};
 use crate::islands::progir::{Instruction, OpCode, OperandField};
 use crate::units::DfirUnit;
@@ -43,7 +43,7 @@ pub struct UniformInstrInfo {
     ///
     /// ⛔⛔ DISJOINT FROM [`Self::common_fields`] BY THE ACCESSORS, WHICH IS WHAT THREE `DT_CHECK`s
     /// TEST — `getCommonField`, `setCommonField` and `getRegularInstr` each abort on a field held in
-    /// both (`cpp:254,258,248`).
+    /// both (`cpp:254,259,248`).
     pub operand_map: Vec<(OperandField, PerUnitOperand)>,
     /// `tag_` — ⛔ THE EMPTY STRING IS THE ABSENCE in the reference (`hasTag`), so it is `None` here.
     pub tag: Option<String>,
@@ -129,7 +129,7 @@ impl PerUnitOperand {
 pub enum Displaced {
     /// It held one value for every unit.
     Common(Operand),
-    /// It held one per unit — ⛔ THE STATE `setCommonField`'s `DT_CHECK` ABORTS ON (`cpp:258`);
+    /// It held one per unit — ⛔ THE STATE `setCommonField`'s `DT_CHECK` ABORTS ON (`cpp:259`);
     /// handing it back loses nothing instead.
     PerUnit(PerUnitOperand),
 }
@@ -172,7 +172,7 @@ impl UniformInstrInfo {
     ///
     /// ⛔ A UNIT WITH NO ENTRY TAKES THE FIRST ONE — the reference's own *"use a random entry for
     /// uniform purpose"* `begin()` into an `unordered_map`.
-    /// ⭐ A UNIT'S OWN COMMENT WINS OVER THE COMMON ONE (`cpp:225-228`).
+    /// ⭐ A UNIT'S OWN COMMENT WINS OVER THE COMMON ONE (`cpp:224-227`).
     #[must_use]
     pub fn uniformized_instr(&self, unit: UnitKey) -> Instruction {
         let mut fields = self.common_fields.clone();
@@ -195,7 +195,7 @@ impl UniformInstrInfo {
     }
 
     /// THE PROOF THAT NOTHING HERE IS PER-UNIT — `getRegularInstr`'s two `DT_CHECK`s
-    /// (`cpp:245,248`), as the only way to reach [`Regular::instr`].
+    /// (`cpp:246,248`), as the only way to reach [`Regular::instr`].
     #[must_use]
     pub fn regular(&self) -> Option<Regular<'_>> {
         let per_unit_comment = match &self.comment {
@@ -608,9 +608,9 @@ pub fn add_entry_to_operand_map(entries: &[MappedEntry], mode: MapMode, scale: f
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Comment, Displaced, FoldConstant, MapMode, MappedEntry, MappedField, MappedOp, OperandMapRefusal,
-        PerUnitOperand, UniformInstrInfo, UniformLabel, add_entry_to_operand_map, create_jmp_instr,
-        create_nop_instr,
+        Comment, Displaced, FoldConstant, MapMode, MappedEntry, MappedField, MappedOp,
+        OperandMapRefusal, PerUnitOperand, UniformInstrInfo, UniformLabel,
+        add_entry_to_operand_map, create_jmp_instr, create_nop_instr,
     };
     use crate::bridges::sentient_to_progir::state::UnitKey;
     use crate::formats::DataFormat;
