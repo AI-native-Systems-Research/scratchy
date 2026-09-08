@@ -381,20 +381,21 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             | dataflow::Op::Receive { .. }
             | dataflow::Op::Opaque(_),
         ) => true,
-        // Four of the thirteen `agen` classes. The nine the island does not declare —
-        // `composite_store`, `composite_indirect_load_and_store`,
-        // `composite_indirect_load`, `composite_indirect_store`, `indirect_vector_load`,
-        // `indirect_vector_store`, `composite_memory_interleave`, `symbolic_vector_load`,
-        // `symbolic_vector_store` — belong on this side of the answer when they land.
+        // Five of the thirteen `agen` classes. The eight the island does not declare —
+        // `composite_indirect_load_and_store`, `composite_indirect_load`,
+        // `composite_indirect_store`, `indirect_vector_load`, `indirect_vector_store`,
+        // `composite_memory_interleave`, `symbolic_vector_load`, `symbolic_vector_store` — belong on
+        // this side of the answer when they land.
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoad(_)
+            | agen::Op::CompositeStore(_)
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
         // `agen.yield` terminates a transfer's region and is not one; the view and unit binders,
         // `program_unit` and every arith/affine/scf/vectorchain op are not in the `isa<>` list.
-        DfirOp::Agen(agen::Op::Yield | agen::Op::SetTransferMaskState { .. })
+        DfirOp::Agen(agen::Op::Yield { .. } | agen::Op::SetTransferMaskState { .. })
         | DfirOp::Dataflow(
             dataflow::Op::GetUnit { .. }
             | dataflow::Op::GetLocalUnit { .. }
@@ -744,7 +745,7 @@ mod unit_tests {
                 precision: None,
                 body: Vec::new(),
             }),
-            DfirOp::Agen(agen::Op::Yield),
+            DfirOp::Agen(agen::Op::Yield { values: Vec::new() }),
             DfirOp::VectorChain(vectorchain::Op::Rotate {
                 result: Val(21),
                 input: Val(20),

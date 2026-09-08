@@ -16,6 +16,7 @@ use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::vectorchain::{LaneMask, Predicate};
 use crate::islands::dataflow_ir::dialects::{Op, Val, dataflow, vectorchain};
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
+use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency};
 
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
@@ -366,15 +367,47 @@ pub fn static_continuous_mask(
     prefix.binds(result)
 }
 
-// crustify:todo: e085_initializeUnit
+/// Replaces: e085_initializeUnit
+///
+/// **085/110** `DataflowIRConstructionUtils.hpp:171` — the `get_unit`/`program_unit` pair for one
+/// `(core, corelet, unit)`, and NOTHING ELSE: no `component_to_handler_`, no neighbour preamble.
+/// The unit's own handle is handed back as the `program_unit`'s single-entry unit list.
+///
+/// ⛔ [`NumFolds::ONE`] IS THE TYPE, NOT A VALUE READ: this one writes the literal
+/// `getI32IntegerAttr(1)` (`:184`) — *"this initalization is for only non-uniform and non-fold
+/// mode"* — where its `DSC2ToDataflowIRUtils.hpp:624` namesake asserts the field equals it.
+#[must_use]
+pub fn initialize_unit(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    core: Core,
+    corelet: Corelet,
+    comp: DfirUnit,
+) -> Val {
+    let handle = vals.mint();
+    into.push(Op::Dataflow(dataflow::Op::GetUnit {
+        result: handle,
+        residency: Residency::Corelet { core, corelet },
+        unit: comp,
+        num_folds: Some(NumFolds::ONE),
+    }));
+    into.push(Op::Dataflow(dataflow::Op::ProgramUnit {
+        units: vec![handle],
+        precision: None,
+        body: Vec::new(),
+    }));
+    handle
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        MacOp, MaskValue, PrecisionName, TypeName, continuous_mask_prefix, logical_memory_view,
-        precision_to_type, reduction_map_for_mac, static_continuous_mask, type_to_name,
+        MacOp, MaskValue, PrecisionName, TypeName, continuous_mask_prefix, initialize_unit,
+        logical_memory_view, precision_to_type, reduction_map_for_mac, static_continuous_mask,
+        type_to_name,
     };
     use crate::arch::Dd2;
+    use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency};
     use crate::bridges::dataflow_ir_to_sentient::vc_helper::{
         MaskValue as PtMaskValue, PtUnit, get_mask_value_for_pt,
     };
@@ -386,6 +419,34 @@ mod unit_tests {
         AffineExpr, AffineMap, Constraint, ElemType, IntegerSet, MemRef, Vector,
     };
     use crate::islands::sentient::dialects::Definitions;
+
+    /// 🎯 085/110 — ⛔ AN **EMPTY** REGION, WHERE ITS NAMESAKE FILLS ONE. This pair is the whole
+    /// operation: no `component_to_handler_`, no neighbour preamble, and the handle it returns is the
+    /// `program_unit`'s single unit.
+    #[test]
+    fn the_construction_pair_is_a_get_unit_and_an_empty_program_unit() {
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let core = Core::checked(1).expect("core 1");
+        let corelet = Corelet::checked(0).expect("corelet 0");
+        let handle = initialize_unit(&mut vals, &mut ops, core, corelet, DfirUnit::Pe);
+        assert_eq!(
+            ops,
+            vec![
+                Op::Dataflow(dataflow::Op::GetUnit {
+                    result: handle,
+                    residency: Residency::Corelet { core, corelet },
+                    unit: DfirUnit::Pe,
+                    num_folds: Some(NumFolds::ONE),
+                }),
+                Op::Dataflow(dataflow::Op::ProgramUnit {
+                    units: vec![handle],
+                    precision: None,
+                    body: Vec::new(),
+                }),
+            ]
+        );
+    }
 
     /// ⛔ THE IDENTITY MAP AND A SINGLE-ELEMENT MEMREF — the built `1 * d0 + 0` never reaches the op.
     #[test]

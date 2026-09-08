@@ -452,7 +452,7 @@ mod unit_tests {
                 time_order: planned.time_order,
                 load_time_addr_map: planned.load_time_addr_map,
                 store_time_addr_map: planned.store_time_addr_map,
-                body: vec![DfirOp::Agen(agen::Op::Yield)],
+                body: vec![DfirOp::Agen(agen::Op::Yield { values: Vec::new() })],
             },
         )))
     }

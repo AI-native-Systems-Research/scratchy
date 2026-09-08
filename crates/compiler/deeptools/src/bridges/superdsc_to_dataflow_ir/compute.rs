@@ -27,17 +27,28 @@
 //! | `e103_constructComputeOperation` | 6 | 83 | `dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1567` |
 
 use super::construction::{MaskValue, static_continuous_mask};
-use super::control_flow::PrimaryDim;
-use super::dsc_lowering::mlir_loop_from_loop_node;
+use super::control_flow::{PrimaryDim, StartAddresses};
+use super::dsc_lowering::{
+    Component, DataLocation, Handlers, Handles, address_granularity_multiply_factor,
+    constant_index, create_get_unit_op_in_different_core, mlir_loop_from_loop_node,
+    uniformized_folded_address, uniformized_folded_destination_core,
+};
+use super::transfer::{
+    AddressedAs, AgenStorage, Latch, LoopStride, TransferElements, TransferSide, ViewSize,
+    elements_of_affine_data_transfer_via_agen_transfer,
+};
 use crate::arch::{Arch, Elements, IsaGen};
 use crate::generated::{DataType, OpaqueFunc, ParamKey, ParamValue, RegName};
 use crate::islands::dataflow_ir::Values;
-use crate::islands::dataflow_ir::dialects::dataflow::{Opaque, RegAddr};
+use crate::islands::dataflow_ir::dialects::dataflow::{Opaque, RegAddr, Received};
 use crate::islands::dataflow_ir::dialects::vectorchain::{Computed, Predicate};
-use crate::islands::dataflow_ir::dialects::{Op, Val, arith, dataflow, vectorchain};
+use crate::islands::dataflow_ir::dialects::{Op, Val, agen, arith, dataflow, vectorchain};
+use crate::islands::dataflow_ir::link::{self as link, Link, RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::ty::{
-    AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, TensorCategory, Vector,
+    AffineExpr, AffineMap, Constraint, ElemType, GenericComp, IntegerSet, ScalarTy, TensorCategory,
+    Vector,
 };
+use crate::units::{Core, Corelet, DfirUnit, NumFolds};
 
 /// ⛔ A STICK IN **BITS** — 128 bytes, and the reference divides by it in bits (`(128 * 8) / width`,
 /// `SNComputeLowering.cpp:363-370`).
@@ -162,6 +173,7 @@ pub const fn is_integer(elem: ElemType) -> bool {
 pub fn single_val_custom_vector(
     vals: &mut Values,
     into: &mut Vec<Op>,
+    name: &str,
     value: i64,
     ty: Vector,
 ) -> Computed {
@@ -176,6 +188,9 @@ pub fn single_val_custom_vector(
     into.push(Op::VectorChain(vectorchain::Op::Shuffle {
         result,
         input: bitstream,
+        variable: Vec::new(),
+        // `getStringAttr(compute_op.name_)` (`:446`).
+        dbg_name: Some(name.to_owned()),
         indices: vec![0],
         repetition: u32::try_from(ty.len).expect("a vector's element count fits a u32"),
         input_ty: ty,
@@ -565,8 +580,559 @@ pub fn opaque_operation(
     }))
 }
 
-// crustify:todo: e086_constructComputeInputOperandAndAddToList
-// crustify:todo: e087_constructComputeOutputOperand
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 086 + 087/110 — ONE COMPUTE OPERAND, IN AND OUT
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH REGISTER FILE AN OPERAND IS READ FROM OR WRITTEN TO, AND WHAT THAT ACCESS THEN COSTS.
+///
+/// ⭐ THE TEN REGISTER-FILE `SenComponents` COLLAPSE TO FOUR SHAPES. `LRFREG`, `PTARF`, `PTXRF`,
+/// `PELRF` and `SFPLRF` share one body (`SNComputeLowering.cpp:519`, `:804`); the two `STATE` files
+/// differ only by suppressing the precision conversion (`:757`, `:782`); and the two forwards and
+/// the scale register each add a shuffle. [`Component`] still says WHICH file it is — this says what
+/// reading it costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryFile {
+    /// `LRFREG` | `PTARF` | `PTXRF` | `PELRF` | `SFPLRF` — the access IS the operand.
+    Register,
+    /// `PESTATE` | `SFPSTATE` — the same access, and the one flag that skips the conversion.
+    State,
+    /// `NFWD0` | `NFWD2` — a neighbour forward, read through a fixed index table.
+    ///
+    /// ⛔⛔ AND IT DOES NOT ADDRESS ITS OWN OPERAND'S STORAGE. `storage` and `data_info` are
+    /// REASSIGNED to `outputs_.front()` and `outputsLdsAndLoopOffsets_.front()` (`:530-533`), and the
+    /// unit view likewise to `outputsLoopsAndSizes_.front()` (`:547`, `:565`) — a forward reads where
+    /// the compute's FIRST OUTPUT is written. That substitution picks a DSC record and so belongs to
+    /// the caller; what is left here is the shuffle.
+    Forward(Forward),
+    /// `LXLUSCALEREG` — one scale register broadcast over half a vector, indexed by a loop counter.
+    ScaleReg,
+}
+
+/// WHICH NEIGHBOUR FORWARD, and so which index table the load is read through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forward {
+    /// `NFWD0`.
+    Nfwd0,
+    /// `NFWD2`.
+    Nfwd2,
+}
+
+impl Forward {
+    /// THE TABLE, PER ELEMENT WIDTH (`:591-628`).
+    ///
+    /// ⛔ [`None`] IS A WIDTH WITH NO ARM, which in the reference is a NULL `input_data` carried
+    /// into `constructPrecisionConversionOperation`: neither `if` has an `else`. The refusal moves to
+    /// the one line that can still name the width.
+    ///
+    /// ⭐ `repetition` IS 8 ON ALL FOUR ARMS, so `8 x 8` fills an f16 stick and `4 x 8` an f32 one.
+    #[must_use]
+    pub fn indices(self, elem: ElemType) -> Option<Vec<i32>> {
+        match (self, elem) {
+            (Forward::Nfwd0, ElemType::F16) => Some(vec![2, 3, 0, 1, 6, 7, 6, 7]),
+            (Forward::Nfwd0, ElemType::F32) => Some(vec![1, 0, 3, 3]),
+            (Forward::Nfwd2, ElemType::F16) => Some(vec![4, 5, 3, 3, 5, 5, 6, 7]),
+            (Forward::Nfwd2, ElemType::F32) => Some(vec![2, 0, 1, 3]),
+            _ => None,
+        }
+    }
+}
+
+/// ONE ENTRY OF `loopEleOffsets_.at(corelet)` — a loop, and how far this operand walks along it.
+///
+/// ⛔ `DT_CHECK(dim_offset.size() == 1)` (`:641`, `:727`) IS THIS SHAPE: one dim and one offset per
+/// loop, so the reference's `*dim_offset.begin()` reads the only entry there is, and the induction
+/// variable is [`mlir_loop_from_loop_node`]'s answer for that dim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopOffset {
+    /// The loop's induction variable.
+    pub iv: Val,
+    /// `dim_offset.begin()->second`, in elements.
+    pub offset: i64,
+}
+
+/// A REGISTER-FILE OPERAND'S ACCESS, AS ONE RECORD — the same fields on both sides of a compute.
+pub struct MemoryOperand<'m> {
+    /// Which file, and what the access then costs.
+    pub file: MemoryFile,
+    /// `storage` — what the view is taken over.
+    pub storage: Component,
+    /// `{comp_, storage}`, as the granularity table keys it.
+    pub location: DataLocation,
+    /// The format the granularity factor is read at — `getElementType(result_type)`.
+    pub precision: DataType,
+    /// `needsUniform()` — the handle set the address maps over, or [`None`] for the constant one.
+    pub uniform: Option<&'m Handles>,
+    /// `data_info->startAddr_`, read the two ways entry 030 reads it.
+    pub addresses: StartAddresses<'m>,
+    /// `*unit_view_sizes` — `sizesNoGaps_` under uniformization and `getSizesForCoreId(core_id_)`
+    /// otherwise, which is a choice of DSC record and so the caller's.
+    pub view_sizes: &'m [ViewSize],
+    /// `unit_view->outerLoops_`.
+    pub outer_loops: &'m [LoopStride],
+    /// `myLdsIdx_ == -1 && constantId_ >= 0`.
+    pub addressed_as: AddressedAs,
+    /// `core_id_`.
+    pub core: Core,
+    /// `corelet_id_` — [`None`] is the reference's `-1`.
+    pub corelet: Option<Corelet>,
+    /// `loopEleOffsets_.at(clId)`, which only [`MemoryFile::ScaleReg`] reads.
+    pub offsets: &'m [LoopOffset],
+}
+
+/// THE RING PEER — another core's copy of THIS unit, and the wire to or from it.
+///
+/// ⛔ `DT_CHECK(comp_ == SFP)` (`:702`, `:880`) IS THE TWO STATIC KINDS OF THAT WIRE. Only an SFP
+/// reaches this arm and the peer is the same `comp_` in a different core, so [`link::Sfp`] at both
+/// ends of the [`Link`] IS the check — and the ring is the one arm of either function whose unit
+/// kind is known here rather than at the caller.
+pub struct Ring<'r> {
+    /// This unit's own handle — the end of the wire that stays here.
+    pub own: Val,
+    /// `needsUniform()`.
+    pub uniform: Option<&'r Handles>,
+    /// `startAddr_` READ AS A CORE ID, which is what this one manager holds (`:707`, `:884`).
+    pub peer_core: &'r dyn Fn(Core, Corelet) -> Core,
+    /// `core_id_`, which the non-uniform arm reads the peer at.
+    pub core: Core,
+    /// `corelet_id_` — the ring never crosses corelets.
+    pub corelet: Corelet,
+    /// `num_folds_`.
+    pub num_folds: NumFolds,
+    /// `uniform_region_iterator_`, for the query entry 059 makes.
+    pub region_iterator: Option<Val>,
+}
+
+/// WHERE ONE COMPUTE INPUT OPERAND COMES FROM — `compute_op.inputs_[index]`, with each arm's facts.
+///
+/// ⛔⛔ THE FIVE PLAIN RECEIVES ARE ONE ARM. `PTNORTH`, `PT`, `LXLU`, `PE` and `SFP` differ in the
+/// reference ONLY in the component `retrieveGetUnitOpInSameCore` is asked for (`:511-4973`), and `PT`
+/// asks for `PTROW7` rather than for itself. The unit that answers is a NEIGHBOUR of the one being
+/// lowered — `PTNORTH` of row 0 is the SFP and of row 3 is row 2, per [`PtDirection`] — so the kind
+/// is not a property of the arm at all and cannot be spelled here. That is why the wire ARRIVES as a
+/// [`RecvEnd`]: [`Link::ends`] is the only thing that mints one, and the send it pairs with belongs
+/// to the producing unit's own lowering, exactly as entries 080, 081 and 090 take theirs.
+pub enum ComputeInput<'i> {
+    /// `ZERO` — a dense zero of the result's own type.
+    Zero,
+    /// `ONE`.
+    One,
+    /// `PTWEST` | `L0LU` | `L0LUROW0` — a receive off the west neighbour, splatted for the MAC.
+    FromL0 {
+        /// The wire from the west unit.
+        west: RecvEnd,
+        /// `compute_op.type_`.
+        mac: MacOp,
+        /// `compute_op.dataFormat_`.
+        format: DataType,
+    },
+    /// `PTNORTH` | `PT` | `LXLU` | `PE` | `SFP` — one receive, and the operand is what arrives.
+    Wire(RecvEnd),
+    /// The ten-component register-file group.
+    Memory(MemoryOperand<'i>),
+    /// `SFPRING`.
+    Ring(Ring<'i>),
+    /// `LATCH` — `getFromLatchMap(latch_id)`, which is the lowering's own state and so the caller's.
+    Latch {
+        /// The value the map holds.
+        data: Val,
+        /// `loopEleOffsets_.at(clId)`, read only when the execution unit is the LXLU.
+        offsets: &'i [LoopOffset],
+    },
+}
+
+/// WHAT BOTH SIDES OF A COMPUTE OPERAND ARE LOWERED AGAINST.
+pub struct OperandContext<'c> {
+    /// `compute_op.name_` — the `dbgName` of every op here that carries one.
+    pub name: &'c str,
+    /// `comp_` — the unit being lowered, which the conversion is chosen for.
+    pub comp: GenericComp,
+    /// `compute_op.exUnit_`, whose being the LXLU suppresses every precision conversion.
+    pub ex_unit: GenericComp,
+    /// `component_to_handler_`, for the view a register-file access is taken over.
+    pub handlers: &'c Handlers,
+    /// `result_type`.
+    ///
+    /// ⛔ AND `element_type` IS ITS ELEMENT, NOT A SECOND ARGUMENT. The reference passes both
+    /// (`:456-457`); a `CustomVectorType` of `CustomMXFloatType` is [`ElemType::MxFloat`] here, so
+    /// the `isa` test those two arguments exist for is a test on this one field.
+    pub result_ty: Vector,
+}
+
+/// Replaces: e086_constructComputeInputOperandAndAddToList
+///
+/// ONE COMPUTE INPUT OPERAND, AT THE COMPUTE'S OWN PRECISION — `SNComputeLowering.cpp:456`.
+///
+/// ⛔⛔ THE TAIL IS NOT A FORMALITY: every arm above it produces a value at the SOURCE's width, and
+/// `constructPrecisionConversionOperation` is what makes it an operand of THIS compute (`:757-771`).
+/// Its two exemptions are the state files and an LXLU execution unit.
+///
+/// ⛔ [`None`] IS EVERY `failure()` THE REFERENCE HAS: the selection map's (`:502`), the affine
+/// transfer's (`:585`), the shuffle table's, the `DT_CHECK` on the innermost loop, the conversion's
+/// (`:766`) and the unmatched component (`:754`).
+/// ⛔ AND ITS `DT_ERROR("Result type is expected to be a vector type")` IS UNREACHABLE — a
+/// [`Vector`] is one, and the reference's third case is a type this island cannot spell.
+pub fn compute_input_operand<A: Arch>(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    source: &ComputeInput<'_>,
+    format: DataType,
+) -> Option<Computed> {
+    let ty = ctx.result_ty;
+    let input_data = match source {
+        // `getZeroAttr(result_vtype)` and `getIntegerAttr/getFloatAttr(element_type, 1)`
+        // (`:461-494`) — one body, and the literal is which of the two pseudo-units it is.
+        ComputeInput::Zero | ComputeInput::One => {
+            let splat = i64::from(matches!(source, ComputeInput::One));
+            if matches!(ty.elem, ElemType::MxFloat(_)) {
+                single_val_custom_vector(vals, into, ctx.name, splat, ty)
+            } else {
+                let result = vals.mint();
+                into.push(Op::Arith(arith::Op::DenseConstant { result, splat, ty }));
+                Computed::of(result, ty)
+            }
+        }
+        // `ReceiveOp::create(..)` then `SelectOp::create(.., splat_data_type, data, selection_map)`.
+        ComputeInput::FromL0 { west, mac, format } => {
+            let data = Received::receive(into, vals.mint(), *west, ty);
+            let (selection_map, splat_ty) = mac.selection_map_from_l0::<A>(*format, ty.elem)?;
+            let result = vals.mint();
+            into.push(Op::VectorChain(vectorchain::Op::Select {
+                result,
+                input: data.operand(),
+                selection_map,
+                input_ty: ty,
+                ty: splat_ty,
+            }));
+            Computed::of(result, splat_ty)
+        }
+        ComputeInput::Wire(from) => {
+            Computed::of(Received::receive(into, vals.mint(), *from, ty).operand(), ty)
+        }
+        ComputeInput::Memory(memory) => {
+            let loaded = memory_load(vals, into, ctx, memory)?;
+            match memory.file {
+                // `input_data = load_op.getResult()`.
+                MemoryFile::Register | MemoryFile::State => loaded,
+                // `ShuffleOp::create(.., result_type, load_op.getResult(), nullptr, index_array, 8,
+                //  name)` — the result type is the LOAD's, so the table only reorders (`:591-628`).
+                MemoryFile::Forward(forward) => {
+                    let result = vals.mint();
+                    into.push(Op::VectorChain(vectorchain::Op::Shuffle {
+                        result,
+                        input: loaded.val(),
+                        variable: Vec::new(),
+                        dbg_name: Some(ctx.name.to_owned()),
+                        indices: forward.indices(ty.elem)?,
+                        repetition: 8,
+                        input_ty: ty,
+                        ty,
+                    }));
+                    Computed::of(result, ty)
+                }
+                // ⛔ THE INNERMOST LOOP IS THE FIRST WITH A NON-ZERO OFFSET (`:638-648`), and
+                // `DT_CHECK(loop_offset_it != loop_offset.end())` is this [`None`].
+                MemoryFile::ScaleReg => {
+                    let offset = memory.offsets.iter().find(|entry| entry.offset != 0)?;
+                    broadcast_over_lanes(vals, into, ctx, loaded.val(), offset.iv, 2)
+                }
+            }
+        }
+        ComputeInput::Ring(ring) => {
+            let peer = ring_peer(vals, into, ring)?;
+            let (_, from) = Link::<link::Sfp, link::Sfp>::between(peer, ring.own).ends();
+            Computed::of(Received::receive(into, vals.mint(), from, ty).operand(), ty)
+        }
+        // `if (compute_op.exUnit_ == LXLU)` — the latched vector is broadcast at QUARTER width, and
+        // the ONE loop offset is taken with no search at all (`:723-745`).
+        ComputeInput::Latch { data, offsets } => {
+            if matches!(ctx.ex_unit, GenericComp::Lxlu) {
+                broadcast_over_lanes(vals, into, ctx, *data, offsets.first()?.iv, 4)
+            } else {
+                Computed::of(*data, ty)
+            }
+        }
+    };
+
+    // `if (!is_any_of(inputs_[index], PESTATE, SFPSTATE) && compute_op.exUnit_ != LXLU)`.
+    if skips_conversion(ctx, input_file(source)) {
+        return Some(input_data);
+    }
+    precision_conversion(vals, into, input_data, format, ctx.comp)
+}
+
+/// THE `agen.vector_load` A REGISTER-FILE INPUT IS READ WITH, address and all (`:537-590`).
+fn memory_load(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    memory: &MemoryOperand<'_>,
+) -> Option<Computed> {
+    let elements = memory_view(vals, into, ctx, memory, TransferSide::Load)?;
+    let result = vals.mint();
+    into.push(Op::Agen(agen::Op::VectorLoad {
+        result,
+        view: elements.view.result,
+        indices: elements.base_address.indices.clone(),
+        dbg_name: Some(ctx.name.to_owned()),
+        access: agen::Access::Stated(elements.transfer_set),
+        view_ty: elements.view.ty.clone(),
+        ty: ctx.result_ty,
+    }));
+    Some(Computed::of(result, ctx.result_ty))
+}
+
+/// THE VIEW, THE ADDRESS AND THE ELEMENT SET BOTH SIDES OF A REGISTER-FILE ACCESS SHARE.
+///
+/// ⭐ UNIFORMIZATION CHANGES ONLY THE ADDRESS — a mapping per handle against one `arith.constant`,
+/// exactly the two arms entry 030 offers (`:541-568`, `:821-844`). Everything below it is identical
+/// on the load and the store, which is why one function serves both.
+fn memory_view(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    memory: &MemoryOperand<'_>,
+    side: TransferSide,
+) -> Option<TransferElements> {
+    let factor = address_granularity_multiply_factor(memory.location, memory.precision);
+    let start_address = match memory.uniform {
+        Some(handles) => uniformized_folded_address(
+            vals,
+            into,
+            handles,
+            memory.addresses.all,
+            memory.addresses.at,
+            factor,
+        ),
+        None => constant_index(vals, into, factor.scale(memory.addresses.single)),
+    };
+    elements_of_affine_data_transfer_via_agen_transfer(
+        vals,
+        into,
+        ctx.handlers,
+        &AgenStorage {
+            storage: memory.storage,
+            core: memory.core,
+            corelet: memory.corelet,
+            side,
+            start_address,
+            view_sizes: memory.view_sizes,
+            elem: ctx.result_ty.elem,
+            outer_loops: memory.outer_loops,
+            addressed_as: memory.addressed_as,
+        },
+    )
+}
+
+/// ONE REGISTER'S VALUE OVER A NARROWED VECTOR — `indices = {-1}` against a loop counter, at
+/// `num_elements / divisor` lanes (`:649-668`, `:735-745`).
+///
+/// ⛔⛔ `{-1}` READS THE `variable` OPERAND AND NOT THE INPUT: every element of the result comes from
+/// the counter, and the input only says how wide the thing being indexed is — see
+/// [`vectorchain::Op::Shuffle::variable`], which entry 086 is why the field exists.
+fn broadcast_over_lanes(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    input: Val,
+    iv: Val,
+    divisor: u64,
+) -> Computed {
+    // ⭐ THE REDUCED WIDTH IS TAKEN OFF `result_type` ON BOTH ARMS, including the latch one, whose
+    // input is a map entry whose own type the reference never names either.
+    let reduced = Vector {
+        len: ctx.result_ty.len / divisor,
+        elem: ctx.result_ty.elem,
+    };
+    let result = vals.mint();
+    into.push(Op::VectorChain(vectorchain::Op::Shuffle {
+        result,
+        input,
+        variable: vec![vectorchain::ShuffleVariable {
+            val: iv,
+            ty: ScalarTy::Index,
+        }],
+        dbg_name: Some(ctx.name.to_owned()),
+        indices: vec![-1],
+        repetition: u32::try_from(reduced.len).expect("a vector's element count fits a u32"),
+        input_ty: ctx.result_ty,
+        ty: reduced,
+    }));
+    Computed::of(result, reduced)
+}
+
+/// THE RING PEER'S HANDLE — a mapping per handle under uniformization, one `get_unit` otherwise.
+///
+/// ⛔ THE UNIT IS `comp_`, WHICH THIS ARM HAS ALREADY PROVED IS THE SFP — see [`Ring`].
+fn ring_peer(vals: &mut Values, into: &mut Vec<Op>, ring: &Ring<'_>) -> Option<Val> {
+    match ring.uniform {
+        Some(handles) => Some(uniformized_folded_destination_core(
+            vals,
+            into,
+            handles,
+            DfirUnit::Sfp,
+            ring.num_folds,
+            ring.region_iterator,
+            ring.peer_core,
+        )),
+        None => {
+            let op = create_get_unit_op_in_different_core(
+                vals,
+                DfirUnit::Sfp,
+                (ring.peer_core)(ring.core, ring.corelet),
+                ring.corelet,
+                ring.num_folds,
+            );
+            let dataflow::Op::GetUnit { result: peer, .. } = &op else {
+                // Entry 023 builds nothing else, so this ring names no peer.
+                return None;
+            };
+            let peer = *peer;
+            into.push(Op::Dataflow(op));
+            Some(peer)
+        }
+    }
+}
+
+/// `is_any_of(component, PESTATE, SFPSTATE) || exUnit_ == LXLU` — the two exemptions BOTH sides of a
+/// compute operand share (`:757`, `:782`).
+const fn skips_conversion(ctx: &OperandContext<'_>, file: Option<MemoryFile>) -> bool {
+    matches!(file, Some(MemoryFile::State)) || matches!(ctx.ex_unit, GenericComp::Lxlu)
+}
+
+/// Which register file an input is, for that exemption.
+const fn input_file(source: &ComputeInput<'_>) -> Option<MemoryFile> {
+    match source {
+        ComputeInput::Memory(memory) => Some(memory.file),
+        _ => None,
+    }
+}
+
+/// WHERE ONE COMPUTE OUTPUT OPERAND GOES — `compute_op.outputs_[i]`.
+///
+/// ⛔ THE FIVE SENDS ARE ONE ARM for the reason [`ComputeInput::Wire`] records: `PTSOUTH`, `LXSU`,
+/// `SFP`, `PE` and `PT` differ only in the component asked for (`:5071-5180`).
+pub enum ComputeOutput<'o> {
+    /// `PTSOUTH` | `LXSU` | `SFP` | `PE` | `PT`.
+    Wire(SendEnd),
+    /// `LRFREG` | `PTXRF` | `PTARF` | `PELRF` | `SFPLRF` | `SFPSTATE` | `PESTATE`.
+    ///
+    /// ⭐ AND NO FORWARD OR SCALE REGISTER: nothing is ever WRITTEN to those, which is why
+    /// [`MemoryFile`]'s other two arms cannot arise here.
+    Memory(MemoryOperand<'o>),
+    /// `SFPRING`.
+    Ring(Ring<'o>),
+    /// `LATCH` — `addToLatchMap(latch_id, compute_result)` emits NOTHING.
+    Latch(Latch),
+}
+
+/// WHAT ONE OUTPUT OPERAND LEFT BEHIND.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// The ops are in the caller's list.
+    Emitted,
+    /// ⛔ THE LATCH MAP IS THE LOWERING'S STATE, so the entry is handed back rather than written
+    /// here — and what it records is the value AFTER the conversion.
+    Latched {
+        /// `latchDataId_`.
+        latch: Latch,
+        /// `compute_result`.
+        data: Val,
+    },
+}
+
+/// THE FORMAT AN OUTPUT IS CONVERTED TO — the labelled data structure's, or the compute's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputFormat {
+    /// `labeledDs_[myLdsIdx_].dataFormat_`, and [`None`] is the reference's `lds_idx == -1`.
+    pub lds: Option<DataType>,
+    /// `compute_op.getComputeOperandFormats(*dsc_)[i]`.
+    pub operand: DataType,
+}
+
+impl OutputFormat {
+    /// `if (lds_idx != -1) format = labeledDs_[..].dataFormat_ else getComputeOperandFormats(..)[i]`.
+    #[must_use]
+    pub const fn get(self) -> DataType {
+        match self.lds {
+            Some(format) => format,
+            None => self.operand,
+        }
+    }
+}
+
+/// Replaces: e087_constructComputeOutputOperand
+///
+/// ONE COMPUTE OUTPUT OPERAND, AT ITS DESTINATION'S PRECISION — `SNComputeLowering.cpp:777`.
+///
+/// ⛔⛔ THE CONVERSION IS AT THE **HEAD** HERE, NOT THE TAIL. A result is converted once and every
+/// arm below spends `compute_result` (`:780-796`), where entry 086 converts last — so the two
+/// functions are not mirror images and a shared helper would have to pick one. The exemptions are
+/// the same pair.
+///
+/// ⛔ AND THE FORMAT IS THE LABELLED DATA STRUCTURE'S WHERE THERE IS ONE (`:785-790`) — see
+/// [`OutputFormat`].
+/// ⛔ [`None`] IS THE THREE `failure()`s: the conversion's, the affine transfer's and the unmatched
+/// component's (`:794`, `:857`, `:908`).
+pub fn compute_output_operand(
+    vals: &mut Values,
+    into: &mut Vec<Op>,
+    ctx: &OperandContext<'_>,
+    output: &ComputeOutput<'_>,
+    result: Computed,
+    format: OutputFormat,
+) -> Option<Stored> {
+    let file = match output {
+        ComputeOutput::Memory(memory) => Some(memory.file),
+        _ => None,
+    };
+    let compute_result = if skips_conversion(ctx, file) {
+        result
+    } else {
+        precision_conversion(vals, into, result, format.get(), ctx.comp)?
+    };
+
+    match output {
+        // `SendOp::create(builder, loc, unit, compute_result, nullptr, name)`.
+        ComputeOutput::Wire(to) => into.push(Op::Dataflow(dataflow::Op::Send {
+            to: *to,
+            data: compute_result.val(),
+            ty: compute_result.ty(),
+        })),
+        // `agen::VectorStoreOp::create(.., compute_result, view.getResult(), name, ..)` — the value's
+        // type is the CONVERTED one, while the view is still stated over `result_type`'s element.
+        ComputeOutput::Memory(memory) => {
+            let elements = memory_view(vals, into, ctx, memory, TransferSide::Store)?;
+            into.push(Op::Agen(agen::Op::VectorStore {
+                value: compute_result.val(),
+                view: elements.view.result,
+                indices: elements.base_address.indices.clone(),
+                dbg_name: Some(ctx.name.to_owned()),
+                access: agen::Access::Stated(elements.transfer_set),
+                view_ty: elements.view.ty.clone(),
+                ty: compute_result.ty(),
+            }));
+        }
+        ComputeOutput::Ring(ring) => {
+            let peer = ring_peer(vals, into, ring)?;
+            let (to, _) = Link::<link::Sfp, link::Sfp>::between(ring.own, peer).ends();
+            into.push(Op::Dataflow(dataflow::Op::Send {
+                to,
+                data: compute_result.val(),
+                ty: compute_result.ty(),
+            }));
+        }
+        ComputeOutput::Latch(latch) => {
+            return Some(Stored::Latched {
+                latch: *latch,
+                data: compute_result.val(),
+            });
+        }
+    }
+    Some(Stored::Emitted)
+}
+
 // crustify:todo: e094_constructComputeOutputOperands
 // crustify:todo: e095_constructFMINorFMAXOperation
 // crustify:todo: e099_constructMACOperation
@@ -577,9 +1143,11 @@ pub fn opaque_operation(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        DynamicMask, MacOp, MaskValue, StickWidth, VectorWidth, dictionary_order, dynamic_masking,
-        is_integer, opaque_operation, precision_conversion, single_val_custom_vector,
-        static_mask_for_result, type_from_compute_type, type_from_format,
+        ComputeInput, ComputeOutput, DynamicMask, Handlers, Latch, MacOp, MaskValue, OperandContext,
+        OutputFormat, StickWidth, Stored, VectorWidth, compute_input_operand,
+        compute_output_operand, dictionary_order, dynamic_masking, is_integer, opaque_operation,
+        precision_conversion, single_val_custom_vector, static_mask_for_result,
+        type_from_compute_type, type_from_format,
     };
     use crate::arch::{Dd2, Elements, Sen1p5};
     use crate::bridges::dataflow_ir_to_sentient::vc_helper::{
@@ -683,7 +1251,7 @@ mod unit_tests {
         };
         let mut vals = Values::default();
         let mut body = Vec::new();
-        let out = single_val_custom_vector(&mut vals, &mut body, 7, ty);
+        let out = single_val_custom_vector(&mut vals, &mut body, "v", 7, ty);
         assert_eq!(
             body,
             vec![
@@ -694,6 +1262,8 @@ mod unit_tests {
                     is_symbol: false,
                 }),
                 Op::VectorChain(vectorchain::Op::Shuffle {
+                    variable: Vec::new(),
+                    dbg_name: Some("v".to_owned()),
                     result: Val(1),
                     input: Val(0),
                     indices: vec![0],
@@ -1268,6 +1838,161 @@ mod unit_tests {
         assert_eq!(
             type_from_compute_type(DataType::Senint24, GenericComp::Pt),
             None
+        );
+    }
+
+    // ─────────────────────────────── 086-087/110 ───────────────────────────────
+
+    /// The two register-file handles every operand context carries, and no bound unit.
+    fn operand_handlers() -> Handlers {
+        Handlers {
+            units: Vec::new(),
+            own_lrf: Val(1),
+            pt_xrf: Val(2),
+        }
+    }
+
+    /// ⛔⛔ THE TAIL IS THE OPERAND, NOT A FORMALITY: `ONE` is a dense splat at the RESULT's type,
+    /// and what the compute is handed is that splat CONVERTED to the operand's format — while an
+    /// LXLU execution unit is the exemption that leaves the splat standing alone.
+    #[test]
+    fn one_is_a_dense_splat_and_the_conversion_after_it_is_the_operand() {
+        let ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let handlers = operand_handlers();
+        let context = |ex_unit| OperandContext {
+            name: "c0",
+            comp: GenericComp::Sfp,
+            ex_unit,
+            handlers: &handlers,
+            result_ty: ty,
+        };
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let operand = compute_input_operand::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &context(GenericComp::Sfp),
+            &ComputeInput::One,
+            DataType::Senint8,
+        )
+        .expect("a float splat converts to an integer operand");
+        let converted = Vector {
+            len: 64,
+            elem: ElemType::Int(8),
+        };
+        assert_eq!(
+            ops,
+            vec![
+                Op::Arith(arith::Op::DenseConstant {
+                    result: Val(0),
+                    splat: 1,
+                    ty,
+                }),
+                Op::Arith(arith::Op::Convert {
+                    result: Val(1),
+                    kind: arith::ConvertKind::FpToSi,
+                    input: Val(0),
+                    input_ty: ty,
+                    ty: converted,
+                }),
+            ]
+        );
+        assert_eq!((operand.val(), operand.ty()), (Val(1), converted));
+
+        // ⛔ THE EXEMPTION: the splat IS the operand, at the result's own width.
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let operand = compute_input_operand::<Dd2>(
+            &mut vals,
+            &mut ops,
+            &context(GenericComp::Lxlu),
+            &ComputeInput::One,
+            DataType::Senint8,
+        )
+        .expect("the LXLU converts nothing");
+        assert_eq!(ops.len(), 1);
+        assert_eq!((operand.val(), operand.ty()), (Val(0), ty));
+    }
+
+    /// ⛔⛔ THE OUTPUT'S CONVERSION IS AT THE **HEAD**: the latch records the CONVERTED value, and
+    /// the format converted to is the labelled data structure's where it has one.
+    #[test]
+    fn the_latch_records_the_value_the_labelled_data_structure_s_format_produced() {
+        let ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let handlers = operand_handlers();
+        let context = |ex_unit| OperandContext {
+            name: "c0",
+            comp: GenericComp::Sfp,
+            ex_unit,
+            handlers: &handlers,
+            result_ty: ty,
+        };
+        let latch = Latch::new(3).expect("latch 3");
+        let format = OutputFormat {
+            lds: Some(DataType::Senint8),
+            operand: DataType::Sen169Fp16,
+        };
+        // ⭐ AND THE LABELLED FORMAT WINS OVER THE COMPUTE'S OWN.
+        assert_eq!(format.get(), DataType::Senint8);
+
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = compute_output_operand(
+            &mut vals,
+            &mut ops,
+            &context(GenericComp::Sfp),
+            &ComputeOutput::Latch(latch),
+            Computed::of(Val(9), ty),
+            format,
+        )
+        .expect("a float result converts to the labelled integer format");
+        assert_eq!(
+            ops,
+            vec![Op::Arith(arith::Op::Convert {
+                result: Val(0),
+                kind: arith::ConvertKind::FpToSi,
+                input: Val(9),
+                input_ty: ty,
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::Int(8),
+                },
+            })]
+        );
+        assert_eq!(
+            stored,
+            Stored::Latched {
+                latch,
+                data: Val(0),
+            }
+        );
+
+        // ⛔ THE SAME EXEMPTION, AND THE LATCH THEN HOLDS THE UNCONVERTED RESULT.
+        let mut vals = Values::default();
+        let mut ops = Vec::new();
+        let stored = compute_output_operand(
+            &mut vals,
+            &mut ops,
+            &context(GenericComp::Lxlu),
+            &ComputeOutput::Latch(latch),
+            Computed::of(Val(9), ty),
+            format,
+        )
+        .expect("the LXLU converts nothing");
+        assert!(ops.is_empty());
+        assert_eq!(
+            stored,
+            Stored::Latched {
+                latch,
+                data: Val(9),
+            }
         );
     }
 }

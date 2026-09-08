@@ -456,12 +456,9 @@ const REGISTER_FILE_UNITS: [GenericComp; 3] = [GenericComp::Pt, GenericComp::Sfp
 /// `isa<agen::VectorLoadOp, agen::VectorStoreOp, agen::CompositeLoadOp, agen::CompositeStoreOp,
 /// agen::CompositeLoadAndStoreOp>(use)` (`:329-331`).
 ///
-/// ⚠️ FOUR OF THE FIVE, for the reason entry 141 already records: the island declares
-/// `vector_load`, `vector_store`, `composite_load` and `composite_load_and_store` and not
-/// `composite_store`, and the brief's rule to grow the island is about a function's *input*
-/// (`AGENT-BRIEF.md:57`) — this predicate's input is any op at all. See
-/// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::is_data_transfer`], which lists the
-/// same absences.
+/// ✅ ALL FIVE — `composite_store` is an island op since the transfer bridge's own store side landed
+/// one, so the `isa<>` list (`:331`) is matched class for class. See
+/// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::is_data_transfer`], the same list.
 ///
 /// ⛔ NO WILDCARD. A new island op has to state whether the induction variable reaching it makes the
 /// loop a candidate; falling through to `false` would silently stop a loop being unrolled.
@@ -471,11 +468,12 @@ fn is_memory_op(op: &DfirOp) -> bool {
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoad(_)
+            | agen::Op::CompositeStore(_)
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
         // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else — the
         // mask-state write among them, which reads no view and so strides against no loop.
-        DfirOp::Agen(agen::Op::Yield | agen::Op::SetTransferMaskState { .. })
+        DfirOp::Agen(agen::Op::Yield { .. } | agen::Op::SetTransferMaskState { .. })
         | DfirOp::Arith(_)
         | DfirOp::Scf(_)
         | DfirOp::Affine(_)
@@ -1207,7 +1205,7 @@ mod unit_tests {
                         .plus(AffineExpr::dim(0).times(2048)),
                 ],
             },
-            body: vec![DfirOp::Agen(agen::Op::Yield)],
+            body: vec![DfirOp::Agen(agen::Op::Yield { values: Vec::new() })],
         }));
 
         let innermost = DfirOp::Affine(affine::Op::For {
@@ -1749,7 +1747,7 @@ mod unit_tests {
                 time_order: AffineMap::identity(4),
                 load_time_addr_map: AffineMap::identity(4),
                 store_time_addr_map: AffineMap::identity(4),
-                body: vec![DfirOp::Agen(agen::Op::Yield)],
+                body: vec![DfirOp::Agen(agen::Op::Yield { values: Vec::new() })],
             },
         )))
     }

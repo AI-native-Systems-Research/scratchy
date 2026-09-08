@@ -1562,7 +1562,10 @@ impl<'a> AccessDetailsBase<'a> {
             agen::Op::CompositeLoad(load) => uses(load.load_iv, scope),
             agen::Op::VectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
-            | agen::Op::Yield
+            // ⭐ AND A COMPOSITE STORE HAS NO LOADED VALUE EITHER: what it writes arrives through
+            // its region's `agen.yield`, so there is nothing whose users decide a shuffle mode.
+            | agen::Op::CompositeStore(_)
+            | agen::Op::Yield { .. }
             // ⭐ A SAMV BINDS A VECTOR BUT LOADS NOTHING, so it has no loaded value to have users of.
             | agen::Op::SetTransferMaskState { .. } => Vec::new(),
         };
@@ -1862,23 +1865,22 @@ impl<'a> AccessDetailsAffine<'a> {
                 ty,
                 ..
             } => (view, view_ty, indices, Some(access), ty),
-            // ⚠️ [`None`] IS `getStoreSet()` NOT YET BEING A FIELD, and not a store having no set.
-            // [`agen::Op::VectorStore`] still derives it from the view, which is right for every
-            // store this island emits and wrong for the day a transfer's STORE side lands one — see
-            // [`agen::Access`], whose load counterpart is exactly that.
+            // ⭐ `getStoreSet()` — `store_set` (`AccessDetails.cpp:330`), the load set's mirror.
             agen::Op::VectorStore {
                 view,
                 view_ty,
                 indices,
+                access,
                 ty,
                 ..
-            } => (view, view_ty, indices, None, ty),
+            } => (view, view_ty, indices, Some(access), ty),
             // ⛔ AND A COMPOSITE LOAD IS `emitError("unsupported operation")` HERE, however much it
             // has a view and a subscript: `initialize`'s four `dyn_cast`s are the two vector
             // accesses and the two indirect ones (`AccessDetails.cpp:315-345`).
             agen::Op::CompositeLoadAndStore(_)
             | agen::Op::CompositeLoad(_)
-            | agen::Op::Yield
+            | agen::Op::CompositeStore(_)
+            | agen::Op::Yield { .. }
             // ⭐ A SAMV CARRIES NO VIEW AND NO SUBSCRIPTS.
             | agen::Op::SetTransferMaskState { .. } => {
                 return AffineInitialize::UnsupportedOperation;
@@ -3140,7 +3142,7 @@ mod unit_tests {
             time_order: planned.time_order,
             load_time_addr_map: planned.load_time_addr_map,
             store_time_addr_map: planned.store_time_addr_map,
-            body: vec![DfirOp::Agen(agen::Op::Yield)],
+            body: vec![DfirOp::Agen(agen::Op::Yield { values: Vec::new() })],
         }))
     }
 

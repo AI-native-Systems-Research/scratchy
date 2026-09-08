@@ -377,7 +377,8 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             // no result to ask about (`Utils.cpp:538-560`).
             dfir_op::agen::Op::CompositeLoadAndStore(_)
             | dfir_op::agen::Op::CompositeLoad(_)
-            | dfir_op::agen::Op::Yield
+            | dfir_op::agen::Op::CompositeStore(_)
+            | dfir_op::agen::Op::Yield { .. }
             // ⭐ A SAMV IS NOT IN `Utils.cpp:548-553`'s CLASS LIST, however much its result is a
             // vector: the reference asks its two accesses and the two `dataflow` transfers only.
             | dfir_op::agen::Op::SetTransferMaskState { .. },
@@ -2385,6 +2386,8 @@ mod unit_tests {
     /// [`compute_precision_of_op`] through.
     fn shuffle(ty: Vector) -> DfirOp {
         DfirOp::VectorChain(vc::Op::Shuffle {
+            dbg_name: None,
+            variable: Vec::new(),
             result: Val(44),
             input: Val(43),
             indices: (0..16).collect(),
@@ -3702,6 +3705,8 @@ mod unit_tests {
     fn a_repetition_of_four_is_valid_and_matches_no_row() {
         let ty = f16x64();
         let shuffle = vc::Op::Shuffle {
+            dbg_name: None,
+            variable: Vec::new(),
             result: Val(44),
             input: Val(43),
             indices: (0..16).collect(),
