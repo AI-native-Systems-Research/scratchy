@@ -372,7 +372,11 @@ fn vector_type_of(op: &DfirOp) -> Option<Vector> {
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad { ty, .. }) => Some(*ty),
         DfirOp::Agen(dfir_op::agen::Op::VectorStore { ty, .. }) => Some(*ty),
         DfirOp::Agen(
+            // ⛔ NEITHER COMPOSITE OP IS ON THE LIST, and the load-only one is the sharper case: it
+            // moves a vector per time step and `getVectorType` still says nothing, because it binds
+            // no result to ask about (`Utils.cpp:538-560`).
             dfir_op::agen::Op::CompositeLoadAndStore(_)
+            | dfir_op::agen::Op::CompositeLoad(_)
             | dfir_op::agen::Op::Yield
             // ⭐ A SAMV IS NOT IN `Utils.cpp:548-553`'s CLASS LIST, however much its result is a
             // vector: the reference asks its two accesses and the two `dataflow` transfers only.
@@ -2736,6 +2740,8 @@ mod unit_tests {
     /// `agen.vector_load %view[0] … : vector<64xf16>` binding `result` — `fmax.mlir:116`.
     fn vector_load(result: u32) -> DfirOp {
         DfirOp::Agen(dfir_op::agen::Op::VectorLoad {
+            dbg_name: None,
+            access: dfir_op::agen::Access::OfView,
             result: Val(result),
             view: Val(92),
             indices: std::vec![dfir_op::Index::Const(0)],

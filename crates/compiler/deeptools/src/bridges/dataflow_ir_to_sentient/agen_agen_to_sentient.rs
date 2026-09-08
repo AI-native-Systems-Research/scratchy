@@ -235,6 +235,12 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             unit.on.kind()
         ),
 
+        // ── 3. `agen.composite_load` (`AgenToSentient.cpp:90-95`) ────────────────────────────────
+        agen::Op::CompositeLoad(_) => todo!(
+            "e329_lowerCompositeLoadOp: agen.composite_load on {:?}",
+            unit.on.kind()
+        ),
+
         // ── 5. `agen.composite_load_and_store` (`AgenToSentient.cpp:102-109`) ────────────────────
         //
         // ⭐ THE EMISSION IS `e331_lowerCompositeLoadAndStoreOp`'s AND IT ALREADY EXISTS. The spine's

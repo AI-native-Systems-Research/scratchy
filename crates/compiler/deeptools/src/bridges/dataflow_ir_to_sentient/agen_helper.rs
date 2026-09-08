@@ -569,6 +569,7 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             dfir_op::agen::Op::VectorLoad { .. } => Some(AgenOpKind::VectorLoad),
             dfir_op::agen::Op::VectorStore { .. } => Some(AgenOpKind::VectorStore),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
+            dfir_op::agen::Op::CompositeLoad(_) => Some(AgenOpKind::CompositeLoad),
             // The region terminator is not a transfer, and neither is a mask-state write.
             dfir_op::agen::Op::Yield | dfir_op::agen::Op::SetTransferMaskState { .. } => None,
         },
@@ -647,7 +648,7 @@ impl AgenLoad {
 
     /// WHICH LOAD CLASS ONE STATEMENT IS, or `None` if it is not one of the five.
     ///
-    /// ⛔ THREE OF THE FIVE HAVE NO ISLAND OP YET (the indirect and symbolic families), and
+    /// ⛔ TWO OF THE FIVE HAVE NO ISLAND OP YET (the indirect families), and
     /// `agen.composite_load_and_store` is **not** `CompositeLoadOp` — the reference's `isa<>` list
     /// does not include it, so it answers `None` here too rather than borrowing the composite arm.
     #[must_use]
@@ -656,6 +657,11 @@ impl AgenLoad {
             DfirOp::Agen(dfir_op::agen::Op::VectorLoad { result, .. }) => {
                 Some(AgenLoad::Vector { result: *result })
             }
+            // ⭐ AND THE ONE THAT ROOTS AT ITS REGION ARGUMENT — `consumer_root =
+            // composite_load_op.getLoadInductionVar()` (`Helper.cpp:1249-1250`).
+            DfirOp::Agen(dfir_op::agen::Op::CompositeLoad(load)) => Some(AgenLoad::Composite {
+                load_induction_var: load.load_iv,
+            }),
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
@@ -1735,6 +1741,8 @@ mod unit_tests {
             carried: Vec::new(),
             body: vec![
                 DfirOp::Agen(agen::Op::VectorLoad {
+                    dbg_name: None,
+                    access: agen::Access::OfView,
                     result: loaded,
                     view: VIEW,
                     indices: indices(iv),
@@ -1902,6 +1910,8 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let program = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(31),
                 view: VIEW,
                 indices: indices(Val(30)),
@@ -1963,6 +1973,8 @@ mod unit_tests {
             })
         };
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(31),
             view: VIEW,
             indices: indices(Val(30)),
@@ -2040,6 +2052,8 @@ mod unit_tests {
         let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, Val(99)).ends();
         let program = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(31),
                 view: VIEW,
                 indices: indices(Val(30)),
@@ -2538,6 +2552,8 @@ mod unit_tests {
     #[test]
     fn a_load_whose_single_user_is_a_store_of_that_class_is_the_pattern() {
         let load = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(31),
             view: VIEW,
             indices: indices(Val(30)),
@@ -2668,6 +2684,8 @@ mod unit_tests {
         let (to, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
         let program = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(31),
                 view: VIEW,
                 indices: indices(Val(30)),
@@ -2733,6 +2751,8 @@ mod unit_tests {
         let (_, from) = Link::<PtRowUnit<0>, LxluUnit>::between(PT, LXLU).ends();
         let load_body = vec![
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(31),
                 view: VIEW,
                 indices: vec![Index::Const(0)],
@@ -2866,6 +2886,8 @@ mod unit_tests {
                 ty: ty.clone(),
             }),
             DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(31),
                 view: Val(21),
                 indices: vec![Index::Const(0)],
@@ -2892,6 +2914,8 @@ mod unit_tests {
         assert!(!is_load_and_extract_scalar_pattern(&scope[5], &scope));
         let mut from_the_ibr = scope.clone();
         from_the_ibr[4] = DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(31),
             view: Val(23),
             indices: vec![Index::Const(0)],
@@ -2929,6 +2953,8 @@ mod unit_tests {
     #[test]
     fn a_symbolic_access_follows_the_clone() {
         let original = agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(31),
             view: Val(21),
             indices: vec![Index::Val(Val(5))],
@@ -2936,6 +2962,8 @@ mod unit_tests {
             ty: LANES,
         };
         let cloned = agen::Op::VectorLoad {
+            dbg_name: None,
+            access: agen::Access::OfView,
             result: Val(131),
             view: Val(121),
             indices: vec![Index::Val(Val(105))],

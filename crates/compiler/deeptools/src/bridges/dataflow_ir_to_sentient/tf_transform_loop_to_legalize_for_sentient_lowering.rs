@@ -456,8 +456,8 @@ const REGISTER_FILE_UNITS: [GenericComp; 3] = [GenericComp::Pt, GenericComp::Sfp
 /// `isa<agen::VectorLoadOp, agen::VectorStoreOp, agen::CompositeLoadOp, agen::CompositeStoreOp,
 /// agen::CompositeLoadAndStoreOp>(use)` (`:329-331`).
 ///
-/// ⚠️ THREE OF THE FIVE, for the reason entry 141 already records: the island declares
-/// `vector_load`, `vector_store` and `composite_load_and_store` and not `composite_load` or
+/// ⚠️ FOUR OF THE FIVE, for the reason entry 141 already records: the island declares
+/// `vector_load`, `vector_store`, `composite_load` and `composite_load_and_store` and not
 /// `composite_store`, and the brief's rule to grow the island is about a function's *input*
 /// (`AGENT-BRIEF.md:57`) — this predicate's input is any op at all. See
 /// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::is_data_transfer`], which lists the
@@ -470,6 +470,7 @@ fn is_memory_op(op: &DfirOp) -> bool {
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::CompositeLoad(_)
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
         // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else — the
@@ -1851,6 +1852,8 @@ mod unit_tests {
         let read = vals.mint();
         let reader = match case.reader {
             Reader::VectorLoad => DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: read,
                 view,
                 // `[%arg27 * 4, %arg28 * 2 + %arg26, %arg25, 0, 0]` — the induction variable is the

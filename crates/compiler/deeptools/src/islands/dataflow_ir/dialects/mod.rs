@@ -281,6 +281,13 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.push(transfer.dst);
                 index_operands(&transfer.dst_indices, &mut reads);
             }
+            // ⭐ AND ITS `$time_symbols` ARE OPERANDS — `Variadic<Index>` beside the subscript
+            // (`Agen.td:437`), which is why the pair op's list ends where this one does not.
+            agen::Op::CompositeLoad(load) => {
+                reads.push(load.view);
+                index_operands(&load.indices, &mut reads);
+                reads.extend(load.time_symbols.iter().copied());
+            }
             // ⭐ ONE OPERAND — `(ins Index:$mask_value, ..)` (`Agen.td:1094`); the slice map and the
             // element counts beside it are attributes.
             agen::Op::SetTransferMaskState { mask_value, .. } => reads.push(*mask_value),
@@ -339,9 +346,7 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 reads.extend(mask.map(|m| m.val()));
             }
             vectorchain::Op::Binary { op1, op2, mask, .. }
-            | vectorchain::Op::Pack {
-                op1, op2, mask, ..
-            } => {
+            | vectorchain::Op::Pack { op1, op2, mask, .. } => {
                 reads.extend([*op1, *op2]);
                 reads.extend(mask.map(|m| m.val()));
             }
@@ -451,11 +456,14 @@ pub fn results(op: &Op) -> Vec<Val> {
             | dataflow::Op::Opaque(_) => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. }
-            | agen::Op::SetTransferMaskState { result, .. } => vec![*result],
-            agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
-                Vec::new()
+            agen::Op::VectorLoad { result, .. } | agen::Op::SetTransferMaskState { result, .. } => {
+                vec![*result]
             }
+            // ⛔ A COMPOSITE LOAD BINDS NOTHING EITHER — see [`agen::Op::CompositeLoad`].
+            agen::Op::VectorStore { .. }
+            | agen::Op::Yield
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeLoad(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::Estimate { result, .. }
@@ -627,6 +635,11 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 places.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut places);
             }
+            agen::Op::CompositeLoad(load) => {
+                places.push(&mut load.view);
+                index_operands_mut(&mut load.indices, &mut places);
+                places.extend(load.time_symbols.iter_mut());
+            }
             agen::Op::SetTransferMaskState { mask_value, .. } => places.push(mask_value),
         },
         // ⭐ ARM FOR ARM WITH [`operands`] — see the note there.
@@ -772,11 +785,13 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::Opaque { .. } => Vec::new(),
         },
         Op::Agen(op) => match op {
-            agen::Op::VectorLoad { result, .. }
-            | agen::Op::SetTransferMaskState { result, .. } => vec![result],
-            agen::Op::VectorStore { .. } | agen::Op::Yield | agen::Op::CompositeLoadAndStore(_) => {
-                Vec::new()
+            agen::Op::VectorLoad { result, .. } | agen::Op::SetTransferMaskState { result, .. } => {
+                vec![result]
             }
+            agen::Op::VectorStore { .. }
+            | agen::Op::Yield
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeLoad(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::CreateAffineMaskSet { result, .. } => vec![result],
@@ -861,6 +876,9 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         // body reads. `getLoadInductionVar()` is what `getLoadConsumer` roots a composite load's
         // consumer chain at (`Helper.cpp:1250`).
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.load_iv],
+        // ⛔ AND THE LOAD-ONLY OP'S IS THE ONLY WAY TO REACH ITS VECTOR AT ALL, since it binds no
+        // result — see [`agen::Op::CompositeLoad`].
+        Op::Agen(agen::Op::CompositeLoad(load)) => vec![load.load_iv],
         // ⛔⛔ ONE ARGUMENT PER REGION, AND EACH REGION BINDS ITS OWN.
         // `getRegionArg(i) { return getRegion(i).getArgument(0); }` (`Uniform.td:96`) — so a
         // two-region op binds two values, and entry 182 maps the one belonging to the region it is
@@ -904,13 +922,15 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         }) => vec![body.as_slice(), else_body.as_slice()],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
+        Op::Agen(agen::Op::CompositeLoad(load)) => vec![load.body.as_slice()],
         // ⛔⛔ AS MANY REGIONS AS IT HAS UNIT LISTS — `VariadicRegion<AnyRegion>:$regions`
         // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
         // `flatten` declines when `op_.getNumRegions() == num_of_regions`
         // (`FlatteningLocalRegions.cpp:418`).
-        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
-            regions.iter().map(|region| region.body.as_slice()).collect()
-        }
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => regions
+            .iter()
+            .map(|region| region.body.as_slice())
+            .collect(),
         Op::Uniform(
             uniform::Op::Yield { .. }
             | uniform::Op::DefImmutableMapping { .. }
@@ -953,6 +973,7 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         }) => vec![body, else_body],
         Op::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => vec![body],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
+        Op::Agen(agen::Op::CompositeLoad(load)) => vec![&mut load.body],
         // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
         Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
             regions.iter_mut().map(|region| &mut region.body).collect()
@@ -1007,7 +1028,13 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
             dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })
             | dataflow::Op::ImplicitSync { dbg_name, .. },
         )
-        | Op::Agen(agen::Op::SetTransferMaskState { dbg_name, .. }) => dbg_name.as_deref(),
+        | Op::Agen(
+            agen::Op::SetTransferMaskState { dbg_name, .. }
+            | agen::Op::VectorLoad { dbg_name, .. },
+        ) => dbg_name.as_deref(),
+        // ⭐ AND THE BOXED ONE NEEDS ITS OWN ARM, because a `Box` field cannot join a pattern
+        // alternation that binds the same name at a different depth.
+        Op::Agen(agen::Op::CompositeLoad(load)) => load.dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1069,7 +1096,11 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
             dataflow::Op::Opaque(dataflow::Opaque { dbg_name, .. })
             | dataflow::Op::ImplicitSync { dbg_name, .. },
         )
-        | Op::Agen(agen::Op::SetTransferMaskState { dbg_name, .. }) => Some(dbg_name),
+        | Op::Agen(
+            agen::Op::SetTransferMaskState { dbg_name, .. }
+            | agen::Op::VectorLoad { dbg_name, .. },
+        ) => Some(dbg_name),
+        Op::Agen(agen::Op::CompositeLoad(load)) => Some(&mut load.dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
             affine::Op::Apply { .. }
@@ -1343,10 +1374,16 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 block_args.push(&mut transfer.load_iv);
                 regions.push(&mut transfer.body);
             }
+            agen::Op::CompositeLoad(load) => {
+                let load = load.as_mut();
+                operands.push(&mut load.view);
+                index_operands_mut(&mut load.indices, &mut operands);
+                operands.extend(load.time_symbols.iter_mut());
+                block_args.push(&mut load.load_iv);
+                regions.push(&mut load.body);
+            }
             agen::Op::SetTransferMaskState {
-                result,
-                mask_value,
-                ..
+                result, mask_value, ..
             } => {
                 operands.push(mask_value);
                 results.push(result);
@@ -1496,7 +1533,9 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 }
                 results.push(result);
             }
-            uniform::Op::QueryMap { result, map, key, .. } => {
+            uniform::Op::QueryMap {
+                result, map, key, ..
+            } => {
                 operands.extend([map, key]);
                 results.push(result);
             }
@@ -1509,7 +1548,6 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
         regions,
     }
 }
-
 
 /// EVERY **USE** OF ONE VALUE IN `scope`, INNERMOST OPS INCLUDED — one entry per use.
 ///
@@ -1880,10 +1918,15 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 index_vals_mut(&mut transfer.dst_indices, &mut vals);
                 vals.push((Role::BlockArg, &mut transfer.load_iv));
             }
+            agen::Op::CompositeLoad(load) => {
+                let load = load.as_mut();
+                vals.push((Role::Operand, &mut load.view));
+                index_vals_mut(&mut load.indices, &mut vals);
+                vals.extend(load.time_symbols.iter_mut().map(|sym| (Role::Operand, sym)));
+                vals.push((Role::BlockArg, &mut load.load_iv));
+            }
             agen::Op::SetTransferMaskState {
-                result,
-                mask_value,
-                ..
+                result, mask_value, ..
             } => {
                 vals.push((Role::Operand, mask_value));
                 vals.push((Role::Result, result));
@@ -2044,7 +2087,9 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 }
                 vals.push((Role::Result, result));
             }
-            uniform::Op::QueryMap { result, map, key, .. } => {
+            uniform::Op::QueryMap {
+                result, map, key, ..
+            } => {
                 vals.push((Role::Operand, map));
                 vals.push((Role::Operand, key));
                 vals.push((Role::Result, result));
@@ -2139,6 +2184,8 @@ mod unit_tests {
             }),
             // An index list holding a strided sum and a literal.
             Op::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                access: agen::Access::OfView,
                 result: Val(20),
                 view: Val(13),
                 indices: vec![
