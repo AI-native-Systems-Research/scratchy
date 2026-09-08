@@ -1,0 +1,30 @@
+{
+ "_comment": [
+  "Narrow inventory for bridge 4, `ProgIR -> SenProg`: all 33 units of the emission's transitive",
+  "closure, in one sub-campaign because they sit at a single dependency layer.",
+  "impl_files is the one verified translation unit; prelude.inc is not a porting input."
+ ],
+ "campaign_objective": "port",
+ "impl_files": [
+  "crustify-bridge4/cpp/bridge4.cpp"
+ ],
+ "api_headers": [],
+ "out_of_scope": {
+  "paths": [
+   "crustify-bridge4/cpp/prelude.inc"
+  ],
+  "features": []
+ },
+ "_comment_authority": [
+  "THE ULTIMATE AUTHORITY IS THE C++ TREE, NOT THE EXTRACT:",
+  "  /Users/nickm/git/deeptools-src  (repo_info.txt: deeptools|master|a0d29abbed\u2026)",
+  "",
+  "\u2705 THIS EXTRACT IS VERIFIED VERBATIM, 33 of 33, by tools/verify_extract.py, which shares no",
+  "code with the extractor: it re-derives each body's end with its own scanner and compares",
+  "length AND content, asserts brace depth reaches zero at the last character, and never",
+  "appends a brace. Both negative controls fail as required. It caught a real defect en route:",
+  "24 header in-class bodies had lost their leading indentation.",
+  "",
+  "\u26d4 /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it."
+ ]
+}

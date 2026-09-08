@@ -1,0 +1,519 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/campaigns/bridge4/progir-to-senprog/wavefront-config.json",
+  "sha256": "7a7a8e21d9317371b66c17b73ffaa54be1875b097b9b733f55d1cc3750253c04"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 8,
+  "max_loc": 320,
+  "max_types": 5,
+  "min_fields": 20
+ },
+ "summary": {
+  "unit_count": 33,
+  "layer_count": 1,
+  "batch_count": 5,
+  "file_count": 1
+ },
+ "waves": [
+  {
+   "unit_count": 33,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge4/cpp/bridge4.cpp",
+     "items": [
+      {
+       "name": "e001_isDescriptive",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e002_isTag",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e003_isVariable",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e004_asString",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e005_getFieldPosForName",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 12,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e006_getOpcodeType",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e007_isValidOpcode",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 12,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e008_checkIfFieldExists",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge4/cpp/bridge4.cpp",
+     "items": [
+      {
+       "name": "e009_hasVariablesInInstr",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 18,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e010_checkProgFormatCompatibility",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 10,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e011_getCommentStr",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 3,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e012_getOpCodePrefix",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 22,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e013_getOpCodeWithPrefix",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e014_getSenComponent",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 7,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e015_hasSenDataType",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e016_getSenDataType",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge4/cpp/bridge4.cpp",
+     "items": [
+      {
+       "name": "e017_isGraphSimple",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 14,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e018_getSimpleInstrVect",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e019_getSimpleRegInit",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e020_getTagStr",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e021_hasComment",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e022_hasTag",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e023_isBool",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e024_isFloat",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge4/cpp/bridge4.cpp",
+     "items": [
+      {
+       "name": "e025_isInt",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e026_isInt128",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e027_isVariableSymbol",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 1,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e028_strToupper",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e029_asInt",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e030_tagToLCCR",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 88,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e031_tagToPC",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 23,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      },
+      {
+       "name": "e032_convertIr2Senprog",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 163,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-bridge4/cpp/bridge4.cpp",
+     "items": [
+      {
+       "name": "e033_print",
+       "defined_in": "crustify-bridge4/cpp/bridge4.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 0,
+       "loc": 38,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": []
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

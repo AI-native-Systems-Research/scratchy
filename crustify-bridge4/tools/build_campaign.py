@@ -38,9 +38,22 @@ for u in units:
     by_home[HOMES.get(u["af"], "misc.rs")].append(u)
 
 # ── the Rust homes, each carrying its units' crustify:todo anchors ─────────────────────────────────
+#
+# ⛔⛔ NEVER OVERWRITE A HOME THAT HOLDS PORTED CODE. On 2026-09-08 this script was re-run purely to
+# regenerate the SCHEDULES, and it silently rewrote all five homes back to anchor scaffolding —
+# destroying 2,299 lines of finished, promoted port (33 of 33 units) in the working tree. It was only
+# noticed because a human opened the directory and counted four lines of code. A review pass was
+# already running against the scaffolding by then.
+#
+# A home containing `/// Replaces:` is finished work. Refuse it, loudly, and carry on with the rest.
 dst = W / "crates/compiler/deeptools/src/bridges/progir_to_senprog"
 dst.mkdir(parents=True, exist_ok=True)
 for home, us in sorted(by_home.items()):
+    p = dst / home
+    if p.exists() and "/// Replaces:" in p.read_text():
+        n = p.read_text().count("/// Replaces:")
+        print(f"  ⛔ REFUSING to overwrite {home}: it holds {n} ported unit(s)")
+        continue
     body = [
         "// SPDX-License-Identifier: Apache-2.0",
         f"//! Ported from `{us[0]['af']}` — {len(us)} unit(s) of bridge 4, `ProgIR -> SenProg`.",
