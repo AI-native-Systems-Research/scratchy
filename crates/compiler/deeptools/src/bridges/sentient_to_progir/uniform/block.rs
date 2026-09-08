@@ -235,6 +235,60 @@ impl UniformInstrBlock {
                 .map_or(&[][..], Vec::as_slice),
         }
     }
+
+    /// `insertInstruction` (`cpp:322`) over both shapes — ⛔ THE REGULAR HALF, which
+    /// [`UniformBlock::insert_instruction`] cannot reach: a REGULAR block's one list IS its only
+    /// region, and its `current_region_` never leaves 0 (`:329`).
+    pub fn insert_instruction(&mut self, instr: UniformInstrInfo) {
+        match self {
+            UniformInstrBlock::Regular(instrs) => instrs.push(instr),
+            UniformInstrBlock::Uniform(block) => block.insert_instruction(instr),
+        }
+    }
+
+    /// Replaces: e074_getMaxInstrRegionIndex
+    ///
+    /// The FIRST region as long as the longest — the region every other one is padded up to, and
+    /// whose instructions the padding copies as dead code (`cpp:298-306`).
+    ///
+    /// ⛔ ONE LIST OR NONE ANSWERS 0 WITHOUT LOOKING (`:343`), which is also every REGULAR block.
+    #[must_use]
+    pub fn max_instr_region_index(&self) -> usize {
+        let lists = self.instr_lists();
+        if lists.len() <= 1 {
+            return 0;
+        }
+        let longest = self.max_instr_size();
+        // Unreachable: some region has the maximum. 0 rather than the reference's uninitialised read.
+        lists
+            .iter()
+            .position(|list| list.len() == longest)
+            .unwrap_or(0)
+    }
+
+    /// Replaces: e075_getRegionInstrSize
+    ///
+    /// How many instructions one unit runs in this block.
+    ///
+    /// ⛔ AN UNMAPPED UNIT ANSWERS THE LONGEST REGION, NOT 0 — uniformization pads its region up to
+    /// that, so that is what the block costs it. ⛔ NOT [`Self::unit_region_index`]: the reference
+    /// reads `unit_to_region_idx_map_` itself here, so a REGULAR block falls through to the same
+    /// maximum, which for one list is that list.
+    #[must_use]
+    pub fn region_instr_size(&self, unit: UnitKey) -> usize {
+        let region = match self {
+            UniformInstrBlock::Regular(_) => None,
+            UniformInstrBlock::Uniform(block) => block
+                .unit_to_region
+                .iter()
+                .rev()
+                .find(|(at, _)| *at == unit)
+                .map(|(_, region)| *region),
+        };
+        region
+            .and_then(|region| self.instr_lists().get(region.0 as usize))
+            .map_or_else(|| self.max_instr_size(), Vec::len)
+    }
 }
 
 impl UniformBlock {
@@ -371,14 +425,67 @@ impl UniformInstrBlocks {
             .and_then(|block| block.instr_lists().get(index.region.0 as usize))
             .is_some_and(|region| index.instr < region.len())
     }
+
+    /// Replaces: e076_getUnitUniformInstrList
+    ///
+    /// Every instruction one unit runs, across every block, in block order.
+    ///
+    /// ⛔ NOT UNIFORMIZED DESPITE THE NAME: no padding NOP and no JCMP, and a UNIFORM block that maps
+    /// the unit nowhere contributes nothing — so this is SHORTER than the unit's program wherever
+    /// [`Self::max_instr_size`] counts a region the unit does not read.
+    #[must_use]
+    pub fn unit_instr_list(&self, unit: UnitKey) -> Vec<UniformInstrInfo> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.unit_instr_list(unit).to_vec())
+            .collect()
+    }
+
+    /// Replaces: e077_getLastBlockCurrentInstrSize
+    ///
+    /// How many instructions the block currently open has taken in its current region — where the
+    /// next one lands.
+    ///
+    /// ⛔ 0 WITH NO BLOCK AT ALL, where the reference's `blocks_.back()` reads off the end.
+    #[must_use]
+    pub fn last_block_current_instr_size(&self) -> usize {
+        self.blocks
+            .last()
+            .map_or(0, UniformInstrBlock::current_region_instr_size)
+    }
+
+    /// Replaces: e078_addInstructionToLastBlock
+    ///
+    /// Appends one instruction to the block currently open, opening a REGULAR one first when the
+    /// unit's program has no block yet.
+    pub fn add_instruction_to_last_block(&mut self, instr: UniformInstrInfo) {
+        if self.blocks.is_empty() {
+            self.append_regular_block();
+        }
+        if let Some(block) = self.blocks.last_mut() {
+            block.insert_instruction(instr);
+        }
+    }
+
+    /// Replaces: e079_getNextInstrIndex
+    ///
+    /// Where the next instruction lands IF it joins the block and region currently open — ⛔ THE
+    /// CALLER OWNS THE OTHER CASE: a following uniform op opens block `blocks_.len()` instead, and
+    /// only the caller knows which op comes next (`SentientToProgIR.cpp:333-346`).
+    ///
+    /// ⛔ `None` WITH NO BLOCK, where the reference answers block `-1` and then reads `back()`.
+    #[must_use]
+    pub fn next_instr_index(&self) -> Option<InstrIndex> {
+        let block = self.blocks.len().checked_sub(1)?;
+        let open = self.blocks.last()?;
+        Some(InstrIndex {
+            block,
+            region: open.current_region(),
+            instr: open.current_region_instr_size(),
+        })
+    }
 }
 
-// crustify:todo: e074_getMaxInstrRegionIndex
-// crustify:todo: e075_getRegionInstrSize
-// crustify:todo: e076_getUnitUniformInstrList
-// crustify:todo: e077_getLastBlockCurrentInstrSize
-// crustify:todo: e078_addInstructionToLastBlock
-// crustify:todo: e079_getNextInstrIndex
 // crustify:todo: e096_getUniformizedUnitInstrList
 // crustify:todo: e097_flattenIndex
 // crustify:todo: e121_getUniformizedUnitUniformInstrList
@@ -606,6 +713,137 @@ mod unit_tests {
         assert_eq!(
             UniformInstrBlock::Regular(vec![nop()]).unit_region_index(unit(DfirUnit::L3su)),
             Some(RegionIndex(0))
+        );
+    }
+
+    /// e074: the FIRST region as long as the longest, and 0 for the one-list and no-region shapes.
+    #[test]
+    fn the_padding_target_is_the_first_longest_region() {
+        let block = UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop()], vec![nop(), ret()], vec![ret(), nop()]],
+            ..UniformBlock::default()
+        });
+        assert_eq!(block.max_instr_region_index(), 1, "the first of the two");
+        assert_eq!(
+            UniformInstrBlock::Regular(vec![nop(), ret()]).max_instr_region_index(),
+            0
+        );
+        assert_eq!(
+            UniformInstrBlock::Uniform(UniformBlock::default()).max_instr_region_index(),
+            0
+        );
+    }
+
+    /// e075: a mapped unit's own region — ⛔ AND AN UNMAPPED ONE COSTS THE LONGEST, not 0.
+    #[test]
+    fn an_unmapped_unit_costs_the_longest_region() {
+        let lxlu = unit(DfirUnit::Lxlu);
+        let block = UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop(), ret(), nop()], vec![ret()]],
+            unit_to_region: vec![(lxlu, RegionIndex(1))],
+            ..UniformBlock::default()
+        });
+        assert_eq!(block.region_instr_size(lxlu), 1);
+        assert_eq!(
+            block.region_instr_size(unit(DfirUnit::L3su)),
+            3,
+            "uniformization pads the unmapped unit up to the longest region"
+        );
+        assert_eq!(
+            UniformInstrBlock::Regular(vec![nop(), ret()]).region_instr_size(lxlu),
+            2
+        );
+    }
+
+    /// e076: every block's contribution in order — ⛔ AND A BLOCK THAT MAPS THE UNIT NOWHERE ADDS
+    /// NOTHING.
+    #[test]
+    fn a_units_instructions_run_together_across_the_blocks() {
+        let lxlu = unit(DfirUnit::Lxlu);
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.append_regular_block();
+        blocks.add_instruction_to_last_block(ret());
+        blocks.blocks.push(UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![ret()], vec![nop(), nop()]],
+            unit_to_region: vec![(lxlu, RegionIndex(1))],
+            ..UniformBlock::default()
+        }));
+        assert_eq!(
+            blocks.unit_instr_list(lxlu),
+            vec![ret(), nop(), nop()],
+            "the regular block's one list, then the unit's own region"
+        );
+        assert_eq!(
+            blocks.unit_instr_list(unit(DfirUnit::L3su)),
+            vec![ret()],
+            "the uniform block maps this unit nowhere"
+        );
+    }
+
+    /// e077: the current region of the LAST block — ⛔ AND 0 WITH NO BLOCK AT ALL.
+    #[test]
+    fn the_last_blocks_current_region_is_where_the_next_instruction_lands() {
+        let mut blocks = UniformInstrBlocks::default();
+        assert_eq!(blocks.last_block_current_instr_size(), 0);
+        blocks.blocks.push(UniformInstrBlock::Uniform(UniformBlock {
+            regions: vec![vec![nop(), nop()], vec![ret()]],
+            current: RegionIndex(1),
+            ..UniformBlock::default()
+        }));
+        assert_eq!(blocks.last_block_current_instr_size(), 1);
+    }
+
+    /// e078: the first instruction opens a REGULAR block, and a later one joins whatever block is
+    /// open, in its current region.
+    #[test]
+    fn the_first_instruction_opens_a_regular_block() {
+        let mut blocks = UniformInstrBlocks::default();
+        blocks.add_instruction_to_last_block(nop());
+        assert!(matches!(
+            blocks.blocks.as_slice(),
+            [UniformInstrBlock::Regular(_)]
+        ));
+        blocks.add_instruction_to_last_block(ret());
+        assert_eq!(
+            blocks.blocks[0].instr_lists().to_vec(),
+            vec![vec![nop(), ret()]]
+        );
+        blocks
+            .append_uniform_block()
+            .set_current_region(RegionIndex(1));
+        blocks.add_instruction_to_last_block(ret());
+        assert_eq!(
+            blocks.blocks[1].instr_lists().to_vec(),
+            vec![Vec::new(), vec![ret()]],
+            "the uniform block's current region takes it"
+        );
+    }
+
+    /// e079: the index names the block and region currently open — ⛔ AND `None` with no block, where
+    /// the reference answers block -1.
+    #[test]
+    fn the_next_index_names_the_open_block_and_region() {
+        let mut blocks = UniformInstrBlocks::default();
+        assert_eq!(blocks.next_instr_index(), None);
+        blocks.add_instruction_to_last_block(nop());
+        assert_eq!(
+            blocks.next_instr_index(),
+            Some(InstrIndex {
+                block: 0,
+                region: RegionIndex(0),
+                instr: 1
+            })
+        );
+        let uniform = blocks.append_uniform_block();
+        uniform.regions = vec![vec![nop()], vec![nop(), ret()]];
+        uniform.set_current_region(RegionIndex(1));
+        assert_eq!(
+            blocks.next_instr_index(),
+            Some(InstrIndex {
+                block: 1,
+                region: RegionIndex(1),
+                instr: 2
+            })
         );
     }
 }

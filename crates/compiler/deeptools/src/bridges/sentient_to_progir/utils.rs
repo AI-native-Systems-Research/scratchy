@@ -19,8 +19,10 @@
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
 use crate::arch::{Arch, Bytes, IsaGen, Sticks};
+use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
+use crate::islands::progir::OperandField;
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue};
-use crate::islands::sentient::dialects::sentient::Precision;
+use crate::islands::sentient::dialects::sentient::{FoldMode, Precision};
 use sys_arch_spec::regfile::Component;
 
 /// WHICH COMPUTE UNIT AN FMA/FMUL/FNMS RUNS ON — the two `is_any_of(comp, PE, SFP)` admits at every
@@ -299,18 +301,83 @@ pub fn addr_wraparounded<A: Arch>(val: i64, space: AddrSpace) -> i64 {
     }
 }
 
-// crustify:todo: e080_setFCValueFromFoldMode
+/// WHAT THE `foldctrl` FIELD SAYS — the four values `setFCValueFromFoldMode` writes
+/// (`Utils.cpp:135-147`), which are exactly that field's encoding
+/// (`sys-arch-spec/src/fields.rs:237`, `ENC_FOLDA_FOLDB_2FOLD2INSTR_2FOLD1INSTR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldControl {
+    /// `folda` (0).
+    FoldA,
+    /// `foldb` (1).
+    FoldB,
+    /// `2fold2instr` (2) — two folds, one instruction each.
+    TwoFoldTwoInstr,
+    /// `2fold1instr` (3) — two folds sharing one instruction.
+    TwoFoldOneInstr,
+}
+
+impl FoldControl {
+    /// Its `DESCRIPTIVE` spelling.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            FoldControl::FoldA => "folda",
+            FoldControl::FoldB => "foldb",
+            FoldControl::TwoFoldTwoInstr => "2fold2instr",
+            FoldControl::TwoFoldOneInstr => "2fold1instr",
+        }
+    }
+
+    /// WHICH `foldctrl` A SENTIENT FOLD MODE MEANS — ⛔ NO ATTRIBUTE AND `none` BOTH MEAN `folda`
+    /// (`Utils.cpp:134-137`), so the absence is not a fifth state, and both `fold_AB_A` and
+    /// `fold_AB_B` mean the same `2fold2instr`: which half this instruction is, is not in this field.
+    #[must_use]
+    pub const fn of(fold_mode: Option<FoldMode>) -> FoldControl {
+        match fold_mode {
+            None | Some(FoldMode::None | FoldMode::FoldA) => FoldControl::FoldA,
+            Some(FoldMode::FoldB) => FoldControl::FoldB,
+            Some(FoldMode::FoldAbA | FoldMode::FoldAbB) => FoldControl::TwoFoldTwoInstr,
+            Some(FoldMode::FoldAbBoth) => FoldControl::TwoFoldOneInstr,
+        }
+    }
+}
+
+/// Replaces: e080_setFCValueFromFoldMode
+///
+/// The compute unit's `foldctrl` field, from the fold mode its op carries.
+///
+/// ⛔ ONLY THE PE AND THE SFP TAKE ONE: for every other component this writes NOTHING, not a default
+/// — the reference's `if (!is_any_of(comp, PE, SFP)) return` (`:130`), which its callers reach with
+/// the PT (`ConstructProgIRHelper.cpp:1651`).
+pub fn set_fc_value_from_fold_mode(
+    super_instr: &mut UniformInstrInfo,
+    comp: Component,
+    fold_mode: Option<FoldMode>,
+) {
+    if !matches!(comp, Component::Pe | Component::Sfp) {
+        return;
+    }
+    super_instr.set_common_field(
+        OperandField::Foldctrl,
+        Operand::every(OperandValue::Descriptive(
+            FoldControl::of(fold_mode).spelling().to_owned(),
+        )),
+    );
+}
 
 #[cfg(test)]
 mod unit_tests {
     use super::{
         AddrSpace, Component, ComputeUnit, ConsumerUnit, InputPrecisions, LoadConsumer, SrcOperand,
-        UnsupportedConversion, addr_wraparounded, proper_consumer,
+        UnsupportedConversion, addr_wraparounded, proper_consumer, set_fc_value_from_fold_mode,
         unsupported_on_the_fly_conversions, update_proper_consumer,
     };
     use crate::arch::{Dd2, Sen1p5};
+    use crate::bridges::sentient_to_progir::uniform::instr::UniformInstrInfo;
+    use crate::islands::progir::OpCode;
+    use crate::islands::progir::OperandField;
     use crate::islands::progir::ty::{FoldId, Operand, OperandValue, PerFold};
-    use crate::islands::sentient::dialects::sentient::Precision;
+    use crate::islands::sentient::dialects::sentient::{FoldMode, Precision};
 
     fn descriptive(name: &str) -> Operand {
         Operand::every(OperandValue::Descriptive(name.to_owned()))
@@ -523,6 +590,42 @@ mod unit_tests {
         assert_eq!(
             addr_wraparounded::<Dd2>(9999, AddrSpace::Unit(Component::Lxlu)),
             9999
+        );
+    }
+
+    /// e080: the vendor's own `foldctrl:folda` for an op with no fold mode
+    /// (`test/Conversion/SentientToProgIR/unary_op_sen1p5.mlir:14`), the two AB spellings — ⛔ AND
+    /// NOTHING AT ALL on a component that is neither the PE nor the SFP.
+    #[test]
+    fn the_foldctrl_field_is_written_on_the_pe_and_the_sfp_alone() {
+        let mut instr = UniformInstrInfo::of(OpCode::FMA);
+        set_fc_value_from_fold_mode(&mut instr, Component::Pe, None);
+        assert_eq!(
+            instr.common_field(OperandField::Foldctrl),
+            Some(&descriptive("folda")),
+            "no fold attribute is folda, not the absence of the field"
+        );
+        set_fc_value_from_fold_mode(&mut instr, Component::Pe, Some(FoldMode::FoldB));
+        assert_eq!(
+            instr.common_field(OperandField::Foldctrl),
+            Some(&descriptive("foldb"))
+        );
+        set_fc_value_from_fold_mode(&mut instr, Component::Sfp, Some(FoldMode::FoldAbB));
+        assert_eq!(
+            instr.common_field(OperandField::Foldctrl),
+            Some(&descriptive("2fold2instr")),
+            "either half of a two-instruction fold names the same value"
+        );
+        set_fc_value_from_fold_mode(&mut instr, Component::Sfp, Some(FoldMode::FoldAbBoth));
+        assert_eq!(
+            instr.common_field(OperandField::Foldctrl),
+            Some(&descriptive("2fold1instr"))
+        );
+        let mut pt = UniformInstrInfo::of(OpCode::FMA);
+        set_fc_value_from_fold_mode(&mut pt, Component::Pt, Some(FoldMode::FoldB));
+        assert!(
+            !pt.has_common_field(OperandField::Foldctrl),
+            "the matrix unit takes no foldctrl at all"
         );
     }
 }

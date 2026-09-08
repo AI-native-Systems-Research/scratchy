@@ -20,6 +20,7 @@
 use crate::bridges::sentient_to_progir::state::UnitKey;
 use crate::bridges::sentient_to_progir::utils::{ConsumerUnit, update_proper_consumer};
 use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::formats::DataFormat;
 use crate::islands::progir::ty::{FoldId, Operand, OperandValue};
 use crate::islands::progir::{Instruction, OpCode, OperandField};
 use crate::units::DfirUnit;
@@ -254,6 +255,84 @@ impl UniformInstrInfo {
     pub fn has_common_field(&self, field: OperandField) -> bool {
         held(&self.common_fields, field).is_some()
     }
+
+    /// Replaces: e073_addEntryToOperandMap
+    ///
+    /// One field's value per unit, from a map of per-fold constants — scaled, truncated to an integer,
+    /// in the format the field is in.
+    /// ⛔⛔ NO FOLD ID IS EVER WRITTEN, so a unit's LAST fold wins, and the units whose folds disagree
+    /// come back instead of `DT_CHECK_MSG(!folding_needed, "Folding in instruction fields are not
+    /// supported")` (`cpp:212`) — whose `folding_needed` is dead either way: this overload sets
+    /// `values_same` to `true` on a difference where its 121-line twin sets `false` (`:100`).
+    pub fn add_const_entries_to_operand_map(
+        &mut self,
+        field: OperandField,
+        entries: &[FoldConstant],
+        scale: f64,
+        format: Option<DataFormat>,
+    ) -> Vec<UnitKey> {
+        // `:180-197` — the per-unit agreement pass, and the only thing it decides.
+        let mut seen: Vec<(UnitKey, i64)> = Vec::new();
+        let mut disagreeing: Vec<UnitKey> = Vec::new();
+        for entry in entries {
+            match seen.iter().find(|(at, _)| *at == entry.unit) {
+                Some((_, first)) if *first != entry.value && !disagreeing.contains(&entry.unit) => {
+                    disagreeing.push(entry.unit);
+                }
+                Some(_) => {}
+                None => seen.push((entry.unit, entry.value)),
+            }
+        }
+        for entry in entries {
+            // `:216` — `int64_t(pair.second * scale)`, truncated toward zero as that cast is.
+            let scaled = (entry.value as f64 * scale) as i64;
+            if let Some(operand) = self.per_unit_operand_mut(field, entry.unit) {
+                operand.set(None, OperandValue::Int(scaled));
+                // `:219-221` — `INVALID` is the absence, so only a real format is written.
+                if let Some(format) = format {
+                    operand.format = Some(format);
+                }
+            }
+        }
+        disagreeing
+    }
+
+    /// The place `operand_map_[field][unit]` names, default-constructed the way the reference's two
+    /// subscripts are (`progir.h:257-271`) — `None` is unreachable, the entry having just been made.
+    fn per_unit_operand_mut(&mut self, field: OperandField, unit: UnitKey) -> Option<&mut Operand> {
+        let at = slot(&self.operand_map, field);
+        if !matches!(self.operand_map.get(at), Some((held, _)) if *held == field) {
+            let fresh = PerUnitOperand {
+                first: (unit, Operand::default()),
+                rest: Vec::new(),
+            };
+            self.operand_map.insert(at, (field, fresh));
+        }
+        let per_unit = &mut self.operand_map.get_mut(at)?.1;
+        // The order [`PerUnitOperand::get`] reads in: the last entry for a unit is the one it sees.
+        if let Some(at) = per_unit.rest.iter().rposition(|(held, _)| *held == unit) {
+            return Some(&mut per_unit.rest.get_mut(at)?.1);
+        }
+        if per_unit.first.0 == unit {
+            return Some(&mut per_unit.first.1);
+        }
+        per_unit.rest.push((unit, Operand::default()));
+        per_unit.rest.last_mut().map(|(_, operand)| operand)
+    }
+}
+
+/// ONE UNIT'S CONSTANT ON ONE FOLD — an entry of `getConstantTargetKeyValues`' map
+/// (`Dialect/Uniform/Utils.cpp:421`), keyed by a fold's own `GetUnitOp`, so one unit appears once per
+/// fold it takes part in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldConstant {
+    /// `getUnitName(key)`.
+    pub unit: UnitKey,
+    /// `unit_foldid_map_.at(key)` — ⛔ READ ONLY TO COMPARE, never written into the operand; see
+    /// [`UniformInstrInfo::add_const_entries_to_operand_map`].
+    pub fold: Option<FoldId>,
+    /// The `sentient.constant` this key maps to.
+    pub value: i64,
 }
 
 /// AN INSTRUCTION WITH NOTHING PER-UNIT — what [`UniformInstrInfo::regular`] witnesses.
@@ -526,16 +605,16 @@ pub fn add_entry_to_operand_map(entries: &[MappedEntry], mode: MapMode, scale: f
     MappedField { value, refused }
 }
 
-// crustify:todo: e073_addEntryToOperandMap
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Comment, Displaced, MapMode, MappedEntry, MappedField, MappedOp, OperandMapRefusal,
+        Comment, Displaced, FoldConstant, MapMode, MappedEntry, MappedField, MappedOp, OperandMapRefusal,
         PerUnitOperand, UniformInstrInfo, UniformLabel, add_entry_to_operand_map, create_jmp_instr,
         create_nop_instr,
     };
     use crate::bridges::sentient_to_progir::state::UnitKey;
-    use crate::islands::progir::ty::{Operand, OperandValue};
+    use crate::formats::DataFormat;
+    use crate::islands::progir::ty::{FoldId, Operand, OperandValue, PerFold};
     use crate::islands::progir::{OpCode, OperandField};
     use crate::units::{Core, Corelet, DfirUnit};
 
@@ -818,6 +897,53 @@ mod unit_tests {
             mapped(MappedOp::Unit(other), MapMode::UnitName).refused,
             vec![OperandMapRefusal::NotAConsumer(other)],
             "an LXLU is no load consumer"
+        );
+    }
+
+    /// e073: one field's value per unit, scaled and in one format — ⛔ AND THE UNIT WHOSE TWO FOLDS
+    /// DISAGREE COMES BACK, its last fold having won.
+    #[test]
+    fn the_folds_of_one_unit_collapse_to_its_last_value() {
+        let pe = unit(DfirUnit::Pe, 0);
+        let sfp = unit(DfirUnit::Sfp, 0);
+        let mut instr = UniformInstrInfo::of(OpCode::FMA);
+        let entries = [
+            FoldConstant {
+                unit: pe,
+                fold: Some(FoldId(0)),
+                value: 3,
+            },
+            FoldConstant {
+                unit: pe,
+                fold: Some(FoldId(1)),
+                value: 5,
+            },
+            FoldConstant {
+                unit: sfp,
+                fold: Some(FoldId(0)),
+                value: 4,
+            },
+        ];
+        let disagreeing = instr.add_const_entries_to_operand_map(
+            OperandField::Imm,
+            &entries,
+            2.0,
+            Some(DataFormat::IeeeFp32),
+        );
+        assert_eq!(disagreeing, vec![pe], "3 and 5 are not the same constant");
+        let (field, per_unit) = instr.operand_map.first().expect("one field was written");
+        assert_eq!(*field, OperandField::Imm);
+        assert_eq!(
+            per_unit.get(pe),
+            &Operand {
+                value: PerFold::Every(OperandValue::Int(10)),
+                format: Some(DataFormat::IeeeFp32),
+            },
+            "the last fold's value, scaled, with no fold id on it"
+        );
+        assert_eq!(
+            per_unit.get(sfp).value,
+            PerFold::Every(OperandValue::Int(8))
         );
     }
 }
