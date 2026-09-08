@@ -59,7 +59,9 @@ for d in STAGES:
     nb = sum(len(w["batches"]) for w in waves)
     nu = sum(w["unit_count"] for w in waves)
     s["waves"] = waves
-    s["summary"].update(batch_count=nb, unit_count=nu, layer_count=len(waves))
+    # ⛔ DISTINCT ITEM LAYERS, not the wave count — crustify checks the former (wave.py:106-107).
+    nl = len({i["layer"] for w in waves for b in w["batches"] for i in b["items"]})
+    s["summary"].update(batch_count=nb, unit_count=nu, layer_count=nl)
     json.dump(s, open(f.with_name("port-remainder.json"), "w"), indent=2)
     print(f"  {d}: {nu} units left, {nb} batches")
 

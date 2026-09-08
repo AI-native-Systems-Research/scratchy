@@ -124,7 +124,12 @@ def schedule(units, levels, max_syms, max_loc, wf_path, wf_sha, per_level=True):
         "budgets": {"max_syms": max_syms, "max_loc": max_loc, "max_types": 5, "min_fields": 20},
         "summary": {
             "unit_count": sum(w["unit_count"] for w in waves),
-            "layer_count": len(waves),
+            # ⛔ THE NUMBER OF DISTINCT ITEM LAYERS, NOT THE NUMBER OF WAVES. crustify's own
+            # consistency check is `len({item["layer"] for item in items}) != layer_count`
+            # (wave.py:106-107); for a REVIEW schedule the two differ (one wave, several levels) and
+            # every review stage died with "schedule summary or batched item identities disagree".
+            "layer_count": len({i["layer"] for w in waves for b in w["batches"]
+                                for i in b["items"]}),
             "batch_count": sum(len(w["batches"]) for w in waves),
             "file_count": 1,
         },

@@ -21,3 +21,8 @@ flamegraph.svg.gz
 *.swo
 *~
 .DS_Store
+crustify-bridge3/tools/__pycache__/
+crustify/campaigns/bridge3/logs/
+crustify/campaigns/bridge3/.driver.lock
+crustify/campaigns/bridge3/*/port-remainder.json
+crustify/campaigns/bridge3/*/.reviewed

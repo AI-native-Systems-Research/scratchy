@@ -1,7 +1,7 @@
 {
  "_comment": [
   "Placement oracle for the bridge-2 port. Every unit lands in the EXISTING scratchy crate",
-  "`deeptools` under src/bridges/dataflow_ir_to_sentient/ \u2014 one .rs per original dcc translation",
+  "`deeptools` under src/bridges/dataflow_ir_to_sentient/ — one .rs per original dcc translation",
   "unit (conventions.md: one .rs home per C translation unit), grouped into the five modules the",
   "campaign's own crates.json named.",
   "",
@@ -181,6 +181,147 @@
       }
      }
     },
+    "construct": {
+     "rust_path": "src/bridges/sentient_to_progir",
+     "rs": {
+      "src/bridges/sentient_to_progir/construct/compute.rs": {
+       "_comment": "6 unit(s) from dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp (levels [1, 2]). ConstructProgIRHelper.cpp — one submodule per instruction family. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e052_setSentientComputeInputProgIROperands",
+         "e053_setSentientComputeOutputProgIROperands",
+         "e085_ConstructFMAInstr",
+         "e086_ConstructBinaryInstr",
+         "e087_ConstructUnaryInstr",
+         "e088_ConstructTernaryInstr"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/construct/mask_and_splat.rs": {
+       "_comment": "9 unit(s) from dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp (levels [0, 1, 2, 3]). ConstructProgIRHelper.cpp — one submodule per instruction family. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e005_ConstructIncrMaskInstr",
+         "e060_ConstructSetDstMaskInstr",
+         "e061_ConstructSetDestInstr",
+         "e062_ConstructImmCopyInstrFromSplatOp",
+         "e064_ConstructSAMVInstr",
+         "e065_ConstructSAMVResetInstruction",
+         "e066_ConstructSetMaskInstr",
+         "e092_ConstructSplatInstrFromSplatOp",
+         "e098_ConstructSplatPadInstr"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/construct/opaque.rs": {
+       "_comment": "2 unit(s) from dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp (levels [0, 1]). ConstructProgIRHelper.cpp — one submodule per instruction family. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e004_rtrim",
+         "e063_ConstructOpaqueInstr"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/construct/reg_init.rs": {
+       "_comment": "3 unit(s) from dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp (levels [0, 1]). ConstructProgIRHelper.cpp — one submodule per instruction family. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e006_addToRegsToInit",
+         "e007_addPESFPLRFImmcopyToRegInit",
+         "e067_fillImmField"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/construct/scalar.rs": {
+       "_comment": "16 unit(s) from dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp (levels [0, 1, 2]). ConstructProgIRHelper.cpp — one submodule per instruction family. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e001_ConstructNOPInstr",
+         "e002_ConstructReturnInstr",
+         "e042_ConstructMVLoopInstr",
+         "e043_ConstructAssignInstr",
+         "e044_ConstructBranchExitInstr",
+         "e045_ConstructSyncInstr",
+         "e046_ConstructJMPInstr",
+         "e047_ConstructJCMPInstr",
+         "e048_ConstructJADDInstr",
+         "e049_ConstructXRFADDInstr",
+         "e050_ConstructXRFADDInstr",
+         "e051_ConstructJSUBInstr",
+         "e081_ConstructLRFADDInstr",
+         "e082_ConstructLARorEARADDInstr",
+         "e083_ConstructLRFSUBInstr",
+         "e084_ConstructLARorEARSUBInstr"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/construct/transfer.rs": {
+       "_comment": "10 unit(s) from dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp (levels [0, 1, 2]). ConstructProgIRHelper.cpp — one submodule per instruction family. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/ConstructProgIRHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e003_normalizeBurstSize",
+         "e054_ConstructL3LoadInstr",
+         "e055_ConstructL3StoreInstr",
+         "e056_ConstructZRAssignInstr",
+         "e057_ConstructL3LoadAndStoreInstr",
+         "e058_ConstructLoadComputeInstr",
+         "e059_ConstructLRFCopyInstr",
+         "e089_ConstructLoadInstr",
+         "e090_ConstructLoadInstr",
+         "e091_ConstructStoreInstr"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      }
+     }
+    },
     "dataflow_to_sentient": {
      "rust_path": "src/bridges/dataflow_ir_to_sentient",
      "rs": {
@@ -222,18 +363,169 @@
       }
      }
     },
-    "vectorchain": {
+    "driver": {
+     "rust_path": "src/bridges/sentient_to_progir",
+     "rs": {
+      "src/bridges/sentient_to_progir/driver.rs": {
+       "_comment": "7 unit(s) from dcc/src/Conversion/SentientToProgIR/SentientToProgIR.cpp (levels [0, 2, 5, 6, 7]). SentientToProgIR.cpp — the D76 pass itself. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/SentientToProgIR.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e015_initializeUtilizedRegisters",
+         "e016_replaceProgramBodyWithSmcOp",
+         "e095_equalizeProgramLength",
+         "e127_GenerateProgIR",
+         "e128_GenerateProgIR",
+         "e129_GenerateProgIRForProgramUnit",
+         "e130_runOnOperation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      }
+     }
+    },
+    "lower": {
+     "rust_path": "src/bridges/sentient_to_progir",
+     "rs": {
+      "src/bridges/sentient_to_progir/lower/compute.rs": {
+       "_comment": "12 unit(s) from dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp (levels [3, 4]). LowerSentientHelper.cpp — the per-operation handlers. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e107_LowerCommonOperations",
+         "e108_LowerBinaryOperation",
+         "e109_LowerUnaryOperation",
+         "e110_LowerTernaryOperation",
+         "e112_LowerMACOperation",
+         "e113_LowerSubOperation",
+         "e114_LowerAddOperation",
+         "e117_LowerOpaqueOperation",
+         "e118_LowerSAMVOperation",
+         "e119_LowerSetMaskOperation",
+         "e120_LowerIncrMaskOperation",
+         "e124_LowerSplatOperation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/lower/control.rs": {
+       "_comment": "9 unit(s) from dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp (levels [0, 3, 4, 5]). LowerSentientHelper.cpp — the per-operation handlers. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e011_fillUnitToIdMap",
+         "e105_LowerSyncOperation",
+         "e106_LowerNOPOperation",
+         "e111_LowerForOperation",
+         "e115_LowerReturnOperation",
+         "e116_LowerSetSendDestinationOperation",
+         "e123_LowerYieldOperation",
+         "e125_LowerUniformYieldOperation",
+         "e126_LowerUniformOperations"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/lower/labels_and_regs.rs": {
+       "_comment": "6 unit(s) from dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp (levels [0, 1, 2]). LowerSentientHelper.cpp — the per-operation handlers. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e008_addToRegInit",
+         "e009_GetAddressScale",
+         "e010_GetOpCodePrefix",
+         "e068_getRegImmVals",
+         "e093_AddToLabelsMap",
+         "e094_updateLabelAndAddToCodeGraph"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/lower/transfer.rs": {
+       "_comment": "7 unit(s) from dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp (levels [3, 4]). LowerSentientHelper.cpp — the per-operation handlers. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/LowerSentientHelper.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e099_LowerLoadAndSendOperation",
+         "e100_LowerReceiveAndStoreOperation",
+         "e101_LowerLoadAndStoreOperation",
+         "e102_LowerLoadAndExtractScalarOperation",
+         "e103_LowerReceiveAndExtractScalarOperation",
+         "e104_LowerLoadComputeAndSendOperation",
+         "e122_LowerCopyOperation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      }
+     }
+    },
+    "reg_def_tracker": {
+     "rust_path": "src/bridges/sentient_to_progir",
+     "rs": {
+      "src/bridges/sentient_to_progir/reg_def_tracker.rs": {
+       "_comment": "5 unit(s) from dcc/src/Conversion/SentientToProgIR/RegDefTracker.cpp (levels [0, 1]). RegDefTracker.cpp — which registers are defined. ⛔ returns offenders, never refuses. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/RegDefTracker.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e012_setRegDef",
+         "e013_addRegDefsForUnit",
+         "e014_checkRegDefs",
+         "e069_recordOpRegDefs",
+         "e070_dtor_UniformRegionContext"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      }
+     }
+    },
+    "standard_and_scf": {
      "rust_path": "src/bridges/dataflow_ir_to_sentient",
      "rs": {
-      "src/bridges/dataflow_ir_to_sentient/vc_helper.rs": {
-       "_comment": "1 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp (levels [0]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs": {
+       "_comment": "1 unit(s) from dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp (levels [0]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp"
+        "dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp"
        ],
        "members": {
         "functions": [
-         "e089_getMaskValueForPT"
+         "e001_matchAndRewrite"
         ],
         "types": [],
         "callbacks": [],
@@ -241,32 +533,18 @@
         "globals": []
        }
       },
-      "src/bridges/dataflow_ir_to_sentient/vc_loop_mask_tree.rs": {
-       "_comment": "17 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp (levels [0, 1, 2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/std_scf_to_sentient.rs": {
+       "_comment": "4 unit(s) from dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp (levels [0, 2]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp",
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp"
+        "dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp"
        ],
        "members": {
         "functions": [
-         "e077_walk",
-         "e078_findNodeFromOp",
-         "e079_OperationNode",
-         "e080_LoopMaskNode",
-         "e081_getParentNode",
-         "e082_getFirstChild",
-         "e083_getNextSibling",
-         "e084_getPrevSibling",
-         "e085_getLastChild",
-         "e086_MaskNode",
-         "e087_LMTLoopNode",
-         "e088_getRoot",
-         "e171_isMaskEquivalentToNode",
-         "e236_addMaskNode",
-         "e237_updateNode",
-         "e238_computeLoops",
-         "e281_OperationTreeBase"
+         "e045_getSentientCmpIPredicate",
+         "e046_ConversionPattern",
+         "e047_runOnOperation",
+         "e225_matchAndRewrite"
         ],
         "types": [],
         "callbacks": [],
@@ -274,17 +552,26 @@
         "globals": []
        }
       },
-      "src/bridges/dataflow_ir_to_sentient/vc_lowering_pt_masks.rs": {
-       "_comment": "3 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp (levels [2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/std_standard_to_sentient.rs": {
+       "_comment": "12 unit(s) from dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp (levels [0, 6, 7, 8]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp"
+        "dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp"
        ],
        "members": {
         "functions": [
-         "e239_insertPTMaskOps",
-         "e282_updateLoopMaskTreeForConstantMask",
-         "e283_updateLoopMaskTreeForDynamicMask"
+         "e048_getSentientCmpIPredicate",
+         "e049_LowerAddIOpToSentient",
+         "e050_LowerSubIOpToSentient",
+         "e051_LowerMulIOpToSentient",
+         "e052_If",
+         "e053_LowerConstantIndexToSentient",
+         "e054_LowerConstantIntToSentient",
+         "e338_ConstructIFRecursively",
+         "e339_SimplifyOrIOp",
+         "e362_LowerSelectOpToSentient",
+         "e363_LowerLogicalOpToSentient",
+         "e376_runOnOperation"
         ],
         "types": [],
         "callbacks": [],
@@ -292,183 +579,17 @@
         "globals": []
        }
       },
-      "src/bridges/dataflow_ir_to_sentient/vc_lowering_xrf.rs": {
-       "_comment": "14 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp (levels [0, 1, 2, 6, 7]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/std_symbol_to_sentient.rs": {
+       "_comment": "3 unit(s) from dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp (levels [2, 3, 4]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp"
+        "dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp"
        ],
        "members": {
         "functions": [
-         "e090_getXrfValue",
-         "e091_getForOpBound",
-         "e092_setSentientMacXrfRegIncrAttr",
-         "e093_replaceAndEraseDummyMacOps",
-         "e172_areXrfAccessesLegal",
-         "e173_insertConstAndAddOps",
-         "e174_isXrfRelated",
-         "e175_updateYieldArgs",
-         "e240_getLayoutExpr",
-         "e241_createForOpWithReturnValue",
-         "e242_createIfOpWithReturnValue",
-         "e243_insertDummyMacOp",
-         "e345_processXrfPtrPerUnit",
-         "e367_createXrfIndexModifOps"
-        ],
-        "types": [],
-        "callbacks": [],
-        "macros": [],
-        "globals": []
-       }
-      },
-      "src/bridges/dataflow_ir_to_sentient/vc_operand_reuse.rs": {
-       "_comment": "7 unit(s) from dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp (levels [0, 1, 2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-bridge2/source/bridge2.cpp",
-       "headers": [
-        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp",
-        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp"
-       ],
-       "members": {
-        "functions": [
-         "e055_getId",
-         "e056_getAbsorbtionFlag",
-         "e057_setReuseFlag",
-         "e058_dominates",
-         "e162_insertIfNotExists",
-         "e227_OperandReuse",
-         "e276_setReuseInformation"
-        ],
-        "types": [],
-        "callbacks": [],
-        "macros": [],
-        "globals": []
-       }
-      },
-      "src/bridges/dataflow_ir_to_sentient/vc_splat.rs": {
-       "_comment": "2 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp (levels [2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-bridge2/source/bridge2.cpp",
-       "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e235_createSentientConstants",
-         "e279_createSplatOperation"
-        ],
-        "types": [],
-        "callbacks": [],
-        "macros": [],
-        "globals": []
-       }
-      },
-      "src/bridges/dataflow_ir_to_sentient/vc_vector_chain_helper.rs": {
-       "_comment": "23 unit(s) from dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp (levels [0, 1, 2, 3, 6]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-bridge2/source/bridge2.cpp",
-       "headers": [
-        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp",
-        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp"
-       ],
-       "members": {
-        "functions": [
-         "e059_isSentientBinaryLogicalOp",
-         "e060_getInputPrecisionFromOperand",
-         "e061_getResultPrecisionFromOperands",
-         "e062_getComputePrecisionOfOp",
-         "e063_hasConstantBounds",
-         "e064_size",
-         "e065_fuseCompareAndSelectIntoMinOrMax",
-         "e066_resetSentientFMAsIfExists",
-         "e067_redefineConstantVectors",
-         "e068_getVectorBinaryToSentientBinary",
-         "e069_getVectorElementWiseCompareOperatorToSentientBinaryOperator",
-         "e070_getVectorTernaryToSentientTernary",
-         "e163_getMaskValueConstantForNonPT",
-         "e164_checkValidityOfPackAndShuffleLowering",
-         "e165_getMergeTypeFromIndices",
-         "e228_validateLoweringAndSetMissingParameters",
-         "e229_getMaskValueForNonPT",
-         "e230_convertStringToType",
-         "e231_convertTypeToString",
-         "e277_getGCVTorFCVTTypeFromIndicesAndCastInputs",
-         "e340_analyzeAndFillOperandForwarding",
-         "e341_analyzeNonComputeOpsForFusion",
-         "e342_analyzeAndFillResultForwarding"
-        ],
-        "types": [],
-        "callbacks": [],
-        "macros": [],
-        "globals": []
-       }
-      },
-      "src/bridges/dataflow_ir_to_sentient/vc_vector_chain_to_sentient_pesfp.rs": {
-       "_comment": "8 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp (levels [0, 3, 6, 7, 8]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-bridge2/source/bridge2.cpp",
-       "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e076_fuseComputeOps",
-         "e280_cleanup",
-         "e344_lowerDanglingNonComputeOpsPESFP",
-         "e364_patternAgnosticFuseNonComputeOpsHelper",
-         "e365_fillOpInfo",
-         "e366_fuseNonComputeOps",
-         "e377_matchAndRewrite",
-         "e378_runOnOperation"
-        ],
-        "types": [],
-        "callbacks": [],
-        "macros": [],
-        "globals": []
-       }
-      },
-      "src/bridges/dataflow_ir_to_sentient/vc_vector_chain_to_sentient_pt.rs": {
-       "_comment": "5 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp (levels [0, 6, 7, 8]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-bridge2/source/bridge2.cpp",
-       "headers": [
-        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e094_computeUnitPrecision",
-         "e346_lowerDanglingNonComputeOps",
-         "e368_fuseNonComputeOps",
-         "e369_fuseComputeOps",
-         "e379_runOnOperation"
-        ],
-        "types": [],
-        "callbacks": [],
-        "macros": [],
-        "globals": []
-       }
-      },
-      "src/bridges/dataflow_ir_to_sentient/vc_vector_operands.rs": {
-       "_comment": "17 unit(s) from dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp (levels [0, 1, 2, 3, 4, 5, 6]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-bridge2/source/bridge2.cpp",
-       "headers": [
-        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp",
-        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp"
-       ],
-       "members": {
-        "functions": [
-         "e071_getOperandFromReceiveOp",
-         "e072_getOperandFromSendOp",
-         "e073_constValToField",
-         "e074_sameBlock",
-         "e075_eraseOp",
-         "e166_getOperandFromConstantOp",
-         "e167_getOperandFromConstantBitstreamOp",
-         "e168_getOperandFromNegOp",
-         "e169_getName",
-         "e170_getLayoutMapAndIndices",
-         "e232_getOperandFromLoadOrStoreOp",
-         "e233_eraseOperands",
-         "e234_setValue",
-         "e278_getOperandFromShuffleOp",
-         "e304_getOperandWithPrecision",
-         "e320_getOperand",
-         "e343_getOperandFromCastOp"
+         "e226_createIfOpFromMapping",
+         "e275_LowerSymbolQueryMap",
+         "e303_runOnOperation"
         ],
         "types": [],
         "callbacks": [],
@@ -896,18 +1017,112 @@
       }
      }
     },
-    "standard_and_scf": {
+    "uniform": {
+     "rust_path": "src/bridges/sentient_to_progir",
+     "rs": {
+      "src/bridges/sentient_to_progir/uniform/block.rs": {
+       "_comment": "24 unit(s) from dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.cpp, dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp (levels [0, 1, 2, 3]). UniformInstrAndBlock.cpp/.hpp — operand map, instruction fields, blocks and regions. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.cpp",
+        "dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.hpp"
+       ],
+       "members": {
+        "functions": [
+         "e023_getUnitInstrList",
+         "e024_insertInstruction",
+         "e025_setCurrentRegion",
+         "e026_getMaxInstrSize",
+         "e027_getCurrentRegionInstrSize",
+         "e028_getInstr",
+         "e029_getLastInstr",
+         "e030_appendEmptyUniformRegion",
+         "e031_getMaxInstrSize",
+         "e032_appendRegularBlock",
+         "e033_appendUniformBlock",
+         "e034_getUniformInstr",
+         "e035_doesInstrWithThisIndexExist",
+         "e036_appendEmptyUniformRegion",
+         "e037_getUnitRegionIndex",
+         "e074_getMaxInstrRegionIndex",
+         "e075_getRegionInstrSize",
+         "e076_getUnitUniformInstrList",
+         "e077_getLastBlockCurrentInstrSize",
+         "e078_addInstructionToLastBlock",
+         "e079_getNextInstrIndex",
+         "e096_getUniformizedUnitInstrList",
+         "e097_flattenIndex",
+         "e121_getUniformizedUnitUniformInstrList"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/sentient_to_progir/uniform/instr.rs": {
+       "_comment": "9 unit(s) from dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.cpp (levels [0, 1]). UniformInstrAndBlock.cpp/.hpp — operand map, instruction fields, blocks and regions. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/UniformInstrAndBlock.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e017_createNOPInstr",
+         "e018_getUniformizedInstr",
+         "e019_getRegularInstr",
+         "e020_getCommonField",
+         "e021_setCommonField",
+         "e022_hasCommonField",
+         "e071_createJmpInstr",
+         "e072_addEntryToOperandMap",
+         "e073_addEntryToOperandMap"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      }
+     }
+    },
+    "utils": {
+     "rust_path": "src/bridges/sentient_to_progir",
+     "rs": {
+      "src/bridges/sentient_to_progir/utils.rs": {
+       "_comment": "5 unit(s) from dcc/src/Conversion/SentientToProgIR/Utils.cpp (levels [0, 1]). Utils.cpp — the shared helpers. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge3/cpp/bridge3.cpp",
+       "headers": [
+        "dcc/src/Conversion/SentientToProgIR/Utils.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e038_verifyOnTheFlyConversions",
+         "e039_getProperConsumer",
+         "e040_updateProperConsumer",
+         "e041_getAddrWraparounded",
+         "e080_setFCValueFromFoldMode"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      }
+     }
+    },
+    "vectorchain": {
      "rust_path": "src/bridges/dataflow_ir_to_sentient",
      "rs": {
-      "src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs": {
-       "_comment": "1 unit(s) from dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp (levels [0]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/vc_helper.rs": {
+       "_comment": "1 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp (levels [0]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp"
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp"
        ],
        "members": {
         "functions": [
-         "e001_matchAndRewrite"
+         "e089_getMaskValueForPT"
         ],
         "types": [],
         "callbacks": [],
@@ -915,18 +1130,32 @@
         "globals": []
        }
       },
-      "src/bridges/dataflow_ir_to_sentient/std_scf_to_sentient.rs": {
-       "_comment": "4 unit(s) from dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp (levels [0, 2]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/vc_loop_mask_tree.rs": {
+       "_comment": "17 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp (levels [0, 1, 2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp"
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp",
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp"
        ],
        "members": {
         "functions": [
-         "e045_getSentientCmpIPredicate",
-         "e046_ConversionPattern",
-         "e047_runOnOperation",
-         "e225_matchAndRewrite"
+         "e077_walk",
+         "e078_findNodeFromOp",
+         "e079_OperationNode",
+         "e080_LoopMaskNode",
+         "e081_getParentNode",
+         "e082_getFirstChild",
+         "e083_getNextSibling",
+         "e084_getPrevSibling",
+         "e085_getLastChild",
+         "e086_MaskNode",
+         "e087_LMTLoopNode",
+         "e088_getRoot",
+         "e171_isMaskEquivalentToNode",
+         "e236_addMaskNode",
+         "e237_updateNode",
+         "e238_computeLoops",
+         "e281_OperationTreeBase"
         ],
         "types": [],
         "callbacks": [],
@@ -934,26 +1163,17 @@
         "globals": []
        }
       },
-      "src/bridges/dataflow_ir_to_sentient/std_standard_to_sentient.rs": {
-       "_comment": "12 unit(s) from dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp (levels [0, 6, 7, 8]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/vc_lowering_pt_masks.rs": {
+       "_comment": "3 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp (levels [2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp"
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp"
        ],
        "members": {
         "functions": [
-         "e048_getSentientCmpIPredicate",
-         "e049_LowerAddIOpToSentient",
-         "e050_LowerSubIOpToSentient",
-         "e051_LowerMulIOpToSentient",
-         "e052_If",
-         "e053_LowerConstantIndexToSentient",
-         "e054_LowerConstantIntToSentient",
-         "e338_ConstructIFRecursively",
-         "e339_SimplifyOrIOp",
-         "e362_LowerSelectOpToSentient",
-         "e363_LowerLogicalOpToSentient",
-         "e376_runOnOperation"
+         "e239_insertPTMaskOps",
+         "e282_updateLoopMaskTreeForConstantMask",
+         "e283_updateLoopMaskTreeForDynamicMask"
         ],
         "types": [],
         "callbacks": [],
@@ -961,17 +1181,183 @@
         "globals": []
        }
       },
-      "src/bridges/dataflow_ir_to_sentient/std_symbol_to_sentient.rs": {
-       "_comment": "3 unit(s) from dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp (levels [2, 3, 4]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+      "src/bridges/dataflow_ir_to_sentient/vc_lowering_xrf.rs": {
+       "_comment": "14 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp (levels [0, 1, 2, 6, 7]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
        "tu": "crustify-bridge2/source/bridge2.cpp",
        "headers": [
-        "dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp"
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp"
        ],
        "members": {
         "functions": [
-         "e226_createIfOpFromMapping",
-         "e275_LowerSymbolQueryMap",
-         "e303_runOnOperation"
+         "e090_getXrfValue",
+         "e091_getForOpBound",
+         "e092_setSentientMacXrfRegIncrAttr",
+         "e093_replaceAndEraseDummyMacOps",
+         "e172_areXrfAccessesLegal",
+         "e173_insertConstAndAddOps",
+         "e174_isXrfRelated",
+         "e175_updateYieldArgs",
+         "e240_getLayoutExpr",
+         "e241_createForOpWithReturnValue",
+         "e242_createIfOpWithReturnValue",
+         "e243_insertDummyMacOp",
+         "e345_processXrfPtrPerUnit",
+         "e367_createXrfIndexModifOps"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/dataflow_ir_to_sentient/vc_operand_reuse.rs": {
+       "_comment": "7 unit(s) from dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp (levels [0, 1, 2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge2/source/bridge2.cpp",
+       "headers": [
+        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp",
+        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp"
+       ],
+       "members": {
+        "functions": [
+         "e055_getId",
+         "e056_getAbsorbtionFlag",
+         "e057_setReuseFlag",
+         "e058_dominates",
+         "e162_insertIfNotExists",
+         "e227_OperandReuse",
+         "e276_setReuseInformation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/dataflow_ir_to_sentient/vc_splat.rs": {
+       "_comment": "2 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp (levels [2, 3]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge2/source/bridge2.cpp",
+       "headers": [
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e235_createSentientConstants",
+         "e279_createSplatOperation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/dataflow_ir_to_sentient/vc_vector_chain_helper.rs": {
+       "_comment": "23 unit(s) from dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp (levels [0, 1, 2, 3, 6]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge2/source/bridge2.cpp",
+       "headers": [
+        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp",
+        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp"
+       ],
+       "members": {
+        "functions": [
+         "e059_isSentientBinaryLogicalOp",
+         "e060_getInputPrecisionFromOperand",
+         "e061_getResultPrecisionFromOperands",
+         "e062_getComputePrecisionOfOp",
+         "e063_hasConstantBounds",
+         "e064_size",
+         "e065_fuseCompareAndSelectIntoMinOrMax",
+         "e066_resetSentientFMAsIfExists",
+         "e067_redefineConstantVectors",
+         "e068_getVectorBinaryToSentientBinary",
+         "e069_getVectorElementWiseCompareOperatorToSentientBinaryOperator",
+         "e070_getVectorTernaryToSentientTernary",
+         "e163_getMaskValueConstantForNonPT",
+         "e164_checkValidityOfPackAndShuffleLowering",
+         "e165_getMergeTypeFromIndices",
+         "e228_validateLoweringAndSetMissingParameters",
+         "e229_getMaskValueForNonPT",
+         "e230_convertStringToType",
+         "e231_convertTypeToString",
+         "e277_getGCVTorFCVTTypeFromIndicesAndCastInputs",
+         "e340_analyzeAndFillOperandForwarding",
+         "e341_analyzeNonComputeOpsForFusion",
+         "e342_analyzeAndFillResultForwarding"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/dataflow_ir_to_sentient/vc_vector_chain_to_sentient_pesfp.rs": {
+       "_comment": "8 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp (levels [0, 3, 6, 7, 8]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge2/source/bridge2.cpp",
+       "headers": [
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e076_fuseComputeOps",
+         "e280_cleanup",
+         "e344_lowerDanglingNonComputeOpsPESFP",
+         "e364_patternAgnosticFuseNonComputeOpsHelper",
+         "e365_fillOpInfo",
+         "e366_fuseNonComputeOps",
+         "e377_matchAndRewrite",
+         "e378_runOnOperation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/dataflow_ir_to_sentient/vc_vector_chain_to_sentient_pt.rs": {
+       "_comment": "5 unit(s) from dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp (levels [0, 6, 7, 8]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge2/source/bridge2.cpp",
+       "headers": [
+        "dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp"
+       ],
+       "members": {
+        "functions": [
+         "e094_computeUnitPrecision",
+         "e346_lowerDanglingNonComputeOps",
+         "e368_fuseNonComputeOps",
+         "e369_fuseComputeOps",
+         "e379_runOnOperation"
+        ],
+        "types": [],
+        "callbacks": [],
+        "macros": [],
+        "globals": []
+       }
+      },
+      "src/bridges/dataflow_ir_to_sentient/vc_vector_operands.rs": {
+       "_comment": "17 unit(s) from dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp (levels [0, 1, 2, 3, 4, 5, 6]). Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
+       "tu": "crustify-bridge2/source/bridge2.cpp",
+       "headers": [
+        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp",
+        "dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp"
+       ],
+       "members": {
+        "functions": [
+         "e071_getOperandFromReceiveOp",
+         "e072_getOperandFromSendOp",
+         "e073_constValToField",
+         "e074_sameBlock",
+         "e075_eraseOp",
+         "e166_getOperandFromConstantOp",
+         "e167_getOperandFromConstantBitstreamOp",
+         "e168_getOperandFromNegOp",
+         "e169_getName",
+         "e170_getLayoutMapAndIndices",
+         "e232_getOperandFromLoadOrStoreOp",
+         "e233_eraseOperands",
+         "e234_setValue",
+         "e278_getOperandFromShuffleOp",
+         "e304_getOperandWithPrecision",
+         "e320_getOperand",
+         "e343_getOperandFromCastOp"
         ],
         "types": [],
         "callbacks": [],

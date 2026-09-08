@@ -106,11 +106,19 @@ stage() { # $1 wave json (relative to $CAMP)  $2 objective  $3 tag
   if [ ! -f "$f" ]; then say "STAGE $3 SKIPPED ($1 does not exist)"; return 0; fi
   n=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" "$f" 2>/dev/null || echo 1)
   if [ "$n" = "0" ]; then say "STAGE $3 SKIPPED (0 units left in $1)"; return 0; fi
-  # a review stage whose sub-campaign still has open ports would review half-finished work
-  if [ "$2" = "review" ] && [ -f "$(dirname "$f")/port-remainder.json" ]; then
-    left=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" \
-           "$(dirname "$f")/port-remainder.json" 2>/dev/null || echo 0)
-    if [ "$left" != "0" ]; then say "STAGE $3 SKIPPED ($left units still unported in this sub-campaign)"; return 0; fi
+  # ⭐ 6. A REVIEW STAGE IS NOT A REMAINDER, so nothing in the schedule shrinks when it finishes and
+  # a restart would re-review every unit — a bridge-2 restart started 9 agents re-reviewing 142 done
+  # functions. A done-marker beside the schedule is what makes the skip possible at all.
+  if [ "$2" = "review" ]; then
+    if [ -f "$(dirname "$f")/.reviewed" ]; then
+      say "STAGE $3 SKIPPED (already reviewed: $(cat "$(dirname "$f")/.reviewed"))"; return 0
+    fi
+    # reviewing a sub-campaign that still has open ports would review half-finished work
+    if [ -f "$(dirname "$f")/port-remainder.json" ]; then
+      left=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" \
+             "$(dirname "$f")/port-remainder.json" 2>/dev/null || echo 0)
+      if [ "$left" != "0" ]; then say "STAGE $3 SKIPPED ($left units still unported in this sub-campaign)"; return 0; fi
+    fi
   fi
   disk
   local rc=1
@@ -135,6 +143,10 @@ stage() { # $1 wave json (relative to $CAMP)  $2 objective  $3 tag
   say "STAGE $3 exit=$rc"
   grep -E '^\[crustify\] [0-9]+ failure' "$LOGDIR/driver-$3.log" >> "$TRACE" 2>/dev/null
   promote "$LOGDIR/driver-$3.log"
+  if [ "$2" = "review" ] && [ $rc -eq 0 ]; then
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$(dirname "$f")/.reviewed"
+    say "STAGE $3 marked reviewed"
+  fi
   count
   prune
 }
