@@ -175,8 +175,11 @@
 
 use crate::arch::Sticks;
 use crate::formats::DataFormat;
+use crate::schedule::dsc2::{AllocateNode, ComputeNode, DataInfo};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::hash::{Hash, Hasher};
+use sys_arch_spec::arch_enums::SenComponent;
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // THE LAYOUT VOCABULARY THESE UNITS ACT ON — `shuffle.h:26-110`, `shuffle.cpp:19-122`.
@@ -213,6 +216,18 @@ impl DimSymbol {
     #[must_use]
     pub const fn id(self) -> i32 {
         self.0
+    }
+
+    /// Replaces: e162_getDefaultSymbols
+    ///
+    /// `n` FRESH SYMBOLS, `1..=n` (`shuffle.h:48`) — unique within the run and, as the reference's
+    /// own comment says, free to collide with symbols minted by any other call.
+    ///
+    /// ⛔ NONE OF THEM IS THE DUMMY, and `n <= 0` mints none: the loop starts at 1, so a caller
+    /// wanting a vacant slot asks [`Self::DUMMY`] for it (`shuffle_standalone.cpp:74`).
+    #[must_use]
+    pub fn default_symbols(n: i32) -> Vec<Self> {
+        (1..=n).map(Self).collect()
     }
 }
 
@@ -305,7 +320,30 @@ impl SliceDim {
 ///
 /// ⛔ FIELD ORDER IS LOAD-BEARING: `operator<` compares format, then stick dims, then slice dims
 /// (`shuffle.h:105-109`), and that is what the derived `Ord` reproduces.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A LAYOUT WITH ITS STICK DIMENSIONS ORDERED — `ConcreteLayout` (`shuffle.h:70`), which is what
+/// `inferLayouts` (e270) states and what the codegen walk numbers its sticks from.
+///
+/// ⛔ THE STICK ORDER IS THE WHOLE DIFFERENCE FROM [`AbstractLayout`]: `make_stick_number_key` gives
+/// position `i` bit `i`, so a concrete layout says WHICH stick an index denotes, where the
+/// abstraction says only which dimensions are taken across sticks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConcreteLayout {
+    /// `stick_dims` — the numbering order.
+    pub stick_dims: Vec<DimSymbol>,
+    /// `slice_dims`, ordered by significance.
+    pub slice_dims: Vec<DimSymbol>,
+}
+
+impl ConcreteLayout {
+    /// `int_pow2(stick_dims.size())` (`shuffle.cpp:105`) — the stick count `codegen_generic`
+    /// `DT_CHECK`s its input edge list against (`shuffle.cpp:929-930`).
+    #[must_use]
+    pub fn num_sticks(&self) -> Sticks {
+        Sticks(1u64 << self.stick_dims.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AbstractLayout {
     /// The element format the sticks are in.
     pub format: DataFormat,
@@ -353,6 +391,57 @@ impl AbstractLayout {
     #[must_use]
     pub fn contains(&self, dim: DimSymbol) -> bool {
         self.stick_dims.contains(&dim) || self.slice_dims.contains(&dim)
+    }
+
+    /// `std::hash<AbstractLayout>::operator()` (`shuffle.h:135`) — FNV-1a over the stick symbols in
+    /// set order and then the six slice symbols, a byte of each `int` at a time, low byte first.
+    ///
+    /// ⛔ THE FORMAT IS NOT IN IT, while `operator==` compares it (`shuffle.h:101`), so two layouts
+    /// differing only in format hash equal. Carried as the reference has it: a collision is legal
+    /// for a hash, and adding the format would move every layout to a different bucket.
+    /// ⛔ AND IT HAS NO USER IN THIS REVISION — `layout_to_nodes` is a `std::map` and the only
+    /// unordered container in the file is keyed on [`DimSymbol`] (`shuffle.cpp:732`).
+    #[must_use]
+    pub fn fnv1a(&self) -> usize {
+        /// `const uint64_t offset` (`shuffle.h:139`).
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        /// `const uint64_t prime` (`shuffle.h:140`).
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET;
+        for symbol in self.stick_dims.iter().chain(&self.slice_dims) {
+            // `hash_int` — FNV-1a wants bytes, so each symbol goes in a byte at a time.
+            for byte in symbol.0.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        narrow_to_usize(hash)
+    }
+}
+
+/// Replaces: e163_constexpr
+///
+/// FOLDS THE 64-BIT FNV RESULT INTO A `size_t` (`shuffle.h:160`): on a narrow host the high half is
+/// xored down first so the whole hash's entropy survives the truncation, and on a wide one the value
+/// passes through.
+///
+/// ⭐ STILL A COMPILE-TIME CHOICE — `size_of` is const exactly as `sizeof` is, so one arm folds away
+/// rather than being tested per hash.
+const fn narrow_to_usize(hash: u64) -> usize {
+    if size_of::<usize>() < size_of::<u64>() {
+        (hash ^ (hash >> 32)) as usize
+    } else {
+        hash as usize
+    }
+}
+
+/// `std::hash<AbstractLayout>` (`shuffle.h:135`) as Rust states it. The C++ RETURNS the `size_t`;
+/// Rust feeds a hasher, so [`AbstractLayout::fnv1a`] is written whole and there is one definition of
+/// the layout hash rather than two.
+impl Hash for AbstractLayout {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_usize(self.fnv1a());
     }
 }
 
@@ -423,6 +512,10 @@ pub struct ComputationOp {
     pub output: StickIndex,
     /// Whether the op reads one stick more than once (`unary_op`, `shuffle.cpp:163`).
     pub reuses_sticks: bool,
+    /// `codegen_psuedocode`, the `std::function` (`shuffle.h:213`), AS DATA: both setters emit ONE
+    /// `packmerge` line from an index table and differ only in whether the second input register is
+    /// the first one again (`shuffle.cpp:147-153`, `:169-175`). Absent until e264/e265 set it.
+    pub packmerge_indices: Option<Vec<ShuffleIndex>>,
 }
 
 /// Replaces: e137_int_log2
@@ -550,6 +643,25 @@ impl ComputationOp {
                 high_copy.output.insert(dim, Half::High);
                 append_to.push(high_copy);
             }
+        }
+    }
+
+    /// `op.codegen_psuedocode(in_reg_names, out_reg_name)` (`shuffle.h:213`) — the one `packmerge`
+    /// line this op's table writes, and nothing at all for an op that has no table yet.
+    ///
+    /// ⛔ THE SECOND REGISTER IS THE FIRST ONE AGAIN for a one-input op, which is `unary_op`'s own
+    /// `insert_packmerge(input[0], input[0], ..)` (`shuffle.cpp:174`): the reference's two arity
+    /// `DT_CHECK`s ARE that choice, so neither is a stop here.
+    #[must_use]
+    pub fn codegen_psuedocode(&self, in_regs: &[PseudoReg], out_reg: &PseudoReg) -> Vec<String> {
+        match (&self.packmerge_indices, in_regs) {
+            (Some(indices), [first, rest @ ..]) => vec![packmerge_psuedostring(
+                indices,
+                first,
+                rest.first().unwrap_or(first),
+                out_reg,
+            )],
+            _ => vec![],
         }
     }
 }
@@ -1338,29 +1450,228 @@ pub fn all_one(stick_repl: &[StickRepl]) -> bool {
     stick_repl.iter().all(|repl| repl.0 == 1)
 }
 
-// crustify:todo: e161_codegen_psuedocode
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1224  (42 body lines, level 0)
-//   class     : AutoShuffler
-//   original  : std::vector<std::string> AutoShuffler::codegen_psuedocode( const ConcreteLayout& input, const ConcreteLayout& output, const std::vector<std::shared_ptr<GraphNode>>& shuffle)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3055-3099
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// THE CODEGEN WALK AND ITS PSEUDOCODE INSTANTIATION — `shuffle.cpp:910-1040`, `:1224-1266`.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 
-// crustify:todo: e162_getDefaultSymbols
-//   authority : ddc/transformations/automatic_shuffle/shuffle.h:48  (8 body lines, level 0)
-//   class     : DimSymbol
-//   original  : static std::vector<DimSymbol> getDefaultSymbols(int n)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3109-3117
+/// WHICH STICK EACH OPERAND OF ONE COMPUTATION IS — `do_op_codegen`'s `input_output_stick_id`, a
+/// `std::pair<std::vector<int>, int>` (`shuffle.cpp:1003`) whose ints are the keys
+/// [`StickNumberKey::key`] hands back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickIds {
+    /// `.first`, one per input in the op's own input order.
+    pub inputs: Vec<StickNumber>,
+    /// `.second`.
+    pub output: StickNumber,
+}
 
-// crustify:todo: e163_constexpr
-//   authority : ddc/transformations/automatic_shuffle/shuffle.h:160  (3 body lines, level 0)
-//   class     : std
-//   original  : if constexpr (sizeof(size_t) < sizeof(uint64_t))
-//   extract   : crustify-ddc/cpp/ddc.cpp:3127-3130
+/// THE TWO `std::function`s THE WALK IS DRIVEN BY, WITH ITS `EdgeType` — `codegen_generic`'s last
+/// two parameters as one implementable thing (`shuffle.cpp:914-920`). [`Pseudocode`] is the
+/// `std::string` instantiation; e371 `replace_assign` is the [`DataEdge`] one.
+pub trait ShuffleCodegen {
+    /// `EdgeType`.
+    type Edge;
 
-// crustify:todo: e164_insert_before
-//   authority : ddc/transformations/automatic_shuffle/shuffle.h:175  (7 body lines, level 0)
-//   class     : DataEdge
-//   original  : void insert_before(dsc2::BlockNode* parent, dsc2::ScheduleNode* insert_point)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3140-3148
+    /// `get_edges_for_node(node)` — the edges this node's output sticks are written to.
+    ///
+    /// ⭐ THE LAYOUT, NOT THE NODE: both instantiations read `node->layout` and nothing else of it
+    /// (`shuffle.cpp:825`, `:1244`), so the hook does not need the node handle.
+    fn edges_for_node(&mut self, layout: &AbstractLayout) -> Vec<Self::Edge>;
+
+    /// `do_op_codegen(op, inputs, output, input_output_stick_id, output_added)`.
+    fn op_codegen(
+        &mut self,
+        op: &ComputationOp,
+        inputs: &[Self::Edge],
+        output: &mut Self::Edge,
+        sticks: &StickIds,
+        output_added: bool,
+    );
+}
+
+/// THE CODEGEN WALK — `AutoShuffler::codegen_generic<EdgeType>` (`shuffle.cpp:910`), which is
+/// `e342_codegen_generic`, LEVEL 3 and not this batch, so it is NAMED here rather than called.
+///
+/// ⭐ A TRAIT BECAUSE THE REFERENCE'S IS A MEMBER TEMPLATE: e342 lands as `impl CodegenGeneric for
+/// AutoShuffler` with `Node = GraphNodeId`, and [`Self::codegen_psuedocode`] — e161, one of the
+/// template's two instantiations — becomes a method on the shuffler with no signature change.
+pub trait CodegenGeneric {
+    /// An element of `shuffle` — the reference's `std::shared_ptr<GraphNode>`, which is
+    /// [`GraphNodeId`] now that the nodes live in [`AutoShuffler`]'s arena.
+    type Node;
+
+    /// `codegen_generic(input_layout, output_layout, shuffle, input_edges, get_edges_for_node,
+    /// do_op_codegen)`.
+    fn codegen_generic<C: ShuffleCodegen>(
+        &mut self,
+        input_layout: &ConcreteLayout,
+        output_layout: &ConcreteLayout,
+        shuffle: &[Self::Node],
+        input_edges: &[C::Edge],
+        codegen: &mut C,
+    );
+
+    /// Replaces: e161_codegen_psuedocode
+    ///
+    /// THE PSEUDOCODE INSTANTIATION OF THE WALK (`shuffle.cpp:1224`): one register per input stick,
+    /// then the walk drives [`Pseudocode`], whose hooks mint each node's registers and collect each
+    /// op's own line.
+    ///
+    /// ⛔ ONE COUNTER FOR ALL OF IT — both lambdas capture `reg_id` BY REFERENCE, so a node's
+    /// registers continue the input registers' numbering instead of restarting at `r0`.
+    fn codegen_psuedocode(
+        &mut self,
+        input: &ConcreteLayout,
+        output: &ConcreteLayout,
+        shuffle: &[Self::Node],
+    ) -> Vec<String> {
+        let mut codegen = Pseudocode::default();
+        let input_regs: Vec<PseudoReg> = (0..input.num_sticks().0)
+            .map(|_| codegen.regs.new_reg_name())
+            .collect();
+        self.codegen_generic(input, output, shuffle, &input_regs, &mut codegen);
+        codegen.code_lines
+    }
+}
+
+/// `codegen_psuedocode`'s `reg_id` — the counter its `get_new_reg_name` lambda captures by reference
+/// (`shuffle.cpp:1228`).
+#[derive(Debug, Default)]
+struct RegNamer(u32);
+
+impl RegNamer {
+    /// `get_new_reg_name()` — `"r" << reg_id`, then `reg_id++`.
+    fn new_reg_name(&mut self) -> PseudoReg {
+        let name = PseudoReg(format!("r{}", self.0));
+        self.0 += 1;
+        name
+    }
+}
+
+/// `create_node_allocations` AND `do_codegen` AS ONE VALUE — they share the register counter and the
+/// line list, which is exactly why the reference captures both by reference (`shuffle.cpp:1240`,
+/// `:1254`).
+#[derive(Debug, Default)]
+struct Pseudocode {
+    /// the shared `reg_id`.
+    regs: RegNamer,
+    /// `code_lines`.
+    code_lines: Vec<String>,
+}
+
+impl ShuffleCodegen for Pseudocode {
+    type Edge = PseudoReg;
+
+    fn edges_for_node(&mut self, layout: &AbstractLayout) -> Vec<PseudoReg> {
+        let mut regs: Vec<PseudoReg> = (0..layout.num_sticks().0)
+            .map(|_| self.regs.new_reg_name())
+            .collect();
+        // "Codegen pulls in order from the back. Register names are interchangeable for psuedocode,
+        // but this order is easier to read." (`shuffle.cpp:1247-1248`)
+        regs.reverse();
+        regs
+    }
+
+    fn op_codegen(
+        &mut self,
+        op: &ComputationOp,
+        inputs: &[PseudoReg],
+        output: &mut PseudoReg,
+        _sticks: &StickIds,
+        _output_added: bool,
+    ) {
+        // ⛔ THE STICK IDS AND `output_reg_added` ARE THE OTHER INSTANTIATION'S: `do_codegen`
+        // (`shuffle.cpp:1254`) takes both and reads neither — they carry the element offsets
+        // `replace_assign` writes into its data edges (`shuffle.cpp:869-895`).
+        self.code_lines
+            .extend(op.codegen_psuedocode(inputs, output));
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// THE DATA EDGE — `DataEdge` (`shuffle.h:171`), the real codegen's `EdgeType`.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// WHERE A NODE SITS IN A BLOCK'S CHILD LIST — one `BlockNode::addChildNode` call's contribution to
+/// `next_` (`dsc/dsc2.cpp:2013`): the node itself, plus the nodes later inserted immediately BEFORE
+/// it, in insertion order.
+///
+/// ⛔ THE PARENT IS NOT A PARAMETER, AND THAT IS THE POINT. `addChildNode` scans `parent->next_` for
+/// the sibling pointer and `DT_ERROR`s when it is absent (`dsc2.cpp:2022`), so giving the insertion
+/// point custody of what precedes it makes "Sibling reference node not found in parent node"
+/// unspellable — and the flattened child order is the reference's, since `insert_packmerge`
+/// (`ddc/ddc_transformation.cpp:1992`) adds the packmerge before `assign` and then the allocate
+/// before the packmerge.
+/// ⭐ A COMPUTE NODE BECAUSE THAT IS THE ONLY INSERT POINT THE REFERENCE HAS: the freshly minted
+/// packmerge. A fuller `BlockNode` belongs with the tree-construction units in `schedule/dsc2.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertPoint {
+    node: ComputeNode,
+    before: Vec<AllocateNode>,
+}
+
+impl InsertPoint {
+    /// The node as `addChildNode` placed it, with nothing before it yet.
+    #[must_use]
+    pub const fn new(node: ComputeNode) -> Self {
+        Self {
+            node,
+            before: Vec::new(),
+        }
+    }
+
+    /// `insert_point` itself.
+    #[must_use]
+    pub const fn node(&self) -> &ComputeNode {
+        &self.node
+    }
+
+    /// The allocate nodes sitting immediately before it, in the order they were inserted.
+    pub fn preceding(&self) -> impl Iterator<Item = &AllocateNode> {
+        self.before.iter()
+    }
+}
+
+/// AN EDGE BETWEEN TWO STICK COMPUTATIONS — `DataEdge` (`shuffle.h:171`): which data, on which
+/// component, and the allocate node that backs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataEdge {
+    /// `dinfo`.
+    pub dinfo: DataInfo,
+    /// `component`.
+    pub component: SenComponent,
+    /// `allocation`.
+    ///
+    /// ⛔ ONE `Option` FOR THE REFERENCE'S TWO LEVELS: `std::optional<AllocateNode*>` is checked as
+    /// `has_value() && value() != nullptr` (`shuffle.h:177`) because "absent" and "present and null"
+    /// are both spellable there. Here [`None`] is both.
+    pub allocation: Option<AllocateNode>,
+    /// `alloc_added`.
+    ///
+    /// ⛔ NOT DERIVABLE FROM `allocation`, WHICH IS WHY IT IS A SEPARATE BIT: it means "already in
+    /// the tree, possibly put there by someone else", and `replace_assign` flips it both ways from
+    /// the already-added list and `getPrev()` (`shuffle.cpp:863-868`).
+    pub alloc_added: bool,
+}
+
+impl DataEdge {
+    /// Replaces: e164_insert_before
+    ///
+    /// PUTS MY ALLOCATE NODE IMMEDIATELY BEFORE `insert_point`, ONCE — `shuffle.h:175`. A no-op for
+    /// an edge with no allocation, or one whose allocation is already in the tree.
+    ///
+    /// ⛔ THE LATCH IS NOT A MOVE: the allocation stays readable afterwards, because
+    /// `insert_packmerge` reads it again for the next computation
+    /// (`ddc/ddc_transformation.cpp:1982`) and the edge is copied per stick (`shuffle.cpp:821`).
+    pub fn insert_before(&mut self, insert_point: &mut InsertPoint) {
+        if let Some(allocation) = self.allocation.as_ref() {
+            if !self.alloc_added {
+                insert_point.before.push(allocation.clone());
+                self.alloc_added = true;
+            }
+        }
+    }
+}
 
 // crustify:todo: e264_bin_op
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:137  (19 body lines, level 1)
@@ -1561,7 +1872,7 @@ mod tests_e137_e144 {
     /// true` a derived `Default` would get backwards.
     #[test]
     fn swap_exchanges_the_two_slots() {
-        let mut buffer: SwapBuffer<u8> = SwapBuffer::default();
+        let buffer: SwapBuffer<u8> = SwapBuffer::default();
         assert_eq!((*buffer.first(), *buffer.second()), (0, 0));
 
         let mut buffer = SwapBuffer::new("a", "b");
@@ -1597,6 +1908,7 @@ mod tests_e137_e144 {
             inputs: vec![[(A, Half::Low)].into_iter().collect::<StickIndex>()],
             output: StickIndex::new(),
             reuses_sticks: false,
+            packmerge_indices: None,
         };
         let mut appended = Vec::new();
         op.repeat_over_dims(&[A, B], &mut appended);
@@ -1614,6 +1926,7 @@ mod tests_e137_e144 {
             inputs: vec![[(A, Half::Low)].into_iter().collect::<StickIndex>()],
             output: [(B, Half::High)].into_iter().collect::<StickIndex>(),
             reuses_sticks: false,
+            packmerge_indices: None,
         };
         let mut appended = Vec::new();
         with_output.repeat_over_dims(&[B], &mut appended);
@@ -1884,9 +2197,8 @@ mod tests_e145_e152 {
 #[cfg(test)]
 mod tests_e153_e160 {
     use super::{
-        AbstractLayout, AutoShuffler, DIMS_PER_SLICE, DimSymbol, GCVTF16F8MergeAction,
-        GCVTF16F8PackAction, Half, ShuffleCost, SliceDim, StickIndex, StickNumber, StickRepl,
-        all_one, make_stick_number_key,
+        AbstractLayout, AutoShuffler, DimSymbol, GCVTF16F8MergeAction, GCVTF16F8PackAction, Half,
+        ShuffleCost, SliceDim, StickIndex, StickNumber, StickRepl, all_one, make_stick_number_key,
     };
     use crate::formats::DataFormat;
     use std::collections::BTreeSet;
@@ -2094,5 +2406,156 @@ mod tests_e153_e160 {
             shuffler.pop_worklist().map(|entry| entry.node),
             Some(unreached)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e161_e164 {
+    use super::{
+        AbstractLayout, CodegenGeneric, ComputationOp, ConcreteLayout, DIMS_PER_SLICE, DataEdge,
+        DimSymbol, InsertPoint, ShuffleCodegen, ShuffleIndex, StickIds, StickIndex, StickNumber,
+        narrow_to_usize,
+    };
+    use crate::formats::DataFormat;
+    use crate::generated::ComputeType;
+    use crate::schedule::dsc2::{AllocateNode, ComputeNode, DataInfo, NodeName};
+    use std::collections::BTreeSet;
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    /// Symbols 1, 2, 3 — `getDefaultSymbol()` and its successors.
+    const A: DimSymbol = DimSymbol::DEFAULT;
+    const B: DimSymbol = A.next();
+    const C: DimSymbol = B.next();
+    const DUMMY: DimSymbol = DimSymbol::DUMMY;
+
+    /// A stand-in for `e342_codegen_generic` (`shuffle.cpp:910`, level 3, NOT this batch): visits
+    /// each node once and drives one `packmerge` op into the node's first edge.
+    struct StubWalk;
+
+    impl CodegenGeneric for StubWalk {
+        type Node = AbstractLayout;
+
+        fn codegen_generic<C: ShuffleCodegen>(
+            &mut self,
+            _input_layout: &ConcreteLayout,
+            _output_layout: &ConcreteLayout,
+            shuffle: &[AbstractLayout],
+            input_edges: &[C::Edge],
+            codegen: &mut C,
+        ) {
+            let op = ComputationOp {
+                inputs: Vec::new(),
+                output: StickIndex::new(),
+                reuses_sticks: false,
+                packmerge_indices: Some(vec![ShuffleIndex(0), ShuffleIndex(16)]),
+            };
+            for node in shuffle {
+                let mut edges = codegen.edges_for_node(node);
+                codegen.op_codegen(
+                    &op,
+                    input_edges,
+                    &mut edges[0],
+                    &StickIds {
+                        inputs: Vec::new(),
+                        output: StickNumber(0),
+                    },
+                    false,
+                );
+            }
+        }
+    }
+
+    /// e162: `1..=n`, so none of them is the dummy, and a non-positive `n` mints none.
+    #[test]
+    fn default_symbols_are_one_through_n_and_never_dummy() {
+        let three = DimSymbol::default_symbols(3);
+        assert_eq!(three, vec![A, B, C]);
+        assert!(!three.iter().any(|symbol| symbol.is_dummy()));
+        assert_eq!(DimSymbol::default_symbols(0), vec![]);
+        assert_eq!(DimSymbol::default_symbols(-4), vec![]);
+    }
+
+    /// e163: the FNV walk against a value derived outside this crate, and the fold — on a narrow host
+    /// a hash whose whole payload is in the high half must not truncate to zero.
+    #[test]
+    fn the_layout_hash_is_fnv1a_over_its_symbols_narrowed_to_usize() {
+        let layout = AbstractLayout::new(
+            [A, B].into_iter().collect::<BTreeSet<_>>(),
+            [C, DUMMY, DUMMY, DUMMY, DUMMY, DUMMY],
+            DataFormat::Senint8,
+        );
+        assert_eq!(layout.fnv1a(), narrow_to_usize(0x8e03_bd9a_478e_c4a5));
+        assert_ne!(narrow_to_usize(0xffff_ffff_0000_0000), 0);
+    }
+
+    /// e161: one register counter across both lambdas, and a node's registers handed out from the
+    /// back — one input stick dimension mints `r0`/`r1`, then a 2-dimension node mints `r2..r5` and
+    /// yields `r5` first.
+    #[test]
+    fn pseudocode_shares_one_register_counter_and_reverses_node_registers() {
+        let input = ConcreteLayout {
+            stick_dims: vec![A],
+            slice_dims: vec![B],
+        };
+        let output = ConcreteLayout {
+            stick_dims: vec![B],
+            slice_dims: vec![A],
+        };
+        let node = AbstractLayout::new(
+            [A, B].into_iter().collect::<BTreeSet<_>>(),
+            [DUMMY; DIMS_PER_SLICE],
+            DataFormat::Senint8,
+        );
+
+        let lines = StubWalk.codegen_psuedocode(&input, &output, &[node]);
+
+        assert_eq!(lines, vec!["r5 = packmerge r0 r1 [ 0 16 ]".to_owned()]);
+    }
+
+    /// e164: the allocation lands before the insert point exactly once, and an edge with none — or
+    /// one already in the tree — inserts nothing.
+    #[test]
+    fn insert_before_adds_the_allocation_once() {
+        let allocation = AllocateNode {
+            name: NodeName("alloc".to_owned()),
+            component: SenComponent::Ptrow0,
+            lds: None,
+        };
+        let mut point = InsertPoint::new(ComputeNode {
+            name: NodeName("packmerge".to_owned()),
+            op: ComputeType::Packmerge,
+            ex_unit: SenComponent::Ptrow0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        let mut edge = DataEdge {
+            dinfo: DataInfo::default(),
+            component: SenComponent::Ptrow0,
+            allocation: Some(allocation.clone()),
+            alloc_added: false,
+        };
+
+        edge.insert_before(&mut point);
+        edge.insert_before(&mut point);
+        assert_eq!(point.preceding().collect::<Vec<_>>(), vec![&allocation]);
+        assert!(edge.alloc_added);
+        assert_eq!(
+            edge.allocation.as_ref(),
+            Some(&allocation),
+            "still readable"
+        );
+
+        let mut nothing_to_add = DataEdge {
+            allocation: None,
+            ..edge.clone()
+        };
+        let mut already_there = DataEdge {
+            alloc_added: true,
+            ..edge.clone()
+        };
+        nothing_to_add.insert_before(&mut point);
+        already_there.insert_before(&mut point);
+        assert_eq!(point.preceding().count(), 1);
+        assert_eq!(point.node().name, NodeName("packmerge".to_owned()));
     }
 }
