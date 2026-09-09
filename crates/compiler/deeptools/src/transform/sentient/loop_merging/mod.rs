@@ -82,14 +82,82 @@
 //! | `e601_runOn` | 601 | 5 | 13 | `dcc/src/Transform/Sentient/LoopMerging.cpp:321` |
 //! | `e627_runOnOperation` | 627 | 6 | 5 | `dcc/src/Transform/Sentient/LoopMerging.cpp:335` |
 
+use crate::islands::sentient::dialects::{Op, dataflow, sentient, symbol, uniform};
 
-// crustify:todo: e075_getNextEligibleOp
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:63  (11 body lines, level 0)
-//   original  : static Operation *getNextEligibleOp(Operation *op)
+/// WHERE AN OP SITS IN ITS BLOCK — the `Operation *` identity `loopsAreMergeable` compares against
+/// the second loop (`:84`).
+///
+/// ⛔ A POSITION AND NOT A BORROW, because `getNextEligibleOp`'s answer is used for IDENTITY
+/// (`getNextEligibleOp(loop_a) != loop_b`), and this island's ops are a tree with no addresses to
+/// compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InBlock(pub usize);
 
-// crustify:todo: e076_getNewDbgName
-//   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:75  (6 body lines, level 0)
-//   original  : StringAttr LoopMergingPass::getNewDbgName(sentient::ForOp for_op1, sentient::ForOp for_op2)
+/// THE FIVE OPS MERGING STEPS OVER — `dataflow.get_unit`, `sentient.scalar_constant`,
+/// `symbol.create_symbol`, `uniform.def_immutable_mapping` and `uniform.query_map` (`:66-69`).
+///
+/// ⛔ IT IS `uniform.query_map`, NOT `symbol.query_map`: the symbol dialect declares one of the same
+/// name and the reference names the uniform one, so a symbol query between two loops keeps them
+/// apart.
+fn skipped_between_loops(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Dataflow(dataflow::Op::GetUnit { .. })
+            | Op::Sentient(sentient::Op::ScalarConstant { .. })
+            | Op::Symbol(symbol::Op::CreateSymbol { .. })
+            | Op::Uniform(uniform::Op::DefImmutableMapping { .. } | uniform::Op::QueryMap { .. })
+    )
+}
+
+/// Replaces: e075_getNextEligibleOp
+///
+/// The next op after `op` in its own block, walking past the bookkeeping ops of
+/// [`skipped_between_loops`].
+///
+/// ⛔ TRAP: `None` IS THE REFERENCE'S NULL AND ITS CALLER TREATS IT AS "NOT ADJACENT" — the last op
+/// of a block is a merge candidate with nothing, so returning the block's end here would make two
+/// loops in different blocks look adjacent.
+#[must_use]
+pub fn get_next_eligible_op(block: &[Op], op: InBlock) -> Option<InBlock> {
+    block
+        .iter()
+        .enumerate()
+        .skip(op.0 + 1)
+        .find(|(_, next)| !skipped_between_loops(next))
+        .map(|(at, _)| InBlock(at))
+}
+
+/// A LOOP'S `dbgName`, PRESENT — `for_op.getDbgName().value()` (`:77-78`) as a type.
+///
+/// ⛔ `.value()` ON AN ABSENT NAME IS `std::bad_optional_access`, so the reference merges two
+/// unnamed loops by throwing. Here a nameless loop cannot reach [`get_new_dbg_name`] at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbgName(String);
+
+impl DbgName {
+    /// The name a `sentient.for` carries, or nothing when it is not a loop or carries none.
+    #[must_use]
+    pub fn of(op: &Op) -> Option<DbgName> {
+        let Op::Sentient(sentient::Op::For { dbg_name, .. }) = op else {
+            return None;
+        };
+        dbg_name.clone().map(DbgName)
+    }
+
+    /// The text it carries.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Replaces: e076_getNewDbgName
+///
+/// `LM(<first>, <second>)` — the merged loop's `dbgName`, built from both sources' own.
+#[must_use]
+pub fn get_new_dbg_name(for_op1: &DbgName, for_op2: &DbgName) -> DbgName {
+    DbgName(format!("LM({}, {})", for_op1.text(), for_op2.text()))
+}
 
 // crustify:todo: e316_mergeLoops
 //   authority : dcc/src/Transform/Sentient/LoopMerging.cpp:179  (100 body lines, level 1)
@@ -116,3 +184,87 @@
 //   original  : void LoopMergingPass::runOnOperation()
 //   calls     : e601_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::Val;
+    use crate::units::{DfirUnit, Residency};
+
+    /// `sentient.for` carrying `dbg_name`.
+    fn sentient_for(dbg_name: Option<&str>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv: Val(0),
+            bound: Val(1),
+            carried: Vec::new(),
+            dbg_name: dbg_name.map(str::to_owned),
+            body: Vec::new(),
+        })
+    }
+
+    /// The four non-`sentient` bookkeeping ops the walk steps over, plus the constant.
+    fn skipped_ops() -> Vec<Op> {
+        vec![
+            Op::Dataflow(dataflow::Op::GetUnit {
+                result: Val(2),
+                residency: Residency::Global,
+                unit: DfirUnit::L3lu,
+                num_folds: None,
+            }),
+            Op::Sentient(sentient::Op::ScalarConstant {
+                value: 0,
+                result: Val(3),
+                reg_locale: sentient::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            }),
+            Op::Symbol(symbol::Op::CreateSymbol {
+                result: Val(4),
+                symbol_id: 0,
+                max_value: None,
+            }),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(5),
+                pairs: Vec::new(),
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(6),
+                map: Val(5),
+                key: Val(3),
+            }),
+        ]
+    }
+
+    /// Two loops separated by all five skipped ops are adjacent; one separated by anything else is
+    /// not, and the last op of a block is adjacent to nothing.
+    #[test]
+    fn e075_walks_past_the_five_bookkeeping_ops_and_stops_at_the_block_end() {
+        let mut block = vec![sentient_for(None)];
+        block.extend(skipped_ops());
+        block.push(sentient_for(None));
+        assert_eq!(get_next_eligible_op(&block, InBlock(0)), Some(InBlock(6)));
+        assert_eq!(get_next_eligible_op(&block, InBlock(6)), None);
+
+        let blocked = vec![
+            sentient_for(None),
+            Op::Sentient(sentient::Op::Nop { dbg_name: None }),
+            sentient_for(None),
+        ];
+        assert_eq!(get_next_eligible_op(&blocked, InBlock(0)), Some(InBlock(1)));
+    }
+
+    /// The merged name, and the absent name the reference's `.value()` throws on.
+    #[test]
+    fn e076_wraps_both_source_names_in_lm() {
+        let first = sentient_for(Some("L0"));
+        let second = sentient_for(Some("LM(L1, L2)"));
+        let first = DbgName::of(&first).expect("a named loop");
+        let second = DbgName::of(&second).expect("a named loop");
+        assert_eq!(
+            get_new_dbg_name(&first, &second).text(),
+            "LM(L0, LM(L1, L2))"
+        );
+        assert!(DbgName::of(&sentient_for(None)).is_none());
+        assert!(DbgName::of(&Op::Sentient(sentient::Op::Nop { dbg_name: None })).is_none());
+    }
+}

@@ -82,14 +82,159 @@
 //! | `e626_runOn` | 626 | 6 | 79 | `dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:330` |
 //! | `e641_runOnOperation` | 641 | 7 | 8 | `dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:410` |
 
+use crate::islands::sentient::dialects::{Op, sentient};
 
-// crustify:todo: e073_getNontrivialOpsInLoop
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:59  (9 body lines, level 0)
-//   original  : std::vector<Operation *> getNontrivialOpsInLoop( sentient::ForOp sentient_for) const
+/// WHERE AN OP SITS IN A LOOP BODY — one entry of the reference's `std::vector<Operation *>`.
+///
+/// ⛔ A POSITION AND NOT A BORROW, because every caller of [`get_nontrivial_ops_in_loop`] REWRITES
+/// what it finds: e314 sets `burst_size` on the op it names and clones it, so a `&Op` would be the
+/// one thing that cannot be handed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InBody(pub usize);
 
-// crustify:todo: e074_checkOperandsOfComputeOp
-//   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:74  (39 body lines, level 0)
-//   original  : bool checkOperandsOfComputeOp(Operation *compute_op, StringRef &invalid_operand) const
+/// A `sentient.for`, AS ITS BODY — `DT_CHECK_MSG(sentient_for, "Expect a valid for op.")` as a type.
+///
+/// ⭐ ONE WITNESS DISCHARGES BOTH OF THIS FILE'S COPIES OF THAT CHECK (`:61` and `:119`): a loop that
+/// is not a `sentient.for` is a value this type cannot hold rather than one it aborts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentientFor<'a> {
+    /// `getBody(0)->getOperations()` — the loop's single region.
+    body: &'a [Op],
+}
+
+impl<'a> SentientFor<'a> {
+    /// The loop `op` is, or nothing when it is not a `sentient.for`.
+    #[must_use]
+    pub fn of(op: &'a Op) -> Option<SentientFor<'a>> {
+        let Op::Sentient(sentient::Op::For { body, .. }) = op else {
+            return None;
+        };
+        Some(SentientFor { body })
+    }
+
+    /// Its body, in block order.
+    #[must_use]
+    pub const fn body(self) -> &'a [Op] {
+        self.body
+    }
+}
+
+/// Replaces: e073_getNontrivialOpsInLoop
+///
+/// Every op in the loop's body except the `sentient.yield` and the constants, in block order.
+///
+/// ⛔ TRAP: `sentient::ConstantOp` IS `sentient.scalar_constant` (`SentientOps.td:848`), NOT
+/// `arith.constant`. An `arith.constant` left in the body is nontrivial here, and every caller tests
+/// `size() != 1`, so widening this filter would make loops candidates that the reference refuses.
+#[must_use]
+pub fn get_nontrivial_ops_in_loop(sentient_for: SentientFor<'_>) -> Vec<InBody> {
+    sentient_for
+        .body()
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            !matches!(
+                op,
+                Op::Sentient(sentient::Op::Yield { .. } | sentient::Op::ScalarConstant { .. })
+            )
+        })
+        .map(|(at, _)| InBody(at))
+        .collect()
+}
+
+/// THE OPERAND A UNIT'S RE-ROLLING FORBIDS — `StringRef invalid_operand = is_pt ? "xrf" : "nfwd"`
+/// (`:147`), which is a closed set of two and so an enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidOperand {
+    /// `"xrf"` — PT units.
+    Xrf,
+    /// `"nfwd"` — PE and SFP units.
+    Nfwd,
+}
+
+impl InvalidOperand {
+    /// `stringifySentientComputePort(port).contains(invalid_operand)`.
+    ///
+    /// ⛔ TRAP: A SUBSTRING TEST, NOT EQUALITY, and that is load-bearing — `nfwd` matches BOTH
+    /// `nfwd0` and `nfwd2` (`SentientTypes.td:213-214`), which is the only reason the reference
+    /// spells the needle without an index.
+    #[must_use]
+    pub fn names(self, port: sentient::Port) -> bool {
+        port.spelling().contains(match self {
+            InvalidOperand::Xrf => "xrf",
+            InvalidOperand::Nfwd => "nfwd",
+        })
+    }
+}
+
+/// A COMPUTE OP AS THE FIELDS THIS PASS READS — `llvm_unreachable("expect a compute op")` (`:110`)
+/// as a type.
+///
+/// ⭐ THE FOUR ARMS COLLAPSE TO ONE LIST because they differ only in HOW MANY operands they declare:
+/// each checks `unrollIncrOp<X>` and the port of every operand it has, plus `unrollIncrResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeOp<'a> {
+    /// `opA`, `opB`, `opC` — exactly the ones the op declares.
+    operands: Vec<&'a sentient::Operand>,
+    /// `getUnrollIncrResult()`.
+    unroll_incr_result: bool,
+}
+
+impl<'a> ComputeOp<'a> {
+    /// The compute `op` is, or nothing for anything the reference's `llvm_unreachable` would meet.
+    #[must_use]
+    pub fn of(op: &'a Op) -> Option<ComputeOp<'a>> {
+        let (operands, result) = match op {
+            Op::Sentient(
+                sentient::Op::VectorMac {
+                    op_a,
+                    op_b,
+                    op_c,
+                    result,
+                    ..
+                }
+                | sentient::Op::VectorTernary {
+                    op_a,
+                    op_b,
+                    op_c,
+                    result,
+                    ..
+                },
+            ) => (vec![op_a, op_b, op_c], result),
+            Op::Sentient(sentient::Op::VectorBinary {
+                op_a, op_b, result, ..
+            }) => (vec![op_a, op_b], result),
+            Op::Sentient(sentient::Op::VectorUnary { op_a, result, .. }) => (vec![op_a], result),
+            _ => return None,
+        };
+        Some(ComputeOp {
+            operands,
+            unroll_incr_result: result.unroll_incr,
+        })
+    }
+}
+
+/// Replaces: e074_checkOperandsOfComputeOp
+///
+/// The compute may be re-rolled only when neither it nor any operand advances per unrolled copy and
+/// no operand reads the unit's forbidden port.
+///
+/// ⛔ TRAP: `unrollIncrLogicalResult` ON `sentient.vector_ternary` IS A DIFFERENT ATTRIBUTE AND IS
+/// NOT READ HERE — all four arms call `getUnrollIncrResult()`, so a ternary forwarding its logical
+/// result stays a candidate.
+#[must_use]
+pub fn check_operands_of_compute_op(
+    compute_op: &ComputeOp<'_>,
+    invalid_operand: InvalidOperand,
+) -> bool {
+    if compute_op.unroll_incr_result {
+        return false;
+    }
+    !compute_op
+        .operands
+        .iter()
+        .any(|operand| operand.unroll_incr || invalid_operand.names(operand.port))
+}
 
 // crustify:todo: e313_isCandidate
 //   authority : dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:117  (52 body lines, level 1)
@@ -116,3 +261,134 @@
 //   original  : void runOnOperation()
 //   calls     : e626_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::Val;
+
+    /// `sentient.scalar_constant` — one of the two ops e073 filters out.
+    fn scalar_constant(result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value: 0,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.nop` — an op that is neither a yield, a constant nor a compute.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// `sentient.for` over `body`.
+    fn sentient_for(body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv: Val(0),
+            bound: Val(1),
+            carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// `sentient.vector_mac` reading `op_a` from `port`, with the given unroll increments.
+    fn mac(port: sentient::Port, operand_incr: bool, result_incr: bool) -> Op {
+        let mut op_a = sentient::Operand::from(port);
+        op_a.unroll_incr = operand_incr;
+        Op::Sentient(sentient::Op::VectorMac {
+            mask: None,
+            xrf_write_ptr: None,
+            xrf_read_ptr: None,
+            results: Vec::new(),
+            op_a,
+            op_b: sentient::Operand::from(sentient::Port::Lrf(sentient::LrfIndex::L0)),
+            op_c: sentient::Operand::from(sentient::Port::Latch),
+            result: sentient::ResultPorts {
+                forwarding: Vec::new(),
+                precision: sentient::Precision::Fp16,
+                unroll_incr: result_incr,
+            },
+            mode: sentient::FmaMode::FusedMulAdd,
+            compute_precision: sentient::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            xrf_read_incr: 0,
+            xrf_write_incr: 0,
+            data_transfer_only: false,
+            dbg_name: None,
+        })
+    }
+
+    /// `sentient.vector_unary` reading `op_a` from `port` — the one-operand arm.
+    fn unary(port: sentient::Port) -> Op {
+        Op::Sentient(sentient::Op::VectorUnary {
+            mask: Val(2),
+            op_a: sentient::Operand::from(port),
+            unary_op: sentient::UnaryOp::Rec,
+            result: sentient::ResultPorts::default(),
+            compute_precision: sentient::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
+    /// The shape every caller tests for — one real op beside the constants and the yield — and the
+    /// yield/constant filter, which is the whole of e073.
+    #[test]
+    fn e073_keeps_only_the_ops_that_are_neither_a_yield_nor_a_scalar_constant() {
+        let loop_op = sentient_for(vec![
+            scalar_constant(Val(3)),
+            nop(),
+            scalar_constant(Val(4)),
+            Op::Sentient(sentient::Op::Yield {
+                results: Vec::new(),
+            }),
+        ]);
+        let sentient_for = SentientFor::of(&loop_op).expect("a sentient.for");
+        assert_eq!(get_nontrivial_ops_in_loop(sentient_for), vec![InBody(1)]);
+        // The `DT_CHECK` this witness replaces: anything that is not a loop has no body to walk.
+        assert!(SentientFor::of(&nop()).is_none());
+    }
+
+    /// The three refusals — an operand's increment, the result's, and the unit's forbidden port —
+    /// against a compute that is re-rollable on both units.
+    #[test]
+    fn e074_refuses_an_unroll_increment_or_the_units_own_forbidden_port() {
+        let clean = mac(sentient::Port::Lrf(sentient::LrfIndex::L1), false, false);
+        let clean = ComputeOp::of(&clean).expect("a compute op");
+        assert!(check_operands_of_compute_op(&clean, InvalidOperand::Xrf));
+        assert!(check_operands_of_compute_op(&clean, InvalidOperand::Nfwd));
+
+        let operand_incr = mac(sentient::Port::Lrf(sentient::LrfIndex::L1), true, false);
+        let operand_incr = ComputeOp::of(&operand_incr).expect("a compute op");
+        assert!(!check_operands_of_compute_op(
+            &operand_incr,
+            InvalidOperand::Xrf
+        ));
+
+        let result_incr = mac(sentient::Port::Lrf(sentient::LrfIndex::L1), false, true);
+        let result_incr = ComputeOp::of(&result_incr).expect("a compute op");
+        assert!(!check_operands_of_compute_op(
+            &result_incr,
+            InvalidOperand::Xrf
+        ));
+
+        // `xrf` is forbidden on PT and allowed elsewhere; `nfwd2` is matched by the un-indexed
+        // needle, which is the substring test the reference relies on.
+        let xrf = mac(sentient::Port::Xrf, false, false);
+        let xrf = ComputeOp::of(&xrf).expect("a compute op");
+        assert!(!check_operands_of_compute_op(&xrf, InvalidOperand::Xrf));
+        assert!(check_operands_of_compute_op(&xrf, InvalidOperand::Nfwd));
+        let nfwd = unary(sentient::Port::Nfwd2);
+        let nfwd = ComputeOp::of(&nfwd).expect("a compute op");
+        assert!(!check_operands_of_compute_op(&nfwd, InvalidOperand::Nfwd));
+        assert!(check_operands_of_compute_op(&nfwd, InvalidOperand::Xrf));
+
+        // The `llvm_unreachable` this witness replaces.
+        assert!(ComputeOp::of(&nop()).is_none());
+    }
+}
