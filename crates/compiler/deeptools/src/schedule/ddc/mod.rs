@@ -132,7 +132,7 @@
 //! | `e232_reset` | 232 | 1 | 5 | `CoordPropTracker` | `ddc/ddc.h:528` |
 //! | `e296_rollBackNodesInBlock` | 296 | 2 | 15 | `CoordPropTracker` | `ddc/ddc.h:511` |
 
-pub(crate) mod fold;
+pub mod fold;
 pub(crate) mod metadata;
 pub(crate) mod shuffle;
 pub(crate) mod transformation;
