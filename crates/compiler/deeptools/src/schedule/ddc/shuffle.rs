@@ -311,16 +311,7 @@ impl SliceDim {
     }
 }
 
-/// A LAYOUT WITH ITS DIMENSIONS AS SYMBOLS — stick dimensions unordered, slice dimensions ordered
-/// by significance (`shuffle.h:81`).
-///
-/// ⛔ THE SLICE IS EXACTLY SIX SUBDIMENSIONS, AS AN ARRAY. The reference `DT_CHECK`s that length
-/// (`shuffle.cpp:692-693`, `:1165-1166`) and every `act` restores it after its erase/insert pair,
-/// so it is an invariant of the type here rather than a check someone remembers.
-///
-/// ⛔ FIELD ORDER IS LOAD-BEARING: `operator<` compares format, then stick dims, then slice dims
-/// (`shuffle.h:105-109`), and that is what the derived `Ord` reproduces.
-/// A LAYOUT WITH ITS STICK DIMENSIONS ORDERED — `ConcreteLayout` (`shuffle.h:70`), which is what
+/// A LAYOUT WITH ITS STICK DIMENSIONS ORDERED — `ConcreteLayout` (`shuffle.h:71`), which is what
 /// `inferLayouts` (e270) states and what the codegen walk numbers its sticks from.
 ///
 /// ⛔ THE STICK ORDER IS THE WHOLE DIFFERENCE FROM [`AbstractLayout`]: `make_stick_number_key` gives
@@ -343,6 +334,15 @@ impl ConcreteLayout {
     }
 }
 
+/// A LAYOUT WITH ITS DIMENSIONS AS SYMBOLS — stick dimensions unordered, slice dimensions ordered
+/// by significance (`shuffle.h:81`).
+///
+/// ⛔ THE SLICE IS EXACTLY SIX SUBDIMENSIONS, AS AN ARRAY. The reference `DT_CHECK`s that length
+/// (`shuffle.cpp:692-693`, `:1165-1166`) and every `act` restores it after its erase/insert pair,
+/// so it is an invariant of the type here rather than a check someone remembers.
+///
+/// ⛔ FIELD ORDER IS LOAD-BEARING: `operator<` compares format, then stick dims, then slice dims
+/// (`shuffle.h:105-109`), and that is what the derived `Ord` reproduces.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AbstractLayout {
     /// The element format the sticks are in.
@@ -393,7 +393,7 @@ impl AbstractLayout {
         self.stick_dims.contains(&dim) || self.slice_dims.contains(&dim)
     }
 
-    /// `std::hash<AbstractLayout>::operator()` (`shuffle.h:135`) — FNV-1a over the stick symbols in
+    /// `std::hash<AbstractLayout>::operator()` (`shuffle.h:140`) — FNV-1a over the stick symbols in
     /// set order and then the six slice symbols, a byte of each `int` at a time, low byte first.
     ///
     /// ⛔ THE FORMAT IS NOT IN IT, while `operator==` compares it (`shuffle.h:101`), so two layouts
@@ -403,9 +403,9 @@ impl AbstractLayout {
     /// unordered container in the file is keyed on [`DimSymbol`] (`shuffle.cpp:732`).
     #[must_use]
     pub fn fnv1a(&self) -> usize {
-        /// `const uint64_t offset` (`shuffle.h:139`).
+        /// `const uint64_t offset` (`shuffle.h:142`).
         const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        /// `const uint64_t prime` (`shuffle.h:140`).
+        /// `const uint64_t prime` (`shuffle.h:143`).
         const PRIME: u64 = 0x0000_0100_0000_01b3;
 
         let mut hash = OFFSET;
@@ -436,7 +436,7 @@ const fn narrow_to_usize(hash: u64) -> usize {
     }
 }
 
-/// `std::hash<AbstractLayout>` (`shuffle.h:135`) as Rust states it. The C++ RETURNS the `size_t`;
+/// `std::hash<AbstractLayout>` (`shuffle.h:139`) as Rust states it. The C++ RETURNS the `size_t`;
 /// Rust feeds a hasher, so [`AbstractLayout::fnv1a`] is written whole and there is one definition of
 /// the layout hash rather than two.
 impl Hash for AbstractLayout {
@@ -514,14 +514,18 @@ pub struct ComputationOp {
     pub reuses_sticks: bool,
     /// `codegen_psuedocode`, the `std::function` (`shuffle.h:213`), AS DATA: both setters emit ONE
     /// `packmerge` line from an index table and differ only in whether the second input register is
-    /// the first one again (`shuffle.cpp:147-153`, `:169-175`). Absent until e264/e265 set it.
+    /// the first one again (`shuffle.cpp:149-154`, `:169-174`). Absent until e264/e265 set it.
     pub packmerge_indices: Option<Vec<ShuffleIndex>>,
 }
 
 /// Replaces: e137_int_log2
 ///
 /// Floor of log2, and `-1` for `x <= 0` — the reference's own documented answer
-/// (`shuffle.cpp:94`), which its callers rely on for a `stickSize_` of 0.
+/// (`shuffle.cpp:94`).
+///
+/// ⛔ NO CALLER SUPPLIES A NON-POSITIVE `x`: `inferLayouts` feeds it a `stickSize_` and immediately
+/// `DT_CHECK`s `stickSize_ == (1 << num_subdims)` (`shuffle.cpp:1072-1073`), which a 0 fails. The
+/// `-1` is the documented answer, not a value the reference computes with.
 #[must_use]
 pub const fn int_log2(x: i32) -> i32 {
     if x <= 0 {
@@ -650,7 +654,7 @@ impl ComputationOp {
     /// line this op's table writes, and nothing at all for an op that has no table yet.
     ///
     /// ⛔ THE SECOND REGISTER IS THE FIRST ONE AGAIN for a one-input op, which is `unary_op`'s own
-    /// `insert_packmerge(input[0], input[0], ..)` (`shuffle.cpp:174`): the reference's two arity
+    /// `insert_packmerge(input[0], input[0], ..)` (`shuffle.cpp:167`): the reference's two arity
     /// `DT_CHECK`s ARE that choice, so neither is a stop here.
     #[must_use]
     pub fn codegen_psuedocode(&self, in_regs: &[PseudoReg], out_reg: &PseudoReg) -> Vec<String> {
@@ -948,8 +952,10 @@ impl ShiftLeftAction {
     /// One instruction per input stick, DOUBLED when the shift also extracts — it then writes two
     /// output sticks per input.
     ///
-    /// ⛔ NO DIVISION, UNLIKE EVERY OTHER ACTION'S COST (`shuffle.cpp:423-425`). A one-stick layout
-    /// costs 1 or 2 here, where a merge or a pack costs 0.
+    /// ⛔ NO DIVISION, AND THE ONLY COST THAT CAN EXCEED THE STICK COUNT (`shuffle.cpp:423-425`).
+    /// The one other undivided cost is an EXTRACTING merge, at `numSticks()` rather than twice it
+    /// (`shuffle.cpp:266-271`); every remaining action halves. So a one-stick layout costs 1 or 2
+    /// here, 1 for an extracting merge, and 0 for a filling merge or any pack.
     #[must_use]
     pub fn cost(&self, input: &AbstractLayout) -> ShuffleCost {
         let sticks = input.num_sticks().0;
@@ -987,9 +993,9 @@ impl Pack8Action {
     /// 64-bit slot becomes a dummy. The 2-bit slot is untouched.
     ///
     /// ⛔ THE TWO ERASES RUN DESCENDING — `{dim_8bit, dim_4bit}` (`shuffle.cpp:480`) — on a
-    /// shrinking vector, so they drop exactly those two originals; ascending would have taken the
-    /// 8-bit slot and then whatever slid into the 4-bit one. `insert(end(), {dim, getDummy()})`
-    /// restores the six-slot length.
+    /// shrinking vector, so they drop exactly those two originals; ascending would have dropped the
+    /// 4-bit slot and then the 16-bit dimension that slid into index 2. `insert(end(), {dim,
+    /// getDummy()})` restores the six-slot length.
     #[must_use]
     pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
         let mut output = input.clone();
@@ -1012,7 +1018,7 @@ pub struct Pack9Action {
 
 impl Pack9Action {
     /// `Pack9Action(stick_dim)` (`shuffle.cpp:521`) — its construction site passes the GOAL's 4-bit
-    /// dimension, having checked the sticks hold it (`shuffle.cpp:512-518`).
+    /// dimension, having checked the sticks hold it (`shuffle.cpp:510-517`).
     #[must_use]
     pub const fn new(dim: DimSymbol) -> Self {
         Self { dim }
@@ -1159,7 +1165,7 @@ impl GCVTF16F8PackAction {
 // ═══ e153..e160 — THE GCVT MERGE, THE MEMOISED GRAPH AND ITS WORKLIST ════════════════════════════
 
 /// THE `gcvt` MERGE — converts fp16 sticks to the goal's fp8 while taking a stick dimension into
-/// the 8-bit subdimension, moving nothing else (`shuffle.cpp:638`).
+/// the 8-bit subdimension, moving nothing else (`shuffle.cpp:639`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GCVTF16F8MergeAction {
     dim: DimSymbol,
@@ -1422,8 +1428,10 @@ impl StickNumberKey {
 /// NUMBERS THE STICK DIMENSIONS, position `i` of the ordering owning bit `i`, and hands back the
 /// numbering that turns a [`StickIndex`] into a [`StickNumber`].
 ///
-/// ⛔ THE REFERENCE'S `DT_CHECK(stick_ordering.size() < 32)` (`shuffle.cpp:731`) IS THE `zip`: a
-/// 32nd dimension gets no bit rather than shifting a `1u` off the end of a `uint32_t`. ⛔ AND A
+/// ⛔ THE `zip` STANDS IN FOR THE REFERENCE'S `DT_CHECK(stick_ordering.size() < 32)`
+/// (`shuffle.cpp:731`), AND IS ONE DIMENSION LOOSER: it hands out every bit a `u32` has, so the 32nd
+/// dimension gets bit 31 where the reference refuses, and the 33rd gets no bit rather than shifting
+/// a `1u` off the end. Identical for every ordering meeting the reference's own cap. ⛔ AND A
 /// REPEATED DIMENSION KEEPS ITS LAST BIT, as `masks[dim] = ...` assigns rather than inserts.
 #[must_use]
 pub fn make_stick_number_key(stick_ordering: &[DimSymbol]) -> StickNumberKey {
@@ -1973,6 +1981,12 @@ mod tests_e137_e144 {
         assert_eq!(
             MergeAction::new(A, MergeDim::Bit64, DUMMY).cost(&one_stick),
             ShuffleCost(0.0)
+        );
+        // ⛔ The EXTRACTING branch does not divide, so a one-stick layout costs 1 and not 0 — the
+        // only other undivided cost in the file is `ShiftLeftAction`'s (e147).
+        assert_eq!(
+            MergeAction::new(A, MergeDim::Bit64, D).cost(&one_stick),
+            ShuffleCost(1.0)
         );
     }
 
