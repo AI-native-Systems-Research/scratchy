@@ -77,6 +77,40 @@
 //! | `e064_dump` | 064 | 0 | 10 | `dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:457` |
 
 
+use crate::islands::sentient::dialects::Val;
+
+/// THE REGION OF THE ORIGINAL `uniform.uniformize_regions` A LOCAL REGION CAME FROM —
+/// `const Region &original_region_` (`:179`), named by the block argument that region binds.
+///
+/// ⛔⛔ AN IDENTITY, NOT A BORROW, for the reason [`crate::transform::sentient::ForRef`] gives: this
+/// pass rewrites the very op these regions hang off, so a `&` into it is unusable. Each region of a
+/// `uniform.uniformize_regions` binds its own argument
+/// ([`uniform::LocalRegion::arg`](crate::islands::sentient::dialects::uniform::LocalRegion::arg),
+/// `Uniform.td:96`), so that argument names exactly one region.
+///
+/// ⚠️⚠️ AND THE REGION'S OPS ARE NOT REACHABLE THROUGH IT YET — AN ISLAND GAP, NOT A CHOICE.
+/// [`uniform::LocalRegion::body`](crate::islands::sentient::dialects::uniform::LocalRegion::body) is
+/// `Vec<`[`dataflow_ir::dialects::Op`](crate::islands::dataflow_ir::dialects::Op)`>`, the rung BELOW,
+/// which has no arm for the `sentient.scalar_copy`s this pass reads out of a local region — so
+/// [`super::collect_uniform_maps`] is handed the region's ops directly instead. The fix is a
+/// sentient-rung `uniform.uniformize_regions` beside
+/// [`AffineFor`](crate::islands::sentient::dialects::AffineFor), which is this exact problem already
+/// solved once for `affine.for`; e444_analyze and e505_transform are the units that need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginalRegion(pub Val);
+
+/// ONE TRANSFORMED LOCAL REGION — `lrs::LocalRegion` (`:135-152`): which units it now represents, and
+/// where it came from, *"without having to create an actual local region in MLIR"* (`:132-134`).
+///
+/// ⛔ NO `Clone`: `LocalRegion(const LocalRegion &) = delete` (`:141`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct LocalRegion {
+    /// `units_` — in [`super::uniform_region::UniformRegion::add_local_region`]'s order.
+    pub units: Vec<Val>,
+    /// `original_region_`.
+    pub original_region: OriginalRegion,
+}
+
 // crustify:todo: e064_dump
 //   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:457  (10 body lines, level 0)
 //   original  : void lrs::LocalRegion::dump(int indent) const

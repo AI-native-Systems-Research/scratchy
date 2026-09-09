@@ -77,7 +77,86 @@
 //! | `e065_dump` | 065 | 0 | 6 | `dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:468` |
 
 
-// crustify:todo: e065_dump
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:468  (6 body lines, level 0)
-//   original  : void lrs::UniformRegion::dump() const
+use super::local_region::LocalRegion;
+use crate::islands::sentient::dialects::Val;
+
+/// THE `uniform.uniformize_regions` A [`UniformRegion`] WAS BUILT FROM — `original_uro_` (`:180`),
+/// named by the block argument of its FIRST region.
+///
+/// ⛔ NOT BY ITS RESULTS: `-> ()` in 305 of the 351 of them under `dcc/test`
+/// ([`uniform::Op::UniformizeRegions`](crate::islands::sentient::dialects::uniform::Op)), so a result
+/// list cannot name one. The op's verifier gives it at least one region (`Uniform.cpp:125`) and every
+/// region binds its own argument, so the first region's argument is a name it always has.
+/// ⭐ IDENTITY, NOT A BORROW — see [`crate::transform::sentient::ForRef`] and
+/// [`super::local_region::OriginalRegion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniformizeRegions(pub Val);
+
+/// THE UNIFORMIZED REGION THIS PASS WANTS, BEFORE ANY OP EXISTS FOR IT — `lrs::UniformRegion`
+/// (`:154-181`). `analyze` (e444) fills it, `transform` (e505) builds the op from it; the reference
+/// keeps it out of the IR because *"MLIR does not allow us to add regions to an existing op"*
+/// (`:157-158`).
+///
+/// ⛔ NO `Clone`: `UniformRegion(const UniformRegion &) = delete` (`:160`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct UniformRegion {
+    /// `local_regions_`, in the order [`UniformRegion::add_local_region`] appended them — which is the
+    /// region order `transform` emits (`:347`).
+    ///
+    /// ⭐ `Vec` FOR `std::deque` (`:178`): nothing holds a reference to an element across a push, so
+    /// the deque's stable element addresses are mechanism a port may drop.
+    pub local_regions: Vec<LocalRegion>,
+    /// `original_uro_`.
+    pub original_uro: UniformizeRegions,
+}
+
+impl UniformRegion {
+    /// Replaces: e065_dump
+    ///
+    /// The header naming how many local regions it holds, then each of them indented by 2, then the
+    /// closing brace.
+    ///
+    /// ⭐ A RETURNED `String` FOR `llvm::dbgs()`, as e014_dump did: the only caller wraps the whole
+    /// call in `LLVM_DEBUG` (`:266`), so nothing the reference gated becomes ungated.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        let mut out = format!(
+            "uniform region (with {} local regions) {{\n",
+            self.local_regions.len()
+        );
+        for local_region in &self.local_regions {
+            out.push_str(&local_region_dump(local_region));
+        }
+        out.push_str("}\n");
+        out
+    }
+}
+
+/// `lr.dump(2)` (`:471`) — ⛔⛔ **e064_dump**, `local_region.rs`, WHICH A PARALLEL BATCH OF THIS WAVE
+/// OWNS AND HAS NOT LANDED. `UNITS.tsv` records e065's calls as `-`, so the scheduler did not order
+/// the two; this function is that one call and nothing else, and it goes away — replaced by
+/// `local_region.dump(Indent(2))` — when e064 lands. ⛔ Not written here: filling a sibling batch's
+/// anchor would double-fill it and take the unit out of the campaign's accounting.
+fn local_region_dump(_local_region: &LocalRegion) -> String {
+    todo!(
+        "lrs::LocalRegion::dump(2) — entry e064_dump, owned by a parallel batch of this wave \
+         (transform/sentient/local_region_splitting_for_value_commoning/local_region.rs)"
+    )
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn dump_names_the_local_region_count_and_closes_the_brace() {
+        let ur = UniformRegion {
+            local_regions: Vec::new(),
+            original_uro: UniformizeRegions(Val(3)),
+        };
+        // ⛔ ZERO REGIONS IS THE WHOLE OF WHAT IS TESTABLE UNTIL e064 LANDS — see
+        // [`local_region_dump`].
+        assert_eq!(ur.dump(), "uniform region (with 0 local regions) {\n}\n");
+    }
+}
 
