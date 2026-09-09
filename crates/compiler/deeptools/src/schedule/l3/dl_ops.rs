@@ -267,7 +267,7 @@
 //! | `e380_setChunkDataStageParams` | 380 | 8 | 129 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1439` |
 //! | `e382_run` | 382 | 9 | 122 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912` |
 
-use crate::arch::{Arch, Bytes, Elements, IsaGen};
+use crate::arch::{Arch, Bounded, Bytes, Elements, IsaGen, Target};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
 use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, stricter_max, stricter_min};
@@ -277,14 +277,15 @@ use crate::schedule::ddc::transformation_util::{
 };
 use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
-    AllocateNode, BlockNode, Dsts, LdsIdx, NodeName, ReplicationFactor, SyncDirection, SyncNode,
-    SyncStrength, SyncUnits, TransferNode, Via,
+    AllocateNode, BlockNode, Dsts, LdsIdx, NodeName, ReplicationFactor, ScheduleTree,
+    SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, Via,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare,
-    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimStage, DscGroup, DscIdx, FilledDims,
-    IndexTensor, IndirectAlloc, InitialPlacement, LabeledDs, MemOrg, MulticastDegree, Pinning,
-    ScheduleNodes, ScheduleTrees, SchedulerMetadata, SuperDsc, SymbolicDimInfo, UnneededPad,
+    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimStage, DscGroup, DscIdx,
+    DscParamCandidates, FilledDims, IndexTensor, IndirectAlloc, InitialPlacement, LabeledDs,
+    MemOrg, MulticastDegree, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
+    StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, UnneededPad, WkSlice,
 };
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -504,8 +505,9 @@ mod tests_e001_e008 {
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
     use crate::schedule::dsc2::LayoutDims;
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, CoreletsUsed, DimPadding, DscList, Granularity, LabeledDsList, MaxSize,
-        PadElems, PadSizes, PrimaryDsInfo, StageDims, Symbolic, VolumeLimit, WkSlice, WkSliceId,
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DimPadding, DscList, Granularity,
+        LabeledDsList, MaxSize, NamedDims, PadElems, PadSizes, PrimaryDsInfo, StageDims, Symbolic,
+        VolumeLimit, WkSliceId,
     };
     use std::num::NonZeroU32;
 
@@ -525,11 +527,13 @@ mod tests_e001_e008 {
             primary_ds_info: BTreeMap::new(),
             core_ids_used: CoreIdsUsed::new(core(0), vec![]),
             layout_dims: BTreeMap::new(),
-            core_stage: one_dim_stage(),
             labeled_ds: LabeledDsList::new(
                 LabeledDs::new(DsType::Output, vec![], LdsIdx(183), Pinning::default()),
                 vec![],
             ),
+            data_stages: DataStages::new(plain_stage(), plain_stage()),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
         }
     }
 
@@ -537,6 +541,17 @@ mod tests_e001_e008 {
         let mut dims = StageDims::default();
         dims.extents.insert(PrimaryDim::In, Extent(1));
         filled(dims)
+    }
+
+    fn plain_stage() -> DataStage {
+        let named = NamedDims {
+            name: StageName::chunk(),
+            dims: one_dim_stage(),
+        };
+        DataStage {
+            ss: named.clone(),
+            el: named,
+        }
     }
 
     fn layout_only(layout: LayoutDims) -> PrimaryDsInfo {
@@ -926,11 +941,11 @@ pub fn core_split_dimensions(sdsc: &SuperDsc) -> BTreeSet<PrimaryDim> {
         if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
             continue;
         }
-        let main = sdsc.dscs().first().core_stage.dims().extent(dim);
+        let main = sdsc.dscs().first().core_stage().dims().extent(dim);
         if sdsc
             .dscs()
             .iter()
-            .any(|dsc| dsc.core_stage.dims().extent(dim) != main)
+            .any(|dsc| dsc.core_stage().dims().extent(dim) != main)
         {
             dims.insert(dim);
         }
@@ -1058,7 +1073,7 @@ pub fn create_allocate_node(
     let mut padding = PaddingForm::default();
     if component == SenComponent::Lx && pinning.lx_padded {
         for (dim, _) in &layout.0 {
-            if dsc.core_stage.dims().padding.contains_key(dim) {
+            if dsc.core_stage().dims().padding.contains_key(dim) {
                 padding.set_padding(*dim, PadType::PaddedFullSpanWUnneeded);
             }
         }
@@ -1101,10 +1116,11 @@ mod tests_e009_e016 {
         is_labeled_ds_lx_neighbor, labeled_ds_with_ds_type, parent_loop_nodes, stick_size,
     };
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, StickDims};
+    use crate::schedule::ddc::transformation_util::StageName;
     use crate::schedule::dsc2::LayoutDims;
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, CoreletsUsed, DimPadding, DscList, DscScheduleStep, LabeledDsList,
-        PrimaryDsInfo, StageDims,
+        CoreIdsUsed, CoreletsUsed, DATA_STAGE_CORE, DataStage, DataStages, DimPadding, DscList,
+        DscScheduleStep, LabeledDsList, NamedDims, PrimaryDsInfo, StageDims,
     };
     use crate::units::Core;
 
@@ -1141,6 +1157,17 @@ mod tests_e009_e016 {
 
     /// A DSC whose ONE labelled DS sits at position 0 while RECORDING `183`, with an `In`-then-`Y`
     /// layout order for it and a core data stage that pads `Y`.
+    fn a_stage(extents: &[(PrimaryDim, i64)]) -> DataStage {
+        let named = NamedDims {
+            name: StageName::default(),
+            dims: a_core_stage(extents),
+        };
+        DataStage {
+            ss: named.clone(),
+            el: named,
+        }
+    }
+
     fn a_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
             corelets_used: CoreletsUsed::ONE,
@@ -1154,7 +1181,12 @@ mod tests_e009_e016 {
             )]
             .into_iter()
             .collect(),
-            core_stage: a_core_stage(&[(PrimaryDim::Y, 16), (PrimaryDim::Ij, 4)]),
+            data_stages: DataStages::new(
+                a_stage(&[(PrimaryDim::Y, 16), (PrimaryDim::Ij, 4)]),
+                a_stage(&[(PrimaryDim::Y, 16)]),
+            ),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
             labeled_ds: LabeledDsList::new(
                 LabeledDs::new(
                     DsType::Input,
@@ -1207,7 +1239,10 @@ mod tests_e009_e016 {
     fn a_differing_core_extent_is_a_split_dim_and_ij_is_skipped() {
         let same = a_dsc();
         let mut differs = a_dsc();
-        differs.core_stage = a_core_stage(&[(PrimaryDim::Y, 8), (PrimaryDim::Ij, 9)]);
+        differs.data_stages.set(
+            DATA_STAGE_CORE,
+            a_stage(&[(PrimaryDim::Y, 8), (PrimaryDim::Ij, 9)]),
+        );
         let sdsc = SuperDsc::new(
             DscList::new(same.clone(), vec![same, differs]),
             BTreeMap::new(),
@@ -1528,7 +1563,10 @@ pub fn create_loop_node(
 /// its child vector empty (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:645`).
 #[must_use]
 pub fn create_block_node(name: NodeName) -> BlockNode {
-    BlockNode { name }
+    BlockNode {
+        name,
+        children: Vec::new(),
+    }
 }
 
 /// Replaces: e020_createSyncNode
@@ -2042,7 +2080,7 @@ fn stick_size_or_default(sizes: &[(PrimaryDim, Elements)], dim: PrimaryDim) -> O
 #[must_use]
 pub fn min_param_scalar_broadcast(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> Option<Extent> {
     match dim {
-        PrimaryDim::J => dsc.core_stage.dims().extent(dim),
+        PrimaryDim::J => dsc.core_stage().dims().extent(dim),
         _ => {
             let sizes = dsc.cumulative_stick_sizes(dsc.labeled_ds.back().ds_type())?;
             stick_size_or_default(&sizes, dim)
@@ -2059,7 +2097,7 @@ pub fn min_param_scalar_broadcast(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> O
 #[must_use]
 pub fn min_param_reduction(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> Option<Extent> {
     match dim {
-        PrimaryDim::J => dsc.core_stage.dims().extent(dim),
+        PrimaryDim::J => dsc.core_stage().dims().extent(dim),
         _ => Some(DEFAULT_MIN_PARAM),
     }
 }
@@ -2077,7 +2115,7 @@ pub fn min_param_pooling_and_depthwise_conv(
     dim: PrimaryDim,
     op_func: OpFunc,
 ) -> Option<Extent> {
-    let core_param = dsc.core_stage.dims().extent(dim);
+    let core_param = dsc.core_stage().dims().extent(dim);
     match dim {
         PrimaryDim::In if is_op_func_depthwise_conv(op_func) => core_param,
         PrimaryDim::Out => Some(Extent(64)),
@@ -2101,7 +2139,7 @@ pub fn min_param_quantization(
     dim: PrimaryDim,
     op_func: OpFunc,
 ) -> Option<Extent> {
-    let core = dsc.core_stage.dims();
+    let core = dsc.core_stage().dims();
     let has_padding = core.has_padding(dim)?;
     match dim {
         PrimaryDim::J => core.extent(dim),
@@ -2133,7 +2171,7 @@ pub fn min_param_conversion_dl16_and_fp32(
     op_func: OpFunc,
 ) -> Option<Extent> {
     match dim {
-        PrimaryDim::J => dsc.core_stage.dims().extent(dim),
+        PrimaryDim::J => dsc.core_stage().dims().extent(dim),
         _ => {
             let lds = if matches!(op_func, OpFunc::Dl16Tofp32) {
                 dsc.labeled_ds.front()
@@ -2152,8 +2190,8 @@ mod tests_e033_e040 {
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
     use crate::schedule::dsc2::LayoutDims;
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, CoreletsUsed, DimPadding, LabeledDsList, PadElems, PadSizes, PrimaryDsInfo,
-        StageDims,
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DimPadding, LabeledDsList, NamedDims,
+        PadElems, PadSizes, PrimaryDsInfo, StageDims,
     };
 
     /// A core data stage stating exactly the given extents.
@@ -2176,6 +2214,14 @@ mod tests_e033_e040 {
 
     fn config(core_stage: FilledDims, labeled: &[DsType]) -> DesignSpaceConfig {
         let (first, rest) = labeled.split_first().expect("a DSC labels a structure");
+        let named = NamedDims {
+            name: StageName::default(),
+            dims: core_stage,
+        };
+        let stage = DataStage {
+            ss: named.clone(),
+            el: named,
+        };
         DesignSpaceConfig {
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
@@ -2183,7 +2229,9 @@ mod tests_e033_e040 {
             primary_ds_info: BTreeMap::new(),
             core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
             layout_dims: BTreeMap::new(),
-            core_stage,
+            data_stages: DataStages::new(stage.clone(), stage),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
             labeled_ds: LabeledDsList::new(
                 LabeledDs::new(*first, vec![], LdsIdx(183), Pinning::default()),
                 rest.iter()
@@ -2396,53 +2444,612 @@ mod tests_e033_e040 {
     }
 }
 
-// crustify:todo: e041_getChunkParamsFromCandidates
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1423  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::getChunkParamsFromCandidates( DataStructDims &params, const DscParamCandidateIndicesType &selectedIndices, const DscParamCandidatesType &dscCandidates, const int dscIdx, const std::vector<PrimaryDimTypes> &primaryDims)
-//   extract   : crustify-ddc/cpp/l3.cpp:1001-1016
+/// A BURST SIZE, `1..=l3BurstSize` — `DT_CHECK_MSG(.., "Invalid Burst size.")` as a constructor,
+/// holding the zero-based row the efficiency table is read by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BurstSize(Bounded<{ Target::L3_BURST }>);
 
-// crustify:todo: e042_getBurstEfficiency
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1609  (17 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : double L3DlOpsScheduler::getBurstEfficiency(const unsigned burstSize, const unsigned multicastDegree)
-//   extract   : crustify-ddc/cpp/l3.cpp:1026-1044
+impl BurstSize {
+    /// A burst of `sticks` sticks, `None` outside `1..=l3BurstSize`.
+    #[must_use]
+    pub const fn new(sticks: u32) -> Option<Self> {
+        match sticks.checked_sub(1) {
+            Some(row) => match Bounded::checked(row) {
+                Some(row) => Some(Self(row)),
+                None => None,
+            },
+            None => None,
+        }
+    }
 
-// crustify:todo: e043_getLabeledDsNumOfStickVolumesInCore
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1694  (37 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : unsigned long L3DlOpsScheduler::getLabeledDsNumOfStickVolumesInCore( const DesignSpaceConfig &dsc, const int ldsIdx, const unsigned long stickVolume, const std::vector<PrimaryDimTypes> &primaryDims)
-//   extract   : crustify-ddc/cpp/l3.cpp:1054-1094
+    /// `burstSize - 1`, the row it names.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0.get()
+    }
+}
 
-// crustify:todo: e044_getOpReducedDimSet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2719  (13 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::set<PrimaryDimTypes> L3DlOpsScheduler::getOpReducedDimSet( const SuperDsc &mySDsc, const DesignSpaceConfig &dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1104-1118
+/// A MULTICAST DEGREE, `1..=numCores` — `DT_CHECK_MSG(.., "Invalid multicast degree.")` as a
+/// constructor, holding the zero-based column the efficiency table is read by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MulticastCores(Bounded<{ Target::CORES }>);
 
-// crustify:todo: e045_addSuperChunkDataStage
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2806  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::addSuperChunkDataStage(DesignSpaceConfig& dsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:1128-1140
+impl MulticastCores {
+    /// A degree, `None` outside `1..=numCores`.
+    #[must_use]
+    pub const fn of(degree: MulticastDegree) -> Option<Self> {
+        match degree.0.checked_sub(1) {
+            Some(column) => match Bounded::checked(column) {
+                Some(column) => Some(Self(column)),
+                None => None,
+            },
+            None => None,
+        }
+    }
 
-// crustify:todo: e046_getLxBelowBlockNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3468  (11 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::BlockNode *L3DlOpsScheduler::getLxBelowBlockNode( dsc2::ScheduleTree &scheduleTree) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1150-1162
+    /// `multicastDegree - 1`, the column it names.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0.get()
+    }
+}
 
-// crustify:todo: e047_collectAllDimensionsForLoopOrder
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3991  (25 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<PrimaryDimTypes> L3DlOpsScheduler::collectAllDimensionsForLoopOrder( const DesignSpaceConfig &dsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:1172-1198
+/// HOW EFFICIENT ONE BURST IS IN THE DATA RING — an entry of `burstEfficiency`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct BurstEfficiency(pub f64);
 
-// crustify:todo: e048_getSharesAndGroupName
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4673  (43 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::pair<size_t, size_t> L3DlOpsScheduler::getSharesAndGroupName( const SuperDsc &mySDsc, const DesignSpaceConfig &dsc, const LabeledDsInfo &lds, const std::map<PrimaryDimTypes, int> &currWkSlices, const std::vector<int> &processingCoreIds)
-//   extract   : crustify-ddc/cpp/l3.cpp:1208-1255
+/// `burstEfficiency` (`L3DlOpsScheduler.cpp:278`) — `dcg/dcg_fe/scheduler/BurstEfficiency.def`
+/// TRANSCRIBED, rows indexed by burst size and columns by multicast degree, both from one.
+///
+/// ⛔ `rustfmt::skip` SO ONE ROW STAYS ONE LINE, as the `.def` file writes it — a reflowed table
+/// cannot be diffed against its source.
+#[rustfmt::skip]
+const BURST_EFFICIENCY: [[f64; 32]; 32] = [
+    [0.1000, 0.0995, 0.0990, 0.0985, 0.0980, 0.0975, 0.0970, 0.0965, 0.0960, 0.0955, 0.0950, 0.0945, 0.0940, 0.0935, 0.0930, 0.0925, 0.0920, 0.0915, 0.0910, 0.0905, 0.0900, 0.0895, 0.0890, 0.0885, 0.0880, 0.0875, 0.0870, 0.0865, 0.0860, 0.0855, 0.0850, 0.0845],
+    [0.1250, 0.1245, 0.1240, 0.1235, 0.1230, 0.1225, 0.1220, 0.1215, 0.1210, 0.1205, 0.1200, 0.1195, 0.1190, 0.1185, 0.1180, 0.1175, 0.1170, 0.1165, 0.1160, 0.1155, 0.1150, 0.1145, 0.1140, 0.1135, 0.1130, 0.1125, 0.1120, 0.1115, 0.1110, 0.1105, 0.1100, 0.1095],
+    [0.1500, 0.1495, 0.1490, 0.1485, 0.1480, 0.1475, 0.1470, 0.1465, 0.1460, 0.1455, 0.1450, 0.1445, 0.1440, 0.1435, 0.1430, 0.1425, 0.1420, 0.1415, 0.1410, 0.1405, 0.1400, 0.1395, 0.1390, 0.1385, 0.1380, 0.1375, 0.1370, 0.1365, 0.1360, 0.1355, 0.1350, 0.1345],
+    [0.1750, 0.1745, 0.1740, 0.1735, 0.1730, 0.1725, 0.1720, 0.1715, 0.1710, 0.1705, 0.1700, 0.1695, 0.1690, 0.1685, 0.1680, 0.1675, 0.1670, 0.1665, 0.1660, 0.1655, 0.1650, 0.1645, 0.1640, 0.1635, 0.1630, 0.1625, 0.1620, 0.1615, 0.1610, 0.1605, 0.1600, 0.1595],
+    [0.2000, 0.1995, 0.1990, 0.1985, 0.1980, 0.1975, 0.1970, 0.1965, 0.1960, 0.1955, 0.1950, 0.1945, 0.1940, 0.1935, 0.1930, 0.1925, 0.1920, 0.1915, 0.1910, 0.1905, 0.1900, 0.1895, 0.1890, 0.1885, 0.1880, 0.1875, 0.1870, 0.1865, 0.1860, 0.1855, 0.1850, 0.1845],
+    [0.2250, 0.2245, 0.2240, 0.2235, 0.2230, 0.2225, 0.2220, 0.2215, 0.2210, 0.2205, 0.2200, 0.2195, 0.2190, 0.2185, 0.2180, 0.2175, 0.2170, 0.2165, 0.2160, 0.2155, 0.2150, 0.2145, 0.2140, 0.2135, 0.2130, 0.2125, 0.2120, 0.2115, 0.2110, 0.2105, 0.2100, 0.2095],
+    [0.2500, 0.2495, 0.2490, 0.2485, 0.2480, 0.2475, 0.2470, 0.2465, 0.2460, 0.2455, 0.2450, 0.2445, 0.2440, 0.2435, 0.2430, 0.2425, 0.2420, 0.2415, 0.2410, 0.2405, 0.2400, 0.2395, 0.2390, 0.2385, 0.2380, 0.2375, 0.2370, 0.2365, 0.2360, 0.2355, 0.2350, 0.2345],
+    [0.2750, 0.2745, 0.2740, 0.2735, 0.2730, 0.2725, 0.2720, 0.2715, 0.2710, 0.2705, 0.2700, 0.2695, 0.2690, 0.2685, 0.2680, 0.2675, 0.2670, 0.2665, 0.2660, 0.2655, 0.2650, 0.2645, 0.2640, 0.2635, 0.2630, 0.2625, 0.2620, 0.2615, 0.2610, 0.2605, 0.2600, 0.2595],
+    [0.3000, 0.2995, 0.2990, 0.2985, 0.2980, 0.2975, 0.2970, 0.2965, 0.2960, 0.2955, 0.2950, 0.2945, 0.2940, 0.2935, 0.2930, 0.2925, 0.2920, 0.2915, 0.2910, 0.2905, 0.2900, 0.2895, 0.2890, 0.2885, 0.2880, 0.2875, 0.2870, 0.2865, 0.2860, 0.2855, 0.2850, 0.2845],
+    [0.3250, 0.3245, 0.3240, 0.3235, 0.3230, 0.3225, 0.3220, 0.3215, 0.3210, 0.3205, 0.3200, 0.3195, 0.3190, 0.3185, 0.3180, 0.3175, 0.3170, 0.3165, 0.3160, 0.3155, 0.3150, 0.3145, 0.3140, 0.3135, 0.3130, 0.3125, 0.3120, 0.3115, 0.3110, 0.3105, 0.3100, 0.3095],
+    [0.3500, 0.3495, 0.3490, 0.3485, 0.3480, 0.3475, 0.3470, 0.3465, 0.3460, 0.3455, 0.3450, 0.3445, 0.3440, 0.3435, 0.3430, 0.3425, 0.3420, 0.3415, 0.3410, 0.3405, 0.3400, 0.3395, 0.3390, 0.3385, 0.3380, 0.3375, 0.3370, 0.3365, 0.3360, 0.3355, 0.3350, 0.3345],
+    [0.3750, 0.3745, 0.3740, 0.3735, 0.3730, 0.3725, 0.3720, 0.3715, 0.3710, 0.3705, 0.3700, 0.3695, 0.3690, 0.3685, 0.3680, 0.3675, 0.3670, 0.3665, 0.3660, 0.3655, 0.3650, 0.3645, 0.3640, 0.3635, 0.3630, 0.3625, 0.3620, 0.3615, 0.3610, 0.3605, 0.3600, 0.3595],
+    [0.4000, 0.3995, 0.3990, 0.3985, 0.3980, 0.3975, 0.3970, 0.3965, 0.3960, 0.3955, 0.3950, 0.3945, 0.3940, 0.3935, 0.3930, 0.3925, 0.3920, 0.3915, 0.3910, 0.3905, 0.3900, 0.3895, 0.3890, 0.3885, 0.3880, 0.3875, 0.3870, 0.3865, 0.3860, 0.3855, 0.3850, 0.3845],
+    [0.4250, 0.4245, 0.4240, 0.4235, 0.4230, 0.4225, 0.4220, 0.4215, 0.4210, 0.4205, 0.4200, 0.4195, 0.4190, 0.4185, 0.4180, 0.4175, 0.4170, 0.4165, 0.4160, 0.4155, 0.4150, 0.4145, 0.4140, 0.4135, 0.4130, 0.4125, 0.4120, 0.4115, 0.4110, 0.4105, 0.4100, 0.4095],
+    [0.4500, 0.4495, 0.4490, 0.4485, 0.4480, 0.4475, 0.4470, 0.4465, 0.4460, 0.4455, 0.4450, 0.4445, 0.4440, 0.4435, 0.4430, 0.4425, 0.4420, 0.4415, 0.4410, 0.4405, 0.4400, 0.4395, 0.4390, 0.4385, 0.4380, 0.4375, 0.4370, 0.4365, 0.4360, 0.4355, 0.4350, 0.4345],
+    [0.4750, 0.4745, 0.4740, 0.4735, 0.4730, 0.4725, 0.4720, 0.4715, 0.4710, 0.4705, 0.4700, 0.4695, 0.4690, 0.4685, 0.4680, 0.4675, 0.4670, 0.4665, 0.4660, 0.4655, 0.4650, 0.4645, 0.4640, 0.4635, 0.4630, 0.4625, 0.4620, 0.4615, 0.4610, 0.4605, 0.4600, 0.4595],
+    [0.5000, 0.4995, 0.4990, 0.4985, 0.4980, 0.4975, 0.4970, 0.4965, 0.4960, 0.4955, 0.4950, 0.4945, 0.4940, 0.4935, 0.4930, 0.4925, 0.4920, 0.4915, 0.4910, 0.4905, 0.4900, 0.4895, 0.4890, 0.4885, 0.4880, 0.4875, 0.4870, 0.4865, 0.4860, 0.4855, 0.4850, 0.4845],
+    [0.5250, 0.5245, 0.5240, 0.5235, 0.5230, 0.5225, 0.5220, 0.5215, 0.5210, 0.5205, 0.5200, 0.5195, 0.5190, 0.5185, 0.5180, 0.5175, 0.5170, 0.5165, 0.5160, 0.5155, 0.5150, 0.5145, 0.5140, 0.5135, 0.5130, 0.5125, 0.5120, 0.5115, 0.5110, 0.5105, 0.5100, 0.5095],
+    [0.5500, 0.5495, 0.5490, 0.5485, 0.5480, 0.5475, 0.5470, 0.5465, 0.5460, 0.5455, 0.5450, 0.5445, 0.5440, 0.5435, 0.5430, 0.5425, 0.5420, 0.5415, 0.5410, 0.5405, 0.5400, 0.5395, 0.5390, 0.5385, 0.5380, 0.5375, 0.5370, 0.5365, 0.5360, 0.5355, 0.5350, 0.5345],
+    [0.5750, 0.5745, 0.5740, 0.5735, 0.5730, 0.5725, 0.5720, 0.5715, 0.5710, 0.5705, 0.5700, 0.5695, 0.5690, 0.5685, 0.5680, 0.5675, 0.5670, 0.5665, 0.5660, 0.5655, 0.5650, 0.5645, 0.5640, 0.5635, 0.5630, 0.5625, 0.5620, 0.5615, 0.5610, 0.5605, 0.5600, 0.5595],
+    [0.6000, 0.5995, 0.5990, 0.5985, 0.5980, 0.5975, 0.5970, 0.5965, 0.5960, 0.5955, 0.5950, 0.5945, 0.5940, 0.5935, 0.5930, 0.5925, 0.5920, 0.5915, 0.5910, 0.5905, 0.5900, 0.5895, 0.5890, 0.5885, 0.5880, 0.5875, 0.5870, 0.5865, 0.5860, 0.5855, 0.5850, 0.5845],
+    [0.6250, 0.6245, 0.6240, 0.6235, 0.6230, 0.6225, 0.6220, 0.6215, 0.6210, 0.6205, 0.6200, 0.6195, 0.6190, 0.6185, 0.6180, 0.6175, 0.6170, 0.6165, 0.6160, 0.6155, 0.6150, 0.6145, 0.6140, 0.6135, 0.6130, 0.6125, 0.6120, 0.6115, 0.6110, 0.6105, 0.6100, 0.6095],
+    [0.6500, 0.6495, 0.6490, 0.6485, 0.6480, 0.6475, 0.6470, 0.6465, 0.6460, 0.6455, 0.6450, 0.6445, 0.6440, 0.6435, 0.6430, 0.6425, 0.6420, 0.6415, 0.6410, 0.6405, 0.6400, 0.6395, 0.6390, 0.6385, 0.6380, 0.6375, 0.6370, 0.6365, 0.6360, 0.6355, 0.6350, 0.6345],
+    [0.6750, 0.6745, 0.6740, 0.6735, 0.6730, 0.6725, 0.6720, 0.6715, 0.6710, 0.6705, 0.6700, 0.6695, 0.6690, 0.6685, 0.6680, 0.6675, 0.6670, 0.6665, 0.6660, 0.6655, 0.6650, 0.6645, 0.6640, 0.6635, 0.6630, 0.6625, 0.6620, 0.6615, 0.6610, 0.6605, 0.6600, 0.6595],
+    [0.7000, 0.6995, 0.6990, 0.6985, 0.6980, 0.6975, 0.6970, 0.6965, 0.6960, 0.6955, 0.6950, 0.6945, 0.6940, 0.6935, 0.6930, 0.6925, 0.6920, 0.6915, 0.6910, 0.6905, 0.6900, 0.6895, 0.6890, 0.6885, 0.6880, 0.6875, 0.6870, 0.6865, 0.6860, 0.6855, 0.6850, 0.6845],
+    [0.7250, 0.7245, 0.7240, 0.7235, 0.7230, 0.7225, 0.7220, 0.7215, 0.7210, 0.7205, 0.7200, 0.7195, 0.7190, 0.7185, 0.7180, 0.7175, 0.7170, 0.7165, 0.7160, 0.7155, 0.7150, 0.7145, 0.7140, 0.7135, 0.7130, 0.7125, 0.7120, 0.7115, 0.7110, 0.7105, 0.7100, 0.7095],
+    [0.7500, 0.7495, 0.7490, 0.7485, 0.7480, 0.7475, 0.7470, 0.7465, 0.7460, 0.7455, 0.7450, 0.7445, 0.7440, 0.7435, 0.7430, 0.7425, 0.7420, 0.7415, 0.7410, 0.7405, 0.7400, 0.7395, 0.7390, 0.7385, 0.7380, 0.7375, 0.7370, 0.7365, 0.7360, 0.7355, 0.7350, 0.7345],
+    [0.7750, 0.7745, 0.7740, 0.7735, 0.7730, 0.7725, 0.7720, 0.7715, 0.7710, 0.7705, 0.7700, 0.7695, 0.7690, 0.7685, 0.7680, 0.7675, 0.7670, 0.7665, 0.7660, 0.7655, 0.7650, 0.7645, 0.7640, 0.7635, 0.7630, 0.7625, 0.7620, 0.7615, 0.7610, 0.7605, 0.7600, 0.7595],
+    [0.8000, 0.7995, 0.7990, 0.7985, 0.7980, 0.7975, 0.7970, 0.7965, 0.7960, 0.7955, 0.7950, 0.7945, 0.7940, 0.7935, 0.7930, 0.7925, 0.7920, 0.7915, 0.7910, 0.7905, 0.7900, 0.7895, 0.7890, 0.7885, 0.7880, 0.7875, 0.7870, 0.7865, 0.7860, 0.7855, 0.7850, 0.7845],
+    [0.8250, 0.8245, 0.8240, 0.8235, 0.8230, 0.8225, 0.8220, 0.8215, 0.8210, 0.8205, 0.8200, 0.8195, 0.8190, 0.8185, 0.8180, 0.8175, 0.8170, 0.8165, 0.8160, 0.8155, 0.8150, 0.8145, 0.8140, 0.8135, 0.8130, 0.8125, 0.8120, 0.8115, 0.8110, 0.8105, 0.8100, 0.8095],
+    [0.8500, 0.8495, 0.8490, 0.8485, 0.8480, 0.8475, 0.8470, 0.8465, 0.8460, 0.8455, 0.8450, 0.8445, 0.8440, 0.8435, 0.8430, 0.8425, 0.8420, 0.8415, 0.8410, 0.8405, 0.8400, 0.8395, 0.8390, 0.8385, 0.8380, 0.8375, 0.8370, 0.8365, 0.8360, 0.8355, 0.8350, 0.8345],
+    [0.8750, 0.8745, 0.8740, 0.8735, 0.8730, 0.8725, 0.8720, 0.8715, 0.8710, 0.8705, 0.8700, 0.8695, 0.8690, 0.8685, 0.8680, 0.8675, 0.8670, 0.8665, 0.8660, 0.8655, 0.8650, 0.8645, 0.8640, 0.8635, 0.8630, 0.8625, 0.8620, 0.8615, 0.8610, 0.8605, 0.8600, 0.8595],
+];
+
+/// Replaces: e041_getChunkParamsFromCandidates
+///
+/// WRITES the chunk extent the search selected for each dim into `params`, then recomputes the
+/// compound dims that depend on them.
+///
+/// ⛔ "Index is out of range." AND BOTH `.at(dim)` LOOKUPS ARE [`SelectedCandidate`]'s: the candidate
+/// list, the index chosen into it and the `primaryDims` narrowing are ONE value before this is
+/// called, so the walk has nothing left to check.
+pub fn chunk_params_from_candidates(params: &mut FilledDims, candidates: &DscParamCandidates) {
+    for (dim, selected) in &candidates.0 {
+        params.set_extent(*dim, selected.extent());
+    }
+    params.compound();
+}
+
+/// Replaces: e042_getBurstEfficiency
+///
+/// The transfer efficiency the heuristic table states for a burst size and a multicast degree.
+///
+/// ⛔ THE TABLE IS TRANSCRIBED, NOT DERIVED: its 1024 entries do follow `0.075 + 0.025·burst -
+/// 0.0005·(degree - 1)`, and fitting a rule to data is how a coefficient chain gets golden-hacked.
+/// ⛔ TRAP: ITS WIDTH IS THE LITERAL `maxNumCores = 32` (`:1618`) while the degree is checked against
+/// `numCores`, so the two guards below are that mismatch turned into a build error.
+#[must_use]
+pub fn burst_efficiency(burst: BurstSize, multicast: MulticastCores) -> BurstEfficiency {
+    const { assert!(Target::L3_BURST <= 32, "the table states 32 burst sizes") }
+    const { assert!(Target::CORES <= 32, "the table states 32 multicast degrees") }
+    BurstEfficiency(BURST_EFFICIENCY[burst.index() as usize][multicast.index() as usize])
+}
+
+/// Replaces: e043_getLabeledDsNumOfStickVolumesInCore
+///
+/// The chunks a core is cut into along `lds`' non-broadcast dims, times the volumes one chunk holds.
+///
+/// ⛔ TWO DEAD PARAMETERS, BOTH THE REFERENCE'S: `primaryDims` is never read, and the `bytesPerStick`
+/// it hands `getBufferCapacityForNode` is read only under `forceEvenNumSticks`, which defaults false.
+/// ⛔ [`None`] IS A `DT_CHECK` ON DATA: an LX capacity that is not whole sticks, a stick volume that
+/// does not divide the chunk, or a chunk extent that does not divide the core's.
+#[must_use]
+pub fn labeled_ds_num_of_stick_volumes_in_core(
+    dsc: &DesignSpaceConfig,
+    lds: LdsIdx,
+    stick_volume: StickVolume,
+) -> Option<StickVolumes> {
+    let capacity = dsc.lx_chunk_capacity.get(&lds)?.0;
+    let bytes_per_stick = Target::BYTES_PER_STICK.get();
+    if capacity % bytes_per_stick != 0 {
+        return None;
+    }
+    let chunk_sticks = capacity / bytes_per_stick;
+    if chunk_sticks % stick_volume.get() != 0 {
+        return None;
+    }
+    let mut chunks: u64 = 1;
+    for dim in dsc.non_broadcast_lds_dims(lds)? {
+        let core = dsc.data_stages.core().ss_extent(dim)?.0;
+        let chunk = dsc.data_stages.chunk().ss_extent(dim)?.0;
+        if core < 0 || chunk <= 0 || core % chunk != 0 {
+            return None;
+        }
+        chunks *= (core / chunk) as u64;
+    }
+    Some(StickVolumes(chunks * chunk_sticks / stick_volume.get()))
+}
+
+/// Replaces: e044_getOpReducedDimSet
+///
+/// THE DIMS THE OP REDUCES AWAY — non-broadcast on some input and on no output.
+///
+/// ⛔ TRAP: `mySDsc` IS NEVER READ, and `isOutputLabeledDs` is `ldsIdx == labeledDs_.size() - 1`
+/// (`L3DlOpsScheduler.h:227`), so "the outputs" is the LAST entry and only ever that one.
+/// ⛔ TRAP: BOTH QUESTIONS ARE ASKED OF [`LabeledDs::recorded`], the entry's OWN `ldsIdx_`, and not
+/// of the position it sits at — so a recorded index that drifted answers for another position.
+#[must_use]
+pub fn op_reduced_dim_set(dsc: &DesignSpaceConfig) -> Option<BTreeSet<PrimaryDim>> {
+    let mut inputs: BTreeSet<PrimaryDim> = BTreeSet::new();
+    let mut outputs: BTreeSet<PrimaryDim> = BTreeSet::new();
+    for entry in dsc.labeled_ds.iter() {
+        let dims = dsc.non_broadcast_lds_dims(entry.recorded())?;
+        if dsc.labeled_ds.is_output(entry.recorded()) {
+            outputs.extend(dims);
+        } else {
+            inputs.extend(dims);
+        }
+    }
+    Some(inputs.difference(&outputs).copied().collect())
+}
+
+/// Replaces: e045_addSuperChunkDataStage
+///
+/// COPIES the chunk data stage into the superchunk stage, renamed `"superchunk"` on both halves.
+///
+/// ⛔ BOTH `DT_CHECK`s ARE DISCHARGED BEFORE THE CALL: [`SuperChunkStage`] witnesses that the index
+/// names an entry `getNewDataStageIndex` already inserted, and `DataStages` holds the chunk stage as
+/// a field rather than a map entry that might be missing.
+pub fn add_super_chunk_data_stage(dsc: &mut DesignSpaceConfig, super_chunk: SuperChunkStage) {
+    let mut stage = dsc.data_stages.chunk().clone();
+    stage.rename(StageName::super_chunk());
+    dsc.data_stages.set(super_chunk.index(), stage);
+}
+
+/// `lxBelowBlockNodeName` (`L3DlOpsScheduler.cpp:277`) — the block every LX-below schedule hangs from.
+pub const LX_BELOW_BLOCK_NODE_NAME: &str = "lx_below_schedule";
+
+/// Replaces: e046_getLxBelowBlockNode
+///
+/// THE `BLOCK` NODE NAMED `lx_below_schedule`, exclusively borrowed so its finder may edit it.
+///
+/// ⛔ TRAP: THE REFERENCE'S `nullptr` RETURN IS A LATENT CRASH IN ITS OWN CALLER —
+/// `L3DlOpsScheduler.cpp:2838` dereferences the result with no null check. Here that case is a
+/// [`None`] the caller has to name.
+pub fn lx_below_block_node(tree: &mut ScheduleTree) -> Option<&mut BlockNode> {
+    tree.find_block_mut(|block| block.name.0 == LX_BELOW_BLOCK_NODE_NAME)
+}
+
+/// Replaces: e047_collectAllDimensionsForLoopOrder
+///
+/// EVERY LAYOUT DIM ONCE, in `labeledDs_` order with the indirect-access-index structures LAST.
+///
+/// ⛔ TRAP: THE REFERENCE'S OWN `DT_CHECK` IS A TAUTOLOGY — `(dim != IJ || dim != KIJ)` holds for
+/// every dim there is, so the combined dims it claims to reject are collected like any other.
+/// ⛔ TRAP: TWO INDICES IN ONE LOOP — `indirectAccessLabeledDs` holds POINTERS into `labeledDs_`, so
+/// membership is by POSITION, while the index pushed is the entry's own [`LabeledDs::recorded`] one.
+#[must_use]
+pub fn collect_all_dimensions_for_loop_order(dsc: &DesignSpaceConfig) -> Option<Vec<PrimaryDim>> {
+    let mut order: Vec<LdsIdx> = Vec::new();
+    let mut low_priority: Vec<LdsIdx> = Vec::new();
+    for (position, entry) in dsc.labeled_ds.indexed() {
+        if dsc.indirect_access_index_lds.contains(&position) {
+            low_priority.push(entry.recorded());
+        } else {
+            order.push(entry.recorded());
+        }
+    }
+    order.append(&mut low_priority);
+    let mut dims: Vec<PrimaryDim> = Vec::new();
+    for lds in order {
+        for dim in dsc.layout_dims.get(&lds)?.iter() {
+            if !dims.contains(&dim) {
+                dims.push(dim);
+            }
+        }
+    }
+    Some(dims)
+}
+
+/// HOW MANY CORES TAKE THE SAME WORK SLICES — `shares`, the first half of the pair entry 048 returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Shares(pub u32);
+
+/// A GTR SHARING GROUP'S ID — `gtr_->groupName_`, `0..=maxGroupID` because the field is SIX BITS
+/// wide (`sysdef.cpp:230`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GtrGroupId(Bounded<{ Target::MAX_GROUP_ID + 1 }>);
+
+impl GtrGroupId {
+    /// A group id, `None` past `maxGroupID` — `DT_CHECK_MSG(gtrCurrGroupName <= maxGroupID,
+    /// "gtr_->groupName_ exceeds the limit.")` as a constructor.
+    #[must_use]
+    pub const fn checked(id: u32) -> Option<Self> {
+        match Bounded::checked(id) {
+            Some(id) => Some(Self(id)),
+            None => None,
+        }
+    }
+
+    /// The id itself, for the GTR field that carries it.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// WHICH SHARING GROUP A LABELLED DATA STRUCTURE'S CORES FORM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupName {
+    /// `maxGroupID + 1`, the default a lone core takes — ONE PAST every id a GTR can carry, so it is
+    /// not a group id and [`GtrGroupId`] rightly cannot hold it.
+    Unshared,
+    /// The id a set of two or more sharing cores was given, and keeps for every later query.
+    Shared(GtrGroupId),
+}
+
+/// THE GTR GROUP NAMES HANDED OUT SO FAR — `coresSetToGtrGroupNameMap` with `gtrCurrGroupName`
+/// (`L3DlOpsScheduler.h:214-219`), ONE value because the counter is read only to name a set of cores
+/// the map does not already hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GtrGroupNames {
+    next: u32,
+    named: BTreeMap<BTreeSet<Core>, GtrGroupId>,
+}
+
+impl GtrGroupNames {
+    /// No group named yet, which is `gtrCurrGroupName = 0` and an empty map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The name this set of cores carries, minting and recording a fresh one where it has none.
+    /// `None` is the 64 GTR groups exhausted.
+    pub fn name_for(&mut self, cores: &BTreeSet<Core>) -> Option<GtrGroupId> {
+        if let Some(name) = self.named.get(cores) {
+            return Some(*name);
+        }
+        let name = GtrGroupId::checked(self.next)?;
+        self.named.insert(cores.clone(), name);
+        self.next += 1;
+        Some(name)
+    }
+}
+
+/// Replaces: e048_getSharesAndGroupName
+///
+/// The processing cores taking `curr_wk_slices` on every non-broadcast dim of `lds`, and their name.
+///
+/// ⛔ TRAP: `dsc` IS READ ONLY FOR THE DIM LIST, asked of `lds`'s OWN [`LabeledDs::recorded`] index,
+/// and a name is minted per SET OF CORES — two unrelated transfers over the same cores share one.
+/// ⛔ [`None`] IS ONE OF THREE `DT_CHECK`s: a negative work-slice id, no matching core at all, or the
+/// GTR group ids exhausted.
+pub fn shares_and_group_name(
+    sdsc: &SuperDsc,
+    dsc: &DesignSpaceConfig,
+    lds: &LabeledDs,
+    curr_wk_slices: &WkSlice,
+    processing: &BTreeSet<Core>,
+    names: &mut GtrGroupNames,
+) -> Option<(Shares, GroupName)> {
+    let dims = dsc.non_broadcast_lds_dims(lds.recorded())?;
+    let mut sharing: BTreeSet<Core> = BTreeSet::new();
+    for (core, slices) in &sdsc.core_id_to_wk_slice {
+        if !processing.contains(core) {
+            continue;
+        }
+        let mut matches = true;
+        for &dim in &dims {
+            let mine = curr_wk_slices.at(dim)?;
+            let theirs = slices.at(dim)?;
+            if mine.0 < 0 || theirs.0 < 0 {
+                return None;
+            }
+            if mine != theirs {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            sharing.insert(*core);
+        }
+    }
+    if sharing.is_empty() {
+        return None;
+    }
+    let shares = Shares(sharing.len() as u32);
+    let name = if shares.0 > 1 {
+        GroupName::Shared(names.name_for(&sharing)?)
+    } else {
+        GroupName::Unshared
+    };
+    Some((shares, name))
+}
+
+#[cfg(test)]
+mod tests_e041_e048 {
+    use super::*;
+    use crate::arch::Bytes;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent;
+    use crate::schedule::ddc::metadata::DatastageId;
+    use crate::schedule::dsc2::{LayoutDims, NodeName, SchedNode};
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList, NamedDims,
+        SelectedCandidate, StageDims, WkSliceId,
+    };
+    use std::num::NonZeroU64;
+
+    fn dims(extents: &[(PrimaryDim, i64)]) -> FilledDims {
+        let mut stage = StageDims::default();
+        for (dim, extent) in extents {
+            stage.extents.insert(*dim, Extent(*extent));
+        }
+        FilledDims::of(stage).expect("a stage that states a dim")
+    }
+
+    fn stage(name: &str, extents: &[(PrimaryDim, i64)]) -> DataStage {
+        let name = StageName(name.to_owned());
+        DataStage {
+            ss: NamedDims {
+                name: name.clone(),
+                dims: dims(extents),
+            },
+            el: NamedDims {
+                name,
+                dims: dims(extents),
+            },
+        }
+    }
+
+    fn sized(recorded: LdsIdx, dims: &[PrimaryDim]) -> LabeledDs {
+        LabeledDs::new(
+            DsType::Input,
+            dims.iter().map(|dim| (*dim, Scale::Sized(1.0))).collect(),
+            recorded,
+            Pinning::default(),
+        )
+    }
+
+    fn dsc(core: &[(PrimaryDim, i64)], chunk: &[(PrimaryDim, i64)]) -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: Some(CoreletsUsed::ONE),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
+            layout_dims: BTreeMap::new(),
+            labeled_ds: LabeledDsList::new(sized(LdsIdx(0), &[]), vec![]),
+            data_stages: DataStages::new(stage("core", core), stage("chunk", chunk)),
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
+        }
+    }
+
+    /// e041 — the selected candidate is what each dim takes, and the compound dim follows from it.
+    #[test]
+    fn chunk_params_take_the_selected_candidate_then_compound() {
+        let mut params = dims(&[(PrimaryDim::I, 1), (PrimaryDim::J, 1)]);
+        let candidates = DscParamCandidates(BTreeMap::from([
+            (
+                PrimaryDim::I,
+                SelectedCandidate::new(vec![Extent(2), Extent(4)], 1).expect("a chosen candidate"),
+            ),
+            (
+                PrimaryDim::J,
+                SelectedCandidate::new(vec![Extent(3)], 0).expect("a chosen candidate"),
+            ),
+        ]));
+        chunk_params_from_candidates(&mut params, &candidates);
+        assert_eq!(params.dims().extent(PrimaryDim::I), Some(Extent(4)));
+        assert_eq!(params.dims().extent(PrimaryDim::J), Some(Extent(3)));
+        assert_eq!(params.dims().extent(PrimaryDim::Ij), Some(Extent(12)));
+        assert_eq!(SelectedCandidate::new(vec![Extent(2)], 1), None);
+    }
+
+    /// e042 — both corners of `BurstEfficiency.def`, and the two ranges its `DT_CHECK`s state.
+    #[test]
+    fn burst_efficiency_reads_the_table_corners() {
+        let one = BurstSize::new(1).expect("a burst of one stick");
+        let full = BurstSize::new(Target::L3_BURST).expect("a full burst");
+        let solo = MulticastCores::of(MulticastDegree(1)).expect("one core");
+        let every = MulticastCores::of(MulticastDegree(Target::CORES)).expect("every core");
+        assert_eq!(
+            burst_efficiency(one, solo).0.to_bits(),
+            0.1000_f64.to_bits()
+        );
+        assert_eq!(
+            burst_efficiency(full, every).0.to_bits(),
+            0.8595_f64.to_bits()
+        );
+        assert_eq!(BurstSize::new(0), None);
+        assert_eq!(BurstSize::new(Target::L3_BURST + 1), None);
+        assert_eq!(MulticastCores::of(MulticastDegree(0)), None);
+        assert_eq!(MulticastCores::of(MulticastDegree(Target::CORES + 1)), None);
+    }
+
+    /// e043 — four chunks of four sticks each, read two sticks at a time, is eight stick volumes.
+    #[test]
+    fn stick_volumes_in_core_multiply_the_chunks_by_the_volumes_per_chunk() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 2)]);
+        let lds = LdsIdx(0);
+        dsc.labeled_ds = LabeledDsList::new(sized(lds, &[PrimaryDim::I]), vec![]);
+        dsc.layout_dims
+            .insert(lds, LayoutDims::new(PrimaryDim::I, vec![]));
+        dsc.lx_chunk_capacity
+            .insert(lds, Bytes(4 * Target::BYTES_PER_STICK.get()));
+        let volume = StickVolume::new(NonZeroU64::new(2).expect("a positive volume"));
+        assert_eq!(
+            labeled_ds_num_of_stick_volumes_in_core(&dsc, lds, volume),
+            Some(StickVolumes(8))
+        );
+        let odd = StickVolume::new(NonZeroU64::new(3).expect("a positive volume"));
+        assert_eq!(
+            labeled_ds_num_of_stick_volumes_in_core(&dsc, lds, odd),
+            None
+        );
+    }
+
+    /// e044 — a dim the inputs carry and the output does not is the dim the op reduces away.
+    #[test]
+    fn op_reduced_dims_are_the_inputs_minus_the_output() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 1)], &[(PrimaryDim::I, 1)]);
+        dsc.labeled_ds = LabeledDsList::new(
+            sized(LdsIdx(0), &[PrimaryDim::I, PrimaryDim::Ki]),
+            vec![sized(LdsIdx(1), &[PrimaryDim::I])],
+        );
+        dsc.layout_dims.insert(
+            LdsIdx(0),
+            LayoutDims::new(PrimaryDim::I, vec![PrimaryDim::Ki]),
+        );
+        dsc.layout_dims
+            .insert(LdsIdx(1), LayoutDims::new(PrimaryDim::I, vec![]));
+        assert_eq!(
+            op_reduced_dim_set(&dsc),
+            Some(BTreeSet::from([PrimaryDim::Ki]))
+        );
+    }
+
+    /// e045 — the superchunk stage is the chunk stage's dims under the superchunk name, both halves.
+    #[test]
+    fn the_super_chunk_stage_is_the_chunk_stage_renamed() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 8)], &[(PrimaryDim::I, 2)]);
+        let minted = DatastageId(2);
+        dsc.data_stages
+            .set(minted, stage("2", &[(PrimaryDim::I, 1)]));
+        let witness = dsc
+            .data_stages
+            .super_chunk(minted)
+            .expect("an index getNewDataStageIndex already inserted");
+        add_super_chunk_data_stage(&mut dsc, witness);
+        let added = dsc.data_stages.at(minted).expect("the stage just written");
+        assert_eq!(added.name(), &StageName::super_chunk());
+        assert_eq!(added.el.name, StageName::super_chunk());
+        assert_eq!(added.ss_extent(PrimaryDim::I), Some(Extent(2)));
+        assert_eq!(dsc.data_stages.super_chunk(DatastageId(3)), None);
+    }
+
+    /// e046 — the named block is found below a loop, and a tree without it answers nothing.
+    #[test]
+    fn the_lx_below_block_node_is_found_under_a_loop() {
+        let named = BlockNode {
+            name: NodeName(LX_BELOW_BLOCK_NODE_NAME.to_owned()),
+            children: vec![],
+        };
+        let mut tree = ScheduleTree::new(BlockNode {
+            name: NodeName("head".to_owned()),
+            children: vec![SchedNode::Loop(BlockNode {
+                name: NodeName("loop_ds0_ds1".to_owned()),
+                children: vec![SchedNode::Block(named)],
+            })],
+        });
+        let found = lx_below_block_node(&mut tree).expect("the lx-below block");
+        found
+            .children
+            .push(SchedNode::Leaf(NodeName("t".to_owned())));
+        assert_eq!(tree.blocks_dfs().len(), 1);
+        assert_eq!(tree.blocks_dfs()[0].children.len(), 1);
+        assert_eq!(lx_below_block_node(&mut ScheduleTree::default()), None);
+    }
+
+    /// e047 — every layout dim once, with the indirect-access-index structure's dims last.
+    #[test]
+    fn the_loop_order_puts_the_indirect_access_index_dims_last() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 1)], &[(PrimaryDim::I, 1)]);
+        dsc.labeled_ds = LabeledDsList::new(sized(LdsIdx(0), &[]), vec![sized(LdsIdx(5), &[])]);
+        dsc.layout_dims.insert(
+            LdsIdx(0),
+            LayoutDims::new(PrimaryDim::I, vec![PrimaryDim::J]),
+        );
+        dsc.layout_dims.insert(
+            LdsIdx(5),
+            LayoutDims::new(PrimaryDim::Ki, vec![PrimaryDim::I]),
+        );
+        // Membership is by POSITION, while the layout is looked up by the RECORDED index 5.
+        dsc.indirect_access_index_lds.insert(LdsIdx(1));
+        assert_eq!(
+            collect_all_dimensions_for_loop_order(&dsc),
+            Some(vec![PrimaryDim::I, PrimaryDim::J, PrimaryDim::Ki])
+        );
+    }
+
+    /// e048 — two cores on the same slice share a name, and that name is kept for the same set.
+    #[test]
+    fn shares_and_group_name_memoise_the_set_of_sharing_cores() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 1)], &[(PrimaryDim::I, 1)]);
+        let lds = sized(LdsIdx(0), &[PrimaryDim::I]);
+        dsc.labeled_ds = LabeledDsList::new(lds.clone(), vec![]);
+        dsc.layout_dims
+            .insert(lds.recorded(), LayoutDims::new(PrimaryDim::I, vec![]));
+        let slice = |id: i32| WkSlice(BTreeMap::from([(PrimaryDim::I, WkSliceId(id))]));
+        let core = |index: u32| Core::checked(index).expect("core in range");
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::from([
+                (core(0), slice(0)),
+                (core(1), slice(0)),
+                (core(2), slice(1)),
+            ]),
+            BTreeMap::new(),
+        );
+        let processing = BTreeSet::from([core(0), core(1), core(2)]);
+        let mut names = GtrGroupNames::new();
+        let shared = shares_and_group_name(&sdsc, &dsc, &lds, &slice(0), &processing, &mut names);
+        assert_eq!(
+            shared,
+            Some((
+                Shares(2),
+                GroupName::Shared(GtrGroupId::checked(0).expect("id 0"))
+            ))
+        );
+        assert_eq!(
+            shares_and_group_name(&sdsc, &dsc, &lds, &slice(0), &processing, &mut names),
+            shared
+        );
+        assert_eq!(
+            shares_and_group_name(&sdsc, &dsc, &lds, &slice(1), &processing, &mut names),
+            Some((Shares(1), GroupName::Unshared))
+        );
+        assert_eq!(
+            shares_and_group_name(&sdsc, &dsc, &lds, &slice(2), &processing, &mut names),
+            None
+        );
+    }
+}
 
 /// Replaces: e049_calculateCoreletOffsetInByte
 ///
@@ -2474,7 +3081,7 @@ pub fn calculate_corelet_offset_in_byte<A: Arch, N: DimStage + ?Sized, C: DimSta
         return Some(offsets);
     }
 
-    let dims = dsc.non_broadcast_lds_dims(lds);
+    let dims = dsc.non_broadcast_lds_dims(lds)?;
     let split: Vec<PrimaryDim> = dims
         .iter()
         .copied()
@@ -2748,8 +3355,8 @@ mod tests_e049_e056 {
     use crate::schedule::ddc::fold::Stride;
     use crate::schedule::dsc2::{AllocLayout, LayoutDims, MaxDimSize, StartAddress};
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, CoreletsUsed, DscList, LabeledDsList, PlacedAllocation, PrimaryDsInfo,
-        StageDims,
+        CoreIdsUsed, CoreletsUsed, DataStage, DataStages, DscList, LabeledDsList, NamedDims,
+        PlacedAllocation, PrimaryDsInfo, StageDims,
     };
     use std::num::NonZeroU32;
 
@@ -2785,7 +3392,19 @@ mod tests_e049_e056 {
             )]),
             core_ids_used: CoreIdsUsed::new(core(0), vec![core(1)]),
             layout_dims: BTreeMap::from([(LdsIdx(0), layout)]),
-            core_stage: FilledDims::of(stage).expect("a stage that states a dim"),
+            data_stages: {
+                let named = NamedDims {
+                    name: StageName::default(),
+                    dims: FilledDims::of(stage).expect("a stage that states a dim"),
+                };
+                let stage = DataStage {
+                    ss: named.clone(),
+                    el: named,
+                };
+                DataStages::new(stage.clone(), stage)
+            },
+            indirect_access_index_lds: BTreeSet::new(),
+            lx_chunk_capacity: BTreeMap::new(),
             labeled_ds: LabeledDsList::new(
                 LabeledDs::new(
                     DsType::Input,
