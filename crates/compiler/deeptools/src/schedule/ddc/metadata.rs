@@ -132,58 +132,612 @@
 //! | `e103_getLoops` | 103 | 0 | 13 | `DataConnect` | `ddc/ddc_metadata.h:179` |
 //! | `e104_clear` | 104 | 0 | 4 | `Metadata` | `ddc/ddc_metadata.h:225` |
 
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    AbsoluteMin, Constraint, ConstraintKind, NoEpilogueDimKind,
+};
+use crate::schedule::dsc2::NodeName;
 
-// crustify:todo: e096_updateMin
-//   authority : ddc/ddc_metadata.h:40  (3 body lines, level 0)
-//   class     : Constraints
-//   original  : inline void updateMin(float newVal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:849-852
+// ═══ `Constraints` — THE FIELDS `dump` OBSERVES, AND THE THREE UPDATERS ══════════════════════════
 
-// crustify:todo: e097_updateMax
-//   authority : ddc/ddc_metadata.h:43  (3 body lines, level 0)
-//   class     : Constraints
-//   original  : inline void updateMax(float newVal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:862-865
+/// WHICH LOOP EXTENT A DATASTAGE CONSTRAINT NAMES — `MetaDimKind` (`dsc/dims.h:59`) less its `Count`
+/// terminator, which is the field's UNSET sentinel (`ddc/ddc_metadata.h:35`) and so is absence here.
+///
+/// ⛔ THE LABELS ARE `stringToMetaDimKind`'s (`dsc/dims.cpp:50-57`), which `e184_setMetaDimKind`
+/// parses back. `Count`'s own label there is `"undefined"` — a string [`Constraint::dump`] never
+/// prints, because it prints `NOT_SET` for that case instead (`ddc/ddc_metadata.h:51-54`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetaDimKind {
+    /// `unpadded`.
+    Unpadded,
+    /// `padded`.
+    Padded,
+    /// `pad_front`.
+    PadFront,
+    /// `pad_back`.
+    PadBack,
+    /// `pad_valid`.
+    PadValid,
+    /// `window`.
+    WindowDim,
+    /// `stride`.
+    Stride,
+    /// `dilation`.
+    Dilation,
+}
 
-// crustify:todo: e098_updateValues
-//   authority : ddc/ddc_metadata.h:46  (3 body lines, level 0)
-//   class     : Constraints
-//   original  : inline void updateValues(std::set<float> newVals)
-//   extract   : crustify-ddc/cpp/ddc.cpp:875-878
+impl MetaDimKind {
+    /// `EnumsConversion::metaDimKindToString.at(kind)` (`dsc/dims.cpp:50-57`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            MetaDimKind::Unpadded => "unpadded",
+            MetaDimKind::Padded => "padded",
+            MetaDimKind::PadFront => "pad_front",
+            MetaDimKind::PadBack => "pad_back",
+            MetaDimKind::PadValid => "pad_valid",
+            MetaDimKind::WindowDim => "window",
+            MetaDimKind::Stride => "stride",
+            MetaDimKind::Dilation => "dilation",
+        }
+    }
+}
 
-// crustify:todo: e099_dump
-//   authority : ddc/ddc_metadata.h:49  (23 body lines, level 0)
-//   class     : Constraints
-//   original  : void dump() const
-//   extract   : crustify-ddc/cpp/ddc.cpp:888-911
+impl NoEpilogueDimKind {
+    /// The `MetaDimKind` a no-epilogue kind IS — the three of nine that arm accepts.
+    #[must_use]
+    pub fn dim_kind(self) -> MetaDimKind {
+        match self {
+            NoEpilogueDimKind::Unpadded => MetaDimKind::Unpadded,
+            NoEpilogueDimKind::Padded => MetaDimKind::Padded,
+            NoEpilogueDimKind::WindowDim => MetaDimKind::WindowDim,
+        }
+    }
+}
 
-// crustify:todo: e100_insertProducer
-//   authority : ddc/ddc_metadata.h:147  (5 body lines, level 0)
-//   class     : DataConnect
-//   original  : void insertProducer(dsc2::ScheduleNode* node)
-//   extract   : crustify-ddc/cpp/ddc.cpp:921-926
+/// `mustBeMultiple_` AND `loopDimKind_` ON A RELATIVE CONSTRAINT (`ddc/ddc_metadata.h:34-35`).
+///
+/// ⛔⛔ `loopDimKind_` OUTLIVES `mustBeMultiple_`, WHICH IS WHY `Off` STILL CARRIES A KIND:
+/// `ddc/ddc_transformation.cpp:968-1035` sets `Unpadded` on constraints that are not multiples, and
+/// `dump` prints the kind unconditionally — a fold that dropped it could not state that constraint.
+///
+/// ⛔ THE TWO `DT_ERROR`s STAY UNREPRESENTABLE: `mustBeMultiple_` with no kind (`ddc/ddcv1.cpp:871-874`)
+/// and with a kind outside `{Unpadded, Padded, WindowDim}` (`:893-901`) have no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopMultiple {
+    /// `mustBeMultiple_` false, with whatever `loopDimKind_` holds — [`None`] for `Count`.
+    Off(Option<MetaDimKind>),
+    /// `mustBeMultiple_`, with the kind its no-epilogue divisibility test reads.
+    NoEpilogue(NoEpilogueDimKind),
+}
 
-// crustify:todo: e101_insertConsumer
-//   authority : ddc/ddc_metadata.h:153  (5 body lines, level 0)
-//   class     : DataConnect
-//   original  : void insertConsumer(dsc2::ScheduleNode* node)
-//   extract   : crustify-ddc/cpp/ddc.cpp:936-941
+impl<S> Constraint<'_, S> {
+    /// Replaces: e096_updateMin
+    ///
+    /// TIGHTENS THE LOWER BOUND — `min_ = min_ ? std::max(*min_, newVal) : newVal`
+    /// (`ddc/ddc_metadata.h:40`).
+    ///
+    /// ⛔ `max` TIGHTENS A *MIN*: the stricter of two lower bounds is the larger. And on the absolute
+    /// arm the bound doubles as the multiple ([`AbsoluteMin`]), so raising it raises both.
+    pub fn update_min(&mut self, new_val: f32) {
+        match &mut self.kind {
+            ConstraintKind::Absolute { min, .. } => {
+                *min = match *min {
+                    AbsoluteMin::Unset => AbsoluteMin::Bound(new_val),
+                    AbsoluteMin::Bound(min) => AbsoluteMin::Bound(stricter_min(min, new_val)),
+                    AbsoluteMin::Multiple(min) => AbsoluteMin::Multiple(stricter_min(min, new_val)),
+                };
+            }
+            ConstraintKind::Relative { min, .. } => {
+                *min = Some(min.map_or(new_val, |min| stricter_min(min, new_val)));
+            }
+        }
+    }
 
-// crustify:todo: e102_print
-//   authority : ddc/ddc_metadata.h:166  (11 body lines, level 0)
-//   class     : DataConnect
-//   original  : void print(std::ostream& outs) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:951-962
+    /// Replaces: e097_updateMax
+    ///
+    /// TIGHTENS THE UPPER BOUND — `max_ = max_ ? std::min(*max_, newVal) : newVal`
+    /// (`ddc/ddc_metadata.h:43`). ⛔ `min` TIGHTENS A *MAX*.
+    pub fn update_max(&mut self, new_val: f32) {
+        self.max = Some(self.max.map_or(new_val, |max| stricter_max(max, new_val)));
+    }
 
-// crustify:todo: e103_getLoops
-//   authority : ddc/ddc_metadata.h:179  (13 body lines, level 0)
-//   class     : DataConnect
-//   original  : std::unordered_set<const dsc2::LoopNode*> getLoops( const std::vector<dsc2::ScheduleNode*>& baseNodes) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:972-986
+    /// Replaces: e098_updateValues
+    ///
+    /// INTERSECTS THE PERMITTED RATIOS — `values_ = values_ ? set_intersect(*values_, newVals) :
+    /// newVals` (`ddc/ddc_metadata.h:46`, `util/utils.h:112`).
+    ///
+    /// ⛔⛔ THE FIRST CALL ADOPTS, IT DOES NOT INTERSECT — an ABSENT `values_` is unconstrained, where
+    /// an intersection may leave it ENGAGED AND EMPTY, which no size satisfies. Two different states,
+    /// and only the second is a contradiction.
+    pub fn update_values(&mut self, new_vals: &[f32]) {
+        let mut incoming = new_vals.to_vec();
+        incoming.sort_by(f32::total_cmp);
+        incoming.dedup();
+        self.values = Some(match &self.values {
+            Some(values) => values
+                .iter()
+                .copied()
+                .filter(|value| incoming.contains(value))
+                .collect(),
+            None => incoming,
+        });
+    }
 
+    /// Replaces: e099_dump
+    ///
+    /// THE CONSTRAINT AS `std::cerr` STATES IT — `ddc/ddc_metadata.h:49`, one trailing-newline line,
+    /// returned rather than written because the caller owns the stream.
+    ///
+    /// ⛔ AN UNSET `loopDimKind_` PRINTS `NOT_SET`, not the conversion map's `"undefined"` (`:51-54`),
+    /// and an unset bound prints `-inf` / `inf` — the bound it is ABSENT of, not one it holds.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        let (must_be_multiple, dim_kind, min) = match self.kind {
+            ConstraintKind::Absolute { dim_kind, min, .. } => (
+                matches!(min, AbsoluteMin::Multiple(_)),
+                dim_kind,
+                match min {
+                    AbsoluteMin::Unset => None,
+                    AbsoluteMin::Bound(min) | AbsoluteMin::Multiple(min) => Some(min),
+                },
+            ),
+            ConstraintKind::Relative { multiple, min, .. } => match multiple {
+                LoopMultiple::Off(dim_kind) => (false, dim_kind, min),
+                LoopMultiple::NoEpilogue(kind) => (true, Some(kind.dim_kind()), min),
+            },
+        };
+
+        let mut out = String::from("mustBeMultiple_= ");
+        out.push_str(if must_be_multiple { "T " } else { "F " });
+        out.push_str("loopDimKind_= ");
+        out.push_str(dim_kind.map_or("NOT_SET", MetaDimKind::label));
+        out.push_str(" , min_= ");
+        match min {
+            Some(min) => out.push_str(&format!("{} ", stream_float(min))),
+            None => out.push_str("-inf "),
+        }
+        out.push_str(", max_= ");
+        match self.max {
+            Some(max) => out.push_str(&format!("{} ", stream_float(max))),
+            None => out.push_str("inf "),
+        }
+        out.push_str(", values_= {");
+        if let Some(values) = &self.values {
+            for value in values {
+                out.push_str(&format!("{} ", stream_float(*value)));
+            }
+        }
+        out.push_str("}\n");
+        out
+    }
+}
+
+/// `std::max` ON TWO LOWER BOUNDS — spelled as the comparison it is, because `f32::max` prefers the
+/// non-NaN operand where `std::max(a, b)` returns `a` whenever the comparison is false.
+fn stricter_min(held: f32, new_val: f32) -> f32 {
+    if held < new_val { new_val } else { held }
+}
+
+/// `std::min` ON TWO UPPER BOUNDS — likewise `(b < a) ? b : a`.
+fn stricter_max(held: f32, new_val: f32) -> f32 {
+    if new_val < held { new_val } else { held }
+}
+
+/// `operator<<(std::ostream&, float)` AT THE DEFAULT PRECISION 6 — `%g`: six significant digits,
+/// trailing zeros dropped, scientific form outside `[1e-4, 1e6)` with a signed two-digit exponent.
+///
+/// ⛔ RUST'S `{}` IS NOT THIS. It prints the shortest decimal that round-trips, so a reciprocal like
+/// `1.0 / 3.0` (`ddc/ddcv1.cpp:759-765`) would come out `0.33333334` where the reference says
+/// `0.333333`.
+fn stream_float(value: f32) -> String {
+    if value.is_nan() {
+        return String::from("nan");
+    }
+    if value.is_infinite() {
+        return String::from(if value < 0.0 { "-inf" } else { "inf" });
+    }
+    // Six significant digits, whose exponent is the one `%g` chooses the form by — already rounded,
+    // so a value that carries to the next power of ten picks the form its printed digits deserve.
+    let scientific = format!("{value:.5e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .unwrap_or((scientific.as_str(), "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if (-4..6).contains(&exponent) {
+        let decimals = usize::try_from(5 - exponent).unwrap_or(0);
+        drop_trailing_zeros(format!("{value:.decimals$}"))
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        let digits = drop_trailing_zeros(mantissa.to_string());
+        format!("{digits}e{sign}{:02}", exponent.abs())
+    }
+}
+
+/// `%g`'s trailing-zero removal, and the point with them.
+fn drop_trailing_zeros(mut digits: String) -> String {
+    if digits.contains('.') {
+        while digits.ends_with('0') {
+            digits.pop();
+        }
+        if digits.ends_with('.') {
+            digits.pop();
+        }
+    }
+    digits
+}
+
+// ═══ `DataConnect` — THE TWO ENDS OF ONE `data_connect=` ════════════════════════════════════════
+
+/// WHERE A SCHEDULE NODE SITS IN THE WALK — its identity in the producer and consumer lists.
+///
+/// ⭐ POSITIONAL, BECAUSE THE REFERENCE'S IS A POINTER. `insertProducer(node)` stores the
+/// `ScheduleNode*` and deduplicates on it (`ddc/ddc_metadata.h:147-157`); an index into the DFS order
+/// is that identity without the walk, which is the mechanism for reaching the nodes rather than the
+/// census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NodeIndex(pub usize);
+
+/// ONE OF THOSE NODES THAT IS A `dsc2::LoopNode` — what `getOwnerLoop` hands back
+/// (`dsc/dsc2.cpp:1896`), still an index because a loop's own owner walk continues from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoopIndex(pub NodeIndex);
+
+impl LoopIndex {
+    /// The loop as a plain node.
+    #[must_use]
+    pub fn node(self) -> NodeIndex {
+        self.0
+    }
+}
+
+/// THE NAME A SCHEDULE NODE PRINTS UNDER — [`NodeName`] resolved from the census' positional
+/// identity, because the census projection carries no `name_` of its own.
+pub trait NodeNames {
+    /// `node->name_`.
+    fn name(&self, node: NodeIndex) -> &NodeName;
+}
+
+/// THE INNERMOST LOOP ENCLOSING A SCHEDULE NODE — `getOwnerLoop` walks `prev_` until `nodeType_ ==
+/// LOOP` (`dsc/dsc2.cpp:1896`), and [`None`] where that walk runs off the top of the tree.
+pub trait OwnerLoops {
+    /// `node->getOwnerLoop()`.
+    fn owner_loop(&self, node: NodeIndex) -> Option<LoopIndex>;
+}
+
+/// ONE DATA CONNECT'S TWO ENDS — `ddc::Metadata::DataConnect`'s `producers_` and `consumers_`
+/// (`ddc/ddc_metadata.h:143-145`), each deduplicated and in first-touch order as `insertProducer` and
+/// `insertConsumer` keep them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Ends {
+    producers: Vec<NodeIndex>,
+    consumers: Vec<NodeIndex>,
+}
+
+impl Ends {
+    /// The nodes that write this connect — NON-EMPTY in every completed census.
+    #[must_use]
+    pub fn producers(&self) -> &[NodeIndex] {
+        &self.producers
+    }
+
+    /// The nodes that read it, which may be none: a connect nothing consumes is legal.
+    #[must_use]
+    pub fn consumers(&self) -> &[NodeIndex] {
+        &self.consumers
+    }
+
+    /// Replaces: e100_insertProducer
+    ///
+    /// RECORDS A WRITER OF THIS CONNECT, ONCE — `if (!is_any_of(node, producers_))
+    /// producers_.push_back(node)` (`ddc/ddc_metadata.h:147`).
+    pub fn insert_producer(&mut self, node: NodeIndex) {
+        if !self.producers.contains(&node) {
+            self.producers.push(node);
+        }
+    }
+
+    /// Replaces: e101_insertConsumer
+    ///
+    /// RECORDS A READER OF THIS CONNECT, ONCE — `ddc/ddc_metadata.h:153`, the same test on the other
+    /// list.
+    pub fn insert_consumer(&mut self, node: NodeIndex) {
+        if !self.consumers.contains(&node) {
+            self.consumers.push(node);
+        }
+    }
+
+    /// Replaces: e102_print
+    ///
+    /// BOTH LISTS AS THE REFERENCE WRITES THEM — `ddc/ddc_metadata.h:166`, returned rather than
+    /// streamed because the caller owns `outs`.
+    ///
+    /// ⛔ CONSUMERS COME FIRST, and every name is PRECEDED by a space, so an empty list prints `[]`
+    /// and a one-name list prints `[ name]`.
+    #[must_use]
+    pub fn print<N: NodeNames + ?Sized>(&self, names: &N) -> String {
+        let mut out = String::from(" Consumers= [");
+        for consumer in &self.consumers {
+            out.push(' ');
+            out.push_str(&names.name(*consumer).0);
+        }
+        out.push_str("] Producers= [");
+        for producer in &self.producers {
+            out.push(' ');
+            out.push_str(&names.name(*producer).0);
+        }
+        out.push_str("]\n");
+        out
+    }
+
+    /// Replaces: e103_getLoops
+    ///
+    /// EVERY LOOP ENCLOSING ANY OF `base_nodes`, ANCESTORS INCLUDED — `ddc/ddc_metadata.h:179`.
+    ///
+    /// ⛔ THE `break` ON AN ALREADY-RECORDED LOOP LOSES NOTHING: that loop's own ancestors went in
+    /// when it did, so the walk it cuts short is one already taken. It is ALSO what terminates a
+    /// `prev_` cycle.
+    ///
+    /// ⭐ FIRST-TOUCH ORDER where the reference's `unordered_set` has none, which its only consumer
+    /// (`ddc/ddc_transformation_util.cpp:400-435`, a membership test) cannot tell apart.
+    fn loops<T: OwnerLoops + ?Sized>(base_nodes: &[NodeIndex], tree: &T) -> Vec<LoopIndex> {
+        let mut loops: Vec<LoopIndex> = Vec::new();
+        for base_node in base_nodes {
+            let mut owner = tree.owner_loop(*base_node);
+            while let Some(enclosing) = owner {
+                if loops.contains(&enclosing) {
+                    break;
+                }
+                loops.push(enclosing);
+                owner = tree.owner_loop(enclosing.node());
+            }
+        }
+        loops
+    }
+
+    /// `getProducerLoops()` (`ddc/ddc_metadata.h:159`) — a 3-line accessor recorded in
+    /// `EXCLUSIONS.tsv`, supplied because `getLoops` is private in the reference too.
+    #[must_use]
+    pub fn producer_loops<T: OwnerLoops + ?Sized>(&self, tree: &T) -> Vec<LoopIndex> {
+        Ends::loops(&self.producers, tree)
+    }
+
+    /// `getConsumerLoops()` (`ddc/ddc_metadata.h:162`) — likewise.
+    #[must_use]
+    pub fn consumer_loops<T: OwnerLoops + ?Sized>(&self, tree: &T) -> Vec<LoopIndex> {
+        Ends::loops(&self.consumers, tree)
+    }
+}
+
+// ⛔ NOT THIS BATCH — `e104_clear` is the `Metadata` unit, and its anchor stands untouched.
 // crustify:todo: e104_clear
 //   authority : ddc/ddc_metadata.h:225  (4 body lines, level 0)
 //   class     : Metadata
 //   original  : void clear()
 //   extract   : crustify-ddc/cpp/ddc.cpp:996-1000
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{
+        Ends, LoopIndex, LoopMultiple, MetaDimKind, NodeIndex, NodeName, NodeNames, OwnerLoops,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        AbsoluteMin, Constraint, ConstraintKind, NoEpilogueDimKind,
+    };
+
+    /// An absolute constraint with no dim kind — the arm where `min_` doubles as the multiple.
+    fn absolute(min: AbsoluteMin) -> Constraint<'static, ()> {
+        Constraint {
+            kind: ConstraintKind::Absolute {
+                cannot_be_symbolic: false,
+                dim_kind: None,
+                min,
+            },
+            max: None,
+            values: None,
+        }
+    }
+
+    /// A relative constraint against `reference`, whose `min_` is a bare bound.
+    fn relative(min: Option<f32>, reference: &(), multiple: LoopMultiple) -> Constraint<'_, ()> {
+        Constraint {
+            kind: ConstraintKind::Relative {
+                reference,
+                min,
+                multiple,
+            },
+            max: None,
+            values: None,
+        }
+    }
+
+    /// A schedule tree as two tables — a name per node, and each node's `prev_` walk already resolved
+    /// to the loop it lands on.
+    struct Tree {
+        names: Vec<NodeName>,
+        unnamed: NodeName,
+        owner: Vec<Option<usize>>,
+    }
+
+    impl NodeNames for Tree {
+        fn name(&self, node: NodeIndex) -> &NodeName {
+            self.names.get(node.0).unwrap_or(&self.unnamed)
+        }
+    }
+
+    impl OwnerLoops for Tree {
+        fn owner_loop(&self, node: NodeIndex) -> Option<LoopIndex> {
+            self.owner
+                .get(node.0)
+                .copied()
+                .flatten()
+                .map(|at| LoopIndex(NodeIndex(at)))
+        }
+    }
+
+    /// 🎯 096/382 THE LARGER LOWER BOUND WINS, AND ON THE ABSOLUTE ARM IT IS ALSO THE MULTIPLE —
+    /// `ddc/ddc_metadata.h:40`.
+    #[test]
+    fn a_second_min_keeps_the_larger_and_the_first_one_adopts() {
+        let mut unset = absolute(AbsoluteMin::Unset);
+        unset.update_min(4.0);
+        assert_eq!(
+            unset.kind,
+            ConstraintKind::Absolute {
+                cannot_be_symbolic: false,
+                dim_kind: None,
+                min: AbsoluteMin::Bound(4.0),
+            }
+        );
+        // ⛔ A LOOSER BOUND CHANGES NOTHING, and the multiple relationship survives the raise.
+        let mut multiple = absolute(AbsoluteMin::Multiple(4.0));
+        multiple.update_min(2.0);
+        multiple.update_min(8.0);
+        assert_eq!(
+            multiple.kind,
+            ConstraintKind::Absolute {
+                cannot_be_symbolic: false,
+                dim_kind: None,
+                min: AbsoluteMin::Multiple(8.0),
+            }
+        );
+        let reference = ();
+        // ⛔ AND ON THE RELATIVE ARM `min_` IS A BARE BOUND: raising it leaves `mustBeMultiple_` and
+        // its dim kind exactly where they were.
+        let mut ratio = relative(
+            Some(0.5),
+            &reference,
+            LoopMultiple::NoEpilogue(NoEpilogueDimKind::Padded),
+        );
+        ratio.update_min(0.25);
+        assert_eq!(
+            ratio.kind,
+            ConstraintKind::Relative {
+                reference: &reference,
+                min: Some(0.5),
+                multiple: LoopMultiple::NoEpilogue(NoEpilogueDimKind::Padded),
+            }
+        );
+    }
+
+    /// 🎯 097/382 THE SMALLER UPPER BOUND WINS — `ddc/ddc_metadata.h:43`.
+    #[test]
+    fn a_second_max_keeps_the_smaller_and_the_first_one_adopts() {
+        let mut constraint = absolute(AbsoluteMin::Unset);
+        constraint.update_max(4.0);
+        assert_eq!(constraint.max, Some(4.0));
+        constraint.update_max(8.0);
+        assert_eq!(constraint.max, Some(4.0));
+        constraint.update_max(1.0);
+        assert_eq!(constraint.max, Some(1.0));
+    }
+
+    /// 🎯 098/382 ⛔ THE FIRST SET IS ADOPTED WHOLE AND LATER ONES INTERSECT, WHICH CAN LEAVE THE SET
+    /// ENGAGED AND EMPTY — `ddc/ddc_metadata.h:46`.
+    #[test]
+    fn the_first_values_are_adopted_and_an_intersection_may_empty_them() {
+        let mut constraint = absolute(AbsoluteMin::Unset);
+        // ⛔ NOT AN INTERSECTION WITH `None`: absent means unconstrained, so this keeps all three.
+        constraint.update_values(&[4.0, 1.0, 2.0, 1.0]);
+        assert_eq!(constraint.values, Some(vec![1.0, 2.0, 4.0]));
+        constraint.update_values(&[2.0, 4.0, 8.0]);
+        assert_eq!(constraint.values, Some(vec![2.0, 4.0]));
+        // ⛔ ENGAGED AND EMPTY IS UNSATISFIABLE, and it is NOT the same state as absent.
+        constraint.update_values(&[16.0]);
+        assert_eq!(constraint.values, Some(vec![]));
+    }
+
+    /// 🎯 099/382 THE LINE `std::cerr` GETS, INCLUDING `%g`'s SIX SIGNIFICANT DIGITS AND THE
+    /// `NOT_SET` / `-inf` / `inf` ABSENCES — `ddc/ddc_metadata.h:49`.
+    #[test]
+    fn a_dumped_constraint_states_every_field_the_way_the_stream_does() {
+        let mut constraint = absolute(AbsoluteMin::Multiple(1.0 / 3.0));
+        constraint.max = Some(1e7);
+        constraint.values = Some(vec![0.5, 64.0, 1e-5]);
+        // ⛔ `0.333333`, NOT Rust's round-tripping `0.33333334`; and `%g` leaves `[1e-4, 1e6)` at both
+        // ends of the value list.
+        assert_eq!(
+            constraint.dump(),
+            "mustBeMultiple_= T loopDimKind_= NOT_SET , min_= 0.333333 , max_= 1e+07 , \
+             values_= {0.5 64 1e-05 }\n"
+        );
+        // A kind on a constraint that is NOT a multiple is exactly what `ddc_transformation.cpp:968`
+        // sets, and both bounds absent print as the infinities they are.
+        let reference = ();
+        let plain = relative(
+            None,
+            &reference,
+            LoopMultiple::Off(Some(MetaDimKind::Unpadded)),
+        );
+        assert_eq!(
+            plain.dump(),
+            "mustBeMultiple_= F loopDimKind_= unpadded , min_= -inf , max_= inf , values_= {}\n"
+        );
+    }
+
+    /// 🎯 100/382 · 101/382 EACH SIDE RECORDS A NODE ONCE, IN FIRST-TOUCH ORDER, AND THE TWO LISTS ARE
+    /// INDEPENDENT — `ddc/ddc_metadata.h:147-157`.
+    #[test]
+    fn a_node_inserted_twice_on_a_side_is_one_entry_there_and_still_free_on_the_other() {
+        let mut ends = Ends::default();
+        ends.insert_producer(NodeIndex(2));
+        ends.insert_producer(NodeIndex(0));
+        ends.insert_producer(NodeIndex(2));
+        assert_eq!(ends.producers(), [NodeIndex(2), NodeIndex(0)]);
+        // ⛔ A NODE THAT PRODUCES AND CONSUMES THE SAME CONNECT IS ON BOTH LISTS: the test is
+        // per-list.
+        ends.insert_consumer(NodeIndex(2));
+        assert_eq!(ends.consumers(), [NodeIndex(2)]);
+    }
+
+    /// 🎯 102/382 CONSUMERS FIRST, EACH NAME PRECEDED BY A SPACE, AND AN EMPTY SIDE PRINTS `[]` —
+    /// `ddc/ddc_metadata.h:166`.
+    #[test]
+    fn a_printed_data_connect_leads_with_its_consumers() {
+        let named = |name: &str| NodeName(name.to_string());
+        let tree = Tree {
+            names: vec![named("ht_out"), named("pe_mac"), named("sfp_act")],
+            unnamed: named(""),
+            owner: vec![],
+        };
+        let mut ends = Ends::default();
+        ends.insert_producer(NodeIndex(0));
+        ends.insert_consumer(NodeIndex(1));
+        ends.insert_consumer(NodeIndex(2));
+        assert_eq!(
+            ends.print(&tree),
+            " Consumers= [ pe_mac sfp_act] Producers= [ ht_out]\n"
+        );
+        assert_eq!(
+            Ends::default().print(&tree),
+            " Consumers= [] Producers= []\n"
+        );
+    }
+
+    /// 🎯 103/382 THE ANCESTOR CHAIN OF EVERY END, WITH THE SHARED TAIL WALKED ONCE — and the `break`
+    /// that makes a `prev_` cycle terminate (`ddc/ddc_metadata.h:179`).
+    #[test]
+    fn the_loops_of_an_end_are_its_ancestors_and_a_shared_tail_is_not_rewalked() {
+        // 0 and 4 are leaves; loops 3 -> 2 -> 1 nest, and 1 is outermost. Loop 5 owns itself.
+        let tree = Tree {
+            names: vec![],
+            unnamed: NodeName(String::new()),
+            owner: vec![Some(3), None, Some(1), Some(2), Some(2), Some(5)],
+        };
+        let mut ends = Ends::default();
+        ends.insert_producer(NodeIndex(0));
+        ends.insert_producer(NodeIndex(4));
+        // ⛔ NODE 4's OWNER 2 IS ALREADY RECORDED, so its walk stops there — and loses nothing,
+        // because 1 went in behind 2 the first time.
+        assert_eq!(
+            ends.producer_loops(&tree),
+            [
+                LoopIndex(NodeIndex(3)),
+                LoopIndex(NodeIndex(2)),
+                LoopIndex(NodeIndex(1)),
+            ]
+        );
+        // ⛔ A SELF-OWNING LOOP TERMINATES: node 5's owner is 5, recorded once and then broken on.
+        ends.insert_consumer(NodeIndex(5));
+        assert_eq!(ends.consumer_loops(&tree), [LoopIndex(NodeIndex(5))]);
+    }
+}
