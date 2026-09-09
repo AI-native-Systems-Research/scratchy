@@ -267,7 +267,8 @@
 //! | `e380_setChunkDataStageParams` | 380 | 8 | 129 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1439` |
 //! | `e382_run` | 382 | 9 | 122 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912` |
 
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::arch::Elements;
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::dsc2::LdsIdx;
 use crate::schedule::l3::dsc::{
@@ -478,8 +479,8 @@ pub fn has_dimension_reuse(dsc: &DesignSpaceConfig) -> bool {
         return false;
     }
     let mut count_per_dim: BTreeMap<PrimaryDim, usize> = BTreeMap::new();
-    for layout in dsc.primary_ds_info.values() {
-        for dim in layout.iter() {
+    for info in dsc.primary_ds_info.values() {
+        for dim in info.layout.iter() {
             *count_per_dim.entry(dim).or_insert(0) += 1;
         }
     }
@@ -489,11 +490,11 @@ pub fn has_dimension_reuse(dsc: &DesignSpaceConfig) -> bool {
 #[cfg(test)]
 mod tests_e001_e008 {
     use super::*;
-    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
     use crate::schedule::dsc2::LayoutDims;
     use crate::schedule::l3::dsc::{
-        CoreIdsUsed, CoreletsUsed, DimPadding, DscList, Granularity, MaxSize, PadElems, PadSizes,
-        StageDims, Symbolic, VolumeLimit, WkSlice, WkSliceId,
+        CoreIdsUsed, CoreletsUsed, DimPadding, DscList, Granularity, LabeledDsList, MaxSize,
+        PadElems, PadSizes, PrimaryDsInfo, StageDims, Symbolic, VolumeLimit, WkSlice, WkSliceId,
     };
     use std::num::NonZeroU32;
 
@@ -512,6 +513,21 @@ mod tests_e001_e008 {
             primary_ds_info: BTreeMap::new(),
             core_ids_used: CoreIdsUsed::new(core(0), vec![]),
             layout_dims: BTreeMap::new(),
+            core_stage: one_dim_stage(),
+            labeled_ds: LabeledDsList::new(LabeledDs::new(DsType::Output, vec![]), vec![]),
+        }
+    }
+
+    fn one_dim_stage() -> FilledDims {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::In, Extent(1));
+        filled(dims)
+    }
+
+    fn layout_only(layout: LayoutDims) -> PrimaryDsInfo {
+        PrimaryDsInfo {
+            layout,
+            stick: StickDims::default(),
         }
     }
 
@@ -596,6 +612,7 @@ mod tests_e001_e008 {
                 front: PadElems(1),
                 back: PadElems(0),
             },
+            ..DimPadding::default()
         };
         let mut dims = StageDims::default();
         dims.extents.insert(PrimaryDim::In, Extent(16));
@@ -605,14 +622,7 @@ mod tests_e001_e008 {
         dims.padding.insert(PrimaryDim::Out, padded(None));
         dims.padding
             .insert(PrimaryDim::Ij, padded(Some(PrimaryDim::Out)));
-        dims.padding.insert(
-            PrimaryDim::Mb,
-            DimPadding {
-                sizes: PadSizes::Unpadded,
-                window_dim: None,
-                unneeded: UnneededPad::NONE,
-            },
-        );
+        dims.padding.insert(PrimaryDim::Mb, DimPadding::default());
         let mut reference = dims.clone();
         reference.extents.insert(PrimaryDim::Out, Extent(32));
         let ref_ds = filled(reference);
@@ -746,22 +756,24 @@ mod tests_e001_e008 {
         let mut dsc = plain_dsc();
         dsc.primary_ds_info.insert(
             DsType::Input,
-            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]),
+            layout_only(LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out])),
         );
-        dsc.primary_ds_info
-            .insert(DsType::Kernel, LayoutDims::new(PrimaryDim::Out, vec![]));
+        dsc.primary_ds_info.insert(
+            DsType::Kernel,
+            layout_only(LayoutDims::new(PrimaryDim::Out, vec![])),
+        );
         assert!(has_dimension_reuse(&dsc));
 
         dsc.primary_ds_info.insert(
             DsType::Kernel,
-            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]),
+            layout_only(LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out])),
         );
         assert!(!has_dimension_reuse(&dsc));
 
         dsc.primary_ds_info.remove(&DsType::Kernel);
         dsc.primary_ds_info.insert(
             DsType::Output,
-            LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::Y]),
+            layout_only(LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::Y])),
         );
         assert!(!has_dimension_reuse(&dsc));
     }
@@ -1189,53 +1201,428 @@ mod tests_e025_e032 {
     }
 }
 
-// crustify:todo: e033_isOpFuncDepthwiseConv
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:843  (5 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncDepthwiseConv(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:796-801
+/// Replaces: e033_isOpFuncDepthwiseConv
+///
+/// Whether the op is the depthwise convolution — a set of exactly one.
+#[must_use]
+pub const fn is_op_func_depthwise_conv(op_func: OpFunc) -> bool {
+    matches!(op_func, OpFunc::DepthwiseConvFwd)
+}
 
-// crustify:todo: e034_isOpFuncQuantization
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:849  (8 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncQuantization(const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:811-819
+/// Replaces: e034_isOpFuncQuantization
+///
+/// Whether the op quantizes — the twelve `Q_FP8`/`CSQ_INT8`/`CSQ_INT4` spellings the scheduler lists.
+///
+/// ⛔ THE SET IS NOT EVERY QUANTIZER THE MACHINE HAS: `Q_FP8_MB`, `CSQ_INT8_V2` and `CSQ_INT8_MB_V2`
+/// are members of `OpFuncs` and ABSENT from this set, so `getMinParamForDimFromOpFunc` gives them the
+/// default minimum of 1 rather than the quantizer's 64 on `IN`/`OUT`.
+#[must_use]
+pub const fn is_op_func_quantization(op_func: OpFunc) -> bool {
+    matches!(
+        op_func,
+        OpFunc::QFp8
+            | OpFunc::QFp8Ch
+            | OpFunc::QFp8Chil
+            | OpFunc::QFp8Wt
+            | OpFunc::CsqInt8
+            | OpFunc::CsqInt8Ch
+            | OpFunc::CsqInt8Wt
+            | OpFunc::CsqInt8Chil
+            | OpFunc::CsqInt8Mb
+            | OpFunc::CsqInt4
+            | OpFunc::CsqInt4Wt
+            | OpFunc::CsqInt4Chil
+    )
+}
 
-// crustify:todo: e035_isOpFuncConversionDl16AndFp32
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:858  (5 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isOpFuncConversionDl16AndFp32( const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:829-835
+/// Replaces: e035_isOpFuncConversionDl16AndFp32
+///
+/// Whether the op converts between DL16 and FP32, in either direction.
+///
+/// ⛔ `FP8TODL16` AND `DL16TOBF16` ARE CONVERSIONS TOO AND ARE NOT IN THE SET, so the stick-size
+/// minimum of [`min_param_conversion_dl16_and_fp32`] is never taken for them.
+#[must_use]
+pub const fn is_op_func_conversion_dl16_and_fp32(op_func: OpFunc) -> bool {
+    matches!(op_func, OpFunc::Dl16Tofp32 | OpFunc::Fp32Todl16)
+}
 
-// crustify:todo: e036_getMinParamScalarBroadcast
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1008  (16 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamScalarBroadcast( const DesignSpaceConfig& dsc, const PrimaryDimTypes dim) const
-//   extract   : crustify-ddc/cpp/l3.cpp:845-862
+/// `constexpr long defaultParam = 1` — the minimum every min-param unit falls back to, and what a
+/// chunk of one element along a dim means.
+const DEFAULT_MIN_PARAM: Extent = Extent(1);
 
-// crustify:todo: e037_getMinParamReduction
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1026  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamReduction(const DesignSpaceConfig& dsc, const PrimaryDimTypes dim) const
-//   extract   : crustify-ddc/cpp/l3.cpp:872-885
+/// `stickSizes.count(dim) ? stickSizes.at(dim) : defaultParam` — the lookup both stick-size arms make.
+///
+/// ⛔ `None` IS A WIDTH THAT DOES NOT FIT THE REFERENCE'S `int`: the answer becomes a data stage's
+/// extent, and an extent that cannot be counted is no minimum at all.
+fn stick_size_or_default(sizes: &[(PrimaryDim, Elements)], dim: PrimaryDim) -> Option<Extent> {
+    match sizes.iter().find(|(named, _)| *named == dim) {
+        Some((_, size)) => i64::try_from(size.0).ok().map(Extent),
+        None => Some(DEFAULT_MIN_PARAM),
+    }
+}
 
-// crustify:todo: e038_getMinParamPoolingAndDepthwiseConv
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1040  (22 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamPoolingAndDepthwiseConv( const DesignSpaceConfig& dsc, const PrimaryDimTypes dim, const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:895-919
+/// Replaces: e036_getMinParamScalarBroadcast
+///
+/// The smallest chunk a scalar or broadcast op may take of `dim`: the core stage's own extent on `J`,
+/// otherwise the LAST labelled data structure's cumulative stick size, or 1 where the stick does not
+/// name the dim.
+///
+/// ⛔ `None` IS THE REFERENCE'S `-1` AND ITS `.at()` THROW AT ONCE — a `J` the core stage does not
+/// state becomes a NEGATIVE minimum parameter at `primaryDimToValHandler_st(dim) = ...` (`:1397`),
+/// and `primaryDsInfo_.at(labeledDs_.back().dsType_)` throws for a structure with no stick.
+#[must_use]
+pub fn min_param_scalar_broadcast(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> Option<Extent> {
+    match dim {
+        PrimaryDim::J => dsc.core_stage.dims().extent(dim),
+        _ => {
+            let sizes = dsc.cumulative_stick_sizes(dsc.labeled_ds.back().ds_type())?;
+            stick_size_or_default(&sizes, dim)
+        }
+    }
+}
 
-// crustify:todo: e039_getMinParamQuantization
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1065  (31 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamQuantization(const DesignSpaceConfig& dsc, const PrimaryDimTypes dim, const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:929-962
+/// Replaces: e037_getMinParamReduction
+///
+/// The smallest chunk a reduction may take of `dim`: the core stage's own extent on `J` — the
+/// reduction axis, which cannot be split — and one everywhere else.
+///
+/// ⛔ `None` IS THE REFERENCE'S `-1` ON THE `J` ARM, as in [`min_param_scalar_broadcast`].
+#[must_use]
+pub fn min_param_reduction(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> Option<Extent> {
+    match dim {
+        PrimaryDim::J => dsc.core_stage.dims().extent(dim),
+        _ => Some(DEFAULT_MIN_PARAM),
+    }
+}
 
-// crustify:todo: e040_getMinParamConversionDl16AndFp32
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1099  (17 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : long L3DlOpsScheduler::getMinParamConversionDl16AndFp32( const DesignSpaceConfig& dsc, const PrimaryDimTypes dim, const OpFuncs opFuncName) const
-//   extract   : crustify-ddc/cpp/l3.cpp:972-991
+/// Replaces: e038_getMinParamPoolingAndDepthwiseConv
+///
+/// Pooling and depthwise-conv minima: `OUT` is 64 whatever the stage says, `J`/`KI`/`KJ` are the core
+/// stage's extent — and so is `IN`, but for depthwise conv only — and everything else is one.
+///
+/// ⛔ THE 64 IS NOT READ FROM THE ARCH, and it is the one arm that cannot come back absent: the other
+/// three carriers hand back the reference's `-1` when the core stage does not state the dim.
+#[must_use]
+pub fn min_param_pooling_and_depthwise_conv(
+    dsc: &DesignSpaceConfig,
+    dim: PrimaryDim,
+    op_func: OpFunc,
+) -> Option<Extent> {
+    let core_param = dsc.core_stage.dims().extent(dim);
+    match dim {
+        PrimaryDim::In if is_op_func_depthwise_conv(op_func) => core_param,
+        PrimaryDim::Out => Some(Extent(64)),
+        PrimaryDim::J | PrimaryDim::Ki | PrimaryDim::Kj => core_param,
+        _ => Some(DEFAULT_MIN_PARAM),
+    }
+}
+
+/// Replaces: e039_getMinParamQuantization
+///
+/// Quantizer minima: a dim that carries padding must be taken WHOLE, `J` is always the core stage's
+/// extent, and an unpadded `IN`/`OUT` is 128 for `CSQ_INT4`/`CSQ_INT4_CHIL` and 64 for the rest.
+///
+/// ⛔ `CSQ_INT4_WT` IS INT4 AND TAKES THE 64, not the 128 — the test names two spellings, not a
+/// width. ⛔ AND `hasPadding` IS COMPUTED BEFORE THE SWITCH, so [`StageDims::has_padding`]'s aborts
+/// reach every dim, `J` included, and the compound `IJ`/`KIJ` that `calculate_padded` refuses
+/// outright takes the whole unit down with it whenever it carries a `paddingSizes_` entry.
+#[must_use]
+pub fn min_param_quantization(
+    dsc: &DesignSpaceConfig,
+    dim: PrimaryDim,
+    op_func: OpFunc,
+) -> Option<Extent> {
+    let core = dsc.core_stage.dims();
+    let has_padding = core.has_padding(dim)?;
+    match dim {
+        PrimaryDim::J => core.extent(dim),
+        PrimaryDim::In | PrimaryDim::Out if has_padding => core.extent(dim),
+        PrimaryDim::In | PrimaryDim::Out => {
+            if matches!(op_func, OpFunc::CsqInt4 | OpFunc::CsqInt4Chil) {
+                Some(Extent(128))
+            } else {
+                Some(Extent(64))
+            }
+        }
+        _ if has_padding => core.extent(dim),
+        _ => Some(DEFAULT_MIN_PARAM),
+    }
+}
+
+/// Replaces: e040_getMinParamConversionDl16AndFp32
+///
+/// DL16↔FP32 conversion minima: the core stage's extent on `J`, otherwise the cumulative stick size
+/// of the FIRST labelled data structure for `DL16TOFP32` and of the LAST for `FP32TODL16`.
+///
+/// ⛔ FRONT/BACK IS POSITIONAL, NOT INPUT/OUTPUT BY NAME — the arm picks `labeledDs_.front()` or
+/// `.back()`, so which structure it lands on is the DSC's list order and not a `DsTypes` test. An
+/// `opFuncName` that is neither direction takes the `.back()` arm, so this is safe to ask of any op.
+#[must_use]
+pub fn min_param_conversion_dl16_and_fp32(
+    dsc: &DesignSpaceConfig,
+    dim: PrimaryDim,
+    op_func: OpFunc,
+) -> Option<Extent> {
+    match dim {
+        PrimaryDim::J => dsc.core_stage.dims().extent(dim),
+        _ => {
+            let lds = if matches!(op_func, OpFunc::Dl16Tofp32) {
+                dsc.labeled_ds.front()
+            } else {
+                dsc.labeled_ds.back()
+            };
+            let sizes = dsc.cumulative_stick_sizes(lds.ds_type())?;
+            stick_size_or_default(&sizes, dim)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_e033_e040 {
+    use super::*;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DimPadding, LabeledDsList, PadElems, PadSizes, PrimaryDsInfo,
+        StageDims,
+    };
+
+    /// A core data stage stating exactly the given extents.
+    fn stage(extents: &[(PrimaryDim, i64)]) -> FilledDims {
+        let mut dims = StageDims::default();
+        for &(dim, extent) in extents {
+            dims.extents.insert(dim, Extent(extent));
+        }
+        FilledDims::of(dims).expect("a stage that states a dim")
+    }
+
+    /// A primary data structure whose stick names the dims given, in that order.
+    fn stick(dims: &[(PrimaryDim, u64)]) -> PrimaryDsInfo {
+        let (first, _) = *dims.first().expect("a stick with a dim in it");
+        PrimaryDsInfo {
+            layout: LayoutDims::new(first, dims[1..].iter().map(|(dim, _)| *dim).collect()),
+            stick: StickDims(dims.iter().map(|&(dim, e)| (dim, Elements(e))).collect()),
+        }
+    }
+
+    fn config(core_stage: FilledDims, labeled: &[DsType]) -> DesignSpaceConfig {
+        let (first, rest) = labeled.split_first().expect("a DSC labels a structure");
+        DesignSpaceConfig {
+            corelets_used: CoreletsUsed::ONE,
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
+            layout_dims: BTreeMap::new(),
+            core_stage,
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(*first, vec![]),
+                rest.iter().map(|ds| LabeledDs::new(*ds, vec![])).collect(),
+            ),
+        }
+    }
+
+    /// e033 — one member, and the pooling op next to it in `isOpFuncStridedWindow` is not it.
+    #[test]
+    fn depthwise_conv_is_a_set_of_one() {
+        assert!(is_op_func_depthwise_conv(OpFunc::DepthwiseConvFwd));
+        assert!(!is_op_func_depthwise_conv(OpFunc::MaxpoolFwd));
+    }
+
+    /// e034 — the twelve the reference lists, and the three quantizers it leaves out.
+    #[test]
+    fn quantization_omits_three_quantizers() {
+        for op_func in [
+            OpFunc::QFp8,
+            OpFunc::QFp8Ch,
+            OpFunc::QFp8Chil,
+            OpFunc::QFp8Wt,
+            OpFunc::CsqInt8,
+            OpFunc::CsqInt8Ch,
+            OpFunc::CsqInt8Wt,
+            OpFunc::CsqInt8Chil,
+            OpFunc::CsqInt8Mb,
+            OpFunc::CsqInt4,
+            OpFunc::CsqInt4Wt,
+            OpFunc::CsqInt4Chil,
+        ] {
+            assert!(is_op_func_quantization(op_func), "{op_func:?}");
+        }
+        for op_func in [OpFunc::QFp8Mb, OpFunc::CsqInt8V2, OpFunc::CsqInt8MbV2] {
+            assert!(!is_op_func_quantization(op_func), "{op_func:?}");
+        }
+    }
+
+    /// e035 — both directions, and the two conversions that are not in the set.
+    #[test]
+    fn conversion_is_dl16_against_fp32_only() {
+        assert!(is_op_func_conversion_dl16_and_fp32(OpFunc::Dl16Tofp32));
+        assert!(is_op_func_conversion_dl16_and_fp32(OpFunc::Fp32Todl16));
+        assert!(!is_op_func_conversion_dl16_and_fp32(OpFunc::Fp8Todl16));
+        assert!(!is_op_func_conversion_dl16_and_fp32(OpFunc::Dl16Tobf16));
+    }
+
+    /// e036 — `J` is the core extent, another dim is the LAST structure's cumulative stick size, a dim
+    /// the stick does not name is one, and an unstated `J` is the reference's `-1`.
+    #[test]
+    fn scalar_broadcast_takes_the_last_structures_stick() {
+        let mut dsc = config(
+            stage(&[(PrimaryDim::J, 12), (PrimaryDim::In, 96)]),
+            &[DsType::Input, DsType::Output],
+        );
+        dsc.primary_ds_info.insert(
+            DsType::Output,
+            stick(&[
+                (PrimaryDim::In, 4),
+                (PrimaryDim::Out, 8),
+                (PrimaryDim::In, 2),
+            ]),
+        );
+        assert_eq!(
+            min_param_scalar_broadcast(&dsc, PrimaryDim::J),
+            Some(Extent(12))
+        );
+        // The stick names IN twice, so its cumulative size is the PRODUCT.
+        assert_eq!(
+            min_param_scalar_broadcast(&dsc, PrimaryDim::In),
+            Some(Extent(8))
+        );
+        assert_eq!(
+            min_param_scalar_broadcast(&dsc, PrimaryDim::Mb),
+            Some(DEFAULT_MIN_PARAM)
+        );
+
+        let unstated = config(stage(&[(PrimaryDim::In, 96)]), &[DsType::Output]);
+        assert_eq!(min_param_scalar_broadcast(&unstated, PrimaryDim::J), None);
+    }
+
+    /// e037 — `J` is the core extent and nothing else is anything but one.
+    #[test]
+    fn reduction_pins_only_the_j_axis() {
+        let dsc = config(
+            stage(&[(PrimaryDim::J, 12), (PrimaryDim::In, 96)]),
+            &[DsType::Output],
+        );
+        assert_eq!(min_param_reduction(&dsc, PrimaryDim::J), Some(Extent(12)));
+        assert_eq!(
+            min_param_reduction(&dsc, PrimaryDim::In),
+            Some(DEFAULT_MIN_PARAM)
+        );
+        assert_eq!(
+            min_param_reduction(&dsc, PrimaryDim::Out),
+            Some(DEFAULT_MIN_PARAM)
+        );
+    }
+
+    /// e038 — `IN` follows the core extent for depthwise conv and drops to one for pooling, `OUT` is
+    /// always 64, the kernel axes follow the core, and `MB` is one.
+    #[test]
+    fn pooling_pins_out_at_sixty_four() {
+        let dsc = config(
+            stage(&[
+                (PrimaryDim::In, 96),
+                (PrimaryDim::Out, 96),
+                (PrimaryDim::J, 12),
+                (PrimaryDim::Ki, 3),
+            ]),
+            &[DsType::Output],
+        );
+        let min = |dim, op_func| min_param_pooling_and_depthwise_conv(&dsc, dim, op_func);
+        assert_eq!(
+            min(PrimaryDim::In, OpFunc::DepthwiseConvFwd),
+            Some(Extent(96))
+        );
+        assert_eq!(
+            min(PrimaryDim::In, OpFunc::MaxpoolFwd),
+            Some(DEFAULT_MIN_PARAM)
+        );
+        assert_eq!(min(PrimaryDim::Out, OpFunc::MaxpoolFwd), Some(Extent(64)));
+        assert_eq!(min(PrimaryDim::J, OpFunc::MaxpoolFwd), Some(Extent(12)));
+        assert_eq!(min(PrimaryDim::Ki, OpFunc::MaxpoolFwd), Some(Extent(3)));
+        assert_eq!(
+            min(PrimaryDim::Mb, OpFunc::MaxpoolFwd),
+            Some(DEFAULT_MIN_PARAM)
+        );
+    }
+
+    /// e039 — an unpadded `IN` is 64, 128 for the two INT4 spellings and 64 for `CSQ_INT4_WT`; padding
+    /// on a dim takes it whole; and a padded compound dim is `calculate_padded`'s abort.
+    #[test]
+    fn quantization_takes_a_padded_dim_whole() {
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::In, Extent(96));
+        dims.extents.insert(PrimaryDim::Out, Extent(80));
+        dims.extents.insert(PrimaryDim::J, Extent(12));
+        dims.extents.insert(PrimaryDim::Mb, Extent(4));
+        dims.padding.insert(
+            PrimaryDim::Out,
+            DimPadding {
+                sizes: PadSizes::of(PadElems(1), PadElems(2)),
+                ..DimPadding::default()
+            },
+        );
+        let dsc = config(
+            FilledDims::of(dims.clone()).expect("a stage that states a dim"),
+            &[DsType::Output],
+        );
+        let min = |dim, op_func| min_param_quantization(&dsc, dim, op_func);
+        assert_eq!(min(PrimaryDim::In, OpFunc::CsqInt8), Some(Extent(64)));
+        assert_eq!(min(PrimaryDim::In, OpFunc::CsqInt4), Some(Extent(128)));
+        assert_eq!(min(PrimaryDim::In, OpFunc::CsqInt4Chil), Some(Extent(128)));
+        assert_eq!(min(PrimaryDim::In, OpFunc::CsqInt4Wt), Some(Extent(64)));
+        // OUT carries padding, so the quantizer must take the whole of it.
+        assert_eq!(min(PrimaryDim::Out, OpFunc::CsqInt4), Some(Extent(80)));
+        assert_eq!(min(PrimaryDim::J, OpFunc::CsqInt8), Some(Extent(12)));
+        assert_eq!(
+            min(PrimaryDim::Mb, OpFunc::CsqInt8),
+            Some(DEFAULT_MIN_PARAM)
+        );
+
+        // A `paddingSizes_` entry on the compound IJ is the "Cannot calculate padded version of
+        // compound dim" abort, and it is reached before the switch picks an arm.
+        dims.extents.insert(PrimaryDim::Ij, Extent(6));
+        dims.padding.insert(
+            PrimaryDim::Ij,
+            DimPadding {
+                sizes: PadSizes::of(PadElems(1), PadElems(0)),
+                ..DimPadding::default()
+            },
+        );
+        let compound = config(
+            FilledDims::of(dims).expect("a stage that states a dim"),
+            &[DsType::Output],
+        );
+        assert_eq!(
+            min_param_quantization(&compound, PrimaryDim::Ij, OpFunc::CsqInt8),
+            None
+        );
+    }
+
+    /// e040 — `DL16TOFP32` reads the FIRST structure's stick and `FP32TODL16` the LAST, and `J` is the
+    /// core extent for both.
+    #[test]
+    fn conversion_picks_its_structure_by_position() {
+        let mut dsc = config(
+            stage(&[(PrimaryDim::J, 12), (PrimaryDim::In, 96)]),
+            &[DsType::Input, DsType::Output],
+        );
+        dsc.primary_ds_info
+            .insert(DsType::Input, stick(&[(PrimaryDim::In, 32)]));
+        dsc.primary_ds_info
+            .insert(DsType::Output, stick(&[(PrimaryDim::In, 8)]));
+        assert_eq!(
+            min_param_conversion_dl16_and_fp32(&dsc, PrimaryDim::In, OpFunc::Dl16Tofp32),
+            Some(Extent(32))
+        );
+        assert_eq!(
+            min_param_conversion_dl16_and_fp32(&dsc, PrimaryDim::In, OpFunc::Fp32Todl16),
+            Some(Extent(8))
+        );
+        assert_eq!(
+            min_param_conversion_dl16_and_fp32(&dsc, PrimaryDim::J, OpFunc::Dl16Tofp32),
+            Some(Extent(12))
+        );
+    }
+}
 
 // crustify:todo: e041_getChunkParamsFromCandidates
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1423  (12 body lines, level 0)
