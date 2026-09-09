@@ -169,6 +169,8 @@ pub(crate) mod simple_constant_descriptor;
 pub(crate) mod toggle_data_transfer_updater;
 pub(crate) mod toggle_descriptor;
 
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::Val;
 use crate::transform::sentient::analyses::EvaluatedValue;
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
@@ -326,29 +328,178 @@ impl DataTransferDescriptorContainer {
     }
 }
 
-// crustify:todo: e009_createOffsetValue
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1017  (14 body lines, level 0)
-//   original  : Value createOffsetValue(Operation *curr_op, const EvaluatedValue &ev) const
+/// Replaces: e009_createOffsetValue
+///
+/// The `sentient.scalar_constant` or `uniform.query_map` holding `ev`, typed like `mutable_addr_[0]`.
+///
+/// ⛔ WHICH OF THE TWO, AND WITH WHAT VALUE, IS `EvaluatedValue::buildOffsetValue`'s DECISION ALONE
+/// (`Analyses/ExpressionEvaluatorUtils.cpp:148`, out of scope); all this adds is where the op goes,
+/// which the campaign names droppable. ⭐ `DT_CHECK(parent_func)` needs no guard: a
+/// `dataflow.program_unit` is a member of [`crate::islands::sentient::Program`].
+#[must_use]
+pub fn create_offset_value(_ev: EvaluatedValue, _ty: ScalarTy) -> Val {
+    todo!(
+        "EvaluatedValue::buildOffsetValue — out of campaign scope \
+         (dcc/src/Transform/Sentient/Analyses/ExpressionEvaluatorUtils.cpp:148)"
+    )
+}
 
-// crustify:todo: e010_updateVariableOffsetCalculation
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1065  (3 body lines, level 0)
-//   original  : void updateVariableOffsetCalculation( const EvaluatedValue &new_immut_addr_ev) override
+/// `SimpleConstantDataTransferUpdater` (`:1046`) — the updater for a transfer whose base address is
+/// one constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimpleConstantDataTransferUpdater;
 
-// crustify:todo: e011_getOffset
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1104  (4 body lines, level 0)
-//   original  : Value getOffset(const EvaluatedValue &new_immut_addr_ev) override
+impl SimpleConstantDataTransferUpdater {
+    /// Replaces: e010_updateVariableOffsetCalculation
+    ///
+    /// `return;  // nothing to do` (`:1063-1066`) — a simple constant has no toggle `scalar_sub` and no
+    /// `sentient.if` whose yielded constants would need re-basing against the pinned address, so this
+    /// override of the three that do is empty.
+    pub const fn update_variable_offset_calculation(self, _new_immut_addr_ev: EvaluatedValue) {}
+}
 
-// crustify:todo: e012_getOffset
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1133  (4 body lines, level 0)
-//   original  : Value getOffset(const EvaluatedValue &new_immut_addr_ev) override
+/// `SubOp toggle_sub_` — the `sentient.scalar_sub` computing a toggling transfer's immutable address,
+/// named by its `$out`.
+///
+/// ⛔ A TYPE AND NOT A BARE [`Val`]: `DT_CHECK_MSG(toggle_sub, …)` (`:1528-1532`) is that
+/// `immutable_addr[0]`'s DEFINING OP is a `scalar_sub`, and only a caller that matched
+/// [`crate::islands::sentient::dialects::sentient::Op::ScalarSub`] can say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToggleSub(Val);
 
-// crustify:todo: e013_getOffset
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1163  (4 body lines, level 0)
-//   original  : Value getOffset(const EvaluatedValue &new_immut_addr_ev) override
+impl ToggleSub {
+    /// The sub named by the `$out` of a matched `sentient.scalar_sub`.
+    #[must_use]
+    pub const fn of(scalar_sub_result: Val) -> ToggleSub {
+        ToggleSub(scalar_sub_result)
+    }
 
-// crustify:todo: e014_dump
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1666  (8 body lines, level 0)
-//   original  : void AddressPinningAndTogglePass::dump() const
+    /// `toggle_sub_.getResult()`.
+    #[must_use]
+    pub const fn result(self) -> Val {
+        self.0
+    }
+}
+
+/// `ToggleDataTransferUpdater` (`:1080`) — the updater for a base address that toggles between two
+/// constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToggleDataTransferUpdater {
+    /// `toggle_sub_`, from `immutable_addr[0].get().getDefiningOp<SubOp>()` (`:1528`).
+    pub toggle_sub: ToggleSub,
+}
+
+impl ToggleDataTransferUpdater {
+    /// Replaces: e011_getOffset
+    ///
+    /// The toggle's own `scalar_sub` result IS the fall-back offset (`:1132-1135`) — nothing new is
+    /// built, because the sub already computes the difference the pinning wants added.
+    ///
+    /// ⭐ `DT_CHECK(toggle_sub_)` is [`ToggleSub`]'s existence; `new_immut_addr_ev` is UNREAD.
+    #[must_use]
+    pub const fn get_offset(self, _new_immut_addr_ev: EvaluatedValue) -> Val {
+        self.toggle_sub.result()
+    }
+}
+
+/// WHICH OF A `sentient.if`'s RESULTS ORIGINALLY BOUND THE IMMUTABLE ADDRESS — `res_index_` (`:1140`).
+///
+/// ⛔ NOT AN `i32` DEFAULTING TO `-1`: `DT_CHECK(res_index_ >= 0)` guards both readers (`:1134`,
+/// `:2070`), and `updateImmutableAddr` sets it from
+/// `getIndexOfOperationResults(immutable_addr_[0].get())` (`:2053`) before `update()` reaches either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YieldedIndex(pub usize);
+
+/// `if_op_.getResult(res_index_)` as a pair: `DT_CHECK(if_op_ && res_index_ >= 0)` is two facts about
+/// one lookup, and carrying the value makes an out-of-range index inexpressible rather than caught. The
+/// index stays because `updateVariableOffsetCalculation` (e277) needs it to reach every yield of that
+/// result (`applyToAllYields(if_op_, …, res_index_)`, `:2071-2086`).
+///
+/// ⚠️ AND IT IS **NOT** `immutable_addr_[0]`: `updateImmutableAddr` REPLACES that operand (`:2060`)
+/// after setting `res_index_` (`:2053`), so this is the pre-pinning value and the two differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionalConstResult {
+    /// `res_index_`.
+    pub index: YieldedIndex,
+    /// `if_op_.getResult(res_index_)`.
+    pub val: Val,
+}
+
+/// `ConditionalConstDataTransferUpdater` (`:1112`) — the updater for a base address an `scf`-style
+/// conditional picks from a set of constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionalConstDataTransferUpdater {
+    /// `if_op_` and `res_index_` together — see [`ConditionalConstResult`].
+    pub if_result: ConditionalConstResult,
+}
+
+impl ConditionalConstDataTransferUpdater {
+    /// Replaces: e012_getOffset
+    ///
+    /// The conditional's own selected result IS the fall-back offset (`:1133-1136`): once
+    /// `updateVariableOffsetCalculation` has re-based every yielded constant against the pinned
+    /// address, that result already carries the difference.
+    ///
+    /// ⭐ The two `DT_CHECK`s are [`ConditionalConstResult`]'s existence; `new_immut_addr_ev` is UNREAD.
+    #[must_use]
+    pub const fn get_offset(self, _new_immut_addr_ev: EvaluatedValue) -> Val {
+        self.if_result.val
+    }
+}
+
+/// `IntegerSequenceDataTransferUpdater` (`:1143`) — the updater for a base address that walks an
+/// integer sequence through a loop's carried argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegerSequenceDataTransferUpdater {
+    /// `iter_arg_` — the loop-carried BLOCK ARGUMENT the sequence arrives as, i.e.
+    /// [`crate::islands::sentient::dialects::sentient::Carried::arg`] and never its `init` or
+    /// `result`: substituting either hands back a value defined outside the loop.
+    pub iter_arg: Val,
+}
+
+impl IntegerSequenceDataTransferUpdater {
+    /// Replaces: e013_getOffset
+    ///
+    /// The carried iter arg IS the fall-back offset (`:1162-1165`) — the sequence's own induction
+    /// already steps by what the pinning wants added.
+    ///
+    /// ⭐ `DT_CHECK(iter_arg_)` is the field's existence; `new_immut_addr_ev` is UNREAD.
+    #[must_use]
+    pub const fn get_offset(self, _new_immut_addr_ev: EvaluatedValue) -> Val {
+        self.iter_arg
+    }
+}
+
+/// WHAT e014 NEEDS OF A DESCRIPTOR — `DataTransferDescriptor::dump` is **e492** (`:2521`, level 3,
+/// `data_transfer_descriptor.rs`), a later unit.
+///
+/// ⚠️ `UNITS.tsv` RECORDS e014's CALLS AS `-`: the call resolves through a virtual `dump()` the
+/// extractor's detector did not follow. This trait is the seam e492 lands into later.
+pub trait DumpDescriptor {
+    /// `dtd->dump()` (`:2521`) — one descriptor's block, `----------` delimited.
+    fn dump(&self) -> String;
+}
+
+/// Replaces: e014_dump
+///
+/// The immutable descriptors under one header then the mutable ones under another, each container in
+/// INSERTION order (`DataTransferDescriptorContainer` exposes the base `std::vector`'s `begin`/`end`,
+/// not `sorted_list_`).
+///
+/// ⭐ THE INNER `LLVM_DEBUG` ON THE TWO HEADERS CHANGES NOTHING: both callsites already wrap the whole
+/// call (`:1349-1353`, `:1370-1375`), so a returned `String` loses no gating the reference had.
+#[must_use]
+pub fn dump(immut: &[&dyn DumpDescriptor], mutable: &[&dyn DumpDescriptor]) -> String {
+    let mut out = String::from("Immutable transfer descriptors:\n");
+    for dtd in immut {
+        out.push_str(&dtd.dump());
+    }
+    out.push_str("Mutable transfer descriptors:\n");
+    for dtd in mutable {
+        out.push_str(&dtd.dump());
+    }
+    out
+}
 
 // crustify:todo: e257_getBaseAddr
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:657  (4 body lines, level 1)
@@ -673,7 +824,7 @@ impl DataTransferDescriptorContainer {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::dialects::{Val, sentient};
     use crate::transform::sentient::{ForRef, IterArgIndex};
 
     /// A matched-looking descriptor field set, so an `invalidate()` has something to clear.
@@ -791,5 +942,76 @@ mod unit_tests {
         let mut container = DataTransferDescriptorContainer::default();
         container.set_chaining_info(DescriptorId(0), ChainFlag::PartOfChain, false);
         assert!(container.chaining_info.is_empty());
+    }
+
+    /// 011/656 — the toggle's fall-back offset is the `scalar_sub`'s own `$out`, with no new op.
+    #[test]
+    fn toggle_get_offset_is_the_toggle_sub_result() {
+        let updater = ToggleDataTransferUpdater {
+            toggle_sub: ToggleSub::of(Val(17)),
+        };
+        assert_eq!(updater.get_offset(EvaluatedValue(7)), Val(17));
+    }
+
+    /// 012/656 — the conditional's fall-back offset is `if_op_.getResult(res_index_)`, and ⛔ NOT the
+    /// immutable-addr operand: `updateImmutableAddr` reassigns that (`:2060`) after fixing the index
+    /// (`:2053`), so the two are different values by the time `getOffset` runs.
+    #[test]
+    fn conditional_const_get_offset_is_the_selected_if_result_not_the_new_immutable() {
+        let updater = ConditionalConstDataTransferUpdater {
+            if_result: ConditionalConstResult {
+                index: YieldedIndex(2),
+                val: Val(9),
+            },
+        };
+        let new_immutable_addr = Val(31);
+        assert_eq!(updater.get_offset(EvaluatedValue(7)), Val(9));
+        assert_ne!(updater.get_offset(EvaluatedValue(7)), new_immutable_addr);
+    }
+
+    /// 013/656 — the integer sequence's fall-back offset is the loop's carried ARGUMENT, ⛔ not the
+    /// `init` it entered with nor the `result` it leaves behind.
+    #[test]
+    fn integer_sequence_get_offset_is_the_carried_arg() {
+        let carried = sentient::Carried {
+            init: Val(4),
+            arg: Val(5),
+            result: Val(6),
+            reg: sentient::Reg {
+                locale: sentient::RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+        };
+        let updater = IntegerSequenceDataTransferUpdater {
+            iter_arg: carried.arg,
+        };
+        assert_eq!(updater.get_offset(EvaluatedValue(7)), Val(5));
+        assert_ne!(updater.get_offset(EvaluatedValue(7)), carried.init);
+        assert_ne!(updater.get_offset(EvaluatedValue(7)), carried.result);
+    }
+
+    /// A descriptor that reports only which one it is — enough to check e014's ORDER and headers
+    /// without standing in for `DataTransferDescriptor::dump` (e492), whose text is that unit's.
+    struct NamedDescriptor(&'static str);
+
+    impl DumpDescriptor for NamedDescriptor {
+        fn dump(&self) -> String {
+            format!("{}\n", self.0)
+        }
+    }
+
+    /// 014/656 — both headers, immutable container first, each container in insertion order.
+    #[test]
+    fn dump_writes_immutable_descriptors_before_mutable_ones() {
+        let a = NamedDescriptor("immut-a");
+        let b = NamedDescriptor("immut-b");
+        let c = NamedDescriptor("mut-c");
+        let immut: [&dyn DumpDescriptor; 2] = [&a, &b];
+        let mutable: [&dyn DumpDescriptor; 1] = [&c];
+        assert_eq!(
+            dump(&immut, &mutable),
+            "Immutable transfer descriptors:\nimmut-a\nimmut-b\nMutable transfer descriptors:\nmut-c\n"
+        );
     }
 }
