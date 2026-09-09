@@ -175,7 +175,8 @@
 
 use crate::arch::Sticks;
 use crate::formats::DataFormat;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // THE LAYOUT VOCABULARY THESE UNITS ACT ON — `shuffle.h:26-110`, `shuffle.cpp:19-122`.
@@ -340,6 +341,18 @@ impl AbstractLayout {
     #[must_use]
     pub fn num_sticks(&self) -> Sticks {
         Sticks(1u64 << self.stick_dims.len())
+    }
+
+    /// Replaces: e156_contains
+    ///
+    /// WHETHER THIS LAYOUT HOLDS `dim` AT ALL, in the sticks or anywhere in the slice — what
+    /// `canonicalize_layout` (e266) asks a goal before keeping one of the input's dimensions.
+    ///
+    /// ⛔ THE DUMMY IS CONTAINED whenever any slice slot is vacant, and every layout with a vacant
+    /// slot answers `true` for it. `canonicalize_layout` never asks about the dummy.
+    #[must_use]
+    pub fn contains(&self, dim: DimSymbol) -> bool {
+        self.stick_dims.contains(&dim) || self.slice_dims.contains(&dim)
     }
 }
 
@@ -1011,53 +1024,319 @@ impl GCVTF16F8PackAction {
             _ => None,
         }
     }
+
+    /// Replaces: e153_act
+    ///
+    /// The 8-bit slot is dropped, the dimensions above it slide one place down, and `dim` lands in
+    /// the freed 64-bit slot.
+    ///
+    /// ⛔ `act` DOES NOT CONVERT THE FORMAT — [`Self::out_format`] is the separate answer its caller
+    /// applies, and the output layout here keeps the input's format (`shuffle.cpp:620-625`).
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        output.stick_dims.remove(&self.dim);
+        for i in SliceDim::Bit8.index()..SliceDim::Bit64.index() {
+            output.slice_dims[i] = output.slice_dims[i + 1];
+        }
+        output.slice_dims[SliceDim::Bit64.index()] = self.dim;
+        output
+    }
 }
 
-// crustify:todo: e153_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:620  (7 body lines, level 0)
-//   class     : GCVTF16F8PackAction
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2914-2921
+// ═══ e153..e160 — THE GCVT MERGE, THE MEMOISED GRAPH AND ITS WORKLIST ════════════════════════════
 
-// crustify:todo: e154__out_format
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:644  (8 body lines, level 0)
-//   class     : GCVTF16F8MergeAction
-//   original  : static std::optional<DataFormats> _out_format(DataFormats in, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2931-2940
+/// THE `gcvt` MERGE — converts fp16 sticks to the goal's fp8 while taking a stick dimension into
+/// the 8-bit subdimension, moving nothing else (`shuffle.cpp:638`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GCVTF16F8MergeAction {
+    dim: DimSymbol,
+}
 
-// crustify:todo: e155_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:666  (6 body lines, level 0)
-//   class     : GCVTF16F8MergeAction
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2950-2956
+impl GCVTF16F8MergeAction {
+    /// `GCVTF16F8MergeAction(stick_dim)` (`shuffle.cpp:661`).
+    #[must_use]
+    pub const fn new(dim: DimSymbol) -> Self {
+        Self { dim }
+    }
 
-// crustify:todo: e156_contains
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:684  (5 body lines, level 0)
-//   class     : AbstractLayout
-//   original  : bool AbstractLayout::contains(DimSymbol dim) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:2966-2971
+    /// The stick dimension being merged in.
+    #[must_use]
+    pub const fn dim(&self) -> DimSymbol {
+        self.dim
+    }
 
-// crustify:todo: e157_get_node
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:717  (11 body lines, level 0)
-//   class     : AutoShuffler
-//   original  : std::shared_ptr<GraphNode> AutoShuffler::get_node( const AbstractLayout& layout)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2981-2993
+    /// Replaces: e154__out_format
+    ///
+    /// THE FORMAT THIS ACTION LEAVES THE STICKS IN — the goal's own fp8 when the input is an fp16
+    /// and the goal an fp8, and nothing otherwise, which is how `add_valid_actions` (e320) decides
+    /// whether to offer the action.
+    ///
+    /// ⛔ CHARACTER-FOR-CHARACTER THE PACK ACTION'S PREDICATE (`shuffle.cpp:644-651` against
+    /// `:598-605`), and a separate `static` in the reference because each action overrides its own
+    /// virtual `out_format`. Kept as a second function so a divergence upstream stays expressible.
+    #[must_use]
+    pub const fn out_format(input: DataFormat, goal: &AbstractLayout) -> Option<DataFormat> {
+        match (input, goal.format) {
+            (
+                DataFormat::IeeeFp16 | DataFormat::Sen169Fp16,
+                DataFormat::Sen143Fp8 | DataFormat::Sen152Fp8,
+            ) => Some(goal.format),
+            _ => None,
+        }
+    }
 
-// crustify:todo: e158_make_stick_number_key
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:730  (14 body lines, level 0)
-//   original  : auto make_stick_number_key(const std::vector<DimSymbol>& stick_ordering)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3002-3016
+    /// Replaces: e155_act
+    ///
+    /// `dim` OVERWRITES the 8-bit slot and every other slot keeps its place.
+    ///
+    /// ⛔ THAT ONE ASSIGNMENT IS THE WHOLE DIFFERENCE FROM [`GCVTF16F8PackAction::act`], which
+    /// erases the slot and slides (`shuffle.cpp:666-670`). Its `add_valid_actions` requires the slot
+    /// to be a dummy, so nothing live is overwritten. ⛔ AND IT DOES NOT CONVERT THE FORMAT.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        output.stick_dims.remove(&self.dim);
+        output.slice_dims[SliceDim::Bit8.index()] = self.dim;
+        output
+    }
+}
 
-// crustify:todo: e159_all_one
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1043  (3 body lines, level 0)
-//   original  : bool all_one(std::vector<int> vec)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3025-3028
+/// WHICH NODE OF THE SHUFFLE GRAPH — an index into [`AutoShuffler`]'s arena, standing in for the
+/// reference's `std::shared_ptr<GraphNode>` (`shuffle.h:264`).
+///
+/// ⛔ A HANDLE, NOT AN OWNER: the reference hands the same `shared_ptr` to the map, the worklist and
+/// every node's `previous_node`, and relaxation MUTATES the node all three see. Copying a node into
+/// the worklist would freeze the graph as it stood at the push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphNodeId(usize);
 
-// crustify:todo: e160_update_worklist
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1139  (7 body lines, level 0)
-//   class     : AutoShuffler
-//   original  : void AutoShuffler::update_worklist(std::shared_ptr<GraphNode> node)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3038-3045
+/// ONE LAYOUT REACHED BY THE SEARCH, with Dijkstra's bookkeeping (`shuffle.h:238-256`).
+///
+/// ⛔ `prev_action` IS REDUCED HERE: the reference's `std::shared_ptr<ShuffleAction>` needs the
+/// action family as one type, which e343 mints. Nothing this batch fills reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphNode {
+    /// The layout this node stands for.
+    pub layout: AbstractLayout,
+    /// The node this one was reached from, absent at the origin.
+    pub previous_node: Option<GraphNodeId>,
+    /// Best cost known from the origin to here — `INFINITY` until first relaxed.
+    pub cost_origin_to_here: ShuffleCost,
+    /// The A* heuristic's estimate from here to the goal.
+    pub heuristic_cost_here_to_goal: ShuffleCost,
+    /// Whether the node has been pulled from the worklist and settled.
+    pub finalized: bool,
+}
+
+impl GraphNode {
+    /// `GraphNode(layout)` (`shuffle.h:247`) — unreached, so its cost is infinite.
+    #[must_use]
+    pub const fn new(layout: AbstractLayout) -> Self {
+        Self {
+            layout,
+            previous_node: None,
+            cost_origin_to_here: ShuffleCost(f64::INFINITY),
+            heuristic_cost_here_to_goal: ShuffleCost(0.0),
+            finalized: false,
+        }
+    }
+
+    /// `estimated_cost()` (`shuffle.h:253`) — A*'s `f = g + h`.
+    #[must_use]
+    pub fn estimated_cost(&self) -> ShuffleCost {
+        ShuffleCost(self.cost_origin_to_here.0 + self.heuristic_cost_here_to_goal.0)
+    }
+}
+
+/// WHEN AN ENTRY WAS PUSHED — the reference's monotonic `worklist_counter` (`shuffle.h:268`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct WorklistSeq(u64);
+
+/// ONE QUEUED VISIT — `std::tuple<double, uint64_t, shared_ptr<GraphNode>>` (`shuffle.h:266`).
+///
+/// ⛔ ORDERED BY `total_cmp` ON THE FROZEN COST, THEN BY SEQUENCE, BECAUSE THE COSTS INCLUDE
+/// `INFINITY`: `f64`'s `PartialOrd` is not a total order, and a [`std::collections::BinaryHeap`]
+/// silently misbehaves on one. The reference's `std::greater<tuple>` compares the `double` directly
+/// and gets away with it only because no NaN reaches the queue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorklistEntry {
+    /// The cost as it stood when the entry was pushed.
+    pub cost: ShuffleCost,
+    /// The push order, which breaks cost ties deterministically.
+    pub seq: WorklistSeq,
+    /// The node to visit.
+    pub node: GraphNodeId,
+}
+
+impl Eq for WorklistEntry {}
+
+impl Ord for WorklistEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cost
+            .0
+            .total_cmp(&other.cost.0)
+            .then(self.seq.cmp(&other.seq))
+    }
+}
+
+impl PartialOrd for WorklistEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// DIJKSTRA OVER LAYOUTS — the search that turns one abstract layout into another
+/// (`shuffle.h:258`).
+#[derive(Debug, Default)]
+pub struct AutoShuffler {
+    /// The node arena. `GraphNodeId` indexes it, and nodes are never removed.
+    nodes: Vec<GraphNode>,
+    /// `layout_to_nodes` — ordered, as the reference notes, for deterministic iteration.
+    layout_to_nodes: BTreeMap<AbstractLayout, GraphNodeId>,
+    /// The min-priority worklist. `Reverse` makes the max-heap a min-heap.
+    worklist: BinaryHeap<Reverse<WorklistEntry>>,
+    /// `worklist_counter` — the next sequence number to hand out.
+    worklist_counter: WorklistSeq,
+}
+
+impl AutoShuffler {
+    /// `AutoShuffler() = default` (`shuffle.h:318`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One node of the graph.
+    #[must_use]
+    pub fn node(&self, id: GraphNodeId) -> &GraphNode {
+        &self.nodes[id.0]
+    }
+
+    /// One node of the graph, to relax.
+    pub fn node_mut(&mut self, id: GraphNodeId) -> &mut GraphNode {
+        &mut self.nodes[id.0]
+    }
+
+    /// How many distinct layouts the search has manifested.
+    #[must_use]
+    pub fn graph_len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The cheapest queued entry, by frozen cost then push order.
+    pub fn pop_worklist(&mut self) -> Option<WorklistEntry> {
+        self.worklist.pop().map(|Reverse(entry)| entry)
+    }
+
+    /// How many entries are queued — several per node, as the reference's own note explains.
+    #[must_use]
+    pub fn worklist_len(&self) -> usize {
+        self.worklist.len()
+    }
+
+    /// Replaces: e157_get_node
+    ///
+    /// THE NODE FOR THIS LAYOUT, manifesting it on first sight and returning the existing one after
+    /// — the memoisation that makes the layout, not the path, the graph's identity.
+    ///
+    /// ⛔ NEVER RESETS A NODE IT FINDS. A layout reached a second time keeps the cost, predecessor
+    /// and `finalized` flag its earlier relaxations wrote; re-manifesting it would lose the search's
+    /// whole state for that layout (`shuffle.cpp:717-727`).
+    pub fn get_node(&mut self, layout: &AbstractLayout) -> GraphNodeId {
+        if let Some(&id) = self.layout_to_nodes.get(layout) {
+            return id;
+        }
+        let id = GraphNodeId(self.nodes.len());
+        self.nodes.push(GraphNode::new(layout.clone()));
+        self.layout_to_nodes.insert(layout.clone(), id);
+        id
+    }
+
+    /// Replaces: e160_update_worklist
+    ///
+    /// QUEUES A VISIT AT THE NODE'S COST AS IT STANDS NOW, with the next sequence number.
+    ///
+    /// ⛔ THE COST IS COPIED, NOT READ THROUGH THE NODE, and the reference says why: relaxation
+    /// mutates the node after the push, and the queue's order has to stay the order it was built
+    /// with (`shuffle.cpp:1139-1145`). ⛔ AND IT NEVER REPLACES AN ENTRY — with no `reduce_key` a
+    /// node is queued once per relaxation, and `finalized` is what discards the stale visits.
+    pub fn update_worklist(&mut self, node: GraphNodeId) {
+        let cost = self.node(node).estimated_cost();
+        let seq = self.worklist_counter;
+        self.worklist_counter = WorklistSeq(seq.0 + 1);
+        self.worklist
+            .push(Reverse(WorklistEntry { cost, seq, node }));
+    }
+}
+
+/// WHICH BIT OF A STICK NUMBER ONE DIMENSION OWNS — the reference's `uint32_t` mask value
+/// (`shuffle.cpp:732`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickMask(u32);
+
+/// WHICH STICK OF A LAYOUT — the number a [`StickIndex`] denotes under one stick ordering
+/// (`shuffle.cpp:736-741`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickNumber(pub u32);
+
+/// THE NUMBERING ITSELF — the reference's captured `masks` closure, as a value (`shuffle.cpp:730`).
+pub struct StickNumberKey {
+    masks: BTreeMap<DimSymbol, StickMask>,
+}
+
+impl StickNumberKey {
+    /// The stick this index denotes: the OR of the bits of the dimensions it takes the HIGH half of.
+    ///
+    /// ⛔ ONE DELIBERATE DIVERGENCE: `masks.at(x.dim)` THROWS for a dimension outside the ordering,
+    /// where this contributes no bit. Identical for every input meeting the reference's own
+    /// precondition — the ordering is the layout's own stick dimensions — and no stop otherwise.
+    #[must_use]
+    pub fn key(&self, index: &StickIndex) -> StickNumber {
+        let mut key = 0u32;
+        for (dim, half) in index.iter() {
+            if half == Half::High {
+                if let Some(mask) = self.masks.get(&dim) {
+                    key |= mask.0;
+                }
+            }
+        }
+        StickNumber(key)
+    }
+}
+
+/// Replaces: e158_make_stick_number_key
+///
+/// NUMBERS THE STICK DIMENSIONS, position `i` of the ordering owning bit `i`, and hands back the
+/// numbering that turns a [`StickIndex`] into a [`StickNumber`].
+///
+/// ⛔ THE REFERENCE'S `DT_CHECK(stick_ordering.size() < 32)` (`shuffle.cpp:731`) IS THE `zip`: a
+/// 32nd dimension gets no bit rather than shifting a `1u` off the end of a `uint32_t`. ⛔ AND A
+/// REPEATED DIMENSION KEEPS ITS LAST BIT, as `masks[dim] = ...` assigns rather than inserts.
+#[must_use]
+pub fn make_stick_number_key(stick_ordering: &[DimSymbol]) -> StickNumberKey {
+    let mut masks = BTreeMap::new();
+    for (&dim, bit) in stick_ordering.iter().zip(0u32..32) {
+        masks.insert(dim, StickMask(1 << bit));
+    }
+    StickNumberKey { masks }
+}
+
+/// HOW MANY TIMES ONE STICK DIMENSION IS REPLICATED — `PrimaryDsInfo::stickRepl_`'s element, where
+/// 1 means not replicated at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickRepl(pub i32);
+
+/// Replaces: e159_all_one
+///
+/// WHETHER NOTHING IS REPLICATED — what `inferLayouts` (e270) `DT_CHECK`s of both its ends before
+/// it will describe them as layouts (`shuffle.cpp:1043-1045`).
+///
+/// ⛔ VACUOUSLY TRUE FOR AN EMPTY LIST, which is `std::all_of`'s answer too.
+#[must_use]
+pub fn all_one(stick_repl: &[StickRepl]) -> bool {
+    stick_repl.iter().all(|repl| repl.0 == 1)
+}
 
 // crustify:todo: e161_codegen_psuedocode
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:1224  (42 body lines, level 0)
@@ -1598,6 +1877,222 @@ mod tests_e145_e152 {
             GCVTF16F8PackAction::out_format(DataFormat::Sen169Fp16, &goal(DataFormat::Sen169Fp16)),
             None,
             "the goal has to be an fp8"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_e153_e160 {
+    use super::{
+        AbstractLayout, AutoShuffler, DIMS_PER_SLICE, DimSymbol, GCVTF16F8MergeAction,
+        GCVTF16F8PackAction, Half, ShuffleCost, SliceDim, StickIndex, StickNumber, StickRepl,
+        all_one, make_stick_number_key,
+    };
+    use crate::formats::DataFormat;
+    use std::collections::BTreeSet;
+
+    /// The symbol with this id; `0` is the dummy, as the reference numbers them.
+    fn sym(id: i32) -> DimSymbol {
+        let mut symbol = DimSymbol::DUMMY;
+        for _ in 0..id {
+            symbol = symbol.next();
+        }
+        symbol
+    }
+
+    /// A layout in `format` whose slice is `[3, 4, dummy, 5, 6, 7]` and whose sticks are `{1, 2}` —
+    /// one with the vacant 8-bit slot both GCVT actions require.
+    fn layout(format: DataFormat) -> AbstractLayout {
+        AbstractLayout::new(
+            BTreeSet::from([sym(1), sym(2)]),
+            [sym(3), sym(4), DimSymbol::DUMMY, sym(5), sym(6), sym(7)],
+            format,
+        )
+    }
+
+    /// The slice as symbol ids, so a failure prints the layout rather than six `DimSymbol`s.
+    fn slice_ids(of: &AbstractLayout) -> Vec<i32> {
+        of.slice_dims.iter().map(|dim| dim.id()).collect()
+    }
+
+    /// e153 — the pack drops the 8-bit slot, slides 16/32/64 down one and lands the stick dimension
+    /// at the top of the slice, leaving the format alone.
+    #[test]
+    fn a_gcvt_pack_slides_the_slice_down_and_takes_the_top_slot() {
+        let input = layout(DataFormat::Sen169Fp16);
+        let output = GCVTF16F8PackAction::new(sym(2)).act(&input);
+
+        assert_eq!(slice_ids(&output), [3, 4, 5, 6, 7, 2]);
+        assert_eq!(output.stick_dims, BTreeSet::from([sym(1)]));
+        assert_eq!(
+            output.format,
+            DataFormat::Sen169Fp16,
+            "`act` does not convert"
+        );
+    }
+
+    /// e154 — the merge's predicate is the pack's, so it is checked as the same answer over the
+    /// whole format square rather than restating e152's own case.
+    #[test]
+    fn the_merges_out_format_is_the_packs_answer_everywhere() {
+        for goal in [
+            DataFormat::Sen143Fp8,
+            DataFormat::Sen152Fp8,
+            DataFormat::Sen169Fp16,
+            DataFormat::Senint8,
+        ] {
+            let goal = layout(goal);
+            for input in [
+                DataFormat::IeeeFp16,
+                DataFormat::Sen169Fp16,
+                DataFormat::IeeeFp32,
+                DataFormat::Senint8,
+            ] {
+                assert_eq!(
+                    GCVTF16F8MergeAction::out_format(input, &goal),
+                    GCVTF16F8PackAction::out_format(input, &goal),
+                    "{input:?} -> {:?}",
+                    goal.format
+                );
+            }
+        }
+        assert_eq!(
+            GCVTF16F8MergeAction::out_format(
+                DataFormat::Sen169Fp16,
+                &layout(DataFormat::Sen143Fp8)
+            ),
+            Some(DataFormat::Sen143Fp8),
+            "and that answer is the goal's own fp8"
+        );
+    }
+
+    /// e155 — the merge overwrites the 8-bit slot and moves nothing else, which is the one
+    /// difference from the pack action.
+    #[test]
+    fn a_gcvt_merge_lands_the_stick_dimension_in_the_eight_bit_slot() {
+        let output = GCVTF16F8MergeAction::new(sym(2)).act(&layout(DataFormat::Sen169Fp16));
+
+        assert_eq!(slice_ids(&output), [3, 4, 2, 5, 6, 7]);
+        assert_eq!(output.stick_dims, BTreeSet::from([sym(1)]));
+        assert_eq!(output.slice_dim(SliceDim::Bit8), sym(2));
+    }
+
+    /// e156 — containment reads from either side, and the dummy of a vacant slot counts.
+    #[test]
+    fn a_layout_contains_a_dimension_from_either_the_sticks_or_the_slice() {
+        let layout = layout(DataFormat::Sen169Fp16);
+
+        assert!(layout.contains(sym(1)), "a stick dimension");
+        assert!(layout.contains(sym(5)), "a slice dimension");
+        assert!(layout.contains(DimSymbol::DUMMY), "the vacant 8-bit slot");
+        assert!(!layout.contains(sym(9)), "a dimension in neither");
+    }
+
+    /// e157 — the graph memoises on the layout, so a second visit is the same node and does not
+    /// reset what the first relaxation wrote.
+    #[test]
+    fn get_node_manifests_a_layout_once() {
+        let mut shuffler = AutoShuffler::new();
+        let first = shuffler.get_node(&layout(DataFormat::Sen169Fp16));
+
+        assert_eq!(shuffler.graph_len(), 1);
+        assert!(shuffler.node(first).cost_origin_to_here.0.is_infinite());
+
+        shuffler.node_mut(first).cost_origin_to_here = ShuffleCost(3.0);
+        let again = shuffler.get_node(&layout(DataFormat::Sen169Fp16));
+        assert_eq!(again, first);
+        assert_eq!(shuffler.graph_len(), 1);
+        assert_eq!(shuffler.node(again).cost_origin_to_here, ShuffleCost(3.0));
+
+        // A different format is a different layout, so a different node.
+        assert_ne!(shuffler.get_node(&layout(DataFormat::Sen143Fp8)), first);
+        assert_eq!(shuffler.graph_len(), 2);
+    }
+
+    /// e158 — position `i` owns bit `i`, only the high halves contribute, and a dimension the
+    /// ordering does not number contributes nothing where the reference's `.at()` would throw.
+    #[test]
+    fn a_stick_number_is_the_or_of_the_high_dimensions_bits() {
+        let key = make_stick_number_key(&[sym(1), sym(2), sym(3)]);
+        let index = |halves: [(i32, Half); 3]| {
+            halves
+                .into_iter()
+                .map(|(id, half)| (sym(id), half))
+                .collect::<StickIndex>()
+        };
+
+        assert_eq!(
+            key.key(&index([(1, Half::Low), (2, Half::High), (3, Half::High)])),
+            StickNumber(0b110)
+        );
+        assert_eq!(
+            key.key(&index([(1, Half::Low), (2, Half::Low), (3, Half::Low)])),
+            StickNumber(0)
+        );
+
+        // ⛔ A dimension outside the ordering is not part of the stick number.
+        let mut unnumbered = StickIndex::new();
+        unnumbered.insert(sym(9), Half::High);
+        assert_eq!(key.key(&unnumbered), StickNumber(0));
+    }
+
+    /// e159 — unreplicated means every entry is exactly 1, and an empty list is vacuously so.
+    #[test]
+    fn all_one_holds_only_for_unreplicated_stick_dimensions() {
+        assert!(all_one(&[StickRepl(1), StickRepl(1), StickRepl(1)]));
+        assert!(all_one(&[]), "no stick dimensions replicate nothing");
+        assert!(!all_one(&[StickRepl(1), StickRepl(2)]));
+        assert!(!all_one(&[StickRepl(0)]));
+    }
+
+    /// e160 — the queued cost is frozen at push time and equal costs pop in push order, which is
+    /// the whole reason the entry carries a cost of its own instead of reading the node.
+    #[test]
+    fn the_worklist_freezes_the_cost_and_breaks_ties_by_push_order() {
+        let mut shuffler = AutoShuffler::new();
+        let first = shuffler.get_node(&layout(DataFormat::Sen169Fp16));
+        let second = shuffler.get_node(&layout(DataFormat::Sen143Fp8));
+        shuffler.node_mut(first).cost_origin_to_here = ShuffleCost(4.0);
+        shuffler.node_mut(second).cost_origin_to_here = ShuffleCost(4.0);
+
+        shuffler.update_worklist(first);
+        shuffler.update_worklist(second);
+        assert_eq!(shuffler.worklist_len(), 2);
+
+        shuffler.node_mut(first).cost_origin_to_here = ShuffleCost(1.0);
+
+        let popped = shuffler.pop_worklist();
+        assert_eq!(
+            popped.map(|entry| (entry.node, entry.cost)),
+            Some((first, ShuffleCost(4.0))),
+            "equal costs pop in push order, at the cost they were pushed with"
+        );
+        assert_eq!(
+            shuffler.pop_worklist().map(|entry| entry.node),
+            Some(second)
+        );
+        assert!(shuffler.pop_worklist().is_none());
+    }
+
+    /// ⛔ AND AN INFINITE COST STILL ORDERS: an unreached node sorts after every reached one instead
+    /// of making the heap's comparator partial.
+    #[test]
+    fn an_unreached_node_queues_behind_every_reached_one() {
+        let mut shuffler = AutoShuffler::new();
+        let unreached = shuffler.get_node(&layout(DataFormat::Sen169Fp16));
+        let reached = shuffler.get_node(&layout(DataFormat::Sen143Fp8));
+        shuffler.node_mut(reached).cost_origin_to_here = ShuffleCost(9.0);
+
+        shuffler.update_worklist(unreached);
+        shuffler.update_worklist(reached);
+
+        assert_eq!(
+            shuffler.pop_worklist().map(|entry| entry.node),
+            Some(reached)
+        );
+        assert_eq!(
+            shuffler.pop_worklist().map(|entry| entry.node),
+            Some(unreached)
         );
     }
 }
