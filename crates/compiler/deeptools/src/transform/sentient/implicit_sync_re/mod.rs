@@ -126,6 +126,12 @@ pub(crate) struct ImplicitSyncGenValue {
     tile_size: Option<TileSize>,
     /// `op_` — absent for the default-constructed unknown value.
     op: Option<Op>,
+    /// `DataFlowDefinitionBase::is_optimized_` (`Analyses/RedundantDefinitionEliminationTree.hpp:290`)
+    /// — the base class is OUT OF CAMPAIGN SCOPE, but e049 prints this flag, so the subclass holds it
+    /// exactly as it already holds `op_`. Nothing in scope sets it yet.
+    is_optimized: bool,
+    /// `DataFlowDefinitionBase::is_dead_`, printed by e049 for the same reason.
+    is_dead: bool,
 }
 
 impl ImplicitSyncGenValue {
@@ -141,6 +147,8 @@ impl ImplicitSyncGenValue {
         ImplicitSyncGenValue {
             tile_size: Some(tile_size),
             op: Some(op),
+            is_optimized: false,
+            is_dead: false,
         }
     }
 
@@ -163,21 +171,73 @@ impl ImplicitSyncGenValue {
     }
 }
 
-// crustify:todo: e047_isEqual
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:28  (7 body lines, level 0)
-//   original  : bool isEqual(const DataFlowDefinitionBase &rhs) const final override
+impl ImplicitSyncGenValue {
+    /// Replaces: e047_isEqual
+    ///
+    /// Two implicit-sync GenValues are equal exactly when their tile sizes are.
+    ///
+    /// ⛔ `is_optimized_` IS INTENTIONALLY LEFT OUT — the reference says so in as many words — and so
+    /// are `is_dead_` and `op_`, which it also never reads here.
+    ///
+    /// ⛔ THE `dynamic_cast` AND ITS `DT_CHECK_MSG` BECAME THE PARAMETER TYPE: a definition that is
+    /// not an `ImplicitSyncGenValue` is not expressible at this call, so nothing is checked at run
+    /// time. This is also why the type does not derive `PartialEq` — a second, disagreeing `==`.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &ImplicitSyncGenValue) -> bool {
+        self.tile_size == rhs.tile_size
+    }
 
-// crustify:todo: e048_copyTo
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:35  (7 body lines, level 0)
-//   original  : void copyTo(DataFlowDefinitionBase &lhs) const final override
+    /// Replaces: e048_copyTo
+    ///
+    /// Copies the tile size and the generating operation onto `lhs`, leaving its two flags alone.
+    ///
+    /// ⛔ "COPY EVERYTHING EXCEPT THE `is_optimized_` FLAG" — and except `is_dead_`, which the
+    /// reference's two assignments also leave untouched. `*lhs = self.clone()` would clobber both.
+    pub(crate) fn copy_to(&self, lhs: &mut ImplicitSyncGenValue) {
+        lhs.tile_size = self.tile_size;
+        lhs.op = self.op.clone();
+    }
 
-// crustify:todo: e049_print
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:49  (5 body lines, level 0)
-//   original  : void print(raw_ostream &OS) const final override
+    /// Replaces: e049_print
+    ///
+    /// Renders the GenValue as the pass's `-debug-only=implicit-sync-re` dump does.
+    ///
+    /// ⛔ AN ABSENT TILE SIZE PRINTS `-1` — the reference streams the sentinel `int`, so the dump
+    /// says `tile_size<-1>` and never a word like "none".
+    pub(crate) fn print(&self, out: &mut String) {
+        out.push_str("(GenValue: tile_size<");
+        match self.tile_size {
+            Some(tile_size) => out.push_str(&tile_size.get().to_string()),
+            None => out.push_str("-1"),
+        }
+        out.push_str(">)");
+        if self.is_optimized {
+            out.push_str(" - optimized!");
+        }
+        if self.is_dead {
+            out.push_str(" - dead!");
+        }
+    }
+}
 
-// crustify:todo: e050_isOperationAUse
-//   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:66  (5 body lines, level 0)
-//   original  : bool isOperationAUse(const Operation &op) const final override
+/// `enable_dead_def_removal`, as `ImplicitSyncRDETree` passes it to the base constructor
+/// (`ImplicitSyncRE.hpp:61`) — a constant of the pass, never a field.
+pub(crate) const ENABLE_DEAD_DEF_REMOVAL: bool = false;
+
+/// Replaces: e050_isOperationAUse
+///
+/// No operation is ever a use in an implicit-sync RDE tree.
+///
+/// ⛔ A CONSTANT `false` ON PURPOSE, NOT A STUB: the reference's own comment says uses are ignored
+/// *"in order to disable dead definition removal"* — it is the mechanism, paired with
+/// [`ENABLE_DEAD_DEF_REMOVAL`].
+///
+/// ⭐ A FREE FUNCTION, matching e044-e046: the tree class itself is `Analyses/` work and out of
+/// campaign scope, so [`implicit_sync_rde_tree`] represents its methods and not the class.
+#[must_use]
+pub(crate) fn is_operation_a_use(_op: &Op) -> bool {
+    false
+}
 
 // crustify:todo: e438_runOn
 //   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:58  (18 body lines, level 2)
@@ -193,3 +253,78 @@ impl ImplicitSyncGenValue {
 //   authority : dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:82  (5 body lines, level 4)
 //   original  : void runOnOperation()
 //   calls     : e438_runOn, e501_runOn
+
+#[cfg(test)]
+mod unit_tests {
+    use core::num::NonZeroU32;
+
+    use super::{ENABLE_DEAD_DEF_REMOVAL, ImplicitSyncGenValue, TileSize, is_operation_a_use};
+    use crate::islands::sentient::dialects::{Op, sentient};
+
+    /// `sentient.nop` — the `op_` a GenValue points at, whatever it is.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// A tile size of `size`.
+    fn tile(size: u32) -> TileSize {
+        TileSize::of(NonZeroU32::new(size).expect("a positive boundary"))
+    }
+
+    /// A GenValue of `tile_size` with both base flags set.
+    fn flagged(value: ImplicitSyncGenValue) -> ImplicitSyncGenValue {
+        ImplicitSyncGenValue {
+            is_optimized: true,
+            is_dead: true,
+            ..value
+        }
+    }
+
+    /// e047 — the tile size decides, and the `is_optimized` bit is left out on purpose.
+    #[test]
+    fn is_equal_reads_the_tile_size_and_nothing_else() {
+        let optimized = flagged(ImplicitSyncGenValue::of(tile(32), nop()));
+        let plain = ImplicitSyncGenValue::of(tile(32), nop());
+        assert!(optimized.is_equal(&plain), "the flags must not count");
+
+        assert!(!optimized.is_equal(&ImplicitSyncGenValue::of(tile(64), nop())));
+        // Both unknown is the reference's `-1 == -1`.
+        assert!(
+            ImplicitSyncGenValue::unknown().is_equal(&ImplicitSyncGenValue::unknown()),
+            "two unknown values are equal"
+        );
+    }
+
+    /// e048 — the tile size and `op_` travel; `is_optimized_` and `is_dead_` stay behind.
+    #[test]
+    fn copy_to_moves_the_tile_size_and_op_but_not_the_flags() {
+        let source = flagged(ImplicitSyncGenValue::of(tile(32), nop()));
+        let mut target = ImplicitSyncGenValue::unknown();
+
+        source.copy_to(&mut target);
+
+        assert_eq!(target.tile_size(), Some(tile(32)));
+        assert_eq!(target.op(), Some(&nop()));
+        assert!(!target.is_optimized, "is_optimized_ is not copied");
+        assert!(!target.is_dead, "is_dead_ is not copied");
+    }
+
+    /// e049 — the sentinel prints as `-1`, and each flag adds its own suffix.
+    #[test]
+    fn print_renders_the_sentinel_as_minus_one_and_both_suffixes() {
+        let mut out = String::new();
+        flagged(ImplicitSyncGenValue::unknown()).print(&mut out);
+        assert_eq!(out, "(GenValue: tile_size<-1>) - optimized! - dead!");
+
+        let mut plain = String::new();
+        ImplicitSyncGenValue::of(tile(32), nop()).print(&mut plain);
+        assert_eq!(plain, "(GenValue: tile_size<32>)");
+    }
+
+    /// e050 — no operation is a use, which is what disables dead definition removal.
+    #[test]
+    fn no_operation_is_a_use_in_an_implicit_sync_tree() {
+        assert!(!is_operation_a_use(&nop()));
+        assert!(!ENABLE_DEAD_DEF_REMOVAL);
+    }
+}

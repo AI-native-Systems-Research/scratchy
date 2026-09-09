@@ -90,6 +90,15 @@ impl<A: Arch> ProgramUnits<A> {
     pub fn iter(&self) -> impl Iterator<Item = &ProgramUnit<A>> {
         core::iter::once(&self.head).chain(self.rest.iter())
     }
+
+    /// Every unit, head first, FOR A REWRITE.
+    ///
+    /// ⛔ THE IN-PLACE PASSES NEED THIS AND [`Self::iter`] CANNOT SERVE THEM. `LexicalOrdering::runOn`
+    /// (`dcc/src/Transform/Sentient/LexicalOrdering.cpp:113`) hoists constants OUT of unit bodies and
+    /// rewires their readers, and a shared iterator can do neither.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ProgramUnit<A>> {
+        core::iter::once(&mut self.head).chain(self.rest.iter_mut())
+    }
 }
 
 /// ONE PROGRAM AT THE SENTIENT RUNG.
