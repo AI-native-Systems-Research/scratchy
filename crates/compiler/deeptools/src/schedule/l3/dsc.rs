@@ -23,6 +23,18 @@ use crate::units::Core;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
+/// WHERE ONE LABELLED DATA STRUCTURE LIVES — `memOrg_` (`dsc/dscdefn.h:337`) reduced to the three
+/// questions this stage asks of it, each already the reference's own predicate over that map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pinning {
+    /// `isHbmPinned()` (`:369`) — `memOrg_.at(HBM).isPresent`.
+    pub hbm: bool,
+    /// `isLxPinned()` (`:424`) — an LX organisation that is neither HBM- nor XRF-pinned nor a ring.
+    pub lx: bool,
+    /// `memOrg_.count(LX) && memOrg_.at(LX).isPadded`.
+    pub lx_padded: bool,
+}
+
 /// ONE LABELLED DATA STRUCTURE — `LabeledDsInfo` (`dsc/dscdefn.h:321`) with its `scale_` ZIPPED onto
 /// the `layoutDimOrder_` of `primaryDsInfo_[dsType_]` that `getDimIndexInLayoutOrder`
 /// (`dsc/designSpaceConfig.cpp:429`) indexes it by.
@@ -33,13 +45,38 @@ use std::num::NonZeroU32;
 pub struct LabeledDs {
     ds_type: DsType,
     scales: Vec<(PrimaryDim, Scale)>,
+    recorded: LdsIdx,
+    pinning: Pinning,
 }
 
 impl LabeledDs {
     /// A labelled data structure's layout order paired with its scales, outermost first.
     #[must_use]
-    pub fn new(ds_type: DsType, scales: Vec<(PrimaryDim, Scale)>) -> Self {
-        Self { ds_type, scales }
+    pub fn new(
+        ds_type: DsType,
+        scales: Vec<(PrimaryDim, Scale)>,
+        recorded: LdsIdx,
+        pinning: Pinning,
+    ) -> Self {
+        Self {
+            ds_type,
+            scales,
+            recorded,
+            pinning,
+        }
+    }
+
+    /// `ldsIdx_` — the entry's OWN self-index, which need NOT equal the position it sits at in
+    /// `labeledDs_`: it defaults to `183` (`dsc/dscdefn.h:323`) and is written independently.
+    #[must_use]
+    pub fn recorded(&self) -> LdsIdx {
+        self.recorded
+    }
+
+    /// `memOrg_`, as the three questions asked of it.
+    #[must_use]
+    pub fn pinning(&self) -> Pinning {
+        self.pinning
     }
 
     /// `dsType_`.
@@ -165,6 +202,25 @@ impl LabeledDsList {
     pub fn back(&self) -> &LabeledDs {
         self.rest.last().unwrap_or(&self.first)
     }
+
+    /// Every entry, in `labeledDs_` order.
+    pub fn iter(&self) -> impl Iterator<Item = &LabeledDs> + '_ {
+        core::iter::once(&self.first).chain(self.rest.iter())
+    }
+
+    /// Every entry WITH THE POSITION IT SITS AT — the index every `labeledDs_.at(idx)` uses, which
+    /// is not the [`LabeledDs::recorded`] index the entry itself carries.
+    pub fn indexed(&self) -> impl Iterator<Item = (LdsIdx, &LabeledDs)> + '_ {
+        (0u32..).map(LdsIdx).zip(self.iter())
+    }
+
+    /// `labeledDs_.at(idx)`, `None` past the end — that `.at()`'s throw.
+    #[must_use]
+    pub fn at(&self, idx: LdsIdx) -> Option<&LabeledDs> {
+        self.indexed()
+            .find(|(at, _)| *at == idx)
+            .map(|(_, lds)| lds)
+    }
 }
 
 /// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:74`) reduced to the
@@ -210,6 +266,11 @@ impl DesignSpaceConfig {
     }
 }
 
+/// WHICH DSC OF THE SUPER-DSC — an index into `dscs_` (`dsc/superdsc.h:67`), which is also the key
+/// a `DscScheduleStep` names its DSCs by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DscIdx(pub u32);
+
 /// A SUPER-DSC'S DSCs, NON-EMPTY — `dscs_.size() >= 1` is the whole body of `isSameDscGroup`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DscList {
@@ -222,6 +283,15 @@ impl DscList {
     #[must_use]
     pub const fn new(first: DesignSpaceConfig, rest: Vec<DesignSpaceConfig>) -> Self {
         Self { first, rest }
+    }
+
+    /// `dscs_.at(idx)`, `None` past the end — that `.at()`'s throw.
+    #[must_use]
+    pub fn at(&self, idx: DscIdx) -> Option<&DesignSpaceConfig> {
+        match idx.0 {
+            0 => Some(&self.first),
+            n => self.rest.get(usize::try_from(n).ok()? - 1),
+        }
     }
 
     /// `dscs_.at(0)`.
@@ -284,6 +354,17 @@ impl WkSlice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MulticastDegree(pub u32);
 
+/// ONE STEP OF A CORE'S DSC SCHEDULE — `DscScheduleStep` (`dsc/superdsc.h:30`) reduced to its two
+/// DSC indices, whose `-1` default is *no DSC* and so is an [`Option`] here. "If both, then we
+/// assume inpNeighborFetch" is the reference's own comment on the pair (`:31`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DscScheduleStep {
+    /// `datadsc_idx`.
+    pub data_dsc: Option<DscIdx>,
+    /// `dldsc_idx`.
+    pub dl_dsc: Option<DscIdx>,
+}
+
 /// THE SUPER-DSC THIS STAGE SCHEDULES — `SuperDsc` (`dsc/superdsc.h:67`) reduced to the two fields
 /// this batch reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -291,15 +372,23 @@ pub struct SuperDsc {
     dscs: DscList,
     /// `coreIdToWkSlice_`.
     pub core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
+    /// `coreIdToDscSchedule` (`dsc/superdsc.h:77`), absent for a core the super-DSC states no
+    /// schedule for — that `.at()`'s throw.
+    pub core_id_to_dsc_schedule: BTreeMap<Core, Vec<DscScheduleStep>>,
 }
 
 impl SuperDsc {
     /// A super-DSC over a non-empty DSC list.
     #[must_use]
-    pub const fn new(dscs: DscList, core_id_to_wk_slice: BTreeMap<Core, WkSlice>) -> Self {
+    pub const fn new(
+        dscs: DscList,
+        core_id_to_wk_slice: BTreeMap<Core, WkSlice>,
+        core_id_to_dsc_schedule: BTreeMap<Core, Vec<DscScheduleStep>>,
+    ) -> Self {
         Self {
             dscs,
             core_id_to_wk_slice,
+            core_id_to_dsc_schedule,
         }
     }
 

@@ -269,10 +269,11 @@
 
 use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
-use crate::schedule::ddc::transformation::{DsType, Scale};
+use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::{
-    DataStage, DataStages, LoopDims, LoopNode, PrimaryDimAndKind, StageDims, StageName,
+    DataStage, DataStages, LoopDims, LoopNode, PaddingForm, PrimaryDimAndKind, StageDims, StageName,
 };
 use crate::schedule::ddc::v1::ComputeOps;
 use crate::schedule::dsc2::{
@@ -280,12 +281,12 @@ use crate::schedule::dsc2::{
     SyncUnits, TransferNode, Via,
 };
 use crate::schedule::l3::dsc::{
-    CoreletShare, DesignSpaceConfig, DscGroup, FilledDims, LabeledDs, MulticastDegree, SuperDsc,
-    SymbolicDimInfo, UnneededPad,
+    CoreletShare, DesignSpaceConfig, DscGroup, DscIdx, FilledDims, LabeledDs, MulticastDegree,
+    Pinning, SuperDsc, SymbolicDimInfo, UnneededPad,
 };
 use crate::units::Core;
 use std::collections::{BTreeMap, BTreeSet};
-use sys_arch_spec::arch_enums::OpFunc;
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
 /// THE WITNESS `isSameDscGroup` HANDS BACK — constructible only from a [`SuperDsc`], whose DSC list
 /// is non-empty by type, so the caller's `DT_CHECK` on the result has nothing left to test.
@@ -522,7 +523,10 @@ mod tests_e001_e008 {
             core_ids_used: CoreIdsUsed::new(core(0), vec![]),
             layout_dims: BTreeMap::new(),
             core_stage: one_dim_stage(),
-            labeled_ds: LabeledDsList::new(LabeledDs::new(DsType::Output, vec![]), vec![]),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(DsType::Output, vec![], LdsIdx(183), Pinning::default()),
+                vec![],
+            ),
         }
     }
 
@@ -546,7 +550,11 @@ mod tests_e001_e008 {
     /// e001 — the answer is a witness, and a super-DSC cannot be built without a DSC to witness.
     #[test]
     fn same_dsc_group_is_a_witness() {
-        let sdsc = SuperDsc::new(DscList::new(plain_dsc(), vec![]), BTreeMap::new());
+        let sdsc = SuperDsc::new(
+            DscList::new(plain_dsc(), vec![]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
         assert_eq!(same_dsc_group(&sdsc), SameDscGroup(()));
         assert_eq!(sdsc.dscs().iter().count(), 1);
     }
@@ -562,6 +570,8 @@ mod tests_e001_e008 {
                 (PrimaryDim::Ij, Scale::UnitStick),
                 (PrimaryDim::Mb, Scale::StickDim),
             ],
+            LdsIdx(183),
+            Pinning::default(),
         );
         assert_eq!(lds.ds_type(), DsType::Input);
         assert_eq!(
@@ -723,6 +733,7 @@ mod tests_e001_e008 {
                 (core(2), slice(1)),
                 (core(3), slice(0)),
             ]),
+            BTreeMap::new(),
         );
         let group = DscGroup::new(&dsc, vec![]);
         assert_eq!(
@@ -787,53 +798,651 @@ mod tests_e001_e008 {
     }
 }
 
-// crustify:todo: e009_getStickSize
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:327  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : int L3DlOpsScheduler::getStickSize(const DesignSpaceConfig &dsc, DsTypes dsType, PrimaryDimTypes dim)
-//   extract   : crustify-ddc/cpp/l3.cpp:245-258
+// ⭐ TYPES FOR ENTRIES 009-016. The DSC-side and super-DSC-side facts these entries read live in
+// [`crate::schedule::l3::dsc`] beside the rest of this stage's reduced vocabulary; what is declared
+// here is the L3 SCHEDULER'S OWN state — its private `Metadata` and the allocate node it mints.
 
-// crustify:todo: e010_getCoreSplitDimensions
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:342  (25 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::unordered_set<PrimaryDimTypes> L3DlOpsScheduler::getCoreSplitDimensions( const SuperDsc &mySDsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:268-294
+/// HOW MANY BUFFERS AN ALLOCATION GETS — `AllocateNode::numBuffers_` (`dsc/dsc2.h:984`), an enum
+/// because that field's own comment states the three values it takes: "1:no buffering,
+/// 2:double-buffer, -1:streaming buffer".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Buffering {
+    /// `1`.
+    None,
+    /// `2`.
+    Double,
+    /// `-1`.
+    Streaming,
+}
 
-// crustify:todo: e011_getLabeledDsWithDsType
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:369  (6 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::getLabeledDsWithDsType(std::vector<int> &indices, DesignSpaceConfig &dsc, DsTypes dsType)
-//   extract   : crustify-ddc/cpp/l3.cpp:304-312
+/// `dsc2::AllocateNode` (`dsc/dsc2.h:974`) AS ENTRY 016 MINTS ONE.
+///
+/// ⛔ A THIRD PROJECTION OF THAT STRUCT, beside [`crate::schedule::dsc2::AllocateNode`] (the
+/// component and lds the fold units read) and `ddc::transformation_util::DdcAllocateNode` (the
+/// layout, padding and user refcounts DDC's own mint keeps). This one carries the BUFFER COUNT,
+/// which neither of those reads, and no user list, because this mint records none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3AllocateNode {
+    /// `name_`, the caller's.
+    pub name: NodeName,
+    /// `ldsIdx_`.
+    pub lds: LdsIdx,
+    /// `component_` — a `SenComponents` and not a memory: the stage allocates in LX and HBM and in
+    /// register files.
+    pub component: SenComponent,
+    /// `numBuffers_`.
+    pub buffering: Buffering,
+    /// `layoutDimOrder_` zipped with `maxDimSizes_`, whose fresh entries are the reference's
+    /// `resize(n, -1)`.
+    pub layout: AllocLayout,
+    /// `padding_`.
+    pub padding: PaddingForm,
+}
 
-// crustify:todo: e012_getAllLabeledDsIndicesSet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:378  (7 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::unordered_set<int> L3DlOpsScheduler::getAllLabeledDsIndicesSet( const DesignSpaceConfig& dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:322-330
+/// `Metadata::Allocation` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:161`) reduced to the one map
+/// entry 016 writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct L3Allocation {
+    /// `ldsIdxAndAllocNode`.
+    pub lds_idx_and_alloc_node: BTreeMap<LdsIdx, AllocId>,
+}
 
-// crustify:todo: e013_getHbmPinnedLabeledDsIndicesSet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:387  (7 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::unordered_set<int> L3DlOpsScheduler::getHbmPinnedLabeledDsIndicesSet( const DesignSpaceConfig& dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:340-348
+/// WHAT THE L3 SCHEDULER RECORDS FOR ONE DSC — its private `Metadata`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:111`), reduced to the `newAllocations_` (`:167`) that
+/// entry 016 writes so the chunks' LX memory can later be allocated against it.
+///
+/// ⛔ A DIFFERENT C++ CLASS FROM [`crate::schedule::ddc::metadata::Metadata`] even where their
+/// fields coincide: the two stages each keep their own, and `dscMetadata` (`:203`) is keyed per DSC
+/// while DDC's is one per run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DscMetadata {
+    /// `newAllocations_`, each component to what was newly allocated in it.
+    pub new_allocations: BTreeMap<SenComponent, L3Allocation>,
+}
 
-// crustify:todo: e014_isLabeledDsLXNeighbor
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:406  (26 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isLabeledDsLXNeighbor(const SuperDsc &mySDsc, const int dscIndex, const LabeledDsInfo &lds) const
-//   extract   : crustify-ddc/cpp/l3.cpp:358-386
+/// A LABELLED DS PROVED READY FOR AN L3 ALLOCATION, WITH THE LAYOUT ORDER IT GETS.
+///
+/// ⛔ ENTRY 016'S *"Handling of external allocations with repeated dimensions is not yet
+/// implemented"* IS THIS TYPE: a layout order naming a dim twice has no witness, so the abort is
+/// unspellable rather than checked. Its two `.at()` throws are the same [`None`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshL3Allocation {
+    lds: LdsIdx,
+    component: SenComponent,
+    layout: AllocLayout,
+    pinning: Pinning,
+}
 
-// crustify:todo: e015_getParentLoopNodes
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:532  (10 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<const dsc2::LoopNode *> L3DlOpsScheduler::getParentLoopNodes( const dsc2::ScheduleNode &node, const DesignSpaceConfig &dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:396-407
+impl FreshL3Allocation {
+    /// The witness, or [`None`] for that one refusal and for a labelled DS the DSC does not state.
+    #[must_use]
+    pub fn of(dsc: &DesignSpaceConfig, lds: LdsIdx, component: SenComponent) -> Option<Self> {
+        let dims = dsc.layout_dims.get(&lds)?.to_vec();
+        let pinning = dsc.labeled_ds.at(lds)?.pinning();
+        let distinct: BTreeSet<PrimaryDim> = dims.iter().copied().collect();
+        (distinct.len() == dims.len()).then(|| Self {
+            lds,
+            component,
+            layout: AllocLayout(dims.into_iter().map(|dim| (dim, None)).collect()),
+            pinning,
+        })
+    }
+}
 
-// crustify:todo: e016_createAllocateNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:544  (49 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::AllocateNode *L3DlOpsScheduler::createAllocateNode( DesignSpaceConfig &dsc, const int ldsIdx, enum SenComponents component, const int numBuffers, const std::string &name, const int dscIdx)
-//   extract   : crustify-ddc/cpp/l3.cpp:417-468
+/// WHAT ENTRY 015 ASKS OF A SCHEDULE TREE — the parent walk, which is the MECHANISM for reaching a
+/// node's enclosing loops rather than a fact about them.
+pub trait LoopNesting {
+    /// `node->getOwnerLoop()` (`dsc/dsc2.cpp:1896`) — the nearest enclosing `LOOP`, walking `prev_`,
+    /// absent where that walk runs off the top of the tree.
+    fn owner_loop(&self, node: NodeId) -> Option<LoopId>;
+    /// `node->getPrev() != nullptr` (`dsc/dsc2.h:463`) — `prev_` is the PARENT block, so this is
+    /// false for the tree root and nothing else.
+    fn has_parent(&self, node: LoopId) -> bool;
+}
+
+/// Replaces: e009_getStickSize
+///
+/// How many elements of `dim` one whole stick of `ds_type` holds, and ONE ELEMENT for a dim the
+/// stick does not name.
+///
+/// ⭐ THE `break` IS A FIND: the reference walks an `unordered_map`, which holds one entry per dim.
+/// ⛔ [`None`] IS [`DesignSpaceConfig::cumulative_stick_sizes`]'s — a DS type the DSC describes no
+/// stick for, or an extent product the fold cannot count.
+#[must_use]
+pub fn stick_size(dsc: &DesignSpaceConfig, ds_type: DsType, dim: PrimaryDim) -> Option<Elements> {
+    Some(
+        dsc.cumulative_stick_sizes(ds_type)?
+            .iter()
+            .find(|(walked, _)| *walked == dim)
+            .map_or(Elements(1), |(_, size)| *size),
+    )
+}
+
+/// Replaces: e010_getCoreSplitDimensions
+///
+/// Which dims the super-DSC's DSCs do NOT agree on in their core data stage — a dim whose extent
+/// differs from DSC 0's in ANY DSC is a dim the work was split across cores along.
+///
+/// ⭐ `IJ` AND `KIJ` ARE SKIPPED as combined dims; `PrimaryDimTypesCount` is not a [`PrimaryDim`] at
+/// all, so the reference's third skip has nothing to skip. Two absent extents agree, which is the
+/// reference's `-1 == -1`.
+/// ⭐ TRAP, DISCHARGED BY CONSTRUCTION: the reference `DT_CHECK`s the core data stage on DSC 0 only
+/// and then `.at()`s EVERY DSC's, so a later DSC without one throws unguarded. Mandatory
+/// [`DesignSpaceConfig::core_stage`] removes both, leaving this total.
+#[must_use]
+pub fn core_split_dimensions(sdsc: &SuperDsc) -> BTreeSet<PrimaryDim> {
+    let mut dims = BTreeSet::new();
+    for dim in PrimaryDim::ALL {
+        if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
+            continue;
+        }
+        let main = sdsc.dscs().first().core_stage.dims().extent(dim);
+        if sdsc
+            .dscs()
+            .iter()
+            .any(|dsc| dsc.core_stage.dims().extent(dim) != main)
+        {
+            dims.insert(dim);
+        }
+    }
+    dims
+}
+
+/// Replaces: e011_getLabeledDsWithDsType
+///
+/// APPENDS the POSITION of every labelled DS of `ds_type` to `positions`.
+///
+/// ⛔ TRAP: it does not clear — a call adds to whatever the caller's vector already held. Both call
+/// sites pass a fresh one (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4423,4489`).
+/// ⛔ TRAP: these are POSITIONS in `labeledDs_`, not the `ldsIdx_` each entry records; the two need
+/// not agree, and [`all_labeled_ds_indices`] returns the other one.
+pub fn labeled_ds_with_ds_type(
+    dsc: &DesignSpaceConfig,
+    ds_type: DsType,
+    positions: &mut Vec<LdsIdx>,
+) {
+    for (at, lds) in dsc.labeled_ds.indexed() {
+        if lds.ds_type() == ds_type {
+            positions.push(at);
+        }
+    }
+}
+
+/// Replaces: e012_getAllLabeledDsIndicesSet
+///
+/// Every index the DSC's labelled DSs RECORD — each entry's own `ldsIdx_`.
+///
+/// ⛔ TRAP: `ldsIdx_` defaults to `183` (`dsc/dscdefn.h:323`) and nothing here relates it to the
+/// position the entry sits at, so this set and [`labeled_ds_with_ds_type`]'s positions are two
+/// different answers over one list.
+#[must_use]
+pub fn all_labeled_ds_indices(dsc: &DesignSpaceConfig) -> BTreeSet<LdsIdx> {
+    dsc.labeled_ds.iter().map(LabeledDs::recorded).collect()
+}
+
+/// Replaces: e013_getHbmPinnedLabeledDsIndicesSet
+///
+/// [`all_labeled_ds_indices`] restricted to the HBM-pinned entries — `memOrg_.at(HBM).isPresent`
+/// (`dsc/dscdefn.h:369`), and the same recorded `ldsIdx_` rather than a position.
+#[must_use]
+pub fn hbm_pinned_labeled_ds_indices(dsc: &DesignSpaceConfig) -> BTreeSet<LdsIdx> {
+    dsc.labeled_ds
+        .iter()
+        .filter(|lds| lds.pinning().hbm)
+        .map(LabeledDs::recorded)
+        .collect()
+}
+
+/// Replaces: e014_isLabeledDsLXNeighbor
+///
+/// Whether an LX-pinned `INPUT` labelled DS is fetched from a neighbour core: true when the DSC's own
+/// schedule step ALSO names a data DSC, which is what an input neighbour fetch is
+/// (`dsc/superdsc.h:31`).
+///
+/// ⭐ ONE CORE ANSWERS FOR ALL OF THEM — every core a DSC uses carries the same step, so the
+/// reference reads the first and so does this; `coreIdsUsed_[0]` cannot miss, because
+/// [`CoreIdsUsed`] is non-empty. A DSC appears in at most one step.
+/// ⛔ [`None`] is a DSC index past the end of `dscs_`, or a core the super-DSC states no schedule for.
+#[must_use]
+pub fn is_labeled_ds_lx_neighbor(sdsc: &SuperDsc, dsc: DscIdx, lds: &LabeledDs) -> Option<bool> {
+    if !lds.pinning().lx || lds.ds_type() != DsType::Input {
+        return Some(false);
+    }
+    let core = sdsc.dscs().at(dsc)?.core_ids_used.first();
+    Some(
+        sdsc.core_id_to_dsc_schedule
+            .get(&core)?
+            .iter()
+            .any(|step| step.dl_dsc == Some(dsc) && step.data_dsc.is_some()),
+    )
+}
+
+/// Replaces: e015_getParentLoopNodes
+///
+/// The loops enclosing a schedule node, INNERMOST FIRST and WITHOUT the root loop — the walk stops
+/// at the loop that has no parent block.
+///
+/// ⭐ THE `dsc` PARAMETER AND ITS *"Expect valid schedule tree"* `DT_CHECK` ARE BOTH GONE BY
+/// CONSTRUCTION: `node` is a node OF the tree being walked, so that tree is not empty.
+#[must_use]
+pub fn parent_loop_nodes<T: LoopNesting + ?Sized>(tree: &T, node: NodeId) -> Vec<LoopId> {
+    let mut loops = Vec::new();
+    let mut parent = tree.owner_loop(node);
+    while let Some(enclosing) = parent {
+        if !tree.has_parent(enclosing) {
+            break;
+        }
+        loops.push(enclosing);
+        parent = tree.owner_loop(enclosing.0);
+    }
+    loops
+}
+
+/// Replaces: e016_createAllocateNode
+///
+/// MINTS THE L3 ALLOCATE NODE for one labelled DS in one component: gives it the DS's layout order
+/// with every max size unset, marks each padded layout dim `PADDED_FULLSPAN_WUNNEEDED` when the DS's
+/// own LX organisation is padded, and — for an HBM-pinned LX allocation — REGISTERS it in
+/// `dscMetadata.at(dsc).newAllocations_[component]`, which is what later allocates the chunks' LX.
+///
+/// ⭐ `alloc` IS THE IDENTITY ITS OWNER ISSUES — `new dsc2::AllocateNode()` in the reference, whose
+/// pointer is what the registry holds it under.
+/// ⛔ [`None`] IS ONE OF TWO ABORTS: no `dscMetadata` entry for `dsc_idx`, or that labelled DS
+/// already registered in the component. The third is [`FreshL3Allocation`]; the *"Expect
+/// dataStageParam_ entry"* fourth is discharged by [`DesignSpaceConfig::core_stage`].
+pub fn create_allocate_node(
+    dsc: &DesignSpaceConfig,
+    metadata: &mut BTreeMap<DscIdx, DscMetadata>,
+    fresh: FreshL3Allocation,
+    buffering: Buffering,
+    name: NodeName,
+    dsc_idx: DscIdx,
+    alloc: AllocId,
+) -> Option<L3AllocateNode> {
+    let FreshL3Allocation {
+        lds,
+        component,
+        layout,
+        pinning,
+    } = fresh;
+    let mut padding = PaddingForm::default();
+    if component == SenComponent::Lx && pinning.lx_padded {
+        for (dim, _) in &layout.0 {
+            if dsc.core_stage.dims().padding.contains_key(dim) {
+                padding.set_padding(*dim, PadType::PaddedFullSpanWUnneeded);
+            }
+        }
+    }
+
+    if pinning.hbm && component == SenComponent::Lx {
+        let allocated = metadata
+            .get_mut(&dsc_idx)?
+            .new_allocations
+            .entry(component)
+            .or_default();
+        if allocated.lds_idx_and_alloc_node.contains_key(&lds) {
+            return None;
+        }
+        allocated.lds_idx_and_alloc_node.insert(lds, alloc);
+    }
+
+    Some(L3AllocateNode {
+        name,
+        lds,
+        component,
+        buffering,
+        layout,
+        padding,
+    })
+}
+
+// ⭐ TESTS FOR ENTRIES 009-016. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e009_e016 {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    use super::{
+        AllocId, Buffering, DesignSpaceConfig, DsType, DscIdx, DscMetadata, Elements, FilledDims,
+        FreshL3Allocation, L3AllocateNode, LabeledDs, LdsIdx, LoopId, LoopNesting, NodeId,
+        NodeName, PadType, Pinning, PrimaryDim, SuperDsc, all_labeled_ds_indices,
+        core_split_dimensions, create_allocate_node, hbm_pinned_labeled_ds_indices,
+        is_labeled_ds_lx_neighbor, labeled_ds_with_ds_type, parent_loop_nodes, stick_size,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, StickDims};
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DimPadding, DscList, DscScheduleStep, LabeledDsList,
+        PrimaryDsInfo, StageDims,
+    };
+    use crate::units::Core;
+
+    /// A three-deep nest: node 7 inside loop 5 inside the ROOT loop 3.
+    struct TestTree;
+
+    impl LoopNesting for TestTree {
+        fn owner_loop(&self, node: NodeId) -> Option<LoopId> {
+            match node.0 {
+                7 => Some(LoopId(NodeId(5))),
+                5 => Some(LoopId(NodeId(3))),
+                _ => None,
+            }
+        }
+        fn has_parent(&self, node: LoopId) -> bool {
+            node.0 != NodeId(3)
+        }
+    }
+
+    /// A core data stage stating one extent per named dim and padding for `Y` alone.
+    fn a_core_stage(extents: &[(PrimaryDim, i64)]) -> FilledDims {
+        FilledDims::of(StageDims {
+            extents: extents
+                .iter()
+                .map(|(dim, extent)| (*dim, Extent(*extent)))
+                .collect(),
+            padding: [(PrimaryDim::Y, DimPadding::default())]
+                .into_iter()
+                .collect(),
+            ..StageDims::default()
+        })
+        .expect("a stage stating at least one dim")
+    }
+
+    /// A DSC whose ONE labelled DS sits at position 0 while RECORDING `183`, with an `In`-then-`Y`
+    /// layout order for it and a core data stage that pads `Y`.
+    fn a_dsc() -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            corelets_used: CoreletsUsed::ONE,
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
+            layout_dims: [(
+                LdsIdx(0),
+                LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Y]),
+            )]
+            .into_iter()
+            .collect(),
+            core_stage: a_core_stage(&[(PrimaryDim::Y, 16), (PrimaryDim::Ij, 4)]),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(
+                    DsType::Input,
+                    vec![],
+                    LdsIdx(183),
+                    Pinning {
+                        hbm: true,
+                        lx: false,
+                        lx_padded: true,
+                    },
+                ),
+                vec![],
+            ),
+        }
+    }
+
+    /// Entry 009: a dim the stick names answers its cumulative extent, and a dim it does not name
+    /// answers ONE element rather than nothing.
+    #[test]
+    fn a_dim_the_stick_does_not_name_is_one_element() {
+        let mut dsc = a_dsc();
+        dsc.primary_ds_info.insert(
+            DsType::Input,
+            PrimaryDsInfo {
+                layout: LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Y]),
+                stick: StickDims(vec![
+                    (PrimaryDim::In, Elements(64)),
+                    (PrimaryDim::X, Elements(2)),
+                    (PrimaryDim::In, Elements(4)),
+                ]),
+            },
+        );
+
+        // The stick names `In` twice, and the cumulative size is the PRODUCT.
+        assert_eq!(
+            stick_size(&dsc, DsType::Input, PrimaryDim::In),
+            Some(Elements(256))
+        );
+        assert_eq!(
+            stick_size(&dsc, DsType::Input, PrimaryDim::Y),
+            Some(Elements(1))
+        );
+        // A DS type the DSC describes no stick for is `primaryDsInfo_.at(dsType)`'s throw.
+        assert_eq!(stick_size(&dsc, DsType::Kernel, PrimaryDim::In), None);
+    }
+
+    /// Entry 010: a dim whose core extent differs in any DSC is core-split, and `IJ` is skipped even
+    /// when it differs.
+    #[test]
+    fn a_differing_core_extent_is_a_split_dim_and_ij_is_skipped() {
+        let same = a_dsc();
+        let mut differs = a_dsc();
+        differs.core_stage = a_core_stage(&[(PrimaryDim::Y, 8), (PrimaryDim::Ij, 9)]);
+        let sdsc = SuperDsc::new(
+            DscList::new(same.clone(), vec![same, differs]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            core_split_dimensions(&sdsc),
+            [PrimaryDim::Y].into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// Entries 011, 012 and 013: the DS-type walk APPENDS POSITIONS to what the caller's vector
+    /// already held, while the two index sets collect the `ldsIdx_` each entry RECORDS — which for
+    /// the position-0 entry is `183` and not `0`.
+    #[test]
+    fn the_positions_and_the_recorded_indices_are_two_answers_over_one_list() {
+        let mut dsc = a_dsc();
+        dsc.labeled_ds = LabeledDsList::new(
+            dsc.labeled_ds.front().clone(),
+            vec![LabeledDs::new(
+                DsType::Kernel,
+                vec![],
+                LdsIdx(7),
+                Pinning::default(),
+            )],
+        );
+        let mut positions = vec![LdsIdx(9)];
+
+        labeled_ds_with_ds_type(&dsc, DsType::Input, &mut positions);
+
+        assert_eq!(positions, vec![LdsIdx(9), LdsIdx(0)]);
+        assert_eq!(
+            all_labeled_ds_indices(&dsc),
+            [LdsIdx(183), LdsIdx(7)].into_iter().collect()
+        );
+        // Only the entry at position 0 is HBM-pinned, and it records 183.
+        assert_eq!(
+            hbm_pinned_labeled_ds_indices(&dsc),
+            [LdsIdx(183)].into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// Entry 014: an LX-pinned input whose own schedule step also names a data DSC is a neighbour
+    /// fetch; the same step for another DSC, a non-input and a non-LX-pinned entry are not; and a
+    /// DSC index past the end of `dscs_` is that `.at()`'s throw.
+    #[test]
+    fn an_lx_pinned_input_with_a_data_dsc_in_its_step_is_a_neighbour_fetch() {
+        let core = Core::checked(0).expect("core 0");
+        let lx_input = LabeledDs::new(
+            DsType::Input,
+            vec![],
+            LdsIdx(0),
+            Pinning {
+                hbm: false,
+                lx: true,
+                lx_padded: false,
+            },
+        );
+        let dsc = a_dsc();
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![dsc.clone(), dsc]),
+            BTreeMap::new(),
+            [(
+                core,
+                vec![
+                    DscScheduleStep {
+                        data_dsc: None,
+                        dl_dsc: Some(DscIdx(1)),
+                    },
+                    DscScheduleStep {
+                        data_dsc: Some(DscIdx(4)),
+                        dl_dsc: Some(DscIdx(2)),
+                    },
+                ],
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            is_labeled_ds_lx_neighbor(&sdsc, DscIdx(2), &lx_input),
+            Some(true)
+        );
+        assert_eq!(
+            is_labeled_ds_lx_neighbor(&sdsc, DscIdx(1), &lx_input),
+            Some(false)
+        );
+        // Not LX-pinned, and an LX-pinned output: both answer before any lookup happens.
+        assert_eq!(
+            is_labeled_ds_lx_neighbor(
+                &sdsc,
+                DscIdx(2),
+                &LabeledDs::new(DsType::Input, vec![], LdsIdx(0), Pinning::default())
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            is_labeled_ds_lx_neighbor(
+                &sdsc,
+                DscIdx(2),
+                &LabeledDs::new(
+                    DsType::Output,
+                    vec![],
+                    LdsIdx(0),
+                    Pinning {
+                        hbm: false,
+                        lx: true,
+                        lx_padded: false,
+                    }
+                )
+            ),
+            Some(false)
+        );
+        // A DSC index past the end of `dscs_`.
+        assert_eq!(is_labeled_ds_lx_neighbor(&sdsc, DscIdx(3), &lx_input), None);
+    }
+
+    /// Entry 015: the enclosing loops innermost first, with the ROOT loop left out — and nothing at
+    /// all for a node the walk finds no loop above.
+    #[test]
+    fn the_parent_loops_exclude_the_root_and_run_innermost_first() {
+        assert_eq!(
+            parent_loop_nodes(&TestTree, NodeId(7)),
+            vec![LoopId(NodeId(5))]
+        );
+        assert_eq!(parent_loop_nodes(&TestTree, NodeId(1)), Vec::new());
+    }
+
+    /// Entry 016: an HBM-pinned LX allocation is registered under its labelled DS index, the padded
+    /// layout dim its core stage states is marked and the other is not, and the same index a second
+    /// time — or a repeated layout dim — yields nothing.
+    #[test]
+    fn an_hbm_pinned_lx_allocation_registers_once_and_pads_only_its_stated_dim() {
+        let dsc = a_dsc();
+        let mut metadata: BTreeMap<DscIdx, DscMetadata> =
+            [(DscIdx(0), DscMetadata::default())].into_iter().collect();
+        let fresh = FreshL3Allocation::of(&dsc, LdsIdx(0), SenComponent::Lx)
+            .expect("a stated labelled DS with distinct layout dims");
+
+        let node = create_allocate_node(
+            &dsc,
+            &mut metadata,
+            fresh,
+            Buffering::Double,
+            NodeName("allocate_lds0_lx".to_owned()),
+            DscIdx(0),
+            AllocId(9),
+        )
+        .expect("a metadata entry and a free registry slot");
+
+        assert_eq!(
+            node,
+            L3AllocateNode {
+                name: NodeName("allocate_lds0_lx".to_owned()),
+                lds: LdsIdx(0),
+                component: SenComponent::Lx,
+                buffering: Buffering::Double,
+                layout: node.layout.clone(),
+                padding: node.padding.clone(),
+            }
+        );
+        assert_eq!(
+            node.padding.padding(PrimaryDim::Y),
+            PadType::PaddedFullSpanWUnneeded
+        );
+        assert_eq!(node.padding.padding(PrimaryDim::In), PadType::NoPad);
+        assert_eq!(
+            node.layout.0,
+            vec![(PrimaryDim::In, None), (PrimaryDim::Y, None)]
+        );
+        assert_eq!(
+            metadata[&DscIdx(0)].new_allocations[&SenComponent::Lx].lds_idx_and_alloc_node
+                [&LdsIdx(0)],
+            AllocId(9)
+        );
+
+        // The second registration of one labelled DS is the `allocMetadata.find(ldsIdx)` `DT_CHECK`.
+        let again = FreshL3Allocation::of(&dsc, LdsIdx(0), SenComponent::Lx)
+            .expect("a stated labelled DS with distinct layout dims");
+        assert_eq!(
+            create_allocate_node(
+                &dsc,
+                &mut metadata,
+                again,
+                Buffering::None,
+                NodeName("allocate_lds0_lx".to_owned()),
+                DscIdx(0),
+                AllocId(10),
+            ),
+            None
+        );
+
+        // A repeated layout dim has no witness at all, and neither has a labelled DS the DSC does
+        // not state a layout order for.
+        let mut repeated = a_dsc();
+        repeated.layout_dims.insert(
+            LdsIdx(0),
+            LayoutDims::new(PrimaryDim::Y, vec![PrimaryDim::Y]),
+        );
+        assert_eq!(
+            FreshL3Allocation::of(&repeated, LdsIdx(0), SenComponent::Lx),
+            None
+        );
+        assert_eq!(
+            FreshL3Allocation::of(&dsc, LdsIdx(9), SenComponent::Lx),
+            None
+        );
+
+        // A DSC the metadata registry states nothing for is `dscMetadata.at(dscIdx)`'s throw.
+        let orphan = FreshL3Allocation::of(&dsc, LdsIdx(0), SenComponent::Lx)
+            .expect("a stated labelled DS with distinct layout dims");
+        assert_eq!(
+            create_allocate_node(
+                &dsc,
+                &mut metadata,
+                orphan,
+                Buffering::Streaming,
+                NodeName("allocate_lds0_lx".to_owned()),
+                DscIdx(4),
+                AllocId(11),
+            ),
+            None
+        );
+    }
+}
 
 /// Replaces: e017_createTransferNode
 ///
@@ -1584,8 +2193,10 @@ mod tests_e033_e040 {
             layout_dims: BTreeMap::new(),
             core_stage,
             labeled_ds: LabeledDsList::new(
-                LabeledDs::new(*first, vec![]),
-                rest.iter().map(|ds| LabeledDs::new(*ds, vec![])).collect(),
+                LabeledDs::new(*first, vec![], LdsIdx(183), Pinning::default()),
+                rest.iter()
+                    .map(|ds| LabeledDs::new(*ds, vec![], LdsIdx(183), Pinning::default()))
+                    .collect(),
             ),
         }
     }
