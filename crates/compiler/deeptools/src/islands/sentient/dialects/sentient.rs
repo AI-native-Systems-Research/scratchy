@@ -338,6 +338,48 @@ impl LrfIndex {
             Self::L31 => 31,
         }
     }
+
+    /// WHICH CASE SPELLS `index` — the inverse of [`Self::get`], and ⛔ `None` IS THE HARDWARE HAVING
+    /// NO SUCH REGISTER, not a check added here: `symbolizeSentientComputePort("lrf32")` returns
+    /// `std::nullopt` and its callers `DT_CHECK` on it (`Dialect/Sentient/Utils.cpp:161-164`).
+    #[must_use]
+    pub const fn at(index: u32) -> Option<LrfIndex> {
+        match index {
+            0 => Some(Self::L0),
+            1 => Some(Self::L1),
+            2 => Some(Self::L2),
+            3 => Some(Self::L3),
+            4 => Some(Self::L4),
+            5 => Some(Self::L5),
+            6 => Some(Self::L6),
+            7 => Some(Self::L7),
+            8 => Some(Self::L8),
+            9 => Some(Self::L9),
+            10 => Some(Self::L10),
+            11 => Some(Self::L11),
+            12 => Some(Self::L12),
+            13 => Some(Self::L13),
+            14 => Some(Self::L14),
+            15 => Some(Self::L15),
+            16 => Some(Self::L16),
+            17 => Some(Self::L17),
+            18 => Some(Self::L18),
+            19 => Some(Self::L19),
+            20 => Some(Self::L20),
+            21 => Some(Self::L21),
+            22 => Some(Self::L22),
+            23 => Some(Self::L23),
+            24 => Some(Self::L24),
+            25 => Some(Self::L25),
+            26 => Some(Self::L26),
+            27 => Some(Self::L27),
+            28 => Some(Self::L28),
+            29 => Some(Self::L29),
+            30 => Some(Self::L30),
+            31 => Some(Self::L31),
+            _ => None,
+        }
+    }
 }
 
 /// WHICH `istate<n>` — ⛔ FOUR EXIST (`SentientTypes.td:143-146`), so four variants.

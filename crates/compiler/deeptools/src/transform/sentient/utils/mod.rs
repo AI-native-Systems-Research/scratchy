@@ -95,9 +95,9 @@
 //! | `e546_findAndReplaceRedundantIterArgsUsedInConditions` | 546 | 3 | 138 | `dcc/src/Transform/Sentient/Utils.cpp:257` |
 
 #![allow(dead_code)]
-// ⛔ NOTHING CALLS THIS FILE YET — `Utils.cpp` is the campaign's shared leaf library, and its
-// consumers (`e392`, `e393`, `e395`, `e546` here, plus the passes) are not in this batch. CI runs
-// clippy with `-D warnings`, so without this the first ported leaf fails the gate.
+// ⛔ NOTHING CALLS THIS FILE YET — `Utils.cpp` is the campaign's shared leaf library, and the passes
+// that read it, along with `e546` here, are still open. CI runs clippy with `-D warnings`, so without
+// this the first ported leaf fails the gate.
 // ⭐ REMOVE THIS WITH THE FIRST CONSUMER: at that point an unused item here is a real defect again.
 
 use core::num::{NonZeroU32, NonZeroU64};
@@ -109,10 +109,13 @@ use super::{ForRef, IterArgIndex};
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
 use sys_arch_spec::fields::{self, ImmSpec, ImmWidth, Sign};
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{ValueMapping, Values};
+use crate::islands::sentient::ProgramUnit;
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, dataflow, operands, regions_mut, regions_ref, results, sentient, symbol,
-    uniform, use_count,
+    Definitions, Op, UniformRegions, Val, clone_ops, dataflow, operands, regions_mut, regions_ref,
+    replace_all_uses_with, results, sentient, symbol, uniform, use_count,
 };
 
 pub(crate) mod units_and_their_values;
@@ -1238,25 +1241,356 @@ pub fn has_uniformize_region(unit_body: &[Op]) -> bool {
 // `units_and_their_values.rs`. The scheduler split one C++ class (`Utils.hpp:161-190`) across two
 // homes; a second Rust type with the same fields would be the split made real.
 
-// crustify:todo: e392_getQueryKeyAndUnitsFromParentRegion
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:40  (24 body lines, level 1)
-//   original  : mlir::LogicalResult getQueryKeyAndUnitsFromParentRegion( Operation *op, Value &key, SmallVector<Value> &units)
-//   calls     : e252_size
+/// WHERE A KEY AND ITS UNIT LIST CAME FROM — the three arms
+/// `getQueryKeyAndUnitsFromParentRegion` returns `success()` from (`Utils.cpp:47-61`).
+///
+/// ⛔ THERE IS NO `failure()` VARIANT, AND THE PATH TYPE IS WHY: an [`OpAt`] names a position inside
+/// ONE `dataflow.program_unit` body, so the climb at `:43` always reaches that unit. The
+/// `while (op->getParentRegion())` falling out is the walk leaving the module altogether, which a
+/// path into a unit cannot describe — the same reasoning as [`NewUse::OtherUnit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryKeyAndUnits {
+    /// `dyn_cast<dataflow::ProgramUnitOp>` (`:47`).
+    ProgramUnit {
+        /// ⭐ THE ONE ARM WHOSE KEY MAY BE ABSENT: the reference writes it only where the region has
+        /// arguments (`:49-50`), which is exactly [`ProgramUnit::iter_arg`]'s [`Option`].
+        key: Option<Val>,
+        /// `program_op.getUnits()`.
+        units: Vec<Val>,
+    },
+    /// `dyn_cast<mlir::uniform::UniformizeRegionsOp>` (`:52`).
+    UniformizeRegions {
+        /// `uniform_op.getRegionArg(region_idx)`.
+        key: Val,
+        /// `uniform_op.getRegionUnitList(region_idx)`.
+        units: Vec<Val>,
+    },
+    /// `dyn_cast<mlir::uniform::EqualizePatternOp>` (`:57`).
+    EqualizePattern {
+        /// `equalize_op.getRegionArg(region_idx)`.
+        key: Val,
+        /// `equalize_op.getRegionUnitList(region_idx)`.
+        units: Vec<Val>,
+    },
+}
 
-// crustify:todo: e393_createSentientForOpWithAdditionalIterArgs
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:195  (59 body lines, level 1)
-//   original  : Operation *createSentientForOpWithAdditionalIterArgs( Operation *loop_op, std::vector<std::pair<Value, Value>> &start_vals_and_steps)
-//   calls     : e252_size
+/// Replaces: e392_getQueryKeyAndUnitsFromParentRegion
+///
+/// Climbs out of `at`'s enclosing regions to the first region-owning op and hands back that
+/// region's query key and unit list (`:40-63`).
+///
+/// ⛔ THE REGION NUMBER IS THE ONE THE CLIMB LAST STEPPED THROUGH: `region_idx` is reassigned every
+/// iteration (`:44`), so an op nested in a `sentient.for` inside a local region answers with the
+/// LOOP's region number and not the local region's — and a loop has exactly one region, so the
+/// number that reaches the `getRegionUnitList` is `0` whatever depth the op sat at.
+#[must_use]
+pub fn query_key_and_units_from_parent_region<A: Arch>(
+    unit: &ProgramUnit<A>,
+    at: &OpAt,
+) -> QueryKeyAndUnits {
+    for depth in (0..at.enclosing.len()).rev() {
+        let (index, region) = at.enclosing[depth];
+        let parent = OpAt::at(&at.enclosing[..depth], index);
+        let Some(Op::UniformRegions(regions)) = parent.op(&unit.body) else {
+            continue;
+        };
+        let Some(local) = regions.regions().get(region) else {
+            continue;
+        };
+        let (key, units) = (local.arg, local.units.clone());
+        return match regions {
+            UniformRegions::UniformizeRegions { .. } => {
+                QueryKeyAndUnits::UniformizeRegions { key, units }
+            }
+            UniformRegions::EqualizePattern { .. } => {
+                QueryKeyAndUnits::EqualizePattern { key, units }
+            }
+        };
+    }
+    QueryKeyAndUnits::ProgramUnit {
+        key: unit.iter_arg,
+        units: unit.on.vals(),
+    }
+}
 
-// crustify:todo: e395_pruneOutOfScopeEntries
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:635  (55 body lines, level 1)
-//   original  : void pruneOutOfScopeEntries(mlir::uniform::DefImmutableMappingOp map_op, SmallVectorImpl<Operation *> &to_be_deleted)
-//   calls     : e252_size
+/// Replaces: e393_createSentientForOpWithAdditionalIterArgs
+///
+/// Rebuilds `loop_op` carrying one further iter argument per `start_vals_and_steps` entry, each
+/// yielded as itself plus its step unless that step is a zero constant (`:195-253`).
+///
+/// ⛔ THE REBUILD DROPS EVERY REGISTER THE LOOP HAD, INCLUDING FOR THE VALUES IT ALREADY CARRIED:
+/// `ForOp::create` is handed an EMPTY `reg_locales`, an empty `ArrayRef<int>` and an empty
+/// `ArrayRef<bool>` (`:214-218`), so locales, indices and program-header flags all come back as the
+/// attribute defaults on the new loop.
+/// ⚠️ ISLAND GAP: `operand.getType()` (`:245`) CANNOT BE ASKED OF A [`Val`], so the added
+/// `sentient.scalar_add` is typed [`ScalarTy::Index`] — [`super::loop_merging`]'s precedent for a
+/// loop counter. The reference's two call sites give a `predicate_type` and a `table_entry_type`
+/// (`CFGSimplificationSentientLevel.cpp:1789, 1801`).
+pub fn create_sentient_for_op_with_additional_iter_args(
+    unit_body: &mut Vec<Op>,
+    loop_op: ForRef,
+    start_vals_and_steps: &[(Val, Val)],
+    values: &mut Values,
+) -> ForRef {
+    let Some(at) = for_at(unit_body, loop_op) else {
+        missing_for(loop_op)
+    };
+    // `dyn_cast<sentient::ConstantOp>(step.getDefiningOp())` (`:238-240`), answered before the
+    // rebuild moves the blocks these steps are visible from.
+    //
+    // ⚠️ A STEP THAT IS A BLOCK ARGUMENT ANSWERS "not a zero constant" HERE AND ASSERTS THERE — a
+    // bare `dyn_cast` on a null defining op, as `promotes_above_uniform_region` records.
+    let zero_step: Vec<bool> = {
+        let scopes = visible_from(unit_body, &at);
+        let defs = Definitions::from_innermost(&scopes);
+        start_vals_and_steps
+            .iter()
+            .map(|(_start, step)| {
+                matches!(
+                    defs.of(*step),
+                    Some(Op::Sentient(sentient::Op::ScalarConstant { value: 0, .. }))
+                )
+            })
+            .collect()
+    };
+    let Some(Op::Sentient(sentient::Op::For {
+        iv,
+        bound,
+        carried,
+        dbg_name,
+        body,
+        ..
+    })) = at.op(unit_body)
+    else {
+        missing_for(loop_op)
+    };
+    let (old_iv, bound, dbg_name) = (*iv, *bound, dbg_name.clone());
+    let old_carried = carried.clone();
+    let old_body = body.clone();
 
-// crustify:todo: e396_replaceValue
-//   authority : dcc/src/Transform/Sentient/Utils.hpp:175  (4 body lines, level 1)
-//   original  : void replaceValue(size_t index, mlir::Value new_val)
-//   calls     : e252_size
+    // `iter_args` is the old inits then each `pair.first` (`:206-211`), and the body block's
+    // arguments are the induction variable then one per entry of it (`:222-225`).
+    let new_iv = values.mint();
+    let new_carried: Vec<ops::Carried> = old_carried
+        .iter()
+        .map(|value| value.init)
+        .chain(start_vals_and_steps.iter().map(|(start, _step)| *start))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|init| ops::Carried {
+            init,
+            arg: values.mint(),
+            result: values.mint(),
+            reg: ops::Reg::UNALLOCATED,
+            result_reg: ops::Reg::UNALLOCATED,
+            program_header: false,
+            element_size: None,
+        })
+        .collect();
+
+    // `copyLoopBody` (`dcc/src/Utils/Utils.cpp:357-381`): the old body args stand for the new ones,
+    // every body op is cloned, and the yield gains the new region iter args in ascending order.
+    let mut mapping = ValueMapping::new();
+    mapping.map(old_iv, new_iv);
+    for (old, new) in old_carried.iter().zip(&new_carried) {
+        mapping.map(old.arg, new.arg);
+    }
+    let mut new_body = clone_ops(&old_body, values, &mut mapping);
+    let orig_num_iter_args = old_carried.len();
+    let Some(Op::Sentient(sentient::Op::Yield { results })) = new_body.last_mut() else {
+        missing_for(loop_op)
+    };
+    results.extend(new_carried[orig_num_iter_args..].iter().map(|new| new.arg));
+
+    // `yield_op->setOperand(i + orig_num_iter_args, add_op)` for every non-zero step (`:242-248`).
+    let mut adds = Vec::new();
+    for (i, (_start, step)) in start_vals_and_steps.iter().enumerate() {
+        if zero_step[i] {
+            continue;
+        }
+        let slot = orig_num_iter_args + i;
+        let result = values.mint();
+        adds.push(ops::Op::ScalarAdd {
+            lhs: new_carried[slot].arg,
+            rhs: *step,
+            result,
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        });
+        results[slot] = result;
+    }
+    let before_yield = new_body.len() - 1;
+    for (offset, add) in adds.into_iter().enumerate() {
+        new_body.insert(before_yield + offset, Op::Sentient(add));
+    }
+
+    let new_loop = Op::Sentient(sentient::Op::For {
+        iv: new_iv,
+        iv_reg: ops::Reg::UNALLOCATED,
+        bound,
+        carried: new_carried.clone(),
+        dbg_name,
+        body: new_body,
+    });
+    let _ = remove_at(unit_body, &at);
+    insert_at(unit_body, &at, new_loop);
+    // `loop_op->getResult(i).replaceAllUsesWith(ret_op->getResult(i))` (`:251-253`), then the erase.
+    for (old, new) in old_carried.iter().zip(&new_carried) {
+        replace_all_uses_with(unit_body, old.result, new.result);
+    }
+    ForRef(new_iv)
+}
+
+/// `DT_CHECK(yield_op != nullptr)` (`:231`) — reached whenever `loop_op` is not a `sentient::ForOp`,
+/// because the `dyn_cast` at `:204` is the only branch that sets either `yield_op` or `ret_op`.
+fn missing_for(loop_op: ForRef) -> ! {
+    panic!(
+        "DT_CHECK(yield_op != nullptr) (`Utils.cpp:231`): {loop_op:?} names no sentient.for of this \
+         program unit"
+    )
+}
+
+/// WHERE THE `sentient.for` A [`ForRef`] NAMES SITS — ⛔ NOT [`path_of`], which matches on
+/// [`results`]: a loop's results are the values it CARRIES OUT and never its induction variable.
+fn for_at(unit_body: &[Op], loop_op: ForRef) -> Option<OpAt> {
+    fn walk(block: &[Op], iv: Val, enclosing: &mut Vec<(InBlock, usize)>) -> Option<OpAt> {
+        for (index, op) in block.iter().enumerate() {
+            if matches!(op, Op::Sentient(sentient::Op::For { iv: named, .. }) if *named == iv) {
+                return Some(OpAt::at(enclosing, InBlock(index)));
+            }
+            for (region, inner) in regions_ref(op).into_iter().enumerate() {
+                enclosing.push((InBlock(index), region));
+                let found = walk(inner, iv, enclosing);
+                enclosing.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+    walk(unit_body, loop_op.0, &mut Vec::new())
+}
+
+/// Replaces: e395_pruneOutOfScopeEntries
+///
+/// Drops from a `uniform.def_immutable_mapping` every key that is not a unit of the local region it
+/// sits in, then either folds the map into its one remaining value or rebuilds it (`:635-687`).
+///
+/// ⛔ THE MAP IS DELETED EITHER WAY — `to_be_deleted.push_back(map_op)` at `:686` is outside both
+/// arms — and in the all-equal arm every `uniform.query_map` reading it is deleted with it.
+/// ⭐ THE SORT AND `std::binary_search` (`:650-668`) ARE DROPPED MECHANISM: they answer only whether
+/// a key is one of the region's units, and `DT_CHECK(keys_v.size() == values_v.size())` (`:669`) is
+/// gone the way e252_size's is, because a kept entry is one pair.
+pub fn prune_out_of_scope_entries<A: Arch>(
+    unit: &mut ProgramUnit<A>,
+    map: Val,
+    to_be_deleted: &mut Vec<Val>,
+    values: &mut Values,
+) {
+    // `if (!parent_uro || region_index < 0) return;` (`:642`) — `getRegionOpAndIndex` walked out of
+    // the unit, which for a path into one means the map is not in this unit at all.
+    let Some(at) = path_of(&unit.body, map) else {
+        return;
+    };
+    let units_of_region = match query_key_and_units_from_parent_region(unit, &at) {
+        // `if (isa<mlir::dataflow::ProgramUnitOp>(parent_uro)) return;` (`:643`)
+        QueryKeyAndUnits::ProgramUnit { .. } => return,
+        QueryKeyAndUnits::UniformizeRegions { units, .. } => units,
+        QueryKeyAndUnits::EqualizePattern { .. } => panic!(
+            "DT_CHECK(isa<mlir::uniform::UniformizeRegionsOp>(parent_uro)) (`Utils.cpp:644`): \
+             {map:?} sits in a uniform.equalize_pattern"
+        ),
+    };
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = at.op(&unit.body)
+    else {
+        panic!(
+            "pruneOutOfScopeEntries(mlir::uniform::DefImmutableMappingOp map_op) (`Utils.cpp:635`): \
+             {map:?} is not a uniform.def_immutable_mapping"
+        )
+    };
+    // `if (map_keys.size() == units_of_region.size()) return;` (`:649`) — nothing is out of scope.
+    if pairs.len() == units_of_region.len() {
+        return;
+    }
+    if pairs.len() < units_of_region.len() {
+        panic!(
+            "DT_CHECK_MSG(map_keys.size() > units_of_region.size(), \"invalid map with missing keys \
+             for the units represented in this local region\") (`Utils.cpp:650`): {} of {}",
+            pairs.len(),
+            units_of_region.len()
+        )
+    }
+    let kept: Vec<(Val, Val)> = pairs
+        .iter()
+        .copied()
+        .filter(|(key, _value)| units_of_region.contains(key))
+        .collect();
+    if kept.len() != units_of_region.len() {
+        panic!(
+            "DT_CHECK_MSG(keys_v.size() == units_of_region.size(), \"expected the original map to \
+             contain keys that match the units in this local region!\") (`Utils.cpp:671`): {} of {}",
+            kept.len(),
+            units_of_region.len()
+        )
+    }
+    // `values_v.back()` (`:678`) on a region with no units at all is the reference's own read past
+    // the end of an empty vector, which `llvm::all_of` over nothing walks straight into.
+    let Some((_key, last)) = kept.last().copied() else {
+        panic!(
+            "values_v.back() (`Utils.cpp:678`): the local region holding {map:?} lists no units, so \
+             every entry of the map was pruned"
+        )
+    };
+    if kept.iter().all(|(_key, value)| *value == last) {
+        for user in query_map_users(&unit.body, map) {
+            replace_all_uses_with(&mut unit.body, user, last);
+            to_be_deleted.push(user);
+        }
+    } else {
+        let new_map = values.mint();
+        insert_at(
+            &mut unit.body,
+            &at,
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: new_map,
+                pairs: kept,
+            }),
+        );
+        replace_all_uses_with(&mut unit.body, map, new_map);
+    }
+    to_be_deleted.push(map);
+}
+
+/// `map_op->getUsers()` WITH ITS `DT_CHECK(isa<mlir::uniform::QueryMapOp>(user))` (`:680`), each
+/// user given as the value `user->getResult(0)` binds — which is what `:681` rewires.
+fn query_map_users(scope: &[Op], map: Val) -> Vec<Val> {
+    fn walk(scope: &[Op], map: Val, users: &mut Vec<Val>) {
+        for op in scope {
+            if operands(op).contains(&map) {
+                let Op::Uniform(uniform::Op::QueryMap { result, .. }) = op else {
+                    panic!(
+                        "DT_CHECK(isa<mlir::uniform::QueryMapOp>(user)) (`Utils.cpp:680`): {op:?} \
+                         reads {map:?}"
+                    )
+                };
+                users.push(*result);
+            }
+            for inner in regions_ref(op) {
+                walk(inner, map, users);
+            }
+        }
+    }
+    let mut users = Vec::new();
+    walk(scope, map, &mut users);
+    users
+}
+
+// e396_replaceValue is ported ONE MODULE DOWN, on the `UnitsAndTheirValues` that already carries
+// e249_normalizeNullValues, e251_add, e252_size and e253_areAllValuesEqual:
+// `units_and_their_values.rs`. Same reason as those three — it is a method of the type that file
+// owns, and a second Rust type with the same fields would make the scheduler's split real.
 
 // crustify:todo: e546_findAndReplaceRedundantIterArgsUsedInConditions
 //   authority : dcc/src/Transform/Sentient/Utils.cpp:257  (138 body lines, level 3)
@@ -1269,7 +1603,9 @@ mod unit_tests {
     use crate::arch::Dd2;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::Units;
     use crate::islands::sentient::dialects::{LocalRegion, UniformRegions};
+    use crate::units::DfirUnit;
 
     /// `sentient.scalar_constant` — the constant an immutable address resolves to.
     fn scalar_constant(result: Val, value: i64) -> Op {
@@ -1712,6 +2048,183 @@ mod unit_tests {
             .map(reverse_predicate)
             .collect();
         assert_eq!(reversed, vec![Eq, Ne, Sgt, Sge, Slt, Sle]);
+    }
+
+    /// One program unit on one PE, carrying `body` — [`ProgramUnit::iter_arg`] is the key e392's
+    /// program-unit arm hands back.
+    fn program_unit(body: Vec<Op>) -> ProgramUnit<Dd2> {
+        ProgramUnit {
+            iter_arg: Some(Val(50)),
+            on: Units::one(DfirUnit::Pe, Val(60)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e392: an op inside a local region answers with THAT region's arg and unit list, and one at the
+    /// top of the unit body walks all the way out to the program unit's own.
+    #[test]
+    fn e392_query_key_and_units_from_parent_region() {
+        let unit = program_unit(vec![
+            Op::UniformRegions(UniformRegions::UniformizeRegions {
+                regions: vec![LocalRegion {
+                    arg: Val(20),
+                    units: vec![Val(21), Val(22)],
+                    body: vec![nop()],
+                }],
+                results: Vec::new(),
+            }),
+            nop(),
+        ]);
+
+        assert_eq!(
+            query_key_and_units_from_parent_region(
+                &unit,
+                &OpAt::at(&[(InBlock(0), 0)], InBlock(0))
+            ),
+            QueryKeyAndUnits::UniformizeRegions {
+                key: Val(20),
+                units: vec![Val(21), Val(22)],
+            }
+        );
+        assert_eq!(
+            query_key_and_units_from_parent_region(&unit, &OpAt::top(InBlock(1))),
+            QueryKeyAndUnits::ProgramUnit {
+                key: Some(Val(50)),
+                units: unit.on.vals(),
+            }
+        );
+    }
+
+    /// e393: the rebuilt loop carries one further value, the cloned yield returns it stepped by a
+    /// `sentient.scalar_add` placed in front of that yield, and the old loop's result readers move to
+    /// the new loop's results.
+    #[test]
+    fn e393_create_sentient_for_op_with_additional_iter_args() {
+        let mut unit_body = vec![
+            constant(Val(0), 4),
+            constant(Val(1), 0),
+            constant(Val(2), 3),
+            for_op(
+                Val(3),
+                Val(0),
+                vec![carried(Val(1), Val(4), Val(5))],
+                vec![yield_op(vec![Val(4)])],
+            ),
+            copy(Val(5), Val(6)),
+        ];
+        let mut values = Values::default();
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+
+        let rebuilt = create_sentient_for_op_with_additional_iter_args(
+            &mut unit_body,
+            ForRef(Val(3)),
+            &[(Val(1), Val(2))],
+            &mut values,
+        );
+
+        let Op::Sentient(sentient::Op::For {
+            iv,
+            carried: new_carried,
+            body,
+            ..
+        }) = &unit_body[3]
+        else {
+            panic!("the loop is rebuilt where it stood")
+        };
+        assert_eq!(*iv, rebuilt.0);
+        assert_eq!(new_carried.len(), 2);
+        assert_eq!(new_carried[1].init, Val(1));
+        let [
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs, rhs, result, ..
+            }),
+            Op::Sentient(sentient::Op::Yield { results }),
+        ] = &body[..]
+        else {
+            panic!("the add lands immediately before the yield")
+        };
+        assert_eq!((*lhs, *rhs), (new_carried[1].arg, Val(2)));
+        assert_eq!(results, &vec![new_carried[0].arg, *result]);
+        assert_eq!(unit_body[4], copy(new_carried[0].result, Val(6)));
+    }
+
+    /// e395: a map holding a key that is not a unit of its local region is REBUILT without it and its
+    /// readers rewired, and where the kept values all agree the map folds into that one value and
+    /// every `uniform.query_map` reading it is marked for deletion instead.
+    #[test]
+    fn e395_prune_out_of_scope_entries() {
+        let (map, read) = (Val(40), Val(41));
+        let unit_of = |pairs: Vec<(Val, Val)>| {
+            program_unit(vec![Op::UniformRegions(
+                UniformRegions::UniformizeRegions {
+                    regions: vec![LocalRegion {
+                        arg: Val(20),
+                        units: vec![Val(21), Val(22)],
+                        body: vec![
+                            Op::Uniform(uniform::Op::DefImmutableMapping { result: map, pairs }),
+                            Op::Uniform(uniform::Op::QueryMap {
+                                result: read,
+                                map,
+                                key: Val(20),
+                            }),
+                        ],
+                    }],
+                    results: Vec::new(),
+                },
+            )])
+        };
+        let region_of = |unit: &ProgramUnit<Dd2>| {
+            let Op::UniformRegions(UniformRegions::UniformizeRegions { regions, .. }) =
+                &unit.body[0]
+            else {
+                panic!("the unit holds the uniformize_regions it was built with")
+            };
+            regions[0].body.clone()
+        };
+
+        // Val(23) is no unit of the region, and the two kept values disagree, so the map is rebuilt.
+        let mut unit = unit_of(vec![
+            (Val(21), Val(30)),
+            (Val(22), Val(31)),
+            (Val(23), Val(32)),
+        ]);
+        let mut to_be_deleted = Vec::new();
+        let mut values = Values::default();
+        for _ in 0..42 {
+            let _ = values.mint();
+        }
+        prune_out_of_scope_entries(&mut unit, map, &mut to_be_deleted, &mut values);
+        assert_eq!(
+            region_of(&unit)[0],
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(42),
+                pairs: vec![(Val(21), Val(30)), (Val(22), Val(31))],
+            })
+        );
+        assert_eq!(
+            region_of(&unit)[2],
+            Op::Uniform(uniform::Op::QueryMap {
+                result: read,
+                map: Val(42),
+                key: Val(20),
+            })
+        );
+        assert_eq!(to_be_deleted, vec![map]);
+
+        // The same map with the kept values equal folds: the query_map's readers take the value and
+        // the query_map itself is deleted alongside the map.
+        let mut unit = unit_of(vec![
+            (Val(21), Val(30)),
+            (Val(22), Val(30)),
+            (Val(23), Val(32)),
+        ]);
+        let mut to_be_deleted = Vec::new();
+        prune_out_of_scope_entries(&mut unit, map, &mut to_be_deleted, &mut values);
+        assert_eq!(to_be_deleted, vec![read, map]);
     }
 
     /// e246: `*curr_iter_arg.user_begin()` IS THE OP THAT READS THE ARG, so an inner `sentient.for`

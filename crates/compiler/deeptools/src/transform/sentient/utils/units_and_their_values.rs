@@ -70,7 +70,7 @@
 //    anchor FILLED so the unit is not lost. ⛔ DO NOT INVENT THE ANALYSIS and do not substitute a
 //    constant for its result. Extending `src/islands/sentient/` is a different case and IS expected.
 
-//! `Utils.cpp`/`Utils.hpp` — 5 of the campaign's 656 units (dependency level(s) [0, 1]).
+//! `Utils.cpp`/`Utils.hpp` — 6 of the campaign's 656 units (dependency level(s) [0, 1]).
 //!
 //! | unit | entry | level | lines | authority path:line |
 //! |---|---|---|---|---|
@@ -84,15 +84,19 @@
 //! |---|---|---|---|---|
 //! | `e251_add` | 251 | 0 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:165` |
 //! | `e252_size` | 252 | 0 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:171` |
+//! | `e396_replaceValue` | 396 | 1 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:175` |
 //! | `e253_areAllValuesEqual` | 253 | 0 | 6 | `dcc/src/Transform/Sentient/Utils.hpp:180` |
 
 
-// ⛔ NOTHING CALLS THIS TYPE YET. `replaceValue` (e396) is still anchored in the PARENT module, and
-// the type's one consumer is `RegisterInitCandidatePromoter` (e606, e517, e570) — all still open.
+// ⛔ NOTHING CALLS THIS TYPE YET — its one consumer is `RegisterInitCandidatePromoter` (e606, e517,
+// e570), all still open. `replaceValue` (e396) is now ported here beside the type it belongs to.
 // ⭐ REMOVE THIS WITH THE FIRST OF THEM: an unused item here is a real defect from then on.
 #![allow(dead_code)]
 
-use crate::islands::sentient::dialects::Val;
+use std::fmt::Write as _;
+
+use crate::islands::sentient::dialects::{self, Op, Val};
+use crate::islands::sentient::print;
 
 /// EVERY UNIT OF A UNIFORMIZED PROGRAM PAIRED WITH ITS VALUE — `dcc::utils::UnitsAndTheirValues`
 /// (`dcc/src/Transform/Sentient/Utils.hpp:161-190`).
@@ -150,6 +154,26 @@ impl UnitsAndTheirValues {
         self.pairs.len()
     }
 
+    /// Replaces: e396_replaceValue
+    ///
+    /// `replaceValue(index, new_val)` (`Utils.hpp:175`) — one mapped value overwritten, its unit left
+    /// alone.
+    ///
+    /// ⛔ `DT_CHECK(index < size())` (`Utils.hpp:176`) STAYS A NAMED STOP, not a `Result`: the one
+    /// consumer indexes with a position it took from the same list (`OldRegisterInitialization.cpp:996`),
+    /// so an out-of-range index is a broken caller and not an input.
+    /// ⭐ THE VALUE ARRIVES NON-NULL — the parameter is a plain `mlir::Value`, so this can only ever
+    /// fill a hole [`Self::normalize_null_values`] would have.
+    pub(crate) fn replace_value(&mut self, index: usize, new_val: Val) {
+        let Some((_unit, value)) = self.pairs.get_mut(index) else {
+            panic!(
+                "DT_CHECK(index < size()) (`Utils.hpp:176`): {index} of {}",
+                self.pairs.len()
+            )
+        };
+        *value = Some(new_val);
+    }
+
     /// Replaces: e253_areAllValuesEqual
     ///
     /// `areAllValuesEqual()` (`Utils.hpp:180`) — whether every mapped value is the same one.
@@ -162,17 +186,49 @@ impl UnitsAndTheirValues {
         let (_, last) = *self.pairs.last()?;
         Some(self.pairs.iter().all(|(_, value)| *value == last))
     }
+
+    /// Replaces: e394_dump
+    ///
+    /// `size: N`, then one `<unit>\t --> <value>` line per mapping, in `add` order.
+    ///
+    /// ⭐ A RETURNED `String` FOR `llvm::dbgs()`, as e014_dump, e065_dump and e102_dumpWeights already
+    /// do: the reference's own caller is the only thing that decides where the text goes.
+    #[must_use]
+    pub(crate) fn dump(&self, scope: &[Op]) -> String {
+        let mut out = format!("size: {}\n", self.size());
+        for (unit, value) in &self.pairs {
+            print_value(&mut out, Some(*unit), scope);
+            out.push_str("\t --> ");
+            print_value(&mut out, *value, scope);
+            out.push('\n');
+        }
+        out
+    }
 }
 
-// crustify:todo: e394_dump
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:615  (6 body lines, level 1)
-//   original  : void UnitsAndTheirValues::dump()
-//   calls     : e252_size
+/// `llvm::dbgs() << v` FOR AN `mlir::Value` — `Value::print`, which prints an op result's whole
+/// defining operation and MLIR's own `<<NULL VALUE>>` where the value is null.
+///
+/// ⚠ A VALUE WHOSE DEFINING OP IS NOT IN `scope` PRINTS AS A BLOCK ARGUMENT WITHOUT ITS TYPE, and
+/// [`print::emit`] ends its line — both are e102_dumpWeights' recorded divergences, unchanged here.
+fn print_value(out: &mut String, val: Option<Val>, scope: &[Op]) {
+    match val {
+        None => out.push_str("<<NULL VALUE>>"),
+        Some(val) => match dialects::defining_op(val, scope) {
+            Some(op) => print::emit(out, op, 0),
+            None => {
+                let _ = write!(out, "<block argument> {val:?}");
+            }
+        },
+    }
+}
 
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient;
 
     /// e249 — the holes take the first non-null value, and an all-null list is left alone.
     #[test]
@@ -227,5 +283,58 @@ mod unit_tests {
 
         uvs.add(Val(3), None);
         assert_eq!(uvs.are_all_values_equal(), Some(false));
+    }
+
+    /// e396 — the value at one index is overwritten and its unit, and every other pair, is untouched.
+    #[test]
+    fn e396_replace_value() {
+        let mut uvs = UnitsAndTheirValues::default();
+        uvs.add(Val(1), Some(Val(9)));
+        uvs.add(Val(2), None);
+
+        uvs.replace_value(1, Val(7));
+
+        assert_eq!(
+            uvs.pairs,
+            vec![(Val(1), Some(Val(9))), (Val(2), Some(Val(7)))]
+        );
+    }
+
+    /// e396 — an index past the end is the reference's `DT_CHECK`, not an answer.
+    #[test]
+    #[should_panic(expected = "DT_CHECK(index < size())")]
+    fn e396_replace_value_past_the_end_is_the_reference_check() {
+        let mut uvs = UnitsAndTheirValues::default();
+        uvs.add(Val(1), None);
+        uvs.replace_value(1, Val(7));
+    }
+
+    /// e394 — the size line, then one line per pair: a defined value prints its whole defining op, a
+    /// null value prints `<<NULL VALUE>>`, and a value with no defining op prints as a block argument.
+    #[test]
+    fn e394_dump() {
+        let scope = vec![Op::Sentient(sentient::Op::ScalarConstant {
+            value: 5,
+            result: Val(20),
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })];
+        let uvs = UnitsAndTheirValues {
+            pairs: vec![
+                (Val(10), Some(Val(20))),
+                (Val(11), None),
+                (Val(12), Some(Val(30))),
+            ],
+        };
+
+        let dumped = uvs.dump(&scope);
+
+        assert!(dumped.starts_with("size: 3\n"), "{dumped}");
+        assert_eq!(dumped.matches("\t --> ").count(), 3, "{dumped}");
+        assert_eq!(dumped.matches("<<NULL VALUE>>").count(), 1, "{dumped}");
+        // The three units and `Val(30)` have no defining op in `scope`; `Val(20)` does.
+        assert_eq!(dumped.matches("<block argument>").count(), 4, "{dumped}");
+        assert_eq!(dumped.matches("scalar_constant").count(), 1, "{dumped}");
     }
 }
