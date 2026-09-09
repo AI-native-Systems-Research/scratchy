@@ -842,7 +842,7 @@ fn fold_to_constant(op: &DfirOp, built: &[DfirOp], unit: &[DfirOp]) -> Option<i6
 /// [`ExpandAffineApplyOps::DoesNotResolveToAConstant`] and stops the pass, which is what the abort
 /// achieves. ⛔ The one thing it must not do is answer `true` — that would let an `affine.apply` be
 /// erased in favour of a value the pass never proved constant.
-fn is_arith_constant(val: Val, built: &[DfirOp], unit: &[DfirOp]) -> bool {
+pub(super) fn is_arith_constant(val: Val, built: &[DfirOp], unit: &[DfirOp]) -> bool {
     // `val.getDefiningOp()` — over the ops this expansion built and then the unit the apply lives in,
     // the two places a Value's defining op can be.
     let define = |val: Val| defining_op(val, built).or_else(|| defining_op(val, unit));

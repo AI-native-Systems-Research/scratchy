@@ -449,6 +449,7 @@ mod insert_pt_mask_ops_tests {
             unroll_factor: sentient::UnrollFactor::X1,
             xrf_read_incr: 0,
             xrf_write_incr: 0,
+            data_transfer_only: false,
             dbg_name: None,
         });
         let mut unit_body = vec![sen::Op::Sentient(sentient::Op::For {
@@ -632,6 +633,7 @@ mod update_loop_mask_tree_tests {
             unroll_factor: sentient::UnrollFactor::X1,
             xrf_read_incr: 0,
             xrf_write_incr: 0,
+            data_transfer_only: false,
             dbg_name: None,
         });
         let body = vec![sen::Op::Sentient(sentient::Op::For {

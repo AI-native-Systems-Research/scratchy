@@ -65,15 +65,22 @@
 //! | `e377_matchAndRewrite` | 377/384 | 12 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44` |
 //! | `e378_runOnOperation` | 378/384 | 30 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374` |
 
-use super::vc_operand_reuse::OperandReuse;
-use super::vc_vector_chain_helper::redefine_constant_vectors;
+use super::vc_operand_reuse::{DataId, OperandReuse};
+use super::vc_vector_chain_helper::{
+    input_precision_from_operand, redefine_constant_vectors, vector_type_of,
+};
 use super::vc_vector_operands::{
-    OpId, VectorOperand, erase_op_recording, erase_operands_recording, remove_at,
+    ComputeComp, OpId, VectorOperand, erase_op, erase_op_recording, erase_operands_recording,
+    origin_val, remove_at, use_positions,
 };
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, dataflow, defining_op, regions};
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, regions, vector,
+};
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{self as dfir, Values};
+use crate::islands::sentient::dialects::{self as sen, sentient};
 use crate::units::DfirUnit;
 
 /// ONE OF THE SIXTEEN COMPUTE LOWERING PATTERNS `fuseComputeOps` INSTALLS —
@@ -578,12 +585,324 @@ pub fn cleanup(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 344/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE DUMMY MAC AND WHERE IT GOES — `OpBuilder builder(op)` (`VectorChainToSentientPESFP.cpp:1296`)
+/// inserts immediately BEFORE the dangling op, which is the position recorded here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DummyMac {
+    /// The dangling receive or load this stands in for.
+    pub at: OpId,
+    /// The `sentient.scalar_constant` mask then the `sentient.vector_mac` that reads it.
+    pub ops: Vec<sen::Op>,
+}
+
+/// WHAT THE DANGLING LOWERING DID — `mlir::LogicalResult` together with the emission it made getting
+/// there, because the MACs land in the sentient island while the erasures happen in the dataflow one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingLowering {
+    /// One per unabsorbed receive or load, in walk order.
+    pub macs: Vec<DummyMac>,
+    /// `result` — ⛔ THE MACS AND THE ERASURES STAND EVEN ON A FAILURE: the walk interrupts *after*
+    /// them and `tobe_deleted` is drained unconditionally (`:1363-1365`).
+    pub outcome: DanglingOutcome,
+}
+
+/// WHY THE DANGLING LOWERING STOPPED, kept apart because each names a different defect in the
+/// program that reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DanglingOutcome {
+    /// `result = success()` (`:1278`), never reassigned.
+    Success,
+    /// `emitError("There is still a receive or load with uses, that shouldn't happen")` (`:1283`).
+    UsedLoad(OpId),
+    /// `emitError("Dangling non-compute op has no use\n")` (`:1342`) — ⛔ IT NAMES `from.op_`, the
+    /// origin, not the dangling load the walk is standing on.
+    NoAbsorption(OpId),
+    /// `emitError("There is still a create_affine_mask with uses - that shouldn't happen")` (`:1354`).
+    UsedMask(OpId),
+    /// ⛔ THE REFERENCE'S OWN ABORTS, WHICH ARE NOT `emitError`s: `getOperand(…).value()` (`:1289`),
+    /// `symbolizeSentientPrecision`/`ComputePort(…).value()` (`:1313-1326`) and
+    /// `llvm_unreachable("unexpected number of elements …")` (`Utils.cpp:452`). A stop either way.
+    Unrepresentable(OpId),
+}
+
+/// WHICH FOLD MODE A COMPUTE ON `comp` CARRIES — `getSentientFoldModeAttrForOperation`
+/// (`dcc/src/Dialect/Sentient/Utils.cpp:427`), which is not one of the 384 and has no other reader
+/// in this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FoldModeAttr {
+    /// `nullptr` — reached only when `comp` is the PT, which folds nothing.
+    Absent,
+    /// The attribute a PE or SFP compute carries.
+    Present(sentient::FoldMode),
+    /// `llvm_unreachable("unexpected number of elements for given compute precision")` (`:452`), and
+    /// the `DT_CHECK(vector_type.has_value())` above it (`:433`).
+    Unsupported,
+}
+
+/// `getSentientFoldModeAttrForOperation(op, comp)` with `sen1p5_receive_from_pt` at its `false`
+/// default (`Utils.hpp`'s declaration), which is what every call in this file takes.
+///
+/// ⛔ THE 24-BIT REMAP IS UNREACHABLE FROM HERE. `bitwidth = 24` only ever arrives through the
+/// `comp == PE && sen1p5_receive_from_pt && bitwidth == 16` rewrite (`:436`), so the `24 -> 32` arm
+/// below is the reference's dead-but-written code and is kept as such.
+pub(super) fn fold_mode_attr_for_operation(op: &DfirOp, comp: ComputeComp) -> FoldModeAttr {
+    // `if (is_any_of(comp, PE, SFP))`, whose `else` leaves `fold_mode` at `none`.
+    if !matches!(comp, ComputeComp::Pe | ComputeComp::Sfp) {
+        return FoldModeAttr::Absent;
+    }
+    // `auto vector_type = getVectorType(op); DT_CHECK(vector_type.has_value());`
+    let Some(ty) = vector_type_of(op) else {
+        return FoldModeAttr::Unsupported;
+    };
+    // `unsigned bitwidth = vector_type.value().getElementTypeBitWidth();` then
+    // `if (bitwidth == 80) bitwidth = 8; else if (bitwidth == 24) bitwidth = 32;`
+    let bitwidth = match ty.elem.bits() {
+        80 => 8,
+        24 => 32,
+        bits => bits,
+    };
+    // `int num_elements = vector_type.value().getNumElements();`
+    let span = u64::from(bitwidth) * ty.len;
+    if span <= 1024 {
+        FoldModeAttr::Present(sentient::FoldMode::FoldA)
+    } else if span == 2048 {
+        FoldModeAttr::Present(sentient::FoldMode::FoldAbBoth)
+    } else {
+        FoldModeAttr::Unsupported
+    }
+}
+
+/// `WalkOrder::PreOrder` OVER A UNIT BODY WITH EACH OP'S POSITION — the flattened numbering
+/// [`OpId`] uses, and the first `Some` is `WalkResult::interrupt()`.
+pub(super) fn walk_positions<T>(
+    scope: &[DfirOp],
+    prefix: &[u32],
+    base: u32,
+    found: &mut impl FnMut(&DfirOp, OpId) -> Option<T>,
+) -> Option<T> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        let mut path: Vec<u32> = prefix.to_vec();
+        path.push(base + ordinal as u32);
+        if let Some(hit) = found(op, OpId::at(&path)) {
+            return Some(hit);
+        }
+        let mut child = 0u32;
+        for region in regions(op) {
+            if let Some(hit) = walk_positions(region, &path, child, found) {
+                return Some(hit);
+            }
+            child += region.len() as u32;
+        }
+    }
+    None
+}
+
+/// THE MASK CONSTANT AND THE MAC THAT STAND IN FOR ONE UNABSORBED RECEIVE OR LOAD — `:1291-1341`,
+/// and [`None`] wherever the reference calls `.value()` on an empty optional.
+fn dummy_mac(
+    op: &DfirOp,
+    at: &OpId,
+    from: &VectorOperand,
+    origin: Val,
+    comp: ComputeComp,
+    reuse: &OperandReuse,
+    values: &mut Values,
+) -> Option<DummyMac> {
+    // `std::string input_precision = getInputPrecisionFromOperand(from);` — entry 060.
+    let input_precision = input_precision_from_operand(from)?;
+    // `compute_precision = from.on_the_fly_conv_precision_;`
+    // `if (compute_precision != "fp32") compute_precision = "fp16";`
+    let compute_precision = if from.on_the_fly_conv_precision == Some(sentient::Precision::Fp32) {
+        sentient::Precision::Fp32
+    } else {
+        sentient::Precision::Fp16
+    };
+    // `getSentientFoldModeAttrForOperation(op, comp)`
+    let fold_mode = match fold_mode_attr_for_operation(op, comp) {
+        FoldModeAttr::Absent => None,
+        FoldModeAttr::Present(mode) => Some(mode),
+        FoldModeAttr::Unsupported => return None,
+    };
+    // `symbolizeSentientComputePort(from.getName()).value()`
+    let port = from.name()?;
+    // `reuse_info.getId(from.op_).value()` — ⛔ `None` IS THE `.td`'s -1, which is exactly what an
+    // unassigned id answers, so the two slots the reference passes -1 outright agree with it.
+    let id = match reuse.id(origin) {
+        DataId::Unassigned => None,
+        assigned => Some(assigned.attribute()),
+    };
+
+    // `sentient::ConstantOp::create(builder, op->getLoc(), builder.getIndexType(), 0)`
+    let mask = values.mint();
+    let mask_const = sen::Op::Sentient(sentient::Op::ScalarConstant {
+        value: 0,
+        result: mask,
+        reg_locale: sentient::RegType::Imm,
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    });
+
+    // `if (from.getName() == "west" && isa<dataflow::ReceiveOp>(op))`
+    let west_receive = port == sentient::Port::West
+        && matches!(op, DfirOp::Dataflow(dataflow::Op::Receive { .. }));
+    // ⛔ THE PORTS AND THE ID'S SLOT MOVE TOGETHER: `one`/`zero`/port with the id on **C**, against
+    // port/port/port with the id on **A** — and only the second sets `DataTransferOnly`.
+    let ((a, b, c), (id_a, id_b, id_c)) = if west_receive {
+        (
+            (sentient::Port::One, sentient::Port::Zero, port),
+            (None, None, id),
+        )
+    } else {
+        ((port, port, port), (id, None, None))
+    };
+    let operand = |port: sentient::Port, data_id: Option<i32>| sentient::Operand {
+        precision: input_precision,
+        data_id,
+        ..sentient::Operand::from(port)
+    };
+
+    let mac = sen::Op::Sentient(sentient::Op::VectorMac {
+        mask: Some(mask),
+        // `ValueRange(pointers)` over `ArrayRef<Value> pointers = {}` — ⛔ ALWAYS EMPTY on this path;
+        // the PT pass (entry 346) is the one that threads an xrf pointer through here.
+        xrf_write_ptr: None,
+        xrf_read_ptr: None,
+        // `TypeRange()` — a dummy MAC binds nothing.
+        results: Vec::new(),
+        op_a: operand(a, id_a),
+        op_b: operand(b, id_b),
+        op_c: operand(c, id_c),
+        // `ArrayAttr::get(context, {})` for `ResultForwarding`, and
+        // *"Set result precision to `none` to indicate dummy MAC"* (`:1306-1307`).
+        result: sentient::ResultPorts {
+            precision: sentient::Precision::None,
+            ..sentient::ResultPorts::default()
+        },
+        // Not passed to `MacOp::create`, so the `.td` defaults stand.
+        mode: sentient::FmaMode::FusedMulAdd,
+        compute_precision,
+        fold_mode,
+        unroll_factor: sentient::UnrollFactor::X1,
+        xrf_read_incr: 0,
+        xrf_write_incr: 0,
+        // `mac_op->setAttr("DataTransferOnly", builder.getBoolAttr(true));` (`:1341`).
+        data_transfer_only: !west_receive,
+        // `auto op_dbg_name = dataflow::getDbgNameAttr(op);`
+        dbg_name: dbg_name(op).map(str::to_owned),
+    });
+
+    Some(DummyMac {
+        at: at.clone(),
+        ops: vec![mask_const, mac],
+    })
+}
+
+/// Replaces: e344_lowerDanglingNonComputeOpsPESFP
+///
+/// **344/384** `lowerDanglingNonComputeOpsPESFP` — `VectorChainToSentientPESFP.cpp:1274` (93L):
+/// every receive or load left unabsorbed becomes a dummy MAC, and every leftover mask is deleted.
+///
+/// ⛔ A DUMMY MAC IS ONE `ResultPrecision = none` (`:1307`) AWAY FROM A REAL ONE, and only the `west`
+/// receive reads `one`/`zero`/its port with the data id on **C** — every other arm reads its port
+/// THREE TIMES, puts the id on **A** and sets `DataTransferOnly = true` (`:1310-1341`).
+pub fn lower_dangling_non_compute_ops_pesfp<A: Arch>(
+    unit: &mut dfir::ProgramUnit<A>,
+    comp: ComputeComp,
+    reuse: &OperandReuse,
+    values: &mut Values,
+) -> DanglingLowering {
+    // `llvm::SmallVector<mlir::Operation *, 4> tobe_deleted;`
+    let mut tobe_deleted: Vec<OpId> = Vec::new();
+    // `mlir::LogicalResult result = success();`
+    let mut lowering = DanglingLowering {
+        macs: Vec::new(),
+        outcome: DanglingOutcome::Success,
+    };
+
+    {
+        let scope: &[DfirOp] = &unit.body;
+        // `unit.walk<WalkOrder::PreOrder>([&](mlir::Operation *op) { … });`
+        walk_positions(scope, &[], 0, &mut |op, at| {
+            // `if (isa<dataflow::ReceiveOp, vector::LoadOp, agen::VectorLoadOp>(op))`
+            if matches!(
+                op,
+                DfirOp::Dataflow(dataflow::Op::Receive { .. })
+                    | DfirOp::Vector(vector::Op::Load { .. })
+                    | DfirOp::Agen(agen::Op::VectorLoad { .. })
+            ) {
+                // `if (!op->use_empty())`
+                if !use_positions(&at, scope).is_empty() {
+                    lowering.outcome = DanglingOutcome::UsedLoad(at);
+                    return Some(());
+                }
+                // `auto from = VectorOperand::getOperand(dcc_ext_ctx, op, comp).value();`
+                let Some(from) = VectorOperand::operand::<A>(&at, comp, true, scope) else {
+                    lowering.outcome = DanglingOutcome::Unrepresentable(at);
+                    return Some(());
+                };
+                // `auto absorption_flag = reuse_info.getAbsorbtionFlag(from.op_);`, which this island
+                // keys by the origin's VALUE — see [`origin_val`].
+                let keyed = origin_val(&from.op, scope)
+                    .and_then(|val| reuse.absorbtion_flag(val).map(|flag| (val, flag)));
+                match keyed {
+                    // `if (absorption_flag.has_value() && !absorption_flag.value())` — *"it has been
+                    // used but not absorbed by some other op that is already lowered"*.
+                    Some((origin, false)) => {
+                        match dummy_mac(op, &at, &from, origin, comp, reuse, values) {
+                            Some(mac) => lowering.macs.push(mac),
+                            None => {
+                                lowering.outcome = DanglingOutcome::Unrepresentable(at);
+                                return Some(());
+                            }
+                        }
+                    }
+                    // `else if (!absorption_flag.has_value())`
+                    None => {
+                        lowering.outcome = DanglingOutcome::NoAbsorption(from.op.clone());
+                        return Some(());
+                    }
+                    // Absorbed already: nothing is emitted, and the op is deleted all the same.
+                    Some((_, true)) => {}
+                }
+                // `tobe_deleted.push_back(op);`
+                tobe_deleted.push(at);
+            } else if matches!(op, DfirOp::VectorChain(vc::Op::CreateAffineMask { .. })) {
+                // *"All CreateAffineMaskOps should be connected to other operations that were already
+                // lowered."*
+                if !use_positions(&at, scope).is_empty() {
+                    lowering.outcome = DanglingOutcome::UsedMask(at);
+                    return Some(());
+                }
+                tobe_deleted.push(at);
+            }
+            // `return WalkResult::advance();`
+            None
+        });
+    }
+
+    // `for (auto op : tobe_deleted) VectorOperand::eraseOp(op);` — ⛔ DESCENDING, because an [`OpId`]
+    // is a POSITION and removing `[3]` renumbers `[4]`; an `Operation *` needs no such ordering.
+    tobe_deleted.sort_unstable();
+    tobe_deleted.dedup();
+    for position in tobe_deleted.iter().rev() {
+        erase_op(position, &mut unit.body);
+    }
+
+    // `return result;`
+    lowering
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        COMPUTE_OPS_PATTERNS, ComputePattern, LEGAL_DIALECTS, Legality, OpId, Unlowered,
-        VectorOperand, cleanup, compute_ops_to_fuse, fuse_compute_ops, installed_pattern, legality,
-        match_and_rewrite, run_on_operation,
+        COMPUTE_OPS_PATTERNS, ComputeComp, ComputePattern, DanglingOutcome, LEGAL_DIALECTS,
+        Legality, OpId, Unlowered, VectorOperand, cleanup, compute_ops_to_fuse, fuse_compute_ops,
+        installed_pattern, legality, lower_dangling_non_compute_ops_pesfp, match_and_rewrite,
+        run_on_operation,
     };
     use crate::arch::Target;
     use crate::bridges::dataflow_ir_to_sentient::vc_operand_reuse::OperandReuse;
@@ -597,8 +916,9 @@ mod unit_tests {
     use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
     use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, IntegerSet, Vector};
     use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units};
+    use crate::islands::sentient::dialects::Op as SenOp;
     use crate::islands::sentient::dialects::sentient as sen;
-    use crate::units::DfirUnit;
+    use crate::units::{Core, Corelet, DfirUnit, Residency};
 
     /// The vector every op in these fixtures is typed at.
     const V: Vector = Vector {
@@ -1079,12 +1399,121 @@ mod unit_tests {
         cleanup(&OpId::at(&[2]), &[at(&[3])], &[at(&[0])], &mut scope);
         assert_eq!(scope, Vec::new());
     }
+
+    /// 🎯 344/384 — THE VENDOR'S OWN CASE, `sfp-to-sfp-ring.mlir:110-114`: three `lx` receives feed
+    /// one `multiply_and_accumulate`, whose fusion absorbs the third and latches the other two.
+    /// Those two come back as dummy MACs, printed at `sfp-to-sfp-ring.mlir:24-26` with
+    /// `DataTransferOnly = true`, `ResultPrecision = none` and `fold_A` for 64 f16 elements.
+    /// ⛔ THE DATA ID SITS ON **A** ALONE; `opB`/`opC` keep the `.td`'s -1 until e228 fills them.
+    #[test]
+    fn the_two_latched_receives_come_back_as_data_transfer_only_macs() {
+        const F16X64: Vector = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let mut vals = Values::default();
+        let (_, from) = Link::<Sfp, Lxsu>::between(vals.mint(), vals.mint()).ends();
+        let data: Vec<Val> = (0..3).map(|_| vals.mint()).collect();
+        // ⛔ THE SOURCE UNIT HAS TO BE IN THE BODY. `VectorOperand::getOperand` resolves a receive's
+        // link end back to the `dataflow.get_unit` that binds it, and with no such op every receive
+        // is `Unrepresentable` before any absorption flag is read — the receives stay at `[0..2]`, so
+        // the unit goes after them.
+        let mut unit = unit_holding(
+            data.iter()
+                .map(|result| {
+                    DfirOp::Dataflow(dataflow::Op::Receive {
+                        result: *result,
+                        from,
+                        ty: F16X64,
+                    })
+                })
+                .chain(core::iter::once(DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: from.val(),
+                    residency: Residency::Corelet {
+                        core: Core::checked(0).expect("the arch has core 0"),
+                        corelet: Corelet::checked(0).expect("the arch has corelet 0"),
+                    },
+                    unit: DfirUnit::Lxsu,
+                    num_folds: None,
+                })))
+                .collect(),
+        );
+        // `reuse_info` as the compute fusion leaves it: the accumulator got absorbed, the two
+        // operands the MAC re-reads from the latch did not.
+        let lx = |at: u32| {
+            VectorOperand::new(
+                VectorOperandType::Link,
+                OperandValue::Port(sen::Port::Lx),
+                OpId::at(&[at]),
+            )
+        };
+        let mut reuse = OperandReuse::default();
+        reuse.set_reuse_information(&OpId::at(&[4]), &mut [lx(0), lx(1), lx(2)], &unit.body);
+
+        let lowering =
+            lower_dangling_non_compute_ops_pesfp(&mut unit, ComputeComp::Sfp, &reuse, &mut vals);
+
+        assert_eq!(lowering.outcome, DanglingOutcome::Success);
+        // ⛔ ALL THREE RECEIVES GO, absorbed or not — `tobe_deleted` is pushed outside the `if`. The
+        // `get_unit` is not one of the three op classes the walk deletes, so it stays.
+        assert_eq!(unit.body.len(), 1);
+        let [first, second] = lowering.macs.as_slice() else {
+            panic!("two dummy MACs, not {:?}", lowering.macs)
+        };
+        assert_eq!((&first.at, &second.at), (&OpId::at(&[0]), &OpId::at(&[1])));
+        let SenOp::Sentient(sen::Op::VectorMac {
+            mask,
+            op_a,
+            op_b,
+            op_c,
+            result,
+            compute_precision,
+            fold_mode,
+            data_transfer_only,
+            ..
+        }) = &first.ops[1]
+        else {
+            panic!("a mac, not {:?}", first.ops[1])
+        };
+        let lx_at = |data_id| sen::Operand {
+            precision: sen::Precision::Fp16,
+            data_id,
+            ..sen::Operand::from(sen::Port::Lx)
+        };
+        assert_eq!(
+            (op_a, op_b, op_c),
+            (&lx_at(Some(0)), &lx_at(None), &lx_at(None))
+        );
+        assert_eq!(
+            (
+                result.precision,
+                *compute_precision,
+                *fold_mode,
+                *data_transfer_only
+            ),
+            (
+                sen::Precision::None,
+                sen::Precision::Fp16,
+                Some(sen::FoldMode::FoldA),
+                true
+            )
+        );
+        // `sentient.scalar_constant {value = 0 : si64} : index`, and the MAC masks with its result.
+        let SenOp::Sentient(sen::Op::ScalarConstant { value, result, .. }) = &first.ops[0] else {
+            panic!("a mask constant, not {:?}", first.ops[0])
+        };
+        assert_eq!((*value, mask), (0, &Some(*result)));
+        // The second dummy MAC differs in exactly one place: `opADataID = 1`.
+        let SenOp::Sentient(sen::Op::VectorMac { op_a, .. }) = &second.ops[1] else {
+            panic!("a mac, not {:?}", second.ops[1])
+        };
+        assert_eq!(op_a, &lx_at(Some(1)));
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e344_lowerDanglingNonComputeOpsPESFP
 // crustify:todo: e364_patternAgnosticFuseNonComputeOpsHelper
 // crustify:todo: e365_fillOpInfo
 // crustify:todo: e366_fuseNonComputeOps

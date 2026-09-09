@@ -1890,6 +1890,217 @@ mod unit_tests {
             "the conditional's own result, forwarded to the constant"
         );
     }
+
+    /// THE COMPARISON THE CONDITIONAL TREE CONFIGURES — entry 100's own three arguments.
+    fn tree_oe() -> OperationEquivalence {
+        OperationEquivalence::tagged(
+            EquivalenceTag::CfgMergingAndHoistingCondTree,
+            SubregionCompare::Recursive,
+            BlockArgEquivalence::SameOwnerAndIndex,
+        )
+    }
+
+    /// 🎯 347/384 — THE SET AND THE OPERANDS BOTH DECIDE AN AFFINE PAIR, THE CONDITION'S DEFINITION
+    /// DECIDES AN SCF PAIR, AND A MIXED PAIR NEVER MATCHES.
+    #[test]
+    fn two_conditions_match_only_within_one_dialect() {
+        let affine_if = |dims: u32, args: Vec<Val>| {
+            DfirOp::Affine(affine::Op::If {
+                set: IntegerSet {
+                    dims,
+                    symbols: 0,
+                    constraints: Vec::new(),
+                },
+                args,
+                symbol_args: Vec::new(),
+                results: Vec::new(),
+                body: Vec::new(),
+                else_body: Vec::new(),
+                dbg_name: None,
+            })
+        };
+        let cmpi = |result: Val, lhs: Val, rhs: Val| {
+            DfirOp::Arith(arith::Op::Compare {
+                result,
+                predicate: arith::CmpIPredicate::Eq,
+                lhs,
+                rhs,
+            })
+        };
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(0),
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 0,
+            }),
+            cmpi(Val(30), Val(26), Val(0)),
+            cmpi(Val(31), Val(26), Val(1)),
+            cmpi(Val(32), Val(27), Val(0)),
+        ];
+        let oe = tree_oe();
+
+        // The same set read with the same region argument.
+        let one = affine_if(1, vec![Val(9)]);
+        assert!(top_level_conditions_match(&oe, &one, &one, &scope));
+        // ⛔ A DIFFERENT ARGUMENT OF THE SAME SHAPE IS A DIFFERENT CONDITION (`:295`).
+        let other_arg = affine_if(1, vec![Val(10)]);
+        assert!(!top_level_conditions_match(&oe, &one, &other_arg, &scope));
+        // ⛔ AND SO IS THE SAME ARGUMENT UNDER A DIFFERENT SET (`:285-286`).
+        let other_set = affine_if(2, vec![Val(9)]);
+        assert!(!top_level_conditions_match(&oe, &one, &other_set, &scope));
+        // ⛔ ONE SIDE A REGION ARGUMENT AND THE OTHER A RESULT (`:296-297`).
+        let a_result = affine_if(1, vec![Val(30)]);
+        assert!(!top_level_conditions_match(&oe, &one, &a_result, &scope));
+
+        // Two `scf.if`s on two `arith.cmpi eq` that compute the same thing.
+        assert!(top_level_conditions_match(
+            &oe,
+            &if_on(Val(30)),
+            &if_on(Val(31)),
+            &scope
+        ));
+        // ⛔ A DIFFERENT LEFT-HAND SIDE IS A DIFFERENT CONDITION.
+        assert!(!top_level_conditions_match(
+            &oe,
+            &if_on(Val(30)),
+            &if_on(Val(32)),
+            &scope
+        ));
+        // ⛔ AND A MIXED PAIR IS THE REFERENCE'S OWN `else` (`:308-309`), whatever they test.
+        assert!(!top_level_conditions_match(
+            &oe,
+            &one,
+            &if_on(Val(30)),
+            &scope
+        ));
+    }
+
+    /// 🎯 348/384 — `merging.mlir:129-133`'S TWO ARMS EACH YIELD THEIR CONSTANT, AND EVERY OTHER
+    /// SHAPE DECLINES.
+    ///
+    /// `%13 = scf.if %12 -> (index) { scf.yield %c1 } else { scf.yield %c2 }`.
+    #[test]
+    fn each_single_statement_arm_yields_its_constant() {
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(1),
+                value: 1,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(2),
+                value: 2,
+            }),
+        ];
+        let yielding = |operands: Vec<Val>| DfirOp::Scf(scf::Op::Yield { operands });
+        let if_op = DfirOp::Scf(scf::Op::If {
+            cond: Val(12),
+            results: vec![Val(13)],
+            body: vec![yielding(vec![Val(1)])],
+            else_body: vec![yielding(vec![Val(2)])],
+            dbg_name: None,
+        });
+        assert_eq!(
+            single_op_branch_to_yield_val(Some(&if_op), Arm::Then, &scope),
+            Some(YieldedIndex(1))
+        );
+        assert_eq!(
+            single_op_branch_to_yield_val(Some(&if_op), Arm::Else, &scope),
+            Some(YieldedIndex(2))
+        );
+
+        // ⛔ `if (!op) return false;` (`:500`).
+        assert_eq!(single_op_branch_to_yield_val(None, Arm::Then, &scope), None);
+        // ⛔ AN ARM THAT COMPUTES SOMETHING IS TWO OPERATIONS (`:505`).
+        let mut computing = if_op.clone();
+        if let DfirOp::Scf(scf::Op::If { body, .. }) = &mut computing {
+            body.insert(0, statement(4));
+        }
+        assert_eq!(
+            single_op_branch_to_yield_val(Some(&computing), Arm::Then, &scope),
+            None
+        );
+        // ⛔ A YIELDED REGION ARGUMENT HAS NO DEFINING OP (`:509-510`), and an `else` with no block
+        // never reaches `.front()` here at all.
+        let un_named = DfirOp::Scf(scf::Op::If {
+            cond: Val(12),
+            results: vec![Val(13)],
+            body: vec![yielding(vec![Val(9)])],
+            else_body: Vec::new(),
+            dbg_name: None,
+        });
+        assert_eq!(
+            single_op_branch_to_yield_val(Some(&un_named), Arm::Then, &scope),
+            None
+        );
+        assert_eq!(
+            single_op_branch_to_yield_val(Some(&un_named), Arm::Else, &scope),
+            None
+        );
+    }
+
+    /// 🎯 349/384 — A CONDITION COMPUTED OUTSIDE THE LOOP IS INVARIANT; THE SAME CONDITIONAL ON THE
+    /// LOOP'S OWN INDUCTION VARIABLE IS NOT.
+    #[test]
+    fn only_a_condition_free_of_the_loops_argument_is_invariant() {
+        // `scf.for %20 { %40 = scf.if %cond -> (index) { scf.yield %5 } else { scf.yield %7 } }`.
+        let scope_on = |cond: Val| {
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(5),
+                    value: 5,
+                }),
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(7),
+                    value: 7,
+                }),
+                // `%30` reads a value from outside the loop; `%31` reads its induction variable.
+                DfirOp::Arith(arith::Op::Compare {
+                    result: Val(30),
+                    predicate: arith::CmpIPredicate::Eq,
+                    lhs: Val(9),
+                    rhs: Val(5),
+                }),
+                DfirOp::Arith(arith::Op::Compare {
+                    result: Val(31),
+                    predicate: arith::CmpIPredicate::Eq,
+                    lhs: Val(20),
+                    rhs: Val(5),
+                }),
+                DfirOp::Scf(scf::Op::For {
+                    iv: Val(20),
+                    lo: Val(5),
+                    hi: Val(7),
+                    step: Val(5),
+                    carried: Vec::new(),
+                    body: vec![DfirOp::Scf(scf::Op::If {
+                        cond,
+                        results: vec![Val(40)],
+                        body: vec![DfirOp::Scf(scf::Op::Yield {
+                            operands: vec![Val(5)],
+                        })],
+                        else_body: vec![DfirOp::Scf(scf::Op::Yield {
+                            operands: vec![Val(7)],
+                        })],
+                        dbg_name: None,
+                    })],
+                    dbg_name: None,
+                }),
+            ]
+        };
+        let answer = |cond: Val| {
+            let scope = scope_on(cond);
+            let DfirOp::Scf(scf::Op::For { body, .. }) = &scope[4] else {
+                unreachable!("the fixture's last statement is the loop")
+            };
+            let n = ScfConditional::of(&body[0]).expect("the fixture's conditional is an scf.if");
+            is_loop_invariant(n, &scope[4], &scope)
+        };
+        assert!(answer(Val(30)));
+        assert!(!answer(Val(31)));
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2299,7 +2510,7 @@ pub enum MergeOrder {
 /// the two arms of a conditional, and it is the reason entry 096 exists — `then` against `then`,
 /// `else` against `else`, never one against the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Arm {
+pub enum Arm {
     /// Region 0, the `then` arm.
     Then,
     /// Region 1, the `else` arm — the one that may have no block at all.
@@ -2308,7 +2519,7 @@ enum Arm {
 
 impl Arm {
     /// The reference's `i`.
-    const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         match self {
             Arm::Then => 0,
             Arm::Else => 1,
@@ -2777,9 +2988,6 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e347_topLevelConditionsMatch
-// crustify:todo: e348_singleOpBranchToYieldVal
-// crustify:todo: e349_isLoopInvariant
 // crustify:todo: e370_areShallowlyMergeable
 // crustify:todo: e371_hoistLoopInvariantConditionals
 
@@ -3192,4 +3400,245 @@ pub fn replace_if_op_by_iter_arg(
         op,
         replacements: widened.replacements,
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 347/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e347_topLevelConditionsMatch
+///
+/// `topLevelConditionsMatch` (`:279`) — whether two conditionals branch on the same test: an
+/// `affine.if` pair must share an integer set AND have equivalent operands, an `scf.if` pair
+/// equivalent CONDITIONS, and a mixed pair never matches (`:308-309`, the reference's own `else`).
+///
+/// ⛔ THE AFFINE ARM COMPARES EVERY OPERAND, THE SCF ARM ONLY OPERAND 0 (`:287`, `:304-305`) —
+/// `affine.if`'s operands are the set's dims and its symbols, and an `scf.if` has none but the `i1`.
+/// ⛔ A BLOCK-ARG PAIR IS `owner0 == owner1 && idx0 == idx1` (`:295`), WHICH HERE IS `Val` EQUALITY:
+/// two distinct [`Val`]s are never one argument of one region — see
+/// [`BlockArgEquivalence::SameOwnerAndIndex`].
+/// ⛔ ONE SIDE A BLOCK ARG AND THE OTHER A RESULT IS A MISMATCH BEFORE ANY COMPARISON (`:296-297`),
+/// which is also what keeps the `getDefiningOp()` on the line after it off a null.
+#[must_use]
+pub fn top_level_conditions_match(
+    oe: &OperationEquivalence,
+    if_op0: &DfirOp,
+    if_op1: &DfirOp,
+    scope: &[DfirOp],
+) -> bool {
+    match (if_op0, if_op1) {
+        // `:281-301` — both `affine.if`.
+        (
+            DfirOp::Affine(affine::Op::If { set: set0, .. }),
+            DfirOp::Affine(affine::Op::If { set: set1, .. }),
+        ) => {
+            // `:285-286` — `getIntegerSet() != getIntegerSet()`.
+            if set0 != set1 {
+                return false;
+            }
+            // `:287-300` — `llvm::zip(if_op0->getOperands(), if_op1->getOperands())`.
+            for (read0, read1) in dfir_op::operands(if_op0)
+                .into_iter()
+                .zip(dfir_op::operands(if_op1))
+            {
+                match (
+                    dfir_op::defining_op(read0, scope),
+                    dfir_op::defining_op(read1, scope),
+                ) {
+                    // `:293-299` — both block arguments.
+                    (None, None) => {
+                        if read0 != read1 {
+                            return false;
+                        }
+                    }
+                    // `:300-302` — neither is, so both have a definition to compare.
+                    (Some(def0), Some(def1)) => {
+                        if !ops_are_equivalent(def0, def1, scope, oe.preference, oe.block_args) {
+                            return false;
+                        }
+                    }
+                    // `:300-301` — `is_if0_operand_block_arg || is_if1_operand_block_arg`.
+                    (Some(_), None) | (None, Some(_)) => return false,
+                }
+            }
+            true
+        }
+        // `:303-307` — both `scf.if`: the definitions of the two conditions, and nothing else.
+        (
+            DfirOp::Scf(scf::Op::If { cond: cond0, .. }),
+            DfirOp::Scf(scf::Op::If { cond: cond1, .. }),
+        ) => match (
+            dfir_op::defining_op(*cond0, scope),
+            dfir_op::defining_op(*cond1, scope),
+        ) {
+            (Some(def0), Some(def1)) => {
+                ops_are_equivalent(def0, def1, scope, oe.preference, oe.block_args)
+            }
+            // ⭐ THE REFERENCE DEREFERENCES A NULL HERE: a condition that is a region argument has no
+            // defining op, and `*if_op0->getOperand(0).getDefiningOp()` (`:304`) is undefined for it.
+            _ => false,
+        },
+        // `:308-309` — a mixed pair, or an operation that is not a conditional at all.
+        (_, _) => false,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 348/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e348_singleOpBranchToYieldVal
+///
+/// `ConditionalSimplificationManager::singleOpBranchToYieldVal` (`:498`) — the constant index one arm
+/// of an `scf.if` yields, where that arm holds nothing but its terminator.
+///
+/// ⛔ `scf.if` ONLY (`:501-502`): an `affine.if` is declined, so [`ConditionalKind`] is not the test.
+/// ⛔ `size() != 1` COUNTS THE TERMINATOR (`:505`) — the one operation IS the `scf.yield`, so the arm
+/// computes nothing and the value it yields is defined OUTSIDE it.
+/// ⛔ AN `else` REGION WITH NO BLOCK ANSWERS `None`, where the reference's `.front()` on it is
+/// undefined — see [`crate::islands::dataflow_ir::dialects::scf::Op::If::else_body`].
+/// ⛔ A YIELDED REGION ARGUMENT IS DECLINED, NOT UNKNOWN (`:509-510`, `if (!yielded_val_op)`).
+#[must_use]
+pub fn single_op_branch_to_yield_val(
+    op: Option<&DfirOp>,
+    branch: Arm,
+    scope: &[DfirOp],
+) -> Option<YieldedIndex> {
+    // `:500-502` — `if (!op) return false;` and then the `dyn_cast<scf::IfOp>`.
+    let DfirOp::Scf(scf::Op::If {
+        body, else_body, ..
+    }) = op?
+    else {
+        return None;
+    };
+    // `:503-505` — the chosen arm, and the single-operation test that `getTerminator()` then relies on.
+    let arm = match branch {
+        Arm::Then => body,
+        Arm::Else => else_body,
+    };
+    let [terminator] = arm.as_slice() else {
+        return None;
+    };
+    // `:506-507` — `terminator->getOperand(0).getDefiningOp()`.
+    let yielded = *dfir_op::operands(terminator).first()?;
+    // `:509-515` — an `arith.constant` of index type, or nothing.
+    let DfirOp::Arith(arith::Op::Constant { value, .. }) = dfir_op::defining_op(yielded, scope)?
+    else {
+        return None;
+    };
+    Some(YieldedIndex(*value))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 349/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// AN `scf.if`, THE ONLY CONDITIONAL LOOP-INVARIANT HOISTING CONSIDERS — `DT_CHECK_MSG(scf_if,
+/// "Expect valid scf::IfOp")` (`:685`) as a minting rule, so an `affine.if` is not an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScfConditional<'a> {
+    /// The operation, whose two arms are `getRegions()[0]` and `getRegions()[1]`.
+    pub op: &'a DfirOp,
+    /// `scf_if.getCondition()` — the `i1` it branches on, which is also its only operand.
+    pub condition: Val,
+}
+
+impl<'a> ScfConditional<'a> {
+    /// The conditional, or [`None`] for anything that is not an `scf.if`.
+    #[must_use]
+    pub fn of(op: &'a DfirOp) -> Option<ScfConditional<'a>> {
+        let DfirOp::Scf(scf::Op::If { cond, .. }) = op else {
+            return None;
+        };
+        Some(ScfConditional {
+            op,
+            condition: *cond,
+        })
+    }
+}
+
+/// Replaces: e349_isLoopInvariant
+///
+/// `CFGSDataflowConditionalTree::isLoopInvariant` (`:681`) — whether a conditional's condition and
+/// everything its arms yield can be computed outside `parent_for_op`.
+///
+/// ⛔ AN ARM IS EITHER A LEAF OR EXACTLY ONE NESTED CONDITIONAL (`:706-708`, `:724-726`): a leaf must
+/// hold its terminator alone and contributes the value it yields to the worklist, and a non-leaf
+/// recurses AND must hold only `arith.cmpi`, `scf.if`, an index `arith.constant` and `scf.yield`.
+/// ⛔ THE DEPENDENCE IS ON THE **OWNER**, NOT THE VALUE (`:736-738`): a region argument fails only
+/// when the region belongs to `parent_for_op` — an argument of an inner loop is invariant here.
+/// ⛔ THE WORKLIST WALKS OPERANDS TRANSITIVELY (`:741-743`), so a constant folded through three
+/// `arith.addi`s outside the loop still answers `true`.
+/// ⚠️ `parent_for_op` MUST POINT INTO `scope`: the owner comparison is the reference's pointer
+/// equality, which is what tells one loop's argument from another's.
+#[must_use]
+pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &[DfirOp]) -> bool {
+    // `:690` — "Worklist of values needed to be checked for dependencies on loop iterator arguments."
+    let mut worklist: Vec<Val> = Vec::new();
+
+    // `:692-729` — the `then` node then the `else` node, the same seven lines twice.
+    for arm in [Arm::Then, Arm::Else] {
+        let body = dfir_op::regions(n.op)[arm.index()];
+        // `n->getThenNode()->isLeaf()` — a tree node's children are the conditionals whose closest
+        // SELECTED ancestor it is, which is what [`sibling_group`] walks.
+        let mut children: Vec<&DfirOp> = Vec::new();
+        sibling_group(body, &mut children);
+
+        if children.is_empty() {
+            // `:694-700` — `if (bb.getOperations().size() != 1) return false;` and then the value the
+            // terminator yields.
+            let [terminator] = body else {
+                return false;
+            };
+            let Some(yielded) = dfir_op::operands(terminator).first().copied() else {
+                return false;
+            };
+            worklist.push(yielded);
+        } else {
+            // `:703-708` — one child, and it must itself be loop invariant.
+            if children.len() != 1 {
+                return false;
+            }
+            // ⭐ AN `affine.if` CHILD ABORTS THE REFERENCE at the recursion's own `DT_CHECK`; the
+            // simplicity scan below would reject it two lines later, so `false` is that answer.
+            let Some(child) = ScfConditional::of(children[0]) else {
+                return false;
+            };
+            if !is_loop_invariant(child, parent_for_op, scope) {
+                return false;
+            }
+            // `:710-714` — "The then-branch body must be simple (only contain certain op types)."
+            for op in body {
+                if !matches!(
+                    op,
+                    DfirOp::Arith(arith::Op::Compare { .. } | arith::Op::Constant { .. })
+                        | DfirOp::Scf(scf::Op::If { .. } | scf::Op::Yield { .. })
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // `:731-732` — "Check the condition for dependencies."
+    worklist.push(n.condition);
+
+    // `:734-745`
+    while let Some(val) = worklist.pop() {
+        match dfir_op::defining_op(val, scope) {
+            // `:736-739` — a region argument: whose region is it?
+            None => {
+                if dfir_op::region_owner(val, scope)
+                    .is_some_and(|owner| core::ptr::eq(owner, parent_for_op))
+                {
+                    return false;
+                }
+            }
+            // `:740-744` — otherwise every operand of its definition joins the worklist.
+            Some(def) => worklist.extend(dfir_op::operands(def)),
+        }
+    }
+
+    // `:746`
+    true
 }

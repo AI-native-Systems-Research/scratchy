@@ -62,11 +62,22 @@
 //! | `e369_fuseComputeOps` | 369/384 | 628 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245` |
 //! | `e379_runOnOperation` | 379/384 | 54 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975` |
 
+use super::vc_loop_mask_tree::MaskedColumns;
+use super::vc_lowering_xrf::XrfPtrMap;
+use super::vc_operand_reuse::{DataId, OperandReuse};
+use super::vc_vector_chain_helper::{input_precision_from_operand, redefine_constant_vectors};
+use super::vc_vector_chain_to_sentient_pesfp::{
+    FoldModeAttr, fold_mode_attr_for_operation, walk_positions,
+};
+use super::vc_vector_operands::{
+    ComputeComp, OpId, VectorOperand, erase_op, origin_val, use_positions,
+};
 use crate::arch::Arch;
-use crate::bridges::dataflow_ir_to_sentient::vc_vector_chain_helper::redefine_constant_vectors;
-use crate::islands::dataflow_ir::dialects::dataflow;
+use crate::islands::dataflow_ir::dialects::vectorchain as vc;
+use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, agen, dataflow, dbg_name, vector};
+use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{self as dfir, Values};
-use crate::islands::sentient::dialects::sentient;
+use crate::islands::sentient::dialects::{self as sen, sentient};
 use crate::units::DfirUnit;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -189,15 +200,318 @@ pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Va
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 346/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE DUMMY MAC THE PT DANGLING LOWERING EMITS, and where the op it replaces stood.
+///
+/// ⛔ THE MASK-TREE ENTRY TRAVELS WITH IT. `updateLoopMaskTreeForConstantMask(pt_masking_tree, op,
+/// &mac_op, 0)` (`VectorChainToSentientPT.cpp:933`, `:947`) keys the tree by the MAC's own position,
+/// which it does not have until the caller places it — so the constant mask is carried here and
+/// [`update_loop_mask_tree_for_constant_mask`](super::vc_lowering_pt_masks::update_loop_mask_tree_for_constant_mask)
+/// is called with it then. ⭐ IT IS THE LITERAL `0` IN BOTH ARMS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtDummyMac {
+    /// The position of the dangling op this replaces.
+    pub at: OpId,
+    /// The `sentient.scalar_constant` then the `sentient.vector_mac`, in emission order.
+    pub ops: Vec<sen::Op>,
+    /// The `mask_val` its mask-tree node carries.
+    pub mask: MaskedColumns,
+}
+
+/// EVERY WAY `lowerDanglingNonComputeOps` CALLS `signalPassFailure()` — one per offending op.
+///
+/// ⛔ THE WALK DOES NOT STOP AT ONE. The reference's lambda returns `void`, so its `return;` skips
+/// the rest of THAT op and the walk carries on — unlike the PESFP twin, which interrupts
+/// ([`DanglingOutcome`](super::vc_vector_chain_to_sentient_pesfp::DanglingOutcome)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtDangling {
+    /// *"There is still a receive or load with uses, that shouldn't happen"* (`:890-893`).
+    UsedLoad(OpId),
+    /// *"Dangling non-compute op has no use"* (`:950`).
+    NoAbsorption(OpId),
+    /// *"There is still a create_affine_mask with uses - that shouldn't happen"* (`:960-963`).
+    UsedMask(OpId),
+    /// `DT_CHECK_MSG(from.orig_precision_ == from.on_the_fly_conv_precision_, "Expecting no on the
+    /// fly conversions in PT")` (`:911-912`).
+    OnTheFlyConversion(OpId),
+    /// The aborts that carry no message: `getOperand(..).value()`, `symbolize…().value()`, the unit's
+    /// missing precision attribute, and `XrfPtrMap::at` on an unrecorded `agen.vector_load`.
+    Unrepresentable(OpId),
+}
+
+/// WHAT ONE DANGLING PT OP BECOMES — a MAC, or the `signalPassFailure()` it earned.
+///
+/// ⭐ AN OUTCOME ENUM, NOT A `Result`: neither arm is an error the caller recovers from, the refusal
+/// is a recorded pass failure ([`PtDangling`]) that the walk carries on past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PtMac {
+    /// `:906-948` ran to the end.
+    Emitted(PtDummyMac),
+    /// One of the aborts on the way, named.
+    Refused(PtDangling),
+}
+
+/// WHAT THE PT DANGLING LOWERING PRODUCES — the MACs it emits beside every op it refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtDanglingLowering {
+    /// One per dangling op that was used but not absorbed, in walk order.
+    pub macs: Vec<PtDummyMac>,
+    /// `signalPassFailure()`, once per offending op.
+    pub refusals: Vec<PtDangling>,
+}
+
+/// Replaces: e346_lowerDanglingNonComputeOps
+///
+/// **346/384** `VectorChainToSentientPTLoweringPass::lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882` (88L).
+///
+/// ⛔ THE PT MAC IS NOT THE PESFP MAC: it takes **no mask** (the `sentient.scalar_constant` is still
+/// emitted, and `nullptr` is passed — `:920`, `:935`), all FOUR precisions are the operand's (`:925-928`,
+/// no `"none"` marker), the non-west arm is `opA = from, opB = one, opC = zero` (`:937-939`) and there
+/// is NO `DataTransferOnly` attribute. ⛔ AND `pointers` IS SET FOR AN `agen.vector_load` ONLY
+/// (`:903-905`) — `at(0)` is the ARGUMENT pair, so the MAC binds both xrf pointers.
+/// ⛔ AN OFFENDING OP IS NOT ERASED and does not stop the walk; see [`PtDangling`].
+pub fn lower_dangling_non_compute_ops<A: Arch>(
+    unit: &mut dfir::ProgramUnit<A>,
+    comp: ComputeComp,
+    vector_op_to_xrfptr_map: &XrfPtrMap,
+    reuse: &OperandReuse,
+    values: &mut Values,
+) -> PtDanglingLowering {
+    let mut tobe_deleted: Vec<OpId> = Vec::new();
+    let mut lowering = PtDanglingLowering {
+        macs: Vec::new(),
+        refusals: Vec::new(),
+    };
+    // `computeUnitPrecision(unit, comp)` (entry 094) — one answer for every MAC in the unit.
+    let compute_precision = unit.precision.map(compute_unit_precision);
+
+    {
+        let scope: &[DfirOp] = &unit.body;
+        walk_positions(scope, &[], 0, &mut |op, at| -> Option<()> {
+            if matches!(
+                op,
+                DfirOp::Dataflow(dataflow::Op::Receive { .. })
+                    | DfirOp::Vector(vector::Op::Load { .. })
+                    | DfirOp::Agen(agen::Op::VectorLoad { .. })
+            ) {
+                if !use_positions(&at, scope).is_empty() {
+                    lowering.refusals.push(PtDangling::UsedLoad(at));
+                    return None;
+                }
+                let Some(from) = VectorOperand::operand::<A>(&at, comp, true, scope) else {
+                    lowering.refusals.push(PtDangling::Unrepresentable(at));
+                    return None;
+                };
+                let keyed = origin_val(&from.op, scope)
+                    .and_then(|val| reuse.absorbtion_flag(val).map(|flag| (val, flag)));
+                match keyed {
+                    Some((origin, false)) => {
+                        // *"it has been used but not absorbed by some other op that is already
+                        // lowered"*.
+                        match pt_dummy_mac(
+                            op,
+                            &at,
+                            &from,
+                            origin,
+                            comp,
+                            compute_precision,
+                            vector_op_to_xrfptr_map,
+                            reuse,
+                            values,
+                        ) {
+                            PtMac::Emitted(mac) => lowering.macs.push(mac),
+                            PtMac::Refused(refusal) => {
+                                lowering.refusals.push(refusal);
+                                return None;
+                            }
+                        }
+                    }
+                    None => {
+                        lowering
+                            .refusals
+                            .push(PtDangling::NoAbsorption(from.op.clone()));
+                        return None;
+                    }
+                    Some((_, true)) => {}
+                }
+                tobe_deleted.push(at);
+            } else if matches!(op, DfirOp::VectorChain(vc::Op::CreateAffineMask { .. })) {
+                // *"All CreateAffineMaskOps should be connected to other operations that were
+                // already lowered."*
+                if !use_positions(&at, scope).is_empty() {
+                    lowering.refusals.push(PtDangling::UsedMask(at));
+                    return None;
+                }
+                tobe_deleted.push(at);
+            }
+            None
+        });
+    }
+
+    // `for (auto op : tobe_deleted) VectorOperand::eraseOp(op);` — ⛔ DEEPEST FIRST, positions being
+    // what names an op here.
+    tobe_deleted.sort_unstable();
+    tobe_deleted.dedup();
+    for position in tobe_deleted.iter().rev() {
+        erase_op(position, &mut unit.body);
+    }
+    lowering
+}
+
+/// The `sentient.scalar_constant` and `sentient.vector_mac` one dangling PT op becomes
+/// (`VectorChainToSentientPT.cpp:906-948`).
+#[allow(clippy::too_many_arguments)]
+fn pt_dummy_mac(
+    op: &DfirOp,
+    at: &OpId,
+    from: &VectorOperand,
+    origin: Val,
+    comp: ComputeComp,
+    compute_precision: Option<sentient::Precision>,
+    vector_op_to_xrfptr_map: &XrfPtrMap,
+    reuse: &OperandReuse,
+    values: &mut Values,
+) -> PtMac {
+    // `pointers = vector_op_to_xrfptr_map.at(op).at(0)` for an `agen.vector_load` and nothing else.
+    let (xrf_write_ptr, xrf_read_ptr) = if matches!(op, DfirOp::Agen(agen::Op::VectorLoad { .. })) {
+        match vector_op_to_xrfptr_map.get(at) {
+            Some(ptrs) => (Some(ptrs.argument.write), Some(ptrs.argument.read)),
+            None => return PtMac::Refused(PtDangling::Unrepresentable(at.clone())),
+        }
+    } else {
+        (None, None)
+    };
+
+    // *"Expecting no on the fly conversions in PT"*.
+    if from.orig_precision != from.on_the_fly_conv_precision {
+        return PtMac::Refused(PtDangling::OnTheFlyConversion(at.clone()));
+    }
+    let (Some(precision), Some(compute_precision), Some(port)) = (
+        input_precision_from_operand(from),
+        compute_precision,
+        from.name(),
+    ) else {
+        return PtMac::Refused(PtDangling::Unrepresentable(at.clone()));
+    };
+    let fold_mode = match fold_mode_attr_for_operation(op, comp) {
+        FoldModeAttr::Absent => None,
+        FoldModeAttr::Present(mode) => Some(mode),
+        FoldModeAttr::Unsupported => {
+            return PtMac::Refused(PtDangling::Unrepresentable(at.clone()));
+        }
+    };
+    let id = match reuse.id(origin) {
+        DataId::Unassigned => None,
+        assigned => Some(assigned.attribute()),
+    };
+
+    // ⭐ THE MASK CONSTANT IS STILL BUILT, AND STILL NOT USED — *"PT masking is not attached to
+    // operations"* (`:936`), the mask tree carrying it instead.
+    let mask_const = sen::Op::Sentient(sentient::Op::ScalarConstant {
+        value: 0,
+        result: values.mint(),
+        reg_locale: sentient::RegType::Imm,
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    });
+    let west_receive = port == sentient::Port::West
+        && matches!(op, DfirOp::Dataflow(dataflow::Op::Receive { .. }));
+    let ((a, b, c), (id_a, id_b, id_c)) = if west_receive {
+        (
+            (sentient::Port::One, sentient::Port::Zero, port),
+            (None, None, id),
+        )
+    } else {
+        (
+            (port, sentient::Port::One, sentient::Port::Zero),
+            (id, None, None),
+        )
+    };
+    let operand = |port: sentient::Port, data_id: Option<i32>| sentient::Operand {
+        precision,
+        data_id,
+        ..sentient::Operand::from(port)
+    };
+    let mac = sen::Op::Sentient(sentient::Op::VectorMac {
+        mask: None,
+        xrf_write_ptr,
+        xrf_read_ptr,
+        results: Vec::new(),
+        op_a: operand(a, id_a),
+        op_b: operand(b, id_b),
+        op_c: operand(c, id_c),
+        result: sentient::ResultPorts {
+            precision,
+            ..sentient::ResultPorts::default()
+        },
+        mode: sentient::FmaMode::FusedMulAdd,
+        compute_precision,
+        fold_mode,
+        unroll_factor: sentient::UnrollFactor::X1,
+        xrf_read_incr: 0,
+        xrf_write_incr: 0,
+        data_transfer_only: false,
+        dbg_name: dbg_name(op).map(str::to_owned),
+    });
+    PtMac::Emitted(PtDummyMac {
+        at: at.clone(),
+        ops: vec![mask_const, mac],
+        mask: MaskedColumns(0),
+    })
+}
+
 #[cfg(test)]
 mod unit_tests {
-    use super::{compute_unit_precision, run_on_operation};
+    use super::{
+        ComputeComp, MaskedColumns, OpId, VectorOperand, XrfPtrMap, compute_unit_precision,
+        lower_dangling_non_compute_ops, run_on_operation,
+    };
     use crate::arch::Target;
-    use crate::islands::dataflow_ir::dialects::Val;
-    use crate::islands::dataflow_ir::dialects::dataflow;
-    use crate::islands::dataflow_ir::{self as dfir, Values};
-    use crate::islands::sentient::dialects::sentient;
+    use crate::bridges::dataflow_ir_to_sentient::vc_lowering_xrf::{XrfPtrPair, XrfPtrs};
+    use crate::bridges::dataflow_ir_to_sentient::vc_operand_reuse::OperandReuse;
+    use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::{
+        OperandValue, VectorOperandType,
+    };
+    use crate::islands::dataflow_ir::dialects::{Index, Op as DfirOp, Val, agen, dataflow};
+    use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef, Vector};
+    use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units, Values};
+    use crate::islands::sentient::dialects::{Op as SenOp, sentient};
     use crate::units::{DfirUnit, Row};
+
+    /// One `ptrow0` unit at `fp16` holding `body` — what this pass lowers.
+    fn pt_unit(body: Vec<DfirOp>) -> ProgramUnit<Target> {
+        let Some(row) = Row::checked(0) else {
+            unreachable!("this arch has a row zero")
+        };
+        ProgramUnit {
+            on: Units::one(DfirUnit::PtRow(row), Val(0)),
+            precision: Some(dataflow::Precision::Fp16),
+            body,
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// `agen.vector_load %view[0, 0] : memref<64x64xf16>, vector<64xf16>` binding `result`.
+    fn xrf_load(result: Val, view: Val) -> DfirOp {
+        DfirOp::Agen(agen::Op::VectorLoad {
+            dbg_name: None,
+            result,
+            view,
+            indices: vec![Index::Const(0), Index::Const(0)],
+            view_ty: MemRef {
+                shape: vec![64, 64],
+                elem: ElemType::F16,
+            },
+            ty: Vector {
+                len: 64,
+                elem: ElemType::F16,
+            },
+            multicast_info: None,
+        })
+    }
 
     /// One program holding one unit on `on` — what this pass walks.
     fn program_of(on: DfirUnit) -> dfir::Program<Target> {
@@ -284,11 +598,132 @@ mod unit_tests {
         let mut program = program_of(DfirUnit::Sfp);
         run_on_operation(&mut program, &mut Values::default());
     }
+
+    // ── 346/384 ───────────────────────────────────────────────────────────────────────────────
+
+    /// 🎯 346/384 — TWO DANGLING `agen.vector_load`s ON A `ptxrf` VIEW (`xrf_increments.mlir:388`,
+    /// `:414`), one of them absorbed. The unabsorbed one becomes a MAC that reads
+    /// `xrf`/`one`/`zero`, binds the map's **argument** pointers and carries NO mask; the absorbed
+    /// one emits nothing. ⛔ BOTH ARE ERASED.
+    #[test]
+    fn an_unabsorbed_xrf_load_becomes_a_pointer_bound_unmasked_mac_and_both_loads_go() {
+        let mut vals = Values::default();
+        let (handle, view, write, read) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+        let loaded = [vals.mint(), vals.mint()];
+        let mut unit = pt_unit(vec![
+            DfirOp::Dataflow(dataflow::Op::GetLocalUnit {
+                result: handle,
+                of: Val(0),
+                which: dataflow::LocalUnit::PtXrf,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: view,
+                from: handle,
+                start: Val(0),
+                layout: AffineMap {
+                    dims: 2,
+                    syms: 0,
+                    results: vec![AffineExpr::dim(1).times(64).plus(AffineExpr::dim(0))],
+                },
+                ty: MemRef {
+                    shape: vec![64, 64],
+                    elem: ElemType::F16,
+                },
+            }),
+            xrf_load(loaded[0], view),
+            xrf_load(loaded[1], view),
+        ]);
+        // The reuse pass latches the first of two loads reading the same `xrf` name, which leaves it
+        // UNABSORBED, and marks the second absorbed.
+        let mut reuse = OperandReuse::default();
+        let mut operands: Vec<VectorOperand> = (2..4)
+            .map(|at| {
+                VectorOperand::new(
+                    VectorOperandType::Xrf,
+                    OperandValue::Port(sentient::Port::Xrf),
+                    OpId::at(&[at]),
+                )
+            })
+            .collect();
+        reuse.set_reuse_information(&OpId::at(&[2]), &mut operands, &unit.body);
+        let ptrs = XrfPtrMap::from([(
+            OpId::at(&[2]),
+            XrfPtrs {
+                argument: XrfPtrPair { write, read },
+                results: XrfPtrPair {
+                    write: Val(90),
+                    read: Val(91),
+                },
+            },
+        )]);
+
+        let lowering =
+            lower_dangling_non_compute_ops(&mut unit, ComputeComp::Pt, &ptrs, &reuse, &mut vals);
+
+        assert_eq!(lowering.refusals, Vec::new());
+        let [mac] = lowering.macs.as_slice() else {
+            panic!("one dummy MAC, not {:?}", lowering.macs)
+        };
+        assert_eq!((&mac.at, mac.mask), (&OpId::at(&[2]), MaskedColumns(0)));
+        // `sentient.scalar_constant {value = 0 : si64} : index` — built, and NOT attached (`:936`).
+        assert!(matches!(
+            &mac.ops[0],
+            SenOp::Sentient(sentient::Op::ScalarConstant { value: 0, .. })
+        ));
+        let SenOp::Sentient(sentient::Op::VectorMac {
+            mask,
+            xrf_write_ptr,
+            xrf_read_ptr,
+            op_a,
+            op_b,
+            op_c,
+            result,
+            compute_precision,
+            fold_mode,
+            data_transfer_only,
+            ..
+        }) = &mac.ops[1]
+        else {
+            panic!("a mac, not {:?}", mac.ops[1])
+        };
+        let reads = |port, data_id| sentient::Operand {
+            precision: sentient::Precision::Fp16,
+            data_id,
+            ..sentient::Operand::from(port)
+        };
+        assert_eq!(
+            (op_a, op_b, op_c),
+            (
+                &reads(sentient::Port::Xrf, Some(0)),
+                &reads(sentient::Port::One, None),
+                &reads(sentient::Port::Zero, None)
+            )
+        );
+        assert_eq!(
+            (*mask, *xrf_write_ptr, *xrf_read_ptr),
+            (None, Some(write), Some(read))
+        );
+        // ⛔ ALL FOUR PRECISIONS ARE THE OPERAND'S — no `none` marker, and no `DataTransferOnly`.
+        assert_eq!(
+            (
+                result.precision,
+                *compute_precision,
+                *fold_mode,
+                *data_transfer_only
+            ),
+            (
+                sentient::Precision::Fp16,
+                sentient::Precision::Fp16,
+                None,
+                false
+            )
+        );
+        assert_eq!(unit.body.len(), 2);
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e346_lowerDanglingNonComputeOps
 // crustify:todo: e368_fuseNonComputeOps
 // crustify:todo: e369_fuseComputeOps

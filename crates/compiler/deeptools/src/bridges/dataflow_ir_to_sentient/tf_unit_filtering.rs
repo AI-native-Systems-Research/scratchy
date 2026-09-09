@@ -1750,7 +1750,7 @@ fn collect_positions(
 
 /// THE OP AT A POSITION, MUTABLY — [`op_at`]'s arm, descending through [`regions_mut`] and re-basing
 /// each ordinal onto the region that holds it exactly as [`remove_at`] does.
-fn op_at_mut<'s>(path: &[u32], scope: &'s mut [DfirOp]) -> Option<&'s mut DfirOp> {
+pub(super) fn op_at_mut<'s>(path: &[u32], scope: &'s mut [DfirOp]) -> Option<&'s mut DfirOp> {
     let (first, rest) = path.split_first()?;
     let op = scope.get_mut(*first as usize)?;
     if rest.is_empty() {

@@ -71,7 +71,7 @@
 //! | `e345_processXrfPtrPerUnit` | 345/384 | 190 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337` |
 //! | `e367_createXrfIndexModifOps` | 367/384 | 97 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564` |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::tf_mutable_start_addr_shifting::ElementsPerStick;
 use super::vc_vector_operands::{OpId, layout_map_and_indices, op_at};
@@ -1487,6 +1487,7 @@ mod unit_tests {
             unroll_factor: sentient::UnrollFactor::X1,
             xrf_read_incr: 0,
             xrf_write_incr: 0,
+            data_transfer_only: false,
             dbg_name: None,
         }
     }
@@ -2582,7 +2583,6 @@ mod unit_tests {
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e345_processXrfPtrPerUnit
 // crustify:todo: e367_createXrfIndexModifOps
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2934,12 +2934,445 @@ pub fn insert_dummy_mac_op(vals: &mut Values) -> XrfPtrAdvance {
                 unroll_factor: sentient::UnrollFactor::X1,
                 xrf_read_incr: 0,
                 xrf_write_incr: 0,
+                data_transfer_only: false,
                 dbg_name: Some("LoweringXRF dummy Mac".to_owned()),
             }),
         ],
         // `return ret.getResult(0);`
         value: result,
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 345/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `XrfPtrMap` (`VectorChainToSentientPT.hpp:44-47`) — one [`XrfPtrs`] per xrf access.
+pub type XrfPtrMap = BTreeMap<OpId, XrfPtrs>;
+
+/// One [`XrfPtrMap`] entry while the two passes fill it — the write half on `i = 0`, the read on `i = 1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PartialXrfPtrs {
+    argument_write: Option<Val>,
+    argument_read: Option<Val>,
+    results_write: Option<Val>,
+    results_read: Option<Val>,
+}
+
+impl PartialXrfPtrs {
+    /// `map[op].at(0).at(i) = …` and `map[op].at(1).at(i) = …` — the two bookkeeping lines, which
+    /// both access arms write together (`LoweringXRF.cpp:449`, `:453`, `:459`, `:462`).
+    fn set(&mut self, ptr: XrfPtr, argument: Val, results: Val) {
+        match ptr {
+            XrfPtr::Write => {
+                self.argument_write = Some(argument);
+                self.results_write = Some(results);
+            }
+            XrfPtr::Read => {
+                self.argument_read = Some(argument);
+                self.results_read = Some(results);
+            }
+        }
+    }
+
+    /// Both passes recorded it, which is every entry once `for (int i = 0; i < 2; i++)` is done.
+    fn complete(self) -> Option<XrfPtrs> {
+        Some(XrfPtrs {
+            argument: XrfPtrPair {
+                write: self.argument_write?,
+                read: self.argument_read?,
+            },
+            results: XrfPtrPair {
+                write: self.results_write?,
+                read: self.results_read?,
+            },
+        })
+    }
+}
+
+/// `use_empty()` ON THE UNION RUNG — a rename to a fresh value that changes nothing had no reader.
+///
+/// ⭐ IT BORROWS [`sen::replace_all_uses_with`]'s TOTALITY rather than restating an operand census
+/// that could miss one of the shared dialects — which is the failure that function's own note names.
+fn use_empty(val: Val, scope: &[sen::Op], vals: &mut Values) -> bool {
+    let mut probe = scope.to_vec();
+    sen::replace_all_uses_with(&mut probe, val, vals.mint());
+    probe.as_slice() == scope
+}
+
+/// The regions of one op on this rung, as [`XrfPass::walk`] descends them.
+fn regions_of(op: &mut sen::Op) -> Vec<&mut Vec<sen::Op>> {
+    match op {
+        sen::Op::Sentient(inner) => sentient::regions_mut(inner),
+        sen::Op::AffineFor(loop_op) => vec![&mut loop_op.body],
+        _ => Vec::new(),
+    }
+}
+
+/// ONE POINTER'S PASS — the reference's four stacks and its two running values.
+struct XrfPass<'a> {
+    /// Which pointer this pass moves — the `i` of `for (int i = 0; i < 2; i++)`.
+    ptr: XrfPtr,
+    /// `expr_map` = `expr_maps[i]`: the accesses this pointer is the ACTIVE one for.
+    active: &'a LayoutExprMap,
+    /// `expr_maps[1 - i]`: the other pointer's accesses, which this one still records and walks past.
+    inactive: &'a LayoutExprMap,
+    /// `region_ops_with_xrf_access` — filled by entry 367 and only READ here.
+    xrf_regions: &'a BTreeSet<OpId>,
+    /// The scope [`for_op_bound`] reads a loop's trip count through.
+    definitions: Definitions<'a>,
+    /// `xrf_incr_after_prev_mac`.
+    incr_after_prev_mac: i64,
+    /// `xrf_ptr_val`.
+    value: Val,
+    /// `xrf_access_offsets`.
+    offsets: Vec<Vec<StickOffset>>,
+    /// `loop_stride_step_stack`, whose `INT64_MIN` is [`None`].
+    strides: Vec<Option<StickOffset>>,
+    /// `if_then_region_init_ptr_stack`.
+    then_init: Vec<Val>,
+    /// `ops_to_delete`, named by the value each defines.
+    to_delete: Vec<Val>,
+    /// ⛔⛔ EVERY OP EITHER PASS HAS SPLICED IN, so the SECOND pass can walk past them. The reference
+    /// keys its three maps by `Operation *` and is immune; an [`OpId`] is a POSITION, and entry 367
+    /// measured all of them over the ORIGINAL body — so the read pass, which runs over the body the
+    /// write pass already grew, would otherwise read a spliced-in constant at the position of the
+    /// access it is looking for. ⭐ STRUCTURAL EQUALITY IDENTIFIES THEM EXACTLY: every inserted op
+    /// binds freshly minted values, so none of them can equal an op that was already there.
+    inserted: &'a mut Vec<sen::Op>,
+    map: BTreeMap<OpId, PartialXrfPtrs>,
+    vals: &'a mut Values,
+}
+
+impl XrfPass<'_> {
+    /// `getOffsetFromOuterForOp` — the innermost ENCLOSING level's last offset, past empty levels.
+    fn offset_from_outer_for_op(&self) -> StickOffset {
+        self.offsets
+            .iter()
+            .rev()
+            .skip(1)
+            .find_map(|level| level.last().copied())
+            .unwrap_or_default()
+    }
+
+    /// The type-1 scenario for the ACTIVE pointer (`LoweringXRF.cpp:427-454`) — the ops to insert in
+    /// front of the access.
+    fn active_access(&mut self, at: &OpId) -> Vec<sen::Op> {
+        // `expr_map[op].constant_val`, `operator[]` defaulting a missing key to zero.
+        let constant = self
+            .active
+            .get(at)
+            .map_or(StickOffset(0), |e| e.constant_val);
+        // ⭐ *"the default xrf ptr increment value of sentient.mac is included in the total"*.
+        // ⛔⛔ THE STACK GETS `curr_const + incr` AND THE OFFSET OP GETS THE RAW `curr_const`
+        // (`LoweringXRF.cpp:429-432` against `:446`): the increment is what the MAC itself will do, so
+        // it counts towards the NEXT access's distance and not towards this one's.
+        if let Some(level) = self.offsets.last_mut() {
+            level.push(StickOffset(constant.0 + self.incr_after_prev_mac));
+        }
+        let previous = self.offsets.last().and_then(|level| {
+            level
+                .len()
+                .checked_sub(2)
+                .and_then(|prev| level.get(prev).copied())
+        });
+        let prev = previous.unwrap_or_else(|| self.offset_from_outer_for_op());
+
+        let mut ops = Vec::new();
+        let advance = insert_const_and_add_ops(
+            self.vals,
+            ScalarTy::Index,
+            self.value,
+            StickOffset(constant.0 - prev.0),
+        );
+        ops.extend(advance.ops);
+        self.value = advance.value;
+        let argument = self.value;
+        let dummy = insert_dummy_mac_op(self.vals);
+        ops.extend(dummy.ops);
+        self.value = dummy.value;
+        self.map
+            .entry(at.clone())
+            .or_default()
+            .set(self.ptr, argument, dummy.value);
+        ops
+    }
+
+    /// *"type 1 scenario for inactive xrf ptr"* (`LoweringXRF.cpp:456-463`) — the placeholder alone,
+    /// with NO offset op: this pointer does not move at the other pointer's access.
+    fn inactive_access(&mut self, at: &OpId) -> Vec<sen::Op> {
+        let argument = self.value;
+        let dummy = insert_dummy_mac_op(self.vals);
+        self.value = dummy.value;
+        self.map
+            .entry(at.clone())
+            .or_default()
+            .set(self.ptr, argument, dummy.value);
+        dummy.ops
+    }
+
+    /// A `sentient.for`/`sentient.if` WITH xrf accesses under it (`LoweringXRF.cpp:391-421`).
+    fn enter(&mut self, at: &OpId, op: &mut sen::Op) {
+        // `forop_stack.push(op)` is this recursion; the other two stacks are these.
+        self.offsets.push(Vec::new());
+        // ⭐ ANY entry whose `layout_map` names this loop answers — `are_xrf_accesses_legal` has
+        // already agreed every access's coefficients, which is what makes the reference's `break`
+        // on the first hit of an unordered map deterministic.
+        self.strides.push(
+            self.active
+                .values()
+                .find_map(|expr| expr.layout_map.get(at).copied()),
+        );
+
+        if let sen::Op::Sentient(sentient::Op::For { carried, .. }) = op {
+            // `op->setOperand(1 + i, xrf_ptr_val)` — the slot entry 090's `For` arm reads back.
+            if let Some(slot) = carried.get_mut(self.ptr.index()) {
+                self.to_delete.push(slot.init);
+                slot.init = self.value;
+            }
+            if let Some(carried) = xrf_value(op, None, self.ptr) {
+                self.value = carried;
+            }
+        } else {
+            // *"stack the init xrf ptr for else-region"*.
+            self.then_init.push(self.value);
+        }
+    }
+
+    /// The type-2 and type-3 scenarios (`LoweringXRF.cpp:464-509`) — close one region over the
+    /// pointer, and for a loop return the ops that undo its travel AFTER it.
+    fn close(&mut self, op: &mut sen::Op, region: YieldRegion) -> Vec<sen::Op> {
+        // `dyn_cast<sentient::YieldOp>(op)` — the walk only reaches this on a terminator.
+        if !matches!(
+            regions_of(op)
+                .into_iter()
+                .nth(region.index())
+                .and_then(|r| r.last()),
+            Some(sen::Op::Sentient(sentient::Op::Yield { .. }))
+        ) {
+            return Vec::new();
+        }
+
+        let prev = self.offset_from_outer_for_op();
+        // *"if there is no xrf access in current loop, no address offset is needed"*.
+        let curr = self
+            .offsets
+            .last()
+            .and_then(|level| level.last().copied())
+            .unwrap_or(prev);
+        let stride = self.strides.last().copied().flatten().unwrap_or_default();
+        let advance = insert_const_and_add_ops(
+            self.vals,
+            ScalarTy::Index,
+            self.value,
+            StickOffset(prev.0 - curr.0 + stride.0),
+        );
+        self.value = advance.value;
+        // `forop_builder.setInsertionPoint(op)` — in front of the terminator.
+        self.inserted.extend(advance.ops.iter().cloned());
+        if let Some(body) = regions_of(op).into_iter().nth(region.index()) {
+            let before = body.len().saturating_sub(1);
+            body.splice(before..before, advance.ops);
+        }
+        if let Some(returned) = update_yield_args(op, region, self.value, self.ptr) {
+            self.value = returned;
+        }
+
+        if matches!(op, sen::Op::Sentient(sentient::Op::For { .. })) {
+            // Type 3, loops only: `-stride * bound` undoes the travel the loop made.
+            let bound = for_op_bound(op, self.definitions);
+            let advance = insert_const_and_add_ops(
+                self.vals,
+                ScalarTy::Index,
+                self.value,
+                StickOffset(-stride.0 * bound.0),
+            );
+            self.value = advance.value;
+            self.offsets.pop();
+            self.strides.pop();
+            return advance.ops;
+        }
+
+        match region {
+            // The `then` region's accesses do not reach the `else` region, and neither does its
+            // pointer: both start from the value stacked at the `sentient.if`.
+            YieldRegion::BodyOrThen => {
+                if let Some(level) = self.offsets.last_mut() {
+                    level.clear();
+                }
+                if let Some(init) = self.then_init.pop() {
+                    self.value = init;
+                }
+            }
+            YieldRegion::Else => {
+                self.offsets.pop();
+                self.strides.pop();
+            }
+        }
+        Vec::new()
+    }
+
+    /// `unit.walk<WalkOrder::PreOrder>` over one region.
+    ///
+    /// ⛔ THE ORDINAL IS THE **ORIGINAL** ONE, and the running index is not: every key in
+    /// [`XrfPass::active`], [`XrfPass::inactive`] and [`XrfPass::xrf_regions`] was measured by
+    /// entry 367 before a single op was inserted, so the ops this walk splices in must not shift the
+    /// positions it is still looking up. Inserted ops are stepped over, never re-examined.
+    fn walk(&mut self, region: &mut Vec<sen::Op>, prefix: &[u32], base: u32) {
+        let mut ordinal = 0u32;
+        let mut index = 0usize;
+        while index < region.len() {
+            // An op the other pass spliced in is not one of the positions the maps were measured
+            // over — step past it without spending an ordinal on it.
+            if self.inserted.contains(&region[index]) {
+                index += 1;
+                continue;
+            }
+            let mut path = prefix.to_vec();
+            path.push(base + ordinal);
+            let at = OpId::at(&path);
+
+            let control = matches!(
+                &region[index],
+                sen::Op::Sentient(sentient::Op::For { .. } | sentient::Op::If { .. })
+            );
+            let member = control && self.xrf_regions.contains(&at);
+            if !control {
+                let before = if self.active.contains_key(&at) {
+                    self.active_access(&at)
+                } else if self.inactive.contains_key(&at) {
+                    self.inactive_access(&at)
+                } else {
+                    Vec::new()
+                };
+                let inserted = before.len();
+                self.inserted.extend(before.iter().cloned());
+                region.splice(index..index, before);
+                index += inserted;
+            } else if member {
+                self.enter(&at, &mut region[index]);
+            }
+
+            // The regions BELOW this op, at their original child positions.
+            let lengths: Vec<u32> = regions_of(&mut region[index])
+                .iter()
+                .map(|ops| ops.len() as u32)
+                .collect();
+            let mut after: Vec<sen::Op> = Vec::new();
+            for (child, kind) in [(0usize, YieldRegion::BodyOrThen), (1, YieldRegion::Else)] {
+                if child >= lengths.len() {
+                    break;
+                }
+                let child_base: u32 = lengths[..child].iter().sum();
+                if let Some(inner) = regions_of(&mut region[index]).into_iter().nth(child) {
+                    self.walk(inner, &path, child_base);
+                }
+                if member {
+                    after.extend(self.close(&mut region[index], kind));
+                }
+            }
+            for (child, _) in lengths.iter().enumerate().skip(2) {
+                if let Some(inner) = regions_of(&mut region[index]).into_iter().nth(child) {
+                    let child_base: u32 = lengths[..child].iter().sum();
+                    self.walk(inner, &path, child_base);
+                }
+            }
+
+            index += 1;
+            let inserted = after.len();
+            self.inserted.extend(after.iter().cloned());
+            region.splice(index..index, after);
+            index += inserted;
+            ordinal += 1;
+        }
+    }
+}
+
+/// Replaces: e345_processXrfPtrPerUnit
+///
+/// **345/384** `LoweringXRF::processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337` (190L).
+///
+/// ⛔ `isXrfRelated(op)` IS READ OFF THE MAPS, NOT RE-ASKED: entry 367 keys `expr_maps[0]` with
+/// exactly the xrf-related STORES and `expr_maps[1]` with the LOADS (`:630-646`), which is the same
+/// population the four `isa<>` tests here select — so membership in `expr_maps[i]` IS the active arm
+/// and membership in `expr_maps[1 - i]` IS the inactive one.
+/// ⛔ THE `use_empty` CHECK ON A LOOP'S OLD INIT MOVES TO THE END OF THE PASS. Nothing after the
+/// rewrite can add a reader, so the answer is unchanged and the census sees the whole unit.
+/// ⭐ THE TWO INIT CONSTANTS LAND IN REVERSE PASS ORDER, `setInsertionPointToStart` putting the read
+/// pointer's in front of the write pointer's (`:376-380`).
+pub fn process_xrf_ptr_per_unit<A: Arch>(
+    body: &mut Vec<sen::Op>,
+    precision: sentient::Precision,
+    expr_maps: &XrfLayoutExprs,
+    xrf_regions: &BTreeSet<OpId>,
+    definitions: Definitions<'_>,
+    vals: &mut Values,
+) -> XrfPtrMap {
+    let mut map: BTreeMap<OpId, PartialXrfPtrs> = BTreeMap::new();
+    let mut prologue: Vec<sen::Op> = Vec::new();
+    let mut inserted: Vec<sen::Op> = Vec::new();
+
+    // *"work on write_ptr and read_ptr sequentially"*.
+    for ptr in [XrfPtr::Write, XrfPtr::Read] {
+        let other = match ptr {
+            XrfPtr::Write => XrfPtr::Read,
+            XrfPtr::Read => XrfPtr::Write,
+        };
+        // `unsigned xrf_incr_after_prev_mac = 1;` and the read pointer's own MAC stride.
+        let incr_after_prev_mac = match ptr {
+            XrfPtr::Write => 1,
+            XrfPtr::Read => i64::from(xrf_rd_ptr_incr_val_after_mac::<A>(precision)),
+        };
+
+        // *"initialize xrf reg to zero and update xrf_access_offsets"* — no locale, so the `.td`'s
+        // `imm`, which is what the commented-out `xrfwrptr`/`xrfrdptr` naming would have set anyway.
+        let init = vals.mint();
+        let mut pass = XrfPass {
+            ptr,
+            active: expr_maps.at(ptr),
+            inactive: expr_maps.at(other),
+            xrf_regions,
+            definitions,
+            incr_after_prev_mac,
+            value: init,
+            offsets: vec![vec![StickOffset(0)]],
+            strides: Vec::new(),
+            then_init: Vec::new(),
+            to_delete: Vec::new(),
+            inserted: &mut inserted,
+            map,
+            vals,
+        };
+        pass.walk(body, &[], 0);
+        let XrfPass {
+            map: filled,
+            to_delete,
+            ..
+        } = pass;
+        map = filled;
+
+        // `for (Operation *op : ops_to_delete) op->erase();`
+        for old in to_delete {
+            if use_empty(old, body, vals) {
+                sen::erase_defining_op(body, old);
+            }
+        }
+        prologue.splice(
+            0..0,
+            [sen::Op::Sentient(sentient::Op::ScalarConstant {
+                value: 0,
+                result: init,
+                reg_locale: sentient::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            })],
+        );
+    }
+    body.splice(0..0, prologue);
+
+    map.into_iter()
+        .filter_map(|(at, partial)| partial.complete().map(|ptrs| (at, ptrs)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3188,5 +3621,116 @@ mod xrf_lowering_unit_tests {
         assert_eq!((op_a, op_b, op_c), (&lrf0, &lrf0, &lrf0));
         assert_eq!(dbg_name.as_deref(), Some("LoweringXRF dummy Mac"));
         assert_eq!(results, &vec![advance.value]);
+    }
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 345/384 — `processXrfPtrPerUnit`
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 345/384 — ONE XRF STORE AND ONE XRF LOAD, AND BOTH PASSES OVER THE SAME BODY.
+    ///
+    /// ⛔ THE STORE'S ADVANCE IS ITS RAW `constant_val` — 2 sticks, not `2 + 1`: the MAC's own
+    /// increment goes on the offset stack for the NEXT access (`LoweringXRF.cpp:429-446`).
+    /// ⛔ AND THE READ PASS STILL FINDS THE LOAD AT `[1]` after the write pass grew the body.
+    #[test]
+    fn the_write_pass_advances_to_its_store_and_the_read_pass_still_finds_the_load() {
+        let mut vals = Values::default();
+        let (view, stored) = (vals.mint(), vals.mint());
+        let mut body = vec![
+            sen::Op::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: stored,
+                view,
+                indices: vec![Index::Const(0)],
+                view_ty: MemRef {
+                    shape: vec![256],
+                    elem: ElemType::F16,
+                },
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+            }),
+            sen::Op::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: vals.mint(),
+                view,
+                indices: vec![Index::Const(0)],
+                view_ty: MemRef {
+                    shape: vec![256],
+                    elem: ElemType::F16,
+                },
+                ty: Vector {
+                    len: 64,
+                    elem: ElemType::F16,
+                },
+                multicast_info: None,
+            }),
+        ];
+        let at = |path: &[u32], constant| {
+            (
+                OpId::at(path),
+                LayoutExpr {
+                    layout_map: BTreeMap::new(),
+                    constant_val: StickOffset(constant),
+                },
+            )
+        };
+        let expr_maps = XrfLayoutExprs {
+            write: LayoutExprMap::from([at(&[0], 2)]),
+            read: LayoutExprMap::from([at(&[1], 0)]),
+        };
+
+        let map = process_xrf_ptr_per_unit::<Dd2>(
+            &mut body,
+            sentient::Precision::Fp16,
+            &expr_maps,
+            &BTreeSet::new(),
+            Definitions::from_innermost(&[]),
+            &mut vals,
+        );
+
+        let shape: Vec<String> = body
+            .iter()
+            .map(|op| match op {
+                sen::Op::Sentient(sentient::Op::ScalarConstant { value, .. }) => {
+                    format!("const {value}")
+                }
+                sen::Op::Sentient(sentient::Op::ScalarAdd { .. }) => "add".to_owned(),
+                sen::Op::Sentient(sentient::Op::VectorMac { .. }) => "dummy mac".to_owned(),
+                sen::Op::Agen(agen::Op::VectorStore { .. }) => "store".to_owned(),
+                sen::Op::Agen(agen::Op::VectorLoad { .. }) => "load".to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                // ⭐ THE READ POINTER'S INIT IN FRONT OF THE WRITE POINTER'S — `:376-380` inserts
+                // each at the start of the region, so the second pass's lands first.
+                "const 0",
+                "const 0",
+                // The write pointer travels its 2 sticks and leaves a placeholder at its store …
+                "const 2",
+                "add",
+                "const 0",
+                "dummy mac",
+                // … where the read pointer places a placeholder and does NOT move.
+                "const 0",
+                "dummy mac",
+                "store",
+                // And at the load the two swap roles, the read pointer's advance being 0 - 0.
+                "const 0",
+                "dummy mac",
+                "const 0",
+                "dummy mac",
+                "load",
+            ]
+        );
+        // `map[op].at(0).at(0)` is the value the store's own advance produced.
+        let sen::Op::Sentient(sentient::Op::ScalarAdd { result, .. }) = &body[3] else {
+            panic!("the write pointer's advance, not {:?}", body[3])
+        };
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&OpId::at(&[0])].argument.write, *result);
     }
 }

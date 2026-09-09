@@ -357,7 +357,7 @@ fn element_type_of(op: &DfirOp) -> ElemType {
 /// which the reference has no op class for because `AffineToStandard` has already rewritten them by
 /// the time `getVectorType` runs. They are the same access one rung earlier; treating them as absent
 /// would make the answer depend on which side of D1 the query happens to run.
-fn vector_type_of(op: &DfirOp) -> Option<Vector> {
+pub(super) fn vector_type_of(op: &DfirOp) -> Option<Vector> {
     match op {
         // `dataflow::SendOp` and `dataflow::ReceiveOp`.
         DfirOp::Dataflow(dfir_op::dataflow::Op::Send { ty, .. }) => Some(*ty),
@@ -3788,6 +3788,7 @@ mod unit_tests {
             unroll_factor: sen::UnrollFactor::X1,
             xrf_read_incr: 0,
             xrf_write_incr: 0,
+            data_transfer_only: false,
             dbg_name: None,
         })
     }

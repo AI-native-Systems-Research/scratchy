@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`341/384 ported; 341/384 audited`
+`349/384 ported; 349/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2740,6 +2740,81 @@ the reference's own copy-paste, and what an LXSU failure actually prints. Its mi
 class, the component gate, and — for 331, through the vendor's own 64-lane composite — the record
 construction stopping before the size check. No island growth and no new dependency for this batch.
 
+⭐ ENTRIES 343-350 — THE CAST FORWARD, THE TWO DANGLING-OP LOWERINGS, THE PER-UNIT XRF POINTER PASS,
+THE CONDITIONAL-TREE PREDICATE TRIO AND THE TOGGLE DUPLICATION. 343 is in `vc_vector_operands.rs`, 344
+in `vc_vector_chain_to_sentient_pesfp.rs`, 345 in `vc_lowering_xrf.rs`, 346 in
+`vc_vector_chain_to_sentient_pt.rs`, 347/348/349 in `tf_cfgs_dataflow_conditional_tree.rs` and 350 in
+`tf_duplicate_reused_toggle.rs`.
+
+⛔⛔ 350'S INNER-LOOP `isa<>` LIST OMITS `scf::YieldOp` AND ITS OWN GOLDEN NEEDS IT. The
+`DT_CHECK(res.getUsers().empty() || isa<affine::AffineYieldOp, scf::ForOp>(*(res.getUsers().begin())))`
+at `DuplicateReusedToggle.cpp:118-121` admits an `affine.yield` and an enclosing `scf.for` and nothing
+else — but `dcc/test/Transform/CanonicalizeToggle/multiple_toggle_uses.mlir:118` is a SUCCESS case in
+which an `scf.yield` reads a mid-nest `affine.for`'s results, so the reference would abort on the
+program it prints. The port admits all three and says so at
+`ToggleDuplication::InnerResultUserUnknown`; a port that copied the list would refuse its own answer
+key.
+
+⛔ AND 350 IS WIDENED IN PLACE WHERE THE REFERENCE CLONES AND ERASES. `createForOpWithAdditionalReturnValue`
+(entry 264, `:83-84`) builds a fresh loop, the `IRMapping` remaps `toggle_op`, the whole `iter_arg`
+chain and every candidate through it, and `rewriter.eraseOp(loop)` drops the original (`:167-179`).
+This island has no parent pointers, so the `iter_args` entry and the self-yield are PUSHED onto the loop
+that is already there — after which all three remaps and `replaceAllUsesWith(res, new_loop->getResult(j))`
+(`:122`) are the identity, and the fill constants entry 264 would emit are dropped because
+`setIterArgInit` overwrites every one of them on both caller paths (`:127-133`, `:153-155`). The clone
+splice is LAST, because every position the rewrite measured was measured on the body as it stood.
+
+⛔ THE DUPLICATES GO TO THE READERS IN REVERSE CREATION ORDER, which is not cosmetic: MLIR prepends to a
+value's use list, so `getUsers()` walks newest-first, and the golden proves the assignment — `%84` to the
+first-written view (`:87`), `%83` next (`:96`), `%82` to the last-written `arith.addi` (`:104`). A
+preorder walk would wire them the other way round, so `users_of` reverses its collection and counts ONE
+ENTRY PER USE.
+
+⭐ AND ENTRY 178 IS THE CALLER THIS CHANGESET FINISHES. `tf_canonicalize_toggle.rs`'s
+`run_on_operation` held a `todo!("e350_matchAndRewrite: …")` where the convergence loop's rewrite
+belonged; it now takes `&mut dfir::Program<A>` and `&mut Values`, applies the pattern and returns a
+`ToggleCanonicalization`. ⛔ THE LOOP TERMINATES ON A MEASURE, NOT A BUDGET: a rewrite empties the
+matched toggle's `candidates` list and each clone is read by exactly one op and one yield, so the count
+of shared reads strictly decreases and zero is the fixed point — which the new test asserts by
+returning.
+
+⛔⛔ 345'S STACK TAKES `curr_const + incr` WHILE THE OFFSET OP TAKES THE RAW `curr_const`
+(`LoweringXRF.cpp:429-432` against `:446`). The MAC's own default pointer increment counts towards the
+NEXT access's distance and not towards this one's, so the two readers of the same constant disagree by
+design; a port that pushed one value to both would drift the pointer by one stick per MAC.
+
+⛔ AND 345 READS `isXrfRelated` OFF THE MAPS RATHER THAN RE-ASKING IT: entry 367 keys `expr_maps[0]`
+with exactly the xrf-related stores and `expr_maps[1]` with the loads (`:630-646`), which is the same
+population the four `isa<>` tests select — so membership in `expr_maps[i]` IS the active arm.
+
+⛔ 344's DUMMY MAC IS ONE `ResultPrecision = none` AWAY FROM A REAL ONE, and only the `west` receive
+reads `one`/`zero`/its port with the data id on **C**; every other arm reads its port THREE TIMES, puts
+the id on **A** and sets `DataTransferOnly = true` (`:1310-1341`). ⛔ 346'S PT TWIN SHARES NONE OF THAT:
+no mask on the MAC (`nullptr` at `:920`, `:935`), all four precisions the operand's, `opA = from,
+opB = one, opC = zero` and no `DataTransferOnly` — and `pointers` is set for an `agen.vector_load`
+ALONE (`:903-905`), where `at(0)` is the ARGUMENT pair. ⛔ AND ITS WALK DOES NOT STOP AT ONE REFUSAL
+where the PESFP twin's does: the PT lambda returns `void`, so `PtDanglingLowering` carries one refusal
+per offending op.
+
+⛔ 347's AFFINE ARM COMPARES EVERY OPERAND AND ITS SCF ARM ONLY OPERAND 0 (`:287`, `:304-305`), and a
+mixed pair never matches (`:308-309`). 348 IS `scf.if` ONLY (`:501-502`) and its `size() != 1` COUNTS
+THE TERMINATOR (`:505`), so the arm computes nothing at all. 349's DEPENDENCE IS ON THE **OWNER**, NOT
+THE VALUE (`:736-738`): an argument of an INNER loop is invariant with respect to `parent_for_op`.
+
+⛔ 343 HAS NO CALL SITE IN THE REFERENCE — only the declaration at `VectorOperands.hpp:56`, entry 304
+spelling the same three lines out inline with three guards this function does not keep (`hasOneUse()`,
+same-block, and the on-the-fly precision rewrite at `:541-556`). Ported for the seam it names.
+
+⛔ ISLAND GROWTH FOR 344, per AGENT-BRIEF.md:87: `sentient::Op::VectorMac` gained
+`data_transfer_only`, the `DataTransferOnly` DISCARDABLE attribute the dummy MACs carry (`:1341`) and
+that `PortAssignment` reads to port-assign such a MAC without treating it as a compute before removing
+it (`PortAssignment.cpp:518`, `:690`, `:703`) — a flag the island could not spell, and a dummy MAC that
+lost it is port-assigned as if it computed something.
+
+⭐ AND ONE PRE-EXISTING `Result<>` IS CONVERTED WITH THEM: `pt_dummy_mac`'s
+`Result<PtDummyMac, PtDangling>` is now the outcome enum `PtMac`, leaving zero `Result<` in
+`src/bridges/dataflow_ir_to_sentient/` as `CLAUDE.md` requires.
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3444,22 +3519,22 @@ construction stopping before the size check. No island growth and no new depende
 - [x] **AUDIT 341/384** `analyzeNonComputeOpsForFusion` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:610`, line by line against the C++
 - [x] **PORT 342/384** `analyzeAndFillResultForwarding` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:162`, 27 lines
 - [x] **AUDIT 342/384** `analyzeAndFillResultForwarding` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:162`, line by line against the C++
-- [ ] **PORT 343/384** `getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354`, 5 lines
-- [ ] **AUDIT 343/384** `getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354`, line by line against the C++
-- [ ] **PORT 344/384** `lowerDanglingNonComputeOpsPESFP` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1274`, 93 lines
-- [ ] **AUDIT 344/384** `lowerDanglingNonComputeOpsPESFP` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1274`, line by line against the C++
-- [ ] **PORT 345/384** `processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337`, 190 lines
-- [ ] **AUDIT 345/384** `processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337`, line by line against the C++
-- [ ] **PORT 346/384** `lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882`, 88 lines
-- [ ] **AUDIT 346/384** `lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882`, line by line against the C++
-- [ ] **PORT 347/384** `topLevelConditionsMatch` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:279`, 31 lines
-- [ ] **AUDIT 347/384** `topLevelConditionsMatch` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:279`, line by line against the C++
-- [ ] **PORT 348/384** `singleOpBranchToYieldVal` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:498`, 18 lines
-- [ ] **AUDIT 348/384** `singleOpBranchToYieldVal` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:498`, line by line against the C++
-- [ ] **PORT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, 66 lines
-- [ ] **AUDIT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, line by line against the C++
-- [ ] **PORT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, 170 lines
-- [ ] **AUDIT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, line by line against the C++
+- [x] **PORT 343/384** `getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354`, 5 lines
+- [x] **AUDIT 343/384** `getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354`, line by line against the C++
+- [x] **PORT 344/384** `lowerDanglingNonComputeOpsPESFP` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1274`, 93 lines
+- [x] **AUDIT 344/384** `lowerDanglingNonComputeOpsPESFP` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1274`, line by line against the C++
+- [x] **PORT 345/384** `processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337`, 190 lines
+- [x] **AUDIT 345/384** `processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337`, line by line against the C++
+- [x] **PORT 346/384** `lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882`, 88 lines
+- [x] **AUDIT 346/384** `lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882`, line by line against the C++
+- [x] **PORT 347/384** `topLevelConditionsMatch` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:279`, 31 lines
+- [x] **AUDIT 347/384** `topLevelConditionsMatch` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:279`, line by line against the C++
+- [x] **PORT 348/384** `singleOpBranchToYieldVal` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:498`, 18 lines
+- [x] **AUDIT 348/384** `singleOpBranchToYieldVal` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:498`, line by line against the C++
+- [x] **PORT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, 66 lines
+- [x] **AUDIT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, line by line against the C++
+- [x] **PORT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, 170 lines
+- [x] **AUDIT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, line by line against the C++
 - [x] **PORT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, 70 lines
 - [x] **AUDIT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, line by line against the C++
 - [x] **PORT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, 25 lines

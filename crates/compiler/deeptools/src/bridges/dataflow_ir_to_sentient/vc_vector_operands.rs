@@ -1154,6 +1154,44 @@ impl VectorOperand {
         get_operand(&parent, comp)
     }
 
+    /// Replaces: e343_getOperandFromCastOp
+    ///
+    /// **343/384** `VectorOperand::getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354` (5L).
+    ///
+    /// ```cpp
+    /// DT_CHECK(isa<vectorchain::CastOp>(op));
+    /// auto *parent = op.getOperand(0).getDefiningOp();
+    /// auto operand = getOperand(dcc_ext_ctx, parent, comp);
+    /// return operand;
+    /// ```
+    ///
+    /// ⛔⛔ A CAST IS TRANSPARENT AND THIS FORWARD IS UNCONDITIONAL — where entry 304's own `CastOp`
+    /// arm asks the same question of the same input it guards it three ways and then rewrites the
+    /// answer: `hasOneUse()`, the input's defining op being in the SAME BLOCK, and
+    /// `on_the_fly_conv_precision_ = getPrecisionInString(getElementType(cast_op.getType()))`
+    /// (`:541-556`). This function keeps neither guard and touches neither precision, so a caller that
+    /// swapped one for the other would report the producer's precision through a multi-use cast.
+    /// ⛔ NO CALL SITE IN THE REFERENCE — only the declaration at `VectorOperands.hpp:56`; entry 304
+    /// spells the same three lines out inline. Ported for the seam it names, not for a caller.
+    /// ⛔ `DT_CHECK(isa<CastOp>(op))` IS `None` HERE, and `get_operand` is the SCC cut
+    /// [`Self::from_neg_op`] documents, carrying the same `traverse_upwards = true` default.
+    #[must_use]
+    pub fn from_cast_op(
+        cast_op: &OpId,
+        comp: ComputeComp,
+        scope: &[DfirOp],
+        get_operand: &mut impl FnMut(&OpId, ComputeComp) -> Option<VectorOperand>,
+    ) -> Option<VectorOperand> {
+        // `DT_CHECK(isa<vectorchain::CastOp>(op));`
+        let Some(DfirOp::VectorChain(vc::Op::Cast { input, .. })) = op_at(cast_op, scope) else {
+            return None;
+        };
+        // `auto *parent = op.getOperand(0).getDefiningOp();`
+        let parent = defining_position(*input, scope)?;
+        // `auto operand = getOperand(dcc_ext_ctx, parent, comp); return operand;`
+        get_operand(&parent, comp)
+    }
+
     /// Replaces: e169_getName
     ///
     /// **169/384** `VectorOperand::getName` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:866` (11L).
@@ -3922,9 +3960,55 @@ mod unit_tests {
         assert_eq!(compute.operand, None);
         assert!(!compute.precision_converted);
     }
-}
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e343_getOperandFromCastOp
+    /// 🎯 343/384 — A CAST FORWARDS ITS INPUT'S OPERAND UNTOUCHED, AND THAT IS EXACTLY WHAT SEPARATES
+    /// IT FROM ENTRY 304'S OWN `CastOp` ARM: two users decline there (`hasOneUse()`, `:542`) and
+    /// forward here, and neither precision is rewritten.
+    #[test]
+    fn a_cast_forwards_its_inputs_operand_untouched() {
+        let scope = vec![
+            dense(Val(0)),
+            DfirOp::VectorChain(vc::Op::Cast {
+                result: Val(1),
+                input: Val(0),
+                input_ty: V,
+                ty: V,
+            }),
+            // TWO users of the cast, which is the one-use guard's negative case.
+            fast_exp(Val(2), Val(1)),
+            fast_exp(Val(3), Val(1)),
+        ];
+        let answer = VectorOperand::from_cast_op(
+            &OpId::at(&[1]),
+            ComputeComp::Sfp,
+            &scope,
+            &mut |op: &OpId, comp| resolved(op, comp, &scope),
+        )
+        .expect("the cast forwards the constant behind it");
+        assert_eq!(answer.kind, VectorOperandType::Constant);
+        assert_eq!(answer.op, OpId::at(&[0]));
+
+        // ⛔ THE GUARDED ARM DECLINES THE SAME POSITION, and does not even set the conversion flag —
+        // it is set INSIDE `hasOneUse()`.
+        let guarded = VectorOperand::with_precision::<Sen1p5>(
+            &OpId::at(&[1]),
+            ComputeComp::Sfp,
+            true,
+            &scope,
+            &mut |op: &OpId, comp| resolved(op, comp, &scope),
+        );
+        assert_eq!(guarded.operand, None);
+        assert!(!guarded.precision_converted);
+
+        // ⛔ `DT_CHECK(isa<CastOp>(op))` — a position holding anything else has no operand to report.
+        assert_eq!(
+            VectorOperand::from_cast_op(
+                &OpId::at(&[0]),
+                ComputeComp::Sfp,
+                &scope,
+                &mut |op: &OpId, comp| resolved(op, comp, &scope),
+            ),
+            None
+        );
+    }
+}

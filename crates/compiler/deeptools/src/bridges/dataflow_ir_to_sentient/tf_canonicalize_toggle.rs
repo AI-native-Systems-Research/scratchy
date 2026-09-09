@@ -58,71 +58,30 @@
 //! |---|---|---|---|
 //! | `e178_runOnOperation` | 178/384 | 42 | `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49` |
 
+use super::tf_duplicate_reused_toggle::{ToggleDuplication, match_and_rewrite};
+use super::vc_vector_chain_to_sentient_pesfp::walk_positions;
+use super::vc_vector_operands::{OpId, op_at};
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, uniform, uses,
+    Op as DfirOp, Val, affine, arith, dataflow, defining_op, scf, uses,
 };
-use crate::islands::dataflow_ir::{self as dfir, ProgramUnit};
+use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Values};
 
-/// PREORDER, DESCENDING INTO EVERY REGION — `unit.walk([&](Operation *op) { .. })` (`:76`).
+/// EVERY OP OF A UNIT AS A POSITION, PREORDER — `unit.walk([&](Operation *op) { .. })` (`:76`).
 ///
 /// ⛔ A USE-WALK IS THE ONE MECHANISM THIS CAMPAIGN MAY SIMPLIFY: MLIR reaches nested ops through
-/// `Region`/`Block`, this island nests them in `Vec`s. ⚠️ AND THE `WalkResult::interrupt()` AT `:84`
-/// IS NOT SIMPLIFIED AWAY — it is the reason the caller's `while (has_changed)` exists, and it is
-/// modelled by [`run_on_operation`] stopping at the first match rather than by a flag here.
-fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
-    for op in ops {
-        visit(op);
-        match op {
-            DfirOp::Affine(affine::Op::For { body, .. })
-            | DfirOp::Scf(scf::Op::Parallel { body, .. } | scf::Op::For { body, .. })
-            | DfirOp::Dataflow(dataflow::Op::ProgramUnit { body, .. }) => {
-                walk_preorder(body, visit);
-            }
-            DfirOp::Scf(scf::Op::If {
-                body, else_body, ..
-            })
-            | DfirOp::Affine(affine::Op::If {
-                body, else_body, ..
-            }) => {
-                walk_preorder(body, visit);
-                walk_preorder(else_body, visit);
-            }
-            DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
-                walk_preorder(&transfer.body, visit);
-            }
-            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
-                walk_preorder(&transfer.body, visit);
-            }
-            // ⭐ A `uniform.uniformize_regions` HOLDS ONE REGION PER UNIT CLASS, and `Operation::walk`
-            // descends into every one of them. Before `FlatteningLocalRegions` has run those regions
-            // ARE the program body, so a walk that stopped at the op would see no toggle at all.
-            DfirOp::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
-                for region in regions {
-                    walk_preorder(&region.body, visit);
-                }
-            }
-            DfirOp::Affine(
-                affine::Op::Apply { .. }
-                | affine::Op::Yield { .. }
-                | affine::Op::VectorLoad { .. }
-                | affine::Op::VectorStore { .. },
-            )
-            | DfirOp::Scf(scf::Op::Yield { .. })
-            | DfirOp::Arith(_)
-            | DfirOp::Dataflow(_)
-            | DfirOp::Agen(_)
-            | DfirOp::VectorChain(_)
-            | DfirOp::Vector(_)
-            // `uniform.yield` terminates one of those regions; the two mapping ops carry none.
-            | DfirOp::Uniform(
-                uniform::Op::Yield { .. }
-                | uniform::Op::DefImmutableMapping { .. }
-                | uniform::Op::QueryMap { .. },
-            )
-            | DfirOp::Symbol(_) => {}
-        }
-    }
+/// `Region`/`Block`, this island nests them in `Vec`s, and the flattened child indexing
+/// [`walk_positions`] hands out is what [`match_and_rewrite`] mutates through. ⚠️ AND THE
+/// `WalkResult::interrupt()` AT `:84` IS NOT SIMPLIFIED AWAY — the positions are collected FIRST and
+/// [`run_on_operation`] abandons the rest of the list at the first rewrite, because that rewrite
+/// splices ops and every position below the toggle has moved.
+fn view_positions(ops: &[DfirOp]) -> Vec<OpId> {
+    let mut found: Vec<OpId> = Vec::new();
+    walk_positions(ops, &[], 0, &mut |_, at| {
+        found.push(at);
+        None::<()>
+    });
+    found
 }
 
 /// WHICH UNITS THIS PASS LOOKS AT — the L3 loader and the L3 store unit, and nothing else.
@@ -147,10 +106,10 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
 /// ⚠️ `getUnits()[0].getDefiningOp<GetUnitOp>()` IS ASKED OF THE TYPE HERE. The island's
 /// [`dfir::Units`] carries the kind as a field precisely because `Helper.cpp:2173-2176` reads it from
 /// the first unit alone; there is no `get_unit` to resolve and no `[0]` to index.
-fn candidate_units<A: Arch>(program: &dfir::Program<A>) -> Vec<&ProgramUnit<A>> {
+fn candidate_units<A: Arch>(program: &mut dfir::Program<A>) -> Vec<&mut ProgramUnit<A>> {
     program
         .units
-        .iter()
+        .iter_mut()
         .filter(|unit| unit.on.moves_memory())
         .collect()
 }
@@ -158,11 +117,11 @@ fn candidate_units<A: Arch>(program: &dfir::Program<A>) -> Vec<&ProgramUnit<A>> 
 /// A TOGGLE A SECOND DATA TRANSFER READS TOO — what the pattern finds at one memory view.
 ///
 /// ⛔⛔ NOT ENTRY 350'S PORT. `DuplicateReusedTogglePattern::matchAndRewrite`
-/// (`dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, entry 350/384, level 6) is 170 lines
-/// that clone a loop nest and add an `iter_args` chain per reuse. What is here is only its MATCH
-/// condition (`:36-57`), and it is here because THE DRIVER CANNOT BE WRITTEN WITHOUT IT:
-/// `CanonicalizeToggle.cpp:82` reads `succeeded(...)` to decide whether the IR changed, and that
-/// answer is what ends the convergence loop.
+/// (`dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, entry 350/384, level 6) is
+/// [`match_and_rewrite`], and it performs the rewrite. What is here is only its MATCH condition
+/// (`:36-57`): the query [`run_on_operation`] asks before handing a position to the rewrite, and the
+/// one a caller asks to learn whether a program is already canonical. ⚠️ The two `DT_CHECK`s it
+/// documents below are named arms of [`ToggleDuplication`] there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReusedToggle {
     /// The `arith.subi` binding the view's start address — `toggle_op` (`:36-37`).
@@ -248,6 +207,18 @@ pub fn reused_toggle(view: &DfirOp, scope: &[DfirOp]) -> Option<ReusedToggle> {
     })
 }
 
+/// WHAT THE PASS DID TO A PROGRAM — the duplicates it made and the shapes it declined.
+///
+/// ⭐ AN OUTCOME RECORD, NOT A `Result`: a declined view is not an error, it is a program shape
+/// `AddressPinningAndToggle` will see unchanged, and the reference reaches convergence with it too.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ToggleCanonicalization {
+    /// Every duplicate toggle minted, in the order the walks applied them.
+    pub duplicated: Vec<Val>,
+    /// The pattern's `DT_CHECK` arms, once per view still holding one when the walk converged.
+    pub refused: Vec<ToggleDuplication>,
+}
+
 /// GIVE EVERY DATA TRANSFER ITS OWN TOGGLE.
 ///
 /// ```cpp
@@ -302,20 +273,24 @@ pub fn reused_toggle(view: &DfirOp, scope: &[DfirOp]) -> Option<ReusedToggle> {
 /// requirement from the other side (see [`super::tf_mutable_addr_splitting`], whose
 /// `a_toggled_start_address_is_not_eligible` test is that refusal).
 ///
-/// # ⛔⛔ THE CONVERGENCE LOOP HAS ONE REACHABLE ITERATION UNTIL ENTRY 350 LANDS
+/// # ⛔⛔ WHAT ENDS THE CONVERGENCE LOOP
 ///
-/// `while (has_changed)` restarts the walk after every rewrite, because `matchAndRewrite` deletes and
-/// clones ops and the walk it interrupted is invalid afterwards (`:65-67`, `:84`). The rewrite is
-/// entry 350/384 at level 6 and is unported, so the first match a candidate unit produces has nothing
-/// to apply: the port stops there, naming the unit and the toggle, rather than looping forever on a
-/// rewrite that cannot happen or — worse — reporting convergence over a program it never changed.
+/// `while (has_changed)` restarts the walk after every rewrite, because `matchAndRewrite` splices ops
+/// and the walk it interrupted is invalid afterwards (`:65-67`, `:84`). ⭐ AND IT TERMINATES ON A
+/// MEASURE, NOT ON A BUDGET: [`match_and_rewrite`] answers
+/// [`ToggleDuplication::Duplicated`] only by giving each of a toggle's OTHER readers a toggle of its
+/// own, so that toggle's `candidates` list is empty on the next pass and each fresh clone is read by
+/// exactly one op and one yield. The number of shared reads across the unit strictly decreases, and
+/// zero is the fixed point.
+///
+/// ⚠️ A REFUSAL IS NOT A CHANGE, AND IS NOT RETRIED. The `DT_CHECK` arms of the pattern
+/// ([`ToggleDuplication`]) leave the IR alone, so a view holding one is walked past and the loop still
+/// converges; what is reported is the refusals of the LAST pass, the one that changed nothing.
 ///
 /// ⭐ AND A PROGRAM WITH NO SHARED TOGGLE IS LEFT ALONE, WHICH IS THE PASS'S ANSWER FOR EVERY PROGRAM
 /// THIS CRATE EMITS TODAY. The toggled-address shape comes from `AddressPinningAndToggle`, one rung
 /// below; nothing here builds an `arith.subi` over an `iter_args` chain, so [`reused_toggle`] answers
-/// `None` for every view and the pass is a checked no-op. ⛔ WHICH IS EXACTLY WHY IT IS PORTED NOW: on
-/// the day a toggle IS shared, the answer must be a build failure naming entry 350, not a silently
-/// unhandled shape that `AddressPinningAndToggle` then mis-pins.
+/// `None` for every view and the pass is a checked no-op.
 ///
 /// # ⛔ WHAT THE PORT DROPS, AND WHY
 ///
@@ -325,59 +300,81 @@ pub fn reused_toggle(view: &DfirOp, scope: &[DfirOp]) -> Option<ReusedToggle> {
 ///   "did the compiler canonicalize" a runtime question with two answers.
 /// - `PatternRewriter rewriter(&getContext()); rewriter.setInsertionPoint(op);` (`:78-79`) and the
 ///   per-op construction of the pattern (`:81`) are an insertion point and an allocation — mechanism.
-///   The insertion point is `op` itself, which is where a ported entry 350 clones from anyway.
+///   The insertion point is `op` itself, which is where [`match_and_rewrite`] splices its clones
+///   anyway.
 /// - The reference's own `TODO` at `:68-71` (that a `RewritePattern` driver would run every basic
 ///   canonicalization, DCE included, with unintended effects mid-pipeline) is why the walk is written
 ///   by hand. Here there is no driver to avoid; the note is recorded because it says the manual walk
 ///   is deliberate.
 ///
-/// # ⛔ AND IT TAKES A SHARED REFERENCE
+/// # ⭐ AND IT REWRITES THE PROGRAM IN PLACE
 ///
-/// The reference rewrites its module in place. The whole of that rewriting is entry 350, so there is
-/// nothing here to write back: the observable is the choice between leaving a program alone and
-/// failing the build. `&mut` would claim a capability nothing behind it has and would make every
-/// caller clone a program to rewrite none of them. It becomes `&mut` in the changeset that lands
-/// entry 350 — the same contract [`super::tf_cfg_simplification_dataflow_level::run_on_operation`]
-/// states.
+/// The reference rewrites its module in place, and the whole of that rewriting is entry 350
+/// ([`match_and_rewrite`]) — which mints values, so the unit's [`Values`] comes with it. What is
+/// RETURNED is what the reference only logs: the toggles it duplicated and the shapes it refused, so a
+/// caller can tell a canonicalized program from one the pattern declined. The same contract
+/// [`super::tf_cfg_simplification_dataflow_level::run_on_operation`] states.
 ///
 /// Replaces: e178_runOnOperation
-pub fn run_on_operation<A: Arch>(program: &dfir::Program<A>) {
+pub fn run_on_operation<A: Arch>(
+    program: &mut dfir::Program<A>,
+    values: &mut Values,
+) -> ToggleCanonicalization {
+    let mut outcome = ToggleCanonicalization::default();
     // `for (auto unit : candidate_units)` — collected first, because the rewrite deletes ops
     // (`:52-55`).
     for unit in candidate_units(program) {
         // `bool has_changed = true; while (has_changed) { has_changed = false; unit.walk(..) }`
-        let mut first_match: Option<ReusedToggle> = None;
-        walk_preorder(&unit.body, &mut |op| {
-            // `if (auto candidate = dyn_cast<dataflow::GetLogicalMemoryViewOp>(op))` — every other
-            // op is `WalkResult::advance()` (`:87`).
-            if first_match.is_none() {
-                first_match = reused_toggle(op, &unit.body);
-            }
-        });
+        let mut has_changed = true;
+        while has_changed {
+            has_changed = false;
+            let mut refused: Vec<ToggleDuplication> = Vec::new();
+            for at in view_positions(&unit.body) {
+                // `if (auto candidate = dyn_cast<dataflow::GetLogicalMemoryViewOp>(op))` with the
+                // pattern's own match condition (`DuplicateReusedToggle.cpp:36-57`) — every op it
+                // answers `None` for is `WalkResult::advance()` (`:87`), and asking here keeps the
+                // rewrite off positions it would only decline.
+                let Some(candidate) = op_at(&at, &unit.body) else {
+                    continue;
+                };
+                if reused_toggle(candidate, &unit.body).is_none() {
+                    continue;
+                }
 
-        // `if (succeeded(pattern.matchAndRewrite(candidate, rewriter))) { has_changed = true; ..`
-        if let Some(found) = first_match {
-            todo!(
-                "e350_matchAndRewrite: {:?} of {:?} shares its toggle {:?} with {} other \
-                 use(s) of it; duplicating it needs one new iter_arg chain per use",
-                unit.on.kind(),
-                unit.on.vals(),
-                found.toggle,
-                found.reuses
-            );
+                // `if (succeeded(pattern.matchAndRewrite(candidate, rewriter))) { has_changed = true;
+                //    return WalkResult::interrupt(); }` (`:82-85`)
+                match match_and_rewrite(&at, &mut unit.body, values) {
+                    ToggleDuplication::Duplicated(toggles) => {
+                        outcome.duplicated.extend(toggles);
+                        has_changed = true;
+                        break;
+                    }
+                    // The two `return failure()`s [`reused_toggle`] already asked about.
+                    ToggleDuplication::NotAToggle | ToggleDuplication::NoOtherUsers => {}
+                    refusal => refused.push(refusal),
+                }
+            }
+            // ⛔ ONLY THE PASS THAT CHANGED NOTHING REPORTS: an earlier one walked the same views
+            // before the rewrite moved them.
+            if !has_changed {
+                outcome.refused = refused;
+            }
         }
     }
+    outcome
 }
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{ReusedToggle, candidate_units, reused_toggle, run_on_operation};
+    use super::{
+        ReusedToggle, ToggleCanonicalization, candidate_units, reused_toggle, run_on_operation,
+    };
     use crate::arch::Target;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith, dataflow};
     use crate::islands::dataflow_ir::ty::{AffineMap, ElemType, MemRef, ScalarTy};
     use crate::islands::dataflow_ir::{
-        Grid, GroupId, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Units,
+        Grid, GroupId, OpIndex, Program, ProgramName, ProgramUnit, ProgramUnits, Units, Values,
     };
     use crate::units::DfirUnit;
 
@@ -459,7 +456,7 @@ mod unit_tests {
     /// the L3 halves — a pass that looked at every unit would ask about views on a PE.
     #[test]
     fn only_the_l3_halves_are_candidate_units() {
-        let program = program_of(vec![
+        let mut program = program_of(vec![
             unit_of(DfirUnit::Lxlu, Vec::new()),
             unit_of(DfirUnit::L3lu, Vec::new()),
             unit_of(DfirUnit::Pe, Vec::new()),
@@ -467,7 +464,7 @@ mod unit_tests {
         ]);
 
         assert_eq!(
-            candidate_units(&program)
+            candidate_units(&mut program)
                 .iter()
                 .map(|unit| unit.on.kind())
                 .collect::<Vec<_>>(),
@@ -558,14 +555,9 @@ mod unit_tests {
     /// 🎯 178/384 — A PROGRAM WHOSE TOGGLES ARE NOT SHARED IS LEFT ALONE, AND THAT INCLUDES EVERY
     /// PROGRAM THIS CRATE EMITS TODAY.
     ///
-    /// REACHING THE END OF THE CALL IS THE ASSERTION: were any candidate unit to hold a shared
-    /// toggle, [`run_on_operation`]'s `todo!` would fire and name entry 350. ⛔ IT DOES NOT COMPARE
-    /// THE PROGRAM WITH A CLONE OF ITSELF — the parameter is shared, so "unchanged" is a fact about
-    /// the type and re-asserting it would test `Clone`.
-    ///
-    /// ⭐ THE SHARED TOGGLE IS PRESENT, ON A UNIT THAT IS NOT A CANDIDATE. `:61` filters the units
-    /// BEFORE any view is looked at, so a reused toggle on a `pe` unit is not this pass's business —
-    /// and a port that walked every unit would stop this build.
+    /// AN EMPTY OUTCOME OVER A PROGRAM THAT STILL HOLDS A SHARED TOGGLE — on a unit that is not a
+    /// candidate. `:61` filters the units BEFORE any view is looked at, so a reused toggle on a `pe`
+    /// unit is not this pass's business, and the two `L3` units it does walk are already canonical.
     #[test]
     fn a_program_with_no_shared_toggle_is_left_alone() {
         let canonical = vec![carrying_loop(
@@ -585,12 +577,108 @@ mod unit_tests {
                 yield_of(&[11]),
             ],
         )];
-
-        run_on_operation(&program_of(vec![
+        let mut program = program_of(vec![
             unit_of(DfirUnit::L3lu, canonical.clone()),
             unit_of(DfirUnit::L3su, canonical),
-            unit_of(DfirUnit::Pe, shared),
-        ]));
+            unit_of(DfirUnit::Pe, shared.clone()),
+        ]);
+        let untouched = program
+            .units
+            .iter()
+            .map(|u| u.body.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            run_on_operation(&mut program, &mut Values::default()),
+            ToggleCanonicalization::default(),
+            "nothing duplicated and nothing refused"
+        );
+        assert_eq!(
+            program
+                .units
+                .iter()
+                .map(|u| u.body.clone())
+                .collect::<Vec<_>>(),
+            untouched,
+            "and the `pe` unit keeps its shared toggle, because `:61` never offered it"
+        );
+    }
+
+    /// 🎯 178/384 — A SHARED TOGGLE ON AN L3 UNIT IS DUPLICATED, AND THE WALK THEN CONVERGES.
+    ///
+    /// `while (has_changed) { .. if (succeeded(pattern.matchAndRewrite(candidate, rewriter))) {
+    /// has_changed = true; return WalkResult::interrupt(); } }` (`:73-89`) — the second view is the
+    /// one candidate, so one duplicate is minted, the loop grows by one `iter_args` entry, and the
+    /// NEXT pass finds every toggle read by one view and one yield. ⛔ THE FIXED POINT IS THE
+    /// ASSERTION: a driver that re-matched the rewritten view would not return.
+    #[test]
+    fn a_shared_toggle_on_an_l3_unit_is_duplicated_and_then_the_walk_converges() {
+        let mut program = program_of(vec![unit_of(
+            DfirUnit::L3su,
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: Val(10),
+                    value: 512,
+                }),
+                carrying_loop(
+                    101,
+                    102,
+                    10,
+                    vec![
+                        toggle(11, 10, 101),
+                        view(12, 11),
+                        view(13, 11),
+                        yield_of(&[11]),
+                    ],
+                ),
+            ],
+        )]);
+        // ⭐ THE COUNTER IS WALKED PAST THE LITERALS THIS TEST WROTE — the island mints every value,
+        // so a builder that starts at 0 beside a hand-written `%102` would issue it twice.
+        let mut values = Values::default();
+        while values.issued() <= 102 {
+            let _ = values.mint();
+        }
+
+        let outcome = run_on_operation(&mut program, &mut values);
+
+        assert_eq!(
+            outcome.refused,
+            Vec::new(),
+            "the shape is the canonical one"
+        );
+        assert_eq!(outcome.duplicated.len(), 1, "one candidate, one duplicate");
+        let duplicate = outcome.duplicated[0];
+        let unit = program.units.iter().next().expect("the one L3 unit");
+        let DfirOp::Affine(affine::Op::For { carried, body, .. }) = &unit.body[1] else {
+            unreachable!("built by `carrying_loop`")
+        };
+        assert_eq!(carried.len(), 2, "the loop carries the new toggle as well");
+        assert_eq!(
+            carried[1].init,
+            Val(10),
+            "initialised to the chain's constant"
+        );
+        assert_eq!(
+            body[1],
+            DfirOp::Arith(arith::Op::SubI(arith::IntBinary {
+                result: duplicate,
+                lhs: Val(10),
+                rhs: carried[1].arg,
+                ty: ScalarTy::Index,
+            })),
+            "the clone sits immediately after the original toggle and reads the added arg"
+        );
+        assert_eq!(
+            body[3],
+            view(13, duplicate.0),
+            "and the second view reads the duplicate, not the shared toggle"
+        );
+        assert_eq!(
+            body[4],
+            yield_of(&[11, duplicate.0]),
+            "which the innermost yield carries to the next iteration"
+        );
     }
 
     /// `affine.yield %operands` — the toggle's other reader.

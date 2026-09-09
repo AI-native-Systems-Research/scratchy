@@ -1797,6 +1797,13 @@ pub enum Op {
         xrf_read_incr: u32,
         /// `$xrfWriteIncr`.
         xrf_write_incr: u32,
+        /// `DataTransferOnly` — a DISCARDABLE attribute rather than a `.td` field, set on the dummy
+        /// MACs the dangling-op lowering emits (`VectorChainToSentientPESFP.cpp:1341`).
+        ///
+        /// ⛔ AND `PortAssignment` READS IT (`PortAssignment.cpp:518`, `:690`) to give such a MAC its
+        /// ports without treating it as a compute, then removes the attribute (`:703`) — so a dummy
+        /// MAC that lost this flag is port-assigned as if it computed something.
+        data_transfer_only: bool,
         /// `$dbgName`.
         dbg_name: Option<String>,
     },
@@ -2873,9 +2880,13 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             unroll_factor,
             xrf_read_incr,
             xrf_write_incr,
+            data_transfer_only,
             dbg_name,
         } => {
             let mut specific = vec![attr("mode", &quoted(mode.spelling()))];
+            if *data_transfer_only {
+                specific.push(attr("DataTransferOnly", "true"));
+            }
             if *xrf_read_incr != 0 {
                 specific.push(attr("xrfReadIncr", &format!("{xrf_read_incr} : i32")));
             }
