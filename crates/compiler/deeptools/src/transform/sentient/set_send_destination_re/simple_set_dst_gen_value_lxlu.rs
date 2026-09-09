@@ -76,8 +76,64 @@
 //! |---|---|---|---|---|
 //! | `e201_print` | 201 | 0 | 16 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:393` |
 
+/// `SimpleSetDstGenValueLXLU::Mode` (`SetSendDestinationRE.hpp:32-37`) — WHERE AN LXLU'S SENDS GO.
+///
+/// ⛔⛔ `kUnknown` IS NOT A VARIANT HERE. `SetDstGenValueLXLU(mode, op)` opens with
+/// `DT_CHECK(mode != Mode::kUnknown)` (`:97`), so a simple GenValue never holds it — the reference's
+/// invalid state is this enum's ABSENCE, and deciding what to do without one belongs to
+/// `initializeDataflowInfoForLXLU` (entry 379), which is where `gen_mode` is still undecided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendDestination {
+    /// `kSendToPT` — ⭐ AND THE CROSS-PT LINK TOO: entry 379 collapses any consumer type containing
+    /// `"pt"` onto this one (`SetSendDestinationRE.cpp:259-260`).
+    Pt,
+    /// `kSendToSFP`.
+    Sfp,
+    /// `kSendToL0SU`.
+    L0su,
+}
+
+/// `SimpleSetDstGenValueLXLU` (`SetSendDestinationRE.hpp:30`) — one destination for the sends of one
+/// LXLU unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SimpleSetDstGenValueLxlu {
+    value: SendDestination,
+}
+
+impl SimpleSetDstGenValueLxlu {
+    /// `SimpleSetDstGenValueLXLU(m)`.
+    ///
+    /// ⭐ `isInitialized()` NEEDS NO PORT: it is `value_ != Mode::kUnknown` (`:43`), which
+    /// [`SendDestination`] having no such state makes unconditionally true.
+    #[must_use]
+    pub(crate) const fn of(value: SendDestination) -> SimpleSetDstGenValueLxlu {
+        SimpleSetDstGenValueLxlu { value }
+    }
+
+    /// `getValue()` (`:46`).
+    #[must_use]
+    pub(crate) const fn value(self) -> SendDestination {
+        self.value
+    }
+
+    /// The body of `SimpleSetDstGenValueLXLU::print` (`SetSendDestinationRE.cpp:393`), which
+    /// [`e200`](super::set_dst_gen_value_lxlu::SetDstGenValueLxlu::print) delegates to.
+    ///
+    /// ⛔ THE ANCHOR ABOVE IS ANOTHER BATCH'S — e201 is not in this worklist, so its TODO stands.
+    /// The batch that owns it should attach `/// Replaces: e201_print` to THIS method rather than add
+    /// a second one; a duplicate would be a second, disagreeing rendering.
+    ///
+    /// ⛔ THE `default:` ARM PRINTING `"(GenValue: Unknown)"` (`:404-406`) IS UNREPRESENTABLE — see
+    /// [`SendDestination`]. `SetDstGenValueLxlu` prints that text from its own `Unknown` kind.
+    pub(crate) fn print(self, out: &mut String) {
+        out.push_str(match self.value {
+            SendDestination::Pt => "(GenValue: PT)",
+            SendDestination::Sfp => "(GenValue: SFP)",
+            SendDestination::L0su => "(GenValue: L0SU)",
+        });
+    }
+}
 
 // crustify:todo: e201_print
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:393  (16 body lines, level 0)
 //   original  : void SimpleSetDstGenValueLXLU::print(raw_ostream &OS) const
-

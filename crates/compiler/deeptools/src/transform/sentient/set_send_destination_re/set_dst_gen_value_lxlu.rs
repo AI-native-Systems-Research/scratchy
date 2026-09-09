@@ -78,16 +78,240 @@
 //! | `e199_copyTo` | 199 | 0 | 22 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:347` |
 //! | `e200_print` | 200 | 0 | 19 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:370` |
 
+use super::QueryMapOp;
+use super::composite_set_dst_gen_value_lxlu::CompositeSetDstGenValueLxlu;
+use super::simple_set_dst_gen_value_lxlu::{SendDestination, SimpleSetDstGenValueLxlu};
+use crate::islands::sentient::dialects::Op;
 
-// crustify:todo: e198_isEqual
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:322  (24 body lines, level 0)
-//   original  : bool SetDstGenValueLXLU::isEqual(const DataFlowDefinitionBase &rhs) const
+/// `SetDstGenValueLXLU::Kind` AND ITS `union GenValue` AS ONE VALUE
+/// (`SetSendDestinationRE.hpp:81-85,113-122`).
+///
+/// ⛔⛔ THE TAG AND THE UNION ARE ONE THING, WHICH IS WHAT MAKES `llvm_unreachable("unhandled case")`
+/// AND `llvm_unreachable("kind of gen value not fully implemented")` UNREPRESENTABLE. In the
+/// reference `kind_` and `gen_value_` can disagree — `SetDstGenValueLXLU(Kind::kSimple, op)` sets the
+/// tag and leaves the union member unconstructed — and the two `llvm_unreachable`s are what happens
+/// when they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GenValue {
+    /// `kUnknown` — the most pessimistic mode, and the default-constructed value.
+    #[default]
+    Unknown,
+    /// `kSimple` — the destination is a `dataflow.get_unit`.
+    Simple(SimpleSetDstGenValueLxlu),
+    /// `kComposite` — the destination comes out of a `uniform.query_map`.
+    Composite(CompositeSetDstGenValueLxlu),
+}
 
-// crustify:todo: e199_copyTo
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:347  (22 body lines, level 0)
-//   original  : void SetDstGenValueLXLU::copyTo(DataFlowDefinitionBase &lhs) const
+/// `SetDstGenValueLXLU` (`SetSendDestinationRE.hpp:78`) — the dataflow definition an RDE node
+/// generates when this pass is optimizing the LXLU's `SETDSTMASK`.
+///
+/// ⭐ THE BASE CLASS'S THREE FIELDS ARE HELD HERE. `DataFlowDefinitionBase`
+/// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) is OUT OF CAMPAIGN SCOPE, and e199 writes
+/// `op_` while e200 prints both flags — so the subclass carries them, exactly as
+/// [`crate::transform::sentient::implicit_sync_re::ImplicitSyncGenValue`] does.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetDstGenValueLxlu {
+    gen_value: GenValue,
+    /// `op_` — absent for the default-constructed unknown value.
+    op: Option<Op>,
+    /// `is_optimized_`; nothing in scope sets it yet.
+    is_optimized: bool,
+    /// `is_dead_`.
+    is_dead: bool,
+}
 
-// crustify:todo: e200_print
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:370  (19 body lines, level 0)
-//   original  : void SetDstGenValueLXLU::print(raw_ostream &OS) const
+impl SetDstGenValueLxlu {
+    /// `SetDstGenValueLXLU()` — the unknown value.
+    #[must_use]
+    pub(crate) fn unknown() -> SetDstGenValueLxlu {
+        SetDstGenValueLxlu::default()
+    }
 
+    /// `SetDstGenValueLXLU(mode, op)` (`:94`).
+    #[must_use]
+    pub(crate) fn simple(value: SendDestination, op: Op) -> SetDstGenValueLxlu {
+        SetDstGenValueLxlu {
+            gen_value: GenValue::Simple(SimpleSetDstGenValueLxlu::of(value)),
+            op: Some(op),
+            is_optimized: false,
+            is_dead: false,
+        }
+    }
+
+    /// `SetDstGenValueLXLU(qmap, op)` (`:88`).
+    #[must_use]
+    pub(crate) fn composite(qmap: QueryMapOp, op: Op) -> SetDstGenValueLxlu {
+        SetDstGenValueLxlu {
+            gen_value: GenValue::Composite(CompositeSetDstGenValueLxlu::of(qmap)),
+            op: Some(op),
+            is_optimized: false,
+            is_dead: false,
+        }
+    }
+
+    /// `isUnknownValue()` — `!isSimple() && !isComposite()` (`:106-108`).
+    #[must_use]
+    pub(crate) const fn is_unknown_value(&self) -> bool {
+        matches!(self.gen_value, GenValue::Unknown)
+    }
+
+    /// What it generates.
+    #[must_use]
+    pub(crate) const fn gen_value(&self) -> GenValue {
+        self.gen_value
+    }
+
+    /// `getOperation()`.
+    #[must_use]
+    pub(crate) const fn op(&self) -> Option<&Op> {
+        self.op.as_ref()
+    }
+
+    /// Replaces: e198_isEqual
+    ///
+    /// Two LXLU GenValues are equal when both are known, of the same kind, and agree on that kind's
+    /// value — the send destination, or the query map by identity.
+    ///
+    /// ⛔ AN UNKNOWN IS EQUAL TO NOTHING, INCLUDING ANOTHER UNKNOWN: `if (isUnknownValue() ||
+    /// rhs.isUnknownValue()) return false` (`SetSendDestinationRE.cpp:323`). ⭐ NOTE THIS DIVERGES
+    /// FROM THE IMPLICIT-SYNC TWIN, where `-1 == -1` holds.
+    ///
+    /// ⛔ THE `is_optimized` BIT IS INTENTIONALLY LEFT OUT — the reference says so in as many words —
+    /// and so are `is_dead_` and `op_`. This is also why the type derives no `PartialEq`.
+    ///
+    /// ⛔ THE `dynamic_cast` AND ITS `DT_CHECK_MSG` BECAME THE PARAMETER TYPE, and the cross-kind
+    /// `return false` pair stays because it is a real answer, not a check.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &SetDstGenValueLxlu) -> bool {
+        match (self.gen_value, rhs.gen_value) {
+            (GenValue::Unknown, _) | (_, GenValue::Unknown) => false,
+            (GenValue::Simple(lhs), GenValue::Simple(rhs)) => lhs.value() == rhs.value(),
+            // "todo: for now we establish equality based on shallow SSA value comparison" (`:337`).
+            (GenValue::Composite(lhs), GenValue::Composite(rhs)) => {
+                lhs.query_map() == rhs.query_map()
+            }
+            // "We don't have valid scenarios where we need to optimize across simple and composite
+            // nodes" (`:328-330`).
+            (GenValue::Simple(_), GenValue::Composite(_))
+            | (GenValue::Composite(_), GenValue::Simple(_)) => false,
+        }
+    }
+
+    /// Replaces: e199_copyTo
+    ///
+    /// Copies the generating operation and the generated value onto `lhs`, leaving its two flags
+    /// alone.
+    ///
+    /// ⛔ "COPY EVERYTHING EXCEPT THE `is_optimized_` FLAG" — and except `is_dead_`, which the
+    /// reference also never assigns here. `*lhs = self.clone()` would clobber both.
+    ///
+    /// ⛔⛔ `DT_CHECK_MSG(lhs_p->kind_ == Kind::kUnknown, "mixed mode copying is currently only
+    /// supported when copying into an unknown")` IS A UNION-SAFETY CHECK, AND THE TAGGED
+    /// [`GenValue`] DISCHARGES IT. The reference can only retag `lhs` while its union member is dead,
+    /// because writing the other member of a live union is what it has no way to do safely; assigning
+    /// one Rust enum value replaces tag and payload together, so every kind pair lands on the same
+    /// result the reference produces for the pairs it permits.
+    pub(crate) fn copy_to(&self, lhs: &mut SetDstGenValueLxlu) {
+        lhs.op = self.op.clone();
+        lhs.gen_value = self.gen_value;
+    }
+
+    /// Replaces: e200_print
+    ///
+    /// Renders the GenValue as the pass's `-debug-only=set-send-dst-re` dump does, delegating the
+    /// value itself to the simple or composite form.
+    pub(crate) fn print(&self, out: &mut String) {
+        match self.gen_value {
+            GenValue::Unknown => out.push_str("(GenValue: Unknown)"),
+            GenValue::Simple(simple) => {
+                out.push_str("kSimple:");
+                simple.print(out);
+            }
+            GenValue::Composite(composite) => {
+                out.push_str("kComposite:");
+                composite.print(out);
+            }
+        }
+        if self.is_optimized {
+            out.push_str(" - optimized!");
+        }
+        if self.is_dead {
+            out.push_str(" - dead!");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{GenValue, SendDestination, SetDstGenValueLxlu};
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::transform::sentient::set_send_destination_re::QueryMapOp;
+
+    /// `sentient.set_send_dst`'s stand-in — whatever op the GenValue points at.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// A GenValue with both base flags set.
+    fn flagged(value: SetDstGenValueLxlu) -> SetDstGenValueLxlu {
+        SetDstGenValueLxlu {
+            is_optimized: true,
+            is_dead: true,
+            ..value
+        }
+    }
+
+    /// e198 — the kind's own value decides, the flags do not, and an unknown matches nothing.
+    #[test]
+    fn e198_compares_within_a_kind_and_never_across_or_from_unknown() {
+        let pt = SetDstGenValueLxlu::simple(SendDestination::Pt, nop());
+        assert!(
+            flagged(pt.clone()).is_equal(&pt),
+            "the flags must not count"
+        );
+        assert!(!pt.is_equal(&SetDstGenValueLxlu::simple(SendDestination::Sfp, nop())));
+
+        let qmap = SetDstGenValueLxlu::composite(QueryMapOp::of(Val(7), Val(3), Val(4)), nop());
+        assert!(qmap.is_equal(&qmap));
+        assert!(!qmap.is_equal(&pt), "simple against composite is false");
+
+        // ⛔ Unlike the implicit-sync twin, two unknowns are NOT equal.
+        let unknown = SetDstGenValueLxlu::unknown();
+        assert!(!unknown.is_equal(&unknown));
+    }
+
+    /// e199 — the value and `op_` travel; `is_optimized_` and `is_dead_` stay behind.
+    #[test]
+    fn e199_copies_the_value_and_op_but_not_the_flags() {
+        let source = flagged(SetDstGenValueLxlu::simple(SendDestination::L0su, nop()));
+        let mut target = SetDstGenValueLxlu::unknown();
+
+        source.copy_to(&mut target);
+
+        assert!(matches!(target.gen_value(), GenValue::Simple(_)));
+        assert!(target.is_equal(&SetDstGenValueLxlu::simple(SendDestination::L0su, nop())));
+        assert_eq!(target.op(), Some(&nop()));
+        assert!(!target.is_optimized, "is_optimized_ is not copied");
+        assert!(!target.is_dead, "is_dead_ is not copied");
+    }
+
+    /// e200 — each kind's prefix, the delegated value, and one suffix per flag.
+    #[test]
+    fn e200_prefixes_the_kind_and_appends_both_suffixes() {
+        let mut unknown = String::new();
+        flagged(SetDstGenValueLxlu::unknown()).print(&mut unknown);
+        assert_eq!(unknown, "(GenValue: Unknown) - optimized! - dead!");
+
+        let mut simple = String::new();
+        SetDstGenValueLxlu::simple(SendDestination::Pt, nop()).print(&mut simple);
+        assert_eq!(simple, "kSimple:(GenValue: PT)");
+
+        let mut composite = String::new();
+        SetDstGenValueLxlu::composite(QueryMapOp::of(Val(7), Val(3), Val(4)), nop())
+            .print(&mut composite);
+        assert_eq!(
+            composite,
+            "kComposite:%7 = uniform.query_map(map:%3, key:%4) : index"
+        );
+    }
+}

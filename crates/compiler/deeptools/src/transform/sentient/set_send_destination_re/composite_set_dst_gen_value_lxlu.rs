@@ -76,8 +76,44 @@
 //! |---|---|---|---|---|
 //! | `e202_print` | 202 | 0 | 1 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:413` |
 
+use super::QueryMapOp;
+
+/// `CompositeSetDstGenValueLXLU` (`SetSendDestinationRE.hpp:58`) — where an LXLU's sends go when the
+/// destination is per-unit and so comes out of a uniformization mapping.
+///
+/// ⛔ THE QUERY MAP IS NOT OPTIONAL. `isInitialized()` is `qmap_` (`:66`) and the default constructor
+/// takes `nullptr`, but the only constructor that ever produces one of these inside a GenValue
+/// `DT_CHECK(qmap)`s first (`:90`) — so the null state is [`super::set_dst_gen_value_lxlu::GenValue`]'s
+/// `Unknown` kind, not a null field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompositeSetDstGenValueLxlu {
+    qmap: QueryMapOp,
+}
+
+impl CompositeSetDstGenValueLxlu {
+    /// `CompositeSetDstGenValueLXLU(qmap)`.
+    #[must_use]
+    pub(crate) const fn of(qmap: QueryMapOp) -> CompositeSetDstGenValueLxlu {
+        CompositeSetDstGenValueLxlu { qmap }
+    }
+
+    /// `getQueryMap()` (`:69`).
+    #[must_use]
+    pub(crate) const fn query_map(self) -> QueryMapOp {
+        self.qmap
+    }
+
+    /// The body of `CompositeSetDstGenValueLXLU::print` (`SetSendDestinationRE.cpp:413`) — `OS
+    /// << qmap_`, which [`e200`](super::set_dst_gen_value_lxlu::SetDstGenValueLxlu::print) delegates
+    /// to.
+    ///
+    /// ⛔ THE ANCHOR BELOW IS ANOTHER BATCH'S — e202 belongs to the `SetMaskRE` batch, so its TODO
+    /// stands; that batch should attach `/// Replaces: e202_print` to THIS method.
+    pub(crate) fn print(self, out: &mut String) {
+        self.qmap.print(out);
+    }
+}
 
 // crustify:todo: e202_print
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:413  (1 body lines, level 0)
 //   original  : void CompositeSetDstGenValueLXLU::print(raw_ostream &OS) const
-

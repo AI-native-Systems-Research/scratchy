@@ -76,8 +76,54 @@
 //! |---|---|---|---|---|
 //! | `e207_print` | 207 | 0 | 1 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:509` |
 
+use super::QueryMapOp;
 
-// crustify:todo: e207_print
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:509  (1 body lines, level 0)
-//   original  : void CompositeSetDstGenValueSFP::print(raw_ostream &OS) const
+/// `CompositeSetDstGenValueSFP` (`SetSendDestinationRE.hpp:150`) — where an SFP's sends go when the
+/// destination is per-unit and so comes out of a uniformization mapping.
+///
+/// ⛔ THE QUERY MAP IS NOT OPTIONAL, for the same reason as its LXLU twin: `SetDstGenValueSFP(qmap,
+/// op)` `DT_CHECK(qmap)`s (`:182`), so the null `isInitialized()` state is
+/// [`super::set_dst_gen_value_sfp::GenValue`]'s `Unknown` kind rather than a null field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompositeSetDstGenValueSfp {
+    qmap: QueryMapOp,
+}
 
+impl CompositeSetDstGenValueSfp {
+    /// `CompositeSetDstGenValueSFP(qmap)`.
+    #[must_use]
+    pub(crate) const fn of(qmap: QueryMapOp) -> CompositeSetDstGenValueSfp {
+        CompositeSetDstGenValueSfp { qmap }
+    }
+
+    /// `getQueryMap()` (`:161`).
+    #[must_use]
+    pub(crate) const fn query_map(self) -> QueryMapOp {
+        self.qmap
+    }
+
+    /// Replaces: e207_print
+    ///
+    /// `OS << qmap_` — the composite GenValue prints as the query map op it holds.
+    ///
+    /// ⛔ THE WHOLE OPERATION, NOT ITS RESULT. MLIR's `operator<<(raw_ostream &, OpState)` prints the
+    /// op, so the dump carries `map:` and `key:` too; see [`QueryMapOp::print`].
+    pub(crate) fn print(self, out: &mut String) {
+        self.qmap.print(out);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::CompositeSetDstGenValueSfp;
+    use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::set_send_destination_re::QueryMapOp;
+
+    /// e207 — the query map op is streamed whole, on one line and with no newline of its own.
+    #[test]
+    fn e207_prints_the_query_map_operation() {
+        let mut out = String::new();
+        CompositeSetDstGenValueSfp::of(QueryMapOp::of(Val(7), Val(3), Val(4))).print(&mut out);
+        assert_eq!(out, "%7 = uniform.query_map(map:%3, key:%4) : index");
+    }
+}

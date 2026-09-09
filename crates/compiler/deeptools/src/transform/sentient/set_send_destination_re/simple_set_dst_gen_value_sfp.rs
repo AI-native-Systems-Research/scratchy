@@ -76,8 +76,56 @@
 //! |---|---|---|---|---|
 //! | `e206_print` | 206 | 0 | 4 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:501` |
 
+use crate::units::{Core, Corelet};
+
+/// `SimpleSetDstGenValueSFP` (`SetSendDestinationRE.hpp:126`) — WHICH OTHER SFP an SFP's sends go to,
+/// named by the core and corelet it sits on.
+///
+/// ⛔⛔ NEITHER ID IS OPTIONAL, AND THAT IS THE REFERENCE'S OWN `DT_CHECK`. The fields are
+/// `short core_id_ = -1, corelet_id_ = -1` with `isInitialized()` reading `>= 0` (`:129-133`), but the
+/// only constructor that puts one inside a GenValue asserts `core_id >= 0 && corelet_id >= 0`
+/// (`:186-189`) — so a REACHABLE simple SFP GenValue never holds a sentinel, and the `-1` state is
+/// [`super::set_dst_gen_value_sfp::GenValue`]'s `Unknown` kind instead. ⭐ [`Core`] and [`Corelet`]
+/// are arch-bounded, so an id past this machine's core count is also unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SimpleSetDstGenValueSfp {
+    core: Core,
+    corelet: Corelet,
+}
+
+impl SimpleSetDstGenValueSfp {
+    /// `SimpleSetDstGenValueSFP(core_id, corelet_id)`.
+    #[must_use]
+    pub(crate) const fn of(core: Core, corelet: Corelet) -> SimpleSetDstGenValueSfp {
+        SimpleSetDstGenValueSfp { core, corelet }
+    }
+
+    /// `getCoreId()` (`:135`).
+    #[must_use]
+    pub(crate) const fn core(self) -> Core {
+        self.core
+    }
+
+    /// `getCoreletId()` (`:137`).
+    #[must_use]
+    pub(crate) const fn corelet(self) -> Corelet {
+        self.corelet
+    }
+
+    /// The body of `SimpleSetDstGenValueSFP::print` (`SetSendDestinationRE.cpp:501`), which
+    /// [`e205`](super::set_dst_gen_value_sfp::SetDstGenValueSfp::print) delegates to.
+    ///
+    /// ⛔ THE ANCHOR BELOW IS ANOTHER BATCH'S — e206 is not in this worklist, so its TODO stands;
+    /// that batch should attach `/// Replaces: e206_print` to THIS method.
+    pub(crate) fn print(self, out: &mut String) {
+        out.push_str("(GenValue: core_id<");
+        out.push_str(&self.core.get().to_string());
+        out.push_str(">, corelet_id<");
+        out.push_str(&self.corelet.get().to_string());
+        out.push_str(">)");
+    }
+}
 
 // crustify:todo: e206_print
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:501  (4 body lines, level 0)
 //   original  : void SimpleSetDstGenValueSFP::print(raw_ostream &OS) const
-

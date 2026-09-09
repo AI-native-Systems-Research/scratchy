@@ -79,6 +79,18 @@
 //! | `e537_runOn` | 537 | 3 | 4 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:164` |
 //! | `e583_runOnOperation` | 583 | 4 | 5 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:169` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so the two GenValue families below are reachable
+// only from each other and their tests until `e583_runOnOperation` (level 4) lands. CI runs clippy
+// with `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH e583: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
+
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::dialects::uniform;
+use crate::islands::sentient::ProgramUnit;
+use crate::islands::sentient::dialects::Val;
+use crate::units::DfirUnit;
+
 pub(crate) mod composite_set_dst_gen_value_lxlu;
 pub(crate) mod composite_set_dst_gen_value_sfp;
 pub(crate) mod set_dst_gen_value_lxlu;
@@ -87,10 +99,93 @@ pub(crate) mod set_send_dst_rde_tree;
 pub(crate) mod simple_set_dst_gen_value_lxlu;
 pub(crate) mod simple_set_dst_gen_value_sfp;
 
+/// `SetDestREOptimizationMode` (`SetSendDestinationRE.hpp:23-27`) — WHICH SETTING THIS PROGRAM UNIT'S
+/// redundant `set_send_dst`s are about: the LXLU's `SETDSTMASK` or the SFP's `SETDEST`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SetDestReOptimizationMode {
+    /// `kUnknown` — the units are neither, and [`e195`](determine_optimization_mode)'s caller skips
+    /// the unit entirely (`SetSendDestinationRE.cpp:110-120`).
+    #[default]
+    Unknown,
+    /// `kOptimizeForLXLU`.
+    OptimizeForLxlu,
+    /// `kOptimizeForSFP`.
+    OptimizeForSfp,
+}
 
-// crustify:todo: e195_determineOptimizationMode
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:184  (22 body lines, level 0)
-//   original  : void determineOptimizationMode(dataflow::ProgramUnitOp unit)
+/// A `uniform::QueryMapOp` AS A COMPOSITE GEN VALUE HOLDS IT — the op the reference stores by handle,
+/// compares by identity and streams whole.
+///
+/// ⭐ THE THREE OPERANDS, NOT AN `Op` — `uniform::QueryMapOp` is a TYPED handle, so a composite
+/// GenValue cannot be holding any other op, and [`uniform::Op`] could be. Identity survives the
+/// change because the value minter gives every op a distinct [`Self::result`]
+/// ([`crate::islands::dataflow_ir::Values`]), so comparing results IS comparing handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryMapOp {
+    result: Val,
+    map: Val,
+    key: Val,
+}
+
+impl QueryMapOp {
+    /// The op that binds `result` by reading `map` at `key`.
+    #[must_use]
+    pub(crate) const fn of(result: Val, map: Val, key: Val) -> QueryMapOp {
+        QueryMapOp { result, map, key }
+    }
+
+    /// `getMap()` — the `uniform.def_immutable_mapping` being read.
+    #[must_use]
+    pub(crate) const fn map(self) -> Val {
+        self.map
+    }
+
+    /// `getKey()` — which unit's value to read.
+    #[must_use]
+    pub(crate) const fn key(self) -> Val {
+        self.key
+    }
+
+    /// `OS << qmap_` — MLIR's `operator<<(raw_ostream &, OpState)`, which prints the whole operation.
+    ///
+    /// ⛔ NO TRAILING NEWLINE. [`uniform::emit`] writes one because it renders a line of a module;
+    /// streaming an op into a debug dump does not, and the reference's callers add their own.
+    pub(crate) fn print(self, out: &mut String) {
+        let mut line = String::new();
+        uniform::emit(
+            &mut line,
+            &uniform::Op::QueryMap {
+                result: self.result,
+                map: self.map,
+                key: self.key,
+            },
+            0,
+        );
+        out.push_str(line.trim_end_matches('\n'));
+    }
+}
+
+/// Replaces: e195_determineOptimizationMode
+///
+/// Which setting to optimize is decided by the kind of unit the program unit runs on.
+///
+/// ⛔⛔ `DT_CHECK_MSG(!(all_lxlu && all_sfp), "it cannot be that all units are both lxlu and sfp")`
+/// IS A TYPE GUARD HERE, NOT A CHECK. [`crate::islands::dataflow_ir::Units`] is constructed BY kind
+/// and is non-empty, so a unit list cannot be all-`lxlu` and all-`sfp` at once, and neither
+/// `llvm::all_of` has anything left to scan — one `kind()` answers both.
+///
+/// ⭐ AND THE REFERENCE'S EMPTY-LIST CASE GOES WITH IT: two vacuous `all_of`s would both be true and
+/// abort, which `Units` having a `head` makes unreachable rather than latent.
+#[must_use]
+pub(crate) fn determine_optimization_mode<A: Arch>(
+    unit: &ProgramUnit<A>,
+) -> SetDestReOptimizationMode {
+    match unit.on.kind() {
+        DfirUnit::Lxlu => SetDestReOptimizationMode::OptimizeForLxlu,
+        DfirUnit::Sfp => SetDestReOptimizationMode::OptimizeForSfp,
+        _ => SetDestReOptimizationMode::Unknown,
+    }
+}
 
 // crustify:todo: e475_runOn
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:109  (54 body lines, level 2)
@@ -107,3 +202,40 @@ pub(crate) mod simple_set_dst_gen_value_sfp;
 //   original  : void runOnOperation()
 //   calls     : e475_runOn, e537_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{SetDestReOptimizationMode, determine_optimization_mode};
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::sentient::ProgramUnit;
+    use crate::islands::sentient::dialects::Val;
+    use crate::units::DfirUnit;
+
+    /// A program unit bound to one unit of `kind`.
+    fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
+        ProgramUnit::<Dd2> {
+            on: Units::one(kind, Val(0)),
+            precision: None,
+            body: Vec::new(),
+            arch: core::marker::PhantomData,
+        }
+    }
+
+    /// e195 — `lxlu` and `sfp` each pick their own setting and everything else is unknown.
+    #[test]
+    fn e195_reads_the_optimization_mode_off_the_unit_kind() {
+        assert_eq!(
+            determine_optimization_mode(&unit_on(DfirUnit::Lxlu)),
+            SetDestReOptimizationMode::OptimizeForLxlu
+        );
+        assert_eq!(
+            determine_optimization_mode(&unit_on(DfirUnit::Sfp)),
+            SetDestReOptimizationMode::OptimizeForSfp
+        );
+        // `else opt_mode_ = kUnknown` — the caller then skips the unit.
+        assert_eq!(
+            determine_optimization_mode(&unit_on(DfirUnit::L3lu)),
+            SetDestReOptimizationMode::Unknown
+        );
+    }
+}

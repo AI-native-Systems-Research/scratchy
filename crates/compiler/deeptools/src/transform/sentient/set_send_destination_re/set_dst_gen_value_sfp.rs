@@ -78,16 +78,285 @@
 //! | `e204_copyTo` | 204 | 0 | 23 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:454` |
 //! | `e205_print` | 205 | 0 | 19 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:478` |
 
+use super::QueryMapOp;
+use super::composite_set_dst_gen_value_sfp::CompositeSetDstGenValueSfp;
+use super::simple_set_dst_gen_value_sfp::SimpleSetDstGenValueSfp;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, uniform_mapping_keys, uniform_mapping_values,
+};
+use crate::units::{Core, Corelet};
 
-// crustify:todo: e203_isEqual
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:418  (35 body lines, level 0)
-//   original  : bool SetDstGenValueSFP::isEqual(const DataFlowDefinitionBase &rhs) const
+/// `SetDstGenValueSFP::Kind` AND ITS `union GenValue` AS ONE VALUE
+/// (`SetSendDestinationRE.hpp:170-174,203-212`) — see
+/// [`super::set_dst_gen_value_lxlu::GenValue`] for why the tag and the union are one thing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GenValue {
+    /// `kUnknown` — the most pessimistic mode, and the default-constructed value.
+    #[default]
+    Unknown,
+    /// `kSimple` — the destination is a `dataflow.get_unit`, i.e. one core and corelet.
+    Simple(SimpleSetDstGenValueSfp),
+    /// `kComposite` — the destination comes out of a `uniform.query_map`.
+    Composite(CompositeSetDstGenValueSfp),
+}
 
-// crustify:todo: e204_copyTo
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:454  (23 body lines, level 0)
-//   original  : void SetDstGenValueSFP::copyTo(DataFlowDefinitionBase &lhs) const
+/// `SetDstGenValueSFP` (`SetSendDestinationRE.hpp:167`) — the dataflow definition an RDE node
+/// generates when this pass is optimizing the SFP's `SETDEST`.
+///
+/// ⭐ THE BASE CLASS'S THREE FIELDS ARE HELD HERE, for the reason
+/// [`super::set_dst_gen_value_lxlu::SetDstGenValueLxlu`] records.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetDstGenValueSfp {
+    gen_value: GenValue,
+    /// `op_` — absent for the default-constructed unknown value.
+    op: Option<Op>,
+    /// `is_optimized_`; nothing in scope sets it yet.
+    is_optimized: bool,
+    /// `is_dead_`.
+    is_dead: bool,
+}
 
-// crustify:todo: e205_print
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:478  (19 body lines, level 0)
-//   original  : void SetDstGenValueSFP::print(raw_ostream &OS) const
+impl SetDstGenValueSfp {
+    /// `SetDstGenValueSFP()` — the unknown value.
+    #[must_use]
+    pub(crate) fn unknown() -> SetDstGenValueSfp {
+        SetDstGenValueSfp::default()
+    }
 
+    /// `SetDstGenValueSFP(core_id, corelet_id, op)` (`:186`).
+    #[must_use]
+    pub(crate) fn simple(core: Core, corelet: Corelet, op: Op) -> SetDstGenValueSfp {
+        SetDstGenValueSfp {
+            gen_value: GenValue::Simple(SimpleSetDstGenValueSfp::of(core, corelet)),
+            op: Some(op),
+            is_optimized: false,
+            is_dead: false,
+        }
+    }
+
+    /// `SetDstGenValueSFP(qmap, op)` (`:180`).
+    #[must_use]
+    pub(crate) fn composite(qmap: QueryMapOp, op: Op) -> SetDstGenValueSfp {
+        SetDstGenValueSfp {
+            gen_value: GenValue::Composite(CompositeSetDstGenValueSfp::of(qmap)),
+            op: Some(op),
+            is_optimized: false,
+            is_dead: false,
+        }
+    }
+
+    /// `isUnknownValue()` — `!isSimple() && !isComposite()` (`:198-200`).
+    #[must_use]
+    pub(crate) const fn is_unknown_value(&self) -> bool {
+        matches!(self.gen_value, GenValue::Unknown)
+    }
+
+    /// What it generates.
+    #[must_use]
+    pub(crate) const fn gen_value(&self) -> GenValue {
+        self.gen_value
+    }
+
+    /// `getOperation()`.
+    #[must_use]
+    pub(crate) const fn op(&self) -> Option<&Op> {
+        self.op.as_ref()
+    }
+
+    /// Replaces: e203_isEqual
+    ///
+    /// Two SFP GenValues are equal when both are known, of the same kind, and agree on that kind's
+    /// value — the destination core AND corelet, or the query map.
+    ///
+    /// ⭐⭐ THE COMPOSITE CASE HAS A SECOND CHANCE THE LXLU TWIN DOES NOT: two DIFFERENT
+    /// `uniform.query_map` ops are still equal when they resolve to the same key list and the same
+    /// value list (`SetSendDestinationRE.cpp:437-448`), which is why `defs` is a parameter here.
+    /// ⛔ THE ORDER OF BOTH LISTS COUNTS — the reference's own todo says so; positional equality is
+    /// the contract, not set equality.
+    ///
+    /// ⛔ AN UNKNOWN IS EQUAL TO NOTHING, `is_optimized`/`is_dead`/`op_` are left out, and the
+    /// `dynamic_cast`'s `DT_CHECK_MSG` became the parameter type — as for e198.
+    #[must_use]
+    pub(crate) fn is_equal(&self, rhs: &SetDstGenValueSfp, defs: Definitions<'_>) -> bool {
+        match (self.gen_value, rhs.gen_value) {
+            (GenValue::Unknown, _) | (_, GenValue::Unknown) => false,
+            (GenValue::Simple(lhs), GenValue::Simple(rhs)) => {
+                lhs.core() == rhs.core() && lhs.corelet() == rhs.corelet()
+            }
+            (GenValue::Composite(lhs), GenValue::Composite(rhs)) => {
+                let (lhs, rhs) = (lhs.query_map(), rhs.query_map());
+                lhs == rhs
+                    || (uniform_mapping_keys(lhs.key(), defs)
+                        == uniform_mapping_keys(rhs.key(), defs)
+                        && uniform_mapping_values(lhs.map(), lhs.key(), defs)
+                            == uniform_mapping_values(rhs.map(), rhs.key(), defs))
+            }
+            (GenValue::Simple(_), GenValue::Composite(_))
+            | (GenValue::Composite(_), GenValue::Simple(_)) => false,
+        }
+    }
+
+    /// Replaces: e204_copyTo
+    ///
+    /// Copies the generating operation and the generated value — both ids, for a simple one — onto
+    /// `lhs`, leaving its two flags alone.
+    ///
+    /// ⛔ THE FLAGS DO NOT TRAVEL, and `DT_CHECK_MSG(lhs_p->kind_ == Kind::kUnknown, "mixed mode
+    /// copying ...")` is discharged by the tagged [`GenValue`]: see e199, which this mirrors exactly.
+    pub(crate) fn copy_to(&self, lhs: &mut SetDstGenValueSfp) {
+        lhs.op = self.op.clone();
+        lhs.gen_value = self.gen_value;
+    }
+
+    /// Replaces: e205_print
+    ///
+    /// Renders the GenValue as the pass's `-debug-only=set-send-dst-re` dump does, delegating the
+    /// value itself to the simple or composite form.
+    pub(crate) fn print(&self, out: &mut String) {
+        match self.gen_value {
+            GenValue::Unknown => out.push_str("(GenValue: Unknown)"),
+            GenValue::Simple(simple) => {
+                out.push_str("kSimple:");
+                simple.print(out);
+            }
+            GenValue::Composite(composite) => {
+                out.push_str("kComposite:");
+                composite.print(out);
+            }
+        }
+        if self.is_optimized {
+            out.push_str(" - optimized!");
+        }
+        if self.is_dead {
+            out.push_str(" - dead!");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{GenValue, SetDstGenValueSfp, SimpleSetDstGenValueSfp};
+    use crate::islands::dataflow_ir::dialects::uniform;
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, dataflow, sentient};
+    use crate::transform::sentient::set_send_destination_re::QueryMapOp;
+    use crate::units::{Core, Corelet};
+
+    /// `sentient.set_send_dst`'s stand-in — whatever op the GenValue points at.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// Core 0's corelet 0, and core 0's corelet 1.
+    fn ids(corelet: u32) -> (Core, Corelet) {
+        (
+            Core::checked(0).expect("core 0"),
+            Corelet::checked(corelet).expect("a corelet of this arch"),
+        )
+    }
+
+    /// A GenValue with both base flags set.
+    fn flagged(value: SetDstGenValueSfp) -> SetDstGenValueSfp {
+        SetDstGenValueSfp {
+            is_optimized: true,
+            is_dead: true,
+            ..value
+        }
+    }
+
+    /// A scope binding `%0`/`%1` as `sfp` units and `%2`/`%3` as two mappings that answer alike.
+    fn scope() -> Vec<Op> {
+        let unit = |result| {
+            Op::Dataflow(dataflow::Op::GetUnit {
+                result,
+                residency: crate::units::Residency::Global,
+                unit: crate::units::DfirUnit::Sfp,
+                num_folds: None,
+            })
+        };
+        vec![
+            unit(Val(0)),
+            unit(Val(1)),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(2),
+                pairs: vec![(Val(0), Val(1))],
+            }),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(3),
+                pairs: vec![(Val(0), Val(1))],
+            }),
+        ]
+    }
+
+    /// e203 — both ids decide a simple pair, and two DIFFERENT query maps that resolve alike are
+    /// equal while an unknown matches nothing.
+    #[test]
+    fn e203_compares_both_ids_and_falls_back_to_the_resolved_key_and_value_lists() {
+        let body = scope();
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+
+        let (core, corelet) = ids(0);
+        let here = SetDstGenValueSfp::simple(core, corelet, nop());
+        assert!(
+            flagged(here.clone()).is_equal(&here, defs),
+            "flags must not count"
+        );
+        let (other_core, other_corelet) = ids(1);
+        assert!(!here.is_equal(
+            &SetDstGenValueSfp::simple(other_core, other_corelet, nop()),
+            defs
+        ));
+
+        // Distinct `query_map` ops over distinct mappings that hold the same pair: the identity test
+        // fails and the key/value lists carry it.
+        let via_2 = SetDstGenValueSfp::composite(QueryMapOp::of(Val(4), Val(2), Val(0)), nop());
+        let via_3 = SetDstGenValueSfp::composite(QueryMapOp::of(Val(5), Val(3), Val(0)), nop());
+        assert!(via_2.is_equal(&via_3, defs), "the resolved lists agree");
+        assert!(
+            !via_2.is_equal(&here, defs),
+            "composite against simple is false"
+        );
+
+        let unknown = SetDstGenValueSfp::unknown();
+        assert!(!unknown.is_equal(&unknown, defs));
+    }
+
+    /// e204 — both ids and `op_` travel; `is_optimized_` and `is_dead_` stay behind.
+    #[test]
+    fn e204_copies_both_ids_and_the_op_but_not_the_flags() {
+        let (core, corelet) = ids(1);
+        let source = flagged(SetDstGenValueSfp::simple(core, corelet, nop()));
+        let mut target = SetDstGenValueSfp::unknown();
+
+        source.copy_to(&mut target);
+
+        assert_eq!(
+            target.gen_value(),
+            GenValue::Simple(SimpleSetDstGenValueSfp::of(core, corelet))
+        );
+        assert_eq!(target.op(), Some(&nop()));
+        assert!(!target.is_optimized, "is_optimized_ is not copied");
+        assert!(!target.is_dead, "is_dead_ is not copied");
+    }
+
+    /// e205 — each kind's prefix, the delegated value, and one suffix per flag.
+    #[test]
+    fn e205_prefixes_the_kind_and_appends_both_suffixes() {
+        let mut unknown = String::new();
+        flagged(SetDstGenValueSfp::unknown()).print(&mut unknown);
+        assert_eq!(unknown, "(GenValue: Unknown) - optimized! - dead!");
+
+        let (core, corelet) = ids(1);
+        let mut simple = String::new();
+        SetDstGenValueSfp::simple(core, corelet, nop()).print(&mut simple);
+        assert_eq!(simple, "kSimple:(GenValue: core_id<0>, corelet_id<1>)");
+
+        let mut composite = String::new();
+        SetDstGenValueSfp::composite(QueryMapOp::of(Val(7), Val(3), Val(4)), nop())
+            .print(&mut composite);
+        assert_eq!(
+            composite,
+            "kComposite:%7 = uniform.query_map(map:%3, key:%4) : index"
+        );
+    }
+}

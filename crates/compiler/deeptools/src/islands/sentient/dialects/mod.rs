@@ -1297,6 +1297,29 @@ impl<'a> Definitions<'a> {
     }
 }
 
+/// THE UNITS ONE `uniform.query_map`'S KEY STANDS FOR — `dcc::uniform::utils::
+/// getListOfKeyOpsFromUniformMapping` (`dcc/src/Dialect/Uniform/Utils.cpp:151-192`).
+///
+/// ⭐ SPLIT OUT OF [`uniform_mapping_values`], WHICH IS THE REFERENCE'S OWN SHAPE: `getListOf
+/// ValueOpsFromUniformMapping` opens by calling this (`:194-197`), and entry 203 compares the two
+/// lists SEPARATELY — key lists first, then value lists — so the keys have to be reachable alone.
+///
+/// See [`uniform_mapping_values`] for the two traps this walk carries: a `dataflow.create_group` key
+/// expanding to its members, and the `dataflow.program_unit` region-argument arm being an island gap.
+#[must_use]
+pub fn uniform_mapping_keys(key: Val, defs: Definitions<'_>) -> Vec<Val> {
+    match defs.of(key) {
+        // `else if (auto unit = dyn_cast<GetUnitOp>(key.getDefiningOp())) key_vals.push_back(key);`
+        // — ⭐ THE KEY ITSELF, not the unit list of anything (`:187-190`).
+        Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => vec![key],
+        Some(_) => Vec::new(),
+        // No defining op: a block argument, so the parent op's unit list for that region.
+        None => defs
+            .uniform_region_of(key)
+            .map_or_else(Vec::new, |region| collect_unit_ops(&region.units, defs)),
+    }
+}
+
 /// THE VALUES ONE `uniform.query_map` CAN ANSWER WITH — `dcc::uniform::utils::
 /// getListOfValueOpsFromUniformMapping` (`dcc/src/Dialect/Uniform/Utils.cpp:194-202`).
 ///
@@ -1317,17 +1340,7 @@ impl<'a> Definitions<'a> {
 /// three parent forms matches (`:154-190`).
 #[must_use]
 pub fn uniform_mapping_values(map: Val, key: Val, defs: Definitions<'_>) -> Vec<Val> {
-    // `getListOfKeyOpsFromUniformMapping` (`Utils.cpp:151-192`).
-    let keys = match defs.of(key) {
-        // `else if (auto unit = dyn_cast<GetUnitOp>(key.getDefiningOp())) key_vals.push_back(key);`
-        // — ⭐ THE KEY ITSELF, not the unit list of anything (`:187-190`).
-        Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => vec![key],
-        Some(_) => Vec::new(),
-        // No defining op: a block argument, so the parent op's unit list for that region.
-        None => defs
-            .uniform_region_of(key)
-            .map_or_else(Vec::new, |region| collect_unit_ops(&region.units, defs)),
-    };
+    let keys = uniform_mapping_keys(key, defs);
     // `auto target_map = dyn_cast<DefImmutableMappingOp>(query_map_op.getMap().getDefiningOp());`
     let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
         return Vec::new();
