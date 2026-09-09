@@ -97,11 +97,6 @@
 // ── STILL SCHEDULED IN THIS FILE (levels 1..8) — anchors, not dead comments. ⛔ Do not delete one
 // you did not port; on bridge 2 that silently lost 149 of 384 functions.
 
-// crustify:todo: e317_checkDeltasOfOperands
-//   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:505  (79 body lines, level 1)
-//   original  : bool checkDeltasOfOperands(Window *cur_window, Operation &op_a, Operation &op_b, MatchedOp *matched_op)
-//   calls     : e080_getOperandKind, e083_computeValsIfDifferent
-
 // crustify:todo: e509_insertNextInstr
 //   authority : dcc/src/Transform/Sentient/LoopRolling.cpp:114  (15 body lines, level 3)
 //   original  : void insertNextInstr(Block::iterator instr)
@@ -671,6 +666,21 @@ pub(crate) fn is_increment_field(op: &Op, i: OperandIdx) -> bool {
     }
 }
 
+/// WHICH RESULT OF WHICH OP DEFINES A VALUE — `getDefiningOp()` paired with
+/// `cast<OpResult>(..).getResultNumber()`.
+///
+/// ⛔ NOT AN ANCHORED UNIT — the *mechanism* for reaching operands. [`Definitions`] answers with the
+/// `&Op`, and every handle a [`Window`] holds is an [`InstrPos`], so the walk is redone here to
+/// speak positions. `None` is a block argument.
+fn defining_result(val: Val, block: &[Op]) -> Option<(InstrPos, ResultNum)> {
+    block.iter().enumerate().find_map(|(at, op)| {
+        dialects::results(op)
+            .iter()
+            .position(|result| *result == val)
+            .map(|num| (InstrPos(at), ResultNum(num)))
+    })
+}
+
 /// THE `sentient.for` BEING BUILT — what `matchAndRoll` creates and [`LoopRollingManager::update_body`]
 /// fills.
 ///
@@ -830,6 +840,82 @@ impl LoopRollingManager {
             }
             _ => OperandDifference::Incomputable,
         }
+    }
+
+    /// Replaces: e317_checkDeltasOfOperands
+    ///
+    /// Whether every operand of `op_b` differs from `op_a`'s in exactly the way `matched_op` recorded
+    /// — the same kind, and for a constant stride the same delta.
+    ///
+    /// ⛔ THE WALK IS BACKWARDS (`:514`) and each slot is asked for its kind whether or not it
+    /// differs, so an unclassified operand is the loud `todo!` of [`MatchedOp::operand_kind`] rather
+    /// than a silent pass.
+    /// ⭐ THE `kFirstLastOpUsage` ARM IS THE ONLY ONE THAT NEEDS POSITIONS: it asks whether `op_a` IS
+    /// the window's first rollable op and whether `op_b`'s operand comes out of its last.
+    pub(crate) fn check_deltas_of_operands(
+        &self,
+        cur_window: &Window,
+        op_a: InstrPos,
+        op_b: InstrPos,
+        matched_op: &MatchedOp,
+        block: &[Op],
+        key_vals: &[Val],
+        defs: Definitions<'_>,
+    ) -> bool {
+        let a_operands = dialects::operands(&block[op_a.0]);
+        let b_operands = dialects::operands(&block[op_b.0]);
+        for i in (0..a_operands.len()).rev() {
+            let i = OperandIdx(i);
+            let a_operand = a_operands[i.0];
+            // The reference indexes `op_b` with `op_a`'s count unchecked; the two are equivalent ops
+            // by the time `compareToNextWindow` gets here, so a shorter `op_b` is not a state to
+            // classify.
+            let Some(b_operand) = b_operands.get(i.0).copied() else {
+                return false;
+            };
+            let operand_kind = matched_op.operand_kind(i);
+
+            if a_operand == b_operand {
+                if operand_kind != OperandKind::NoDelta {
+                    return false;
+                }
+                continue;
+            }
+
+            // `op_b` (the next window's first rollable op) reading one of this window's last
+            // rollable op's results.
+            if cur_window.first_rollable_op == Some(op_a) {
+                if let Some((at, res_num)) = defining_result(b_operand, block) {
+                    if cur_window.last_rollable_op == Some(at) {
+                        if operand_kind != OperandKind::FirstLastOpUsage
+                            || self.operand_to_result_num.get(&i) != Some(&res_num)
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            match LoopRollingManager::compute_vals_if_different(a_operand, b_operand, key_vals, defs)
+            {
+                OperandDifference::Delta(delta) if delta != Delta(0) => {
+                    if operand_kind != OperandKind::ConstValueDelta
+                        || matched_op.operand_deltas.get(&i) != Some(&delta)
+                    {
+                        return false;
+                    }
+                }
+                // `delta == 0`, and `Same` is the reference's "delta untouched" over its pre-set 0.
+                OperandDifference::Delta(_) | OperandDifference::Same => {
+                    if operand_kind != OperandKind::NoDelta {
+                        return false;
+                    }
+                }
+                OperandDifference::Incomputable => return false,
+            }
+        }
+        true
     }
 
     /// Replaces: e084_updateBody
@@ -1079,6 +1165,55 @@ mod unit_tests {
             LoopRollingManager::compute_vals_if_different(Val(9), Val(0), &[], defs),
             OperandDifference::Incomputable
         );
+    }
+
+    /// `e317_checkDeltasOfOperands` — the recorded stride is confirmed operand by operand, and one
+    /// wrong delta refuses the whole op.
+    #[test]
+    fn check_deltas_of_operands_confirms_the_recorded_stride() {
+        let block = vec![
+            scalar_constant(Val(0), 4),
+            scalar_constant(Val(1), 10),
+            add(Val(0), Val(9), Val(2)),
+            add(Val(1), Val(9), Val(3)),
+        ];
+        let regions: [&[Op]; 1] = [&block];
+        let defs = Definitions::from_innermost(&regions);
+        let manager = LoopRollingManager::over(
+            RollingCase::SingleInstrWindows,
+            NewLoopCount(0),
+            WindowIndex(0),
+            WindowIndex(2),
+        );
+        let window = Window::opening(RollingCase::SingleInstrWindows, InstrPos(2));
+        let mut matched_op = MatchedOp::of(InstrPos(2));
+        matched_op
+            .operand_kinds
+            .insert(OperandIdx(0), OperandKind::ConstValueDelta);
+        matched_op
+            .operand_kinds
+            .insert(OperandIdx(1), OperandKind::NoDelta);
+        matched_op.operand_deltas.insert(OperandIdx(0), Delta(6));
+        assert!(manager.check_deltas_of_operands(
+            &window,
+            InstrPos(2),
+            InstrPos(3),
+            &matched_op,
+            &block,
+            &[],
+            defs
+        ));
+        // The same pair against a stride of 7 is not the pair that was matched.
+        matched_op.operand_deltas.insert(OperandIdx(0), Delta(7));
+        assert!(!manager.check_deltas_of_operands(
+            &window,
+            InstrPos(2),
+            InstrPos(3),
+            &matched_op,
+            &block,
+            &[],
+            defs
+        ));
     }
 
     /// `e084_updateBody` — the end op moves into the loop reading `iter_arg`, the yield carries

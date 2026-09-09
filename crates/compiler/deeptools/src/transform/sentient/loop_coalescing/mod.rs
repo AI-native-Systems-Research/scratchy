@@ -85,6 +85,10 @@
 // with `-D warnings`. ⭐ REMOVE THIS WITH e445.
 #![allow(dead_code)]
 
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, use_count};
+use crate::transform::sentient::ForRef;
+use crate::transform::sentient::utils::{ConstKind, is_constant};
+
 /// A loop's trip count — `sentient.for`'s `$bound`, and what coalescing multiplies together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TripCount(pub i64);
@@ -190,17 +194,224 @@ mod unit_tests {
         ));
         assert!(!is_all_less_than_max(&[TripCount(65536)], TripLimit::LCCR));
     }
+
+    /// `sentient.scalar_constant` naming `result`.
+    fn constant(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.for` carrying exactly one value.
+    fn sentient_for(iv: Val, bound: Val, carried: sentient::Carried, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried: vec![carried],
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// One carried value, unassigned.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lrf,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// A two-deep perfect nest is a band of two, innermost last; a non-constant outer bound is a band
+    /// of NONE, because the dynamic-loop refusal (`:89-91`) precedes the push.
+    #[test]
+    fn e311_collects_the_perfect_nest_and_refuses_a_dynamic_outer_bound() {
+        let inner = sentient_for(
+            Val(20),
+            Val(2),
+            carried(Val(11), Val(21), Val(22)),
+            vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(21)],
+            })],
+        );
+        let outer = sentient_for(
+            Val(10),
+            Val(1),
+            carried(Val(0), Val(11), Val(12)),
+            vec![
+                inner,
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(22)],
+                }),
+            ],
+        );
+        let scope = vec![constant(Val(1), 8), constant(Val(2), 4), outer];
+        let root = &scope[2];
+        assert_eq!(
+            get_candidate_loops(root, &scope, MaxLoops::UNLIMITED),
+            [ForRef(Val(10)), ForRef(Val(20))]
+        );
+        assert_eq!(get_candidate_loops(root, &scope, MaxLoops(1)), [ForRef(Val(10))]);
+
+        let dynamic = vec![constant(Val(2), 4), scope[2].clone()];
+        assert!(get_candidate_loops(&dynamic[1], &dynamic, MaxLoops::UNLIMITED).is_empty());
+    }
+
+    /// `coalesceLoops`' own vectors (`:246-251`): a bound over one LCCR splits into an exact pair, one
+    /// under it keeps the pre-filled cofactor of `1`.
+    #[test]
+    fn e312_splits_only_the_bounds_over_one_lccr() {
+        let split = split_bounds(&[TripCount(65536 * 3), TripCount(7)]);
+        assert_eq!(split[1], SplitBound {
+            fitting: TripCount(7),
+            cofactor: TripCount(1)
+        });
+        assert!(split[0].fitting.0 <= TripLimit::LCCR.0);
+        assert_eq!(split[0].fitting.0 * split[0].cofactor.0, 65536 * 3);
+    }
 }
 
-// crustify:todo: e311_getCandidateLoops
-//   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:76  (56 body lines, level 1)
-//   original  : void getCandidateLoops( SmallVectorImpl<sentient::ForOp> &band_ForOps, sentient::ForOp root_ForOp, unsigned max_loops = std::numeric_limits<unsigned>::max())
-//   calls     : e252_size
+/// HOW MANY LOOPS OF A BAND TO COLLECT — the `max_loops` parameter (`:78`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaxLoops(pub usize);
 
-// crustify:todo: e312_splitBounds
-//   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:417  (10 body lines, level 1)
-//   original  : void LoopCoalescingPass::splitBounds(std::vector<int64_t> &new_bounds, std::vector<int64_t> &new_bounds0, std::vector<int64_t> &new_bounds1)
-//   calls     : e071_getLargestDivisor, e252_size
+impl MaxLoops {
+    /// `std::numeric_limits<unsigned>::max()` — the default, and what the one in-scope caller
+    /// (`:317`) takes: collect the whole band.
+    pub(crate) const UNLIMITED: Self = Self(usize::MAX);
+}
+
+/// The fields of one `sentient.for` the band walk reads — the parent pointers this island does not
+/// keep, supplied per step.
+struct ForView<'a> {
+    iv: Val,
+    bound: Val,
+    carried: &'a [sentient::Carried],
+    body: &'a [Op],
+}
+
+/// `dyn_cast<sentient::ForOp>(op)`.
+fn for_view(op: &Op) -> Option<ForView<'_>> {
+    let Op::Sentient(sentient::Op::For {
+        iv,
+        bound,
+        carried,
+        body,
+        ..
+    }) = op
+    else {
+        return None;
+    };
+    Some(ForView {
+        iv: *iv,
+        bound: *bound,
+        carried,
+        body,
+    })
+}
+
+/// Replaces: e311_getCandidateLoops
+///
+/// The perfectly nested band at `root`, outermost first: each loop's bound is constant, its induction
+/// variable unread, and its body one `sentient.for` plus the yield that returns that loop's results.
+///
+/// ⛔ TRAP: THE PUSH COMES BEFORE THE BODY CHECKS (`:99-102`), so the band's LAST entry is the loop
+/// that FAILED them — an unnested loop still yields a band of one, and it is the caller's
+/// `loops.size() > 1` (`:325`) that rejects it.
+///
+/// ⛔ TRAP: `hasOneUse() || use_empty()` on a region iter arg (`:126-128`) is `use_count(..) <= 1`,
+/// ONE PER USE — the single permitted use is the inner loop's matching iter operand, proved just above.
+pub(crate) fn get_candidate_loops(root: &Op, scope: &[Op], max_loops: MaxLoops) -> Vec<ForRef> {
+    let defs = Definitions::from_innermost(core::slice::from_ref(&scope));
+    let mut band = Vec::new();
+    let Some(mut root) = for_view(root) else {
+        return band;
+    };
+    // `int n_loop_carried_args = root_ForOp.getNumRegionIterArgs();` (`:79`).
+    let n_loop_carried_args = root.carried.len();
+    for _ in 0..max_loops.0 {
+        // The region-argument count `1 + n` and `getNumRegionIterArgs() != n` (`:83-87`) are ONE
+        // question at this rung: the body's arguments ARE `[iv, carried…]`.
+        if use_count(root.iv, root.body) != 0 || root.carried.len() != n_loop_carried_args {
+            return band;
+        }
+        if !is_constant(root.bound, ConstKind::ScalarConstant, defs) {
+            return band;
+        }
+        band.push(ForRef(root.iv));
+        if root.body.len() != 2 {
+            return band;
+        }
+        let Some(Op::Sentient(sentient::Op::Yield { results: yielded })) = root.body.last() else {
+            return band;
+        };
+        let Some(inner) = root.body.first().and_then(for_view) else {
+            return band;
+        };
+        if inner.carried.len() != n_loop_carried_args {
+            return band;
+        }
+        for j in 0..n_loop_carried_args {
+            if inner.carried[j].init != root.carried[j].arg
+                || yielded.get(j) != Some(&inner.carried[j].result)
+                || use_count(root.carried[j].arg, root.body) > 1
+            {
+                return band;
+            }
+        }
+        root = inner;
+    }
+    band
+}
+
+/// ONE BOUND'S SPLIT — `new_bounds0[i]` and `new_bounds1[i]`, the two loops `coalesceLoops` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SplitBound {
+    /// `new_bounds0[i]` — a divisor of the bound that fits one LCCR.
+    pub(crate) fitting: TripCount,
+    /// `new_bounds1[i]` — the exact cofactor.
+    pub(crate) cofactor: TripCount,
+}
+
+/// Replaces: e312_splitBounds
+///
+/// Splits every bound wider than one LCCR into a divisor that fits and its exact cofactor.
+///
+/// ⛔ TRAP: THE `else` BRANCH NEVER WRITES `new_bounds1[i]` (`:423`), so the cofactor there is the
+/// `1` the caller pre-filled the vector with (`:246-251`) — an unsplit bound coalesces as `n * 1`,
+/// not as `n * 0`.
+pub(crate) fn split_bounds(new_bounds: &[TripCount]) -> Vec<SplitBound> {
+    new_bounds
+        .iter()
+        .map(|bound| {
+            if bound.0 <= TripLimit::LCCR.0 {
+                return SplitBound {
+                    fitting: *bound,
+                    cofactor: TripCount(1),
+                };
+            }
+            match get_largest_divisor(*bound, TripLimit::LCCR) {
+                LargestDivisor::Fits(fitting) => SplitBound {
+                    fitting,
+                    cofactor: TripCount(bound.0 / fitting.0),
+                },
+                LargestDivisor::NoSmallPrimeFactor(_) => {
+                    todo!("DT_ERROR(\"No valid prime factor but input still too large!\") (`:400`)")
+                }
+            }
+        })
+        .collect()
+}
 
 // crustify:todo: e445_coalesceLoops
 //   authority : dcc/src/Transform/Sentient/LoopCoalescing.cpp:135  (165 body lines, level 2)
