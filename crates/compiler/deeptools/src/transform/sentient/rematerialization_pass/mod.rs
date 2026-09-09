@@ -87,6 +87,7 @@
 #![allow(dead_code)]
 
 use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, use_count};
+use crate::transform::sentient::utils::{self, ConstKind};
 
 /// A VALUE SOME ENCLOSING REGION BINDS AS A RESULT — `DT_CHECK_MSG(!isa<BlockArgument>(v), "Function
 /// should not be called on an iter arg")` (`:83-84`) AS THE PARAMETER TYPE.
@@ -196,10 +197,50 @@ pub fn last_use_within_block(v: Defined, block: &[Op]) -> Option<InBlock> {
         .map(InBlock::at)
 }
 
-// crustify:todo: e353_increasesOperandLiverange
-//   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:109  (52 body lines, level 1)
-//   original  : bool RematerializationPass::increasesOperandLiverange(Operation *op, Operation *user)
-//   calls     : e146_getLastUseWithinBlock
+/// Replaces: e353_increasesOperandLiverange
+///
+/// Whether cloning `op` in front of `user` would keep one of its operands alive longer: it would if
+/// `op` has no non-constant operand at all, or if `user` sits after such an operand's last use in the
+/// block (`:109-161`).
+///
+/// ⛔⛔ `DominanceInfo` AND `findAncestorOpInBlock` ARE BOTH IN THE SIGNATURE, NOT THE BODY: `user` is
+/// already the ancestor of the user within `op`'s own block ([`InBlock`]), and dominance between two
+/// ops of ONE block is `user <= last_use`.
+/// ⛔ TRAP: NO NON-CONSTANT OPERAND IS `true` (`:130`), not `false` — the reference's *"if any
+/// non-constant operands have no uses, then rematerialization would extend their live range"*.
+/// ⛔ TRAP: THE CONSTANT TEST HERE IS THE QUERY-MAP-AWARE `dcc::utils::isConstant<sentient::ConstantOp>`
+/// (`Utils/Utils.cpp:424`), NOT the raw `isa` of [`is_candidate_for_rematerialization`].
+/// ⛔ A REGION-ARGUMENT OPERAND IS SKIPPED rather than checked ([`Defined`] is the `!isa<BlockArgument>`
+/// guard), and `DT_CHECK_MSG(operand_last_use, "Op itself is a use of its operands")` (`:154`) — which
+/// cannot fire while `op` is in `block` — takes the conservative "extends" arm instead of aborting.
+#[must_use]
+pub fn increases_operand_liverange(
+    op: &Op,
+    user: InBlock,
+    block: &[Op],
+    defs: Definitions<'_>,
+) -> bool {
+    let operands: Vec<Val> = match op {
+        Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => vec![*input],
+        Op::Sentient(
+            sentient::Op::ScalarAdd { lhs, rhs, .. } | sentient::Op::ScalarSub { lhs, rhs, .. },
+        ) => vec![*lhs, *rhs],
+        // Every other op queues nothing, so the `empty()` arm below answers for it.
+        _ => Vec::new(),
+    };
+    let to_check: Vec<Val> = operands
+        .into_iter()
+        .filter(|val| !utils::is_constant(*val, ConstKind::ScalarConstant, defs))
+        .collect();
+    if to_check.is_empty() {
+        return true;
+    }
+    to_check.into_iter().any(|val| {
+        Defined::of(val, defs).is_some_and(|defined| {
+            last_use_within_block(defined, block).is_none_or(|last_use| user > last_use)
+        })
+    })
+}
 
 // crustify:todo: e464_runOn
 //   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:175  (42 body lines, level 2)
@@ -213,7 +254,10 @@ pub fn last_use_within_block(v: Defined, block: &[Op]) -> Option<InBlock> {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{Defined, InBlock, is_candidate_for_rematerialization, last_use_within_block};
+    use super::{
+        Defined, InBlock, increases_operand_liverange, is_candidate_for_rematerialization,
+        last_use_within_block,
+    };
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 
@@ -290,6 +334,45 @@ mod unit_tests {
             program_header: false,
             element_size: None,
         }
+    }
+
+    /// `e353` — the vendor's own scenario: the operand's last use decides, and an all-constant op
+    /// extends nothing to nowhere and so answers `true`.
+    #[test]
+    fn a_user_past_the_operands_last_use_extends_that_operands_liverange() {
+        let (c1, m, a, later) = (Val(0), Val(1), Val(2), Val(3));
+        let block = vec![
+            constant(c1),
+            mul(c1, c1, m),  // 0: the non-constant operand's definition
+            add(m, c1, a),   // 1: the op under test  (block index 2)
+            copy(m, later),  // 3: the operand's LAST use
+            copy(a, Val(4)), // 4: the user
+        ];
+        let scope: [&[Op]; 1] = [block.as_slice()];
+        let defs = Definitions::from_innermost(&scope);
+        let op = &block[2];
+
+        // The user is after `%1`'s last use, so cloning there keeps `%1` alive longer.
+        assert!(increases_operand_liverange(
+            op,
+            InBlock::at(4),
+            &block,
+            defs
+        ));
+        // A user at or before that last use does not.
+        assert!(!increases_operand_liverange(
+            op,
+            InBlock::at(3),
+            &block,
+            defs
+        ));
+        // ⛔ AN OP WITH NO NON-CONSTANT OPERAND ANSWERS `true`.
+        assert!(increases_operand_liverange(
+            &copy(c1, Val(5)),
+            InBlock::at(0),
+            &block,
+            defs
+        ));
     }
 
     /// The three candidate shapes and the three declines, including the `scalar_copy` of an iter arg

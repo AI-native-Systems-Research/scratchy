@@ -1176,6 +1176,113 @@ pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
     }
 }
 
+/// WRITE THE REGISTER FILE A VALUE LIVES IN — the write twin of [`value_reg_locale`], against ONE op.
+///
+/// ⭐ PER-OP RATHER THAN SCOPE-RECURSIVE, UNLIKE [`set_value_reg_index`]: the reference writes locales
+/// from a `walk<PreOrder>` that already holds the op (`RegisterTypeAssignment.cpp:441-483`), so a
+/// second value-keyed search of the whole unit per position would be quadratic and buys nothing.
+///
+/// ⛔ AN OP WITH NO [`sentient::Reg`] AT THAT POSITION IS A NO-OP, not a refusal — the `_` arm is
+/// exactly the set of ops whose `regLocales` array the reference materialises and no reader of this
+/// island asks for, `sentient.mac` (positional) and `dataflow.get_unit` among them.
+pub fn set_reg_locale_on(op: &mut Op, val: Val, locale: sentient::RegType) {
+    match op {
+        // ⭐ ONE ENTRY FOR THE ARGUMENT AND THE RESULT, where the reference has `[i + 1]` and
+        // `[i + numRegionIterArgs + 1]` of one `1 + 2n` array — see [`sentient::Carried`].
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound_reg,
+            carried,
+            ..
+        }) => {
+            // ⭐ ENTRY 0 IS THE INDUCTION VARIABLE'S, exactly as [`set_reg_index_on`] writes it, and
+            // an absent array is minted here with its index still unassigned.
+            if *iv == val {
+                *bound_reg = Some(sentient::Reg {
+                    locale,
+                    index: bound_reg.and_then(|reg| reg.index),
+                });
+            }
+            for value in carried.iter_mut() {
+                if value.arg == val || value.result == val {
+                    value.reg.locale = locale;
+                }
+            }
+        }
+        Op::Sentient(sentient::Op::If { yielded, .. }) => {
+            for value in yielded.iter_mut() {
+                if value.result == val {
+                    value.reg.locale = locale;
+                }
+            }
+        }
+        Op::Sentient(
+            sentient::Op::LoadAndSend { result, reg, .. }
+            | sentient::Op::ReceiveAndStore { result, reg, .. }
+            | sentient::Op::LoadComputeAndSend { result, reg, .. }
+            | sentient::Op::ScalarCopy { result, reg, .. }
+            | sentient::Op::ReceiveAndExtractScalar { result, reg, .. },
+        ) => {
+            if *result == val {
+                reg.locale = locale;
+            }
+        }
+        Op::Sentient(sentient::Op::LoadAndStore {
+            results,
+            src_reg,
+            dst_reg,
+            ..
+        }) => {
+            if results.0 == val {
+                src_reg.locale = locale;
+            }
+            if results.1 == val {
+                dst_reg.locale = locale;
+            }
+        }
+        Op::Sentient(sentient::Op::LoadAndExtractScalar {
+            addr_result,
+            data_result,
+            addr_reg,
+            data_reg,
+            ..
+        }) => {
+            if *addr_result == val {
+                addr_reg.locale = locale;
+            }
+            if *data_result == val {
+                data_reg.locale = locale;
+            }
+        }
+        Op::Sentient(sentient::Op::ScalarConstant {
+            result, reg_locale, ..
+        }) => {
+            if *result == val {
+                *reg_locale = locale;
+            }
+        }
+        // ⭐ THE REFERENCE CREATES THE ATTRIBUTE WHERE NONE STOOD, so an absent `reg` becomes one
+        // whose index is still unassigned.
+        Op::Sentient(
+            sentient::Op::ScalarAdd { result, reg, .. }
+            | sentient::Op::ScalarSub { result, reg, .. },
+        ) => {
+            if *result == val {
+                match reg {
+                    Some(reg) => reg.locale = locale,
+                    None => {
+                        *reg = Some(sentient::Reg {
+                            locale,
+                            index: None,
+                        })
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// WRITE THE REGISTER INDEX A VALUE LIVES IN — `sentient::setValueRegIndex`
 /// (`dcc/src/Dialect/Sentient/SentientOps.cpp:1982`), the write twin of [`value_reg_locale`].
 ///

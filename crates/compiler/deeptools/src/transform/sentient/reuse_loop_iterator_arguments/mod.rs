@@ -85,14 +85,20 @@
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
 // file's own tests until `e355_runOnOperation` lands and something calls it. CI runs clippy with
 // `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e355_runOnOperation`: at that point an unused item here is a real defect again.
+// ⭐ REMOVE THIS WITH `e634_runOn`, NOT WITH `e355_runOnOperation`: this module is `pub(crate) mod`
+// and e355 is the pass ENTRY, so filling it adds no caller — the first real caller of anything here is
+// e634, which is what `run_on_unit` still `todo!`s.
 #![allow(dead_code)]
 
 use crate::arch::Arch;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::{Program, ProgramUnit};
 use crate::model::Model;
+use crate::transform::sentient::analyses::{Liveness, PropagationAnalysis};
 use crate::workload::Workload;
+
+/// `-dcc-reuse-loop-iterator-arguments-disable`, `cl::init(false)` (`:57-60`).
+const DISABLE_THIS_PASS: bool = false;
 
 /// Replaces: e147_runOn
 ///
@@ -282,20 +288,106 @@ fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Va
     }
 }
 
-// crustify:todo: e355_runOnOperation
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:102  (5 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e147_runOn
+/// Replaces: e355_runOnOperation
+///
+/// The pass entry: unless [`DISABLE_THIS_PASS`] is set, run [`run_on_program`] over the module.
+///
+/// ⛔ A THIRD NAME FOR A THIRD ENTRY: `runOnOperation`, `runOn(ModuleOp)` (e147) and
+/// `runOn(dataflow::ProgramUnitOp)` (e634) are three members of one class, and only C++ overloading
+/// lets two of them share a spelling.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if !DISABLE_THIS_PASS {
+        run_on_program(program);
+    }
+}
 
-// crustify:todo: e356_reuseIdenticalIterArgs
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:345  (64 body lines, level 1)
-//   original  : void ReuseLoopIteratorArgumentsPass::reuseIdenticalIterArgs( sentient::ForOp for_op, PropagationAnalysis &expr_prop_analysis)
-//   calls     : e252_size
+/// Replaces: e356_reuseIdenticalIterArgs
+///
+/// Groups the loop's iterator arguments by identical affine expression — same register locale, same
+/// element size, and `areExpressionsSame` — then points every use of a non-head argument at its
+/// group's head (`:345-409`).
+///
+/// ⛔ THE EFFECT IS THE `replaceAllUsesWith`, and only `body` is rewritten: the `carried` list keeps
+/// every slot, which is what e634's later rounds and the loop's own signature still read.
+/// ⛔ TRAP: THE SCAN IS OVER HEADS ONLY, in index order, so the LOWEST index of a group is its head
+/// and the grouping is deterministic where the reference's `unordered_map` is not.
+/// ⛔ `locales[i + 1]` AND `element_sizes[i + 1]` ARE `carried[i]` HERE: the `+1` skips the induction
+/// variable's slot of the reference's `1 + 2n` arrays, which [`sentient::Carried`] does not carry —
+/// and that also discharges its `DT_CHECK(getRegLocales().size() == 2 * n_iter_args + 1)` (`:352`).
+/// ⚠️ `if (!locales || !element_sizes) return;` (`:351`) IS DROPPED AS INEXPRESSIBLE: a
+/// [`sentient::Carried`] always has both, and in the shipped pipeline both attributes are always
+/// present by the time this pass runs (`dcc-standalone-main.cpp:318` assigns the locales).
+pub fn reuse_identical_iter_args(
+    body: &mut [Op],
+    carried: &[sentient::Carried],
+    expr_prop_analysis: &mut impl PropagationAnalysis,
+) {
+    let n_iter_args = carried.len();
+    if n_iter_args == 0 {
+        return;
+    }
+    let mut head: Vec<usize> = (0..n_iter_args).collect();
+    for curr_iter in 0..n_iter_args {
+        if head[curr_iter] != curr_iter {
+            continue;
+        }
+        for next_iter in (curr_iter + 1)..n_iter_args {
+            if head[next_iter] != next_iter
+                || carried[curr_iter].reg.locale != carried[next_iter].reg.locale
+                || carried[curr_iter].element_size != carried[next_iter].element_size
+            {
+                continue;
+            }
+            if expr_prop_analysis
+                .are_expressions_same(carried[curr_iter].arg, carried[next_iter].arg)
+            {
+                head[next_iter] = curr_iter;
+            }
+        }
+    }
+    for curr_iter in 0..n_iter_args {
+        if head[curr_iter] == curr_iter {
+            continue;
+        }
+        dialects::replace_all_uses_with(body, carried[curr_iter].arg, carried[head[curr_iter]].arg);
+    }
+}
 
-// crustify:todo: e357_areUsersLiverangesOverlapping
-//   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:458  (23 body lines, level 1)
-//   original  : bool ReuseLoopIteratorArgumentsPass::areUsersLiverangesOverlapping( BlockArgument iter_arg1, BlockArgument iter_arg2, const Liveness &liveness) const
-//   calls     : e148_collectResultsOfNonYieldFeedingUsers
+/// Replaces: e357_areUsersLiverangesOverlapping
+///
+/// Whether any non-yield-feeding user of the first iterator argument and any of the second hold values
+/// that are live at once — in which case replacing one argument by the other plus an offset would add a
+/// `scalar_add` without saving a register (`:458-482`).
+///
+/// ⛔ TWO RESULTS OF ONE OP OVERLAP BY CONSTRUCTION, and that is checked before the analysis
+/// (`:477-478`): [`dialects::defining_op`] is recursive, so the op that binds one result is found
+/// wherever it sits and asked whether it binds the other too.
+/// ⛔ `Liveness::isLiveRangeOverlaps` IS OUT OF CAMPAIGN SCOPE — see
+/// [`crate::transform::sentient::analyses::Liveness`]; it is a parameter so that the cross product,
+/// the early exit and the same-op shortcut are all observable without it.
+#[must_use]
+pub fn are_users_liveranges_overlapping(
+    iter_arg1: IterArg,
+    iter_arg2: IterArg,
+    body: &[Op],
+    liveness: &impl Liveness,
+) -> bool {
+    let results1 = collect_results_of_non_yield_feeding_users(iter_arg1, body);
+    let results2 = collect_results_of_non_yield_feeding_users(iter_arg2, body);
+    for result1 in &results1 {
+        for result2 in &results2 {
+            if dialects::defining_op(*result1, body)
+                .is_some_and(|op| dialects::results(op).contains(result2))
+            {
+                return true;
+            }
+            if liveness.is_live_range_overlaps(*result1, *result2) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 // crustify:todo: e467_replaceCorrelatedIterArgsInEquivClass
 //   authority : dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:259  (81 body lines, level 2)
@@ -309,12 +401,16 @@ fn result_corresponding_to_operand_num(op: &Op, operand_num: usize) -> Option<Va
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{IterArg, collect_results_of_non_yield_feeding_users};
+    use super::{
+        IterArg, are_users_liveranges_overlapping, collect_results_of_non_yield_feeding_users,
+        reuse_identical_iter_args,
+    };
     use crate::arch::Elements;
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::sentient::StoreSource;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::transform::sentient::analyses::{Liveness, PropagationAnalysis};
 
     /// `%out = sentient.scalar_add %lhs, %rhs : index`.
     fn add(lhs: Val, rhs: Val, result: Val) -> Op {
@@ -387,6 +483,107 @@ mod unit_tests {
             collect_results_of_non_yield_feeding_users(iter_arg, &body),
             vec![stored]
         );
+    }
+
+    /// `PropagationAnalysis&` that calls a fixed set of pairs equal, which is the only way to observe
+    /// [`reuse_identical_iter_args`]'s grouping.
+    struct SameFor(Vec<(Val, Val)>);
+    impl PropagationAnalysis for SameFor {
+        fn are_expressions_same(&mut self, val1: Val, val2: Val) -> bool {
+            self.0.contains(&(val1, val2))
+        }
+    }
+
+    /// `Liveness&` that never reports an overlap, so only the same-op shortcut can answer `true`.
+    struct NeverOverlaps;
+    impl Liveness for NeverOverlaps {
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {}
+        fn is_live_range_overlaps(&self, _v1: Val, _v2: Val) -> bool {
+            false
+        }
+    }
+
+    /// `e356` — the second argument's uses move to the first, and the third is left alone because its
+    /// register locale differs however the analysis answers.
+    #[test]
+    fn identical_iter_args_are_reused_and_a_different_locale_is_not() {
+        let (a0, a1, a2) = (Val(10), Val(11), Val(12));
+        let mut slots = vec![
+            carried(Val(1), a0, Val(20)),
+            carried(Val(2), a1, Val(21)),
+            carried(Val(3), a2, Val(22)),
+        ];
+        slots[2].reg.locale = sentient::RegType::Lbr;
+        // ⭐ THE YIELD HANDS BACK THE SLOTS' ADVANCED VALUES, not the arguments themselves — a loop
+        // that yields an argument unchanged is the reference's own `DT_CHECK` shape (see e148).
+        let mut body = vec![
+            store(a0, Val(30)),
+            store(a1, Val(31)),
+            store(a2, Val(32)),
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(50), Val(51), Val(52)],
+            }),
+        ];
+        // The analysis calls all three pairs equal; only the first two share a locale.
+        let mut prop = SameFor(vec![(a0, a1), (a0, a2), (a1, a2)]);
+
+        reuse_identical_iter_args(&mut body, &slots, &mut prop);
+
+        assert_eq!(
+            collect_results_of_non_yield_feeding_users(
+                IterArg::at(&slots, &body, 0).expect("slot 0"),
+                &body
+            ),
+            vec![Val(30), Val(31)]
+        );
+        // ⛔ THE `carried` LIST STILL HOLDS EVERY SLOT.
+        assert_eq!(slots.len(), 3);
+        // ⛔ AND THE THIRD ARGUMENT'S USE IS UNTOUCHED.
+        assert_eq!(
+            collect_results_of_non_yield_feeding_users(
+                IterArg::at(&slots, &body, 2).expect("slot 2"),
+                &body
+            ),
+            vec![Val(32)]
+        );
+    }
+
+    /// `e357` — two results of ONE op overlap before the analysis is consulted, and two separate
+    /// transfers do not once it declines.
+    #[test]
+    fn two_results_of_one_op_overlap_without_asking_the_analysis() {
+        let (a0, a1) = (Val(10), Val(11));
+        let slots = [carried(Val(1), a0, Val(20)), carried(Val(2), a1, Val(21))];
+        let shared = vec![
+            add(a0, a1, Val(30)),
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(50), Val(51)],
+            }),
+        ];
+        let (first, second) = (
+            IterArg::at(&slots, &shared, 0).expect("slot 0"),
+            IterArg::at(&slots, &shared, 1).expect("slot 1"),
+        );
+        assert!(are_users_liveranges_overlapping(
+            first,
+            second,
+            &shared,
+            &NeverOverlaps
+        ));
+
+        let apart = vec![
+            store(a0, Val(30)),
+            store(a1, Val(31)),
+            Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(50), Val(51)],
+            }),
+        ];
+        assert!(!are_users_liveranges_overlapping(
+            IterArg::at(&slots, &apart, 0).expect("slot 0"),
+            IterArg::at(&slots, &apart, 1).expect("slot 1"),
+            &apart,
+            &NeverOverlaps
+        ));
     }
 
     /// An `scalar_add` reading the same iterator argument but NOT producing what this slot yields is

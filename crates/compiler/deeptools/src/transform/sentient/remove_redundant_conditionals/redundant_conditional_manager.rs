@@ -79,11 +79,83 @@
 //! | `e466_updateIfOpFeedingDynLoopBound` | 466 | 2 | 77 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:217` |
 //! | `e526_processIfOp` | 526 | 3 | 22 | `dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:98` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
+// file's own tests until `e575_runOnOperation` lands and something calls it. CI runs clippy with
+// `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH `e575_runOnOperation`: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e354_getReturnValsIfSimpleConditional
-//   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:121  (27 body lines, level 1)
-//   original  : std::optional<std::pair<WidestIntType, WidestIntType>> RedundantConditionalManager::getReturnValsIfSimpleConditional( sentient::IfOp if_op, int idx)
-//   calls     : e252_size
+use crate::islands::sentient::dialects::{Definitions, Op, sentient};
+
+/// `typedef int64_t WidestIntType` (`:52`) — the width the pass compares yielded constants at.
+///
+/// ⭐ AN ALIAS AND NOT A NEWTYPE: [`sentient::Op::ScalarConstant::value`] is already the `i64` this
+/// names, and wrapping it here would only be unwrapped again at the one comparison it exists for.
+pub type WidestInt = i64;
+
+/// A `sentient.if` — `sentient::IfOp if_op` as a witness over the union type, so that the two regions
+/// this reads are reachable without a second `dyn_cast`.
+#[derive(Debug, Clone, Copy)]
+pub struct IfOp<'a> {
+    /// `if_op.getThenRegion().front()`.
+    then_body: &'a [Op],
+    /// `if_op.getElseRegion().front()`.
+    else_body: &'a [Op],
+}
+
+impl<'a> IfOp<'a> {
+    /// The witness, or `None` for any other op.
+    #[must_use]
+    pub fn of(op: &'a Op) -> Option<IfOp<'a>> {
+        match op {
+            Op::Sentient(sentient::Op::If {
+                then_body,
+                else_body,
+                ..
+            }) => Some(IfOp {
+                then_body,
+                else_body,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces: e354_getReturnValsIfSimpleConditional
+///
+/// The `(then-val, else-val)` constants yielded at `idx` when BOTH regions hold nothing but their
+/// yield, and `None` otherwise (`:121-148`).
+///
+/// ⛔ `None` COVERS ALL THREE REFUSALS: a region with more than the yield in it, and either side
+/// yielding something that is not a `sentient.scalar_constant`.
+/// ⛔ TRAP: THE CONSTANTS ARE DEFINED OUTSIDE THE REGIONS, which is why `defs` is a parameter — the
+/// yield's operand is looked up in the enclosing scopes, innermost first.
+/// ⛔ `dyn_cast_or_null` (`:130`, `:139`) IS ALREADY TOTAL HERE: a yielded region argument has no
+/// defining op, and [`Definitions::of`] answers `None` where the reference relies on the null-tolerant
+/// spelling to avoid an assert.
+#[must_use]
+pub fn get_return_vals_if_simple_conditional(
+    if_op: IfOp<'_>,
+    idx: usize,
+    defs: Definitions<'_>,
+) -> Option<(WidestInt, WidestInt)> {
+    let then_val = yielded_constant(if_op.then_body, idx, defs)?;
+    let else_val = yielded_constant(if_op.else_body, idx, defs)?;
+    Some((then_val, else_val))
+}
+
+/// One region's `front().getOperations().size() != 1` check and its terminator's `idx`th operand.
+///
+/// ⭐ THE TERMINATOR IS THE ONE OP, so the size check and the `getTerminator()` are the same match.
+fn yielded_constant(body: &[Op], idx: usize, defs: Definitions<'_>) -> Option<WidestInt> {
+    let [Op::Sentient(sentient::Op::Yield { results })] = body else {
+        return None;
+    };
+    match defs.of(*results.get(idx)?) {
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => Some(*value),
+        _ => None,
+    }
+}
 
 // crustify:todo: e465_updateIfOpBasedOnParentIfOp
 //   authority : dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:151  (65 body lines, level 2)
@@ -100,3 +172,86 @@
 //   original  : void RedundantConditionalManager::processIfOp()
 //   calls     : e465_updateIfOpBasedOnParentIfOp, e466_updateIfOpFeedingDynLoopBound
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{IfOp, get_return_vals_if_simple_conditional};
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+
+    /// `%r = sentient.scalar_constant {value = <value>} : index`.
+    fn constant(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.yield %results`.
+    fn yield_op(results: Vec<Val>) -> Op {
+        Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// `%r = sentient.if eq(%lhs, %rhs) { <then> } else { <else> }`.
+    fn if_op(result: Val, then_body: Vec<Op>, else_body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate: sentient::CmpPredicate::Eq,
+            lhs: Val(0),
+            rhs: Val(1),
+            yielded: vec![sentient::Yielded {
+                result,
+                reg: sentient::Reg {
+                    locale: sentient::RegType::Unknown,
+                    index: None,
+                },
+            }],
+            dbg_name: None,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// `e354` — the simple conditional's pair, and each of the three refusals.
+    #[test]
+    fn a_pair_of_constants_needs_both_regions_to_hold_only_the_yield() {
+        let (c3, c7, other) = (Val(2), Val(3), Val(4));
+        let simple = if_op(Val(5), vec![yield_op(vec![c3])], vec![yield_op(vec![c7])]);
+        let body = vec![constant(c3, 3), constant(c7, 7), simple];
+        let scope: [&[Op]; 1] = [body.as_slice()];
+        let defs = Definitions::from_innermost(&scope);
+        let witness = IfOp::of(&body[2]).expect("a sentient.if");
+        assert_eq!(
+            get_return_vals_if_simple_conditional(witness, 0, defs),
+            Some((3, 7))
+        );
+        // ⛔ NO SUCH INDEX.
+        assert_eq!(
+            get_return_vals_if_simple_conditional(witness, 1, defs),
+            None
+        );
+        // ⛔ A REGION WITH MORE THAN ITS YIELD IN IT.
+        let busy = if_op(
+            Val(6),
+            vec![constant(other, 9), yield_op(vec![other])],
+            vec![yield_op(vec![c7])],
+        );
+        assert_eq!(
+            get_return_vals_if_simple_conditional(IfOp::of(&busy).unwrap(), 0, defs),
+            None
+        );
+        // ⛔ A YIELDED VALUE THAT IS NOT A CONSTANT — here nothing in scope defines it.
+        let unknown = if_op(
+            Val(7),
+            vec![yield_op(vec![Val(99)])],
+            vec![yield_op(vec![c7])],
+        );
+        assert_eq!(
+            get_return_vals_if_simple_conditional(IfOp::of(&unknown).unwrap(), 0, defs),
+            None
+        );
+        // ⛔ AND ONLY A `sentient.if` IS A WITNESS.
+        assert!(IfOp::of(&body[0]).is_none());
+    }
+}

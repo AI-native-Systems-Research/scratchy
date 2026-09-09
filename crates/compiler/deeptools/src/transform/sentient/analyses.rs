@@ -812,6 +812,31 @@ impl Liveness for OutOfScopeLiveness {
     }
 }
 
+/// THE `PropagationAnalysis&` A PASS IS HANDED — a trait for the same reason [`Liveness`] is one: the
+/// analysis is not in this campaign, and a test must still be able to observe which values a ported
+/// pass treats as carrying the same expression.
+///
+/// ⛔ `Analyses/PropagationAnalysis.{h,cpp}` IS OUT OF CAMPAIGN SCOPE, so the crate's only
+/// implementation is [`OutOfScopePropagationAnalysis`] and every method of it is a `todo!`. See
+/// [`UnitIndexMap`] for the one part of this class a ported pass reaches through a narrower seam.
+pub trait PropagationAnalysis {
+    /// `areExpressionsSame(val1, val2)` (`Analyses/PropagationAnalysis.h:335`) — whether the two
+    /// values' affine expressions agree unit by unit. ⭐ NOT `const` THERE (it memoises), so `&mut`.
+    fn are_expressions_same(&mut self, val1: Val, val2: Val) -> bool;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the affine expressions behind the answer are not ported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopePropagationAnalysis;
+
+impl PropagationAnalysis for OutOfScopePropagationAnalysis {
+    fn are_expressions_same(&mut self, _val1: Val, _val2: Val) -> bool {
+        todo!(
+            "PropagationAnalysis::areExpressionsSame (Analyses/PropagationAnalysis.h:335) — out of campaign scope"
+        )
+    }
+}
+
 /// A COUNT OF CYCLES — what `TimeStamp::getCyclesGap` answers and what an exposed-pipeline budget is
 /// spent in (`Analyses/TimeStamps.h:20`, `TransformForExposedPipeline.cpp:308`).
 ///
