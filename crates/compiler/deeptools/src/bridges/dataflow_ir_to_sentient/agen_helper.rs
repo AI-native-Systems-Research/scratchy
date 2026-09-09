@@ -122,7 +122,10 @@ use super::agen_access_details::{
     ConstructedDetails, IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim, TimeStepsInfo,
     construct_iterator_coeff_dict, construct_time_steps_info,
 };
-use super::agen_agen_to_sentient::{StrideStep, TransferSpecialisation};
+use super::agen_agen_to_sentient::{
+    AddressAdvance, CarriedFromEnd, LoopBodyOp, StrideStep, TransferSpecialisation,
+    insert_copy_and_add_stmts_helper,
+};
 use super::std_standard_to_sentient::lower_constant_index_to_sentient;
 use super::tf_utils::constant_index;
 use super::vc_vector_operands::access_map;
@@ -5127,6 +5130,165 @@ mod unit_tests {
             built.hoisted
         );
     }
+    // ─────────────────────────────── 335/384 ───────────────────────────────
+
+    /// ⛔ THE STALE INIT AND ITS DEFINING OP BOTH GO (`Helper.cpp:3866-3868`), and the advance lands
+    /// on the carried address COUNTED FROM THE END.
+    #[test]
+    fn a_copied_address_replaces_the_init_and_erases_what_defined_it() {
+        // `lx_indirect_loads_stores_composite.mlir:41`: two carried addresses, `index` 0 is the last.
+        let mut carried = vec![
+            affine::Carried {
+                init: Val(20),
+                arg: Val(28),
+                result: Val(26),
+            },
+            affine::Carried {
+                init: Val(25),
+                arg: Val(29),
+                result: Val(27),
+            },
+        ];
+        let mut body = vec![DfirOp::Affine(affine::Op::Yield {
+            operands: vec![Val(28), Val(29)],
+        })];
+        let mut enclosing = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(20),
+                value: 0,
+            }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: Val(25),
+                value: 0,
+            }),
+        ];
+        let mut vals = Values::default();
+        let advance = insert_copy_and_add_stmts(
+            &mut vals,
+            AdvancedLoop {
+                carried: &mut carried,
+                body: &mut body,
+            },
+            &mut enclosing,
+            0,
+            Val(50),
+            64,
+        )
+        .expect("the last of two carried addresses");
+
+        assert_eq!(carried[1].init, Val(50), "`setOperand(.., copy_value)`");
+        assert_eq!(
+            enclosing,
+            vec![DfirOp::Arith(arith::Op::Constant {
+                result: Val(20),
+                value: 0
+            })],
+            "`stale_val.getDefiningOp()->erase()`"
+        );
+        assert_eq!(
+            advance.iter_arg,
+            Val(29),
+            "it returns the ARGUMENT, not the sum"
+        );
+        assert_eq!(
+            body,
+            vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: advance.addend,
+                    value: 64
+                }),
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: advance.yielded,
+                    lhs: Val(29),
+                    rhs: advance.addend,
+                    ty: ScalarTy::Index,
+                })),
+                DfirOp::Affine(affine::Op::Yield {
+                    operands: vec![Val(28), advance.yielded]
+                }),
+            ]
+        );
+    }
+
+    // ─────────────────────────────── 336/384 ───────────────────────────────
+
+    /// ⛔ ONE STEP EARLY, THROUGH `-stride_step` (`Helper.cpp:4053`), on the LOOP'S INIT when there is
+    /// a loop and on the op's own `mutable_addr` when there is not.
+    #[test]
+    fn a_strided_address_starts_one_step_before_its_base() {
+        let mut vals = Values::default();
+        let mut carried = vec![affine::Carried {
+            init: Val(20),
+            arg: Val(21),
+            result: Val(22),
+        }];
+        let looped = adjust_mutable_addr_init_for_stride(
+            &mut vals,
+            StrideTarget::CompositeLoop(&mut carried),
+            StrideStep(64),
+        )
+        .expect("one iter_arg");
+        let [
+            SenOp::Arith(arith::Op::Constant {
+                result: addend,
+                value: -64,
+            }),
+            SenOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: sum,
+                lhs: Val(20),
+                rhs,
+                ty: ScalarTy::Index,
+            })),
+        ] = looped.hoisted[..]
+        else {
+            panic!(
+                "a constant then an addi over the old init: {:?}",
+                looped.hoisted
+            );
+        };
+        assert_eq!((rhs, sum), (addend, looped.adjusted));
+        assert_eq!(
+            carried[0].init, looped.adjusted,
+            "`replaceUsesOfWith(init_val, ..)`"
+        );
+
+        // `:4064-4081` — no loop, so the memory op's own `mutable_addr` is what moves.
+        let mut op = sent_load_and_send(sen::Extent::of(Elements(64), Bits(16)));
+        let direct = adjust_mutable_addr_init_for_stride(
+            &mut vals,
+            StrideTarget::MemoryOp(&mut op),
+            StrideStep(8),
+        )
+        .expect("a load_and_send");
+        assert!(matches!(
+            direct.hoisted[0],
+            SenOp::Arith(arith::Op::Constant { value: -8, .. })
+        ));
+        assert!(
+            matches!(op, SenOp::Sentient(sen::Op::LoadAndSend { mutable_addr, .. })
+                if mutable_addr == direct.adjusted),
+            "`setOperand(mutable_addr_idx, ..)`: {op:?}"
+        );
+
+        // ⛔ THE TWO `DT_CHECK`s (`:4037`, `:4046`): another op, and a loop carrying more than one.
+        assert!(
+            adjust_mutable_addr_init_for_stride(
+                &mut vals,
+                StrideTarget::MemoryOp(&mut SenOp::Agen(agen::Op::Yield)),
+                StrideStep(8),
+            )
+            .is_none()
+        );
+        let mut two = vec![carried[0], carried[0]];
+        assert!(
+            adjust_mutable_addr_init_for_stride(
+                &mut vals,
+                StrideTarget::CompositeLoop(&mut two),
+                StrideStep(8),
+            )
+            .is_none()
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -10061,6 +10223,144 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
     }))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 335/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE LOOP ONE ADDRESS ADVANCE IS ADDED TO — the two places `insertCopyAndAddStmts` writes.
+///
+/// ⭐ EITHER DIALECT. The reference dispatches to `insertCopyAndAddStmtsHelper<affine::AffineForOp>` or
+/// `<scf::ForOp>` (`Helper.cpp:3870-3876`, `llvm_unreachable` otherwise) and the two differ only in the
+/// terminator [`LoopBodyOp::yielded`] already finds, so that dispatch is the template instantiation and
+/// not a decision this port has to make.
+pub struct AdvancedLoop<'a, O> {
+    /// The `iter_args` list — the loop's trailing operands and the region arguments they arrive as.
+    pub carried: &'a mut Vec<affine::Carried>,
+    /// The body, where the copy and add statements go just before the terminator.
+    pub body: &'a mut Vec<O>,
+}
+
+/// Replaces: e335_insertCopyAndAddStmts
+///
+/// **335/384** `Helper.cpp:3861` (13L): points one carried address at `copy_value`, erases the
+/// placeholder init that fed it, and advances it by `imm_val` at the end of the body.
+///
+/// ⛔ COUNTED FROM THE END, as `getNumOperands() - index - 1` is — see [`CarriedFromEnd`].
+/// ⛔ THE STALE INIT'S DEFINING OP GOES WITH IT (`:3868`): nothing reads it once the loop does not, and
+/// a dead `arith.constant` left in the block is what dbo-opt calls a dangling non-compute op.
+#[must_use]
+pub fn insert_copy_and_add_stmts<O: LoopBodyOp>(
+    vals: &mut Values,
+    loop_op: AdvancedLoop<'_, O>,
+    enclosing: &mut Vec<O>,
+    from_end: usize,
+    copy_value: Val,
+    imm_val: i64,
+) -> Option<AddressAdvance> {
+    let at = loop_op
+        .carried
+        .len()
+        .checked_sub(from_end.checked_add(1)?)?;
+    // `auto stale_val = loop_op->getOperand(loop_op->getNumOperands() - index - 1);`
+    let stale = loop_op.carried.get(at)?.init;
+    // `loop_op->setOperand(loop_op->getNumOperands() - index - 1, copy_value);`
+    loop_op.carried[at].init = copy_value;
+    // `stale_val.getDefiningOp()->erase();`
+    if let Some(dead) = enclosing.iter().position(|op| op.binds().contains(&stale)) {
+        enclosing.remove(dead);
+    }
+    let carried = CarriedFromEnd::at(loop_op.carried, from_end)?;
+    Some(insert_copy_and_add_stmts_helper(
+        vals,
+        loop_op.body,
+        carried,
+        imm_val,
+    ))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 336/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT ONE STRIDE ADJUSTMENT REWRITES — `adjustMutableAddrInitForStride`'s two branches, named.
+pub enum StrideTarget<'a> {
+    /// `outermost_comp_loop`: the `affine.for` the lowering created, whose ONE carried address the
+    /// stride adjusts (`Helper.cpp:4041-4062`).
+    CompositeLoop(&'a mut Vec<affine::Carried>),
+    /// No loop was created, so the memory operation's own `mutable_addr` is what it adjusts (`:4064`).
+    MemoryOp(&'a mut SenOp),
+}
+
+/// WHAT A STRIDE ADJUSTMENT LEFT BEHIND.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrideAdjustment {
+    /// The `arith.constant` and the `arith.addi`, in creation order, for the block holding what was
+    /// adjusted — `OpBuilder builder(for_op)` / `OpBuilder builder(mem_op)` puts them IMMEDIATELY
+    /// BEFORE it.
+    pub hoisted: Vec<SenOp>,
+    /// The sum that replaced the old init or mutable address.
+    pub adjusted: Val,
+}
+
+/// Replaces: e336_adjustMutableAddrInitForStride
+///
+/// **336/384** `Helper.cpp:4034` (47L): a strided transfer's address starts one step EARLY, so the
+/// first advance inside the loop lands on the real base.
+///
+/// ⛔ THE CONSTANT IS `-stride_step` (`:4053`, `:4077`) — the adjustment SUBTRACTS, through an `addi`.
+/// ⛔ AND IT LANDS ON THE LOOP'S INIT WHEN THERE IS A LOOP AND ON THE OP'S `mutable_addr` WHEN THERE IS
+/// NOT (`:4043`, `:4064`); doing both would move the address twice.
+/// ⛔ A LOOP CARRYING ANYTHING BUT ONE ADDRESS, or an op that is neither `sentient.load_and_send` nor
+/// `sentient.receive_and_store`, is the reference's own `DT_CHECK` (`:4037`, `:4046`): [`None`].
+#[must_use]
+pub fn adjust_mutable_addr_init_for_stride(
+    vals: &mut Values,
+    target: StrideTarget<'_>,
+    stride_step: StrideStep,
+) -> Option<StrideAdjustment> {
+    let addend = vals.mint();
+    let sum = vals.mint();
+    let old = match target {
+        // `:4046-4060` — one `iter_arg`, and `getInits()[iter_arg_idx - 1]` is its init.
+        StrideTarget::CompositeLoop(carried) => match carried.as_mut_slice() {
+            [one] => {
+                let init = one.init;
+                // `for_op->replaceUsesOfWith(init_val, init_adjustment.getResult());`
+                one.init = sum;
+                init
+            }
+            _ => return None,
+        },
+        // `:4067-4081` — `mem_op->setOperand(mutable_addr_idx, init_adjustment.getResult());`
+        StrideTarget::MemoryOp(op) => match op {
+            SenOp::Sentient(
+                sen::Op::LoadAndSend { mutable_addr, .. }
+                | sen::Op::ReceiveAndStore { mutable_addr, .. },
+            ) => {
+                let old = *mutable_addr;
+                *mutable_addr = sum;
+                old
+            }
+            _ => return None,
+        },
+    };
+    Some(StrideAdjustment {
+        hoisted: vec![
+            SenOp::Arith(arith::Op::Constant {
+                result: addend,
+                value: -i64::from(stride_step.0),
+            }),
+            SenOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: sum,
+                lhs: old,
+                rhs: addend,
+                ty: ScalarTy::Index,
+            })),
+        ],
+        adjusted: sum,
+    })
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
@@ -10072,8 +10372,6 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
 // crustify:todo: e332_lowerCompositeIndirectLoadOp
 // crustify:todo: e333_lowerCompositeIndirectStoreOp
 // crustify:todo: e334_lowerCompositeIndirectLoadAndStoreOp
-// crustify:todo: e335_insertCopyAndAddStmts
-// crustify:todo: e336_adjustMutableAddrInitForStride
 // crustify:todo: e357_generateAffineAddressManipulationStmts
 // crustify:todo: e358_constructLoadAndSendStmt
 // crustify:todo: e359_constructReceiveAndStoreStmt

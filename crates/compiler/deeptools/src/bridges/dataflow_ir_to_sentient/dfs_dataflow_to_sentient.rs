@@ -1616,6 +1616,55 @@ mod unit_tests {
             "an l0lu source cannot sync with another l0lu"
         );
     }
+    /// 🎯 337/384 — THE SOURCES SPLIT BY CORELET AND THE DESTINATION'S OP PICKS THE LOWERING; a list
+    /// mixing two unit kinds is *"Src unit types has to be the same."*
+    #[test]
+    fn a_sync_dispatches_on_its_destination_over_corelet_split_sources() {
+        let scope = vec![
+            get_unit_on(0, DfirUnit::Lxsu, corelet0()),
+            get_unit_on(1, DfirUnit::Lxsu, corelet1()),
+            get_unit_on(2, DfirUnit::Lxlu, corelet0()),
+            get_unit_on(3, DfirUnit::L3lu, corelet0()),
+        ];
+        let mut values = Values::default();
+        let lowered = lower_sync_operation(
+            &[Val(0), Val(1)],
+            L0LxSyncToLower::Recv,
+            Val(2),
+            &scope,
+            None,
+            &mut values,
+        );
+        let mut expected_values = Values::default();
+        assert_eq!(
+            lowered,
+            lower_sync_for_a_unit(
+                SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Store)),
+                L0LxSyncToLower::Recv,
+                &[Val(0)],
+                &[Val(1)],
+                L0LxSyncDst::Lx(LxHalf::Load, corelet0()),
+                None,
+                &mut expected_values,
+            )
+            .map(SyncLowering::L0Lx),
+            "`lowerSyncForAUnit(src_unit_name, op, .., corelet0, corelet1, dst_unit)`"
+        );
+
+        // ⛔ THE MIXED LIST IS THE REFUSAL, and an L3 source reaches the lowering with both corelet
+        // lists empty.
+        assert_eq!(
+            lower_sync_operation(
+                &[Val(0), Val(3)],
+                L0LxSyncToLower::Recv,
+                Val(2),
+                &scope,
+                None,
+                &mut values,
+            ),
+            None
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -3300,8 +3349,132 @@ pub fn lower_sync_for_a_query_map(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 337/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT ONE `dataflow` SYNC LOWERED TO — the two answer shapes its three dispatch targets have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncLowering {
+    /// A `get_unit` or a `create_group` destination, through [`lower_sync_for_a_unit`] and
+    /// [`lower_sync_for_a_group`].
+    L0Lx(L0LxLowering),
+    /// A `uniform.query_map` destination, through [`lower_sync_for_a_query_map`].
+    QueryMap(QueryMapLowering),
+}
+
+/// The source's family, off the one `type` every source agreed on — ⛔ [`None`] IS
+/// `stringToSenComponents.find(src_unit_name)->second` DEREFERENCING `end()`, which is what a source
+/// that is no sync-capable unit reaches (`:245`, `:397`, `:487`, `:686`).
+const fn sync_source(unit: DfirUnit) -> Option<SyncSrc> {
+    match unit {
+        DfirUnit::L0lu => Some(SyncSrc::L0Lx(L0LxSrc::L0(L0Half::Load))),
+        DfirUnit::L0su => Some(SyncSrc::L0Lx(L0LxSrc::L0(L0Half::Store))),
+        DfirUnit::Lxlu => Some(SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Load))),
+        DfirUnit::Lxsu => Some(SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Store))),
+        // `src_unit_name.substr(0, 2) != "l3"` — the two spellings that fail it.
+        DfirUnit::L3lu => Some(SyncSrc::L3(L3Half::Load)),
+        DfirUnit::L3su => Some(SyncSrc::L3(L3Half::Store)),
+        DfirUnit::Sfp
+        | DfirUnit::Pe
+        | DfirUnit::PtRow(_)
+        | DfirUnit::Lx
+        | DfirUnit::Hbm
+        | DfirUnit::L0
+        | DfirUnit::Constant
+        | DfirUnit::SfpState
+        | DfirUnit::PeState
+        | DfirUnit::SfpRing
+        | DfirUnit::LxVirtualIbr
+        | DfirUnit::L3Ibr
+        | DfirUnit::CrossPtnLink
+        | DfirUnit::LxluScaleReg => None,
+    }
+}
+
+/// Replaces: e337_lowerSyncOperation
+///
+/// **337/384** `DataflowToSentient.cpp:1901` (80L): the sync dispatcher — one source family for the
+/// whole list, the sources split by corelet, and the destination's defining op picking the lowering.
+///
+/// ⛔ THE CORELET SPLIT IS NOT MADE FOR AN L3 SOURCE (`:1935`), so both lists reach an L3 lowering
+/// empty — which is exactly what it reads them for: nothing.
+/// ⛔⛔ `src_units` IS ALREADY NARROWED BY THE CALLER. `:1912-1925` replaces the operand list with the
+/// units of the enclosing `uniform.uniformize_regions` region when the op sits in one; the enclosing
+/// op is not in the `&[DfirOp]` scope holding a region's body, so no walk here can find it.
+#[must_use]
+pub fn lower_sync_operation(
+    src_units: &[Val],
+    op: L0LxSyncToLower,
+    dst_units: Val,
+    scope: &[DfirOp],
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<SyncLowering> {
+    // `getUnitNameFromAListOfGetUnitOp` over `src_unit_ops`, whose `DT_CHECK(src_unit_op)` and
+    // `DT_CHECK(src_units.size() > 0)` are the walk and the empty list.
+    // ⭐ `getDirectUnitOpOrgetFirstIndirectUnitOpViaQueryMap(src_units[0])` (`:1905`) reads the name
+    // off the FIRST source, resolving one behind a query map; every source is then checked against
+    // it, so a list this walk resolves at all agrees on one kind either way.
+    let mut units = Vec::with_capacity(src_units.len());
+    for src_unit in src_units {
+        units.push(queried_unit(*src_unit, scope)?);
+    }
+    let src = sync_source(unit_name_from_a_list_of_get_unit_op(&units)?)?;
+
+    // `:1935-1946` — `corelet == 0` or, `DT_CHECK`ed by [`Corelet`], 1.
+    let (mut corelet0, mut corelet1) = (Vec::new(), Vec::new());
+    if !matches!(src, SyncSrc::L3(_)) {
+        for src_unit in src_units {
+            if key_corelet(*src_unit, scope)?.get() == 0 {
+                corelet0.push(*src_unit);
+            } else {
+                corelet1.push(*src_unit);
+            }
+        }
+    }
+
+    // ⭐ WHICH OPERAND NAMES THE DESTINATION IS THE OP'S OWN (`:1949-1961`): `$to_unit` on a send,
+    // `$from_unit` on a recv, `$dst_unit` on an implicit sync — one value once resolved.
+    match defining_op(dst_units, scope)? {
+        // `:1963-1967`.
+        DfirOp::Dataflow(dataflow::Op::GetUnit { .. }) => lower_sync_for_a_unit(
+            src,
+            op,
+            &corelet0,
+            &corelet1,
+            sync_destination(dst_units, scope)?,
+            dbg_name,
+            values,
+        )
+        .map(SyncLowering::L0Lx),
+        // `:1968-1973`.
+        DfirOp::Dataflow(dataflow::Op::CreateGroup { .. }) => lower_sync_for_a_group(
+            src,
+            op,
+            &corelet0,
+            &corelet1,
+            &sync_group_destinations(dst_units, scope)?,
+            dbg_name,
+            values,
+        )
+        .map(SyncLowering::L0Lx),
+        // `:1974-1979` — the map's pairs, which the reference's callee reads off the op itself.
+        DfirOp::Uniform(uniform::Op::QueryMap { map, .. }) => {
+            let Some(DfirOp::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) =
+                defining_op(*map, scope)
+            else {
+                return None;
+            };
+            lower_sync_for_a_query_map(src, op, pairs, scope, dbg_name, values)
+                .map(SyncLowering::QueryMap)
+        }
+        // `return LogicalResult::failure();` (`:1980`) — a destination that is none of the three.
+        _ => None,
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e337_lowerSyncOperation
 // crustify:todo: e361_runOnOperation

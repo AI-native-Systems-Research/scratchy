@@ -768,7 +768,7 @@ pub(super) fn op_at<'a>(id: &OpId, scope: &'a [DfirOp]) -> Option<&'a DfirOp> {
 /// ⭐ A PATH THAT RESOLVES TO NOTHING IS NOT A CONSTANT, and [`same_block`] then falls through to
 /// its block comparison. An `Operation *` cannot dangle in the reference; a position can name an op
 /// in a scope it was not given, and the total answer to "is that a constant" is no.
-fn is_arith_constant(op: &OpId, scope: &[DfirOp]) -> bool {
+pub(super) fn is_arith_constant(op: &OpId, scope: &[DfirOp]) -> bool {
     matches!(
         op_at(op, scope),
         Some(DfirOp::Arith(
@@ -1872,7 +1872,7 @@ impl VectorOperand {
 
 /// WHETHER AN OP IS ONE OF THE FIVE THAT CAN SIT BETWEEN AN OPERAND AND THE COMPUTE — the `isa<>`
 /// list of [`erase_operands`] (`VectorOperands.cpp:705-707`).
-fn is_intermediate(op: &OpId, scope: &[DfirOp]) -> bool {
+pub(super) fn is_intermediate(op: &OpId, scope: &[DfirOp]) -> bool {
     matches!(
         op_at(op, scope),
         Some(

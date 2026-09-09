@@ -659,6 +659,10 @@ pub trait LoopBodyOp: Sized {
     ///
     /// ⭐ `None` MEANS *NOT A TERMINATOR*. It is how the body is searched, not a refusal.
     fn yielded(&mut self) -> Option<&mut Vec<Val>>;
+
+    /// The values this op binds — what `stale_val.getDefiningOp()` is found by
+    /// (`Helper.cpp:3868`, [`super::agen_helper::insert_copy_and_add_stmts`]).
+    fn binds(&self) -> Vec<Val>;
 }
 
 impl LoopBodyOp for crate::islands::dataflow_ir::dialects::Op {
@@ -675,6 +679,10 @@ impl LoopBodyOp for crate::islands::dataflow_ir::dialects::Op {
             _ => None,
         }
     }
+
+    fn binds(&self) -> Vec<Val> {
+        crate::islands::dataflow_ir::dialects::results(self)
+    }
 }
 
 impl LoopBodyOp for crate::islands::sentient::dialects::Op {
@@ -690,6 +698,10 @@ impl LoopBodyOp for crate::islands::sentient::dialects::Op {
             }
             _ => None,
         }
+    }
+
+    fn binds(&self) -> Vec<Val> {
+        crate::islands::sentient::dialects::results(self)
     }
 }
 
