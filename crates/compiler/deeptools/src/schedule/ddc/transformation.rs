@@ -142,16 +142,25 @@
 //! | `e376_performAutomaticShuffling` | 376 | 6 | 167 | `Ddc` | `ddc/ddc_transformation.cpp:1855` |
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
-// ⭐ USES FOR ENTRIES 105-109. Union these into this file's top block when its other entries land.
+// ⭐ USES FOR ENTRIES 105-109 AND 242-246. Union these into this file's top block when its other
+// entries land.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
+
+use std::collections::BTreeSet;
 
 use sys_arch_spec::arch_enums::SenComponent;
 
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::arch::Elements;
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    Extent, PrimaryDim, StickDims, StickPart, stick_sizes,
+};
 use crate::generated::DataConnect;
+use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::schedule::ddc::fold::{AllocId, NodeId};
-use crate::schedule::ddc::metadata::DestIdx;
-use crate::schedule::dsc2::{ComputeNode, LdsIdx, NodeName, Operand, TransferNode};
+use crate::schedule::ddc::metadata::{DatastageId, DestIdx, MetaDimKind, Metadata};
+use crate::schedule::dsc2::{
+    ComputeNode, LdsIdx, NodeName, Operand, TransferNode, generic_comp,
+};
 use crate::units::Corelet;
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -612,40 +621,732 @@ pub fn transform_a_compute_node_for_inter_slice_restickify<T: ComputeMasking + ?
     }
 }
 
-// crustify:todo: e242_canUseFifo
-//   authority : ddc/ddc_transformation.cpp:15  (270 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::canUseFifo(const dsc2::TransferNode *transferNode, size_t dstIndex, const dsc2::ScheduleNode *consumer) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:4373-4644
-//   calls     : e117_getNodeDescription
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE SKIP-REGISTER, OFFSET-ADJUSTMENT AND RESTICKIFY VOCABULARY — as entries 242-246 read it.
+//
+// ⭐ THE TRAITS ARE AGAIN THE MECHANISM FOR REACHING OPERANDS, the one part the campaign statement
+// names as droppable: `getInnermostCommonAncestor`, `getNextView`, `getPrev`,
+// `getNonBroadcastLdsDimSet`, `getBlockTransferSize` and `getStickSizes` are all `dsc/dsc2.cpp` —
+// outside this campaign's file list. What these five units OWN is the decision each makes over
+// those answers, and the mutation it performs.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
-// crustify:todo: e243_canUseLatch
-//   authority : ddc/ddc_transformation.cpp:287  (321 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::canUseLatch(const dsc2::TransferNode *transferNode, size_t dstIndex, std::vector<dsc2::ScheduleNode *> consumers) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:4654-4976
-//   calls     : e117_getNodeDescription
+/// HOW MANY LOADS ONE BLOCK TRANSFER COSTS — `getBlockTransferSize(.., sizeInNumberOfLoads = true)`
+/// (`dsc/dsc2.cpp:3601`), a product of per-dim LOAD counts and not an element count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Loads(pub i64);
 
-// crustify:todo: e244_cloneForOffsetAdjustment
-//   authority : ddc/ddc_transformation.cpp:1386  (8 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::cloneForOffsetAdjustment()
-//   extract   : crustify-ddc/cpp/ddc.cpp:4986-4994
-//   calls     : e108_cloneComputeForOffsetAdjustment
+impl Loads {
+    /// The one value entry 243 admits: a single load per corelet.
+    pub const ONE: Self = Self(1);
+}
 
-// crustify:todo: e245_setSizeForFixedSizeTransfers
-//   authority : ddc/ddc_transformation.cpp:1731  (34 body lines, level 1)
-//   class     : Ddc
-//   original  : void Ddc::setSizeForFixedSizeTransfers()
-//   extract   : crustify-ddc/cpp/ddc.cpp:5004-5038
-//   calls     : e104_clear
+/// ONE DESTINATION OF A TRANSFER WITH EVERYTHING `dstIndex` SELECTS — `dstVias_.at(dstIndex).loc_`,
+/// `dstLdsAndLoopOffsets_.at(dstIndex)` and that destination's `via_`, resolved ONCE.
+///
+/// ⛔ THE TWO `.at()`s ARE THE THROW: both units index them repeatedly and neither ever checks
+/// `dstIndex`, so obtaining this value is where an out-of-range destination is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferDst<'a> {
+    /// The transfer node's identity.
+    pub node: NodeId,
+    /// The transfer itself.
+    pub transfer: &'a TransferNode,
+    /// `dstVias_.at(dstIndex).loc_` zipped with `dstLdsAndLoopOffsets_.at(dstIndex)`.
+    pub dst: Operand,
+    /// `dstVias_.at(dstIndex).via_`.
+    pub hops: &'a [SenComponent],
+}
 
-// crustify:todo: e246_transformForInterSliceRestickify
-//   authority : ddc/ddc_transformation.cpp:2398  (28 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::transformForInterSliceRestickify()
-//   extract   : crustify-ddc/cpp/ddc.cpp:5048-5076
-//   calls     : e109_transformAComputeNodeForInterSliceRestickify
+impl<'a> TransferDst<'a> {
+    /// The destination, or [`None`] past the end of `dstVias_`.
+    #[must_use]
+    pub fn of(node: NodeId, transfer: &'a TransferNode, index: DestIdx) -> Option<Self> {
+        let index = index.0 as usize;
+        let dst = *transfer.dsts.get(index)?;
+        Some(Self {
+            node,
+            transfer,
+            dst,
+            hops: transfer.dsts.hops(index),
+        })
+    }
+}
+
+/// THE COMMUNICATION CHANNEL A SKIPPED REGISTER WOULD USE — entry 242's `communicationChannel`: the
+/// last component before the destination, paired with the destination's own.
+///
+/// ⭐ THE CONSTRUCTOR IS THE REFUSAL. A `NO_COMPONENT` or `CONSTANT` source cannot act as a FIFO, so
+/// there is no channel to carry rather than a channel that has to be re-tested downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Channel {
+    /// `.first` — `via_.back()`, or `src_.unit_` where the transfer has no hops.
+    pub from: SenComponent,
+    /// `.second` — `dstVias_.at(dstIndex).loc_.unit_`.
+    pub to: SenComponent,
+}
+
+impl Channel {
+    /// The channel, or [`None`] where its source cannot be used as a FIFO.
+    #[must_use]
+    pub fn of(dst: &TransferDst<'_>) -> Option<Self> {
+        let from = dst.hops.last().copied().unwrap_or(dst.transfer.src.unit);
+        match from {
+            SenComponent::NoComponent | SenComponent::Constant => None,
+            from => Some(Self {
+                from,
+                to: dst.dst.unit,
+            }),
+        }
+    }
+}
+
+/// WHAT A LOOP ON AN ANCESTOR PATH IS ASKED — `isParametricLoop()` (`dsc/dsc2.h:599`), `dims_`
+/// (`:575`) and the two datastage ids entry 242's reuse test compares (`:573-574`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathLoop {
+    /// `isParametricLoop_`.
+    pub parametric: bool,
+    /// `dims_`, inner to outer.
+    pub dims: Vec<(PrimaryDim, MetaDimKind)>,
+    /// `numId_`.
+    pub num: DatastageId,
+    /// `denId_`.
+    pub den: DatastageId,
+}
+
+/// WHAT A PATH NODE IS — `nodeType_` narrowed to the three answers these units act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathKind {
+    /// `nodeType_ == CONDITION`.
+    Condition,
+    /// `nodeType_ == LOOP`, with what a `dsc2::LoopNode` is then asked.
+    Loop(PathLoop),
+    /// Any other node type — a block, a transfer, a compute, an allocate or a sync.
+    Other,
+}
+
+/// ONE NODE ON AN ANCESTOR PATH.
+///
+/// ⛔ NAMES ARE NOT CARRIED: `name_` is read only by the `std::cerr` diagnostics both units emit
+/// under `transformationReportLevel_`, and those have no effect on the IR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathNode {
+    /// The node.
+    pub node: NodeId,
+    /// What it is.
+    pub kind: PathKind,
+}
+
+impl PathNode {
+    /// `checkUnsupportedNode`'s body — a CONDITION, or a LOOP that `isParametricLoop()`.
+    #[must_use]
+    pub fn unsupported(&self) -> bool {
+        match &self.kind {
+            PathKind::Condition => true,
+            PathKind::Loop(dim_loop) => dim_loop.parametric,
+            PathKind::Other => false,
+        }
+    }
+}
+
+/// ONE PATH `getInnermostCommonAncestor` FILLS, LESS ITS LAST ENTRY — `path.at(0)`, the node itself,
+/// and `path.at(1) ..= path.size() - 2`, its strict ancestors BELOW the common one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorPath {
+    node: PathNode,
+    between: Vec<PathNode>,
+}
+
+impl AncestorPath {
+    /// The path from one node up to (but not including) the common ancestor, innermost first.
+    #[must_use]
+    pub const fn new(node: PathNode, between: Vec<PathNode>) -> Self {
+        Self { node, between }
+    }
+
+    /// `path.at(0)`.
+    #[must_use]
+    pub const fn node(&self) -> &PathNode {
+        &self.node
+    }
+
+    /// `path.at(1) ..= path.size() - 2`, in path order.
+    #[must_use]
+    pub fn between(&self) -> &[PathNode] {
+        &self.between
+    }
+
+    /// `path.at(path.size() - 2)` — the common ancestor's own child on this path, WHICH IS THE NODE
+    /// ITSELF where the ancestor holds it directly. The reference's `size() - 2` underflows for a
+    /// one-entry path; a node is never its own innermost common ancestor with another, so it cannot.
+    #[must_use]
+    pub fn child_of_ancestor(&self) -> &PathNode {
+        self.between.last().unwrap_or(&self.node)
+    }
+
+    /// `for (i = 0; i < path.size() - 1; ++i)` — entry 242's `loopsWithoutReuse` domain: the node
+    /// and every ancestor below the common one.
+    pub fn below_ancestor(&self) -> impl Iterator<Item = &PathNode> {
+        core::iter::once(&self.node).chain(self.between.iter())
+    }
+}
+
+/// THE TWO PATHS `getInnermostCommonAncestor(transferNode, consumer, ..)` FILLS
+/// (`dsc/dsc2.cpp:4243`), WITH THE SHARED ANCESTOR HELD ONCE.
+///
+/// ⭐ HOLDING IT ONCE IS WHAT REMOVES A `DT_ERROR`: the reference aborts with *"Failed to find the
+/// common ancestor"* when the two paths' backs differ, and here they cannot differ.
+/// ⛔ BOTH UNITS CALL IT AS `(transferNode, consumer)`, which is why the paths are named for those
+/// roles rather than for argument positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestry {
+    /// `pathToTransfer`.
+    pub to_transfer: AncestorPath,
+    /// `pathToConsumer`.
+    pub to_consumer: AncestorPath,
+    /// `pathToTransfer.back()`, which is also `pathToConsumer.back()`.
+    pub ancestor: PathNode,
+}
+
+impl Ancestry {
+    /// Entry 242's `checkUnsupportedNode` domain — `for (i = 1; i < path.size(); ++i)` on BOTH
+    /// paths, which INCLUDES the common ancestor.
+    ///
+    /// ⛔⛔ TRAP, AND IT IS A REAL DIFFERENCE BETWEEN THE TWO UNITS: entry 243's identical-looking
+    /// walk stops one entry short (`ddc/ddc_transformation.cpp:463` against `:89`), so a parametric
+    /// common ancestor refuses a FIFO and permits a LATCH.
+    pub fn ancestors_through_common(&self) -> impl Iterator<Item = &PathNode> {
+        self.ancestors_below_common()
+            .chain(core::iter::once(&self.ancestor))
+    }
+
+    /// Entry 243's domain — `for (i = 1; i < path.size() - 1; ++i)` on both paths, which EXCLUDES
+    /// the common ancestor. The reference walks it once per path; one `bool` needs it once.
+    pub fn ancestors_below_common(&self) -> impl Iterator<Item = &PathNode> {
+        self.to_consumer
+            .between()
+            .iter()
+            .chain(self.to_transfer.between().iter())
+    }
+}
+
+/// A NODE IN THE SCOPE BETWEEN A PRODUCER AND ITS CONSUMER — the `nodeType_` tests and the
+/// `dynamic_cast<const dsc2::BlockNode *>` fallback both recursions make, as one value.
+///
+/// ⛔ NOT [`crate::schedule::ddc::fold::BlockId`]: that names a `BLOCK` node, while `isBlockNode()`
+/// (`dsc/dsc2.h:479`) also admits a LOOP and a CONDITION, and it is that wider set the recursions
+/// descend into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeNode {
+    /// `nodeType_ == COMPUTE`.
+    Compute(ComputeNode),
+    /// `nodeType_ == TRANSFER`.
+    Transfer(TransferNode),
+    /// The `dynamic_cast` succeeded — a BLOCK, LOOP or CONDITION, and its `getNextView(ALL)`
+    /// children in order.
+    Nest(Vec<NodeId>),
+    /// An allocate, sync or stick-mask node: no arm fires and the reference falls through.
+    Other,
+}
+
+/// THE CONSUMERS OF ONE TRANSFER RESULT — `metadata.dataConnects_.at(resultDc).consumers_` as entry
+/// 243 is handed them, NON-EMPTY so that its `DT_CHECK(!consumers.empty())` is unspellable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Consumers {
+    first: NodeId,
+    rest: Vec<NodeId>,
+}
+
+impl Consumers {
+    /// A consumed connect has at least one consumer, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: NodeId, rest: Vec<NodeId>) -> Self {
+        Self { first, rest }
+    }
+
+    /// Every consumer, in census order.
+    pub fn iter(&self) -> impl Iterator<Item = NodeId> + '_ {
+        core::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+
+    /// `is_any_of(node, consumers)`.
+    #[must_use]
+    pub fn contains(&self, node: NodeId) -> bool {
+        self.iter().any(|consumer| consumer == node)
+    }
+}
+
+/// WHAT THE SKIP-REGISTER DECISIONS ASK OF THE SCHEDULE TREE.
+pub trait ScopeTree {
+    /// `getInnermostCommonAncestor(transferNode, consumer, pathToTransfer, pathToConsumer)` as ONE
+    /// value.
+    fn ancestry(&self, transfer: NodeId, consumer: NodeId) -> Ancestry;
+    /// What that node is, and — for a block, a loop or a condition — its `getNextView(ALL)`
+    /// children. ⛔ `ALL` FILTERS NOTHING (`dsc/dsc2.cpp:2222`); it is the argument's default.
+    fn scope_node(&self, node: NodeId) -> ScopeNode;
+    /// `node->getPrev()` (`dsc/dsc2.h:463`) — ⛔ THE SAME `prev_` FIELD `getMutableParent()` HANDS
+    /// BACK (`:464`), so comparing two nodes' `getPrev()` asks whether they are SIBLINGS.
+    fn parent(&self, node: NodeId) -> Option<NodeId>;
+    /// `getNonBroadcastLdsDimSet(myLdsIdx_)` (`dsc/dsc2.cpp:4050`) — EMPTY for an absent index,
+    /// which is the reference's own `ldsIdx < 0` arm and not a case this port adds.
+    fn non_broadcast_lds_dims(&self, lds: Option<LdsIdx>) -> BTreeSet<PrimaryDim>;
+}
+
+/// THE DATASTAGE EXTENTS ENTRY 242 COMPARES — `dataStageParam_.at(id).ss_.primaryDimToVal_st(dim)`
+/// (`dsc/dims.cpp:647`).
+///
+/// ⭐ REACHING THEM AT ALL IS THE FLAG. Entry 242 reads them only once `dataStageExplorationDone_`
+/// is set, so the port takes them as an [`Option`] and [`None`] IS that flag being false.
+pub trait StageExtents {
+    /// One stage's stick-view extent for one dim.
+    fn stage_extent(&self, stage: DatastageId, dim: PrimaryDim) -> Extent;
+}
+
+/// WHAT ONE TRANSFER COSTS PER CORELET — entry 243's per-corelet `getBlockTransferSize`.
+pub trait TransferLoads {
+    /// `0 .. numCoreletsUsed_DSC2_`, as corelets rather than as an `int` that can range past them.
+    fn corelets(&self) -> Vec<Corelet>;
+    /// `getBlockTransferSize(*transferNode, transferNode->src_.unit_, clId, false, true)` — the
+    /// transfer and the unit are one value here, so the two cannot disagree.
+    fn block_transfer_loads(&self, transfer: NodeId, corelet: Corelet) -> Loads;
+}
+
+/// THE `getStickSizes(labeledDs_.at(lds).dsType_)` LOOKUP — one labelled DS's stick dims, which is
+/// what entry 041's port ([`stick_sizes`]) is then asked of.
+pub trait DsSticks {
+    /// `labeledDs_.at(lds).dsType_`'s `stickDimOrder_` zipped with its `stickSize_`.
+    fn ds_stick_dims(&self, lds: LdsIdx) -> StickDims;
+}
+
+/// WHAT ENTRY 245 READS AND WRITES BESIDE THE TRANSFER WALK.
+pub trait FixedSizeTransfers {
+    /// `metadata.dataConnects_.find(dc)->second.consumers_`, each consumer AS WHAT IT IS. ⛔ A
+    /// connect the census does not carry answers EMPTY, which is the reference's second `continue`.
+    fn connect_consumers(&self, connect: DataConnect) -> Vec<ScopeNode>;
+    /// `transferNode->transferSize_.clear()` FOLLOWED BY one entry per stick dim — one write, so a
+    /// cleared-but-unfilled `transferSize_` is unspellable.
+    fn set_transfer_size(&mut self, transfer: NodeId, sizes: Vec<(PrimaryDim, Elements)>);
+}
+
+/// THE COMPUTE NODE BEHIND ONE IDENTITY — `inputs_`/`outputs_` each zipped with their
+/// `..LdsAndLoopOffsets_`.
+pub trait ComputeNodes {
+    /// The compute that node is.
+    fn compute(&self, compute: NodeId) -> ComputeNode;
+}
+
+/// `static_cast<const dsc2::BlockNode *>(path.back())->getNextView(ALL)` — the common ancestor's
+/// children in order.
+///
+/// ⛔ THE REFERENCE `static_cast`s BLINDLY: the innermost common ancestor is a block by
+/// construction, and a node that is not one answers EMPTY here rather than being reinterpreted.
+fn children_of<T: ScopeTree + ?Sized>(tree: &T, node: NodeId) -> Vec<NodeId> {
+    match tree.scope_node(node) {
+        ScopeNode::Nest(children) => children,
+        ScopeNode::Compute(_) | ScopeNode::Transfer(_) | ScopeNode::Other => Vec::new(),
+    }
+}
+
+/// Whether a consumer reads that result on MORE THAN ONE input — the DCC-transformed FMA that reads
+/// two different FIFO elements, which both units refuse (`ddc/ddc_transformation.cpp:56-75`).
+///
+/// ⛔ AN ABSENT CONNECT MATCHES AN ABSENT ONE, because the reference compares `std::string`s and an
+/// unset `dataConnect_` is `""` on both sides.
+fn reads_result_twice(inputs: &[Operand], result: Option<DataConnect>) -> bool {
+    inputs
+        .iter()
+        .filter(|input| input.data.data_connect == result)
+        .count()
+        > 1
+}
+
+/// Entry 242's `usesCommunicationChannel` — whether that node, or anything nested in it, drives the
+/// intended FIFO. The producer itself is skipped.
+fn uses_communication_channel<T: ScopeTree + ?Sized>(
+    tree: &T,
+    producer: NodeId,
+    node: NodeId,
+    channel: Channel,
+    other_consumer_inputs: &BTreeSet<SenComponent>,
+) -> bool {
+    if node == producer {
+        return false;
+    }
+    match tree.scope_node(node) {
+        ScopeNode::Compute(compute) => {
+            let reads_the_fifo = (compute.ex_unit == channel.to
+                || other_consumer_inputs.contains(&compute.ex_unit))
+                && compute.inputs.iter().any(|input| input.unit == channel.from);
+            let drives_the_fifo = compute.ex_unit == channel.from
+                && compute.outputs.iter().any(|output| output.unit == channel.to);
+            reads_the_fifo || drives_the_fifo
+        }
+        ScopeNode::Transfer(transfer) => transfer.dsts.routes().any(|(dst, hops)| {
+            // `comp` walks the hop chain from the source, one component behind `it`.
+            let mut comp = transfer.src.unit;
+            for &hop in hops {
+                if comp == channel.from
+                    && (hop == channel.to || other_consumer_inputs.contains(&hop))
+                {
+                    return true;
+                }
+                comp = hop;
+            }
+            comp == channel.from
+                && (dst.unit == channel.to || other_consumer_inputs.contains(&dst.unit))
+        }),
+        ScopeNode::Nest(children) => children.into_iter().any(|child| {
+            uses_communication_channel(tree, producer, child, channel, other_consumer_inputs)
+        }),
+        ScopeNode::Other => false,
+    }
+}
+
+/// Entry 242's `loopsWithoutReuse` — whether every loop on that path either carries a dim the
+/// transfer moves or is known to trip exactly once.
+fn loops_without_reuse<S: StageExtents + ?Sized>(
+    stages: Option<&S>,
+    path: &AncestorPath,
+    relevant_dims: &BTreeSet<PrimaryDim>,
+) -> bool {
+    for entry in path.below_ancestor() {
+        let PathKind::Loop(dim_loop) = &entry.kind else {
+            continue;
+        };
+        for &(dim, kind) in &dim_loop.dims {
+            if relevant_dims.contains(&dim) && kind != MetaDimKind::WindowDim {
+                continue;
+            }
+            // The transfer result is reused unless the dimension is known to be 1.
+            let Some(stages) = stages else {
+                return false;
+            };
+            if stages.stage_extent(dim_loop.num, dim) != stages.stage_extent(dim_loop.den, dim) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Replaces: e242_canUseFifo
+///
+/// Whether a transfer's result can reach its one consumer through a FIFO instead of a register: the
+/// channel must exist, the consumer must not read the result on two inputs, neither ancestor path
+/// may cross a condition or a parametric loop, nothing scheduled between the two may use that
+/// channel, and — unless they are siblings — no loop over the scope may make the result be reused.
+/// ⛔ TRAP: `otherConsumerInputs` COMPARES AN INPUT UNIT AGAINST `loc_.storage_` (`:51`), so the
+/// destination's own unit normally lands in the set. ⛔ TRAP: `LXLUVALUE` answers FALSE here and
+/// TRUE in entry 243 (`:289`), on the same field. ⛔ The `std::cerr` reports are dropped: they read
+/// nothing but names and change no IR, which is why `getNodeDescription` is not called.
+pub fn can_use_fifo<T, S>(
+    tree: &T,
+    stages: Option<&S>,
+    transfer: &TransferDst<'_>,
+    consumer: NodeId,
+) -> bool
+where
+    T: ScopeTree + ?Sized,
+    S: StageExtents + ?Sized,
+{
+    if transfer.dst.unit == SenComponent::Lxluvalue {
+        return false;
+    }
+    let Some(channel) = Channel::of(transfer) else {
+        return false;
+    };
+
+    // Other inputs of the consumer, to avoid triangular dependencies that would rely on fifo depth.
+    let mut other_consumer_inputs = BTreeSet::new();
+    if let ScopeNode::Compute(compute) = tree.scope_node(consumer) {
+        for input in &compute.inputs {
+            if input.unit != transfer.dst.storage {
+                other_consumer_inputs.insert(input.unit);
+            }
+        }
+        if reads_result_twice(&compute.inputs, transfer.dst.data.data_connect) {
+            return false;
+        }
+    }
+
+    let ancestry = tree.ancestry(transfer.node, consumer);
+    if ancestry.ancestors_through_common().any(PathNode::unsupported) {
+        return false;
+    }
+
+    let start = ancestry.to_transfer.child_of_ancestor().node;
+    let end = ancestry.to_consumer.child_of_ancestor().node;
+    let mut checking = false;
+    for child in children_of(tree, ancestry.ancestor.node) {
+        if child == start {
+            checking = true;
+        } else if !checking {
+            continue;
+        }
+        if uses_communication_channel(
+            tree,
+            transfer.node,
+            child,
+            channel,
+            &other_consumer_inputs,
+        ) {
+            return false;
+        }
+        if child == end {
+            // The path to the consumer (inclusive) does not access the channel of interest.
+            break;
+        }
+    }
+
+    if tree.parent(transfer.node) == tree.parent(consumer) {
+        return true;
+    }
+
+    let transfer_dims = tree.non_broadcast_lds_dims(transfer.transfer.src.data.my_lds_idx);
+    loops_without_reuse(stages, &ancestry.to_consumer, &transfer_dims)
+        && loops_without_reuse(stages, &ancestry.to_transfer, &transfer_dims)
+}
+
+/// Entry 243's `analyzeLatchUsage` — whether the scope below that node is free of anything that
+/// would conflict with the intended latch. The producer itself is accepted.
+///
+/// ⛔ `unit`, `srcIndex` AND `dataConnect` ARE DEAD: the reference threads all three through the
+/// recursion and reads none of them (`ddc/ddc_transformation.cpp:508-576`), so `destUnit` — bound at
+/// `:347` for this call alone — is not carried either.
+fn analyze_latch_usage<T: ScopeTree + ?Sized>(
+    tree: &T,
+    producer: NodeId,
+    node: NodeId,
+    consumers: &Consumers,
+) -> bool {
+    if node == producer {
+        return true;
+    }
+    match tree.scope_node(node) {
+        ScopeNode::Compute(_) => consumers.contains(node),
+        ScopeNode::Transfer(transfer) => {
+            consumers.contains(node)
+                || transfer
+                    .dsts
+                    .iter()
+                    .all(|dst| dst.storage != SenComponent::Latch)
+        }
+        ScopeNode::Nest(children) => children
+            .into_iter()
+            .all(|child| analyze_latch_usage(tree, producer, child, consumers)),
+        ScopeNode::Other => true,
+    }
+}
+
+/// Replaces: e243_canUseLatch
+///
+/// Whether one transfer's result can be latched for all of its consumers: one load per corelet,
+/// every consumer a non-opaque, non-PT compute of the same type reading the result on the same input
+/// positions and never twice, no condition or parametric loop strictly between transfer and
+/// consumer, and nothing else in that scope computing or latching.
+/// ⛔ TRAP: `LXLUVALUE` answers TRUE — see entry 242's ⛔ on the same field. ⛔ `isOpaqueOp_` is read
+/// as a `metadata.opaqueOps_` entry: the flag and the entry are written together
+/// (`ddc/ddl/ddl_conversion.cpp:1575-1577`) and cloned together (`ddc_transformation_util.cpp:1497`).
+/// ⛔ `DT_ERROR` on `!dataStageExplorationDone_` is unreachable: its one caller tests that flag on
+/// the line before the call (`:675`), so no phase argument is taken.
+pub fn can_use_latch<T>(
+    tree: &T,
+    metadata: &Metadata,
+    transfer: &TransferDst<'_>,
+    consumers: &Consumers,
+) -> bool
+where
+    T: ScopeTree + TransferLoads + ?Sized,
+{
+    if transfer.dst.unit == SenComponent::Lxluvalue {
+        return true;
+    }
+    if transfer.dst.storage == SenComponent::Lxluscalereg {
+        return false;
+    }
+    if transfer.transfer.src.unit == SenComponent::Constant {
+        return false;
+    }
+    if tree
+        .corelets()
+        .into_iter()
+        .any(|corelet| tree.block_transfer_loads(transfer.node, corelet) != Loads::ONE)
+    {
+        return false;
+    }
+
+    let result_connect = transfer.dst.data.data_connect;
+    let mut computes = Vec::new();
+    for consumer in consumers.iter() {
+        // `computeConsumersCount != consumers.size()` — a non-compute consumer refuses.
+        let ScopeNode::Compute(compute) = tree.scope_node(consumer) else {
+            return false;
+        };
+        if reads_result_twice(&compute.inputs, result_connect) {
+            return false;
+        }
+        computes.push((consumer, compute));
+    }
+
+    // Latched data is used on the same input port for all compute-consumers, so all of them must
+    // agree on the compute type, and PT may not have access to all FIFOs for all sources.
+    let mut prev_op = None;
+    for (_, compute) in &computes {
+        if compute.ex_unit == SenComponent::Pt {
+            return false;
+        }
+        match prev_op {
+            None => prev_op = Some(compute.op),
+            Some(op) if op != compute.op => return false,
+            Some(_) => {}
+        }
+    }
+
+    // The source position(s) every consumer reads the result on.
+    // ⛔ `DT_CHECK(!srcIndex.empty())` holds because the consumers are the connect's own census.
+    let mut src_index = BTreeSet::new();
+    let mut first_consumer = true;
+    for (node, compute) in &computes {
+        if metadata.opaque_ops.contains_key(node) {
+            return false;
+        }
+        let mut use_count = 0;
+        for (position, input) in compute.inputs.iter().enumerate() {
+            if input.data.data_connect != result_connect {
+                continue;
+            }
+            use_count += 1;
+            if first_consumer {
+                src_index.insert(position);
+            } else if !src_index.contains(&position) {
+                return false;
+            }
+        }
+        if !first_consumer && src_index.len() != use_count {
+            return false;
+        }
+        first_consumer = false;
+    }
+
+    for consumer in consumers.iter() {
+        let ancestry = tree.ancestry(transfer.node, consumer);
+        if ancestry.ancestors_below_common().any(PathNode::unsupported) {
+            return false;
+        }
+        let start = ancestry.to_transfer.child_of_ancestor().node;
+        let end = ancestry.to_consumer.child_of_ancestor().node;
+        let mut checking = false;
+        for child in children_of(tree, ancestry.ancestor.node) {
+            if child == start {
+                checking = true;
+            } else if !checking {
+                continue;
+            }
+            if !analyze_latch_usage(tree, transfer.node, child, consumers) {
+                return false;
+            }
+            if child == end {
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+/// Replaces: e244_cloneForOffsetAdjustment
+///
+/// Runs entry 108 over every compute in the schedule tree.
+///
+/// ⛔ THE WALK IS A SNAPSHOT: `traverseTreeDFSMutable` hands back the vector it has already
+/// collected, so the clones entry 108 inserts beside each compute are NOT revisited.
+/// ⛔ The unconditional `return true` is dropped — its one caller discards it (`ddc/ddcv1.cpp:3732`).
+pub fn clone_for_offset_adjustment<T: ComputeWalk + OffsetAdjustment + ?Sized>(tree: &mut T) {
+    for node in tree.computes() {
+        clone_compute_for_offset_adjustment(tree, node);
+    }
+}
+
+/// Replaces: e245_setSizeForFixedSizeTransfers
+///
+/// Gives every transfer that feeds an LXLU compute the stick sizes of the data structure at its
+/// FIRST such destination, and stops scanning that transfer there.
+///
+/// ⛔ DELIBERATE DIVERGENCE: `DT_CHECK(ldsIdx >= 0 && ldsIdx < labeledDs_.size())` aborts on a
+/// destination that carries no `myLdsIdx_`; here that destination is skipped and the scan continues,
+/// because a runtime refusal is not available to this crate and an abort states nothing about the
+/// remaining destinations.
+pub fn set_size_for_fixed_size_transfers<T>(tree: &mut T)
+where
+    T: TransferWalk + DsSticks + FixedSizeTransfers + ?Sized,
+{
+    for node in tree.transfers() {
+        let transfer = tree.transfer(node);
+        for dst in transfer.dsts.iter() {
+            let Some(connect) = dst.data.data_connect else {
+                continue;
+            };
+            let feeds_lxlu = tree.connect_consumers(connect).into_iter().any(|consumer| {
+                matches!(consumer, ScopeNode::Compute(compute) if compute.ex_unit == SenComponent::Lxlu)
+            });
+            if !feeds_lxlu {
+                continue;
+            }
+            let Some(lds) = dst.data.my_lds_idx else {
+                continue;
+            };
+            let sizes = stick_sizes(&tree.ds_stick_dims(lds), StickPart::Whole);
+            tree.set_transfer_size(node, sizes);
+            break;
+        }
+    }
+}
+
+/// Replaces: e246_transformForInterSliceRestickify
+///
+/// Masks (entry 109) every PT compute of the shape `(ZERO, ONE, <a labelled DS>)` whose input and
+/// output stick dim orders differ, over the output's OUTERMOST stick dim.
+///
+/// ⛔ THE COMPARISON IS OF THE WHOLE DIM-AND-SIZE LISTS, not of the dim orders alone: `operator!=`
+/// on `std::vector<std::pair<PrimaryDimTypes, int>>` (`:2419`), so two identical orders with one
+/// differing extent transform. ⛔ `didTransformation` is dropped — its one caller discards it
+/// (`ddc/ddcv1.cpp:3764`) — and so is `none_trivial_input_idx`, which entry 109 never reads.
+pub fn transform_for_inter_slice_restickify<T>(tree: &mut T)
+where
+    T: ComputeWalk + ComputeNodes + DsSticks + ComputeMasking + ?Sized,
+{
+    for node in tree.computes() {
+        let compute = tree.compute(node);
+        if generic_comp(compute.ex_unit) != Some(GenericComp::Pt) {
+            continue;
+        }
+        let [zero, one, variable] = compute.inputs.as_slice() else {
+            continue;
+        };
+        if zero.unit != SenComponent::Zero || one.unit != SenComponent::One {
+            continue;
+        }
+        let (Some(input_lds), Some(output_lds)) = (
+            variable.data.my_lds_idx,
+            compute.outputs.first().and_then(|out| out.data.my_lds_idx),
+        ) else {
+            continue;
+        };
+        let input_sticks = stick_sizes(&tree.ds_stick_dims(input_lds), StickPart::Whole);
+        let output_sticks = stick_sizes(&tree.ds_stick_dims(output_lds), StickPart::Whole);
+        if input_sticks == output_sticks {
+            continue;
+        }
+        let Some(&(outermost, _)) = output_sticks.first() else {
+            continue;
+        };
+        let Some(site) = MaskedComputeSite::of(&*tree, node, outermost) else {
+            continue;
+        };
+        transform_a_compute_node_for_inter_slice_restickify(tree, site);
+    }
+}
 
 // crustify:todo: e300_packStickDim
 //   authority : ddc/ddc_transformation.cpp:811  (544 body lines, level 2)
@@ -1008,5 +1709,540 @@ mod tests_e105_e109 {
                 (1, PrimaryDim::In, MaskLoopOffset::ADVANCE),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_e242_e246 {
+    use super::*;
+    use crate::generated::ComputeType;
+    use crate::schedule::dsc2::{DataInfo, Dsts, ReplicationFactor};
+    use crate::units::NumFolds;
+
+    fn operand(
+        unit: SenComponent,
+        storage: SenComponent,
+        connect: Option<DataConnect>,
+        lds: Option<u32>,
+    ) -> Operand {
+        Operand {
+            unit,
+            storage,
+            data: DataInfo {
+                data_connect: connect,
+                my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
+            },
+        }
+    }
+
+    fn compute_node(
+        ex_unit: SenComponent,
+        inputs: Vec<Operand>,
+        outputs: Vec<Operand>,
+    ) -> ComputeNode {
+        ComputeNode {
+            name: NodeName("c".to_owned()),
+            op: ComputeType::Macc,
+            ex_unit,
+            inputs,
+            outputs,
+            num_folds_engaged: NumFolds::ONE,
+        }
+    }
+
+    fn transfer_node(src: Operand, dsts: Dsts) -> TransferNode {
+        TransferNode {
+            name: NodeName("t".to_owned()),
+            src,
+            dsts,
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+        }
+    }
+
+    /// An LXLU→PE transfer of `PeHtOut`, and the PE compute that reads it off `PELRF`.
+    fn lxlu_to_pe(dst_unit: SenComponent) -> (TransferNode, ComputeNode) {
+        let xfer = transfer_node(
+            operand(
+                SenComponent::Lxlu,
+                SenComponent::Lxlu,
+                Some(DataConnect::PeHtOut),
+                Some(0),
+            ),
+            Dsts::new(
+                operand(
+                    dst_unit,
+                    SenComponent::Pelrf,
+                    Some(DataConnect::PeHtOut),
+                    Some(0),
+                ),
+                vec![],
+            ),
+        );
+        let consumer = compute_node(
+            SenComponent::Pe,
+            vec![operand(
+                SenComponent::Pelrf,
+                SenComponent::Pelrf,
+                Some(DataConnect::PeHtOut),
+                Some(0),
+            )],
+            vec![operand(SenComponent::Pelrf, SenComponent::Pelrf, None, Some(1))],
+        );
+        (xfer, consumer)
+    }
+
+    /// One node of the fixture tree.
+    struct Node {
+        scope: ScopeNode,
+        path: PathKind,
+        parent: Option<NodeId>,
+    }
+
+    /// A schedule tree as a flat list, each node naming its parent.
+    struct Tree {
+        nodes: Vec<Node>,
+        loads: Loads,
+    }
+
+    impl Tree {
+        fn at(&self, node: NodeId) -> &Node {
+            &self.nodes[node.0 as usize]
+        }
+
+        fn path_node(&self, node: NodeId) -> PathNode {
+            PathNode {
+                node,
+                kind: self.at(node).path.clone(),
+            }
+        }
+
+        /// The node and its ancestors, innermost first.
+        fn chain(&self, node: NodeId) -> Vec<NodeId> {
+            let mut chain = vec![node];
+            while let Some(parent) = self.parent(*chain.last().expect("a seeded chain")) {
+                chain.push(parent);
+            }
+            chain
+        }
+    }
+
+    impl ScopeTree for Tree {
+        fn ancestry(&self, transfer: NodeId, consumer: NodeId) -> Ancestry {
+            let to_transfer = self.chain(transfer);
+            let to_consumer = self.chain(consumer);
+            let common = *to_transfer
+                .iter()
+                .find(|node| to_consumer.contains(node))
+                .expect("one shared root was stated");
+            let cut = |chain: Vec<NodeId>| {
+                let mut below = chain.into_iter().take_while(|node| *node != common);
+                let node = self.path_node(below.next().expect("the node itself"));
+                AncestorPath::new(node, below.map(|inner| self.path_node(inner)).collect())
+            };
+            Ancestry {
+                to_transfer: cut(to_transfer),
+                to_consumer: cut(to_consumer),
+                ancestor: self.path_node(common),
+            }
+        }
+
+        fn scope_node(&self, node: NodeId) -> ScopeNode {
+            self.at(node).scope.clone()
+        }
+
+        fn parent(&self, node: NodeId) -> Option<NodeId> {
+            self.at(node).parent
+        }
+
+        fn non_broadcast_lds_dims(&self, _lds: Option<LdsIdx>) -> BTreeSet<PrimaryDim> {
+            BTreeSet::new()
+        }
+    }
+
+    impl TransferLoads for Tree {
+        fn corelets(&self) -> Vec<Corelet> {
+            (0..1).filter_map(Corelet::checked).collect()
+        }
+
+        fn block_transfer_loads(&self, _transfer: NodeId, _corelet: Corelet) -> Loads {
+            self.loads
+        }
+    }
+
+    /// `dataStageParam_` for one loop: the `numId_` extent and the `denId_` one.
+    struct Stages(Extent, Extent);
+
+    impl StageExtents for Stages {
+        fn stage_extent(&self, stage: DatastageId, _dim: PrimaryDim) -> Extent {
+            if stage == DatastageId(0) { self.0 } else { self.1 }
+        }
+    }
+
+    /// A root block holding the transfer at node 1, then `between`, then the consumer LAST.
+    fn one_block(xfer: TransferNode, between: Vec<ScopeNode>, consumer: ScopeNode) -> Tree {
+        let mut nodes = vec![Node {
+            scope: ScopeNode::Nest(Vec::new()),
+            path: PathKind::Other,
+            parent: None,
+        }];
+        for scope in core::iter::once(ScopeNode::Transfer(xfer))
+            .chain(between)
+            .chain(core::iter::once(consumer))
+        {
+            nodes.push(Node {
+                scope,
+                path: PathKind::Other,
+                parent: Some(NodeId(0)),
+            });
+        }
+        let children = (1..u32::try_from(nodes.len()).expect("a small fixture"))
+            .map(NodeId)
+            .collect();
+        nodes[0].scope = ScopeNode::Nest(children);
+        Tree {
+            nodes,
+            loads: Loads::ONE,
+        }
+    }
+
+    #[test]
+    fn siblings_can_use_a_fifo_until_something_between_them_drives_the_channel() {
+        let (xfer, consumer) = lxlu_to_pe(SenComponent::Pe);
+        let tree = one_block(xfer.clone(), vec![], ScopeNode::Compute(consumer.clone()));
+        let dst = TransferDst::of(NodeId(1), &xfer, DestIdx(0)).expect("one destination");
+        assert!(can_use_fifo(&tree, Some(&Stages(Extent(1), Extent(1))), &dst, NodeId(2)));
+
+        // A PE compute reading LXLU between the two occupies the very channel the FIFO would use.
+        let interposed = compute_node(
+            SenComponent::Pe,
+            vec![operand(SenComponent::Lxlu, SenComponent::Lxlu, None, None)],
+            vec![],
+        );
+        let blocked = one_block(
+            xfer.clone(),
+            vec![ScopeNode::Compute(interposed)],
+            ScopeNode::Compute(consumer.clone()),
+        );
+        assert!(!can_use_fifo(
+            &blocked,
+            Some(&Stages(Extent(1), Extent(1))),
+            &dst,
+            NodeId(3)
+        ));
+
+        // ⛔ THE TRAP: the LXLUVALUE destination that refuses a FIFO PERMITS a latch.
+        let (value_xfer, _) = lxlu_to_pe(SenComponent::Lxluvalue);
+        let value_dst =
+            TransferDst::of(NodeId(1), &value_xfer, DestIdx(0)).expect("one destination");
+        assert!(!can_use_fifo(
+            &tree,
+            Some(&Stages(Extent(1), Extent(1))),
+            &value_dst,
+            NodeId(2)
+        ));
+        assert!(can_use_latch(
+            &tree,
+            &Metadata::default(),
+            &value_dst,
+            &Consumers::new(NodeId(2), vec![])
+        ));
+    }
+
+    #[test]
+    fn a_loop_over_the_consumer_needs_its_dimension_known_to_trip_once() {
+        let (xfer, consumer) = lxlu_to_pe(SenComponent::Pe);
+        // Root { transfer, loop { consumer } } — the transfer's data carries no dim, so the loop's
+        // own dim is never `relevantDims` and only equal datastage extents can excuse it.
+        let tree = Tree {
+            nodes: vec![
+                Node {
+                    scope: ScopeNode::Nest(vec![NodeId(1), NodeId(2)]),
+                    path: PathKind::Other,
+                    parent: None,
+                },
+                Node {
+                    scope: ScopeNode::Transfer(xfer.clone()),
+                    path: PathKind::Other,
+                    parent: Some(NodeId(0)),
+                },
+                Node {
+                    scope: ScopeNode::Nest(vec![NodeId(3)]),
+                    path: PathKind::Loop(PathLoop {
+                        parametric: false,
+                        dims: vec![(PrimaryDim::Out, MetaDimKind::Unpadded)],
+                        num: DatastageId(0),
+                        den: DatastageId(1),
+                    }),
+                    parent: Some(NodeId(0)),
+                },
+                Node {
+                    scope: ScopeNode::Compute(consumer),
+                    path: PathKind::Other,
+                    parent: Some(NodeId(2)),
+                },
+            ],
+            loads: Loads::ONE,
+        };
+        let dst = TransferDst::of(NodeId(1), &xfer, DestIdx(0)).expect("one destination");
+        assert!(can_use_fifo(
+            &tree,
+            Some(&Stages(Extent(4), Extent(4))),
+            &dst,
+            NodeId(3)
+        ));
+        assert!(!can_use_fifo(
+            &tree,
+            Some(&Stages(Extent(4), Extent(2))),
+            &dst,
+            NodeId(3)
+        ));
+        // ⛔ `None` IS `!dataStageExplorationDone_`: the extents cannot be consulted at all.
+        assert!(!can_use_fifo(&tree, None::<&Stages>, &dst, NodeId(3)));
+    }
+
+    #[test]
+    fn a_latch_is_refused_by_any_unrelated_compute_in_the_scope() {
+        let (xfer, consumer) = lxlu_to_pe(SenComponent::Pe);
+        let dst = TransferDst::of(NodeId(1), &xfer, DestIdx(0)).expect("one destination");
+        let consumers = Consumers::new(NodeId(2), vec![]);
+        let tree = one_block(xfer.clone(), vec![], ScopeNode::Compute(consumer.clone()));
+        assert!(can_use_latch(&tree, &Metadata::default(), &dst, &consumers));
+
+        // An unrelated compute between producer and consumer, and then a latching transfer.
+        let unrelated = compute_node(SenComponent::Pe, vec![], vec![]);
+        let latching = transfer_node(
+            operand(SenComponent::Lxlu, SenComponent::Lxlu, None, None),
+            Dsts::new(
+                operand(SenComponent::Pe, SenComponent::Latch, None, None),
+                vec![],
+            ),
+        );
+        for between in [
+            ScopeNode::Compute(unrelated),
+            ScopeNode::Transfer(latching),
+        ] {
+            let blocked = one_block(
+                xfer.clone(),
+                vec![between],
+                ScopeNode::Compute(consumer.clone()),
+            );
+            assert!(!can_use_latch(
+                &blocked,
+                &Metadata::default(),
+                &dst,
+                &Consumers::new(NodeId(3), vec![])
+            ));
+        }
+
+        // An opaque consumer refuses, and `isOpaqueOp_` is read as its `opaqueOps_` entry.
+        let mut metadata = Metadata::default();
+        metadata
+            .opaque_ops
+            .insert(NodeId(2), crate::schedule::ddc::metadata::OpaqueOp::default());
+        assert!(!can_use_latch(&tree, &metadata, &dst, &consumers));
+    }
+
+    /// Two computes, each with one output that repeats twice.
+    #[derive(Default)]
+    struct Cloning {
+        next: u32,
+        cloned: Vec<(NodeId, NodeId)>,
+    }
+
+    impl ComputeWalk for Cloning {
+        fn computes(&self) -> Vec<NodeId> {
+            vec![NodeId(0), NodeId(1)]
+        }
+        fn compute_op(&self, _node: NodeId) -> ComputeOp {
+            ComputeOp::Other
+        }
+    }
+
+    impl OffsetAdjustment for Cloning {
+        fn output_repetitions(&self, _node: NodeId) -> Vec<Repetition> {
+            vec![Repetition(2)]
+        }
+        fn clone_compute_after(&mut self, _node: NodeId) -> NodeId {
+            self.next += 1;
+            NodeId(100 + self.next)
+        }
+        fn set_output_repetition(&mut self, _node: NodeId, _idx: OutputIdx, _reps: Repetition) {}
+        fn record_clone(&mut self, original: NodeId, clone: NodeId) {
+            self.cloned.push((original, clone));
+        }
+        fn output_allocation(&self, _node: NodeId, _idx: OutputIdx) -> Option<AllocId> {
+            None
+        }
+        fn add_alloc_user(&mut self, _alloc: AllocId, _user: NodeId) {}
+        fn alloc_outermost_layout_dim(&self, _alloc: AllocId) -> PrimaryDim {
+            PrimaryDim::Out
+        }
+        fn set_gap_stick_spread(
+            &mut self,
+            _alloc: AllocId,
+            _dim: PrimaryDim,
+            _spread: StickSpread,
+        ) {
+        }
+    }
+
+    #[test]
+    fn every_compute_in_the_tree_is_offset_adjusted_and_the_clones_are_not_revisited() {
+        let mut tree = Cloning::default();
+        clone_for_offset_adjustment(&mut tree);
+        assert_eq!(
+            tree.cloned,
+            vec![(NodeId(0), NodeId(101)), (NodeId(1), NodeId(102))]
+        );
+    }
+
+    /// One transfer with two destinations, and the sizes entry 245 wrote.
+    struct Sizing {
+        transfer: TransferNode,
+        written: Vec<(NodeId, Vec<(PrimaryDim, Elements)>)>,
+    }
+
+    impl TransferWalk for Sizing {
+        fn transfers(&self) -> Vec<NodeId> {
+            vec![NodeId(0)]
+        }
+        fn transfer(&self, _node: NodeId) -> TransferNode {
+            self.transfer.clone()
+        }
+    }
+
+    impl DsSticks for Sizing {
+        fn ds_stick_dims(&self, lds: LdsIdx) -> StickDims {
+            StickDims(vec![(PrimaryDim::Out, Elements(u64::from(lds.0) + 2))])
+        }
+    }
+
+    impl FixedSizeTransfers for Sizing {
+        fn connect_consumers(&self, connect: DataConnect) -> Vec<ScopeNode> {
+            let ex_unit = if connect == DataConnect::ArfPt {
+                SenComponent::Lxlu
+            } else {
+                SenComponent::Pe
+            };
+            vec![ScopeNode::Compute(compute_node(ex_unit, vec![], vec![]))]
+        }
+        fn set_transfer_size(&mut self, transfer: NodeId, sizes: Vec<(PrimaryDim, Elements)>) {
+            self.written.push((transfer, sizes));
+        }
+    }
+
+    #[test]
+    fn only_the_first_destination_feeding_an_lxlu_compute_sizes_the_transfer() {
+        let mut tree = Sizing {
+            transfer: transfer_node(
+                operand(SenComponent::Lxlu, SenComponent::Lxlu, None, Some(0)),
+                Dsts::new(
+                    // A destination whose consumer is not on LXLU, then one whose consumer is.
+                    operand(
+                        SenComponent::Pe,
+                        SenComponent::Pelrf,
+                        Some(DataConnect::PeHtOut),
+                        Some(9),
+                    ),
+                    vec![operand(
+                        SenComponent::Lxlu,
+                        SenComponent::Lxlu,
+                        Some(DataConnect::ArfPt),
+                        Some(3),
+                    )],
+                ),
+            ),
+            written: Vec::new(),
+        };
+        set_size_for_fixed_size_transfers(&mut tree);
+        assert_eq!(
+            tree.written,
+            vec![(NodeId(0), vec![(PrimaryDim::Out, Elements(5))])]
+        );
+    }
+
+    /// One PT compute of the `(ZERO, ONE, <a labelled DS>)` shape, and what masking it recorded.
+    struct Restickify {
+        compute: ComputeNode,
+        sticks: Vec<StickDims>,
+        offsets: Vec<(u32, PrimaryDim)>,
+    }
+
+    impl ComputeWalk for Restickify {
+        fn computes(&self) -> Vec<NodeId> {
+            vec![NodeId(0)]
+        }
+        fn compute_op(&self, _node: NodeId) -> ComputeOp {
+            ComputeOp::Other
+        }
+    }
+
+    impl ComputeNodes for Restickify {
+        fn compute(&self, _compute: NodeId) -> ComputeNode {
+            self.compute.clone()
+        }
+    }
+
+    impl DsSticks for Restickify {
+        fn ds_stick_dims(&self, lds: LdsIdx) -> StickDims {
+            self.sticks[lds.0 as usize].clone()
+        }
+    }
+
+    impl ComputeMasking for Restickify {
+        fn compute_name(&self, _compute: NodeId) -> NodeName {
+            self.compute.name.clone()
+        }
+        fn set_compute_name(&mut self, _compute: NodeId, name: NodeName) {
+            self.compute.name = name;
+        }
+        fn parent_dim_loop(&self, _compute: NodeId, _dim: PrimaryDim) -> Option<LoopId> {
+            Some(LoopId(NodeId(9)))
+        }
+        fn corelets(&self) -> Vec<Corelet> {
+            (0..1).filter_map(Corelet::checked).collect()
+        }
+        fn loop_dims(&self, _dim_loop: LoopId) -> Vec<PrimaryDim> {
+            vec![PrimaryDim::In]
+        }
+        fn set_compute_mask_loop_offset(
+            &mut self,
+            _compute: NodeId,
+            corelet: Corelet,
+            _dim_loop: LoopId,
+            dim: PrimaryDim,
+            _offset: MaskLoopOffset,
+        ) {
+            self.offsets.push((corelet.get(), dim));
+        }
+    }
+
+    #[test]
+    fn a_pt_compute_is_masked_only_when_its_input_and_output_sticks_differ() {
+        let restickify = |output: StickDims| Restickify {
+            compute: compute_node(
+                SenComponent::Ptrow0,
+                vec![
+                    operand(SenComponent::Zero, SenComponent::NoComponent, None, None),
+                    operand(SenComponent::One, SenComponent::NoComponent, None, None),
+                    operand(SenComponent::Lxlu, SenComponent::Lxlu, None, Some(0)),
+                ],
+                vec![operand(SenComponent::Pe, SenComponent::Pelrf, None, Some(1))],
+            ),
+            sticks: vec![StickDims(vec![(PrimaryDim::Out, Elements(4))]), output],
+            offsets: Vec::new(),
+        };
+
+        let mut differing = restickify(StickDims(vec![(PrimaryDim::In, Elements(4))]));
+        transform_for_inter_slice_restickify(&mut differing);
+        assert_eq!(differing.compute.name, NodeName("c_masked".to_owned()));
+        assert_eq!(differing.offsets, vec![(0, PrimaryDim::In)]);
+
+        let mut same = restickify(StickDims(vec![(PrimaryDim::Out, Elements(4))]));
+        transform_for_inter_slice_restickify(&mut same);
+        assert_eq!(same.compute.name, NodeName("c".to_owned()));
+        assert!(same.offsets.is_empty());
     }
 }
