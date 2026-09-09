@@ -96,7 +96,7 @@ use crate::transform::sentient::{ForRef, IterArgIndex};
 /// A BASE ADDRESS TOGGLING BETWEEN TWO CONSTANTS — `class ToggleDescriptor`
 /// (`AddressPinningAndToggle.cpp:213-286`), matched as `X = c1 - Y` around a loop's iter arg.
 ///
-/// ⛔ THE THREE FIELDS ARE EXACTLY WHAT `isValid()` READS (`:263`:
+/// ⛔ ITS FIRST THREE FIELDS ARE EXACTLY WHAT `isValid()` READS (`:263`:
 /// `c1_ && iter_arg_index_ >= 0 && outer_loop_`), which is why [`ToggleDescriptor::invalidate`]
 /// clears these three and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,6 +107,13 @@ pub struct ToggleDescriptor {
     pub iter_arg_index: Option<IterArgIndex>,
     /// `c1_` — the constant term in `X = c1 - Y`.
     pub c1: Option<EvaluatedValue>,
+    /// `can_be_simplified_` — the base class's cached flag (`:159`), which the constructor sets to
+    /// `getX() == getY()` (e552, `:2710`): a "toggle" whose two constants turned out to be one.
+    ///
+    /// ⛔ IT IS PART OF THE TRANSFER'S VALIDITY, not a hint. `DataTransferDescriptor::isValid()`
+    /// accepts a toggle holding a SINGLE base address only when this is true (`:2484`), which is why
+    /// [`super::DataTransferDescriptor::is_toggle`] reads it.
+    pub can_be_simplified: bool,
 }
 
 impl ToggleDescriptor {
@@ -221,6 +228,7 @@ mod unit_tests {
             outer_loop: Some(ForRef(Val(2))),
             iter_arg_index: Some(IterArgIndex(0)),
             c1: None,
+            can_be_simplified: false,
         };
         let regions: [&[Op]; 1] = [&body];
         let _evaluated = toggle.init(&body, Definitions::from_innermost(&regions));

@@ -501,45 +501,176 @@ pub fn dump(immut: &[&dyn DumpDescriptor], mutable: &[&dyn DumpDescriptor]) -> S
     out
 }
 
-// crustify:todo: e257_getBaseAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:657  (4 body lines, level 1)
-//   original  : const EvaluatedValue &getBaseAddr() const
-//   calls     : e252_size
+// THE FIVE DESCRIPTORS' OWN `isValid()` — `:263`, `:318`, `:356`, `:468`, `:562`, each one to three
+// lines reading its own fields, and each on `EXCLUSIONS.tsv` as "a struct field in Rust, not a
+// function". ⛔ NONE OF THEM IS `DataTransferDescriptor::isValid()`, which is e278
+// (`data_transfer_descriptor.rs`): that one first requires a stored base address and then defers to
+// exactly the arm below that matches its `pattern_desc_`.
 
-// crustify:todo: e258_isToggle
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:677  (4 body lines, level 1)
-//   original  : bool isToggle() const
-//   calls     : e278_isValid
+impl ToggleDescriptor {
+    /// `isValid()` (`:263`) — `c1_ && iter_arg_index_ >= 0 && outer_loop_`, i.e. the three fields
+    /// [`ToggleDescriptor::invalidate`] clears being present.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.c1.is_some() && self.iter_arg_index.is_some() && self.outer_loop.is_some()
+    }
+}
 
-// crustify:todo: e259_isConditionalConstant
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:681  (4 body lines, level 1)
-//   original  : bool isConditionalConstant() const
-//   calls     : e278_isValid
+impl ConditionalConstantDescriptor {
+    /// `isValid()` (`:318`) — the conditional yielded at least one constant.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.yielded_constants.is_empty()
+    }
+}
 
-// crustify:todo: e260_isIntegerSequence
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:685  (4 body lines, level 1)
-//   original  : bool isIntegerSequence() const
-//   calls     : e278_isValid
+impl IntegerSequenceDescriptor {
+    /// `isValid()` (`:356`) — `iter_arg_index_ >= 0 && outer_loop_ && size_ > 0`.
+    ///
+    /// ⛔ [`SequenceSize::Symbolic`] IS NOT A LENGTH: it is the reference's `size_ == -1`, which fails
+    /// `size_ > 0` exactly as [`SequenceSize::Cleared`]'s `0` does.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.iter_arg_index.is_some()
+            && self.outer_loop.is_some()
+            && matches!(self.size, SequenceSize::Terms(terms) if terms > 0)
+    }
+}
 
-// crustify:todo: e261_isDiscreteIntegerSet
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:689  (4 body lines, level 1)
-//   original  : bool isDiscreteIntegerSet() const
-//   calls     : e278_isValid
+impl DiscreteIntegerSetDescriptor {
+    /// `isValid()` (`:468`) — `iter_arg_index_ >= 0 && outer_loop_`; ⛔ the two delta totals are NOT
+    /// part of it, unlike its four siblings' value fields.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.iter_arg_index.is_some() && self.outer_loop.is_some()
+    }
+}
 
-// crustify:todo: e262_isLoopingChainMutableAddr
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:693  (4 body lines, level 1)
-//   original  : bool isLoopingChainMutableAddr() const
-//   calls     : e278_isValid
+impl LoopingChainMutableAddrDescriptor {
+    /// `isValid()` (`:562`) — `is_head_of_chain_ && size_ >= 1 && outer_loop_`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.is_head_of_chain && self.size.0 >= 1 && self.outer_loop.is_some()
+    }
+}
 
-// crustify:todo: e263_getToggleDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:706  (4 body lines, level 1)
-//   original  : ToggleDescriptor &getToggleDescriptor()
-//   calls     : e258_isToggle
+impl DataTransferDescriptor {
+    /// Replaces: e257_getBaseAddr
+    ///
+    /// THE ONE constant base address this transfer resolved to — `*base_addrs_.back()` under
+    /// `DT_CHECK(base_addrs_.size() == 1)`.
+    ///
+    /// ⛔ `None` IS THAT `DT_CHECK`, AND IT IS NOT "no base address": a matched toggle stores TWO and
+    /// this accessor is the wrong one for it — a pair is read through [`Self::base_addrs`], which is
+    /// `getBaseAddrList()` (`:661`, an `EXCLUSIONS.tsv` field accessor).
+    #[must_use]
+    pub fn base_addr(&self) -> Option<EvaluatedValue> {
+        match self.base_addrs.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
 
-// crustify:todo: e264_getToggleDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:710  (4 body lines, level 1)
-//   original  : const ToggleDescriptor &getToggleDescriptor() const
-//   calls     : e258_isToggle
+    /// Replaces: e258_isToggle
+    ///
+    /// Whether this transfer's base address is a MATCHED toggle.
+    ///
+    /// ⛔ THE `isValid()` CONJUNCT IS SPECIALISED, NOT DROPPED: with the arm already destructured,
+    /// `isValid() && isa<Toggle>` is e278's toggle arm alone (`:2482-2485`), so an `invalidate()`d
+    /// toggle answers false, and so does a live one left holding one base address it never simplified
+    /// to. ⭐ `base_addrs.empty()` (`:2480`) needs no line here: neither size this arm accepts is 0.
+    #[must_use]
+    pub fn is_toggle(&self) -> bool {
+        let Some(PatternDescriptor::Toggle(toggle)) = &self.pattern_desc else {
+            return false;
+        };
+        toggle.is_valid()
+            && ((toggle.can_be_simplified && self.base_addrs.len() == 1)
+                || self.base_addrs.len() == 2)
+    }
+
+    /// Replaces: e259_isConditionalConstant
+    ///
+    /// Whether this transfer's base address is a MATCHED set of conditionally yielded constants.
+    ///
+    /// ⛔ THE EMPTY-LIST GUARD IS THE TRANSFER'S, NOT THE DESCRIPTOR'S: `isValid()` refuses a
+    /// transfer with no stored base address before it ever reaches this arm (`:2480`), and the arm
+    /// itself imposes no count (`:2486-2488`).
+    #[must_use]
+    pub fn is_conditional_constant(&self) -> bool {
+        let Some(PatternDescriptor::ConditionalConstant(cond_const)) = &self.pattern_desc else {
+            return false;
+        };
+        !self.base_addrs.is_empty() && cond_const.is_valid()
+    }
+
+    /// Replaces: e260_isIntegerSequence
+    ///
+    /// Whether this transfer's base address is a MATCHED `init + stride * i` sequence (`:2489-2491`).
+    #[must_use]
+    pub fn is_integer_sequence(&self) -> bool {
+        let Some(PatternDescriptor::IntegerSequence(int_seq)) = &self.pattern_desc else {
+            return false;
+        };
+        !self.base_addrs.is_empty() && int_seq.is_valid()
+    }
+
+    /// Replaces: e261_isDiscreteIntegerSet
+    ///
+    /// Whether this transfer's base address is a MATCHED set of independent per-loop increments
+    /// (`:2492-2494`).
+    #[must_use]
+    pub fn is_discrete_integer_set(&self) -> bool {
+        let Some(PatternDescriptor::DiscreteIntegerSet(int_set)) = &self.pattern_desc else {
+            return false;
+        };
+        !self.base_addrs.is_empty() && int_set.is_valid()
+    }
+
+    /// Replaces: e262_isLoopingChainMutableAddr
+    ///
+    /// Whether this transfer is the MATCHED head of a looping chain (`:2495-2497`).
+    #[must_use]
+    pub fn is_looping_chain_mutable_addr(&self) -> bool {
+        let Some(PatternDescriptor::LoopingChainMutableAddr(chain)) = &self.pattern_desc else {
+            return false;
+        };
+        !self.base_addrs.is_empty() && chain.is_valid()
+    }
+
+    /// Replaces: e263_getToggleDescriptor
+    ///
+    /// The toggle to MUTATE — the reference's non-const overload, which is what
+    /// `ToggleDescriptor::invalidate` and the pinning updates are reached through.
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isToggle())` (`:707`), so a descriptor that stopped being a valid toggle
+    /// hands back nothing rather than a live reference to an invalidated pattern.
+    #[must_use]
+    pub fn toggle_descriptor_mut(&mut self) -> Option<&mut ToggleDescriptor> {
+        if !self.is_toggle() {
+            return None;
+        }
+        match &mut self.pattern_desc {
+            Some(PatternDescriptor::Toggle(toggle)) => Some(toggle),
+            _ => None,
+        }
+    }
+
+    /// Replaces: e264_getToggleDescriptor
+    ///
+    /// The toggle to READ — the reference's `const` overload, a separate unit because the two differ
+    /// in exactly the mutability Rust makes the caller ask for.
+    ///
+    /// ⛔ `None` IS `DT_CHECK(isToggle())` (`:711`), NOT "not a toggle": a `Toggle` arm that fails
+    /// [`Self::is_toggle`] is present and refused, which is the whole point of the check.
+    #[must_use]
+    pub fn toggle_descriptor(&self) -> Option<&ToggleDescriptor> {
+        match &self.pattern_desc {
+            Some(PatternDescriptor::Toggle(toggle)) if self.is_toggle() => Some(toggle),
+            _ => None,
+        }
+    }
+}
 
 // ⭐ THE EIGHT PATTERN GETTERS ARE ONE `match` ON [`DataTransferDescriptor::pattern_desc`]: the
 // reference's `cast<T>(pattern_desc_)` IS the variant, and the `pattern_desc_ != nullptr` conjunct
@@ -913,6 +1044,28 @@ mod unit_tests {
         (Some(ForRef(Val(7))), Some(IterArgIndex(1)))
     }
 
+    /// One transfer carrying `pattern_desc_` and `base_addrs_`, the only two fields any `is*()` reads.
+    fn transfer(
+        pattern_desc: Option<PatternDescriptor>,
+        base_addrs: usize,
+    ) -> DataTransferDescriptor {
+        DataTransferDescriptor {
+            pattern_desc,
+            base_addrs: (0..base_addrs).map(|i| EvaluatedValue(i as u32)).collect(),
+        }
+    }
+
+    /// A toggle whose three validity fields are all present and that did NOT collapse to one value.
+    fn matched_toggle() -> ToggleDescriptor {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        ToggleDescriptor {
+            outer_loop,
+            iter_arg_index,
+            c1: Some(EvaluatedValue(3)),
+            can_be_simplified: false,
+        }
+    }
+
     #[test]
     fn toggle_invalidate_clears_all_three_validity_fields() {
         let (outer_loop, iter_arg_index) = loop_and_arg();
@@ -920,6 +1073,9 @@ mod unit_tests {
             outer_loop,
             iter_arg_index,
             c1: Some(EvaluatedValue(3)),
+            // ⛔ `invalidate()` does not clear this one either, so the equality below is only a
+            // statement about the three fields `isValid()` reads.
+            can_be_simplified: false,
         };
         desc.invalidate();
         assert_eq!(desc, ToggleDescriptor::default());
@@ -1188,6 +1344,7 @@ mod unit_tests {
             outer_loop: Some(ForRef(Val(7))),
             iter_arg_index: Some(IterArgIndex(1)),
             c1: Some(EvaluatedValue(3)),
+            can_be_simplified: false,
         };
         let _ = with_pattern(PatternDescriptor::Toggle(toggle)).integer_sequence_descriptor();
     }
@@ -1197,5 +1354,177 @@ mod unit_tests {
     #[should_panic(expected = "DT_CHECK(isConditionalConstant())")]
     fn asking_an_unmatched_transfer_for_a_pattern_descriptor_is_the_dt_check() {
         let _ = DataTransferDescriptor::default().conditional_constant_descriptor();
+    }
+
+    /// 257/656 — the `DT_CHECK(size() == 1)`: one stored address is the answer, a toggle's pair and an
+    /// unmatched transfer's empty list are both refusals.
+    #[test]
+    fn e257_base_addr_is_the_single_stored_address_or_nothing() {
+        assert_eq!(transfer(None, 1).base_addr(), Some(EvaluatedValue(0)));
+        assert_eq!(transfer(None, 2).base_addr(), None);
+        assert_eq!(transfer(None, 0).base_addr(), None);
+    }
+
+    /// 258/656 — a toggle needs TWO stored addresses, or one when it simplified; and an invalidated
+    /// toggle is not one however many it holds.
+    #[test]
+    fn e258_a_toggle_needs_two_base_addrs_unless_it_simplified_to_one() {
+        let toggle = matched_toggle();
+        assert!(transfer(Some(PatternDescriptor::Toggle(toggle)), 2).is_toggle());
+        assert!(!transfer(Some(PatternDescriptor::Toggle(toggle)), 1).is_toggle());
+
+        let simplified = ToggleDescriptor {
+            can_be_simplified: true,
+            ..toggle
+        };
+        assert!(transfer(Some(PatternDescriptor::Toggle(simplified)), 1).is_toggle());
+
+        let mut invalidated = toggle;
+        invalidated.invalidate();
+        assert!(!transfer(Some(PatternDescriptor::Toggle(invalidated)), 2).is_toggle());
+        assert!(!transfer(None, 2).is_toggle());
+    }
+
+    /// 259/656 — one yielded constant and one stored address, and ⛔ the two conditions are separate:
+    /// dropping either flips the answer.
+    #[test]
+    fn e259_conditional_constant_needs_a_yielded_constant_and_a_stored_address() {
+        let matched = ConditionalConstantDescriptor {
+            yielded_constants: vec![EvaluatedValue(11)],
+            can_be_simplified: false,
+        };
+        let empty = ConditionalConstantDescriptor {
+            yielded_constants: Vec::new(),
+            can_be_simplified: false,
+        };
+        assert!(
+            transfer(
+                Some(PatternDescriptor::ConditionalConstant(matched.clone())),
+                1
+            )
+            .is_conditional_constant()
+        );
+        assert!(
+            !transfer(Some(PatternDescriptor::ConditionalConstant(matched)), 0)
+                .is_conditional_constant()
+        );
+        assert!(
+            !transfer(Some(PatternDescriptor::ConditionalConstant(empty)), 1)
+                .is_conditional_constant()
+        );
+    }
+
+    /// 260/656 — `size_ > 0`: a symbolic length is as invalid as a cleared one.
+    #[test]
+    fn e260_integer_sequence_refuses_a_symbolic_or_cleared_length() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let seq = IntegerSequenceDescriptor {
+            outer_loop,
+            iter_arg_index,
+            init: Some(EvaluatedValue(4)),
+            stride: Some(EvaluatedValue(8)),
+            size: SequenceSize::Terms(6),
+        };
+        assert!(transfer(Some(PatternDescriptor::IntegerSequence(seq)), 1).is_integer_sequence());
+        for size in [SequenceSize::Symbolic, SequenceSize::Cleared] {
+            let unsized_seq = IntegerSequenceDescriptor { size, ..seq };
+            assert!(
+                !transfer(Some(PatternDescriptor::IntegerSequence(unsized_seq)), 1)
+                    .is_integer_sequence()
+            );
+        }
+    }
+
+    /// 261/656 — the loop and its iter arg are the whole validity; ⛔ the delta totals are not part of
+    /// it, so a set that has them but no loop is still refused.
+    #[test]
+    fn e261_discrete_integer_set_is_the_loop_and_its_iter_arg_not_the_deltas() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let deltas = DiscreteIntegerSetDescriptor {
+            outer_loop,
+            iter_arg_index,
+            init: Some(EvaluatedValue(4)),
+            total_positive_delta: Some(EvaluatedValue(64)),
+            total_negative_delta: Some(EvaluatedValue(32)),
+        };
+        assert!(
+            transfer(Some(PatternDescriptor::DiscreteIntegerSet(deltas)), 1)
+                .is_discrete_integer_set()
+        );
+        let mut invalidated = deltas;
+        invalidated.invalidate();
+        assert!(
+            !transfer(Some(PatternDescriptor::DiscreteIntegerSet(invalidated)), 1)
+                .is_discrete_integer_set()
+        );
+        let no_loop = DiscreteIntegerSetDescriptor {
+            outer_loop: None,
+            ..deltas
+        };
+        assert!(
+            !transfer(Some(PatternDescriptor::DiscreteIntegerSet(no_loop)), 1)
+                .is_discrete_integer_set()
+        );
+    }
+
+    /// 262/656 — head flag, `size_ >= 1` and a loop, all three.
+    #[test]
+    fn e262_looping_chain_needs_the_head_flag_a_size_and_a_loop() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let head = LoopingChainMutableAddrDescriptor {
+            is_head_of_chain: true,
+            outer_loop,
+            iter_arg_index,
+            size: ChainSize(3),
+            init: Some(EvaluatedValue(4)),
+            increment: Some(EvaluatedValue(8)),
+        };
+        let chain = |desc| transfer(Some(PatternDescriptor::LoopingChainMutableAddr(desc)), 1);
+        assert!(chain(head).is_looping_chain_mutable_addr());
+        assert!(
+            !chain(LoopingChainMutableAddrDescriptor {
+                is_head_of_chain: false,
+                ..head
+            })
+            .is_looping_chain_mutable_addr()
+        );
+        assert!(
+            !chain(LoopingChainMutableAddrDescriptor {
+                size: ChainSize(0),
+                ..head
+            })
+            .is_looping_chain_mutable_addr()
+        );
+    }
+
+    /// 263/656 — the mutable overload is what an `invalidate()` travels through, and the same call
+    /// afterwards refuses: the descriptor stopped being a valid toggle.
+    #[test]
+    fn e263_toggle_descriptor_mut_is_how_a_toggle_gets_invalidated() {
+        let mut dtd = transfer(Some(PatternDescriptor::Toggle(matched_toggle())), 2);
+        dtd.toggle_descriptor_mut()
+            .expect("a matched toggle")
+            .invalidate();
+        assert!(dtd.toggle_descriptor_mut().is_none());
+        assert_eq!(
+            dtd.pattern_desc,
+            Some(PatternDescriptor::Toggle(ToggleDescriptor::default()))
+        );
+    }
+
+    /// 264/656 — the shared overload answers `Some` exactly when e258 does, so a present-but-invalid
+    /// `Toggle` arm is refused rather than handed out.
+    #[test]
+    fn e264_toggle_descriptor_is_none_for_a_present_but_invalid_toggle() {
+        let toggle = matched_toggle();
+        let matched = transfer(Some(PatternDescriptor::Toggle(toggle)), 2);
+        assert_eq!(matched.toggle_descriptor(), Some(&toggle));
+        // Present, and still refused: one stored address without `can_be_simplified`.
+        let one_addr = transfer(Some(PatternDescriptor::Toggle(toggle)), 1);
+        assert!(one_addr.toggle_descriptor().is_none());
+        assert!(matches!(
+            one_addr.pattern_desc,
+            Some(PatternDescriptor::Toggle(_))
+        ));
     }
 }
