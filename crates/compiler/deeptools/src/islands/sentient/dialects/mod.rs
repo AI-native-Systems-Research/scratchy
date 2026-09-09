@@ -485,3 +485,207 @@ impl<'a> Definitions<'a> {
             .find_map(|region| defining_op(val, region))
     }
 }
+
+/// WHICH `sentient.for` BINDS A VALUE AS A REGION ARGUMENT, AND AT WHICH POSITION — the
+/// `cast<BlockArgument>(val).getOwner()->getParentOp()` plus `getArgNumber()` that every reader of a
+/// loop's attribute arrays performs.
+///
+/// ⭐ POSITION 0 IS THE INDUCTION VARIABLE AND `i + 1` IS `carried[i]`, which is exactly how the two
+/// readers index: `getValueRegLocale` takes `locales[0]` for the induction variable and
+/// `locales[i + 1]` for region iter arg `i` (`Dialect/Sentient/SentientOps.cpp:1762-1776`), and
+/// `getElementSize` indexes `element_sizes` by the raw `getArgNumber()`
+/// (`Dialect/Sentient/Utils.cpp:307-315`).
+///
+/// ⛔ `None` FOR AN OP RESULT — the failed `dyn_cast<BlockArgument>`. And `None` rather than a wrong
+/// answer for a region argument of anything else, which is the `DT_CHECK_MSG(for_op, "Expect parent
+/// region of block arg to be ForOp")` both readers make (`Utils.cpp:310`) expressed as a fact about
+/// the island: `sentient.for` is the only op of this dialect that binds any
+/// ([`sentient::block_args`]).
+#[must_use]
+pub fn parent_for_arg(val: Val, scope: &[Op]) -> Option<(&Op, usize)> {
+    for op in scope {
+        match op {
+            Op::Sentient(inner) => {
+                if let Some(index) = sentient::block_args(inner)
+                    .iter()
+                    .position(|arg| *arg == val)
+                {
+                    return Some((op, index));
+                }
+                for region in sentient::regions(inner) {
+                    if let Some(found) = parent_for_arg(val, region) {
+                        return Some(found);
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if let Some(found) = parent_for_arg(val, &loop_op.body) {
+                    return Some(found);
+                }
+            }
+            // ⛔ NO `_` ARM: the remaining dialects bind region arguments of their own — a
+            // `uniform.uniformize_regions` region has one — but none of those regions can hold a
+            // `sentient.for`, because the shared dialects carry the rung BELOW this one in their
+            // bodies (see [`defining_op`]'s own note on the same limitation).
+            Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_) => {}
+        }
+    }
+    None
+}
+
+/// THE ELEMENT WIDTH AN ADDRESS IS STEPPED BY — `dcc::sentient::utils::getElementSize`
+/// (`Dialect/Sentient/Utils.cpp:306`).
+///
+/// ⭐ `None` IS THE REFERENCE'S `-1`, its `return -1;` at `:367` and at every `hasAttr` that fails:
+/// "no op in this chain says". The reference's return type is `const uint32_t` and its callers assign
+/// it to an `int`, which is how `-1` survives to be compared `< 1`.
+///
+/// ⛔ FOUR OF THE REFERENCE'S ARMS ARE ISLAND GAPS AND ANSWER `None`, WHICH IS THE REFERENCE'S OWN
+/// `hasAttr == false` BRANCH FOR EACH — `element_size` is a DISCARDABLE attribute on `scalar_add` and
+/// `scalar_sub` and `element_sizes` a discardable ARRAY on `sentient.for` and
+/// `uniform.uniformize_regions`, and this island carries none of the four. The pass that writes them
+/// is `LiveRangeReduction::addResultToYield` (`Transform/Sentient/LiveRangeReduction.cpp:1033-1070`,
+/// campaign unit `e442`), so the fields belong with THAT unit: the reference pins both the spelling
+/// and the layout — `element_sizes = [-1 : i32, 8 : i32, 8 : i32]` beside a `regLocales` of the same
+/// `1 + 2n` length (`dcc/test/Transform/LiveRangeReduction/uniformizeRegions.mlir:174`) and the op
+/// declares the layout in words: "First entry is register info for `bound`, followed by entries for
+/// `initArgs`, followed by entries for `results`" (`SentientOps.td:58-61`).
+#[must_use]
+pub fn element_size(val: Val, defs: Definitions<'_>) -> Option<crate::formats::Bits> {
+    // ⭐ THE BLOCK-ARGUMENT ARM IS FIRST, as the reference's `isa<BlockArgument>` is (`:307`).
+    if defs.for_arg_of(val).is_some() {
+        return None;
+    }
+    match defs.of(val)? {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { extent, .. }
+            | sentient::Op::ReceiveAndStore { extent, .. }
+            | sentient::Op::LoadAndStore { extent, .. },
+        ) => Some(extent.element_size),
+        // ⛔ THE **SRC** WIDTH HERE, AND THE **DST** WIDTH IN `getElementSizeOfMemOp` (`:302`). The
+        // asymmetry is the reference's own and its comment claims the opposite of what it does.
+        Op::Sentient(sentient::Op::LoadComputeAndSend {
+            src_element_size, ..
+        }) => Some(*src_element_size),
+        Op::Sentient(sentient::Op::LoadAndExtractScalar { element_size, .. }) => Some(*element_size),
+        // ⭐ THE `_` ARM IS THE REFERENCE'S OWN `return -1;` (`:367`), not a fall-through: every op
+        // it does not name answers "no element size", and so do the four island gaps above.
+        _ => None,
+    }
+}
+
+/// WHERE A SCALAR VALUE LIVES — `sentient::getValueRegLocale`
+/// (`Dialect/Sentient/SentientOps.cpp:1758`).
+///
+/// ⭐ [`sentient::RegType::Unknown`] IS THE REFERENCE'S `locale` LOCAL, initialised to
+/// `SentientRegType::unknown` at `:1759` and returned by every arm that finds no attribute — an
+/// unassigned register, which `RegisterTypeAssignment` (D66) is what replaces.
+///
+/// ⛔ THREE ISLAND GAPS ANSWER `Unknown`, EACH THE REFERENCE'S OWN NO-ATTRIBUTE BRANCH: `regLocales`
+/// entry 0, which the op declares to be `bound`'s and which the reference reads for the INDUCTION
+/// VARIABLE (`locales[argNumber]`, `SentientOps.td:58-61`) — this island's `For` has a field per
+/// CARRIED value and none for the bound; `regLocale` as a discardable attribute on
+/// `dataflow.get_unit` (`:1793-1800`, whose own `else` returns `unknown`); and `regLocales` on
+/// `uniform.uniformize_regions` (`:1832-1842`, whose own `else` returns `unknown`).
+#[must_use]
+pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
+    if let Some((Op::Sentient(sentient::Op::For { carried, .. }), index)) = defs.for_arg_of(val) {
+        return index
+            .checked_sub(1)
+            .and_then(|position| carried.get(position))
+            .map_or(sentient::RegType::Unknown, |value| value.reg.locale);
+    }
+    match defs.of(val) {
+        Some(Op::Sentient(
+            sentient::Op::LoadAndSend { reg, .. }
+            | sentient::Op::ReceiveAndStore { reg, .. }
+            | sentient::Op::LoadComputeAndSend { reg, .. }
+            | sentient::Op::ScalarCopy { reg, .. }
+            | sentient::Op::ReceiveAndExtractScalar { reg, .. },
+        )) => reg.locale,
+        Some(Op::Sentient(sentient::Op::LoadAndStore {
+            results,
+            src_reg,
+            dst_reg,
+            ..
+        })) => {
+            if val == results.0 {
+                src_reg.locale
+            } else {
+                dst_reg.locale
+            }
+        }
+        // ⛔ NO ARM OF ITS OWN IN THE REFERENCE — this is its GENERIC TAIL (`:1846-1858`) reaching
+        // `regLocales[resultIndex]`, and `load_and_extract_scalar` declares that array beside
+        // `results = (outs Index:$addr, Index:$data)` (`SentientOps.td:616, 622`), so the address
+        // result reads entry 0 and the data result entry 1.
+        Some(Op::Sentient(sentient::Op::LoadAndExtractScalar {
+            addr_result,
+            addr_reg,
+            data_reg,
+            ..
+        })) => {
+            if val == *addr_result {
+                addr_reg.locale
+            } else {
+                data_reg.locale
+            }
+        }
+        Some(Op::Sentient(sentient::Op::ScalarConstant { reg_locale, .. })) => *reg_locale,
+        Some(Op::Sentient(
+            sentient::Op::ScalarAdd { reg, .. } | sentient::Op::ScalarSub { reg, .. },
+        )) => reg.map_or(sentient::RegType::Unknown, |reg| reg.locale),
+        // ⛔ ONE LOCALE PER CARRIED VALUE WHERE THE REFERENCE HAS TWO. Its `regLocales` is
+        // `1 + 2n` long and a RESULT reads `attrs[index + 1 + numRegionIterArgs]` (`:1846-1858`)
+        // while the matching region argument reads `attrs[i + 1]`; this island's one
+        // `Carried::reg` is that position's whole answer, so it serves both.
+        Some(Op::Sentient(sentient::Op::For { carried, .. })) => carried
+            .iter()
+            .find(|value| value.result == val)
+            .map_or(sentient::RegType::Unknown, |value| value.reg.locale),
+        // ⛔ THE `sentient.mac` ARM IS A WORKAROUND THE REFERENCE LABELS AS ONE (`:1810-1820`): the
+        // op declares no register arrays, so its first result is the XRF write pointer and its
+        // second the read pointer by position alone.
+        Some(Op::Sentient(sentient::Op::VectorMac { results, .. })) => {
+            match results.iter().position(|result| *result == val) {
+                Some(0) => sentient::RegType::XrfWrPtr,
+                Some(1) => sentient::RegType::XrfRdPtr,
+                _ => sentient::RegType::Unknown,
+            }
+        }
+        Some(Op::Symbol(symbol::Op::CreateSymbol { .. })) => sentient::RegType::Imm,
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => value_reg_locale(*map, defs),
+        // ⛔ THE FIRST VALUE'S LOCALE, WITH NO CHECK THAT THE REST AGREE. The reference
+        // `DT_CHECK(curr == locale)`s over the whole map (`:1826-1829`); this crate never refuses at
+        // runtime, and a mapping whose per-core constants disagree about their register file is a
+        // defect in whatever built it rather than a question this reader can answer.
+        Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs
+            .first()
+            .map_or(sentient::RegType::Unknown, |(_, value)| {
+                value_reg_locale(*value, defs)
+            }),
+        // ⭐ THE FALL-THROUGH IS THE REFERENCE'S OWN `return locale;` (`:1861`) — including for
+        // `scalar_mul`, which the reference names no arm for either and which declares `regLocale`
+        // singular rather than the `regLocales` array its generic tail reads.
+        _ => sentient::RegType::Unknown,
+    }
+}
+
+impl<'a> Definitions<'a> {
+    /// THE `sentient.for` THAT BINDS A VALUE AS A REGION ARGUMENT, and at which position — see
+    /// [`parent_for_arg`].
+    #[must_use]
+    pub fn for_arg_of(&self, val: Val) -> Option<(&'a Op, usize)> {
+        self.regions
+            .iter()
+            .find_map(|region| parent_for_arg(val, region))
+    }
+}

@@ -77,7 +77,14 @@
 //! | `e064_dump` | 064 | 0 | 10 | `dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:457` |
 
 
-use crate::islands::sentient::dialects::Val;
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// file's own tests until `e624_runOnOperation` (level 6) lands and something calls it. CI runs clippy
+// with `-D warnings`, so without this the first ported leaf of a 9-unit module fails the gate.
+// ⭐ REMOVE THIS WITH e624: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
+
+use crate::islands::sentient::dialects::{Definitions, Op, Val, dataflow};
+use crate::units::{NumFolds, Residency};
 
 /// THE REGION OF THE ORIGINAL `uniform.uniformize_regions` A LOCAL REGION CAME FROM —
 /// `const Region &original_region_` (`:179`), named by the block argument that region binds.
@@ -111,7 +118,120 @@ pub struct LocalRegion {
     pub original_region: OriginalRegion,
 }
 
-// crustify:todo: e064_dump
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:457  (10 body lines, level 0)
-//   original  : void lrs::LocalRegion::dump(int indent) const
+/// HOW FAR A DUMP IS INDENTED — `llvm::raw_ostream::indent(int)`'s argument (`:458`).
+///
+/// ⛔ A TYPE AND NOT A BARE COUNT, so the only caller cannot pass the region's index, its unit count
+/// or any other number that happens to be in scope: [`super::uniform_region::UniformRegion::dump`]
+/// indents every local region by 2 (`:471`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Indent(pub usize);
+
+impl LocalRegion {
+    /// Replaces: e064_dump
+    ///
+    /// The one line a local region contributes to [`super::uniform_region::UniformRegion::dump`]:
+    /// the indent, then its units' hardware names, then the placeholder body.
+    ///
+    /// ⭐ ITS OWN TEXT, VERBATIM: `interleaveComma` puts `", "` BETWEEN names only, and `") {...}\n"`
+    /// is literally what the reference prints — the braces are its placeholder, not an elision here.
+    #[must_use]
+    pub fn dump(&self, defs: Definitions<'_>, indent: Indent) -> String {
+        let names = self
+            .units
+            .iter()
+            .filter_map(|unit| unit_name(*unit, defs))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{:width$}local region units({names}) {{...}}\n",
+            "",
+            width = indent.0
+        )
+    }
+}
+
+/// `dcc::utils::getUnitNameAsString` (`Analyses/Utils.cpp:635-641`) — `<type>core<N>corelet<N>folds<N>`
+/// for the `dataflow.get_unit` behind a unit handle.
+///
+/// ⛔ `None` IS `dyn_cast_or_null<dataflow::GetUnitOp>` FAILING, which the reference `DT_CHECK`s on
+/// (`:461-462`) — it cannot be a type here because `units_` is the cluster's `ArrayRef<Value>` in the
+/// reference too, so a value that is not a unit handle simply has no hardware name and contributes
+/// nothing to this trace.
+///
+/// ⛔ AND `-1` IS AN ABSENT ATTRIBUTE, NOT A UNIT: `dcc::getCoreId`/`getCoreletId` return `-1` where
+/// the op carries no `core`/`corelet` (`Utils/DccExtContext.cpp:78-125`), which is exactly the
+/// residencies whose emitter prints neither ([`dataflow::Op::GetUnit`]). `getNumResults()` is the
+/// `num_folds` attribute (`Transform/Dataflow/UnitFiltering.cpp:279, 296`), one result when absent.
+///
+/// ⚠️ CITED FROM THE OUT-OF-SCOPE `Analyses/` DIRECTORY, and ported rather than `todo!`d because it is
+/// a formatter over the op's own attributes and computes no analysis result.
+fn unit_name(val: Val, defs: Definitions<'_>) -> Option<String> {
+    let Op::Dataflow(dataflow::Op::GetUnit {
+        residency,
+        unit,
+        num_folds,
+        ..
+    }) = defs.of(val)?
+    else {
+        return None;
+    };
+    // `std::to_string(dcc::getCoreId(unit))` — the attribute, or `-1` where the op carries none.
+    let attr = |value: Option<u32>| match value {
+        Some(value) => value.to_string(),
+        None => "-1".to_owned(),
+    };
+    let (core, corelet) = match residency {
+        Residency::Global => (None, None),
+        Residency::Scratchpad { core } => (Some(core.get()), None),
+        Residency::CoreWide { core } => (Some(core.get()), Some(0)),
+        Residency::Corelet { core, corelet } => (Some(core.get()), Some(corelet.get())),
+    };
+    let folds = num_folds.unwrap_or(NumFolds::ONE).0;
+    Some(format!(
+        "{}core{}corelet{}folds{folds}",
+        unit.spelling(),
+        attr(core),
+        attr(corelet)
+    ))
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::units::{Core, Corelet, DfirUnit};
+
+    /// e064_dump — the reference's indent-then-interleave shape, over one corelet unit and one global
+    /// one so both halves of `getUnitNameAsString`'s `-1` are exercised.
+    #[test]
+    fn dump_indents_then_interleaves_the_units_hardware_names() {
+        let ops = vec![
+            Op::Dataflow(dataflow::Op::GetUnit {
+                result: Val(7),
+                residency: Residency::Corelet {
+                    core: Core::checked(0).expect("core 0 exists"),
+                    corelet: Corelet::checked(1).expect("corelet 1 exists"),
+                },
+                unit: DfirUnit::Lxlu,
+                num_folds: Some(NumFolds(2)),
+            }),
+            Op::Dataflow(dataflow::Op::GetUnit {
+                result: Val(9),
+                residency: Residency::Global,
+                unit: DfirUnit::Hbm,
+                num_folds: None,
+            }),
+        ];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+        let region = LocalRegion {
+            units: vec![Val(7), Val(9)],
+            original_region: OriginalRegion(Val(3)),
+        };
+
+        assert_eq!(
+            region.dump(defs, Indent(2)),
+            "  local region units(lxlucore0corelet1folds2, hbmcore-1corelet-1folds1) {...}\n"
+        );
+    }
+}
 

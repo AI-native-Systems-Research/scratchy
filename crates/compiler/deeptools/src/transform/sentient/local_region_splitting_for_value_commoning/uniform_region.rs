@@ -77,8 +77,8 @@
 //! | `e065_dump` | 065 | 0 | 6 | `dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:468` |
 
 
-use super::local_region::LocalRegion;
-use crate::islands::sentient::dialects::Val;
+use super::local_region::{Indent, LocalRegion};
+use crate::islands::sentient::dialects::{Definitions, Val};
 
 /// THE `uniform.uniformize_regions` A [`UniformRegion`] WAS BUILT FROM — `original_uro_` (`:180`),
 /// named by the block argument of its FIRST region.
@@ -119,44 +119,52 @@ impl UniformRegion {
     /// ⭐ A RETURNED `String` FOR `llvm::dbgs()`, as e014_dump did: the only caller wraps the whole
     /// call in `LLVM_DEBUG` (`:266`), so nothing the reference gated becomes ungated.
     #[must_use]
-    pub fn dump(&self) -> String {
+    pub fn dump(&self, defs: Definitions<'_>) -> String {
         let mut out = format!(
             "uniform region (with {} local regions) {{\n",
             self.local_regions.len()
         );
         for local_region in &self.local_regions {
-            out.push_str(&local_region_dump(local_region));
+            out.push_str(&local_region.dump(defs, Indent(2)));
         }
         out.push_str("}\n");
         out
     }
 }
 
-/// `lr.dump(2)` (`:471`) — ⛔⛔ **e064_dump**, `local_region.rs`, WHICH A PARALLEL BATCH OF THIS WAVE
-/// OWNS AND HAS NOT LANDED. `UNITS.tsv` records e065's calls as `-`, so the scheduler did not order
-/// the two; this function is that one call and nothing else, and it goes away — replaced by
-/// `local_region.dump(Indent(2))` — when e064 lands. ⛔ Not written here: filling a sibling batch's
-/// anchor would double-fill it and take the unit out of the campaign's accounting.
-fn local_region_dump(_local_region: &LocalRegion) -> String {
-    todo!(
-        "lrs::LocalRegion::dump(2) — entry e064_dump, owned by a parallel batch of this wave \
-         (transform/sentient/local_region_splitting_for_value_commoning/local_region.rs)"
-    )
-}
-
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use super::super::local_region::OriginalRegion;
 
     #[test]
     fn dump_names_the_local_region_count_and_closes_the_brace() {
+        let regions: [&[crate::islands::sentient::dialects::Op]; 0] = [];
+        let defs = Definitions::from_innermost(&regions);
         let ur = UniformRegion {
             local_regions: Vec::new(),
             original_uro: UniformizeRegions(Val(3)),
         };
-        // ⛔ ZERO REGIONS IS THE WHOLE OF WHAT IS TESTABLE UNTIL e064 LANDS — see
-        // [`local_region_dump`].
-        assert_eq!(ur.dump(), "uniform region (with 0 local regions) {\n}\n");
+        assert_eq!(ur.dump(defs), "uniform region (with 0 local regions) {\n}\n");
+    }
+
+    /// e064 HAS LANDED, so the seam that used to `todo!` here is a real call: one local region is one
+    /// indented line between the header and the brace.
+    #[test]
+    fn dump_indents_each_local_region_by_two() {
+        let regions: [&[crate::islands::sentient::dialects::Op]; 0] = [];
+        let defs = Definitions::from_innermost(&regions);
+        let ur = UniformRegion {
+            local_regions: vec![LocalRegion {
+                units: Vec::new(),
+                original_region: OriginalRegion(Val(10)),
+            }],
+            original_uro: UniformizeRegions(Val(3)),
+        };
+        assert_eq!(
+            ur.dump(defs),
+            "uniform region (with 1 local regions) {\n  local region units() {...}\n}\n"
+        );
     }
 }
 
