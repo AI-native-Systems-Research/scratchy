@@ -116,6 +116,156 @@ pub struct CompositeAccess {
     pub body: Vec<super::Op>,
 }
 
+/// WHERE A `composite_store` GETS THE VECTOR IT WRITES.
+///
+/// ⛔⛔ THE TWO FORMS ARE MUTUALLY EXCLUSIVE AND THE VERIFIER SAYS SO: *"either store_set/order or
+/// input vector has to be present in composite store"* (`Agen.cpp:786-790`). The operand form carries
+/// no region; the region form carries no operand, so a struct with both would spell a state the op
+/// cannot hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeStoreSource {
+    /// `input_vector=%v` — the COALESCE store, whose vector is already packed
+    /// (`int8-kg3-l0su-compositestore_coalesce.mlir:87`).
+    ///
+    /// ⛔ `store_order` IS NOT THE USER'S HERE: the parser overwrites it with the identity map over
+    /// `affine_map`'s results *"for coalesce store, store_order attr is not allowed from users"*
+    /// (`Agen.cpp:771-776`), and the printer elides it and `store_set` both — which is why neither is
+    /// a field of this arm.
+    InputVector {
+        /// `$input_vector`.
+        value: Val,
+        /// Its type.
+        ty: Vector,
+    },
+    /// The region form: the vector written is the one the region hands back
+    /// (`l3-core2core-multicast-burst.mlir:116-124`).
+    Region {
+        /// `$store_set` — which elements form each stored vector.
+        store_set: IntegerSet,
+        /// `$store_order` — how those are packed.
+        store_order: AffineMap,
+        /// The value the region's terminator yields — `agen.yield %data : vector<..>`.
+        ///
+        /// ⛔ IT IS A FIELD BECAUSE THIS ISLAND'S [`Op::Yield`] IS OPERAND-LESS, and the region's
+        /// block binds NO argument (`Agen.cpp:884-886`): a store receives its data inside the region
+        /// instead of on one. [`body`](Self::Region::body) therefore holds the ops BEFORE the
+        /// terminator and the terminator is printed from this pair.
+        stored: Val,
+        /// Its type.
+        stored_ty: Vector,
+        /// The region, entered once per time step, terminator excluded.
+        body: Vec<super::Op>,
+    },
+}
+
+/// A `composite_store`'s operands and attributes.
+///
+/// See [`Op::CompositeStore`] for what the op means. It is [`CompositeAccess`] written the other way
+/// round: one view, the same time quadruple, and a [`CompositeStoreSource`] where the load carries a
+/// `load_iv` (`Agen.td:486-554`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeStoreAccess {
+    /// `$mem_ref` — the view written to.
+    pub view: Val,
+    /// Its subscript — `$affine_map` and `$map_operands` written inline.
+    pub indices: Vec<Index>,
+    /// Its type.
+    pub view_ty: MemRef,
+    /// Which of the two forms this store is.
+    pub source: CompositeStoreSource,
+    /// `$time_symbols` — the values the time set's bounds are written against.
+    pub time_symbols: Vec<Val>,
+    /// `$time_set` — the time steps the store takes.
+    pub time_set: IntegerSet,
+    /// `$time_order` — the order among them.
+    pub time_order: AffineMap,
+    /// `$time_addr_map` — the offset at each time step, one result per view dimension.
+    pub time_addr_map: AffineMap,
+    /// `dbgName` — the scheduler's name for this store.
+    pub dbg_name: Option<String>,
+}
+
+/// A `composite_indirect_load`'s operands and attributes.
+///
+/// See [`Op::CompositeIndirectLoad`] for what the op means. One [`IndirectAccess`] holding the
+/// ADDRESSES and one direct view holding the data, then [`CompositeAccess`]'s load pair and time
+/// quadruple (`Agen.td:677-757`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeIndirectLoadAccess {
+    /// `$indirect_memref` and its access — ⛔ NOT OPTIONAL HERE, unlike the two-sided op's
+    /// (`Agen.td:677-690`): a one-sided indirect load without its address view is not this op.
+    pub indirect: IndirectAccess,
+    /// `$direct_memref` — the view the DATA is read from, and the one every access record reads.
+    pub direct: Val,
+    /// `$direct_map_indices`.
+    pub direct_indices: Vec<Index>,
+    /// The direct view's type.
+    pub direct_ty: MemRef,
+    /// `$multicast_info`, printed as an operand ahead of `time_symbols` (`Agen.cpp:1581`).
+    pub multicast_info: Option<Val>,
+    /// The block argument carrying the vector loaded at each time step — `getLoadInductionVar()`.
+    pub load_iv: Val,
+    /// That vector's type — ONE hardware vector.
+    pub load_iv_ty: Vector,
+    /// `$load_set` — which elements form each loaded vector.
+    pub load_set: IntegerSet,
+    /// `$load_order` — how those elements are packed.
+    pub load_order: AffineMap,
+    /// `$time_symbols`.
+    pub time_symbols: Vec<Val>,
+    /// `$time_set`.
+    pub time_set: IntegerSet,
+    /// `$time_order`.
+    pub time_order: AffineMap,
+    /// `$time_addr_map` — the offset at each time step, over the DIRECT view's dimensions.
+    pub time_addr_map: AffineMap,
+    /// `dbgName`.
+    pub dbg_name: Option<String>,
+    /// The region, entered once per time step.
+    pub body: Vec<super::Op>,
+}
+
+/// A `composite_indirect_store`'s operands and attributes.
+///
+/// See [`Op::CompositeIndirectStore`] for what the op means. [`CompositeIndirectLoadAccess`] with the
+/// store pair in place of the load pair and NO `load_iv` — the reference declares
+/// `getLoadInductionVar()` on the indirect load only (`Agen.td:758-838`), so the stored vector comes
+/// out of the region as [`CompositeStoreSource::Region::stored`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeIndirectStoreAccess {
+    /// `$indirect_memref` and its access, on the same terms as the load's.
+    pub indirect: IndirectAccess,
+    /// `$direct_memref` — the view the DATA is written to.
+    pub direct: Val,
+    /// `$direct_map_indices`.
+    pub direct_indices: Vec<Index>,
+    /// The direct view's type.
+    pub direct_ty: MemRef,
+    /// `$multicast_info` — ⛔ PRINTED AFTER THE FIRST NEWLINE HERE, where the load prints it before
+    /// (`Agen.cpp:1803-1805` against `:1581`).
+    pub multicast_info: Option<Val>,
+    /// `$store_set` — which elements form each stored vector.
+    pub store_set: IntegerSet,
+    /// `$store_order` — how those are packed.
+    pub store_order: AffineMap,
+    /// The value the region's terminator yields — see [`CompositeStoreSource::Region::stored`].
+    pub stored: Val,
+    /// Its type.
+    pub stored_ty: Vector,
+    /// `$time_symbols`.
+    pub time_symbols: Vec<Val>,
+    /// `$time_set`.
+    pub time_set: IntegerSet,
+    /// `$time_order`.
+    pub time_order: AffineMap,
+    /// `$time_addr_map`.
+    pub time_addr_map: AffineMap,
+    /// `dbgName`.
+    pub dbg_name: Option<String>,
+    /// The region, entered once per time step, terminator excluded.
+    pub body: Vec<super::Op>,
+}
+
 /// WHICH WAY ROUND THE RING A TRANSFER IS ROUTED — `AgenRoutingDirection`
 /// (`AgenEnums.td:29-42`), whose four cases and their order are the four
 /// [`sentient::RoutingDirection`](crate::islands::sentient::dialects::sentient::RoutingDirection)
@@ -361,6 +511,41 @@ pub enum Op {
     /// [`TpmvCompositeLoad`](crate::bridges::dataflow_ir_to_sentient::tf_transform_paged_mem_view_impl::TpmvCompositeLoad)
     /// is its only reader. ⛔ BOXED, as its two-sided twin is.
     CompositeLoad(Box<CompositeAccess>),
+
+    /// `agen.composite_store %view[..] [input_vector=%v] time_symbols(..) {..} [{ .. }] :
+    /// memref<..>[ , vector<..>]` — a sequence of vector stores, one per time step
+    /// (`Agen.td:486-554`).
+    ///
+    /// ⛔ IT IS HERE BECAUSE ENTRY 330 CANNOT BE SPELLED WITHOUT IT. `lowerCompositeStoreOp`
+    /// `dyn_cast`s exactly this op (`Helper.cpp:3133`) and `constructTimeLoopsAndVectorOperations`
+    /// reads its memref's element type to pick the store statement (`:1870-1877`), so declaring the
+    /// input is what AGENT-BRIEF.md:87 asks for rather than calling the unit unnecessary.
+    /// ⛔ BOXED, as the other composites are.
+    CompositeStore(Box<CompositeStoreAccess>),
+
+    /// `agen.composite_indirect_load indirect:%i[..] direct:%d[..] time_symbols(..),
+    /// load_iv(%v:vector<..>) {..} { .. } : memref<..>, memref<..>` (`Agen.td:677`).
+    ///
+    /// ⭐⭐ THE COMPOSITE GATHER: the address comes out of the INDIRECT view — the virtual IBR an
+    /// `agen.vector_store` wrote the index into — and the data out of the DIRECT one, once per time
+    /// step.
+    ///
+    /// ⛔ IT IS HERE BECAUSE ENTRY 332 CANNOT BE SPELLED WITHOUT IT, and entry 332 is the LXLU-only
+    /// lowering that pairs this op with the `sentient.load_and_extract_scalar` its `extract_idx`
+    /// names (`Helper.cpp:3267-3311`). ⛔ BOXED, as the other composites are.
+    CompositeIndirectLoad(Box<CompositeIndirectLoadAccess>),
+
+    /// `agen.composite_indirect_store indirect:%i[..] direct:%d[..] time_symbols(..) {..} { .. } :
+    /// memref<..>, memref<..>` (`Agen.td:758`).
+    ///
+    /// ⭐⭐ THE COMPOSITE SCATTER — the store twin of [`Op::CompositeIndirectLoad`], whose stored
+    /// vector arrives on the region's `agen.yield` rather than on a `load_iv`
+    /// (`lx_indirect_loads_stores_composite.mlir:241-247`).
+    ///
+    /// ⛔ IT IS HERE BECAUSE ENTRY 333 CANNOT BE SPELLED WITHOUT IT — the LXSU-only lowering, which
+    /// pairs it with a `sentient.receive_and_extract_scalar` (`Helper.cpp:3313-3356`).
+    /// ⛔ BOXED, as the other composites are.
+    CompositeIndirectStore(Box<CompositeIndirectStoreAccess>),
 
     /// `agen.composite_indirect_load_and_store [indirect_src:%is[..]] direct_src:%ds[..]
     /// [indirect_dst:%id[..]] direct_dst:%dd[..] time_symbols(..), load_iv(%v:vector<..>) {..} { .. } :
@@ -741,6 +926,247 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             }
             print::indent(out, depth);
             let _ = writeln!(out, "}} : {}", print::memref(view_ty));
+        }
+        Op::CompositeStore(access) => {
+            let CompositeStoreAccess {
+                view,
+                indices,
+                view_ty,
+                source,
+                time_symbols,
+                time_set,
+                time_order,
+                time_addr_map,
+                dbg_name,
+            } = access.as_ref();
+            let symbols = time_symbols
+                .iter()
+                .map(|sym| print::val(*sym))
+                .collect::<Vec<String>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "agen.composite_store {}[{}]",
+                print::val(*view),
+                print::index_list(indices),
+            );
+            print::indent(out, depth);
+            // `if (input_vector) p << "input_vector=" << v` then ` time_symbols(..)`
+            // (`Agen.cpp:812-817`) — no leading space on the operand, one before the symbols.
+            let _ = writeln!(
+                out,
+                "{} time_symbols({symbols})",
+                match source {
+                    CompositeStoreSource::InputVector { value, .. } => {
+                        format!("input_vector={}", print::val(*value))
+                    }
+                    CompositeStoreSource::Region { .. } => String::new(),
+                }
+            );
+            print::indent(out, depth);
+            // ⛔ THE COALESCE FORM ELIDES `store_order` AND `store_set` (`Agen.cpp:823-827`); the
+            // region form prints them, alphabetically ahead of the time trio.
+            let _ = writeln!(
+                out,
+                " {{{}{}time_addr_map = {}, time_order = {}, time_set = {}}}",
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
+                match source {
+                    CompositeStoreSource::InputVector { .. } => String::new(),
+                    CompositeStoreSource::Region {
+                        store_set,
+                        store_order,
+                        ..
+                    } => format!(
+                        "store_order = {}, store_set = {}, ",
+                        print::affine_map(store_order),
+                        print::integer_set(store_set)
+                    ),
+                },
+                print::affine_map(time_addr_map),
+                print::affine_map(time_order),
+                print::integer_set(time_set),
+            );
+            match source {
+                CompositeStoreSource::InputVector { ty, .. } => {
+                    print::indent(out, depth);
+                    // `p << " : " << memref` then `p << " , " << vector` — ⛔ SPACES BOTH SIDES OF
+                    // THE COMMA on this one (`Agen.cpp:832-834`).
+                    let _ = writeln!(
+                        out,
+                        " : {} , {}",
+                        print::memref(view_ty),
+                        print::vector(*ty)
+                    );
+                }
+                CompositeStoreSource::Region {
+                    stored,
+                    stored_ty,
+                    body,
+                    ..
+                } => {
+                    print::indent(out, depth);
+                    out.push_str("{\n");
+                    for inner in body {
+                        print::emit(out, inner, depth + 1);
+                    }
+                    // The terminator this island holds as a field — see
+                    // [`CompositeStoreSource::Region::stored`].
+                    print::indent(out, depth + 1);
+                    let _ = writeln!(
+                        out,
+                        "agen.yield {} : {}",
+                        print::val(*stored),
+                        print::vector(*stored_ty)
+                    );
+                    print::indent(out, depth);
+                    let _ = writeln!(out, "}} : {}", print::memref(view_ty));
+                }
+            }
+        }
+        Op::CompositeIndirectLoad(access) => {
+            let CompositeIndirectLoadAccess {
+                indirect,
+                direct,
+                direct_indices,
+                direct_ty,
+                multicast_info,
+                load_iv,
+                load_iv_ty,
+                load_set,
+                load_order,
+                time_symbols,
+                time_set,
+                time_order,
+                time_addr_map,
+                dbg_name,
+                body,
+            } = access.as_ref();
+            // One line through `load_iv`, then the attributes, then the region
+            // (`Agen.cpp:1569-1594`, `lx_indirect_loads_stores_composite.mlir:205-210`).
+            let _ = writeln!(
+                out,
+                "agen.composite_indirect_load indirect:{}[{}] direct:{}[{}]{} time_symbols({}), \
+                 load_iv({}:{})",
+                print::val(indirect.view),
+                print::index_list(&indirect.indices),
+                print::val(*direct),
+                print::index_list(direct_indices),
+                multicast_info.map_or(String::new(), |group| format!(
+                    " multicast_info = {}",
+                    print::val(group)
+                )),
+                time_symbols
+                    .iter()
+                    .map(|sym| print::val(*sym))
+                    .collect::<Vec<String>>()
+                    .join(", "),
+                print::val(*load_iv),
+                print::vector(*load_iv_ty),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                " {{{}load_order = {}, load_set = {}, time_addr_map = {}, time_order = {}, \
+                 time_set = {}}}",
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
+                print::affine_map(load_order),
+                print::integer_set(load_set),
+                print::affine_map(time_addr_map),
+                print::affine_map(time_order),
+                print::integer_set(time_set),
+            );
+            print::indent(out, depth);
+            out.push_str("{\n");
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                "}} : {}, {}",
+                print::memref(&indirect.ty),
+                print::memref(direct_ty)
+            );
+        }
+        Op::CompositeIndirectStore(access) => {
+            let CompositeIndirectStoreAccess {
+                indirect,
+                direct,
+                direct_indices,
+                direct_ty,
+                multicast_info,
+                store_set,
+                store_order,
+                stored,
+                stored_ty,
+                time_symbols,
+                time_set,
+                time_order,
+                time_addr_map,
+                dbg_name,
+                body,
+            } = access.as_ref();
+            // ⛔ THE NEWLINE COMES BEFORE THE MULTICAST HANDLE HERE, where the load prints it on the
+            // access line (`Agen.cpp:1803-1808` against `:1581`).
+            let _ = writeln!(
+                out,
+                "agen.composite_indirect_store indirect:{}[{}] direct:{}[{}]",
+                print::val(indirect.view),
+                print::index_list(&indirect.indices),
+                print::val(*direct),
+                print::index_list(direct_indices),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                "{} time_symbols({})",
+                multicast_info.map_or(String::new(), |group| format!(
+                    " multicast_info = {}",
+                    print::val(group)
+                )),
+                time_symbols
+                    .iter()
+                    .map(|sym| print::val(*sym))
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                " {{{}store_order = {}, store_set = {}, time_addr_map = {}, time_order = {}, \
+                 time_set = {}}}",
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
+                print::affine_map(store_order),
+                print::integer_set(store_set),
+                print::affine_map(time_addr_map),
+                print::affine_map(time_order),
+                print::integer_set(time_set),
+            );
+            print::indent(out, depth);
+            out.push_str("{\n");
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth + 1);
+            let _ = writeln!(
+                out,
+                "agen.yield {} : {}",
+                print::val(*stored),
+                print::vector(*stored_ty)
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                "}} : {}, {}",
+                print::memref(&indirect.ty),
+                print::memref(direct_ty)
+            );
         }
         Op::CompositeIndirectLoadAndStore(transfer) => {
             let CompositeIndirectTransfer {

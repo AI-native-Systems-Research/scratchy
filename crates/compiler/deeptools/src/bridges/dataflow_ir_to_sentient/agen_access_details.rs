@@ -1721,6 +1721,9 @@ impl<'a> AccessDetailsBase<'a> {
             // VARIABLE's users rather than a result: a composite load binds no top-level SSA value.
             // The scope is its own region, which is the only place a region argument can be read.
             agen::Op::CompositeLoad(access) => uses(access.load_iv, &access.body),
+            // `:215-218` — ⭐ AND THE COMPOSITE GATHER IS THE FOURTH CLASS IN THE GATE, on the same
+            // terms: its region argument's users, inside its own region.
+            agen::Op::CompositeIndirectLoad(access) => uses(access.load_iv, &access.body),
             // ⛔ A SYMBOLIC ACCESS HAS NO USER WALK. The gate is
             // `isa<VectorLoadOp, IndirectVectorLoadOp, CompositeLoadOp, CompositeIndirectLoadOp>`
             // (`:207-208`) and the symbolic pair is in none of it, so a symbolic load's users never
@@ -1731,6 +1734,9 @@ impl<'a> AccessDetailsBase<'a> {
             | agen::Op::IndirectVectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
             | agen::Op::CompositeIndirectLoadAndStore(_)
+            // ⛔ AND NEITHER STORE FORM IS IN THE GATE — it names four LOAD classes (`:207-208`).
+            | agen::Op::CompositeStore(_)
+            | agen::Op::CompositeIndirectStore(_)
             // ⛔ AND NEITHER IS THE INTERLEAVE OR THE MASK STATE: one holds transfers rather than
             // being one, the other writes a unit's mask state and loads no vector at all.
             | agen::Op::CompositeMemoryInterleave { .. }
@@ -1911,6 +1917,11 @@ pub enum AffineInitialize {
     UnsupportedOperation,
     /// `mem_ref_` does not trace back to a `dataflow.get_*_memory_view` in this scope.
     MemoryViewUnresolved,
+    /// ⛔ THE COALESCE `composite_store` HAS NO `store_set`/`store_order` TO READ, and the composite
+    /// override reads both through `.value()` (`AccessDetails.cpp:494-495`) — an abort, not a
+    /// diagnostic, because the verifier forbids the input-vector form from carrying either
+    /// (`Agen.cpp:786-790`). This is that abort's door.
+    CoalesceStoreHasNoTransferSet,
 }
 
 impl AffineInitialize {
@@ -1924,7 +1935,9 @@ impl AffineInitialize {
     #[must_use]
     pub const fn diagnostic(self) -> Option<&'static str> {
         match self {
-            AffineInitialize::Initialized | AffineInitialize::MemoryViewUnresolved => None,
+            AffineInitialize::Initialized
+            | AffineInitialize::MemoryViewUnresolved
+            | AffineInitialize::CoalesceStoreHasNoTransferSet => None,
             AffineInitialize::MemoryIndexUnset => Some("uninitialized memory_index_ detected"),
             AffineInitialize::UnsupportedOperation => Some("unsupported operation"),
         }
@@ -2062,7 +2075,10 @@ impl<'a> AccessDetailsAffine<'a> {
             agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
             | agen::Op::CompositeLoad(_)
+            | agen::Op::CompositeStore(_)
             | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoad(_)
+            | agen::Op::CompositeIndirectStore(_)
             | agen::Op::CompositeIndirectLoadAndStore(_)
             | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::SetTransferMaskState { .. }
@@ -2711,6 +2727,68 @@ impl<'a> AccessDetailsAffineComposite<'a> {
                     access.indices.as_slice(),
                     access.load_set.clone(),
                     access.load_order.clone(),
+                    access.time_addr_map.clone(),
+                )
+            }
+            // `:493-517` — ⛔ THE STORE'S EXPECTED TOTAL ELEMENTS COME OFF THE TERMINATOR'S OPERAND
+            // TYPE, not off a `load_iv`: a `composite_store` binds no region argument at all.
+            agen::Op::CompositeStore(access) => {
+                self.time_set = Some(access.time_set.clone());
+                self.time_order = Some(access.time_order.clone());
+                self.set_time_symbols(&access.time_symbols);
+                let agen::CompositeStoreSource::Region {
+                    store_set,
+                    store_order,
+                    stored_ty,
+                    ..
+                } = &access.source
+                else {
+                    return AffineInitialize::CoalesceStoreHasNoTransferSet;
+                };
+                self.affine
+                    .base
+                    .set_expected_total_elements(Elements(stored_ty.len));
+                (
+                    access.view,
+                    &access.view_ty,
+                    access.indices.as_slice(),
+                    store_set.clone(),
+                    store_order.clone(),
+                    access.time_addr_map.clone(),
+                )
+            }
+            // `:518-541` — ⛔ THE **DIRECT** VIEW AND ITS MAP, as the one-shot indirect pair's are:
+            // the indirect view holds addresses, and no record is ever seated over it here.
+            agen::Op::CompositeIndirectLoad(access) => {
+                self.time_set = Some(access.time_set.clone());
+                self.time_order = Some(access.time_order.clone());
+                self.set_time_symbols(&access.time_symbols);
+                self.affine
+                    .base
+                    .set_expected_total_elements(Elements(access.load_iv_ty.len));
+                (
+                    access.direct,
+                    &access.direct_ty,
+                    access.direct_indices.as_slice(),
+                    access.load_set.clone(),
+                    access.load_order.clone(),
+                    access.time_addr_map.clone(),
+                )
+            }
+            // `:542-566` — the scatter, with the store pair and the terminator's width.
+            agen::Op::CompositeIndirectStore(access) => {
+                self.time_set = Some(access.time_set.clone());
+                self.time_order = Some(access.time_order.clone());
+                self.set_time_symbols(&access.time_symbols);
+                self.affine
+                    .base
+                    .set_expected_total_elements(Elements(access.stored_ty.len));
+                (
+                    access.direct,
+                    &access.direct_ty,
+                    access.direct_indices.as_slice(),
+                    access.store_set.clone(),
+                    access.store_order.clone(),
                     access.time_addr_map.clone(),
                 )
             }

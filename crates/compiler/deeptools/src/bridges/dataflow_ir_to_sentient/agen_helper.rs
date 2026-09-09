@@ -127,13 +127,14 @@ use super::agen_agen_to_sentient::{
     insert_copy_and_add_stmts_helper,
 };
 use super::std_standard_to_sentient::lower_constant_index_to_sentient;
-use super::tf_utils::constant_index;
+use super::tf_transform_paged_mem_view_impl::{binding_path, ops_at_mut};
+use super::tf_utils::{CountedLoop, constant_index, create_for_op_with_additional_return_value};
 use super::vc_vector_operands::access_map;
 use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
-    self as dfir_op, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, results,
-    uniform, uses, vectorchain as vc,
+    self as dfir_op, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op,
+    replace_all_uses, results, scf, uniform, uses, vectorchain as vc,
 };
 use crate::islands::dataflow_ir::link::SendEnd;
 use crate::islands::dataflow_ir::ty::{
@@ -141,7 +142,7 @@ use crate::islands::dataflow_ir::ty::{
 };
 use crate::islands::dataflow_ir::{ProgramUnit, ValueMapping, Values};
 use crate::islands::sentient::dialects::{
-    AffineFor, Op as SenOp, defining_op as sen_defining_op, sentient as sen,
+    AffineFor, Op as SenOp, defining_op as sen_defining_op, results as sen_results, sentient as sen,
 };
 use crate::units::{DfirUnit, NumFolds, Residency};
 use core::num::NonZeroU32;
@@ -603,11 +604,9 @@ impl ExtractScalarOps {
 /// (`VectorStoreOp` at `:3053, :3067`, `SymbolicVectorStoreOp` at `:3384`). A port that hard-coded
 /// one class would be a port of one instantiation, not of the function.
 ///
-/// ⛔ THIS ISLAND HOLDS THREE OF THE TWELVE TODAY — `agen.vector_load`, `agen.vector_store` and
-/// `agen.composite_load_and_store`. The other nine are the indirect (gather/scatter) and symbolic
-/// addressing families, which nothing in this crate emits yet; [`agen_op_kind`] is the one place
-/// they attach when an op for them is added, and until then a search for one finds nothing rather
-/// than finding the wrong thing.
+/// ⭐ THE ISLAND NOW HOLDS ALL TWELVE, the last three (`agen.composite_store`,
+/// `agen.composite_indirect_load`, `agen.composite_indirect_store`) added for entries 330/332/333.
+/// [`agen_op_kind`] is the one place a class attaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AgenOpKind {
     /// `agen.vector_load`.
@@ -653,6 +652,11 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             dfir_op::agen::Op::SymbolicVectorLoad { .. } => Some(AgenOpKind::SymbolicVectorLoad),
             dfir_op::agen::Op::SymbolicVectorStore { .. } => Some(AgenOpKind::SymbolicVectorStore),
             dfir_op::agen::Op::CompositeLoad(_) => Some(AgenOpKind::CompositeLoad),
+            dfir_op::agen::Op::CompositeStore(_) => Some(AgenOpKind::CompositeStore),
+            dfir_op::agen::Op::CompositeIndirectLoad(_) => Some(AgenOpKind::CompositeIndirectLoad),
+            dfir_op::agen::Op::CompositeIndirectStore(_) => {
+                Some(AgenOpKind::CompositeIndirectStore)
+            }
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
             dfir_op::agen::Op::CompositeIndirectLoadAndStore(_) => {
                 Some(AgenOpKind::CompositeIndirectLoadAndStore)
@@ -741,8 +745,7 @@ impl AgenLoad {
     ///
     /// ⛔ `agen.composite_load_and_store` IS **NOT** `CompositeLoadOp` — the reference's `isa<>` list
     /// does not include it, so it answers `None` rather than borrowing the composite arm.
-    /// `composite_indirect_load` still has no island op; `composite_load` now does (entry 326's
-    /// input), and roots at its induction variable.
+    /// Both composite loads root at their induction variable.
     #[must_use]
     pub fn of(op: &DfirOp) -> Option<AgenLoad> {
         match op {
@@ -762,10 +765,19 @@ impl AgenLoad {
             DfirOp::Agen(dfir_op::agen::Op::CompositeLoad(access)) => Some(AgenLoad::Composite {
                 load_induction_var: access.load_iv,
             }),
+            // ⭐ AND THE COMPOSITE GATHER LIKEWISE (`:1250-1251`).
+            DfirOp::Agen(dfir_op::agen::Op::CompositeIndirectLoad(access)) => {
+                Some(AgenLoad::CompositeIndirect {
+                    load_induction_var: access.load_iv,
+                })
+            }
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
+                // ⛔ AND NEITHER COMPOSITE STORE IS A LOAD: the `isa<>` list is five load classes.
+                | dfir_op::agen::Op::CompositeStore(_)
+                | dfir_op::agen::Op::CompositeIndirectStore(_)
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeIndirectLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
@@ -3540,13 +3552,16 @@ mod unit_tests {
         dict: IndicesCoeffDict,
     }
 
-    impl AccessRecord for Record {
+    impl AddressedAccess for Record {
         fn memory_index(&self) -> Option<MemoryOperandIndex> {
             Some(self.moi)
         }
         fn mem_view_start_addr(&self) -> Option<Val> {
             self.start_addr
         }
+    }
+
+    impl AccessRecord for Record {
         fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
             &self.dict
         }
@@ -4092,12 +4107,13 @@ mod unit_tests {
 
         let mut values = Values::default();
         let outcome = construct_time_loops_and_vector_operations(
-            TransferOp::of(&body[2]).expect("a composite transfer"),
+            &body[2],
             DfirUnit::L3su,
             &mut mutable_addrs,
             // `src_immutable_addr(%348)`, `dst_immutable_addr(%3)`.
             &pair(Val(348), Val(3)),
             &details,
+            None,
             &body,
             &mut values,
         );
@@ -4596,7 +4612,7 @@ mod unit_tests {
             AgenOpKind::CompositeLoadAndStore,
             &Marked::at([0]),
             &unit,
-            TransferOp::of(&unit[0]).expect("a composite transfer"),
+            &unit[0],
             DfirUnit::L3su,
             &mut AccessContainer::<Val>::default(),
             &AccessContainer::<Val>::default(),
@@ -5287,6 +5303,295 @@ mod unit_tests {
                 StrideStep(8),
             )
             .is_none()
+        );
+    }
+
+    // ─────────────────────────────── 327/384 ───────────────────────────────
+
+    /// ⛔ THE GROWN SEAT **IS** THE MUTABLE ADDRESS: outside L3 it starts at the view start address
+    /// and yields itself plus the index's stride, one step per trip.
+    #[test]
+    fn a_symbolic_index_grows_an_iter_arg_that_accumulates_its_stride() {
+        let seat = agen::Op::Yield;
+        let mut record = AccessDetailsSymbolic::new(&seat, DfirUnit::Lxlu);
+        record.base.set_indices(&[Val(100)]);
+        record.set_strides(&[Val(150)]);
+        record.base.set_mem_view_start_addr(Val(200));
+        record.base.set_memory_index(MemoryOperandIndex::DirSrc);
+        let mut access_details = AccessContainer::default();
+        access_details
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("a fresh container has every slot empty")
+            .fill(record);
+
+        let mut scope = vec![DfirOp::Affine(affine::Op::For {
+            iv: Val(100),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: Vec::new(),
+            body: vec![DfirOp::Affine(affine::Op::Yield {
+                operands: Vec::new(),
+            })],
+            dbg_name: None,
+        })];
+        let mut mutable_addrs = AccessContainer::default();
+        let mut immutable_addrs = AccessContainer::default();
+        let mut values = Values::default();
+
+        assert_eq!(
+            gather_symbolic_load_store_details(
+                DfirUnit::Lxlu,
+                &mut access_details,
+                &mut mutable_addrs,
+                &mut immutable_addrs,
+                &mut scope,
+                &mut values,
+            ),
+            SymbolicLoadStoreDetails::Gathered
+        );
+        let Some(DfirOp::Affine(affine::Op::For { carried, body, .. })) = scope.last() else {
+            panic!("the clone stands where the original did: {scope:?}");
+        };
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            carried[0].init,
+            Val(200),
+            "the first seat in the chain starts at the view start"
+        );
+        assert!(
+            matches!(
+                (&body[0], &body[1]),
+                (
+                    DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                        result,
+                        lhs,
+                        rhs: Val(150),
+                        ..
+                    })),
+                    DfirOp::Affine(affine::Op::Yield { operands }),
+                ) if *lhs == carried[0].arg && operands.as_slice() == [*result]
+            ),
+            "the seat accumulates its own stride: {body:?}"
+        );
+        assert_eq!(
+            mutable_addrs.get(MemoryOperandIndex::DirSrc),
+            Some(&carried[0].arg)
+        );
+    }
+
+    // ─────────────────────────────── 328/384 ───────────────────────────────
+
+    /// ⛔ SAME PARENT, SO THE ADD GOES **AFTER THE EXTRACT** and the statement reads its result — the
+    /// initialiser walk is for an address the extract's own loop does not hold.
+    #[test]
+    fn an_extracted_scalar_is_added_into_the_mutable_addr_beside_the_extract() {
+        let mut extract_ops = ExtractScalarOps::default();
+        let extract = extract_ops.mint(ExtractScalarResults::LoadAndExtractScalar {
+            addr: Val(120),
+            data: Val(121),
+        });
+        let mut send = sent_load_and_send(sen::Extent::of(Elements(64), Bits(16)));
+        if let SenOp::Sentient(sen::Op::LoadAndSend {
+            mutable_addr,
+            result,
+            ..
+        }) = &mut send
+        {
+            *mutable_addr = Val(102);
+            *result = Val(130);
+        }
+        let mut scope = vec![SenOp::AffineFor(AffineFor {
+            iv: Val(101),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(4),
+            carried: vec![affine::Carried {
+                init: Val(100),
+                arg: Val(102),
+                result: Val(103),
+            }],
+            body: vec![
+                SenOp::Sentient(sen::Op::LoadAndExtractScalar {
+                    mutable_addr: Val(110),
+                    immutable_addr: Val(111),
+                    increment: Val(112),
+                    consumer: Link::<LxluUnit, L0suUnit>::between(Val(113), Val(114))
+                        .ends()
+                        .0,
+                    addr_result: Val(120),
+                    data_result: Val(121),
+                    total_elements: Elements(64),
+                    element_size: Bits(16),
+                    addr_reg: sen::Reg {
+                        locale: sen::RegType::Unknown,
+                        index: None,
+                    },
+                    data_reg: sen::Reg {
+                        locale: sen::RegType::Unknown,
+                        index: None,
+                    },
+                    dbg_name: None,
+                }),
+                send,
+                SenOp::Agen(agen::Op::Yield),
+            ],
+            dbg_name: None,
+        })];
+
+        let mem_op = IndirectMemOp::of(Val(130), extract, &scope)
+            .expect("a load_and_send pairs with a load_and_extract_scalar");
+        let mut values = Values::default();
+        assert_eq!(
+            adjust_mutable_addr_init_for_indirect(mem_op, extract, &mut scope, &mut values),
+            MutableAddrInit::Adjusted
+        );
+        let SenOp::AffineFor(loop_op) = &scope[0] else {
+            panic!("the loop is still the only statement: {scope:?}");
+        };
+        assert!(
+            matches!(
+                (&loop_op.body[1], &loop_op.body[2]),
+                (
+                    SenOp::Sentient(sen::Op::ScalarAdd {
+                        lhs: Val(102),
+                        rhs: Val(121),
+                        result,
+                        ..
+                    }),
+                    SenOp::Sentient(sen::Op::LoadAndSend { mutable_addr, .. }),
+                ) if mutable_addr == result
+            ),
+            "the add follows the extract and feeds the send: {:?}",
+            loop_op.body
+        );
+    }
+
+    // ─────────────────────────── 329/384, 330/384 ───────────────────────────
+
+    /// The two one-record composite lowerings answer for their own op class only.
+    #[test]
+    fn a_composite_load_and_a_composite_store_each_name_their_own_class() {
+        let op = DfirOp::Agen(agen::Op::Yield);
+        let unit = [DfirOp::Agen(agen::Op::Yield)];
+        let mut marked = Marked::at([]);
+        let mut to_be_deleted = Vec::new();
+        let mut values = Values::default();
+        assert_eq!(
+            lower_composite_load_op(
+                &op,
+                0,
+                &unit,
+                DfirUnit::Lxlu,
+                &mut marked,
+                &mut to_be_deleted,
+                &mut values,
+            ),
+            CompositeLowering::WrongOpClass
+        );
+        assert_eq!(
+            lower_composite_store_op(
+                &op,
+                0,
+                &unit,
+                DfirUnit::Lxsu,
+                &mut marked,
+                &mut to_be_deleted,
+                &mut values,
+            ),
+            CompositeLowering::WrongOpClass
+        );
+    }
+
+    // ─────────────────────────────── 331/384 ───────────────────────────────
+
+    /// ⛔ THE RECORDS COME FIRST AND A REFUSED RECORD ENDS IT — the vendor's own 64-lane composite
+    /// names memory views nothing in this scope defines, so entry 311 never reaches the `DT_CHECK`.
+    #[test]
+    fn a_composite_load_and_store_stops_where_its_records_do() {
+        let unit = [DfirOp::Agen(composite_transfer())];
+        let mut marked = Marked::at([0]);
+        let mut to_be_deleted = Vec::new();
+        let mut values = Values::default();
+        assert!(
+            matches!(
+                lower_composite_load_and_store_op(
+                    &unit[0],
+                    0,
+                    &unit,
+                    DfirUnit::Lxlu,
+                    &mut marked,
+                    &mut to_be_deleted,
+                    &mut values,
+                ),
+                CompositeLowering::DetailsFailed(_)
+            ),
+            "an unresolved memory view refuses before the size check"
+        );
+        assert!(to_be_deleted.is_empty(), "nothing is queued for deletion");
+    }
+
+    // ─────────────────────────── 332/384, 333/384 ───────────────────────────
+
+    /// ⛔ THE COMPONENT GATE IS FIRST, before any record is built: the gather side is LXLU only and
+    /// the scatter side LXSU only.
+    #[test]
+    fn the_one_sided_indirect_composites_are_gated_on_the_component() {
+        let op = DfirOp::Agen(agen::Op::Yield);
+        let unit = [DfirOp::Agen(agen::Op::Yield)];
+        let extract_ops = ExtractScalarOps::default();
+        let mut marked = Marked::at([]);
+        let mut to_be_deleted = Vec::new();
+        let mut values = Values::default();
+        assert_eq!(
+            lower_composite_indirect_load_op(
+                &op,
+                0,
+                &unit,
+                DfirUnit::Lxsu,
+                None,
+                &extract_ops,
+                &mut marked,
+                &mut to_be_deleted,
+                &mut values,
+            ),
+            CompositeIndirectLowering::OnlySupportedInLxlu
+        );
+        assert_eq!(
+            lower_composite_indirect_store_op(
+                &op,
+                0,
+                &unit,
+                DfirUnit::Lxlu,
+                None,
+                &extract_ops,
+                &mut marked,
+                &mut to_be_deleted,
+                &mut values,
+            ),
+            CompositeIndirectLowering::OnlySupportedInLxsu
+        );
+    }
+
+    // ─────────────────────────────── 334/384 ───────────────────────────────
+
+    /// The two-sided indirect composite answers for its own op class only.
+    #[test]
+    fn a_composite_indirect_load_and_store_names_its_own_class() {
+        let op = DfirOp::Agen(agen::Op::Yield);
+        let unit = [DfirOp::Agen(agen::Op::Yield)];
+        let mut marked = Marked::at([]);
+        let mut to_be_deleted = Vec::new();
+        let mut values = Values::default();
+        assert_eq!(
+            lower_composite_indirect_load_and_store_op(
+                &op,
+                0,
+                &unit,
+                DfirUnit::Lxlu,
+                &mut marked,
+                &mut to_be_deleted,
+                &mut values,
+            ),
+            CompositeLowering::WrongOpClass
         );
     }
 }
@@ -6756,36 +7061,57 @@ fn sentient_op_name(op: &SenOp) -> Option<&'static str> {
 /// ⭐⭐ A TRAIT BECAUSE THE C++ IS A TEMPLATE, and it has exactly two instantiations —
 /// `AccessDetailsAffine` and `AccessDetailsAffineComposite` (`Helper.cpp:2805`, `:2845`). The
 /// precedent is `LoopBodyOp` in this module.
-pub trait AccessRecord {
+pub trait AddressedAccess {
     /// `getMemoryIndex()` — [`None`] is the reference's `kMax`, i.e. never set.
     fn memory_index(&self) -> Option<MemoryOperandIndex>;
     /// `getMemViewStartAddr()` — [`None`] is a null `Value`, i.e. no view resolved.
     fn mem_view_start_addr(&self) -> Option<Val>;
+}
+
+/// ⛔ SPLIT FROM [`AddressedAccess`] BECAUSE THE TWO TEMPLATES HAVE DIFFERENT INSTANTIATION SETS.
+/// `constructImmutableAddress` is instantiated with `AccessDetailsSymbolic` as well
+/// (`Helper.cpp:1200`), and a symbolic record carries no `indices_coeff_dict_`.
+pub trait AccessRecord: AddressedAccess {
     /// `getIndicesCoeffDict()`.
     fn indices_coeff_dict(&self) -> &IndicesCoeffDict;
 }
 
-impl AccessRecord for AccessDetailsAffine<'_> {
+impl AddressedAccess for AccessDetailsAffine<'_> {
     fn memory_index(&self) -> Option<MemoryOperandIndex> {
         self.base.memory_index
     }
     fn mem_view_start_addr(&self) -> Option<Val> {
         self.base.mem_view_start_addr
     }
+}
+
+impl AccessRecord for AccessDetailsAffine<'_> {
     fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
         &self.indices_coeff_dict
     }
 }
 
-impl AccessRecord for AccessDetailsAffineComposite<'_> {
+impl AddressedAccess for AccessDetailsAffineComposite<'_> {
     fn memory_index(&self) -> Option<MemoryOperandIndex> {
         self.affine.base.memory_index
     }
     fn mem_view_start_addr(&self) -> Option<Val> {
         self.affine.base.mem_view_start_addr
     }
+}
+
+impl AccessRecord for AccessDetailsAffineComposite<'_> {
     fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
         &self.affine.indices_coeff_dict
+    }
+}
+
+impl AddressedAccess for AccessDetailsSymbolic<'_> {
+    fn memory_index(&self) -> Option<MemoryOperandIndex> {
+        self.base.memory_index
+    }
+    fn mem_view_start_addr(&self) -> Option<Val> {
+        self.base.mem_view_start_addr
     }
 }
 
@@ -6980,7 +7306,7 @@ impl ImmutableAddresses {
 /// because entry 212 filled both containers from the same walk.
 /// ⛔ THE SIZE TEST IS WHY THAT INDEX IS IN RANGE (`:1221`), and it is a bare `failure()` with no
 /// message.
-pub fn construct_immutable_address<T: AccessRecord>(
+pub fn construct_immutable_address<T: AddressedAccess>(
     comp: DfirUnit,
     access_details: &AccessContainer<T>,
     updated_mem_view_start_addrs: &AccessContainer<Val>,
@@ -7299,7 +7625,10 @@ impl<'a> ExtractVectorStore<'a> {
                 | dfir_op::agen::Op::SymbolicVectorLoad { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoad(_)
+                | dfir_op::agen::Op::CompositeStore(_)
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeIndirectLoad(_)
+                | dfir_op::agen::Op::CompositeIndirectStore(_)
                 | dfir_op::agen::Op::CompositeIndirectLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
@@ -8212,7 +8541,10 @@ impl<'a> ExtractVectorLoad<'a> {
                 | dfir_op::agen::Op::SymbolicVectorLoad { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoad(_)
+                | dfir_op::agen::Op::CompositeStore(_)
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeIndirectLoad(_)
+                | dfir_op::agen::Op::CompositeIndirectStore(_)
                 | dfir_op::agen::Op::CompositeIndirectLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
@@ -8490,9 +8822,9 @@ pub struct TransferOp<'a> {
 
 impl<'a> TransferOp<'a> {
     /// `None` exactly where the reference reaches
-    /// `llvm_unreachable("Expecting a VectorLoadOp or Composite[Indirect]LoadAndStoreOp!")` — ⭐ AND
-    /// THE ISLAND HAS NO `agen.composite_indirect_load_and_store`, so the third `dyn_cast` has no
-    /// arm here rather than a wrong one.
+    /// `llvm_unreachable("Expecting a VectorLoadOp or Composite[Indirect]LoadAndStoreOp!")` — ⛔ AND
+    /// THE ONE-SIDED COMPOSITES ARE THAT ARM: `composite_store` and both `composite_indirect`
+    /// halves name no `dyn_cast` here, however much they look like the pair that does.
     #[must_use]
     pub fn of(op: &'a DfirOp) -> Option<TransferOp<'a>> {
         match op {
@@ -8531,6 +8863,9 @@ impl<'a> TransferOp<'a> {
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoad(_)
+                | dfir_op::agen::Op::CompositeStore(_)
+                | dfir_op::agen::Op::CompositeIndirectLoad(_)
+                | dfir_op::agen::Op::CompositeIndirectStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
                 | dfir_op::agen::Op::Yield,
@@ -8802,6 +9137,8 @@ pub enum TimeLoopsAndVectorOps {
     MissingOperandRecord,
     /// Entry 268 refused (`:1882`).
     UnableToGenerateLoadAndStore(LoadAndStoreStmt),
+    /// `llvm_unreachable("unexpected operation")` (`:1901`) — none of the six composite classes.
+    UnexpectedOperation,
 }
 
 /// Replaces: e267_constructTimeLoopsAndVectorOperations
@@ -8814,14 +9151,15 @@ pub enum TimeLoopsAndVectorOps {
 /// operand, yield]`, not creation order — and `mutable_addrs` is RESEATED in place onto the
 /// innermost region arguments (`:1831-1834`), which is what entry 268 reads.
 /// ⛔ AN INDIRECT OPERAND STEPS BY ZERO, not by its own offset (`:1842-1844`).
-/// ⭐ NO `extract_op` PARAMETER: it feeds only the four `composite_[indirect_]load`/`store` arms
-/// (`:1868-1897`), whose ops this island does not carry.
+/// ⛔ `extract_op` FEEDS THE TWO **INDIRECT** ARMS ONLY (`:1890`, `:1898`) — the pairing entry 269
+/// stamped, which the gather and the scatter read and the other three arms never see.
 pub fn construct_time_loops_and_vector_operations(
-    composite: TransferOp<'_>,
+    op: &DfirOp,
     comp: DfirUnit,
     mutable_addrs: &mut AccessContainer<Val>,
     immutable_addrs: &AccessContainer<Val>,
     access_details: &AccessContainer<AccessDetailsAffineComposite<'_>>,
+    extract_op: Option<ExtractScalarOp>,
     scope: &[DfirOp],
     values: &mut Values,
 ) -> TimeLoopsAndVectorOps {
@@ -8902,8 +9240,7 @@ pub fn construct_time_loops_and_vector_operations(
             steps,
             yield_args,
             // `:1823-1826` — named only when the composite itself carries a name.
-            dbg_name: dfir_op::dbg_name(composite.op)
-                .map(|name| format!("Time-Loop({name}, t-dim {idx})")),
+            dbg_name: dfir_op::dbg_name(op).map(|name| format!("Time-Loop({name}, t-dim {idx})")),
         });
     }
 
@@ -8943,24 +9280,63 @@ pub fn construct_time_loops_and_vector_operations(
     )]
     let stride_step = StrideStep(stride_step as i32);
 
-    // `:1867-1900` — five arms, and this island carries the input of exactly one of them.
-    let stmt = match construct_load_and_store_stmt(
-        composite,
-        comp,
-        access_details,
-        mutable_addrs,
-        immutable_addrs,
-        TransferSpecialisation {
-            burst_size: claimed(burst_index),
-            group_size: claimed(group_index),
-            stride_step,
-            ..TransferSpecialisation::UNSPECIALISED
-        },
-        scope,
-        values,
-    ) {
-        LoadAndStoreStmt::Constructed(stmt) => stmt,
-        refused => return TimeLoopsAndVectorOps::UnableToGenerateLoadAndStore(refused),
+    // `for_ops.empty() ? nullptr : for_ops.front()` — the OUTERMOST loop of the nest just built,
+    // which the two one-sided arms hand on to entry 336 as the loop to hoist their init outside of.
+    let outermost = levels.first().map(|level| level.iv);
+
+    // `:1866-1901` — five arms over the six composite classes, then `llvm_unreachable`.
+    let stmt = match op {
+        // `:1867-1872`.
+        DfirOp::Agen(agen::Op::CompositeLoad(_)) => todo!(
+            "e358_constructLoadAndSendStmt is unported, so the agen.composite_load on {comp:?} \
+             cannot become a sentient.load_and_send under {outermost:?}"
+        ),
+        // `:1873-1881` — ⛔ THE ELEMENT TYPE IS READ OFF THE OP'S OWN MEMREF, not off the record.
+        DfirOp::Agen(agen::Op::CompositeStore(access)) => todo!(
+            "e359_constructReceiveAndStoreStmt is unported, so the {:?} agen.composite_store on \
+             {comp:?} cannot become a sentient.receive_and_store under {outermost:?}",
+            access.view_ty.elem
+        ),
+        // `:1882-1887` — the two-sided pair, and the only arm whose statement is ported.
+        DfirOp::Agen(
+            agen::Op::CompositeLoadAndStore(_) | agen::Op::CompositeIndirectLoadAndStore(_),
+        ) => {
+            let Some(composite) = TransferOp::of(op) else {
+                return TimeLoopsAndVectorOps::UnexpectedOperation;
+            };
+            match construct_load_and_store_stmt(
+                composite,
+                comp,
+                access_details,
+                mutable_addrs,
+                immutable_addrs,
+                TransferSpecialisation {
+                    burst_size: claimed(burst_index),
+                    group_size: claimed(group_index),
+                    stride_step,
+                    ..TransferSpecialisation::UNSPECIALISED
+                },
+                scope,
+                values,
+            ) {
+                LoadAndStoreStmt::Constructed(stmt) => stmt,
+                refused => return TimeLoopsAndVectorOps::UnableToGenerateLoadAndStore(refused),
+            }
+        }
+        // `:1888-1893` — the gather, which additionally reads the extract it is paired with.
+        DfirOp::Agen(agen::Op::CompositeIndirectLoad(_)) => todo!(
+            "e358_constructLoadAndSendStmt is unported, so the agen.composite_indirect_load on \
+             {comp:?} cannot become a sentient.load_and_send paired with {extract_op:?}"
+        ),
+        // `:1894-1900` — ⛔ THE **DIRECT** MEMREF'S ELEMENT TYPE, `getDirectMemrefType()`.
+        DfirOp::Agen(agen::Op::CompositeIndirectStore(access)) => todo!(
+            "e359_constructReceiveAndStoreStmt is unported, so the {:?} \
+             agen.composite_indirect_store on {comp:?} cannot become a sentient.receive_and_store \
+             paired with {extract_op:?}",
+            access.direct_ty.elem
+        ),
+        // `llvm_unreachable("unexpected operation")` (`:1901`).
+        _ => return TimeLoopsAndVectorOps::UnexpectedOperation,
     };
 
     // The nest closes from the inside out, which is the only order its bodies can be filled in.
@@ -9089,7 +9465,7 @@ pub fn lower_affine_composite_helper<'a>(
     kind: AgenOpKind,
     marked: &Marked,
     unit: &'a [DfirOp],
-    composite: TransferOp<'_>,
+    op: &DfirOp,
     comp: DfirUnit,
     mutable_addrs: &mut AccessContainer<Val>,
     immutable_addrs: &AccessContainer<Val>,
@@ -9097,12 +9473,15 @@ pub fn lower_affine_composite_helper<'a>(
     to_be_deleted: &mut Vec<&'a DfirOp>,
     values: &mut Values,
 ) -> AffineCompositeLowering {
+    // ⭐ NO `extract_op` HERE: this helper's four callers are the four NON-indirect-one-sided
+    // lowerings, and the reference lets the parameter default to null (`:2959-2960`).
     let result = construct_time_loops_and_vector_operations(
-        composite,
+        op,
         comp,
         mutable_addrs,
         immutable_addrs,
         access_details,
+        None,
         unit,
         values,
     );
@@ -9123,18 +9502,6 @@ pub fn lower_affine_composite_helper<'a>(
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 311/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-
-/// `AccessDetailsAffineComposite::constructDetails` (`AccessDetails.cpp:833`) — ⛔ UNPORTED AND
-/// UNSCHEDULED, and its `initialize` (`:442`, six composite op classes) with it. The affine base
-/// class's override is a DIFFERENT function that answers
-/// [`ConstructedDetails::NotInitialized`] for every composite op, so standing in with it would turn
-/// every valid composite transfer into a silent refusal.
-fn composite_construct_details(memory_index: MemoryOperandIndex) -> ConstructedDetails {
-    todo!(
-        "AccessDetailsAffineComposite::constructDetails (AccessDetails.cpp:833) is unported, so the \
-         {memory_index:?} record of a composite transfer cannot be built"
-    );
-}
 
 /// THE OUTCOME OF [`construct_affine_comp_details_and_addrs`] — every requested record built and its
 /// addresses placed, or WHICH of the reference's diagnostics refused.
@@ -9199,8 +9566,8 @@ pub fn construct_affine_comp_details_and_addrs<'a>(
         let Some(slot) = access_details.vacancy(memory_index) else {
             return AffineCompDetailsAndAddrs::OperandSlotTaken(memory_index);
         };
-        slot.emplace_insert(AccessDetailsAffineComposite::new(op, comp));
-        let constructed = composite_construct_details(memory_index);
+        let record = slot.emplace_insert(AccessDetailsAffineComposite::new(op, comp));
+        let constructed = record.construct_details(memory_index, scope);
         if !matches!(constructed, ConstructedDetails::Complete) {
             return match memory_index {
                 MemoryOperandIndex::DirSrc => {
@@ -10364,15 +10731,970 @@ pub fn adjust_mutable_addr_init_for_stride(
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e327_gatherSymbolicLoadStoreDetails
-// crustify:todo: e328_adjustMutableAddrInitForIndirect
-// crustify:todo: e329_lowerCompositeLoadOp
-// crustify:todo: e330_lowerCompositeStoreOp
-// crustify:todo: e331_lowerCompositeLoadAndStoreOp
-// crustify:todo: e332_lowerCompositeIndirectLoadOp
-// crustify:todo: e333_lowerCompositeIndirectStoreOp
-// crustify:todo: e334_lowerCompositeIndirectLoadAndStoreOp
 // crustify:todo: e357_generateAffineAddressManipulationStmts
 // crustify:todo: e358_constructLoadAndSendStmt
 // crustify:todo: e359_constructReceiveAndStoreStmt
 // crustify:todo: e360_constructSymbolicDetailsAndAddrs
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 327/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`gather_symbolic_load_store_details`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum SymbolicLoadStoreDetails {
+    /// `success()` (`Helper.cpp:1204`).
+    Gathered,
+    /// `DT_CHECK(block_arg)` (`:1066`) — an index that no loop region binds.
+    IndexIsNotALoopIterator,
+    /// `llvm_unreachable("unsupported loop operation")` (`:1094`) and `"unsupport loop op"` (`:1136`).
+    UnsupportedLoopOperation,
+    /// `DT_CHECK(terminator && iter_arg)` (`:1097`) and `DT_CHECK(num_iter_args > 0)` (`:1127`).
+    NoIterArgsOnLoop,
+    /// `strides[indices_idx]` past the end — a record with fewer strides than indices.
+    NoStrideForIndex,
+    /// `sorted_indices.back()` on an empty list (`:1191`), which the reference reads regardless.
+    NoIndicesOnRecord,
+    /// *"Unable to construct immutable addresses"* (`:1201-1203`).
+    ImmutableAddressesFailed(ImmutableAddresses),
+}
+
+/// `getInductionVar()`, `getRegionIterArgs()` and the body of either counted loop, at once.
+fn counted_parts_mut(
+    op: &mut DfirOp,
+) -> Option<(Val, &mut Vec<affine::Carried>, &mut Vec<DfirOp>)> {
+    match op {
+        DfirOp::Affine(affine::Op::For {
+            iv, carried, body, ..
+        }) => Some((*iv, carried, body)),
+        DfirOp::Scf(scf::Op::For {
+            iv, carried, body, ..
+        }) => Some((*iv, carried, body)),
+        _ => None,
+    }
+}
+
+/// `getBody()->getTerminator()`'s operand list, for either dialect's `yield`.
+fn yield_operands_mut(body: &mut Vec<DfirOp>) -> Option<&mut Vec<Val>> {
+    match body.last_mut()? {
+        DfirOp::Affine(affine::Op::Yield { operands })
+        | DfirOp::Scf(scf::Op::Yield { operands }) => Some(operands),
+        _ => None,
+    }
+}
+
+/// `collectMutableIterArg` (`Helper.cpp:1120-1145`) — the record's own seat on this loop, counted
+/// BACK from the end so the `num_records` seats added last are the mutable addresses.
+///
+/// ⭐ THE REFERENCE RETURNS THE ARG **AND** ITS OPERAND NUMBER, because MLIR needs the second to
+/// write the first's initialiser. A [`affine::Carried`] holds both ends, so one borrow is the pair.
+fn mutable_iter_arg(
+    op: &mut DfirOp,
+    num_records: usize,
+    mutable_idx: usize,
+) -> Option<&mut affine::Carried> {
+    let carried = match op {
+        DfirOp::Affine(affine::Op::For { carried, .. })
+        | DfirOp::Scf(scf::Op::For { carried, .. }) => carried,
+        _ => return None,
+    };
+    if carried.is_empty() {
+        return None;
+    }
+    let idx = carried.len().checked_sub(num_records)? + mutable_idx;
+    carried.get_mut(idx)
+}
+
+/// Replaces: e327_gatherSymbolicLoadStoreDetails
+///
+/// **327/384** `Helper.cpp:1051` (154L). One extra `iter_arg` per index per record, chained
+/// outermost-to-innermost; the innermost seat becomes that record's mutable address.
+///
+/// ⛔⛔ THE CLONE INVALIDATES EVERY HANDLE, so the index and its stride are re-read after it (`:1076`).
+/// ⛔ `prev_arg` IS ASSIGNED ONLY IN THE `else` (`:1178`): every later loop is wired to the FIRST
+/// seat, not to its parent's, and on L3 that seat keeps the constant 0 it was cloned with (`:1174`).
+pub fn gather_symbolic_load_store_details<'a>(
+    comp: DfirUnit,
+    access_details: &mut AccessContainer<AccessDetailsSymbolic<'a>>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &mut AccessContainer<Val>,
+    scope: &mut Vec<DfirOp>,
+    values: &mut Values,
+) -> SymbolicLoadStoreDetails {
+    // `:1055-1117`.
+    for ad_idx in 0..access_details.entries().len() {
+        let mut indices_idx = 0;
+        while indices_idx < access_details.entries()[ad_idx].base.indices.len() {
+            let index = access_details.entries()[ad_idx].base.indices[indices_idx];
+            let Some(path) = binding_path(index, scope) else {
+                return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+            };
+
+            // `:1064-1069` — entry 264 with `delete_op` false, so the mapping comes back.
+            let mut grown = {
+                let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+                    return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+                };
+                let Some(counted) = ops.get(ordinal).and_then(CountedLoop::of) else {
+                    return SymbolicLoadStoreDetails::UnsupportedLoopOperation;
+                };
+                create_for_op_with_additional_return_value(values, &counted, 1, false)
+            };
+            let ir_map = grown.ir_map.take().unwrap_or_default();
+
+            // `:1070` — ⛔ VALUES ONLY. The op half of `IRMapping` keys on an address, and a record
+            // whose op the caller owns was not cloned by the loop clone.
+            update_symbolic_access_details(access_details, &ir_map, &OpMapping::new());
+
+            // `:1076-1077` — re-read, because the line above rewrote them.
+            let record = &access_details.entries()[ad_idx];
+            let index = record.base.indices[indices_idx];
+            let stride = record.strides().get(indices_idx).copied();
+
+            let Some((iv, carried, body)) = counted_parts_mut(&mut grown.op) else {
+                return SymbolicLoadStoreDetails::UnsupportedLoopOperation;
+            };
+            // `:1080-1091` — `getIndexOfIterArg`, and `DT_CHECK(index == getInductionVar())` when it
+            // answers `-1`.
+            let carried_idx = carried.iter().position(|seat| seat.arg == index);
+            if carried_idx.is_none() && index != iv {
+                return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+            }
+            // `:1092` — `getRegionIterArgs().back()`, which is the seat just added.
+            let Some(iter_arg) = carried.last().map(|seat| seat.arg) else {
+                return SymbolicLoadStoreDetails::NoIterArgsOnLoop;
+            };
+
+            let sum = values.mint();
+            let rhs = {
+                let Some(operands) = yield_operands_mut(body) else {
+                    return SymbolicLoadStoreDetails::UnsupportedLoopOperation;
+                };
+                let rhs = match carried_idx {
+                    // `:1099-1105` — a loop IV steps by the index's own stride.
+                    None => {
+                        let Some(stride) = stride else {
+                            return SymbolicLoadStoreDetails::NoStrideForIndex;
+                        };
+                        stride
+                    }
+                    // `:1107-1113` — an iter_arg's stride was applied upstream, so the value FEEDING
+                    // the yield is what the new seat accumulates.
+                    Some(carried_idx) => {
+                        let Some(feeding) = operands.get(carried_idx).copied() else {
+                            return SymbolicLoadStoreDetails::UnsupportedLoopOperation;
+                        };
+                        feeding
+                    }
+                };
+                // `setOperand(getNumOperands() - 1, ..)` — the LAST operand, which is the new seat's.
+                let Some(last) = operands.last_mut() else {
+                    return SymbolicLoadStoreDetails::NoIterArgsOnLoop;
+                };
+                *last = sum;
+                rhs
+            };
+            body.insert(
+                body.len().saturating_sub(1),
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: sum,
+                    lhs: iter_arg,
+                    rhs,
+                    ty: ScalarTy::Index,
+                })),
+            );
+
+            // `:1116` — `curr_loop->erase()`, with the constants and the clone where it stood.
+            let replacements = core::mem::take(&mut grown.replacements);
+            let mut standing = core::mem::take(&mut grown.consts);
+            standing.push(grown.op);
+            let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+                return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+            };
+            ops.splice(ordinal..=ordinal, standing);
+            for (old, new) in replacements {
+                replace_all_uses(scope, old, new);
+            }
+            indices_idx += 1;
+        }
+    }
+
+    // `:1147-1195`.
+    let num_records = access_details.entries().len();
+    let mut mem_view_start_addrs = AccessContainer::<Val>::default();
+    for ad_idx in 0..num_records {
+        // `:1152-1157` — `isProperAncestor` as a total order: an enclosing loop's path is shorter.
+        let mut sorted = access_details.entries()[ad_idx].base.indices.clone();
+        sorted
+            .sort_by_key(|index| binding_path(*index, scope).map_or(usize::MAX, |path| path.len()));
+
+        let mut prev_arg: Option<Val> = None;
+        for index in &sorted {
+            let start = access_details.entries()[ad_idx].base.mem_view_start_addr;
+            let Some(path) = binding_path(*index, scope) else {
+                return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+            };
+            let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+                return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+            };
+            let Some(loop_op) = ops.get_mut(ordinal) else {
+                return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+            };
+            if CountedLoop::of(loop_op).is_none() {
+                return SymbolicLoadStoreDetails::UnsupportedLoopOperation;
+            }
+            let Some(seat) = mutable_iter_arg(loop_op, num_records, ad_idx) else {
+                return SymbolicLoadStoreDetails::NoIterArgsOnLoop;
+            };
+            if let Some(prev) = prev_arg {
+                seat.init = prev;
+            } else {
+                if !matches!(comp, DfirUnit::L3lu | DfirUnit::L3su)
+                    && let Some(start) = start
+                {
+                    seat.init = start;
+                }
+                prev_arg = Some(seat.arg);
+            }
+        }
+
+        // `:1188-1196` — the mutable address is the INNERMOST seat in the chain.
+        let record = &access_details.entries()[ad_idx];
+        let memory_index = record.base.memory_index;
+        // ⛔ `insert(getMemoryIndex(), getMemViewStartAddr())` IS UNCONDITIONAL (`:1190-1191`) and a
+        // null start address still counts towards the size entry 213 checks. A container of `Val`
+        // cannot hold null, so a record with no view start leaves the counts unequal and 213 answers
+        // `SizeMismatch` instead of placing an address nothing defines.
+        if let Some(moi) = memory_index
+            && let Some(start) = record.base.mem_view_start_addr
+            && let Some(slot) = mem_view_start_addrs.vacancy(moi)
+        {
+            slot.fill(start);
+        }
+        let Some(innermost) = sorted.last().copied() else {
+            return SymbolicLoadStoreDetails::NoIndicesOnRecord;
+        };
+        let Some(path) = binding_path(innermost, scope) else {
+            return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+        };
+        let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+            return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+        };
+        let Some(loop_op) = ops.get_mut(ordinal) else {
+            return SymbolicLoadStoreDetails::IndexIsNotALoopIterator;
+        };
+        let Some(seat) = mutable_iter_arg(loop_op, num_records, ad_idx) else {
+            return SymbolicLoadStoreDetails::NoIterArgsOnLoop;
+        };
+        let arg = seat.arg;
+        if let Some(moi) = memory_index
+            && let Some(slot) = mutable_addrs.vacancy(moi)
+        {
+            slot.fill(arg);
+        }
+    }
+
+    // `:1201-1203` — entry 213.
+    let placed =
+        construct_immutable_address(comp, access_details, &mem_view_start_addrs, immutable_addrs);
+    if placed.admissible() {
+        SymbolicLoadStoreDetails::Gathered
+    } else {
+        SymbolicLoadStoreDetails::ImmutableAddressesFailed(placed)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 328/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE INDIRECT STATEMENT WHOSE MUTABLE ADDRESS IS BEING ADJUSTED, paired with a matching extract.
+///
+/// ⭐⭐ THE `DT_CHECK` ON THE COMBINATION IS THIS TYPE (`Helper.cpp:1450-1454`): a `load_and_send`
+/// goes with a `load_and_extract_scalar` and a `receive_and_store` with a
+/// `receive_and_extract_scalar`, and [`Self::of`] is the only door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectMemOp {
+    /// `sentient.load_and_send`, carrying the value it binds.
+    LoadAndSend(Val),
+    /// `sentient.receive_and_store`, carrying the value it binds.
+    ReceiveAndStore(Val),
+}
+
+impl IndirectMemOp {
+    /// The pairing `DT_CHECK` (`:1450-1454`), decided once.
+    #[must_use]
+    pub fn of(mem_op: Val, extract: ExtractScalarOp, scope: &[SenOp]) -> Option<IndirectMemOp> {
+        match (sen_defining_op(mem_op, scope)?, extract.kind()) {
+            (
+                SenOp::Sentient(sen::Op::LoadAndSend { .. }),
+                ExtractScalarKind::LoadAndExtractScalar,
+            ) => Some(IndirectMemOp::LoadAndSend(mem_op)),
+            (
+                SenOp::Sentient(sen::Op::ReceiveAndStore { .. }),
+                ExtractScalarKind::ReceiveAndExtractScalar,
+            ) => Some(IndirectMemOp::ReceiveAndStore(mem_op)),
+            _ => None,
+        }
+    }
+
+    /// The value the statement binds.
+    #[must_use]
+    pub const fn result(self) -> Val {
+        match self {
+            IndirectMemOp::LoadAndSend(result) | IndirectMemOp::ReceiveAndStore(result) => result,
+        }
+    }
+}
+
+/// THE OUTCOME OF [`adjust_mutable_addr_init_for_indirect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum MutableAddrInit {
+    /// `LogicalResult::success()` — the add is placed and the address rewired.
+    Adjusted,
+    /// A handed-in value that nothing in this scope binds.
+    OperationNotInScope,
+    /// `llvm_unreachable("expecting mutable_addr_op and extract_op to dominate mem_op")` (`:1565`).
+    ExtractDoesNotDominateMemOp,
+    /// The `while (curr_loop)` walk stepped INWARD, which a well-formed init chain cannot do
+    /// (`:1509-1540`); the reference would loop forever.
+    IterArgChainDoesNotNest,
+}
+
+/// One `sentient.scalar_add` over index-typed operands, with no register named — the five-argument
+/// `sentient::AddOp::create` (`:1496`). See [`lower_addi_op_to_sentient`] for why `reg` is [`None`].
+const fn sen_scalar_add(result: Val, lhs: Val, rhs: Val) -> SenOp {
+    SenOp::Sentient(sen::Op::ScalarAdd {
+        lhs,
+        rhs,
+        result,
+        reg: None,
+        ty: ScalarTy::Index,
+    })
+}
+
+/// `getDefiningOp()`'s ADDRESS: ordinals from the outermost body inward, the last naming the op.
+///
+/// ⭐ ONLY [`SenOp::AffineFor`] IS DESCENDED, and that is a type-level fact rather than a shortcut:
+/// it is the one op of this rung whose region holds sentient statements — a `SenOp::Scf(scf::Op::For)`
+/// carries a body of DataflowIR ops, so the reference's `scf::ForOp` arm is unreachable here.
+fn sen_defining_path(val: Val, scope: &[SenOp]) -> Option<Vec<usize>> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        if sen_results(op).contains(&val) {
+            return Some(vec![ordinal]);
+        }
+        if let SenOp::AffineFor(loop_op) = op
+            && let Some(rest) = sen_defining_path(val, &loop_op.body)
+        {
+            let mut path = vec![ordinal];
+            path.extend(rest);
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The loop that binds `val` as a region argument, and WHICH carried seat it is.
+fn sen_iter_arg_path(val: Val, scope: &[SenOp]) -> Option<(Vec<usize>, usize)> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        if let SenOp::AffineFor(loop_op) = op {
+            if let Some(idx) = loop_op.carried.iter().position(|seat| seat.arg == val) {
+                return Some((vec![ordinal], idx));
+            }
+            if let Some((rest, idx)) = sen_iter_arg_path(val, &loop_op.body) {
+                let mut path = vec![ordinal];
+                path.extend(rest);
+                return Some((path, idx));
+            }
+        }
+    }
+    None
+}
+
+/// The body a path ends in, and the ordinal within it.
+fn sen_ops_at_mut<'s>(
+    scope: &'s mut Vec<SenOp>,
+    path: &[usize],
+) -> Option<(&'s mut Vec<SenOp>, usize)> {
+    let (&ordinal, rest) = path.split_first()?;
+    if rest.is_empty() {
+        return Some((scope, ordinal));
+    }
+    match scope.get_mut(ordinal)? {
+        SenOp::AffineFor(loop_op) => sen_ops_at_mut(&mut loop_op.body, rest),
+        _ => None,
+    }
+}
+
+/// The op a path names.
+fn sen_op_at<'s>(scope: &'s [SenOp], path: &[usize]) -> Option<&'s SenOp> {
+    let (&ordinal, rest) = path.split_first()?;
+    let op = scope.get(ordinal)?;
+    if rest.is_empty() {
+        return Some(op);
+    }
+    match op {
+        SenOp::AffineFor(loop_op) => sen_op_at(&loop_op.body, rest),
+        _ => None,
+    }
+}
+
+/// `mem_op->setOperand(mutable_addr_idx, ..)` — found by the value the statement BINDS, so an insert
+/// that shifted the statement along its body cannot leave this writing the wrong op.
+fn sen_mutable_addr_mut(result: Val, scope: &mut [SenOp]) -> Option<&mut Val> {
+    for op in scope {
+        match op {
+            SenOp::Sentient(
+                sen::Op::LoadAndSend {
+                    mutable_addr,
+                    result: bound,
+                    ..
+                }
+                | sen::Op::ReceiveAndStore {
+                    mutable_addr,
+                    result: bound,
+                    ..
+                },
+            ) if *bound == result => return Some(mutable_addr),
+            SenOp::AffineFor(loop_op) => {
+                if let Some(found) = sen_mutable_addr_mut(result, &mut loop_op.body) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Replaces: e328_adjustMutableAddrInitForIndirect
+///
+/// **328/384** `Helper.cpp:1447` (127L). The extracted scalar is added into the statement's mutable
+/// address, and WHERE the add goes depends on where that address comes from.
+///
+/// ⛔⛔ AN `iter_arg` ADDRESS IS ADJUSTED AT ITS **INITIALISER**, walked outward (`:1505-1540`) —
+/// adding inside the loop would re-add per trip. ⛔ THE REFERENCE READS `getInits()[arg_idx - 1]` BUT
+/// WRITES `setOperand(arg_idx, ..)`; we read and write the same seat. ⛔ A non-`iter_arg` address is
+/// walked backwards from `mem_op` (`:1548-1566`): the add follows whichever operand comes LAST.
+pub fn adjust_mutable_addr_init_for_indirect(
+    mem_op: IndirectMemOp,
+    extract: ExtractScalarOp,
+    scope: &mut Vec<SenOp>,
+    values: &mut Values,
+) -> MutableAddrInit {
+    // `:1467-1470` — result 1 of a load, result 0 of a receive.
+    let replacement = extract.data();
+    let bound = mem_op.result();
+    let (Some(mem_path), Some(extract_path)) = (
+        sen_defining_path(bound, scope),
+        sen_defining_path(replacement, scope),
+    ) else {
+        return MutableAddrInit::OperationNotInScope;
+    };
+    // `extract_op->getParentOp()` (`:1491`).
+    let extract_parent = &extract_path[..extract_path.len() - 1];
+    let Some(mutable_addr) = sen_mutable_addr_mut(bound, scope).map(|addr| *addr) else {
+        return MutableAddrInit::OperationNotInScope;
+    };
+
+    if let Some((loop_path, arg_idx)) = sen_iter_arg_path(mutable_addr, scope) {
+        // `:1493-1502` — same loop: the add goes right AFTER the extract.
+        if loop_path.as_slice() == extract_parent {
+            let sum = values.mint();
+            let Some((body, ordinal)) = sen_ops_at_mut(scope, &extract_path) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            body.insert(ordinal + 1, sen_scalar_add(sum, mutable_addr, replacement));
+            let Some(seat) = sen_mutable_addr_mut(bound, scope) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            *seat = sum;
+            return MutableAddrInit::Adjusted;
+        }
+
+        // `:1506-1540` — the initialiser chain, outward.
+        let mut curr = loop_path;
+        let mut curr_idx = arg_idx;
+        loop {
+            let Some(SenOp::AffineFor(loop_op)) = sen_op_at(scope, &curr) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            let Some(init) = loop_op.carried.get(curr_idx).map(|seat| seat.init) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            if let Some((outer, outer_idx)) = sen_iter_arg_path(init, scope)
+                && outer.as_slice() != extract_parent
+            {
+                if outer.len() >= curr.len() {
+                    return MutableAddrInit::IterArgChainDoesNotNest;
+                }
+                curr = outer;
+                curr_idx = outer_idx;
+                continue;
+            }
+            // `:1519-1526` and `:1533-1539` — ⛔ THE TWO TERMINATING CASES DO THE SAME THING: insert
+            // before `curr_loop` and replace that seat's initialiser.
+            let sum = values.mint();
+            let Some((body, ordinal)) = sen_ops_at_mut(scope, &curr) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            body.insert(ordinal, sen_scalar_add(sum, init, replacement));
+            let Some(SenOp::AffineFor(loop_op)) = body.get_mut(ordinal + 1) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            let Some(seat) = loop_op.carried.get_mut(curr_idx) else {
+                return MutableAddrInit::OperationNotInScope;
+            };
+            seat.init = sum;
+            return MutableAddrInit::Adjusted;
+        }
+    }
+
+    // `:1541-1570` — walk backwards from `mem_op`: previous statement, else out to the parent.
+    let mutable_addr_path = sen_defining_path(mutable_addr, scope);
+    let mut cursor = mem_path;
+    while mutable_addr_path.as_deref() != Some(cursor.as_slice()) && cursor != extract_path {
+        match cursor.last().copied() {
+            Some(0) if cursor.len() > 1 => {
+                cursor.pop();
+            }
+            Some(0) | None => return MutableAddrInit::ExtractDoesNotDominateMemOp,
+            Some(ordinal) => {
+                let last = cursor.len() - 1;
+                cursor[last] = ordinal - 1;
+            }
+        }
+    }
+    let sum = values.mint();
+    let Some((body, ordinal)) = sen_ops_at_mut(scope, &cursor) else {
+        return MutableAddrInit::OperationNotInScope;
+    };
+    body.insert(ordinal + 1, sen_scalar_add(sum, mutable_addr, replacement));
+    let Some(seat) = sen_mutable_addr_mut(bound, scope) else {
+        return MutableAddrInit::OperationNotInScope;
+    };
+    *seat = sum;
+    MutableAddrInit::Adjusted
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 329/384, 330/384, 331/384, 334/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// HOW MANY RECORDS THE FOUR AFFINE COMPOSITE LOWERINGS EACH DEMAND — the `DT_CHECK` they differ by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessInfoCount {
+    /// `size() == n` on all three containers (`:3118`, `:3139`, `:3160`).
+    Exactly(usize),
+    /// `size() >= n` on all three (`:3371`).
+    AtLeast(usize),
+}
+
+impl AccessInfoCount {
+    /// Whether the three counts pass.
+    #[must_use]
+    const fn admits(self, counts: [usize; 3]) -> bool {
+        let (n, exact) = match self {
+            AccessInfoCount::Exactly(n) => (n, true),
+            AccessInfoCount::AtLeast(n) => (n, false),
+        };
+        let mut i = 0;
+        while i < counts.len() {
+            if exact && counts[i] != n {
+                return false;
+            }
+            if !exact && counts[i] < n {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+/// THE OUTCOME THE FOUR AFFINE COMPOSITE LOWERINGS SHARE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum CompositeLowering {
+    /// `return lowerAffineCompositeHelper<..>(..)` — entry 299's outcome, verbatim.
+    Handed(AffineCompositeLowering),
+    /// The operation this was called over is not of the class the lowering names.
+    WrongOpClass,
+    /// Entry 311 refused — `return failure()` with no diagnostic of its own.
+    DetailsFailed(AffineCompDetailsAndAddrs),
+    /// The `DT_CHECK` on the three container sizes.
+    AccessInfoCountMismatch,
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+}
+
+/// The body entries 329, 330, 331 and 334 share: three containers, entry 311, the size `DT_CHECK`,
+/// the re-found candidate, then entry 299.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own parameter list"
+)]
+fn lower_affine_composite_op<'a>(
+    kind: AgenOpKind,
+    src_op: &'a agen::Op,
+    position: usize,
+    dst_op: Option<&'a agen::Op>,
+    has_ind_src: bool,
+    has_ind_dst: bool,
+    expected: AccessInfoCount,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeLowering {
+    let mut access_details = AccessContainer::<AccessDetailsAffineComposite<'a>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    let details = construct_affine_comp_details_and_addrs(
+        src_op,
+        position,
+        dst_op,
+        comp,
+        has_ind_src,
+        has_ind_dst,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        unit,
+    );
+    if !matches!(details, AffineCompDetailsAndAddrs::Constructed) {
+        return CompositeLowering::DetailsFailed(details);
+    }
+    if !expected.admits([
+        access_details.entries().len(),
+        mutable_addrs.entries().len(),
+        immutable_addrs.entries().len(),
+    ]) {
+        return CompositeLowering::AccessInfoCountMismatch;
+    }
+
+    let Some(candidate) = find_candidate_for_lowering(kind, marked, unit) else {
+        return CompositeLowering::NoCandidate;
+    };
+    CompositeLowering::Handed(lower_affine_composite_helper(
+        kind,
+        marked,
+        unit,
+        candidate.op,
+        comp,
+        &mut mutable_addrs,
+        &immutable_addrs,
+        &access_details,
+        to_be_deleted,
+        values,
+    ))
+}
+
+/// Replaces: e329_lowerCompositeLoadOp
+///
+/// **329/384** `Helper.cpp:3106` (20L). One record, one mutable address, one immutable address, then
+/// entry 299 — the plain composite load has no destination operand to describe.
+pub fn lower_composite_load_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeLowering {
+    let DfirOp::Agen(src_op @ agen::Op::CompositeLoad(_)) = op else {
+        return CompositeLowering::WrongOpClass;
+    };
+    lower_affine_composite_op(
+        AgenOpKind::CompositeLoad,
+        src_op,
+        position,
+        // `constructAffineCompDetailsAndAddrs(op, nullptr, ..)` (`:3112`).
+        None,
+        false,
+        false,
+        AccessInfoCount::Exactly(1),
+        unit,
+        comp,
+        marked,
+        to_be_deleted,
+        values,
+    )
+}
+
+/// Replaces: e330_lowerCompositeStoreOp
+///
+/// **330/384** `Helper.cpp:3127` (20L). Entry 329 with `CompositeStoreOp` throughout — ⛔ INCLUDING
+/// THE `nullptr` DESTINATION (`:3133`), so the store's own view is described as the SOURCE record.
+pub fn lower_composite_store_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeLowering {
+    let DfirOp::Agen(src_op @ agen::Op::CompositeStore(_)) = op else {
+        return CompositeLowering::WrongOpClass;
+    };
+    lower_affine_composite_op(
+        AgenOpKind::CompositeStore,
+        src_op,
+        position,
+        None,
+        false,
+        false,
+        AccessInfoCount::Exactly(1),
+        unit,
+        comp,
+        marked,
+        to_be_deleted,
+        values,
+    )
+}
+
+/// Replaces: e331_lowerCompositeLoadAndStoreOp
+///
+/// **331/384** `Helper.cpp:3148` (21L). ⛔ THE OP IS ITS OWN DESTINATION (`:3153`), which is what
+/// makes entry 311 build TWO records and the `DT_CHECK` demand two of each.
+pub fn lower_composite_load_and_store_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeLowering {
+    let DfirOp::Agen(src_op @ agen::Op::CompositeLoadAndStore(_)) = op else {
+        return CompositeLowering::WrongOpClass;
+    };
+    lower_affine_composite_op(
+        AgenOpKind::CompositeLoadAndStore,
+        src_op,
+        position,
+        Some(src_op),
+        false,
+        false,
+        AccessInfoCount::Exactly(2),
+        unit,
+        comp,
+        marked,
+        to_be_deleted,
+        values,
+    )
+}
+
+/// Replaces: e334_lowerCompositeIndirectLoadAndStoreOp
+///
+/// **334/384** `Helper.cpp:3358` (18L). Entry 331 with the two indirect flags read off the op, so a
+/// two-sided indirect transfer describes up to FOUR operands — hence `>= 2`, not `== 2` (`:3371`).
+pub fn lower_composite_indirect_load_and_store_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeLowering {
+    let DfirOp::Agen(src_op @ agen::Op::CompositeIndirectLoadAndStore(transfer)) = op else {
+        return CompositeLowering::WrongOpClass;
+    };
+    lower_affine_composite_op(
+        AgenOpKind::CompositeIndirectLoadAndStore,
+        src_op,
+        position,
+        Some(src_op),
+        // `op.hasIndirectSrc()`, `op.hasIndirectDst()` (`:3365-3366`).
+        transfer.indirect_src.is_some(),
+        transfer.indirect_dst.is_some(),
+        AccessInfoCount::AtLeast(2),
+        unit,
+        comp,
+        marked,
+        to_be_deleted,
+        values,
+    )
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 332/384, 333/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME THE TWO ONE-SIDED INDIRECT COMPOSITE LOWERINGS SHARE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum CompositeIndirectLowering {
+    /// Entry 267's nest, with the candidate queued for deletion (`:3308`, `:3354`).
+    Lowered(Box<TimeLoopsAndTransfer>),
+    /// *"CompositeIndirectLoadOp only supported in LXLU"* (`:3270-3271`).
+    OnlySupportedInLxlu,
+    /// *"CompositeIndirectStoreOp only supported in LXSU"* (`:3316-3317`).
+    OnlySupportedInLxsu,
+    /// The operation this was called over is not of the class the lowering names.
+    WrongOpClass,
+    /// Entry 311 refused.
+    DetailsFailed(AffineCompDetailsAndAddrs),
+    /// Nothing marked of this class is left in the unit to re-find.
+    NoCandidate,
+    /// *"composite_indirect_load operations should have an extract_idx attribute"* (`:3287-3290`).
+    NoExtractIndex,
+    /// *"could not locate a … operation matching the extract_idx used by op"*.
+    NoMatchingExtractOp,
+    /// *"Unable to generate loops and sentient statements for the agen.composite_indirect_load
+    /// operation"* (`:3303-3306`).
+    Refused(TimeLoopsAndVectorOps),
+}
+
+/// The body entries 332 and 333 share. ⛔ NO SIZE `DT_CHECK` HERE, unlike every other composite
+/// lowering, and entry 267 is called DIRECTLY so the extract can be passed to it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reference's own parameter list"
+)]
+fn lower_composite_indirect_op<'a>(
+    kind: AgenOpKind,
+    of: ExtractScalarKind,
+    src_op: &'a agen::Op,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    extract_idx: Option<ExtractIndex>,
+    extract_ops: &ExtractScalarOps,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeIndirectLowering {
+    let mut access_details = AccessContainer::<AccessDetailsAffineComposite<'a>>::default();
+    let mut mutable_addrs = AccessContainer::<Val>::default();
+    let mut immutable_addrs = AccessContainer::<Val>::default();
+    // ⛔ BOTH INDIRECT FLAGS ARE `false` AND THE DESTINATION IS NULL (`:3275-3278`), even though the
+    // op this describes IS an indirect one: its indirect view is reached through the extract pairing,
+    // not through a record.
+    let details = construct_affine_comp_details_and_addrs(
+        src_op,
+        position,
+        None,
+        comp,
+        false,
+        false,
+        &mut access_details,
+        &mut mutable_addrs,
+        &mut immutable_addrs,
+        marked,
+        unit,
+    );
+    if !matches!(details, AffineCompDetailsAndAddrs::Constructed) {
+        return CompositeIndirectLowering::DetailsFailed(details);
+    }
+
+    let Some(candidate) = find_candidate_for_lowering(kind, marked, unit) else {
+        return CompositeIndirectLowering::NoCandidate;
+    };
+    let Some(extract_idx) = extract_idx else {
+        return CompositeIndirectLowering::NoExtractIndex;
+    };
+    let Some(extract) = extract_ops.find(of, extract_idx) else {
+        return CompositeIndirectLowering::NoMatchingExtractOp;
+    };
+
+    match construct_time_loops_and_vector_operations(
+        candidate.op,
+        comp,
+        &mut mutable_addrs,
+        &immutable_addrs,
+        &access_details,
+        Some(extract),
+        unit,
+        values,
+    ) {
+        TimeLoopsAndVectorOps::Constructed(built) => {
+            to_be_deleted.push(candidate.op);
+            CompositeIndirectLowering::Lowered(built)
+        }
+        refused => CompositeIndirectLowering::Refused(refused),
+    }
+}
+
+/// Replaces: e332_lowerCompositeIndirectLoadOp
+///
+/// **332/384** `Helper.cpp:3267` (44L). The LXLU gather: entry 311, the candidate, the
+/// `load_and_extract_scalar` its `extract_idx` names, then entry 267 with that pairing.
+pub fn lower_composite_indirect_load_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    extract_idx: Option<ExtractIndex>,
+    extract_ops: &ExtractScalarOps,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeIndirectLowering {
+    // `:3270-3271` — the gate is FIRST, before any record is built.
+    if comp != DfirUnit::Lxlu {
+        return CompositeIndirectLowering::OnlySupportedInLxlu;
+    }
+    let DfirOp::Agen(src_op @ agen::Op::CompositeIndirectLoad(_)) = op else {
+        return CompositeIndirectLowering::WrongOpClass;
+    };
+    lower_composite_indirect_op(
+        AgenOpKind::CompositeIndirectLoad,
+        ExtractScalarKind::LoadAndExtractScalar,
+        src_op,
+        position,
+        unit,
+        comp,
+        extract_idx,
+        extract_ops,
+        marked,
+        to_be_deleted,
+        values,
+    )
+}
+
+/// Replaces: e333_lowerCompositeIndirectStoreOp
+///
+/// **333/384** `Helper.cpp:3313` (44L). The LXSU scatter, entry 332 with the receive side.
+///
+/// ⛔ ITS `extract_idx` AND FINAL DIAGNOSTICS STILL SAY *"composite_indirect_load"* (`:3288`,
+/// `:3350`) — the reference's own copy-paste, and what an LXSU failure actually prints.
+pub fn lower_composite_indirect_store_op<'a>(
+    op: &'a DfirOp,
+    position: usize,
+    unit: &'a [DfirOp],
+    comp: DfirUnit,
+    extract_idx: Option<ExtractIndex>,
+    extract_ops: &ExtractScalarOps,
+    marked: &mut Marked,
+    to_be_deleted: &mut Vec<&'a DfirOp>,
+    values: &mut Values,
+) -> CompositeIndirectLowering {
+    // `:3316-3317`.
+    if comp != DfirUnit::Lxsu {
+        return CompositeIndirectLowering::OnlySupportedInLxsu;
+    }
+    let DfirOp::Agen(src_op @ agen::Op::CompositeIndirectStore(_)) = op else {
+        return CompositeIndirectLowering::WrongOpClass;
+    };
+    lower_composite_indirect_op(
+        AgenOpKind::CompositeIndirectStore,
+        ExtractScalarKind::ReceiveAndExtractScalar,
+        src_op,
+        position,
+        unit,
+        comp,
+        extract_idx,
+        extract_ops,
+        marked,
+        to_be_deleted,
+        values,
+    )
+}

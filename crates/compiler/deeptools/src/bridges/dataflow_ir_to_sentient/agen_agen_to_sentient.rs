@@ -156,19 +156,20 @@ impl Consumed {
 /// | 1 | `agen.vector_load` | `e153`? `e312` : `e314` | [`agen::Op::VectorLoad`] |
 /// | 2 | `agen.vector_store` | `e154`? `e313` : `e315` | [`agen::Op::VectorStore`] |
 /// | 3 | `agen.composite_load` | `e329` | — |
-/// | 4 | `agen.composite_store` | `e330` | — |
+/// | 4 | `agen.composite_store` | `e330` | [`agen::Op::CompositeStore`] |
 /// | 5 | `agen.composite_load_and_store` | `e331` | [`agen::Op::CompositeLoadAndStore`] |
 /// | 6 | `agen.indirect_vector_load` | `e316` | — |
 /// | 7 | `agen.indirect_vector_store` | `e317` | [`agen::Op::IndirectVectorStore`] |
-/// | 8 | `agen.composite_indirect_load` | `e332` | — |
-/// | 9 | `agen.composite_indirect_store` | `e333` | — |
-/// | 10 | `agen.composite_indirect_load_and_store` | `e334` | — |
+/// | 8 | `agen.composite_indirect_load` | `e332` | [`agen::Op::CompositeIndirectLoad`] |
+/// | 9 | `agen.composite_indirect_store` | `e333` | [`agen::Op::CompositeIndirectStore`] |
+/// | 10 | `agen.composite_indirect_load_and_store` | `e334` | [`agen::Op::CompositeIndirectLoadAndStore`] |
 /// | 11 | `agen.symbolic_vector_load` | `e374` | [`agen::Op::SymbolicVectorLoad`] |
 /// | 12 | `agen.symbolic_vector_store` | `e375` | [`agen::Op::SymbolicVectorStore`] |
 ///
-/// ⛔ SIX OF THE TWELVE HAVE NO ISLAND VARIANT and so cannot be a candidate here at all: a kind
-/// this crate cannot construct is a kind this dispatch cannot meet. The `match` below is therefore
-/// exhaustive over [`agen::Op`] rather than over the twelve — which is why declaring the symbolic
+/// ⭐ ALL TWELVE NOW HAVE AN ISLAND VARIANT — entries 330/332/333 declared the last three. The
+/// `match` below is still exhaustive over [`agen::Op`] rather than over the twelve, because the
+/// island also carries the interleave, the mask state and the yield, which the walk's guard passes
+/// over — which is why declaring the symbolic
 /// pair for entries 374/375 grew arms 11 and 12 here, and `agen.indirect_vector_store` for entry 216
 /// grew arm 7, in the one place that has to have them.
 ///
@@ -319,6 +320,24 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             unit.on.kind()
         ),
 
+        // ── 4. `agen.composite_store` (`AgenToSentient.cpp:96-101`) ─────────────────────────────
+        agen::Op::CompositeStore(_) => todo!(
+            "e330_lowerCompositeStoreOp: an agen.composite_store on {:?}",
+            unit.on.kind()
+        ),
+
+        // ── 8. `agen.composite_indirect_load` (`AgenToSentient.cpp:126-132`) ────────────────────
+        agen::Op::CompositeIndirectLoad(_) => todo!(
+            "e332_lowerCompositeIndirectLoadOp: an agen.composite_indirect_load on {:?}",
+            unit.on.kind()
+        ),
+
+        // ── 9. `agen.composite_indirect_store` (`AgenToSentient.cpp:133-139`) ───────────────────
+        agen::Op::CompositeIndirectStore(_) => todo!(
+            "e333_lowerCompositeIndirectStoreOp: an agen.composite_indirect_store on {:?}",
+            unit.on.kind()
+        ),
+
         // ── 6. `agen.indirect_vector_load` (`AgenToSentient.cpp:109-115`) ───────────────────────
         //
         // ⛔ NO EXTRACT PREDICATE HERE EITHER, and the pairing is why: the gather reads the address
@@ -385,7 +404,7 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
 ///
 /// ⛔ IT IS THE WALK'S GUARD, NOT THE DISPATCH'S. `checkBasicConditions` sits inside it, so the
 /// interleave and the mask state — which the fusion passes over and `e384` lowers in its own later
-/// steps — are never asked. Written as an exhaustive `match` so a thirteenth island `agen` op has to
+/// steps — are never asked. Written as an exhaustive `match` so a further island `agen` op has to
 /// state which side of the guard it is on.
 fn is_candidate(op: &agen::Op) -> bool {
     match op {
@@ -394,7 +413,10 @@ fn is_candidate(op: &agen::Op) -> bool {
         | agen::Op::IndirectVectorLoad { .. }
         | agen::Op::IndirectVectorStore { .. }
         | agen::Op::CompositeLoad(_)
+        | agen::Op::CompositeStore(_)
         | agen::Op::CompositeLoadAndStore(_)
+        | agen::Op::CompositeIndirectLoad(_)
+        | agen::Op::CompositeIndirectStore(_)
         | agen::Op::CompositeIndirectLoadAndStore(_)
         | agen::Op::SymbolicVectorLoad { .. }
         | agen::Op::SymbolicVectorStore { .. } => true,

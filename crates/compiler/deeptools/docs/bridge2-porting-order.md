@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`333/384 ported; 333/384 audited`
+`341/384 ported; 341/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2688,6 +2688,58 @@ the 106 exclusions: `order_map`, `replace_const_ops_in_subscripts_map`,
 `AccessDetailsAffine::construct_details_after_initialize`, which 326 calls and the schedule does not
 list.
 
+⭐ ENTRIES 327-334 — THE SYMBOLIC ITER-ARG CHAIN, THE INDIRECT MUTABLE-ADDRESS ADJUSTMENT AND THE SIX
+COMPOSITE LOWERINGS. All eight are in `agen_helper.rs`, and the six lowerings are two shared bodies:
+329/330/331/334 differ only in op class, destination operand and the size `DT_CHECK`, and 332/333 only
+in component, op class and extract kind.
+
+⛔⛔ 327 CLONES INSIDE ITS OWN INDEX LOOP AND EVERY HANDLE DIES WITH THE CLONE (`Helper.cpp:1064-1076`).
+The index and its stride are re-read from the record AFTER `updateSymbolicAccessDetails` has remapped
+them, which is why the Rust iterates by position rather than over an iterator the container hands out —
+the reference aliases the container it is walking. The grown `iter_arg` yields itself plus the index's
+stride when the index is an IV, and itself plus the value already feeding the yield when the index is a
+carried arg, because that stride was applied upstream.
+
+⛔ 327's `prev_arg` IS ASSIGNED ONLY IN THE `else` (`:1178`). The chain is therefore seeded ONCE and
+every later loop's initialiser is wired to the FIRST seat rather than to its own parent's — ported as
+written. On L3 that first seat keeps the `arith.constant 0` the clone gave it (`:1174-1176`), and the
+immutable address comes from the view start instead (`:1226-1232`). `isProperAncestor` becomes loop
+DEPTH here, which is the total order the reference's comparator is a partial version of.
+
+⛔ 327's ONE DIVERGENCE IS A NULL IT CANNOT HOLD: `mem_view_start_addrs.insert(..)` is unconditional
+(`:1190`) and a null start address still counts towards the size entry 213 checks, so the reference
+would place an address nothing defines. A container of `Val` has no null, so a record with no view start
+leaves the counts unequal and 213 answers `SizeMismatch`. Stated at the fill site.
+
+⛔⛔ 328 ADJUSTS AN `iter_arg` ADDRESS AT ITS **INITIALISER**, NOT WHERE IT IS USED (`:1505-1540`) —
+adding inside the loop would re-add the extracted scalar once per trip. The walk climbs the initialiser
+chain until it leaves the loop holding the extract, and BOTH terminating cases do the same thing: insert
+the add before the current loop and replace that seat's initialiser. Only the case *"the initialiser is
+a block arg of some OTHER loop"* keeps walking.
+
+⛔ 328's REFERENCE READS `getInits()[arg_idx - 1]` AND WRITES `setOperand(arg_idx, ..)` (`:1513`,
+`:1525`). Region arguments are `[iv, iter_arg0, ..]` and an `affine.for` with constant bounds has
+operands `[init0, ..]`, so those are two DIFFERENT seats on any loop carrying more than one. We read and
+write the same seat, which is what the comment at `:1490` says the code means. Recorded at the port.
+
+⛔ 328's `scf::ForOp` ARM IS UNREACHABLE ON THIS RUNG, as a type fact rather than an omission: a
+`sentient` statement can only sit in a `SenOp::AffineFor` body — `SenOp::Scf(scf::Op::For)` carries a
+body of DataflowIR ops — so the loop holding an extract is always the affine one. The pairing
+`DT_CHECK` (`:1450-1454`) became `IndirectMemOp::of`, the only constructor.
+
+⛔ 332/333 SKIP THE SIZE `DT_CHECK` EVERY OTHER COMPOSITE LOWERING MAKES, and pass `nullptr` for the
+destination with BOTH indirect flags `false` (`:3275-3278`) even though the op they describe IS an
+indirect one: its indirect view is reached through the extract pairing, not through a record. They also
+call entry 267 DIRECTLY rather than through 299, because 299 has no `extract_op` parameter.
+
+⛔ 333's `extract_idx` AND FINAL DIAGNOSTICS BOTH SAY *"composite_indirect_load"* (`:3288`, `:3350`) —
+the reference's own copy-paste, and what an LXSU failure actually prints. Its middle one names
+`receive_and_extract_scalar` correctly. All three are the outcome variants' doc text.
+
+⭐ 329-334 BOTTOM OUT IN THE `todo!` 358/359 OWN, so their refusal doors are what is testable: the op
+class, the component gate, and — for 331, through the vendor's own 64-lane composite — the record
+construction stopping before the size check. No island growth and no new dependency for this batch.
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3360,22 +3412,22 @@ list.
 
 ## Level 6
 
-- [ ] **PORT 327/384** `gatherSymbolicLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1051`, 153 lines
-- [ ] **AUDIT 327/384** `gatherSymbolicLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1051`, line by line against the C++
-- [ ] **PORT 328/384** `adjustMutableAddrInitForIndirect` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1447`, 127 lines
-- [ ] **AUDIT 328/384** `adjustMutableAddrInitForIndirect` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1447`, line by line against the C++
-- [ ] **PORT 329/384** `lowerCompositeLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3106`, 17 lines
-- [ ] **AUDIT 329/384** `lowerCompositeLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3106`, line by line against the C++
-- [ ] **PORT 330/384** `lowerCompositeStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3127`, 17 lines
-- [ ] **AUDIT 330/384** `lowerCompositeStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3127`, line by line against the C++
-- [ ] **PORT 331/384** `lowerCompositeLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3148`, 17 lines
-- [ ] **AUDIT 331/384** `lowerCompositeLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3148`, line by line against the C++
-- [ ] **PORT 332/384** `lowerCompositeIndirectLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3267`, 42 lines
-- [ ] **AUDIT 332/384** `lowerCompositeIndirectLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3267`, line by line against the C++
-- [ ] **PORT 333/384** `lowerCompositeIndirectStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3313`, 42 lines
-- [ ] **AUDIT 333/384** `lowerCompositeIndirectStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3313`, line by line against the C++
-- [ ] **PORT 334/384** `lowerCompositeIndirectLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3359`, 17 lines
-- [ ] **AUDIT 334/384** `lowerCompositeIndirectLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3359`, line by line against the C++
+- [x] **PORT 327/384** `gatherSymbolicLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1051`, 153 lines
+- [x] **AUDIT 327/384** `gatherSymbolicLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1051`, line by line against the C++
+- [x] **PORT 328/384** `adjustMutableAddrInitForIndirect` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1447`, 127 lines
+- [x] **AUDIT 328/384** `adjustMutableAddrInitForIndirect` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1447`, line by line against the C++
+- [x] **PORT 329/384** `lowerCompositeLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3106`, 17 lines
+- [x] **AUDIT 329/384** `lowerCompositeLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3106`, line by line against the C++
+- [x] **PORT 330/384** `lowerCompositeStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3127`, 17 lines
+- [x] **AUDIT 330/384** `lowerCompositeStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3127`, line by line against the C++
+- [x] **PORT 331/384** `lowerCompositeLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3148`, 17 lines
+- [x] **AUDIT 331/384** `lowerCompositeLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3148`, line by line against the C++
+- [x] **PORT 332/384** `lowerCompositeIndirectLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3267`, 42 lines
+- [x] **AUDIT 332/384** `lowerCompositeIndirectLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3267`, line by line against the C++
+- [x] **PORT 333/384** `lowerCompositeIndirectStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3313`, 42 lines
+- [x] **AUDIT 333/384** `lowerCompositeIndirectStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3313`, line by line against the C++
+- [x] **PORT 334/384** `lowerCompositeIndirectLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3359`, 17 lines
+- [x] **AUDIT 334/384** `lowerCompositeIndirectLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3359`, line by line against the C++
 - [x] **PORT 335/384** `insertCopyAndAddStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3861`, 13 lines
 - [x] **AUDIT 335/384** `insertCopyAndAddStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3861`, line by line against the C++
 - [x] **PORT 336/384** `adjustMutableAddrInitForStride` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4034`, 47 lines

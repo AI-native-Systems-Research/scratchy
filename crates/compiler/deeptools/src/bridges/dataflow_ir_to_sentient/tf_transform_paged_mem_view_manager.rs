@@ -287,9 +287,9 @@ impl<'a> TpmvManager<'a> {
     ///
     /// `agen.composite_load` (`paged_mem_view_loads.mlir:331`) IS declared now — entry 326
     /// `TPMVCompositeLoad::initialize_time` `dyn_cast`s exactly it, so `AGENT-BRIEF.md:87` applied —
-    /// and this selector reaches [`Tpmv::CompositeLoad`] for real. `agen.composite_store`
-    /// (`paged_mem_view_stores.mlir:361`) is still absent, so [`Tpmv::CompositeStore`] stays
-    /// reachable from a test and from nothing the crate emits.
+    /// and this selector reaches [`Tpmv::CompositeLoad`] for real. ⭐ SO IS `agen.composite_store`
+    /// (`paged_mem_view_stores.mlir:361`), declared for entry 330, which puts all five memory
+    /// classes of the `dyn_cast` chain on a real arm.
     ///
     /// # ⭐ THE TWO THINGS WITH NO COUNTERPART
     ///
@@ -340,9 +340,12 @@ impl<'a> TpmvManager<'a> {
             DfirOp::Agen(agen::Op::CompositeLoad(_)) => {
                 Selection::Selected(Tpmv::CompositeLoad(TpmvCompositeLoad::new(op, self.comp)))
             }
+            // `else if (auto comp_store_op = dyn_cast<agen::CompositeStoreOp>(op))` (`:54-56`).
+            DfirOp::Agen(agen::Op::CompositeStore(_)) => {
+                Selection::Selected(Tpmv::CompositeStore(TpmvCompositeStore::new(op, self.comp)))
+            }
             // `else if (auto comp_load_store_op = dyn_cast<agen::CompositeLoadAndStoreOp>(op))` —
-            // the LAST of the three composite arms in the reference. `CompositeStoreOp`, between
-            // them, has no island op; see the note above.
+            // the LAST of the three composite arms in the reference.
             DfirOp::Agen(agen::Op::CompositeLoadAndStore(_)) => Selection::Selected(
                 Tpmv::CompositeLoadStore(TpmvCompositeLoadStore::new(op, self.comp)),
             ),
@@ -357,6 +360,11 @@ impl<'a> TpmvManager<'a> {
                 | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeMemoryInterleave { .. }
+                // ⛔ AND NEITHER INDIRECT COMPOSITE IS ONE: the chain's five `dyn_cast`s name the
+                // direct classes only, so a gather or a scatter onto a static paged tensor is the
+                // `llvm_unreachable` too.
+                | agen::Op::CompositeIndirectLoad(_)
+                | agen::Op::CompositeIndirectStore(_)
                 | agen::Op::CompositeIndirectLoadAndStore(_)
                 | agen::Op::SetTransferMaskState { .. },
             )

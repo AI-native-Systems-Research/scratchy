@@ -942,7 +942,10 @@ impl<'a> VectorLoadOp<'a> {
                 | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeLoad(_)
+                | agen::Op::CompositeStore(_)
                 | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::CompositeIndirectLoad(_)
+                | agen::Op::CompositeIndirectStore(_)
                 | agen::Op::CompositeIndirectLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. }
@@ -1204,7 +1207,10 @@ impl<'a> VectorStoreOp<'a> {
                 | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeLoad(_)
+                | agen::Op::CompositeStore(_)
                 | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::CompositeIndirectLoad(_)
+                | agen::Op::CompositeIndirectStore(_)
                 | agen::Op::CompositeIndirectLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. }
@@ -6678,7 +6684,7 @@ pub fn create_iter_args_for_conditionals(
 ///
 /// ⭐ THE REGION ORDINAL IS WHAT [`loop_path_of`] DROPS, and a mutable descent needs it: an
 /// `scf.if` has two regions and only one of them holds the loop.
-fn binding_path(val: Val, scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
+pub(super) fn binding_path(val: Val, scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
     for (ordinal, op) in scope.iter().enumerate() {
         if dialects::block_args(op).contains(&val) {
             return Some(vec![(ordinal, 0)]);
@@ -6696,7 +6702,7 @@ fn binding_path(val: Val, scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
 }
 
 /// The list an op sits in and where in it — [`binding_path`] followed mutably.
-fn ops_at_mut<'s>(
+pub(super) fn ops_at_mut<'s>(
     scope: &'s mut Vec<DfirOp>,
     path: &[(usize, usize)],
 ) -> Option<(&'s mut Vec<DfirOp>, usize)> {
