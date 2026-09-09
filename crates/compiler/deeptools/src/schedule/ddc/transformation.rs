@@ -163,8 +163,8 @@ use crate::units::Corelet;
 // units OWN is the decision and the mutation, and both are below.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
-/// WHICH COMPUTE STICK PACKING CARES ABOUT — `ComputeOpType` (`dsc/dscdefn.h:157-158`) narrowed to
-/// the two members entry 105 distinguishes.
+/// WHICH COMPUTE STICK PACKING CARES ABOUT — `ComputeOpType` (`dsc/dscdefn.h:134`, its two members
+/// at `:157-158`) narrowed to the two entry 105 distinguishes.
 ///
 /// ⛔ NOT `dsc2::ComputeType`: that is the crate's DDL census, and `RECIPROCAL`/`LAYERNORMSCALE` are
 /// not in it. Spelling the other ~68 members of `ComputeOpType` would state `type_` twice; these
@@ -183,11 +183,12 @@ pub enum ComputeOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InputCount(pub usize);
 
-/// ONE LAYOUT DIM'S SCALE — `LabeledDsInfo::scale_` entry (`dsc/dscdefn.h:327`), whose two negative
-/// values are sentinels the `DT_CHECK` at `dsc/designSpaceConfig.cpp:523-525` closes to `1|-1|-2`.
+/// ONE LAYOUT DIM'S SCALE — `LabeledDsInfo::scale_` entry (`dsc/dscdefn.h:332`), whose two negative
+/// values are sentinels the `DT_CHECK` at `dsc/designSpaceConfig.cpp:524-525` closes to `1|-1|-2`
+/// wherever `applyScale` is set.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scale {
-    /// A non-negative scale: the dim's size comes from the data stage (`dsc/dsc2.cpp:3832`).
+    /// A non-negative scale: the dim's size comes from the data stage (`dsc/dsc2.cpp:3830`).
     Sized(f64),
     /// `-1` — the dim is exactly ONE element (`dsc/dsc2.cpp:3824-3826`).
     UnitStick,
@@ -239,7 +240,7 @@ pub struct StickPackingTransfers {
     /// `releventInputTransfers` — the LXLU-to-`exUnit_` side.
     pub inputs: Vec<StickPackTransfer>,
     /// `releventOutputTransfer` — the `exUnit_`-to-LXSU side, absent where the reference leaves an
-    /// UNINITIALISED pointer (`ddc/ddc_transformation.cpp:815`).
+    /// UNINITIALISED pointer (`ddc/ddc_transformation.cpp:819`).
     pub output: Option<StickPackTransfer>,
     /// `releventTransferDstIdx`, one per arm that fired — ⛔ INCLUDING for transfers the scale and
     /// `myLdsIdx_` checks later skip, which is why the caller's `DT_CHECK` counts it separately.
@@ -264,8 +265,9 @@ pub struct OutputIdx(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoopId(pub NodeId);
 
-/// ONE `computeMaskLoopOffsets_` ENTRY — "put 1 if popping next element, or 0 if reuse is expected"
-/// (`dsc/dsc2.h:920-923`).
+/// ONE `computeMaskLoopOffsets_` ENTRY (`dsc/dsc2.h:923-925`) — "put 1 if popping next element, or 0
+/// if reuse is expected", which is the encoding stated on the COMMENTED-OUT `loopEleOffsets_` right
+/// above it (`dsc/dsc2.h:917-922`) and nowhere on the live field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaskLoopOffset(pub i32);
 
@@ -277,7 +279,7 @@ impl MaskLoopOffset {
 /// A COMPUTE PROVED TO HAVE A PARENT LOOP FOR THE RESTICKIFY DIM — `getParentDimLoop(dimForLoop)`
 /// returning `nullptr` made unconstructible.
 ///
-/// ⛔ THE REFERENCE DEREFERENCES IT UNGUARDED (`ddc/ddc_transformation.cpp:2385-2389`): a compute
+/// ⛔ THE REFERENCE DEREFERENCES IT UNGUARDED (`ddc/ddc_transformation.cpp:2388-2390`): a compute
 /// with no loop over `dimForLoop` reads `loopNode->dims_` through a null pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaskedComputeSite {
@@ -348,7 +350,9 @@ pub trait OffsetAdjustment {
     /// `labeledDs_.at(outputsLdsAndLoopOffsets_.at(idx).myLdsIdx_).memOrg_.at(outputs_.at(idx))
     /// .allocateNode_`, absent where either `.at()` throws or the allocation is null.
     fn output_allocation(&self, node: NodeId, idx: OutputIdx) -> Option<AllocId>;
-    /// `alloc->allocUsers_.push_back({user, 1})` (`dsc/dsc2.h:1019`).
+    /// `alloc->allocUsers_.push_back({user, 1})` (`ddc/ddc_transformation.cpp:1373`) — the RAW push,
+    /// ⛔ NOT `addAllocUser` (`dsc/dsc2.h:1012`): a repeat user gets a SECOND entry at count 1, not
+    /// an incremented one.
     fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId);
     /// `alloc->layoutDimOrder_.at(0)` — the OUTERMOST layout dim, total because the reference
     /// `DT_CHECK`s that order non-empty wherever it derives one.
@@ -391,7 +395,7 @@ const MASKED_SUFFIX: &str = "_masked";
 ///
 /// ⛔ TRAP, AND IT IS THE REFERENCE'S: `numberOfInputs` LATCHES while the chosen node does not. A
 /// `LAYERNORMSCALE` followed by a `RECIPROCAL` returns the reciprocal paired with 2, and the caller
-/// then requires two input transfers for a one-input op (`ddc/ddc_transformation.cpp:698-705`).
+/// then requires two input transfers for a one-input op (`ddc/ddc_transformation.cpp:824`).
 /// ⛔ The out-parameter is left UNTOUCHED when nothing matches, so the caller reads an uninitialised
 /// pointer unless it checks the `bool` first; the [`Option`] makes that unspellable.
 pub fn is_relevant_compute_to_pack_stick_dim<T: ComputeWalk + ?Sized>(
@@ -517,7 +521,7 @@ where
 ///
 /// ⛔ `numberOfInputs` IS DROPPED: the reference indexes `ldsInputIdx.at(i)` for `i < numberOfInputs`
 /// and its one caller fills that vector with exactly `numberOfInputs` entries
-/// (`ddc/ddc_transformation.cpp:830-835`), so iterating the slice is the same walk without the throw.
+/// (`ddc/ddc_transformation.cpp:827-830`), so iterating the slice is the same walk without the throw.
 pub fn is_eligible_compute<L: LabeledDs + ?Sized>(
     lds: &L,
     input_transfers: &[StickPackTransfer],
@@ -552,6 +556,9 @@ pub fn is_eligible_compute<L: LabeledDs + ?Sized>(
 ///
 /// ⛔ THE ORIGINAL KEEPS ITS `n`: only the clones are set to 1, so the spread read on every trip is
 /// the unreduced repetition, and that is what `gapStickSpread_` receives.
+/// ⛔ DELIBERATE DIVERGENCE: an output whose `memOrg_` entry is missing or whose `allocateNode_` is
+/// null makes the reference throw or dereference null (`ddc/ddc_transformation.cpp:1370-1373`); here
+/// the clone is still made and recorded and only the user bump and the spread are skipped.
 pub fn clone_compute_for_offset_adjustment<T: OffsetAdjustment + ?Sized>(
     tree: &mut T,
     node: NodeId,
@@ -583,8 +590,9 @@ pub fn clone_compute_for_offset_adjustment<T: OffsetAdjustment + ?Sized>(
 /// use, tells it to ADVANCE one element per dim of its enclosing loop over the restickify dim.
 ///
 /// ⛔ `none_trivial_input_idx` IS DROPPED — the reference binds it and never reads it
-/// (`ddc/ddc_transformation.cpp:2383-2394`). ⛔ The unconditional `return true` is the witness being
-/// constructible: the caller only `|=`s it, so [`MaskedComputeSite::of`] carries that answer.
+/// (`ddc/ddc_transformation.cpp:2384`). ⛔ The unconditional `return true` is the witness being
+/// constructible: the one live caller only `|=`s it (`:2419`), so [`MaskedComputeSite::of`] carries
+/// that answer.
 pub fn transform_a_compute_node_for_inter_slice_restickify<T: ComputeMasking + ?Sized>(
     tree: &mut T,
     site: MaskedComputeSite,
@@ -867,6 +875,8 @@ mod tests_e105_e109 {
     struct Spreading {
         next: u32,
         log: Vec<Edit>,
+        /// The output has no allocation — where the reference throws or dereferences null.
+        unallocated: bool,
     }
 
     impl OffsetAdjustment for Spreading {
@@ -886,7 +896,7 @@ mod tests_e105_e109 {
             self.log.push(Edit::Recorded(original, clone));
         }
         fn output_allocation(&self, _node: NodeId, _idx: OutputIdx) -> Option<AllocId> {
-            Some(AllocId(7))
+            (!self.unallocated).then_some(AllocId(7))
         }
         fn add_alloc_user(&mut self, alloc: AllocId, user: NodeId) {
             self.log.push(Edit::AllocUser(alloc, user));
@@ -915,6 +925,26 @@ mod tests_e105_e109 {
                 Edit::RepetitionSet(NodeId(2), OutputIdx(0), Repetition(1)),
                 Edit::Recorded(NodeId(0), NodeId(2)),
                 Edit::AllocUser(AllocId(7), NodeId(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_output_with_no_allocation_still_clones_and_records() {
+        let mut tree = Spreading {
+            unallocated: true,
+            ..Spreading::default()
+        };
+        clone_compute_for_offset_adjustment(&mut tree, NodeId(0));
+        assert_eq!(
+            tree.log,
+            vec![
+                Edit::Cloned(NodeId(1)),
+                Edit::RepetitionSet(NodeId(1), OutputIdx(0), Repetition(1)),
+                Edit::Recorded(NodeId(0), NodeId(1)),
+                Edit::Cloned(NodeId(2)),
+                Edit::RepetitionSet(NodeId(2), OutputIdx(0), Repetition(1)),
+                Edit::Recorded(NodeId(0), NodeId(2)),
             ]
         );
     }

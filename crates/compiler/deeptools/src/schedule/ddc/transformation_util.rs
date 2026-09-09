@@ -192,7 +192,7 @@ impl PaddingForm {
 }
 
 /// `EnumsConversion::senComponentsToString.at(comp)` for the eight `ddc::memories`
-/// (`sys-arch-spec/arch_enums.cpp:11-113`, `ddc/ddc_metadata.h:19`).
+/// (`sys-arch-spec/arch_enums.cpp:10-118`, `ddc/ddc_metadata.h:20-21`).
 const fn memory_spelling(memory: DdcMemory) -> &'static str {
     match memory {
         DdcMemory::Lx => "lx",
@@ -217,14 +217,17 @@ pub struct DdcAllocateNode {
     pub name: NodeName,
     /// `ldsIdx_`/`constIdx_`, exactly one of which is set.
     pub origin: DataOrigin,
-    /// `component_`, a MEMORY BY TYPE — `ddc::memories` (`ddc/ddc_metadata.h:19`), which is what
-    /// makes *"Requested storage <c> is not a memory"* unspellable.
+    /// `component_`, a MEMORY BY TYPE, which is what makes *"Requested storage <c> is not a memory"*
+    /// unspellable. ⛔ THAT GUARD READS `dsc2::memories` — 16 members (`dsc/dscdefn.cpp:142-144`) —
+    /// and NOT [`DdcMemory`]'s eight (`ddc::memories`, `ddc/ddc_metadata.h:20-21`); the narrowing
+    /// holds because both callsites pass PELRF or SFPLRF only
+    /// (`ddc/ddc_transformation_util.cpp:834-837`, `ddc/ddc_transformation.cpp:1876-1878`).
     pub component: DdcMemory,
     /// `layoutDimOrder_` zipped with `maxDimSizes_`, whose fresh entries are the reference's `-1`.
     pub layout: AllocLayout,
     /// `padding_`.
     pub padding: PaddingForm,
-    /// `allocUsers_` (`dsc/dsc2.h:1010`) — each user to its reference count, a map because the
+    /// `allocUsers_` (`dsc/dsc2.h:1007`) — each user to its reference count, a map because the
     /// reference's vector of pairs is only ever searched by node.
     pub alloc_users: BTreeMap<NodeId, u32>,
 }
@@ -281,7 +284,7 @@ impl FreshAllocation {
         {
             return None;
         }
-        let dims = dsc.layout_dims(dsc.reference_lds(lds)).to_vec();
+        let dims = dsc.layout_dims(dsc.own_lds_idx(lds)).to_vec();
         let distinct: BTreeSet<PrimaryDim> = dims.iter().copied().collect();
         (distinct.len() == dims.len()).then(|| Self {
             lds,
@@ -355,9 +358,10 @@ impl AllocationUse {
 /// `reduceUsersOrDeleteAllocation` (`:2495`) does the tree-side unlink; what these two entries want
 /// is the allocation, and whether it left the tree.
 pub trait DscAllocations: Dsc {
-    /// `labeledDs_.at(lds).ldsIdx_` (`dsc/dscdefn.h:321`) — the ENTRY'S OWN self-index, which is
-    /// what `getLayoutDims` is keyed by and need not be the index it was looked up under.
-    fn reference_lds(&self, lds: LdsIdx) -> LdsIdx;
+    /// `labeledDs_.at(lds).ldsIdx_` (`dsc/dscdefn.h:323`) — the ENTRY'S OWN self-index, which is
+    /// what `getLayoutDims` is keyed by and need not be the index it was looked up under. ⛔ NOT
+    /// `referenceLdsIdx_` (`dsc/dscdefn.h:324`), the neighbouring field naming another tensor.
+    fn own_lds_idx(&self, lds: LdsIdx) -> LdsIdx;
 
     /// `getAllocation(di, storage, /*allowMissingAlloc=*/true)`.
     fn allocation_in(&self, origin: DataOrigin, storage: DdcMemory) -> Option<AllocId>;
@@ -366,7 +370,7 @@ pub trait DscAllocations: Dsc {
     /// (`dsc/dscdefn.h:305`).
     fn set_allocation_in(&mut self, lds: LdsIdx, storage: DdcMemory, alloc: AllocId);
 
-    /// The nodes in `allocUsers_` (`dsc/dsc2.h:1010`).
+    /// The nodes in `allocUsers_` (`dsc/dsc2.h:1007`).
     fn alloc_users(&self, alloc: AllocId) -> Vec<NodeId>;
 
     /// `allocNode->component_`.
@@ -401,11 +405,14 @@ pub struct StageDims<D> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct StageName(pub String);
 
-/// `dsc2::DataStage` (`dsc/dsc2.h:40`) — the steady-state and epilogue halves of one staging
+/// `dsc2::DataStage` (`dsc/dsc2.h:39`) — the steady-state and epilogue halves of one staging
 /// parameter set.
 ///
 /// ⭐ GENERIC IN THE EXTENTS PAYLOAD ON PURPOSE: entry 113 mints a stage by COPYING a reference
 /// one, and a projection that dropped the extents would make it entry 112 spelled twice.
+/// ⚠️ `schedule::l3::dsc::DataStage` PROJECTS THE SAME C++ STRUCT for the L3 side, with the core and
+/// chunk stages held out of the map; the mint is NOT spelled twice — `e064_constructDatastage` calls
+/// [`construct_datastage_from`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataStage<D> {
     /// `ss_` — the steady-state dims.
@@ -506,12 +513,12 @@ pub struct LoopCond {
     pub loop_node: NodeId,
 }
 
-/// A CONDITION NODE'S LOOP CONDITION — `LoopCondComposite::twoLevelOrOfAnds_` (`dsc/dsc2.h:675`),
+/// A CONDITION NODE'S LOOP CONDITION — `LoopCondComposite::twoLevelOrOfAnds_` (`dsc/dsc2.h:676`),
 /// an OR of ANDs of per-loop terms.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoopCondComposite {
     /// `twoLevelOrOfAnds_`, EMPTY exactly when the node carries the core/corelet condition instead
-    /// — that is the whole of `hasCoreClCond()` (`dsc/dsc2.h:692`).
+    /// — that is the whole of `hasCoreClCond()` (`dsc/dsc2.h:693-695`).
     pub or_of_ands: Vec<Vec<LoopCond>>,
 }
 
@@ -576,7 +583,7 @@ pub trait AllocationPaddings: Allocations {
 /// records `user_node` as its first user (`ddc/ddc_transformation_util.cpp:20`).
 ///
 /// ⚠️ TRAP: the layout order comes from the labeled DS entry's OWN `ldsIdx_`
-/// ([`DscAllocations::reference_lds`]), NOT from the index it was looked up under.
+/// ([`DscAllocations::own_lds_idx`]), NOT from the index it was looked up under.
 /// ⭐ `alloc` IS THE IDENTITY ITS OWNER ISSUES — `new dsc2::AllocateNode()` in the reference, whose
 /// pointer both names the node and is the key both registries hold it under.
 pub fn construct_allocation<D: DscAllocations + ?Sized>(
@@ -627,9 +634,11 @@ pub fn construct_allocation<D: DscAllocations + ?Sized>(
 /// ⛔ DELIBERATE DIVERGENCE, and the defect is the reference's: it folds both indices into one
 /// `int` and erases that from `ldsIdxAndAllocNode`, so a CONSTANT allocation either aborts on
 /// *"Missing metadata for allocateNode"* or erases an unrelated labeled DS. `consIdAndAllocNode`
-/// exists for exactly those (`:1356`), so a constant is erased from it; the mixed-key state cannot
-/// be spelled here. Its two *"Missing metadata"* aborts are then a registry with nothing to erase,
-/// which entry 110 — the only writer of `newAllocations_`, and it always registers — rules out.
+/// exists for exactly those (`ddc/ddc_metadata.h:123`), so a constant is erased from it; the
+/// mixed-key state cannot be spelled here. Its two *"Missing metadata"* aborts become a no-op
+/// instead: EVERY site that mints an allocation registers it under the node's own `component_`
+/// (`:59`, `:1339`, `:1506`; `ddc/ddc_transformation.cpp:2126`, `:2355`), so a live allocation with
+/// no registry entry is unreachable — entry 110 is one such writer, not the only one.
 pub fn reduce_users_or_delete_allocation_and_metadata<D: DscAllocations + ?Sized>(
     dsc: &mut D,
     metadata: &mut Metadata,
@@ -717,7 +726,7 @@ pub fn construct_loop_node(num: DatastageId, den: DatastageId, dims: LoopDims) -
 /// Adds every loop that any and-clause of a CONDITION node's loop condition compares against; every
 /// other node kind contributes nothing (`:318`).
 ///
-/// ⚠️ TRAP: the `hasCoreClCond()` early return IS `twoLevelOrOfAnds_.empty()` (`dsc/dsc2.h:692`),
+/// ⚠️ TRAP: the `hasCoreClCond()` early return IS `twoLevelOrOfAnds_.empty()` (`dsc/dsc2.h:693-695`),
 /// so all it can ever skip is an empty walk — the guard filters no clause.
 pub fn collect_loop_references(node: UtilNode<'_>, referenced_loops: &mut BTreeSet<NodeId>) {
     if let UtilNode::Condition(_, cond) = node {
@@ -1031,7 +1040,7 @@ mod tests_e110_e117 {
     }
 
     impl DscAllocations for TestDsc {
-        fn reference_lds(&self, _lds: LdsIdx) -> LdsIdx {
+        fn own_lds_idx(&self, _lds: LdsIdx) -> LdsIdx {
             self.reference
         }
 
