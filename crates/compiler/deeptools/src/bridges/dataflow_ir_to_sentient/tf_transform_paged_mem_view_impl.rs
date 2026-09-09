@@ -7257,7 +7257,7 @@ pub(super) fn order_map(map: &AffineMap, map_order: &AffineMap) -> AffineMap {
 }
 
 /// `agen::utils::replaceConstOpsInSubscriptsMap` — `dcc/src/Dialect/Agen/Utils.cpp:46` (20L), with
-/// `removeConstantOpsFromIndices` (`:33-44`) inlined as its closing statement.
+/// `removeConstantOpsFromIndices` (`:35-44`) inlined as its closing statement.
 ///
 /// ⛔ TWO RENUMBERINGS IN ONE PASS: a constant operand becomes an `AffineConstantExpr` and is
 /// DROPPED from `indices`, and every surviving operand is renumbered densely — so `indices[dim]` and

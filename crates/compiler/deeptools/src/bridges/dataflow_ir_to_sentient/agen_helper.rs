@@ -9794,7 +9794,7 @@ pub enum AffineCompDetailsAndAddrs {
     /// *"unable to construct details for indirect src"*.
     IndSrcDetailsFailed(ConstructedDetails),
     /// *"unable to construct details for indirect src"* — ⛔ the message is the src one again
-    /// (`Helper.cpp:2840`).
+    /// (`Helper.cpp:2838`).
     DstIndDetailsFailed(ConstructedDetails),
     /// A record was already bound to that operand slot.
     OperandSlotTaken(MemoryOperandIndex),
@@ -9825,7 +9825,7 @@ pub fn construct_affine_comp_details_and_addrs<'a>(
     marked: &mut Marked,
     scope: &[DfirOp],
 ) -> AffineCompDetailsAndAddrs {
-    // `DT_CHECK(src_op)` (`:2816`) — a `&agen::Op` cannot be null. `dst_op`'s can.
+    // `DT_CHECK(src_op)` (`:2815`) — a `&agen::Op` cannot be null. `dst_op`'s can.
     if has_ind_dst && dst_op.is_none() {
         return AffineCompDetailsAndAddrs::IndirectDstWithoutDst;
     }
@@ -9864,7 +9864,7 @@ pub fn construct_affine_comp_details_and_addrs<'a>(
     }
 
     // `:2841` — with the declaration's own defaults, `do_coalesce` and `do_burst_il_group_calc`
-    // both true (`AccessDetails.hpp:275-276`).
+    // both true (`AccessDetails.hpp:275-277`).
     let steps = construct_time_steps_info(access_details, true, true, scope);
     if !steps.constructed() {
         return AffineCompDetailsAndAddrs::TimeStepsFailed(steps);
@@ -9897,7 +9897,7 @@ pub enum ExtractVectorLoadLowering<'a> {
     NotAVectorLoad,
     /// Entry 298 refused.
     DetailsFailed(AffineDetailsAndAddrs),
-    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3009`).
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3010`).
     SingleAccessInfoNeeded,
     /// Nothing marked of this class is left in the unit to re-find.
     NoCandidate,
@@ -9987,7 +9987,7 @@ pub enum ExtractVectorStoreLowering<'a> {
     NotAVectorStore,
     /// Entry 298 refused.
     DetailsFailed(AffineDetailsAndAddrs),
-    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3036`).
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3035`).
     SingleAccessInfoNeeded,
     /// Nothing marked of this class is left in the unit to re-find.
     NoCandidate,
@@ -10076,7 +10076,7 @@ pub enum VectorLoadLowering<'a> {
 ///
 /// ⛔ NO SIZE CHECK HERE, unlike its three siblings: a load-and-store pattern legitimately holds two
 /// records. The store is RE-COLLECTED off the re-found candidate, because building the records may
-/// have cloned or deleted operations, and `bool is_load_store` (`:3052`) is never read.
+/// have cloned or deleted operations, and `bool is_load_store` (`:3054`) is never read.
 pub fn lower_vector_load_op<'a, A: Arch>(
     op: &'a DfirOp,
     position: usize,
@@ -10153,13 +10153,13 @@ pub enum VectorStoreLowering<'a> {
         to_be_deleted: Vec<&'a DfirOp>,
     },
     /// `emitError("Unable to generate receive_and_store statement for the agen.vector_store
-    /// operation")` (`:3094-3097`).
+    /// operation")` (`:3094-3096`).
     UnableToGenerateReceiveAndStore(ReceiveAndStoreStmt),
     /// The operation this was called over is not an `agen.vector_store`.
     NotAVectorStore,
     /// Entry 298 refused.
     DetailsFailed(AffineDetailsAndAddrs),
-    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3084`).
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3083`).
     SingleAccessInfoNeeded,
     /// Nothing marked of this class is left in the unit to re-find.
     NoCandidate,
@@ -10167,7 +10167,7 @@ pub enum VectorStoreLowering<'a> {
 
 /// Replaces: e315_lowerVectorStoreOp
 ///
-/// ⛔ `element_type` IS READ OFF THE CANDIDATE'S OWN MEMREF (`:3088`) AND ENTRY 359 NEVER LOOKS AT IT
+/// ⛔ `element_type` IS READ OFF THE CANDIDATE'S OWN MEMREF (`:3089`) AND ENTRY 359 NEVER LOOKS AT IT
 /// (`:2027`), so there is nothing here to compute it for.
 /// ⛔ AND THE STORE IS RE-FOUND BEFORE IT IS LOWERED (`:3086`): entry 298 may have cloned the loops
 /// around it, so the record's op and the op the statement is built from are not the same pointer.
@@ -10219,7 +10219,7 @@ pub fn lower_vector_store_op<'a, A: Arch>(
     let DfirOp::Agen(agen::Op::VectorStore { value, .. }) = candidate.op else {
         return VectorStoreLowering::NotAVectorStore;
     };
-    // `:3089-3097` — entry 359 with all five trailing arguments defaulted (`:3090`).
+    // `:3090-3096` — entry 359 with all five trailing arguments defaulted (`:3090`).
     let stmt = match construct_receive_and_store_stmt::<A, AccessDetailsAffine<'_>>(
         &AgenStore::Vector { value: *value },
         candidate.op,
@@ -10235,7 +10235,7 @@ pub fn lower_vector_store_op<'a, A: Arch>(
         ReceiveAndStoreStmt::Constructed(stmt) => stmt,
         refused => return VectorStoreLowering::UnableToGenerateReceiveAndStore(refused),
     };
-    // `:3099-3101` — the candidate, then entry 270 over the op behind its stored value.
+    // `:3098-3101` — the candidate, then entry 270 over the op behind its stored value.
     let mut to_be_deleted = vec![candidate.op];
     if let Some(input_op) = defining_op(*value, scope) {
         add_store_input_to_delete_list(input_op, scope, &mut to_be_deleted);
@@ -10262,20 +10262,20 @@ pub enum IndirectVectorLoadLowering<'a> {
         /// `to_be_deleted`, in push order.
         to_be_deleted: Vec<&'a DfirOp>,
     },
-    /// `emitError("Unable to generate load_and_send statement for the agen.indirect_vector_load
-    /// operation")` (`:3205-3207`).
+    /// `emitError("Unable to generate load_and_send 'statement for the agen.indirect_vector_load
+    /// operation")` (`:3206-3208`) — ⛔ the stray `'` is the reference's own.
     UnableToGenerateLoadAndSend(LoadAndSendStmt),
-    /// *"IndirectVectorLoadOp only supported in LXLU"* (`:3172-3174`).
+    /// *"IndirectVectorLoadOp only supported in LXLU"* (`:3172-3173`).
     OnlySupportedInLxlu,
     /// The operation this was called over is not an `agen.indirect_vector_load`.
     NotAnIndirectVectorLoad,
     /// Entry 298 refused.
     DetailsFailed(AffineDetailsAndAddrs),
-    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3183`).
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3181`).
     SingleAccessInfoNeeded,
     /// Nothing marked of this class is left in the unit to re-find.
     NoCandidate,
-    /// *"agen.indirect_vector_load op does not have extract_idx attribute"* (`:3187-3190`).
+    /// *"indirect_vector_load operations should have an extract_idx attribute"* (`:3188-3191`).
     NoExtractIndex,
     /// *"could not locate a load_and_extract_scalar operation matching the extract_idx used by op"*.
     NoMatchingExtractOp,
@@ -10344,7 +10344,7 @@ pub fn lower_indirect_vector_load_op<'a, A: Arch>(
     else {
         return IndirectVectorLoadLowering::NoMatchingExtractOp;
     };
-    // `:3200-3207` — entry 027's overload, which is the extract statement and nothing else.
+    // `:3202-3208` — entry 027's overload, which is the extract statement and nothing else.
     let stmt = match construct_load_and_send_stmt::<A, AccessDetailsAffine<'_>>(
         candidate.op,
         comp,
@@ -10387,20 +10387,21 @@ pub enum IndirectVectorStoreLowering<'a> {
         /// `to_be_deleted`, in push order.
         to_be_deleted: Vec<&'a DfirOp>,
     },
-    /// `emitError("Unable to generate receive_and_store statement for the
-    /// agen.indirect_vector_store operation")` (`:3255-3257`).
+    /// `emitError("Unable to generate receive_and_store 'statement for the
+    /// agen.indirect_vector_store operation")` (`:3255-3257`) — ⛔ the stray `'` is the reference's
+    /// own.
     UnableToGenerateReceiveAndStore(ReceiveAndStoreStmt),
-    /// *"IndirectVectorStoreOp only supported in LXSU"* (`:3220-3222`).
+    /// *"IndirectVectorStoreOp only supported in LXSU"* (`:3220-3221`).
     OnlySupportedInLxsu,
     /// The operation this was called over is not an `agen.indirect_vector_store`.
     NotAnIndirectVectorStore,
     /// Entry 298 refused.
     DetailsFailed(AffineDetailsAndAddrs),
-    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3231`).
+    /// `DT_CHECK(access_details.size() == 1 && …)` (`:3229`).
     SingleAccessInfoNeeded,
     /// Nothing marked of this class is left in the unit to re-find.
     NoCandidate,
-    /// *"agen.indirect_vector_store op does not have extract_idx attribute"* (`:3235-3238`).
+    /// *"indirect_vector_store operations should have an extract_idx attribute"* (`:3236-3239`).
     NoExtractIndex,
     /// *"could not locate a receive_and_extract_scalar operation matching the extract_idx used by
     /// op"*.
@@ -10521,7 +10522,7 @@ struct LdcvtiShuffle<'a> {
 /// and every shuffle index naming it.
 ///
 /// ⛔ `isSplatOfFirstVar`, NOT `isFirstElemSplat`. `getFirstVariableIndex()` is **-1** for any
-/// non-empty `variable` (`VectorChain.td:485-490`), so the splat is of the first VARIABLE operand and
+/// non-empty `variable` (`VectorChain.td:485-489`), so the splat is of the first VARIABLE operand and
 /// not of element 0 — [`is_first_elem_splat`] is a different test and would admit the wrong shuffles.
 fn ldcvti_shuffle<'a>(op: &'a DfirOp, scope: &[DfirOp]) -> Option<LdcvtiShuffle<'a>> {
     let DfirOp::VectorChain(vc::Op::Shuffle {
@@ -10569,11 +10570,11 @@ struct LdcvtiLoad<'a> {
     ty: Vector,
 }
 
-/// `identifyLoads` (`Helper.cpp:3520-3535`) — the shuffle's input is the `agen.vector_load`, or a
+/// `identifyLoads` (`Helper.cpp:3520-3536`) — the shuffle's input is the `agen.vector_load`, or a
 /// nested ldtype shuffle whose input is one.
 ///
 /// ⛔ THE ldtype DT_CHECK NEVER FIRES: `DT_CHECK_MSG(!ldtype_shuffle, "ldtype for LDCVTI not
-/// currently supported")` (`:3536-3538`) runs BEFORE this is ever called, so a nested shuffle is
+/// currently supported")` (`:3537-3539`) runs BEFORE this is ever called, so a nested shuffle is
 /// accepted here and only the future work behind it is missing.
 fn ldcvti_load<'a>(input: Val, scope: &'a [DfirOp]) -> Option<LdcvtiLoad<'a>> {
     let input_op = defining_op(input, scope)?;
@@ -10605,13 +10606,13 @@ fn ldcvti_load<'a>(input: Val, scope: &'a [DfirOp]) -> Option<LdcvtiLoad<'a>> {
     })
 }
 
-/// `setElementLoadIfFound` (`Helper.cpp:3577-3589`) — the element load is the one whose view was cut
+/// `setElementLoadIfFound` (`Helper.cpp:3579-3590`) — the element load is the one whose view was cut
 /// from the LX.
 fn is_ldcvti_element_load(load: &LdcvtiLoad<'_>, scope: &[DfirOp]) -> bool {
     viewed_unit(load.view, scope) == Some(DfirUnit::Lx)
 }
 
-/// `setScaleLoadIfFound` (`:3548-3576`) — a view on the LXLU's scale register file, starting at
+/// `setScaleLoadIfFound` (`:3550-3576`) — a view on the LXLU's scale register file, starting at
 /// address 0, whose every iterator coefficient is 0.
 fn is_ldcvti_scale_load(load: &LdcvtiLoad<'_>, scope: &[DfirOp]) -> bool {
     if viewed_unit(load.view, scope) != Some(DfirUnit::LxluScaleReg) {
@@ -10676,7 +10677,7 @@ fn send_consumer_units(to: Val, scope: &[DfirOp]) -> Option<ConsumerUnits> {
     }
 }
 
-/// `evaluateValue(increment).getUniqueConstant() == 0` (`Helper.cpp:3723-3728`), over the constants
+/// `evaluateValue(increment).getUniqueConstant() == 0` (`Helper.cpp:3724-3728`), over the constants
 /// entry 214 just hoisted — the only thing that can define an increment it just minted.
 fn is_hoisted_zero(hoisted: &[SenOp], increment: Val) -> bool {
     hoisted.iter().any(|op| {
@@ -10697,7 +10698,7 @@ pub struct LoweredLdcvti<'a> {
     /// The `sentient.load_compute_and_send`.
     pub load_compute_and_send: SenOp,
     /// The send, the multiply, the scale shuffle, the scale load, the element shuffle and the
-    /// element load — ⛔ in that order (`:3765-3770`).
+    /// element load — ⛔ in that order (`:3766-3771`).
     pub to_be_deleted: [&'a DfirOp; 6],
 }
 
@@ -10728,18 +10729,18 @@ pub enum LdcvtiPattern<'a> {
     InputsDoNotMatchThePattern,
     /// *"Unable to identify element and scale load operations"*.
     LoadsNotIdentified,
-    /// `DT_CHECK(element_load_op && scale_load_op)` (`:3595`) — the two loads are there but one is
+    /// `DT_CHECK(element_load_op && scale_load_op)` (`:3597`) — the two loads are there but one is
     /// on neither the LX nor the scale register file.
     NoElementOrScaleLoad,
     /// The element load is not reachable by the walk that assigns positions.
     ElementLoadNotInScope,
     /// *"Cannot set access details for element load op"*.
     DetailsFailed(AffineDetailsAndAddrs),
-    /// `DT_CHECK(element_ad.size() == 1 && …)` (`:3641`).
+    /// `DT_CHECK(element_ad.size() == 1 && …)` (`:3644`).
     SingleAccessInfoNeeded,
     /// *"vector_loadOp's consumer is not a getUnitOp."*.
     ConsumerIsNotAGetUnit,
-    /// `DT_CHECK(shuffle_mode == SentientShuffleMode::noshuffle)` (`:3715`).
+    /// `DT_CHECK(shuffle_mode == SentientShuffleMode::noshuffle)` (`:3714`).
     ShuffleModeIsNotNoShuffle(sen::ShuffleMode),
     /// *"Expected increment to be 0"*.
     IncrementIsNotZero,
@@ -10823,7 +10824,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
         return LdcvtiPattern::InputsDoNotMatchThePattern;
     };
 
-    // `:3540-3546`.
+    // `:3541-3546`.
     let (Some(load_1), Some(load_2)) = (
         ldcvti_load(shuffle_1.input, scope),
         ldcvti_load(shuffle_2.input, scope),
@@ -10831,7 +10832,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
         return LdcvtiPattern::LoadsNotIdentified;
     };
 
-    // `:3591-3595` — each `setXIfFound` keeps the FIRST of the two loads that answers it.
+    // `:3593-3596` — each `setXIfFound` keeps the FIRST of the two loads that answers it.
     let loads = [&load_1, &load_2];
     let (Some(element_load), Some(scale_load)) = (
         loads
@@ -10844,14 +10845,14 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
         return LdcvtiPattern::NoElementOrScaleLoad;
     };
 
-    // `:3606-3616`.
+    // `:3611-3617`.
     let (scale_shuffle, element_shuffle) = if core::ptr::eq(scale_load.op, load_1.op) {
         (&shuffle_1, &shuffle_2)
     } else {
         (&shuffle_2, &shuffle_1)
     };
 
-    // `:3632-3641`.
+    // `:3636-3643`.
     let Some(position) = position_of(element_load.op, scope) else {
         return LdcvtiPattern::ElementLoadNotInScope;
     };
@@ -10880,7 +10881,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
         return LdcvtiPattern::SingleAccessInfoNeeded;
     };
 
-    // `:3675-3695` — the scale's index constant, then the element's.
+    // `:3677-3695` — the scale's index constant, then the element's.
     let mut hoisted = Vec::new();
     let scale_index = hoisted_index_constant(values, &mut hoisted, scale_shuffle.index);
     let element_index = hoisted_index_constant(values, &mut hoisted, element_shuffle.index);
@@ -10896,7 +10897,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
     let dst_total_elements = Elements(bin_ty.len);
     let dst_element_size = Bits(bin_ty.elem.bits());
 
-    // `:3712-3715`.
+    // `:3712-3714`.
     let shuffle_mode = access.base.shuffle_mode;
     if shuffle_mode != sen::ShuffleMode::NoShuffle {
         return LdcvtiPattern::ShuffleModeIsNotNoShuffle(shuffle_mode);
@@ -10917,7 +10918,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
     }
     hoisted.extend(addresses.hoisted);
 
-    // `:3739-3745`.
+    // `:3742-3745`.
     let set_send_destination =
         generate_set_send_destination_stmts::<A>(unit.on.kind().generic(), &consumer, *to);
     if matches!(
@@ -10927,7 +10928,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
         return LdcvtiPattern::SetSendDestinationRefused(set_send_destination);
     }
 
-    // `:3747-3762`.
+    // `:3747-3760`.
     let load_compute_and_send = SenOp::Sentient(sen::Op::LoadComputeAndSend {
         mutable_addr,
         immutable_addr: addresses.immutable_addr,

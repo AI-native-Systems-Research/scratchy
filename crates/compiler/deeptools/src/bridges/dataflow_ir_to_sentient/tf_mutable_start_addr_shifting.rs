@@ -944,7 +944,7 @@ pub fn calculate_shifts<A: Arch>(
 /// move what fits of the constant offset into the immutable start address, or report no shift.
 ///
 /// ⛔ `AffineMap::get(ctx)` IS THE "NO SHIFT" ANSWER, not an empty rewrite — a zero-result map is
-/// falsy at both call sites (`:265`, `:307`), so `None` is it. ⛔ And the
+/// falsy at all four call sites (`:219`, `:247`, `:276`, `:327`), so `None` is it. ⛔ And the
 /// `DT_CHECK(hasValidL3ImmutableAddr(…, req_even_toggle = arch >= SEN1P5))` is the
 /// [`ConstStartMemView`] TYPE: a view whose start is not a constant cannot reach this function.
 #[must_use]

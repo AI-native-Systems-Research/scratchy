@@ -9347,7 +9347,7 @@ pub fn transform_vector_store<'s, A: Arch>(
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// WHAT THE TWO COMPOSITE SPLITS AGREE ON — everything from the access container down to the
-/// overflow gate (`:455-479` and `:550-574`, line for line the same).
+/// overflow gate (`:456-479` and `:551-573`, the same steps in the same order).
 enum CompositeOverflow<'a> {
     /// The mutable address overflows, and here is what the partition plan needs.
     Overflows {
@@ -9364,9 +9364,9 @@ enum CompositeOverflow<'a> {
     Stopped(TransferSplit<'a>),
 }
 
-/// `transformComp{,Ind}LoadAndStore`'S SHARED PROLOGUE — `MutableAddrSplitting.cpp:455-479`.
+/// `transformComp{,Ind}LoadAndStore`'S SHARED PROLOGUE — `MutableAddrSplitting.cpp:456-479`.
 ///
-/// ⛔ `synthesizeTimeInfo` IS THE STEP ENTRIES 306/307 DO NOT HAVE (`:478`): a composite walks its
+/// ⛔ `synthesizeTimeInfo` IS THE STEP ENTRIES 306/307 DO NOT HAVE (`:476`): a composite walks its
 /// own time dimensions in hardware, and every one of them adds to `max_mutable` — without it a
 /// transfer that overflows only through its time nest is never split.
 /// ⛔ AND `constructTimeStepsInfo` RUNS BEFORE THE `DT_CHECK` OVER BOTH ANSWERS (`:459-465`), so it
@@ -9450,7 +9450,7 @@ fn composite_overflow<'s, A: Arch>(
     }
 }
 
-/// THE PARTITIONS GO IN THE INNERMOST TIME LOOP — `OpBuilder cond_builder(op)` (`:1003`) seats the
+/// THE PARTITIONS GO IN THE INNERMOST TIME LOOP — `OpBuilder cond_builder(op)` (`:1005`) seats the
 /// conditional tree where `op` now is, and `createExplicitTimeLoops` has just moved `op` to the
 /// bottom of the nest (`:1326-1327`). So the tree replaces the transfer inside that body.
 fn splice_partitions_into_nest(nest: &mut DfirOp, partitions: Vec<DfirOp>) {
@@ -9469,7 +9469,7 @@ fn splice_partitions_into_nest(nest: &mut DfirOp, partitions: Vec<DfirOp>) {
 
 /// ONE CLONE OF A VIEW, OR THE VALUE ITSELF WHERE NO OP IN SCOPE BINDS IT.
 ///
-/// *"Every memory operand should have it's own unique mem view"* (`:503-504`) —
+/// *"Every memory operand should have it's own unique mem view"* (`:504-505`) —
 /// `partition_builder.clone(*v.getDefiningOp())` followed by `assign`ing the clone onto the operand.
 /// ⭐ THE REFERENCE ASSIGNS ONTO THE ORIGINAL, so partition 2 clones partition 1's clone; a clone
 /// carries its operands over unchanged, so every partition gets the same view either way.
@@ -9493,7 +9493,7 @@ fn clone_mem_view_for_partition(
 /// ⛔ `dir` IS **ALWAYS** `PseudoRandom` (`:491-493`), whatever the original carried, and an absent
 /// `dbgName` becomes the EMPTY STRING (`:485`) — `dbgName = ""` is what the vendor's key prints.
 /// ⛔ AND THE BODY IS RE-BOUND: the new op's `load_iv` is fresh and every use inside the cloned
-/// region is remapped onto it (`:507-512`), which an `IRMapping` clone plus one seeded pair is.
+/// region is remapped onto it (`:507-511`), which an `IRMapping` clone plus one seeded pair is.
 pub(super) fn clone_composite_with_new_access_info(
     vals: &mut Values,
     transfer: &agen::CompositeTransfer,
@@ -9538,7 +9538,7 @@ pub(super) fn clone_composite_with_new_access_info(
 
 /// `agen::CompositeIndirectLoadAndStoreOp::cloneWithNewAccessInfo` — `Agen.cpp:1369-1435`.
 ///
-/// ⛔ THE INDIRECT SIDES' INDICES COME FROM `this`, NOT FROM THE ARGUMENTS (`:1382-1391`): the
+/// ⛔ THE INDIRECT SIDES' INDICES COME FROM `this`, NOT FROM THE ARGUMENTS (`:1379-1389`): the
 /// caller hands over four views and four maps, and `num_ind_src_indices`/`num_ind_dst_indices` are
 /// recounted off the ORIGINAL op — so an indirect side handed a view the original did not have gets
 /// that view with NO indices. `dbgName`, the fresh `load_iv` and the region are entry 321's clone's.
@@ -9599,7 +9599,7 @@ pub(super) fn clone_composite_indirect_with_new_access_info(
 /// REWROTE THE **LOCAL** (`:491`) — so every partition's map descends from the ORIGINAL two-dimensional
 /// subscripts while `indices` has grown the new loop's iterator. Ported as written; see
 /// [`TimeLoopNest::access`] for why the vendor's own key cannot show it.
-/// ⛔ AND THE UNSPLIT SIDE IS CLONED PER PARTITION, THEN READ BACK OFF `op` (`:505-509`) — the clone,
+/// ⛔ AND THE UNSPLIT SIDE IS CLONED PER PARTITION, THEN READ BACK OFF `op` (`:506-513`) — the clone,
 /// not the original, is what the new transfer points at.
 #[must_use]
 pub fn transform_comp_load_and_store<'s, A: Arch>(
@@ -9770,10 +9770,10 @@ pub fn transform_comp_load_and_store<'s, A: Arch>(
 /// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546` (124L): entry 321 for an
 /// `agen.composite_indirect_load_and_store`, whose ADDRESS views are cloned per partition too.
 ///
-/// ⛔ THE INDIRECT MUST BE ON THE OTHER SIDE (`:581-585`): *"The immutable address must be zero for
+/// ⛔ THE INDIRECT MUST BE ON THE OTHER SIDE (`:577-581`): *"The immutable address must be zero for
 /// the side of the transfer involving the indirect."*
 /// ⛔⛔ AND THE `kDirDst` BRANCH PASSES `op.getIndirectSrcMemref()` INTO THE INDIRECT **DESTINATION**
-/// SLOT (`:653`) with `getEmptyAffineMap()` for its map (`:657`) — so a gather whose direct
+/// SLOT (`:651`) with `getEmptyAffineMap()` for its map (`:655`) — so a gather whose direct
 /// destination overflows is rebuilt claiming an indirect destination that is really its address view,
 /// with no indices. Ported as written; the vendor's key only exercises the `kDirSrc` branch.
 #[must_use]
@@ -9944,7 +9944,7 @@ pub fn transform_comp_ind_load_and_store<'s, A: Arch>(
                             indices: indirect.indices.clone(),
                             ty: indirect.ty.clone(),
                         });
-                // ⛔ THE INDIRECT **SOURCE** VIEW IN THE INDIRECT **DESTINATION** SLOT (`:653`),
+                // ⛔ THE INDIRECT **SOURCE** VIEW IN THE INDIRECT **DESTINATION** SLOT (`:651`),
                 // with an empty map and — `num_ind_dst_indices` being recounted off the original —
                 // no indices. See this function's banner.
                 let indirect_dst = indirect_src.as_ref().map(|indirect| agen::IndirectAccess {
