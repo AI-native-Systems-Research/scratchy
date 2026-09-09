@@ -150,7 +150,7 @@ use sys_arch_spec::arch_enums::OpFunc;
 /// ⛔ THE LABELS ARE `stringToMetaDimKind`'s (`dsc/dims.cpp:50-57`), which `e184_setMetaDimKind`
 /// parses back. `Count`'s own label there is `"undefined"` — a string [`Constraint::dump`] never
 /// prints, because it prints `NOT_SET` for that case instead (`ddc/ddc_metadata.h:51-54`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetaDimKind {
     /// `unpadded`.
     Unpadded,

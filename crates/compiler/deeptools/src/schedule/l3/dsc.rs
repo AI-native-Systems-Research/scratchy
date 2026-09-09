@@ -986,6 +986,24 @@ pub trait MemOrg {
     /// `memOrg_.at(SenComponents::HBM).allocateNode_->indirectAllocType_` with its
     /// `indexTensorType_`; [`None`] is no HBM entry, a null allocate node, or `NO_INDIRECTION`.
     fn hbm_indirection(&self) -> Option<IndirectAlloc>;
+
+    /// That allocate node's `name_`, [`None`] where there is no HBM entry or it holds no node —
+    /// which is *"Expect HBM in memOrg_."* and *"Expect a valid allocate node."* both
+    /// (`L3DlOpsScheduler.cpp:7157`, `:7161`).
+    fn hbm_allocation(&self) -> Option<NodeName>;
+
+    /// That node's `layoutDimOrder_` (`dsc/dsc2.h:982`), whose non-emptiness is [`LayoutDims`]' own
+    /// — which is *"Expect valid layoutDimOrder_."* (`:6717`).
+    fn hbm_layout_dims(&self) -> Option<LayoutDims>;
+
+    /// `getPageSize()`'s KEY SET on that node (`dsc/dsc2.cpp:4479`), EMPTY where nothing pages.
+    ///
+    /// ⛔ THE SIZES ARE DELIBERATELY NOT ASKED FOR: every reader in scope asks `pageSize.count(dim)`
+    /// and nothing more, and `maxDimSizes_` entries are datastage KEYS as often as element counts.
+    /// ⭐ ONE UNBOUNDED ENTRY WINS WHEREVER IT SITS — the reference ERASES an already-multiplied dim
+    /// on meeting a negative `maxSize` and skips every later entry naming it, so the key set is
+    /// "bounded by the layout and never left unbounded", whatever order the layout states them in.
+    fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim>;
 }
 
 /// WHAT ENTRY 049 READS OFF ONE DATA STAGE — `DataStructDims` (`dsc/dims.h:268-300`) reduced to the

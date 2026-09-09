@@ -273,16 +273,17 @@ use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, stricter_max, stricter_min};
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::{
-    DataStage, DataStages, LoopDims, LoopNode, PaddingForm, PrimaryDimAndKind, StageDims, StageName,
+    DataStage, DataStages, LoopDims, LoopNode, PaddingForm, PrimaryDimAndKind, StageDims,
+    StageName, construct_datastage_from,
 };
 use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
-    AllocateNode, BlockNode, Dsts, LdsIdx, NodeName, ReplicationFactor, ScheduleTree,
-    SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, Via,
+    AllocateNode, BlockNode, Dsc, Dsts, Fold, FoldDim, LdsIdx, Node, NodeName, ReplicationFactor,
+    ScheduleTree, SyncDirection, SyncNode, SyncStrength, SyncUnits, TransferNode, Via,
 };
 use crate::schedule::l3::dsc::{
     AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare,
-    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimStage, DscGroup, DscIdx,
+    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimPadding, DimStage, DscGroup, DscIdx,
     DscParamCandidates, FilledDims, IndexTensor, IndirectAlloc, InitialPlacement, LabeledDs,
     MemOrg, MulticastDegree, Pinning, ScheduleNodes, ScheduleTrees, SchedulerMetadata, StickVolume,
     StickVolumes, SuperChunkStage, SuperDsc, SymbolicDimInfo, UnneededPad, WkSlice,
@@ -3573,6 +3574,18 @@ mod tests_e049_e056 {
         fn hbm_indirection(&self) -> Option<IndirectAlloc> {
             self.indirection
         }
+
+        fn hbm_allocation(&self) -> Option<NodeName> {
+            None
+        }
+
+        fn hbm_layout_dims(&self) -> Option<crate::schedule::dsc2::LayoutDims> {
+            None
+        }
+
+        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
+            BTreeSet::new()
+        }
     }
 
     /// e050 — a pinned DS takes its buffer offset from the node while an unpinned one is always at
@@ -3808,53 +3821,566 @@ mod tests_e049_e056 {
     }
 }
 
-// crustify:todo: e057_isPagedLds
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6596  (9 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isPagedLds(const LabeledDsInfo &lds) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1632-1641
+/// Replaces: e057_isPagedLds
+///
+/// Whether a labelled DS is a PAGED tensor — its HBM allocation holds the VALUES an indirect access
+/// pages through.
+///
+/// ⛔ `isPresent` IS NOT CONSULTED, unlike [`get_hbm_allocations`]: an HBM entry that merely CARRIES
+/// an allocation answers `true`. ⭐ And unlike its twin [`is_index_lds`] there is no refusal on this
+/// arm, because no `indexTensorType_` is read.
+#[must_use]
+pub fn is_paged_lds<M: MemOrg + ?Sized>(lds: &M) -> bool {
+    matches!(lds.hbm_indirection(), Some(IndirectAlloc::ValueTensor))
+}
 
-// crustify:todo: e058_getNewDataStageIndex
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6606  (18 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : int L3DlOpsScheduler::getNewDataStageIndex(SuperDsc& mySDsc, DesignSpaceConfig& dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1651-1670
+/// Replaces: e058_getNewDataStageIndex
+///
+/// MINTS AN EMPTY DATA STAGE in this DSC under the lowest index above [`DATA_STAGE_CHUNK`] that no
+/// DSC of the super-DSC holds, and answers with that index.
+///
+/// ⛔ DELIBERATE DIVERGENCE — THE REFERENCE HANGS: its outer `while` retries WITHOUT advancing
+/// `newIdx` once a SIBLING DSC holds it, and the inner `while` cannot advance past an index this DSC
+/// does not hold. ⭐ `&otherDsc != &dsc` was dead code either way — the inner loop had already
+/// skipped every index this DSC holds — and the exclusive borrow is what spells that out.
+pub fn get_new_data_stage_index<D: Default>(
+    dsc: &mut DataStages<D>,
+    other_dscs: &[&DataStages<D>],
+) -> DatastageId {
+    let mut id = DatastageId(DATA_STAGE_CHUNK.0 + 1);
+    while dsc.0.contains_key(&id) || other_dscs.iter().any(|other| other.0.contains_key(&id)) {
+        id.0 += 1;
+    }
+    dsc.0.entry(id).or_default();
+    id
+}
 
-// crustify:todo: e059_getPagedDimensions
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6709  (20 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<PrimaryDimTypes> L3DlOpsScheduler::getPagedDimensions( const DesignSpaceConfig &dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1680-1701
+/// Replaces: e059_getPagedDimensions
+///
+/// THE DSC'S PAGED DIMS — every INDEX-TENSOR allocation's layout dim that its own pages span, in
+/// layout order, each dim once, over `labeledDs_` in order.
+///
+/// ⛔ BOTH `DT_CHECK`s ARE GONE BY CONSTRUCTION: an indirection is only ever reported by an allocate
+/// node that EXISTS, which is *"Expect a valid HBM allocate node."*, and [`crate::schedule::dsc2::
+/// LayoutDims`] is non-empty, which is *"Expect valid layoutDimOrder_."*.
+#[must_use]
+pub fn get_paged_dimensions<M: MemOrg + ?Sized>(labeled_ds: &[&M]) -> Vec<PrimaryDim> {
+    let mut dims: Vec<PrimaryDim> = Vec::new();
+    for lds in labeled_ds {
+        let Some(IndirectAlloc::IndexTensor(_)) = lds.hbm_indirection() else {
+            continue;
+        };
+        let Some(layout) = lds.hbm_layout_dims() else {
+            continue;
+        };
+        let pages = lds.hbm_page_dims();
+        for dim in layout.iter() {
+            if pages.contains(&dim) && !dims.contains(&dim) {
+                dims.push(dim);
+            }
+        }
+    }
+    dims
+}
 
-// crustify:todo: e060_getHbmAllocations
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7152  (13 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<dsc2::AllocateNode *> L3DlOpsScheduler::getHbmAllocations( const DesignSpaceConfig &dsc) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1711-1725
+/// Replaces: e060_getHbmAllocations
+///
+/// The HBM allocate node of every HBM-PINNED labelled DS of the DSC, in `labeledDs_` order.
+///
+/// ⛔ [`None`] IS *"Expect a valid allocate node."* — a DS that states `isPresent` while its HBM
+/// entry holds none; *"Expect HBM in memOrg_."* cannot be reached from a true `isHbmPinned()`.
+/// ⚠️ The reference hands back NON-const pointers out of a `const` DSC; a later write to one is that
+/// unit's own `memOrg_` read, so what travels out of here is the node's name.
+#[must_use]
+pub fn get_hbm_allocations<M: MemOrg + ?Sized>(labeled_ds: &[&M]) -> Option<Vec<NodeName>> {
+    labeled_ds
+        .iter()
+        .filter(|lds| lds.hbm_pinned())
+        .map(|lds| lds.hbm_allocation())
+        .collect()
+}
 
-// crustify:todo: e061_gatherFoldParams
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7248  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::gatherFoldParams( const FoldManager<CoordinateBaseType> &cfm, std::vector<dsc2::FoldParamInfoType> &foldParams) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1735-1749
+/// Replaces: e061_gatherFoldParams
+///
+/// APPENDS ONE DIM'S FOLDS — cardinality, label and the affine pair — to the caller's fold-param
+/// list, outermost position first.
+///
+/// ⭐ [`Fold`] IS `dsc2::FoldParamInfoType` FIELD FOR FIELD, so the copy is the whole of it, and the
+/// reference's `const_cast` writes nothing: it only reaches getters that were not marked `const`.
+/// ⛔ `getAlphaBeta`'s *"Only affine folds are supported"* is [`Fold`]'s own shape, which states an
+/// alpha and a beta and cannot spell any other kind.
+pub fn gather_fold_params(fm: &FoldDim, fold_params: &mut Vec<Fold>) {
+    fold_params.extend(fm.folds().cloned());
+}
 
-// crustify:todo: e062_getEnclosingLoopsAndRelatedDims
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7263  (38 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::getEnclosingLoopsAndRelatedDims( dsc2::ScheduleNode *node, const DesignSpaceConfig *dsc, std::vector<dsc2::LoopNode *> &loopChain, std::unordered_set<PrimaryDimAndKind> &relatedDims) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1759-1800
+/// THE LOOPS ENCLOSING ONE SCHEDULE NODE, INNERMOST FIRST AND THE ROOT LOOP LAST — the
+/// `getMutableOwnerLoop()` walk, NON-EMPTY.
+///
+/// ⛔⛔ `loopChain.pop_back()` ON AN EMPTY CHAIN IS UB, not an empty answer, and a node no loop
+/// encloses reaches it — so such a node has no witness here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerLoops<'a> {
+    below_root: Vec<&'a LoopNode>,
+    root: &'a LoopNode,
+}
 
-// crustify:todo: e063_findAndStoreLoopWithDim
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7307  (21 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::findAndStoreLoopWithDim( DesignSpaceConfig *currDsc, const PrimaryDimAndKind dimToFind, dsc2::LoopNode *loop, const std::unordered_set<PrimaryDimAndKind> &relatedDims, dsc2::VectorOfLoopAndDim &relatedLoops, PadType accessPadType) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1810-1835
+impl<'a> OwnerLoops<'a> {
+    /// The walk's result, innermost first and THE ROOT LOOP LAST, or [`None`] where the reference
+    /// pops an empty chain.
+    #[must_use]
+    pub fn of(innermost_first: Vec<&'a LoopNode>) -> Option<Self> {
+        let (&root, below_root) = innermost_first.split_last()?;
+        Some(Self {
+            below_root: below_root.to_vec(),
+            root,
+        })
+    }
 
-// crustify:todo: e064_constructDatastage
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7724  (11 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : int L3DlOpsScheduler::constructDatastage(DesignSpaceConfig *currDsc, dsc2::DataStage &refDataStage) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1845-1857
+    /// Every enclosing loop, innermost first, INCLUDING the root.
+    pub fn iter(&self) -> impl Iterator<Item = &'a LoopNode> + '_ {
+        self.below_root
+            .iter()
+            .copied()
+            .chain(core::iter::once(self.root))
+    }
+
+    /// The chain the reference hands back — every enclosing loop BUT the root.
+    #[must_use]
+    pub fn below_root(&self) -> &[&'a LoopNode] {
+        &self.below_root
+    }
+}
+
+/// Replaces: e062_getEnclosingLoopsAndRelatedDims
+///
+/// THE ENCLOSING LOOP CHAIN WITHOUT ITS ROOT, plus every dim those loops walk together with the
+/// node's own — an allocation's `layoutDimOrder_`, a transfer's lds layout, nothing for a compute.
+///
+/// ⛔ THE ROOT LOOP'S DIMS STAY IN THE SET even though its loop leaves the chain. ⛔ AND A LAYOUT DIM
+/// ENTERS AS `{dim, Unpadded}` through `PrimaryDimAndKind`'s implicit constructor, so it can never
+/// match a `WindowDim` loop entry and the set may hold one dim under two kinds.
+/// ⚠️ A TRANSFER TAKES ITS SOURCE'S lds, else the FIRST DESTINATION that states one.
+pub fn get_enclosing_loops_and_related_dims<'a, D: Dsc + ?Sized>(
+    node: Node<'a>,
+    dsc: &D,
+    loops: &OwnerLoops<'a>,
+) -> (Vec<&'a LoopNode>, BTreeSet<PrimaryDimAndKind>) {
+    let mut related: BTreeSet<PrimaryDimAndKind> =
+        loops.iter().flat_map(|owner| owner.dims.iter()).collect();
+
+    let layout = match node {
+        Node::Allocate(alloc) => Some(alloc.layout.dims()),
+        Node::Transfer(transfer) => transfer
+            .src
+            .data
+            .my_lds_idx
+            .or_else(|| transfer.dsts.iter().find_map(|dst| dst.data.my_lds_idx))
+            .map(|lds| dsc.layout_dims(lds)),
+        Node::Compute(_) => None,
+    };
+    if let Some(dims) = layout {
+        related.extend(dims.iter().map(|dim| PrimaryDimAndKind {
+            dim,
+            kind: MetaDimKind::Unpadded,
+        }));
+    }
+
+    (loops.below_root().to_vec(), related)
+}
+
+/// WHERE A LOOP SITS RELATIVE TO THE CHUNK BOUNDARY — `LoopDistributionInfo::LoopDistributionCat`
+/// (`dsc/dsc2.h:1138`) less `UNKNOWN`, which is only the field's unset default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopDistribution {
+    /// `ABOVE_CHUNK`.
+    AboveChunk,
+    /// `BELOW_CHUNK`.
+    BelowChunk,
+    /// `CORELET_SLICE`.
+    CoreletSlice,
+}
+
+/// ONE LOOP, THE DIM OF IT THAT MATCHED AND WHERE IT SITS — `LoopDistributionInfo`
+/// (`dsc/dsc2.h:1137`); a `VectorOfLoopAndDim` (`:1170`) is a [`Vec`] of these.
+///
+/// ⚠️ dsc2 VOCABULARY HOMED HERE because [`LoopNode`] is; moving both belongs to whichever batch
+/// first needs this in a second module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopAndDim<'a> {
+    /// `loopNode`.
+    pub loop_node: &'a LoopNode,
+    /// `dimAndKind` — the loop's OWN entry that matched, kind included.
+    pub dim: PrimaryDimAndKind,
+    /// `cat`.
+    pub distribution: LoopDistribution,
+}
+
+/// HOW A COORDINATE READS ITS DIM, WITH THE PADDING THAT ARM NEEDS — `accessPadType` FUSED to
+/// `dataStageParam_.at(loop->denId_).ss_.paddingSizes_`.
+///
+/// ⛔ THAT `.at()` THROW IS WHY THE TWO ARE ONE ARGUMENT: the reference reads the map only inside its
+/// `accessPadType != NOPAD` arm, so [`Self::NoPad`] cannot reach it. WHICH other [`PadType`] it is
+/// is never asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessPad<'a> {
+    /// [`PadType::NoPad`].
+    NoPad,
+    /// Any other [`PadType`], together with the DENOMINATOR stage's `paddingSizes_`.
+    Padded(&'a BTreeMap<PrimaryDim, DimPadding>),
+}
+
+/// Replaces: e063_findAndStoreLoopWithDim
+///
+/// APPENDS THE LOOP to `related_loops` once per dim entry of it that IS the sought dim, or that is a
+/// `WindowDim` the sought dim's own padding windows.
+///
+/// ⛔ `dimAndKind.dim_ == dimToFind` COMPARES A WHOLE `PrimaryDimAndKind` WITH A BARE DIM
+/// (`dsc/dims.h:85`), so the implicit constructor ALSO demands the sought kind be `Unpadded` — which
+/// the dsc2 twin `isLoopDimRelated` (`dsc/dsc2.cpp:6550`) does not. ⛔ AND `relatedDims` IS NEVER
+/// READ: the reference takes the set and consults it nowhere.
+pub fn find_and_store_loop_with_dim<'a>(
+    to_find: PrimaryDimAndKind,
+    loop_node: &'a LoopNode,
+    pad: AccessPad<'_>,
+    related_loops: &mut Vec<LoopAndDim<'a>>,
+) {
+    for dim in loop_node.dims.iter() {
+        let related = if dim.dim == to_find.dim && to_find.kind == MetaDimKind::Unpadded {
+            true
+        } else if let AccessPad::Padded(padding) = pad {
+            dim.kind == MetaDimKind::WindowDim
+                && padding
+                    .get(&to_find.dim)
+                    .is_some_and(|entry| entry.window_dim == Some(dim.dim))
+        } else {
+            false
+        };
+        if related {
+            related_loops.push(LoopAndDim {
+                loop_node,
+                dim,
+                distribution: LoopDistribution::AboveChunk,
+            });
+        }
+    }
+}
+
+/// Replaces: e064_constructDatastage
+///
+/// Mints a COPY of a reference data stage in the DSC under the first free id and renames its two
+/// halves `<id>` and `<id>el`.
+///
+/// ⭐ THE SAME OPERATION AS `e113_constructDatastage` (`ddc/ddc_transformation_util.cpp:126`), down
+/// to the `size()`-seeded id search, so this CALLS that port rather than spelling it twice.
+pub fn construct_datastage<D: Clone>(
+    stages: &mut DataStages<D>,
+    reference: &DataStage<D>,
+) -> DatastageId {
+    construct_datastage_from(stages, reference)
+}
+
+#[cfg(test)]
+mod tests_e057_e064 {
+    use super::*;
+    use crate::schedule::dsc2::{
+        AllocLayout as Dsc2AllocLayout, Coordinate, CoordinateCategory, FoldCardinality, FoldCoeff,
+        FoldLabel, LayoutDims, MaxDimSize, StartAddress,
+    };
+
+    /// One labelled DS's `memOrg_` as this batch reads it, stated by field.
+    #[derive(Default)]
+    struct HbmStub {
+        pinned: bool,
+        allocation: Option<NodeName>,
+        indirection: Option<IndirectAlloc>,
+        layout: Option<LayoutDims>,
+        pages: BTreeSet<PrimaryDim>,
+    }
+
+    impl MemOrg for HbmStub {
+        fn hbm_pinned(&self) -> bool {
+            self.pinned
+        }
+
+        fn lx_buffering(&self) -> Option<Buffering> {
+            None
+        }
+
+        fn lx_start_address(&self, _at: &AddressCoord) -> Option<ByteAddress> {
+            None
+        }
+
+        fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
+            None
+        }
+
+        fn hbm_indirection(&self) -> Option<IndirectAlloc> {
+            self.indirection
+        }
+
+        fn hbm_allocation(&self) -> Option<NodeName> {
+            self.allocation.clone()
+        }
+
+        fn hbm_layout_dims(&self) -> Option<LayoutDims> {
+            self.layout.clone()
+        }
+
+        fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim> {
+            self.pages.clone()
+        }
+    }
+
+    fn allocate(name: &str, dim: PrimaryDim) -> AllocateNode {
+        AllocateNode {
+            name: NodeName(name.to_owned()),
+            component: SenComponent::Hbm,
+            lds: Some(LdsIdx(0)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: Dsc2AllocLayout::new((dim, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    fn loop_over(first: PrimaryDimAndKind, rest: Vec<PrimaryDimAndKind>) -> LoopNode {
+        LoopNode {
+            name: NodeName("loop_ds0_ds1".to_owned()),
+            num: DatastageId(0),
+            den: DatastageId(1),
+            dims: LoopDims::new(first, rest),
+        }
+    }
+
+    /// A DSC whose every lds lays out one dim — which e062's allocate arm never asks for.
+    struct OneDim;
+
+    impl Dsc for OneDim {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            LayoutDims::new(PrimaryDim::In, Vec::new())
+        }
+    }
+
+    /// e057 — a value tensor is paged whether or not the entry states `isPresent`, and its twin's
+    /// index tensor is not.
+    #[test]
+    fn a_paged_lds_is_a_value_tensor_pinned_or_not() {
+        assert!(is_paged_lds(&HbmStub {
+            indirection: Some(IndirectAlloc::ValueTensor),
+            ..HbmStub::default()
+        }));
+        assert!(!is_paged_lds(&HbmStub {
+            pinned: true,
+            indirection: Some(IndirectAlloc::IndexTensor(IndexTensor::Address)),
+            ..HbmStub::default()
+        }));
+        assert!(!is_paged_lds(&HbmStub::default()));
+    }
+
+    /// e058 — the search starts above the chunk stage and clears the SIBLING DSCs too, then MINTS.
+    #[test]
+    fn a_new_data_stage_index_clears_every_dsc_of_the_super_dsc() {
+        let mut dsc: DataStages<()> = DataStages::default();
+        dsc.0.insert(DatastageId(2), DataStage::default());
+        let mut sibling: DataStages<()> = DataStages::default();
+        sibling.0.insert(DatastageId(3), DataStage::default());
+
+        let id = get_new_data_stage_index(&mut dsc, &[&sibling]);
+        assert_eq!(id, DatastageId(4));
+        assert!(dsc.0.contains_key(&id));
+    }
+
+    /// e059 — layout order decides the order, the pages decide membership, and only an index tensor
+    /// is walked at all.
+    #[test]
+    fn paged_dimensions_are_the_index_layout_against_its_pages() {
+        let index = HbmStub {
+            indirection: Some(IndirectAlloc::IndexTensor(IndexTensor::Address)),
+            layout: Some(LayoutDims::new(
+                PrimaryDim::Out,
+                vec![PrimaryDim::In, PrimaryDim::Ki],
+            )),
+            pages: BTreeSet::from([PrimaryDim::In, PrimaryDim::Ki]),
+            ..HbmStub::default()
+        };
+        let value = HbmStub {
+            indirection: Some(IndirectAlloc::ValueTensor),
+            layout: Some(LayoutDims::new(PrimaryDim::Kj, Vec::new())),
+            pages: BTreeSet::from([PrimaryDim::Kj]),
+            ..HbmStub::default()
+        };
+        assert_eq!(
+            get_paged_dimensions(&[&index, &value, &index]),
+            vec![PrimaryDim::In, PrimaryDim::Ki]
+        );
+        assert!(get_paged_dimensions(&[&HbmStub::default()]).is_empty());
+    }
+
+    /// e060 — only a PINNED entry answers, and a pinned one holding no node is the refusal.
+    #[test]
+    fn hbm_allocations_are_the_pinned_ones() {
+        let pinned = HbmStub {
+            pinned: true,
+            allocation: Some(NodeName("pinned".to_owned())),
+            ..HbmStub::default()
+        };
+        let unpinned = HbmStub {
+            allocation: Some(NodeName("unpinned".to_owned())),
+            ..HbmStub::default()
+        };
+        assert_eq!(
+            get_hbm_allocations(&[&unpinned, &pinned]),
+            Some(vec![NodeName("pinned".to_owned())])
+        );
+        assert_eq!(
+            get_hbm_allocations(&[&HbmStub {
+                pinned: true,
+                ..HbmStub::default()
+            }]),
+            None
+        );
+    }
+
+    /// e061 — every fold of the dim, position 0 first, APPENDED to what the caller already gathered.
+    #[test]
+    fn fold_params_are_the_whole_dim_appended() {
+        let mut coord = Coordinate::default();
+        coord.add_fold_front(
+            PrimaryDim::In,
+            CoordinateCategory::Temporal,
+            FoldCardinality(4),
+            FoldLabel("inner".to_owned()),
+            FoldCoeff(1),
+            FoldCoeff(0),
+        );
+        coord.add_fold_front(
+            PrimaryDim::In,
+            CoordinateCategory::Spatial,
+            FoldCardinality(2),
+            FoldLabel("outer".to_owned()),
+            FoldCoeff(3),
+            FoldCoeff(5),
+        );
+
+        let mut params = vec![Fold {
+            cardinality: FoldCardinality(9),
+            label: FoldLabel("already there".to_owned()),
+            alpha: FoldCoeff(0),
+            beta: FoldCoeff(0),
+        }];
+        gather_fold_params(
+            coord.fold_dim(PrimaryDim::In).expect("the dim was folded"),
+            &mut params,
+        );
+
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[1].label, FoldLabel("outer".to_owned()));
+        assert_eq!(
+            (params[1].alpha, params[1].beta),
+            (FoldCoeff(3), FoldCoeff(5))
+        );
+        assert_eq!(params[2].cardinality, FoldCardinality(4));
+    }
+
+    /// e062 — the root leaves the CHAIN but not the DIM SET, and a layout dim arrives `Unpadded`.
+    #[test]
+    fn enclosing_loops_drop_the_root_and_keep_its_dims() {
+        assert!(OwnerLoops::of(Vec::new()).is_none());
+
+        let window = PrimaryDimAndKind {
+            dim: PrimaryDim::Out,
+            kind: MetaDimKind::WindowDim,
+        };
+        let padded = PrimaryDimAndKind {
+            dim: PrimaryDim::In,
+            kind: MetaDimKind::Padded,
+        };
+        let inner = loop_over(window, Vec::new());
+        let root = loop_over(padded, Vec::new());
+        let loops = OwnerLoops::of(vec![&inner, &root]).expect("a loop encloses the node");
+        let node = allocate("a", PrimaryDim::Out);
+
+        let (chain, related) =
+            get_enclosing_loops_and_related_dims(Node::Allocate(&node), &OneDim, &loops);
+        assert_eq!(chain, vec![&inner]);
+        assert_eq!(
+            related,
+            BTreeSet::from([
+                window,
+                padded,
+                PrimaryDimAndKind {
+                    dim: PrimaryDim::Out,
+                    kind: MetaDimKind::Unpadded,
+                },
+            ])
+        );
+    }
+
+    /// e063 — a bare dim matches only an `Unpadded` entry, and the padded arm reaches the window dim.
+    #[test]
+    fn a_bare_dim_matches_unpadded_and_the_padding_reaches_the_window() {
+        let node = loop_over(
+            PrimaryDimAndKind {
+                dim: PrimaryDim::In,
+                kind: MetaDimKind::Unpadded,
+            },
+            vec![PrimaryDimAndKind {
+                dim: PrimaryDim::Out,
+                kind: MetaDimKind::WindowDim,
+            }],
+        );
+        let bare = PrimaryDimAndKind {
+            dim: PrimaryDim::In,
+            kind: MetaDimKind::Unpadded,
+        };
+        let padded = PrimaryDimAndKind {
+            dim: PrimaryDim::In,
+            kind: MetaDimKind::Padded,
+        };
+
+        let mut related = Vec::new();
+        find_and_store_loop_with_dim(bare, &node, AccessPad::NoPad, &mut related);
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].dim, bare);
+        assert_eq!(related[0].distribution, LoopDistribution::AboveChunk);
+
+        related.clear();
+        find_and_store_loop_with_dim(padded, &node, AccessPad::NoPad, &mut related);
+        assert!(related.is_empty());
+
+        let mut padding = BTreeMap::new();
+        padding.insert(
+            PrimaryDim::In,
+            DimPadding {
+                window_dim: Some(PrimaryDim::Out),
+                ..DimPadding::default()
+            },
+        );
+        related.clear();
+        find_and_store_loop_with_dim(padded, &node, AccessPad::Padded(&padding), &mut related);
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].dim.dim, PrimaryDim::Out);
+    }
+
+    /// e064 — the copy lands under the size-seeded free id and only the two names are overwritten.
+    #[test]
+    fn a_constructed_datastage_is_a_renamed_copy() {
+        let mut stages: DataStages<u32> = DataStages::default();
+        stages.0.insert(DatastageId(0), DataStage::default());
+        let mut reference = DataStage::<u32>::default();
+        reference.ss.name = StageName("reference".to_owned());
+        reference.ss.dims = 7;
+
+        let id = construct_datastage(&mut stages, &reference);
+        assert_eq!(id, DatastageId(1));
+        let minted = &stages.0[&id];
+        assert_eq!(minted.ss.name, StageName("1".to_owned()));
+        assert_eq!(minted.el.name, StageName("1el".to_owned()));
+        assert_eq!(minted.ss.dims, 7);
+    }
+}
 
 /// Replaces: e065_constructLoopNode
 ///

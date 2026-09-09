@@ -449,7 +449,7 @@ impl<D> DataStages<D> {
 }
 
 /// ONE LOOP DIM AND WHAT KIND OF EXTENT IT WALKS — `PrimaryDimAndKind` (`dsc/dims.h:76`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrimaryDimAndKind {
     /// `dim_`, whose `PrimaryDimTypesCount` default this type does not admit.
     pub dim: PrimaryDim,
