@@ -186,6 +186,82 @@ pub trait ExpressionEvaluator {
             "EvaluatedValue::buildOffsetValue (Analyses/ExpressionEvaluatorUtils.h:126) — out of campaign scope"
         )
     }
+
+    // ─────────────────────────── the HANDLE flavour ───────────────────────────
+    //
+    // ⛔⛔ THE SAME C++ FUNCTIONS, ASKED FOR THE ARENA ENTRY RATHER THAN ITS CONTENTS, and the two
+    // flavours are not interchangeable. `evaluateValue` and `evaluateSum` return
+    // `const EvaluatedValue &` (`Analyses/ExpressionEvaluatorUtils.h:219`, `:242`); a pass that
+    // inspects offsets decodes that into an [`Evaluation`], but every one of the six
+    // `AddressPinningAndToggle` descriptors STORES the reference itself (`:198`, `:285`, `:339`,
+    // `:432`, `:528`, `:628`) and compares stored handles with `==`. Decoding for them would be inventing the
+    // analysis; see [`EvaluatedValue`].
+    // ⭐ ALL DEFAULTED, like [`ExpressionEvaluator::evaluate_sub`]: the out-of-scope refusal is
+    // stated once here and a test double for a pass that never asks need not repeat it.
+
+    /// `ExpressionEvaluator::evaluateValue` (`Analyses/ExpressionEvaluatorUtils.h:219`) for its
+    /// HANDLE — what a descriptor keeps.
+    fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+        let _ = value;
+        todo!(
+            "ExpressionEvaluator::evaluateValue (Analyses/ExpressionEvaluatorUtils.h:219) — out of campaign scope"
+        )
+    }
+
+    /// `ExpressionEvaluator::getConstant` (`Analyses/ExpressionEvaluatorUtils.h:335`) — the evaluated
+    /// value of a literal, which is how a descriptor obtains the `zero_ev` it tests against.
+    fn constant(&mut self, value: i64) -> EvaluatedValue {
+        let _ = value;
+        todo!(
+            "ExpressionEvaluator::getConstant (Analyses/ExpressionEvaluatorUtils.h:335) — out of campaign scope"
+        )
+    }
+
+    /// `ExpressionEvaluator::evaluateSum` (`Analyses/ExpressionEvaluatorUtils.h:242`) on two handles.
+    fn evaluate_sum_handle(&mut self, lhs: EvaluatedValue, rhs: EvaluatedValue) -> EvaluatedValue {
+        let _ = (lhs, rhs);
+        todo!(
+            "ExpressionEvaluator::evaluateSum (Analyses/ExpressionEvaluatorUtils.h:242) — out of campaign scope"
+        )
+    }
+
+    /// `ExpressionEvaluator::evaluateMultiplyByConst`
+    /// (`Analyses/ExpressionEvaluatorUtils.h:285`) — `ev * by`.
+    fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+        let _ = (ev, by);
+        todo!(
+            "ExpressionEvaluator::evaluateMultiplyByConst (Analyses/ExpressionEvaluatorUtils.h:285) — out of campaign scope"
+        )
+    }
+
+    /// `ExpressionEvaluator::evaluateMinMax` (`Analyses/ExpressionEvaluatorUtils.h:318`) — the
+    /// element-wise minimum or maximum of a list.
+    fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
+        let _ = (values, which);
+        todo!(
+            "ExpressionEvaluator::evaluateMinMax (Analyses/ExpressionEvaluatorUtils.h:318) — out of campaign scope"
+        )
+    }
+
+    /// `EvaluatedValue::isAnyValLessThan` (`Analyses/ExpressionEvaluatorUtils.h:71`) — whether ANY
+    /// unit's value is below `bound`, which is how a chain refuses a negative stride.
+    fn is_any_val_less_than(&mut self, ev: EvaluatedValue, bound: ScalarOffset) -> bool {
+        let _ = (ev, bound);
+        todo!(
+            "EvaluatedValue::isAnyValLessThan (Analyses/ExpressionEvaluatorUtils.h:71) — out of campaign scope"
+        )
+    }
+}
+
+/// WHICH END OF `evaluateMinMax` IS WANTED — the reference's `bool compute_min`
+/// (`Analyses/ExpressionEvaluatorUtils.h:318`), which its two adjacent call sites pass `false` then
+/// `true` (`AddressPinningAndToggle.cpp:3043-3046`) and which a `bool` argument cannot keep apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinMax {
+    /// `compute_min = true`.
+    Min,
+    /// `compute_min = false`.
+    Max,
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.

@@ -77,27 +77,220 @@
 //! | `e016_ConditionalConstantDescriptor` | 016 | 0 | 32 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2744` |
 //! | `e425_dump` | 425 | 2 | 15 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2780` |
 
-
-// crustify:todo: e016_ConditionalConstantDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2744  (32 body lines, level 0)
-//   original  : ConditionalConstantDescriptor::ConditionalConstantDescriptor( ExpressionEvaluator &evaluator, Value base_addr) : DynamicPatternDescriptorBase(PatternKind::kConditionalConstant, evaluator)
-
 // crustify:todo: e425_dump
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2780  (15 body lines, level 2)
 //   original  : void ConditionalConstantDescriptor::dump() const
 //   calls     : e252_size, e278_isValid, e279_canBeSimplified
 
-
-use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 
 /// A BASE ADDRESS CHOSEN BY NESTED `sentient.if`s FROM TWO OR MORE CONSTANTS —
-/// `class ConditionalConstantDescriptor` (`AddressPinningAndToggle.cpp:283-343`).
+/// `class ConditionalConstantDescriptor` (`AddressPinningAndToggle.cpp:303-340`).
 ///
-/// ⛔ EMPTY IS THE INVALID STATE: `isValid()` is `!yielded_constants_.empty()` (`:308`), so this
+/// ⛔ EMPTY IS THE INVALID STATE: `isValid()` is `!yielded_constants_.empty()` (`:318`), so this
 /// pattern has no `invalidate()` of its own — the ctor either fills the list or leaves it empty.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConditionalConstantDescriptor {
     /// `yielded_constants_` — the possible constants yielded from the conditional, in the order the
     /// match walked them.
     pub yielded_constants: Vec<EvaluatedValue>,
+    /// `can_be_simplified_`, the base class's own field (`AddressPinningAndToggle.cpp:159`) — true
+    /// when every path yields the SAME constant, so the conditional is not really a choice.
+    pub can_be_simplified: bool,
+}
+
+impl ConditionalConstantDescriptor {
+    /// Replaces: e016_ConditionalConstantDescriptor
+    ///
+    /// Matches `base_addr` as one `sentient.if` result whose every reachable yield is a constant,
+    /// collecting those constants in region order (`AddressPinningAndToggle.cpp:2744-2778`).
+    ///
+    /// ⛔ ONE NON-CONSTANT YIELD CLEARS THE WHOLE LIST (`:2771`) — all-or-nothing, and an empty list
+    /// IS the invalid state (`isValid()` is `!yielded_constants_.empty()`, `:318`).
+    /// ⛔ A `base_addr` NO `sentient.if` BINDS STAYS DEFAULT: the reference's failing `dyn_cast`
+    /// (`:2755`) leaves both base-class fields untouched.
+    #[must_use]
+    pub fn new(
+        base_addr: Val,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> ConditionalConstantDescriptor {
+        // `int result_index = getIndexOfOperationResults(base_addr)` then
+        // `dyn_cast<sentient::IfOp>(base_addr.getDefiningOp())` (`:2753-2755`). ⭐ THE INDEX IS ONLY
+        // EVER USED TO INDEX THAT `if`'s YIELDS, so finding `base_addr` among them is both steps.
+        let Some(Op::Sentient(if_op @ sentient::Op::If { yielded, .. })) = defs.of(base_addr)
+        else {
+            return ConditionalConstantDescriptor::default();
+        };
+        let Some(result_index) = yielded.iter().position(|entry| entry.result == base_addr) else {
+            return ConditionalConstantDescriptor::default();
+        };
+
+        let mut operands = Vec::new();
+        yielded_operands(if_op, result_index, defs, &mut operands);
+
+        // `bool all_yield_operands_constant = true` and the lambda's two arms (`:2757-2768`).
+        let mut yielded_constants = Vec::new();
+        let mut all_yield_operands_constant = true;
+        for operand in operands {
+            if is_constant(operand, ConstKind::ScalarConstant, defs) {
+                yielded_constants.push(evaluator.evaluate_value_handle(operand));
+            } else {
+                all_yield_operands_constant = false;
+            }
+        }
+        if !all_yield_operands_constant {
+            yielded_constants.clear();
+        }
+
+        // `if (yielded_constants_.empty()) return;` — `setCanBeSimplified` is never reached, so it
+        // keeps the base class's `false` rather than the vacuous truth of `all_of` on nothing.
+        let can_be_simplified = match yielded_constants.first() {
+            None => false,
+            Some(first) => yielded_constants.iter().all(|ev| ev == first),
+        };
+        ConditionalConstantDescriptor {
+            yielded_constants,
+            can_be_simplified,
+        }
+    }
+}
+
+/// `dcc::utils::applyToAllYields<sentient::IfOp>` (`dcc/src/Utils/Utils.cpp:164-179`) reduced to the
+/// operands its callback reads: per region of `if_op`, the `sentient.yield` operand at
+/// `result_index`, descending through a nested `sentient.if` bound at that position.
+///
+/// ⭐ AN EMPTY `else_body` IS NO ELSE REGION, which is the reference's `getNumRegions()` answering 1;
+/// an empty region has no terminator to read and the reference would deref a null one.
+fn yielded_operands(
+    if_op: &sentient::Op,
+    result_index: usize,
+    defs: Definitions<'_>,
+    out: &mut Vec<Val>,
+) {
+    let sentient::Op::If {
+        then_body,
+        else_body,
+        ..
+    } = if_op
+    else {
+        return;
+    };
+    for region in [then_body.as_slice(), else_body.as_slice()] {
+        if region.is_empty() {
+            continue;
+        }
+        let Some(Op::Sentient(sentient::Op::Yield { results })) = region.last() else {
+            continue;
+        };
+        let Some(&operand) = results.get(result_index) else {
+            continue;
+        };
+        // `!isa<BlockArgument>(yield_operand) && isa<IfOpTy>(yield_operand.getDefiningOp())` — the
+        // nested case recurses at `getIndexOfOperationResults(yield_operand)`.
+        match defs.of(operand) {
+            Some(Op::Sentient(nested @ sentient::Op::If { yielded, .. })) => {
+                match yielded.iter().position(|entry| entry.result == operand) {
+                    Some(index) => yielded_operands(nested, index, defs, out),
+                    None => out.push(operand),
+                }
+            }
+            _ => out.push(operand),
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{CmpPredicate, Reg, RegType, Yielded};
+    use crate::transform::sentient::analyses::OutOfScopeEvaluator;
+
+    /// `sentient.scalar_constant %value -> result`.
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// A `sentient.if` whose `then` yields `Val(1)` and whose `else` yields a nested `sentient.if`,
+    /// so a faithful walk reaches THREE constants and a shallow one would reach two.
+    fn nested_conditional() -> Vec<Op> {
+        let inner = Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Eq,
+            lhs: Val(20),
+            rhs: Val(21),
+            yielded: vec![Yielded {
+                result: Val(11),
+                reg: Reg {
+                    locale: RegType::Lbr,
+                    index: None,
+                },
+            }],
+            dbg_name: None,
+            then_body: vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(2)],
+            })],
+            else_body: vec![Op::Sentient(sentient::Op::Yield {
+                results: vec![Val(3)],
+            })],
+        });
+        vec![
+            constant(4096, Val(1)),
+            constant(8192, Val(2)),
+            constant(8192, Val(3)),
+            Op::Sentient(sentient::Op::If {
+                predicate: CmpPredicate::Eq,
+                lhs: Val(20),
+                rhs: Val(21),
+                yielded: vec![Yielded {
+                    result: Val(10),
+                    reg: Reg {
+                        locale: RegType::Lbr,
+                        index: None,
+                    },
+                }],
+                dbg_name: None,
+                then_body: vec![Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(1)],
+                })],
+                else_body: vec![
+                    inner,
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(11)],
+                    }),
+                ],
+            }),
+        ]
+    }
+
+    /// The walk IS the ported half, so the seam it stops at proves it reached a constant to evaluate.
+    #[test]
+    #[should_panic(expected = "evaluateValue")]
+    fn e016_descends_into_the_nested_conditional_before_evaluating() {
+        let body = nested_conditional();
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let _desc =
+            ConditionalConstantDescriptor::new(Val(10), defs, &mut OutOfScopeEvaluator::default());
+    }
+
+    /// The negative the reference reaches by `dyn_cast` failing: a base address no `sentient.if`
+    /// binds never asks the evaluator anything, and an empty list is the invalid state.
+    #[test]
+    fn e016_a_base_addr_that_is_not_an_if_result_stays_empty() {
+        let body = nested_conditional();
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let desc =
+            ConditionalConstantDescriptor::new(Val(1), defs, &mut OutOfScopeEvaluator::default());
+        assert_eq!(desc, ConditionalConstantDescriptor::default());
+    }
 }

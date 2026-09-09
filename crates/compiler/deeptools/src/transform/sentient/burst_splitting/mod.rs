@@ -87,7 +87,7 @@ use crate::units::DfirUnit;
 
 /// A MEMORY OP THIS PASS MAY SPLIT, WITH THE BURST IT CARRIES.
 ///
-/// ⭐ THE `DT_CHECK` AT `BurstSplitting.cpp:113-116` AS A TYPE. Only `sentient.load_and_send`,
+/// ⭐ THE `DT_CHECK` AT `BurstSplitting.cpp:114-117` AS A TYPE. Only `sentient.load_and_send`,
 /// `sentient.receive_and_store` and `sentient.load_and_store` carry a burst this pass understands,
 /// and "Unsupported operation for burst splitting" is then a state [`split_burst`] cannot be reached
 /// in rather than one it aborts on.
@@ -135,10 +135,10 @@ impl BurstCandidate {
 /// Costs the split in IBuff — one entry when more than one full burst fits and so a `sentient.for` is
 /// needed, one more for a residual op — then hands the rewrite itself to `burst_utils`.
 /// ⛔ `getMaxBurstSize` IS A PARAMETER, NOT A LOOKUP: it reads the per-unit table on
-/// `dcc_ext_ctx_`, which is outside this campaign, and `DT_CHECK_MSG(max_burst != -1)` (`:126`)
+/// `dcc_ext_ctx_`, which is outside this campaign, and `DT_CHECK_MSG(max_burst != -1)` (`:130`)
 /// becomes [`Elements`] having no negative value.
 /// ⭐ THE TWO IBUFF WARNINGS COST THIS PORT NOTHING: `haveIbuffSpace` and `getRemainingIbuffSpace`
-/// only feed `LLVM_DEBUG` (`:120-124`, `:143-149`) and change no IR, so `InstructionEstimator` being
+/// only feed `LLVM_DEBUG` (`:123-127`, `:147-151`) and change no IR, so `InstructionEstimator` being
 /// out of scope removes no effect.
 pub fn split_burst<A: Arch>(
     unit: &mut ProgramUnit<A>,
@@ -151,7 +151,7 @@ pub fn split_burst<A: Arch>(
     if max_burst == Elements(0) || candidate.burst_size <= max_burst {
         todo!(
             "splitBurst: expected burst_size {:?} to be larger than max_burst {max_burst:?} \
-             (BurstSplitting.cpp:126-133)",
+             (BurstSplitting.cpp:130-135)",
             candidate.burst_size
         )
     }
@@ -162,7 +162,7 @@ pub fn split_burst<A: Arch>(
         "burst_utils::processBurstSplitOrInterleave (Analyses/BurstUtils.cpp, out of campaign \
          scope) — splitting {:?} on {:?}/{comp:?} into {full_iterations} bursts of {max_burst:?} \
          plus a residual of {residual} needs {required_ibuff} additional IBuff \
-         (BurstSplitting.cpp:151-158)",
+         (BurstSplitting.cpp:157-158)",
         candidate.at,
         unit.on.kind()
     )
@@ -191,7 +191,7 @@ mod unit_tests {
     use crate::islands::sentient::dialects::Val;
 
     /// The file header's own example: a burst of 264 where 64 is the maximum needs a loop of four
-    /// full bursts AND a residual of 8, so both extra IBuff entries (`BurstSplitting.cpp:10-35`).
+    /// full bursts AND a residual of 8, so both extra IBuff entries (`BurstSplitting.cpp:16-35`).
     #[test]
     #[should_panic(expected = "needs 2 additional IBuff")]
     fn e021_costs_the_vendors_264_over_64_example_at_two_ibuff() {

@@ -185,18 +185,18 @@ pub use simple_constant_descriptor::SimpleConstantDescriptor;
 pub use toggle_descriptor::ToggleDescriptor;
 
 /// THE CONSTANT BASE ADDRESSES ONE TRANSFER CAN USE — `using BaseAddrListTy =
-/// llvm::SmallVector<const EvaluatedValue *, 2>` (`AddressPinningAndToggle.cpp:157`).
+/// SmallVector<const EvaluatedValue *, 1>` (`AddressPinningAndToggle.cpp:100`).
 pub type BaseAddrList = Vec<EvaluatedValue>;
 
 /// WHICH PATTERN A BASE ADDRESS FOLLOWS — the `DynamicPatternDescriptorBase *pattern_desc_`
-/// hierarchy (`AddressPinningAndToggle.cpp:100-628`), whose six subclasses the reference
+/// hierarchy (`AddressPinningAndToggle.cpp:104-629`), whose six subclasses the reference
 /// discriminates with `isa<>` and its `PatternKind` tag.
 ///
-/// ⭐ AN ENUM BECAUSE THE SET IS CLOSED AND MUTUALLY EXCLUSIVE — the reference says so at `:855`
+/// ⭐ AN ENUM BECAUSE THE SET IS CLOSED AND MUTUALLY EXCLUSIVE — the reference says so at `:858`
 /// ("the descriptor types should be mutually exclusive"), which is why a non-looping chain gets no
 /// arm here and lives on `HBMDataTransferDescriptor::total_chain_increment_` instead.
 ///
-/// ⛔ NO `kUnknown` ARM: `PatternKind::kUnknown` (`:104`) is the base class's default tag and no
+/// ⛔ NO `kUnknown` ARM: `PatternKind::kUnknown` (`:108`) is the base class's default tag and no
 /// subclass constructs it — an unmatched transfer leaves `pattern_desc_` NULL, which is
 /// [`DataTransferDescriptor::pattern_desc`]`== None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,7 +219,7 @@ impl ToggleDescriptor {
     /// Replaces: e001_invalidate
     ///
     /// Clears exactly the three fields `ToggleDescriptor::isValid()` reads
-    /// (`AddressPinningAndToggle.cpp:257`), so the toggle reads as unmatched.
+    /// (`AddressPinningAndToggle.cpp:263`), so the toggle reads as unmatched.
     pub fn invalidate(&mut self) {
         self.outer_loop = None;
         self.iter_arg_index = None;
@@ -242,7 +242,7 @@ impl ConditionalConstantDescriptor {
 impl IntegerSequenceDescriptor {
     /// Replaces: e003_invalidate
     ///
-    /// Clears everything `IntegerSequenceDescriptor::isValid()` reads (`:392`).
+    /// Clears everything `IntegerSequenceDescriptor::isValid()` reads (`:356`).
     ///
     /// ⛔ THE SIZE GOES TO [`SequenceSize::Cleared`], the reference's `size_ = 0` — NOT to
     /// [`SequenceSize::Symbolic`], which is the different `-1` meaning "length not known statically".
@@ -297,7 +297,7 @@ impl DataTransferDescriptorContainer {
     /// `chaining_info` entry at all.
     ///
     /// ⛔ THE KEY IS A [`DescriptorId`], not a borrow: the reference keys `chaining_info_` on the
-    /// descriptor's ADDRESS (`:955`), which is not expressible while this container owns them.
+    /// descriptor's ADDRESS (`:957`), which is not expressible while this container owns them.
     #[must_use]
     pub fn is_part_of_some_chain(&self, desc: DescriptorId) -> bool {
         self.chaining_info
@@ -344,7 +344,7 @@ pub fn create_offset_value(_ev: EvaluatedValue, _ty: ScalarTy) -> Val {
     )
 }
 
-/// `SimpleConstantDataTransferUpdater` (`:1046`) — the updater for a transfer whose base address is
+/// `SimpleConstantDataTransferUpdater` (`:1050`) — the updater for a transfer whose base address is
 /// one constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimpleConstantDataTransferUpdater;
@@ -352,7 +352,7 @@ pub struct SimpleConstantDataTransferUpdater;
 impl SimpleConstantDataTransferUpdater {
     /// Replaces: e010_updateVariableOffsetCalculation
     ///
-    /// `return;  // nothing to do` (`:1063-1066`) — a simple constant has no toggle `scalar_sub` and no
+    /// `return;  // nothing to do` (`:1065-1068`) — a simple constant has no toggle `scalar_sub` and no
     /// `sentient.if` whose yielded constants would need re-basing against the pinned address, so this
     /// override of the three that do is empty.
     pub const fn update_variable_offset_calculation(self, _new_immut_addr_ev: EvaluatedValue) {}
@@ -361,7 +361,7 @@ impl SimpleConstantDataTransferUpdater {
 /// `SubOp toggle_sub_` — the `sentient.scalar_sub` computing a toggling transfer's immutable address,
 /// named by its `$out`.
 ///
-/// ⛔ A TYPE AND NOT A BARE [`Val`]: `DT_CHECK_MSG(toggle_sub, …)` (`:1528-1532`) is that
+/// ⛔ A TYPE AND NOT A BARE [`Val`]: `DT_CHECK_MSG(toggle_sub, …)` (`:1529-1532`) is that
 /// `immutable_addr[0]`'s DEFINING OP is a `scalar_sub`, and only a caller that matched
 /// [`crate::islands::sentient::dialects::sentient::Op::ScalarSub`] can say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,7 +381,7 @@ impl ToggleSub {
     }
 }
 
-/// `ToggleDataTransferUpdater` (`:1080`) — the updater for a base address that toggles between two
+/// `ToggleDataTransferUpdater` (`:1082`) — the updater for a base address that toggles between two
 /// constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToggleDataTransferUpdater {
@@ -392,7 +392,7 @@ pub struct ToggleDataTransferUpdater {
 impl ToggleDataTransferUpdater {
     /// Replaces: e011_getOffset
     ///
-    /// The toggle's own `scalar_sub` result IS the fall-back offset (`:1132-1135`) — nothing new is
+    /// The toggle's own `scalar_sub` result IS the fall-back offset (`:1104-1107`) — nothing new is
     /// built, because the sub already computes the difference the pinning wants added.
     ///
     /// ⭐ `DT_CHECK(toggle_sub_)` is [`ToggleSub`]'s existence; `new_immut_addr_ev` is UNREAD.
@@ -413,7 +413,7 @@ pub struct YieldedIndex(pub usize);
 /// `if_op_.getResult(res_index_)` as a pair: `DT_CHECK(if_op_ && res_index_ >= 0)` is two facts about
 /// one lookup, and carrying the value makes an out-of-range index inexpressible rather than caught. The
 /// index stays because `updateVariableOffsetCalculation` (e277) needs it to reach every yield of that
-/// result (`applyToAllYields(if_op_, …, res_index_)`, `:2071-2086`).
+/// result (`applyToAllYields(if_op_, …, res_index_)`, `:2071-2085`).
 ///
 /// ⚠️ AND IT IS **NOT** `immutable_addr_[0]`: `updateImmutableAddr` REPLACES that operand (`:2060`)
 /// after setting `res_index_` (`:2053`), so this is the pre-pinning value and the two differ.
@@ -425,7 +425,7 @@ pub struct ConditionalConstResult {
     pub val: Val,
 }
 
-/// `ConditionalConstDataTransferUpdater` (`:1112`) — the updater for a base address an `scf`-style
+/// `ConditionalConstDataTransferUpdater` (`:1113`) — the updater for a base address an `scf`-style
 /// conditional picks from a set of constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConditionalConstDataTransferUpdater {
@@ -460,7 +460,7 @@ pub struct IntegerSequenceDataTransferUpdater {
 impl IntegerSequenceDataTransferUpdater {
     /// Replaces: e013_getOffset
     ///
-    /// The carried iter arg IS the fall-back offset (`:1162-1165`) — the sequence's own induction
+    /// The carried iter arg IS the fall-back offset (`:1163-1166`) — the sequence's own induction
     /// already steps by what the pinning wants added.
     ///
     /// ⭐ `DT_CHECK(iter_arg_)` is the field's existence; `new_immut_addr_ev` is UNREAD.
@@ -476,7 +476,7 @@ impl IntegerSequenceDataTransferUpdater {
 /// ⚠️ `UNITS.tsv` RECORDS e014's CALLS AS `-`: the call resolves through a virtual `dump()` the
 /// extractor's detector did not follow. This trait is the seam e492 lands into later.
 pub trait DumpDescriptor {
-    /// `dtd->dump()` (`:2521`) — one descriptor's block, `----------` delimited.
+    /// `dtd->dump()` (`:1669`) — one descriptor's block, `----------` delimited.
     fn dump(&self) -> String;
 }
 
@@ -487,7 +487,7 @@ pub trait DumpDescriptor {
 /// not `sorted_list_`).
 ///
 /// ⭐ THE INNER `LLVM_DEBUG` ON THE TWO HEADERS CHANGES NOTHING: both callsites already wrap the whole
-/// call (`:1349-1353`, `:1370-1375`), so a returned `String` loses no gating the reference had.
+/// call (`:1350-1354`, `:1371-1375`), so a returned `String` loses no gating the reference had.
 #[must_use]
 pub fn dump(immut: &[&dyn DumpDescriptor], mutable: &[&dyn DumpDescriptor]) -> String {
     let mut out = String::from("Immutable transfer descriptors:\n");
@@ -848,6 +848,7 @@ mod unit_tests {
     fn get_all_constants_appends_in_order_without_clearing() {
         let desc = ConditionalConstantDescriptor {
             yielded_constants: vec![EvaluatedValue(11), EvaluatedValue(22)],
+            can_be_simplified: false,
         };
         let mut output: BaseAddrList = vec![EvaluatedValue(99)];
         desc.get_all_constants(&mut output);

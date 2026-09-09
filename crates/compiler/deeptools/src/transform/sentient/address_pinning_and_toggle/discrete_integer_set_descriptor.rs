@@ -78,11 +78,6 @@
 //! | `e281_DiscreteIntegerSetDescriptor` | 281 | 1 | 45 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2901` |
 //! | `e426_dump` | 426 | 2 | 13 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2954` |
 
-
-// crustify:todo: e017_getOutermostConstInitialization
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2968  (107 body lines, level 0)
-//   original  : std::tuple<sentient::ForOp, int, const EvaluatedValue *, const EvaluatedValue *> DiscreteIntegerSetDescriptor::getOutermostConstInitialization( BlockArgument iter_arg)
-
 // crustify:todo: e281_DiscreteIntegerSetDescriptor
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2901  (45 body lines, level 1)
 //   original  : DiscreteIntegerSetDescriptor::DiscreteIntegerSetDescriptor( ExpressionEvaluator &evaluator, Value base_addr) : DynamicPatternDescriptorBase(PatternKind::kDiscreteIntegerSet, evaluator), outer_loop_(nullptr), iter_arg_index_(-1), init_(nullptr), total_positive_delta_(nullptr), total_negative_delta_(n
@@ -93,12 +88,15 @@
 //   original  : void DiscreteIntegerSetDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified
 
-
-use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, operands, regions_ref, results, sentient,
+};
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, MinMax};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
 /// A SET OF ADDRESSES REACHED BY SEVERAL INDEPENDENT INCREMENTS —
-/// `class DiscreteIntegerSetDescriptor` (`AddressPinningAndToggle.cpp:466-528`). Unlike
+/// `class DiscreteIntegerSetDescriptor` (`AddressPinningAndToggle.cpp:454-529`). Unlike
 /// [`super::integer_sequence_descriptor::IntegerSequenceDescriptor`] the increments come from a
 /// chain of iter args across nested loops, each with its own stride, so the pattern keeps only the
 /// initial value and the totals it can move by.
@@ -114,4 +112,431 @@ pub struct DiscreteIntegerSetDescriptor {
     pub total_positive_delta: Option<EvaluatedValue>,
     /// `total_negative_delta_` — the same sum over its negative strides.
     pub total_negative_delta: Option<EvaluatedValue>,
+}
+
+/// WHAT THE WALK ANSWERS — the reference's
+/// `tuple<ForOp, int, const EvaluatedValue *, const EvaluatedValue *>` (`:502-504`).
+///
+/// ⛔ WHOLE-`None` IS ITS `{nullptr, -1, nullptr, nullptr}`; `iter_arg_index: None` is the OTHER
+/// failure it spells with `-1`, where the loop was reached but no constant initialiser was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutermostConstInitAndDeltas {
+    /// The outermost loop the walk reached, named by its induction variable.
+    pub outer_loop: ForRef,
+    /// Which iter arg of it a constant initialises.
+    pub iter_arg_index: Option<IterArgIndex>,
+    /// `total_positive_delta` — Σ `max((bound-1) * stride, 0)` over the chain.
+    pub total_positive_delta: EvaluatedValue,
+    /// `total_negative_delta` — Σ `min((bound-1) * stride, 0)` over the chain.
+    pub total_negative_delta: EvaluatedValue,
+}
+
+impl DiscreteIntegerSetDescriptor {
+    /// Replaces: e017_getOutermostConstInitialization
+    ///
+    /// Walks the iter-arg initialisation chain inner to outer, accumulating each loop's
+    /// `(bound-1) * stride` into a positive and a negative total (`:2968-3076`).
+    ///
+    /// ⛔ NOT THE SAME FUNCTION AS [`crate::transform::sentient::utils::outermost_const_initialization`]
+    /// (`Utils.cpp:469`), which answers a SIZE — this one answers per-unit deltas and refuses a
+    /// non-constant bound outright instead of recording it.
+    /// ⛔ EVERY REFUSAL IS `None`, INCLUDING `bound <= 0` (`:3002`): the reference's own comment
+    /// there is "dead load/stores?".
+    #[must_use]
+    pub fn outermost_const_initialization(
+        iter_arg: Val,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> Option<OutermostConstInitAndDeltas> {
+        let mut iter_arg_index: Option<IterArgIndex> = None;
+        let mut curr: Option<Val> = Some(iter_arg);
+        let mut outer_loop: Option<&Op> = None;
+        let mut totals: Option<(EvaluatedValue, EvaluatedValue)> = None;
+
+        // `while (iter_arg_index < 0 && cur_iter_arg)` (`:2993`)
+        while iter_arg_index.is_none() {
+            let Some(curr_arg) = curr else { break };
+            // `getIndexOfLoopRegionIterArgs` then `cur_iter_arg.getOwner()->getParentOp()`, whose
+            // `dyn_cast<ForOp>` the reference then uses UNCHECKED (`:2994-2996`).
+            let (for_op, arg_number) = defs.for_arg_of(curr_arg)?;
+            let curr_it_index = arg_number.checked_sub(1)?;
+            outer_loop = Some(for_op);
+            let Op::Sentient(sentient::Op::For {
+                bound,
+                carried,
+                body,
+                ..
+            }) = for_op
+            else {
+                return None;
+            };
+
+            // `dyn_cast_or_null<ConstantOp>(outer_loop.getBound().getDefiningOp())` — ⛔ THE OP
+            // ITSELF, not `isConstant`, so a `uniform.query_map` bound is refused here.
+            let Some(Op::Sentient(sentient::Op::ScalarConstant {
+                value: bound_value, ..
+            })) = defs.of(*bound)
+            else {
+                return None;
+            };
+            if *bound_value <= 0 {
+                return None;
+            }
+
+            // `getIterArgIncrementer<ForOp, AddOp>` and the constancy of its `getOperand(1)`.
+            let (add_result, stride_val) = iter_arg_incrementer(carried, body, curr_it_index)?;
+            if !is_constant(stride_val, ConstKind::ScalarConstant, defs) {
+                return None;
+            }
+            let stride = evaluator.evaluate_value_handle(stride_val);
+
+            // `cur_loop_delta = stride * (bound-1)`, split at zero into its positive and negative
+            // halves so that the two run in opposite directions (`:3035-3046`).
+            let cur_loop_delta = evaluator.evaluate_multiply_by_const(stride, bound_value - 1);
+            let zero = evaluator.constant(0);
+            let cur_positive = evaluator.evaluate_min_max(&[cur_loop_delta, zero], MinMax::Max);
+            let cur_negative = evaluator.evaluate_min_max(&[cur_loop_delta, zero], MinMax::Min);
+            totals = Some(match totals {
+                None => (cur_positive, cur_negative),
+                Some((positive, negative)) => (
+                    evaluator.evaluate_sum_handle(positive, cur_positive),
+                    evaluator.evaluate_sum_handle(negative, cur_negative),
+                ),
+            });
+
+            // `DT_CHECK_MSG(num_non_yield_feeding_uses == 1, ..)` (`:3064-3067`) — an ABORT in the
+            // reference, so it stays a named stop rather than becoming a refusal.
+            let uses = num_users_except(curr_arg, body, &|op| {
+                matches!(op, Op::Sentient(sentient::Op::Yield { .. }))
+                    || results(op).contains(&add_result)
+            });
+            if uses != 1 {
+                todo!(
+                    "getOutermostConstInitialization: DT_CHECK_MSG(num_non_yield_feeding_uses == \
+                     1, \"base_addr should only be used in memory op and to feed the yield op\") \
+                     — {uses} such uses of {curr_arg:?} (:3064-3067)"
+                )
+            }
+
+            let curr_init = carried.get(curr_it_index)?.init;
+            if defs.for_arg_of(curr_init).is_some() {
+                curr = Some(curr_init);
+            } else {
+                if is_constant(curr_init, ConstKind::ScalarConstant, defs) {
+                    iter_arg_index = u32::try_from(curr_it_index).ok().map(IterArgIndex);
+                }
+                curr = None;
+            }
+        }
+
+        let Op::Sentient(sentient::Op::For { iv, .. }) = outer_loop? else {
+            return None;
+        };
+        let (total_positive_delta, total_negative_delta) = totals?;
+        Some(OutermostConstInitAndDeltas {
+            outer_loop: ForRef(*iv),
+            iter_arg_index,
+            total_positive_delta,
+            total_negative_delta,
+        })
+    }
+}
+
+/// `dcc::utils::getIterArgIncrementer<sentient::ForOp, sentient::AddOp>`
+/// (`dcc/src/Utils/Utils.cpp:342-355`) — the `sentient.scalar_add` that advances iter arg `index`,
+/// as `(its result, its second operand)`. `None` covers both the reference's `nullptr` and the
+/// `DT_CHECK_MSG(idx < ..getNumOperands(), "index is outside operand range")` a loop whose yield is
+/// short of its carried list would trip.
+fn iter_arg_incrementer(
+    carried: &[sentient::Carried],
+    body: &[Op],
+    index: usize,
+) -> Option<(Val, Val)> {
+    let arg = carried.get(index)?.arg;
+    let Op::Sentient(sentient::Op::Yield { results: yielded }) = body.last()? else {
+        return None;
+    };
+    let yield_operand = *yielded.get(index)?;
+    let add = body
+        .iter()
+        .find(|op| results(op).contains(&yield_operand))?;
+    let Op::Sentient(sentient::Op::ScalarAdd {
+        lhs, rhs, result, ..
+    }) = add
+    else {
+        return None;
+    };
+    (*lhs == arg).then_some((*result, *rhs))
+}
+
+/// `dcc::utils::getNumUsersExcept` (`dcc/src/Utils/Utils.cpp:384-390`) — uses of `val` in `scope`
+/// and its nested regions whose owner `filter_out` rejects, counted ONCE PER USE as `getUsers()`
+/// iterates uses rather than distinct ops.
+fn num_users_except(val: Val, scope: &[Op], filter_out: &impl Fn(&Op) -> bool) -> usize {
+    scope
+        .iter()
+        .map(|op| {
+            let here = if filter_out(op) {
+                0
+            } else {
+                operands(op).iter().filter(|read| **read == val).count()
+            };
+            here + regions_ref(op)
+                .into_iter()
+                .map(|region| num_users_except(val, region, filter_out))
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
+    use crate::transform::sentient::analyses::{
+        Evaluation, OffsetSites, OutOfScopeEvaluator, ScalarOffset,
+    };
+
+    /// The handle flavour with its answers stated as INTEGERS: one entry per interned value, so `==`
+    /// on handles is `==` on values and the walk's arithmetic is observable.
+    #[derive(Default)]
+    struct StatedEvaluator {
+        held: Vec<i64>,
+        constants: Vec<(Val, i64)>,
+    }
+
+    impl StatedEvaluator {
+        fn intern(&mut self, value: i64) -> EvaluatedValue {
+            let index = self
+                .held
+                .iter()
+                .position(|held| *held == value)
+                .unwrap_or_else(|| {
+                    self.held.push(value);
+                    self.held.len() - 1
+                });
+            EvaluatedValue(u32::try_from(index).unwrap_or_default())
+        }
+
+        fn value(&self, ev: EvaluatedValue) -> i64 {
+            self.held
+                .get(usize::try_from(ev.0).unwrap_or_default())
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e017 asks for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e017 asks for handles, never for a decoded evaluation")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e017 builds no value")
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            let held = self
+                .constants
+                .iter()
+                .find(|(val, _)| *val == value)
+                .map(|(_, held)| *held);
+            match held {
+                Some(held) => self.intern(held),
+                None => todo!("the fixture states no constant for {value:?}"),
+            }
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            self.intern(value)
+        }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let sum = self.value(lhs) + self.value(rhs);
+            self.intern(sum)
+        }
+
+        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+            let product = self.value(ev) * by;
+            self.intern(product)
+        }
+
+        fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
+            let mut held: Vec<i64> = values.iter().map(|ev| self.value(*ev)).collect();
+            held.sort_unstable();
+            let picked = match which {
+                MinMax::Min => held.first().copied(),
+                MinMax::Max => held.last().copied(),
+            };
+            self.intern(picked.unwrap_or_default())
+        }
+
+        fn is_any_val_less_than(&mut self, ev: EvaluatedValue, bound: ScalarOffset) -> bool {
+            self.value(ev) < bound.0
+        }
+    }
+
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: Some(Reg {
+                locale: RegType::Lar,
+                index: None,
+            }),
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    fn carried(init: Val, arg: Val, result: Val) -> Carried {
+        Carried {
+            init,
+            arg,
+            result,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    fn load_and_store(src_mutable_addr: Val) -> Op {
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src: Val(90),
+            dst: Val(91),
+            src_mutable_addr,
+            src_immutable_addr: Val(92),
+            src_inc: Val(93),
+            dst_mutable_addr: Val(94),
+            dst_immutable_addr: Val(95),
+            dst_inc: Val(93),
+            multicast_info: None,
+            results: (Val(96), Val(97)),
+            extent: Extent::of(Elements(8), Bits(16)),
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            src_reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dst_reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        })
+    }
+
+    /// The reference's own example (`:437-452`): `%arg1` starts at a constant and two nested loops add
+    /// `+3` and `-4` to the chain, `outer_bound` being the OUTER loop's.
+    fn chained_nest(outer_bound: Val) -> Vec<Op> {
+        let inner = Op::Sentient(sentient::Op::For {
+            iv: Val(20),
+            bound: Val(2),
+            carried: vec![carried(Val(11), Val(21), Val(22))],
+            dbg_name: None,
+            body: vec![
+                load_and_store(Val(21)),
+                add(Val(21), Val(4), Val(23)),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(23)],
+                }),
+            ],
+        });
+        vec![
+            constant(3, Val(1)),
+            constant(5, Val(2)),
+            constant(0, Val(3)),
+            constant(3, Val(4)),
+            constant(-4, Val(5)),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(10),
+                bound: outer_bound,
+                carried: vec![carried(Val(3), Val(11), Val(12))],
+                dbg_name: None,
+                body: vec![
+                    inner,
+                    add(Val(11), Val(5), Val(13)),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(13)],
+                    }),
+                ],
+            }),
+        ]
+    }
+
+    /// The deltas are `Σ max((bound-1) * stride, 0)` and `Σ min(…, 0)`: `+3` over five iterations and
+    /// `-4` over three give `+12` and `-8`, and the walk ends at the OUTER loop's constant init.
+    #[test]
+    fn e017_accumulates_the_positive_and_negative_deltas_of_the_chain() {
+        let body = chained_nest(Val(1));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(4), 3), (Val(5), -4)],
+        };
+        let found = DiscreteIntegerSetDescriptor::outermost_const_initialization(
+            Val(21),
+            defs,
+            &mut evaluator,
+        );
+        let found = found.expect("the chain resolves to the outer loop's constant init");
+        assert_eq!(found.outer_loop, ForRef(Val(10)));
+        assert_eq!(found.iter_arg_index, Some(IterArgIndex(0)));
+        assert_eq!(evaluator.value(found.total_positive_delta), 12);
+        assert_eq!(evaluator.value(found.total_negative_delta), -8);
+    }
+
+    /// `dyn_cast_or_null<ConstantOp>(outer_loop.getBound()...)` failing is a REFUSAL, not an abort:
+    /// the walk answers nothing without asking the analysis anything, which
+    /// [`OutOfScopeEvaluator`] proves by panicking if it is asked.
+    #[test]
+    fn e017_refuses_a_non_constant_bound_without_asking_the_analysis() {
+        let body = chained_nest(Val(99));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let found = DiscreteIntegerSetDescriptor::outermost_const_initialization(
+            Val(11),
+            defs,
+            &mut OutOfScopeEvaluator::default(),
+        );
+        assert_eq!(found, None);
+    }
 }

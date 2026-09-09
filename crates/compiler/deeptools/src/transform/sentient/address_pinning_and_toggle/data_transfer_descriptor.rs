@@ -79,7 +79,6 @@
 //! | `e492_dump` | 492 | 3 | 28 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2521` |
 //! | `e593_initializeDescriptor` | 593 | 5 | 161 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2316` |
 
-
 // crustify:todo: e278_isValid
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2478  (23 body lines, level 1)
 //   original  : bool DataTransferDescriptor::isValid() const
@@ -100,12 +99,11 @@
 //   original  : void DataTransferDescriptor::initializeDescriptor()
 //   calls     : e002_getAllConstants, e015_getInit, e016_ConditionalConstantDescriptor, e252_size, e278_isValid, e279_canBeSimplified, e280_IntegerSequenceDescriptor, e281_DiscreteIntegerSetDescriptor, e282_LoopingChainMutableAddrDescriptor, e407_getInit, e408_getAllConstants, e411_getInit, e414_getInit, e485_getX …
 
-
 use super::{BaseAddrList, PatternDescriptor};
 
 /// ONE DATA TRANSFER'S BASE-ADDRESS STORY — `class DataTransferDescriptor`
-/// (`AddressPinningAndToggle.cpp:632-786`), one per `load_and_send`/`receive_and_store`/
-/// `load_and_store` per address role (the HBM `load_and_store` case makes TWO, `:1410-1431`).
+/// (`AddressPinningAndToggle.cpp:632-790`), one per `load_and_send`/`receive_and_store`/
+/// `load_and_store` per address role (the HBM `load_and_store` case makes TWO, `:1410-1415`).
 ///
 /// ⛔ NOT `evaluator_`: the reference stores `ExpressionEvaluator &`, one global the pass threads
 /// through. A shared borrow in a field would make the descriptor unstorable while the pass rewrites
@@ -115,9 +113,9 @@ pub struct DataTransferDescriptor {
     /// Replaces: e006_dtor_DataTransferDescriptor
     ///
     /// `pattern_desc_` — which recognised pattern this transfer follows, `None` for the reference's
-    /// `nullptr` (every `is*()` tests it, `:670-696`).
+    /// `nullptr` (every `is*()` tests it, `:673-696`).
     ///
-    /// ⭐ THIS FIELD *IS* THE PORT OF `~DataTransferDescriptor()` (`:647`, whose whole body is
+    /// ⭐ THIS FIELD *IS* THE PORT OF `~DataTransferDescriptor()` (`:645-647`, whose whole body is
     /// `if (pattern_desc_) delete pattern_desc_;`): the destructor exists only because the reference
     /// holds `DynamicPatternDescriptorBase *` from a `new` in `initializeDescriptor`. An owned
     /// `Option` frees exactly that, at exactly that point, so ⛔ there is no `impl Drop` to write —

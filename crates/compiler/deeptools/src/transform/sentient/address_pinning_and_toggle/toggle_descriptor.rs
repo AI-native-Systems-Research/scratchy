@@ -88,14 +88,15 @@
 //   original  : void ToggleDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified, e401_getC1, e485_getX
 
-use crate::islands::sentient::dialects::{Op, Val, defining_op, sentient};
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
 use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
 /// A BASE ADDRESS TOGGLING BETWEEN TWO CONSTANTS — `class ToggleDescriptor`
-/// (`AddressPinningAndToggle.cpp:210-281`), matched as `X = c1 - Y` around a loop's iter arg.
+/// (`AddressPinningAndToggle.cpp:213-286`), matched as `X = c1 - Y` around a loop's iter arg.
 ///
-/// ⛔ THE THREE FIELDS ARE EXACTLY WHAT `isValid()` READS (`:257`:
+/// ⛔ THE THREE FIELDS ARE EXACTLY WHAT `isValid()` READS (`:263`:
 /// `c1_ && iter_arg_index_ >= 0 && outer_loop_`), which is why [`ToggleDescriptor::invalidate`]
 /// clears these three and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,7 +120,7 @@ impl ToggleDescriptor {
     /// `ExpressionEvaluator` (`Analyses/ExpressionEvaluatorUtils`, out of campaign scope), so it is a
     /// `todo!` — resolving the operand and proving it constant, everything before that call, is here.
     #[must_use]
-    pub fn init(&self, body: &[Op]) -> EvaluatedValue {
+    pub fn init(&self, body: &[Op], defs: Definitions<'_>) -> EvaluatedValue {
         let (Some(outer_loop), Some(iter_arg_index)) = (self.outer_loop, self.iter_arg_index)
         else {
             todo!(
@@ -137,14 +138,14 @@ impl ToggleDescriptor {
                  (AddressPinningAndToggle.cpp:2716-2717)"
             )
         };
-        // `DT_CHECK(dcc::utils::isConstant<sentient::ConstantOp>(init))`.
-        let Some(Op::Sentient(sentient::Op::ScalarConstant { .. })) = defining_op(init, body)
-        else {
+        // `DT_CHECK(dcc::utils::isConstant<sentient::ConstantOp>(init))` — the op itself OR a
+        // `uniform.query_map` all of whose mapped values are constants, never just the op.
+        if !is_constant(init, ConstKind::ScalarConstant, defs) {
             todo!(
                 "getInit: iter arg init {init:?} is expected to be constant in ToggleDescriptor \
                  (AddressPinningAndToggle.cpp:2718-2719)"
             )
-        };
+        }
         todo!(
             "ExpressionEvaluator::evaluateValue (Analyses/ExpressionEvaluatorUtils, out of campaign \
              scope) on the constant iter arg init {init:?} that {outer_loop:?} starts \
@@ -221,6 +222,7 @@ mod unit_tests {
             iter_arg_index: Some(IterArgIndex(0)),
             c1: None,
         };
-        let _evaluated = toggle.init(&body);
+        let regions: [&[Op]; 1] = [&body];
+        let _evaluated = toggle.init(&body, Definitions::from_innermost(&regions));
     }
 }

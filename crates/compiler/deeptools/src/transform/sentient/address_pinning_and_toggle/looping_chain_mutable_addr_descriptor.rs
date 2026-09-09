@@ -78,11 +78,6 @@
 //! | `e282_LoopingChainMutableAddrDescriptor` | 282 | 1 | 27 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3081` |
 //! | `e427_dump` | 427 | 2 | 12 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3121` |
 
-
-// crustify:todo: e018_getOutermostConstInitAndLoopingChainIncrement
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3134  (168 body lines, level 0)
-//   original  : std::tuple<sentient::ForOp, IndexTy, IndexTy, const EvaluatedValue *> LoopingChainMutableAddrDescriptor:: getOutermostConstInitAndLoopingChainIncrement(BlockArgument iter_arg)
-
 // crustify:todo: e282_LoopingChainMutableAddrDescriptor
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3081  (27 body lines, level 1)
 //   original  : LoopingChainMutableAddrDescriptor::LoopingChainMutableAddrDescriptor( ExpressionEvaluator &evaluator, Value base_addr, Operation &op, int mutable_addr_result_idx) : DynamicPatternDescriptorBase(PatternKind::kLoopingChainMutableAddr, evaluator), is_head_of_chain_(false), op_(op), mutable_addr_result_
@@ -93,16 +88,19 @@
 //   original  : void LoopingChainMutableAddrDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified
 
-
-use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, operands, regions_ref, sentient, use_count,
+};
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, ScalarOffset};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
-/// HOW LONG A LOOPING CHAIN IS — `unsigned size_`, where `isValid()` requires `>= 1` (`:559`).
+/// HOW LONG A LOOPING CHAIN IS — `unsigned size_`, where `isValid()` requires `>= 1` (`:562-564`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChainSize(pub u32);
 
 /// THE HEAD OF A LOOPING CHAIN OF MEMORY OPS — `class LoopingChainMutableAddrDescriptor`
-/// (`AddressPinningAndToggle.cpp:530-628`). Applies to a MUTABLE address only, and carries the
+/// (`AddressPinningAndToggle.cpp:544-629`). Applies to a MUTABLE address only, and carries the
 /// chain's total increment so the rest of the chain's transfers can be ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LoopingChainMutableAddrDescriptor {
@@ -118,4 +116,561 @@ pub struct LoopingChainMutableAddrDescriptor {
     pub init: Option<EvaluatedValue>,
     /// `increment_` — the chain's total increment.
     pub increment: Option<EvaluatedValue>,
+}
+
+/// WHICH END OF A TRANSFER A DESCRIPTOR IS ABOUT — `int mutable_addr_result_idx_` (`:613`), which
+/// `getMutableAndImmutableAddr` requires to be 0 or 1 (`Analyses/Utils.cpp:577-578`) and
+/// `getIncrementVal` reads as `target_mem_unit_is_src` (`SentientOps.cpp:2073`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferEnd {
+    /// `result_idx == 0` — the source half, and the only index a one-result memory op has.
+    Src,
+    /// `result_idx == 1` — the destination half of a `sentient.load_and_store`.
+    Dst,
+}
+
+/// WHAT THE CHAIN WALK ANSWERS — the reference's `tuple<ForOp, IndexTy, IndexTy,
+/// const EvaluatedValue *>` (`:596-597`).
+///
+/// ⛔ WHOLE-`None` IS ITS `{nullptr, -1, -1, nullptr}`; `iter_arg_index: None` is the walk that
+/// reached a loop but no constant initialiser, which the caller invalidates on (`:3100`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutermostConstInitAndChainIncrement {
+    /// The outermost loop the walk reached, named by its induction variable.
+    pub outer_loop: ForRef,
+    /// Which iter arg of it a constant initialises.
+    pub iter_arg_index: Option<IterArgIndex>,
+    /// The unrolled size of the looping chain.
+    pub size: ChainSize,
+    /// The chain's total increment.
+    pub increment: EvaluatedValue,
+}
+
+impl LoopingChainMutableAddrDescriptor {
+    /// Replaces: e018_getOutermostConstInitAndLoopingChainIncrement
+    ///
+    /// Walks the iter-arg chain inner to outer, taking each level's stride from either a
+    /// `sentient.scalar_add` or a chain of memory ops' increments, and folds it into
+    /// `(increment + stride) * bound` (`:3134-3303`).
+    ///
+    /// ⛔ A NEGATIVE STRIDE IS REFUSED, NOT NEGATED (`:3260`), and so is a non-constant or
+    /// non-positive bound — every refusal is the reference's all-null tuple.
+    /// ⛔ THE TAIL WALK IS SKIPPED WHEN NO CONSTANT INIT WAS FOUND: `outer_loop.getResult(-1)`
+    /// (`:3282`) reads out of range in the reference, and the caller invalidates on that index.
+    #[must_use]
+    pub fn outermost_const_init_and_looping_chain_increment(
+        iter_arg: Val,
+        end: TransferEnd,
+        scope: &[Op],
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> Option<OutermostConstInitAndChainIncrement> {
+        let mut iter_arg_index: Option<IterArgIndex> = None;
+        let mut curr: Option<Val> = Some(iter_arg);
+        let mut outer_loop: Option<&Op> = None;
+        let mut prev: Option<(&Op, usize)> = None;
+        let mut increment = evaluator.constant(0);
+        let mut size: u32 = 0;
+
+        // `while (iter_arg_index < 0 && cur_iter_arg)` (`:3166`)
+        while iter_arg_index.is_none() {
+            let Some(curr_arg) = curr else { break };
+            let (for_op, arg_number) = defs.for_arg_of(curr_arg)?;
+            let curr_it_index = arg_number.checked_sub(1)?;
+            outer_loop = Some(for_op);
+            let Op::Sentient(sentient::Op::For {
+                bound,
+                carried,
+                body,
+                ..
+            }) = for_op
+            else {
+                return None;
+            };
+            let Some(Op::Sentient(sentient::Op::ScalarConstant {
+                value: bound_value, ..
+            })) = defs.of(*bound)
+            else {
+                return None;
+            };
+            if *bound_value <= 0 {
+                return None;
+            }
+
+            let Some(Op::Sentient(sentient::Op::Yield { results: yielded })) = body.last() else {
+                todo!(
+                    "getOutermostConstInitAndLoopingChainIncrement: DT_CHECK_MSG(yield, \
+                     \"expected terminator of loop body to be a yield\") (:3193)"
+                )
+            };
+            let yield_opnd = *yielded.get(curr_it_index)?;
+
+            // The stride comes from EITHER a `scalar_add` whose left summand is the previous
+            // loop's result, OR a chain of memory ops walked back to `cur_iter_arg` (`:3189-3252`).
+            // ⭐ `LoadAndExtractScalarOp` IS DELIBERATELY ABSENT — the reference's own note at
+            // `:3196` is "not supported outside LX".
+            let stride = match defs.of(yield_opnd) {
+                Some(Op::Sentient(sentient::Op::ScalarAdd { lhs, rhs, .. })) => {
+                    let (prev_loop, prev_it_index) = prev?;
+                    if carried_result(prev_loop, prev_it_index) != Some(*lhs)
+                        || !is_constant(*rhs, ConstKind::ScalarConstant, defs)
+                    {
+                        return None;
+                    }
+                    evaluator.evaluate_value_handle(*rhs)
+                }
+                Some(
+                    tail @ Op::Sentient(
+                        sentient::Op::LoadAndSend { .. }
+                        | sentient::Op::ReceiveAndStore { .. }
+                        | sentient::Op::LoadAndStore { .. },
+                    ),
+                ) => {
+                    let mut cur_op = tail;
+                    let mut stride = evaluator.constant(0);
+                    loop {
+                        size = size.saturating_add(1);
+                        let mutable_addr = mutable_addr_of(cur_op, end);
+                        let incr_field = increment_val(cur_op, end, defs);
+                        let incr_ev = evaluator.constant(incr_field);
+                        stride = evaluator.evaluate_sum_handle(stride, incr_ev);
+                        if mutable_addr == curr_arg {
+                            break;
+                        }
+                        match defs.of(mutable_addr) {
+                            Some(
+                                next @ Op::Sentient(
+                                    sentient::Op::LoadAndSend { .. }
+                                    | sentient::Op::ReceiveAndStore { .. }
+                                    | sentient::Op::LoadAndStore { .. },
+                                ),
+                            ) => cur_op = next,
+                            _ if prev.is_some_and(|(prev_loop, prev_it_index)| {
+                                carried_result(prev_loop, prev_it_index) == Some(mutable_addr)
+                            }) =>
+                            {
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                    stride
+                }
+                // `if (!match_found)` — a block argument, a non-memory op, or nothing (`:3253`).
+                _ => return None,
+            };
+
+            if evaluator.is_any_val_less_than(stride, ScalarOffset(0)) {
+                return None;
+            }
+            // `increment = (increment + stride) * bound; size *= bound;` (`:3267-3270`) — ⛔ the
+            // reference's `unsigned size` WRAPS here; saturation cannot make a chain look shorter.
+            let sum = evaluator.evaluate_sum_handle(increment, stride);
+            increment = evaluator.evaluate_multiply_by_const(sum, *bound_value);
+            size = size.saturating_mul(u32::try_from(*bound_value).unwrap_or(u32::MAX));
+
+            let curr_init = carried.get(curr_it_index)?.init;
+            if defs.for_arg_of(curr_init).is_some() {
+                curr = Some(curr_init);
+                prev = Some((for_op, curr_it_index));
+            } else {
+                if is_constant(curr_init, ConstKind::ScalarConstant, defs) {
+                    iter_arg_index = u32::try_from(curr_it_index).ok().map(IterArgIndex);
+                }
+                curr = None;
+            }
+        }
+
+        let outer_loop = outer_loop?;
+        // `if (outer_loop_result.hasOneUse())` and the walk over the chain's tail (`:3281-3300`).
+        if let Some(index) = iter_arg_index {
+            let result = carried_result(outer_loop, index.0 as usize)?;
+            if use_count(result, scope) == 1 {
+                let mut cur = first_user(result, scope);
+                while let Some(
+                    cur_op @ Op::Sentient(
+                        sentient::Op::LoadAndSend { .. }
+                        | sentient::Op::ReceiveAndStore { .. }
+                        | sentient::Op::LoadAndStore { .. },
+                    ),
+                ) = cur
+                {
+                    let incr_field = increment_val(cur_op, end, defs);
+                    let incr_ev = evaluator.constant(incr_field);
+                    increment = evaluator.evaluate_sum_handle(increment, incr_ev);
+                    let cur_result = mutable_result(cur_op, end)?;
+                    match use_count(cur_result, scope) {
+                        0 => break,
+                        1 => cur = first_user(cur_result, scope),
+                        uses => todo!(
+                            "getOutermostConstInitAndLoopingChainIncrement: \
+                             DT_CHECK_MSG(cur_result.hasOneUse(), \"Expect at most one use of a \
+                             memory op result in the chain.\") — {uses} uses (:3295-3297)"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let Op::Sentient(sentient::Op::For { iv, .. }) = outer_loop else {
+            return None;
+        };
+        Some(OutermostConstInitAndChainIncrement {
+            outer_loop: ForRef(*iv),
+            iter_arg_index,
+            size: ChainSize(size),
+            increment,
+        })
+    }
+}
+
+/// `loop.getResult(index)` for a `sentient.for` — the result bound to carried value `index`.
+fn carried_result(loop_op: &Op, index: usize) -> Option<Val> {
+    let Op::Sentient(sentient::Op::For { carried, .. }) = loop_op else {
+        return None;
+    };
+    Some(carried.get(index)?.result)
+}
+
+/// The MUTABLE half of `dcc::utils::getMutableAndImmutableAddr(op, result_idx)`
+/// (`Analyses/Utils.cpp:569-605`); e018 `std::ignore`s the immutable half (`:3219-3221`).
+///
+/// ⛔ THE REFERENCE'S `LoadAndExtractScalarOp` ARM DEREFERENCES THE FAILED `dyn_cast`
+/// (`Analyses/Utils.cpp:590`, `receive_and_store.getMutableAddr()`); e018's own `isa` filter
+/// (`:3207-3208`, `:3232-3234`) never reaches it, so only the three ops it admits are written here.
+fn mutable_addr_of(op: &Op, end: TransferEnd) -> Val {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { mutable_addr, .. }
+            | sentient::Op::ReceiveAndStore { mutable_addr, .. },
+        ) => *mutable_addr,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_mutable_addr,
+            dst_mutable_addr,
+            ..
+        }) => match end {
+            TransferEnd::Src => *src_mutable_addr,
+            TransferEnd::Dst => *dst_mutable_addr,
+        },
+        _ => todo!(
+            "getMutableAndImmutableAddr: DT_CHECK(isa<LoadAndSendOp, ReceiveAndStoreOp, \
+             LoadAndStoreOp, LoadAndExtractScalarOp, LoadComputeAndSendOp>(op)) on {op:?} \
+             (Analyses/Utils.cpp:571-576)"
+        ),
+    }
+}
+
+/// `sentient::getIncrementVal(op, target_mem_unit_is_src)` (`SentientOps.cpp:2065-2101`) for the
+/// three ops a looping chain admits. Both stops are the reference's own aborts: its `cast` to
+/// `ConstantOp` (`:2067`) and its trailing `DT_ERROR` (`:2099`).
+fn increment_val(op: &Op, end: TransferEnd, defs: Definitions<'_>) -> i64 {
+    let increment = match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { increment, .. }
+            | sentient::Op::ReceiveAndStore { increment, .. },
+        ) => *increment,
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src_inc, dst_inc, ..
+        }) => match end {
+            TransferEnd::Src => *src_inc,
+            TransferEnd::Dst => *dst_inc,
+        },
+        _ => todo!(
+            "getIncrementVal: DT_ERROR(\"operation does not have an increment value!\") on {op:?} \
+             (SentientOps.cpp:2099)"
+        ),
+    };
+    match defs.of(increment) {
+        Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => *value,
+        _ => todo!(
+            "getIncrementVal: cast<sentient::ConstantOp>({increment:?}.getDefiningOp()) \
+             (SentientOps.cpp:2067)"
+        ),
+    }
+}
+
+/// `op->getResult(mutable_addr_result_idx_)` (`:3293`) — ⛔ `None` for the second result of a
+/// one-result memory op, which the reference reads out of range.
+fn mutable_result(op: &Op, end: TransferEnd) -> Option<Val> {
+    match op {
+        Op::Sentient(
+            sentient::Op::LoadAndSend { result, .. } | sentient::Op::ReceiveAndStore { result, .. },
+        ) => matches!(end, TransferEnd::Src).then_some(*result),
+        Op::Sentient(sentient::Op::LoadAndStore { results, .. }) => Some(match end {
+            TransferEnd::Src => results.0,
+            TransferEnd::Dst => results.1,
+        }),
+        _ => None,
+    }
+}
+
+/// `*val.user_begin()` — the op that reads `val`, searched through nested regions. ⭐ ONLY CALLED
+/// WHERE THE USE COUNT IS ONE, so the reference's unordered use list cannot disagree with this order.
+fn first_user(val: Val, scope: &[Op]) -> Option<&Op> {
+    for op in scope {
+        if operands(op).contains(&val) {
+            return Some(op);
+        }
+        for region in regions_ref(op) {
+            if let Some(user) = first_user(val, region) {
+                return Some(user);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
+    use crate::transform::sentient::analyses::{Evaluation, MinMax, OffsetSites};
+
+    /// The handle flavour with its answers stated as INTEGERS: one entry per interned value, so the
+    /// chain's `(increment + stride) * bound` is observable.
+    #[derive(Default)]
+    struct StatedEvaluator {
+        held: Vec<i64>,
+        constants: Vec<(Val, i64)>,
+    }
+
+    impl StatedEvaluator {
+        fn intern(&mut self, value: i64) -> EvaluatedValue {
+            let index = self
+                .held
+                .iter()
+                .position(|held| *held == value)
+                .unwrap_or_else(|| {
+                    self.held.push(value);
+                    self.held.len() - 1
+                });
+            EvaluatedValue(u32::try_from(index).unwrap_or_default())
+        }
+
+        fn value(&self, ev: EvaluatedValue) -> i64 {
+            self.held
+                .get(usize::try_from(ev.0).unwrap_or_default())
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e018 asks for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e018 asks for handles, never for a decoded evaluation")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e018 builds no value")
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            let held = self
+                .constants
+                .iter()
+                .find(|(val, _)| *val == value)
+                .map(|(_, held)| *held);
+            match held {
+                Some(held) => self.intern(held),
+                None => todo!("the fixture states no constant for {value:?}"),
+            }
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            self.intern(value)
+        }
+
+        fn evaluate_sum_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let sum = self.value(lhs) + self.value(rhs);
+            self.intern(sum)
+        }
+
+        fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {
+            let product = self.value(ev) * by;
+            self.intern(product)
+        }
+
+        fn evaluate_min_max(&mut self, values: &[EvaluatedValue], which: MinMax) -> EvaluatedValue {
+            let mut held: Vec<i64> = values.iter().map(|ev| self.value(*ev)).collect();
+            held.sort_unstable();
+            let picked = match which {
+                MinMax::Min => held.first().copied(),
+                MinMax::Max => held.last().copied(),
+            };
+            self.intern(picked.unwrap_or_default())
+        }
+
+        fn is_any_val_less_than(&mut self, ev: EvaluatedValue, bound: ScalarOffset) -> bool {
+            self.value(ev) < bound.0
+        }
+    }
+
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn carried(init: Val, arg: Val, result: Val) -> Carried {
+        Carried {
+            init,
+            arg,
+            result,
+            reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    fn load_and_store(src_mutable_addr: Val, src_inc: Val, results: (Val, Val)) -> Op {
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src: Val(90),
+            dst: Val(91),
+            src_mutable_addr,
+            src_immutable_addr: Val(92),
+            src_inc,
+            dst_mutable_addr: Val(94),
+            dst_immutable_addr: Val(95),
+            dst_inc: Val(5),
+            multicast_info: None,
+            results,
+            extent: Extent::of(Elements(8), Bits(16)),
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            src_reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dst_reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        })
+    }
+
+    /// The reference's own example (`:536-542`) with the tail of `:3153` attached: an inner loop whose
+    /// transfer advances its own address by 2, an outer `scalar_add` of 5, and one more transfer
+    /// outside the nest advancing by 7. `inner_bound` is the inner loop's trip count.
+    fn looping_chain(inner_bound: Val) -> Vec<Op> {
+        let inner = Op::Sentient(sentient::Op::For {
+            iv: Val(20),
+            bound: inner_bound,
+            carried: vec![carried(Val(11), Val(21), Val(22))],
+            dbg_name: None,
+            body: vec![
+                load_and_store(Val(21), Val(5), (Val(30), Val(31))),
+                Op::Sentient(sentient::Op::Yield {
+                    results: vec![Val(30)],
+                }),
+            ],
+        });
+        vec![
+            constant(3, Val(1)),
+            constant(4, Val(2)),
+            constant(0, Val(3)),
+            constant(5, Val(4)),
+            constant(2, Val(5)),
+            constant(7, Val(6)),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(10),
+                bound: Val(1),
+                carried: vec![carried(Val(3), Val(11), Val(12))],
+                dbg_name: None,
+                body: vec![
+                    inner,
+                    Op::Sentient(sentient::Op::ScalarAdd {
+                        lhs: Val(22),
+                        rhs: Val(4),
+                        result: Val(13),
+                        reg: Some(Reg {
+                            locale: RegType::Lar,
+                            index: None,
+                        }),
+                        element_size: None,
+                        ty: ScalarTy::Index,
+                    }),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(13)],
+                    }),
+                ],
+            }),
+            load_and_store(Val(12), Val(6), (Val(40), Val(41))),
+        ]
+    }
+
+    /// `(0 + 2) * 4 = 8` inside, `(8 + 5) * 3 = 39` outside, `+7` for the tail — and the size is the
+    /// one memory op unrolled by both bounds, `1 * 4 * 3`.
+    #[test]
+    fn e018_folds_each_level_then_the_chain_tail_into_the_total_increment() {
+        let body = looping_chain(Val(2));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(4), 5)],
+        };
+        let found =
+            LoopingChainMutableAddrDescriptor::outermost_const_init_and_looping_chain_increment(
+                Val(21),
+                TransferEnd::Src,
+                &body,
+                defs,
+                &mut evaluator,
+            );
+        let found = found.expect("the chain resolves to the outer loop's constant init");
+        assert_eq!(found.outer_loop, ForRef(Val(10)));
+        assert_eq!(found.iter_arg_index, Some(IterArgIndex(0)));
+        assert_eq!(found.size, ChainSize(12));
+        assert_eq!(evaluator.value(found.increment), 46);
+    }
+
+    /// A non-constant bound anywhere in the nest is the reference's all-null tuple (`:3186`). ⭐ THE
+    /// DOUBLE IS STILL NEEDED: `getConstant(0)` (`:3161`) precedes the walk, so a refusal is not the
+    /// absence of every analysis call.
+    #[test]
+    fn e018_refuses_a_non_constant_bound() {
+        let body = looping_chain(Val(99));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = StatedEvaluator::default();
+        let found =
+            LoopingChainMutableAddrDescriptor::outermost_const_init_and_looping_chain_increment(
+                Val(21),
+                TransferEnd::Src,
+                &body,
+                defs,
+                &mut evaluator,
+            );
+        assert_eq!(found, None);
+    }
 }

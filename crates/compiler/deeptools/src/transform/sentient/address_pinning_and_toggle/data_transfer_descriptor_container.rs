@@ -78,7 +78,6 @@
 //! | `e423_lookup` | 423 | 2 | 11 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2179` |
 //! | `e491_computeChainingInfo` | 491 | 3 | 120 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2192` |
 
-
 // crustify:todo: e422_insert
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2169  (9 body lines, level 2)
 //   original  : void DataTransferDescriptorContainer::insert(DataTransferDescriptor *desc)
@@ -94,7 +93,6 @@
 //   original  : void DataTransferDescriptorContainer::computeChainingInfo()
 //   calls     : e007_isPartOfSomeChain, e008_setChainingInfo, e252_size, e273_isHeadOfChain, e278_isValid, e417_isHeadOfLoopingChain, e423_lookup
 
-
 use std::collections::BTreeMap;
 
 use super::DataTransferDescriptor;
@@ -102,13 +100,13 @@ use super::DataTransferDescriptor;
 /// WHICH DESCRIPTOR — a position in [`DataTransferDescriptorContainer::descriptors`].
 ///
 /// ⛔ THE REFERENCE KEYS ON THE ADDRESS OF THE DESCRIPTOR (`std::map<const DataTransferDescriptor *,
-/// unsigned char> chaining_info_`, `:955`). A pointer key is not portable to Rust while the
+/// unsigned char> chaining_info_`, `:957`). A pointer key is not portable to Rust while the
 /// container owns the same objects, and the index is stable because the container only ever grows by
-/// `insert` and is cleared wholesale by `clear_all` (`:888`).
+/// `insert` and is cleared wholesale by `clear_all` (`:886`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DescriptorId(pub u32);
 
-/// ONE CHAINING BIT — `enum Flags : unsigned char` (`:944-948`), the argument
+/// ONE CHAINING BIT — `enum Flags : unsigned char` (`:939-943`), the argument
 /// [`DataTransferDescriptorContainer::set_chaining_info`] takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChainFlag {
@@ -123,7 +121,7 @@ pub enum ChainFlag {
 /// WHAT `chaining_info_` HOLDS FOR ONE DESCRIPTOR — the three `Flags` bits, named.
 ///
 /// ⛔ AN ABSENT ENTRY IS NOT `Default`: `setChainingInfo(desc, flag, false)` on a descriptor with no
-/// entry inserts NOTHING (`:949-958`), so [`DataTransferDescriptorContainer::chaining_info`] must
+/// entry inserts NOTHING (`:945-955`), so [`DataTransferDescriptorContainer::chaining_info`] must
 /// keep "no entry" distinct from "all three clear".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChainFlags {
@@ -157,15 +155,15 @@ impl ChainFlags {
 }
 
 /// THE PASS'S DESCRIPTORS FOR ONE ADDRESS ROLE — `class DataTransferDescriptorContainer`
-/// (`AddressPinningAndToggle.cpp:872-956`): stable syntactic-order iteration plus the chaining
+/// (`AddressPinningAndToggle.cpp:872-958`): stable syntactic-order iteration plus the chaining
 /// relationships between its elements.
 ///
 /// ⭐ IT OWNS THEM. The reference is a `std::vector<DataTransferDescriptor *>` whose `clear_all`
-/// does not delete, because the pass's `cleanup()` (`:1657-1663`) deletes every element and then
+/// does not delete, because the pass's `cleanup()` (`:1656-1664`) deletes every element and then
 /// clears — so each descriptor is reached, and freed, through exactly one container. Owning `Vec` is
 /// that, minus the delete loop.
 ///
-/// ⛔ NO `sorted_list_`: it is a lookup memoisation (`:934`), which the campaign lets a port drop —
+/// ⛔ NO `sorted_list_`: it is a lookup memoisation (`:937`), which the campaign lets a port drop —
 /// `lookup` (`e423`) is scheduled separately and owns that decision.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataTransferDescriptorContainer {

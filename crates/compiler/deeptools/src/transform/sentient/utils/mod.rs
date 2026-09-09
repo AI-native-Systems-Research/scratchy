@@ -441,7 +441,7 @@ fn insert_at(unit_body: &mut Vec<Op>, at: &OpAt, op: Op) {
 /// WHICH OP `isConstant<ConstTy>` IS INSTANTIATED FOR (`dcc/src/Utils/Utils.cpp:444-446`); the
 /// `arith::ConstantOp` instantiation has no reader in this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConstKind {
+pub(crate) enum ConstKind {
     /// `mlir::sentient::ConstantOp`.
     ScalarConstant,
     /// `mlir::symbol::CreateSymbolOp`.
@@ -450,7 +450,7 @@ enum ConstKind {
 
 impl ConstKind {
     /// `isa<ConstTy>(op)`.
-    fn matches(self, op: &Op) -> bool {
+    pub(crate) fn matches(self, op: &Op) -> bool {
         match self {
             ConstKind::ScalarConstant => {
                 matches!(op, Op::Sentient(sentient::Op::ScalarConstant { .. }))
@@ -462,7 +462,7 @@ impl ConstKind {
 
 /// `isConstant<ConstTy>` (`dcc/src/Utils/Utils.cpp:423-442`) — the op itself, or a
 /// `uniform.query_map` every value of whose immutable mapping is one.
-fn is_constant(val: Val, kind: ConstKind, defs: Definitions<'_>) -> bool {
+pub(crate) fn is_constant(val: Val, kind: ConstKind, defs: Definitions<'_>) -> bool {
     let Some(def) = defs.of(val) else {
         return false;
     };

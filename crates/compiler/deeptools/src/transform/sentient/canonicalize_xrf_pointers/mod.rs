@@ -232,7 +232,7 @@ fn plan_one_mac<A: Arch>(op: &mut sentient::Op, values: &mut Values, plan: &mut 
         let &[wt_result, rd_result] = &results[..] else {
             todo!(
                 "replaceXRFImplicitIncrWithAdd: DT_CHECK(getNumResults() == 2) on an xrf-related \
-                 mac binding {} (CanonicalizeXRFPointers.cpp:81)",
+                 mac binding {} (CanonicalizeXRFPointers.cpp:83)",
                 results.len()
             )
         };
@@ -298,7 +298,7 @@ fn plan_xrf_incr_adds<A: Arch>(body: &mut [Op], values: &mut Values, plan: &mut 
 /// factor; read: `getXrfRdPtrIncrValAfterMAC`) gains an explicit `sentient.scalar_add` of the
 /// difference, and the mac's own attribute is reset to the implied value.
 /// ⛔ THE CONSTANTS GO TO THE PROGRAM PREAMBLE: `const_builder` is anchored on `unit_op` itself and
-/// only the adds' builder follows the mac (`CanonicalizeXRFPointers.cpp:79-89`). The body ends
+/// only the adds' builder follows the mac (`CanonicalizeXRFPointers.cpp:80-87`). The body ends
 /// `[mac, add_rd, add_wt]` — both adds insert immediately after the mac, and write is planned first.
 pub fn replace_xrf_implicit_incr_with_add<A: Arch>(
     preamble: &mut Vec<Op>,
@@ -343,7 +343,7 @@ pub struct XrfMinExpr {
 /// Each xrf-related `sentient.scalar_add` with a unit-independent constant expression is replaced by
 /// a `sentient.scalar_constant` in the add's OWN block, and the adds are erased only after every
 /// rewire — an op destroyed while still used is MLIR's own abort, not a diagnostic.
-/// ⛔ ITER ARGS ARE SKIPPED EVEN WHEN CONSTANT (`CanonicalizeXRFPointers.cpp:143-147`), or
+/// ⛔ ITER ARGS ARE SKIPPED EVEN WHEN CONSTANT (`CanonicalizeXRFPointers.cpp:145-149`), or
 /// RegisterTypeAssignment answers them with a copy op inside the loop. A block argument has no
 /// defining op, so the reference's two skip tests collapse into this island's one lookup.
 pub fn replace_const_xrf_expressions<A: Arch>(
@@ -360,12 +360,12 @@ pub fn replace_const_xrf_expressions<A: Arch>(
         };
         let (locale, ty) = (reg.map(|reg| reg.locale), *ty);
         // `DT_CHECK(is_any_of(getValueRegLocale(val), xrfrdptr, xrfwrptr))` — for an add that is the
-        // add's own `regLocale` (`SentientOps.cpp:1806-1807`), `unknown` when it has none.
+        // add's own `regLocale` (`SentientOps.cpp:1805-1806`), `unknown` when it has none.
         match locale {
             Some(sentient::RegType::XrfRdPtr | sentient::RegType::XrfWrPtr) => {}
             other => todo!(
                 "replaceConstXRFExpressions: DT_CHECK(is_any_of(locale, xrfrdptr, xrfwrptr)) on a \
-                 scalar_add whose regLocale is {other:?} (CanonicalizeXRFPointers.cpp:154-155)"
+                 scalar_add whose regLocale is {other:?} (CanonicalizeXRFPointers.cpp:152-153)"
             ),
         }
         let Some(value) = entry.constant else {

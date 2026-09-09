@@ -141,7 +141,7 @@ pub struct PrecisionAssignments {
     /// `assignments_` — per op, one slot per value it binds, `None` for the reference's `-1`.
     assignments: BTreeMap<OpId, Vec<Option<Bits>>>,
     /// `cached_copies_` — *"given a copy_op and an element_size map it to a cloned copy for that
-    /// element_size"* (`AddressRegisterPrecisionAssignment.cpp:64-65`), keyed by the ORIGINAL copy's
+    /// element_size"* (`AddressRegisterPrecisionAssignment.cpp:65-66`), keyed by the ORIGINAL copy's
     /// result.
     cached_copies: BTreeMap<Val, BTreeMap<Bits, Val>>,
 }
@@ -152,7 +152,7 @@ impl PrecisionAssignments {
     /// One unassigned slot per value `op` binds.
     /// ⛔ A `sentient.for`'S VECTOR IS `1 + carried.len()` LONGER THAN ITS RESULT COUNT, laid out
     /// `[iv, iter_args…, results…]`: entry 283 reads an iter arg at `i + 1` and a result at
-    /// `i + offset` with `offset = 1 + getNumRegionIterArgs()` (`:169-195`), so slot 0 is the
+    /// `i + offset` with `offset = 1 + getNumRegionIterArgs()` (`:173-190`), so slot 0 is the
     /// induction variable's. ⛔ AND IT APPENDS, exactly as `assignments_[op]` followed by
     /// `push_back` does — the reference initialises each op once, off one preorder walk.
     pub fn initialize_precision(&mut self, at: OpId, op: &Op) {
@@ -170,11 +170,11 @@ impl PrecisionAssignments {
     ///
     /// Writes `element_size` into `at`'s `index`th slot, and where the slot already holds a
     /// different size clones the `scalar_copy` of a constant behind it so both sizes can coexist.
-    /// ⛔ `uniform.equalize_pattern`, THE SIXTH MEMBER OF THE SKIP LIST (`:107-111`), HAS NO FORM AT
+    /// ⛔ `uniform.equalize_pattern`, THE SIXTH MEMBER OF THE SKIP LIST (`:102-104`), HAS NO FORM AT
     /// THIS RUNG — `uniform::Op` declares four ops and nothing in this compiler emits it, so an op
     /// this list would skip cannot be built. The other five are matched below.
     /// ⛔ THE CLONE GOES BEFORE THE **USER**, not before the copy: `OpBuilder builder(user)` is
-    /// anchored on the op that asked, which is what keeps the clone in scope for it (`:118`).
+    /// anchored on the op that asked, which is what keeps the clone in scope for it (`:117`).
     pub fn assign_precision_helper(
         &mut self,
         body: &mut Vec<Op>,
@@ -187,7 +187,7 @@ impl PrecisionAssignments {
         let Some(op) = op_at(at, body) else {
             todo!(
                 "assignPrecisionHelper: `assignments_.at(op)` on an op absent from this unit body \
-                 ({at:?}) (AddressRegisterPrecisionAssignment.cpp:113)"
+                 ({at:?}) (AddressRegisterPrecisionAssignment.cpp:107)"
             )
         };
         // `isa<ConstantOp, ReceiveAndExtractScalarOp, DefImmutableMappingOp, QueryMapOp,
@@ -226,13 +226,13 @@ impl PrecisionAssignments {
         let Some(slots) = self.assignments.get_mut(at) else {
             todo!(
                 "assignPrecisionHelper: `assignments_.at(op)` on an op initializePrecision never saw \
-                 ({at:?}) (AddressRegisterPrecisionAssignment.cpp:474)"
+                 ({at:?}) (AddressRegisterPrecisionAssignment.cpp:479-480)"
             )
         };
         let Some(slot) = slots.get_mut(index) else {
             todo!(
                 "assignPrecisionHelper: slot {index} past the {} initializePrecision gave {at:?} \
-                 (AddressRegisterPrecisionAssignment.cpp:113)",
+                 (AddressRegisterPrecisionAssignment.cpp:107)",
                 slots.len()
             )
         };
@@ -250,7 +250,7 @@ impl PrecisionAssignments {
             && copies_a_constant
         {
             // ⭐ AN LBR COPY IS COMMONED WHATEVER THE FLAG SAYS: it has to be promoted to the program
-            // header anyway, so hoisting it does not lengthen its live range (`:121-124`).
+            // header anyway, so hoisting it does not lengthen its live range (`:120-122`).
             if (DO_CONST_COMMONING || reg.locale == sentient::RegType::Lbr)
                 && let Some(cached) = self
                     .cached_copies
@@ -270,14 +270,14 @@ impl PrecisionAssignments {
                 result: clone_result,
                 reg,
                 // `builder.clone` COPIES THE DICTIONARY; the map entry below is what the flush
-                // (`:540-547`) later overwrites it with.
+                // (`:535-547`) later overwrites it with.
                 element_size: copy_element_size,
                 program_header,
             });
             if insert_at(body, user.path(), clone).is_some() {
                 todo!(
                     "assignPrecisionHelper: `OpBuilder builder(user)` on a user absent from this \
-                     unit body ({user:?}) (AddressRegisterPrecisionAssignment.cpp:118)"
+                     unit body ({user:?}) (AddressRegisterPrecisionAssignment.cpp:117)"
                 )
             }
             self.shift_keys_at_or_after(user.path());
