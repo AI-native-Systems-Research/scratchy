@@ -366,6 +366,8 @@ pub(super) fn vector_type_of(op: &DfirOp) -> Option<Vector> {
             dfir_op::dataflow::Op::GetUnit { .. }
             | dfir_op::dataflow::Op::GetLocalUnit { .. }
             | dfir_op::dataflow::Op::CreateGroup { .. }
+            // `create_multicast_group` binds `Index:$result` (`Dataflow.td:181`), never a vector.
+            | dfir_op::dataflow::Op::CreateMulticastGroup { .. }
             | dfir_op::dataflow::Op::GetLogicalMemoryView { .. }
             | dfir_op::dataflow::Op::GetPagedLogicalMemoryView(_)
             | dfir_op::dataflow::Op::ProgramUnit { .. }

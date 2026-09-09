@@ -205,6 +205,20 @@ impl RecvEnd {
         self.0
     }
 
+    /// THE END A `dataflow.create_multicast_group` STATES — its `$producer`, *"the unit ID of the
+    /// producer of data"* (`Dataflow.td:163`).
+    ///
+    /// ⛔⛔ NOT EXPRESSIBLE AS A [`Link`], AND DELIBERATELY SO — the same case as
+    /// [`SendEnd::to_self`]. A multicast group is ONE producer driving many consumers, so the wire
+    /// this end belongs to has no single matching send to be paired with; the group op is the
+    /// pairing. `MulticastCanonicalization` writes exactly this end into a
+    /// `sentient.receive_and_store`'s `$producer` when it lifts the group into `$multicast_info`
+    /// (`dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:131-134`).
+    #[must_use]
+    pub const fn from_multicast_group(unit: Val) -> RecvEnd {
+        RecvEnd(unit)
+    }
+
     /// THE END'S VALUE, MUTABLY — for RENUMBERING ONLY. See [`SendEnd::val_mut`].
     pub(crate) const fn val_mut(&mut self) -> &mut Val {
         &mut self.0

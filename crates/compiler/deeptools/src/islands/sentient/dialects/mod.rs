@@ -675,6 +675,76 @@ pub fn parent_for_arg(val: Val, scope: &[Op]) -> Option<(&Op, usize)> {
     None
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// `sentient::IfOp`'s ONE CANONICALIZATION PATTERN
+//
+// ⛔⛔ AN ISLAND EXTENSION, AND NOT AN OPTIONAL ONE. `IfOp::getCanonicalizationPatterns` adds
+// `RemoveStaticCondition` and nothing else (`dcc/src/Dialect/Sentient/SentientOps.cpp:1509-1512`),
+// and campaign unit `e096_simplifyConditionals` IS a run of that pattern
+// (`MultiDimLoopPeeling.cpp:529-541`). The pattern lives in `Dialect/Sentient/`, which is outside the
+// campaign's `Transform/Sentient/` file scope but is NOT one of the out-of-scope `Analyses/`
+// directories — so `todo!` would not be a faithful stand-in, it would make e096 and both of its
+// callers (`copyOneIter`, `performLoopPeeling`) panic on every peeled loop. Region-level rewrites are
+// this module's job, beside [`replace_all_uses_with`] and [`erase_defining_op`].
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT `RemoveStaticCondition` KNOWS ABOUT ONE OPERAND OF A `sentient.if`
+/// (`dcc/src/Dialect/Sentient/SentientOps.cpp:1370-1427`).
+///
+/// ⛔ THE THREE SHAPES ARE THE PATTERN'S OWN `dyn_cast` CHAINS, not a classification of values in
+/// general: a `sentient.scalar_constant`, a `sentient.for`'s induction variable, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticOperand {
+    /// `dyn_cast<sentient::ConstantOp>(v.getDefiningOp())` succeeded, carrying this `$value`.
+    Constant(i64),
+    /// A `sentient.for`'s `$iv`, with the loop's `$bound` — `None` where that bound is not itself a
+    /// `sentient.scalar_constant`, which is the reference's innermost `dyn_cast` failing (`:1382`).
+    InductionVar(Option<i64>),
+    /// Neither shape: `findBranchesToDelete` returns false and `both_consts` stays unset.
+    Dynamic,
+}
+
+/// READ ONE `sentient.if` OPERAND AS A [`StaticOperand`].
+///
+/// ⛔ A REGION ARGUMENT HAS NO DEFINING OP, which is exactly how the pattern tells a loop iterator
+/// from a constant — `isa<BlockArgument>` guards every `getDefiningOp()` it calls. See
+/// [`defining_op`].
+#[must_use]
+pub fn static_operand(val: Val, scope: &[Op]) -> StaticOperand {
+    if let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) = defining_op(val, scope)
+    {
+        return StaticOperand::Constant(*value);
+    }
+    if let Some(bound) = loop_bound_of_iv(val, scope) {
+        return StaticOperand::InductionVar(match defining_op(bound, scope) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => Some(*value),
+            _ => None,
+        });
+    }
+    StaticOperand::Dynamic
+}
+
+/// The `$bound` of the `sentient.for` whose induction variable is `iv` —
+/// `cast<BlockArgument>(rhs).getOwner()->getParentOp()` narrowed by
+/// `for_op.getInductionVar() != rhs` (`SentientOps.cpp:1377-1381`).
+fn loop_bound_of_iv(iv: Val, scope: &[Op]) -> Option<Val> {
+    for op in scope {
+        if let Op::Sentient(sentient::Op::For {
+            iv: loop_iv, bound, ..
+        }) = op
+            && *loop_iv == iv
+        {
+            return Some(*bound);
+        }
+        for region in regions_ref(op) {
+            if let Some(bound) = loop_bound_of_iv(iv, region) {
+                return Some(bound);
+            }
+        }
+    }
+    None
+}
+
 /// THE ELEMENT WIDTH AN ADDRESS IS STEPPED BY — `dcc::sentient::utils::getElementSize`
 /// (`Dialect/Sentient/Utils.cpp:306`).
 ///
@@ -822,4 +892,210 @@ impl<'a> Definitions<'a> {
             .iter()
             .find_map(|region| parent_for_arg(val, region))
     }
+}
+
+/// THE REGIONS OF ONE OP OF THIS RUNG, BORROWED — the reading half of the pair
+/// [`regions_mut`] mutates through.
+///
+/// ⛔⛔ NOT [`regions`], AND THE DIFFERENCE IS LOAD-BEARING FOR A DECIDE-THEN-MUTATE WALK. `regions`
+/// answers OWNED and therefore total, descending into a shared dialect's region by cloning it through
+/// [`raised`]; nothing can be written back through that clone, so a walk that records a
+/// `(op index, region index)` path and later reopens it with [`regions_mut`] must enumerate regions
+/// the same way BOTH times — which is this function.
+///
+/// ⛔ EVERY REMAINING VARIANT'S REGIONS HOLD `dataflow_ir::dialects::Op`, PROVED BY THE TYPE. An
+/// `agen.composite_load_and_store` body is a `Vec` of the rung BELOW's ops — see
+/// [`agen::CompositeStoreSource`] — so it cannot contain a `sentient.*` op at all and there is
+/// nothing of this rung's type to hand back. The rung below answers for its own regions.
+#[must_use]
+pub fn regions_ref(op: &Op) -> Vec<&[Op]> {
+    match op {
+        Op::Sentient(inner) => sentient::regions(inner),
+        Op::AffineFor(loop_op) => vec![loop_op.body.as_slice()],
+        // ⛔ NO `_` ARM — a twelfth dialect reaching this rung must be a build error here, not a
+        // region tree every walk quietly stops at.
+        Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_) => Vec::new(),
+    }
+}
+
+/// THE REGIONS OF ONE OP OF THIS RUNG, MUTABLY — see [`regions_ref`].
+pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
+    match op {
+        Op::Sentient(inner) => sentient::regions_mut(inner),
+        Op::AffineFor(loop_op) => vec![&mut loop_op.body],
+        // ⛔ NO `_` ARM — see [`regions_ref`].
+        Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_) => Vec::new(),
+    }
+}
+
+/// WHICH BRANCH OF A `sentient.if` SURVIVES CANONICALISATION — `RemoveStaticCondition`'s three
+/// outcomes (`SentientOps.cpp:1487-1502`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticBranch {
+    /// `replaceOpWithRegion(rewriter, op, op.getThenRegion())`.
+    Then,
+    /// `replaceOpWithRegion(rewriter, op, op.getElseRegion())`.
+    Else,
+    /// `rewriter.eraseOp(op)` — reached only where the else region is EMPTY, which the entry gate has
+    /// already paired with "no results", so there is nothing left to rewire.
+    Neither,
+}
+
+/// `findBranchesToDelete`'s two out-parameters (`SentientOps.cpp:1370-1374`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DeadBranches {
+    then_branch: bool,
+    else_branch: bool,
+}
+
+/// `findBranchesToDelete` — `lhs` a constant compared against `rhs`, a loop iterator running over
+/// `[1, bound]` (`SentientOps.cpp:1370-1427`).
+///
+/// ⛔ IT RESETS BOTH FLAGS ON ENTRY (`:1375`), which is what makes the caller's second, reversed
+/// attempt safe to run over the first's leftovers.
+fn branches_to_delete(
+    predicate: sentient::CmpPredicate,
+    lhs: StaticOperand,
+    rhs: StaticOperand,
+    dead: &mut DeadBranches,
+) -> bool {
+    *dead = DeadBranches::default();
+    let (StaticOperand::Constant(l), StaticOperand::InductionVar(Some(bound))) = (lhs, rhs) else {
+        return false;
+    };
+    match predicate {
+        sentient::CmpPredicate::Eq => dead.then_branch = l > bound || l < 1,
+        sentient::CmpPredicate::Ne => dead.else_branch = l > bound || l < 1,
+        sentient::CmpPredicate::Sge => {
+            dead.else_branch = l >= bound;
+            dead.then_branch = l < 1;
+        }
+        sentient::CmpPredicate::Sgt => {
+            dead.else_branch = l > bound;
+            dead.then_branch = l <= 1;
+        }
+        sentient::CmpPredicate::Sle => {
+            dead.else_branch = l <= 1;
+            dead.then_branch = l > bound;
+        }
+        sentient::CmpPredicate::Slt => {
+            dead.else_branch = l < 1;
+            dead.then_branch = l >= bound;
+        }
+    }
+    dead.then_branch || dead.else_branch
+}
+
+/// `RemoveStaticCondition::matchAndRewrite`'s DECISION, with no rewriting
+/// (`SentientOps.cpp:1429-1506`).
+///
+/// ⛔⛔ `None` IS `failure()` — *"this `sentient.if` is not static"*, never an error. The pattern is
+/// a fold: a condition it cannot decide leaves the op exactly as it was.
+///
+/// ⛔ THE DECISION IS SPLIT FROM THE REWRITE because it reads the whole region tree — the constants
+/// and the enclosing loops' bounds — while the rewrite mutates one block of it. An MLIR `Value`
+/// carries its own owner and needs no such split.
+///
+/// ⭐ THE `else return failure()` ON AN UNRECOGNISED PREDICATE (`:1466`) IS UNWRITABLE HERE:
+/// [`sentient::CmpPredicate`] carries exactly the six the arms above it cover.
+#[must_use]
+pub fn static_if_branch(
+    predicate: sentient::CmpPredicate,
+    lhs: StaticOperand,
+    rhs: StaticOperand,
+    has_else: bool,
+    has_results: bool,
+) -> Option<StaticBranch> {
+    // `if (op->getNumResults() > 0 && op.getElseRegion().empty()) return failure();` (`:1434`).
+    if has_results && !has_else {
+        return None;
+    }
+    let mut both_consts = false;
+    let mut use_then_branch = false;
+    if let (StaticOperand::Constant(l), StaticOperand::Constant(r)) = (lhs, rhs) {
+        use_then_branch = match predicate {
+            sentient::CmpPredicate::Eq => l == r,
+            sentient::CmpPredicate::Ne => l != r,
+            sentient::CmpPredicate::Sle => l <= r,
+            sentient::CmpPredicate::Sge => l >= r,
+            sentient::CmpPredicate::Slt => l < r,
+            sentient::CmpPredicate::Sgt => l > r,
+        };
+        both_consts = true;
+    }
+    let mut dead = DeadBranches::default();
+    let mut cond_out_of_loop_bounds = false;
+    if !both_consts {
+        cond_out_of_loop_bounds = branches_to_delete(predicate, lhs, rhs, &mut dead);
+        // ⭐ THE SECOND ATTEMPT SWAPS THE OPERANDS **AND** REVERSES THE PREDICATE, so it is the same
+        // condition read the other way round (`:1483-1485`).
+        if !cond_out_of_loop_bounds {
+            cond_out_of_loop_bounds = branches_to_delete(predicate.reversed(), rhs, lhs, &mut dead);
+        }
+    }
+    if !both_consts && !cond_out_of_loop_bounds {
+        return None;
+    }
+    if use_then_branch || dead.else_branch {
+        return Some(StaticBranch::Then);
+    }
+    if has_else && (!use_then_branch || dead.then_branch) {
+        return Some(StaticBranch::Else);
+    }
+    Some(StaticBranch::Neither)
+}
+
+/// SPLICE ONE BRANCH OF THE `sentient.if` AT `at` INTO ITS OWN BLOCK — `replaceOpWithRegion`
+/// (`SentientOps.cpp:1354-1363`), and the `eraseOp` arm beside it for [`StaticBranch::Neither`].
+///
+/// ⛔⛔ IT RETURNS THE REWIRES RATHER THAN PERFORMING THEM. `rewriter.replaceOp(op, results)` moves
+/// every reader of the `sentient.if`'s results onto the surviving region's `sentient.yield` operands,
+/// and those readers are in the ENCLOSING scope — of which this holds `&mut` to one block. The caller
+/// feeds each pair to [`replace_all_uses_with`] over the whole scope.
+///
+/// ⛔ THE TERMINATOR IS DROPPED, NOT INLINED — `rewriter.eraseOp(terminator)` (`:1362`).
+pub fn replace_if_with_region(
+    block: &mut Vec<Op>,
+    at: usize,
+    branch: StaticBranch,
+) -> Vec<(Val, Val)> {
+    let mut produced: Vec<Val> = Vec::new();
+    let mut region: Vec<Op> = Vec::new();
+    if let Some(Op::Sentient(sentient::Op::If {
+        yielded,
+        then_body,
+        else_body,
+        ..
+    })) = block.get_mut(at)
+    {
+        produced = yielded.iter().map(|y| y.result).collect();
+        region = match branch {
+            StaticBranch::Then => core::mem::take(then_body),
+            StaticBranch::Else => core::mem::take(else_body),
+            StaticBranch::Neither => Vec::new(),
+        };
+    }
+    let mut rewires: Vec<(Val, Val)> = Vec::new();
+    if let Some(Op::Sentient(sentient::Op::Yield { results })) = region.last() {
+        rewires = produced.into_iter().zip(results.iter().copied()).collect();
+        region.pop();
+    }
+    drop(block.splice(at..=at, region));
+    rewires
 }

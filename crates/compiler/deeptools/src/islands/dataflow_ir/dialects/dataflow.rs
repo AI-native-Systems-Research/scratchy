@@ -27,6 +27,25 @@ use crate::islands::dataflow_ir::ty::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegAddr(pub u32);
 
+/// `$num_consumers` OF A `dataflow.create_multicast_group` — the number of SHARERS.
+///
+/// ⛔ A COUNT AND NOT A LIST LENGTH; see [`Op::CreateMulticastGroup::num_consumers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConsumerCount(pub u32);
+
+/// `$group_id` OF A `dataflow.create_multicast_group` — which group this is.
+///
+/// ⛔ A NEWTYPE BECAUSE IT SITS BETWEEN TWO OTHER SMALL INTEGERS in the same attribute dictionary,
+/// where `{count = 0, group_id = 3, num_consumers = 1}` and `{count = 3, group_id = 1, ..}` both
+/// parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MulticastGroupId(pub u32);
+
+/// `$count` OF A `dataflow.create_multicast_group` — *"the initial number of outstanding requests"*
+/// (`Dataflow.td:169`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OutstandingRequests(pub u32);
+
 /// WHICH REGISTER FILE a `get_local_unit` names.
 ///
 /// ⭐ THESE ARE THE UNIT-PREFIXED SPELLINGS, and the prefix matters: `arch_enums.h:62-66` keeps a
@@ -486,6 +505,44 @@ pub enum Op {
         unit_ids: Vec<Val>,
     },
 
+    /// `dataflow.create_multicast_group(%1 -> ()) {count, group_id, num_consumers} : index` — ONE
+    /// PRODUCER DRIVING MANY CONSUMERS, named by a single handle (`Dataflow.td:159-184`).
+    ///
+    /// ⛔⛔ ADDED FOR `MulticastCanonicalization` (D-pass,
+    /// `dcc/src/Transform/Sentient/MulticastCanonicalization.cpp`), WHOSE ENTIRE INPUT IS THIS OP.
+    /// The pass exists to move a `sentient.receive_and_store`'s `$producer` off the group and onto
+    /// the group's own `$producer`, putting the group in `$multicast_info` (`:121-135`). With no
+    /// variant for it the pass's precondition — `dyn_cast<CreateMulticastGroupOp>(ras.getProducer())`
+    /// — could never hold, so all seven of its units would have been a no-op. See
+    /// [`super::super::super::sentient::dialects::sentient::StoreSource::Multicast`].
+    ///
+    /// ⭐ THE VENDOR'S OWN OUTPUT IS THE SPELLING: `%7 = dataflow.create_multicast_group(%1 -> ())
+    /// {count = 0 : i32, group_id = 3 : i32, num_consumers = 1 : i32} : index`
+    /// (`dcc/test/Conversion/StandardToSentient/cmpi_select_different_BB.mlir:86`) — no space before
+    /// the paren, and the attribute dictionary alphabetical.
+    CreateMulticastGroup {
+        /// `$result` — the handle the group is addressed by.
+        result: Val,
+        /// `$producer` — *"the unit ID of the producer of data"* (`Dataflow.td:163`).
+        producer: Val,
+        /// `$consumers` — the consumers' unit ids, and the list MAY BE EMPTY. See
+        /// [`CreateMulticastGroup::num_consumers`].
+        consumers: Vec<Val>,
+        /// `$num_consumers` — the number of SHARERS.
+        ///
+        /// ⛔⛔ NOT `consumers.len()`. The `.td` says the list *"could be left empty, however when
+        /// it is not empty, the size of that list must match the `num_consumers` (number of
+        /// sharers) field"* (`Dataflow.td:164-168`), and the vendor prints an EMPTY list beside
+        /// `num_consumers = 1 : i32` (`cmpi_select_different_BB.mlir:86`) and beside
+        /// `num_consumers = 8 : i32` (`uniform_scalar_sub.mlir:65`). Deriving it from the list would
+        /// print `0` on every op the reference prints non-zero.
+        num_consumers: ConsumerCount,
+        /// `$group_id`.
+        group_id: MulticastGroupId,
+        /// `$count` — *"the initial number of outstanding requests"* (`Dataflow.td:169`).
+        count: OutstandingRequests,
+    },
+
     /// `dataflow.get_unit_collection {name} : vector<Nxindex>` — ONE HANDLE FOR N UNITS THAT RUN
     /// ONE PROGRAM, which `EnumerateCollectionUnit` expands into N of them (entry 245).
     ///
@@ -795,6 +852,28 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 out,
                 "{} = dataflow.create_group ({members}) : index",
                 print::val(*result)
+            );
+        }
+        Op::CreateMulticastGroup {
+            result,
+            producer,
+            consumers,
+            num_consumers,
+            group_id,
+            count,
+        } => {
+            // ⭐ NO SPACE BEFORE THE PAREN and the attribute dictionary is ALPHABETICAL — the
+            // assembly format opens with a literal `(` (`Dataflow.td:182`) and MLIR sorts
+            // `attr-dict` by name.
+            let _ = writeln!(
+                out,
+                "{} = dataflow.create_multicast_group({} -> ({})) {{count = {} : i32, group_id = {} : i32, num_consumers = {} : i32}} : index",
+                print::val(*result),
+                print::val(*producer),
+                print::vals(consumers),
+                count.0,
+                group_id.0,
+                num_consumers.0
             );
         }
         Op::GetLogicalMemoryView {

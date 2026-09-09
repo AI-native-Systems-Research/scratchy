@@ -82,14 +82,412 @@
 //! | `e604_findCandidates` | 604 | 5 | 30 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402` |
 //! | `e630_run` | 630 | 6 | 130 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607` |
 
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{
+    self, Op, StaticBranch, Val, replace_if_with_region, sentient, static_if_branch, static_operand,
+};
 
-// crustify:todo: e095_decrementPredicatesOnIV
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:433  (27 body lines, level 0)
-//   original  : void LoopPeelingManager::decrementPredicatesOnIV(Value iv)
+/// WHERE ONE OP SITS IN A REGION TREE — the block reached by taking region `r` of the op at index `i`
+/// for each `(i, r)` of `into`, then index `at` in that block.
+///
+/// ⛔⛔ AN MLIR `Operation *` IS ITS OWN CURSOR AND THIS IS NOT. Both ports below decide over the
+/// whole tree and then mutate it, so a decision has to name its subject; a `&mut Op` would hold the
+/// tree borrowed while the next decision is read. `Ord` is derived and load-bearing: `into` orders
+/// before `at`, so a descendant (whose `into` extends its ancestor's) always sorts AFTER its
+/// ancestor, and the greatest remaining path is always the deepest-then-last one — post-order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RegionPath {
+    /// `(op index, region index)` from the root block down.
+    into: Vec<(usize, usize)>,
+    /// The op's index in the block `into` reaches.
+    at: usize,
+}
 
-// crustify:todo: e096_simplifyConditionals
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:529  (11 body lines, level 0)
-//   original  : void LoopPeelingManager::simplifyConditionals( mlir::MLIRContext *context, SmallVector<Operation *, 4> if_ops_to_simplify)
+/// The block `into` names, or `None` where an index no longer resolves.
+fn block_at<'a>(root: &'a mut Vec<Op>, into: &[(usize, usize)]) -> Option<&'a mut Vec<Op>> {
+    let mut block = root;
+    for &(op_index, region_index) in into {
+        let op = block.get_mut(op_index)?;
+        block = dialects::regions_mut(op).into_iter().nth(region_index)?;
+    }
+    Some(block)
+}
+
+/// Every `sentient.if` under `block`, deepest-last-first, as `(path, index of the op)`.
+fn if_paths(block: &[Op], into: &[(usize, usize)], out: &mut Vec<RegionPath>) {
+    for (at, op) in block.iter().enumerate() {
+        if matches!(op, Op::Sentient(sentient::Op::If { .. })) {
+            out.push(RegionPath {
+                into: into.to_vec(),
+                at,
+            });
+        }
+        for (region_index, region) in dialects::regions_ref(op).into_iter().enumerate() {
+            let mut deeper = into.to_vec();
+            deeper.push((at, region_index));
+            if_paths(region, &deeper, out);
+        }
+    }
+}
+
+/// WHICH OPERAND OF A `sentient.if` IS THE INDUCTION VARIABLE — `if_op.getLhs() == iv` against
+/// `if_op.getRhs() == iv` (`MultiDimLoopPeeling.cpp:436-439`), which decides which operand index the
+/// decremented constant is written to (`:453-456`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvSide {
+    /// `$lhs` is the IV, so `$rhs` is the constant side — `setOperand(1, ..)`.
+    Lhs,
+    /// `$rhs` is the IV, so `$lhs` is the constant side — `setOperand(0, ..)`.
+    Rhs,
+}
+
+/// ONE `sentient.if` COMPARING THE INDUCTION VARIABLE AGAINST A `sentient.scalar_constant`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateOnIv {
+    path: RegionPath,
+    side: IvSide,
+    /// `const_op.getValue()`.
+    value: i64,
+    /// `const_side.getType()`, which the replacement constant is built with.
+    ty: ScalarTy,
+}
+
+/// EVERY USE OF ONE LOOP'S INDUCTION VARIABLE, ALL OF THEM COMPARISONS AGAINST A CONSTANT.
+///
+/// ⛔⛔ THE TYPE IS `decrementPredicatesOnIV`'S THREE ABORTS. `llvm_unreachable("expect iv users to
+/// be IfOps")` (`:457`), `llvm_unreachable("expect a comparison on the IV")` (`:441`) and
+/// `DT_CHECK_MSG(const_op, "Expect a comparison between the IV and a ConstantOp")` (`:445-446`) all
+/// say the same thing: an IV whose uses are not exactly this. [`PredicatesOnIv::of`] answers `None`
+/// there instead, so the caller cannot reach the rewrite with a tree that would have aborted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicatesOnIv {
+    iv: Val,
+    predicates: Vec<PredicateOnIv>,
+}
+
+impl PredicatesOnIv {
+    /// The comparisons on `iv` anywhere under `scope`, or `None` where `iv` has a use that is not
+    /// one — `iv.getUsers()` with its three aborts read as a precondition.
+    #[must_use]
+    pub fn of(iv: Val, scope: &[Op]) -> Option<PredicatesOnIv> {
+        let mut paths = Vec::new();
+        if_paths(scope, &[], &mut paths);
+        let mut predicates = Vec::new();
+        for path in paths {
+            let block = walk_to(scope, &path.into)?;
+            let Op::Sentient(sentient::Op::If { lhs, rhs, .. }) = block.get(path.at)? else {
+                return None;
+            };
+            let (side, const_side) = match (*lhs == iv, *rhs == iv) {
+                (true, false) => (IvSide::Lhs, *rhs),
+                (false, true) => (IvSide::Rhs, *lhs),
+                // Neither side is the IV: not a use of it at all, so not this walk's business.
+                (false, false) => continue,
+                // Both sides: `const_side` would be the IV itself and its `dyn_cast` would fail.
+                (true, true) => return None,
+            };
+            let Some(Op::Sentient(sentient::Op::ScalarConstant { value, ty, .. })) =
+                dialects::defining_op(const_side, scope)
+            else {
+                return None;
+            };
+            predicates.push(PredicateOnIv {
+                path,
+                side,
+                value: *value,
+                ty: *ty,
+            });
+        }
+        // ⭐ THE EXACT WITNESS THAT `getUsers()` YIELDED NOTHING ELSE: every use counted, and every
+        // one of them accounted for by a comparison collected above.
+        (dialects::use_count(iv, scope) == predicates.len())
+            .then_some(PredicatesOnIv { iv, predicates })
+    }
+
+    /// The induction variable these comparisons are on.
+    #[must_use]
+    pub const fn iv(&self) -> Val {
+        self.iv
+    }
+}
+
+/// The block `into` names, immutably — see [`block_at`].
+fn walk_to<'a>(root: &'a [Op], into: &[(usize, usize)]) -> Option<&'a [Op]> {
+    let mut block = root;
+    for &(op_index, region_index) in into {
+        let op = block.get(op_index)?;
+        block = dialects::regions_ref(op).into_iter().nth(region_index)?;
+    }
+    Some(block)
+}
+
+/// Replaces: e095_decrementPredicatesOnIV
+///
+/// Rebuilds every comparison on the induction variable against a constant one lower, which is what
+/// the loop's bound losing its last iteration means for the conditions inside it.
+///
+/// ⛔ TRAP: THE OLD CONSTANT IS LEFT WHERE IT IS. The reference creates a second `ConstantOp` and
+/// re-points the operand (`:447-456`); it never edits the old one, which other ops may still read.
+///
+/// ⛔ TRAP: THE REPLACEMENT TAKES `const_side.getType()`, NOT the IV's — the two differ wherever a
+/// comparison is on `i1`.
+pub fn decrement_predicates_on_iv(
+    predicates: &PredicatesOnIv,
+    values: &mut Values,
+    block: &mut Vec<Op>,
+) {
+    // ⭐ MINTED IN THE ORDER `getUsers()` YIELDS, so the constants carry the reference's numbering,
+    // and APPLIED deepest-and-last first: inserting one shifts the indices at and after it in that
+    // one block, and every path still to be applied there names a smaller index.
+    let mut ordered: Vec<(Val, &PredicateOnIv)> = predicates
+        .predicates
+        .iter()
+        .map(|predicate| (values.mint(), predicate))
+        .collect();
+    ordered.sort_by(|(_, a), (_, b)| a.path.cmp(&b.path));
+    for (result, predicate) in ordered.into_iter().rev() {
+        let constant = Op::Sentient(sentient::Op::ScalarConstant {
+            value: predicate.value - 1,
+            result,
+            // `ConstantOp`'s own default, which this creation does not override.
+            reg_locale: sentient::RegType::Imm,
+            ty: predicate.ty,
+            is_symbol: false,
+        });
+        let Some(inner) = block_at(block, &predicate.path.into) else {
+            continue;
+        };
+        inner.insert(predicate.path.at, constant);
+        if let Some(Op::Sentient(sentient::Op::If { lhs, rhs, .. })) =
+            inner.get_mut(predicate.path.at + 1)
+        {
+            match predicate.side {
+                IvSide::Lhs => *rhs = result,
+                IvSide::Rhs => *lhs = result,
+            }
+        }
+    }
+}
+
+/// WHICH `sentient.if`s A ROUND OF CANONICALISATION MAY TOUCH — `applyOpPatternsGreedily`'s `ops`
+/// argument under `GreedyRewriteStrictness::ExistingOps`.
+///
+/// ⛔ THE TWO CALLERS BUILD IT DIFFERENTLY. `performLoopPeeling` walks the loop's parent op for every
+/// `sentient.if` (`:601-603`); `copyOneIter` lists only the users of the cloned loop's induction
+/// variable (`:474-479`), and since it has already replaced that variable with a fresh constant that
+/// nothing else reads, naming that constant selects exactly those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfOpsToSimplify {
+    /// Every `sentient.if` in the block.
+    Every,
+    /// Those comparing this value on either side.
+    Reading(Val),
+}
+
+/// Replaces: e096_simplifyConditionals
+///
+/// Folds every candidate `sentient.if` whose condition is decidable from the constants and loop
+/// bounds around it, splicing the surviving branch into its place — a run of `sentient.if`'s ONE
+/// canonicalisation pattern, `RemoveStaticCondition` (`SentientOps.cpp:1509-1512`).
+///
+/// ⛔ TRAP: ONE PASS DEEPEST-FIRST IS NOT ENOUGH AND THE LOOP IS NOT DECORATION. A folded `if`
+/// rewires its readers onto the yielded values, which can turn an enclosing `if`'s operand into a
+/// constant; the reference gets that from the greedy driver's worklist. Each round erases one
+/// `sentient.if`, so this terminates.
+pub fn simplify_conditionals(candidates: IfOpsToSimplify, block: &mut Vec<Op>) {
+    while let Some((path, branch)) = next_static_if(candidates, block) {
+        let rewires = match block_at(block, &path.into) {
+            Some(inner) => replace_if_with_region(inner, path.at, branch),
+            None => break,
+        };
+        // `rewriter.replaceOp(op, results)` — the readers are in the enclosing scope.
+        for (of, with) in rewires {
+            dialects::replace_all_uses_with(block, of, with);
+        }
+    }
+}
+
+/// The deepest-then-last candidate `sentient.if` the pattern matches — the greedy worklist's next
+/// item, in the post-order the callers collect their lists in.
+fn next_static_if(candidates: IfOpsToSimplify, block: &[Op]) -> Option<(RegionPath, StaticBranch)> {
+    let mut paths = Vec::new();
+    if_paths(block, &[], &mut paths);
+    paths.sort();
+    for path in paths.into_iter().rev() {
+        let inner = walk_to(block, &path.into)?;
+        let Some(Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            yielded,
+            else_body,
+            ..
+        })) = inner.get(path.at)
+        else {
+            continue;
+        };
+        if let IfOpsToSimplify::Reading(val) = candidates
+            && *lhs != val
+            && *rhs != val
+        {
+            continue;
+        }
+        if let Some(branch) = static_if_branch(
+            *predicate,
+            static_operand(*lhs, block),
+            static_operand(*rhs, block),
+            !else_body.is_empty(),
+            !yielded.is_empty(),
+        ) {
+            return Some((path, branch));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{
+        IfOpsToSimplify, PredicatesOnIv, decrement_predicates_on_iv, simplify_conditionals,
+    };
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+
+    /// `%c = scalar_constant N : index`.
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.if <predicate> lhs, rhs { then } else { else }`, resultless.
+    fn if_op(
+        predicate: sentient::CmpPredicate,
+        lhs: Val,
+        rhs: Val,
+        then_body: Vec<Op>,
+        else_body: Vec<Op>,
+    ) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate,
+            lhs,
+            rhs,
+            yielded: Vec::new(),
+            dbg_name: None,
+            then_body,
+            else_body,
+        })
+    }
+
+    /// A loop whose body compares the IV against 4 on each side, after the bound has lost an
+    /// iteration: both constants are rebuilt one lower and the comparisons re-pointed, with the
+    /// originals left in place.
+    #[test]
+    fn decrement_predicates_on_iv_rebuilds_both_constant_sides() {
+        let (iv, bound, four) = (Val(0), Val(1), Val(2));
+        let mut block = vec![
+            constant(8, bound),
+            constant(4, four),
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![
+                    if_op(
+                        sentient::CmpPredicate::Slt,
+                        iv,
+                        four,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    if_op(
+                        sentient::CmpPredicate::Sgt,
+                        four,
+                        iv,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ],
+            }),
+        ];
+        let predicates = PredicatesOnIv::of(iv, &block).expect("both uses are comparisons");
+        let mut values = Values::default();
+        for _ in 0..3 {
+            let _ = values.mint();
+        }
+        decrement_predicates_on_iv(&predicates, &mut values, &mut block);
+        let Op::Sentient(sentient::Op::For { body, .. }) = &block[2] else {
+            panic!("the loop is still the third op")
+        };
+        assert_eq!(body.len(), 4);
+        assert!(matches!(
+            body[0],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 3, .. })
+        ));
+        assert!(matches!(
+            body[1],
+            Op::Sentient(sentient::Op::If { lhs, rhs, .. }) if lhs == iv && rhs == Val(3)
+        ));
+        assert!(matches!(
+            body[2],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 3, .. })
+        ));
+        assert!(matches!(
+            body[3],
+            Op::Sentient(sentient::Op::If { lhs, rhs, .. }) if lhs == Val(4) && rhs == iv
+        ));
+        // An IV also read by something that is not a comparison is the `llvm_unreachable`.
+        let mut with_other_use = block.clone();
+        if let Op::Sentient(sentient::Op::For { body, .. }) = &mut with_other_use[2] {
+            body.push(Op::Sentient(sentient::Op::Yield { results: vec![iv] }));
+        }
+        assert_eq!(PredicatesOnIv::of(iv, &with_other_use), None);
+    }
+
+    /// `%iv < 1` over a loop running `[1, 8]` is statically false, so the `else` branch survives and
+    /// the `sentient.if` inside it — now out of the folded one — folds in the same run.
+    #[test]
+    fn simplify_conditionals_folds_a_nest_to_fixpoint() {
+        let (iv, bound, one) = (Val(0), Val(1), Val(2));
+        let nop = Op::Sentient(sentient::Op::Nop { dbg_name: None });
+        let mut block = vec![
+            constant(8, bound),
+            constant(1, one),
+            Op::Sentient(sentient::Op::For {
+                iv,
+                bound,
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![if_op(
+                    sentient::CmpPredicate::Slt,
+                    iv,
+                    one,
+                    Vec::new(),
+                    vec![if_op(
+                        sentient::CmpPredicate::Sge,
+                        iv,
+                        one,
+                        vec![nop.clone()],
+                        Vec::new(),
+                    )],
+                )],
+            }),
+        ];
+        simplify_conditionals(IfOpsToSimplify::Every, &mut block);
+        let Op::Sentient(sentient::Op::For { body, .. }) = &block[2] else {
+            panic!("the loop survives")
+        };
+        assert_eq!(body.len(), 1);
+        assert!(matches!(body[0], Op::Sentient(sentient::Op::Nop { .. })));
+    }
+}
 
 // crustify:todo: e322_copyOneIter
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:461  (65 body lines, level 1)
@@ -115,4 +513,3 @@
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607  (130 body lines, level 6)
 //   original  : void LoopPeelingManager::run()
 //   calls     : e321_printLoopToPeelingType, e448_performLoopPeeling, e564_runLoopMerging, e571_runOpRerolling, e597_runLightWeightSimplifications, e600_runLoopAbsorption, e604_findCandidates
-

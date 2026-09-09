@@ -403,6 +403,9 @@ pub fn is_data_transfer(op: &DfirOp) -> bool {
             dataflow::Op::GetUnit { .. }
             | dataflow::Op::GetLocalUnit { .. }
             | dataflow::Op::CreateGroup { .. }
+            // ⭐ NOR IS `create_multicast_group`, FOR THE SAME REASON AS `create_group`: it BINDS a
+            // group the transfers then name, and nothing crosses a datapath because of it.
+            | dataflow::Op::CreateMulticastGroup { .. }
             | dataflow::Op::GetLogicalMemoryView { .. }
             | dataflow::Op::GetPagedLogicalMemoryView { .. }
             | dataflow::Op::ProgramUnit { .. }
@@ -1229,11 +1232,13 @@ fn plan_cleanup(scope: &[DfirOp], module: &[DfirOp], to_erase: &mut BTreeSet<Val
         }
 
         // `isa<dataflow::CreateGroupOp, dataflow::CreateMulticastGroupOp>(op) && op->use_empty()`,
-        // and the `get_unit_op.use_empty()` arm below it. ⚠️ `create_multicast_group` is not declared
-        // in this island (as entry 141 records for ten `agen` classes); it belongs in this pattern
-        // the day it is.
+        // and the `get_unit_op.use_empty()` arm below it. ⭐ `create_multicast_group` IS DECLARED
+        // NOW — `MulticastCanonicalization` (D48) is its whole reader — so it joins the pattern the
+        // reference always had it in.
         if let DfirOp::Dataflow(
-            dataflow::Op::CreateGroup { result, .. } | dataflow::Op::GetUnit { result, .. },
+            dataflow::Op::CreateGroup { result, .. }
+            | dataflow::Op::CreateMulticastGroup { result, .. }
+            | dataflow::Op::GetUnit { result, .. },
         ) = op
             && uses(*result, module).is_empty()
         {
@@ -1251,7 +1256,10 @@ fn apply_cleanup(scope: &mut Vec<DfirOp>, filters: &UnitFilters, to_erase: &BTre
     }
 
     scope.retain_mut(|op| match op {
-        DfirOp::Dataflow(dataflow::Op::CreateGroup { result, .. }) => !to_erase.contains(result),
+        DfirOp::Dataflow(
+            dataflow::Op::CreateGroup { result, .. }
+            | dataflow::Op::CreateMulticastGroup { result, .. },
+        ) => !to_erase.contains(result),
         DfirOp::Dataflow(dataflow::Op::GetUnit {
             result, num_folds, ..
         }) => {

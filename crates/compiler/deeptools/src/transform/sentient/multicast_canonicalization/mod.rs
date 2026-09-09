@@ -83,18 +83,309 @@
 //! | `e569_runOn` | 569 | 4 | 43 | `dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:327` |
 //! | `e605_runOn` | 605 | 5 | 24 | `dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:371` |
 
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
+use crate::islands::dataflow_ir::link::RecvEnd;
+use crate::islands::sentient::dialects::sentient::StoreSource;
+use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 
-// crustify:todo: e097_runOn
-//   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:83  (6 body lines, level 0)
-//   original  : void runOn(ModuleOp module_op)
+/// Replaces: e097_runOn
+///
+/// Runs the pass over every program unit of one module.
+///
+/// ⛔ NAMED FOR ITS ARGUMENT: `runOn(ModuleOp)`, `runOn(ProgramUnitOp)` (e605) and
+/// `runOn(ReceiveAndStoreOp)` (e569) are one C++ overload set and cannot all be `run_on` here.
+///
+/// ⛔ TRAP: THE WALK IS COLLECTED BEFORE IT IS ITERATED (`:84-87`) because `runOn` rewrites the unit
+/// it is handed. A program's units are a fixed list here, so the snapshot is the droppable mechanism.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    for unit in program.units.iter_mut() {
+        run_on_unit(unit);
+    }
+}
 
-// crustify:todo: e098_processDirectMulticast
-//   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:121  (14 body lines, level 0)
-//   original  : void MulticastCanonicalizationPass::processDirectMulticast( sentient::ReceiveAndStoreOp ras, dataflow::CreateMulticastGroupOp multicast)
+/// `runOn(dataflow::ProgramUnitOp)` — entry 605, level 5, not yet ported.
+fn run_on_unit<A: Arch>(unit: &mut ProgramUnit<A>) -> ! {
+    let _ = unit;
+    todo!(
+        "e605_runOn(dataflow::ProgramUnitOp) — the L3LU/L3SU gate and the unique-producer store walk          (MulticastCanonicalization.cpp:371), which schedules e569_runOn per store"
+    )
+}
 
-// crustify:todo: e099_createNewProducerQMap
-//   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:299  (26 body lines, level 0)
-//   original  : uniform::QueryMapOp MulticastCanonicalizationPass::createNewProducerQMap( uniform::QueryMapOp orig_qmap)
+/// ONE `dataflow.create_multicast_group` READ AS A STORE'S `$producer` — the group handle and the
+/// unit that produces the data (`Dataflow.td:163`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectMulticast {
+    /// What the op binds, which is what the store currently names.
+    group: Val,
+    /// The group's own `$producer`.
+    producer: Val,
+}
+
+impl DirectMulticast {
+    /// `dyn_cast<dataflow::CreateMulticastGroupOp>(ras.getProducer().getDefiningOp())` (`:334-335`) —
+    /// `None` where the producer is anything else, which is the `else if` chain moving on.
+    #[must_use]
+    pub fn of(group: Val, scope: &[Op]) -> Option<DirectMulticast> {
+        match dialects::defining_op(group, scope) {
+            Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { producer, .. })) => {
+                Some(DirectMulticast {
+                    group,
+                    producer: *producer,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Replaces: e098_processDirectMulticast
+///
+/// Moves the group off every store's `$producer` into its `$multicast_info` and puts the group's own
+/// `$producer` — the unit the data comes from — in its place.
+///
+/// ⛔ TRAP: THE `ras` PARAMETER IS UNUSED (`:121-135`). The function re-collects every store reading
+/// the group and rewrites all of them, so the store it was handed is rewritten only because it is one
+/// of those; passing a store that does not read the group changes nothing.
+///
+/// ⛔ TRAP: THE GROUP OP ITSELF IS NOT ERASED — `$multicast_info` keeps reading it.
+pub fn process_direct_multicast(multicast: DirectMulticast, body: &mut [Op]) {
+    for op in body.iter_mut() {
+        if let Op::Sentient(sentient::Op::ReceiveAndStore {
+            producer,
+            multicast_info,
+            ..
+        }) = op
+            && *producer == StoreSource::Multicast(multicast.group)
+        {
+            *producer = StoreSource::Wire(RecvEnd::from_multicast_group(multicast.producer));
+            *multicast_info = Some(multicast.group);
+        }
+        for region in dialects::regions_mut(op) {
+            process_direct_multicast(multicast, region);
+        }
+    }
+}
+
+/// THE TWO OPS A `query_map` OF MULTICAST GROUPS BECOMES, in the reference's creation order — both
+/// built at the original `uniform.def_immutable_mapping`'s position (`OpBuilder tmp_builder(immutable_map)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerQMap {
+    /// `uniform.def_immutable_mapping` over the same keys, values replaced by the producers.
+    pub map: Op,
+    /// `uniform.query_map` reading it with the original's `$key`.
+    pub qmap: Op,
+    /// What the new `query_map` binds — the `$producer` a store then reads.
+    pub result: Val,
+}
+
+/// Replaces: e099_createNewProducerQMap
+///
+/// Rebuilds a `uniform.query_map` whose every value is a `dataflow.create_multicast_group` into one
+/// whose values are those groups' `$producer`s — `None` where any value is not a group, which is the
+/// reference's `return nullptr`, *"not a type of q_map we know how to process"*.
+///
+/// ⛔ TRAP: `getNonNullValuesFromKeys` MAY ANSWER SHORTER THAN `keys` — it builds a lookup from the
+/// mapping's own pairs and pushes only the keys present in it (`Uniform.cpp:548-556`), so a key the
+/// mapping does not carry contributes no value. Here the pairs are ONE list of necessarily equal
+/// length, which is why the keys are re-zipped as they are looked up rather than after.
+#[must_use]
+pub fn create_new_producer_qmap(
+    orig_qmap: &uniform::Op,
+    keys: &[Val],
+    scope: &[Op],
+    values: &mut Values,
+) -> Option<ProducerQMap> {
+    let uniform::Op::QueryMap { map, key, .. } = orig_qmap else {
+        return None;
+    };
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) =
+        dialects::defining_op(*map, scope)
+    else {
+        return None;
+    };
+    let mut new_pairs: Vec<(Val, Val)> = Vec::new();
+    for &wanted in keys {
+        let Some((_, value)) = pairs.iter().find(|(each, _)| *each == wanted) else {
+            continue;
+        };
+        match dialects::defining_op(*value, scope) {
+            Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { producer, .. })) => {
+                new_pairs.push((wanted, *producer));
+            }
+            _ => return None,
+        }
+    }
+    let new_map = values.mint();
+    let result = values.mint();
+    Some(ProducerQMap {
+        map: Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: new_map,
+            pairs: new_pairs,
+        }),
+        qmap: Op::Uniform(uniform::Op::QueryMap {
+            result,
+            map: new_map,
+            key: *key,
+        }),
+        result,
+    })
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{
+        DirectMulticast, ProducerQMap, create_new_producer_qmap, process_direct_multicast,
+    };
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::dialects::dataflow::{
+        ConsumerCount, MulticastGroupId, OutstandingRequests,
+    };
+    use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
+    use crate::islands::dataflow_ir::link::RecvEnd;
+    use crate::islands::sentient::dialects::sentient::StoreSource;
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+
+    /// `%g = dataflow.create_multicast_group(%p -> ())`.
+    fn group(result: Val, producer: Val) -> Op {
+        Op::Dataflow(dataflow::Op::CreateMulticastGroup {
+            result,
+            producer,
+            consumers: Vec::new(),
+            num_consumers: ConsumerCount(1),
+            group_id: MulticastGroupId(3),
+            count: OutstandingRequests(0),
+        })
+    }
+
+    /// A `sentient.receive_and_store` whose `$producer` names `source`.
+    fn store(producer: StoreSource, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ReceiveAndStore {
+            mutable_addr: Val(90),
+            immutable_addr: Val(91),
+            increment: Val(92),
+            producer,
+            result,
+            dst: None,
+            drop_first: None,
+            multicast_info: None,
+            extent: sentient::Extent::of(Elements(64), Bits(16)),
+            interleaved_group: Elements(0),
+            coalesce: false,
+            subword_length: 0,
+            stride: 0,
+            permute: false,
+            shuffle_mode: None,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Imm,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// Both stores reading the group are rewritten, not just one, and the store reading something
+    /// else is left alone.
+    #[test]
+    fn process_direct_multicast_rewrites_every_store_on_the_group() {
+        let (unit, handle, other) = (Val(0), Val(1), Val(2));
+        let mut body = vec![
+            group(handle, unit),
+            store(StoreSource::Multicast(handle), Val(10)),
+            store(StoreSource::Constant(other), Val(11)),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(20),
+                bound: Val(21),
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![store(StoreSource::Multicast(handle), Val(12))],
+            }),
+        ];
+        let multicast = DirectMulticast::of(handle, &body).expect("the group defines the handle");
+        process_direct_multicast(multicast, &mut body);
+        let rewritten = StoreSource::Wire(RecvEnd::from_multicast_group(unit));
+        assert!(matches!(
+            body[1],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == rewritten && multicast_info == Some(handle)
+        ));
+        assert!(matches!(
+            body[2],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == StoreSource::Constant(other) && multicast_info.is_none()
+        ));
+        let Op::Sentient(sentient::Op::For { body: inner, .. }) = &body[3] else {
+            panic!("the loop survives")
+        };
+        assert!(matches!(
+            inner[0],
+            Op::Sentient(sentient::Op::ReceiveAndStore { producer, multicast_info, .. })
+                if producer == rewritten && multicast_info == Some(handle)
+        ));
+    }
+
+    /// A mapping of two groups becomes a mapping of their producers under the same keys; one value
+    /// that is not a group refuses the whole map.
+    #[test]
+    fn create_new_producer_qmap_replaces_values_with_producers() {
+        let (k0, k1) = (Val(0), Val(1));
+        let (g0, g1) = (Val(2), Val(3));
+        let (p0, p1) = (Val(4), Val(5));
+        let (mapping, key) = (Val(6), Val(7));
+        let orig = uniform::Op::QueryMap {
+            result: Val(8),
+            map: mapping,
+            key,
+        };
+        let mut scope = vec![
+            group(g0, p0),
+            group(g1, p1),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: mapping,
+                pairs: vec![(k0, g0), (k1, g1)],
+            }),
+        ];
+        let mut values = Values::default();
+        for _ in 0..9 {
+            let _ = values.mint();
+        }
+        let built = create_new_producer_qmap(&orig, &[k0, k1], &scope, &mut values)
+            .expect("both values are multicast groups");
+        assert_eq!(
+            built,
+            ProducerQMap {
+                map: Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(9),
+                    pairs: vec![(k0, p0), (k1, p1)],
+                }),
+                qmap: Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(10),
+                    map: Val(9),
+                    key,
+                }),
+                result: Val(10),
+            }
+        );
+        // `else { return nullptr; }` — a value that is not a `create_multicast_group`.
+        scope[1] = Op::Sentient(sentient::Op::ScalarConstant {
+            value: 0,
+            result: g1,
+            reg_locale: sentient::RegType::Imm,
+            ty: crate::islands::dataflow_ir::ty::ScalarTy::Index,
+            is_symbol: false,
+        });
+        assert_eq!(
+            create_new_producer_qmap(&orig, &[k0, k1], &scope, &mut values),
+            None
+        );
+    }
+}
 
 // crustify:todo: e323_runOnOperation
 //   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:90  (5 body lines, level 1)
@@ -120,4 +411,3 @@
 //   authority : dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:371  (24 body lines, level 5)
 //   original  : void MulticastCanonicalizationPass::runOn(dataflow::ProgramUnitOp unit)
 //   calls     : e097_runOn, e569_runOn
-

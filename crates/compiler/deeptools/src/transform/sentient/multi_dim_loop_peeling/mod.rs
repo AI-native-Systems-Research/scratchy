@@ -82,14 +82,153 @@
 
 pub(crate) mod loop_peeling_manager;
 
+use crate::transform::sentient::ForRef;
 
-// crustify:todo: e093_stringifyPeelingType
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:93  (12 body lines, level 0)
-//   original  : std::string stringifyPeelingType(PeelingType t) const
+/// WHICH ITERATION(S) OF A LOOP GET PEELED — `LoopPeelingManager::PeelingType`
+/// (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:83-88`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeelingType {
+    /// `kFirstIterOnly`.
+    FirstIterOnly,
+    /// `kLastIterOnly`.
+    LastIterOnly,
+    /// `kFirstAndLastIter`.
+    FirstAndLastIter,
+    /// `kNoPeeling`.
+    NoPeeling,
+}
 
-// crustify:todo: e094_insertOrUpdatePeelingType
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:164  (20 body lines, level 0)
-//   original  : void insertOrUpdatePeelingType(sentient::ForOp for_op, PeelingType p_type)
+impl PeelingType {
+    /// Replaces: e093_stringifyPeelingType
+    ///
+    /// The spelling of one peeling mode.
+    ///
+    /// ⛔ TRAP: NOT DEBUG OUTPUT. `performLoopPeeling` feeds it to
+    /// `updateDbgName("MDLP(", for_op, stringifyPeelingType(p_type) + ")")` (`:583-585`), so these
+    /// four strings reach the emitted IR as a loop's `dbgName`.
+    ///
+    /// ⛔ TRAP: THE `default:` ARM IS `"NoPeeling"` (`:99-100`) — not an error, not the empty string.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::FirstIterOnly => "FirstIterOnly",
+            Self::LastIterOnly => "LastIterOnly",
+            Self::FirstAndLastIter => "FirstAndLastIter",
+            Self::NoPeeling => "NoPeeling",
+        }
+    }
+}
+
+/// THE PEELING MODES THE CANDIDATE LIST MAY HOLD — [`PeelingType`] MINUS `kNoPeeling`.
+///
+/// ⛔⛔ THE TWO `DT_CHECK_MSG`s OF `insertOrUpdatePeelingType` ARE THIS TYPE. *"Map should only
+/// contain valid peeling modes"* guards the argument (`:165-166`) and *"Expect valid peeling mode in
+/// map"* guards the value already stored (`:177-178`); a list that cannot hold `kNoPeeling` makes
+/// both unwritable — which is what the field's own comment asks for, *"No loop should have the
+/// peeling type kNoPeeling in this list"* (`:125-126`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peeling {
+    /// `kFirstIterOnly`.
+    FirstIterOnly,
+    /// `kLastIterOnly`.
+    LastIterOnly,
+    /// `kFirstAndLastIter`.
+    FirstAndLastIter,
+}
+
+impl Peeling {
+    /// The mode `ty` names — `None` for `kNoPeeling`, which is an ABSENCE of peeling and not a
+    /// refusal to peel.
+    #[must_use]
+    pub const fn of(ty: PeelingType) -> Option<Peeling> {
+        match ty {
+            PeelingType::FirstIterOnly => Some(Peeling::FirstIterOnly),
+            PeelingType::LastIterOnly => Some(Peeling::LastIterOnly),
+            PeelingType::FirstAndLastIter => Some(Peeling::FirstAndLastIter),
+            PeelingType::NoPeeling => None,
+        }
+    }
+
+    /// This mode as a [`PeelingType`] — for [`PeelingType::spelling`].
+    #[must_use]
+    pub const fn ty(self) -> PeelingType {
+        match self {
+            Peeling::FirstIterOnly => PeelingType::FirstIterOnly,
+            Peeling::LastIterOnly => PeelingType::LastIterOnly,
+            Peeling::FirstAndLastIter => PeelingType::FirstAndLastIter,
+        }
+    }
+}
+
+/// `LoopPeelingManager::loop_to_peeling_type_` — the loops to peel and how, in the order
+/// `findCandidates` found them (`:127-129`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeelingCandidates(Vec<(ForRef, Peeling)>);
+
+impl PeelingCandidates {
+    /// The records in insertion order — `findCandidates` answers `!empty()` (`:406`) and
+    /// `performLoopPeeling` walks them in REVERSE, innermost loop out (`:547`).
+    #[must_use]
+    pub fn records(&self) -> &[(ForRef, Peeling)] {
+        &self.0
+    }
+
+    /// Replaces: e094_insertOrUpdatePeelingType
+    ///
+    /// Records `peeling` for `for_op`, or unions it with the mode already recorded there.
+    ///
+    /// ⛔ TRAP: THE UNION IS "DIFFERS, SO BOTH", NOT A JOIN OVER THE THREE MODES. The reference
+    /// writes `kFirstAndLastIter` whenever the stored mode merely DIFFERS from the new one
+    /// (`:180-183`), so `kFirstAndLastIter` meeting `kFirstIterOnly` stays `kFirstAndLastIter` only
+    /// because that rule happens to give the right answer there.
+    pub fn insert_or_update(&mut self, for_op: ForRef, peeling: Peeling) {
+        match self.0.iter_mut().find(|(loop_ref, _)| *loop_ref == for_op) {
+            Some((_, existing)) => {
+                if *existing != peeling {
+                    *existing = Peeling::FirstAndLastIter;
+                }
+            }
+            None => self.0.push((for_op, peeling)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{Peeling, PeelingCandidates, PeelingType};
+    use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::ForRef;
+
+    /// The four spellings `updateDbgName` writes into `MDLP(..)`.
+    #[test]
+    fn stringify_peeling_type_spells_all_four_modes() {
+        assert_eq!(PeelingType::FirstIterOnly.spelling(), "FirstIterOnly");
+        assert_eq!(PeelingType::LastIterOnly.spelling(), "LastIterOnly");
+        assert_eq!(PeelingType::FirstAndLastIter.spelling(), "FirstAndLastIter");
+        assert_eq!(PeelingType::NoPeeling.spelling(), "NoPeeling");
+        assert_eq!(Peeling::of(PeelingType::NoPeeling), None);
+    }
+
+    /// A second, DIFFERENT mode for a loop already recorded unions to `kFirstAndLastIter`; the same
+    /// mode twice leaves it alone, and a second loop is a second record.
+    #[test]
+    fn insert_or_update_unions_only_a_differing_mode() {
+        let (outer, inner) = (ForRef(Val(1)), ForRef(Val(2)));
+        let mut candidates = PeelingCandidates::default();
+        candidates.insert_or_update(outer, Peeling::FirstIterOnly);
+        candidates.insert_or_update(outer, Peeling::FirstIterOnly);
+        assert_eq!(candidates.records(), [(outer, Peeling::FirstIterOnly)]);
+        candidates.insert_or_update(outer, Peeling::LastIterOnly);
+        candidates.insert_or_update(inner, Peeling::LastIterOnly);
+        assert_eq!(
+            candidates.records(),
+            [
+                (outer, Peeling::FirstAndLastIter),
+                (inner, Peeling::LastIterOnly)
+            ]
+        );
+    }
+}
 
 // crustify:todo: e321_printLoopToPeelingType
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:188  (11 body lines, level 1)
@@ -105,4 +244,3 @@ pub(crate) mod loop_peeling_manager;
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:738  (34 body lines, level 7)
 //   original  : void MultiDimLoopPeelingPass::runOnOperation()
 //   calls     : e630_run
-

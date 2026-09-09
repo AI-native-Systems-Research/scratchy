@@ -256,6 +256,16 @@ pub fn operands(op: &Op) -> Vec<Val> {
             dataflow::Op::ProgramCollection { unit, .. } => reads.push(*unit),
             // ⭐ EVERY MEMBER IS AN OPERAND — `Variadic<Index>:$unit_ids` (`Dataflow.td:152`).
             dataflow::Op::CreateGroup { unit_ids, .. } => reads.extend(unit_ids.iter().copied()),
+            // ⭐ THE PRODUCER IS AN OPERAND TOO — `Index:$producer` beside
+            // `Variadic<Index>:$consumers` (`Dataflow.td:175-176`).
+            dataflow::Op::CreateMulticastGroup {
+                producer,
+                consumers,
+                ..
+            } => {
+                reads.push(*producer);
+                reads.extend(consumers.iter().copied());
+            }
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => reads.extend([*from, *start]),
             // ⭐ EVERY PAGE'S START ADDRESS IS AN OPERAND — `Variadic<Index>:$page_start_addrs`
             // (`Dataflow.td:267-299`) — and the extents beside them are attributes, so they are not.
@@ -591,6 +601,7 @@ pub fn results(op: &Op) -> Vec<Val> {
             dataflow::Op::GetUnit { result, .. }
             | dataflow::Op::GetLocalUnit { result, .. }
             | dataflow::Op::CreateGroup { result, .. }
+            | dataflow::Op::CreateMulticastGroup { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::GetUnitCollection { result, .. }
             | dataflow::Op::GetMyUnitInCollection { result, .. }
@@ -764,6 +775,14 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
             | dataflow::Op::GetTotalUnitsInCollection { of, .. } => places.push(of),
             dataflow::Op::ProgramCollection { unit, .. } => places.push(unit),
             dataflow::Op::CreateGroup { unit_ids, .. } => places.extend(unit_ids.iter_mut()),
+            dataflow::Op::CreateMulticastGroup {
+                producer,
+                consumers,
+                ..
+            } => {
+                places.push(producer);
+                places.extend(consumers.iter_mut());
+            }
             dataflow::Op::GetLogicalMemoryView { from, start, .. } => places.extend([from, start]),
             dataflow::Op::GetPagedLogicalMemoryView(view) => {
                 places.extend([&mut view.unit, &mut view.start_addr]);
@@ -1066,6 +1085,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             dataflow::Op::GetUnit { result, .. }
             | dataflow::Op::GetLocalUnit { result, .. }
             | dataflow::Op::CreateGroup { result, .. }
+            | dataflow::Op::CreateMulticastGroup { result, .. }
             | dataflow::Op::GetLogicalMemoryView { result, .. }
             | dataflow::Op::GetUnitCollection { result, .. }
             | dataflow::Op::GetMyUnitInCollection { result, .. }
@@ -1673,6 +1693,16 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
             }
             dataflow::Op::CreateGroup { result, unit_ids } => {
                 operands.extend(unit_ids.iter_mut());
+                results.push(result);
+            }
+            dataflow::Op::CreateMulticastGroup {
+                result,
+                producer,
+                consumers,
+                ..
+            } => {
+                operands.push(producer);
+                operands.extend(consumers.iter_mut());
                 results.push(result);
             }
             dataflow::Op::GetLogicalMemoryView {
@@ -2360,6 +2390,16 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
             }
             dataflow::Op::CreateGroup { result, unit_ids } => {
                 vals.extend(unit_ids.iter_mut().map(|val| (Role::Operand, val)));
+                vals.push((Role::Result, result));
+            }
+            dataflow::Op::CreateMulticastGroup {
+                result,
+                producer,
+                consumers,
+                ..
+            } => {
+                vals.push((Role::Operand, producer));
+                vals.extend(consumers.iter_mut().map(|val| (Role::Operand, val)));
                 vals.push((Role::Result, result));
             }
             dataflow::Op::GetLogicalMemoryView {

@@ -1129,6 +1129,29 @@ impl CmpPredicate {
             Self::Sge => "sge",
         }
     }
+
+    /// THE PREDICATE THAT HOLDS WITH THE OPERANDS SWAPPED — `a P b` iff `b P.reversed() a`.
+    ///
+    /// ⛔ TOTAL OVER ALL SIX, SO THE REFERENCE'S `llvm_unreachable` IS UNWRITABLE.
+    /// `dcc::utils::reversePredicate` (`dcc/src/Transform/Sentient/Utils.cpp:450`) ends in one only
+    /// because `CmpIPredicate` also carries the unsigned comparisons a `sentient.if` never uses;
+    /// this enum carries exactly the six that do.
+    ///
+    /// ⭐ `RemoveStaticCondition` ASKS IT OF EVERY NON-CONSTANT CONDITION: having failed to read
+    /// `lhs P rhs` as `constant P induction_var`, it retries as `rhs reversed(P) lhs`
+    /// (`dcc/src/Dialect/Sentient/SentientOps.cpp:1482-1485`). Campaign unit `e245_reversePredicate`
+    /// (`transform/sentient/utils`) should delegate here when it lands.
+    #[must_use]
+    pub const fn reversed(self) -> CmpPredicate {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::Ne => Self::Ne,
+            Self::Slt => Self::Sgt,
+            Self::Sle => Self::Sge,
+            Self::Sgt => Self::Slt,
+            Self::Sge => Self::Sle,
+        }
+    }
 }
 
 /// HOW FAR A COMPUTE IS UNROLLED — `SentientUnrollFactorAttr` (`SentientTypes.td:491-509`).
@@ -1656,6 +1679,15 @@ pub enum StoreSource {
     Wire(RecvEnd),
     /// The `sentient.scalar_constant` the bitstream became.
     Constant(Val),
+    /// THE `dataflow.create_multicast_group` A STORE READS THROUGH BEFORE
+    /// `MulticastCanonicalization` (D-pass, `dcc/src/Transform/Sentient/MulticastCanonicalization.cpp`)
+    /// SPLITS IT.
+    ///
+    /// ⛔⛔ NOT A WIRE END AND NOT A CONSTANT. The scheduler hands `dcc` a `$producer` that names the
+    /// GROUP, and the pass's whole job is to move that value to `$multicast_info` and put the group's
+    /// own `$producer` — a unit — in its place (`:121-135`). Without this variant the input shape of
+    /// the pass is inexpressible, so the pass could only ever be a no-op.
+    Multicast(Val),
 }
 
 impl StoreSource {
@@ -1665,6 +1697,7 @@ impl StoreSource {
         match self {
             StoreSource::Wire(end) => end.val(),
             StoreSource::Constant(val) => val,
+            StoreSource::Multicast(val) => val,
         }
     }
 }
