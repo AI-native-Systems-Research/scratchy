@@ -1,0 +1,64 @@
+symbol	qualifier	authority	body_lines	rule	reason
+doCoreletSplitSdsc	sbf	dbo/src/Utils/sdsc_bundle/SdscCoreletSplit.cpp:84	-	stage1_not_reached	STAGE 1 of runDdc, and it is SKIPPED for our input: SchedulerStages.cpp:25 returns early unless numCoreletsPerCore == 2, and scratchy emits numCoreletsUsed_ = 1 in all 313 sampled SuperDSCs. Recorded here so the skip is a stated decision, not an omission.
+getCores	CrossCoreReductionGroup	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:33	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+isEmpty	CrossCoreReductionGroup	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:52	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+setAccessPattern	DataTransfer	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:145	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+getMutableAccessPatternList	DataTransfer	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:151	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+clear	Metadata	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:197	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+isValidDimParam	L3DlOpsScheduler	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:227	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+isOutputLabeledDs	L3DlOpsScheduler	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:228	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+hasComputeOp	L3DlOpsScheduler	dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:285	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+runDcg	DcgManager	dcg/dcg_manager/dcg_manager.cpp:17	94	named_exclusion	NOT THE BRANCH TAKEN. SchedulerStages.cpp:53-57 picks runDcgForDlOpsStandalone whenever dscs_ is non-empty, which is always true for scratchy's input; runDcg is the dataOpdscs_-only PCFG path.
+runDcgGeneratePCFG	DcgManager	dcg/dcg_manager/dcg_manager.cpp:126	18	named_exclusion	The PCFG / data-DSC path is ruled off our path by the user (dcg_fe/pcfg_gen/ is out of scope).
+isExternalNode	Ddc	ddc/ddc.h:298	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+empty	CoordPropTracker	ddc/ddc.h:534	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+setAccessPattern	DataTransfer	ddc/ddc_metadata.h:98	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+hasAccessPattern	DataTransfer	ddc/ddc_metadata.h:102	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+hasAccessPattern	DataTransfer	ddc/ddc_metadata.h:105	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+getMutableAccessPatternList	DataTransfer	ddc/ddc_metadata.h:108	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+getAccessPatternList	DataTransfer	ddc/ddc_metadata.h:111	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+getProducerLoops	DataConnect	ddc/ddc_metadata.h:159	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+getConsumerLoops	DataConnect	ddc/ddc_metadata.h:162	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+createDataConnectMetadata	Ddc	ddc/ddcv1.cpp:3283	45	already_ported	ALREADY PORTED on bridge1-campaign -- re-porting it would create a second, diverging implementation of the same authority citation
+DdlConvertInterface	DdlConvertInterface	ddc/ddl/ddl_conversion.cpp:26	3	trivial_ctor_dtor	trivial ctor/dtor of DdlConvertInterface (3-line body) -- a Rust struct literal
+~DdlConvertInterface	DdlConvertInterface	ddc/ddl/ddl_conversion.cpp:32	1	trivial_ctor_dtor	trivial ctor/dtor of DdlConvertInterface (1-line body) -- a Rust struct literal
+selectAndParseDdlTemplate	DdlConvertInterface	ddc/ddl/ddl_conversion.cpp:34	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+setPrimaryDim	DimProp	ddc/ddl/ddl_conversion.h:314	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+getPrimaryDim	DimProp	ddc/ddl/ddl_conversion.h:315	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+setMetaDimKind	DimProp	ddc/ddl/ddl_conversion.h:325	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+getMetaDimKind	DimProp	ddc/ddl/ddl_conversion.h:326	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+isUnpadded	DimProp	ddc/ddl/ddl_conversion.h:327	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+isPadded	DimProp	ddc/ddl/ddl_conversion.h:328	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+int_pow2		ddc/transformations/automatic_shuffle/shuffle.cpp:105	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+bitwidth_to_idx		ddc/transformations/automatic_shuffle/shuffle.cpp:107	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+first	SwapBuffer	ddc/transformations/automatic_shuffle/shuffle.cpp:119	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+second	SwapBuffer	ddc/transformations/automatic_shuffle/shuffle.cpp:120	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+cost	PackAction	ddc/transformations/automatic_shuffle/shuffle.cpp:362	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+extract_dim	ShiftLeftAction	ddc/transformations/automatic_shuffle/shuffle.cpp:407	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+dim	Pack8Action	ddc/transformations/automatic_shuffle/shuffle.cpp:474	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+cost	Pack8Action	ddc/transformations/automatic_shuffle/shuffle.cpp:486	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+enumerate_stick_computations	Pack8Action	ddc/transformations/automatic_shuffle/shuffle.cpp:490	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+dim	Pack9Action	ddc/transformations/automatic_shuffle/shuffle.cpp:521	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+enumerate_stick_computations	Pack9Action	ddc/transformations/automatic_shuffle/shuffle.cpp:537	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+dim	Pack24Action	ddc/transformations/automatic_shuffle/shuffle.cpp:571	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+cost	Pack24Action	ddc/transformations/automatic_shuffle/shuffle.cpp:584	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+enumerate_stick_computations	Pack24Action	ddc/transformations/automatic_shuffle/shuffle.cpp:588	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+dim	GCVTF16F8PackAction	ddc/transformations/automatic_shuffle/shuffle.cpp:618	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+cost	GCVTF16F8PackAction	ddc/transformations/automatic_shuffle/shuffle.cpp:627	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+enumerate_stick_computations	GCVTF16F8PackAction	ddc/transformations/automatic_shuffle/shuffle.cpp:630	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+out_format	GCVTF16F8PackAction	ddc/transformations/automatic_shuffle/shuffle.cpp:633	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+dim	GCVTF16F8MergeAction	ddc/transformations/automatic_shuffle/shuffle.cpp:664	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+cost	GCVTF16F8MergeAction	ddc/transformations/automatic_shuffle/shuffle.cpp:672	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+enumerate_stick_computations	GCVTF16F8MergeAction	ddc/transformations/automatic_shuffle/shuffle.cpp:675	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+out_format	GCVTF16F8MergeAction	ddc/transformations/automatic_shuffle/shuffle.cpp:678	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+symbol	DimSymbol	ddc/transformations/automatic_shuffle/shuffle.h:31	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+is_dummy	DimSymbol	ddc/transformations/automatic_shuffle/shuffle.h:35	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+next	DimSymbol	ddc/transformations/automatic_shuffle/shuffle.h:36	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+getID	DimSymbol	ddc/transformations/automatic_shuffle/shuffle.h:43	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+getDummy	DimSymbol	ddc/transformations/automatic_shuffle/shuffle.h:44	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+getDefaultSymbol	DimSymbol	ddc/transformations/automatic_shuffle/shuffle.h:45	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+stickDims	AbstractLayout	ddc/transformations/automatic_shuffle/shuffle.h:94	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+sliceDims	AbstractLayout	ddc/transformations/automatic_shuffle/shuffle.h:95	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+numSticks	AbstractLayout	ddc/transformations/automatic_shuffle/shuffle.h:96	1	field_accessor	1-line field accessor -- a struct field in Rust, not a function
+out_format	ShuffleAction	ddc/transformations/automatic_shuffle/shuffle.h:232	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function
+estimated_cost	GraphNode	ddc/transformations/automatic_shuffle/shuffle.h:253	3	field_accessor	3-line field accessor -- a struct field in Rust, not a function

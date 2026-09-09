@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Write every crustify config this campaign needs.
+
+⛔⛔ THE TRANSLATOR PROMPT NEVER NAMES A BRIEF. It names only crustify/build.json,
+crustify/wavefront/wavefront-config.json, crustify/crates.json, the worklist and the worktree.
+Anything written only in a brief never reaches an agent: bridge 2's first 144 functions ran with no
+budget at all for exactly that reason. So the campaign's facts AND the hard caps live in the
+`_comment` arrays of build.json and wavefront-config.json, and in the banner of every home .rs.
+
+⛔ crustify reads the REPO-TIER crustify/crates.json. This worktree was branched from
+bridge1-campaign and INHERITED bridge 2's copy, which names bridge 2's homes; left alone, crustify
+refuses the port stage with "N selected item(s) have no home .rs on disk" while our homes exist.
+These files replace it.
+
+⛔ oracle_config must be {path, sha256}, not a string, and the sha256 must be of the
+wavefront-config.json that actually LANDS -- so the pair is GENERATED here, never copied.
+"""
+import hashlib
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _paths  # noqa: E402
+from collections import defaultdict
+
+WORK = _paths.WORK
+CAMP = _paths.CAMP
+VSTATS = json.load(open(os.path.join(WORK, "verify-stats.json")))
+EXCL_ROWS = [r.split("\t") for r in
+             open(os.path.join(_paths.CAMP, "EXCLUSIONS.tsv")).read().splitlines()[1:]]
+EXCL_BY_RULE = {}
+for _r in EXCL_ROWS:
+    EXCL_BY_RULE[_r[4]] = EXCL_BY_RULE.get(_r[4], 0) + 1
+NDEF = None  # set in main() once units.json is loaded
+TREE = _paths.TREE
+AUTH = _paths.AUTH_ROOT
+REV = _paths.REV
+OUTDIR = _paths.OUTDIR
+CAMPNAME = _paths.CAMPNAME
+
+CAPS = [
+    "⛔ HARD CAPS -- MEASURED, AND THEY BIND. Bridge 2's first 144 functions cost 43 h wall clock",
+    "and 586 M cache-read tokens against 5 M output; of the 30,991 lines produced only 5,306 were",
+    "implementation (12,333 doc comments, 12,575 tests). PER PORTED FUNCTION:",
+    "  * 8 DOC LINES: the `/// Replaces: eNNN_name` anchor, ONE line of what it does, any TRAP.",
+    "    No tutorials, no restating the C++ in prose, no design essays.",
+    "  * ONE TEST. Two only where the vendor's own case AND a negative both apply.",
+    "  * `cargo check -p deeptools` + `cargo test -p deeptools` ONCE PER BATCH, never per function.",
+    "  * Do NOT re-verify citations -- the review pass owns that.",
+    "  * Do NOT grep the crate to discover types; the anchor names what you need.",
+    "NOT capped: correctness, and the emission.",
+    "⛔ AGENTS MUST NOT run the workspace build, the acceptance build, or clippy over the workspace:",
+    "   ~6 GB of target/ per agent worktree and this host is tight. The orchestrator owns that gate.",
+]
+
+WHAT = [
+    "⭐ WHAT THIS CAMPAIGN IS. `dbo-opt` is the binary scratchy shells out to, and its per-program",
+    "pipeline runs `runDdc` for every program (dbo/src/Transforms/sdsc_bundle/RunSchedulerOnSdsc.cpp",
+    ":145). ⭐ dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp -- 60 lines -- IS THE SPEC FOR THIS",
+    "WHOLE JOB. READ IT FIRST. It is FOUR stages:",
+    "   1. sbf::doCoreletSplitSdsc(SuperDsc*)  dbo/src/Utils/sdsc_bundle/SdscCoreletSplit.cpp:84",
+    "      ⛔ EXCLUDED, and recorded as such in EXCLUSIONS.tsv: SchedulerStages.cpp:25 returns early",
+    "      unless numCoreletsPerCore == 2, and scratchy emits numCoreletsUsed_ = 1 in all 313",
+    "      sampled SuperDSCs.",
+    "   2a. L3DlOpsScheduler(dscGlobal, memTrackers, {executionStep}, verbose).run(sdsc)",
+    "      dcg/dcg_fe/scheduler/  -- 8,033 lines of .cpp, ZERO units ported before this campaign.",
+    "   2b. ddc::Ddc(dscGlobal, ..).run_v1(sdsc)   ENTRY IS ddc/ddcv1.cpp:3695.",
+    "      ddc/  -- 18,830 .cpp lines, exactly FOUR functions ported before this campaign.",
+    "   3. DcgManager::runDcgForDlOpsStandalone(sdsc)   dcg/dcg_manager/dcg_manager.cpp:449",
+    "      ⛔ THIS BRANCH, NOT runDcg: SchedulerStages.cpp:53-57 picks it whenever dscs_ is",
+    "      non-empty, which is always true for scratchy's input.",
+    "`runDdc` raises when DDC finds no mapping (\"Scheduler failed to find a suitable op mapping\"),",
+    "so the mapping is not optional.",
+    "",
+    "⛔ ALREADY PORTED ON bridge1-campaign -- DO NOT RE-PORT, AND DO NOT DUPLICATE. All FOUR live in",
+    "   crates/compiler/deeptools/src/bridges/superdsc_to_dataflow_ir/shape_constraints.rs and follow",
+    "   the `/// Replaces: eNNN_name` convention, so cross-referencing works:",
+    "     e001_checkConstraints           ddc/ddcv1.cpp:792",
+    "     e002_createDataConnectMetadata  ddc/ddcv1.cpp:3283",
+    "     e041_getStickSizes              dsc/dsc2.cpp:4066 (a DesignSpaceConfig method)",
+    "     e071_getCumulativeStickSizes    dsc/dsc2.cpp      (a DesignSpaceConfig method)",
+    "   The last two are OUTSIDE this campaign's file list, so they were never enumerated -- our",
+    "   units CALL them. NOTE that `checkConstraints` is a LAMBDA inside",
+    "   `Ddc::exploreAssignDataStages` (ddc/ddcv1.cpp:555), so porting that unit means CALLING the",
+    "   existing port, not writing a second constraint checker. UNITS.tsv carries that note on the",
+    "   unit itself.",
+]
+
+WHY = [
+    "⭐ WHY THIS MATTERS. `ddc.run_v1` is what PLACES ADDRESSES, and the L3 scheduler's own",
+    "`run` commits LX allocations and then calls `fillAllocationStartAddrAndOffset` -- literally",
+    "\"Set start address, offset in allocations\" (dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:8000).",
+    "Our emitted views have printed `start_address = 0` where the reference states a placed base;",
+    "the backend has refused with `Register initialization out of boundary`; and",
+    "crates/compiler/deeptools/src/reginit.rs (1,569 lines, on the integ branch) HAND-COMPUTES",
+    "placement from ddc/ddcv1.cpp:132-360 -- hand-transcribed, from the file with 2 of its",
+    "functions ported. This campaign replaces that guesswork with the real thing. The units that",
+    "supersede it are the ones for Ddc::allocAllMem, Ddc::minimizeAllocations,",
+    "Ddc::calculateClStartAddress and Ddc::finalizeOps; each carries a NOTE in UNITS.tsv and on its",
+    "own anchor saying so. (Entry numbers are not quoted here: they shift whenever the scope does.)",
+]
+
+L3 = [
+    "⚠️ THE L3 SCHEDULER MAY OR MAY NOT APPLY TO US -- DO NOT DECIDE THIS, PORT IT. Scratchy states",
+    "its own schedule (our SuperDSC writes `coreIdToDscSchedule`), and L3DlOpsScheduler.cpp:415-425",
+    "READS that field. That question is the USER'S, not the porter's, and being wrong about it costs",
+    "a whole rediscovery. Port it; if a function turns out unreachable later, that is cheap to delete",
+    "and expensive to have skipped.",
+    "MEASURED WHILE SCOPING THIS CAMPAIGN, and it points the other way: `coreIdToDscSchedule` occurs",
+    "in L3DlOpsScheduler.cpp ONLY as a READ (:425, `mySDsc.coreIdToDscSchedule.at(coreId)`), never a",
+    "write, and nowhere in ddc/ outside test JSON. So the field is an INPUT to both stages, and what",
+    "the L3 scheduler actually PRODUCES is the dsc2 schedule tree, the LX buffer type, the committed",
+    "LX allocations and their start addresses. Supplying `coreIdToDscSchedule` does not make it",
+    "redundant.",
+]
+
+SCOPE_NOTE = [
+    "⛔ dcg's OTHER ~48,000 lines (dcg/dcg_be/, dcg/dcg_fe/pcfg_gen/) are OUT OF SCOPE -- the user",
+    "has ruled the PCFG / data-DSC path off our path (\"we don't need pcfg, because our input is",
+    "simple superdsc\"). In from dcg: dcg/dcg_fe/scheduler/ and dcg/dcg_manager/.",
+    "⚠️ MEASURED TENSION, REPORTED RATHER THAN RESOLVED: runDcgForDlOpsStandalone's own body",
+    "(dcg_manager.cpp:449-513) delegates almost entirely to those two OUT-of-scope subtrees --",
+    "DscPcfgTranslator::transformDscCompToPcfg, dcg_fe_.createPcfgForUnitPerCore and",
+    "dcg_be_.fillAndCreateSenProgInfoUsingSuperDSC. Its in-scope effect is the `mySDsc.pcfg_` and",
+    "firstAvailGlobalGrpId mutation. ⛔ `todo!` NAMING the missing translator is the correct action",
+    "there; DO NOT INVENT A PCFG and do not substitute a constant for one.",
+    "⛔ The four standalone `main()` drivers (ddc/ddc_standalone.cpp, ddc/ddl/ddl_standalone.cpp,",
+    "ddc/transformations/automatic_shuffle/shuffle_standalone.cpp,",
+    "dcg/dcg_fe/scheduler/L3DlOpsScheduler_standalone.cpp) are command-line harnesses around the",
+    "library, not part of the runDdc path, and are not in the file list.",
+]
+
+PORTED_MEANS = [
+    "⭐ PORTED MEANS THE WHOLE FUNCTION INCLUDING ITS EFFECT. For this stage the effect is WHAT IS",
+    "WRITTEN INTO THE SuperDsc: addresses, mappings, symbol definitions, fold state, schedule steps.",
+    "A hand attempt on bridge 2 extracted each function's decision rule into a documented predicate,",
+    "omitted the part that changed the IR, and reported it done -- nothing called any of it.",
+    "A PREDICATE IS NOT A PORT; the op/mutation a function performs IS the function.",
+    "Droppable: only the mechanism for reaching operands (walking uses, memoising, positioning a",
+    "builder). ⛔ If a TYPE CANNOT EXPRESS A RESULT, EXTEND THE TYPE -- deciding a function is",
+    "unnecessary is not the porter's call.",
+]
+
+ACCEPTANCE = [
+    "⭐⭐ THE ACCEPTANCE CRITERION -- WHAT THESE STAGES PRODUCE. The stages mutate the `SuperDsc` IN",
+    "PLACE, and the observable result is that THE `ScheduleNode` TREE GAINS ITS LOOP, TRANSFER, SYNC",
+    "AND CONDITION NODES. Scratchy's SuperDSC today has only ALLOCATE nodes (one construction site:",
+    "crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs:5127) plus a flat `computeOp_` list",
+    "-- which matches torch-spyre's own `generate_sdsc`, and is exactly why `dxp_standalone` works",
+    "and the Rust `sdscToDataflowIR` port yields nothing.",
+    "⭐ THE REPRESENTATIVE MINTING SITE TO MODEL is ddc/ddl/ddl_conversion.cpp:1065: it mints a",
+    "`dsc2::LoopNode`, takes its dims from the DDL, names it `loop_ds<num>_ds<den>`, and registers it",
+    "in `ddlInterface.loop_labels_`.",
+    "⛔ A PORT THAT DOCUMENTS THE SCHEDULING DECISION WITHOUT ADDING NODES TO THAT TREE IS NOT A",
+    "PORT.",
+]
+
+VOCABULARY = [
+    "⭐⭐ THE TARGET VOCABULARY IS ALREADY TYPED -- A WRONG SHAPE MUST BE A COMPILE ERROR, NOT A",
+    "JUDGEMENT CALL. Emit into these EXISTING types rather than inventing any:",
+    "   crates/compiler/deeptools/src/bridges/superdsc_to_dataflow_ir/driver.rs:467   `Statement`",
+    "   driver.rs:1152        `Scheduled`",
+    "   driver.rs:1756-1790   `Viewed` / `Viewing`",
+    "   driver.rs:1539        `ScheduleView::roots`",
+    "   driver.rs:1788        `Dsc`",
+    "The single function it all plugs into is `Schedule::roots` in",
+    "crates/targets/spyre/src/lower_superdsc_to_dataflow_ir.rs -- committed, compiles, and currently",
+    "yields nothing. Both the component and the DSC are already in hand there.",
+]
+
+AUTHORITY = [
+    "⭐ THE ULTIMATE AUTHORITY IS THE LOCAL C++ TREE: %s" % AUTH,
+    "   revision %s -- exactly the revision every banner cites." % REV,
+    "⛔ The other local deeptools checkout is a DIFFERENT revision. Do not use it.",
+    "⛔ The pod (/project_src/deeptools) is NOT reachable from this host -- use the local tree.",
+    "The three extracts crustify-%s/cpp/{l3,ddc,ddl}.cpp say WHICH functions are in scope and IN"
+    % CAMPNAME,
+    "WHAT ORDER. Unlike bridge 2's extract (truncated at the tail of 366 of 384 bodies), these were",
+    "verified INDEPENDENTLY: crustify-%s/tools/verify_extract.py re-derives every body's end with"
+    % CAMPNAME,
+    "its own character state machine -- it does not import the extractor's scanner and never",
+    "re-slices with the extractor's own (file, line, length) -- and reports %d/%d bodies"
+    % (VSTATS["units"] - VSTATS["failures"], VSTATS["units"]),
+    "byte-identical to the authority, %d bytes compared, with %d of %d negative controls (a dropped"
+    % (VSTATS["bytes"], VSTATS["negative_controls_detected"], VSTATS["negative_controls"]),
+    "last line, a blanked inner brace) DETECTED. Either file may be read; the authority",
+    "file is the one that carries the surrounding declarations you will need.",
+]
+
+CRATE_RULES = [
+    "⛔ CRATE RULES BIND YOU -- crates/compiler/deeptools/CLAUDE.md, in full. NEVER RUNTIME REFUSE:",
+    "   no `Result`, no `Err(`, no `.ok_or`, no `assert!`, no `debug_assert!`. NEWTYPES, NEVER RAW",
+    "   SCALARS -- an address, an offset, a core index and an element count must not be",
+    "   interchangeable u64s. No strings for closed sets (a closed set is a generated enum).",
+    "   `Arch`/`Model`/`Workload` flow through. `todo!` NAMING UNPORTED WORK IS ALLOWED here (the",
+    "   crate's refusal ratchet, crates/targets/spyre/tests/dfir_never_runtime_refuses.rs, is scoped",
+    "   to ONE file, src/lower_subtile_tape_to_dataflow_ir.rs, and does not cover src/schedule/) --",
+    "   but ⛔ NEVER substitute a stand-in op or a fabricated address to dodge one. A fabricated",
+    "   placement to avoid a stop is worse than the stop.",
+    "⛔ THIS IS A PURE-LOGIC PORT WITH NO C ANYWHERE. Whatever generic C-to-Rust conventions say:",
+    "   no bindgen/allowlist/-sys, no `ffi::`/`extern \"C\"`, no `CRUSTIFY_<FILE>` switch, no",
+    "   `Foo`/`FooRef`/`FooMut` triple, no `unsafe`, no sanitizers, no C-vs-Rust equivalence harness.",
+]
+
+ANCHORS = [
+    "⛔ ANCHORS: each `// crustify:todo: eNNN_name` in a home file is one scheduled unit. Replace it",
+    "with the ported item carrying the doc anchor `/// Replaces: eNNN_name`. ⛔ NEVER DELETE AN",
+    "ANCHOR YOU DID NOT PORT -- on bridge 2 a deleted anchor was indistinguishable from a finished",
+    "unit and the campaign reported DONE having silently lost 149 of 384 functions, the biggest in",
+    "its span. OUTSTANDING WORK IS JUDGED FROM UNITS.tsv, never from anchors in the tree.",
+]
+
+
+def sha256_file(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def build_crates_json(units):
+    by_mod = defaultdict(lambda: defaultdict(list))
+    files_of = defaultdict(set)
+    tu_of = {}
+    for u in units:
+        by_mod[u["module"]][u["rust_home"]].append(u["unit"])
+        files_of[u["rust_home"]].add(u["rel"])
+        tu_of[u["rust_home"]] = u["extract_file"]
+    modules = {}
+    for mod in sorted(by_mod):
+        rs = {}
+        for home in sorted(by_mod[mod]):
+            crate_rel = home.split("crates/compiler/deeptools/", 1)[1]
+            rs[crate_rel] = {
+                "_comment": "%d unit(s) from %s. Authority: %s/<file>:<line> per unit."
+                            % (len(by_mod[mod][home]), ", ".join(sorted(files_of[home])), AUTH),
+                "tu": tu_of[home],
+                "headers": sorted(files_of[home]),
+                "members": {"functions": sorted(by_mod[mod][home])},
+            }
+        modules[mod] = {"rust_path": "%s/%s" % (OUTDIR, mod), "rs": rs}
+    return {
+        "_comment": [
+            "Placement oracle for the ddc + L3-scheduler campaign: the scheduling and",
+            "address-placement stage of IBM Spyre deeptools, the largest unported hole on the",
+            "SuperDSC -> init_binary path and never part of any earlier campaign.",
+            "",
+            "⛔ THIS FILE REPLACES THE ONE THIS WORKTREE INHERITED FROM bridge1-campaign (which was",
+            "bridge 2's copy). crustify reads the REPO-TIER crustify/crates.json; with the inherited",
+            "copy in place it looks for bridge 2's homes and refuses the port stage with \"N selected",
+            "item(s) have no home .rs on disk\" while these homes exist. Two bridge-3 agents ran a",
+            "whole batch against a sibling campaign's inherited config for exactly this reason.",
+            "",
+            "Every unit lands in the EXISTING scratchy crate `deeptools`, under",
+            "%s/ -- REAL NESTED SUBMODULES named after the original files" % OUTDIR,
+            "(ddc/fold.rs, ddc/transformation.rs, ddl/conversion.rs, l3/dl_ops.rs, ...).",
+            "⛔ NOT flat prefixed filenames: bridge 2's agen_*/tf_*/vc_* layout is the thing this",
+            "campaign does not repeat.",
+            "",
+            "UNIT NAMES are `e<NNN>_<cppName>`, NNN being the GLOBAL entry number in the three",
+            "extracts and in crustify-%s/UNITS.tsv. EVERY entry's signature in the extract is"
+            % CAMPNAME,
+            "rewritten to its unit symbol, so symbol == unit name everywhere. Two pairs of units",
+            "share a C++ name across the two stages (allocAllMem, fillLoopOffsetsAndAddresses); the",
+            "unit number is what disambiguates them.",
+            "",
+            "`tu` is the extract the unit's home draws from; `headers` names the ORIGINAL file(s).",
+            "There is no -sys surface: deeptools-sys is an empty placeholder.",
+        ] + AUTHORITY + WHAT + WHY + L3 + SCOPE_NOTE + PORTED_MEANS + ACCEPTANCE + VOCABULARY + CRATE_RULES + ANCHORS + CAPS,
+        "crates": {
+            "deeptools": {
+                "kind": "library",
+                "in_tree": True,
+                "crate_path": "crates/compiler/deeptools",
+                "sys_crate": "crustify/rust/deeptools-sys",
+                "depends_on": [],
+                "modules": modules,
+            }
+        },
+    }
+
+
+BUILD_JSON = {
+    "_comment": [
+        "ddc + L3-scheduler campaign build manifest. The campaign ports C++ into an EXISTING Rust",
+        "crate (crates/compiler/deeptools); there is no C build to configure, no shim to compile and",
+        "no FFI boundary, so `configure` is a no-op and the C-side gates in the translator playbook",
+        "do not apply. No bindgen/-sys, no ffi::/extern \"C\", no unsafe, no C-vs-Rust harness:",
+        "there is no C to call.",
+        "",
+        "⛔ TRANSLATOR GATE -- run EXACTLY these two, from the repo root, ONCE PER BATCH:",
+        "     cargo check -p deeptools",
+        "     cargo test  -p deeptools",
+        "   Both are seconds-to-a-minute: `deeptools` has one path dependency (sys-arch-spec) and no",
+        "   registry deps.",
+        "",
+        "⛔ THE ACCEPTANCE COMMAND DOES NOT BUILD ON THIS HOST:",
+        "     cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel",
+        "   `superdsc` on the CLI turns on scratchy-serving-worker/sendnn -> flex-rs, whose build.rs",
+        "   cc-compiles a senlib shim against /opt/ibm/spyre/senlib/include -- Spyre-host-only",
+        "   headers that do not exist on this Mac. The `pipeline` command below is the largest",
+        "   runnable prefix that still expands #[forward].",
+    ] + CAPS + WHAT + WHY + L3 + PORTED_MEANS + ACCEPTANCE + VOCABULARY + CRATE_RULES + ANCHORS + AUTHORITY,
+    "version": 1,
+    "build_commands": {
+        "configure": "true",
+        "build": "cargo check -p deeptools",
+        "test": "cargo test -p deeptools",
+        "pipeline": ("cargo build -p scratchy-models --features superdsc,granite-3.1-2b-instruct,"
+                     "scratchy-quantizations/fp8-dynamic-per-channel"),
+        "acceptance_on_a_spyre_host": ("cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,"
+                                       "quant/fp8-dynamic-per-channel"),
+    },
+}
+
+
+def wavefront_config(units):
+    nlev = max(u["level"] for u in units)
+    per_scope = defaultdict(int)
+    for u in units:
+        per_scope[u["scope"]] += 1
+    return {
+        "_comment": [
+            "Campaign-wide inventory for the scheduling and address-placement stage: %d units,"
+            % len(units),
+            "dependency levels 0..%d, from the two stages of `runDdc` -- %d in"
+            % (nlev, per_scope["l3"]),
+            "dcg/dcg_fe/scheduler/ (8,574 lines, zero previously ported), %d in ddc/ and %d in"
+            % (per_scope["ddc"], per_scope["ddl"]),
+            "ddc/ddl/ (20,869 lines together, two previously ported). 24,688 in-scope body lines.",
+            "This was never part of any earlier campaign.",
+            "",
+            "⛔ THERE IS NO CODEQL DATABASE AND NO WAVEFRONT EXTRACTION, and that is a decision:",
+            "  1. The C++ surface is three self-contained TUs whose bodies call names that exist only",
+            "     as semantically empty stand-ins in cpp/prelude.inc. A CodeQL call graph over",
+            "     stand-ins yields edges through a stub type, so it cannot order this work.",
+            "  2. The dependency order is already authoritative and machine-readable: the extracts",
+            "     are emitted in dependency order computed over the SCC CONDENSATION (Tarjan), so a",
+            "     mutually recursive group shares one level instead of inflating -- bridge 3's plain",
+            "     longest-path fixpoint printed \"level 266\" on a mutually recursive pair. This span",
+            "     turned out to be acyclic (366 SCCs over 366 units, 599 resolved call edges).",
+            "     Every entry carries its original file:line; UNITS.tsv lists all %d in that order"
+            % len(units),
+            "     with level, SCC, size, home, class, callees and any per-unit note.",
+            "  3. prelude.inc is a NAME INVENTORY, not a compilable prelude, so a database built from",
+            "     it would drop bodies anyway. It is out_of_scope and NOTHING IN IT IS TO BE PORTED.",
+            "",
+            "⭐ ENUMERATION METHOD, because the count is load-bearing: definitions were found BY BRACE",
+            "MATCHING from each signature's opening paren, comment- and string-aware, never by a",
+            "signature regex -- a signature regex undercounted bridge 2 by 72%. Headers were scanned",
+            "too, and in-class definitions with them: on bridge 4 progir.h held 18 of 33 units and a",
+            ".cpp-only scan would have missed every one; here ddc.h (805 lines) and ddl_conversion.h",
+            "(562) hold 13 units between them. %d definitions were found; %d are excluded with a"
+            % (len(units) + len(EXCL_ROWS), len(EXCL_ROWS)),
+            "stated reason each in crustify-%s/EXCLUSIONS.tsv (%s) and NONE for being hard. The"
+            % (CAMPNAME, ", ".join("%d %s" % (v, k) for k, v in
+                                   sorted(EXCL_BY_RULE.items(), key=lambda kv: -kv[1]))),
+            "count was cross-checked independently against each file's column-0 closing-brace count.",
+            "",
+            "This file is the provenance the schedules record and hash. Keep it byte-stable while a",
+            "wave is in flight: `crustify translate` rejects a schedule whose oracle config changed",
+            "since planning.",
+        ] + AUTHORITY + WHAT + WHY + L3 + SCOPE_NOTE + PORTED_MEANS + ACCEPTANCE + VOCABULARY + CRATE_RULES + ANCHORS + CAPS,
+        "campaign_objective": "port",
+        "impl_files": [_paths.extract_rel(s) for s in _paths.SCOPES],
+        "api_headers": [],
+        "out_of_scope": {"paths": ["crustify-%s/cpp/prelude.inc" % CAMPNAME], "features": []},
+    }
+
+
+def main():
+    units = json.load(open(WORK + "/units.json"))
+    for d in ("crustify", "crustify/wavefront", "crustify/campaigns/%s" % CAMPNAME):
+        os.makedirs(os.path.join(TREE, d), exist_ok=True)
+
+    crates = build_crates_json(units)
+    wf = wavefront_config(units)
+
+    def w(rel, obj):
+        p = os.path.join(TREE, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(json.dumps(obj, indent=1, ensure_ascii=False) + "\n")
+        return p
+
+    w("crustify/crates.json", crates)
+    w("crustify/build.json", BUILD_JSON)
+    w("crustify/wavefront/wavefront-config.json", wf)
+    # campaign-local copies, as every earlier campaign kept
+    w("crustify-%s/crates.json" % CAMPNAME, crates)
+    w("crustify-%s/build.json" % CAMPNAME, BUILD_JSON)
+    w("crustify-%s/scope-config.json" % CAMPNAME, wf)
+    print("configs written:")
+    for r in ("crustify/crates.json", "crustify/build.json",
+              "crustify/wavefront/wavefront-config.json"):
+        p = os.path.join(TREE, r)
+        print("   %7d B  %s   sha256 %s..." % (os.path.getsize(p), r, sha256_file(p)[:16]))
+    print("crates.json modules: %d" % len(crates["crates"]["deeptools"]["modules"]))
+    print("impl_files         : %s" % wf["impl_files"])
+
+
+if __name__ == "__main__":
+    main()

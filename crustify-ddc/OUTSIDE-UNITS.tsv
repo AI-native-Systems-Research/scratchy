@@ -1,0 +1,104 @@
+unit	level	loc	authority	subsystems
+e009_getStickSize	0	12	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:327	stick sizes (ALREADY PORTED)
+e015_getParentLoopNodes	0	10	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:532	dsc2 tree utilities
+e036_getMinParamScalarBroadcast	0	16	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1008	stick sizes (ALREADY PORTED)
+e040_getMinParamConversionDl16AndFp32	0	17	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1099	stick sizes (ALREADY PORTED)
+e046_getLxBelowBlockNode	0	11	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3468	dsc2 tree utilities
+e049_calculateCoreletOffsetInByte	0	82	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4842	stick sizes (ALREADY PORTED)
+e053_verifyScheduleTree	0	22	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6385	dsc2 tree utilities
+e055_computeMinHMICoreGroupSizeForSEN1P5	0	94	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6486	dsc2 tree utilities; fold infrastructure
+e061_gatherFoldParams	0	12	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7248	fold infrastructure
+e081_buildFoldForBroadcastDim	0	19	ddc/ddc_fold.cpp:87	stick sizes (ALREADY PORTED)
+e089_constructAllocElemArrLayout	0	87	ddc/ddc_fold.cpp:296	stick sizes (ALREADY PORTED)
+e092_getNumElementsInPTSlice	0	18	ddc/ddc_fold.cpp:1519	stick sizes (ALREADY PORTED)
+e095_gatherFoldParams	0	12	ddc/ddc_fold.cpp:2224	fold infrastructure
+e103_getLoops	0	13	ddc/ddc_metadata.h:179	dsc2 tree utilities
+e105_isReleventComputeToPackStickDim	0	17	ddc/ddc_transformation.cpp:693	dsc2 tree utilities
+e106_findReleventStickPackingTransfers	0	72	ddc/ddc_transformation.cpp:712	dsc2 tree utilities
+e123_updateNodesWithNewLds	0	57	ddc/ddc_transformation_util.cpp:1919	dsc2 tree utilities
+e125_minimizeAllocations	0	101	ddc/ddcv1.cpp:30	dsc2 tree utilities
+e126_populateUnitTimeTransfers	0	115	ddc/ddcv1.cpp:439	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e128_finalizeAllocateLayouts	0	30	ddc/ddcv1.cpp:1712	stick sizes (ALREADY PORTED)
+e130_getPeSfpSplitDim	0	47	ddc/ddcv1.cpp:1819	stick sizes (ALREADY PORTED)
+e131_setPeFoldsIfPtInteraction	0	22	ddc/ddcv1.cpp:1868	dsc2 tree utilities
+e133_adjustLoopOffsetsAndAddresses	0	81	ddc/ddcv1.cpp:3201	dsc2 tree utilities
+e134_simplifyScheduleTree	0	27	ddc/ddcv1.cpp:3457	dsc2 tree utilities
+e173_addInternalTensor	0	107	ddc/ddl/ddl_conversion.cpp:473	dsc2 tree utilities
+e188_runDcgComputeTransfer	0	13	dcg/dcg_manager/dcg_manager.cpp:112	ISA tables
+e189_runDcgForDlOps	0	52	dcg/dcg_manager/dcg_manager.cpp:216	DCG backend; ISA tables; PCFG translator; fold infrastructure
+e190_runDcgForDlOpsStandalone	0	64	dcg/dcg_manager/dcg_manager.cpp:449	DCG backend; ISA tables; PCFG translator; dsc2 tree utilities; fold infrastructure
+e192_printSenProgram	0	16	dcg/dcg_manager/dcg_manager.cpp:959	ISA tables
+e193_runDcgForGenKG3	0	3	dcg/dcg_manager/dcg_manager.h:94	DCG backend
+e194_runDcgForSparseKG3CONV2D	0	3	dcg/dcg_manager/dcg_manager.h:98	DCG backend
+e195_runDcgForSparseKG3BMM	0	3	dcg/dcg_manager/dcg_manager.h:102	DCG backend
+e201_computeLdsAllocateSiblingLoopNode	1	55	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:435	dsc2 tree utilities
+e202_computeLdsTransferSiblingLoopNode	1	32	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:495	dsc2 tree utilities
+e207_generateDscParamCandidates	1	204	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1172	dsc2 tree utilities
+e208_getLdsL3TransferNodes	1	34	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1571	dsc2 tree utilities
+e214_optimizeHbmLdsOutputInScheduleTree	1	94	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4018	dsc2 tree utilities
+e218_setCondGtr	1	114	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4721	dsc2 tree utilities
+e219_fillFinalStartAddressAndOffset	1	137	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4959	stick sizes (ALREADY PORTED)
+e220_fillIBRStartAddressAndOffset	1	43	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5100	fold infrastructure
+e222_allocAllMem	1	236	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5508	fold infrastructure; memory trackers
+e227_convertTransferDirectToIndirect	1	45	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7103	dsc2 tree utilities
+e228_buildCoordinateFromAllocation	1	181	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7333	dsc2 tree utilities
+e240_buildFoldForExternalAllocation	1	156	ddc/ddc_fold.cpp:2238	dsc2 tree utilities
+e242_canUseFifo	1	270	ddc/ddc_transformation.cpp:15	dsc2 tree utilities
+e244_cloneForOffsetAdjustment	1	8	ddc/ddc_transformation.cpp:1386	dsc2 tree utilities
+e245_setSizeForFixedSizeTransfers	1	34	ddc/ddc_transformation.cpp:1731	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e246_transformForInterSliceRestickify	1	28	ddc/ddc_transformation.cpp:2398	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e247_splitLoopBandOnDim	1	123	ddc/ddc_transformation_util.cpp:159	dsc2 tree utilities
+e248_splitLoopBandOnDatastage	1	30	ddc/ddc_transformation_util.cpp:287	dsc2 tree utilities
+e249_moveTransferNode	1	372	ddc/ddc_transformation_util.cpp:335	dsc2 tree utilities
+e251_unrollTransfer	1	72	ddc/ddc_transformation_util.cpp:1120	dsc2 tree utilities
+e252_unrollTransferForSymbolicDims	1	110	ddc/ddc_transformation_util.cpp:1193	dsc2 tree utilities
+e257_addNewLds	1	107	ddc/ddc_transformation_util.cpp:1811	dsc2 tree utilities
+e258_allocAllMem	1	306	ddc/ddcv1.cpp:132	dsc2 tree utilities; fold infrastructure; memory trackers
+e259_calculateClStartAddress	1	123	ddc/ddcv1.cpp:1895	stick sizes (ALREADY PORTED)
+e260_fillLoopOffsetsAndAddresses	1	844	ddc/ddcv1.cpp:2355	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e261_finalizeOps	1	127	ddc/ddcv1.cpp:3329	dsc2 tree utilities; fold infrastructure
+e262_coordinateMasking	1	181	ddc/ddcv1.cpp:3485	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e263_identifyBelowChunkBoundaryLoops	1	8	ddc/ddcv1.cpp:3683	dsc2 tree utilities
+e276_verifyDdlConstraints	1	216	ddc/ddl/ddl_conversion.cpp:2553	stick sizes (ALREADY PORTED)
+e280_runDcgGenerateProgIR	1	70	dcg/dcg_manager/dcg_manager.cpp:145	DCG backend; ISA tables; fold infrastructure
+e281_runDcgForInputFetchNeighbor	1	52	dcg/dcg_manager/dcg_manager.cpp:514	DCG backend; fold infrastructure
+e282_mergePcfgInSuperDSC	1	259	dcg/dcg_manager/dcg_manager.cpp:635	PCFG translator
+e285_calculateBurstEfficiency	2	267	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1738	dsc2 tree utilities
+e286_calculateFlopPerByte	2	230	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2253	dsc2 tree utilities
+e288_createSynchronizationDSC	2	423	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3487	dsc2 tree utilities
+e289_optimizeHbmTransfers	2	76	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4113	dsc2 tree utilities
+e291_fillTransferMulticastInfo	2	127	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5146	dsc2 tree utilities
+e295_fillExplicitTransferSize	2	35	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7875	dsc2 tree utilities
+e296_rollBackNodesInBlock	2	15	ddc/ddc.h:511	dsc2 tree utilities
+e297_gatherRelatedPTRowsBase	2	217	ddc/ddc_fold.cpp:740	dsc2 tree utilities
+e298_buildFoldFromAllocation	2	245	ddc/ddc_fold.cpp:3043	dsc2 tree utilities
+e299_buildFoldFromNonAllocRef	2	355	ddc/ddc_fold.cpp:3294	dsc2 tree utilities
+e300_packStickDim	2	544	ddc/ddc_transformation.cpp:811	dsc2 tree utilities
+e301_hoistTransfersUpForReuse	2	230	ddc/ddc_transformation.cpp:1432	dsc2 tree utilities
+e302_unrollSymbolicTransfers	2	42	ddc/ddc_transformation.cpp:1663	dsc2 tree utilities
+e303_unrollSpreadTransfers	2	24	ddc/ddc_transformation.cpp:1706	dsc2 tree utilities
+e307_exploreAssignDataStages	2	1126	ddc/ddcv1.cpp:555	constraint check (ALREADY PORTED); dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e308_prepDsc	2	252	ddc/ddcv1.cpp:2019	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e309_attachToPrefilledSchedule	2	71	ddc/ddcv1.cpp:2280	dsc2 tree utilities
+e323_processOp	2	1424	ddc/ddl/ddl_conversion.cpp:582	fold infrastructure; stick sizes (ALREADY PORTED)
+e326_mergePcfgInSuperDSC	2	5	dcg/dcg_manager/dcg_manager.cpp:629	PCFG translator
+e331_exploreSuperChunkDataStageParams	3	140	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2829	dsc2 tree utilities
+e333_fillLoopOffsetsAndAddresses	3	613	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5750	dsc2 tree utilities; stick sizes (ALREADY PORTED)
+e334_addIbrDataStage	3	47	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6626	stick sizes (ALREADY PORTED)
+e338_performPeSfpWorkSplit	3	36	ddc/ddc_transformation.cpp:1395	dsc2 tree utilities
+e347_matchDdl2Dsc	3	442	ddc/ddl/ddl_conversion.cpp:2110	dsc2 tree utilities
+e348_runDcgForDataOpsDlOps	3	179	dcg/dcg_manager/dcg_manager.cpp:269	DCG backend; ISA tables; PCFG translator; fold infrastructure
+e349_convertToProgIRDataOp	3	46	dcg/dcg_manager/dcg_manager.cpp:898	DCG backend; ISA tables; PCFG translator
+e353_createAllocationAndTransfer	4	254	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3121	dsc2 tree utilities
+e354_processDscHbmPagedTensors	4	56	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6746	dsc2 tree utilities
+e356_buildFoldForAllocation	4	473	ddc/ddc_fold.cpp:2395	dsc2 tree utilities; fold infrastructure
+e357_buildFoldForCompute	4	773	ddc/ddc_fold.cpp:3656	dsc2 tree utilities
+e359_transformRegToFifoOrLatch	4	82	ddc/ddc_transformation.cpp:610	dsc2 tree utilities
+e360_transformFor4BsplatRead	4	87	ddc/ddc_transformation.cpp:1766	dsc2 tree utilities
+e361_relatedToExternalNodes	4	20	ddc/ddc_transformation_util.cpp:1757	dsc2 tree utilities
+e370_buildAndPropagateFold	5	350	ddc/ddc_fold.cpp:1625	dsc2 tree utilities
+e371_replace_assign	5	119	ddc/transformations/automatic_shuffle/shuffle.cpp:788	stick sizes (ALREADY PORTED)
+e375_coordinateCapture	6	86	ddc/ddc_fold.cpp:1538	dsc2 tree utilities
+e376_performAutomaticShuffling	6	167	ddc/ddc_transformation.cpp:1855	dsc2 tree utilities
+e379_run_v1	7	109	ddc/ddcv1.cpp:3692	constraint check (ALREADY PORTED)
+e382_run	9	122	dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912	dsc2 tree utilities

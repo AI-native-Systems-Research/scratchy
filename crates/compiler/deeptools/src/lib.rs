@@ -39,6 +39,10 @@ pub mod bridges;
 /// AN IR AND NOTHING ELSE — one module per IR.
 pub mod islands;
 
+/// The scheduling and address-placement stage: `runDdc`'s L3 DL-ops
+/// scheduler and Deep Dataflow Constructor.
+pub mod schedule;
+
 /// HOW WIDE ONE ELEMENT OF EACH FORMAT IS — IBM's own bit-width table.
 pub mod formats;
 
