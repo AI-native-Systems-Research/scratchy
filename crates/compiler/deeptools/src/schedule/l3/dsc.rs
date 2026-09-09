@@ -19,11 +19,11 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
 use crate::schedule::ddc::fold::Stride;
 use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::{DsType, Scale};
-use crate::schedule::ddc::transformation_util::PaddingForm;
+use crate::schedule::ddc::transformation_util::{PaddingForm, StageName};
 use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName};
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use sys_arch_spec::arch_enums::SenComponent;
 
 /// WHERE ONE LABELLED DATA STRUCTURE LIVES — `memOrg_` (`dsc/dscdefn.h:337`) reduced to the three
@@ -230,6 +230,17 @@ impl LabeledDsList {
             .find(|(at, _)| *at == idx)
             .map(|(_, lds)| lds)
     }
+
+    /// `isOutputLabeledDs(ldsIdx, dsc)` (`L3DlOpsScheduler.h:228`) — `ldsIdx == labeledDs_.size()
+    /// - 1`, so the LAST entry is the output and a non-empty list always has one.
+    ///
+    /// ⛔ TRAP: IT IS ASKED OF `lds.ldsIdx_`, THE ENTRY'S OWN [`LabeledDs::recorded`] INDEX, and not
+    /// of the position that entry sits at — so a recorded index that drifted from its position
+    /// answers for whichever position the index names.
+    #[must_use]
+    pub fn is_output(&self, idx: LdsIdx) -> bool {
+        idx.0 as usize + 1 == self.iter().count()
+    }
 }
 
 /// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:74`) reduced to the
@@ -254,6 +265,21 @@ pub struct DesignSpaceConfig {
     pub core_ids_used: CoreIdsUsed,
     /// `getLayoutDims(ldsIdx)` (`dsc/dsc2.cpp:4007`), per labelled data structure.
     pub layout_dims: BTreeMap<LdsIdx, LayoutDims>,
+    /// `labeledDs_`.
+    pub labeled_ds: LabeledDsList,
+    /// `dataStageParam_` (`dsc/designSpaceConfig.h:105`).
+    pub data_stages: DataStages,
+    /// `computeOp_.at(0).indirectAccessIndexLabeledDs` (`dsc/dscdefn.h:511`), by index.
+    pub indirect_access_index_lds: BTreeSet<LdsIdx>,
+    /// `getBufferCapacityForNode(lds.memOrg_.at(LX).allocateNode_, ldsIdx, LX, -1, -1, bytesPerStick)`
+    /// (`dsc/dsc2.cpp:3977`) per labelled data structure, in BYTES as the reference computes it.
+    ///
+    /// ⭐ ABSENCE IS THE TWO `DT_CHECK`s: `memOrg_` naming no `LX`, or its entry carrying no allocate
+    /// node (`L3DlOpsScheduler.cpp:1705-1711`), are one missing entry here.
+    pub lx_chunk_capacity: BTreeMap<LdsIdx, Bytes>,
+}
+
+impl DesignSpaceConfig {
     /// `dataStageParam_.at(dataStageCoreIdx).ss_` — `dataStageCoreIdx` is `0`
     /// (`L3DlOpsScheduler.cpp:275`).
     ///
@@ -262,12 +288,40 @@ pub struct DesignSpaceConfig {
     /// every min-param unit reaches it with a bare `.at()`. `isDimensionCoreletSplit`'s defensive
     /// `count` (`:77`) is then a constant, and [`Self::corelet_shares`] keeps its own answer because
     /// the split it reports may come from `CoreletD_`/`CoreD_` instead.
-    pub core_stage: FilledDims,
-    /// `labeledDs_`.
-    pub labeled_ds: LabeledDsList,
-}
+    ///
+    /// ⭐ A READ OF [`Self::data_stages`] AND NOT A FIELD OF ITS OWN: `dataStageParam_.at(0).ss_` is
+    /// one fact, and a second field holding it is a second answer that can disagree.
+    #[must_use]
+    pub const fn core_stage(&self) -> &FilledDims {
+        &self.data_stages.core().ss.dims
+    }
 
-impl DesignSpaceConfig {
+    /// `getNonBroadcastLdsDims(ldsIdx)` (`dsc/dsc2.cpp:4039`) — `getLayoutDims`' order, filtered to
+    /// the dims whose `scale_` is strictly positive.
+    ///
+    /// ⛔ TRAP: THIS IS NOT THE COMPLEMENT OF `isLabeledDsDimensionBroadcast`. That predicate
+    /// broadcasts on `scale_ < 1` (`L3DlOpsScheduler.cpp:759`); this set keeps every `scale_ > 0`, so
+    /// a fractional scale is broadcast to one and non-broadcast to the other.
+    ///
+    /// ⛔ [`None`] IS `getLayoutDims`' OWN `DT_CHECK`: an index past `labeledDs_`, or a labelled data
+    /// structure whose layout order this DSC does not state. ⛔ AN EMPTY VECTOR IS NOT THAT ABORT —
+    /// a wholly broadcast structure names no dim and is a legitimate answer.
+    ///
+    /// ⭐ THE TWO ORDERS STAY TWO. The reference builds its set from `primaryDsInfo_`'s layout order
+    /// and then filters `getLayoutDims(ldsIdx)`, a DIFFERENT list; [`LabeledDs`] carries the first
+    /// zipped, so the membership test is a scale lookup and a dim named by neither drops out.
+    #[must_use]
+    pub fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Option<Vec<PrimaryDim>> {
+        let entry = self.labeled_ds.at(lds)?;
+        let layout = self.layout_dims.get(&lds)?;
+        Some(
+            layout
+                .iter()
+                .filter(|dim| matches!(entry.scale(*dim), Some(Scale::Sized(scale)) if scale > 0.0))
+                .collect(),
+        )
+    }
+
     /// `getCumulativeStickSizes(dsType)` (`dsc/dsc2.cpp:4108`) with all four flags at their defaults,
     /// which is [`StickPart::Whole`], delegating to the ported fold.
     ///
@@ -279,26 +333,6 @@ impl DesignSpaceConfig {
     pub fn cumulative_stick_sizes(&self, ds_type: DsType) -> Option<Vec<(PrimaryDim, Elements)>> {
         let info = self.primary_ds_info.get(&ds_type)?;
         shape_constraints::cumulative_stick_sizes(&info.stick, StickPart::Whole)
-    }
-
-    /// `getNonBroadcastLdsDims(ldsIdx)` (`dsc/dsc2.cpp:4039`) — `getLayoutDims(ldsIdx)` keeping only
-    /// the dims whose `scale_` is POSITIVE, in that order.
-    ///
-    /// ⭐ THE TWO ORDERS STAY TWO. The reference builds its set from `primaryDsInfo_`'s layout order
-    /// and then filters `getLayoutDims(ldsIdx)`, a DIFFERENT list; [`LabeledDs`] carries the first
-    /// zipped, so the membership test is a scale lookup and a dim named by neither drops out.
-    #[must_use]
-    pub fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Vec<PrimaryDim> {
-        let Some(labeled) = self.labeled_ds.at(lds) else {
-            return Vec::new();
-        };
-        let Some(layout) = self.layout_dims.get(&lds) else {
-            return Vec::new();
-        };
-        layout
-            .iter()
-            .filter(|&dim| matches!(labeled.scale(dim), Some(Scale::Sized(scale)) if scale > 0.0))
-            .collect()
     }
 }
 
@@ -768,6 +802,29 @@ impl StageDims {
         };
         Some(padded != plain.0)
     }
+
+    /// `DataStructDims::compound` (`dsc/dims.cpp:84`) — `IJ = I·J` and `KIJ = KI·KJ`, and a product
+    /// with an absent or negative operand is the compound dim's OWN absence, which is the `-1` the
+    /// reference writes.
+    ///
+    /// ⛔ THE REFERENCE ALSO WRITES `zij_`, `sij_` AND `rc_`: no `PrimaryDimTypes` value names those
+    /// six operands or their three products (`dsc/dims.cpp:485`), so they are unspellable here — and
+    /// no unit of this file reads them.
+    pub fn compound(&mut self) {
+        for (product, left, right) in [
+            (PrimaryDim::Ij, PrimaryDim::I, PrimaryDim::J),
+            (PrimaryDim::Kij, PrimaryDim::Ki, PrimaryDim::Kj),
+        ] {
+            match (self.extent(left), self.extent(right)) {
+                (Some(Extent(left)), Some(Extent(right))) if left >= 0 && right >= 0 => {
+                    self.extents.insert(product, Extent(left * right));
+                }
+                _ => {
+                    self.extents.remove(&product);
+                }
+            }
+        }
+    }
 }
 
 /// A DATA STAGE WITH DIMS IN IT — `!DataStructDims::empty()` (`dsc/dims.cpp:112`) as a type, so
@@ -797,6 +854,26 @@ impl FilledDims {
     /// `symbolicDimInfo_`/`maxSymbolicVolume_`, for the scheduler to carry forward.
     pub const fn symbolic_mut(&mut self) -> &mut Symbolic {
         &mut self.0.symbolic
+    }
+
+    /// `primaryDimToValHandler_st(dim) = extent` — the scheduler's one way to write a dim. Adding an
+    /// extent cannot empty the map, so the non-emptiness survives it.
+    pub fn set_extent(&mut self, dim: PrimaryDim, extent: Extent) {
+        self.0.extents.insert(dim, extent);
+    }
+
+    /// `DataStructDims::compound()`, which only ever writes a COMPOUND dim and so cannot empty a
+    /// stage that states any other one.
+    ///
+    /// ⛔ DIVERGENCE, IN THE ONE CASE THE REFERENCE CAN EMPTY A STAGE: a stage stating NOTHING BUT
+    /// `IJ`/`KIJ` would lose them to the `-1` write, and keeps them here instead. Every stage this
+    /// file compounds is a copy of a data stage's `ss_`, which states its layout dims.
+    pub fn compound(&mut self) {
+        let before = self.0.extents.clone();
+        self.0.compound();
+        if self.0.extents.is_empty() {
+            self.0.extents = before;
+        }
     }
 }
 
@@ -1000,3 +1077,209 @@ pub struct InitialPlacement {
     /// `bufferOffsetCoreCorelet_.at(core).at(0)`, or `0` where there is only ever one buffer.
     pub buffer_offset: BufferOffset,
 }
+/// THE TWO STAGE NAMES THE L3 SCHEDULER WRITES.
+///
+/// ⭐ AN INHERENT IMPL ON [`crate::schedule::ddc::transformation_util::StageName`] AND NOT A SECOND
+/// NEWTYPE: `DataStructDims::name_` is one field, and the ddc view already states it. The two names
+/// live here because `"superchunk"` is the L3 scheduler's word, not the transformer's.
+impl StageName {
+    /// `"superchunk"` (`L3DlOpsScheduler.cpp:2814`).
+    #[must_use]
+    pub fn super_chunk() -> Self {
+        Self("superchunk".to_owned())
+    }
+
+    /// `"chunk"` (`L3DlOpsScheduler.cpp:1412`).
+    #[must_use]
+    pub fn chunk() -> Self {
+        Self("chunk".to_owned())
+    }
+}
+
+/// ONE HALF OF A DATA STAGE — a `DataStructDims` with its `name_`, which is the field the two halves
+/// of a `dsc2::DataStage` differ in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedDims {
+    /// `name_`.
+    pub name: StageName,
+    /// The dims themselves.
+    pub dims: FilledDims,
+}
+
+/// ONE DATA STAGE — `dsc2::DataStage` (`dsc/dsc2.h:40`): the stick-space dims and the element-space
+/// dims, each carrying its own name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataStage {
+    /// `ss_`.
+    pub ss: NamedDims,
+    /// `el_`.
+    pub el: NamedDims,
+}
+
+impl DataStage {
+    /// `name()` — `ss_.name_` (`dsc/dsc2.h:43`), so the stage's name is the stick side's.
+    #[must_use]
+    pub const fn name(&self) -> &StageName {
+        &self.ss.name
+    }
+
+    /// `ds.ss_.name_ = ds.el_.name_ = name` — a rename touches BOTH halves, which is the only write
+    /// `addSuperChunkDataStage` makes to the stage it copies.
+    pub fn rename(&mut self, name: StageName) {
+        self.ss.name = name.clone();
+        self.el.name = name;
+    }
+
+    /// `ss_.primaryDimToVal_st(dim)`, `None` for a dim the stick side does not state.
+    #[must_use]
+    pub fn ss_extent(&self, dim: PrimaryDim) -> Option<Extent> {
+        self.ss.dims.dims().extent(dim)
+    }
+}
+
+/// EVERY DATA STAGE OF A DSC — `dataStageParam_`, with the core and chunk stages HELD APART.
+///
+/// ⭐⭐ THAT SPLIT IS "Core data stage parameters are unavailable." AND "Expect chunk data stage."
+/// DISCHARGED ONCE: eight units of this file open with one or both of those `DT_CHECK`s and not one
+/// of them has an arm for the failure, so the two fixed stages are fields and the minted ones are a
+/// map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataStages {
+    core: DataStage,
+    chunk: DataStage,
+    minted: BTreeMap<DatastageId, DataStage>,
+}
+
+impl DataStages {
+    /// A DSC whose core and chunk stages are both stated.
+    #[must_use]
+    pub const fn new(core: DataStage, chunk: DataStage) -> Self {
+        Self {
+            core,
+            chunk,
+            minted: BTreeMap::new(),
+        }
+    }
+
+    /// `dataStageParam_.at(dataStageCoreIdx)`.
+    #[must_use]
+    pub const fn core(&self) -> &DataStage {
+        &self.core
+    }
+
+    /// `dataStageParam_.at(dataStageChunkIdx)`.
+    #[must_use]
+    pub const fn chunk(&self) -> &DataStage {
+        &self.chunk
+    }
+
+    /// `dataStageParam_.at(index)`, `None` for an index no stage was created for.
+    #[must_use]
+    pub fn at(&self, index: DatastageId) -> Option<&DataStage> {
+        match index {
+            DATA_STAGE_CORE => Some(&self.core),
+            DATA_STAGE_CHUNK => Some(&self.chunk),
+            other => self.minted.get(&other),
+        }
+    }
+
+    /// `dataStageParam_[index] = stage`.
+    pub fn set(&mut self, index: DatastageId, stage: DataStage) {
+        match index {
+            DATA_STAGE_CORE => self.core = stage,
+            DATA_STAGE_CHUNK => self.chunk = stage,
+            other => {
+                self.minted.insert(other, stage);
+            }
+        }
+    }
+
+    /// `dataStageSuperChunkIdx >= 0 && dataStageParam_.count(dataStageSuperChunkIdx)` — the witness
+    /// that a superchunk index NAMES AN ENTRY THAT ALREADY EXISTS.
+    ///
+    /// ⭐ IT HOLDS BECAUSE `getNewDataStageIndex` DEFAULT-INSERTS: its last statement is the bare
+    /// subscript `dsc.dataStageParam_[newIdx];` (`L3DlOpsScheduler.cpp:6624`), so the entry is present
+    /// and empty before `addSuperChunkDataStage` ever runs. The `>= 0` half is [`DatastageId`]'s own.
+    #[must_use]
+    pub fn super_chunk(&self, index: DatastageId) -> Option<SuperChunkStage> {
+        self.at(index).map(|_| SuperChunkStage(index))
+    }
+}
+
+/// A SUPERCHUNK DATA-STAGE INDEX THAT NAMES AN EXISTING ENTRY — minted by
+/// [`DataStages::super_chunk`] and by nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperChunkStage(DatastageId);
+
+impl SuperChunkStage {
+    /// `dataStageSuperChunkIdx` (`L3DlOpsScheduler.h:225`).
+    #[must_use]
+    pub const fn index(self) -> DatastageId {
+        self.0
+    }
+}
+
+/// ONE DIM'S CANDIDATE CHUNK EXTENTS WITH THE INDEX THE SEARCH SELECTED — `DscParamCandidatesType`'s
+/// inner vector ZIPPED ONTO `DscParamCandidateIndicesType`'s index (`L3DlOpsScheduler.h:99-102`).
+///
+/// ⭐ THE ZIP IS `DT_CHECK_MSG(selectedIdx < dscCandidates[dscIdx].at(dim).size(), "Index is out of
+/// range.")`: once the list and the choice into it are one value, the question cannot be asked, and
+/// the pair of `.at(dim)` lookups the reference does on two separate maps becomes one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedCandidate {
+    candidates: Vec<Extent>,
+    selected: usize,
+}
+
+impl SelectedCandidate {
+    /// A candidate list with the index the search chose, or `None` where the index is past its end.
+    #[must_use]
+    pub fn new(candidates: Vec<Extent>, selected: u32) -> Option<Self> {
+        let selected = selected as usize;
+        (selected < candidates.len()).then_some(Self {
+            candidates,
+            selected,
+        })
+    }
+
+    /// `dscCandidates[dscIdx].at(dim).at(selectedIdx)`.
+    #[must_use]
+    pub fn extent(&self) -> Extent {
+        self.candidates[self.selected]
+    }
+
+    /// Every candidate the search generated for this dim.
+    #[must_use]
+    pub fn candidates(&self) -> &[Extent] {
+        &self.candidates
+    }
+}
+
+/// ONE DSC'S SELECTED CHUNK PARAMETERS — `dscCandidates[dscIdx]` and `selectedIndices[dscIdx]`
+/// narrowed to the `primaryDims` the caller asks to be written, which is the whole mechanism for
+/// reaching this unit's operands.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DscParamCandidates(pub BTreeMap<PrimaryDim, SelectedCandidate>);
+
+/// HOW MANY STICKS ONE STICK VOLUME SPANS — `stickVolume`, POSITIVE BY TYPE, which is
+/// `DT_CHECK_MSG(stickVolume > 0, "Invalid stick volume.")` (`L3DlOpsScheduler.cpp:1704`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StickVolume(NonZeroU64);
+
+impl StickVolume {
+    /// A stick volume of at least one stick.
+    #[must_use]
+    pub const fn new(sticks: NonZeroU64) -> Self {
+        Self(sticks)
+    }
+
+    /// The span, in sticks.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// HOW MANY STICK VOLUMES — the count `getLabeledDsNumOfStickVolumesInCore` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StickVolumes(pub u64);

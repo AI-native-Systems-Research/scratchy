@@ -263,8 +263,8 @@ impl Coordinate {
     }
 }
 
-/// A NODE'S NAME — `ScheduleNode::name_`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A NODE'S NAME — `ScheduleNode::name_`, whose default is the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct NodeName(pub String);
 
 /// WHAT AN OPERAND KNOWS ABOUT ITS DATA — `DataInfo` (`dsc/dsc2.h:721`) narrowed to the three fields
@@ -546,14 +546,17 @@ pub struct TransferNode {
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
 }
 
-/// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to what minting one writes.
+/// `dsc2::BlockNode` (`dsc/dsc2.h:526`) narrowed to the `name_` a block is looked up by and the
+/// `next_` children a traversal descends into.
 ///
-/// ⛔ `next_` IS NOT HERE BECAUSE A FRESH BLOCK HAS NO CHILDREN: `new dsc2::BlockNode()` leaves the
-/// child vector empty, and `addChildNode`/`moveChildNode` are the units that fill it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ⛔ A FRESH BLOCK HAS NO CHILDREN: `new dsc2::BlockNode()` leaves the child vector empty, and
+/// `addChildNode`/`moveChildNode` are the units that fill it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockNode {
     /// `name_`.
     pub name: NodeName,
+    /// `next_`, in order.
+    pub children: Vec<SchedNode>,
 }
 
 /// WHICH END OF A SIGNAL PAIR A SYNC NODE IS — `SyncNode::isReceive_` (`dsc/dsc2.h:967`), whose
@@ -832,4 +835,116 @@ pub const fn generic_comp(unit: SenComponent) -> Option<GenericComp> {
         | SenComponent::Nfwd2
         | SenComponent::L0Scale => None,
     }
+}
+
+/// ONE SCHEDULE-TREE NODE — `dsc2::ScheduleNode`'s subclasses, reduced to the distinction
+/// `traverseTreeDFS`'s `nodeTypes` filter makes (`dsc/dsc2.cpp:2222`): which `nodeType_` a node
+/// carries, and whether `isBlockNode()` (`dsc/dsc2.h:477`) lets the walk descend into it.
+///
+/// ⭐ `Loop` AND `Condition` HOLD A [`BlockNode`] BECAUSE THAT IS THE C++ INHERITANCE: `LoopNode`
+/// derives from `BlockNode` (`dsc/dsc2.h:563`), so each is its block part narrowed to what the
+/// traversal reads. Their own fields belong to the units that read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedNode {
+    /// `nodeType_ == BLOCK` — the only kind a `{BLOCK}` filter yields.
+    Block(BlockNode),
+    /// `nodeType_ == LOOP`: descended into, never yielded by a `{BLOCK}` filter.
+    Loop(BlockNode),
+    /// `nodeType_ == CONDITION`: likewise a block kind that a `{BLOCK}` filter passes over.
+    Condition(BlockNode),
+    /// An allocate, compute, transfer, sync or stick-mask node — `isBlockNode()` is false and it has
+    /// no children, so the walk neither yields nor descends.
+    Leaf(NodeName),
+}
+
+/// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:625`) reduced to `head_`, whose
+/// children are the frontier every traversal starts from.
+///
+/// ⭐ `head_` IS NEVER VISITED. `traverseTreeDFS(nullptr, ..)` seeds the queue with `head_.next_`
+/// (`dsc/dsc2.cpp:2233`), and `head_` is a `LoopNode` with `denId_ = 0` in any case, so a `{BLOCK}`
+/// filter could not name it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScheduleTree {
+    head: BlockNode,
+}
+
+impl ScheduleTree {
+    /// A tree over `head_`'s children.
+    #[must_use]
+    pub const fn new(head: BlockNode) -> Self {
+        Self { head }
+    }
+
+    /// `getHead()` — the root's block part.
+    #[must_use]
+    pub const fn head(&self) -> &BlockNode {
+        &self.head
+    }
+
+    /// `getHeadMutable()`.
+    pub const fn head_mut(&mut self) -> &mut BlockNode {
+        &mut self.head
+    }
+
+    /// `traverseTreeDFS(nullptr, {BLOCK})` (`dsc/dsc2.cpp:2222`) — every `BLOCK` node in pre-order
+    /// DFS, descending through the loop and condition blocks it does not yield.
+    #[must_use]
+    pub fn blocks_dfs(&self) -> Vec<&BlockNode> {
+        let mut found = Vec::new();
+        collect_blocks(&self.head, &mut found);
+        found
+    }
+
+    /// `traverseTreeDFSMutable(nullptr, {BLOCK})` FUSED WITH THE `break` ITS CALLERS WRITE: the FIRST
+    /// `BLOCK` node the pre-order walk accepts, exclusively borrowed so the caller can edit it.
+    ///
+    /// ⭐ THE FUSION IS WHAT RUST ADMITS. The reference hands back a `std::vector<ScheduleNode*>`
+    /// holding a block AND its descendants at once; every `{BLOCK}` caller in the scheduler stops at
+    /// its first match, so the search — not the vector — is the primitive.
+    pub fn find_block_mut(
+        &mut self,
+        accepts: impl Fn(&BlockNode) -> bool + Copy,
+    ) -> Option<&mut BlockNode> {
+        find_block_mut(&mut self.head, accepts)
+    }
+}
+
+/// Pre-order DFS over the `BLOCK` nodes below `block`, which is itself never yielded.
+fn collect_blocks<'a>(block: &'a BlockNode, found: &mut Vec<&'a BlockNode>) {
+    for child in &block.children {
+        match child {
+            SchedNode::Block(inner) => {
+                found.push(inner);
+                collect_blocks(inner, found);
+            }
+            SchedNode::Loop(inner) | SchedNode::Condition(inner) => collect_blocks(inner, found),
+            SchedNode::Leaf(_) => {}
+        }
+    }
+}
+
+/// The first accepted `BLOCK` node below `block`, in the same pre-order.
+fn find_block_mut(
+    block: &mut BlockNode,
+    accepts: impl Fn(&BlockNode) -> bool + Copy,
+) -> Option<&mut BlockNode> {
+    for child in &mut block.children {
+        match child {
+            SchedNode::Block(inner) => {
+                if accepts(inner) {
+                    return Some(inner);
+                }
+                if let Some(found) = find_block_mut(inner, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Loop(inner) | SchedNode::Condition(inner) => {
+                if let Some(found) = find_block_mut(inner, accepts) {
+                    return Some(found);
+                }
+            }
+            SchedNode::Leaf(_) => {}
+        }
+    }
+    None
 }
