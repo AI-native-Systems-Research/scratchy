@@ -79,12 +79,13 @@
 //! | `e325_runOnOperation` | 325 | 1 | 10 | `dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:81` |
 
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e325_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e325_runOnOperation`: at that point an unused item here is a real defect again.
+// file's own tests. CI runs clippy with `-D warnings`, so without this the module fails the gate.
+// ⭐ `e325_runOnOperation` HAS LANDED AND THE ATTRIBUTE STILL HAS TO STAY: it is the pass entry, and
+// nothing constructs the pass list yet, so IT is now the unused item. REMOVE THIS when a pipeline
+// calls [`run_on_operation`].
 #![allow(dead_code)]
 
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{Op, sentient};
@@ -224,15 +225,25 @@ fn insert_nops(block: &mut Vec<Op>, marker: &mut Marker) {
     }
 }
 
-// crustify:todo: e325_runOnOperation
-//   authority : dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:81  (10 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e100_runOn
+/// Replaces: e325_runOnOperation
+///
+/// The pass entry: [`run_on_program`] over the module, and only where the ISA generation is at or
+/// below `RCUDD1A_ISA` — the hardware whose back-to-back sync bug this works around.
+///
+/// ⛔ TRAP: THE GATE IS A COMPARISON, NOT AN EQUALITY (`:83`), so a generation ABOVE `RCUDD1A_ISA`
+/// gets no NOPs at all — `IsaGen::Sen1p5` is one.
+/// ⭐ `if (DisableThisPass) return;` IS COMMENTED OUT AT `:82` and so is the flag it reads (`:60-63`);
+/// there is nothing to gate on, which is why no `DISABLE_THIS_PASS` appears here.
+pub fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if A::GEN <= IsaGen::Rcudd1a {
+        run_on_program(program);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{run_on_program, run_on_unit};
-    use crate::arch::Dd2;
+    use super::{run_on_operation, run_on_program, run_on_unit};
+    use crate::arch::{Arch, Dd2, Sen1p5};
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
@@ -291,8 +302,8 @@ mod unit_tests {
         })
     }
 
-    /// A one-unit program of `kind` running `body`.
-    fn program_on(kind: DfirUnit, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+    /// A one-unit program of `kind` running `body`, on whichever arch the caller names.
+    fn program_on<A: Arch>(kind: DfirUnit, body: Vec<Op>) -> Program<A, AnyModel, AnyRung> {
         Program {
             name: ProgramName {
                 group: GroupId(0),
@@ -318,7 +329,7 @@ mod unit_tests {
     #[test]
     fn e100_inserts_only_into_l0su_units() {
         let body = vec![hard_send("s0"), hard_send("s1")];
-        let mut on_l0su = program_on(DfirUnit::L0su, body.clone());
+        let mut on_l0su = program_on::<Dd2>(DfirUnit::L0su, body.clone());
         run_on_program(&mut on_l0su);
         assert_eq!(
             on_l0su.units.iter().next().expect("the head unit").body,
@@ -331,7 +342,7 @@ mod unit_tests {
             ]
         );
 
-        let mut on_lxsu = program_on(DfirUnit::Lxsu, body.clone());
+        let mut on_lxsu = program_on::<Dd2>(DfirUnit::Lxsu, body.clone());
         run_on_program(&mut on_lxsu);
         assert_eq!(
             on_lxsu.units.iter().next().expect("the head unit").body,
@@ -387,6 +398,32 @@ mod unit_tests {
                 nop("s3"),
                 hard_send("s3"),
             ]
+        );
+    }
+
+    /// e325 — the same back-to-back pair on an `l0su` unit is separated on Dd2 (`RCUDD1A_ISA`) and
+    /// left exactly as it is on Sen1p5, which is above the gate.
+    #[test]
+    fn e325_inserts_only_at_or_below_rcudd1a() {
+        let body = vec![hard_send("s0"), hard_send("s1")];
+        let mut on_dd2 = program_on::<Dd2>(DfirUnit::L0su, body.clone());
+        run_on_operation(&mut on_dd2);
+        assert_eq!(
+            on_dd2.units.iter().next().expect("the head unit").body,
+            vec![
+                hard_send("s0"),
+                Op::Sentient(sentient::Op::Nop {
+                    dbg_name: Some("NOPInsB2BS(s1)".to_owned()),
+                }),
+                hard_send("s1"),
+            ]
+        );
+
+        let mut on_sen1p5 = program_on::<Sen1p5>(DfirUnit::L0su, body.clone());
+        run_on_operation(&mut on_sen1p5);
+        assert_eq!(
+            on_sen1p5.units.iter().next().expect("the head unit").body,
+            body
         );
     }
 }

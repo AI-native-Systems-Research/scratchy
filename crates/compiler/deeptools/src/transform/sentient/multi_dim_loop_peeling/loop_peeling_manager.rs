@@ -82,8 +82,8 @@
 //! | `e604_findCandidates` | 604 | 5 | 30 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:402` |
 //! | `e630_run` | 630 | 6 | 130 | `dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:607` |
 
-use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::islands::sentient::dialects::{
     self, Op, StaticBranch, Val, replace_if_with_region, sentient, static_if_branch, static_operand,
 };
@@ -349,7 +349,8 @@ fn next_static_if(candidates: IfOpsToSimplify, block: &[Op]) -> Option<(RegionPa
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        IfOpsToSimplify, PredicatesOnIv, decrement_predicates_on_iv, simplify_conditionals,
+        IfOpsToSimplify, PredicatesOnIv, copy_one_iter, decrement_predicates_on_iv,
+        simplify_conditionals,
     };
     use crate::islands::dataflow_ir::Values;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -382,6 +383,44 @@ mod unit_tests {
             dbg_name: None,
             then_body,
             else_body,
+        })
+    }
+
+    /// `%r = sentient.scalar_add %lhs, %rhs : index`.
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            ty: ScalarTy::Index,
+            element_size: None,
+        })
+    }
+
+    /// One carried value: `init` in, `arg` inside, `result` out.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lrf,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// `sentient.for %iv = 1 to %bound iter_args(..) { body }`.
+    fn for_loop(iv: Val, bound: Val, carried: Vec<sentient::Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried,
+            dbg_name: None,
+            body,
         })
     }
 
@@ -487,12 +526,173 @@ mod unit_tests {
         assert_eq!(body.len(), 1);
         assert!(matches!(body[0], Op::Sentient(sentient::Op::Nop { .. })));
     }
+
+    /// e322 — one iteration of `for %iv = 1 to 8 iter_args(%a = %c0) { if %iv < 4 {..}; %n = %a + 4;
+    /// yield %n }` peeled BEFORE the loop, then one peeled AFTER it: the clone's body lands in the
+    /// clone's place with the IV pinned and the iter arg reading the init, the `sentient.if` the
+    /// pinning decided is gone, and the loop's own result reader ends on the yielded value.
+    #[test]
+    fn e322_copies_one_iteration_out_of_the_loop() {
+        let nop = Op::Sentient(sentient::Op::Nop { dbg_name: None });
+        let loop_op = |sibling: Vec<Op>| {
+            let mut block = vec![
+                constant(0, Val(0)),
+                constant(8, Val(1)),
+                constant(4, Val(2)),
+                for_loop(
+                    Val(3),
+                    Val(1),
+                    vec![carried(Val(0), Val(4), Val(5))],
+                    vec![
+                        if_op(
+                            sentient::CmpPredicate::Slt,
+                            Val(3),
+                            Val(2),
+                            vec![nop.clone()],
+                            Vec::new(),
+                        ),
+                        add(Val(4), Val(2), Val(6)),
+                        Op::Sentient(sentient::Op::Yield {
+                            results: vec![Val(6)],
+                        }),
+                    ],
+                ),
+            ];
+            block.extend(sibling);
+            block
+        };
+
+        // Peeled before the loop: constant, hoisted body, then the untouched original.
+        let mut values = Values::default();
+        for _ in 0..7 {
+            let _ = values.mint();
+        }
+        let mut block = loop_op(Vec::new());
+        let original = block[3].clone();
+        let mut new_iter_args = vec![Val(0)];
+        copy_one_iter(&mut block, 3, &mut new_iter_args, 5, false, &mut values);
+        assert_eq!(new_iter_args, vec![Val(10)]);
+        assert!(matches!(
+            block[3],
+            Op::Sentient(sentient::Op::ScalarConstant { value: 5, .. })
+        ));
+        assert_eq!(block[4], add(Val(0), Val(2), Val(10)));
+        assert_eq!(block[5], original);
+        assert_eq!(block.len(), 6);
+
+        // Peeled after it, with a sibling reading the loop's result: that reader ends on the value
+        // this iteration yielded, through the clone's result.
+        let mut values = Values::default();
+        for _ in 0..13 {
+            let _ = values.mint();
+        }
+        let mut block = loop_op(vec![add(Val(5), Val(2), Val(12))]);
+        let original = block[3].clone();
+        let mut new_iter_args = vec![Val(0)];
+        copy_one_iter(&mut block, 3, &mut new_iter_args, 8, true, &mut values);
+        assert_eq!(new_iter_args, vec![Val(16)]);
+        assert_eq!(block[3], original);
+        assert_eq!(block[5], add(Val(0), Val(2), Val(16)));
+        assert_eq!(block[6], add(Val(16), Val(2), Val(12)));
+        assert_eq!(block.len(), 7);
+    }
 }
 
-// crustify:todo: e322_copyOneIter
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:461  (65 body lines, level 1)
-//   original  : void LoopPeelingManager::copyOneIter( sentient::ForOp for_op, llvm::SmallVector<mlir::Value, 4> &new_iter_args, int64_t iv_val, bool move_after)
-//   calls     : e096_simplifyConditionals, e252_size
+/// Replaces: e322_copyOneIter
+///
+/// Peels one iteration: clones the loop beside itself, pins the clone's IV to `iv_val`, rewires its
+/// iter args onto `new_iter_args`, folds what pinning decided, hoists the clone's body into the
+/// clone's place and leaves `new_iter_args` holding what that iteration yielded.
+///
+/// ⛔ TRAP: THE RESULT REWIRING IS IN TWO PARTS ON PURPOSE (`:484-493`) — the original's results go to
+/// the clone's, and only the hoist sends those on to the yielded values, so an iter arg init value
+/// that reads the original loop is NOT rewired to this iteration's value.
+/// ⭐ DIVERGENCE: the `iv_val` constant lands immediately before the clone, not at `const_builder_`'s
+/// program-unit top — [`static_operand`] resolves a definition in the block it is handed, as e095.
+pub fn copy_one_iter(
+    block: &mut Vec<Op>,
+    at: usize,
+    new_iter_args: &mut Vec<Val>,
+    iv_val: i64,
+    move_after: bool,
+    values: &mut Values,
+) {
+    let Some(original @ Op::Sentient(sentient::Op::For { .. })) = block.get(at) else {
+        return;
+    };
+    let original_results = dialects::results(original);
+    let mut mapping = ValueMapping::new();
+    let Some(cloned) =
+        dialects::clone_ops(core::slice::from_ref(original), values, &mut mapping).pop()
+    else {
+        return;
+    };
+    let folded = values.mint();
+    let constant = Op::Sentient(sentient::Op::ScalarConstant {
+        value: iv_val,
+        result: folded,
+        reg_locale: sentient::RegType::Imm,
+        // `iv.getType()` — a `sentient.for`'s induction variable is an `index`.
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    });
+    // `OpBuilder builder(for_op)`, or `setInsertionPointAfter(for_op)` — with the pinned IV's
+    // constant immediately before the clone either way.
+    let const_at = at + usize::from(move_after);
+    block.insert(const_at, constant);
+    let cloned_at = const_at + 1;
+    block.insert(cloned_at, cloned);
+
+    let Some(Op::Sentient(sentient::Op::For { iv, carried, .. })) = block.get(cloned_at) else {
+        return;
+    };
+    let cloned_iv = *iv;
+    let cloned_args: Vec<Val> = carried.iter().map(|entry| entry.arg).collect();
+    let cloned_results: Vec<Val> = carried.iter().map(|entry| entry.result).collect();
+
+    dialects::replace_all_uses_with(block, cloned_iv, folded);
+    if move_after {
+        for (of, with) in original_results.iter().zip(&cloned_results) {
+            dialects::replace_all_uses_with(block, *of, *with);
+        }
+    }
+    // `DT_CHECK_MSG(new_iter_args.size() == cloned_for_op.getNumResults(), "Invalid set of iter arg
+    // init values")` (`:498-499`) — the zip stops at the shorter, so a caller holding fewer inits
+    // rewires fewer args rather than aborting.
+    for (arg, init) in cloned_args.iter().zip(new_iter_args.iter()) {
+        dialects::replace_all_uses_with(block, *arg, *init);
+    }
+    simplify_conditionals(IfOpsToSimplify::Reading(folded), block);
+
+    let Some(Op::Sentient(sentient::Op::For { body, .. })) = block.get_mut(cloned_at) else {
+        return;
+    };
+    let mut hoisted = core::mem::take(body);
+    // `while (!body->empty())` BREAKS AT THE `sentient.yield`: whatever follows it dies with the loop.
+    let mut yielded = None;
+    if let Some(cut) = hoisted
+        .iter()
+        .position(|op| matches!(op, Op::Sentient(sentient::Op::Yield { .. })))
+    {
+        if let Op::Sentient(sentient::Op::Yield { results }) = &hoisted[cut] {
+            yielded = Some(results.clone());
+        }
+        hoisted.truncate(cut);
+    }
+    let tail = block.split_off(cloned_at + 1);
+    block.truncate(cloned_at);
+    block.extend(hoisted);
+    block.extend(tail);
+    if let Some(results) = yielded {
+        new_iter_args.clear();
+        new_iter_args.extend(results);
+        if move_after {
+            for (of, with) in cloned_results.iter().zip(new_iter_args.iter()) {
+                dialects::replace_all_uses_with(block, *of, *with);
+            }
+        }
+    }
+}
 
 // crustify:todo: e448_performLoopPeeling
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:543  (63 body lines, level 2)

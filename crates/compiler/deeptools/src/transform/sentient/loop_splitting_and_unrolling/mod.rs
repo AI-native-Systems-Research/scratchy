@@ -761,20 +761,71 @@ pub(crate) fn compute_reduced_cost<E: InstructionEstimator>(
     }
 }
 
-// crustify:todo: e318_promoteForLoopBodyAndDelete
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:147  (10 body lines, level 1)
-//   original  : void LoopSplittingAndUnrollingPass::promoteForLoopBodyAndDelete( sentient::ForOp for_op)
-//   calls     : e085_replaceIterArgsAndYieldResults
+/// Replaces: e318_promoteForLoopBodyAndDelete
+///
+/// Rewires the loop's iter args and results ([`replace_iter_args_and_yield_results`]), then hoists
+/// its body — minus the terminator — into the loop's own place and erases the loop.
+///
+/// ⛔ TRAP: THE SPLICE IS AT THE LOOP'S POSITION, not the end of the block, so the hoisted ops keep
+/// their order against the loop's siblings — a later sibling still reads them.
+/// ⭐ `getBody()->back().erase()` erases the terminator unconditionally; this island materialises a
+/// `sentient.yield` only when the loop carries something, so the drop is guarded.
+pub(crate) fn promote_for_loop_body_and_delete(scope: &mut Vec<Op>, at: usize) {
+    if scope.get(at).and_then(ForOp::of).is_none() {
+        return;
+    }
+    replace_iter_args_and_yield_results(scope, at);
+    let Some(Op::Sentient(ops::Op::For { body, .. })) = scope.get_mut(at) else {
+        return;
+    };
+    let mut hoisted = core::mem::take(body);
+    if matches!(hoisted.last(), Some(Op::Sentient(ops::Op::Yield { .. }))) {
+        hoisted.pop();
+    }
+    let tail = scope.split_off(at + 1);
+    scope.truncate(at);
+    scope.extend(hoisted);
+    scope.extend(tail);
+}
 
-// crustify:todo: e319_getAllTrueIndexOfIfOpsList
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:587  (7 body lines, level 1)
-//   original  : std::vector<bool> LoopSplittingAndUnrollingPass::getAllTrueIndexOfIfOpsList( int bound, llvm::SmallVectorImpl<sentient::IfOp> &if_list)
-//   calls     : e090_evaluatePredicate
+/// Replaces: e319_getAllTrueIndexOfIfOpsList
+///
+/// Each if op's predicate ([`evaluate_predicate`]) at one iteration bound, in the list's order.
+///
+/// ⛔ TRAP: THE NAME IS A MISNOMER — nothing is filtered and no index is returned: the result is one
+/// `bool` per if op, positionally, and its callers compare whole vectors across bounds.
+#[must_use]
+pub(crate) fn get_all_true_index_of_if_ops_list(
+    bound: IterBound,
+    if_list: &[&Op],
+    scope: &[Op],
+) -> Vec<bool> {
+    if_list
+        .iter()
+        .map(|if_op| evaluate_predicate(bound, if_op, scope))
+        .collect()
+}
 
-// crustify:todo: e320_subsetsImpl
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:622  (9 body lines, level 1)
-//   original  : static void subsetsImpl(std::vector<std::pair<int, int>> &split_vals, std::vector<std::vector<std::pair<int, int>>> &res, std::vector<std::pair<int, int>> &subset, int index)
-//   calls     : e252_size
+/// Replaces: e320_subsetsImpl
+///
+/// Every subset of the split ranges, emitted in the recursion's own order: the running subset first,
+/// then one descent per remaining range.
+///
+/// ⭐ THE EMPTY SUBSET IS THE FIRST ENTRY — `res.push_back(subset)` runs before the loop, so the
+/// caller's initially empty `subset` is recorded, and each range is pushed then popped in place.
+fn subsets_impl(
+    split_vals: &[SplitRange],
+    res: &mut Vec<Vec<SplitRange>>,
+    subset: &mut Vec<SplitRange>,
+    index: usize,
+) {
+    res.push(subset.clone());
+    for at in index..split_vals.len() {
+        subset.push(split_vals[at]);
+        subsets_impl(split_vals, res, subset, at + 1);
+        subset.pop();
+    }
+}
 
 // crustify:todo: e446_subsets
 //   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:635  (12 body lines, level 2)
@@ -1203,5 +1254,66 @@ mod unit_tests {
         let mut cost_reduced = InstructionCount(0);
         compute_reduced_cost(Some(&node), &mut ie, &mut cost_reduced, &BTreeMap::new());
         assert_eq!(cost_reduced, InstructionCount(0));
+    }
+
+    /// e318 — the body replaces the loop in place, the iter arg reads the init and the sibling that
+    /// read the loop's result reads the yielded value.
+    #[test]
+    fn e318_hoists_the_body_over_the_loop_and_rewires_it() {
+        let mut scope = vec![
+            constant(0, Val(0)),
+            for_loop(
+                Val(1),
+                Val(9),
+                vec![carried(Val(0), Val(2), Val(3))],
+                vec![add(Val(2), Val(2), Val(4)), yields(vec![Val(4)])],
+            ),
+            add(Val(3), Val(3), Val(5)),
+        ];
+        promote_for_loop_body_and_delete(&mut scope, 1);
+        assert_eq!(
+            scope,
+            vec![
+                constant(0, Val(0)),
+                add(Val(0), Val(0), Val(4)),
+                add(Val(4), Val(4), Val(5)),
+            ]
+        );
+    }
+
+    /// e319 — one predicate value per if op at bound 5, including a `false` for the if op whose
+    /// operands are both non-constant.
+    #[test]
+    fn e319_answers_one_predicate_value_per_if_op() {
+        let scope = vec![constant(4, Val(0))];
+        let if_list = [
+            compare(ops::CmpPredicate::Sge, Val(0), Val(2)),
+            compare(ops::CmpPredicate::Slt, Val(0), Val(2)),
+            compare(ops::CmpPredicate::Eq, Val(7), Val(8)),
+        ];
+        let if_list: Vec<&Op> = if_list.iter().collect();
+        assert_eq!(
+            get_all_true_index_of_if_ops_list(IterBound(5), &if_list, &scope),
+            vec![false, true, false]
+        );
+    }
+
+    /// e320 — two ranges give four subsets, empty one first, in the recursion's order.
+    #[test]
+    fn e320_enumerates_every_subset_starting_with_the_empty_one() {
+        let high = SplitRange {
+            high: IterBound(9),
+            low: IterBound(5),
+        };
+        let low = SplitRange {
+            high: IterBound(4),
+            low: IterBound(1),
+        };
+        let mut res = Vec::new();
+        subsets_impl(&[high, low], &mut res, &mut Vec::new(), 0);
+        assert_eq!(
+            res,
+            vec![Vec::new(), vec![high], vec![high, low], vec![low]]
+        );
     }
 }

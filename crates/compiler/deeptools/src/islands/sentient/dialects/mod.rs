@@ -1348,6 +1348,133 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
     }
 }
 
+/// CLONES `ops` AT THIS RUNG, MINTING A FRESH VALUE FOR EVERYTHING THEY DEFINE — `OpBuilder::clone`
+/// under an `IRMapping`, for a body that has reached SentientIR.
+///
+/// ⛔⛔ THE RUNG BELOW'S [`crate::islands::dataflow_ir::Values::clone_ops`] CANNOT BE ASKED FOR A
+/// `sentient.for`: [`lowered`] answers `None` for this rung's own three variants, so a clone routed
+/// through it would copy the loop's NAME and none of what it binds. `copyOneIter`
+/// (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:469`) clones exactly such a loop, twice per
+/// peeled loop, and two copies binding one SSA name is not a program — MLIR would say *"redefinition
+/// of value"* and a typed island has nothing to say at all.
+///
+/// ⛔ THE ORDER WITHIN ONE OP IS THE RUNG BELOW'S — OPERANDS, RESULTS, BLOCK ARGUMENTS, REGIONS — and
+/// the two facts that hold it in place are written out on
+/// [`crate::islands::dataflow_ir::Values::clone_ops`]. The shared arms DELEGATE to that function, so
+/// the two rungs cannot disagree about the numbering of one `agen.composite_load_and_store`.
+#[must_use]
+pub fn clone_ops(
+    ops: &[Op],
+    values: &mut crate::islands::dataflow_ir::Values,
+    mapping: &mut crate::islands::dataflow_ir::ValueMapping,
+) -> Vec<Op> {
+    ops.iter()
+        .map(|op| clone_one(op, values, mapping))
+        .collect()
+}
+
+/// ONE OP OF [`clone_ops`] — the four groups in order, then the regions recursively.
+fn clone_one(
+    op: &Op,
+    values: &mut crate::islands::dataflow_ir::Values,
+    mapping: &mut crate::islands::dataflow_ir::ValueMapping,
+) -> Op {
+    let mut copy = op.clone();
+    match &mut copy {
+        Op::Sentient(inner) => {
+            for operand in sentient::operands_mut(inner) {
+                *operand = mapping.lookup_or_default(*operand);
+            }
+            for result in sentient::results_mut(inner) {
+                let fresh = values.mint();
+                mapping.map(*result, fresh);
+                *result = fresh;
+            }
+            for arg in sentient::block_args_mut(inner) {
+                let fresh = values.mint();
+                mapping.map(*arg, fresh);
+                *arg = fresh;
+            }
+            for region in sentient::regions_mut(inner) {
+                // ⭐ TAKEN, NOT COPIED AGAIN — `op.clone()` above already deep-copied the body.
+                let source = core::mem::take(region);
+                *region = clone_ops(&source, values, mapping);
+            }
+        }
+        // ⭐ ARM FOR ARM WITH THE RUNG BELOW'S `parts_mut` FOR `affine::Op::For`: a constant bound is
+        // no operand, and the result of a carried value is numbered before the arguments.
+        Op::AffineFor(loop_op) => {
+            for bound in [&mut loop_op.lo, &mut loop_op.hi] {
+                if let affine::Bound::Val(val) = bound {
+                    *val = mapping.lookup_or_default(*val);
+                }
+            }
+            for carried in &mut loop_op.carried {
+                carried.init = mapping.lookup_or_default(carried.init);
+            }
+            for carried in &mut loop_op.carried {
+                let fresh = values.mint();
+                mapping.map(carried.result, fresh);
+                carried.result = fresh;
+            }
+            let fresh = values.mint();
+            mapping.map(loop_op.iv, fresh);
+            loop_op.iv = fresh;
+            for carried in &mut loop_op.carried {
+                let fresh = values.mint();
+                mapping.map(carried.arg, fresh);
+                carried.arg = fresh;
+            }
+            let source = core::mem::take(&mut loop_op.body);
+            loop_op.body = clone_ops(&source, values, mapping);
+        }
+        // ⭐ THE UNITS READ, THE `$results` BOUND, ONE ARGUMENT PER REGION — the rung below's uniform
+        // arm, whose own note says entry 182 depends on exactly this split.
+        Op::UniformRegions(op) => {
+            for region in op.regions_mut() {
+                for unit in &mut region.units {
+                    *unit = mapping.lookup_or_default(*unit);
+                }
+            }
+            if let UniformRegions::UniformizeRegions { results, .. } = op {
+                for result in results.iter_mut() {
+                    let fresh = values.mint();
+                    mapping.map(*result, fresh);
+                    *result = fresh;
+                }
+            }
+            for region in op.regions_mut() {
+                let fresh = values.mint();
+                mapping.map(region.arg, fresh);
+                region.arg = fresh;
+            }
+            for region in op.regions_mut() {
+                let source = core::mem::take(&mut region.body);
+                region.body = clone_ops(&source, values, mapping);
+            }
+        }
+        // ⛔ BOUND RATHER THAN A BARE `_` — see [`results`].
+        other @ (Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_)) => {
+            if let Some(lower) = lowered(other)
+                && let Some(one) = values
+                    .clone_ops(core::slice::from_ref(&lower), mapping)
+                    .pop()
+            {
+                *other = raised(one);
+            }
+        }
+    }
+    copy
+}
+
 /// WHICH BRANCH OF A `sentient.if` SURVIVES CANONICALISATION — `RemoveStaticCondition`'s three
 /// outcomes (`SentientOps.cpp:1489-1502`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

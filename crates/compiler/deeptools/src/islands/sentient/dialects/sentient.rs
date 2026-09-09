@@ -1715,6 +1715,16 @@ pub enum StoreSource {
     /// own `$producer` — a unit — in its place (`:121-135`). Without this variant the input shape of
     /// the pass is inexpressible, so the pass could only ever be a no-op.
     Multicast(Val),
+    /// THE `uniform.query_map` A STORE READS THROUGH WHEN THE GROUP IT NAMES IS PER-UNIT — the
+    /// [`StoreSource::Multicast`] shape one level of indirection out.
+    ///
+    /// ⛔⛔ THE SECOND ARM OF THE SAME PASS, AND ALSO INEXPRESSIBLE WITHOUT IT.
+    /// `runOn(ReceiveAndStoreOp)` branches on `dyn_cast<uniform::QueryMapOp>(ras.getProducer()
+    /// .getDefiningOp())` (`MulticastCanonicalization.cpp:346-347`) and `processQMapOfDirectMulticast`
+    /// then moves that map to `$multicast_info` and puts a SECOND `uniform.query_map` — of the groups'
+    /// producers — in `$producer` (`:138-153`), so both the input and the output of that rewrite need
+    /// this variant.
+    QueryMap(Val),
 }
 
 impl StoreSource {
@@ -1725,6 +1735,7 @@ impl StoreSource {
             StoreSource::Wire(end) => end.val(),
             StoreSource::Constant(val) => val,
             StoreSource::Multicast(val) => val,
+            StoreSource::QueryMap(val) => val,
         }
     }
 }
