@@ -2634,6 +2634,40 @@ fn folded_cast(
     Some(operand)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 320/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+impl VectorOperand {
+    /// Replaces: e320_getOperand
+    ///
+    /// **320/384** `VectorOperand::getOperand` — `VectorOperands.cpp:378` (4L): the overload that
+    /// asks [`Self::with_precision`] and throws the `bool&` away, and the one that CLOSES the
+    /// recursion every other unit in this file cuts open with a `get_operand` parameter.
+    ///
+    /// ⛔ THE RECURSION IT HANDS DOWN IS `traverse_upwards = true`, NOT THIS CALL'S ARGUMENT — the
+    /// reference's inner calls pass three arguments and take the declaration's default
+    /// (`VectorOperands.hpp:85`), so only the FIRST hop honours a caller's `false`.
+    #[must_use]
+    pub fn operand<A: Arch>(
+        op: &OpId,
+        comp: ComputeComp,
+        traverse_upwards: bool,
+        scope: &[DfirOp],
+    ) -> Option<VectorOperand> {
+        // `bool is_precision_converted;` — declared UNINITIALISED and never read by this overload;
+        // `getOperandWithPrecision` writes it on entry, so nothing observes the indeterminate value.
+        Self::with_precision::<A>(
+            op,
+            comp,
+            traverse_upwards,
+            scope,
+            &mut |inner, inner_comp| Self::operand::<A>(inner, inner_comp, true, scope),
+        )
+        .operand
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::{BitstreamConstant, IrfIndex, LayoutAndIndices, RegisterSlice};
@@ -3763,14 +3797,27 @@ mod unit_tests {
         assert_eq!(operand.op, OpId::at(&[4]));
     }
 
-    /// `getOperand` (entry 320) AS THE SCC CUT: `getOperandWithPrecision` with the declaration's
-    /// default `traverse_upwards = true` (`VectorOperands.hpp:85`), which is what every recursion
-    /// inside it passes.
+    /// 🎯 320/384 — `getOperand` IS THE SCC CUT, and the two tests below drive the whole dispatch
+    /// through it: a cast over a uniformized receive resolves only because the recursion closes.
     fn resolved(op: &OpId, comp: ComputeComp, scope: &[DfirOp]) -> Option<VectorOperand> {
-        VectorOperand::with_precision::<Sen1p5>(op, comp, true, scope, &mut |inner, inner_comp| {
-            resolved(inner, inner_comp, scope)
-        })
-        .operand
+        VectorOperand::operand::<Sen1p5>(op, comp, true, scope)
+    }
+
+    /// 🎯 320/384 — THE KNOT TIES: `%1 = vectorchain.neg %0` over an `arith.constant dense` resolves
+    /// in two hops, so the recursion `getOperandFromNegOp` needs is really reachable and terminates.
+    ///
+    /// ⛔ AND THE ANSWER IS THE CONSTANT'S OWN POSITION, not the negation's: entry 168 forwards the
+    /// operand untouched, precisions and all.
+    #[test]
+    fn a_negated_constant_resolves_through_the_closed_recursion() {
+        let scope = vec![dense(Val(0)), neg(Val(1), Val(0))];
+        let answer =
+            VectorOperand::operand::<Sen1p5>(&OpId::at(&[1]), ComputeComp::Sfp, true, &scope)
+                .expect("the negation forwards the constant");
+        assert_eq!(answer.kind, VectorOperandType::Constant);
+        assert_eq!(answer.op, OpId::at(&[0]));
+        assert!(answer.orig_precision.is_some());
+        assert_eq!(answer.orig_precision, answer.on_the_fly_conv_precision);
     }
 
     /// 🎯 304/384 — THE VENDOR'S OWN CAST OVER A UNIFORMIZED PT RECEIVE, on `SENARCH=sen1p5`.
@@ -3880,5 +3927,4 @@ mod unit_tests {
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e320_getOperand
 // crustify:todo: e343_getOperandFromCastOp

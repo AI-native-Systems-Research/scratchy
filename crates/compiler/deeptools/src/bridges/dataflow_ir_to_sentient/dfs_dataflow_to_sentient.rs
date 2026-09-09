@@ -1513,6 +1513,109 @@ mod unit_tests {
         assert_eq!(peers(&syncs[0]), vec![sen::Consumer::Lxsu]);
         assert_eq!(peers(&syncs[1]), vec![sen::Consumer::LxsuN]);
     }
+
+    /// 🎯 319/384 — BOTH CORELETS HOLD A SOURCE, SO THE SYNC IS UNIFORMIZED: region 0 names `lxsu`
+    /// and region 1 names `lxsuN` for the SAME destination, because `corelet_id` is the region's.
+    ///
+    /// ⛔ THE UNITS THE REGIONS BIND ARE THE MAP'S KEYS, split by the key's own corelet.
+    #[test]
+    fn a_query_map_over_both_corelets_uniformizes_into_two_regions() {
+        let scope = vec![
+            get_unit_on(0, DfirUnit::Lxsu, corelet0()),
+            get_unit_on(1, DfirUnit::Lxsu, corelet1()),
+            get_unit_on(10, DfirUnit::Lxsu, corelet0()),
+        ];
+        let mut values = Values::default();
+        let lowered = lower_sync_for_a_query_map(
+            SyncSrc::L0Lx(L0LxSrc::Lx(LxHalf::Store)),
+            L0LxSyncToLower::Recv,
+            &[(Val(0), Val(10)), (Val(1), Val(10))],
+            &scope,
+            None,
+            &mut values,
+        )
+        .expect("both corelets hold a source and the target is not the L3");
+
+        let peers = |sync: &sen::Op| match sync {
+            sen::Op::Sync { peers, .. } => peers
+                .iter()
+                .copied()
+                .map(sen::SyncHalf::peer)
+                .collect::<Vec<_>>(),
+            other => panic!("a region holds one sentient.sync: {other:?}"),
+        };
+        let QueryMapLowering::TwoRegions {
+            regions,
+            region0,
+            region1,
+        } = lowered
+        else {
+            panic!("two corelets are two regions");
+        };
+        let uniform::Op::UniformizeRegions { regions, results } = regions else {
+            panic!("`createUniformRegionsWithTwoRegionsNoResult` builds one op");
+        };
+        assert!(results.is_empty());
+        assert_eq!(
+            regions.iter().map(|r| r.units.clone()).collect::<Vec<_>>(),
+            vec![vec![Val(0)], vec![Val(1)]]
+        );
+        let LxL3Lowering::One(ref sync0) = region0 else {
+            panic!("one bucket is one sync");
+        };
+        let LxL3Lowering::One(ref sync1) = region1 else {
+            panic!("one bucket is one sync");
+        };
+        assert_eq!(peers(sync0), vec![sen::Consumer::Lxsu]);
+        assert_eq!(
+            peers(sync1),
+            vec![sen::Consumer::LxsuN],
+            "corelet 1's sources reach a corelet-0 destination through the neighbour"
+        );
+    }
+
+    /// 🎯 319/384 — THE L0 ARM NAMES THE DESTINATION'S HALF AND CARRIES THE IMPLICIT SYNC'S TILE
+    /// SIZE; a destination on the SAME half is `emitError("Unsupported dst unit for L0 unit.")`.
+    #[test]
+    fn an_l0_query_map_syncs_with_the_other_half_and_refuses_its_own() {
+        let scope = vec![
+            get_unit_on(0, DfirUnit::L0lu, corelet0()),
+            get_unit_on(10, DfirUnit::L0su, corelet0()),
+            get_unit_on(11, DfirUnit::L0lu, corelet1()),
+        ];
+        let mut values = Values::default();
+        let lowered = lower_sync_for_a_query_map(
+            SyncSrc::L0Lx(L0LxSrc::L0(L0Half::Load)),
+            L0LxSyncToLower::ImplicitSync(64),
+            &[(Val(0), Val(10))],
+            &scope,
+            None,
+            &mut values,
+        );
+        assert_eq!(
+            lowered,
+            Some(QueryMapLowering::One(sen::Op::Sync {
+                mode: sen::SyncMode::SendRecv,
+                peers: vec![sen::SyncHalf::of_lowered_destination(sen::Consumer::L0su)],
+                soft: false,
+                implicit_sync_memory_boundary: Some(64),
+                dbg_name: None,
+            }))
+        );
+
+        assert_eq!(
+            lower_sync_for_a_query_map(
+                SyncSrc::L0Lx(L0LxSrc::L0(L0Half::Load)),
+                L0LxSyncToLower::ImplicitSync(64),
+                &[(Val(0), Val(11))],
+                &scope,
+                None,
+                &mut values,
+            ),
+            None,
+            "an l0lu source cannot sync with another l0lu"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2953,9 +3056,252 @@ pub fn lower_sync_lx_l3_to_lx_l3(
     Some(uniformized(per_region, values))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 319/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT ONE QUERY-MAP SYNC LOWERING EMITS.
+///
+/// ⛔ THE TWO-REGION FORM HOLDS A WHOLE [`LxL3Lowering`] PER REGION, which may itself be a nested
+/// `uniform.uniformize_regions` — and its syncs sit beside the regions for the reason
+/// [`L0LxLowering`] gives: a `sentient.sync` is not a [`DfirOp`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryMapLowering {
+    /// The L0 arm's one `sentient.sync` (`:1811-1822`).
+    One(sen::Op),
+    /// Every arm that delegates once: one corelet holds every source, the target is the L3, or the
+    /// source is an L3 half.
+    Delegated(LxL3Lowering),
+    /// `:1846-1884` — a result-less two-region `uniform.uniformize_regions`, region *i* lowering
+    /// corelet *i*'s pairs with `corelet_id = i`.
+    TwoRegions {
+        /// [`create_uniform_regions_with_two_regions_no_result`]'s op, carrying only its two yields.
+        regions: uniform::Op,
+        /// What `builder_region0` writes.
+        region0: LxL3Lowering,
+        /// What `builder_region1` writes.
+        region1: LxL3Lowering,
+    },
+}
+
+/// `separateKeyValuesBasedOnKeysCorelet`'s per-key corelet (`Dialect/Uniform/Utils.cpp:459-466`) —
+/// ⛔ [`None`] IS BOTH `emitError("Unknown corelet information for sentient")` and the null
+/// dereference a key that is not a `get_unit` walks into. `DT_CHECK(corelet_id == 1)` on the else
+/// side is [`Corelet`]'s own bound.
+fn key_corelet(v: Val, scope: &[DfirOp]) -> Option<Corelet> {
+    let Some(DfirOp::Dataflow(dataflow::Op::GetUnit { residency, .. })) = defining_op(v, scope)
+    else {
+        return None;
+    };
+    match residency {
+        Residency::Corelet { corelet, .. } => Some(*corelet),
+        // `CoreWide` prints `corelet = 0`, as [`are_corelets_different`] says.
+        Residency::CoreWide { .. } => Corelet::checked(0),
+        Residency::Scratchpad { .. } | Residency::Global => None,
+    }
+}
+
+/// `dyn_cast<dataflow::GetUnitOp>(v.getDefiningOp())` — the unit type alone.
+fn queried_unit(v: Val, scope: &[DfirOp]) -> Option<DfirUnit> {
+    let Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) = defining_op(v, scope) else {
+        return None;
+    };
+    Some(*unit)
+}
+
+/// One L0 destination (`:1790-1802`) — a `get_unit`, or the sole member of a `dataflow.create_group`.
+///
+/// ⛔ [`None`] IS BOTH `DT_CHECK_MSG(getUnitIds().size() == 1, "For L0 units the target cannot be a
+/// group of multiple units")` and `DT_CHECK_MSG(target_unit, "…has to be a single unit.")`.
+fn l0_target_unit(v: Val, scope: &[DfirOp]) -> Option<DfirUnit> {
+    if let Some(unit) = queried_unit(v, scope) {
+        return Some(unit);
+    }
+    let Some(DfirOp::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) = defining_op(v, scope)
+    else {
+        return None;
+    };
+    let [member] = unit_ids.as_slice() else {
+        return None;
+    };
+    queried_unit(*member, scope)
+}
+
+/// Replaces: e319_lowerSyncForAQueryMap
+///
+/// **319/384** `DataflowToSentient.cpp:1728` (166L) — one `sentient.sync` for an L0 source, else
+/// [`lower_sync_lx_l3_to_lx_l3`] over the map's pairs split by the KEY's corelet: once, or twice
+/// inside a two-region `uniform.uniformize_regions` when both corelets hold a source.
+///
+/// ⛔ TRAP: `corelet_id = -1` IS NOT A THIRD CASE — `lowerSyncLXL3ToLXL3` tests `corelet_id == 0`
+/// and takes its `else`, so the merged target-L3 arm lowers as corelet **1** (`:816-830`). ⭐ And
+/// the three `src_unit_ops*` parameters are never read; the split is re-derived from the map.
+#[must_use]
+pub fn lower_sync_for_a_query_map(
+    src: SyncSrc,
+    op: L0LxSyncToLower,
+    src_dst: &[(Val, Val)],
+    scope: &[DfirOp],
+    dbg_name: Option<String>,
+    values: &mut Values,
+) -> Option<QueryMapLowering> {
+    // `if (send_op && !send_op.getWaitImmediatelyForAsyncTransfers().has_value())` — "Unknown async
+    // transfers modes for sentient". [`L0LxSyncToLower::Send`] carries the value, so the ABSENT
+    // attribute has no spelling and the refusal has no input.
+    let l0lx = match src {
+        // `else` (`:1888-1897`) — `DT_CHECK_MSG(implicit_sync_tile_size == -1, "L3 doesn't have
+        // implicit sync")`, then one merged lowering with `is_src_l3 = true`.
+        SyncSrc::L3(_) => {
+            if op.tile_size().is_some() {
+                return None;
+            }
+            return Some(QueryMapLowering::Delegated(lower_sync_lx_l3_to_lx_l3(
+                src,
+                op,
+                src_dst,
+                // `corelet_id = -1`, unread on the path `is_src_l3` takes first.
+                Corelet::checked(1)?,
+                scope,
+                dbg_name,
+                values,
+            )?));
+        }
+        SyncSrc::L0Lx(l0lx) => l0lx,
+    };
+
+    // `separateKeyValuesBasedOnKeysCorelet(query_map, …)` — the pairs split by the KEY's corelet.
+    let mut corelet0: Vec<(Val, Val)> = Vec::new();
+    let mut corelet1: Vec<(Val, Val)> = Vec::new();
+    for pair in src_dst {
+        if key_corelet(pair.0, scope)?.get() == 0 {
+            corelet0.push(*pair);
+        } else {
+            corelet1.push(*pair);
+        }
+    }
+    // `DT_CHECK(src_corelet0_vs.size() + src_corelet1_vs.size() != 0)`.
+    if corelet0.is_empty() && corelet1.is_empty() {
+        return None;
+    }
+
+    match l0lx {
+        L0LxSrc::L0(src_half) => {
+            // `for (int i = 0; i < dst_vs.size(); i++)` — ⛔ THE LOOP ONLY GUARDS. `dst_unit_name` is
+            // overwritten per destination and the last one wins, which is harmless because the
+            // cross-half test forces every destination onto the half the source is not.
+            let mut dst_half = None;
+            for (_, dst_v) in src_dst {
+                let unit = l0_target_unit(*dst_v, scope)?;
+                // `if (!((isSenComponentL0LU(src_comp) && isSenComponentL0SU(dst_comp)) ||
+                // (isSenComponentL0SU(src_comp) && isSenComponentL0LU(dst_comp))))` — "Unsupported
+                // dst unit for L0 unit.". Then the name is the DESTINATION's half (`:1808-1809`).
+                dst_half = Some(match src_half {
+                    L0Half::Load if is_sen_component_l0su(unit) => L0Half::Store,
+                    L0Half::Store if is_sen_component_l0lu(unit) => L0Half::Load,
+                    L0Half::Load | L0Half::Store => return None,
+                });
+            }
+            // ⛔ AN EMPTY VALUE LIST LEAVES `dst_unit_name` `""`, which
+            // `symbolizeSentientLoadConsumer` has no case for and the reference `.value()`s.
+            // ⭐ AND THIS ARM NEVER READS THE WAIT FLAG: a deferred send that entry 273 refuses
+            // (`:249-252`) emits `soft = false` here.
+            // ⚠️ `if (SyncOp::create(…)) return success();` HAS NO `break`, so a falsy create would
+            // fall through into the LX case below; `create` never answers null.
+            Some(QueryMapLowering::One(sync(
+                op.mode(),
+                vec![l0_consumer(dst_half?)],
+                op.tile_size(),
+                dbg_name,
+            )))
+        }
+        L0LxSrc::Lx(_) => {
+            // `DT_CHECK_MSG(implicit_sync_tile_size == -1, "LX doesn't have implicit sync")`.
+            if op.tile_size().is_some() {
+                return None;
+            }
+            // `if (src_corelet1_vs.size() == 0)` — every source sits on corelet 0.
+            if corelet1.is_empty() {
+                return Some(QueryMapLowering::Delegated(lower_sync_lx_l3_to_lx_l3(
+                    src,
+                    op,
+                    &corelet0,
+                    Corelet::checked(0)?,
+                    scope,
+                    dbg_name,
+                    values,
+                )?));
+            }
+            // `else if (src_corelet0_vs.size() == 0)`.
+            if corelet0.is_empty() {
+                return Some(QueryMapLowering::Delegated(lower_sync_lx_l3_to_lx_l3(
+                    src,
+                    op,
+                    &corelet1,
+                    Corelet::checked(1)?,
+                    scope,
+                    dbg_name,
+                    values,
+                )?));
+            }
+            // `else if (isTargetL3(query_map))` — entry 043, which reads the mapping's FIRST value
+            // alone. ⛔ A `create_group` there leaves the helper's string PRESENT AND EMPTY, so
+            // `substr(0, 2)` is `""`: not L3 (`Dialect/Uniform/Utils.cpp:258`).
+            let target_l3 = match src_dst.first() {
+                None => is_target_l3(&[]),
+                Some((_, dst_v)) => match queried_unit(*dst_v, scope) {
+                    Some(unit) => is_target_l3(&[unit]),
+                    None => false,
+                },
+            };
+            if target_l3 {
+                // `src_unit_res`/`dst_unit_res` — corelet 0's pairs, then corelet 1's.
+                let merged: Vec<(Val, Val)> = corelet0.iter().chain(&corelet1).copied().collect();
+                return Some(QueryMapLowering::Delegated(lower_sync_lx_l3_to_lx_l3(
+                    src,
+                    op,
+                    &merged,
+                    Corelet::checked(1)?,
+                    scope,
+                    dbg_name,
+                    values,
+                )?));
+            }
+            // `:1846-1884` — both corelets hold a source and the target is not the L3.
+            let keys = |pairs: &[(Val, Val)]| -> Vec<Val> {
+                pairs.iter().map(|(src_v, _)| *src_v).collect()
+            };
+            let regions = create_uniform_regions_with_two_regions_no_result(
+                &keys(&corelet0),
+                &keys(&corelet1),
+                values,
+            );
+            Some(QueryMapLowering::TwoRegions {
+                regions,
+                region0: lower_sync_lx_l3_to_lx_l3(
+                    src,
+                    op,
+                    &corelet0,
+                    Corelet::checked(0)?,
+                    scope,
+                    dbg_name.clone(),
+                    values,
+                )?,
+                region1: lower_sync_lx_l3_to_lx_l3(
+                    src,
+                    op,
+                    &corelet1,
+                    Corelet::checked(1)?,
+                    scope,
+                    dbg_name,
+                    values,
+                )?,
+            })
+        }
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e319_lowerSyncForAQueryMap
 // crustify:todo: e337_lowerSyncOperation
 // crustify:todo: e361_runOnOperation

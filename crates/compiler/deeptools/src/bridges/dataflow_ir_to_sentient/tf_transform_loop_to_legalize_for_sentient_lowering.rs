@@ -460,12 +460,10 @@ const REGISTER_FILE_UNITS: [GenericComp; 3] = [GenericComp::Pt, GenericComp::Sfp
 /// `isa<agen::VectorLoadOp, agen::VectorStoreOp, agen::CompositeLoadOp, agen::CompositeStoreOp,
 /// agen::CompositeLoadAndStoreOp>(use)` (`:329-331`).
 ///
-/// ⚠️ THREE OF THE FIVE, for the reason entry 141 already records: the island declares
-/// `vector_load`, `vector_store` and `composite_load_and_store` and not `composite_load` or
-/// `composite_store`, and the brief's rule to grow the island is about a function's *input*
-/// (`AGENT-BRIEF.md:87`) — this predicate's input is any op at all. See
+/// ⚠️ FOUR OF THE FIVE: the island declares `vector_load`, `vector_store`, `composite_load` (entry
+/// 326's input) and `composite_load_and_store`, and not `composite_store`. See
 /// [`crate::bridges::dataflow_ir_to_sentient::tf_unit_filtering::is_data_transfer`], which lists the
-/// same absences.
+/// same absence.
 ///
 /// ⛔ NO WILDCARD. A new island op has to state whether the induction variable reaching it makes the
 /// loop a candidate; falling through to `false` would silently stop a loop being unrolled.
@@ -474,6 +472,7 @@ fn is_memory_op(op: &DfirOp) -> bool {
         DfirOp::Agen(
             agen::Op::VectorLoad { .. }
             | agen::Op::VectorStore { .. }
+            | agen::Op::CompositeLoad(_)
             | agen::Op::CompositeLoadAndStore(_),
         ) => true,
         // `agen.yield` is a terminator, and no arm of the `isa<>` list names anything else — the
@@ -488,6 +487,7 @@ fn is_memory_op(op: &DfirOp) -> bool {
             // ⛔ THE INTERLEAVE IS NOT ONE EITHER, and it is the one to say so about: it CONTAINS
             // composite transfers, and the induction variable reaching it reaches them — the ops
             // inside its region answer for themselves.
+            | agen::Op::CompositeIndirectLoadAndStore(_)
             | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::SetTransferMaskState { .. },
         )
@@ -1441,6 +1441,7 @@ mod unit_tests {
             load_order: AffineMap::identity(1),
             store_set: load_set(),
             store_order: AffineMap::identity(1),
+            time_symbols: Vec::new(),
             time_set: time_set(),
             time_order: AffineMap::identity(4),
             load_time_addr_map: AffineMap {
@@ -2007,6 +2008,7 @@ mod unit_tests {
                 load_order: AffineMap::identity(1),
                 store_set: load_set(),
                 store_order: AffineMap::identity(1),
+                time_symbols: Vec::new(),
                 time_set: time_set(),
                 time_order: AffineMap::identity(4),
                 load_time_addr_map: AffineMap::identity(4),

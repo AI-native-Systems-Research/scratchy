@@ -649,7 +649,11 @@ pub fn agen_op_kind(op: &DfirOp) -> Option<AgenOpKind> {
             }
             dfir_op::agen::Op::SymbolicVectorLoad { .. } => Some(AgenOpKind::SymbolicVectorLoad),
             dfir_op::agen::Op::SymbolicVectorStore { .. } => Some(AgenOpKind::SymbolicVectorStore),
+            dfir_op::agen::Op::CompositeLoad(_) => Some(AgenOpKind::CompositeLoad),
             dfir_op::agen::Op::CompositeLoadAndStore(_) => Some(AgenOpKind::CompositeLoadAndStore),
+            dfir_op::agen::Op::CompositeIndirectLoadAndStore(_) => {
+                Some(AgenOpKind::CompositeIndirectLoadAndStore)
+            }
             // The region terminator is not a transfer, and neither the interleave nor the mask
             // state is one of the twelve classes `fuseLoadOrStoreChainOps`'s candidate walk looks
             // for (`AgenToSentient.cpp:33-37`) — `e384_runOnOperation` finds those two itself.
@@ -732,9 +736,10 @@ impl AgenLoad {
 
     /// WHICH LOAD CLASS ONE STATEMENT IS, or `None` if it is not one of the five.
     ///
-    /// ⛔ THE COMPOSITE PAIR HAS NO ISLAND OP YET (`composite_load`/`composite_indirect_load`), and
-    /// `agen.composite_load_and_store` is **not** `CompositeLoadOp` — the reference's `isa<>` list
-    /// does not include it, so it answers `None` here too rather than borrowing the composite arm.
+    /// ⛔ `agen.composite_load_and_store` IS **NOT** `CompositeLoadOp` — the reference's `isa<>` list
+    /// does not include it, so it answers `None` rather than borrowing the composite arm.
+    /// `composite_indirect_load` still has no island op; `composite_load` now does (entry 326's
+    /// input), and roots at its induction variable.
     #[must_use]
     pub fn of(op: &DfirOp) -> Option<AgenLoad> {
         match op {
@@ -750,11 +755,16 @@ impl AgenLoad {
             DfirOp::Agen(dfir_op::agen::Op::SymbolicVectorLoad { result, .. }) => {
                 Some(AgenLoad::SymbolicVector { result: *result })
             }
+            // ⭐ AND THE COMPOSITE LOAD ROOTS AT ITS REGION ARGUMENT (`:1248-1249`).
+            DfirOp::Agen(dfir_op::agen::Op::CompositeLoad(access)) => Some(AgenLoad::Composite {
+                load_induction_var: access.load_iv,
+            }),
             DfirOp::Agen(
                 dfir_op::agen::Op::VectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeIndirectLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
                 | dfir_op::agen::Op::Yield,
@@ -3410,6 +3420,7 @@ mod unit_tests {
             load_order: planned.load_order,
             store_set: planned.store_set,
             store_order: planned.store_order,
+            time_symbols: Vec::new(),
             time_set: planned.time_set,
             time_order: planned.time_order,
             load_time_addr_map: planned.load_time_addr_map,
@@ -6344,6 +6355,17 @@ pub fn check_basic_conditions(op: CheckedOp<'_>) -> BasicConditions {
             data_orders.push(transfer.store_order.clone());
             time_order = Some(&transfer.time_order);
         }
+        // `:130-137` — the indirect twin's arm is the direct one word for word, and it checks no
+        // region either.
+        CheckedOp::Dfir(DfirOp::Agen(dfir_op::agen::Op::CompositeIndirectLoadAndStore(
+            transfer,
+        ))) => {
+            data_sets.push(transfer.load_set.clone());
+            data_sets.push(transfer.store_set.clone());
+            data_orders.push(transfer.load_order.clone());
+            data_orders.push(transfer.store_order.clone());
+            time_order = Some(&transfer.time_order);
+        }
         // Every other op falls out of the chain with both lists empty and is admissible (`:190`).
         CheckedOp::Dfir(_) => {}
     }
@@ -7114,7 +7136,9 @@ impl<'a> ExtractVectorStore<'a> {
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorLoad { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::CompositeLoad(_)
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeIndirectLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
                 | dfir_op::agen::Op::Yield,
@@ -8025,7 +8049,9 @@ impl<'a> ExtractVectorLoad<'a> {
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorLoad { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::CompositeLoad(_)
                 | dfir_op::agen::Op::CompositeLoadAndStore(_)
+                | dfir_op::agen::Op::CompositeIndirectLoadAndStore(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
                 | dfir_op::agen::Op::Yield,
@@ -8320,6 +8346,16 @@ impl<'a> TransferOp<'a> {
                 multicast_info: transfer.multicast_info,
                 dir: transfer.dir,
             }),
+            // ⛔ AND THE INDIRECT TWIN CARRIES NO `dir`: `getDir()`'s `dyn_cast` chain names the
+            // direct op only (`Helper.cpp:2318-2321`), and `Agen.td:559-661` declares no `$dir` on
+            // this one — its `multicast_info` is read all the same (`Helper.cpp:2295-2299`).
+            DfirOp::Agen(dfir_op::agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
+                Some(TransferOp {
+                    op,
+                    multicast_info: transfer.multicast_info,
+                    dir: None,
+                })
+            }
             DfirOp::Agen(dfir_op::agen::Op::SymbolicVectorLoad { multicast, .. }) => {
                 Some(TransferOp {
                     op,
@@ -8332,6 +8368,7 @@ impl<'a> TransferOp<'a> {
                 | dfir_op::agen::Op::IndirectVectorLoad { .. }
                 | dfir_op::agen::Op::IndirectVectorStore { .. }
                 | dfir_op::agen::Op::SymbolicVectorStore { .. }
+                | dfir_op::agen::Op::CompositeLoad(_)
                 | dfir_op::agen::Op::CompositeMemoryInterleave { .. }
                 | dfir_op::agen::Op::SetTransferMaskState { .. }
                 | dfir_op::agen::Op::Yield,

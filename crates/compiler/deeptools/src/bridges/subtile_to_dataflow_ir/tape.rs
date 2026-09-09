@@ -405,6 +405,8 @@ fn node_program<
                 load_order: plan.load_order,
                 store_set: plan.store_set,
                 store_order: plan.store_order,
+                // The tape's time set is written against constants, so there is no symbol to bind.
+                time_symbols: Vec::new(),
                 time_set: plan.time_set,
                 time_order: plan.time_order,
                 load_time_addr_map: plan.load_time_addr_map,

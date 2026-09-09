@@ -91,6 +91,9 @@ fn walk_preorder(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
             DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
                 walk_preorder(&transfer.body, visit);
             }
+            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
+                walk_preorder(&transfer.body, visit);
+            }
             // ⭐ A `uniform.uniformize_regions` HOLDS ONE REGION PER UNIT CLASS, and `Operation::walk`
             // descends into every one of them. Before `FlatteningLocalRegions` has run those regions
             // ARE the program body, so a walk that stopped at the op would see no toggle at all.

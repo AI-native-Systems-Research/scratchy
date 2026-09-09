@@ -360,7 +360,32 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 index_operands(&transfer.src_indices, &mut reads);
                 reads.push(transfer.dst);
                 index_operands(&transfer.dst_indices, &mut reads);
+                reads.extend(transfer.time_symbols.iter().copied());
                 reads.extend(transfer.multicast_info);
+            }
+            // ⛔ THE INDIRECT VIEWS ARE OPERANDS TOO, and their indices with them: the address view a
+            // gather reads is a use like any other, and a census that skipped it would let the view be
+            // erased under the transfer that dereferences it.
+            agen::Op::CompositeIndirectLoadAndStore(transfer) => {
+                for side in [&transfer.indirect_src, &transfer.indirect_dst] {
+                    if let Some(side) = side {
+                        reads.push(side.view);
+                        index_operands(&side.indices, &mut reads);
+                    }
+                }
+                reads.push(transfer.direct_src);
+                index_operands(&transfer.direct_src_indices, &mut reads);
+                reads.push(transfer.direct_dst);
+                index_operands(&transfer.direct_dst_indices, &mut reads);
+                reads.extend(transfer.time_symbols.iter().copied());
+                reads.extend(transfer.multicast_info);
+            }
+            // ⭐ ITS `$time_symbols` ARE OPERANDS TOO — `Variadic<Index>` (`Agen.td:436`), the
+            // values its `time_set`'s symbolic bounds are written against.
+            agen::Op::CompositeLoad(access) => {
+                reads.push(access.view);
+                index_operands(&access.indices, &mut reads);
+                reads.extend(access.time_symbols.iter().copied());
             }
             // ⛔ THE INTERLEAVE HAS NO OPERANDS AT ALL — granularity is an attribute and the
             // transfers it splits are in its region (`Agen.td:1030-1031`).
@@ -565,7 +590,9 @@ pub fn results(op: &Op) -> Vec<Val> {
             | agen::Op::IndirectVectorStore { .. }
             | agen::Op::Yield
             | agen::Op::CompositeMemoryInterleave { .. }
-            | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoadAndStore(_)
+            | agen::Op::CompositeLoad(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::Estimate { result, .. }
@@ -797,7 +824,31 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 index_operands_mut(&mut transfer.src_indices, &mut places);
                 places.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut places);
+                places.extend(transfer.time_symbols.iter_mut());
                 places.extend(transfer.multicast_info.as_mut());
+            }
+            // ⭐ ARM FOR ARM WITH [`operands`], indirect sides first.
+            agen::Op::CompositeIndirectLoadAndStore(transfer) => {
+                let transfer = transfer.as_mut();
+                for side in [&mut transfer.indirect_src, &mut transfer.indirect_dst] {
+                    if let Some(side) = side {
+                        places.push(&mut side.view);
+                        index_operands_mut(&mut side.indices, &mut places);
+                    }
+                }
+                places.push(&mut transfer.direct_src);
+                index_operands_mut(&mut transfer.direct_src_indices, &mut places);
+                places.push(&mut transfer.direct_dst);
+                index_operands_mut(&mut transfer.direct_dst_indices, &mut places);
+                places.extend(transfer.time_symbols.iter_mut());
+                places.extend(transfer.multicast_info.as_mut());
+            }
+            // ⭐ ARM FOR ARM WITH [`operands`].
+            agen::Op::CompositeLoad(access) => {
+                let access = access.as_mut();
+                places.push(&mut access.view);
+                index_operands_mut(&mut access.indices, &mut places);
+                places.extend(access.time_symbols.iter_mut());
             }
             // ⛔ ARM FOR ARM WITH [`operands`]: the interleave names no value, the mask state names one.
             agen::Op::CompositeMemoryInterleave { .. } => {}
@@ -979,7 +1030,9 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
             | agen::Op::IndirectVectorStore { .. }
             | agen::Op::Yield
             | agen::Op::CompositeMemoryInterleave { .. }
-            | agen::Op::CompositeLoadAndStore(_) => Vec::new(),
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoadAndStore(_)
+            | agen::Op::CompositeLoad(_) => Vec::new(),
         },
         Op::VectorChain(op) => match op {
             vectorchain::Op::CreateAffineMaskSet { result, .. } => vec![result],
@@ -1080,6 +1133,8 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         // body reads. `getLoadInductionVar()` is what `getLoadConsumer` roots a composite load's
         // consumer chain at (`Helper.cpp:1250`).
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.load_iv],
+        Op::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => vec![transfer.load_iv],
+        Op::Agen(agen::Op::CompositeLoad(access)) => vec![access.load_iv],
         // ⛔⛔ ONE ARGUMENT PER REGION, AND EACH REGION BINDS ITS OWN.
         // `getRegionArg(i) { return getRegion(i).getArgument(0); }` (`Uniform.td:96`) — so a
         // two-region op binds two values, and entry 182 maps the one belonging to the region it is
@@ -1125,6 +1180,10 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
             dataflow::Op::ProgramUnit { body, .. } | dataflow::Op::ProgramCollection { body, .. },
         ) => vec![body.as_slice()],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![transfer.body.as_slice()],
+        Op::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
+            vec![transfer.body.as_slice()]
+        }
+        Op::Agen(agen::Op::CompositeLoad(access)) => vec![access.body.as_slice()],
         Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body.as_slice()],
         // ⛔⛔ AS MANY REGIONS AS IT HAS UNIT LISTS — `VariadicRegion<AnyRegion>:$regions`
         // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
@@ -1178,6 +1237,8 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
             dataflow::Op::ProgramUnit { body, .. } | dataflow::Op::ProgramCollection { body, .. },
         ) => vec![body],
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => vec![&mut transfer.body],
+        Op::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => vec![&mut transfer.body],
+        Op::Agen(agen::Op::CompositeLoad(access)) => vec![&mut access.body],
         Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body],
         // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
         Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
@@ -1238,6 +1299,8 @@ pub fn dbg_name(op: &Op) -> Option<&str> {
         // ⭐ THE ONE `agen` OP THAT CARRIES ONE, and two ports read it — see
         // [`agen::CompositeTransfer::dbg_name`].
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => transfer.dbg_name.as_deref(),
+        Op::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => transfer.dbg_name.as_deref(),
+        Op::Agen(agen::Op::CompositeLoad(access)) => access.dbg_name.as_deref(),
         Op::Agen(agen::Op::VectorLoad { dbg_name, .. }) => dbg_name.as_deref(),
         // ── the ops of this island that carry no name at all ─────────────────────────────────────
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
@@ -1300,6 +1363,10 @@ pub fn dbg_name_mut(op: &mut Op) -> Option<&mut Option<String>> {
         // The discardable one — see [`dbg_name`].
         Op::Arith(arith::Op::Select { dbg_name, .. }) => Some(dbg_name),
         Op::Agen(agen::Op::CompositeLoadAndStore(transfer)) => Some(&mut transfer.dbg_name),
+        Op::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
+            Some(&mut transfer.dbg_name)
+        }
+        Op::Agen(agen::Op::CompositeLoad(access)) => Some(&mut access.dbg_name),
         Op::Agen(agen::Op::VectorLoad { dbg_name, .. }) => Some(dbg_name),
         Op::Scf(scf::Op::Yield { .. } | scf::Op::Parallel { .. })
         | Op::Affine(
@@ -1632,9 +1699,35 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 index_operands_mut(&mut transfer.src_indices, &mut operands);
                 operands.push(&mut transfer.dst);
                 index_operands_mut(&mut transfer.dst_indices, &mut operands);
+                operands.extend(transfer.time_symbols.iter_mut());
                 operands.extend(transfer.multicast_info.as_mut());
                 block_args.push(&mut transfer.load_iv);
                 regions.push(&mut transfer.body);
+            }
+            agen::Op::CompositeIndirectLoadAndStore(transfer) => {
+                let transfer = transfer.as_mut();
+                for side in [&mut transfer.indirect_src, &mut transfer.indirect_dst] {
+                    if let Some(side) = side {
+                        operands.push(&mut side.view);
+                        index_operands_mut(&mut side.indices, &mut operands);
+                    }
+                }
+                operands.push(&mut transfer.direct_src);
+                index_operands_mut(&mut transfer.direct_src_indices, &mut operands);
+                operands.push(&mut transfer.direct_dst);
+                index_operands_mut(&mut transfer.direct_dst_indices, &mut operands);
+                operands.extend(transfer.time_symbols.iter_mut());
+                operands.extend(transfer.multicast_info.as_mut());
+                block_args.push(&mut transfer.load_iv);
+                regions.push(&mut transfer.body);
+            }
+            agen::Op::CompositeLoad(access) => {
+                let access = access.as_mut();
+                operands.push(&mut access.view);
+                index_operands_mut(&mut access.indices, &mut operands);
+                operands.extend(access.time_symbols.iter_mut());
+                block_args.push(&mut access.load_iv);
+                regions.push(&mut access.body);
             }
             // ⛔ A REGION AND NOTHING ELSE, and it binds NO block argument: the transfers inside carry
             // their own `load_iv` (`Agen.td:1031` — a bare `SizedRegion<1>`).
@@ -2265,6 +2358,50 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 index_vals_mut(&mut transfer.dst_indices, &mut vals);
                 vals.extend(
                     transfer
+                        .time_symbols
+                        .iter_mut()
+                        .map(|val| (Role::Operand, val)),
+                );
+                vals.extend(
+                    transfer
+                        .multicast_info
+                        .as_mut()
+                        .map(|val| (Role::Operand, val)),
+                );
+                vals.push((Role::BlockArg, &mut transfer.load_iv));
+            }
+            agen::Op::CompositeLoad(access) => {
+                let access = access.as_mut();
+                vals.push((Role::Operand, &mut access.view));
+                index_vals_mut(&mut access.indices, &mut vals);
+                vals.extend(
+                    access
+                        .time_symbols
+                        .iter_mut()
+                        .map(|val| (Role::Operand, val)),
+                );
+                vals.push((Role::BlockArg, &mut access.load_iv));
+            }
+            agen::Op::CompositeIndirectLoadAndStore(transfer) => {
+                let transfer = transfer.as_mut();
+                for side in [&mut transfer.indirect_src, &mut transfer.indirect_dst] {
+                    if let Some(side) = side {
+                        vals.push((Role::Operand, &mut side.view));
+                        index_vals_mut(&mut side.indices, &mut vals);
+                    }
+                }
+                vals.push((Role::Operand, &mut transfer.direct_src));
+                index_vals_mut(&mut transfer.direct_src_indices, &mut vals);
+                vals.push((Role::Operand, &mut transfer.direct_dst));
+                index_vals_mut(&mut transfer.direct_dst_indices, &mut vals);
+                vals.extend(
+                    transfer
+                        .time_symbols
+                        .iter_mut()
+                        .map(|val| (Role::Operand, val)),
+                );
+                vals.extend(
+                    transfer
                         .multicast_info
                         .as_mut()
                         .map(|val| (Role::Operand, val)),
@@ -2600,6 +2737,8 @@ mod unit_tests {
                     load_order: AffineMap::identity(1),
                     store_set: IntegerSet::from_sizes(&[8]),
                     store_order: AffineMap::identity(1),
+                    // ⭐ ONE TIME SYMBOL, so all four walks are held to it.
+                    time_symbols: vec![Val(55)],
                     time_set: IntegerSet::from_sizes(&[8]),
                     time_order: AffineMap::identity(1),
                     load_time_addr_map: AffineMap::identity(1),

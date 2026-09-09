@@ -1058,8 +1058,8 @@ second site above, not the path.
 
 ⛔ **AND THE TICK COUNT UNDERSTATES THE LANDED PORTS BY 18.** Measured after the 230-253 review landed:
 257 `[x]` PORT and 257 `[x]` AUDIT boxes, 127 unticked each (257 + 127 = 384), which is what the
-Progress counter read then — it now reads 303/303, with 265-272, 273-280, 281-288, 289-296,
-297-304 and 305-310 ticked by their own porting batches. But 18 further entries carry a filled
+Progress counter read then — it now reads 319/319, with 265-272, 273-280, 281-288, 289-296,
+297-304, 305-310, 311-318 and 319-326 ticked by their own porting batches. But 18 further entries carry a filled
 `/// Replaces:` anchor with both boxes
 still `[ ]`: **167-174, 183-190 and 382-383.** 143-150 and 230-237 were in exactly that state and
 `801187bde` and `edfa7b2bb`'s review passes ticked them; `2c70786a4`'s review of 167-190 did not, so its
@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`311/384 ported; 311/384 audited`
+`319/384 ported; 319/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2603,6 +2603,91 @@ non-L3 unit whose `init_value` is 0 takes neither arm at `:788` nor `:795` and l
 a non-zero constant offset, or an iterator subscript at all still stops at the `todo!`.
 
 
+⭐ ENTRIES 319-326 — THE `sync` LOWERING BEHIND A QUERY MAP, THE VECTOR-OPERAND FREE FUNCTION, THE
+MUTABLE-ADDRESS SPLIT OF A COMPOSITE TRANSFER AND OF AN INDIRECT ONE, THE SHIFT APPLICATION, THE PAGE
+ANALYSIS-AND-CONSTRUCTION PAIRING AND THE COMPOSITE TIME PAIR. 319 is in
+`dfs_dataflow_to_sentient.rs`, 320 in `vc_vector_operands.rs`, 321/322 in
+`tf_mutable_addr_splitting.rs`, 323 in `tf_mutable_start_addr_shifting.rs`, 324/325/326 in
+`tf_transform_paged_mem_view_impl.rs`.
+
+⛔⛔ 322's `kDirDst` BRANCH PUTS THE INDIRECT **SOURCE** INTO THE INDIRECT **DESTINATION** SLOT, WITH
+`getEmptyAffineMap()` FOR ITS INDICES (`MutableAddrSplitting.cpp:640-646`). Both slots then name the
+SAME cloned address view — the split side's view is the clone, and the unsplit side's indirect access
+is rebuilt over that clone rather than over the original — so the rebuilt transfer reads its peer
+address through the partition's own view and the destination's index map is empty where the source's is
+carried over. The port reproduces both, and the negative test
+(`the_dir_dst_branch_puts_the_indirect_source_in_the_destination_slot_with_no_indices`) pins
+`src.view == dst.view` and `dst.indices.is_empty()`, which is the only place that arm is observable.
+
+⛔ 321 HANDS `createPartitions` THE **ORIGINAL** SUBSCRIPTS MAP (`:497`), NOT THE ONE
+`createExplicitTimeLoops` JUST REWROTE. That rewrite touches the pass's locals only, so the partition
+geometry is derived from the access as it arrived while the emitted indices are derived from the
+rewritten copy. The Rust pre-clones the map before the time loops run for exactly that reason; sharing
+one map would renumber the partitions.
+
+⛔ AND THE TWO MAS ANSWER KEYS CANNOT BE REPRODUCED AT THE VENDOR'S SIZE, FOR A REASON THAT IS THIS
+ISLAND'S: `MAX_MUTABLE_SIZE` is a compile-time `const` of `None` here where the vendor takes
+`--dcc-mutable-addr-splitting-max-mutable-size=600000` (37500 fp16 elements) on the command line, and
+which passes read which flags is a call in this crate. The keys are re-expressed by SCALING THE VENDOR
+LAYOUT by 4096 — 306 and 307's precedent, which scales by 24576 and 24000 — so that the span reaches
+the EAR's own `134217728`: `43072 * 4096 + 64 = 176422976`, overflow `42205248`, `extra_iters = 6`,
+`sizes = [10]`, `num_partitions = 2`, and a hoisted shift of `10 * 2048 * 4096 = 83886080` where the
+vendor's prints `13 * 2048 = 26624`. The overflow is the one quantity the arithmetic reads; the
+partition count, the loop bound, the pinned `time_set`, `dbgName = ""` and `dir = pseudo_random` are all
+the vendor's, and `TIME_DIMS_K` states the scale beside the test.
+
+⛔ 325's EMISSION IS **NOT** THE ANSWER KEY'S, AND THE DIFFERENCE IS ENTRY 356'S. The CHECK at
+`paged_mem_view_loads.mlir:128-166` prints `0` at subscript position 1 in all three arms because
+`constructValidPage` (309/356) later rebases each page's selecting axis onto that page's own start;
+325's own output still names the innermost induction variable there. Derived independently and
+confirmed: `order_map` gives `(0, d2, 0, 0, d1 * 2)`, concatenating `(d0) -> (d0, 0, 0, 0, 0)` gives
+`(d0, d3, 0, 0, d2 * 2)` over six dims, and the explicit-time rewrite maps `d1 -> iv0`, `d2 -> iv1`,
+`d3 -> iv2` — so `[arg9, iv2, 0, 0, iv1 * 2]`, with the paged view still in place. Everything else in
+the key is byte-for-byte: three `affine.for`s of `0 to 2`, `0 to 2`, `0 to 3`, and `#ATTR_9`'s three
+prepended equalities (`d0 == 0, d4 == 0, d2 == 0`, in `time_order` order) over d1's and d3's surviving
+constraints.
+
+⛔ 326's TIME BOUNDS COME OUT OF THE **SYMBOLS**, NOT THE SET'S DIMENSIONS ALONE: widths
+`d0:2 d1:1 d2:s0=3 d3:3 d4:2` reordered by `time_order`'s `(d0, d4, d2, d3, d1)` give
+`[2, 2, 3, 3, 1]`, and the `s0` column is resolvable only because the op carries `time_symbols`. Which
+is why this batch grew the island there (below) rather than reading a constant out of the set.
+
+⛔ 324 CONSTRUCTS INSIDE THE ANALYSIS LOOP, so a page's guards WRAP its start addend: the `arith.addi`
+that adds a page's own `start_addr` is not the first op of `placed[0]` but sits under the `scf.if` the
+page's validity emitted. The test walks the arms recursively to find it, and pins four reached pages of
+the vendor's six (`:291-296`) — the two the analysis rejects never reach a rebuild.
+
+⛔ 323's "NO SHIFT" ANSWER IS `AffineMap::get(ctx)` — A ZERO-RESULT MAP, falsy at both call sites
+(`:265`, `:307`), so `None` is it and not an empty rewrite; and its
+`DT_CHECK(hasValidL3ImmutableAddr(…, req_even_toggle = arch >= SEN1P5))` is a TYPE here
+(`ConstStartMemView`), because a view whose start is not a constant cannot reach the function at all.
+
+⛔ 320 IS THE 304↔320 CYCLE'S LEVEL-5 SIDE, already recorded above (`:151`, `:257`): four lines that
+forward to the operand dispatch 304 owns, which is why it lands beside it rather than under a level of
+its own.
+
+⛔ 319's `default:` ARM AND ITS L0 FALL-THROUGH ARE UNREPRESENTABLE HERE, and that is a property of the
+island, not a dropped branch: `L0LxSrc` has exactly two variants and its constructor never answers
+null, so the C++'s third case and its null test have no input. Both are documented at the port.
+`QueryMapLowering::TwoRegions` carries the two `uniform::YieldOp::create` calls as the `regions` op's
+own yields.
+
+⛔ ISLAND GROWTH FOR 321, 322, 325 AND 326, per AGENT-BRIEF.md:87, each because a port had no input to
+read: `islands/dataflow_ir/dialects/agen.rs` gained `Op::CompositeIndirectLoadAndStore` and
+`Op::CompositeLoad` (16 exhaustive-match arms across 9 files) — a composite transfer that carries an
+indirect peer address, and a composite load with no store side, neither of which the island could
+spell; and `time_symbols` on `CompositeTransfer`, `CompositeIndirectTransfer` and `CompositeAccess`
+(8 census edits, 2 printer changes, 12 construction-site fills), which is the column 326 resolves its
+symbolic bound through and which the vendor prints as `time_symbols(%VAL_2)`.
+
+⭐ WRITTEN UNANCHORED BESIDE THESE EIGHT, all reached from a scheduled body and in neither the 384 nor
+the 106 exclusions: `order_map`, `replace_const_ops_in_subscripts_map`,
+`clone_composite_load_with_new_access_info`, `create_new_composite_mem_op`,
+`nest_explicit_time_loops_over`, `TimeSteps::trip_count`, `TpmvCompositeInfo` and four new
+`TpmvComposite` fields, plus `AccessDetailsAffineComposite::{initialize, construct_details}` and
+`AccessDetailsAffine::construct_details_after_initialize`, which 326 calls and the schedule does not
+list.
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3256,22 +3341,22 @@ a non-zero constant offset, or an iterator subscript at all still stops at the `
 - [x] **AUDIT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, line by line against the C++
 - [x] **PORT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, 326 lines
 - [x] **AUDIT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, line by line against the C++
-- [ ] **PORT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, 166 lines
-- [ ] **AUDIT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, line by line against the C++
-- [ ] **PORT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, 4 lines
-- [ ] **AUDIT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, line by line against the C++
-- [ ] **PORT 321/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451`, 92 lines
-- [ ] **AUDIT 321/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451`, line by line against the C++
-- [ ] **PORT 322/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546`, 124 lines
-- [ ] **AUDIT 322/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546`, line by line against the C++
-- [ ] **PORT 323/384** `shiftMutableAddr` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:366`, 19 lines
-- [ ] **AUDIT 323/384** `shiftMutableAddr` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:366`, line by line against the C++
-- [ ] **PORT 324/384** `analyzeAndConstructValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152`, 32 lines
-- [ ] **AUDIT 324/384** `analyzeAndConstructValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152`, line by line against the C++
-- [ ] **PORT 325/384** `transform_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977`, 98 lines
-- [ ] **AUDIT 325/384** `transform_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977`, line by line against the C++
-- [ ] **PORT 326/384** `initialize_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095`, 23 lines
-- [ ] **AUDIT 326/384** `initialize_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095`, line by line against the C++
+- [x] **PORT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, 166 lines
+- [x] **AUDIT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, line by line against the C++
+- [x] **PORT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, 4 lines
+- [x] **AUDIT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, line by line against the C++
+- [x] **PORT 321/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451`, 92 lines
+- [x] **AUDIT 321/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451`, line by line against the C++
+- [x] **PORT 322/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546`, 124 lines
+- [x] **AUDIT 322/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546`, line by line against the C++
+- [x] **PORT 323/384** `shiftMutableAddr` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:366`, 19 lines
+- [x] **AUDIT 323/384** `shiftMutableAddr` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:366`, line by line against the C++
+- [x] **PORT 324/384** `analyzeAndConstructValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152`, 32 lines
+- [x] **AUDIT 324/384** `analyzeAndConstructValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152`, line by line against the C++
+- [x] **PORT 325/384** `transform_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977`, 98 lines
+- [x] **AUDIT 325/384** `transform_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977`, line by line against the C++
+- [x] **PORT 326/384** `initialize_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095`, 23 lines
+- [x] **AUDIT 326/384** `initialize_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095`, line by line against the C++
 
 ## Level 6
 

@@ -86,16 +86,16 @@ use std::num::NonZeroU64;
 use crate::arch::{Arch, Bounded, Elements, IsaGen, Sticks};
 use crate::formats::Bits;
 use crate::generated::DataType;
-use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
-    self, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol,
+    self, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, scf, symbol,
 };
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, MemRef};
+use crate::islands::dataflow_ir::{ValueMapping, Values};
 use crate::units::DfirUnit;
 
 use super::agen_access_details::{
-    AccessDetailsAffine, AccessDetailsAffineComposite, ConstructedDetails, MemoryOperandIndex,
-    TimeBound,
+    AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, ConstructedDetails,
+    MemoryOperandIndex, TimeBound, TimeStepsInfo, construct_time_steps_info,
 };
 use super::tf_transform_paged_mem_view_impl::{
     UseChain, VectorLoadOp, VectorStoreOp, clone_store_with_new_access_info,
@@ -3405,6 +3405,8 @@ mod unit_tests {
             load_order: AffineMap::identity(3),
             store_set: transfer_set,
             store_order: AffineMap::identity(3),
+            // `time_symbols(%c3)` (`:130`) — `%c3` is the key's own `%[[VAL_1]]`.
+            time_symbols: vec![Val(1)],
             time_set: time_dims_time_set(),
             time_order: time_dims_time_order(),
             load_time_addr_map: AffineMap::identity(3),
@@ -4895,6 +4897,562 @@ mod unit_tests {
                 &mut |_: &mut Values, _: &AffineMap, _| Vec::new()
             ),
             Partitions::NoConditionalTree(ConditionalTree::NoPartitionsToBuild)
+        );
+    }
+
+    // ── 321/384 and 322/384 — the two composite transfers, each on its own answer key ────────────
+
+    /// THE `time_dims` KEY'S LAYOUT SCALED BY 4096, WHICH IS WHAT MAKES IT OVERFLOW HERE.
+    ///
+    /// [`MAX_MUTABLE_SIZE`] is [`None`] in this crate, so the vendor's
+    /// `--dcc-mutable-addr-splitting-max-mutable-size=600000` (37500 `f16` elements) becomes the
+    /// `EAR`'s own 134217728, and the key's `43136`-element span has to grow to reach it. Scaling the
+    /// layout is entry 306's precedent: `43072 * 4096 + 64 = 176422976` against 134217728 leaves an
+    /// overflow of 42205248, so the heaviest dimension's cut falls at 10 of its 16 iterations where
+    /// the vendor's falls at 13, and the shift is `10 * 2048 * 4096` where the vendor's is `13 * 2048`.
+    const TIME_DIMS_K: i64 = 4096;
+
+    /// The two arms' start addresses, in the fill order [`TransferSplit::hoisted`] records.
+    fn hoisted_starts(hoisted: &[DfirOp]) -> Vec<i64> {
+        hoisted
+            .iter()
+            .map(|op| match op {
+                DfirOp::Arith(arith::Op::Constant { value, .. }) => *value,
+                _ => unreachable!("a partition's start address is an `arith.constant`"),
+            })
+            .collect()
+    }
+
+    /// `#[[$ATTR_9]]`/`#[[$ATTR_10]]` — the split time dimension PINNED and its own two constraints
+    /// dropped, which is what `updateTimeSetForExplicitDims` leaves on every rebuilt transfer.
+    fn time_set_with_dim_pinned(set: &IntegerSet, dim: u32, dropped: usize) -> IntegerSet {
+        IntegerSet {
+            dims: set.dims,
+            symbols: set.symbols,
+            constraints: std::iter::once(Constraint {
+                expr: AffineExpr::dim(dim),
+                is_equality: true,
+            })
+            .chain(
+                set.constraints
+                    .iter()
+                    .enumerate()
+                    .filter(|&(c, _)| c / 2 != dropped)
+                    .map(|(_, constraint)| constraint.clone()),
+            )
+            .collect(),
+        }
+    }
+
+    /// `affine.for %arg1 = 0 to 4 { affine.for %arg2 = 0 to 8 { } }` — the key's own two iterators.
+    fn time_dims_loop_nest(outer: Val, inner: Val) -> DfirOp {
+        let for_op = |iv: Val, hi: i64, body: Vec<DfirOp>| {
+            DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(hi),
+                carried: Vec::new(),
+                body,
+                dbg_name: None,
+            })
+        };
+        for_op(outer, 4, vec![for_op(inner, 8, Vec::new())])
+    }
+
+    /// 🎯 321/384 — ⭐⭐ IBM'S `constant_start_addr` KEY END TO END: THE OUTERMOST TIME DIMENSION
+    /// BECOMES AN `affine.for 0 to 16` AND THE TRANSFER IS REBUILT IN BOTH ARMS OF ONE `scf.if`.
+    ///
+    /// `mutable_addr_splitting_time_dims.mlir:116-146` in, `:19-60` out — one loop of 16 around the
+    /// cut, three ops per arm in the vendor's order (the split dst view, the cloned src view, the
+    /// transfer), `#[[$ATTR_9]]`'s pinned `d2`, and `dst:[0, %arg1 * 16, %arg3 * 8]` UNCHANGED by the
+    /// split. ⛔ THE CUT IS 10 AND THE SHIFT 83886080 — see [`TIME_DIMS_K`].
+    #[test]
+    fn the_time_dims_key_splits_its_outermost_time_dimension_end_to_end() {
+        let mut vals = Values::default();
+        let (c0_op, c0) = index_const(&mut vals, 0);
+        let (c3_op, _c3) = index_const(&mut vals, 3);
+        let lx = vals.mint();
+        let hbm = vals.mint();
+        // [`time_dims_transfer`] is written in the answer key's own SSA numbering, so the scope mints
+        // into it: `%9`/`%10` are the two iterators, `%11`/`%12` the two views, `%18` the load iv.
+        while vals.issued() < 9 {
+            vals.mint();
+        }
+        let arg1 = vals.mint();
+        let arg3 = vals.mint();
+        let src_view = vals.mint();
+        let dst_view = vals.mint();
+        while vals.issued() < 19 {
+            vals.mint();
+        }
+
+        let (_, ty) = answer_key_memref();
+        let layout = AffineMap::linear(&[1, 64 * TIME_DIMS_K, 256 * TIME_DIMS_K]);
+        let view = |result: Val, from: Val| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start: c0,
+                layout: layout.clone(),
+                ty: ty.clone(),
+            })
+        };
+        let scope = vec![
+            c0_op,
+            c3_op,
+            time_dims_loop_nest(arg1, arg3),
+            view(src_view, lx),
+            view(dst_view, hbm),
+            DfirOp::Agen(time_dims_transfer()),
+        ];
+        let candidate = MasCandidate {
+            op: &scope[5],
+            comp: DfirUnit::L3su,
+            mem_index: MemoryOperandIndex::DirDst,
+        };
+        let mut conditionals = Conditionals::default();
+        let split = transform_comp_load_and_store::<Dd2>(
+            &mut vals,
+            &candidate,
+            DataType::Sen169Fp16,
+            EarOverflowCorrection::Allowed,
+            &mut conditionals,
+            &scope,
+        );
+        let TransferSplit::Split {
+            ops,
+            hoisted,
+            erased,
+            partitions,
+            adjustments,
+        } = split
+        else {
+            panic!("the scaled key overflows the EAR by 42205248 elements: {split:?}")
+        };
+        assert_eq!(partitions, 2);
+        assert_eq!(
+            erased,
+            [&scope[5]],
+            "the transfer alone — a composite carries its own body"
+        );
+        assert_eq!(
+            adjustments,
+            [
+                EvenImmutableAdjustment::NotOnThisArch,
+                EvenImmutableAdjustment::NotOnThisArch
+            ]
+        );
+        // `%[[VAL_6]] = arith.constant 26624` then `%[[VAL_7]] = arith.constant 0` — the `else`
+        // partition is filled first, and 26624 is `13 * 2048` where this is `10 * 2048 * 4096`.
+        let shift = 10 * 2048 * TIME_DIMS_K;
+        assert_eq!(hoisted_starts(&hoisted), [shift, 0]);
+
+        // `affine.for %[[VAL_13]] = 0 to 16 { %c13; cmpi slt; scf.if .. else .. }`.
+        let [DfirOp::Affine(affine::Op::For { lo, hi, body, .. })] = &ops[..] else {
+            panic!("one explicit loop for the split time dimension: {ops:?}")
+        };
+        assert_eq!(
+            (lo, hi),
+            (&affine::Bound::Const(0), &affine::Bound::Const(16))
+        );
+        let [
+            DfirOp::Arith(arith::Op::Constant { value: cut, .. }),
+            DfirOp::Arith(arith::Op::Compare { predicate, .. }),
+            DfirOp::Scf(scf::Op::If {
+                body: then_arm,
+                else_body,
+                ..
+            }),
+        ] = &body[..]
+        else {
+            panic!("the cut, its comparison and the two arms: {body:?}")
+        };
+        assert_eq!(
+            (*cut, *predicate),
+            (10, arith::CmpIPredicate::Slt),
+            "the vendor's `arith.constant 13` at 4096x"
+        );
+
+        let narrowed = time_set_with_dim_pinned(&time_dims_time_set(), 2, 2);
+        let original = match &scope[5] {
+            DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => transfer,
+            _ => unreachable!("the candidate is the key's transfer"),
+        };
+        for (arm, start) in [(then_arm, &hoisted[1]), (else_body, &hoisted[0])] {
+            let [
+                DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                    result: split_view,
+                    start: split_start,
+                    ..
+                }),
+                DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                    result: cloned_src,
+                    from: cloned_from,
+                    ..
+                }),
+                DfirOp::Agen(agen::Op::CompositeLoadAndStore(rebuilt)),
+                DfirOp::Scf(scf::Op::Yield { .. }),
+            ] = &arm[..]
+            else {
+                panic!("the two views, the transfer and the region's terminator: {arm:?}")
+            };
+            let DfirOp::Arith(arith::Op::Constant { result: from, .. }) = start else {
+                unreachable!("a partition's start address is an `arith.constant`")
+            };
+            assert_eq!(split_start, from, "the arm reads its own hoisted constant");
+            assert_eq!(cloned_from, &lx, "the unsplit side is cloned off `%lx`");
+            assert_eq!((rebuilt.dst, rebuilt.src), (*split_view, *cloned_src));
+            assert_eq!(
+                rebuilt.dst_indices, original.dst_indices,
+                "`createPartitions` reads the ORIGINAL two-dimensional subscripts map"
+            );
+            assert_eq!(rebuilt.time_set, narrowed);
+            assert_eq!(
+                rebuilt.time_symbols, original.time_symbols,
+                "`time_symbols(%c3)`"
+            );
+            assert_eq!(rebuilt.dbg_name, Some(String::new()), "`dbgName = \"\"`");
+            assert_eq!(rebuilt.dir, Some(agen::RoutingDirection::PseudoRandom));
+        }
+    }
+
+    /// THE `query_start_addr` KEY'S TRANSFER (`mutable_addr_splitting_time_dims.mlir:169-186`), with
+    /// the split side chosen by `mem_index`.
+    ///
+    /// ⛔ `direct_src` GATHERS ON `kDirSrc` AND `direct_dst` SCATTERS ON `kDirDst`, and the maps swap
+    /// with them so both arrangements reach the SAME cut: the split side always carries
+    /// `[0, %arg1 * 16 + 1, %arg2 * 8]` and the `(d2 * 64, d1, d0 * 8)` time map.
+    fn query_transfer(
+        mem_index: MemoryOperandIndex,
+        hbm_view: Val,
+        lx_view: Val,
+        ibr_view: Val,
+        ibr_ty: MemRef,
+        args: (Val, Val),
+    ) -> agen::Op {
+        let (_, ty) = answer_key_memref();
+        let (arg1, arg2) = args;
+        // `load_set`/`store_set` — `(d0 >= 0, -d0 + 63 >= 0, d1 == 0, d2 == 0)`, as the first key's.
+        let transfer_set = match time_dims_transfer() {
+            agen::Op::CompositeLoadAndStore(transfer) => transfer.load_set.clone(),
+            _ => unreachable!("the first key's transfer is a composite load and store"),
+        };
+        // `time_set = (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + s0 - 1 >= 0, d2 >= 0, -d2 + 2 >= 0)`.
+        let spanning = |dim: u32, upper: AffineExpr| {
+            vec![
+                Constraint {
+                    expr: AffineExpr::dim(dim),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(dim).times(-1).plus(upper),
+                    is_equality: false,
+                },
+            ]
+        };
+        let time_set = IntegerSet {
+            dims: 3,
+            symbols: 1,
+            constraints: spanning(0, AffineExpr::Const(15))
+                .into_iter()
+                .chain(spanning(1, AffineExpr::sym(0).plus(AffineExpr::Const(-1))))
+                .chain(spanning(2, AffineExpr::Const(2)))
+                .collect(),
+        };
+        // `(d2 * 64, d1, d0 * 8)` — the split side's offset at each time step.
+        let split_time_addr_map = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2).times(64),
+                AffineExpr::dim(1),
+                AffineExpr::dim(0).times(8),
+            ],
+        };
+        // `[0, %arg1 * 16 + 1, %arg2 * 8]` and `[0, 0, %arg1]`.
+        let split_indices = vec![
+            Index::Const(0),
+            Index::Strided(vec![(arg1, 16)], 1),
+            Index::Strided(vec![(arg2, 8)], 0),
+        ];
+        let peer_indices = vec![Index::Const(0), Index::Const(0), Index::Val(arg1)];
+        let address = agen::IndirectAccess {
+            view: ibr_view,
+            indices: vec![Index::Val(arg2)],
+            ty: ibr_ty,
+        };
+        let on_dir_src = mem_index == MemoryOperandIndex::DirSrc;
+        agen::Op::CompositeIndirectLoadAndStore(Box::new(agen::CompositeIndirectTransfer {
+            // The address view sits on the side that is NOT split, which is the `DT_CHECK`.
+            indirect_src: (!on_dir_src).then(|| address.clone()),
+            direct_src: if on_dir_src { hbm_view } else { lx_view },
+            direct_src_indices: if on_dir_src {
+                split_indices.clone()
+            } else {
+                peer_indices.clone()
+            },
+            direct_src_ty: ty.clone(),
+            indirect_dst: on_dir_src.then_some(address),
+            direct_dst: if on_dir_src { lx_view } else { hbm_view },
+            direct_dst_indices: if on_dir_src {
+                peer_indices
+            } else {
+                split_indices
+            },
+            direct_dst_ty: ty,
+            load_iv: Val(27),
+            load_iv_ty: Vector {
+                len: 64,
+                elem: ElemType::F16,
+            },
+            load_set: transfer_set.clone(),
+            load_order: AffineMap::identity(3),
+            store_set: transfer_set,
+            store_order: AffineMap::identity(3),
+            time_symbols: vec![Val(1)],
+            time_set,
+            time_order: AffineMap::identity(3),
+            load_indirect_time_addr_map: None,
+            load_direct_time_addr_map: if on_dir_src {
+                split_time_addr_map.clone()
+            } else {
+                AffineMap::identity(3)
+            },
+            store_indirect_time_addr_map: Some(AffineMap {
+                dims: 3,
+                syms: 0,
+                results: vec![AffineExpr::Const(0); 3],
+            }),
+            store_direct_time_addr_map: if on_dir_src {
+                AffineMap::identity(3)
+            } else {
+                split_time_addr_map
+            },
+            multicast_info: None,
+            dbg_name: None,
+            body: vec![DfirOp::Agen(agen::Op::Yield)],
+        }))
+    }
+
+    /// THE `query_start_addr` KEY'S SCOPE, with its three views and the transfer last.
+    ///
+    /// ⛔ `%query` IS AN `arith.constant 0` HERE. `uniform.query_map(map:%def_map, key:%arg0)` over a
+    /// mapping whose every destination is `%c0` is exactly the constant `isConstant`'s second arm
+    /// answers `true` for, and this island has no `uniform` dialect — see
+    /// [`SplitCandidateView::resolve`], which records that collapse.
+    fn query_scope(vals: &mut Values, mem_index: MemoryOperandIndex) -> (Vec<DfirOp>, Val) {
+        let (c0_op, c0) = index_const(vals, 0);
+        let (c3_op, _c3) = index_const(vals, 3);
+        let lx = vals.mint();
+        let hbm = vals.mint();
+        let ibr = vals.mint();
+        while vals.issued() < 14 {
+            vals.mint();
+        }
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let hbm_view = vals.mint();
+        let ibr_view = vals.mint();
+        let lx_view = vals.mint();
+        while vals.issued() < 28 {
+            vals.mint();
+        }
+
+        let (_, ty) = answer_key_memref();
+        let layout = AffineMap::linear(&[1, 64 * TIME_DIMS_K, 256 * TIME_DIMS_K]);
+        // `memref<32xi32>` under `affine_map<(d0) -> (d0)>` — the address view.
+        let ibr_ty = MemRef {
+            shape: vec![32],
+            elem: ElemType::Int(32),
+        };
+        let view = |result: Val, from: Val, layout: AffineMap, ty: MemRef| {
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start: c0,
+                layout,
+                ty,
+            })
+        };
+        let scope = vec![
+            c0_op,
+            c3_op,
+            time_dims_loop_nest(arg1, arg2),
+            view(hbm_view, hbm, layout.clone(), ty.clone()),
+            view(ibr_view, ibr, AffineMap::identity(1), ibr_ty.clone()),
+            view(lx_view, lx, layout, ty),
+            DfirOp::Agen(query_transfer(
+                mem_index,
+                hbm_view,
+                lx_view,
+                ibr_view,
+                ibr_ty,
+                (arg1, arg2),
+            )),
+        ];
+        (scope, ibr_view)
+    }
+
+    /// 🎯 322/384 — ⭐⭐ IBM'S `query_start_addr` KEY END TO END: THE GATHER'S DIRECT SOURCE IS SPLIT
+    /// AND ITS DIRECT **AND** INDIRECT DESTINATIONS ARE BOTH CLONED PER PARTITION.
+    ///
+    /// `mutable_addr_splitting_time_dims.mlir:148-186` in, `:63-113` out — one loop of 16, four ops
+    /// per arm in the vendor's order (split src view, direct dst clone, address view clone, the
+    /// transfer), `#[[$ATTR_10]]`'s pinned `d0`, and `indirect_dst:[%arg2]` carried through with its
+    /// index. ⛔ THE CUT IS 10 AND THE SHIFT 83886080 — see [`TIME_DIMS_K`].
+    #[test]
+    fn the_query_start_addr_key_splits_the_direct_source_and_clones_both_destinations() {
+        let mut vals = Values::default();
+        let (scope, ibr_view) = query_scope(&mut vals, MemoryOperandIndex::DirSrc);
+        let candidate = MasCandidate {
+            op: &scope[6],
+            comp: DfirUnit::L3lu,
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        let mut conditionals = Conditionals::default();
+        let split = transform_comp_ind_load_and_store::<Dd2>(
+            &mut vals,
+            &candidate,
+            DataType::Sen169Fp16,
+            EarOverflowCorrection::Allowed,
+            &mut conditionals,
+            &scope,
+        );
+        let TransferSplit::Split {
+            ops,
+            hoisted,
+            partitions,
+            ..
+        } = split
+        else {
+            panic!("the scaled key overflows the EAR by 42205248 elements: {split:?}")
+        };
+        assert_eq!(partitions, 2);
+        assert_eq!(hoisted_starts(&hoisted), [10 * 2048 * TIME_DIMS_K, 0]);
+
+        let [DfirOp::Affine(affine::Op::For { hi, body, .. })] = &ops[..] else {
+            panic!("one explicit loop for the split time dimension: {ops:?}")
+        };
+        assert_eq!(hi, &affine::Bound::Const(16));
+        let [_, _, DfirOp::Scf(scf::Op::If { body: then_arm, .. })] = &body[..] else {
+            panic!("the cut, its comparison and the two arms: {body:?}")
+        };
+        let [
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: split_view, ..
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: direct_dst, ..
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: address, ..
+            }),
+            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(rebuilt)),
+            DfirOp::Scf(scf::Op::Yield { .. }),
+        ] = &then_arm[..]
+        else {
+            panic!(
+                "the split src view, both cloned destinations, the transfer and the yield: {then_arm:?}"
+            )
+        };
+        let original = match &scope[6] {
+            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => transfer,
+            _ => unreachable!("the candidate is the key's transfer"),
+        };
+        assert_eq!(rebuilt.direct_src, *split_view);
+        assert_eq!(rebuilt.direct_dst, *direct_dst);
+        assert_eq!(
+            rebuilt.direct_src_indices, original.direct_src_indices,
+            "`createPartitions` reads the ORIGINAL subscripts map"
+        );
+        assert_eq!(
+            rebuilt.indirect_dst,
+            Some(agen::IndirectAccess {
+                view: *address,
+                indices: original
+                    .indirect_dst
+                    .as_ref()
+                    .map(|indirect| indirect.indices.clone())
+                    .unwrap_or_default(),
+                ty: MemRef {
+                    shape: vec![32],
+                    elem: ElemType::Int(32),
+                },
+            }),
+            "`indirect_dst:%[[VAL_26]][%[[VAL_15]]]` — the address view cloned, its index kept"
+        );
+        assert_ne!(
+            *address, ibr_view,
+            "each partition gets its own address view"
+        );
+        assert_eq!(rebuilt.indirect_src, None);
+        assert_eq!(
+            rebuilt.time_set,
+            time_set_with_dim_pinned(&original.time_set, 0, 0)
+        );
+    }
+
+    /// 🎯 322/384 — ⛔⛔ AND THE `kDirDst` BRANCH REBUILDS A SCATTER CLAIMING AN INDIRECT
+    /// **DESTINATION** THAT IS REALLY ITS INDIRECT SOURCE, WITH NO INDICES.
+    ///
+    /// `MutableAddrSplitting.cpp:653`, `:657` — `op.getIndirectSrcMemref()` goes into the indirect
+    /// destination slot with `getEmptyAffineMap()`, and `num_ind_dst_indices` is recounted off the
+    /// original's empty one. The vendor's key never reaches this branch; the same transfer with the
+    /// address on the LOAD side does, and the two indirect slots come out pointing at one view.
+    #[test]
+    fn the_dir_dst_branch_puts_the_indirect_source_in_the_destination_slot_with_no_indices() {
+        let mut vals = Values::default();
+        let (scope, _) = query_scope(&mut vals, MemoryOperandIndex::DirDst);
+        let candidate = MasCandidate {
+            op: &scope[6],
+            comp: DfirUnit::L3su,
+            mem_index: MemoryOperandIndex::DirDst,
+        };
+        let mut conditionals = Conditionals::default();
+        let split = transform_comp_ind_load_and_store::<Dd2>(
+            &mut vals,
+            &candidate,
+            DataType::Sen169Fp16,
+            EarOverflowCorrection::Allowed,
+            &mut conditionals,
+            &scope,
+        );
+        let TransferSplit::Split { ops, .. } = split else {
+            panic!("the scaled key overflows the EAR by 42205248 elements: {split:?}")
+        };
+        let [DfirOp::Affine(affine::Op::For { body, .. })] = &ops[..] else {
+            panic!("one explicit loop for the split time dimension: {ops:?}")
+        };
+        let [_, _, DfirOp::Scf(scf::Op::If { body: then_arm, .. })] = &body[..] else {
+            panic!("the cut, its comparison and the two arms: {body:?}")
+        };
+        let [
+            ..,
+            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(rebuilt)),
+            DfirOp::Scf(scf::Op::Yield { .. }),
+        ] = &then_arm[..]
+        else {
+            panic!("the transfer sits last, ahead of the region's terminator: {then_arm:?}")
+        };
+        let (Some(src), Some(dst)) = (&rebuilt.indirect_src, &rebuilt.indirect_dst) else {
+            panic!("both indirect slots are filled: {rebuilt:?}")
+        };
+        assert_eq!(src.view, dst.view, "ONE cloned address view in both slots");
+        assert!(
+            dst.indices.is_empty(),
+            "`getEmptyAffineMap()` has no operands"
+        );
+        let original = match &scope[6] {
+            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => transfer,
+            _ => unreachable!("the candidate is the key's transfer"),
+        };
+        assert_eq!(
+            Some(&src.indices),
+            original
+                .indirect_src
+                .as_ref()
+                .map(|indirect| &indirect.indices),
+            "the indirect SOURCE keeps its own `[%arg2]`"
         );
     }
 }
@@ -7153,6 +7711,32 @@ pub fn create_explicit_time_loops(
     })
 }
 
+/// [`nest_explicit_time_loops`] WITH MORE THAN ONE OP IN THE INNERMOST BODY.
+///
+/// ⛔ `TPMVCompositeLoadStore::createNewMemOp` NEEDS IT: its `cloneMemViewIfNonPaged` builds the other
+/// side's view at the SAME insertion point as the new transfer
+/// (`TransformPagedMemView/TransformPagedMemViewImpl.cpp:1252`, `:1259`), which is
+/// `for_ops.back().getBody()` by the time entry 325 calls it. The single-op form above cannot say
+/// that, and hoisting the view out of the nest would put it where the loop iterators are not in scope.
+pub(super) fn nest_explicit_time_loops_over(
+    body: Vec<DfirOp>,
+    ivs: &[Val],
+    trip_counts: &[i64],
+) -> Vec<DfirOp> {
+    let mut nest = body;
+    for (&iv, &hi) in ivs.iter().zip(trip_counts).rev() {
+        nest = vec![DfirOp::Affine(affine::Op::For {
+            iv,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(hi),
+            carried: Vec::new(),
+            body: nest,
+            dbg_name: None,
+        })];
+    }
+    nest
+}
+
 /// `constructExplicitTimeLoops` — `dcc/src/Dialect/Agen/Utils.cpp:422` (16L).
 ///
 /// ```cpp
@@ -7188,7 +7772,7 @@ pub fn create_explicit_time_loops(
 /// ⭐ `carried: Vec::new()`, WHICH PRINTS NO `iter_args`, NO RESULTS AND NO TERMINATOR — the plain
 /// counted loop `AffineForOp::create(builder, loc, 0, ub)` builds. ⭐ AND `dbg_name: None`: the
 /// reference passes no name, and an empty dictionary is not the same text as no dictionary.
-fn nest_explicit_time_loops(op: DfirOp, ivs: &[Val], trip_counts: &[i64]) -> DfirOp {
+pub(super) fn nest_explicit_time_loops(op: DfirOp, ivs: &[Val], trip_counts: &[i64]) -> DfirOp {
     let mut nest = op;
     for (&iv, &hi) in ivs.iter().zip(trip_counts).rev() {
         nest = DfirOp::Affine(affine::Op::For {
@@ -7232,7 +7816,7 @@ fn nest_explicit_time_loops(op: DfirOp, ivs: &[Val], trip_counts: &[i64]) -> Dfi
 /// dropped, not merged — a `subscripts_map` with a symbol in it would lose it here. Every subscripts
 /// map in the authority tree's own keys is symbol-free (the transfer's symbols live on `time_set`
 /// instead, as `time_symbols`), which is why the reference can do this.
-fn concatenate_maps(map_a: &AffineMap, map_b: &AffineMap) -> AffineMap {
+pub(super) fn concatenate_maps(map_a: &AffineMap, map_b: &AffineMap) -> AffineMap {
     let shifted_map_b = map_b.shift_dims(map_a.dims);
     let results = map_a
         .results
@@ -7300,7 +7884,7 @@ fn concatenate_maps(map_a: &AffineMap, map_b: &AffineMap) -> AffineMap {
 /// ⚠️ TOTAL, WITH BOTH REFERENCE LOOKUPS HOISTED: `explicit_dims` is `(getResult(dim),
 /// getDimPosition(dim))` for `dim` in `0..=time_dim`, resolved by the caller so the two aborts can be
 /// reported rather than taken.
-fn update_time_set_for_explicit_dims(
+pub(super) fn update_time_set_for_explicit_dims(
     explicit_dims: &[(AffineExpr, u32)],
     time_set: &IntegerSet,
     time_order: &AffineMap,
@@ -7390,7 +7974,7 @@ fn update_time_set_for_explicit_dims(
 /// structurally unreachable when `ivs` comes from [`nest_explicit_time_loops`]'s own bound list.
 /// ⚠️ `subscripts_map` IS NOT A PARAMETER: the reference reads only its `getNumDims()` and its
 /// context off it, and the caller has that number already.
-fn update_subscripts_and_indices_for_explicit_time_loops(
+pub(super) fn update_subscripts_and_indices_for_explicit_time_loops(
     ivs: &[Val],
     time_dim: usize,
     num_orig_dims: usize,
@@ -8219,6 +8803,26 @@ pub enum TransferSplit<'a> {
     NotSetUpForPartitioning(SetupForPartitioning),
     /// [`create_partitions`]'s refusal (`:367-368`).
     NotPartitioned(Partitions),
+    /// `auto op = dyn_cast<agen::CompositeLoadAndStoreOp>(candidate.op_); DT_CHECK(op);` (`:453-454`).
+    NotACompositeLoadAndStore,
+    /// `dyn_cast<agen::CompositeIndirectLoadAndStoreOp>(candidate.op_)` with its `DT_CHECK` (`:548`).
+    NotACompositeIndirectLoadAndStore,
+    /// THE OPERAND UNDER CONSIDERATION ALREADY HAS AN ENTRY — `insert`'s first `DT_CHECK_MSG`
+    /// (`AccessDetails.hpp:389-390`), which a container built one line earlier cannot fail.
+    AccessSlotUnavailable(MemoryOperandIndex),
+    /// The `result &= ..constructTimeStepsInfo(access_details, false, false).succeeded()` half of
+    /// `DT_CHECK(result)` (`:462-466`).
+    TimeStepsNotConstructed(TimeStepsInfo),
+    /// `initialize()` left `time_set_` unset, which `ad.getTimeSet()` (`:490`) hands to every clone.
+    ///
+    /// ⚠️ UNREACHABLE AFTER [`TimeStepsInfo::Constructed`], whose first act is to read it.
+    TimeSetIsNotSet,
+    /// `DT_CHECK(candidate.mem_index_ == kDirSrc ? !op.hasIndirectSrc() : !op.hasIndirectDst())`
+    /// (`:581-585`) — *"The immutable address must be zero for the side of the transfer involving the
+    /// indirect."*
+    IndirectIsOnTheSplitSide(MemoryOperandIndex),
+    /// [`create_explicit_time_loops`]'s refusal (`:492-493`) — boxed, being the largest variant.
+    TimeLoopsNotCreated(Box<ExplicitTimeLoops>),
 }
 
 /// Replaces: e306_transformVectorLoad
@@ -8577,6 +9181,650 @@ pub fn transform_vector_store<'s, A: Arch>(
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e321_transformCompLoadAndStore
-// crustify:todo: e322_transformCompIndLoadAndStore
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 321/384 and 322/384 — the two composite transfers, and what they share
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT THE TWO COMPOSITE SPLITS AGREE ON — everything from the access container down to the
+/// overflow gate (`:455-479` and `:550-574`, line for line the same).
+enum CompositeOverflow<'a> {
+    /// The mutable address overflows, and here is what the partition plan needs.
+    Overflows {
+        /// The split side's `dataflow.get_logical_memory_view`.
+        view: ConstStartMemView<'a>,
+        /// The iterators, including [`synthesize_time_info`]'s implicit time dimensions.
+        mas_data: Vec<MasData>,
+        /// `max_mutable` after both contributions.
+        max_mutable: MutableAddr,
+        /// Which L3 half the candidate runs on.
+        half: L3Half,
+    },
+    /// The reference stopped, or aborted, before the gate.
+    Stopped(TransferSplit<'a>),
+}
+
+/// `transformComp{,Ind}LoadAndStore`'S SHARED PROLOGUE — `MutableAddrSplitting.cpp:455-479`.
+///
+/// ⛔ `synthesizeTimeInfo` IS THE STEP ENTRIES 306/307 DO NOT HAVE (`:478`): a composite walks its
+/// own time dimensions in hardware, and every one of them adds to `max_mutable` — without it a
+/// transfer that overflows only through its time nest is never split.
+/// ⛔ AND `constructTimeStepsInfo` RUNS BEFORE THE `DT_CHECK` OVER BOTH ANSWERS (`:459-465`), so it
+/// runs even when `constructDetails` already failed; the first refusal is what gets reported.
+fn composite_overflow<'s, A: Arch>(
+    access_details: &mut AccessContainer<AccessDetailsAffineComposite<'s>>,
+    candidate: &MasCandidate<'s>,
+    agen_op: &'s agen::Op,
+    elem: DataType,
+    correction: EarOverflowCorrection,
+    scope: &'s [DfirOp],
+) -> CompositeOverflow<'s> {
+    // `access_details.emplace_insert(candidate.mem_index_, op, candidate.comp_)`.
+    let Some(slot) = access_details.vacancy(candidate.mem_index) else {
+        return CompositeOverflow::Stopped(TransferSplit::AccessSlotUnavailable(
+            candidate.mem_index,
+        ));
+    };
+    let ad = slot.emplace_insert(AccessDetailsAffineComposite::new(agen_op, candidate.comp));
+    // `bool result = ad.constructDetails(candidate.mem_index_).succeeded();`
+    let details = ad.construct_details(candidate.mem_index, scope);
+    // "Construct the time steps info without coalescing and without burst/IL calcs." — `result &=`.
+    let steps = construct_time_steps_info(access_details, false, false, scope);
+    // `DT_CHECK(result);`
+    if details != ConstructedDetails::Complete {
+        return CompositeOverflow::Stopped(TransferSplit::DetailsNotConstructed(details));
+    }
+    if !steps.constructed() {
+        return CompositeOverflow::Stopped(TransferSplit::TimeStepsNotConstructed(steps));
+    }
+
+    let Some(ad) = access_details.get(candidate.mem_index) else {
+        return CompositeOverflow::Stopped(TransferSplit::AccessSlotUnavailable(
+            candidate.mem_index,
+        ));
+    };
+    // `dyn_cast_or_null<dataflow::GetLogicalMemoryViewOp>(ad.getMemRef().getDefiningOp())` — the
+    // view of the operand under consideration, which is what `initialize` splits against.
+    let Some(mem_ref) = ad.affine.base.mem_ref else {
+        return CompositeOverflow::Stopped(TransferSplit::MemRefIsNotAMemoryView);
+    };
+    let view = match SplitCandidateView::resolve(mem_ref, scope) {
+        SplitCandidateView::ConstantStart(view) => view,
+        SplitCandidateView::NonConstantStart => {
+            return CompositeOverflow::Stopped(TransferSplit::MemViewStartIsNotConstant);
+        }
+        SplitCandidateView::NotAMemoryView => {
+            return CompositeOverflow::Stopped(TransferSplit::MemRefIsNotAMemoryView);
+        }
+    };
+
+    // `initialize(evaluator, mas_data, mem_view_op, ad, max_mutable);`
+    let initialized = initialize::<A>(&ad.affine, &view, scope);
+    let (mut mas_data, mut max_mutable) = match initialized {
+        MasInitialization::Initialized(MasDataInit::Initialized {
+            mas_data,
+            max_mutable,
+        }) => (mas_data, max_mutable),
+        MasInitialization::Initialized(MasDataInit::NoIndices) => (Vec::new(), MutableAddr(0)),
+        refusal => return CompositeOverflow::Stopped(TransferSplit::NotInitialized(refusal)),
+    };
+
+    // `synthesizeTimeInfo(mas_data, ad, max_mutable);`
+    synthesize_time_info(&mut mas_data, ad, &mut max_mutable);
+
+    // `if (!hasMutableAddrOverflow(mas_data, candidate.comp_, max_mutable, ad.getElementWidth()))
+    //  return;`, with `getMaxMutableRange`'s own `DT_CHECK` — see entry 306 on its position.
+    let Some(half) = L3Half::of(candidate.comp) else {
+        return CompositeOverflow::Stopped(TransferSplit::CandidateIsNotOnAnL3Half(candidate.comp));
+    };
+    let overflow = has_mutable_addr_overflow::<A>(&mas_data, half, max_mutable, elem, correction);
+    if overflow != MutableAddrOverflow::Overflow {
+        return CompositeOverflow::Stopped(TransferSplit::AddressFits(overflow));
+    }
+
+    CompositeOverflow::Overflows {
+        view,
+        mas_data,
+        max_mutable,
+        half,
+    }
+}
+
+/// THE PARTITIONS GO IN THE INNERMOST TIME LOOP — `OpBuilder cond_builder(op)` (`:1003`) seats the
+/// conditional tree where `op` now is, and `createExplicitTimeLoops` has just moved `op` to the
+/// bottom of the nest (`:1326-1327`). So the tree replaces the transfer inside that body.
+fn splice_partitions_into_nest(nest: &mut DfirOp, partitions: Vec<DfirOp>) {
+    let DfirOp::Affine(affine::Op::For { body, .. }) = nest else {
+        return;
+    };
+    // [`nest_explicit_time_loops`] gives every loop but the innermost a body of exactly one loop.
+    if matches!(body.as_slice(), [DfirOp::Affine(affine::Op::For { .. })]) {
+        if let Some(inner) = body.first_mut() {
+            splice_partitions_into_nest(inner, partitions);
+        }
+        return;
+    }
+    *body = partitions;
+}
+
+/// ONE CLONE OF A VIEW, OR THE VALUE ITSELF WHERE NO OP IN SCOPE BINDS IT.
+///
+/// *"Every memory operand should have it's own unique mem view"* (`:503-504`) —
+/// `partition_builder.clone(*v.getDefiningOp())` followed by `assign`ing the clone onto the operand.
+/// ⭐ THE REFERENCE ASSIGNS ONTO THE ORIGINAL, so partition 2 clones partition 1's clone; a clone
+/// carries its operands over unchanged, so every partition gets the same view either way.
+fn clone_mem_view_for_partition(
+    vals: &mut Values,
+    mem_view: Val,
+    scope: &[DfirOp],
+    into: &mut Vec<DfirOp>,
+) -> Val {
+    let Some(view_op) = defining_op(mem_view, scope) else {
+        return mem_view;
+    };
+    let cloned = dialects::clone_with_fresh_results(view_op, vals);
+    let result = dialects::results(&cloned).first().copied();
+    into.push(cloned);
+    result.unwrap_or(mem_view)
+}
+
+/// `agen::CompositeLoadAndStoreOp::cloneWithNewAccessInfo` — `Agen.cpp:478-514`.
+///
+/// ⛔ `dir` IS **ALWAYS** `PseudoRandom` (`:491-493`), whatever the original carried, and an absent
+/// `dbgName` becomes the EMPTY STRING (`:485`) — `dbgName = ""` is what the vendor's key prints.
+/// ⛔ AND THE BODY IS RE-BOUND: the new op's `load_iv` is fresh and every use inside the cloned
+/// region is remapped onto it (`:507-512`), which an `IRMapping` clone plus one seeded pair is.
+pub(super) fn clone_composite_with_new_access_info(
+    vals: &mut Values,
+    transfer: &agen::CompositeTransfer,
+    src: Val,
+    src_indices: Vec<Index>,
+    dst: Val,
+    dst_indices: Vec<Index>,
+    time_set: IntegerSet,
+) -> DfirOp {
+    let load_iv = vals.mint();
+    let mut mapping = ValueMapping::new();
+    mapping.map(transfer.load_iv, load_iv);
+    let body = vals.clone_ops(&transfer.body, &mut mapping);
+    DfirOp::Agen(agen::Op::CompositeLoadAndStore(Box::new(
+        agen::CompositeTransfer {
+            src,
+            src_indices,
+            src_ty: transfer.src_ty.clone(),
+            dst,
+            dst_indices,
+            dst_ty: transfer.dst_ty.clone(),
+            load_iv,
+            load_iv_ty: transfer.load_iv_ty,
+            load_set: transfer.load_set.clone(),
+            load_order: transfer.load_order.clone(),
+            store_set: transfer.store_set.clone(),
+            store_order: transfer.store_order.clone(),
+            // `getTimeSymbols()` goes straight through (`Agen.cpp:487`): the new op resolves its
+            // time set against the same values.
+            time_symbols: transfer.time_symbols.clone(),
+            time_set,
+            time_order: transfer.time_order.clone(),
+            load_time_addr_map: transfer.load_time_addr_map.clone(),
+            store_time_addr_map: transfer.store_time_addr_map.clone(),
+            dir: Some(agen::RoutingDirection::PseudoRandom),
+            multicast_info: transfer.multicast_info,
+            dbg_name: Some(transfer.dbg_name.clone().unwrap_or_default()),
+            body,
+        },
+    )))
+}
+
+/// `agen::CompositeIndirectLoadAndStoreOp::cloneWithNewAccessInfo` — `Agen.cpp:1369-1435`.
+///
+/// ⛔ THE INDIRECT SIDES' INDICES COME FROM `this`, NOT FROM THE ARGUMENTS (`:1382-1391`): the
+/// caller hands over four views and four maps, and `num_ind_src_indices`/`num_ind_dst_indices` are
+/// recounted off the ORIGINAL op — so an indirect side handed a view the original did not have gets
+/// that view with NO indices. `dbgName`, the fresh `load_iv` and the region are entry 321's clone's.
+fn clone_composite_indirect_with_new_access_info(
+    vals: &mut Values,
+    transfer: &agen::CompositeIndirectTransfer,
+    indirect_src: Option<agen::IndirectAccess>,
+    direct_src: Val,
+    direct_src_indices: Vec<Index>,
+    indirect_dst: Option<agen::IndirectAccess>,
+    direct_dst: Val,
+    direct_dst_indices: Vec<Index>,
+    time_set: IntegerSet,
+) -> DfirOp {
+    let load_iv = vals.mint();
+    let mut mapping = ValueMapping::new();
+    mapping.map(transfer.load_iv, load_iv);
+    let body = vals.clone_ops(&transfer.body, &mut mapping);
+    DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(Box::new(
+        agen::CompositeIndirectTransfer {
+            indirect_src,
+            direct_src,
+            direct_src_indices,
+            direct_src_ty: transfer.direct_src_ty.clone(),
+            indirect_dst,
+            direct_dst,
+            direct_dst_indices,
+            direct_dst_ty: transfer.direct_dst_ty.clone(),
+            load_iv,
+            load_iv_ty: transfer.load_iv_ty,
+            load_set: transfer.load_set.clone(),
+            load_order: transfer.load_order.clone(),
+            store_set: transfer.store_set.clone(),
+            store_order: transfer.store_order.clone(),
+            // `getTimeSymbols()` goes straight through (`Agen.cpp:487`): the new op resolves its
+            // time set against the same values.
+            time_symbols: transfer.time_symbols.clone(),
+            time_set,
+            time_order: transfer.time_order.clone(),
+            load_indirect_time_addr_map: transfer.load_indirect_time_addr_map.clone(),
+            load_direct_time_addr_map: transfer.load_direct_time_addr_map.clone(),
+            store_indirect_time_addr_map: transfer.store_indirect_time_addr_map.clone(),
+            store_direct_time_addr_map: transfer.store_direct_time_addr_map.clone(),
+            multicast_info: transfer.multicast_info,
+            dbg_name: Some(transfer.dbg_name.clone().unwrap_or_default()),
+            body,
+        },
+    )))
+}
+
+/// Replaces: e321_transformCompLoadAndStore
+///
+/// **321/384** `MutableAddrSplittingPass::transformCompLoadAndStore` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451` (92L): split one overflowing
+/// `agen.composite_load_and_store`, making its innermost split time dimension an explicit loop first.
+///
+/// ⛔⛔ `createPartitions` IS HANDED `ad.getSubscriptsMap()` (`:533`) WHILE `createExplicitTimeLoops`
+/// REWROTE THE **LOCAL** (`:491`) — so every partition's map descends from the ORIGINAL two-dimensional
+/// subscripts while `indices` has grown the new loop's iterator. Ported as written; see
+/// [`TimeLoopNest::access`] for why the vendor's own key cannot show it.
+/// ⛔ AND THE UNSPLIT SIDE IS CLONED PER PARTITION, THEN READ BACK OFF `op` (`:505-509`) — the clone,
+/// not the original, is what the new transfer points at.
+#[must_use]
+pub fn transform_comp_load_and_store<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    elem: DataType,
+    correction: EarOverflowCorrection,
+    num_conditionals: &mut Conditionals,
+    scope: &'s [DfirOp],
+) -> TransferSplit<'s> {
+    // `auto op = dyn_cast<agen::CompositeLoadAndStoreOp>(candidate.op_); DT_CHECK(op);`
+    let DfirOp::Agen(agen_op) = candidate.op else {
+        return TransferSplit::NotACompositeLoadAndStore;
+    };
+    let agen::Op::CompositeLoadAndStore(transfer) = agen_op else {
+        return TransferSplit::NotACompositeLoadAndStore;
+    };
+
+    let mut access_details: AccessContainer<AccessDetailsAffineComposite<'s>> =
+        AccessContainer::default();
+    let (view, mut mas_data, max_mutable, half) = match composite_overflow::<A>(
+        &mut access_details,
+        candidate,
+        agen_op,
+        elem,
+        correction,
+        scope,
+    ) {
+        CompositeOverflow::Overflows {
+            view,
+            mas_data,
+            max_mutable,
+            half,
+        } => (view, mas_data, max_mutable, half),
+        CompositeOverflow::Stopped(stopped) => return stopped,
+    };
+    let Some(ad) = access_details.get(candidate.mem_index) else {
+        return TransferSplit::AccessSlotUnavailable(candidate.mem_index);
+    };
+
+    // `SmallVector<Value> all_mem_views = {op.getSrcMemRef(), op.getDstMemRef()};`
+    let all_mem_views = vec![transfer.src, transfer.dst];
+
+    // `setupForPartitioning(evaluator, mas_data, partition_sizes, all_mem_views, candidate.comp_,
+    //                       mem_view_op, max_mutable, ad.getElementWidth());`
+    let sized = setup_for_partitioning::<A>(
+        &mut mas_data,
+        &all_mem_views,
+        half,
+        &view,
+        max_mutable,
+        elem,
+        num_conditionals,
+        scope,
+    );
+    let SetupForPartitioning::Sized(Partitioning::Split(plan)) = &sized else {
+        return TransferSplit::NotSetUpForPartitioning(sized);
+    };
+    let sizes = plan.sizes.clone();
+
+    // `auto subscripts_map = ad.getSubscriptsMap(); auto indices = ad.getIndices();
+    //  auto time_set = ad.getTimeSet();`
+    let Some(subscripts_map) = ad.affine.subscripts_map.clone() else {
+        return TransferSplit::SubscriptsMapIsNotSet;
+    };
+    let Some(time_set) = ad.time_set.clone() else {
+        return TransferSplit::TimeSetIsNotSet;
+    };
+    let original = SubscriptsAndTime {
+        subscripts_map: subscripts_map.clone(),
+        indices: ad.affine.base.indices.clone(),
+        time_set,
+    };
+
+    // `createExplicitTimeLoops(mas_data, partition_sizes, op, ad, subscripts_map, indices,
+    //  time_set);` — the transfer goes in by value because it ends up inside the innermost loop.
+    let loops = create_explicit_time_loops(
+        vals,
+        &mut mas_data,
+        &sizes,
+        (*candidate.op).clone(),
+        ad,
+        &original,
+    );
+    let (mut nest, access) = match loops {
+        ExplicitTimeLoops::Created(created) => (Some(created.nest), created.access),
+        // No split dimension is a time dimension: nothing was created and nothing was rewritten.
+        ExplicitTimeLoops::NotSplitOnATimeDimension(_) => (None, original),
+        refusal => return TransferSplit::TimeLoopsNotCreated(Box::new(refusal)),
+    };
+
+    let mut adjustments: Vec<EvenImmutableAdjustment> = Vec::new();
+    let mut hoisted: Vec<DfirOp> = Vec::new();
+    let partitioned = {
+        let mut create_ops = |vals: &mut Values, map: &AffineMap, start_addr_mod: i64| {
+            // `adjustForEvenImmutableAddr(..)` on this leaf's own map and modifier, as entry 306.
+            let mut map = map.clone();
+            let mut start_addr_mod = start_addr_mod;
+            adjustments.push(adjust_for_even_immutable_addr::<A>(
+                view.start,
+                &mut map,
+                &ad.affine,
+                &mut start_addr_mod,
+                elem,
+            ));
+
+            // `createNewMemViewWithMod(..)`, then `setInsertionPointAfter(new_mem_view_op)`.
+            let new_view = create_new_mem_view_with_mod(vals, &view, start_addr_mod);
+            hoisted.push(new_view.start_address);
+            let mut created = vec![new_view.mem_view];
+            let split_indices = indices_from_map(&map, &access.indices);
+
+            if candidate.mem_index == MemoryOperandIndex::DirSrc {
+                let dst = clone_mem_view_for_partition(vals, transfer.dst, scope, &mut created);
+                created.push(clone_composite_with_new_access_info(
+                    vals,
+                    transfer,
+                    new_view.result,
+                    split_indices,
+                    dst,
+                    transfer.dst_indices.clone(),
+                    access.time_set.clone(),
+                ));
+            } else {
+                let src = clone_mem_view_for_partition(vals, transfer.src, scope, &mut created);
+                created.push(clone_composite_with_new_access_info(
+                    vals,
+                    transfer,
+                    src,
+                    transfer.src_indices.clone(),
+                    new_view.result,
+                    split_indices,
+                    access.time_set.clone(),
+                ));
+            }
+            created
+        };
+        // `createPartitions(mas_data, partition_sizes, op, ad.getSubscriptsMap(), createOps);`
+        create_partitions(vals, &mas_data, &sizes, &subscripts_map, &mut create_ops)
+    };
+    let Partitions::Created { ops, partitions } = partitioned else {
+        return TransferSplit::NotPartitioned(partitioned);
+    };
+
+    // `op->erase();` — the transfer alone, NOT its use chain: a composite carries its own body.
+    TransferSplit::Split {
+        ops: match nest.take() {
+            Some(mut nest) => {
+                splice_partitions_into_nest(&mut nest, ops);
+                vec![nest]
+            }
+            None => ops,
+        },
+        hoisted,
+        erased: vec![candidate.op],
+        partitions,
+        adjustments,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 322/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e322_transformCompIndLoadAndStore
+///
+/// **322/384** `MutableAddrSplittingPass::transformCompIndLoadAndStore` —
+/// `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546` (124L): entry 321 for an
+/// `agen.composite_indirect_load_and_store`, whose ADDRESS views are cloned per partition too.
+///
+/// ⛔ THE INDIRECT MUST BE ON THE OTHER SIDE (`:581-585`): *"The immutable address must be zero for
+/// the side of the transfer involving the indirect."*
+/// ⛔⛔ AND THE `kDirDst` BRANCH PASSES `op.getIndirectSrcMemref()` INTO THE INDIRECT **DESTINATION**
+/// SLOT (`:653`) with `getEmptyAffineMap()` for its map (`:657`) — so a gather whose direct
+/// destination overflows is rebuilt claiming an indirect destination that is really its address view,
+/// with no indices. Ported as written; the vendor's key only exercises the `kDirSrc` branch.
+#[must_use]
+pub fn transform_comp_ind_load_and_store<'s, A: Arch>(
+    vals: &mut Values,
+    candidate: &MasCandidate<'s>,
+    elem: DataType,
+    correction: EarOverflowCorrection,
+    num_conditionals: &mut Conditionals,
+    scope: &'s [DfirOp],
+) -> TransferSplit<'s> {
+    // `auto op = dyn_cast<agen::CompositeIndirectLoadAndStoreOp>(candidate.op_); DT_CHECK(op);`
+    let DfirOp::Agen(agen_op) = candidate.op else {
+        return TransferSplit::NotACompositeIndirectLoadAndStore;
+    };
+    let agen::Op::CompositeIndirectLoadAndStore(transfer) = agen_op else {
+        return TransferSplit::NotACompositeIndirectLoadAndStore;
+    };
+
+    let mut access_details: AccessContainer<AccessDetailsAffineComposite<'s>> =
+        AccessContainer::default();
+    let (view, mut mas_data, max_mutable, half) = match composite_overflow::<A>(
+        &mut access_details,
+        candidate,
+        agen_op,
+        elem,
+        correction,
+        scope,
+    ) {
+        CompositeOverflow::Overflows {
+            view,
+            mas_data,
+            max_mutable,
+            half,
+        } => (view, mas_data, max_mutable, half),
+        CompositeOverflow::Stopped(stopped) => return stopped,
+    };
+    let Some(ad) = access_details.get(candidate.mem_index) else {
+        return TransferSplit::AccessSlotUnavailable(candidate.mem_index);
+    };
+
+    // `DT_CHECK(candidate.mem_index_ == kDirSrc ? !op.hasIndirectSrc() : !op.hasIndirectDst());`
+    let on_dir_src = candidate.mem_index == MemoryOperandIndex::DirSrc;
+    let indirect_on_split_side = if on_dir_src {
+        transfer.indirect_src.is_some()
+    } else {
+        transfer.indirect_dst.is_some()
+    };
+    if indirect_on_split_side {
+        return TransferSplit::IndirectIsOnTheSplitSide(candidate.mem_index);
+    }
+
+    // `all_mem_views = {op.getDirectSrcMemref(), op.getDirectDstMemref()}`, plus each indirect side
+    // that is present — an address view is split against the same ranges the data views are.
+    let mut all_mem_views = vec![transfer.direct_src, transfer.direct_dst];
+    if let Some(indirect) = &transfer.indirect_src {
+        all_mem_views.push(indirect.view);
+    }
+    if let Some(indirect) = &transfer.indirect_dst {
+        all_mem_views.push(indirect.view);
+    }
+
+    let sized = setup_for_partitioning::<A>(
+        &mut mas_data,
+        &all_mem_views,
+        half,
+        &view,
+        max_mutable,
+        elem,
+        num_conditionals,
+        scope,
+    );
+    let SetupForPartitioning::Sized(Partitioning::Split(plan)) = &sized else {
+        return TransferSplit::NotSetUpForPartitioning(sized);
+    };
+    let sizes = plan.sizes.clone();
+
+    let Some(subscripts_map) = ad.affine.subscripts_map.clone() else {
+        return TransferSplit::SubscriptsMapIsNotSet;
+    };
+    let Some(time_set) = ad.time_set.clone() else {
+        return TransferSplit::TimeSetIsNotSet;
+    };
+    let original = SubscriptsAndTime {
+        subscripts_map: subscripts_map.clone(),
+        indices: ad.affine.base.indices.clone(),
+        time_set,
+    };
+
+    let loops = create_explicit_time_loops(
+        vals,
+        &mut mas_data,
+        &sizes,
+        (*candidate.op).clone(),
+        ad,
+        &original,
+    );
+    let (mut nest, access) = match loops {
+        ExplicitTimeLoops::Created(created) => (Some(created.nest), created.access),
+        ExplicitTimeLoops::NotSplitOnATimeDimension(_) => (None, original),
+        refusal => return TransferSplit::TimeLoopsNotCreated(Box::new(refusal)),
+    };
+
+    let mut adjustments: Vec<EvenImmutableAdjustment> = Vec::new();
+    let mut hoisted: Vec<DfirOp> = Vec::new();
+    let partitioned = {
+        let mut create_ops = |vals: &mut Values, map: &AffineMap, start_addr_mod: i64| {
+            let mut map = map.clone();
+            let mut start_addr_mod = start_addr_mod;
+            adjustments.push(adjust_for_even_immutable_addr::<A>(
+                view.start,
+                &mut map,
+                &ad.affine,
+                &mut start_addr_mod,
+                elem,
+            ));
+
+            let new_view = create_new_mem_view_with_mod(vals, &view, start_addr_mod);
+            hoisted.push(new_view.start_address);
+            let mut created = vec![new_view.mem_view];
+            let split_indices = indices_from_map(&map, &access.indices);
+
+            if on_dir_src {
+                // The direct destination, then the indirect one where the transfer scatters.
+                let direct_dst =
+                    clone_mem_view_for_partition(vals, transfer.direct_dst, scope, &mut created);
+                let indirect_dst =
+                    transfer
+                        .indirect_dst
+                        .as_ref()
+                        .map(|indirect| agen::IndirectAccess {
+                            view: clone_mem_view_for_partition(
+                                vals,
+                                indirect.view,
+                                scope,
+                                &mut created,
+                            ),
+                            indices: indirect.indices.clone(),
+                            ty: indirect.ty.clone(),
+                        });
+                created.push(clone_composite_indirect_with_new_access_info(
+                    vals,
+                    transfer,
+                    // `op.getIndirectSrcMemref()` with `getEmptyAffineMap()` — null, by the
+                    // `DT_CHECK` above.
+                    None,
+                    new_view.result,
+                    split_indices,
+                    indirect_dst,
+                    direct_dst,
+                    transfer.direct_dst_indices.clone(),
+                    access.time_set.clone(),
+                ));
+            } else {
+                let direct_src =
+                    clone_mem_view_for_partition(vals, transfer.direct_src, scope, &mut created);
+                let indirect_src =
+                    transfer
+                        .indirect_src
+                        .as_ref()
+                        .map(|indirect| agen::IndirectAccess {
+                            view: clone_mem_view_for_partition(
+                                vals,
+                                indirect.view,
+                                scope,
+                                &mut created,
+                            ),
+                            indices: indirect.indices.clone(),
+                            ty: indirect.ty.clone(),
+                        });
+                // ⛔ THE INDIRECT **SOURCE** VIEW IN THE INDIRECT **DESTINATION** SLOT (`:653`),
+                // with an empty map and — `num_ind_dst_indices` being recounted off the original —
+                // no indices. See this function's banner.
+                let indirect_dst = indirect_src.as_ref().map(|indirect| agen::IndirectAccess {
+                    view: indirect.view,
+                    indices: Vec::new(),
+                    ty: indirect.ty.clone(),
+                });
+                created.push(clone_composite_indirect_with_new_access_info(
+                    vals,
+                    transfer,
+                    indirect_src,
+                    direct_src,
+                    transfer.direct_src_indices.clone(),
+                    indirect_dst,
+                    new_view.result,
+                    split_indices,
+                    access.time_set.clone(),
+                ));
+            }
+            created
+        };
+        create_partitions(vals, &mas_data, &sizes, &subscripts_map, &mut create_ops)
+    };
+    let Partitions::Created { ops, partitions } = partitioned else {
+        return TransferSplit::NotPartitioned(partitioned);
+    };
+
+    // `op->erase();`
+    TransferSplit::Split {
+        ops: match nest.take() {
+            Some(mut nest) => {
+                splice_partitions_into_nest(&mut nest, ops);
+                vec![nest]
+            }
+            None => ops,
+        },
+        hoisted,
+        erased: vec![candidate.op],
+        partitions,
+        adjustments,
+    }
+}
+
 // crustify:todo: e351_runOnOperation

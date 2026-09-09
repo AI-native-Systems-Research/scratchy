@@ -922,6 +922,40 @@ pub fn calculate_shifts<A: Arch>(
     shifts
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 323/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e323_shiftMutableAddr
+///
+/// **323/384** `MutableStartAddrShifting.cpp:366` (19L) — the pass's one entry point per access:
+/// move what fits of the constant offset into the immutable start address, or report no shift.
+///
+/// ⛔ `AffineMap::get(ctx)` IS THE "NO SHIFT" ANSWER, not an empty rewrite — a zero-result map is
+/// falsy at both call sites (`:265`, `:307`), so `None` is it. ⛔ And the
+/// `DT_CHECK(hasValidL3ImmutableAddr(…, req_even_toggle = arch >= SEN1P5))` is the
+/// [`ConstStartMemView`] TYPE: a view whose start is not a constant cannot reach this function.
+#[must_use]
+pub fn shift_mutable_addr<A: Arch>(
+    vals: &mut Values,
+    inputs: &ShiftInputs<'_>,
+    half: L3Half,
+    view: &ConstStartMemView<'_>,
+) -> Option<ShiftedMemView> {
+    // `SmallVector<int64_t> shifts; calculateShifts(evaluator, shifts, mem_view_op, ad);`
+    let shifts = calculate_shifts::<A>(inputs, half, view);
+
+    // *"If all the shifts are 0, there is nothing to shift. Return and report no shift."*
+    // `if (std::all_of(shifts.begin(), shifts.end(), [](int64_t s) { return s == 0; })) return
+    // AffineMap::get(mem_view_op->getContext());`
+    if shifts.iter().all(|shift| shift.0 == 0) {
+        return None;
+    }
+
+    // `return applyShifts(evaluator, shifts, unit, op, mem_view_op, ad);`
+    Some(apply_shifts(vals, &shifts, inputs, view))
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -1857,12 +1891,64 @@ mod unit_tests {
             "below SEN1P5 the parity of the immutable address is not a constraint"
         );
     }
+
+    /// 🎯 323/384 — THE VENDOR'S FULL CASE END TO END, AND THE "NOTHING TO SHIFT" ANSWER BESIDE IT.
+    ///
+    /// `@full_shift_zero_const_start` (`mutable_start_addr_shift_full.mlir:14-34`) reaches
+    /// [`apply_shifts`] through this function; with the offset already 0 every shift is 0 and the
+    /// reference returns its empty map instead.
+    #[test]
+    fn the_vendors_access_shifts_and_a_zero_offset_reports_no_shift() {
+        let subscripts = vendor_subscripts_map();
+        let layout = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(256)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        let ty = MemRef {
+            shape: vec![8, 64, 4],
+            elem: ElemType::F16,
+        };
+        let view = ConstStartMemView {
+            from: Val(0),
+            start: 0,
+            layout: &layout,
+            ty: &ty,
+        };
+        let layout = AffineMap::identity(3);
+        let mut inputs = shift_inputs(&VENDOR_COEFFS, &layout, &subscripts, 16);
+        inputs.const_offset = 64 + 16 * 64 + 128 * 256;
+
+        let mut vals = Values::default();
+        let shifted = shift_mutable_addr::<Dd2>(&mut vals, &inputs, L3Half::Load, &view)
+            .expect("a shift the fixture reports");
+        assert_eq!(shifted.total, TotalShift::WholeSticks(33856));
+        assert_eq!(
+            shifted.subscripts_map.results,
+            vec![
+                AffineExpr::Const(0),
+                AffineExpr::dim(0).times(3),
+                AffineExpr::dim(1).times(2),
+            ]
+        );
+
+        inputs.const_offset = 0;
+        assert_eq!(
+            shift_mutable_addr::<Dd2>(&mut vals, &inputs, L3Half::Load, &view),
+            None,
+            "every shift 0 is `AffineMap::get(ctx)` — the pass reports no shift"
+        );
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e323_shiftMutableAddr
 // crustify:todo: e352_transformVectorLoad
 // crustify:todo: e353_transformVectorStore
 // crustify:todo: e354_transformCompLoadAndStore

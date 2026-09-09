@@ -283,15 +283,13 @@ impl<'a> TpmvManager<'a> {
     /// `dataflow.send`). [`uses`] returns one entry per USE, so a value read twice by one op is not
     /// single-used.
     ///
-    /// # ⛔ TWO OF THE FIVE MEMORY CLASSES HAVE NO ISLAND OP, AND THAT IS RECORDED, NOT INVENTED
+    /// # ⛔ ONE OF THE FIVE MEMORY CLASSES HAS NO ISLAND OP, AND THAT IS RECORDED, NOT INVENTED
     ///
-    /// `agen.composite_load` (`paged_mem_view_loads.mlir:331`) and `agen.composite_store`
-    /// (`paged_mem_view_stores.mlir:361`) are two of the eleven `agen` operations the island does not
-    /// declare, so [`Tpmv::CompositeLoad`] and [`Tpmv::CompositeStore`] — whose constructors are
-    /// entry 138 and its deduplicated sibling — are reachable from a test and from nothing the crate
-    /// emits. [`super::agen_helper::AgenLoad::of`] records the same for three of its five load
-    /// classes. Growing the island for a *branch* of a `dyn_cast` chain is not the brief's rule; its
-    /// rule is about a function's input, and that one was applied above.
+    /// `agen.composite_load` (`paged_mem_view_loads.mlir:331`) IS declared now — entry 326
+    /// `TPMVCompositeLoad::initialize_time` `dyn_cast`s exactly it, so `AGENT-BRIEF.md:87` applied —
+    /// and this selector reaches [`Tpmv::CompositeLoad`] for real. `agen.composite_store`
+    /// (`paged_mem_view_stores.mlir:361`) is still absent, so [`Tpmv::CompositeStore`] stays
+    /// reachable from a test and from nothing the crate emits.
     ///
     /// # ⭐ THE TWO THINGS WITH NO COUNTERPART
     ///
@@ -338,9 +336,13 @@ impl<'a> TpmvManager<'a> {
                 }
                 Selection::Selected(Tpmv::VectorStore(TpmvVectorStore::new(op, self.comp)))
             }
+            // `else if (auto comp_load_op = dyn_cast<agen::CompositeLoadOp>(op))` (`:51-53`).
+            DfirOp::Agen(agen::Op::CompositeLoad(_)) => {
+                Selection::Selected(Tpmv::CompositeLoad(TpmvCompositeLoad::new(op, self.comp)))
+            }
             // `else if (auto comp_load_store_op = dyn_cast<agen::CompositeLoadAndStoreOp>(op))` —
-            // the LAST of the three composite arms in the reference. The two before it,
-            // `CompositeLoadOp` and `CompositeStoreOp`, have no island op; see the note above.
+            // the LAST of the three composite arms in the reference. `CompositeStoreOp`, between
+            // them, has no island op; see the note above.
             DfirOp::Agen(agen::Op::CompositeLoadAndStore(_)) => Selection::Selected(
                 Tpmv::CompositeLoadStore(TpmvCompositeLoadStore::new(op, self.comp)),
             ),
@@ -355,6 +357,7 @@ impl<'a> TpmvManager<'a> {
                 | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
                 | agen::Op::CompositeMemoryInterleave { .. }
+                | agen::Op::CompositeIndirectLoadAndStore(_)
                 | agen::Op::SetTransferMaskState { .. },
             )
             | DfirOp::Arith(_)
@@ -676,6 +679,7 @@ mod unit_tests {
                 load_order: planned.load_order,
                 store_set: planned.store_set,
                 store_order: planned.store_order,
+                time_symbols: Vec::new(),
                 time_set: planned.time_set,
                 time_order: planned.time_order,
                 load_time_addr_map: planned.load_time_addr_map,

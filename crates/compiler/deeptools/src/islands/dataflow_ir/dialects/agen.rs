@@ -45,6 +45,11 @@ pub struct CompositeTransfer {
     pub store_set: IntegerSet,
     /// How those are packed.
     pub store_order: AffineMap,
+    /// `$time_symbols` — the values this transfer's `time_set` writes its symbolic bounds against
+    /// (`Agen.td:436`, `Variadic<Index>`). ⛔ THE VENDOR'S OWN KEY CARRIES ONE: `time_symbols(%c3)`
+    /// beside `-d0 + s0 - 1 >= 0` (`mutable_addr_splitting_time_dims.mlir:130`, `:136`), and without
+    /// it `calculateTimeBounds` cannot resolve that dimension at all.
+    pub time_symbols: Vec<Val>,
     /// The time steps the transfer takes — a single pinned step when it fits in one vector.
     pub time_set: IntegerSet,
     /// The order among them.
@@ -67,6 +72,45 @@ pub struct CompositeTransfer {
     /// ⛔ TWO PORTS READ IT: `e268_constructLoadAndStoreStmt` copies it onto the
     /// `sentient.load_and_store`, and `e267_constructTimeLoopsAndVectorOperations` builds each time
     /// loop's `Time-Loop(<name>, t-dim N)` out of it (`l3-burst-calc.mlir:759`, `:364`, `:370`).
+    pub dbg_name: Option<String>,
+    /// The region, entered once per time step.
+    pub body: Vec<super::Op>,
+}
+
+/// A `composite_load`'s operands and attributes.
+///
+/// See [`Op::CompositeLoad`] for what the op means. It is one side of a [`CompositeTransfer`]: one
+/// view, one element set and order, and the same time triple, with the vector loaded at each step
+/// reaching its consumers inside the region instead of a second view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeAccess {
+    /// `$mem_ref` — the view read from.
+    pub view: Val,
+    /// Its subscript — `$affine_map` and `$map_operands` written inline, as everything in this
+    /// island is (see [`Index::Strided`]).
+    pub indices: Vec<Index>,
+    /// Its type.
+    pub view_ty: MemRef,
+    /// The block argument carrying the vector loaded at each time step —
+    /// `getLoadInductionVar()` (`Agen.td:454-456`).
+    pub load_iv: Val,
+    /// That vector's type — ONE hardware vector, as [`CompositeTransfer::load_iv_ty`].
+    pub load_iv_ty: Vector,
+    /// `$load_set` — which elements form each loaded vector.
+    pub load_set: IntegerSet,
+    /// `$load_order` — how those elements are packed.
+    pub load_order: AffineMap,
+    /// `$time_symbols` — the values the time set's bounds are written against. ⛔ NON-EMPTY HERE
+    /// WHERE THE ISLAND'S TRANSFERS CARRY NONE: the vendor's own key prints `time_symbols(%c3)`
+    /// against a `time_set` with an `s0` (`paged_mem_view_loads.mlir:332-337`).
+    pub time_symbols: Vec<Val>,
+    /// `$time_set` — the time steps the load takes.
+    pub time_set: IntegerSet,
+    /// `$time_order` — the order among them.
+    pub time_order: AffineMap,
+    /// `$time_addr_map` — the offset at each time step, one result per view dimension.
+    pub time_addr_map: AffineMap,
+    /// `dbgName` — the scheduler's name for this load.
     pub dbg_name: Option<String>,
     /// The region, entered once per time step.
     pub body: Vec<super::Op>,
@@ -100,6 +144,88 @@ impl RoutingDirection {
             Self::BothWays => "BothWays",
         }
     }
+}
+
+/// ONE OF A COMPOSITE INDIRECT TRANSFER'S TWO OPTIONAL INDIRECT ACCESSES — the view of ADDRESSES a
+/// gather reads its source offsets from, or a scatter its destination offsets.
+///
+/// ⛔ THE THREE MEMBERS ARE ONE FACT. `hasIndirectSrc()`/`hasIndirectDst()` are operand PRESENCE
+/// (`Agen.td:656-661`), so a view without its subscript or its type is a state the op cannot hold —
+/// which is why this is one [`Option`] and not three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectAccess {
+    /// `$indirect_src_memref` / `$indirect_dst_memref`.
+    pub view: Val,
+    /// Its subscript — `$indirect_*_map` and `$indirect_*_map_indices` written inline, as everything
+    /// in this island is (see [`Index::Strided`]).
+    pub indices: Vec<Index>,
+    /// Its type. Its elements are addresses, so this is the `memref<32xi32>` of the vendor's key and
+    /// not the transfer's data type.
+    pub ty: MemRef,
+}
+
+/// A `composite_indirect_load_and_store`'s operands and attributes.
+///
+/// See [`Op::CompositeIndirectLoadAndStore`] for what the op means. It is
+/// [`CompositeTransfer`] with an optional [`IndirectAccess`] on each side, a second time-address map
+/// per side to go with it, and NO `$dir` — the indirect op declares no routing direction
+/// (`Agen.td:576-605`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeIndirectTransfer {
+    /// `$indirect_src_memref` and its access — [`Some`] makes this transfer a GATHER.
+    pub indirect_src: Option<IndirectAccess>,
+    /// `$direct_src_memref` — the data read, always present.
+    pub direct_src: Val,
+    /// Its subscript.
+    pub direct_src_indices: Vec<Index>,
+    /// Its type.
+    pub direct_src_ty: MemRef,
+    /// `$indirect_dst_memref` and its access — [`Some`] makes this transfer a SCATTER.
+    pub indirect_dst: Option<IndirectAccess>,
+    /// `$direct_dst_memref` — the data written, always present.
+    pub direct_dst: Val,
+    /// Its subscript.
+    pub direct_dst_indices: Vec<Index>,
+    /// Its type.
+    pub direct_dst_ty: MemRef,
+    /// The block argument carrying the vector loaded at each time step.
+    pub load_iv: Val,
+    /// That vector's type — ONE hardware vector, as [`CompositeTransfer::load_iv_ty`].
+    pub load_iv_ty: Vector,
+    /// Which elements form each loaded vector.
+    pub load_set: IntegerSet,
+    /// How those elements are packed.
+    pub load_order: AffineMap,
+    /// Which elements form each stored vector.
+    pub store_set: IntegerSet,
+    /// How those are packed.
+    pub store_order: AffineMap,
+    /// `$time_symbols` — the values this transfer's `time_set` writes its symbolic bounds against
+    /// (`Agen.td:436`, `Variadic<Index>`). ⛔ THE VENDOR'S OWN KEY CARRIES ONE: `time_symbols(%c3)`
+    /// beside `-d0 + s0 - 1 >= 0` (`mutable_addr_splitting_time_dims.mlir:130`, `:136`), and without
+    /// it `calculateTimeBounds` cannot resolve that dimension at all.
+    pub time_symbols: Vec<Val>,
+    /// The time steps the transfer takes.
+    pub time_set: IntegerSet,
+    /// The order among them.
+    pub time_order: AffineMap,
+    /// `$load_indirect_time_addr_map` — the ADDRESS view's offset at each time step. ⛔ [`None`] is
+    /// `getEmptyAffineMap()`, which is what `cloneWithNewAccessInfo` substitutes for an absent one
+    /// (`Agen.cpp:1404-1406`) and what the vendor's key prints as `affine_map<() -> ()>`.
+    pub load_indirect_time_addr_map: Option<AffineMap>,
+    /// `$load_direct_time_addr_map` — the data source's offset at each time step.
+    pub load_direct_time_addr_map: AffineMap,
+    /// `$store_indirect_time_addr_map`, on the same terms as its load twin.
+    pub store_indirect_time_addr_map: Option<AffineMap>,
+    /// `$store_direct_time_addr_map` — the data destination's offset at each time step.
+    pub store_direct_time_addr_map: AffineMap,
+    /// `$multicast_info` — the group this transfer's destinations form, as
+    /// [`CompositeTransfer::multicast_info`].
+    pub multicast_info: Option<Val>,
+    /// `dbgName` — the scheduler's name for this transfer.
+    pub dbg_name: Option<String>,
+    /// The region, entered once per time step.
+    pub body: Vec<super::Op>,
 }
 
 /// ONE MASK PATTERN — `(unmasked = N, masked = M)`, repeated to fill the slice it is applied to.
@@ -200,7 +326,7 @@ pub enum Op {
         ty: Vector,
     },
 
-    /// `agen.composite_load_and_store src:%s[..] dst:%d[..] time_symbols(), load_iv(%v:vector<..>)
+    /// `agen.composite_load_and_store src:%s[..] dst:%d[..] time_symbols(..), load_iv(%v:vector<..>)
     /// {..} { .. } : memref<..>, memref<..>`.
     ///
     /// ⭐⭐ THIS IS HOW A WEIGHT LEAVES THE HBM. A view is only an address; nothing crosses a
@@ -222,6 +348,35 @@ pub enum Op {
     /// ⛔ BOXED, because it carries four affine maps, four integer sets and two subscripts, and an
     /// enum is as large as its largest variant. Every other op in this IR is a handful of words.
     CompositeLoadAndStore(Box<CompositeTransfer>),
+
+    /// `agen.composite_load %view[..] time_symbols(..)(%v:vector<..>) {..} { .. } : memref<..>` —
+    /// a sequence of vector loads, one per time step, whose loaded vector reaches its consumers
+    /// inside the op's own region rather than a second view (`Agen.td:423-486`).
+    ///
+    /// ⛔ IT IS HERE BECAUSE ENTRY 326 CANNOT BE SPELLED WITHOUT IT. `TPMVCompositeLoad::initialize_time`
+    /// `dyn_cast`s exactly this op (`TransformPagedMemViewImpl.cpp:1096-1098`), so declaring the input
+    /// is what AGENT-BRIEF.md:87 asks for rather than calling the unit unnecessary.
+    /// ⚠️ NOTHING THIS CRATE EMITS PRODUCES ONE — the vendor's keys do
+    /// (`paged_mem_view_loads.mlir:331`), and
+    /// [`TpmvCompositeLoad`](crate::bridges::dataflow_ir_to_sentient::tf_transform_paged_mem_view_impl::TpmvCompositeLoad)
+    /// is its only reader. ⛔ BOXED, as its two-sided twin is.
+    CompositeLoad(Box<CompositeAccess>),
+
+    /// `agen.composite_indirect_load_and_store [indirect_src:%is[..]] direct_src:%ds[..]
+    /// [indirect_dst:%id[..]] direct_dst:%dd[..] time_symbols(..), load_iv(%v:vector<..>) {..} { .. } :
+    /// memref<..>, ..` (`Agen.td:559`).
+    ///
+    /// ⭐⭐ THE GATHER AND THE SCATTER AS ONE TRANSFER. *"composite_indirect_load_and_store
+    /// operations are used for [indirectly] loading from one memory address and [indirectly] storing
+    /// into another as part of each time step. All of the indirect access functions are optional."*
+    /// The indirect view holds ADDRESSES; the direct one holds the data.
+    ///
+    /// ⛔ AT MOST ONE INDIRECT SIDE IS SPLITTABLE. `e322_transformCompIndLoadAndStore`'s
+    /// `DT_CHECK` refuses a candidate whose own side carries the indirect
+    /// (`MutableAddrSplitting.cpp:581-585`): *"The immutable address must be zero for the side of the
+    /// transfer involving the indirect."*
+    /// ⛔ BOXED for the same reason as its direct twin, and it carries two more maps than that one.
+    CompositeIndirectLoadAndStore(Box<CompositeIndirectTransfer>),
 
     /// `agen.yield` — the terminator of a composite transfer's region.
     Yield,
@@ -452,6 +607,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 load_order,
                 store_set,
                 store_order,
+                time_symbols,
                 time_set,
                 time_order,
                 load_time_addr_map,
@@ -474,7 +630,12 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             print::indent(out, depth);
             let _ = writeln!(
                 out,
-                " time_symbols(), load_iv({}:{}){}",
+                " time_symbols({}), load_iv({}:{}){}",
+                time_symbols
+                    .iter()
+                    .map(|sym| print::val(*sym))
+                    .collect::<Vec<String>>()
+                    .join(", "),
                 print::val(*load_iv),
                 print::vector(*load_iv_ty),
                 // `p << ", multicast_info = " << multicast_info` (`Agen.cpp:358-359`), which is an
@@ -521,6 +682,183 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 "}} : {}, {}",
                 print::memref(src_ty),
                 print::memref(dst_ty)
+            );
+        }
+        Op::CompositeLoad(access) => {
+            let CompositeAccess {
+                view,
+                indices,
+                view_ty,
+                load_iv,
+                load_iv_ty,
+                load_set,
+                load_order,
+                time_symbols,
+                time_set,
+                time_order,
+                time_addr_map,
+                dbg_name,
+                body,
+            } = access.as_ref();
+            // Three lines, as the vendor's key writes it (`paged_mem_view_loads.mlir:331-341`): the
+            // access, then the time symbols with the induction variable, then the attributes.
+            let _ = writeln!(
+                out,
+                "agen.composite_load {}[{}]",
+                print::val(*view),
+                print::index_list(indices),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                " time_symbols({})({}:{})",
+                time_symbols
+                    .iter()
+                    .map(|sym| print::val(*sym))
+                    .collect::<Vec<String>>()
+                    .join(", "),
+                print::val(*load_iv),
+                print::vector(*load_iv_ty),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                " {{{}load_order = {}, load_set = {}, time_addr_map = {}, time_order = {}, \
+                 time_set = {}}}",
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
+                print::affine_map(load_order),
+                print::integer_set(load_set),
+                print::affine_map(time_addr_map),
+                print::affine_map(time_order),
+                print::integer_set(time_set),
+            );
+            print::indent(out, depth);
+            out.push_str("{\n");
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            let _ = writeln!(out, "}} : {}", print::memref(view_ty));
+        }
+        Op::CompositeIndirectLoadAndStore(transfer) => {
+            let CompositeIndirectTransfer {
+                indirect_src,
+                direct_src,
+                direct_src_indices,
+                direct_src_ty,
+                indirect_dst,
+                direct_dst,
+                direct_dst_indices,
+                direct_dst_ty,
+                load_iv,
+                load_iv_ty,
+                load_set,
+                load_order,
+                store_set,
+                store_order,
+                time_symbols,
+                time_set,
+                time_order,
+                load_indirect_time_addr_map,
+                load_direct_time_addr_map,
+                store_indirect_time_addr_map,
+                store_direct_time_addr_map,
+                multicast_info,
+                dbg_name,
+                body,
+            } = transfer.as_ref();
+            // `if (hasIndirectSrc()) p << " indirect_src:" ..` then the direct source, then the same
+            // pair for the destination (`Agen.cpp:1185-1211`) — an absent indirect prints nothing.
+            let access = |label: &str, view: Val, indices: &[Index]| {
+                format!(
+                    "{label}:{}[{}]",
+                    print::val(view),
+                    print::index_list(indices)
+                )
+            };
+            let indirect = |label: &str, side: &Option<IndirectAccess>| {
+                side.as_ref().map_or(String::new(), |side| {
+                    format!("{} ", access(label, side.view, &side.indices))
+                })
+            };
+            let _ = writeln!(
+                out,
+                "agen.composite_indirect_load_and_store {}{} {}{}",
+                indirect("indirect_src", indirect_src),
+                access("direct_src", *direct_src, direct_src_indices),
+                indirect("indirect_dst", indirect_dst),
+                access("direct_dst", *direct_dst, direct_dst_indices),
+            );
+            print::indent(out, depth);
+            let _ = writeln!(
+                out,
+                " time_symbols({}), load_iv({}:{}){}",
+                time_symbols
+                    .iter()
+                    .map(|sym| print::val(*sym))
+                    .collect::<Vec<String>>()
+                    .join(", "),
+                print::val(*load_iv),
+                print::vector(*load_iv_ty),
+                multicast_info.map_or(String::new(), |group| format!(
+                    ", multicast_info = {}",
+                    print::val(group)
+                ))
+            );
+            print::indent(out, depth);
+            // ⛔ ALPHABETICAL, AND `load_direct_time_addr_map` SORTS AHEAD OF THE INDIRECT ONE
+            // (`mutable_addr_splitting_one_dim.mlir:160`). An absent optional map is elided.
+            let optional = |name: &str, map: &Option<AffineMap>| {
+                map.as_ref().map_or(String::new(), |map| {
+                    format!("{name} = {}, ", print::affine_map(map))
+                })
+            };
+            let _ = writeln!(
+                out,
+                " {{{}{}{}load_order = {}, load_set = {}, {}{}store_order = {}, store_set = {}, \
+                 time_order = {}, time_set = {}}}",
+                dbg_name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
+                format_args!(
+                    "load_direct_time_addr_map = {}, ",
+                    print::affine_map(load_direct_time_addr_map)
+                ),
+                optional("load_indirect_time_addr_map", load_indirect_time_addr_map),
+                print::affine_map(load_order),
+                print::integer_set(load_set),
+                format_args!(
+                    "store_direct_time_addr_map = {}, ",
+                    print::affine_map(store_direct_time_addr_map)
+                ),
+                optional("store_indirect_time_addr_map", store_indirect_time_addr_map),
+                print::affine_map(store_order),
+                print::integer_set(store_set),
+                print::affine_map(time_order),
+                print::integer_set(time_set),
+            );
+            print::indent(out, depth);
+            out.push_str("{\n");
+            for inner in body {
+                print::emit(out, inner, depth + 1);
+            }
+            print::indent(out, depth);
+            // `p << " : "`, indirect type first on each side, and only where that side has one.
+            let _ = writeln!(
+                out,
+                "}} : {}{}{}{}",
+                indirect_src.as_ref().map_or(String::new(), |side| format!(
+                    "{}, ",
+                    print::memref(&side.ty)
+                )),
+                print::memref(direct_src_ty),
+                indirect_dst.as_ref().map_or(String::new(), |side| format!(
+                    ", {}",
+                    print::memref(&side.ty)
+                )),
+                format_args!(", {}", print::memref(direct_dst_ty)),
             );
         }
         Op::Yield => {
@@ -840,6 +1178,7 @@ mod tests {
             load_order: planned.load_order,
             store_set: planned.store_set,
             store_order: planned.store_order,
+            time_symbols: Vec::new(),
             time_set: planned.time_set,
             time_order: planned.time_order,
             load_time_addr_map: planned.load_time_addr_map,

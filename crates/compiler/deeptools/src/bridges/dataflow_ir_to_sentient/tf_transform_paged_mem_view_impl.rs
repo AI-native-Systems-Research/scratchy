@@ -98,7 +98,10 @@
 //!
 //! Original files homed here: `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp`, `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp`
 
-use super::agen_access_details::{MemoryOperandIndex, TimeBound, TimeDim};
+use super::agen_access_details::{
+    AccessContainer, AccessDetailsAffineComposite, ConstructedDetails, MemoryOperandIndex,
+    TimeBound, TimeDim, TimeStepsInfo, construct_time_steps_info,
+};
 use super::agen_helper::{AgenOpKind, store_op_from_load_store_pattern};
 use super::tf_utils::{
     CountedLoop, LoopBound, create_for_op_with_additional_return_value,
@@ -106,6 +109,10 @@ use super::tf_utils::{
 };
 // ⭐ THE MANAGER'S `dyn_cast` HANDLE, aliased because this file's `PagedMemView` is the island op it
 // wraps — `cast<GetPagedLogicalMemoryViewOp>` at `:396` and `:663` is [`PagedMemViewHandle::of`].
+use super::tf_mutable_addr_splitting::{
+    clone_composite_with_new_access_info, concatenate_maps, nest_explicit_time_loops_over,
+    update_subscripts_and_indices_for_explicit_time_loops, update_time_set_for_explicit_dims,
+};
 use super::tf_transform_paged_mem_view_manager::PagedMemView as PagedMemViewHandle;
 use super::vc_vector_operands::access_map;
 use crate::islands::dataflow_ir::dialects::arith::CmpIPredicate;
@@ -919,7 +926,9 @@ impl<'a> VectorLoadOp<'a> {
                 | agen::Op::SymbolicVectorStore { .. }
                 | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
+                | agen::Op::CompositeLoad(_)
                 | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::CompositeIndirectLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. }
                 | agen::Op::Yield,
@@ -1179,7 +1188,9 @@ impl<'a> VectorStoreOp<'a> {
                 | agen::Op::SymbolicVectorStore { .. }
                 | agen::Op::IndirectVectorLoad { .. }
                 | agen::Op::IndirectVectorStore { .. }
+                | agen::Op::CompositeLoad(_)
                 | agen::Op::CompositeLoadAndStore(_)
+                | agen::Op::CompositeIndirectLoadAndStore(_)
                 | agen::Op::CompositeMemoryInterleave { .. }
                 | agen::Op::SetTransferMaskState { .. }
                 | agen::Op::Yield,
@@ -1468,6 +1479,16 @@ impl TimeSteps {
     #[must_use]
     pub fn last_index(self) -> i64 {
         i64::from(self.0.get() - 1)
+    }
+
+    /// `b` ITSELF — an `affine.for`'s exclusive upper bound, which is what
+    /// `constructExplicitTimeLoops` passes to `AffineForOp::create(builder, loc, 0, time_bounds[dim])`
+    /// (`Dialect/Agen/Utils.cpp:430-431`) and what [`super::tf_mutable_addr_splitting::nest_explicit_time_loops`]
+    /// takes. ⛔ THE TWO ARE ONE APART AND BOTH ARE CALLED "the time bound": mixing them up gives a
+    /// nest one iteration short or a page range one element wide.
+    #[must_use]
+    pub fn trip_count(self) -> i64 {
+        i64::from(self.0.get())
     }
 }
 
@@ -2073,18 +2094,42 @@ impl<'p> TpmvVectorLoadStore<'p> {
 /// against entry 373 (`TPMVVector::run`, `Impl.cpp:647`), so it appears in neither the 384 nor the
 /// exclusions.
 ///
-/// ⛔ THREE OF ITS FOUR EXTRA MEMBERS ARE STILL NOT DECLARED, for the reason [`TpmvBase`] gives:
-/// `time_set_`, `access_details_` and `tpmv_comp_info_` (`hpp:508-513`) are *"Set during
-/// initialization"* and arrive with entry 326 (`initialize`). The fourth,
-/// `page_dependent_time_syms_`, is below — entry 310 is what fills it.
+/// ⭐ ALL FIVE MEMBERS ARE DECLARED NOW. `time_order_`, `time_set_`, `access_details_` and
+/// `tpmv_comp_info_` (`hpp:509-513`) are *"Set during initialization"* and are what entry 326
+/// ([`TpmvCompositeLoad::initialize_time`]) fills; `page_dependent_time_syms_` is entry 310's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TpmvComposite<'p> {
     /// The `TPMVBase` subobject.
     pub base: TpmvBase<'p>,
+    /// `time_order_` — the permutation the time dimensions are walked in. `None` is MLIR's
+    /// default-constructed null map, as in [`AccessDetailsAffineComposite::time_order`].
+    pub time_order: Option<AffineMap>,
+    /// `time_set_` — the time iteration domain, REWRITTEN IN PLACE by entry 325's
+    /// `updateTimeSetForExplicitDims` once some dimensions become real loops.
+    pub time_set: Option<IntegerSet>,
+    /// `access_details_` — one composite access detail per memory operand, built by entry 326.
+    pub access_details: AccessContainer<AccessDetailsAffineComposite<'p>>,
     /// `page_dependent_time_syms_` — which loop iterators have a bearing on page selection, as
     /// [`gather_page_dependent_dims_for_page`] adds them and [`identify_time_dim_for_explicit_loops`]
     /// reads them. Empty until [`Self::analyze_valid_pages`] runs.
     pub page_dependent_time_syms: BTreeSet<PageSelSym>,
+    /// `tpmv_comp_info_` — parallel to `tpmv_info_`, one per memory operand.
+    pub tpmv_comp_info: Vec<TpmvCompositeInfo>,
+}
+
+/// `TPMVComposite::TPMVCompositeInfo` (`TransformPagedMemViewImpl.hpp:455-462`) — the time address
+/// map of one memory operand, plus which access detail it belongs to.
+///
+/// ⛔ THE C++ HOLDS AN `AccessDetailsAffineComposite&` AND THIS HOLDS ITS KEY. A reference into
+/// `access_details_` would alias the container entry 326 keeps writing to and entry 325 reads
+/// `access_details_[0]` off; a [`MemoryOperandIndex`] answers the same question through
+/// [`AccessContainer::get`] and cannot dangle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmvCompositeInfo {
+    /// `time_addr_map_` — this operand's address map over the time dimensions.
+    pub time_addr_map: AffineMap,
+    /// `access_details_` — which slot of the container the reference bound by reference.
+    pub access_details: MemoryOperandIndex,
 }
 
 impl<'p> TpmvComposite<'p> {
@@ -2098,7 +2143,11 @@ impl<'p> TpmvComposite<'p> {
     pub fn new(mem_op: &'p DfirOp, comp: DfirUnit) -> TpmvComposite<'p> {
         TpmvComposite {
             base: TpmvBase::new(mem_op, comp),
+            time_order: None,
+            time_set: None,
+            access_details: AccessContainer::default(),
             page_dependent_time_syms: BTreeSet::new(),
+            tpmv_comp_info: Vec::new(),
         }
     }
 }
@@ -2125,18 +2174,13 @@ impl<'p> TpmvCompositeLoad<'p> {
     /// mem-initializer line. The same reading as entry 137, one branch over; see
     /// [`TpmvVectorLoad::new`].
     ///
-    /// # ⛔ ITS INPUT HAS NO ISLAND OP YET, AND THAT IS RECORDED RATHER THAN INVENTED
-    ///
-    /// `agen.composite_load` — the op whose paged view selects this leaf
-    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:331`) — is one of the
-    /// eleven `agen` operations [`crate::islands::dataflow_ir::dialects::agen`] does not declare;
-    /// only `composite_load_and_store` is present. So this constructor is reachable from a vendor test
-    /// and from nothing this crate emits, the same position
-    /// [`super::agen_helper::AgenLoad`] documents for three of its five load classes. The campaign's
-    /// *add the op to the island* rule (`AGENT-BRIEF.md:87`) was applied to entry 139's actual input,
-    /// `dataflow.get_paged_logical_memory_view`, which without it could not be spelled at all; a
-    /// branch of a `dyn_cast` chain that no emitter can reach is a different case, and minting two
-    /// composite ops nothing produces would be the stand-in the crate rules forbid.
+    /// ⭐ ITS INPUT IS AN ISLAND OP NOW, AND THE EARLIER NOTE HERE SAID OTHERWISE. Entry 326
+    /// `initialize_time` `dyn_cast`s `agen.composite_load`
+    /// (`dcc/test/Transform/TransformPagedMemView/paged_mem_view_loads.mlir:331`) and reads six of
+    /// its attributes, so it is that unit's *input* and `AGENT-BRIEF.md:87` applied:
+    /// [`crate::islands::dataflow_ir::dialects::agen::Op::CompositeLoad`] declares it and
+    /// [`super::tf_transform_paged_mem_view_manager::TpmvManager::run`] selects this leaf for real.
+    /// `agen.composite_store` is still absent, which is why [`TpmvCompositeStore`] is not.
     ///
     /// ⭐ THE BODY IS THE DELEGATION, as in entry 137: both arguments forwarded, the four members
     /// [`TpmvComposite`] documents left unset.
@@ -5408,6 +5452,511 @@ scf.if %11 {
             composite.page_dependent_time_syms
         );
     }
+
+    // ── 324/384, 325/384 and 326/384 ─────────────────────────────────────────────────────────────
+
+    /// `paged_mem_view_loads.mlir:291-296` — the six pages, `d1` over three spans of two and `d2`
+    /// over two spans of five, each with its own start address.
+    fn vendor_six_pages(vals: &mut Values) -> Vec<Page> {
+        [
+            ([0, 1], [0, 4]),
+            ([0, 1], [5, 9]),
+            ([2, 3], [0, 4]),
+            ([2, 3], [5, 9]),
+            ([4, 5], [0, 4]),
+            ([4, 5], [5, 9]),
+        ]
+        .into_iter()
+        .map(|([lo1, hi1], [lo2, hi2])| Page {
+            idx_set: PageRect {
+                spans: vec![
+                    PageSpan { lo: 0, hi: 63 },
+                    PageSpan { lo: lo1, hi: hi1 },
+                    PageSpan { lo: lo2, hi: hi2 },
+                ],
+            },
+            start_addr: vals.mint(),
+        })
+        .collect()
+    }
+
+    /// 🎯 324/384 — ⭐⭐ IBM'S SIX-PAGE VIEW WALKED END TO END: THE FOUR PAGES THE SUBSCRIPTS REACH
+    /// ARE EACH BUILT OVER THEIR OWN START ADDRESS, AND PAGES 4 AND 5 EMIT NOTHING.
+    ///
+    /// `paged_mem_view_loads.mlir:288-299` in, `:44-180` out — four copies of the load chain over the
+    /// addends `%c0`, `%c1000`, `%c2000` and `%c3000`, in `getIdxSets()` order.
+    ///
+    /// ⛔ AND EVERY PAGE READS THE PREVIOUS PAGE'S `info`: `access` is threaded page to page, which is
+    /// what makes `constructValidPage`'s re-read of `mem_ops_` correct. Handing each page the ORIGINAL
+    /// `access` would still emit four chains here — the difference only shows once some page takes the
+    /// iter_args arm — so the count is asserted alongside the addends, not instead of them.
+    #[test]
+    fn the_vendors_four_reached_pages_are_each_built_over_their_own_start() {
+        let mut vals = Values::default();
+        let lx = vals.mint();
+        let c0 = vals.mint();
+        let c16 = vals.mint();
+        let arg1 = vals.mint();
+        let arg2 = vals.mint();
+        let lxlu0 = vals.mint();
+        let sfp0 = vals.mint();
+        let mem_view = vals.mint();
+        let loaded = vals.mint();
+        let rotated = vals.mint();
+        let pages = vendor_six_pages(&mut vals);
+        let starts: Vec<Val> = pages.iter().map(|page| page.start_addr).collect();
+        let (to, _) = Link::<LxluUnit, SfpUnit>::between(lxlu0, sfp0).ends();
+
+        let view_ty = MemRef {
+            shape: vec![8, 64, 4],
+            elem: ElemType::F16,
+        };
+        // `affine_map<(d0, d1, d2) -> (d2 * 256 + d1 * 64 + d0)>` (`:289`).
+        let vendor_layout = AffineMap {
+            dims: 3,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(2)
+                    .times(256)
+                    .plus(AffineExpr::dim(1).times(64))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+                PagedMemView {
+                    result: mem_view,
+                    unit: lx,
+                    start_addr: c0,
+                    pages,
+                    layout: vendor_layout,
+                    ty: view_ty.clone(),
+                },
+            ))),
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: loaded,
+                view: mem_view,
+                indices: vec![
+                    Index::Const(0),
+                    Index::Strided(vec![(arg1, 3)], 0),
+                    Index::Strided(vec![(arg2, 2)], 2),
+                ],
+                view_ty,
+                ty: LANES,
+                multicast_info: None,
+            }),
+            DfirOp::VectorChain(vectorchain::Op::Rotate {
+                result: rotated,
+                input: loaded,
+                position: c16,
+                right_shift: true,
+                input_ty: LANES,
+                ty: LANES,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: rotated,
+                ty: LANES,
+            }),
+        ];
+
+        let access = PagedAccess {
+            mem_ops: vec![loaded],
+            paged_mem_view: mem_view,
+            subscripts_map: vendor_subscripts(),
+            indices: vec![arg1, arg2],
+            indices_ranges: vec![IvRange { lb: 0, ub: 1 }, IvRange { lb: 0, ub: 3 }],
+            conditional_iter_args: Vec::new(),
+        };
+        let info = TpmvInfo {
+            paged_mem_view: PagedMemViewHandle::of(&scope[0]),
+            subscripts_map: access.subscripts_map.clone(),
+            indices: access.indices.clone(),
+            indices_ranges: access.indices_ranges.clone(),
+            conditional_iter_args: Vec::new(),
+            mem_index: MemoryOperandIndex::DirSrc,
+        };
+        // `info` borrows the view op, so the emission goes into a clone — as entry 309's test does.
+        let mut emitted = scope.clone();
+        let constructed = analyze_and_construct_valid_pages(
+            &mut vals,
+            &mut emitted,
+            &access,
+            &info,
+            &replace_dims_in_map_with_syms(&access.subscripts_map),
+        );
+
+        let ConstructedPages::Constructed { pages, access } = constructed else {
+            panic!("`%arg1 * 3` and `%arg2 * 2 + 2` reach four of the six pages: {constructed:?}")
+        };
+        assert_eq!(pages.len(), 4, "pages 4 and 5 are skipped, not refused");
+
+        /// Every `arith.addi` a page emitted, guards and all — the page's start addend.
+        fn addends(ops: &[DfirOp]) -> Vec<Val> {
+            ops.iter()
+                .flat_map(|op| match op {
+                    DfirOp::Arith(arith::Op::AddI(add)) => vec![add.rhs],
+                    DfirOp::Scf(scf::Op::If {
+                        body, else_body, ..
+                    }) => {
+                        let mut found = addends(body);
+                        found.extend(addends(else_body));
+                        found
+                    }
+                    _ => Vec::new(),
+                })
+                .collect()
+        }
+        for (page, &start) in pages.iter().zip(&starts) {
+            assert_eq!(addends(&page.placed[0]), [start]);
+            assert_eq!(
+                page.new_mem_ops.len(),
+                1,
+                "one replacement per `mem_ops_` entry"
+            );
+        }
+        // Every page's bounds are constants here, so nothing took the non-hyper-rectangular arm.
+        assert!(access.conditional_iter_args.is_empty());
+        assert_eq!(access.mem_ops, vec![loaded]);
+    }
+
+    /// `vector<128xi8>` — the composite key's own vector, twice the width of [`LANES`].
+    const STICK: Vector = Vector {
+        len: 128,
+        elem: ElemType::Int(8),
+    };
+
+    /// `paged_mem_view_loads.mlir:316-341` — the composite load on its four-page view, flat, with the
+    /// `%c3` its `time_set`'s `s0` reads and the `%arg9` its subscripts do.
+    ///
+    /// ⭐ THE FOUR OUTER LOOPS ARE LEFT OUT: only `%arg9` appears in the subscripts, and entry 197
+    /// resolves an iterator through the `affine.for` that BINDS it, which needs no enclosing nest.
+    fn vendor_composite_load(vals: &mut Values) -> (Vec<DfirOp>, Val, Val) {
+        let lx = vals.mint();
+        let sfp1 = vals.mint();
+        let lxlu1 = vals.mint();
+        let base = vals.mint();
+        let c3 = vals.mint();
+        let mem_view = vals.mint();
+        let arg9 = vals.mint();
+        let load_iv = vals.mint();
+        let starts: Vec<Val> = (0..4).map(|_| vals.mint()).collect();
+        let (to, _) = Link::<LxluUnit, SfpUnit>::between(lxlu1, sfp1).ends();
+
+        let ty = MemRef {
+            shape: vec![128, 2, 1, 1, 2],
+            elem: ElemType::Int(8),
+        };
+        // `(d0, d1, d2, d3, d4) -> (d4 * 256 + d3 * 256 + d2 * 256 + d1 * 128 + d0)` (`:317`).
+        let layout = AffineMap {
+            dims: 5,
+            syms: 0,
+            results: vec![
+                AffineExpr::dim(4)
+                    .times(256)
+                    .plus(AffineExpr::dim(3).times(256))
+                    .plus(AffineExpr::dim(2).times(256))
+                    .plus(AffineExpr::dim(1).times(128))
+                    .plus(AffineExpr::dim(0)),
+            ],
+        };
+        // `page0`..`page3` (`:319-322`) — one per value of `d1`, which is what makes the time
+        // dimension that reaches `d1` page-dependent.
+        let pages: Vec<Page> = starts
+            .iter()
+            .enumerate()
+            .map(|(n, &start_addr)| Page {
+                idx_set: PageRect {
+                    spans: vec![
+                        PageSpan { lo: 0, hi: 63 },
+                        PageSpan {
+                            lo: i64::try_from(n).expect("four pages"),
+                            hi: i64::try_from(n).expect("four pages"),
+                        },
+                        PageSpan { lo: 0, hi: 63 },
+                        PageSpan { lo: 0, hi: 1 },
+                        PageSpan { lo: 0, hi: 7 },
+                    ],
+                },
+                start_addr,
+            })
+            .collect();
+        let spanning = |dim: u32, upper: AffineExpr| {
+            vec![
+                Constraint {
+                    expr: AffineExpr::dim(dim),
+                    is_equality: false,
+                },
+                Constraint {
+                    expr: AffineExpr::dim(dim).times(-1).plus(upper),
+                    is_equality: false,
+                },
+            ]
+        };
+        let pinned = |dim: u32| Constraint {
+            expr: AffineExpr::dim(dim),
+            is_equality: true,
+        };
+        let scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: c3,
+                value: 3,
+            }),
+            DfirOp::Affine(affine::Op::For {
+                iv: arg9,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(56),
+                carried: Vec::new(),
+                body: Vec::new(),
+                dbg_name: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+                PagedMemView {
+                    result: mem_view,
+                    unit: lx,
+                    start_addr: base,
+                    pages,
+                    layout,
+                    ty: ty.clone(),
+                },
+            ))),
+            DfirOp::Agen(agen::Op::CompositeLoad(Box::new(agen::CompositeAccess {
+                view: mem_view,
+                // `%mem_view[%arg9, 0, 0, 0, 0]` (`:323`).
+                indices: vec![
+                    Index::Val(arg9),
+                    Index::Const(0),
+                    Index::Const(0),
+                    Index::Const(0),
+                    Index::Const(0),
+                ],
+                view_ty: ty,
+                load_iv,
+                load_iv_ty: STICK,
+                // `(d0 >= 0, -d0 + 127 >= 0, d1 == 0, d2 == 0, d3 == 0, d4 == 0)`.
+                load_set: IntegerSet {
+                    dims: 5,
+                    symbols: 0,
+                    constraints: spanning(0, AffineExpr::Const(127))
+                        .into_iter()
+                        .chain((1..5).map(pinned))
+                        .collect(),
+                },
+                load_order: AffineMap::identity(5),
+                // `time_symbols(%c3)` — `s0` below is 3, which is `d2`'s width.
+                time_symbols: vec![c3],
+                time_set: IntegerSet {
+                    dims: 5,
+                    symbols: 1,
+                    constraints: spanning(0, AffineExpr::Const(1))
+                        .into_iter()
+                        .chain(spanning(1, AffineExpr::Const(0)))
+                        .chain(spanning(2, AffineExpr::sym(0).plus(AffineExpr::Const(-1))))
+                        .chain(spanning(3, AffineExpr::Const(2)))
+                        .chain(spanning(4, AffineExpr::Const(1)))
+                        .collect(),
+                },
+                // `(d0, d4, d2, d3, d1)` (`:336`).
+                time_order: AffineMap {
+                    dims: 5,
+                    syms: 0,
+                    results: vec![
+                        AffineExpr::dim(0),
+                        AffineExpr::dim(4),
+                        AffineExpr::dim(2),
+                        AffineExpr::dim(3),
+                        AffineExpr::dim(1),
+                    ],
+                },
+                // `(0, d2, 0, 0, d4 * 2)` (`:335`).
+                time_addr_map: AffineMap {
+                    dims: 5,
+                    syms: 0,
+                    results: vec![
+                        AffineExpr::Const(0),
+                        AffineExpr::dim(2),
+                        AffineExpr::Const(0),
+                        AffineExpr::Const(0),
+                        AffineExpr::dim(4).times(2),
+                    ],
+                },
+                dbg_name: None,
+                body: vec![
+                    DfirOp::Dataflow(dataflow::Op::Send {
+                        to,
+                        data: load_iv,
+                        ty: STICK,
+                    }),
+                    DfirOp::Agen(agen::Op::Yield),
+                ],
+            }))),
+        ];
+        (scope, arg9, mem_view)
+    }
+
+    /// 🎯 326/384 — ⭐ THE VENDOR'S COMPOSITE LOAD GIVES UP ITS FIVE TIME BOUNDS IN `time_order`'S
+    /// ORDER, WITH ITS SYMBOLIC DIMENSION RESOLVED THROUGH `time_symbols(%c3)`.
+    ///
+    /// `paged_mem_view_loads.mlir:331-337`. The set's own widths are `d0:2 d1:1 d2:s0 d3:3 d4:2`, and
+    /// `time_order = (d0, d4, d2, d3, d1)` reorders them to `[2, 2, 3, 3, 1]` — which is where entry
+    /// 325's three loops of 2, 2 and 3 come from.
+    ///
+    /// ⛔ WITHOUT `time_symbols` THIS IS `NonConstantTimeSymbol(d2)` AND THE PASS STOPS: the island's
+    /// composite transfers carried no such list until this entry needed one.
+    #[test]
+    fn the_vendors_composite_load_resolves_its_symbolic_time_bound_through_its_symbols() {
+        let mut vals = Values::default();
+        let (scope, _, _) = vendor_composite_load(&mut vals);
+        let mut load = TpmvCompositeLoad::new(&scope[3], DfirUnit::Lxlu);
+
+        assert_eq!(load.initialize_time(&scope), CompositeTimeInit::Initialized);
+
+        let details = load.composite.access_details.entries();
+        assert_eq!(details.len(), 1, "a composite load has one memory operand");
+        assert_eq!(
+            details[0].time_bounds,
+            [
+                TimeBound::Steps(2),
+                TimeBound::Steps(2),
+                TimeBound::Steps(3),
+                TimeBound::Steps(3),
+                TimeBound::Steps(1)
+            ]
+        );
+        // `time_order_`, `time_set_` and `tpmv_comp_info_` are the op's, unnarrowed until entry 325.
+        let DfirOp::Agen(agen::Op::CompositeLoad(access)) = &scope[3] else {
+            unreachable!("the fixture's last op is the composite load")
+        };
+        assert_eq!(load.composite.time_order, Some(access.time_order.clone()));
+        assert_eq!(load.composite.time_set, Some(access.time_set.clone()));
+        assert_eq!(
+            load.composite.tpmv_comp_info,
+            vec![TpmvCompositeInfo {
+                time_addr_map: access.time_addr_map.clone(),
+                access_details: MemoryOperandIndex::DirSrc,
+            }]
+        );
+    }
+
+    /// 🎯 325/384 — ⭐⭐ IBM'S COMPOSITE KEY END TO END: THREE OF ITS FIVE TIME DIMENSIONS BECOME REAL
+    /// LOOPS OF 2, 2 AND 3, AND THE LOAD IS REBUILT INSIDE THEM WITH THE NARROWED `time_set`.
+    ///
+    /// `paged_mem_view_loads.mlir:316-341` in, `:128-131` and `:136-142` out — the three `affine.for`s
+    /// and the rebuilt `agen.composite_load` still on the PAGED view, with `#[[$ATTR_9]]` pinning
+    /// `d0`, `d4` and `d2` and subscripts `[%arg9, ivs[2], 0, 0, ivs[1] * 2]`.
+    ///
+    /// ⛔ THE PAGE GUARDS AND THE `0` AT POSITION 1 IN THE CHECK ARE **ENTRY 356's**, not this one's:
+    /// `constructValidPage` rebases each page's selecting axis onto its own start, which is why all
+    /// three of the vendor's arms print `0` there while this emission still names `ivs[2]`.
+    #[test]
+    fn the_vendors_composite_key_turns_three_time_dimensions_into_loops() {
+        let mut vals = Values::default();
+        let (scope, arg9, mem_view) = vendor_composite_load(&mut vals);
+        let mut load = TpmvCompositeLoad::new(&scope[3], DfirUnit::Lxlu);
+        assert_eq!(load.initialize_time(&scope), CompositeTimeInit::Initialized);
+
+        // `TPMVCompositeLoad::initialize` (`Impl.cpp:1078`) is not in the 384 — it is what fills
+        // `tpmv_info_` from the op's own `[%arg9, 0, 0, 0, 0]`, and entry 325 reads it here.
+        load.composite.base.tpmv_info.push(TpmvInfo {
+            paged_mem_view: PagedMemViewHandle::of(&scope[2]),
+            subscripts_map: AffineMap {
+                dims: 1,
+                syms: 0,
+                results: vec![
+                    AffineExpr::dim(0),
+                    AffineExpr::Const(0),
+                    AffineExpr::Const(0),
+                    AffineExpr::Const(0),
+                    AffineExpr::Const(0),
+                ],
+            },
+            indices: vec![arg9],
+            indices_ranges: Vec::new(),
+            conditional_iter_args: Vec::new(),
+            mem_index: MemoryOperandIndex::DirSrc,
+        });
+
+        let transformed = load.composite.transform_time(&mut vals, &scope);
+        let TransformedTime::ExplicitLoops(ExplicitTimeNest { nest, ivs }) = transformed else {
+            panic!(
+                "`d1` is reached by time dimension 2, so three dims become loops: {transformed:?}"
+            )
+        };
+        assert_eq!(ivs.len(), 3);
+
+        let mut level = &nest;
+        let mut trips: Vec<affine::Bound> = Vec::new();
+        for iv in &ivs {
+            let [
+                DfirOp::Affine(affine::Op::For {
+                    iv: bound_iv,
+                    lo,
+                    hi,
+                    body,
+                    ..
+                }),
+            ] = &level[..]
+            else {
+                panic!("one `affine.for` per explicit time dimension: {level:?}")
+            };
+            assert_eq!((bound_iv, lo), (iv, &affine::Bound::Const(0)));
+            trips.push(*hi);
+            level = body;
+        }
+        assert_eq!(
+            trips,
+            [
+                affine::Bound::Const(2),
+                affine::Bound::Const(2),
+                affine::Bound::Const(3)
+            ],
+            "the first three of `[2, 2, 3, 3, 1]`"
+        );
+
+        let [DfirOp::Agen(agen::Op::CompositeLoad(rebuilt))] = &level[..] else {
+            panic!("the innermost body holds the rebuilt load: {level:?}")
+        };
+        assert_eq!(
+            rebuilt.view, mem_view,
+            "still the PAGED view — entry 356 replaces it"
+        );
+        assert_eq!(
+            rebuilt.indices,
+            vec![
+                Index::Val(arg9),
+                Index::Val(ivs[2]),
+                Index::Const(0),
+                Index::Const(0),
+                Index::Strided(vec![(ivs[1], 2)], 0)
+            ],
+            "`(0, d2, 0, 0, d4 * 2)` reordered to `(0, d2, 0, 0, d1 * 2)` and concatenated"
+        );
+        // `#[[$ATTR_9]]` (`:25`) — `d0`, `d4` and `d2` pinned in `time_order` order, their six
+        // constraints dropped, `d1`'s and `d3`'s kept.
+        let pinned = |dim: u32| Constraint {
+            expr: AffineExpr::dim(dim),
+            is_equality: true,
+        };
+        let DfirOp::Agen(agen::Op::CompositeLoad(original)) = &scope[3] else {
+            unreachable!("the fixture's last op is the composite load")
+        };
+        assert_eq!(
+            rebuilt.time_set,
+            IntegerSet {
+                dims: 5,
+                symbols: 1,
+                constraints: vec![pinned(0), pinned(4), pinned(2)]
+                    .into_iter()
+                    .chain(original.time_set.constraints[2..4].iter().cloned())
+                    .chain(original.time_set.constraints[6..8].iter().cloned())
+                    .collect(),
+            }
+        );
+        assert_eq!(load.composite.time_set.as_ref(), Some(&rebuilt.time_set));
+        assert_eq!(rebuilt.time_symbols, original.time_symbols);
+        assert_eq!(rebuilt.dbg_name, Some(String::new()), "`dbgName = \"\"`");
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -6333,11 +6882,594 @@ impl TpmvComposite<'_> {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 324/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT THE PAGE WALK PRODUCED — every valid page's construction, or the refusal that ended it.
+///
+/// ⛔ THE LAST THREE FAIL THE PASS: two are `emitOpError`s (`:179`, `:183`) and one is
+/// `constructValidPage(..).failed()` (`:172-175`), and `run()` returns all of them as `failure()`.
+#[derive(Debug, Clone)]
+pub enum ConstructedPages {
+    /// One entry per valid page, in `getIdxSets()` order, plus `info` as the last page left it.
+    Constructed {
+        /// `new_mem_ops` and the guarded accesses, per page.
+        pages: Vec<ConstructedPage>,
+        /// `info.indices_` and `info.conditional_iter_args_` after the walk — see [`PagedAccess`].
+        access: PagedAccess,
+    },
+    /// `"expecting only one active page when subscripts are constant"`.
+    ConstantSubscriptsReachSeveralPages,
+    /// `"no valid pages found"`, and the absent `paged_mem_view_` that presents no pages at all.
+    NoValidPages,
+    /// [`PageValidity::PageIsNotHyperRectangular`], naming the page that is not one.
+    PageIsNotHyperRectangular(PageIdx),
+    /// [`ValidPage::SubscriptBoundIsNotConstant`], naming the page whose construction hit it.
+    SubscriptBoundIsNotConstant(PageIdx),
+}
+
+/// Replaces: e324_analyzeAndConstructValidPages
+///
+/// **324/384** `TPMVBase::analyzeAndConstructValidPages` —
+/// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152` (32L).
+///
+/// ⛔ `info` IS MUTATED PAGE TO PAGE AND THAT IS WHAT `access` THREADS: page two's conditionals see
+/// page one's `conditional_iter_args_` and its re-pointed `mem_ops_`, which is the whole reason
+/// `constructValidPage` re-reads `mem_ops_` every page. ⚠️ BUT [`get_page_validity`] IS STILL HANDED
+/// THE ORIGINAL `info`: it reads only `indices_ranges_`, which nothing in the loop writes.
+/// ⚠️ `FlatLinearValueConstraints compare_constraints;` is declared here and never read — entry 310
+/// is where that system does its work.
+#[must_use]
+pub fn analyze_and_construct_valid_pages(
+    vals: &mut Values,
+    scope: &mut Vec<DfirOp>,
+    access: &PagedAccess,
+    info: &TpmvInfo<'_>,
+    subscripts_map_sym: &AffineMap,
+) -> ConstructedPages {
+    // `DT_CHECK(new_mem_ops.empty())` — the list is this function's own here, so it starts empty.
+    let mut pages: Vec<ConstructedPage> = Vec::new();
+    let mut current = access.clone();
+
+    // `auto idx_sets = info.paged_mem_view_.getIdxSets();`, dereferenced unqualified as entry 310.
+    let Some(handle) = info.paged_mem_view else {
+        return ConstructedPages::NoValidPages;
+    };
+    let mut valid_pages = 0u32;
+
+    for (page_idx, page) in handle.view.pages.iter().enumerate() {
+        let at = PageIdx(u32::try_from(page_idx).expect("a page count fits a u32"));
+        // ⚠️ `DT_CHECK(page_set.getNumDims() == info.subscripts_map_.getNumResults())` is one fact in
+        // two spellings — see entry 310, which asserts the same pair.
+        let page_set = page.idx_set.as_integer_set();
+        let page_sel_constraints = match get_page_validity(info, subscripts_map_sym, &page_set) {
+            PageValidity::Valid(set) => set,
+            // `if (page_sel_constraints.isEmpty()) continue;`
+            PageValidity::SubscriptsDoNotIntersectThePage
+            | PageValidity::IvBoundsDoNotIntersectThePage => continue,
+            PageValidity::PageIsNotHyperRectangular => {
+                return ConstructedPages::PageIsNotHyperRectangular(at);
+            }
+        };
+
+        // `++valid_pages;` — BEFORE the construction, so a page that then refuses still counted.
+        valid_pages += 1;
+
+        match construct_valid_page(vals, scope, &current, page, &page_sel_constraints) {
+            ValidPage::Constructed(built) => {
+                current = built.access.clone();
+                pages.push(built);
+            }
+            ValidPage::SubscriptBoundIsNotConstant => {
+                return ConstructedPages::SubscriptBoundIsNotConstant(at);
+            }
+        }
+    }
+
+    // `if (subscripts_map_sym.getNumSymbols() == 0 && valid_pages > 1)` — constant subscripts name
+    // one element, so two pages holding it means the pages overlap.
+    if subscripts_map_sym.syms == 0 && valid_pages > 1 {
+        return ConstructedPages::ConstantSubscriptsReachSeveralPages;
+    }
+    if valid_pages == 0 {
+        return ConstructedPages::NoValidPages;
+    }
+
+    ConstructedPages::Constructed {
+        pages,
+        access: current,
+    }
+}
+
+/// `agen::utils::orderMap` — `dcc/src/Dialect/Agen/Utils.cpp:87` (14L). Rewrites `map`'s dimensions
+/// into the order `map_order` names, which is how a time address map is read in walk order.
+///
+/// ⛔ `map_order.getDimPosition(i)` IS A `cast`, so a `map_order` that is not a permutation aborts —
+/// [`AffineMap::dim_position`]'s [`None`] leaves that dimension where it was, which is the identity
+/// this crate's default-constructed orders already mean. ⚠️ THE TWO `DT_CHECK`s (`:88-89`) are
+/// arities, and the callers hand over a `time_order` with no symbols by construction.
+#[must_use]
+pub(super) fn order_map(map: &AffineMap, map_order: &AffineMap) -> AffineMap {
+    let ordered: Vec<AffineExpr> = (0..map_order.results.len())
+        .map(|i| {
+            AffineExpr::Dim(
+                map_order
+                    .dim_position(i)
+                    .unwrap_or(u32::try_from(i).unwrap_or(0)),
+            )
+        })
+        .collect();
+    map.replace_dims_and_symbols(&ordered, &[], map_order.dims, 0)
+}
+
+/// `agen::utils::replaceConstOpsInSubscriptsMap` — `dcc/src/Dialect/Agen/Utils.cpp:46` (20L), with
+/// `removeConstantOpsFromIndices` (`:33-44`) inlined as its closing statement.
+///
+/// ⛔ TWO RENUMBERINGS IN ONE PASS: a constant operand becomes an `AffineConstantExpr` and is
+/// DROPPED from `indices`, and every surviving operand is renumbered densely — so `indices[dim]` and
+/// `d<dim>` still line up afterwards. Folding without dropping, or dropping without renumbering,
+/// leaves the map indexing the wrong operand.
+pub(super) fn replace_const_ops_in_subscripts_map(
+    subscripts_map: &mut AffineMap,
+    indices: &mut Vec<Val>,
+    scope: &[DfirOp],
+) {
+    let constant_at = |index: Val| match defining_op(index, scope) {
+        // `dyn_cast_or_null<arith::ConstantOp>` then `cast<IntegerAttr>(getValue()).getInt()`.
+        Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => Some(*value),
+        _ => None,
+    };
+
+    let mut operand_exprs: Vec<AffineExpr> = Vec::with_capacity(indices.len());
+    let mut num_dim_vars = 0u32;
+    for &index in indices.iter() {
+        match constant_at(index) {
+            Some(value) => operand_exprs.push(AffineExpr::Const(value)),
+            None => {
+                operand_exprs.push(AffineExpr::Dim(num_dim_vars));
+                num_dim_vars += 1;
+            }
+        }
+    }
+    *subscripts_map = subscripts_map.replace_dims_and_symbols(&operand_exprs, &[], num_dim_vars, 0);
+    indices.retain(|&index| constant_at(index).is_none());
+}
+
+/// `agen::CompositeLoadOp::cloneWithNewAccessInfo` — `Agen.cpp:653` (33L).
+///
+/// ⛔ ONLY THE VIEW, ITS INDICES AND THE TIME SET ARE THE CALLER'S; the load side, `time_order` and
+/// `time_addr_map` come from the original, and an absent `dbgName` becomes the EMPTY STRING (`:658`).
+/// ⛔ AND THE BODY IS RE-BOUND onto a fresh `load_iv` (`:678-682`), as
+/// [`super::tf_mutable_addr_splitting::clone_composite_with_new_access_info`] does for the transfer.
+#[must_use]
+pub(super) fn clone_composite_load_with_new_access_info(
+    vals: &mut Values,
+    access: &agen::CompositeAccess,
+    view: Val,
+    indices: Vec<Index>,
+    time_set: IntegerSet,
+) -> DfirOp {
+    let load_iv = vals.mint();
+    let mut mapping = ValueMapping::new();
+    mapping.map(access.load_iv, load_iv);
+    let body = vals.clone_ops(&access.body, &mut mapping);
+    DfirOp::Agen(agen::Op::CompositeLoad(Box::new(agen::CompositeAccess {
+        view,
+        indices,
+        view_ty: access.view_ty.clone(),
+        load_iv,
+        load_iv_ty: access.load_iv_ty,
+        load_set: access.load_set.clone(),
+        load_order: access.load_order.clone(),
+        time_symbols: access.time_symbols.clone(),
+        time_set,
+        time_order: access.time_order.clone(),
+        time_addr_map: access.time_addr_map.clone(),
+        dbg_name: Some(access.dbg_name.clone().unwrap_or_default()),
+        body,
+    })))
+}
+
+/// THE COMPOSITE `createNewMemOp` VIRTUAL, DISPATCHED ON THE OP CLASS — the leaf overrides at
+/// `Impl.cpp:1120`, `:1173` and `:1242`, each of which is a `cast<>` to its own class and nothing
+/// else. ⚠️ UNANCHORED: all three are outside the 384, and entry 325 cannot call the virtual without
+/// them.
+#[derive(Debug, Clone)]
+pub enum NewCompositeMemOp {
+    /// The replacement, preceded by any non-paged view it had to clone for the other side.
+    Created(Vec<DfirOp>),
+    /// `agen.composite_store` — `TPMVCompositeStore` (`:1173`) has no island op to clone, for the
+    /// reason [`TpmvCompositeStore::new`] gives.
+    MemOpHasNoCompositeClass,
+}
+
+/// `TPMVCompositeLoad::createNewMemOp` (`:1120`) and `TPMVCompositeLoadStore::createNewMemOp`
+/// (`:1242`) — see [`NewCompositeMemOp`].
+///
+/// ⛔ THE LOAD-AND-STORE ARM REPLACES ONLY `info.mem_index_`'S SIDE and clones the OTHER side's view
+/// through [`clone_mem_view_if_non_paged`] (`:1252`, `:1259`), keeping that side's own map and
+/// indices — so a `kDirDst` info leaves the src exactly as it was.
+fn create_new_composite_mem_op(
+    vals: &mut Values,
+    mem_op: &DfirOp,
+    info: &TpmvInfo<'_>,
+    mem_view: Val,
+    subscripts_map: &AffineMap,
+    indices: &[Val],
+    time_set: IntegerSet,
+    scope: &[DfirOp],
+) -> NewCompositeMemOp {
+    let new_indices = indices_from_map(subscripts_map, indices);
+    match mem_op {
+        DfirOp::Agen(agen::Op::CompositeLoad(access)) => {
+            NewCompositeMemOp::Created(vec![clone_composite_load_with_new_access_info(
+                vals,
+                access,
+                mem_view,
+                new_indices,
+                time_set,
+            )])
+        }
+        DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
+            let (other, side) = match info.mem_index {
+                MemoryOperandIndex::DirSrc => (transfer.dst, false),
+                _ => (transfer.src, true),
+            };
+            let cloned = clone_mem_view_if_non_paged(vals, defining_op(other, scope), other);
+            let mut ops = cloned.ops;
+            ops.push(if side {
+                clone_composite_with_new_access_info(
+                    vals,
+                    transfer,
+                    cloned.value,
+                    transfer.src_indices.clone(),
+                    mem_view,
+                    new_indices,
+                    time_set,
+                )
+            } else {
+                clone_composite_with_new_access_info(
+                    vals,
+                    transfer,
+                    mem_view,
+                    new_indices,
+                    cloned.value,
+                    transfer.dst_indices.clone(),
+                    time_set,
+                )
+            });
+            NewCompositeMemOp::Created(ops)
+        }
+        _ => NewCompositeMemOp::MemOpHasNoCompositeClass,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 325/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE EXPLICIT TIME NEST ENTRY 325 EMITTED, when some time dimension crosses a page boundary.
+#[derive(Debug, Clone)]
+pub struct ExplicitTimeNest {
+    /// `for_ops` as one nested `affine.for`, outermost first, with `mem_ops_[0]`'s replacement in the
+    /// innermost body — where `builder.setInsertionPointToStart(for_ops.back().getBody())` put it.
+    pub nest: Vec<DfirOp>,
+    /// The nest's induction variables, outermost first, as `indices_` now names them.
+    pub ivs: Vec<Val>,
+}
+
+/// WHAT `transform_time` DID — see [`TransformedTime::TimeDimsPreserved`] for the common answer.
+#[derive(Debug, Clone)]
+pub enum TransformedTime {
+    /// `explicit_loop_dim == -1`: *"all time dims can be preserved"* (`:1028`) and the `else` arm's
+    /// only statement is a debug print. ⭐ THE ORDINARY CASE — a transfer whose pages do not move
+    /// with time needs no loops at all.
+    TimeDimsPreserved,
+    /// `explicit_loop_dim > -1`: the loops, with `mem_ops_[0]` erased and re-pointed at the new op.
+    ExplicitLoops(ExplicitTimeNest),
+    /// `analyzeValidPages(..).failed()` (`:1021`).
+    PagesNotAnalyzed(ValidPages),
+    /// `DT_CHECK(mem_ops_.size() == 1)` (`:980`, `:1032`) and
+    /// `DT_CHECK(tpmv_info_.size() == tpmv_comp_info_.size())` (`:981`).
+    OperandListsDisagree {
+        /// `mem_ops_.size()`.
+        mem_ops: usize,
+        /// `tpmv_info_.size()`.
+        infos: usize,
+        /// `tpmv_comp_info_.size()`.
+        comp_infos: usize,
+    },
+    /// A subscript that is not an `affine.for` induction variable with constant bounds — entry 197's
+    /// own aborts, through [`SubscriptIv::of`], naming the operand.
+    SubscriptIsNotALoopIterator(usize),
+    /// `access_details_[0]` is empty, so there are no time bounds to add.
+    AccessDetailsAreEmpty,
+    /// A time bound that is [`TimeBound::Coalesced`] or [`TimeBound::Variable`] where entry 131's
+    /// `DT_CHECK_MSG` and `AffineForOp::create` both need a step count. See [`TimeSteps`].
+    TimeBoundIsNotAStepCount(TimeBound),
+    /// `DT_CHECK(subscripts_map_time[i].getNumDims() == indices_ranges_.size())` (`:1018-1019`).
+    SubscriptsAndRangesDisagree {
+        /// `subscripts_map_time[i].getNumDims()`.
+        dims: u32,
+        /// `indices_ranges_.size()`.
+        ranges: usize,
+    },
+    /// `time_order_` or `time_set_` is the default-constructed null — entry 326 has not run.
+    TimeInfoIsAbsent,
+    /// `time_order.getResult(dim)` off the end (`Agen/Utils.cpp:489`).
+    TimeOrderHasNoDimension(usize),
+    /// `time_order.getDimPosition(dim)` on a result that is not a bare dimension (`:497`).
+    TimeOrderIsNotAPermutation(usize),
+    /// `DT_CHECK((i - num_orig_dims) < for_ops.size())` (`Agen/Utils.cpp:470`).
+    TimeDimensionHasNoLoop(usize),
+    /// `DT_CHECK(paged_idx >= 0)` (`:1060`) — no operand reads a paged view.
+    NoOperandHasAPagedView,
+    /// [`NewCompositeMemOp::MemOpHasNoCompositeClass`].
+    MemOpHasNoCompositeClass,
+}
+
+impl<'p> TpmvComposite<'p> {
+    /// Replaces: e325_transform_time
+    ///
+    /// **325/384** `TPMVComposite::transform_time` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977` (98L).
+    ///
+    /// ⛔ `explicit_loop_dim` IS ASSIGNED EVERY PAGED OPERAND AND ONLY THE LAST SURVIVES (`:1024`),
+    /// while `page_dependent_time_syms_` accumulates across all of them — so a two-operand transfer's
+    /// nest depth is the DST's answer over the UNION of both operands' page-dependent symbols.
+    /// ⛔ AND `subscripts_map_time` IS BUILT FOR EVERY OPERAND, paged or not (`:994-1000`): the
+    /// non-paged one needs it in phase B to have its own subscripts updated.
+    /// ⚠️ `mem_ops_[0] = new_mem_op` is [`ExplicitTimeNest`], not a write: see [`TpmvBase`].
+    pub fn transform_time(&mut self, vals: &mut Values, scope: &'p [DfirOp]) -> TransformedTime {
+        // `DT_CHECK(mem_ops_.size() == 1); DT_CHECK(tpmv_info_.size() == tpmv_comp_info_.size());`
+        if self.base.mem_ops.len() != 1 || self.base.tpmv_info.len() != self.tpmv_comp_info.len() {
+            return TransformedTime::OperandListsDisagree {
+                mem_ops: self.base.mem_ops.len(),
+                infos: self.base.tpmv_info.len(),
+                comp_infos: self.tpmv_comp_info.len(),
+            };
+        }
+        let (Some(time_order), Some(time_set)) = (self.time_order.clone(), self.time_set.clone())
+        else {
+            return TransformedTime::TimeInfoIsAbsent;
+        };
+
+        // ── Phase A: per memory operand ───────────────────────────────────────────────────────────
+        let mut explicit_loop_dim: Option<TimeDim> = None;
+        let mut subscripts_map_time: Vec<AffineMap> = Vec::new();
+        for i in 0..self.base.tpmv_info.len() {
+            // `replaceConstOpsInSubscriptsMap(tpmv_info_[i].subscripts_map_, tpmv_info_[i].indices_)`.
+            let info = &mut self.base.tpmv_info[i];
+            replace_const_ops_in_subscripts_map(&mut info.subscripts_map, &mut info.indices, scope);
+
+            // "Create a new set of subscripts considering the time steps."
+            let time_map = order_map(&self.tpmv_comp_info[i].time_addr_map, &time_order);
+            subscripts_map_time.push(concatenate_maps(&info.subscripts_map, &time_map));
+
+            // `if (!tpmv_info_[i].paged_mem_view_) continue;` — the non-paged operand keeps the map
+            // just built and skips the analysis entirely.
+            if info.paged_mem_view.is_none() {
+                continue;
+            }
+
+            // "Create a copy of the subscripts_map that represents loop iterators as symbols."
+            let subscripts_map_sym = replace_dims_in_map_with_syms(&subscripts_map_time[i]);
+
+            // "Ranges of the loop iterators are used to only choose pages within the loop iteration
+            // space." — entry 197 over `indices_`, which no longer holds any constant.
+            let mut ivs: Vec<SubscriptIv> = Vec::with_capacity(info.indices.len());
+            for &index in &info.indices {
+                let Some(iv) = SubscriptIv::of(index, scope) else {
+                    return TransformedTime::SubscriptIsNotALoopIterator(i);
+                };
+                ivs.push(iv);
+            }
+            calculate_indices_ranges(&ivs, &mut info.indices_ranges);
+
+            // "Since all memory accesses for a memory op use the same time bounds, just use the first
+            // access_details_ to grab time bounds." — entry 131 appends after entry 197.
+            let Some(first) = self.access_details.entries().first() else {
+                return TransformedTime::AccessDetailsAreEmpty;
+            };
+            let mut time_bounds: Vec<TimeSteps> = Vec::with_capacity(first.time_bounds.len());
+            for &bound in &first.time_bounds {
+                let Some(steps) = TimeSteps::of(bound) else {
+                    return TransformedTime::TimeBoundIsNotAStepCount(bound);
+                };
+                time_bounds.push(steps);
+            }
+            let info = &mut self.base.tpmv_info[i];
+            add_time_dim_indices_ranges(&time_bounds, &mut info.indices_ranges);
+            if subscripts_map_time[i].dims as usize != info.indices_ranges.len() {
+                return TransformedTime::SubscriptsAndRangesDisagree {
+                    dims: subscripts_map_time[i].dims,
+                    ranges: info.indices_ranges.len(),
+                };
+            }
+
+            let info = self.base.tpmv_info[i].clone();
+            match self.analyze_valid_pages(&info, &subscripts_map_sym) {
+                ValidPages::Found(_) => {}
+                refusal => return TransformedTime::PagesNotAnalyzed(refusal),
+            }
+
+            // `identifyTimeDimForExplicitLoops(tpmv_info_[i].subscripts_map_.getNumDims())`.
+            explicit_loop_dim = identify_time_dim_for_explicit_loops(
+                &time_set,
+                &self.page_dependent_time_syms,
+                NonTimeDims(info.subscripts_map.dims),
+            );
+        }
+
+        // "A explicit_loop_dim of -1 indicates all time dims can be preserved."
+        let Some(explicit_loop_dim) = explicit_loop_dim else {
+            return TransformedTime::TimeDimsPreserved;
+        };
+        let time_dim = explicit_loop_dim.0 as usize;
+
+        // ── Phase B: the dims from the outermost down to `explicit_loop_dim` become real loops ────
+        //
+        // `constructExplicitTimeLoops(mem_ops_[0], access_details_[0].getTimeBounds(),
+        //  explicit_loop_dim)` — the bounds first, since the nest is assembled around the new op.
+        let Some(first) = self.access_details.entries().first() else {
+            return TransformedTime::AccessDetailsAreEmpty;
+        };
+        let mut trip_counts: Vec<i64> = Vec::with_capacity(time_dim + 1);
+        for &bound in first.time_bounds.iter().take(time_dim + 1) {
+            let Some(steps) = TimeSteps::of(bound) else {
+                return TransformedTime::TimeBoundIsNotAStepCount(bound);
+            };
+            trip_counts.push(steps.trip_count());
+        }
+        if trip_counts.len() != time_dim + 1 {
+            return TransformedTime::TimeDimensionHasNoLoop(time_dim);
+        }
+        let ivs: Vec<Val> = trip_counts.iter().map(|_| vals.mint()).collect();
+
+        // `updateTimeSetForExplicitDims(explicit_loop_dim, time_order_, time_set_)` — IN PLACE, so
+        // the new mem op below is cloned with the narrowed set.
+        let mut explicit_dims: Vec<(AffineExpr, u32)> = Vec::with_capacity(time_dim + 1);
+        for dim in 0..=time_dim {
+            let Some(result) = time_order.results.get(dim) else {
+                return TransformedTime::TimeOrderHasNoDimension(dim);
+            };
+            let Some(position) = time_order.dim_position(dim) else {
+                return TransformedTime::TimeOrderIsNotAPermutation(dim);
+            };
+            explicit_dims.push((result.clone(), position));
+        }
+        let time_set = update_time_set_for_explicit_dims(&explicit_dims, &time_set, &time_order);
+        self.time_set = Some(time_set.clone());
+
+        for (i, map_time) in subscripts_map_time.iter().enumerate() {
+            let info = &mut self.base.tpmv_info[i];
+            let num_orig_dims = info.subscripts_map.dims as usize;
+            let Some((subscripts_map, indices)) =
+                update_subscripts_and_indices_for_explicit_time_loops(
+                    &ivs,
+                    time_dim,
+                    num_orig_dims,
+                    map_time,
+                    &info.indices,
+                )
+            else {
+                return TransformedTime::TimeDimensionHasNoLoop(time_dim);
+            };
+            info.subscripts_map = subscripts_map;
+            info.indices = indices;
+        }
+
+        // "Replace mem_ops_ with an updated one that reflects the time dims being removed." — the
+        // FIRST operand with a paged view, whatever its `mem_index_`.
+        let Some(paged_idx) = self
+            .base
+            .tpmv_info
+            .iter()
+            .position(|info| info.paged_mem_view.is_some())
+        else {
+            return TransformedTime::NoOperandHasAPagedView;
+        };
+        let info = &self.base.tpmv_info[paged_idx];
+        let Some(handle) = info.paged_mem_view else {
+            return TransformedTime::NoOperandHasAPagedView;
+        };
+        let created = create_new_composite_mem_op(
+            vals,
+            self.base.mem_ops[0],
+            info,
+            handle.view.result,
+            &info.subscripts_map,
+            &info.indices,
+            time_set,
+            scope,
+        );
+        let NewCompositeMemOp::Created(ops) = created else {
+            return TransformedTime::MemOpHasNoCompositeClass;
+        };
+
+        // `mem_ops_[0]->erase(); mem_ops_[0] = new_mem_op;` — the erase is the caller's, as
+        // [`TpmvBase`] records; the new op goes in the innermost body the builder was pointing at.
+        TransformedTime::ExplicitLoops(ExplicitTimeNest {
+            nest: nest_explicit_time_loops_over(ops, &ivs, &trip_counts),
+            ivs,
+        })
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 326/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT `initialize_time` DID — the two `emitError`s (`:1103`, `:1110`) plus the `DT_CHECK`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeTimeInit {
+    /// `access_details_`, `time_order_`, `time_set_` and `tpmv_comp_info_` are all set.
+    Initialized,
+    /// `DT_CHECK(mem_ops_.size() == 1)` and `DT_CHECK(op)` on the `dyn_cast<agen::CompositeLoadOp>`.
+    MemOpIsNotACompositeLoad,
+    /// `emplace_insert` on a slot already taken — see [`VacantSlot`].
+    AccessSlotUnavailable(MemoryOperandIndex),
+    /// `"Unable to construct details"`.
+    DetailsNotConstructed(ConstructedDetails),
+    /// `"Unable to construct time step info"`.
+    TimeStepsNotConstructed(TimeStepsInfo),
+}
+
+impl<'p> TpmvCompositeLoad<'p> {
+    /// Replaces: e326_initialize_time
+    ///
+    /// **326/384** `TPMVCompositeLoad::initialize_time` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095` (23L).
+    ///
+    /// ⛔ THE TIME STEPS ARE BUILT WITHOUT COALESCING AND WITHOUT BURST/IL CALCS (`:1107-1108`): entry
+    /// 325 needs `time_bounds_` as the op wrote them, and a coalesced dimension carries
+    /// [`TimeBound::Coalesced`] where [`TimeSteps`] needs a count. ⛔ AND IT STOPS AT THE FIRST
+    /// REFUSAL, unlike `MutableAddrSplitting`'s composite prologue, which runs both and reports the
+    /// first (`MutableAddrSplitting.cpp:459-465`).
+    /// ⚠️ `time_set_` is the op's, and entry 325 narrows it in place once loops become explicit.
+    pub fn initialize_time(&mut self, scope: &'p [DfirOp]) -> CompositeTimeInit {
+        // `DT_CHECK(mem_ops_.size() == 1); auto op = dyn_cast<agen::CompositeLoadOp>(mem_ops_[0]);`
+        let comp = &mut self.composite;
+        let [DfirOp::Agen(agen_op)] = comp.base.mem_ops[..] else {
+            return CompositeTimeInit::MemOpIsNotACompositeLoad;
+        };
+        let agen::Op::CompositeLoad(access) = agen_op else {
+            return CompositeTimeInit::MemOpIsNotACompositeLoad;
+        };
+
+        // `access_details_.emplace_insert(kDirSrc, op, comp_)` — a composite load reads, so its one
+        // operand is the source however the view is paged.
+        let moi = MemoryOperandIndex::DirSrc;
+        let Some(slot) = comp.access_details.vacancy(moi) else {
+            return CompositeTimeInit::AccessSlotUnavailable(moi);
+        };
+        let ad = slot.emplace_insert(AccessDetailsAffineComposite::new(agen_op, comp.base.comp));
+        let details = ad.construct_details(moi, scope);
+        if details != ConstructedDetails::Complete {
+            return CompositeTimeInit::DetailsNotConstructed(details);
+        }
+
+        // "Construct the time steps info without coalescing and without burst/IL calcs."
+        let steps = construct_time_steps_info(&mut comp.access_details, false, false, scope);
+        if !steps.constructed() {
+            return CompositeTimeInit::TimeStepsNotConstructed(steps);
+        }
+
+        comp.time_order = Some(access.time_order.clone());
+        comp.time_set = Some(access.time_set.clone());
+        // `tpmv_comp_info_.emplace_back(op.getTimeAddrMap(), access_details_[0])`.
+        comp.tpmv_comp_info.push(TpmvCompositeInfo {
+            time_addr_map: access.time_addr_map.clone(),
+            access_details: moi,
+        });
+
+        CompositeTimeInit::Initialized
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e324_analyzeAndConstructValidPages
-// crustify:todo: e325_transform_time
-// crustify:todo: e326_initialize_time
 // crustify:todo: e356_transform
 // crustify:todo: e373_run

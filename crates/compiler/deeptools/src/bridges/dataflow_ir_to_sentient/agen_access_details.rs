@@ -1717,6 +1717,10 @@ impl<'a> AccessDetailsBase<'a> {
             agen::Op::VectorLoad { result, .. } | agen::Op::IndirectVectorLoad { result, .. } => {
                 uses(*result, scope)
             }
+            // `:212-214` — a `composite_load` IS in the gate, and it walks the LOAD INDUCTION
+            // VARIABLE's users rather than a result: a composite load binds no top-level SSA value.
+            // The scope is its own region, which is the only place a region argument can be read.
+            agen::Op::CompositeLoad(access) => uses(access.load_iv, &access.body),
             // ⛔ A SYMBOLIC ACCESS HAS NO USER WALK. The gate is
             // `isa<VectorLoadOp, IndirectVectorLoadOp, CompositeLoadOp, CompositeIndirectLoadOp>`
             // (`:207-208`) and the symbolic pair is in none of it, so a symbolic load's users never
@@ -1726,6 +1730,7 @@ impl<'a> AccessDetailsBase<'a> {
             | agen::Op::VectorStore { .. }
             | agen::Op::IndirectVectorStore { .. }
             | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoadAndStore(_)
             // ⛔ AND NEITHER IS THE INTERLEAVE OR THE MASK STATE: one holds transfers rather than
             // being one, the other writes a unit's mask state and loads no vector at all.
             | agen::Op::CompositeMemoryInterleave { .. }
@@ -2056,7 +2061,9 @@ impl<'a> AccessDetailsAffine<'a> {
             // does not.
             agen::Op::SymbolicVectorLoad { .. }
             | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::CompositeLoad(_)
             | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoadAndStore(_)
             | agen::Op::CompositeMemoryInterleave { .. }
             | agen::Op::SetTransferMaskState { .. }
             | agen::Op::Yield => {
@@ -2262,6 +2269,20 @@ impl<'a> AccessDetailsAffine<'a> {
         // Memory index is used to identify src/dest in composite_load_and_store.
         self.base.set_memory_index(memory_index);
         let initialized = self.initialize(scope);
+        self.construct_details_after_initialize(initialized, scope)
+    }
+
+    /// THE SIX STEPS `constructDetails` RUNS AFTER THE VIRTUAL `initialize()`
+    /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:422-437`).
+    ///
+    /// ⭐ SPLIT OUT BECAUSE `initialize()` IS VIRTUAL AND THE REST IS NOT.
+    /// [`AccessDetailsAffineComposite::initialize`] overrides it (`:442`), so a composite reaches
+    /// these same six steps through this entry rather than through a second copy of them.
+    pub fn construct_details_after_initialize(
+        &mut self,
+        initialized: AffineInitialize,
+        scope: &[DfirOp],
+    ) -> ConstructedDetails {
         if !initialized.admissible() {
             return ConstructedDetails::NotInitialized(initialized);
         }
@@ -2565,6 +2586,175 @@ impl<'a> AccessDetailsAffineComposite<'a> {
         }
     }
 
+    /// THE COMPOSITE OVERRIDE OF `initialize` — `AccessDetails.cpp:442-620`.
+    ///
+    /// ⛔ NOT ONE OF THE 384, AND ITS ABSENCE WAS LOAD-BEARING. `MutableAddrSplitting`'s two
+    /// composite splitters call `constructDetails` on a composite op, which dispatches here;
+    /// [`AccessDetailsAffine::initialize`] answers [`AffineInitialize::UnsupportedOperation`] for
+    /// one, so routing them through the base would have made both ports dead code. Only the two
+    /// composite classes the island declares are covered — the other four `dyn_cast` arms
+    /// (`:447-517`) have no island op.
+    ///
+    /// ⭐ TIME IS SET ONCE PER OP AND THE ADDRESS MAP ONCE PER OPERAND (`:519-522` vs `:532`/`:543`).
+    /// `setTimeSymbols` is the empty list the island's transfers carry.
+    pub fn initialize(&mut self, scope: &[DfirOp]) -> AffineInitialize {
+        let Some(memory_index) = self.affine.base.memory_index else {
+            return AffineInitialize::MemoryIndexUnset;
+        };
+        let op = self.affine.base.op;
+        // ⛔ AN ABSENT INDIRECT SIDE IS AN UNRESOLVED VIEW, NOT AN UNSUPPORTED OP: `:585` reads
+        // `getIndirectSrcMemref()` unconditionally, so a missing operand reaches
+        // `initializeMemViewInfo` as a null `mem_ref_` and fails there. The container only ever
+        // seats an index whose operand is present, so neither arm is reachable.
+        let (view, view_ty, indices, transfer_set, transfer_order, time_addr_map) = match op {
+            agen::Op::CompositeLoadAndStore(transfer) => {
+                self.time_set = Some(transfer.time_set.clone());
+                self.time_order = Some(transfer.time_order.clone());
+                self.set_time_symbols(&transfer.time_symbols);
+                self.affine
+                    .base
+                    .set_expected_total_elements(Elements(transfer.load_iv_ty.len));
+                match memory_index {
+                    MemoryOperandIndex::DirSrc => (
+                        transfer.src,
+                        &transfer.src_ty,
+                        transfer.src_indices.as_slice(),
+                        transfer.load_set.clone(),
+                        transfer.load_order.clone(),
+                        transfer.load_time_addr_map.clone(),
+                    ),
+                    // ⛔ THE REFERENCE'S `else` IS EVERY OTHER INDEX (`:535`), not just `kDirDst`.
+                    MemoryOperandIndex::DirDst
+                    | MemoryOperandIndex::IndSrc
+                    | MemoryOperandIndex::IndDst => (
+                        transfer.dst,
+                        &transfer.dst_ty,
+                        transfer.dst_indices.as_slice(),
+                        transfer.store_set.clone(),
+                        transfer.store_order.clone(),
+                        transfer.store_time_addr_map.clone(),
+                    ),
+                }
+            }
+            agen::Op::CompositeIndirectLoadAndStore(transfer) => {
+                self.time_set = Some(transfer.time_set.clone());
+                self.time_order = Some(transfer.time_order.clone());
+                self.set_time_symbols(&transfer.time_symbols);
+                self.affine
+                    .base
+                    .set_expected_total_elements(Elements(transfer.load_iv_ty.len));
+                // `(kIndSrc, kDirSrc, kDirDst)` is a gather, `(kDirSrc, kIndDst, kDirDst)` a
+                // scatter (`:555-556`) — the load side's maps for a src, the store side's for a dst.
+                match memory_index {
+                    MemoryOperandIndex::DirSrc => (
+                        transfer.direct_src,
+                        &transfer.direct_src_ty,
+                        transfer.direct_src_indices.as_slice(),
+                        transfer.load_set.clone(),
+                        transfer.load_order.clone(),
+                        transfer.load_direct_time_addr_map.clone(),
+                    ),
+                    MemoryOperandIndex::DirDst => (
+                        transfer.direct_dst,
+                        &transfer.direct_dst_ty,
+                        transfer.direct_dst_indices.as_slice(),
+                        transfer.store_set.clone(),
+                        transfer.store_order.clone(),
+                        transfer.store_direct_time_addr_map.clone(),
+                    ),
+                    MemoryOperandIndex::IndSrc => {
+                        let (Some(side), Some(map)) = (
+                            transfer.indirect_src.as_ref(),
+                            transfer.load_indirect_time_addr_map.clone(),
+                        ) else {
+                            return AffineInitialize::MemoryViewUnresolved;
+                        };
+                        (
+                            side.view,
+                            &side.ty,
+                            side.indices.as_slice(),
+                            transfer.load_set.clone(),
+                            transfer.load_order.clone(),
+                            map,
+                        )
+                    }
+                    MemoryOperandIndex::IndDst => {
+                        let (Some(side), Some(map)) = (
+                            transfer.indirect_dst.as_ref(),
+                            transfer.store_indirect_time_addr_map.clone(),
+                        ) else {
+                            return AffineInitialize::MemoryViewUnresolved;
+                        };
+                        (
+                            side.view,
+                            &side.ty,
+                            side.indices.as_slice(),
+                            transfer.store_set.clone(),
+                            transfer.store_order.clone(),
+                            map,
+                        )
+                    }
+                }
+            }
+            // `:448-462` — ⛔ A BARE `composite_load` IGNORES THE MEMORY INDEX: one memref, the LOAD
+            // side's set and order whichever index is seated, and no side to choose between.
+            agen::Op::CompositeLoad(access) => {
+                self.time_set = Some(access.time_set.clone());
+                self.time_order = Some(access.time_order.clone());
+                self.set_time_symbols(&access.time_symbols);
+                self.affine
+                    .base
+                    .set_expected_total_elements(Elements(access.load_iv_ty.len));
+                (
+                    access.view,
+                    &access.view_ty,
+                    access.indices.as_slice(),
+                    access.load_set.clone(),
+                    access.load_order.clone(),
+                    access.time_addr_map.clone(),
+                )
+            }
+            // `else { return op->emitError("unsupported operation"); }` (`:617`).
+            agen::Op::VectorLoad { .. }
+            | agen::Op::VectorStore { .. }
+            | agen::Op::IndirectVectorLoad { .. }
+            | agen::Op::IndirectVectorStore { .. }
+            | agen::Op::SymbolicVectorLoad { .. }
+            | agen::Op::SymbolicVectorStore { .. }
+            | agen::Op::CompositeMemoryInterleave { .. }
+            | agen::Op::SetTransferMaskState { .. }
+            | agen::Op::Yield => return AffineInitialize::UnsupportedOperation,
+        };
+        let (subscripts_map, map_indices) = access_map(indices);
+        self.affine.base.mem_ref = Some(view);
+        self.affine.base.set_transfer_set(transfer_set);
+        self.affine.base.set_transfer_order(transfer_order);
+        self.affine.set_subscripts_map(subscripts_map);
+        self.affine
+            .base
+            .set_element_width(Bits(view_ty.elem.bits()));
+        self.set_time_addr_map(time_addr_map);
+        self.affine.base.set_indices(&map_indices);
+
+        let Some(source) = MemViewSource::of(view, scope) else {
+            return AffineInitialize::MemoryViewUnresolved;
+        };
+        self.affine.base.initialize_mem_view_info(source);
+        AffineInitialize::Initialized
+    }
+
+    /// `constructDetails` ON A COMPOSITE — entry 265's six steps over the override above.
+    pub fn construct_details(
+        &mut self,
+        memory_index: MemoryOperandIndex,
+        scope: &[DfirOp],
+    ) -> ConstructedDetails {
+        self.affine.base.set_memory_index(memory_index);
+        let initialized = self.initialize(scope);
+        self.affine
+            .construct_details_after_initialize(initialized, scope)
+    }
+
     /// Replaces: e020_setTimeAddrMap
     ///
     /// **`setTimeAddrMap`** — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286-288` (3L).
@@ -2607,16 +2797,14 @@ impl<'a> AccessDetailsAffineComposite<'a> {
     /// `kDirSrc` branch (`AccessDetails.cpp:519-521`), unlike
     /// [`set_time_addr_map`](Self::set_time_addr_map).
     ///
-    /// ⛔⛔ OUR ISLAND CANNOT YET PRODUCE A NON-EMPTY RANGE, AND THAT IS A FACT ABOUT THE ISLAND, NOT
-    /// A REASON TO SKIP THE SETTER. `agen.composite_load_and_store` prints its time symbols as a
-    /// literal empty `time_symbols()` in this crate's emitter, and all eighteen
-    /// `tests/sentient_corpus/*.dfir.mlir` files agree. The reason is structural: the only consumer
-    /// is `calculateTimeBounds`, which consults a symbol solely for a dimension whose bound is
-    /// symbolic (`dialect_utils/Agen/Utils.cpp:216-256`), and
-    /// [`IntegerSet`](crate::islands::dataflow_ir::ty::IntegerSet) here has a dimension count and no
-    /// symbol count at all — so no set we can build has a symbolic bound to resolve. The field is
-    /// ported faithfully and the island is deliberately NOT widened, because widening it would add a
-    /// symbol operand that nothing in this crate can populate. Reported to the orchestrator.
+    /// ⛔⛔ SUPERSEDED CLAIM, KEPT AS A WARNING: this doc used to argue the island could not produce
+    /// a non-empty range, on the reading that no [`IntegerSet`](crate::islands::dataflow_ir::ty::IntegerSet)
+    /// here carries symbols. It carries a `symbols` count, and the vendor's own key needs one —
+    /// `time_symbols(%c3)` against `-d0 + s0 - 1 >= 0`
+    /// (`mutable_addr_splitting_time_dims.mlir:130`, `:136`). All three composite ops now hold the
+    /// operand list, and without it `calculateTimeBounds` answers
+    /// [`TimeStepsInfo::NonConstantTimeSymbol`] on every transfer whose time bound is symbolic —
+    /// which is what entries 321 and 322 split.
     pub fn set_time_symbols(&mut self, time_symbols: &[Val]) {
         self.time_symbols = time_symbols.to_vec();
     }
@@ -3583,6 +3771,7 @@ mod unit_tests {
             load_order: planned.load_order,
             store_set: planned.store_set,
             store_order: planned.store_order,
+            time_symbols: Vec::new(),
             time_set: planned.time_set,
             time_order: planned.time_order,
             load_time_addr_map: planned.load_time_addr_map,

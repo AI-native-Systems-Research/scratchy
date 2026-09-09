@@ -306,6 +306,19 @@ pub(super) fn fuse_load_or_store_chain_ops<A: Arch>(
             Consumed(1)
         }
 
+        // ── 3. `agen.composite_load` (`AgenToSentient.cpp:90-95`) ───────────────────────────────
+        agen::Op::CompositeLoad(_) => todo!(
+            "e329_lowerCompositeLoadOp: an agen.composite_load on {:?}",
+            unit.on.kind()
+        ),
+
+        // ── 10. `agen.composite_indirect_load_and_store` (`AgenToSentient.cpp:140-146`) ─────────
+        agen::Op::CompositeIndirectLoadAndStore(_) => todo!(
+            "e334_lowerCompositeIndirectLoadAndStoreOp: an agen.composite_indirect_load_and_store \
+             on {:?}",
+            unit.on.kind()
+        ),
+
         // ── 6. `agen.indirect_vector_load` (`AgenToSentient.cpp:109-115`) ───────────────────────
         //
         // ⛔ NO EXTRACT PREDICATE HERE EITHER, and the pairing is why: the gather reads the address
@@ -380,7 +393,9 @@ fn is_candidate(op: &agen::Op) -> bool {
         | agen::Op::VectorStore { .. }
         | agen::Op::IndirectVectorLoad { .. }
         | agen::Op::IndirectVectorStore { .. }
+        | agen::Op::CompositeLoad(_)
         | agen::Op::CompositeLoadAndStore(_)
+        | agen::Op::CompositeIndirectLoadAndStore(_)
         | agen::Op::SymbolicVectorLoad { .. }
         | agen::Op::SymbolicVectorStore { .. } => true,
         agen::Op::CompositeMemoryInterleave { .. }

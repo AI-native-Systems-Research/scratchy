@@ -447,6 +447,7 @@ mod unit_tests {
                 load_order: planned.load_order,
                 store_set: planned.store_set,
                 store_order: planned.store_order,
+                time_symbols: Vec::new(),
                 time_set: planned.time_set,
                 time_order: planned.time_order,
                 load_time_addr_map: planned.load_time_addr_map,
