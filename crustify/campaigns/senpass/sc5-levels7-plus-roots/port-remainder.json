@@ -36,51 +36,6 @@
         "types": [],
         "symbols": [
          {
-          "name": "e007_isPartOfSomeChain",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e010_updateVariableOffsetCalculation",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e011_getOffset",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e012_getOffset",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e013_getOffset",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e014_dump",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e273_isHeadOfChain",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e276_updateImmutableAddr",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e277_updateVariableOffsetCalculation",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e417_isHeadOfLoopingChain",
           "defined_in": "crustify-senpass/cpp/sentient.cpp",
           "scope": "port"
@@ -345,16 +300,6 @@
         "types": [],
         "symbols": [
          {
-          "name": "e107_hasUniformizeRegion",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e108_removeInitAttrFromOps",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e327_calcSSAWeight",
           "defined_in": "crustify-senpass/cpp/sentient.cpp",
           "scope": "port"
@@ -505,21 +450,6 @@
         "types": [],
         "symbols": [
          {
-          "name": "e263_getToggleDescriptor",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e264_getToggleDescriptor",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e278_isValid",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e638_update",
           "defined_in": "crustify-senpass/cpp/sentient.cpp",
           "scope": "port"
@@ -608,11 +538,6 @@
         "types": [],
         "symbols": [
          {
-          "name": "e252_size",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
           "name": "e642_rollInstrsInBlock",
           "defined_in": "crustify-senpass/cpp/sentient.cpp",
           "scope": "port"
@@ -645,36 +570,6 @@
        "deps": {
         "types": [],
         "symbols": [
-         {
-          "name": "e252_size",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e258_isToggle",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e259_isConditionalConstant",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e260_isIntegerSequence",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e278_isValid",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e279_canBeSimplified",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
          {
           "name": "e488_computeOrGetNumberOfStreams",
           "defined_in": "crustify-senpass/cpp/sentient.cpp",
@@ -799,21 +694,6 @@
        "deps": {
         "types": [],
         "symbols": [
-         {
-          "name": "e014_dump",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e221_initialize",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
-         {
-          "name": "e252_size",
-          "defined_in": "crustify-senpass/cpp/sentient.cpp",
-          "scope": "port"
-         },
          {
           "name": "e419_turnHBMConstantOpAddrsToQueryMapsInUniformRegions",
           "defined_in": "crustify-senpass/cpp/sentient.cpp",
