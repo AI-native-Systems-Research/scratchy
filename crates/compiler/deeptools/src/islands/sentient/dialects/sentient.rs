@@ -1130,6 +1130,23 @@ impl CmpPredicate {
         }
     }
 
+    /// THE PREDICATE THAT HOLDS EXACTLY WHEN `self` DOES NOT — `!(a P b)` is `a P.negated() b`.
+    ///
+    /// ⛔ TOTAL OVER ALL SIX, SO THE REFERENCE'S `llvm_unreachable` IS UNWRITABLE — the same reason
+    /// [`CmpPredicate::reversed`] has none. Campaign unit `e244_negatePredicate`
+    /// (`dcc/src/Transform/Sentient/Utils.cpp:431`) delegates here.
+    #[must_use]
+    pub const fn negated(self) -> CmpPredicate {
+        match self {
+            Self::Eq => Self::Ne,
+            Self::Ne => Self::Eq,
+            Self::Slt => Self::Sge,
+            Self::Sle => Self::Sgt,
+            Self::Sgt => Self::Sle,
+            Self::Sge => Self::Slt,
+        }
+    }
+
     /// THE PREDICATE THAT HOLDS WITH THE OPERANDS SWAPPED — `a P b` iff `b P.reversed() a`.
     ///
     /// ⛔ TOTAL OVER ALL SIX, SO THE REFERENCE'S `llvm_unreachable` IS UNWRITABLE.

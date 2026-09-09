@@ -104,6 +104,7 @@ use std::fmt::Write as _;
 use crate::formats::Bits;
 use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient};
 use crate::islands::sentient::print;
+use crate::transform::sentient::utils::{self, Hoisted, NewUse, OpAt};
 use crate::units::{Core, DfirUnit};
 
 /// `RegisterLocales` (`:83-97`) IS THE ISLAND'S [`sentient::RegType`], not a second enum.
@@ -285,25 +286,36 @@ impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {
     }
 }
 
+/// WHERE A `sentient.scalar_copy` SITS IN ITS PROGRAM UNIT — [`CopyOp`]'s `isa` check carried on the
+/// [`OpAt`] that [`utils::move_to_common_dominator`] moves by.
+#[derive(Debug, Clone)]
+pub(crate) struct CopyAt(OpAt);
+
+impl CopyAt {
+    /// The witness, or `None` when `at` names no op or names some other op.
+    #[must_use]
+    pub(crate) fn of(at: OpAt, unit_body: &[Op]) -> Option<CopyAt> {
+        CopyOp::of(at.op(unit_body)?).map(|_| CopyAt(at))
+    }
+}
+
 /// Replaces: e140_moveToCommonDominator
 ///
 /// Hoists a `scalar_copy` until it dominates `new_use`, failing when the common dominator would leave
 /// the program unit.
 ///
-/// ⛔ BOTH `DT_CHECK_MSG`s ARE THE SIGNATURE: [`CopyOp`] is `isa<sentient::CopyOp>(op)` and two
+/// ⛔ BOTH `DT_CHECK_MSG`s ARE THE SIGNATURE: [`CopyAt`] is `isa<sentient::CopyOp>(op)` and two
 /// references are `op && new_use`. What is left of the body is the delegation.
 /// ⛔ TRAP: `dcc::utils::moveToCommonDominator` IS THIS CAMPAIGN'S e241
 /// (`dcc/src/Transform/Sentient/Utils.cpp:84`, homed in `transform/sentient/utils`), and the scheduler
-/// did not record the edge — the call is namespace-qualified rather than a member call. It is not
-/// ported yet, so the only honest body is the one below; e241 also owns the success/failure type.
-pub(crate) fn move_to_common_dominator(copy: CopyOp<'_>, new_use: &Op) -> ! {
-    let _ = (copy, new_use);
-    todo!(
-        "moveToCommonDominator (senpass e241, transform/sentient/utils) is not ported yet — the \
-         `DominanceInfo` walk, the `sentient.nop` insert points and the operand-rehoisting worklist \
-         (Transform/Sentient/Utils.cpp:84-154) are what this delegates to \
-         (RegisterTypeAssignment.cpp:252)"
-    )
+/// did not record the edge — the call is namespace-qualified rather than a member call. e241 also owns
+/// the success/failure type.
+pub(crate) fn move_to_common_dominator(
+    unit_body: &mut Vec<Op>,
+    copy: CopyAt,
+    new_use: &NewUse,
+) -> Hoisted {
+    utils::move_to_common_dominator(unit_body, &copy.0, new_use)
 }
 
 impl<const ADD_SCALAR_COPIES: bool> RegisterTypeAssignment<ADD_SCALAR_COPIES> {

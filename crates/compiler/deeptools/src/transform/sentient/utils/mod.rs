@@ -100,48 +100,675 @@
 // clippy with `-D warnings`, so without this the first ported leaf fails the gate.
 // ⭐ REMOVE THIS WITH THE FIRST CONSUMER: at that point an unused item here is a real defect again.
 
+use core::num::{NonZeroU32, NonZeroU64};
+
+use super::analyses::{UnitIndex, UnitIndexMap};
 use super::register_packing::constant_target_values;
 use super::scalar_op_merging_and_hoisting::{ScalarOpComp, compute_address_scale};
+use super::{ForRef, IterArgIndex};
 use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
 use sys_arch_spec::fields::{self, ImmSpec, ImmWidth, Sign};
 use crate::islands::sentient::dialects::sentient as ops;
-use crate::islands::sentient::dialects::{Definitions, Op, Val, uniform};
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, dataflow, operands, regions_mut, regions_ref, results, sentient, symbol,
+    uniform, use_count,
+};
 
 pub(crate) mod units_and_their_values;
 
+/// A POSITION IN ONE BLOCK — what `int op_num` indexes and what every `(op, region)` step of an
+/// [`OpAt`] is expressed in.
+///
+/// ⛔ `usize`, SO A NEGATIVE `op_num` IS INEXPRESSIBLE: `while (op_num > 0)` (`:33`) treats every
+/// negative as zero and hands back the FIRST op of the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InBlock(pub usize);
 
-// crustify:todo: e239_getOperationOfBlock
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:31  (8 body lines, level 0)
-//   original  : Operation &getOperationOfBlock(Block &block, int op_num)
+/// Replaces: e239_getOperationOfBlock
+///
+/// The op at position `op_num` of `block` — `std::next(block.getOperations().begin(), op_num)`
+/// (`:31-38`).
+///
+/// ⛔ TRAP: THE REFERENCE WALKS PAST THE END and dereferences the list sentinel. Every call site
+/// derives `op_num` from a scan of the very block it then indexes
+/// (`LiveRangeReduction.cpp:1039`, `:1076`, `:1180`), so `None` names that unreachable case.
+#[must_use]
+pub fn operation_of_block(block: &[Op], op_num: InBlock) -> Option<&Op> {
+    block.get(op_num.0)
+}
 
-// crustify:todo: e240_selectIndicesForUnits
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:66  (15 body lines, level 0)
-//   original  : void selectIndicesForUnits( SmallVector<Value> &units, SmallVector<unsigned> &indices, std::unordered_map<std::string, unsigned> unit_name_to_index_map)
+/// Replaces: e240_selectIndicesForUnits
+///
+/// Flattens every `dataflow.create_group` in `units` to its members and appends each surviving
+/// unit's index to `indices` (`:66-80`).
+///
+/// ⛔ TRAP: `units` COMES BACK REVERSED — the walk is a LIFO pop-back that pushes onto
+/// `cleaned_units` in pop order, and a group's members go onto the same stack, so nested groups
+/// expand transitively and in reverse.
+/// ⛔ TRAP: `indices` IS APPENDED TO, NOT CLEARED — the caller's earlier entries survive.
+pub fn select_indices_for_units(
+    units: &mut Vec<Val>,
+    indices: &mut Vec<UnitIndex>,
+    map: &impl UnitIndexMap,
+    defs: Definitions<'_>,
+) {
+    let mut cleaned = Vec::new();
+    while let Some(unit) = units.pop() {
+        if let Some(Op::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) = defs.of(unit) {
+            units.extend(unit_ids.iter().copied());
+            continue;
+        }
+        cleaned.push(unit);
+        indices.push(map.index_of(unit));
+    }
+    *units = cleaned;
+}
 
-// crustify:todo: e241_moveToCommonDominator
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:84  (71 body lines, level 0)
-//   original  : mlir::LogicalResult moveToCommonDominator(Operation *op, Operation *new_use)
+/// WHERE ONE OP SITS INSIDE A `dataflow.program_unit` BODY — the `(op, region)` steps that open each
+/// enclosing block, outermost first, then its own position in the innermost one.
+///
+/// ⭐⭐ THIS IS THE WHOLE OF WHAT `DominanceInfo` (`:86`) ANSWERS HERE, AND THAT IS PROVABLE: every
+/// region of this island holds exactly one block, so `dominates(a, b)` reduces to *a's block
+/// encloses b's, and a comes no later than b's ancestor in it* — see [`OpAt::dominates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpAt {
+    /// One `(position of the enclosing op, which of its regions)` step per level, outermost first.
+    enclosing: Vec<(InBlock, usize)>,
+    /// The position in the block those steps open.
+    index: InBlock,
+}
 
-// crustify:todo: e242_getForLoopInfoIfIV
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:156  (37 body lines, level 0)
-//   original  : std::tuple<Operation *, int64_t, int64_t, int64_t, int64_t> getForLoopInfoIfIV( Value val, bool allow_normalized_iv)
+impl OpAt {
+    /// An op at `index` of the block `enclosing` opens.
+    #[must_use]
+    pub fn at(enclosing: &[(InBlock, usize)], index: InBlock) -> OpAt {
+        OpAt {
+            enclosing: enclosing.to_vec(),
+            index,
+        }
+    }
 
-// crustify:todo: e243_roundDownUnrollFactor
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:397  (32 body lines, level 0)
-//   original  : unsigned roundDownUnrollFactor(unsigned n, Operation *compute_op, SenTargets sen_target)
+    /// An op at `index` of the program-unit body itself.
+    #[must_use]
+    pub fn top(index: InBlock) -> OpAt {
+        OpAt {
+            enclosing: Vec::new(),
+            index,
+        }
+    }
 
-// crustify:todo: e244_negatePredicate
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:431  (18 body lines, level 0)
-//   original  : CmpIPredicate negatePredicate(CmpIPredicate pred)
+    /// `Operation::getParentOp()`, and `None` when that parent is the `dataflow.program_unit` — which
+    /// is the `dyn_cast<dataflow::ProgramUnitOp>` arm at `:91`.
+    #[must_use]
+    pub fn parent(&self) -> Option<OpAt> {
+        let (index, _) = *self.enclosing.last()?;
+        Some(OpAt {
+            enclosing: self.enclosing[..self.enclosing.len() - 1].to_vec(),
+            index,
+        })
+    }
 
-// crustify:todo: e245_reversePredicate
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:450  (18 body lines, level 0)
-//   original  : CmpIPredicate reversePredicate(CmpIPredicate pred)
+    /// The op this path names.
+    #[must_use]
+    pub fn op<'a>(&self, unit_body: &'a [Op]) -> Option<&'a Op> {
+        block_of(unit_body, &self.enclosing)?.get(self.index.0)
+    }
 
-// crustify:todo: e246_getOutermostConstInitialization
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:469  (55 body lines, level 0)
-//   original  : std::tuple<mlir::sentient::ForOp, int, int> getOutermostConstInitialization( BlockArgument iter_arg)
+    /// `DominanceInfo::dominates(self, other)` for two ops of one program unit — reflexive, as MLIR's
+    /// `dominates(Operation *, Operation *)` is.
+    #[must_use]
+    pub fn dominates(&self, other: &OpAt) -> bool {
+        let depth = self.enclosing.len();
+        depth <= other.enclosing.len()
+            && self.enclosing[..] == other.enclosing[..depth]
+            && if depth == other.enclosing.len() {
+                self.index <= other.index
+            } else {
+                self.index <= other.enclosing[depth].0
+            }
+    }
+}
+
+/// WHERE THE NEW USE IS — `new_use`, which the reference only ever asks `DominanceInfo` about.
+///
+/// ⛔⛔ [`NewUse::OtherUnit`] IS THE ONLY WAY `failure()` HAPPENS, AND THAT IS PROVED: the nop the
+/// `ProgramUnitOp` arm inserts sits at position 0 of the unit body and therefore dominates every op
+/// in it, so `!dom_info.dominates(insert_point, new_use)` at `:99` can hold only when `new_use` lies
+/// outside the unit — which is exactly the comment the reference puts on that line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewUse {
+    /// Inside the same `dataflow.program_unit`, at this path.
+    SameUnit(OpAt),
+    /// Outside it.
+    OtherUnit,
+}
+
+/// `mlir::LogicalResult` FROM A HOIST — the one `failure()` at `:100` and `success()` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Hoisted {
+    /// `success()` — `op` now dominates `new_use`.
+    Done,
+    /// `failure()` — the common dominator would be outside the program unit.
+    OutsideProgramUnit,
+}
+
+/// Replaces: e241_moveToCommonDominator
+///
+/// Climbs out of the enclosing regions until the insert point dominates `new_use`, rehoists every
+/// operand definition that would stop dominating it, then moves `op` there (`:84-154`).
+///
+/// ⭐ THE DUMMY `sentient.nop` IS DROPPED POSITIONING MECHANISM, erased again at `:153`; [`NewUse`]
+/// records why an insert POSITION still reaches the one `failure()`.
+/// ⭐ `op` MOVES FIRST HERE AND LAST THERE (`:152`) — it changes no verdict below, because every
+/// operand of `op` is defined outside `op` and the removal is in a strictly nested block.
+pub fn move_to_common_dominator(unit_body: &mut Vec<Op>, op: &OpAt, new_use: &NewUse) -> Hoisted {
+    let mut point = op.clone();
+    loop {
+        if dominates_use(&point, new_use) {
+            break;
+        }
+        match point.parent() {
+            Some(parent) => {
+                // ⚠️ ISLAND GAP, NOT A CHOICE: this arm (`:105-129`) cannot fire, because
+                // `uniform::LocalRegion::body` holds ops of the rung BELOW and no op of this island
+                // is ever nested in a `uniform.uniformize_regions`. The sentient-rung op that would
+                // change that is the extension `e444_analyze`/`e505_transform` already need — see
+                // `transform/sentient/local_region_splitting_for_value_commoning/local_region.rs`.
+                if let Some(Op::Uniform(uniform::Op::UniformizeRegions { .. })) =
+                    parent.op(unit_body)
+                    && !promotes_above_uniform_region(op, unit_body)
+                {
+                    todo!(
+                        "dcc::uniform::utils::getRegionOpAndIndex (dcc/src/Dialect/Uniform/Utils.cpp:343) — \
+                         a sentient-rung uniform.uniformize_regions is the island extension this arm \
+                         needs (Transform/Sentient/Utils.cpp:117-127)"
+                    )
+                }
+                point = parent;
+            }
+            None => {
+                // The nop the `ProgramUnitOp` arm builds goes at the front of the unit body, and
+                // `break` because the climb cannot go farther than the unit (`:91-103`).
+                point = OpAt::top(InBlock(0));
+                if !dominates_use(&point, new_use) {
+                    return Hoisted::OutsideProgramUnit;
+                }
+                break;
+            }
+        }
+    }
+    // `if (insert_point == op) return success();` (`:131`)
+    if point == *op {
+        return Hoisted::Done;
+    }
+    let Some(moved) = remove_at(unit_body, op) else {
+        return Hoisted::Done;
+    };
+    let mut worklist = defined_operands(unit_body, &moved);
+    let mut hoisted = 0;
+    while let Some(curr) = worklist.pop() {
+        let Some(curr_at) = path_of(unit_body, curr) else {
+            continue;
+        };
+        if curr_at.dominates(&point) {
+            continue;
+        }
+        let Some(def) = remove_at(unit_body, &curr_at) else {
+            continue;
+        };
+        worklist.extend(defined_operands(unit_body, &def));
+        insert_at(unit_body, &point, def);
+        hoisted += 1;
+    }
+    // The moves left `[m_k, .., m_1, insert_point]`, so `final_insert_point` has drifted by `hoisted`
+    // and `op->moveBefore(final_insert_point)` (`:152`) lands immediately after the last of them.
+    insert_at(
+        unit_body,
+        &OpAt::at(&point.enclosing, InBlock(point.index.0 + hoisted)),
+        moved,
+    );
+    Hoisted::Done
+}
+
+/// `dom_info.dominates(insert_point, new_use)` — see [`NewUse`] for why the second arm is `false`.
+fn dominates_use(point: &OpAt, new_use: &NewUse) -> bool {
+    match new_use {
+        NewUse::SameUnit(at) => point.dominates(at),
+        NewUse::OtherUnit => false,
+    }
+}
+
+/// `llvm::copy_if(op->getOperands(), .., [](Value v) { return v.getDefiningOp(); })` (`:139-140`),
+/// which is also the `DT_CHECK(!isa<BlockArgument>(curr))` at `:145`.
+fn defined_operands(unit_body: &[Op], op: &Op) -> Vec<Val> {
+    operands(op)
+        .into_iter()
+        .filter(|val| path_of(unit_body, *val).is_some())
+        .collect()
+}
+
+/// `promote_above_uniform_region` (`:107-118`) — `op` is a `sentient.scalar_copy` of a
+/// `dataflow.create_multicast_group`, a `sentient.scalar_constant` or a `symbol.create_symbol`.
+fn promotes_above_uniform_region(op: &OpAt, unit_body: &[Op]) -> bool {
+    let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) = op.op(unit_body) else {
+        return false;
+    };
+    let scopes = visible_from(unit_body, op);
+    let defs = Definitions::from_innermost(&scopes);
+    matches!(
+        defs.of(*input),
+        Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { .. }))
+    ) || is_constant(*input, ConstKind::ScalarConstant, defs)
+        || is_constant(*input, ConstKind::CreateSymbol, defs)
+}
+
+/// The blocks an op at `at` can see definitions in, innermost first — MLIR's outward visibility.
+fn visible_from<'a>(unit_body: &'a [Op], at: &OpAt) -> Vec<&'a [Op]> {
+    (0..=at.enclosing.len())
+        .rev()
+        .filter_map(|depth| block_of(unit_body, &at.enclosing[..depth]))
+        .collect()
+}
+
+/// The block `enclosing` opens, borrowed.
+fn block_of<'a>(unit_body: &'a [Op], enclosing: &[(InBlock, usize)]) -> Option<&'a [Op]> {
+    match enclosing.split_first() {
+        None => Some(unit_body),
+        Some((&(InBlock(index), region), rest)) => {
+            let inner = *regions_ref(unit_body.get(index)?).get(region)?;
+            block_of(inner, rest)
+        }
+    }
+}
+
+/// The block `enclosing` opens, mutably.
+fn block_of_mut<'a>(
+    unit_body: &'a mut Vec<Op>,
+    enclosing: &[(InBlock, usize)],
+) -> Option<&'a mut Vec<Op>> {
+    match enclosing.split_first() {
+        None => Some(unit_body),
+        Some((&(InBlock(index), region), rest)) => {
+            let inner = regions_mut(unit_body.get_mut(index)?)
+                .into_iter()
+                .nth(region)?;
+            block_of_mut(inner, rest)
+        }
+    }
+}
+
+/// WHERE THE OP BINDING `val` SITS — `Value::getDefiningOp()` plus the position the moves index by.
+///
+/// ⭐ THE WHOLE UNIT IS SEARCHED RATHER THAN THE VISIBLE SCOPES, because a [`Val`] is bound once
+/// ([`crate::islands::dataflow_ir::Values`]) and the answer must stay right as ops move between
+/// blocks.
+fn path_of(unit_body: &[Op], val: Val) -> Option<OpAt> {
+    fn walk(block: &[Op], val: Val, enclosing: &mut Vec<(InBlock, usize)>) -> Option<OpAt> {
+        for (index, op) in block.iter().enumerate() {
+            if results(op).contains(&val) {
+                return Some(OpAt::at(enclosing, InBlock(index)));
+            }
+            for (region, inner) in regions_ref(op).into_iter().enumerate() {
+                enclosing.push((InBlock(index), region));
+                let found = walk(inner, val, enclosing);
+                enclosing.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+    walk(unit_body, val, &mut Vec::new())
+}
+
+/// `Operation::remove()` — the first half of a `moveBefore`.
+fn remove_at(unit_body: &mut Vec<Op>, at: &OpAt) -> Option<Op> {
+    let block = block_of_mut(unit_body, &at.enclosing)?;
+    (at.index.0 < block.len()).then(|| block.remove(at.index.0))
+}
+
+/// `Operation::moveBefore(at)` — the second half, `at` naming the op to land in front of.
+fn insert_at(unit_body: &mut Vec<Op>, at: &OpAt, op: Op) {
+    if let Some(block) = block_of_mut(unit_body, &at.enclosing) {
+        let index = at.index.0.min(block.len());
+        block.insert(index, op);
+    }
+}
+
+/// WHICH OP `isConstant<ConstTy>` IS INSTANTIATED FOR (`dcc/src/Utils/Utils.cpp:444-446`); the
+/// `arith::ConstantOp` instantiation has no reader in this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstKind {
+    /// `mlir::sentient::ConstantOp`.
+    ScalarConstant,
+    /// `mlir::symbol::CreateSymbolOp`.
+    CreateSymbol,
+}
+
+impl ConstKind {
+    /// `isa<ConstTy>(op)`.
+    fn matches(self, op: &Op) -> bool {
+        match self {
+            ConstKind::ScalarConstant => {
+                matches!(op, Op::Sentient(sentient::Op::ScalarConstant { .. }))
+            }
+            ConstKind::CreateSymbol => matches!(op, Op::Symbol(symbol::Op::CreateSymbol { .. })),
+        }
+    }
+}
+
+/// `isConstant<ConstTy>` (`dcc/src/Utils/Utils.cpp:423-442`) — the op itself, or a
+/// `uniform.query_map` every value of whose immutable mapping is one.
+fn is_constant(val: Val, kind: ConstKind, defs: Definitions<'_>) -> bool {
+    let Some(def) = defs.of(val) else {
+        return false;
+    };
+    if kind.matches(def) {
+        return true;
+    }
+    match def {
+        Op::Uniform(uniform::Op::QueryMap { map, .. }) => match defs.of(*map) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs
+                .iter()
+                .all(|(_, value)| defs.of(*value).is_some_and(|def| kind.matches(def))),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// WHETHER A NORMALIZED INDUCTION VARIABLE IS ACCEPTED — `allow_normalized_iv`, whose declaration
+/// defaults it to `true` (`Utils.hpp:78`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalizedIv {
+    /// The default: `const - iv` reads as the same loop, ascending.
+    Accepted,
+    /// `MultiDimLoopPeeling.cpp:150` passes `false` — only a bare induction variable counts.
+    Rejected,
+}
+
+/// WHAT A `sentient.for` INDUCTION VARIABLE RESOLVES TO — the reference's five-tuple, whose fields
+/// its own declaration names *"the loop, lower and upper bounds of this (normalized) IV, the step and
+/// the number of iterations"* (`Utils.hpp:60-66`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForLoopInfo {
+    /// The loop, named by its induction variable.
+    pub loop_op: ForRef,
+    /// `std::get<1>` — the lower bound.
+    pub lower_bound: i64,
+    /// `std::get<2>` — the upper bound.
+    pub upper_bound: i64,
+    /// `std::get<3>` — the step.
+    pub step: i64,
+    /// `std::get<4>` — the iteration count, always the loop's own constant bound.
+    pub iterations: i64,
+}
+
+/// Replaces: e242_getForLoopInfoIfIV
+///
+/// The `sentient.for` and bounds `val` names as an induction variable, bare or normalized as
+/// `const - iv`, and `None` for the reference's `{nullptr, 0, 0, 0, 0}` (`:156-192`).
+///
+/// ⛔ TRAP: A BARE `sentient.for` IV COUNTS DOWN — the tuple is `(bound, 1, -1, bound)`, so
+/// `lower_bound` is the HIGH end; only the normalized form is ascending.
+/// ⛔ TRAP: `MultiDimLoopPeeling.cpp:154` DOCUMENTS THE FAILURE TUPLE AS `{nullptr,-1,-1,-1,-1}`
+/// and it is all zeros — nothing reads it, which is why `None` loses nothing.
+#[must_use]
+pub fn for_loop_info_if_iv(
+    val: Val,
+    allow_normalized_iv: NormalizedIv,
+    defs: Definitions<'_>,
+) -> Option<ForLoopInfo> {
+    let (iv_candidate, subtracted_from, val_is_sub_op) = match defs.of(val) {
+        // `isa<BlockArgument>(val)` — nothing in scope binds it (`:163`).
+        None => (val, 0, false),
+        Some(_) if allow_normalized_iv == NormalizedIv::Rejected => return None,
+        Some(Op::Sentient(sentient::Op::ScalarSub { lhs, rhs, .. })) => {
+            let Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) = defs.of(*lhs)
+            else {
+                return None;
+            };
+            (*rhs, *value, true)
+        }
+        Some(_) => return None,
+    };
+    let (for_op, arg_number) = defs.for_arg_of(iv_candidate)?;
+    // `sentient_for_op.getInductionVar() == iv_candidate` — argument 0 is the induction variable.
+    if arg_number != 0 {
+        return None;
+    }
+    // `Sentient For-op can have non-constant bounds.` (`:183`)
+    let Op::Sentient(sentient::Op::For { bound, .. }) = for_op else {
+        return None;
+    };
+    let Some(Op::Sentient(sentient::Op::ScalarConstant { value: bound, .. })) = defs.of(*bound)
+    else {
+        return None;
+    };
+    let loop_op = ForRef(iv_candidate);
+    Some(if val_is_sub_op {
+        ForLoopInfo {
+            loop_op,
+            lower_bound: subtracted_from - bound,
+            upper_bound: subtracted_from,
+            step: 1,
+            iterations: *bound,
+        }
+    } else {
+        ForLoopInfo {
+            loop_op,
+            lower_bound: *bound,
+            upper_bound: 1,
+            step: -1,
+            iterations: *bound,
+        }
+    })
+}
+
+/// WHICH BACKEND A PROGRAM IS BUILT FOR — `enum class SenTargets` (`util/sendefs/sendefs.h:177`),
+/// read from `dccExtContext().dsc_global_->backend` (`OpRerolling.cpp:1053`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenTarget {
+    /// `UNDEFINED`.
+    Undefined,
+    /// `SENTIENT` — the card, and the only target a reduction is ever unrolled for.
+    Sentient,
+    /// `SENULATOR`.
+    Senulator,
+    /// `SENPCFG`.
+    SenPcfg,
+    /// `SENTF`.
+    SenTf,
+    /// `SYSTEMC`.
+    SystemC,
+    /// `R5SS`.
+    R5ss,
+    /// `HOST`.
+    Host,
+    /// `INVALID`.
+    Invalid,
+    /// `NOP`.
+    Nop,
+}
+
+/// Replaces: e243_roundDownUnrollFactor
+///
+/// The largest legal unroll factor at or below `n` — 1, 2, 3 or 4 for a reduction on
+/// [`SenTarget::Sentient`], and 1, 2, 4 or 8 otherwise (`:397-428`).
+///
+/// ⛔ TRAP: A REDUCTION ON ANY OTHER TARGET IS NEVER UNROLLED, whatever `n` is (`:414`).
+/// ⭐ `DT_CHECK_MSG(n != 0, "Expect a positive target unroll value")` IS [`NonZeroU32`], and the
+/// return set is [`sentient::UnrollFactor`] exactly — 3 reduction-only, 8 non-reduction-only.
+#[must_use]
+pub fn round_down_unroll_factor(
+    n: NonZeroU32,
+    compute_op: &Op,
+    sen_target: SenTarget,
+) -> sentient::UnrollFactor {
+    let reduction = matches!(
+        compute_op,
+        Op::Sentient(sentient::Op::VectorUnary {
+            unary_op: sentient::UnaryOp::ReductionAbsMax
+                | sentient::UnaryOp::ReductionAbsMin
+                | sentient::UnaryOp::ReductionAdd
+                | sentient::UnaryOp::ReductionMax
+                | sentient::UnaryOp::ReductionMin,
+            ..
+        })
+    );
+    match (reduction, sen_target, n.get()) {
+        (true, SenTarget::Sentient, 1) => sentient::UnrollFactor::X1,
+        (true, SenTarget::Sentient, 2) => sentient::UnrollFactor::X2,
+        (true, SenTarget::Sentient, 3) => sentient::UnrollFactor::X3,
+        (true, SenTarget::Sentient, _) => sentient::UnrollFactor::X4,
+        (true, _, _) => sentient::UnrollFactor::X1,
+        (false, _, 1) => sentient::UnrollFactor::X1,
+        (false, _, 2 | 3) => sentient::UnrollFactor::X2,
+        (false, _, 4..=7) => sentient::UnrollFactor::X4,
+        (false, _, _) => sentient::UnrollFactor::X8,
+    }
+}
+
+/// Replaces: e244_negatePredicate
+///
+/// The predicate that holds exactly when `pred` does not — [`sentient::CmpPredicate::negated`],
+/// which is total over the six a `sentient.if` can carry, so the `llvm_unreachable` is unwritable.
+#[must_use]
+pub fn negate_predicate(pred: sentient::CmpPredicate) -> sentient::CmpPredicate {
+    pred.negated()
+}
+
+/// Replaces: e245_reversePredicate
+///
+/// The predicate that holds with the operands swapped — [`sentient::CmpPredicate::reversed`], which
+/// the island already carries because `RemoveStaticCondition` asks it of every condition.
+#[must_use]
+pub fn reverse_predicate(pred: sentient::CmpPredicate) -> sentient::CmpPredicate {
+    pred.reversed()
+}
+
+/// HOW MANY ITERATIONS OF THE INNERMOST LOOP THE UNROLLED PROGRAM RUNS — the third element of
+/// `getOutermostConstInitialization`'s tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSize {
+    /// The product of the chain's bounds; a `bound <= 0` is refused outright (`:500-502`).
+    Iterations(NonZeroU64),
+    /// `size = -1` — some loop in the chain has a non-constant bound (`Utils.hpp:140-141`).
+    Unknown,
+}
+
+/// THE OUTERMOST CONSTANT INITIALIZATION OF AN ITER-ARG CHAIN — the reference's triple
+/// (`Utils.hpp:135-144`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutermostConstInit {
+    /// The outermost loop the walk reached, named by its induction variable.
+    pub loop_op: ForRef,
+    /// Which iter arg of it a constant initialises — `None` is the reference's `-1`.
+    pub iter_arg: Option<IterArgIndex>,
+    /// The unrolled iteration count.
+    pub size: ChainSize,
+}
+
+/// Replaces: e246_getOutermostConstInitialization
+///
+/// Walks the chain of iter-arg initializations inner to outer and answers the outermost loop, which
+/// of its iter args a constant initialises, and the unrolled iteration count (`:469-524`).
+///
+/// ⛔ TRAP: A VALID LOOP COMES BACK WITH `iter_arg: None` when the walk ends without a constant —
+/// the reference returns `{outer_loop, -1, size}` there, and callers test the index (`:2677`).
+/// ⛔ TRAP: ONCE `size` IS `-1` THE REFERENCE KEEPS MULTIPLYING IT, printing `-4` for a constant 4
+/// outside a non-constant loop; every caller tests only `size <= 0`, which [`ChainSize`] answers.
+#[must_use]
+pub fn outermost_const_initialization(
+    iter_arg: Val,
+    defs: Definitions<'_>,
+) -> Option<OutermostConstInit> {
+    let mut iter_arg_index: Option<IterArgIndex> = None;
+    let mut curr: Option<Val> = Some(iter_arg);
+    let mut outer_loop: Option<&Op> = None;
+    let mut prev: Option<(&Op, usize)> = None;
+    let mut size: u64 = 1;
+    let mut unknown = false;
+
+    // `while (iter_arg_index < 0 && curr_iter_arg)` (`:485`)
+    while iter_arg_index.is_none() {
+        let Some(curr_arg) = curr else { break };
+        let (for_op, arg_number) = defs.for_arg_of(curr_arg)?;
+        // `getRegionIterArgs()` is `getBody()->getArguments().drop_front(1)`.
+        let curr_it_index = arg_number.checked_sub(1)?;
+        outer_loop = Some(for_op);
+        let Op::Sentient(sentient::Op::For {
+            bound,
+            carried,
+            body,
+            ..
+        }) = for_op
+        else {
+            return None;
+        };
+        match defs.of(*bound) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => {
+                if *value <= 0 {
+                    return None;
+                }
+                size = size.saturating_mul(value.unsigned_abs());
+            }
+            _ => unknown = true,
+        }
+        if let Some((prev_loop, prev_it_index)) = prev {
+            // `!curr_iter_arg.hasOneUse() || !isa<ForOp>(*curr_iter_arg.user_begin())` (`:513-515`)
+            if use_count(curr_arg, body) != 1 {
+                return None;
+            }
+            let user = body
+                .iter()
+                .find(|op| use_count(curr_arg, core::slice::from_ref(*op)) == 1)?;
+            if !matches!(user, Op::Sentient(sentient::Op::For { .. })) {
+                return None;
+            }
+            // `DT_CHECK_MSG(yield, "expected terminator of previous loop body to be a yield")`
+            let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
+                return None;
+            };
+            let Op::Sentient(sentient::Op::For {
+                carried: prev_carried,
+                ..
+            }) = prev_loop
+            else {
+                return None;
+            };
+            if results.get(curr_it_index) != prev_carried.get(prev_it_index).map(|it| &it.result) {
+                break;
+            }
+        }
+        let curr_init = carried.get(curr_it_index)?.init;
+        if defs.for_arg_of(curr_init).is_some() {
+            curr = Some(curr_init);
+            prev = Some((for_op, curr_it_index));
+        } else {
+            if is_constant(curr_init, ConstKind::ScalarConstant, defs) {
+                iter_arg_index = u32::try_from(curr_it_index).ok().map(IterArgIndex);
+            }
+            curr = None;
+        }
+    }
+
+    let Op::Sentient(sentient::Op::For { iv, .. }) = outer_loop? else {
+        return None;
+    };
+    Some(OutermostConstInit {
+        loop_op: ForRef(*iv),
+        iter_arg: iter_arg_index,
+        size: if unknown {
+            ChainSize::Unknown
+        } else {
+            NonZeroU64::new(size).map_or(ChainSize::Unknown, ChainSize::Iterations)
+        },
+    })
+}
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // The types e247 is stated in — its two `llvm_unreachable`s and its one `DT_CHECK`.
@@ -722,5 +1349,335 @@ mod unit_tests {
             }
         )]));
         assert!(!has_uniformize_region(&[scalar_constant(Val(2), 0)]));
+    }
+
+    use core::num::NonZeroU32;
+
+    /// `%r = sentient.scalar_constant {value} : index`.
+    fn constant(result: Val, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%out = sentient.scalar_copy %input : index`.
+    fn copy(input: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lrf,
+                index: None,
+            },
+            element_size: None,
+            program_header: false,
+        })
+    }
+
+    /// `%out = sentient.scalar_sub %lhs, %rhs : index`.
+    fn sub(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarSub {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// `sentient.nop`.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// `sentient.yield`.
+    fn yield_op(results: Vec<Val>) -> Op {
+        Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// One carried value, with nothing assigned to it yet.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// `%r = sentient.for %iv = 0 to %bound iter_args(..) { body }`.
+    fn for_op(iv: Val, bound: Val, carried: Vec<sentient::Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried,
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// `sentient.vector_unary` computing `unary_op`.
+    fn reduction_unary(unary_op: sentient::UnaryOp) -> Op {
+        Op::Sentient(sentient::Op::VectorUnary {
+            mask: Val(90),
+            op_a: sentient::Operand::from(sentient::Port::North),
+            unary_op,
+            result: sentient::ResultPorts::default(),
+            compute_precision: sentient::Precision::Fp16,
+            fold_mode: None,
+            unroll_factor: sentient::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
+    /// Which op each position of a block holds, for asserting a layout.
+    fn kind(op: &Op) -> &'static str {
+        match op {
+            Op::Sentient(sentient::Op::ScalarConstant { .. }) => "constant",
+            Op::Sentient(sentient::Op::ScalarCopy { .. }) => "copy",
+            Op::Sentient(sentient::Op::For { .. }) => "for",
+            Op::Sentient(sentient::Op::Nop { .. }) => "nop",
+            _ => "other",
+        }
+    }
+
+    /// A target unroll count.
+    fn n(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).expect("the test's own literal is nonzero")
+    }
+
+    /// e239: the op at the index, and the walk past the end that the reference dereferences.
+    #[test]
+    fn operation_of_block_indexes_the_block_and_stops_at_its_end() {
+        let block = vec![
+            constant(Val(0), 1),
+            constant(Val(1), 2),
+            constant(Val(2), 3),
+        ];
+        assert!(matches!(
+            operation_of_block(&block, InBlock(1)),
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value: 2, .. }))
+        ));
+        assert!(operation_of_block(&block, InBlock(3)).is_none());
+    }
+
+    /// e240: a group expands transitively, `units` comes back reversed and `indices` is appended to.
+    #[test]
+    fn select_indices_for_units_flattens_groups_and_reverses_the_units() {
+        /// Ten times the value number, standing in for an out-of-scope index map.
+        struct TenTimes;
+        impl UnitIndexMap for TenTimes {
+            fn index_of(&self, unit: Val) -> UnitIndex {
+                UnitIndex(unit.0 * 10)
+            }
+        }
+        let scope = vec![Op::Dataflow(dataflow::Op::CreateGroup {
+            result: Val(1),
+            unit_ids: vec![Val(2), Val(3)],
+        })];
+        let scopes: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&scopes);
+        let mut units = vec![Val(0), Val(1)];
+        let mut indices = vec![UnitIndex(99)];
+        select_indices_for_units(&mut units, &mut indices, &TenTimes, defs);
+        assert_eq!(units, vec![Val(3), Val(2), Val(0)]);
+        assert_eq!(
+            indices,
+            vec![UnitIndex(99), UnitIndex(30), UnitIndex(20), UnitIndex(0)]
+        );
+    }
+
+    /// e241: the copy and the operand it reads both leave the loop, landing in front of it in that
+    /// order, and a use in another program unit is the one failure.
+    #[test]
+    fn move_to_common_dominator_hoists_the_operand_chain_ahead_of_the_insert_point() {
+        let body = vec![constant(Val(2), 7), copy(Val(2), Val(3))];
+        let mut unit = vec![
+            constant(Val(0), 4),
+            for_op(Val(1), Val(0), Vec::new(), body.clone()),
+            nop(),
+        ];
+        let copy_at = OpAt::at(&[(InBlock(1), 0)], InBlock(1));
+        let landed = move_to_common_dominator(
+            &mut unit,
+            &copy_at,
+            &NewUse::SameUnit(OpAt::top(InBlock(2))),
+        );
+        assert_eq!(landed, Hoisted::Done);
+        let layout: Vec<&str> = unit.iter().map(kind).collect();
+        assert_eq!(layout, vec!["constant", "constant", "copy", "for", "nop"]);
+        let Op::Sentient(sentient::Op::For { body: emptied, .. }) = &unit[3] else {
+            panic!("position 3 is still the loop")
+        };
+        assert!(emptied.is_empty());
+
+        let mut other = vec![
+            constant(Val(0), 4),
+            for_op(Val(1), Val(0), Vec::new(), body),
+            nop(),
+        ];
+        assert_eq!(
+            move_to_common_dominator(&mut other, &copy_at, &NewUse::OtherUnit),
+            Hoisted::OutsideProgramUnit
+        );
+    }
+
+    /// e242: a bare induction variable counts DOWN, `const - iv` counts up, and a normalized IV is
+    /// refused when the caller says so.
+    #[test]
+    fn for_loop_info_if_iv_reads_both_the_bare_and_the_normalized_induction_variable() {
+        let body = vec![constant(Val(2), 8), sub(Val(2), Val(1), Val(3))];
+        let top = vec![
+            constant(Val(0), 8),
+            for_op(Val(1), Val(0), Vec::new(), body.clone()),
+        ];
+        let scopes: [&[Op]; 2] = [&body, &top];
+        let defs = Definitions::from_innermost(&scopes);
+        assert_eq!(
+            for_loop_info_if_iv(Val(1), NormalizedIv::Accepted, defs),
+            Some(ForLoopInfo {
+                loop_op: ForRef(Val(1)),
+                lower_bound: 8,
+                upper_bound: 1,
+                step: -1,
+                iterations: 8,
+            })
+        );
+        assert_eq!(
+            for_loop_info_if_iv(Val(3), NormalizedIv::Accepted, defs),
+            Some(ForLoopInfo {
+                loop_op: ForRef(Val(1)),
+                lower_bound: 0,
+                upper_bound: 8,
+                step: 1,
+                iterations: 8,
+            })
+        );
+        assert_eq!(
+            for_loop_info_if_iv(Val(3), NormalizedIv::Rejected, defs),
+            None
+        );
+        // A constant is neither, whatever `allow_normalized_iv` says.
+        assert_eq!(
+            for_loop_info_if_iv(Val(2), NormalizedIv::Accepted, defs),
+            None
+        );
+    }
+
+    /// e243: a reduction caps at 4 on the card and at 1 everywhere else; anything else rounds down to
+    /// a power of two up to 8.
+    #[test]
+    fn round_down_unroll_factor_caps_reductions_at_four_and_only_on_the_card() {
+        let reduction = reduction_unary(sentient::UnaryOp::ReductionAdd);
+        let plain = nop();
+        assert_eq!(
+            round_down_unroll_factor(n(3), &reduction, SenTarget::Sentient),
+            sentient::UnrollFactor::X3
+        );
+        assert_eq!(
+            round_down_unroll_factor(n(9), &reduction, SenTarget::Sentient),
+            sentient::UnrollFactor::X4
+        );
+        assert_eq!(
+            round_down_unroll_factor(n(9), &reduction, SenTarget::Senulator),
+            sentient::UnrollFactor::X1
+        );
+        assert_eq!(
+            round_down_unroll_factor(n(3), &plain, SenTarget::Sentient),
+            sentient::UnrollFactor::X2
+        );
+        assert_eq!(
+            round_down_unroll_factor(n(7), &plain, SenTarget::Host),
+            sentient::UnrollFactor::X4
+        );
+        assert_eq!(
+            round_down_unroll_factor(n(99), &plain, SenTarget::Host),
+            sentient::UnrollFactor::X8
+        );
+    }
+
+    /// e244: all six, and negating twice is the identity.
+    #[test]
+    fn negate_predicate_is_total_and_an_involution() {
+        use sentient::CmpPredicate::{Eq, Ne, Sge, Sgt, Sle, Slt};
+        let negated: Vec<sentient::CmpPredicate> = [Eq, Ne, Slt, Sle, Sgt, Sge]
+            .into_iter()
+            .map(negate_predicate)
+            .collect();
+        assert_eq!(negated, vec![Ne, Eq, Sge, Sgt, Sle, Slt]);
+        for pred in [Eq, Ne, Slt, Sle, Sgt, Sge] {
+            assert_eq!(negate_predicate(negate_predicate(pred)), pred);
+        }
+    }
+
+    /// e245: all six — equality is symmetric, so only the four orderings swap.
+    #[test]
+    fn reverse_predicate_leaves_the_symmetric_predicates_alone() {
+        use sentient::CmpPredicate::{Eq, Ne, Sge, Sgt, Sle, Slt};
+        let reversed: Vec<sentient::CmpPredicate> = [Eq, Ne, Slt, Sle, Sgt, Sge]
+            .into_iter()
+            .map(reverse_predicate)
+            .collect();
+        assert_eq!(reversed, vec![Eq, Ne, Sgt, Sge, Slt, Sle]);
+    }
+
+    /// e246: the reference's own chained-initialization example — an inner iter arg initialised from an
+    /// outer one, whose own initializer is a constant, with the sizes multiplied along the way.
+    #[test]
+    fn outermost_const_initialization_walks_the_chain_to_the_constant() {
+        let inner_body = vec![yield_op(vec![Val(7)])];
+        let outer_body = vec![
+            for_op(
+                Val(6),
+                Val(1),
+                vec![carried(Val(4), Val(7), Val(8))],
+                inner_body.clone(),
+            ),
+            yield_op(vec![Val(8)]),
+        ];
+        let top = vec![
+            constant(Val(0), 4),
+            constant(Val(1), 2),
+            constant(Val(2), 0),
+            for_op(
+                Val(3),
+                Val(0),
+                vec![carried(Val(2), Val(4), Val(5))],
+                outer_body.clone(),
+            ),
+        ];
+        let scopes: [&[Op]; 3] = [&inner_body, &outer_body, &top];
+        let defs = Definitions::from_innermost(&scopes);
+        assert_eq!(
+            outermost_const_initialization(Val(7), defs),
+            Some(OutermostConstInit {
+                loop_op: ForRef(Val(3)),
+                iter_arg: Some(IterArgIndex(0)),
+                size: ChainSize::Iterations(
+                    core::num::NonZeroU64::new(8).expect("the product of 2 and 4")
+                ),
+            })
+        );
+        // The outer loop's own iter arg reaches the constant in one step, and only its own bound.
+        assert_eq!(
+            outermost_const_initialization(Val(4), defs),
+            Some(OutermostConstInit {
+                loop_op: ForRef(Val(3)),
+                iter_arg: Some(IterArgIndex(0)),
+                size: ChainSize::Iterations(
+                    core::num::NonZeroU64::new(4).expect("the outer bound")
+                ),
+            })
+        );
     }
 }

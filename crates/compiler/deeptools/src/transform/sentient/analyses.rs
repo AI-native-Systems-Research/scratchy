@@ -532,3 +532,35 @@ pub struct Dependency {
     /// `gap`.
     pub gap: Cycles,
 }
+
+/// WHICH UNIT AN INDEX-KEYED ANALYSIS RESULT BELONGS TO — a position in the value range of
+/// `PropagationAnalysis::getUnitIndexMap()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnitIndex(pub u32);
+
+/// THE `std::unordered_map<std::string, unsigned>` `selectIndicesForUnits` IS HANDED — a trait,
+/// because BOTH halves of the lookup are out of campaign scope.
+///
+/// ⛔ THE MAP IS `PropagationAnalysis::getUnitIndexMap()` at every call site
+/// (`ScalarSimplifications.cpp:335`, `:420`, `:554`, `Analyses/PropagationAnalysis.cpp:954`) and the
+/// key is `getFoldedUnitNameAsString` (`Analyses/Utils.cpp:644`); `Analyses/` is not in this
+/// campaign, so the crate's only implementation is [`OutOfScopeUnitIndexMap`].
+///
+/// ⭐ KEYED BY [`Val`], NOT BY A STRING. The name is a formatter over the unit op's own attributes,
+/// and it is the map's key only because C++ has no hashable `Value` for an `unordered_map`.
+pub trait UnitIndexMap {
+    /// `unit_name_to_index_map.at(getFoldedUnitNameAsString(unit))` (`Utils.cpp:78-79`).
+    fn index_of(&self, unit: Val) -> UnitIndex;
+}
+
+/// THE ONE CRATE IMPLEMENTATION: neither the map nor the name formatter behind it is ported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeUnitIndexMap;
+
+impl UnitIndexMap for OutOfScopeUnitIndexMap {
+    fn index_of(&self, _unit: Val) -> UnitIndex {
+        todo!(
+            "PropagationAnalysis::getUnitIndexMap + getFoldedUnitNameAsString (Analyses/PropagationAnalysis.hpp:—, Analyses/Utils.cpp:644) — out of campaign scope"
+        )
+    }
+}
