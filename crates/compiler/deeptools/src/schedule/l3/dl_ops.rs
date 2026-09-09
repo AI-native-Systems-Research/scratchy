@@ -2583,11 +2583,13 @@ pub fn chunk_params_from_candidates(params: &mut FilledDims, candidates: &DscPar
 ///
 /// ⛔ THE TABLE IS TRANSCRIBED, NOT DERIVED: its 1024 entries do follow `0.075 + 0.025·burst -
 /// 0.0005·(degree - 1)`, and fitting a rule to data is how a coefficient chain gets golden-hacked.
-/// ⛔ TRAP: ITS WIDTH IS THE LITERAL `maxNumCores = 32` (`:1618`) while the degree is checked against
-/// `numCores`, so the two guards below are that mismatch turned into a build error.
+/// ⛔ TRAP: THE TWO GUARDS ARE NOT THE SAME SHAPE. The ROW COUNT must EQUAL `l3BurstSize` (`:1616`),
+/// so an arch with a shorter burst ABORTS rather than reading a prefix; each ROW is only required to
+/// be the literal `maxNumCores = 32` (`:1618`) while the degree is checked against `numCores`. Both
+/// are that asymmetry turned into a build error.
 #[must_use]
 pub fn burst_efficiency(burst: BurstSize, multicast: MulticastCores) -> BurstEfficiency {
-    const { assert!(Target::L3_BURST <= 32, "the table states 32 burst sizes") }
+    const { assert!(Target::L3_BURST == 32, "the table states 32 burst sizes") }
     const { assert!(Target::CORES <= 32, "the table states 32 multicast degrees") }
     BurstEfficiency(BURST_EFFICIENCY[burst.index() as usize][multicast.index() as usize])
 }
@@ -2598,8 +2600,11 @@ pub fn burst_efficiency(burst: BurstSize, multicast: MulticastCores) -> BurstEff
 ///
 /// ⛔ TWO DEAD PARAMETERS, BOTH THE REFERENCE'S: `primaryDims` is never read, and the `bytesPerStick`
 /// it hands `getBufferCapacityForNode` is read only under `forceEvenNumSticks`, which defaults false.
-/// ⛔ [`None`] IS A `DT_CHECK` ON DATA: an LX capacity that is not whole sticks, a stick volume that
-/// does not divide the chunk, or a chunk extent that does not divide the core's.
+/// ⛔ [`None`] IS EVERY REFUSAL HERE, and only some are the reference's `DT_CHECK`s: no LX capacity
+/// stated for `lds` (`:1705-1709`), a capacity that is not whole sticks, a stick volume that does
+/// not divide the chunk, and `getNonBroadcastLdsDims`' own abort.
+/// ⛔ DIVERGENCE, NOT A `DT_CHECK`: the reference's `-1` extents make an UNSTATED dim a factor of `1`
+/// (`-1 / -1`) or a NEGATIVE chunk count (`8 / -1`); the sign guards below refuse instead.
 #[must_use]
 pub fn labeled_ds_num_of_stick_volumes_in_core(
     dsc: &DesignSpaceConfig,
@@ -2632,7 +2637,7 @@ pub fn labeled_ds_num_of_stick_volumes_in_core(
 /// THE DIMS THE OP REDUCES AWAY — non-broadcast on some input and on no output.
 ///
 /// ⛔ TRAP: `mySDsc` IS NEVER READ, and `isOutputLabeledDs` is `ldsIdx == labeledDs_.size() - 1`
-/// (`L3DlOpsScheduler.h:227`), so "the outputs" is the LAST entry and only ever that one.
+/// (`L3DlOpsScheduler.h:228-230`), so "the outputs" is the LAST entry and only ever that one.
 /// ⛔ TRAP: BOTH QUESTIONS ARE ASKED OF [`LabeledDs::recorded`], the entry's OWN `ldsIdx_`, and not
 /// of the position it sits at — so a recorded index that drifted answers for another position.
 #[must_use]
@@ -2670,9 +2675,10 @@ pub const LX_BELOW_BLOCK_NODE_NAME: &str = "lx_below_schedule";
 ///
 /// THE `BLOCK` NODE NAMED `lx_below_schedule`, exclusively borrowed so its finder may edit it.
 ///
-/// ⛔ TRAP: THE REFERENCE'S `nullptr` RETURN IS A LATENT CRASH IN ITS OWN CALLER —
-/// `L3DlOpsScheduler.cpp:2838` dereferences the result with no null check. Here that case is a
-/// [`None`] the caller has to name.
+/// ⛔ TRAP: THE REFERENCE'S `nullptr` RETURN IS A LATENT CRASH IN ONE OF ITS FOUR CALLERS —
+/// `L3DlOpsScheduler.cpp:2838` takes it and `:2845` dereferences `->getOwnerLoop()` with no null
+/// check, while `:3129`, `:3611` and `:7599` each `DT_CHECK_MSG` it. Here that case is a [`None`]
+/// the caller has to name.
 pub fn lx_below_block_node(tree: &mut ScheduleTree) -> Option<&mut BlockNode> {
     tree.find_block_mut(|block| block.name.0 == LX_BELOW_BLOCK_NODE_NAME)
 }
@@ -2945,6 +2951,26 @@ mod tests_e041_e048 {
             labeled_ds_num_of_stick_volumes_in_core(&dsc, lds, odd),
             None
         );
+    }
+
+    /// e043/e044's seam — a wholly broadcast structure answers EMPTY before the layout is asked for,
+    /// and a structure that does name a non-broadcast dim still needs one.
+    #[test]
+    fn a_wholly_broadcast_structure_answers_before_the_layout_is_needed() {
+        let mut dsc = dsc(&[(PrimaryDim::I, 1)], &[(PrimaryDim::I, 1)]);
+        let broadcast = LabeledDs::new(
+            DsType::Input,
+            vec![
+                (PrimaryDim::I, Scale::Sized(0.0)),
+                (PrimaryDim::J, Scale::UnitStick),
+            ],
+            LdsIdx(0),
+            Pinning::default(),
+        );
+        dsc.labeled_ds = LabeledDsList::new(broadcast, vec![sized(LdsIdx(1), &[PrimaryDim::I])]);
+        // Neither entry has a layout_dims entry, which is getLayoutDims' abort.
+        assert_eq!(dsc.non_broadcast_lds_dims(LdsIdx(0)), Some(vec![]));
+        assert_eq!(dsc.non_broadcast_lds_dims(LdsIdx(1)), None);
     }
 
     /// e044 — a dim the inputs carry and the output does not is the dim the op reduces away.
