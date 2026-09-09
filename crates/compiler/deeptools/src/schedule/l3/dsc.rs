@@ -12,7 +12,11 @@
 //! and `maxSymbolicVolume_`'s keys being named by `symbolicDimInfo_` are each discharged once, where
 //! the value is built.
 
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
+use crate::arch::Elements;
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart,
+};
+use crate::schedule::ddc::fold::Stride;
 use crate::schedule::ddc::transformation::{DsType, Scale};
 use crate::schedule::dsc2::{LayoutDims, LdsIdx};
 use crate::units::Core;
@@ -121,6 +125,48 @@ impl CoreIdsUsed {
     }
 }
 
+/// ONE PRIMARY DATA STRUCTURE — `PrimaryDsInfo` (`dsc/dscdefn.h:474`) reduced to its two dim orders,
+/// ONE value because `primaryDsInfo_.at(dsType)` hands both back together and a `DsTypes` present in
+/// one order and absent from the other is not a state the reference can hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrimaryDsInfo {
+    /// `layoutDimOrder_`.
+    pub layout: LayoutDims,
+    /// `stickDimOrder_` zipped with `stickSize_`, as [`StickDims`] carries them.
+    pub stick: StickDims,
+}
+
+/// A DSC'S LABELLED DATA STRUCTURES, NON-EMPTY — `labeledDs_` (`dsc/designSpaceConfig.h:86`).
+///
+/// ⭐ NON-EMPTY BECAUSE THE REFERENCE NEVER GUARDS IT: the min-param units reach `.front()`/`.back()`
+/// with no check, and `isLastLds` compares against the UNSIGNED `labeledDs_.size() - 1`
+/// (`L3DlOpsScheduler.h:229`), which on an empty list is `SIZE_MAX`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabeledDsList {
+    first: LabeledDs,
+    rest: Vec<LabeledDs>,
+}
+
+impl LabeledDsList {
+    /// A DSC labels at least one data structure, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: LabeledDs, rest: Vec<LabeledDs>) -> Self {
+        Self { first, rest }
+    }
+
+    /// `labeledDs_.front()`.
+    #[must_use]
+    pub const fn front(&self) -> &LabeledDs {
+        &self.first
+    }
+
+    /// `labeledDs_.back()`.
+    #[must_use]
+    pub fn back(&self) -> &LabeledDs {
+        self.rest.last().unwrap_or(&self.first)
+    }
+}
+
 /// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:74`) reduced to the
 /// fields this batch reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,12 +176,38 @@ pub struct DesignSpaceConfig {
     /// Per dim, corelet 0's share against the whole — `dataStageParam_.at(0).ss_` where the core
     /// data stage exists, else `CoreletD_` against `CoreD_`.
     pub corelet_shares: BTreeMap<PrimaryDim, CoreletShare>,
-    /// `primaryDsInfo_` (`dsc/dscdefn.h:474`), reduced to each entry's `layoutDimOrder_`.
-    pub primary_ds_info: BTreeMap<DsType, LayoutDims>,
+    /// `primaryDsInfo_` (`dsc/dscdefn.h:474`).
+    pub primary_ds_info: BTreeMap<DsType, PrimaryDsInfo>,
     /// `coreIdsUsed_`.
     pub core_ids_used: CoreIdsUsed,
     /// `getLayoutDims(ldsIdx)` (`dsc/dsc2.cpp:4007`), per labelled data structure.
     pub layout_dims: BTreeMap<LdsIdx, LayoutDims>,
+    /// `dataStageParam_.at(dataStageCoreIdx).ss_` — `dataStageCoreIdx` is `0`
+    /// (`L3DlOpsScheduler.cpp:275`).
+    ///
+    /// ⭐ MANDATORY, WHICH IS `DT_CHECK_MSG(dsc.dataStageParam_.count(dataStageCoreIdx), "Expect
+    /// dataStageParam_ entry for the core data stage.")` (`:353`, `:1185`, `:1191`) DISCHARGED HERE:
+    /// every min-param unit reaches it with a bare `.at()`. `isDimensionCoreletSplit`'s defensive
+    /// `count` (`:77`) is then a constant, and [`Self::corelet_shares`] keeps its own answer because
+    /// the split it reports may come from `CoreletD_`/`CoreD_` instead.
+    pub core_stage: FilledDims,
+    /// `labeledDs_`.
+    pub labeled_ds: LabeledDsList,
+}
+
+impl DesignSpaceConfig {
+    /// `getCumulativeStickSizes(dsType)` (`dsc/dsc2.cpp:4108`) with all four flags at their defaults,
+    /// which is [`StickPart::Whole`], delegating to the ported fold.
+    ///
+    /// ⛔ `None` IS `primaryDsInfo_.at(dsType)` THROWING, or the `int` product the fold refuses to
+    /// wrap. ⛔ AND THE REFERENCE'S `DT_CHECK(elemInSlice > 0 && elemInSlice % 8 == 0)`
+    /// (`dsc/dsc2.cpp:4083`) RUNS EVEN ON THE WHOLE-STICK PATH, where it constrains nothing the
+    /// answer depends on; [`StickPart::Whole`] carries no slice, so that abort is not reproduced.
+    #[must_use]
+    pub fn cumulative_stick_sizes(&self, ds_type: DsType) -> Option<Vec<(PrimaryDim, Elements)>> {
+        let info = self.primary_ds_info.get(&ds_type)?;
+        shape_constraints::cumulative_stick_sizes(&info.stick, StickPart::Whole)
+    }
 }
 
 /// A SUPER-DSC'S DSCs, NON-EMPTY — `dscs_.size() >= 1` is the whole body of `isSameDscGroup`.
@@ -304,9 +376,9 @@ impl UnneededPad {
     };
 }
 
-/// ONE DIM'S PADDING — `DimPaddingSizes` (`dsc/dims.h:100`) reduced to what `voidPaddingIfChunking`
-/// touches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// ONE DIM'S PADDING — `DimPaddingSizes` (`dsc/dims.h:134`) reduced to what `voidPaddingIfChunking`
+/// and `calculate_padded`'s full-span arm touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DimPadding {
     /// `padFront_`/`padBack_`.
     pub sizes: PadSizes,
@@ -314,6 +386,21 @@ pub struct DimPadding {
     pub window_dim: Option<PrimaryDim>,
     /// The three `unneededPad` counts.
     pub unneeded: UnneededPad,
+    /// `stride_`, whose declared default is `1` and not `0`.
+    pub stride: Stride,
+}
+
+impl Default for DimPadding {
+    /// The reference's own field initialisers (`dsc/dims.h:135-142`) — every count zero and the
+    /// stride ONE.
+    fn default() -> Self {
+        Self {
+            sizes: PadSizes::Unpadded,
+            window_dim: None,
+            unneeded: UnneededPad::NONE,
+            stride: Stride::ONE,
+        }
+    }
 }
 
 /// A SYMBOLIC DIM'S BOUNDS — `SymbolicDimInfo` (`dsc/dims.h:148`).
@@ -500,6 +587,51 @@ impl StageDims {
     #[must_use]
     pub fn extent(&self, dim: PrimaryDim) -> Option<Extent> {
         self.extents.get(&dim).copied()
+    }
+
+    /// `hasPadding` (`L3DlOpsScheduler.cpp:1070-1075`) — the dim has a `paddingSizes_` entry AND its
+    /// `PADDED_FULLSPAN_WUNNEEDED` span (`calculate_padded`, `dsc/dims.cpp:563`) differs from its
+    /// plain extent.
+    ///
+    /// ⛔ `None` IS `calculate_padded`'s THREE REACHABLE ABORTS: *"Cannot calculate padded version of
+    /// compound dim"* for [`PrimaryDim::Ij`]/[`PrimaryDim::Kij`], *"Padded access is not valid in
+    /// datastage"* for a [`PadSizes::Voided`] non-window dim, and *"Missing window size"* where the
+    /// window dim's own extent is absent or below one.
+    ///
+    /// ⭐ AN UNSTATED DIM IS `Some(false)`, NOT AN ABORT — `val < 0` short-circuits to `-1` on both
+    /// sides of the comparison. Spans saturate rather than wrap: a saturated span still differs from
+    /// the extent, which is the only question asked.
+    #[must_use]
+    pub fn has_padding(&self, dim: PrimaryDim) -> Option<bool> {
+        let Some(pad) = self.padding.get(&dim) else {
+            return Some(false);
+        };
+        let Some(plain) = self.extent(dim) else {
+            return Some(false);
+        };
+        if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
+            return None;
+        }
+        let unneeded = i64::from(pad.unneeded.total.0);
+        let padded = match pad.window_dim {
+            None => match pad.sizes {
+                PadSizes::Voided => return None,
+                PadSizes::Unpadded => plain.0.saturating_add(unneeded),
+                PadSizes::Sized { front, back } => plain
+                    .0
+                    .saturating_add(i64::from(front.0))
+                    .saturating_add(i64::from(back.0))
+                    .saturating_add(unneeded),
+            },
+            Some(window) => {
+                let window_size = self.extent(window).filter(|size| size.0 >= 1)?;
+                window_size
+                    .0
+                    .saturating_add(plain.0.saturating_sub(1).saturating_mul(pad.stride.0))
+                    .saturating_add(unneeded)
+            }
+        };
+        Some(padded != plain.0)
     }
 }
 
