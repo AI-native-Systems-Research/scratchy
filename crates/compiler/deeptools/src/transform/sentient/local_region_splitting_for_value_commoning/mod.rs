@@ -177,7 +177,7 @@ pub fn collect_uniform_maps(
 
 /// `op.walk<WalkOrder::PreOrder>(..)` over one region, nested regions included.
 ///
-/// ⭐ THE REFERENCE'S `for (block) for (op) op.walk(..)` NEST (`:310-312`) FLATTENED: walking every op
+/// ⭐ THE REFERENCE'S `for (block) for (op) op.walk(..)` NEST (`:311-313`) FLATTENED: walking every op
 /// of the region visits the region's own ops and everything under them, which is what the nest amounts
 /// to. Blocks are mechanism this island drops — one region is one op list.
 fn walk_pre_order(ops: &[Op], visit: &mut impl FnMut(&sentient::Op)) {

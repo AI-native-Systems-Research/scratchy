@@ -103,9 +103,9 @@ use crate::transform::sentient::loop_tree::{LoopNodeId, LoopTree};
 /// WHERE THE PASS MAY INSERT — the `dataflow.program_unit` the anchor loop sits in.
 ///
 /// ⛔⛔ `DT_CHECK_MSG(unit, "expected loop to appear in dataflow.program_unit")`
-/// (`LoopAbsorption.cpp:72`) IS THIS TYPE. The check cannot be asked at run time because naming the
+/// (`LoopAbsorption.cpp:70`) IS THIS TYPE. The check cannot be asked at run time because naming the
 /// unit is what builds one. ⭐ `preamble` IS THE REGION HOLDING the unit, which is where
-/// `OpBuilder const_builder(dyn_cast<dataflow::ProgramUnitOp>(*unit))` (`:73`) inserts: an
+/// `OpBuilder const_builder(dyn_cast<dataflow::ProgramUnitOp>(*unit))` (`:71`) inserts: an
 /// `OpBuilder` built from an operation inserts BEFORE it, not into it — contrast
 /// `LoopMerging.cpp:205`, which passes `.getRegion()` and so starts inside.
 #[derive(Debug)]
@@ -165,7 +165,7 @@ impl<'a> LoopAbsorptionManager<'a> {
         tree: &'a mut LoopTree<true>,
         site: UnitSite<'a>,
     ) -> Option<Self> {
-        // `anchor_(sorted_worklist.back())` (`LoopAbsorption.cpp:41`).
+        // `anchor_(sorted_worklist.back())` (`LoopAbsorption.cpp:42`).
         let anchor = *sorted_worklist.last()?;
         // `anchor_for_op_ = anchor_->getOpAs<sentient::ForOp>();` (`:47`).
         let anchor_for_op = tree.loop_of(anchor)?;
@@ -174,7 +174,7 @@ impl<'a> LoopAbsorptionManager<'a> {
         positions_of(anchor_for_op, site.body)?;
         Some(Self {
             // `oe_(dcc::OperationEquivalence(nullptr, nullptr, DEBUG_TYPE, true, false, true))`
-            // (`:42-45`) — `use_equiv_classes` is `tagged`'s default.
+            // (`:43-46`) — `use_equiv_classes` is `tagged`'s default.
             oe: OperationEquivalence::tagged(
                 EquivalenceTag::LoopAbsorption,
                 SubregionCompare::Recursive,
@@ -201,8 +201,8 @@ impl<'a> LoopAbsorptionManager<'a> {
     /// `sentient.scalar_add` beside whatever defines it, then drop a bound left with no uses.
     ///
     /// ⛔ THE INCREMENT CONSTANT IS MINTED BEFORE THE BRANCH AND ERASED AGAIN IN THE FOLDED ARM
-    /// (`:73-80`) — it is the operand of a `scalar_add` that only two of the four arms emit.
-    /// ⛔ TRAP: `bound.getType()` is always `index` — `Index:$bound` (`SentientOps.td:47`).
+    /// (`:72-78`) — it is the operand of a `scalar_add` that only two of the four arms emit.
+    /// ⛔ TRAP: `bound.getType()` is always `index` — `Index:$bound` (`SentientOps.td:62`).
     pub(crate) fn update_loop_bound(&mut self, vals: &mut Values, increment: BoundIncrement) {
         // `Value bound = anchor_for_op_.getBound();` (`:59`).
         let Some(bound) = bound_of(self.anchor_for_op, self.site.body) else {
@@ -218,7 +218,7 @@ impl<'a> LoopAbsorptionManager<'a> {
         let query_map = matches!(definer, Some(Op::Uniform(uniform::Op::QueryMap { .. })));
         let has_definer = definer.is_some();
         let bound_type = ScalarTy::Index;
-        // `auto const_increm = sentient::ConstantOp::create(const_builder, …, increment);` (`:73-74`).
+        // `auto const_increm = sentient::ConstantOp::create(const_builder, …, increment);` (`:72-73`).
         let const_increm = vals.mint();
         self.site
             .preamble
@@ -226,7 +226,7 @@ impl<'a> LoopAbsorptionManager<'a> {
 
         if let Some(value) = const_bound {
             // `setBound(ConstantOp::create(const_builder, loc, bound_type,
-            //  const_bound.getValue() + increment))` (`:77-78`).
+            //  const_bound.getValue() + increment))` (`:76-77`).
             let folded = vals.mint();
             self.site.preamble.push(constant(
                 folded,
@@ -234,18 +234,18 @@ impl<'a> LoopAbsorptionManager<'a> {
                 bound_type,
             ));
             set_bound(self.anchor_for_op, self.site.body, folded);
-            // `const_increm.erase();` (`:79`) — the add was never emitted, so nothing reads it.
+            // `const_increm.erase();` (`:78`) — the add was never emitted, so nothing reads it.
             dialects::erase_defining_op(&mut *self.site.preamble, const_increm);
         } else if query_map {
             // `is_query_map_constant` (`:64-66`) chooses between two `updateBoundToValuePlusMap`
-            // calls (`:81-88`); the predicate AND the rewrite are both in
+            // calls (`:80-86`); the predicate AND the rewrite are both in
             // `Transform/Sentient/Analyses/Utils`, which is outside this campaign.
             todo!(
                 "dcc::utils::isConstant / dcc::utils::updateBoundToValuePlusMap — out of campaign scope"
             )
         } else {
-            // `sentient::AddOp::create(builder, loc, bound_type, bound, const_increm)` (`:106-107`),
-            // placed *"as to avoid preventing absorption opportunities"* (`:90-93`).
+            // `sentient::AddOp::create(builder, loc, bound_type, bound, const_increm)` (`:99-100`),
+            // placed *"as to avoid preventing absorption opportunities"* (`:88-91`).
             let sum = vals.mint();
             let add = Op::Sentient(sentient::Op::ScalarAdd {
                 lhs: bound,
@@ -256,17 +256,17 @@ impl<'a> LoopAbsorptionManager<'a> {
                 element_size: None,
             });
             if has_definer {
-                // `builder.setInsertionPointAfter(bound.getDefiningOp());` (`:97`).
+                // `builder.setInsertionPointAfter(bound.getDefiningOp());` (`:94`).
                 insert_after_definition(&mut *self.site.body, bound, add);
             } else {
-                // `setInsertionPointToStart(cast<BlockArgument>(bound).getOwner());` (`:99-101`).
+                // `setInsertionPointToStart(cast<BlockArgument>(bound).getOwner());` (`:96-97`).
                 insert_at_start_of_binder(&mut *self.site.body, bound, add);
             }
             set_bound(self.anchor_for_op, self.site.body, sum);
         }
 
         // `if (bound.getDefiningOp() && bound.getDefiningOp()->use_empty())
-        //  bound.getDefiningOp()->erase();` (`:110-111`).
+        //  bound.getDefiningOp()->erase();` (`:103-104`).
         if has_definer && !is_used(&mut *self.site.body, bound) {
             dialects::erase_defining_op(&mut *self.site.body, bound);
         }
@@ -284,7 +284,7 @@ impl<'a> LoopAbsorptionManager<'a> {
         let mut next_sibling = self.tree.prev_sibling(self.anchor);
         while let Some(child) = next_child {
             // `if (!next_sibling || getSubtreeHeightOf(next_child) != getSubtreeHeightOf(next_sibling))`
-            // (`:126-129`) — the anchor ran out of siblings before it ran out of children.
+            // (`:127-130`) — the anchor ran out of siblings before it ran out of children.
             let Some(sibling) = next_sibling else {
                 return false;
             };
@@ -326,9 +326,9 @@ impl<'a> LoopAbsorptionManager<'a> {
     /// this. See [`crate::bridges::dataflow_ir_to_sentient::vc_loop_mask_tree::OperationTreeBase::remove`].
     pub(crate) fn remove_nodes_from_worklist_and_tree(&mut self, nodes_to_delete: &[LoopNodeId]) {
         for n in nodes_to_delete {
-            // `llvm::erase_if(sorted_worklist_, [n](LoopNode *node) { return node == n; })` (`:412-413`).
+            // `llvm::erase_if(sorted_worklist_, [n](LoopNode *node) { return node == n; })` (`:413-414`).
             self.sorted_worklist.retain(|node| node != n);
-            // `tree_.remove(n);` (`:414`).
+            // `tree_.remove(n);` (`:415`).
             self.tree.remove(*n);
         }
     }

@@ -127,7 +127,7 @@ fn sign_extended(value: arith::IntConst) -> i64 {
 /// WHAT `less_than` COMPARES — the sort key of one hoistable constant.
 ///
 /// ⛔ THE DIALECT IS THE ORDERING'S FIRST TERM: every `arith.constant` sorts before every
-/// `sentient.scalar_constant` (`LexicalOrdering.cpp:117-119`, `:139-141`), so which op it is belongs
+/// `sentient.scalar_constant` (`LexicalOrdering.cpp:118-119`, `:141-142`), so which op it is belongs
 /// in the key rather than in the comparison's caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConstKey {
@@ -156,16 +156,18 @@ impl ConstKey {
     /// ⛔ EQUAL VALUES OF DIFFERENT TYPES FALL BACK TO THE TYPE **SPELLING**, which the reference
     /// says out loud: *"A deterministic ordering is required so use the type strings."*
     ///
-    /// ⛔ THIS DIVERGES FROM THE REFERENCE FOR EQUAL-VALUED NEGATIVES OF DIFFERENT WIDTHS. It reaches
-    /// `slt` only after `v_a != v_b`, an APInt comparison that is not sign-extending, so a `-1 : i32`
-    /// and a `-1 : index` take its type-string path and take the equal path here — where the equal
-    /// path RAUWs one onto the other. Sign extension is the ordering `slt` intends, and this is the
-    /// side of the disagreement that does not rewire an `i32` reader onto an `index` value.
+    /// ⛔ THIS DIVERGES FROM THE REFERENCE FOR EQUAL-VALUED NEGATIVES OF DIFFERENT WIDTHS, and it is the
+    /// reference that is wrong. `v_a != v_b` (`:125`) compares APInt RAW WORDS — a width mismatch its
+    /// assert catches only in a debug build — so `-1 : i32` and `-1 : index` DIFFER there and DO reach
+    /// `slt`, which sign-extends each side by its OWN width and answers false both ways: a TIE, and the
+    /// tie path RAUWs one onto the other. [`sign_extended`] has already made them equal here, so the
+    /// type-spelling path orders them and they never tie — the side that does not rewire an `i32`
+    /// reader onto an `index` value.
     fn lt(&self, other: &ConstKey) -> bool {
         use ConstKey::{Arith, ArithDense, Sentient};
         match (self, other) {
             // ⛔ THE REFERENCE ABORTS HERE, IT DOES NOT ORDER THEM: `mlir::cast<mlir::IntegerAttr>`
-            // on a `DenseIntElementsAttr` is a failed cast (`:122-125`), not a null. Reached only
+            // on a `DenseIntElementsAttr` is a failed cast (`:121-124`), not a null. Reached only
             // when a dense constant is actually compared — a lone one is still hoisted.
             (ArithDense, Arith { .. } | ArithDense) | (Arith { .. }, ArithDense) => todo!(
                 "LexicalOrdering::less_than — mlir::cast<IntegerAttr> aborts on an arith.constant \
@@ -188,20 +190,20 @@ impl ConstKey {
         }
     }
 
-    /// Whether two keys tie — `!less_than(a, b) && !less_than(b, a)`, the duplicate test (`:187`).
+    /// Whether two keys tie — `!less_than(a, b) && !less_than(b, a)`, the duplicate test (`:190`).
     fn ties(&self, other: &ConstKey) -> bool {
         !self.lt(other) && !other.lt(self)
     }
 }
 
 /// THE SORT KEY AND RESULT OF ONE HOISTABLE OP — `isa<arith::ConstantOp>` or
-/// `isa<sentient::ConstantOp>` (`:164-166`), and nothing else.
+/// `isa<sentient::ConstantOp>` (`:163-165`), and nothing else.
 ///
 /// ⛔ `sentient.vector_constant` IS NOT A `sentient::ConstantOp` — it is `Sentient_VectorConstantOp`,
 /// a different op class — so it is not collected and not hoisted.
 ///
 /// ⭐ ONE RESULT, NOT A LIST: the reference's `DT_CHECK(op->getNumResults() == prev_op->...)` at
-/// `:189` is discharged by the shape of every constant op, so it is a field and not a check.
+/// `:192` is discharged by the shape of every constant op, so it is a field and not a check.
 fn constant_of(op: &Op) -> Option<(ConstKey, Val)> {
     match op {
         Op::Sentient(sentient::Op::ScalarConstant {
@@ -399,7 +401,7 @@ fn take_from_lower(ops: &mut Vec<lower::Op>, wanted: &[Val], taken: &mut Vec<(Va
 /// duplicate's readers are rewired onto the survivor and the duplicate is dropped.
 ///
 /// ⛔ A NO-OP WHEN THE CONSTANTS ARE ALREADY A CONTIGUOUS, STRICTLY INCREASING PREFIX of the entry
-/// block (`:166-179`) — otherwise EVERY collected constant moves, including ones already in place.
+/// block (`:167-178`) — otherwise EVERY collected constant moves, including ones already in place.
 ///
 /// ⛔ NAMED FOR ITS ARGUMENT because `runOn(func::FuncOp)` and `runOn(ModuleOp)` (e303) are one
 /// overload set in C++ and cannot both be `run_on` here.
@@ -420,7 +422,7 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
     }
     let mut found = collect.found;
 
-    // `do_transform` (`:166-179`). ⛔ THE `||` SHORT-CIRCUITS: a constant that is not adjacent to the
+    // `do_transform` (`:167-178`). ⛔ THE `||` SHORT-CIRCUITS: a constant that is not adjacent to the
     // previous one is never compared to it, which is what keeps a lone dense constant out of `lt`.
     let mut transform = false;
     for (at, current) in found.iter().enumerate() {
@@ -457,7 +459,7 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
         take_from(&mut unit.body, &wanted, &mut taken);
     }
 
-    // `:182-199`, walked back to front: the largest is placed at the entry block's head first, so
+    // `:184-200`, walked back to front: the largest is placed at the entry block's head first, so
     // each survivor inserted before it leaves the block ascending.
     let mut rewires: Vec<(Val, Val)> = Vec::new();
     let mut kept: Option<&Found> = None;

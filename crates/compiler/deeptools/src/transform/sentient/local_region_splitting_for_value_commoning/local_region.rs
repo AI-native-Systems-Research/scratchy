@@ -86,7 +86,7 @@ use crate::islands::sentient::dialects::{Definitions, Op, Val, dataflow};
 use crate::units::{NumFolds, Residency};
 
 /// THE REGION OF THE ORIGINAL `uniform.uniformize_regions` A LOCAL REGION CAME FROM —
-/// `const Region &original_region_` (`:179`), named by the block argument that region binds.
+/// `const Region &original_region_` (`:150`), named by the block argument that region binds.
 ///
 /// ⛔⛔ AN IDENTITY, NOT A BORROW, for the reason [`crate::transform::sentient::ForRef`] gives: this
 /// pass rewrites the very op these regions hang off, so a `&` into it is unusable. Each region of a
@@ -102,10 +102,10 @@ use crate::units::{NumFolds, Residency};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginalRegion(pub Val);
 
-/// ONE TRANSFORMED LOCAL REGION — `lrs::LocalRegion` (`:135-152`): which units it now represents, and
-/// where it came from, *"without having to create an actual local region in MLIR"* (`:132-134`).
+/// ONE TRANSFORMED LOCAL REGION — `lrs::LocalRegion` (`:137-151`): which units it now represents, and
+/// where it came from, *"without having to create an actual local region in MLIR"* (`:134-136`).
 ///
-/// ⛔ NO `Clone`: `LocalRegion(const LocalRegion &) = delete` (`:141`).
+/// ⛔ NO `Clone`: `LocalRegion(const LocalRegion &) = delete` (`:142`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct LocalRegion {
     /// `units_` — in [`super::uniform_region::UniformRegion::add_local_region`]'s order.

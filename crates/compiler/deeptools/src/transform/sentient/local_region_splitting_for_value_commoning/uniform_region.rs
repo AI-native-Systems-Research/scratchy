@@ -92,17 +92,17 @@ use crate::islands::sentient::dialects::{Definitions, Val};
 pub struct UniformizeRegions(pub Val);
 
 /// THE UNIFORMIZED REGION THIS PASS WANTS, BEFORE ANY OP EXISTS FOR IT — `lrs::UniformRegion`
-/// (`:154-181`). `analyze` (e444) fills it, `transform` (e505) builds the op from it; the reference
+/// (`:159-181`). `analyze` (e444) fills it, `transform` (e505) builds the op from it; the reference
 /// keeps it out of the IR because *"MLIR does not allow us to add regions to an existing op"*
 /// (`:157-158`).
 ///
-/// ⛔ NO `Clone`: `UniformRegion(const UniformRegion &) = delete` (`:160`).
+/// ⛔ NO `Clone`: `UniformRegion(const UniformRegion &) = delete` (`:162`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct UniformRegion {
     /// `local_regions_`, in the order [`UniformRegion::add_local_region`] appended them — which is the
     /// region order `transform` emits (`:347`).
     ///
-    /// ⭐ `Vec` FOR `std::deque` (`:178`): nothing holds a reference to an element across a push, so
+    /// ⭐ `Vec` FOR `std::deque` (`:179`): nothing holds a reference to an element across a push, so
     /// the deque's stable element addresses are mechanism a port may drop.
     pub local_regions: Vec<LocalRegion>,
     /// `original_uro_`.
@@ -116,7 +116,7 @@ impl UniformRegion {
     /// closing brace.
     ///
     /// ⭐ A RETURNED `String` FOR `llvm::dbgs()`, as e014_dump did: the only caller wraps the whole
-    /// call in `LLVM_DEBUG` (`:266`), so nothing the reference gated becomes ungated.
+    /// call in `LLVM_DEBUG` (`:267`), so nothing the reference gated becomes ungated.
     #[must_use]
     pub fn dump(&self, defs: Definitions<'_>) -> String {
         let mut out = format!(

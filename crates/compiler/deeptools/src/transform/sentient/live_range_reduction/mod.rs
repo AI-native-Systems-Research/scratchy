@@ -111,7 +111,7 @@ use crate::islands::sentient::print;
 /// AFFINE EXPRESSION, opaque here.
 ///
 /// ⛔ MLIR UPSTREAM, AND NOTHING IN THIS CAMPAIGN BUILDS OR READS ONE. The only producer is
-/// `mlir::getFlattenedAffineExpr` (`LiveRangeReduction.cpp:305`, out of campaign scope) and the only
+/// `mlir::getFlattenedAffineExpr` (`LiveRangeReduction.cpp:308-310`, out of campaign scope) and the only
 /// readers are the system's own `isEqual` and `print`. So this is an IDENTITY, like
 /// [`crate::transform::sentient::analyses::EvaluatedValue`]: which system, not the system.
 ///
@@ -160,7 +160,7 @@ pub struct ExprInfo {
 impl ExprInfo {
     /// Replaces: e056_set
     ///
-    /// Overwrites all three fields — the one way `getBaseExpr` (`:337`, `:349`) fills an `ExprInfo`.
+    /// Overwrites all three fields — the one way `getBaseExpr` (`:342`, `:350`) fills an `ExprInfo`.
     ///
     /// ⛔ `clearAndCopyFrom` IS A REPLACEMENT, NOT A MERGE: it drops whatever system was there and
     /// takes a copy, which owned assignment performs exactly.
@@ -175,8 +175,8 @@ impl ExprInfo {
     /// The three-section trace `printSsaMap` (`e304`) writes per mapped value, each header indented
     /// two spaces.
     ///
-    /// ⭐ EVERY COEFFICIENT IS FOLLOWED BY `", "`, INCLUDING THE LAST (`:145`), and "constrains" is
-    /// the reference's own spelling (`:154`) — this is its output text, not prose.
+    /// ⭐ EVERY COEFFICIENT IS FOLLOWED BY `", "`, INCLUDING THE LAST (`:144`), and "constrains" is
+    /// the reference's own spelling (`:152`) — this is its output text, not prose.
     ///
     /// ⛔ `Value::print` PRINTS THE DEFINING OPERATION, not an SSA name, falling back to
     /// `<block argument> of type '..' at index: N`; [`print::emit`] already terminates the line that
@@ -232,13 +232,13 @@ pub fn are_element_size_identical(lhs: Val, rhs: Val, defs: Definitions<'_>) -> 
 /// per-core query or the symbol it is founded on, stopping at the first op outside `uniform_region`.
 ///
 /// ⛔ `None` IS `signalPassFailure()`: an op the walk cannot attribute an address operand to makes
-/// the reference `emitOpError("can't find global ancestor")` and fail the pass (`:1147-1149`).
+/// the reference `emitOpError("can't find global ancestor")` and fail the pass (`:1153-1154`).
 ///
 /// ⛔ AND THE SRC/DST SPLIT IS THE REFERENCE'S INTENT, NOT ITS CODE. `val ==
-/// load_store_op.getSrcMutableAddr()` (`:1123`) compares an op RESULT against that op's own operand
+/// load_store_op.getSrcMutableAddr()` (`:1127`) compares an op RESULT against that op's own operand
 /// 2 and so is always false, leaving the `src` branch dead and every `load_and_store` address
 /// walking through `dst`; the `.td` names the two results `src_res`/`dst_res` as "the final,
-/// potentially updated, address" of each side (`SentientOps.td:760-763`), so this dispatches on WHICH
+/// potentially updated, address" of each side (`SentientOps.td:744-746`), so this dispatches on WHICH
 /// RESULT `val` is.
 #[must_use]
 pub fn get_first_global_or_constant_ancestor(
@@ -248,7 +248,7 @@ pub fn get_first_global_or_constant_ancestor(
 ) -> Option<Val> {
     let mut val = val;
     loop {
-        // ⭐ `DT_CHECK(isa<sentient::ForOp>(op))` (`:1113`) IS A FACT ABOUT THE ISLAND, not a check:
+        // ⭐ `DT_CHECK(isa<sentient::ForOp>(op))` (`:1114`) IS A FACT ABOUT THE ISLAND, not a check:
         // `for` is the only op of this dialect that binds a region argument.
         let (op, next) = match defs.for_arg_of(val) {
             Some((op @ Op::Sentient(sentient::Op::For { bound, carried, .. }), index)) => {
@@ -283,7 +283,7 @@ pub fn get_first_global_or_constant_ancestor(
                             *dst_mutable_addr
                         }
                     }
-                    // ⭐ FOLLOW THE OPERAND THAT IS NOT A CONSTANT, PREFERRING `lhs` (`:1136-1140`)
+                    // ⭐ FOLLOW THE OPERAND THAT IS NOT A CONSTANT, PREFERRING `lhs` (`:1141-1146`)
                     // — an address plus a constant offset is still that address.
                     Op::Sentient(
                         sentient::Op::ScalarAdd { lhs, rhs, .. }
@@ -303,7 +303,7 @@ pub fn get_first_global_or_constant_ancestor(
                             .map(|value| value.init)?
                     }
                     // ⭐ THE THREE ANCESTORS THE WALK IS LOOKING FOR — returned WITHOUT the region
-                    // test, which is why a terminal op outside the region still answers (`:1145`).
+                    // test, which is why a terminal op outside the region still answers (`:1151`).
                     Op::Sentient(sentient::Op::ScalarConstant { .. })
                     | Op::Uniform(uniform::Op::QueryMap { .. })
                     | Op::Symbol(symbol::Op::CreateSymbol { .. }) => return Some(val),

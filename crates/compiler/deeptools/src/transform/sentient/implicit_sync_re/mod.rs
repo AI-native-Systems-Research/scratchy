@@ -96,7 +96,7 @@ pub(crate) mod implicit_sync_rde_tree;
 
 /// `ImplicitSyncGenValue::tile_size_` WHEN IT IS KNOWN.
 ///
-/// ⛔ `isUnknownValue()` IS `tile_size_ < 0` (`ImplicitSyncRE.hpp:24`) and the constructor's default
+/// ⛔ `isUnknownValue()` IS `tile_size_ < 0` (`ImplicitSyncRE.hpp:43`) and the constructor's default
 /// is `-1`, so the two states are a `NonZeroU32` and its ABSENCE — never a sentinel in the number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TileSize(NonZeroU32);
@@ -108,14 +108,14 @@ impl TileSize {
         TileSize(size)
     }
 
-    /// `getTileSize()` (`ImplicitSyncRE.hpp:26`).
+    /// `getTileSize()` (`ImplicitSyncRE.hpp:46`).
     #[must_use]
     pub(crate) const fn get(self) -> NonZeroU32 {
         self.0
     }
 }
 
-/// `ImplicitSyncGenValue` (`ImplicitSyncRE.hpp:19`) — the dataflow definition an RDE node generates.
+/// `ImplicitSyncGenValue` (`ImplicitSyncRE.hpp:22`) — the dataflow definition an RDE node generates.
 ///
 /// ⭐ DECLARED HERE, WHERE ITS OWN METHODS BELONG: e047-e049 are `isEqual`/`copyTo`/`print` on this
 /// class and are scheduled into this file. e045 (in [`implicit_sync_rde_tree`]) constructs it, which
@@ -126,7 +126,7 @@ pub(crate) struct ImplicitSyncGenValue {
     tile_size: Option<TileSize>,
     /// `op_` — absent for the default-constructed unknown value.
     op: Option<Op>,
-    /// `DataFlowDefinitionBase::is_optimized_` (`Analyses/RedundantDefinitionEliminationTree.hpp:290`)
+    /// `DataFlowDefinitionBase::is_optimized_` (`Analyses/RedundantDefinitionEliminationTree.hpp:327`)
     /// — the base class is OUT OF CAMPAIGN SCOPE, but e049 prints this flag, so the subclass holds it
     /// exactly as it already holds `op_`. Nothing in scope sets it yet.
     is_optimized: bool,
@@ -152,7 +152,7 @@ impl ImplicitSyncGenValue {
         }
     }
 
-    /// `isUnknownValue()` (`ImplicitSyncRE.hpp:24`).
+    /// `isUnknownValue()` (`ImplicitSyncRE.hpp:43`).
     #[must_use]
     pub(crate) const fn is_unknown_value(&self) -> bool {
         self.tile_size.is_none()
@@ -221,7 +221,7 @@ impl ImplicitSyncGenValue {
 }
 
 /// `enable_dead_def_removal`, as `ImplicitSyncRDETree` passes it to the base constructor
-/// (`ImplicitSyncRE.hpp:61`) — a constant of the pass, never a field.
+/// (`ImplicitSyncRE.hpp:62-63`) — a constant of the pass, never a field.
 pub(crate) const ENABLE_DEAD_DEF_REMOVAL: bool = false;
 
 /// Replaces: e050_isOperationAUse

@@ -670,7 +670,7 @@ fn replace_all_uses_in_lower(
 /// value one op reads twice, so `use_count(v, scope) == 1` is exactly `hasOneUse()` and `== 0` is
 /// exactly `use_empty()`. `coalesceScalarArithSimplification` (entry 054) spends this on both of an
 /// add's operands: it only rewrites when an op will be REMOVED to pay for the one it creates
-/// (`LightweightSimplification.cpp:101-104`), and an over-count there declines a rewrite the
+/// (`LightweightSimplification.cpp:125-129`), and an over-count there declines a rewrite the
 /// reference performs while an under-count performs one it declines.
 ///
 /// ⛔ AND IT DESCENDS INTO REGIONS, like the rung below's [`crate::islands::dataflow_ir::dialects::uses`]
