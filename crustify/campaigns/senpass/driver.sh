@@ -121,6 +121,15 @@ prune() {
 
 # ── ONE STAGE ─────────────────────────────────────────────────────────────────────────────────
 stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
+  # ⛔⛔ A COMPLETED STAGE MUST NOT RE-RUN ON RESTART. A port stage is idempotent through its
+  # remainder (below), but a REVIEW stage is not: its schedule always names every unit of the level,
+  # so a restart re-reviewed all 256 of sc1 — already reviewed and gated green hours earlier — and
+  # the driver's own comment records the same thing happening to 142 units before. So each stage
+  # writes a marker on success and skips if one is present. Delete a marker to force a re-run.
+  if [ -f "$CAMPDIR/.done-$3" ]; then
+    say "STAGE $3 SKIPPED (already completed: .done-$3 present)"
+    return 0
+  fi
   # ⛔⛔ A PORT STAGE MUST RUN THE REMAINDER, NOT THE ORIGINAL SCHEDULE. `gen_campaign.py
   # --remainder` writes `port-remainder.json`; the stage list names `port.json`, which still holds
   # every unit the level ever had. On the restart after the stuck-promote recovery this driver
@@ -173,6 +182,8 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
   fi
   python3 "$ROOT/crustify-senpass/tools/gen_campaign.py" --remainder "$ROOT" >> "$TRACE" 2>&1
   prune
+  # The stage got here having landed work and promoted it, so a restart must not redo it.
+  touch "$CAMPDIR/.done-$3"
 }
 
 gate() { # $1 tag
