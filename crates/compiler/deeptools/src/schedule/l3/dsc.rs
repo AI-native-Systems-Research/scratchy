@@ -12,16 +12,19 @@
 //! and `maxSymbolicVolume_`'s keys being named by `symbolicDimInfo_` are each discharged once, where
 //! the value is built.
 
-use crate::arch::Elements;
+use crate::arch::{Bytes, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart,
 };
 use crate::schedule::ddc::fold::Stride;
+use crate::schedule::ddc::metadata::DatastageId;
 use crate::schedule::ddc::transformation::{DsType, Scale};
-use crate::schedule::dsc2::{LayoutDims, LdsIdx};
-use crate::units::Core;
+use crate::schedule::ddc::transformation_util::PaddingForm;
+use crate::schedule::dsc2::{LayoutDims, LdsIdx, NodeName};
+use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+use sys_arch_spec::arch_enums::SenComponent;
 
 /// WHERE ONE LABELLED DATA STRUCTURE LIVES — `memOrg_` (`dsc/dscdefn.h:337`) reduced to the three
 /// questions this stage asks of it, each already the reference's own predicate over that map.
@@ -108,6 +111,12 @@ impl CoreletsUsed {
     #[must_use]
     pub const fn new(count: NonZeroU32) -> Self {
         Self(count)
+    }
+
+    /// The count itself.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
     }
 
     /// Whether more than one corelet is in play — the `numCoreletsUsed_ <= 1` early-out.
@@ -229,6 +238,13 @@ impl LabeledDsList {
 pub struct DesignSpaceConfig {
     /// `numCoreletsUsed_`.
     pub corelets_used: CoreletsUsed,
+    /// `numCoreletsUsed_DSC2_` (`dsc/designSpaceConfig.h:118`).
+    ///
+    /// ⛔⛔ [`None`] IS THE `-1` A DSC IS BUILT WITH, and `prepDsc` (entry 054) is the only thing
+    /// that replaces it. The reference SIZES A `std::vector` WITH IT — `std::vector<int64_t>
+    /// coreletOffsets(dsc.numCoreletsUsed_DSC2_, 0)` (`L3DlOpsScheduler.cpp:4844`) — so the
+    /// unprepared state is undefined behaviour there and absence is the honest answer here.
+    pub corelets_used_dsc2: Option<CoreletsUsed>,
     /// Per dim, corelet 0's share against the whole — `dataStageParam_.at(0).ss_` where the core
     /// data stage exists, else `CoreletD_` against `CoreD_`.
     pub corelet_shares: BTreeMap<PrimaryDim, CoreletShare>,
@@ -263,6 +279,26 @@ impl DesignSpaceConfig {
     pub fn cumulative_stick_sizes(&self, ds_type: DsType) -> Option<Vec<(PrimaryDim, Elements)>> {
         let info = self.primary_ds_info.get(&ds_type)?;
         shape_constraints::cumulative_stick_sizes(&info.stick, StickPart::Whole)
+    }
+
+    /// `getNonBroadcastLdsDims(ldsIdx)` (`dsc/dsc2.cpp:4039`) — `getLayoutDims(ldsIdx)` keeping only
+    /// the dims whose `scale_` is POSITIVE, in that order.
+    ///
+    /// ⭐ THE TWO ORDERS STAY TWO. The reference builds its set from `primaryDsInfo_`'s layout order
+    /// and then filters `getLayoutDims(ldsIdx)`, a DIFFERENT list; [`LabeledDs`] carries the first
+    /// zipped, so the membership test is a scale lookup and a dim named by neither drops out.
+    #[must_use]
+    pub fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Vec<PrimaryDim> {
+        let Some(labeled) = self.labeled_ds.at(lds) else {
+            return Vec::new();
+        };
+        let Some(layout) = self.layout_dims.get(&lds) else {
+            return Vec::new();
+        };
+        layout
+            .iter()
+            .filter(|&dim| matches!(labeled.scale(dim), Some(Scale::Sized(scale)) if scale > 0.0))
+            .collect()
     }
 }
 
@@ -303,6 +339,11 @@ impl DscList {
     /// Every DSC, in `dscs_` order.
     pub fn iter(&self) -> impl Iterator<Item = &DesignSpaceConfig> + '_ {
         core::iter::once(&self.first).chain(self.rest.iter())
+    }
+
+    /// Every DSC, in `dscs_` order, to be WRITTEN — `for (auto &dsc : mySDsc.dscs_)`.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut DesignSpaceConfig> + '_ {
+        core::iter::once(&mut self.first).chain(self.rest.iter_mut())
     }
 }
 
@@ -396,6 +437,11 @@ impl SuperDsc {
     #[must_use]
     pub const fn dscs(&self) -> &DscList {
         &self.dscs
+    }
+
+    /// `dscs_`, to be WRITTEN — entry 054 fills each DSC's `numCoreletsUsed_DSC2_` through it.
+    pub const fn dscs_mut(&mut self) -> &mut DscList {
+        &mut self.dscs
     }
 }
 
@@ -752,4 +798,205 @@ impl FilledDims {
     pub const fn symbolic_mut(&mut self) -> &mut Symbolic {
         &mut self.0.symbolic
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// PLACEMENT — what entries 049, 050, 053, 055 and 056 read off an allocation and its schedule tree.
+// ⭐ REACHING AN `AllocateNode` THROUGH `memOrg_` OR A TREE WALK IS THE MECHANISM, the one part the
+// campaign statement names as droppable; the placed address, the corelet share and the indirection
+// are the facts, and they are what these seams state.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A PLACED BYTE ADDRESS — `AllocateNode::startAddressCoreCorelet_`'s `int64_t` (`dsc/dsc2.h:983`).
+///
+/// ⛔⛔ UNSIGNED, WHICH IS `DT_CHECK_MSG(startAddr >= 0 && bufferOffset >= 0, "Invalid start address
+/// or buffer offset.")` (`L3DlOpsScheduler.cpp:4955`) DISCHARGED HERE: the reference seeds both at
+/// `-1` and that check is what rules the sentinel out. Absence carries the sentinel instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteAddress(pub u64);
+
+/// HOW FAR INTO AN ALLOCATION ONE CORE'S BUFFER STARTS — `bufferOffsetCoreCorelet_`'s `int64_t`
+/// (`dsc/dsc2.h:988`). A DISPLACEMENT, not an address, and the reference adds the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BufferOffset(pub u64);
+
+/// HOW MANY BUFFERS AN ALLOCATION GETS — `AllocateNode::numBuffers_` (`dsc/dsc2.h:984`), an enum
+/// because that field's own comment states the three values it takes: "1:no buffering,
+/// 2:double-buffer, -1:streaming buffer".
+///
+/// ⛔ ENTRY 050 ACCEPTS ONLY TWO OF THEM — `DT_CHECK_MSG(numBuffers_ == 1 || numBuffers_ == 2,
+/// "Expect no buffering or double buffering.")` — so [`Streaming`](Buffering::Streaming) is a state
+/// entry 016 can MINT and a placement cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Buffering {
+    /// `1`.
+    None,
+    /// `2`.
+    Double,
+    /// `-1`.
+    Streaming,
+}
+
+impl Buffering {
+    /// `numBuffers_`, `None` for a count the field's own comment does not name.
+    #[must_use]
+    pub const fn of(buffers: i32) -> Option<Self> {
+        match buffers {
+            1 => Some(Self::None),
+            2 => Some(Self::Double),
+            -1 => Some(Self::Streaming),
+            _ => Option::None,
+        }
+    }
+}
+
+/// A COORDINATE INTO AN ALLOCATION'S PLACED ADDRESSES — `startAddressCoreCorelet_`'s
+/// `std::deque<int64_t>`, "per core, corelet, and sdsc folds" (`dsc/dsc2.h:982-984`).
+///
+/// ⭐ THE CORE AND THE CORELET ARE ENTRIES 0 AND 1, which is what lets entry 050 write
+/// `coord.at(1) = 0`; everything behind them belongs to the super-DSC's own folds and passes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressCoord {
+    /// `coord.at(0)`.
+    pub core: Core,
+    /// `coord.at(1)`.
+    pub corelet: Corelet,
+    /// `coord` from index 2 on.
+    pub sdsc_folds: Vec<i64>,
+}
+
+/// WHAT AN ALLOCATION INDIRECTS THROUGH — `AllocateNode::IndirectAllocType` (`dsc/dsc2.h:990`) with
+/// the `INDEX_TENSOR` arm carrying the `IndexTensorType` (`:995`) that is only read under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectAlloc {
+    /// `VALUE_TENSOR` — a paged tensor's values.
+    ValueTensor,
+    /// `INDEX_TENSOR`.
+    IndexTensor(IndexTensor),
+}
+
+/// WHAT AN INDEX TENSOR HOLDS — `AllocateNode::IndexTensorType` (`dsc/dsc2.h:995`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexTensor {
+    /// `ADDRESS` — the only kind the L3 scheduler supports.
+    Address,
+    /// `INDEX`.
+    Index,
+}
+
+/// WHAT A LABELLED DS'S `memOrg_` ANSWERS — `LabeledDsInfo::memOrg_` (`dsc/dscdefn.h:330`) reduced to
+/// the reads this batch makes of it.
+pub trait MemOrg {
+    /// `isHbmPinned()` (`dsc/dscdefn.h:369`) — `memOrg_.at(HBM).isPresent`, false with no HBM entry.
+    ///
+    /// ⭐ THE SAME PREDICATE [`Pinning::hbm`] STATES, reached from the allocation side rather than
+    /// from a [`LabeledDs`]; entry 050 holds the LX node this seam answers for, not the labelled DS.
+    fn hbm_pinned(&self) -> bool;
+
+    /// `memOrg_.at(SenComponents::LX).allocateNode_->numBuffers_`.
+    ///
+    /// ⛔ [`None`] COVERS THREE OF ENTRY 050'S REFUSALS AT ONCE: `DT_CHECK_MSG(memOrg_.count(LX),
+    /// "Expect LX in memOrg_.")`, `DT_ERROR("Expect a valid LX allocate node.")`, and a `numBuffers_`
+    /// outside the two [`Buffering`] names.
+    fn lx_buffering(&self) -> Option<Buffering>;
+
+    /// `startAddressCoreCorelet_.getData(coord)` on that node, `None` where it holds no such entry.
+    fn lx_start_address(&self, at: &AddressCoord) -> Option<ByteAddress>;
+
+    /// `bufferOffsetCoreCorelet_.at(coord.at(0)).at(corelet)` on that node — both `.at()`s.
+    fn lx_buffer_offset(&self, core: Core, corelet: Corelet) -> Option<BufferOffset>;
+
+    /// `memOrg_.at(SenComponents::HBM).allocateNode_->indirectAllocType_` with its
+    /// `indexTensorType_`; [`None`] is no HBM entry, a null allocate node, or `NO_INDIRECTION`.
+    fn hbm_indirection(&self) -> Option<IndirectAlloc>;
+}
+
+/// WHAT ENTRY 049 READS OFF ONE DATA STAGE — `DataStructDims` (`dsc/dims.h:268-300`) reduced to the
+/// four lookups a corelet offset is built from, so the node stage and the chunk stage are ONE type.
+pub trait DimStage {
+    /// `primaryDimToVal_st(dim, comp, /*ptrowId=*/-1, corelet, padded)` (`dsc/dims.cpp:651`) — that
+    /// corelet's padded extent along `dim`, [`None`] for any of its `.at()` throws.
+    fn corelet_dim_val(
+        &self,
+        dim: PrimaryDim,
+        comp: SenComponent,
+        corelet: Corelet,
+        padded: &PaddingForm,
+    ) -> Option<Extent>;
+
+    /// `coreletSplit_.count(dim)` (`dsc/dims.h:236`).
+    fn is_corelet_split(&self, dim: PrimaryDim) -> bool;
+
+    /// `coreletSplit_.at(dim).at(corelet)` — that corelet's RAW share, unpadded.
+    fn corelet_split(&self, dim: PrimaryDim, corelet: Corelet) -> Option<Extent>;
+
+    /// `paddingSizes_.at(dim).stride_` (`dsc/dims.h:219,140`).
+    ///
+    /// ⛔ [`None`] IS BOTH OF ENTRY 049'S CHECKS ON IT — `paddingSizes_.count(dim)` and
+    /// `stride_ > 0` — because a non-positive stride is not a stride this offset can use.
+    fn pad_stride(&self, dim: PrimaryDim) -> Option<Stride>;
+}
+
+/// ONE DSC'S SCHEDULE TREE AS ENTRY 053 READS IT — `scheduleTree_.traverseTreeDFS()`.
+pub trait ScheduleNodes {
+    /// Every node's `name_` in DFS order; the EMPTY vector is `scheduleTree_.empty()`.
+    fn node_names(&self) -> Vec<NodeName>;
+}
+
+/// ONE ALLOCATION AS ENTRY 055 READS IT — an `ALLOCATE` node's `ldsIdx_`, `component_` and the
+/// `(core, address)` pairs its `startAddressCoreCorelet_` states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedAllocation {
+    /// `ldsIdx_`, [`None`] for the reference's `-1`.
+    pub lds: Option<LdsIdx>,
+    /// `component_`.
+    pub component: SenComponent,
+    /// `getDataAndFoldCoordinates()` reduced to `coord[0]` and the value, in the fold manager's own
+    /// order — `if (!coord.empty())` skips an entry that names no core at all.
+    pub addresses: Vec<(Core, ByteAddress)>,
+}
+
+/// EVERY DSC'S ALLOCATIONS IN ONE SUPER-DSC — `dscs_.at(i).scheduleTree_.traverseTreeDFS(nullptr,
+/// {dsc2::ScheduleNode::ALLOCATE})`.
+///
+/// ⭐ `DT_CHECK_MSG(allocNode, "Expect an allocate node.")` IS THE FILTER THAT PRODUCED THE LIST: the
+/// reference `dynamic_cast`s each node back down and checks the cast it just asked the walk for.
+pub trait ScheduleTrees {
+    /// That DSC's allocations in DFS order; EMPTY for an index the super-DSC does not have.
+    fn allocations(&self, dsc: DscIdx) -> Vec<PlacedAllocation>;
+}
+
+/// `dataStageCoreIdx`, `0` (`L3DlOpsScheduler.cpp:275`).
+pub const DATA_STAGE_CORE: DatastageId = DatastageId(0);
+
+/// `dataStageChunkIdx`, `1` (`L3DlOpsScheduler.cpp:276`).
+pub const DATA_STAGE_CHUNK: DatastageId = DatastageId(1);
+
+/// ONE DSC'S SCHEDULER METADATA — `L3DlOpsScheduler::Metadata` (`L3DlOpsScheduler.h:111`) reduced to
+/// the two fields this batch writes.
+///
+/// ⭐⭐ NEITHER ID IS OPTIONAL, AND THAT IS THE REFERENCE'S `-1`s GONE. `core_dstgid` and
+/// `chunk_dstgid` are declared `-1` (`:193-194`) and `prepDsc` is the ONLY thing that mints an
+/// entry, always writing both, so a `Metadata` without them is a state the reference cannot reach.
+/// ⛔ IT IS THE SCHEDULER'S OWN `Metadata`, NOT [`crate::schedule::ddc::metadata::Metadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerMetadata {
+    /// `core_dstgid`.
+    pub core_dstg: DatastageId,
+    /// `chunk_dstgid`.
+    pub chunk_dstg: DatastageId,
+}
+
+/// HOW FAR INTO AN ALLOCATION ONE CORELET'S SHARE STARTS — entry 049's `int64_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CoreletOffset(pub Bytes);
+
+/// WHERE ONE LABELLED DS'S LX DATA STARTS — entry 050's `std::pair<int64_t, int64_t>`, whose two
+/// halves are different units and so different types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitialPlacement {
+    /// `startAddressCoreCorelet_.getData(coord)`.
+    pub start: ByteAddress,
+    /// `bufferOffsetCoreCorelet_.at(core).at(0)`, or `0` where there is only ever one buffer.
+    pub buffer_offset: BufferOffset,
 }

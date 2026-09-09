@@ -247,7 +247,10 @@ fn sampled_as(component: SenComponent) -> Option<VectorComp> {
 
 /// `stickSizePerDim.count(dim) ? .at(dim) : 1` — and the reference's DIVISION BY ZERO where a stick
 /// dim measures nought, which has no [`NonZeroU64`].
-fn stick_divisor(sizes: &[(PrimaryDim, Elements)], dim: PrimaryDim) -> Option<NonZeroU64> {
+pub(crate) fn stick_divisor(
+    sizes: &[(PrimaryDim, Elements)],
+    dim: PrimaryDim,
+) -> Option<NonZeroU64> {
     match sizes.iter().find(|(walked, _)| *walked == dim) {
         Some(&(_, size)) => NonZeroU64::new(size.0),
         None => NonZeroU64::new(1),

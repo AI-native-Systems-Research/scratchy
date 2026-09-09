@@ -267,7 +267,7 @@
 //! | `e380_setChunkDataStageParams` | 380 | 8 | 129 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1439` |
 //! | `e382_run` | 382 | 9 | 122 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912` |
 
-use crate::arch::Elements;
+use crate::arch::{Arch, Bytes, Elements, IsaGen};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
 use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, PadType};
 use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, stricter_max, stricter_min};
@@ -275,14 +275,16 @@ use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::{
     DataStage, DataStages, LoopDims, LoopNode, PaddingForm, PrimaryDimAndKind, StageDims, StageName,
 };
-use crate::schedule::ddc::v1::ComputeOps;
+use crate::schedule::ddc::v1::{self, ComputeOps};
 use crate::schedule::dsc2::{
-    BlockNode, Dsts, LdsIdx, NodeName, ReplicationFactor, SyncDirection, SyncNode, SyncStrength,
-    SyncUnits, TransferNode, Via,
+    AllocateNode, BlockNode, Dsts, LdsIdx, NodeName, ReplicationFactor, SyncDirection, SyncNode,
+    SyncStrength, SyncUnits, TransferNode, Via,
 };
 use crate::schedule::l3::dsc::{
-    CoreletShare, DesignSpaceConfig, DscGroup, DscIdx, FilledDims, LabeledDs, MulticastDegree,
-    Pinning, SuperDsc, SymbolicDimInfo, UnneededPad,
+    AddressCoord, BufferOffset, Buffering, ByteAddress, CoreletOffset, CoreletShare,
+    DATA_STAGE_CHUNK, DATA_STAGE_CORE, DesignSpaceConfig, DimStage, DscGroup, DscIdx, FilledDims,
+    IndexTensor, IndirectAlloc, InitialPlacement, LabeledDs, MemOrg, MulticastDegree, Pinning,
+    ScheduleNodes, ScheduleTrees, SchedulerMetadata, SuperDsc, SymbolicDimInfo, UnneededPad,
 };
 use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -518,6 +520,7 @@ mod tests_e001_e008 {
     fn plain_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
             corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
             primary_ds_info: BTreeMap::new(),
             core_ids_used: CoreIdsUsed::new(core(0), vec![]),
@@ -801,19 +804,6 @@ mod tests_e001_e008 {
 // ⭐ TYPES FOR ENTRIES 009-016. The DSC-side and super-DSC-side facts these entries read live in
 // [`crate::schedule::l3::dsc`] beside the rest of this stage's reduced vocabulary; what is declared
 // here is the L3 SCHEDULER'S OWN state — its private `Metadata` and the allocate node it mints.
-
-/// HOW MANY BUFFERS AN ALLOCATION GETS — `AllocateNode::numBuffers_` (`dsc/dsc2.h:984`), an enum
-/// because that field's own comment states the three values it takes: "1:no buffering,
-/// 2:double-buffer, -1:streaming buffer".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Buffering {
-    /// `1`.
-    None,
-    /// `2`.
-    Double,
-    /// `-1`.
-    Streaming,
-}
 
 /// `dsc2::AllocateNode` (`dsc/dsc2.h:974`) AS ENTRY 016 MINTS ONE.
 ///
@@ -1154,6 +1144,7 @@ mod tests_e009_e016 {
     fn a_dsc() -> DesignSpaceConfig {
         DesignSpaceConfig {
             corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
             primary_ds_info: BTreeMap::new(),
             core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
@@ -2187,6 +2178,7 @@ mod tests_e033_e040 {
         let (first, rest) = labeled.split_first().expect("a DSC labels a structure");
         DesignSpaceConfig {
             corelets_used: CoreletsUsed::ONE,
+            corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
             primary_ds_info: BTreeMap::new(),
             core_ids_used: CoreIdsUsed::new(Core::checked(0).expect("core 0"), vec![]),
@@ -2452,53 +2444,750 @@ mod tests_e033_e040 {
 //   original  : std::pair<size_t, size_t> L3DlOpsScheduler::getSharesAndGroupName( const SuperDsc &mySDsc, const DesignSpaceConfig &dsc, const LabeledDsInfo &lds, const std::map<PrimaryDimTypes, int> &currWkSlices, const std::vector<int> &processingCoreIds)
 //   extract   : crustify-ddc/cpp/l3.cpp:1208-1255
 
-// crustify:todo: e049_calculateCoreletOffsetInByte
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4842  (82 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::vector<int64_t> L3DlOpsScheduler::calculateCoreletOffsetInByte( const DesignSpaceConfig &dsc, dsc2::AllocateNode *allocNode) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1265-1348
+/// Replaces: e049_calculateCoreletOffsetInByte
+///
+/// Where each corelet's share of an allocation begins, in bytes: the stick size times each
+/// non-broadcast dim's stick count, walked until the one corelet-split dim, accumulated corelet by
+/// corelet.
+///
+/// ⛔⛔ THE CHECKED STRIDE IS NOT THE USED STRIDE. All four `DT_CHECK`s of the padded arm test
+/// `dsNode` — one of them worded *"Expect padding sizes in chunk data stage params"* — while the
+/// arithmetic multiplies `dsChunk.paddingSizes_.at(dim).stride_` and `dsChunk.coreletSplit_`; entry
+/// 219, the near-duplicate, checks `dsChunk`. Both stages are asked here, so neither reading is lost.
+/// ⛔ THE OPERANDS COME FROM CORELET `id - 1` WHILE THE OFFSET LANDS ON CORELET `id`.
+/// ⛔ The reference accumulates in `int` and returns `int64_t`, with `bytesPerStick` multiplied in
+/// FIRST; this checks in `u64` and answers [`None`] on overflow instead of wrapping.
+#[must_use]
+pub fn calculate_corelet_offset_in_byte<A: Arch, N: DimStage + ?Sized, C: DimStage + ?Sized>(
+    dsc: &DesignSpaceConfig,
+    node_stage: &N,
+    chunk_stage: &C,
+    lds: LdsIdx,
+    component: SenComponent,
+    padding: &PaddingForm,
+) -> Option<BTreeMap<Corelet, CoreletOffset>> {
+    let corelets = dsc.corelets_used_dsc2?.get();
+    let mut offsets = (0..corelets)
+        .map(|id| Some((Corelet::checked(id)?, CoreletOffset(Bytes(0)))))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    if corelets < 2 {
+        return Some(offsets);
+    }
 
-// crustify:todo: e050_getInitialStartAddressAndOffset
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4926  (31 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::pair<int64_t, int64_t> L3DlOpsScheduler::getInitialStartAddressAndOffset( DesignSpaceConfig &dsc, const int ldsIdx, std::deque<int64_t> coord) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1358-1390
+    let dims = dsc.non_broadcast_lds_dims(lds);
+    let split: Vec<PrimaryDim> = dims
+        .iter()
+        .copied()
+        .filter(|&dim| chunk_stage.is_corelet_split(dim))
+        .collect();
+    let split_dim = match split.as_slice() {
+        [] => return Some(offsets),
+        [only] => *only,
+        // `DT_CHECK_MSG(.size() <= 1, "Support maximal one corelet split dimension for a tensor")`.
+        _ => return None,
+    };
 
-// crustify:todo: e051_getLdsOrConstNameOfAllocNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5493  (10 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::string L3DlOpsScheduler::getLdsOrConstNameOfAllocNode( DesignSpaceConfig *currDsc, dsc2::AllocateNode *anode)
-//   extract   : crustify-ddc/cpp/l3.cpp:1400-1411
+    let sticks = dsc.cumulative_stick_sizes(dsc.labeled_ds.at(lds)?.ds_type())?;
+    let mut overall: u64 = 0;
+    for id in 1..corelets {
+        let from = Corelet::checked(id - 1)?;
+        let mut offset = A::BYTES_PER_STICK.get();
+        for dim in &dims {
+            let dim = *dim;
+            let extent = if dim != split_dim {
+                node_stage.corelet_dim_val(dim, component, from, padding)?
+            } else if padding.padding(dim) == PadType::NoPad {
+                chunk_stage.corelet_dim_val(dim, component, from, padding)?
+            } else {
+                // `offset_in_element = size_of_i * stride`, and only for `I`.
+                (padding.padding(dim) == PadType::PaddedFullSpanWUnneeded).then_some(())?;
+                (dim == PrimaryDim::I).then_some(())?;
+                node_stage.pad_stride(dim)?;
+                let share = chunk_stage.corelet_split(dim, from)?;
+                Extent(share.0.checked_mul(chunk_stage.pad_stride(dim)?.0)?)
+            };
+            let per_stick = v1::stick_divisor(&sticks, dim)?;
+            offset = offset.checked_mul(u64::try_from(extent.0).ok()? / per_stick.get())?;
+            if dim == split_dim {
+                break;
+            }
+        }
+        overall = overall.checked_add(offset)?;
+        offsets.insert(Corelet::checked(id)?, CoreletOffset(Bytes(overall)));
+    }
+    Some(offsets)
+}
 
-// crustify:todo: e052_verifyLoopOrder
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6366  (17 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::verifyLoopOrder( std::vector<PrimaryDimTypes> &loopOrder)
-//   extract   : crustify-ddc/cpp/l3.cpp:1421-1439
+/// Replaces: e050_getInitialStartAddressAndOffset
+///
+/// Where a labelled DS's LX data starts on one core and which buffer it reads, both taken at
+/// corelet 0.
+///
+/// ⛔ CORELET 0 IS BOUND HERE, NOT BY THE CALLER: the reference OVERWRITES `coord.at(1)`, so a
+/// caller's corelet is discarded and only the core and the super-DSC folds behind it survive.
+/// ⛔ [`None`] IS EVERY REFUSAL AT ONCE — no `LX` in `memOrg_`, a null LX allocate node, a
+/// `numBuffers_` the field's comment does not name, an unplaced address, and any buffering but
+/// [`Buffering::None`] on a DS that is not HBM pinned, where the reference demands one buffer.
+#[must_use]
+pub fn initial_start_address_and_offset<M: MemOrg + ?Sized>(
+    mem: &M,
+    coord: &AddressCoord,
+) -> Option<InitialPlacement> {
+    let at = AddressCoord {
+        core: coord.core,
+        corelet: Corelet::at::<0>(),
+        sdsc_folds: coord.sdsc_folds.clone(),
+    };
+    let buffering = mem.lx_buffering()?;
+    let start = mem.lx_start_address(&at)?;
+    let buffer_offset = if mem.hbm_pinned() {
+        mem.lx_buffer_offset(at.core, at.corelet)?
+    } else {
+        // "There is always only one buffer in this case, so the offset is zero."
+        matches!(buffering, Buffering::None).then_some(())?;
+        BufferOffset(0)
+    };
+    Some(InitialPlacement {
+        start,
+        buffer_offset,
+    })
+}
 
-// crustify:todo: e053_verifyScheduleTree
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6385  (22 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::verifyScheduleTree(const DesignSpaceConfig &dsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:1449-1471
+/// Replaces: e051_getLdsOrConstNameOfAllocNode
+///
+/// The L3 scheduler's own copy of [`v1::get_lds_or_const_name_of_alloc_node`].
+///
+/// ⭐⭐ IT DELEGATES BECAUSE THE REFERENCE SAYS TO: *"This function is mostly copied from DDC. We may
+/// have to frequently synchronize with the one in DDC. And eventually we should try to combine"*
+/// (`L3DlOpsScheduler.cpp:5504-5507`). The two bodies are identical but for `currDsc` being a
+/// parameter here and a member there, so a second name resolver would be the drift that TODO fears.
+#[must_use]
+pub fn get_lds_or_const_name_of_alloc_node(
+    anode: &AllocateNode,
+    names: &impl v1::StorageNames,
+) -> Option<v1::StorageName> {
+    v1::get_lds_or_const_name_of_alloc_node(anode, names)
+}
 
-// crustify:todo: e054_prepDsc
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6411  (13 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : void L3DlOpsScheduler::prepDsc(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:1481-1494
+/// A LOOP ORDER PROVED TO NAME EACH DIM ONCE — `verifyLoopOrder`'s `isGood` made unconstructible
+/// where it is false.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopOrder(Vec<PrimaryDim>);
 
-// crustify:todo: e055_computeMinHMICoreGroupSizeForSEN1P5
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6486  (94 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : int L3DlOpsScheduler::computeMinHMICoreGroupSizeForSEN1P5( const SuperDsc &mySDsc, const std::vector<int> &hbmLdsIndices) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1504-1599
+impl LoopOrder {
+    /// Replaces: e052_verifyLoopOrder
+    ///
+    /// A loop order is good exactly when no dim repeats in it; [`None`] is the reference's `false`.
+    ///
+    /// ⭐ THE `verbose` PRINT IS DIAGNOSTICS, NOT THE ANSWER: the reference names every repeat on
+    /// `std::cout` and keeps scanning, and the value it returns does not depend on the printing.
+    #[must_use]
+    pub fn of(order: &[PrimaryDim]) -> Option<Self> {
+        let mut visited = BTreeSet::new();
+        order
+            .iter()
+            .all(|dim| visited.insert(*dim))
+            .then(|| Self(order.to_vec()))
+    }
 
-// crustify:todo: e056_isIndexLds
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6582  (13 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isIndexLds(const LabeledDsInfo &lds) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1609-1622
+    /// The order, as the reference's `loopOrder` holds it.
+    #[must_use]
+    pub fn dims(&self) -> &[PrimaryDim] {
+        &self.0
+    }
+}
+
+/// A SCHEDULE TREE PROVED NON-EMPTY AND UNIQUELY NAMED — `verifyScheduleTree`'s two answers as one
+/// type, because a caller that has this has both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedScheduleTree(());
+
+impl VerifiedScheduleTree {
+    /// Replaces: e053_verifyScheduleTree
+    ///
+    /// A schedule tree passes when it has nodes at all and no two of them share a name.
+    ///
+    /// ⛔ ITS TWO `false`s ARE ONE ABSENCE: `scheduleTree_.empty()` returns early and a repeated
+    /// `name_` falls out of the name set, and no caller distinguishes them. The `verbose` print is
+    /// diagnostics.
+    #[must_use]
+    pub fn of<T: ScheduleNodes + ?Sized>(tree: &T) -> Option<Self> {
+        let names = tree.node_names();
+        (!names.is_empty()).then_some(())?;
+        let mut all_names = BTreeSet::new();
+        names
+            .into_iter()
+            .all(|name| all_names.insert(name))
+            .then_some(Self(()))
+    }
+}
+
+/// Replaces: e054_prepDsc
+///
+/// Gives every DSC its dsc2 corelet count and mints its scheduler metadata, naming the core and
+/// chunk data stages.
+///
+/// ⭐⭐ THIS IS THE MUTATION, and it is why [`DesignSpaceConfig::corelets_used_dsc2`] is an
+/// [`Option`]: a DSC is built holding the reference's `-1`, and this is the only thing that
+/// replaces it. "do imbalanced corelet split in the future" — the copy is the whole rule today.
+/// ⭐ `dscMetadata.emplace` KEEPS AN EXISTING ENTRY, but both ids are written after it unconditionally,
+/// so a rerun lands the same two values on every DSC and a freshly built map is that same state.
+pub fn prep_dsc(sdsc: &mut SuperDsc) -> BTreeMap<DscIdx, SchedulerMetadata> {
+    for dsc in sdsc.dscs_mut().iter_mut() {
+        dsc.corelets_used_dsc2 = Some(dsc.corelets_used);
+    }
+    sdsc.dscs()
+        .iter()
+        .zip(0u32..)
+        .map(|(_, idx)| {
+            (
+                DscIdx(idx),
+                SchedulerMetadata {
+                    core_dstg: DATA_STAGE_CORE,
+                    chunk_dstg: DATA_STAGE_CHUNK,
+                },
+            )
+        })
+        .collect()
+}
+
+/// AN HMI GROUP KEY — address bits 39, 36, 35 and 34 packed into four, most significant first
+/// (`L3DlOpsScheduler.cpp:6552-6563`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HmiBits(pub u32);
+
+impl HmiBits {
+    /// The four bits one address falls into.
+    #[must_use]
+    pub const fn of(address: ByteAddress) -> Self {
+        let bits = address.0;
+        Self(
+            (((bits >> 39) & 1) << 3
+                | ((bits >> 36) & 1) << 2
+                | ((bits >> 35) & 1) << 1
+                | ((bits >> 34) & 1)) as u32,
+        )
+    }
+}
+
+/// HOW MANY WORK SLICES SHARE ONE HMI REQUEST GROUP — entry 055's `int`, a count of distinct
+/// addresses and never zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HmiGroupSize(pub u32);
+
+/// Replaces: e055_computeMinHMICoreGroupSizeForSEN1P5
+///
+/// The smallest HMI request group over the given HBM tensors: per tensor one address per used core,
+/// deduplicated, bucketed by [`HmiBits`], the smallest bucket taken, then the smallest across tensors.
+///
+/// ⛔ [`None`] IS THE `INT_MAX` THE REFERENCE RETURNS UNTOUCHED when no tensor produced a group at
+/// all — and also `DT_CHECK_MSG(coreArch == SEN1P5_ISA, "Expecting SEN1P5_ISA.")`, which no other
+/// generation survives.
+/// ⛔ FIRST ADDRESS PER CORE WINS, and across DSCs the reference walks an `unordered_map`, so which
+/// DSC that is is unspecified there; `dscs_` order is taken here.
+#[must_use]
+pub fn compute_min_hmi_core_group_size_for_sen1p5<A: Arch, T: ScheduleTrees + ?Sized>(
+    sdsc: &SuperDsc,
+    trees: &T,
+    hbm_lds: &[LdsIdx],
+) -> Option<HmiGroupSize> {
+    if A::GEN != IsaGen::Sen1p5 {
+        return None;
+    }
+    let mut min_requests: Option<HmiGroupSize> = None;
+    for &lds in hbm_lds {
+        let mut core_to_address: BTreeMap<Core, ByteAddress> = BTreeMap::new();
+        for (dsc, idx) in sdsc.dscs().iter().zip(0u32..) {
+            let used: BTreeSet<Core> = dsc.core_ids_used.iter().collect();
+            for alloc in trees.allocations(DscIdx(idx)) {
+                if alloc.lds != Some(lds) || alloc.component != SenComponent::Hbm {
+                    continue;
+                }
+                for (core, address) in alloc.addresses {
+                    if used.contains(&core) {
+                        core_to_address.entry(core).or_insert(address);
+                    }
+                }
+            }
+        }
+        let unique: BTreeSet<ByteAddress> = core_to_address.into_values().collect();
+        let mut groups: BTreeMap<HmiBits, u32> = BTreeMap::new();
+        for address in unique {
+            *groups.entry(HmiBits::of(address)).or_insert(0) += 1;
+        }
+        if let Some(&smallest) = groups.values().min() {
+            min_requests = Some(HmiGroupSize(
+                min_requests.map_or(smallest, |seen: HmiGroupSize| seen.0.min(smallest)),
+            ));
+        }
+    }
+    min_requests
+}
+
+/// Replaces: e056_isIndexLds
+///
+/// Whether a labelled DS is an INDEX tensor — its HBM allocation indirects through one.
+///
+/// ⛔ [`None`] IS `DT_CHECK_MSG(indexTensorType_ == ADDRESS, "Only index tensors of type address are
+/// supported")`: an index tensor holding INDICES is a refusal, not a `false`. Every other shape — no
+/// HBM entry, a null allocate node, no indirection, a value tensor — answers `false`.
+#[must_use]
+pub fn is_index_lds<M: MemOrg + ?Sized>(lds: &M) -> Option<bool> {
+    match lds.hbm_indirection() {
+        Some(IndirectAlloc::IndexTensor(IndexTensor::Address)) => Some(true),
+        Some(IndirectAlloc::IndexTensor(IndexTensor::Index)) => None,
+        Some(IndirectAlloc::ValueTensor) | None => Some(false),
+    }
+}
+
+#[cfg(test)]
+mod tests_e049_e056 {
+    use super::*;
+    use crate::arch::{Dd2, Sen1p5};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::StickDims;
+    use crate::schedule::ddc::fold::Stride;
+    use crate::schedule::dsc2::{AllocLayout, LayoutDims, MaxDimSize, StartAddress};
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DscList, LabeledDsList, PlacedAllocation, PrimaryDsInfo,
+        StageDims,
+    };
+    use std::num::NonZeroU32;
+
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("core in range")
+    }
+
+    fn corelets(count: u32) -> CoreletsUsed {
+        CoreletsUsed::new(NonZeroU32::new(count).expect("a corelet count"))
+    }
+
+    /// A DSC labelling one INPUT tensor whose layout and stick both name `dims`, none broadcast.
+    fn dsc(dims: &[(PrimaryDim, u64)], sticks: &[(PrimaryDim, u64)]) -> DesignSpaceConfig {
+        let (first, _) = *dims.first().expect("a tensor with a dim in it");
+        let layout = LayoutDims::new(first, dims[1..].iter().map(|(dim, _)| *dim).collect());
+        let mut stage = StageDims::default();
+        stage.extents.insert(first, Extent(1));
+        DesignSpaceConfig {
+            corelets_used: corelets(2),
+            corelets_used_dsc2: Some(corelets(2)),
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::from([(
+                DsType::Input,
+                PrimaryDsInfo {
+                    layout: layout.clone(),
+                    stick: StickDims(
+                        sticks
+                            .iter()
+                            .map(|&(dim, size)| (dim, Elements(size)))
+                            .collect(),
+                    ),
+                },
+            )]),
+            core_ids_used: CoreIdsUsed::new(core(0), vec![core(1)]),
+            layout_dims: BTreeMap::from([(LdsIdx(0), layout)]),
+            core_stage: FilledDims::of(stage).expect("a stage that states a dim"),
+            labeled_ds: LabeledDsList::new(
+                LabeledDs::new(
+                    DsType::Input,
+                    dims.iter()
+                        .map(|&(dim, _)| (dim, Scale::Sized(1.0)))
+                        .collect(),
+                    LdsIdx(0),
+                    Pinning::default(),
+                ),
+                vec![],
+            ),
+        }
+    }
+
+    /// One `DataStructDims`, stated by lookup.
+    #[derive(Default)]
+    struct Stage {
+        vals: BTreeMap<(PrimaryDim, u32), Extent>,
+        splits: BTreeMap<(PrimaryDim, u32), Extent>,
+        strides: BTreeMap<PrimaryDim, Stride>,
+    }
+
+    impl DimStage for Stage {
+        fn corelet_dim_val(
+            &self,
+            dim: PrimaryDim,
+            _comp: SenComponent,
+            corelet: Corelet,
+            _padded: &PaddingForm,
+        ) -> Option<Extent> {
+            self.vals.get(&(dim, corelet.get())).copied()
+        }
+
+        fn is_corelet_split(&self, dim: PrimaryDim) -> bool {
+            self.splits.keys().any(|(split, _)| *split == dim)
+        }
+
+        fn corelet_split(&self, dim: PrimaryDim, corelet: Corelet) -> Option<Extent> {
+            self.splits.get(&(dim, corelet.get())).copied()
+        }
+
+        fn pad_stride(&self, dim: PrimaryDim) -> Option<Stride> {
+            self.strides.get(&dim).copied()
+        }
+    }
+
+    /// e049 — the offset is the stick size times each outer dim's stick count, and it stops at the
+    /// corelet-split dim: 128 × (4 / 1) × (16 / 8) for corelet 1, and nothing for corelet 0.
+    #[test]
+    fn corelet_offset_stops_at_the_split_dim() {
+        let config = dsc(
+            &[(PrimaryDim::Out, 4), (PrimaryDim::In, 16)],
+            &[(PrimaryDim::In, 8)],
+        );
+        let node = Stage {
+            vals: BTreeMap::from([((PrimaryDim::Out, 0), Extent(4))]),
+            ..Stage::default()
+        };
+        let chunk = Stage {
+            vals: BTreeMap::from([((PrimaryDim::In, 0), Extent(16))]),
+            splits: BTreeMap::from([((PrimaryDim::In, 0), Extent(16))]),
+            ..Stage::default()
+        };
+        let offsets = calculate_corelet_offset_in_byte::<Dd2, _, _>(
+            &config,
+            &node,
+            &chunk,
+            LdsIdx(0),
+            SenComponent::Lx,
+            &PaddingForm::default(),
+        )
+        .expect("a stated corelet offset");
+        assert_eq!(
+            offsets,
+            BTreeMap::from([
+                (Corelet::at::<0>(), CoreletOffset(Bytes(0))),
+                (Corelet::at::<1>(), CoreletOffset(Bytes(1024))),
+            ])
+        );
+    }
+
+    /// e049 — two corelet-split dims is `DT_CHECK_MSG(ldsCoreletSplitDim.size() <= 1, ..)`, and no
+    /// split dim at all leaves every offset at zero.
+    #[test]
+    fn corelet_offset_refuses_a_second_split_dim() {
+        let config = dsc(
+            &[(PrimaryDim::Out, 4), (PrimaryDim::In, 16)],
+            &[(PrimaryDim::In, 8)],
+        );
+        let node = Stage::default();
+        let two = Stage {
+            splits: BTreeMap::from([
+                ((PrimaryDim::Out, 0), Extent(4)),
+                ((PrimaryDim::In, 0), Extent(16)),
+            ]),
+            ..Stage::default()
+        };
+        assert_eq!(
+            calculate_corelet_offset_in_byte::<Dd2, _, _>(
+                &config,
+                &node,
+                &two,
+                LdsIdx(0),
+                SenComponent::Lx,
+                &PaddingForm::default(),
+            ),
+            None
+        );
+        assert_eq!(
+            calculate_corelet_offset_in_byte::<Dd2, _, _>(
+                &config,
+                &node,
+                &Stage::default(),
+                LdsIdx(0),
+                SenComponent::Lx,
+                &PaddingForm::default(),
+            )
+            .expect("no split dim is still an answer")
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+            vec![CoreletOffset(Bytes(0)); 2]
+        );
+    }
+
+    /// One labelled DS's `memOrg_`, stated by field.
+    struct MemOrgStub {
+        pinned: bool,
+        buffering: Option<Buffering>,
+        address: Option<ByteAddress>,
+        offset: Option<BufferOffset>,
+        indirection: Option<IndirectAlloc>,
+    }
+
+    impl Default for MemOrgStub {
+        fn default() -> Self {
+            Self {
+                pinned: false,
+                buffering: Some(Buffering::None),
+                address: Some(ByteAddress(0x4000)),
+                offset: Some(BufferOffset(0x80)),
+                indirection: None,
+            }
+        }
+    }
+
+    impl MemOrg for MemOrgStub {
+        fn hbm_pinned(&self) -> bool {
+            self.pinned
+        }
+
+        fn lx_buffering(&self) -> Option<Buffering> {
+            self.buffering
+        }
+
+        fn lx_start_address(&self, at: &AddressCoord) -> Option<ByteAddress> {
+            // The corelet the caller asked for is gone; entry 050 bound corelet 0 instead.
+            (at.corelet.get() == 0).then_some(())?;
+            self.address
+        }
+
+        fn lx_buffer_offset(&self, _core: Core, _corelet: Corelet) -> Option<BufferOffset> {
+            self.offset
+        }
+
+        fn hbm_indirection(&self) -> Option<IndirectAlloc> {
+            self.indirection
+        }
+    }
+
+    /// e050 — a pinned DS takes its buffer offset from the node while an unpinned one is always at
+    /// zero, and double buffering off the pinned path is the check that refuses.
+    #[test]
+    fn initial_placement_reads_corelet_zero() {
+        let coord = AddressCoord {
+            core: core(3),
+            corelet: Corelet::at::<1>(),
+            sdsc_folds: vec![7],
+        };
+        assert_eq!(
+            initial_start_address_and_offset(
+                &MemOrgStub {
+                    pinned: true,
+                    buffering: Some(Buffering::Double),
+                    ..MemOrgStub::default()
+                },
+                &coord,
+            ),
+            Some(InitialPlacement {
+                start: ByteAddress(0x4000),
+                buffer_offset: BufferOffset(0x80),
+            })
+        );
+        assert_eq!(
+            initial_start_address_and_offset(&MemOrgStub::default(), &coord),
+            Some(InitialPlacement {
+                start: ByteAddress(0x4000),
+                buffer_offset: BufferOffset(0),
+            })
+        );
+        assert_eq!(
+            initial_start_address_and_offset(
+                &MemOrgStub {
+                    buffering: Some(Buffering::Double),
+                    ..MemOrgStub::default()
+                },
+                &coord,
+            ),
+            None
+        );
+    }
+
+    /// e051 — it is the DDC's resolver, reached through the L3 scheduler's copy.
+    #[test]
+    fn lds_name_delegates_to_the_ddc_resolver() {
+        struct Names;
+        impl v1::StorageNames for Names {
+            fn lds_name(&self, lds: LdsIdx) -> v1::StorageName {
+                v1::StorageName(format!("lds{}", lds.0))
+            }
+            fn constant_name(
+                &self,
+                _constant: crate::schedule::ddc::fold::ConstIdx,
+            ) -> v1::StorageName {
+                v1::StorageName("constant".to_owned())
+            }
+        }
+        let anode = AllocateNode {
+            name: NodeName("alloc".to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(LdsIdx(2)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        };
+        assert_eq!(
+            get_lds_or_const_name_of_alloc_node(&anode, &Names),
+            v1::get_lds_or_const_name_of_alloc_node(&anode, &Names)
+        );
+        assert_eq!(
+            get_lds_or_const_name_of_alloc_node(&anode, &Names),
+            Some(v1::StorageName("lds2".to_owned()))
+        );
+    }
+
+    /// e052 — a repeated dim has no loop order, and one that names each dim once keeps its order.
+    #[test]
+    fn loop_order_is_unique_dims() {
+        assert_eq!(
+            LoopOrder::of(&[PrimaryDim::Out, PrimaryDim::In, PrimaryDim::Out]),
+            None
+        );
+        assert_eq!(
+            LoopOrder::of(&[PrimaryDim::Out, PrimaryDim::In])
+                .expect("unique dims")
+                .dims(),
+            [PrimaryDim::Out, PrimaryDim::In]
+        );
+    }
+
+    /// One DSC's schedule tree, stated as its node names, plus its allocations per DSC index.
+    #[derive(Default)]
+    struct Tree {
+        names: Vec<NodeName>,
+        allocs: BTreeMap<DscIdx, Vec<PlacedAllocation>>,
+    }
+
+    impl ScheduleNodes for Tree {
+        fn node_names(&self) -> Vec<NodeName> {
+            self.names.clone()
+        }
+    }
+
+    impl ScheduleTrees for Tree {
+        fn allocations(&self, dsc: DscIdx) -> Vec<PlacedAllocation> {
+            self.allocs.get(&dsc).cloned().unwrap_or_default()
+        }
+    }
+
+    fn named(names: &[&str]) -> Tree {
+        Tree {
+            names: names
+                .iter()
+                .map(|name| NodeName((*name).to_owned()))
+                .collect(),
+            ..Tree::default()
+        }
+    }
+
+    /// e053 — an empty tree and a repeated name are the same absence, and distinct names pass.
+    #[test]
+    fn schedule_tree_needs_nodes_and_unique_names() {
+        assert_eq!(VerifiedScheduleTree::of(&named(&[])), None);
+        assert_eq!(VerifiedScheduleTree::of(&named(&["b", "l", "b"])), None);
+        assert_eq!(
+            VerifiedScheduleTree::of(&named(&["b", "l"])),
+            Some(VerifiedScheduleTree(()))
+        );
+    }
+
+    /// e054 — every DSC gets its dsc2 corelet count, and one metadata entry per DSC naming stages
+    /// 0 and 1.
+    #[test]
+    fn prep_dsc_fills_the_dsc2_corelet_count() {
+        let mut plain = dsc(&[(PrimaryDim::In, 8)], &[(PrimaryDim::In, 8)]);
+        plain.corelets_used = CoreletsUsed::ONE;
+        plain.corelets_used_dsc2 = None;
+        let mut sdsc = SuperDsc::new(
+            DscList::new(plain.clone(), vec![plain]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let metadata = prep_dsc(&mut sdsc);
+        assert!(
+            sdsc.dscs()
+                .iter()
+                .all(|dsc| dsc.corelets_used_dsc2 == Some(CoreletsUsed::ONE))
+        );
+        assert_eq!(
+            metadata,
+            BTreeMap::from([
+                (
+                    DscIdx(0),
+                    SchedulerMetadata {
+                        core_dstg: DATA_STAGE_CORE,
+                        chunk_dstg: DATA_STAGE_CHUNK,
+                    }
+                ),
+                (
+                    DscIdx(1),
+                    SchedulerMetadata {
+                        core_dstg: DATA_STAGE_CORE,
+                        chunk_dstg: DATA_STAGE_CHUNK,
+                    }
+                ),
+            ])
+        );
+    }
+
+    /// e055 — three used cores land in two HMI buckets (bit 34 apart) of two and one, so the answer
+    /// is the smaller bucket; a core the DSC does not use is not counted, and only SEN1P5 answers.
+    #[test]
+    fn min_hmi_group_is_the_smallest_bucket() {
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc(&[(PrimaryDim::In, 8)], &[(PrimaryDim::In, 8)]), vec![]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let bit34 = 1u64 << 34;
+        let trees = Tree {
+            allocs: BTreeMap::from([(
+                DscIdx(0),
+                vec![PlacedAllocation {
+                    lds: Some(LdsIdx(0)),
+                    component: SenComponent::Hbm,
+                    addresses: vec![
+                        (core(0), ByteAddress(0x1000)),
+                        (core(1), ByteAddress(0x2000)),
+                        (core(2), ByteAddress(bit34)),
+                    ],
+                }],
+            )]),
+            ..Tree::default()
+        };
+        assert_eq!(
+            compute_min_hmi_core_group_size_for_sen1p5::<Sen1p5, _>(&sdsc, &trees, &[LdsIdx(0)]),
+            Some(HmiGroupSize(2))
+        );
+        assert_eq!(
+            compute_min_hmi_core_group_size_for_sen1p5::<Dd2, _>(&sdsc, &trees, &[LdsIdx(0)]),
+            None
+        );
+        assert_eq!(
+            compute_min_hmi_core_group_size_for_sen1p5::<Sen1p5, _>(&sdsc, &trees, &[LdsIdx(1)]),
+            None
+        );
+    }
+
+    /// e056 — an address index tensor is one, an INDEX one is the refusal, and everything else is no.
+    #[test]
+    fn index_lds_is_an_address_index_tensor() {
+        let of = |indirection| {
+            is_index_lds(&MemOrgStub {
+                indirection,
+                ..MemOrgStub::default()
+            })
+        };
+        assert_eq!(
+            of(Some(IndirectAlloc::IndexTensor(IndexTensor::Address))),
+            Some(true)
+        );
+        assert_eq!(
+            of(Some(IndirectAlloc::IndexTensor(IndexTensor::Index))),
+            None
+        );
+        assert_eq!(of(Some(IndirectAlloc::ValueTensor)), Some(false));
+        assert_eq!(of(None), Some(false));
+    }
+}
 
 // crustify:todo: e057_isPagedLds
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6596  (9 body lines, level 0)
