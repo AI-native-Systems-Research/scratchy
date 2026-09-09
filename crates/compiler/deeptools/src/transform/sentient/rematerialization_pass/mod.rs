@@ -80,14 +80,121 @@
 //! | `e464_runOn` | 464 | 2 | 42 | `dcc/src/Transform/Sentient/RematerializationPass.cpp:175` |
 //! | `e525_runOnOperation` | 525 | 3 | 11 | `dcc/src/Transform/Sentient/RematerializationPass.cpp:163` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
+// file's own tests until `e525_runOnOperation` lands and something calls it. CI runs clippy with
+// `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH `e525_runOnOperation`: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e145_isCandidateForRematerialization
-//   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:60  (15 body lines, level 0)
-//   original  : bool isCandidateForRematerialization(Operation *op)
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient, use_count};
 
-// crustify:todo: e146_getLastUseWithinBlock
-//   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:82  (20 body lines, level 0)
-//   original  : Operation *getLastUseWithinBlock(Value v, Block *bb)
+/// A VALUE SOME ENCLOSING REGION BINDS AS A RESULT — `DT_CHECK_MSG(!isa<BlockArgument>(v), "Function
+/// should not be called on an iter arg")` (`:83-84`) AS THE PARAMETER TYPE.
+///
+/// ⛔ AN ITER ARG IS EXACTLY WHAT THE CHECK REFUSES, and a region argument is bound by no op — so
+/// [`Definitions::of`] answering [`None`] IS the failed `dyn_cast<BlockArgument>`, and the witness
+/// costs no second walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Defined(Val);
+
+impl Defined {
+    /// `None` for a region argument, which is the one input the reference aborts on.
+    #[must_use]
+    pub fn of(val: Val, defs: Definitions<'_>) -> Option<Defined> {
+        defs.of(val).map(|_| Defined(val))
+    }
+
+    /// The value itself.
+    #[must_use]
+    pub const fn val(self) -> Val {
+        self.0
+    }
+}
+
+/// WHERE AN OP SITS IN ONE BLOCK — what `Block::findAncestorOpInBlock` hands back, reduced to the one
+/// fact `DominanceInfo` carries between two ops of the SAME block.
+///
+/// # ⭐⭐ THE `DominanceInfo` IS DROPPABLE MECHANISM, AND THAT IS PROVABLE
+///
+/// `dominates(a, b)` for `a` and `b` in one block is `a == b || a comes first`, so
+/// `if (dom_info_->dominates(last_use, cand)) last_use = cand;` (`:96-97`) keeps whichever of the two
+/// is LATER in the block — both having been mapped into `bb` by `findAncestorOpInBlock` before the
+/// comparison. A position is the whole of what this pass asks the dominance tree, which is why
+/// `new DominanceInfo(unit_op)` (`:168`) has nothing to answer here.
+///
+/// ⛔ AND IT IS ONLY COMPARABLE WITHIN THE BLOCK IT CAME FROM. Two positions from different blocks
+/// are unrelated; the reference has the same restriction and discharges it the same way, by mapping
+/// every operand into one block first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InBlock(usize);
+
+impl InBlock {
+    /// Position `index` of a block.
+    #[must_use]
+    pub const fn at(index: usize) -> InBlock {
+        InBlock(index)
+    }
+
+    /// The position, as an index into the block it came from.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// Replaces: e145_isCandidateForRematerialization
+///
+/// Whether `op` may be cloned before each of its uses: a `sentient.scalar_add` or `sentient.scalar_sub`
+/// with a `sentient.scalar_constant` operand, or a `sentient.scalar_copy` of one (`:58-73`).
+///
+/// ⛔ TRAP: `sentient.scalar_mul` IS NOT A CANDIDATE. `Sentient_MulOp` is its own op class
+/// (`SentientOps.td:816`) and the `dyn_cast` chain names only `AddOp`, `SubOp` and `CopyOp`.
+///
+/// ⭐ THE `!isa<BlockArgument>` GUARDS FUSE INTO THE LOOKUP — see [`is_constant`], which is also why
+/// the `scalar_copy` arm is SAFE here and is a null deref in the reference.
+#[must_use]
+pub fn is_candidate_for_rematerialization(op: &Op, defs: Definitions<'_>) -> bool {
+    match op {
+        Op::Sentient(
+            sentient::Op::ScalarAdd { lhs, rhs, .. } | sentient::Op::ScalarSub { lhs, rhs, .. },
+        ) => is_constant(*lhs, defs) || is_constant(*rhs, defs),
+        Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => is_constant(*input, defs),
+        // `return false;` (`:73`) — anything the three `dyn_cast`s decline.
+        _ => false,
+    }
+}
+
+/// `isa<sentient::ConstantOp>(v.getDefiningOp())`, with the `!isa<BlockArgument>(v)` guard folded in.
+///
+/// ⛔ THE REFERENCE'S `scalar_copy` ARM HAS NO GUARD OF ITS OWN (`:71-72`): it hands
+/// `copy_op.getInp().getDefiningOp()` straight to `isa<>`, which dereferences a null `Operation *`
+/// when the copy reads an iter arg. This port answers that arm's stated intent, *"a copy of a constant
+/// op"* (`:58-59`), and a copy of an iter arg is `false` — a deliberate divergence from a crash.
+fn is_constant(val: Val, defs: Definitions<'_>) -> bool {
+    matches!(
+        defs.of(val),
+        Some(Op::Sentient(sentient::Op::ScalarConstant { .. }))
+    )
+}
+
+/// Replaces: e146_getLastUseWithinBlock
+///
+/// The position in `block` of the LAST op whose subtree reads `v` — `findAncestorOpInBlock` for every
+/// use of `v`, then the later of the two by dominance (`:82-101`).
+///
+/// ⭐ A USE NESTED IN A REGION IS A USE BY THE OP THAT ENCLOSES IT, which is exactly what
+/// `bb->findAncestorOpInBlock(*use.getOwner())` returns; [`use_count`] descends into regions, so one
+/// call per op of the block performs both the use walk and that mapping.
+///
+/// ⛔ `None` COVERS BOTH `nullptr` RETURNS: `v.use_empty()` (`:85`) and "every use lies outside this
+/// block", which is `last_use` still null at `:100` after every `continue` (`:91`).
+#[must_use]
+pub fn last_use_within_block(v: Defined, block: &[Op]) -> Option<InBlock> {
+    block
+        .iter()
+        .rposition(|op| use_count(v.val(), core::slice::from_ref(op)) > 0)
+        .map(InBlock::at)
+}
 
 // crustify:todo: e353_increasesOperandLiverange
 //   authority : dcc/src/Transform/Sentient/RematerializationPass.cpp:109  (52 body lines, level 1)
@@ -104,3 +211,146 @@
 //   original  : void RematerializationPass::runOnOperation()
 //   calls     : e464_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{Defined, InBlock, is_candidate_for_rematerialization, last_use_within_block};
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+
+    /// `%r = sentient.scalar_constant {value = 1 : si64} : index`.
+    fn constant(result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value: 1,
+            result,
+            reg_locale: sentient::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%out = sentient.scalar_add %lhs, %rhs : index`.
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// `%out = sentient.scalar_mul %lhs, %rhs : index` — the op the `dyn_cast` chain never names.
+    fn mul(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarMul {
+            lhs,
+            rhs,
+            result,
+            reg_locale: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// `%out = sentient.scalar_copy %input : index`.
+    fn copy(input: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Lrf,
+                index: None,
+            },
+            element_size: None,
+            program_header: false,
+        })
+    }
+
+    /// A `sentient.for` carrying one value, running `body`.
+    fn for_op(iv: Val, bound: Val, carried: sentient::Carried, body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried: vec![carried],
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// One carried value, with nothing assigned to it yet.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// The three candidate shapes and the three declines, including the `scalar_copy` of an iter arg
+    /// that is a null deref in the reference.
+    #[test]
+    fn only_add_sub_and_copy_of_a_constant_are_candidates() {
+        let (c1, iv, bound) = (Val(0), Val(1), Val(2));
+        let body = vec![
+            add(Val(10), c1, Val(11)),
+            add(Val(10), Val(10), Val(12)),
+            mul(Val(10), c1, Val(13)),
+            copy(c1, Val(14)),
+            copy(Val(10), Val(15)),
+        ];
+        let outer = vec![
+            constant(c1),
+            for_op(iv, bound, carried(c1, Val(10), Val(16)), body.clone()),
+        ];
+        let scopes: [&[Op]; 2] = [&body, &outer];
+        let defs = Definitions::from_innermost(&scopes);
+        let verdicts: Vec<bool> = body
+            .iter()
+            .map(|op| is_candidate_for_rematerialization(op, defs))
+            .collect();
+        // `%10` is the loop's iter arg, so it is a `BlockArgument` and never a constant.
+        assert_eq!(verdicts, vec![true, false, false, true, false]);
+    }
+
+    /// The last use is the later position in the block, a use inside a loop body counts for the loop
+    /// that encloses it, and a value read only outside the block has no last use in it.
+    #[test]
+    fn last_use_is_the_latest_position_that_reads_the_value() {
+        let (c1, iv, bound, elsewhere) = (Val(0), Val(1), Val(2), Val(3));
+        let block = vec![
+            constant(c1),
+            add(c1, c1, Val(11)),
+            for_op(
+                iv,
+                bound,
+                carried(Val(20), Val(21), Val(22)),
+                vec![add(c1, Val(21), Val(23))],
+            ),
+            add(Val(11), Val(11), Val(12)),
+        ];
+        let scopes: [&[Op]; 1] = [&block];
+        let defs = Definitions::from_innermost(&scopes);
+        let c1_defined = Defined::of(c1, defs).expect("the constant binds it");
+        // The `sentient.for` at position 2 is the ancestor within the block of the nested use.
+        assert_eq!(
+            last_use_within_block(c1_defined, &block),
+            Some(InBlock::at(2))
+        );
+        let bound_defined = Defined::of(Val(11), defs).expect("the first add binds it");
+        assert_eq!(
+            last_use_within_block(bound_defined, &block),
+            Some(InBlock::at(3))
+        );
+        // `v.use_empty()` — nothing in the block reads the loop's result.
+        let result_defined = Defined::of(Val(22), defs).expect("the loop binds it");
+        assert_eq!(last_use_within_block(result_defined, &block), None);
+        // The `DT_CHECK_MSG` this type replaces: an iter arg has no defining op anywhere in scope.
+        assert_eq!(Defined::of(Val(21), defs), None);
+        assert_eq!(Defined::of(elsewhere, defs), None);
+    }
+}
