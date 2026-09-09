@@ -82,20 +82,244 @@
 //! | `e535_runOn` | 535 | 3 | 4 | `dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:73` |
 //! | `e582_runOnOperation` | 582 | 4 | 5 | `dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:78` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so `SetActiveMaskValueGenValue` is reachable only
+// from `set_active_mask_value_rde_tree` and its tests until `e582_runOnOperation` (level 4) lands. CI
+// runs clippy with `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH e582: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
+
+use crate::islands::sentient::dialects::sentient::{RawPrecision, SliceId, ValidEntries, WslLen};
+use crate::islands::sentient::dialects::{Op, Val, sentient};
+use crate::islands::sentient::print;
+
 pub(crate) mod set_active_mask_value_rde_tree;
 
+/// A `sentient.samv`'S WHOLE ATTRIBUTE DICTIONARY — `samv_op->getAttrDictionary()`, which is what
+/// `SetActiveMaskValueGenValue::attrs_` holds and compares.
+///
+/// ⛔ THE DICTIONARY IS THE OP'S ATTRIBUTES AND `$mask_value` IS AN OPERAND (`SentientOps.td:1019`),
+/// so the mask value is NOT in here — it is the GenValue's other field, compared by its own rule.
+///
+/// ⛔ `dbgName` IS IN THE DICTIONARY, hence in the equality: `OptionalAttr<StrAttr>:$dbgName`
+/// (`SentientOps.td:1026`) is an attribute like the other six, so two otherwise identical `samv`s with
+/// different debug names are NOT equal definitions. That is the reference's behaviour, not a choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SamvAttrs {
+    /// `maskall`.
+    pub(crate) mask_all: bool,
+    /// `numvalidentry`.
+    pub(crate) num_valid_entry: ValidEntries,
+    /// `sliceid_xsl`.
+    pub(crate) slice_id_xsl: SliceId,
+    /// `xslinner`.
+    pub(crate) xsl_inner: bool,
+    /// `wsllen`.
+    pub(crate) wsl_len: WslLen,
+    /// `precision` — ⛔ a raw ISA field, never the `Precision` enum's spelling.
+    pub(crate) precision: RawPrecision,
+    /// `dbgName`.
+    pub(crate) dbg_name: Option<String>,
+}
 
-// crustify:todo: e182_copyTo
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:38  (8 body lines, level 0)
-//   original  : void copyTo(DataFlowDefinitionBase &lhs) const final override
+impl SamvAttrs {
+    /// `OS << attrs_` — MLIR's `DictionaryAttr` rendering, which sorts by name.
+    ///
+    /// ⛔ ALPHABETICAL, NOT DECLARATION ORDER, and an absent `dbgName` is absent from the dictionary
+    /// rather than printed empty — the same rule the island's own `samv` printer follows.
+    fn print(&self, out: &mut String) {
+        let mut entries = vec![
+            format!("maskall = {}", self.mask_all),
+            format!("numvalidentry = {} : i32", self.num_valid_entry.0),
+            format!("precision = {} : i32", self.precision.0),
+            format!("sliceid_xsl = {} : i32", self.slice_id_xsl.0),
+            format!("wsllen = {} : i32", self.wsl_len.0),
+            format!("xslinner = {}", self.xsl_inner),
+        ];
+        if let Some(name) = &self.dbg_name {
+            entries.push(format!("dbgName = \"{name}\""));
+        }
+        entries.sort();
+        out.push('{');
+        out.push_str(&entries.join(", "));
+        out.push('}');
+    }
+}
 
-// crustify:todo: e183_print
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:55  (6 body lines, level 0)
-//   original  : void print(raw_ostream &OS) const final override
+/// `SetActiveMaskValueGenValue` (`SetActiveMaskValueRE.hpp:22`) — the dataflow definition an RDE node
+/// generates for the SAMV state.
+///
+/// ⭐ DECLARED HERE, WHERE ITS OWN METHODS BELONG: e182-e184 are `copyTo`/`print`/
+/// `maskValuesAreEquivalent` on this class and e374 is its `isEqual`, all scheduled into this file.
+/// [`set_active_mask_value_rde_tree`]'s e180 constructs it — a batch filling the remaining anchors
+/// should UNION with this, not duplicate it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetActiveMaskValueGenValue {
+    /// `mask_value_` — `None` is the constructor's `nullptr`.
+    mask_value: Option<Val>,
+    /// `attrs_` — `None` is the constructor's null `DictionaryAttr`.
+    attrs: Option<SamvAttrs>,
+    /// `op_` — absent for the default-constructed unknown value.
+    op: Option<Op>,
+    /// `DataFlowDefinitionBase::is_optimized_`
+    /// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) — the base class is OUT OF CAMPAIGN
+    /// SCOPE, but e183 prints this flag, so the subclass holds it exactly as it holds `op_`.
+    is_optimized: bool,
+    /// `DataFlowDefinitionBase::is_dead_`, printed by e183 for the same reason.
+    is_dead: bool,
+}
 
-// crustify:todo: e184_maskValuesAreEquivalent
-//   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:63  (6 body lines, level 0)
-//   original  : bool maskValuesAreEquivalent(const Value a, const Value b) const
+impl SetActiveMaskValueGenValue {
+    /// `SetActiveMaskValueGenValue()` — the unknown value.
+    #[must_use]
+    pub(crate) fn unknown() -> SetActiveMaskValueGenValue {
+        SetActiveMaskValueGenValue::default()
+    }
+
+    /// `SetActiveMaskValueGenValue(mask_value, attrs, op)`.
+    #[must_use]
+    pub(crate) fn of(mask_value: Val, attrs: SamvAttrs, op: Op) -> SetActiveMaskValueGenValue {
+        SetActiveMaskValueGenValue {
+            mask_value: Some(mask_value),
+            attrs: Some(attrs),
+            op: Some(op),
+            is_optimized: false,
+            is_dead: false,
+        }
+    }
+
+    /// `SetActiveMaskValueGenValue(samv_op.getMaskValue(), samv_op->getAttrDictionary(), op)` — the
+    /// definition a `sentient.samv` generates, and nothing for any other operation.
+    ///
+    /// ⭐ ONE MATCH, so the mask value and the dictionary cannot be taken from two different ops.
+    #[must_use]
+    pub(crate) fn of_samv(op: &Op) -> Option<SetActiveMaskValueGenValue> {
+        let Op::Sentient(sentient::Op::Samv {
+            mask_value,
+            mask_all,
+            num_valid_entry,
+            slice_id_xsl,
+            xsl_inner,
+            wsl_len,
+            precision,
+            dbg_name,
+        }) = op
+        else {
+            return None;
+        };
+        Some(SetActiveMaskValueGenValue::of(
+            *mask_value,
+            SamvAttrs {
+                mask_all: *mask_all,
+                num_valid_entry: *num_valid_entry,
+                slice_id_xsl: *slice_id_xsl,
+                xsl_inner: *xsl_inner,
+                wsl_len: *wsl_len,
+                precision: *precision,
+                dbg_name: dbg_name.clone(),
+            },
+            op.clone(),
+        ))
+    }
+
+    /// `isUnknownValue()` (`SetActiveMaskValueRE.hpp:47`) — `!mask_value_ || !attrs_`.
+    #[must_use]
+    pub(crate) const fn is_unknown_value(&self) -> bool {
+        self.mask_value.is_none() || self.attrs.is_none()
+    }
+
+    /// `getMaskValue()`.
+    #[must_use]
+    pub(crate) const fn mask_value(&self) -> Option<Val> {
+        self.mask_value
+    }
+
+    /// `setMaskValue(v)`.
+    pub(crate) const fn set_mask_value(&mut self, v: Option<Val>) {
+        self.mask_value = v;
+    }
+
+    /// `getAttrs()`.
+    #[must_use]
+    pub(crate) const fn attrs(&self) -> Option<&SamvAttrs> {
+        self.attrs.as_ref()
+    }
+
+    /// `setAttrs(a)`.
+    pub(crate) fn set_attrs(&mut self, a: Option<SamvAttrs>) {
+        self.attrs = a;
+    }
+
+    /// The op that generated it.
+    #[must_use]
+    pub(crate) const fn op(&self) -> Option<&Op> {
+        self.op.as_ref()
+    }
+}
+
+impl SetActiveMaskValueGenValue {
+    /// Replaces: e182_copyTo
+    ///
+    /// Copies the mask value, the attribute dictionary and the generating op onto `lhs`, leaving its
+    /// two base flags alone.
+    ///
+    /// ⛔ "COPY EVERYTHING EXCEPT THE `is_optimized_` FLAG" — and except `is_dead_`, which the
+    /// reference's three assignments also leave untouched. `*lhs = self.clone()` would clobber both.
+    ///
+    /// ⛔ THE `dynamic_cast` AND ITS `DT_CHECK_MSG` BECAME THE PARAMETER TYPE: a definition that is
+    /// not a `SetActiveMaskValueGenValue` is not expressible at this call, so nothing is checked at
+    /// run time.
+    pub(crate) fn copy_to(&self, lhs: &mut SetActiveMaskValueGenValue) {
+        lhs.set_mask_value(self.mask_value());
+        lhs.set_attrs(self.attrs.clone());
+        lhs.op = self.op.clone();
+    }
+
+    /// Replaces: e183_print
+    ///
+    /// Renders the GenValue as the pass's `-debug-only` dump does.
+    ///
+    /// ⛔ THE REFERENCE PRINTS `mask_value_.getAsOpaquePointer()`, A MACHINE ADDRESS — nondeterministic
+    /// between runs, so the port prints the value's SSA identity (`%14`) instead. A null `Value`
+    /// streams as `0x0` there and as `%null` here; a null `attrs_` streams as MLIR's
+    /// `<<NULL ATTRIBUTE>>`, which is kept verbatim.
+    ///
+    /// ⛔ THE `>)` IS THE REFERENCE'S OWN TYPO — an unmatched `>` with no opening `<` anywhere in the
+    /// format. Preserved, because this dump is compared against the reference's.
+    pub(crate) fn print(&self, out: &mut String) {
+        out.push_str("(GenValue: value_:");
+        match self.mask_value {
+            Some(mask_value) => out.push_str(&print::val(mask_value)),
+            None => out.push_str("%null"),
+        }
+        out.push_str(", attrs:");
+        match &self.attrs {
+            Some(attrs) => attrs.print(out),
+            None => out.push_str("<<NULL ATTRIBUTE>>"),
+        }
+        out.push_str(">)");
+        if self.is_optimized {
+            out.push_str(" - optimized!");
+        }
+        if self.is_dead {
+            out.push_str(" - dead!");
+        }
+    }
+
+    /// Replaces: e184_maskValuesAreEquivalent
+    ///
+    /// Two mask values are equivalent when they are the same SSA value — deliberately shallow.
+    ///
+    /// ⛔ NOT `SetMaskGenValue`'S RULE. That sibling also folds two `sentient.constant`s with equal
+    /// values (e189); this one does not, and the reference says why: the specialized canonicalization
+    /// pass already commoned them, so a deeper comparison is future work.
+    ///
+    /// ⭐ AN ASSOCIATED FUNCTION: the reference's `const` member reads no field, and `Option` carries
+    /// the nullability its `Value` parameters have, so two null masks are equivalent.
+    #[must_use]
+    pub(crate) fn mask_values_are_equivalent(a: Option<Val>, b: Option<Val>) -> bool {
+        a == b
+    }
+}
 
 // crustify:todo: e374_isEqual
 //   authority : dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:30  (8 body lines, level 1)
@@ -117,3 +341,101 @@ pub(crate) mod set_active_mask_value_rde_tree;
 //   original  : void runOnOperation()
 //   calls     : e473_runOn, e535_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::{SamvAttrs, SetActiveMaskValueGenValue};
+    use crate::islands::sentient::dialects::sentient::{
+        RawPrecision, SliceId, ValidEntries, WslLen,
+    };
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+
+    /// `sentient.samv mask_value(%7) {...}` — the op a GenValue is built from.
+    fn samv(mask_value: Val) -> Op {
+        Op::Sentient(sentient::Op::Samv {
+            mask_value,
+            mask_all: false,
+            num_valid_entry: ValidEntries(5),
+            slice_id_xsl: SliceId(4),
+            xsl_inner: false,
+            wsl_len: WslLen(2),
+            precision: RawPrecision(16),
+            dbg_name: None,
+        })
+    }
+
+    /// The attribute dictionary [`samv`] carries.
+    fn attrs() -> SamvAttrs {
+        SetActiveMaskValueGenValue::of_samv(&samv(Val(7)))
+            .and_then(|value| value.attrs().cloned())
+            .expect("a samv carries its dictionary")
+    }
+
+    /// A GenValue with both base flags set.
+    fn flagged(value: SetActiveMaskValueGenValue) -> SetActiveMaskValueGenValue {
+        SetActiveMaskValueGenValue {
+            is_optimized: true,
+            is_dead: true,
+            ..value
+        }
+    }
+
+    /// e182 — the mask value, the dictionary and `op_` travel; the two flags stay behind.
+    #[test]
+    fn copy_to_moves_the_value_the_attrs_and_the_op_but_not_the_flags() {
+        let source = flagged(SetActiveMaskValueGenValue::of(
+            Val(7),
+            attrs(),
+            samv(Val(7)),
+        ));
+        let mut target = SetActiveMaskValueGenValue::unknown();
+
+        source.copy_to(&mut target);
+
+        assert_eq!(target.mask_value(), Some(Val(7)));
+        assert_eq!(target.attrs(), Some(&attrs()));
+        assert_eq!(target.op(), Some(&samv(Val(7))));
+        assert!(!target.is_optimized, "is_optimized_ is not copied");
+        assert!(!target.is_dead, "is_dead_ is not copied");
+        assert!(!target.is_unknown_value(), "both halves arrived");
+    }
+
+    /// e183 — the dictionary is alphabetical, the null halves keep their spellings, and each flag adds
+    /// its own suffix.
+    #[test]
+    fn print_renders_the_dictionary_alphabetically_and_both_suffixes() {
+        let mut out = String::new();
+        SetActiveMaskValueGenValue::of(Val(7), attrs(), samv(Val(7))).print(&mut out);
+        assert_eq!(
+            out,
+            "(GenValue: value_:%7, attrs:{maskall = false, numvalidentry = 5 : i32, \
+             precision = 16 : i32, sliceid_xsl = 4 : i32, wsllen = 2 : i32, xslinner = false}>)"
+        );
+
+        let mut unknown = String::new();
+        flagged(SetActiveMaskValueGenValue::unknown()).print(&mut unknown);
+        assert_eq!(
+            unknown,
+            "(GenValue: value_:%null, attrs:<<NULL ATTRIBUTE>>>) - optimized! - dead!"
+        );
+    }
+
+    /// e184 — the same SSA value and nothing else, two nulls included.
+    #[test]
+    fn only_the_same_ssa_value_is_an_equivalent_mask() {
+        assert!(SetActiveMaskValueGenValue::mask_values_are_equivalent(
+            Some(Val(7)),
+            Some(Val(7))
+        ));
+        assert!(!SetActiveMaskValueGenValue::mask_values_are_equivalent(
+            Some(Val(7)),
+            Some(Val(8))
+        ));
+        assert!(!SetActiveMaskValueGenValue::mask_values_are_equivalent(
+            Some(Val(7)),
+            None
+        ));
+        assert!(SetActiveMaskValueGenValue::mask_values_are_equivalent(
+            None, None
+        ));
+    }
+}

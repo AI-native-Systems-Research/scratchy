@@ -393,3 +393,27 @@ impl ColoringGraph for OutOfScopeColoringGraph {
         todo!("GraphColoring::clear (Analyses/GraphColoring.hpp:52) — out of campaign scope")
     }
 }
+
+/// `RDENode` (`Analyses/RedundantDefinitionEliminationTree.hpp:34`) AS THE PORTED PASSES READ IT —
+/// the tree itself is out of campaign scope, so only the two facts an `initializeDataflowInfo` or an
+/// `isSimplifiable` asks of a node are represented.
+///
+/// ⭐ `Root` IS THE IDENTITY TEST, NOT A FLAG: `root_ = root_ ? root_ : new RDENode(nullptr)`
+/// (`Analyses/RedundantDefinitionEliminationTree.cpp:294`) makes the root the ONLY node without an
+/// operation, so `getRoot() == &node` is a CASE of this enum rather than a pointer comparison.
+///
+/// ⭐ ONE DEFINITION FOR THE WHOLE CAMPAIGN. Four RDE passes (`ImplicitSyncRE`,
+/// `SetActiveMaskValueRE`, `SetMaskRE`, `SetSendDestinationRE`) override the same two hooks and ask a
+/// node the same two questions, so this lives at the out-of-scope seam and not in one pass's module.
+#[derive(Debug, Clone, Copy)]
+pub enum RdeNode<'a> {
+    /// The tree's root — `getOperation()` is null.
+    Root,
+    /// A node over one op.
+    At {
+        /// `getOperation()`.
+        op: &'a Op,
+        /// `isLeaf()` (`src/Analysis/OperationTree.hpp:70`).
+        leaf: bool,
+    },
+}

@@ -78,16 +78,196 @@
 //! | `e191_copyTo` | 191 | 0 | 5 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:282` |
 //! | `e192_print` | 192 | 0 | 5 | `dcc/src/Transform/Sentient/SetMaskRE.cpp:290` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so `IncrMaskGenValue` is reachable only from this
+// file's own tests until `e536_runOnOperation` (level 3) lands and something calls it. CI runs clippy
+// with `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH e536: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e190_isEqual
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:276  (5 body lines, level 0)
-//   original  : bool IncrMaskGenValue::isEqual(const DataFlowDefinitionBase &rhs) const
+use crate::islands::sentient::dialects::{Op, sentient};
 
-// crustify:todo: e191_copyTo
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:282  (5 body lines, level 0)
-//   original  : void IncrMaskGenValue::copyTo(DataFlowDefinitionBase &lhs) const
+/// HOW MUCH A `sentient.incrmask` INCREMENTS THE MASK — a witness, because the answer is a constant.
+///
+/// ⛔ `int getIncrement() { return 1; }` (`SentientOps.td:1081`) — the op has NO operands and no
+/// increment attribute, so ONE is the only value `IncrMaskGenValue::increment_` can ever hold and
+/// nothing in the tree calls `setIncrement`. A field would invite a second answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Increment;
 
-// crustify:todo: e192_print
-//   authority : dcc/src/Transform/Sentient/SetMaskRE.cpp:290  (5 body lines, level 0)
-//   original  : void IncrMaskGenValue::print(raw_ostream &OS) const
+impl Increment {
+    /// `getIncrement()`.
+    #[must_use]
+    pub(crate) const fn get(self) -> i32 {
+        1
+    }
+}
 
+/// A TARGET FOR `IncrMaskGenValue::copyTo` — uninhabited, because there is none.
+///
+/// ⛔⛔ THIS IS `llvm_unreachable("should never be attempting to copy an IncrMaskGenValue")`
+/// (`SetMaskRE.cpp:285`) TURNED INTO A COMPILE ERROR. The reference's whole body is that abort; with
+/// no value of this type constructible, the call it aborts on cannot be written at all, so the
+/// guarantee holds at build time instead of costing a run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NoCopyTarget {}
+
+/// `IncrMaskGenValue` (`SetMaskRE.hpp:49`) — the dataflow definition an RDE node generates for a
+/// `sentient.incrmask`.
+///
+/// ⭐ DECLARED HERE, WHERE ITS OWN METHODS BELONG: e190-e192 are its `isEqual`/`copyTo`/`print` and
+/// all three are scheduled into this file.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IncrMaskGenValue {
+    /// `increment_` — `None` is the constructor's `-1`, i.e. `isUnknownValue()`.
+    increment: Option<Increment>,
+    /// `op_` — absent for the default-constructed unknown value.
+    op: Option<Op>,
+    /// `DataFlowDefinitionBase::is_optimized_`
+    /// (`Analyses/RedundantDefinitionEliminationTree.hpp:290`) — the base class is OUT OF CAMPAIGN
+    /// SCOPE, but e192 prints this flag, so the subclass holds it exactly as it holds `op_`.
+    is_optimized: bool,
+    /// `DataFlowDefinitionBase::is_dead_`, printed by e192 for the same reason.
+    is_dead: bool,
+}
+
+impl IncrMaskGenValue {
+    /// `IncrMaskGenValue()` — the unknown value.
+    #[must_use]
+    pub(crate) fn unknown() -> IncrMaskGenValue {
+        IncrMaskGenValue::default()
+    }
+
+    /// `IncrMaskGenValue(incrmask_op.getIncrement(), op)`, and nothing for any other operation.
+    #[must_use]
+    pub(crate) fn of_incr_mask(op: &Op) -> Option<IncrMaskGenValue> {
+        if !matches!(op, Op::Sentient(sentient::Op::IncrMask { .. })) {
+            return None;
+        }
+        Some(IncrMaskGenValue {
+            increment: Some(Increment),
+            op: Some(op.clone()),
+            is_optimized: false,
+            is_dead: false,
+        })
+    }
+
+    /// `isUnknownValue()` (`SetMaskRE.cpp:288`) — `increment_ < 0`.
+    #[must_use]
+    pub(crate) const fn is_unknown_value(&self) -> bool {
+        self.increment.is_none()
+    }
+
+    /// `getIncrement()`, absent when the value is unknown.
+    #[must_use]
+    pub(crate) const fn increment(&self) -> Option<Increment> {
+        self.increment
+    }
+
+    /// The op that generated it.
+    #[must_use]
+    pub(crate) const fn op(&self) -> Option<&Op> {
+        self.op.as_ref()
+    }
+}
+
+impl IncrMaskGenValue {
+    /// Replaces: e190_isEqual
+    ///
+    /// No two incrmask definitions are ever equal.
+    ///
+    /// ⛔ A CONSTANT `false` ON PURPOSE, NOT A STUB: the reference's comment says every incrmask is a
+    /// unique invocation whose placement must not change, so the RDE tree must never common two.
+    /// This is also why the type does not derive `PartialEq` — a second, disagreeing `==`.
+    ///
+    /// ⛔ IT IGNORES `rhs` ENTIRELY, including its own identity: `value.is_equal(&value)` is `false`.
+    #[must_use]
+    pub(crate) fn is_equal(&self, _rhs: &IncrMaskGenValue) -> bool {
+        false
+    }
+
+    /// Replaces: e191_copyTo
+    ///
+    /// ⛔⛔ NOT AN OPERATION — the reference's body is `llvm_unreachable("should never be attempting to
+    /// copy an IncrMaskGenValue")` (`SetMaskRE.cpp:282-286`), because an incrmask never moves.
+    ///
+    /// ⭐ THE ABORT IS THE PARAMETER TYPE: [`NoCopyTarget`] is uninhabited, so no caller can build the
+    /// argument and the path the reference aborts on does not compile. The `match` has no arms for
+    /// the same reason.
+    pub(crate) fn copy_to(&self, lhs: NoCopyTarget) -> ! {
+        match lhs {}
+    }
+
+    /// Replaces: e192_print
+    ///
+    /// Renders the GenValue as the pass's `-debug-only=set-mask-re` dump does.
+    ///
+    /// ⛔ AN ABSENT INCREMENT PRINTS `-1` — the reference streams the sentinel `int`, so the dump says
+    /// `(GenValue: -1)` and never a word like "none".
+    pub(crate) fn print(&self, out: &mut String) {
+        out.push_str("(GenValue: ");
+        match self.increment {
+            Some(increment) => out.push_str(&increment.get().to_string()),
+            None => out.push_str("-1"),
+        }
+        out.push(')');
+        if self.is_optimized {
+            out.push_str(" - optimized!");
+        }
+        if self.is_dead {
+            out.push_str(" - dead!");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{IncrMaskGenValue, Increment};
+    use crate::islands::sentient::dialects::{Op, sentient};
+
+    /// `sentient.incrmask`.
+    fn incr_mask() -> Op {
+        Op::Sentient(sentient::Op::IncrMask { dbg_name: None })
+    }
+
+    /// A GenValue with both base flags set.
+    fn flagged(value: IncrMaskGenValue) -> IncrMaskGenValue {
+        IncrMaskGenValue {
+            is_optimized: true,
+            is_dead: true,
+            ..value
+        }
+    }
+
+    /// e190 — nothing is equal to an incrmask definition, not even itself.
+    ///
+    /// ⭐ e191 NEEDS NO TEST AND CAN HAVE NONE: its argument type is uninhabited, so a call is a
+    /// compile error rather than a run-time abort.
+    #[test]
+    fn no_incrmask_definition_is_ever_equal_to_another() {
+        let value =
+            IncrMaskGenValue::of_incr_mask(&incr_mask()).expect("an incrmask generates one");
+        assert!(!value.is_equal(&value), "not even to itself");
+        assert!(!value.is_equal(&IncrMaskGenValue::unknown()));
+        assert!(!IncrMaskGenValue::unknown().is_equal(&IncrMaskGenValue::unknown()));
+    }
+
+    /// e192 — the sentinel prints as `-1`, a real increment as the constant `1`, and each flag adds
+    /// its own suffix.
+    #[test]
+    fn print_renders_the_sentinel_as_minus_one_and_both_suffixes() {
+        let mut out = String::new();
+        flagged(IncrMaskGenValue::unknown()).print(&mut out);
+        assert_eq!(out, "(GenValue: -1) - optimized! - dead!");
+
+        let mut plain = String::new();
+        IncrMaskGenValue::of_incr_mask(&incr_mask())
+            .expect("an incrmask generates one")
+            .print(&mut plain);
+        assert_eq!(plain, "(GenValue: 1)");
+        assert_eq!(Increment.get(), 1);
+        assert!(
+            IncrMaskGenValue::of_incr_mask(&Op::Sentient(sentient::Op::Nop { dbg_name: None }))
+                .is_none()
+        );
+    }
+}

@@ -89,24 +89,9 @@ use core::num::NonZeroU32;
 use super::{ImplicitSyncGenValue, TileSize};
 use crate::islands::sentient::dialects::{Op, sentient};
 
-/// `RDENode` (`Analyses/RedundantDefinitionEliminationTree.hpp`) AS THIS FILE READS IT — the tree
-/// itself is out of campaign scope, so only the facts e045 and e046 ask of a node are represented.
-///
-/// ⭐ `Root` IS THE IDENTITY TEST, NOT A FLAG: `root_ = root_ ? root_ : new RDENode(nullptr)`
-/// (`Analyses/RedundantDefinitionEliminationTree.cpp:294`) makes the root the ONLY node without an
-/// operation, so `getRoot() == &node` is a CASE of this enum rather than a pointer comparison.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RdeNode<'a> {
-    /// The tree's root — `getOperation()` is null.
-    Root,
-    /// A node over one op.
-    At {
-        /// `getOperation()`.
-        op: &'a Op,
-        /// `isLeaf()` (`src/Analysis/OperationTree.hpp:70`).
-        leaf: bool,
-    },
-}
+/// ⭐ THE RDE NODE IS THE CAMPAIGN-WIDE OUT-OF-SCOPE SEAM, not this pass's own type: four RDE passes
+/// override the same two hooks and ask a node the same two questions.
+pub(crate) use crate::transform::sentient::analyses::RdeNode;
 
 /// A `sentient.sync` WHOSE `implicit_sync_memory_boundary` IS POSITIVE.
 ///
