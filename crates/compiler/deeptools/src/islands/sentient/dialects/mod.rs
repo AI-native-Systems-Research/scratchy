@@ -752,16 +752,19 @@ fn loop_bound_of_iv(iv: Val, scope: &[Op]) -> Option<Val> {
 /// "no op in this chain says". The reference's return type is `const uint32_t` and its callers assign
 /// it to an `int`, which is how `-1` survives to be compared `< 1`.
 ///
-/// ⛔ FOUR OF THE REFERENCE'S ARMS ARE ISLAND GAPS AND ANSWER `None`, WHICH IS THE REFERENCE'S OWN
-/// `hasAttr == false` BRANCH FOR EACH — `element_size` is a DISCARDABLE attribute on `scalar_add` and
-/// `scalar_sub` and `element_sizes` a discardable ARRAY on `sentient.for` and
-/// `uniform.uniformize_regions`, and this island carries none of the four. The pass that writes them
-/// is `LiveRangeReduction::addResultToYield` (`Transform/Sentient/LiveRangeReduction.cpp:1033-1070`,
-/// campaign unit `e442`), so the fields belong with THAT unit: the reference pins both the spelling
-/// and the layout — `element_sizes = [-1 : i32, 8 : i32, 8 : i32]` beside a `regLocales` of the same
-/// `1 + 2n` length (`dcc/test/Transform/LiveRangeReduction/uniformizeRegions.mlir:174`) and the op
-/// declares the layout in words: "First entry is register info for `bound`, followed by entries for
-/// `initArgs`, followed by entries for `results`" (`SentientOps.td:58-61`).
+/// ⛔ THE REFERENCE'S `element_sizes` ARMS ARE NOT ANSWERED HERE AND ANSWER `None`, WHICH IS ITS OWN
+/// `hasAttr == false` BRANCH FOR EACH — the discardable ARRAY on `sentient.for` (`:341-352`, both the
+/// block-argument arm and the result arm) and on `uniform.uniformize_regions` (`:353-366`). The
+/// island now carries HALF of the first: [`sentient::Carried::element_size`] is this loop's
+/// `element_sizes` collapsed to one slot per carried value, so both of the reference's `for` arms
+/// reduce to that slot; the BOUND's entry 0 and the whole `uniformize_regions` array are still
+/// absent. Whoever ports the readers owns those arms — the writer is
+/// `LiveRangeReduction::addResultToYield` (`Transform/Sentient/LiveRangeReduction.cpp:1033-1070`,
+/// campaign unit `e442`), and the reference pins both the spelling and the layout:
+/// `element_sizes = [-1 : i32, 8 : i32, 8 : i32]` beside a `regLocales` of the same `1 + 2n` length
+/// (`dcc/test/Transform/LiveRangeReduction/uniformizeRegions.mlir:174`), the op declaring it in words
+/// as "First entry is register info for `bound`, followed by entries for `initArgs`, followed by
+/// entries for `results`" (`SentientOps.td:58-61`).
 #[must_use]
 pub fn element_size(val: Val, defs: Definitions<'_>) -> Option<crate::formats::Bits> {
     // ⭐ THE BLOCK-ARGUMENT ARM IS FIRST, as the reference's `isa<BlockArgument>` is (`:307`).
@@ -780,8 +783,17 @@ pub fn element_size(val: Val, defs: Definitions<'_>) -> Option<crate::formats::B
             src_element_size, ..
         }) => Some(*src_element_size),
         Op::Sentient(sentient::Op::LoadAndExtractScalar { element_size, .. }) => Some(*element_size),
+        // ⭐ THE DISCARDABLE `element_size` ATTRIBUTE (`:333-340`) — `None` is the reference's own
+        // `hasAttr == false` on each of these two arms.
+        // ⛔ NO `ScalarCopy` ARM: the copy carries the attribute (unit `e154` writes it) but
+        // `getElementSize` names AddOp and SubOp only — its readers reach a copy's width through
+        // `dcc::utils::getAttr(copy_op.getResult(), "element_size")` instead.
+        Op::Sentient(
+            sentient::Op::ScalarAdd { element_size, .. }
+            | sentient::Op::ScalarSub { element_size, .. },
+        ) => *element_size,
         // ⭐ THE `_` ARM IS THE REFERENCE'S OWN `return -1;` (`:367`), not a fall-through: every op
-        // it does not name answers "no element size", and so do the four island gaps above.
+        // it does not name answers "no element size", and so do the `element_sizes` arms above.
         _ => None,
     }
 }

@@ -437,3 +437,27 @@ pub enum RdeNode<'a> {
         leaf: bool,
     },
 }
+
+/// THE `Liveness&` A PASS IS HANDED — a trait for the same reason [`ExpressionEvaluator`] is one:
+/// the analysis is not in this campaign, and a test must still be able to observe WHICH values a
+/// ported pass promotes.
+///
+/// ⛔ `Analyses/Liveness.{h,cpp}` IS OUT OF CAMPAIGN SCOPE, so the crate's only implementation is
+/// [`OutOfScopeLiveness`] and every method of it is a `todo!`.
+pub trait Liveness {
+    /// `updateLiveRangesForProgramHeaderPromotion(candidate)` (`Analyses/Liveness.h:130`) — widens
+    /// `candidate`'s live range to the whole program because it is about to live in the header.
+    fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val);
+}
+
+/// THE ONE CRATE IMPLEMENTATION: liveness is not ported, so telling it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeLiveness;
+
+impl Liveness for OutOfScopeLiveness {
+    fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {
+        todo!(
+            "Liveness::updateLiveRangesForProgramHeaderPromotion (Analyses/Liveness.h:130) — out of campaign scope"
+        )
+    }
+}
