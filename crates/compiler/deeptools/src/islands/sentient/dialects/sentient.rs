@@ -1157,7 +1157,7 @@ impl CmpPredicate {
     /// ⭐ `RemoveStaticCondition` ASKS IT OF EVERY NON-CONSTANT CONDITION: having failed to read
     /// `lhs P rhs` as `constant P induction_var`, it retries as `rhs reversed(P) lhs`
     /// (`dcc/src/Dialect/Sentient/SentientOps.cpp:1482-1485`). Campaign unit `e245_reversePredicate`
-    /// (`transform/sentient/utils`) should delegate here when it lands.
+    /// (`dcc/src/Transform/Sentient/Utils.cpp:450`) delegates here.
     #[must_use]
     pub const fn reversed(self) -> CmpPredicate {
         match self {

@@ -636,7 +636,8 @@ pub struct OutOfScopeUnitIndexMap;
 impl UnitIndexMap for OutOfScopeUnitIndexMap {
     fn index_of(&self, _unit: Val) -> UnitIndex {
         todo!(
-            "PropagationAnalysis::getUnitIndexMap + getFoldedUnitNameAsString (Analyses/PropagationAnalysis.hpp:—, Analyses/Utils.cpp:644) — out of campaign scope"
+            "PropagationAnalysis::getUnitIndexMap + getFoldedUnitNameAsString \
+             (Analyses/PropagationAnalysis.h:325, Analyses/Utils.cpp:644) — out of campaign scope"
         )
     }
 }

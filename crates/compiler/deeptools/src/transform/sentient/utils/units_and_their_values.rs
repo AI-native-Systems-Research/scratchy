@@ -70,12 +70,21 @@
 //    anchor FILLED so the unit is not lost. ⛔ DO NOT INVENT THE ANALYSIS and do not substitute a
 //    constant for its result. Extending `src/islands/sentient/` is a different case and IS expected.
 
-//! `Utils.cpp` — 2 of the campaign's 656 units (dependency level(s) [0, 1]).
+//! `Utils.cpp`/`Utils.hpp` — 5 of the campaign's 656 units (dependency level(s) [0, 1]).
 //!
 //! | unit | entry | level | lines | authority path:line |
 //! |---|---|---|---|---|
 //! | `e249_normalizeNullValues` | 249 | 0 | 14 | `dcc/src/Transform/Sentient/Utils.cpp:600` |
 //! | `e394_dump` | 394 | 1 | 6 | `dcc/src/Transform/Sentient/Utils.cpp:615` |
+//!
+//! Promoted here from `utils/mod.rs`, whose scheduler TODOs they were — they are methods of the type
+//! this file already owns, and a second Rust type with the same fields would be the split made real:
+//!
+//! | unit | entry | level | lines | authority path:line |
+//! |---|---|---|---|---|
+//! | `e251_add` | 251 | 0 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:165` |
+//! | `e252_size` | 252 | 0 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:171` |
+//! | `e253_areAllValuesEqual` | 253 | 0 | 6 | `dcc/src/Transform/Sentient/Utils.hpp:180` |
 
 
 // ⛔ NOTHING CALLS THIS TYPE YET. `replaceValue` (e396) is still anchored in the PARENT module, and
@@ -89,7 +98,7 @@ use crate::islands::sentient::dialects::Val;
 /// (`dcc/src/Transform/Sentient/Utils.hpp:161-190`).
 ///
 /// ⛔⛔ ONE LIST OF PAIRS, NOT THE REFERENCE'S TWO PARALLEL `ListTy`s. `size()`'s
-/// `DT_CHECK(values_.size() == units_.size())` (`Utils.hpp:171`) is the ONE invariant the class exists
+/// `DT_CHECK(values_.size() == units_.size())` (`Utils.hpp:172`) is the ONE invariant the class exists
 /// to hold, and it is the only thing `add` — the sole way to grow either list — enforces. A pair
 /// cannot be half-pushed, so the check has nothing left to guard and the `units()[index]` /
 /// `values()[index]` reads its callers do (`OldRegisterInitialization.cpp:996-1009`) stay one index.

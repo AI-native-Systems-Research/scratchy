@@ -131,8 +131,9 @@ pub struct InBlock(pub usize);
 /// (`:31-38`).
 ///
 /// ⛔ TRAP: THE REFERENCE WALKS PAST THE END and dereferences the list sentinel. Every call site
-/// derives `op_num` from a scan of the very block it then indexes
-/// (`LiveRangeReduction.cpp:1039`, `:1076`, `:1180`), so `None` names that unreachable case.
+/// bounds `op_num` by the block it indexes — `LiveRangeReduction.cpp:1180` scans that very block, and
+/// `:1039`/`:1076` index a clone built one op for one (`:1024-1026`) — so `None` names that
+/// unreachable case.
 #[must_use]
 pub fn operation_of_block(block: &[Op], op_num: InBlock) -> Option<&Op> {
     block.get(op_num.0)
@@ -141,7 +142,7 @@ pub fn operation_of_block(block: &[Op], op_num: InBlock) -> Option<&Op> {
 /// Replaces: e240_selectIndicesForUnits
 ///
 /// Flattens every `dataflow.create_group` in `units` to its members and appends each surviving
-/// unit's index to `indices` (`:66-80`).
+/// unit's index to `indices` (`:66-82`).
 ///
 /// ⛔ TRAP: `units` COMES BACK REVERSED — the walk is a LIFO pop-back that pushes onto
 /// `cleaned_units` in pop order, and a group's members go onto the same stack, so nested groups
@@ -168,7 +169,7 @@ pub fn select_indices_for_units(
 /// WHERE ONE OP SITS INSIDE A `dataflow.program_unit` BODY — the `(op, region)` steps that open each
 /// enclosing block, outermost first, then its own position in the innermost one.
 ///
-/// ⭐⭐ THIS IS THE WHOLE OF WHAT `DominanceInfo` (`:86`) ANSWERS HERE, AND THAT IS PROVABLE: every
+/// ⭐⭐ THIS IS THE WHOLE OF WHAT `DominanceInfo` (`:85`) ANSWERS HERE, AND THAT IS PROVABLE: every
 /// region of this island holds exactly one block, so `dominates(a, b)` reduces to *a's block
 /// encloses b's, and a comes no later than b's ancestor in it* — see [`OpAt::dominates`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,7 +235,7 @@ impl OpAt {
 ///
 /// ⛔⛔ [`NewUse::OtherUnit`] IS THE ONLY WAY `failure()` HAPPENS, AND THAT IS PROVED: the nop the
 /// `ProgramUnitOp` arm inserts sits at position 0 of the unit body and therefore dominates every op
-/// in it, so `!dom_info.dominates(insert_point, new_use)` at `:99` can hold only when `new_use` lies
+/// in it, so `!dom_info.dominates(insert_point, new_use)` at `:98` can hold only when `new_use` lies
 /// outside the unit — which is exactly the comment the reference puts on that line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewUse {
@@ -244,7 +245,7 @@ pub enum NewUse {
     OtherUnit,
 }
 
-/// `mlir::LogicalResult` FROM A HOIST — the one `failure()` at `:100` and `success()` otherwise.
+/// `mlir::LogicalResult` FROM A HOIST — the one `failure()` at `:99` and `success()` otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum Hoisted {
@@ -259,9 +260,9 @@ pub enum Hoisted {
 /// Climbs out of the enclosing regions until the insert point dominates `new_use`, rehoists every
 /// operand definition that would stop dominating it, then moves `op` there (`:84-154`).
 ///
-/// ⭐ THE DUMMY `sentient.nop` IS DROPPED POSITIONING MECHANISM, erased again at `:153`; [`NewUse`]
+/// ⭐ THE DUMMY `sentient.nop` IS DROPPED POSITIONING MECHANISM, erased again at `:152`; [`NewUse`]
 /// records why an insert POSITION still reaches the one `failure()`.
-/// ⭐ `op` MOVES FIRST HERE AND LAST THERE (`:152`) — it changes no verdict below, because every
+/// ⭐ `op` MOVES FIRST HERE AND LAST THERE (`:151`) — it changes no verdict below, because every
 /// operand of `op` is defined outside `op` and the removal is in a strictly nested block.
 pub fn move_to_common_dominator(unit_body: &mut Vec<Op>, op: &OpAt, new_use: &NewUse) -> Hoisted {
     let mut point = op.clone();
@@ -271,7 +272,7 @@ pub fn move_to_common_dominator(unit_body: &mut Vec<Op>, op: &OpAt, new_use: &Ne
         }
         match point.parent() {
             Some(parent) => {
-                // ⚠️ ISLAND GAP, NOT A CHOICE: this arm (`:105-129`) cannot fire, because
+                // ⚠️ ISLAND GAP, NOT A CHOICE: this arm (`:101-125`) cannot fire, because
                 // `uniform::LocalRegion::body` holds ops of the rung BELOW and no op of this island
                 // is ever nested in a `uniform.uniformize_regions`. The sentient-rung op that would
                 // change that is the extension `e444_analyze`/`e505_transform` already need — see
@@ -283,14 +284,14 @@ pub fn move_to_common_dominator(unit_body: &mut Vec<Op>, op: &OpAt, new_use: &Ne
                     todo!(
                         "dcc::uniform::utils::getRegionOpAndIndex (dcc/src/Dialect/Uniform/Utils.cpp:343) — \
                          a sentient-rung uniform.uniformize_regions is the island extension this arm \
-                         needs (Transform/Sentient/Utils.cpp:117-127)"
+                         needs (Transform/Sentient/Utils.cpp:114-124)"
                     )
                 }
                 point = parent;
             }
             None => {
                 // The nop the `ProgramUnitOp` arm builds goes at the front of the unit body, and
-                // `break` because the climb cannot go farther than the unit (`:91-103`).
+                // `break` because the climb cannot go farther than the unit (`:91-100`).
                 point = OpAt::top(InBlock(0));
                 if !dominates_use(&point, new_use) {
                     return Hoisted::OutsideProgramUnit;
@@ -299,7 +300,7 @@ pub fn move_to_common_dominator(unit_body: &mut Vec<Op>, op: &OpAt, new_use: &Ne
             }
         }
     }
-    // `if (insert_point == op) return success();` (`:131`)
+    // `if (insert_point == op) return success();` (`:127`)
     if point == *op {
         return Hoisted::Done;
     }
@@ -323,7 +324,7 @@ pub fn move_to_common_dominator(unit_body: &mut Vec<Op>, op: &OpAt, new_use: &Ne
         hoisted += 1;
     }
     // The moves left `[m_k, .., m_1, insert_point]`, so `final_insert_point` has drifted by `hoisted`
-    // and `op->moveBefore(final_insert_point)` (`:152`) lands immediately after the last of them.
+    // and `op->moveBefore(final_insert_point)` (`:151`) lands immediately after the last of them.
     insert_at(
         unit_body,
         &OpAt::at(&point.enclosing, InBlock(point.index.0 + hoisted)),
@@ -340,8 +341,8 @@ fn dominates_use(point: &OpAt, new_use: &NewUse) -> bool {
     }
 }
 
-/// `llvm::copy_if(op->getOperands(), .., [](Value v) { return v.getDefiningOp(); })` (`:139-140`),
-/// which is also the `DT_CHECK(!isa<BlockArgument>(curr))` at `:145`.
+/// `llvm::copy_if(op->getOperands(), .., [](Value v) { return v.getDefiningOp(); })` (`:136-137`),
+/// which is also the `DT_CHECK(!isa<BlockArgument>(curr))` at `:141`.
 fn defined_operands(unit_body: &[Op], op: &Op) -> Vec<Val> {
     operands(op)
         .into_iter()
@@ -349,8 +350,12 @@ fn defined_operands(unit_body: &[Op], op: &Op) -> Vec<Val> {
         .collect()
 }
 
-/// `promote_above_uniform_region` (`:107-118`) — `op` is a `sentient.scalar_copy` of a
+/// `promote_above_uniform_region` (`:104-112`) — `op` is a `sentient.scalar_copy` of a
 /// `dataflow.create_multicast_group`, a `sentient.scalar_constant` or a `symbol.create_symbol`.
+///
+/// ⚠️ DIVERGENCE: A COPY OF A BLOCK ARGUMENT ANSWERS `false` HERE AND ASSERTS THERE —
+/// `isa<CreateMulticastGroupOp>(copy_inp_op)` (`:107`) is a bare `isa<>` on a possibly-null defining
+/// op, which is an assertion failure and not an answer of false.
 fn promotes_above_uniform_region(op: &OpAt, unit_body: &[Op]) -> bool {
     let Some(Op::Sentient(sentient::Op::ScalarCopy { input, .. })) = op.op(unit_body) else {
         return false;
@@ -424,6 +429,19 @@ fn path_of(unit_body: &[Op], val: Val) -> Option<OpAt> {
     walk(unit_body, val, &mut Vec::new())
 }
 
+/// `*val.user_begin()` — THE OP THAT READS `val` ITSELF, at whatever depth, and never the enclosing
+/// op whose region merely holds that read. Only meaningful where `val` has exactly one use.
+fn immediate_user<'a>(val: Val, scope: &'a [Op]) -> Option<&'a Op> {
+    scope.iter().find_map(|op| {
+        if operands(op).contains(&val) {
+            return Some(op);
+        }
+        regions_ref(op)
+            .into_iter()
+            .find_map(|region| immediate_user(val, region))
+    })
+}
+
 /// `Operation::remove()` — the first half of a `moveBefore`.
 fn remove_at(unit_body: &mut Vec<Op>, at: &OpAt) -> Option<Op> {
     let block = block_of_mut(unit_body, &at.enclosing)?;
@@ -438,7 +456,7 @@ fn insert_at(unit_body: &mut Vec<Op>, at: &OpAt, op: Op) {
     }
 }
 
-/// WHICH OP `isConstant<ConstTy>` IS INSTANTIATED FOR (`dcc/src/Utils/Utils.cpp:444-446`); the
+/// WHICH OP `isConstant<ConstTy>` IS INSTANTIATED FOR (`dcc/src/Utils/Utils.cpp:445-447`); the
 /// `arith::ConstantOp` instantiation has no reader in this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConstKind {
@@ -460,8 +478,12 @@ impl ConstKind {
     }
 }
 
-/// `isConstant<ConstTy>` (`dcc/src/Utils/Utils.cpp:423-442`) — the op itself, or a
+/// `isConstant<ConstTy>` (`dcc/src/Utils/Utils.cpp:424-442`) — the op itself, or a
 /// `uniform.query_map` every value of whose immutable mapping is one.
+///
+/// ⚠️ DIVERGENCE: AN EMPTY IMMUTABLE MAPPING ANSWERS `true` HERE AND THROWS THERE —
+/// `DT_CHECK(!immutable_map.getValues().empty())` (`Utils/Utils.cpp:434`), and `.all()` over no pairs
+/// is vacuously true.
 pub(crate) fn is_constant(val: Val, kind: ConstKind, defs: Definitions<'_>) -> bool {
     let Some(def) = defs.of(val) else {
         return false;
@@ -481,18 +503,18 @@ pub(crate) fn is_constant(val: Val, kind: ConstKind, defs: Definitions<'_>) -> b
 }
 
 /// WHETHER A NORMALIZED INDUCTION VARIABLE IS ACCEPTED — `allow_normalized_iv`, whose declaration
-/// defaults it to `true` (`Utils.hpp:78`).
+/// defaults it to `true` (`Utils.hpp:73`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NormalizedIv {
     /// The default: `const - iv` reads as the same loop, ascending.
     Accepted,
-    /// `MultiDimLoopPeeling.cpp:150` passes `false` — only a bare induction variable counts.
+    /// `MultiDimLoopPeeling.cpp:153` passes `false` — only a bare induction variable counts.
     Rejected,
 }
 
 /// WHAT A `sentient.for` INDUCTION VARIABLE RESOLVES TO — the reference's five-tuple, whose fields
 /// its own declaration names *"the loop, lower and upper bounds of this (normalized) IV, the step and
-/// the number of iterations"* (`Utils.hpp:60-66`).
+/// the number of iterations"* (`Utils.hpp:69-70`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForLoopInfo {
     /// The loop, named by its induction variable.
@@ -510,11 +532,11 @@ pub struct ForLoopInfo {
 /// Replaces: e242_getForLoopInfoIfIV
 ///
 /// The `sentient.for` and bounds `val` names as an induction variable, bare or normalized as
-/// `const - iv`, and `None` for the reference's `{nullptr, 0, 0, 0, 0}` (`:156-192`).
+/// `const - iv`, and `None` for the reference's `{nullptr, 0, 0, 0, 0}` (`:156-193`).
 ///
 /// ⛔ TRAP: A BARE `sentient.for` IV COUNTS DOWN — the tuple is `(bound, 1, -1, bound)`, so
 /// `lower_bound` is the HIGH end; only the normalized form is ascending.
-/// ⛔ TRAP: `MultiDimLoopPeeling.cpp:154` DOCUMENTS THE FAILURE TUPLE AS `{nullptr,-1,-1,-1,-1}`
+/// ⛔ TRAP: `MultiDimLoopPeeling.cpp:148` DOCUMENTS THE FAILURE TUPLE AS `{nullptr,-1,-1,-1,-1}`
 /// and it is all zeros — nothing reads it, which is why `None` loses nothing.
 #[must_use]
 pub fn for_loop_info_if_iv(
@@ -523,7 +545,7 @@ pub fn for_loop_info_if_iv(
     defs: Definitions<'_>,
 ) -> Option<ForLoopInfo> {
     let (iv_candidate, subtracted_from, val_is_sub_op) = match defs.of(val) {
-        // `isa<BlockArgument>(val)` — nothing in scope binds it (`:163`).
+        // `isa<BlockArgument>(val)` — nothing in scope binds it (`:161`).
         None => (val, 0, false),
         Some(_) if allow_normalized_iv == NormalizedIv::Rejected => return None,
         Some(Op::Sentient(sentient::Op::ScalarSub { lhs, rhs, .. })) => {
@@ -540,7 +562,7 @@ pub fn for_loop_info_if_iv(
     if arg_number != 0 {
         return None;
     }
-    // `Sentient For-op can have non-constant bounds.` (`:183`)
+    // `Sentient For-op can have non-constant bounds.` (`:181`)
     let Op::Sentient(sentient::Op::For { bound, .. }) = for_op else {
         return None;
     };
@@ -599,7 +621,7 @@ pub enum SenTarget {
 /// The largest legal unroll factor at or below `n` — 1, 2, 3 or 4 for a reduction on
 /// [`SenTarget::Sentient`], and 1, 2, 4 or 8 otherwise (`:397-428`).
 ///
-/// ⛔ TRAP: A REDUCTION ON ANY OTHER TARGET IS NEVER UNROLLED, whatever `n` is (`:414`).
+/// ⛔ TRAP: A REDUCTION ON ANY OTHER TARGET IS NEVER UNROLLED, whatever `n` is (`:416`).
 /// ⭐ `DT_CHECK_MSG(n != 0, "Expect a positive target unroll value")` IS [`NonZeroU32`], and the
 /// return set is [`sentient::UnrollFactor`] exactly — 3 reduction-only, 8 non-reduction-only.
 #[must_use]
@@ -654,14 +676,14 @@ pub fn reverse_predicate(pred: sentient::CmpPredicate) -> sentient::CmpPredicate
 /// `getOutermostConstInitialization`'s tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSize {
-    /// The product of the chain's bounds; a `bound <= 0` is refused outright (`:500-502`).
+    /// The product of the chain's bounds; a `bound <= 0` is refused outright (`:496-498`).
     Iterations(NonZeroU64),
-    /// `size = -1` — some loop in the chain has a non-constant bound (`Utils.hpp:140-141`).
+    /// `size = -1` — some loop in the chain has a non-constant bound (`Utils.hpp:139-140`).
     Unknown,
 }
 
 /// THE OUTERMOST CONSTANT INITIALIZATION OF AN ITER-ARG CHAIN — the reference's triple
-/// (`Utils.hpp:135-144`).
+/// (`Utils.hpp:134-144`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutermostConstInit {
     /// The outermost loop the walk reached, named by its induction variable.
@@ -678,9 +700,11 @@ pub struct OutermostConstInit {
 /// of its iter args a constant initialises, and the unrolled iteration count (`:469-524`).
 ///
 /// ⛔ TRAP: A VALID LOOP COMES BACK WITH `iter_arg: None` when the walk ends without a constant —
-/// the reference returns `{outer_loop, -1, size}` there, and callers test the index (`:2677`).
+/// the reference returns `{outer_loop, -1, size}` there, and callers test the index
+/// (`AddressPinningAndToggle.cpp:2677`).
 /// ⛔ TRAP: ONCE `size` IS `-1` THE REFERENCE KEEPS MULTIPLYING IT, printing `-4` for a constant 4
-/// outside a non-constant loop; every caller tests only `size <= 0`, which [`ChainSize`] answers.
+/// outside a non-constant loop; the ONE caller that reads `size` at all tests `size <= 0`
+/// (`AddressPinningAndToggle.cpp:2830`), which [`ChainSize`] answers; the other three discard it.
 #[must_use]
 pub fn outermost_const_initialization(
     iter_arg: Val,
@@ -693,11 +717,13 @@ pub fn outermost_const_initialization(
     let mut size: u64 = 1;
     let mut unknown = false;
 
-    // `while (iter_arg_index < 0 && curr_iter_arg)` (`:485`)
+    // `while (iter_arg_index < 0 && curr_iter_arg)` (`:488`)
     while iter_arg_index.is_none() {
         let Some(curr_arg) = curr else { break };
         let (for_op, arg_number) = defs.for_arg_of(curr_arg)?;
-        // `getRegionIterArgs()` is `getBody()->getArguments().drop_front(1)`.
+        // `getRegionIterArgs()` is `getBody()->getArguments().drop_front(1)`, and `None` is the `-1`
+        // `getIndexOfLoopRegionIterArgs` answers for an induction variable or a non-`for` block
+        // argument (`Analyses/Utils.cpp:257-271`) — which the reference then indexes lists with.
         let curr_it_index = arg_number.checked_sub(1)?;
         outer_loop = Some(for_op);
         let Op::Sentient(sentient::Op::For {
@@ -719,14 +745,16 @@ pub fn outermost_const_initialization(
             _ => unknown = true,
         }
         if let Some((prev_loop, prev_it_index)) = prev {
-            // `!curr_iter_arg.hasOneUse() || !isa<ForOp>(*curr_iter_arg.user_begin())` (`:513-515`)
+            // `!curr_iter_arg.hasOneUse() || !isa<ForOp>(*curr_iter_arg.user_begin())` (`:509-510`).
+            // Every use of a block argument is inside the region that binds it, so `body` holds all
+            // of them and `hasOneUse()` is this count.
             if use_count(curr_arg, body) != 1 {
                 return None;
             }
-            let user = body
-                .iter()
-                .find(|op| use_count(curr_arg, core::slice::from_ref(*op)) == 1)?;
-            if !matches!(user, Op::Sentient(sentient::Op::For { .. })) {
+            if !matches!(
+                immediate_user(curr_arg, body)?,
+                Op::Sentient(sentient::Op::For { .. })
+            ) {
                 return None;
             }
             // `DT_CHECK_MSG(yield, "expected terminator of previous loop body to be a yield")`
@@ -820,7 +848,7 @@ pub enum RangeCheck {
 }
 
 /// WHICH OF THE FOUR OPS THIS IS, AND THE ATTRIBUTES THAT OP CONTRIBUTES — the `dyn_cast` chain
-/// (`Utils.cpp:531-553`) with its `llvm_unreachable("unexpected op type")` as a type.
+/// (`Utils.cpp:532-554`) with its `llvm_unreachable("unexpected op type")` as a type.
 ///
 /// ⛔ EACH ARM CARRIES ONLY WHAT ITS ARM READS. The reference leaves `burst_size`/`il` at their
 /// initialised 0 for the two scalar/compute ops and reads `getChunkStride()` on the load alone, so a
@@ -862,7 +890,7 @@ pub struct ImmutAddrMemoryOpInfo {
 }
 
 impl ImmutAddrMemoryOpInfo {
-    /// The `dyn_cast` chain (`Utils.cpp:531-553`) — `None` where the reference reaches
+    /// The `dyn_cast` chain (`Utils.cpp:532-554`) — `None` where the reference reaches
     /// `llvm_unreachable("unexpected op type")`.
     #[must_use]
     pub fn of(op: &Op) -> Option<ImmutAddrMemoryOpInfo> {
@@ -917,7 +945,7 @@ impl ImmutAddrMemoryOpInfo {
     }
 }
 
-/// `isConstant<mlir::sentient::ConstantOp>` (`Utils/Utils.cpp:424-447`) AND THE CONSTANTS IT FOUND —
+/// `isConstant<mlir::sentient::ConstantOp>` (`Utils/Utils.cpp:424-442`) AND THE CONSTANTS IT FOUND —
 /// so `is_imm_size_valid`'s opening `DT_CHECK_MSG(isConstant(imm), …)` (`DccExtContext.cpp:34`) is
 /// this value's existence rather than a check the range test repeats.
 ///
@@ -932,7 +960,7 @@ pub enum ConstantImm {
     PerUnit(Vec<i64>),
 }
 
-/// `isConstant<mlir::sentient::ConstantOp>(val)` (`Utils/Utils.cpp:424-447`), keeping the values.
+/// `isConstant<mlir::sentient::ConstantOp>(val)` (`Utils/Utils.cpp:424-442`), keeping the values.
 ///
 /// ⭐ `None` COVERS ALL THREE OF THE REFERENCE'S FALSE PATHS: a block argument (`defs.of` answers
 /// `None`), an op that is neither a constant nor a query map, and a query map with a non-constant
@@ -956,9 +984,9 @@ pub fn constant_imm(val: Val, defs: Definitions<'_>) -> Option<ConstantImm> {
 }
 
 /// `Isa::typeToImmInfo.at(isa.getOpcodeType(OpCodeT::LDSTIU))` for one unit
-/// (`Utils/DccExtContext.cpp:40-46`).
+/// (`Utils/DccExtContext.cpp:40-45`).
 ///
-/// ⭐ `DT_CHECK(sizeSignMap.size() == 1)` (`:43`) FAILS THE BUILD HERE, not the run: this is a
+/// ⭐ `DT_CHECK(sizeSignMap.size() == 1)` (`:42`) FAILS THE BUILD HERE, not the run: this is a
 /// `const fn` and the four call sites below are `const` items, so a table with two immediate fields on
 /// the LDSTIU type is a compile error.
 const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
@@ -993,7 +1021,7 @@ const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
         (Some(info), 1) => info,
         _ => panic!(
             "the LDSTIU type must have exactly one immediate field — \
-             DT_CHECK(sizeSignMap.size() == 1) (`Utils/DccExtContext.cpp:43`)"
+             DT_CHECK(sizeSignMap.size() == 1) (`Utils/DccExtContext.cpp:42`)"
         ),
     }
 }
@@ -1065,8 +1093,8 @@ pub(crate) fn imm_size_valid<A: Arch>(
 /// ridden as an LDSTIU immediate (`Utils.cpp:526-590`).
 ///
 /// TRAP: the LCAS arm can only ever return `false` — `DT_CHECK_MSG(is_constant && is_in_range, …)`
-/// (`:582`) throws whenever `res` would be true, and `DT_CHECK_MSG` is not debug-gated
-/// (`util/dt_exception.hpp:107-118`). TRAP: `load_and_send`'s `chunk_stride` DEFAULTS TO **1**
+/// (`:581`) throws whenever `res` would be true, and `DT_CHECK_MSG` is not debug-gated
+/// (`util/dt_exception.hpp:110-118`). TRAP: `load_and_send`'s `chunk_stride` DEFAULTS TO **1**
 /// (`SentientOps.td:517`), so an L0LU load's `chunk_stride_present` is normally TRUE.
 #[must_use]
 pub fn memory_op_requires_immut_addr_scalar_copy<A: Arch>(
@@ -1075,18 +1103,22 @@ pub fn memory_op_requires_immut_addr_scalar_copy<A: Arch>(
     do_range_check: RangeCheck,
     defs: Definitions<'_>,
 ) -> bool {
-    // Every arm below is `is_constant && …`, and the L3 arm returns `is_constant` itself.
-    let Some(imm) = constant_imm(op.immutable_addr, defs) else {
-        return false;
-    };
-    let is_in_range = match (do_range_check, unit_type.with_imm()) {
-        (RangeCheck::Check, Some(unit)) => imm_size_valid::<A>(unit, &imm, op.element_size),
-        // `do_range_check` off, or an L3 unit with no IMM for these operations (`:557-558`).
-        (RangeCheck::Check | RangeCheck::Skip, _) => true,
+    // ⛔ A NON-CONSTANT ADDRESS IS NOT AN EARLY RETURN. It makes every arm's ANSWER `false`, but the
+    // LCAS `DT_CHECK`s (`:579`, `:581`) and the trailing `llvm_unreachable` (`:589`) are reached
+    // whatever `is_constant` is, so it stays a flag.
+    let imm = constant_imm(op.immutable_addr, defs);
+    let is_constant = imm.is_some();
+    let is_in_range = match (&imm, do_range_check, unit_type.with_imm()) {
+        (Some(imm), RangeCheck::Check, Some(unit)) => {
+            imm_size_valid::<A>(unit, imm, op.element_size)
+        }
+        // Not constant, `do_range_check` off, or an L3 unit with no IMM for these operations
+        // (`:559-562`).
+        _ => true,
     };
 
     // ⛔ THE ORDER IS THE `else if` CHAIN'S: the two scalar/compute ops answer before the L3 arm, so an
-    // LAE or LCAS on an L3 unit reaches its own arm with `is_in_range` forced true (`:576-586`).
+    // LAE or LCAS on an L3 unit reaches its own arm with `is_in_range` forced true (`:576-585`).
     match (op.kind, unit_type) {
         (
             ImmutAddrMemoryOp::ReceiveAndStore {
@@ -1094,7 +1126,10 @@ pub fn memory_op_requires_immut_addr_scalar_copy<A: Arch>(
                 interleaved_group,
             },
             MemoryUnit::L0su | MemoryUnit::Lxsu,
-        ) => burst_size > Elements(1) || interleaved_group > Elements(0) || !is_in_range,
+        ) => {
+            is_constant
+                && (burst_size > Elements(1) || interleaved_group > Elements(0) || !is_in_range)
+        }
         (
             ImmutAddrMemoryOp::LoadAndSend {
                 burst_size,
@@ -1103,33 +1138,36 @@ pub fn memory_op_requires_immut_addr_scalar_copy<A: Arch>(
             },
             MemoryUnit::L0lu | MemoryUnit::Lxlu,
         ) => {
-            // `chunk_stride_present` is an L0LU-only term — LX uses no LRF for the offset (`:543`).
+            // `chunk_stride_present` IS AN L0LU-ONLY TERM: *"In case of chunk strides, we should use
+            // LRF for offset"* (`:542`), and the test the reference writes is `unit_type == L0LU`
+            // (`:543`).
             let chunk_stride_present =
                 unit_type == MemoryUnit::L0lu && chunk_stride > Elements(0);
-            burst_size > Elements(1)
-                || interleaved_group > Elements(0)
-                || chunk_stride_present
-                || !is_in_range
+            is_constant
+                && (burst_size > Elements(1)
+                    || interleaved_group > Elements(0)
+                    || chunk_stride_present
+                    || !is_in_range)
         }
-        (ImmutAddrMemoryOp::LoadAndExtractScalar, _) => !is_in_range,
+        (ImmutAddrMemoryOp::LoadAndExtractScalar, _) => is_constant && !is_in_range,
         (ImmutAddrMemoryOp::LoadComputeAndSend, MemoryUnit::Lxlu) => {
-            if is_in_range {
+            if is_constant && is_in_range {
                 false
             } else {
                 panic!(
                     "sentient::LoadComputeAndSendOp requires immediate immutable address in range \
-                     (`Utils.cpp:582`)"
+                     (`Utils.cpp:581`)"
                 )
             }
         }
         (ImmutAddrMemoryOp::LoadComputeAndSend, _) => {
-            panic!("DT_CHECK(unit_type == LXLU) (`Utils.cpp:580`): {unit_type:?}")
+            panic!("DT_CHECK(unit_type == LXLU) (`Utils.cpp:579`): {unit_type:?}")
         }
-        // No imm in L3LU/L3SU, so being constant at all is the whole answer (`:586-588`).
+        // No imm in L3LU/L3SU, so being constant at all is the whole answer (`:585-587`).
         (
             ImmutAddrMemoryOp::ReceiveAndStore { .. } | ImmutAddrMemoryOp::LoadAndSend { .. },
             MemoryUnit::L3lu | MemoryUnit::L3su,
-        ) => true,
+        ) => is_constant,
         (ImmutAddrMemoryOp::ReceiveAndStore { .. } | ImmutAddrMemoryOp::LoadAndSend { .. }, _) => {
             panic!(
                 "llvm_unreachable(\"unexpected operation or unit type\") (`Utils.cpp:589`): \
@@ -1146,7 +1184,7 @@ pub fn memory_op_requires_immut_addr_scalar_copy<A: Arch>(
 ///
 /// ⭐ THE `if (!op)` NULL CHECK IS THE `&Op` PARAMETER, and `hasAttr("fold_mode")` is WHICH VARIANT:
 /// the four compute ops are the only ones the `.td` gives the attribute to, and on those it is already
-/// an `Option` because it is a `DefaultValuedAttr`.
+/// an `Option` because it is an `OptionalAttr` (`SentientOps.td:248`, `:303`, `:335`, `:375`).
 #[must_use]
 pub fn fold_mode_attribute_if_exists(op: &Op) -> Option<ops::FoldMode> {
     match op {
@@ -1165,9 +1203,9 @@ pub fn fold_mode_attribute_if_exists(op: &Op) -> Option<ops::FoldMode> {
 /// Whether a program unit holds a `uniform.uniformize_regions` or a `uniform.equalize_pattern`
 /// anywhere inside it (`Utils.cpp:622-632`).
 ///
-/// ⭐ ONE FUNCTION, TWO DECLARATIONS: this body and `OldRegisterInitialization.cpp:536-547` are
-/// byte-identical, and that one is already ported as `e107_hasUniformizeRegion` — so this FORWARDS to
-/// it rather than walking the unit a second time.
+/// ⭐ ONE FUNCTION, TWO DECLARATIONS: this body and `OldRegisterInitialization.cpp:536-546` are the
+/// same walk twice — they differ only in namespace qualification and line wrapping — and that one is
+/// already ported as `e107_hasUniformizeRegion`, so this FORWARDS to it rather than walking twice.
 #[must_use]
 pub fn has_uniformize_region(unit_body: &[Op]) -> bool {
     super::old_register_initialization::register_init_info::has_uniformize_region(unit_body)
@@ -1209,6 +1247,7 @@ mod unit_tests {
     use crate::arch::Dd2;
     use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::{LocalRegion, UniformRegions};
 
     /// `sentient.scalar_constant` — the constant an immutable address resolves to.
     fn scalar_constant(result: Val, value: i64) -> Op {
@@ -1295,6 +1334,26 @@ mod unit_tests {
             RangeCheck::Check,
             defs
         ));
+    }
+
+    /// A NON-CONSTANT ADDRESS STILL REACHES THE LCAS `DT_CHECK_MSG`: `is_constant` is a term OF that
+    /// check (`Utils.cpp:581`), not a guard in front of it, so a block-argument address throws where
+    /// the load arms merely answer `false`.
+    #[test]
+    #[should_panic(expected = "Utils.cpp:581")]
+    fn e247_a_non_constant_address_still_throws_on_an_lcas() {
+        let scope: Vec<Op> = Vec::new();
+        let regions: [&[Op]; 1] = [&scope];
+        let _ = memory_op_requires_immut_addr_scalar_copy::<Dd2>(
+            MemoryUnit::Lxlu,
+            &ImmutAddrMemoryOpInfo {
+                kind: ImmutAddrMemoryOp::LoadComputeAndSend,
+                immutable_addr: Val(99),
+                element_size: Bits(32),
+            },
+            RangeCheck::Check,
+            Definitions::from_innermost(&regions),
+        );
     }
 
     /// AN ADDRESS THAT DOES NOT FIT THE UNIT'S IMMEDIATE FORCES THE COPY on the unit whose field is
@@ -1629,6 +1688,52 @@ mod unit_tests {
             .map(reverse_predicate)
             .collect();
         assert_eq!(reversed, vec![Eq, Ne, Sgt, Sge, Slt, Sle]);
+    }
+
+    /// e246: `*curr_iter_arg.user_begin()` IS THE OP THAT READS THE ARG, so an inner `sentient.for`
+    /// sitting inside a local region of the outer loop's body still passes the `isa<ForOp>` test —
+    /// the enclosing `uniform.equalize_pattern` is not the user.
+    #[test]
+    fn outermost_const_initialization_reads_the_user_and_not_its_enclosing_op() {
+        let inner_body = vec![yield_op(vec![Val(7)])];
+        let inner_loop = for_op(
+            Val(6),
+            Val(1),
+            vec![carried(Val(4), Val(7), Val(8))],
+            inner_body.clone(),
+        );
+        let outer_body = vec![
+            Op::UniformRegions(UniformRegions::EqualizePattern {
+                regions: vec![LocalRegion {
+                    arg: Val(20),
+                    units: Vec::new(),
+                    body: vec![inner_loop],
+                }],
+            }),
+            yield_op(vec![Val(8)]),
+        ];
+        let top = vec![
+            constant(Val(0), 4),
+            constant(Val(1), 2),
+            constant(Val(2), 0),
+            for_op(
+                Val(3),
+                Val(0),
+                vec![carried(Val(2), Val(4), Val(5))],
+                outer_body.clone(),
+            ),
+        ];
+        let scopes: [&[Op]; 3] = [&inner_body, &outer_body, &top];
+        assert_eq!(
+            outermost_const_initialization(Val(7), Definitions::from_innermost(&scopes)),
+            Some(OutermostConstInit {
+                loop_op: ForRef(Val(3)),
+                iter_arg: Some(IterArgIndex(0)),
+                size: ChainSize::Iterations(
+                    core::num::NonZeroU64::new(8).expect("the product of 2 and 4")
+                ),
+            })
+        );
     }
 
     /// e246: the reference's own chained-initialization example — an inner iter arg initialised from an

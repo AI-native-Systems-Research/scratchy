@@ -108,7 +108,8 @@ pub(crate) struct VectorRegisterInitCount(pub(crate) u32);
 /// `VectorRegisterInitializationPass`'s OWN STATE (`:51-78`) — the statistic these units share.
 ///
 /// ⭐ `opts_` IS DELIBERATELY ABSENT. Its one reader is the `opts_.OptLevel == 0` test inside the
-/// `#if 0` that the FIXME at `:84-92` disables, so the C++ carries the option and nothing reads it.
+/// `#if 0` at `:88-92` that the FIXME at `:84-87` explains, so the C++ carries the option and
+/// nothing reads it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct VectorRegisterInitialization {
     /// How many splats this pass has moved into the program header.
@@ -154,8 +155,9 @@ impl VectorRegisterInitialization {
     ///
     /// ⛔ THE PORT RULE IS DELIBERATELY CONSERVATIVE (`:151-155`): the splat must be the FIRST access
     /// through its output port, so a port already in `accessed_ports` disqualifies it outright.
-    /// ⛔ A `uniform.query_map` INPUT NEEDS **EVERY** ENTRY of the mapping behind it to be constant,
-    /// not just the entry this unit would read — the marked splat becomes one program header for all.
+    /// ⛔ A `uniform.query_map` INPUT NEEDS **EVERY** ENTRY of the mapping behind it constant, not
+    /// just the entry one unit reads: the marked splat becomes a register init for every unit of the
+    /// list, each reading its own mapped value (`ConstructProgIRHelper.cpp:4377-4383`).
     pub(crate) fn is_candidate(
         &self,
         op: &Op,
@@ -184,7 +186,7 @@ impl VectorRegisterInitialization {
         else {
             todo!(
                 "isCandidate: DT_CHECK_MSG(output_port, \"expected output port to be specified \
-                 through logical_port\") on {output:?} (:147-150)"
+                 through logical_port\") on {output:?} (:149-150)"
             )
         };
         // `if (set_of_accessed_ports.count(output_port.getPortName())) return false; return true;`
@@ -194,7 +196,8 @@ impl VectorRegisterInitialization {
     /// Replaces: e256_markForRegisterInit
     ///
     /// Sets `programHeader = true` on a candidate `sentient.splat` and counts it — THE PASS'S WHOLE
-    /// EFFECT on the IR; `ConstructProgIRHelper` reads the attribute instead of emitting an IMMCOPY.
+    /// EFFECT on the IR; `ConstructProgIRHelper` then reads the attribute instead of emitting an
+    /// IMMCOPY, and only when `pad` is `none` (`ConstructProgIRHelper.cpp:3834`).
     ///
     /// ⛔ THE `DT_CHECK_MSG(isa<sentient::SplatOp>(op), ..)` IS NOT UNREPRESENTABLE HERE: the argument
     /// is `Operation &op` in the reference and any [`Op`] here, so it stays a named stop.
@@ -220,7 +223,7 @@ fn all_mapped_values_are_constants(map: Val, defs: Definitions<'_>) -> bool {
     let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
         todo!(
             "isCandidate: a uniform.query_map's $map is not a uniform.def_immutable_mapping, which \
-             `dyn_cast` + `target_map.getValues()` dereferences unchecked (:136-138)"
+             `dyn_cast` + `target_map.getValues()` dereferences unchecked (:137-139)"
         )
     };
     pairs.iter().all(|(_key, value)| {
