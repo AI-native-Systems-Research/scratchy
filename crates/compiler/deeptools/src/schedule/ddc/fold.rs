@@ -159,53 +159,303 @@
 //! | `e370_buildAndPropagateFold` | 370 | 5 | 350 | `Ddc` | `ddc/ddc_fold.cpp:1625` |
 //! | `e375_coordinateCapture` | 375 | 6 | 86 | `Ddc` | `ddc/ddc_fold.cpp:1538` |
 
-// crustify:todo: e078_dbgPrint
-//   authority : ddc/ddc_fold.cpp:20  (25 body lines, level 0)
-//   original  : void dbgPrint(const dsc2::ComputeNode *computeNode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:177-202
+use sys_arch_spec::arch_enums::SenComponent;
 
-// crustify:todo: e079_dbgPrint
-//   authority : ddc/ddc_fold.cpp:46  (16 body lines, level 0)
-//   original  : void dbgPrint(const dsc2::TransferNode *transferNode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:211-227
-
-// crustify:todo: e080_allDimsCovered
-//   authority : ddc/ddc_fold.cpp:75  (9 body lines, level 0)
-//   original  : bool allDimsCovered(const DesignSpaceConfig *currDsc, const dsc2::CoordinateType<CoordinateBaseType> &coord, const int ldsIdx)
-//   extract   : crustify-ddc/cpp/ddc.cpp:236-247
-
-// crustify:todo: e081_buildFoldForBroadcastDim
-//   authority : ddc/ddc_fold.cpp:87  (19 body lines, level 0)
-//   original  : void buildFoldForBroadcastDim(const DesignSpaceConfig *currDsc, dsc2::CoordinateType<CoordinateBaseType> &coord, const LabeledDsInfo &lds, PrimaryDimTypes dim, int scale)
-//   extract   : crustify-ddc/cpp/ddc.cpp:256-278
-
-// crustify:todo: e082_getCompRowId
-//   authority : ddc/ddc_fold.cpp:110  (7 body lines, level 0)
-//   original  : int getCompRowId(SenComponents comp)
-//   extract   : crustify-ddc/cpp/ddc.cpp:287-294
-
-// crustify:todo: e083_getComponent
-//   authority : ddc/ddc_fold.cpp:118  (17 body lines, level 0)
-//   original  : SenComponents getComponent(const dsc2::ScheduleNode *node, bool getSrc = true)
-//   extract   : crustify-ddc/cpp/ddc.cpp:303-320
-
-// crustify:todo: e084_getLayoutDimsFromNode
-//   authority : ddc/ddc_fold.cpp:136  (51 body lines, level 0)
-//   original  : std::vector<PrimaryDimTypes> getLayoutDimsFromNode( const DesignSpaceConfig *currDsc, const dsc2::ScheduleNode *node, int inputPos = -1, int outputPos = -1)
-//   extract   : crustify-ddc/cpp/ddc.cpp:329-382
-
-// crustify:todo: e085_needToConsiderRowBundling
-//   authority : ddc/ddc_fold.cpp:190  (7 body lines, level 0)
-//   original  : bool needToConsiderRowBundling( const dsc2::DataStage &coreDs, const dsc2::CoordinateType<CoordinateBaseType> &refCoord, const std::vector<PrimaryDimTypes> &workingDims)
-//   extract   : crustify-ddc/cpp/ddc.cpp:391-401
-
-// ⭐ USES FOR ENTRIES 086-093. Union these into this file's top block when its other entries land.
 use crate::arch::{Arch, Elements};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    Extent, PrimaryDim, SliceElems, StickDims, StickPart, cumulative_stick_sizes,
+    Extent, PrimaryDim, SliceElems, Stage, StickDims, StickPart, cumulative_stick_sizes,
 };
 use crate::generated::DataConnect;
+use crate::schedule::dsc2;
+use crate::schedule::dsc2::{
+    ComputeNode, CoordinateCategory, Dsc, FoldCardinality, FoldCoeff, LdsIdx, Node, Operand,
+    OperandPos, TransferNode, TransferSide,
+};
 use crate::units::DfirUnit;
+
+/// ONE OPERAND AS `dbgPrint` SPELLS IT — `'<component>(<data_connect>)'`, and an unset
+/// `dataConnect_` is the empty string the default-constructed `DataInfo` prints.
+fn operand_text(operand: &Operand) -> String {
+    let connect = operand.data.data_connect.map_or("", |dc| dc.spelling());
+    format!(" '{}({})'", operand.unit.spelling(), connect)
+}
+
+/// Replaces: e078_dbgPrint
+///
+/// A compute node's debug line: name, address, op spelling, then its inputs and its outputs.
+///
+/// ⛔ TRAP CLOSED: the reference bounds both loops by the `..LdsAndLoopOffsets_` length while
+/// indexing `inputs_`/`outputs_` with `.at(i)`, so a length mismatch throws. `Operand` pairs the
+/// component with its data, and `ComputeType::cpp_spelling` is total where
+/// `computeTypeToString.at(type_)` has no entry for `FCVT`.
+#[must_use]
+pub fn dbg_print_compute(node: &ComputeNode) -> String {
+    let mut out = format!(
+        " ComputeNode: {}({:p}) {} [",
+        node.name.0,
+        node,
+        node.op.cpp_spelling()
+    );
+    for operand in &node.inputs {
+        out.push_str(&operand_text(operand));
+    }
+    out.push_str("] -> [");
+    for operand in &node.outputs {
+        out.push_str(&operand_text(operand));
+    }
+    out.push(']');
+    out
+}
+
+/// Replaces: e079_dbgPrint
+///
+/// A transfer node's debug line: name, address, its one source, then every destination.
+///
+/// ⛔ TRAP CLOSED: the reference bounds its loop by `dstLdsAndLoopOffsets_.size()` while indexing
+/// `dstVias_` with `.at(i)`. `Dsts` holds the pair as one list.
+#[must_use]
+pub fn dbg_print_transfer(node: &TransferNode) -> String {
+    let mut out = format!(
+        " TransferNode: {}({:p}) [{}] -> [",
+        node.name.0,
+        node,
+        operand_text(&node.src).trim_start()
+    );
+    for operand in node.dsts.iter() {
+        out.push_str(&operand_text(operand));
+    }
+    out.push(']');
+    out
+}
+
+/// Replaces: e080_allDimsCovered
+///
+/// Whether the coordinate already has a fold for every dim of that labelled data structure's
+/// layout order.
+#[must_use]
+pub fn all_dims_covered(dsc: &impl Dsc, coord: &dsc2::Coordinate, lds: LdsIdx) -> bool {
+    dsc.layout_dims(lds).iter().all(|dim| coord.covers(dim))
+}
+
+/// WHAT A BROADCAST DIM'S ELEMENT ARRANGEMENT COSTS — the reference's `scale`, which reaches
+/// `buildFoldForBroadcastDim` only when NEGATIVE (`ddc/ddc_fold.cpp:2298`, `:3975`, `:4284`) and
+/// there distinguishes exactly one value, `-2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastScale {
+    /// Any negative scale other than `-2`: the arrangement is one element.
+    Unit,
+    /// `scale == -2`: the dim's own cumulative stick size (`ddc/ddc_fold.cpp:92`).
+    CumulativeStickSize(FoldCardinality),
+}
+
+/// Replaces: e081_buildFoldForBroadcastDim
+///
+/// Gives a broadcast dim its element-arrangement fold plus cardinality-1 row-split, corelet and
+/// core-workslice folds, each pushed to the FRONT — which is why the dim ends up with
+/// `FoldPosition::Core`, `Corelet` and `RowSplit` at positions 0, 1 and 2.
+///
+/// ⛔ TRAP CLOSED: `getCumulativeStickSizes(lds.dsType_).at(dim)` throws for a dim those sizes omit.
+/// The cardinality arrives resolved in `BroadcastScale`, which is the only fact the reference's
+/// `currDsc` and `lds` arguments were reached through.
+pub fn build_fold_for_broadcast_dim(
+    coord: &mut dsc2::Coordinate,
+    dim: PrimaryDim,
+    scale: BroadcastScale,
+) {
+    let elem_arr_card = match scale {
+        BroadcastScale::Unit => FoldCardinality(1),
+        BroadcastScale::CumulativeStickSize(card) => card,
+    };
+    let alpha = FoldCoeff(i64::from(elem_arr_card.0));
+    let fold_dim_str = dim.spelling();
+
+    coord.add_fold_front(
+        dim,
+        CoordinateCategory::ElemArr,
+        elem_arr_card,
+        dsc2::FoldLabel("elem_arr_0".to_owned()),
+        FoldCoeff(0),
+        FoldCoeff(0),
+    );
+    for label in [
+        format!("rowsplit_fold_{fold_dim_str}"),
+        format!("corelet_fold_{fold_dim_str}"),
+        format!("core_workslice_fold_{fold_dim_str}"),
+    ] {
+        coord.add_fold_front(
+            dim,
+            CoordinateCategory::Spatial,
+            FoldCardinality(1),
+            dsc2::FoldLabel(label),
+            alpha,
+            FoldCoeff(0),
+        );
+    }
+}
+
+/// WHICH PT ROW A COMPONENT SITS ON — the ordinal `senCompToRowId`
+/// (`sys-arch-spec/arch_enums.cpp:296`) gives it, which is the digit in the component's own name.
+///
+/// ⛔ ARCH-BLIND ON PURPOSE, so it is NOT `units::PtRow`. That table names rows 0..7 whatever the
+/// arch's row count, and callers compare row ids for equality and adjacency
+/// (`ddc/ddc_fold.cpp:768`, `:1184`); folding "row 7 on a 4-row arch" into the same absence as "not
+/// a row component" would make those comparisons lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PtRowId(u8);
+
+impl PtRowId {
+    /// The row ordinal, 0..=7.
+    #[must_use]
+    pub const fn ordinal(self) -> u8 {
+        self.0
+    }
+
+    /// `abs(refRowId - getCompRowId(propDestUnit)) <= 1` (`ddc/ddc_fold.cpp:1184`).
+    #[must_use]
+    pub const fn is_adjacent_or_same(self, other: Self) -> bool {
+        self.0.abs_diff(other.0) <= 1
+    }
+}
+
+/// Replaces: e082_getCompRowId
+///
+/// The PT row a component is on, absent where it is on none — the reference's `-1`.
+#[must_use]
+pub fn comp_row_id(comp: SenComponent) -> Option<PtRowId> {
+    let row = match comp {
+        SenComponent::Ptrow0
+        | SenComponent::Ptrow0_0
+        | SenComponent::Ptrow0_1
+        | SenComponent::L0lurow0
+        | SenComponent::L0lurow0_0
+        | SenComponent::L0lurow0_1 => 0,
+        SenComponent::Ptrow1
+        | SenComponent::Ptrow1_0
+        | SenComponent::Ptrow1_1
+        | SenComponent::L0lurow1
+        | SenComponent::L0lurow1_0
+        | SenComponent::L0lurow1_1 => 1,
+        SenComponent::Ptrow2
+        | SenComponent::Ptrow2_0
+        | SenComponent::Ptrow2_1
+        | SenComponent::L0lurow2
+        | SenComponent::L0lurow2_0
+        | SenComponent::L0lurow2_1 => 2,
+        SenComponent::Ptrow3
+        | SenComponent::Ptrow3_0
+        | SenComponent::Ptrow3_1
+        | SenComponent::L0lurow3
+        | SenComponent::L0lurow3_0
+        | SenComponent::L0lurow3_1 => 3,
+        SenComponent::Ptrow4
+        | SenComponent::Ptrow4_0
+        | SenComponent::Ptrow4_1
+        | SenComponent::L0lurow4
+        | SenComponent::L0lurow4_0
+        | SenComponent::L0lurow4_1 => 4,
+        SenComponent::Ptrow5
+        | SenComponent::Ptrow5_0
+        | SenComponent::Ptrow5_1
+        | SenComponent::L0lurow5
+        | SenComponent::L0lurow5_0
+        | SenComponent::L0lurow5_1 => 5,
+        SenComponent::Ptrow6
+        | SenComponent::Ptrow6_0
+        | SenComponent::Ptrow6_1
+        | SenComponent::L0lurow6
+        | SenComponent::L0lurow6_0
+        | SenComponent::L0lurow6_1 => 6,
+        SenComponent::Ptrow7
+        | SenComponent::Ptrow7_0
+        | SenComponent::Ptrow7_1
+        | SenComponent::L0lurow7
+        | SenComponent::L0lurow7_0
+        | SenComponent::L0lurow7_1 => 7,
+        // The other 59 components are not on a row, which is what `senCompToRowId.count(comp) == 0`
+        // says, and a component added to the enum is not on one either.
+        _ => return None,
+    };
+    Some(PtRowId(row))
+}
+
+/// Replaces: e083_getComponent
+///
+/// The component a node is at: an allocation's own, a compute's execution unit, or a transfer's
+/// source or FIRST destination. The side is read for a transfer and ignored otherwise.
+///
+/// ⛔ TRAP CLOSED: `"Unsupported node type"` is unspellable over `Node`, and `dstVias_.at(0)` cannot
+/// throw because `Dsts` is non-empty.
+#[must_use]
+pub fn component(node: Node<'_>, side: TransferSide) -> SenComponent {
+    match node {
+        Node::Allocate(alloc) => alloc.component,
+        Node::Compute(compute) => compute.ex_unit,
+        Node::Transfer(transfer) => match side {
+            TransferSide::Src => transfer.src.unit,
+            TransferSide::Dst => transfer.dsts.first().unit,
+        },
+    }
+}
+
+/// Replaces: e084_getLayoutDimsFromNode
+///
+/// The layout order of the labelled data structure one named operand of a node reads or writes, and
+/// no dims where that operand has none — the reference's `myLdsIdx_ == -1`.
+///
+/// ⛔ The reference's `DT_ERROR` for "neither input nor output specified" is unspellable, and its
+/// `DT_CHECK(inputPos == 0)` on a transfer cannot fail because a transfer has exactly one source.
+/// ⛔ TRAP: a position past the operand list gives no dims where the reference's `.at()` throws.
+#[must_use]
+pub fn layout_dims_from_node(dsc: &impl Dsc, node: Node<'_>, pos: OperandPos) -> Vec<PrimaryDim> {
+    let lds = match (node, pos) {
+        (Node::Allocate(alloc), _) => alloc.lds,
+        (Node::Transfer(transfer), OperandPos::Input(_)) => transfer.src.data.my_lds_idx,
+        (Node::Transfer(transfer), OperandPos::Output(at)) => {
+            transfer.dsts.get(at).and_then(|dst| dst.data.my_lds_idx)
+        }
+        (Node::Compute(compute), OperandPos::Input(at)) => compute
+            .inputs
+            .get(at)
+            .and_then(|input| input.data.my_lds_idx),
+        (Node::Compute(compute), OperandPos::Output(at)) => compute
+            .outputs
+            .get(at)
+            .and_then(|output| output.data.my_lds_idx),
+    };
+    lds.map(|lds| dsc.layout_dims(lds).to_vec())
+        .unwrap_or_default()
+}
+
+/// Replaces: e085_needToConsiderRowBundling
+///
+/// Whether the core stage's FIRST row-split dim — lowest `PrimaryDimTypes` ordinal, which is what
+/// `rowSplit_.begin()` yields — is one of the dims being worked on. No row split at all is `false`.
+///
+/// ⛔ The reference's `refCoord` argument is never read (`ddc/ddc_fold.cpp:190-198`).
+#[must_use]
+pub fn need_to_consider_row_bundling<S: Stage>(core_ds: &S, working_dims: &[PrimaryDim]) -> bool {
+    PrimaryDim::ALL
+        .into_iter()
+        .find(|&dim| core_ds.is_row_split(dim))
+        .is_some_and(|row_split_dim| working_dims.contains(&row_split_dim))
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// ⛔ THIS FILE CARRIES THE FOLD VOCABULARY TWICE, and a review pass owns converging it — entries
+// 078-085 landed on `crate::schedule::dsc2`, entries 086-095 on the block below, and each pair
+// below is ONE C++ declaration typed twice. `LdsIdx` was identical and is now `dsc2`'s alone; the
+// rest differ in a way that decides which survives, so they are not merged by guesswork:
+//   `dsc2::FoldCardinality(u32)` / `Cardinality(u64)` — `addFold` takes `int foldCardinality` and
+//     stores it in `FoldDimProp::factor_`, a `uint32_t` (`dsc/dsc2.h:120`, `foldInfrastructure.h:119`)
+//   `dsc2::FoldCoeff` / `Alpha` + `Beta` — one newtype for both coefficients lets a caller
+//     transpose them; two do not
+//   `dsc2::FoldLabel(String)` / `FoldLabel` (4 variants) — `addFold` takes a `std::string`; the
+//     later entries mint fixed spellings and entry 081 mints `"rowsplit_fold_" + dim`, which is a
+//     DIFFERENT label from entry 094's bare `"rowsplit_fold"` (`ddc/ddc_fold.cpp:100` vs `:2158`),
+//     so the closed set that covers both needs a dim-carrying variant
+//   `dsc2::CoordinateCategory` / `CoordCategory` — same three variants, same dropped `UNKNOWN_COORD`
+//   `dsc2::Coordinate` (the map and its counts) / `Coordinate` (the one `addFold` entry 093 makes)
+// ════════════════════════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE SCHEDULE TREE, ITS ALLOCATIONS AND ITS FOLDS — as entries 086-093 read them.
@@ -248,11 +498,6 @@ pub struct NodeId(pub u32);
 /// nothing with one but compare it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AllocId(pub u32);
-
-/// A `labeledDs_` index, positive by type — the reference's `-1` is *no labeled DS*, which is a
-/// different thing from index zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LdsIdx(pub u32);
 
 /// A `constantInfo_` index, positive by type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1702,3 +1947,247 @@ mod tests_e094_e095 {
 //   original  : void Ddc::coordinateCapture()
 //   extract   : crustify-ddc/cpp/ddc.cpp:14875-14961
 //   calls     : e076_print, e102_print, e370_buildAndPropagateFold
+
+// ⭐ TESTS FOR ENTRIES 078-085. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e078_e085 {
+    use super::*;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        Extent, PaddedExtent, Sample,
+    };
+    use crate::generated::{ComputeType, DataConnect};
+    use crate::schedule::dsc2::{AllocateNode, DataInfo, Dsts, FoldPosition, LayoutDims, NodeName};
+
+    /// One labelled data structure whose layout order is `[out, in]`, which is all
+    /// `getLayoutDims` is ever asked for here.
+    struct OneLds(LayoutDims);
+
+    impl Dsc for OneLds {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            self.0.clone()
+        }
+    }
+
+    fn out_then_in() -> OneLds {
+        OneLds(LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::In]))
+    }
+
+    /// A core stage that splits exactly the dims it is told to. Only [`Stage::is_row_split`] is
+    /// read by entry 085; the extents are not part of the question.
+    struct RowSplitOn(Vec<PrimaryDim>);
+
+    impl Stage for RowSplitOn {
+        fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_row_split(&self, dim: PrimaryDim) -> bool {
+            self.0.contains(&dim)
+        }
+        fn is_pe_sfp_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn splits_any_row(&self) -> bool {
+            !self.0.is_empty()
+        }
+        fn extent(&self, _dim: PrimaryDim, _at: Sample) -> Extent {
+            Extent(0)
+        }
+        fn padded_extent(&self, _dim: PrimaryDim, _at: Sample) -> Option<PaddedExtent> {
+            None
+        }
+    }
+
+    fn operand(unit: SenComponent, connect: Option<DataConnect>, lds: Option<u32>) -> Operand {
+        Operand {
+            unit,
+            data: DataInfo {
+                data_connect: connect,
+                my_lds_idx: lds.map(LdsIdx),
+            },
+        }
+    }
+
+    #[test]
+    fn a_compute_line_names_every_operand_with_its_own_connect() {
+        let node = ComputeNode {
+            name: NodeName("mac0".to_owned()),
+            op: ComputeType::Macc,
+            ex_unit: SenComponent::Ptrow3,
+            inputs: vec![
+                operand(SenComponent::Ptrow3, Some(DataConnect::AconstConnect), None),
+                operand(SenComponent::Lx, None, None),
+            ],
+            outputs: vec![operand(SenComponent::Ptsouth, None, None)],
+        };
+        assert_eq!(
+            dbg_print_compute(&node),
+            format!(
+                " ComputeNode: mac0({:p}) macc [ 'ptrow3(aconst_connect)' 'lx()'] -> \
+                 [ 'ptsouth()']",
+                &node
+            )
+        );
+    }
+
+    #[test]
+    fn a_transfer_line_carries_one_source_and_every_destination() {
+        let node = TransferNode {
+            name: NodeName("t0".to_owned()),
+            src: operand(SenComponent::Hbm, None, None),
+            dsts: Dsts::new(
+                operand(SenComponent::Lx, None, None),
+                vec![operand(SenComponent::L0, None, None)],
+            ),
+        };
+        assert_eq!(
+            dbg_print_transfer(&node),
+            format!(
+                " TransferNode: t0({:p}) ['hbm()'] -> [ 'lx()' 'l0()']",
+                &node
+            )
+        );
+    }
+
+    #[test]
+    fn a_coordinate_covers_a_layout_order_only_once_it_holds_every_dim_of_it() {
+        let dsc = out_then_in();
+        let mut coord = dsc2::Coordinate::default();
+        build_fold_for_broadcast_dim(&mut coord, PrimaryDim::Out, BroadcastScale::Unit);
+        assert!(!all_dims_covered(&dsc, &coord, LdsIdx(0)));
+        build_fold_for_broadcast_dim(&mut coord, PrimaryDim::In, BroadcastScale::Unit);
+        assert!(all_dims_covered(&dsc, &coord, LdsIdx(0)));
+    }
+
+    #[test]
+    fn a_broadcast_dim_lands_its_four_folds_with_core_corelet_and_rowsplit_at_their_positions() {
+        let mut coord = dsc2::Coordinate::default();
+        build_fold_for_broadcast_dim(
+            &mut coord,
+            PrimaryDim::Mb,
+            BroadcastScale::CumulativeStickSize(FoldCardinality(64)),
+        );
+        let dim = coord.fold_dim(PrimaryDim::Mb).expect("the dim was folded");
+        assert_eq!(
+            dim.folds()
+                .map(|fold| fold.label.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "core_workslice_fold_mb",
+                "corelet_fold_mb",
+                "rowsplit_fold_mb",
+                "elem_arr_0",
+            ]
+        );
+        assert_eq!(
+            dim.cardinality_at(FoldPosition::Core),
+            Some(FoldCardinality(1))
+        );
+        assert_eq!(
+            dim.cardinality_at(FoldPosition::RowSplit),
+            Some(FoldCardinality(1))
+        );
+        // The element arrangement is the one that took the scale, and it is the three spatial
+        // folds' alpha.
+        assert_eq!(
+            dim.folds().nth(3).map(|f| f.cardinality),
+            Some(FoldCardinality(64))
+        );
+        assert!(dim.folds().take(3).all(|fold| fold.alpha == FoldCoeff(64)));
+        assert_eq!((dim.spatial_folds(), dim.elem_arr_folds()), (3, 1));
+    }
+
+    #[test]
+    fn a_row_id_is_the_digit_in_the_name_and_absent_for_anything_not_on_a_row() {
+        assert_eq!(
+            comp_row_id(SenComponent::Ptrow7_1).map(PtRowId::ordinal),
+            Some(7)
+        );
+        assert_eq!(
+            comp_row_id(SenComponent::L0lurow0).map(PtRowId::ordinal),
+            Some(0)
+        );
+        assert_eq!(comp_row_id(SenComponent::Lx), None);
+        let (row3, row4) = (
+            comp_row_id(SenComponent::Ptrow3).expect("a row"),
+            comp_row_id(SenComponent::L0lurow4_0).expect("a row"),
+        );
+        assert!(row3.is_adjacent_or_same(row4));
+        assert!(!row3.is_adjacent_or_same(comp_row_id(SenComponent::Ptrow5).expect("a row")));
+    }
+
+    #[test]
+    fn a_nodes_component_is_its_own_unit_and_a_transfer_answers_for_both_sides() {
+        let alloc = AllocateNode {
+            name: NodeName("a0".to_owned()),
+            component: SenComponent::Lx,
+            lds: Some(LdsIdx(0)),
+        };
+        let compute = ComputeNode {
+            name: NodeName("c0".to_owned()),
+            op: ComputeType::Macc,
+            ex_unit: SenComponent::Ptrow2,
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let transfer = TransferNode {
+            name: NodeName("t0".to_owned()),
+            src: operand(SenComponent::Hbm, None, None),
+            dsts: Dsts::new(operand(SenComponent::L0, None, None), vec![]),
+        };
+        assert_eq!(
+            component(Node::Allocate(&alloc), TransferSide::Src),
+            SenComponent::Lx
+        );
+        assert_eq!(
+            component(Node::Compute(&compute), TransferSide::Dst),
+            SenComponent::Ptrow2
+        );
+        assert_eq!(
+            component(Node::Transfer(&transfer), TransferSide::Src),
+            SenComponent::Hbm
+        );
+        assert_eq!(
+            component(Node::Transfer(&transfer), TransferSide::Dst),
+            SenComponent::L0
+        );
+    }
+
+    #[test]
+    fn an_operand_without_a_labelled_ds_has_no_layout_dims_and_neither_has_one_past_the_end() {
+        let dsc = out_then_in();
+        let compute = ComputeNode {
+            name: NodeName("c0".to_owned()),
+            op: ComputeType::Macc,
+            ex_unit: SenComponent::Ptrow0,
+            inputs: vec![
+                operand(SenComponent::Lx, None, Some(0)),
+                operand(SenComponent::Lx, None, None),
+            ],
+            outputs: vec![],
+        };
+        let node = Node::Compute(&compute);
+        assert_eq!(
+            layout_dims_from_node(&dsc, node, OperandPos::Input(0)),
+            vec![PrimaryDim::Out, PrimaryDim::In]
+        );
+        assert!(layout_dims_from_node(&dsc, node, OperandPos::Input(1)).is_empty());
+        assert!(layout_dims_from_node(&dsc, node, OperandPos::Input(9)).is_empty());
+        assert!(layout_dims_from_node(&dsc, node, OperandPos::Output(0)).is_empty());
+    }
+
+    #[test]
+    fn row_bundling_asks_only_about_the_lowest_ordinal_row_split_dim() {
+        assert!(!need_to_consider_row_bundling(
+            &RowSplitOn(vec![]),
+            &[PrimaryDim::Out]
+        ));
+        // `Out` is ordinal 1 and `Mb` is 3, so `rowSplit_.begin()` is `Out` — a working set naming
+        // only the LATER dim does not bundle.
+        let both = RowSplitOn(vec![PrimaryDim::Mb, PrimaryDim::Out]);
+        assert!(need_to_consider_row_bundling(&both, &[PrimaryDim::Out]));
+        assert!(!need_to_consider_row_bundling(&both, &[PrimaryDim::Mb]));
+    }
+}

@@ -129,5 +129,8 @@
 pub mod dcg;
 pub mod ddc;
 pub(crate) mod ddl;
+/// The `dsc/dsc2.h` vocabulary these stages read and write — NOT a scheduled unit of the campaign,
+/// but the types its units traffic in. Each declaration cites the C++ one it narrows.
+pub mod dsc2;
 pub(crate) mod l3;
 

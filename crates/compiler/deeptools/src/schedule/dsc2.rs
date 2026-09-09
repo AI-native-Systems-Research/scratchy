@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! THE `dsc2` VOCABULARY THE ddc FOLD UNITS TRAFFIC IN — a reduced view of `dsc/dsc2.h`.
+//!
+//! ⭐ REDUCED, NOT INVENTED. Every type here is one C++ declaration's fields narrowed to what the
+//! ported units read and write; the citation is on each. `src/bridges/superdsc_to_dataflow_ir/
+//! shape_constraints.rs` carries a DIFFERENT reduced view of `ScheduleNode` — that one projects a
+//! node onto its `data_connect=` reads and writes and carries no unit, lds or fold, so the two are
+//! separate projections of one C++ class rather than one fact spelled twice.
+//!
+//! ⛔ THE `DT_ERROR`/`DT_CHECK` ARMS ARE GONE BY CONSTRUCTION, not by a runtime refusal:
+//!   * [`Node`] has exactly the three arms `dbgPrint`/`getComponent` accept, so
+//!     `"Unsupported node type"` is unspellable.
+//!   * [`Dsts`] is non-empty, so `dstVias_.at(0)` cannot throw.
+//!   * [`CoordinateCategory`] omits `UNKNOWN_COORD`, so `addFold`'s `default:` arm is unspellable.
+//!   * [`LayoutDims`] is non-empty, so `getLayoutDims`' `DT_CHECK(!layoutDimOrder_.empty())` holds.
+//!   * An operand and its [`DataInfo`] are ONE value, so the length mismatch `dbgPrint` walks into
+//!     (it bounds the loop by `inputsLdsAndLoopOffsets_.size()` and indexes `inputs_`) cannot occur.
+
+use std::collections::{BTreeMap, VecDeque};
+
+use sys_arch_spec::arch_enums::SenComponent;
+
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::generated::{ComputeType, DataConnect};
+
+impl PrimaryDim {
+    /// Every layout dim IN `PrimaryDimTypes`' OWN ORDINAL ORDER (`dsc/dims.h:34`), which is what a
+    /// `std::map<PrimaryDimTypes, ..>` iterates in — `rowSplit_.begin()->first` is the first of
+    /// these that the stage splits.
+    pub const ALL: [Self; 12] = [
+        Self::In,
+        Self::Out,
+        Self::Ij,
+        Self::Mb,
+        Self::X,
+        Self::Y,
+        Self::Kij,
+        Self::I,
+        Self::J,
+        Self::Ki,
+        Self::Kj,
+        Self::X1,
+    ];
+
+    /// `EnumsConversion::primaryDimToString` (`dsc/dims.cpp:22`) — total over the 12 dims, so the
+    /// reference's `.at()` cannot throw for any of them.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::Ij => "ij",
+            Self::Mb => "mb",
+            Self::X => "x",
+            Self::Y => "y",
+            Self::Kij => "kij",
+            Self::I => "i",
+            Self::J => "j",
+            Self::Ki => "ki",
+            Self::Kj => "kj",
+            Self::X1 => "x1",
+        }
+    }
+}
+
+impl ComputeType {
+    /// `EnumsConversion::computeTypeToString` (`dsc/dscdefn.cpp:34`), which is what the dsc-side debug
+    /// prints and JSON carry.
+    ///
+    /// ⛔ NOT the generated [`ComputeType::spelling`] — that one is the DDL template's own spelling,
+    /// which is UPPERCASE (`MACC`), and the two are different strings for one op.
+    /// ⛔ NO `_` ARM: a compute type entering the census has to be given its C++ spelling here. That
+    /// is also why the reference's `computeTypeToString.at(type_)` throw is unreachable rather than
+    /// mapped — the one op with no entry, `FCVT`, is not in the census.
+    #[must_use]
+    pub const fn cpp_spelling(self) -> &'static str {
+        match self {
+            Self::Assign => "assign",
+            Self::Equal => "equal",
+            Self::Fabsmax => "fabsmax",
+            Self::Fest => "fest",
+            Self::Floor => "floor",
+            Self::Fma16 => "fma16",
+            Self::Fma32 => "fma32",
+            Self::Fmax => "fmax",
+            Self::Fmin => "fmin",
+            Self::Fmul => "fmul",
+            Self::Fnms => "fnms",
+            Self::Greaterequal => "greaterequal",
+            Self::Greaterthan => "greaterthan",
+            Self::Icvt => "icvt",
+            Self::Lesserequal => "lesserequal",
+            Self::Lesserthan => "lesserthan",
+            Self::Macc => "macc",
+            Self::Notequal => "notequal",
+            Self::Or => "or",
+            Self::Packmerge => "packmerge",
+            Self::Reduce => "reduce",
+            Self::Select => "select",
+            Self::Shuffle => "shuffle",
+            Self::Splat => "splat",
+        }
+    }
+}
+
+/// WHICH LABELLED DATA STRUCTURE — `DataInfo::myLdsIdx_` (`dsc/dsc2.h:722`) once its `-1` is an
+/// [`Option`]. Issued by the [`Dsc`] that owns the `labeledDs_` list; the range `DT_CHECK` in
+/// `getLayoutDims` is that owner's, not a caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LdsIdx(pub u32);
+
+/// HOW MANY OF THE FOLD'S OWN STEPS — `FoldDimProp::factor_`, a `uint32_t`
+/// (`util/foldManager/foldInfrastructure.h:119`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FoldCardinality(pub u32);
+
+/// A FOLD'S AFFINE COEFFICIENT — `alpha`/`beta`, whose `Dtype` is `CoordinateBaseType`, i.e.
+/// `int64_t` (`dsc/dsc2.h:442`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FoldCoeff(pub i64);
+
+/// A FOLD'S NAME — `FoldDimProp::label_`. Not a closed set: the reference builds it by
+/// concatenation (`"rowsplit_fold_" + primaryDimToString.at(dim)`), so it is a name, not an enum.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FoldLabel(pub String);
+
+/// WHAT KIND OF FOLD — `CoordinateCategory` (`dsc/dsc2.h:66`) less `UNKNOWN_COORD`, which is only
+/// ever the value `addFold`'s `default:` arm raises on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CoordinateCategory {
+    /// `SPATIAL_COORD` — a fold across components.
+    Spatial,
+    /// `TEMPORAL_COORD` — a fold across loop iterations.
+    Temporal,
+    /// `ELEM_ARR_COORD` — the element arrangement within a stick.
+    ElemArr,
+}
+
+/// WHERE IN A DIM'S FOLD LIST — `CoordinateFoldPosition` (`dsc/dsc2.h:73`). The discriminants are
+/// load-bearing: they are the `pos` a `FoldManager` is indexed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum FoldPosition {
+    /// The core work-slice fold, outermost.
+    Core = 0,
+    /// The corelet fold.
+    Corelet = 1,
+    /// The row-split fold.
+    RowSplit = 2,
+}
+
+/// ONE FOLD OF ONE DIM — a `FoldDimProp` plus the affine pair `insertAlphaBeta` puts on it
+/// (`foldInfrastructure.h:1328`, `:2394`). Only `Affine` folds carry alpha/beta, and `addFold`
+/// builds nothing else, so the base function type is not a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fold {
+    /// `FoldDimProp::factor_`.
+    pub cardinality: FoldCardinality,
+    /// `FoldDimProp::label_`.
+    pub label: FoldLabel,
+    /// `insertAlpha`.
+    pub alpha: FoldCoeff,
+    /// `insertBeta`.
+    pub beta: FoldCoeff,
+}
+
+/// ONE DIM'S FOLDS, OUTERMOST FIRST — `FoldManager::dim_prop_` plus the three per-category counts
+/// `CoordinateType` keeps beside it (`numOfSpatialFolds_` and friends, `dsc/dsc2.h:120-141`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FoldDim {
+    folds: VecDeque<Fold>,
+    spatial: u32,
+    temporal: u32,
+    elem_arr: u32,
+}
+
+impl FoldDim {
+    /// This dim's folds, position 0 first — the order `getFoldDimSize(pos)` indexes.
+    pub fn folds(&self) -> impl Iterator<Item = &Fold> {
+        self.folds.iter()
+    }
+
+    /// `getNumOfSpatialFolds`.
+    #[must_use]
+    pub const fn spatial_folds(&self) -> u32 {
+        self.spatial
+    }
+
+    /// `getNumOfTemporalFolds`.
+    #[must_use]
+    pub const fn temporal_folds(&self) -> u32 {
+        self.temporal
+    }
+
+    /// `getNumOfElemArrFolds`.
+    #[must_use]
+    pub const fn elem_arr_folds(&self) -> u32 {
+        self.elem_arr
+    }
+
+    /// `getFoldDimSize(pos)` — the cardinality at a named fold position, absent where the dim has
+    /// not been folded that far.
+    #[must_use]
+    pub fn cardinality_at(&self, pos: FoldPosition) -> Option<FoldCardinality> {
+        self.folds.get(pos as usize).map(|fold| fold.cardinality)
+    }
+}
+
+/// A COORDINATE — `CoordinateType<CoordinateBaseType>` (`dsc/dsc2.h:76`) narrowed to its
+/// `coordinates_` map and the fold counts, which is what the fold builders read and write.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Coordinate {
+    dims: BTreeMap<PrimaryDim, FoldDim>,
+}
+
+impl Coordinate {
+    /// `hasCoordinateForDim` / `coordinates_.count(dim)`.
+    #[must_use]
+    pub fn covers(&self, dim: PrimaryDim) -> bool {
+        self.dims.contains_key(&dim)
+    }
+
+    /// This dim's folds, absent where the coordinate does not cover it.
+    #[must_use]
+    pub fn fold_dim(&self, dim: PrimaryDim) -> Option<&FoldDim> {
+        self.dims.get(&dim)
+    }
+
+    /// `CoordinateType::addFold(dim, cat, card, label, alpha, beta, 0)` (`dsc/dsc2.h:120`) — the
+    /// `pos == 0` case, which inserts at the FRONT of the dim's fold list
+    /// (`foldInfrastructure.h:1349`) and is the only position the fold builders in this module use.
+    ///
+    /// ⛔ Front insertion is TOTAL; a positional insert is not (`buildDim` `DT_CHECK`s `pos == 0`
+    /// on an empty list and `insertAlphaBeta` `DT_CHECK`s `pos <= size - 1`), so the units that
+    /// need one own that surface rather than this one growing a refusal.
+    pub fn add_fold_front(
+        &mut self,
+        dim: PrimaryDim,
+        category: CoordinateCategory,
+        cardinality: FoldCardinality,
+        label: FoldLabel,
+        alpha: FoldCoeff,
+        beta: FoldCoeff,
+    ) {
+        let entry = self.dims.entry(dim).or_default();
+        entry.folds.push_front(Fold {
+            cardinality,
+            label,
+            alpha,
+            beta,
+        });
+        match category {
+            CoordinateCategory::Spatial => entry.spatial += 1,
+            CoordinateCategory::Temporal => entry.temporal += 1,
+            CoordinateCategory::ElemArr => entry.elem_arr += 1,
+        }
+    }
+}
+
+/// A NODE'S NAME — `ScheduleNode::name_`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeName(pub String);
+
+/// WHAT AN OPERAND KNOWS ABOUT ITS DATA — `DataInfo` (`dsc/dsc2.h:721`) narrowed to the two fields
+/// the fold units read. `dataConnect_` is a closed set, so it is [`DataConnect`] and not a string;
+/// a default-constructed `DataInfo` leaves it EMPTY, which is the [`None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DataInfo {
+    /// `dataConnect_`.
+    pub data_connect: Option<DataConnect>,
+    /// `myLdsIdx_`, once its `-1` is an [`Option`].
+    pub my_lds_idx: Option<LdsIdx>,
+}
+
+/// A NODE OPERAND — its component and its [`DataInfo`] AS ONE VALUE.
+///
+/// ⭐ THIS PAIRING IS THE POINT. The C++ keeps `inputs_` (components) and
+/// `inputsLdsAndLoopOffsets_` (data) in two vectors of independent length, and `dbgPrint` bounds
+/// its loop by the second while indexing the first with `.at()`. Pairing them makes that throw
+/// unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Operand {
+    /// `inputs_`/`outputs_` entry, `src_.unit_`, or `dstVias_.at(i).loc_.unit_`.
+    pub unit: SenComponent,
+    /// The matching `..LdsAndLoopOffsets_` entry.
+    pub data: DataInfo,
+}
+
+/// A TRANSFER'S DESTINATIONS — `dstVias_` zipped with `dstLdsAndLoopOffsets_`, NON-EMPTY so that
+/// `getComponent`'s `dstVias_.at(0)` is total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dsts {
+    first: Operand,
+    rest: Vec<Operand>,
+}
+
+impl Dsts {
+    /// A transfer has at least one destination, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: Operand, rest: Vec<Operand>) -> Self {
+        Self { first, rest }
+    }
+
+    /// `dstVias_.at(0)` — total.
+    #[must_use]
+    pub const fn first(&self) -> &Operand {
+        &self.first
+    }
+
+    /// Every destination in order.
+    pub fn iter(&self) -> impl Iterator<Item = &Operand> {
+        core::iter::once(&self.first).chain(self.rest.iter())
+    }
+
+    /// `dstLdsAndLoopOffsets_.at(i)`, absent past the end.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&Operand> {
+        match index {
+            0 => Some(&self.first),
+            n => self.rest.get(n - 1),
+        }
+    }
+}
+
+/// `dsc2::AllocateNode` (`dsc/dsc2.h:1008`) narrowed to what the fold units read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocateNode {
+    /// `name_`.
+    pub name: NodeName,
+    /// `component_`.
+    pub component: SenComponent,
+    /// `ldsIdx_`, once its `-1` is an [`Option`].
+    pub lds: Option<LdsIdx>,
+}
+
+/// `dsc2::ComputeNode` (`dsc/dsc2.h:948`) narrowed to what the fold units read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeNode {
+    /// `name_`.
+    pub name: NodeName,
+    /// `type_` — the crate's censused compute set, whose `spelling()` is
+    /// `EnumsConversion::computeTypeToString` for every member of it.
+    pub op: ComputeType,
+    /// `exUnit_`.
+    pub ex_unit: SenComponent,
+    /// `inputs_` zipped with `inputsLdsAndLoopOffsets_`.
+    pub inputs: Vec<Operand>,
+    /// `outputs_` zipped with `outputsLdsAndLoopOffsets_`.
+    pub outputs: Vec<Operand>,
+}
+
+/// `dsc2::TransferNode` (`dsc/dsc2.h:852`) narrowed to what the fold units read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferNode {
+    /// `name_`.
+    pub name: NodeName,
+    /// `src_.unit_` zipped with `srcLdsAndLoopOffsets_`.
+    pub src: Operand,
+    /// `dstVias_` zipped with `dstLdsAndLoopOffsets_`.
+    pub dsts: Dsts,
+}
+
+/// A SCHEDULE NODE, AS THE FOLD UNITS SEE IT — `nodeType_`'s `ALLOCATE`, `COMPUTE` and `TRANSFER`
+/// and nothing else, so `dbgPrint`'s and `getComponent`'s `"Unsupported node type"` cannot be
+/// reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Node<'a> {
+    /// `ScheduleNode::ALLOCATE`.
+    Allocate(&'a AllocateNode),
+    /// `ScheduleNode::COMPUTE`.
+    Compute(&'a ComputeNode),
+    /// `ScheduleNode::TRANSFER`.
+    Transfer(&'a TransferNode),
+}
+
+impl Node<'_> {
+    /// `ScheduleNode::name_`.
+    #[must_use]
+    pub const fn name(&self) -> &NodeName {
+        match self {
+            Self::Allocate(node) => &node.name,
+            Self::Compute(node) => &node.name,
+            Self::Transfer(node) => &node.name,
+        }
+    }
+}
+
+/// WHICH SIDE OF A TRANSFER — `getComponent`'s `getSrc` flag, which is ignored for every other
+/// node kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferSide {
+    /// `getSrc == true`, the default.
+    Src,
+    /// `getSrc == false` — the FIRST destination.
+    Dst,
+}
+
+/// WHICH OPERAND — `getLayoutDimsFromNode`'s `(inputPos, outputPos)` pair of `-1` sentinels.
+///
+/// ⛔ "Neither source nor destination was specified" is unspellable: there is no third arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandPos {
+    /// `inputPos` — for a transfer this names the source, which is the reference's
+    /// `DT_CHECK(inputPos == 0)`: a transfer has exactly one, so the index cannot select wrongly.
+    Input(usize),
+    /// `outputPos` — for a transfer, the destination at that index.
+    Output(usize),
+}
+
+/// A LABELLED DATA STRUCTURE'S LAYOUT ORDER — `AllocateNode::layoutDimOrder_` as
+/// `getLayoutDims` returns it, NON-EMPTY because that function `DT_CHECK`s it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutDims {
+    first: PrimaryDim,
+    rest: Vec<PrimaryDim>,
+}
+
+impl LayoutDims {
+    /// A layout order has at least one dim, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: PrimaryDim, rest: Vec<PrimaryDim>) -> Self {
+        Self { first, rest }
+    }
+
+    /// The dims, outermost first.
+    pub fn iter(&self) -> impl Iterator<Item = PrimaryDim> + '_ {
+        core::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+
+    /// The dims as the reference's `std::vector<PrimaryDimTypes>`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<PrimaryDim> {
+        self.iter().collect()
+    }
+}
+
+/// WHAT THE FOLD UNITS ASK OF A `DesignSpaceConfig`.
+///
+/// ⭐ REACHING THE LAYOUT ORDER IS THE MECHANISM, NOT THE FACT. `getLayoutDims`
+/// (`dsc/dsc2.cpp:4007`) walks `referenceLdsIdx_` until it finds a `memOrg_` entry with an
+/// allocate node, preferring `LX`/`HBM`; what every caller wants is the order it lands on.
+pub trait Dsc {
+    /// `DesignSpaceConfig::getLayoutDims(ldsIdx)`.
+    fn layout_dims(&self, lds: LdsIdx) -> LayoutDims;
+}
