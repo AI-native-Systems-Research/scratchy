@@ -1642,6 +1642,33 @@ impl Default for ResultPorts {
     }
 }
 
+/// WHERE A `sentient.receive_and_store` TAKES ITS DATA FROM — `producer_info.second->getResult(0)`
+/// (`Helper.cpp:2089`) and the one thing that is not a unit.
+///
+/// ⛔⛔ A `vectorchain.constant_bitstream` PRODUCER IS REPLACED BY A `sentient.scalar_constant` AND
+/// THE STORE READS **THAT** (`Helper.cpp:2069-2088`), so this operand is not always a wire end. It is
+/// L3LU-only — every other component reaches `emitError("ConstantBitstreamOp producers are only
+/// supported in L3")` — which is why the two cases are told apart here rather than collapsed to a
+/// bare [`Val`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreSource {
+    /// The wire's receive end, paired with a send by construction.
+    Wire(RecvEnd),
+    /// The `sentient.scalar_constant` the bitstream became.
+    Constant(Val),
+}
+
+impl StoreSource {
+    /// The value the `$producer` operand names.
+    #[must_use]
+    pub const fn val(self) -> Val {
+        match self {
+            StoreSource::Wire(end) => end.val(),
+            StoreSource::Constant(val) => val,
+        }
+    }
+}
+
 /// HOW MANY ELEMENTS A TRANSFER MOVES AND HOW WIDE THEY ARE — the attributes every transfer shares.
 ///
 /// ⭐ A STRUCT FOR THE SAME REASON AS [`Operand`]: `load_and_send`, `receive_and_store`,
@@ -1907,8 +1934,9 @@ pub enum Op {
         result: Val,
         /// The extents.
         extent: Extent,
-        /// `$interleaved_group`.
-        interleaved_group: u32,
+        /// `$interleaved_group` — `group_size` at the two construction sites
+        /// (`Helper.cpp:1991`, `:2126`), which is a count of elements like its `burst_size` twin.
+        interleaved_group: Elements,
         /// `$rotate_val`.
         rotate_val: Option<u32>,
         /// `$dir`.
@@ -1930,8 +1958,8 @@ pub enum Op {
         immutable_addr: Val,
         /// `$increment`.
         increment: Val,
-        /// `$producer` — ⛔ THE WIRE'S RECEIVE END, paired with the send by construction.
-        producer: RecvEnd,
+        /// `$producer` — the wire's receive end, or the constant that replaced a bitstream.
+        producer: StoreSource,
         /// The value it binds.
         result: Val,
         /// `$dst`.
@@ -1942,8 +1970,9 @@ pub enum Op {
         multicast_info: Option<Val>,
         /// The extents.
         extent: Extent,
-        /// `$interleaved_group`.
-        interleaved_group: u32,
+        /// `$interleaved_group` — `group_size` at the two construction sites
+        /// (`Helper.cpp:1991`, `:2126`), which is a count of elements like its `burst_size` twin.
+        interleaved_group: Elements,
         /// `$coalesce`.
         coalesce: bool,
         /// `$subword_length`.
@@ -3064,10 +3093,10 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             let mut attrs = extent_attrs(extent);
             attrs.push(attr("shuffle_mode", &quoted(shuffle_mode.spelling())));
             attrs.push(attr("reg_locale", &quoted(reg.locale.spelling())));
-            if *interleaved_group != 0 {
+            if interleaved_group.0 != 0 {
                 attrs.push(attr(
                     "interleaved_group",
-                    &format!("{interleaved_group} : i32"),
+                    &format!("{} : i32", interleaved_group.0),
                 ));
             }
             if let Some(rotate) = rotate_val {
@@ -3120,10 +3149,10 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             if let Some(mode) = shuffle_mode {
                 attrs.push(attr("shuffle_mode", &quoted(mode.spelling())));
             }
-            if *interleaved_group != 0 {
+            if interleaved_group.0 != 0 {
                 attrs.push(attr(
                     "interleaved_group",
-                    &format!("{interleaved_group} : i32"),
+                    &format!("{} : i32", interleaved_group.0),
                 ));
             }
             if *coalesce {

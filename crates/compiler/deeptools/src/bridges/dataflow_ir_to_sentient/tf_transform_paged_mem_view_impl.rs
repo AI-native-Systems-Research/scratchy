@@ -3512,6 +3512,7 @@ agen.vector_store %4, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
                 to,
                 data: estimated,
                 ty: LANES,
+                dir: None,
             }),
         ];
         let mem_op = VectorLoadOp::of(&ops[0]).expect("the first op is the load");
@@ -3659,6 +3660,7 @@ agen.vector_store %5, %0[0, 0, 0] {store_order = affine_map<(d0, d1, d2) -> (d0,
             to,
             data,
             ty: LANES,
+            dir: None,
         })
     }
 
@@ -5323,6 +5325,7 @@ scf.if %3 {
                 to,
                 data: rotated,
                 ty: LANES,
+                dir: None,
             }),
         ];
 
@@ -5579,6 +5582,7 @@ scf.if %11 {
                 to,
                 data: rotated,
                 ty: LANES,
+                dir: None,
             }),
         ];
 
@@ -5808,6 +5812,7 @@ scf.if %11 {
                         to,
                         data: load_iv,
                         ty: STICK,
+                        dir: None,
                     }),
                     DfirOp::Agen(agen::Op::Yield),
                 ],
@@ -6059,6 +6064,7 @@ scf.if %11 {
                 to,
                 data: rotated,
                 ty: LANES,
+                dir: None,
             }),
         ];
         // `affine.for %arg1 = 0 to 2 { affine.for %arg2 = 0 to 4 { .. } }` (`:286-287`).

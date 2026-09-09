@@ -4874,6 +4874,7 @@ mod unit_tests {
                 to,
                 data: Val(1),
                 ty: v,
+                dir: None,
             }),
             DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
                 result: Val(21),
@@ -4937,6 +4938,7 @@ mod unit_tests {
                         to,
                         data: Val(0),
                         ty: v,
+                        dir: None,
                     }),
                     DfirOp::VectorChain(vc::Op::Neg {
                         result: Val(5),
@@ -5023,6 +5025,7 @@ mod unit_tests {
                 to,
                 data: Val(2),
                 ty: v,
+                dir: None,
             }),
             DfirOp::Dataflow(dfir_op::dataflow::Op::GetUnit {
                 result: Val(21),

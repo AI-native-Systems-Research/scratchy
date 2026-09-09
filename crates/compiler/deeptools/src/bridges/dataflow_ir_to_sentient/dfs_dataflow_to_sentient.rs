@@ -79,9 +79,12 @@
 //! | `e361_runOnOperation` | 361/384 | 33 | `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` |
 
 use super::vc_vector_operands::defining_position;
-use crate::islands::dataflow_ir::Values;
-use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, dataflow, defining_op, uniform};
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::dialects::{
+    Op as DfirOp, Val, arith, dataflow, defining_op, regions, uniform, uses,
+};
 use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::dataflow_ir::{Program, Values};
 use crate::islands::sentient::dialects::sentient as sen;
 use crate::units::{Corelet, DfirUnit, Residency};
 
@@ -411,12 +414,15 @@ pub fn is_target_l3(queried_units: &[DfirUnit]) -> bool {
 ///
 /// # ⛔ WHAT THE PORT DROPS
 ///
-/// `OpBuilder builder(opaque_op)` positions the insertion point; the caller
-/// (`runOnOperation`, `:2027-2029`, entry 361) overrides it with
-/// `builder.setInsertionPointToStart(&unit_op.getRegion().front())` before this runs, so the
-/// `sentient.opaque` lands at the TOP of the unit's region and the `dataflow.opaque` is erased
-/// afterwards via `to_be_deleted`. Both are placement, which is the one mechanism this campaign's
-/// ports may drop — the op itself is what this function decides.
+/// `OpBuilder builder(opaque_op)` (`:2004`) positions the insertion point AT the `dataflow.opaque`,
+/// and the `dataflow.opaque` is erased afterwards via `to_be_deleted`. Placement is the one mechanism
+/// this campaign's ports may drop — the op itself is what this function decides.
+///
+/// ⚠️ THE CALLER'S OWN `setInsertionPointToStart` IS DEAD, AND AN EARLIER NOTE HERE SAID OTHERWISE.
+/// `runOnOperation` (`:2028-2029`, entry 361) builds `OpBuilder builder(unit_op)` and moves it to the
+/// front of the unit's region — but this function takes the op alone and makes the builder above, so
+/// nothing carries that insertion point in. The `sentient.opaque` lands where the `dataflow.opaque`
+/// was, not at the top of the region.
 #[must_use]
 pub fn lower_opaque_operation(opaque: &dataflow::Opaque) -> sen::Op {
     sen::Op::Opaque {
@@ -3474,7 +3480,257 @@ pub fn lower_sync_operation(
     }
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e361_runOnOperation
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 361/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE `dataflow` OPERATION THE PASS REPLACED, IN WALK ORDER.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoweredDataflowOp<'a> {
+    /// A `sync_send`, `sync_recv` or `implicit_sync_on_streaming_buffer` that lowered, and is
+    /// therefore queued for erasure (`:2026`).
+    Sync {
+        /// The op replaced.
+        op: &'a DfirOp,
+        /// Entry 337's answer.
+        lowering: SyncLowering,
+    },
+    /// `signalPassFailure()` (`:2027`) — entry 337 refused, and the op is NOT queued.
+    SyncFailed {
+        /// The op left standing.
+        op: &'a DfirOp,
+    },
+    /// A `dataflow.opaque` that lowered (`:2031`).
+    Opaque {
+        /// The op replaced.
+        op: &'a DfirOp,
+        /// Entry 044's `sentient.opaque`.
+        lowered: sen::Op,
+    },
+}
+
+/// WHAT ONE `dataflow.program_unit` CAME OUT OF THE PASS AS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitSyncLowering<'a> {
+    /// The FIRST walk's sites, in walk order (`:2019-2034`).
+    pub lowered: Vec<LoweredDataflowOp<'a>>,
+    /// The SECOND walk's own list (`:2035-2038`) — `dataflow.create_group`s nothing reads.
+    pub dead_groups: Vec<&'a DfirOp>,
+}
+
+/// Replaces: e361_runOnOperation
+///
+/// **361/384** `DataflowToSentientLoweringPass::runOnOperation` —
+/// `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` (33L). Entry 337 over every
+/// sync and entry 044 over every opaque of every program unit, then the groups nothing reads.
+///
+/// ⛔⛔ THE SECOND WALK RUNS BEFORE ANY ERASE, so `op->use_empty()` (`:2036`) is asked while the syncs
+/// that name a group are all still standing. A group addressed by a sync this pass just lowered is
+/// therefore NOT dead here — only a group nothing ever referenced is.
+/// ⛔ `auto unit = unit_op.getUnits()[0].getDefiningOp<GetUnitOp>();` (`:2018`) IS DEAD — bound and
+/// never read.
+/// ⛔ AND SO IS THE OPAQUE BRANCH'S BUILDER (`:2028-2029`): `lowerOpaqueOperation` takes the op alone
+/// and makes its OWN `OpBuilder builder(opaque_op)` (`:2004`), so `setInsertionPointToStart` acts on a
+/// builder that is never passed anywhere. The `sentient.opaque` lands where the `dataflow.opaque` was,
+/// not at the top of the region — see [`lower_opaque_operation`].
+/// ⛔ THE `CODEGEN_DUMP_IRS` DUMP (`:2042-2046`) IS NOT PORTED: an env-gated debug artefact.
+#[must_use]
+pub fn run_on_operation<'a, A: Arch>(
+    program: &'a Program<A>,
+    values: &mut Values,
+) -> Vec<UnitSyncLowering<'a>> {
+    let mut per_unit: Vec<UnitSyncLowering<'_>> = Vec::new();
+    // `module_op.walk([&](dataflow::ProgramUnitOp unit_op) { .. })`.
+    for unit in program.units.iter() {
+        // ⛔ THE RESOLUTION SCOPE IS THE PREAMBLE **AND** THE BODY. A sync's sources are the
+        // module-level `dataflow.get_unit`s the program unit takes as operands, while the group a
+        // collective sync addresses is inside the unit — which is why the second walk looks for it
+        // there (`:2035`). Entry 337 reads one `&[DfirOp]`, so the two are joined for it; the delete
+        // lists below still name ops of `unit.body` itself.
+        let scope: Vec<DfirOp> = program
+            .preamble
+            .iter()
+            .chain(unit.body.iter())
+            .cloned()
+            .collect();
+        let src_units = unit.on.vals();
+
+        let mut sites: Vec<&DfirOp> = Vec::new();
+        sync_and_opaque_sites(&unit.body, &mut sites);
+        let mut lowered: Vec<LoweredDataflowOp<'_>> = Vec::new();
+        for site in sites {
+            // ⭐ WHICH OPERAND NAMES THE DESTINATION IS THE OP'S OWN, and the debug name is the
+            // signal it carries — see [`L0LxSyncToLower`].
+            let sync = match site {
+                DfirOp::Dataflow(dataflow::Op::SyncSend { to, signal, wait }) => Some((
+                    *to,
+                    L0LxSyncToLower::Send(*wait),
+                    Some(signal.spelling().to_owned()),
+                )),
+                DfirOp::Dataflow(dataflow::Op::SyncRecv { from, signal }) => Some((
+                    *from,
+                    L0LxSyncToLower::Recv,
+                    Some(signal.spelling().to_owned()),
+                )),
+                // ⛔ THE TILE SIZE IS RESOLVED HERE because entry 337 takes it already resolved: a
+                // size that is no `arith.constant` is `DT_ERROR("sync buffer size has to be a
+                // constant op")`, which is this walk's own refusal and not a lowering.
+                DfirOp::Dataflow(dataflow::Op::ImplicitSync { dst, size, .. }) => {
+                    match defining_op(*size, &scope) {
+                        Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => {
+                            i32::try_from(*value)
+                                .ok()
+                                .map(|size| (*dst, L0LxSyncToLower::ImplicitSync(size), None))
+                        }
+                        _ => None,
+                    }
+                }
+                DfirOp::Dataflow(dataflow::Op::Opaque(opaque)) => {
+                    lowered.push(LoweredDataflowOp::Opaque {
+                        op: site,
+                        lowered: lower_opaque_operation(opaque),
+                    });
+                    continue;
+                }
+                _ => continue,
+            };
+            let lowering = sync.and_then(|(dst_units, op, dbg_name)| {
+                lower_sync_operation(&src_units, op, dst_units, &scope, dbg_name, values)
+            });
+            lowered.push(match lowering {
+                Some(lowering) => LoweredDataflowOp::Sync { op: site, lowering },
+                None => LoweredDataflowOp::SyncFailed { op: site },
+            });
+        }
+
+        // `:2035-2038` — a second walk of the same unit, for groups only.
+        let mut dead_groups: Vec<&DfirOp> = Vec::new();
+        dead_create_groups(&unit.body, &unit.body, &mut dead_groups);
+        per_unit.push(UnitSyncLowering {
+            lowered,
+            dead_groups,
+        });
+    }
+    per_unit
+}
+
+/// `unit_op.walk([&](Operation* op) { if (isa<SyncSendOp, SyncRecvOp,
+/// ImplicitSyncOnStreamingBufferOp>(op)) .. else if (dyn_cast<OpaqueOp>(op)) .. })`
+/// (`:2019-2034`) — the four kinds the first walk stops on, regions included.
+fn sync_and_opaque_sites<'a>(body: &'a [DfirOp], found: &mut Vec<&'a DfirOp>) {
+    for op in body {
+        if matches!(
+            op,
+            DfirOp::Dataflow(
+                dataflow::Op::SyncSend { .. }
+                    | dataflow::Op::SyncRecv { .. }
+                    | dataflow::Op::ImplicitSync { .. }
+                    | dataflow::Op::Opaque(_)
+            )
+        ) {
+            found.push(op);
+        }
+        for region in regions(op) {
+            sync_and_opaque_sites(region, found);
+        }
+    }
+}
+
+/// `if (isa<CreateGroupOp>(op) && op->use_empty()) to_be_deleted.push_back(op);` (`:2036-2037`).
+///
+/// ⭐ `unit` IS THE WHOLE UNIT BODY WHILE `body` DESCENDS, because a group bound in a loop can be
+/// named by a sync outside it — `use_empty` is a census over the operation, not over the region.
+fn dead_create_groups<'a>(body: &'a [DfirOp], unit: &[DfirOp], found: &mut Vec<&'a DfirOp>) {
+    for op in body {
+        if let DfirOp::Dataflow(dataflow::Op::CreateGroup { result, .. }) = op
+            && uses(*result, unit).is_empty()
+        {
+            found.push(op);
+        }
+        for region in regions(op) {
+            dead_create_groups(region, unit, found);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pass_unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::{OpFunc, SyncSignal};
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+    };
+    use crate::units::Core;
+
+    /// 🎯 361/384 — THE TWO WALKS ARE NOT ONE: a sync lowers and is queued, while the group it
+    /// addresses survives the second walk BECAUSE that sync has not been erased yet.
+    #[test]
+    fn a_lowered_sync_leaves_the_group_it_names_alive_and_an_unnamed_one_dead() {
+        let core = Core::checked(0).expect("every arch has core 0");
+        let corelet = Corelet::checked(0).expect("every arch has corelet 0");
+        let preamble = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(0),
+                residency: crate::units::residency_of(DfirUnit::Lxsu, core, corelet),
+                unit: DfirUnit::Lxsu,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(1),
+                residency: crate::units::residency_of(DfirUnit::Lxlu, core, corelet),
+                unit: DfirUnit::Lxlu,
+                num_folds: None,
+            }),
+        ];
+        let body = vec![
+            DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                result: Val(2),
+                unit_ids: vec![Val(1)],
+            }),
+            DfirOp::Dataflow(dataflow::Op::CreateGroup {
+                result: Val(3),
+                unit_ids: vec![Val(1)],
+            }),
+            DfirOp::Dataflow(dataflow::Op::SyncRecv {
+                from: Val(2),
+                signal: SyncSignal::InputToLxsuToLxluToSync,
+            }),
+        ];
+        let program = Program::<Dd2> {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble,
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxsu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            arch: core::marker::PhantomData,
+        };
+
+        let mut values = Values::default();
+        let per_unit = run_on_operation(&program, &mut values);
+        let [unit] = per_unit.as_slice() else {
+            panic!("one program unit in, one record out, got {per_unit:?}");
+        };
+        assert!(
+            matches!(unit.lowered.as_slice(), [LoweredDataflowOp::Sync { .. }]),
+            "the recv over a group lowered, got {:?}",
+            unit.lowered
+        );
+        assert_eq!(
+            unit.dead_groups,
+            [&program.units.iter().next().expect("one unit").body[1]],
+            "only the group no sync names is dead — the addressed one still has its user"
+        );
+    }
+}

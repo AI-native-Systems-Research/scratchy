@@ -73,8 +73,8 @@ use super::SenOp;
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::arith::{CmpIPredicate, IntBinary, IntConst, LogicKind};
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, arith, dbg_name, defining_op, regions, regions_mut, replace_all_uses,
-    results, uses,
+    Op as DfirOp, Val, arith, dbg_name, defining_op, region_owner, regions, regions_mut,
+    replace_all_uses, results, uses,
 };
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{self as dfir};
@@ -632,25 +632,9 @@ pub fn construct_if_recursively(
             let [lhs, rhs] = operands[..] else {
                 return None;
             };
-            // ⛔ THE REFERENCE `dyn_cast`s A NULL DEFINING OP, so a region argument stops it here.
-            let mut left = construct_if_recursively(
-                original,
-                defining_op(lhs, scope)?,
-                true_value,
-                false_value,
-                scope,
-                values,
-                ops_to_be_erased,
-            )?;
-            let mut nest = construct_if_recursively(
-                original,
-                defining_op(rhs, scope)?,
-                true_value,
-                false_value,
-                scope,
-                values,
-                ops_to_be_erased,
-            )?;
+            let arms = (true_value, false_value);
+            let mut left = recurse_into(original, lhs, arms, scope, values, ops_to_be_erased)?;
+            let mut nest = recurse_into(original, rhs, arms, scope, values, ops_to_be_erased)?;
             // ⛔ THE NAME LANDS ON BOTH SIDES (`:157-160`, `:185-188`), not on one.
             if let Some(name) = dbg_name(current) {
                 name_if(&mut left.op, name);
@@ -677,28 +661,83 @@ pub fn construct_if_recursively(
                 //  operations or an op with one return value"); signalPassFailure();`
                 return None;
             };
-            // `auto val_true = sentient::ConstantOp::create(.., builder.getI1Type(), 1);`  `:210-212`
-            let val_true = values.mint();
-            let mut nest = one_if(
-                sen::CmpPredicate::Eq,
-                (only, val_true),
-                // ⛔ THE NAME IS THE `arith.select`'S HERE, not this op's (`:222-223`).
+            // ⛔ AND THIS ARM ERASES NOTHING: the op supplying the condition is still read.
+            // ⛔ THE NAME IS THE `arith.select`'S HERE, not this op's (`:222-223`).
+            Some(eq_true_nest(
                 dbg_name(original),
+                only,
                 (true_value, false_value),
                 values,
-            );
-            nest.constants
-                .push(SenOp::Sentient(sen::Op::ScalarConstant {
-                    value: 1,
-                    result: val_true,
-                    reg_locale: sen::RegType::Imm,
-                    ty: ScalarTy::Int(1),
-                    is_symbol: false,
-                }));
-            // ⛔ AND THIS ARM ERASES NOTHING: the op supplying the condition is still read.
-            Some(nest)
+            ))
         }
     }
+}
+
+/// ONE OPERAND RECURSED INTO — `ConstructIFRecursively(original, v.getDefiningOp(), ..)`.
+///
+/// ⛔⛔ THE DEFINING OP IS OFTEN NO LONGER AN `arith` OP, and that is not an edge case: the walk
+/// lowers each `cmpi` before the `andi`/`ori` over it and `replaceAllUsesWith` re-points this
+/// operand at the `sentient.if` it produced, so the reference's `dyn_cast`s all miss and it takes the
+/// one-result arm. The vendor's own output shows it — `sentient.if eq, %[[VAL_20]], %[[VAL_23]] : i1`
+/// over an `if`, not over a comparison
+/// (`dcc/test/Conversion/SentientToProgIR/simplify_or_op.mlir:63-70`).
+/// ⛔ [`None`] IS THE REGION ARGUMENT the reference dereferences as a null defining op.
+fn recurse_into(
+    original: &DfirOp,
+    operand: Val,
+    arms: (Val, Val),
+    scope: &[DfirOp],
+    values: &mut dfir::Values,
+    ops_to_be_erased: &mut Vec<Val>,
+) -> Option<Nest> {
+    if let Some(def) = defining_op(operand, scope) {
+        construct_if_recursively(
+            original,
+            def,
+            arms.0,
+            arms.1,
+            scope,
+            values,
+            ops_to_be_erased,
+        )
+    } else if region_owner(operand, scope).is_some() {
+        None
+    } else {
+        Some(eq_true_nest(dbg_name(original), operand, arms, values))
+    }
+}
+
+/// THE `getNumResults() == 1` ARM OF ENTRY 338 — `cond == true` against a fresh `i1` 1
+/// (`StandardToSentient.cpp:204-238`). ⭐ ENTRY 362 REACHES IT TOO, because a condition entry 363
+/// already lowered is no longer an `arith` op at all; see [`lower_select_op_to_sentient`].
+fn eq_true_nest(
+    dbg_name: Option<&str>,
+    only: Val,
+    arms: (Val, Val),
+    values: &mut dfir::Values,
+) -> Nest {
+    // `auto val_true = sentient::ConstantOp::create(.., builder.getI1Type(), 1);`  `:210-212`
+    let val_true = values.mint();
+    let mut nest = one_if(
+        sen::CmpPredicate::Eq,
+        (only, val_true),
+        dbg_name,
+        arms,
+        values,
+    );
+    nest.constants.push(i1_constant(1, val_true));
+    nest
+}
+
+/// ONE `sentient.scalar_constant` OF `i1` TYPE — `ConstantOp::create(.., getI1Type(), v)`.
+fn i1_constant(value: i64, result: Val) -> SenOp {
+    SenOp::Sentient(sen::Op::ScalarConstant {
+        value,
+        result,
+        reg_locale: sen::RegType::Imm,
+        ty: ScalarTy::Int(1),
+        is_symbol: false,
+    })
 }
 
 /// ONE `sentient.if` WITH ITS TWO YIELDING ARMS — `:123-142`, built again at `:213-231`.
@@ -999,59 +1038,177 @@ fn collect_ors(ops: &[DfirOp], into: &mut Vec<Val>) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-// 376/384
+// 362/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// PREORDER OVER THE WHOLE MODULE — `module_op.walk(..)` visits the preamble and every unit body,
-/// descending into every region.
-fn walk_module<A: Arch>(program: &dfir::Program<A>, visit: &mut impl FnMut(&DfirOp)) {
-    fn walk(ops: &[DfirOp], visit: &mut impl FnMut(&DfirOp)) {
-        for op in ops {
-            visit(op);
-            for region in regions(op) {
-                walk(region, visit);
-            }
-        }
+/// Replaces: e362_LowerSelectOpToSentient
+///
+/// **362/384** `StandardToSentient.cpp:243` (19L): an `arith.select` becomes the `sentient.if` nest
+/// entry 338 builds from its condition; its uses move onto the nest and the condition tree goes.
+///
+/// ⛔ THE CONDITION IS OFTEN NO LONGER AN `arith` OP. Entry 363 reaches the `andi` first in the same
+/// walk and re-points this operand at a `sentient.if` result, so `cond_def_op` is that `if` and the
+/// recursion takes its one-result `eq true` arm. [`None`] is the region argument the reference
+/// dereferences as a null defining op.
+/// ⛔ ERASURE IS REVERSE-ORDER AND ONLY WHEN USE-EMPTY (`:255-259`); the select itself goes flatly.
+#[must_use]
+pub fn lower_select_op_to_sentient(
+    select: &DfirOp,
+    scope: &mut Vec<DfirOp>,
+    values: &mut dfir::Values,
+) -> Option<Nest> {
+    let DfirOp::Arith(arith::Op::Select {
+        result,
+        condition,
+        true_value,
+        false_value,
+        ..
+    }) = select
+    else {
+        return None;
+    };
+    let (result, condition) = (*result, *condition);
+    let arms = (*true_value, *false_value);
+    let mut ops_to_be_erased: Vec<Val> = Vec::new();
+    // `ConstructIFRecursively(select_op, cond_def_op, getTrueValue(), getFalseValue(), ..)`  `:249`
+    let nest = recurse_into(
+        select,
+        condition,
+        arms,
+        scope,
+        values,
+        &mut ops_to_be_erased,
+    )?;
+    // `select_op->replaceAllUsesWith(transformed_op); select_op->erase();`  `:253-254`
+    replace_all_uses(scope, result, nest.result);
+    erase_defining_op(result, scope);
+    erase_when_use_empty(&ops_to_be_erased, scope);
+    Some(nest)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 363/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Replaces: e363_LowerLogicalOpToSentient
+///
+/// **363/384** `StandardToSentient.cpp:264` (19L): an `arith.andi` becomes entry 338's nest over
+/// ITSELF, yielding a fresh `i1` 1 or 0 where entry 362 yields a select's two arms.
+///
+/// ⭐ THE `OrIOp` OVERLOAD AT `:286` IS THIS BODY BYTE FOR BYTE, so one port serves both kinds; the
+/// `CmpIOp` one at `:308` is not, and is not among the 384 — see [`lower_cmpi_op_to_sentient`].
+/// ⛔ AND THERE IS NO UNCONDITIONAL ERASE HERE (unlike entry 362): the `andi` goes only through the
+/// reverse use-empty loop, which reaches it because `replaceAllUsesWith` ran first.
+#[must_use]
+pub fn lower_logical_op_to_sentient(
+    logical: &DfirOp,
+    scope: &mut Vec<DfirOp>,
+    values: &mut dfir::Values,
+) -> Option<Nest> {
+    let DfirOp::Arith(arith::Op::Logic {
+        kind: LogicKind::And | LogicKind::Or,
+        ..
+    }) = logical
+    else {
+        return None;
+    };
+    logical_nest(logical, scope, values)
+}
+
+/// `LowerLogicalOpToSentient(mlir::arith::CmpIOp)` — `StandardToSentient.cpp:308`, the third
+/// overload. ⛔ NOT ONE OF THE 384, AND ENTRY 362 IS UNREACHABLE WITHOUT IT: every `arith.cmpi`
+/// precedes the select it conditions in the walk, and this early return is what leaves that cmpi in
+/// place for [`lower_select_op_to_sentient`] to recurse into (`:319-324`).
+/// ⛔ THE `DT_CHECK` THAT ALL USERS AGREE IS AN ABORT, so the first user decides and a mixed set is
+/// a program the reference does not accept.
+fn lower_cmpi_op_to_sentient(
+    cmpi: &DfirOp,
+    scope: &mut Vec<DfirOp>,
+    values: &mut dfir::Values,
+) -> Option<Nest> {
+    let DfirOp::Arith(arith::Op::Compare { result, .. }) = cmpi else {
+        return None;
+    };
+    // `isa<SelectOp>(*op.getOperation()->getUsers().begin())` — unguarded on an empty use list.
+    if let Some(DfirOp::Arith(arith::Op::Select { condition, .. })) =
+        uses(*result, scope).first().copied()
+        && condition == result
+    {
+        return None;
     }
-    walk(&program.preamble, visit);
-    for unit in program.units.iter() {
-        walk(&unit.body, visit);
+    logical_nest(cmpi, scope, values)
+}
+
+/// THE BODY ALL THREE `LowerLogicalOpToSentient` OVERLOADS SHARE — `:266-282`, `:288-304`,
+/// `:326-342`. ⛔ THE TWO `i1` CONSTANTS ARE MINTED BEFORE THE RECURSION and lead the nest.
+fn logical_nest(op: &DfirOp, scope: &mut Vec<DfirOp>, values: &mut dfir::Values) -> Option<Nest> {
+    let [result] = results(op)[..] else {
+        return None;
+    };
+    // `val_true = ConstantOp(.., getI1Type(), 1); val_false = ConstantOp(.., getI1Type(), 0);`
+    let (val_true, val_false) = (values.mint(), values.mint());
+    let mut ops_to_be_erased: Vec<Val> = Vec::new();
+    // `ConstructIFRecursively(op, op, val_true, val_false, insertion_point, ops_to_be_erased)`
+    let mut nest = construct_if_recursively(
+        op,
+        op,
+        val_true,
+        val_false,
+        scope,
+        values,
+        &mut ops_to_be_erased,
+    )?;
+    nest.constants
+        .splice(0..0, [i1_constant(1, val_true), i1_constant(0, val_false)]);
+    // `op->replaceAllUsesWith(transformed_op);`
+    replace_all_uses(scope, result, nest.result);
+    erase_when_use_empty(&ops_to_be_erased, scope);
+    Some(nest)
+}
+
+/// THE REVERSE USE-EMPTY ERASE LOOP the three overloads and entry 362 all end with (`:255-259`).
+fn erase_when_use_empty(ops_to_be_erased: &[Val], scope: &mut Vec<DfirOp>) {
+    for val in ops_to_be_erased.iter().rev() {
+        if uses(*val, scope).is_empty() {
+            erase_defining_op(*val, scope);
+        }
     }
 }
 
-/// Replaces: e376_runOnOperation
-///
-/// `StandardToSentientLoweringPass::runOnOperation` (`StandardToSentient.cpp:439`) — TWO module
-/// walks: the first simplifies every `arith.ori`, the second lowers the ten `arith` classes it
-/// recognises, in the reference's own `dyn_cast` order (`:447-471`).
-///
-/// ⛔ `arith.muli` IS A REFUSAL, NOT A GAP — `LowerMulIOpToSentient(op)` is COMMENTED OUT at `:454`
-/// under `emitError("Cannot lower mul expressions to sentient")`, so the ported entry 051
-/// [`lower_muli_op_to_sentient`] must NOT be called from here.
-/// ⛔ AND SO IS THE TRAILING `arith.constant` (`:467-470`, `op->dump(); signalPassFailure();`): an
-/// index constant went to `:457` and an integer one to `:465`, so what reaches it is a constant of
-/// some OTHER type — a dense vector one included, and this pass runs after both VectorChain
-/// lowerings have consumed those (`dcc/tools/dcc-standalone/dcc-standalone-main.cpp:277-287`).
-/// ⛔ `arith.divsi`, `arith.remsi` AND `arith.not` HAVE NO ARM and fall through untouched.
-/// ⛔ THE `arith.ori` WALK RUNS TO COMPLETION FIRST (`:441-445`) — entry 339 folds an `ori` chain into
-/// one op, so lowering an `ori` before that simplification lowers a shape entry 363 never sees.
-pub fn run_on_operation<A: Arch>(
-    program: &mut dfir::Program<A>,
-    values: &mut dfir::Values,
-) -> Vec<SenOp> {
-    // `:441-445` — the first walk, `SimplifyOrIOp` on every `arith.ori`.
-    simplify_every_ori(&mut program.preamble, values);
-    for unit in program.units.iter_mut() {
-        simplify_every_ori(&mut unit.body, values);
-    }
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 376/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 
-    // `:447-471` — the second walk, one arm per recognised class.
-    let mut out: Vec<SenOp> = Vec::new();
-    walk_module(&*program, &mut |op| {
-        let DfirOp::Arith(arith_op) = op else {
-            return;
+/// EVERY `arith` OP IN ONE ROOT BLOCK, PREORDER — the second walk of `runOnOperation` (`:447-471`),
+/// which descends into every region.
+///
+/// ⛔ SNAPSHOTTED BEFORE ANY LOWERING, because entries 362 and 363 erase the condition tree behind
+/// them and no walk survives that. ⭐ THE SNAPSHOT IS STILL THE REFERENCE'S OWN ORDER: every op they
+/// erase DOMINATES the one that erases it, so the walk had already visited it.
+fn collect_arith(ops: &[DfirOp], into: &mut Vec<Val>) {
+    for op in ops {
+        if matches!(op, DfirOp::Arith(_)) {
+            into.extend(results(op));
+        }
+        for region in regions(op) {
+            collect_arith(region, into);
+        }
+    }
+}
+
+/// The second walk over one root block — see [`run_on_operation`] for the branch order.
+fn lower_every_arith(root: &mut Vec<DfirOp>, values: &mut dfir::Values, out: &mut Vec<SenOp>) {
+    let mut sites: Vec<Val> = Vec::new();
+    collect_arith(root, &mut sites);
+    for bound in sites {
+        // ⛔ RE-READ, NEVER SNAPSHOTTED: entries 362 and 363 re-point the operands of the ops still
+        // ahead of the walk, and a `cmpi` one of them already erased is simply no longer there.
+        let Some(DfirOp::Arith(live)) = defining_op(bound, root) else {
+            continue;
         };
-        match arith_op {
+        let arith_op = live.clone();
+        let site = &DfirOp::Arith(arith_op.clone());
+        match &arith_op {
             // `:447-448`
             arith::Op::AddI(binary) => out.push(SenOp::Sentient(lower_addi_op_to_sentient(binary))),
             // `:449-450`
@@ -1065,31 +1222,51 @@ pub fn run_on_operation<A: Arch>(
                 binary.rhs
             ),
             // `:455-456`
-            arith::Op::Select { result, .. } => todo!(
-                "e362_LowerSelectOpToSentient is unported: {:?} = arith.select",
-                result
-            ),
+            arith::Op::Select { result, .. } => {
+                let Some(nest) = lower_select_op_to_sentient(site, root, values) else {
+                    todo!(
+                        "The input condition to {:?} = arith.select comes from neither CMPI/AND/OR \
+                         nor an op with one return value, which the reference reports with \
+                         emitError + signalPassFailure (StandardToSentient.cpp:234-238)",
+                        result
+                    )
+                };
+                out.extend(nest.constants);
+                out.push(nest.op);
+            }
             // `:457-458` — `isa<ConstantIndexOp>`.
             arith::Op::Constant { result, value } => {
                 out.push(SenOp::Sentient(lower_constant_index_to_sentient(
                     *result, *value,
                 )));
             }
-            // `:459-464` — `AndIOp`, `OrIOp` and `CmpIOp` all take entry 363. The `ori` arm is
-            // unreachable behind the first walk; it is spelled out because the reference spells it.
+            // `:459-464` — `AndIOp`, `OrIOp` and `CmpIOp` all take entry 363's body. The `ori` arm
+            // is all but unreachable behind the first walk; it is spelled out because the reference
+            // spells it, and because entry 339 only folds the chains it recognises.
             arith::Op::Logic {
                 result,
-                kind: kind @ (LogicKind::And | LogicKind::Or),
+                kind: LogicKind::And | LogicKind::Or,
                 ..
-            } => todo!(
-                "e363_LowerLogicalOpToSentient is unported: {:?} = arith.{:?}",
-                result,
-                kind
-            ),
-            arith::Op::Compare { result, .. } => todo!(
-                "e363_LowerLogicalOpToSentient is unported: {:?} = arith.cmpi",
-                result
-            ),
+            } => {
+                let Some(nest) = lower_logical_op_to_sentient(site, root, values) else {
+                    todo!(
+                        "An operand of {:?} = arith.andi/ori is a region argument or a multi-result \
+                         op, which the reference reports with emitError + signalPassFailure \
+                         (StandardToSentient.cpp:234-238)",
+                        result
+                    )
+                };
+                out.extend(nest.constants);
+                out.push(nest.op);
+            }
+            arith::Op::Compare { .. } => {
+                // ⛔ `None` IS THE EARLY RETURN, NOT A REFUSAL: a cmpi that conditions a select is
+                // left for entry 362 to recurse into. See [`lower_cmpi_op_to_sentient`].
+                if let Some(nest) = lower_cmpi_op_to_sentient(site, root, values) {
+                    out.extend(nest.constants);
+                    out.push(nest.op);
+                }
+            }
             // `:465-466` — `isa<ConstantIntOp>`.
             arith::Op::ConstantInt { result, value } => {
                 out.push(SenOp::Sentient(lower_constant_int_to_sentient(
@@ -1115,7 +1292,39 @@ pub fn run_on_operation<A: Arch>(
                 ..
             } => {}
         }
-    });
+    }
+}
+
+/// Replaces: e376_runOnOperation
+///
+/// `StandardToSentientLoweringPass::runOnOperation` (`StandardToSentient.cpp:439`) — TWO module
+/// walks: the first simplifies every `arith.ori`, the second lowers the classes it recognises in the
+/// reference's own `dyn_cast` order (`:447-471`); see [`lower_every_arith`].
+///
+/// ⛔ `arith.muli` IS A REFUSAL, NOT A GAP — `LowerMulIOpToSentient(op)` is COMMENTED OUT at `:454`
+/// under `emitError("Cannot lower mul expressions to sentient")`, so the ported entry 051
+/// [`lower_muli_op_to_sentient`] must NOT be called from here.
+/// ⛔ AND SO IS THE TRAILING `arith.constant` (`:467-470`, `op->dump(); signalPassFailure();`): an
+/// index constant went to `:457` and an integer one to `:465`, so what reaches it is a constant of
+/// some OTHER type. `arith.divsi`, `arith.remsi` and `arith.not` have no arm at all.
+/// ⛔ THE `arith.ori` WALK RUNS TO COMPLETION FIRST (`:441-445`) — entry 339 folds an `ori` chain
+/// into one op, so lowering an `ori` before that lowers a shape entry 363 never sees.
+pub fn run_on_operation<A: Arch>(
+    program: &mut dfir::Program<A>,
+    values: &mut dfir::Values,
+) -> Vec<SenOp> {
+    // `:441-445` — the first walk, `SimplifyOrIOp` on every `arith.ori`.
+    simplify_every_ori(&mut program.preamble, values);
+    for unit in program.units.iter_mut() {
+        simplify_every_ori(&mut unit.body, values);
+    }
+
+    // `:447-471` — the second walk, over the preamble and then every unit body.
+    let mut out: Vec<SenOp> = Vec::new();
+    lower_every_arith(&mut program.preamble, values, &mut out);
+    for unit in program.units.iter_mut() {
+        lower_every_arith(&mut unit.body, values, &mut out);
+    }
     out
 }
 
@@ -1877,10 +2086,119 @@ mod unit_tests {
             &mut dfir::Values::default(),
         );
     }
-}
+    /// 🎯 362/384 — THE VENDOR'S OWN CASE: A SELECT ON A `cmpi` BECOMES ONE `sentient.if` AND BOTH
+    /// `arith` OPS LEAVE THE BLOCK.
+    ///
+    /// `cmpi_select_different_BB.mlir:104` feeds `%12 = arith.cmpi eq, %3, %c2` and
+    /// `%17 = arith.select %12, %c0, %c131072`; the expectation is
+    /// `sentient.if eq, %[[VAL_12]], %[[VAL_6]] : index -> (index)` yielding `%[[VAL_8]]` then
+    /// `%[[VAL_4]]` (`:46-51`), with neither the compare nor the select left anywhere in the output.
+    #[test]
+    fn a_select_over_a_compare_becomes_one_if_and_empties_the_block() {
+        let mut scope = vec![
+            DfirOp::Arith(arith::Op::Compare {
+                result: Val(12),
+                predicate: CmpIPredicate::Eq,
+                lhs: Val(3),
+                rhs: Val(2),
+            }),
+            DfirOp::Arith(arith::Op::Select {
+                result: Val(17),
+                condition: Val(12),
+                true_value: Val(30),
+                false_value: Val(31),
+                ty: ScalarTy::Index,
+                dbg_name: None,
+            }),
+        ];
+        let select = scope[1].clone();
+        let mut values = dfir::Values::default();
+        let nest = lower_select_op_to_sentient(&select, &mut scope, &mut values);
+        assert_eq!(
+            nest,
+            Some(Nest {
+                constants: Vec::new(),
+                op: SenOp::Sentient(sen::Op::If {
+                    predicate: sen::CmpPredicate::Eq,
+                    lhs: Val(3),
+                    rhs: Val(2),
+                    yielded: vec![unknown_reg(Val(0))],
+                    dbg_name: None,
+                    then_body: vec![yield_of(Val(30))],
+                    else_body: vec![yield_of(Val(31))],
+                }),
+                result: Val(0),
+            })
+        );
+        assert_eq!(scope, Vec::new());
+    }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e362_LowerSelectOpToSentient
-// crustify:todo: e363_LowerLogicalOpToSentient
+    /// 🎯 363/384 — THE VENDOR'S OWN CASE: A CONNECTIVE OVER TWO ALREADY-LOWERED CONDITIONS IS TWO
+    /// FRESH `i1` CONSTANTS, THE TWO THE ONE-RESULT ARM MINTS, AND ONE GRAFTED NEST.
+    ///
+    /// `simplify_or_op.mlir:243` reaches this pass as `%16 = arith.ori %13, %5` with `%13` already a
+    /// `sentient.if` result. Its expectation is four `i1` constants — `1`, `0`, `1`, `1` — then
+    /// `%[[VAL_25]] = sentient.if eq, %[[VAL_13]], %[[VAL_24]] : i1` yielding `%[[VAL_21]]` and, in
+    /// its else arm, `%[[VAL_26]] = sentient.if eq, %[[VAL_20]], %[[VAL_23]] : i1` (`:52-70`).
+    /// ⛔ THE DISJUNCTION GRAFTS ONTO THE **FALSE** ARM; a conjunction would graft onto the true one.
+    #[test]
+    fn a_connective_over_lowered_conditions_grafts_onto_the_false_arm() {
+        let mut scope = vec![DfirOp::Arith(arith::Op::Logic {
+            result: Val(16),
+            kind: LogicKind::Or,
+            operands: vec![Val(20), Val(13)],
+        })];
+        let ori = scope[0].clone();
+        let mut values = dfir::Values::default();
+        let nest = lower_logical_op_to_sentient(&ori, &mut scope, &mut values);
+        assert_eq!(
+            nest,
+            Some(Nest {
+                constants: vec![
+                    i1_constant(1, Val(0)),
+                    i1_constant(0, Val(1)),
+                    i1_constant(1, Val(2)),
+                    i1_constant(1, Val(4)),
+                ],
+                op: SenOp::Sentient(sen::Op::If {
+                    predicate: sen::CmpPredicate::Eq,
+                    lhs: Val(13),
+                    rhs: Val(4),
+                    yielded: vec![unknown_reg(Val(5))],
+                    dbg_name: None,
+                    then_body: vec![yield_of(Val(0))],
+                    else_body: vec![
+                        SenOp::Sentient(sen::Op::If {
+                            predicate: sen::CmpPredicate::Eq,
+                            lhs: Val(20),
+                            rhs: Val(2),
+                            yielded: vec![unknown_reg(Val(6))],
+                            dbg_name: None,
+                            then_body: vec![yield_of(Val(0))],
+                            else_body: vec![yield_of(Val(1))],
+                        }),
+                        yield_of(Val(6)),
+                    ],
+                }),
+                result: Val(5),
+            })
+        );
+        assert_eq!(scope, Vec::new());
+    }
+
+    /// One `sentient.if` result carried in an unknown register — `regLocales = [unknown]`.
+    fn unknown_reg(result: Val) -> sen::Yielded {
+        sen::Yielded {
+            result,
+            reg: sen::Reg {
+                locale: sen::RegType::Unknown,
+                index: None,
+            },
+        }
+    }
+
+    /// One `sentient.yield` of a single value.
+    fn yield_of(val: Val) -> SenOp {
+        SenOp::Sentient(sen::Op::Yield { results: vec![val] })
+    }
+}

@@ -3913,6 +3913,7 @@ mod merge_and_hoist_tests {
                 to,
                 data: Val(30),
                 ty: vec_ty,
+                dir: None,
             }),
             an_if(),
         ];

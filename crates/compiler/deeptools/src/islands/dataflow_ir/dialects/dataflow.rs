@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 use crate::generated::{OpaqueFunc, ParamKey, ParamValue, RegName, SyncSignal};
 use crate::islands::dataflow_ir::dialects::Val;
+use crate::islands::dataflow_ir::dialects::agen::RoutingDirection;
 use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::print;
 use crate::islands::dataflow_ir::ty::{
@@ -591,6 +592,12 @@ pub enum Op {
         data: Val,
         /// Its type.
         ty: Vector,
+        /// `$dir` — `OptionalAttr<DataflowRoutingDirectionAttr>` (`Dataflow.td:301-321`), whose four
+        /// cases (`DataflowEnums.td:35-42`) are [`RoutingDirection`]'s four in the same order.
+        ///
+        /// ⛔ `e358_constructLoadAndSendStmt` READS IT OFF THE SEND, not off the agen op
+        /// (`Helper.cpp:1954-1969`), so a send that loses it is emitted with no routing direction.
+        dir: Option<RoutingDirection>,
     },
 
     /// `dataflow.receive %from : vector<..>`.
@@ -871,12 +878,16 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             print::indent(out, depth);
             out.push_str("}\n");
         }
-        Op::Send { to, data, ty } => {
+        Op::Send { to, data, ty, dir } => {
             let _ = writeln!(
                 out,
-                "dataflow.send {}, {} : {}",
+                "dataflow.send {}, {}{} : {}",
                 print::val(to.val()),
                 print::val(*data),
+                match dir {
+                    Some(dir) => format!(" {{dir = #dataflow<direction {}>}}", dir.spelling()),
+                    None => String::new(),
+                },
                 print::vector(*ty)
             );
         }

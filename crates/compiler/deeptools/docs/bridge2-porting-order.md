@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`358/384 ported; 358/384 audited`
+`366/384 ported; 366/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2884,11 +2884,98 @@ POSITION, so erasing the write pass's init renumbered every op after it and the 
 the whole map. The erasures now run once both passes have walked; no reader can appear after the
 rewrite, so the answer is unchanged.
 
-⭐ 366 AND 372 ARE DRIVERS OVER PORTED PARTS: 366's three patterns all funnel into the unported entry
-364, so it names the ops the fusion would have rewritten, and 372 is
+⭐ 366 AND 372 ARE DRIVERS OVER PORTED PARTS: 366's three patterns all funnel into entry 364, so it
+names the ops the fusion would have rewritten, and 372 is
 `tf_mutable_addr_splitting::run_on_operation`'s walk line for line — `isCandidateMemView` and the
 pre-order view walk are reused rather than copied, the only differences being that pass's inert
 per-unit `num_conditionals_ = 0` and its `DT_CHECK` wording.
+
+⚠️ AND 366's `todo!` NO LONGER NAMES ENTRY 364, which the changeset below ports: what is left is 366's
+OWN wiring. `applyPartialConversion` interleaves the legality query and the rewrite per op, so
+`is_visited` must be ONE map spanning both where `non_compute_ops_to_fuse` owns a map of its own; entry
+364 writes through `reuse_info` and mints values, so the signature needs `&mut OperandReuse` and
+`&mut Values`; and 364's emission and `to_erase` are POSITIONS on the unrewritten body, so 366 must
+return them for a caller to splice rather than apply them to a `&` unit. Entry 378 stops at entry 227
+(`OperandReuse`) before reaching any of it, so the wiring arrives with the changeset that lands 227 —
+366 stays as its audit describes it and is not re-ported here.
+
+⭐ ENTRIES 357-364 — THE AFFINE ADDRESS-MANIPULATION NEST, THE LOAD-AND-SEND AND RECEIVE-AND-STORE
+CONSTRUCTORS, THE SYMBOLIC DETAIL PAIR, THE `DataflowToSentient` PASS BODY, THE SELECT AND LOGICAL
+LOWERINGS AND THE PESFP NON-COMPUTE FUSION. 357/358/359/360 are in `agen_helper.rs` (360's two record
+constructors in `agen_access_details.rs`), 361 in `dfs_dataflow_to_sentient.rs`, 362/363 in
+`std_standard_to_sentient.rs` and 364 in `vc_vector_chain_to_sentient_pesfp.rs`.
+
+⛔⛔ 357 IS PORTED IN FULL AND ENTRY 212 KEEPS ITS `writes_nothing`-GATED `todo!`. The seam is the
+BODY, not the function: 357 replaces every indexing loop with an entry-264 clone carrying one more
+`iter_arg` per record and mints the values for it, so it takes `&mut Vec<DfirOp>` and `&mut Values`.
+Entry 212 can hand it neither — its two callers (`construct_affine_details_and_addrs`,
+`construct_affine_comp_details_and_addrs`) are reached from ten lowerings that hold
+`unit: &'a ProgramUnit<A>`, derive their scope as `unit.body.as_slice()`, keep `&'a agen::Op` inside the
+access records and return types that borrow `unit.body`. That is the same seam entries 374 and 375 name,
+and the same position entry 360 lands in; wiring it belongs to the pass that owns the unit's body, and
+doing it at the leaf would regress ten audited entries to a `todo!` to reach one. The `todo!` message
+and the comment above it now say so, and the count is FLAT — not one has been added.
+
+⛔⛔ AND THE WALK AT `:875-899` READS THE **SEAT**, NOT THE VALUE — the audit finding on 357. The
+reference carries the survivors of the clone on `"index"`/`"iter-index"` attributes and entry 264 copies
+every attribute but `operandSegmentSizes` onto the new loop (`Utils.cpp:88-91`), so a marked loop is
+re-found with both. `"index"` is written unconditionally (`:712`) while `"iter-index"` is only written
+inside the match that breaks (`:733`) — so where two records share one loop the LAST record can be
+handed the FIRST record's seat, and only re-reading `getRegionIterArgs()[iter_idx]` after the clones
+reproduces it. The port therefore tracks `(induction variable, slot)` and reads the seat back, where
+carrying the marked value through the `IRMapping`s would have handed the later record its own induction
+variable instead. `AccessRecord` gained `set_mem_view_start_addr` for `:901`, the one write 357 makes
+through the trait.
+
+⛔ 357's `uniform.query_map` START ADDRESS IS A REFUSAL OUTCOME, not a placement. Entry 219's region-key
+arm needs a `UniformizeSource<'a>` borrowed from the op enclosing the loop (`:3967-3983`), which cannot
+be taken while the body is borrowed mutably to clone the nest, so `AddressManipulation::StartAddrIsAQueryMap`
+names it and `preceding` stays empty. ⭐ AND EVERY MARKED **LOOP** REFUSES ON A NON-L3 UNIT by the
+reference's own arithmetic: `:708` marks only def ops inside the outermost indexing loop, so the seat the
+walk recovers is bound by that loop or one inside it and entry 219's
+`DT_CHECK(parent_op->isProperAncestor(loop_op))` cannot hold. Only L3 survives, because entry 272 returns
+the constant before it reaches 219.
+
+⛔ 359'S COALESCE BLOCK HAS NO REACHABLE EFFECT BEYOND ITS INITIALISERS. `getCoalesceInfo` and
+`is_src1_reg` are declared NOWHERE in the authority tree and `COMMENT_OUT_COALESCE_STORE` is `#define`d
+nowhere, so the block cannot be resolved against anything; what it computes before them is what the port
+keeps.
+
+⛔ 358 AND 359 ARE NOW THE BODIES OF ENTRIES 316 AND 317, whose `todo!`s are gone. 374 and 375 stay
+`-> !` for the seam above. ⭐ AND WIRING THEM UP MADE ENTRY 314's OWN TEST FIXTURE INVALID, which is the
+whole-crate run's finding: it handed `lower_vector_load_op` a load with NO consumer at all and called it
+a load-and-send. Entry 033 counts uses, so a load nothing reads is `NotOneUse` and 358 refuses with
+`ConsumerNotExtracted` — the send is part of the INPUT, not of the pattern entry 314 matches. The fixture
+now carries the `dataflow.send` and the `get_unit` it goes to, and asserts the routing direction reaches
+the transfer off the SEND.
+
+⛔ 360 LANDS WITH ZERO CALLERS, exactly as its 16 lines describe: it constructs the symbolic record pair
+and hands it back. `AccessDetailsSymbolic::initialize` (`AccessDetails.cpp:858`) and
+`::construct_details` (`:898`) were added beside it as UNSCHEDULED siblings — neither is in `UNITS.tsv`
+— because 360 calls both and a port that stubbed them would be a predicate.
+
+⛔ 361 IS PORTED AND TESTED AND ITS SPINE WIRING IS OUTSTANDING, exactly where entry 303 sits: the
+post-`AgenToSentient` pass chain is what calls it. ⛔ ITS SECOND WALK RUNS BEFORE ANY ERASE, so
+`op->use_empty()` (`:2036`) is asked while the syncs still read their sources; the `GetUnitOp` bound at
+`:2018` is DEAD; and the `CODEGEN_DUMP_IRS` dump (`:2042-2046`) is an env-gated debug artefact and is not
+ported.
+
+⛔ 364's `fold_mode_attr_for_operation` GAINED ITS THIRD ARGUMENT and all five other call sites pass
+the declaration's `false` (three of them entries 365, 368 and 369, updated on the rebase): it is
+what makes the 16 -> 24 remap reachable, the reference's declaration defaults it to `false` and exactly
+one caller passes `true`. With it, entry 377's stale `todo!("e304_getOperandWithPrecision is unported…")`
+became a real call through `VectorOperand::with_precision`. ⛔ AND THE INSERTION POINT IS NEVER RESTORED
+after `setInsertionPointAfter(to)`, which is observable in the emission order — the port returns the
+positions rather than applying them, because every position the rewrite measured was measured on the body
+as it stood.
+
+⛔ ISLAND GROWTH FOR THIS BATCH, per AGENT-BRIEF.md:87. `dataflow::Op::Send` gained
+`dir: Option<RoutingDirection>` (33 `dataflow::Op::Send` initialisers across 10 files name it, four of
+them arriving with entries 365-373 on the rebase). `sentient::Op::ReceiveAndStore`'s
+`producer` widened from `RecvEnd` to `StoreSource`, an `enum` of a wire end and a constant, because 359
+REPLACES a bitstream producer with a `sentient.scalar_constant` the store then reads; its
+`interleaved_group` was retyped from `u32` to `Elements`. `HasTransferMemory` gained
+`rotation_position()`, and `ldcvti_consumer` is renamed `send_consumer_units` after what it answers.
 
 ## Level 0
 
@@ -3625,22 +3712,22 @@ per-unit `num_conditionals_ = 0` and its `DT_CHECK` wording.
 
 ## Level 7
 
-- [ ] **PORT 357/384** `generateAffineAddressManipulationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:625`, 381 lines
-- [ ] **AUDIT 357/384** `generateAffineAddressManipulationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:625`, line by line against the C++
-- [ ] **PORT 358/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910`, 104 lines
-- [ ] **AUDIT 358/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910`, line by line against the C++
-- [ ] **PORT 359/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025`, 131 lines
-- [ ] **AUDIT 359/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025`, line by line against the C++
-- [ ] **PORT 360/384** `constructSymbolicDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849`, 16 lines
-- [ ] **AUDIT 360/384** `constructSymbolicDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849`, line by line against the C++
-- [ ] **PORT 361/384** `runOnOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014`, 33 lines
-- [ ] **AUDIT 361/384** `runOnOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014`, line by line against the C++
-- [ ] **PORT 362/384** `LowerSelectOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:243`, 19 lines
-- [ ] **AUDIT 362/384** `LowerSelectOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:243`, line by line against the C++
-- [ ] **PORT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, 19 lines
-- [ ] **AUDIT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, line by line against the C++
-- [ ] **PORT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, 222 lines
-- [ ] **AUDIT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, line by line against the C++
+- [x] **PORT 357/384** `generateAffineAddressManipulationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:625`, 381 lines
+- [x] **AUDIT 357/384** `generateAffineAddressManipulationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:625`, line by line against the C++
+- [x] **PORT 358/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910`, 104 lines
+- [x] **AUDIT 358/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910`, line by line against the C++
+- [x] **PORT 359/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025`, 131 lines
+- [x] **AUDIT 359/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025`, line by line against the C++
+- [x] **PORT 360/384** `constructSymbolicDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849`, 16 lines
+- [x] **AUDIT 360/384** `constructSymbolicDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849`, line by line against the C++
+- [x] **PORT 361/384** `runOnOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014`, 33 lines
+- [x] **AUDIT 361/384** `runOnOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014`, line by line against the C++
+- [x] **PORT 362/384** `LowerSelectOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:243`, 19 lines
+- [x] **AUDIT 362/384** `LowerSelectOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:243`, line by line against the C++
+- [x] **PORT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, 19 lines
+- [x] **AUDIT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, line by line against the C++
+- [x] **PORT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, 222 lines
+- [x] **AUDIT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, line by line against the C++
 - [x] **PORT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, 83 lines
 - [x] **AUDIT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, line by line against the C++
 - [x] **PORT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, 80 lines

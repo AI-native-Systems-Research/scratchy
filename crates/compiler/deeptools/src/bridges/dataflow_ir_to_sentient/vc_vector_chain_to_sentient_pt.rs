@@ -410,7 +410,10 @@ fn pt_dummy_mac(
     ) else {
         return PtMac::Refused(PtDangling::Unrepresentable(at.clone()));
     };
-    let fold_mode = match fold_mode_attr_for_operation(op, comp) {
+    // ⛔ `sen1p5_receive_from_pt` IS `false` HERE AND CANNOT BE ANYTHING ELSE: the flag's own
+    // definition tests `comp == PE` (`VectorChainToSentientPESFP.cpp:165`, `Utils.cpp:436`) and this
+    // pass runs on the PT, which folds nothing.
+    let fold_mode = match fold_mode_attr_for_operation(op, comp, false) {
         FoldModeAttr::Absent => None,
         FoldModeAttr::Present(mode) => Some(mode),
         FoldModeAttr::Unsupported => {
@@ -787,7 +790,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                 }
             }
 
-            let fold_mode = match fold_mode_attr_for_operation(op, comp) {
+            let fold_mode = match fold_mode_attr_for_operation(op, comp, false) {
                 FoldModeAttr::Absent => None,
                 FoldModeAttr::Present(mode) => Some(mode),
                 FoldModeAttr::Unsupported => {
@@ -1283,7 +1286,7 @@ pub fn fuse_compute_ops<A: Arch>(
             };
 
             // `getSentientFoldModeAttrForOperation(op, comp)` (`:376`).
-            let (fold_mode, fold_supported) = match fold_mode_attr_for_operation(op, comp) {
+            let (fold_mode, fold_supported) = match fold_mode_attr_for_operation(op, comp, false) {
                 FoldModeAttr::Absent => (None, true),
                 FoldModeAttr::Present(mode) => (Some(mode), true),
                 FoldModeAttr::Unsupported => (None, false),
@@ -1885,7 +1888,12 @@ mod unit_tests {
                 from,
                 ty: V,
             }),
-            DfirOp::Dataflow(dataflow::Op::Send { to, data, ty: V }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data,
+                ty: V,
+                dir: None,
+            }),
         ]);
 
         let fusion = fuse_non_compute_ops(
@@ -1991,6 +1999,7 @@ mod unit_tests {
                 to: Link::<PtRowUnit<0>, Pe>::between(Val(0), pe).ends().0,
                 data: product,
                 ty: V,
+                dir: None,
             }),
         ]);
 

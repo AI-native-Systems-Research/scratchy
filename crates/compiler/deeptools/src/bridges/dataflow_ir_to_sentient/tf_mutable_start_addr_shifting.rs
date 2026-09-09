@@ -2769,7 +2769,9 @@ mod unit_tests {
             }),
             view(src_view, lx),
             view(dst_view, hbm),
-            DfirOp::Agen(toggle_start_transfer(src_view, dst_view, arg1, arg3, load_iv)),
+            DfirOp::Agen(toggle_start_transfer(
+                src_view, dst_view, arg1, arg3, load_iv,
+            )),
         ];
         let candidate = MasCandidate {
             op: &scope[4],
@@ -2890,8 +2892,8 @@ mod unit_tests {
                 },
             ]
         };
-        let transfer = agen::Op::CompositeIndirectLoadAndStore(Box::new(
-            agen::CompositeIndirectTransfer {
+        let transfer =
+            agen::Op::CompositeIndirectLoadAndStore(Box::new(agen::CompositeIndirectTransfer {
                 indirect_src: None,
                 // `direct_src:%src_mem_view[%c64, %arg1 * 3 + %c16, %arg2 * 2 + 128]`.
                 direct_src: src_view,
@@ -2939,8 +2941,7 @@ mod unit_tests {
                 multicast_info: None,
                 dbg_name: None,
                 body: vec![DfirOp::Agen(agen::Op::Yield)],
-            },
-        ));
+            }));
         let scope = vec![
             DfirOp::Arith(arith::Op::Constant {
                 result: zero,
@@ -3007,7 +3008,11 @@ mod unit_tests {
         let DfirOp::Arith(arith::Op::Constant { value, .. }) = shifted.start_address else {
             panic!("the new start address is one `arith.constant`")
         };
-        assert_eq!(value, 2048 + 33856, "the start it had plus what moved into it");
+        assert_eq!(
+            value,
+            2048 + 33856,
+            "the start it had plus what moved into it"
+        );
         let DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(rebuilt)) = &shifted.mem_op else {
             panic!("the clone is a composite indirect load and store")
         };

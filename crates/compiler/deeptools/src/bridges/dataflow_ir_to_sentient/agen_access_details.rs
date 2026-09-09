@@ -102,7 +102,7 @@
 use crate::arch::Elements;
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, scf, uses,
+    Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op, region_owner, scf, uses,
     vectorchain,
 };
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, FlatConstraints, IntegerSet};
@@ -3147,6 +3147,152 @@ impl<'a> AccessDetailsSymbolic<'a> {
     pub fn set_strides(&mut self, strides: &[Val]) {
         self.strides.clear();
         self.strides.extend_from_slice(strides);
+    }
+
+    /// `AccessDetailsSymbolic::initialize` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:858` (39L). ⭐ NOT A SCHEDULED UNIT and
+    /// not in `UNITS.tsv`: `e360_constructSymbolicDetailsAndAddrs` calls it and nothing else can, so
+    /// it is written here rather than left as a gap the caller would have to refuse into.
+    ///
+    /// ⛔ THE WIDTH AND THE COUNT COME FROM THE **VECTOR**, as in [`AccessDetailsAffine::initialize`]:
+    /// the loaded result on a load, `getValueToStore()` on a store (`:864-871`, `:876-883`).
+    /// ⛔ AND `setStrides` (`:891`) IS WHAT THE AFFINE FORM NEVER CALLS — an affine access states its
+    /// coefficients as integers, so its stride list stays empty and this one carries SSA values.
+    pub fn initialize(&mut self, scope: &[DfirOp]) -> SymbolicInitialize {
+        // `DT_CHECK_MSG(getMemoryIndex() != kMax, "uninitialized memory_index_ detected")` (`:859`).
+        if self.base.memory_index.is_none() {
+            return SymbolicInitialize::MemoryIndexUnset;
+        }
+
+        let (view, view_ty, indices, strides, vector_ty) = match self.base.op {
+            agen::Op::SymbolicVectorLoad {
+                view,
+                view_ty,
+                indices,
+                strides,
+                ty,
+                ..
+            }
+            | agen::Op::SymbolicVectorStore {
+                view,
+                view_ty,
+                indices,
+                strides,
+                ty,
+                ..
+            } => (view, view_ty, indices, strides, ty),
+            // `else return op->emitError("unsupported operation")` (`:885-887`) — the reference's own
+            // catch-all, so a class added later lands here rather than being silently initialized.
+            _ => return SymbolicInitialize::UnsupportedOperation,
+        };
+
+        // `for (auto index : ..getIndices()) indices.push_back(index)` (`:873`, `:884`) — VALUES, and
+        // an [`Index`] that folded a literal is not one.
+        let mut subscripts: Vec<Val> = Vec::with_capacity(indices.len());
+        for index in indices {
+            let Index::Val(val) = index else {
+                return SymbolicInitialize::SubscriptNotAValue;
+            };
+            subscripts.push(*val);
+        }
+
+        self.base.mem_ref = Some(*view);
+        self.base
+            .set_transfer_set(agen::access_set(view_ty, vector_ty.len));
+        self.base
+            .set_transfer_order(agen::access_order(view_ty.shape.len()));
+        self.base.set_element_width(Bits(vector_ty.elem.bits()));
+        self.base
+            .set_expected_total_elements(Elements(vector_ty.len));
+        self.base.set_indices(&subscripts);
+        self.set_strides(strides);
+
+        // `initializeMemViewInfo()` (`:893`) reads `mem_ref_` back; entry 145 takes the resolved view.
+        let Some(source) = MemViewSource::of(*view, scope) else {
+            return SymbolicInitialize::MemoryViewUnresolved;
+        };
+        self.base.initialize_mem_view_info(source);
+        SymbolicInitialize::Initialized
+    }
+
+    /// `AccessDetailsSymbolic::constructDetails` —
+    /// `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:898` (17L). ⭐ NOT A SCHEDULED UNIT
+    /// either — the symbolic sibling of [`AccessDetailsAffine::construct_details`], and the one thing
+    /// `e360_constructSymbolicDetailsAndAddrs` does per record.
+    ///
+    /// ⛔ FOUR STEPS, NOT SIX: no `constructIndices` and no `constructIteratorCoefficients`
+    /// (`:901-912`). A symbolic subscript is a runtime value, so there is no constant to fold out of a
+    /// map and no per-iterator coefficient to derive — `e327_gatherSymbolicLoadStoreDetails` derives
+    /// the address arithmetic from [`Self::strides`] instead.
+    pub fn construct_details(
+        &mut self,
+        memory_index: MemoryOperandIndex,
+        scope: &[DfirOp],
+    ) -> ConstructedSymbolicDetails {
+        // Memory index is used to identify src/dest in composite_load_and_store.
+        self.base.set_memory_index(memory_index);
+        let initialized = self.initialize(scope);
+        if !initialized.admissible() {
+            return ConstructedSymbolicDetails::NotInitialized(initialized);
+        }
+        let extents = self.base.construct_extent_and_total_elements();
+        if !matches!(extents, TransferExtents::Rectangular) {
+            return ConstructedSymbolicDetails::ExtentsRefused(extents);
+        }
+        let chunked = self.base.construct_chunk_and_shuffle_info(scope);
+        if !chunked.admissible() {
+            return ConstructedSymbolicDetails::ChunkRefused(chunked);
+        }
+        self.base.construct_ld_or_st_type();
+        ConstructedSymbolicDetails::Complete
+    }
+}
+
+/// WHY `AccessDetailsSymbolic::initialize` REFUSED — [`AffineInitialize`]'s symbolic twin.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolicInitialize {
+    /// `success()` — the record carries everything the op says about itself.
+    Initialized,
+    /// `DT_CHECK_MSG(getMemoryIndex() != kMax, ..)` (`:859-860`).
+    MemoryIndexUnset,
+    /// *"unsupported operation"* (`:886`) — neither symbolic vector op.
+    UnsupportedOperation,
+    /// ⭐ NOT A REFERENCE ARM. `getIndices()` yields `Value`s there; this island models a subscript as
+    /// an [`Index`], which can also be a folded literal or a strided sum — and one of those is not
+    /// the SSA operand `setIndices` takes.
+    SubscriptNotAValue,
+    /// `initializeMemViewInfo().failed()` (`:893`) — the view resolves to no `agen.memory_view`.
+    MemoryViewUnresolved,
+}
+
+impl SymbolicInitialize {
+    /// Whether `constructDetails` carries on past `initialize()`.
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, SymbolicInitialize::Initialized)
+    }
+}
+
+/// THE OUTCOME OF [`AccessDetailsSymbolic::construct_details`] — which of its four steps refused.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructedSymbolicDetails {
+    /// `success()` (`:912`).
+    Complete,
+    /// `initialize().failed()` (`:904`).
+    NotInitialized(SymbolicInitialize),
+    /// `constructExtentAndTotalElements().failed()` (`:906-907`).
+    ExtentsRefused(TransferExtents),
+    /// `constructChunkAndShuffleInfo().failed()` (`:909`).
+    ChunkRefused(ChunkAndShuffleInfo),
+}
+
+impl ConstructedSymbolicDetails {
+    /// Whether the record is complete — `e360_constructSymbolicDetailsAndAddrs`' `failed()` test.
+    #[must_use]
+    pub const fn admissible(self) -> bool {
+        matches!(self, ConstructedSymbolicDetails::Complete)
     }
 }
 

@@ -3788,6 +3788,7 @@ mod unit_tests {
                 to,
                 data: Val(4),
                 ty: V64,
+                dir: None,
             }),
             DfirOp::Dataflow(dataflow::Op::GetUnit {
                 result: Val(21),

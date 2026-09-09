@@ -810,6 +810,7 @@ fn load_and_send(
             to,
             data: loaded,
             ty,
+            dir: None,
         }));
     }
     ops
@@ -991,6 +992,7 @@ fn tail<const STICK_ALIGNED: bool>(
         to,
         data: produced.val(),
         ty: produced.ty(),
+        dir: None,
     }));
     ops
 }

@@ -66,6 +66,7 @@
 //! | `e378_runOnOperation` | 378/384 | 30 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374` |
 
 use super::vc_operand_reuse::{DataId, OperandReuse};
+use super::vc_splat::create_splat_operation;
 use super::vc_vector_chain_helper::{
     FusionAnalysis, analyze_and_fill_operand_forwarding, analyze_and_fill_result_forwarding,
     analyze_non_compute_ops_for_fusion, compute_precision_of_op, get_mask_value_for_non_pt,
@@ -73,14 +74,14 @@ use super::vc_vector_chain_helper::{
     vector_type_of,
 };
 use super::vc_vector_operands::{
-    ComputeComp, OpId, VectorOperand, defining_position, erase_op, erase_op_recording,
-    erase_operands_recording, is_arith_constant, op_at, origin_val, remove_at, use_positions,
+    ComputeComp, OpId, OperandValue, VectorOperand, VectorOperandType, defining_position, erase_op,
+    erase_op_recording, erase_operands_recording, is_arith_constant, op_at, origin_val, remove_at,
+    same_block, use_positions,
 };
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, operands as op_operands, regions,
-    vector,
+    Op as DfirOp, Val, agen, dataflow, dbg_name, operands as op_operands, regions, vector,
 };
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{self as dfir, Values};
@@ -473,6 +474,504 @@ pub fn fuse_compute_ops<A: Arch>(unit: &dfir::ProgramUnit<A>, reuse_info: &Opera
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+// 364/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHERE ONE GROUP OF FUSED SENTIENT OPS GOES — the two kinds of `rewriter.setInsertionPoint*` this
+/// fusion makes.
+///
+/// ⛔⛔ THE SECOND KIND IS NEVER RESTORED, AND THAT IS OBSERVABLE. `setInsertionPointAfter(to)`
+/// (`VectorChainToSentientPESFP.cpp:227`) fires inside the to-operand loop for an `sfpring`
+/// destination, and the mask constant (`:252`) and the fused compute (`:271`, `:294`) are created
+/// AFTER it — so they land behind that send rather than in front of `op`. One position per group is
+/// what stops a port quietly re-ordering them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertAt {
+    /// `rewriter.setInsertionPoint(op)` (`:180`) — immediately before the send or store being fused.
+    Before(OpId),
+    /// `rewriter.setInsertionPointAfter(to.value().op_)` (`:227`) — immediately after an `sfpring`
+    /// destination's own send.
+    After(OpId),
+}
+
+/// ONE GROUP OF SENTIENT OPS AND THE INSERTION POINT THEY WERE BUILT AT, in creation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FusedEmission {
+    /// Where the group goes.
+    pub at: InsertAt,
+    /// The ops, in the order the reference creates them.
+    pub ops: Vec<sen::Op>,
+}
+
+/// WHAT THE NON-COMPUTE FUSION DID — the reference's `LogicalResult` together with the emission and
+/// the erasure it owes its caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonComputeFusion {
+    /// Every group, in the order the reference creates them. ⛔ TWO GROUPS CAN NAME THE SAME
+    /// POSITION — an `sfpring` destination puts the `SetSendDst` and then the compute after the same
+    /// send — and a caller must splice them IN THIS ORDER, because the reference's insertion point
+    /// advances past every op it creates.
+    pub emitted: Vec<FusedEmission>,
+    /// `erased_list` as the two `VectorOperand::eraseOperands` calls leave it (`:308-312`), sorted
+    /// and deduped — the list is only ever asked `contains`, so its order is not part of it.
+    ///
+    /// ⛔⛔ RETURNED, NOT APPLIED, AND NOT FOR CONVENIENCE. Every position in [`Self::emitted`] names
+    /// an op ON THIS LIST — the send being fused, or the `sfpring` send behind it — because a fused
+    /// compute REPLACES them. The reference's rewriter holds `Operation *`s and can insert then
+    /// erase; an [`OpId`] is a POSITION, so a caller must splice the emission in first and only then
+    /// remove these, descending, exactly as [`cleanup`] does.
+    pub to_erase: Vec<OpId>,
+    /// `return success()` / `return failure()`, and which one.
+    pub outcome: FusionOutcome,
+}
+
+/// WHY THE NON-COMPUTE FUSION STOPPED, each arm a different fact about the program that reached it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusionOutcome {
+    /// `return success()` with the whole body skipped (`:101-103`, `:320`) — there is no producer, or
+    /// it is not one of the four this fuses. ⛔ NOT A FAILURE: the op stays, and entry 344 is what
+    /// lowers what is left of it.
+    NotFused,
+    /// `return success()` after the rewrite.
+    Fused,
+    /// `if (!is_fusion_respected) return failure();` (`:114`) — ⛔ BEFORE `setReuseInformation`, so
+    /// the reuse map is untouched on this arm.
+    FusionNotRespected,
+    /// `emitError("All to operands should be in the same block in order to be fused.")` (`:313-317`)
+    /// — ⛔ AFTER `setReuseInformation`, whose writes stand.
+    NotSameBlock,
+    /// `createSplatOperation` answered `failure()` (`:288-291`) — entry 279's own refusal.
+    SplatRefused,
+    /// THE REFERENCE'S OWN ABORTS, which are not `emitError`s: every
+    /// `symbolizeSentientComputePort(…).value()` and `symbolizeSentientPrecision(…).value()`
+    /// (`:274-285`, `:296-305`) on a port or precision with no spelling — an EMPTY `opA`, `opC` or
+    /// result precision is the one that is reachable, and `getSentientFoldModeAttrForOperation`'s own
+    /// `llvm_unreachable` (`Utils.cpp:452`) arrives here too.
+    Unrepresentable,
+}
+
+/// Replaces: e364_patternAgnosticFuseNonComputeOpsHelper
+///
+/// **364/384** `patternAgnosticFuseNonComputeOpsHelper` — `VectorChainToSentientPESFP.cpp:96`
+/// (222L): a receive, load or constant feeding a send or store becomes ONE fused compute.
+///
+/// ⛔ `use_logical = !(use_fma || use_immcopy)` (`:178`), so its two `if`s ARE the others' `else` and
+/// the reference's fourth arm is dead; the FMA arm's three `std::swap`s sit INSIDE the to-operand
+/// loop and cancel on a second one; `opC_forwarding` (`:182`) is declared and never pushed to.
+#[allow(clippy::too_many_arguments)]
+pub fn pattern_agnostic_fuse_non_compute_ops_helper<A: Arch>(
+    op: &OpId,
+    from: Option<&VectorOperand>,
+    unit: &OpId,
+    comp: ComputeComp,
+    reuse_info: &mut OperandReuse,
+    is_visited: &mut BTreeMap<OpId, bool>,
+    is_precision_converted_global: bool,
+    scope: &[DfirOp],
+    values: &mut Values,
+) -> NonComputeFusion {
+    let refused = |outcome| NonComputeFusion {
+        emitted: Vec::new(),
+        to_erase: Vec::new(),
+        outcome,
+    };
+
+    // `if (from.has_value() && isa<dataflow::ReceiveOp, vector::LoadOp, agen::VectorLoadOp,
+    //  mlir::arith::ConstantOp>(from.value().op_))`, whose `else` is the `return success()` at `:320`.
+    let Some(from) = from else {
+        return refused(FusionOutcome::NotFused);
+    };
+    let producer = op_at(&from.op, scope);
+    let fuses = matches!(
+        producer,
+        Some(
+            DfirOp::Dataflow(dataflow::Op::Receive { .. })
+                | DfirOp::Vector(vector::Op::Load { .. })
+                | DfirOp::Agen(agen::Op::VectorLoad { .. })
+        )
+    ) || is_arith_constant(&from.op, scope);
+    if !fuses {
+        return refused(FusionOutcome::NotFused);
+    }
+    // The op being fused as an OP — `getComputePrecisionOfOp`, `getSentientFoldModeAttrForOperation`,
+    // `getDbgNameAttr` and `createSplatOperation` all take it that way. An `Operation *` cannot
+    // dangle in the reference; a position naming no op is [`FusionOutcome::Unrepresentable`].
+    let Some(fused) = op_at(op, scope) else {
+        return refused(FusionOutcome::Unrepresentable);
+    };
+
+    // `analyzeNonComputeOpsForFusion(unit_, dcc_ext_ctx_, reuse_info_, op, from, comp_, is_visited_,
+    //  is_fusion_respected, to_operands, is_dangling_ops_present_after_fusion);` — entry 341, which
+    // also carries the three locals the reference declares above it (`:105-107`).
+    let mut analysis = FusionAnalysis::default();
+    analyze_non_compute_ops_for_fusion::<A>(unit, op, from, comp, is_visited, scope, &mut analysis);
+
+    // `if (!is_fusion_respected) return failure();`
+    if !analysis.is_fusion_respected {
+        return refused(FusionOutcome::FusionNotRespected);
+    }
+
+    // `from_operands.push_back(from); this->reuse_info_.setReuseInformation(op, from_operands);`
+    // ⛔ IT IS THE **COPY** THAT GETS LATCHED, and `:185` below reads that copy back while `:122`
+    // reads the original `from` — see the two reads' own notes.
+    let mut from_operands = vec![from.clone()];
+    reuse_info.set_reuse_information(op, &mut from_operands, scope);
+
+    // `if (VectorOperand::sameBlock(op, to_operands).succeeded())`, whose `else` is the `emitError` at
+    // `:313-317`. The LIST overload (`VectorOperands.cpp:670`) is `.all()` over the single-operand
+    // one — an empty list succeeds, and an ABSENT operand fails.
+    if !analysis
+        .to_operands
+        .iter()
+        .all(|to| same_block(op, to.as_ref(), scope))
+    {
+        return refused(FusionOutcome::NotSameBlock);
+    }
+    // ⭐ WHICH IS WHY THE UNGUARDED `to.value()`s AT `:160` AND `:211` CANNOT FIRE: `sameBlock`'s
+    // `else { return failure(); }` (`VectorOperands.cpp:657`) already refused an absent operand, so
+    // this `flatten` drops nothing and the lengths `:154` and `:174` test are the same lengths.
+    let to_operands: Vec<&VectorOperand> = analysis.to_operands.iter().flatten().collect();
+
+    // `std::string op1 = from.value().getName(), op2 = "one", op3 = "zero";` — ⛔ THE ORIGINAL `from`.
+    let mut op1 = from.name();
+    let op2 = sentient::Port::One;
+    let mut op3 = Some(sentient::Port::Zero);
+    // `int from_ID[3] = {this->reuse_info_.getId(from.value().op_).value(), -1, -1};` — ⛔ READ AFTER
+    // `setReuseInformation`, which is the call that assigned it. `None` is the `.td`'s -1, and the
+    // reference's `.value()` is total: `getId` answers -1 on a miss (`OperandReuse.cpp:65-71`).
+    let mut from_id: [Option<i32>; 3] = [
+        match origin_val(&from.op, scope).map_or(DataId::Unassigned, |val| reuse_info.id(val)) {
+            DataId::Unassigned => None,
+            assigned => Some(assigned.attribute()),
+        },
+        None,
+        None,
+    ];
+
+    // `bool use_fma = false;` and `bool sen1p5_receive_from_pt = isa<ReceiveOp>(from.value().op_) &&
+    //  from.value().getFirstValue() == "pt" && dcc_ext_ctx_.getArch() >= IsaCoreGen::SEN1P5_ISA;`
+    // ⛔ `getFirstValue()`, NOT `getName()`: the raw first value, which is `pt` for the PT FIFO and a
+    // bare slice index for an `lrf`/`irf`/`istate` operand.
+    let mut use_fma = false;
+    let sen1p5_receive_from_pt = matches!(
+        producer,
+        Some(DfirOp::Dataflow(dataflow::Op::Receive { .. }))
+    ) && from.values.first()
+        == Some(&OperandValue::Port(sentient::Port::Pt))
+        && A::GEN >= IsaGen::Sen1p5;
+
+    // `if (is_any_of(this->comp_, PE, SFP) && !to_operands.empty())`
+    if matches!(comp, ComputeComp::Pe | ComputeComp::Sfp) && !to_operands.is_empty() {
+        // `if (is_precision_converted_global) use_fma = true;`
+        if is_precision_converted_global {
+            use_fma = true;
+        }
+
+        // `if (isa<mlir::arith::ConstantOp>(from.value().op_))` — the constant+send case.
+        if is_arith_constant(&from.op, scope) {
+            for to in &to_operands {
+                // `if (to.value().type_ == Link) { use_fma = true; op1 = "lrf14"; }` — the reference's
+                // own comment on that port is *"doesn't influence the result"*.
+                if to.kind == VectorOperandType::Link {
+                    use_fma = true;
+                    op1 = Some(sentient::Port::Lrf(sentient::LrfIndex::L14));
+                }
+            }
+        } else if sen1p5_receive_from_pt && comp == ComputeComp::Pe {
+            // *"PT FIFO not valid for LOGICAL in sen1p5 so need to realize as FMA."*
+            use_fma = true;
+        }
+    }
+
+    // `bool use_immcopy = (isa<mlir::arith::ConstantOp>(from.value().op_) &&
+    //  is_any_of(this->comp_, PE, SFP) && to_operands.size() == 1 &&
+    //  to_operands[0].value().type_ == LRF);` — *"Use IMMCOPY if its constant storing into a register."*
+    let use_immcopy = is_arith_constant(&from.op, scope)
+        && matches!(comp, ComputeComp::Pe | ComputeComp::Sfp)
+        && to_operands.len() == 1
+        && to_operands[0].kind == VectorOperandType::Lrf;
+
+    // `bool use_logical = !(use_fma || use_immcopy);` — ⛔ NOT A LOCAL HERE, because it is the
+    // NEGATION of the other two: both of its `if`s are the `else` of an `if use_fma … else if
+    // use_immcopy` chain, and the reference's fourth arm (`llvm::errs() << "Unknown option to lower
+    // to sentient"`, `:246-249`) is dead code there is nothing to write as.
+
+    // `rewriter.setInsertionPoint(op);`
+    let mut at = InsertAt::Before(op.clone());
+    // `SmallVector<Attribute, 1> opA_forwarding, opC_forwarding, result_forwarding;` — ⛔ THE C ONE IS
+    // DECLARED AND NEVER PUSHED TO (`:182`), so the MAC's C forwarding is always empty.
+    let mut opa_forwarding: Vec<sentient::Port> = Vec::new();
+    let opc_forwarding: Vec<sentient::Port> = Vec::new();
+    let mut result_forwarding: Vec<sentient::Port> = Vec::new();
+
+    // `std::string opA_precision = getInputPrecisionFromOperand(from_operands[0]);` — ⛔ THE LATCHED
+    // COPY, not `from`. It reads `orig_precision_`, which latching does not touch, so the two agree
+    // for a one-operand list — but the reference reads the copy and so does this.
+    let mut opa_precision = input_precision_from_operand(&from_operands[0]);
+    // `auto compute_precision = getComputePrecisionOfOp(op);`
+    let mut compute_precision = compute_precision_of_op(fused);
+    // `if (sen1p5_receive_from_pt && this->comp_ == PE) { if (compute_precision == "fp16")
+    //  compute_precision = "fp32"; }` — *"fp16 coming from PT is really fp24, which shouldn't be
+    // downcast to fp16."*
+    if sen1p5_receive_from_pt
+        && comp == ComputeComp::Pe
+        && compute_precision == sentient::Precision::Fp16
+    {
+        compute_precision = sentient::Precision::Fp32;
+    }
+
+    // `if (opA_precision == "fp32" && compute_precision == "fp16")` — *"Use the operation
+    // corresponding to the higher of opA/compute precisions to determine foldMode."*
+    let fp32_in_fp16_out = opa_precision == Some(sentient::Precision::Fp32)
+        && compute_precision == sentient::Precision::Fp16;
+    // ⛔ THE FOLD MODE COMES OFF THE **PRODUCER** ON THAT ARM (`:196-198`) AND OFF `op` OTHERWISE
+    // (`:204-206`) — the two ops need not carry the same vector type, so this is not one call.
+    let Some(fold_of) = (if fp32_in_fp16_out {
+        producer
+    } else {
+        Some(fused)
+    }) else {
+        return refused(FusionOutcome::Unrepresentable);
+    };
+    let fold_mode = match fold_mode_attr_for_operation(fold_of, comp, sen1p5_receive_from_pt) {
+        FoldModeAttr::Absent => None,
+        FoldModeAttr::Present(mode) => Some(mode),
+        FoldModeAttr::Unsupported => return refused(FusionOutcome::Unrepresentable),
+    };
+    if fp32_in_fp16_out {
+        // `std::swap(opA_precision, compute_precision);` — *"Cast op should be interpreted as output
+        // on the fly conversion, so opA_precision should be fp16 and compute&result precisions should
+        // be fp32."* ⛔ THE GUARD PINS BOTH SIDES, so this pair is the whole exchange.
+        opa_precision = Some(sentient::Precision::Fp16);
+        compute_precision = sentient::Precision::Fp32;
+    }
+    // `std::string opB_precision = compute_precision; std::string opC_precision = compute_precision;`
+    let opb_precision = compute_precision;
+    let mut opc_precision = Some(compute_precision);
+
+    let mut emitted: Vec<FusedEmission> = Vec::new();
+    // `for (auto &to : to_operands) {`
+    for to in &to_operands {
+        // `auto destination_type = to.value().type_; std::string dest = to.value().getName();`
+        let destination_type = to.kind;
+        let Some(dest) = to.name() else {
+            return refused(FusionOutcome::Unrepresentable);
+        };
+        if use_fma {
+            // *"Use the accumulation part if plan to use FMA / Solves INT24 challenges in IMA8 /
+            // Allows constants 0, 1, 2, 3."* ⛔ ALL THREE SWAPS ARE INSIDE THIS LOOP, so a second
+            // to-operand puts every one of them back.
+            core::mem::swap(&mut op1, &mut op3);
+            core::mem::swap(&mut opa_precision, &mut opc_precision);
+            from_id.swap(0, 2);
+            result_forwarding.push(dest);
+
+            // `if (dest == "sfpring")` — *"A special case in DD1a where sfp unit forwarding one of its
+            // input operands is forwarded to another sfp via MAC. In case of SFPRing, only FMA result
+            // can be sent to data fifo."*
+            if dest == sentient::Port::SfpRing {
+                // `rewriter.setInsertionPointAfter(to.value().op_);` — ⛔ AND NEVER BACK; see
+                // [`InsertAt`].
+                at = InsertAt::After(to.op.clone());
+                // `auto send_op = llvm::dyn_cast<dataflow::SendOp>(to.value().op_);
+                //  sentient::SetSendDestinationOp::create(rewriter, op->getLoc(),
+                //  send_op.getToUnit());` — ⛔ THE `dyn_cast` IS UNCHECKED, and only a send can name
+                // `sfpring` (`VectorOperands.cpp:113-131`); a position that is not one is a stop.
+                let Some(DfirOp::Dataflow(dataflow::Op::Send { to: units, .. })) =
+                    op_at(&to.op, scope)
+                else {
+                    return refused(FusionOutcome::Unrepresentable);
+                };
+                emitted.push(FusedEmission {
+                    at: at.clone(),
+                    ops: vec![sen::Op::Sentient(sentient::Op::SetSendDst {
+                        units: *units,
+                    })],
+                });
+            }
+        } else if use_immcopy {
+            // `DT_CHECK(destination_type == LRF);` — ⛔ NOT A TEST THIS PORT CAN FAIL: `use_immcopy`
+            // IS that comparison, on the single to-operand there is (`:172-175`). ⭐ AND THIS ARM
+            // NEVER SYMBOLIZES `dest`, so the refusal above it is stricter than the reference by
+            // nothing: an `LRF` operand always spells `lrf<N>`.
+        } else {
+            // `else if (use_logical) { if (destination_type == LRF) …` — *"LOGICAL doesn't allow
+            // src0/src2 port forwarding in tgtrf"*, so a register destination goes on the RESULT and
+            // everything else on opA.
+            if destination_type == VectorOperandType::Lrf {
+                result_forwarding.push(dest);
+            } else {
+                opa_forwarding.push(dest);
+            }
+            // *"Precision of opC (0.0) should match opA's precision in LOGICAL."*
+            opc_precision = opa_precision;
+        }
+    }
+
+    // `sentient::ConstantOp::create(rewriter, op->getLoc(), rewriter.getIndexType(), 0);` — ⛔ BUILT
+    // BEFORE THE BRANCH, so the immcopy arm emits it and never reads it; entry 279 mints its own.
+    let mask = values.mint();
+    let mask_const = sen::Op::Sentient(sentient::Op::ScalarConstant {
+        value: 0,
+        result: mask,
+        reg_locale: sentient::RegType::Imm,
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    });
+
+    // `auto op_dbg_name = dataflow::getDbgNameAttr(op);`
+    let op_dbg_name = dbg_name(fused).map(str::to_owned);
+
+    // `auto result_precision = getResultPrecisionFromOperands(to_operands);` — entry 061, which reads
+    // the FIRST PRESENT operand's `on_the_fly_conv_precision_` and returns its emptiness too. The
+    // `DT_CHECK_MSG(from_operands.size() == 1, …)` beside it (`:258`) is the one-element vector this
+    // function pushed at `:117`.
+    let mut result_precision = result_precision_from_operands(&analysis.to_operands);
+    // `if (result_forwarding.empty() && result_precision == "") result_precision = compute_precision;`
+    if result_forwarding.is_empty() && result_precision.is_none() {
+        result_precision = Some(compute_precision);
+    }
+
+    let mut ops = vec![mask_const];
+    if use_fma {
+        // ⛔ THE FIVE `.value()`s THIS ARM TAKES, and no others: an empty precision or an unspellable
+        // port is where the reference dies.
+        let (
+            Some(op1),
+            Some(op3),
+            Some(opa_precision),
+            Some(opc_precision),
+            Some(result_precision),
+        ) = (op1, op3, opa_precision, opc_precision, result_precision)
+        else {
+            return refused(FusionOutcome::Unrepresentable);
+        };
+        // `sentient::MacOp::create(rewriter, op->getLoc(), TypeRange(), mask_const_op.getResult(),
+        //  ValueRange(pointers), op_dbg_name, op1, op2, op3, opA_forwarding, {}, opC_forwarding,
+        //  result_forwarding, fold_mode_attr, opA_precision, opB_precision, opC_precision,
+        //  result_precision, compute_precision, from_ID[0], from_ID[1], from_ID[2]);`
+        ops.push(sen::Op::Sentient(sentient::Op::VectorMac {
+            // *"PE/SFP associates mask directly to operations. … Therefore the mask should be set to
+            // 0 (default)."*
+            mask: Some(mask),
+            // `ArrayRef<Value> pointers = {}` — always empty here; the PT pass is what threads one.
+            xrf_write_ptr: None,
+            xrf_read_ptr: None,
+            // `TypeRange()` — a fused non-compute binds nothing.
+            results: Vec::new(),
+            op_a: sentient::Operand {
+                forwarding: opa_forwarding,
+                precision: opa_precision,
+                data_id: from_id[0],
+                ..sentient::Operand::from(op1)
+            },
+            // `ArrayAttr::get(context, {})` for B's forwarding.
+            op_b: sentient::Operand {
+                precision: opb_precision,
+                data_id: from_id[1],
+                ..sentient::Operand::from(op2)
+            },
+            op_c: sentient::Operand {
+                forwarding: opc_forwarding,
+                precision: opc_precision,
+                data_id: from_id[2],
+                ..sentient::Operand::from(op3)
+            },
+            result: sentient::ResultPorts {
+                forwarding: result_forwarding,
+                precision: result_precision,
+                unroll_incr: false,
+            },
+            // Not passed to `MacOp::create`, so the `.td` defaults stand.
+            mode: sentient::FmaMode::FusedMulAdd,
+            compute_precision,
+            fold_mode,
+            unroll_factor: sentient::UnrollFactor::X1,
+            xrf_read_incr: 0,
+            xrf_write_incr: 0,
+            data_transfer_only: false,
+            dbg_name: op_dbg_name,
+        }));
+    } else if use_immcopy {
+        // `if (failed(vectorchain::createSplatOperation(op, from.value(), to_operands[0].value(),
+        //  rewriter, this->comp_, dcc_ext_ctx_.dsc_global_->sysDef))) return failure();` — entry 279.
+        let Some(splat) =
+            create_splat_operation::<A>(fused, from, to_operands[0], comp, scope, values)
+        else {
+            return refused(FusionOutcome::SplatRefused);
+        };
+        ops.extend(splat);
+    } else {
+        let (
+            Some(op1),
+            Some(op3),
+            Some(opa_precision),
+            Some(opc_precision),
+            Some(result_precision),
+        ) = (op1, op3, opa_precision, opc_precision, result_precision)
+        else {
+            return refused(FusionOutcome::Unrepresentable);
+        };
+        // `sentient::BinaryOp::create(rewriter, op->getLoc(), mask_const_op, op_dbg_name, op1, op3,
+        //  SentientBinaryOperator::or0, opA_forwarding, {}, result_forwarding, nullptr,
+        //  fold_mode_attr, opA_precision, opC_precision, result_precision, "none", from_ID[0],
+        //  from_ID[2]);`
+        ops.push(sen::Op::Sentient(sentient::Op::VectorBinary {
+            mask,
+            op_a: sentient::Operand {
+                forwarding: opa_forwarding,
+                precision: opa_precision,
+                data_id: from_id[0],
+                ..sentient::Operand::from(op1)
+            },
+            // ⛔⛔ **B TAKES `op3`, `opC_precision` AND `from_ID[2]`** — a binary has two operands, so
+            // the C slot's port and precision are what land on B and the B ones are dropped.
+            op_b: sentient::Operand {
+                precision: opc_precision,
+                data_id: from_id[2],
+                ..sentient::Operand::from(op3)
+            },
+            // `SentientBinaryOperator::or0` with `nullptr` for the logical result forwarding — the
+            // comment block at `:129-139` is why: *"tgtrf = src0 --> not allowed! we need OR with
+            // zero."*
+            binary_op: sentient::Binary::Plain(sentient::BinaryOp::Or),
+            result: sentient::ResultPorts {
+                forwarding: result_forwarding,
+                precision: result_precision,
+                unroll_incr: false,
+            },
+            // *"Bitwise operation so set compute precision to none."*
+            compute_precision: sentient::Precision::None,
+            fold_mode,
+            unroll_factor: sentient::UnrollFactor::X1,
+            dbg_name: op_dbg_name,
+        }));
+    }
+    emitted.push(FusedEmission { at, ops });
+
+    // `std::vector<mlir::Operation *> erased_list;
+    //  VectorOperand::eraseOperands(to_operands, rewriter, erased_list);`
+    let mut to_erase: Vec<OpId> = Vec::new();
+    erase_operands_recording(&analysis.to_operands, scope, &mut to_erase);
+    // `if (!is_dangling_ops_present_after_fusion) VectorOperand::eraseOperands(from_operands, …);`
+    // ⛔ ONE `erased_list` SPANS BOTH, which is what keeps an op reached from either side claimed
+    // once — the same reason [`cleanup`] shares its list across three phases.
+    if !analysis.is_dangling_ops_present_after_fusion {
+        let from_side: Vec<Option<VectorOperand>> = from_operands.into_iter().map(Some).collect();
+        erase_operands_recording(&from_side, scope, &mut to_erase);
+    }
+    to_erase.sort_unstable();
+    to_erase.dedup();
+
+    // `return success();`
+    NonComputeFusion {
+        emitted,
+        to_erase,
+        outcome: FusionOutcome::Fused,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 // 377/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -491,25 +990,52 @@ pub fn fuse_compute_ops<A: Arch>(unit: &dfir::ProgramUnit<A>, reuse_info: &Opera
 /// 304) is never read again.
 /// ⛔ IT EMITS NOTHING ITSELF — both of its statements are calls, and the rewrite is entry 364's.
 pub fn match_and_rewrite<A: Arch>(
-    send: &dataflow::Op,
+    send: &OpId,
     unit: &dfir::ProgramUnit<A>,
-    comp: DfirUnit,
-) {
-    // `:48-50` — `send_op.getSendData().getDefiningOp()`.
-    let dataflow::Op::Send { data, .. } = send else {
-        return;
+    comp: ComputeComp,
+    reuse_info: &mut OperandReuse,
+    is_visited: &mut BTreeMap<OpId, bool>,
+    values: &mut Values,
+) -> NonComputeFusion {
+    let scope: &[DfirOp] = &unit.body;
+    let nothing = NonComputeFusion {
+        emitted: Vec::new(),
+        to_erase: Vec::new(),
+        outcome: FusionOutcome::NotFused,
     };
-    let from = defining_op(*data, &unit.body);
 
-    // `:53-55` — `patternAgnosticFuseNonComputeOpsHelper`, whose first act is to ask entry 304 what
-    // the producer is at which precision.
-    todo!(
-        "e304_getOperandWithPrecision is unported, so e364_patternAgnosticFuseNonComputeOpsHelper \
-         cannot fuse the dataflow.send of {:?} on {:?} (producer {:?})",
-        data,
+    // `:48-50` — `send_op.getSendData().getDefiningOp()`. ⛔ A `getDefiningOp()` THAT ANSWERS NULL IS
+    // NOT A REFUSAL: entry 364's own gate takes `std::nullopt` as "nothing to fuse here".
+    let Some(DfirOp::Dataflow(dataflow::Op::Send { data, .. })) = op_at(send, scope) else {
+        return nothing;
+    };
+    let Some(producer) = defining_position(*data, scope) else {
+        return nothing;
+    };
+
+    // `:48-50` — `VectorOperand::getOperandWithPrecision(dcc_ext_ctx_, …, comp_,
+    // is_precision_converted)` at the declaration's `traverse_upwards = true` (entry 304).
+    let from = VectorOperand::with_precision::<A>(&producer, comp, true, scope, &mut |op, comp| {
+        VectorOperand::operand::<A>(op, comp, true, scope)
+    });
+
+    // `:53-55` — `patternAgnosticFuseNonComputeOpsHelper(send_op, from, rewriter,
+    // is_precision_converted_global)`, and `return success();` under it: a `failure()` propagates as
+    // itself, so the answer is handed straight back.
+    pattern_agnostic_fuse_non_compute_ops_helper::<A>(
+        send,
+        from.operand.as_ref(),
+        // ⛔ `this->unit_` AS A POSITION IS THE EMPTY PATH. The scope here IS the unit's body, so
+        // every position in it is inside the unit — which is the only question entry 341 asks of it,
+        // and a constant hoisted ABOVE the unit is not in this scope to be asked about at all.
+        &OpId::at(&[]),
         comp,
-        from
-    );
+        reuse_info,
+        is_visited,
+        from.precision_converted,
+        scope,
+        values,
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -648,13 +1174,19 @@ pub enum FoldModeAttr {
     Unsupported,
 }
 
-/// `getSentientFoldModeAttrForOperation(op, comp)` with `sen1p5_receive_from_pt` at its `false`
-/// default (`Utils.hpp`'s declaration), which is what every call in this file takes.
+/// `getSentientFoldModeAttrForOperation(op, comp, sen1p5_receive_from_pt)`
+/// (`dcc/src/Dialect/Sentient/Utils.cpp:427`) in full.
 ///
-/// ⛔ THE 24-BIT REMAP IS UNREACHABLE FROM HERE. `bitwidth = 24` only ever arrives through the
-/// `comp == PE && sen1p5_receive_from_pt && bitwidth == 16` rewrite (`:436`), so the `24 -> 32` arm
-/// below is the reference's dead-but-written code and is kept as such.
-pub(super) fn fold_mode_attr_for_operation(op: &DfirOp, comp: ComputeComp) -> FoldModeAttr {
+/// ⛔ THE THIRD ARGUMENT IS WHAT MAKES THE 24-BIT REMAP REACHABLE, and it has exactly one caller
+/// that passes `true`: entry 364 for a PE reading the PT FIFO on sen1p5 (`:198`, `:206`). Every other
+/// call takes the declaration's `false` default. ⛔ AND THE 16 -> 24 REWRITE RUNS **FIRST** (`:436`),
+/// so a 16-bit element on that path ends at 32 through the `24 -> 32` arm below — a 128-lane vector
+/// folds `fold_A` at 16 bits and is UNSUPPORTED at 32.
+pub(super) fn fold_mode_attr_for_operation(
+    op: &DfirOp,
+    comp: ComputeComp,
+    sen1p5_receive_from_pt: bool,
+) -> FoldModeAttr {
     // `if (is_any_of(comp, PE, SFP))`, whose `else` leaves `fold_mode` at `none`.
     if !matches!(comp, ComputeComp::Pe | ComputeComp::Sfp) {
         return FoldModeAttr::Absent;
@@ -664,8 +1196,14 @@ pub(super) fn fold_mode_attr_for_operation(op: &DfirOp, comp: ComputeComp) -> Fo
         return FoldModeAttr::Unsupported;
     };
     // `unsigned bitwidth = vector_type.value().getElementTypeBitWidth();` then
-    // `if (bitwidth == 80) bitwidth = 8; else if (bitwidth == 24) bitwidth = 32;`
+    // `if (comp == PE && sen1p5_receive_from_pt && bitwidth == 16) bitwidth = 24;` — ⛔ BEFORE the
+    // pair below, which is what turns it into 32.
     let bitwidth = match ty.elem.bits() {
+        16 if comp == ComputeComp::Pe && sen1p5_receive_from_pt => 24,
+        bits => bits,
+    };
+    // `if (bitwidth == 80) bitwidth = 8; else if (bitwidth == 24) bitwidth = 32;`
+    let bitwidth = match bitwidth {
         80 => 8,
         24 => 32,
         bits => bits,
@@ -726,8 +1264,9 @@ fn dummy_mac(
     } else {
         sentient::Precision::Fp16
     };
-    // `getSentientFoldModeAttrForOperation(op, comp)`
-    let fold_mode = match fold_mode_attr_for_operation(op, comp) {
+    // `getSentientFoldModeAttrForOperation(op, comp)` — the two-argument overload, i.e.
+    // `sen1p5_receive_from_pt` at its `false` default.
+    let fold_mode = match fold_mode_attr_for_operation(op, comp, false) {
         FoldModeAttr::Absent => None,
         FoldModeAttr::Present(mode) => Some(mode),
         FoldModeAttr::Unsupported => return None,
@@ -905,8 +1444,8 @@ pub fn lower_dangling_non_compute_ops_pesfp<A: Arch>(
 mod unit_tests {
     use super::{
         COMPUTE_OPS_PATTERNS, ComputeComp, ComputePattern, DanglingOutcome, FilledOpInfo,
-        LEGAL_DIALECTS, Legality, OpId, Unlowered, VectorOperand, cleanup, compute_ops_to_fuse,
-        fill_op_info, fuse_compute_ops, installed_pattern, legality,
+        FusionOutcome, InsertAt, LEGAL_DIALECTS, Legality, OpId, Unlowered, VectorOperand, cleanup,
+        compute_ops_to_fuse, fill_op_info, fuse_compute_ops, installed_pattern, legality,
         lower_dangling_non_compute_ops_pesfp, match_and_rewrite, non_compute_ops_to_fuse,
         run_on_operation,
     };
@@ -919,12 +1458,13 @@ mod unit_tests {
     use crate::islands::dataflow_ir::dialects::dataflow;
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
-    use crate::islands::dataflow_ir::link::{Link, Lxlu, Lxsu, Sfp};
+    use crate::islands::dataflow_ir::link::{Link, Lxlu, Lxsu, Pe, Sfp};
     use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, IntegerSet, Vector};
     use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units};
     use crate::islands::sentient::dialects::Op as SenOp;
     use crate::islands::sentient::dialects::sentient as sen;
     use crate::units::{Core, Corelet, DfirUnit, Residency};
+    use std::collections::BTreeMap;
 
     /// The vector every op in these fixtures is typed at.
     const V: Vector = Vector {
@@ -1327,30 +1867,134 @@ mod unit_tests {
         fuse_compute_ops(&unit_holding(vec![binary()]), &OperandReuse::default());
     }
 
-    /// 🎯 377/384 — THE PATTERN READS THE SEND'S PRODUCER. The unit holds a `dataflow.receive`
-    /// binding the value the send spends, so the producer this reaches is that receive — one of the
-    /// four ops `patternAgnosticFuseNonComputeOpsHelper` fuses (`:100-102`) — and the panic proves
-    /// the fusion was attempted rather than the send silently left in the IR.
+    /// 🎯 377/384 AND 364/384 — THE VENDOR'S OWN CASE, `opA-forwarding.mlir:73-74`: an `lxlu`
+    /// receive feeding a send to the `sfp` on a PE unit becomes ONE `sentient.vector_binary` OR-ing
+    /// `lx` with `zero` and forwarding `opA` to `sfp` (`:16-17` of the same file's expectations).
+    /// ⛔ THE RESULT FORWARDING IS EMPTY AND `opA`'S IS NOT — a LOGICAL fusion may not forward
+    /// src0/src2 through `tgtrf` (`:237`), so a non-register destination lands on **A**.
+    /// ⛔ AND `opBDataID` IS UNASSIGNED HERE. The vendor prints `6`, which entry 228 fills in after
+    /// both fusions (`VectorChainHelper.cpp:483-533`); this pass emits the `.td`'s -1.
     #[test]
-    #[should_panic(expected = "e304_getOperandWithPrecision")]
-    fn a_send_reaches_the_fusion_helper_with_its_producer() {
-        let (to, from) = Link::<Sfp, Lxsu>::between(Val(2), Val(3)).ends();
-        let unit = unit_holding(vec![
-            DfirOp::Dataflow(dataflow::Op::Receive {
-                result: Val(5),
-                from,
-                ty: V,
-            }),
-            DfirOp::Dataflow(dataflow::Op::Send {
-                to,
-                data: Val(5),
-                ty: V,
-            }),
-        ]);
-        let DfirOp::Dataflow(send) = &unit.body[1] else {
-            unreachable!()
+    fn a_receive_and_its_send_fuse_into_one_or_with_zero() {
+        const F16X64: Vector = Vector {
+            len: 64,
+            elem: ElemType::F16,
         };
-        match_and_rewrite(send, &unit, DfirUnit::Sfp);
+        let corelet0 = || Residency::Corelet {
+            core: Core::checked(0).expect("the arch has core 0"),
+            corelet: Corelet::checked(0).expect("the arch has corelet 0"),
+        };
+        let mut vals = Values::default();
+        let (lxlu, pe, sfp_unit, data) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+        // ⛔ BOTH ENDS NEED THEIR `get_unit` IN THE BODY: an operand is resolved by walking a link
+        // end back to the op that binds it, and `lx` comes from the SOURCE's kind, `sfp` from the
+        // DESTINATION's.
+        let (_, from) = Link::<Lxlu, Pe>::between(lxlu, pe).ends();
+        let (to, _) = Link::<Pe, Sfp>::between(pe, sfp_unit).ends();
+        let unit = ProgramUnit::<Target> {
+            on: Units::one(DfirUnit::Pe, pe),
+            precision: None,
+            body: vec![
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: lxlu,
+                    residency: corelet0(),
+                    unit: DfirUnit::Lxlu,
+                    num_folds: None,
+                }),
+                DfirOp::Dataflow(dataflow::Op::GetUnit {
+                    result: sfp_unit,
+                    residency: corelet0(),
+                    unit: DfirUnit::Sfp,
+                    num_folds: None,
+                }),
+                DfirOp::Dataflow(dataflow::Op::Receive {
+                    result: data,
+                    from,
+                    ty: F16X64,
+                }),
+                DfirOp::Dataflow(dataflow::Op::Send {
+                    to,
+                    data,
+                    ty: F16X64,
+                    dir: None,
+                }),
+            ],
+            arch: core::marker::PhantomData,
+        };
+
+        let mut reuse = OperandReuse::default();
+        let mut is_visited = BTreeMap::new();
+        let fusion = match_and_rewrite(
+            &OpId::at(&[3]),
+            &unit,
+            ComputeComp::Pe,
+            &mut reuse,
+            &mut is_visited,
+            &mut vals,
+        );
+
+        assert_eq!(fusion.outcome, FusionOutcome::Fused);
+        let [group] = fusion.emitted.as_slice() else {
+            panic!("one insertion point, not {:?}", fusion.emitted)
+        };
+        // ⛔ IN FRONT OF THE SEND, because no destination was `sfpring` — see [`InsertAt`].
+        assert_eq!(group.at, InsertAt::Before(OpId::at(&[3])));
+        let [mask_const, compute] = group.ops.as_slice() else {
+            panic!("a mask constant and one compute, not {:?}", group.ops)
+        };
+        let SenOp::Sentient(sen::Op::ScalarConstant {
+            value: 0,
+            result: mask,
+            ..
+        }) = mask_const
+        else {
+            panic!("a mask constant, not {mask_const:?}")
+        };
+        let SenOp::Sentient(sen::Op::VectorBinary {
+            mask: masked_by,
+            op_a,
+            op_b,
+            binary_op,
+            result,
+            compute_precision,
+            fold_mode,
+            ..
+        }) = compute
+        else {
+            panic!("a vector_binary, not {compute:?}")
+        };
+        assert_eq!(masked_by, mask);
+        assert_eq!(
+            op_a,
+            &sen::Operand {
+                forwarding: vec![sen::Port::Sfp],
+                precision: sen::Precision::Fp16,
+                data_id: Some(0),
+                ..sen::Operand::from(sen::Port::Lx)
+            }
+        );
+        assert_eq!(
+            op_b,
+            &sen::Operand {
+                precision: sen::Precision::Fp16,
+                ..sen::Operand::from(sen::Port::Zero)
+            }
+        );
+        assert!(result.forwarding.is_empty());
+        assert_eq!(
+            (binary_op, result.precision, *compute_precision, *fold_mode),
+            (
+                &sen::Binary::Plain(sen::BinaryOp::Or),
+                sen::Precision::Fp16,
+                // *"Bitwise operation so set compute precision to none."*
+                sen::Precision::None,
+                // 16 bits x 64 lanes = 1024, the `<= 1024` arm.
+                Some(sen::FoldMode::FoldA)
+            )
+        );
+        // ⛔ THE RECEIVE GOES TOO, and only because nothing dangles after the fusion (`:310`) — the
+        // send is its one user and the fused compute has taken its place.
+        assert_eq!(fusion.to_erase, vec![OpId::at(&[2]), OpId::at(&[3])]);
     }
 
     /// 🎯 378/384 — THE PASS CLAIMS THE SFP AND STOPS AT THE SHARED REUSE ANALYSIS. `redefine_constant_vectors`
@@ -1393,6 +2037,7 @@ mod unit_tests {
                 to,
                 data: Val(2),
                 ty: V,
+                dir: None,
             }),
         ];
         let at = |path: &[u32]| {
@@ -1549,7 +2194,12 @@ mod unit_tests {
                         from,
                         ty: V,
                     }),
-                    DfirOp::Dataflow(dataflow::Op::Send { to, data, ty: V }),
+                    DfirOp::Dataflow(dataflow::Op::Send {
+                        to,
+                        data,
+                        ty: V,
+                        dir: None,
+                    }),
                 ]
                 .into_iter()
                 .chain(extra)
@@ -1914,8 +2564,9 @@ pub fn fill_op_info<A: Arch>(
         set_send_dst,
         result_precision,
         compute_precision,
-        // `:1139` — `getSentientFoldModeAttrForOperation(op, comp)`.
-        fold_mode_attr: fold_mode_attr_for_operation(op, comp),
+        // `:1139` — `getSentientFoldModeAttrForOperation(op, comp)` at the declaration's
+        // `sen1p5_receive_from_pt = false`; only entry 364 passes `true`.
+        fold_mode_attr: fold_mode_attr_for_operation(op, comp, false),
         // `:1154` — `dataflow::getDbgNameAttr(op)`.
         op_dbg_name: dbg_name(op).map(str::to_owned),
     })
@@ -2092,8 +2743,17 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
 /// `VectorChainToSentientPESFP.cpp:1159` (80L): fuse one unit's sends and stores into the compute
 /// that produces the data they move.
 ///
-/// ⛔ THE THREE PATTERNS ALL FUNNEL INTO ENTRY 364, which is unported — so this driver names the op
-/// the fusion would have rewritten instead of emitting, exactly as [`fuse_compute_ops`] does.
+/// ⛔ THE THREE PATTERNS ALL FUNNEL INTO ENTRY 364, WHICH IS NOW PORTED
+/// ([`pattern_agnostic_fuse_non_compute_ops_helper`], and [`match_and_rewrite`] is `SendOpLowering`'s
+/// half of the funnel) — SO WHAT IS LEFT HERE IS THIS DRIVER'S OWN WIRING, not a missing rewrite.
+/// Three things it does not carry yet: `is_visited` must be ONE map spanning the legality queries and
+/// the rewrites, because `applyPartialConversion` interleaves them per op while
+/// [`non_compute_ops_to_fuse`] owns a map of its own and drops it; entry 364 writes through
+/// `reuse_info` and mints values, so the signature needs `&mut OperandReuse` and `&mut Values`; and
+/// its emission and `to_erase` are POSITIONS measured on the unrewritten body, so this driver must
+/// return them for a caller to splice rather than apply them to a `&` unit. The pass above is blocked
+/// before any of it — [`run_on_operation`] stops at entry 227 (`OperandReuse`), so the wiring arrives
+/// with the changeset that lands it.
 /// ⭐ `comp` IS THE CALLER'S. The reference reads it from `unit_op.getUnits()[0]`'s defining
 /// `dataflow.get_unit` under a `DT_CHECK` (`:1174-1177`); a [`dfir::ProgramUnit`] carries it.
 pub fn fuse_non_compute_ops<A: Arch>(
@@ -2107,8 +2767,9 @@ pub fn fuse_non_compute_ops<A: Arch>(
     // UNCHANGED — `applyPartialConversion` had nothing to legalize and returned `success()`.
     if let Some(first) = to_fuse.first() {
         todo!(
-            "e364_patternAgnosticFuseNonComputeOpsHelper is unported, so {} non-compute op(s) on \
-             {:?} cannot be fused (first {:?}, rest {:?}); reuse info at entry: {:?}",
+            "e366_fuseNonComputeOps is not wired to e364 yet — it needs one shared `is_visited`, a \
+             `&mut OperandReuse` and a `&mut Values`, so {} non-compute op(s) on {:?} cannot be \
+             fused (first {:?}, rest {:?}); reuse info at entry: {:?}",
             to_fuse.len(),
             comp,
             first,
@@ -2117,8 +2778,3 @@ pub fn fuse_non_compute_ops<A: Arch>(
         );
     }
 }
-
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e364_patternAgnosticFuseNonComputeOpsHelper

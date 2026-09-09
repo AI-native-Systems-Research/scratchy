@@ -2891,6 +2891,7 @@ mod unit_tests {
                 to: Link::<Lxlu, Sfp>::between(Val(30), Val(31)).ends().0,
                 data: Val(32),
                 ty: vector(),
+                dir: None,
             }),
             Op::Dataflow(dataflow::Op::Receive {
                 result: Val(35),

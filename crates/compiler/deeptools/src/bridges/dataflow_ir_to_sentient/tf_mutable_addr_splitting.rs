@@ -5600,7 +5600,10 @@ mod unit_tests {
             "one candidate: the LX view is not HBM, the symbol-started view is excluded, and the \
              `lxlu` unit is not walked"
         );
-        let MasSplit { candidate, dispatch } = &split[0];
+        let MasSplit {
+            candidate,
+            dispatch,
+        } = &split[0];
         assert_eq!(candidate.comp, DfirUnit::L3lu);
         assert_eq!(candidate.mem_index, MemoryOperandIndex::DirSrc);
         assert!(
@@ -10185,13 +10188,13 @@ pub fn run_on_operation<'p, A: Arch>(
             let mem_index = match mem_op {
                 // ⛔ A COMPOSITE'S SOURCE IS COMPARED, AND EVERYTHING ELSE IS THE DESTINATION:
                 // `comp_las.getSrcMemRef() == mem_view.getResult() ? kDirSrc : kDirDst`.
-                DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => Some(
-                    if transfer.src == *result {
+                DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
+                    Some(if transfer.src == *result {
                         MemoryOperandIndex::DirSrc
                     } else {
                         MemoryOperandIndex::DirDst
-                    },
-                ),
+                    })
+                }
                 // ⛔⛔ TWO `if`s AND NO `else` (`:262-267`) — an indirect transfer whose HBM view is
                 // one of its INDIRECT operands leaves `mem_index` at `kMax` and hits the check below.
                 DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
@@ -10222,9 +10225,9 @@ pub fn run_on_operation<'p, A: Arch>(
             // type of a vector transfer and from the memory operand's VIEW type for a composite — and
             // this view IS that operand, so its own `memref` is the composite's answer.
             let elem = match mem_op {
-                DfirOp::Agen(agen::Op::VectorLoad { ty, .. } | agen::Op::VectorStore { ty, .. }) => {
-                    ty.elem
-                }
+                DfirOp::Agen(
+                    agen::Op::VectorLoad { ty, .. } | agen::Op::VectorStore { ty, .. },
+                ) => ty.elem,
                 _ => view_ty.elem,
             };
             candidates.push((
@@ -10247,26 +10250,26 @@ pub fn run_on_operation<'p, A: Arch>(
         let dispatch = match transfer_format(elem) {
             None => MasDispatch::ElementFormatIsUnnamed(elem),
             Some(elem) => match candidate.op {
-                DfirOp::Agen(agen::Op::VectorLoad { .. }) => MasDispatch::VectorLoad(
-                    transform_vector_load::<A>(
+                DfirOp::Agen(agen::Op::VectorLoad { .. }) => {
+                    MasDispatch::VectorLoad(transform_vector_load::<A>(
                         vals,
                         &candidate,
                         elem,
                         correction,
                         &mut num_conditionals,
                         scope,
-                    ),
-                ),
-                DfirOp::Agen(agen::Op::VectorStore { .. }) => MasDispatch::VectorStore(
-                    transform_vector_store::<A>(
+                    ))
+                }
+                DfirOp::Agen(agen::Op::VectorStore { .. }) => {
+                    MasDispatch::VectorStore(transform_vector_store::<A>(
                         vals,
                         &candidate,
                         elem,
                         correction,
                         &mut num_conditionals,
                         scope,
-                    ),
-                ),
+                    ))
+                }
                 DfirOp::Agen(agen::Op::CompositeLoadAndStore(_)) => {
                     MasDispatch::CompLoadAndStore(transform_comp_load_and_store::<A>(
                         vals,

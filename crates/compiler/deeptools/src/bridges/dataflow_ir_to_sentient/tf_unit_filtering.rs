@@ -691,6 +691,7 @@ mod unit_tests {
                 to: send_end,
                 data: Val(20),
                 ty: LANES,
+                dir: None,
             }),
             DfirOp::Dataflow(dataflow::Op::Receive {
                 result: Val(21),

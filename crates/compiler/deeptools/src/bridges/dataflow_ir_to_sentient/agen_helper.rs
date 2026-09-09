@@ -119,12 +119,12 @@
 
 use super::agen_access_details::{
     AccessContainer, AccessDetailsAffine, AccessDetailsAffineComposite, AccessDetailsSymbolic,
-    ConstructedDetails, IndicesCoeffDict, MemoryOperandIndex, TimeBound, TimeDim, TimeStepsInfo,
-    construct_iterator_coeff_dict, construct_time_steps_info,
+    ConstructedDetails, ConstructedSymbolicDetails, IndicesCoeffDict, MemoryOperandIndex,
+    TimeBound, TimeDim, TimeStepsInfo, construct_iterator_coeff_dict, construct_time_steps_info,
 };
 use super::agen_agen_to_sentient::{
-    AddressAdvance, CarriedFromEnd, LoopBodyOp, StrideStep, TransferSpecialisation,
-    insert_copy_and_add_stmts_helper,
+    AddressAdvance, CarriedFromEnd, LoopBodyOp, OutermostCompLoop, StrideStep,
+    TransferSpecialisation, insert_copy_and_add_stmts_helper,
 };
 use super::std_standard_to_sentient::lower_constant_index_to_sentient;
 use super::tf_transform_paged_mem_view_impl::{binding_path, ops_at_mut};
@@ -136,7 +136,7 @@ use crate::islands::dataflow_ir::dialects::{
     self as dfir_op, Index, Op as DfirOp, Val, affine, agen, arith, dataflow, defining_op,
     replace_all_uses, results, scf, uniform, uses, vectorchain as vc,
 };
-use crate::islands::dataflow_ir::link::SendEnd;
+use crate::islands::dataflow_ir::link::{RecvEnd, SendEnd};
 use crate::islands::dataflow_ir::ty::{
     AffineMap, FlatConstraints, GenericComp, IntegerSet, MemRef, ScalarTy, Vector,
 };
@@ -1872,6 +1872,7 @@ mod unit_tests {
                     to,
                     data: loaded,
                     ty: LANES,
+                    dir: None,
                 }),
             ],
         })
@@ -2041,6 +2042,7 @@ mod unit_tests {
                 to: to_pt,
                 data: Val(31),
                 ty: LANES,
+                dir: None,
             }),
         ];
         assert!(matches!(
@@ -2118,6 +2120,7 @@ mod unit_tests {
                 to: to_pt,
                 data: Val(41),
                 ty: LANES,
+                dir: None,
             }),
         ];
         let found = load_consumer(AgenLoad::Vector { result: Val(31) }, &through);
@@ -2187,6 +2190,7 @@ mod unit_tests {
                 to: to_pt,
                 data: Val(31),
                 ty: LANES,
+                dir: None,
             }),
         ];
         let found = load_consumer(AgenLoad::Vector { result: Val(31) }, &program);
@@ -2734,6 +2738,7 @@ mod unit_tests {
                 to,
                 data: Val(31),
                 ty: LANES,
+                dir: None,
             }),
         ];
         assert_eq!(
@@ -2749,6 +2754,7 @@ mod unit_tests {
                 to,
                 data: Val(31),
                 ty: LANES,
+                dir: None,
             }),
         ];
         assert_eq!(
@@ -2764,6 +2770,7 @@ mod unit_tests {
                     to,
                     data: Val(31),
                     ty: LANES,
+                    dir: None,
                 }),
                 &pattern
             ),
@@ -2855,6 +2862,7 @@ mod unit_tests {
                 to,
                 data: Val(41),
                 ty: LANES,
+                dir: None,
             }),
         ];
 
@@ -2877,6 +2885,7 @@ mod unit_tests {
                 to,
                 data: Val(31),
                 ty: LANES,
+                dir: None,
             }),
         ];
         let mut only_the_send = Vec::new();
@@ -2911,6 +2920,7 @@ mod unit_tests {
                 to,
                 data: Val(31),
                 ty: LANES,
+                dir: None,
             }),
             DfirOp::Agen(agen::Op::Yield),
         ];
@@ -3485,7 +3495,7 @@ mod unit_tests {
             consumer: Link::<LxluUnit, L0suUnit>::between(Val(4), Val(5)).ends().0,
             result: Val(6),
             extent,
-            interleaved_group: 0,
+            interleaved_group: Elements(0),
             rotate_val: None,
             dir: None,
             shuffle_mode: sen::ShuffleMode::NoShuffle,
@@ -3564,6 +3574,9 @@ mod unit_tests {
     impl AccessRecord for Record {
         fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
             &self.dict
+        }
+        fn set_mem_view_start_addr(&mut self, mem_view_start_addr: Val) {
+            self.start_addr = Some(mem_view_start_addr);
         }
     }
 
@@ -3891,6 +3904,7 @@ mod unit_tests {
                 &addrs(),
                 &addrs(),
                 &[],
+                &mut Vec::new(),
                 &mut values,
             ),
             VectorLoadHelper::AccessDetailsDiffer
@@ -4827,34 +4841,99 @@ mod unit_tests {
 
     // ─────────────────────────────── 314/384 ───────────────────────────────
 
-    /// 🎯 314/384 — A LOAD WITH NOTHING STORING ITS RESULT IS A LOAD-AND-SEND, and ⛔ THAT STATEMENT
-    /// IS ENTRY 358, unported — so entry 217's single-access arm is where the reachable half ends.
+    /// 🎯 314/384 — A LOAD WITH NOTHING STORING ITS RESULT IS A LOAD-AND-SEND, and ⛔ THE LOAD IS
+    /// DELETED LAST: entry 270's consumer chain goes on the list first (`:2917`), the load after it
+    /// (`:2949`).
+    ///
+    /// ⛔ THE SEND IS PART OF THE INPUT, NOT OF THE PATTERN THIS ENTRY MATCHES. Entry 033 needs the
+    /// load's result to have exactly ONE use and that use to be a `dataflow.send` whose `to` resolves
+    /// to a `get_unit`, or entry 358 refuses with [`LoadAndSendStmt::ConsumerNotExtracted`] — a load
+    /// nothing reads is not a load-and-send, it is a load with no consumer.
     #[test]
-    #[should_panic(expected = "e358_constructLoadAndSendStmt")]
-    fn a_lone_vector_load_reaches_the_load_and_send_gap() {
-        let unit = unit_holding(DfirUnit::Lxlu, extract_load_body()[..4].to_vec());
+    fn a_lone_vector_load_becomes_a_load_and_send_and_is_deleted_last() {
+        let (to_pt, _) = Link::<LxluUnit, PtRowUnit<0>>::between(LXLU, PT).ends();
+        let mut body = extract_load_body()[..4].to_vec();
+        body.push(DfirOp::Dataflow(dataflow::Op::GetUnit {
+            result: PT,
+            residency: at_corelet_zero(),
+            unit: DfirUnit::PtRow(Row::checked(0).expect("row 0 exists")),
+            num_folds: None,
+        }));
+        body.push(DfirOp::Dataflow(dataflow::Op::Send {
+            to: to_pt,
+            data: Val(63),
+            ty: LANES,
+            dir: Some(agen::RoutingDirection::Clockwise),
+        }));
+        let unit = unit_holding(DfirUnit::Lxlu, body);
         let mut marked = Marked::at([]);
         let mut values = Values::default();
-        let _ = lower_vector_load_op(
+        let mut emitted = Vec::new();
+        let lowered = lower_vector_load_op(
             &unit.body[3],
             3,
             &unit,
             DfirUnit::Lxlu,
             &mut marked,
+            &mut emitted,
             &mut values,
+        );
+        let VectorLoadLowering::Helper(VectorLoadHelper::Sent { to_be_deleted, .. }) = lowered
+        else {
+            panic!("a load with no store is a load_and_send, got {lowered:?}");
+        };
+        assert_eq!(
+            to_be_deleted,
+            [&unit.body[5], &unit.body[3]],
+            "the send goes on the list first and the load is the last thing it takes"
+        );
+        assert!(
+            emitted.iter().any(|op| matches!(
+                op,
+                SenOp::Sentient(sen::Op::LoadAndSend {
+                    consumer,
+                    dir: Some(sen::RoutingDirection::Clockwise),
+                    ..
+                }) if *consumer == to_pt
+            )),
+            "entry 358 appended the transfer, routed the way the SEND said, got {emitted:?}"
         );
     }
 
     // ─────────────────────────────── 315/384 ───────────────────────────────
 
-    /// 🎯 315/384 — ⛔ THE STORE'S STATEMENT IS ENTRY 359, unported, and the element type the reference
-    /// reads for it comes off the candidate's OWN memref rather than off the record.
+    /// 🎯 315/384 — ⛔ THE DELETE LIST IS THE STORE **THEN** WHAT FED IT (`:3099-3101`), which is the
+    /// opposite order from the load side, and the element type the reference reads off the candidate's
+    /// own memref is dead in entry 359.
     #[test]
-    #[should_panic(expected = "e359_constructReceiveAndStoreStmt")]
-    fn a_vector_store_reaches_the_receive_and_store_gap() {
+    fn a_vector_store_becomes_a_receive_and_store_and_deletes_its_input_after_itself() {
         let scope = extract_store_body();
         let mut marked = Marked::at([]);
-        let _ = lower_vector_store_op(&scope[5], 5, DfirUnit::Lxlu, &mut marked, &scope);
+        let mut values = Values::default();
+        let mut emitted = Vec::new();
+        let lowered = lower_vector_store_op::<Dd2>(
+            &scope[5],
+            5,
+            DfirUnit::Lxlu,
+            &mut marked,
+            &scope,
+            &mut emitted,
+            &mut values,
+        );
+        let VectorStoreLowering::Stored { to_be_deleted, .. } = lowered else {
+            panic!("the vendor's own store must lower, got {lowered:?}");
+        };
+        assert_eq!(
+            to_be_deleted.first(),
+            Some(&&scope[5]),
+            "the store is pushed before its input chain"
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|op| matches!(op, SenOp::Sentient(sen::Op::ReceiveAndStore { .. }))),
+            "entry 359 appended the transfer, got {emitted:?}"
+        );
     }
 
     // ─────────────────────────────── 316/384 ───────────────────────────────
@@ -4866,7 +4945,7 @@ mod unit_tests {
         let body = extract_load_body();
         let mut marked = Marked::at([]);
         assert_eq!(
-            lower_indirect_vector_load_op(
+            lower_indirect_vector_load_op::<Dd2>(
                 &body[7],
                 0,
                 DfirUnit::Lxsu,
@@ -4874,12 +4953,14 @@ mod unit_tests {
                 &ExtractScalarOps::default(),
                 &mut marked,
                 &[],
+                &mut Vec::new(),
+                &mut Values::default(),
             ),
             IndirectVectorLoadLowering::OnlySupportedInLxlu
         );
         assert!(
             matches!(
-                lower_indirect_vector_load_op(
+                lower_indirect_vector_load_op::<Dd2>(
                     &body[7],
                     0,
                     DfirUnit::Lxlu,
@@ -4887,6 +4968,8 @@ mod unit_tests {
                     &ExtractScalarOps::default(),
                     &mut marked,
                     &[],
+                    &mut Vec::new(),
+                    &mut Values::default(),
                 ),
                 IndirectVectorLoadLowering::DetailsFailed(_)
             ),
@@ -4903,7 +4986,7 @@ mod unit_tests {
         let body = extract_store_body();
         let mut marked = Marked::at([]);
         assert_eq!(
-            lower_indirect_vector_store_op(
+            lower_indirect_vector_store_op::<Dd2>(
                 &body[6],
                 0,
                 DfirUnit::Lxlu,
@@ -4911,12 +4994,14 @@ mod unit_tests {
                 &ExtractScalarOps::default(),
                 &mut marked,
                 &[],
+                &mut Vec::new(),
+                &mut Values::default(),
             ),
             IndirectVectorStoreLowering::OnlySupportedInLxsu
         );
         assert!(
             matches!(
-                lower_indirect_vector_store_op(
+                lower_indirect_vector_store_op::<Dd2>(
                     &body[6],
                     0,
                     DfirUnit::Lxsu,
@@ -4924,6 +5009,8 @@ mod unit_tests {
                     &ExtractScalarOps::default(),
                     &mut marked,
                     &[],
+                    &mut Vec::new(),
+                    &mut Values::default(),
                 ),
                 IndirectVectorStoreLowering::DetailsFailed(_)
             ),
@@ -5065,6 +5152,7 @@ mod unit_tests {
                 to: SendEnd::to_self(Val(93)),
                 data: Val(92),
                 ty: LANES,
+                dir: None,
             }),
         ];
         let unit = unit_holding(DfirUnit::Lxlu, body);
@@ -5592,6 +5680,116 @@ mod unit_tests {
                 &mut values,
             ),
             CompositeLowering::WrongOpClass
+        );
+    }
+
+    // ─────────────────────────────── 357/384 ───────────────────────────────
+
+    /// ⛔ THE ADDRESS REGISTER **IS** THE LOOP'S OWN SEAT: initialised to the view start plus the
+    /// constant offset immediately before the nest, advanced by the iterator's coefficient at the end
+    /// of every trip, and entry 264's placeholder zero gone with the initialiser it fed — the shape
+    /// `dcc/test/Conversion/AgenToSentient/lx_indirect_loads_stores_composite.mlir:41-47` carries.
+    #[test]
+    fn one_iterator_turns_a_view_start_into_an_initialised_and_advanced_seat() {
+        let mut values = Values::default();
+        let start = values.mint();
+        let iv = values.mint();
+        let mut scope = vec![
+            DfirOp::Arith(arith::Op::Constant {
+                result: start,
+                value: 100,
+            }),
+            DfirOp::Affine(affine::Op::For {
+                iv,
+                lo: affine::Bound::Const(0),
+                hi: affine::Bound::Const(8),
+                carried: Vec::new(),
+                body: vec![DfirOp::Affine(affine::Op::Yield {
+                    operands: Vec::new(),
+                })],
+                dbg_name: None,
+            }),
+        ];
+        let mut access_details = AccessContainer::default();
+        access_details
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("a fresh container has every slot empty")
+            .fill(record(MemoryOperandIndex::DirSrc, start.0));
+        let mut mutable_addrs_base = AccessContainer::default();
+        mutable_addrs_base
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("a fresh container has every slot empty")
+            .fill(start);
+        let mut mutable_addrs = AccessContainer::default();
+        mutable_addrs
+            .vacancy(MemoryOperandIndex::DirSrc)
+            .expect("a fresh container has every slot empty")
+            .fill(start);
+        let coefficients = GatheredCoefficients {
+            per_index: vec![(iv, vec![4])],
+            constant: vec![16],
+        };
+
+        assert_eq!(
+            generate_affine_address_manipulation_stmts(
+                DfirUnit::Lxlu,
+                &mut access_details,
+                &mut mutable_addrs_base,
+                &mut mutable_addrs,
+                &coefficients,
+                &mut scope,
+                &mut values,
+            ),
+            AddressManipulation::Manipulated
+        );
+
+        let [
+            DfirOp::Arith(arith::Op::Constant { value: 100, .. }),
+            DfirOp::Arith(arith::Op::Constant {
+                result: offset,
+                value: 16,
+            }),
+            DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: initial,
+                lhs,
+                rhs,
+                ..
+            })),
+            DfirOp::Affine(affine::Op::For { carried, body, .. }),
+        ] = scope.as_slice()
+        else {
+            panic!("the initialisation stands before the grown loop: {scope:?}");
+        };
+        assert_eq!(
+            (*lhs, *rhs),
+            (start, *offset),
+            "the view start plus the constant offset"
+        );
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            carried[0].init, *initial,
+            "the seat starts at the sum, and entry 264's zero went with it"
+        );
+        assert!(
+            matches!(
+                (&body[0], &body[1], &body[2]),
+                (
+                    DfirOp::Arith(arith::Op::Constant {
+                        result: step,
+                        value: 4,
+                    }),
+                    DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                        result, lhs, rhs, ..
+                    })),
+                    DfirOp::Affine(affine::Op::Yield { operands }),
+                ) if *lhs == carried[0].arg && rhs == step && operands.as_slice() == [*result]
+            ),
+            "the seat advances by the iterator's coefficient: {body:?}"
+        );
+        assert_eq!(
+            mutable_addrs.get(MemoryOperandIndex::DirSrc),
+            Some(&carried[0].arg),
+            "the address the rest of the lowering reads is the argument, not the sum"
         );
     }
 }
@@ -7074,6 +7272,10 @@ pub trait AddressedAccess {
 pub trait AccessRecord: AddressedAccess {
     /// `getIndicesCoeffDict()`.
     fn indices_coeff_dict(&self) -> &IndicesCoeffDict;
+
+    /// `setMemViewStartAddr(..)` — entry 357's `access_details[val].setMemViewStartAddr(..)`
+    /// (`Helper.cpp:901`), the one write this trait makes.
+    fn set_mem_view_start_addr(&mut self, mem_view_start_addr: Val);
 }
 
 impl AddressedAccess for AccessDetailsAffine<'_> {
@@ -7089,6 +7291,9 @@ impl AccessRecord for AccessDetailsAffine<'_> {
     fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
         &self.indices_coeff_dict
     }
+    fn set_mem_view_start_addr(&mut self, mem_view_start_addr: Val) {
+        self.base.set_mem_view_start_addr(mem_view_start_addr);
+    }
 }
 
 impl AddressedAccess for AccessDetailsAffineComposite<'_> {
@@ -7103,6 +7308,11 @@ impl AddressedAccess for AccessDetailsAffineComposite<'_> {
 impl AccessRecord for AccessDetailsAffineComposite<'_> {
     fn indices_coeff_dict(&self) -> &IndicesCoeffDict {
         &self.affine.indices_coeff_dict
+    }
+    fn set_mem_view_start_addr(&mut self, mem_view_start_addr: Val) {
+        self.affine
+            .base
+            .set_mem_view_start_addr(mem_view_start_addr);
     }
 }
 
@@ -7239,7 +7449,18 @@ pub fn gather_affine_load_store_details<T: AccessRecord>(
         }
     }
 
-    // `generateAffineAddressManipulationStmts(...)` (`:597-603`) — entry 357/384, unported.
+    // `generateAffineAddressManipulationStmts(...)` (`:597-603`) — entry 357/384, ported in full as
+    // [`generate_affine_address_manipulation_stmts`] and NOT REACHABLE FROM HERE.
+    //
+    // ⛔ THE SEAM IS THE BODY, NOT THE FUNCTION. Entry 357 replaces every indexing loop with a clone
+    // carrying one more `iter_arg` and mints the values for it, so it takes `&mut Vec<DfirOp>` and
+    // `&mut Values`; this entry can hand it neither. Its two callers
+    // ([`construct_affine_details_and_addrs`] and [`construct_affine_comp_details_and_addrs`]) are
+    // reached from ten lowerings that hold `unit: &'a ProgramUnit<A>`, derive their scope as
+    // `unit.body.as_slice()`, keep `&'a agen::Op` inside the access records, and return types that
+    // borrow `unit.body` — the seam entries 374 and 375 name and [`lower_symbolic_vector_load_op`]
+    // documents. Handing the body down belongs to the pass that owns it, not to a leaf of the
+    // lowering, and doing it here would regress ten audited entries to a `todo!` to reach one.
     //
     // ⛔ THE GATE IS THE SET OF INPUTS ON WHICH IT PROVABLY WRITES NOTHING, and there are two. With no
     // access details its `DT_CHECK` on the three sizes holds trivially (`:631-632`), the coefficient
@@ -7259,9 +7480,11 @@ pub fn gather_affine_load_store_details<T: AccessRecord>(
                 .all(|init_value| *init_value == 0));
     if !writes_nothing {
         todo!(
-            "e357_generateAffineAddressManipulationStmts not ported: {} access record(s) need their \
-             mutable address registers assigned and advanced across the loop nest \
-             (`Helper.cpp:625`)",
+            "e357_generateAffineAddressManipulationStmts is ported as \
+             generate_affine_address_manipulation_stmts but cannot be reached from here: {} access \
+             record(s) need their mutable address registers assigned and advanced across the loop \
+             nest (`Helper.cpp:625`), which rewrites the unit's body — the `&mut Vec<DfirOp>` this \
+             entry's callers cannot hand down",
             records.len()
         );
     }
@@ -7349,9 +7572,13 @@ pub fn construct_immutable_address<T: AddressedAccess>(
 /// gathers, so the second read takes the store out of `kDirDst` rather than trusting the first.
 /// ⛔ `has(kDirDst)` IS THE PATTERN TEST AFTER THE FACT — a load with no store reaches
 /// `lowerVectorLoadHelper` with a null `store_op`, which is the plain-load half of that helper.
-/// ⛔ THE RETURN TYPE IS `!` BECAUSE NO OUTCOME EXISTS YET. `LogicalResult` has no counterpart here
-/// (the crate forbids `Result`) and the statement count its caller advances by cannot be answered
-/// before entry 360 says whether the store came with it. It becomes a real type with 360.
+/// ⛔ THE RETURN TYPE IS STILL `!`, AND ENTRY 360 IS NO LONGER THE REASON.
+/// [`construct_symbolic_details_and_addrs`] is ported and sits below; what this function cannot reach
+/// is its OWN caller's seam. Entry 360 takes `scope: &mut Vec<DfirOp>` because entry 327 REPLACES the
+/// enclosing loops with clones carrying one extra `iter_arg` each, and it mints values — but
+/// [`super::agen_agen_to_sentient::fuse_load_or_store_chain_ops`] is handed `unit: &ProgramUnit<A>`
+/// and no [`Values`], because [`super::body`] walks `&unit.body[i..]` immutably. Giving the walk a
+/// mutable body and the minter is entries 382/384's shape, not this one's.
 pub fn lower_symbolic_vector_load_op<A: Arch>(
     op: &DfirOp,
     unit: &ProgramUnit<A>,
@@ -7365,8 +7592,9 @@ pub fn lower_symbolic_vector_load_op<A: Arch>(
     // below reads one of them: `:3393-3394` takes the candidate out of `kDirSrc`, `:3399` asks
     // `has(kDirDst)`, and `:3405-3407` hands all three to entry 217.
     todo!(
-        "e360_constructSymbolicDetailsAndAddrs is unported, so e217_lowerVectorLoadHelper cannot \
-         lower the agen.symbolic_vector_load on {:?} of {:?} (store {:?})",
+        "e360_constructSymbolicDetailsAndAddrs mutates the DataflowIR body it gathers over and mints \
+         values, and AgenToSentient's walk hands this seam neither, so e217_lowerVectorLoadHelper \
+         cannot lower the agen.symbolic_vector_load on {:?} of {:?} (store {:?})",
         comp,
         unit.on.kind(),
         store_op
@@ -7391,15 +7619,15 @@ pub fn lower_symbolic_vector_load_op<A: Arch>(
 /// (`AccessDetails.cpp:879-880`).
 /// ⛔ AND THE DELETE LIST GETS TWO THINGS: the store itself (`:3436`) and, through entry 270, the op
 /// that produced the value it stored (`:3438-3439`).
-/// ⛔ `!` FOR THE SAME REASON AS ENTRY 374 — see its note.
+/// ⛔ `!` FOR THE SAME REASON AS ENTRY 374 — its note names the seam, and it is not entry 360.
 pub fn lower_symbolic_vector_store_op<A: Arch>(unit: &ProgramUnit<A>, comp: DfirUnit) -> ! {
     // `:3413-3418` — `constructSymbolicDetailsAndAddrs(op, nullptr, ...)`. The single record it
     // gathers is the only route to `access_details[0]`, `mutable_addrs[0]` and `immutable_addrs[0]`,
     // which are exactly the three arguments entry 028 needs at `:3428-3431`.
     todo!(
-        "e360_constructSymbolicDetailsAndAddrs is unported, so e028_constructReceiveAndStoreStmt \
-         cannot lower the agen.symbolic_vector_store on {:?} of {:?} (e270_addStoreInputToDeleteList \
-         is unported too)",
+        "e360_constructSymbolicDetailsAndAddrs mutates the DataflowIR body it gathers over and mints \
+         values, and AgenToSentient's walk hands this seam neither, so e359_constructReceiveAndStoreStmt \
+         cannot lower the agen.symbolic_vector_store on {:?} of {:?}",
         comp,
         unit.on.kind()
     );
@@ -7871,6 +8099,18 @@ pub enum VectorLoadHelper<'a> {
     /// `emitError("Unable to generate load_and_store statement for the agen.vector_load operation")`
     /// (`:2941-2944`) — ⭐ CARRYING WHICH OF ENTRY 268's CHECKS REFUSED, including its non-L3 gate.
     UnableToGenerateLoadAndStore(LoadAndStoreStmt),
+    /// The no-store arm: entry 358's `sentient.load_and_send`, and `to_be_deleted` — the load's whole
+    /// consumer chain (`:2917`) and then the load itself (`:2949`).
+    Sent {
+        /// Entry 358's hoisted constants and the value the transfer binds.
+        stmt: Box<ConstructedLoadAndSend>,
+        /// `to_be_deleted`, in push order. ⭐ NOT A FIXED WIDTH like the pair arm's: the chain is as
+        /// long as the load's uses are.
+        to_be_deleted: Vec<&'a DfirOp>,
+    },
+    /// `emitError("Unable to generate load_and_send statement for the agen.vector_load operation")`
+    /// (`:2912-2915`).
+    UnableToGenerateLoadAndSend(LoadAndSendStmt),
     /// `DT_CHECK_MSG(.. == 1, "single access info needed")` — a load with no store came with more
     /// than one record.
     SingleAccessInfoNeeded,
@@ -7890,7 +8130,7 @@ pub enum VectorLoadHelper<'a> {
 /// `sentient.load_and_send`; present, two records must AGREE on all four extents before they become
 /// one `sentient.load_and_store`.
 /// ⛔ THE DELETE LIST IS NOT A PARAMETER because the reference fills it only after the emission
-/// succeeded (`:2945-2947`), which is behind both `todo!`s.
+/// succeeded (`:2945-2947`); each arm returns its own, and the load is last on both (`:2949`).
 pub fn lower_vector_load_helper<'a, A: Arch, T: HasTransferMemory>(
     load: TransferOp<'a>,
     store_op: Option<&'a DfirOp>,
@@ -7898,24 +8138,50 @@ pub fn lower_vector_load_helper<'a, A: Arch, T: HasTransferMemory>(
     access_details: &AccessContainer<T>,
     mutable_addrs: &AccessContainer<Val>,
     immutable_addrs: &AccessContainer<Val>,
-    scope: &[DfirOp],
+    scope: &'a [DfirOp],
+    emitted: &mut Vec<SenOp>,
     values: &mut Values,
 ) -> VectorLoadHelper<'a> {
     let Some(store_op) = store_op else {
         // `:2906-2909`.
+        let (Some(access), Some(&mutable_addr), Some(&immutable_addr)) = (
+            access_details.get_first(),
+            mutable_addrs.get_first(),
+            immutable_addrs.get_first(),
+        ) else {
+            return VectorLoadHelper::SingleAccessInfoNeeded;
+        };
         if access_details.entries().len() != 1
             || mutable_addrs.entries().len() != 1
             || immutable_addrs.entries().len() != 1
         {
             return VectorLoadHelper::SingleAccessInfoNeeded;
         }
-        // `:2910-2917`.
-        todo!(
-            "e358_constructLoadAndSendStmt is unported, so {:?} on {:?} cannot become a \
-             sentient.load_and_send",
+        // `:2910-2915` — entry 358 with all five trailing arguments defaulted (`:2910`).
+        let stmt = match construct_load_and_send_stmt::<A, T>(
             load.op,
-            unit.on.kind()
-        );
+            unit.on.kind(),
+            access,
+            mutable_addr,
+            immutable_addr,
+            TransferSpecialisation::UNSPECIALISED,
+            scope,
+            emitted,
+            values,
+        ) {
+            LoadAndSendStmt::Constructed(stmt) => stmt,
+            refused => return VectorLoadHelper::UnableToGenerateLoadAndSend(refused),
+        };
+        // `:2917` then `:2949` — the chain, consumer-first, and the load last.
+        let mut to_be_deleted = Vec::new();
+        if let Some(agen_load) = AgenLoad::of(load.op) {
+            add_load_chain_to_delete_list(agen_load.consumer_root(), scope, &mut to_be_deleted);
+        }
+        to_be_deleted.push(load.op);
+        return VectorLoadHelper::Sent {
+            stmt,
+            to_be_deleted,
+        };
     };
 
     // `:2919-2921`.
@@ -8778,6 +9044,8 @@ pub trait HasTransferMemory: HasTransferShape {
     fn memory(&self) -> Option<Val>;
     /// `getShuffleMode()`.
     fn shuffle_mode(&self) -> sen::ShuffleMode;
+    /// `getRotationPosition()` — `Elements(0)` is *no rotation*, which is `$rotate_val` absent.
+    fn rotation_position(&self) -> Elements;
 }
 
 impl HasTransferMemory for AccessDetailsAffine<'_> {
@@ -8786,6 +9054,9 @@ impl HasTransferMemory for AccessDetailsAffine<'_> {
     }
     fn shuffle_mode(&self) -> sen::ShuffleMode {
         self.base.shuffle_mode
+    }
+    fn rotation_position(&self) -> Elements {
+        self.base.rotation_position
     }
 }
 
@@ -8796,6 +9067,9 @@ impl HasTransferMemory for AccessDetailsAffineComposite<'_> {
     fn shuffle_mode(&self) -> sen::ShuffleMode {
         self.affine.shuffle_mode()
     }
+    fn rotation_position(&self) -> Elements {
+        self.affine.rotation_position()
+    }
 }
 
 impl HasTransferMemory for AccessDetailsSymbolic<'_> {
@@ -8804,6 +9078,9 @@ impl HasTransferMemory for AccessDetailsSymbolic<'_> {
     }
     fn shuffle_mode(&self) -> sen::ShuffleMode {
         self.base.shuffle_mode
+    }
+    fn rotation_position(&self) -> Elements {
+        self.base.rotation_position
     }
 }
 
@@ -9806,6 +10083,7 @@ pub fn lower_vector_load_op<'a, A: Arch>(
     unit: &'a ProgramUnit<A>,
     comp: DfirUnit,
     marked: &mut Marked,
+    emitted: &mut Vec<SenOp>,
     values: &mut Values,
 ) -> VectorLoadLowering<'a> {
     let scope = unit.body.as_slice();
@@ -9853,6 +10131,7 @@ pub fn lower_vector_load_op<'a, A: Arch>(
         &mutable_addrs,
         &immutable_addrs,
         scope,
+        emitted,
         values,
     ))
 }
@@ -9861,11 +10140,21 @@ pub fn lower_vector_load_op<'a, A: Arch>(
 // 315/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE OUTCOME OF [`lower_vector_store_op`] — every arm a refusal, because the statement it exists to
-/// build is entry 359 and that is unported.
+/// THE OUTCOME OF [`lower_vector_store_op`] — the statement entry 359 built, or which check refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
-pub enum VectorStoreLowering {
+pub enum VectorStoreLowering<'a> {
+    /// The `sentient.receive_and_store`, and `to_be_deleted` — the store (`:3098`) then the op behind
+    /// its stored value and, for a shuffle, that op's own producer (`:3101`, entry 270).
+    Stored {
+        /// Entry 359's hoisted constants and the value the transfer binds.
+        stmt: Box<ConstructedReceiveAndStore>,
+        /// `to_be_deleted`, in push order.
+        to_be_deleted: Vec<&'a DfirOp>,
+    },
+    /// `emitError("Unable to generate receive_and_store statement for the agen.vector_store
+    /// operation")` (`:3094-3097`).
+    UnableToGenerateReceiveAndStore(ReceiveAndStoreStmt),
     /// The operation this was called over is not an `agen.vector_store`.
     NotAVectorStore,
     /// Entry 298 refused.
@@ -9878,16 +10167,19 @@ pub enum VectorStoreLowering {
 
 /// Replaces: e315_lowerVectorStoreOp
 ///
-/// The element type comes off the candidate's OWN memref, not off the record. ⛔ THE STATEMENT AND
-/// BOTH DELETES ARE BEHIND `e359_constructReceiveAndStoreStmt`, which is unported — the candidate and
-/// the input chain behind its stored value are what the reference queues once the statement is built.
-pub fn lower_vector_store_op(
+/// ⛔ `element_type` IS READ OFF THE CANDIDATE'S OWN MEMREF (`:3088`) AND ENTRY 359 NEVER LOOKS AT IT
+/// (`:2027`), so there is nothing here to compute it for.
+/// ⛔ AND THE STORE IS RE-FOUND BEFORE IT IS LOWERED (`:3086`): entry 298 may have cloned the loops
+/// around it, so the record's op and the op the statement is built from are not the same pointer.
+pub fn lower_vector_store_op<'a, A: Arch>(
     op: &DfirOp,
     position: usize,
     comp: DfirUnit,
     marked: &mut Marked,
-    scope: &[DfirOp],
-) -> VectorStoreLowering {
+    scope: &'a [DfirOp],
+    emitted: &mut Vec<SenOp>,
+    values: &mut Values,
+) -> VectorStoreLowering<'a> {
     let DfirOp::Agen(src_op) = op else {
         return VectorStoreLowering::NotAVectorStore;
     };
@@ -9912,7 +10204,7 @@ pub fn lower_vector_store_op(
     if !matches!(details, AffineDetailsAndAddrs::Constructed) {
         return VectorStoreLowering::DetailsFailed(details);
     }
-    let (Some(_), Some(_), Some(_)) = (
+    let (Some(access), Some(&mutable_addr), Some(&immutable_addr)) = (
         access_details.get_first(),
         mutable_addrs.get_first(),
         immutable_addrs.get_first(),
@@ -9924,26 +10216,55 @@ pub fn lower_vector_store_op(
     else {
         return VectorStoreLowering::NoCandidate;
     };
-    let element_type = match candidate.op {
-        DfirOp::Agen(agen::Op::VectorStore { view_ty, .. }) => view_ty.elem,
-        _ => return VectorStoreLowering::NotAVectorStore,
+    let DfirOp::Agen(agen::Op::VectorStore { value, .. }) = candidate.op else {
+        return VectorStoreLowering::NotAVectorStore;
     };
-    todo!(
-        "e359_constructReceiveAndStoreStmt is unported, so the {element_type:?} store {:?} on \
-         {comp:?} cannot become a sentient.receive_and_store",
-        candidate.op
-    );
+    // `:3089-3097` — entry 359 with all five trailing arguments defaulted (`:3090`).
+    let stmt = match construct_receive_and_store_stmt::<A, AccessDetailsAffine<'_>>(
+        &AgenStore::Vector { value: *value },
+        candidate.op,
+        comp,
+        access,
+        mutable_addr,
+        immutable_addr,
+        TransferSpecialisation::UNSPECIALISED,
+        scope,
+        emitted,
+        values,
+    ) {
+        ReceiveAndStoreStmt::Constructed(stmt) => stmt,
+        refused => return VectorStoreLowering::UnableToGenerateReceiveAndStore(refused),
+    };
+    // `:3099-3101` — the candidate, then entry 270 over the op behind its stored value.
+    let mut to_be_deleted = vec![candidate.op];
+    if let Some(input_op) = defining_op(*value, scope) {
+        add_store_input_to_delete_list(input_op, scope, &mut to_be_deleted);
+    }
+    VectorStoreLowering::Stored {
+        stmt,
+        to_be_deleted,
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 316/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE OUTCOME OF [`lower_indirect_vector_load_op`] — every arm a refusal, because the statement it
-/// exists to build is entry 358 and that is unported.
+/// THE OUTCOME OF [`lower_indirect_vector_load_op`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
-pub enum IndirectVectorLoadLowering {
+pub enum IndirectVectorLoadLowering<'a> {
+    /// The gather's `sentient.load_and_send`, and `to_be_deleted` — the load's consumer chain
+    /// (`:3210`) then the candidate itself (`:3212`).
+    Sent {
+        /// Entry 358's hoisted constants and the value the transfer binds.
+        stmt: Box<ConstructedLoadAndSend>,
+        /// `to_be_deleted`, in push order.
+        to_be_deleted: Vec<&'a DfirOp>,
+    },
+    /// `emitError("Unable to generate load_and_send statement for the agen.indirect_vector_load
+    /// operation")` (`:3205-3207`).
+    UnableToGenerateLoadAndSend(LoadAndSendStmt),
     /// *"IndirectVectorLoadOp only supported in LXLU"* (`:3172-3174`).
     OnlySupportedInLxlu,
     /// The operation this was called over is not an `agen.indirect_vector_load`.
@@ -9965,15 +10286,17 @@ pub enum IndirectVectorLoadLowering {
 /// ⛔ `extract_idx` IS A PAIRING, NOT AN OPERAND. The reference reads an attribute entry 269 stamped
 /// on this gather when it built the extract; here that pairing is carried in and looked up, so a
 /// gather that never went through entry 269 answers [`IndirectVectorLoadLowering::NoExtractIndex`].
-pub fn lower_indirect_vector_load_op(
+pub fn lower_indirect_vector_load_op<'a, A: Arch>(
     op: &DfirOp,
     position: usize,
     comp: DfirUnit,
     extract_idx: Option<ExtractIndex>,
     extract_ops: &ExtractScalarOps,
     marked: &mut Marked,
-    scope: &[DfirOp],
-) -> IndirectVectorLoadLowering {
+    scope: &'a [DfirOp],
+    emitted: &mut Vec<SenOp>,
+    values: &mut Values,
+) -> IndirectVectorLoadLowering<'a> {
     if comp != DfirUnit::Lxlu {
         return IndirectVectorLoadLowering::OnlySupportedInLxlu;
     }
@@ -10001,7 +10324,7 @@ pub fn lower_indirect_vector_load_op(
     if !matches!(details, AffineDetailsAndAddrs::Constructed) {
         return IndirectVectorLoadLowering::DetailsFailed(details);
     }
-    let (Some(_), Some(_), Some(_)) = (
+    let (Some(access), Some(&mutable_addr), Some(&immutable_addr)) = (
         access_details.get_first(),
         mutable_addrs.get_first(),
         immutable_addrs.get_first(),
@@ -10021,23 +10344,52 @@ pub fn lower_indirect_vector_load_op(
     else {
         return IndirectVectorLoadLowering::NoMatchingExtractOp;
     };
-    todo!(
-        "e358_constructLoadAndSendStmt is unported, so the gather {:?} pairing with extract_idx {} \
-         on {comp:?} cannot become a sentient.load_and_send",
+    // `:3200-3207` — entry 027's overload, which is the extract statement and nothing else.
+    let stmt = match construct_load_and_send_stmt::<A, AccessDetailsAffine<'_>>(
         candidate.op,
-        extract.index.get()
-    );
+        comp,
+        access,
+        mutable_addr,
+        immutable_addr,
+        super::agen_agen_to_sentient::construct_load_and_send_stmt(extract),
+        scope,
+        emitted,
+        values,
+    ) {
+        LoadAndSendStmt::Constructed(stmt) => stmt,
+        refused => return IndirectVectorLoadLowering::UnableToGenerateLoadAndSend(refused),
+    };
+    // `:3210` then `:3212` — the consumer chain, and the gather last.
+    let mut to_be_deleted = Vec::new();
+    if let Some(agen_load) = AgenLoad::of(candidate.op) {
+        add_load_chain_to_delete_list(agen_load.consumer_root(), scope, &mut to_be_deleted);
+    }
+    to_be_deleted.push(candidate.op);
+    IndirectVectorLoadLowering::Sent {
+        stmt,
+        to_be_deleted,
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 317/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE OUTCOME OF [`lower_indirect_vector_store_op`] — every arm a refusal, because the statement it
-/// exists to build is entry 359 and that is unported.
+/// THE OUTCOME OF [`lower_indirect_vector_store_op`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
-pub enum IndirectVectorStoreLowering {
+pub enum IndirectVectorStoreLowering<'a> {
+    /// The scatter's `sentient.receive_and_store`, and `to_be_deleted` — the candidate (`:3259`) then
+    /// the op behind the value it stored (`:3261-3262`).
+    Stored {
+        /// Entry 359's hoisted constants and the value the transfer binds.
+        stmt: Box<ConstructedReceiveAndStore>,
+        /// `to_be_deleted`, in push order.
+        to_be_deleted: Vec<&'a DfirOp>,
+    },
+    /// `emitError("Unable to generate receive_and_store statement for the
+    /// agen.indirect_vector_store operation")` (`:3255-3257`).
+    UnableToGenerateReceiveAndStore(ReceiveAndStoreStmt),
     /// *"IndirectVectorStoreOp only supported in LXSU"* (`:3220-3222`).
     OnlySupportedInLxsu,
     /// The operation this was called over is not an `agen.indirect_vector_store`.
@@ -10058,17 +10410,21 @@ pub enum IndirectVectorStoreLowering {
 /// Replaces: e317_lowerIndirectVectorStoreOp
 ///
 /// The scatter's twin of entry 316, on the LXSU and against the RECEIVE side of the extract counter.
-/// Its element type comes off the DIRECT memref, and the statement, the candidate's delete and the
-/// input chain behind its stored value are all behind `e359_constructReceiveAndStoreStmt`.
-pub fn lower_indirect_vector_store_op(
+///
+/// ⛔ `element_type` IS READ OFF THE **DIRECT** MEMREF (`:3250`) AND ENTRY 359 NEVER LOOKS AT IT
+/// (`:2027`) — the reference computes it for a parameter that is dead in the callee, so it is read
+/// here only because reading the wrong memref is the mistake this note exists to prevent.
+pub fn lower_indirect_vector_store_op<'a, A: Arch>(
     op: &DfirOp,
     position: usize,
     comp: DfirUnit,
     extract_idx: Option<ExtractIndex>,
     extract_ops: &ExtractScalarOps,
     marked: &mut Marked,
-    scope: &[DfirOp],
-) -> IndirectVectorStoreLowering {
+    scope: &'a [DfirOp],
+    emitted: &mut Vec<SenOp>,
+    values: &mut Values,
+) -> IndirectVectorStoreLowering<'a> {
     if comp != DfirUnit::Lxsu {
         return IndirectVectorStoreLowering::OnlySupportedInLxsu;
     }
@@ -10096,7 +10452,7 @@ pub fn lower_indirect_vector_store_op(
     if !matches!(details, AffineDetailsAndAddrs::Constructed) {
         return IndirectVectorStoreLowering::DetailsFailed(details);
     }
-    let (Some(_), Some(_), Some(_)) = (
+    let (Some(access), Some(&mutable_addr), Some(&immutable_addr)) = (
         access_details.get_first(),
         mutable_addrs.get_first(),
         immutable_addrs.get_first(),
@@ -10116,16 +10472,34 @@ pub fn lower_indirect_vector_store_op(
     else {
         return IndirectVectorStoreLowering::NoMatchingExtractOp;
     };
-    let element_type = match candidate.op {
-        DfirOp::Agen(agen::Op::IndirectVectorStore { direct_view_ty, .. }) => direct_view_ty.elem,
-        _ => return IndirectVectorStoreLowering::NotAnIndirectVectorStore,
+    let DfirOp::Agen(agen::Op::IndirectVectorStore { value, .. }) = candidate.op else {
+        return IndirectVectorStoreLowering::NotAnIndirectVectorStore;
     };
-    todo!(
-        "e359_constructReceiveAndStoreStmt is unported, so the {element_type:?} scatter {:?} \
-         pairing with extract_idx {} on {comp:?} cannot become a sentient.receive_and_store",
+    // `:3251-3257` — entry 028's overload: the dead element type, and the extract statement.
+    let stmt = match construct_receive_and_store_stmt::<A, AccessDetailsAffine<'_>>(
+        &AgenStore::IndirectVector { value: *value },
         candidate.op,
-        extract.index.get()
-    );
+        comp,
+        access,
+        mutable_addr,
+        immutable_addr,
+        super::agen_agen_to_sentient::construct_receive_and_store_stmt(extract),
+        scope,
+        emitted,
+        values,
+    ) {
+        ReceiveAndStoreStmt::Constructed(stmt) => stmt,
+        refused => return IndirectVectorStoreLowering::UnableToGenerateReceiveAndStore(refused),
+    };
+    // `:3259` then `:3261-3262` — the scatter, then entry 270 over the op behind its stored value.
+    let mut to_be_deleted = vec![candidate.op];
+    if let Some(input_op) = defining_op(*value, scope) {
+        add_store_input_to_delete_list(input_op, scope, &mut to_be_deleted);
+    }
+    IndirectVectorStoreLowering::Stored {
+        stmt,
+        to_be_deleted,
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -10276,7 +10650,7 @@ fn position_of(needle: &DfirOp, scope: &[DfirOp]) -> Option<usize> {
 /// [`None`] is *"vector_loadOp's consumer is not a getUnitOp."*, which the reference reports from
 /// inside that entry; neither op class at all leaves its component list EMPTY, which is
 /// [`ConsumerUnits::Neither`] and emits nothing.
-fn ldcvti_consumer(to: Val, scope: &[DfirOp]) -> Option<ConsumerUnits> {
+fn send_consumer_units(to: Val, scope: &[DfirOp]) -> Option<ConsumerUnits> {
     match defining_op(to, scope) {
         Some(DfirOp::Dataflow(dataflow::Op::GetUnit { unit, .. })) => {
             Some(ConsumerUnits::Bound(*unit))
@@ -10512,7 +10886,7 @@ pub fn lower_ldcvti_pattern<'a, A: Arch>(
     let element_index = hoisted_index_constant(values, &mut hoisted, element_shuffle.index);
 
     // `:3697-3699`.
-    let Some(consumer) = ldcvti_consumer(to.val(), scope) else {
+    let Some(consumer) = send_consumer_units(to.val(), scope) else {
         return LdcvtiPattern::ConsumerIsNotAGetUnit;
     };
 
@@ -10728,13 +11102,1344 @@ pub fn adjust_mutable_addr_init_for_stride(
     })
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e357_generateAffineAddressManipulationStmts
-// crustify:todo: e358_constructLoadAndSendStmt
-// crustify:todo: e359_constructReceiveAndStoreStmt
-// crustify:todo: e360_constructSymbolicDetailsAndAddrs
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 358/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT A BUILT `sentient.load_and_send` LEAVES **OUTSIDE** THE STATEMENT LIST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructedLoadAndSend {
+    /// Entry 214's constants. ⭐ THEY GO BEFORE THE `dataflow.program_unit`, as
+    /// [`AddressIncrements::hoisted`] records; everything else was appended in place.
+    pub hoisted: Vec<SenOp>,
+    /// The value the `sentient.load_and_send` binds.
+    pub result: Val,
+}
+
+/// THE OUTCOME OF [`construct_load_and_send_stmt`] — the statement, or which check refused.
+///
+/// ⛔ LIFETIME-FREE ON PURPOSE, so it can sit inside [`VectorLoadHelper`] beside entry 268's twin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LoadAndSendStmt {
+    /// Built and appended; boxed for the reason [`LoadAndStoreStmt::Constructed`] is.
+    Constructed(Box<ConstructedLoadAndSend>),
+    /// The op handed in is none of `getLoadConsumer`'s five load classes — its
+    /// `DT_CHECK_MSG(consumer_root, ..)` (`Helper.cpp:1252`).
+    OpIsNotALoad,
+    /// *"can not extract the loadOp's consumer!"* (`:1939-1941`) — ⭐ AND A NULL
+    /// `consumer_info.second` IS THIS ARM TOO, which is what makes [`LoadConsumer::Found`]'s `None`
+    /// consumer a refusal here and a silent nothing inside entry 35.
+    ConsumerNotExtracted,
+    /// *"vector_loadOp's consumer is not a getUnitOp."* (`:2755-2757`), reported from inside entry 35.
+    ConsumerIsNotAGetUnit,
+    /// *"problem in generating set_send_destination operation"* (`:1952-1955`).
+    SetSendDestinationRefused(SetSendDestination),
+    /// *"could not set ldtype"* (`:1975-1978`).
+    LdTypeRefused(LdType),
+    /// `emitOpError("cannot update mutable_addr init for stride.")` (`:2000-2003`).
+    StrideAdjustmentRefused,
+    /// The `DT_CHECK` pairing a `load_and_send` with a `load_and_extract_scalar` (`:1450-1454`).
+    IndirectPairingMismatch,
+    /// `emitOpError("cannot adjust mutable_addr for indirect load op")` (`:2007-2010`).
+    IndirectAdjustmentRefused(MutableAddrInit),
+}
+
+/// ENTRY 336 OVER A TRANSFER THAT WAS JUST APPENDED — the loop `outermost_comp_loop` names when there
+/// is one (`:4041-4062`), else the statement itself, which is the last one appended (`:4064`).
+///
+/// ⭐ TOP LEVEL OF `emitted` ONLY, BY DEFINITION: the loop the reference hands in is the OUTERMOST one
+/// its composite lowering created, so a nested `affine.for` carrying the same iterator is not it.
+/// The adjustment's own constants are spliced in IMMEDIATELY BEFORE what they adjust, which is what
+/// `OpBuilder builder(for_op)` / `OpBuilder builder(mem_op)` means.
+fn apply_stride_adjustment(
+    emitted: &mut Vec<SenOp>,
+    outermost_comp_loop: Option<OutermostCompLoop>,
+    stride_step: StrideStep,
+    values: &mut Values,
+) -> bool {
+    let at = match outermost_comp_loop {
+        Some(OutermostCompLoop(iv)) => emitted
+            .iter()
+            .position(|op| matches!(op, SenOp::AffineFor(loop_op) if loop_op.iv == iv)),
+        None => emitted.len().checked_sub(1),
+    };
+    let Some(at) = at else {
+        return false;
+    };
+    let adjustment = match (&mut emitted[at], outermost_comp_loop) {
+        (SenOp::AffineFor(loop_op), Some(_)) => adjust_mutable_addr_init_for_stride(
+            values,
+            StrideTarget::CompositeLoop(&mut loop_op.carried),
+            stride_step,
+        ),
+        (op, _) => {
+            adjust_mutable_addr_init_for_stride(values, StrideTarget::MemoryOp(op), stride_step)
+        }
+    };
+    let Some(adjustment) = adjustment else {
+        return false;
+    };
+    emitted.splice(at..at, adjustment.hoisted);
+    true
+}
+
+/// `stride_step > 0 && is_any_of(comp, L0LU, L0SU, LXLU, LXSU)` (`Helper.cpp:1999`, `:2140`) — the
+/// stride step is part of the MUTABLE address on these four only, so only they need it reset.
+fn stride_lives_in_mutable_addr(comp: DfirUnit) -> bool {
+    matches!(
+        comp.generic(),
+        GenericComp::L0lu | GenericComp::L0su | GenericComp::Lxlu | GenericComp::Lxsu
+    )
+}
+
+/// Replaces: e358_constructLoadAndSendStmt
+///
+/// **358/384** `AgenToSentientLoweringPass::constructLoadAndSendStmt` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910` (104L). A load and the send it feeds become one
+/// `sentient.load_and_send`, appended to `emitted` behind whatever entry 35 wants in front of it.
+///
+/// ⛔⛔ THE ROUTING DIRECTION IS READ OFF THE **SEND**, NOT OFF THE AGEN OP (`:1954-1969`) — a send
+/// that lost its `$dir` is emitted with no routing direction at all.
+/// ⛔ AND `setldtype` REWRITES BOTH `total_elements` AND `shuffle_mode` (`:1975`), so the record's own
+/// extents reach the op only when it declined to.
+/// ⛔ THE TWO ADJUSTMENTS RUN AFTER THE OP EXISTS AND IN THIS ORDER (`:1999`, `:2005`); a refusal
+/// leaves the statement appended, which is the reference leaving it in the IR and failing the pass.
+pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
+    load_op: &DfirOp,
+    comp: DfirUnit,
+    access_details: &D,
+    mutable_addr: Val,
+    immutable_addr: Val,
+    spec: TransferSpecialisation,
+    scope: &[DfirOp],
+    emitted: &mut Vec<SenOp>,
+    values: &mut Values,
+) -> LoadAndSendStmt {
+    // `:1921-1927` — the record's extents, `immutable_addr` aliased as the view's start address.
+    let shape = access_details.transfer_shape();
+    let rotation_position = access_details.rotation_position();
+
+    // `:1929-1936` — entry 214. ⭐ ITS `failed()` ARM IS UNREACHABLE (`:1581-1627`).
+    let addresses = set_immutable_addr_and_increments(
+        values,
+        comp,
+        spec.performs_burst_or_group(),
+        spec.stride_step,
+        spec.burst_size,
+        shape.total_elements,
+        immutable_addr,
+    );
+
+    // `:1938-1946` — entry 33, then `DT_CHECK(send_op && "expected send as the consumer of load")`,
+    // which [`LoadConsumer::Found`] has already made true: only a `dataflow.send` reaches it.
+    let Some(load) = AgenLoad::of(load_op) else {
+        return LoadAndSendStmt::OpIsNotALoad;
+    };
+    let LoadConsumer::Found {
+        send,
+        consumer: Some(_),
+    } = load_consumer(load, scope)
+    else {
+        return LoadAndSendStmt::ConsumerNotExtracted;
+    };
+    let DfirOp::Dataflow(dataflow::Op::Send {
+        to,
+        data,
+        dir: send_dir,
+        ..
+    }) = send
+    else {
+        return LoadAndSendStmt::ConsumerNotExtracted;
+    };
+
+    // `:1948-1955` — the insertion-point shift onto the send is builder mechanics; what it buys is
+    // that the set_send_dst and the transfer precede the send, which appending to `emitted` gives.
+    let Some(consumer) = send_consumer_units(to.val(), scope) else {
+        return LoadAndSendStmt::ConsumerIsNotAGetUnit;
+    };
+    let set_send_destination =
+        generate_set_send_destination_stmts::<A>(comp.generic(), &consumer, *to);
+    match set_send_destination {
+        SetSendDestination::Emit(op) => emitted.push(*op),
+        SetSendDestination::Nothing => {}
+        refused @ SetSendDestination::NoSetDstMaskAtThisArchLevel => {
+            return LoadAndSendStmt::SetSendDestinationRefused(refused);
+        }
+    }
+
+    // `:1957-1972` — ⛔ `routing_dir0` IS DEAD: bound at `:1957` and never read.
+    let dir = send_dir.map(|direction| match direction {
+        dfir_op::agen::RoutingDirection::BothWays => sen::RoutingDirection::BothWays,
+        dfir_op::agen::RoutingDirection::Clockwise => sen::RoutingDirection::Clockwise,
+        dfir_op::agen::RoutingDirection::CounterClockwise => {
+            sen::RoutingDirection::CounterClockwise
+        }
+        dfir_op::agen::RoutingDirection::PseudoRandom => sen::RoutingDirection::PseudoRandom,
+    });
+
+    // `:1974-1978` — and `element_width` IS A DIVISOR THERE (`:1656`). A memref element type has no
+    // zero bit width, so the two LX arms that divide take the nearest refusal rather than the
+    // reference's division by zero, and every other component returns `success()` before dividing.
+    let ld_type = match NonZeroU32::new(shape.element_width.0) {
+        Some(width) => setldtype::<A>(comp.generic(), *data, scope, shape.total_elements, width),
+        None if matches!(comp.generic(), GenericComp::Lxlu | GenericComp::Lxsu) => {
+            LdType::UnsupportedLdType
+        }
+        None => LdType::Default,
+    };
+    let (total_elements, shuffle_mode) = match ld_type {
+        LdType::Default => (shape.total_elements, access_details.shuffle_mode()),
+        LdType::NonDefault {
+            shuffle_mode,
+            total_elements,
+        } => (total_elements, shuffle_mode),
+        refused => return LoadAndSendStmt::LdTypeRefused(refused),
+    };
+
+    // `:1980-1996` — ⛔ `DT_CHECK_MSG(consumer_info.second->getNumResults() == 1)` IS
+    // UNREPRESENTABLE: the operand IS the value the send names ([`SendEnd`]), not a result index.
+    let result = values.mint();
+    emitted.push(SenOp::Sentient(sen::Op::LoadAndSend {
+        mutable_addr,
+        immutable_addr: addresses.immutable_addr,
+        increment: addresses.increment,
+        consumer: *to,
+        result,
+        extent: sen::Extent {
+            total_elements,
+            element_size: shape.element_width,
+            chunk_size: shape.chunk_size,
+            chunk_stride: shape.chunk_stride,
+            burst_size: spec.burst_size,
+        },
+        interleaved_group: spec.group_size,
+        // `rotation_position != 0 ? getI32IntegerAttr(rotation_position) : nullptr` (`:1990-1991`).
+        rotate_val: u32::try_from(rotation_position.0)
+            .ok()
+            .filter(|position| *position != 0),
+        dir,
+        shuffle_mode,
+        reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        dbg_name: dfir_op::dbg_name(load_op).map(str::to_owned),
+    }));
+
+    // `:1998-2003`.
+    if spec.adjusts_for_stride()
+        && stride_lives_in_mutable_addr(comp)
+        && !apply_stride_adjustment(emitted, spec.outermost_comp_loop, spec.stride_step, values)
+    {
+        return LoadAndSendStmt::StrideAdjustmentRefused;
+    }
+
+    // `:2005-2010` — entry 328, which needs the statement to be in the scope it rewrites.
+    if let Some(extract) = spec.extract_op {
+        let Some(mem_op) = IndirectMemOp::of(result, extract, emitted) else {
+            return LoadAndSendStmt::IndirectPairingMismatch;
+        };
+        let adjusted = adjust_mutable_addr_init_for_indirect(mem_op, extract, emitted, values);
+        if adjusted != MutableAddrInit::Adjusted {
+            return LoadAndSendStmt::IndirectAdjustmentRefused(adjusted);
+        }
+    }
+
+    LoadAndSendStmt::Constructed(Box::new(ConstructedLoadAndSend {
+        hoisted: addresses.hoisted,
+        result,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 359/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT A BUILT `sentient.receive_and_store` LEAVES **OUTSIDE** THE STATEMENT LIST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructedReceiveAndStore {
+    /// Entry 214's constants. ⭐ THEY GO BEFORE THE `dataflow.program_unit`.
+    pub hoisted: Vec<SenOp>,
+    /// The value the `sentient.receive_and_store` binds.
+    pub result: Val,
+}
+
+/// THE OUTCOME OF [`construct_receive_and_store_stmt`] — the statement, or which check refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum ReceiveAndStoreStmt {
+    /// Built and appended.
+    Constructed(Box<ConstructedReceiveAndStore>),
+    /// *"can not extract the StoreOp's producer!"* (`:2051-2054`) — entry 156 refused, and its own
+    /// `diagnostic()` says which of its twelve checks did.
+    ProducerNotExtracted,
+    /// *"ConstantBitstreamOp producers are only supported in L3"* (`:2073-2076`).
+    BitstreamProducerNotL3,
+    /// `bs_value[0]` on a bitstream with no values — ⭐ UNREACHABLE BEHIND
+    /// [`StoreProducer::BitstreamNotOneValue`], and it is where an empty one would land.
+    BitstreamHasNoValue,
+    /// The producer is neither a bitstream nor reached through a `dataflow.receive` — ⭐ UNREACHABLE
+    /// behind [`StoreProducer::Found`], whose two stages admit only those two shapes.
+    ProducerIsNotAWireEnd,
+    /// *"could not set sttype"* (`:2091-2094`).
+    StTypeRefused(StType),
+    /// `emitOpError("cannot update mutable_addr init for stride.")` (`:2141-2144`).
+    StrideAdjustmentRefused,
+    /// The `DT_CHECK` pairing a `receive_and_store` with a `receive_and_extract_scalar` (`:1450-1454`).
+    IndirectPairingMismatch,
+    /// `emitOpError("cannot adjust mutable_addr for indirect store op")` (`:2147-2151`).
+    IndirectAdjustmentRefused(MutableAddrInit),
+}
+
+/// `producer_info.second->getResult(0)` AS THE WIRE END IT IS, recovered off the `dataflow.receive`
+/// that named it — a [`RecvEnd`] is minted by `Link::ends` and nothing else, and the receive's `from`
+/// IS that result (the same identity entry 35 relies on for the send side).
+fn store_wire_end(inp_op: &DfirOp, scope: &[DfirOp]) -> Option<RecvEnd> {
+    match inp_op {
+        DfirOp::Dataflow(dataflow::Op::Receive { from, .. }) => Some(*from),
+        DfirOp::VectorChain(vc::Op::Shuffle { input, .. }) => match defining_op(*input, scope) {
+            Some(DfirOp::Dataflow(dataflow::Op::Receive { from, .. })) => Some(*from),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Replaces: e359_constructReceiveAndStoreStmt
+///
+/// **359/384** `AgenToSentientLoweringPass::constructReceiveAndStoreStmt` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025` (131L). The store side's twin of entry 358.
+///
+/// ⛔⛔ THE COALESCE BLOCK (`:2102-2111`) CANNOT RUN: `COMMENT_OUT_COALESCE_STORE` is defined nowhere,
+/// so its `#else` arm compiles — and `getCoalesceInfo` and `is_src1_reg` are declared nowhere in the
+/// authority tree, so nothing that reaches it links. Its only effect is its initialisers, which are
+/// what this emits: no coalesce, no `drop_first`, no `multicast_info`, `subword_length` and `stride` 1.
+/// ⛔ NO `chunk_size`/`chunk_stride` REACH THE OP (`:2120-2131`) — the `.td` defaults of 1 and 1 stand,
+/// unlike entry 358 which passes the record's.
+/// ⛔ AND `data_elem_type` IS A DEAD PARAMETER: threaded in at `:2027` and never read.
+pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
+    store: &AgenStore<'_>,
+    store_op: &DfirOp,
+    comp: DfirUnit,
+    access_details: &D,
+    mutable_addr: Val,
+    immutable_addr: Val,
+    spec: TransferSpecialisation,
+    scope: &[DfirOp],
+    emitted: &mut Vec<SenOp>,
+    values: &mut Values,
+) -> ReceiveAndStoreStmt {
+    // `:2030-2032`.
+    let shape = access_details.transfer_shape();
+
+    // `:2041-2049` — entry 214.
+    let addresses = set_immutable_addr_and_increments(
+        values,
+        comp,
+        spec.performs_burst_or_group(),
+        spec.stride_step,
+        spec.burst_size,
+        shape.total_elements,
+        immutable_addr,
+    );
+
+    // `:2051-2054` — entry 156. `:2060-2064`'s `DT_CHECK_MSG` on a non-`get_unit` producer's result
+    // count is unrepresentable for the same reason entry 358's is.
+    let StoreProducer::Found { inp_op, producer } = get_store_producer(store, scope) else {
+        return ReceiveAndStoreStmt::ProducerNotExtracted;
+    };
+
+    // `:2066-2088` — a bitstream producer is REPLACED by a `sentient.scalar_constant` and the store
+    // reads THAT; every other component reaches the diagnostic instead.
+    let producer = if let DfirOp::VectorChain(vc::Op::ConstantBitstream {
+        value,
+        ty: bitstream_ty,
+        ..
+    }) = producer
+    {
+        if comp != DfirUnit::L3lu {
+            return ReceiveAndStoreStmt::BitstreamProducerNotL3;
+        }
+        let Some(&imm_val) = value.first() else {
+            return ReceiveAndStoreStmt::BitstreamHasNoValue;
+        };
+        let constant = values.mint();
+        emitted.push(SenOp::Sentient(sen::Op::ScalarConstant {
+            value: imm_val,
+            result: constant,
+            reg_locale: sen::RegType::Imm,
+            ty: ScalarTy::of_elem(bitstream_ty.elem),
+            is_symbol: false,
+        }));
+        sen::StoreSource::Constant(constant)
+    } else {
+        let Some(end) = store_wire_end(inp_op, scope) else {
+            return ReceiveAndStoreStmt::ProducerIsNotAWireEnd;
+        };
+        sen::StoreSource::Wire(end)
+    };
+
+    // `:2090-2094` — and the `shuffle_mode` here is DOUBLY optional: `setsttype` writing nothing is
+    // the attribute being absent, not a default mode.
+    let st_type = match NonZeroU32::new(shape.element_width.0) {
+        Some(width) => setsttype::<A>(comp.generic(), inp_op, width),
+        None if matches!(comp.generic(), GenericComp::Lxlu | GenericComp::Lxsu) => {
+            StType::UnsupportedStType
+        }
+        None => StType::Default,
+    };
+    let (total_elements, shuffle_mode) = match st_type {
+        StType::Default => (shape.total_elements, None),
+        StType::NonDefault {
+            shuffle_mode,
+            total_elements,
+        } => (total_elements, Some(shuffle_mode)),
+        StType::FullStick { total_elements } => (total_elements, None),
+        refused => return ReceiveAndStoreStmt::StTypeRefused(refused),
+    };
+
+    // `:2113-2131` — the destination unit is set on a sen1p5 L0SU and nowhere else.
+    let dst = (comp == DfirUnit::L0su && A::GEN >= IsaGen::Sen1p5)
+        .then(|| access_details.memory())
+        .flatten();
+    let result = values.mint();
+    emitted.push(SenOp::Sentient(sen::Op::ReceiveAndStore {
+        mutable_addr,
+        immutable_addr: addresses.immutable_addr,
+        increment: addresses.increment,
+        producer,
+        result,
+        dst,
+        drop_first: None,
+        multicast_info: None,
+        extent: sen::Extent {
+            total_elements,
+            element_size: shape.element_width,
+            chunk_size: Elements(1),
+            chunk_stride: Elements(1),
+            burst_size: spec.burst_size,
+        },
+        interleaved_group: spec.group_size,
+        coalesce: false,
+        subword_length: 1,
+        stride: 1,
+        permute: false,
+        shuffle_mode,
+        reg: sen::Reg {
+            locale: sen::RegType::Unknown,
+            index: None,
+        },
+        dbg_name: dfir_op::dbg_name(store_op).map(str::to_owned),
+    }));
+
+    // `:2139-2144`.
+    if spec.adjusts_for_stride()
+        && stride_lives_in_mutable_addr(comp)
+        && !apply_stride_adjustment(emitted, spec.outermost_comp_loop, spec.stride_step, values)
+    {
+        return ReceiveAndStoreStmt::StrideAdjustmentRefused;
+    }
+
+    // `:2146-2151` — entry 328.
+    if let Some(extract) = spec.extract_op {
+        let Some(mem_op) = IndirectMemOp::of(result, extract, emitted) else {
+            return ReceiveAndStoreStmt::IndirectPairingMismatch;
+        };
+        let adjusted = adjust_mutable_addr_init_for_indirect(mem_op, extract, emitted, values);
+        if adjusted != MutableAddrInit::Adjusted {
+            return ReceiveAndStoreStmt::IndirectAdjustmentRefused(adjusted);
+        }
+    }
+
+    ReceiveAndStoreStmt::Constructed(Box::new(ConstructedReceiveAndStore {
+        hoisted: addresses.hoisted,
+        result,
+    }))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 357/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`generate_affine_address_manipulation_stmts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum AddressManipulation {
+    /// `success()` (`Helper.cpp:827`, `:1008`).
+    Manipulated,
+    /// `DT_CHECK(mutable_addrs_base.size() == mutable_addrs.size() && mutable_addrs.size() ==
+    /// access_details.size())` (`:631-632`).
+    SizeMismatch,
+    /// `DT_CHECK(isa<affine::AffineForOp, scf::ForOp>(def_op))` (`:705`) — a start address bound as
+    /// the argument of a region that is not a counted loop.
+    StartAddrOwnerIsNotALoop,
+    /// `DT_CHECK(op->hasAttr("iter-index") && "perhaps main IV is used as a subscript instead of an
+    /// iter-arg")` (`:880-882`, `:891-893`): the marked loop binds the start address as its INDUCTION
+    /// VARIABLE, so `:719-737` found no `iter_arg` to name.
+    StartAddrIsTheInductionVariable,
+    /// `llvm_unreachable("unhandeled type of loop")` (`:3877`) and the `DT_CHECK(ret_op)` entry 264
+    /// makes ([`CountedLoop::of`]).
+    UnsupportedLoopOperation,
+    /// An iterator of the coefficient table that no region of `scope` binds — the `cast<BlockArgument>`
+    /// at `:674-680` and `:835`, which aborts rather than answering null.
+    IndexIsNotALoopIterator,
+    /// `DT_CHECK_MSG(def_op, "could not set def_op")` (`:774`) and `DT_CHECK_MSG(init, "expected
+    /// operation for mem_view_start addr")` (`:988`).
+    StartAddrUndefined,
+    /// `DT_CHECK(parent_op->isProperAncestor(loop_op))` inside entry 219 (`:3946`) — a start address
+    /// that is a region argument of the nest being rewritten rather than of something enclosing it.
+    ///
+    /// ⛔ EVERY MARKED **LOOP** LANDS HERE ON A NON-L3 UNIT, and that is the reference's own
+    /// arithmetic: `:708` marks only def ops inside `last_loop`, so the `iter_arg` the walk recovers
+    /// at `:886` is bound by `outer_most_loop` or by a loop within it, and neither properly encloses
+    /// it. Only L3 survives, because entry 272 returns the constant before it reaches entry 219.
+    StartAddrDoesNotEncloseTheLoop,
+    /// ⛔ A `uniform.query_map` START ADDRESS IS A SEAM, NOT A REFUSAL IN THE REFERENCE. Entry 219's
+    /// region-key arm needs a [`UniformizeSource`] borrowed from the op enclosing the loop
+    /// (`:3967-3983`), which cannot be taken while the body is borrowed mutably to clone the nest —
+    /// see [`clone_start_addr_outside_loop`].
+    StartAddrIsAQueryMap,
+    /// The loop entry 335 is pointed at carries no seat at the requested distance from the end, or the
+    /// one entry 357's post-processing reads does not — `getOperand(getNumOperands() - i - 1)`
+    /// (`:993`) on a list that short.
+    NoIterArgsOnLoop,
+    /// Entry 272 could not place the view's start address, so there is no `addi` to initialise with.
+    StartAddrRefused(ClonedStartAddr),
+    /// `llvm_unreachable("unexpected mem_view_start addr index for kIndSrc/Dst")` (`:934-936`).
+    IndirectStartAddrUnexpected,
+    /// `emitWarning("unable to find the right loop to add mem_view_start addr of indirect src/dst")`
+    /// then `failure()` (`:1000-1004`).
+    NoInvariantLoopForIndirectStartAddr,
+}
+
+impl AddressManipulation {
+    /// `success()` only for [`Self::Manipulated`].
+    #[must_use]
+    pub const fn admissible(&self) -> bool {
+        matches!(self, AddressManipulation::Manipulated)
+    }
+}
+
+/// `Value::getDefiningOp()` AS A ROUTE THROUGH THE REGION TREE — the mirror of [`binding_path`],
+/// which answers for a region argument instead.
+///
+/// ⭐ EXACTLY ONE OF THE TWO ANSWERS, as [`crate::islands::dataflow_ir::dialects::region_owner`]
+/// documents: a value is an op's result or a region's argument, never both.
+fn defining_path(val: Val, scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
+    for (ordinal, op) in scope.iter().enumerate() {
+        if results(op).contains(&val) {
+            return Some(vec![(ordinal, 0)]);
+        }
+        for (region_ordinal, region) in dfir_op::regions(op).into_iter().enumerate() {
+            if let Some(rest) = defining_path(val, region) {
+                let mut path = vec![(ordinal, region_ordinal)];
+                path.extend(rest);
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// The op one path names — [`ops_at_mut`]'s read-only twin.
+fn op_at<'s>(scope: &'s [DfirOp], path: &[(usize, usize)]) -> Option<&'s DfirOp> {
+    let (&(ordinal, region_ordinal), rest) = path.split_first()?;
+    let op = scope.get(ordinal)?;
+    if rest.is_empty() {
+        return Some(op);
+    }
+    op_at(dfir_op::regions(op).into_iter().nth(region_ordinal)?, rest)
+}
+
+/// TWO PATHS NAME THE SAME OP.
+///
+/// ⛔ THE LAST STEP'S REGION ORDINAL IS NOT PART OF THE OP'S IDENTITY — it is where a descent WOULD
+/// go next, and [`binding_path`] leaves it 0 while a prefix of a longer path carries the region it
+/// descended into.
+fn same_op(left: &[(usize, usize)], right: &[(usize, usize)]) -> bool {
+    match (left.split_last(), right.split_last()) {
+        (Some((last, left_rest)), Some((there, right_rest))) => {
+            last.0 == there.0 && left_rest == right_rest
+        }
+        _ => false,
+    }
+}
+
+/// `Operation::isProperAncestor` — `outer` names an op one of whose regions holds `inner`.
+fn is_proper_ancestor(outer: &[(usize, usize)], inner: &[(usize, usize)]) -> bool {
+    !outer.is_empty()
+        && outer.len() < inner.len()
+        && outer[..outer.len() - 1] == inner[..outer.len() - 1]
+        && outer[outer.len() - 1].0 == inner[outer.len() - 1].0
+}
+
+/// `isAncestor`, which INCLUDES SELF (`:708`, `:991`).
+fn is_ancestor(outer: &[(usize, usize)], inner: &[(usize, usize)]) -> bool {
+    same_op(outer, inner) || is_proper_ancestor(outer, inner)
+}
+
+/// THE NEAREST ENCLOSING COUNTED LOOP OF THE OP A PATH NAMES — `while (parent) { if (isa<for>(parent))
+/// { loop_containing_init = parent; break; } parent = parent->getParentOp(); }` (`:970-976`), which
+/// starts AT the op itself.
+fn enclosing_loop_path(path: &[(usize, usize)], scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
+    (1..=path.len()).rev().find_map(|len| {
+        let prefix = &path[..len];
+        op_at(scope, prefix)
+            .and_then(CountedLoop::of)
+            .map(|_| prefix.to_vec())
+    })
+}
+
+/// `Operation::moveBefore` for the one case entry 357 needs: an op inside the outermost loop, moved to
+/// immediately before it (`:958-960`).
+///
+/// ⭐ THE TWO LISTS ARE ALWAYS DIFFERENT `Vec`s, because `from` is a proper descendant of `to`, so the
+/// removal cannot shift `to`'s own ordinal.
+fn move_before(scope: &mut Vec<DfirOp>, from: &[(usize, usize)], to: &[(usize, usize)]) {
+    let removed = match ops_at_mut(scope, from) {
+        Some((list, ordinal)) if ordinal < list.len() => list.remove(ordinal),
+        _ => return,
+    };
+    if let Some((list, at)) = ops_at_mut(scope, to) {
+        let at = at.min(list.len());
+        list.insert(at, removed);
+    }
+}
+
+/// `builder.setInsertionPointAfter(def_op)` / `setInsertionPointToStart(&def_op->getRegion(0).front())`
+/// (`:769-778`) as a (list path, index) pair this island can splice at.
+fn insertion_after_definition(addr: Val, scope: &[DfirOp]) -> Option<(Vec<(usize, usize)>, usize)> {
+    if let Some(mut path) = binding_path(addr, scope) {
+        // `:772-774` — a region argument: the start of its owner's FIRST region.
+        if let Some(last) = path.last_mut() {
+            last.1 = 0;
+        }
+        path.push((0, 0));
+        return Some((path, 0));
+    }
+    // `:776-777` — `DT_CHECK_MSG(def_op, "could not set def_op")`, then immediately after it.
+    let path = defining_path(addr, scope)?;
+    let at = path.last()?.0 + 1;
+    Some((path, at))
+}
+
+/// WHICH ARM OF ENTRY 219 A START ADDRESS TAKES, decided while the body is still borrowed shared.
+enum StartAddrArm {
+    /// `EnclosingBlockArgument` and `Outside` — entry 219 answers `AsItStands` for both.
+    AsItStands,
+    /// An `arith.constant` inside the loop, cloned out (`:3954-3955`).
+    InLoopConstant(DfirOp),
+    /// Anything else inside the loop — `emitOpError("unsupported operation for start address.")`.
+    InLoopOther,
+    /// The refusal this classification is.
+    Refused(AddressManipulation),
+}
+
+/// `cloneStartAddrOutsideLoop`'s dispatch (`:3942-4020`), taken as a decision rather than as a walk.
+fn classify_start_addr(
+    base: Val,
+    outer_most_loop: &[(usize, usize)],
+    scope: &[DfirOp],
+) -> StartAddrArm {
+    if let Some(owner) = binding_path(base, scope) {
+        // `:3944-3948` — `DT_CHECK(parent_op->isProperAncestor(loop_op))`.
+        return if is_proper_ancestor(&owner, outer_most_loop) {
+            StartAddrArm::AsItStands
+        } else {
+            StartAddrArm::Refused(AddressManipulation::StartAddrDoesNotEncloseTheLoop)
+        };
+    }
+    let Some(def) = defining_path(base, scope) else {
+        return StartAddrArm::Refused(AddressManipulation::StartAddrUndefined);
+    };
+    // `:4018-4020` — already outside, so it is read as it stands.
+    if !is_proper_ancestor(outer_most_loop, &def) {
+        return StartAddrArm::AsItStands;
+    }
+    match op_at(scope, &def) {
+        Some(
+            constant @ DfirOp::Arith(arith::Op::Constant { .. } | arith::Op::ConstantInt { .. }),
+        ) => StartAddrArm::InLoopConstant(constant.clone()),
+        Some(DfirOp::Uniform(dfir_op::uniform::Op::QueryMap { .. })) => {
+            StartAddrArm::Refused(AddressManipulation::StartAddrIsAQueryMap)
+        }
+        _ => StartAddrArm::InLoopOther,
+    }
+}
+
+/// ONE `setAttr("index")`/`setAttr("iter-index")` PAIR — the attributes `:712-737` writes on a start
+/// address's defining op, held as a record instead.
+struct Mark {
+    /// The def op they sit on, which is their identity.
+    path: Vec<(usize, usize)>,
+    /// `"index"` — ⛔ THE LAST RECORD SHARING THE OP WINS, because `:712` is an unconditional write.
+    record: usize,
+    /// `"iter-index"` — ⛔ ONCE SET IT IS NEVER CLEARED by a later record whose search found nothing
+    /// (`:733` writes inside the match and breaks), so the later record can be handed the earlier
+    /// one's seat.
+    iter_index: Option<usize>,
+    /// The value `:886`/`:897` recovers the op by: its induction variable for a loop, its own single
+    /// result otherwise.
+    anchor: Val,
+    /// Which branch of the walk it takes (`:876` against `:896`).
+    is_loop: bool,
+}
+
+/// WHAT THE WALK AT `:875-899` READS BACK FOR ONE MARKED OP, in the form that survives the clones.
+enum MarkedStartAddr {
+    /// `op->getResult(0)` (`:897`) — ⭐ THE BASE ITSELF: every start-address producer the reference
+    /// admits (`arith.constant`, `addi`, `subi`, `symbol.create_symbol`, `uniform.query_map`) binds
+    /// exactly one value, so the result number it hard-codes is the value that was read.
+    Result(Val),
+    /// `loop.getRegionIterArgs()[iter_idx]` (`:886`, `:895`) — ⛔ THE LOOP AND THE SLOT, NOT THE
+    /// VALUE. Where two records share one loop the slot can be the FIRST record's, read under the
+    /// LAST record's number ([`Mark::iter_index`]), and only re-reading the seat reproduces that.
+    Seat {
+        /// The loop's induction variable, which is how it is re-found once it has been cloned.
+        iv: Val,
+        /// `iter-index`.
+        iter_index: usize,
+    },
+}
+
+/// `:761-827` — THE `else`: an offset that is one constant needs only its own operand adjusted, and no
+/// loop is touched at all.
+///
+/// ⛔ THE L3 ARM **OVERWRITES** THE ADDRESS WITH THE OFFSET (`:783-786`) where every other unit ADDS to
+/// it: an L3 half's mutable address holds the memory op's offset and its immutable address holds the
+/// view's start, so combining them there would count the base twice.
+fn constant_only_address_adjustment(
+    comp: DfirUnit,
+    mutable_addrs_base: &mut AccessContainer<Val>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    coefficients: &GatheredCoefficients,
+    scope: &mut Vec<DfirOp>,
+    values: &mut Values,
+) -> AddressManipulation {
+    for i in 0..mutable_addrs_base.entries().len() {
+        let Some(addr) = mutable_addrs.entries().get(i).copied() else {
+            break;
+        };
+        // `DT_CHECK(indices_coeff_dict.find(nullptr) != indices_coeff_dict.end())` (`:766`) — the null
+        // key is [`GatheredCoefficients::constant`], a field that is always there.
+        let init_value = coefficients.constant.get(i).copied().unwrap_or(0);
+        let Some((list_path, at)) = insertion_after_definition(addr, scope) else {
+            return AddressManipulation::StartAddrUndefined;
+        };
+        // `dyn_cast_or_null<mlir::arith::ConstantIndexOp>(def_op)` (`:790`) — ⭐ NEVER A REGION
+        // ARGUMENT'S OWNER, so this and the block-arg insertion point above are exclusive.
+        let folded = match defining_op(addr, scope) {
+            Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => Some(*value),
+            _ => None,
+        };
+
+        let built: Vec<DfirOp> = if matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+            // `:781-787`.
+            let result = values.mint();
+            let ops = vec![DfirOp::Arith(arith::Op::Constant {
+                result,
+                value: init_value,
+            })];
+            write_both(mutable_addrs_base, mutable_addrs, i, result);
+            ops
+        } else if init_value == 0 {
+            // `:788` — *"If the init_value is 0, no update needed."*
+            continue;
+        } else if let Some(offset) = folded {
+            // `:790-803` — ⛔ A **NEW** CONSTANT, not an edit of the old one, which the reference
+            // leaves standing where it is.
+            let result = values.mint();
+            let ops = vec![DfirOp::Arith(arith::Op::Constant {
+                result,
+                value: init_value + offset,
+            })];
+            write_both(mutable_addrs_base, mutable_addrs, i, result);
+            ops
+        } else {
+            // `:804-816` — the constant, then `addi(mutable_addrs[i], init_const)`.
+            let addend = values.mint();
+            let sum = values.mint();
+            let ops = vec![
+                DfirOp::Arith(arith::Op::Constant {
+                    result: addend,
+                    value: init_value,
+                }),
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: sum,
+                    lhs: addr,
+                    rhs: addend,
+                    ty: ScalarTy::Index,
+                })),
+            ];
+            write_both(mutable_addrs_base, mutable_addrs, i, sum);
+            ops
+        };
+
+        let Some((list, _)) = ops_at_mut(scope, &list_path) else {
+            return AddressManipulation::StartAddrUndefined;
+        };
+        let at = at.min(list.len());
+        list.splice(at..at, built);
+    }
+    // `:827`.
+    AddressManipulation::Manipulated
+}
+
+/// `mutable_addrs[i] = mutable_addrs_base[i] = ..` — the chained assignment, once (`:783`, `:800`,
+/// `:812`, `:943-944`).
+fn write_both(
+    mutable_addrs_base: &mut AccessContainer<Val>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    i: usize,
+    addr: Val,
+) {
+    if let Some(slot) = mutable_addrs_base.entries_mut().get_mut(i) {
+        *slot = addr;
+    }
+    if let Some(slot) = mutable_addrs.entries_mut().get_mut(i) {
+        *slot = addr;
+    }
+}
+
+/// Replaces: e357_generateAffineAddressManipulationStmts
+///
+/// **357/384** `AgenToSentientLoweringPass::generateAffineAddressManipulationStmts` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:625` (381L). One address register per access record,
+/// initialised before the outermost loop that indexes it and advanced by that loop's own coefficient
+/// at every level of the nest.
+///
+/// ⛔⛔ EVERY INDEXING LOOP IS REPLACED BY A CLONE CARRYING ONE EXTRA `iter_arg` PER RECORD
+/// (`:833-851`), so every value inside them is re-minted. The reference carries the survivors across
+/// that on `"index"`/`"iter-index"`/`"marked"` ATTRIBUTES and this port carries them through the
+/// composed [`ValueMapping`]s, which answer the same question: `lookup(base)` IS
+/// `getRegionIterArgs()[iter_idx]` for a marked loop and IS `getResult(0)` for anything else, because
+/// every start-address producer the reference admits binds exactly one value.
+/// ⛔ THE LAST RECORD SHARING A DEF OP WINS (`:712` is a `setAttr`), and the earlier ones are left
+/// naming a value in the loop that was erased — a dangling `Value` in the reference and a `Val` no op
+/// in `scope` defines here. Both are read only by the caller that asked for them.
+pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
+    comp: DfirUnit,
+    access_details: &mut AccessContainer<T>,
+    mutable_addrs_base: &mut AccessContainer<Val>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    coefficients: &GatheredCoefficients,
+    scope: &mut Vec<DfirOp>,
+    values: &mut Values,
+) -> AddressManipulation {
+    // `:631-632`.
+    let records = access_details.entries().len();
+    if mutable_addrs_base.entries().len() != records || mutable_addrs.entries().len() != records {
+        return AddressManipulation::SizeMismatch;
+    }
+
+    // `:663-681` — ⭐ NOTHING TO SKIP: the reference's `record.first != nullptr` drops the constant
+    // row, which is [`GatheredCoefficients::constant`] here and was never in this list. The sort is
+    // `isProperAncestor` as a total order, and an enclosing loop's path is the SHORTER one — the entry
+    // 327 precedent (`:1152-1157`). ⭐ STABLE, so two iterators of one loop keep first-seen order,
+    // which is all `llvm::sort` promises for a comparator that answers `false` both ways.
+    let mut sorted: Vec<(Val, Vec<i64>)> = coefficients.per_index.clone();
+    sorted.sort_by_key(|(index, _)| binding_path(*index, scope).map_or(usize::MAX, |p| p.len()));
+
+    let Some((outermost_index, _)) = sorted.first() else {
+        return constant_only_address_adjustment(
+            comp,
+            mutable_addrs_base,
+            mutable_addrs,
+            coefficients,
+            scope,
+            values,
+        );
+    };
+    let Some(last_loop) = binding_path(*outermost_index, scope) else {
+        return AddressManipulation::IndexIsNotALoopIterator;
+    };
+
+    // `:697-759` — mark the bases defined inside the outermost indexing loop. ⛔ `last_loop` IS THE
+    // OUTERMOST one despite the name: it is `sorted.front()`.
+    let mut marks: Vec<Mark> = Vec::new();
+    for i in 0..records {
+        let Some(base) = mutable_addrs_base.entries().get(i).copied() else {
+            break;
+        };
+        let path = if let Some(owner) = binding_path(base, scope) {
+            // `:701-706` — `DT_CHECK(isa<affine::AffineForOp, scf::ForOp>(def_op))`.
+            if op_at(scope, &owner).and_then(CountedLoop::of).is_none() {
+                return AddressManipulation::StartAddrOwnerIsNotALoop;
+            }
+            owner
+        } else {
+            // ⛔ A `Val` NOTHING IN `scope` DEFINES cannot be inside `last_loop`, which is what the
+            // reference's `!last_loop->isAncestor(def_op)` answers for the pointer it just read.
+            match defining_path(base, scope) {
+                Some(path) => path,
+                None => continue,
+            }
+        };
+        // `:708` — `isAncestor` INCLUDES SELF, so the outermost loop's own arguments are marked too.
+        if !is_ancestor(&last_loop, &path) {
+            continue;
+        }
+        // `:719-737` and `:748-758` — which `iter_arg` this is, searched on the def op whichever way
+        // the base was reached: a loop RESULT used as a start address takes the same branch and finds
+        // nothing. ⛔ NOTHING IS FOUND FOR THE INDUCTION VARIABLE either, and the reference then
+        // leaves whatever an earlier record wrote.
+        let counted = op_at(scope, &path).and_then(CountedLoop::of);
+        let iter_index = counted
+            .as_ref()
+            .and_then(|loop_op| loop_op.carried.iter().position(|seat| seat.arg == base));
+        // `:897` is `getResult(0)`, which for every producer the reference admits IS the base; a loop
+        // is re-found by its induction variable instead, because the SLOT is what `:886` reads.
+        let anchor = counted.map_or(base, |loop_op| loop_op.iv);
+        let is_loop = counted.is_some();
+        // `:712`/`:733` — both are `setAttr` on the op, so the last record sharing it wins and
+        // `"iter-index"` is only overwritten where a match was found.
+        match marks.iter_mut().find(|mark| same_op(&mark.path, &path)) {
+            Some(mark) => {
+                mark.record = i;
+                if iter_index.is_some() {
+                    mark.iter_index = iter_index;
+                }
+            }
+            None => marks.push(Mark {
+                path,
+                record: i,
+                iter_index,
+                anchor,
+                is_loop,
+            }),
+        }
+    }
+
+    // `:880-882`/`:891-893` — the walk's `DT_CHECK`, which is a question about the pre-clone nest and
+    // so is answerable before the clones are made.
+    let mut marked: Vec<(usize, MarkedStartAddr)> = Vec::new();
+    for mark in marks {
+        marked.push(if mark.is_loop {
+            let Some(iter_index) = mark.iter_index else {
+                return AddressManipulation::StartAddrIsTheInductionVariable;
+            };
+            (
+                mark.record,
+                MarkedStartAddr::Seat {
+                    iv: mark.anchor,
+                    iter_index,
+                },
+            )
+        } else {
+            (mark.record, MarkedStartAddr::Result(mark.anchor))
+        });
+    }
+
+    // `:833-851` — ⛔ INNERMOST FIRST, so the outer clone carries the inner clone with it and the
+    // reference's *"to keep indices tracking valid"* comment holds for the mapping too.
+    let mut n_extra = 0usize;
+    let mut tracked: Vec<Option<Val>> = vec![None; sorted.len()];
+    for k in (0..sorted.len()).rev() {
+        n_extra = sorted[k].1.len();
+        // ⛔ THE REFERENCE READS A DANGLING `Operation*` WHERE TWO ITERATORS NAME ONE LOOP: the k+1
+        // iteration erased it. Here the value it was found by is simply no longer bound.
+        let Some(path) = binding_path(sorted[k].0, scope) else {
+            return AddressManipulation::IndexIsNotALoopIterator;
+        };
+        // `createForOpWithAdditionalReturnValue(loop_op, n, ir_map)` — ⭐ `delete_op` FALSE, to READ
+        // the mapping the reference's `true` default suppresses without reading; the erasure is the
+        // splice below either way, exactly as entry 327 does it (`:1064-1069`, `:1116`).
+        let mut grown = {
+            let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+                return AddressManipulation::IndexIsNotALoopIterator;
+            };
+            let Some(counted) = ops.get(ordinal).and_then(CountedLoop::of) else {
+                return AddressManipulation::UnsupportedLoopOperation;
+            };
+            create_for_op_with_additional_return_value(values, &counted, n_extra, false)
+        };
+        let ir_map = grown.ir_map.take().unwrap_or_default();
+        // ⭐ THIS IS THE `"marked"` AND `"index"` ATTRIBUTES: what survives the clone, and under which
+        // name.
+        for slot in tracked.iter_mut().flatten() {
+            *slot = ir_map.lookup_or_default(*slot);
+        }
+        for (_, target) in &mut marked {
+            match target {
+                MarkedStartAddr::Result(val) => *val = ir_map.lookup_or_default(*val),
+                MarkedStartAddr::Seat { iv, .. } => *iv = ir_map.lookup_or_default(*iv),
+            }
+        }
+        let Some(counted) = CountedLoop::of(&grown.op) else {
+            return AddressManipulation::UnsupportedLoopOperation;
+        };
+        tracked[k] = Some(counted.iv);
+
+        let replacements = core::mem::take(&mut grown.replacements);
+        let mut standing = core::mem::take(&mut grown.consts);
+        standing.push(grown.op);
+        let Some((ops, ordinal)) = ops_at_mut(scope, &path) else {
+            return AddressManipulation::IndexIsNotALoopIterator;
+        };
+        ops.splice(ordinal..=ordinal, standing);
+        for (old, new) in replacements {
+            replace_all_uses(scope, old, new);
+        }
+    }
+
+    // `:856-903` — the preorder walk, as the mapping's answer. ⛔ THE `removeAttr("marked")` IS INSIDE
+    // THE `isa<for>` GUARD (`:857-862`), so the memory op's own `"marked"` — set by entry 212 at
+    // `:546` — SURVIVES for [`lower_affine_composite_helper`] to re-find it. Nothing here clears it.
+    for (record, target) in &marked {
+        let base = match target {
+            MarkedStartAddr::Result(val) => *val,
+            // `:886`/`:895` — `loop.getRegionIterArgs()[iter_idx]` on the loop as it now stands: the
+            // clone's own arguments, with the added seats after the ones this index counts over.
+            MarkedStartAddr::Seat { iv, iter_index } => {
+                let Some(path) = binding_path(*iv, scope) else {
+                    return AddressManipulation::IndexIsNotALoopIterator;
+                };
+                let Some(arg) = op_at(scope, &path)
+                    .and_then(CountedLoop::of)
+                    .and_then(|loop_op| loop_op.carried.get(*iter_index).map(|seat| seat.arg))
+                else {
+                    return AddressManipulation::NoIterArgsOnLoop;
+                };
+                arg
+            }
+        };
+        if let Some(slot) = mutable_addrs_base.entries_mut().get_mut(*record) {
+            *slot = base;
+        }
+        // `:901`.
+        if let Some(entry) = access_details.entries_mut().get_mut(*record) {
+            entry.set_mem_view_start_addr(base);
+        }
+    }
+
+    // `for_ops` is the preorder collection of the loops just created, which is outermost-first — the
+    // order `tracked` is already in.
+    let for_ops: Vec<Val> = tracked.iter().flatten().copied().collect();
+    let Some(&outer_iv) = for_ops.first() else {
+        // `if (outer_most_loop)` (`:855`), unreachable with a non-empty `sorted`.
+        return AddressManipulation::Manipulated;
+    };
+
+    // `:919-945` — one initialisation per variable added to the outer loop.
+    let mut post_process: Vec<(usize, Val)> = Vec::new();
+    for i in 0..n_extra {
+        let init_value = coefficients.constant.get(i).copied().unwrap_or(0);
+        let Some(base) = mutable_addrs_base.entries().get(i).copied() else {
+            break;
+        };
+
+        // `:923-938` — ⭐ LIVE: `TOGGLE_INDIRECT_IMPL1` is `#define`d at `Helper.cpp:34`, and the
+        // `kIndSrc`/`kIndDst` records that reach here are the ones
+        // [`construct_affine_comp_details_and_addrs`] inserts (`:2830-2840`).
+        if access_details.entries().get(i).is_some_and(|record| {
+            matches!(
+                record.memory_index(),
+                Some(MemoryOperandIndex::IndSrc | MemoryOperandIndex::IndDst)
+            )
+        }) {
+            match defining_op(base, scope) {
+                Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => {
+                    if *value != 0 {
+                        post_process.push((i, base));
+                    }
+                }
+                Some(DfirOp::Arith(arith::Op::ConstantInt { value, .. })) => {
+                    if !matches!(
+                        value,
+                        arith::IntConst::Bool(false) | arith::IntConst::Int { value: 0, .. }
+                    ) {
+                        post_process.push((i, base));
+                    }
+                }
+                Some(
+                    DfirOp::Arith(arith::Op::SubI(_))
+                    | DfirOp::Symbol(dfir_op::symbol::Op::CreateSymbol { .. }),
+                ) => post_process.push((i, base)),
+                _ => return AddressManipulation::IndirectStartAddrUnexpected,
+            }
+        }
+
+        // `:940-944` — entry 272, whose ops `OpBuilder builder(loop_op)` puts immediately BEFORE the
+        // outermost loop.
+        let arm = if matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
+            // ⭐ NEVER READ: entry 272 returns the constant alone before it reaches entry 219 on L3.
+            StartAddrArm::AsItStands
+        } else {
+            let Some(outer) = binding_path(outer_iv, scope) else {
+                return AddressManipulation::IndexIsNotALoopIterator;
+            };
+            classify_start_addr(base, &outer, scope)
+        };
+        let def = match &arm {
+            StartAddrArm::AsItStands => StartAddrDef::Outside,
+            StartAddrArm::InLoopConstant(constant) => StartAddrDef::InLoopConstant(constant),
+            StartAddrArm::InLoopOther => StartAddrDef::InLoopOther,
+            StartAddrArm::Refused(refusal) => return refusal.clone(),
+        };
+        let mut preceding: Vec<Uniformized> = Vec::new();
+        let (built, addr) = match insert_initialization_stmt(
+            values,
+            comp,
+            init_value,
+            base,
+            &def,
+            &mut preceding,
+        ) {
+            InitializationStmt::Placed { ops, addr } => (ops, addr),
+            InitializationStmt::StartAddrRefused(refused) => {
+                return AddressManipulation::StartAddrRefused(refused);
+            }
+        };
+        let Some(outer) = binding_path(outer_iv, scope) else {
+            return AddressManipulation::IndexIsNotALoopIterator;
+        };
+        let Some((list, ordinal)) = ops_at_mut(scope, &outer) else {
+            return AddressManipulation::IndexIsNotALoopIterator;
+        };
+        let ordinal = ordinal.min(list.len());
+        list.splice(ordinal..ordinal, built);
+        write_both(mutable_addrs_base, mutable_addrs, i, addr);
+    }
+
+    // `:947-953` — the copy and add statements, one per (loop, record) pair.
+    for dim in 0..for_ops.len() {
+        for i in 0..n_extra {
+            let add_value = sorted[dim].1.get(i).copied().unwrap_or(0);
+            let Some(copy_value) = mutable_addrs.entries().get(i).copied() else {
+                break;
+            };
+            let Some(path) = binding_path(for_ops[dim], scope) else {
+                return AddressManipulation::IndexIsNotALoopIterator;
+            };
+            let Some((list, ordinal)) = ops_at_mut(scope, &path) else {
+                return AddressManipulation::IndexIsNotALoopIterator;
+            };
+            // ⛔ ENTRY 335 ERASES THE STALE INIT FROM THE **ENCLOSING** LIST while it rewrites the
+            // loop's own seats, and here both live in one `Vec` — so the loop is lifted out for the
+            // call and put back where the erasure leaves it.
+            let Some(stale) = list
+                .get(ordinal)
+                .and_then(CountedLoop::of)
+                .and_then(|counted| {
+                    let at = counted.carried.len().checked_sub(i + 1)?;
+                    counted.carried.get(at).map(|seat| seat.init)
+                })
+            else {
+                return AddressManipulation::NoIterArgsOnLoop;
+            };
+            let dead = list.iter().position(|op| results(op).contains(&stale));
+            let mut loop_op = list.remove(ordinal);
+            let advance = {
+                let Some((_, carried, body)) = counted_parts_mut(&mut loop_op) else {
+                    return AddressManipulation::UnsupportedLoopOperation;
+                };
+                insert_copy_and_add_stmts(
+                    values,
+                    AdvancedLoop { carried, body },
+                    list,
+                    i,
+                    copy_value,
+                    add_value,
+                )
+            };
+            let reinsert = match dead {
+                Some(at) if at < ordinal => ordinal - 1,
+                _ => ordinal,
+            };
+            list.insert(reinsert.min(list.len()), loop_op);
+            let Some(advance) = advance else {
+                return AddressManipulation::NoIterArgsOnLoop;
+            };
+            // ⭐ THE ARGUMENT, NOT THE SUM — see [`insert_copy_and_add_stmts_helper`].
+            if let Some(slot) = mutable_addrs.entries_mut().get_mut(i) {
+                *slot = advance.iter_arg;
+            }
+        }
+    }
+
+    // `:955-1006` — `findInvariantLoop`, then one `addi` into the seat's initialiser at that level.
+    for (record, saved) in post_process {
+        let Some(init) = defining_path(saved, scope) else {
+            return AddressManipulation::StartAddrUndefined;
+        };
+        let hoistable = matches!(
+            op_at(scope, &init),
+            Some(
+                DfirOp::Arith(arith::Op::Constant { .. } | arith::Op::ConstantInt { .. })
+                    | DfirOp::Symbol(dfir_op::symbol::Op::CreateSymbol { .. })
+            )
+        );
+        let found = if hoistable {
+            // `:957-962` — hoisted to just before the outermost loop, which is then the answer.
+            let Some(outer) = binding_path(outer_iv, scope) else {
+                return AddressManipulation::IndexIsNotALoopIterator;
+            };
+            if is_proper_ancestor(&outer, &init) {
+                move_before(scope, &init, &outer);
+            }
+            binding_path(outer_iv, scope)
+        } else {
+            match enclosing_loop_path(&init, scope) {
+                // `:978` — nothing encloses it, so it is invariant everywhere.
+                None => binding_path(outer_iv, scope),
+                Some(containing) => {
+                    let Some(innermost) = for_ops.last().and_then(|iv| binding_path(*iv, scope))
+                    else {
+                        return AddressManipulation::IndexIsNotALoopIterator;
+                    };
+                    // ⛔ `prev_loop` IS ASSIGNED **AFTER** THE EQUALITY TEST (`:982-987`), so
+                    // `for_ops.back() == loop_containing_init` answers `nullptr` — the warning below,
+                    // not the innermost loop.
+                    let mut prev: Option<Vec<(usize, usize)>> = None;
+                    let mut answer: Option<Vec<(usize, usize)>> = None;
+                    let mut cur: &[(usize, usize)] = &innermost;
+                    loop {
+                        if same_op(cur, &containing) {
+                            answer = prev;
+                            break;
+                        }
+                        if op_at(scope, cur).and_then(CountedLoop::of).is_some() {
+                            prev = Some(cur.to_vec());
+                        }
+                        if cur.len() <= 1 {
+                            break;
+                        }
+                        cur = &cur[..cur.len() - 1];
+                    }
+                    answer
+                }
+            }
+        };
+        let Some(loop_path) = found else {
+            // `:1000-1004`.
+            return AddressManipulation::NoInvariantLoopForIndirectStartAddr;
+        };
+        // `:991` — `DT_CHECK(outer_most_loop->isAncestor(loop))`.
+        let Some(outer) = binding_path(outer_iv, scope) else {
+            return AddressManipulation::IndexIsNotALoopIterator;
+        };
+        if !is_ancestor(&outer, &loop_path) {
+            return AddressManipulation::NoInvariantLoopForIndirectStartAddr;
+        }
+
+        // `:992-999` — `OpBuilder builder(loop)` puts the sum immediately before the loop, and the
+        // seat it rewrites is `getNumOperands() - v.first - 1`: COUNTED FROM THE END, as everything
+        // that touches these seats is ([`CarriedFromEnd`]).
+        let sum = values.mint();
+        let Some((list, ordinal)) = ops_at_mut(scope, &loop_path) else {
+            return AddressManipulation::IndexIsNotALoopIterator;
+        };
+        let Some((at, old_init)) =
+            list.get(ordinal)
+                .and_then(CountedLoop::of)
+                .and_then(|counted| {
+                    let at = counted.carried.len().checked_sub(record + 1)?;
+                    counted.carried.get(at).map(|seat| (at, seat.init))
+                })
+        else {
+            return AddressManipulation::NoIterArgsOnLoop;
+        };
+        list.insert(
+            ordinal,
+            DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                result: sum,
+                lhs: old_init,
+                rhs: saved,
+                ty: ScalarTy::Index,
+            })),
+        );
+        let Some((_, carried, _)) = list.get_mut(ordinal + 1).and_then(counted_parts_mut) else {
+            return AddressManipulation::UnsupportedLoopOperation;
+        };
+        if let Some(seat) = carried.get_mut(at) {
+            seat.init = sum;
+        }
+        if let Some(slot) = mutable_addrs_base.entries_mut().get_mut(record) {
+            *slot = sum;
+        }
+    }
+
+    // `:1008`.
+    AddressManipulation::Manipulated
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 360/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE OUTCOME OF [`construct_symbolic_details_and_addrs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum SymbolicDetailsAndAddrs {
+    /// The tail call to entry 327 succeeded (`Helper.cpp:2867-2868`).
+    Constructed,
+    /// *"unable to construct details for src"* (`:2857-2858`).
+    SrcDetailsFailed(ConstructedSymbolicDetails),
+    /// *"unable to construct details for dst"* (`:2864-2865`).
+    DstDetailsFailed(ConstructedSymbolicDetails),
+    /// `emplace_insert` ABORTS on a slot that is already taken; here the slot is a capability
+    /// ([`AccessContainer::vacancy`]) and a taken one refuses instead.
+    OperandSlotTaken(MemoryOperandIndex),
+    /// Entry 327 refused (`:2867`).
+    GatherFailed(SymbolicLoadStoreDetails),
+}
+
+/// Replaces: e360_constructSymbolicDetailsAndAddrs
+///
+/// **360/384** `AgenToSentientLoweringPass::constructSymbolicDetailsAndAddrs` —
+/// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849` (16L). The symbolic twin of entry 298: one
+/// record per direct operand, then entry 327 over both.
+///
+/// ⛔ THE DESTINATION IS OPTIONAL AND THE SOURCE IS NOT (`:2853`, `:2860`) — a lone symbolic store
+/// reaches this with `nullptr` for the destination, which is what makes `size() == 1` hold at `:3419`.
+/// ⛔ `unit_op` IS DEAD HERE: the reference threads it in (`:2851`) and neither the two
+/// `constructDetails` calls nor entry 327 reads it.
+/// ⛔ AND THE RECORDS' OP OUTLIVES THE GATHER, which CLONES the loops around them (entry 327 at
+/// `:1064-1074`) — so `src_op` is borrowed independently of `scope` and not out of it.
+pub fn construct_symbolic_details_and_addrs<'a>(
+    src_op: &'a agen::Op,
+    dst_op: Option<&'a agen::Op>,
+    comp: DfirUnit,
+    access_details: &mut AccessContainer<AccessDetailsSymbolic<'a>>,
+    mutable_addrs: &mut AccessContainer<Val>,
+    immutable_addrs: &mut AccessContainer<Val>,
+    scope: &mut Vec<DfirOp>,
+    values: &mut Values,
+) -> SymbolicDetailsAndAddrs {
+    // `DT_CHECK(src_op)` (`:2853`) — a `&agen::Op` cannot be null.
+    let Some(slot) = access_details.vacancy(MemoryOperandIndex::DirSrc) else {
+        return SymbolicDetailsAndAddrs::OperandSlotTaken(MemoryOperandIndex::DirSrc);
+    };
+    let src_ad = slot.emplace_insert(AccessDetailsSymbolic::new(src_op, comp));
+    let constructed = src_ad.construct_details(MemoryOperandIndex::DirSrc, scope);
+    if !constructed.admissible() {
+        return SymbolicDetailsAndAddrs::SrcDetailsFailed(constructed);
+    }
+
+    if let Some(dst_op) = dst_op {
+        let Some(slot) = access_details.vacancy(MemoryOperandIndex::DirDst) else {
+            return SymbolicDetailsAndAddrs::OperandSlotTaken(MemoryOperandIndex::DirDst);
+        };
+        let dst_ad = slot.emplace_insert(AccessDetailsSymbolic::new(dst_op, comp));
+        let constructed = dst_ad.construct_details(MemoryOperandIndex::DirDst, scope);
+        if !constructed.admissible() {
+            return SymbolicDetailsAndAddrs::DstDetailsFailed(constructed);
+        }
+    }
+
+    match gather_symbolic_load_store_details(
+        comp,
+        access_details,
+        mutable_addrs,
+        immutable_addrs,
+        scope,
+        values,
+    ) {
+        SymbolicLoadStoreDetails::Gathered => SymbolicDetailsAndAddrs::Constructed,
+        refused => SymbolicDetailsAndAddrs::GatherFailed(refused),
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 327/384
