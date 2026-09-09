@@ -89,6 +89,17 @@ impl<const N: u32> Bounded<N> {
         }
     }
 
+    /// A CIRCULAR INDEX — `% N`, so there is no out-of-range case and no `Option`.
+    ///
+    /// ⭐ FOR AN INDEX THAT IS GENUINELY MODULAR, AND ONLY THAT. The core ring's neighbour `hops`
+    /// away is `(i + hops) % N` *by definition*, so the modulo is the answer rather than a check that
+    /// might refuse — where [`Bounded::checked`] is right for an index that could be nonsense.
+    #[must_use]
+    pub const fn wrapping(index: u32) -> Self {
+        const { assert!(N > 0, "a bound of zero admits no index at all") }
+        Bounded(index % N)
+    }
+
     /// The index itself, for the one place it becomes text.
     #[must_use]
     pub const fn get(self) -> u32 {

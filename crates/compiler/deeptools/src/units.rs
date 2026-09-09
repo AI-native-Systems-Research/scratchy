@@ -46,6 +46,26 @@ impl<const CORES: u32> CoreId<CORES> {
         }
     }
 
+    /// THE CORE `hops` STEPS COUNTER-CLOCKWISE OF THIS ONE — the ring wraps, so this is total.
+    ///
+    /// ⛔⛔ THIS METHOD EXISTS BECAUSE THE VENDOR WROTE THE STEP AS A DIVISION. `printTrafficPerCore`
+    /// walks the CCW arc with `int ccoreId = (c + coreID) / 32;` in both of its CCW arms
+    /// (`dcg/dcg_fe/pcfg_gen/stcdpOp.cpp:5889,5904`) — a typo for `%` that charges every hop landing
+    /// below core 32 to core 0. Its own second copy of the identical walk writes
+    /// `% (int)maxNumCores` (`dcg/dcg_fe/pcfg_gen/inputNeighFetchOp.cpp:2294,2308,2318`), and the CW
+    /// arm three lines below it wraps by hand. One CCW hop is core `i` to core `i + 1`
+    /// (`dsc/dataOpDsc.h:216`); with the step in the type, `/` is no longer a thing to write.
+    #[must_use]
+    pub const fn step_ccw(self, hops: u32) -> CoreId<CORES> {
+        CoreId(Bounded::wrapping(self.0.get() + hops % CORES))
+    }
+
+    /// THE CORE `hops` STEPS CLOCKWISE OF THIS ONE — the other way round [`CoreId::step_ccw`]'s ring.
+    #[must_use]
+    pub const fn step_cw(self, hops: u32) -> CoreId<CORES> {
+        CoreId(Bounded::wrapping(self.0.get() + CORES - hops % CORES))
+    }
+
     /// The index, for the one place it becomes an attribute.
     #[must_use]
     pub const fn get(self) -> u32 {
