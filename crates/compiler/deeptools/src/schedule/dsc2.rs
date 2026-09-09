@@ -131,7 +131,8 @@ pub struct FoldCoeff(pub i64);
 pub struct FoldLabel(pub String);
 
 /// WHAT KIND OF FOLD — `CoordinateCategory` (`dsc/dsc2.h:66`) less `UNKNOWN_COORD`, which is only
-/// ever the value `addFold`'s `default:` arm raises on.
+/// ever the value `addFold`'s `default:` arm raises *"Unsupported coordinate category"* on
+/// (`dsc/dsc2.h:139-140`). Dropping it removes that refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CoordinateCategory {
     /// `SPATIAL_COORD` — a fold across components.
@@ -220,7 +221,7 @@ pub struct Coordinate {
 }
 
 impl Coordinate {
-    /// `hasCoordinateForDim` / `coordinates_.count(dim)`.
+    /// `hasCoordForDim` / `coordinates_.count(dim)` (`dsc/dsc2.h:254`).
     #[must_use]
     pub fn covers(&self, dim: PrimaryDim) -> bool {
         self.dims.contains_key(&dim)

@@ -238,13 +238,13 @@ pub fn all_dims_covered(dsc: &impl Dsc, coord: &dsc2::Coordinate, lds: LdsIdx) -
 }
 
 /// WHAT A BROADCAST DIM'S ELEMENT ARRANGEMENT COSTS — the reference's `scale`, which reaches
-/// `buildFoldForBroadcastDim` only when NEGATIVE (`ddc/ddc_fold.cpp:2298`, `:3975`, `:4284`) and
+/// `buildFoldForBroadcastDim` only when NEGATIVE (`ddc/ddc_fold.cpp:2301`, `:3975`, `:4284`) and
 /// there distinguishes exactly one value, `-2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastScale {
     /// Any negative scale other than `-2`: the arrangement is one element.
     Unit,
-    /// `scale == -2`: the dim's own cumulative stick size (`ddc/ddc_fold.cpp:92`).
+    /// `scale == -2`: the dim's own cumulative stick size (`ddc/ddc_fold.cpp:94`).
     CumulativeStickSize(FoldCardinality),
 }
 
@@ -403,7 +403,8 @@ pub fn component(node: Node<'_>, side: TransferSide) -> SenComponent {
 /// no dims where that operand has none — the reference's `myLdsIdx_ == -1`.
 ///
 /// ⛔ The reference's `DT_ERROR` for "neither input nor output specified" is unspellable, and its
-/// `DT_CHECK(inputPos == 0)` on a transfer cannot fail because a transfer has exactly one source.
+/// `DT_CHECK(inputPos == 0)` on a transfer cannot fail because its one transfer caller passes a
+/// literal 0 (`ddc/ddc_fold.cpp:802`); an input position past 0 here reads the src regardless.
 /// ⛔ TRAP: a position past the operand list gives no dims where the reference's `.at()` throws.
 #[must_use]
 pub fn layout_dims_from_node(dsc: &impl Dsc, node: Node<'_>, pos: OperandPos) -> Vec<PrimaryDim> {
@@ -441,20 +442,25 @@ pub fn need_to_consider_row_bundling<S: Stage>(core_ds: &S, working_dims: &[Prim
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
-// ⛔ THIS FILE CARRIES THE FOLD VOCABULARY TWICE, and a review pass owns converging it — entries
-// 078-085 landed on `crate::schedule::dsc2`, entries 086-095 on the block below, and each pair
-// below is ONE C++ declaration typed twice. `LdsIdx` was identical and is now `dsc2`'s alone; the
-// rest differ in a way that decides which survives, so they are not merged by guesswork:
-//   `dsc2::FoldCardinality(u32)` / `Cardinality(u64)` — `addFold` takes `int foldCardinality` and
-//     stores it in `FoldDimProp::factor_`, a `uint32_t` (`dsc/dsc2.h:120`, `foldInfrastructure.h:119`)
-//   `dsc2::FoldCoeff` / `Alpha` + `Beta` — one newtype for both coefficients lets a caller
-//     transpose them; two do not
-//   `dsc2::FoldLabel(String)` / `FoldLabel` (4 variants) — `addFold` takes a `std::string`; the
-//     later entries mint fixed spellings and entry 081 mints `"rowsplit_fold_" + dim`, which is a
-//     DIFFERENT label from entry 094's bare `"rowsplit_fold"` (`ddc/ddc_fold.cpp:100` vs `:2158`),
-//     so the closed set that covers both needs a dim-carrying variant
-//   `dsc2::CoordinateCategory` / `CoordCategory` — same three variants, same dropped `UNKNOWN_COORD`
-//   `dsc2::Coordinate` (the map and its counts) / `Coordinate` (the one `addFold` entry 093 makes)
+// ⛔ THIS FILE CARRIES THE FOLD VOCABULARY TWICE — entries 078-085 landed on
+// `crate::schedule::dsc2`, entries 086-095 on the block below. THE REVIEW WALKED ALL FIVE PAIRS AND
+// ONLY ONE WAS ONE C++ DECLARATION TYPED TWICE; the premise that they all were is withdrawn.
+// `LdsIdx` was identical and is now `dsc2`'s alone:
+//   `dsc2::CoordinateCategory` / `CoordCategory` — CONVERGED BY THIS REVIEW: one declaration
+//     (`dsc/dsc2.h:66`), same three variants, same dropped `UNKNOWN_COORD`, so `CoordCategory` is
+//     gone and this file uses `dsc2::CoordinateCategory`.
+//   `dsc2::FoldCardinality(u32)` / `Cardinality(u64)` — NOT ONE DECLARATION: `FoldDimProp::factor_`
+//     is `uint32_t` (`foldInfrastructure.h:153`) and `FoldParamInfoType::cardinality` is `int64_t`
+//     (`dsc/dsc2.h:1083`). Two widths, two types; converging them would erase one.
+//   `dsc2::FoldCoeff` / `Alpha` + `Beta` — both are `CoordinateBaseType`, but one newtype for both
+//     coefficients lets a caller transpose them and two do not, so the SPLIT pair should win.
+//   `dsc2::FoldLabel(String)` / `FoldLabel` (4 variants) — the enum should win, because the crate
+//     rule is that a closed set is an enum. Entry 081 mints `"rowsplit_fold_" + dim`, a DIFFERENT
+//     label from entry 094's bare `"rowsplit_fold"` (`ddc/ddc_fold.cpp:100` vs `:2158`), so the set
+//     covering both needs a dim-carrying variant first.
+//   `dsc2::Coordinate` / `Coordinate` — NOT A DUPLICATE: one is the concrete map, the other is this
+//     file's one-operation seam. The real gap is that the concrete type does not IMPLEMENT the seam,
+//     so entry 093 cannot be pointed at a real coordinate yet.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -529,7 +535,7 @@ pub struct DataStream {
 }
 
 /// A DATASTREAM END TOGETHER WITH THE MEMORY IT LIVES IN — the reference's parallel
-/// `inputsLdsAndLoopOffsets_.at(i)` / `inputs_.at(i)` pair (`ddc/ddc_fold.cpp:217-220`), zipped so
+/// `inputsLdsAndLoopOffsets_.at(i)` / `inputs_.at(i)` pair (`ddc/ddc_fold.cpp:221-222`), zipped so
 /// the two cannot disagree in length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredStream {
@@ -551,7 +557,7 @@ pub trait ScheduleTree {
 }
 
 /// A NODE PROVED TO BE A `BLOCK` — `DT_CHECK_MSG(commonAncestor->nodeType_ == BLOCK, "... is not a
-/// block node")` (`ddc/ddc_fold.cpp:270-272`) made unconstructible.
+/// block node")` (`ddc/ddc_fold.cpp:271-273`) made unconstructible.
 ///
 /// ⛔ `BLOCK` ONLY, NOT `isBlockNode()`: a `LOOP` and a `CONDITION` also have children, and entry
 /// 088's check refuses both.
@@ -588,7 +594,7 @@ pub trait Allocations {
 ///
 /// ⛔⛔ BOTH OF ENTRY 086'S `DT_ERROR`s ARE THIS TYPE. `hasAllocUser(node)` false gives *"ScheduleNode
 /// <n> is not a user of the allocateNode <a>"* (`ddc/ddc_fold.cpp:205-207`) and any `nodeType_` but
-/// `TRANSFER`/`COMPUTE` gives *"Unsupported nodeType for scheduleNode <n>"* (`:228`). Neither is
+/// `TRANSFER`/`COMPUTE` gives *"Unsupported nodeType for scheduleNode <n>"* (`:229`). Neither is
 /// reachable from a value of this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Incoming<'n>(IncomingStreams<'n>);
@@ -633,7 +639,7 @@ pub struct Cardinality(pub u64);
 
 impl Cardinality {
     /// A LAYOUT DIM'S CAPPED EXTENT AS A FOLD'S TRIP COUNT — the reference's
-    /// `newFoldParam.cardinality = maxDimSize` (`ddc/ddc_fold.cpp:397`): the split fold steps once
+    /// `newFoldParam.cardinality = maxDimSize` (`ddc/ddc_fold.cpp:366`): the split fold steps once
     /// per capped chunk, so the cap is the trip count.
     #[must_use]
     pub const fn of_capped_extent(extent: Elements) -> Self {
@@ -668,29 +674,15 @@ pub enum PadType {
     PaddedFullSpanWUnneeded,
 }
 
-/// WHICH AXIS OF THE COORDINATE A FOLD SITS ON — `dsc2::CoordinateCategory` (`dsc/dsc2.h:65`).
-///
-/// ⛔ `UNKNOWN_COORD` IS NOT HERE, AND THAT REMOVES A REFUSAL: it is the enum's zero and `addFold`'s
-/// `default:` arm aborts with *"Unsupported coordinate category"* (`dsc/dsc2.h:138-139`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum CoordCategory {
-    /// `SPATIAL_COORD` — spread across corelets, cores and rows.
-    Spatial,
-    /// `TEMPORAL_COORD` — walked over program time.
-    Temporal,
-    /// `ELEM_ARR_COORD` — the element arrangement inside one stick.
-    ElemArr,
-}
-
 /// A FOLD'S LABEL — `addFold`'s `foldLabel` / `FoldParamInfoType::foldDimLabel`, the closed set of
 /// spellings this file mints. A closed set is an enum here, never a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FoldLabel {
     /// `"corelet_fold_dim"` (`ddc/ddc_fold.cpp:2135`).
     CoreletFoldDim,
-    /// `"core_workslice_fold_dim"` (`:2148`).
+    /// `"core_workslice_fold_dim"` (`:2149`).
     CoreWorksliceFoldDim,
-    /// `"elem_arr_layout_split"` (`:400`).
+    /// `"elem_arr_layout_split"` (`:370`).
     ElemArrLayoutSplit,
     /// `"rowsplit_fold"` (`:2158,2172`).
     RowSplitFold,
@@ -712,7 +704,7 @@ impl FoldLabel {
 /// ONE FOLD LEVEL — `dsc2::FoldParamInfoType` (`dsc/dsc2.h:1081`).
 ///
 /// ⭐ INDEX 0 IS THE OUTERMOST LEVEL, throughout: `combineContigousLevels`' own diagram says so
-/// (`ddc/ddc_fold.cpp:388-392`) and `FoldManager::buildDim` inserts *before* `pos`
+/// (`ddc/ddc_fold.cpp:391-392`) and `FoldManager::buildDim` inserts *before* `pos`
 /// (`util/foldManager/foldInfrastructure.h:1350`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoldParamInfo {
@@ -727,7 +719,7 @@ pub struct FoldParamInfo {
 }
 
 /// A FOLD ABOUT TO BE ADDED TO A COORDINATE — `addFold`'s arguments other than the dim and the
-/// category (`dsc/dsc2.h:115`).
+/// category (`dsc/dsc2.h:120`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fold {
     /// `foldCardinality`.
@@ -742,11 +734,11 @@ pub struct Fold {
 
 /// `dsc2::CoordinateType<CoordinateBaseType>` reduced to the one operation entry 093 performs.
 pub trait Coordinate {
-    /// `addFold(dim, coordCat, cardinality, label, alpha, beta, /*pos=*/0)` (`dsc/dsc2.h:115`).
+    /// `addFold(dim, coordCat, cardinality, label, alpha, beta, /*pos=*/0)` (`dsc/dsc2.h:120`).
     ///
     /// ⛔⛔ `pos = 0` IS THE OUTERMOST POSITION, so the fold added SECOND ends up OUTSIDE the one
     /// added first (`foldInfrastructure.h:1350`, "insert new node before pos").
-    fn add_fold(&mut self, dim: PrimaryDim, category: CoordCategory, fold: Fold);
+    fn add_fold(&mut self, dim: PrimaryDim, category: CoordinateCategory, fold: Fold);
 }
 
 /// HOW MANY ELEMENT-ARRANGEMENT LEVELS OF THE FOLD LIST BELONG TO ONE ALLOCATE NODE — the
@@ -756,7 +748,7 @@ pub struct ElemArrFolds(pub u32);
 
 /// WHICH ELEMENT-ARRANGEMENT LEVEL A LOOP WAS RELATED TO — `LoopDistributionParamType::
 /// relatedElemArrLevel` (`dsc/dsc2.h:1113`), counted 1-based from the INNERMOST level:
-/// `currElemArrLevel = foldParams.size() - currElemArrIndex` (`ddc/ddc_fold.cpp:375`).
+/// `currElemArrLevel = foldParams.size() - currElemArrIndex` (`ddc/ddc_fold.cpp:341`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ElemArrLevel(pub u32);
 
@@ -764,16 +756,16 @@ pub struct ElemArrLevel(pub u32);
 /// 089 performs on it — the whole map stays with whoever owns it.
 pub trait LoopLevels {
     /// `++loopInfo.at(dim).relatedElemArrLevel` for EVERY loop whose `dim` entry sits at or inside
-    /// `level` (`ddc/ddc_fold.cpp:407-412`) — one insert shifted them all by one.
+    /// `level` (`ddc/ddc_fold.cpp:376-381`) — one insert shifted them all by one.
     fn bump_levels_at_or_inside(&mut self, dim: PrimaryDim, level: ElemArrLevel);
 }
 
 /// AN ALLOCATE NODE'S LAYOUT — `layoutDimOrder_` zipped with `maxDimSizes_`
-/// (`dsc/dsc2.h:952-953`), so the reference's parallel `.at(i)` pair cannot disagree in length.
+/// (`dsc/dsc2.h:982-983`), so the reference's parallel `.at(i)` pair cannot disagree in length.
 ///
-/// ⛔ THE CAP IS AN `Option`, NOT A NUMBER: the reference's `maxDimSize > 0` test (`:388`) folds
-/// zero and every negative into one absence, and absence stops the split rather than capping at
-/// nothing.
+/// ⛔ THE CAP IS AN `Option`, NOT A NUMBER: the reference's `maxDimSize > 0` test
+/// (`ddc/ddc_fold.cpp:358`) folds zero and every negative into one absence, and absence stops the
+/// split rather than capping at nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AllocLayout(pub Vec<(PrimaryDim, Option<Elements>)>);
 
@@ -792,7 +784,7 @@ pub trait CoreStage {
     /// padding sizes for the dim.
     fn pad_stride(&self, dim: PrimaryDim) -> Option<Stride>;
     /// `coreletSplit_.at(dim).at(0)` — the FIRST corelet's share, absent where the dim is not
-    /// corelet-split at all.
+    /// corelet-split at all, and also where its split list is EMPTY, which the reference `.at(0)`s.
     fn first_corelet_share(&self, dim: PrimaryDim) -> Option<Extent>;
     /// `dataStageDimToVal_compView_st(dim, SenComponents::NO_COMPONENT, -1, {})`
     /// (`dsc/dims.h:277`) — one core's whole extent for the dim, with no component, corelet or
@@ -826,7 +818,7 @@ pub enum ScaledLds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropEnd {
     /// `ALLOCATE` — the allocation, and the labeled-DS category that decides whether a match is
-    /// redirected to its value tensor. [`None`] covers the reference's `ldsIdx_ == -1` (`:465`).
+    /// redirected to its value tensor. [`None`] covers the reference's `ldsIdx_ == -1` (`:462`).
     Allocate {
         /// The allocation itself.
         alloc: AllocId,
@@ -949,9 +941,9 @@ pub fn order_descendants<T: ScheduleTree + ?Sized>(
 /// Splits the innermost non-unit elem-arr level into `maxDimSizes_` chunks along `coord_dim`.
 ///
 /// ⛔⛔ HALF THE BODY IS DEAD AND IS NOT REPRODUCED: the whole `stickDimSize` map (`:310-327`) is read
-/// only by an `if` whose body is COMMENTED OUT (`:356-358`), and `layoutDims` (`:343-344`) not at all.
-/// ⛔⛔ `remainingDimSizes` IS A REFERENCE INTO THE VECTOR BEING INSERTED INTO (`:342`, `:373`); every
-/// `DT_CHECK` (`:362`) is decided HERE first, so [`None`] leaves the fold list untouched.
+/// only by an `if` whose body is COMMENTED OUT (`:355-357`), and `layoutDims` (`:344-345`) not at all.
+/// ⛔⛔ `remainingDimSizes` IS A REFERENCE INTO THE VECTOR BEING INSERTED INTO (`:343`, `:371-372`);
+/// every `DT_CHECK` (`:362`) is decided HERE first, so [`None`] leaves the fold list untouched.
 pub fn construct_alloc_elem_arr_layout<S: SizeStage + ?Sized, L: LoopLevels + ?Sized>(
     stage: &S,
     layout: &AllocLayout,
@@ -1023,8 +1015,9 @@ pub fn construct_alloc_elem_arr_layout<S: SizeStage + ?Sized, L: LoopLevels + ?S
 /// cardinality-1 levels, scanning inner to outer over `start..=end` (`end` = innermost by default).
 ///
 /// ⛔⛔ THE MERGED ALPHA IS THE INNER ONE, NOT THE COMMENT'S: the diagram (`:409-412`) writes the value
-/// the outer level ALREADY had, while the code assigns `alpha_i` (`:413`). The code is right.
+/// the outer level ALREADY had, while the code assigns `alpha_i` (`:414`). The code is right.
 /// ⛔ AND THE INNERMOST LEVEL IS NEVER DROPPED for cardinality 1 — that arm only ever erases `i - 1`.
+/// ⚠️ AN `end` PAST THE LAST LEVEL IS CLAMPED to it, where the reference's `.at(end)` throws.
 pub fn combine_contigous_levels(
     fold_params: &mut Vec<FoldParamInfo>,
     start: usize,
@@ -1044,7 +1037,7 @@ pub fn combine_contigous_levels(
         let inner = fold_params[i];
         if i128::from(outer.alpha.0) == i128::from(inner.alpha.0) * i128::from(inner.cardinality.0)
         {
-            //   [Outer] elemArr(i-1) : ( alpha_(i) * card_(i), card_(i-1) * card_(i))
+            //   [Outer] elemArr(i-1) : ( alpha_(i), card_(i-1) * card_(i))
             //   [Inner] elemArr(i)   : Removed
             fold_params[i - 1].alpha = inner.alpha;
             fold_params[i - 1].cardinality =
@@ -1066,9 +1059,11 @@ pub fn combine_contigous_levels(
 /// Whether this datastream is the propagation's — by `data_connect=` if it names one, else by whether
 /// the stream's allocation in `storage` IS the propagation's allocate end.
 ///
-/// ⛔ A COMPUTE ON THE OTHER END REDIRECTS A SCALE TENSOR TO ITS VALUE TENSOR (`:459-471`): computes
+/// ⛔ A COMPUTE ON THE OTHER END REDIRECTS A SCALE TENSOR TO ITS VALUE TENSOR (`:461-471`): computes
 /// consume the values and the MX scales ride along. `LXLU` is exempt — an FMUL there converts FP4 to
 /// bf16 and touches the scale allocation directly.
+/// ⚠️ AN ABSENT VALUE ALLOCATION ANSWERS `false`; the reference aborts inside `getValueAllocation`
+/// (`dsc/dsc2.cpp:5824,5842`).
 #[must_use]
 pub fn match_data_stream<A: Allocations + ?Sized>(
     dsc: &A,
@@ -1149,7 +1144,7 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
         .map_or(Alpha(0), |share| Alpha(share.0.wrapping_mul(stride.0)));
     coord.add_fold(
         dim,
-        CoordCategory::Spatial,
+        CoordinateCategory::Spatial,
         Fold {
             cardinality: stage.corelets_used(),
             label: FoldLabel::CoreletFoldDim,
@@ -1161,7 +1156,7 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
     // Core workslice fold. Assumption: each core is assigned the same number of elements.
     coord.add_fold(
         dim,
-        CoordCategory::Spatial,
+        CoordinateCategory::Spatial,
         Fold {
             cardinality: stage.work_slices(dim),
             label: FoldLabel::CoreWorksliceFoldDim,
@@ -1175,13 +1170,13 @@ pub fn build_spatial_fold<S: CoreStage + ?Sized, C: Coordinate + ?Sized>(
 #[cfg(test)]
 mod tests_e086_e093 {
     use super::{
-        AllocId, AllocLayout, Allocations, Alpha, Beta, BlockId, Cardinality, CoordCategory,
-        CoordPropInfo, Coordinate, CoreStage, DataOrigin, DataStream, ElemArrFolds, ElemArrLevel,
-        Fold, FoldLabel, FoldParamInfo, Incoming, IncomingStreams, LdsIdx, LoopLevels, NodeId,
-        NodeKind, PadType, PropEnd, ScaledLds, ScheduleTree, SizeStage, StoredStream, Stride,
-        build_spatial_fold, combine_contigous_levels, construct_alloc_elem_arr_layout,
-        find_common_ancestor, is_allocate_incoming, match_data_stream, num_elements_in_pt_slice,
-        order_descendants,
+        AllocId, AllocLayout, Allocations, Alpha, Beta, BlockId, Cardinality, CoordPropInfo,
+        Coordinate, CoordinateCategory, CoreStage, DataOrigin, DataStream, ElemArrFolds,
+        ElemArrLevel, Fold, FoldLabel, FoldParamInfo, Incoming, IncomingStreams, LdsIdx,
+        LoopLevels, NodeId, NodeKind, PadType, PropEnd, ScaledLds, ScheduleTree, SizeStage,
+        StoredStream, Stride, build_spatial_fold, combine_contigous_levels,
+        construct_alloc_elem_arr_layout, find_common_ancestor, is_allocate_incoming,
+        match_data_stream, num_elements_in_pt_slice, order_descendants,
     };
     use crate::arch::{Dd2, Elements};
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
@@ -1191,7 +1186,7 @@ mod tests_e086_e093 {
     use crate::units::DfirUnit;
 
     /// A LOOKUP TABLE FOR `getAllocation` — the reference's own map keyed on `(myLdsIdx_, storage)`
-    /// (`dsc/dsc2.cpp:2596`), plus the scale-to-value edge beside it.
+    /// (`dsc/dsc2.cpp:2605-2607`), plus the scale-to-value edge beside it.
     #[derive(Default)]
     struct Allocs {
         placed: Vec<(LdsIdx, DfirUnit, AllocId)>,
@@ -1313,10 +1308,10 @@ mod tests_e086_e093 {
 
     /// Every `addFold` in the order it was made.
     #[derive(Default)]
-    struct Coord(Vec<(PrimaryDim, CoordCategory, Fold)>);
+    struct Coord(Vec<(PrimaryDim, CoordinateCategory, Fold)>);
 
     impl Coordinate for Coord {
-        fn add_fold(&mut self, dim: PrimaryDim, category: CoordCategory, fold: Fold) {
+        fn add_fold(&mut self, dim: PrimaryDim, category: CoordinateCategory, fold: Fold) {
             self.0.push((dim, category, fold));
         }
     }
@@ -1478,6 +1473,10 @@ mod tests_e086_e093 {
         assert_eq!(folds, vec![level(8, 7, 12)]);
         // ⛔ THE MERGED ALPHA IS THE INNER STRIDE — 8, not the comment's 32.
         assert_eq!(folds[0].alpha, Alpha(8));
+        // ⚠️ AN `end` PAST THE LAST LEVEL IS CLAMPED to it, where the reference's `.at(end)` throws.
+        let mut clamped = vec![level(32, 2, 3), level(8, 5, 4)];
+        combine_contigous_levels(&mut clamped, 0, Some(99));
+        assert_eq!(clamped, vec![level(8, 7, 12)]);
     }
 
     #[test]
@@ -1586,7 +1585,7 @@ mod tests_e086_e093 {
             vec![
                 (
                     PrimaryDim::Out,
-                    CoordCategory::Spatial,
+                    CoordinateCategory::Spatial,
                     Fold {
                         cardinality: Cardinality(2),
                         label: FoldLabel::CoreletFoldDim,
@@ -1596,7 +1595,7 @@ mod tests_e086_e093 {
                 ),
                 (
                     PrimaryDim::Out,
-                    CoordCategory::Spatial,
+                    CoordinateCategory::Spatial,
                     Fold {
                         cardinality: Cardinality(3),
                         label: FoldLabel::CoreWorksliceFoldDim,
@@ -1658,7 +1657,7 @@ impl FoldPosition {
     }
 }
 
-/// `FoldManager<CoordinateBaseType>` (`util/foldManager/foldInfrastructure.h:2262`) reduced to what
+/// `FoldManager<CoordinateBaseType>` (`util/foldManager/foldInfrastructure.h:898`) reduced to what
 /// entry 095 reads out of it.
 ///
 /// ⛔ AFFINE IN THE NAME BECAUSE THAT RETIRES A `DT_ERROR`. `getAlphaBeta` refuses any dimension
@@ -1714,13 +1713,14 @@ pub const fn default_row_split_fold() -> FoldParamInfo {
 /// (`ddc/ddc_fold.cpp:2224`).
 ///
 /// ⛔ THE ORDER IS LOAD-BEARING, NOT INCIDENTAL. Callers index the result by role —
-/// `foldParams.at(FOLD_POS_ROWSPLIT)` (`:3142`) — and re-add folds walking it BACKWARDS because
+/// `foldParams.at(FOLD_POS_ROWSPLIT)` (`:3146`) — and re-add folds walking it BACKWARDS because
 /// `addFold(.., pos = 0)` inserts at the front (`:3267-3279`). See [`FoldPosition`].
 ///
 /// ⛔ IT RETURNS THE LIST INSTEAD OF APPENDING TO ONE. The reference `push_back`s into an
 /// out-parameter, and all ten call sites pass a vector that is empty at that instant — eight freshly
 /// declared (`:499,621,2531,2997,3142,3413`, `L3DlOpsScheduler.cpp:7396,7617`) and two `clear()`ed
-/// on the two lines above (`:1343-1346`). The appending mode has no caller, so it is not offered.
+/// on the two lines above (`ddc/ddc_fold.cpp:1345-1346`). The appending mode has no caller, so it
+/// is not offered.
 ///
 /// ⚠️ ITS L3 TWIN IS A SEPARATE UNIT. `L3DlOpsScheduler::gatherFoldParams`
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7248`) is this function character for character and
