@@ -213,6 +213,14 @@ mod unit_tests {
         fn group_leaders(&self) -> Vec<Val> {
             self.0.clone()
         }
+
+        fn is_group_leader(&self, unit: Val) -> bool {
+            self.0.contains(&unit)
+        }
+
+        fn group_members_led_by(&self, _leader: Val) -> Vec<Val> {
+            Vec::new()
+        }
     }
 
     /// e131_runLocalAnalysis — the sequence, and the globals merged LAST and already purged.

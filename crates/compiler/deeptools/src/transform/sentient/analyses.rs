@@ -525,6 +525,14 @@ pub trait UniformGroups {
     /// `getGroupLeaders()` (`Analyses/UniformGroupAnalysis.h:67`) — one unit value per exclusive
     /// group.
     fn group_leaders(&self) -> Vec<Val>;
+
+    /// `isGroupLeader(unit)` (`Analyses/UniformGroupAnalysis.h:68`) — is `unit` a leader, which the
+    /// analysis answers as "not a key of `non_leader_group_members_`".
+    fn is_group_leader(&self, unit: Val) -> bool;
+
+    /// `getGroupMembersLedBy(leader)` (`Analyses/UniformGroupAnalysis.h:72`) — the non-leader units
+    /// `leader` speaks for, `leader` itself excluded.
+    fn group_members_led_by(&self, leader: Val) -> Vec<Val>;
 }
 
 /// THE ONE CRATE IMPLEMENTATION of [`CandidateCollector`]: asking it anything is a `todo!`.
@@ -588,6 +596,18 @@ impl UniformGroups for OutOfScopeUniformGroups {
     fn group_leaders(&self) -> Vec<Val> {
         todo!(
             "UniformGroupAnalyzer::getGroupLeaders (Analyses/UniformGroupAnalysis.h:67) — out of campaign scope"
+        )
+    }
+
+    fn is_group_leader(&self, _unit: Val) -> bool {
+        todo!(
+            "UniformGroupAnalyzer::isGroupLeader (Analyses/UniformGroupAnalysis.h:68) — out of campaign scope"
+        )
+    }
+
+    fn group_members_led_by(&self, _leader: Val) -> Vec<Val> {
+        todo!(
+            "UniformGroupAnalyzer::getGroupMembersLedBy (Analyses/UniformGroupAnalysis.h:72) — out of campaign scope"
         )
     }
 }
@@ -684,6 +704,10 @@ pub trait Liveness {
     /// `updateLiveRangesForProgramHeaderPromotion(candidate)` (`Analyses/Liveness.h:130`) — widens
     /// `candidate`'s live range to the whole program because it is about to live in the header.
     fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val);
+
+    /// `isLiveRangeOverlaps(val1, val2)` (`Analyses/Liveness.h:111`) — do the two values' live
+    /// ranges intersect anywhere, i.e. may they NOT share one register.
+    fn is_live_range_overlaps(&self, val1: Val, val2: Val) -> bool;
 }
 
 /// THE ONE CRATE IMPLEMENTATION: liveness is not ported, so telling it anything is a `todo!`.
@@ -695,6 +719,10 @@ impl Liveness for OutOfScopeLiveness {
         todo!(
             "Liveness::updateLiveRangesForProgramHeaderPromotion (Analyses/Liveness.h:130) — out of campaign scope"
         )
+    }
+
+    fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+        todo!("Liveness::isLiveRangeOverlaps (Analyses/Liveness.h:111) — out of campaign scope")
     }
 }
 

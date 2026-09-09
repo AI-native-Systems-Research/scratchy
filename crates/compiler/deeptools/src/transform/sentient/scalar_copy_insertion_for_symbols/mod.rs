@@ -717,6 +717,10 @@ mod unit_tests {
         fn update_live_ranges_for_program_header_promotion(&mut self, candidate: Val) {
             self.0.push(candidate);
         }
+
+        fn is_live_range_overlaps(&self, _val1: Val, _val2: Val) -> bool {
+            todo!("this fake records promotions only; no unit here asks it about an overlap")
+        }
     }
 
     /// `e149` — the four arms, with the inner loop rejected by `isOuterMostLoop` and the misplaced

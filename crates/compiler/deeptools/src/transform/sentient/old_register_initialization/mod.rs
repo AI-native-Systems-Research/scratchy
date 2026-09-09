@@ -94,16 +94,14 @@
 pub(crate) mod register_init_candidate_promoter;
 pub(crate) mod register_init_info;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::formats::Bits;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::print;
 
-/// `ssa_weight_`'s value — *"weight is based on number of times it is accessed"* (`:123-124`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Weight(pub i32);
+use self::register_init_info::{RegisterInitInfo, SsaWeights};
 
 /// Replaces: e102_dumpWeights
 ///
@@ -111,16 +109,16 @@ pub struct Weight(pub i32);
 ///
 /// ⛔ TRAP: `llvm::errs()` IS A DUMP AND A DUMP IS A STRING HERE — the caller (`e331_dumpWeight`)
 /// wraps these lines in its own banner, so returning them is what lets it.
-/// ⭐ ORDERED, WHERE `DenseMap` IS NOT: the reference's iteration order is unspecified, so a
-/// `BTreeMap` is the only version of this whose output is the same twice.
+/// ⭐ ORDERED, WHERE `DenseMap` IS NOT: the reference's iteration order is unspecified, so
+/// [`SsaWeights`]' `BTreeMap` is the only version of this whose output is the same twice.
 /// ⚠️ A VALUE WITH NO DEFINING OP IN `scope` GETS `Value::print`'S BLOCK-ARGUMENT LINE WITHOUT ITS
 /// TYPE — this island carries no per-value type. And [`print::emit`] ends its line, so `--t>` starts
 /// the next one rather than following on the same one.
 #[must_use]
-pub fn dump_weights(ssa_weight: &BTreeMap<Val, Weight>, scope: &[Op]) -> String {
+pub fn dump_weights(ssa_weight: &SsaWeights, scope: &[Op]) -> String {
     let mut out = String::new();
-    for (val, weight) in ssa_weight {
-        match dialects::defining_op(*val, scope) {
+    for (val, weight) in ssa_weight.iter() {
+        match dialects::defining_op(val, scope) {
             Some(op) => print::emit(&mut out, op, 0),
             None => {
                 let _ = writeln!(out, "<block argument> {val:?}");
@@ -255,20 +253,68 @@ pub fn has_same_attr(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bool
     }
 }
 
-// crustify:todo: e326_replaceVirtualAssignTarget
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:159  (8 body lines, level 1)
-//   original  : void replaceVirtualAssignTarget(mlir::Value old_v, mlir::Value new_v)
-//   calls     : e252_size
+// e326_replaceVirtualAssignTarget is ported ONE MODULE DOWN, as the method it is: it mutates
+// `enforced_virtual_assign_` and `final_reg_coalescing_candidates_`, two fields of the
+// `RegisterInitInfo` that lives in `register_init_info.rs` beside the four other units of the same
+// class this batch fills. A free function here would need both fields passed in and would leave the
+// class's state split across two files — see the same promotion at `utils/mod.rs:1214`.
+// ⭐ FILLED ANCHOR: `register_init_info.rs`, `RegisterInitInfo::replace_virtual_assign_target`.
 
-// crustify:todo: e331_dumpWeight
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:706  (5 body lines, level 1)
-//   original  : void OldRegisterInitializationPass::dumpWeight( std::vector<RegisterInitInfo> &rtis)
-//   calls     : e102_dumpWeights
+/// Replaces: e331_dumpWeight
+///
+/// Every program unit's weight table between one pair of banners (`OldRegisterInitialization.cpp:706-712`).
+///
+/// ⛔ TRAP: THE BANNERS EACH OPEN WITH A BLANK LINE, `"\n------Op Weights Begin------\n"`, so the
+/// dump is separated from whatever `llvm::errs()` last wrote and again from the first weight line.
+#[must_use]
+pub fn dump_weight(rtis: &[RegisterInitInfo], scope: &[Op]) -> String {
+    let mut out = String::from("\n------Op Weights Begin------\n");
+    for rti in rtis {
+        out.push_str(&dump_weights(&rti.ssa_weight, scope));
+    }
+    out.push_str("\n------Op Weights End------\n");
+    out
+}
 
-// crustify:todo: e332_moveSSAToInit
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:715  (25 body lines, level 1)
-//   original  : static void moveSSAToInit(mlir::Value val)
-//   calls     : e252_size
+/// Replaces: e332_moveSSAToInit
+///
+/// Marks the op behind one promoted value for the program header: a `sentient.scalar_copy` outright,
+/// or the one carried position of a `sentient.for` that binds it (`OldRegisterInitialization.cpp:715-739`).
+///
+/// ⛔ TRAP: ONLY THE MATCHING LOOP POSITION IS SET AND EVERY OTHER IS PRESERVED. The reference rebuilds
+/// the whole `programHeader` array to do it, padding positions the old array never reached with
+/// `false` — which is the same IR here, because absent IS all-false; see `e108`'s TRAP.
+/// ⚠️ A VALUE THAT IS NEITHER — a loop RESULT, an induction variable, any other op's result — is a
+/// no-op, which is the reference's own outcome: its rebuilt array reproduces itself.
+pub fn move_ssa_to_init(scope: &mut [Op], val: Val) {
+    for op in scope.iter_mut() {
+        match op {
+            Op::Sentient(inner) => {
+                match inner {
+                    sentient::Op::ScalarCopy {
+                        result,
+                        program_header,
+                        ..
+                    } if *result == val => *program_header = true,
+                    sentient::Op::For { carried, .. } => {
+                        for position in carried.iter_mut() {
+                            if position.arg == val {
+                                position.program_header = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for region in sentient::regions_mut(inner) {
+                    move_ssa_to_init(region, val);
+                }
+            }
+            Op::AffineFor(loop_op) => move_ssa_to_init(&mut loop_op.body, val),
+            // ⛔ PROVED ABSENT BY THE TYPE, exactly as `e108`'s tail is.
+            _ => {}
+        }
+    }
+}
 
 // crustify:todo: e570_getFirstSource
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:788  (5 body lines, level 4)
@@ -287,13 +333,15 @@ pub fn has_same_attr(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bool
 
 #[cfg(test)]
 mod unit_tests {
+    use super::register_init_info::{RegisterInitInfo, SsaWeight, SsaWeights};
     use super::{
-        Weight, dump_weights, erase_deleted_ops, has_same_attr, remove_init_attr_from_ops,
+        dump_weight, dump_weights, erase_deleted_ops, has_same_attr, move_ssa_to_init,
+        remove_init_attr_from_ops,
     };
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Op, Val, sentient};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     /// `%r = sentient.scalar_copy %in`, in or out of the program header and at a width.
     fn copy(input: u32, result: u32, element_size: Option<Bits>, program_header: bool) -> Op {
@@ -328,12 +376,86 @@ mod unit_tests {
     #[test]
     fn e102_prints_each_weighted_value_above_its_weight() {
         let scope = vec![copy(1, 2, None, false)];
-        let mut weights = BTreeMap::new();
-        weights.insert(Val(2), Weight(7));
-        weights.insert(Val(9), Weight(-1));
+        let mut weights = SsaWeights::default();
+        weights.set(Val(2), SsaWeight(7));
+        weights.set(Val(9), SsaWeight(-1));
         assert_eq!(
             dump_weights(&weights, &scope),
             "%2 = sentient.scalar_copy %1  {reg_locale = \"lbr\"} : index\n--t> 7\n<block argument> Val(9)\n--t> -1\n"
+        );
+    }
+
+    /// e331 — one pair of banners around EVERY unit's table, each opening with a blank line.
+    #[test]
+    fn e331_wraps_every_units_weights_in_one_pair_of_banners() {
+        let scope = vec![copy(1, 2, None, false)];
+        let mut first = RegisterInitInfo::default();
+        first.ssa_weight.set(Val(2), SsaWeight(7));
+        let mut second = RegisterInitInfo::default();
+        second.ssa_weight.set(Val(9), SsaWeight(3));
+
+        assert_eq!(
+            dump_weight(&[first, second], &scope),
+            "\n------Op Weights Begin------\n\
+             %2 = sentient.scalar_copy %1  {reg_locale = \"lbr\"} : index\n--t> 7\n\
+             <block argument> Val(9)\n--t> 3\n\
+             \n------Op Weights End------\n"
+        );
+    }
+
+    /// e332 — the copy is marked, the loop position that binds the value is marked, and its
+    /// neighbour keeps the flag it already had.
+    #[test]
+    fn e332_marks_only_the_op_behind_the_promoted_value() {
+        let mut body = vec![
+            copy(1, 2, None, false),
+            copy(1, 3, None, false),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(4),
+                bound: Val(5),
+                carried: vec![
+                    sentient::Carried {
+                        program_header: false,
+                        ..carried(1, 6, 7, None)
+                    },
+                    sentient::Carried {
+                        program_header: false,
+                        ..carried(1, 8, 9, None)
+                    },
+                ],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+
+        move_ssa_to_init(&mut body, Val(2));
+        move_ssa_to_init(&mut body, Val(8));
+        // ⚠️ A LOOP RESULT IS A NO-OP, and so is a value nothing here binds.
+        move_ssa_to_init(&mut body, Val(7));
+        move_ssa_to_init(&mut body, Val(99));
+
+        assert_eq!(
+            body,
+            vec![
+                copy(1, 2, None, true),
+                copy(1, 3, None, false),
+                Op::Sentient(sentient::Op::For {
+                    iv: Val(4),
+                    bound: Val(5),
+                    carried: vec![
+                        sentient::Carried {
+                            program_header: false,
+                            ..carried(1, 6, 7, None)
+                        },
+                        sentient::Carried {
+                            program_header: true,
+                            ..carried(1, 8, 9, None)
+                        },
+                    ],
+                    dbg_name: None,
+                    body: Vec::new(),
+                }),
+            ]
         );
     }
 

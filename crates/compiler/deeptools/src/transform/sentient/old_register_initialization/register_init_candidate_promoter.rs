@@ -88,7 +88,11 @@
 #![allow(dead_code)]
 
 use crate::islands::dataflow_ir::dialects as lower;
-use crate::islands::sentient::dialects::{self, Op, Val, dataflow, sentient, symbol, uniform};
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, Val, dataflow, sentient, symbol, uniform,
+};
+use crate::transform::sentient::analyses::UniformGroups;
+use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
 
 /// WHERE THE OP BEHIND A CANDIDATE SITS — what `getParentOfType<uniform::UniformizeRegionsOp,
 /// uniform::EqualizePatternOp>` answers about it (`:1081-1083`).
@@ -255,10 +259,74 @@ pub fn is_same_op_type(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bo
     }
 }
 
-// crustify:todo: e333_constructValues
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1107  (34 body lines, level 1)
-//   original  : void RegisterInitCandidatePromoter::constructValues( mlir::Value val, mlir::Value core, dcc::utils::UnitsAndTheirValues &results) const
-//   calls     : e251_add, e252_size
+/// `def_map.getNonNullValuesFromKeys({key})` for ONE key — the entry a
+/// `uniform.def_immutable_mapping` holds for it, or nothing (`dataflow-scheduler/.../lib/Dialect/
+/// Uniform/Uniform.cpp:548-556`).
+fn mapped_value(map: Val, key: Val, defs: Definitions<'_>) -> Option<Val> {
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
+        return None;
+    };
+    pairs
+        .iter()
+        .find(|(mapped, _)| *mapped == key)
+        .map(|(_, value)| *value)
+}
+
+/// THE UNITS ONE `dataflow.get_unit` STANDS FOR — `get_unit_op->getResults()`.
+///
+/// ⛔ ONE, AND THAT IS A RECORDED ISLAND GAP, NOT A CHOICE. `dataflow.get_unit` binds
+/// `Variadic<Index>:$units` in the reference (`Dataflow.td:56-58`) while this island's
+/// [`dataflow::Op::GetUnit`] binds a single [`Val`] — the same gap
+/// `bridges/dataflow_ir_to_sentient/tf_unit_filtering.rs:1211-1274` records, where the rebuild's only
+/// observable is `num_folds`. So `nfolds` is 1 here and the fold loop runs once.
+fn folds_of(core: Val) -> Vec<Val> {
+    vec![core]
+}
+
+/// Replaces: e333_constructValues
+///
+/// Pairs every unit a candidate must be shared across with the value that unit needs: one entry per
+/// fold of `core`'s `dataflow.get_unit`, plus one for each non-leader unit `core` speaks for
+/// (`OldRegisterInitialization.cpp:1107-1141`).
+///
+/// ⛔ TRAP: A UNIFORMIZED CANDIDATE IS PER-UNIT AND EVERY OTHER IS SHARED. Behind a
+/// `uniform.query_map` each key gets its OWN mapped value; behind anything else every key gets the
+/// SAME `val`.
+/// ⛔ TRAP: A FOLLOWER RESOLVING TO `core`'S OWN `get_unit` IS SKIPPED — it is already one of the
+/// folds above, and adding it twice would make `areAllValuesEqual` (`e253`) count one unit twice.
+/// ⚠️ `DT_CHECK(tmp_values.size() == tmp_keys.size())` BECOMES A HOLE: `getNonNullValuesFromKeys` drops
+/// a key the map has no entry for, so a key with no entry is added with `None` here — identical
+/// whenever the check holds, and `None` is what [`UnitsAndTheirValues`] already spells a null value.
+pub fn construct_values<U: UniformGroups>(
+    val: Val,
+    core: Val,
+    results: &mut UnitsAndTheirValues,
+    defs: Definitions<'_>,
+    uga: &U,
+) {
+    let mut keys = folds_of(core);
+    // `uga_.isGroupLeader(core)` then `getGroupMembersLedBy(core)` — the units this one answers for.
+    if uga.is_group_leader(core) {
+        for follower in uga.group_members_led_by(core) {
+            if follower != core {
+                keys.push(follower);
+            }
+        }
+    }
+    match defs.of(val) {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let map = *map;
+            for key in keys {
+                results.add(key, mapped_value(map, key, defs));
+            }
+        }
+        _ => {
+            for key in keys {
+                results.add(key, Some(val));
+            }
+        }
+    }
+}
 
 // crustify:todo: e452_postProcessing
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1047  (27 body lines, level 2)
@@ -282,11 +350,39 @@ pub fn is_same_op_type(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bo
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{is_same_op_type, is_within_global_region};
+    use super::{construct_values, is_same_op_type, is_within_global_region};
     use crate::islands::dataflow_ir::dialects as lower;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient, symbol, uniform};
+    use crate::islands::sentient::dialects::{
+        Definitions, Op, Val, dataflow, sentient, symbol, uniform,
+    };
+    use crate::transform::sentient::analyses::UniformGroups;
+    use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
     use crate::units::{DfirUnit, Residency};
+
+    /// The out-of-scope group analysis, answering for ONE leader and its followers.
+    struct Groups {
+        leader: Val,
+        followers: Vec<Val>,
+    }
+
+    impl UniformGroups for Groups {
+        fn group_leaders(&self) -> Vec<Val> {
+            vec![self.leader]
+        }
+
+        fn is_group_leader(&self, unit: Val) -> bool {
+            unit == self.leader
+        }
+
+        fn group_members_led_by(&self, leader: Val) -> Vec<Val> {
+            if leader == self.leader {
+                self.followers.clone()
+            } else {
+                Vec::new()
+            }
+        }
+    }
 
     /// `%r = dataflow.get_unit`, at whichever rung the region holding it is.
     fn get_unit(result: u32) -> dataflow::Op {
@@ -353,6 +449,57 @@ mod unit_tests {
         // not a local region.
         assert!(is_within_global_region(Val(4), &scope));
         assert!(is_within_global_region(Val(5), &scope));
+    }
+
+    /// e333 — a plain candidate is shared with every unit, and a uniformized one is looked up PER
+    /// unit, with the follower that is `core` itself skipped.
+    #[test]
+    fn e333_shares_one_value_but_looks_a_uniformized_one_up_per_unit() {
+        let scope = vec![
+            Op::Dataflow(get_unit(1)),
+            Op::Dataflow(get_unit(2)),
+            scalar_constant(3),
+            scalar_constant(4),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(5),
+                pairs: vec![(Val(1), Val(3)), (Val(2), Val(4))],
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(6),
+                map: Val(5),
+                key: Val(1),
+            }),
+        ];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+        let groups = Groups {
+            leader: Val(1),
+            // ⭐ `core` ITSELF AMONG ITS OWN FOLLOWERS: skipped, because the fold loop added it.
+            followers: vec![Val(1), Val(2)],
+        };
+
+        let mut shared = UnitsAndTheirValues::default();
+        construct_values(Val(3), Val(1), &mut shared, defs, &groups);
+        assert_eq!(
+            shared.pairs,
+            vec![(Val(1), Some(Val(3))), (Val(2), Some(Val(3)))]
+        );
+
+        let mut per_unit = UnitsAndTheirValues::default();
+        construct_values(Val(6), Val(1), &mut per_unit, defs, &groups);
+        assert_eq!(
+            per_unit.pairs,
+            vec![(Val(1), Some(Val(3))), (Val(2), Some(Val(4)))]
+        );
+
+        // ⚠️ A KEY THE MAP HAS NO ENTRY FOR IS THE DROPPED `getNonNullValuesFromKeys` HOLE.
+        let mut hole = UnitsAndTheirValues::default();
+        let unmapped = Groups {
+            leader: Val(1),
+            followers: vec![Val(9)],
+        };
+        construct_values(Val(6), Val(1), &mut hole, defs, &unmapped);
+        assert_eq!(hole.pairs, vec![(Val(1), Some(Val(3))), (Val(9), None)]);
     }
 
     /// e112 — a matching pair, a mismatched one, the null side, and the region argument whose
