@@ -5990,7 +5990,7 @@ scf.if %11 {
     /// each get their own load, the original load and its whole rotate/send tail go on the erase
     /// list, the paged view goes with them, and `mem_ops_` comes back as the FOUR replacements.
     ///
-    /// `paged_mem_view_loads.mlir:286-299` in, `:44-180` out.
+    /// `paged_mem_view_loads.mlir:286-299` in, `:44-112` out.
     ///
     /// ⛔ THE ERASE LIST IS CONSUMER-FIRST AND IT IS NOT JUST THE LOAD: `TPMVVectorLoad` overrides
     /// `eraseMemOpAndUseChain` (entry 129), so a port that called the base's one-op answer here would
@@ -7821,14 +7821,14 @@ impl<'p> TpmvBase<'p> {
                 return TransformedPagedViews::PagesNotConstructed(constructed);
             };
 
-            // `info.indices_ = indices;` (`:497`) and `info.conditional_iter_args_` (`:481`) — what
+            // `info.indices_ = indices;` (`:216`) and `info.conditional_iter_args_` (`:466-474`) — what
             // the page walk wrote back into `info`, threaded out through [`PagedAccess`].
             let info = &mut self.tpmv_info[i];
             info.indices = access.indices.clone();
             info.conditional_iter_args = access.conditional_iter_args.clone();
 
             // "The other TPMVInfo objects need to be synced as the values they use for paged_mem_view
-            // or indices may have changed as a result of the clones." (`:518-520`) — per cloned loop,
+            // or indices may have changed as a result of the clones." (`:515-520`) — per cloned loop,
             // in the order `createIterArgsForConditionals` cloned them.
             for page in &pages {
                 for ir_map in &page.ir_maps {

@@ -10073,7 +10073,7 @@ pub(super) fn mem_views_in_pre_order<'a>(body: &'a [DfirOp], found: &mut Vec<&'a
     }
 }
 
-/// WHICH OF THE FOUR TRANSFORMS RAN ON ONE CANDIDATE, AND WHAT IT ANSWERED — `:281-291`.
+/// WHICH OF THE FOUR TRANSFORMS RAN ON ONE CANDIDATE, AND WHAT IT ANSWERED — `:284-294`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MasDispatch<'a> {
     /// `if (isa<agen::VectorLoadOp>(candidate.op_)) transformVectorLoad(candidate);`
@@ -10095,7 +10095,7 @@ pub enum MasDispatch<'a> {
 /// ONE ENTRY OF `candidates`, AND WHAT THE DISPATCH LOOP DID WITH IT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasSplit<'a> {
-    /// `candidates.emplace_back(mem_op, unit, comp, mem_index)` (`:277`).
+    /// `candidates.emplace_back(mem_op, unit, comp, mem_index)` (`:278`).
     pub candidate: MasCandidate<'a>,
     /// The transform's own answer.
     pub dispatch: MasDispatch<'a>,
@@ -10104,7 +10104,7 @@ pub struct MasSplit<'a> {
 /// WHAT THE PASS DID TO A PROGRAM — or the `DT_CHECK` in the collecting walk that stopped it.
 ///
 /// ⛔ THE THREE REFUSALS END THE WHOLE PASS, WHICH IS WHY THEY ARE NOT PER-CANDIDATE. All three are
-/// `DT_CHECK`s inside the module walk (`:253`, `:271`, `:275`), and the walk finishes before the
+/// `DT_CHECK`s inside the module walk (`:255`, `:272`, `:276`), and the walk finishes before the
 /// first transform runs — so an abort there means NOTHING was transformed, in any unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
@@ -10136,7 +10136,7 @@ pub fn run_on_operation<'p, A: Arch>(
     correction: EarOverflowCorrection,
 ) -> MutableAddrSplitting<'p> {
     // ⛔ `if (DisableThisPass) return;` (`:227`) IS DROPPED, as at entry 305:
-    // `dcc-mutable-addr-splitting-disable` (`:70-73`) is a `dcc-opt` command-line flag, and which
+    // `dcc-mutable-addr-splitting-disable` (`:51-54`) is a `dcc-opt` command-line flag, and which
     // passes run is a call in this crate.
     //
     // `std::vector<MASCandidate> candidates;` — ⭐ EACH PAIRED WITH ITS UNIT'S BODY, which is
@@ -10195,7 +10195,7 @@ pub fn run_on_operation<'p, A: Arch>(
                         MemoryOperandIndex::DirDst
                     })
                 }
-                // ⛔⛔ TWO `if`s AND NO `else` (`:262-267`) — an indirect transfer whose HBM view is
+                // ⛔⛔ TWO `if`s AND NO `else` (`:265-268`) — an indirect transfer whose HBM view is
                 // one of its INDIRECT operands leaves `mem_index` at `kMax` and hits the check below.
                 DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
                     if transfer.direct_src == *result {

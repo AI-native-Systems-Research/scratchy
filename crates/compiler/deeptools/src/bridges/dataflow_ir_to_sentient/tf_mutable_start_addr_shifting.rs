@@ -1101,10 +1101,10 @@ fn shift_one_access<'s, A: Arch>(
 /// Replaces: e352_transformVectorLoad
 ///
 /// **352/384** `MutableStartAddrShiftingPass::transformVectorLoad` —
-/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201` (28L): move what fits of one
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201` (25L): move what fits of one
 /// `agen.vector_load`'s constant offset out of its subscripts and into its view's start address.
 ///
-/// ⛔ THE CONSUMERS ARE RE-POINTED, NOT CLONED (`:222`): `replaceAllUsesWith` where entry 306's split
+/// ⛔ THE CONSUMERS ARE RE-POINTED, NOT CLONED (`:225`): `replaceAllUsesWith` where entry 306's split
 /// needs `cloneUseChainToNewOp`, because one load still becomes exactly one load here.
 #[must_use]
 pub fn transform_vector_load<'s, A: Arch>(
@@ -1162,7 +1162,7 @@ pub fn transform_vector_load<'s, A: Arch>(
 /// Replaces: e353_transformVectorStore
 ///
 /// **353/384** `MutableStartAddrShiftingPass::transformVectorStore` —
-/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229` (27L): entry 352 for an
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229` (24L): entry 352 for an
 /// `agen.vector_store`, which is entry 352 minus the re-pointing — a store binds nothing.
 ///
 /// ⚠️ ITS `mem_index_` IS `kDirSrc`, NOT `kDirDst`: the collection's `else` arm hands every
@@ -1218,7 +1218,7 @@ pub fn transform_vector_store<'s, A: Arch>(
 /// Replaces: e354_transformCompLoadAndStore
 ///
 /// **354/384** `MutableStartAddrShiftingPass::transformCompLoadAndStore` —
-/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256` (41L): entries 352/353 for one side
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256` (39L): entries 352/353 for one side
 /// of an `agen.composite_load_and_store`, the OTHER side's view, map and operands passed through.
 ///
 /// ⛔ THE VIEW COMES OFF `ad.getMemRef()`, NOT OFF THE OP (`:268-270`): a composite has two memrefs
@@ -1292,10 +1292,10 @@ pub fn transform_comp_load_and_store<'s, A: Arch>(
 /// Replaces: e355_transformCompIndLoadAndStore
 ///
 /// **355/384** `MutableStartAddrShiftingPass::transformCompIndLoadAndStore` —
-/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298` (55L): entry 354 for an
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298` (54L): entry 354 for an
 /// `agen.composite_indirect_load_and_store`, refusing the side that carries the indirect.
 ///
-/// ⛔ THE `getEmptyAffineMap()` THE SHIFTED SIDE'S INDIRECT MAP IS GIVEN (`:337`, `:349`) DESCRIBES
+/// ⛔ THE `getEmptyAffineMap()` THE SHIFTED SIDE'S INDIRECT MAP IS GIVEN (`:336`, `:347`) DESCRIBES
 /// NOTHING: the two early returns above guarantee that side has no indirect memref, so both arms hand
 /// both indirect accesses through unchanged. ⛔ AND THERE IS NO SLOT SWAP — entry 322's
 /// `clone_composite_indirect_with_new_access_info` moves a split indirect source into the destination
@@ -2368,7 +2368,7 @@ mod unit_tests {
     /// 🎯 352/384 — ⭐⭐ IBM'S `full_shift_zero_const_start` KEY END TO END: ALL 33856 ELEMENTS OF
     /// CONSTANT OFFSET LEAVE THE SUBSCRIPTS AND ARRIVE IN THE VIEW'S START ADDRESS.
     ///
-    /// `mutable_start_addr_shift_full.mlir:137-158` in, `:22-27` out. ⛔ THE ACCESS IS THE VENDOR'S
+    /// `mutable_start_addr_shift_full.mlir:137-158` in, `:22-28` out. ⛔ THE ACCESS IS THE VENDOR'S
     /// TRANSPOSED, as entry 306's test is: this island derives the lane run on the LAST axis where the
     /// key's `d2 * 256 + d1 * 64 + d0` puts it on `d0`, and its `?` extent is one vector wide here.
     #[test]
@@ -2815,7 +2815,7 @@ mod unit_tests {
     /// SUBSCRIPT DO NOT, AND ASKING FOR THE INDIRECT'S OWN SIDE IS REFUSED.
     ///
     /// The vendor's `@full_shift_conditional_start`
-    /// (`mutable_start_addr_shift_partial.mlir:218-259`) on a CONSTANT start of 2048 — its `scf.if`
+    /// (`mutable_start_addr_shift_partial.mlir:218-261`) on a CONSTANT start of 2048 — its `scf.if`
     /// start is [`MutableStartAddrShift::MemViewStartIsNotConstant`] here. ⛔ AND THE SHIFT IS THE
     /// WHOLE 33856 WHERE ITS CHECK SHOWS `[64, .. * 3 + 14, .. * 2 + 78]`: that run passes
     /// `--dcc-mutable-start-addr-shifting-max-immutable-size=240000`, i.e. 15000 `f16` elements, and
