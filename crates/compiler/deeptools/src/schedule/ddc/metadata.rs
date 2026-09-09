@@ -132,10 +132,14 @@
 //! | `e103_getLoops` | 103 | 0 | 13 | `DataConnect` | `ddc/ddc_metadata.h:179` |
 //! | `e104_clear` | 104 | 0 | 4 | `Metadata` | `ddc/ddc_metadata.h:225` |
 
+use super::fold::{AllocId, BlockId, ConstIdx, NodeId, PadType};
+use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
-    AbsoluteMin, Constraint, ConstraintKind, NoEpilogueDimKind,
+    AbsoluteMin, Constraint, ConstraintKind, DimSet, NoEpilogueDimKind, PrimaryDim,
 };
-use crate::schedule::dsc2::NodeName;
+use crate::generated::{DataConnect, MaxUnroll, OpFunc, OpaqueReg, RegName, Strategy};
+use crate::schedule::dsc2::{LdsIdx, NodeName};
+use std::collections::{BTreeMap, BTreeSet};
 
 // ═══ `Constraints` — THE FIELDS `dump` OBSERVES, AND THE THREE UPDATERS ══════════════════════════
 
@@ -507,13 +511,369 @@ impl Ends {
         Ends::loops(&self.consumers, tree)
     }
 }
+// ⭐ USES FOR ENTRY 104 ARE UNIONED INTO THIS FILE'S TOP BLOCK. Entries 096-103 landed first, so
+// their `Constraint`/`Ends`/`MetaDimKind` vocabulary is REUSED below, never restated.
 
-// ⛔ NOT THIS BATCH — `e104_clear` is the `Metadata` unit, and its anchor stands untouched.
-// crustify:todo: e104_clear
-//   authority : ddc/ddc_metadata.h:225  (4 body lines, level 0)
-//   class     : Metadata
-//   original  : void clear()
-//   extract   : crustify-ddc/cpp/ddc.cpp:996-1000
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE DDC METADATA — the state entry 104 resets (`ddc/ddc_metadata.h:31-243`).
+//
+// ⭐ THE FIELD LIST *IS* THIS UNIT'S CONTENT. The reference spells the reset
+// `this->~Metadata(); new (this) Metadata();` (:225) because `Metadata` carries TWO `const int`
+// members (`core_dstgid`, `chunk_dstgid`, :210-211) and therefore has no assignment operator at
+// all. Here those two are associated consts rather than state, so the reset is ONE assignment and
+// every field a later batch adds is reset by construction.
+//
+// ⚠️ A SCHEDULE NODE HAS TWO SPELLINGS IN THIS CRATE TODAY: [`NodeIndex`] above (entries 100-103's
+// positional census identity) and [`NodeId`] from `super::fold` (entries 086-093'). The maps below
+// key by `NodeId`; unifying the two belongs to whichever batch first owns a schedule-tree type.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A DATASTAGE'S INDEX — a loop's `numId_` / `denId_` and the key of `datastages_`
+/// (`ddc/ddc_metadata.h:82`, `ddc/ddcv1.cpp:607-609`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DatastageId(pub u32);
+
+/// ONE STORED `Metadata::Datastage::Constraints` (`ddc/ddc_metadata.h:33`), as the header declares
+/// it — [`Constraint`] is the SAME constraint at CHECK time, where entries 096-099 fold `min_` into
+/// [`ConstraintKind`] and borrow the reference stage the outer key names here.
+///
+/// ⛔ RATIOS STAY `f32`, exactly as [`Constraint`] and [`AbsoluteMin`] keep them: these are
+/// `size / refSize` ratios compared for exact equality, and a second spelling of one number is what
+/// lets two spellings disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredConstraint {
+    /// `mustBeMultiple_` and `loopDimKind_` — one field, because [`LoopMultiple`] is what those two
+    /// jointly say.
+    pub multiple: LoopMultiple,
+    /// `min_`.
+    pub min: Option<f32>,
+    /// `max_`.
+    pub max: Option<f32>,
+    /// `values_` — absent is UNCONSTRAINED, and an empty set admits no size at all.
+    pub values: Option<Vec<f32>>,
+    /// `cannotBeSymbolic_`.
+    pub cannot_be_symbolic: bool,
+}
+
+impl Default for StoredConstraint {
+    fn default() -> Self {
+        Self {
+            multiple: LoopMultiple::Off(None),
+            min: None,
+            max: None,
+            values: None,
+            cannot_be_symbolic: false,
+        }
+    }
+}
+
+/// ONE DATASTAGE'S EXPLORATION STATE — `Metadata::Datastage` (`ddc/ddc_metadata.h:32`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Datastage {
+    /// `constraints_` (:74-76) — outer key is the REFERENCE datastage, [`None`] for the `-1`
+    /// absolute constraints; the inner `std::map` key is a [`DimSet`], which has no ordering of its
+    /// own here.
+    pub constraints: BTreeMap<Option<DatastageId>, Vec<(DimSet, StoredConstraint)>>,
+    /// `strategyMinimize_` (:77), whose `// false == maximize` comment is this enum.
+    pub strategy: Strategy,
+    /// `allowEpilogue_` (:78).
+    pub allow_epilogue: bool,
+    /// `relevantDimsAndNumerator_` (:79) — per dim, the numerator datastage of the loop carrying it.
+    pub relevant_dims_and_numerator: BTreeMap<PrimaryDim, DatastageId>,
+    /// `nearestNumeratorIdx_` (:80) — `-1` is none (`ddc/ddcv1.cpp:609`, read as a datastage index
+    /// at `:940`).
+    pub nearest_numerator_idx: Option<DatastageId>,
+}
+
+impl Default for Datastage {
+    fn default() -> Self {
+        Self {
+            constraints: BTreeMap::new(),
+            strategy: Strategy::Minimize,
+            allow_epilogue: false,
+            relevant_dims_and_numerator: BTreeMap::new(),
+            nearest_numerator_idx: None,
+        }
+    }
+}
+
+/// WHICH DESTINATION of a multi-destination transfer — an index into `dstLdsAndLoopOffsets_`
+/// (`ddc/ddcv1.cpp:2947-2957`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DestIdx(pub u32);
+
+/// HOW ONE DIM IS READ AND WRITTEN — the reference's `pair<PadType, PadType>` typedef
+/// (`ddc/ddc_metadata.h:84`), printed `<first>-to-<second>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransferAccessPattern {
+    /// `.first` — how the source is padded.
+    pub from: PadType,
+    /// `.second` — how the destination is.
+    pub to: PadType,
+}
+
+/// ONE TRANSFER'S DDC STATE — `Metadata::DataTransfer` (`ddc/ddc_metadata.h:88`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataTransfer {
+    /// `apply_row_offset_src_`.
+    pub apply_row_offset_src: bool,
+    /// `apply_row_offset_dst_`.
+    pub apply_row_offset_dst: bool,
+    /// `apply_pe_sfp_split_offset_src_`.
+    pub apply_pe_sfp_split_offset_src: bool,
+    /// `apply_pe_sfp_split_offset_dest_` — which destinations take the split offset
+    /// (`ddc/ddc_transformation_util.cpp:1642`).
+    pub apply_pe_sfp_split_offset_dest: Vec<DestIdx>,
+    /// `replicated_`.
+    pub replicated: bool,
+    /// `offset_src_`. ⛔ NOTHING IN THE AUTHORITY TREE WRITES THIS FIELD OR `offset_dest_`: both are
+    /// only ever READ, as `> 0` tests (`ddc/ddcv1.cpp:2914,2932,2947`), so on this revision they
+    /// hold their defaults throughout and the branches they gate are dead.
+    pub offset_src: Elements,
+    /// `offset_dest_` — per destination, its offset.
+    pub offset_dest: BTreeMap<DestIdx, Elements>,
+    /// `force_num_elements_` — `-1` is NOT FORCED (`ddc/ddl/ddl_conversion.cpp:3217`).
+    pub force_num_elements: Option<Elements>,
+    /// `accessPatternPerDim_`, which the DDL's `access_pattern_style=` fills
+    /// (`ddc/ddl/ddl_conversion.cpp:1219-1226`).
+    pub access_pattern_per_dim: BTreeMap<PrimaryDim, TransferAccessPattern>,
+}
+
+impl Default for DataTransfer {
+    fn default() -> Self {
+        Self {
+            apply_row_offset_src: false,
+            apply_row_offset_dst: false,
+            apply_pe_sfp_split_offset_src: false,
+            apply_pe_sfp_split_offset_dest: Vec::new(),
+            replicated: false,
+            offset_src: Elements(0),
+            offset_dest: BTreeMap::new(),
+            force_num_elements: None,
+            access_pattern_per_dim: BTreeMap::new(),
+        }
+    }
+}
+
+/// WHAT DDC NEWLY ALLOCATED IN ONE MEMORY — `Metadata::Allocation` (`ddc/ddc_metadata.h:121`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Allocation {
+    /// `ldsIdxAndAllocNode`.
+    pub lds_idx_and_alloc_node: BTreeMap<LdsIdx, AllocId>,
+    /// `consIdAndAllocNode` — keyed by the allocation's `constIdx_`
+    /// (`ddc/ddc_transformation_util.cpp:1356`), not by a consumer.
+    pub cons_id_and_alloc_node: BTreeMap<ConstIdx, AllocId>,
+    /// `compAndAllocNode`.
+    pub comp_and_alloc_node: BTreeMap<NodeId, AllocId>,
+}
+
+/// A TRANSFER NODE THE METADATA OWNS OUTRIGHT — `unique_ptr<TransferNode>`
+/// (`ddc/ddc_metadata.h:131`). ⛔ NEITHER `Copy` NOR `Clone`: entry 104 destroys it, and a second
+/// handle would be exactly the reference's dangling pointer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnedTransferNode(pub NodeId);
+
+/// AN ALLOCATE NODE THE METADATA OWNS OUTRIGHT — `unique_ptr<AllocateNode>` (:132), same contract.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnedAllocateNode(pub AllocId);
+
+/// A TRANSFER HELD OUTSIDE THE SCHEDULE TREE — `Metadata::ExternalTransfer`
+/// (`ddc/ddc_metadata.h:130`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExternalTransfer {
+    /// `transfer_`.
+    pub transfer: OwnedTransferNode,
+    /// `allocate_`.
+    pub allocate: OwnedAllocateNode,
+}
+
+/// WHICH END of a transfer's datastreams a data connect is filled through — the source's, or the
+/// FIRST destination's when the source is external (`ddc/ddcv1.cpp:2312-2327`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TransferEnd {
+    /// `&tn->srcLdsAndLoopOffsets_.dataConnect_`.
+    Src,
+    /// `&tn->dstLdsAndLoopOffsets_[0].dataConnect_`.
+    FirstDst,
+}
+
+/// A `data_connect=` SLOT STILL TO BE FILLED — the reference's `std::string*`
+/// (`ddc/ddc_metadata.h:138`). ⛔ NON-OWNING: entry 104 drops the locator and destroys nothing,
+/// while the DDL writes through it later (`*prefilledIt->second = ...`,
+/// `ddc/ddl/ddl_conversion.cpp:938`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DataConnectSlot {
+    /// The transfer node holding the slot.
+    pub transfer: NodeId,
+    /// Which of its ends.
+    pub end: TransferEnd,
+}
+
+/// A STORAGE AN EXTERNAL TRANSFER MAY BE PREFILLED IN — `is_any_of(storage, LX, PTXRF, L3LUIBR)`,
+/// the guard every insert into that map passes (`ddc/ddcv1.cpp:2331-2336`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExternalStorage {
+    /// `LX`.
+    Lx,
+    /// `PTXRF`.
+    PtxRf,
+    /// `L3LUIBR`.
+    L3LuIbr,
+}
+
+/// A MEMORY DDC ALLOCATES IN — `ddc::memories` (`ddc/ddc_metadata.h:19-21`).
+///
+/// ⛔ NOT [`crate::generated::Memory`]: that is the `ddl.allocate` census and has neither `HBM` nor
+/// `PTIRF`, so it cannot spell this key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DdcMemory {
+    /// `LX`.
+    Lx,
+    /// `L0`.
+    L0,
+    /// `PELRF`.
+    PeLrf,
+    /// `SFPLRF`.
+    SfpLrf,
+    /// `PTARF`.
+    PtaRf,
+    /// `PTXRF`.
+    PtxRf,
+    /// `PTIRF`.
+    PtiRf,
+    /// `HBM`.
+    Hbm,
+}
+
+/// ONE OPAQUE COMPUTE'S REGISTERS — `Metadata::OpaqueOp` (`ddc/ddc_metadata.h:193`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueOp {
+    /// `inOutRegAllocs_` — which allocation supplies each in/out register's address
+    /// (`ddc/ddl/ddl_conversion.cpp:1676-1690`).
+    pub in_out_reg_allocs: BTreeMap<RegName, AllocId>,
+    /// `internalRegs_`.
+    pub internal_regs: Vec<OpaqueReg>,
+    /// `internalRegAlloc_`.
+    pub internal_reg_alloc: Option<AllocId>,
+    /// `max_unroll_`, whose default is ONE and not zero.
+    pub max_unroll: MaxUnroll,
+    /// `ldsIdx_` — `-1` is none.
+    pub lds_idx: Option<LdsIdx>,
+}
+
+impl Default for OpaqueOp {
+    fn default() -> Self {
+        Self {
+            in_out_reg_allocs: BTreeMap::new(),
+            internal_regs: Vec::new(),
+            internal_reg_alloc: None,
+            max_unroll: MaxUnroll(1),
+            lds_idx: None,
+        }
+    }
+}
+
+impl OpaqueOp {
+    /// `internalRegsWithUnroll_` (`ddc/ddc_metadata.h:199`) — the reference keeps a counter bumped
+    /// as each `_unroll` register is pushed (`ddc/ddl/ddl_conversion.cpp:1663-1664`);
+    /// [`OpaqueReg::unrolled`] already carries that fact, so it is derived here and cannot disagree
+    /// with the list it counts.
+    #[must_use]
+    pub fn internal_regs_with_unroll(&self) -> usize {
+        self.internal_regs.iter().filter(|reg| reg.unrolled).count()
+    }
+}
+
+/// `Metadata::DDCTransformationConfigT` (`ddc/ddc_metadata.h:229`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransformationConfig {
+    /// `enableMovingDataTransfer`, whose default is TRUE — `run_v1` hoists transfers for reuse
+    /// unless it is off (`ddc/ddcv1.cpp:3757-3759`).
+    pub enable_moving_data_transfer: bool,
+}
+
+impl Default for TransformationConfig {
+    fn default() -> Self {
+        Self {
+            enable_moving_data_transfer: true,
+        }
+    }
+}
+
+/// DDC'S WHOLE PER-DSC STATE — `ddc::Metadata` (`ddc/ddc_metadata.h:31`).
+#[derive(Debug, Default, PartialEq)]
+pub struct Metadata {
+    /// `datastages_` (:82).
+    pub datastages: BTreeMap<DatastageId, Datastage>,
+    /// `datatransfers_` (:119), keyed by the transfer node.
+    pub datatransfers: BTreeMap<NodeId, DataTransfer>,
+    /// `newAllocations_` (:127).
+    pub new_allocations: BTreeMap<DdcMemory, Allocation>,
+    /// `shadowAllocations_` (:128).
+    pub shadow_allocations: Vec<Vec<AllocId>>,
+    /// `externalTransfers_` (:137) — the one OWNING field, so the one entry 104 frees through.
+    pub external_transfers: Vec<ExternalTransfer>,
+    /// `prefilledExternalTransferToDataConnectToFill_` (:138), keyed by labeled DS and storage.
+    pub prefilled_external_transfer_data_connects:
+        BTreeMap<(LdsIdx, ExternalStorage), DataConnectSlot>,
+    /// `externalNodes_` (:140).
+    pub external_nodes: BTreeSet<NodeId>,
+    /// `TransferNodesInterSliceTranspose_` (:141).
+    pub transfer_nodes_inter_slice_transpose: BTreeSet<NodeId>,
+    /// `dataConnects_` (:191) — keyed by the connect's NAME, holding the [`Ends`] entries 100-103
+    /// maintain.
+    pub data_connects: BTreeMap<DataConnect, Ends>,
+    /// `opaqueOps_` (:203), keyed by the compute node.
+    pub opaque_ops: BTreeMap<NodeId, OpaqueOp>,
+    /// `implicitSyncs_` (:205) — the allocation each implicit sync stands for.
+    pub implicit_syncs: BTreeMap<NodeId, AllocId>,
+    /// `dimToCoreChunkLoops_` (:207).
+    pub dim_to_core_chunk_loops: BTreeMap<PrimaryDim, Vec<NodeId>>,
+    /// `rowSplitDim` (:212) — `PrimaryDimTypesCount` is UNSET, which is not dimension zero.
+    pub row_split_dim: Option<PrimaryDim>,
+    /// `clSplitDims_` (:213).
+    pub cl_split_dims: BTreeSet<PrimaryDim>,
+    /// `peSfpSplitDims_` (:214).
+    pub pe_sfp_split_dims: BTreeSet<PrimaryDim>,
+    /// `nodeCloningMap_` (:215).
+    pub node_cloning_map: BTreeMap<NodeId, Vec<NodeId>>,
+    /// `discardAboveLxSchedule_` (:217).
+    pub discard_above_lx_schedule: bool,
+    /// `belowLxScheduleInsertBlock` (:218) — the block named `lx_below_schedule` where the tree has
+    /// one (`ddc/ddcv1.cpp:2341-2345`).
+    pub below_lx_schedule_insert_block: Option<BlockId>,
+    /// `opFuncBackup_` (:221) — `OpFuncs::NONE` is none.
+    pub op_func_backup: Option<OpFunc>,
+    /// `transformationConfig_` (:229).
+    pub transformation_config: TransformationConfig,
+    /// `ldsIdxAfterDdc` (:234) — each labeled DS index before DDC to its index after.
+    pub lds_idx_after_ddc: BTreeMap<LdsIdx, LdsIdx>,
+    /// `intermLdsIdxToExtLds` (:237).
+    pub interm_lds_idx_to_ext_lds: BTreeMap<LdsIdx, LdsIdx>,
+}
+
+impl Metadata {
+    /// `core_dstgid` (`ddc/ddc_metadata.h:210`) — a `const int` in the reference, so not state.
+    pub const CORE_DSTGID: DatastageId = DatastageId(0);
+    /// `chunk_dstgid` (:211).
+    pub const CHUNK_DSTGID: DatastageId = DatastageId(1);
+
+    /// Replaces: e104_clear
+    ///
+    /// REINITIALIZES THE WHOLE METADATA (`ddc/ddc_metadata.h:225`). `run_v1` calls it once per DSC
+    /// before working on that DSC (`ddc/ddcv1.cpp:3706`) — the ONLY callsite in the tree.
+    ///
+    /// ⛔ THE RESET IS NOT A MEMSET: `strategyMinimize_`, `enableMovingDataTransfer` and
+    /// `max_unroll_` come back true/true/1, and `rowSplitDim`, `nearestNumeratorIdx_`,
+    /// `force_num_elements_` and `ldsIdx_` come back UNSET rather than zero.
+    /// ⛔ AND IT FREES: `externalTransfers_`'s `unique_ptr`s are destroyed here, while the
+    /// non-owning `std::string*` slots beside them are only dropped.
+    /// ⚠️ 25 OTHER UNITS LIST `e104_clear` AS A CALLEE IN `UNITS.tsv`; every one of those is a
+    /// container `.clear()` resolved by name, not this method.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
@@ -739,5 +1099,80 @@ mod unit_tests {
         // ⛔ A SELF-OWNING LOOP TERMINATES: node 5's owner is 5, recorded once and then broken on.
         ends.insert_consumer(NodeIndex(5));
         assert_eq!(ends.consumer_loops(&tree), [LoopIndex(NodeIndex(5))]);
+    }
+}
+
+// ⭐ TESTS FOR ENTRY 104. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e104 {
+    use super::{
+        AllocId, DataConnectSlot, DataTransfer, Datastage, DestIdx, ExternalStorage,
+        ExternalTransfer, LdsIdx, Metadata, NodeId, OpaqueOp, OwnedAllocateNode, OwnedTransferNode,
+        PrimaryDim, StoredConstraint, TransferEnd,
+    };
+    use crate::arch::Elements;
+    use crate::generated::{MaxUnroll, Strategy};
+
+    /// A metadata dirtied in the fields whose construction default is NOT the zero value comes back
+    /// to exactly the constructed state — true, true, 1 and unset, not false, false, 0 and zero.
+    #[test]
+    fn clear_restores_the_constructed_defaults_and_not_zeros() {
+        let mut md = Metadata::default();
+        md.datastages.insert(
+            Metadata::CORE_DSTGID,
+            Datastage {
+                strategy: Strategy::Maximize,
+                nearest_numerator_idx: Some(Metadata::CHUNK_DSTGID),
+                ..Datastage::default()
+            },
+        );
+        md.datatransfers.insert(
+            NodeId(4),
+            DataTransfer {
+                force_num_elements: Some(Elements(64)),
+                offset_dest: [(DestIdx(1), Elements(8))].into_iter().collect(),
+                ..DataTransfer::default()
+            },
+        );
+        md.opaque_ops.insert(
+            NodeId(5),
+            OpaqueOp {
+                max_unroll: MaxUnroll(4),
+                lds_idx: Some(LdsIdx(2)),
+                ..OpaqueOp::default()
+            },
+        );
+        md.external_transfers.push(ExternalTransfer {
+            transfer: OwnedTransferNode(NodeId(7)),
+            allocate: OwnedAllocateNode(AllocId(9)),
+        });
+        // The non-owning slot beside them, which the reset drops without destroying anything.
+        md.prefilled_external_transfer_data_connects.insert(
+            (LdsIdx(3), ExternalStorage::Lx),
+            DataConnectSlot {
+                transfer: NodeId(7),
+                end: TransferEnd::Src,
+            },
+        );
+        md.row_split_dim = Some(PrimaryDim::Y);
+        md.discard_above_lx_schedule = true;
+        md.transformation_config.enable_moving_data_transfer = false;
+        md.cl_split_dims.insert(PrimaryDim::X);
+
+        md.clear();
+
+        assert_eq!(md, Metadata::default());
+        assert!(md.transformation_config.enable_moving_data_transfer);
+        assert_eq!(md.row_split_dim, None);
+        assert!(md.external_transfers.is_empty());
+        assert_eq!(Datastage::default().strategy, Strategy::Minimize);
+        assert_eq!(Datastage::default().nearest_numerator_idx, None);
+        assert_eq!(OpaqueOp::default().max_unroll, MaxUnroll(1));
+        assert_eq!(DataTransfer::default().offset_src, Elements(0));
+        assert_eq!(DataTransfer::default().force_num_elements, None);
+        assert_eq!(StoredConstraint::default().min, None);
+        // The two `const int` members are consts here, so the reset cannot lose them.
+        assert_eq!(Metadata::CORE_DSTGID.0, 0);
+        assert_eq!(Metadata::CHUNK_DSTGID.0, 1);
     }
 }
