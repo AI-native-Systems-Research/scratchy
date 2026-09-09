@@ -6132,6 +6132,78 @@ scf.if %11 {
             [IvRange { lb: 0, ub: 1 }, IvRange { lb: 0, ub: 3 }]
         );
     }
+
+    // ── 373/384 ──────────────────────────────────────────────────────────────────────────────────
+
+    /// 🎯 373/384 — ⭐ BOTH HALVES, IN ORDER, WITHOUT THE CALLER RUNNING EITHER.
+    ///
+    /// ⛔ THE SEQUENCE IS WHAT IS ASSERTED, AND EACH HALF IS FALSIFIED BY A DIFFERENT FIELD. An
+    /// object `initialize()` never touched has an empty `tpmv_info_`, and `transform()` skips every
+    /// operand it does not find there — so `operands` would be EMPTY. A `transform()` that never ran
+    /// would leave `paged_mem_view_` non-null, which is the second assertion.
+    #[test]
+    fn run_initializes_before_it_transforms() {
+        let mut vals = Values::default();
+        let lx = vals.mint();
+        let c0 = vals.mint();
+        let arg1 = vals.mint();
+        let start = vals.mint();
+        let mem_view = vals.mint();
+        let loaded = vals.mint();
+
+        // `affine.for %arg1 = 0 to 2 { %mem_view = dataflow.get_paged_logical_memory_view ..;
+        //  %load = agen.vector_load %mem_view[0, %arg1, 0] }` — the one page's `d1` span is `0 ..= 1`,
+        // which is exactly the iterator's range, so the page is reached.
+        let scope = vec![DfirOp::Affine(affine::Op::For {
+            iv: arg1,
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(2),
+            carried: Vec::new(),
+            body: vec![
+                DfirOp::Dataflow(dataflow::Op::GetPagedLogicalMemoryView(Box::new(
+                    PagedMemView {
+                        result: mem_view,
+                        unit: lx,
+                        start_addr: c0,
+                        pages: vec![page(0, 1, start)],
+                        layout: layout(),
+                        ty: paged_view_ty(),
+                    },
+                ))),
+                DfirOp::Agen(agen::Op::VectorLoad {
+                    dbg_name: None,
+                    result: loaded,
+                    view: mem_view,
+                    indices: vec![Index::Const(0), Index::Val(arg1), Index::Const(0)],
+                    view_ty: paged_view_ty(),
+                    ty: LANES,
+                    multicast_info: None,
+                }),
+            ],
+            dbg_name: None,
+        })];
+
+        let load_op = defining_op(loaded, &scope).expect("the load is in the loop body");
+        let mut load = TpmvVectorLoad::new(load_op, DfirUnit::Lxlu);
+        // The emission goes into a clone, as entries 324 and 356 do it.
+        let mut emitted = scope.clone();
+
+        let transformed = load.run(&mut vals, &scope, &mut emitted);
+
+        let TransformedPagedViews::Transformed { operands, .. } = transformed else {
+            panic!("the one subscript is a constant-bounded iterator: {transformed:?}")
+        };
+        // `initialize()` first: no `TPMVInfo`, no operand.
+        let [operand] = operands.as_slice() else {
+            panic!("one memory operand, and it is paged: {operands:?}")
+        };
+        assert_eq!(operand.pages.len(), 1);
+        // `transform()` second: `info.paged_mem_view_ = nullptr` is the last thing it does per operand.
+        let [info] = load.vector.base.tpmv_info.as_slice() else {
+            unreachable!("entry 202 filled exactly one")
+        };
+        assert_eq!(info.paged_mem_view, None);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -7804,7 +7876,59 @@ impl<'p> TpmvBase<'p> {
     }
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e373_run
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 373/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE LEAF OF `TPMVVector` — the `initialize()` override [`TpmvVectorLeaf::run`] dispatches through.
+///
+/// ⛔ A TRAIT AND NOT AN ENUM, BECAUSE THE MISSING LEAVES MUST BE A COMPILE ERROR. Only
+/// `TPMVVectorLoad::initialize` is a scheduled unit (entry 202, `:658`); `TPMVVectorStore`'s (`:706`)
+/// and `TPMVVectorLoadStore`'s (`:755`) are in neither the 384 nor the 106 exclusions, so each gets
+/// its impl when it is ported. An enum would need an arm for them today, and both an empty arm and a
+/// `todo!` are wrong here — the first emits nothing silently, the second is a frozen ratchet
+/// (`crates/targets/spyre/tests/dfir_never_runtime_refuses.rs`). A missing impl is an E0277.
+pub trait TpmvVectorLeaf<'p> {
+    /// `initialize()` — the pure virtual at `hpp:66`, one `override final` per leaf. ⭐ NAMED APART
+    /// from entry 202's inherent [`TpmvVectorLoad::initialize`] so the delegation cannot read as
+    /// recursion.
+    fn initialize_leaf(&mut self, scope: &'p [DfirOp]);
+
+    /// The `TPMVBase` subobject, which is where the NON-virtual `transform()` (`hpp:72`) lives.
+    fn base_mut(&mut self) -> &mut TpmvBase<'p>;
+
+    /// Replaces: e373_run
+    ///
+    /// **373/384** `TPMVVector::run` —
+    /// `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647` (6L).
+    ///
+    /// ⛔ NOT `TPMVComposite::run` (`:855`), which the extractor deduplicated away under the same
+    /// name: that one runs FOUR steps and clears `tpmv_info_` between them.
+    /// ⭐ THE `LogicalResult` IS `transform()`'s ALONE — entry 202's `initialize` is unconditionally
+    /// success, so [`TransformedPagedViews`] is the whole answer and `Transformed` is `success()`.
+    #[must_use]
+    fn run(
+        &mut self,
+        vals: &mut Values,
+        scope: &'p [DfirOp],
+        emitted: &mut Vec<DfirOp>,
+    ) -> TransformedPagedViews<'p> {
+        // `if (initialize().failed()) return LogicalResult::failure();`
+        self.initialize_leaf(scope);
+
+        // `if (transform().failed()) return LogicalResult::failure();`, then
+        // `return LogicalResult::success();` — one value carries both.
+        self.base_mut().transform(vals, scope, emitted)
+    }
+}
+
+impl<'p> TpmvVectorLeaf<'p> for TpmvVectorLoad<'p> {
+    fn initialize_leaf(&mut self, scope: &'p [DfirOp]) {
+        // Entry 202's `override final` (`:658`).
+        self.initialize(scope);
+    }
+
+    fn base_mut(&mut self) -> &mut TpmvBase<'p> {
+        &mut self.vector.base
+    }
+}

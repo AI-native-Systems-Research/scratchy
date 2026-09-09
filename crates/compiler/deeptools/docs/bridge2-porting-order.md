@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`349/384 ported; 349/384 audited`
+`350/384 ported; 350/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2815,6 +2815,31 @@ lost it is port-assigned as if it computed something.
 `Result<PtDummyMac, PtDangling>` is now the outcome enum `PtMac`, leaving zero `Result<` in
 `src/bridges/dataflow_ir_to_sentient/` as `CLAUDE.md` requires.
 
+⭐ ENTRY 373 — `TPMVVector::run()`, THE THREE-LINE DRIVER OF THE VECTOR DE-PAGING, in
+`tf_transform_paged_mem_view_impl.rs`: `initialize()` then `transform()`, and its `LogicalResult` is
+`transform()`'s alone because entry 202's `initialize` ends `return LogicalResult::success();`
+unconditionally (`:658-670`) — so `TransformedPagedViews` is the whole answer and `Transformed` is
+`success()`.
+
+⛔ IT IS A TRAIT WITH ONE IMPL, AND THAT IS THE 1-OF-6 `initialize()` RECORDED ABOVE. `run` is declared
+on `TPMVVector` (`hpp:391`) and dispatches through the pure virtual at `hpp:66`, whose six `override
+final`s are `:658`, `:706`, `:755`, `:1080`, `:1133` and `:1186` — only `TPMVVectorLoad`'s is a
+scheduled entry, and `TPMVVectorStore`'s and `TPMVVectorLoadStore`'s are in neither the 384 nor the 106
+exclusions. `TpmvVectorLeaf` therefore carries `run` once as a provided method and is implemented for
+`TpmvVectorLoad` alone: calling `run` on either unported leaf is an E0277 rather than a stop, which an
+enum arm could not have been — an empty arm emits nothing silently and `todo!` is a frozen ratchet
+(`crates/targets/spyre/tests/dfir_never_runtime_refuses.rs`).
+
+⛔ AND IT IS **NOT** `TPMVComposite::run()` (`:855`), which the extractor shadowed under the same name:
+that one runs `initialize()`, `initialize_time()`, `transform_time()` and `transform()` and CLEARS
+`tpmv_info_` between them. Porting 373 as "the TPMV driver" would have put four steps behind an anchor
+whose body has two.
+
+⚠️ NO NEW CALLER. Entry 139 ([`TpmvManager::run`]) ends every arm with `return tpmv.run()` and entry
+196's pass loop is where it would land, but both are `&`-only today and the composite half of entry
+139's six-way dispatch has no ported `run` at all — so the call site arrives with the changeset that
+lands the erase, exactly as entry 196's own anchor already says.
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3582,8 +3607,8 @@ lost it is port-assigned as if it computed something.
 - [ ] **AUDIT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, line by line against the C++
 - [ ] **PORT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, 69 lines
 - [ ] **AUDIT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, line by line against the C++
-- [ ] **PORT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, 6 lines
-- [ ] **AUDIT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, line by line against the C++
+- [x] **PORT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, 6 lines
+- [x] **AUDIT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, line by line against the C++
 
 ## Level 8
 
