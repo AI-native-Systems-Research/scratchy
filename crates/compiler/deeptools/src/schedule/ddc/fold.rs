@@ -166,11 +166,15 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, SliceElems, Stage, StickDims, StickPart, cumulative_stick_sizes,
 };
 use crate::generated::DataConnect;
+use crate::schedule::ddc::metadata::MetaDimKind;
+use crate::schedule::ddc::transformation::Scale;
+use crate::schedule::ddc::transformation_util::PrimaryDimAndKind;
 use crate::schedule::dsc2;
 use crate::schedule::dsc2::{
     ComputeNode, CoordinateCategory, Dsc, FoldCardinality, FoldCoeff, LdsIdx, Node, Operand,
     OperandPos, TransferNode, TransferSide,
 };
+use crate::schedule::l3::dl_ops::LoopAndDim;
 use crate::units::DfirUnit;
 
 /// ONE OPERAND AS `dbgPrint` SPELLS IT — `'<component>(<data_connect>)'`, and an unset
@@ -1823,6 +1827,588 @@ mod tests_e094_e095 {
     }
 }
 
+/// HOW MANY OF A DIM'S FOLDS ARE SPATIAL — `getNumOfSpatialFolds(dim)` (`dsc/dsc2.h:144`), which is
+/// TOTAL: a dim the coordinate does not cover answers 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpatialFolds(pub u32);
+
+/// HOW MANY OF A DIM'S FOLDS ARE TEMPORAL — `getNumOfTemporalFolds(dim)` (`:147`), likewise total. A
+/// type of its own, so the two counts cannot be transposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TemporalFolds(pub u32);
+
+/// ONE DIM OF A COORDINATE — its fold manager, the two fold counts and `getPadding(dim)` (`:242`).
+///
+/// ⛔ AN UNCOVERED DIM IS AN ABSENT FOLD MANAGER, NOT A THROW: `coordinates_.at(dim)` aborts where
+/// the two counts answer 0, and [`gather_fold_params`] over nothing is the empty list.
+pub struct CoordDim<'a, F: AffineFoldDims + ?Sized> {
+    /// `coordinates_.at(dim)`.
+    pub folds: Option<&'a F>,
+    /// `getNumOfSpatialFolds(dim)`.
+    pub spatial: SpatialFolds,
+    /// `getNumOfTemporalFolds(dim)`.
+    pub temporal: TemporalFolds,
+    /// `getPadding(dim)`.
+    pub pad: PadType,
+}
+
+/// AN ALLOCATE NODE'S TWO COORDINATES FOR ONE DIM — `allocateCoordinates_` and
+/// `sliceViewCoordinates_` (`dsc/dsc2.h:1008-1009`), the second absent where `foldConstructed()`
+/// (`:119`) is false.
+pub struct AllocCoordinates<'a, F: AffineFoldDims + ?Sized> {
+    /// `allocateCoordinates_`.
+    pub allocate: CoordDim<'a, F>,
+    /// `sliceViewCoordinates_`, once its folds are constructed.
+    pub slice_view: Option<CoordDim<'a, F>>,
+}
+
+impl<'a, F: AffineFoldDims + ?Sized> AllocCoordinates<'a, F> {
+    /// `effectiveRefCoord` (`ddc/ddc_fold.cpp:2988-2991`) — the slice view only when the size
+    /// component is an individual PT row AND the slice view's folds were constructed.
+    #[must_use]
+    pub fn effective(&self, row: Option<PtRowId>) -> &CoordDim<'a, F> {
+        match (row, &self.slice_view) {
+            (Some(_), Some(slice_view)) => slice_view,
+            _ => &self.allocate,
+        }
+    }
+}
+
+/// THE PROPAGATION'S ALLOCATE END — `coordPropInfo.nodeToFold` as an `AllocateNode`, with the
+/// labeled DS's scale for the dim being related already in hand.
+///
+/// ⛔ BOTH `DT_CHECK_MSG`s ARE DISCHARGED BY TYPE: that the node IS an `ALLOCATE` (`:2883`), and that
+/// its `ldsIdx_ >= 0` (`:2910`).
+pub struct BaseAllocation<'a, F: AffineFoldDims + ?Sized> {
+    /// `component_`.
+    pub component: SenComponent,
+    /// `ldsIdx_`.
+    pub lds: LdsIdx,
+    /// `allocateCoordinates_` / `sliceViewCoordinates_`, for the dim being related.
+    pub coordinates: AllocCoordinates<'a, F>,
+    /// `labeledDs_.at(ldsIdx_).scale_.at(getDimIndexInLayoutOrder(dsType_, dim))`, absent where the
+    /// layout order does not name the dim — which the reference reads as a scale of 1 (`:3002`).
+    pub dim_scale: Option<Scale>,
+}
+
+/// ONE TRANSFER DESTINATION — `dstVias_.at(i).loc_` zipped with `dstLdsAndLoopOffsets_.at(i)`.
+///
+/// ⚠️ NOT [`crate::schedule::dsc2::Operand`], whose `storage` is a [`SenComponent`] and whose data is
+/// a [`crate::schedule::dsc2::DataInfo`]: [`match_data_stream`] reads this file's spellings, and
+/// converging the two is the review pass's, as `dsc2.rs` already notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferDst {
+    /// `loc_.unit_`.
+    pub unit: SenComponent,
+    /// The destination stream, in `loc_.storage_`.
+    pub stream: StoredStream,
+}
+
+/// A TRANSFER'S DESTINATIONS, NON-EMPTY — so neither `dstVias_.at(0)` override (`:2960`, `:2977`)
+/// can throw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferDsts {
+    first: TransferDst,
+    rest: Vec<TransferDst>,
+}
+
+impl TransferDsts {
+    /// A transfer has at least one destination, and this is how that is stated.
+    #[must_use]
+    pub const fn new(first: TransferDst, rest: Vec<TransferDst>) -> Self {
+        Self { first, rest }
+    }
+
+    /// `dstVias_.at(0)` — total.
+    #[must_use]
+    pub const fn first(&self) -> &TransferDst {
+        &self.first
+    }
+
+    /// Every destination in order.
+    pub fn iter(&self) -> impl Iterator<Item = &TransferDst> {
+        core::iter::once(&self.first).chain(self.rest.iter())
+    }
+}
+
+/// WHICH WAY A TRANSFER MOVES RELATIVE TO THE ALLOCATION — `coordPropInfo.refIsProducer`
+/// (`dsc/dsc2.h:1091`), which is a direction and so an enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    /// `refIsProducer` — transfer -> allocate, so the MATCHING destination carries the components.
+    IntoAllocation,
+    /// allocate -> transfer, so `src_.unit_` does.
+    OutOfAllocation,
+}
+
+/// THE PROPAGATION'S NON-ALLOC END — `coordPropInfo.refNode`'s `nodeType_` reduced to the three arms
+/// entry 241 distinguishes.
+pub enum RefNode<'a> {
+    /// `COMPUTE`.
+    Compute {
+        /// `exUnit_`.
+        ex_unit: SenComponent,
+    },
+    /// `TRANSFER`.
+    Transfer {
+        /// `src_.unit_`.
+        src: SenComponent,
+        /// `dstVias_` zipped with `dstLdsAndLoopOffsets_`.
+        dsts: &'a TransferDsts,
+        /// `refIsProducer`.
+        direction: TransferDirection,
+    },
+    /// Any other `nodeType_`: neither arm runs, and both components stay as the allocation set them.
+    Other,
+}
+
+/// THE COMPONENT PAIR A PROPAGATION IS SIZED AND PROPAGATED FOR — `sizeRefComp` and `propRefComp`.
+///
+/// ⛔ THEY MOVE INDEPENDENTLY: both transfer overrides (`:2952-2963`, `:2966-2981`) move the SIZE
+/// alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefComponents {
+    /// `sizeRefComp`, whose start is `SenComponents::ALL`.
+    pub size: SenComponent,
+    /// `propRefComp`, whose start is the allocation's own `component_`.
+    pub prop: SenComponent,
+}
+
+/// ONE COORDINATE PROPAGATION OFF AN ALLOCATION'S ELEMENT ARRANGEMENT — `coordPropInfo` with both of
+/// its ends resolved.
+pub struct AllocPropagation<'a, F: AffineFoldDims + ?Sized> {
+    /// `nodeToFold`.
+    pub alloc: BaseAllocation<'a, F>,
+    /// `refNode` — the node the distributor records the loop params against.
+    pub ref_node: NodeId,
+    /// `refNode`'s kind.
+    pub ref_kind: RefNode<'a>,
+    /// The propagation as [`match_data_stream`] reads it.
+    pub streams: &'a CoordPropInfo,
+}
+
+/// `sizeRefComp` and `propRefComp` as entry 241 derives them (`ddc/ddc_fold.cpp:2914-2981`).
+fn ref_components<A: Allocations + ?Sized, F: AffineFoldDims + ?Sized>(
+    dsc: &A,
+    prop: &AllocPropagation<'_, F>,
+) -> RefComponents {
+    let is_pe_or_sfp = |comp| matches!(comp, SenComponent::Pe | SenComponent::Sfp);
+    let mut comps = RefComponents {
+        size: SenComponent::All,
+        prop: prop.alloc.component,
+    };
+    match prop.ref_kind {
+        RefNode::Compute { ex_unit } => {
+            comps.size = ex_unit;
+            if comps.prop == SenComponent::Ptxrf || comps.prop == SenComponent::Ptarf {
+                // *** This is a kludge. FIND A GENERAL SOLUTION ***
+                // PTXRF and PTARF represent the allocation for all PT rows; a computeNode on the PT
+                // represents computation on an individual PT row.
+                comps.prop = ex_unit;
+            }
+        }
+        RefNode::Transfer {
+            src,
+            dsts,
+            direction,
+        } => {
+            match direction {
+                // Transfer -> allocate.
+                TransferDirection::IntoAllocation => {
+                    if let Some(dst) = dsts
+                        .iter()
+                        .find(|dst| match_data_stream(dsc, prop.streams, dst.stream, false))
+                    {
+                        comps.size = dst.unit;
+                        comps.prop = dst.unit;
+                    }
+                }
+                // Allocate -> transfer.
+                TransferDirection::OutOfAllocation => {
+                    comps.size = src;
+                    comps.prop = src;
+                }
+            }
+            // Override the comp in case transfer is for a single PT row: for a transfer from LXLU to
+            // PTRow4 the coordinate should be for row 4 only.
+            if comp_row_id(comps.size).is_none() {
+                if comp_row_id(src).is_some() {
+                    comps.size = src;
+                } else if comp_row_id(dsts.first().unit).is_some() {
+                    comps.size = dsts.first().unit;
+                }
+            }
+            // Override the comp in case transfer involves PE or SFP, to account for PE-SFP
+            // splitting. A component that already represents an individual PT row has higher
+            // priority.
+            if comp_row_id(comps.size).is_none() && !is_pe_or_sfp(comps.size) {
+                if is_pe_or_sfp(src) {
+                    comps.size = src;
+                } else if is_pe_or_sfp(dsts.first().unit) {
+                    comps.size = dsts.first().unit;
+                }
+            }
+        }
+        RefNode::Other => {}
+    }
+    comps
+}
+
+/// THE DISTRIBUTOR'S REQUEST — `distributeElemArrToTemporalLoops`' arguments (`dsc/dsc2.h:1174`)
+/// other than the DSC and its two out-params.
+pub struct ElemArrDistribution<'l> {
+    /// `currDim`.
+    pub dim: PrimaryDimAndKind,
+    /// `foldOwnerNode` — the REF node, not the allocation.
+    pub fold_owner: NodeId,
+    /// `targetLdxIdx` — the ALLOCATION's labeled DS.
+    pub target_lds: LdsIdx,
+    /// `refPadType` — the effective coordinate's padding for the dim.
+    pub ref_pad: PadType,
+    /// `targetPadType` — the propagated coordinate's padding for the dim.
+    pub target_pad: PadType,
+    /// `sizeRefComp` and `propRefComp`.
+    pub components: RefComponents,
+    /// `loopChain` — the surplus loops, INNERMOST FIRST.
+    pub loops_to_distribute: Vec<LoopAndDim<'l>>,
+    /// `elemArr` — the fold levels inside the reference's own folds, INNERMOST FIRST.
+    pub elem_arr: Vec<FoldParamInfo>,
+}
+
+/// THE TWO `dsc/dsc2.cpp` HELPERS ENTRY 241 REACHES OUT TO — both OUTSIDE this campaign's file list
+/// (`crustify-ddc/OUTSIDE-DEPS.tsv`, "dsc2 tree utilities"), so they are seams here and not ports.
+pub trait TemporalLoopDistribution<'l> {
+    /// `dsc2::LoopDistributionParamPerNodeType` — the out-param entry 241 threads through, whose
+    /// contents are the distributor's own business.
+    type LoopParams;
+
+    /// `collectRelatedLoops(currDsc, dimToFind, allEnclosingLoops, relatedLoops, accessPadType)`
+    /// (`dsc/dsc2.cpp:6575`) — the enclosing chain filtered to the loops that walk this dim, and
+    /// INNERMOST FIRST because the chain is.
+    fn related_loops(
+        &self,
+        dim: PrimaryDimAndKind,
+        chain: &[LoopAndDim<'l>],
+        pad: PadType,
+    ) -> Vec<LoopAndDim<'l>>;
+
+    /// `distributeElemArrToTemporalLoops(.., targetCoreletId = 0, ..)` (`dsc/dsc2.cpp:5934`) — for
+    /// ONE corelet, as entry 241's own argument comment says (`ddc/ddc_fold.cpp:3038`).
+    ///
+    /// ⛔ `elemArrParamsAfterDistribution` IS A DROPPED LOCAL at this callsite (`:3029`), so only the
+    /// loop params escape entry 241.
+    fn distribute(&self, request: &ElemArrDistribution<'l>, loop_params: &mut Self::LoopParams);
+}
+
+/// Replaces: e241_relateLoopsToAllocElemArr
+///
+/// Hands the loops around the REF node that the allocation's own temporal folds do NOT account for,
+/// together with the fold levels inside them, to the temporal distributor — for one dim.
+///
+/// ⛔ THE `coordinate` ARGUMENT IS READ ONLY FOR ITS PADDING OF THIS DIM (`:3005`, `:3037`).
+/// ⚠️ `allocPosInDest` is computed and never read (`:2932`, `:2941`), and the report-level prints
+/// (`:2891-2908`) are diagnostics; neither survives.
+pub fn relate_loops_to_alloc_elem_arr<'l, A, T, F>(
+    dsc: &A,
+    distribution: &T,
+    prop: &AllocPropagation<'_, F>,
+    dim: PrimaryDim,
+    target_pad: PadType,
+    ref_loop_chain: &[LoopAndDim<'l>],
+    loop_params: &mut T::LoopParams,
+) where
+    A: Allocations + ?Sized,
+    T: TemporalLoopDistribution<'l> + ?Sized,
+    F: AffineFoldDims + ?Sized,
+{
+    let components = ref_components(dsc, prop);
+    let effective = prop
+        .alloc
+        .coordinates
+        .effective(comp_row_id(components.size));
+    let fold_params = effective.folds.map(gather_fold_params).unwrap_or_default();
+
+    let scale_is_non_broadcast = |scale| matches!(scale, Scale::Sized(scale) if scale > 0.0);
+    // Note: dim is of type PrimaryDimTypes, metaDimKind is missing here.
+    let dim = PrimaryDimAndKind {
+        dim,
+        kind: MetaDimKind::Unpadded,
+    };
+    let related_loops = if prop.alloc.dim_scale.is_none_or(scale_is_non_broadcast) {
+        // The dimension is a non-broadcast dimension.
+        distribution.related_loops(dim, ref_loop_chain, target_pad)
+    } else {
+        Vec::new()
+    };
+
+    // The node has more enclosing loops than the reference allocateNode: distribute the additional
+    // loops over the element arrangement levels.
+    let temporal_diff = related_loops
+        .len()
+        .saturating_sub(effective.temporal.0 as usize);
+    if temporal_diff == 0 {
+        return;
+    }
+    // `temporalFoldEnds + 1` is `spatialFoldEnds + refTemporalCount + 1`, so the levels inside the
+    // reference's own folds start at spatial + temporal — with no negative index to clamp.
+    let inside = (effective.spatial.0 + effective.temporal.0) as usize;
+    distribution.distribute(
+        &ElemArrDistribution {
+            dim,
+            fold_owner: prop.ref_node,
+            target_lds: prop.alloc.lds,
+            ref_pad: effective.pad,
+            target_pad,
+            components,
+            // Scan order is from the innermost loop towards the outermost loop.
+            loops_to_distribute: related_loops[..temporal_diff].to_vec(),
+            elem_arr: fold_params
+                .get(inside..)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .copied()
+                .collect(),
+        },
+        loop_params,
+    );
+}
+
+#[cfg(test)]
+mod tests_e241 {
+    use super::{
+        AffineFoldDims, AllocCoordinates, AllocId, AllocPropagation, Allocations, Alpha,
+        BaseAllocation, Beta, Cardinality, CoordDim, CoordPropInfo, DataOrigin, DataStream,
+        ElemArrDistribution, FoldLabel, LdsIdx, NodeId, PadType, PropEnd, RefComponents, RefNode,
+        SpatialFolds, StoredStream, TemporalFolds, TemporalLoopDistribution, TransferDirection,
+        TransferDst, TransferDsts, relate_loops_to_alloc_elem_arr,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+    use crate::generated::DataConnect;
+    use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
+    use crate::schedule::ddc::transformation::Scale;
+    use crate::schedule::ddc::transformation_util::{LoopDims, LoopNode, PrimaryDimAndKind};
+    use crate::schedule::dsc2::NodeName;
+    use crate::schedule::l3::dl_ops::{LoopAndDim, LoopDistribution};
+    use crate::units::DfirUnit;
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    /// A fold manager's dims by trip count, OUTERMOST FIRST.
+    struct Dims(Vec<u64>);
+
+    impl AffineFoldDims for Dims {
+        fn num_dims(&self) -> usize {
+            self.0.len()
+        }
+        fn alpha_beta(&self, _dim: usize) -> (Alpha, Beta) {
+            (Alpha(1), Beta(0))
+        }
+        fn dim_size(&self, dim: usize) -> Cardinality {
+            Cardinality(self.0[dim])
+        }
+        fn dim_label(&self, _dim: usize) -> Option<FoldLabel> {
+            None
+        }
+    }
+
+    /// The propagation names a `data_connect=`, so [`super::match_data_stream`] short-circuits and
+    /// no allocation is ever looked up.
+    struct NoAllocs;
+
+    impl Allocations for NoAllocs {
+        fn allocation(&self, _stored: StoredStream) -> Option<AllocId> {
+            None
+        }
+        fn value_allocation(&self, _scale: AllocId) -> Option<AllocId> {
+            None
+        }
+    }
+
+    /// What the distributor was asked to do.
+    #[derive(Debug, PartialEq)]
+    struct Recorded {
+        dim: PrimaryDimAndKind,
+        fold_owner: NodeId,
+        target_lds: LdsIdx,
+        ref_pad: PadType,
+        target_pad: PadType,
+        components: RefComponents,
+        loops: Vec<String>,
+        elem_arr: Vec<Cardinality>,
+    }
+
+    /// The two dsc2 seams: `collectRelatedLoops` keeps the chain entries that walk the dim, and the
+    /// distributor records its request in the out-param.
+    struct Seams;
+
+    impl<'l> TemporalLoopDistribution<'l> for Seams {
+        type LoopParams = Option<Recorded>;
+
+        fn related_loops(
+            &self,
+            dim: PrimaryDimAndKind,
+            chain: &[LoopAndDim<'l>],
+            _pad: PadType,
+        ) -> Vec<LoopAndDim<'l>> {
+            chain
+                .iter()
+                .copied()
+                .filter(|entry| entry.dim == dim)
+                .collect()
+        }
+
+        fn distribute(
+            &self,
+            request: &ElemArrDistribution<'l>,
+            loop_params: &mut Self::LoopParams,
+        ) {
+            *loop_params = Some(Recorded {
+                dim: request.dim,
+                fold_owner: request.fold_owner,
+                target_lds: request.target_lds,
+                ref_pad: request.ref_pad,
+                target_pad: request.target_pad,
+                components: request.components,
+                loops: request
+                    .loops_to_distribute
+                    .iter()
+                    .map(|entry| entry.loop_node.name.0.clone())
+                    .collect(),
+                elem_arr: request
+                    .elem_arr
+                    .iter()
+                    .map(|fold| fold.cardinality)
+                    .collect(),
+            });
+        }
+    }
+
+    fn loop_named(name: &str, dim: PrimaryDim) -> LoopNode {
+        LoopNode {
+            name: NodeName(name.to_owned()),
+            num: DatastageId(0),
+            den: DatastageId(1),
+            dims: LoopDims::new(
+                PrimaryDimAndKind {
+                    dim,
+                    kind: MetaDimKind::Unpadded,
+                },
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// THE REFERENCE'S OWN EXAMPLE — `transfer_lds4_src:ptrow6_dst:pe` in resnet's `Conv_0`
+    /// (`ddc/ddc_fold.cpp:2969-2971`): the matched destination sets both components to `PE`, then the
+    /// PT-row override moves the SIZE to row 6 alone and leaves the propagation on `PE`. Row 6 then
+    /// selects the SLICE-VIEW coordinate, whose two counts decide both slices.
+    #[test]
+    fn a_transfer_off_a_pt_row_sizes_for_the_row_and_hands_over_the_surplus_loops() {
+        let allocate_folds = Dims(vec![7, 7]);
+        let slice_view_folds = Dims(vec![2, 3, 4, 5]);
+        let dsts = TransferDsts::new(
+            TransferDst {
+                unit: SenComponent::Pe,
+                stream: StoredStream {
+                    stream: DataStream {
+                        origin: DataOrigin::LabeledDs(LdsIdx(4)),
+                        data_connect: Some(DataConnect::PeHtOut),
+                    },
+                    storage: DfirUnit::L0,
+                },
+            },
+            Vec::new(),
+        );
+        let streams = CoordPropInfo {
+            data_connect: Some(DataConnect::PeHtOut),
+            ref_node: PropEnd::Other,
+            node_to_fold: PropEnd::Other,
+        };
+        let prop = AllocPropagation {
+            alloc: BaseAllocation {
+                component: SenComponent::Ptxrf,
+                lds: LdsIdx(4),
+                coordinates: AllocCoordinates {
+                    allocate: CoordDim {
+                        folds: Some(&allocate_folds),
+                        spatial: SpatialFolds(0),
+                        temporal: TemporalFolds(0),
+                        pad: PadType::NoPad,
+                    },
+                    slice_view: Some(CoordDim {
+                        folds: Some(&slice_view_folds),
+                        spatial: SpatialFolds(1),
+                        temporal: TemporalFolds(1),
+                        pad: PadType::PaddedWZeroPad,
+                    }),
+                },
+                dim_scale: Some(Scale::Sized(1.0)),
+            },
+            ref_node: NodeId(9),
+            ref_kind: RefNode::Transfer {
+                src: SenComponent::Ptrow6,
+                dsts: &dsts,
+                direction: TransferDirection::IntoAllocation,
+            },
+            streams: &streams,
+        };
+        let (inner, middle, outer, other) = (
+            loop_named("inner", PrimaryDim::In),
+            loop_named("middle", PrimaryDim::In),
+            loop_named("outer", PrimaryDim::In),
+            loop_named("other", PrimaryDim::Out),
+        );
+        let chain: Vec<LoopAndDim<'_>> = [&inner, &middle, &outer, &other]
+            .into_iter()
+            .map(|loop_node| LoopAndDim {
+                loop_node,
+                dim: PrimaryDimAndKind {
+                    dim: loop_node.dims.iter().next().expect("one dim").dim,
+                    kind: MetaDimKind::Unpadded,
+                },
+                distribution: LoopDistribution::AboveChunk,
+            })
+            .collect();
+
+        let mut loop_params = None;
+        relate_loops_to_alloc_elem_arr(
+            &NoAllocs,
+            &Seams,
+            &prop,
+            PrimaryDim::In,
+            PadType::LoweredPadded,
+            &chain,
+            &mut loop_params,
+        );
+
+        assert_eq!(
+            loop_params,
+            Some(Recorded {
+                dim: PrimaryDimAndKind {
+                    dim: PrimaryDim::In,
+                    kind: MetaDimKind::Unpadded,
+                },
+                fold_owner: NodeId(9),
+                target_lds: LdsIdx(4),
+                // The REFERENCE's padding is the effective coordinate's, the TARGET's is the
+                // propagated coordinate's, and they are not interchangeable.
+                ref_pad: PadType::PaddedWZeroPad,
+                target_pad: PadType::LoweredPadded,
+                components: RefComponents {
+                    size: SenComponent::Ptrow6,
+                    prop: SenComponent::Pe,
+                },
+                // Three loops walk `In`, one temporal fold covers one of them, and the two that are
+                // left are handed over innermost first.
+                loops: vec!["inner".to_owned(), "middle".to_owned()],
+                // Spatial 1 + temporal 1 of the slice view's four levels are the reference's own, so
+                // the last two are the element arrangement — innermost first.
+                elem_arr: vec![Cardinality(5), Cardinality(4)],
+            })
+        );
+    }
+}
+
 // crustify:todo: e233_dbgPrint
 //   authority : ddc/ddc_fold.cpp:63  (11 body lines, level 1)
 //   original  : void dbgPrint(const dsc2::ScheduleNode *node)
@@ -1877,13 +2463,6 @@ mod tests_e094_e095 {
 //   original  : void Ddc::buildFoldForExternalAllocation(dsc2::AllocateNode *allocNode)
 //   extract   : crustify-ddc/cpp/ddc.cpp:4027-4183
 //   calls     : e062_getEnclosingLoopsAndRelatedDims, e081_buildFoldForBroadcastDim, e093_buildSpatialFold
-
-// crustify:todo: e241_relateLoopsToAllocElemArr
-//   authority : ddc/ddc_fold.cpp:2872  (166 body lines, level 1)
-//   class     : Ddc
-//   original  : void Ddc::relateLoopsToAllocElemArr( dsc2::CoordPropInfoType &coordPropInfo, const PrimaryDimTypes dim, const dsc2::CoordinateType<CoordinateBaseType> &coordinate, const dsc2::VectorOfLoopAndDim &refLoopChain, dsc2::LoopDistributionParamPerNodeType &loopParamsAfterDistribution)
-//   extract   : crustify-ddc/cpp/ddc.cpp:4193-4363
-//   calls     : e091_matchDataStream, e095_gatherFoldParams
 
 // crustify:todo: e297_gatherRelatedPTRowsBase
 //   authority : ddc/ddc_fold.cpp:740  (217 body lines, level 2)
