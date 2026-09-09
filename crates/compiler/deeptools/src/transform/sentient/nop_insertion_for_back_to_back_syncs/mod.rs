@@ -79,12 +79,13 @@
 //! | `e325_runOnOperation` | 325 | 1 | 10 | `dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:81` |
 
 // ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
-// file's own tests until `e325_runOnOperation` lands and something calls it. CI runs clippy with
-// `-D warnings`, so without this the first ported leaf of the module fails the gate.
-// ⭐ REMOVE THIS WITH `e325_runOnOperation`: at that point an unused item here is a real defect again.
+// file's own tests. CI runs clippy with `-D warnings`, so without this the first ported leaf of the
+// module fails the gate.
+// ⭐ REMOVE THIS WHEN THE PASS IS WIRED: `e325_runOnOperation` is the pass ENTRY and is now ported, but
+// nothing calls the entry either, so this is still what keeps the module warning-free.
 #![allow(dead_code)]
 
-use crate::arch::Arch;
+use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::Program;
 use crate::islands::sentient::dialects::{Op, sentient};
@@ -224,15 +225,25 @@ fn insert_nops(block: &mut Vec<Op>, marker: &mut Marker) {
     }
 }
 
-// crustify:todo: e325_runOnOperation
-//   authority : dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:81  (10 body lines, level 1)
-//   original  : void runOnOperation()
-//   calls     : e100_runOn
+/// Replaces: e325_runOnOperation
+///
+/// The pass entry: on DD2 and older the whole module gets [`run_on_program`]; on SEN1P5 and newer
+/// nothing does, because the hardware bug the nops work around is fixed there.
+///
+/// ⛔ THE `DisableThisPass` GATE IS COMMENTED OUT IN THE REFERENCE (`:82`), so the flag is declared
+/// (`:52-56`) and read by nothing — the pass runs whatever it is set to, and so does this.
+/// ⭐ THE ARCH TEST IS A `const` COMPARISON ON [`IsaGen`], which is ordered: `getArch() <=
+/// RCUDD1A_ISA`.
+pub(crate) fn run_on_operation<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    if A::GEN <= IsaGen::Rcudd1a {
+        run_on_program(program);
+    }
+}
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{run_on_program, run_on_unit};
-    use crate::arch::Dd2;
+    use super::{run_on_operation, run_on_program, run_on_unit};
+    use crate::arch::{Arch, Dd2, Sen1p5};
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
@@ -291,8 +302,8 @@ mod unit_tests {
         })
     }
 
-    /// A one-unit program of `kind` running `body`.
-    fn program_on(kind: DfirUnit, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+    /// A one-unit program of `kind` running `body`, on whichever arch the caller asks for.
+    fn program_of<A: Arch>(kind: DfirUnit, body: Vec<Op>) -> Program<A, AnyModel, AnyRung> {
         Program {
             name: ProgramName {
                 group: GroupId(0),
@@ -312,6 +323,36 @@ mod unit_tests {
             ),
             bound: core::marker::PhantomData,
         }
+    }
+
+    /// The same on DD2, which is what e100's and e101's cases run on.
+    fn program_on(kind: DfirUnit, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        program_of::<Dd2>(kind, body)
+    }
+
+    /// e325 — DD2 gets the nop; SEN1P5, where the hardware bug is fixed, gets nothing.
+    #[test]
+    fn e325_runs_on_dd2_and_below_only() {
+        let body = vec![hard_send("s0"), hard_send("s1")];
+        let mut on_dd2 = program_of::<Dd2>(DfirUnit::L0su, body.clone());
+        run_on_operation(&mut on_dd2);
+        assert_eq!(
+            on_dd2
+                .units
+                .iter()
+                .next()
+                .expect("the head unit")
+                .body
+                .len(),
+            3
+        );
+
+        let mut on_sen1p5 = program_of::<Sen1p5>(DfirUnit::L0su, body.clone());
+        run_on_operation(&mut on_sen1p5);
+        assert_eq!(
+            on_sen1p5.units.iter().next().expect("the head unit").body,
+            body
+        );
     }
 
     /// e100 — the `l0su` unit's back-to-back pair is separated; the same body on an `lxsu` is not

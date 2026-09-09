@@ -219,6 +219,19 @@ impl RecvEnd {
         RecvEnd(unit)
     }
 
+    /// THE END A `uniform.query_map` OF MULTICAST GROUPS STATES — the result of the SECOND query map
+    /// `MulticastCanonicalization` builds, whose every value is a group's `$producer`.
+    ///
+    /// ⛔ A SIBLING OF [`Self::from_multicast_group`] AND NOT THE SAME CONSTRUCTOR: the value here is
+    /// not a unit ID but a per-unit SELECTION of one, so a reader that wants to know which unit sends
+    /// has to resolve the map. `processQMapOfDirectMulticast` writes exactly this into a
+    /// `sentient.receive_and_store`'s `$producer`
+    /// (`dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:155-158`).
+    #[must_use]
+    pub const fn from_producer_query_map(qmap: Val) -> RecvEnd {
+        RecvEnd(qmap)
+    }
+
     /// THE END'S VALUE, MUTABLY — for RENUMBERING ONLY. See [`SendEnd::val_mut`].
     pub(crate) const fn val_mut(&mut self) -> &mut Val {
         &mut self.0

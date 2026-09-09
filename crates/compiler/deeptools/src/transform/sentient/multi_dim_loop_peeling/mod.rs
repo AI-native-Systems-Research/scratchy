@@ -82,6 +82,8 @@
 
 pub(crate) mod loop_peeling_manager;
 
+use crate::islands::sentient::dialects::{self as dialects, Op};
+use crate::islands::sentient::print;
 use crate::transform::sentient::ForRef;
 
 /// WHICH ITERATION(S) OF A LOOP GET PEELED — `LoopPeelingManager::PeelingType`
@@ -191,12 +193,38 @@ impl PeelingCandidates {
             None => self.0.push((for_op, peeling)),
         }
     }
+
+    /// Replaces: e321_printLoopToPeelingType
+    ///
+    /// The candidate list as text — the mode, then the whole loop — or `"No loops to be peeled."` for
+    /// an empty list.
+    ///
+    /// ⛔ `raw_ostream &OS` IS A PARAMETER, so a test reads what the manager wrote; e027 and e144 have
+    /// the same shape.
+    /// ⛔ TRAP: `OS << record.first` PRINTS THE WHOLE `sentient.for` — `OpState`'s stream operator
+    /// prints the operation, not its name. `scope` resolves a [`ForRef`] back to that op, which this
+    /// island needs because its ops carry no parent pointers.
+    pub fn print_loop_to_peeling_type(&self, out: &mut String, scope: &[Op]) {
+        if self.0.is_empty() {
+            out.push_str("No loops to be peeled.\n");
+            return;
+        }
+        out.push_str("Candidate loops for peeling:\n");
+        for (loop_ref, peeling) in &self.0 {
+            out.push_str(peeling.ty().spelling());
+            out.push_str(":\n");
+            if let Some((for_op, _)) = dialects::parent_for_arg(loop_ref.0, scope) {
+                print::emit(out, for_op, 0);
+            }
+            out.push('\n');
+        }
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::{Peeling, PeelingCandidates, PeelingType};
-    use crate::islands::sentient::dialects::Val;
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
     use crate::transform::sentient::ForRef;
 
     /// The four spellings `updateDbgName` writes into `MDLP(..)`.
@@ -228,12 +256,31 @@ mod unit_tests {
             ]
         );
     }
-}
 
-// crustify:todo: e321_printLoopToPeelingType
-//   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:188  (11 body lines, level 1)
-//   original  : void printLoopToPeelingType(raw_ostream &OS) const
-//   calls     : e093_stringifyPeelingType
+    /// e321 — the mode then the WHOLE loop, body included, and the empty list's own sentence.
+    #[test]
+    fn the_candidate_list_prints_the_mode_then_the_loop() {
+        let mut nothing = String::new();
+        PeelingCandidates::default().print_loop_to_peeling_type(&mut nothing, &[]);
+        assert_eq!(nothing, "No loops to be peeled.\n");
+
+        let scope = vec![Op::Sentient(sentient::Op::For {
+            iv: Val(1),
+            bound: Val(0),
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![Op::Sentient(sentient::Op::Nop { dbg_name: None })],
+        })];
+        let mut candidates = PeelingCandidates::default();
+        candidates.insert_or_update(ForRef(Val(1)), Peeling::LastIterOnly);
+        let mut printed = String::new();
+        candidates.print_loop_to_peeling_type(&mut printed, &scope);
+        assert!(printed.starts_with("Candidate loops for peeling:\nLastIterOnly:\n"));
+        // ⛔ THE OPERATION, NOT ITS NAME — so the body is in there too.
+        assert!(printed.contains("sentient.for") && printed.contains("sentient.nop"));
+        assert!(printed.ends_with("\n\n"));
+    }
+}
 
 // crustify:todo: e515_getOrCreateTupleForIV
 //   authority : dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:149  (8 body lines, level 3)

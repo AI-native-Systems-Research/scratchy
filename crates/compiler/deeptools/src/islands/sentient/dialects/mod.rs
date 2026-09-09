@@ -59,6 +59,9 @@ pub mod sentient;
 /// held one value type while `Op::Sentient` held another, and no printer could take both.
 pub use crate::islands::dataflow_ir::dialects::Val;
 
+/// The value minter and the `IRMapping` a clone at this rung needs — see [`clone_ops`].
+use crate::islands::dataflow_ir::{ValueMapping, Values};
+
 /// AN `affine.for` WHOSE BODY HAS REACHED THIS RUNG — the loop [`Op::Affine`] cannot hold.
 ///
 /// ⛔⛔ THE VENDOR'S OWN OUTPUT PUTS A `sentient.load_and_store` INSIDE AN `affine.for` BODY
@@ -1406,6 +1409,120 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
     }
 }
 
+/// CLONES `ops` AT **THIS** RUNG, MINTING A FRESH VALUE FOR EVERYTHING THEY DEFINE —
+/// `OpBuilder::clone(Operation &, IRMapping &)`.
+///
+/// # ⛔⛔ THE ISLAND HAD NO CLONE AT THIS RUNG AND `copyOneIter` IS ONE
+///
+/// `builder.clone(*for_op)` copies a whole `sentient.for`, hoists the copy's body out and deletes the
+/// copy (`dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:465-467`), which is how a peeled
+/// iteration is built. [`crate::islands::dataflow_ir::Values::clone_ops`] is typed to the rung BELOW —
+/// it goes through that island's [`crate::islands::dataflow_ir::dialects::parts_mut`], which has no
+/// `Sentient` arm — so without this the peel would emit a second definition of every value the loop
+/// body binds, and nothing would say so.
+///
+/// ⭐ THE ORDER IS THE RUNG BELOW'S, BECAUSE IT IS MLIR'S PRINTING ORDER: operands read through
+/// `mapping`, then this op's results minted, then its regions' arguments, then the regions.
+///
+/// ⛔ FOUR SEPARATELY SCOPED PHASES, NOT ONE `parts_mut`: each of [`sentient::operands_mut`],
+/// [`sentient::results_mut`], [`sentient::block_args_mut`] and [`sentient::regions_mut`] borrows the
+/// whole op, so only one of the four lists can be live at a time and the groups cannot be collected
+/// together the way the rung below collects them.
+///
+/// ⭐ THE SHARED DIALECTS DELEGATE through [`lowered`]/[`raised`] onto that same `parts_mut` — one
+/// description of one operation, as everywhere else in this module.
+#[must_use]
+pub fn clone_ops(ops: &[Op], values: &mut Values, mapping: &mut ValueMapping) -> Vec<Op> {
+    ops.iter().map(|op| clone_op(op, values, mapping)).collect()
+}
+
+/// One op of [`clone_ops`].
+fn clone_op(op: &Op, values: &mut Values, mapping: &mut ValueMapping) -> Op {
+    if let Some(lower) = lowered(op) {
+        let mut cloned = values.clone_ops(&[lower], mapping);
+        return raised(cloned.remove(0));
+    }
+    let mut copy = op.clone();
+    match &mut copy {
+        Op::Sentient(inner) => {
+            for operand in sentient::operands_mut(inner) {
+                *operand = mapping.lookup_or_default(*operand);
+            }
+            for result in sentient::results_mut(inner) {
+                *result = minted(*result, values, mapping);
+            }
+            for arg in sentient::block_args_mut(inner) {
+                *arg = minted(*arg, values, mapping);
+            }
+            for region in sentient::regions_mut(inner) {
+                // ⭐ TAKEN, NOT COPIED AGAIN — `op.clone()` above already deep-copied the body.
+                let source = core::mem::take(region);
+                *region = clone_ops(&source, values, mapping);
+            }
+        }
+        // ⭐ ARM FOR ARM WITH THE RUNG BELOW'S `affine::Op::For`: a constant bound is not a value, and
+        // the induction variable is region argument 0.
+        Op::AffineFor(loop_op) => {
+            for bound in [&mut loop_op.lo, &mut loop_op.hi] {
+                if let affine::Bound::Val(val) = bound {
+                    *val = mapping.lookup_or_default(*val);
+                }
+            }
+            for carried in &mut loop_op.carried {
+                carried.init = mapping.lookup_or_default(carried.init);
+            }
+            for carried in &mut loop_op.carried {
+                carried.result = minted(carried.result, values, mapping);
+            }
+            loop_op.iv = minted(loop_op.iv, values, mapping);
+            for carried in &mut loop_op.carried {
+                carried.arg = minted(carried.arg, values, mapping);
+            }
+            let source = core::mem::take(&mut loop_op.body);
+            loop_op.body = clone_ops(&source, values, mapping);
+        }
+        // ⭐ ARM FOR ARM WITH THE RUNG BELOW'S `uniform::Op::UniformizeRegions`: each region reads its
+        // unit list and binds its own argument, and only `uniformize_regions` binds results.
+        Op::UniformRegions(regions) => {
+            for region in regions.regions_mut() {
+                for unit in &mut region.units {
+                    *unit = mapping.lookup_or_default(*unit);
+                }
+            }
+            if let UniformRegions::UniformizeRegions { results, .. } = regions {
+                for result in results {
+                    *result = minted(*result, values, mapping);
+                }
+            }
+            for region in regions.regions_mut() {
+                region.arg = minted(region.arg, values, mapping);
+            }
+            for region in regions.regions_mut() {
+                let source = core::mem::take(&mut region.body);
+                region.body = clone_ops(&source, values, mapping);
+            }
+        }
+        // ⛔ NO `_` ARM, and unreachable: [`lowered`] answered every one of these above.
+        Op::Dataflow(_)
+        | Op::Agen(_)
+        | Op::VectorChain(_)
+        | Op::Affine(_)
+        | Op::Vector(_)
+        | Op::Arith(_)
+        | Op::Scf(_)
+        | Op::Symbol(_)
+        | Op::Uniform(_) => {}
+    }
+    copy
+}
+
+/// One value the clone DEFINES: a fresh name, recorded so every later read of the original finds it.
+fn minted(of: Val, values: &mut Values, mapping: &mut ValueMapping) -> Val {
+    let fresh = values.mint();
+    mapping.map(of, fresh);
+    fresh
+}
+
 /// WHICH BRANCH OF A `sentient.if` SURVIVES CANONICALISATION — `RemoveStaticCondition`'s three
 /// outcomes (`SentientOps.cpp:1489-1502`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1755,4 +1872,72 @@ pub fn uniform_mapping_values(map: Val, key: Val, defs: Definitions<'_>) -> Vec<
                 .map(|(_, value)| *value)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{Op, Val, clone_ops, sentient};
+    use crate::islands::dataflow_ir::dialects::arith;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{ValueMapping, Values};
+
+    /// `builder.clone(*for_op, mapping)` — a `sentient.for` and everything under it get fresh names,
+    /// and every read inside follows the mapping.
+    ///
+    /// ⛔ THE SHARED-DIALECT ARM IS THE POINT: the `arith.constant` in the body goes through
+    /// [`super::lowered`]/[`super::raised`], which is the rung below's clone, so its result must be
+    /// minted too — otherwise the copy would define `%2` a second time.
+    #[test]
+    fn clone_ops_mints_every_value_the_copy_defines() {
+        let ops = vec![Op::Sentient(sentient::Op::For {
+            iv: Val(1),
+            bound: Val(0),
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![
+                Op::Arith(arith::Op::Constant {
+                    result: Val(2),
+                    value: 3,
+                }),
+                Op::Sentient(sentient::Op::ScalarAdd {
+                    lhs: Val(1),
+                    rhs: Val(2),
+                    result: Val(3),
+                    reg: None,
+                    ty: ScalarTy::Index,
+                    element_size: None,
+                }),
+            ],
+        })];
+        let mut values = Values::default();
+        for _ in 0..4 {
+            let _ = values.mint();
+        }
+        let mut mapping = ValueMapping::new();
+        let cloned = clone_ops(&ops, &mut values, &mut mapping);
+
+        let Op::Sentient(sentient::Op::For {
+            iv, bound, body, ..
+        }) = &cloned[0]
+        else {
+            panic!("the clone is the same op")
+        };
+        // ⭐ THE BOUND IS AN OPERAND DEFINED OUTSIDE, so it is NOT remapped.
+        assert_eq!(*bound, Val(0));
+        assert_eq!(*iv, Val(4));
+        assert_eq!(
+            body[0],
+            Op::Arith(arith::Op::Constant {
+                result: Val(5),
+                value: 3
+            })
+        );
+        let Op::Sentient(sentient::Op::ScalarAdd {
+            lhs, rhs, result, ..
+        }) = body[1]
+        else {
+            panic!("the body's second op is the add")
+        };
+        assert_eq!((lhs, rhs, result), (Val(4), Val(5), Val(6)));
+    }
 }

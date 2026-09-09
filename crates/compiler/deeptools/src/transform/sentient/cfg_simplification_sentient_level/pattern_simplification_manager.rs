@@ -508,7 +508,9 @@ fn walk_mut_under(root: &mut [Op], base: &OpPath, visit: &mut impl FnMut(&[(u32,
 }
 
 /// The op those steps name, if they still name one.
-fn op_at<'a>(root: &'a [Op], path: &[(u32, u32)]) -> Option<&'a Op> {
+///
+/// ⭐ `pub(crate)` FOR e319, which resolves an [`OpPath`] of a `sentient.if` in another pass's home.
+pub(crate) fn op_at<'a>(root: &'a [Op], path: &[(u32, u32)]) -> Option<&'a Op> {
     let (&(_, index), rest) = path.split_first()?;
     let op = root.get(index as usize)?;
     if rest.is_empty() {

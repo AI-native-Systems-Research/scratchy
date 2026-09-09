@@ -103,7 +103,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use super::ForRef;
 use super::analyses::{InstructionCount, InstructionEstimator};
-use super::cfg_simplification_sentient_level::pattern_simplification_manager::OpPath;
+use super::cfg_simplification_sentient_level::pattern_simplification_manager::{OpPath, op_at};
 use crate::islands::sentient::dialects::sentient as ops;
 use crate::islands::sentient::dialects::{Op, Val, defining_op, replace_all_uses_with};
 
@@ -761,20 +761,67 @@ pub(crate) fn compute_reduced_cost<E: InstructionEstimator>(
     }
 }
 
-// crustify:todo: e318_promoteForLoopBodyAndDelete
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:147  (10 body lines, level 1)
-//   original  : void LoopSplittingAndUnrollingPass::promoteForLoopBodyAndDelete( sentient::ForOp for_op)
-//   calls     : e085_replaceIterArgsAndYieldResults
+/// Replaces: e318_promoteForLoopBodyAndDelete
+///
+/// Rewires the loop's iter args and results, drops its terminator and leaves its body standing where
+/// the loop was — one unrolled iteration.
+///
+/// ⛔ TRAP: `getBody()->back().erase()` ERASES THE LAST OP WHATEVER IT IS, not "the yield if there is
+/// one", so a loop whose body does not end in `sentient.yield` loses its last real op here.
+/// ⭐ THE SPLICE THEN THE ERASE IS ONE EDIT: the body goes in front of the loop and the loop goes, so
+/// the body ENDS UP at the loop's index.
+pub(crate) fn promote_for_loop_body_and_delete(scope: &mut Vec<Op>, at: usize) {
+    replace_iter_args_and_yield_results(scope, at);
+    let Some(Op::Sentient(ops::Op::For { body, .. })) = scope.get_mut(at) else {
+        return;
+    };
+    body.pop();
+    let promoted = core::mem::take(body);
+    scope.splice(at..=at, promoted);
+}
 
-// crustify:todo: e319_getAllTrueIndexOfIfOpsList
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:587  (7 body lines, level 1)
-//   original  : std::vector<bool> LoopSplittingAndUnrollingPass::getAllTrueIndexOfIfOpsList( int bound, llvm::SmallVectorImpl<sentient::IfOp> &if_list)
-//   calls     : e090_evaluatePredicate
+/// Replaces: e319_getAllTrueIndexOfIfOpsList
+///
+/// Each if op's predicate value at one iteration bound, in the list's own order — the bit vector
+/// `findAllSplitVals` groups bounds by.
+///
+/// ⭐ A PATH THAT NO LONGER RESOLVES ANSWERS `false`, which is [`evaluate_predicate`]'s own answer for
+/// an op that is not a `sentient.if`.
+#[must_use]
+pub(crate) fn get_all_true_index_of_if_ops_list(
+    bound: IterBound,
+    if_list: &[OpPath],
+    unit: &[Op],
+) -> Vec<bool> {
+    if_list
+        .iter()
+        .map(|path| match op_at(unit, path.path()) {
+            Some(if_op) => evaluate_predicate(bound, if_op, unit),
+            None => false,
+        })
+        .collect()
+}
 
-// crustify:todo: e320_subsetsImpl
-//   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:622  (9 body lines, level 1)
-//   original  : static void subsetsImpl(std::vector<std::pair<int, int>> &split_vals, std::vector<std::vector<std::pair<int, int>>> &res, std::vector<std::pair<int, int>> &subset, int index)
-//   calls     : e252_size
+/// Replaces: e320_subsetsImpl
+///
+/// Appends `subset` and then every subset that extends it with a suffix of `split_vals` from `index`
+/// on — the power set of the split ranges, built depth first.
+///
+/// ⭐ `res` GETS THE PREFIX BEFORE THE RECURSION, so the empty subset is entry 0 and the emission
+/// order is the reference's.
+pub(crate) fn subsets_impl(
+    split_vals: &[SplitRange],
+    res: &mut Vec<Vec<SplitRange>>,
+    subset: &mut Vec<SplitRange>,
+    index: usize,
+) {
+    res.push(subset.clone());
+    for at in index..split_vals.len() {
+        subset.push(split_vals[at]);
+        subsets_impl(split_vals, res, subset, at + 1);
+        subset.pop();
+    }
+}
 
 // crustify:todo: e446_subsets
 //   authority : dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:635  (12 body lines, level 2)
@@ -1203,5 +1250,71 @@ mod unit_tests {
         let mut cost_reduced = InstructionCount(0);
         compute_reduced_cost(Some(&node), &mut ie, &mut cost_reduced, &BTreeMap::new());
         assert_eq!(cost_reduced, InstructionCount(0));
+    }
+
+    /// e318 — the body stands where the loop stood, its iter arg reads the init and its terminator is
+    /// gone.
+    #[test]
+    fn the_promoted_body_replaces_the_loop() {
+        let mut scope = vec![
+            constant(4, Val(0)),
+            constant(7, Val(1)),
+            for_loop(
+                Val(2),
+                Val(0),
+                vec![carried(Val(1), Val(3), Val(4))],
+                vec![add(Val(3), Val(3), Val(5)), yields(vec![Val(5)])],
+            ),
+            add(Val(4), Val(4), Val(6)),
+        ];
+        promote_for_loop_body_and_delete(&mut scope, 2);
+        assert_eq!(scope.len(), 4);
+        // The one body op, reading the init in place of the iter arg.
+        assert_eq!(scope[2], add(Val(1), Val(1), Val(5)));
+        // The loop's reader now reads what the body yielded.
+        assert_eq!(scope[3], add(Val(5), Val(5), Val(6)));
+    }
+
+    /// e319 — one bit per if op, in the list's order, and `false` for a path that no longer resolves.
+    #[test]
+    fn the_bit_vector_follows_the_lists_order() {
+        let scope = vec![
+            constant(5, Val(0)),
+            if_op(Val(0), Val(1), Vec::new(), Vec::new()),
+            if_op(Val(1), Val(0), Vec::new(), Vec::new()),
+        ];
+        let mut if_list = if_op_paths(&scope);
+        if_list.reverse();
+        if_list.push(OpPath::at(&[(0, 9)]));
+        // Reversed: `bound >= %c5` first, then `%c5 >= bound`, then a path that resolves to nothing.
+        assert_eq!(
+            get_all_true_index_of_if_ops_list(IterBound(3), &if_list, &scope),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            get_all_true_index_of_if_ops_list(IterBound(7), &if_list, &scope),
+            vec![true, false, false]
+        );
+    }
+
+    /// e320 — the power set, empty subset first and each range appended before its own extensions.
+    #[test]
+    fn the_subsets_are_the_power_set_depth_first() {
+        let range = |high, low| SplitRange {
+            high: IterBound(high),
+            low: IterBound(low),
+        };
+        let split_vals = [range(4, 3), range(2, 1)];
+        let mut res = Vec::new();
+        subsets_impl(&split_vals, &mut res, &mut Vec::new(), 0);
+        assert_eq!(
+            res,
+            vec![
+                vec![],
+                vec![range(4, 3)],
+                vec![range(4, 3), range(2, 1)],
+                vec![range(2, 1)],
+            ]
+        );
     }
 }
