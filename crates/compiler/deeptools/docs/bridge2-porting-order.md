@@ -1115,6 +1115,80 @@ walk lambda, so one total-units op reading a non-collection abandons every later
 collection expansion with no diagnostic. `dataflow::Op::GetTotalUnitsInCollection` was added to the
 island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td` for the same reason).
 
+## ⛔ AND WHAT THE LANDED RUST CLAIMED ABOUT ENTRIES 265-288 — ALL 24 PORTS HOLD, 82 CITATIONS FIXED IN THIS COMMIT
+
+24 `/// Replaces:` anchors, 0 surviving `// crustify:todo:`, 48/48 PORT/AUDIT boxes `[x]`. ⭐ **EVERY
+SUBSTANTIVE CLAIM RE-DERIVED FROM THE AUTHORITY AND EVERY ONE HELD — NO IMPLEMENTATION NEEDED A FIX.**
+The load-bearing ones, in the order they were checked: 277's 18-row GCVT/FCVT table is faithful
+value-for-value (`VectorChainHelper.cpp:211-267`), including the two `repetition = 4` rows
+(`:229-240`), the absent `fcvt_imm4` the reference comments out (`:262-264`) and `fcvt_imm3`'s padded
+`-1` tail (`:256-261`), with the three `continue` filters in reference order and the source-type loop
+correctly NOT `found`-guarded (`:279-295`); 278's NFWD arms and its single-user test (`:339-340`);
+279's three pad arms all reaching `SentientSplatPad::none` but the middle one; 280's `erased_list`;
+281's `DT_CHECK_MSG(!root_ && op_to_node_.empty(), ..)` (`LoopMaskTree.cpp:174`); 282, 283, 284 and
+287 clean throughout; 271's granularity default and the burst boundary it hands to
+`processBurstSplitOrInterleave`; 272's L3-returns-the-constant-alone arm; 265's six steps and 266's two
+`setTimeBounds` sites; 267's five dispatch arms and their `llvm_unreachable`; 268's `$rotate_val`
+(`SentientOps.td:734`); 269's two-user walk; 275's use-list-order walk; and 276's `LRF` test on `i`
+alone.
+
+⛔⛔ **285'S CITED REFERENCE DEFECT IS REAL, AND THE VENDOR'S OWN GOLDEN IS THE PROOF — BUT THE PROOF
+IS AT `:64`, NOT `:73`.** `simplify-conditional.mlir:64` prints
+`scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49)` with `%49 = arith.constant 1` at `:63`: the
+`setOperand(num_iter_args - 1, start_val)` at `CFGSDataflowConditionalTree.cpp:658` lands `start_val`
+in the LOWER BOUND and leaves the iteration argument reading entry 264's scf fill of **1** where
+`seq_lb_ = 0`. The affine golden it stays byte-identical to is `:47`/`:50`, not `:52-53`. Both were
+misnumbered by the port; the finding they support is unchanged.
+
+⭐ **274'S TWO DELIBERATE DIVERGENCES ARE BOTH EXACT AND BOTH PINNED.** `:645` really does hand region
+1 `dst_unit_names_for_src_corelet0`, the list built at `:568`/`:576` — `dst_unit_names_for_src_corelet1`
+(`:572`, `:580`) is never read — and `uniform_sync.mlir:247` against `:255` really does print the two
+lists as distinct and reversed. The third `SyncOp::create` at `:648-653` really is unconditional. The
+batch's one test asserts both: region 1 gets `[lxsuN, lxsu]` and `l3.is_none()`.
+
+⛔ **AND 286 AND 288'S "NEVER COMPILED" CLAIM STANDS.** `Transform/Dataflow/CMakeLists.txt:5-7`'s
+`LLVM_OPTIONAL_SOURCES` and `senCompToGenericComp`'s `SenComponents` key
+(`sys-arch-spec/arch_enums.h:130`) both re-measured exact.
+
+**82 citations corrected, and one missing banner citation added** (279 carried no
+`Splat.cpp:70`; it is folded into the existing first doc line rather than spending a ninth line on it).
+Every correction is off by a line or two in the direction of the reference's own comments, case labels
+and closing braces — the drift a `review` pass exists to find, which is why the porters are told not to
+re-measure (`AGENT-BRIEF.md:26-28`). **269, 270, 272, 282, 283, 286, 287 and 288 carried none at all;
+the drift is concentrated in 284 (18), 273 (11), 267 (9), 274 (8) and 265 (7).**
+
+| where | said | is |
+|---|---|---|
+| 265's six steps after `initialize()` | `AccessDetails.cpp:422-437` | `:425-436` |
+| 265's five outcomes | `:435`, `:437`, `:422`, `:424`, `:426-427`, `:429` | `:434`, `:436`, `:423`, `:425`, `:427-428`, `:430` |
+| 266's two `setTimeBounds` sites and its insert | `:786`, `:790`, `:784` | `:787`, `:792`, `:785-786` |
+| 267's five arms and its `llvm_unreachable` | `:1866-1901`, `:1867-1872`, `:1873-1881`, `:1882-1887`, `:1888-1893`, `:1894-1900`, `:1901` | `:1867-1900`, `:1868-1872`, `:1873-1879`, `:1880-1884`, `:1885-1889`, `:1890-1897`, `:1899` |
+| 267's two `extract_op` sites | `:1890`, `:1898` | `:1889`, `:1897` |
+| 268's `$rotate_val` and its delete-list pushes | `SentientOps.td:735`, `:2944-2947` | `:734`, `:2945-2947` |
+| 271's `burst / granularity == 0` return | `BurstUtils.cpp:96-99` | `:96-100` |
+| 273's L0 arm | `:253-258`, `(:271)` | `:255-258`, `(:273)` |
+| 273's LX arm | `:275-276`, `:277-287`, `:289-293`, `:295-300`, `:315-365`, `:337-340`, `:369` | `:277-278`, `:279-288`, `:293-296`, `:299-317`, `:320-363`, `:336-339`, `:366` |
+| 273's wait-flag trap | `:275-287` before `:289` | `:279-292` before `:294` |
+| 274's spans | `:473-483`, `:507-512`, `:516-522`, `:524-531`, `:561-583`, `:584-587`, `:608-624`, `:625-655` | `:473-485`, `:510-513`, `:515-523`, `:525-531`, `:554-582`, `:583-586`, `:608-622`, `:623-654` |
+| the shared consumer helpers | `:256-257`, `:514-515`, `:300`, `:337-340`, `:568` | `:257-258`, `:516-517`, `:305`, `:336-339`, `:566` |
+| 275's result count and its reverse walk | `:80-84`, `:93-95` | `:79-86`, `:94-95` |
+| 276's `LRF` test | `:37` | `:37-38` |
+| 277's table, its absent FCVT mode 4 and its type loop | `VectorChainHelper.cpp:211-266`, `(:257-259)`, `:272-292` | `:211-267`, `(:262-264)`, `:279-295` |
+| 277's `OpBuilder builder(src)` | `VectorChainHelper.cpp:274` | `:280` |
+| 277's empty-name error and its two Pack `dyn_cast`s | `VectorChainToSentientPESFP.cpp:642`, `:694-696` | `:643`, `:694-697` |
+| 278's single-user test | `:338-339` | `:339-340` |
+| 279's first pad index | `VectorChain.td:487-492` | `:491-497` |
+| 280's `erased_list` | `:1059` | `:1060` |
+| 281's empty-tree `DT_CHECK_MSG` | `LoopMaskTree.cpp:173` | `:174` |
+| 284's node-entry guard and its "current node" comment | `:120`, `:107-109` | `:122-123`, `:109-111` |
+| 284's `nodes_to_skip` declaration (2 sites) | `:139` | `:141` |
+| 284's both-arms filter and its address compare | `:125`, `:129` | `:127`, `:130` |
+| 284's unported `deleteAncestorsIfPossible`/`recompute` (4 sites) | `:187`, `:188-190`, `:188-191` | `:185`, `:187-188`, `:186-190` |
+| 284's remaining spans | `:115`, `:119`, `:120-122`, `:123-125`, `:127-134`, `:138-142`, `:143`, `:159-161` | `:116`, `:120`, `:122-124`, `:125-127`, `:129-133`, `:137-143`, `:144`, `:158-160` |
+| 285's `setOperand` (2 sites) | `:659` | `:658` |
+| 285's golden and its affine twin | `simplify-conditional.mlir:73`, `:52-53` | `:64`, `:47`/`:50` |
+| 285's `dyn_cast` pair | `:645-655` | `:646-654` |
+
 ## Progress
 
 `366/384 ported; 366/384 audited`

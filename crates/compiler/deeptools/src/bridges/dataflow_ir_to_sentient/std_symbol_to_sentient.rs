@@ -227,9 +227,9 @@ pub enum QueryMapLowering {
 ///
 /// ⛔ THE RESULT COUNT IS NOT THE USE COUNT: one JCR result for the loop-bound uses TOGETHER, then
 /// one LRF result for all non-loop-bound uses — except on L3, which gets one PER non-loop-bound use
-/// (`:80-84`).
+/// (`:79-86`).
 /// ⛔ `uses` IS IN MLIR USE-LIST ORDER, WHICH IS REVERSE PROGRAM ORDER, and the reference walks it
-/// backwards (`:93-95`) — so the L3 result indices ascend in PROGRAM order. `replacements` comes
+/// backwards (`:94-95`) — so the L3 result indices ascend in PROGRAM order. `replacements` comes
 /// back aligned with `uses`, not with the walk.
 #[must_use]
 pub fn lower_symbol_query_map(

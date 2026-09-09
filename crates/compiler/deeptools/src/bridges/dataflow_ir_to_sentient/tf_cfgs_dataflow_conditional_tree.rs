@@ -3316,36 +3316,36 @@ fn reverse_bfs_candidates(body: &[DfirOp]) -> Vec<&DfirOp> {
 /// point the else-copy's users at it, and return the parent so the next call resumes there.
 ///
 /// ⛔ ONE HOIST PER CALL, AND `cur_parent_if_op_of_hoist` IS BOTH THE ANSWER AND THE GUARD — but it is
-/// tested only on NODE ENTRY (`:120`), so the `child_a` x `child_b` search that set it runs to
-/// completion and may hoist again out of the SAME node (`:107-109`, *"finish analyzing the current
+/// tested only on NODE ENTRY (`:122-123`), so the `child_a` x `child_b` search that set it runs to
+/// completion and may hoist again out of the SAME node (`:109-111`, *"finish analyzing the current
 /// node"*).
-/// ⛔ `nodes_to_skip` IS DECLARED INSIDE THE `child_a` LOOP (`:139`): an else-child skipped for one
+/// ⛔ `nodes_to_skip` IS DECLARED INSIDE THE `child_a` LOOP (`:141`): an else-child skipped for one
 /// then-child is offered again to the next, so the same op can be hoisted and queued for deletion
 /// twice. ⛔ `n->isLeaf()`, `isThenNode()` and `isElseNode()` are dead or absent here for the reasons
-/// entry 380 records; BOTH ARMS HOLDING A CONDITIONAL (`:125`) is the live part of that filter.
+/// entry 380 records; BOTH ARMS HOLDING A CONDITIONAL (`:127`) is the live part of that filter.
 /// ⭐ THE NODE IS NAMED BY THE BORROW, compared with `core::ptr::eq` — the reference compares
-/// `Operation *` by address (`:129`), and entry 244 already names a position that way.
-/// ⚠️ `moveAncestorsToMaintainDominance` (`:163`), `deleteAncestorsIfPossible` (`:187`), `recompute`
-/// and `clearCache` (`:188-190`) all live in `dcc/src/Analysis/` — outside bridge 2's 384 — so this
+/// `Operation *` by address (`:130`), and entry 244 already names a position that way.
+/// ⚠️ `moveAncestorsToMaintainDominance` (`:163`), `deleteAncestorsIfPossible` (`:185`), `recompute`
+/// and `clearCache` (`:187-188`) all live in `dcc/src/Analysis/` — outside bridge 2's 384 — so this
 /// stops at the first, as entries 380 and 381 stop at theirs.
 #[must_use]
 pub fn hoist_common_conditionals<'u, A: Arch>(
     tree: &CfgsDataflowConditionalTree<'u, A>,
     if_op_where_last_hoist_occurred: Option<&DfirOp>,
 ) -> Option<&'u DfirOp> {
-    // `:96` — what a hoist leaves for the deletion pass, and `:115` the guard that is also the answer.
+    // `:96` — what a hoist leaves for the deletion pass, and `:116` the guard that is also the answer.
     let ops_to_delete: Vec<&'u DfirOp> = Vec::new();
     let cur_parent_if_op_of_hoist: Option<&'u DfirOp> = None;
-    // `:119` — `bool start_analysis = (if_op_where_last_hoist_occurred == nullptr);`
+    // `:120` — `bool start_analysis = (if_op_where_last_hoist_occurred == nullptr);`
     let mut start_analysis = if_op_where_last_hoist_occurred.is_none();
 
     for n in reverse_bfs_candidates(&tree.unit.body) {
-        // `:120-122` — every LATER node is skipped once a hoist has happened.
+        // `:122-124` — every LATER node is skipped once a hoist has happened.
         if cur_parent_if_op_of_hoist.is_some() {
             continue;
         }
 
-        // `:123-125` — the then- and else-nodes, each of which must hold a conditional of its own.
+        // `:125-127` — the then- and else-nodes, each of which must hold a conditional of its own.
         let regions = dfir_op::regions(n);
         let [then_block, else_block] = regions.as_slice() else {
             continue;
@@ -3358,7 +3358,7 @@ pub fn hoist_common_conditionals<'u, A: Arch>(
             continue;
         }
 
-        // `:127-134` — `DT_CHECK_MSG(n_if_op, ..)` is discharged by the node BEING the op here; then
+        // `:129-133` — `DT_CHECK_MSG(n_if_op, ..)` is discharged by the node BEING the op here; then
         // resume at the node the previous call returned, and look at nothing before it.
         if if_op_where_last_hoist_occurred.is_some_and(|prev| core::ptr::eq(prev, n)) {
             start_analysis = true;
@@ -3367,12 +3367,12 @@ pub fn hoist_common_conditionals<'u, A: Arch>(
             continue;
         }
 
-        // `:138-142` — every (then-child, else-child) pair, in order.
+        // `:137-143` — every (then-child, else-child) pair, in order.
         for child_a in &then_children {
-            // `:139` — ⛔ HERE, so it is empty again for every `child_a`.
+            // `:141` — ⛔ HERE, so it is empty again for every `child_a`.
             let nodes_to_skip: Vec<&DfirOp> = Vec::new();
             for child_b in &else_children {
-                // `:143`
+                // `:144`
                 if nodes_to_skip
                     .iter()
                     .any(|skip| core::ptr::eq(*skip, *child_b))
@@ -3380,7 +3380,7 @@ pub fn hoist_common_conditionals<'u, A: Arch>(
                     continue;
                 }
 
-                // `:159-161` — the legality triple. `op_a && op_b` is vacuous in this representation,
+                // `:158-160` — the legality triple. `op_a && op_b` is vacuous in this representation,
                 // and the two blocks are `n`'s own then/else regions, not a nested loop's.
                 if ops_are_equivalent(
                     child_a,
@@ -3408,8 +3408,8 @@ pub fn hoist_common_conditionals<'u, A: Arch>(
         }
     }
 
-    // `:187` — `for (auto *op : ops_to_delete) deleteAncestorsIfPossible(op);`, unported with the hoist
-    // that fills the list; `:188-191` recomputes the tree and clears the cache and returns the parent.
+    // `:185` — `for (auto *op : ops_to_delete) deleteAncestorsIfPossible(op);`, unported with the hoist
+    // that fills the list; `:186-190` recomputes the tree and clears the cache and returns the parent.
     drop(ops_to_delete);
     cur_parent_if_op_of_hoist
 }
@@ -3496,20 +3496,20 @@ fn erase_and_forward(scope: &mut Vec<DfirOp>, from: Val, to: Val) {
 /// ⛔ A ONE-TRIP LOOP TAKES NEITHER (`:622-630`): the sequence is one value, so an `arith.constant
 /// seq_lb_` replaces the conditional and the loop is left alone.
 /// ⛔⛔ THE REFERENCE MISWIRES THE `scf.for` ARM, AND ITS OWN FROZEN EXPECTATION SHOWS IT.
-/// `new_for_op->setOperand(num_iter_args - 1, start_val)` (`:659`) indexes the RAW operand list: an
+/// `new_for_op->setOperand(num_iter_args - 1, start_val)` (`:658`) indexes the RAW operand list: an
 /// `affine.for` with constant bounds carries its inits first, so operand 0 IS the added init — but
 /// `scf.for`'s operands are `lb, ub, step, inits..`, so operand 0 is its LOWER BOUND.
-/// `simplify-conditional.mlir:73` prints `scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49)`:
+/// `simplify-conditional.mlir:64` prints `scf.for %51 = %47 to %11 step %6 iter_args(%52 = %49)`:
 /// `%47` is `start_val` landed in the lower bound while the iteration argument still reads `%49`,
 /// entry 264's scf fill of **1**, so the sequence comes out `1, 1025, 2049, 3073` where `seq_lb_ = 0`.
 /// This port initialises the added argument with `seq_lb_` in both dialects and leaves the bounds
-/// alone; the affine arm stays byte-identical to `:52-53`.
+/// alone; the affine arm stays byte-identical to `:47`/`:50`.
 /// ⭐ THE MARKER ATTRIBUTE IS THE `ir_map`. `IF_OP_TO_BE_REPLACED_BY_ITER_ARG` (`:26`, `:633`, `:667`)
 /// exists only to find `if_op_`'s CLONE inside the new loop; entry 264's mapping names that
 /// correspondence directly, so `delete_op` is passed `false` to read it and no island attribute is
 /// invented. ⭐ `for_op` AND `iterations` ARE `std::get<0>` AND `std::get<4>` OF `for_op_tuple_`
 /// (`:620-621`), split because entry 264 takes a [`CountedLoop`] — which is also the `dyn_cast` pair
-/// at `:645-655` and makes `DT_ERROR("no matching for operation")` (`:656`) unwritable.
+/// at `:646-654` and makes `DT_ERROR("no matching for operation")` (`:656`) unwritable.
 #[must_use]
 pub fn replace_if_op_by_iter_arg(
     if_op: ValueYieldingConditional<'_>,
@@ -3557,7 +3557,7 @@ pub fn replace_if_op_by_iter_arg(
     match &mut op {
         DfirOp::Affine(affine::Op::For { carried, body, .. })
         | DfirOp::Scf(scf::Op::For { carried, body, .. }) => {
-            // `:659` — the added init. ⛔ THE REFERENCE WRITES OPERAND `num_iter_args - 1`; see the
+            // `:658` — the added init. ⛔ THE REFERENCE WRITES OPERAND `num_iter_args - 1`; see the
             // anchor for why that is `scf.for`'s lower bound and this is the argument it meant.
             if let Some(added) = carried.last_mut() {
                 added.init = start_val;

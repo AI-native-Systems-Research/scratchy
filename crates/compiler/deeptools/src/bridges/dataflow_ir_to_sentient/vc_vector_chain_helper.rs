@@ -2509,8 +2509,8 @@ impl CvtInst {
 /// THE ONE THING THE SCAN READS OFF A `vectorchain.cast` — its input and result element types.
 ///
 /// ⛔ `llvm::dyn_cast<vectorchain::CastOp>` IS THE CALLER'S, and both call sites do it before
-/// building the list (`VectorChainToSentientPESFP.cpp:632`, `:694-696`). `OpBuilder builder(src)`
-/// (`VectorChainHelper.cpp:274`) is only `convertTypeToString`'s context and is dropped with it.
+/// building the list (`VectorChainToSentientPESFP.cpp:632`, `:694-697`). `OpBuilder builder(src)`
+/// (`VectorChainHelper.cpp:280`) is only `convertTypeToString`'s context and is dropped with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CastSource {
     /// `getElementType(src.getInput().getType())`.
@@ -2548,10 +2548,10 @@ struct GcvtFcvt {
 }
 
 /// THE EIGHTEEN CVT INSTRUCTIONS, IN THE ORDER THE SCAN WALKS THEM
-/// (`VectorChainHelper.cpp:211-266`).
+/// (`VectorChainHelper.cpp:211-267`).
 ///
 /// ⛔⛔ `fcvt_imm4` IS COMMENTED OUT IN THE REFERENCE AND IS THEREFORE ABSENT HERE:
-/// *"TODO: Add FCVT mode 4. Need a way to differentiate it from mode 2."* (`:257-259`) — it would
+/// *"TODO: Add FCVT mode 4. Need a way to differentiate it from mode 2."* (`:262-264`) — it would
 /// have been `{"fcvt_imm4", 2, 8, {0,1,2,3,4,5,6,7}, "fp32", "fp16"}`, row-for-row identical to
 /// `fcvt_imm2`, so the scan would never reach it. [`sen::BinaryFcvt::Imm4`] exists and nothing here
 /// produces it.
@@ -2705,9 +2705,9 @@ fn gcvt_fcvt_insts() -> [GcvtFcvt; 18] {
 /// `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188` (108L).
 ///
 /// Which CVT a permutation over cast sources is, or `None` for the caller's *"There is no GCVT
-/// instruction corresponding to the following operation"* (`VectorChainToSentientPESFP.cpp:642`).
+/// instruction corresponding to the following operation"* (`VectorChainToSentientPESFP.cpp:643`).
 ///
-/// ⛔ THE TYPE PAIR IS THE ROW'S, NOT THE SOURCE'S: the loop at `:272-292` compares EVERY source
+/// ⛔ THE TYPE PAIR IS THE ROW'S, NOT THE SOURCE'S: the loop at `:279-295` compares EVERY source
 /// against the SAME `src_input_type_str_`/`src_output_type_str_`, so a two-source pack whose casts
 /// convert differently matches nothing. ⛔ AND AN EMPTY `sources` MATCHES NO ROW — arity is 1 or 2.
 /// ⭐ `dcc_ext_ctx` is a dropped parameter; the body never reads it.

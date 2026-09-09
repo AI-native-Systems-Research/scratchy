@@ -2380,7 +2380,7 @@ pub enum L0LxLowering {
     },
 }
 
-/// `symbolizeSentientLoadConsumer("l0lu"/"l0su")` — `:256-257` and `:514-515`.
+/// `symbolizeSentientLoadConsumer("l0lu"/"l0su")` — `:257-258` and `:516-517`.
 const fn l0_consumer(half: L0Half) -> sen::Consumer {
     match half {
         L0Half::Load => sen::Consumer::L0lu,
@@ -2396,8 +2396,8 @@ const fn l3_consumer(half: L3Half) -> sen::Consumer {
     }
 }
 
-/// `dst_unit_name` for an LX destination, with the `"N"` a cross-corelet sync appends (`:300`,
-/// `:337-340`, `:568`).
+/// `dst_unit_name` for an LX destination, with the `"N"` a cross-corelet sync appends (`:305`,
+/// `:336-339`, `:566`).
 const fn lx_consumer(half: LxHalf, neighbour: bool) -> sen::Consumer {
     match (half, neighbour) {
         (LxHalf::Load, false) => sen::Consumer::Lxlu,
@@ -2436,7 +2436,7 @@ impl L0LxSrc {
     ///
     /// ⛔ EVERY REFUSAL IS AN `emitError`, WHICH FAILS THE PASS, so [`None`] is what each of the
     /// reference's diagnostic arms means — including the ones that `break` past a create.
-    /// ⛔ TRAP: THE LX→L3 ARM NEVER READS THE WAIT FLAG (`:275-287` sits before the `:289` check), so
+    /// ⛔ TRAP: THE LX→L3 ARM NEVER READS THE WAIT FLAG (`:279-292` sits before the `:294` check), so
     /// a DEFERRED send from an LX to an L3 still emits `soft = false`; only the L0 and LX→LX arms
     /// refuse one.
     #[must_use]
@@ -2460,8 +2460,8 @@ impl L0LxSrc {
                 if op.deferred() {
                     return None;
                 }
-                // `:253-258` — the cross-half guard, then the name off the DESTINATION's half.
-                // Anything else is `emitError("Unknown lowering of the L0 sync operation")` (`:271`).
+                // `:255-258` — the cross-half guard, then the name off the DESTINATION's half.
+                // Anything else is `emitError("Unknown lowering of the L0 sync operation")` (`:273`).
                 let L0LxSyncDst::L0(dst_half, _) = dst else {
                     return None;
                 };
@@ -2477,12 +2477,12 @@ impl L0LxSrc {
             }
             L0LxSrc::Lx(_) => {
                 // `DT_CHECK_MSG(implicit_sync_tile_size == -1, "LX doesn't have implicit sync")`
-                // (`:275-276`).
+                // (`:277-278`).
                 if op.tile_size().is_some() {
                     return None;
                 }
                 match dst {
-                    // `:277-287` — the L3 destination keeps its bare name and its `-1` boundary.
+                    // `:279-288` — the L3 destination keeps its bare name and its `-1` boundary.
                     L0LxSyncDst::L3(half) => Some(L0LxLowering::One(sync(
                         mode,
                         vec![l3_consumer(half)],
@@ -2490,12 +2490,12 @@ impl L0LxSrc {
                         dbg_name,
                     ))),
                     L0LxSyncDst::Lx(dst_half, dst_corelet) => {
-                        // `:289-293` — "Unsuported sync operation for LX".
+                        // `:293-296` — "Unsuported sync operation for LX".
                         if op.deferred() {
                             return None;
                         }
                         match occupied {
-                            // `:295-300` — one corelet holds every source, so the sync is one op and
+                            // `:299-317` — one corelet holds every source, so the sync is one op and
                             // the `N` says whether the destination sits on the OTHER corelet.
                             OccupiedCorelets::Corelet0 | OccupiedCorelets::Corelet1 => {
                                 let neighbour = (occupied.holds_corelet_0()
@@ -2508,7 +2508,7 @@ impl L0LxSrc {
                                     dbg_name,
                                 )))
                             }
-                            // `:315-365` — both corelets have sources, so the sync is uniformized
+                            // `:320-363` — both corelets have sources, so the sync is uniformized
                             // and each region names the destination from ITS corelet's point of view.
                             OccupiedCorelets::Both => {
                                 let regions = create_uniform_regions_with_two_regions_no_result(
@@ -2516,7 +2516,7 @@ impl L0LxSrc {
                                     src_units_corelet1,
                                     values,
                                 );
-                                // `:337-340` — a corelet-1 destination is the neighbour of region 0's
+                                // `:336-339` — a corelet-1 destination is the neighbour of region 0's
                                 // sources and the local unit of region 1's; a corelet-0 destination
                                 // is the mirror (the reference's bare `else`).
                                 let dst_on_corelet1 = dst_corelet.get() == 1;
@@ -2539,7 +2539,7 @@ impl L0LxSrc {
                             }
                         }
                     }
-                    // `:369` — "Unknown lowering of the LXLU/LXSU sync operation".
+                    // `:366` — "Unknown lowering of the LXLU/LXSU sync operation".
                     L0LxSyncDst::L0(..) => None,
                 }
             }
@@ -2573,7 +2573,7 @@ impl L0LxSrc {
         dbg_name: Option<String>,
         values: &mut Values,
     ) -> Option<L0LxLowering> {
-        // `:473-483` — "List of src units cannot be empty" and the two-list `DT_CHECK`.
+        // `:473-485` — "List of src units cannot be empty" and the two-list `DT_CHECK`.
         let occupied = OccupiedCorelets::of(src_units_corelet0, src_units_corelet1)?;
         let mode = op.mode();
 
@@ -2585,7 +2585,7 @@ impl L0LxSrc {
                 }
                 let mut peers = Vec::new();
                 for dst in dst_unit_group {
-                    // `:507-512` — "Unknown lowering of the L0 sync operation", which an L3 or LX
+                    // `:510-513` — "Unknown lowering of the L0 sync operation", which an L3 or LX
                     // destination takes too: neither is the other L0 half.
                     let L0LxSyncDst::L0(dst_half, _) = dst else {
                         return None;
@@ -2593,10 +2593,10 @@ impl L0LxSrc {
                     if *dst_half == src_half {
                         return None;
                     }
-                    // `:516-522`.
+                    // `:515-523`.
                     push_back_the_unit_to_list_if_doesnot_exist(l0_consumer(*dst_half), &mut peers);
                 }
-                // `:524-531` — ⭐ ONE sync for the whole group, carrying the implicit-sync boundary.
+                // `:525-531` — ⭐ ONE sync for the whole group, carrying the implicit-sync boundary.
                 Some(L0LxLowering::One(sync(
                     mode,
                     peers,
@@ -2614,7 +2614,7 @@ impl L0LxSrc {
                 let mut for_l3 = Vec::new();
                 for dst in dst_unit_group {
                     match dst {
-                        // `:561-583` — each LX destination joins BOTH lists, local on its own
+                        // `:554-582` — each LX destination joins BOTH lists, local on its own
                         // corelet's and neighbour on the other's.
                         L0LxSyncDst::Lx(half, corelet) => {
                             let local = lx_consumer(*half, false);
@@ -2633,7 +2633,7 @@ impl L0LxSrc {
                                 &mut for_corelet1,
                             );
                         }
-                        // `:584-587`.
+                        // `:583-586`.
                         L0LxSyncDst::L3(half) => push_back_the_unit_to_list_if_doesnot_exist(
                             l3_consumer(*half),
                             &mut for_l3,
@@ -2643,7 +2643,7 @@ impl L0LxSrc {
                     }
                 }
                 match occupied {
-                    // `:593-607` and `:608-624` — one corelet's list, then the L3 destinations, in
+                    // `:593-607` and `:608-622` — one corelet's list, then the L3 destinations, in
                     // that order.
                     OccupiedCorelets::Corelet0 | OccupiedCorelets::Corelet1 => {
                         let mut peers = if occupied.holds_corelet_0() {
@@ -2654,7 +2654,7 @@ impl L0LxSrc {
                         peers.extend(for_l3);
                         Some(L0LxLowering::One(sync(mode, peers, None, dbg_name)))
                     }
-                    // `:625-655` — two regions plus one outer sync for the L3 destinations, which
+                    // `:623-654` — two regions plus one outer sync for the L3 destinations, which
                     // stay OUTSIDE the uniformization because they are the same unit from both
                     // corelets.
                     OccupiedCorelets::Both => {

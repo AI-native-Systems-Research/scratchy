@@ -8661,7 +8661,7 @@ pub fn lower_composite_memory_interleave_op<A: Arch>(
 
     // `:3803-3810` — `dcc::burst_utils::processBurstSplitOrInterleave`, which is NOT one of bridge
     // 2's 384: it is `dcc/src/Transform/Sentient/Analyses/BurstUtils.cpp:84`. It emits nothing and
-    // returns `success()` when `burst / granularity == 0` (`:96-99`), so a burst under the
+    // returns `success()` when `burst / granularity == 0` (`:96-100`), so a burst under the
     // granularity needs it for nothing — and above it, it rewrites `burst_size`, the increments and
     // possibly a `sentient.for`, none of which this campaign owns.
     if let Some(extent) = moved.first().and_then(transfer_extent)
@@ -9314,7 +9314,7 @@ pub fn construct_load_and_store_stmt<D: HasTransferMemory>(
     };
 
     // `:2262-2270` — the insertion-point shift onto the `agen.vector_store` is builder mechanics with
-    // nothing to represent: the pair goes on the delete list either way (`:2944-2947`).
+    // nothing to represent: the pair goes on the delete list either way (`:2945-2947`).
 
     // `:2333-2342` — the flag is set AFTER the op is built, and only when the destination is not
     // itself indirect: a scatter writes the IBR through `kIndDst` and is not an IBR write.
@@ -9347,7 +9347,7 @@ pub fn construct_load_and_store_stmt<D: HasTransferMemory>(
             burst_size: spec.burst_size,
         },
         stride: spec.stride_step.0,
-        // `nullptr` for `$rotate_val` (`:2328`, `SentientOps.td:735`).
+        // `nullptr` for `$rotate_val` (`:2328`, `SentientOps.td:734`).
         rotate_val: None,
         shuffle_mode,
         src_reg: sen::Reg {
@@ -9414,7 +9414,7 @@ pub enum TimeLoopsAndVectorOps {
     MissingOperandRecord,
     /// Entry 268 refused (`:1882`).
     UnableToGenerateLoadAndStore(LoadAndStoreStmt),
-    /// `llvm_unreachable("unexpected operation")` (`:1901`) — none of the six composite classes.
+    /// `llvm_unreachable("unexpected operation")` (`:1899`) — none of the six composite classes.
     UnexpectedOperation,
 }
 
@@ -9428,7 +9428,7 @@ pub enum TimeLoopsAndVectorOps {
 /// operand, yield]`, not creation order — and `mutable_addrs` is RESEATED in place onto the
 /// innermost region arguments (`:1831-1834`), which is what entry 268 reads.
 /// ⛔ AN INDIRECT OPERAND STEPS BY ZERO, not by its own offset (`:1842-1844`).
-/// ⛔ `extract_op` FEEDS THE TWO **INDIRECT** ARMS ONLY (`:1890`, `:1898`) — the pairing entry 269
+/// ⛔ `extract_op` FEEDS THE TWO **INDIRECT** ARMS ONLY (`:1889`, `:1897`) — the pairing entry 269
 /// stamped, which the gather and the scatter read and the other three arms never see.
 pub fn construct_time_loops_and_vector_operations(
     op: &DfirOp,
@@ -9561,20 +9561,20 @@ pub fn construct_time_loops_and_vector_operations(
     // which the two one-sided arms hand on to entry 336 as the loop to hoist their init outside of.
     let outermost = levels.first().map(|level| level.iv);
 
-    // `:1866-1901` — five arms over the six composite classes, then `llvm_unreachable`.
+    // `:1867-1900` — five arms over the six composite classes, then `llvm_unreachable`.
     let stmt = match op {
-        // `:1867-1872`.
+        // `:1868-1872`.
         DfirOp::Agen(agen::Op::CompositeLoad(_)) => todo!(
             "e358_constructLoadAndSendStmt is unported, so the agen.composite_load on {comp:?} \
              cannot become a sentient.load_and_send under {outermost:?}"
         ),
-        // `:1873-1881` — ⛔ THE ELEMENT TYPE IS READ OFF THE OP'S OWN MEMREF, not off the record.
+        // `:1873-1879` — ⛔ THE ELEMENT TYPE IS READ OFF THE OP'S OWN MEMREF, not off the record.
         DfirOp::Agen(agen::Op::CompositeStore(access)) => todo!(
             "e359_constructReceiveAndStoreStmt is unported, so the {:?} agen.composite_store on \
              {comp:?} cannot become a sentient.receive_and_store under {outermost:?}",
             access.view_ty.elem
         ),
-        // `:1882-1887` — the two-sided pair, and the only arm whose statement is ported.
+        // `:1880-1884` — the two-sided pair, and the only arm whose statement is ported.
         DfirOp::Agen(
             agen::Op::CompositeLoadAndStore(_) | agen::Op::CompositeIndirectLoadAndStore(_),
         ) => {
@@ -9600,12 +9600,12 @@ pub fn construct_time_loops_and_vector_operations(
                 refused => return TimeLoopsAndVectorOps::UnableToGenerateLoadAndStore(refused),
             }
         }
-        // `:1888-1893` — the gather, which additionally reads the extract it is paired with.
+        // `:1885-1889` — the gather, which additionally reads the extract it is paired with.
         DfirOp::Agen(agen::Op::CompositeIndirectLoad(_)) => todo!(
             "e358_constructLoadAndSendStmt is unported, so the agen.composite_indirect_load on \
              {comp:?} cannot become a sentient.load_and_send paired with {extract_op:?}"
         ),
-        // `:1894-1900` — ⛔ THE **DIRECT** MEMREF'S ELEMENT TYPE, `getDirectMemrefType()`.
+        // `:1890-1897` — ⛔ THE **DIRECT** MEMREF'S ELEMENT TYPE, `getDirectMemrefType()`.
         DfirOp::Agen(agen::Op::CompositeIndirectStore(access)) => todo!(
             "e359_constructReceiveAndStoreStmt is unported, so the {:?} \
              agen.composite_indirect_store on {comp:?} cannot become a sentient.receive_and_store \

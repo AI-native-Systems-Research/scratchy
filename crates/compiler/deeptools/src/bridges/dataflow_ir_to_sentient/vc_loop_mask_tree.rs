@@ -2335,7 +2335,7 @@ impl LoopMaskTree {
     ///
     /// ⭐ `OperationTreeBase()` AND `computeLoops(unit)` ARE ONE ACT HERE: [`compute_loops`] hands
     /// back a tree that already carries its synthetic root, so the base's null-`root_` state — the one
-    /// `computeLoops`' own `DT_CHECK_MSG(!root_ && op_to_node_.empty())` (`LoopMaskTree.cpp:173`)
+    /// `computeLoops`' own `DT_CHECK_MSG(!root_ && op_to_node_.empty())` (`LoopMaskTree.cpp:174`)
     /// guards against being filled twice — is unrepresentable, and this is the only way to get a tree.
     #[must_use]
     pub fn new(unit_body: &[sen::Op]) -> LoopMaskTree {

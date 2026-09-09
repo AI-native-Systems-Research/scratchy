@@ -445,7 +445,7 @@ impl OperandReuse {
     ///
     /// ⛔ `name_i` IS RE-READ INSIDE THE `j` LOOP: the reference holds a reference, so latching
     /// operand `i` changes what later `j`s compare against.
-    /// ⛔ THE `LRF` TEST IS ON `i` ONLY (`:37`), and the inner loop skips no kind — a `Constant` `j`
+    /// ⛔ THE `LRF` TEST IS ON `i` ONLY (`:37-38`), and the inner loop skips no kind — a `Constant` `j`
     /// is compared, and cannot match (see [`VectorOperand::name`]).
     /// ⛔ THE UNDECIDABLE-DOMINANCE ARM RETURNS EARLY, skipping the rest of loop one AND all of loop
     /// two, which is observable even though all 20 callers discard the answer — hence

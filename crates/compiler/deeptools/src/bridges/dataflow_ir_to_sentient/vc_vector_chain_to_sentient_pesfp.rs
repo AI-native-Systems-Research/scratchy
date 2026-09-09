@@ -1089,7 +1089,7 @@ pub fn run_on_operation<A: Arch>(program: &mut dfir::Program<A>, values: &mut Va
 /// DELETE WHAT A LOWERED COMPUTE CONSUMED — the destination operands, then the compute itself, then
 /// the source operands, in that order.
 ///
-/// ⛔ ONE `erased_list` SPANS ALL THREE PHASES (`:1059`), which is why the `_recording` overloads
+/// ⛔ ONE `erased_list` SPANS ALL THREE PHASES (`:1060`), which is why the `_recording` overloads
 /// exist: an op reached from both the `to` and the `from` side is claimed once, not twice.
 /// ⛔ AND NOTHING IS REMOVED UNTIL THE END, DESCENDING — an [`OpId`] is a POSITION, so erasing the
 /// `to` side first would renumber the `op` and `from` positions the next two phases name.

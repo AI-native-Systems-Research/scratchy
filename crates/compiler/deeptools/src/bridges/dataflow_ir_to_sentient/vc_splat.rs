@@ -169,7 +169,7 @@ fn is_first_elem_splat(indices: &[i32], repetition: u32, variables: usize, pads:
 /// ⛔ NO PAD SEGMENT IS FALSE, AND THAT IS THE `std::optional` COMPARISON: `indices_expanded[i] !=
 /// getFirstPadIndex()` is an `int` against an optional, which C++ answers `!=` for whenever the
 /// optional is empty, so lane 1 returns at once. ⛔ AND THE FIRST PAD INDEX IS
-/// `-(variable.len() + 1)`, `-1` only where there are no variables (`VectorChain.td:487-492`).
+/// `-(variable.len() + 1)`, `-1` only where there are no variables (`VectorChain.td:491-497`).
 fn is_pad_left_for_8_first_elem_splat(
     indices: &[i32],
     repetition: u32,
@@ -212,7 +212,7 @@ fn logical_port(port_name: sentient::Port, result: Val) -> sen::Op {
 ///
 /// The ops one `vectorchain.shuffle` — or one `arith.constant` splat feeding an immediate copy —
 /// lowers to: the default `index` mask constant, the value broadcast, the destination
-/// `sentient.logical_port`, and the `sentient.splat`.
+/// `sentient.logical_port`, and the `sentient.splat` (`Splat.cpp:70`, 115L).
 ///
 /// ⛔ TRAP: ONLY THE MIDDLE PAD ARM IS DISTINCT. `isFirstElemSplat` and the register-init
 /// fall-through both emit `SentientSplatPad::none` (`Splat.cpp:160-181`); only

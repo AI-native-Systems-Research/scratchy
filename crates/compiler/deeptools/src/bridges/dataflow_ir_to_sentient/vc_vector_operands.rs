@@ -2262,7 +2262,7 @@ impl VectorOperand {
     /// keeps the parent's position and precisions and loses only its value and kind.
     /// ⛔ THE TRIVIAL-SHUFFLE ARM TAKES `is_constant_splatted_vector = true` — the only caller that
     /// does — and then overwrites `Constant` with `ConstantBitstream` (`:333-335`).
-    /// ⛔ ONLY THE **FIRST** USER IS INSPECTED (`:338-339`); program order is the order here.
+    /// ⛔ ONLY THE **FIRST** USER IS INSPECTED (`:339-340`); program order is the order here.
     /// ⭐ `get_operand` IS THE SAME SCC CUT [`Self::from_neg_op`] takes, `traverse_upwards = true`.
     #[must_use]
     pub fn from_shuffle_op<A: Arch>(

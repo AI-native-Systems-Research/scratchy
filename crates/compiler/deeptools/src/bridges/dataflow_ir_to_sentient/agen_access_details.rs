@@ -429,7 +429,7 @@ pub fn set_coalesced_bound_values(
 /// and destination offsets start to differ, then merges every run of dimensions whose offsets are
 /// contiguous into its innermost dimension.
 ///
-/// ⛔ ONLY `time_bounds` IS WRITTEN BACK (`:786`, `:790`). The coalesced `time_offsets` drive the scan
+/// ⛔ ONLY `time_bounds` IS WRITTEN BACK (`:787`, `:792`). The coalesced `time_offsets` drive the scan
 /// and are then dropped, which is why the cut has to be recomputed by whoever wants the offsets.
 pub fn coalesce_time_dimensions(
     access_details: &mut AccessContainer<AccessDetailsAffineComposite<'_>>,
@@ -533,7 +533,7 @@ pub fn coalesce_time_dimensions(
     }
 
     // If the cut has happened, then those remaining time dimensions from the cut to the outermost
-    // have to be added back — at the FRONT, in their own order (`:784`).
+    // have to be added back — at the FRONT, in their own order (`:785-786`).
     time_bounds_remaining.extend(time_bounds);
     let time_bounds = time_bounds_remaining;
     if let Some(first) = access_details.get_first_mut() {
@@ -2275,7 +2275,7 @@ impl<'a> AccessDetailsAffine<'a> {
     /// what makes the "unresolved memory view" arms of [`TransferExtents`] and [`AffineInitialize`]
     /// unreachable from here.
     ///
-    /// ⛔ THE `constructIteratorCoefficients().failed()` TEST (`:435`) IS DEAD: entry 147 returns
+    /// ⛔ THE `constructIteratorCoefficients().failed()` TEST (`:434`) IS DEAD: entry 147 returns
     /// `success()` unconditionally. Its call stays; the branch has nothing to carry.
     pub fn construct_details(
         &mut self,
@@ -2289,7 +2289,7 @@ impl<'a> AccessDetailsAffine<'a> {
     }
 
     /// THE SIX STEPS `constructDetails` RUNS AFTER THE VIRTUAL `initialize()`
-    /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:422-437`).
+    /// (`dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:425-436`).
     ///
     /// ⭐ SPLIT OUT BECAUSE `initialize()` IS VIRTUAL AND THE REST IS NOT.
     /// [`AccessDetailsAffineComposite::initialize`] overrides it (`:442`), so a composite reaches
@@ -2328,15 +2328,15 @@ impl<'a> AccessDetailsAffine<'a> {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstructedDetails {
-    /// `success()` (`:437`) — every field of the record is set.
+    /// `success()` (`:436`) — every field of the record is set.
     Complete,
-    /// `initialize()` refused (`:422`).
+    /// `initialize()` refused (`:423`).
     NotInitialized(AffineInitialize),
-    /// `constructIndices()` refused (`:424`).
+    /// `constructIndices()` refused (`:425`).
     IndicesRefused(ConstructedIndices),
-    /// `constructExtentAndTotalElements()` refused (`:426-427`).
+    /// `constructExtentAndTotalElements()` refused (`:427-428`).
     ExtentsRefused(TransferExtents),
-    /// `constructChunkAndShuffleInfo()` refused (`:429`).
+    /// `constructChunkAndShuffleInfo()` refused (`:430`).
     ChunkRefused(ChunkAndShuffleInfo),
 }
 
