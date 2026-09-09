@@ -267,49 +267,504 @@
 //! | `e380_setChunkDataStageParams` | 380 | 8 | 129 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1439` |
 //! | `e382_run` | 382 | 9 | 122 | `L3DlOpsScheduler` | `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7912` |
 
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::schedule::ddc::transformation::{DsType, Scale};
+use crate::schedule::dsc2::LdsIdx;
+use crate::schedule::l3::dsc::{
+    CoreletShare, DesignSpaceConfig, DscGroup, FilledDims, LabeledDs, MulticastDegree, SuperDsc,
+    SymbolicDimInfo, UnneededPad,
+};
+use crate::units::Core;
+use std::collections::{BTreeMap, BTreeSet};
 
-// crustify:todo: e001_isSameDscGroup
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:60  (4 body lines, level 0)
-//   original  : [[maybe_unused]] static bool isSameDscGroup(SuperDsc &mySDsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:31-35
+/// THE WITNESS `isSameDscGroup` HANDS BACK — constructible only from a [`SuperDsc`], whose DSC list
+/// is non-empty by type, so the caller's `DT_CHECK` on the result has nothing left to test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SameDscGroup(());
 
-// crustify:todo: e002_isLabeledDsDimensionBroadcast
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:65  (6 body lines, level 0)
-//   original  : static inline bool isLabeledDsDimensionBroadcast(const DesignSpaceConfig &dsc, const LabeledDsInfo &lds, PrimaryDimTypes dim)
-//   extract   : crustify-ddc/cpp/l3.cpp:44-52
+/// Replaces: e001_isSameDscGroup
+///
+/// `DT_CHECK_MSG(mySDsc.dscs_.size() >= 1, "Expect at least one DSC.")` then `return true` is the
+/// whole body, so the answer is the witness that a super-DSC has a DSC in it.
+///
+/// ⛔ TRAP: NEITHER THE NAME NOR THE CALLER'S MESSAGE DESCRIBES THE BODY — `run` calls it under
+/// "Expect DSCs in the same group" (`:7938`), and no field of any DSC is read at all.
+#[must_use]
+pub const fn same_dsc_group(_sdsc: &SuperDsc) -> SameDscGroup {
+    SameDscGroup(())
+}
 
-// crustify:todo: e003_isDimensionCoreletSplit
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:74  (12 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::isDimensionCoreletSplit(const DesignSpaceConfig &dsc, PrimaryDimTypes dim)
-//   extract   : crustify-ddc/cpp/l3.cpp:62-75
+/// Replaces: e002_isLabeledDsDimensionBroadcast
+///
+/// Whether a labelled data structure BROADCASTS along `dim` — `scale_ < 1`, which is a fractional
+/// scale, the one-element stick (`-1`) or the whole-stick dim (`-2`).
+///
+/// ⛔ `None` IS THE `DT_CHECK("Invalid layoutDimOrder_ index.")` ARM AND IT IS REACHABLE: callers
+/// walk `getLayoutDims(ldsIdx)`, a DIFFERENT list from `primaryDsInfo_`'s layout order. The `dsc`
+/// parameter is gone — it served only to reach the order [`LabeledDs`] now carries zipped.
+#[must_use]
+pub fn is_labeled_ds_dimension_broadcast(lds: &LabeledDs, dim: PrimaryDim) -> Option<bool> {
+    lds.scale(dim).map(|scale| match scale {
+        Scale::Sized(size) => size < 1.0,
+        Scale::UnitStick | Scale::StickDim => true,
+    })
+}
 
-// crustify:todo: e004_voidPaddingIfChunking
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:128  (20 body lines, level 0)
-//   original  : static void voidPaddingIfChunking(DataStructDims &ds, const DataStructDims &refDs)
-//   extract   : crustify-ddc/cpp/l3.cpp:84-105
+/// Replaces: e003_isDimensionCoreletSplit
+///
+/// Whether `dim` is split across corelets: corelet 0 holds less of it than the whole core does.
+///
+/// ⭐ THE TWO ARMS ARE ONE COMPARISON — the core data stage's `primaryDimToVal_st(dim, .., -1, 0)`
+/// against `(.., -1, -1)` and `CoreletD_`'s value against `CoreD_`'s ask it of two carriers, so
+/// [`CoreletShare`] states it once and `dataStageParam_.count(dataStageCoreIdx)` stops being a
+/// branch. A dim neither carrier states answers the reference's `1 < 1`.
+#[must_use]
+pub fn is_dimension_corelet_split(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> bool {
+    dsc.corelets_used.splits()
+        && dsc
+            .corelet_shares
+            .get(&dim)
+            .copied()
+            .is_some_and(CoreletShare::splits)
+}
 
-// crustify:todo: e005_addOrUpdateSymbolicInfoInParams
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:158  (15 body lines, level 0)
-//   original  : static void addOrUpdateSymbolicInfoInParams(DataStructDims &chunkParams, const DataStructDims &coreParams)
-//   extract   : crustify-ddc/cpp/l3.cpp:114-130
+/// Replaces: e004_voidPaddingIfChunking
+///
+/// VOIDS a chunk stage's padding on every dim whose extent — or whose window dim's extent — chunking
+/// moved off the reference stage's, because a chunk owns the whole dim's padding or none of it.
+///
+/// ⭐ `CARRY_UNNEEDED_PAD` IS `carryUnneededPadToChunk`, a file-static `bool` initialised `true` and
+/// never written (`:126`), so its zeroing arm is DEAD: as a const generic that arm leaves the build
+/// instead of being tested per dim, and the reference's own TODO to flip it stays expressible.
+pub fn void_padding_if_chunking<const CARRY_UNNEEDED_PAD: bool>(
+    ds: &mut FilledDims,
+    ref_ds: &FilledDims,
+) {
+    let chunked: Vec<PrimaryDim> = ds
+        .dims()
+        .padding
+        .iter()
+        .filter(|(dim, pad)| {
+            let moved = |dim: PrimaryDim| ref_ds.dims().extent(dim) != ds.dims().extent(dim);
+            moved(**dim) || pad.window_dim.is_some_and(moved)
+        })
+        .map(|(dim, _)| *dim)
+        .collect();
+    for dim in chunked {
+        if let Some(pad) = ds.padding_mut().get_mut(&dim) {
+            pad.sizes = pad.sizes.voided();
+            if !CARRY_UNNEEDED_PAD {
+                pad.unneeded = UnneededPad::NONE;
+            }
+        }
+    }
+}
 
-// crustify:todo: e006_getLabeledDsWkSliceMulticastDegree
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:176  (39 body lines, level 0)
-//   original  : static unsigned getLabeledDsWkSliceMulticastDegree( const SuperDsc &mySDsc, const int ldsIdx, const std::vector<int> &dscIndices)
-//   extract   : crustify-ddc/cpp/l3.cpp:139-180
+/// Replaces: e005_addOrUpdateSymbolicInfoInParams
+///
+/// Carries the core stage's symbolic dims onto the chunk stage for every dim CHUNKING LEFT ALONE,
+/// then adopts the core's volume limits pruned against the dims that survived.
+///
+/// ⛔ BOTH "Expect non-empty data-stage parameters" `DT_CHECK`s ARE [`FilledDims`], and the
+/// `maxSymbolicVolume_` assignment is fused into `Symbolic::prune_volumes_from` — the state
+/// between assignment and prune is the one state a well-formed `Symbolic` cannot hold.
+pub fn add_or_update_symbolic_info_in_params(
+    chunk_params: &mut FilledDims,
+    core_params: &FilledDims,
+) {
+    let unchunked: Vec<(PrimaryDim, SymbolicDimInfo)> = core_params
+        .dims()
+        .symbolic
+        .info()
+        .iter()
+        .filter(|(dim, _)| chunk_params.dims().extent(**dim) == core_params.dims().extent(**dim))
+        .map(|(dim, info)| (*dim, *info))
+        .collect();
+    for (dim, info) in unchunked {
+        chunk_params.symbolic_mut().add_dim(dim, info);
+    }
+    chunk_params
+        .symbolic_mut()
+        .prune_volumes_from(&core_params.dims().symbolic);
+}
 
-// crustify:todo: e007_scheduleDimTypeToString
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:282  (16 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : std::string L3DlOpsScheduler::scheduleDimTypeToString(ScheduleDimTypes type)
-//   extract   : crustify-ddc/cpp/l3.cpp:190-206
+/// Replaces: e006_getLabeledDsWkSliceMulticastDegree
+///
+/// HOW MANY CORES SHARE ONE LABELLED DATA STRUCTURE'S DATA — the cores of `dscs` whose work slice
+/// agrees with the group's first core on every layout dim of `lds`.
+///
+/// ⛔ `None` IS `coreIdToWkSlice_.at(dim)` THROWING: a layout dim that no work slice states. The
+/// `!dscIndices.empty()` check, the `dscs_.at()` lookups and the `coreIdsUsed_[0]` subscript are
+/// [`DscGroup`] and `CoreIdsUsed`, discharged before this is called.
+#[must_use]
+pub fn labeled_ds_wk_slice_multicast_degree(
+    sdsc: &SuperDsc,
+    lds: LdsIdx,
+    dscs: &DscGroup<'_>,
+) -> Option<MulticastDegree> {
+    let main = dscs.main();
+    let processing: BTreeSet<Core> = dscs
+        .iter()
+        .flat_map(|dsc| dsc.core_ids_used.iter())
+        .collect();
+    let layout = main.layout_dims.get(&lds)?;
+    let reference = sdsc.core_id_to_wk_slice.get(&main.core_ids_used.first())?;
+    let mut degree = 0;
+    for (core, slice) in &sdsc.core_id_to_wk_slice {
+        if !processing.contains(core) {
+            continue;
+        }
+        let mut matches = true;
+        for dim in layout.iter() {
+            if slice.at(dim)? != reference.at(dim)? {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            degree += 1;
+        }
+    }
+    Some(MulticastDegree(degree))
+}
 
-// crustify:todo: e008_hasDimensionReuse
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:303  (19 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : bool L3DlOpsScheduler::hasDimensionReuse(const DesignSpaceConfig& dsc)
-//   extract   : crustify-ddc/cpp/l3.cpp:216-235
+/// WHAT ROLE A DIM PLAYS IN THE SCHEDULE — `ScheduleDimTypes` (`L3DlOpsScheduler.h:88`), less its
+/// `ScheduleDimTypesCount` terminator, which is a count and not a role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScheduleDimType {
+    /// `ELEMENTWISE`.
+    Elementwise,
+    /// `BROADCAST`.
+    Broadcast,
+    /// `REDUCTION`.
+    Reduction,
+    /// `WINDOW_PADDED`.
+    WindowPadded,
+    /// `REUSE`.
+    Reuse,
+}
+
+/// Replaces: e007_scheduleDimTypeToString
+///
+/// The name the scheduler prints for a dim's role.
+///
+/// ⭐ `DT_ERROR("Unsupported ScheduleDimTypes.")` IS UNSPELLABLE: the only value the switch declines
+/// to name is the enum's `Count` terminator, which [`ScheduleDimType`] does not carry, so the
+/// default arm has no input and the return type needs no absence in it.
+#[must_use]
+pub const fn schedule_dim_type_to_string(ty: ScheduleDimType) -> &'static str {
+    match ty {
+        ScheduleDimType::Elementwise => "Elementwise",
+        ScheduleDimType::Broadcast => "Broadcast",
+        ScheduleDimType::Reduction => "Reduction",
+        ScheduleDimType::WindowPadded => "Window/Padded",
+        ScheduleDimType::Reuse => "Reuse",
+    }
+}
+
+/// Replaces: e008_hasDimensionReuse
+///
+/// Whether some layout dim is missing from at least one of the DSC's primary data structures — asked
+/// only of a DSC that has a KERNEL and more than one data structure.
+///
+/// ⛔ TRAP, AND IT IS THE REFERENCE'S: the tally counts ENTRIES, not data structures, so one
+/// `layoutDimOrder_` that names a dim twice can reach the count on its own and HIDE the reuse
+/// (`:310-313`). The `int` against `size()` comparison beside it is signed/unsigned but harmless.
+#[must_use]
+pub fn has_dimension_reuse(dsc: &DesignSpaceConfig) -> bool {
+    let structures = dsc.primary_ds_info.len();
+    if structures <= 1 || !dsc.primary_ds_info.contains_key(&DsType::Kernel) {
+        return false;
+    }
+    let mut count_per_dim: BTreeMap<PrimaryDim, usize> = BTreeMap::new();
+    for layout in dsc.primary_ds_info.values() {
+        for dim in layout.iter() {
+            *count_per_dim.entry(dim).or_insert(0) += 1;
+        }
+    }
+    count_per_dim.values().any(|count| *count < structures)
+}
+
+#[cfg(test)]
+mod tests_e001_e008 {
+    use super::*;
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent;
+    use crate::schedule::dsc2::LayoutDims;
+    use crate::schedule::l3::dsc::{
+        CoreIdsUsed, CoreletsUsed, DimPadding, DscList, Granularity, MaxSize, PadElems, PadSizes,
+        StageDims, Symbolic, VolumeLimit, WkSlice, WkSliceId,
+    };
+    use std::num::NonZeroU32;
+
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("core in range")
+    }
+
+    fn step(value: u32) -> Granularity {
+        Granularity::new(NonZeroU32::new(value).expect("a positive step"))
+    }
+
+    fn plain_dsc() -> DesignSpaceConfig {
+        DesignSpaceConfig {
+            corelets_used: CoreletsUsed::ONE,
+            corelet_shares: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            core_ids_used: CoreIdsUsed::new(core(0), vec![]),
+            layout_dims: BTreeMap::new(),
+        }
+    }
+
+    fn filled(dims: StageDims) -> FilledDims {
+        FilledDims::of(dims).expect("a stage that states a dim")
+    }
+
+    /// e001 — the answer is a witness, and a super-DSC cannot be built without a DSC to witness.
+    #[test]
+    fn same_dsc_group_is_a_witness() {
+        let sdsc = SuperDsc::new(DscList::new(plain_dsc(), vec![]), BTreeMap::new());
+        assert_eq!(same_dsc_group(&sdsc), SameDscGroup(()));
+        assert_eq!(sdsc.dscs().iter().count(), 1);
+    }
+
+    /// e002 — a scale below 1 broadcasts, and a dim the layout order does not name has no answer.
+    #[test]
+    fn broadcast_is_a_scale_below_one() {
+        let lds = LabeledDs::new(
+            DsType::Input,
+            vec![
+                (PrimaryDim::In, Scale::Sized(2.0)),
+                (PrimaryDim::Out, Scale::Sized(0.5)),
+                (PrimaryDim::Ij, Scale::UnitStick),
+                (PrimaryDim::Mb, Scale::StickDim),
+            ],
+        );
+        assert_eq!(lds.ds_type(), DsType::Input);
+        assert_eq!(
+            is_labeled_ds_dimension_broadcast(&lds, PrimaryDim::In),
+            Some(false)
+        );
+        assert_eq!(
+            is_labeled_ds_dimension_broadcast(&lds, PrimaryDim::Out),
+            Some(true)
+        );
+        assert_eq!(
+            is_labeled_ds_dimension_broadcast(&lds, PrimaryDim::Ij),
+            Some(true)
+        );
+        assert_eq!(
+            is_labeled_ds_dimension_broadcast(&lds, PrimaryDim::Mb),
+            Some(true)
+        );
+        assert_eq!(is_labeled_ds_dimension_broadcast(&lds, PrimaryDim::Y), None);
+    }
+
+    /// e003 — one corelet never splits, and a split is corelet 0 holding less than the whole.
+    #[test]
+    fn corelet_split_is_a_short_share() {
+        let mut dsc = plain_dsc();
+        dsc.corelet_shares.insert(
+            PrimaryDim::In,
+            CoreletShare {
+                corelet0: Extent(8),
+                whole: Extent(16),
+            },
+        );
+        dsc.corelet_shares.insert(
+            PrimaryDim::Out,
+            CoreletShare {
+                corelet0: Extent(16),
+                whole: Extent(16),
+            },
+        );
+        assert!(!is_dimension_corelet_split(&dsc, PrimaryDim::In));
+        dsc.corelets_used = CoreletsUsed::new(NonZeroU32::new(2).expect("two corelets"));
+        assert!(is_dimension_corelet_split(&dsc, PrimaryDim::In));
+        assert!(!is_dimension_corelet_split(&dsc, PrimaryDim::Out));
+        assert!(!is_dimension_corelet_split(&dsc, PrimaryDim::Ij));
+    }
+
+    /// e004 — a moved extent voids the dim's padding, directly or through its window dim, and an
+    /// unpadded dim has nothing to void.
+    #[test]
+    fn chunking_voids_moved_padding() {
+        let padded = |window: Option<PrimaryDim>| DimPadding {
+            sizes: PadSizes::of(PadElems(2), PadElems(3)),
+            window_dim: window,
+            unneeded: UnneededPad {
+                total: PadElems(1),
+                front: PadElems(1),
+                back: PadElems(0),
+            },
+        };
+        let mut dims = StageDims::default();
+        dims.extents.insert(PrimaryDim::In, Extent(16));
+        dims.extents.insert(PrimaryDim::Out, Extent(8));
+        dims.extents.insert(PrimaryDim::Ij, Extent(4));
+        dims.padding.insert(PrimaryDim::In, padded(None));
+        dims.padding.insert(PrimaryDim::Out, padded(None));
+        dims.padding
+            .insert(PrimaryDim::Ij, padded(Some(PrimaryDim::Out)));
+        dims.padding.insert(
+            PrimaryDim::Mb,
+            DimPadding {
+                sizes: PadSizes::Unpadded,
+                window_dim: None,
+                unneeded: UnneededPad::NONE,
+            },
+        );
+        let mut reference = dims.clone();
+        reference.extents.insert(PrimaryDim::Out, Extent(32));
+        let ref_ds = filled(reference);
+
+        let mut ds = filled(dims.clone());
+        void_padding_if_chunking::<true>(&mut ds, &ref_ds);
+        let padding = &ds.dims().padding;
+        assert_eq!(padding[&PrimaryDim::In].sizes, padded(None).sizes);
+        assert_eq!(padding[&PrimaryDim::Out].sizes, PadSizes::Voided);
+        assert_eq!(padding[&PrimaryDim::Ij].sizes, PadSizes::Voided);
+        assert_eq!(padding[&PrimaryDim::Mb].sizes, PadSizes::Unpadded);
+        assert_eq!(padding[&PrimaryDim::Out].unneeded, padded(None).unneeded);
+
+        let mut ds = filled(dims);
+        void_padding_if_chunking::<false>(&mut ds, &ref_ds);
+        assert_eq!(
+            ds.dims().padding[&PrimaryDim::Out].unneeded,
+            UnneededPad::NONE
+        );
+        assert_eq!(
+            ds.dims().padding[&PrimaryDim::In].unneeded,
+            padded(None).unneeded
+        );
+    }
+
+    /// e005 — the reference's own worked example (`dsc/dims.cpp:715-727`): `abc` limited to 2048 with
+    /// `a` chunked away becomes `bc` limited to `min(64 * 64, 2048 / 4) = 512`.
+    #[test]
+    fn symbolic_volumes_prune_onto_the_dims_that_survive() {
+        let info = |max: u32, granularity: u32| SymbolicDimInfo {
+            max_size: MaxSize(max),
+            granularity: step(granularity),
+        };
+        let core_info = BTreeMap::from([
+            (PrimaryDim::In, info(128, 4)),
+            (PrimaryDim::Out, info(64, 2)),
+            (PrimaryDim::Ij, info(64, 2)),
+        ]);
+        let abc = BTreeSet::from([PrimaryDim::In, PrimaryDim::Out, PrimaryDim::Ij]);
+        let core_params = filled(StageDims {
+            extents: BTreeMap::from([
+                (PrimaryDim::In, Extent(128)),
+                (PrimaryDim::Out, Extent(64)),
+                (PrimaryDim::Ij, Extent(64)),
+            ]),
+            padding: BTreeMap::new(),
+            symbolic: Symbolic::new(core_info, BTreeMap::from([(abc, VolumeLimit(2048))])),
+        });
+        let mut chunk_params = filled(StageDims {
+            extents: BTreeMap::from([
+                (PrimaryDim::In, Extent(32)),
+                (PrimaryDim::Out, Extent(64)),
+                (PrimaryDim::Ij, Extent(64)),
+            ]),
+            padding: BTreeMap::new(),
+            symbolic: Symbolic::default(),
+        });
+
+        add_or_update_symbolic_info_in_params(&mut chunk_params, &core_params);
+
+        let symbolic = &chunk_params.dims().symbolic;
+        assert_eq!(
+            symbolic.info().keys().copied().collect::<Vec<_>>(),
+            vec![PrimaryDim::Out, PrimaryDim::Ij]
+        );
+        assert_eq!(
+            symbolic.volumes(),
+            &BTreeMap::from([(
+                BTreeSet::from([PrimaryDim::Out, PrimaryDim::Ij]),
+                VolumeLimit(512)
+            )])
+        );
+    }
+
+    /// e006 — the degree counts the group's cores whose slice matches the first core's, and a core
+    /// outside the group does not count however well it matches.
+    #[test]
+    fn multicast_degree_counts_matching_group_cores() {
+        let lds = LdsIdx(0);
+        let mut dsc = plain_dsc();
+        dsc.core_ids_used = CoreIdsUsed::new(core(0), vec![core(1), core(2)]);
+        dsc.layout_dims
+            .insert(lds, LayoutDims::new(PrimaryDim::In, vec![]));
+        let slice = |value: i32| WkSlice(BTreeMap::from([(PrimaryDim::In, WkSliceId(value))]));
+        let sdsc = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::from([
+                (core(0), slice(0)),
+                (core(1), slice(0)),
+                (core(2), slice(1)),
+                (core(3), slice(0)),
+            ]),
+        );
+        let group = DscGroup::new(&dsc, vec![]);
+        assert_eq!(
+            labeled_ds_wk_slice_multicast_degree(&sdsc, lds, &group),
+            Some(MulticastDegree(2))
+        );
+        assert_eq!(
+            labeled_ds_wk_slice_multicast_degree(&sdsc, LdsIdx(1), &group),
+            None
+        );
+    }
+
+    /// e007 — the five spellings the scheduler prints, and there is no sixth to ask for.
+    #[test]
+    fn schedule_dim_types_spell_themselves() {
+        assert_eq!(
+            [
+                ScheduleDimType::Elementwise,
+                ScheduleDimType::Broadcast,
+                ScheduleDimType::Reduction,
+                ScheduleDimType::WindowPadded,
+                ScheduleDimType::Reuse,
+            ]
+            .map(schedule_dim_type_to_string),
+            [
+                "Elementwise",
+                "Broadcast",
+                "Reduction",
+                "Window/Padded",
+                "Reuse"
+            ]
+        );
+    }
+
+    /// e008 — a dim missing from one data structure is reuse; a dim in all of them is not, and a DSC
+    /// without a KERNEL is never asked.
+    #[test]
+    fn reuse_is_a_dim_one_data_structure_lacks() {
+        let mut dsc = plain_dsc();
+        dsc.primary_ds_info.insert(
+            DsType::Input,
+            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]),
+        );
+        dsc.primary_ds_info
+            .insert(DsType::Kernel, LayoutDims::new(PrimaryDim::Out, vec![]));
+        assert!(has_dimension_reuse(&dsc));
+
+        dsc.primary_ds_info.insert(
+            DsType::Kernel,
+            LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]),
+        );
+        assert!(!has_dimension_reuse(&dsc));
+
+        dsc.primary_ds_info.remove(&DsType::Kernel);
+        dsc.primary_ds_info.insert(
+            DsType::Output,
+            LayoutDims::new(PrimaryDim::Out, vec![PrimaryDim::Y]),
+        );
+        assert!(!has_dimension_reuse(&dsc));
+    }
+}
 
 // crustify:todo: e009_getStickSize
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:327  (12 body lines, level 0)

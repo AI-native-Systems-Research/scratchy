@@ -122,5 +122,6 @@
 //!
 //! 144 units across 1 file(s).
 
+pub mod dsc;
 pub(crate) mod dl_ops;
 
