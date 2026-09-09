@@ -238,6 +238,7 @@ mod unit_tests {
     #[should_panic(expected = "needs 2 additional IBuff")]
     fn e021_costs_the_vendors_264_over_64_example_at_two_ibuff() {
         let mut unit = ProgramUnit::<Dd2> {
+            iter_arg: None,
             on: Units::one(DfirUnit::L3lu, Val(0)),
             precision: None,
             body: Vec::new(),
@@ -286,6 +287,7 @@ mod unit_tests {
             dbg_name: None,
         });
         let mut unit = ProgramUnit::<Dd2> {
+            iter_arg: None,
             on: Units::one(DfirUnit::L3lu, Val(0)),
             precision: None,
             body: vec![

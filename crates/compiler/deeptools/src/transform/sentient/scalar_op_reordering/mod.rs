@@ -501,6 +501,7 @@ mod unit_tests {
             preamble: Vec::new(),
             units: ProgramUnits::of(
                 ProgramUnit {
+                    iter_arg: None,
                     on: Units::one(DfirUnit::Sfp, Val(0)),
                     precision: None,
                     body,

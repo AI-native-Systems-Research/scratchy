@@ -514,6 +514,7 @@ mod unit_tests {
             preamble: Vec::new(),
             units: ProgramUnits::of(
                 ProgramUnit {
+                    iter_arg: None,
                     on: Units::one(DfirUnit::L3lu, Val(0)),
                     precision: None,
                     body: vec![scalar_const(1, 384)],

@@ -139,6 +139,24 @@ impl Residency {
             }
         }
     }
+
+    /// WHICH CORELET, or `None` for the -1 `dcc::getCoreletId` answers
+    /// (`dcc/src/Utils/DccExtContext.cpp:116-124`).
+    ///
+    /// ⛔⛔ A CORE-WIDE UNIT'S CORELET IS **0**, NOT ABSENT, and that is the whole reason
+    /// [`Self::CoreWide`] and [`Self::Scratchpad`] are separate variants: the materializer writes
+    /// `core` AND `corelet = 0` for a unit declared in a `group { kind = "core" }` — the L3 halves
+    /// (`UnitMaterializer.cpp:62-80`) — and `core` alone for a per-core scratchpad (`:142-152`).
+    #[must_use]
+    pub const fn corelet(self) -> Option<Corelet> {
+        match self {
+            // No `corelet` attribute at all.
+            Self::Global | Self::Scratchpad { .. } => None,
+            // `corelet = 0`, written explicitly.
+            Self::CoreWide { .. } => Corelet::checked(0),
+            Self::Corelet { corelet, .. } => Some(corelet),
+        }
+    }
 }
 
 /// HOW MANY FOLDS a `dataflow.get_unit` produces results for.

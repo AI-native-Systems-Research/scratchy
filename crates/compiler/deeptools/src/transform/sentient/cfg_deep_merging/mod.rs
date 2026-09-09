@@ -127,6 +127,7 @@ mod unit_tests {
     fn e022_walks_every_program_unit_and_stops_at_the_tree() {
         let mut units = ProgramUnits::of(
             ProgramUnit::<Dd2> {
+                iter_arg: None,
                 on: Units::one(DfirUnit::Pe, Val(0)),
                 precision: None,
                 body: Vec::new(),

@@ -450,6 +450,7 @@ mod unit_tests {
     /// A unit running `body` on one PE — the pass reads nothing else off the unit.
     fn unit(body: Vec<Op>) -> ProgramUnit<Dd2> {
         ProgramUnit {
+            iter_arg: None,
             on: Units::one(DfirUnit::Pe, Val(100)),
             precision: None,
             body,
@@ -681,12 +682,14 @@ mod unit_tests {
             preamble: Vec::new(),
             units: ProgramUnits::of(
                 ProgramUnit {
+                    iter_arg: None,
                     on: Units::one(DfirUnit::Lxlu, Val(0)),
                     precision: None,
                     body: lxlu_body.clone(),
                     arch: core::marker::PhantomData,
                 },
                 vec![ProgramUnit {
+                    iter_arg: None,
                     on: Units::one(DfirUnit::PtRow(Row::checked(0).expect("row 0")), Val(1)),
                     precision: Some(dataflow::Precision::Int8),
                     body: vec![add, reader(Val(20), Val(22))],

@@ -826,13 +826,36 @@ pub fn erase_defining_op(scope: &mut Vec<Op>, val: Val) {
 #[derive(Debug, Clone, Copy)]
 pub struct Definitions<'a> {
     regions: &'a [&'a [Op]],
+    program_unit: Option<(Val, &'a [Val])>,
 }
 
 impl<'a> Definitions<'a> {
     /// THE ENCLOSING REGIONS, INNERMOST FIRST.
     #[must_use]
     pub const fn from_innermost(regions: &'a [&'a [Op]]) -> Definitions<'a> {
-        Definitions { regions }
+        Definitions {
+            regions,
+            program_unit: None,
+        }
+    }
+
+    /// THE SAME REGIONS PLUS THE ENCLOSING `dataflow.program_unit`'S OWN ARGUMENT AND UNIT LIST —
+    /// `iter_arg : %arg -> (%units)` (`DataflowOps.cpp:145-155`).
+    ///
+    /// ⛔⛔ THE THIRD PARENT FORM OF `getListOfKeyOpsFromUniformMapping`, AND UNSTATABLE UNTIL NOW.
+    /// A key may be bound by a `uniform.uniformize_regions` region, by a `uniform.equalize_pattern`
+    /// region, or by the program unit itself, in which case the keys are `prog_unit_op.getUnits()`
+    /// (`Dialect/Uniform/Utils.cpp:180-186`). [`crate::islands::sentient::ProgramUnit`] now carries
+    /// that argument, so the arm is reachable — see [`uniform_mapping_keys`].
+    ///
+    /// ⭐ A BUILDER RATHER THAN A SECOND CONSTRUCTOR, so every existing caller keeps
+    /// [`Self::from_innermost`] unchanged and only a walk that IS inside a program unit says so.
+    #[must_use]
+    pub const fn with_program_unit(self, arg: Val, units: &'a [Val]) -> Definitions<'a> {
+        Definitions {
+            regions: self.regions,
+            program_unit: Some((arg, units)),
+        }
     }
 
     /// `Value::getDefiningOp()` — the first enclosing region that binds it.
@@ -1252,6 +1275,76 @@ impl<'a> Definitions<'a> {
     }
 }
 
+/// THE OP WHOSE REGION BINDS A VALUE AS AN ARGUMENT — `cast<BlockArgument>(val).getOwner()
+/// ->getParentOp()`.
+///
+/// ⛔⛔ WIDER THAN [`parent_for_arg`] AND THAT IS THE POINT. `addToWorkListAndUpdateAssignment` blames
+/// an assignment on whatever op binds the value, `sentient.for` or not
+/// (`Transform/Sentient/EnhancedDeadVariableElimination.cpp:87-91`), so a caller that can only name
+/// loops would attribute a `uniform.uniformize_regions` region argument to nothing.
+///
+/// ⛔ `None` FOR AN OP RESULT — the failed `dyn_cast<BlockArgument>`; see [`defining_op`]. And `None`
+/// for a `dataflow.program_unit`'s own argument, which is no op of this island at all
+/// ([`Definitions::program_unit_units_of`] answers for that one).
+#[must_use]
+pub fn parent_op_of_block_arg(val: Val, scope: &[Op]) -> Option<&Op> {
+    for op in scope {
+        match op {
+            Op::Sentient(inner) => {
+                if sentient::block_args(inner).contains(&val) {
+                    return Some(op);
+                }
+                for region in sentient::regions(inner) {
+                    if let Some(found) = parent_op_of_block_arg(val, region) {
+                        return Some(found);
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if loop_op.iv == val || loop_op.carried.iter().any(|carried| carried.arg == val) {
+                    return Some(op);
+                }
+                if let Some(found) = parent_op_of_block_arg(val, &loop_op.body) {
+                    return Some(found);
+                }
+            }
+            Op::UniformRegions(regions) => {
+                if regions.regions().iter().any(|region| region.arg == val) {
+                    return Some(op);
+                }
+                for region in regions.regions() {
+                    if let Some(found) = parent_op_of_block_arg(val, &region.body) {
+                        return Some(found);
+                    }
+                }
+            }
+            // ⛔ NO `_` ARM, and the same limitation [`parent_uniform_region_units`] records: a shared
+            // dialect's regions hold ops of the rung BELOW, so an argument bound in one is a value of
+            // the other island's type and cannot be answered for from here.
+            Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_) => {}
+        }
+    }
+    None
+}
+
+impl<'a> Definitions<'a> {
+    /// THE OP THAT BINDS A VALUE AS A REGION ARGUMENT — see [`parent_op_of_block_arg`].
+    #[must_use]
+    pub fn block_arg_owner_of(&self, val: Val) -> Option<&'a Op> {
+        self.regions
+            .iter()
+            .find_map(|region| parent_op_of_block_arg(val, region))
+    }
+}
+
 /// THE REGIONS OF ONE OP OF THIS RUNG, BORROWED — the reading half of the pair
 /// [`regions_mut`] mutates through.
 ///
@@ -1574,6 +1667,33 @@ impl<'a> Definitions<'a> {
             .iter()
             .find_map(|region| parent_uniform_region_units(val, region))
     }
+
+    /// THE UNITS OF THE `dataflow.program_unit` THAT BINDS A VALUE AS ITS REGION ARGUMENT — `None`
+    /// for any other value, and for a walk that did not say which unit it is inside
+    /// ([`Self::with_program_unit`]).
+    #[must_use]
+    pub fn program_unit_units_of(&self, val: Val) -> Option<&'a [Val]> {
+        self.program_unit
+            .and_then(|(arg, units)| (arg == val).then_some(units))
+    }
+}
+
+/// EVERY `dataflow.create_group` IN A UNIT LIST REPLACED BY ITS MEMBERS —
+/// `dcc::uniform::utils::expandAllGroupsToUnits` (`dcc/src/Dialect/Uniform/Utils.cpp:1149-1161`).
+///
+/// ⛔ NOT [`collect_unit_ops`], WHICH IS A DIFFERENT FUNCTION OF THE SAME FILE. `collectUnitOps`
+/// STOPS at a value that is neither a `get_unit` nor a group and returns the partial list
+/// (`Utils.cpp:110-113`); this one passes such a value through unchanged, so its result is always as
+/// long as its input or longer.
+#[must_use]
+pub fn expand_all_groups_to_units(units: &[Val], defs: Definitions<'_>) -> Vec<Val> {
+    units
+        .iter()
+        .flat_map(|unit| match defs.of(*unit) {
+            Some(Op::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) => unit_ids.clone(),
+            _ => vec![*unit],
+        })
+        .collect()
 }
 
 /// THE UNITS ONE `uniform.query_map`'S KEY STANDS FOR — `dcc::uniform::utils::
@@ -1592,10 +1712,14 @@ pub fn uniform_mapping_keys(key: Val, defs: Definitions<'_>) -> Vec<Val> {
         // — ⭐ THE KEY ITSELF, not the unit list of anything (`:187-190`).
         Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => vec![key],
         Some(_) => Vec::new(),
-        // No defining op: a block argument, so the parent op's unit list for that region.
-        None => defs
-            .uniform_region_units_of(key)
-            .map_or_else(Vec::new, |units| collect_unit_ops(units, defs)),
+        // No defining op: a block argument, so the parent op's unit list for that region — a local
+        // region's (`:172-179`), or the enclosing `dataflow.program_unit`'s own (`:180-186`).
+        None => match defs.uniform_region_units_of(key) {
+            Some(units) => collect_unit_ops(units, defs),
+            None => defs
+                .program_unit_units_of(key)
+                .map_or_else(Vec::new, |units| collect_unit_ops(units, defs)),
+        },
     }
 }
 
@@ -1610,13 +1734,12 @@ pub fn uniform_mapping_keys(key: Val, defs: Definitions<'_>) -> Vec<Val> {
 /// the key list when a unit has no entry — which is why its sibling `getValuesFromKeys`, which keeps
 /// the holes as `std::nullopt`, exists separately.
 ///
-/// ⚠️ ONE ARM OF THE KEY WALK IS AN ISLAND GAP: a key bound as the region argument of a
-/// `dataflow.program_unit`, whose keys are `prog_unit_op.getUnits()` (`Utils.cpp:180-186`). This
-/// island's [`dataflow::Op::ProgramUnit`] and [`crate::islands::sentient::ProgramUnit`] carry no
-/// region argument at all — `iter_arg : %arg0 -> (%l1lu0, %l1lu1)` (`Dataflow.td:103`) is the form
-/// that binds one — so no [`Val`] can BE that argument here and the arm is unreachable rather than
-/// wrong. It answers with the empty list, which is the reference's own `key_vals` when none of the
-/// three parent forms matches (`:154-190`).
+/// ⭐ THE THIRD ARM OF THE KEY WALK — a key bound as the region argument of a
+/// `dataflow.program_unit`, whose keys are `prog_unit_op.getUnits()` (`Utils.cpp:180-186`) — WAS AN
+/// ISLAND GAP AND IS NOW DISCHARGED: [`crate::islands::sentient::ProgramUnit::iter_arg`] carries that
+/// argument and [`Definitions::with_program_unit`] hands it to this walk. A walk built with plain
+/// [`Definitions::from_innermost`] still answers the empty list for it, which is the reference's own
+/// `key_vals` when none of the three parent forms matches (`:154-190`).
 #[must_use]
 pub fn uniform_mapping_values(map: Val, key: Val, defs: Definitions<'_>) -> Vec<Val> {
     let keys = uniform_mapping_keys(key, defs);

@@ -214,6 +214,7 @@ mod unit_tests {
     /// A program unit bound to one unit of `kind`.
     fn unit_on(kind: DfirUnit) -> ProgramUnit<Dd2> {
         ProgramUnit::<Dd2> {
+            iter_arg: None,
             on: Units::one(kind, Val(0)),
             precision: None,
             body: Vec::new(),

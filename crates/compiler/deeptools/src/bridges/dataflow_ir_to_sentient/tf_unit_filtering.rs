@@ -206,13 +206,7 @@ fn unit_bound_by(unit: Val, scope: &[DfirOp]) -> Option<(FoldId, Residency)> {
 /// erases the L3 units, and a port that answered "absent" for them would keep units the reference
 /// drops.
 const fn corelet_id(residency: Residency) -> Option<Corelet> {
-    match residency {
-        // No `corelet` attribute at all: `getCoreletId` returns -1.
-        Residency::Global | Residency::Scratchpad { .. } => None,
-        // `corelet = 0`, written explicitly.
-        Residency::CoreWide { .. } => Corelet::checked(0),
-        Residency::Corelet { corelet, .. } => Some(corelet),
-    }
+    residency.corelet()
 }
 
 /// THE THREE-CLAUSE FILTER TEST — `UnitFiltering.cpp:250-255` (entry 140) and `:186-191`

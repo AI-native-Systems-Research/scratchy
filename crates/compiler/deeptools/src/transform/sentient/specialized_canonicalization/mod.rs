@@ -455,6 +455,7 @@ mod unit_tests {
             preamble,
             units: ProgramUnits::of(
                 ProgramUnit {
+                    iter_arg: None,
                     on: Units::one(DfirUnit::Lxlu, Val(0)),
                     precision: None,
                     body,

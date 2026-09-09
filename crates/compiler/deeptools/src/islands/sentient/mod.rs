@@ -24,7 +24,7 @@ use crate::islands::dataflow_ir::{KernelName, ProgramName, Units};
 use crate::model::Model;
 use crate::units::DfirUnit;
 use crate::workload::Workload;
-use dialects::Op;
+use dialects::{Op, Val};
 
 /// ONE `dataflow.program_unit` AT THIS RUNG — the units it runs on, and what they run.
 ///
@@ -49,6 +49,29 @@ pub struct ProgramUnit<A: Arch> {
     /// The units this runs on — ⭐ [`Units`] IS THE RUNG BELOW'S, reused: it already refuses a list
     /// mixing kinds and cannot be empty, and those facts do not change on the way down.
     pub on: Units,
+    /// `iter_arg : %arg ->` — THE VALUE THE UNIT'S REGION BINDS, standing for *whichever* of
+    /// [`Self::on`] is running this body.
+    ///
+    /// # ⛔⛔ WITHOUT IT `simplifyProgramUnitOp` CANNOT ASK ITS ONE QUESTION
+    ///
+    /// `DeuniformPass::simplifyProgramUnitOp` opens with `prog_unit_op.getBody()->getArgument(0)`
+    /// (`Transform/Sentient/Deuniform.cpp:157`) and then uses it twice: as the value a local region's
+    /// own argument is replaced by when the region is flattened into the unit
+    /// (`extractOpFromLocalRegion`, `Dialect/Uniform/Utils.cpp:1118-1121`), and as the key a
+    /// `uniform.query_map` must be reading for its answer to be foldable (`:219`). With no such field
+    /// the second test is false for every query map in the module and the fold — a whole third of the
+    /// function — is a silent no-op.
+    ///
+    /// ⭐ AND IT CLOSES THE GAP [`crate::islands::sentient::dialects::uniform_mapping_keys`] RECORDED:
+    /// `getListOfKeyOpsFromUniformMapping`'s third parent form is a key bound as a
+    /// `dataflow.program_unit`'s region argument (`Dialect/Uniform/Utils.cpp:180-186`), which no
+    /// [`crate::islands::sentient::dialects::Val`] could BE before this field existed.
+    ///
+    /// ⭐ [`Option`] BECAUSE THE PRINTER MAKES IT ONE: `ProgramUnitOp::print` emits
+    /// `iter_arg : %arg -> (%units)` only when the region has arguments and the bare unit list
+    /// otherwise (`DataflowOps.cpp:145-155`), so absent and present are two forms the reference itself
+    /// writes.
+    pub iter_arg: Option<Val>,
     /// `precision =`, present only where the unit computes.
     pub precision: Option<dataflow::Precision>,
     /// What it runs.

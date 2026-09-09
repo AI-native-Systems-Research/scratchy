@@ -3820,6 +3820,7 @@ mod unit_tests {
     /// A unit whose body is `body`.
     fn sentient_unit(body: Vec<SenOp>) -> SentientProgramUnit<Target> {
         SentientProgramUnit {
+            iter_arg: None,
             on: crate::islands::dataflow_ir::Units::one(crate::units::DfirUnit::Sfp, Val(0)),
             precision: None,
             body,

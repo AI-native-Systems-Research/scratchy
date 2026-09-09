@@ -362,6 +362,11 @@ fn body<A: Arch>(
     }
     ProgramUnit {
         on: unit.on.clone(),
+        // ⛔ NONE, BECAUSE THE RUNG BELOW BINDS NO SUCH VALUE: `dfir::ProgramUnit` has no region
+        // argument for this to carry over, so the lowering cannot invent one. See
+        // [`ProgramUnit::iter_arg`] — the reference's own SentientIR does print it, and supplying it
+        // is a change to the DataflowIR island rather than to this lowering.
+        iter_arg: None,
         precision: unit.precision,
         body: out,
         arch: core::marker::PhantomData,

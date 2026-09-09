@@ -88,9 +88,12 @@
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::Program;
-use crate::islands::sentient::dialects::{self, Op, Val, arith, sentient};
+use crate::islands::sentient::dialects::{
+    self, Definitions, Op, Val, arith, dataflow, sentient, uniform,
+};
+use crate::islands::sentient::{Program, Run};
 use crate::model::Model;
+use crate::units::{Core, Corelet};
 use crate::workload::Workload;
 
 /// THE FUNCTION'S ENTRY BLOCK — `func.getBody().front()`, the one block a constant is hoisted INTO.
@@ -487,15 +490,94 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
     }
 }
 
-// crustify:todo: e302_matchAndRewrite
-//   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:50  (40 body lines, level 1)
-//   original  : LogicalResult matchAndRewrite(uniform::DefImmutableMappingOp op, PatternRewriter& rewriter) const override
-//   calls     : e252_size
+/// THE SORT KEY OF ONE `uniform.def_immutable_mapping` KEY — `less_than`'s four nested comparisons
+/// (`LexicalOrdering.cpp:53-77`) as one orderable record.
+///
+/// ⛔⛔ THE FIRST TERM IS THE **SPELLING**, NOT THE ENUM. `unit_op.getType()` is the `type` StringAttr
+/// and `<` on it is `StringRef`'s byte order (`:76`), so `"l3lu" < "pe"` — while [`crate::units::DfirUnit`]'s own
+/// derived order is its DECLARATION order, in which `Pe` precedes both L3 halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct UnitKey {
+    /// `unit_op.getType()`.
+    ty: &'static str,
+    /// `dcc::getCoreId` — ⭐ `None` IS THE REFERENCE'S -1, and it sorts below every real core.
+    core: Option<Core>,
+    /// `dcc::getCoreletId` — `None` is -1 (`Utils/DccExtContext.cpp:116-124`); see
+    /// [`crate::units::Residency::corelet`].
+    corelet: Option<Corelet>,
+    /// `cast<OpResult>(a).getResultNumber()` — ⭐ ALWAYS 0, because this island's
+    /// `dataflow.get_unit` binds exactly one result, so the innermost tie-break has one representable
+    /// answer and two keys can only tie by being the SAME value.
+    result_number: usize,
+}
 
-// crustify:todo: e303_runOn
-//   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:203  (8 body lines, level 1)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e051_runOn
+/// ONE KEY'S `dataflow.get_unit`, READ AS A [`UnitKey`].
+fn unit_key(key: Val, defs: Definitions<'_>) -> UnitKey {
+    let Some(Op::Dataflow(dataflow::Op::GetUnit {
+        residency, unit, ..
+    })) = defs.of(key)
+    else {
+        todo!(
+            "OrderDefImmutableMapKeys::matchAndRewrite: DT_CHECK_MSG(unit_op_a && unit_op_b, \
+             \"DefImmutableMappingOp keys are expected to be dataflow::GetUnitOp\") \
+             (LexicalOrdering.cpp:56-58) — {key:?} is defined by no dataflow.get_unit in scope"
+        );
+    };
+    UnitKey {
+        ty: unit.spelling(),
+        core: residency.core(),
+        corelet: residency.corelet(),
+        result_number: 0,
+    }
+}
+
+/// WHETHER A PATTERN CHANGED THE OP — `LogicalResult`, whose `failure()` here means "already ordered"
+/// rather than "went wrong" (`LexicalOrdering.cpp:79`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rewrote {
+    /// `success()`.
+    Yes,
+    /// `failure()` — the greedy driver stops re-running the pattern on this op.
+    No,
+}
+
+/// Replaces: e302_matchAndRewrite
+///
+/// Sorts a `uniform.def_immutable_mapping`'s entries by their key unit's type, core, corelet and
+/// result number, and reports whether they were out of order to begin with.
+///
+/// ⭐ THE PAIRS MOVE TOGETHER, which is what makes this equal to the reference's
+/// `replaceOpWithNewOp(ordered_keys, ordered_vals)`: it permutes both operand ranges by ONE index
+/// list (`:81-92`), and this island already holds them as one paired list.
+pub(crate) fn order_def_immutable_map_keys(op: &mut Op, defs: Definitions<'_>) -> Rewrote {
+    let Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) = op else {
+        return Rewrote::No;
+    };
+    let mut keyed: Vec<(UnitKey, (Val, Val))> = pairs
+        .iter()
+        .map(|pair| (unit_key(pair.0, defs), *pair))
+        .collect();
+    if keyed.windows(2).all(|two| two[0].0 <= two[1].0) {
+        return Rewrote::No;
+    }
+    keyed.sort_by_key(|(key, _)| *key);
+    *pairs = keyed.into_iter().map(|(_, pair)| pair).collect();
+    Rewrote::Yes
+}
+
+/// Replaces: e303_runOn
+///
+/// Runs the constant hoist over every program of a run.
+///
+/// ⭐ ONE `func.func` PER PROGRAM IS WHY THE COLLECT-THEN-RUN DISAPPEARS: the pre-order walk's
+/// `WalkResult::skip()` says a function holds no nested function (`:206`), and this island's
+/// [`Program`] IS that one function — so the walk's result is exactly `run.programs`, and it is
+/// collected first only because the reference rewrites the module while walking it.
+pub(crate) fn run_on_module<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, W>) {
+    for program in &mut run.programs {
+        run_on_program(program);
+    }
+}
 
 // crustify:todo: e439_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:99  (12 body lines, level 2)
@@ -504,16 +586,16 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
 
 #[cfg(test)]
 mod unit_tests {
-    use super::run_on_program;
+    use super::{Rewrote, order_def_immutable_map_keys, run_on_module, run_on_program};
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
     use crate::islands::dataflow_ir::dialects::arith::IntBinary;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
-    use crate::islands::sentient::dialects::{Op, Val, arith, sentient};
-    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::islands::dataflow_ir::{GroupId, KernelName, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::dialects::{Definitions, Op, Val, arith, dataflow, sentient, uniform};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits, Run};
     use crate::model::Model;
-    use crate::units::DfirUnit;
+    use crate::units::{Core, Corelet, DfirUnit, Residency};
     use crate::workload::Workload;
 
     /// A model, so the program is typed; nothing here reads it.
@@ -566,6 +648,21 @@ mod unit_tests {
         }))
     }
 
+    /// Core 0 — the only core these fixtures name.
+    fn core0() -> Core {
+        Core::checked(0).expect("Dd2 has a core 0")
+    }
+
+    /// `%r = dataflow.get_unit` — one `uniform.def_immutable_mapping` key.
+    fn get_unit(result: u32, residency: Residency, unit: DfirUnit) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency,
+            unit,
+            num_folds: None,
+        })
+    }
+
     /// A one-unit program with `preamble` before it and `body` inside it.
     fn program_of(preamble: Vec<Op>, body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
         Program {
@@ -577,6 +674,7 @@ mod unit_tests {
             preamble,
             units: ProgramUnits::of(
                 ProgramUnit {
+                    iter_arg: None,
                     on: Units::one(DfirUnit::Sfp, Val(0)),
                     precision: None,
                     body,
@@ -626,5 +724,81 @@ mod unit_tests {
         run_on_program(&mut program);
 
         assert_eq!(program, before);
+    }
+    /// e302 — four keys sorted by unit spelling then corelet, and the second call reports the list was
+    /// already ordered.
+    ///
+    /// ⛔⛔ `hbm` BEFORE `l3lu` BEFORE `sfp` IS THE POINT: [`DfirUnit`]'s own declaration order puts
+    /// `Sfp` FIRST, so an enum comparison would have answered the reverse for the first term.
+    #[test]
+    fn e302_keys_sort_by_unit_spelling_then_corelet() {
+        let core = core0();
+        let corelet0 = Corelet::checked(0).expect("Dd2 has a corelet 0");
+        let corelet1 = Corelet::checked(1).expect("Dd2 has a corelet 1");
+        let scope = vec![
+            get_unit(1, Residency::Corelet { core, corelet: corelet1 }, DfirUnit::Sfp),
+            get_unit(2, Residency::Global, DfirUnit::Hbm),
+            get_unit(3, Residency::Corelet { core, corelet: corelet0 }, DfirUnit::Sfp),
+            get_unit(4, Residency::CoreWide { core }, DfirUnit::L3lu),
+        ];
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let mut mapping = Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: Val(20),
+            pairs: vec![
+                (Val(1), Val(10)),
+                (Val(2), Val(11)),
+                (Val(3), Val(12)),
+                (Val(4), Val(13)),
+            ],
+        });
+
+        assert_eq!(order_def_immutable_map_keys(&mut mapping, defs), Rewrote::Yes);
+
+        let sorted = vec![
+            (Val(2), Val(11)),
+            (Val(4), Val(13)),
+            (Val(3), Val(12)),
+            (Val(1), Val(10)),
+        ];
+        let Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) = &mapping else {
+            panic!("still a mapping");
+        };
+        assert_eq!(*pairs, sorted, "the values moved with their keys");
+
+        // The greedy driver re-runs the pattern until it fails, and a sorted list is where it stops.
+        assert_eq!(order_def_immutable_map_keys(&mut mapping, defs), Rewrote::No);
+        let Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) = &mapping else {
+            panic!("still a mapping");
+        };
+        assert_eq!(*pairs, sorted);
+    }
+
+    /// e303 — the hoist reaches EVERY program of a run, which is the whole content of the walk.
+    #[test]
+    fn e303_every_program_of_a_run_is_hoisted() {
+        let mut run = Run {
+            kernel: KernelName(GroupId(0)),
+            programs: vec![
+                program_of(Vec::new(), vec![index_const(1, 7), adds(2, 1)]),
+                program_of(Vec::new(), vec![index_const(3, 9), adds(4, 3)]),
+            ],
+        };
+        run.programs[1].name.index = OpIndex(1);
+
+        run_on_module(&mut run);
+
+        assert_eq!(run.programs[0].preamble, vec![index_const(1, 7)]);
+        assert_eq!(run.programs[1].preamble, vec![index_const(3, 9)]);
+        for program in &run.programs {
+            assert_eq!(
+                program.units.iter().next().map(|unit| unit.body.clone()),
+                Some(vec![adds(
+                    if program.name.index == OpIndex(0) { 2 } else { 4 },
+                    if program.name.index == OpIndex(0) { 1 } else { 3 },
+                )]),
+                "only the reader is left in the unit"
+            );
+        }
     }
 }

@@ -75,11 +75,13 @@ where
         let precision = unit.precision.map_or_else(String::new, |p| {
             format!(" {{precision = \"{}\"}}", p.spelling())
         });
-        let _ = writeln!(
-            out,
-            "      dataflow.program_unit {}{precision} : {{",
-            vals(&unit.on.vals())
-        );
+        // `iter_arg : %arg -> (%units)` only where the region binds one, and the bare list otherwise
+        // (`DataflowOps.cpp:145-155`) — see [`crate::islands::sentient::ProgramUnit::iter_arg`].
+        let on = match unit.iter_arg {
+            Some(arg) => format!("iter_arg : {} -> ({})", vals(&[arg]), vals(&unit.on.vals())),
+            None => vals(&unit.on.vals()),
+        };
+        let _ = writeln!(out, "      dataflow.program_unit {on}{precision} : {{");
         for op in &unit.body {
             emit(out, op, 4);
         }

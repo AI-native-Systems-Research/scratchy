@@ -99,8 +99,11 @@
 use core::fmt::Write as _;
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, symbol};
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, Val, sentient, symbol, uniform,
+};
 use crate::islands::sentient::print;
+use crate::units::DfirUnit;
 
 /// `InfluenceType` (`EnhancedDeadVariableElimination.hpp:42`) — what an SSA value's value decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +212,27 @@ pub(crate) struct InfluenceConflict {
     pub(crate) proposed: Influence,
 }
 
+/// `op->emitError("Not expecting <op> in other units")` + `signalPassFailure()` AS DATA — the same
+/// treatment [`InfluenceConflict`] gives e040's disagreement, for the four unit-placement refusals
+/// e301 makes.
+#[derive(Debug, Clone)]
+pub(crate) struct MisplacedOp {
+    /// What `op->dump()` would have written.
+    pub(crate) dumped: String,
+    /// The unit whose program the op appeared in.
+    pub(crate) unit: DfirUnit,
+}
+
+impl MisplacedOp {
+    /// One refusal, recorded.
+    #[must_use]
+    fn of(op: &Op, unit: DfirUnit) -> MisplacedOp {
+        let mut dumped = String::new();
+        print::emit(&mut dumped, op, 0);
+        MisplacedOp { dumped, unit }
+    }
+}
+
 /// `bool add` — whether the value also joins `worklist_`. The header's default is `true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorklistAdd {
@@ -227,6 +251,8 @@ pub(crate) struct EnhancedDeadVariableElimination {
     worklist: VecDeque<Val>,
     /// `signalPassFailure()`, as data.
     conflicts: Vec<InfluenceConflict>,
+    /// The `emitError("Not expecting <op> in other units")` arms of e301, as data.
+    misplaced: Vec<MisplacedOp>,
 }
 
 impl EnhancedDeadVariableElimination {
@@ -299,6 +325,12 @@ impl EnhancedDeadVariableElimination {
     #[must_use]
     pub(crate) fn conflicts(&self) -> &[InfluenceConflict] {
         &self.conflicts
+    }
+
+    /// Every op e301 refused to see on the unit it was on.
+    #[must_use]
+    pub(crate) fn misplaced(&self) -> &[MisplacedOp] {
+        &self.misplaced
     }
 }
 
@@ -436,15 +468,301 @@ fn constant_iter_arg(for_op: &Op, i: usize) -> Option<(Val, Val, Val)> {
     (*yielded.get(i)? == carried.arg).then_some((carried.arg, carried.init, carried.result))
 }
 
-// crustify:todo: e300_processWorkList
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:460  (53 body lines, level 1)
-//   original  : void EnhancedDeadVariableEliminationPass::processWorkList()
-//   calls     : e040_addToWorkListAndUpdateAssignment
+/// WHERE A VALUE COMES FROM, RESOLVED AGAINST A SCOPE — `val.getDefiningOp()` when it has one, and
+/// `cast<BlockArgument>(val).getOwner()->getParentOp()` when it does not.
+///
+/// ⭐ THE `Operation *user` E300 AND E301 PASS IS NOT THIS. That argument is dead in e040's body
+/// (`:66-99`); what e040 actually reads is the owner of `val` ITSELF (`:87-91`), which is what this
+/// answers.
+fn origin_of(val: Val, defs: Definitions<'_>) -> Origin {
+    if let Some(def) = defs.of(val) {
+        return Origin::Defined(def.clone());
+    }
+    if defs.program_unit_units_of(val).is_some() {
+        return Origin::ProgramUnitArg;
+    }
+    match defs.block_arg_owner_of(val) {
+        Some(op) => Origin::RegionArg(op.clone()),
+        None => todo!(
+            "addToWorkListAndUpdateAssignment: {val:?} is neither an op result nor a region argument \
+             of anything in scope, so `cast<BlockArgument>(val).getOwner()` \
+             (EnhancedDeadVariableElimination.cpp:73) has nothing to cast"
+        ),
+    }
+}
 
-// crustify:todo: e301_initializeAssignmentForAnOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:525  (147 body lines, level 1)
-//   original  : void EnhancedDeadVariableEliminationPass::initializeAssignmentForAnOperation( Operation *op)
-//   calls     : e040_addToWorkListAndUpdateAssignment
+impl EnhancedDeadVariableElimination {
+    /// Replaces: e300_processWorkList
+    ///
+    /// Drains the worklist, propagating each value's influence to what feeds it: a loop-carried arg to
+    /// its init and its yield operand, an add/sub/copy to its inputs, and a loop/if/uniformize result
+    /// to every region's yield operand at the same position (plus that loop's own iter_arg).
+    ///
+    /// ⛔ TRAP: island block-arg position 0 is the induction variable, so
+    /// `getIndexOfLoopRegionIterArgs` (`Analyses/Utils.cpp:257-271`) is that position MINUS ONE.
+    /// ⛔ TRAP: the `else` arm's `isa<>(def)` is bare on a possibly-null op and therefore asserts.
+    pub(crate) fn process_work_list(&mut self, defs: Definitions<'_>) {
+        while let Some(val) = self.worklist.pop_front() {
+            let influence = self.influence_type(val);
+            let carried_at = defs
+                .for_arg_of(val)
+                .and_then(|(for_op, pos)| pos.checked_sub(1).map(|index| (for_op, index)));
+            // ⭐ ONE FEED LIST PER ROUND, IN THE REFERENCE'S OWN ORDER, because e040 takes `&mut self`
+            // and the ops the positions are read from are borrowed from `defs`.
+            let mut feeds: Vec<Val> = Vec::new();
+            match carried_at {
+                Some((for_op, index)) => {
+                    if let Op::Sentient(sentient::Op::For { carried, .. }) = for_op {
+                        // ⛔ `.get`: `getIterOperands()[index]` past the end is an out-of-bounds read
+                        // there and there is nothing to propagate to here.
+                        feeds.extend(carried.get(index).map(|carried| carried.init));
+                    }
+                    feeds.extend(terminator(for_op).and_then(|yielded| yielded.get(index).copied()));
+                }
+                None => {
+                    let Some(def) = defs.of(val) else {
+                        todo!(
+                            "processWorkList: {val:?} has no defining op and is no loop iter_arg, so \
+                             `isa<sentient::AddOp, sentient::SubOp>(def)` \
+                             (EnhancedDeadVariableElimination.cpp:481) is a bare isa<> on a null op"
+                        );
+                    };
+                    match def {
+                        Op::Sentient(
+                            sentient::Op::ScalarAdd { lhs, rhs, .. }
+                            | sentient::Op::ScalarSub { lhs, rhs, .. },
+                        ) => feeds.extend([*lhs, *rhs]),
+                        Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => feeds.push(*input),
+                        // ⭐ THE LOWER RUNG'S SPELLING OF A LOCAL REGION IS HERE TOO, and reachable:
+                        // [`dialects::regions`] is total and raises a shared dialect's body, unlike
+                        // the borrowing [`dialects::regions_ref`].
+                        Op::Sentient(sentient::Op::For { .. } | sentient::Op::If { .. })
+                        | Op::UniformRegions(_)
+                        | Op::Uniform(uniform::Op::UniformizeRegions { .. }) => {
+                            let results = dialects::results(def);
+                            let Some(at) = results.iter().position(|result| *result == val) else {
+                                todo!(
+                                    "processWorkList: DT_CHECK(val_index != -1) \
+                                     (EnhancedDeadVariableElimination.cpp:497) — {val:?} is not among \
+                                     the results of the op that defines it"
+                                );
+                            };
+                            for region in dialects::regions(def) {
+                                // The block's terminator is its last op, and its operand list is what
+                                // `getOperand(val_index)` indexes.
+                                let yielded = region.last().map(dialects::operands).unwrap_or_default();
+                                feeds.extend(yielded.get(at).copied());
+                            }
+                            if let Op::Sentient(sentient::Op::For { carried, .. }) = def {
+                                feeds.extend(carried.get(at).map(|carried| carried.arg));
+                            }
+                        }
+                        // ⭐ EVERY OTHER DEFINING OP ENDS THE CHAIN — the reference's `if`/`else if`
+                        // has no final `else` (`:479-514`).
+                        _ => {}
+                    }
+                }
+            }
+            for feed in feeds {
+                let origin = origin_of(feed, defs);
+                self.add_to_work_list_and_update_assignment(
+                    feed,
+                    &origin,
+                    influence,
+                    WorklistAdd::Push,
+                );
+            }
+        }
+    }
+
+    /// Replaces: e301_initializeAssignmentForAnOperation
+    ///
+    /// Seeds the assignments from one op: every mask, address, increment and endpoint operand is a
+    /// memory influencer, while a loop's induction variable and non-constant bound and a
+    /// `sentient.if`'s two comparands are control-flow ones.
+    ///
+    /// ⛔ TRAP: a maskless `sentient.vector_ternary` reaches e040 with a NULL `Value` — `:557-559`
+    /// guards nothing, unlike the `mac` arm's `if (mask)` — and `isa<BlockArgument>(null)` asserts.
+    pub(crate) fn initialize_assignment_for_an_operation(
+        &mut self,
+        op: &Op,
+        unit: DfirUnit,
+        defs: Definitions<'_>,
+    ) {
+        let Op::Sentient(inner) = op else {
+            return;
+        };
+        let mut seeds: Vec<(Val, Influence, WorklistAdd)> = Vec::new();
+        let memory = |vals: &[Val]| {
+            vals.iter()
+                .map(|val| (*val, Influence::Memory, WorklistAdd::Push))
+                .collect::<Vec<_>>()
+        };
+        match inner {
+            sentient::Op::VectorMac {
+                mask,
+                xrf_write_ptr,
+                xrf_read_ptr,
+                ..
+            } => {
+                if !matches!(unit, DfirUnit::PtRow(_) | DfirUnit::Sfp | DfirUnit::Pe) {
+                    todo!(
+                        "initializeAssignmentForAnOperation: \
+                         DT_CHECK(is_any_of(current_unit_type_, PT, SFP, PE)) \
+                         (EnhancedDeadVariableElimination.cpp:529) — a sentient.vector_mac on \
+                         {unit:?}"
+                    );
+                }
+                // ⭐ WRITE POINTER THEN READ POINTER, which is the `pointers(..)` operand order
+                // (`SentientOps.td:234`) `getPointers()` hands back.
+                let pointers: Vec<Val> = [*xrf_write_ptr, *xrf_read_ptr]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                seeds.extend(memory(mask.as_slice()));
+                seeds.extend(memory(&pointers));
+            }
+            sentient::Op::VectorBinary { mask, .. } | sentient::Op::VectorUnary { mask, .. } => {
+                seeds.extend(memory(&[*mask]));
+            }
+            sentient::Op::VectorTernary { mask, .. } => {
+                let Some(mask) = *mask else {
+                    todo!(
+                        "initializeAssignmentForAnOperation: a maskless sentient.vector_ternary \
+                         reaches addToWorkListAndUpdateAssignment with a null Value \
+                         (EnhancedDeadVariableElimination.cpp:557-559), and `isa<BlockArgument>` on \
+                         one asserts"
+                    );
+                };
+                seeds.extend(memory(&[mask]));
+            }
+            sentient::Op::SetMask { mask_value, .. } => seeds.extend(memory(&[*mask_value])),
+            sentient::Op::For { iv, bound, .. } => {
+                // ⛔ `RecordOnly`: the induction variable is `add = false`, the pass's ONE such call.
+                seeds.push((*iv, Influence::ControlFlow, WorklistAdd::RecordOnly));
+                match defs.of(*bound) {
+                    Some(Op::Sentient(sentient::Op::ScalarConstant { .. })) => {}
+                    Some(_) => seeds.push((*bound, Influence::ControlFlow, WorklistAdd::Push)),
+                    None => todo!(
+                        "initializeAssignmentForAnOperation: \
+                         `isa<sentient::ConstantOp>(bound.getDefiningOp())` \
+                         (EnhancedDeadVariableElimination.cpp:571) is a bare isa<> and {bound:?} is a \
+                         region argument, so `getDefiningOp()` is null and it asserts"
+                    ),
+                }
+            }
+            sentient::Op::If { lhs, rhs, .. } => seeds.extend([
+                (*lhs, Influence::ControlFlow, WorklistAdd::Push),
+                (*rhs, Influence::ControlFlow, WorklistAdd::Push),
+            ]),
+            sentient::Op::LoadAndSend {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                consumer,
+                ..
+            } => match unit {
+                DfirUnit::L0lu | DfirUnit::Lxlu | DfirUnit::L3su => seeds.extend(memory(&[
+                    *mutable_addr,
+                    *immutable_addr,
+                    *increment,
+                    consumer.val(),
+                ])),
+                _ => self.misplaced.push(MisplacedOp::of(op, unit)),
+            },
+            sentient::Op::ReceiveAndStore {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                producer,
+                multicast_info,
+                ..
+            } => match unit {
+                DfirUnit::L0su | DfirUnit::Lxsu | DfirUnit::L3lu => {
+                    seeds.extend(memory(&[
+                        *mutable_addr,
+                        *immutable_addr,
+                        *increment,
+                        producer.val(),
+                    ]));
+                    seeds.extend(memory(multicast_info.as_slice()));
+                }
+                _ => self.misplaced.push(MisplacedOp::of(op, unit)),
+            },
+            sentient::Op::LoadAndStore {
+                src_mutable_addr,
+                src_immutable_addr,
+                src_inc,
+                dst_mutable_addr,
+                dst_immutable_addr,
+                dst_inc,
+                multicast_info,
+                ..
+            } => match unit {
+                // ⭐ SOURCE AND DESTINATION INTERLEAVED BY FIELD, not source-then-destination
+                // (`:612-624`).
+                DfirUnit::L3su | DfirUnit::L3lu => {
+                    seeds.extend(memory(&[
+                        *src_mutable_addr,
+                        *dst_mutable_addr,
+                        *src_immutable_addr,
+                        *dst_immutable_addr,
+                        *src_inc,
+                        *dst_inc,
+                    ]));
+                    seeds.extend(memory(multicast_info.as_slice()));
+                }
+                _ => self.misplaced.push(MisplacedOp::of(op, unit)),
+            },
+            sentient::Op::LoadAndExtractScalar {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                consumer,
+                ..
+            } => match unit {
+                DfirUnit::Lxlu => seeds.extend(memory(&[
+                    *mutable_addr,
+                    *immutable_addr,
+                    *increment,
+                    consumer.val(),
+                ])),
+                _ => self.misplaced.push(MisplacedOp::of(op, unit)),
+            },
+            sentient::Op::LoadComputeAndSend {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                consumer,
+                ..
+            } => {
+                // ⛔ A `DT_CHECK` AND NOT AN `emitError` (`:665`): this one aborts rather than failing
+                // the pass, so it is a `todo!` and not a [`MisplacedOp`].
+                if !matches!(unit, DfirUnit::Lxlu) {
+                    todo!(
+                        "initializeAssignmentForAnOperation: \
+                         DT_CHECK(current_unit_type_ == LXLU) \
+                         (EnhancedDeadVariableElimination.cpp:665) — a \
+                         sentient.load_compute_and_send on {unit:?}"
+                    );
+                }
+                seeds.extend(memory(&[
+                    *mutable_addr,
+                    *immutable_addr,
+                    *increment,
+                    consumer.val(),
+                ]));
+            }
+            sentient::Op::Splat { input, .. } => seeds.extend(memory(&[*input])),
+            // ⭐ EVERY OTHER OP SEEDS NOTHING — the reference's chain has no final `else` (`:527-682`).
+            _ => {}
+        }
+        for (val, influence, add) in seeds {
+            let origin = origin_of(val, defs);
+            self.add_to_work_list_and_update_assignment(val, &origin, influence, add);
+        }
+    }
+}
 
 // crustify:todo: e437_initializeWorkList
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:685  (4 body lines, level 2)
@@ -542,6 +860,18 @@ mod unit_tests {
     /// `sentient.yield %a, %b`.
     fn yield_op(results: Vec<Val>) -> Op {
         Op::Sentient(sentient::Op::Yield { results })
+    }
+
+    /// `%out = sentient.scalar_add %lhs, %rhs`.
+    fn add(lhs: u32, rhs: u32, result: u32) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs: Val(lhs),
+            rhs: Val(rhs),
+            result: Val(result),
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
     }
 
     /// Every `sentient.yield`'s operands, in walk order.
@@ -667,5 +997,74 @@ mod unit_tests {
             })
             .collect();
         assert_eq!(bounds, vec![Val(41), Val(10)]);
+    }
+
+    /// e300 propagates off a loop-carried argument to BOTH its init and its yield operand, and then
+    /// off the `sentient.scalar_add` that yield names to both of that add's inputs.
+    #[test]
+    fn process_work_list_follows_the_carried_arg_then_its_adds_inputs() {
+        let scope = vec![
+            constant(Val(0), 4),
+            constant(Val(1), 0),
+            constant(Val(9), 1),
+            for_op(
+                2,
+                0,
+                vec![carried(1, 3, 4)],
+                vec![add(3, 9, 8), yield_op(vec![Val(8)])],
+            ),
+        ];
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+
+        let mut pass = EnhancedDeadVariableElimination::default();
+        let origin = origin_of(Val(3), defs);
+        pass.add_to_work_list_and_update_assignment(
+            Val(3),
+            &origin,
+            Influence::Memory,
+            WorklistAdd::Push,
+        );
+        pass.process_work_list(defs);
+
+        for val in [Val(1), Val(3), Val(8), Val(9)] {
+            assert_eq!(pass.influence_type(val), Influence::Memory, "{val:?}");
+        }
+        // ⛔ THE BOUND AND THE INDUCTION VARIABLE ARE NOT REACHED — e300 walks what feeds a value,
+        // and neither feeds the carried argument.
+        assert_eq!(pass.influence_type(Val(0)), Influence::None);
+        assert_eq!(pass.influence_type(Val(2)), Influence::None);
+        assert!(pass.conflicts().is_empty());
+    }
+
+    /// e301 seeds a `sentient.set_mask`'s value as memory and a `sentient.for`'s induction variable as
+    /// control flow — the latter recorded WITHOUT being queued, which is the pass's one `add = false`.
+    #[test]
+    fn initialize_assignment_for_an_operation_seeds_masks_and_loop_control() {
+        let set_mask = Op::Sentient(sentient::Op::SetMask {
+            mask_value: Val(6),
+            dbg_name: None,
+        });
+        let loop_op = for_op(2, 5, vec![carried(1, 3, 4)], vec![yield_op(vec![Val(3)])]);
+        let scope = vec![
+            constant(Val(0), 1),
+            constant(Val(1), 0),
+            constant(Val(6), 7),
+            add(0, 1, 5),
+            set_mask.clone(),
+            loop_op.clone(),
+        ];
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+
+        let mut pass = EnhancedDeadVariableElimination::default();
+        pass.initialize_assignment_for_an_operation(&set_mask, DfirUnit::Sfp, defs);
+        pass.initialize_assignment_for_an_operation(&loop_op, DfirUnit::Sfp, defs);
+
+        assert_eq!(pass.influence_type(Val(6)), Influence::Memory);
+        assert_eq!(pass.influence_type(Val(2)), Influence::ControlFlow);
+        assert_eq!(pass.influence_type(Val(5)), Influence::ControlFlow);
+        assert_eq!(pass.worklist, VecDeque::from([Val(6), Val(5)]));
+        assert!(pass.misplaced().is_empty());
     }
 }
