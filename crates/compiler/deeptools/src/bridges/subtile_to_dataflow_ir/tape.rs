@@ -586,6 +586,8 @@ fn node_program<
                 value: received.operand(),
                 view: out_view,
                 indices: vec![Index::Const(0), Index::Const(0)],
+                dbg_name: None,
+                access: agen::Access::OfView,
                 view_ty: MemRef {
                     shape: vec![out_rows, out_cols],
                     elem: ElemType::F16,
@@ -799,6 +801,9 @@ fn load_and_send(
             view: *view,
             indices: vec![Index::Const(0), Index::Const(0)],
             dbg_name: None,
+            // This bridge names no access and reads whole sticks — see [`agen::Access`].
+            dbg_name: None,
+            access: agen::Access::OfView,
             view_ty: MemRef {
                 shape: vec![operand.rows(), operand.cols()],
                 elem: ElemType::F16,
@@ -881,6 +886,7 @@ fn compute<const STICK_ALIGNED: bool>(
     // mask that masks nothing. `$mask` is `Optional` in the dialect, so an unmasked binary omits
     // the operand entirely.
     ops.push(Op::VectorChain(vectorchain::Op::Binary {
+        dbg_name: None,
         result,
         op1,
         op2,
@@ -981,6 +987,7 @@ fn tail<const STICK_ALIGNED: bool>(
             // (`VectorChain.td:401-402`); reusing the predicate as both would be one value doing
             // two jobs, and the dialect makes the mask optional precisely so it can be absent.
             mask: None,
+            dbg_name: None,
             ty,
         }));
         produced = Computed::of(selected, ty);

@@ -22,6 +22,7 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::print;
+use crate::islands::dataflow_ir::ty::Vector;
 
 /// ONE REGION OF A `uniform.uniformize_regions`, WITH THE UNITS IT IS MAPPED ONTO.
 ///
@@ -178,6 +179,9 @@ pub enum Op {
         /// the verifier checks they are all `dataflow.get_unit`s when the first one is
         /// (`Uniform.cpp:477-486`).
         pairs: Vec<(Val, Val)>,
+        /// What the VALUES are typed — see [`MappedTy`]. `index` for every mapping in the reference
+        /// but the constant-bitstream one, whose values are vectors while the result stays `index`.
+        values_ty: MappedTy,
     },
 
     /// `%v = uniform.query_map(map:%m, key:%arg0) : index` — READ ONE UNIT'S CONSTANT OUT OF A
@@ -195,7 +199,38 @@ pub enum Op {
         map: Val,
         /// `Index:$key` — which unit's value to read.
         key: Val,
+        /// What the result is typed — `AnyType:$result` (`Uniform.td:177`). See [`MappedTy`].
+        ty: MappedTy,
     },
+}
+
+/// THE TYPE A MAPPING'S VALUES AND A QUERY'S RESULT CARRY.
+///
+/// ⛔⛔ NOT ALWAYS `index`, AND THE PRINTER SAYS SO TWICE. `DefImmutableMappingOp::print` appends
+/// `, <value type>` whenever the last value's type differs from the result's (`Uniform.cpp:468-472`)
+/// and `QueryMapOp::print` prints whatever the result is typed (`Uniform.cpp:591`) — so a map over
+/// `vectorchain.constant_bitstream`s prints `):index, vector<64xf16>` and its query prints
+/// `: vector<64xf16>`. `constructUniformizedFoldedConstantBitStream` builds exactly that
+/// (`SNDSCLowering.cpp:520-537`): the mapping's declared result type is `index` while its values are
+/// vectors. Without this the emitted text types a vector-producing query as `index`, which is a
+/// parse error in the consumer rather than a wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappedTy {
+    /// `index` — every address, bound and toggle a program specialises per unit.
+    Index,
+    /// `vector<NxT>` — a constant bitstream, which is the one non-`index` case the reference builds.
+    Vector(Vector),
+}
+
+impl MappedTy {
+    /// HOW MLIR SPELLS IT.
+    #[must_use]
+    pub fn spelling(self) -> String {
+        match self {
+            MappedTy::Index => "index".to_owned(),
+            MappedTy::Vector(ty) => print::vector(ty),
+        }
+    }
 }
 
 /// ONE `uniform` OP AS TEXT. The caller has already indented the opening line.
@@ -261,14 +296,23 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 );
             }
         }
-        Op::DefImmutableMapping { result, pairs } => {
+        Op::DefImmutableMapping {
+            result,
+            pairs,
+            values_ty,
+        } => {
             // ⛔ `"):"` WITH NO SPACES AROUND THE COLON, and the trailing value type elided when it
-            // equals the result type (`Uniform.cpp:456-472`). Every value in this island is `index`,
-            // so the `, <value type>` tail at `:469-472` never prints — and the vendor's own line is
-            // `..[%62 -> %95]):index` (`flatten_local_region4.mlir:750`).
+            // equals the result type (`Uniform.cpp:456-472`). The result type is `index` at every
+            // site the reference builds, so the `, <value type>` tail prints exactly when the values
+            // are NOT `index` — the vendor's own `index` line is `..[%62 -> %95]):index`
+            // (`flatten_local_region4.mlir:750`).
+            let tail = match values_ty {
+                MappedTy::Index => String::new(),
+                other => format!(", {}", other.spelling()),
+            };
             let _ = writeln!(
                 out,
-                "{} = uniform.def_immutable_mapping({}):index",
+                "{} = uniform.def_immutable_mapping({}):index{tail}",
                 print::val(*result),
                 pairs
                     .iter()
@@ -277,15 +321,21 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                     .join(", ")
             );
         }
-        Op::QueryMap { result, map, key } => {
+        Op::QueryMap {
+            result,
+            map,
+            key,
+            ty,
+        } => {
             // `p << "(map:"; .. p << ", key:"; .. p << ") : "` (`Uniform.cpp:586-591`) — no space
             // after either colon, and one on each side of the result type's.
             let _ = writeln!(
                 out,
-                "{} = uniform.query_map(map:{}, key:{}) : index",
+                "{} = uniform.query_map(map:{}, key:{}) : {}",
                 print::val(*result),
                 print::val(*map),
-                print::val(*key)
+                print::val(*key),
+                ty.spelling()
             );
         }
     }
@@ -293,9 +343,11 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::MappedTy;
     use crate::islands::dataflow_ir::dialects::uniform::{LocalRegion, Op};
     use crate::islands::dataflow_ir::dialects::{self, Val, arith};
     use crate::islands::dataflow_ir::print::emit;
+    use crate::islands::dataflow_ir::ty::{ElemType, Vector};
 
     /// ⭐⭐ IBM'S OWN NESTED REGION, REPRODUCED BYTE FOR BYTE.
     ///
@@ -387,11 +439,13 @@ mod tests {
             dialects::Op::Uniform(Op::DefImmutableMapping {
                 result: Val(285),
                 pairs: vec![(Val(2), Val(65)), (Val(6), Val(67))],
+                values_ty: MappedTy::Index,
             }),
             dialects::Op::Uniform(Op::QueryMap {
                 result: Val(286),
                 map: Val(285),
                 key: Val(48),
+                ty: MappedTy::Index,
             }),
         ];
 
@@ -404,6 +458,47 @@ mod tests {
             got,
             "%285 = uniform.def_immutable_mapping([%2 -> %65], [%6 -> %67]):index\n\
              %286 = uniform.query_map(map:%285, key:%48) : index\n"
+        );
+    }
+
+    /// ⭐⭐ AND A MAPPING OVER VECTORS TYPES ITSELF TWICE — the case entry 032 builds.
+    ///
+    /// ⛔⛔ THE RESULT TYPE STAYS `index` WHILE THE VALUES ARE VECTORS.
+    /// `constructUniformizedFoldedConstantBitStream` passes `builder.getIndexType()` as the mapping's
+    /// result type and `bitstream_vector_type` to the query (`SNDSCLowering.cpp:530-537`), so
+    /// `DefImmutableMappingOp::print` appends `, vector<64xf16>` because the last value's type differs
+    /// from the result's (`Uniform.cpp:468-472`) and `QueryMapOp::print` prints the vector
+    /// (`:591`). Typing the query `: index` — which is what this island printed before the mapping
+    /// carried a value type — is a parse error in the consumer rather than a wrong value.
+    #[test]
+    fn a_mapping_over_vectors_prints_the_value_type_and_the_query_prints_the_vector() {
+        let f16x64 = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let ops = vec![
+            dialects::Op::Uniform(Op::DefImmutableMapping {
+                result: Val(285),
+                pairs: vec![(Val(2), Val(65)), (Val(6), Val(67))],
+                values_ty: MappedTy::Vector(f16x64),
+            }),
+            dialects::Op::Uniform(Op::QueryMap {
+                result: Val(286),
+                map: Val(285),
+                key: Val(48),
+                ty: MappedTy::Vector(f16x64),
+            }),
+        ];
+
+        let mut got = String::new();
+        for op in &ops {
+            emit(&mut got, op, 0);
+        }
+
+        assert_eq!(
+            got,
+            "%285 = uniform.def_immutable_mapping([%2 -> %65], [%6 -> %67]):index, vector<64xf16>\n\
+             %286 = uniform.query_map(map:%285, key:%48) : vector<64xf16>\n"
         );
     }
 
@@ -453,6 +548,7 @@ mod tests {
             result: Val(286),
             map: Val(285),
             key: Val(48),
+            ty: MappedTy::Index,
         });
         assert_eq!(dialects::operands(&op), vec![Val(285), Val(48)]);
         assert_eq!(dialects::results(&op), vec![Val(286)]);
@@ -460,6 +556,7 @@ mod tests {
         let mapping = dialects::Op::Uniform(Op::DefImmutableMapping {
             result: Val(285),
             pairs: vec![(Val(2), Val(65))],
+            values_ty: MappedTy::Index,
         });
         // ⭐ KEYS AND VALUES BOTH, KEY FIRST — the two `Variadic` ranges in declaration order
         // (`Uniform.td:132-133`).

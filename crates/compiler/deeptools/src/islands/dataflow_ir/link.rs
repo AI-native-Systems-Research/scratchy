@@ -253,6 +253,33 @@ impl<From: UnitKind, To: UnitKind> Link<From, To> {
     }
 }
 
+/// ONE WIRE WHOSE TWO UNITS ARE CHOSEN AT RUN TIME — a via chain's neighbours.
+///
+/// ⛔⛔ THE KINDS CANNOT BE TYPE PARAMETERS HERE. A destination's via list is walked at run time and
+/// the hop that becomes `from` is whichever one precedes this unit in it
+/// (`SNTransferLowering.cpp:2634-2646`), so no call site can spell the pair. What [`Link`] actually
+/// enforces is kept: the two ends come out together, once, by consuming the wire, so a send cannot be
+/// paired with a receive from a different hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynLink {
+    from: Val,
+    to: Val,
+}
+
+impl DynLink {
+    /// A wire between two units whose `dataflow.get_unit` results are already bound.
+    #[must_use]
+    pub const fn between(from: Val, to: Val) -> DynLink {
+        DynLink { from, to }
+    }
+
+    /// THE TWO ENDS, ONCE — see [`Link::ends`].
+    #[must_use]
+    pub const fn ends(self) -> (SendEnd, RecvEnd) {
+        (SendEnd(self.to), RecvEnd(self.from))
+    }
+}
+
 /// ONE SIDE OF A RENDEZVOUS — the peer this unit signals, then waits on.
 ///
 /// ⛔ THE PAIR IS EMITTED TOGETHER. `dataflow.sync_recv` is BLOCKING — *"it does not return until

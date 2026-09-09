@@ -466,8 +466,12 @@ pub fn operands(op: &Op) -> Vec<Val> {
                 ..
             } => {
                 reads.push(*input);
-                reads.extend(variable.iter().copied());
-                reads.extend(pad.iter().copied());
+                // ⛔ THE SCALAR, NOT THE PAIR. A `variable`/`pad` entry is a
+                // [`vectorchain::ShuffleVariable`] — the value AND the type the op prints for it —
+                // because `$variable` is `Variadic<AnyTypeOf<[Index, AnyInteger, AnyFloat]>>`
+                // (`VectorChain.td:459`). Only the value is an operand.
+                reads.extend(variable.iter().map(|scalar| scalar.val));
+                reads.extend(pad.iter().map(|scalar| scalar.val));
             }
             vectorchain::Op::Rotate {
                 input, position, ..
@@ -956,8 +960,9 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                 ..
             } => {
                 places.push(input);
-                places.extend(variable.iter_mut());
-                places.extend(pad.iter_mut());
+                // The value alone is the operand — see [`operands`] for why the entry is a pair.
+                places.extend(variable.iter_mut().map(|scalar| &mut scalar.val));
+                places.extend(pad.iter_mut().map(|scalar| &mut scalar.val));
             }
             vectorchain::Op::Rotate {
                 input, position, ..
@@ -1916,8 +1921,9 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                 ..
             } => {
                 operands.push(input);
-                operands.extend(variable.iter_mut());
-                operands.extend(pad.iter_mut());
+                // The value alone is the operand — see [`operands`] for why the entry is a pair.
+                operands.extend(variable.iter_mut().map(|scalar| &mut scalar.val));
+                operands.extend(pad.iter_mut().map(|scalar| &mut scalar.val));
                 results.push(result);
             }
             vectorchain::Op::Rotate {
@@ -2656,8 +2662,13 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                 ..
             } => {
                 vals.push((Role::Operand, input));
-                vals.extend(variable.iter_mut().map(|val| (Role::Operand, val)));
-                vals.extend(pad.iter_mut().map(|val| (Role::Operand, val)));
+                // The value alone is the operand — see [`operands`] for why the entry is a pair.
+                vals.extend(
+                    variable
+                        .iter_mut()
+                        .map(|scalar| (Role::Operand, &mut scalar.val)),
+                );
+                vals.extend(pad.iter_mut().map(|scalar| (Role::Operand, &mut scalar.val)));
                 vals.push((Role::Result, result));
             }
             vectorchain::Op::Rotate {

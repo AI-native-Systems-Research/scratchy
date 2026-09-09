@@ -191,6 +191,10 @@ pub enum Precision {
     Mxfp4,
     /// `mxfp8` — 4 occurrences.
     Mxfp8,
+    /// `mxint4` — ⛔ NOT IN `dcc/test` EITHER, AND STILL PRODUCIBLE: entry 103 prefixes `mx` onto
+    /// `stringifyComputePrecision`'s spelling for a scaled `IMA4`, and `SentientTypes.td:56-58`
+    /// carries `mxint4` for it to lower to.
+    Mxint4,
 
     /// `fp80` — ⛔⛔ **AN ALIAS FOR `fp8`, AND THE ONLY REASON ENTRY 094 IS NOT THE IDENTITY.**
     ///
@@ -221,6 +225,7 @@ impl Precision {
             Self::Bf16 => "bf16",
             Self::Mxfp4 => "mxfp4",
             Self::Mxfp8 => "mxfp8",
+            Self::Mxint4 => "mxint4",
             Self::Fp80 => "fp80",
         }
     }
@@ -569,11 +574,18 @@ pub enum Op {
     /// — see [`PagedMemView`], which is the whole of it.
     GetPagedLogicalMemoryView(Box<PagedMemView>),
 
-    /// `dataflow.program_unit %unit {precision} : { .. }` — one unit's whole program.
+    /// `dataflow.program_unit iter_arg : %arg -> (%unit) {precision} : { .. }` — one unit's whole
+    /// program.
     ProgramUnit {
         /// The units this program runs on. More than one where the same program is bound across
         /// program time steps (`Dataflow.td:99-104`).
         units: Vec<Val>,
+        /// The region's own block argument, which `build` gives it the type of `units[0]`
+        /// (`DataflowOps.cpp:74`) and the printer spells `iter_arg : %arg -> (..)`
+        /// (`DataflowOps.cpp:146-157`). This is what a uniformized unit's `uniform.query_map`
+        /// reads: `component_to_handler_[comp] = unit_op.getRegion().getArguments().front()`.
+        /// `None` prints no `iter_arg` clause at all.
+        iter_arg: Option<Val>,
         /// `precision=`, which selects the MAC opcode. Absent on a unit that computes nothing.
         precision: Option<Precision>,
         /// The body.
@@ -640,6 +652,15 @@ pub enum Op {
         size: Val,
         /// The buffer's type.
         view_ty: MemRef,
+        /// `dbgName` — the sync's own name.
+        ///
+        /// ⛔ ADDED FOR BRIDGE 1, AND IT PRINTS. `constructImplicitSyncOperation` passes
+        /// `builder.getStringAttr(sync->name_)` as the op's fourth argument
+        /// (`SNSyncLowering.cpp:200-203`), and the authority's own IR carries it:
+        /// `%9, %0, %c4 {dbgName = "sync_implicit_L0"} : memref<1xf16>, index, index`
+        /// (`hcc/samples/Matmul_L0/matmul_l0.mlir:27`). Without a slot for it every implicit sync
+        /// this bridge emits would be anonymous where the reference's is named.
+        dbg_name: Option<String>,
     },
 
     /// `dataflow.opaque {func_name, read_write_register_dictionary, read_only_register_dictionary,
@@ -721,10 +742,32 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 Some(folds) => format!("num_folds = {} : i32, ", folds.0),
                 None => String::new(),
             };
+            // ⛔⛔ MORE THAN ONE FOLD IS A RESULT **GROUP**, NOT ONE VALUE, AND THE ATTRIBUTE ALONE
+            // IS NOT THE OP. `get_unit`'s result is `Variadic<Index>` — "each return value
+            // corresponding to an instance of program time steps" (`Dataflow.td:56-58`) — and
+            // `createGetUnitOp` builds exactly `num_folds_` of them beside the attribute
+            // (`DSC2ToDataflowIRUtils.hpp:70-77`). MLIR prints that as one name, its COUNT, and one
+            // result type per result: the vendor's eleven-fold L3 load unit is
+            // `%28:11 = dataflow.get_unit {core = 0 : i32, name = "l3lu", num_folds = 11 : i32,
+            // type = "l3lu"} : index, index, ...` (`dcc/test/PT/bf16-pt.mlir:126`), and `%9:2` its
+            // two-fold HBM (`dcc/test/PT/symbolic_ebr.mlir:86`). Printing one `index` writes an
+            // arity that contradicts the attribute beside it, and the first `%28#3` that reads a
+            // later fold has nothing to resolve against.
+            let count = match num_folds {
+                Some(folds) => folds.0,
+                None => 1,
+            };
+            let mut bound = print::val(*result);
+            let mut results = String::from("index");
+            if count > 1 {
+                let _ = write!(bound, ":{count}");
+                for _ in 1..count {
+                    results.push_str(", index");
+                }
+            }
             let _ = writeln!(
                 out,
-                "{} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}type = \"{spelling}\"}} : index",
-                print::val(*result),
+                "{bound} = dataflow.get_unit {{{attrs}name = \"{name}\", {folds}type = \"{spelling}\"}} : {results}",
             );
         }
         // ⭐ THE MEMBERS PRINT AS THE VECTOR WIDTH THE REFERENCE READS THEM BACK FROM
@@ -860,6 +903,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         }
         Op::ProgramUnit {
             units,
+            iter_arg,
             precision,
             body,
         } => {
@@ -867,11 +911,15 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 Some(p) => format!(" {{precision = \"{}\"}}", Precision::spelling(*p)),
                 None => String::new(),
             };
-            let _ = writeln!(
-                out,
-                "dataflow.program_unit {}{precision} : {{",
-                print::vals(units)
-            );
+            let units = match iter_arg {
+                Some(arg) => format!(
+                    "iter_arg : {} -> ({})",
+                    print::val(*arg),
+                    print::vals(units)
+                ),
+                None => print::vals(units),
+            };
+            let _ = writeln!(out, "dataflow.program_unit {units}{precision} : {{");
             for inner in body {
                 print::emit(out, inner, depth + 1);
             }
@@ -927,10 +975,17 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             dst,
             size,
             view_ty,
+            dbg_name,
         } => {
+            // ⭐ THE ATTRIBUTE DICTIONARY SITS BETWEEN THE OPERANDS AND THE TYPE LIST, and is absent
+            // altogether when there is no name (`implicit-sync.mlir:159` against
+            // `l0su_mx_precision.mlir:148`).
+            let named = dbg_name
+                .as_ref()
+                .map_or_else(String::new, |name| format!(" {{dbgName = \"{name}\"}}"));
             let _ = writeln!(
                 out,
-                "dataflow.implicit_sync_on_streaming_buffer {}, {}, {} : {}, index, index",
+                "dataflow.implicit_sync_on_streaming_buffer {}, {}, {}{named} : {}, index, index",
                 print::val(*view),
                 print::val(*dst),
                 print::val(*size),
@@ -1012,7 +1067,7 @@ mod tests {
     use crate::islands::dataflow_ir::dialects::{self, Val};
     use crate::islands::dataflow_ir::print::emit;
     use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, MemRef};
-    use crate::units::{Core, Corelet, DfirUnit, Residency};
+    use crate::units::{Core, Corelet, DfirUnit, NumFolds, Residency};
 
     /// A core this build's arch has.
     fn core(index: u32) -> Core {
@@ -1189,5 +1244,60 @@ mod tests {
             "} : index, index, memref<64x4x64xf16>\n",
         );
         assert_eq!(got, want);
+    }
+
+    /// ⛔⛔ A FOLDED UNIT BINDS A RESULT **GROUP**, AND THE VENDOR'S OWN LINE IS THE PROOF.
+    ///
+    /// `num_folds = 11 : i32` is not decoration beside one `index`: `dcc/test/PT/bf16-pt.mlir:126`
+    /// binds eleven results under one name, one `index` per fold, and that is the arity every
+    /// `%28#k` later in the file resolves against. This compares the whole line, so an emitter that
+    /// writes the attribute and keeps a single result is a diff rather than a plausible-looking op.
+    #[test]
+    fn a_folded_unit_prints_the_vendors_result_group() {
+        let op = dialects::Op::Dataflow(Op::GetUnit {
+            result: Val(28),
+            residency: Residency::Scratchpad { core: core(0) },
+            unit: DfirUnit::L3lu,
+            num_folds: Some(NumFolds(11)),
+        });
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        assert_eq!(
+            got,
+            concat!(
+                "%28:11 = dataflow.get_unit {core = 0 : i32, name = \"C0-l3lu\", ",
+                "num_folds = 11 : i32, type = \"l3lu\"} : ",
+                "index, index, index, index, index, index, index, index, index, index, index\n",
+            )
+        );
+    }
+
+    /// ⭐ AND ONE FOLD IS STILL ONE VALUE — the vendor writes `num_folds = 1 : i32` on an op whose
+    /// single result is named plainly (`dcc/test/PT/fp8-bmm-1p5.mlir:104`), so the group spelling
+    /// must not appear at a count of one.
+    #[test]
+    fn a_single_fold_keeps_the_plain_result() {
+        let op = dialects::Op::Dataflow(Op::GetUnit {
+            result: Val(4),
+            residency: Residency::Corelet {
+                core: core(0),
+                corelet: corelet(0),
+            },
+            unit: DfirUnit::Lxlu,
+            num_folds: Some(NumFolds::ONE),
+        });
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        assert_eq!(
+            got,
+            concat!(
+                "%4 = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, ",
+                "name = \"C0-lxlu-CL0\", num_folds = 1 : i32, type = \"lxlu\"} : index\n",
+            )
+        );
     }
 }

@@ -10,7 +10,23 @@ use std::fmt::Write as _;
 
 use crate::islands::dataflow_ir::dialects::Val;
 use crate::islands::dataflow_ir::print;
-use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, Constraint, IntegerSet, Vector};
+use crate::islands::dataflow_ir::ty::{
+    AffineExpr, AffineMap, Constraint, IntegerSet, ScalarTy, Vector,
+};
+
+/// ONE SCALAR A SHUFFLE'S NEGATIVE INDEX REACHES, WITH THE TYPE THE OP PRINTS FOR IT.
+///
+/// ⭐ THE TYPE IS THE OPERAND'S, NOT THE RESULT ELEMENT'S. `Variadic<AnyTypeOf<[Index, AnyInteger,
+/// AnyFloat]>>:$variable` (`VectorChain.td:459`) and `ShuffleOp::print` writes each one out beside
+/// the input's (`VectorChain.cpp:389-390`), so a loop counter prints `index` inside an op whose
+/// result is a `vector<64xf16>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShuffleVariable {
+    /// The scalar.
+    pub val: Val,
+    /// How it is typed.
+    pub ty: ScalarTy,
+}
 
 /// WHICH COMPARISON — `VectorChainElementWiseCompareOperator` (`VectorChainEnums.td`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +360,24 @@ impl Predicate {
     pub const fn ty(self) -> Vector {
         self.ty
     }
+
+    /// A CONDITION THAT **ARRIVED** RATHER THAN BEING MASKED HERE — the vector an operand already
+    /// carries, at the type its own definition stated.
+    ///
+    /// ⭐ ADDED FOR `e100_constructBinaryOrTernaryOperation`, whose `SELECT` hands
+    /// `ElementWiseSelectionOp` its `inputs[0]` (`SNComputeLowering.cpp:1168-1171`) — an input
+    /// operand entry 086 built, not a `create_affine_mask` this lowering minted. `$cond` is
+    /// `AnyVectorOfAnyRank` (`VectorChain.td:517`), so there is nothing to check.
+    ///
+    /// ⛔ IT STILL CANNOT DISAGREE WITH ITS DEFINITION: the type comes from the [`Computed`] the
+    /// producing op bound, which is the invariant this type exists for.
+    #[must_use]
+    pub const fn of_operand(operand: Computed) -> Predicate {
+        Predicate {
+            val: operand.val(),
+            ty: operand.ty(),
+        }
+    }
 }
 
 /// ONE `vectorchain` OPERATION.
@@ -361,6 +395,11 @@ pub enum Op {
         input: Val,
         /// Which estimate.
         kind: EstimateKind,
+        /// `$mask`, IF THIS OP CARRIES ONE — `Optional<VectorOfRankAndType<[1], [I1]>>`
+        /// (`VectorChain.td:255`), which every estimate in the family declares.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// Which version, where the op takes one. `rec` and `ln` do not.
         version: Option<EstimateVersion>,
         /// The input's type.
@@ -386,6 +425,10 @@ pub enum Op {
         result: Val,
         /// What is exponentiated.
         input: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `VectorChain.td:243`.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// The input's type.
         input_ty: Vector,
         /// The result's type.
@@ -402,6 +445,10 @@ pub enum Op {
         result: Val,
         /// What is rounded down.
         input: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `VectorChain.td:274`.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// The input's type.
         input_ty: Vector,
         /// The result's type.
@@ -445,6 +492,8 @@ pub enum Op {
         input: Val,
         /// Which reduction.
         reduction_op: BinaryOp,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// The input's type.
         input_ty: Vector,
         /// The result's type.
@@ -493,11 +542,23 @@ pub enum Op {
         b: Val,
         /// The accumulator read in.
         acc: Val,
+        /// `$mask`, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
+        /// (`VectorChain.td:384`). ⛔ [`Op::Multiply`] HAS NONE; only the accumulating form does.
+        mask: Option<Predicate>,
+        /// `dbgName=` — the compute node's name.
+        dbg_name: Option<String>,
         /// As [`Op::Multiply`].
         reduction_map: AffineMap,
-        /// The operands' type.
-        operand_ty: Vector,
-        /// The result's type.
+        /// `type($op1)`.
+        ///
+        /// ⛔⛔ THE TWO FACTORS ARE **TWO** TYPES, unlike [`Op::Multiply`]'s one. `FNMS` negates
+        /// `inputs[0]` AT THE ACCUMULATOR'S TYPE and feeds the negation in
+        /// (`SNComputeLowering.cpp:1013-1016`), so within one emitted MAC `op1` is the narrow type
+        /// and `op2` the wide one — a single `operand_ty` printed the wrong type for one of them.
+        a_ty: Vector,
+        /// `type($op2)`.
+        b_ty: Vector,
+        /// The result's type, which `$op3` is also printed at.
         ty: Vector,
     },
 
@@ -519,6 +580,9 @@ pub enum Op {
         mask: Option<Predicate>,
         /// Which comparison.
         compare_op: CompareOp,
+        /// `dbgName=` — `OptionalAttr<StrAttr>:$dbgName` (`VectorChain.td:145-158`), which
+        /// `constructFMINorFMAXOperation` fills with the node's name.
+        dbg_name: Option<String>,
         /// The operands' type.
         operand_ty: Vector,
         /// The i1 result's type.
@@ -538,6 +602,9 @@ pub enum Op {
         lhs: Val,
         /// Taken otherwise.
         rhs: Val,
+        /// `dbgName=` — `OptionalAttr<StrAttr>:$dbgName` (`VectorChain.td:395-407`), filled from
+        /// the node's name by `constructFMINorFMAXOperation`.
+        dbg_name: Option<String>,
         /// The lane mask, IF THIS OP CARRIES ONE. `Optional` in the dialect
         /// (`VectorChain.td:402`), and the condition is a SEPARATE operand from it.
         mask: Option<Predicate>,
@@ -563,6 +630,9 @@ pub enum Op {
         mask: Option<Predicate>,
         /// Which operation.
         binary_op: BinaryOp,
+        /// `dbgName=` — the compute node's name, which every `BinaryOp::create` in the lowering
+        /// passes (`SNComputeLowering.cpp:1117-1119`).
+        dbg_name: Option<String>,
         /// `op_specific_map=` — REQUIRED, and dbo-opt says so: "'vectorchain.binary' op requires
         /// attribute 'op_specific_map'". IBM's own IR writes the identity, `affine_map<(d0) -> (d0)>`,
         /// which is lane `i` of each operand into lane `i` of the result.
@@ -606,6 +676,8 @@ pub enum Op {
         /// `[0, -1, 1, -1, 2, -1, …]` (`dcc/test/SFP/merge_and_pack.mlir:176`) — an `i32` list, not
         /// a `u32` one, and a `usize` here would refuse half the family.
         indices: Vec<i32>,
+        /// `dbgName=` — the compute node's name (`SNComputeLowering.cpp:1128-1131`).
+        dbg_name: Option<String>,
         /// How many times the index pattern repeats to fill the result — `IndexAttr`, printed
         /// `: index` and not `: i32`.
         ///
@@ -680,6 +752,15 @@ pub enum Op {
         /// later. `SNDSCLowering.cpp:480,516` sets it and entry 235 `createSentientConstants`
         /// copies it onto the `sentient.scalar_constant` it emits (`Splat.cpp:50-51`), where it
         /// changes what the op prints.
+        /// `is_symbol` — the values are SYMBOL IDS a later pass resolves, not bit patterns.
+        ///
+        /// ⛔⛔ IT CHANGES THE WHOLE PRINTED FORM, not just one attribute.
+        /// `ConstantBitstreamOp::print` reads `is_symbol` FIRST and prints the hand-rolled
+        /// `{value = [0x..]}` only when it is absent or false; when it is true the op prints its
+        /// generic attribute dictionary instead — decimal `N : i64` values, `is_symbol` before
+        /// `value` (`VectorChain.cpp:78-105`). `constructUniformizedFoldedConstantBitStream` sets it
+        /// on every bitstream it builds when its `is_symbolic` argument is set
+        /// (`SNDSCLowering.cpp:479-481, 519-521`).
         is_symbol: bool,
     },
 
@@ -694,36 +775,33 @@ pub enum Op {
         result: Val,
         /// What is widened.
         input: Val,
-        /// `$variable` — THE VALUES A **NEGATIVE** INDEX NAMES, starting at `-1`.
+        /// The SCALARS a negative index reaches — `variable(%iv)`, indexed from `-1`
+        /// (`VectorChain.td:445`).
         ///
-        /// ⛔⛔ ADDED FOR `LoopUnrollForShuffleOp`'s `runOnOperation` (entry 248), whose ONLY job is
-        /// to find a shuffle with a loop induction variable in this list and unroll that loop
-        /// (`:88-112`). Without the field the pass had no domain: `getVariable()` was a shape this
-        /// island could not state, and the `indices` list already carried the negative entries that
-        /// refer to it (`VectorChain.td:445`, `getVariableOrPadOperand`).
+        /// ⛔⛔ A NEGATIVE INDEX IS NOT A REORDERING, IT IS A DIFFERENT OPERAND. `indices = [-1]`
+        /// broadcasts `variable`'s first scalar over the whole result and reads NOTHING out of
+        /// `input`, so an empty list here with a negative index is an op whose elements have no
+        /// source. That is what makes this a field rather than an attribute: the value travels.
+        variable: Vec<ShuffleVariable>,
+        /// `pad(..)` — `Variadic<..>:$pad` (`VectorChain.td:462`), the SECOND scalar group, printed
+        /// after `variable(..)` and typed in the same operand order (`VectorChain.cpp:373-379`).
         ///
-        variable: Vec<Val>,
-        /// `$pad` — THE VALUES A NEGATIVE INDEX NAMES **AFTER** THE VARIABLES, so the first of them
-        /// is `-(variable.len() + 1)` and `-1` when there are no variables
-        /// (`VectorChain.td:487-492`, `getFirstPadIndex`).
-        ///
-        /// ⛔⛔ ADDED FOR `createSplatOperation` (entry 279), WHOSE ONLY BEHAVIOURALLY DISTINCT ARM
-        /// CANNOT FIRE WITHOUT IT. `isPadLeftFor8FirstElemSplat` compares each expanded index against
-        /// `getFirstPadIndex()` — an `int` against a `std::optional`, which C++ answers `!=` for
-        /// whenever the optional is empty (`dialect_utils/VectorChain/Utils.cpp:113-119`) — so with no
-        /// pad segment the classifier is false and `SentientSplatPad::left` is unreachable, while the
-        /// other two arms both emit `none`. ⭐ AND IT IS THE VENDOR'S OWN CASE:
-        /// `splat_const_bit.mlir:87` writes `shuffle input(%c25), pad(%c0)` and expects
-        /// `pad = #sentient<splat_pad left>` at `:22`. 24 of the authority's shuffles carry one.
-        pad: Vec<Val>,
+        /// ⛔ A NEGATIVE INDEX READS `variable` FIRST AND `pad` ONLY ONCE THAT IS EXHAUSTED, by the
+        /// offset arithmetic the op declares itself (`VectorChain.td:500-510`). So `variable` empty
+        /// with one `pad` scalar is how a SPLAT reaches its fill value.
+        pad: Vec<ShuffleVariable>,
         /// `$mask`, IF THIS OP CARRIES ONE — `Optional<AnyVectorOfAnyRank>:$mask`
-        /// (`VectorChain.td:463`).
+        /// (`VectorChain.td:461`), printed `mask(%m)` after the pad group and typed in the same
+        /// operand order (`VectorChain.cpp:381-382, 393-394`).
         ///
-        /// ⛔ ADDED FOR THE SAME UNIT: entry 279 reads `shuffle_op.getMask()` and, off the PT, hands
-        /// its defining op to `getMaskValueForNonPT` (entry 229) to REPLACE the splat's default mask
-        /// operand (`Splat.cpp:106-113`).
+        /// ⛔ ADDED FOR entry 279 `createSplatOperation`, which reads `shuffle_op.getMask()` and, off
+        /// the PT, hands its defining op to `getMaskValueForNonPT` (entry 229) to REPLACE the splat's
+        /// default mask operand (`Splat.cpp:106-113`). Without the field a masked shuffle could not
+        /// be spelled at all, let alone read.
         mask: Option<Predicate>,
-        /// One index per element of the input.
+        /// `dbgName`.
+        dbg_name: Option<String>,
+        /// One index per element of the input, or a negative one per [`Op::Shuffle::variable`].
         indices: Vec<i32>,
         /// How many times the pattern repeats to fill the result.
         repetition: u32,
@@ -846,6 +924,13 @@ impl Op {
                 val: *result,
                 ty: *ty,
             }),
+            // ⭐ AND A COMPARISON BINDS ONE TOO: its result IS the `$cond` of the
+            // `element_wise_selection` an FMIN/FMAX emits next
+            // (`SNComputeLowering.cpp:6238-6323`), and `ty` is the i1 vector it was defined over.
+            Op::ElementWiseCompare { result, ty, .. } => Some(Predicate {
+                val: *result,
+                ty: *ty,
+            }),
             _ => None,
         }
     }
@@ -858,24 +943,37 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             input,
             kind,
+            mask,
+            dbg_name,
             version,
             input_ty,
             ty,
         } => {
-            let version = match version {
-                Some(v) => format!(
-                    " {{version = #vectorchain<{} {}>}}",
+            // ⭐ ALPHABETICAL, `printOptionalAttrDict`'s order — `dbgName` ahead of `version`, and
+            // an estimate with neither prints no dictionary at all.
+            let mut attrs = Vec::new();
+            if let Some(name) = dbg_name {
+                attrs.push(format!("dbgName = \"{name}\""));
+            }
+            if let Some(v) = version {
+                attrs.push(format!(
+                    "version = #vectorchain<{} {}>",
                     kind.version_mnemonic(),
                     v.spelling()
-                ),
-                None => String::new(),
+                ));
+            }
+            let attrs = if attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" {{{}}}", attrs.join(", "))
             };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.{} {}{version} : {}, {}",
+                "{} = vectorchain.{} {}{}{attrs} : {}, {}",
                 print::val(*result),
                 kind.spelling(),
                 print::val(*input),
+                mask_bracket(*mask),
                 print::vector(*input_ty),
                 print::vector(*ty)
             );
@@ -885,12 +983,16 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
         Op::FastExp {
             result,
             input,
+            mask,
+            dbg_name,
             input_ty,
             ty,
         }
         | Op::Floor {
             result,
             input,
+            mask,
+            dbg_name,
             input_ty,
             ty,
         } => {
@@ -898,11 +1000,16 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 Op::FastExp { .. } => "fast_exp",
                 _ => "floor",
             };
+            let name = match dbg_name {
+                Some(name) => format!(" {{dbgName = \"{name}\"}}"),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.{mnemonic} {} : {}, {}",
+                "{} = vectorchain.{mnemonic} {}{}{name} : {}, {}",
                 print::val(*result),
                 print::val(*input),
+                mask_bracket(*mask),
                 print::vector(*input_ty),
                 print::vector(*ty)
             );
@@ -931,12 +1038,18 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             result,
             input,
             reduction_op,
+            dbg_name,
             input_ty,
             ty,
         } => {
+            // `dbgName` is declared first (`VectorChain.td:519`) and sorts first too.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.scan_with_gap {} {{reduction_op = #vectorchain<binary_operator {}>, \
+                "{} = vectorchain.scan_with_gap {} {{{name}reduction_op = #vectorchain<binary_operator {}>, \
                  gap = 8 : index, eval_order = #vectorchain<eval_order left_to_right>}} : {}, {}",
                 print::val(*result),
                 print::val(*input),
@@ -987,20 +1100,31 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             a,
             b,
             acc,
+            mask,
+            dbg_name,
             reduction_map,
-            operand_ty,
+            a_ty,
+            b_ty,
             ty,
         } => {
+            // ⭐ ALPHABETICAL — `dbgName` sorts ahead of `reduction_map`, which is required.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
+            // ⛔ THE ACCUMULATOR'S TYPE IS THE RESULT'S, NOT THE OPERANDS' — `type($op3)` is the
+            // third of four, and a MAC reduces, so `op1`/`op2` are wider than `op3`/`data`.
             let _ = writeln!(
                 out,
-                "{} = vectorchain.multiply_and_accumulate {}, {}, {} {{reduction_map = {}}} : {}, {}, {}, {}",
+                "{} = vectorchain.multiply_and_accumulate {}, {}, {}{} {{{name}reduction_map = {}}} : {}, {}, {}, {}",
                 print::val(*result),
                 print::val(*a),
                 print::val(*b),
                 print::val(*acc),
+                mask_bracket(*mask),
                 print::affine_map(reduction_map),
-                print::vector(*operand_ty),
-                print::vector(*operand_ty),
+                print::vector(*a_ty),
+                print::vector(*b_ty),
                 print::vector(*ty),
                 print::vector(*ty)
             );
@@ -1011,12 +1135,19 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             op2,
             mask,
             compare_op,
+            dbg_name,
             operand_ty,
             ty,
         } => {
+            // ⭐ ALPHABETICAL, `printOptionalAttrDict`'s order — `compare_op` sorts ahead of
+            // `dbgName`, which is the only one of the two that can be absent.
+            let name = match dbg_name {
+                Some(name) => format!(", dbgName = \"{name}\""),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.element_wise_compare {}, {}{} {{compare_op = #vectorchain<element_wise_compare_operator {}>}} : {}, {}, {}",
+                "{} = vectorchain.element_wise_compare {}, {}{} {{compare_op = #vectorchain<element_wise_compare_operator {}>{name}}} : {}, {}, {}",
                 print::val(*result),
                 print::val(*op1),
                 print::val(*op2),
@@ -1032,14 +1163,21 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             cond,
             lhs,
             rhs,
+            dbg_name,
             mask,
             ty,
         } => {
+            // `attr-dict` sits between the mask bracket and the types, and `dbgName` is the only
+            // attribute this op has.
+            let name = match dbg_name {
+                Some(name) => format!(" {{dbgName = \"{name}\"}}"),
+                None => String::new(),
+            };
             // ⭐ THE CONDITION'S TYPE IS THE CONDITION'S OWN — it was `cond_ty`, a field the
             // emitter filled in beside the value, which is the same two-records shape.
             let _ = writeln!(
                 out,
-                "{} = vectorchain.element_wise_selection {} ? {} : {} {} : {}, {}, {}, {}",
+                "{} = vectorchain.element_wise_selection {} ? {} : {} {}{name} : {}, {}, {}, {}",
                 print::val(*result),
                 print::val(cond.val()),
                 print::val(*lhs),
@@ -1057,13 +1195,19 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             op2,
             mask,
             binary_op,
+            dbg_name,
             op_specific_map,
             operand_ty,
             ty,
         } => {
+            // ⭐ BYTE-WISE NAME ORDER — `binary_op` ahead of `dbgName` ahead of `op_specific_map`.
+            let name = match dbg_name {
+                Some(name) => format!(", dbgName = \"{name}\""),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.binary {}, {}{} {{binary_op = #vectorchain<binary_operator {}>, op_specific_map = {}}} : {}, {}, {}",
+                "{} = vectorchain.binary {}, {}{} {{binary_op = #vectorchain<binary_operator {}>{name}, op_specific_map = {}}} : {}, {}, {}",
                 print::val(*result),
                 print::val(*op1),
                 print::val(*op2),
@@ -1081,6 +1225,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             op2,
             mask,
             indices,
+            dbg_name,
             repetition,
             sign_extend,
             operand_ty,
@@ -1105,9 +1250,14 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 .map(|index| format!("{index} : i32"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // `dbgName` sorts ahead of all three.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.pack {}, {}{} {{indices = [{indices}], repetition = {repetition} : index, sign_extend = {sign_extend}}} : {}, {}, {}",
+                "{} = vectorchain.pack {}, {}{} {{{name}indices = [{indices}], repetition = {repetition} : index, sign_extend = {sign_extend}}} : {}, {}, {}",
                 print::val(*result),
                 print::val(*op1),
                 print::val(*op2),
@@ -1160,15 +1310,29 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             ty,
             is_symbol,
         } => {
-            let values = value
-                .iter()
-                .map(|bits| format!("{bits:#x}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let symbol = if *is_symbol { "is_symbol, " } else { "" };
+            // ⛔ TWO FORMS, PICKED BY `is_symbol` (`VectorChain.cpp:80-101`): the custom one prints
+            // the values as hex with no type suffix, the generic attribute dictionary prints them
+            // decimal with one — and puts `is_symbol` first, because a `DictionaryAttr` is sorted by
+            // name. Not a cosmetic difference: `0x2a` and `42 : i64` are different attributes to the
+            // parser on the far side.
+            let attrs = if *is_symbol {
+                let values = value
+                    .iter()
+                    .map(|v| format!("{v} : i64"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{is_symbol = true, value = [{values}]}}")
+            } else {
+                let values = value
+                    .iter()
+                    .map(|bits| format!("{bits:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{value = [{values}]}}")
+            };
             let _ = writeln!(
                 out,
-                "{} = vectorchain.constant_bitstream {{{symbol}value = [{values}]}} : {}",
+                "{} = vectorchain.constant_bitstream {attrs} : {}",
                 print::val(*result),
                 print::vector(*ty)
             );
@@ -1179,6 +1343,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             variable,
             pad,
             mask,
+            dbg_name,
             indices,
             repetition,
             input_ty,
@@ -1189,52 +1354,60 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 .map(|index| format!("{index} : i32"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            // ⛔ `, variable(..)` IS WRITTEN ONLY WHEN THE SEGMENT IS NON-EMPTY, and one `index`
-            // joins the type list per entry — `if (numVariable > 0)` in both halves of
-            // `ShuffleOp::print` (`VectorChain.cpp:365-372, 388-390`).
-            let vars = if variable.is_empty() {
+            // `if (numVariable > 0) p << ", variable(" .. ")"` (`VectorChain.cpp:365-372`) — the
+            // group is absent, not empty, when there is none.
+            let variables = if variable.is_empty() {
                 String::new()
             } else {
-                format!(
-                    ", variable({})",
-                    variable
-                        .iter()
-                        .map(|val| print::val(*val))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                let vals = variable
+                    .iter()
+                    .map(|scalar| print::val(scalar.val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", variable({vals})")
             };
-            // ⛔ SAME RULE FOR `pad`, AND IT PRINTS AFTER `variable` — `if (numPad > 0)` between the
-            // two segments in both halves of `ShuffleOp::print` (`VectorChain.cpp:373-382, 391-393`).
+            // `if (numPad > 0) p << ", pad(" .. ")"` (`VectorChain.cpp:373-379`) — same rule.
             let pads = if pad.is_empty() {
                 String::new()
             } else {
-                format!(
-                    ", pad({})",
-                    pad.iter()
-                        .map(|val| print::val(*val))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                let vals = pad
+                    .iter()
+                    .map(|scalar| print::val(scalar.val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", pad({vals})")
             };
-            // ⛔ AND THE MASK IS LAST, WITH ITS OWN TYPE — `if (numMask > 0)` at `:391` and `:394`.
+            // ⛔ AND THE MASK IS LAST OF THE OPERANDS — `if (numMask > 0) p << ", mask(" << .. << ")"`
+            // (`VectorChain.cpp:381-382`), after both scalar groups.
             let mask_operand = match mask {
                 Some(mask) => format!(", mask({})", print::val(mask.val())),
                 None => String::new(),
             };
-            // ⭐ EVERY VARIABLE AND EVERY PAD IS AN `index` in the authority's own cases
-            // (`splat_const_bit.mlir:87`, `VectorChain.td:449-455`); the mask carries its width.
-            let var_tys = ", index".repeat(variable.len() + pad.len());
-            let mask_ty = match mask {
-                Some(mask) => format!(", {}", print::vector(mask.ty())),
+            // ⭐ ALPHABETICAL, WHICH IS `printOptionalAttrDict`'s ORDER (`:385`) — `dbgName` sorts
+            // ahead of `indices` and `repetition`, and it is the only one that can be absent.
+            let name = match dbg_name {
+                Some(name) => format!("dbgName = \"{name}\", "),
                 None => String::new(),
             };
+            // `p << " : " << input; for (variable) p << ", " << type; p << ", " << result`
+            // (`:387-395`) — one type per operand, in operand order, result last.
+            //
+            // ⛔ ONE TYPE PER SCALAR, READ OFF THAT SCALAR. `$variable` and `$pad` are
+            // `Variadic<AnyTypeOf<[Index, AnyInteger, AnyFloat]>>` (`VectorChain.td:459-460`), so a
+            // fixed `index` per entry is wrong for any shuffle whose scalars are not indices.
+            let mut types = print::vector(*input_ty);
+            for scalar in variable.iter().chain(pad) {
+                let _ = write!(types, ", {}", scalar.ty.spelling());
+            }
+            // The mask's type joins the list in the same operand position (`:393-394`).
+            if let Some(mask) = mask {
+                let _ = write!(types, ", {}", print::vector(mask.ty()));
+            }
             let _ = writeln!(
                 out,
-                "{} = vectorchain.shuffle input({}){vars}{pads}{mask_operand} {{indices = [{indices}], repetition = {repetition} : i32}} : {}{var_tys}{mask_ty}, {}",
+                "{} = vectorchain.shuffle input({}){variables}{pads}{mask_operand} {{{name}indices = [{indices}], repetition = {repetition} : i32}} : {types}, {}",
                 print::val(*result),
                 print::val(*input),
-                print::vector(*input_ty),
                 print::vector(*ty)
             );
         }
@@ -1333,6 +1506,56 @@ mod tests {
     use crate::islands::dataflow_ir::dialects::vectorchain::{Op, emit};
     use crate::islands::dataflow_ir::ty::{ElemType, Vector};
 
+    /// ⭐⭐ A BITSTREAM'S TWO PRINTED FORMS, AND `is_symbol` IS WHAT PICKS BETWEEN THEM.
+    ///
+    /// `ConstantBitstreamOp::print` reads the attribute FIRST and takes the hand-rolled hex form only
+    /// when it is absent or false; when it is true the op prints its generic attribute dictionary
+    /// instead (`VectorChain.cpp:80-101`). So the same values print as `0x2a` in one case and
+    /// `42 : i64` in the other, with `is_symbol` ahead of `value` because a `DictionaryAttr` is sorted
+    /// by name.
+    ///
+    /// ⛔ A SHAPE ASSERTION PASSES ON BOTH. "It names the op and carries the value" holds for
+    /// `{value = [0x2a]}` and `{is_symbol = true, value = [42 : i64]}` alike, and the far side parses
+    /// exactly one of them for a given op — which is why this is checked as bytes.
+    #[test]
+    fn a_symbolic_bitstream_prints_its_attribute_dictionary() {
+        let f16x64 = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+
+        let mut literal = String::new();
+        emit(
+            &mut literal,
+            &Op::ConstantBitstream {
+                result: Val(3),
+                value: vec![42, 1],
+                ty: f16x64,
+                is_symbol: false,
+            },
+        );
+        assert_eq!(
+            literal,
+            "%3 = vectorchain.constant_bitstream {value = [0x2a, 0x1]} : vector<64xf16>\n"
+        );
+
+        let mut symbolic = String::new();
+        emit(
+            &mut symbolic,
+            &Op::ConstantBitstream {
+                result: Val(3),
+                value: vec![42, 1],
+                ty: f16x64,
+                is_symbol: true,
+            },
+        );
+        assert_eq!(
+            symbolic,
+            "%3 = vectorchain.constant_bitstream {is_symbol = true, value = [42 : i64, 1 : i64]} : \
+             vector<64xf16>\n"
+        );
+    }
+
     /// ⭐⭐ IBM'S OWN PACK LINE, REPRODUCED BYTE FOR BYTE.
     ///
     /// `dcc/test/Conversion/VectorChainToSentientPESFP/fpuop.mlir:217` — the whole
@@ -1355,6 +1578,7 @@ mod tests {
         emit(
             &mut out,
             &Op::Pack {
+                dbg_name: None,
                 result: Val(29),
                 op1: Val(24),
                 op2: Val(27),

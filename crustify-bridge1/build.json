@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Bridge-1 campaign build manifest. The campaign ports C++ into an EXISTING Rust crate",
+    "(crates/compiler/deeptools); there is no C build to configure, no shim to compile and no FFI",
+    "boundary, so `configure` is a no-op and the C-side gates in the translator playbook do not apply.",
+    "",
+    "⛔ TRANSLATOR GATE — run EXACTLY these two, from the repo root, ONCE PER BATCH:",
+    "     cargo check -p deeptools",
+    "     cargo test  -p deeptools",
+    "   Both are seconds-to-a-minute: `deeptools` has one path dependency (sys-arch-spec) and no",
+    "   registry deps. DO NOT run the workspace-wide or acceptance build in an agent worktree — its",
+    "   target/ is ~6 GB and this host has under 75 GB free with a second campaign running; the",
+    "   orchestrator owns that gate and runs it once per landed sub-campaign.",
+    "",
+    "⛔ THE CRATE'S OWN ACCEPTANCE IS BOTH MODELS, BOTH OR NEITHER",
+    "   (crates/compiler/deeptools/CLAUDE.md):",
+    "     cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel",
+    "     cargo build -Fsuperdsc,model/granite-3.1-8b-instruct,quant/fp8-dynamic-per-channel",
+    "   8b is hd=128/4096/12800 vs 2b's 64/2048/8192 — a different door arm and tile geometry, so 2b",
+    "   passing HIDES defects 8b finds. Neither links on this Mac: `superdsc` on the CLI turns on",
+    "   scratchy-serving-worker/sendnn -> flex-rs, whose build.rs cc-compiles a senlib shim against",
+    "   /opt/ibm/spyre/senlib/include — Spyre-host-only headers. The `pipeline` command below is the",
+    "   largest runnable prefix that still expands #[forward] and therefore still runs this bridge",
+    "   over every staged program."
+  ],
+  "version": 1,
+  "build_commands": {
+    "configure": "true",
+    "build": "cargo check -p deeptools",
+    "test": "cargo test -p deeptools",
+    "pipeline": "cargo build -p scratchy-models --features superdsc,granite-3.1-2b-instruct,scratchy-quantizations/fp8-dynamic-per-channel",
+    "acceptance_on_a_spyre_host": "cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel && cargo build -Fsuperdsc,model/granite-3.1-8b-instruct,quant/fp8-dynamic-per-channel"
+  },
+  "_comment_cpp": [
+    "There is a C++ translation unit in the campaign (cpp/bridge1.cpp) but nothing builds it. It is",
+    "an INDEX: which function, in what order, and where its original lives.",
+    "",
+    "✅ ITS BODIES ARE VERIFIED VERBATIM AND UNTRUNCATED — 110 of 110, by tools/verify_extract.py,",
+    "which re-derives every function's end from the authority with its OWN brace matcher and compares",
+    "LENGTHS and CONTENT. It never re-slices with the extractor's own (file, line, length): that",
+    "tautology is what let bridge 2 report 'verbatim, 12 sampled, none differed' over a corpus where",
+    "366 of 384 bodies were truncated. Two negative controls confirm the check bites.",
+    "",
+    "⚠ cpp/prelude.inc does NOT make the unit compile, and no gate requires it to. These bodies do",
+    "heavy member access on opaque reference types (mlir::Value, OpBuilder, dsc2::*), which no",
+    "behaviour-free stand-in can satisfy without the real headers — bridge 2 stopped at ~500",
+    "name-resolution errors for the same reason. prelude.inc catalogues the 116 qualified scopes and",
+    "217 external calls the bodies reach, so the unit is self-describing."
+  ]
+}

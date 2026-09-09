@@ -378,6 +378,38 @@ pub struct CompositeIndirectTransfer {
     pub body: Vec<super::Op>,
 }
 
+/// WHICH ELEMENTS ONE ACCESS TOUCHES — the `load_set`/`store_set` an `agen` access carries.
+///
+/// ⛔⛔ TWO PRODUCERS ANSWER THIS QUESTION AND ONLY ONE OF THEM CAN DERIVE IT. A whole-stick access
+/// is [`access_set`] over the view's rank, which is what every access the subtile bridge emits is
+/// and why the printer computed it rather than storing it. A TRANSFER's is
+/// `constructLoadOrStoreSet`'s (`SNTransferLowering.cpp:135-222`): chunked by
+/// `unitTimeTransferChunkSize_`, strided by `unitTimeTransferChunkStride_` and repeated
+/// `unitTimeTransferNumChunks_` times — a set no view type implies. See
+/// [`crate::bridges::superdsc_to_dataflow_ir::transfer::load_or_store_set`].
+///
+/// ⭐ THE ORDER STAYS DERIVED. `load_order` is `getMultiDimIdentityMap(getLayoutMap().getNumDims())`
+/// on BOTH producers (`SNTransferLowering.cpp:1250`, and [`access_order`]), so the identity over the
+/// view's rank is the whole answer and a field for it would be a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// The set the view's own shape implies — [`access_set`] over its rank and the vector's lanes.
+    OfView,
+    /// The set its producer computed.
+    Stated(IntegerSet),
+}
+
+impl Access {
+    /// The set this access prints, resolving [`Access::OfView`] against the view and the lane count.
+    #[must_use]
+    pub fn set(&self, view_ty: &MemRef, lanes: u64) -> IntegerSet {
+        match self {
+            Access::OfView => access_set(view_ty, lanes),
+            Access::Stated(set) => set.clone(),
+        }
+    }
+}
+
 /// ONE MASK PATTERN — `(unmasked = N, masked = M)`, repeated to fill the slice it is applied to.
 ///
 /// ⛔ THE SUM MUST DIVIDE THE SLICE. *"The sum of num_unmasked_elements and num_masked elements at a
@@ -470,6 +502,9 @@ pub enum Op {
         /// ⛔ `constructLoadAndExtractScalarOp` COPIES IT onto the `sentient.load_and_extract_scalar`
         /// (`Helper.cpp:2444`, `lx_indirect_loads_stores_composite.mlir:75`).
         dbg_name: Option<String>,
+        /// `$load_set` — which elements this load touches. See [`Access`] for why it is not always
+        /// derivable from the view.
+        access: Access,
         /// The view's type. Its INNERMOST extent is the lane count.
         view_ty: MemRef,
         /// The vector's type.
@@ -611,6 +646,8 @@ pub enum Op {
         /// one for an absent one (`Agen.cpp:240-248`), which is why a rebuilt store prints
         /// `dbgName = ""` where the original printed nothing.
         dbg_name: Option<String>,
+        /// `$store_set` — which elements this store touches. See [`Access`].
+        access: Access,
         /// The view's type. Its INNERMOST extent is the lane count.
         view_ty: MemRef,
         /// The vector's type.
@@ -755,6 +792,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             indices,
             multicast_info,
             dbg_name,
+            access,
             view_ty,
             ty,
         } => {
@@ -773,7 +811,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                     .as_ref()
                     .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
                 print::affine_map(&access_order(view_ty.shape.len())),
-                print::integer_set(&access_set(view_ty, ty.len)),
+                print::integer_set(&access.set(view_ty, ty.len)),
                 print::memref(view_ty),
                 print::vector(*ty)
             );
@@ -1295,6 +1333,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             view,
             indices,
             dbg_name,
+            access,
             view_ty,
             ty,
         } => {
@@ -1309,7 +1348,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                     .as_ref()
                     .map_or(String::new(), |name| format!("dbgName = \"{name}\", ")),
                 print::affine_map(&access_order(view_ty.shape.len())),
-                print::integer_set(&access_set(view_ty, ty.len)),
+                print::integer_set(&access.set(view_ty, ty.len)),
                 print::memref(view_ty),
                 print::vector(*ty)
             );

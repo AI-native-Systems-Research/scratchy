@@ -1,0 +1,111 @@
+entry	level	loc	authority	extract_lines	rust_home	callees
+e001_checkConstraints	0	132	ddc/ddcv1.cpp:792	18-148	shape_constraints.rs	
+e002_createDataConnectMetadata	0	45	ddc/ddcv1.cpp:3283	151-195	shape_constraints.rs	
+e003_startDataflowIRGeneration	0	18	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:20	198-215	driver.rs	
+e004_stopDataflowIRGeneration	0	15	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:39	218-232	driver.rs	
+e005_areFoldedAddressesSameAcrossFoldsAndCoresForGivenCorelet	0	21	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:226	235-255	driver.rs	
+e006_getTranslatorVersion	0	15	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:22	258-272	utils.rs	
+e007_createGetLocalUnitOp	0	13	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:44	275-287	utils.rs	
+e008_setPrecisionInUnitOp	0	12	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:143	290-301	utils.rs	
+e009_constructAVectorOfIndexType	0	5	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:711	304-308	utils.rs	
+e010_emitError	0	4	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:718	311-314	utils.rs	
+e011_constructLogicalMemoryViewOp	0	22	dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp:33	317-338	construction.rs	
+e012_convertPrecisionToType	0	20	dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp:130	341-360	construction.rs	
+e013_convertTypeToString	0	19	dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp:151	363-381	construction.rs	
+e014_constructTypeFromFormat	0	91	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:278	384-474	compute.rs	
+e015_constructSingleValCustomVector	0	15	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:435	477-491	compute.rs	
+e016_mapToDicAttr	0	9	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1524	494-502	compute.rs	
+e017_getCmpIPredicate_dup	0	25	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:21	505-529	control_flow.rs	
+e018_getMLIRLoopFromSNLoopNode	0	16	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:49	532-547	control_flow.rs	
+e019_getParentLoop	0	26	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:381	550-575	control_flow.rs	
+e020_propagateBufferSwitchLoopsToRootRecursively	0	50	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:519	578-627	control_flow.rs	
+e021_resetIterArguments	0	15	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:738	630-644	control_flow.rs	
+e022_retrieveGetUnitOpInSameCore	0	35	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:32	647-681	dsc_lowering.rs	
+e023_createGetUnitOpInDifferentCore	0	18	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:73	684-701	dsc_lowering.rs	
+e024_getMLIRTypeFromDSCDataFormat	0	53	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:97	704-756	dsc_lowering.rs	
+e025_getAddressGranularityMultiplyFactor	0	17	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:156	759-775	dsc_lowering.rs	
+e026_emitError	0	5	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:175	778-782	dsc_lowering.rs	
+e027_setBuilderForDataTransfer	0	32	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:185	785-816	dsc_lowering.rs	
+e028_getMLIRLoopFromLoopNode	0	14	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:220	819-832	dsc_lowering.rs	
+e029_constructUniformizedAddress	0	47	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:236	835-881	dsc_lowering.rs	
+e030_constructUniformizedFoldedAddress	0	51	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:285	884-934	dsc_lowering.rs	
+e031_constructUniformizedFoldedDoubleBufferToggling	0	83	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:339	937-1019	dsc_lowering.rs	
+e032_constructUniformizedFoldedConstantBitStream	0	75	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:462	1022-1096	dsc_lowering.rs	
+e033_constructUnitsForUniformization	0	90	dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:47	1099-1188	sync.rs	
+e034_constructLogicalMemoryViewOp	0	32	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:94	1191-1222	transfer.rs	
+e035_constructTimeOrder	0	12	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:206	1225-1236	transfer.rs	
+e036_constructTimeAddressMap	0	29	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:224	1239-1267	transfer.rs	
+e037_getImmediateParentWithMatchingDim	0	33	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:670	1270-1302	transfer.rs	
+e038_areEpiloguesInTransferSizes	0	12	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1491	1305-1316	transfer.rs	
+e039_construct2B16BLoadShuffle	0	86	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1778	1319-1404	transfer.rs	
+e040_construct2B16BStoreShuffle	0	87	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1865	1407-1493	transfer.rs	
+e041_getStickSizes	0	41	dsc/dsc2.cpp:4066	1496-1536	shape_constraints.rs	
+e042_terminate	1	3	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:221	1544-1546	driver.rs	emitError
+e043_areFoldsNeeded	1	40	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:249	1549-1588	driver.rs	areFoldedAddressesSameAcrossFoldsAndCoresForGivenCorelet
+e044_createGetUnitOp	1	24	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:64	1591-1614	utils.rs	constructAVectorOfIndexType
+e045_getReductionMapForMACOperation	1	40	dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp:61	1617-1656	construction.rs	
+e046_getStaticContinuousMaskValue	1	24	dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp:105	1659-1682	construction.rs	
+e047_getStaticContinuousMaskValue	1	23	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:33	1685-1707	compute.rs	emitError
+e048_constructDynamicMasking	1	43	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:60	1710-1752	compute.rs	getMLIRLoopFromLoopNode
+e049_getTypeBasedOnComputeType	1	12	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:108	1755-1766	compute.rs	constructTypeFromFormat
+e050_getReductionMapForMACOperation	1	70	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:126	1769-1838	compute.rs	emitError
+e051_getSelectionMapForMACOperandFromL0	1	74	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:200	1841-1914	compute.rs	emitError
+e052_constructPrecisionConversionOperation	1	59	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:375	1917-1975	compute.rs	constructTypeFromFormat
+e053_constructOpaqueOperation	1	25	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1534	1978-2002	compute.rs	mapToDicAttr
+e054_constructConditionalOperation	1	211	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:66	2005-2215	control_flow.rs	emitError,getCmpIPredicate_dup,getMLIRLoopFromSNLoopNode
+e055_constructConditionalsForSAMV	1	91	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:284	2218-2308	control_flow.rs	getMLIRLoopFromSNLoopNode
+e056_getBufferingOrStreamingMode	1	54	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:408	2311-2364	control_flow.rs	getAddressGranularityMultiplyFactor,getMLIRTypeFromDSCDataFormat
+e057_propagateBufferSwitchLoopsToRoot	1	15	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:575	2367-2381	control_flow.rs	propagateBufferSwitchLoopsToRootRecursively
+e058_constructLoopForADim	1	101	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:754	2384-2484	control_flow.rs	getParentLoop,resetIterArguments
+e059_constructUniformizedFoldedDestinationCore	1	36	dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:425	2487-2522	dsc_lowering.rs	createGetUnitOpInDifferentCore
+e060_constructStickMaskOperation	1	58	dsc-based-utils/DSC2ToDataflowIR/V3/SNStickMaskLowering.cpp:21	2525-2582	stick_mask.rs	getMLIRTypeFromDSCDataFormat
+e061_constructUnits	1	25	dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:20	2585-2609	sync.rs	retrieveGetUnitOpInSameCore
+e062_constructImplicitSyncOperation	1	66	dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:138	2612-2677	sync.rs	getMLIRTypeFromDSCDataFormat
+e063_getLabeledDsType	1	21	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:28	2680-2700	transfer.rs	getMLIRTypeFromDSCDataFormat
+e064_getBufferingOrStreamingMode	1	39	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:50	2703-2741	transfer.rs	
+e065_constructBaseAddress	1	73	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:132	2744-2816	transfer.rs	getMLIRLoopFromLoopNode
+e066_constructTimeSet	1	47	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:260	2819-2865	transfer.rs	getMLIRLoopFromLoopNode
+e067_constructLoadOrStoreSet	1	90	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:314	2868-2957	transfer.rs	emitError
+e068_constructImplicitLoopsForContiguousTransfer	1	137	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:707	2960-3096	transfer.rs	getImmediateParentWithMatchingDim
+e069_areEpiloguesInLoops	1	24	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1464	3099-3122	transfer.rs	getMLIRLoopFromLoopNode
+e070_GenerateConstantBitStreamAndShuffle	1	41	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2475	3125-3165	transfer.rs	constructTypeFromFormat,constructUniformizedFoldedConstantBitStream
+e071_getCumulativeStickSizes	1	17	dsc/dsc2.cpp:4108	3168-3184	shape_constraints.rs	getStickSizes
+e072_createUniformizedGetUnitOp	2	42	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:95	3192-3233	utils.rs	createGetUnitOp
+e073_buildNeighborUnits	2	213	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:161	3236-3448	utils.rs	createGetLocalUnitOp,createGetUnitOp
+e074_getBlockingOrStreamingBufferLoopLocations	2	46	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:467	3451-3496	control_flow.rs	emitError,getBufferingOrStreamingMode
+e075_constructLoopIterArgs	2	91	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:595	3499-3589	control_flow.rs	constructUniformizedFoldedAddress,emitError,getBufferingOrStreamingMode
+e076_constructSyncOperation	2	69	dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:205	3592-3660	sync.rs	constructImplicitSyncOperation,constructUnits,constructUnitsForUniformization
+e077_constructElementsOfAgenDataTransfer	2	68	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:412	3663-3730	transfer.rs	constructBaseAddress,constructLoadOrStoreSet,constructLogicalMemoryViewOp,retrieveGetUnitOpInSameCore
+e078_constructElementsOfAgenCompositeDataTransfer	2	94	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:488	3733-3826	transfer.rs	constructBaseAddress,constructLoadOrStoreSet,constructLogicalMemoryViewOp,constructTimeAddressMap,constructTimeSet,retrieveGetUnitOpInSameCore
+e079_constructElementsOfAffineDataTransferViaAgenTransfer	2	77	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:590	3829-3905	transfer.rs	constructBaseAddress,constructLoadOrStoreSet,constructLogicalMemoryViewOp,retrieveGetUnitOpInSameCore
+e080_constructStreamingOrDoubleBufferingLoad	2	347	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:851	3908-4254	transfer.rs	construct2B16BLoadShuffle,constructBaseAddress,constructLoadOrStoreSet,constructLogicalMemoryViewOp,constructPrecisionConversionOperation,constructTimeAddressMap,constructTimeSet,constructUniformizedAddress,constructUniformizedFoldedDoubleBufferToggling,emitError,getAddressGranularityMultiplyFactor,retrieveGetUnitOpInSameCore
+e081_GenerateReceiveAndSendFromDataTransferNode	2	66	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1395	4257-4322	transfer.rs	constructImplicitLoopsForContiguousTransfer,emitError
+e082_ConstructSAMVOperation	2	96	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1957	4325-4420	transfer.rs	constructConditionalsForSAMV,emitError
+e083_buildUniformizedNeighborUnits	3	239	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:380	4428-4666	utils.rs	createGetLocalUnitOp,createUniformizedGetUnitOp
+e084_initializeUnit	3	33	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:624	4669-4701	utils.rs	buildNeighborUnits
+e085_initializeUnit	3	22	dsc-based-utils/DSC2ToDataflowIR/DataflowIRConstructionUtils.hpp:171	4704-4725	construction.rs	
+e086_constructComputeInputOperandAndAddToList	3	320	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:456	4728-5047	compute.rs	constructElementsOfAffineDataTransferViaAgenTransfer,constructPrecisionConversionOperation,constructSingleValCustomVector,constructUniformizedFoldedAddress,constructUniformizedFoldedDestinationCore,createGetUnitOpInDifferentCore,getAddressGranularityMultiplyFactor,getMLIRLoopFromLoopNode,getSelectionMapForMACOperandFromL0,retrieveGetUnitOpInSameCore
+e087_constructComputeOutputOperand	3	139	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:777	5050-5188	compute.rs	constructElementsOfAffineDataTransferViaAgenTransfer,constructPrecisionConversionOperation,constructUniformizedFoldedAddress,constructUniformizedFoldedDestinationCore,createGetUnitOpInDifferentCore,getAddressGranularityMultiplyFactor,retrieveGetUnitOpInSameCore
+e088_constructLoopsRecursive	3	324	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:862	5191-5514	control_flow.rs	constructConditionalOperation,constructLoopForADim,constructLoopIterArgs,emitError,getMLIRLoopFromLoopNode,resetIterArguments
+e089_constructStreamingOrDoubleBufferingStore	3	185	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1205	5517-5701	transfer.rs	constructElementsOfAgenDataTransfer,constructTimeAddressMap,constructTimeSet,constructUniformizedAddress,constructUniformizedFoldedDoubleBufferToggling,emitError,getAddressGranularityMultiplyFactor,retrieveGetUnitOpInSameCore
+e090_GenerateLoadAndSendFromDataTransferNode	3	274	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2058	5704-5977	transfer.rs	GenerateConstantBitStreamAndShuffle,areEpiloguesInLoops,areEpiloguesInTransferSizes,construct2B16BLoadShuffle,constructElementsOfAgenCompositeDataTransfer,constructElementsOfAgenDataTransfer,constructImplicitLoopsForContiguousTransfer,constructPrecisionConversionOperation,constructStreamingOrDoubleBufferingLoad,constructUniformizedFoldedAddress,emitError,getAddressGranularityMultiplyFactor,getBufferingOrStreamingMode
+e091_GenerateLoadAndStoreFromDataTransferNode	3	132	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2337	5980-6111	transfer.rs	GenerateConstantBitStreamAndShuffle,constructElementsOfAgenDataTransfer,constructImplicitLoopsForContiguousTransfer,constructUniformizedFoldedAddress,emitError,getAddressGranularityMultiplyFactor
+e092_GenerateDataTransfersForViaIfSo	3	52	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2617	6114-6165	transfer.rs	GenerateReceiveAndSendFromDataTransferNode,emitError,retrieveGetUnitOpInSameCore
+e093_initializeUniformizedUnit	4	47	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIRUtils.hpp:663	6173-6219	utils.rs	buildUniformizedNeighborUnits,constructAVectorOfIndexType
+e094_constructComputeOutputOperands	4	14	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:921	6222-6235	compute.rs	constructComputeOutputOperand
+e095_constructFMINorFMAXOperation	4	86	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1189	6238-6323	compute.rs	constructComputeInputOperandAndAddToList,constructComputeOutputOperand,emitError,getStaticContinuousMaskValue,getTypeBasedOnComputeType
+e096_constructLoops	4	27	dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:1191	6326-6352	control_flow.rs	constructLoopsRecursive,getBlockingOrStreamingBufferLoopLocations,propagateBufferSwitchLoopsToRoot
+e097_GenerateReceiveAndStoreFromDataTransferNode	4	269	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1508	6355-6623	transfer.rs	GenerateConstantBitStreamAndShuffle,areEpiloguesInLoops,areEpiloguesInTransferSizes,construct2B16BStoreShuffle,constructElementsOfAgenCompositeDataTransfer,constructElementsOfAgenDataTransfer,constructImplicitLoopsForContiguousTransfer,constructPrecisionConversionOperation,constructStreamingOrDoubleBufferingStore,constructUniformizedFoldedAddress,emitError,getAddressGranularityMultiplyFactor,getBufferingOrStreamingMode
+e098_GenerateDataTranferForSrc	4	34	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2522	6626-6659	transfer.rs	GenerateLoadAndSendFromDataTransferNode,GenerateLoadAndStoreFromDataTransferNode,emitError,retrieveGetUnitOpInSameCore
+e099_constructMACOperation	5	87	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:942	6667-6753	compute.rs	constructComputeInputOperandAndAddToList,constructComputeOutputOperands,constructDynamicMasking,constructTypeFromFormat,emitError,getReductionMapForMACOperation,getStaticContinuousMaskValue
+e100_constructBinaryOrTernaryOperation	5	152	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1036	6756-6907	compute.rs	constructComputeInputOperandAndAddToList,constructComputeOutputOperands,emitError,getStaticContinuousMaskValue,getTypeBasedOnComputeType
+e101_constructUnaryOperation	5	247	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1276	6910-7156	compute.rs	constructComputeInputOperandAndAddToList,constructComputeOutputOperands,emitError,getStaticContinuousMaskValue,getTypeBasedOnComputeType
+e102_GenerateDataTranferForDst	5	47	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2563	7159-7205	transfer.rs	GenerateReceiveAndStoreFromDataTransferNode,emitError,retrieveGetUnitOpInSameCore
+e103_constructComputeOperation	6	83	dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1567	7213-7295	compute.rs	constructBinaryOrTernaryOperation,constructFMINorFMAXOperation,constructMACOperation,constructOpaqueOperation,constructUnaryOperation,emitError
+e104_constructDataTransfer	6	164	dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2676	7298-7461	transfer.rs	GenerateDataTranferForDst,GenerateDataTranferForSrc,GenerateDataTransfersForViaIfSo,areEpiloguesInTransferSizes,emitError,getLabeledDsType
+e105_constructOperationsRecursively	7	165	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:55	7469-7633	driver.rs	constructComputeOperation,constructDataTransfer,constructStickMaskOperation,constructSyncOperation,emitError
+e106_ConstructAProgramUnit	8	81	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:293	7641-7721	driver.rs	constructLoops,constructOperationsRecursively,emitError,initializeUniformizedUnit,initializeUnit,setPrecisionInUnitOp,terminate
+e107_ConstructAUniformizedProgramUnit	8	84	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:378	7724-7807	driver.rs	areFoldsNeeded,constructLoops,constructOperationsRecursively,emitError,initializeUniformizedUnit,setPrecisionInUnitOp,terminate
+e108_convertV3	9	29	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:466	7815-7843	driver.rs	ConstructAProgramUnit,startDataflowIRGeneration,stopDataflowIRGeneration
+e109_convertV4	9	33	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:499	7846-7878	driver.rs	ConstructAProgramUnit,ConstructAUniformizedProgramUnit,startDataflowIRGeneration,stopDataflowIRGeneration
+e110_runTranslator	10	32	dsc-based-utils/DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:534	7886-7917	driver.rs	convertV3,convertV4,getTranslatorVersion

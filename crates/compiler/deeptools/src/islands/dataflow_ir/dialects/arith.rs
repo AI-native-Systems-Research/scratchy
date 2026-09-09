@@ -20,6 +20,25 @@ pub enum LogicKind {
     Not,
 }
 
+/// WHICH WAY A NUMERIC CONVERSION GOES — `arith.sitofp` or `arith.fptosi`.
+///
+/// ⛔⛔ TWO OPS THE CAST IS NOT. `constructPrecisionConversionOperation` picks between THREE ops by
+/// the two signednesses (`SNComputeLowering.cpp:411-427`): a signed-integer source with a float
+/// result is `arith::SIToFPOp`, a float source with an integer result is `arith::FPToSIOp`, and
+/// float to float is [`super::vectorchain::Op::Cast`]. A cast reinterprets a vector's elements; these
+/// two compute new ones, so folding either into the cast changes every value on the wire.
+///
+/// ⭐ AND THE VENDOR WRITES BOTH: `%pt_result_fp = arith.sitofp %pt_result : vector<64xi16> to
+/// vector<64xf16>` (`dcc/test/PE/int8-kg3-pe.mlir:98`) and `%d1r = arith.fptosi %d1c :
+/// vector<64xf16> to vector<64xi8>` (`dcc/test/SFP/csqint8-sfp.mlir:112`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertKind {
+    /// `arith.sitofp` — a signed integer becoming a float.
+    SiToFp,
+    /// `arith.fptosi` — a float becoming a signed integer, truncated toward zero.
+    FpToSi,
+}
+
 /// WHICH INTEGER COMPARISON — `mlir::arith::CmpIPredicate`, as `arith.cmpi` spells it.
 ///
 /// ⭐ THE SPELLING IS THE ENUMERATOR'S OWN NAME, printed as a bare keyword before the operands:
@@ -269,6 +288,15 @@ pub enum Op {
         /// writing `arith.cmpi eq, %14, 0 : index` is "expected SSA operand". The bound is minted as
         /// an `arith.constant` first.
         rhs: Val,
+        /// THE TYPE OF BOTH OPERANDS — ⛔⛔ NOT ALWAYS `index`, AND THE ONE EXCEPTION IS THE
+        /// NEGATED CONDITIONAL. `arith.cmpi` prints its OPERAND type, and 785 of the 788 under the
+        /// authority tree's `dcc/test` are `index`; the three that are not compare an `i1` against an
+        /// `arith.constant false` — `%284 = arith.cmpi eq, %283, %false : i1`
+        /// (`Transform/FlatteningLocalRegions/flatten_local_region4.mlir:746`), which is exactly how
+        /// `constructConditionalOperation` negates a condition (`SNControlFlowLowering.cpp:179-183`).
+        /// A welded `index` states a type the compared value was not defined with, which is "use of
+        /// value expects different type than prior uses".
+        ty: ScalarTy,
     },
 
     /// `arith.select %cond, %true_value, %false_value : index` — ONE VALUE CHOSEN BY A PREDICATE.
@@ -337,6 +365,30 @@ pub enum Op {
         operands: Vec<Val>,
     },
 
+    /// `%r = arith.sitofp %v : vector<NxI> to vector<NxF>` — A PRECISION CONVERSION BETWEEN THE
+    /// INTEGER AND FLOAT DOMAINS.
+    ///
+    /// ⛔⛔ WITHOUT IT `constructPrecisionConversionOperation` (entry 052) COULD EMIT ONLY ITS THIRD
+    /// ARM. That function has four: integer to float, float to integer, float to float and a
+    /// failure (`SNComputeLowering.cpp:411-429`) — and this island held the float-to-float one alone,
+    /// so the two conversions the PE's own fixtures perform on every int8 matmul result had no op to
+    /// be.
+    ///
+    /// ⭐ ONE VARIANT FOR THE TWO DIRECTIONS because MLIR declares them alike — one operand, one
+    /// result, both stated in the printed type — and which it is, is [`ConvertKind`].
+    Convert {
+        /// The vector it binds.
+        result: Val,
+        /// Which direction.
+        kind: ConvertKind,
+        /// What is converted.
+        input: Val,
+        /// The input's type — ⛔ PRINTED, NOT INFERRED: MLIR spells both types, `: tin to tout`.
+        input_ty: Vector,
+        /// The result's type.
+        ty: Vector,
+    },
+
     /// `arith.constant dense<V> : vector<NxT>` — an immediate operand of a compute.
     ///
     /// (E) NOT A SPLAT OP. `constructComputeInputOperandAndAddToList`
@@ -401,14 +453,16 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
             predicate,
             lhs,
             rhs,
+            ty,
         } => {
             let _ = writeln!(
                 out,
-                "{} = arith.cmpi {}, {}, {} : index",
+                "{} = arith.cmpi {}, {}, {} : {}",
                 print::val(*result),
                 predicate.spelling(),
                 print::val(*lhs),
-                print::val(*rhs)
+                print::val(*rhs),
+                ty.spelling()
             );
         }
         Op::Select {
@@ -457,6 +511,28 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 print::vals(operands)
             );
         }
+        Op::Convert {
+            result,
+            kind,
+            input,
+            input_ty,
+            ty,
+        } => {
+            let mnemonic = match kind {
+                ConvertKind::SiToFp => "arith.sitofp",
+                ConvertKind::FpToSi => "arith.fptosi",
+            };
+            // ⛔ `to`, NOT A COMMA. `vectorchain.cast` prints `: tin, tout`; MLIR's own conversion
+            // ops print `: tin to tout` (`dcc/test/PE/int8-kg3-pe.mlir:98`).
+            let _ = writeln!(
+                out,
+                "{} = {mnemonic} {} : {} to {}",
+                print::val(*result),
+                print::val(*input),
+                print::vector(*input_ty),
+                print::vector(*ty)
+            );
+        }
         Op::DenseConstant { result, splat, ty } => {
             // MLIR prints a float splat in scientific form, which is what the vendored IR shows:
             // `arith.constant dense<0.000000e+00> : vector<64xf16>`.
@@ -467,6 +543,7 @@ pub(crate) fn emit(out: &mut String, op: &Op) {
                 | ElemType::Bf16
                 | ElemType::F8E4M3Fn
                 | ElemType::F8E8M0Fnu
+                | ElemType::F8E5M2
                 | ElemType::F4E2M1Fn
                 | ElemType::F8E5M2
                 | ElemType::MxFloat(_) => float_splat(*splat),

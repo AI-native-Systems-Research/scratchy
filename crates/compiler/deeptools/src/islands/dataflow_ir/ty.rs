@@ -137,6 +137,13 @@ pub enum ElemType {
     F8E4M3Fn,
     /// `f8E8M0FNU`.
     F8E8M0Fnu,
+    /// `f8E5M2`.
+    ///
+    /// ⛔ ADDED FOR BRIDGE 1: `convertPrecisionToType` builds a `Float8E5M2Type` and
+    /// `convertTypeToString` compares against one (`DataflowIRConstructionUtils.hpp:138`, `:159`).
+    /// Without it those two functions could not state their own input, and folding it into
+    /// [`ElemType::F8E4M3Fn`] would name a different exponent split at the same width.
+    F8E5M2,
     /// `f4E2M1FN`.
     F4E2M1Fn,
     /// `dataflow.mxfloat<N>` — the MX element of a scaled tensor.
