@@ -79,11 +79,6 @@
 //! | `e616_updateConstantMutableAddr` | 616 | 6 | 21 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2088` |
 
 
-// crustify:todo: e277_updateVariableOffsetCalculation
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2065  (21 body lines, level 1)
-//   original  : void ConditionalConstDataTransferUpdater::updateVariableOffsetCalculation( const EvaluatedValue &new_immut_addr_ev)
-//   calls     : e009_createOffsetValue
-
 // crustify:todo: e615_updateImmutableAddr
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2043  (20 body lines, level 6)
 //   original  : const EvaluatedValue & ConditionalConstDataTransferUpdater::updateImmutableAddr()
@@ -94,3 +89,407 @@
 //   original  : void ConditionalConstDataTransferUpdater::updateConstantMutableAddr( const EvaluatedValue &new_immut_addr_ev)
 //   calls     : e011_getOffset, e012_getOffset, e013_getOffset, e265_getConditionalConstantDescriptor, e266_getConditionalConstantDescriptor, e277_updateVariableOffsetCalculation, e400_getMax, e404_getMax, e406_getMax, e410_getMax, e413_getMax, e418_getOffset, e548_getMax, e588_getMax …
 
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, regions_mut, sentient};
+use crate::transform::sentient::address_pinning_and_toggle::ConditionalConstDataTransferUpdater;
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator, OffsetSites};
+use crate::transform::sentient::utils::{ConstKind, is_constant};
+
+/// ONE `applyToAllYields` CALLBACK INVOCATION, RECORDED RATHER THAN APPLIED — `(terminator, index)`
+/// named by VALUE and never by position.
+///
+/// ⛔⛔ AN INSERTION INDEX WOULD GO STALE: `createOffsetValue` mints ops between the decision and the
+/// write, which is exactly how e170 lost its position. A `sentient.if`'s result at the walked index is
+/// unique to one (op, index) pair, so reopening the yield after a build cannot land elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YieldSite {
+    /// `if_op->getResult(index)` — the identity of the `sentient.if` whose yield this is.
+    result: Val,
+    /// Which region of that `if`: 0 is `then_body`, 1 is `else_body`.
+    region: usize,
+    /// `result_index` — where in the yield the operand sits.
+    index: usize,
+    /// The constant currently yielded there.
+    operand: Val,
+}
+
+impl ConditionalConstDataTransferUpdater {
+    /// Replaces: e277_updateVariableOffsetCalculation
+    ///
+    /// REBASES EVERY REACHABLE YIELDED CONSTANT of the conditional on the pinned immutable address:
+    /// each yield operand becomes a fresh offset value holding `operand - new_immut_addr_ev`
+    /// (`:2081-2085`).
+    ///
+    /// ⛔ IT REWRITES THE IR — decide over the whole `if` first, then build and set one site at a
+    /// time, because every build appends ops to the blocks being rewritten.
+    /// ⭐ `createOffsetValue` (e009) IS `EvaluatedValue::buildOffsetValue` PLUS TWO BUILDER
+    /// POSITIONS, which the campaign names droppable and which `sites`/`walked` carry instead.
+    pub fn update_variable_offset_calculation<E: ExpressionEvaluator>(
+        self,
+        new_immut_addr_ev: EvaluatedValue,
+        ty: ScalarTy,
+        evaluator: &mut E,
+        sites: &mut OffsetSites<'_>,
+        walked: &mut Vec<Op>,
+    ) {
+        // `DT_CHECK(if_op_)` and `DT_CHECK(res_index_ >= 0)` (`:2069-2070`) are
+        // [`super::ConditionalConstResult`]'s own existence — there is no absent case to check.
+        let index = self.if_result.index.0;
+        let mut yield_sites = Vec::new();
+        {
+            let regions: [&[Op]; 1] = [walked.as_slice()];
+            let defs = Definitions::from_innermost(&regions);
+            constant_yield_sites(self.if_result.val, index, defs, &mut yield_sites);
+        }
+
+        for site in yield_sites {
+            let operand_ev = evaluator.evaluate_value_handle(site.operand);
+            // `new_const = const_op.getValue() - new_immut_addr_ev` (`:2079-2080`).
+            let new_const = evaluator.evaluate_sub_handle(operand_ev, new_immut_addr_ev);
+            let new_operand = evaluator.build_offset_value_of(new_const, sites, walked, ty);
+            // `terminator->setOperand(index, ..)` (`:2081-2082`).
+            let Some(operands) = yield_operands_of(walked, &site) else {
+                todo!(
+                    "updateVariableOffsetCalculation: the yield of region {} of the sentient.if \
+                     binding {:?} is gone after building its offset value (:2081-2082)",
+                    site.region,
+                    site.result
+                )
+            };
+            let Some(slot) = operands.get_mut(site.index) else {
+                todo!(
+                    "updateVariableOffsetCalculation: yield operand {} is out of range after \
+                     building its offset value (:2081-2082)",
+                    site.index
+                )
+            };
+            *slot = new_operand;
+        }
+    }
+}
+
+/// `dcc::utils::applyToAllYields<sentient::IfOp>` (`dcc/src/Utils/Utils.cpp:164-179`) with the
+/// callback's `(terminator, index)` RECORDED: per region of the `sentient.if` binding `result`, the
+/// yield operand at `index`, descending through a nested `sentient.if` bound at that position.
+///
+/// ⭐ AN EMPTY `else_body` IS NO ELSE REGION, which is the reference's `getNumRegions()` answering 1.
+fn constant_yield_sites(
+    result: Val,
+    index: usize,
+    defs: Definitions<'_>,
+    out: &mut Vec<YieldSite>,
+) {
+    let Some(Op::Sentient(sentient::Op::If {
+        then_body,
+        else_body,
+        ..
+    })) = defs.of(result)
+    else {
+        return;
+    };
+    for (region, body) in [then_body.as_slice(), else_body.as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        if body.is_empty() {
+            continue;
+        }
+        let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last() else {
+            continue;
+        };
+        let Some(&operand) = results.get(index) else {
+            continue;
+        };
+        // `!isa<BlockArgument>(yield_operand) && isa<IfOpTy>(yield_operand.getDefiningOp())` — the
+        // nested case recurses at `getIndexOfOperationResults(yield_operand)`.
+        let nested = match defs.of(operand) {
+            Some(Op::Sentient(sentient::Op::If { yielded, .. })) => {
+                yielded.iter().position(|entry| entry.result == operand)
+            }
+            _ => None,
+        };
+        match nested {
+            Some(nested_index) => constant_yield_sites(operand, nested_index, defs, out),
+            None => {
+                // `DT_CHECK(isConstant<ConstantOp>(terminator->getOperand(index)) && "Expect
+                // constant yield operands")` (`:2074-2077`).
+                if !is_constant(operand, ConstKind::ScalarConstant, defs) {
+                    todo!(
+                        "updateVariableOffsetCalculation: DT_CHECK(isConstant(..) && \"Expect \
+                         constant yield operands\") — {operand:?} is yielded by region {region} \
+                         of the sentient.if binding {result:?} (:2074-2077)"
+                    )
+                }
+                out.push(YieldSite {
+                    result,
+                    region,
+                    index,
+                    operand,
+                });
+            }
+        }
+    }
+}
+
+/// The `sentient.yield` operand list `site` names, for a rewrite — the `terminator` the reference's
+/// callback calls `setOperand` on, reopened by value after the offset value was built.
+fn yield_operands_of<'a>(block: &'a mut Vec<Op>, site: &YieldSite) -> Option<&'a mut Vec<Val>> {
+    for op in block.iter_mut() {
+        let regions: Vec<&mut Vec<Op>> = match op {
+            Op::Sentient(sentient::Op::If {
+                yielded,
+                then_body,
+                else_body,
+                ..
+            }) => {
+                if yielded
+                    .get(site.index)
+                    .is_some_and(|entry| entry.result == site.result)
+                {
+                    let body = if site.region == 0 {
+                        then_body
+                    } else {
+                        else_body
+                    };
+                    let Some(Op::Sentient(sentient::Op::Yield { results })) = body.last_mut()
+                    else {
+                        return None;
+                    };
+                    return Some(results);
+                }
+                vec![then_body, else_body]
+            }
+            _ => regions_mut(op),
+        };
+        for region in regions {
+            if let Some(found) = yield_operands_of(region, site) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::sentient::dialects::sentient::{CmpPredicate, Reg, RegType, Yielded};
+    use crate::transform::sentient::address_pinning_and_toggle::{
+        ConditionalConstResult, YieldedIndex,
+    };
+    use crate::transform::sentient::analyses::Evaluation;
+
+    /// The handle flavour with its answers stated as INTEGERS, plus a `buildOffsetValue` that mints a
+    /// `sentient.scalar_constant` into `sites.consts` — so the rebase is observable as both a value
+    /// and an op.
+    #[derive(Default)]
+    struct StatedEvaluator {
+        held: Vec<i64>,
+        constants: Vec<(Val, i64)>,
+        built: Vec<(Val, i64)>,
+    }
+
+    impl StatedEvaluator {
+        fn intern(&mut self, value: i64) -> EvaluatedValue {
+            let index = self
+                .held
+                .iter()
+                .position(|held| *held == value)
+                .unwrap_or_else(|| {
+                    self.held.push(value);
+                    self.held.len() - 1
+                });
+            EvaluatedValue(u32::try_from(index).unwrap_or_default())
+        }
+
+        fn value(&self, ev: EvaluatedValue) -> i64 {
+            self.held
+                .get(usize::try_from(ev.0).unwrap_or_default())
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e277 asks for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e277 never sums")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e277 builds from a stored handle, not from an evaluation")
+        }
+
+        fn build_offset_value_of(
+            &mut self,
+            immutable: EvaluatedValue,
+            sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            ty: ScalarTy,
+        ) -> Val {
+            let value = self.value(immutable);
+            let result = sites.values.mint();
+            self.built.push((result, value));
+            sites
+                .consts
+                .push(Op::Sentient(sentient::Op::ScalarConstant {
+                    value,
+                    result,
+                    reg_locale: RegType::Imm,
+                    ty,
+                    is_symbol: false,
+                }));
+            result
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            let held = self
+                .constants
+                .iter()
+                .find(|(val, _)| *val == value)
+                .map(|(_, held)| *held);
+            match held {
+                Some(held) => self.intern(held),
+                None => todo!("the fixture states no constant for {value:?}"),
+            }
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            self.intern(value)
+        }
+
+        fn evaluate_sub_handle(
+            &mut self,
+            lhs: EvaluatedValue,
+            rhs: EvaluatedValue,
+        ) -> EvaluatedValue {
+            let difference = self.value(lhs) - self.value(rhs);
+            self.intern(difference)
+        }
+    }
+
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn if_op(result: Val, then_body: Vec<Op>, else_body: Vec<Op>) -> Op {
+        Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Eq,
+            lhs: Val(120),
+            rhs: Val(121),
+            yielded: vec![Yielded {
+                result,
+                reg: Reg {
+                    locale: RegType::Lbr,
+                    index: None,
+                },
+            }],
+            dbg_name: None,
+            then_body,
+            else_body,
+        })
+    }
+
+    fn yield_of(result: Val) -> Op {
+        Op::Sentient(sentient::Op::Yield {
+            results: vec![result],
+        })
+    }
+
+    /// The reference's own shape (`e016`'s fixture): the `else` of the outer `if` yields a NESTED
+    /// `if`'s result, so a faithful walk rebases THREE yields and a shallow one would rebase two.
+    fn nested_conditional() -> Vec<Op> {
+        vec![
+            constant(4096, Val(101)),
+            constant(8192, Val(102)),
+            constant(8192, Val(103)),
+            if_op(
+                Val(110),
+                vec![yield_of(Val(101))],
+                vec![
+                    if_op(Val(111), vec![yield_of(Val(102))], vec![yield_of(Val(103))]),
+                    yield_of(Val(111)),
+                ],
+            ),
+        ]
+    }
+
+    /// Each of the three reachable yields now names a fresh constant holding `yielded - pinned`, and
+    /// the outer `else` still yields the nested `if`'s result.
+    #[test]
+    fn e277_rebases_every_reachable_yielded_constant_on_the_pinned_address() {
+        let mut walked = nested_conditional();
+        let mut consts = Vec::new();
+        let mut values = Values::default();
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(101), 4096), (Val(102), 8192), (Val(103), 8192)],
+            built: Vec::new(),
+        };
+        let pinned = evaluator.constant(4096);
+        let updater = ConditionalConstDataTransferUpdater {
+            if_result: ConditionalConstResult {
+                index: YieldedIndex(0),
+                val: Val(110),
+            },
+        };
+        {
+            let mut sites = OffsetSites {
+                consts: &mut consts,
+                query_maps: None,
+                values: &mut values,
+            };
+            updater.update_variable_offset_calculation(
+                pinned,
+                ScalarTy::Index,
+                &mut evaluator,
+                &mut sites,
+                &mut walked,
+            );
+        }
+
+        // `4096 - 4096`, then `8192 - 4096` twice — one built constant per reachable yield.
+        let built: Vec<i64> = evaluator.built.iter().map(|(_, value)| *value).collect();
+        assert_eq!(built, vec![0, 4096, 4096]);
+        assert_eq!(consts.len(), 3);
+        let rebased: Vec<Val> = evaluator.built.iter().map(|(val, _)| *val).collect();
+
+        let Op::Sentient(sentient::Op::If {
+            then_body: outer_then,
+            else_body: outer_else,
+            ..
+        }) = &walked[3]
+        else {
+            panic!("the fixture's fourth op is the outer sentient.if")
+        };
+        assert_eq!(outer_then.last(), Some(&yield_of(rebased[0])));
+        // ⭐ THE OUTER `else` IS UNTOUCHED: its operand is the nested `if`'s result, not a constant.
+        assert_eq!(outer_else.last(), Some(&yield_of(Val(111))));
+        let Some(Op::Sentient(sentient::Op::If {
+            then_body: inner_then,
+            else_body: inner_else,
+            ..
+        })) = outer_else.first()
+        else {
+            panic!("the outer else region opens with the nested sentient.if")
+        };
+        assert_eq!(inner_then.last(), Some(&yield_of(rebased[1])));
+        assert_eq!(inner_else.last(), Some(&yield_of(rebased[2])));
+    }
+}

@@ -78,11 +78,6 @@
 //! | `e281_DiscreteIntegerSetDescriptor` | 281 | 1 | 45 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2901` |
 //! | `e426_dump` | 426 | 2 | 13 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2954` |
 
-// crustify:todo: e281_DiscreteIntegerSetDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2901  (45 body lines, level 1)
-//   original  : DiscreteIntegerSetDescriptor::DiscreteIntegerSetDescriptor( ExpressionEvaluator &evaluator, Value base_addr) : DynamicPatternDescriptorBase(PatternKind::kDiscreteIntegerSet, evaluator), outer_loop_(nullptr), iter_arg_index_(-1), init_(nullptr), total_positive_delta_(nullptr), total_negative_delta_(n
-//   calls     : e001_invalidate, e003_invalidate, e004_invalidate, e005_invalidate, e017_getOutermostConstInitialization
-
 // crustify:todo: e426_dump
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2954  (13 body lines, level 2)
 //   original  : void DiscreteIntegerSetDescriptor::dump() const
@@ -112,6 +107,9 @@ pub struct DiscreteIntegerSetDescriptor {
     pub total_positive_delta: Option<EvaluatedValue>,
     /// `total_negative_delta_` — the same sum over its negative strides.
     pub total_negative_delta: Option<EvaluatedValue>,
+    /// `can_be_simplified_`, the base class's own field (`AddressPinningAndToggle.cpp:159`) — true
+    /// when BOTH delta totals are zero, so the set is really one address.
+    pub can_be_simplified: bool,
 }
 
 /// WHAT THE WALK ANSWERS — the reference's
@@ -132,6 +130,65 @@ pub struct OutermostConstInitAndDeltas {
 }
 
 impl DiscreteIntegerSetDescriptor {
+    /// Replaces: e281_DiscreteIntegerSetDescriptor
+    ///
+    /// Matches `base_addr` as the iter arg of a loop nest whose outermost initialisation is constant,
+    /// recording that loop, its index, the initial value and both delta totals (`:2901-2951`).
+    ///
+    /// ⛔ IT `invalidate()`s ON THE INDEX FAILURE (`:2933`) where its `IntegerSequenceDescriptor`
+    /// twin (e280) returns untouched — the two constructors differ exactly there.
+    /// ⭐ THE DELTAS COME FROM ITS OWN MEMBER WALK (e017), never from `dcc::utils`'.
+    #[must_use]
+    pub fn new(
+        base_addr: Val,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> DiscreteIntegerSetDescriptor {
+        // `dyn_cast<BlockArgument>(base_addr)` (`:2909`) and `dyn_cast<ForOp>(getParentOp())`
+        // (`:2916`) are one lookup — `sentient.for` is the only op of this island that binds a
+        // region argument at all.
+        if defs.for_arg_of(base_addr).is_none() {
+            return DiscreteIntegerSetDescriptor::default();
+        }
+
+        let found = DiscreteIntegerSetDescriptor::outermost_const_initialization(
+            base_addr, defs, evaluator,
+        );
+        let mut desc = match found {
+            None => DiscreteIntegerSetDescriptor::default(),
+            Some(found) => DiscreteIntegerSetDescriptor {
+                outer_loop: Some(found.outer_loop),
+                iter_arg_index: found.iter_arg_index,
+                init: None,
+                total_positive_delta: Some(found.total_positive_delta),
+                total_negative_delta: Some(found.total_negative_delta),
+                can_be_simplified: false,
+            },
+        };
+
+        // `if (!outer_loop_ || iter_arg_index_ < 0) { invalidate(); return; }` (`:2929-2936`).
+        let (Some(outer_loop), Some(iter_arg_index)) = (desc.outer_loop, desc.iter_arg_index)
+        else {
+            desc.invalidate();
+            return desc;
+        };
+        // `Value curr_init = outer_loop_.getIterOperands()[iter_arg_index_]` (`:2938`).
+        let Some(curr_init) = super::iter_operand_of(outer_loop, iter_arg_index, defs) else {
+            desc.invalidate();
+            return desc;
+        };
+        if !is_constant(curr_init, ConstKind::ScalarConstant, defs) {
+            desc.invalidate();
+            return desc;
+        }
+        desc.init = Some(evaluator.evaluate_value_handle(curr_init));
+
+        let zero = evaluator.constant(0);
+        desc.can_be_simplified =
+            desc.total_positive_delta == Some(zero) && desc.total_negative_delta == Some(zero);
+        desc
+    }
+
     /// Replaces: e017_getOutermostConstInitialization
     ///
     /// Walks the iter-arg initialisation chain inner to outer, accumulating each loop's
@@ -247,7 +304,7 @@ impl DiscreteIntegerSetDescriptor {
 /// as `(its result, its second operand)`. `None` covers both the reference's `nullptr` and the
 /// `DT_CHECK_MSG(idx < ..getNumOperands(), "index is outside operand range")` a loop whose yield is
 /// short of its carried list would trip.
-fn iter_arg_incrementer(
+pub(super) fn iter_arg_incrementer(
     carried: &[sentient::Carried],
     body: &[Op],
     index: usize,
@@ -272,7 +329,7 @@ fn iter_arg_incrementer(
 /// `dcc::utils::getNumUsersExcept` (`dcc/src/Utils/Utils.cpp:384-390`) — uses of `val` in `scope`
 /// and its nested regions whose owner `filter_out` rejects, counted ONCE PER USE as `getUsers()`
 /// iterates uses rather than distinct ops.
-fn num_users_except(val: Val, scope: &[Op], filter_out: &impl Fn(&Op) -> bool) -> usize {
+pub(super) fn num_users_except(val: Val, scope: &[Op], filter_out: &impl Fn(&Op) -> bool) -> usize {
     scope
         .iter()
         .map(|op| {
@@ -538,5 +595,32 @@ mod unit_tests {
             &mut OutOfScopeEvaluator::default(),
         );
         assert_eq!(found, None);
+    }
+
+    /// The reference's own example (`:437-452`) end to end: the walk's deltas are kept, the outer
+    /// loop's constant init becomes `init_`, and a set that moves both ways is no single address.
+    #[test]
+    fn e281_keeps_the_walks_deltas_and_the_outer_loops_constant_init() {
+        let body = chained_nest(Val(1));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(3), 0), (Val(4), 3), (Val(5), -4)],
+        };
+        let desc = DiscreteIntegerSetDescriptor::new(Val(21), defs, &mut evaluator);
+        assert!(desc.is_valid());
+        assert_eq!(desc.outer_loop, Some(ForRef(Val(10))));
+        assert_eq!(desc.iter_arg_index, Some(IterArgIndex(0)));
+        assert_eq!(desc.init.map(|init| evaluator.value(init)), Some(0));
+        assert_eq!(
+            desc.total_positive_delta.map(|ev| evaluator.value(ev)),
+            Some(12)
+        );
+        assert_eq!(
+            desc.total_negative_delta.map(|ev| evaluator.value(ev)),
+            Some(-8)
+        );
+        assert!(!desc.can_be_simplified);
     }
 }

@@ -78,11 +78,6 @@
 //! | `e282_LoopingChainMutableAddrDescriptor` | 282 | 1 | 27 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3081` |
 //! | `e427_dump` | 427 | 2 | 12 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3121` |
 
-// crustify:todo: e282_LoopingChainMutableAddrDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3081  (27 body lines, level 1)
-//   original  : LoopingChainMutableAddrDescriptor::LoopingChainMutableAddrDescriptor( ExpressionEvaluator &evaluator, Value base_addr, Operation &op, int mutable_addr_result_idx) : DynamicPatternDescriptorBase(PatternKind::kLoopingChainMutableAddr, evaluator), is_head_of_chain_(false), op_(op), mutable_addr_result_
-//   calls     : e001_invalidate, e003_invalidate, e004_invalidate, e005_invalidate, e018_getOutermostConstInitAndLoopingChainIncrement
-
 // crustify:todo: e427_dump
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3121  (12 body lines, level 2)
 //   original  : void LoopingChainMutableAddrDescriptor::dump() const
@@ -116,6 +111,9 @@ pub struct LoopingChainMutableAddrDescriptor {
     pub init: Option<EvaluatedValue>,
     /// `increment_` — the chain's total increment.
     pub increment: Option<EvaluatedValue>,
+    /// `can_be_simplified_`, the base class's own field (`AddressPinningAndToggle.cpp:159`) — true
+    /// when the chain is one transfer long or never moves, so it is really one address.
+    pub can_be_simplified: bool,
 }
 
 /// WHICH END OF A TRANSFER A DESCRIPTOR IS ABOUT — `int mutable_addr_result_idx_` (`:613`), which
@@ -147,6 +145,72 @@ pub struct OutermostConstInitAndChainIncrement {
 }
 
 impl LoopingChainMutableAddrDescriptor {
+    /// Replaces: e282_LoopingChainMutableAddrDescriptor
+    ///
+    /// Matches `base_addr` as the head of a looping chain of transfers, recording the outermost loop,
+    /// its index, the chain's unrolled size, its initial value and its total increment (`:3081-3118`).
+    ///
+    /// ⛔ A NON-BLOCK-ARGUMENT `base_addr` IS AN ABORT HERE, not a quiet default (`:3096`) — this is
+    /// the one descriptor whose constructor asserts rather than returning unmatched.
+    /// ⭐ `op_` AND `mutable_addr_result_idx_` BECOME THE `end` ARGUMENT: the index is the only one of
+    /// the two the walk reads, and `op_` is read by `e427_dump` alone.
+    #[must_use]
+    pub fn new(
+        base_addr: Val,
+        end: TransferEnd,
+        scope: &[Op],
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> LoopingChainMutableAddrDescriptor {
+        // `DT_CHECK_MSG(iter_arg, "Expected block argument forming the looping chain\n")` (`:3096`).
+        if defs.for_arg_of(base_addr).is_none() {
+            todo!(
+                "LoopingChainMutableAddrDescriptor: DT_CHECK_MSG(iter_arg, \"Expected block \
+                 argument forming the looping chain\") — {base_addr:?} is no loop region argument \
+                 (:3096)"
+            )
+        }
+
+        let found =
+            LoopingChainMutableAddrDescriptor::outermost_const_init_and_looping_chain_increment(
+                base_addr, end, scope, defs, evaluator,
+            );
+        let mut desc = match found {
+            None => LoopingChainMutableAddrDescriptor::default(),
+            Some(found) => LoopingChainMutableAddrDescriptor {
+                is_head_of_chain: false,
+                outer_loop: Some(found.outer_loop),
+                iter_arg_index: found.iter_arg_index,
+                size: found.size,
+                init: None,
+                increment: Some(found.increment),
+                can_be_simplified: false,
+            },
+        };
+
+        // `if (!outer_loop_ || iter_arg_index_ < 0) { invalidate(); return; }` (`:3100-3106`).
+        let (Some(outer_loop), Some(iter_arg_index)) = (desc.outer_loop, desc.iter_arg_index)
+        else {
+            desc.invalidate();
+            return desc;
+        };
+        // `Value curr_init = outer_loop_.getIterOperands()[iter_arg_index_]` (`:3107`).
+        let Some(curr_init) = super::iter_operand_of(outer_loop, iter_arg_index, defs) else {
+            desc.invalidate();
+            return desc;
+        };
+        if !is_constant(curr_init, ConstKind::ScalarConstant, defs) {
+            desc.invalidate();
+            return desc;
+        }
+        desc.init = Some(evaluator.evaluate_value_handle(curr_init));
+        desc.is_head_of_chain = true;
+
+        let zero = evaluator.constant(0);
+        desc.can_be_simplified = desc.size == ChainSize(1) || desc.increment == Some(zero);
+        desc
+    }
+
     /// Replaces: e018_getOutermostConstInitAndLoopingChainIncrement
     ///
     /// Walks the iter-arg chain inner to outer, taking each level's stride from either a
@@ -672,5 +736,33 @@ mod unit_tests {
                 &mut evaluator,
             );
         assert_eq!(found, None);
+    }
+
+    /// The chain resolves end to end: `is_head_of_chain_` goes true only once the outer loop's init
+    /// proved constant, and a twelve-transfer chain that moves by 46 is no single address.
+    #[test]
+    fn e282_marks_the_head_of_chain_once_the_outer_loops_init_is_constant() {
+        let body = looping_chain(Val(2));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(3), 0), (Val(4), 5)],
+        };
+        let desc = LoopingChainMutableAddrDescriptor::new(
+            Val(21),
+            TransferEnd::Src,
+            &body,
+            defs,
+            &mut evaluator,
+        );
+        assert!(desc.is_valid());
+        assert!(desc.is_head_of_chain);
+        assert_eq!(desc.outer_loop, Some(ForRef(Val(10))));
+        assert_eq!(desc.iter_arg_index, Some(IterArgIndex(0)));
+        assert_eq!(desc.size, ChainSize(12));
+        assert_eq!(desc.init.map(|init| evaluator.value(init)), Some(0));
+        assert_eq!(desc.increment.map(|ev| evaluator.value(ev)), Some(46));
+        assert!(!desc.can_be_simplified);
     }
 }

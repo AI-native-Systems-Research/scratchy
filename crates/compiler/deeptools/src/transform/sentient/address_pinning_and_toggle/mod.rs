@@ -175,6 +175,7 @@ use crate::islands::sentient::dialects::{
     self, Definitions, Op, UniformRegions, Val, dataflow, sentient, uniform,
 };
 use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::{ForRef, IterArgIndex};
 use crate::units::DfirUnit;
 
 pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
@@ -330,6 +331,29 @@ impl DataTransferDescriptorContainer {
             }
         }
     }
+}
+
+/// `outer_loop_.getIterOperands()[iter_arg_index_]` — the initial value of ONE of a loop's carried
+/// addresses, the three pattern constructors' (e280, e281, e282) shared first read of the loop their
+/// walk resolved.
+///
+/// ⭐ REACHED THROUGH THE DEFINITIONS AND NOT A SCOPE SLICE: a [`ForRef`] names its loop by the
+/// induction variable, which is block-argument position 0 of that loop's own body
+/// ([`crate::islands::sentient::dialects::parent_for_arg`]), so the name alone finds the loop.
+/// ⛔ `None` IS THE REFERENCE'S OUT-OF-RANGE READ, which is undefined there and which an index that
+/// walk produced cannot reach; each caller treats it as the pattern not matching.
+fn iter_operand_of(
+    outer_loop: ForRef,
+    iter_arg_index: IterArgIndex,
+    defs: Definitions<'_>,
+) -> Option<Val> {
+    let (for_op, _) = defs.for_arg_of(outer_loop.0)?;
+    let Op::Sentient(sentient::Op::For { carried, .. }) = for_op else {
+        return None;
+    };
+    carried
+        .get(iter_arg_index.0 as usize)
+        .map(|entry| entry.init)
 }
 
 /// Replaces: e009_createOffsetValue
@@ -1375,6 +1399,7 @@ mod unit_tests {
             init: Some(EvaluatedValue(4)),
             stride: Some(EvaluatedValue(8)),
             size: SequenceSize::Terms(6),
+            can_be_simplified: false,
         };
         desc.invalidate();
         assert_eq!(desc, IntegerSequenceDescriptor::default());
@@ -1391,6 +1416,7 @@ mod unit_tests {
             init: Some(EvaluatedValue(4)),
             total_positive_delta: Some(EvaluatedValue(64)),
             total_negative_delta: Some(EvaluatedValue(32)),
+            can_be_simplified: false,
         };
         desc.invalidate();
         assert_eq!(desc, DiscreteIntegerSetDescriptor::default());
@@ -1406,6 +1432,7 @@ mod unit_tests {
             size: ChainSize(3),
             init: Some(EvaluatedValue(4)),
             increment: Some(EvaluatedValue(8)),
+            can_be_simplified: false,
         };
         desc.invalidate();
         assert!(!desc.is_head_of_chain);
@@ -1563,6 +1590,7 @@ mod unit_tests {
             init: Some(EvaluatedValue(4)),
             stride: Some(EvaluatedValue(8)),
             size: SequenceSize::Terms(3),
+            can_be_simplified: false,
         };
         let mut dtd = with_pattern(PatternDescriptor::IntegerSequence(isq));
         assert_eq!(dtd.integer_sequence_descriptor(), &isq);
@@ -1582,6 +1610,7 @@ mod unit_tests {
             init: Some(EvaluatedValue(4)),
             total_positive_delta: Some(EvaluatedValue(24)),
             total_negative_delta: Some(EvaluatedValue(0)),
+            can_be_simplified: false,
         };
         let mut dtd = with_pattern(PatternDescriptor::DiscreteIntegerSet(dis));
         assert_eq!(dtd.discrete_integer_set_descriptor(), &dis);
@@ -1599,6 +1628,7 @@ mod unit_tests {
             size: ChainSize(3),
             init: Some(EvaluatedValue(4)),
             increment: Some(EvaluatedValue(8)),
+            can_be_simplified: false,
         };
         let mut dtd = with_pattern(PatternDescriptor::LoopingChainMutableAddr(lcma));
         assert_eq!(dtd.looping_chain_mutable_addr_descriptor(), &lcma);
@@ -1695,6 +1725,7 @@ mod unit_tests {
             init: Some(EvaluatedValue(4)),
             stride: Some(EvaluatedValue(8)),
             size: SequenceSize::Terms(6),
+            can_be_simplified: false,
         };
         assert!(transfer(Some(PatternDescriptor::IntegerSequence(seq)), 1).is_integer_sequence());
         for size in [SequenceSize::Symbolic, SequenceSize::Cleared] {
@@ -1717,6 +1748,7 @@ mod unit_tests {
             init: Some(EvaluatedValue(4)),
             total_positive_delta: Some(EvaluatedValue(64)),
             total_negative_delta: Some(EvaluatedValue(32)),
+            can_be_simplified: false,
         };
         assert!(
             transfer(Some(PatternDescriptor::DiscreteIntegerSet(deltas)), 1)
@@ -1749,6 +1781,7 @@ mod unit_tests {
             size: ChainSize(3),
             init: Some(EvaluatedValue(4)),
             increment: Some(EvaluatedValue(8)),
+            can_be_simplified: false,
         };
         let chain = |desc| transfer(Some(PatternDescriptor::LoopingChainMutableAddr(desc)), 1);
         assert!(chain(head).is_looping_chain_mutable_addr());

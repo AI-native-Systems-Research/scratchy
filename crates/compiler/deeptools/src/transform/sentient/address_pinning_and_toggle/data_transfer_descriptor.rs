@@ -79,16 +79,6 @@
 //! | `e492_dump` | 492 | 3 | 28 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2521` |
 //! | `e593_initializeDescriptor` | 593 | 5 | 161 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2316` |
 
-// crustify:todo: e278_isValid
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2478  (23 body lines, level 1)
-//   original  : bool DataTransferDescriptor::isValid() const
-//   calls     : e252_size, e279_canBeSimplified
-
-// crustify:todo: e279_canBeSimplified
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2502  (18 body lines, level 1)
-//   original  : bool DataTransferDescriptor::canBeSimplified() const
-//   calls     : e252_size, e258_isToggle, e259_isConditionalConstant, e260_isIntegerSequence, e261_isDiscreteIntegerSet, e262_isLoopingChainMutableAddr, e263_getToggleDescriptor, e264_getToggleDescriptor, e265_getConditionalConstantDescriptor, e266_getConditionalConstantDescriptor, e267_getIntegerSequenceDescriptor, e268_getIntegerSequenceDescriptor, e269_getDiscreteIntegerSetDescriptor, e270_getDiscreteIntegerSetDescriptor …
-
 // crustify:todo: e492_dump
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2521  (28 body lines, level 3)
 //   original  : void DataTransferDescriptor::dump() const
@@ -124,4 +114,151 @@ pub struct DataTransferDescriptor {
     /// `base_addrs_` — the possible constant values `base_addr_` can take (one, or two for a
     /// toggle); the list [`super::ConditionalConstantDescriptor::get_all_constants`] appends into.
     pub base_addrs: BaseAddrList,
+}
+
+impl DataTransferDescriptor {
+    /// Replaces: e278_isValid
+    ///
+    /// Whether this transfer follows a recognised pattern: no base addresses is invalid, a matched
+    /// pattern answers for itself, and anything else needs exactly one base address (`:2478-2500`).
+    ///
+    /// ⛔ THE TOGGLE ARM IS THE ONLY ONE THAT COUNTS BASE ADDRESSES (`:2483-2486`): two of them, or
+    /// one when the toggle simplified away.
+    /// ⛔ THERE IS NO `SimpleConstant` ARM IN THE REFERENCE'S `dyn_cast` CHAIN — a simple constant
+    /// falls through to the `base_addrs.size() == 1` tail, exactly as `pattern_desc_ == nullptr` does.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.base_addrs.is_empty() {
+            return false;
+        }
+        match &self.pattern_desc {
+            Some(PatternDescriptor::Toggle(toggle)) => {
+                toggle.is_valid()
+                    && ((toggle.can_be_simplified && self.base_addrs.len() == 1)
+                        || self.base_addrs.len() == 2)
+            }
+            Some(PatternDescriptor::ConditionalConstant(cc)) => cc.is_valid(),
+            Some(PatternDescriptor::IntegerSequence(isq)) => isq.is_valid(),
+            Some(PatternDescriptor::DiscreteIntegerSet(dis)) => dis.is_valid(),
+            Some(PatternDescriptor::LoopingChainMutableAddr(lcma)) => lcma.is_valid(),
+            Some(PatternDescriptor::SimpleConstant(_)) | None => self.base_addrs.len() == 1,
+        }
+    }
+
+    /// Replaces: e279_canBeSimplified
+    ///
+    /// Whether the matched pattern collapsed to a single constant base address — the pattern's own
+    /// `can_be_simplified_`, and `false` for no pattern at all (`:2502-2519`).
+    ///
+    /// ⛔ EVERY `is*()` OPENS WITH `isValid()` (`:673-696`), so an invalid descriptor answers `false`
+    /// however its pattern's own flag stands.
+    /// ⛔ A SIMPLE CONSTANT ANSWERS `false` DESPITE ITS OWN `setCanBeSimplified(true)` (`:169`):
+    /// `isSimpleConstant()` is absent from this `else if` chain, and nothing reads that flag here.
+    #[must_use]
+    pub fn can_be_simplified(&self) -> bool {
+        let res = self.is_valid()
+            && match &self.pattern_desc {
+                Some(PatternDescriptor::Toggle(toggle)) => toggle.can_be_simplified,
+                Some(PatternDescriptor::ConditionalConstant(cc)) => cc.can_be_simplified,
+                Some(PatternDescriptor::IntegerSequence(isq)) => isq.can_be_simplified,
+                Some(PatternDescriptor::DiscreteIntegerSet(dis)) => dis.can_be_simplified,
+                Some(PatternDescriptor::LoopingChainMutableAddr(lcma)) => lcma.can_be_simplified,
+                Some(PatternDescriptor::SimpleConstant(_)) | None => false,
+            };
+        // `DT_CHECK_MSG((!res || getBaseAddrList().size() == 1), ..)` (`:2514-2518`) — an ABORT in the
+        // reference, so it stays a named stop rather than becoming a refusal.
+        if res && self.base_addrs.len() != 1 {
+            todo!(
+                "DataTransferDescriptor::canBeSimplified: DT_CHECK_MSG(!res || \
+                 getBaseAddrList().size() == 1, \"simplified pattern should have a single \
+                 base_addr stored in the descriptor\") — {} base addrs (:2514-2518)",
+                self.base_addrs.len()
+            )
+        }
+        res
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::address_pinning_and_toggle::{
+        SimpleConstantDescriptor, ToggleDescriptor,
+    };
+    use crate::transform::sentient::analyses::EvaluatedValue;
+    use crate::transform::sentient::{ForRef, IterArgIndex};
+
+    /// A toggle that matched, so only the base-address count decides.
+    fn matched_toggle(can_be_simplified: bool) -> ToggleDescriptor {
+        ToggleDescriptor {
+            outer_loop: Some(ForRef(Val(1))),
+            iter_arg_index: Some(IterArgIndex(0)),
+            c1: Some(EvaluatedValue(2)),
+            can_be_simplified,
+        }
+    }
+
+    fn descriptor(pattern: Option<PatternDescriptor>, base_addrs: u32) -> DataTransferDescriptor {
+        DataTransferDescriptor {
+            pattern_desc: pattern,
+            base_addrs: (0..base_addrs).map(EvaluatedValue).collect(),
+        }
+    }
+
+    fn simple_constant() -> PatternDescriptor {
+        PatternDescriptor::SimpleConstant(SimpleConstantDescriptor {
+            ev: EvaluatedValue(2),
+        })
+    }
+
+    /// The toggle arm's base-address count, and the `SimpleConstant` the `dyn_cast` chain skips.
+    #[test]
+    fn e278_counts_base_addrs_for_a_toggle_and_falls_through_for_a_simple_constant() {
+        let toggle = |simplified, count| {
+            descriptor(
+                Some(PatternDescriptor::Toggle(matched_toggle(simplified))),
+                count,
+            )
+            .is_valid()
+        };
+        assert!(toggle(false, 2));
+        assert!(!toggle(false, 1));
+        assert!(toggle(true, 1));
+        // ⭐ `|| base_addrs.size() == 2` IS NOT GUARDED BY THE FLAG, so a simplified toggle holding
+        // two is valid too.
+        assert!(toggle(true, 2));
+        // No `SimpleConstant` arm: it reaches the `base_addrs.size() == 1` tail, as `None` does.
+        assert!(descriptor(Some(simple_constant()), 1).is_valid());
+        assert!(!descriptor(Some(simple_constant()), 2).is_valid());
+        assert!(descriptor(None, 1).is_valid());
+        assert!(!DataTransferDescriptor::default().is_valid());
+    }
+
+    /// The pattern's own flag, gated on validity — and the simple constant whose `true` is unread.
+    #[test]
+    fn e279_reads_the_patterns_flag_and_never_the_simple_constants() {
+        assert!(
+            descriptor(Some(PatternDescriptor::Toggle(matched_toggle(true))), 1)
+                .can_be_simplified()
+        );
+        // Every `is*()` opens with `isValid()`, which an unmatched toggle fails.
+        assert!(
+            !descriptor(
+                Some(PatternDescriptor::Toggle(ToggleDescriptor::default())),
+                1
+            )
+            .can_be_simplified()
+        );
+        assert!(!descriptor(Some(simple_constant()), 1).can_be_simplified());
+    }
+
+    /// `DT_CHECK_MSG((!res || getBaseAddrList().size() == 1), ..)` is an abort, and a simplified
+    /// toggle holding two base addresses is a descriptor that reaches it.
+    #[test]
+    #[should_panic(expected = "single base_addr stored in the descriptor")]
+    fn e279_aborts_on_a_simplified_pattern_with_more_than_one_base_addr() {
+        let desc = descriptor(Some(PatternDescriptor::Toggle(matched_toggle(true))), 2);
+        let _simplified = desc.can_be_simplified();
+    }
 }

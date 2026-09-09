@@ -225,6 +225,16 @@ pub trait ExpressionEvaluator {
         )
     }
 
+    /// `ExpressionEvaluator::evaluateSub` (`Analyses/ExpressionEvaluatorUtils.h:260`) on two handles
+    /// — how a conditional-constant updater rebases each yielded constant on the new immutable
+    /// address (`AddressPinningAndToggle.cpp:2073`).
+    fn evaluate_sub_handle(&mut self, lhs: EvaluatedValue, rhs: EvaluatedValue) -> EvaluatedValue {
+        let _ = (lhs, rhs);
+        todo!(
+            "ExpressionEvaluator::evaluateSub (Analyses/ExpressionEvaluatorUtils.h:260) — out of campaign scope"
+        )
+    }
+
     /// `ExpressionEvaluator::evaluateMultiplyByConst`
     /// (`Analyses/ExpressionEvaluatorUtils.h:285`) — `ev * by`.
     fn evaluate_multiply_by_const(&mut self, ev: EvaluatedValue, by: i64) -> EvaluatedValue {

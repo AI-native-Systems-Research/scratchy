@@ -78,18 +78,15 @@
 //! | `e493_dump` | 493 | 3 | 20 | `dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2877` |
 
 
-// crustify:todo: e280_IntegerSequenceDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2799  (75 body lines, level 1)
-//   original  : IntegerSequenceDescriptor::IntegerSequenceDescriptor( ExpressionEvaluator &evaluator, Value base_addr) : DynamicPatternDescriptorBase(PatternKind::kIntegerSequence, evaluator)
-//   calls     : e001_invalidate, e003_invalidate, e004_invalidate, e005_invalidate, e017_getOutermostConstInitialization
-
 // crustify:todo: e493_dump
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:2877  (20 body lines, level 3)
 //   original  : void IntegerSequenceDescriptor::dump() const
 //   calls     : e002_getAllConstants, e252_size, e278_isValid, e279_canBeSimplified, e408_getAllConstants
 
 
-use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, sentient};
+use crate::transform::sentient::analyses::{EvaluatedValue, ExpressionEvaluator};
+use crate::transform::sentient::utils::{ChainSize, ConstKind, is_constant};
 use crate::transform::sentient::{ForRef, IterArgIndex};
 
 /// HOW MANY TERMS AN INTEGER SEQUENCE HAS — `int size_`, which is TRI-STATE in the reference.
@@ -125,4 +122,320 @@ pub struct IntegerSequenceDescriptor {
     pub stride: Option<EvaluatedValue>,
     /// `size_` — how many terms. See [`SequenceSize`].
     pub size: SequenceSize,
+    /// `can_be_simplified_`, the base class's own field (`AddressPinningAndToggle.cpp:159`) — true
+    /// when the sequence has one term or never moves, so it is really one constant.
+    pub can_be_simplified: bool,
+}
+
+impl IntegerSequenceDescriptor {
+    /// Replaces: e280_IntegerSequenceDescriptor
+    ///
+    /// Matches `base_addr` as a loop iter arg walking `init + stride * i`, recording the outermost
+    /// loop, its index, the term count, the first term and the stride (`:2799-2874`).
+    ///
+    /// ⛔ THE FIRST TWO EXITS DO NOT `invalidate()` (`:2825`, `:2833`) — the loop, index and size the
+    /// walk already assigned SURVIVE them, and only a bad init or stride clears everything.
+    /// ⛔ [`SequenceSize::Symbolic`] IS THE ONLY ROUTE TO `size_ <= 0`: a `bound <= 0` makes
+    /// `outermost_const_initialization` answer nothing at all, which is the `!outer_loop_` exit.
+    /// ⭐ THE STRIDE COMES FROM `base_addr`'s OWN LOOP, not from `outer_loop_` (`:2857-2861`).
+    #[must_use]
+    pub fn new(
+        base_addr: Val,
+        defs: Definitions<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> IntegerSequenceDescriptor {
+        // `dyn_cast<BlockArgument>(base_addr)` (`:2807`) and `iter_arg.getOwner()->getParentOp()`
+        // (`:2814`) are one lookup: a region argument of this island has a `sentient.for` parent or
+        // it is not a region argument at all. `getIndexOfLoopRegionIterArgs` is the `- 1`.
+        let Some((loop_op, arg_number)) = defs.for_arg_of(base_addr) else {
+            return IntegerSequenceDescriptor::default();
+        };
+        let Some(inner_loop_iter_arg_index) = arg_number.checked_sub(1) else {
+            return IntegerSequenceDescriptor::default();
+        };
+
+        // `std::tie(outer_loop_, iter_arg_index_, size_) = getOutermostConstInitialization(iter_arg)`
+        let found =
+            crate::transform::sentient::utils::outermost_const_initialization(base_addr, defs);
+        let mut desc = match found {
+            None => IntegerSequenceDescriptor::default(),
+            Some(found) => IntegerSequenceDescriptor {
+                outer_loop: Some(found.loop_op),
+                iter_arg_index: found.iter_arg,
+                init: None,
+                stride: None,
+                size: match found.size {
+                    ChainSize::Unknown => SequenceSize::Symbolic,
+                    ChainSize::Iterations(iterations) => {
+                        SequenceSize::Terms(u32::try_from(iterations.get()).unwrap_or(u32::MAX))
+                    }
+                },
+                can_be_simplified: false,
+            },
+        };
+
+        // `if (!outer_loop_ || iter_arg_index_ < 0) return;` (`:2825`) and `if (size_ <= 0) return;`
+        // (`:2833`) — both keep what is already assigned.
+        let (Some(outer_loop), Some(iter_arg_index)) = (desc.outer_loop, desc.iter_arg_index)
+        else {
+            return desc;
+        };
+        if !matches!(desc.size, SequenceSize::Terms(terms) if terms > 0) {
+            return desc;
+        }
+
+        // `Value curr_init = outer_loop_.getIterOperands()[iter_arg_index_]` (`:2841`) — the
+        // reference indexes unchecked, and an index that walk produced is in range by construction.
+        let Some(curr_init) = super::iter_operand_of(outer_loop, iter_arg_index, defs) else {
+            desc.invalidate();
+            return desc;
+        };
+        if !is_constant(curr_init, ConstKind::ScalarConstant, defs) {
+            desc.invalidate();
+            return desc;
+        }
+        desc.init = Some(evaluator.evaluate_value_handle(curr_init));
+
+        // `getIterArgIncrementer<ForOp, AddOp>(loop_op, inner_loop_iter_arg_index)` and the
+        // constancy of its `getOperand(1)` (`:2857-2868`).
+        let Op::Sentient(sentient::Op::For { carried, body, .. }) = loop_op else {
+            desc.invalidate();
+            return desc;
+        };
+        let incrementer = super::discrete_integer_set_descriptor::iter_arg_incrementer(
+            carried,
+            body,
+            inner_loop_iter_arg_index,
+        );
+        let Some((add_result, stride_val)) = incrementer else {
+            desc.invalidate();
+            return desc;
+        };
+        if !is_constant(stride_val, ConstKind::ScalarConstant, defs) {
+            desc.invalidate();
+            return desc;
+        }
+        let stride = evaluator.evaluate_value_handle(stride_val);
+        desc.stride = Some(stride);
+
+        // `DT_CHECK_MSG(num_non_yield_feeding_uses == 1, ..)` (`:2870-2873`) — an ABORT in the
+        // reference, so it stays a named stop rather than becoming a refusal.
+        let uses =
+            super::discrete_integer_set_descriptor::num_users_except(base_addr, body, &|op| {
+                matches!(op, Op::Sentient(sentient::Op::Yield { .. }))
+                    || crate::islands::sentient::dialects::results(op).contains(&add_result)
+            });
+        if uses != 1 {
+            todo!(
+                "IntegerSequenceDescriptor: DT_CHECK_MSG(num_non_yield_feeding_uses == 1, \
+                 \"base_addr should only be used in memory op and to feed the yield op\") — \
+                 {uses} such uses of {base_addr:?} (:2870-2873)"
+            )
+        }
+
+        let zero = evaluator.constant(0);
+        desc.can_be_simplified = desc.size == SequenceSize::Terms(1) || stride == zero;
+        desc
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
+    use crate::transform::sentient::analyses::{Evaluation, OffsetSites, OutOfScopeEvaluator};
+
+    /// The handle flavour with its answers stated as INTEGERS, so `==` on handles is `==` on values.
+    #[derive(Default)]
+    struct StatedEvaluator {
+        held: Vec<i64>,
+        constants: Vec<(Val, i64)>,
+    }
+
+    impl StatedEvaluator {
+        fn intern(&mut self, value: i64) -> EvaluatedValue {
+            let index = self
+                .held
+                .iter()
+                .position(|held| *held == value)
+                .unwrap_or_else(|| {
+                    self.held.push(value);
+                    self.held.len() - 1
+                });
+            EvaluatedValue(u32::try_from(index).unwrap_or_default())
+        }
+
+        fn value(&self, ev: EvaluatedValue) -> i64 {
+            self.held
+                .get(usize::try_from(ev.0).unwrap_or_default())
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("e280 asks for handles, never for a decoded evaluation")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("e280 never sums")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("e280 builds no value")
+        }
+
+        fn evaluate_value_handle(&mut self, value: Val) -> EvaluatedValue {
+            let held = self
+                .constants
+                .iter()
+                .find(|(val, _)| *val == value)
+                .map(|(_, held)| *held);
+            match held {
+                Some(held) => self.intern(held),
+                None => todo!("the fixture states no constant for {value:?}"),
+            }
+        }
+
+        fn constant(&mut self, value: i64) -> EvaluatedValue {
+            self.intern(value)
+        }
+    }
+
+    fn constant(value: i64, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: Some(Reg {
+                locale: RegType::Lar,
+                index: None,
+            }),
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    fn load_and_store(src_mutable_addr: Val) -> Op {
+        Op::Sentient(sentient::Op::LoadAndStore {
+            src: Val(90),
+            dst: Val(91),
+            src_mutable_addr,
+            src_immutable_addr: Val(92),
+            src_inc: Val(93),
+            dst_mutable_addr: Val(94),
+            dst_immutable_addr: Val(95),
+            dst_inc: Val(93),
+            multicast_info: None,
+            results: (Val(96), Val(97)),
+            extent: Extent::of(Elements(8), Bits(16)),
+            stride: 1,
+            rotate_val: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            src_reg: Reg {
+                locale: RegType::Lar,
+                index: None,
+            },
+            dst_reg: Reg {
+                locale: RegType::Lbr,
+                index: None,
+            },
+            dir: None,
+            is_ibr_write: false,
+            dbg_name: None,
+        })
+    }
+
+    /// The reference's own example (`:345-352`): `%arg1` starts at a constant `0` and one loop of
+    /// `bound` iterations adds `+3` each time, the transfer being `%arg1`'s only other use.
+    fn sequence(bound: Val) -> Vec<Op> {
+        vec![
+            constant(0, Val(1)),
+            constant(5, Val(2)),
+            constant(3, Val(3)),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(10),
+                bound,
+                carried: vec![Carried {
+                    init: Val(1),
+                    arg: Val(11),
+                    result: Val(12),
+                    reg: Reg {
+                        locale: RegType::Lar,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: vec![
+                    load_and_store(Val(11)),
+                    add(Val(11), Val(3), Val(13)),
+                    Op::Sentient(sentient::Op::Yield {
+                        results: vec![Val(13)],
+                    }),
+                ],
+            }),
+        ]
+    }
+
+    /// Five terms from `0` by `+3`: neither one term nor a zero stride, so it is a real sequence.
+    #[test]
+    fn e280_records_the_loop_the_size_the_first_term_and_the_stride() {
+        let body = sequence(Val(2));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut evaluator = StatedEvaluator {
+            held: Vec::new(),
+            constants: vec![(Val(1), 0), (Val(3), 3)],
+        };
+        let desc = IntegerSequenceDescriptor::new(Val(11), defs, &mut evaluator);
+        assert!(desc.is_valid());
+        assert_eq!(desc.outer_loop, Some(ForRef(Val(10))));
+        assert_eq!(desc.iter_arg_index, Some(IterArgIndex(0)));
+        assert_eq!(desc.size, SequenceSize::Terms(5));
+        assert_eq!(desc.init.map(|init| evaluator.value(init)), Some(0));
+        assert_eq!(desc.stride.map(|stride| evaluator.value(stride)), Some(3));
+        assert!(!desc.can_be_simplified);
+    }
+
+    /// A non-constant bound makes the size unknown, and the reference RETURNS THERE WITHOUT
+    /// `invalidate()` — the loop and index it already assigned survive, `init` and `stride` do not,
+    /// and [`OutOfScopeEvaluator`] proves the analysis was never asked.
+    #[test]
+    fn e280_keeps_the_loop_and_index_when_the_size_is_symbolic() {
+        let body = sequence(Val(99));
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let desc =
+            IntegerSequenceDescriptor::new(Val(11), defs, &mut OutOfScopeEvaluator::default());
+        assert!(!desc.is_valid());
+        assert_eq!(desc.outer_loop, Some(ForRef(Val(10))));
+        assert_eq!(desc.iter_arg_index, Some(IterArgIndex(0)));
+        assert_eq!(desc.size, SequenceSize::Symbolic);
+        assert_eq!(desc.init, None);
+        assert_eq!(desc.stride, None);
+    }
 }
