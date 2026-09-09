@@ -146,6 +146,44 @@ impl DataFormat {
             Self::Senint2 | Self::Senuint2 => 2,
         })
     }
+
+    /// THE FORMAT A `data_type=` SPELLING NAMES — `FromString<DataFormats>`
+    /// (`util/sendefs/sendefs.h:251-297`), all twenty-one spellings it answers.
+    ///
+    /// ⛔⛔ AN UNKNOWN SPELLING IS `None`, WHERE THE VENDOR ANSWERS `INVALID` — and that difference
+    /// is deliberate, because `INVALID` is what makes `DatatypeOp::verify` accept a typo: the width
+    /// table answers `-1` for it (`sendefs.cpp:131`), so the "can not find this type" arm is
+    /// unreachable and `-1 > bit_width` is false — see `DatatypeOp::verify` (`DdlOps.cpp:149`).
+    ///
+    /// ⛔ EXACT, NOT CASE-INSENSITIVE: the vendor compares `s == "SEN169_FP16"` and nothing folds
+    /// case on the way in, so `"sen169_fp16"` is `INVALID` there and `None` here.
+    #[must_use]
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        Some(match spelling {
+            "SEN169_FP16" => Self::Sen169Fp16,
+            "IEEE_FP32" => Self::IeeeFp32,
+            "SEN143_FP8" => Self::Sen143Fp8,
+            "SEN152_FP8" => Self::Sen152Fp8,
+            "SEN153_FP9" => Self::Sen153Fp9,
+            "SENINT2" => Self::Senint2,
+            "SENINT4" => Self::Senint4,
+            "SENINT8" => Self::Senint8,
+            "SENINT16" => Self::Senint16,
+            "SENINT24" => Self::Senint24,
+            "IEEE_INT64" => Self::IeeeInt64,
+            "IEEE_INT32" => Self::IeeeInt32,
+            "SENUINT32" => Self::Senuint32,
+            "SENUINT2" => Self::Senuint2,
+            "IEEE_FP16" => Self::IeeeFp16,
+            "BOOL" => Self::Bool,
+            "BFLOAT16" => Self::Bfloat16,
+            "SEN18F_FP24" => Self::Sen18fFp24,
+            "SEN080_FP8" => Self::Sen080Fp8,
+            "SEN053_FP8" => Self::Sen053Fp8,
+            "SEN121_FP4" => Self::Sen121Fp4,
+            _ => return None,
+        })
+    }
 }
 
 impl From<DataType> for DataFormat {
@@ -252,5 +290,45 @@ mod tests {
     fn the_vendor_has_formats_the_census_does_not() {
         assert_eq!(DataFormat::IeeeFp16.bits(), Bits(16));
         assert_eq!(DataFormat::Sen152Fp8.bits(), Bits(8));
+    }
+    /// ⭐ EVERY SPELLING `FromString<DataFormats>` ANSWERS, AND ONE IT DOES NOT.
+    ///
+    /// ⛔ CARRIED AS THE SPELLING-TO-VARIANT PAIR, not as a count: a `from_spelling` that mapped
+    /// two spellings to one variant would still answer 21 spellings.
+    #[test]
+    fn every_vendor_spelling_names_its_own_format() {
+        for (spelling, want) in [
+            ("SEN169_FP16", DataFormat::Sen169Fp16),
+            ("IEEE_FP32", DataFormat::IeeeFp32),
+            ("SEN143_FP8", DataFormat::Sen143Fp8),
+            ("SEN152_FP8", DataFormat::Sen152Fp8),
+            ("SEN153_FP9", DataFormat::Sen153Fp9),
+            ("SENINT2", DataFormat::Senint2),
+            ("SENINT4", DataFormat::Senint4),
+            ("SENINT8", DataFormat::Senint8),
+            ("SENINT16", DataFormat::Senint16),
+            ("SENINT24", DataFormat::Senint24),
+            ("IEEE_INT64", DataFormat::IeeeInt64),
+            ("IEEE_INT32", DataFormat::IeeeInt32),
+            ("SENUINT32", DataFormat::Senuint32),
+            ("SENUINT2", DataFormat::Senuint2),
+            ("IEEE_FP16", DataFormat::IeeeFp16),
+            ("BOOL", DataFormat::Bool),
+            ("BFLOAT16", DataFormat::Bfloat16),
+            ("SEN18F_FP24", DataFormat::Sen18fFp24),
+            ("SEN080_FP8", DataFormat::Sen080Fp8),
+            ("SEN053_FP8", DataFormat::Sen053Fp8),
+            ("SEN121_FP4", DataFormat::Sen121Fp4),
+        ] {
+            assert_eq!(
+                DataFormat::from_spelling(spelling),
+                Some(want),
+                "{spelling}"
+            );
+        }
+        // ⛔ `INVALID` IS A SPELLING THE VENDOR'S ENUM HAS AND THIS ONE DOES NOT, and the lowercase
+        // form of a real name is not a real name.
+        assert_eq!(DataFormat::from_spelling("INVALID"), None);
+        assert_eq!(DataFormat::from_spelling("sen169_fp16"), None);
     }
 }
