@@ -2813,8 +2813,14 @@ pub fn construct_samv_operation(
                 .map(|slice| slice.cmp(&transition))
                 .unwrap_or(core::cmp::Ordering::Greater)
             {
-                core::cmp::Ordering::Less => agen::SliceMask::A,
-                core::cmp::Ordering::Equal => agen::SliceMask::AOrB,
+                // ⛔ THE MASK IS NAMED BY INDEX, NOT BY LETTER. `(A)` is mask 0 and `(A|B)` is the OR
+                // of masks 0 and 1 — *"lettering starts with A and continues sequentially for each
+                // mask thereafter"* (`Agen.td:1064-1065`), so the letter is derived from the index
+                // and a third mask would spell `(C)` with no new variant.
+                core::cmp::Ordering::Less => agen::SliceMask::By(agen::MaskId(0)),
+                core::cmp::Ordering::Equal => {
+                    agen::SliceMask::Or(agen::MaskId(0), agen::MaskId(1))
+                }
                 core::cmp::Ordering::Greater => agen::SliceMask::Full,
             }
         })
@@ -2822,18 +2828,18 @@ pub fn construct_samv_operation(
 
     // `unmasked_offsets = {wsllen, num_valid_entries}` against
     // `masked_offsets = {1, entries_per_slice - num_valid_entries}` — ⛔ ZIPPED BY COLUMN, and
-    // [`agen::MaskCounts`] is what keeps the two halves of one mask together.
+    // [`agen::MaskPattern`] is what keeps the two halves of one mask together.
     let live = entries.in_last_slice();
     let masks = vec![
         // "unmask-0, mask-1 for MaskA (WSL masking)".
-        agen::MaskCounts {
-            unmasked: wsl_len.get(),
-            masked: 1,
+        agen::MaskPattern {
+            unmasked: Elements(u64::from(wsl_len.get().unsigned_abs())),
+            masked: Elements(1),
         },
         // "unmask-valid entries, mask-(entries - num valid entries) (XSL masking)".
-        agen::MaskCounts {
-            unmasked: live,
-            masked: ENTRIES_PER_SLICE - live,
+        agen::MaskPattern {
+            unmasked: Elements(u64::from(live.unsigned_abs())),
+            masked: Elements(u64::from((ENTRIES_PER_SLICE - live).unsigned_abs())),
         },
     ];
 
@@ -2843,8 +2849,11 @@ pub fn construct_samv_operation(
     let body = vec![DfirOp::Agen(agen::Op::SetTransferMaskState {
         result: armed,
         mask_value: val_false,
-        dbg_name: Some(name.to_owned()),
-        slice_mask_map,
+        // ⚠️ `dbgName` IS NOT MODELLED HERE. `constructStickMaskOperation` sets it
+        // (`SNStickMaskLowering.cpp:72`) but the op's own printer emits the operand and its four
+        // attributes without it (`Agen.cpp:2677-2705`), so it is carried and never printed and no
+        // reader in this crate asks for it. Recorded rather than silently dropped.
+        slices: slice_mask_map,
         masks,
         ty: result_ty,
     })];
@@ -2856,7 +2865,7 @@ pub fn construct_samv_operation(
         result: reset,
         mask_value: val_false,
         dbg_name: Some(name.to_owned()),
-        slice_mask_map: vec![agen::SliceMask::Unmasked; SAMV_SLICES],
+        slices: vec![agen::SliceMask::Unmasked; SAMV_SLICES],
         masks: Vec::new(),
         ty: result_ty,
     })];
