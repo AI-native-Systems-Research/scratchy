@@ -154,14 +154,16 @@
 //! | `e364_parseDdl2Dsc` | 364 | 4 | 54 | `DdlConversion` | `ddc/ddl/ddl_conversion.cpp:2770` |
 //! | `e372_selectAndParseDdlTemplate` | 372 | 5 | 59 | `DdlConversion` | `ddc/ddl/ddl_conversion.cpp:42` |
 
-// ⭐ USES FOR ENTRIES 172-179. Union these into this file's top block when its other entries land.
+// ⭐ USES FOR ENTRIES 172-187. Union these into this file's top block when its other entries land.
 use std::collections::BTreeMap;
 
 use sys_arch_spec::arch_enums::SenComponent;
 
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::formats::{Bits, DataFormat};
-use crate::generated::{Attrs, NameId, Operand, Program, StmtKind};
+use crate::generated::{
+    AccessPattern, Attrs, DimProperty, NameId, Operand, PaddingType, Program, StmtKind,
+};
 use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
 use crate::schedule::ddc::metadata::{
     DataTransfer, ExternalStorage, MetaDimKind, Metadata, TransferAccessPattern,
@@ -565,6 +567,40 @@ impl DimProp {
         ));
         out
     }
+
+    /// Replaces: e184_setMetaDimKind
+    ///
+    /// TAKES THE KIND FROM A `dim_property=` — `stringToMetaDimKind.at(inDimKind)`.
+    ///
+    /// ⛔ THE `false` RETURN IS UNSPELLABLE: `dim_property=` is a censused [`DimProperty`] whose
+    /// absence the dialect defaults to `"unpadded"`, which is the [`None`] arm.
+    /// ⛔ `Padded` IS NOT REACHABLE FROM A STRING — `processPaddedDimensionOp` sets it through the
+    /// enum overload of this setter, never through this one.
+    pub fn set_meta_dim_kind(&mut self, property: Option<DimProperty>) {
+        self.meta_dim_kind = match property {
+            None => MetaDimKind::Unpadded,
+            Some(DimProperty::Window) => MetaDimKind::WindowDim,
+            Some(DimProperty::Stride) => MetaDimKind::Stride,
+            Some(DimProperty::Dilation) => MetaDimKind::Dilation,
+            Some(DimProperty::PadFront) => MetaDimKind::PadFront,
+            Some(DimProperty::PadBack) => MetaDimKind::PadBack,
+            Some(DimProperty::PadValid) => MetaDimKind::PadValid,
+        };
+    }
+
+    /// Replaces: e185_isMetaDim
+    ///
+    /// WHETHER THIS DIM CARRIES A META KIND — anything but `Unpadded` and `Padded`.
+    ///
+    /// ⛔ THE THIRD DISJUNCT IS DISCHARGED BY THE TYPE: `MetaDimKind::Count` is an absence and has no
+    /// variant, and [`DimProp::meta_dim_kind`] is never unset.
+    #[must_use]
+    pub const fn is_meta_dim(&self) -> bool {
+        !matches!(
+            self.meta_dim_kind,
+            MetaDimKind::Unpadded | MetaDimKind::Padded
+        )
+    }
 }
 
 impl DataTransfer {
@@ -593,53 +629,152 @@ impl DataTransfer {
             pad_type_spelling(pattern.to)
         ))
     }
+
+    /// Replaces: e183_dump
+    ///
+    /// THE TRANSFER'S ACCESS PATTERNS AS `std::cerr` STATES THEM, returned rather than written
+    /// because the caller owns the stream.
+    ///
+    /// ⛔ THE FRAMING NEWLINES ARE THE REFERENCE'S: it opens with `"\n["` and closes with
+    /// `std::endl`, so a transfer stating no pattern at all still prints three lines.
+    #[must_use]
+    pub fn dump(&self) -> String {
+        let mut out = String::from(
+            "\n[Ddl::DataTransfer]\n--------------------------\n  access-patterns per dimension: ",
+        );
+        for (dim, pattern) in &self.access_pattern_per_dim {
+            out.push_str(&format!(
+                "\n    Dim {} access-pattern ({} to {})",
+                dim.spelling(),
+                pad_type_spelling(pattern.from),
+                pad_type_spelling(pattern.to)
+            ));
+        }
+        out.push('\n');
+        out
+    }
 }
 
-// crustify:todo: e180_checkAccessPattern
-//   authority : ddc/ddl/ddl_conversion.cpp:3648  (34 body lines, level 0)
-//   class     : DdlConversion
-//   original  : template <typename T> bool DdlConversion::checkAccessPattern( T& op, std::string dimArgName, mlir::Operation::operand_range dims, std::string accessPatternAttrName, std::optional<mlir::ArrayAttr> opAccessPatternStyles)
-//   extract   : crustify-ddc/cpp/ddl.cpp:602-640
+/// ONE `access_pattern_style=`/`padding_type=` LIST PAIRED TO THE DIMS IT DESCRIBES, which is the
+/// only shape `processAccessPatterns` can walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledDims<S>(Vec<(NameId, S)>);
 
-// crustify:todo: e181_convertAccessPatternStrToDdcType
-//   authority : ddc/ddl/ddl_conversion.cpp:3687  (29 body lines, level 0)
-//   original  : ddc::Metadata::TransferAccessPatternType convertAccessPatternStrToDdcType( DataTransferOp& op, std::string const& accessPattern)
-//   extract   : crustify-ddc/cpp/ddl.cpp:649-679
+impl<S: Copy> StyledDims<S> {
+    /// Replaces: e180_checkAccessPattern
+    ///
+    /// THE PAIRING A DDL OP STATES, or absent where the reference emits *"Illegal ddl"*.
+    ///
+    /// ⛔ THE THREE ABORTS ARE THE [`None`]: dims with no styles, styles with no dims, and a style
+    /// count that is neither 1 nor one-per-dim. An EMPTY pairing is the reference's `return false`
+    /// — *"Nothing to process"* — and an absent attribute is an empty `styles` here, exactly as
+    /// `!hasAccessPatternStyle || empty()` treats the two alike.
+    /// ⭐ A SINGLE STYLE BROADCASTS at construction, which is what the caller then does per dim.
+    #[must_use]
+    pub fn stated(dims: &[NameId], styles: &[S]) -> Option<Self> {
+        if styles.is_empty() {
+            return dims.is_empty().then(|| Self(Vec::new()));
+        }
+        match styles {
+            _ if dims.is_empty() => None,
+            [only] => Some(Self(dims.iter().map(|dim| (*dim, *only)).collect())),
+            _ if styles.len() == dims.len() => Some(Self(
+                dims.iter().copied().zip(styles.iter().copied()).collect(),
+            )),
+            _ => None,
+        }
+    }
 
-// crustify:todo: e182_convertAccessPatternStrToDdcType
-//   authority : ddc/ddl/ddl_conversion.cpp:3718  (7 body lines, level 0)
-//   original  : PadType convertAccessPatternStrToDdcType(AllocateOp& op, std::string const& paddingType)
-//   extract   : crustify-ddc/cpp/ddl.cpp:688-696
+    /// The pairs, in the order the op states its dims.
+    #[must_use]
+    pub fn pairs(&self) -> &[(NameId, S)] {
+        &self.0
+    }
+}
 
-// crustify:todo: e183_dump
-//   authority : ddc/ddl/ddl_conversion.cpp:3756  (13 body lines, level 0)
-//   class     : DataTransfer
-//   original  : void Metadata::DataTransfer::dump()
-//   extract   : crustify-ddc/cpp/ddl.cpp:706-719
+/// Replaces: e181_convertAccessPatternStrToDdcType
+///
+/// THE PAD-TYPE PAIR AN `access_pattern_style=` NAMES — the reference's split on `"-to-"` and its two
+/// `stringToPadType` lookups, resolved once per spelling the templates actually state.
+///
+/// ⛔ ALL THREE *"Illegal ddl"* ABORTS ARE UNSPELLABLE: a missing `-to-`, an unknown source and an
+/// unknown destination cannot occur for a value of [`AccessPattern`]. A new spelling in the census
+/// makes this match non-exhaustive rather than silently unhandled.
+#[must_use]
+pub const fn transfer_access_pattern(pattern: AccessPattern) -> TransferAccessPattern {
+    match pattern {
+        AccessPattern::PaddedWzeropadToToToLoweredPadded => TransferAccessPattern {
+            from: PadType::PaddedWZeroPad,
+            to: PadType::LoweredPadded,
+        },
+    }
+}
 
-// crustify:todo: e184_setMetaDimKind
-//   authority : ddc/ddl/ddl_conversion.h:317  (7 body lines, level 0)
-//   class     : DimProp
-//   original  : bool setMetaDimKind(llvm::StringRef inDimKind)
-//   extract   : crustify-ddc/cpp/ddl.cpp:729-736
+/// Replaces: e182_convertAccessPatternStrToDdcType
+///
+/// THE PAD TYPE AN ALLOCATION'S `padding_type=` NAMES — one `stringToPadType` lookup.
+///
+/// ⛔ THE *"Unknown memory access pattern"* ABORT IS UNSPELLABLE for a value of [`PaddingType`].
+#[must_use]
+pub const fn allocation_pad_type(padding: PaddingType) -> PadType {
+    match padding {
+        PaddingType::PaddedWzeropad => PadType::PaddedWZeroPad,
+    }
+}
 
-// crustify:todo: e185_isMetaDim
-//   authority : ddc/ddl/ddl_conversion.h:329  (5 body lines, level 0)
-//   class     : DimProp
-//   original  : bool isMetaDim() const
-//   extract   : crustify-ddc/cpp/ddl.cpp:746-751
+/// THE DDL↔DSC SYMBOL TABLE — `DdlInterface` (`ddc/ddl/ddl_conversion.h:288-460`), carrying the
+/// sub-maps whose element types are defined.
+///
+/// ⛔ TWELVE MEMBERS ARE STILL ABSENT, each arriving with the unit that decides its element type:
+/// `operation_definition_`, `datastage_definition_`, `ext_constant_definition_`, `alloc_storage_`,
+/// `transfer_acc_pat_dims_`, `operand_constant_tensor_`, `loop_labels_`, `core_chunk_loop_label_`,
+/// `region2blocks_`, `resolvedConditions_`, `sync_definitions_` and `coreToCore_definitions_`.
+/// [`Self::clear`] resets whatever the struct holds, so it stays correct as they land.
+///
+/// ⛔ THE MAPS ARE ORDERED WHERE THE REFERENCE'S ARE NOT: `unordered_map<Value, _>` iterates in an
+/// unspecified order, so any unit that depends on this order is depending on more than the reference
+/// guarantees.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DdlInterface {
+    /// `dim_association_`.
+    pub dim_association: BTreeMap<NameId, DimProp>,
+    /// `type_definition_`, which [`process_types`] fills.
+    pub type_definition: BTreeMap<NameId, TypeDefinition>,
+    /// `tensor_definition_`, which [`tensor_prop`] fills.
+    pub tensor_definition: BTreeMap<NameId, TensorProp>,
+}
 
-// crustify:todo: e186_getNonPaddedDimProp
-//   authority : ddc/ddl/ddl_conversion.h:351  (5 body lines, level 0)
-//   class     : DdlInterface
-//   original  : DimProp& getNonPaddedDimProp(Value ddlDim)
-//   extract   : crustify-ddc/cpp/ddl.cpp:761-766
+impl DdlInterface {
+    /// Replaces: e186_getNonPaddedDimProp
+    ///
+    /// THE DIM'S PROPERTIES, FOLLOWED THROUGH TO THE UNPADDED DIM IT NAMES when it is itself padded.
+    ///
+    /// ⛔ [`None`] IS A PADDED DIM WITH NO `nonPaddedDim`: the reference default-inserts a fresh
+    /// `DimProp` under a null `Value` and hands that back. ⛔ ASKING IS A MUTATION — both lookups are
+    /// `operator[]`, so a dim that was not in the map is in it afterwards.
+    pub fn non_padded_dim_prop(&mut self, dim: NameId) -> Option<&mut DimProp> {
+        let key = {
+            let prop = self.dim_association.entry(dim).or_default();
+            if matches!(prop.meta_dim_kind, MetaDimKind::Padded) {
+                prop.non_padded_dim?
+            } else {
+                dim
+            }
+        };
+        Some(self.dim_association.entry(key).or_default())
+    }
 
-// crustify:todo: e187_clear
-//   authority : ddc/ddl/ddl_conversion.h:458  (4 body lines, level 0)
-//   class     : DdlInterface
-//   original  : void clear()
-//   extract   : crustify-ddc/cpp/ddl.cpp:776-780
+    /// Replaces: e187_clear
+    ///
+    /// DROPS EVERY MAPPING — the reference's destructor-then-placement-new, which is a REBUILD and
+    /// not a memset: a re-inserted [`DimProp`] gets its full candidate list back.
+    ///
+    /// ⛔ ~25 LATER UNITS LIST THIS AS A CALLEE; most of those are a container's own `.clear()`
+    /// resolved by name, exactly as `e104_clear` was.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 // crustify:todo: e274_processDimensionOp
 //   authority : ddc/ddl/ddl_conversion.cpp:187  (22 body lines, level 1)
@@ -753,13 +888,16 @@ mod unit_tests {
     use sys_arch_spec::arch_enums::SenComponent;
 
     use super::{
-        ComputeOpIdx, DimProp, ExprValue, GlobalLayoutRefs, InternalTensor, InternalTensorSite,
-        LabeledDsTail, LdsSlot, TensorProp, TypeDefinition, add_internal_tensor, pad_type_spelling,
-        process_expression, process_types, tensor, tensor_prop,
+        ComputeOpIdx, DdlInterface, DimProp, ExprValue, GlobalLayoutRefs, InternalTensor,
+        InternalTensorSite, LabeledDsTail, LdsSlot, StyledDims, TensorProp, TypeDefinition,
+        add_internal_tensor, allocation_pad_type, pad_type_spelling, process_expression,
+        process_types, tensor, tensor_prop, transfer_access_pattern,
     };
     use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
     use crate::formats::{Bits, DataFormat};
-    use crate::generated::{Attrs, NameId, Operand, PROGRAMS, Program, Stmt, StmtKind};
+    use crate::generated::{
+        AccessPattern, Attrs, NameId, Operand, PROGRAMS, Program, Stmt, StmtKind,
+    };
     use crate::schedule::ddc::fold::{AllocId, ConstIdx, DataOrigin, NodeId, PadType};
     use crate::schedule::ddc::metadata::{
         Allocation, DataConnectSlot, DataTransfer, DdcMemory, ExternalStorage, MetaDimKind,
@@ -1149,6 +1287,256 @@ mod unit_tests {
         assert_eq!(
             DataTransfer::default().access_pattern_spelling(PrimaryDim::Y),
             None
+        );
+    }
+    /// ⭐ EVERY VENDORED `access_pattern_style=` LIST, PAIRED TO AS MANY DIMS AS IT STATES — plus the
+    /// three *"Illegal ddl"* aborts and the *"Nothing to process"* empty.
+    #[test]
+    fn an_access_pattern_list_pairs_one_style_per_dim() {
+        let dims = [NameId(7), NameId(8), NameId(9)];
+        let mut seen = 0;
+        for program in PROGRAMS {
+            for stmt in program.stmts {
+                let Attrs::DataTransfer {
+                    access_pattern: styles,
+                    ..
+                } = stmt.attrs
+                else {
+                    continue;
+                };
+                if styles.is_empty() {
+                    continue;
+                }
+                let paired = StyledDims::stated(&dims[..styles.len()], styles)
+                    .expect("a vendored list is one style per dim");
+                assert_eq!(paired.pairs().len(), styles.len());
+                // ONE style covers every dim, however many there are.
+                assert_eq!(
+                    StyledDims::stated(&dims, &styles[..1])
+                        .expect("a single style broadcasts")
+                        .pairs(),
+                    &[
+                        (dims[0], styles[0]),
+                        (dims[1], styles[0]),
+                        (dims[2], styles[0])
+                    ]
+                );
+                // The three aborts.
+                assert_eq!(StyledDims::stated(&dims, &[] as &[AccessPattern]), None);
+                assert_eq!(StyledDims::stated(&[], styles), None);
+                assert_eq!(
+                    StyledDims::stated(&dims[..2], &[styles[0], styles[0], styles[0]]),
+                    None
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "no vendored transfer states an access pattern");
+        // Nothing stated at all is not an abort.
+        assert_eq!(
+            StyledDims::stated(&[], &[] as &[AccessPattern])
+                .expect("neither dims nor styles is nothing to process")
+                .pairs(),
+            &[]
+        );
+    }
+
+    /// ⭐ EVERY VENDORED `access_pattern_style=` AGAINST ITS OWN SPELLING: the two pad types this
+    /// hands back must re-spell as `<src>-to-<dst>`, which is the split the reference performs.
+    #[test]
+    fn every_vendored_access_pattern_recomposes_from_its_two_pad_types() {
+        let mut seen = 0;
+        for program in PROGRAMS {
+            for stmt in program.stmts {
+                let Attrs::DataTransfer { access_pattern, .. } = stmt.attrs else {
+                    continue;
+                };
+                for pattern in access_pattern {
+                    let pair = transfer_access_pattern(*pattern);
+                    assert_eq!(
+                        format!(
+                            "{}-to-{}",
+                            pad_type_spelling(pair.from),
+                            pad_type_spelling(pair.to)
+                        ),
+                        pattern.spelling()
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 0, "no vendored transfer states an access pattern");
+    }
+
+    /// ⭐ EVERY VENDORED `padding_type=` AGAINST ITS OWN SPELLING.
+    #[test]
+    fn every_vendored_padding_type_is_the_pad_type_it_spells() {
+        let mut seen = 0;
+        for program in PROGRAMS {
+            for stmt in program.stmts {
+                let Attrs::Allocate { padding, .. } = stmt.attrs else {
+                    continue;
+                };
+                for pad in padding {
+                    assert_eq!(pad_type_spelling(allocation_pad_type(*pad)), pad.spelling());
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 0, "no vendored allocation states a padding type");
+    }
+
+    /// The three framing lines, and one line per dim in `PrimaryDimTypes` order.
+    #[test]
+    fn a_transfer_dumps_its_access_patterns_in_dim_order() {
+        let mut transfer = DataTransfer::default();
+        assert_eq!(
+            transfer.dump(),
+            "\n[Ddl::DataTransfer]\n--------------------------\n  access-patterns per dimension: \n"
+        );
+        transfer.access_pattern_per_dim.insert(
+            PrimaryDim::Y,
+            TransferAccessPattern {
+                from: PadType::NoPad,
+                to: PadType::LoweredPadded,
+            },
+        );
+        transfer.access_pattern_per_dim.insert(
+            PrimaryDim::Out,
+            TransferAccessPattern {
+                from: PadType::PaddedWZeroPad,
+                to: PadType::PaddedFullSpan,
+            },
+        );
+        assert_eq!(
+            transfer.dump(),
+            "\n[Ddl::DataTransfer]\n--------------------------\n  access-patterns per dimension: \
+             \n    Dim out access-pattern (padded_wzeropad to padded_fullspan)\
+             \n    Dim y access-pattern (nopad to lowered_padded)\n"
+        );
+    }
+
+    /// ⭐ EVERY VENDORED `dim_property=`, WHICH MUST LAND ON THE KIND THAT SPELLS IT BACK — and the
+    /// absent one, which is `unpadded`.
+    #[test]
+    fn every_vendored_dim_property_sets_the_kind_that_spells_it() {
+        let mut seen = 0;
+        for program in PROGRAMS {
+            for stmt in program.stmts {
+                let Attrs::Dimension { property } = stmt.attrs else {
+                    continue;
+                };
+                let mut prop = DimProp::default();
+                prop.set_meta_dim_kind(property);
+                assert_eq!(
+                    prop.meta_dim_kind.label(),
+                    property.map_or("unpadded", |property| property.spelling())
+                );
+                assert_eq!(prop.is_meta_dim(), property.is_some());
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "no vendored program declares a `ddl.dimension`");
+    }
+
+    /// Neither `Unpadded` nor `Padded` is a meta dim; every other kind is.
+    #[test]
+    fn only_the_six_meta_kinds_are_meta_dims() {
+        for (kind, want) in [
+            (MetaDimKind::Unpadded, false),
+            (MetaDimKind::Padded, false),
+            (MetaDimKind::PadFront, true),
+            (MetaDimKind::PadBack, true),
+            (MetaDimKind::PadValid, true),
+            (MetaDimKind::WindowDim, true),
+            (MetaDimKind::Stride, true),
+            (MetaDimKind::Dilation, true),
+        ] {
+            let prop = DimProp {
+                meta_dim_kind: kind,
+                ..DimProp::default()
+            };
+            assert_eq!(prop.is_meta_dim(), want, "{}", kind.label());
+        }
+    }
+
+    /// A padded dim answers with the unpadded one it names; one that names nothing is the [`None`].
+    #[test]
+    fn a_padded_dim_resolves_to_the_unpadded_dim_it_names() {
+        let mut interface = DdlInterface::default();
+        interface.dim_association.insert(
+            NameId(1),
+            DimProp {
+                dim: Some(PrimaryDim::I),
+                ..DimProp::default()
+            },
+        );
+        interface.dim_association.insert(
+            NameId(2),
+            DimProp {
+                meta_dim_kind: MetaDimKind::Padded,
+                non_padded_dim: Some(NameId(1)),
+                ..DimProp::default()
+            },
+        );
+        interface.dim_association.insert(
+            NameId(3),
+            DimProp {
+                meta_dim_kind: MetaDimKind::Padded,
+                ..DimProp::default()
+            },
+        );
+        assert_eq!(
+            interface
+                .non_padded_dim_prop(NameId(2))
+                .map(|prop| prop.dim),
+            Some(Some(PrimaryDim::I))
+        );
+        assert_eq!(
+            interface
+                .non_padded_dim_prop(NameId(1))
+                .map(|prop| prop.dim),
+            Some(Some(PrimaryDim::I))
+        );
+        assert!(interface.non_padded_dim_prop(NameId(3)).is_none());
+        // ⛔ ASKING INSERTS: an unknown dim gets a fresh `DimProp` and is in the map afterwards.
+        assert!(interface.non_padded_dim_prop(NameId(9)).is_some());
+        assert!(interface.dim_association.contains_key(&NameId(9)));
+    }
+
+    /// Every map is dropped, and the reset is a REBUILD: a re-inserted dim gets its candidates back.
+    #[test]
+    fn clearing_the_interface_drops_every_mapping() {
+        let mut interface = DdlInterface::default();
+        interface.dim_association.insert(
+            NameId(1),
+            DimProp {
+                dim_candidates: Vec::new(),
+                ..DimProp::default()
+            },
+        );
+        interface.type_definition.insert(
+            NameId(2),
+            TypeDefinition {
+                format: DataFormat::Sen169Fp16,
+                bit_size: Bits(16),
+            },
+        );
+        interface.tensor_definition.insert(
+            NameId(3),
+            TensorProp {
+                lds: Some(LdsIdx(4)),
+            },
+        );
+        interface.clear();
+        assert_eq!(interface, DdlInterface::default());
+        assert!(
+            !interface
+                .dim_association
+                .entry(NameId(1))
+                .or_default()
+                .dim_candidates
+                .is_empty()
         );
     }
 }
