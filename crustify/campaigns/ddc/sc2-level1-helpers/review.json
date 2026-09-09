@@ -1,0 +1,2284 @@
+{
+ "schema_version": 3,
+ "oracle_config": {
+  "path": "crustify/wavefront/wavefront-config.json",
+  "sha256": "36beccdbb873960af95883a4dc041887b8f6578b0ec1ce3294e849fbee043eee"
+ },
+ "api_headers_only": false,
+ "budgets": {
+  "max_syms": 24,
+  "max_loc": 960,
+  "max_types": 15,
+  "min_fields": 60
+ },
+ "summary": {
+  "unit_count": 86,
+  "layer_count": 1,
+  "batch_count": 6,
+  "file_count": 4
+ },
+ "waves": [
+  {
+   "unit_count": 86,
+   "batches": [
+    {
+     "kind": "symbol",
+     "source_file": "crustify-ddc/cpp/dcg.cpp",
+     "items": [
+      {
+       "name": "e280_runDcgGenerateProgIR",
+       "defined_in": "crustify-ddc/cpp/dcg.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 70,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e187_clear",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e191_removeextraPTrows",
+          "defined_in": "crustify-ddc/cpp/dcg.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e281_runDcgForInputFetchNeighbor",
+       "defined_in": "crustify-ddc/cpp/dcg.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 52,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e187_clear",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e282_mergePcfgInSuperDSC",
+       "defined_in": "crustify-ddc/cpp/dcg.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 259,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e187_clear",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-ddc/cpp/ddc.cpp",
+     "items": [
+      {
+       "name": "e233_dbgPrint",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 11,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e078_dbgPrint",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e079_dbgPrint",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e234_scaleUpCoord",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 118,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e062_getEnclosingLoopsAndRelatedDims",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e095_gatherFoldParams",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e235_scaleDownCoord",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 87,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e095_gatherFoldParams",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e236_needNonRowBundling",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 50,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e082_getCompRowId",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e083_getComponent",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e087_findCommonAncestor",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e237_sameCoordinateRange",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 252,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e090_combineContigousLevels",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e095_gatherFoldParams",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e238_getRelatedComputeCoord",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 129,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e239_computeParamsForRowSplitFold",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 60,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e094_getDefaultRowSplitFold",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e240_buildFoldForExternalAllocation",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 156,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e062_getEnclosingLoopsAndRelatedDims",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e081_buildFoldForBroadcastDim",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e093_buildSpatialFold",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e241_relateLoopsToAllocElemArr",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 166,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e091_matchDataStream",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e095_gatherFoldParams",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e230_addPropInfo",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e073_addPropInfo",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e231_rollbackToPos",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 36,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e232_reset",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e264_bin_op",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 19,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e139_packmerge_psuedostring",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e265_unary_op",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 17,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e139_packmerge_psuedostring",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e266_canonicalize_layout",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 18,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e156_contains",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e267_reset_graph",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 6,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e268_sort_by_stick_key",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 15,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e163_constexpr",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e269_check_single_inorder_accesses",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 17,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e163_constexpr",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e270_inferLayouts",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 90,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e137_int_log2",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e159_all_one",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e242_canUseFifo",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 270,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e117_getNodeDescription",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e243_canUseLatch",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 321,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e117_getNodeDescription",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e244_cloneForOffsetAdjustment",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e108_cloneComputeForOffsetAdjustment",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e245_setSizeForFixedSizeTransfers",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 34,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e246_transformForInterSliceRestickify",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 28,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e109_transformAComputeNodeForInterSliceRestickify",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-ddc/cpp/ddc.cpp",
+     "items": [
+      {
+       "name": "e247_splitLoopBandOnDim",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 123,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e114_constructLoopNode",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e248_splitLoopBandOnDatastage",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 30,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e112_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e113_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e114_constructLoopNode",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e249_moveTransferNode",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 372,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e250_convertResultFromFIFOtoReg",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 148,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e110_constructAllocation",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e116_getPaddingPerDim",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e251_unrollTransfer",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 72,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e112_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e113_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e114_constructLoopNode",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e252_unrollTransferForSymbolicDims",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 110,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e112_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e113_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e114_constructLoopNode",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e253_srcRelatedToExternalNodes",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 4,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e120_storageOrDatastreamIsExternal",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e254_destRelatedToExternalNodes",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e120_storageOrDatastreamIsExternal",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e255_inputRelatedToExternalNodes",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 11,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e120_storageOrDatastreamIsExternal",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e256_outputRelatedToExternalNodes",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 11,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e120_storageOrDatastreamIsExternal",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e257_addNewLds",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 107,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e258_allocAllMem",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 306,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e124_getLdsOrConstNameOfAllocNode",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e259_calculateClStartAddress",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 123,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e260_fillLoopOffsetsAndAddresses",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 844,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e076_print",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e102_print",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e261_finalizeOps",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 127,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e131_setPeFoldsIfPtInteraction",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e262_coordinateMasking",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 181,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e263_identifyBelowChunkBoundaryLoops",
+       "defined_in": "crustify-ddc/cpp/ddc.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-ddc/cpp/ddl.cpp",
+     "items": [
+      {
+       "name": "e274_processDimensionOp",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 22,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e184_setMetaDimKind",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e275_processCondition",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 234,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e174_processExpression",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e175_getTensorProp",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e176_getTensor",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e187_clear",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e276_verifyDdlConstraints",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 216,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e175_getTensorProp",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e176_getTensor",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e277_getTensorAndAllocation",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 31,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e176_getTensor",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e278_checkMetaDimensions",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 81,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e185_isMetaDim",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e279_processAccessPatterns",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 24,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e181_convertAccessPatternStrToDdcType",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e182_convertAccessPatternStrToDdcType",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e273_processBuffer",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 13,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e171_performActions",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e271_verify",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 7,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e021_getOpFuncName",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e272_print",
+       "defined_in": "crustify-ddc/cpp/ddl.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 19,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e176_getTensor",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-ddc/cpp/l3.cpp",
+     "items": [
+      {
+       "name": "e197_getCoreletSplitDimensions",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 15,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e003_isDimensionCoreletSplit",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e198_addOrUpdatePaddingSizesInChunkParams",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 6,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e004_voidPaddingIfChunking",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e199_getLabeledDsNumOfWkSlices",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 49,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e002_isLabeledDsDimensionBroadcast",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e200_getLxNeighborLabeledDsIndicesSet",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 7,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e014_isLabeledDsLXNeighbor",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e201_computeLdsAllocateSiblingLoopNode",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 55,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e014_isLabeledDsLXNeighbor",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e202_computeLdsTransferSiblingLoopNode",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 32,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e014_isLabeledDsLXNeighbor",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e203_getOpFuncDataFormat",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 49,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e021_getOpFuncName",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e204_isOpFuncConv2d",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 15,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e023_isOpFuncConv2dInt4",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e024_isOpFuncConv2dOs1",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e205_isOpFuncBmm",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e025_isOpFuncBmmInt4",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e026_isOpFuncBmmInt8",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e027_isOpFuncBmmFp8NonXrf",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e028_isOpFuncBmmFp8Xrf",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e029_isOpFuncBmmFp16",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e206_getMinParamBmm",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 80,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e025_isOpFuncBmmInt4",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e026_isOpFuncBmmInt8",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e027_isOpFuncBmmFp8NonXrf",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e028_isOpFuncBmmFp8Xrf",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e029_isOpFuncBmmFp16",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e207_generateDscParamCandidates",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 204,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e003_isDimensionCoreletSplit",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e009_getStickSize",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e059_getPagedDimensions",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e208_getLdsL3TransferNodes",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 34,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e014_isLabeledDsLXNeighbor",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e209_getLabeledDsChunkStickVolume",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 64,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e009_getStickSize",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e210_isOpCrossCoreReduction",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 7,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e044_getOpReducedDimSet",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e211_getInsertionNode",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 89,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e104_clear",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e187_clear",
+          "defined_in": "crustify-ddc/cpp/ddl.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e212_addL3LUAndLXLUSyncNodeSequence",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 45,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e020_createSyncNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e213_addL3LUAndLXLUSoftSyncNodeSequence",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 26,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e020_createSyncNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e214_optimizeHbmLdsOutputInScheduleTree",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 94,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e015_getParentLoopNodes",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e072_getTripCount",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e215_buildScheduleDimensionsTable",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 103,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e007_scheduleDimTypeToString",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e216_buildLoopOrder",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 231,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e011_getLabeledDsWithDsType",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e014_isLabeledDsLXNeighbor",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e052_verifyLoopOrder",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e059_getPagedDimensions",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e138_swap",
+          "defined_in": "crustify-ddc/cpp/ddc.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e217_createChunkLoopNodes",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 58,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e018_createLoopNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e019_createBlockNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e058_getNewDataStageIndex",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e218_setCondGtr",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 114,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e010_getCoreSplitDimensions",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e017_createTransferNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e048_getSharesAndGroupName",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e219_fillFinalStartAddressAndOffset",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 137,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e050_getInitialStartAddressAndOffset",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e220_fillIBRStartAddressAndOffset",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 43,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e056_isIndexLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
+    {
+     "kind": "symbol",
+     "source_file": "crustify-ddc/cpp/l3.cpp",
+     "items": [
+      {
+       "name": "e221_fillTransferZeroPaddingInfo",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 196,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e059_getPagedDimensions",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e222_allocAllMem",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 236,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e051_getLdsOrConstNameOfAllocNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e223_getHbmLdsTransferHMIRequestEstimate",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 30,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e055_computeMinHMICoreGroupSizeForSEN1P5",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e224_getAllPagedLdsIndices",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 8,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e057_isPagedLds",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e225_createPagedDimChunkLoops",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 62,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e018_createLoopNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e226_createStoreIndexTensorToIbr",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 62,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e016_createAllocateNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e017_createTransferNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e020_createSyncNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e227_convertTransferDirectToIndirect",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 45,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e018_createLoopNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e228_buildCoordinateFromAllocation",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 181,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e061_gatherFoldParams",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e062_getEnclosingLoopsAndRelatedDims",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e063_findAndStoreLoopWithDim",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e229_sliceCoordinateForCorelet",
+       "defined_in": "crustify-ddc/cpp/l3.cpp",
+       "kind": "symbol",
+       "source_kind": "function",
+       "layer": 1,
+       "loc": 203,
+       "deps": {
+        "types": [],
+        "symbols": [
+         {
+          "name": "e046_getLxBelowBlockNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e061_gatherFoldParams",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e064_constructDatastage",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         },
+         {
+          "name": "e065_constructLoopNode",
+          "defined_in": "crustify-ddc/cpp/l3.cpp",
+          "scope": "port"
+         }
+        ]
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "_comment": [
+  "REVIEW wave for level1-helpers: every unit reviewed by a DIFFERENT agent instance than",
+  "ported it. The review pass owns citation checks -- porters must not re-verify.",
+  "Batches are packed WITHIN A SINGLE HOME FILE so two concurrent agents rarely touch the same",
+  "file; where a home holds more than max_syms units its batches do run concurrently, and the",
+  "driver's promote is rebase-then-fast-forward for exactly that reason.",
+  "\u26d4 layer_count is the number of DISTINCT ITEM LAYERS in this schedule, not the wave count.",
+  "\u26d4 OUTSTANDING WORK COMES FROM crustify-ddc/UNITS.tsv, NEVER FROM ANCHORS IN THE TREE.",
+  "   A deleted `crustify:todo:` anchor is indistinguishable from a finished unit: bridge 2",
+  "   printed CAMPAIGN DRIVER DONE having ported 235 of 384, silently losing 149 -- the biggest",
+  "   functions in its span. Never delete an anchor you did not port.",
+  "\u26d4 Independent review is mandatory: every unit is reviewed by a DIFFERENT agent instance",
+  "   than ported it, which is why each sub-campaign has a review.json of its own."
+ ]
+}
