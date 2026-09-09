@@ -84,10 +84,24 @@
 //! | `e595_deuniform` | 595 | 5 | 30 | `dcc/src/Transform/Sentient/Deuniform.cpp:448` |
 //! | `e621_runOnOperation` | 621 | 6 | 42 | `dcc/src/Transform/Sentient/Deuniform.cpp:482` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// file's own tests until `e621_runOnOperation` (level 6) lands and something calls it. CI runs clippy
+// with `-D warnings`, so without this the first ported leaf of a 9-unit module fails the gate.
+// ⭐ REMOVE THIS WITH e621: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e039_existsInCollection
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:128  (8 body lines, level 0)
-//   original  : static bool existsInCollection( dataflow::GetUnitOp unit_op, std::vector<std::vector<dataflow::GetUnitOp>> &collection)
+use crate::islands::sentient::dialects::Val;
+
+/// Replaces: e039_existsInCollection
+///
+/// Whether this unit is already a member of one of the collected sets of units.
+///
+/// TRAP: the identity is the `Val` the `dataflow.get_unit` BINDS — every `unit_op` this pass compares
+/// arrives through `unit.getDefiningOp()` (`dcc/src/Transform/Sentient/Deuniform.cpp:509`), so equal
+/// values are the same op.
+pub fn exists_in_collection(unit_op: Val, collection: &[Vec<Val>]) -> bool {
+    collection.iter().any(|set| set.contains(&unit_op))
+}
 
 // crustify:todo: e297_simplifyProgramUnitOp
 //   authority : dcc/src/Transform/Sentient/Deuniform.cpp:155  (64 body lines, level 1)
@@ -129,3 +143,16 @@
 //   original  : void DeuniformPass::runOnOperation()
 //   calls     : e039_existsInCollection, e252_size, e297_simplifyProgramUnitOp, e556_deuniform, e595_deuniform
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// A unit in the second set is found; one in no set is not.
+    #[test]
+    fn exists_in_collection_searches_every_set() {
+        let collection = vec![vec![Val(1), Val(2)], vec![Val(3)]];
+
+        assert!(exists_in_collection(Val(3), &collection));
+        assert!(!exists_in_collection(Val(4), &collection));
+    }
+}
