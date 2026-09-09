@@ -261,6 +261,7 @@ mod unit_tests {
             num_consumers: ConsumerCount(1),
             group_id: MulticastGroupId(3),
             count: OutstandingRequests(0),
+            init_packet_opt_en: false,
         })
     }
 

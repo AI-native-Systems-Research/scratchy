@@ -159,6 +159,14 @@ pub fn operands(op: &Op) -> Vec<Val> {
                     reads.extend(region.units.iter().copied());
                 }
             }
+            // ⭐ ARM FOR ARM WITH `uniformize_regions` — `EqualizePatternOp` declares the same
+            // `$units` / `$list_sizes` pair (`Uniform.td:196-197`) and slices it the same way
+            // (`Uniform.cpp:214`).
+            uniform::Op::EqualizePattern { regions } => {
+                for region in regions {
+                    reads.extend(region.units.iter().copied());
+                }
+            }
             // ⭐ A TERMINATOR READS WHAT IT YIELDS (`Uniform.td:71`).
             uniform::Op::Yield { operands } => reads.extend(operands.iter().copied()),
             // ⭐ KEYS AND VALUES BOTH, KEY FIRST — the two `Variadic` ranges in declaration order
@@ -562,7 +570,9 @@ pub fn results(op: &Op) -> Vec<Val> {
             uniform::Op::DefImmutableMapping { result, .. } | uniform::Op::QueryMap { result, .. },
         ) => vec![*result],
         // ⭐ A TERMINATOR BINDS NOTHING; the values it carries out are its PARENT's results.
-        Op::Uniform(uniform::Op::Yield { .. }) => Vec::new(),
+        // ⛔ AND NEITHER DOES `uniform.equalize_pattern`: it declares no `let results` at all
+        // (`Uniform.td:187-211`), which is why its printer has no `printArrowTypeList`.
+        Op::Uniform(uniform::Op::Yield { .. } | uniform::Op::EqualizePattern { .. }) => Vec::new(),
         Op::Scf(op) => match op {
             // ⭐ A CARRYING `scf.for` BINDS RESULTS, one per `iter_args` entry — the reference's own
             // input to `TransformLoopToLegalizeForSentientLowering` is
@@ -1007,6 +1017,11 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
                     places.extend(region.units.iter_mut());
                 }
             }
+            uniform::Op::EqualizePattern { regions } => {
+                for region in regions {
+                    places.extend(region.units.iter_mut());
+                }
+            }
             uniform::Op::Yield { operands } => places.extend(operands.iter_mut()),
             uniform::Op::DefImmutableMapping { pairs, .. } => {
                 for (key, value) in pairs {
@@ -1052,7 +1067,7 @@ pub fn results_mut(op: &mut Op) -> Vec<&mut Val> {
         Op::Uniform(
             uniform::Op::DefImmutableMapping { result, .. } | uniform::Op::QueryMap { result, .. },
         ) => vec![result],
-        Op::Uniform(uniform::Op::Yield { .. }) => Vec::new(),
+        Op::Uniform(uniform::Op::Yield { .. } | uniform::Op::EqualizePattern { .. }) => Vec::new(),
         // ⛔ THIS WAS `Op::Scf(_) => Vec::new()`, AND THAT DISAGREED WITH [`results`]. The read side
         // has answered the carried results of an `scf.for` since the variant landed; the write side
         // did not, so a clone that reminted an op's results left a carrying loop binding the
@@ -1230,9 +1245,12 @@ pub fn block_args(op: &Op) -> Vec<Val> {
         // two-region op binds two values, and entry 182 maps the one belonging to the region it is
         // cloning out of (`FlatteningLocalRegions.cpp:246-256`). A census that missed them would let
         // a clone keep reading the ORIGINAL region's argument.
-        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
-            regions.iter().map(|region| region.arg).collect()
-        }
+        // ⭐ AND `uniform.equalize_pattern` BINDS ONE PER REGION TOO — its own
+        // `Value getRegionArg(int i) {return getRegion(i).getArgument(0);}` (`Uniform.td:204`).
+        Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. }
+            | uniform::Op::EqualizePattern { regions },
+        ) => regions.iter().map(|region| region.arg).collect(),
         Op::Uniform(
             uniform::Op::Yield { .. }
             | uniform::Op::DefImmutableMapping { .. }
@@ -1286,7 +1304,10 @@ pub fn regions(op: &Op) -> Vec<&[Op]> {
         // (`Uniform.td:91`), one per [`uniform::LocalRegion`]. This count IS the pass's decision:
         // `flatten` declines when `op_.getNumRegions() == num_of_regions`
         // (`FlatteningLocalRegions.cpp:418`).
-        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => regions
+        Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. }
+            | uniform::Op::EqualizePattern { regions },
+        ) => regions
             .iter()
             .map(|region| region.body.as_slice())
             .collect(),
@@ -1345,9 +1366,10 @@ pub fn regions_mut(op: &mut Op) -> Vec<&mut Vec<Op>> {
         },
         Op::Agen(agen::Op::CompositeMemoryInterleave { body, .. }) => vec![body],
         // ⭐ ARM FOR ARM WITH [`regions`], which is what entry 182's per-region recursion indexes.
-        Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
-            regions.iter_mut().map(|region| &mut region.body).collect()
-        }
+        Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. }
+            | uniform::Op::EqualizePattern { regions },
+        ) => regions.iter_mut().map(|region| &mut region.body).collect(),
         Op::Uniform(
             uniform::Op::Yield { .. }
             | uniform::Op::DefImmutableMapping { .. }
@@ -2051,6 +2073,15 @@ pub fn parts_mut(op: &mut Op) -> OpPartsMut<'_> {
                     regions.push(&mut region.body);
                 }
                 results.extend(bound.iter_mut());
+            }
+            uniform::Op::EqualizePattern {
+                regions: local_regions,
+            } => {
+                for region in local_regions {
+                    operands.extend(region.units.iter_mut());
+                    block_args.push(&mut region.arg);
+                    regions.push(&mut region.body);
+                }
             }
             uniform::Op::Yield { operands: yielded } => operands.extend(yielded.iter_mut()),
             uniform::Op::DefImmutableMapping { result, pairs } => {
@@ -2808,6 +2839,12 @@ pub fn vals_mut(op: &mut Op) -> Vec<(Role, &mut Val)> {
                     vals.push((Role::BlockArg, &mut region.arg));
                 }
                 vals.extend(results.iter_mut().map(|result| (Role::Result, result)));
+            }
+            uniform::Op::EqualizePattern { regions } => {
+                for region in regions {
+                    vals.extend(region.units.iter_mut().map(|unit| (Role::Operand, unit)));
+                    vals.push((Role::BlockArg, &mut region.arg));
+                }
             }
             uniform::Op::Yield { operands } => {
                 vals.extend(operands.iter_mut().map(|read| (Role::Operand, read)));

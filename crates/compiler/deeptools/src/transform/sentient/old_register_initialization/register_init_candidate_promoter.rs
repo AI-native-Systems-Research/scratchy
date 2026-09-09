@@ -291,6 +291,9 @@ mod unit_tests {
             num_consumers: dataflow::ConsumerCount(1),
             group_id: dataflow::MulticastGroupId(0),
             count: dataflow::OutstandingRequests(0),
+            // ⭐ ABSENT, WHICH IS THE VENDOR'S DEFAULT — see
+            // [`dataflow::Op::CreateMulticastGroup::init_packet_opt_en`].
+            init_packet_opt_en: false,
         }
     }
 

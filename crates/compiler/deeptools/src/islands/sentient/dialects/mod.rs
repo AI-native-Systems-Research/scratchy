@@ -1099,3 +1099,124 @@ pub fn replace_if_with_region(
     drop(block.splice(at..=at, region));
     rewires
 }
+
+/// WHICH UNIT HANDLES A `uniform.query_map`'S KEY STANDS FOR — `collectUnitOps` over the key's own
+/// region unit list (`dcc/src/Dialect/Uniform/Utils.cpp:98-115, 151-192`).
+///
+/// ⛔⛔ A `dataflow.create_group` KEY EXPANDS TO ITS MEMBERS. The reference pushes the group's whole
+/// `getUnitIds()` rather than the group handle (`Utils.cpp:105-108`), so one entry of a region's unit
+/// list can contribute several keys — and the mapping is keyed by the individual `get_unit`s.
+///
+/// ⛔ A KEY THAT IS NEITHER STOPS THE WALK. `op->emitError("Key has to be GetUnitOp or
+/// CreateGroupOp."); break;` (`:110-113`) — the reference returns the PARTIAL list it has built and
+/// carries on, which is what the `break` here reproduces.
+fn collect_unit_ops(units: &[Val], defs: Definitions<'_>) -> Vec<Val> {
+    let mut keys = Vec::new();
+    for value in units {
+        match defs.of(*value) {
+            Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => keys.push(*value),
+            Some(Op::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) => {
+                keys.extend(unit_ids.iter().copied());
+            }
+            _ => break,
+        }
+    }
+    keys
+}
+
+/// THE REGION OF A `uniform.uniformize_regions` OR `uniform.equalize_pattern` THAT BINDS A VALUE AS
+/// ITS ARGUMENT — the `getRegionUnitList(block_arg)` both ops declare (`Uniform.td:98`, `:206`).
+#[must_use]
+pub fn parent_uniform_region(val: Val, scope: &[Op]) -> Option<&uniform::LocalRegion> {
+    for op in scope {
+        if let Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. } | uniform::Op::EqualizePattern { regions },
+        ) = op
+            && let Some(region) = regions.iter().find(|region| region.arg == val)
+        {
+            return Some(region);
+        }
+        match op {
+            Op::Sentient(inner) => {
+                for region in sentient::regions(inner) {
+                    if let Some(found) = parent_uniform_region(val, region) {
+                        return Some(found);
+                    }
+                }
+            }
+            Op::AffineFor(loop_op) => {
+                if let Some(found) = parent_uniform_region(val, &loop_op.body) {
+                    return Some(found);
+                }
+            }
+            // ⛔ NO `_` ARM. A shared dialect's regions hold ops of the rung BELOW this one, whose
+            // `uniform` ops are values of the other island's type — a region found there could not be
+            // returned from this signature. [`defining_op`] records the same limitation.
+            Op::Uniform(_)
+            | Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_) => {}
+        }
+    }
+    None
+}
+
+impl<'a> Definitions<'a> {
+    /// THE UNIFORM REGION THAT BINDS A VALUE AS ITS ARGUMENT — see [`parent_uniform_region`].
+    #[must_use]
+    pub fn uniform_region_of(&self, val: Val) -> Option<&'a uniform::LocalRegion> {
+        self.regions
+            .iter()
+            .find_map(|region| parent_uniform_region(val, region))
+    }
+}
+
+/// THE VALUES ONE `uniform.query_map` CAN ANSWER WITH — `dcc::uniform::utils::
+/// getListOfValueOpsFromUniformMapping` (`dcc/src/Dialect/Uniform/Utils.cpp:194-202`).
+///
+/// The query map's key names one unit or a whole region's worth of them; those units are looked up in
+/// the `uniform.def_immutable_mapping` behind `map`, and the values found are the answers.
+///
+/// ⛔ MISSES ARE DROPPED, NOT REPORTED. `getNonNullValuesFromKeys` pushes only the keys the map holds
+/// (`dataflow-scheduler/.../lib/Dialect/Uniform/Uniform.cpp:548-556`), so the result is SHORTER than
+/// the key list when a unit has no entry — which is why its sibling `getValuesFromKeys`, which keeps
+/// the holes as `std::nullopt`, exists separately.
+///
+/// ⚠️ ONE ARM OF THE KEY WALK IS AN ISLAND GAP: a key bound as the region argument of a
+/// `dataflow.program_unit`, whose keys are `prog_unit_op.getUnits()` (`Utils.cpp:180-186`). This
+/// island's [`dataflow::Op::ProgramUnit`] and [`crate::islands::sentient::ProgramUnit`] carry no
+/// region argument at all — `iter_arg : %arg0 -> (%l1lu0, %l1lu1)` (`Dataflow.td:103`) is the form
+/// that binds one — so no [`Val`] can BE that argument here and the arm is unreachable rather than
+/// wrong. It answers with the empty list, which is the reference's own `key_vals` when none of the
+/// three parent forms matches (`:154-190`).
+#[must_use]
+pub fn uniform_mapping_values(map: Val, key: Val, defs: Definitions<'_>) -> Vec<Val> {
+    // `getListOfKeyOpsFromUniformMapping` (`Utils.cpp:151-192`).
+    let keys = match defs.of(key) {
+        // `else if (auto unit = dyn_cast<GetUnitOp>(key.getDefiningOp())) key_vals.push_back(key);`
+        // — ⭐ THE KEY ITSELF, not the unit list of anything (`:187-190`).
+        Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => vec![key],
+        Some(_) => Vec::new(),
+        // No defining op: a block argument, so the parent op's unit list for that region.
+        None => defs
+            .uniform_region_of(key)
+            .map_or_else(Vec::new, |region| collect_unit_ops(&region.units, defs)),
+    };
+    // `auto target_map = dyn_cast<DefImmutableMappingOp>(query_map_op.getMap().getDefiningOp());`
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(map) else {
+        return Vec::new();
+    };
+    keys.iter()
+        .filter_map(|sought| {
+            pairs
+                .iter()
+                .find(|(mapped, _)| mapped == sought)
+                .map(|(_, value)| *value)
+        })
+        .collect()
+}

@@ -86,9 +86,28 @@
 pub(crate) mod unroll_operands;
 
 
-// crustify:todo: e122_incrementUnrollSize
-//   authority : dcc/src/Transform/Sentient/OpRerolling.hpp:131  (1 body lines, level 0)
-//   original  : void incrementUnrollSize(unsigned int incr_val)
+/// HOW MANY OPS ONE REROLLED STATEMENT STANDS FOR — `UnrollOperands::unroll_size_`, whose declaration
+/// initialises it to ONE and not zero, so an unrerolled statement already stands for itself
+/// (`dcc/src/Transform/Sentient/OpRerolling.hpp:45`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnrollSize(pub u32);
+
+impl Default for UnrollSize {
+    fn default() -> UnrollSize {
+        UnrollSize(1)
+    }
+}
+
+impl UnrollSize {
+    /// Replaces: e122_incrementUnrollSize
+    ///
+    /// Adds `incr_val` further ops to the count this rerolled statement stands for
+    /// (`dcc/src/Transform/Sentient/OpRerolling.hpp:131`).
+    pub fn increment(&mut self, incr_val: UnrollSize) {
+        // `unroll_size_ += incr_val;` — `unsigned`, so the reference wraps rather than trapping.
+        self.0 = self.0.wrapping_add(incr_val.0);
+    }
+}
 
 // crustify:todo: e334_mergeScalarOpIntoMac
 //   authority : dcc/src/Transform/Sentient/OpRerolling.cpp:81  (57 body lines, level 1)
@@ -125,3 +144,16 @@ pub(crate) mod unroll_operands;
 //   original  : void OpRerollingPass::runOnOperation()
 //   calls     : e571_runOpRerolling
 
+#[cfg(test)]
+mod unit_tests {
+    use super::UnrollSize;
+
+    /// AN UNREROLLED STATEMENT ALREADY STANDS FOR ONE OP, and each merge adds its own count.
+    #[test]
+    fn incrementing_adds_to_a_size_that_starts_at_one() {
+        let mut size = UnrollSize::default();
+        assert_eq!(size, UnrollSize(1));
+        size.increment(UnrollSize(3));
+        assert_eq!(size, UnrollSize(4));
+    }
+}

@@ -100,9 +100,10 @@ pub struct LocalRegion {
 
 /// ONE `uniform` OPERATION.
 ///
-/// ⚠️ FOUR OF `Uniform.td`'S FIVE. `uniform.equalize_pattern` (`:187`) is declared beside them and is
-/// absent: no bridge-2 function this campaign has reached names it, and an op nothing reads would be
-/// a variant every total match in this island has to answer for with nothing to say.
+/// ⭐ ALL FIVE OF `Uniform.td`'S. `uniform.equalize_pattern` (`:187`) was the absent one, on the
+/// grounds that no function reached so far named it — `e107_hasUniformizeRegion` does, in the same
+/// `isa<>` as `uniformize_regions` (`Transform/Sentient/OldRegisterInitialization.cpp:539-540`), so
+/// the predicate that decided its absence no longer holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// `uniform.uniformize_regions -> () { (%arg -> %0, %2){ .. } .. }` — THE DIALECT'S MAIN OP.
@@ -135,6 +136,32 @@ pub enum Op {
         /// `mlir::TypeRange()` (`FlatteningLocalRegions.cpp:421`), so the emitted form is always
         /// `-> ()`.
         results: Vec<Val>,
+    },
+
+    /// `uniform.equalize_pattern { (%arg -> %0, %2){ .. } .. }` — THE SAME SHAPE AS
+    /// [`Op::UniformizeRegions`] FOR REGIONS WHOSE PATTERNS DIFFER.
+    ///
+    /// Its own summary: *"captures the variations in transfer or compute patterns between units and
+    /// encapsulates them within parallel regions. All regions must exhibit an identical pattern of
+    /// operation sequence"* (`Uniform.td:190-194`).
+    ///
+    /// ⛔⛔ ADDED FOR `e107_hasUniformizeRegion`, WHICH ASKS FOR IT AND `uniformize_regions` IN ONE
+    /// `isa<>`: `isa<uniform::UniformizeRegionsOp, uniform::EqualizePatternOp>(op)`
+    /// (`Transform/Sentient/OldRegisterInitialization.cpp:539-540`). With no variant the predicate
+    /// would answer `false` for a unit holding only these, and `collectRegInitAndRegCoalescing\
+    /// CandidateFast` (`e451`) and the pass body (`e644`) both branch on it.
+    ///
+    /// ⛔ NO RESULTS, UNLIKE `uniformize_regions`. `EqualizePatternOp` declares `$units` and
+    /// `$list_sizes` and a `VariadicRegion` and no `let results` at all (`Uniform.td:196-198`), and
+    /// its printer opens straight with `p << " {"` — no `printArrowTypeList`
+    /// (`dataflow-scheduler/.../lib/Dialect/Uniform/Uniform.cpp:276-292`).
+    ///
+    /// ⭐ THE UNIT LISTS ARE ZIPPED PER REGION for the same reason `uniformize_regions`' are: its
+    /// `getRegionUnitList(int)` re-slices `$units` by the prefix sum of `$list_sizes`
+    /// (`Uniform.cpp:214-219` declares them; the verifier asserts the zip at `:294-298`).
+    EqualizePattern {
+        /// One record per region — the argument, the units it stands for, and the body.
+        regions: Vec<LocalRegion>,
     },
 
     /// `uniform.yield` — the implicit terminator of every region of the two ops above.
@@ -238,6 +265,28 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 // ⭐ THE TERMINATOR PRINTS. `printRegion(region, /*printEntryBlockArgs=*/false,
                 // /*printBlockTerminators=*/true)` (`:112`) — the argument is already in the header
                 // above, the `uniform.yield` is not.
+                for inner in &region.body {
+                    print::emit(out, inner, depth + 2);
+                }
+                print::indent(out, depth + 1);
+                out.push_str("}\n");
+            }
+            print::indent(out, depth);
+            out.push_str("}\n");
+        }
+        Op::EqualizePattern { regions } => {
+            // ⛔ NO RESULT LIST AND NO ARROW. `p << " {"` is the printer's first act
+            // (`Uniform.cpp:280`); the region headers below are `uniformize_regions`' character for
+            // character (`:284-287` against `:109-112`).
+            let _ = writeln!(out, "uniform.equalize_pattern {{");
+            for region in regions {
+                print::indent(out, depth + 1);
+                let _ = writeln!(
+                    out,
+                    "({} -> {}){{",
+                    print::val(region.arg),
+                    print::vals(&region.units)
+                );
                 for inner in &region.body {
                     print::emit(out, inner, depth + 2);
                 }
@@ -471,5 +520,55 @@ mod tests {
         });
         assert_eq!(dialects::operands(&yielded), vec![Val(71)]);
         assert!(dialects::results(&yielded).is_empty());
+    }
+
+    /// ⭐⭐ IBM'S OWN THREE-REGION PATTERN, REPRODUCED BYTE FOR BYTE.
+    ///
+    /// `dcc/test/Dialect/Uniform/roundtripping.mlir:48-58`'s `CHECK-IR` lines — the *printed* form,
+    /// which is what the round-trip test pins, so the implicit `uniform.yield` each region ends with
+    /// is spelled out and no result list appears.
+    #[test]
+    fn an_equalize_pattern_prints_as_the_reference_writes_it() {
+        let region = |arg: u32, units: Vec<Val>, konst: u32, value: i64| LocalRegion {
+            arg: Val(arg),
+            units,
+            body: vec![
+                dialects::Op::Arith(arith::Op::Constant {
+                    result: Val(konst),
+                    value,
+                }),
+                dialects::Op::Uniform(Op::Yield {
+                    operands: Vec::new(),
+                }),
+            ],
+        };
+        let op = dialects::Op::Uniform(Op::EqualizePattern {
+            regions: vec![
+                region(21, vec![Val(0), Val(1)], 22, 2),
+                region(23, vec![Val(2), Val(3)], 24, 3),
+                region(25, vec![Val(4)], 26, 4),
+            ],
+        });
+
+        let mut got = String::new();
+        emit(&mut got, &op, 0);
+
+        assert_eq!(
+            got,
+            "uniform.equalize_pattern {\n  \
+             (%21 -> %0, %1){\n    \
+             %22 = arith.constant 2 : index\n    \
+             uniform.yield\n  \
+             }\n  \
+             (%23 -> %2, %3){\n    \
+             %24 = arith.constant 3 : index\n    \
+             uniform.yield\n  \
+             }\n  \
+             (%25 -> %4){\n    \
+             %26 = arith.constant 4 : index\n    \
+             uniform.yield\n  \
+             }\n\
+             }\n"
+        );
     }
 }

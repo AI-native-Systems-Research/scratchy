@@ -520,6 +520,13 @@ pub enum Op {
     /// {count = 0 : i32, group_id = 3 : i32, num_consumers = 1 : i32} : index`
     /// (`dcc/test/Conversion/StandardToSentient/cmpi_select_different_BB.mlir:86`) — no space before
     /// the paren, and the attribute dictionary alphabetical.
+    ///
+    /// ⚠️ TWO FURTHER DISCARDABLE ATTRIBUTES ARE NOT CARRIED, both because nothing this campaign has
+    /// reached reads either: `regLocale = #sentient<reg_type imm>`
+    /// (`SentientToProgIR/uniform_scalar_sub.mlir:65`), which a LOWER-rung op printing an upper-rung
+    /// attribute would be an inversion of, and `dir = 0 : i32`
+    /// (`SentientToProgIR/L3/mem2core-multicast-simple-e2e.mlir:38`). `e104` reaches the locale from
+    /// the `scalar_copy`, never from here.
     CreateMulticastGroup {
         /// `$result` — the handle the group is addressed by.
         result: Val,
@@ -541,6 +548,15 @@ pub enum Op {
         group_id: MulticastGroupId,
         /// `$count` — *"the initial number of outstanding requests"* (`Dataflow.td:169`).
         count: OutstandingRequests,
+        /// `init_packet_opt_en` — ⭐ A DISCARDABLE ATTRIBUTE THE TRANSLATOR SETS AND `dcc` ONLY
+        /// READS, AND THE WHOLE OF `e104_getRegisterInitPriority`'S `gtr` BRANCH. `isOptimizable` is
+        /// a bare `hasAttr("init_packet_opt_en")` (`dcc/src/Dialect/Dataflow/Utils.cpp:18-19`), so
+        /// presence IS the value and `dcc/src` contains no `setAttr` of it; a `gtr` is allowed into
+        /// the program header only when the group behind its `sentient.scalar_copy` carries it
+        /// (`Transform/Sentient/OldRegisterInitialization.cpp:220-240`). Printed as
+        /// `init_packet_opt_en = true` (`SentientToProgIR/uniform_scalar_sub.mlir:65`) and absent
+        /// entirely otherwise (`StandardToSentient/cmpi_select_different_BB.mlir:86`).
+        init_packet_opt_en: bool,
     },
 
     /// `dataflow.get_unit_collection {name} : vector<Nxindex>` — ONE HANDLE FOR N UNITS THAT RUN
@@ -861,13 +877,20 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
             num_consumers,
             group_id,
             count,
+            init_packet_opt_en,
         } => {
             // ⭐ NO SPACE BEFORE THE PAREN and the attribute dictionary is ALPHABETICAL — the
             // assembly format opens with a literal `(` (`Dataflow.td:182`) and MLIR sorts
-            // `attr-dict` by name.
+            // `attr-dict` by name, which puts `init_packet_opt_en` between the other two.
+            let opt = if *init_packet_opt_en {
+                ", init_packet_opt_en = true"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 out,
-                "{} = dataflow.create_multicast_group({} -> ({})) {{count = {} : i32, group_id = {} : i32, num_consumers = {} : i32}} : index",
+                "{} = dataflow.create_multicast_group({} -> ({})) \
+                 {{count = {} : i32, group_id = {} : i32{opt}, num_consumers = {} : i32}} : index",
                 print::val(*result),
                 print::val(*producer),
                 print::vals(consumers),
@@ -1086,7 +1109,8 @@ fn dictionary<K: Copy, V: Copy>(
 #[cfg(test)]
 mod tests {
     use crate::islands::dataflow_ir::dialects::dataflow::{
-        Op, Page, PageRect, PageSpan, PagedMemView,
+        ConsumerCount, MulticastGroupId, Op, OutstandingRequests, Page, PageRect, PageSpan,
+        PagedMemView,
     };
     use crate::islands::dataflow_ir::dialects::{self, Val};
     use crate::islands::dataflow_ir::print::emit;
@@ -1268,5 +1292,47 @@ mod tests {
             "} : index, index, memref<64x4x64xf16>\n",
         );
         assert_eq!(got, want);
+    }
+
+    /// ⭐⭐ IBM'S OWN MULTICAST GROUP, REPRODUCED BYTE FOR BYTE.
+    ///
+    /// `dcc/test/Conversion/StandardToSentient/cmpi_select_different_BB.mlir:86` and, for the
+    /// attribute `e104_getRegisterInitPriority` reads,
+    /// `dcc/test/Conversion/SentientToProgIR/uniform_scalar_sub.mlir:65` — whose two DISCARDABLE
+    /// attributes `regLocale` and `dir` this island deliberately does not carry, so the second want
+    /// is that line minus them.
+    ///
+    /// ⛔ BOTH VENDOR LINES HAVE AN EMPTY CONSUMER LIST AND A NON-ZERO `num_consumers`, which is why
+    /// the count is a field and not `consumers.len()`.
+    #[test]
+    fn reproduces_ibms_multicast_group() {
+        let group = |result, producer, count, group_id, num_consumers, opt| {
+            dialects::Op::Dataflow(Op::CreateMulticastGroup {
+                result: Val(result),
+                producer: Val(producer),
+                consumers: Vec::new(),
+                num_consumers: ConsumerCount(num_consumers),
+                group_id: MulticastGroupId(group_id),
+                count: OutstandingRequests(count),
+                init_packet_opt_en: opt,
+            })
+        };
+
+        let mut got = String::new();
+        emit(&mut got, &group(7, 1, 0, 3, 1, false), 0);
+        assert_eq!(
+            got,
+            "%7 = dataflow.create_multicast_group(%1 -> ()) \
+             {count = 0 : i32, group_id = 3 : i32, num_consumers = 1 : i32} : index\n"
+        );
+
+        let mut got = String::new();
+        emit(&mut got, &group(23, 9, 0, 1, 8, true), 0);
+        assert_eq!(
+            got,
+            "%23 = dataflow.create_multicast_group(%9 -> ()) \
+             {count = 0 : i32, group_id = 1 : i32, init_packet_opt_en = true, \
+             num_consumers = 8 : i32} : index\n"
+        );
     }
 }
