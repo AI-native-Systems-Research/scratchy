@@ -360,8 +360,8 @@ pub enum MaxDimSize {
 /// NON-EMPTY.
 ///
 /// ⛔⛔ TWO REFERENCE ABORTS GONE BY CONSTRUCTION. Zipping the two vectors is
-/// `DT_ERROR("Mismatch in allocate layout vectors")` (`ddc/ddcv1.cpp:1717`); being non-empty is
-/// `layoutDimOrder_.at(0)` (`:1706`).
+/// `DT_ERROR("Mismatch in allocate layout vectors")` (`ddc/ddcv1.cpp:1715-1716`); being non-empty is
+/// `layoutDimOrder_.at(0)` (`:1704`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocLayout {
     first: (PrimaryDim, MaxDimSize),
