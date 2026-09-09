@@ -324,7 +324,7 @@ pub fn fill_typed_reg_collection(
 /// ⛔ NOT AN ANCHORED UNIT — `Dialect/Uniform/Utils.cpp` is outside this campaign's file list. The
 /// reference dereferences the `getDefiningOp<DefImmutableMappingOp>()` without a check and
 /// `DT_CHECK`s the mapping non-empty, so both are a crash there and a named `todo!` here.
-fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64> {
+pub(crate) fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64> {
     let pairs = match defs.of(map) {
         Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs.clone(),
         other => todo!(

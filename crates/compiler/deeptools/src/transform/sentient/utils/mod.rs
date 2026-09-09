@@ -94,6 +94,20 @@
 //! | `e396_replaceValue` | 396 | 1 | 4 | `dcc/src/Transform/Sentient/Utils.hpp:175` |
 //! | `e546_findAndReplaceRedundantIterArgsUsedInConditions` | 546 | 3 | 138 | `dcc/src/Transform/Sentient/Utils.cpp:257` |
 
+#![allow(dead_code)]
+// ⛔ NOTHING CALLS THIS FILE YET — `Utils.cpp` is the campaign's shared leaf library, and its
+// consumers (`e392`, `e393`, `e395`, `e546` here, plus the passes) are not in this batch. CI runs
+// clippy with `-D warnings`, so without this the first ported leaf fails the gate.
+// ⭐ REMOVE THIS WITH THE FIRST CONSUMER: at that point an unused item here is a real defect again.
+
+use super::register_packing::constant_target_values;
+use super::scalar_op_merging_and_hoisting::{ScalarOpComp, compute_address_scale};
+use crate::arch::{Arch, Elements};
+use crate::formats::Bits;
+use sys_arch_spec::fields::{self, ImmSpec, ImmWidth, Sign};
+use crate::islands::sentient::dialects::sentient as ops;
+use crate::islands::sentient::dialects::{Definitions, Op, Val, uniform};
+
 pub(crate) mod units_and_their_values;
 
 
@@ -129,29 +143,413 @@ pub(crate) mod units_and_their_values;
 //   authority : dcc/src/Transform/Sentient/Utils.cpp:469  (55 body lines, level 0)
 //   original  : std::tuple<mlir::sentient::ForOp, int, int> getOutermostConstInitialization( BlockArgument iter_arg)
 
-// crustify:todo: e247_memoryOpRequiresImmutAddrScalarCopy
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:526  (64 body lines, level 0)
-//   original  : bool memoryOpRequiresImmutAddrScalarCopy(const dcc::DccExtContext &dcc_ext_ctx, SenComponents unit_type, Operation *op, bool do_range_check)
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The types e247 is stated in — its two `llvm_unreachable`s and its one `DT_CHECK`.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 
-// crustify:todo: e248_getFoldModeAttributeIfExists
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:593  (6 body lines, level 0)
-//   original  : std::optional<SentientFoldMode> getFoldModeAttributeIfExists(Operation *op)
+/// THE SIX MEMORY UNITS `memoryOpRequiresImmutAddrScalarCopy` DECIDES FOR — the units its own arms
+/// name, so the trailing `llvm_unreachable("unexpected operation or unit type")` (`Utils.cpp:589`) is
+/// only ever about a MISMATCHED op/unit pair and never about an unknown unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryUnit {
+    /// `L0LU` — the L0 load unit.
+    L0lu,
+    /// `L0SU` — the L0 store unit.
+    L0su,
+    /// `LXLU` — the LX load unit.
+    Lxlu,
+    /// `LXSU` — the LX store unit.
+    Lxsu,
+    /// `L3LU` — the L3 load half.
+    L3lu,
+    /// `L3SU` — the L3 store half.
+    L3su,
+}
 
-// crustify:todo: e250_hasUniformizeRegion
-//   authority : dcc/src/Transform/Sentient/Utils.cpp:622  (12 body lines, level 0)
-//   original  : bool hasUniformizeRegion(dataflow::ProgramUnitOp unit)
+impl MemoryUnit {
+    /// `DT_CHECK(!is_any_of(unit, L3LU, L3SU))` (`Utils/DccExtContext.cpp:36`) AS A CONVERSION —
+    /// `None` for the two L3 units, which have no IMM for these operations (`Utils.cpp:557-558`), and
+    /// the four that remain are exactly [`ScalarOpComp`]'s.
+    #[must_use]
+    pub(crate) const fn with_imm(self) -> Option<ScalarOpComp> {
+        match self {
+            MemoryUnit::L0lu => Some(ScalarOpComp::L0lu),
+            MemoryUnit::L0su => Some(ScalarOpComp::L0su),
+            MemoryUnit::Lxlu => Some(ScalarOpComp::Lxlu),
+            MemoryUnit::Lxsu => Some(ScalarOpComp::Lxsu),
+            MemoryUnit::L3lu | MemoryUnit::L3su => None,
+        }
+    }
+}
 
-// crustify:todo: e251_add
-//   authority : dcc/src/Transform/Sentient/Utils.hpp:165  (4 body lines, level 0)
-//   original  : void add(mlir::Value unit, mlir::Value value)
+/// `do_range_check` (`Utils.hpp:154`, defaulted `true`) — whether the constant is also checked against
+/// the unit's immediate width, or only tested for being constant at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeCheck {
+    /// The default: check the immediate fits.
+    Check,
+    /// Skip the width check — the caller is asking only whether the address is constant.
+    Skip,
+}
 
-// crustify:todo: e252_size
-//   authority : dcc/src/Transform/Sentient/Utils.hpp:171  (4 body lines, level 0)
-//   original  : const size_t size() const
+/// WHICH OF THE FOUR OPS THIS IS, AND THE ATTRIBUTES THAT OP CONTRIBUTES — the `dyn_cast` chain
+/// (`Utils.cpp:531-553`) with its `llvm_unreachable("unexpected op type")` as a type.
+///
+/// ⛔ EACH ARM CARRIES ONLY WHAT ITS ARM READS. The reference leaves `burst_size`/`il` at their
+/// initialised 0 for the two scalar/compute ops and reads `getChunkStride()` on the load alone, so a
+/// chunk stride is not a fact the other three have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImmutAddrMemoryOp {
+    /// `sentient.receive_and_store`.
+    ReceiveAndStore {
+        /// `getBurstSize()`.
+        burst_size: Elements,
+        /// `getInterleavedGroup()`.
+        interleaved_group: Elements,
+    },
+    /// `sentient.load_and_send`.
+    LoadAndSend {
+        /// `getBurstSize()`.
+        burst_size: Elements,
+        /// `getInterleavedGroup()`.
+        interleaved_group: Elements,
+        /// `getChunkStride()` — read by no other arm.
+        chunk_stride: Elements,
+    },
+    /// `sentient.load_and_extract_scalar`.
+    LoadAndExtractScalar,
+    /// `sentient.load_compute_and_send`.
+    LoadComputeAndSend,
+}
 
-// crustify:todo: e253_areAllValuesEqual
-//   authority : dcc/src/Transform/Sentient/Utils.hpp:180  (6 body lines, level 0)
-//   original  : bool areAllValuesEqual()
+/// ONE MEMORY OP AS e247 READS IT — the kind, the immutable address and the element size the address
+/// is computed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImmutAddrMemoryOpInfo {
+    /// Which op, and its own attributes.
+    pub kind: ImmutAddrMemoryOp,
+    /// `getImmutableAddr()` — the operand every test below is about.
+    pub immutable_addr: Val,
+    /// `getElementSize()`, or `getDstElementSize()` for an LCAS (`:550`) — a width in BITS.
+    pub element_size: Bits,
+}
+
+impl ImmutAddrMemoryOpInfo {
+    /// The `dyn_cast` chain (`Utils.cpp:531-553`) — `None` where the reference reaches
+    /// `llvm_unreachable("unexpected op type")`.
+    #[must_use]
+    pub fn of(op: &Op) -> Option<ImmutAddrMemoryOpInfo> {
+        match op {
+            Op::Sentient(ops::Op::ReceiveAndStore {
+                immutable_addr,
+                extent,
+                interleaved_group,
+                ..
+            }) => Some(ImmutAddrMemoryOpInfo {
+                kind: ImmutAddrMemoryOp::ReceiveAndStore {
+                    burst_size: extent.burst_size,
+                    interleaved_group: *interleaved_group,
+                },
+                immutable_addr: *immutable_addr,
+                element_size: extent.element_size,
+            }),
+            Op::Sentient(ops::Op::LoadAndSend {
+                immutable_addr,
+                extent,
+                interleaved_group,
+                ..
+            }) => Some(ImmutAddrMemoryOpInfo {
+                kind: ImmutAddrMemoryOp::LoadAndSend {
+                    burst_size: extent.burst_size,
+                    interleaved_group: *interleaved_group,
+                    chunk_stride: extent.chunk_stride,
+                },
+                immutable_addr: *immutable_addr,
+                element_size: extent.element_size,
+            }),
+            Op::Sentient(ops::Op::LoadAndExtractScalar {
+                immutable_addr,
+                element_size,
+                ..
+            }) => Some(ImmutAddrMemoryOpInfo {
+                kind: ImmutAddrMemoryOp::LoadAndExtractScalar,
+                immutable_addr: *immutable_addr,
+                element_size: *element_size,
+            }),
+            Op::Sentient(ops::Op::LoadComputeAndSend {
+                immutable_addr,
+                dst_element_size,
+                ..
+            }) => Some(ImmutAddrMemoryOpInfo {
+                kind: ImmutAddrMemoryOp::LoadComputeAndSend,
+                immutable_addr: *immutable_addr,
+                element_size: *dst_element_size,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// `isConstant<mlir::sentient::ConstantOp>` (`Utils/Utils.cpp:424-447`) AND THE CONSTANTS IT FOUND —
+/// so `is_imm_size_valid`'s opening `DT_CHECK_MSG(isConstant(imm), …)` (`DccExtContext.cpp:34`) is
+/// this value's existence rather than a check the range test repeats.
+///
+/// ⛔ NOT THE NARROWER PRIVATE COPIES: `rematerialization_pass/mod.rs:173` and
+/// `scalar_copy_insertion_for_symbols/mod.rs:356` each hold one that omits the query-map arm, and
+/// they should collapse into this when their units are reviewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstantImm {
+    /// A `sentient.scalar_constant` — one value for every unit.
+    Scalar(i64),
+    /// A `uniform.query_map` whose mapping targets are all constants — one value per unit.
+    PerUnit(Vec<i64>),
+}
+
+/// `isConstant<mlir::sentient::ConstantOp>(val)` (`Utils/Utils.cpp:424-447`), keeping the values.
+///
+/// ⭐ `None` COVERS ALL THREE OF THE REFERENCE'S FALSE PATHS: a block argument (`defs.of` answers
+/// `None`), an op that is neither a constant nor a query map, and a query map with a non-constant
+/// target — which is also the empty list `getConstantTargetValues` returns for the last of those.
+#[must_use]
+pub fn constant_imm(val: Val, defs: Definitions<'_>) -> Option<ConstantImm> {
+    match defs.of(val) {
+        Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => {
+            Some(ConstantImm::Scalar(*value))
+        }
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let values = constant_target_values(*map, defs);
+            if values.is_empty() {
+                None
+            } else {
+                Some(ConstantImm::PerUnit(values))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `Isa::typeToImmInfo.at(isa.getOpcodeType(OpCodeT::LDSTIU))` for one unit
+/// (`Utils/DccExtContext.cpp:40-46`).
+///
+/// ⭐ `DT_CHECK(sizeSignMap.size() == 1)` (`:43`) FAILS THE BUILD HERE, not the run: this is a
+/// `const fn` and the four call sites below are `const` items, so a table with two immediate fields on
+/// the LDSTIU type is a compile error.
+const fn ldstiu_imm_info(comp: fields::Comp) -> (ImmWidth, Sign) {
+    let opcodes = comp.opcodes();
+    let mut i = 0;
+    let mut ldstiu = None;
+    while i < opcodes.len() {
+        if str_eq(opcodes[i].op, "LDSTIU") {
+            ldstiu = Some(opcodes[i].ty);
+        }
+        i += 1;
+    }
+    let ty = match ldstiu {
+        Some(ty) => ty.get(),
+        None => panic!("every memory unit defines LDSTIU (`isa.cpp:1132`, `:1198`, `:1267`, `:1359`)"),
+    };
+
+    let all = comp.fields();
+    let mut j = 0;
+    let mut info = None;
+    let mut found = 0;
+    while j < all.len() {
+        if all[j].ty.get() == ty
+            && let ImmSpec::Imm { bits, sign } = all[j].imm
+        {
+            info = Some((bits, sign));
+            found += 1;
+        }
+        j += 1;
+    }
+    match (info, found) {
+        (Some(info), 1) => info,
+        _ => panic!(
+            "the LDSTIU type must have exactly one immediate field — \
+             DT_CHECK(sizeSignMap.size() == 1) (`Utils/DccExtContext.cpp:43`)"
+        ),
+    }
+}
+
+/// `str::eq` is not `const`, and [`ldstiu_imm_info`] needs the opcode spelling compared at build time.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const LDSTIU_IMM_L0LU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::L0lu);
+const LDSTIU_IMM_L0SU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::L0su);
+const LDSTIU_IMM_LXLU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::Lxlu);
+const LDSTIU_IMM_LXSU: (ImmWidth, Sign) = ldstiu_imm_info(fields::Comp::Lxsu);
+
+/// `DccExtContext::is_imm_size_valid` (`Utils/DccExtContext.cpp:32-75`) — whether the constant
+/// immutable address still fits the unit's LDSTIU immediate field once scaled.
+///
+/// ⛔ NOT AN ANCHORED UNIT: `dcc/src/Utils/` is outside this campaign's file list, and this is the
+/// same in-scope-because-it-is-needed case as
+/// [`machine_max_reg_num`](super::local_region_splitting_for_value_commoning).
+///
+/// TRAP: the reference computes `(imm * element_size) / 8 / scale` in a 32-bit `int` and compares
+/// against `pow(2, immSize)` in `double`; the width is at most 14 bits, so `i64` throughout is the
+/// same answer without the overflow.
+#[must_use]
+pub(crate) fn imm_size_valid<A: Arch>(
+    unit: ScalarOpComp,
+    imm: &ConstantImm,
+    element_size: Bits,
+) -> bool {
+    let (bits, sign) = match unit {
+        ScalarOpComp::L0lu => LDSTIU_IMM_L0LU,
+        ScalarOpComp::L0su => LDSTIU_IMM_L0SU,
+        ScalarOpComp::Lxlu => LDSTIU_IMM_LXLU,
+        ScalarOpComp::Lxsu => LDSTIU_IMM_LXSU,
+    };
+    let scale = i64::from(compute_address_scale::<A>(unit).get());
+    let width = i64::from(bits.get());
+    let valid = |value: i64| -> bool {
+        let val = (value * i64::from(element_size.0)) / 8 / scale;
+        match sign {
+            Sign::Unsigned => val < (1 << width) && val >= 0,
+            Sign::Signed => val < (1 << (width - 1)) && val >= -(1 << (width - 1)),
+            Sign::ModuloUnsigned => val <= (1 << width) && val >= -(1 << width),
+        }
+    };
+    match imm {
+        ConstantImm::Scalar(value) => valid(*value),
+        // ⭐ EVERY UNIT'S TARGET MUST FIT, and `llvm::all_of` over the empty list is true — which is
+        // the symbol case the reference notes performs no range check (`:65-67`).
+        ConstantImm::PerUnit(values) => values.iter().all(|value| valid(*value)),
+    }
+}
+
+/// Replaces: e247_memoryOpRequiresImmutAddrScalarCopy
+///
+/// Whether a memory op's constant immutable address must be copied into a scalar register rather than
+/// ridden as an LDSTIU immediate (`Utils.cpp:526-590`).
+///
+/// TRAP: the LCAS arm can only ever return `false` — `DT_CHECK_MSG(is_constant && is_in_range, …)`
+/// (`:582`) throws whenever `res` would be true, and `DT_CHECK_MSG` is not debug-gated
+/// (`util/dt_exception.hpp:107-118`). TRAP: `load_and_send`'s `chunk_stride` DEFAULTS TO **1**
+/// (`SentientOps.td:517`), so an L0LU load's `chunk_stride_present` is normally TRUE.
+#[must_use]
+pub fn memory_op_requires_immut_addr_scalar_copy<A: Arch>(
+    unit_type: MemoryUnit,
+    op: &ImmutAddrMemoryOpInfo,
+    do_range_check: RangeCheck,
+    defs: Definitions<'_>,
+) -> bool {
+    // Every arm below is `is_constant && …`, and the L3 arm returns `is_constant` itself.
+    let Some(imm) = constant_imm(op.immutable_addr, defs) else {
+        return false;
+    };
+    let is_in_range = match (do_range_check, unit_type.with_imm()) {
+        (RangeCheck::Check, Some(unit)) => imm_size_valid::<A>(unit, &imm, op.element_size),
+        // `do_range_check` off, or an L3 unit with no IMM for these operations (`:557-558`).
+        (RangeCheck::Check | RangeCheck::Skip, _) => true,
+    };
+
+    // ⛔ THE ORDER IS THE `else if` CHAIN'S: the two scalar/compute ops answer before the L3 arm, so an
+    // LAE or LCAS on an L3 unit reaches its own arm with `is_in_range` forced true (`:576-586`).
+    match (op.kind, unit_type) {
+        (
+            ImmutAddrMemoryOp::ReceiveAndStore {
+                burst_size,
+                interleaved_group,
+            },
+            MemoryUnit::L0su | MemoryUnit::Lxsu,
+        ) => burst_size > Elements(1) || interleaved_group > Elements(0) || !is_in_range,
+        (
+            ImmutAddrMemoryOp::LoadAndSend {
+                burst_size,
+                interleaved_group,
+                chunk_stride,
+            },
+            MemoryUnit::L0lu | MemoryUnit::Lxlu,
+        ) => {
+            // `chunk_stride_present` is an L0LU-only term — LX uses no LRF for the offset (`:543`).
+            let chunk_stride_present =
+                unit_type == MemoryUnit::L0lu && chunk_stride > Elements(0);
+            burst_size > Elements(1)
+                || interleaved_group > Elements(0)
+                || chunk_stride_present
+                || !is_in_range
+        }
+        (ImmutAddrMemoryOp::LoadAndExtractScalar, _) => !is_in_range,
+        (ImmutAddrMemoryOp::LoadComputeAndSend, MemoryUnit::Lxlu) => {
+            if is_in_range {
+                false
+            } else {
+                panic!(
+                    "sentient::LoadComputeAndSendOp requires immediate immutable address in range \
+                     (`Utils.cpp:582`)"
+                )
+            }
+        }
+        (ImmutAddrMemoryOp::LoadComputeAndSend, _) => {
+            panic!("DT_CHECK(unit_type == LXLU) (`Utils.cpp:580`): {unit_type:?}")
+        }
+        // No imm in L3LU/L3SU, so being constant at all is the whole answer (`:586-588`).
+        (
+            ImmutAddrMemoryOp::ReceiveAndStore { .. } | ImmutAddrMemoryOp::LoadAndSend { .. },
+            MemoryUnit::L3lu | MemoryUnit::L3su,
+        ) => true,
+        (ImmutAddrMemoryOp::ReceiveAndStore { .. } | ImmutAddrMemoryOp::LoadAndSend { .. }, _) => {
+            panic!(
+                "llvm_unreachable(\"unexpected operation or unit type\") (`Utils.cpp:589`): \
+                 {:?} on {unit_type:?}",
+                op.kind
+            )
+        }
+    }
+}
+
+/// Replaces: e248_getFoldModeAttributeIfExists
+///
+/// An op's `fold_mode` attribute, `None` when it carries none (`Utils.cpp:593-598`).
+///
+/// ⭐ THE `if (!op)` NULL CHECK IS THE `&Op` PARAMETER, and `hasAttr("fold_mode")` is WHICH VARIANT:
+/// the four compute ops are the only ones the `.td` gives the attribute to, and on those it is already
+/// an `Option` because it is a `DefaultValuedAttr`.
+#[must_use]
+pub fn fold_mode_attribute_if_exists(op: &Op) -> Option<ops::FoldMode> {
+    match op {
+        Op::Sentient(
+            ops::Op::VectorMac { fold_mode, .. }
+            | ops::Op::VectorBinary { fold_mode, .. }
+            | ops::Op::VectorUnary { fold_mode, .. }
+            | ops::Op::VectorTernary { fold_mode, .. },
+        ) => *fold_mode,
+        _ => None,
+    }
+}
+
+/// Replaces: e250_hasUniformizeRegion
+///
+/// Whether a program unit holds a `uniform.uniformize_regions` or a `uniform.equalize_pattern`
+/// anywhere inside it (`Utils.cpp:622-632`).
+///
+/// ⭐ ONE FUNCTION, TWO DECLARATIONS: this body and `OldRegisterInitialization.cpp:536-547` are
+/// byte-identical, and that one is already ported as `e107_hasUniformizeRegion` — so this FORWARDS to
+/// it rather than walking the unit a second time.
+#[must_use]
+pub fn has_uniformize_region(unit_body: &[Op]) -> bool {
+    super::old_register_initialization::register_init_info::has_uniformize_region(unit_body)
+}
+
+// e251_add, e252_size and e253_areAllValuesEqual are ported ONE MODULE DOWN, on the
+// `UnitsAndTheirValues` that already carries e249_normalizeNullValues:
+// `units_and_their_values.rs`. The scheduler split one C++ class (`Utils.hpp:161-190`) across two
+// homes; a second Rust type with the same fields would be the split made real.
 
 // crustify:todo: e392_getQueryKeyAndUnitsFromParentRegion
 //   authority : dcc/src/Transform/Sentient/Utils.cpp:40  (24 body lines, level 1)
@@ -178,3 +576,151 @@ pub(crate) mod units_and_their_values;
 //   original  : LogicalResult findAndReplaceRedundantIterArgsUsedInConditions( mlir::sentient::ForOp loop, std::set<int> &iter_arg_indices_to_delete)
 //   calls     : e422_insert
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+
+    /// `sentient.scalar_constant` — the constant an immutable address resolves to.
+    fn scalar_constant(result: Val, value: i64) -> Op {
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: ops::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.load_and_send` reading `immutable_addr`, with the `.td`'s own extent defaults.
+    fn load_and_send(immutable_addr: Val, chunk_stride: Elements) -> Op {
+        Op::Sentient(ops::Op::LoadAndSend {
+            mutable_addr: Val(1),
+            immutable_addr,
+            increment: Val(3),
+            consumer: SendEnd::to_self(Val(4)),
+            result: Val(5),
+            extent: ops::Extent {
+                chunk_stride,
+                ..ops::Extent::of(Elements(64), Bits(32))
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ops::ShuffleMode::NoShuffle,
+            reg: ops::Reg {
+                locale: ops::RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// `sentient.vector_unary`, carrying `fold_mode` or not.
+    fn vector_unary(fold_mode: Option<ops::FoldMode>) -> Op {
+        Op::Sentient(ops::Op::VectorUnary {
+            mask: Val(2),
+            op_a: ops::Operand::from(ops::Port::Zero),
+            unary_op: ops::UnaryOp::Floor,
+            result: ops::ResultPorts::default(),
+            compute_precision: ops::Precision::Fp16,
+            fold_mode,
+            unroll_factor: ops::UnrollFactor::X1,
+            dbg_name: None,
+        })
+    }
+
+    /// AN L0LU LOAD NEEDS THE COPY FOR ITS CHUNK STRIDE ALONE, the same load on LXLU does not, and a
+    /// non-constant address needs none — the three ways the `is_constant && (…)` arm resolves.
+    #[test]
+    fn e247_memory_op_requires_immut_addr_scalar_copy() {
+        let scope = vec![
+            scalar_constant(Val(2), 0),
+            load_and_send(Val(2), Elements(1)),
+        ];
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let op = ImmutAddrMemoryOpInfo::of(&scope[1]).expect("a load_and_send is one of the four");
+
+        assert!(memory_op_requires_immut_addr_scalar_copy::<Dd2>(
+            MemoryUnit::L0lu,
+            &op,
+            RangeCheck::Check,
+            defs
+        ));
+        assert!(!memory_op_requires_immut_addr_scalar_copy::<Dd2>(
+            MemoryUnit::Lxlu,
+            &op,
+            RangeCheck::Check,
+            defs
+        ));
+
+        // A block argument is not a constant, so no arm can ask for the copy.
+        let unbound = ImmutAddrMemoryOpInfo {
+            immutable_addr: Val(99),
+            ..op
+        };
+        assert!(!memory_op_requires_immut_addr_scalar_copy::<Dd2>(
+            MemoryUnit::L0lu,
+            &unbound,
+            RangeCheck::Check,
+            defs
+        ));
+    }
+
+    /// AN ADDRESS THAT DOES NOT FIT THE UNIT'S IMMEDIATE FORCES THE COPY on the unit whose field is
+    /// narrower, and the wider one takes the same address as an immediate.
+    #[test]
+    fn e247_an_out_of_range_constant_needs_the_copy() {
+        let scope = vec![
+            scalar_constant(Val(2), 8_000),
+            load_and_send(Val(2), Elements(0)),
+        ];
+        let regions: [&[Op]; 1] = [&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let op = ImmutAddrMemoryOpInfo::of(&scope[1]).expect("a load_and_send is one of the four");
+
+        // 8000 * 32 bits / 8 = 32,000, past LXLU's 14-bit signed field but not past `Skip`.
+        assert!(memory_op_requires_immut_addr_scalar_copy::<Dd2>(
+            MemoryUnit::Lxlu,
+            &op,
+            RangeCheck::Check,
+            defs
+        ));
+        assert!(!memory_op_requires_immut_addr_scalar_copy::<Dd2>(
+            MemoryUnit::Lxlu,
+            &op,
+            RangeCheck::Skip,
+            defs
+        ));
+    }
+
+    /// THE ATTRIBUTE IS RETURNED WHERE IT EXISTS, and an op the `.td` gives no `fold_mode` answers
+    /// `None` rather than `FoldMode::None`.
+    #[test]
+    fn e248_get_fold_mode_attribute_if_exists() {
+        assert_eq!(
+            fold_mode_attribute_if_exists(&vector_unary(Some(ops::FoldMode::FoldAbBoth))),
+            Some(ops::FoldMode::FoldAbBoth)
+        );
+        assert_eq!(fold_mode_attribute_if_exists(&vector_unary(None)), None);
+        assert_eq!(
+            fold_mode_attribute_if_exists(&scalar_constant(Val(2), 0)),
+            None
+        );
+    }
+
+    /// THE RE-EXPORT ANSWERS FOR BOTH MEMBERS OF THE `isa<>`, and `false` for a unit holding neither.
+    #[test]
+    fn e250_has_uniformize_region() {
+        assert!(has_uniformize_region(&[Op::Uniform(
+            uniform::Op::UniformizeRegions {
+                regions: Vec::new(),
+                results: Vec::new(),
+            }
+        )]));
+        assert!(!has_uniformize_region(&[scalar_constant(Val(2), 0)]));
+    }
+}

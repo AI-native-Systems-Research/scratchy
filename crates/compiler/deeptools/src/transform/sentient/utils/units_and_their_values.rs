@@ -78,10 +78,9 @@
 //! | `e394_dump` | 394 | 1 | 6 | `dcc/src/Transform/Sentient/Utils.cpp:615` |
 
 
-// ⛔ NOTHING CALLS THIS TYPE YET. `add` (e251), `size` (e252), `replaceValue` (e396) and
-// `areAllValuesEqual` (e253) are anchored in the PARENT module (`super`, `Utils.hpp:165-185`) and its
-// one consumer is `RegisterInitCandidatePromoter` (e606, e517, e570); every one of those anchors is
-// still open. ⭐ REMOVE THIS WITH THE FIRST OF THEM: an unused item here is a real defect from then on.
+// ⛔ NOTHING CALLS THIS TYPE YET. `replaceValue` (e396) is still anchored in the PARENT module, and
+// the type's one consumer is `RegisterInitCandidatePromoter` (e606, e517, e570) — all still open.
+// ⭐ REMOVE THIS WITH THE FIRST OF THEM: an unused item here is a real defect from then on.
 #![allow(dead_code)]
 
 use crate::islands::sentient::dialects::Val;
@@ -122,6 +121,38 @@ impl UnitsAndTheirValues {
             }
         }
     }
+
+    /// Replaces: e251_add
+    ///
+    /// `add(unit, value)` (`Utils.hpp:165`) — one more mapping, with the two lists the same length by
+    /// construction rather than by a check.
+    pub(crate) fn add(&mut self, unit: Val, value: Option<Val>) {
+        self.pairs.push((unit, value));
+    }
+
+    /// Replaces: e252_size
+    ///
+    /// `size()` (`Utils.hpp:171`) — how many units are mapped.
+    ///
+    /// ⭐ THE `DT_CHECK` IS GONE, NOT SKIPPED: [`Self::pairs`] makes the two lengths one number, so
+    /// this cannot refuse.
+    #[must_use]
+    pub(crate) fn size(&self) -> usize {
+        self.pairs.len()
+    }
+
+    /// Replaces: e253_areAllValuesEqual
+    ///
+    /// `areAllValuesEqual()` (`Utils.hpp:180`) — whether every mapped value is the same one.
+    ///
+    /// ⛔ `None` IS NOT `false`. It is `DT_CHECK(!values_.empty())` (`:181`), a crash on an empty
+    /// mapping, and a caller that reads it as "not all equal" inverts the branch it guards
+    /// (`OldRegisterInitialization.cpp:925`).
+    #[must_use]
+    pub(crate) fn are_all_values_equal(&self) -> Option<bool> {
+        let (_, last) = *self.pairs.last()?;
+        Some(self.pairs.iter().all(|(_, value)| *value == last))
+    }
 }
 
 // crustify:todo: e394_dump
@@ -161,5 +192,31 @@ mod unit_tests {
         };
         all_null.normalize_null_values();
         assert_eq!(all_null.pairs, vec![(Val(10), None), (Val(11), None)]);
+    }
+
+    /// `add` KEEPS THE PAIRS IN PUSH ORDER and `size` counts them — including a null value.
+    #[test]
+    fn e251_add_and_e252_size() {
+        let mut uvs = UnitsAndTheirValues::default();
+        uvs.add(Val(1), None);
+        uvs.add(Val(2), Some(Val(3)));
+
+        assert_eq!(uvs.size(), 2);
+        assert_eq!(uvs.pairs, vec![(Val(1), None), (Val(2), Some(Val(3)))]);
+    }
+
+    /// ALL EQUAL, NOT ALL EQUAL, AND THE EMPTY MAPPING'S `None` — which is the reference's `DT_CHECK`
+    /// and NOT an answer of `false`.
+    #[test]
+    fn e253_are_all_values_equal() {
+        let mut uvs = UnitsAndTheirValues::default();
+        assert_eq!(uvs.are_all_values_equal(), None);
+
+        uvs.add(Val(1), Some(Val(9)));
+        uvs.add(Val(2), Some(Val(9)));
+        assert_eq!(uvs.are_all_values_equal(), Some(true));
+
+        uvs.add(Val(3), None);
+        assert_eq!(uvs.are_all_values_equal(), Some(false));
     }
 }
