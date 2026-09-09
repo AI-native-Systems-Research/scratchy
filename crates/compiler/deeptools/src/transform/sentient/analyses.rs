@@ -152,6 +152,26 @@ pub trait ExpressionEvaluator {
         walked: &mut Vec<Op>,
         ty: ScalarTy,
     ) -> Val;
+
+    /// The SAME `EvaluatedValue::buildOffsetValue` (`:126`) reached from a STORED handle rather than a
+    /// fresh [`Evaluation`] — what a memoising pass has when it comes back to build the value.
+    ///
+    /// ⛔ THE HANDLE IS NOT AN [`Evaluation`] AND CANNOT BE TURNED INTO ONE HERE: the arena entry it
+    /// names is the analysis's, so `ScalarOpMerging::unrollBurstAndIL` (`:1042`) calls the method on
+    /// `const EvaluatedValue *` directly. ⭐ DEFAULTED so the out-of-scope refusal is stated once and
+    /// a test double that never unrolls need not repeat it.
+    fn build_offset_value_of(
+        &mut self,
+        immutable: EvaluatedValue,
+        sites: &mut OffsetSites<'_>,
+        walked: &mut Vec<Op>,
+        ty: ScalarTy,
+    ) -> Val {
+        let _ = (immutable, sites, walked, ty);
+        todo!(
+            "EvaluatedValue::buildOffsetValue (Analyses/ExpressionEvaluatorUtils.h:126) — out of campaign scope"
+        )
+    }
 }
 
 /// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.

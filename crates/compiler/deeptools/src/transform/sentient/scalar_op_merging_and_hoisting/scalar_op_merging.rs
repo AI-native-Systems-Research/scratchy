@@ -86,26 +86,292 @@
 //! | `e577_collectBlocks` | 577 | 4 | 26 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:869` |
 //! | `e611_runScalarOpMerging` | 611 | 5 | 10 | `dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:569` |
 
+use core::cmp::Ordering;
 
-// crustify:todo: e165_calculateIBuffRequired
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:591  (24 body lines, level 0)
-//   original  : template <class OpTy> int ScalarOpMerging::calculateIBuffRequired(Operation *op)
+use super::{BurstAndIl, FieldUnrollData, OperationData, ScalarOpMergingBlock, UnrollTarget};
+use crate::arch::Elements;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::sentient as ops;
+use crate::islands::sentient::dialects::{
+    Op, Val, erase_defining_op, replace_all_uses_with, results, use_count,
+};
+use crate::transform::sentient::analyses::{ExpressionEvaluator, InstructionCount, OffsetSites};
 
-// crustify:todo: e166_isProfitableForHoisting
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:837  (29 body lines, level 0)
-//   original  : bool ScalarOpMerging::isProfitableForHoisting(ScalarOpMergingBlock &block)
+/// Replaces: e165_calculateIBuffRequired
+///
+/// The ADDITIONAL IBuff entries one transfer's burst and interleaved group cost — their product,
+/// less the one entry the op itself already consumes (`:591-615`).
+///
+/// ⭐ `max(_, 1)` GIVES 0, 1 AND THE REFERENCE'S `il_group = -1` ONE ANSWER, which is why
+/// [`BurstAndIl`] can carry the island's unsigned counts without losing a case.
+#[must_use]
+pub(crate) fn calculate_ibuff_required(transfer: BurstAndIl) -> InstructionCount {
+    let entries = transfer
+        .burst
+        .0
+        .max(1)
+        .saturating_mul(transfer.interleaved_group.0.max(1))
+        - 1;
+    // `(int)` on both counts, and `int` is what `required_ibuff_` accumulates. ⭐ SATURATING WHERE THE
+    // REFERENCE'S NARROWING CAST IS IMPLEMENTATION-DEFINED: a burst past `INT_MAX` is not an IBuff
+    // budget any unit could meet on either side of the conversion.
+    InstructionCount(i32::try_from(entries).unwrap_or(i32::MAX))
+}
 
-// crustify:todo: e167_sortBlocks
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:910  (19 body lines, level 0)
-//   original  : void ScalarOpMerging::sortBlocks()
+/// Replaces: e166_isProfitableForHoisting
+///
+/// Whether merging `block` would also let scalar op hoisting fire: the block's bottom op must feed
+/// the enclosing `sentient.for`'s `sentient.yield` at the very iter-arg position the block reads
+/// (`:837-865`).
+///
+/// ⭐ `parent_op` IS `region->getParentOp()`, which a `&mut Vec<Op>` region cannot answer — `None`,
+/// and any op that is not a `sentient.for`, are both the reference's failed `dyn_cast_or_null`.
+#[must_use]
+pub(crate) fn is_profitable_for_hoisting(
+    block: &ScalarOpMergingBlock,
+    parent_op: Option<&Op>,
+) -> bool {
+    // "Blocks are formed in reverse order so the front of the block is closest to the bottom of the
+    // containing Region" — and an empty block has no such op, which `front()` does not survive.
+    let Some(&OperationData { op: bottom_op, .. }) = block.block_ops.first() else {
+        return false;
+    };
+    let Some(Op::Sentient(ops::Op::For { carried, body, .. })) = parent_op else {
+        return false;
+    };
+    let Some(input_val) = block.input_value_to_block else {
+        return false;
+    };
+    // `!input_val.hasOneUse()`. ⭐ COUNTING INSIDE THE BODY LOSES NOTHING: the count only decides the
+    // answer for a value that IS one of `carried`'s args, and a region argument has no use outside.
+    if use_count(input_val, body) != 1 {
+        return false;
+    }
+    let Some(yielded) = body.iter().find_map(|op| match op {
+        Op::Sentient(ops::Op::Yield { results }) => Some(results),
+        _ => None,
+    }) else {
+        return false;
+    };
+    // ⭐ `*last_op_in_block->getUsers().begin()` IS THAT YIELD, OR THE ANSWER IS NO: every op of a
+    // merging block has exactly one use, so a yield reading `bottom_op` at `idx` is that one use.
+    carried
+        .iter()
+        .enumerate()
+        .any(|(idx, slot)| slot.arg == input_val && yielded.get(idx) == Some(&bottom_op))
+}
 
-// crustify:todo: e168_unrollBurstAndIL
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1011  (51 body lines, level 0)
-//   original  : template <class OpTy> SmallVector<Operation *> ScalarOpMerging::unrollBurstAndIL( FieldUnrollData &unroll_candidate)
+/// HOW MUCH TRANSFORMING ONE BLOCK IS WORTH — `sortBlocks`'s `GetBlockRatio` lambda (`:911-926`).
+///
+/// ⛔ NEITHER THE FLOAT NOR THE `1000.0` SENTINEL SURVIVES, BECAUSE BOTH SPELL AN ORDER. The ratio is
+/// `num_scalar_ops / required_ibuff` and the sentinel is there so a block needing no IBuff "will
+/// always beat blocks that do require additional IBuff" — the reference's own words. Comparing by
+/// cross-multiplication says the first exactly, and a greatest element says the second including the
+/// one case the sentinel gets wrong: 1001 eliminated scalar ops against a single IBuff slot.
+#[derive(Debug, Clone, Copy)]
+enum BlockRatio {
+    /// `(float)getNumScalarOpsInBlock() / (float)required_ibuff`, kept as the pair.
+    PerSlot { ops: u32, slots: i32 },
+    /// `required_ibuff == 0` — highest priority, and transformed wherever it lands.
+    NoSlotsNeeded,
+}
 
-// crustify:todo: e169_findFieldUnrollCandidate
-//   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1294  (8 body lines, level 0)
-//   original  : std::optional<FieldUnrollData> ScalarOpMerging::findFieldUnrollCandidate( Operation *op, ScalarOpMergingBlock &block)
+impl BlockRatio {
+    fn of(block: &ScalarOpMergingBlock) -> BlockRatio {
+        if block.required_ibuff == InstructionCount(0) {
+            return BlockRatio::NoSlotsNeeded;
+        }
+        BlockRatio::PerSlot {
+            ops: block.num_scalar_ops_in_block.0,
+            slots: block.required_ibuff.0,
+        }
+    }
+}
+
+impl Ord for BlockRatio {
+    fn cmp(&self, other: &BlockRatio) -> Ordering {
+        match (self, other) {
+            (BlockRatio::NoSlotsNeeded, BlockRatio::NoSlotsNeeded) => Ordering::Equal,
+            (BlockRatio::NoSlotsNeeded, BlockRatio::PerSlot { .. }) => Ordering::Greater,
+            (BlockRatio::PerSlot { .. }, BlockRatio::NoSlotsNeeded) => Ordering::Less,
+            // `a.ops / a.slots` against `b.ops / b.slots`, without the division. ⭐ THE DIVISOR IS
+            // POSITIVE HERE — `required_ibuff_` is a sum of `calculateIBuffRequired` answers, none of
+            // them negative — so cross-multiplication preserves the order the float division gives.
+            // `i128` because `u32 * i32` is the one place this could wrap, and a wrap reorders the pass.
+            (
+                BlockRatio::PerSlot {
+                    ops: a_ops,
+                    slots: a_slots,
+                },
+                BlockRatio::PerSlot {
+                    ops: b_ops,
+                    slots: b_slots,
+                },
+            ) => (i128::from(*a_ops) * i128::from(*b_slots))
+                .cmp(&(i128::from(*b_ops) * i128::from(*a_slots))),
+        }
+    }
+}
+
+impl PartialOrd for BlockRatio {
+    fn partial_cmp(&self, other: &BlockRatio) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for BlockRatio {
+    fn eq(&self, other: &BlockRatio) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for BlockRatio {}
+
+/// Replaces: e167_sortBlocks
+///
+/// Orders the candidate blocks highest benefit first, so that running out of IBuff drops the least
+/// valuable of them (`:910-928`).
+///
+/// ⭐ STABLE WHERE `std::sort` IS NOT: the C++ order among equal ratios is unspecified, and two
+/// equally valuable blocks still have to be transformed in SOME order — collection order is the one
+/// that is reproducible.
+pub(crate) fn sort_blocks(blocks: &mut [ScalarOpMergingBlock]) {
+    // `GetBlockRatio(a) > GetBlockRatio(b)` — descending.
+    blocks.sort_by(|a, b| BlockRatio::of(b).cmp(&BlockRatio::of(a)));
+}
+
+/// Replaces: e168_unrollBurstAndIL
+///
+/// FIELD UNROLLS one transfer: replaces it with one copy per speculative immutable, chained through
+/// `mutable_addr`, each unbursted, un-interleaved and incrementing by zero (`:1011-1062`). Answers
+/// the values the created ops bind, in creation order.
+///
+/// ⛔ THE EXTRA ADDS THE IL CASE NEEDS ARE NOT EMITTED HERE and that is the reference: its own note
+/// says the merging candidate absorbs them, and `mutable_addr` chaining is all it creates.
+pub(crate) fn unroll_burst_and_il(
+    target: UnrollTarget,
+    region: &mut Vec<Op>,
+    evaluator: &mut dyn ExpressionEvaluator,
+    sites: &mut OffsetSites<'_>,
+) -> Vec<Val> {
+    // `zero_const` — ONE for the whole unroll, in the const builder's block (`:1030-1033`).
+    let zero = sites.values.mint();
+    sites.consts.push(Op::Sentient(ops::Op::ScalarConstant {
+        value: 0,
+        result: zero,
+        reg_locale: ops::RegType::Imm,
+        ty: ScalarTy::Index,
+        is_symbol: false,
+    }));
+
+    // ⭐ EVERY `buildOffsetValue` BEFORE THE FIRST CLONE, because it can insert into `region` too
+    // (see [`OffsetSites::query_maps`]) and a position taken before it would drift. Its ops go to the
+    // START of whichever block it uses, so hoisting them out of the loop reorders nothing.
+    // "Ops are unrolled top down but the speculative immutables are in reverse order."
+    let mut immutables: Vec<Val> = Vec::with_capacity(target.immutables.len());
+    for immutable in target.immutables.iter().rev() {
+        immutables.push(evaluator.build_offset_value_of(
+            *immutable,
+            sites,
+            region,
+            ScalarTy::Index,
+        ));
+    }
+
+    // `OpBuilder builder(op); builder.setInsertionPointAfter(op);` — every clone lands directly after
+    // the original, in creation order, so one index taken here serves the whole loop.
+    let Some(at) = region
+        .iter()
+        .position(|op| results(op).contains(&target.result))
+    else {
+        // ⭐ UNREACHABLE, AND A NO-OP RATHER THAN A REFUSAL: [`UnrollTarget::of`] found this op in
+        // this region, and building an offset value only ever creates ops. Nothing was inserted, so
+        // nothing is reported as created.
+        return Vec::new();
+    };
+    let template = region[at].clone();
+
+    let mut input_to_next_op = target.mutable_addr;
+    let mut created: Vec<Val> = Vec::with_capacity(immutables.len());
+    for (offset, immutable) in immutables.into_iter().enumerate() {
+        let result = sites.values.mint();
+        let Some(clone) = unrolled_clone(&template, input_to_next_op, immutable, zero, result)
+        else {
+            // ⭐ UNREACHABLE for the same reason as above: [`UnrollTarget::of`] admitted only the two
+            // transfers [`unrolled_clone`] matches.
+            break;
+        };
+        region.insert(at + 1 + offset, clone);
+        input_to_next_op = result;
+        created.push(result);
+    }
+
+    if let Some(&last) = created.last() {
+        // ⛔ THE ORDER IS LOAD-BEARING: erasing first would take the uses with the op.
+        replace_all_uses_with(region, target.result, last);
+        erase_defining_op(region, target.result);
+    }
+    created
+}
+
+/// One `builder.clone(*op)` with its three addresses re-pointed, a fresh result, and burst and
+/// interleaving cleared — `None` for anything but the two transfers [`UnrollTarget::of`] admits.
+fn unrolled_clone(
+    template: &Op,
+    mutable_addr: Val,
+    immutable_addr: Val,
+    increment: Val,
+    result: Val,
+) -> Option<Op> {
+    let mut clone = template.clone();
+    let Op::Sentient(
+        ops::Op::LoadAndSend {
+            mutable_addr: into_mutable,
+            immutable_addr: into_immutable,
+            increment: into_increment,
+            result: into_result,
+            extent,
+            interleaved_group,
+            ..
+        }
+        | ops::Op::ReceiveAndStore {
+            mutable_addr: into_mutable,
+            immutable_addr: into_immutable,
+            increment: into_increment,
+            result: into_result,
+            extent,
+            interleaved_group,
+            ..
+        },
+    ) = &mut clone
+    else {
+        return None;
+    };
+    *into_mutable = mutable_addr;
+    *into_immutable = immutable_addr;
+    *into_increment = increment;
+    // ⭐ A CLONE BINDS A FRESH VALUE, which is the identity the created list is made of.
+    *into_result = result;
+    extent.burst_size = Elements(0);
+    *interleaved_group = Elements(0);
+    Some(clone)
+}
+
+/// Replaces: e169_findFieldUnrollCandidate
+///
+/// The block's field unroll candidate for `op`, and only once it has been marked for unrolling
+/// (`:1294-1302`).
+#[must_use]
+pub(crate) fn find_field_unroll_candidate(
+    op: Val,
+    block: &ScalarOpMergingBlock,
+) -> Option<FieldUnrollData> {
+    block
+        .unroll_candidates
+        .iter()
+        .find(|candidate| candidate.op == Some(op) && candidate.marked_for_unrolling)
+        .cloned()
+}
 
 // crustify:todo: e362_isFieldUnrollCandidate
 //   authority : dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:1080  (124 body lines, level 1)
@@ -137,3 +403,303 @@
 //   original  : void ScalarOpMerging::runScalarOpMerging()
 //   calls     : e363_markFieldUnrollingCandidates, e364_doScalarOpMerging, e577_collectBlocks
 
+#[cfg(test)]
+mod unit_tests {
+    use super::super::ScalarOpCount;
+    use super::*;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::Values;
+    use crate::islands::dataflow_ir::link::SendEnd;
+    use crate::transform::sentient::analyses::{EvaluatedValue, Evaluation};
+
+    /// The out-of-scope evaluator, stating the ONE answer these units consume.
+    struct StatedEvaluator {
+        offsets: Vec<(EvaluatedValue, Val)>,
+    }
+
+    impl ExpressionEvaluator for StatedEvaluator {
+        fn evaluate_value(&mut self, _value: Val) -> Evaluation {
+            todo!("no unit of this file evaluates a value")
+        }
+
+        fn evaluate_sum(&mut self, _lhs: &Evaluation, _rhs: &Evaluation) -> Evaluation {
+            todo!("no unit of this file evaluates a sum")
+        }
+
+        fn build_offset_value(
+            &mut self,
+            _evaluation: &Evaluation,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            todo!("no unit of this file builds an offset from a fresh evaluation")
+        }
+
+        fn build_offset_value_of(
+            &mut self,
+            immutable: EvaluatedValue,
+            _sites: &mut OffsetSites<'_>,
+            _walked: &mut Vec<Op>,
+            _ty: ScalarTy,
+        ) -> Val {
+            self.offsets
+                .iter()
+                .find(|(of, _)| *of == immutable)
+                .map_or(Val(0), |(_, val)| *val)
+        }
+    }
+
+    fn values_after(issued: u32) -> Values {
+        let mut values = Values::default();
+        for _ in 0..issued {
+            values.mint();
+        }
+        values
+    }
+
+    fn load_and_send(
+        mutable_addr: Val,
+        immutable_addr: Val,
+        increment: Val,
+        result: Val,
+        burst: u64,
+        interleaved_group: u64,
+    ) -> Op {
+        Op::Sentient(ops::Op::LoadAndSend {
+            mutable_addr,
+            immutable_addr,
+            increment,
+            consumer: SendEnd::to_self(Val(9)),
+            result,
+            extent: ops::Extent {
+                total_elements: Elements(4),
+                element_size: Bits(32),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(burst),
+            },
+            interleaved_group: Elements(interleaved_group),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ops::ShuffleMode::NoShuffle,
+            reg: ops::Reg {
+                locale: ops::RegType::Lar,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    fn add(lhs: Val, rhs: Val, result: Val) -> Op {
+        Op::Sentient(ops::Op::ScalarAdd {
+            lhs,
+            rhs,
+            result,
+            reg: None,
+            ty: ScalarTy::Index,
+            element_size: None,
+        })
+    }
+
+    fn carried(init: Val, arg: Val, result: Val) -> ops::Carried {
+        ops::Carried {
+            init,
+            arg,
+            result,
+            reg: ops::Reg {
+                locale: ops::RegType::Lrf,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    fn for_loop(carried: Vec<ops::Carried>, body: Vec<Op>) -> Op {
+        Op::Sentient(ops::Op::For {
+            iv: Val(30),
+            bound: Val(31),
+            carried,
+            dbg_name: None,
+            body,
+        })
+    }
+
+    fn bottom_op(op: Val) -> OperationData {
+        OperationData {
+            op,
+            mod_by: EvaluatedValue(0),
+            merging_increment: EvaluatedValue(0),
+            replace_with_mod: false,
+        }
+    }
+
+    fn block_of(ops: u32, slots: i32) -> ScalarOpMergingBlock {
+        ScalarOpMergingBlock {
+            num_scalar_ops_in_block: ScalarOpCount(ops),
+            required_ibuff: InstructionCount(slots),
+            ..ScalarOpMergingBlock::default()
+        }
+    }
+
+    fn candidate_of(op: Val, cost: i32, immutables: Vec<EvaluatedValue>) -> FieldUnrollData {
+        FieldUnrollData {
+            op: Some(op),
+            cost: InstructionCount(cost),
+            speculative_immutables: immutables,
+            ..FieldUnrollData::default()
+        }
+    }
+
+    /// The vendor's own worked example (`:936-940`): burst 2 × IL 2 is four transfers, three of them
+    /// beyond the IBuff entry the op already holds.
+    #[test]
+    fn a_burst_two_il_two_transfer_costs_three_further_ibuff_entries() {
+        let transfer = BurstAndIl::of(&load_and_send(Val(1), Val(2), Val(3), Val(5), 2, 2));
+        assert_eq!(
+            transfer,
+            Some(BurstAndIl {
+                burst: Elements(2),
+                interleaved_group: Elements(2),
+            })
+        );
+        assert_eq!(
+            calculate_ibuff_required(transfer.expect("a load_and_send has both counts")),
+            InstructionCount(3)
+        );
+        // Unbursted and un-interleaved: the op's own entry is the whole cost.
+        assert_eq!(
+            calculate_ibuff_required(BurstAndIl {
+                burst: Elements(0),
+                interleaved_group: Elements(0),
+            }),
+            InstructionCount(0)
+        );
+        // ⛔ AND THE `isa<>` PAIR IS THE CONSTRUCTOR: a scalar add has no burst to cost anything.
+        assert_eq!(BurstAndIl::of(&add(Val(1), Val(2), Val(3))), None);
+    }
+
+    #[test]
+    fn a_block_whose_bottom_op_yields_the_slot_it_reads_is_worth_hoisting() {
+        let body = vec![
+            add(Val(3), Val(9), Val(5)),
+            Op::Sentient(ops::Op::Yield {
+                results: vec![Val(5)],
+            }),
+        ];
+        let block = ScalarOpMergingBlock {
+            input_value_to_block: Some(Val(3)),
+            block_ops: vec![bottom_op(Val(5))],
+            ..ScalarOpMergingBlock::default()
+        };
+        let loop_op = for_loop(vec![carried(Val(1), Val(3), Val(4))], body.clone());
+        assert!(is_profitable_for_hoisting(&block, Some(&loop_op)));
+
+        // ⛔ THE NEGATIVE THE INDEX PAIRING EXISTS FOR: the same chain, yielded at ANOTHER slot. The
+        // block reads iter arg 1 and the yield hands its result back at position 0.
+        let mispaired = for_loop(
+            vec![
+                carried(Val(0), Val(2), Val(7)),
+                carried(Val(1), Val(3), Val(4)),
+            ],
+            vec![
+                add(Val(3), Val(9), Val(5)),
+                Op::Sentient(ops::Op::Yield {
+                    results: vec![Val(5), Val(8)],
+                }),
+            ],
+        );
+        assert!(!is_profitable_for_hoisting(&block, Some(&mispaired)));
+    }
+
+    #[test]
+    fn blocks_sort_by_benefit_and_needing_no_ibuff_wins_outright() {
+        let mut blocks = vec![
+            block_of(5, 3),
+            // ⛔ THE SENTINEL'S OWN CASE: 2000 : 1 is above `1000.0`, and it must still lose.
+            block_of(2000, 1),
+            block_of(1, 0),
+            block_of(5, 2),
+        ];
+        sort_blocks(&mut blocks);
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| (block.num_scalar_ops_in_block.0, block.required_ibuff.0))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2000, 1), (5, 2), (5, 3)]
+        );
+    }
+
+    /// The vendor's worked example again (`:936-968`), unrolled: one `load_and_send` with burst 2 and
+    /// IL 2 becomes four, chained through `mutable_addr`, and its reader follows the last of them.
+    #[test]
+    fn a_burst_two_il_two_load_unrolls_into_four_chained_loads() {
+        let mut region = vec![
+            load_and_send(Val(1), Val(2), Val(3), Val(5), 2, 2),
+            add(Val(5), Val(9), Val(6)),
+        ];
+        // The immutables come in REVERSE program order, as `isFieldUnrollCandidate` collects them.
+        let candidate = candidate_of(
+            Val(5),
+            3,
+            vec![
+                EvaluatedValue(3),
+                EvaluatedValue(2),
+                EvaluatedValue(1),
+                EvaluatedValue(0),
+            ],
+        );
+        let target = UnrollTarget::of(&candidate, &region).expect("the op is in the region");
+
+        let mut evaluator = StatedEvaluator {
+            offsets: (0..4).map(|i| (EvaluatedValue(i), Val(100 + i))).collect(),
+        };
+        let mut consts: Vec<Op> = Vec::new();
+        let mut values = values_after(20);
+        let mut sites = OffsetSites {
+            consts: &mut consts,
+            query_maps: None,
+            values: &mut values,
+        };
+        let created = unroll_burst_and_il(target, &mut region, &mut evaluator, &mut sites);
+
+        assert_eq!(created, vec![Val(21), Val(22), Val(23), Val(24)]);
+        assert_eq!(
+            region,
+            vec![
+                load_and_send(Val(1), Val(100), Val(20), Val(21), 0, 0),
+                load_and_send(Val(21), Val(101), Val(20), Val(22), 0, 0),
+                load_and_send(Val(22), Val(102), Val(20), Val(23), 0, 0),
+                load_and_send(Val(23), Val(103), Val(20), Val(24), 0, 0),
+                add(Val(24), Val(9), Val(6)),
+            ]
+        );
+        // The zero increment is created once, in the const builder's block.
+        assert_eq!(
+            consts,
+            vec![Op::Sentient(ops::Op::ScalarConstant {
+                value: 0,
+                result: Val(20),
+                reg_locale: ops::RegType::Imm,
+                ty: ScalarTy::Index,
+                is_symbol: false,
+            })]
+        );
+    }
+
+    #[test]
+    fn only_a_candidate_marked_for_unrolling_is_found() {
+        let mut marked = candidate_of(Val(5), 3, Vec::new());
+        marked.marked_for_unrolling = true;
+        let block = ScalarOpMergingBlock {
+            unroll_candidates: vec![candidate_of(Val(4), 1, Vec::new()), marked.clone()],
+            ..ScalarOpMergingBlock::default()
+        };
+        assert_eq!(find_field_unroll_candidate(Val(5), &block), Some(marked));
+        // ⛔ THE UNMARKED ONE IS NOT AN ANSWER: `markFieldUnrollingCandidates` has not chosen it, so
+        // there is no IBuff reserved for it.
+        assert_eq!(find_field_unroll_candidate(Val(4), &block), None);
+    }
+}

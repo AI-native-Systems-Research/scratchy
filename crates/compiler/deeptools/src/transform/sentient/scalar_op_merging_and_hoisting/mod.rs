@@ -100,7 +100,7 @@ use crate::arch::{Arch, Elements};
 use crate::formats::Bits;
 use crate::islands::dataflow_ir::ty::GenericComp;
 use crate::islands::sentient::dialects::sentient as ops;
-use crate::islands::sentient::dialects::{Op, Val};
+use crate::islands::sentient::dialects::{Op, Val, results};
 
 pub(crate) mod scalar_op_hoisting;
 pub(crate) mod scalar_op_merging;
@@ -394,6 +394,48 @@ impl MemoryOpInfo {
     }
 }
 
+/// THE BURST AND INTERLEAVED-GROUP COUNTS OF ONE TRANSFER — `calculateIBuffRequired`'s two
+/// `DT_CHECK`s (`:594-597`), as a constructor.
+///
+/// ⛔ NOT [`MemoryOpInfo`], THOUGH IT CARRIES THE SAME TWO FIELDS: that one also admits a
+/// `load_compute_and_send`, and the IBuff cost of one is exactly what this pair of checks refuses to
+/// be asked for. `buildBlock` agrees by hand — it charges the cost for those two ops and leaves
+/// `required_ibuff` at 0 for an LCAS (`:742-749`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BurstAndIl {
+    /// `getBurstSize()` — `Extent::burst_size`, zero meaning unbursted.
+    pub(crate) burst: Elements,
+    /// `getInterleavedGroup()` — zero meaning no interleaving.
+    pub(crate) interleaved_group: Elements,
+}
+
+impl BurstAndIl {
+    /// The two counts of a `sentient.load_and_send` or `sentient.receive_and_store`, and `None` for
+    /// every other op — the `isa<>` pair, so [`scalar_op_merging::calculate_ibuff_required`] cannot
+    /// be handed anything else and needs no refusal of its own.
+    #[must_use]
+    pub(crate) fn of(op: &Op) -> Option<BurstAndIl> {
+        match op {
+            Op::Sentient(
+                ops::Op::LoadAndSend {
+                    extent,
+                    interleaved_group,
+                    ..
+                }
+                | ops::Op::ReceiveAndStore {
+                    extent,
+                    interleaved_group,
+                    ..
+                },
+            ) => Some(BurstAndIl {
+                burst: extent.burst_size,
+                interleaved_group: *interleaved_group,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// HOW ONE OPERATION WILL BE MODIFIED — `class OperationData` (`:338-368`).
 ///
 /// ⭐ THE OP IS ITS BOUND RESULT. `applyOperationData` handles only add, sub, LAS, RAS and LCAS and
@@ -435,6 +477,56 @@ impl FieldUnrollData {
     /// immutable one of the memory ops this unrolling would create is going to need.
     pub(crate) fn add_speculative_immutable(&mut self, speculative_immutable: EvaluatedValue) {
         self.speculative_immutables.push(speculative_immutable);
+    }
+}
+
+/// A FIELD UNROLL CANDIDATE `unrollBurstAndIL` CAN ACTUALLY UNROLL — its three `DT_CHECK`s
+/// (`:1013-1021`), as a constructor.
+///
+/// # ⛔ THE CHECKS ARE THE CONSTRUCTOR, SO THE UNROLL ITSELF CANNOT REFUSE
+///
+/// `DT_CHECK_MSG(candidate_op, ...)` is [`FieldUnrollData::op`] being `Some`, the `isa<>` pair is the
+/// two arms below, and `created_ops.back()` at the end (`:1057`) is *"did it create at least one"* —
+/// which an empty `speculative_immutables_` would read past. [`UnrollTarget::of`] answers all three
+/// with `None`, and [`scalar_op_merging::unroll_burst_and_il`] then has nothing left to check.
+///
+/// ⭐ CONSUMED ONCE: the position it carries is a position in the region it was read from, and the
+/// unroll mutates that region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnrollTarget {
+    /// `op.getMutableAddr()` — the first clone's `mutable_addr`, and the head of the chain.
+    pub(crate) mutable_addr: Val,
+    /// `op->getResult(0)` — the value the candidate binds, and its identity here.
+    pub(crate) result: Val,
+    /// `unroll_candidate.getSpeculativeImmutables()`, non-empty and in REVERSE program order:
+    /// `isFieldUnrollCandidate` counts the burst and IL groups DOWN (`:1129-1132`, `:1149`) because
+    /// merging runs bottom up, so the unroll walks this list backwards to emit top down.
+    pub(crate) immutables: Vec<EvaluatedValue>,
+}
+
+impl UnrollTarget {
+    /// The candidate's op as `region` holds it, or `None` when any of the three checks fails.
+    #[must_use]
+    pub(crate) fn of(candidate: &FieldUnrollData, region: &[Op]) -> Option<UnrollTarget> {
+        if candidate.speculative_immutables.is_empty() {
+            return None;
+        }
+        let result = candidate.op?;
+        let op = region.iter().find(|op| results(op).contains(&result))?;
+        // `dyn_cast<OpTy>` and the `isa<>` pair — the same two ops [`BurstAndIl`] admits, and the only
+        // two whose `mutable_addr` the unroll re-points.
+        let Op::Sentient(
+            ops::Op::LoadAndSend { mutable_addr, .. }
+            | ops::Op::ReceiveAndStore { mutable_addr, .. },
+        ) = op
+        else {
+            return None;
+        };
+        Some(UnrollTarget {
+            mutable_addr: *mutable_addr,
+            result,
+            immutables: candidate.speculative_immutables.clone(),
+        })
     }
 }
 
