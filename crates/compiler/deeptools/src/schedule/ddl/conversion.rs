@@ -174,7 +174,7 @@ use crate::schedule::dsc2::LdsIdx;
 // the seam entry 173 mutates the DSC through.
 
 /// AN ELEMENT FORMAT A TEMPLATE DECLARES — `DdlInterface::TypeDefinition`
-/// (`ddc/ddl/ddl_conversion.h:363-366`) once its two `INVALID`/`-1` sentinels are gone.
+/// (`ddc/ddl/ddl_conversion.h:361-365`) once its two `INVALID`/`-1` sentinels are gone.
 ///
 /// ⛔ NEITHER FIELD CAN BE UNSET HERE. `dataFormat_ == INVALID` is the reference's "not yet parsed"
 /// flag on a memo entry, and `bitSize_ == -1` never survives [`process_types`] — so a value of this
@@ -200,7 +200,7 @@ pub struct TensorProp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct GlobalLayoutRefs(pub u32);
 
-/// ONE DDL DIMENSION'S PROPERTIES — `DdlInterface::DimProp` (`ddc/ddl/ddl_conversion.h:295-341`).
+/// ONE DDL DIMENSION'S PROPERTIES — `DdlInterface::DimProp` (`ddc/ddl/ddl_conversion.h:297-340`).
 ///
 /// ⛔ `dim_`'s `PrimaryDimTypesCount` DEFAULT IS AN ABSENCE, not dimension zero, and entry 177 is the
 /// one place that spelling is observable: it prints `Invalid` for it.
@@ -221,7 +221,7 @@ pub struct DimProp {
 }
 
 impl Default for DimProp {
-    /// `DimProp()` (`ddc/ddl/ddl_conversion.h:302-307`).
+    /// `DimProp()` (`ddc/ddl/ddl_conversion.h:307-312`).
     ///
     /// ⭐ THE CANDIDATE LIST STARTS FULL — every dim EXCEPT `IJ` and `KIJ` — and narrows from there,
     /// so an empty one is a dim whose candidates were all eliminated and not a fresh one.
@@ -722,7 +722,7 @@ pub const fn allocation_pad_type(padding: PaddingType) -> PadType {
     }
 }
 
-/// THE DDL↔DSC SYMBOL TABLE — `DdlInterface` (`ddc/ddl/ddl_conversion.h:288-460`), carrying the
+/// THE DDL↔DSC SYMBOL TABLE — `DdlInterface` (`ddc/ddl/ddl_conversion.h:288-462`), carrying the
 /// sub-maps whose element types are defined.
 ///
 /// ⛔ TWELVE MEMBERS ARE STILL ABSENT, each arriving with the unit that decides its element type:
@@ -738,7 +738,8 @@ pub const fn allocation_pad_type(padding: PaddingType) -> PadType {
 pub struct DdlInterface {
     /// `dim_association_`.
     pub dim_association: BTreeMap<NameId, DimProp>,
-    /// `type_definition_`, which [`process_types`] fills.
+    /// `type_definition_`. ⛔ [`process_types`] HANDS ITS VECTOR BACK rather than memoising
+    /// here, so nothing in the port fills this; `ddl_conversion.cpp:451` is the only read.
     pub type_definition: BTreeMap<NameId, TypeDefinition>,
     /// `tensor_definition_`, which [`tensor_prop`] fills.
     pub tensor_definition: BTreeMap<NameId, TensorProp>,
@@ -769,8 +770,8 @@ impl DdlInterface {
     /// DROPS EVERY MAPPING — the reference's destructor-then-placement-new, which is a REBUILD and
     /// not a memset: a re-inserted [`DimProp`] gets its full candidate list back.
     ///
-    /// ⛔ ~25 LATER UNITS LIST THIS AS A CALLEE; most of those are a container's own `.clear()`
-    /// resolved by name, exactly as `e104_clear` was.
+    /// ⛔ FOURTEEN LATER UNITS LIST THIS AS A CALLEE (`crustify-ddc/UNITS.tsv`); most of those
+    /// are a container's own `.clear()` resolved by name, exactly as `e104_clear` was.
     pub fn clear(&mut self) {
         *self = Self::default();
     }
