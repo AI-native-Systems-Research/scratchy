@@ -935,7 +935,7 @@ impl Buffering {
 }
 
 /// A COORDINATE INTO AN ALLOCATION'S PLACED ADDRESSES — `startAddressCoreCorelet_`'s
-/// `std::deque<int64_t>`, "per core, corelet, and sdsc folds" (`dsc/dsc2.h:982-984`).
+/// `std::deque<int64_t>`, "per core, corelet, and sdsc folds" (`dsc/dsc2.h:985-986`).
 ///
 /// ⭐ THE CORE AND THE CORELET ARE ENTRIES 0 AND 1, which is what lets entry 050 write
 /// `coord.at(1) = 0`; everything behind them belongs to the super-DSC's own folds and passes through.
@@ -968,7 +968,7 @@ pub enum IndexTensor {
     Index,
 }
 
-/// WHAT A LABELLED DS'S `memOrg_` ANSWERS — `LabeledDsInfo::memOrg_` (`dsc/dscdefn.h:330`) reduced to
+/// WHAT A LABELLED DS'S `memOrg_` ANSWERS — `LabeledDsInfo::memOrg_` (`dsc/dscdefn.h:337`) reduced to
 /// the reads this batch makes of it.
 pub trait MemOrg {
     /// `isHbmPinned()` (`dsc/dscdefn.h:369`) — `memOrg_.at(HBM).isPresent`, false with no HBM entry.
@@ -981,7 +981,8 @@ pub trait MemOrg {
     ///
     /// ⛔ [`None`] COVERS THREE OF ENTRY 050'S REFUSALS AT ONCE: `DT_CHECK_MSG(memOrg_.count(LX),
     /// "Expect LX in memOrg_.")`, `DT_ERROR("Expect a valid LX allocate node.")`, and a `numBuffers_`
-    /// outside the two [`Buffering`] names.
+    /// outside the THREE [`Buffering`] names. WHICH of the three an arm admits is entry 050's own
+    /// check, not this seam's — [`Buffering::Streaming`] reaches here and only the pinned arm may.
     fn lx_buffering(&self) -> Option<Buffering>;
 
     /// `startAddressCoreCorelet_.getData(coord)` on that node, `None` where it holds no such entry.
@@ -996,14 +997,14 @@ pub trait MemOrg {
 
     /// That allocate node's `name_`, [`None`] where there is no HBM entry or it holds no node —
     /// which is *"Expect HBM in memOrg_."* and *"Expect a valid allocate node."* both
-    /// (`L3DlOpsScheduler.cpp:7157`, `:7161`).
+    /// (`L3DlOpsScheduler.cpp:7157`, `:7160`).
     fn hbm_allocation(&self) -> Option<NodeName>;
 
     /// That node's `layoutDimOrder_` (`dsc/dsc2.h:982`), whose non-emptiness is [`LayoutDims`]' own
-    /// — which is *"Expect valid layoutDimOrder_."* (`:6717`).
+    /// — which is *"Expect valid layoutDimOrder_."* (`:6719`).
     fn hbm_layout_dims(&self) -> Option<LayoutDims>;
 
-    /// `getPageSize()`'s KEY SET on that node (`dsc/dsc2.cpp:4479`), EMPTY where nothing pages.
+    /// `getPageSize()`'s KEY SET on that node (`dsc/dsc2.cpp:4480`), EMPTY where nothing pages.
     ///
     /// ⛔ THE SIZES ARE DELIBERATELY NOT ASKED FOR: every reader in scope asks `pageSize.count(dim)`
     /// and nothing more, and `maxDimSizes_` entries are datastage KEYS as often as element counts.
@@ -1013,7 +1014,7 @@ pub trait MemOrg {
     fn hbm_page_dims(&self) -> BTreeSet<PrimaryDim>;
 }
 
-/// WHAT ENTRY 049 READS OFF ONE DATA STAGE — `DataStructDims` (`dsc/dims.h:268-300`) reduced to the
+/// WHAT ENTRY 049 READS OFF ONE DATA STAGE — `DataStructDims` (`dsc/dims.h:158-303`) reduced to the
 /// four lookups a corelet offset is built from, so the node stage and the chunk stage are ONE type.
 pub trait DimStage {
     /// `primaryDimToVal_st(dim, comp, /*ptrowId=*/-1, corelet, padded)` (`dsc/dims.cpp:651`) — that
@@ -1026,7 +1027,7 @@ pub trait DimStage {
         padded: &PaddingForm,
     ) -> Option<Extent>;
 
-    /// `coreletSplit_.count(dim)` (`dsc/dims.h:236`).
+    /// `coreletSplit_.count(dim)` (`dsc/dims.h:206`).
     fn is_corelet_split(&self, dim: PrimaryDim) -> bool;
 
     /// `coreletSplit_.at(dim).at(corelet)` — that corelet's RAW share, unpadded.
