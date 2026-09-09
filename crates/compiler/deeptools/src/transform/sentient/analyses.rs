@@ -10,6 +10,7 @@
 //! invent the analysis, do not inline a guess at what it would have returned, and do not substitute
 //! a constant for its result.
 
+use crate::bridges::dataflow_ir_to_sentient::vc_vector_operands::OpId;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{Op, Val};
@@ -495,4 +496,39 @@ impl Liveness for OutOfScopeLiveness {
             "Liveness::updateLiveRangesForProgramHeaderPromotion (Analyses/Liveness.h:130) — out of campaign scope"
         )
     }
+}
+
+/// A COUNT OF CYCLES — what `TimeStamp::getCyclesGap` answers and what an exposed-pipeline budget is
+/// spent in (`Analyses/TimeStamps.h:20`, `TransformForExposedPipeline.cpp:308`).
+///
+/// ⛔ SIGNED, AND NEGATIVE IS A CASE THE CALLERS READ: `computeDependenciesSameBlock` drops a pair on
+/// `gap < 0` (`:164`), and `insertNOPOperations` lets its own budget go below zero and still banks it
+/// (`:333-337`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Cycles(pub i32);
+
+/// ONE COLUMN OF A `TimeStamp` — `TimeStampColumnVal` (`Analyses/TimeStamps.h:40`) AS A PORTED PASS
+/// HOLDS IT: an identity, like [`LiveRange`], because the loop or condition it names, and the
+/// iteration count beside it, belong to the analysis.
+///
+/// ⛔ `Analyses/TimeStamps.{h,cpp}` IS OUT OF CAMPAIGN SCOPE. `isLoop`, `isCond`, `getLoop` and
+/// `getCond` are `todo!`s at the units that need them — `e482_computeDependenciesSameBlock` walks a
+/// timestamp to find a parent op, and `e234_printDependencies` only carries the vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeStampColumnVal;
+
+/// `Dependency` (`Analyses/TimeStamps.h:30-34`) — one RAW hazard between two MACs, and how many
+/// cycles apart they are.
+///
+/// ⛔ THE ENDS ARE POSITIONS, NOT `Operation *`: [`OpId`] is this crate's stand-in, so every entry in
+/// a list of these GOES STALE the moment an op is inserted before it — which is exactly what
+/// `e237_insertNOPOperations` does, and why it computes every count before it moves anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// `src` — the MAC whose result is written.
+    pub src: OpId,
+    /// `dst` — the MAC that reads it.
+    pub dst: OpId,
+    /// `gap`.
+    pub gap: Cycles,
 }

@@ -80,10 +80,194 @@
 //! | `e545_runOn` | 545 | 3 | 8 | `dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:96` |
 //! | `e586_runOnOperation` | 586 | 4 | 5 | `dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:58` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
+// file's own tests until `e545_runOn` and `e586_runOnOperation` land. CI runs clippy with
+// `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH `e586_runOnOperation`: an unused item here is a real defect again at that point.
+#![allow(dead_code)]
 
-// crustify:todo: e238_cleanupConstants
-//   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:105  (10 body lines, level 0)
-//   original  : void UniformMapCanonicalizationPass::cleanupConstants(ModuleOp module_op)
+use crate::arch::Arch;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::Program;
+use crate::islands::sentient::dialects::{self, Op, Val, sentient};
+use crate::model::Model;
+use crate::workload::Workload;
+
+/// ONE CONSTANT'S FOLD KEY — `std::make_tuple(op->getDialect(), constValue, *op->result_type_begin())`
+/// (`mlir/lib/Transforms/Utils/FoldUtils.cpp`, `OperationFolder::insertKnownConstant`).
+///
+/// ⛔⛔ `regLocale` IS **NOT** IN THE KEY. Two `sentient.scalar_constant`s of the same value and type
+/// unify onto the first one seen even when one is `imm` and the other is not — the locale of the
+/// survivor is the one every reader ends up with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConstId {
+    /// `getValue()`, an `si64` attribute.
+    value: i64,
+    /// `getType()`.
+    ty: ScalarTy,
+}
+
+/// `m_Constant` FOR THE ONE OP THIS PASS NAMES — `sentient::ConstantOp`.
+///
+/// ⛔ NO OTHER `ConstantLike` OP IS TOUCHED HERE. `sentient.vector_constant` and the `arith`
+/// constants carry the trait too, so the greedy driver would unify them on the same key; the
+/// reference's own comment scopes this call to `sentient.scalar_constant`, and an `arith.constant`
+/// holding a dense attribute has no key this island can spell (see
+/// [`lexical_ordering`](super::lexical_ordering)'s `ConstKey::ArithDense`).
+fn scalar_constant(op: &Op) -> Option<(ConstId, Val)> {
+    match op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value, result, ty, ..
+        }) => Some((
+            ConstId {
+                value: *value,
+                ty: *ty,
+            },
+            *result,
+        )),
+        _ => None,
+    }
+}
+
+/// The driver's pre-order walk, collecting every `sentient.scalar_constant` in the order it is met.
+///
+/// ⛔ PROVED ABSENT BY THE TYPE: a shared dialect's region holds the rung below's ops, which have no
+/// `Sentient` arm — so no scalar constant of this rung can be inside one.
+fn collect(ops: &[Op], found: &mut Vec<(ConstId, Val)>) {
+    for op in ops {
+        if let Some(constant) = scalar_constant(op) {
+            found.push(constant);
+        }
+        match op {
+            Op::Sentient(inner) => {
+                for region in sentient::regions(inner) {
+                    collect(region, found);
+                }
+            }
+            Op::AffineFor(loop_op) => collect(&loop_op.body, found),
+            // ⛔ NEITHER `uniformize_regions` NOR `equalize_pattern` IS `IsolatedFromAbove`
+            // (`Uniform.td:79-80`, `:187-188`), so a constant a sink put inside one shares the
+            // function's fold scope and hoists out of it.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions() {
+                    collect(&region.body, found);
+                }
+            }
+            Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_) => {}
+        }
+    }
+}
+
+/// TAKE EACH COLLECTED CONSTANT OUT OF WHEREVER IT SITS — the first half of both `moveBefore` and
+/// `erase()`.
+fn take_from(ops: &mut Vec<Op>, wanted: &[Val], taken: &mut Vec<(Val, Op)>) {
+    let mut at = 0;
+    while at < ops.len() {
+        if let Some((_, result)) = scalar_constant(&ops[at])
+            && wanted.contains(&result)
+        {
+            taken.push((result, ops.remove(at)));
+            continue;
+        }
+        match &mut ops[at] {
+            Op::Sentient(inner) => {
+                for region in sentient::regions_mut(inner) {
+                    take_from(region, wanted, taken);
+                }
+            }
+            Op::AffineFor(loop_op) => take_from(&mut loop_op.body, wanted, taken),
+            // See [`collect`]: a local region is not a fold barrier.
+            Op::UniformRegions(regions) => {
+                for region in regions.regions_mut() {
+                    take_from(&mut region.body, wanted, taken);
+                }
+            }
+            Op::Dataflow(_)
+            | Op::Agen(_)
+            | Op::VectorChain(_)
+            | Op::Affine(_)
+            | Op::Vector(_)
+            | Op::Arith(_)
+            | Op::Scf(_)
+            | Op::Symbol(_)
+            | Op::Uniform(_) => {}
+        }
+        at += 1;
+    }
+}
+
+/// How many operands in the whole program read `of`.
+fn uses<A: Arch, M: Model, W: Workload>(of: Val, program: &Program<A, M, W>) -> usize {
+    let mut count = dialects::use_count(of, &program.preamble);
+    for unit in program.units.iter() {
+        count += dialects::use_count(of, &unit.body);
+    }
+    count
+}
+
+/// Replaces: e238_cleanupConstants
+///
+/// Unifies the program's duplicate `sentient.scalar_constant`s onto their first occurrence, hoists
+/// each survivor to the head of the function's entry block and drops the ones nothing reads.
+///
+/// ⛔⛔ THE PATTERN SET IT BUILDS IS **EMPTY**: `ConstantOp` declares `hasFolder` and NO
+/// `hasCanonicalizer` (`SentientOps.td:848-864`), so `getCanonicalizationPatterns` is `mlir::Op`'s
+/// do-nothing default and the whole effect is the greedy driver's own constant folding.
+/// ⛔ THE SCOPE IS THE **FUNCTION**, NOT THE UNIT: `dataflow.program_unit` is not `IsolatedFromAbove`,
+/// so a constant leaves the unit it was written in and dedupes program-wide.
+/// ⚠️ RESIDUE: the driver also folds and dead-erases every other op it walks; only the constants this
+/// call's own comment names are ported. The pass ships DISABLED (`DisableThisPass`, `:35-38`).
+pub(crate) fn cleanup_constants<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    let mut found: Vec<(ConstId, Val)> = Vec::new();
+    collect(&program.preamble, &mut found);
+    for unit in program.units.iter() {
+        collect(&unit.body, &mut found);
+    }
+
+    // `if (folderConstOp) { replaceAllUsesWith(op, folderConstOp); op->erase(); }` — the FIRST
+    // occurrence of a key is the survivor and every later one is rewired onto it.
+    let mut survivors: Vec<(ConstId, Val)> = Vec::new();
+    let mut rewires: Vec<(Val, Val)> = Vec::new();
+    for (id, result) in &found {
+        match survivors.iter().find(|(kept, _)| kept == id) {
+            Some((_, kept)) => rewires.push((*result, *kept)),
+            None => survivors.push((*id, *result)),
+        }
+    }
+    for (of, with) in rewires {
+        dialects::replace_all_uses_with(&mut program.preamble, of, with);
+        for unit in program.units.iter_mut() {
+            dialects::replace_all_uses_with(&mut unit.body, of, with);
+        }
+    }
+
+    let wanted: Vec<Val> = found.iter().map(|(_, result)| *result).collect();
+    let mut taken: Vec<(Val, Op)> = Vec::new();
+    take_from(&mut program.preamble, &wanted, &mut taken);
+    for unit in program.units.iter_mut() {
+        take_from(&mut unit.body, &wanted, &mut taken);
+    }
+
+    // `op->moveBefore(&insertBlock->front())` in the order the walk met them, so the entry block ends
+    // in REVERSE discovery order. ⛔ A survivor nothing reads is trivially dead and stays out.
+    for (_, result) in &survivors {
+        if uses(*result, program) == 0 {
+            continue;
+        }
+        if let Some(position) = taken.iter().position(|(val, _)| val == result) {
+            let (_, op) = taken.remove(position);
+            program.preamble.insert(0, op);
+        }
+    }
+}
 
 // crustify:todo: e484_runOn
 //   authority : dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:83  (12 body lines, level 2)
@@ -105,3 +289,129 @@
 //   original  : void runOnOperation()
 //   calls     : e484_runOn, e544_runOn, e545_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::cleanup_constants;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::dialects::{Op, Val, sentient};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::model::Model;
+    use crate::units::DfirUnit;
+    use crate::workload::Workload;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// `%result = sentient.scalar_constant value` in `locale`.
+    fn constant(value: i64, result: Val, locale: sentient::RegType) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: locale,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%result = sentient.scalar_add %lhs, %lhs` — a reader, so a constant is not dead.
+    fn adds(lhs: Val, result: Val) -> Op {
+        Op::Sentient(sentient::Op::ScalarAdd {
+            lhs,
+            rhs: lhs,
+            result,
+            reg: None,
+            element_size: None,
+            ty: ScalarTy::Index,
+        })
+    }
+
+    /// A one-unit program running `body`.
+    fn program_of(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxsu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e238 — two same-valued constants unify onto the first even across a `sentient.for` and across
+    /// a differing `regLocale`, the survivors are hoisted out of the unit into the entry block in
+    /// reverse discovery order, and the one nothing reads is dropped.
+    #[test]
+    fn e238_unifies_and_hoists_the_scalar_constants() {
+        let mut program = program_of(vec![
+            constant(7, Val(1), sentient::RegType::Imm),
+            constant(9, Val(2), sentient::RegType::Imm),
+            adds(Val(1), Val(3)),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(4),
+                bound: Val(2),
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![
+                    constant(7, Val(5), sentient::RegType::Lrf),
+                    adds(Val(5), Val(6)),
+                ],
+            }),
+        ]);
+        cleanup_constants(&mut program);
+
+        // `9` bound nothing but the loop's trip count, which reads it — `7` survives once, in `imm`.
+        assert_eq!(
+            program.preamble,
+            vec![
+                constant(9, Val(2), sentient::RegType::Imm),
+                constant(7, Val(1), sentient::RegType::Imm),
+            ]
+        );
+        assert_eq!(
+            program.units.iter().next().expect("the head unit").body,
+            vec![
+                adds(Val(1), Val(3)),
+                Op::Sentient(sentient::Op::For {
+                    iv: Val(4),
+                    bound: Val(2),
+                    carried: Vec::new(),
+                    dbg_name: None,
+                    // ⛔ THE DUPLICATE'S READER MOVED ONTO THE SURVIVOR, which is now in the entry
+                    // block — the `lrf` locale it was written with is gone with it.
+                    body: vec![adds(Val(1), Val(6))],
+                }),
+            ]
+        );
+    }
+}
