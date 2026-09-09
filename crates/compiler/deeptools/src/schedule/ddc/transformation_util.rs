@@ -983,8 +983,8 @@ mod tests_e110_e117 {
     use super::super::metadata::{Allocation, DataTransfer, TransferAccessPattern};
     use crate::generated::ComputeType;
     use crate::schedule::ddc::fold::{ConstIdx, DataStream};
-    use crate::schedule::dsc2::{DataInfo, Dsts, LayoutDims, Operand};
-    use crate::units::DfirUnit;
+    use crate::schedule::dsc2::{DataInfo, Dsts, LayoutDims, Operand, ReplicationFactor};
+    use crate::units::{DfirUnit, NumFolds};
 
     /// A DSC WITH ONE LABELED DS. Its own `ldsIdx_` is deliberately NOT the index it is looked up
     /// under, which is what puts entry 110's layout trap under test.
@@ -1116,6 +1116,7 @@ mod tests_e110_e117 {
             data: DataInfo {
                 data_connect: connect,
                 my_lds_idx: None,
+                constant_id: None,
             },
         }
     }
@@ -1413,6 +1414,8 @@ mod tests_e110_e117 {
             name: NodeName("t0".to_string()),
             src: operand(Some(DataConnect::ArfPt)),
             dsts: Dsts::new(operand(Some(DataConnect::ArfPtsum)), vec![operand(None)]),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
         };
         assert_eq!(
             get_node_description(UtilNode::Transfer(&transfer)),
@@ -1425,6 +1428,7 @@ mod tests_e110_e117 {
             ex_unit: SenComponent::Pe,
             inputs: vec![operand(Some(DataConnect::ArfPt))],
             outputs: vec![operand(Some(DataConnect::ArfPtsum))],
+            num_folds_engaged: NumFolds::ONE,
         };
         assert_eq!(
             get_node_description(UtilNode::Compute(&compute)),

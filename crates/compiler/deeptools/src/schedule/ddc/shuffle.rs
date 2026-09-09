@@ -2416,9 +2416,13 @@ mod tests_e161_e164 {
         DimSymbol, InsertPoint, ShuffleCodegen, ShuffleIndex, StickIds, StickIndex, StickNumber,
         narrow_to_usize,
     };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
     use crate::formats::DataFormat;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{AllocateNode, ComputeNode, DataInfo, NodeName};
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocateNode, ComputeNode, DataInfo, MaxDimSize, NodeName, StartAddress,
+    };
+    use crate::units::NumFolds;
     use std::collections::BTreeSet;
     use sys_arch_spec::arch_enums::SenComponent;
 
@@ -2520,6 +2524,12 @@ mod tests_e161_e164 {
             name: NodeName("alloc".to_owned()),
             component: SenComponent::Ptrow0,
             lds: None,
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            gap_stick_spread: Default::default(),
+            alloc_users: Vec::new(),
         };
         let mut point = InsertPoint::new(ComputeNode {
             name: NodeName("packmerge".to_owned()),
@@ -2527,6 +2537,7 @@ mod tests_e161_e164 {
             ex_unit: SenComponent::Ptrow0,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            num_folds_engaged: NumFolds::ONE,
         });
         let mut edge = DataEdge {
             dinfo: DataInfo::default(),

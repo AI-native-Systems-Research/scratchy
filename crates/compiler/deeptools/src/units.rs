@@ -83,6 +83,16 @@ impl<const CORES: u32> CoreId<CORES> {
 pub struct CoreletId<const CORELETS: u32>(Bounded<CORELETS>);
 
 impl<const CORELETS: u32> CoreletId<CORELETS> {
+    /// A CONSTANT CORELET INDEX, CHECKED WHERE IT IS WRITTEN — see [`Bounded::at`].
+    ///
+    /// ⭐ CORELET 0 IS A LITERAL IN THE REFERENCE, not a computed index: `primaryDimToVal_st(dim,
+    /// comp, 0, 0)` and `(dim, NO_COMPONENT, -1, 0)` both pass it verbatim (`ddc/ddcv1.cpp:1721`,
+    /// `:1861`), so it wants a constructor that cannot hand back an absence.
+    #[must_use]
+    pub const fn at<const I: u32>() -> CoreletId<CORELETS> {
+        CoreletId(Bounded::at::<I>())
+    }
+
     /// A corelet, or `None` if this arch has no such corelet.
     #[must_use]
     pub const fn checked(index: u32) -> Option<CoreletId<CORELETS>> {
@@ -202,6 +212,16 @@ pub enum Adjacent<const ROWS: u32> {
 }
 
 impl<const ROWS: u32> PtRow<ROWS> {
+    /// A CONSTANT ROW INDEX, CHECKED WHERE IT IS WRITTEN — see [`Bounded::at`].
+    ///
+    /// ⭐ ROW 0 IS A LITERAL IN THE REFERENCE: `primaryDimToVal_st(dim, comp, 0, 0)`
+    /// (`ddc/ddcv1.cpp:1721`) passes it verbatim, so it wants a constructor that cannot hand back an
+    /// absence.
+    #[must_use]
+    pub const fn at<const I: u32>() -> PtRow<ROWS> {
+        PtRow(Bounded::at::<I>())
+    }
+
     /// A row, or `None` if this arch's PT has no such row.
     #[must_use]
     pub const fn checked(index: u32) -> Option<PtRow<ROWS>> {

@@ -147,70 +147,629 @@
 //! | `e379_run_v1` | 379 | 7 | 109 | `Ddc` | `ddc/ddcv1.cpp:3692` |
 //! | `e381_run` | 381 | 8 | 15 | `Ddc` | `ddc/ddcv1.cpp:3802` |
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// ⭐ USES FOR ENTRIES 132-136. Union these into this file's top block when its other entries land.
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
+use core::num::NonZeroU64;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
-use crate::arch::{Arch, IsaGen};
-use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+use crate::arch::{Arch, Elements, FoldedUnit, IsaGen, Sticks};
+use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+    Extent, PrimaryDim, Sample, SliceElems, Stage, StickDims, StickPart, VectorComp,
+    cumulative_stick_sizes, stick_sizes,
+};
+use crate::formats::DataFormat;
 use crate::generated::ComputeType;
 use crate::islands::dataflow_ir::ty::GenericComp;
-use crate::schedule::ddc::fold::NodeId;
-use crate::schedule::ddc::metadata::{DatastageId, Metadata};
+use crate::schedule::ddc::fold::{AllocId, ConstIdx, NodeId};
+use crate::schedule::ddc::metadata::{DatastageId, DdcMemory, Metadata};
 use crate::schedule::ddc::transformation::LoopId;
-use crate::schedule::dsc2::{ComputeNode, LdsIdx, TransferNode, generic_comp};
-use crate::units::{Core, Corelet};
+use crate::schedule::dsc2::{
+    AllocateNode, ComputeNode, Dsc, LdsIdx, MaxDimSize, ReplicationFactor, Size, SizeAndIndex,
+    StickDimIdx, TransferNode, generic_comp,
+};
+use crate::units::{Core, Corelet, Row};
 
-// crustify:todo: e124_getLdsOrConstNameOfAllocNode
-//   authority : ddc/ddcv1.cpp:20  (10 body lines, level 0)
-//   class     : Ddc
-//   original  : std::string Ddc::getLdsOrConstNameOfAllocNode(dsc2::AllocateNode* anode)
-//   extract   : crustify-ddc/cpp/ddc.cpp:1945-1955
+/// AN ALLOCATION ARENA — the `dsc2::AllocateNode*`s the metadata's maps name.
+///
+/// ⭐ WALKING THE SCHEDULE TREE TO REACH THEM IS THE MECHANISM; the identity is the [`AllocId`], and
+/// that is what `newAllocations_` and `shadowAllocations_` already hold.
+pub type AllocArena = BTreeMap<AllocId, AllocateNode>;
 
-// crustify:todo: e125_minimizeAllocations
-//   authority : ddc/ddcv1.cpp:30  (101 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::minimizeAllocations(bool has_auto_shuffling)
-//   extract   : crustify-ddc/cpp/ddc.cpp:1967-2068
-//   ⛔ NOTE   : Part of the ddcv1.cpp:30-360 placement span that reginit.rs hand-transcribes. The
-//               authority is this body.
+/// WHAT A LABELLED DS OR A CONSTANT IS CALLED — `LabeledDs::dsName_` / `ConstantInfo::name_`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StorageName(pub String);
 
-// crustify:todo: e126_populateUnitTimeTransfers
-//   authority : ddc/ddcv1.cpp:439  (115 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::populateUnitTimeTransfers()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2078-2193
+/// THE TWO NAME TABLES — `currDsc->labeledDs_` and `currDsc->constantInfo_`. Both are indexed by an
+/// id the DSC itself issued, so neither `.at()` is a caller's obligation.
+pub trait StorageNames {
+    /// `labeledDs_.at(lds).dsName_`.
+    fn lds_name(&self, lds: LdsIdx) -> StorageName;
+    /// `constantInfo_.at(constant).name_`.
+    fn constant_name(&self, constant: ConstIdx) -> StorageName;
+}
 
-// crustify:todo: e127_spreadDataInAllocate
-//   authority : ddc/ddcv1.cpp:1682  (27 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::spreadDataInAllocate()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2203-2230
+/// WHAT ONE LABELLED DS'S STICK IS — `labeledDs_.at(i).dsType_` as `getStickSizes` reads it.
+pub trait LdsSticks {
+    /// The stick dims and their sizes.
+    fn stick_dims(&self, lds: LdsIdx) -> StickDims;
+}
 
-// crustify:todo: e128_finalizeAllocateLayouts
-//   authority : ddc/ddcv1.cpp:1712  (30 body lines, level 0)
-//   class     : Ddc
-//   original  : void Ddc::finalizeAllocateLayouts()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2240-2270
+/// WHETHER ONE ALLOC USER IS A MASKED COMPUTE — `nodeType_ == COMPUTE` AND
+/// `instrAttribute_.computeMaskLoopOffsets_` non-empty (`ddc/ddcv1.cpp:1698-1704`), which is ONE
+/// question about one user rather than two.
+pub trait ComputeMasks {
+    /// True only for a COMPUTE node carrying mask loop offsets.
+    fn computes_under_mask(&self, node: NodeId) -> bool;
+}
 
-// crustify:todo: e129_getClSplitDim
-//   authority : ddc/ddcv1.cpp:1799  (19 body lines, level 0)
-//   original  : std::set<PrimaryDimTypes> getClSplitDim(const DesignSpaceConfig& dsc)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2279-2298
+/// THE CORE-VERSUS-CORELET EXTENTS entry 129 COMPARES — `numCoreletsUsed_`, `CoreD_`, `CoreletD_`.
+pub trait CoreletShapes {
+    /// `numCoreletsUsed_`.
+    fn corelets_used(&self) -> u32;
+    /// `CoreD_.primaryDimToVal_st(dim)`.
+    fn core_extent(&self, dim: PrimaryDim) -> Extent;
+    /// `CoreletD_.primaryDimToVal_st(dim)`.
+    fn corelet_extent(&self, dim: PrimaryDim) -> Extent;
+}
 
-// crustify:todo: e130_getPeSfpSplitDim
-//   authority : ddc/ddcv1.cpp:1819  (47 body lines, level 0)
-//   original  : std::set<PrimaryDimTypes> getPeSfpSplitDim( const DesignSpaceConfig& dsc, const DesignSpaceConfigGlobal& dscGlobal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2307-2355
+/// ONE ENTRY OF `computeOp_` — `opFuncName` with `attributes_.dataFormat_`, the two fields entries
+/// 127 and 130 read off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeOp {
+    /// `opFuncName`.
+    pub op_func: OpFunc,
+    /// `attributes_.dataFormat_`.
+    pub format: DataFormat,
+}
 
-// crustify:todo: e131_setPeFoldsIfPtInteraction
-//   authority : ddc/ddcv1.cpp:1868  (22 body lines, level 0)
-//   original  : void setPeFoldsIfPtInteraction(DesignSpaceConfig* currDsc, const DesignSpaceConfigGlobal& dscGlobal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2364-2387
+/// `dtGetEnv<bool>("ENABLE_LN32")` (`ddc/ddcv1.cpp:1849`) AS AN ARGUMENT.
+///
+/// ⛔ NOT AN AMBIENT READ. A placement decision taken from the process environment can be neither
+/// reproduced nor tested, so the caller states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ln32 {
+    /// `ENABLE_LN32` unset or false — the `value_or(false)` default.
+    Off,
+    /// `ENABLE_LN32` true, which withdraws `LAYERNORM_SCALE` from the PE/SFP split set.
+    On,
+}
+
+/// `primaryDimToVal_st`'s `comp` ARGUMENT for an allocation's component (`dsc/dims.cpp:659-663`) —
+/// only the PE and the SFP, with their register files, name a vector component; every other
+/// component falls through as `NO_COMPONENT` (`:683`).
+fn sampled_as(component: SenComponent) -> Option<VectorComp> {
+    match component {
+        SenComponent::Pelrf | SenComponent::Pe => Some(VectorComp::Pe),
+        SenComponent::Sfplrf | SenComponent::Sfp => Some(VectorComp::Sfp),
+        _ => None,
+    }
+}
+
+/// `stickSizePerDim.count(dim) ? .at(dim) : 1` — and the reference's DIVISION BY ZERO where a stick
+/// dim measures nought, which has no [`NonZeroU64`].
+fn stick_divisor(sizes: &[(PrimaryDim, Elements)], dim: PrimaryDim) -> Option<NonZeroU64> {
+    match sizes.iter().find(|(walked, _)| *walked == dim) {
+        Some(&(_, size)) => NonZeroU64::new(size.0),
+        None => NonZeroU64::new(1),
+    }
+}
+
+/// Replaces: e124_getLdsOrConstNameOfAllocNode
+///
+/// WHAT AN ALLOCATION'S DATA IS CALLED — its temp-storage compute's name, else its labelled DS's,
+/// else its constant's.
+///
+/// ⭐ [`None`] IS THE REFERENCE'S `""`, which is not a name: every caller compares the result
+/// against the empty string rather than using it.
+#[must_use]
+pub fn get_lds_or_const_name_of_alloc_node(
+    anode: &AllocateNode,
+    names: &impl StorageNames,
+) -> Option<StorageName> {
+    if let Some(compute) = &anode.temp_storage_for_compute {
+        return Some(StorageName(compute.0.clone()));
+    }
+    if let Some(lds) = anode.lds {
+        return Some(names.lds_name(lds));
+    }
+    anode
+        .const_idx
+        .map(|constant| names.constant_name(constant))
+}
+
+/// A POSITION IN THE SCHEDULE TREE'S DFS ORDER — `node_to_index`'s `int` (`ddc/ddcv1.cpp:44-48`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DfsIndex(pub u32);
+
+/// AN ALLOCATION'S LIVE RANGE — entry 125's local `Interval`, half-open `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveRange {
+    /// `start` — the earliest user's DFS index.
+    pub start: DfsIndex,
+    /// `end` — the latest user's.
+    pub end: DfsIndex,
+}
+
+impl LiveRange {
+    /// `{INT_MAX, 0}` — what a USER-LESS allocation gets (`ddc/ddcv1.cpp:52-53`).
+    ///
+    /// ⭐ INVERTED ON PURPOSE, and it is load-bearing: it is false against every interval in both
+    /// directions, so an allocation nothing reads always lands in a shadow group of its own.
+    pub const NONE: Self = Self {
+        start: DfsIndex(u32::MAX),
+        end: DfsIndex(0),
+    };
+
+    /// The range spanning every user (`ddc/ddcv1.cpp:54-60`).
+    #[must_use]
+    pub fn of(users: &[DfsIndex]) -> Self {
+        let mut range = Self::NONE;
+        for &user in users {
+            range.start = range.start.min(user);
+            range.end = range.end.max(user);
+        }
+        range
+    }
+
+    /// `overlapInterval` (`ddc/ddcv1.cpp:88-93`) — transcribed INCLUDING its asymmetry, so `self` is
+    /// the allocation being placed and `other` a group member already there.
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        (self.end > other.start && self.end <= other.end)
+            || (self.start >= other.start && self.start < other.end)
+    }
+}
+
+/// ONE ALLOCATE NODE AS entry 125 GROUPS IT — its identity, the two fields it filters on, and its
+/// [`LiveRange`].
+///
+/// ⭐ CARRYING THE RANGE IS WHAT MAKES `live_range.at(node)` TOTAL: the reference builds a side map
+/// keyed by node and then indexes it three times, and every one of those is a throw here impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocLive {
+    /// Which allocation.
+    pub alloc: AllocId,
+    /// `component_`.
+    pub component: SenComponent,
+    /// `ldsIdx_`, whose `-1` the auto-shuffling arm SKIPS ENTIRELY — not even a group of its own.
+    pub lds: Option<LdsIdx>,
+    /// Its live range over the DFS order.
+    pub range: LiveRange,
+}
+
+/// Replaces: e125_minimizeAllocations
+///
+/// GROUPS ALLOCATIONS THAT MAY SHARE ONE ADDRESS into `shadowAllocations_`: with auto shuffling a
+/// register-file allocation joins the first group of its own component that no member's live range
+/// overlaps; everything else gets a group of its own.
+///
+/// ⭐ ASSIGNED, NOT APPENDED, AND THAT IS EXACT: entry 104 clears the field and this is its ONLY
+/// writer in the authority tree (`ddc/ddcv1.cpp:118`), so it is empty at every entry.
+pub fn minimize_allocations(
+    allocs: &[AllocLive],
+    has_auto_shuffling: bool,
+    metadata: &mut Metadata,
+) {
+    let mut ordered: Vec<&AllocLive> = allocs.iter().collect();
+    ordered.sort_by_key(|live| live.range.start);
+    let mut groups: Vec<Vec<&AllocLive>> = Vec::new();
+    for live in ordered {
+        let mut node_added = false;
+        if has_auto_shuffling
+            && matches!(
+                live.component,
+                SenComponent::Sfplrf | SenComponent::Pelrf | SenComponent::Ptxrf
+            )
+        {
+            if live.lds.is_none() {
+                continue;
+            }
+            for group in &mut groups {
+                if node_added {
+                    break;
+                }
+                let Some(component) = group.first().map(|member| member.component) else {
+                    continue;
+                };
+                if live.component != component {
+                    continue;
+                }
+                if group.iter().any(|member| live.range.overlaps(member.range)) {
+                    continue;
+                }
+                if !group.iter().any(|member| member.alloc == live.alloc) {
+                    group.push(live);
+                }
+                node_added = true;
+            }
+        }
+        if !node_added {
+            groups.push(vec![live]);
+        }
+    }
+    metadata.shadow_allocations = groups
+        .iter()
+        .map(|group| group.iter().map(|member| member.alloc).collect())
+        .collect();
+}
+
+/// WHICH LAYOUT DIMS ARE SPLAT — the `-2` positions of `LabeledDs::scale_`, as dims.
+///
+/// ⭐ `is_any_of(-2, scale_)` IS `!is_empty()` HERE, because `scale_` is indexed by a dim's position
+/// in layout order (`getDimIndexInLayoutOrder`), so every entry of it names a layout dim and the two
+/// spellings of the same test cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SplatDims(pub BTreeSet<PrimaryDim>);
+
+/// A CONSTANT AS A CONSTANT-TO-CONSTANT TRANSFER READS IT — `data_.getSingleData().size()` and
+/// `dataFormat_`.
+///
+/// ⛔ BOTH DIVISORS NON-ZERO BY TYPE: the element count is a [`NonZeroU64`], and [`DataFormat`] has
+/// no `INVALID` arm, so `dataFormatsToBitWidth.at(INVALID) == -1` cannot reach the division.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstantData {
+    /// `data_.getSingleData().size()`.
+    pub elements: NonZeroU64,
+    /// `dataFormat_`.
+    pub format: DataFormat,
+}
+
+/// THE LABELLED DS A TENSOR TRANSFER MEASURES — `labeledDs_.at(ldsIdx)` narrowed to the three fields
+/// entry 126 reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferLds {
+    /// `dsType_`, as stick dims.
+    pub stick: StickDims,
+    /// `scale_`'s `-2` positions — see [`SplatDims`].
+    pub splat_dims: SplatDims,
+    /// `dataFormat_`.
+    pub format: DataFormat,
+}
+
+/// WHAT `getTransferType()` SAID, AND THE LABELLED DS THE MATCHING SIDE NAMES.
+///
+/// ⛔ FIVE ARMS AND NO SIXTH, so `DT_CHECK_MSG("Unexpected transfer type.")` is unspellable —
+/// `INVALID_TRANSFER_TYPE` (`dsc/dsc2.h:854`) has no variant here. The [`None`] lds is the
+/// reference's `ldsIdx < 0` skip; which SIDE supplies it is the arm's own answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferOperands {
+    /// `CONSTANT_TO_CONSTANT` — `constantInfo_.at(srcLdsAndLoopOffsets_.constantId_)`.
+    ConstantToConstant(ConstantData),
+    /// `CONSTANT_TO_TENSOR` — the DESTINATION's `myLdsIdx_`.
+    ConstantToTensor(Option<TransferLds>),
+    /// `TENSOR_TO_TENSOR` — the SOURCE's.
+    TensorToTensor(Option<TransferLds>),
+    /// `NO_TRANSFER_TO_TENSOR` — the DESTINATION's.
+    NoTransferToTensor(Option<TransferLds>),
+    /// `NO_TRANSFER_FROM_TENSOR` — the SOURCE's.
+    NoTransferFromTensor(Option<TransferLds>),
+}
+
+/// Replaces: e126_populateUnitTimeTransfers
+///
+/// FILLS ONE TRANSFER'S `replicationFactor_` AND `unitTimeTransferChunkSize_` — the elements it moves
+/// per unit time, chunked along the stick's dims, capped by the metadata's forced element count, and
+/// collapsed to a single-element splat where the source is a constant or a `-2`-scaled LX load.
+///
+/// ⛔ [`None`] IS A REFERENCE ABORT: an element count indivisible by the constant or by the stick
+/// composition, a multi-dim splat that is not constant-to-tensor, a splat format narrower than 16b or
+/// a replication factor not divisible by 4, and `senCompToGenericComp.at()` on a component that map
+/// has no key for.
+pub fn populate_unit_time_transfers<A: Arch>(
+    transfer: &mut TransferNode,
+    operands: &TransferOperands,
+    num_elem_limit: Option<Elements>,
+) -> Option<()> {
+    let (lds, unit) = match operands {
+        TransferOperands::ConstantToConstant(constant) => {
+            let mut factor = 8 * A::BYTES_PER_STICK.get()
+                / constant.elements.get()
+                / u64::from(constant.format.bits().0);
+            if let Some(limit) = num_elem_limit.filter(|limit| limit.0 > 0) {
+                if limit.0 % constant.elements.get() != 0 {
+                    return None;
+                }
+                factor = factor.min(limit.0 / constant.elements.get());
+            }
+            transfer.replication_factor = ReplicationFactor(factor);
+            return Some(());
+        }
+        TransferOperands::ConstantToTensor(lds) | TransferOperands::NoTransferToTensor(lds) => {
+            (lds, transfer.dsts.first().unit)
+        }
+        TransferOperands::TensorToTensor(lds) | TransferOperands::NoTransferFromTensor(lds) => {
+            (lds, transfer.src.unit)
+        }
+    };
+    if unit == SenComponent::NoComponent {
+        return Some(());
+    }
+    let Some(lds) = lds.as_ref() else {
+        return Some(());
+    };
+    let constant_to_tensor = matches!(operands, TransferOperands::ConstantToTensor(_));
+    let src_is_constant = transfer.src.unit == SenComponent::Constant;
+    let part = if unit.generic()? == SenComponent::L0lu {
+        StickPart::WithinSlice(SliceElems::per_l0_row::<A>(&lds.stick)?)
+    } else {
+        StickPart::Whole
+    };
+    let sizes = stick_sizes(&lds.stick, part);
+    let mut do_2b_splat =
+        (!lds.splat_dims.0.is_empty() && unit == SenComponent::Lxlu && sizes.len() == 1)
+            || src_is_constant;
+    if !src_is_constant && unit == SenComponent::Lxlu && sizes.len() > 1 {
+        do_2b_splat = sizes.iter().all(|(dim, _)| lds.splat_dims.0.contains(dim));
+    }
+    let mut elem_so_far = 1u64;
+    let mut chunks: Vec<SizeAndIndex> = Vec::new();
+    for (index, &(dim, extent)) in sizes.iter().enumerate() {
+        // ⛔ THE LOOP CONDITION IS WHY `% numElemLimit` BELOW CANNOT DIVIDE BY ZERO: a limit of nought
+        // fails `elemSoFar < numElemLimit` at the first test, so the body is unreachable for it.
+        if num_elem_limit.is_some_and(|limit| elem_so_far >= limit.0) {
+            break;
+        }
+        let mut size = extent.0;
+        elem_so_far *= size;
+        if let Some(limit) = num_elem_limit.filter(|limit| elem_so_far > limit.0) {
+            if elem_so_far % limit.0 != 0 {
+                return None;
+            }
+            size /= elem_so_far / limit.0;
+        }
+        chunks.push(SizeAndIndex {
+            size_dim: Size {
+                dim,
+                size: Elements(if do_2b_splat { 1 } else { size }),
+            },
+            src_size_idx: StickDimIdx(index as u32),
+            dst_size_idx: StickDimIdx(index as u32),
+        });
+    }
+    if do_2b_splat {
+        if sizes.len() > 1 && !constant_to_tensor {
+            return None;
+        }
+        if let Some(limit) = num_elem_limit {
+            transfer.replication_factor = ReplicationFactor(limit.0);
+        } else {
+            let mut factor = 1u64;
+            for &(_, size) in &sizes {
+                factor *= size.0;
+            }
+            if !src_is_constant && lds.format != DataFormat::Sen169Fp16 {
+                if !matches!(
+                    lds.format,
+                    DataFormat::IeeeFp32 | DataFormat::IeeeInt32 | DataFormat::Senuint32
+                ) {
+                    return None;
+                }
+                // ⭐ `unitTimeTransferChunkSize_[0].sizeDim_.size_ == 1` HOLDS BY CONSTRUCTION: every
+                // chunk pushed under `do2BSplat` above carries a size of exactly one. The empty case
+                // the reference indexes into regardless is the [`None`].
+                let first = chunks.first_mut()?;
+                first.size_dim.size = Elements(first.size_dim.size.0 * 4);
+                if factor % 4 != 0 {
+                    return None;
+                }
+                factor /= 4;
+            }
+            transfer.replication_factor = ReplicationFactor(factor);
+        }
+    }
+    transfer.unit_time_transfer_chunk_size = chunks;
+    Some(())
+}
+
+/// Replaces: e127_spreadDataInAllocate
+///
+/// SPREADS EVERY PTXRF ALLOCATION OVER EIGHT STICKS OF GAP in its outermost layout dim — on SEN1P5
+/// only, only when the DSC restickifies, and only for an allocation some MASKED compute reads.
+pub fn spread_data_in_allocate<A: Arch>(
+    compute_ops: &[ComputeOp],
+    metadata: &Metadata,
+    allocs: &mut AllocArena,
+    masks: &impl ComputeMasks,
+) {
+    if A::GEN != IsaGen::Sen1p5 {
+        return;
+    }
+    if !compute_ops
+        .iter()
+        .any(|op| matches!(op.op_func, OpFunc::ReStickifyOpLx | OpFunc::ReStickifyOpHbm))
+    {
+        return;
+    }
+    let Some(allocation) = metadata.new_allocations.get(&DdcMemory::PtxRf) else {
+        return;
+    };
+    for &id in allocation.lds_idx_and_alloc_node.values() {
+        let Some(alloc) = allocs.get_mut(&id) else {
+            continue;
+        };
+        if !alloc
+            .alloc_users
+            .iter()
+            .any(|&user| masks.computes_under_mask(user))
+        {
+            continue;
+        }
+        let dim = alloc.layout.outermost_dim();
+        alloc.gap_stick_spread.insert(dim, Sticks(8));
+    }
+}
+
+/// Replaces: e128_finalizeAllocateLayouts
+///
+/// RESOLVES EVERY ALLOCATION'S `maxDimSizes_` from a datastage index to a stick-normalised element
+/// count, then gives every shadow group its FIRST member's start address.
+///
+/// ⛔ [`None`] IS A REFERENCE ABORT: a `dataStageParam_` or `getCumulativeStickSizes` `.at()` throw,
+/// a zero stick size, or a negative extent — which has no [`Elements`].
+pub fn finalize_allocate_layouts<S: Stage>(
+    metadata: &Metadata,
+    allocs: &mut AllocArena,
+    stages: &BTreeMap<DatastageId, S>,
+    sticks: &impl LdsSticks,
+) -> Option<()> {
+    for allocation in metadata.new_allocations.values() {
+        for (&lds, &id) in &allocation.lds_idx_and_alloc_node {
+            let Some(alloc) = allocs.get_mut(&id) else {
+                continue;
+            };
+            // ⭐ THE LDS COMES FROM THE MAP KEY, which is what makes `labeledDs_.at(alloc->ldsIdx_)`
+            // total: `newAllocations_` is keyed BY the index the allocation carries.
+            let cumulative = cumulative_stick_sizes(&sticks.stick_dims(lds), StickPart::Whole)?;
+            let at = Sample {
+                corelet: Corelet::at::<0>(),
+                row: Some(Row::at::<0>()),
+                comp: sampled_as(alloc.component),
+            };
+            for entry in alloc.layout.iter_mut() {
+                let MaxDimSize::Stage(stage) = entry.1 else {
+                    continue;
+                };
+                let extent = u64::try_from(stages.get(&stage)?.extent(entry.0, at).0).ok()?;
+                entry.1 = MaxDimSize::Resolved(Elements(
+                    extent / stick_divisor(&cumulative, entry.0)?.get(),
+                ));
+            }
+        }
+    }
+    for group in &metadata.shadow_allocations {
+        let Some((&first, rest)) = group.split_first() else {
+            continue;
+        };
+        let Some(address) = allocs.get(&first).map(|alloc| alloc.start_address.clone()) else {
+            continue;
+        };
+        for &other in rest {
+            if let Some(alloc) = allocs.get_mut(&other) {
+                alloc.start_address = address.clone();
+            }
+        }
+    }
+    Some(())
+}
+
+/// Replaces: e129_getClSplitDim
+///
+/// WHICH DIMS A MULTI-CORELET DSC SPLITS ACROSS CORELETS — every dim whose per-core extent differs
+/// from its per-corelet one, and NONE at all when the DSC uses one corelet.
+///
+/// ⛔ [`None`] IS THE `DT_ERROR`: more than one corelet and not a single dim to explain it. An empty
+/// [`Some`] is the legitimate single-corelet answer, so the two are not the same value.
+pub fn get_cl_split_dim(dsc: &impl CoreletShapes) -> Option<BTreeSet<PrimaryDim>> {
+    let mut split = BTreeSet::new();
+    if dsc.corelets_used() > 1 {
+        for dim in PrimaryDim::ALL {
+            // `is_any_of(dim, IJ, KIJ, PrimaryDimTypesCount)` — the terminator has no variant here.
+            if matches!(dim, PrimaryDim::Ij | PrimaryDim::Kij) {
+                continue;
+            }
+            if dsc.core_extent(dim) != dsc.corelet_extent(dim) {
+                split.insert(dim);
+            }
+        }
+        if split.is_empty() {
+            return None;
+        }
+    }
+    Some(split)
+}
+
+/// Replaces: e130_getPeSfpSplitDim
+///
+/// WHICH DIM THE PE AND THE SFP SPLIT — the chunk stage's own request where it made one, else the
+/// innermost layout dim of the input whose chunk extent is an even multiple of its stick size, and
+/// only for the nine op-funcs the split is implemented for.
+///
+/// ⛔ [`None`] IS `DT_CHECK_MSG("PE/SFP split requested, but hardware cannot perform it")`: an fp32
+/// compute before SEN1P5. An empty [`Some`] is "no split", which is not the same answer.
+pub fn get_pe_sfp_split_dim<A: Arch, S: Stage>(
+    compute_op: &ComputeOp,
+    chunk_stage: &S,
+    input_lds: LdsIdx,
+    dsc: &impl Dsc,
+    sticks: &impl LdsSticks,
+    ln32: Ln32,
+) -> Option<BTreeSet<PrimaryDim>> {
+    let split_not_possible = compute_op.format == DataFormat::IeeeFp32 && A::GEN <= IsaGen::Rcudd1a;
+    // `dataStageParam_.at(1).ss_.peSfpSplit_` — datastage 1 is `Metadata::CHUNK_DSTGID`, and
+    // `PrimaryDim::ALL` walks the dims in the `std::map` order its key set is iterated in.
+    let requested: BTreeSet<PrimaryDim> = PrimaryDim::ALL
+        .into_iter()
+        .filter(|&dim| chunk_stage.is_pe_sfp_split(dim))
+        .collect();
+    if !requested.is_empty() {
+        if split_not_possible {
+            return None;
+        }
+        return Some(requested);
+    }
+    if split_not_possible {
+        return Some(BTreeSet::new());
+    }
+    let splits = matches!(
+        compute_op.op_func,
+        OpFunc::Reciprocal
+            | OpFunc::SqrtFwd
+            | OpFunc::Rsqrt
+            | OpFunc::GeluFwd
+            | OpFunc::TanhFwd
+            | OpFunc::Int32Idxtoaddr
+            | OpFunc::SigmoidFwd
+            | OpFunc::SiluFwd
+    ) || (compute_op.op_func == OpFunc::LayernormScale && ln32 == Ln32::Off);
+    if !splits {
+        return Some(BTreeSet::new());
+    }
+    let per_dim = cumulative_stick_sizes(&sticks.stick_dims(input_lds), StickPart::Whole)?;
+    let mut split = BTreeSet::new();
+    for dim in dsc.layout_dims(input_lds).to_vec().into_iter().rev() {
+        let at = Sample {
+            corelet: Corelet::at::<0>(),
+            row: None,
+            comp: None,
+        };
+        let extent = u64::try_from(chunk_stage.extent(dim, at).0).ok()?;
+        let for_split = extent / stick_divisor(&per_dim, dim)?.get();
+        if for_split > 1 && for_split % 2 == 0 {
+            split.insert(dim);
+            break;
+        }
+    }
+    Some(split)
+}
+
+/// Replaces: e131_setPeFoldsIfPtInteraction
+///
+/// ENGAGES THE PE'S SECOND FOLD ON EVERY COMPUTE of a SEN1P5 DSC that has any PT compute at all —
+/// the PT's presence is what makes the PE fold, not the PE's own op.
+///
+/// ⛔ [`None`] IS `senCompToGenericComp.at()` ON A COMPONENT THAT MAP HAS NO KEY FOR, which is 20 of
+/// the 107 (`sys-arch-spec/arch_enums.cpp:124-211`).
+pub fn set_pe_folds_if_pt_interaction<A: Arch>(computes: &mut [ComputeNode]) -> Option<()> {
+    if A::GEN < IsaGen::Sen1p5 {
+        return Some(());
+    }
+    let mut do_change = false;
+    for node in computes.iter() {
+        if node.ex_unit.generic()? == SenComponent::Pt {
+            do_change = true;
+            break;
+        }
+    }
+    if !do_change {
+        return Some(());
+    }
+    for node in computes.iter_mut() {
+        if node.ex_unit.generic()? == SenComponent::Pe {
+            node.num_folds_engaged = A::GEN.folds_per_unit(FoldedUnit::Pe);
+        }
+    }
+    Some(())
+}
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 // THE `run_v1` FIX-UP VOCABULARY — as entries 132-136 read it.
@@ -765,7 +1324,8 @@ pub fn init_global_data<T: DataStages + ?Sized>(global: &mut GlobalData, dsc: &T
 mod tests_e132_e136 {
     use super::*;
     use crate::arch::{Dd2, Sen1p5};
-    use crate::schedule::dsc2::{DataInfo, Dsts, NodeName, Operand};
+    use crate::schedule::dsc2::{DataInfo, Dsts, NodeName, Operand, ReplicationFactor};
+    use crate::units::NumFolds;
 
     /// The one corelet every build has, which is all these fixtures need.
     fn corelet0() -> Corelet {
@@ -778,6 +1338,7 @@ mod tests_e132_e136 {
             data: DataInfo {
                 data_connect: None,
                 my_lds_idx: lds.map(LdsIdx),
+                constant_id: None,
             },
         }
     }
@@ -848,6 +1409,8 @@ mod tests_e132_e136 {
                 name: NodeName("t".to_owned()),
                 src: operand(src, Some(0)),
                 dsts: Dsts::new(operand(dst, Some(0)), Vec::new()),
+                replication_factor: ReplicationFactor::ONE,
+                unit_time_transfer_chunk_size: Vec::new(),
             }
         }
         fn computes(&self) -> Vec<NodeId> {
@@ -863,6 +1426,7 @@ mod tests_e132_e136 {
                     operand(SenComponent::Latch, None),
                 ],
                 outputs: Vec::new(),
+                num_folds_engaged: NumFolds::ONE,
             }
         }
         fn stick_dims(&self, _lds: LdsIdx) -> Vec<PrimaryDim> {
@@ -1057,5 +1621,436 @@ mod tests_e132_e136 {
         // No such data stage: the stale dim is still cleared.
         init_global_data(&mut global, &Stages(BTreeMap::new()));
         assert_eq!(global.corelet_split_dim, None);
+    }
+}
+
+#[cfg(test)]
+mod tests_e124_e131 {
+    use super::{
+        AllocArena, AllocLive, ComputeMasks, ComputeOp, ConstantData, CoreletShapes, DfsIndex,
+        LdsSticks, LiveRange, Ln32, SplatDims, StorageName, StorageNames, TransferLds,
+        TransferOperands, finalize_allocate_layouts, get_cl_split_dim,
+        get_lds_or_const_name_of_alloc_node, get_pe_sfp_split_dim, minimize_allocations,
+        populate_unit_time_transfers, set_pe_folds_if_pt_interaction, spread_data_in_allocate,
+    };
+    use core::num::NonZeroU64;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
+
+    use crate::arch::{Elements, Sen1p5, Sticks};
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
+        PaddedExtent, PrimaryDim, Sample, Stage, StickDims,
+    };
+    use crate::formats::DataFormat;
+    use crate::schedule::ddc::fold::{AllocId, ConstIdx, NodeId};
+    use crate::schedule::ddc::metadata::{Allocation, DdcMemory, Metadata};
+    use crate::schedule::dsc2::{
+        AllocLayout, AllocateNode, ComputeNode, Coordinate, CoordinateCategory, DataInfo, Dsc,
+        Dsts, FoldCardinality, FoldCoeff, FoldLabel, LayoutDims, LdsIdx, MaxDimSize, NodeName,
+        Operand, ReplicationFactor, StartAddress, TransferNode,
+    };
+    use crate::units::NumFolds;
+
+    /// A NAME TABLE that answers with the id it was asked about, so a test can tell the two apart.
+    struct Names;
+    impl StorageNames for Names {
+        fn lds_name(&self, lds: LdsIdx) -> StorageName {
+            StorageName(format!("lds{}", lds.0))
+        }
+        fn constant_name(&self, constant: ConstIdx) -> StorageName {
+            StorageName(format!("const{}", constant.0))
+        }
+    }
+
+    /// ONE DIM'S EXTENTS, and the PE/SFP split the chunk stage requests.
+    struct Chunk {
+        extents: BTreeMap<PrimaryDim, i64>,
+        pe_sfp_split: BTreeSet<PrimaryDim>,
+    }
+
+    impl Stage for Chunk {
+        fn is_symbolic(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_corelet_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_row_split(&self, _dim: PrimaryDim) -> bool {
+            false
+        }
+        fn is_pe_sfp_split(&self, dim: PrimaryDim) -> bool {
+            self.pe_sfp_split.contains(&dim)
+        }
+        fn splits_any_row(&self) -> bool {
+            false
+        }
+        fn extent(
+            &self,
+            dim: PrimaryDim,
+            _at: Sample,
+        ) -> crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent {
+            crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent(
+                self.extents.get(&dim).copied().unwrap_or(-1),
+            )
+        }
+        fn padded_extent(&self, _dim: PrimaryDim, _at: Sample) -> Option<PaddedExtent> {
+            None
+        }
+    }
+
+    /// ONE STICK for every labelled DS.
+    struct Sticked(StickDims);
+    impl LdsSticks for Sticked {
+        fn stick_dims(&self, _lds: LdsIdx) -> StickDims {
+            self.0.clone()
+        }
+    }
+
+    /// ONE LAYOUT ORDER for every labelled DS.
+    struct Layout(LayoutDims);
+    impl Dsc for Layout {
+        fn layout_dims(&self, _lds: LdsIdx) -> LayoutDims {
+            self.0.clone()
+        }
+    }
+
+    /// THE ONE MASKED COMPUTE.
+    struct Masked(Option<NodeId>);
+    impl ComputeMasks for Masked {
+        fn computes_under_mask(&self, node: NodeId) -> bool {
+            self.0 == Some(node)
+        }
+    }
+
+    /// THE CORE/CORELET EXTENTS entry 129 compares, with `Out` the only dim that may differ.
+    struct Corelets {
+        used: u32,
+        out_per_corelet: i64,
+    }
+    impl CoreletShapes for Corelets {
+        fn corelets_used(&self) -> u32 {
+            self.used
+        }
+        fn core_extent(
+            &self,
+            dim: PrimaryDim,
+        ) -> crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent {
+            crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent(match dim {
+                PrimaryDim::Out => 128,
+                _ => 1,
+            })
+        }
+        fn corelet_extent(
+            &self,
+            dim: PrimaryDim,
+        ) -> crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent {
+            crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent(match dim {
+                PrimaryDim::Out => self.out_per_corelet,
+                _ => 1,
+            })
+        }
+    }
+
+    fn allocate(name: &str) -> AllocateNode {
+        AllocateNode {
+            name: NodeName(name.to_owned()),
+            component: SenComponent::Ptxrf,
+            lds: Some(LdsIdx(0)),
+            const_idx: None,
+            temp_storage_for_compute: None,
+            layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
+            start_address: StartAddress::default(),
+            gap_stick_spread: BTreeMap::new(),
+            alloc_users: Vec::new(),
+        }
+    }
+
+    fn operand(unit: SenComponent) -> Operand {
+        Operand {
+            unit,
+            data: DataInfo::default(),
+        }
+    }
+
+    #[test]
+    fn e124_names_the_temp_storage_then_the_lds_then_the_constant() {
+        let mut node = allocate("a");
+        assert_eq!(
+            get_lds_or_const_name_of_alloc_node(&node, &Names),
+            Some(StorageName("lds0".to_owned()))
+        );
+        node.temp_storage_for_compute = Some(NodeName("compute".to_owned()));
+        assert_eq!(
+            get_lds_or_const_name_of_alloc_node(&node, &Names),
+            Some(StorageName("compute".to_owned()))
+        );
+        node.temp_storage_for_compute = None;
+        node.lds = None;
+        node.const_idx = Some(ConstIdx(3));
+        assert_eq!(
+            get_lds_or_const_name_of_alloc_node(&node, &Names),
+            Some(StorageName("const3".to_owned()))
+        );
+        node.const_idx = None;
+        assert_eq!(get_lds_or_const_name_of_alloc_node(&node, &Names), None);
+    }
+
+    #[test]
+    fn e125_shares_one_shadow_group_only_between_disjoint_live_ranges() {
+        let live = |alloc: u32, users: &[u32]| AllocLive {
+            alloc: AllocId(alloc),
+            component: SenComponent::Sfplrf,
+            lds: Some(LdsIdx(0)),
+            range: LiveRange::of(&users.iter().map(|&u| DfsIndex(u)).collect::<Vec<_>>()),
+        };
+        let allocs = [live(0, &[0, 1]), live(1, &[4, 5]), live(2, &[0, 1])];
+        let mut metadata = Metadata::default();
+        minimize_allocations(&allocs, true, &mut metadata);
+        assert_eq!(
+            metadata.shadow_allocations,
+            vec![vec![AllocId(0), AllocId(1)], vec![AllocId(2)]]
+        );
+        // Without auto shuffling every allocation stands alone.
+        minimize_allocations(&allocs, false, &mut metadata);
+        assert_eq!(
+            metadata.shadow_allocations,
+            vec![vec![AllocId(0)], vec![AllocId(2)], vec![AllocId(1)]]
+        );
+    }
+
+    #[test]
+    fn e126_splats_a_constant_source_one_element_at_a_time() {
+        let mut transfer = TransferNode {
+            name: NodeName("t".to_owned()),
+            src: operand(SenComponent::Constant),
+            dsts: Dsts::new(operand(SenComponent::Lxlu), Vec::new()),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+        };
+        let operands = TransferOperands::ConstantToTensor(Some(TransferLds {
+            stick: StickDims(vec![(PrimaryDim::Out, Elements(64))]),
+            splat_dims: SplatDims::default(),
+            format: DataFormat::IeeeFp32,
+        }));
+        assert_eq!(
+            populate_unit_time_transfers::<Sen1p5>(&mut transfer, &operands, None),
+            Some(())
+        );
+        assert_eq!(transfer.replication_factor, ReplicationFactor(64));
+        assert_eq!(
+            transfer
+                .unit_time_transfer_chunk_size
+                .iter()
+                .map(|chunk| chunk.size_dim.size)
+                .collect::<Vec<_>>(),
+            vec![Elements(1)]
+        );
+    }
+
+    #[test]
+    fn e126_replicates_a_constant_to_constant_transfer_across_the_stick() {
+        let mut transfer = TransferNode {
+            name: NodeName("t".to_owned()),
+            src: operand(SenComponent::Constant),
+            dsts: Dsts::new(operand(SenComponent::Constant), Vec::new()),
+            replication_factor: ReplicationFactor::ONE,
+            unit_time_transfer_chunk_size: Vec::new(),
+        };
+        let operands = TransferOperands::ConstantToConstant(ConstantData {
+            elements: NonZeroU64::new(8).expect("8 is not zero"),
+            format: DataFormat::Sen169Fp16,
+        });
+        // 8 * 128 bytes per stick / 8 elements / 16 bits.
+        assert_eq!(
+            populate_unit_time_transfers::<Sen1p5>(&mut transfer, &operands, None),
+            Some(())
+        );
+        assert_eq!(transfer.replication_factor, ReplicationFactor(8));
+        // An element count the constant does not divide is the `DT_ERROR`.
+        assert_eq!(
+            populate_unit_time_transfers::<Sen1p5>(&mut transfer, &operands, Some(Elements(12))),
+            None
+        );
+    }
+
+    #[test]
+    fn e127_spreads_only_a_masked_ptxrf_allocation() {
+        let mut metadata = Metadata::default();
+        metadata.new_allocations.insert(
+            DdcMemory::PtxRf,
+            Allocation {
+                lds_idx_and_alloc_node: BTreeMap::from([(LdsIdx(0), AllocId(7))]),
+                cons_id_and_alloc_node: BTreeMap::new(),
+                comp_and_alloc_node: BTreeMap::new(),
+            },
+        );
+        let mut node = allocate("ptxrf");
+        node.alloc_users = vec![NodeId(3)];
+        let ops = [ComputeOp {
+            op_func: OpFunc::ReStickifyOpHbm,
+            format: DataFormat::Sen169Fp16,
+        }];
+
+        let mut allocs: AllocArena = BTreeMap::from([(AllocId(7), node.clone())]);
+        spread_data_in_allocate::<Sen1p5>(&ops, &metadata, &mut allocs, &Masked(None));
+        assert!(allocs[&AllocId(7)].gap_stick_spread.is_empty());
+
+        let mut allocs: AllocArena = BTreeMap::from([(AllocId(7), node)]);
+        spread_data_in_allocate::<Sen1p5>(&ops, &metadata, &mut allocs, &Masked(Some(NodeId(3))));
+        assert_eq!(
+            allocs[&AllocId(7)].gap_stick_spread,
+            BTreeMap::from([(PrimaryDim::Out, Sticks(8))])
+        );
+    }
+
+    #[test]
+    fn e128_normalises_a_max_dim_size_by_its_stick_and_shares_the_shadow_address() {
+        let mut placed = Coordinate::default();
+        placed.add_fold_front(
+            PrimaryDim::Out,
+            CoordinateCategory::Spatial,
+            FoldCardinality(4),
+            FoldLabel("cl_fold_out".to_owned()),
+            FoldCoeff(1),
+            FoldCoeff(0),
+        );
+        let address = StartAddress(
+            placed
+                .fold_dim(PrimaryDim::Out)
+                .cloned()
+                .expect("the fold was just added"),
+        );
+
+        let mut first = allocate("first");
+        first.layout = AllocLayout::new(
+            (PrimaryDim::Out, MaxDimSize::Stage(Metadata::CHUNK_DSTGID)),
+            Vec::new(),
+        );
+        first.start_address = address.clone();
+        let mut second = allocate("second");
+        second.layout = first.layout.clone();
+
+        let mut allocs: AllocArena = BTreeMap::from([(AllocId(0), first), (AllocId(1), second)]);
+        let mut metadata = Metadata::default();
+        metadata.new_allocations.insert(
+            DdcMemory::PtxRf,
+            Allocation {
+                lds_idx_and_alloc_node: BTreeMap::from([(LdsIdx(0), AllocId(0))]),
+                cons_id_and_alloc_node: BTreeMap::new(),
+                comp_and_alloc_node: BTreeMap::new(),
+            },
+        );
+        metadata.shadow_allocations = vec![vec![AllocId(0), AllocId(1)]];
+        let stages = BTreeMap::from([(
+            Metadata::CHUNK_DSTGID,
+            Chunk {
+                extents: BTreeMap::from([(PrimaryDim::Out, 128)]),
+                pe_sfp_split: BTreeSet::new(),
+            },
+        )]);
+        let sticks = Sticked(StickDims(vec![(PrimaryDim::Out, Elements(64))]));
+
+        assert_eq!(
+            finalize_allocate_layouts(&metadata, &mut allocs, &stages, &sticks),
+            Some(())
+        );
+        assert_eq!(
+            allocs[&AllocId(0)].layout.iter().collect::<Vec<_>>(),
+            vec![(PrimaryDim::Out, MaxDimSize::Resolved(Elements(2)))]
+        );
+        assert_eq!(allocs[&AllocId(1)].start_address, address);
+    }
+
+    #[test]
+    fn e129_names_the_corelet_split_dim_and_refuses_a_split_it_cannot_find() {
+        assert_eq!(
+            get_cl_split_dim(&Corelets {
+                used: 2,
+                out_per_corelet: 64
+            }),
+            Some(BTreeSet::from([PrimaryDim::Out]))
+        );
+        assert_eq!(
+            get_cl_split_dim(&Corelets {
+                used: 2,
+                out_per_corelet: 128
+            }),
+            None
+        );
+        assert_eq!(
+            get_cl_split_dim(&Corelets {
+                used: 1,
+                out_per_corelet: 128
+            }),
+            Some(BTreeSet::new())
+        );
+    }
+
+    #[test]
+    fn e130_splits_the_innermost_even_dim_for_a_reciprocal() {
+        let chunk = Chunk {
+            extents: BTreeMap::from([(PrimaryDim::In, 8), (PrimaryDim::Out, 32)]),
+            pe_sfp_split: BTreeSet::new(),
+        };
+        let sticks = Sticked(StickDims(vec![(PrimaryDim::Out, Elements(8))]));
+        let layout = Layout(LayoutDims::new(PrimaryDim::In, vec![PrimaryDim::Out]));
+        let op = ComputeOp {
+            op_func: OpFunc::Reciprocal,
+            format: DataFormat::Sen169Fp16,
+        };
+        assert_eq!(
+            get_pe_sfp_split_dim::<Sen1p5, Chunk>(
+                &op,
+                &chunk,
+                LdsIdx(0),
+                &layout,
+                &sticks,
+                Ln32::Off
+            ),
+            Some(BTreeSet::from([PrimaryDim::Out]))
+        );
+        // An op-func the split is not implemented for asks for none of it.
+        let add = ComputeOp {
+            op_func: OpFunc::Add,
+            format: DataFormat::Sen169Fp16,
+        };
+        assert_eq!(
+            get_pe_sfp_split_dim::<Sen1p5, Chunk>(
+                &add,
+                &chunk,
+                LdsIdx(0),
+                &layout,
+                &sticks,
+                Ln32::Off
+            ),
+            Some(BTreeSet::new())
+        );
+    }
+
+    #[test]
+    fn e131_folds_the_pe_only_when_a_pt_compute_is_present() {
+        let compute = |unit: SenComponent| ComputeNode {
+            name: NodeName("c".to_owned()),
+            op: crate::generated::ComputeType::Fmul,
+            ex_unit: unit,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            num_folds_engaged: NumFolds::ONE,
+        };
+        let mut alone = [compute(SenComponent::Pe0)];
+        assert_eq!(
+            set_pe_folds_if_pt_interaction::<Sen1p5>(&mut alone),
+            Some(())
+        );
+        assert_eq!(alone[0].num_folds_engaged, NumFolds::ONE);
+
+        let mut with_pt = [compute(SenComponent::Pe0), compute(SenComponent::Ptrow0)];
+        assert_eq!(
+            set_pe_folds_if_pt_interaction::<Sen1p5>(&mut with_pt),
+            Some(())
+        );
+        assert_eq!(with_pt[0].num_folds_engaged, NumFolds(2));
+        assert_eq!(with_pt[1].num_folds_engaged, NumFolds::ONE);
     }
 }

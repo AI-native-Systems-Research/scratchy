@@ -1406,4 +1406,112 @@ impl SenComponent {
             Self::Qgi => "qgi",
         }
     }
+
+    /// `EnumsConversion::senCompToGenericComp` (`sys-arch-spec/arch_enums.cpp:123-211`) — the
+    /// component a numbered, per-row or per-corelet instance STANDS FOR, and itself for one that is
+    /// already generic.
+    ///
+    /// ⛔ [`None`] IS THE REFERENCE'S `.at()` THROW. 20 of the 107 components are not keys of that
+    /// map — `NO_COMPONENT`, `L0`, `L3`, `RING`, `ZERO`, `LXLUSUFIFO`, `PTIRF`, the three PT compass
+    /// ports, `SFPRING`, `ALL`, `ONE`, `LATCH`, `CONSTANT`, `NFWD0`, `NFWD2`, `L3LUIBR`, `L3SUIBR`
+    /// and `L0_SCALE` — and asking it for one aborts.
+    #[must_use]
+    pub const fn generic(self) -> Option<Self> {
+        Some(match self {
+            Self::Sfp0 | Self::Sfp1 | Self::Sfp => Self::Sfp,
+            Self::Ptrow0_0
+            | Self::Ptrow1_0
+            | Self::Ptrow2_0
+            | Self::Ptrow3_0
+            | Self::Ptrow4_0
+            | Self::Ptrow5_0
+            | Self::Ptrow6_0
+            | Self::Ptrow7_0
+            | Self::Ptrow0_1
+            | Self::Ptrow1_1
+            | Self::Ptrow2_1
+            | Self::Ptrow3_1
+            | Self::Ptrow4_1
+            | Self::Ptrow5_1
+            | Self::Ptrow6_1
+            | Self::Ptrow7_1
+            | Self::Ptrow0
+            | Self::Ptrow1
+            | Self::Ptrow2
+            | Self::Ptrow3
+            | Self::Ptrow4
+            | Self::Ptrow5
+            | Self::Ptrow6
+            | Self::Ptrow7
+            | Self::Pt => Self::Pt,
+            Self::Lrfreg | Self::PeLrfreg | Self::SfpLrfreg | Self::PtLrfreg => Self::Lrfreg,
+            Self::Sfplrf => Self::Sfplrf,
+            Self::Pelrf => Self::Pelrf,
+            Self::Sfpstate => Self::Sfpstate,
+            Self::Pestate => Self::Pestate,
+            Self::Ptarf => Self::Ptarf,
+            Self::Ptxrf => Self::Ptxrf,
+            Self::Pe0 | Self::Pe1 | Self::Pe => Self::Pe,
+            Self::Lxlu0 | Self::Lxlu1 | Self::Lxlu => Self::Lxlu,
+            Self::Lxluscalereg => Self::Lxluscalereg,
+            Self::Lxluvalue => Self::Lxluvalue,
+            Self::Lxsu0 | Self::Lxsu1 | Self::Lxsu => Self::Lxsu,
+            Self::Lx => Self::Lx,
+            Self::L0lu0
+            | Self::L0lu1
+            | Self::L0lurow0
+            | Self::L0lurow1
+            | Self::L0lurow2
+            | Self::L0lurow3
+            | Self::L0lurow4
+            | Self::L0lurow5
+            | Self::L0lurow6
+            | Self::L0lurow7
+            | Self::L0lurow0_0
+            | Self::L0lurow1_0
+            | Self::L0lurow2_0
+            | Self::L0lurow3_0
+            | Self::L0lurow4_0
+            | Self::L0lurow5_0
+            | Self::L0lurow6_0
+            | Self::L0lurow7_0
+            | Self::L0lurow0_1
+            | Self::L0lurow1_1
+            | Self::L0lurow2_1
+            | Self::L0lurow3_1
+            | Self::L0lurow4_1
+            | Self::L0lurow5_1
+            | Self::L0lurow6_1
+            | Self::L0lurow7_1
+            | Self::L0lu => Self::L0lu,
+            Self::L0su0 | Self::L0su1 | Self::L0su => Self::L0su,
+            Self::L3lu => Self::L3lu,
+            Self::L3su => Self::L3su,
+            Self::Hbm => Self::Hbm,
+            Self::L3ibr => Self::L3ibr,
+            Self::Lxvirtualibr => Self::Lxvirtualibr,
+            Self::Crossptnlink => Self::Crossptnlink,
+            Self::Qgi => Self::Qgi,
+            Self::NoComponent
+            | Self::Ring
+            | Self::Zero
+            | Self::L3
+            | Self::L0
+            | Self::Lxlusufifo
+            | Self::Ptirf
+            | Self::Ptnorth
+            | Self::Ptwest
+            | Self::Ptsouth
+            | Self::Sfpring
+            | Self::All
+            | Self::One
+            | Self::Latch
+            | Self::Constant
+            | Self::Nfwd0
+            | Self::Nfwd2
+            | Self::L3luibr
+            | Self::L3suibr
+            | Self::L0Scale => return None,
+        })
+    }
 }
