@@ -88,12 +88,13 @@
 //! | `e451_collectRegInitAndRegCoalescingCandidateFast` | 451 | 2 | 114 | `dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:548` |
 
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, dataflow, lowered, sentient, uniform, uniform_mapping_values, use_count,
-    value_reg_locale,
+    Definitions, Op, Val, arith, dataflow, lowered, regions_ref, sentient, symbol, uniform,
+    uniform_mapping_values, use_count, value_reg_locale,
 };
+use crate::transform::sentient::analyses::Liveness;
 
 /// WHETHER A VALUE'S REGISTER FILE MAY, MUST OR MAY NOT BE INITIALISED IN THE PROGRAM HEADER —
 /// `RegisterInitInfo::RegInitLocalePriority` (`OldRegisterInitialization.cpp:100-105`).
@@ -165,6 +166,20 @@ impl SsaWeights {
     /// Every scored value and its weight, for `dumpWeights` (`e102`).
     pub fn iter(&self) -> impl Iterator<Item = (Val, SsaWeight)> {
         self.0.iter().map(|(val, weight)| (*val, *weight))
+    }
+
+    /// THE SAME MAP AS `e102_dumpWeights` TAKES IT — the ONE adapter between this file's [`SsaWeight`]
+    /// and the parent module's [`super::Weight`].
+    ///
+    /// ⛔ TWO NEWTYPES FOR ONE `int` BECAUSE TWO FILLED ANCHORS ALREADY NAME THEM, `e102` in the
+    /// parent module and `e105` here; rewriting either would be work outside this batch's worklist.
+    /// The ordering is `e102`'s own requirement, not this method's.
+    #[must_use]
+    pub fn ordered(&self) -> BTreeMap<Val, super::Weight> {
+        self.0
+            .iter()
+            .map(|(val, weight)| (*val, super::Weight(weight.0)))
+            .collect()
     }
 }
 
@@ -388,25 +403,473 @@ fn has_uniform_group_below(body: &[crate::islands::dataflow_ir::dialects::Op]) -
     })
 }
 
-// crustify:todo: e327_calcSSAWeight
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:262  (59 body lines, level 1)
-//   original  : int RegisterInitInfo::calcSSAWeight(mlir::Operation *op)
-//   calls     : e103_totalTripCount, e104_getRegisterInitPriority
+/// THE PASS'S PER-PROGRAM-UNIT STATE — `RegisterInitInfo`'s data members
+/// (`OldRegisterInitialization.cpp:122-137`), one instance per `dataflow.program_unit`.
+///
+/// ⛔ `final_reginit_candidates` IS THE REFERENCE'S `std::stack<mlir::Value>` (`:132`) AS A `Vec`:
+/// `getFinalRegInitCandidates()` hands the stack out by mutable reference and the promoter drains it
+/// with `top()`/`pop()`, which is a `Vec`'s `last()`/`pop()`. `liveness_` is NOT a field here — it is
+/// a `Liveness &` (`:121`) the ported methods take as a parameter, because the analysis is out of
+/// campaign scope and a test must be able to observe what they ask it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegisterInitInfo {
+    /// `ssa_weight_` (`:125`).
+    pub(super) ssa_weight: SsaWeights,
+    /// `valid_reginit_candidates_` (`:127`).
+    pub(super) valid_reginit_candidates: Vec<Val>,
+    /// `required_reginit_candidates_` (`:129`).
+    pub(super) required_reginit_candidates: Vec<Val>,
+    /// `valid_reg_coalescing_candidates_` (`:131`).
+    pub(super) valid_reg_coalescing_candidates: Vec<Vec<Val>>,
+    /// `final_reginit_candidates_` (`:133`) — the stack's bottom first, so `pop` takes the top.
+    pub(super) final_reginit_candidates: Vec<Val>,
+    /// `final_reg_coalescing_candidates_` (`:135`).
+    pub(super) final_reg_coalescing_candidates: Vec<Vec<Val>>,
+    /// `enforced_virtual_assign_` (`:137`) — `(result, mutable addr)`, and it is the SECOND of each
+    /// pair that `replaceVirtualAssignTarget` rewrites.
+    pub(super) enforced_virtual_assign: Vec<(Val, Val)>,
+}
 
-// crustify:todo: e328_sortRegCoalescingCandidates
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:332  (7 body lines, level 1)
-//   original  : void RegisterInitInfo::sortRegCoalescingCandidates()
-//   calls     : e105_weightOfSubset
+/// WHERE `collectRegInitAndRegCoalescingCandidateFast`'S GREEDY MERGE HAS REACHED — the reference's
+/// `i` and `j`, which it threads through `getNextMaxWeight`'s return value (`:504-537`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WeightCursor {
+    /// `i` — how far into `valid_reginit_candidates_`.
+    pub reg_init: usize,
+    /// `j` — how far into `valid_reg_coalescing_candidates_`.
+    pub reg_coalescing: usize,
+}
 
-// crustify:todo: e329_collectAllRegCoalescingCandidates
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:371  (133 body lines, level 1)
-//   original  : void RegisterInitInfo::collectAllRegCoalescingCandidates(mlir::Operation *op)
-//   calls     : e106_collectAllRegCoalescingCandidatesImpl
+impl WeightCursor {
+    /// `i++`.
+    #[must_use]
+    const fn advance_reg_init(self) -> WeightCursor {
+        WeightCursor {
+            reg_init: self.reg_init + 1,
+            ..self
+        }
+    }
 
-// crustify:todo: e330_getNextMaxWeight
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:505  (29 body lines, level 1)
-//   original  : std::tuple<int, int, bool, std::vector<mlir::Value>> RegisterInitInfo::getNextMaxWeight(int i, int j)
-//   calls     : e105_weightOfSubset, e252_size
+    /// `j++`.
+    #[must_use]
+    const fn advance_reg_coalescing(self) -> WeightCursor {
+        WeightCursor {
+            reg_coalescing: self.reg_coalescing + 1,
+            ..self
+        }
+    }
+}
+
+/// WHICH LIST THE NEXT-HEAVIEST CANDIDATE CAME OUT OF — the reference's `bool` third element together
+/// with the `std::vector<mlir::Value>` fourth (`:504`).
+///
+/// ⛔ THE `bool` AND THE VECTOR ARE ONE FACT, NOT TWO: `true` is always a one-element vector holding a
+/// register-init candidate and `false` is always a coalescing subset, so a pair could disagree with
+/// itself. The caller switches on the flag and never on the length (`:588-616`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextCandidate {
+    /// `{i, j, true, {reg_init_val}}` — one value to initialise in the program header.
+    RegInit(Val),
+    /// `{i, j, false, reg_coal_val}` — a subset to give one register to.
+    RegCoalescing(Vec<Val>),
+}
+
+/// `dcc::utils::isOuterMostLoop(loop)` (`Analyses/Utils.cpp:523-533`) — whether no `sentient.for`
+/// encloses this one.
+///
+/// ⭐ THE PARENT CHAIN IS THE WALKER'S, exactly as [`total_trip_count`]'s is: the reference walks
+/// `loop->getParentOp()` outwards until it finds a `ForOp` or runs out.
+fn is_outermost_loop(enclosing: Enclosing<'_>) -> bool {
+    !enclosing
+        .ops()
+        .iter()
+        .any(|parent| matches!(parent, Op::Sentient(sentient::Op::For { .. })))
+}
+
+/// THE INTEGER A VALUE IS, or [`None`] for a value no integer-constant op defines — the two
+/// `dyn_cast`s `isTargetConstant` opens with (`Analyses/Utils.cpp:159-162`).
+fn integer_constant(val: Val, defs: Definitions<'_>) -> Option<i64> {
+    match defs.of(val)? {
+        Op::Sentient(sentient::Op::ScalarConstant { value, .. })
+        | Op::Arith(arith::Op::Constant { value, .. }) => Some(*value),
+        // `dyn_cast<IntegerAttr>(const_op.getValue()).getInt()` — an MLIR `BoolAttr` IS an i1
+        // `IntegerAttr`, so it answers 1 or 0.
+        Op::Arith(arith::Op::ConstantInt { value, .. }) => Some(match value {
+            arith::IntConst::Int { value, .. } => *value,
+            arith::IntConst::Bool(set) => i64::from(*set),
+        }),
+        _ => None,
+    }
+}
+
+/// `dcc::utils::isTargetConstant(val, target)` (`Analyses/Utils.cpp:156-183`) — whether a value is a
+/// given constant, INCLUDING the uniformized case where every unit's mapped constant must be it.
+///
+/// ⛔ PORTED, NOT STUBBED, WHERE `lightweight_simplification` `todo!`s IT. It lives under
+/// `Analyses/`, which is out of campaign scope, but it is a purely structural predicate over ops this
+/// island already holds and `uniform_mapping_values` — the one thing it needs — is already ported. A
+/// `todo!` here would make EVERY transfer arm of `e329` unreachable, which is the campaign's other
+/// prohibition: a stand-in for the effect. ⚠️ The divergence to record is that the two spellings now
+/// disagree until `lightweight_simplification`'s is replaced by this one.
+///
+/// ⛔ A MAPPED VALUE THAT IS NOT AN INTEGER CONSTANT IS SKIPPED, NOT A REFUSAL (`:171-179`): neither
+/// `dyn_cast` matches and the loop moves on, so a mapping of `dataflow.get_unit`s answers `true`.
+fn is_target_constant(val: Val, target: i64, defs: Definitions<'_>) -> bool {
+    if let Some(value) = integer_constant(val, defs) {
+        return value == target;
+    }
+    // `isa<BlockArgument>(val)` is `false` (`:158`), and so is every other defining op (`:182`).
+    let Some(Op::Uniform(uniform::Op::QueryMap { map, key, .. })) = defs.of(val) else {
+        return false;
+    };
+    let values = uniform_mapping_values(*map, *key, defs);
+    if values.is_empty() {
+        todo!(
+            "isTargetConstant: DT_CHECK(values.size() > 0) — the mapping behind {val:?} answers nothing (Analyses/Utils.cpp:168)"
+        )
+    }
+    values
+        .iter()
+        .all(|value| match integer_constant(*value, defs) {
+            Some(value) => value == target,
+            // `if (!const_int_attr) return false;` (`:177`) — an `arith.constant` whose attribute is not
+            // an integer, which in this island is the dense one.
+            None => !matches!(
+                defs.of(*value),
+                Some(Op::Arith(arith::Op::DenseConstant { .. }))
+            ),
+        })
+}
+
+/// WHICH OP BINDS A VALUE AS A REGION ARGUMENT — the `dyn_cast<mlir::BlockArgument>(def)` plus
+/// `arg0.getOwner()->getParentOp()` of `e329`, which is broader than the `sentient.for`
+/// [`Definitions::for_arg_of`] answers for and is the whole reason its `push_back` runs at all.
+fn region_arg_owner<'a>(val: Val, scope: &'a [Op]) -> Option<&'a Op> {
+    for op in scope {
+        let binds = match op {
+            Op::Sentient(sentient::Op::For { iv, carried, .. }) => {
+                *iv == val || carried.iter().any(|position| position.arg == val)
+            }
+            Op::AffineFor(loop_op) => {
+                loop_op.iv == val || loop_op.carried.iter().any(|position| position.arg == val)
+            }
+            Op::UniformRegions(regions) => regions.regions().iter().any(|region| region.arg == val),
+            Op::Uniform(uniform::Op::UniformizeRegions { regions, .. }) => {
+                regions.iter().any(|region| region.arg == val)
+            }
+            _ => false,
+        };
+        if binds {
+            return Some(op);
+        }
+        for region in regions_ref(op) {
+            if let Some(found) = region_arg_owner(val, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+impl RegisterInitInfo {
+    /// `addCandidate` (`:263-269`) — the lambda `calcSSAWeight` files each newly weighted value with.
+    fn add_candidate(&mut self, val: Val, defs: Definitions<'_>, gtr_reg_init: GtrRegInit) {
+        match get_register_init_priority(val, defs, gtr_reg_init) {
+            RegInitLocalePriority::Required => self.required_reginit_candidates.push(val),
+            RegInitLocalePriority::Allowed => self.valid_reginit_candidates.push(val),
+            RegInitLocalePriority::Unknown | RegInitLocalePriority::NotAllowed => {}
+        }
+    }
+
+    /// `e329`'S TRANSFER ARM, WHICH IS THE SAME SIX LINES FIVE TIMES OVER (`:400-467`) — and twice for
+    /// `sentient.load_and_store`, once per side.
+    fn coalesce_with_mutable_addr(
+        &mut self,
+        result: Val,
+        mutable_addr: Val,
+        increment: Val,
+        defs: Definitions<'_>,
+        liveness: &dyn Liveness,
+    ) {
+        if !liveness.is_live_range_overlaps(result, mutable_addr) {
+            self.valid_reg_coalescing_candidates
+                .push(vec![result, mutable_addr]);
+        }
+        // "When the increment field is 0, assign this op the same register as the mutable field."
+        if is_target_constant(increment, 0, defs) {
+            self.enforced_virtual_assign.push((result, mutable_addr));
+        }
+    }
+
+    /// Replaces: e327_calcSSAWeight
+    ///
+    /// Scores one op's results with the number of times the op runs, and files the newly scored values
+    /// that may live in the program header as register-init candidates.
+    ///
+    /// ⛔ TRAP: EVERY ARM SCORES WITH THE SAME NUMBER. `totalTripCount` is called on the op being
+    /// visited, so `enclosing` is that op's parent chain — not each result's — and the ten arms differ
+    /// only in WHICH values get it.
+    /// ⚠️ A `dataflow.create_multicast_group` WHOSE PRODUCER HAS NO DEFINING OP reaches a bare
+    /// `isa<>` on null in the reference (`:287`), which asserts; this answers "not a query map" and
+    /// scores the copy.
+    pub fn calc_ssa_weight(
+        &mut self,
+        op: &Op,
+        enclosing: Enclosing<'_>,
+        defs: Definitions<'_>,
+        gtr_reg_init: GtrRegInit,
+    ) {
+        let weight = SsaWeight(total_trip_count(enclosing, defs).0);
+        let Op::Sentient(inner) = op else { return };
+        match inner {
+            sentient::Op::For { carried, .. } => {
+                for position in carried {
+                    if matches!(
+                        defs.of(position.init),
+                        Some(
+                            Op::Sentient(sentient::Op::ScalarConstant { .. })
+                                | Op::Uniform(uniform::Op::QueryMap { .. })
+                        )
+                    ) {
+                        self.ssa_weight.set(position.arg, weight);
+                        if is_outermost_loop(enclosing) {
+                            self.add_candidate(position.arg, defs, gtr_reg_init);
+                        }
+                    }
+                }
+            }
+            sentient::Op::ScalarCopy { input, result, .. } => {
+                let scores = match defs.of(*input) {
+                    Some(
+                        Op::Sentient(sentient::Op::ScalarConstant { .. })
+                        | Op::Uniform(uniform::Op::QueryMap { .. })
+                        | Op::Dataflow(dataflow::Op::GetUnit { .. })
+                        | Op::Symbol(symbol::Op::CreateSymbol { .. }),
+                    ) => true,
+                    Some(Op::Dataflow(dataflow::Op::CreateMulticastGroup { producer, .. })) => {
+                        !matches!(
+                            defs.of(*producer),
+                            Some(Op::Uniform(uniform::Op::QueryMap { .. }))
+                        )
+                    }
+                    _ => false,
+                };
+                if scores {
+                    self.ssa_weight.set(*result, weight);
+                    self.add_candidate(*result, defs, gtr_reg_init);
+                }
+            }
+            sentient::Op::LoadAndSend { result, .. }
+            | sentient::Op::ReceiveAndStore { result, .. }
+            | sentient::Op::ScalarAdd { result, .. }
+            | sentient::Op::ScalarSub { result, .. }
+            | sentient::Op::ReceiveAndExtractScalar { result, .. }
+            | sentient::Op::LoadComputeAndSend { result, .. } => {
+                self.ssa_weight.set(*result, weight);
+            }
+            sentient::Op::LoadAndStore { results, .. } => {
+                self.ssa_weight.set(results.0, weight);
+                self.ssa_weight.set(results.1, weight);
+            }
+            sentient::Op::LoadAndExtractScalar {
+                addr_result,
+                data_result,
+                ..
+            } => {
+                self.ssa_weight.set(*addr_result, weight);
+                self.ssa_weight.set(*data_result, weight);
+            }
+            _ => {}
+        }
+    }
+
+    /// Replaces: e328_sortRegCoalescingCandidates
+    ///
+    /// Orders the coalescing subsets heaviest first, which is the order the greedy selection consumes
+    /// them in.
+    ///
+    /// ⛔ TRAP: STABLE, WHERE `std::sort` IS NOT. The comparator is a strict `>` on the subset weight,
+    /// so equal-weight subsets are unordered by it — and `dcc` spells `std::stable_sort` where it means
+    /// one, so a stable sort is the only version of this whose output is the same twice.
+    pub fn sort_reg_coalescing_candidates(&mut self) {
+        let RegisterInitInfo {
+            ssa_weight,
+            valid_reg_coalescing_candidates,
+            ..
+        } = self;
+        valid_reg_coalescing_candidates.sort_by(|s1, s2| {
+            weight_of_subset(s2, ssa_weight).cmp(&weight_of_subset(s1, ssa_weight))
+        });
+    }
+
+    /// Replaces: e329_collectAllRegCoalescingCandidates
+    ///
+    /// Collects one op's coalescing subsets: a loop's singly-used carried chain, a transfer's result
+    /// paired with its mutable address, and a scalar add/sub's result paired with its non-constant
+    /// operand — plus the enforced same-register pairs a zero increment demands.
+    ///
+    /// ⛔ TRAP: THE LOOP ARM PUSHES A SUBSET ONLY WHEN THE INCOMING VALUE IS A REGION ARGUMENT, and
+    /// pushes it whatever binds it — the `dyn_cast<ForOp>` guards only the chain-extending recursion,
+    /// not the `push_back` beside it (`:380-386`).
+    pub fn collect_all_reg_coalescing_candidates(
+        &mut self,
+        op: &Op,
+        scope: &[Op],
+        defs: Definitions<'_>,
+        liveness: &dyn Liveness,
+    ) {
+        let Op::Sentient(inner) = op else { return };
+        match inner {
+            sentient::Op::For { carried, .. } => {
+                for position in carried {
+                    let iter_arg = position.arg;
+                    if use_count(iter_arg, scope) != 1 {
+                        continue;
+                    }
+                    let mut subset = vec![iter_arg];
+                    let def = position.init;
+                    if let Some(owner) = region_arg_owner(def, scope) {
+                        if let Op::Sentient(sentient::Op::For {
+                            carried: outer_carried,
+                            ..
+                        }) = owner
+                        {
+                            collect_all_reg_coalescing_candidates_impl(
+                                &mut subset,
+                                outer_carried,
+                                def,
+                                scope,
+                                defs,
+                            );
+                        }
+                        self.valid_reg_coalescing_candidates.push(subset);
+                    }
+                }
+            }
+            sentient::Op::LoadAndSend {
+                result,
+                mutable_addr,
+                increment,
+                ..
+            }
+            | sentient::Op::ReceiveAndStore {
+                result,
+                mutable_addr,
+                increment,
+                ..
+            }
+            | sentient::Op::LoadComputeAndSend {
+                result,
+                mutable_addr,
+                increment,
+                ..
+            } => {
+                self.coalesce_with_mutable_addr(*result, *mutable_addr, *increment, defs, liveness)
+            }
+            sentient::Op::LoadAndExtractScalar {
+                addr_result,
+                mutable_addr,
+                increment,
+                ..
+            } => self.coalesce_with_mutable_addr(
+                *addr_result,
+                *mutable_addr,
+                *increment,
+                defs,
+                liveness,
+            ),
+            sentient::Op::LoadAndStore {
+                results,
+                src_mutable_addr,
+                src_inc,
+                dst_mutable_addr,
+                dst_inc,
+                ..
+            } => {
+                self.coalesce_with_mutable_addr(
+                    results.0,
+                    *src_mutable_addr,
+                    *src_inc,
+                    defs,
+                    liveness,
+                );
+                self.coalesce_with_mutable_addr(
+                    results.1,
+                    *dst_mutable_addr,
+                    *dst_inc,
+                    defs,
+                    liveness,
+                );
+            }
+            sentient::Op::ScalarAdd {
+                lhs, rhs, result, ..
+            }
+            | sentient::Op::ScalarSub {
+                lhs, rhs, result, ..
+            } => {
+                // `getOperand(0)` FIRST AND `getOperand(1)` ONLY IF IT IS A CONSTANT OR UNDEFINED —
+                // an `else if`, so at most one pair per op (`:469-503`).
+                let non_constant = |val: Val| {
+                    defs.of(val).is_some_and(|def| {
+                        !matches!(def, Op::Sentient(sentient::Op::ScalarConstant { .. }))
+                    })
+                };
+                let operand = if non_constant(*lhs) {
+                    Some(*lhs)
+                } else if non_constant(*rhs) {
+                    Some(*rhs)
+                } else {
+                    None
+                };
+                if let Some(operand) = operand
+                    && !liveness.is_live_range_overlaps(*result, operand)
+                {
+                    self.valid_reg_coalescing_candidates
+                        .push(vec![*result, operand]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Replaces: e330_getNextMaxWeight
+    ///
+    /// The heavier of the two lists' next candidates, and the cursor advanced past whichever it took.
+    ///
+    /// ⛔ TRAP: `None` IS EXHAUSTION AND NOT AN EMPTY SUBSET. The reference signals it with an empty
+    /// vector, which is unambiguous only because a collected subset always holds at least the iter arg
+    /// that opened it — the caller's `val_with_max_weight.empty()` break (`:591`) is this `None`.
+    /// ⚠️ The reference's second `if (valid_reginit_candidates_.size() <= i)` (`:517`) is dead: the
+    /// first one already answered it.
+    #[must_use]
+    pub fn get_next_max_weight(
+        &self,
+        cursor: WeightCursor,
+    ) -> (WeightCursor, Option<NextCandidate>) {
+        let next_reg_init = self.valid_reginit_candidates.get(cursor.reg_init).copied();
+        let next_subset = self
+            .valid_reg_coalescing_candidates
+            .get(cursor.reg_coalescing);
+        match (next_reg_init, next_subset) {
+            (None, None) => (cursor, None),
+            (None, Some(subset)) => (
+                cursor.advance_reg_coalescing(),
+                Some(NextCandidate::RegCoalescing(subset.clone())),
+            ),
+            (Some(val), None) => (cursor.advance_reg_init(), Some(NextCandidate::RegInit(val))),
+            (Some(val), Some(subset)) => {
+                if self.ssa_weight.weight_of(val) > weight_of_subset(subset, &self.ssa_weight) {
+                    (cursor.advance_reg_init(), Some(NextCandidate::RegInit(val)))
+                } else {
+                    (
+                        cursor.advance_reg_coalescing(),
+                        Some(NextCandidate::RegCoalescing(subset.clone())),
+                    )
+                }
+            }
+        }
+    }
+}
 
 // crustify:todo: e449_calcSSAWeight
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:252  (9 body lines, level 2)
@@ -426,17 +889,81 @@ fn has_uniform_group_below(body: &[crate::islands::dataflow_ir::dialects::Op]) -
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        Enclosing, GtrRegInit, RegInitLocalePriority, SsaWeight, SsaWeights, TripCount,
-        collect_all_reg_coalescing_candidates_impl, get_register_init_priority, has_uniformize_region,
-        total_trip_count, weight_of_subset,
+        Enclosing, GtrRegInit, Liveness, NextCandidate, RegInitLocalePriority, RegisterInitInfo,
+        SsaWeight, SsaWeights, TripCount, WeightCursor, collect_all_reg_coalescing_candidates_impl,
+        get_register_init_priority, has_uniformize_region, total_trip_count, weight_of_subset,
     };
+    use crate::arch::Elements;
+    use crate::formats::Bits;
     use crate::islands::dataflow_ir::dialects::dataflow::{
         ConsumerCount, MulticastGroupId, OutstandingRequests,
     };
     use crate::islands::dataflow_ir::dialects::uniform::LocalRegion;
+    use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
     use crate::islands::sentient::dialects::{Definitions, Op, Val, dataflow, sentient, uniform};
+
+    /// `sentient.load_and_send` addressed by `mutable_addr` and advanced by `increment`.
+    fn load_and_send(mutable_addr: u32, increment: u32, result: u32) -> Op {
+        Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(mutable_addr),
+            immutable_addr: Val(99),
+            increment: Val(increment),
+            consumer: SendEnd::to_self(Val(98)),
+            result: Val(result),
+            extent: Extent {
+                total_elements: Elements(64),
+                element_size: Bits(32),
+                chunk_size: Elements(1),
+                chunk_stride: Elements(1),
+                burst_size: Elements(1),
+            },
+            interleaved_group: Elements(0),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: reg(RegType::Lar),
+            dbg_name: None,
+        })
+    }
+
+    /// `%r = dataflow.get_unit`.
+    fn get_unit(result: u32) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: crate::units::Residency::Global,
+            unit: crate::units::DfirUnit::L3lu,
+            num_folds: None,
+        })
+    }
+
+    /// One carried position in the named register file, out of the program header.
+    fn position(init: u32, arg: u32, result: u32, locale: RegType) -> Carried {
+        Carried {
+            init: Val(init),
+            arg: Val(arg),
+            result: Val(result),
+            reg: reg(locale),
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// A `Liveness` that overlaps exactly the pairs it is given, in that order.
+    struct Overlaps(Vec<(Val, Val)>);
+
+    impl Liveness for Overlaps {
+        fn update_live_ranges_for_program_header_promotion(&mut self, _candidate: Val) {
+            unreachable!("collectAllRegCoalescingCandidates promotes nothing")
+        }
+
+        fn is_live_range_overlaps(&self, val1: Val, val2: Val) -> bool {
+            self.0.contains(&(val1, val2))
+        }
+    }
 
     /// An unassigned register in the named file.
     fn reg(locale: RegType) -> Reg {
@@ -687,5 +1214,165 @@ mod unit_tests {
             }
         ))));
         assert!(!has_uniformize_region(&nest(copy(1, 0, RegType::Lrf))));
+    }
+    /// e327 — an OUTERMOST loop's constant-fed iter arg is scored and filed, and a copy nested one
+    /// loop deep is scored with that loop's trip count.
+    #[test]
+    fn e327_scores_the_op_and_files_the_candidate_it_may_promote() {
+        let loop_op = for_op(0, 10, vec![position(1, 2, 3, RegType::Lrf)], Vec::new());
+        let copy_op = copy(21, 20, RegType::Ebr);
+        let scope = vec![
+            constant(1, 7),
+            constant(10, 4),
+            get_unit(20),
+            copy_op.clone(),
+            loop_op.clone(),
+        ];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+
+        let mut rti = RegisterInitInfo::default();
+        let outermost: [&Op; 0] = [];
+        rti.calc_ssa_weight(
+            &loop_op,
+            Enclosing::from_innermost(&outermost),
+            defs,
+            GtrRegInit::Enabled,
+        );
+        assert_eq!(rti.ssa_weight.weight_of(Val(2)), SsaWeight(1));
+        assert_eq!(rti.valid_reginit_candidates, vec![Val(2)]);
+
+        // ⭐ THE SAME NUMBER FOR EVERY RESULT OF THE VISITED OP: the copy sits inside the loop, so it
+        // runs 4 times, and an `ebr` is REQUIRED rather than merely allowed.
+        let enclosing = [&loop_op];
+        rti.calc_ssa_weight(
+            &copy_op,
+            Enclosing::from_innermost(&enclosing),
+            defs,
+            GtrRegInit::Enabled,
+        );
+        assert_eq!(rti.ssa_weight.weight_of(Val(21)), SsaWeight(4));
+        assert_eq!(rti.required_reginit_candidates, vec![Val(21)]);
+        assert_eq!(rti.valid_reginit_candidates, vec![Val(2)]);
+    }
+
+    /// e328 — heaviest first, and the two zero-weight subsets keep the order they were collected in.
+    #[test]
+    fn e328_sorts_the_subsets_heaviest_first_and_stably() {
+        let mut rti = RegisterInitInfo::default();
+        rti.ssa_weight.set(Val(1), SsaWeight(2));
+        rti.ssa_weight.set(Val(2), SsaWeight(2));
+        rti.ssa_weight.set(Val(3), SsaWeight(10));
+        rti.ssa_weight.set(Val(4), SsaWeight(10));
+        rti.valid_reg_coalescing_candidates = vec![
+            vec![Val(1), Val(2)],
+            vec![Val(5), Val(6)],
+            vec![Val(3), Val(4)],
+            vec![Val(7), Val(8)],
+        ];
+
+        rti.sort_reg_coalescing_candidates();
+
+        assert_eq!(
+            rti.valid_reg_coalescing_candidates,
+            vec![
+                vec![Val(3), Val(4)],
+                vec![Val(1), Val(2)],
+                vec![Val(5), Val(6)],
+                vec![Val(7), Val(8)],
+            ]
+        );
+    }
+
+    /// e329 — a transfer pairs with its mutable address unless the two overlap, a zero increment
+    /// enforces the pair either way, and a loop pushes the carried chain.
+    #[test]
+    fn e329_pairs_a_transfer_with_its_address_and_pushes_the_carried_chain() {
+        let zero_increment = load_and_send(40, 41, 42);
+        let overlapping = load_and_send(50, 51, 52);
+        let scope = vec![
+            constant(41, 0),
+            constant(51, 3),
+            zero_increment.clone(),
+            overlapping.clone(),
+        ];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+        let liveness = Overlaps(vec![(Val(52), Val(50))]);
+
+        let mut rti = RegisterInitInfo::default();
+        rti.collect_all_reg_coalescing_candidates(&zero_increment, &scope, defs, &liveness);
+        rti.collect_all_reg_coalescing_candidates(&overlapping, &scope, defs, &liveness);
+
+        assert_eq!(
+            rti.valid_reg_coalescing_candidates,
+            vec![vec![Val(42), Val(40)]]
+        );
+        // ⛔ THE OVERLAPPING PAIR STILL ENFORCES NOTHING, because its increment is 3 and not 0 — the
+        // two decisions are independent.
+        assert_eq!(rti.enforced_virtual_assign, vec![(Val(42), Val(40))]);
+
+        let inner = for_op(
+            4,
+            11,
+            vec![position(2, 5, 6, RegType::Lrf)],
+            // The single use of `%5` that `hasOneUse()` accepts.
+            vec![copy(7, 5, RegType::Lrf)],
+        );
+        let outer = for_op(
+            0,
+            10,
+            vec![position(1, 2, 3, RegType::Lrf)],
+            vec![inner.clone()],
+        );
+        let scope = vec![outer];
+        let module = [scope.as_slice()];
+        let defs = Definitions::from_innermost(&module);
+
+        let mut rti = RegisterInitInfo::default();
+        rti.collect_all_reg_coalescing_candidates(&inner, &scope, defs, &liveness);
+        assert_eq!(
+            rti.valid_reg_coalescing_candidates,
+            vec![vec![Val(5), Val(2)]]
+        );
+    }
+
+    /// e330 — the heavier list wins, a spent list is skipped, and both spent is `None`.
+    #[test]
+    fn e330_takes_the_heavier_list_and_reports_exhaustion_as_none() {
+        let mut rti = RegisterInitInfo::default();
+        rti.ssa_weight.set(Val(1), SsaWeight(9));
+        rti.ssa_weight.set(Val(2), SsaWeight(20));
+        rti.ssa_weight.set(Val(3), SsaWeight(20));
+        rti.valid_reginit_candidates = vec![Val(1)];
+        rti.valid_reg_coalescing_candidates = vec![vec![Val(2), Val(3)]];
+
+        // The subset weighs 20 against the init candidate's 9, and only `j` advances.
+        let (cursor, next) = rti.get_next_max_weight(WeightCursor::default());
+        assert_eq!(
+            next,
+            Some(NextCandidate::RegCoalescing(vec![Val(2), Val(3)]))
+        );
+        assert_eq!(
+            cursor,
+            WeightCursor {
+                reg_init: 0,
+                reg_coalescing: 1
+            }
+        );
+
+        // The coalescing list is spent, so the init candidate goes whatever its weight.
+        let (cursor, next) = rti.get_next_max_weight(cursor);
+        assert_eq!(next, Some(NextCandidate::RegInit(Val(1))));
+        assert_eq!(
+            cursor,
+            WeightCursor {
+                reg_init: 1,
+                reg_coalescing: 1
+            }
+        );
+
+        // ⛔ BOTH SPENT — the reference's empty vector, and the cursor does NOT move.
+        assert_eq!(rti.get_next_max_weight(cursor), (cursor, None));
     }
 }

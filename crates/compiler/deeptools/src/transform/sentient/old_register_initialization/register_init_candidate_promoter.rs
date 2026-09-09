@@ -89,6 +89,8 @@
 
 use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::sentient::dialects::{self, Op, Val, dataflow, sentient, symbol, uniform};
+use crate::transform::sentient::analyses::UniformGroups;
+use crate::transform::sentient::utils::units_and_their_values::UnitsAndTheirValues;
 
 /// WHERE THE OP BEHIND A CANDIDATE SITS — what `getParentOfType<uniform::UniformizeRegionsOp,
 /// uniform::EqualizePatternOp>` answers about it (`:1081-1083`).
@@ -255,11 +257,95 @@ pub fn is_same_op_type(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bo
     }
 }
 
-// crustify:todo: e333_constructValues
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1107  (34 body lines, level 1)
-//   original  : void RegisterInitCandidatePromoter::constructValues( mlir::Value val, mlir::Value core, dcc::utils::UnitsAndTheirValues &results) const
-//   calls     : e251_add, e252_size
+/// `DefImmutableMappingOp::getNonNullValuesFromKeys(keys)` — each key's mapped value, MISSES DROPPED.
+///
+/// ⛔ SHORTER THAN `keys` WHEN THE MAP HAS NO ENTRY FOR ONE, which is the whole point of the
+/// `DT_CHECK` its caller makes on the two lengths — see
+/// [`uniform_mapping_values`][crate::islands::sentient::dialects::uniform_mapping_values], which is
+/// this lookup with the keys derived rather than supplied.
+fn non_null_values_from_keys(map: Val, keys: &[Val], scope: &[Op]) -> Vec<Val> {
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) =
+        dialects::defining_op(map, scope)
+    else {
+        return Vec::new();
+    };
+    keys.iter()
+        .filter_map(|sought| {
+            pairs
+                .iter()
+                .find(|(mapped, _)| mapped == sought)
+                .map(|(_, value)| *value)
+        })
+        .collect()
+}
 
+/// Replaces: e333_constructValues
+///
+/// Pairs every unit a promoted candidate must serve — the core's own folds, plus the group it leads —
+/// with the value each of them needs: one constant per unit out of the mapping for a
+/// `uniform.query_map` candidate, and the candidate itself for anything else.
+///
+/// ⛔ TRAP: `isGroupLeader` IS A KEY TEST ON THE FOLLOWER MAP, so a leader with no followers still
+/// answers `true` and this still runs the (empty) follower loop.
+/// ⚠️ ISLAND GAP: `dataflow.get_unit` binds ONE result here, so a `num_folds >= 2` core — whose extra
+/// fold results are both the reference's extra keys and its `nfolds` loop — is a `todo!`.
+pub(crate) fn construct_values(
+    val: Val,
+    core: Val,
+    results: &mut UnitsAndTheirValues,
+    scope: &[Op],
+    uga: &dyn UniformGroups,
+) {
+    // `core.getDefiningOp<dataflow::GetUnitOp>()`, dereferenced unconditionally by both branches.
+    let Some(Op::Dataflow(dataflow::Op::GetUnit {
+        result: unit,
+        num_folds,
+        ..
+    })) = dialects::defining_op(core, scope)
+    else {
+        todo!(
+            "constructValues: core {core:?} is not a dataflow.get_unit, which the reference then dereferences (OldRegisterInitialization.cpp:1111)"
+        )
+    };
+    if num_folds.is_some_and(|folds| folds.0 >= 2) {
+        todo!(
+            "constructValues: dataflow.get_unit binds one result in this island and {core:?} declares {num_folds:?} folds — the fold results are the reference's extra keys (OldRegisterInitialization.cpp:1116, :1131)"
+        )
+    }
+    let unit = *unit;
+    // ⭐ A FOLLOWER'S get_unit IS THE CORE'S IFF THE FOLLOWER **IS** THE CORE, given the one result
+    // above: `follower.getDefiningOp<GetUnitOp>() != get_unit_op` is `follower != core`, and a
+    // follower defined by anything else is kept, which is the null the reference compares.
+    let followers = |uga: &dyn UniformGroups| -> Vec<Val> {
+        if uga.is_group_leader(core) {
+            uga.group_members_led_by(core)
+                .into_iter()
+                .filter(|follower| *follower != core)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    if let Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) = dialects::defining_op(val, scope)
+    {
+        let mut keys = vec![unit];
+        keys.extend(followers(uga));
+        let values = non_null_values_from_keys(*map, &keys, scope);
+        if values.len() != keys.len() {
+            todo!(
+                "constructValues: DT_CHECK(tmp_values.size() == tmp_keys.size()) — the mapping behind {val:?} has no entry for every unit (OldRegisterInitialization.cpp:1128)"
+            )
+        }
+        for (key, value) in keys.iter().zip(values) {
+            results.add(*key, Some(value));
+        }
+    } else {
+        results.add(unit, Some(val));
+        for follower in followers(uga) {
+            results.add(follower, Some(val));
+        }
+    }
+}
 // crustify:todo: e452_postProcessing
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1047  (27 body lines, level 2)
 //   original  : void RegisterInitCandidatePromoter::postProcessing()
@@ -282,7 +368,10 @@ pub fn is_same_op_type(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bo
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{is_same_op_type, is_within_global_region};
+    use super::{
+        UniformGroups, UnitsAndTheirValues, construct_values, is_same_op_type,
+        is_within_global_region,
+    };
     use crate::islands::dataflow_ir::dialects as lower;
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::sentient::dialects::{Op, Val, dataflow, sentient, symbol, uniform};
@@ -388,5 +477,73 @@ mod unit_tests {
         // ⛔ THE DIVERGENCE, PINNED: a value with no defining op is none of the four rather than
         // the reference's assert. See [`is_same_op_type`].
         assert!(!is_same_op_type(Some(Val(5)), Some(Val(5)), &scope));
+    }
+    /// A `UniformGroupAnalyzer` with one leader and its followers.
+    struct Group {
+        leader: Val,
+        followers: Vec<Val>,
+    }
+
+    impl UniformGroups for Group {
+        fn group_leaders(&self) -> Vec<Val> {
+            vec![self.leader]
+        }
+
+        fn is_group_leader(&self, unit: Val) -> bool {
+            unit == self.leader
+        }
+
+        fn group_members_led_by(&self, _leader: Val) -> Vec<Val> {
+            self.followers.clone()
+        }
+    }
+
+    /// e333 — a plain candidate goes to the core and every follower unchanged, while a
+    /// `uniform.query_map` candidate gives each unit the constant the mapping holds FOR THAT UNIT.
+    #[test]
+    fn e333_gives_each_unit_the_value_it_needs() {
+        let scope = vec![
+            Op::Dataflow(get_unit(10)),
+            Op::Dataflow(get_unit(11)),
+            scalar_constant(20),
+            scalar_constant(40),
+            scalar_constant(41),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(30),
+                pairs: vec![(Val(10), Val(40)), (Val(11), Val(41))],
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(31),
+                map: Val(30),
+                key: Val(50),
+            }),
+        ];
+        let uga = Group {
+            leader: Val(10),
+            followers: vec![Val(11)],
+        };
+
+        let mut plain = UnitsAndTheirValues::default();
+        construct_values(Val(20), Val(10), &mut plain, &scope, &uga);
+        assert_eq!(
+            plain.pairs,
+            vec![(Val(10), Some(Val(20))), (Val(11), Some(Val(20)))]
+        );
+
+        let mut uniformized = UnitsAndTheirValues::default();
+        construct_values(Val(31), Val(10), &mut uniformized, &scope, &uga);
+        assert_eq!(
+            uniformized.pairs,
+            vec![(Val(10), Some(Val(40))), (Val(11), Some(Val(41)))]
+        );
+
+        // ⛔ A CORE THAT LEADS NOTHING SERVES ONLY ITSELF, and `isGroupLeader` is what says so.
+        let mut alone = UnitsAndTheirValues::default();
+        let led_by_another = Group {
+            leader: Val(11),
+            followers: vec![Val(10)],
+        };
+        construct_values(Val(20), Val(10), &mut alone, &scope, &led_by_another);
+        assert_eq!(alone.pairs, vec![(Val(10), Some(Val(20)))]);
     }
 }

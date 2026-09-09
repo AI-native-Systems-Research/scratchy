@@ -100,6 +100,7 @@ use std::fmt::Write as _;
 use crate::formats::Bits;
 use crate::islands::sentient::dialects::{self, Op, Val, sentient};
 use crate::islands::sentient::print;
+use crate::transform::sentient::old_register_initialization::register_init_info::RegisterInitInfo;
 
 /// `ssa_weight_`'s value — *"weight is based on number of times it is accessed"* (`:123-124`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,21 +256,100 @@ pub fn has_same_attr(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bool
     }
 }
 
-// crustify:todo: e326_replaceVirtualAssignTarget
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:159  (8 body lines, level 1)
-//   original  : void replaceVirtualAssignTarget(mlir::Value old_v, mlir::Value new_v)
-//   calls     : e252_size
+impl RegisterInitInfo {
+    /// Replaces: e326_replaceVirtualAssignTarget
+    ///
+    /// Points every enforced same-register pair and every final coalescing subset at `new_v` wherever
+    /// they named `old_v`.
+    ///
+    /// ⛔ TRAP: ONLY THE SECOND OF EACH ENFORCED PAIR IS REWRITTEN — the pair is
+    /// `(result, mutable addr)` and the promoter replaces the ADDRESS it copied, so a `old_v` sitting
+    /// in the first slot is deliberately left alone (`:160-162`).
+    pub fn replace_virtual_assign_target(&mut self, old_v: Val, new_v: Val) {
+        for (_result, target) in &mut self.enforced_virtual_assign {
+            if *target == old_v {
+                *target = new_v;
+            }
+        }
+        for values in &mut self.final_reg_coalescing_candidates {
+            for value in values.iter_mut() {
+                if *value == old_v {
+                    *value = new_v;
+                }
+            }
+        }
+    }
+}
 
-// crustify:todo: e331_dumpWeight
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:706  (5 body lines, level 1)
-//   original  : void OldRegisterInitializationPass::dumpWeight( std::vector<RegisterInitInfo> &rtis)
-//   calls     : e102_dumpWeights
+/// Replaces: e331_dumpWeight
+///
+/// Every program unit's weights under one banner.
+///
+/// ⛔ TRAP: THE BANNERS OPEN WITH A NEWLINE AND SO CLOSE THE LAST WEIGHT LINE TWICE — the reference
+/// writes `"\n------Op Weights End------\n"` after lines that already ended, which is a blank line the
+/// dump is expected to have.
+#[must_use]
+pub fn dump_weight(rtis: &[RegisterInitInfo], scope: &[Op]) -> String {
+    let mut out = String::from("\n------Op Weights Begin------\n");
+    for rti in rtis {
+        out.push_str(&dump_weights(&rti.ssa_weight.ordered(), scope));
+    }
+    out.push_str("\n------Op Weights End------\n");
+    out
+}
 
-// crustify:todo: e332_moveSSAToInit
-//   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:715  (25 body lines, level 1)
-//   original  : static void moveSSAToInit(mlir::Value val)
-//   calls     : e252_size
-
+/// Replaces: e332_moveSSAToInit
+///
+/// Marks the op behind a value as initialised in the program header: a `sentient.scalar_copy` wholly,
+/// a `sentient.for` at the carried position the value arrives as.
+///
+/// ⛔ TRAP: THE LOOP'S OTHER POSITIONS KEEP THE FLAGS THEY HAD. The reference rebuilds the whole
+/// `programHeader` array and copies each other slot across, defaulting to `false` only where the
+/// existing array is SHORTER than the iter-arg list — which this island's carried-length array cannot
+/// be, the same argument `e108`'s TRAP makes.
+/// ⚠️ Any other defining op is a no-op, which is the reference's two failed `dyn_cast_or_null`s.
+pub fn move_ssa_to_init(val: Val, body: &mut [Op]) {
+    for op in body {
+        match op {
+            Op::Sentient(inner) => {
+                let marked = match inner {
+                    sentient::Op::ScalarCopy {
+                        result,
+                        program_header,
+                        ..
+                    } => {
+                        let hit = *result == val;
+                        if hit {
+                            *program_header = true;
+                        }
+                        hit
+                    }
+                    sentient::Op::For { carried, .. } => {
+                        let mut hit = false;
+                        for position in carried.iter_mut() {
+                            if position.arg == val {
+                                position.program_header = true;
+                                hit = true;
+                            }
+                        }
+                        hit
+                    }
+                    _ => false,
+                };
+                if marked {
+                    return;
+                }
+                for region in sentient::regions_mut(inner) {
+                    move_ssa_to_init(val, region);
+                }
+            }
+            Op::AffineFor(loop_op) => move_ssa_to_init(val, &mut loop_op.body),
+            // ⛔ PROVED ABSENT BY THE TYPE, exactly as in `e108`: a lower-rung region holds
+            // `dataflow_ir::dialects::Op`, and neither of the two ops this marks is one.
+            _ => {}
+        }
+    }
+}
 // crustify:todo: e570_getFirstSource
 //   authority : dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:788  (5 body lines, level 4)
 //   original  : mlir::Value getFirstSource(mlir::Value core, mlir::Value val, OpBuilder &const_builder)
@@ -287,8 +367,10 @@ pub fn has_same_attr(val1: Option<Val>, val2: Option<Val>, scope: &[Op]) -> bool
 
 #[cfg(test)]
 mod unit_tests {
+    use super::register_init_info::SsaWeight;
     use super::{
-        Weight, dump_weights, erase_deleted_ops, has_same_attr, remove_init_attr_from_ops,
+        RegisterInitInfo, Weight, dump_weight, dump_weights, erase_deleted_ops, has_same_attr,
+        move_ssa_to_init, remove_init_attr_from_ops,
     };
     use crate::formats::Bits;
     use crate::islands::dataflow_ir::ty::ScalarTy;
@@ -405,5 +487,71 @@ mod unit_tests {
         // ⭐ AND A LOOP ITER ARGUMENT READS THE LOOP'S OWN ARRAY AT ITS POSITION.
         assert!(has_same_attr(Some(Val(8)), Some(Val(4)), &scope));
         assert!(!has_same_attr(Some(Val(8)), Some(Val(2)), &scope));
+    }
+    /// e326 — the SECOND slot of each enforced pair and every member of every final subset.
+    #[test]
+    fn e326_retargets_the_second_of_each_pair_and_every_final_subset() {
+        let mut rti = RegisterInitInfo::default();
+        rti.enforced_virtual_assign = vec![(Val(1), Val(2)), (Val(2), Val(3))];
+        rti.final_reg_coalescing_candidates = vec![vec![Val(2), Val(4)], vec![Val(5)]];
+
+        rti.replace_virtual_assign_target(Val(2), Val(9));
+
+        // ⛔ `(%2, %3)` KEEPS ITS FIRST SLOT: only the target is rewritten.
+        assert_eq!(
+            rti.enforced_virtual_assign,
+            vec![(Val(1), Val(9)), (Val(2), Val(3))]
+        );
+        assert_eq!(
+            rti.final_reg_coalescing_candidates,
+            vec![vec![Val(9), Val(4)], vec![Val(5)]]
+        );
+    }
+
+    /// e331 — one banner around every unit's lines, and an unweighted unit contributes nothing.
+    #[test]
+    fn e331_wraps_every_units_weights_in_one_banner() {
+        let scope = vec![copy(1, 2, None, false)];
+        let mut first = RegisterInitInfo::default();
+        first.ssa_weight.set(Val(2), SsaWeight(7));
+
+        assert_eq!(
+            dump_weight(&[first, RegisterInitInfo::default()], &scope),
+            "\n------Op Weights Begin------\n%2 = sentient.scalar_copy %1  {reg_locale = \"lbr\"} : index\n--t> 7\n\n------Op Weights End------\n"
+        );
+    }
+
+    /// e332 — the copy at depth is marked, and the loop marks ONLY the position the value arrives as.
+    #[test]
+    fn e332_marks_the_copy_and_only_the_named_carried_position() {
+        let loop_op = |first: bool, second: bool, header: bool| {
+            vec![Op::Sentient(sentient::Op::For {
+                iv: Val(3),
+                bound: Val(4),
+                carried: vec![
+                    sentient::Carried {
+                        program_header: first,
+                        ..carried(1, 5, 6, None)
+                    },
+                    sentient::Carried {
+                        program_header: second,
+                        ..carried(10, 11, 12, None)
+                    },
+                ],
+                dbg_name: None,
+                body: vec![copy(5, 7, None, header)],
+            })]
+        };
+        let mut body = loop_op(false, false, false);
+
+        move_ssa_to_init(Val(7), &mut body);
+        move_ssa_to_init(Val(11), &mut body);
+
+        assert_eq!(body, loop_op(false, true, true));
+
+        // ⚠️ A VALUE BEHIND ANY OTHER OP IS A NO-OP — the reference's two failed `dyn_cast_or_null`s.
+        let mut untouched = loop_op(false, false, false);
+        move_ssa_to_init(Val(99), &mut untouched);
+        assert_eq!(untouched, loop_op(false, false, false));
     }
 }
