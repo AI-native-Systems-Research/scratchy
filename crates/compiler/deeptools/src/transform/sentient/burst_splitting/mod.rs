@@ -299,6 +299,7 @@ mod unit_tests {
                 Op::Sentient(sentient::Op::For {
                     iv: Val(2),
                     bound: Val(1),
+                    bound_reg: None,
                     carried: Vec::new(),
                     dbg_name: None,
                     body: vec![transfer],

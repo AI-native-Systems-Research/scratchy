@@ -521,6 +521,7 @@ mod unit_tests {
         let loop_op = Op::Sentient(sentient::Op::For {
             iv: Val(4),
             bound: Val(5),
+            bound_reg: None,
             carried: vec![
                 carrier(Val(6), Val(7), Val(8)),
                 carrier(Val(9), Val(10), Val(11)),
@@ -601,6 +602,7 @@ mod unit_tests {
         let mut body = vec![Op::Sentient(sentient::Op::For {
             iv: Val(4),
             bound: Val(5),
+            bound_reg: None,
             carried: vec![carried],
             dbg_name: None,
             body: vec![copy(Val(2), Val(6), RegType::Lbr)],

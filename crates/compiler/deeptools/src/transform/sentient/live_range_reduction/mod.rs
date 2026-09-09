@@ -1311,6 +1311,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(60),
                 bound: Val(1),
+                bound_reg: None,
                 carried: vec![sentient::Carried {
                     init: Val(4),
                     arg: Val(61),

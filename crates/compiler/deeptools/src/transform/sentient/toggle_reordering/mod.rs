@@ -321,6 +321,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(11),
                 bound: Val(12),
+                bound_reg: None,
                 carried: vec![carried(Val(2), Val(20), Val(21))],
                 dbg_name: None,
                 body,

@@ -418,6 +418,7 @@ mod unit_tests {
         Op::Sentient(sentient::Op::For {
             iv,
             bound,
+            bound_reg: None,
             carried,
             dbg_name: None,
             body,
@@ -436,6 +437,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv,
                 bound,
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![
@@ -502,6 +504,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv,
                 bound,
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![if_op(

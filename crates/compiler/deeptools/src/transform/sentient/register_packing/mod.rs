@@ -208,9 +208,8 @@ impl RegisterPacking {
     /// ⚠️ TRAP: `is_index_updated_` IS NOT CONSULTED. A register the packer never renumbered has
     /// `new_register_index_ == -1` and that `-1` is written back over the index it came in with
     /// (`RegisterPacking.cpp:150-156`).
-    /// ⚠️ TRAP: an index is only ever COPIED here, never minted — see [`ops::RegIndex::at`], which
-    /// takes its value as a const generic. Choosing a new one is e348/e459's problem, and the island
-    /// has no runtime constructor for them to use.
+    /// ⚠️ TRAP: an index is only ever COPIED here, never minted. Choosing a new one is e348/e459's
+    /// problem, and [`ops::RegIndex::allocated`] is the one door for it.
     pub fn do_renumbering(&self, unit: &mut [Op]) {
         for collection in &self.reg_table {
             for reg in &collection.regs {
@@ -350,15 +349,59 @@ pub(crate) fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64
     values
 }
 
-// crustify:todo: e348_updateRegIndex
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:162  (16 body lines, level 1)
-//   original  : bool RegisterPackingPass::updateRegIndex(TypedRegCollection &typed_reg_collec, RegIndex &reg, int suggested_index)
-//   calls     : e132_setNewRegisterIndex
+impl TypedRegCollection {
+    /// Replaces: e348_updateRegIndex
+    ///
+    /// Gives the register at `at` its packed index — its own `-1` back, else the index an equally
+    /// numbered register already got, else `suggested` — and answers whether `suggested` was consumed.
+    ///
+    /// ⛔ THE REGISTER IS A POSITION IN THIS COLLECTION, NOT A SECOND BORROW. The reference's `reg` is
+    /// an element of the very `getRegistersList()` it then scans (`RegisterPacking.cpp:169-175`, and
+    /// e459 calls it with exactly that aliasing pair), which two `&mut` cannot say.
+    /// ⭐ `suggested_index` IS AN INDEX AND NEVER `-1`: e459's `idx` starts at 0 and only rises, so the
+    /// type is [`ops::RegIndex`] rather than an `Option` of one.
+    pub fn update_reg_index(&mut self, at: usize, suggested: ops::RegIndex) -> bool {
+        let old = self.regs[at].old_index;
+        if old.is_none() {
+            self.regs[at].set_new_register_index(None);
+            return false;
+        }
+        let inherited = self
+            .regs
+            .iter()
+            .find(|other| other.old_index == old && other.index_updated)
+            .map(|other| other.new_index);
+        match inherited {
+            Some(new_index) => {
+                self.regs[at].set_new_register_index(new_index);
+                false
+            }
+            None => {
+                self.regs[at].set_new_register_index(Some(suggested));
+                true
+            }
+        }
+    }
+}
 
-// crustify:todo: e349_getRegWithType
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:239  (7 body lines, level 1)
-//   original  : TypedRegCollection *RegisterPackingPass::getRegWithType( std::vector<TypedRegCollection> &reg_table, SentientRegType reg_type)
-//   calls     : e252_size
+/// Replaces: e349_getRegWithType
+///
+/// Where `reg_type`'s collection sits in the table, appending an empty one when the table has none.
+///
+/// ⭐ A POSITION, NOT THE `TypedRegCollection *` THE REFERENCE RETURNS: the caller mutates the table
+/// through it and the reference's pointer is invalidated by its own `push_back`.
+pub fn reg_with_type(reg_table: &mut Vec<TypedRegCollection>, reg_type: ops::RegType) -> usize {
+    match reg_table
+        .iter()
+        .position(|collection| collection.reg_type == reg_type)
+    {
+        Some(at) => at,
+        None => {
+            reg_table.push(TypedRegCollection::new(reg_type));
+            reg_table.len() - 1
+        }
+    }
+}
 
 // crustify:todo: e459_computeNewRegisterIndices
 //   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:182  (53 body lines, level 2)
@@ -441,6 +484,7 @@ mod unit_tests {
         Op::Sentient(ops::Op::For {
             iv: Val(1),
             bound: Val(2),
+            bound_reg: None,
             carried: vec![
                 carried(Val(3), Val(4), Val(5), first),
                 carried(Val(6), Val(7), Val(8), second),
@@ -594,5 +638,43 @@ mod unit_tests {
         );
         // ⭐ THE SILENT DROP: promoted, but its initialiser is none of the three.
         assert_eq!(fill(Val(14), true, 5), Vec::new());
+    }
+
+    /// e348_updateRegIndex — the three answers: an unassigned register keeps its `-1`, a register
+    /// numbered like an already-decided one inherits that decision, and anything else takes the
+    /// suggestion and consumes it.
+    #[test]
+    fn e348_update_reg_index() {
+        let mut collection = TypedRegCollection {
+            reg_type: ops::RegType::Lrf,
+            regs: vec![
+                TrackedReg::new(Val(1), None),
+                TrackedReg::new(Val(2), Some(ops::RegIndex::at::<7>())),
+                TrackedReg::new(Val(3), Some(ops::RegIndex::at::<7>())),
+            ],
+        };
+
+        assert!(!collection.update_reg_index(0, ops::RegIndex::at::<0>()));
+        assert_eq!(collection.regs[0].new_index, None);
+
+        assert!(collection.update_reg_index(1, ops::RegIndex::at::<0>()));
+        assert_eq!(collection.regs[1].new_index, Some(ops::RegIndex::at::<0>()));
+
+        // ⭐ SAME OLD INDEX AS THE ONE JUST DECIDED, so it follows it and `idx` is not consumed.
+        assert!(!collection.update_reg_index(2, ops::RegIndex::at::<1>()));
+        assert_eq!(collection.regs[2].new_index, Some(ops::RegIndex::at::<0>()));
+    }
+
+    /// e349_getRegWithType — an existing file is found where it sits, a new one is appended.
+    #[test]
+    fn e349_get_reg_with_type() {
+        let mut reg_table = vec![
+            TypedRegCollection::new(ops::RegType::Lrf),
+            TypedRegCollection::new(ops::RegType::Lar),
+        ];
+        assert_eq!(reg_with_type(&mut reg_table, ops::RegType::Lar), 1);
+        assert_eq!(reg_table.len(), 2);
+        assert_eq!(reg_with_type(&mut reg_table, ops::RegType::Ebr), 2);
+        assert_eq!(reg_table[2], TypedRegCollection::new(ops::RegType::Ebr));
     }
 }

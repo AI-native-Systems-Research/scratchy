@@ -520,6 +520,7 @@ mod unit_tests {
         Op::Sentient(ops::Op::For {
             iv: Val(30),
             bound: Val(31),
+            bound_reg: None,
             carried,
             dbg_name: None,
             body,

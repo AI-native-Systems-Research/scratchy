@@ -1517,6 +1517,29 @@ impl RegIndex {
         RegIndex(Bounded::at::<I>())
     }
 
+    /// THE INDEX A REGISTER ALLOCATOR HAS JUST HANDED OUT — ⛔ THE ONE RUNTIME CONSTRUCTOR, and the
+    /// only callers are `Transform/Sentient`'s allocation passes counting registers they have already
+    /// given away.
+    ///
+    /// ⛔⛔ NO TYPE CAN CARRY THIS BOUND, WHICH IS WHY THIS EXISTS AT ALL. [`Self::at`] needs the index
+    /// as a literal and an allocator's index is a COUNTER over the program being compiled, so the
+    /// ceiling is a compile-time constant while the count is program data. A `checked -> Option` was
+    /// rejected for the reason `at::<I>` gives, and doubly here: this island spells absence as the
+    /// `.td`'s `-1`, which is the exact value the backend refuses with `Register initialization out of
+    /// boundary`, so folding an overflow into `None` would move the failure past the emitter instead of
+    /// naming it. The panic names the ISA's own ceiling at the instruction that broke it.
+    #[must_use]
+    pub fn allocated(index: u32) -> RegIndex {
+        match Bounded::checked(index) {
+            Some(bounded) => RegIndex(bounded),
+            None => panic!(
+                "register allocation handed out index {index}, and a unit has only \
+                 {} (kMaxCompRegs, progir.h:508-509)",
+                sys_arch_spec::progir::MAX_REGISTERS_PER_UNIT
+            ),
+        }
+    }
+
     /// The index.
     #[must_use]
     pub const fn get(self) -> u32 {
@@ -1820,6 +1843,21 @@ pub enum Op {
         iv: Val,
         /// `$bound` — the trip count.
         bound: Val,
+        /// ⭐ `regLocales`/`regIndices` **ENTRY 0** — the register the loop counts in, which the op
+        /// declares as "First entry is register info for `bound`" (`SentientOps.td:58-61`) and which
+        /// the reference reads and writes for the INDUCTION VARIABLE, argument 0 of the body
+        /// (`locales[argNumber]` at `SentientOps.cpp:1846-1858`, `reg_indices[0] = index` at `:1992`).
+        ///
+        /// ⛔ IT WAS ABSENT AND `RegisterAllocation` (unit `e344`) IS WHAT NEEDS IT: for a loop
+        /// carrying nothing it is the ONLY register that pass assigns, and the reference's own
+        /// expectation is `regIndices = [0 : i32], regLocales = [#sentient<reg_type lccr>]` on a
+        /// `sentient.for` with no `iter_args` (`dcc/test/L3SU/dyn_node_e2e.mlir`). Reading it as
+        /// [`RegType::Unknown`] and writing it as a `todo!` made the loop counter unallocatable.
+        ///
+        /// ⭐ `None` IS "THE REFERENCE HAS NOT PUSHED THIS ENTRY YET" — `updateProgramUnit` is what
+        /// pushes it, from the induction variable's locale (`RegisterTypeAssignment.cpp:440-450`), so
+        /// a freshly lowered loop has no entry 0 at all and prints the empty arrays bridge 2 emits.
+        bound_reg: Option<Reg>,
         /// THE VALUES THE LOOP CARRIES — ⛔ ONE ENTRY EACH, so the iter-operand list and the register
         /// arrays cannot disagree about how many there are. See [`Carried`].
         carried: Vec<Carried>,
@@ -2521,6 +2559,7 @@ pub fn operands_mut(op: &mut Op) -> Vec<&mut Val> {
         Op::For {
             iv: _,
             bound,
+            bound_reg: _,
             carried,
             dbg_name: _,
             body: _,
@@ -2983,6 +3022,7 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
         Op::For {
             iv,
             bound,
+            bound_reg,
             carried,
             dbg_name,
             body,
@@ -2996,9 +3036,14 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 format!(" -> ({})", tys.join(", "))
             };
             let results: Vec<Val> = carried.iter().map(|c| c.result).collect();
+            // ⭐ ENTRY 0 FIRST, THEN ONE PER CARRIED VALUE — the `[bound, initArgs…, results…]`
+            // layout of `SentientOps.td:58-61`, with this island's one entry per carried value
+            // standing for the reference's argument-and-result pair. ⛔ A `bound_reg` of `None` is
+            // the attribute the reference has not written yet, so the arrays stay one shorter.
+            let regs: Vec<Reg> = bound_reg.iter().copied().chain(carried.iter().map(|c| c.reg)).collect();
             let mut attrs = vec![
-                attr("regLocales", &locale_array(carried.iter().map(|c| c.reg))),
-                attr("regIndices", &index_array(carried.iter().map(|c| c.reg))),
+                attr("regLocales", &locale_array(regs.iter().copied())),
+                attr("regIndices", &index_array(regs.iter().copied())),
             ];
             if carried.iter().any(|c| c.program_header) {
                 attrs.push(attr(

@@ -741,6 +741,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(2),
                 bound: Val(3),
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![
@@ -748,6 +749,7 @@ mod unit_tests {
                     Op::Sentient(sentient::Op::For {
                         iv: Val(5),
                         bound: Val(6),
+                        bound_reg: None,
                         carried: Vec::new(),
                         dbg_name: None,
                         body: Vec::new(),
@@ -779,6 +781,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(3),
                 bound: Val(4),
+                bound_reg: None,
                 carried: vec![
                     a_carried(Val(0), Val(5), Val(6), RegType::Jcr),
                     a_carried(Val(2), Val(7), Val(8), RegType::Jcr),
@@ -845,6 +848,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(7),
                 bound: Val(8),
+                bound_reg: None,
                 carried: vec![
                     a_carried(Val(5), Val(9), Val(10), RegType::Jcr),
                     a_carried(Val(6), Val(11), Val(12), RegType::Jcr),
@@ -956,6 +960,7 @@ mod unit_tests {
         let loop_op = Op::Sentient(sentient::Op::For {
             iv: Val(0),
             bound: Val(1),
+            bound_reg: None,
             carried: vec![a_carried(Val(2), Val(3), Val(4), RegType::Lccr)],
             dbg_name: None,
             body: Vec::new(),
@@ -1012,6 +1017,7 @@ mod unit_tests {
         let loop_op = Op::Sentient(sentient::Op::For {
             iv: Val(5),
             bound: Val(6),
+            bound_reg: None,
             carried: vec![Carried {
                 element_size: Some(Bits(8)),
                 ..a_carried(Val(7), Val(8), Val(9), RegType::Lccr)

@@ -153,3 +153,20 @@ pub struct ForRef(pub Val);
 /// negative index. `iter_arg_index_ >= 0` is half of four descriptors' `isValid()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IterArgIndex(pub u32);
+
+/// WHETHER THE PROGRAMS ARE BEING STITCHED TOGETHER — `dccExtContext().getProgStitch()`, which is
+/// `dsc_global_->doProgStitch` (`Utils/DccExtContext.cpp:329`).
+///
+/// ⛔ A PASS INPUT, NOT A CONSTANT HERE. It is a property of the whole compilation that four of these
+/// passes branch on (`ReadOnlyRegisterRenumbering.cpp:111`, `RegisterPacking.cpp:186`,
+/// `SetSendDestinationRE.cpp:147`, `AddressPinningAndToggle.cpp:1509`), so the pass that reads it takes
+/// it and the pipeline that knows the answer states it — see
+/// [`crate::bridges::dataflow_ir_to_sentient::tf_program_units_reduction`] for the sibling
+/// `getFolding()` and why a context flag is not a runtime question in this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgStitch {
+    /// `getProgStitch() == true` — this program is one piece of a stitched program.
+    Stitched,
+    /// `getProgStitch() == false` — the standalone compilation, and the crate's own path today.
+    Standalone,
+}

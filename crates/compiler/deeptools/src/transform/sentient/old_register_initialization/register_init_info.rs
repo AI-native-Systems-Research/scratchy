@@ -986,6 +986,7 @@ mod unit_tests {
         Op::Sentient(sentient::Op::For {
             iv: Val(iv),
             bound: Val(bound),
+            bound_reg: None,
             carried,
             dbg_name: None,
             body,

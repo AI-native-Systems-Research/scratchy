@@ -362,6 +362,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(20),
                 bound: Val(21),
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![store(StoreSource::Multicast(handle), Val(12))],

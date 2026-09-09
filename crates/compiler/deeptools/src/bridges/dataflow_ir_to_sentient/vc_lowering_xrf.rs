@@ -1462,6 +1462,7 @@ mod unit_tests {
         sen::Op::Sentient(sentient::Op::For {
             iv,
             bound,
+            bound_reg: None,
             carried: ptrs
                 .into_iter()
                 .map(|(init, arg, result)| sentient::Carried {
@@ -2742,6 +2743,7 @@ pub fn create_for_op_with_return_value(
     let sen::Op::Sentient(sentient::Op::For {
         iv,
         bound,
+        bound_reg,
         carried,
         dbg_name,
         body,
@@ -2816,6 +2818,12 @@ pub fn create_for_op_with_return_value(
         op: sen::Op::Sentient(sentient::Op::For {
             iv: *iv,
             bound: *bound,
+            // ⭐ ENTRY 0 IS CARRIED OVER LOCALE-ONLY, exactly as every other entry is: `getRegLocales()`
+            // is passed through whole and `ArrayRef<int32_t>()` drops the whole index array.
+            bound_reg: bound_reg.map(|reg| sentient::Reg {
+                locale: reg.locale,
+                index: None,
+            }),
             carried: new_carried,
             dbg_name: dbg_name.clone(),
             body: new_body,
@@ -3823,6 +3831,7 @@ mod xrf_lowering_unit_tests {
         let for_op = sen::Op::Sentient(sentient::Op::For {
             iv: Val(4),
             bound: Val(5),
+            bound_reg: None,
             carried: vec![carried],
             dbg_name: Some("SCF-For #1".to_owned()),
             body: vec![sen::Op::Sentient(sentient::Op::Yield {
@@ -4130,6 +4139,7 @@ mod xrf_lowering_unit_tests {
             sen::Op::Sentient(sentient::Op::For {
                 iv: vals.mint(),
                 bound: Val(0),
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![

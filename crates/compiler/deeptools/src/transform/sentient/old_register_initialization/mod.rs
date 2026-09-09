@@ -413,6 +413,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(4),
                 bound: Val(5),
+                bound_reg: None,
                 carried: vec![
                     sentient::Carried {
                         program_header: false,
@@ -442,6 +443,7 @@ mod unit_tests {
                 Op::Sentient(sentient::Op::For {
                     iv: Val(4),
                     bound: Val(5),
+                    bound_reg: None,
                     carried: vec![
                         sentient::Carried {
                             program_header: false,
@@ -465,6 +467,7 @@ mod unit_tests {
         let mut body = vec![Op::Sentient(sentient::Op::For {
             iv: Val(3),
             bound: Val(4),
+            bound_reg: None,
             carried: vec![carried(1, 5, 6, None)],
             dbg_name: None,
             body: vec![copy(5, 7, None, true)],
@@ -475,6 +478,7 @@ mod unit_tests {
             vec![Op::Sentient(sentient::Op::For {
                 iv: Val(3),
                 bound: Val(4),
+                bound_reg: None,
                 carried: vec![sentient::Carried {
                     program_header: false,
                     ..carried(1, 5, 6, None)
@@ -514,6 +518,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(6),
                 bound: Val(7),
+                bound_reg: None,
                 carried: vec![carried(2, 8, 9, Some(Bits(16)))],
                 dbg_name: None,
                 body: Vec::new(),

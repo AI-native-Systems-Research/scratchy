@@ -456,6 +456,7 @@ mod insert_pt_mask_ops_tests {
         let mut unit_body = vec![sen::Op::Sentient(sentient::Op::For {
             iv: vals.mint(),
             bound: vals.mint(),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: vec![
@@ -641,6 +642,7 @@ mod update_loop_mask_tree_tests {
         let body = vec![sen::Op::Sentient(sentient::Op::For {
             iv,
             bound: vals.mint(),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: vec![mac],

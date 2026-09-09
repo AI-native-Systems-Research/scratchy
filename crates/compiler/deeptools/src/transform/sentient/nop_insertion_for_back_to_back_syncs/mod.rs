@@ -364,6 +364,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(3),
                 bound: Val(4),
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![hard_send("s2")],
@@ -389,6 +390,7 @@ mod unit_tests {
                 Op::Sentient(sentient::Op::For {
                     iv: Val(3),
                     bound: Val(4),
+                    bound_reg: None,
                     carried: Vec::new(),
                     dbg_name: None,
                     // The loop clears the marker before its body, so `s2` stands alone inside it.

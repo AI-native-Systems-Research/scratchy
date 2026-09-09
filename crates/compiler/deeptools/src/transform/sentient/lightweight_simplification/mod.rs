@@ -650,6 +650,7 @@ mod unit_tests {
             Op::Sentient(ops::Op::For {
                 iv: Val(2),
                 bound: Val(0),
+                bound_reg: None,
                 carried: vec![carried],
                 dbg_name: None,
                 body: vec![
@@ -672,6 +673,7 @@ mod unit_tests {
             Op::Sentient(ops::Op::For {
                 iv: Val(2),
                 bound: Val(0),
+                bound_reg: None,
                 carried: vec![carried],
                 dbg_name: None,
                 body: vec![Op::Sentient(ops::Op::Yield {

@@ -1077,19 +1077,28 @@ pub fn element_size(val: Val, defs: Definitions<'_>) -> Option<crate::formats::B
 /// `SentientRegType::unknown` at `:1759` and returned by every arm that finds no attribute — an
 /// unassigned register, which `RegisterTypeAssignment` (D66) is what replaces.
 ///
-/// ⛔ THREE ISLAND GAPS ANSWER `Unknown`, EACH THE REFERENCE'S OWN NO-ATTRIBUTE BRANCH: `regLocales`
-/// entry 0, which the op declares to be `bound`'s and which the reference reads for the INDUCTION
-/// VARIABLE (`locales[argNumber]`, `SentientOps.td:58-61`) — this island's `For` has a field per
-/// CARRIED value and none for the bound; `regLocale` as a discardable attribute on
-/// `dataflow.get_unit` (`:1793-1800`, whose own `else` returns `unknown`); and `regLocales` on
-/// `uniform.uniformize_regions` (`:1832-1842`, whose own `else` returns `unknown`).
+/// ⛔ TWO ISLAND GAPS ANSWER `Unknown`, EACH THE REFERENCE'S OWN NO-ATTRIBUTE BRANCH: `regLocale` as a
+/// discardable attribute on `dataflow.get_unit` (`:1793-1800`, whose own `else` returns `unknown`);
+/// and `regLocales` on `uniform.uniformize_regions` (`:1832-1842`, whose own `else` returns
+/// `unknown`). ⭐ ENTRY 0 WAS THE THIRD AND IS NOW [`sentient::Op::For::bound_reg`], which the
+/// reference reads for the INDUCTION VARIABLE — argument 0, `locales[argNumber]`.
 #[must_use]
 pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
-    if let Some((Op::Sentient(sentient::Op::For { carried, .. }), index)) = defs.for_arg_of(val) {
-        return index
-            .checked_sub(1)
-            .and_then(|position| carried.get(position))
-            .map_or(sentient::RegType::Unknown, |value| value.reg.locale);
+    if let Some((
+        Op::Sentient(sentient::Op::For {
+            bound_reg, carried, ..
+        }),
+        index,
+    )) = defs.for_arg_of(val)
+    {
+        // ⭐ ARGUMENT 0 IS THE INDUCTION VARIABLE AND READS ENTRY 0 — `locales[argNumber]` with no
+        // special case, so the loop counter's own register is the array's first entry.
+        return match index.checked_sub(1) {
+            None => bound_reg.map_or(sentient::RegType::Unknown, |reg| reg.locale),
+            Some(position) => carried
+                .get(position)
+                .map_or(sentient::RegType::Unknown, |value| value.reg.locale),
+        };
     }
     match defs.of(val) {
         Some(Op::Sentient(
@@ -1195,13 +1204,20 @@ pub fn set_value_reg_index(scope: &mut [Op], val: Val, index: Option<sentient::R
 /// region arguments it binds.
 fn set_reg_index_on(op: &mut sentient::Op, val: Val, index: Option<sentient::RegIndex>) {
     match op {
-        sentient::Op::For { iv, carried, .. } => {
+        sentient::Op::For {
+            iv,
+            bound_reg,
+            carried,
+            ..
+        } => {
+            // ⭐ `reg_indices[0] = index` (`SentientOps.cpp:1992`) — and where the array did not
+            // exist, `getAndBuildRegIndicesAttrIfNotExists` mints an all-`-1` one WITHOUT touching
+            // `regLocales`, so an entry 0 created here carries an unassigned locale.
             if *iv == val {
-                todo!(
-                    "setValueRegIndex on a sentient.for induction variable writes regIndices[0] \
-                     (Dialect/Sentient/SentientOps.cpp:1992), and this island's `For` has a `Reg` \
-                     per CARRIED value and none for the bound the induction variable counts against"
-                );
+                *bound_reg = Some(sentient::Reg {
+                    locale: bound_reg.map_or(sentient::RegType::Unknown, |reg| reg.locale),
+                    index,
+                });
             }
             // ⭐ ONE ENTRY FOR THE ARGUMENT AND THE RESULT, where the reference has `[i + 1]` and
             // `[i + numRegionIterArgs + 1]` of one `1 + 2n` array — see [`sentient::Carried`].

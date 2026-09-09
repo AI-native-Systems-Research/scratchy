@@ -983,6 +983,7 @@ mod unit_tests {
         let for_op = sen::Op::Sentient(sentient::Op::For {
             iv: Val(4),
             bound: Val(13),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: Vec::new(),
@@ -1020,6 +1021,7 @@ mod unit_tests {
         let for_op = sen::Op::Sentient(sentient::Op::For {
             iv: Val(4),
             bound: Val(13),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: Vec::new(),
@@ -1083,6 +1085,7 @@ mod unit_tests {
         let for_op = sen::Op::Sentient(sentient::Op::For {
             iv: Val(4),
             bound: Val(13),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: Vec::new(),

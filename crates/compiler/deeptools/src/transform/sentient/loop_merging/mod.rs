@@ -451,6 +451,7 @@ mod unit_tests {
         Op::Sentient(sentient::Op::For {
             iv: Val(0),
             bound: Val(1),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: dbg_name.map(str::to_owned),
             body: Vec::new(),
@@ -473,6 +474,7 @@ mod unit_tests {
         Op::Sentient(sentient::Op::For {
             iv,
             bound,
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: dbg_name.map(str::to_owned),
             body: Vec::new(),

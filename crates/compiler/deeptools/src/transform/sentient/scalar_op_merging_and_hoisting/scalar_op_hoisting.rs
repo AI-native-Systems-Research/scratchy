@@ -623,6 +623,7 @@ mod unit_tests {
         Op::Sentient(ops::Op::For {
             iv: Val(0),
             bound: Val(1),
+            bound_reg: None,
             carried: entries,
             dbg_name: None,
             body,

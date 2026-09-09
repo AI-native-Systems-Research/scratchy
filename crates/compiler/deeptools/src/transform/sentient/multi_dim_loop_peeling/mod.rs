@@ -282,6 +282,7 @@ mod unit_tests {
         let unit = vec![Op::Sentient(sentient::Op::For {
             iv: Val(1),
             bound: Val(0),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: vec![Op::Sentient(sentient::Op::Nop { dbg_name: None })],

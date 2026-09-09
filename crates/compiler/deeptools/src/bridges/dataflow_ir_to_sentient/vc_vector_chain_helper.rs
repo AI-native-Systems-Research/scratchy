@@ -3876,6 +3876,7 @@ mod unit_tests {
                 // walk under test ignores it; it is here because the op always names one.
                 iv: Val(11),
                 bound: Val(1),
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: std::vec![

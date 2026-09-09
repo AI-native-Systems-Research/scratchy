@@ -834,6 +834,7 @@ mod unit_tests {
                 SenOp::Sentient(sen::Op::For {
                     iv,
                     bound: n_iterations,
+                    bound_reg: None,
                     carried: vec![sen::Carried {
                         init,
                         arg,
@@ -980,6 +981,9 @@ pub fn match_and_rewrite(scf_for_loop: ScfForLoop<'_>, values: &mut Values) -> V
         SenOp::Sentient(sen::Op::For {
             iv: scf_for_loop.iv,
             bound: n_iterations,
+            // ⛔ NO ENTRY 0 EITHER, for the reason the carried locales are `unknown` above: the `lccr`
+            // push-back is commented out at `:101-103` and `RegisterTypeAssignment` is what pushes it.
+            bound_reg: None,
             carried,
             dbg_name: scf_for_loop.dbg_name.map(str::to_owned),
             body,

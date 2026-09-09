@@ -2349,6 +2349,7 @@ mod compute_loops_tests {
         sen::Op::Sentient(sentient::Op::For {
             iv: vals.mint(),
             bound: vals.mint(),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body,
@@ -2427,6 +2428,7 @@ mod loop_mask_tree_new_tests {
         let unit_body = vec![sen::Op::Sentient(sentient::Op::For {
             iv: vals.mint(),
             bound: vals.mint(),
+            bound_reg: None,
             carried: Vec::new(),
             dbg_name: None,
             body: Vec::new(),

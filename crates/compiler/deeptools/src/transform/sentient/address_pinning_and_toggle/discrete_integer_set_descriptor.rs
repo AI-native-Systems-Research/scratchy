@@ -526,6 +526,7 @@ mod unit_tests {
         let inner = Op::Sentient(sentient::Op::For {
             iv: Val(20),
             bound: Val(2),
+            bound_reg: None,
             carried: vec![carried(Val(11), Val(21), Val(22))],
             dbg_name: None,
             body: vec![
@@ -545,6 +546,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(10),
                 bound: outer_bound,
+                bound_reg: None,
                 carried: vec![carried(Val(3), Val(11), Val(12))],
                 dbg_name: None,
                 body: vec![

@@ -340,6 +340,7 @@ mod unit_tests {
         let inner = Op::Sentient(sentient::Op::For {
             iv: Val(11),
             bound: Val(12),
+            bound_reg: None,
             carried: vec![carried(Val(2), Val(20), Val(21))],
             dbg_name: None,
             body: vec![
@@ -367,6 +368,7 @@ mod unit_tests {
         let mut walked = vec![Op::Sentient(sentient::Op::For {
             iv: Val(1),
             bound: Val(0),
+            bound_reg: None,
             carried: vec![carried(Val(9), Val(2), Val(3))],
             dbg_name: None,
             body: vec![

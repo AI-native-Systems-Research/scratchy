@@ -419,6 +419,7 @@ mod unit_tests {
             Op::Sentient(sentient::Op::For {
                 iv: Val(4),
                 bound: Val(2),
+                bound_reg: None,
                 carried: Vec::new(),
                 dbg_name: None,
                 body: vec![
@@ -444,6 +445,7 @@ mod unit_tests {
                 Op::Sentient(sentient::Op::For {
                     iv: Val(4),
                     bound: Val(2),
+                    bound_reg: None,
                     carried: Vec::new(),
                     dbg_name: None,
                     // ⛔ THE DUPLICATE'S READER MOVED ONTO THE SURVIVOR, which is now in the entry
