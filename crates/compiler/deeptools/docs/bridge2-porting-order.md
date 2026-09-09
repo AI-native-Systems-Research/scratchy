@@ -1117,7 +1117,7 @@ island for it (the sibling of `GetMyUnitInCollection`, absent from `Dataflow.td`
 
 ## Progress
 
-`350/384 ported; 350/384 audited`
+`358/384 ported; 358/384 audited`
 
 ⭐ ENTRIES 297-304 — THE COMPOSITE TIME-STEP CONSTRUCTOR, THE DIRECT-OPERAND RECORD PAIR AND ITS
 COMPOSITE LOWERING, THE THREE SYNC DISPATCHERS, THE `symbol.query_map` PASS AND THE OPERAND/PRECISION
@@ -2840,6 +2840,56 @@ whose body has two.
 139's six-way dispatch has no ported `run` at all — so the call site arrives with the changeset that
 lands the erase, exactly as entry 196's own anchor already says.
 
+⭐ ENTRIES 365-372 — THE PESFP OP-INFO RECORD AND ITS NON-COMPUTE DRIVER, THE XRF INDEX PASS, THE PT
+NON-COMPUTE AND COMPUTE FUSIONS, THE SHALLOW-MERGE PREDICATE, THE LOOP-INVARIANT CONDITIONAL HOIST AND
+THE MUTABLE START-ADDRESS PASS. 365/366 are in `vc_vector_chain_to_sentient_pesfp.rs`, 367 in
+`vc_lowering_xrf.rs`, 368/369 in `vc_vector_chain_to_sentient_pt.rs`, 370/371 in
+`tf_cfgs_dataflow_conditional_tree.rs` and 372 in `tf_mutable_start_addr_shifting.rs`.
+
+⛔ 365's MASK IS THE OPERAND **PAST** THE COUNTED ONES (`:1097-1113`): `from_operands_` is filled for
+`num_operands` slots and the mask is read at that index, so a masked `vectorchain.binary` carries three
+operands where two are counted. ⛔ AND AN ABSENT OPERAND SLOT TAKES THE **COMPUTE** PRECISION, not
+nothing and not A's (`:1140-1148`) — a unary op's B and C both come back `fp16` where A is the
+receive's own `bf16` — while `result_precision_` substitutes the compute precision when there is no
+result forwarding and no precision of its own.
+
+⛔ 368's THREE `std::swap`s RUN ONCE PER DESTINATION AND ARE CUMULATIVE (`:152-154`), so a second
+destination swaps A and C back; `opA_forwarding`/`opC_forwarding` are declared and never pushed to
+(`:148-149`), `from_ID[1]` is never written, and `op1` is read off the ORIGINAL `from` rather than the
+copy `setReuseInformation` may have re-valued to `latch`.
+
+⛔⛔ 369'S DISPATCH BEYOND ITS OWN THREE OP CLASSES IS DEAD CODE. The walk collects
+`vectorchain.multiply`, `multiply_and_accumulate` and `binary` alone (`:252-260`), then branches on
+`ElementWiseCompare`, `ElementWiseSelection`, `Shuffle`, `ScanWithGap`, seven estimate ops and `Pack`
+(`:519-869`) — twelve arms plus the leading `dyn_cast<ShuffleOp>` skip (`:264-271`) that `isa<>`'s
+concrete-class matching can never reach. ⛔ AND ITS `binary` ARM DISCARDS the `opA_forwarding`/
+`opB_forwarding` it just computed, passing two literal `{}`s (`:508-509`).
+
+⛔⛔ 370's `is_between_if_ops` IS SET **AFTER** THE `break` (`:357-359` against `:376`), so a BACKWARDS
+pair is vacuously mergeable with nothing checked; entry 380 only ever offers a later sibling, so no
+bridge-2 caller reaches it. ⛔ AND THE EXEMPTION READS OPERAND 0 BEFORE ASKING WHETHER `if_op1` IS AN
+`scf.if` (`:369-370`), which indexes out of range on an operandless `affine.if` — `first()` is `None`
+here, the same answer the `!isa<scf::IfOp>` beside it already gives.
+
+⛔ 371's EARLY-STOP LAMBDA CAN NEVER ANSWER NON-NULL: every exit from its `while (1)` is
+`return nullptr` (`:777-789`), so the reverse-BFS walk runs to the end and the hoist loop stops only
+when the parent stops being a loop or invariance fails. `n->isLeaf()` (`:762`) is dead for the reason
+entry 380 records.
+
+⛔ AND 367 SURFACED A REAL DEFECT IN ENTRY 345, WHICH THIS CHANGESET FIXES. `processXrfPtrPerUnit`
+erases each pass's spent loop init inside `for (int i = 0; i < 2; i++)` (`LoweringXRF.cpp:524`), which
+costs the reference nothing because its map is keyed by `Operation *`. Entry 367 keys these maps by
+POSITION, so erasing the write pass's init renumbered every op after it and the read pass looked up
+`[4, 0]` for an access recorded at `[5, 0]` — every entry stayed half-filled and `complete()` dropped
+the whole map. The erasures now run once both passes have walked; no reader can appear after the
+rewrite, so the answer is unchanged.
+
+⭐ 366 AND 372 ARE DRIVERS OVER PORTED PARTS: 366's three patterns all funnel into the unported entry
+364, so it names the ops the fusion would have rewritten, and 372 is
+`tf_mutable_addr_splitting::run_on_operation`'s walk line for line — `isCandidateMemView` and the
+pre-order view walk are reused rather than copied, the only differences being that pass's inert
+per-unit `num_conditionals_ = 0` and its `DT_CHECK` wording.
+
 ## Level 0
 
 - [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
@@ -3591,22 +3641,22 @@ lands the erase, exactly as entry 196's own anchor already says.
 - [ ] **AUDIT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, line by line against the C++
 - [ ] **PORT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, 222 lines
 - [ ] **AUDIT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, line by line against the C++
-- [ ] **PORT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, 83 lines
-- [ ] **AUDIT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, line by line against the C++
-- [ ] **PORT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, 80 lines
-- [ ] **AUDIT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, line by line against the C++
-- [ ] **PORT 367/384** `createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564`, 97 lines
-- [ ] **AUDIT 367/384** `createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564`, line by line against the C++
-- [ ] **PORT 368/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:46`, 191 lines
-- [ ] **AUDIT 368/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:46`, line by line against the C++
-- [ ] **PORT 369/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245`, 628 lines
-- [ ] **AUDIT 369/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245`, line by line against the C++
-- [ ] **PORT 370/384** `areShallowlyMergeable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:343`, 34 lines
-- [ ] **AUDIT 370/384** `areShallowlyMergeable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:343`, line by line against the C++
-- [ ] **PORT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, 42 lines
-- [ ] **AUDIT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, line by line against the C++
-- [ ] **PORT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, 69 lines
-- [ ] **AUDIT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, line by line against the C++
+- [x] **PORT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, 83 lines
+- [x] **AUDIT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, line by line against the C++
+- [x] **PORT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, 80 lines
+- [x] **AUDIT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, line by line against the C++
+- [x] **PORT 367/384** `createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564`, 97 lines
+- [x] **AUDIT 367/384** `createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564`, line by line against the C++
+- [x] **PORT 368/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:46`, 191 lines
+- [x] **AUDIT 368/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:46`, line by line against the C++
+- [x] **PORT 369/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245`, 628 lines
+- [x] **AUDIT 369/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245`, line by line against the C++
+- [x] **PORT 370/384** `areShallowlyMergeable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:343`, 34 lines
+- [x] **AUDIT 370/384** `areShallowlyMergeable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:343`, line by line against the C++
+- [x] **PORT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, 42 lines
+- [x] **AUDIT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, line by line against the C++
+- [x] **PORT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, 69 lines
+- [x] **AUDIT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, line by line against the C++
 - [x] **PORT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, 6 lines
 - [x] **AUDIT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, line by line against the C++
 

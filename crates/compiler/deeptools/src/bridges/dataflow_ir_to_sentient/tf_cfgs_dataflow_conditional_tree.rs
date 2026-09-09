@@ -84,7 +84,7 @@ use crate::arch::Arch;
 use crate::islands::dataflow_ir::ProgramUnit;
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{
-    self as dfir_op, Op as DfirOp, Val, affine, arith, scf, symbol,
+    self as dfir_op, Op as DfirOp, Val, affine, arith, dataflow, scf, symbol,
 };
 use crate::islands::dataflow_ir::ty::ScalarTy;
 
@@ -1599,13 +1599,11 @@ mod unit_tests {
         })
     }
 
-    /// 🎯 380/384 — A CONDITIONAL WITH A LATER SIBLING IS OFFERED TO THE MERGE PREDICATE, AND A LONE
-    /// ONE IS NOT. The second `scf.if` in the same block is the first one's next sibling (`:229`), so
-    /// the pair reaches entry 370; ⛔ THE SIBLING NESTED IN THE `affine.for` IS ALSO A SIBLING —
-    /// `findClosestParent` skips the unselected loop (`ConditionalTree.cpp:200`) — which is what the
-    /// same-block rejection at `:346-349` exists for and what a same-list walk would never offer.
+    /// 🎯 380/384 — A CONDITIONAL WITH A LATER SIBLING IS OFFERED TO THE MERGE PREDICATE, AND THE
+    /// SIBLING NESTED IN THE `affine.for` IS ONE — `findClosestParent` skips the unselected loop
+    /// (`ConditionalTree.cpp:200`), so a pair a same-list walk would never offer reaches entry 370,
+    /// which then refuses it across blocks (`:346-349`) and leaves the walk with nothing merged.
     #[test]
-    #[should_panic(expected = "e370_areShallowlyMergeable")]
     fn a_conditional_and_its_next_sibling_reach_the_merge_predicate() {
         let unit = unit_holding(vec![
             if_on(Val(0)),
@@ -1618,7 +1616,10 @@ mod unit_tests {
                 dbg_name: None,
             }),
         ]);
-        shallowly_merge_conditionals(&CfgsDataflowConditionalTree::new(&unit), None);
+        assert_eq!(
+            shallowly_merge_conditionals(&CfgsDataflowConditionalTree::new(&unit), None),
+            None
+        );
     }
 
     /// 🎯⛔ AND A SINGLE CONDITIONAL HAS NO SIBLING TO MERGE WITH, so the walk completes and the
@@ -2805,7 +2806,7 @@ pub fn merge_shallow(src: &mut DfirOp, dst: &mut DfirOp, order: MergeOrder) {
 /// ⚠️ IT NAMES THE TREE AS IT STANDS AT RETURN. The reference's pointer survives its `recompute()`
 /// (`:271`) because the merged conditional is the op that STAYS; an index does not survive ops being
 /// deleted before it. No caller can observe that yet — the merge below is unported — and this becomes
-/// a path or a handle in the changeset that lands entry 370.
+/// a path or a handle in the changeset that applies one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CondNodeIndex(usize);
 
@@ -2896,16 +2897,24 @@ pub fn shallowly_merge_conditionals<A: Arch>(
             return;
         }
 
+        // `:346` — `if_op0->getBlock()`, which the tree's sibling groups cross (see [`sibling_group`]).
+        let Some(block) = block_of(&tree.unit.body, siblings[at]) else {
+            return;
+        };
         // `:229-230` — `for (sibling = n->getNextSibling(); sibling; sibling = ...->getNextSibling())`.
         for sibling in &siblings[at + 1..] {
-            // `:233` — the predicate that decides the pair, and with it the merge at `:237-259`.
+            // `:233` — the predicate that decides the pair.
+            if !are_shallowly_mergeable(&tree.oe, siblings[at], sibling, block, &tree.unit.body) {
+                continue;
+            }
+            // `:237-259` — the merge itself, then `:260` `break`.
             todo!(
-                "e370_areShallowlyMergeable is unported, so e177_mergeShallow cannot be aimed: \
-                 candidate {:?} and sibling {:?} on {:?} under {:?}",
+                "e177_mergeShallow rewrites the unit in place and deleteAncestorsIfPossible, \
+                 recompute and clearCache are unported, so the merge of candidate {:?} with \
+                 sibling {:?} on {:?} cannot be applied",
                 siblings[at],
                 sibling,
-                tree.unit.on.kind(),
-                tree.oe
+                tree.unit.on.kind()
             );
         }
     });
@@ -2985,11 +2994,212 @@ pub fn simplify_value_based_conditionals<A: Arch>(tree: &CfgsDataflowConditional
     drop(processed);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 370/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHETHER `needle` IS `root` OR SITS ANYWHERE INSIDE IT — the reference's parent walk
+/// `for (cur_op = use.getOwner(); cur_op != parent_op; cur_op = cur_op->getParentOp())`, read from the
+/// other end. Two siblings share a parent, so "if_op1 is on the chain" is exactly "the use is in
+/// if_op1's subtree, if_op1 itself included" — and `use.getOwner() == if_op1` is the case that makes
+/// the `CmpIOp` exemption below necessary.
+fn in_subtree(root: &DfirOp, needle: &DfirOp) -> bool {
+    core::ptr::eq(root, needle)
+        || dfir_op::regions(root)
+            .into_iter()
+            .flatten()
+            .any(|op| in_subtree(op, needle))
+}
+
+/// Replaces: e370_areShallowlyMergeable
+///
+/// `CFGSDataflowConditionalTree::areShallowlyMergeable` (`:343`) — whether two conditionals of one
+/// block share a top-level condition and nothing strictly between them blocks the splice.
+///
+/// ⛔⛔ `is_between_if_ops` IS SET AFTER THE `break`, SO A BACKWARDS PAIR IS VACUOUSLY MERGEABLE
+/// (`:357-359`, `:376`): if `if_op1` stands BEFORE `if_op0` the walk breaks at `if_op1` while the flag
+/// is still false, and the answer is `true` with nothing checked. Entry 380 only ever offers a LATER
+/// sibling, so no caller in bridge 2 reaches it.
+/// ⛔ THE EXEMPTION READS OPERAND 0 BEFORE ASKING WHETHER `if_op1` IS AN `scf.if` (`:369-370`), so an
+/// operandless `affine.if` indexes out of range there; `operands(..).first()` is `None`, which makes
+/// the left disjunct true — the same answer the `!isa<scf::IfOp>` on its right already gives.
+/// ⚠️ `DT_CHECK_MSG(if_op0 != if_op1, ..)` is `false`: a conditional cannot be merged with itself.
+#[must_use]
+pub fn are_shallowly_mergeable(
+    oe: &OperationEquivalence,
+    if_op0: &DfirOp,
+    if_op1: &DfirOp,
+    block: &[DfirOp],
+    scope: &[DfirOp],
+) -> bool {
+    // `:345` — `DT_CHECK_MSG(if_op0 != if_op1, "Cannot merge a conditional with itself.")`.
+    if core::ptr::eq(if_op0, if_op1) {
+        return false;
+    }
+    // `:346-349` — `bb != if_op1->getBlock()`, and at most one of the pair may bind a result. A block
+    // is a statement list here, so "the same block" is "both are elements of `block`".
+    let in_block = |needle: &DfirOp| block.iter().any(|op| core::ptr::eq(op, needle));
+    if !in_block(if_op0)
+        || !in_block(if_op1)
+        || (!dfir_op::results(if_op0).is_empty() && !dfir_op::results(if_op1).is_empty())
+    {
+        return false;
+    }
+
+    // `:351` — `if (!topLevelConditionsMatch(oe, if_op0, if_op1)) return false;`
+    if !top_level_conditions_match(oe, if_op0, if_op1, scope) {
+        return false;
+    }
+
+    // `:355-356` — *"Check that the ops strictly between if_op0, if_op1 have no side-effects and no
+    // uses inside of if_op1."*
+    let mut is_between_if_ops = false;
+    // `:369` — `if_op1->getOperand(0).getDefiningOp()`, hoisted out of the loop because it does not
+    // depend on `op`. See this function's second trap for the out-of-range read.
+    let cond_def = dfir_op::operands(if_op1)
+        .first()
+        .and_then(|cond| dfir_op::defining_op(*cond, block));
+    for op in block {
+        // `:358` — ⛔ BEFORE the flag is consulted, and before it is ever set.
+        if core::ptr::eq(op, if_op1) {
+            break;
+        }
+        if is_between_if_ops {
+            // `:360`
+            if op_has_side_effect(op) {
+                return false;
+            }
+            // `:368-370` — the condition `if_op1` branches on is allowed to be one of these ops,
+            // because `if_op0` has an equivalent condition standing before it.
+            let is_exempt_condition = matches!(cond_def, Some(def) if core::ptr::eq(def, op))
+                && matches!(ConditionalKind::of(if_op1), Some(ConditionalKind::Scf));
+            if !is_exempt_condition {
+                // `:371-375` — every use of `op`, up its owner's parent chain to `op`'s own parent.
+                for result in dfir_op::results(op) {
+                    if dfir_op::uses(result, block)
+                        .into_iter()
+                        .any(|user| in_subtree(if_op1, user))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        // `:376`
+        if core::ptr::eq(op, if_op0) {
+            is_between_if_ops = true;
+        }
+    }
+    // `:378`
+    true
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 371/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE STATEMENT LIST THAT DIRECTLY HOLDS `needle` — `Operation::getBlock()`.
+fn block_of<'a>(ops: &'a [DfirOp], needle: &DfirOp) -> Option<&'a [DfirOp]> {
+    if ops.iter().any(|op| core::ptr::eq(op, needle)) {
+        return Some(ops);
+    }
+    ops.iter()
+        .flat_map(dfir_op::regions)
+        .find_map(|region| block_of(region, needle))
+}
+
+/// THE OP WHOSE REGION DIRECTLY HOLDS `needle` — `Operation::getParentOp()`, and [`None`] for a
+/// statement of the unit's own body.
+fn enclosing_op<'a>(ops: &'a [DfirOp], needle: &DfirOp) -> Option<&'a DfirOp> {
+    for op in ops {
+        for region in dfir_op::regions(op) {
+            if region.iter().any(|inner| core::ptr::eq(inner, needle)) {
+                return Some(op);
+            }
+            if let Some(found) = enclosing_op(region, needle) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Replaces: e371_hoistLoopInvariantConditionals
+///
+/// `CFGSDataflowConditionalTree::hoistLoopInvariantConditionals` (`:750`) — hoist every simple,
+/// result-yielding, loop-invariant conditional whose one result only feeds a
+/// `dataflow.get_logical_memory_view` or a `dataflow.send`/`receive` out of its enclosing loop.
+///
+/// ⛔⛔ THE LAMBDA CAN NEVER ANSWER NON-NULL: every exit from `while (1)` (`:777-789`) is
+/// `return nullptr`, so the reverse-BFS walk's early-stop is unreachable and the hoist loop ends only
+/// when the parent stops being a loop or invariance fails. That is why this is a `for` over every
+/// candidate rather than a walk that stops at the first hit.
+/// ⛔ `n->isLeaf()` (`:762`) IS DEAD, for the reason entry 380 records; `isThenNode()`/`isElseNode()`
+/// have no counterpart in a representation where only conditionals are nodes.
+/// ⚠️ AN `affine.if` NODE IS NOT HOISTED: `isLoopInvariant`'s `DT_CHECK_MSG(scf_if, ..)` (`:686`)
+/// aborts on one, and entry 349 answers "not invariant" there.
+/// ⚠️ `moveAncestorsToMaintainDominance` (`:787`) is `dcc/src/Analysis/`
+/// (`TransformationConditionalTree.cpp:141`) — outside bridge 2's 384, as at entries 284 and 380.
+pub fn hoist_loop_invariant_conditionals<A: Arch>(tree: &CfgsDataflowConditionalTree<'_, A>) {
+    let body = &tree.unit.body;
+    for n in reverse_bfs_candidates(body) {
+        // `:766-768` — `DT_CHECK_MSG(n_if_op, ..)` is discharged by the node BEING the op here, and
+        // `getNumResults() != 1` is the "result-yielding" half of the pattern.
+        let results = dfir_op::results(n);
+        let [result] = results.as_slice() else {
+            continue;
+        };
+        let result = *result;
+
+        // `:770-775` — *"Restrict hoisting to IfOps only used in get_logical_mem_view or
+        // dataflow.send/receive."* ⭐ A CONDITIONAL WITH NO USERS PASSES, which is the `for`'s own
+        // answer over an empty list.
+        if !dfir_op::uses(result, body).into_iter().all(|user| {
+            matches!(
+                user,
+                DfirOp::Dataflow(
+                    dataflow::Op::GetLogicalMemoryView { .. }
+                        | dataflow::Op::Send { .. }
+                        | dataflow::Op::Receive { .. }
+                )
+            )
+        }) {
+            continue;
+        }
+
+        // `:779-789` — `while (1)`, whose first two exits are the loop's own termination conditions.
+        let Some(parent_for_op) = enclosing_op(body, n) else {
+            continue;
+        };
+        if !matches!(
+            parent_for_op,
+            DfirOp::Scf(scf::Op::For { .. }) | DfirOp::Affine(affine::Op::For { .. })
+        ) {
+            continue;
+        }
+        // `:784` — and the `affine.if` case, which entry 349 answers `false` for.
+        let Some(scf_if) = ScfConditional::of(n) else {
+            continue;
+        };
+        if !is_loop_invariant(scf_if, parent_for_op, body) {
+            continue;
+        }
+
+        // `:787` — *"Move n_if_op and its ancestors which do not dominate parent_for_op to right
+        // before parent_for_op."*
+        todo!(
+            "moveAncestorsToMaintainDominance is unported, so e371_hoistLoopInvariantConditionals \
+             cannot hoist the loop-invariant conditional {:?} out of {:?} on {:?}",
+            n,
+            parent_for_op,
+            tree.unit.on.kind()
+        );
+    }
+}
+
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e370_areShallowlyMergeable
-// crustify:todo: e371_hoistLoopInvariantConditionals
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 244/384
@@ -3641,4 +3851,116 @@ pub fn is_loop_invariant(n: ScfConditional<'_>, parent_for_op: &DfirOp, scope: &
 
     // `:746`
     true
+}
+
+#[cfg(test)]
+mod merge_and_hoist_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::islands::dataflow_ir::Units;
+    use crate::islands::dataflow_ir::link::{Link, Lxlu, Lxsu};
+    use crate::islands::dataflow_ir::ty::{ElemType, Vector};
+    use crate::units::DfirUnit;
+
+    /// 🎯 370/384 — THE VENDOR'S OWN CONTRAST: A SIDE-EFFECTING OP BETWEEN THE PAIR REFUSES THE MERGE.
+    ///
+    /// `merging-shallow-skip.mlir:80-83` states the rule — *"do not shallow-merge them if … the
+    /// operations between the conditionals in their block have side effects"* — and its input puts a
+    /// `dataflow.receive`/`send` sequence between two `scf.if %12` on one `arith.cmpi` (`:117-131`),
+    /// which the expectation leaves unmerged (`:38-77`).
+    #[test]
+    fn a_side_effecting_op_between_the_pair_refuses_the_merge() {
+        let oe = OperationEquivalence::tagged(
+            EquivalenceTag::CfgMergingAndHoistingCondTree,
+            SubregionCompare::Recursive,
+            BlockArgEquivalence::SameOwnerAndIndex,
+        );
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let cmp = DfirOp::Arith(arith::Op::Compare {
+            result: Val(12),
+            predicate: arith::CmpIPredicate::Eq,
+            lhs: Val(1),
+            rhs: Val(2),
+        });
+        let an_if = || {
+            DfirOp::Scf(scf::Op::If {
+                cond: Val(12),
+                results: Vec::new(),
+                body: Vec::new(),
+                else_body: Vec::new(),
+                dbg_name: None,
+            })
+        };
+
+        let clean = vec![cmp.clone(), an_if(), an_if()];
+        assert!(are_shallowly_mergeable(
+            &oe, &clean[1], &clean[2], &clean, &clean
+        ));
+
+        let (to, from) = Link::<Lxlu, Lxsu>::between(Val(6), Val(10)).ends();
+        let blocked = vec![
+            cmp,
+            an_if(),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: Val(30),
+                from,
+                ty: vec_ty,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Send {
+                to,
+                data: Val(30),
+                ty: vec_ty,
+            }),
+            an_if(),
+        ];
+        assert!(!are_shallowly_mergeable(
+            &oe,
+            &blocked[1],
+            &blocked[4],
+            &blocked,
+            &blocked
+        ));
+    }
+
+    /// 🎯 371/384 — A CONDITIONAL WHOSE RESULT FEEDS ANYTHING BUT A VIEW OR A LINK IS NOT A CANDIDATE.
+    ///
+    /// `:770-775` restricts hoisting to results used only by `dataflow.get_logical_memory_view`,
+    /// `dataflow.send` or `dataflow.receive`; an `arith.addi` reader stops the walk before it reaches
+    /// the unported `moveAncestorsToMaintainDominance`, so this returns rather than panicking.
+    #[test]
+    fn a_conditional_read_by_arithmetic_is_not_hoisted() {
+        let body = vec![DfirOp::Affine(affine::Op::For {
+            iv: Val(1),
+            lo: affine::Bound::Const(0),
+            hi: affine::Bound::Const(28),
+            carried: Vec::new(),
+            dbg_name: None,
+            body: vec![
+                DfirOp::Scf(scf::Op::If {
+                    cond: Val(12),
+                    results: vec![Val(20)],
+                    body: Vec::new(),
+                    else_body: Vec::new(),
+                    dbg_name: None,
+                }),
+                DfirOp::Arith(arith::Op::AddI(arith::IntBinary {
+                    result: Val(21),
+                    lhs: Val(20),
+                    rhs: Val(1),
+                    ty: ScalarTy::Index,
+                })),
+            ],
+        })];
+        let unit = ProgramUnit::<Dd2> {
+            on: Units::one(DfirUnit::Lxlu, Val(0)),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let tree = CfgsDataflowConditionalTree::new(&unit);
+        hoist_loop_invariant_conditionals(&tree);
+    }
 }

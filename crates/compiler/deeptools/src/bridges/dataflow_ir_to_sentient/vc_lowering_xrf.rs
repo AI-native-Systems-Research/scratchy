@@ -71,6 +71,7 @@
 //! | `e345_processXrfPtrPerUnit` | 345/384 | 190 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337` |
 //! | `e367_createXrfIndexModifOps` | 367/384 | 97 | `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564` |
 
+use core::num::NonZeroU32;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::tf_mutable_start_addr_shifting::ElementsPerStick;
@@ -79,7 +80,7 @@ use crate::arch::{Arch, IsaGen};
 use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::dataflow::LocalUnit;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, agen, dataflow, defining_op, vector};
-use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::dataflow_ir::ty::{ScalarTy, Vector};
 use crate::islands::sentient::dialects::{self as sen, Definitions, Val, arith, sentient, symbol};
 use crate::units::DfirUnit;
 
@@ -2580,11 +2581,6 @@ mod unit_tests {
     }
 }
 
-// ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
-// `/// Replaces:` ever appearing, which removed them from every later schedule and let the
-// driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e367_createXrfIndexModifOps
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // 240/384
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -3296,8 +3292,11 @@ impl XrfPass<'_> {
 /// exactly the xrf-related STORES and `expr_maps[1]` with the LOADS (`:630-646`), which is the same
 /// population the four `isa<>` tests here select — so membership in `expr_maps[i]` IS the active arm
 /// and membership in `expr_maps[1 - i]` IS the inactive one.
-/// ⛔ THE `use_empty` CHECK ON A LOOP'S OLD INIT MOVES TO THE END OF THE PASS. Nothing after the
-/// rewrite can add a reader, so the answer is unchanged and the census sees the whole unit.
+/// ⛔ THE `use_empty` CHECK ON A LOOP'S OLD INIT MOVES TO THE END OF **BOTH** PASSES. The reference
+/// erases inside `for (int i = 0; i < 2; i++)` (`:524`) and keys its map by `Operation *`, so a
+/// deletion costs it nothing; entry 367 keyed these maps by POSITION, and erasing the write pass's
+/// spent init renumbers every op after it — which is the read pass's whole lookup. Nothing after the
+/// rewrite can add a reader, so deferring leaves the answer unchanged.
 /// ⭐ THE TWO INIT CONSTANTS LAND IN REVERSE PASS ORDER, `setInsertionPointToStart` putting the read
 /// pointer's in front of the write pointer's (`:376-380`).
 pub fn process_xrf_ptr_per_unit<A: Arch>(
@@ -3311,6 +3310,9 @@ pub fn process_xrf_ptr_per_unit<A: Arch>(
     let mut map: BTreeMap<OpId, PartialXrfPtrs> = BTreeMap::new();
     let mut prologue: Vec<sen::Op> = Vec::new();
     let mut inserted: Vec<sen::Op> = Vec::new();
+    // `SmallVector<Operation *, 16> ops_to_delete;` — see this function's note on why one list
+    // spans both passes here where the reference has one per pass.
+    let mut to_delete: Vec<Val> = Vec::new();
 
     // *"work on write_ptr and read_ptr sequentially"*.
     for ptr in [XrfPtr::Write, XrfPtr::Read] {
@@ -3346,17 +3348,12 @@ pub fn process_xrf_ptr_per_unit<A: Arch>(
         pass.walk(body, &[], 0);
         let XrfPass {
             map: filled,
-            to_delete,
+            to_delete: consumed,
             ..
         } = pass;
         map = filled;
+        to_delete.extend(consumed);
 
-        // `for (Operation *op : ops_to_delete) op->erase();`
-        for old in to_delete {
-            if use_empty(old, body, vals) {
-                sen::erase_defining_op(body, old);
-            }
-        }
         prologue.splice(
             0..0,
             [sen::Op::Sentient(sentient::Op::ScalarConstant {
@@ -3368,11 +3365,340 @@ pub fn process_xrf_ptr_per_unit<A: Arch>(
             })],
         );
     }
+    // `for (Operation *op : ops_to_delete) op->erase();` (`:524`), once both passes have walked.
+    for old in to_delete {
+        if use_empty(old, body, vals) {
+            sen::erase_defining_op(body, old);
+        }
+    }
     body.splice(0..0, prologue);
 
     map.into_iter()
         .filter_map(|(at, partial)| partial.complete().map(|ptrs| (at, ptrs)))
         .collect()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 367/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHICH POINTER ONE ACCESS MOVES, AND THE VECTOR TYPE ITS STICK COUNT IS READ OFF.
+///
+/// ⛔ THE STORES ARE `expr_maps[0]` AND THE LOADS `expr_maps[1]` (`LoweringXRF.cpp:641-646`) —
+/// *"assume that agen::vector_store is only used to store data to XRF in PT"*.
+const fn xrf_access(op: &DfirOp) -> Option<(XrfPtr, Vector)> {
+    match op {
+        DfirOp::Agen(agen::Op::VectorStore { ty, .. })
+        | DfirOp::Vector(vector::Op::Store { ty, .. }) => Some((XrfPtr::Write, *ty)),
+        DfirOp::Agen(agen::Op::VectorLoad { ty, .. })
+        | DfirOp::Vector(vector::Op::Load { ty, .. }) => Some((XrfPtr::Read, *ty)),
+        _ => None,
+    }
+}
+
+/// `dcc::utils::getStickElemNumForOp` (`dcc/src/Utils/Utils.cpp:522-536`) — a switch on the width of
+/// `getElementType(op)`, which for all four accesses is their vector type's element.
+///
+/// ⛔ `default: return -1` IS THE `DT_CHECK_MSG` ABOVE THE CALL, so a 32-bit element is `None` here
+/// even though `getBytesPerStick() * 8 / 32` is a perfectly good 32: the three widths the reference
+/// names are the only ones it will lower, and on both arches those three ARE that quotient
+/// (`case 16: 64`, `case 8: 128`, `case 4: 256` against 128 bytes per stick).
+fn stick_elem_num<A: Arch>(ty: Vector) -> Option<ElementsPerStick> {
+    match ty.elem.bits() {
+        width @ (16 | 8 | 4) => NonZeroU32::new(width).and_then(ElementsPerStick::of::<A>),
+        _ => None,
+    }
+}
+
+/// ONE XRF ACCESS AS EVERYTHING `getLayoutExpr` AND `processXrfPtrPerUnit` ASK OF IT.
+struct XrfAccess {
+    /// Its position in the SEN body — the [`LayoutExprMap`] key entry 345 looks it up by.
+    at: OpId,
+    /// Its index in [`XrfCensus::dfir`], which is the scope every [`Val`]-keyed query reads.
+    index: usize,
+    /// Write for a store, read for a load — see [`xrf_access`].
+    ptr: XrfPtr,
+    /// `type($result)` / `type($valueToStore)`, for [`stick_elem_num`].
+    ty: Vector,
+    /// The `sentient.for`s around it, outermost first.
+    enclosing: Vec<EnclosingLoop>,
+}
+
+/// ⛔⛔ ONE MIXED BODY READ AT TWO RUNGS AT ONCE, WHICH IS THE WHOLE SHAPE OF THIS ENTRY.
+///
+/// `unit.walk` runs over a region holding `sentient.for`/`sentient.if` wrapped around still-unlowered
+/// `agen`/`vector`/`dataflow` accesses — a [`sen::Op`] body — while every question asked OF those
+/// accesses ([`is_xrf_related`], [`layout_expr`]) is a DataflowIR one over a `&[DfirOp]`. So one walk
+/// records both: the sen-body [`OpId`] that keys the maps entry 345 reads, and a FLATTENED
+/// DataflowIR projection (shared-dialect ops in preorder, region contents spliced inline) that
+/// resolves every [`Val`].
+///
+/// ⭐ AND THE PROJECTION IS SELF-CONSISTENT: `op_at` is the ONLY positional use either query makes of
+/// it ([`layout_map_and_indices`] resolves the view by [`Val`] and hands back a position measured in
+/// the same scope), so a flat index answers for the access and for the view it names.
+#[derive(Default)]
+struct XrfCensus {
+    /// The projection — one entry per shared-dialect op, in walk order.
+    dfir: Vec<DfirOp>,
+    /// The four memory accesses, before `isXrfRelated` narrows them.
+    accesses: Vec<XrfAccess>,
+    /// Every `dataflow.get_logical_memory_view`'s index, for the *"is there any xrf view"* walk.
+    views: Vec<usize>,
+}
+
+/// The regions below one op, in the order [`OpId`]'s flat ordinals run — the immutable twin of
+/// [`regions_of`].
+fn regions_at(op: &sen::Op) -> Vec<&[sen::Op]> {
+    match op {
+        sen::Op::Sentient(inner) => sentient::regions(inner),
+        sen::Op::AffineFor(loop_op) => vec![loop_op.body.as_slice()],
+        _ => Vec::new(),
+    }
+}
+
+/// `unit.walk` over a mixed body, filling both halves of an [`XrfCensus`].
+fn take_census(
+    body: &[sen::Op],
+    prefix: &[u32],
+    base: u32,
+    enclosing: &[EnclosingLoop],
+    into: &mut XrfCensus,
+) {
+    for (ordinal, op) in body.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(base + ordinal as u32);
+        match op {
+            // `getInductionVar()` is what a subscript's `arith.subi` names its loop by; the position
+            // is the `layout_map` key. See [`EnclosingLoop`].
+            sen::Op::Sentient(sentient::Op::For { iv, body, .. }) => {
+                let mut inner = enclosing.to_vec();
+                inner.push(EnclosingLoop {
+                    op: OpId::at(&path),
+                    iv: *iv,
+                });
+                take_census(body, &path, 0, &inner, into);
+            }
+            // ⛔ ONE FLAT ORDINAL SPACE ACROSS THE TWO REGIONS — [`OpId::block`]'s convention, and
+            // the one entry 345's walk measures its own positions in.
+            sen::Op::Sentient(sentient::Op::If {
+                then_body,
+                else_body,
+                ..
+            }) => {
+                take_census(then_body, &path, 0, enclosing, into);
+                take_census(else_body, &path, then_body.len() as u32, enclosing, into);
+            }
+            // ⛔ NOT A `sentient.for`, so it drives no layout coefficient — see [`layout_expr`]'s
+            // `DT_CHECK_MSG(isa<sentient::ForOp>(for_op), ..)`.
+            sen::Op::AffineFor(loop_op) => take_census(&loop_op.body, &path, 0, enclosing, into),
+            other => {
+                // This rung's own ops are not DataflowIR ops and take no projected index.
+                let Some(op) = sen::lowered(other) else {
+                    continue;
+                };
+                let index = into.dfir.len();
+                if matches!(
+                    op,
+                    DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView { .. })
+                ) {
+                    into.views.push(index);
+                }
+                if let Some((ptr, ty)) = xrf_access(&op) {
+                    into.accesses.push(XrfAccess {
+                        at: OpId::at(&path),
+                        index,
+                        ptr,
+                        ty,
+                        enclosing: enclosing.to_vec(),
+                    });
+                }
+                into.dfir.push(op);
+            }
+        }
+    }
+}
+
+/// `isa<agen::VectorLoadOp, agen::VectorStoreOp, vector::LoadOp, vector::StoreOp>(each_op) &&
+/// isXrfRelated(&each_op)` — the immediate-body test of `checkAndAddToRegionOpMap`.
+fn is_xrf_access(op: &sen::Op, scope: &[DfirOp]) -> bool {
+    sen::lowered(op).is_some_and(|op| xrf_access(&op).is_some() && is_xrf_related(&op, scope))
+}
+
+/// `checkAndAddToRegionOpMap` AND THE REBUILD IT DRIVES (`LoweringXRF.cpp:583-624`), as one
+/// postorder pass over one region, answering whether that region marks the op that owns it.
+///
+/// ⛔ POSITIONLESS, AND IT HAS TO BE: each rebuilt loop brings two `sentient.scalar_constant`s in
+/// front of it (entry 241), which moves every sibling after it — so the *"already marked"* half of
+/// the test is this function's own answer for the child, and the *"is an xrf access"* half is asked
+/// of the op itself.
+/// ⛔ ONLY REGION 0 MARKS THE OWNER: `for_op.getBody()` and `if_op.getBody(0)` (`:585`, `:595`), so an
+/// access in an `else` region is rebuilt but does not make its `sentient.if` carry the pointers.
+/// ⛔ THE ERASE AT `:615`/`:619` IS NOT A RETRACTION — step 4 refills the mark over a rebuilt body
+/// that still holds the same accesses, which is why a rebuilt op marks its owner here.
+fn mark_and_rebuild(region: &mut Vec<sen::Op>, scope: &[DfirOp], vals: &mut Values) -> bool {
+    let mut marks_owner = false;
+    let mut index = 0usize;
+    while index < region.len() {
+        // `unit.walk<WalkOrder::PostOrder>` — everything below this op first.
+        let mut member = false;
+        for (child, inner) in regions_of(&mut region[index]).into_iter().enumerate() {
+            let holds = mark_and_rebuild(inner, scope, vals);
+            if child == 0 {
+                member = holds;
+            }
+        }
+
+        let control = matches!(
+            &region[index],
+            sen::Op::Sentient(sentient::Op::For { .. } | sentient::Op::If { .. })
+        );
+        if control && member {
+            // `createForOpWithReturnValue(for_op)` / `createIfOpWithReturnValue(if_op)`.
+            let rebuilt = match &region[index] {
+                op @ sen::Op::Sentient(sentient::Op::For { .. }) => {
+                    create_for_op_with_return_value(op, vals)
+                }
+                op => create_if_op_with_return_value(op, vals),
+            };
+            if let Some(XrfCarryingOp { before, op, .. }) = rebuilt {
+                // `OpBuilder builder(for_op)` — the two init constants go in front of it.
+                let inserted = before.len();
+                region.splice(index..index, before);
+                index += inserted;
+                region[index] = op;
+            }
+            marks_owner = true;
+        } else if !control && is_xrf_access(&region[index], scope) {
+            marks_owner = true;
+        }
+        index += 1;
+    }
+    marks_owner
+}
+
+/// `checkAndAddToRegionOpMap` OVER A STABLE BODY — step 4's *"reflll after forOp clone"* (`:626`),
+/// whose answers are the POSITIONS entry 345 looks `region_ops_with_xrf_access` up by.
+fn mark_regions(
+    body: &[sen::Op],
+    prefix: &[u32],
+    base: u32,
+    accesses: &BTreeSet<OpId>,
+    marked: &mut BTreeSet<OpId>,
+) -> bool {
+    let mut marks_owner = false;
+    for (ordinal, op) in body.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(base + ordinal as u32);
+        let mut member = false;
+        let mut child_base = 0u32;
+        for (child, inner) in regions_at(op).iter().enumerate() {
+            let holds = mark_regions(inner, &path, child_base, accesses, marked);
+            if child == 0 {
+                member = holds;
+            }
+            child_base += inner.len() as u32;
+        }
+        let at = OpId::at(&path);
+        if matches!(
+            op,
+            sen::Op::Sentient(sentient::Op::For { .. } | sentient::Op::If { .. })
+        ) {
+            if member {
+                marked.insert(at);
+                marks_owner = true;
+            }
+        } else if accesses.contains(&at) {
+            marks_owner = true;
+        }
+    }
+    marks_owner
+}
+
+/// Replaces: e367_createXrfIndexModifOps
+///
+/// **367/384** `LoweringXRF::createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564` (97L).
+///
+/// ⛔ SIX WALKS, AND THE FOURTH REPEATS THE SECOND — *"reflll after forOp clone"* (`:626`): the
+/// rebuild erases every mark it consumed, so the regions entry 345 reads are the ones measured over
+/// the FINISHED body. ⛔ `emitError("XRF accesses are illegal")` (`:655`) LEAVES THE MAP
+/// DEFAULT-CONSTRUCTED — an empty map is a FAILED pass here, not an absent one — and
+/// `DT_CHECK(comp == PT)` is unrepresentable for [`compute_unit_precision`](super::vc_vector_chain_to_sentient_pt::compute_unit_precision)'s reason.
+/// ⛔ See [`XrfCensus`] for the two rungs one walk has to answer on.
+#[must_use]
+pub fn create_xrf_index_modif_ops<A: Arch>(
+    body: &mut Vec<sen::Op>,
+    precision: sentient::Precision,
+    definitions: Definitions<'_>,
+    vals: &mut Values,
+) -> XrfPtrMap {
+    // *"if there is no xrf memory view, skip this pass"* (`:572-579`).
+    let census = {
+        let mut census = XrfCensus::default();
+        take_census(body, &[], 0, &[], &mut census);
+        census
+    };
+    if !census
+        .views
+        .iter()
+        .any(|&view| is_xrf_related(&census.dfir[view], &census.dfir))
+    {
+        return XrfPtrMap::new();
+    }
+
+    // `:608-624` — *"find out which forOp needs to be recreated to add xrf iter_args"*, then
+    // *"add iter_args and return values for forop loops"*.
+    mark_and_rebuild(body, &census.dfir, vals);
+
+    // `:626-628` and `:630-646` — the refill and the access census, over the rebuilt body.
+    let census = {
+        let mut census = XrfCensus::default();
+        take_census(body, &[], 0, &[], &mut census);
+        census
+    };
+    let accesses: Vec<&XrfAccess> = census
+        .accesses
+        .iter()
+        .filter(|access| is_xrf_related(&census.dfir[access.index], &census.dfir))
+        .collect();
+    let mut xrf_regions = BTreeSet::new();
+    mark_regions(
+        body,
+        &[],
+        0,
+        &accesses.iter().map(|access| access.at.clone()).collect(),
+        &mut xrf_regions,
+    );
+
+    let mut expr_maps = XrfLayoutExprs::default();
+    for access in accesses {
+        let Some(stick_elem_num) = stick_elem_num::<A>(access.ty) else {
+            todo!(
+                "createXrfIndexModifOps: DT_CHECK_MSG(stick_elem_num != -1, \"Could not compute \
+                 stick element number\") on a {:?} access (LoweringXRF.cpp:637-639)",
+                access.ty
+            );
+        };
+        // `getLayoutExpr(op, stick_elem_num)` — entry 240, over the projection.
+        let expr = layout_expr(
+            &OpId::at(&[access.index as u32]),
+            &census.dfir,
+            &access.enclosing,
+            stick_elem_num,
+        );
+        match access.ptr {
+            XrfPtr::Write => expr_maps.write.insert(access.at.clone(), expr),
+            XrfPtr::Read => expr_maps.read.insert(access.at.clone(), expr),
+        };
+    }
+
+    // *"insert xrf ptr manipulation operations"* (`:648-657`).
+    if expr_maps.write.is_empty() && expr_maps.read.is_empty() {
+        return XrfPtrMap::new();
+    }
+    if !are_xrf_accesses_legal(&expr_maps) {
+        return XrfPtrMap::new();
+    }
+    process_xrf_ptr_per_unit::<A>(body, precision, &expr_maps, &xrf_regions, definitions, vals)
 }
 
 #[cfg(test)]
@@ -3732,5 +4058,92 @@ mod xrf_lowering_unit_tests {
         };
         assert_eq!(map.len(), 2);
         assert_eq!(map[&OpId::at(&[0])].argument.write, *result);
+    }
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // 367/384 — `createXrfIndexModifOps`
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 🎯 367/384 — ONE `agen.vector_store` THROUGH A `ptxrf` VIEW INSIDE A LOOP, WHICH IS EVERY STEP.
+    ///
+    /// The view makes `use_xrf` true, the store marks the loop, the loop comes back carrying the two
+    /// pointers — and the key entry 345 fills is the store's position AFTER the two init constants
+    /// entry 241 puts in front of that loop moved it from `[3, 0]` to `[5, 0]`.
+    #[test]
+    fn a_store_through_a_ptxrf_view_rebuilds_its_loop_and_keys_the_map_by_the_moved_position() {
+        let mut vals = Values::default();
+        let (unit, start, view, stored) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+        let flat = MemRef {
+            shape: vec![256],
+            elem: ElemType::F16,
+        };
+        // ⛔ THE BOUND IS ABOVE THE UNIT, as entry 091 reads it — `Definitions` is the enclosing
+        // regions, and the body itself is the one region it cannot be handed.
+        let bound = vec![sen::Op::Arith(arith::Op::Constant {
+            result: Val(0),
+            value: 4,
+        })];
+        let mut body = vec![
+            sen::Op::Dataflow(dataflow::Op::GetLocalUnit {
+                result: unit,
+                of: Val(0),
+                which: LocalUnit::PtXrf,
+            }),
+            sen::Op::Arith(arith::Op::Constant {
+                result: start,
+                value: 0,
+            }),
+            sen::Op::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result: view,
+                from: unit,
+                start,
+                layout: AffineMap {
+                    dims: 1,
+                    syms: 0,
+                    results: vec![AffineExpr::dim(0).times(64)],
+                },
+                ty: flat.clone(),
+            }),
+            sen::Op::Sentient(sentient::Op::For {
+                iv: vals.mint(),
+                bound: Val(0),
+                carried: Vec::new(),
+                dbg_name: None,
+                body: vec![
+                    sen::Op::Agen(agen::Op::VectorStore {
+                        dbg_name: None,
+                        value: stored,
+                        view,
+                        indices: vec![Index::Const(0)],
+                        view_ty: flat,
+                        ty: Vector {
+                            len: 64,
+                            elem: ElemType::F16,
+                        },
+                    }),
+                    sen::Op::Sentient(sentient::Op::Yield {
+                        results: Vec::new(),
+                    }),
+                ],
+            }),
+        ];
+
+        let map = create_xrf_index_modif_ops::<Dd2>(
+            &mut body,
+            sentient::Precision::Fp16,
+            Definitions::from_innermost(&[&bound]),
+            &mut vals,
+        );
+
+        assert_eq!(
+            map.keys().cloned().collect::<Vec<OpId>>(),
+            vec![OpId::at(&[5, 0])]
+        );
+        assert_eq!(
+            body.iter().find_map(|op| match op {
+                sen::Op::Sentient(sentient::Op::For { carried, .. }) => Some(carried.len()),
+                _ => None,
+            }),
+            Some(2)
+        );
     }
 }

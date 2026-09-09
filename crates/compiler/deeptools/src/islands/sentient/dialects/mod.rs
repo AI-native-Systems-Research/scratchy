@@ -155,10 +155,15 @@ pub enum Op {
 /// a second description of one operation to keep in step, which is exactly the defect this island's
 /// header forbids.
 ///
+/// ⭐ PUBLIC BECAUSE ONE CALLER IS A BRIDGE, NOT THIS ISLAND: entry 367 walks a body holding
+/// `sentient.for` around still-unlowered `agen`/`vector` accesses and has to ask the rung below
+/// about each of them (its `XrfCensus`).
+///
 /// ⭐ A CLONE, BECAUSE THESE ARE QUERIES. The answer is read and dropped; nothing is written through
 /// it. Where a REWRITE has to reach a shared op, the callers below say so out loud rather than
 /// pretending the walk covered it.
-fn lowered(op: &Op) -> Option<crate::islands::dataflow_ir::dialects::Op> {
+#[must_use]
+pub fn lowered(op: &Op) -> Option<crate::islands::dataflow_ir::dialects::Op> {
     use crate::islands::dataflow_ir::dialects::Op as LowerOp;
     match op {
         Op::Sentient(_) | Op::AffineFor(_) => None,

@@ -77,15 +77,16 @@ use super::agen_access_details::{
 use super::tf_mutable_addr_splitting::{
     AddrRange, ConstStartMemView, L3Half, MasCandidate, SplitCandidateView,
     clone_composite_indirect_with_new_access_info, clone_composite_with_new_access_info,
+    is_candidate_mem_view, mem_views_in_pre_order,
 };
 use super::tf_transform_paged_mem_view_impl::{
-    VectorLoadOp, VectorStoreOp, clone_load_with_new_access_info,
-    clone_store_with_new_access_info, indices_from_map,
+    VectorLoadOp, VectorStoreOp, clone_load_with_new_access_info, clone_store_with_new_access_info,
+    indices_from_map,
 };
 use crate::arch::{Arch, Elements, IsaGen};
-use crate::islands::dataflow_ir::Values;
 use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, agen, arith, dataflow, uses};
 use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap};
+use crate::islands::dataflow_ir::{Program, Values};
 use crate::units::DfirUnit;
 use core::cmp::Reverse;
 use core::num::{NonZeroU32, NonZeroU64};
@@ -1376,11 +1377,15 @@ mod unit_tests {
     use crate::arch::{Dd2, Sen1p5};
     use crate::formats::Bits;
     use crate::generated::DataType;
-    use crate::islands::dataflow_ir::dialects::{Index, Val, affine, agen};
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::dialects::{Index, Val, affine, agen, symbol};
     use crate::islands::dataflow_ir::ty::{
         AffineExpr, Constraint, ElemType, IntegerSet, MemRef, Vector,
     };
-    use crate::units::DfirUnit;
+    use crate::islands::dataflow_ir::{
+        Grid, GroupId, OpIndex, ProgramName, ProgramUnit, ProgramUnits, Units,
+    };
+    use crate::units::{Core, Corelet, DfirUnit, Residency};
 
     /// 🎯 116/384 — THE DERIVED RANGE IS `2^bitSize * bytesPerStick * 8` ON EACH ARCH.
     ///
@@ -3031,9 +3036,334 @@ mod unit_tests {
             "the scatter's side is copied through, subscript and all"
         );
     }
+
+    /// 🎯 372/384 — THE WALK COLLECTS ONE CANDIDATE OUT OF FOUR VIEWS AND TWO UNITS.
+    ///
+    /// The LX view is not HBM, the symbol-started HBM view is excluded by `isCandidateMemView`, and
+    /// the `lxlu` unit fails the `is_any_of(comp, L3LU, L3SU)` gate — so only the L3LU HBM load is a
+    /// candidate, reached as that view's single user, and it dispatches to `transformVectorLoad`.
+    #[test]
+    fn the_walk_collects_the_one_hbm_view_in_an_l3_unit() {
+        let mut vals = Values::default();
+        let get_unit = |result: Val, unit: DfirUnit, residency: Residency| {
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result,
+                residency,
+                unit,
+                num_folds: None,
+            })
+        };
+        let core0 = Core::checked(0).expect("core 0 exists");
+        let (hbm, lx, l3lu, lxlu) = (vals.mint(), vals.mint(), vals.mint(), vals.mint());
+        let preamble = vec![
+            get_unit(hbm, DfirUnit::Hbm, Residency::Global),
+            get_unit(lx, DfirUnit::Lx, Residency::Scratchpad { core: core0 }),
+            get_unit(l3lu, DfirUnit::L3lu, Residency::CoreWide { core: core0 }),
+            get_unit(
+                lxlu,
+                DfirUnit::Lxlu,
+                Residency::Corelet {
+                    core: core0,
+                    corelet: Corelet::checked(0).expect("corelet 0 exists"),
+                },
+            ),
+        ];
+
+        let layout = AffineMap::linear(&[2048, 1]);
+        let ty = MemRef {
+            shape: vec![1, 2048],
+            elem: ElemType::F16,
+        };
+        let vec_ty = Vector {
+            len: 64,
+            elem: ElemType::F16,
+        };
+        let view = |vals: &mut Values, from: Val, start: Val| {
+            let result = vals.mint();
+            (
+                DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                    result,
+                    from,
+                    start,
+                    layout: layout.clone(),
+                    ty: ty.clone(),
+                }),
+                result,
+            )
+        };
+        let start = vals.mint();
+        let start_op = DfirOp::Arith(arith::Op::Constant {
+            result: start,
+            value: 0,
+        });
+        let sym = vals.mint();
+        let (hbm_view_op, hbm_view) = view(&mut vals, hbm, start);
+        let (lx_view_op, lx_view) = view(&mut vals, lx, start);
+        let (sym_view_op, _) = view(&mut vals, hbm, sym);
+        let data = vals.mint();
+        let l3lu_body = vec![
+            start_op.clone(),
+            DfirOp::Symbol(symbol::Op::CreateSymbol {
+                result: sym,
+                symbol_id: -1476,
+                max_value: Some(8),
+            }),
+            hbm_view_op,
+            lx_view_op,
+            sym_view_op,
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: data,
+                view: hbm_view,
+                indices: vec![Index::Const(0); 2],
+                view_ty: ty.clone(),
+                ty: vec_ty.clone(),
+                multicast_info: None,
+            }),
+            DfirOp::Agen(agen::Op::VectorStore {
+                dbg_name: None,
+                value: data,
+                view: lx_view,
+                indices: vec![Index::Const(0); 2],
+                view_ty: ty.clone(),
+                ty: vec_ty.clone(),
+            }),
+        ];
+
+        let (other_view_op, other_view) = view(&mut vals, hbm, start);
+        let lxlu_body = vec![
+            start_op,
+            other_view_op,
+            DfirOp::Agen(agen::Op::VectorLoad {
+                dbg_name: None,
+                result: vals.mint(),
+                view: other_view,
+                indices: vec![Index::Const(0); 2],
+                view_ty: ty,
+                ty: vec_ty,
+                multicast_info: None,
+            }),
+        ];
+
+        let a_unit = |on: DfirUnit, val: Val, body: Vec<DfirOp>| ProgramUnit::<Dd2> {
+            on: Units::one(on, val),
+            precision: None,
+            body,
+            arch: core::marker::PhantomData,
+        };
+        let program = Program::<Dd2> {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            grid: Grid::single(),
+            preamble,
+            units: ProgramUnits::of(
+                a_unit(DfirUnit::L3lu, l3lu, l3lu_body),
+                vec![a_unit(DfirUnit::Lxlu, lxlu, lxlu_body)],
+            ),
+            arch: core::marker::PhantomData,
+        };
+
+        let shifting = run_on_operation::<Dd2>(&program, &mut vals);
+        let MutableStartAddrShifting::Shifted(shifted) = shifting else {
+            panic!("every candidate has one user and one direct memory operand: {shifting:?}")
+        };
+        assert_eq!(shifted.len(), 1);
+        let MsasShift {
+            candidate,
+            dispatch,
+        } = &shifted[0];
+        assert_eq!(candidate.comp, DfirUnit::L3lu);
+        assert_eq!(candidate.mem_index, MemoryOperandIndex::DirSrc);
+        assert!(
+            matches!(candidate.op, DfirOp::Agen(agen::Op::VectorLoad { view, .. }) if *view == hbm_view),
+            "the load of the HBM view, reached as its one user"
+        );
+        assert!(
+            matches!(dispatch, MsasDispatch::VectorLoad(_)),
+            "{dispatch:?}"
+        );
+    }
+}
+
+// ═══════════════════════════════════════ 372/384 ═══════════════════════════════════════
+
+/// WHICH OF THE FOUR TRANSFORMS RAN ON ONE CANDIDATE, AND WHAT IT ANSWERED — `:186-197`.
+///
+/// ⛔ `llvm_unreachable("Unexpected candidate operation.")` IS [`Self::UnexpectedCandidateOperation`]
+/// and it is reachable: the collecting walk's `else` arm admits ANY user of an HBM view (`:170`), so a
+/// `dataflow.send` reading one lands here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum MsasDispatch<'s> {
+    /// `isa<agen::VectorLoadOp>` → `transformVectorLoad`.
+    VectorLoad(MutableStartAddrShift<'s>),
+    /// `isa<agen::VectorStoreOp>` → `transformVectorStore`.
+    VectorStore(MutableStartAddrShift<'s>),
+    /// `isa<agen::CompositeLoadAndStoreOp>` → `transformCompLoadAndStore`.
+    CompLoadAndStore(MutableStartAddrShift<'s>),
+    /// `isa<agen::CompositeIndirectLoadAndStoreOp>` → `transformCompIndLoadAndStore`.
+    CompIndLoadAndStore(MutableStartAddrShift<'s>),
+    /// `llvm_unreachable("Unexpected candidate operation.")`.
+    UnexpectedCandidateOperation,
+}
+
+/// ONE COLLECTED CANDIDATE AND WHAT THE DISPATCH LOOP DID TO IT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct MsasShift<'s> {
+    /// `candidates.emplace_back(mem_op, unit, comp, mem_index)` (`:181`).
+    pub candidate: MasCandidate<'s>,
+    /// The transform's own answer.
+    pub dispatch: MsasDispatch<'s>,
+}
+
+/// WHAT THE PASS DID TO A PROGRAM — or the `DT_CHECK` in the collecting walk that stopped it.
+///
+/// ⛔ THE THREE REFUSALS END THE WHOLE PASS. All three are `DT_CHECK`s inside the module walk
+/// (`:157`, `:175`, `:179`) and the walk finishes before the first transform runs, so an abort there
+/// means NOTHING was shifted, in any unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum MutableStartAddrShifting<'s> {
+    /// One entry per candidate, in the order the walk collected them.
+    Shifted(Vec<MsasShift<'s>>),
+    /// `DT_CHECK_MSG(mem_view->hasOneUse(), "Expecting L3 memory views to be used in one memory
+    /// operand.")`.
+    MemViewIsNotSingleUsed(Val),
+    /// `DT_CHECK_MSG(mem_index != kMax, "Invalid HBM memory operand.")`.
+    InvalidHbmMemoryOperand(Val),
+    /// `DT_CHECK_MSG(res.second, "Data transfers should only have one HBM memory operand.")`.
+    SecondHbmMemoryOperand(Val),
+}
+
+/// Replaces: e372_runOnOperation
+///
+/// **372/384** `MutableStartAddrShiftingPass::runOnOperation` —
+/// `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130` (69L): collect every HBM view in an
+/// L3 unit, then run one transform per memory operation reached through one.
+///
+/// ⭐ THE SAME WALK AS [`super::tf_mutable_addr_splitting::run_on_operation`], line for line — the
+/// only differences are that pass's inert per-unit `num_conditionals_ = 0` and its `DT_CHECK` wording,
+/// so `isCandidateMemView` and the pre-order view walk are reused rather than copied.
+pub fn run_on_operation<'p, A: Arch>(
+    program: &'p Program<A>,
+    vals: &mut Values,
+) -> MutableStartAddrShifting<'p> {
+    // ⛔ `if (DisableThisPass) return;` (`:131`) IS DROPPED: `dcc-mutable-start-addr-shifting-disable`
+    // is a `dcc-opt` command-line flag, and which passes run is a call in this crate.
+    let mut candidates: Vec<(MasCandidate<'p>, &'p [DfirOp])> = Vec::new();
+    // `std::unordered_set<Operation *> analyzed_candidates;` — ⚠️ BY IDENTITY, so two structurally
+    // equal transfers are two entries.
+    let mut analyzed: Vec<&'p DfirOp> = Vec::new();
+
+    // `module_op.walk<WalkOrder::PreOrder>([&](dataflow::ProgramUnitOp unit) { .. })`.
+    for unit in program.units.iter() {
+        // `if (!is_any_of(comp, L3LU, L3SU)) return WalkResult::advance();`
+        let comp = unit.on.kind();
+        if L3Half::of(comp).is_none() {
+            continue;
+        }
+        let body = unit.body.as_slice();
+        let mut views: Vec<&'p DfirOp> = Vec::new();
+        mem_views_in_pre_order(body, &mut views);
+        for view in views {
+            let DfirOp::Dataflow(dataflow::Op::GetLogicalMemoryView {
+                result,
+                from,
+                start,
+                ..
+            }) = view
+            else {
+                continue;
+            };
+            // `if (!mem_view || !isCandidateMemView(mem_view)) return WalkResult::advance();`
+            if !is_candidate_mem_view(*from, *start, body, &program.preamble) {
+                continue;
+            }
+            // `DT_CHECK_MSG(mem_view->hasOneUse(), ..)` then `*mem_view->getUsers().begin()` —
+            // [`uses`] gives one entry per USE, so a view read twice by one transfer is not
+            // single-used either.
+            let users = uses(*result, body);
+            let [mem_op] = users.as_slice() else {
+                return MutableStartAddrShifting::MemViewIsNotSingleUsed(*result);
+            };
+            let mem_op = *mem_op;
+
+            // `agen::MemoryOperandIndex mem_index = agen::MemoryOperandIndex::kMax;`
+            let mem_index = match mem_op {
+                // `comp_las.getSrcMemRef() == mem_view.getResult() ? kDirSrc : kDirDst`.
+                DfirOp::Agen(agen::Op::CompositeLoadAndStore(transfer)) => {
+                    Some(if transfer.src == *result {
+                        MemoryOperandIndex::DirSrc
+                    } else {
+                        MemoryOperandIndex::DirDst
+                    })
+                }
+                // ⛔ TWO `if`s AND NO `else` (`:167-172`) — an indirect transfer whose HBM view is one
+                // of its INDIRECT operands leaves `mem_index` at `kMax` and hits the check below.
+                DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
+                    if transfer.direct_src == *result {
+                        Some(MemoryOperandIndex::DirSrc)
+                    } else if transfer.direct_dst == *result {
+                        Some(MemoryOperandIndex::DirDst)
+                    } else {
+                        None
+                    }
+                }
+                // `} else { mem_index = kDirSrc; }` — a vector load reads its one memref as the
+                // source, and so does a vector STORE's, which is the reference's own answer for it.
+                _ => Some(MemoryOperandIndex::DirSrc),
+            };
+            let Some(mem_index) = mem_index else {
+                return MutableStartAddrShifting::InvalidHbmMemoryOperand(*result);
+            };
+            // `auto res = analyzed_candidates.insert(mem_op); DT_CHECK_MSG(res.second, ..);`
+            if analyzed.iter().any(|seen| core::ptr::eq(*seen, mem_op)) {
+                return MutableStartAddrShifting::SecondHbmMemoryOperand(*result);
+            }
+            analyzed.push(mem_op);
+            candidates.push((
+                MasCandidate {
+                    op: mem_op,
+                    comp,
+                    mem_index,
+                },
+                body,
+            ));
+        }
+    }
+
+    // `for (auto &candidate : candidates)` — a SECOND loop, after the whole module was walked.
+    let mut shifted: Vec<MsasShift<'p>> = Vec::new();
+    for (candidate, scope) in candidates {
+        let dispatch = match candidate.op {
+            DfirOp::Agen(agen::Op::VectorLoad { .. }) => {
+                MsasDispatch::VectorLoad(transform_vector_load::<A>(vals, &candidate, scope))
+            }
+            DfirOp::Agen(agen::Op::VectorStore { .. }) => {
+                MsasDispatch::VectorStore(transform_vector_store::<A>(vals, &candidate, scope))
+            }
+            DfirOp::Agen(agen::Op::CompositeLoadAndStore(_)) => MsasDispatch::CompLoadAndStore(
+                transform_comp_load_and_store::<A>(vals, &candidate, scope),
+            ),
+            DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(_)) => {
+                MsasDispatch::CompIndLoadAndStore(transform_comp_ind_load_and_store::<A>(
+                    vals, &candidate, scope,
+                ))
+            }
+            _ => MsasDispatch::UnexpectedCandidateOperation,
+        };
+        shifted.push(MsasShift {
+            candidate,
+            dispatch,
+        });
+    }
+    MutableStartAddrShifting::Shifted(shifted)
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
-// crustify:todo: e372_runOnOperation

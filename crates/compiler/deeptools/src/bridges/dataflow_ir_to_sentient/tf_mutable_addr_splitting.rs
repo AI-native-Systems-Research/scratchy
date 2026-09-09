@@ -10021,7 +10021,12 @@ fn transfer_format(elem: ElemType) -> Option<DataType> {
 /// ⭐ THE SECOND TEST IS WHY THE PASS AND `MutableStartAddrShifting` DO NOT FIGHT: a start address
 /// bound by `symbol.create_symbol` or `symbol.query_map` is one the schedule fixes later, and there
 /// is no constant to add a partition offset to ([`is_eligible_for_splitting`]).
-fn is_candidate_mem_view(from: Val, start: Val, body: &[DfirOp], preamble: &[DfirOp]) -> bool {
+pub(super) fn is_candidate_mem_view(
+    from: Val,
+    start: Val,
+    body: &[DfirOp],
+    preamble: &[DfirOp],
+) -> bool {
     // `dcc::getUnitType(mem_view_op.getFromUnit().getDefiningOp()) != SenComponents::HBM`.
     // ⚠️ THE `dataflow.get_unit` OPS SIT AT FUNCTION SCOPE while the view sits in a unit's body
     // (`tests/sentient_corpus/group_0__g0_0_mul.dfir.mlir:3-12`), so the def walk spans both — which
@@ -10051,7 +10056,7 @@ fn is_candidate_mem_view(from: Val, start: Val, body: &[DfirOp], preamble: &[Dfi
 ///
 /// ⛔ THROUGH EVERY REGION. A view bound inside an `scf.for` is one the reference's `unit.walk`
 /// reaches, and [`dialects::regions`] is the one table that knows which ops have one.
-fn mem_views_in_pre_order<'a>(body: &'a [DfirOp], found: &mut Vec<&'a DfirOp>) {
+pub(super) fn mem_views_in_pre_order<'a>(body: &'a [DfirOp], found: &mut Vec<&'a DfirOp>) {
     for op in body {
         if matches!(
             op,

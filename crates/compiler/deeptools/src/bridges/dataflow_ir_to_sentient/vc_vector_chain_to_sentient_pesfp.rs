@@ -67,21 +67,26 @@
 
 use super::vc_operand_reuse::{DataId, OperandReuse};
 use super::vc_vector_chain_helper::{
-    input_precision_from_operand, redefine_constant_vectors, vector_type_of,
+    FusionAnalysis, analyze_and_fill_operand_forwarding, analyze_and_fill_result_forwarding,
+    analyze_non_compute_ops_for_fusion, compute_precision_of_op, get_mask_value_for_non_pt,
+    input_precision_from_operand, redefine_constant_vectors, result_precision_from_operands,
+    vector_type_of,
 };
 use super::vc_vector_operands::{
-    ComputeComp, OpId, VectorOperand, erase_op, erase_op_recording, erase_operands_recording,
-    origin_val, remove_at, use_positions,
+    ComputeComp, OpId, VectorOperand, defining_position, erase_op, erase_op_recording,
+    erase_operands_recording, is_arith_constant, op_at, origin_val, remove_at, use_positions,
 };
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects::vectorchain as vc;
 use crate::islands::dataflow_ir::dialects::{
-    Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, regions, vector,
+    Op as DfirOp, Val, agen, dataflow, dbg_name, defining_op, operands as op_operands, regions,
+    vector,
 };
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::dataflow_ir::{self as dfir, Values};
 use crate::islands::sentient::dialects::{self as sen, sentient};
 use crate::units::DfirUnit;
+use std::collections::BTreeMap;
 
 /// ONE OF THE SIXTEEN COMPUTE LOWERING PATTERNS `fuseComputeOps` INSTALLS —
 /// `compute_ops_patterns.insert<…>` (`VectorChainToSentientPESFP.cpp:1246-1254`).
@@ -633,7 +638,7 @@ pub enum DanglingOutcome {
 /// (`dcc/src/Dialect/Sentient/Utils.cpp:427`), which is not one of the 384 and has no other reader
 /// in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FoldModeAttr {
+pub enum FoldModeAttr {
     /// `nullptr` — reached only when `comp` is the PT, which folds nothing.
     Absent,
     /// The attribute a PE or SFP compute carries.
@@ -899,9 +904,10 @@ pub fn lower_dangling_non_compute_ops_pesfp<A: Arch>(
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        COMPUTE_OPS_PATTERNS, ComputeComp, ComputePattern, DanglingOutcome, LEGAL_DIALECTS,
-        Legality, OpId, Unlowered, VectorOperand, cleanup, compute_ops_to_fuse, fuse_compute_ops,
-        installed_pattern, legality, lower_dangling_non_compute_ops_pesfp, match_and_rewrite,
+        COMPUTE_OPS_PATTERNS, ComputeComp, ComputePattern, DanglingOutcome, FilledOpInfo,
+        LEGAL_DIALECTS, Legality, OpId, Unlowered, VectorOperand, cleanup, compute_ops_to_fuse,
+        fill_op_info, fuse_compute_ops, installed_pattern, legality,
+        lower_dangling_non_compute_ops_pesfp, match_and_rewrite, non_compute_ops_to_fuse,
         run_on_operation,
     };
     use crate::arch::Target;
@@ -913,7 +919,7 @@ mod unit_tests {
     use crate::islands::dataflow_ir::dialects::dataflow;
     use crate::islands::dataflow_ir::dialects::vectorchain as vc;
     use crate::islands::dataflow_ir::dialects::{Op as DfirOp, Val, affine, arith};
-    use crate::islands::dataflow_ir::link::{Link, Lxsu, Sfp};
+    use crate::islands::dataflow_ir::link::{Link, Lxlu, Lxsu, Sfp};
     use crate::islands::dataflow_ir::ty::{AffineExpr, AffineMap, ElemType, IntegerSet, Vector};
     use crate::islands::dataflow_ir::{self as dfir, ProgramUnit, Units};
     use crate::islands::sentient::dialects::Op as SenOp;
@@ -1509,11 +1515,610 @@ mod unit_tests {
         };
         assert_eq!(op_a, &lx_at(Some(1)));
     }
+
+    /// 🎯 366/384 — THE INVERSION AT `:1230`. A receive whose ONLY user is a send fuses, so
+    /// `is_fusion_respected` stays true and the lambda answers *illegal*; add one user that is
+    /// neither a send nor a store and entry 341 clears the flag, which answers *legal* and leaves
+    /// the send exactly where it is.
+    #[test]
+    fn a_send_fed_by_a_lone_receive_is_the_illegal_op_and_a_second_user_makes_it_legal() {
+        let mut vals = Values::default();
+        let sfp = vals.mint();
+        let (_, from) = Link::<Lxlu, Sfp>::between(vals.mint(), sfp).ends();
+        let (to, _) = Link::<Sfp, Lxsu>::between(sfp, vals.mint()).ends();
+        let data = vals.mint();
+        let unit = |extra: Vec<DfirOp>| {
+            unit_holding(
+                vec![
+                    // ⛔ BOTH ENDS NEED THEIR `get_unit` IN THE BODY, or neither operand resolves —
+                    // see the 344 fixture's note.
+                    DfirOp::Dataflow(dataflow::Op::GetUnit {
+                        result: from.val(),
+                        residency: Residency::Global,
+                        unit: DfirUnit::Lxlu,
+                        num_folds: None,
+                    }),
+                    DfirOp::Dataflow(dataflow::Op::GetUnit {
+                        result: to.val(),
+                        residency: Residency::Global,
+                        unit: DfirUnit::Lxsu,
+                        num_folds: None,
+                    }),
+                    DfirOp::Dataflow(dataflow::Op::Receive {
+                        result: data,
+                        from,
+                        ty: V,
+                    }),
+                    DfirOp::Dataflow(dataflow::Op::Send { to, data, ty: V }),
+                ]
+                .into_iter()
+                .chain(extra)
+                .collect(),
+            )
+        };
+
+        assert_eq!(
+            non_compute_ops_to_fuse::<Target>(&unit(Vec::new()), ComputeComp::Sfp),
+            vec![OpId::at(&[3])]
+        );
+        assert_eq!(
+            non_compute_ops_to_fuse::<Target>(
+                &unit(vec![DfirOp::VectorChain(vc::Op::FastExp {
+                    result: vals.mint(),
+                    input: data,
+                    input_ty: V,
+                    ty: V,
+                })]),
+                ComputeComp::Sfp
+            ),
+            Vec::new()
+        );
+    }
+
+    // ── 365/384 ───────────────────────────────────────────────────────────────────────────────
+
+    /// 🎯 365/384 — THE MASK IS THE OPERAND **PAST** THE COUNTED ONES, AND AN ABSENT SLOT CARRIES
+    /// THE COMPUTE PRECISION.
+    ///
+    /// A masked `vectorchain.binary` has three operands where `num_operands` is two, so operand 2 is
+    /// the mask: 96 live lanes of 128 masks slices 6 and 7, `{value = 192 : si64}`. The unary
+    /// `vectorchain.fast_exp` beside it has ONE operand, and its B and C slots carry the COMPUTE
+    /// precision — `bf16` remapped to `fp16` — where A carries the receive's own `bf16`.
+    #[test]
+    fn the_mask_is_the_operand_past_the_counted_ones_and_an_absent_slot_takes_the_compute_precision()
+     {
+        let mut vals = Values::default();
+        let (_, from) = Link::<Lxlu, Sfp>::between(Val(10), Val(11)).ends();
+        let (data, masked) = (Val(1), Val(2));
+        const I1: Vector = Vector {
+            len: 128,
+            elem: ElemType::Int(1),
+        };
+        let scope = vec![
+            DfirOp::Dataflow(dataflow::Op::GetUnit {
+                result: Val(10),
+                residency: Residency::Global,
+                unit: DfirUnit::Lxlu,
+                num_folds: None,
+            }),
+            DfirOp::Dataflow(dataflow::Op::Receive {
+                result: data,
+                from,
+                ty: V,
+            }),
+            DfirOp::VectorChain(vc::Op::CreateAffineMask {
+                result: masked,
+                mask: vc::LaneMask::prefix_of(96, I1),
+            }),
+            DfirOp::VectorChain(vc::Op::Binary {
+                result: Val(3),
+                op1: data,
+                op2: data,
+                mask: Some(vc::LaneMask::prefix_of(96, I1).binds(masked)),
+                binary_op: vc::BinaryOp::Add,
+                op_specific_map: map(),
+                operand_ty: V,
+                ty: V,
+            }),
+            DfirOp::VectorChain(vc::Op::FastExp {
+                result: Val(4),
+                input: data,
+                input_ty: V,
+                ty: V,
+            }),
+        ];
+
+        let FilledOpInfo::Filled(binary) = fill_op_info::<Target>(
+            &scope[3],
+            2,
+            &OpId::at(&[3]),
+            ComputeComp::Sfp,
+            &scope,
+            &mut vals,
+        ) else {
+            panic!("a masked binary fills")
+        };
+        assert_eq!(binary.mask_operand, Some(OpId::at(&[2])));
+        let SenOp::Sentient(sen::Op::ScalarConstant { value, result, .. }) = &binary.mask_op else {
+            panic!("a mask constant, not {:?}", binary.mask_op)
+        };
+        assert_eq!((*value, binary.mask_val), (192, *result));
+        assert_eq!(
+            (
+                binary.op_a_precision,
+                binary.op_b_precision,
+                binary.compute_precision
+            ),
+            (
+                Some(sen::Precision::Bf16),
+                Some(sen::Precision::Bf16),
+                sen::Precision::Fp16
+            )
+        );
+
+        // ⛔ AND THE UNARY OP'S B AND C SLOTS ARE THE COMPUTE PRECISION — not empty, and not A's.
+        let FilledOpInfo::Filled(unary) = fill_op_info::<Target>(
+            &scope[4],
+            1,
+            &OpId::at(&[4]),
+            ComputeComp::Sfp,
+            &scope,
+            &mut vals,
+        ) else {
+            panic!("a unary op fills")
+        };
+        assert_eq!(
+            (
+                unary.op_a_precision,
+                unary.op_b_precision,
+                unary.op_c_precision
+            ),
+            (
+                Some(sen::Precision::Bf16),
+                Some(sen::Precision::Fp16),
+                Some(sen::Precision::Fp16)
+            )
+        );
+        // Nothing reads it, so the result precision is the substituted compute precision and the
+        // mask is the unmasked arm's own `sentient.constant 0`.
+        assert_eq!(unary.mask_operand, None);
+        assert_eq!(unary.result_precision, Some(sen::Precision::Fp16));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 365/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// EVERYTHING THE SIXTEEN COMPUTE PATTERNS READ OFF ONE `vectorchain` OP — `OpInfo`
+/// (`VectorChainToSentientPESFP.cpp`'s pass class), filled in one pass by [`fill_op_info`].
+///
+/// ⛔ THE THREE OPERAND SLOTS ARE NOT A LIST. `opA_`/`opB_`/`opC_` are the `sentient.compute`'s three
+/// named ports, and each carries its own forwarding list and its own precision — a `Vec` of triples
+/// would let a pattern read B's precision into C's slot and still typecheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpInfo {
+    /// `from_operands_` — one per source operand, in operand order. ⛔ An ABSENT operand is KEPT, as
+    /// entry 342 records for the `to` side.
+    pub from_operands: Vec<Option<VectorOperand>>,
+    /// `mask_operand_` — the op that produced the mask, as a position. See [`fill_op_info`]'s note on
+    /// the null pointer the reference can store here.
+    pub mask_operand: Option<OpId>,
+    /// `opA_forwarding_`, `opB_forwarding_`, `opC_forwarding_` — entry 340, once per present operand.
+    pub op_a_forwarding: Vec<sentient::Port>,
+    /// See [`Self::op_a_forwarding`].
+    pub op_b_forwarding: Vec<sentient::Port>,
+    /// See [`Self::op_a_forwarding`].
+    pub op_c_forwarding: Vec<sentient::Port>,
+    /// `mask_val_` — the value the `sentient.vector_mac` reads as its mask.
+    pub mask_val: Val,
+    /// The op that binds [`Self::mask_val`]: entry 229's `sentient.scalar_constant`, or the literal
+    /// `sentient.constant 0` the unmasked arm creates.
+    pub mask_op: sen::Op,
+    /// `to_operands_` — entry 342's, one per user.
+    pub to_operands: Vec<Option<VectorOperand>>,
+    /// `result_forwarding_` — entry 342's.
+    pub result_forwarding: Vec<sentient::Port>,
+    /// `logical_result_forwarding_` — the `istate` destination entry 342 splits off.
+    pub logical_result_forwarding: Option<sentient::Port>,
+    /// The `sentient.set_send_dst` ops entry 342 emits for an `sfpring` destination, which the caller
+    /// positions after the send.
+    pub set_send_dst: Vec<sen::Op>,
+    /// `result_precision_` — entry 061's, with the compute precision substituted where there is no
+    /// result forwarding and no precision.
+    pub result_precision: Option<sentient::Precision>,
+    /// `compute_precision_` — entry 062's.
+    pub compute_precision: sentient::Precision,
+    /// `fold_mode_attr_` — [`fold_mode_attr_for_operation`].
+    pub fold_mode_attr: FoldModeAttr,
+    /// `opA_precision_` — entry 060's on operand 0.
+    pub op_a_precision: Option<sentient::Precision>,
+    /// `opB_precision_` — entry 060's on operand 1, or the COMPUTE precision when there is no
+    /// operand 1.
+    pub op_b_precision: Option<sentient::Precision>,
+    /// `opC_precision_` — entry 060's on operand 2, or the COMPUTE precision when there is no
+    /// operand 2.
+    pub op_c_precision: Option<sentient::Precision>,
+    /// `op_dbg_name_` — `dataflow::getDbgNameAttr(op)`.
+    pub op_dbg_name: Option<String>,
+}
+
+/// WHAT `fillOpInfo` ANSWERS — `mlir::LogicalResult`, with the filled record on the success side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum FilledOpInfo {
+    /// `return success();`
+    Filled(OpInfo),
+    /// `if (!op_info.mask_val_.has_value()) return failure();` — the mask op carries no constant
+    /// affine set, which is entry 229's only refusal.
+    MaskHasNoConstantValue(OpId),
+    /// The op has fewer than one operand, so `from_operands_[0]` is out of range — the reference
+    /// indexes it unguarded (`:1097`).
+    NoOperands,
+}
+
+/// Replaces: e365_fillOpInfo
+///
+/// **365/384** `VectorChainToSentientPESFPLoweringPass::fillOpInfo` —
+/// `VectorChainToSentientPESFP.cpp:1070` (83L): read one compute's operands, mask, forwarding and
+/// precisions into the record its lowering pattern emits from.
+///
+/// ⛔ THE MASK IS THE OPERAND **PAST** THE COUNTED ONES (`:1092`), which is why `num_operands` is a
+/// parameter and not `op->getNumOperands()`: a masked binary has three operands and `num_operands` is
+/// two. ⛔ A `vectorchain.shuffle` is the exception and reads `getMask()` instead (`:1082-1090`),
+/// because its two VARIADIC operand groups sit between the input and the mask.
+/// ⛔ `opB`/`opC` PRECISION FALL BACK TO THE **COMPUTE** PRECISION, NOT TO EMPTY (`:1145-1152`) — a
+/// unary op's B and C slots carry the compute precision on the wire.
+/// ⚠️ A MASK BOUND BY A REGION ARGUMENT: the reference stores a NULL `Operation*` in a live
+/// `std::optional` and dereferences it in entry 229; `defining_position` answers [`None`], which takes
+/// the unmasked arm and its `sentient.constant 0`.
+pub fn fill_op_info<A: Arch>(
+    op: &DfirOp,
+    num_operands: usize,
+    at: &OpId,
+    comp: ComputeComp,
+    scope: &[DfirOp],
+    values: &mut Values,
+) -> FilledOpInfo {
+    // `:1077-1081` — `for (int i = 0; i < num_operands; i++)`, each through entry 320.
+    let reads = op_operands(op);
+    let mut from_operands: Vec<Option<VectorOperand>> = Vec::new();
+    for read in reads.iter().take(num_operands) {
+        let operand_op = defining_position(*read, scope);
+        from_operands
+            .push(operand_op.and_then(|operand_op| {
+                VectorOperand::operand::<A>(&operand_op, comp, true, scope)
+            }));
+    }
+
+    // `:1082-1094` — the mask operand, and the two ways of naming it.
+    let mask_operand = match op {
+        // *"Shuffle operations contain two variadic operands before the mask operand."*
+        DfirOp::VectorChain(vc::Op::Shuffle { mask, .. }) => {
+            mask.and_then(|mask| defining_position(mask.val(), scope))
+        }
+        // `else if (op->getNumOperands() == num_operands + 1)`.
+        _ if reads.len() == num_operands + 1 => defining_position(reads[num_operands], scope),
+        _ => None,
+    };
+
+    // `:1096-1112` — entry 340 on operand 0, then on 1 and 2 only if the list is that long. ⛔ THE
+    // FIRST CALL IS UNGUARDED, so an op with no operands indexes out of range there.
+    if from_operands.is_empty() {
+        return FilledOpInfo::NoOperands;
+    }
+    let mut op_a_forwarding: Vec<sentient::Port> = Vec::new();
+    let mut op_b_forwarding: Vec<sentient::Port> = Vec::new();
+    let mut op_c_forwarding: Vec<sentient::Port> = Vec::new();
+    analyze_and_fill_operand_forwarding::<A>(
+        comp,
+        from_operands[0].as_ref(),
+        scope,
+        &mut op_a_forwarding,
+    );
+    if from_operands.len() > 1 {
+        analyze_and_fill_operand_forwarding::<A>(
+            comp,
+            from_operands[1].as_ref(),
+            scope,
+            &mut op_b_forwarding,
+        );
+    }
+    if from_operands.len() > 2 {
+        analyze_and_fill_operand_forwarding::<A>(
+            comp,
+            from_operands[2].as_ref(),
+            scope,
+            &mut op_c_forwarding,
+        );
+    }
+
+    // `:1117-1125` — *"If no mask info is attached to the op, use the default mask, 0."*
+    let mask_vc_op = mask_operand
+        .as_ref()
+        .and_then(|mask| op_at(mask, scope))
+        .and_then(|mask| match mask {
+            DfirOp::VectorChain(mask) => Some(mask),
+            _ => None,
+        });
+    let (mask_val, mask_op) = match mask_vc_op {
+        Some(mask) => match get_mask_value_for_non_pt::<A>(mask, values) {
+            Some(mask) => (mask.value, mask.op),
+            // `:1125` — `if (!op_info.mask_val_.has_value()) return failure();`
+            None => {
+                return FilledOpInfo::MaskHasNoConstantValue(at.clone());
+            }
+        },
+        // `sentient::ConstantOp::create(rewriter, op->getLoc(), rewriter.getIndexType(), 0)`.
+        None => {
+            let value = values.mint();
+            (
+                value,
+                sen::Op::Sentient(sentient::Op::ScalarConstant {
+                    value: 0,
+                    result: value,
+                    reg_locale: sentient::RegType::Imm,
+                    ty: ScalarTy::Index,
+                    is_symbol: false,
+                }),
+            )
+        }
+    };
+
+    // `:1127-1129` — entry 342.
+    let mut to_operands: Vec<Option<VectorOperand>> = Vec::new();
+    let mut result_forwarding: Vec<sentient::Port> = Vec::new();
+    let mut logical_result_forwarding: Option<sentient::Port> = None;
+    let mut set_send_dst: Vec<sen::Op> = Vec::new();
+    analyze_and_fill_result_forwarding::<A>(
+        at,
+        comp,
+        scope,
+        &mut to_operands,
+        &mut result_forwarding,
+        &mut logical_result_forwarding,
+        &mut set_send_dst,
+    );
+
+    // `:1131-1132` — entries 061 and 062.
+    let mut result_precision = result_precision_from_operands(&to_operands);
+    let compute_precision = compute_precision_of_op(op);
+    // `:1135-1136` — *"If no result forwarding, set result_precision to default precision."*
+    if result_forwarding.is_empty() && result_precision.is_none() {
+        result_precision = Some(compute_precision);
+    }
+
+    FilledOpInfo::Filled(OpInfo {
+        // `:1145-1152` — and the compute precision is what an absent B or C slot carries.
+        op_a_precision: from_operands[0]
+            .as_ref()
+            .and_then(input_precision_from_operand),
+        op_b_precision: match from_operands.get(1) {
+            Some(operand) => operand.as_ref().and_then(input_precision_from_operand),
+            None => Some(compute_precision),
+        },
+        op_c_precision: match from_operands.get(2) {
+            Some(operand) => operand.as_ref().and_then(input_precision_from_operand),
+            None => Some(compute_precision),
+        },
+        from_operands,
+        mask_operand,
+        op_a_forwarding,
+        op_b_forwarding,
+        op_c_forwarding,
+        mask_val,
+        mask_op,
+        to_operands,
+        result_forwarding,
+        logical_result_forwarding,
+        set_send_dst,
+        result_precision,
+        compute_precision,
+        // `:1139` — `getSentientFoldModeAttrForOperation(op, comp)`.
+        fold_mode_attr: fold_mode_attr_for_operation(op, comp),
+        // `:1154` — `dataflow::getDbgNameAttr(op)`.
+        op_dbg_name: dbg_name(op).map(str::to_owned),
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 366/384
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// WHAT `fuseNonComputeOps`'s TARGET SAYS ABOUT ONE OP — `VectorChainToSentientPESFP.cpp:1178-1236`.
+///
+/// ⛔⛔ THERE IS NO `addIllegalOp` IN THIS FUNCTION, unlike [`legality`]'s thirteen. So
+/// [`NonComputeLegality::Unnamed`] can never fail the conversion, and the ONLY behaviour in the whole
+/// target is [`NonComputeLegality::Dynamic`]'s callback over three op classes.
+/// ⭐ `vectorchain` IS LEGAL HERE (`:1180`) and absent from [`LEGAL_DIALECTS`] — the non-compute half
+/// runs FIRST (`:1391`, `:1393`), so the computes it must not touch are declared legal outright,
+/// while `agen`, `trace` and `dataflow` are enumerated op by op (`:1185-1197`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NonComputeLegality {
+    /// `addLegalDialect` or one of the three `addLegalOp` lists names it.
+    Legal,
+    /// `addDynamicallyLegalOp<dataflow::SendOp, vector::StoreOp, agen::VectorStoreOp>` (`:1234-1236`).
+    Dynamic,
+    /// Named by neither list: partial conversion offers it to the patterns and leaves it alone.
+    Unnamed,
+}
+
+/// THE TARGET AS ONE EXHAUSTIVE MATCH. ⛔ EXHAUSTIVE DELIBERATELY, as [`legality`] is: an op added to
+/// the island later must be classified here rather than defaulted.
+#[must_use]
+pub fn non_compute_legality(op: &DfirOp) -> NonComputeLegality {
+    match op {
+        // ── the three dynamically legal ops (`:1234-1236`) ────────────────────────────────────────
+        DfirOp::Dataflow(dataflow::Op::Send { .. })
+        | DfirOp::Vector(vector::Op::Store { .. })
+        | DfirOp::Agen(agen::Op::VectorStore { .. }) => NonComputeLegality::Dynamic,
+
+        // ── `addLegalDialect<arith, vectorchain, sentient, memref, uniform, symbol>` (`:1179-1183`);
+        //    `sentient` and `memref` have no `Op` arm of their own in this island ─────────────────
+        DfirOp::Arith(_) | DfirOp::VectorChain(_) | DfirOp::Uniform(_) | DfirOp::Symbol(_) => {
+            NonComputeLegality::Legal
+        }
+
+        // ── `addLegalOp<agen::YieldOp, …, agen::SetTransferMaskStateOp>` (`:1185-1193`) ───────────
+        DfirOp::Agen(
+            agen::Op::Yield
+            | agen::Op::VectorLoad { .. }
+            | agen::Op::CompositeLoad(_)
+            | agen::Op::CompositeStore(_)
+            | agen::Op::CompositeLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoadAndStore(_)
+            | agen::Op::CompositeIndirectLoad(_)
+            | agen::Op::CompositeIndirectStore(_)
+            | agen::Op::IndirectVectorLoad { .. }
+            | agen::Op::IndirectVectorStore { .. }
+            | agen::Op::CompositeMemoryInterleave { .. }
+            | agen::Op::SetTransferMaskState { .. },
+        ) => NonComputeLegality::Legal,
+
+        // ── `addLegalOp<dataflow::GetUnitOp, …, dataflow::OpaqueOp>` (`:1195-1197`). The four
+        //    collection ops are this island's, are named by neither list, and so are `Unnamed` ────
+        DfirOp::Dataflow(
+            dataflow::Op::GetUnit { .. }
+            | dataflow::Op::GetLocalUnit { .. }
+            | dataflow::Op::ProgramUnit { .. }
+            | dataflow::Op::CreateGroup { .. }
+            | dataflow::Op::SyncSend { .. }
+            | dataflow::Op::SyncRecv { .. }
+            | dataflow::Op::ImplicitSync { .. }
+            | dataflow::Op::GetLogicalMemoryView { .. }
+            | dataflow::Op::Receive { .. },
+        ) => NonComputeLegality::Legal,
+
+        // ── `vector.load`, `scf`, `affine`, the symbolic agen accesses and the collection ops:
+        //    unnamed, and therefore untouched ───────────────────────────────────────────────────
+        DfirOp::Vector(_)
+        | DfirOp::Scf(_)
+        | DfirOp::Affine(_)
+        | DfirOp::Agen(_)
+        | DfirOp::Dataflow(_) => NonComputeLegality::Unnamed,
+    }
+}
+
+/// WHICH SENDS AND STORES THE THREE PATTERNS WOULD REWRITE IN ONE UNIT, IN PREORDER — the
+/// `getDynamicLoweringLegality` lambda (`:1200-1231`) asked of every [`NonComputeLegality::Dynamic`]
+/// op.
+///
+/// ⛔⛔ THE LAMBDA'S OWN COMMENT IS INVERTED. `addDynamicallyLegalOp`'s callback answers *is this op
+/// LEGAL*, so `return !is_fusion_respected` means a RESPECTED fusion is the illegal op the pattern
+/// rewrites, and the trailing `return true` leaves a send whose producer is not a
+/// receive/load/constant exactly where it is. Reading the comment instead of the contract inverts
+/// the pass.
+/// ⛔ `is_visited` IS MUTATED BY THE QUERY, through entry 341 — so the answer for one op depends on
+/// which ops were asked before it. The queries are made in the same preorder as the seeding walk.
+/// ⭐ SEPARATE FROM [`fuse_non_compute_ops`] SO IT IS TESTABLE: the pass can only fail on a non-empty
+/// answer, and the answer is the part with content.
+#[must_use]
+pub fn non_compute_ops_to_fuse<A: Arch>(
+    unit: &dfir::ProgramUnit<A>,
+    comp: ComputeComp,
+) -> Vec<OpId> {
+    let scope: &[DfirOp] = &unit.body;
+
+    // `unit_op.walk<WalkOrder::PreOrder>([&](Operation *op) { if (isa<…>(op)) is_visited[op] = false; })`
+    // (`:1163-1167`) — ⛔ SEEDED FOR ALL THREE CLASSES BEFORE ANY IS ASKED, so entry 341 can see a
+    // sibling store it has not reached yet.
+    let mut is_visited: BTreeMap<OpId, bool> = BTreeMap::new();
+    walk_positions(scope, &[], 0, &mut |op, at| -> Option<()> {
+        if non_compute_legality(op) == NonComputeLegality::Dynamic {
+            is_visited.insert(at, false);
+        }
+        None
+    });
+
+    let mut to_fuse: Vec<OpId> = Vec::new();
+    walk_positions(scope, &[], 0, &mut |op, at| -> Option<()> {
+        // `send_op.getSendData()` / `store_op.getValueToStore()` (`:1206-1212`) — ⛔ `Operation *data`
+        // is left UNINITIALISED by an `else`-less chain, which only the target's three-op
+        // registration makes safe.
+        let data = match op {
+            DfirOp::Dataflow(dataflow::Op::Send { data, .. })
+            | DfirOp::Vector(vector::Op::Store { value: data, .. })
+            | DfirOp::Agen(agen::Op::VectorStore { value: data, .. }) => *data,
+            _ => return None,
+        };
+
+        // `VectorOperand::getOperandWithPrecision(dcc_ext_ctx, data, comp, is_precision_converted)`
+        // (`:1215-1216`), whose `traverse_upwards` defaults to `true` (`VectorOperands.hpp:87-90`).
+        let Some(from) = defining_position(data, scope)
+            .and_then(|at| VectorOperand::operand::<A>(&at, comp, true, scope))
+        else {
+            return None;
+        };
+
+        // `isa<dataflow::ReceiveOp, vector::LoadOp, agen::VectorLoadOp, arith::ConstantOp>(from.op_)`
+        // (`:1218-1220`) — anything else is legal and stays.
+        let fusible = matches!(
+            op_at(&from.op, scope),
+            Some(
+                DfirOp::Dataflow(dataflow::Op::Receive { .. })
+                    | DfirOp::Vector(vector::Op::Load { .. })
+                    | DfirOp::Agen(agen::Op::VectorLoad { .. })
+            )
+        ) || is_arith_constant(&from.op, scope);
+        if !fusible {
+            return None;
+        }
+
+        // `analyzeNonComputeOpsForFusion(unit_op, …)` (`:1225-1228`). ⭐ `unit_op` IS THE SCOPE'S OWN
+        // ROOT, so entry 341's containment test is the empty prefix.
+        let mut analysis = FusionAnalysis::default();
+        analyze_non_compute_ops_for_fusion::<A>(
+            &OpId::at(&[]),
+            &at,
+            &from,
+            comp,
+            &mut is_visited,
+            scope,
+            &mut analysis,
+        );
+        // `return !is_fusion_respected;`
+        if analysis.is_fusion_respected {
+            to_fuse.push(at);
+        }
+        None
+    });
+
+    to_fuse
+}
+
+/// Replaces: e366_fuseNonComputeOps
+///
+/// **366/384** `VectorChainToSentientPESFPLoweringPass::fuseNonComputeOps` —
+/// `VectorChainToSentientPESFP.cpp:1159` (80L): fuse one unit's sends and stores into the compute
+/// that produces the data they move.
+///
+/// ⛔ THE THREE PATTERNS ALL FUNNEL INTO ENTRY 364, which is unported — so this driver names the op
+/// the fusion would have rewritten instead of emitting, exactly as [`fuse_compute_ops`] does.
+/// ⭐ `comp` IS THE CALLER'S. The reference reads it from `unit_op.getUnits()[0]`'s defining
+/// `dataflow.get_unit` under a `DT_CHECK` (`:1174-1177`); a [`dfir::ProgramUnit`] carries it.
+pub fn fuse_non_compute_ops<A: Arch>(
+    unit: &dfir::ProgramUnit<A>,
+    comp: ComputeComp,
+    reuse_info: &OperandReuse,
+) {
+    let to_fuse = non_compute_ops_to_fuse::<A>(unit, comp);
+
+    // ⭐ A UNIT WHOSE SENDS AND STORES ALL DECLINED THE FUSION IS CONVERTED SUCCESSFULLY AND
+    // UNCHANGED — `applyPartialConversion` had nothing to legalize and returned `success()`.
+    if let Some(first) = to_fuse.first() {
+        todo!(
+            "e364_patternAgnosticFuseNonComputeOpsHelper is unported, so {} non-compute op(s) on \
+             {:?} cannot be fused (first {:?}, rest {:?}); reuse info at entry: {:?}",
+            to_fuse.len(),
+            comp,
+            first,
+            &to_fuse[1..],
+            reuse_info
+        );
+    }
 }
 
 // ⛔ RE-CREATED ANCHORS. These units' `crustify:todo:` markers were deleted without a
 // `/// Replaces:` ever appearing, which removed them from every later schedule and let the
 // driver report the campaign DONE. Outstanding work is now computed from UNITS.tsv.
 // crustify:todo: e364_patternAgnosticFuseNonComputeOpsHelper
-// crustify:todo: e365_fillOpInfo
-// crustify:todo: e366_fuseNonComputeOps
