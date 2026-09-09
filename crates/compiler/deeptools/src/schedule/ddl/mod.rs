@@ -143,7 +143,7 @@ pub struct ParsedDdl {
     pub verifiable: Vec<Unverified>,
 }
 
-/// A DDL SOURCE — a buffer `parseSourceFileForTool` can read (`ddl.cpp:57`).
+/// A DDL SOURCE — a buffer `parseSourceFileForTool` can read (`ddl.cpp:54-55`).
 ///
 /// ⭐ A TRAIT BECAUSE MLIR'S GENERIC PARSE IS THE FRAMEWORK'S, not this campaign's: `performActions`
 /// states only the CONFIG it hands over, and our own text parse of the same templates is `build.rs`.
@@ -155,12 +155,12 @@ pub trait DdlSource {
 /// Replaces: e171_performActions
 ///
 /// PARSE, THEN RUN EVERY VERIFIER — `ParserConfig(context, /*verifyAfterParse=*/true, ..)`
-/// (`ddl.cpp:51-52`) is the flag that makes the four ported verifiers load-bearing instead of dead
+/// (`ddl.cpp:49-50`) is the flag that makes the four ported verifiers load-bearing instead of dead
 /// predicates: one rejection anywhere and the parse yields nothing.
 ///
-/// ⭐ THE THREADING SAVE / DISABLE / RESTORE (`:39-40`, `:57`) IS PERFORMANCE-ONLY — it drops
+/// ⭐ THE THREADING SAVE / DISABLE / RESTORE (`:40-41`, `:56`) IS PERFORMANCE-ONLY — it drops
 /// `MLIRContext` synchronisation for the duration — and there is no context here.
-/// ⭐ `PassReproducerOptions` + `FallbackAsmResourceMap` (`:48-52`) make unhandled external
+/// ⭐ `PassReproducerOptions` + `FallbackAsmResourceMap` (`:47-51`) make unhandled external
 /// resources PASSTHROUGH; no vendored template states one.
 #[must_use]
 pub fn perform_actions(source: &(impl DdlSource + ?Sized), dialect: &Dialect) -> Option<Verified> {

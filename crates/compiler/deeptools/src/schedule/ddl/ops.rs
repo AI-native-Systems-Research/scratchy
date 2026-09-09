@@ -168,7 +168,7 @@ impl Value {
 /// EVERY OPERATION THE `ddl` DIALECT REGISTERS — `GET_OP_LIST` (`DdlOps.cpp:35-37`), which TableGen
 /// fills from every `Ddl_Op<..>` in `DdlOps.td`, in declaration order.
 ///
-/// ⛔⛔ THIRTY-NINE, NOT FORTY: `Ddl_AccessPattenOp` is COMMENTED OUT (`DdlOps.td:514-525`), so
+/// ⛔⛔ THIRTY-NINE, NOT FORTY: `Ddl_AccessPattenOp` is COMMENTED OUT (`DdlOps.td:514-524`), so
 /// `ddl.access_pattern` is not an op at all — an access pattern is stated as `access_pattern_style`
 /// on a `ddl.data_transfer` (`:604`) over its `access_pattern_dim` operands (`:608`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -538,7 +538,7 @@ impl DimensionValue {
 
 /// THE DIMENSIONS TO FORCE INNERMOST, IN ORDER — non-empty and pairwise distinct BY CONSTRUCTION.
 ///
-/// ⛔ `{ first, rest }` RATHER THAN A `Vec`, so "provide at least one dimension" (`DdlOps.cpp:70`)
+/// ⛔ `{ first, rest }` RATHER THAN A `Vec`, so "provide at least one dimension" (`DdlOps.cpp:71`)
 /// cannot be re-asked downstream: there is no way to spell the empty list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnermostDims {
@@ -575,7 +575,7 @@ impl InnermostDims {
 /// A `ddl.force_innermost_dimensions` WHOSE FIVE CHECKS HAVE ALL PASSED — passed into the TYPES, so
 /// nothing downstream can re-ask them.
 ///
-/// ⛔ THE `isa<>` CALLS SIT ON A POSSIBLY-NULL `getDefiningOp()` (`:61`, `:65`, `:76`), which ASSERTS
+/// ⛔ THE `isa<>` CALLS SIT ON A POSSIBLY-NULL `getDefiningOp()` (`:60`, `:65`, `:76`), which ASSERTS
 /// rather than answering false. Unreachable in practice — every DDL region is `AnyRegion` with no
 /// block arguments, so every operand has a defining op — which is what makes
 /// [`Defining::defining_op`] answering [`None`] a safe widening rather than a behaviour change.
@@ -613,7 +613,7 @@ impl ForceInnermostDimensions {
 }
 
 /// WHICH COMPUTE THE DIALECT RECOGNISES — the thirty-three names `ComputeOp::verify` tests
-/// (`DdlOps.cpp:117-134`), listed in the vendor's own order and grouped by required arity.
+/// (`DdlOps.cpp:119-128`), listed in the vendor's own order and grouped by required arity.
 ///
 /// ⛔⛔ NINE OF THEM THE CENSUS CANNOT SPELL, which is why this is not [`ComputeType`]: no vendored
 /// template states `FMA8`, `FMA4`, `IMA8`, `IMA4`, `SHR`, `FSUB`, `GCVT`, `IME` or `AND`, and
@@ -691,9 +691,9 @@ pub enum DdlComputeType {
 
 impl DdlComputeType {
     /// THE COMPUTE A `computetype=` NAMES, or [`None`] for the "Unrecognized compute op" arm
-    /// (`DdlOps.cpp:135`).
+    /// (`DdlOps.cpp:131`).
     ///
-    /// ⛔ THE SPELLING IS UPPERCASED FIRST — `getComputetype().upper()` (`:111`) — because
+    /// ⛔ THE SPELLING IS UPPERCASED FIRST — `getComputetype().upper()` (`:110`) — because
     /// `unary_parallel.ddl` states `computetype="assign"` in lowercase and a case-sensitive match
     /// would reject it.
     #[must_use]
@@ -961,10 +961,10 @@ impl AllocateOperands {
     /// and the unconsumed tail, which starts at `attr-dict`.
     ///
     /// ⛔ ONE `,` MAY INTRODUCE EITHER THE LIST OR THE EXTERNAL, which is what
-    /// `commaNeedsFurtherParsing` (`:239-249`) is for: `(%kertensor, %kertensor_xrf_ext_allocation)`
+    /// `commaNeedsFurtherParsing` (`:237-255`) is for: `(%kertensor, %kertensor_xrf_ext_allocation)`
     /// parses with an EMPTY padding list, and `bmm.ddl` states exactly that form.
     ///
-    /// ⛔ `attr-dict` IS THE FRAMEWORK'S generic parse (`:257`), so it is handed back, not invented.
+    /// ⛔ `attr-dict` IS THE FRAMEWORK'S generic parse (`:272`), so it is handed back, not invented.
     #[must_use]
     pub fn parse(input: &str) -> Option<(Self, &str)> {
         let mut rest = punct(input, '(')?;
@@ -1011,7 +1011,7 @@ impl AllocateOperands {
         ))
     }
 
-    /// `operandSegmentSizes` — `{1, |padding_dim|, |external_allocate|}` (`DdlOps.cpp:296-300`),
+    /// `operandSegmentSizes` — `{1, |padding_dim|, |external_allocate|}` (`DdlOps.cpp:275-279`),
     /// which the reference stores as a `DenseI32ArrayAttr` and `AttrSizedOperandSegments` reads back
     /// to re-split the flat operand list.
     #[must_use]
