@@ -126,7 +126,7 @@
 //! the L3 DL-ops scheduler, then the Deep Dataflow Constructor. This module is
 //! both.
 
-pub(crate) mod dcg;
+pub mod dcg;
 pub(crate) mod ddc;
 pub(crate) mod ddl;
 pub(crate) mod l3;

@@ -139,6 +139,8 @@
 //! | `e348_runDcgForDataOpsDlOps` | 348 | 3 | 179 | `DcgManager` | `dcg/dcg_manager/dcg_manager.cpp:269` |
 //! | `e349_convertToProgIRDataOp` | 349 | 3 | 46 | `DcgManager` | `dcg/dcg_manager/dcg_manager.cpp:898` |
 
+use crate::arch::{Arch, Bytes, Elements, Sticks, Target};
+use crate::units::Core;
 
 // crustify:todo: e188_runDcgComputeTransfer
 //   authority : dcg/dcg_manager/dcg_manager.cpp:112  (13 body lines, level 0)
@@ -188,11 +190,265 @@
 //   original  : void runDcgForSparseKG3BMM(SuperDsc& mySDsc)
 //   extract   : crustify-ddc/cpp/dcg.cpp:315-318
 
-// crustify:todo: e196_printTrafficPerCore
-//   authority : dcg/dcg_manager/dcg_manager.h:120  (3 body lines, level 0)
-//   class     : DcgManager
-//   original  : void printTrafficPerCore(SuperDsc& sdsc, std::string fileName)
-//   extract   : crustify-ddc/cpp/dcg.cpp:328-331
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// e196_printTrafficPerCore — the per-core traffic table.
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// WHICH WAY ROUND THE CORE RING A MULTICAST TRAVELS — `selectedMCMode` (`dsc/dataOpDsc.h:212-213`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MulticastMode {
+    /// `-1`, the field's initial value: nothing has chosen an arc yet.
+    #[default]
+    Unselected,
+    /// `0` — random.
+    Random,
+    /// `1` — counter-clockwise, one hop being core `i` to core `i + 1`.
+    CounterClockwise,
+    /// `2` — clockwise.
+    Clockwise,
+    /// `3` — replication: whichever arc is under half the ring, else both at half the volume.
+    Replication,
+}
+
+/// HOW FAR ROUND THE RING A TRANSFER REACHES — one end of `CCWHopCWHop` (`dsc/dataOpDsc.h:216`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct RingHops(pub u32);
+
+/// ONE PRODUCED TRANSFER of a `coreIDtoDtKey_L3SU` entry (`stcdpOp.cpp:5875-5915`).
+#[derive(Debug, Clone, Copy)]
+pub struct Multicast {
+    /// `CCWHopCWHop.first`.
+    pub ccw_hops: RingHops,
+    /// `CCWHopCWHop.second`.
+    pub cw_hops: RingHops,
+    /// `selectedMCMode`.
+    pub mode: MulticastMode,
+    /// The transfer's volume — see [`transfer_sticks`].
+    pub volume: Sticks,
+}
+
+/// ONE `coreIDtoDtKey_L3SU` ENTRY: a producing core and its transfers (`stcdpOp.cpp:5870-5873`).
+///
+/// ⛔ THE CORE IS NOT PER-TRANSFER. `initCore(coreID)` runs on the KEY, before the transfer list
+/// (`:5873`), so a producer with an empty list still gets a row in the report.
+#[derive(Debug, Clone)]
+pub struct Produced {
+    /// The producing core.
+    pub producer: Core,
+    /// Its transfers, in `dtTable_` order.
+    pub transfers: Vec<Multicast>,
+}
+
+/// ONE `coreIDtoDtKey_L3LU` ENTRY: a consuming core and the volumes it takes in (`:5918-5926`).
+#[derive(Debug, Clone)]
+pub struct Consumed {
+    /// The consuming core.
+    pub consumer: Core,
+    /// Its transfers' volumes.
+    pub volumes: Vec<Sticks>,
+}
+
+/// ONE STCDP DATA OP'S CONTRIBUTION TO THE TRAFFIC TABLE.
+#[derive(Debug, Clone, Default)]
+pub struct DataOpTraffic {
+    /// `STCDPOpHBM` seeds EVERY core into the table whether or not it carries traffic (`:5862-5863`);
+    /// `STCDPOpLx` seeds only the cores its transfers name.
+    pub seeds_every_core: bool,
+    /// The producer side (`:5870`).
+    pub produced: Vec<Produced>,
+    /// The consumer side (`:5918`).
+    pub consumed: Vec<Consumed>,
+    /// Volumes of this op's transfers produced by the HBM — `pMemID == -1`, since an LX producer's
+    /// mem id is its core id (`:5930-5931`, `dsc/dataOpDsc.h:184`).
+    pub hbm_sourced: Vec<Sticks>,
+}
+
+/// THE STICKS A TRANSFER'S ELEMENTS OCCUPY — `128.0 / inpLds->wordLength` elements to a stick
+/// (`stcdpOp.cpp:5868`), truncating exactly where the reference's `int` accumulators truncate.
+#[must_use]
+pub fn transfer_sticks<A: Arch>(elements: Elements, word: Bytes) -> Sticks {
+    Sticks(elements.0 * word.0 / A::BYTES_PER_STICK.get())
+}
+
+/// ONE CORE'S ROW OF THE TRAFFIC TABLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoreTraffic {
+    incoming: Sticks,
+    outgoing: Sticks,
+    through: Sticks,
+}
+
+impl Default for CoreTraffic {
+    /// What `initCore` seeds a fresh core with (`stcdpOp.cpp:5856-5858`).
+    fn default() -> Self {
+        CoreTraffic {
+            incoming: Sticks(0),
+            outgoing: Sticks(0),
+            through: Sticks(0),
+        }
+    }
+}
+
+/// THE TABLE `printTrafficPerCore` FILLS — one slot per core of the ring.
+///
+/// ⛔ `Option`, BECAUSE `initCore` DECIDES WHICH ROWS PRINT. The reference's three `std::map`s hold
+/// only the cores something touched and it renders by walking `coreIdToInpVol` (`:5957`), so a core
+/// no transfer mentioned has NO row — which is not the same as a row of zeroes. The three maps also
+/// collapse into one record per core, which is what retires its `DT_CHECK` at `:5958`: a slot cannot
+/// hold an incoming count without the outgoing one beside it.
+struct TrafficTable {
+    cores: [Option<CoreTraffic>; Target::CORES as usize],
+    total_produced: Sticks,
+}
+
+impl TrafficTable {
+    fn new() -> Self {
+        TrafficTable {
+            cores: [None; Target::CORES as usize],
+            total_produced: Sticks(0),
+        }
+    }
+
+    /// `initCore` — and the row it hands back (`:5855-5859`).
+    fn entry(&mut self, core: Core) -> &mut CoreTraffic {
+        self.cores[core.get() as usize].get_or_insert_default()
+    }
+
+    /// `STCDPOpHBM`'s seeding of the whole ring (`:5863`), and the HBM through-charge's (`:5934`).
+    fn seed_every_core(&mut self) {
+        for slot in &mut self.cores {
+            slot.get_or_insert_default();
+        }
+    }
+
+    /// The through-traffic a CCW arc of `hops` passes over — `for (c = 1; c < CCW_hop; c++)`.
+    fn pass_ccw(&mut self, producer: Core, hops: RingHops, volume: Sticks) {
+        for hop in 1..hops.0 {
+            self.entry(producer.step_ccw(hop)).through.0 += volume.0;
+        }
+    }
+
+    /// The same over a CW arc — `for (c = 1; c < CW_hop; c++)`.
+    fn pass_cw(&mut self, producer: Core, hops: RingHops, volume: Sticks) {
+        for hop in 1..hops.0 {
+            self.entry(producer.step_cw(hop)).through.0 += volume.0;
+        }
+    }
+
+    /// One producer's outgoing volume and the cores its arc passes over (`:5870-5916`).
+    fn add_produced(&mut self, produced: &Produced) {
+        self.entry(produced.producer);
+        for transfer in &produced.transfers {
+            self.entry(produced.producer).outgoing.0 += transfer.volume.0;
+            self.total_produced.0 += transfer.volume.0;
+
+            // ⛔ ARM ORDER IS THE REFERENCE'S `if / else if / else` (`:5885-5914`): mode 3 takes an
+            // arc only when THAT arc is under half the ring, and every other mode — including the
+            // unselected -1 and random 0 — splits the volume over both.
+            let half = Sticks(transfer.volume.0 / 2);
+            let half_ring = Target::CORES / 2;
+            match transfer.mode {
+                MulticastMode::CounterClockwise => {
+                    self.pass_ccw(produced.producer, transfer.ccw_hops, transfer.volume);
+                }
+                MulticastMode::Replication if transfer.ccw_hops.0 < half_ring => {
+                    self.pass_ccw(produced.producer, transfer.ccw_hops, transfer.volume);
+                }
+                MulticastMode::Clockwise => {
+                    self.pass_cw(produced.producer, transfer.cw_hops, transfer.volume);
+                }
+                MulticastMode::Replication if transfer.cw_hops.0 < half_ring => {
+                    self.pass_cw(produced.producer, transfer.cw_hops, transfer.volume);
+                }
+                MulticastMode::Unselected | MulticastMode::Random | MulticastMode::Replication => {
+                    self.pass_ccw(produced.producer, transfer.ccw_hops, half);
+                    self.pass_cw(produced.producer, transfer.cw_hops, half);
+                }
+            }
+        }
+    }
+
+    /// One consumer's incoming volume (`:5918-5927`).
+    fn add_consumed(&mut self, consumed: &Consumed) {
+        self.entry(consumed.consumer);
+        for volume in &consumed.volumes {
+            self.entry(consumed.consumer).incoming.0 += volume.0;
+        }
+    }
+
+    /// An HBM-produced transfer: half its volume passes through EVERY core (`:5930-5939`).
+    fn add_hbm_sourced(&mut self, volume: Sticks) {
+        self.seed_every_core();
+        for slot in &mut self.cores {
+            if let Some(traffic) = slot {
+                traffic.through.0 += volume.0 / 2;
+            }
+        }
+    }
+
+    /// The dump itself (`:5949-5965`). `std::setw` right-aligns, and the reference's fourth line is
+    /// the `setw`-only `<<` chain at `:5954`, which emits nothing but its newline.
+    fn report(&self) -> String {
+        let mut out = String::new();
+        out.push_str("---------------------------------------------------------------\n");
+        out.push_str(&format!(
+            "{:>12}{:>20}{:>20}{:>20}{:>20}\n",
+            "Core Id", "Incoming Sticks", "Outgoing Sticks", "In/out Sticks", "Through Sticks",
+        ));
+        out.push('\n');
+        for (index, slot) in self.cores.iter().enumerate() {
+            if let Some(traffic) = slot {
+                out.push_str(&format!(
+                    "{:>12}{:>20}{:>20}{:>20}{:>20}\n",
+                    index,
+                    traffic.incoming.0,
+                    traffic.outgoing.0,
+                    traffic.outgoing.0 + traffic.incoming.0,
+                    traffic.through.0,
+                ));
+            }
+        }
+        out.push_str(&format!("totalProdSticks={}\n", self.total_produced.0));
+        out
+    }
+}
+
+/// Replaces: e196_printTrafficPerCore
+///
+/// THE PER-CORE TRAFFIC TABLE — incoming, outgoing and through-passing sticks per core, then
+/// `totalProdSticks`. `DcgManager::printTrafficPerCore` (`dcg/dcg_manager/dcg_manager.h:120`) is a
+/// forward to `DcgFE::printTrafficPerCore` (`dcg/dcg_fe/pcfg_gen/stcdpOp.cpp:5849`), which is this.
+///
+/// ⛔ THIS PORT DIVERGES, AND THE REFERENCE IS WRONG: its CCW ring step is `(c + coreID) / 32`
+/// (`:5889,5904`) where every sibling wraps modularly — its own second copy of the identical walk
+/// writes `% (int)maxNumCores` (`inputNeighFetchOp.cpp:2294,2308,2318`) and the CW arm three lines
+/// below wraps by hand — so `/ 32` charges every CCW hop landing below core 32 to core 0.
+/// [`Core::step_ccw`] steps the ring; `unit_tests::ccw_arc_walks_the_ring_not_core_zero` pins it.
+///
+/// ⛔ TWO SEAMS THE CALLER OWNS. The `sdsc.dataOpdscs_` walk that reads each `baseSTCDPOp`'s
+/// `dtTable_` and `coreIDtoDtKey_L3{SU,LU}` is `dcg_fe/pcfg_gen/`, OUT of this campaign, so the
+/// caller supplies [`DataOpTraffic`]; and the file write is the caller's, since the reference's own
+/// open failure is a message and a no-op (`:5946-5947`) leaving only the text to preserve.
+/// ⚠️ NO CALLER ON THE `runDdc` PATH — the only one is `dcg/tools/dcg_standalone.cpp:553`, a harness.
+#[must_use]
+pub fn print_traffic_per_core(ops: &[DataOpTraffic]) -> String {
+    let mut table = TrafficTable::new();
+    for op in ops {
+        if op.seeds_every_core {
+            table.seed_every_core();
+        }
+        for produced in &op.produced {
+            table.add_produced(produced);
+        }
+        for consumed in &op.consumed {
+            table.add_consumed(consumed);
+        }
+        for &volume in &op.hbm_sourced {
+            table.add_hbm_sourced(volume);
+        }
+    }
+    table.report()
+}
 
 // crustify:todo: e280_runDcgGenerateProgIR
 //   authority : dcg/dcg_manager/dcg_manager.cpp:145  (70 body lines, level 1)
@@ -242,4 +498,107 @@
 //   original  : void DcgManager::convertToProgIRDataOp(SuperDsc& mySDsc)
 //   extract   : crustify-ddc/cpp/dcg.cpp:983-1029
 //   calls     : e282_mergePcfgInSuperDSC, e326_mergePcfgInSuperDSC
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
 
+    /// A core, at a literal index this arch is known to have.
+    fn core<const I: u32>() -> Core {
+        Core::checked(I).expect("this arch has 32 cores")
+    }
+
+    /// `(core id, incoming, outgoing, in/out, through)` per rendered row, read back by splitting on
+    /// whitespace — never by re-slicing at the widths the renderer used.
+    fn rows(report: &str) -> Vec<(u32, u64, u64, u64, u64)> {
+        report
+            .lines()
+            .skip(3)
+            .filter(|line| !line.starts_with("totalProdSticks="))
+            .map(|line| {
+                let cells: Vec<u64> = line
+                    .split_whitespace()
+                    .map(|cell| cell.parse().expect("a rendered cell is a number"))
+                    .collect();
+                let [id, incoming, outgoing, in_out, through] = cells[..] else {
+                    unreachable!("a rendered row has five columns")
+                };
+                (id as u32, incoming, outgoing, in_out, through)
+            })
+            .collect()
+    }
+
+    /// ⛔⛔ THE DIVERGENCE, PINNED. A 4-hop CCW multicast out of core 30 passes over cores 31, 0 and 1
+    /// — `for (c = 1; c < 4; c++)` at `(30 + c) % 32` (`stcdpOp.cpp:5888`, wrapping as
+    /// `inputNeighFetchOp.cpp:2294` does). The reference's `(c + coreID) / 32` would answer 0, 1, 1
+    /// instead: core 31 would carry NO through traffic and core 1 would carry twice its share. The
+    /// whole dump is compared, so the column layout of `:5949-5965` is pinned with it.
+    #[test]
+    fn ccw_arc_walks_the_ring_not_core_zero() {
+        let report = print_traffic_per_core(&[DataOpTraffic {
+            produced: vec![Produced {
+                producer: core::<30>(),
+                transfers: vec![Multicast {
+                    ccw_hops: RingHops(4),
+                    cw_hops: RingHops(28),
+                    mode: MulticastMode::CounterClockwise,
+                    volume: Sticks(10),
+                }],
+            }],
+            ..DataOpTraffic::default()
+        }]);
+
+        assert_eq!(
+            report,
+            concat!(
+                "---------------------------------------------------------------\n",
+                "     Core Id     Incoming Sticks     Outgoing Sticks",
+                "       In/out Sticks      Through Sticks\n",
+                "\n",
+                "           0                   0                   0",
+                "                   0                  10\n",
+                "           1                   0                   0",
+                "                   0                  10\n",
+                "          30                   0                  10",
+                "                  10                   0\n",
+                "          31                   0                   0",
+                "                   0                  10\n",
+                "totalProdSticks=10\n",
+            ),
+        );
+    }
+
+    /// THE VENDOR'S OWN TWO SPECIAL CASES IN ONE OP. A replication whose BOTH arcs reach half the
+    /// ring or further takes neither branch and charges half its volume over each (`:5902-5913`), and
+    /// an HBM-produced transfer charges half its volume through EVERY core (`:5930-5939`) — which,
+    /// with `STCDPOpHBM`'s seeding (`:5862-5863`), is why all 32 rows print.
+    #[test]
+    fn replication_past_half_the_ring_splits_and_hbm_charges_every_core() {
+        let report = print_traffic_per_core(&[DataOpTraffic {
+            seeds_every_core: true,
+            produced: vec![Produced {
+                producer: core::<0>(),
+                transfers: vec![Multicast {
+                    ccw_hops: RingHops(20),
+                    cw_hops: RingHops(20),
+                    mode: MulticastMode::Replication,
+                    volume: Sticks(8),
+                }],
+            }],
+            consumed: Vec::new(),
+            // 9 sticks halved is 4, truncating as the reference's `int` map does.
+            hbm_sourced: vec![Sticks(9)],
+        }]);
+
+        let rows = rows(&report);
+        assert_eq!(rows.len(), 32, "every core has a row");
+        // The producer: 8 sticks out, and only the HBM's 4 passing through it.
+        assert_eq!(rows[0], (0, 0, 8, 8, 4));
+        // Core 12 is on the CCW arc alone (hops 1..19): 4 of the split, plus the HBM's 4.
+        assert_eq!(rows[12], (12, 0, 0, 0, 8));
+        // Core 13 is on BOTH arcs (CW reaches 13 at hop 19): 4 + 4, plus the HBM's 4.
+        assert_eq!(rows[13], (13, 0, 0, 0, 12));
+        // Core 20 is on the CW arc alone: 4 of the split, plus the HBM's 4.
+        assert_eq!(rows[20], (20, 0, 0, 0, 8));
+        assert!(report.ends_with("totalProdSticks=8\n"), "{report}");
+    }
+}

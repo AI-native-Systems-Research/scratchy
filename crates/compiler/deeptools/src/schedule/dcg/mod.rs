@@ -122,5 +122,5 @@
 //!
 //! 16 units across 1 file(s).
 
-pub(crate) mod manager;
+pub mod manager;
 
