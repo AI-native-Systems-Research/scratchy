@@ -840,7 +840,7 @@ pub const fn generic_comp(unit: SenComponent) -> Option<GenericComp> {
 
 /// ONE SCHEDULE-TREE NODE — `dsc2::ScheduleNode`'s subclasses, reduced to the distinction
 /// `traverseTreeDFS`'s `nodeTypes` filter makes (`dsc/dsc2.cpp:2222`): which `nodeType_` a node
-/// carries, and whether `isBlockNode()` (`dsc/dsc2.h:477`) lets the walk descend into it.
+/// carries, and whether `isBlockNode()` (`dsc/dsc2.h:479`) lets the walk descend into it.
 ///
 /// ⭐ `Loop` AND `Condition` HOLD A [`BlockNode`] BECAUSE THAT IS THE C++ INHERITANCE: `LoopNode`
 /// derives from `BlockNode` (`dsc/dsc2.h:563`), so each is its block part narrowed to what the
@@ -858,7 +858,7 @@ pub enum SchedNode {
     Leaf(NodeName),
 }
 
-/// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:625`) reduced to `head_`, whose
+/// A DSC'S SCHEDULE TREE — `dsc2::ScheduleTree` (`dsc/dsc2.h:621`) reduced to `head_`, whose
 /// children are the frontier every traversal starts from.
 ///
 /// ⭐ `head_` IS NEVER VISITED. `traverseTreeDFS(nullptr, ..)` seeds the queue with `head_.next_`

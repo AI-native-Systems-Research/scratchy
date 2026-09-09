@@ -275,7 +275,7 @@ pub struct DesignSpaceConfig {
     /// (`dsc/dsc2.cpp:3977`) per labelled data structure, in BYTES as the reference computes it.
     ///
     /// ⭐ ABSENCE IS THE TWO `DT_CHECK`s: `memOrg_` naming no `LX`, or its entry carrying no allocate
-    /// node (`L3DlOpsScheduler.cpp:1705-1711`), are one missing entry here.
+    /// node (`L3DlOpsScheduler.cpp:1705-1709`), are one missing entry here.
     pub lx_chunk_capacity: BTreeMap<LdsIdx, Bytes>,
 }
 
@@ -284,10 +284,11 @@ impl DesignSpaceConfig {
     /// (`L3DlOpsScheduler.cpp:275`).
     ///
     /// ⭐ MANDATORY, WHICH IS `DT_CHECK_MSG(dsc.dataStageParam_.count(dataStageCoreIdx), "Expect
-    /// dataStageParam_ entry for the core data stage.")` (`:353`, `:1185`, `:1191`) DISCHARGED HERE:
-    /// every min-param unit reaches it with a bare `.at()`. `isDimensionCoreletSplit`'s defensive
-    /// `count` (`:77`) is then a constant, and [`Self::corelet_shares`] keeps its own answer because
-    /// the split it reports may come from `CoreletD_`/`CoreD_` instead.
+    /// dataStageParam_ entry for the core data stage.")` (`:353`, `:1186`, `:1197`, `:1385`, `:1630`)
+    /// DISCHARGED HERE: every min-param unit reaches it with a bare `.at()`.
+    /// `isDimensionCoreletSplit`'s defensive `count` (`:77`) is then a constant, and
+    /// [`Self::corelet_shares`] keeps its own answer because the split it reports may come from
+    /// `CoreletD_`/`CoreD_` instead.
     ///
     /// ⭐ A READ OF [`Self::data_stages`] AND NOT A FIELD OF ITS OWN: `dataStageParam_.at(0).ss_` is
     /// one fact, and a second field holding it is a second answer that can disagree.
@@ -303,9 +304,10 @@ impl DesignSpaceConfig {
     /// broadcasts on `scale_ < 1` (`L3DlOpsScheduler.cpp:71`); this set keeps every `scale_ > 0`, so
     /// a fractional scale is broadcast to one and non-broadcast to the other.
     ///
-    /// ⛔ [`None`] IS `getLayoutDims`' OWN `DT_CHECK`: an index past `labeledDs_`, or a labelled data
-    /// structure whose layout order this DSC does not state. ⛔ AN EMPTY VECTOR IS NOT THAT ABORT —
-    /// a wholly broadcast structure names no dim and is a legitimate answer.
+    /// ⛔ [`None`] IS `getLayoutDims`' OWN `DT_CHECK` (`dsc/dsc2.cpp:4009`, `:4022`): an index past
+    /// `labeledDs_`, or a labelled data structure this DSC states no allocate node for. ⛔ AND THE
+    /// EMPTY ANSWER PRECEDES IT — `if (nbDimSet.empty()) return nbDims;` (`dsc/dsc2.cpp:4043`) runs
+    /// BEFORE `getLayoutDims` is ever called, so a wholly broadcast structure cannot reach the abort.
     ///
     /// ⭐ THE TWO ORDERS STAY TWO. The reference builds its set from `primaryDsInfo_`'s layout order
     /// and then filters `getLayoutDims(ldsIdx)`, a DIFFERENT list; [`LabeledDs`] carries the first
@@ -313,11 +315,15 @@ impl DesignSpaceConfig {
     #[must_use]
     pub fn non_broadcast_lds_dims(&self, lds: LdsIdx) -> Option<Vec<PrimaryDim>> {
         let entry = self.labeled_ds.at(lds)?;
+        let non_broadcast = |scale: &Scale| matches!(scale, Scale::Sized(scale) if *scale > 0.0);
+        if !entry.scales.iter().any(|(_, scale)| non_broadcast(scale)) {
+            return Some(Vec::new());
+        }
         let layout = self.layout_dims.get(&lds)?;
         Some(
             layout
                 .iter()
-                .filter(|dim| matches!(entry.scale(*dim), Some(Scale::Sized(scale)) if scale > 0.0))
+                .filter(|dim| entry.scale(*dim).as_ref().is_some_and(non_broadcast))
                 .collect(),
         )
     }
@@ -758,7 +764,7 @@ impl StageDims {
         self.extents.get(&dim).copied()
     }
 
-    /// `hasPadding` (`L3DlOpsScheduler.cpp:1070-1075`) — the dim has a `paddingSizes_` entry AND its
+    /// `hasPadding` (`L3DlOpsScheduler.cpp:1071-1075`) — the dim has a `paddingSizes_` entry AND its
     /// `PADDED_FULLSPAN_WUNNEEDED` span (`calculate_padded`, `dsc/dims.cpp:563`) differs from its
     /// plain extent.
     ///
@@ -884,11 +890,12 @@ impl FilledDims {
 // are the facts, and they are what these seams state.
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
-/// A PLACED BYTE ADDRESS — `AllocateNode::startAddressCoreCorelet_`'s `int64_t` (`dsc/dsc2.h:983`).
+/// A PLACED BYTE ADDRESS — `AllocateNode::startAddressCoreCorelet_`'s `int64_t`
+/// (`dsc/dsc2.h:985-986`).
 ///
 /// ⛔⛔ UNSIGNED, WHICH IS `DT_CHECK_MSG(startAddr >= 0 && bufferOffset >= 0, "Invalid start address
-/// or buffer offset.")` (`L3DlOpsScheduler.cpp:4955`) DISCHARGED HERE: the reference seeds both at
-/// `-1` and that check is what rules the sentinel out. Absence carries the sentinel instead.
+/// or buffer offset.")` (`L3DlOpsScheduler.cpp:4954-4955`) DISCHARGED HERE: the reference seeds both
+/// at `-1` and that check is what rules the sentinel out. Absence carries the sentinel instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteAddress(pub u64);
 
@@ -1216,7 +1223,7 @@ impl DataStages {
     /// that a superchunk index NAMES AN ENTRY THAT ALREADY EXISTS.
     ///
     /// ⭐ IT HOLDS BECAUSE `getNewDataStageIndex` DEFAULT-INSERTS: its last statement is the bare
-    /// subscript `dsc.dataStageParam_[newIdx];` (`L3DlOpsScheduler.cpp:6624`), so the entry is present
+    /// subscript `dsc.dataStageParam_[newIdx];` (`L3DlOpsScheduler.cpp:6622`), so the entry is present
     /// and empty before `addSuperChunkDataStage` ever runs. The `>= 0` half is [`DatastageId`]'s own.
     #[must_use]
     pub fn super_chunk(&self, index: DatastageId) -> Option<SuperChunkStage> {
@@ -1230,7 +1237,7 @@ impl DataStages {
 pub struct SuperChunkStage(DatastageId);
 
 impl SuperChunkStage {
-    /// `dataStageSuperChunkIdx` (`L3DlOpsScheduler.h:225`).
+    /// `dataStageSuperChunkIdx` (`L3DlOpsScheduler.h:224`).
     #[must_use]
     pub const fn index(self) -> DatastageId {
         self.0
@@ -1238,7 +1245,7 @@ impl SuperChunkStage {
 }
 
 /// ONE DIM'S CANDIDATE CHUNK EXTENTS WITH THE INDEX THE SEARCH SELECTED — `DscParamCandidatesType`'s
-/// inner vector ZIPPED ONTO `DscParamCandidateIndicesType`'s index (`L3DlOpsScheduler.h:99-102`).
+/// inner vector ZIPPED ONTO `DscParamCandidateIndicesType`'s index (`L3DlOpsScheduler.h:100-103`).
 ///
 /// ⭐ THE ZIP IS `DT_CHECK_MSG(selectedIdx < dscCandidates[dscIdx].at(dim).size(), "Index is out of
 /// range.")`: once the list and the choice into it are one value, the question cannot be asked, and
@@ -1280,7 +1287,7 @@ impl SelectedCandidate {
 pub struct DscParamCandidates(pub BTreeMap<PrimaryDim, SelectedCandidate>);
 
 /// HOW MANY STICKS ONE STICK VOLUME SPANS — `stickVolume`, POSITIVE BY TYPE, which is
-/// `DT_CHECK_MSG(stickVolume > 0, "Invalid stick volume.")` (`L3DlOpsScheduler.cpp:1704`).
+/// `DT_CHECK_MSG(stickVolume > 0, "Invalid stick volume.")` (`L3DlOpsScheduler.cpp:1703`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StickVolume(NonZeroU64);
 
