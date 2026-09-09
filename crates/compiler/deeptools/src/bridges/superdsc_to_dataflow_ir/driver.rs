@@ -854,8 +854,127 @@ pub fn construct_a_uniformized_program_unit<'c, A: Arch, L, M, T: Clone, R: Sche
     construct_a_units_program(vals, opened, switching, roots)
 }
 
-// crustify:todo: e108_convertV3
-// crustify:todo: e109_convertV4
+/// Replaces: e108_convertV3
+///
+/// EVERY (DSC, CORE, CORELET, COMPONENT)'S PROGRAM UNIT, UNIFORMIZATION OFF — `:466`.
+///
+/// ⛔⛔ THE CORELET LOOP IS `0..num_corelets` UNCONDITIONALLY (`:483`) AND NEVER READS
+/// `numCoreletsUsed_DSC2_`, which is entry 109's business alone — so a DSC that says it uses one
+/// corelet still gets both corelets' units here.
+/// ⛔ AND `core_idx` IS DEAD IN THE CALLEE. Entry 106 reads `core_id` and `corelet_id` and never the
+/// index (`:293-372`), which is why this port hands over the id alone — and why `:523` can pass
+/// `core_id` for it without changing anything.
+#[must_use]
+pub fn convert_v3<'c, A: Arch, D: Dsc<'c>>(
+    vals: &mut Values,
+    name: ProgramName,
+    grid: Grid,
+    components: &Used<DfirUnit>,
+    fold_dims: &[NumFolds],
+    dscs: &[D],
+) -> Converted<A> {
+    let scaffold = start_dataflow_ir_generation(name, grid);
+    let mut assembled = Assembled::new();
+    for dsc in dscs {
+        for &core in dsc.cores() {
+            for corelet in BOTH_CORELETS {
+                for comp in components.iter() {
+                    let Viewing {
+                        transfers,
+                        mut head_children,
+                        roots,
+                    } = dsc.view(comp, Viewed::OnPair(core, corelet));
+                    assembled.push(construct_a_program_unit(
+                        vals,
+                        comp,
+                        core,
+                        corelet,
+                        fold_dims,
+                        SwitchInputs {
+                            transfers: &transfers,
+                            head_children: &mut head_children,
+                        },
+                        roots,
+                    ));
+                }
+            }
+        }
+    }
+    assembled.close(scaffold)
+}
+
+/// Replaces: e109_convertV4
+///
+/// EVERY (DSC, COMPONENT)'S UNIFORMIZED UNIT, PLUS THE CORELET-1 PASS THE L3 FIX NEEDS — `:499`.
+///
+/// ⛔⛔ THE SECOND PASS IS EXTRA, NOT A FALLBACK. `if (dsc.numCoreletsUsed_DSC2_ != num_corelets)`
+/// (`:518`) adds a per-core, corelet-1 unit ON TOP of the uniformized one every component already
+/// got, because DCG-generated L3 code syncs with both corelets while the DSC names one.
+/// ⛔ AND IT NEVER CONSULTS ENTRY 043: entry 106 has no `areFoldsNeeded` (`:311-324`), so a fold
+/// product the uniformized pass collapsed back to one stays folded in these units.
+#[must_use]
+pub fn convert_v4<'c, A: Arch, D: Dsc<'c>>(
+    vals: &mut Values,
+    name: ProgramName,
+    grid: Grid,
+    components: &Used<DfirUnit>,
+    fold_dims: &[NumFolds],
+    dscs: &[D],
+) -> Converted<A> {
+    let scaffold = start_dataflow_ir_generation(name, grid);
+    let mut assembled = Assembled::new();
+    for dsc in dscs {
+        for comp in components.iter() {
+            let Viewing {
+                transfers,
+                mut head_children,
+                roots,
+            } = dsc.view(comp, Viewed::OverEveryPair);
+            assembled.push(construct_a_uniformized_program_unit(
+                vals,
+                comp,
+                dsc.cores(),
+                dsc.num_corelets_used(),
+                fold_dims,
+                // ⛔ LAZY, so a one-fold component never asks — see entry 107.
+                || dsc.folds_needed(comp),
+                SwitchInputs {
+                    transfers: &transfers,
+                    head_children: &mut head_children,
+                },
+                roots,
+            ));
+        }
+
+        // `// TODO: Temporary fix in presence of DCG generated L3 code syncing with both corelets,
+        // but dsc2.0 mentioning use of a single corelet.` (`:516-517`).
+        if dsc.num_corelets_used() != NUM_CORELETS {
+            for &core in dsc.cores() {
+                for comp in components.iter() {
+                    let Viewing {
+                        transfers,
+                        mut head_children,
+                        roots,
+                    } = dsc.view(comp, Viewed::OnPair(core, CORELET_ONE));
+                    assembled.push(construct_a_program_unit(
+                        vals,
+                        comp,
+                        core,
+                        CORELET_ONE,
+                        fold_dims,
+                        SwitchInputs {
+                            transfers: &transfers,
+                            head_children: &mut head_children,
+                        },
+                        roots,
+                    ));
+                }
+            }
+        }
+    }
+    assembled.close(scaffold)
+}
+
 // crustify:todo: e110_runTranslator
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1297,7 +1416,8 @@ pub struct SwitchInputs<'t, 'h, L, M, T> {
 /// built, but every leaf of the view it returns is lowered against these handles — the reference gets
 /// away with it because the leaves read `dsc_lowering` back out much later, and a value tree has to
 /// have them in hand when the leaf is made. So the emptiness test moves one step later than `:300`
-/// and the `get_unit`s are minted for a component that may have no roots.
+/// and the `get_unit`s are minted for a component that may have no roots — and are DROPPED again
+/// where it has none, so the function keeps exactly the handles the reference put in it.
 pub struct UnitHandles<'u> {
     /// `component_to_handler_` and the register files behind it.
     pub neighbours: &'u Neighbourhood,
@@ -1349,6 +1469,9 @@ struct Opened {
 pub struct ConstructedProgramUnit<A: Arch> {
     /// The `dataflow.get_unit`s, which belong to the FUNCTION and not to the unit — `Program`'s
     /// preamble, because entry 084's builder is aimed at `dataflow_func_op_.back()`.
+    ///
+    /// ⭐ EMPTY WHERE THE SCHEDULE NAMED NO ROOT, because `:300` and `:382` return ahead of the
+    /// initializer: the handles this port mints first are dropped rather than preambled.
     pub bound: Vec<Op>,
     /// The unit and its body, or [`None`] for the reference's three empty returns: no roots
     /// (`:300`, `:382`), no units bound, and a loop walk that failed.
@@ -1429,9 +1552,16 @@ fn construct_a_units_program<'c, A: Arch, L, M, T: Clone, R: ScheduleView<'c>>(
         },
     );
     // `if (roots.empty()) return;` (`:300`, `:382`).
+    //
+    // ⛔⛔ AND THE HANDLES MINTED ABOVE ARE DROPPED, WHICH IS WHAT ENTRIES 108 AND 109 NEED. The
+    // reference returns AHEAD of its initializer, so a component the schedule names no root for
+    // leaves NOTHING in the function; this port has to mint them first to lower the view's leaves
+    // against (see [`UnitHandles`]), and preambling them would put a `dataflow.get_unit` in every
+    // program for each rootless (core, corelet, component) — ten to fourteen components, times both
+    // corelets of every core, for the few that have a unit. The mint still consumed its SSA numbers.
     if scheduled.is_empty() {
         return ConstructedProgramUnit {
-            bound,
+            bound: Vec::new(),
             unit: None,
             iterator,
             raised: Vec::new(),
@@ -1505,6 +1635,154 @@ fn construct_a_units_program<'c, A: Arch, L, M, T: Clone, R: ScheduleView<'c>>(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// 108/110 · 109/110 — THE TWO MAIN LOOPS, AND WHAT ONE DSC HANDS THEM
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `int num_corelets = 2` (`:470`, `:503`) — A LITERAL IN BOTH DRIVERS AND NOT AN ARCH READ: entry
+/// 108 visits this many corelets of every core and entry 109 compares `numCoreletsUsed_DSC2_`
+/// against it. It is [`crate::arch::Arch::CORELETS_PER_CORE`] on both arches this crate has.
+const NUM_CORELETS: u32 = 2;
+
+/// THE CORELETS ENTRY 108 ITERATES, the second of which is the one entry 109's temporary fix rebuilds.
+///
+/// ⭐ A BUILD-TIME GUARD, NOT A RUNTIME ONE: an arch with one corelet cannot spell this array, and
+/// const evaluation is where such a build stops.
+const BOTH_CORELETS: [Corelet; NUM_CORELETS as usize] =
+    match (Corelet::checked(0), Corelet::checked(1)) {
+        (Some(zero), Some(one)) => [zero, one],
+        _ => panic!("the DCG's L3 code syncs with two corelets; this arch has fewer"),
+    };
+
+/// `1 /*corelet_id*/` (`:523`).
+const CORELET_ONE: Corelet = BOTH_CORELETS[1];
+
+/// WHICH `getNextView` OVERLOAD A COMPONENT'S ROOTS COME FROM — the one thing that tells the two
+/// drivers' reads of the same schedule tree apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Viewed {
+    /// `getNextView(comp, corelet_id, core_id)` (`:298`) — one pair, for entry 106.
+    OnPair(Core, Corelet),
+    /// `getNextView(comp)` (`:380`) — over every core and corelet the DSC uses, for entry 107.
+    OverEveryPair,
+}
+
+/// ONE COMPONENT'S VIEW OF ONE DSC — the roots, and the buffer-switch state entry 096 reads and writes.
+///
+/// ⛔ THE SWITCH STATE IS OWNED PER CALL BECAUSE IT IS PER CALL IN THE REFERENCE:
+/// `dsc_all_parent_loops_to_buffers_switch_map` is a LOCAL of `ConstructAProgramUnit` (`:331-332`),
+/// declared fresh and dropped at the end, so a view that lent it out of the DSC would carry one
+/// component's propagation into the next.
+pub struct Viewing<'c, D: Dsc<'c> + ?Sized> {
+    /// The component's own switching transfers, in the order that IS each one's [`TransferId`].
+    pub transfers: Vec<SwitchingTransfer<'c, D::Latch, D::Mask>>,
+    /// The schedule head's children, as this component sees them.
+    pub head_children: Vec<SwitchNode<D::Switch>>,
+    /// The roots, whose leaves are lowered against the unit's handles.
+    pub roots: D::View,
+}
+
+/// ONE `DesignSpaceConfig` AS THE TWO DRIVERS READ IT — `sdsc_->dscs_`'s element, minus everything
+/// only its own schedule view touches.
+///
+/// ⭐ EVERY METHOD IS `&self`. The reference holds the DSC by reference for the whole loop
+/// (`for (auto &dsc : sdsc_->dscs_)`) and mutates translator state alone, which is what lets
+/// [`Dsc::folds_needed`] stay callable while a view of the same DSC is in hand.
+///
+/// ⚠️ `: 'c` IS THE VIEWED DATA OUTLIVING ITS VIEWER, which is [`ScheduleView`]'s `'c: 's` one step
+/// out: a DSC hands its own borrows to the leaves it builds, so it cannot hold anything shorter-lived
+/// than the schedule they are read against.
+pub trait Dsc<'c>: 'c {
+    /// The loop a `bufferSwitchPosition_` names, as entry 074 identifies one.
+    type Latch;
+    /// A switching side's mask payload.
+    type Mask;
+    /// What a [`SwitchNode`] carries — one switching transfer's identity.
+    type Switch: Clone;
+    /// The schedule head's view of one component.
+    type View: ScheduleView<'c>;
+
+    /// `dsc.coreIdsUsed_`.
+    ///
+    /// ⛔ POSSIBLY EMPTY, AND THE TWO DRIVERS DIFFER ON THAT: entry 108 builds nothing at all for a
+    /// DSC that names no core, while entry 109's uniformized pass still runs and ends in an empty
+    /// `units_involved` — so this is not [`Used`], whose emptiness entry 005 rules out.
+    fn cores(&self) -> &[Core];
+
+    /// `dsc.numCoreletsUsed_DSC2_` — read by entry 109 only.
+    fn num_corelets_used(&self) -> u32;
+
+    /// `areFoldsNeeded(dsc, comp)` — entry 043's answer, asked only where the fold product exceeds one.
+    fn folds_needed(&self, comp: DfirUnit) -> bool;
+
+    /// `dsc.scheduleTree_.getHead()->getNextView(..)` (`:298`, `:380`), with what entry 096 needs.
+    fn view(&self, comp: DfirUnit, at: Viewed) -> Viewing<'c, Self>;
+}
+
+/// WHAT ONE DRIVER LEFT IN THE MODULE — entry 003's scaffold, closed by entry 004 over every unit the
+/// loops built.
+pub struct Converted<A: Arch> {
+    /// The program, or [`None`] where no component of any DSC had a unit.
+    ///
+    /// ⛔⛔ THAT ABSENCE IS dbo-opt's *"found no program to compile"* AND NOT A REFUSAL OF OURS. The
+    /// reference closes the empty `func.func` all the same (`:493`, `:530`) and
+    /// `AdaptSchedulerDfir.cpp:63-78` is what then rejects it; [`ProgramUnits`] cannot spell an empty
+    /// list, so the state lives here instead of inside the program.
+    pub program: Option<Program<A>>,
+    /// `program_unit_iterator` PER BUILT UNIT, in [`ProgramUnits::iter`] order — see
+    /// [`ConstructedProgramUnit::iterator`] for the island gap this keeps reachable.
+    pub iterators: Vec<Option<Val>>,
+    /// Every diagnostic, in the order the reference prints it.
+    pub raised: Vec<String>,
+}
+
+/// THE MODULE AS THE LOOPS FILL IT — every `dataflow.get_unit` ahead of every unit, which is where
+/// entries 084 and 093 aim their builder.
+struct Assembled<A: Arch> {
+    preamble: Vec<Op>,
+    units: Vec<ProgramUnit<A>>,
+    iterators: Vec<Option<Val>>,
+    raised: Vec<String>,
+}
+
+impl<A: Arch> Assembled<A> {
+    fn new() -> Self {
+        Self {
+            preamble: Vec::new(),
+            units: Vec::new(),
+            iterators: Vec::new(),
+            raised: Vec::new(),
+        }
+    }
+
+    /// One `ConstructA*ProgramUnit` call's result, where that call left it.
+    fn push(&mut self, built: ConstructedProgramUnit<A>) {
+        self.preamble.extend(built.bound);
+        self.raised.extend(built.raised);
+        if let Some(unit) = built.unit {
+            self.units.push(unit);
+            self.iterators.push(built.iterator);
+        }
+    }
+
+    /// `this->stopDataflowIRGeneration()` over what the loops left.
+    fn close(self, scaffold: Scaffold) -> Converted<A> {
+        let mut units = self.units.into_iter();
+        let program = units.next().map(|head| {
+            stop_dataflow_ir_generation(
+                scaffold,
+                self.preamble,
+                ProgramUnits::of(head, units.collect()),
+            )
+        });
+        Converted {
+            program,
+            iterators: self.iterators,
+            raised: self.raised,
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::super::compute::{
@@ -1517,10 +1795,11 @@ mod unit_tests {
     use super::super::sync::{SyncKind, SyncUnits};
     use super::super::transfer::Latch;
     use super::{
-        Component, CondStatement, ConstructedProgramUnit, Emitted, FoldDimFunc, FoldedAddresses,
-        Made, ParametricIters, Placed, Raised, ScheduleView, Scheduled, ScheduledCond, StartAddrOf,
-        Statement, SwitchInputs, Transfer, UnitHandles, Used, construct_a_program_unit,
-        construct_a_uniformized_program_unit, construct_operations_recursively, corelets_used,
+        Component, CondStatement, ConstructedProgramUnit, Converted, Dsc, Emitted, FoldDimFunc,
+        FoldedAddresses, Made, ParametricIters, Placed, Raised, ScheduleView, Scheduled,
+        ScheduledCond, StartAddrOf, Statement, SwitchInputs, Transfer, UnitHandles, Used, Viewed,
+        Viewing, construct_a_program_unit, construct_a_uniformized_program_unit,
+        construct_operations_recursively, convert_v3, convert_v4, corelets_used,
         folded_addresses_are_same, folds_are_needed, start_dataflow_ir_generation,
         stop_dataflow_ir_generation, terminate,
     };
@@ -2224,8 +2503,8 @@ mod unit_tests {
             "entry 008 would have taken it; this gate does not hand it over"
         );
 
-        // ⭐ AND A COMPONENT WITH NO ROOTS BUILDS NO UNIT, which is `:382`'s early return — the
-        // handles it minted before the answer was known still come back.
+        // ⭐ AND A COMPONENT WITH NO ROOTS BUILDS NO UNIT, which is `:382`'s early return.
+        let minted_before = vals.issued();
         let empty: ConstructedProgramUnit<Dd2> = construct_a_uniformized_program_unit(
             &mut vals,
             DfirUnit::Sfp,
@@ -2240,9 +2519,232 @@ mod unit_tests {
             NoRoots,
         );
         assert!(empty.unit.is_none());
+        // ⛔ AND NOTHING OF IT REACHES THE FUNCTION: the handles were minted to lower the view's
+        // leaves against, but `:382` returns ahead of `initializeUniformizedUnit`, so entries 108 and
+        // 109 must not preamble them. The mint itself still happened.
+        assert!(empty.bound.is_empty());
         assert!(
-            !empty.bound.is_empty(),
-            "the `get_unit`s were already minted"
+            vals.issued() > minted_before,
+            "the handles were minted all the same"
         );
+    }
+
+    /// A DSC WHOSE SCHEDULE NAMES ONE ROOT — a stick mask — FOR THE LXLU AND FOR NOTHING ELSE.
+    struct MaskOnLxlu {
+        /// `dsc.coreIdsUsed_`.
+        cores: Vec<Core>,
+        /// `dsc.numCoreletsUsed_DSC2_`.
+        num_corelets_used: u32,
+        /// Every `getNextView` this DSC was asked for, in order.
+        asked: RefCell<Vec<(DfirUnit, Viewed)>>,
+        /// Every `areFoldsNeeded` it was asked for.
+        folds_asked: RefCell<Vec<DfirUnit>>,
+    }
+
+    impl MaskOnLxlu {
+        fn on(cores: Vec<Core>, num_corelets_used: u32) -> MaskOnLxlu {
+            MaskOnLxlu {
+                cores,
+                num_corelets_used,
+                asked: RefCell::default(),
+                folds_asked: RefCell::default(),
+            }
+        }
+    }
+
+    impl<'c> Dsc<'c> for MaskOnLxlu {
+        type Latch = ();
+        type Mask = ();
+        type Switch = ();
+        type View = MaskOn;
+
+        fn cores(&self) -> &[Core] {
+            &self.cores
+        }
+
+        fn num_corelets_used(&self) -> u32 {
+            self.num_corelets_used
+        }
+
+        fn folds_needed(&self, comp: DfirUnit) -> bool {
+            self.folds_asked.borrow_mut().push(comp);
+            // ⛔ THE COLLAPSE, so the uniformized units come back with one fold.
+            false
+        }
+
+        fn view(&self, comp: DfirUnit, at: Viewed) -> Viewing<'c, Self> {
+            self.asked.borrow_mut().push((comp, at));
+            Viewing {
+                transfers: Vec::new(),
+                head_children: Vec::new(),
+                roots: MaskOn(comp == DfirUnit::Lxlu),
+            }
+        }
+    }
+
+    /// One component's roots: the stick mask, or none at all.
+    struct MaskOn(bool);
+
+    impl<'c> ScheduleView<'c> for MaskOn {
+        fn roots<'s>(self, _vals: &mut Values, _handles: UnitHandles<'s>) -> Vec<Scheduled<'s>>
+        where
+            'c: 's,
+        {
+            if self.0 {
+                vec![Scheduled::Leaf(Emitted::StickMask {
+                    view: mask_view(),
+                    name: "samv_0",
+                    format: DataType::Senint8,
+                    mask_value: 3,
+                })]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// The program both drivers below open.
+    fn program_name() -> ProgramName {
+        ProgramName {
+            group: GroupId(1),
+            index: OpIndex(0),
+            func: OpFunc::Add,
+        }
+    }
+
+    /// The two components every driver below walks: one the schedule has a root for, one it does not.
+    fn both_components() -> Used<DfirUnit> {
+        Used::of(DfirUnit::Lxlu, vec![DfirUnit::Sfp])
+    }
+
+    /// 🎯 108/110 — ⛔⛔ THE PRODUCT IS DSC × CORE × BOTH CORELETS × COMPONENT, and a component the
+    /// schedule names no root for leaves NO handle in the preamble.
+    ///
+    /// Iterating `numCoreletsUsed_DSC2_` corelets instead of two would build half the units; keeping
+    /// a rootless component's minted `get_unit` would put four dead handles in this one program.
+    #[test]
+    fn both_corelets_of_every_core_and_a_rootless_component_binds_nothing() {
+        let dsc = MaskOnLxlu::on(
+            vec![
+                Core::checked(0).expect("core 0"),
+                Core::checked(1).expect("core 1"),
+            ],
+            // ⛔ ONE CORELET, AND ENTRY 108 IGNORES IT.
+            1,
+        );
+        let mut vals = Values::default();
+        let converted: Converted<Dd2> = convert_v3(
+            &mut vals,
+            program_name(),
+            Grid::single(),
+            &both_components(),
+            &[NumFolds::ONE],
+            core::slice::from_ref(&dsc),
+        );
+
+        // TWO CORES × BOTH CORELETS × TWO COMPONENTS, component-innermost.
+        let asked = dsc.asked.borrow();
+        assert_eq!(asked.len(), 8);
+        let pair = |core, corelet| {
+            Viewed::OnPair(
+                Core::checked(core).expect("a core"),
+                Corelet::checked(corelet).expect("a corelet"),
+            )
+        };
+        assert_eq!(
+            asked[..4],
+            [
+                (DfirUnit::Lxlu, pair(0, 0)),
+                (DfirUnit::Sfp, pair(0, 0)),
+                (DfirUnit::Lxlu, pair(0, 1)),
+                (DfirUnit::Sfp, pair(0, 1)),
+            ]
+        );
+        assert_eq!(asked[4], (DfirUnit::Lxlu, pair(1, 0)));
+        // ⛔ ENTRY 108 NEVER CONSULTS ENTRY 043 — that is entry 109's alone.
+        assert!(dsc.folds_asked.borrow().is_empty());
+
+        let program = converted.program.expect("four units of one component");
+        let built: Vec<&ProgramUnit<Dd2>> = program.units.iter().collect();
+        assert_eq!(built.len(), 4);
+        assert!(built.iter().all(|unit| unit.on.kind() == DfirUnit::Lxlu));
+        // ⛔ FOUR HANDLES, NOT EIGHT: the SFP had no root, so nothing was bound for it.
+        assert_eq!(program.preamble.len(), 4);
+        assert!(
+            program
+                .preamble
+                .iter()
+                .all(|op| matches!(op, Op::Dataflow(dataflow::Op::GetUnit { .. })))
+        );
+        // ⭐ A PRODUCT OF ONE FOLD TAKES ENTRY 084'S ARM, which binds no region argument.
+        assert_eq!(converted.iterators, vec![None; 4]);
+        assert!(converted.raised.is_empty());
+    }
+
+    /// 🎯 109/110 — ⛔⛔ THE CORELET-1 PASS IS EXTRA AND UNCOLLAPSED: the uniformized unit asked entry
+    /// 043 and folded back to one, while the fix pass never asks and stays folded.
+    ///
+    /// Reading the pass as a fallback would replace the uniformized unit instead of adding to it;
+    /// running it for a DSC that already names both corelets would double every unit.
+    #[test]
+    fn the_corelet_one_fix_pass_is_extra_and_never_collapses_its_folds() {
+        let core = Core::checked(0).expect("core 0");
+        let dsc = MaskOnLxlu::on(vec![core], 1);
+        let mut vals = Values::default();
+        let converted: Converted<Dd2> = convert_v4(
+            &mut vals,
+            program_name(),
+            Grid::single(),
+            &both_components(),
+            &[NumFolds(2)],
+            core::slice::from_ref(&dsc),
+        );
+
+        assert_eq!(
+            *dsc.asked.borrow(),
+            vec![
+                (DfirUnit::Lxlu, Viewed::OverEveryPair),
+                (DfirUnit::Sfp, Viewed::OverEveryPair),
+                (DfirUnit::Lxlu, Viewed::OnPair(core, super::CORELET_ONE)),
+                (DfirUnit::Sfp, Viewed::OnPair(core, super::CORELET_ONE)),
+            ]
+        );
+        // ⛔ ASKED ONCE PER COMPONENT BY THE UNIFORMIZED PASS AND NEVER BY THE FIX PASS, even though
+        // that pass builds a unit of its own at the same fold product.
+        assert_eq!(
+            *dsc.folds_asked.borrow(),
+            vec![DfirUnit::Lxlu, DfirUnit::Sfp]
+        );
+
+        let program = converted.program.expect("two units on the one component");
+        let built: Vec<&ProgramUnit<Dd2>> = program.units.iter().collect();
+        assert_eq!(built.len(), 2);
+        // ⛔ ONE HANDLE COLLAPSED, TWO STILL FOLDED — `corelets_used(1)` × one core × one fold, then
+        // one core × corelet 1 × the uncollapsed two folds.
+        assert_eq!(built[0].on.vals().len(), 1);
+        assert_eq!(built[1].on.vals().len(), 2);
+        assert_eq!(program.preamble.len(), 2);
+        // ⭐ BOTH TOOK ENTRY 093'S ARM, so both name a region argument.
+        assert!(converted.iterators.iter().all(Option::is_some));
+
+        // ⛔ AND A DSC THAT ALREADY NAMES BOTH CORELETS GETS NO FIX PASS AT ALL.
+        let paired = MaskOnLxlu::on(vec![core], super::NUM_CORELETS);
+        let converted: Converted<Dd2> = convert_v4(
+            &mut vals,
+            program_name(),
+            Grid::single(),
+            &both_components(),
+            &[NumFolds(2)],
+            core::slice::from_ref(&paired),
+        );
+        assert_eq!(
+            *paired.asked.borrow(),
+            vec![
+                (DfirUnit::Lxlu, Viewed::OverEveryPair),
+                (DfirUnit::Sfp, Viewed::OverEveryPair),
+            ]
+        );
+        let units = converted.program.expect("the uniformized unit").units;
+        assert_eq!(units.iter().count(), 1);
     }
 }
