@@ -112,11 +112,13 @@ impl SimpleSetDstGenValueSfp {
         self.corelet
     }
 
-    /// The body of `SimpleSetDstGenValueSFP::print` (`SetSendDestinationRE.cpp:501`), which
-    /// [`e205`](super::set_dst_gen_value_sfp::SetDstGenValueSfp::print) delegates to.
+    /// Replaces: e206_print
     ///
-    /// ⛔ THE ANCHOR BELOW IS ANOTHER BATCH'S — e206 is not in this worklist, so its TODO stands;
-    /// that batch should attach `/// Replaces: e206_print` to THIS method.
+    /// The pair as `-debug-only=set-send-destination-re` dumps it;
+    /// [`e205`](super::set_dst_gen_value_sfp::SetDstGenValueSfp::print) delegates here.
+    ///
+    /// ⛔ THE REFERENCE'S `-1` SENTINEL CANNOT REACH THIS `print` — see the type: the ids are
+    /// arch-bounded, and the `Unknown` kind carries the uninitialised case.
     pub(crate) fn print(self, out: &mut String) {
         out.push_str("(GenValue: core_id<");
         out.push_str(&self.core.get().to_string());
@@ -126,6 +128,17 @@ impl SimpleSetDstGenValueSfp {
     }
 }
 
-// crustify:todo: e206_print
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:501  (4 body lines, level 0)
-//   original  : void SimpleSetDstGenValueSFP::print(raw_ostream &OS) const
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// e206 — both ids appear, each in its own angle brackets.
+    #[test]
+    fn e206_prints_the_core_and_the_corelet() {
+        let mut out = String::new();
+        let core = Core::checked(1).expect("every arch this crate builds for has core 1");
+        let corelet = Corelet::checked(0).expect("every core has corelet 0");
+        SimpleSetDstGenValueSfp::of(core, corelet).print(&mut out);
+        assert_eq!(out, "(GenValue: core_id<1>, corelet_id<0>)");
+    }
+}

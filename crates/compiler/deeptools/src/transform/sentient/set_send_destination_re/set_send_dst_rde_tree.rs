@@ -81,13 +81,77 @@
 //! | `e476_initializeDataflowInfo` | 476 | 2 | 8 | `dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:235` |
 
 
-// crustify:todo: e196_isOperationAUse
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:225  (5 body lines, level 0)
-//   original  : bool SetSendDstRDETree::isOperationAUse(const Operation &op) const
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so both items below are reachable only from this
+// file's own tests until `e583_runOnOperation` (level 4) lands and something calls it. CI runs clippy
+// with `-D warnings`, so without this the first ported leaf of the module fails the gate.
+// ⭐ REMOVE THIS WITH e583: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
-// crustify:todo: e197_isSimplifiable
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:308  (10 body lines, level 0)
-//   original  : bool SetSendDstRDETree::isSimplifiable(const RDENode &node) const
+use crate::islands::sentient::dialects::{Op, sentient};
+use crate::transform::sentient::analyses::RdeNode;
+
+/// Replaces: e196_isOperationAUse
+///
+/// The six ops that READ a send destination: the two sends and the four vector computes.
+#[must_use]
+pub(crate) fn is_operation_a_use(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::LoadAndSend { .. }
+                | sentient::Op::LoadComputeAndSend { .. }
+                | sentient::Op::VectorMac { .. }
+                | sentient::Op::VectorUnary { .. }
+                | sentient::Op::VectorBinary { .. }
+                | sentient::Op::VectorTernary { .. }
+        )
+    )
+}
+
+/// Replaces: e197_isSimplifiable
+///
+/// *"We would like to remove subtrees that do not contain any set_send_dst or load_and_send, mac,
+/// unary, binary, ternary operations"* (`:309-310`) — and that are a leaf, or a statically dead loop.
+///
+/// ⭐ [`RdeNode`] IS THE CAMPAIGN-WIDE SEAM: the tree class is `Analyses/` work and out of campaign
+/// scope, and all four RDE passes ask a node the same questions.
+///
+/// ⛔ TRAP: `sentient.load_compute_and_send` IS A USE (e196) AND STILL SIMPLIFIABLE HERE — the two
+/// `isa<>` lists differ by exactly that op (`:226-228` against `:311-313`). `simplify()` clears every
+/// simplifiable node (`Analyses/RedundantDefinitionEliminationTree.cpp:325-341`), so such a use leaves
+/// the tree and `deadDefOptimization`'s `sib->isUse()` guard
+/// (`Analyses/RedundantDefinitionEliminationTreeImpl.cpp:228`) can no longer fire for it. Ported as
+/// written — dbo-opt is this pipeline's oracle, so a "corrected" list would be the divergence.
+///
+/// ⛔ `isStaticallyDeadLoop` is `Analyses/` work and OUT OF CAMPAIGN SCOPE; the `||` short-circuits,
+/// so a leaf never reaches it.
+#[must_use]
+pub(crate) fn is_simplifiable(node: &RdeNode<'_>) -> bool {
+    let RdeNode::At { op, leaf } = node else {
+        // `getRoot() == &node` — the root is the only node without an operation.
+        return false;
+    };
+    if matches!(
+        op,
+        Op::Sentient(
+            sentient::Op::SetSendDst { .. }
+                | sentient::Op::LoadAndSend { .. }
+                | sentient::Op::VectorMac { .. }
+                | sentient::Op::VectorUnary { .. }
+                | sentient::Op::VectorBinary { .. }
+                | sentient::Op::VectorTernary { .. }
+        )
+    ) {
+        return false;
+    }
+    if *leaf {
+        return true;
+    }
+    todo!(
+        "RedundantDefinitionEliminationTree::isStaticallyDeadLoop \
+         (Analyses/RedundantDefinitionEliminationTree.hpp:247) — out of campaign scope"
+    )
+}
 
 // crustify:todo: e379_initializeDataflowInfoForLXLU
 //   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:244  (32 body lines, level 1)
@@ -104,3 +168,78 @@
 //   original  : void SetSendDstRDETree::initializeDataflowInfo(RDENode *node)
 //   calls     : e379_initializeDataflowInfoForLXLU, e380_initializeDataflowInfoForSFP
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::link::{L0su as L0suUnit, Link, Lxlu as LxluUnit};
+    use crate::islands::sentient::dialects::Val;
+
+    /// `sentient.load_compute_and_send` — the op the two `isa<>` lists disagree about.
+    fn load_compute_and_send() -> Op {
+        Op::Sentient(sentient::Op::LoadComputeAndSend {
+            mutable_addr: Val(1),
+            immutable_addr: Val(2),
+            increment: Val(3),
+            element_index: Val(4),
+            scale_index: Val(5),
+            consumer: Link::<LxluUnit, L0suUnit>::between(Val(6), Val(7)).ends().0,
+            result: Val(8),
+            src_total_elements: Elements(32),
+            dst_total_elements: Elements(32),
+            src_element_size: Bits(16),
+            dst_element_size: Bits(16),
+            dir: None,
+            shuffle_mode: sentient::ShuffleMode::NoShuffle,
+            reg: sentient::Reg {
+                locale: sentient::RegType::Unknown,
+                index: None,
+            },
+            dbg_name: None,
+        })
+    }
+
+    /// `sentient.set_send_dst` — the definition the tree exists to place.
+    fn set_send_dst() -> Op {
+        Op::Sentient(sentient::Op::SetSendDst {
+            units: Link::<LxluUnit, L0suUnit>::between(Val(6), Val(7)).ends().0,
+        })
+    }
+
+    /// `sentient.nop` — in neither list.
+    fn nop() -> Op {
+        Op::Sentient(sentient::Op::Nop { dbg_name: None })
+    }
+
+    /// e196 — a send is a use; the definition it places, and an op in neither list, are not.
+    #[test]
+    fn e196_only_the_sends_and_the_computes_are_uses() {
+        assert!(is_operation_a_use(&load_compute_and_send()));
+        assert!(!is_operation_a_use(&set_send_dst()));
+        assert!(!is_operation_a_use(&nop()));
+    }
+
+    /// e197 — the root and a `set_send_dst` stay; a leaf in neither list goes; and so does a
+    /// `load_compute_and_send`, which e196 calls a USE. That last one is the asymmetry, witnessed.
+    #[test]
+    fn e197_a_load_compute_and_send_leaf_is_simplifiable_though_it_is_a_use() {
+        assert!(!is_simplifiable(&RdeNode::Root));
+        let def = set_send_dst();
+        assert!(!is_simplifiable(&RdeNode::At {
+            op: &def,
+            leaf: true
+        }));
+        let other = nop();
+        assert!(is_simplifiable(&RdeNode::At {
+            op: &other,
+            leaf: true
+        }));
+        let use_op = load_compute_and_send();
+        assert!(is_operation_a_use(&use_op));
+        assert!(is_simplifiable(&RdeNode::At {
+            op: &use_op,
+            leaf: true
+        }));
+    }
+}

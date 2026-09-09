@@ -116,12 +116,10 @@ impl SimpleSetDstGenValueLxlu {
         self.value
     }
 
-    /// The body of `SimpleSetDstGenValueLXLU::print` (`SetSendDestinationRE.cpp:393`), which
-    /// [`e200`](super::set_dst_gen_value_lxlu::SetDstGenValueLxlu::print) delegates to.
+    /// Replaces: e201_print
     ///
-    /// ⛔ THE ANCHOR ABOVE IS ANOTHER BATCH'S — e201 is not in this worklist, so its TODO stands.
-    /// The batch that owns it should attach `/// Replaces: e201_print` to THIS method rather than add
-    /// a second one; a duplicate would be a second, disagreeing rendering.
+    /// One destination, one name, as `-debug-only=set-send-destination-re` dumps it;
+    /// [`e200`](super::set_dst_gen_value_lxlu::SetDstGenValueLxlu::print) delegates here.
     ///
     /// ⛔ THE `default:` ARM PRINTING `"(GenValue: Unknown)"` (`:404-406`) IS UNREPRESENTABLE — see
     /// [`SendDestination`]. `SetDstGenValueLxlu` prints that text from its own `Unknown` kind.
@@ -134,6 +132,17 @@ impl SimpleSetDstGenValueLxlu {
     }
 }
 
-// crustify:todo: e201_print
-//   authority : dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:393  (16 body lines, level 0)
-//   original  : void SimpleSetDstGenValueLXLU::print(raw_ostream &OS) const
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// e201 — each destination has its own text, and the unrepresentable fourth one prints nowhere.
+    #[test]
+    fn e201_prints_one_name_per_destination() {
+        let mut out = String::new();
+        SimpleSetDstGenValueLxlu::of(SendDestination::Pt).print(&mut out);
+        SimpleSetDstGenValueLxlu::of(SendDestination::Sfp).print(&mut out);
+        SimpleSetDstGenValueLxlu::of(SendDestination::L0su).print(&mut out);
+        assert_eq!(out, "(GenValue: PT)(GenValue: SFP)(GenValue: L0SU)");
+    }
+}

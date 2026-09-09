@@ -77,7 +77,224 @@
 //! | `e208_runOnOperation` | 208 | 0 | 51 | `dcc/src/Transform/Sentient/SimplifyUniformRegions.cpp:55` |
 
 
-// crustify:todo: e208_runOnOperation
-//   authority : dcc/src/Transform/Sentient/SimplifyUniformRegions.cpp:55  (51 body lines, level 0)
-//   original  : void SimplifyUniformRegionsPass::runOnOperation()
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so everything below is reachable only from this
+// file's own tests until a pipeline calls it. CI runs clippy with `-D warnings`, so without this the
+// module's first ported unit fails the gate.
+// ⭐ REMOVE THIS WHEN THE PASS IS WIRED: at that point an unused item here is a real defect again.
+#![allow(dead_code)]
 
+use crate::arch::Arch;
+use crate::islands::sentient::Program;
+use crate::islands::sentient::dialects::{self, Op, uniform};
+use crate::model::Model;
+use crate::workload::Workload;
+
+/// `-dcc-simplify-uniform-regions-disable`, `cl::init(false)` (`SimplifyUniformRegions.cpp:36-39`).
+const DISABLE_THIS_PASS: bool = false;
+
+/// Replaces: e208_runOnOperation
+///
+/// Four walks: flatten every uniform region in the module; per program unit merge its local ops and —
+/// unless disabled — drop the empty and the unnecessary ones and simplify the rest; then canonicalise
+/// every query map.
+///
+/// ⛔ ALL SIX CALLEES ARE `dcc/src/Dialect/Uniform/Utils.cpp` AND OUT OF CAMPAIGN SCOPE, so the
+/// traversal, the ordering and the `DisableThisPass` gate are ported and each call site is a `todo!`
+/// naming its authority line. ⭐ TWO OF THEM ARE ALREADY PORTED ONE RUNG DOWN — bridge 2's private
+/// `flatten_uniform_region` and `simplify_query_map_with_same_target` — but both take a
+/// `dataflow_ir::dialects::Op` and the first mints values from a `Values` this rung's [`Program`] does
+/// not carry, so calling them from here is its own change and not this unit's.
+///
+/// ⛔ TRAP: EVERY `WalkResult::skip()` IN THE REFERENCE IS INERT. `Operation::walk` defaults to
+/// `WalkOrder::PostOrder` (`mlir/IR/Visitors.h:272`), which calls back only AFTER the nested regions
+/// have been walked (`:224-245`), so nothing is pruned and a nested uniform op is visited FIRST.
+///
+/// ⭐ `dcc::getUnitType(prog_unit_op)` NEEDS NO WALK: [`crate::islands::dataflow_ir::Units`] binds the
+/// kind to the unit list, so `unit.on.kind()` is the answer.
+pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Program<A, M, W>) {
+    // THE FIRST WALK (`:57-61`) — the whole module, so the preamble as well as every unit body.
+    let mut flatten = |op: &Op| {
+        if is_uniformize_regions(op) {
+            todo!(
+                "dcc::uniform::utils::flattenUniformRegion (Dialect/Uniform/Utils.cpp:563) — out of \
+                 campaign scope; bridge 2 ports it at the DataflowIR rung as the private \
+                 `flatten_uniform_region`, which mints values from a `Values` this rung does not carry"
+            )
+        }
+    };
+    walk_post_order(&program.preamble, &mut flatten);
+    for unit in program.units.iter() {
+        walk_post_order(&unit.body, &mut flatten);
+    }
+
+    // THE SECOND WALK (`:62-101`) — per `dataflow.program_unit`.
+    for unit in program.units.iter() {
+        // `mergeAllLocalOps(prog_unit_op)` (`:64`) is ITSELF a walk (`Utils.cpp:1239-1259`) whose body
+        // fires only on a local op, so a unit holding none is genuinely untouched and the seam is
+        // where the sister-merging loop would begin.
+        walk_post_order(&unit.body, &mut |op| {
+            if is_local_op(op) {
+                todo!(
+                    "dcc::uniform::utils::{{mergeLocalOps,getNextSisterOperation}} \
+                     (Dialect/Uniform/Utils.cpp:1187,1164) — out of campaign scope: \
+                     `mergeAllLocalOps`' merge of this unit's consecutive local ops (`:1239-1259`)"
+                )
+            }
+        });
+
+        if !DISABLE_THIS_PASS {
+            walk_post_order(&unit.body, &mut |op| {
+                if is_uniformize_regions(op) {
+                    todo!(
+                        "dcc::uniform::utils::removeEmptyLocalRegions \
+                         (Dialect/Uniform/Utils.cpp:1023) — out of campaign scope"
+                    )
+                }
+            });
+            walk_post_order(&unit.body, &mut |op| {
+                if is_uniformize_regions(op) {
+                    todo!(
+                        "dcc::uniform::utils::removeNotNecessaryLocalRegions \
+                         (Dialect/Uniform/Utils.cpp:1007) — out of campaign scope: promoting a local \
+                         region's operations to global where it can"
+                    )
+                }
+            });
+
+            // ⭐ `PropagationAnalysis` IS NOT NEEDED HERE, and the reference is why: its lookup is
+            // COMMENTED OUT (`:81-86`) and `simplifyUniformRegions` is passed `nullptr` (`:92`).
+            let comp = unit.on.kind();
+            walk_post_order(&unit.body, &mut |op| {
+                if is_local_op(op) {
+                    todo!(
+                        "dcc::uniform::utils::simplifyUniformRegions \
+                         (Dialect/Uniform/Utils.cpp:994) — out of campaign scope: the whole \
+                         UniformRegionSimplicationHelper over this {comp:?} unit's local op, with no \
+                         propagation analysis (SimplifyUniformRegions.cpp:88-93)"
+                    )
+                }
+            });
+        }
+    }
+
+    // THE THIRD WALK (`:102-104`) — every `uniform.query_map` in the module.
+    let mut simplify_query_maps = |op: &Op| {
+        if matches!(op, Op::Uniform(uniform::Op::QueryMap { .. })) {
+            todo!(
+                "dcc::uniform::utils::simplifyQueryMapWithSameTarget \
+                 (Dialect/Uniform/Utils.cpp:1263) — out of campaign scope; bridge 2 ports it at the \
+                 DataflowIR rung as the private `simplify_query_map_with_same_target`"
+            )
+        }
+    };
+    walk_post_order(&program.preamble, &mut simplify_query_maps);
+    for unit in program.units.iter() {
+        walk_post_order(&unit.body, &mut simplify_query_maps);
+    }
+}
+
+/// `llvm::dyn_cast<uniform::UniformizeRegionsOp>(op)` (`:58`), which three of the four walks test for.
+fn is_uniformize_regions(op: &Op) -> bool {
+    matches!(op, Op::Uniform(uniform::Op::UniformizeRegions { .. }))
+}
+
+/// `isa<uniform::UniformizeRegionsOp, uniform::EqualizePatternOp>(op)` — the pair the merge
+/// (`Utils.cpp:1241-1243`) and `simplifyUniformRegions` (`:90`) both accept.
+fn is_local_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Uniform(uniform::Op::UniformizeRegions { .. } | uniform::Op::EqualizePattern { .. })
+    )
+}
+
+/// `Operation::walk` IN ITS DEFAULT `WalkOrder::PostOrder` — nested first, then the op itself.
+///
+/// ⛔ A SHARED DIALECT'S REGION HOLDS RUNG-BELOW OPS AND CANNOT BE ENTERED FROM HERE — see
+/// [`dialects::regions_ref`]. A `uniform.uniformize_regions`' body is one of those, which is the same
+/// reason the two ported utils live at the DataflowIR rung.
+fn walk_post_order(scope: &[Op], visit: &mut impl FnMut(&Op)) {
+    for op in scope {
+        for region in dialects::regions_ref(op) {
+            walk_post_order(region, visit);
+        }
+        visit(op);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::dialects::{Val, sentient};
+    use crate::islands::sentient::{ProgramUnit, ProgramUnits};
+    use crate::units::DfirUnit;
+
+    /// A model, so the program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// A one-unit program running `body`.
+    fn program(body: Vec<Op>) -> Program<Dd2, AnyModel, AnyRung> {
+        Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::Lxlu, Val(0)),
+                    precision: None,
+                    body,
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        }
+    }
+
+    /// e208 — the module walk comes first, so a program holding a local region stops at the flatten.
+    #[test]
+    #[should_panic(expected = "flattenUniformRegion")]
+    fn e208_flattens_before_it_merges() {
+        let mut held = program(vec![Op::Uniform(uniform::Op::UniformizeRegions {
+            regions: Vec::new(),
+            results: Vec::new(),
+        })]);
+        run_on_program(&mut held);
+    }
+
+    /// e208 — a program with no uniform op anywhere runs all four walks to completion and changes
+    /// nothing, because every one of them fires only on a `uniform` op.
+    #[test]
+    fn e208_leaves_a_program_with_no_uniform_op_alone() {
+        let nop = Op::Sentient(sentient::Op::Nop { dbg_name: None });
+        let mut plain = program(vec![nop.clone()]);
+        run_on_program(&mut plain);
+        assert_eq!(
+            plain.units.iter().next().expect("the head unit").body,
+            vec![nop]
+        );
+    }
+}
