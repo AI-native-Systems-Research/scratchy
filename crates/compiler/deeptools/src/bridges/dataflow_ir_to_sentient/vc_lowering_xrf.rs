@@ -3576,7 +3576,7 @@ fn mark_and_rebuild(region: &mut Vec<sen::Op>, scope: &[DfirOp], vals: &mut Valu
     marks_owner
 }
 
-/// `checkAndAddToRegionOpMap` OVER A STABLE BODY — step 4's *"reflll after forOp clone"* (`:626`),
+/// `checkAndAddToRegionOpMap` OVER A STABLE BODY — step 4's *"reflll after forOp clone"* (`:625`),
 /// whose answers are the POSITIONS entry 345 looks `region_ops_with_xrf_access` up by.
 fn mark_regions(
     body: &[sen::Op],
@@ -3618,9 +3618,9 @@ fn mark_regions(
 ///
 /// **367/384** `LoweringXRF::createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564` (97L).
 ///
-/// ⛔ SIX WALKS, AND THE FOURTH REPEATS THE SECOND — *"reflll after forOp clone"* (`:626`): the
+/// ⛔ FIVE WALKS, AND THE FOURTH REPEATS THE SECOND — *"reflll after forOp clone"* (`:625`): the
 /// rebuild erases every mark it consumed, so the regions entry 345 reads are the ones measured over
-/// the FINISHED body. ⛔ `emitError("XRF accesses are illegal")` (`:655`) LEAVES THE MAP
+/// the FINISHED body. ⛔ `emitError("XRF accesses are illegal")` (`:657`) LEAVES THE MAP
 /// DEFAULT-CONSTRUCTED — an empty map is a FAILED pass here, not an absent one — and
 /// `DT_CHECK(comp == PT)` is unrepresentable for [`compute_unit_precision`](super::vc_vector_chain_to_sentient_pt::compute_unit_precision)'s reason.
 /// ⛔ See [`XrfCensus`] for the two rungs one walk has to answer on.
@@ -3645,11 +3645,11 @@ pub fn create_xrf_index_modif_ops<A: Arch>(
         return XrfPtrMap::new();
     }
 
-    // `:608-624` — *"find out which forOp needs to be recreated to add xrf iter_args"*, then
+    // `:607-623` — *"find out which forOp needs to be recreated to add xrf iter_args"*, then
     // *"add iter_args and return values for forop loops"*.
     mark_and_rebuild(body, &census.dfir, vals);
 
-    // `:626-628` and `:630-646` — the refill and the access census, over the rebuilt body.
+    // `:625-627` and `:629-648` — the refill and the access census, over the rebuilt body.
     let census = {
         let mut census = XrfCensus::default();
         take_census(body, &[], 0, &[], &mut census);
@@ -3674,7 +3674,7 @@ pub fn create_xrf_index_modif_ops<A: Arch>(
         let Some(stick_elem_num) = stick_elem_num::<A>(access.ty) else {
             todo!(
                 "createXrfIndexModifOps: DT_CHECK_MSG(stick_elem_num != -1, \"Could not compute \
-                 stick element number\") on a {:?} access (LoweringXRF.cpp:637-639)",
+                 stick element number\") on a {:?} access (LoweringXRF.cpp:638-639)",
                 access.ty
             );
         };
@@ -3691,7 +3691,7 @@ pub fn create_xrf_index_modif_ops<A: Arch>(
         };
     }
 
-    // *"insert xrf ptr manipulation operations"* (`:648-657`).
+    // *"insert xrf ptr manipulation operations"* (`:650-659`).
     if expr_maps.write.is_empty() && expr_maps.read.is_empty() {
         return XrfPtrMap::new();
     }

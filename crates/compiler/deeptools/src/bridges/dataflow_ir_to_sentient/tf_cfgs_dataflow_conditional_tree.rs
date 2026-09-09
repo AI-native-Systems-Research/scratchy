@@ -3017,10 +3017,10 @@ fn in_subtree(root: &DfirOp, needle: &DfirOp) -> bool {
 /// block share a top-level condition and nothing strictly between them blocks the splice.
 ///
 /// ⛔⛔ `is_between_if_ops` IS SET AFTER THE `break`, SO A BACKWARDS PAIR IS VACUOUSLY MERGEABLE
-/// (`:357-359`, `:376`): if `if_op1` stands BEFORE `if_op0` the walk breaks at `if_op1` while the flag
+/// (`:357-359`, `:375`): if `if_op1` stands BEFORE `if_op0` the walk breaks at `if_op1` while the flag
 /// is still false, and the answer is `true` with nothing checked. Entry 380 only ever offers a LATER
 /// sibling, so no caller in bridge 2 reaches it.
-/// ⛔ THE EXEMPTION READS OPERAND 0 BEFORE ASKING WHETHER `if_op1` IS AN `scf.if` (`:369-370`), so an
+/// ⛔ THE EXEMPTION READS OPERAND 0 BEFORE ASKING WHETHER `if_op1` IS AN `scf.if` (`:367-368`), so an
 /// operandless `affine.if` indexes out of range there; `operands(..).first()` is `None`, which makes
 /// the left disjunct true — the same answer the `!isa<scf::IfOp>` on its right already gives.
 /// ⚠️ `DT_CHECK_MSG(if_op0 != if_op1, ..)` is `false`: a conditional cannot be merged with itself.
@@ -3051,10 +3051,10 @@ pub fn are_shallowly_mergeable(
         return false;
     }
 
-    // `:355-356` — *"Check that the ops strictly between if_op0, if_op1 have no side-effects and no
+    // `:353-356` — *"Check that the ops strictly between if_op0, if_op1 have no side-effects and no
     // uses inside of if_op1."*
     let mut is_between_if_ops = false;
-    // `:369` — `if_op1->getOperand(0).getDefiningOp()`, hoisted out of the loop because it does not
+    // `:367` — `if_op1->getOperand(0).getDefiningOp()`, hoisted out of the loop because it does not
     // depend on `op`. See this function's second trap for the out-of-range read.
     let cond_def = dfir_op::operands(if_op1)
         .first()
@@ -3065,16 +3065,16 @@ pub fn are_shallowly_mergeable(
             break;
         }
         if is_between_if_ops {
-            // `:360`
+            // `:359`
             if op_has_side_effect(op) {
                 return false;
             }
-            // `:368-370` — the condition `if_op1` branches on is allowed to be one of these ops,
+            // `:367-368` — the condition `if_op1` branches on is allowed to be one of these ops,
             // because `if_op0` has an equivalent condition standing before it.
             let is_exempt_condition = matches!(cond_def, Some(def) if core::ptr::eq(def, op))
                 && matches!(ConditionalKind::of(if_op1), Some(ConditionalKind::Scf));
             if !is_exempt_condition {
-                // `:371-375` — every use of `op`, up its owner's parent chain to `op`'s own parent.
+                // `:369-373` — every use of `op`, up its owner's parent chain to `op`'s own parent.
                 for result in dfir_op::results(op) {
                     if dfir_op::uses(result, block)
                         .into_iter()
@@ -3085,12 +3085,12 @@ pub fn are_shallowly_mergeable(
                 }
             }
         }
-        // `:376`
+        // `:375`
         if core::ptr::eq(op, if_op0) {
             is_between_if_ops = true;
         }
     }
-    // `:378`
+    // `:377`
     true
 }
 
@@ -3130,11 +3130,11 @@ fn enclosing_op<'a>(ops: &'a [DfirOp], needle: &DfirOp) -> Option<&'a DfirOp> {
 /// result-yielding, loop-invariant conditional whose one result only feeds a
 /// `dataflow.get_logical_memory_view` or a `dataflow.send`/`receive` out of its enclosing loop.
 ///
-/// ⛔⛔ THE LAMBDA CAN NEVER ANSWER NON-NULL: every exit from `while (1)` (`:777-789`) is
+/// ⛔⛔ THE LAMBDA CAN NEVER ANSWER NON-NULL: every exit from `while (1)` (`:778-788`) is
 /// `return nullptr`, so the reverse-BFS walk's early-stop is unreachable and the hoist loop ends only
 /// when the parent stops being a loop or invariance fails. That is why this is a `for` over every
 /// candidate rather than a walk that stops at the first hit.
-/// ⛔ `n->isLeaf()` (`:762`) IS DEAD, for the reason entry 380 records; `isThenNode()`/`isElseNode()`
+/// ⛔ `n->isLeaf()` (`:761`) IS DEAD, for the reason entry 380 records; `isThenNode()`/`isElseNode()`
 /// have no counterpart in a representation where only conditionals are nodes.
 /// ⚠️ AN `affine.if` NODE IS NOT HOISTED: `isLoopInvariant`'s `DT_CHECK_MSG(scf_if, ..)` (`:686`)
 /// aborts on one, and entry 349 answers "not invariant" there.
@@ -3143,7 +3143,7 @@ fn enclosing_op<'a>(ops: &'a [DfirOp], needle: &DfirOp) -> Option<&'a DfirOp> {
 pub fn hoist_loop_invariant_conditionals<A: Arch>(tree: &CfgsDataflowConditionalTree<'_, A>) {
     let body = &tree.unit.body;
     for n in reverse_bfs_candidates(body) {
-        // `:766-768` — `DT_CHECK_MSG(n_if_op, ..)` is discharged by the node BEING the op here, and
+        // `:765-766` — `DT_CHECK_MSG(n_if_op, ..)` is discharged by the node BEING the op here, and
         // `getNumResults() != 1` is the "result-yielding" half of the pattern.
         let results = dfir_op::results(n);
         let [result] = results.as_slice() else {
@@ -3151,7 +3151,7 @@ pub fn hoist_loop_invariant_conditionals<A: Arch>(tree: &CfgsDataflowConditional
         };
         let result = *result;
 
-        // `:770-775` — *"Restrict hoisting to IfOps only used in get_logical_mem_view or
+        // `:768-773` — *"Restrict hoisting to IfOps only used in get_logical_mem_view or
         // dataflow.send/receive."* ⭐ A CONDITIONAL WITH NO USERS PASSES, which is the `for`'s own
         // answer over an empty list.
         if !dfir_op::uses(result, body).into_iter().all(|user| {
@@ -3167,7 +3167,7 @@ pub fn hoist_loop_invariant_conditionals<A: Arch>(tree: &CfgsDataflowConditional
             continue;
         }
 
-        // `:779-789` — `while (1)`, whose first two exits are the loop's own termination conditions.
+        // `:778-788` — `while (1)`, whose first two exits are the loop's own termination conditions.
         let Some(parent_for_op) = enclosing_op(body, n) else {
             continue;
         };
@@ -3177,7 +3177,7 @@ pub fn hoist_loop_invariant_conditionals<A: Arch>(tree: &CfgsDataflowConditional
         ) {
             continue;
         }
-        // `:784` — and the `affine.if` case, which entry 349 answers `false` for.
+        // `:783` — and the `affine.if` case, which entry 349 answers `false` for.
         let Some(scf_if) = ScfConditional::of(n) else {
             continue;
         };
@@ -3185,7 +3185,7 @@ pub fn hoist_loop_invariant_conditionals<A: Arch>(tree: &CfgsDataflowConditional
             continue;
         }
 
-        // `:787` — *"Move n_if_op and its ancestors which do not dominate parent_for_op to right
+        // `:785-787` — *"Move n_if_op and its ancestors which do not dominate parent_for_op to right
         // before parent_for_op."*
         todo!(
             "moveAncestorsToMaintainDominance is unported, so e371_hoistLoopInvariantConditionals \

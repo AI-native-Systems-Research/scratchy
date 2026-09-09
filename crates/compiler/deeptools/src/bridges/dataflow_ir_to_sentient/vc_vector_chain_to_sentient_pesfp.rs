@@ -546,7 +546,7 @@ pub enum FusionOutcome {
     /// `symbolizeSentientComputePort(…).value()` and `symbolizeSentientPrecision(…).value()`
     /// (`:274-285`, `:296-305`) on a port or precision with no spelling — an EMPTY `opA`, `opC` or
     /// result precision is the one that is reachable, and `getSentientFoldModeAttrForOperation`'s own
-    /// `llvm_unreachable` (`Utils.cpp:452`) arrives here too.
+    /// `llvm_unreachable` (`Sentient/Utils.cpp:450-451`) arrives here too.
     Unrepresentable,
 }
 
@@ -618,8 +618,8 @@ pub fn pattern_agnostic_fuse_non_compute_ops_helper<A: Arch>(
     reuse_info.set_reuse_information(op, &mut from_operands, scope);
 
     // `if (VectorOperand::sameBlock(op, to_operands).succeeded())`, whose `else` is the `emitError` at
-    // `:313-317`. The LIST overload (`VectorOperands.cpp:670`) is `.all()` over the single-operand
-    // one — an empty list succeeds, and an ABSENT operand fails.
+    // `:313-317`. ⛔ THE LIST OVERLOAD (`VectorOperands.cpp:670-685`) DUPLICATES the single-operand
+    // one's body rather than delegating to it — an empty list succeeds, and an ABSENT operand fails.
     if !analysis
         .to_operands
         .iter()
@@ -628,7 +628,7 @@ pub fn pattern_agnostic_fuse_non_compute_ops_helper<A: Arch>(
         return refused(FusionOutcome::NotSameBlock);
     }
     // ⭐ WHICH IS WHY THE UNGUARDED `to.value()`s AT `:160` AND `:211` CANNOT FIRE: `sameBlock`'s
-    // `else { return failure(); }` (`VectorOperands.cpp:657`) already refused an absent operand, so
+    // `else { return failure(); }` (`VectorOperands.cpp:679-681`) already refused an absent operand, so
     // this `flatten` drops nothing and the lengths `:154` and `:174` test are the same lengths.
     let to_operands: Vec<&VectorOperand> = analysis.to_operands.iter().flatten().collect();
 
@@ -775,8 +775,11 @@ pub fn pattern_agnostic_fuse_non_compute_ops_helper<A: Arch>(
                 at = InsertAt::After(to.op.clone());
                 // `auto send_op = llvm::dyn_cast<dataflow::SendOp>(to.value().op_);
                 //  sentient::SetSendDestinationOp::create(rewriter, op->getLoc(),
-                //  send_op.getToUnit());` — ⛔ THE `dyn_cast` IS UNCHECKED, and only a send can name
-                // `sfpring` (`VectorOperands.cpp:113-131`); a position that is not one is a stop.
+                //  send_op.getToUnit());` — ⛔ THE `dyn_cast` IS UNCHECKED, and what makes it safe is
+                // that a destination can only ever be a send or a store
+                // (`VectorChainHelper.cpp:619-621`, `:671-674`) — ⛔ NOT that only a send names
+                // `sfpring`: the RECEIVE side names it too (`VectorOperands.cpp:70-76`, `link +=
+                // "ring"` at `:74`; the send side is `:121-129`).
                 let Some(DfirOp::Dataflow(dataflow::Op::Send { to: units, .. })) =
                     op_at(&to.op, scope)
                 else {
@@ -2403,7 +2406,7 @@ pub enum FilledOpInfo {
     /// affine set, which is entry 229's only refusal.
     MaskHasNoConstantValue(OpId),
     /// The op has fewer than one operand, so `from_operands_[0]` is out of range — the reference
-    /// indexes it unguarded (`:1097`).
+    /// indexes it unguarded (`:1099`).
     NoOperands,
 }
 
@@ -2417,7 +2420,7 @@ pub enum FilledOpInfo {
 /// parameter and not `op->getNumOperands()`: a masked binary has three operands and `num_operands` is
 /// two. ⛔ A `vectorchain.shuffle` is the exception and reads `getMask()` instead (`:1082-1090`),
 /// because its two VARIADIC operand groups sit between the input and the mask.
-/// ⛔ `opB`/`opC` PRECISION FALL BACK TO THE **COMPUTE** PRECISION, NOT TO EMPTY (`:1145-1152`) — a
+/// ⛔ `opB`/`opC` PRECISION FALL BACK TO THE **COMPUTE** PRECISION, NOT TO EMPTY (`:1144-1153`) — a
 /// unary op's B and C slots carry the compute precision on the wire.
 /// ⚠️ A MASK BOUND BY A REGION ARGUMENT: the reference stores a NULL `Operation*` in a live
 /// `std::optional` and dereferences it in entry 229; `defining_position` answers [`None`], which takes
@@ -2430,7 +2433,7 @@ pub fn fill_op_info<A: Arch>(
     scope: &[DfirOp],
     values: &mut Values,
 ) -> FilledOpInfo {
-    // `:1077-1081` — `for (int i = 0; i < num_operands; i++)`, each through entry 320.
+    // `:1076-1080` — `for (int i = 0; i < num_operands; i++)`, each through entry 320.
     let reads = op_operands(op);
     let mut from_operands: Vec<Option<VectorOperand>> = Vec::new();
     for read in reads.iter().take(num_operands) {
@@ -2452,7 +2455,7 @@ pub fn fill_op_info<A: Arch>(
         _ => None,
     };
 
-    // `:1096-1112` — entry 340 on operand 0, then on 1 and 2 only if the list is that long. ⛔ THE
+    // `:1098-1112` — entry 340 on operand 0, then on 1 and 2 only if the list is that long. ⛔ THE
     // FIRST CALL IS UNGUARDED, so an op with no operands indexes out of range there.
     if from_operands.is_empty() {
         return FilledOpInfo::NoOperands;
@@ -2483,7 +2486,7 @@ pub fn fill_op_info<A: Arch>(
         );
     }
 
-    // `:1117-1125` — *"If no mask info is attached to the op, use the default mask, 0."*
+    // `:1114-1124` — *"If no mask info is attached to the op, use the default mask, 0."*
     let mask_vc_op = mask_operand
         .as_ref()
         .and_then(|mask| op_at(mask, scope))
@@ -2494,7 +2497,7 @@ pub fn fill_op_info<A: Arch>(
     let (mask_val, mask_op) = match mask_vc_op {
         Some(mask) => match get_mask_value_for_non_pt::<A>(mask, values) {
             Some(mask) => (mask.value, mask.op),
-            // `:1125` — `if (!op_info.mask_val_.has_value()) return failure();`
+            // `:1124` — `if (!op_info.mask_val_.has_value()) return failure();`
             None => {
                 return FilledOpInfo::MaskHasNoConstantValue(at.clone());
             }
@@ -2515,7 +2518,7 @@ pub fn fill_op_info<A: Arch>(
         }
     };
 
-    // `:1127-1129` — entry 342.
+    // `:1126-1128` — entry 342.
     let mut to_operands: Vec<Option<VectorOperand>> = Vec::new();
     let mut result_forwarding: Vec<sentient::Port> = Vec::new();
     let mut logical_result_forwarding: Option<sentient::Port> = None;
@@ -2530,7 +2533,7 @@ pub fn fill_op_info<A: Arch>(
         &mut set_send_dst,
     );
 
-    // `:1131-1132` — entries 061 and 062.
+    // `:1130-1132` — entries 061 and 062.
     let mut result_precision = result_precision_from_operands(&to_operands);
     let compute_precision = compute_precision_of_op(op);
     // `:1135-1136` — *"If no result forwarding, set result_precision to default precision."*
@@ -2539,7 +2542,7 @@ pub fn fill_op_info<A: Arch>(
     }
 
     FilledOpInfo::Filled(OpInfo {
-        // `:1145-1152` — and the compute precision is what an absent B or C slot carries.
+        // `:1144-1153` — and the compute precision is what an absent B or C slot carries.
         op_a_precision: from_operands[0]
             .as_ref()
             .and_then(input_precision_from_operand),
@@ -2567,7 +2570,7 @@ pub fn fill_op_info<A: Arch>(
         // `:1139` — `getSentientFoldModeAttrForOperation(op, comp)` at the declaration's
         // `sen1p5_receive_from_pt = false`; only entry 364 passes `true`.
         fold_mode_attr: fold_mode_attr_for_operation(op, comp, false),
-        // `:1154` — `dataflow::getDbgNameAttr(op)`.
+        // `:1155` — `dataflow::getDbgNameAttr(op)`.
         op_dbg_name: dbg_name(op).map(str::to_owned),
     })
 }
@@ -2583,12 +2586,12 @@ pub fn fill_op_info<A: Arch>(
 /// target is [`NonComputeLegality::Dynamic`]'s callback over three op classes.
 /// ⭐ `vectorchain` IS LEGAL HERE (`:1180`) and absent from [`LEGAL_DIALECTS`] — the non-compute half
 /// runs FIRST (`:1391`, `:1393`), so the computes it must not touch are declared legal outright,
-/// while `agen`, `trace` and `dataflow` are enumerated op by op (`:1185-1197`).
+/// while `agen`, `trace` and `dataflow` are enumerated op by op (`:1183-1197`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NonComputeLegality {
     /// `addLegalDialect` or one of the three `addLegalOp` lists names it.
     Legal,
-    /// `addDynamicallyLegalOp<dataflow::SendOp, vector::StoreOp, agen::VectorStoreOp>` (`:1234-1236`).
+    /// `addDynamicallyLegalOp<dataflow::SendOp, vector::StoreOp, agen::VectorStoreOp>` (`:1232-1234`).
     Dynamic,
     /// Named by neither list: partial conversion offers it to the patterns and leaves it alone.
     Unnamed,
@@ -2599,18 +2602,18 @@ pub enum NonComputeLegality {
 #[must_use]
 pub fn non_compute_legality(op: &DfirOp) -> NonComputeLegality {
     match op {
-        // ── the three dynamically legal ops (`:1234-1236`) ────────────────────────────────────────
+        // ── the three dynamically legal ops (`:1232-1234`) ────────────────────────────────────────
         DfirOp::Dataflow(dataflow::Op::Send { .. })
         | DfirOp::Vector(vector::Op::Store { .. })
         | DfirOp::Agen(agen::Op::VectorStore { .. }) => NonComputeLegality::Dynamic,
 
-        // ── `addLegalDialect<arith, vectorchain, sentient, memref, uniform, symbol>` (`:1179-1183`);
+        // ── `addLegalDialect<arith, vectorchain, sentient, memref, uniform, symbol>` (`:1179-1182`);
         //    `sentient` and `memref` have no `Op` arm of their own in this island ─────────────────
         DfirOp::Arith(_) | DfirOp::VectorChain(_) | DfirOp::Uniform(_) | DfirOp::Symbol(_) => {
             NonComputeLegality::Legal
         }
 
-        // ── `addLegalOp<agen::YieldOp, …, agen::SetTransferMaskStateOp>` (`:1185-1193`) ───────────
+        // ── `addLegalOp<agen::YieldOp, …, agen::SetTransferMaskStateOp>` (`:1183-1189`) ───────────
         DfirOp::Agen(
             agen::Op::Yield
             | agen::Op::VectorLoad { .. }
@@ -2626,7 +2629,7 @@ pub fn non_compute_legality(op: &DfirOp) -> NonComputeLegality {
             | agen::Op::SetTransferMaskState { .. },
         ) => NonComputeLegality::Legal,
 
-        // ── `addLegalOp<dataflow::GetUnitOp, …, dataflow::OpaqueOp>` (`:1195-1197`). The four
+        // ── `addLegalOp<dataflow::GetUnitOp, …, dataflow::OpaqueOp>` (`:1191-1197`). The four
         //    collection ops are this island's, are named by neither list, and so are `Unnamed` ────
         DfirOp::Dataflow(
             dataflow::Op::GetUnit { .. }
@@ -2651,7 +2654,7 @@ pub fn non_compute_legality(op: &DfirOp) -> NonComputeLegality {
 }
 
 /// WHICH SENDS AND STORES THE THREE PATTERNS WOULD REWRITE IN ONE UNIT, IN PREORDER — the
-/// `getDynamicLoweringLegality` lambda (`:1200-1231`) asked of every [`NonComputeLegality::Dynamic`]
+/// `getDynamicLoweringLegality` lambda (`:1201-1230`) asked of every [`NonComputeLegality::Dynamic`]
 /// op.
 ///
 /// ⛔⛔ THE LAMBDA'S OWN COMMENT IS INVERTED. `addDynamicallyLegalOp`'s callback answers *is this op
@@ -2671,7 +2674,7 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
     let scope: &[DfirOp] = &unit.body;
 
     // `unit_op.walk<WalkOrder::PreOrder>([&](Operation *op) { if (isa<…>(op)) is_visited[op] = false; })`
-    // (`:1163-1167`) — ⛔ SEEDED FOR ALL THREE CLASSES BEFORE ANY IS ASKED, so entry 341 can see a
+    // (`:1163-1166`) — ⛔ SEEDED FOR ALL THREE CLASSES BEFORE ANY IS ASKED, so entry 341 can see a
     // sibling store it has not reached yet.
     let mut is_visited: BTreeMap<OpId, bool> = BTreeMap::new();
     walk_positions(scope, &[], 0, &mut |op, at| -> Option<()> {
@@ -2683,7 +2686,7 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
 
     let mut to_fuse: Vec<OpId> = Vec::new();
     walk_positions(scope, &[], 0, &mut |op, at| -> Option<()> {
-        // `send_op.getSendData()` / `store_op.getValueToStore()` (`:1206-1212`) — ⛔ `Operation *data`
+        // `send_op.getSendData()` / `store_op.getValueToStore()` (`:1205-1211`) — ⛔ `Operation *data`
         // is left UNINITIALISED by an `else`-less chain, which only the target's three-op
         // registration makes safe.
         let data = match op {
@@ -2694,7 +2697,7 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
         };
 
         // `VectorOperand::getOperandWithPrecision(dcc_ext_ctx, data, comp, is_precision_converted)`
-        // (`:1215-1216`), whose `traverse_upwards` defaults to `true` (`VectorOperands.hpp:87-90`).
+        // (`:1213-1214`), whose `traverse_upwards` defaults to `true` (`VectorOperands.hpp:87-90`).
         let Some(from) = defining_position(data, scope)
             .and_then(|at| VectorOperand::operand::<A>(&at, comp, true, scope))
         else {
@@ -2702,7 +2705,7 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
         };
 
         // `isa<dataflow::ReceiveOp, vector::LoadOp, agen::VectorLoadOp, arith::ConstantOp>(from.op_)`
-        // (`:1218-1220`) — anything else is legal and stays.
+        // (`:1215-1217`) — anything else is legal and stays.
         let fusible = matches!(
             op_at(&from.op, scope),
             Some(
@@ -2715,7 +2718,7 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
             return None;
         }
 
-        // `analyzeNonComputeOpsForFusion(unit_op, …)` (`:1225-1228`). ⭐ `unit_op` IS THE SCOPE'S OWN
+        // `analyzeNonComputeOpsForFusion(unit_op, …)` (`:1222-1225`). ⭐ `unit_op` IS THE SCOPE'S OWN
         // ROOT, so entry 341's containment test is the empty prefix.
         let mut analysis = FusionAnalysis::default();
         analyze_non_compute_ops_for_fusion::<A>(
@@ -2755,7 +2758,7 @@ pub fn non_compute_ops_to_fuse<A: Arch>(
 /// before any of it — [`run_on_operation`] stops at entry 227 (`OperandReuse`), so the wiring arrives
 /// with the changeset that lands it.
 /// ⭐ `comp` IS THE CALLER'S. The reference reads it from `unit_op.getUnits()[0]`'s defining
-/// `dataflow.get_unit` under a `DT_CHECK` (`:1174-1177`); a [`dfir::ProgramUnit`] carries it.
+/// `dataflow.get_unit` under a `DT_CHECK` (`:1173-1176`); a [`dfir::ProgramUnit`] carries it.
 pub fn fuse_non_compute_ops<A: Arch>(
     unit: &dfir::ProgramUnit<A>,
     comp: ComputeComp,

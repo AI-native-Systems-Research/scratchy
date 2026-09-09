@@ -498,7 +498,7 @@ const fn is_send_or_store(op: &DfirOp) -> bool {
 /// ONE FUSED PT MAC — the send or store it replaces, and the two ops that go in its place.
 ///
 /// ⛔ THE MASK-TREE NODE AND THE MAC-MAP ENTRY BOTH TRAVEL WITH IT, for the reason [`PtDummyMac`]
-/// gives: `updateLoopMaskTreeForConstantMask` (`:212`) and `replaceAndEraseDummyMacOps` (`:236`) key
+/// gives: `updateLoopMaskTreeForConstantMask` (`:214`) and `replaceAndEraseDummyMacOps` (`:239`) key
 /// by the MAC's own position, which it does not have until the caller places it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtFusedMac {
@@ -506,14 +506,14 @@ pub struct PtFusedMac {
     pub at: OpId,
     /// The `sentient.scalar_constant` then the `sentient.vector_mac`, in emission order.
     pub ops: Vec<sen::Op>,
-    /// `mask_val` — ⭐ the literal `0`, and the MAC itself carries no mask (`:199`, `:212`).
+    /// `mask_val` — ⭐ the literal `0`, and the MAC itself carries no mask (`:188-189`, `:198`).
     pub mask: MaskedColumns,
     /// `mac_op_to_xrfptr_map[mac_op]`, filled only when the xrf map knew `vector_op` (`:216-220`).
     pub xrf: Option<DummyMacPtrs>,
 }
 
 /// THE `sentient.set_send_dst` THE SFPRING DESTINATION EMITS — *"In case of SFPRing, only FMA result
-/// can be sent to data fifo"* (`:173-183`).
+/// can be sent to data fifo"* (`:177-185`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtSendDst {
     /// `builder.setInsertionPointAfter(to.value().op_)` — ⛔ AFTER THE DESTINATION, not after the
@@ -532,9 +532,9 @@ pub enum PtFusionRefusal {
     /// unlike the PESFP twin whose failure arm `continue`s.
     NotSameBlock(OpId),
     /// The unguarded `.value()`s, each of which aborts the compiler where it stands: an absent
-    /// to-operand (`:151`), a port or precision that does not symbolize (`:198`, `:203-206`), a unit
+    /// to-operand (`:152`), a port or precision that does not symbolize (`:200-202`, `:207-211`), a unit
     /// with no precision attribute (entry 094), and `dyn_cast<SendOp>(to.value().op_)` on the
-    /// sfpring path (`:177-179`).
+    /// sfpring path (`:182`).
     Unrepresentable(OpId),
 }
 
@@ -542,7 +542,7 @@ pub enum PtFusionRefusal {
 ///
 /// ⭐ `dummy_macs` IS `mac_op_to_xrfptr_map`, AND IT IS RETURNED RATHER THAN APPLIED:
 /// [`replace_and_erase_dummy_mac_ops`](super::vc_lowering_xrf::replace_and_erase_dummy_mac_ops)
-/// (entry 093, `:236`) rewrites the SentientIR body the placeholder pointers live in, which does not
+/// (entry 093, `:239`) rewrites the SentientIR body the placeholder pointers live in, which does not
 /// exist until the caller places these MACs. ⛔ IT MUST NOT RUN WHEN `refusal` IS SET.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtNonComputeFusion {
@@ -563,7 +563,7 @@ pub struct PtNonComputeFusion {
 /// FUSE EVERY SEND AND STORE INTO ONE `sentient.vector_mac` PER SOURCE, the destinations becoming its
 /// `ResultForwarding` and the source its operand A or C.
 ///
-/// ⛔ THE THREE `std::swap`s RUN ONCE PER DESTINATION AND ARE CUMULATIVE (`:152-154`), so two
+/// ⛔ THE THREE `std::swap`s RUN ONCE PER DESTINATION AND ARE CUMULATIVE (`:156-158`), so two
 /// destinations swap back; `opA_forwarding` and `opC_forwarding` are declared and NEVER pushed to
 /// (`:148-149`); `from_ID[1]` is never written; and `op1` is read off the ORIGINAL `from`, not the
 /// copy `setReuseInformation` may have re-valued to `latch`.
@@ -650,7 +650,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
 
             // `VectorOperand::getOperandWithPrecision(ctx, …, comp, is_precision_converted)`, whose
             // `traverse_upwards` defaults to true. ⛔ `is_precision_converted_global` IS OR'd IN THREE
-            // TIMES AND NEVER READ (`:88`, `:96`, `:102`, `:108`) — a dead out-parameter.
+            // TIMES AND NEVER READ (`:88`, `:95`, `:101`, `:107`) — a dead out-parameter.
             let Some(from) = defining
                 .as_ref()
                 .and_then(|def| VectorOperand::operand::<A>(def, comp, true, scope))
@@ -771,7 +771,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                     op2 = sentient::Port::North;
                 }
 
-                // `if (dest == "sfpring")` (`:171-183`) — ⛔ `dyn_cast<SendOp>` IS NOT TESTED before
+                // `if (dest == "sfpring")` (`:179-185`) — ⛔ `dyn_cast<SendOp>` IS NOT TESTED before
                 // `getToUnit()`, so a destination named `sfpring` that is not a send aborts there.
                 if dest == sentient::Port::SfpRing {
                     let after = to.as_ref().map(|to| to.op.clone());
@@ -798,7 +798,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                     None
                 }
             };
-            // `symbolizeSentientPrecision(..).value()` on all five (`:203-207`).
+            // `symbolizeSentientPrecision(..).value()` on all five (`:207-211`).
             let (
                 Some(op_a_precision),
                 Some(op_b_precision),
@@ -821,7 +821,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                 break;
             }
 
-            // `sentient::ConstantOp::create(builder, loc, getIndexType(), 0)` (`:185-186`) — ⭐ STILL
+            // `sentient::ConstantOp::create(builder, loc, getIndexType(), 0)` (`:188-189`) — ⭐ STILL
             // BUILT AND STILL NOT ATTACHED: *"PT does not associate mask directly to operations"*.
             let mask_const = sen::Op::Sentient(sentient::Op::ScalarConstant {
                 value: 0,
@@ -844,7 +844,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                 ..sentient::Operand::from(port)
             };
             let mut mac = sen::Op::Sentient(sentient::Op::VectorMac {
-                // `nullptr` (`:199`).
+                // `nullptr` (`:198`).
                 mask: None,
                 xrf_write_ptr: xrf.map(|ptrs| ptrs.argument.write),
                 xrf_read_ptr: xrf.map(|ptrs| ptrs.argument.read),
@@ -853,7 +853,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
                 op_b: operand(op2, op_b_precision, from_id[1]),
                 op_c: operand(op3, op_c_precision, from_id[2]),
                 // ⛔ THREE OF THE FOUR FORWARDING LISTS ARE EMPTY BY CONSTRUCTION — `opA_forwarding`
-                // and `opC_forwarding` are never pushed to and opB's is a literal `{}` (`:202-205`),
+                // and `opC_forwarding` are never pushed to and opB's is a literal `{}` (`:203-205`),
                 // so only the result's carries the destinations. [`sentient::Operand::from`] gives
                 // the other three theirs empty.
                 result: sentient::ResultPorts {
@@ -902,7 +902,7 @@ pub fn fuse_non_compute_ops<A: Arch>(
             });
 
             // `VectorOperand::eraseOperands(to_operands);` and, only when nothing dangles,
-            // `eraseOperands(from_operands)` (`:222-226`).
+            // `eraseOperands(from_operands)` (`:224-226`).
             erase_operands_recording(&analysis.to_operands, scope, &mut erased_list);
             if !analysis.is_dangling_ops_present_after_fusion {
                 let from_operands: Vec<Option<VectorOperand>> =
@@ -1008,7 +1008,7 @@ pub struct PtLoweredCompute {
     /// `VectorOperand::eraseOp(op)` — the `vectorchain` op this replaces.
     pub replaces: OpId,
     /// Where [`Self::ops`] go: `OpBuilder builder(op)`, or `to_operands[0].value().op_` when the xrf
-    /// map knew `vector_op` (`:378-383`) — ⛔ so the MAC lands before the TRANSFER, not before `op`.
+    /// map knew `vector_op` (`:381-385`) — ⛔ so the MAC lands before the TRANSFER, not before `op`.
     pub insert_before: OpId,
     /// The `sentient.scalar_constant` [`get_mask_value_for_pt`] emitted — ⛔ AT [`Self::replaces`],
     /// because its builder was constructed before the move above, and DEAD on a MAC, which reads no
@@ -1034,8 +1034,8 @@ pub enum PtComputeRefusal {
     MaskUnsupported(OpId),
     /// The unguarded `.value()`s and `DT_CHECK_MSG`s, each of which aborts the compiler where it
     /// stands: an absent operand or a port that does not symbolize (`:396-402`), a precision that
-    /// does not (`:404-408`), a `LogicalResultForwarding` in a PT unit (`:361-362`), a mask on a
-    /// `multiply` (`:391-392`), a MISSING mask on a `binary` (`:489`), and a unit with no precision
+    /// does not (`:406-410`), a `LogicalResultForwarding` in a PT unit (`:361-362`), a mask on a
+    /// `multiply` (`:393-394`), a MISSING mask on a `binary` (`:490`), and a unit with no precision
     /// attribute (entry 094).
     Unrepresentable(OpId),
 }
@@ -1061,9 +1061,9 @@ pub struct PtComputeFusion {
 ///
 /// ⛔ **THE DISPATCH BEYOND THOSE THREE IS DEAD CODE.** The walk collects only those three classes
 /// (`:252-260`), yet the body then branches on `ElementWiseCompareOp`, `ElementWiseSelectionOp`,
-/// `ShuffleOp`, `ScanWithGapOp`, seven estimate ops and `PackOp` (`:519-869`), and MLIR's `isa<>` is
+/// `ShuffleOp`, `ScanWithGapOp`, seven estimate ops and `PackOp` (`:516-869`), and MLIR's `isa<>` is
 /// concrete-class matching with no hierarchy — none of them can arrive. The leading
-/// `dyn_cast<ShuffleOp>` skip (`:264-271`) is dead for the same reason.
+/// `dyn_cast<ShuffleOp>` skip (`:264-270`) is dead for the same reason.
 /// ⛔ THE `binary` ARM DISCARDS the `opA_forwarding`/`opB_forwarding` it just computed and passes two
 /// literal `{}`s (`:508-509`).
 #[must_use]
@@ -1077,7 +1077,7 @@ pub fn fuse_compute_ops<A: Arch>(
     loops: &[EnclosingLoop<'_>],
     values: &mut Values,
 ) -> PtComputeFusion {
-    // `computeUnitPrecision(unit, comp)` (entry 094, `:365`) — re-read per op there, one answer here.
+    // `computeUnitPrecision(unit, comp)` (entry 094, `:366`) — re-read per op there, one answer here.
     let unit_precision = unit.precision.map(compute_unit_precision);
     let mut out = PtComputeFusion {
         computes: Vec::new(),
@@ -1110,7 +1110,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 DfirOp::VectorChain(vc::Op::MultiplyAccumulate { .. })
             )) + 2;
 
-            // `for (int i = 0; i < numOperands; i++)` (`:283-296`) — ⛔ THE LAST MATCHING OPERAND
+            // `for (int i = 0; i < numOperands; i++)` (`:283-294`) — ⛔ THE LAST MATCHING OPERAND
             // WINS: `vector_op` is assigned inside the loop with no `break`.
             let mut vector_op: Option<OpId> = None;
             let mut from_operands: Vec<Option<VectorOperand>> = Vec::new();
@@ -1133,7 +1133,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 }));
             }
 
-            // `if (!vector_op) { for (auto user : op->getUsers()) { … } }` (`:298-315`) — the store
+            // `if (!vector_op) { for (auto user : op->getUsers()) { … } }` (`:296-314`) — the store
             // side, *"There could be an intermediate operations between the operand and the store
             // op"*, and the FIRST map hit wins (`break`).
             if vector_op.is_none() {
@@ -1167,7 +1167,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 .and_then(|vector_op| vector_op_to_xrfptr_map.get(vector_op));
 
             // `if (op->getNumOperands() == numOperands + 1) mask_operand = op->getOperand(
-            //  numOperands).getDefiningOp();` (`:317-322`) — ⭐ ONLY A `binary` CAN HAVE ONE in this
+            //  numOperands).getDefiningOp();` (`:317-321`) — ⭐ ONLY A `binary` CAN HAVE ONE in this
             // island: `Multiply` and `MultiplyAccumulate` carry no mask field at all.
             let mask_operand = if reads.len() == num_operands + 1 {
                 defining_position(reads[num_operands], scope)
@@ -1175,7 +1175,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 None
             };
 
-            // `reuse_info.setReuseInformation(op, from_operands);` (`:324`) — ⛔ BY REFERENCE, so the
+            // `reuse_info.setReuseInformation(op, from_operands);` (`:323`) — ⛔ BY REFERENCE, so the
             // latch re-valuing IS what every `from_operands[i].value().getName()` below reads. Its
             // own `if (!operands[i].has_value()) return nullopt;` makes it a no-op when one is
             // absent, which is what skipping the call is.
@@ -1217,7 +1217,7 @@ pub fn fuse_compute_ops<A: Arch>(
             }
 
             // `if (mask_operand.has_value()) { mask_val = getMaskValueForPT(…); if (!mask_val
-            //  .has_value()) { signalPassFailure(); return; } }` (`:341-351`) — *"PT does not
+            //  .has_value()) { signalPassFailure(); return; } }` (`:342-352`) — *"PT does not
             //  associate mask directly to operations"*, entry 089.
             let mut mask_ops: Vec<sen::Op> = Vec::new();
             let mut mask_val: Option<MaskValue> = None;
@@ -1249,7 +1249,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 }
             }
 
-            // `analyzeAndFillResultForwarding(…)` (`:353-360`) — entry 342.
+            // `analyzeAndFillResultForwarding(…)` (`:355-361`) — entry 342.
             let mut to_operands: Vec<Option<VectorOperand>> = Vec::new();
             let mut result_forwarding: Vec<sentient::Port> = Vec::new();
             let mut logical_result_forwarding: Option<sentient::Port> = None;
@@ -1270,7 +1270,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 break;
             }
 
-            // `:364-374` — entry 061, entry 094, then entry 060 per slot. ⛔ AN ABSENT B OR C SLOT
+            // `:365-375` — entry 061, entry 094, then entry 060 per slot. ⛔ AN ABSENT B OR C SLOT
             // CARRIES THE **COMPUTE** PRECISION, not nothing.
             let result_precision = result_precision_from_operands(&to_operands);
             let op_a_precision = from_operands[0]
@@ -1285,7 +1285,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 None => unit_precision,
             };
 
-            // `getSentientFoldModeAttrForOperation(op, comp)` (`:376`).
+            // `getSentientFoldModeAttrForOperation(op, comp)` (`:377-378`).
             let (fold_mode, fold_supported) = match fold_mode_attr_for_operation(op, comp, false) {
                 FoldModeAttr::Absent => (None, true),
                 FoldModeAttr::Present(mode) => (Some(mode), true),
@@ -1317,7 +1317,7 @@ pub fn fuse_compute_ops<A: Arch>(
             }
 
             // `if (count(vector_op) > 0) builder.setInsertionPoint(to_operands[0].value().op_);`
-            // (`:378-383`) — *"XRF-related scalar adds were already created, right before the
+            // (`:381-386`) — *"XRF-related scalar adds were already created, right before the
             // transfer's SendOp/StoreOp"*.
             let insert_before = if xrf.is_some() {
                 match to_operands.first().and_then(|to| to.as_ref()) {
@@ -1349,7 +1349,7 @@ pub fn fuse_compute_ops<A: Arch>(
             };
 
             let mut lowered = match op {
-                // ── `isa<vectorchain::MultiplyOp>(op)` (`:386-421`) ──────────────────────────────
+                // ── `isa<vectorchain::MultiplyOp>(op)` (`:389-422`) ──────────────────────────────
                 DfirOp::VectorChain(vc::Op::Multiply { .. }) => {
                     // `DT_CHECK_MSG(comp == PT && !mask_val.has_value(), "expecting PT with no mask
                     //  op")` — and this island cannot give a `multiply` a mask operand at all.
@@ -1452,7 +1452,7 @@ pub fn fuse_compute_ops<A: Arch>(
                             dbg_name: op_dbg_name,
                         })],
                         send_dsts,
-                        // `:461-478` — *"Only multiply_and_accumulate ops control this masking."*
+                        // `:454-478` — *"Only multiply_and_accumulate ops control this masking."*
                         // ⛔ `DT_CHECK_MSG(isa<BlockArgument>(mask), "expecting a block arg mask")`
                         // is the [`MaskValue::LoopIterator`] arm: entry 089 answers a loop induction
                         // variable or a constant it minted, and nothing else.
@@ -1471,7 +1471,7 @@ pub fn fuse_compute_ops<A: Arch>(
                     }
                 }
 
-                // ── `dyn_cast<vectorchain::BinaryOp>(op)` (`:489-517`) ───────────────────────────
+                // ── `dyn_cast<vectorchain::BinaryOp>(op)` (`:488-515`) ───────────────────────────
                 DfirOp::VectorChain(vc::Op::Binary { binary_op, .. }) => {
                     // `DT_CHECK_MSG(mask_val.has_value(), "expecting valid mask value")` — ⛔ AN
                     // UNMASKED `vectorchain.binary` ABORTS HERE, unlike the PE/SFP twin, which
@@ -1527,7 +1527,7 @@ pub fn fuse_compute_ops<A: Arch>(
                 // no op-class hierarchy, so `ShuffleOp`, `ElementWiseCompareOp`,
                 // `ElementWiseSelectionOp`, `ScanWithGapOp`, `FastExpOp`, `ExpEstimateOp`,
                 // `RecEstimateOp`, `LnEstimateOp`, `RsqrtEstimateOp`, `SigmoidEstimateOp`,
-                // `TanhEstimateOp` and `PackOp` cannot reach `:519-869`. ⭐ AND NOTHING FALLS
+                // `TanhEstimateOp` and `PackOp` cannot reach `:516-869`. ⭐ AND NOTHING FALLS
                 // THROUGH: an op that matched none of the three still runs the three erases below.
                 _ => {
                     erase_operands_recording(&to_operands, scope, &mut erased_list);

@@ -3488,14 +3488,14 @@ pub fn lower_sync_operation(
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoweredDataflowOp<'a> {
     /// A `sync_send`, `sync_recv` or `implicit_sync_on_streaming_buffer` that lowered, and is
-    /// therefore queued for erasure (`:2026`).
+    /// therefore queued for erasure (`:2024`).
     Sync {
         /// The op replaced.
         op: &'a DfirOp,
         /// Entry 337's answer.
         lowering: SyncLowering,
     },
-    /// `signalPassFailure()` (`:2027`) — entry 337 refused, and the op is NOT queued.
+    /// `signalPassFailure()` (`:2026`) — entry 337 refused, and the op is NOT queued.
     SyncFailed {
         /// The op left standing.
         op: &'a DfirOp,
@@ -3514,7 +3514,7 @@ pub enum LoweredDataflowOp<'a> {
 pub struct UnitSyncLowering<'a> {
     /// The FIRST walk's sites, in walk order (`:2019-2034`).
     pub lowered: Vec<LoweredDataflowOp<'a>>,
-    /// The SECOND walk's own list (`:2035-2038`) — `dataflow.create_group`s nothing reads.
+    /// The SECOND walk's own list (`:2036-2039`) — `dataflow.create_group`s nothing reads.
     pub dead_groups: Vec<&'a DfirOp>,
 }
 
@@ -3524,7 +3524,7 @@ pub struct UnitSyncLowering<'a> {
 /// `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014` (33L). Entry 337 over every
 /// sync and entry 044 over every opaque of every program unit, then the groups nothing reads.
 ///
-/// ⛔⛔ THE SECOND WALK RUNS BEFORE ANY ERASE, so `op->use_empty()` (`:2036`) is asked while the syncs
+/// ⛔⛔ THE SECOND WALK RUNS BEFORE ANY ERASE, so `op->use_empty()` (`:2037`) is asked while the syncs
 /// that name a group are all still standing. A group addressed by a sync this pass just lowered is
 /// therefore NOT dead here — only a group nothing ever referenced is.
 /// ⛔ `auto unit = unit_op.getUnits()[0].getDefiningOp<GetUnitOp>();` (`:2018`) IS DEAD — bound and
@@ -3533,7 +3533,7 @@ pub struct UnitSyncLowering<'a> {
 /// and makes its OWN `OpBuilder builder(opaque_op)` (`:2004`), so `setInsertionPointToStart` acts on a
 /// builder that is never passed anywhere. The `sentient.opaque` lands where the `dataflow.opaque` was,
 /// not at the top of the region — see [`lower_opaque_operation`].
-/// ⛔ THE `CODEGEN_DUMP_IRS` DUMP (`:2042-2046`) IS NOT PORTED: an env-gated debug artefact.
+/// ⛔ THE `CODEGEN_DUMP_IRS` DUMP (`:2043-2046`) IS NOT PORTED: an env-gated debug artefact.
 #[must_use]
 pub fn run_on_operation<'a, A: Arch>(
     program: &'a Program<A>,
@@ -3545,7 +3545,7 @@ pub fn run_on_operation<'a, A: Arch>(
         // ⛔ THE RESOLUTION SCOPE IS THE PREAMBLE **AND** THE BODY. A sync's sources are the
         // module-level `dataflow.get_unit`s the program unit takes as operands, while the group a
         // collective sync addresses is inside the unit — which is why the second walk looks for it
-        // there (`:2035`). Entry 337 reads one `&[DfirOp]`, so the two are joined for it; the delete
+        // there (`:2036`). Entry 337 reads one `&[DfirOp]`, so the two are joined for it; the delete
         // lists below still name ops of `unit.body` itself.
         let scope: Vec<DfirOp> = program
             .preamble
@@ -3603,7 +3603,7 @@ pub fn run_on_operation<'a, A: Arch>(
             });
         }
 
-        // `:2035-2038` — a second walk of the same unit, for groups only.
+        // `:2036-2039` — a second walk of the same unit, for groups only.
         let mut dead_groups: Vec<&DfirOp> = Vec::new();
         dead_create_groups(&unit.body, &unit.body, &mut dead_groups);
         per_unit.push(UnitSyncLowering {

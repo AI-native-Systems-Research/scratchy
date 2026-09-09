@@ -3307,7 +3307,7 @@ pub fn run_on_operation<'p, A: Arch>(
                         MemoryOperandIndex::DirDst
                     })
                 }
-                // ⛔ TWO `if`s AND NO `else` (`:167-172`) — an indirect transfer whose HBM view is one
+                // ⛔ TWO `if`s AND NO `else` (`:168-171`) — an indirect transfer whose HBM view is one
                 // of its INDIRECT operands leaves `mem_index` at `kMax` and hits the check below.
                 DfirOp::Agen(agen::Op::CompositeIndirectLoadAndStore(transfer)) => {
                     if transfer.direct_src == *result {

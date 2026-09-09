@@ -11132,7 +11132,7 @@ pub enum LoadAndSendStmt {
     /// `consumer_info.second` IS THIS ARM TOO, which is what makes [`LoadConsumer::Found`]'s `None`
     /// consumer a refusal here and a silent nothing inside entry 35.
     ConsumerNotExtracted,
-    /// *"vector_loadOp's consumer is not a getUnitOp."* (`:2755-2757`), reported from inside entry 35.
+    /// *"vector_loadOp's consumer is not a getUnitOp."* (`:2760`), reported from inside entry 35.
     ConsumerIsNotAGetUnit,
     /// *"problem in generating set_send_destination operation"* (`:1952-1955`).
     SetSendDestinationRefused(SetSendDestination),
@@ -11147,7 +11147,7 @@ pub enum LoadAndSendStmt {
 }
 
 /// ENTRY 336 OVER A TRANSFER THAT WAS JUST APPENDED — the loop `outermost_comp_loop` names when there
-/// is one (`:4041-4062`), else the statement itself, which is the last one appended (`:4064`).
+/// is one (`:4042-4061`), else the statement itself, which is the last one appended (`:4066`).
 ///
 /// ⭐ TOP LEVEL OF `emitted` ONLY, BY DEFINITION: the loop the reference hands in is the OUTERMOST one
 /// its composite lowering created, so a nested `affine.for` carrying the same iterator is not it.
@@ -11185,7 +11185,7 @@ fn apply_stride_adjustment(
     true
 }
 
-/// `stride_step > 0 && is_any_of(comp, L0LU, L0SU, LXLU, LXSU)` (`Helper.cpp:1999`, `:2140`) — the
+/// `stride_step > 0 && is_any_of(comp, L0LU, L0SU, LXLU, LXSU)` (`Helper.cpp:1999`, `:2144`) — the
 /// stride step is part of the MUTABLE address on these four only, so only they need it reset.
 fn stride_lives_in_mutable_addr(comp: DfirUnit) -> bool {
     matches!(
@@ -11200,11 +11200,11 @@ fn stride_lives_in_mutable_addr(comp: DfirUnit) -> bool {
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910` (104L). A load and the send it feeds become one
 /// `sentient.load_and_send`, appended to `emitted` behind whatever entry 35 wants in front of it.
 ///
-/// ⛔⛔ THE ROUTING DIRECTION IS READ OFF THE **SEND**, NOT OFF THE AGEN OP (`:1954-1969`) — a send
+/// ⛔⛔ THE ROUTING DIRECTION IS READ OFF THE **SEND**, NOT OFF THE AGEN OP (`:1958-1972`) — a send
 /// that lost its `$dir` is emitted with no routing direction at all.
 /// ⛔ AND `setldtype` REWRITES BOTH `total_elements` AND `shuffle_mode` (`:1975`), so the record's own
 /// extents reach the op only when it declined to.
-/// ⛔ THE TWO ADJUSTMENTS RUN AFTER THE OP EXISTS AND IN THIS ORDER (`:1999`, `:2005`); a refusal
+/// ⛔ THE TWO ADJUSTMENTS RUN AFTER THE OP EXISTS AND IN THIS ORDER (`:1999`, `:2006`); a refusal
 /// leaves the statement appended, which is the reference leaving it in the IR and failing the pass.
 pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
     load_op: &DfirOp,
@@ -11217,7 +11217,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
     emitted: &mut Vec<SenOp>,
     values: &mut Values,
 ) -> LoadAndSendStmt {
-    // `:1921-1927` — the record's extents, `immutable_addr` aliased as the view's start address.
+    // `:1920-1926` — the record's extents, `immutable_addr` aliased as the view's start address.
     let shape = access_details.transfer_shape();
     let rotation_position = access_details.rotation_position();
 
@@ -11232,7 +11232,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         immutable_addr,
     );
 
-    // `:1938-1946` — entry 33, then `DT_CHECK(send_op && "expected send as the consumer of load")`,
+    // `:1938-1944` — entry 33, then `DT_CHECK(send_op && "expected send as the consumer of load")`,
     // which [`LoadConsumer::Found`] has already made true: only a `dataflow.send` reaches it.
     let Some(load) = AgenLoad::of(load_op) else {
         return LoadAndSendStmt::OpIsNotALoad;
@@ -11254,7 +11254,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         return LoadAndSendStmt::ConsumerNotExtracted;
     };
 
-    // `:1948-1955` — the insertion-point shift onto the send is builder mechanics; what it buys is
+    // `:1949-1955` — the insertion-point shift onto the send is builder mechanics; what it buys is
     // that the set_send_dst and the transfer precede the send, which appending to `emitted` gives.
     let Some(consumer) = send_consumer_units(to.val(), scope) else {
         return LoadAndSendStmt::ConsumerIsNotAGetUnit;
@@ -11269,7 +11269,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         }
     }
 
-    // `:1957-1972` — ⛔ `routing_dir0` IS DEAD: bound at `:1957` and never read.
+    // `:1958-1972` — ⛔ `routing_dir0` IS DEAD: bound at `:1958` and never read.
     let dir = send_dir.map(|direction| match direction {
         dfir_op::agen::RoutingDirection::BothWays => sen::RoutingDirection::BothWays,
         dfir_op::agen::RoutingDirection::Clockwise => sen::RoutingDirection::Clockwise,
@@ -11279,9 +11279,10 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         dfir_op::agen::RoutingDirection::PseudoRandom => sen::RoutingDirection::PseudoRandom,
     });
 
-    // `:1974-1978` — and `element_width` IS A DIVISOR THERE (`:1656`). A memref element type has no
-    // zero bit width, so the two LX arms that divide take the nearest refusal rather than the
-    // reference's division by zero, and every other component returns `success()` before dividing.
+    // `:1975-1978` — and `element_width` IS ONLY EVER A DIVISOR THERE (`:1664`, `:1707`); `setldtype`
+    // never writes it. A memref element type has no zero bit width, so the two LX arms that divide
+    // take the nearest refusal rather than the reference's division by zero, and every other
+    // component returns `success()` at `:1653` before dividing.
     let ld_type = match NonZeroU32::new(shape.element_width.0) {
         Some(width) => setldtype::<A>(comp.generic(), *data, scope, shape.total_elements, width),
         None if matches!(comp.generic(), GenericComp::Lxlu | GenericComp::Lxsu) => {
@@ -11298,7 +11299,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         refused => return LoadAndSendStmt::LdTypeRefused(refused),
     };
 
-    // `:1980-1996` — ⛔ `DT_CHECK_MSG(consumer_info.second->getNumResults() == 1)` IS
+    // `:1980-1992` — ⛔ `DT_CHECK_MSG(consumer_info.second->getNumResults() == 1)` IS
     // UNREPRESENTABLE: the operand IS the value the send names ([`SendEnd`]), not a result index.
     let result = values.mint();
     emitted.push(SenOp::Sentient(sen::Op::LoadAndSend {
@@ -11315,7 +11316,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
             burst_size: spec.burst_size,
         },
         interleaved_group: spec.group_size,
-        // `rotation_position != 0 ? getI32IntegerAttr(rotation_position) : nullptr` (`:1990-1991`).
+        // `rotation_position != 0 ? getI32IntegerAttr(rotation_position) : nullptr` (`:1989-1990`).
         rotate_val: u32::try_from(rotation_position.0)
             .ok()
             .filter(|position| *position != 0),
@@ -11328,7 +11329,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         dbg_name: dfir_op::dbg_name(load_op).map(str::to_owned),
     }));
 
-    // `:1998-2003`.
+    // `:1999-2003`.
     if spec.adjusts_for_stride()
         && stride_lives_in_mutable_addr(comp)
         && !apply_stride_adjustment(emitted, spec.outermost_comp_loop, spec.stride_step, values)
@@ -11336,7 +11337,7 @@ pub fn construct_load_and_send_stmt<A: Arch, D: HasTransferMemory>(
         return LoadAndSendStmt::StrideAdjustmentRefused;
     }
 
-    // `:2005-2010` — entry 328, which needs the statement to be in the scope it rewrites.
+    // `:2006-2010` — entry 328, which needs the statement to be in the scope it rewrites.
     if let Some(extract) = spec.extract_op {
         let Some(mem_op) = IndirectMemOp::of(result, extract, emitted) else {
             return LoadAndSendStmt::IndirectPairingMismatch;
@@ -11375,7 +11376,7 @@ pub enum ReceiveAndStoreStmt {
     /// *"can not extract the StoreOp's producer!"* (`:2051-2054`) — entry 156 refused, and its own
     /// `diagnostic()` says which of its twelve checks did.
     ProducerNotExtracted,
-    /// *"ConstantBitstreamOp producers are only supported in L3"* (`:2073-2076`).
+    /// *"ConstantBitstreamOp producers are only supported in L3"* (`:2071-2072`).
     BitstreamProducerNotL3,
     /// `bs_value[0]` on a bitstream with no values — ⭐ UNREACHABLE BEHIND
     /// [`StoreProducer::BitstreamNotOneValue`], and it is where an empty one would land.
@@ -11385,11 +11386,11 @@ pub enum ReceiveAndStoreStmt {
     ProducerIsNotAWireEnd,
     /// *"could not set sttype"* (`:2091-2094`).
     StTypeRefused(StType),
-    /// `emitOpError("cannot update mutable_addr init for stride.")` (`:2141-2144`).
+    /// `emitOpError("cannot update mutable_addr init for stride.")` (`:2145-2148`).
     StrideAdjustmentRefused,
     /// The `DT_CHECK` pairing a `receive_and_store` with a `receive_and_extract_scalar` (`:1450-1454`).
     IndirectPairingMismatch,
-    /// `emitOpError("cannot adjust mutable_addr for indirect store op")` (`:2147-2151`).
+    /// `emitOpError("cannot adjust mutable_addr for indirect store op")` (`:2154-2155`).
     IndirectAdjustmentRefused(MutableAddrInit),
 }
 
@@ -11412,12 +11413,15 @@ fn store_wire_end(inp_op: &DfirOp, scope: &[DfirOp]) -> Option<RecvEnd> {
 /// **359/384** `AgenToSentientLoweringPass::constructReceiveAndStoreStmt` —
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025` (131L). The store side's twin of entry 358.
 ///
-/// ⛔⛔ THE COALESCE BLOCK (`:2102-2111`) CANNOT RUN: `COMMENT_OUT_COALESCE_STORE` is defined nowhere,
-/// so its `#else` arm compiles — and `getCoalesceInfo` and `is_src1_reg` are declared nowhere in the
-/// authority tree, so nothing that reaches it links. Its only effect is its initialisers, which are
-/// what this emits: no coalesce, no `drop_first`, no `multicast_info`, `subword_length` and `stride` 1.
-/// ⛔ NO `chunk_size`/`chunk_stride` REACH THE OP (`:2120-2131`) — the `.td` defaults of 1 and 1 stand,
-/// unlike entry 358 which passes the record's.
+/// ⛔⛔ THE COALESCE BLOCK (`:2104-2111`) IS PREPROCESSED AWAY: `COMMENT_OUT_COALESCE_STORE` **is**
+/// defined — `VectorChain.h:26`, reached by `Helper.cpp:19` → `dialect_utils/VectorChain/Utils.hpp:15`
+/// — so the EMPTY `#ifdef` arm is the one that compiles. `getCoalesceInfo` and `is_src1_reg` are
+/// declared nowhere in the tree, which is the proof: that arm would not build. Only the initialisers
+/// at `:2098-2101` survive, and they are what this emits: no coalesce, no `drop_first`, no
+/// `multicast_info`, `subword_length` and `stride` 1.
+/// ⛔ `Sentient_ReceiveAndStoreOp` HAS NO `chunk_size`/`chunk_stride` (`SentientOps.td:546`, args
+/// `:550-568`), unlike `Sentient_LoadAndSendOp` (`:504`, `:516-517`) which entry 358 fills; the 1s in
+/// the shared [`sen::Extent`] are what `extent_attrs` suppresses.
 /// ⛔ AND `data_elem_type` IS A DEAD PARAMETER: threaded in at `:2027` and never read.
 pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
     store: &AgenStore<'_>,
@@ -11445,13 +11449,13 @@ pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
         immutable_addr,
     );
 
-    // `:2051-2054` — entry 156. `:2060-2064`'s `DT_CHECK_MSG` on a non-`get_unit` producer's result
+    // `:2051-2054` — entry 156. `:2062-2064`'s `DT_CHECK_MSG` on a non-`get_unit` producer's result
     // count is unrepresentable for the same reason entry 358's is.
     let StoreProducer::Found { inp_op, producer } = get_store_producer(store, scope) else {
         return ReceiveAndStoreStmt::ProducerNotExtracted;
     };
 
-    // `:2066-2088` — a bitstream producer is REPLACED by a `sentient.scalar_constant` and the store
+    // `:2067-2088` — a bitstream producer is REPLACED by a `sentient.scalar_constant` and the store
     // reads THAT; every other component reaches the diagnostic instead.
     let producer = if let DfirOp::VectorChain(vc::Op::ConstantBitstream {
         value,
@@ -11481,7 +11485,7 @@ pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
         sen::StoreSource::Wire(end)
     };
 
-    // `:2090-2094` — and the `shuffle_mode` here is DOUBLY optional: `setsttype` writing nothing is
+    // `:2091-2095` — and the `shuffle_mode` here is DOUBLY optional: `setsttype` writing nothing is
     // the attribute being absent, not a default mode.
     let st_type = match NonZeroU32::new(shape.element_width.0) {
         Some(width) => setsttype::<A>(comp.generic(), inp_op, width),
@@ -11500,7 +11504,7 @@ pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
         refused => return ReceiveAndStoreStmt::StTypeRefused(refused),
     };
 
-    // `:2113-2131` — the destination unit is set on a sen1p5 L0SU and nowhere else.
+    // `:2118-2131` — the destination unit is set on a sen1p5 L0SU and nowhere else.
     let dst = (comp == DfirUnit::L0su && A::GEN >= IsaGen::Sen1p5)
         .then(|| access_details.memory())
         .flatten();
@@ -11534,7 +11538,7 @@ pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
         dbg_name: dfir_op::dbg_name(store_op).map(str::to_owned),
     }));
 
-    // `:2139-2144`.
+    // `:2144-2149`.
     if spec.adjusts_for_stride()
         && stride_lives_in_mutable_addr(comp)
         && !apply_stride_adjustment(emitted, spec.outermost_comp_loop, spec.stride_step, values)
@@ -11542,7 +11546,7 @@ pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
         return ReceiveAndStoreStmt::StrideAdjustmentRefused;
     }
 
-    // `:2146-2151` — entry 328.
+    // `:2151-2156` — entry 328.
     if let Some(extract) = spec.extract_op {
         let Some(mem_op) = IndirectMemOp::of(result, extract, emitted) else {
             return ReceiveAndStoreStmt::IndirectPairingMismatch;
@@ -11567,7 +11571,7 @@ pub fn construct_receive_and_store_stmt<A: Arch, D: HasTransferMemory>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub enum AddressManipulation {
-    /// `success()` (`Helper.cpp:827`, `:1008`).
+    /// `success()` (`Helper.cpp:827`, `:1010`).
     Manipulated,
     /// `DT_CHECK(mutable_addrs_base.size() == mutable_addrs.size() && mutable_addrs.size() ==
     /// access_details.size())` (`:631-632`).
@@ -11576,17 +11580,17 @@ pub enum AddressManipulation {
     /// the argument of a region that is not a counted loop.
     StartAddrOwnerIsNotALoop,
     /// `DT_CHECK(op->hasAttr("iter-index") && "perhaps main IV is used as a subscript instead of an
-    /// iter-arg")` (`:880-882`, `:891-893`): the marked loop binds the start address as its INDUCTION
-    /// VARIABLE, so `:719-737` found no `iter_arg` to name.
+    /// iter-arg")` (`:878-880`, `:889-891`): the marked loop binds the start address as its INDUCTION
+    /// VARIABLE, so `:730-740` found no `iter_arg` to name.
     StartAddrIsTheInductionVariable,
-    /// `llvm_unreachable("unhandeled type of loop")` (`:3877`) and the `DT_CHECK(ret_op)` entry 264
+    /// `llvm_unreachable("unhandeled type of loop")` (`:3876`) and the `DT_CHECK(ret_op)` entry 264
     /// makes ([`CountedLoop::of`]).
     UnsupportedLoopOperation,
     /// An iterator of the coefficient table that no region of `scope` binds — the `cast<BlockArgument>`
-    /// at `:674-680` and `:835`, which aborts rather than answering null.
+    /// at `:676`, `:678` and `:836`, which aborts rather than answering null.
     IndexIsNotALoopIterator,
-    /// `DT_CHECK_MSG(def_op, "could not set def_op")` (`:774`) and `DT_CHECK_MSG(init, "expected
-    /// operation for mem_view_start addr")` (`:988`).
+    /// `DT_CHECK_MSG(def_op, "could not set def_op")` (`:783`) and `DT_CHECK_MSG(init, "expected
+    /// operation for mem_view_start addr")` (`:990`).
     StartAddrUndefined,
     /// `DT_CHECK(parent_op->isProperAncestor(loop_op))` inside entry 219 (`:3946`) — a start address
     /// that is a region argument of the nest being rewritten rather than of something enclosing it.
@@ -11603,14 +11607,14 @@ pub enum AddressManipulation {
     StartAddrIsAQueryMap,
     /// The loop entry 335 is pointed at carries no seat at the requested distance from the end, or the
     /// one entry 357's post-processing reads does not — `getOperand(getNumOperands() - i - 1)`
-    /// (`:993`) on a list that short.
+    /// (`:995`) on a list that short.
     NoIterArgsOnLoop,
     /// Entry 272 could not place the view's start address, so there is no `addi` to initialise with.
     StartAddrRefused(ClonedStartAddr),
-    /// `llvm_unreachable("unexpected mem_view_start addr index for kIndSrc/Dst")` (`:934-936`).
+    /// `llvm_unreachable("unexpected mem_view_start addr index for kIndSrc/Dst")` (`:936-938`).
     IndirectStartAddrUnexpected,
     /// `emitWarning("unable to find the right loop to add mem_view_start addr of indirect src/dst")`
-    /// then `failure()` (`:1000-1004`).
+    /// then `failure()` (`:1001-1005`).
     NoInvariantLoopForIndirectStartAddr,
 }
 
@@ -11675,13 +11679,13 @@ fn is_proper_ancestor(outer: &[(usize, usize)], inner: &[(usize, usize)]) -> boo
         && outer[outer.len() - 1].0 == inner[outer.len() - 1].0
 }
 
-/// `isAncestor`, which INCLUDES SELF (`:708`, `:991`).
+/// `isAncestor`, which INCLUDES SELF (`:708`, `:993`).
 fn is_ancestor(outer: &[(usize, usize)], inner: &[(usize, usize)]) -> bool {
     same_op(outer, inner) || is_proper_ancestor(outer, inner)
 }
 
 /// THE NEAREST ENCLOSING COUNTED LOOP OF THE OP A PATH NAMES — `while (parent) { if (isa<for>(parent))
-/// { loop_containing_init = parent; break; } parent = parent->getParentOp(); }` (`:970-976`), which
+/// { loop_containing_init = parent; break; } parent = parent->getParentOp(); }` (`:969-975`), which
 /// starts AT the op itself.
 fn enclosing_loop_path(path: &[(usize, usize)], scope: &[DfirOp]) -> Option<Vec<(usize, usize)>> {
     (1..=path.len()).rev().find_map(|len| {
@@ -11693,7 +11697,7 @@ fn enclosing_loop_path(path: &[(usize, usize)], scope: &[DfirOp]) -> Option<Vec<
 }
 
 /// `Operation::moveBefore` for the one case entry 357 needs: an op inside the outermost loop, moved to
-/// immediately before it (`:958-960`).
+/// immediately before it (`:957-959`).
 ///
 /// ⭐ THE TWO LISTS ARE ALWAYS DIFFERENT `Vec`s, because `from` is a proper descendant of `to`, so the
 /// removal cannot shift `to`'s own ordinal.
@@ -11709,17 +11713,17 @@ fn move_before(scope: &mut Vec<DfirOp>, from: &[(usize, usize)], to: &[(usize, u
 }
 
 /// `builder.setInsertionPointAfter(def_op)` / `setInsertionPointToStart(&def_op->getRegion(0).front())`
-/// (`:769-778`) as a (list path, index) pair this island can splice at.
+/// (`:778-785`) as a (list path, index) pair this island can splice at.
 fn insertion_after_definition(addr: Val, scope: &[DfirOp]) -> Option<(Vec<(usize, usize)>, usize)> {
     if let Some(mut path) = binding_path(addr, scope) {
-        // `:772-774` — a region argument: the start of its owner's FIRST region.
+        // `:779-781` — a region argument: the start of its owner's FIRST region.
         if let Some(last) = path.last_mut() {
             last.1 = 0;
         }
         path.push((0, 0));
         return Some((path, 0));
     }
-    // `:776-777` — `DT_CHECK_MSG(def_op, "could not set def_op")`, then immediately after it.
+    // `:783-784` — `DT_CHECK_MSG(def_op, "could not set def_op")`, then immediately after it.
     let path = defining_path(addr, scope)?;
     let at = path.last()?.0 + 1;
     Some((path, at))
@@ -11777,23 +11781,23 @@ struct Mark {
     /// `"index"` — ⛔ THE LAST RECORD SHARING THE OP WINS, because `:712` is an unconditional write.
     record: usize,
     /// `"iter-index"` — ⛔ ONCE SET IT IS NEVER CLEARED by a later record whose search found nothing
-    /// (`:733` writes inside the match and breaks), so the later record can be handed the earlier
+    /// (`:737-738` writes inside the match and breaks), so the later record can be handed the earlier
     /// one's seat.
     iter_index: Option<usize>,
-    /// The value `:886`/`:897` recovers the op by: its induction variable for a loop, its own single
+    /// The value `:886`/`:898` recovers the op by: its induction variable for a loop, its own single
     /// result otherwise.
     anchor: Val,
-    /// Which branch of the walk it takes (`:876` against `:896`).
+    /// Which branch of the walk it takes (`:871` against `:896`).
     is_loop: bool,
 }
 
-/// WHAT THE WALK AT `:875-899` READS BACK FOR ONE MARKED OP, in the form that survives the clones.
+/// WHAT THE WALK AT `:865-903` READS BACK FOR ONE MARKED OP, in the form that survives the clones.
 enum MarkedStartAddr {
-    /// `op->getResult(0)` (`:897`) — ⭐ THE BASE ITSELF: every start-address producer the reference
+    /// `op->getResult(0)` (`:898`) — ⭐ THE BASE ITSELF: every start-address producer the reference
     /// admits (`arith.constant`, `addi`, `subi`, `symbol.create_symbol`, `uniform.query_map`) binds
     /// exactly one value, so the result number it hard-codes is the value that was read.
     Result(Val),
-    /// `loop.getRegionIterArgs()[iter_idx]` (`:886`, `:895`) — ⛔ THE LOOP AND THE SLOT, NOT THE
+    /// `loop.getRegionIterArgs()[iter_idx]` (`:886`, `:894`) — ⛔ THE LOOP AND THE SLOT, NOT THE
     /// VALUE. Where two records share one loop the slot can be the FIRST record's, read under the
     /// LAST record's number ([`Mark::iter_index`]), and only re-reading the seat reproduces that.
     Seat {
@@ -11807,7 +11811,7 @@ enum MarkedStartAddr {
 /// `:761-827` — THE `else`: an offset that is one constant needs only its own operand adjusted, and no
 /// loop is touched at all.
 ///
-/// ⛔ THE L3 ARM **OVERWRITES** THE ADDRESS WITH THE OFFSET (`:783-786`) where every other unit ADDS to
+/// ⛔ THE L3 ARM **OVERWRITES** THE ADDRESS WITH THE OFFSET (`:788-794`) where every other unit ADDS to
 /// it: an L3 half's mutable address holds the memory op's offset and its immutable address holds the
 /// view's start, so combining them there would count the base twice.
 fn constant_only_address_adjustment(
@@ -11822,13 +11826,13 @@ fn constant_only_address_adjustment(
         let Some(addr) = mutable_addrs.entries().get(i).copied() else {
             break;
         };
-        // `DT_CHECK(indices_coeff_dict.find(nullptr) != indices_coeff_dict.end())` (`:766`) — the null
+        // `DT_CHECK(indices_coeff_dict.find(nullptr) != indices_coeff_dict.end())` (`:772`) — the null
         // key is [`GatheredCoefficients::constant`], a field that is always there.
         let init_value = coefficients.constant.get(i).copied().unwrap_or(0);
         let Some((list_path, at)) = insertion_after_definition(addr, scope) else {
             return AddressManipulation::StartAddrUndefined;
         };
-        // `dyn_cast_or_null<mlir::arith::ConstantIndexOp>(def_op)` (`:790`) — ⭐ NEVER A REGION
+        // `dyn_cast_or_null<mlir::arith::ConstantIndexOp>(def_op)` (`:799-800`) — ⭐ NEVER A REGION
         // ARGUMENT'S OWNER, so this and the block-arg insertion point above are exclusive.
         let folded = match defining_op(addr, scope) {
             Some(DfirOp::Arith(arith::Op::Constant { value, .. })) => Some(*value),
@@ -11836,7 +11840,7 @@ fn constant_only_address_adjustment(
         };
 
         let built: Vec<DfirOp> = if matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
-            // `:781-787`.
+            // `:788-794`.
             let result = values.mint();
             let ops = vec![DfirOp::Arith(arith::Op::Constant {
                 result,
@@ -11845,10 +11849,10 @@ fn constant_only_address_adjustment(
             write_both(mutable_addrs_base, mutable_addrs, i, result);
             ops
         } else if init_value == 0 {
-            // `:788` — *"If the init_value is 0, no update needed."*
+            // `:798` — *"If the init_value is 0, no update needed."*
             continue;
         } else if let Some(offset) = folded {
-            // `:790-803` — ⛔ A **NEW** CONSTANT, not an edit of the old one, which the reference
+            // `:799-811` — ⛔ A **NEW** CONSTANT, not an edit of the old one, which the reference
             // leaves standing where it is.
             let result = values.mint();
             let ops = vec![DfirOp::Arith(arith::Op::Constant {
@@ -11858,7 +11862,7 @@ fn constant_only_address_adjustment(
             write_both(mutable_addrs_base, mutable_addrs, i, result);
             ops
         } else {
-            // `:804-816` — the constant, then `addi(mutable_addrs[i], init_const)`.
+            // `:812-822` — the constant, then `addi(mutable_addrs[i], init_const)`.
             let addend = values.mint();
             let sum = values.mint();
             let ops = vec![
@@ -11887,8 +11891,8 @@ fn constant_only_address_adjustment(
     AddressManipulation::Manipulated
 }
 
-/// `mutable_addrs[i] = mutable_addrs_base[i] = ..` — the chained assignment, once (`:783`, `:800`,
-/// `:812`, `:943-944`).
+/// `mutable_addrs[i] = mutable_addrs_base[i] = ..` — the chained assignment, once (`:792`, `:808`,
+/// `:819`, `:941-943`).
 fn write_both(
     mutable_addrs_base: &mut AccessContainer<Val>,
     mutable_addrs: &mut AccessContainer<Val>,
@@ -11911,7 +11915,7 @@ fn write_both(
 /// at every level of the nest.
 ///
 /// ⛔⛔ EVERY INDEXING LOOP IS REPLACED BY A CLONE CARRYING ONE EXTRA `iter_arg` PER RECORD
-/// (`:833-851`), so every value inside them is re-minted. The reference carries the survivors across
+/// (`:835-852`), so every value inside them is re-minted. The reference carries the survivors across
 /// that on `"index"`/`"iter-index"`/`"marked"` ATTRIBUTES and this port carries them through the
 /// composed [`ValueMapping`]s, which answer the same question: `lookup(base)` IS
 /// `getRegionIterArgs()[iter_idx]` for a marked loop and IS `getResult(0)` for anything else, because
@@ -11956,7 +11960,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         return AddressManipulation::IndexIsNotALoopIterator;
     };
 
-    // `:697-759` — mark the bases defined inside the outermost indexing loop. ⛔ `last_loop` IS THE
+    // `:698-760` — mark the bases defined inside the outermost indexing loop. ⛔ `last_loop` IS THE
     // OUTERMOST one despite the name: it is `sorted.front()`.
     let mut marks: Vec<Mark> = Vec::new();
     for i in 0..records {
@@ -11981,7 +11985,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         if !is_ancestor(&last_loop, &path) {
             continue;
         }
-        // `:719-737` and `:748-758` — which `iter_arg` this is, searched on the def op whichever way
+        // `:730-740` and `:748-758` — which `iter_arg` this is, searched on the def op whichever way
         // the base was reached: a loop RESULT used as a start address takes the same branch and finds
         // nothing. ⛔ NOTHING IS FOUND FOR THE INDUCTION VARIABLE either, and the reference then
         // leaves whatever an earlier record wrote.
@@ -11989,11 +11993,11 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         let iter_index = counted
             .as_ref()
             .and_then(|loop_op| loop_op.carried.iter().position(|seat| seat.arg == base));
-        // `:897` is `getResult(0)`, which for every producer the reference admits IS the base; a loop
+        // `:898` is `getResult(0)`, which for every producer the reference admits IS the base; a loop
         // is re-found by its induction variable instead, because the SLOT is what `:886` reads.
         let anchor = counted.map_or(base, |loop_op| loop_op.iv);
         let is_loop = counted.is_some();
-        // `:712`/`:733` — both are `setAttr` on the op, so the last record sharing it wins and
+        // `:712`/`:737` — both are `setAttr` on the op, so the last record sharing it wins and
         // `"iter-index"` is only overwritten where a match was found.
         match marks.iter_mut().find(|mark| same_op(&mark.path, &path)) {
             Some(mark) => {
@@ -12012,7 +12016,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         }
     }
 
-    // `:880-882`/`:891-893` — the walk's `DT_CHECK`, which is a question about the pre-clone nest and
+    // `:878-880`/`:889-891` — the walk's `DT_CHECK`, which is a question about the pre-clone nest and
     // so is answerable before the clones are made.
     let mut marked: Vec<(usize, MarkedStartAddr)> = Vec::new();
     for mark in marks {
@@ -12032,7 +12036,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         });
     }
 
-    // `:833-851` — ⛔ INNERMOST FIRST, so the outer clone carries the inner clone with it and the
+    // `:835-852` — ⛔ INNERMOST FIRST, so the outer clone carries the inner clone with it and the
     // reference's *"to keep indices tracking valid"* comment holds for the mapping too.
     let mut n_extra = 0usize;
     let mut tracked: Vec<Option<Val>> = vec![None; sorted.len()];
@@ -12084,13 +12088,13 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         }
     }
 
-    // `:856-903` — the preorder walk, as the mapping's answer. ⛔ THE `removeAttr("marked")` IS INSIDE
-    // THE `isa<for>` GUARD (`:857-862`), so the memory op's own `"marked"` — set by entry 212 at
+    // `:857-904` — the preorder walk, as the mapping's answer. ⛔ THE `removeAttr("marked")` IS INSIDE
+    // THE `isa<for>` GUARD (`:858-864`), so the memory op's own `"marked"` — set by entry 212 at
     // `:546` — SURVIVES for [`lower_affine_composite_helper`] to re-find it. Nothing here clears it.
     for (record, target) in &marked {
         let base = match target {
             MarkedStartAddr::Result(val) => *val,
-            // `:886`/`:895` — `loop.getRegionIterArgs()[iter_idx]` on the loop as it now stands: the
+            // `:886`/`:894` — `loop.getRegionIterArgs()[iter_idx]` on the loop as it now stands: the
             // clone's own arguments, with the added seats after the ones this index counts over.
             MarkedStartAddr::Seat { iv, iter_index } => {
                 let Some(path) = binding_path(*iv, scope) else {
@@ -12122,7 +12126,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         return AddressManipulation::Manipulated;
     };
 
-    // `:919-945` — one initialisation per variable added to the outer loop.
+    // `:921-944` — one initialisation per variable added to the outer loop.
     let mut post_process: Vec<(usize, Val)> = Vec::new();
     for i in 0..n_extra {
         let init_value = coefficients.constant.get(i).copied().unwrap_or(0);
@@ -12130,7 +12134,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
             break;
         };
 
-        // `:923-938` — ⭐ LIVE: `TOGGLE_INDIRECT_IMPL1` is `#define`d at `Helper.cpp:34`, and the
+        // `:924-940` — ⭐ LIVE: `TOGGLE_INDIRECT_IMPL1` is `#define`d at `Helper.cpp:34`, and the
         // `kIndSrc`/`kIndDst` records that reach here are the ones
         // [`construct_affine_comp_details_and_addrs`] inserts (`:2830-2840`).
         if access_details.entries().get(i).is_some_and(|record| {
@@ -12161,7 +12165,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
             }
         }
 
-        // `:940-944` — entry 272, whose ops `OpBuilder builder(loop_op)` puts immediately BEFORE the
+        // `:941-943` — entry 272, whose ops `OpBuilder builder(loop_op)` puts immediately BEFORE the
         // outermost loop.
         let arm = if matches!(comp, DfirUnit::L3lu | DfirUnit::L3su) {
             // ⭐ NEVER READ: entry 272 returns the constant alone before it reaches entry 219 on L3.
@@ -12272,7 +12276,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
             )
         );
         let found = if hoistable {
-            // `:957-962` — hoisted to just before the outermost loop, which is then the answer.
+            // `:956-959` — hoisted to just before the outermost loop, which is then the answer.
             let Some(outer) = binding_path(outer_iv, scope) else {
                 return AddressManipulation::IndexIsNotALoopIterator;
             };
@@ -12282,14 +12286,14 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
             binding_path(outer_iv, scope)
         } else {
             match enclosing_loop_path(&init, scope) {
-                // `:978` — nothing encloses it, so it is invariant everywhere.
+                // `:976` — nothing encloses it, so it is invariant everywhere.
                 None => binding_path(outer_iv, scope),
                 Some(containing) => {
                     let Some(innermost) = for_ops.last().and_then(|iv| binding_path(*iv, scope))
                     else {
                         return AddressManipulation::IndexIsNotALoopIterator;
                     };
-                    // ⛔ `prev_loop` IS ASSIGNED **AFTER** THE EQUALITY TEST (`:982-987`), so
+                    // ⛔ `prev_loop` IS ASSIGNED **AFTER** THE EQUALITY TEST (`:981-983`), so
                     // `for_ops.back() == loop_containing_init` answers `nullptr` — the warning below,
                     // not the innermost loop.
                     let mut prev: Option<Vec<(usize, usize)>> = None;
@@ -12313,10 +12317,10 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
             }
         };
         let Some(loop_path) = found else {
-            // `:1000-1004`.
+            // `:1001-1005`.
             return AddressManipulation::NoInvariantLoopForIndirectStartAddr;
         };
-        // `:991` — `DT_CHECK(outer_most_loop->isAncestor(loop))`.
+        // `:993` — `DT_CHECK(outer_most_loop->isAncestor(loop))`.
         let Some(outer) = binding_path(outer_iv, scope) else {
             return AddressManipulation::IndexIsNotALoopIterator;
         };
@@ -12324,7 +12328,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
             return AddressManipulation::NoInvariantLoopForIndirectStartAddr;
         }
 
-        // `:992-999` — `OpBuilder builder(loop)` puts the sum immediately before the loop, and the
+        // `:994-999` — `OpBuilder builder(loop)` puts the sum immediately before the loop, and the
         // seat it rewrites is `getNumOperands() - v.first - 1`: COUNTED FROM THE END, as everything
         // that touches these seats is ([`CarriedFromEnd`]).
         let sum = values.mint();
@@ -12361,7 +12365,7 @@ pub fn generate_affine_address_manipulation_stmts<T: AccessRecord>(
         }
     }
 
-    // `:1008`.
+    // `:1010`.
     AddressManipulation::Manipulated
 }
 
@@ -12392,9 +12396,9 @@ pub enum SymbolicDetailsAndAddrs {
 /// `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849` (16L). The symbolic twin of entry 298: one
 /// record per direct operand, then entry 327 over both.
 ///
-/// ⛔ THE DESTINATION IS OPTIONAL AND THE SOURCE IS NOT (`:2853`, `:2860`) — a lone symbolic store
+/// ⛔ THE DESTINATION IS OPTIONAL AND THE SOURCE IS NOT (`:2854`, `:2860`) — a lone symbolic store
 /// reaches this with `nullptr` for the destination, which is what makes `size() == 1` hold at `:3419`.
-/// ⛔ `unit_op` IS DEAD HERE: the reference threads it in (`:2851`) and neither the two
+/// ⛔ `unit_op` IS DEAD HERE: the reference threads it in (`:2850`) and neither the two
 /// `constructDetails` calls nor entry 327 reads it.
 /// ⛔ AND THE RECORDS' OP OUTLIVES THE GATHER, which CLONES the loops around them (entry 327 at
 /// `:1064-1074`) — so `src_op` is borrowed independently of `scope` and not out of it.
@@ -12408,7 +12412,7 @@ pub fn construct_symbolic_details_and_addrs<'a>(
     scope: &mut Vec<DfirOp>,
     values: &mut Values,
 ) -> SymbolicDetailsAndAddrs {
-    // `DT_CHECK(src_op)` (`:2853`) — a `&agen::Op` cannot be null.
+    // `DT_CHECK(src_op)` (`:2854`) — a `&agen::Op` cannot be null.
     let Some(slot) = access_details.vacancy(MemoryOperandIndex::DirSrc) else {
         return SymbolicDetailsAndAddrs::OperandSlotTaken(MemoryOperandIndex::DirSrc);
     };
