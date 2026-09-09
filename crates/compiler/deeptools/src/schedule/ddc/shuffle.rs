@@ -174,7 +174,7 @@
 //! | `e371_replace_assign` | 371 | 5 | 119 | `AutoShuffler` | `ddc/transformations/automatic_shuffle/shuffle.cpp:788` |
 
 use crate::arch::Sticks;
-use crate::generated::DataType;
+use crate::formats::DataFormat;
 use std::collections::{BTreeMap, BTreeSet};
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -307,7 +307,7 @@ impl SliceDim {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AbstractLayout {
     /// The element format the sticks are in.
-    pub format: DataType,
+    pub format: DataFormat,
     /// The dimensions taken across sticks. Order carries no meaning in the abstraction.
     pub stick_dims: BTreeSet<DimSymbol>,
     /// The dimensions within a slice, least significant first.
@@ -320,7 +320,7 @@ impl AbstractLayout {
     pub fn new(
         stick_dims: BTreeSet<DimSymbol>,
         slice_dims: [DimSymbol; DIMS_PER_SLICE],
-        format: DataType,
+        format: DataFormat,
     ) -> Self {
         Self {
             format,
@@ -380,6 +380,15 @@ const MERGE32L: [ShuffleIndex; 8] = indices([0, 1, 8, 9, 4, 5, 12, 13]);
 const MERGE64H: [ShuffleIndex; 8] = indices([4, 5, 6, 7, 12, 13, 14, 15]);
 /// `merge64l` (`shuffle.cpp:53`).
 const MERGE64L: [ShuffleIndex; 8] = indices([0, 1, 2, 3, 8, 9, 10, 11]);
+/// `pack25` (`shuffle.cpp:42`).
+const PACK25: [ShuffleIndex; 16] =
+    indices([0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]);
+/// `pack26` (`shuffle.cpp:44`).
+const PACK26: [ShuffleIndex; 16] =
+    indices([0, 2, 4, 6, 16, 18, 20, 22, 8, 10, 12, 14, 24, 26, 28, 30]);
+/// `pack27` (`shuffle.cpp:46`).
+const PACK27: [ShuffleIndex; 16] =
+    indices([0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30]);
 
 /// A PSEUDOCODE REGISTER NAME — `r0`, `r1`, .. as `codegen_psuedocode` mints them
 /// (`shuffle.cpp:1229-1234`).
@@ -744,55 +753,265 @@ impl PackAction {
         output.slice_dims[to] = self.stick_dim;
         output
     }
+
+    /// Replaces: e145_get_indices
+    ///
+    /// The `packmerge` table this pack drives the vector unit with, one per reachable
+    /// subdimension — `pack25` at the 64-bit slot, `pack26` at the 32-bit, `pack27` at the 16-bit.
+    ///
+    /// ⛔ THE REFERENCE'S `DT_ERROR("Tried to use illegal pack action")` (`shuffle.cpp:375`) HAS NO
+    /// ARM HERE BECAUSE [`PackDim`] CANNOT NAME THE THREE ILLEGAL SLOTS.
+    #[must_use]
+    pub const fn get_indices(&self) -> &'static [ShuffleIndex] {
+        match self.slice {
+            PackDim::Bit64 => &PACK25,
+            PackDim::Bit32 => &PACK26,
+            PackDim::Bit16 => &PACK27,
+        }
+    }
 }
 
-// crustify:todo: e145_get_indices
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:366  (12 body lines, level 0)
-//   class     : PackAction
-//   original  : std::vector<int> get_indices()
-//   extract   : crustify-ddc/cpp/ddc.cpp:2763-2775
+/// SHIFTS THE SLICE DIMENSIONS ONE PLACE UP, dropping the 64-bit subdimension or extracting it back
+/// into the sticks — `pack12` and `pack13` (`shuffle.cpp:385-392`).
+///
+/// ⛔ `extract_dim` IS THE INPUT'S OWN 64-BIT SLOT. Its one construction site passes
+/// `input.sliceDims()[dim_64bit]` (`shuffle.cpp:404`), which is what the `DT_CHECK` at `:410-411`
+/// restates; [`Self::act`] therefore reads that slot instead of trusting the field to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShiftLeftAction {
+    extract_dim: DimSymbol,
+}
 
-// crustify:todo: e146_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:409  (13 body lines, level 0)
-//   class     : ShiftLeftAction
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2785-2798
+impl ShiftLeftAction {
+    /// `ShiftLeftAction(extract_dim)` (`shuffle.cpp:407`).
+    #[must_use]
+    pub const fn new(extract_dim: DimSymbol) -> Self {
+        Self { extract_dim }
+    }
 
-// crustify:todo: e147_cost
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:423  (4 body lines, level 0)
-//   class     : ShiftLeftAction
-//   original  : double cost(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2808-2812
+    /// The dimension it lifts out of the 64-bit slot — dummy when that slot holds nothing live, in
+    /// which case the shift discards it instead.
+    #[must_use]
+    pub const fn extract_dim(&self) -> DimSymbol {
+        self.extract_dim
+    }
 
-// crustify:todo: e148_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:476  (10 body lines, level 0)
-//   class     : Pack8Action
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2822-2832
+    /// Replaces: e146_act
+    ///
+    /// Every subdimension from the 8-bit slot up moves one place up, the 8-bit slot becomes a dummy,
+    /// and the dimension pushed out of the 64-bit slot joins the stick dimensions when it is live.
+    ///
+    /// ⛔ THAT IS `erase(begin() + dim_64bit)` FOLLOWED BY `insert(begin() + dim_8bit, getDummy())`
+    /// (`shuffle.cpp:418-419`): the pair restores the six-slot length, so this shifts rather than
+    /// resizes. ⛔ AND THE STICK GAINS THE SLOT'S DIMENSION, not `extract_dim` — the same symbol by
+    /// the construction site above, and read from the layout so it stays so.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        if !self.extract_dim.is_dummy() {
+            output.stick_dims.insert(input.slice_dim(SliceDim::Bit64));
+        }
+        for i in (SliceDim::Bit8.index() + 1..=SliceDim::Bit64.index()).rev() {
+            output.slice_dims[i] = output.slice_dims[i - 1];
+        }
+        output.slice_dims[SliceDim::Bit8.index()] = DimSymbol::DUMMY;
+        output
+    }
 
-// crustify:todo: e149_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:523  (8 body lines, level 0)
-//   class     : Pack9Action
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2842-2850
+    /// Replaces: e147_cost
+    ///
+    /// One instruction per input stick, DOUBLED when the shift also extracts — it then writes two
+    /// output sticks per input.
+    ///
+    /// ⛔ NO DIVISION, UNLIKE EVERY OTHER ACTION'S COST (`shuffle.cpp:423-425`). A one-stick layout
+    /// costs 1 or 2 here, where a merge or a pack costs 0.
+    #[must_use]
+    pub fn cost(&self, input: &AbstractLayout) -> ShuffleCost {
+        let sticks = input.num_sticks().0;
+        if self.extract_dim.is_dummy() {
+            ShuffleCost(sticks as f64)
+        } else {
+            ShuffleCost((sticks * 2) as f64)
+        }
+    }
+}
 
-// crustify:todo: e150_cost
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:532  (4 body lines, level 0)
-//   class     : Pack9Action
-//   original  : double cost(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2860-2864
+/// THE `pack8` INSTRUCTION — takes a stick dimension into the slice, drops the 4- and 8-bit
+/// subdimensions and slides the rest down two places (`shuffle.cpp:446`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pack8Action {
+    dim: DimSymbol,
+}
 
-// crustify:todo: e151_act
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:573  (11 body lines, level 0)
-//   class     : Pack24Action
-//   original  : AbstractLayout act(const AbstractLayout& input) override
-//   extract   : crustify-ddc/cpp/ddc.cpp:2874-2885
+impl Pack8Action {
+    /// `Pack8Action(stick_dim)` (`shuffle.cpp:474`).
+    #[must_use]
+    pub const fn new(dim: DimSymbol) -> Self {
+        Self { dim }
+    }
 
-// crustify:todo: e152__out_format
-//   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:598  (8 body lines, level 0)
-//   class     : GCVTF16F8PackAction
-//   original  : static std::optional<DataFormats> _out_format(DataFormats in, const AbstractLayout& goal)
-//   extract   : crustify-ddc/cpp/ddc.cpp:2895-2904
+    /// The stick dimension being packed in.
+    #[must_use]
+    pub const fn dim(&self) -> DimSymbol {
+        self.dim
+    }
+
+    /// Replaces: e148_act
+    ///
+    /// The 16-, 32- and 64-bit dimensions drop two slots, `dim` lands in the 32-bit slot, and the
+    /// 64-bit slot becomes a dummy. The 2-bit slot is untouched.
+    ///
+    /// ⛔ THE TWO ERASES RUN DESCENDING — `{dim_8bit, dim_4bit}` (`shuffle.cpp:480`) — on a
+    /// shrinking vector, so they drop exactly those two originals; ascending would have taken the
+    /// 8-bit slot and then whatever slid into the 4-bit one. `insert(end(), {dim, getDummy()})`
+    /// restores the six-slot length.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        output.stick_dims.remove(&self.dim);
+        output.slice_dims[SliceDim::Bit4.index()] = input.slice_dim(SliceDim::Bit16);
+        output.slice_dims[SliceDim::Bit8.index()] = input.slice_dim(SliceDim::Bit32);
+        output.slice_dims[SliceDim::Bit16.index()] = input.slice_dim(SliceDim::Bit64);
+        output.slice_dims[SliceDim::Bit32.index()] = self.dim;
+        output.slice_dims[SliceDim::Bit64.index()] = DimSymbol::DUMMY;
+        output
+    }
+}
+
+/// THE `pack9` INSTRUCTION — takes a stick dimension into the 4-bit subdimension in place
+/// (`shuffle.cpp:496`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pack9Action {
+    dim: DimSymbol,
+}
+
+impl Pack9Action {
+    /// `Pack9Action(stick_dim)` (`shuffle.cpp:521`) — its construction site passes the GOAL's 4-bit
+    /// dimension, having checked the sticks hold it (`shuffle.cpp:512-518`).
+    #[must_use]
+    pub const fn new(dim: DimSymbol) -> Self {
+        Self { dim }
+    }
+
+    /// The stick dimension being packed in.
+    #[must_use]
+    pub const fn dim(&self) -> DimSymbol {
+        self.dim
+    }
+
+    /// Replaces: e149_act
+    ///
+    /// `dim` takes the 4-bit slot and the 8-bit slot becomes a dummy.
+    ///
+    /// ⛔ NO SLIDE, UNLIKE `pack8` AND `pack24`: this is an assignment pair on the existing slots
+    /// (`shuffle.cpp:527-528`), so the dimensions above the 8-bit slot keep their places.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        output.stick_dims.remove(&self.dim);
+        output.slice_dims[SliceDim::Bit4.index()] = self.dim;
+        output.slice_dims[SliceDim::Bit8.index()] = DimSymbol::DUMMY;
+        output
+    }
+
+    /// Replaces: e150_cost
+    ///
+    /// One instruction per two input sticks.
+    ///
+    /// ⛔ SPELLED `int_pow2(input.stickDims().size())` (`shuffle.cpp:533`) WHERE EVERY OTHER COST
+    /// SPELLS THE SAME NUMBER `numSticks()` — both are `1 << |stick dims|`, so this is not a second
+    /// quantity. ⛔ AND THE DIVISION IS INTEGER: a one-stick layout costs 0, not 0.5.
+    #[must_use]
+    pub fn cost(&self, input: &AbstractLayout) -> ShuffleCost {
+        ShuffleCost((input.num_sticks().0 / 2) as f64)
+    }
+}
+
+/// THE `pack24` INSTRUCTION — takes a stick dimension into the slice, drops the 2-, 4- and 8-bit
+/// subdimensions and slides the rest down three places (`shuffle.cpp:543`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pack24Action {
+    dim: DimSymbol,
+}
+
+impl Pack24Action {
+    /// `Pack24Action(stick_dim)` (`shuffle.cpp:571`).
+    #[must_use]
+    pub const fn new(dim: DimSymbol) -> Self {
+        Self { dim }
+    }
+
+    /// The stick dimension being packed in.
+    #[must_use]
+    pub const fn dim(&self) -> DimSymbol {
+        self.dim
+    }
+
+    /// Replaces: e151_act
+    ///
+    /// The 16-, 32- and 64-bit dimensions drop three slots to the bottom of the slice, `dim` lands
+    /// in the 16-bit slot, and the 32- and 64-bit slots become dummies.
+    ///
+    /// ⛔ THE THREE ERASES RUN DESCENDING — `{dim_8bit, dim_4bit, dim_2bit}` (`shuffle.cpp:577`) —
+    /// so they drop exactly the bottom three originals, and `insert(end(), {dim, getDummy(),
+    /// getDummy()})` restores the six-slot length. ⛔ TWO dummies, not one: `pack24` frees three
+    /// slots and fills only one.
+    #[must_use]
+    pub fn act(&self, input: &AbstractLayout) -> AbstractLayout {
+        let mut output = input.clone();
+        output.stick_dims.remove(&self.dim);
+        output.slice_dims[SliceDim::Bit2.index()] = input.slice_dim(SliceDim::Bit16);
+        output.slice_dims[SliceDim::Bit4.index()] = input.slice_dim(SliceDim::Bit32);
+        output.slice_dims[SliceDim::Bit8.index()] = input.slice_dim(SliceDim::Bit64);
+        output.slice_dims[SliceDim::Bit16.index()] = self.dim;
+        output.slice_dims[SliceDim::Bit32.index()] = DimSymbol::DUMMY;
+        output.slice_dims[SliceDim::Bit64.index()] = DimSymbol::DUMMY;
+        output
+    }
+}
+
+/// THE `gcvt` PACK — the one action family that CHANGES THE FORMAT, converting fp16 sticks to the
+/// goal's fp8 while packing a stick dimension into the slice (`shuffle.cpp:593`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GCVTF16F8PackAction {
+    dim: DimSymbol,
+}
+
+impl GCVTF16F8PackAction {
+    /// `GCVTF16F8PackAction(stick_dim)` (`shuffle.cpp:618`).
+    #[must_use]
+    pub const fn new(dim: DimSymbol) -> Self {
+        Self { dim }
+    }
+
+    /// The stick dimension being packed in.
+    #[must_use]
+    pub const fn dim(&self) -> DimSymbol {
+        self.dim
+    }
+
+    /// Replaces: e152__out_format
+    ///
+    /// THE FORMAT THIS ACTION LEAVES THE STICKS IN — the goal's own fp8 format when the input is an
+    /// fp16 and the goal an fp8, and nothing at all otherwise, which is how `add_valid_actions`
+    /// (e319) decides whether to offer the action.
+    ///
+    /// ⛔ BOTH SIDES ARE TWO FORMATS WIDE (`is_any_of`, `shuffle.cpp:600-602`), and TWO OF THE FOUR
+    /// ARE OUTSIDE OUR TEMPLATE CENSUS — `IEEE_FP16` and `SEN152_FP8` have no
+    /// [`crate::generated::DataType`], which is why the layout carries a
+    /// [`DataFormat`](crate::formats::DataFormat). Narrowing to the census would silently stop
+    /// offering the conversion for a torch-fp16 input.
+    #[must_use]
+    pub const fn out_format(input: DataFormat, goal: &AbstractLayout) -> Option<DataFormat> {
+        match (input, goal.format) {
+            (
+                DataFormat::IeeeFp16 | DataFormat::Sen169Fp16,
+                DataFormat::Sen143Fp8 | DataFormat::Sen152Fp8,
+            ) => Some(goal.format),
+            _ => None,
+        }
+    }
+}
 
 // crustify:todo: e153_act
 //   authority : ddc/transformations/automatic_shuffle/shuffle.cpp:620  (7 body lines, level 0)
@@ -1022,7 +1241,7 @@ mod tests_e137_e144 {
         PackAction, PackDim, PseudoReg, ShuffleCost, ShuffleIndex, StickIndex, SwapBuffer,
         int_log2, packmerge_psuedostring,
     };
-    use crate::generated::DataType;
+    use crate::formats::DataFormat;
     use std::collections::BTreeSet;
 
     /// Symbols 1, 2, 3, 4 — `getDefaultSymbol()` and its successors.
@@ -1037,7 +1256,7 @@ mod tests_e137_e144 {
         AbstractLayout::new(
             sticks.iter().copied().collect::<BTreeSet<_>>(),
             slice,
-            DataType::Senint8,
+            DataFormat::Senint8,
         )
     }
 
@@ -1210,6 +1429,175 @@ mod tests_e137_e144 {
         assert_eq!(
             PackAction::new(DUMMY, PackDim::Bit32).act(&input),
             layout(&[A, B], [C, D, A, B, DUMMY, C])
+        );
+    }
+}
+
+// ═══ e145..e152 — THE PACK, SHIFT AND GCVT ACTIONS ═══════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests_e145_e152 {
+    use super::{
+        AbstractLayout, DIMS_PER_SLICE, DimSymbol, GCVTF16F8PackAction, Pack8Action, Pack9Action,
+        Pack24Action, PackAction, PackDim, ShiftLeftAction, ShuffleCost, ShuffleIndex,
+    };
+    use crate::formats::DataFormat;
+    use std::collections::BTreeSet;
+
+    /// The symbol with this id; `0` is the dummy, as the reference numbers them.
+    fn sym(id: i32) -> DimSymbol {
+        let mut symbol = DimSymbol::DUMMY;
+        for _ in 0..id {
+            symbol = symbol.next();
+        }
+        symbol
+    }
+
+    /// A layout from slice symbol ids (2-bit slot first) and stick symbol ids.
+    fn layout(slice: [i32; DIMS_PER_SLICE], sticks: &[i32]) -> AbstractLayout {
+        AbstractLayout::new(
+            sticks.iter().copied().map(sym).collect(),
+            slice.map(sym),
+            DataFormat::Senint8,
+        )
+    }
+
+    /// The slice as symbol ids, so a failure prints the layout rather than six `DimSymbol`s.
+    fn slice_ids(of: &AbstractLayout) -> Vec<i32> {
+        of.slice_dims.iter().map(|dim| dim.id()).collect()
+    }
+
+    /// The stick dimensions as symbol ids.
+    fn stick_ids(of: &AbstractLayout) -> Vec<i32> {
+        of.stick_dims.iter().map(|dim| dim.id()).collect()
+    }
+
+    fn raw(indices: &[ShuffleIndex]) -> Vec<i32> {
+        indices.iter().map(|index| index.0).collect()
+    }
+
+    /// e145 — the three vendored tables, CARRIED AS THEIR VALUES: comparing `get_indices()` against
+    /// the constants it returns would pass on any transcription error.
+    #[test]
+    fn a_pack_names_the_vendors_three_tables() {
+        assert_eq!(
+            raw(PackAction::new(sym(1), PackDim::Bit64).get_indices()),
+            [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30],
+            "pack25 (shuffle.cpp:42)"
+        );
+        assert_eq!(
+            raw(PackAction::new(sym(1), PackDim::Bit32).get_indices()),
+            [0, 2, 4, 6, 16, 18, 20, 22, 8, 10, 12, 14, 24, 26, 28, 30],
+            "pack26 (shuffle.cpp:44)"
+        );
+        assert_eq!(
+            raw(PackAction::new(sym(1), PackDim::Bit16).get_indices()),
+            [0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30],
+            "pack27 (shuffle.cpp:46)"
+        );
+    }
+
+    /// e146 — the shift moves the slice up from the 8-bit slot and dummies it, and the 64-bit
+    /// dimension it displaces reaches the sticks ONLY when the action extracts.
+    #[test]
+    fn a_shift_left_slides_the_slice_up_and_dummies_the_8_bit_slot() {
+        let input = layout([1, 2, 3, 4, 5, 6], &[7]);
+
+        let extracted = ShiftLeftAction::new(sym(6)).act(&input);
+        assert_eq!(slice_ids(&extracted), [1, 2, 0, 3, 4, 5]);
+        assert_eq!(stick_ids(&extracted), [6, 7]);
+
+        let dropped = ShiftLeftAction::new(DimSymbol::DUMMY).act(&input);
+        assert_eq!(slice_ids(&dropped), [1, 2, 0, 3, 4, 5]);
+        assert_eq!(stick_ids(&dropped), [7], "a dummy 64-bit slot is discarded");
+    }
+
+    /// e147 — one instruction per stick, two when it extracts. ⛔ AND NO DIVISION: the one-stick
+    /// layout costs 1, where a merge or a pack costs 0.
+    #[test]
+    fn a_shift_left_costs_double_when_it_extracts() {
+        let eight = layout([1, 2, 3, 4, 5, 6], &[7, 8, 9]);
+        assert_eq!(ShiftLeftAction::new(sym(6)).cost(&eight), ShuffleCost(16.0));
+        assert_eq!(
+            ShiftLeftAction::new(DimSymbol::DUMMY).cost(&eight),
+            ShuffleCost(8.0)
+        );
+
+        let one = layout([1, 2, 3, 4, 5, 6], &[]);
+        assert_eq!(
+            ShiftLeftAction::new(DimSymbol::DUMMY).cost(&one),
+            ShuffleCost(1.0),
+            "no division here, unlike every other cost"
+        );
+    }
+
+    /// e148 — `pack8` drops the 4- and 8-bit slots, slides three dimensions down and dummies the
+    /// 64-bit slot.
+    #[test]
+    fn pack8_drops_two_slots_and_lands_the_dim_in_the_32_bit_slot() {
+        let packed = Pack8Action::new(sym(7)).act(&layout([1, 2, 3, 4, 5, 6], &[7, 8]));
+        assert_eq!(slice_ids(&packed), [1, 4, 5, 6, 7, 0]);
+        assert_eq!(stick_ids(&packed), [8]);
+    }
+
+    /// e149 — `pack9` assigns in place: the 4-bit slot takes the dimension, the 8-bit slot goes
+    /// dummy, and NOTHING ABOVE THEM MOVES.
+    #[test]
+    fn pack9_assigns_the_4_bit_slot_without_sliding() {
+        let packed = Pack9Action::new(sym(7)).act(&layout([1, 2, 3, 4, 5, 6], &[7]));
+        assert_eq!(slice_ids(&packed), [1, 7, 0, 4, 5, 6]);
+        assert!(stick_ids(&packed).is_empty());
+    }
+
+    /// e150 — half the input sticks, by INTEGER division: a one-stick layout costs 0.
+    #[test]
+    fn pack9_costs_half_the_sticks_and_rounds_down() {
+        assert_eq!(
+            Pack9Action::new(sym(9)).cost(&layout([1, 2, 3, 4, 5, 6], &[7, 8, 9])),
+            ShuffleCost(4.0)
+        );
+        assert_eq!(
+            Pack9Action::new(sym(9)).cost(&layout([1, 2, 3, 4, 5, 6], &[])),
+            ShuffleCost(0.0),
+            "1 / 2 is 0, not 0.5"
+        );
+    }
+
+    /// e151 — `pack24` drops three slots, slides three dimensions to the bottom and leaves TWO
+    /// dummies behind.
+    #[test]
+    fn pack24_drops_three_slots_and_leaves_two_dummies() {
+        let packed = Pack24Action::new(sym(7)).act(&layout([1, 2, 3, 4, 5, 6], &[7]));
+        assert_eq!(slice_ids(&packed), [4, 5, 6, 7, 0, 0]);
+        assert!(stick_ids(&packed).is_empty());
+    }
+
+    /// e152 — both fp16 spellings convert, to both fp8 spellings, and nothing else converts at all.
+    #[test]
+    fn a_gcvt_pack_converts_only_fp16_to_the_goals_fp8() {
+        let goal = |format| {
+            AbstractLayout::new(BTreeSet::new(), [DimSymbol::DUMMY; DIMS_PER_SLICE], format)
+        };
+
+        for input in [DataFormat::IeeeFp16, DataFormat::Sen169Fp16] {
+            for out in [DataFormat::Sen143Fp8, DataFormat::Sen152Fp8] {
+                assert_eq!(
+                    GCVTF16F8PackAction::out_format(input, &goal(out)),
+                    Some(out),
+                    "{input:?} -> {out:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            GCVTF16F8PackAction::out_format(DataFormat::IeeeFp32, &goal(DataFormat::Sen143Fp8)),
+            None,
+            "the input has to be an fp16"
+        );
+        assert_eq!(
+            GCVTF16F8PackAction::out_format(DataFormat::Sen169Fp16, &goal(DataFormat::Sen169Fp16)),
+            None,
+            "the goal has to be an fp8"
         );
     }
 }
