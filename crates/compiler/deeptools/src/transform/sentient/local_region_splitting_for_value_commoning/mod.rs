@@ -318,10 +318,43 @@ const fn register_class(locale: RegType) -> RegFile {
     }
 }
 
-// crustify:todo: e308_cluster
-//   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:330  (14 body lines, level 1)
-//   original  : void LocalRegionSplittingForValueCommoningPass::cluster( GroupedValuesTy &output, const ArrayRef<Value> units, ListOfUniformMapsTy &uniform_maps) const
-//   calls     : e252_size
+/// Replaces: e308_cluster
+///
+/// APPENDS one group per unit — the fall-back that splits a local region into one region per unit.
+///
+/// ⛔ ONE GROUP PER UNIT *IS* THE PORT. The reference's own `// todo: implement an actual
+/// sophisticated clustering algorithm` (`:340`) sits above this very loop, so there is no algorithm
+/// here to omit; `uniform_maps` is read only by the check.
+/// ⭐ THE `DT_CHECK_MSG` IS WHAT MAKES `uniform_maps` A PARAMETER: every map captured must be keyed by
+/// exactly the units of the local region being split (`:334-337`).
+pub fn cluster(
+    output: &mut Vec<Vec<Val>>,
+    units: &[Val],
+    uniform_maps: &[UniformMap],
+    defs: Definitions<'_>,
+) {
+    for map in uniform_maps {
+        // `uniform_map.getKeys()` — the `$keys` operands of the `uniform.def_immutable_mapping`.
+        let keys = match defs.of(map.handle()) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs.len(),
+            _ => panic!(
+                "a captured uniform map's handle is not defined by a \
+                 uniform.def_immutable_mapping (LocalRegionSplittingForValueCommoning.cpp:334)"
+            ),
+        };
+        if keys != units.len() {
+            panic!(
+                "expected all the maps captured to be from the local region that represents the \
+                 list of input units (LocalRegionSplittingForValueCommoning.cpp:334-337)"
+            );
+        }
+    }
+
+    // fall-back: naively splitting every unit into its own local region.
+    for unit in units {
+        output.push(vec![*unit]);
+    }
+}
 
 // crustify:todo: e444_analyze
 //   authority : dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:273  (32 body lines, level 2)
@@ -466,6 +499,27 @@ mod unit_tests {
         assert_eq!(
             get_max_reg_num::<Dd2>(RegType::Lbr, Component::L3lu, unset),
             MaxRegNum(8)
+        );
+    }
+
+    /// e308 — every unit becomes its own group, APPENDED to whatever the caller already had.
+    #[test]
+    fn cluster_gives_every_unit_its_own_group() {
+        let outer = vec![Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: Val(100),
+            pairs: vec![(Val(1), Val(11)), (Val(2), Val(12)), (Val(3), Val(13))],
+        })];
+        let units = [Val(1), Val(2), Val(3)];
+        let mut output = vec![vec![Val(9)]];
+        cluster(
+            &mut output,
+            &units,
+            &[UniformMap::of(Val(100))],
+            Definitions::from_innermost(&[&outer]),
+        );
+        assert_eq!(
+            output,
+            vec![vec![Val(9)], vec![Val(1)], vec![Val(2)], vec![Val(3)]]
         );
     }
 }

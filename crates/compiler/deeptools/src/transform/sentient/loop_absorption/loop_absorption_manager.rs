@@ -89,6 +89,8 @@
 // clippy with `-D warnings`. ⭐ REMOVE THIS WITH e600.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 use crate::bridges::dataflow_ir_to_sentient::tf_cfgs_dataflow_conditional_tree::{
     BlockArgEquivalence, EquivalenceTag, OperationEquivalence, SubregionCompare,
 };
@@ -128,14 +130,28 @@ pub(crate) struct AnchorPositions<'s> {
     pub terminator: Option<&'s sentient::Op>,
 }
 
+/// WHICH ARGUMENT OF THE ANCHOR LOOP A NEW STARTING VALUE BELONGS TO — the `int` key of
+/// `iter_arg_num_to_new_start_val_` (`LoopAbsorption.hpp:43`).
+///
+/// ⛔⛔ IT IS A BLOCK-ARGUMENT NUMBER USED DIRECTLY AS AN OPERAND INDEX. `canAbsorbToTheLeft` keys on
+/// `cast<BlockArgument>(b_operand).getArgNumber()` (`:169`) and `absorbIntoAnchorFromLeft` hands it
+/// straight to `setOperand` (`:238`); a `sentient.for` BINDS `[iv, iterArgs..]` and TAKES
+/// `[bound, inits..]`, so `AnchorArgNumber(i)` for `i >= 1` really is `inits[i - 1]` — but
+/// `AnchorArgNumber(0)` is the induction variable, and writes the loop's `$bound`.
+/// ⭐ A TRAP KEPT, NOT A TYPO FIXED: the mirror image in `canAbsorbToTheRight` subtracts the 1 and
+/// says so — *"getArgNumber() counts the inductive variable as argument #0"* (`:334-336`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AnchorArgNumber(pub usize);
+
 /// HOW MUCH `updateLoopBound` ADDS TO THE ANCHOR'S TRIP COUNT — its `int64_t increment`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct BoundIncrement(pub i64);
 
 /// `LoopAbsorptionManager` (`LoopAbsorption.hpp:22`) — one anchor loop and the absorptions into it.
 ///
-/// ⚠️ `iter_arg_num_to_new_start_val_` and `to_update_` (`:43-51`) are NOT fields yet: they are what
-/// `e506_canAbsorbToTheLeft`/`e507_canAbsorbToTheRight` populate, and they arrive with those units.
+/// ⭐ `iter_arg_num_to_new_start_val_` AND `to_update_` (`:43-51`) ARE FIELDS: `e506_canAbsorbToTheLeft`
+/// and `e507_canAbsorbToTheRight` fill them while checking equivalence, and the two absorptions here
+/// apply and clear them.
 #[derive(Debug)]
 pub(crate) struct LoopAbsorptionManager<'a> {
     /// `oe_` — already ported, and already tagged `"loop-absorption"`.
@@ -150,6 +166,12 @@ pub(crate) struct LoopAbsorptionManager<'a> {
     anchor_for_op: ForRef,
     /// The unit the anchor lives in — what the three `Block *` fields point into.
     site: UnitSite<'a>,
+    /// `iter_arg_num_to_new_start_val_` (`LoopAbsorption.hpp:43`) — drained by
+    /// [`Self::absorb_into_anchor_from_left`]. See [`AnchorArgNumber`] for what the key really is.
+    iter_arg_num_to_new_start_val: BTreeMap<AnchorArgNumber, Val>,
+    /// `to_update_` (`:51`) — the old→new result rewrites, drained by
+    /// [`Self::absorb_into_anchor_from_right`].
+    to_update: BTreeMap<Val, Val>,
 }
 
 impl<'a> LoopAbsorptionManager<'a> {
@@ -185,6 +207,8 @@ impl<'a> LoopAbsorptionManager<'a> {
             anchor,
             anchor_for_op,
             site,
+            iter_arg_num_to_new_start_val: BTreeMap::new(),
+            to_update: BTreeMap::new(),
         })
     }
 
@@ -332,6 +356,53 @@ impl<'a> LoopAbsorptionManager<'a> {
             self.tree.remove(*n);
         }
     }
+
+    /// Replaces: e309_absorbIntoAnchorFromLeft
+    ///
+    /// Rewrite the anchor's starting values, then delete the ops immediately to its LEFT — one per op
+    /// of its body, the yield excluded.
+    ///
+    /// ⛔ THE KEY IS A BLOCK-ARGUMENT NUMBER USED AS AN OPERAND INDEX — see [`AnchorArgNumber`].
+    /// ⭐ SATURATING WHERE `std::prev` WALKS OFF `begin()` (`:245-247`): it is `canAbsorbToTheLeft`'s
+    /// `rend()` test that keeps that walk in range (`:152`), so a short block absorbs what is there.
+    pub(crate) fn absorb_into_anchor_from_left(&mut self) {
+        // `for (pair : ..) setOperand(..)` then `clear()` (`:237-240`) — cleared even if the anchor
+        // has since moved, as the reference's `clear()` is unconditional too.
+        let updates = core::mem::take(&mut self.iter_arg_num_to_new_start_val);
+        let Some((block, at)) = anchor_slot_mut(self.anchor_for_op, &mut *self.site.body) else {
+            return;
+        };
+        for (arg, val) in updates {
+            dialects::set_operand(&mut block[at], arg.0, val);
+        }
+        // `int count = body_bb_->getOperations().size() - 1;` (`:244`) — the yield is not counted.
+        let count = body_len(&block[at]).saturating_sub(1);
+        block.drain(at.saturating_sub(count)..at);
+    }
+
+    /// Replaces: e310_absorbIntoAnchorFromRight
+    ///
+    /// Move every reader of an absorbed op's result onto the anchor's own result, then delete the ops
+    /// immediately to its RIGHT — one per op of its body, the yield excluded.
+    ///
+    /// ⭐ THE UNIT IS THE REWRITE SCOPE: `Value::replaceAllUsesWith` is module-wide and this manager's
+    /// widest reach is the `dataflow.program_unit` the anchor sits in.
+    /// ⭐ ERASING IN REVERSE (`:400-401`) IS ONE CONTIGUOUS REMOVAL HERE, so the order is kept for free.
+    pub(crate) fn absorb_into_anchor_from_right(&mut self) {
+        // `for (pair : to_update_) get<0>(pair).replaceAllUsesWith(get<1>(pair));` then `clear()`
+        // (`:388-391`).
+        let updates = core::mem::take(&mut self.to_update);
+        for (of, with) in updates {
+            dialects::replace_all_uses_with(&mut *self.site.body, of, with);
+        }
+        let Some((block, at)) = anchor_slot_mut(self.anchor_for_op, &mut *self.site.body) else {
+            return;
+        };
+        let count = body_len(&block[at]).saturating_sub(1);
+        // `std::next(Block::iterator(anchor_for_op_), 1)` walked forward `count` times (`:397-399`).
+        let end = block.len().min(at + 1 + count);
+        block.drain(at + 1..end);
+    }
 }
 
 /// `sentient.scalar_constant` holding `value` — the op both `ConstantOp::create` calls mint.
@@ -414,6 +485,35 @@ fn positions_of(for_op: ForRef, scope: &[Op]) -> Option<AnchorPositions<'_>> {
         }
     }
     None
+}
+
+/// [`positions_of`]'S MUTABLE TWIN — the block holding the anchor loop, and its index in it.
+///
+/// ⭐ THE TWO ABSORPTIONS NEED THE BLOCK ITSELF, not a view of it: they `erase()` the ops beside the
+/// anchor, which `AnchorPositions`' shared slices cannot express.
+fn anchor_slot_mut(for_op: ForRef, scope: &mut Vec<Op>) -> Option<(&mut Vec<Op>, usize)> {
+    if let Some(at) = scope.iter().position(
+        |op| matches!(op, Op::Sentient(sentient::Op::For { iv, .. }) if *iv == for_op.0),
+    ) {
+        return Some((scope, at));
+    }
+    for op in scope.iter_mut() {
+        for region in regions_mut_of(op) {
+            if let Some(found) = anchor_slot_mut(for_op, region) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// `body_bb_->getOperations().size()` — the anchor loop's body ops, its `sentient.yield` INCLUDED,
+/// which is why both absorptions subtract one.
+fn body_len(anchor: &Op) -> usize {
+    match anchor {
+        Op::Sentient(sentient::Op::For { body, .. }) => body.len(),
+        _ => 0,
+    }
 }
 
 /// `anchor_for_op_.getBound()` — `$bound`, the loop's one non-variadic operand.
@@ -541,16 +641,6 @@ fn is_used(scope: &mut [Op], val: Val) -> bool {
     false
 }
 
-// crustify:todo: e309_absorbIntoAnchorFromLeft
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:236  (15 body lines, level 1)
-//   original  : void LoopAbsorptionManager::absorbIntoAnchorFromLeft()
-//   calls     : e252_size
-
-// crustify:todo: e310_absorbIntoAnchorFromRight
-//   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:387  (17 body lines, level 1)
-//   original  : void LoopAbsorptionManager::absorbIntoAnchorFromRight()
-//   calls     : e252_size
-
 // crustify:todo: e506_canAbsorbToTheLeft
 //   authority : dcc/src/Transform/Sentient/LoopAbsorption.cpp:135  (99 body lines, level 3)
 //   original  : bool LoopAbsorptionManager::canAbsorbToTheLeft( std::vector<dcc::LoopNode *> &nodes_to_delete)
@@ -576,6 +666,36 @@ mod unit_tests {
             iv,
             bound,
             carried: Vec::new(),
+            dbg_name: None,
+            body,
+        })
+    }
+
+    /// One `$initArgs` slot of a loop — the five facts a [`sentient::Carried`] keeps together.
+    fn carried(init: Val, arg: Val, result: Val) -> sentient::Carried {
+        sentient::Carried {
+            init,
+            arg,
+            result,
+            reg: sentient::Reg {
+                locale: RegType::Unknown,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        }
+    }
+
+    /// One `sentient.for` carrying one value, `body` then the `sentient.yield` that closes it.
+    fn carrying_for(iv: Val, bound: Val, carried: sentient::Carried, body: Vec<Op>) -> Op {
+        let mut body = body;
+        body.push(Op::Sentient(sentient::Op::Yield {
+            results: vec![carried.arg],
+        }));
+        Op::Sentient(sentient::Op::For {
+            iv,
+            bound,
+            carried: vec![carried],
             dbg_name: None,
             body,
         })
@@ -754,5 +874,113 @@ mod unit_tests {
         assert_eq!(*manager.sorted_worklist, vec![first, anchor]);
         assert_eq!(manager.tree.next_sibling(first), Some(anchor));
         assert_eq!(manager.tree.parent_loop(middle), None);
+    }
+
+    /// e309: the new starting value lands on the anchor's own init, and exactly ONE op to the left is
+    /// absorbed — one per body op with the yield not counted.
+    #[test]
+    fn absorb_from_left_rewrites_the_inits_and_absorbs_that_many_ops() {
+        let mut vals = Values::default();
+        let bound = vals.mint();
+        let init = vals.mint();
+        let new_start = vals.mint();
+        let left = vals.mint();
+        let iv = vals.mint();
+        let arg = vals.mint();
+        let result = vals.mint();
+        let inner = vals.mint();
+        let mut body = vec![
+            constant(bound, 4, ScalarTy::Index),
+            constant(init, 0, ScalarTy::Index),
+            constant(new_start, 7, ScalarTy::Index),
+            constant(left, 1, ScalarTy::Index),
+            carrying_for(
+                iv,
+                bound,
+                carried(init, arg, result),
+                vec![constant(inner, 1, ScalarTy::Index)],
+            ),
+        ];
+        let mut tree = LoopTree::<true>::of(&body);
+        let mut worklist = vec![tree.node_of(ForRef(iv)).unwrap()];
+        let mut preamble = Vec::new();
+        let mut manager = LoopAbsorptionManager::new(
+            &mut worklist,
+            &mut tree,
+            UnitSite {
+                preamble: &mut preamble,
+                body: &mut body,
+            },
+        )
+        .unwrap();
+        // ⭐ ARGUMENT #1, so operand #1 — which really is `inits[0]`. See [`AnchorArgNumber`].
+        manager
+            .iter_arg_num_to_new_start_val
+            .insert(AnchorArgNumber(1), new_start);
+
+        manager.absorb_into_anchor_from_left();
+
+        assert!(manager.iter_arg_num_to_new_start_val.is_empty());
+        assert_eq!(manager.site.body.len(), 4);
+        let Op::Sentient(sentient::Op::For { carried, .. }) = &manager.site.body[3] else {
+            panic!("the anchor is the last op of the block")
+        };
+        assert_eq!(carried[0].init, new_start);
+    }
+
+    /// e310: the reader to the right moves onto the anchor's result, and the op it read is absorbed.
+    #[test]
+    fn absorb_from_right_repoints_uses_and_absorbs_that_many_ops() {
+        let mut vals = Values::default();
+        let bound = vals.mint();
+        let init = vals.mint();
+        let iv = vals.mint();
+        let arg = vals.mint();
+        let result = vals.mint();
+        let inner = vals.mint();
+        let right = vals.mint();
+        let sum = vals.mint();
+        let mut body = vec![
+            constant(bound, 4, ScalarTy::Index),
+            constant(init, 0, ScalarTy::Index),
+            carrying_for(
+                iv,
+                bound,
+                carried(init, arg, result),
+                vec![constant(inner, 1, ScalarTy::Index)],
+            ),
+            constant(right, 1, ScalarTy::Index),
+            Op::Sentient(sentient::Op::ScalarAdd {
+                lhs: right,
+                rhs: right,
+                result: sum,
+                reg: None,
+                ty: ScalarTy::Index,
+                element_size: None,
+            }),
+        ];
+        let mut tree = LoopTree::<true>::of(&body);
+        let mut worklist = vec![tree.node_of(ForRef(iv)).unwrap()];
+        let mut preamble = Vec::new();
+        let mut manager = LoopAbsorptionManager::new(
+            &mut worklist,
+            &mut tree,
+            UnitSite {
+                preamble: &mut preamble,
+                body: &mut body,
+            },
+        )
+        .unwrap();
+        manager.to_update.insert(right, result);
+
+        manager.absorb_into_anchor_from_right();
+
+        assert!(manager.to_update.is_empty());
+        assert_eq!(manager.site.body.len(), 4);
+        assert!(matches!(
+            &manager.site.body[3],
+            Op::Sentient(sentient::Op::ScalarAdd { lhs, rhs, .. })
+                if *lhs == result && *rhs == result
+        ));
     }
 }

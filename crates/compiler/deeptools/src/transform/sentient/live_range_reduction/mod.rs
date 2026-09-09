@@ -101,9 +101,13 @@
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
+use std::collections::BTreeMap;
 
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::dialects as lower;
 use crate::islands::sentient::dialects::{
-    Definitions, Op, Val, element_size, sentient, symbol, uniform, value_reg_locale,
+    Definitions, LocalRegion, Op, UniformRegions, Val, element_size, sentient, symbol, uniform,
+    value_reg_locale,
 };
 use crate::islands::sentient::print;
 
@@ -356,25 +360,586 @@ pub fn are_reglocales_matching(lhs: Val, rhs: Val, defs: Definitions<'_>) -> boo
     value_reg_locale(lhs, defs) == value_reg_locale(rhs, defs)
 }
 
-// crustify:todo: e304_printSsaMap
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:218  (18 body lines, level 1)
-//   original  : void LiveRangeReductionPass::printSsaMap(raw_ostream& os)
-//   calls     : e057_print, e252_size
+/// ONE EQUIVALENCE CLASS OF THE PASS'S SSA MAP — `expr_info_list_[i]` and `ssa_value_list_[i]`
+/// (`LiveRangeReduction.cpp:104-106`) as one record.
+///
+/// ⭐ ONE STRUCT WHERE THE REFERENCE KEEPS TWO PARALLEL VECTORS, because `addToMap` (`e440`, `:241`)
+/// only ever grows the two together — so a length disagreement between them is unwritable here.
+#[derive(Debug, Clone, Default)]
+pub struct EquivalenceClass {
+    /// `expr_info_list_[i]` — the flattened affine expression every value of this class shares.
+    pub expr_info: ExprInfo,
+    /// `ssa_value_list_[i]` — the values that share it, in discovery order.
+    pub values: Vec<Val>,
+}
 
-// crustify:todo: e305_getBaseExpr
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:271  (116 body lines, level 1)
-//   original  : LogicalResult LiveRangeReductionPass::getBaseExpr( PropagationAnalysis& expr_prop_analysis, const Value value, ExprInfo& expr_info, std::vector<int64_t>& const_val, bool& negated)
-//   calls     : e056_set, e252_size
+/// `LiveRangeReductionPass`'S SSA MAP — the four members `mapAllValues` (`e503`) fills and
+/// `reduceLiveRange` (`e560`) consumes (`:104-108`).
+#[derive(Debug, Clone, Default)]
+pub struct SsaMap {
+    /// `expr_info_list_` zipped with `ssa_value_list_` — see [`EquivalenceClass`].
+    pub classes: Vec<EquivalenceClass>,
+    /// `ssa_expr_const_map_` — one constant offset per unit, for each mapped value.
+    pub const_offsets: BTreeMap<Val, Vec<i64>>,
+    /// `ssa_negated_map_` — whether the value's coefficients were sign-flipped by `getBaseExpr`.
+    pub negated: BTreeMap<Val, bool>,
+}
 
-// crustify:todo: e306_getRootIterArg
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:393  (72 body lines, level 1)
-//   original  : Value LiveRangeReductionPass::getRootIterArg(Value val)
-//   calls     : e252_size
+impl SsaMap {
+    /// Replaces: e304_printSsaMap
+    ///
+    /// The `DEBUG_WITH_TYPE` dump of the whole map — one section per equivalence class, one block per
+    /// value in it.
+    ///
+    /// ⛔ EVERY CLASS'S SECTION RUNS INTO [`ExprInfo::print`], whose tail is MLIR upstream's
+    /// `FlatAffineValueConstraints::print` and out of campaign scope.
+    pub fn print_ssa_map(&self, defs: Definitions<'_>, out: &mut String) {
+        for class in &self.classes {
+            out.push_str("+++printing ExprInfo:\n");
+            class.expr_info.print(defs, out);
+            for value in &class.values {
+                out.push_str("--\n");
+                self.print_mapped_value(*value, defs, out);
+            }
+            out.push_str("\n+++++++++++++\n\n");
+        }
+    }
 
-// crustify:todo: e307_cloneValueToRegion
-//   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:917  (40 body lines, level 1)
-//   original  : std::optional<Value> cloneValueToRegion(Value val, Region& region, OpBuilder& builder)
-//   calls     : e252_size
+    /// One mapped value's block of the dump — the value itself, its per-unit constant offsets, and
+    /// whether its coefficients were negated (`:225-232`).
+    ///
+    /// ⛔ A VALUE WITH NO ENTRY PRINTS AS EMPTY AND `false`, NOT AS MISSING: both members are read
+    /// through `DenseMap::operator[]`, which DEFAULT-CONSTRUCTS on a miss.
+    /// ⭐ `os.indent(2) << "\nconst offset: "` PUTS THE TWO SPACES *BEFORE* THE NEWLINE (`:227`) —
+    /// the reference's own output, kept character for character.
+    fn print_mapped_value(&self, value: Val, defs: Definitions<'_>, out: &mut String) {
+        print_value(value, defs, out);
+        out.push_str("  \nconst offset: ");
+        for item in self.const_offsets.get(&value).into_iter().flatten() {
+            let _ = write!(out, "{item}, ");
+        }
+        let negated = self.negated.get(&value).copied().unwrap_or(false);
+        let _ = write!(
+            out,
+            "\nexpr negated: {}\n",
+            if negated { "true" } else { "false" }
+        );
+    }
+}
+
+/// `Value::print` — the DEFINING OPERATION, or the block-argument fallback.
+///
+/// ⛔ [`ExprInfo::print`] INLINES THE SAME THREE LINES rather than calling this: that anchor is
+/// already filled, and this port does not reach into completed work to share a helper.
+fn print_value(val: Val, defs: Definitions<'_>, out: &mut String) {
+    match defs.of(val) {
+        Some(op) => print::emit(out, op, 0),
+        None => match defs.for_arg_of(val) {
+            Some((_, index)) => {
+                let _ = writeln!(out, "<block argument> of type 'index' at index: {index}");
+            }
+            None => out.push('\n'),
+        },
+    }
+}
+
+/// `AffineMap` AS THIS PASS USES ONE — an identity, plus the single structural fact `getBaseExpr`
+/// reads off it.
+///
+/// ⛔ MLIR UPSTREAM AND OUT OF CAMPAIGN SCOPE, exactly like [`FlatAffineValueConstraints`]: the map is
+/// built by `PropagationAnalysis` and flattened by `mlir::getFlattenedAffineExpr`, neither of which is
+/// in this scope. `getResult(0)` is the only expression ever taken from it (`:308`), so the map does
+/// not have to be indexable here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PropagatedMap {
+    /// WHICH map — `propagated_map_`, held by identity.
+    pub id: u32,
+    /// `getNumDims()` (`:328`) — how many of the flattened coefficients are dimension coefficients.
+    pub num_dims: usize,
+}
+
+/// `PropagationAnalysis::ExprInfo` (`Analyses/PropagationAnalysis.h:38`) — ONE UNIT'S PROPAGATED
+/// EXPRESSION.
+///
+/// ⛔ NOT THIS PASS'S OWN [`ExprInfo`], which is a different class of the same name (`:116`).
+#[derive(Debug, Clone, Default)]
+pub struct PropagatedExpr {
+    /// `propagated_map_`.
+    pub propagated_map: PropagatedMap,
+    /// `propagated_args_` — the SSA values the map's dimensions stand for.
+    pub propagated_args: Vec<Val>,
+    /// `cannot_be_resolved_`.
+    pub cannot_be_resolved: bool,
+}
+
+/// `mlir::getFlattenedAffineExpr`'S THREE OUTPUTS for one expression (`:308-310`).
+#[derive(Debug, Clone, Default)]
+pub struct FlattenedExpr {
+    /// `flat_expr` — one coefficient per dim, then per local var, then the constant LAST.
+    pub coeffs: Vec<i64>,
+    /// The local-variable system built alongside them.
+    pub constraints: FlatAffineValueConstraints,
+    /// `local_vars_constraints.getNumLocalVars()`.
+    pub num_local_vars: usize,
+}
+
+/// `PropagationAnalysis::ExprInfoMap` (`Analyses/PropagationAnalysis.h:106`) — the BUCKETS of
+/// propagated expressions for one value, and which bucket each unit reads.
+///
+/// ⭐ [`Self::buckets`]`.len()` IS `getUnitNumber()`, so the unit count and the unit→bucket map cannot
+/// disagree; `unit_number() == 0` is the reference's `isGlobal()`.
+#[derive(Debug, Clone, Default)]
+pub struct ExprInfoMap {
+    /// `getExprInfoList()` — `None` is the reference's null bucket.
+    pub exprs: Vec<Option<PropagatedExpr>>,
+    /// `getListIdxFromUnitIdx(i)` for every unit `i`, in unit order.
+    pub buckets: Vec<usize>,
+}
+
+impl ExprInfoMap {
+    /// `getUnitNumber()` (`:223`).
+    #[must_use]
+    pub fn unit_number(&self) -> usize {
+        self.buckets.len()
+    }
+}
+
+/// `PropagationAnalysis` (`Analyses/PropagationAnalysis.h`) — THE SEAM ONTO AN ANALYSIS THIS CAMPAIGN
+/// DOES NOT PORT, the same arrangement [`crate::transform::sentient::analyses`] uses for the others.
+///
+/// ⛔ SCOPED TO THIS FILE UNTIL A SECOND CONSUMER APPEARS. Hoist it beside those seams when one does;
+/// `crustify-senpass/OUTSIDE-DEPS.tsv` names this analysis for several more passes.
+pub trait PropagationAnalysis {
+    /// `getAffineExpression(Value)` (`Analyses/PropagationAnalysis.h:308`).
+    fn affine_expression(&mut self, val: Val) -> ExprInfoMap;
+
+    /// `mlir::getFlattenedAffineExpr(map.getResult(0), map.getNumDims(), 0, ..)` (`:308-310`).
+    fn flattened_affine_expr(&self, map: PropagatedMap) -> FlattenedExpr;
+}
+
+/// THE ANALYSIS THIS CAMPAIGN DOES NOT PORT — every method `todo!`s, naming it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopePropagationAnalysis;
+
+impl PropagationAnalysis for OutOfScopePropagationAnalysis {
+    fn affine_expression(&mut self, _val: Val) -> ExprInfoMap {
+        todo!(
+            "PropagationAnalysis::getAffineExpression \
+             (dcc/src/Transform/Sentient/Analyses/PropagationAnalysis.h) — out of campaign scope"
+        )
+    }
+
+    fn flattened_affine_expr(&self, _map: PropagatedMap) -> FlattenedExpr {
+        todo!(
+            "mlir::getFlattenedAffineExpr (mlir/Dialect/Affine/Analysis/AffineStructures.h) \
+             — MLIR upstream, out of campaign scope"
+        )
+    }
+}
+
+/// WHAT `getBaseExpr` ANSWERS WITH — the three out-parameters it fills on `LogicalResult::success()`.
+#[derive(Debug, Clone, Default)]
+pub struct BaseExpr {
+    /// `expr_info` — the one flattened expression every unit agreed on.
+    pub expr_info: ExprInfo,
+    /// `const_val` — ONE CONSTANT PER UNIT, `i64::MAX` where no expression applies.
+    pub const_val: Vec<i64>,
+    /// `negated` — whether the agreed coefficients were sign-flipped to make the first non-zero one
+    /// positive.
+    pub negated: bool,
+}
+
+/// Replaces: e305_getBaseExpr
+///
+/// One value's base expression: flatten every unit's propagated map, insist they all agree, and hand
+/// back the per-unit constant offsets they differ by.
+///
+/// ⛔ `None` IS `LogicalResult::failure()` — no unit resolved, or two of them disagreed.
+/// ⛔ `i64::MAX` IS THE "NO EXPRESSION FOR THIS UNIT" SENTINEL, written by three separate paths, then
+/// smoothed away for a `uniform.uniformize_regions` result because those live in the global region.
+/// ⭐ THE `args.size() > dim_num` TRIM IS THE REFERENCE'S OWN WORKAROUND for a bug in expression
+/// propagation (`:333-336`) — kept, comment and all.
+#[must_use]
+pub fn get_base_expr(
+    analysis: &mut impl PropagationAnalysis,
+    value: Val,
+    defs: Definitions<'_>,
+) -> Option<BaseExpr> {
+    let expr_info_map = analysis.affine_expression(value);
+    let is_constant = is_sentient_constant(value, defs);
+    // `isa<OpResult>(value)`, whose complement is `isa<BlockArgument>(value)`.
+    let is_op_result = defs.of(value).is_some();
+    let mut expr_info = ExprInfo::default();
+    let mut negated = false;
+    let mut is_expr_info_known = false;
+    let mut num_irresolvable = 0usize;
+    let mut const_val_tmp: Vec<i64> = Vec::new();
+    // Each bucket here may correspond to one or multiple units.
+    for expr in &expr_info_map.exprs {
+        // if no expression, use INT64_MAX to indicate no applicable expression for this unit
+        let Some(expr) = expr else {
+            const_val_tmp.push(i64::MAX);
+            continue;
+        };
+        // for constant values, const_val needs to be filled.
+        if expr.cannot_be_resolved && !is_constant {
+            num_irresolvable += 1;
+            // if expressions for all cores are irresolvable, return failure
+            // if value is blockArgument, use itself as baseExpr
+            if num_irresolvable == expr_info_map.exprs.len() && is_op_result {
+                return None;
+            }
+            const_val_tmp.push(i64::MAX);
+            continue;
+        }
+
+        let flat = analysis.flattened_affine_expr(expr.propagated_map);
+        let mut coeffs = flat.coeffs;
+        let dim_num = expr.propagated_map.num_dims;
+        let mut args = expr.propagated_args.clone();
+        // TODO there is a bug in expression propagation pass which incorrectly adds
+        // additional value to args_. a temporary fix to remove the first entry.
+        if args.len() > dim_num {
+            args.remove(0);
+        }
+        // ⛔ `DT_CHECK(flat_expr.size() == dim_num + getNumLocalVars() + 1)` (`:337-338`).
+        if coeffs.len() != dim_num + flat.num_local_vars + 1 {
+            panic!(
+                "a flattened affine expression has {} coefficients, not one per dimension, one per \
+                 local variable and one constant (LiveRangeReduction.cpp:337-338)",
+                coeffs.len()
+            );
+        }
+
+        // the const expr is at the back.
+        const_val_tmp.push(coeffs.pop().unwrap_or(i64::MAX));
+        // normalize flat_expr to make the first non-zero value positive.
+        let temp_negated = coeffs
+            .iter()
+            .find(|coeff| **coeff != 0)
+            .is_some_and(|coeff| *coeff < 0);
+        if temp_negated {
+            for coeff in &mut coeffs {
+                // ⭐ `-x` ON `i64::MIN` IS THE REFERENCE'S OWN TWO'S-COMPLEMENT WRAP.
+                *coeff = coeff.wrapping_neg();
+            }
+        }
+        if is_expr_info_known {
+            // compare the new expr with the existing one
+            let mut new_expr_info = ExprInfo::default();
+            new_expr_info.set(coeffs, args, flat.constraints);
+            // If mismatching expr_info (e.g. due to different coefficients), return failure.
+            if !expr_info_eq(&new_expr_info, &expr_info) || negated != temp_negated {
+                return None;
+            }
+        } else {
+            // set expr_info for the first time
+            expr_info.set(coeffs, args, flat.constraints);
+            negated = temp_negated;
+            is_expr_info_known = true;
+        }
+    }
+
+    // At this point const_val_tmp contains one constant per bucket. However, we need one per unit.
+    // ⭐ A BUCKET INDEX PAST THE LIST TAKES THE SENTINEL — the same "no expression for this unit"
+    // answer the null bucket gives, and only reachable if the analysis disagreed with itself.
+    let mut const_val: Vec<i64> = expr_info_map
+        .buckets
+        .iter()
+        .map(|bucket| const_val_tmp.get(*bucket).copied().unwrap_or(i64::MAX))
+        .collect();
+
+    // if iter_arg is not resolvable for all units, copy the last entry of const_val to all others
+    if num_irresolvable == expr_info_map.exprs.len()
+        && expr_info_map.exprs.len() > 1
+        && !is_op_result
+    {
+        if let Some(last) = const_val.last().copied() {
+            // ⭐ SATURATING WHERE `const_val.size() - 1` WOULD WRAP on an empty vector (`:388`).
+            let count = const_val.len().saturating_sub(1);
+            for item in const_val.iter_mut().take(count) {
+                *item = last;
+            }
+        }
+    }
+
+    // uniformize_regionsOp's results are in global region, so it is necessary to replace INT64_MAX
+    // entries with any valid value in the vector to improve the uniformity across cores.
+    if is_op_result && defs.of(value).is_some_and(is_uniformize_regions) {
+        let mut tmp = i64::MAX;
+        for item in &const_val {
+            if *item != i64::MAX {
+                tmp = *item;
+            }
+        }
+        for item in &mut const_val {
+            if *item == i64::MAX {
+                *item = tmp;
+            }
+        }
+    }
+
+    Some(BaseExpr {
+        expr_info,
+        const_val,
+        negated,
+    })
+}
+
+/// `ExprInfo::operator==` (`:125`) — coefficients, then args, then the two constraint SYSTEMS.
+///
+/// ⛔ NOT A DERIVED `PartialEq`, AND THE ORDER IS THE REFERENCE'S: the element-wise tests answer
+/// first, so the Presburger `isEqual` that [`FlatAffineValueConstraints`] cannot express is reached
+/// only when every coefficient and every arg already matched.
+/// ⭐ TWO IDENTICAL SYSTEMS ANSWER `true` WITHOUT IT — and that is the only case `getBaseExpr`
+/// produces, since one `getFlattenedAffineExpr` call feeds both sides of the comparison.
+fn expr_info_eq(lhs: &ExprInfo, rhs: &ExprInfo) -> bool {
+    if lhs.expr_coeffs != rhs.expr_coeffs || lhs.args != rhs.args {
+        return false;
+    }
+    if lhs.local_vars_constraints.0 == rhs.local_vars_constraints.0 {
+        return true;
+    }
+    todo!(
+        "affine::FlatAffineValueConstraints::isEqual (mlir/Analysis/Presburger/IntegerRelation.h) \
+         — MLIR upstream, out of campaign scope"
+    )
+}
+
+/// Replaces: e306_getRootIterArg
+///
+/// Walks an address back through every op that merely FORWARDS it — adds, subs, loop carries,
+/// transfers, local regions — to the value it is rooted in.
+///
+/// ⛔ ONLY THE ADDRESS RESULT OF A `load_and_extract_scalar` CHAINS: the data result represents what
+/// is STORED at that address and maps to nothing in the IR, so it ends the walk (`:456-461`).
+/// ⭐ IT ALWAYS ANSWERS WITH A VALUE, NEVER `None`: an op with no forwarding arm ends the walk at the
+/// result it was asked about, which is the reference's `break`.
+#[must_use]
+pub fn get_root_iter_arg(val: Val, defs: Definitions<'_>) -> Val {
+    let mut val = val;
+    // `while (val && !isa<BlockArgument>(val))` — a block argument has no defining op.
+    while let Some(op) = defs.of(val) {
+        let next = match op {
+            // Follow the operand that is not a constant, preferring `$inp1` (`:422-434`).
+            Op::Sentient(
+                sentient::Op::ScalarAdd { lhs, rhs, .. } | sentient::Op::ScalarSub { lhs, rhs, .. },
+            ) => {
+                if defs.of(*lhs).is_none() || !is_sentient_constant(*lhs, defs) {
+                    *lhs
+                } else {
+                    *rhs
+                }
+            }
+            // `getOperand(getResultNumber() + getNumControlOperands())` — the one control operand is
+            // `$bound`, so result `i` came from `initArgs[i]`.
+            Op::Sentient(sentient::Op::For { carried, .. }) => {
+                match carried.iter().find(|value| value.result == val) {
+                    Some(value) => value.init,
+                    None => break,
+                }
+            }
+            Op::Sentient(
+                sentient::Op::LoadAndSend { mutable_addr, .. }
+                | sentient::Op::ReceiveAndStore { mutable_addr, .. }
+                | sentient::Op::LoadComputeAndSend { mutable_addr, .. },
+            ) => *mutable_addr,
+            // `result_idx > 0 ? getDstMutableAddr() : getSrcMutableAddr()` — `results.0` is `$src_res`.
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src_mutable_addr,
+                dst_mutable_addr,
+                results,
+                ..
+            }) => {
+                if val == results.0 {
+                    *src_mutable_addr
+                } else {
+                    *dst_mutable_addr
+                }
+            }
+            Op::Sentient(sentient::Op::LoadAndExtractScalar {
+                mutable_addr,
+                addr_result,
+                ..
+            }) => {
+                if val == *addr_result {
+                    *mutable_addr
+                } else {
+                    break;
+                }
+            }
+            local if is_uniformize_regions(local) => match uniformize_result_source(local, val) {
+                Some(source) => source,
+                None => break,
+            },
+            _ => break,
+        };
+        val = next;
+    }
+    val
+}
+
+/// `dyn_cast<uniform::UniformizeRegionsOp>(op)` IN BOTH ISLAND SPELLINGS — the same op whether its
+/// regions hold this rung's ops or the rung below's, which is how `SimplifyUniformRegions` reads it.
+fn is_uniformize_regions(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Uniform(uniform::Op::UniformizeRegions { .. })
+            | Op::UniformRegions(UniformRegions::UniformizeRegions { .. })
+    )
+}
+
+/// `uniformize_op->getRegion(0).front().getTerminator()->getOperand(result_idx)` — what region 0
+/// yields for the result `val` (`:467-478`), in both island spellings.
+///
+/// ⛔ THE TWO `DT_CHECK`s ARE A SHAPE, NOT A CHOICE: more than one region means EXACTLY two, the
+/// second holding nothing but its terminator (`:470-476`).
+fn uniformize_result_source(op: &Op, val: Val) -> Option<Val> {
+    let (results, yielded, region_count, second_len) = match op {
+        Op::UniformRegions(UniformRegions::UniformizeRegions { regions, results }) => (
+            results.as_slice(),
+            regions.first().and_then(|region| match region.body.last() {
+                Some(Op::Uniform(uniform::Op::Yield { operands })) => Some(operands.as_slice()),
+                _ => None,
+            }),
+            regions.len(),
+            regions.get(1).map(|region| region.body.len()),
+        ),
+        Op::Uniform(uniform::Op::UniformizeRegions { regions, results }) => (
+            results.as_slice(),
+            regions.first().and_then(|region| match region.body.last() {
+                Some(lower::Op::Uniform(uniform::Op::Yield { operands })) => {
+                    Some(operands.as_slice())
+                }
+                _ => None,
+            }),
+            regions.len(),
+            regions.get(1).map(|region| region.body.len()),
+        ),
+        _ => return None,
+    };
+    if region_count > 1 {
+        if region_count != 2 {
+            panic!(
+                "a uniform.uniformize_regions has {region_count} regions, not one or two \
+                 (LiveRangeReduction.cpp:470)"
+            );
+        }
+        if second_len != Some(1) {
+            panic!(
+                "a uniform.uniformize_regions' second region holds more than its terminator \
+                 (LiveRangeReduction.cpp:471-476)"
+            );
+        }
+    }
+    let at = results.iter().position(|result| *result == val)?;
+    yielded?.get(at).copied()
+}
+
+/// THE SECOND REGION OF A `uniform.uniformize_regions`, WITH THE REGIONS BEFORE IT — what
+/// `cloneValueToRegion` is handed.
+///
+/// ⛔⛔ `DT_CHECK(region.getRegionNumber() == 1)` (`:920`) IS THIS TYPE, not a check: only
+/// [`Self::of`] can build one, and it answers `None` for an op that has no second region.
+/// ⭐ [`Self::preceding`] IS THE OTHER HALF OF THE REFERENCE'S `isProperAncestor` TEST: a value
+/// defined in an ENCLOSING region needs no clone, and a value defined in a SIBLING region is exactly
+/// one found in here.
+pub struct SecondRegion<'a> {
+    /// Region 1 — where the clone goes.
+    pub region: &'a mut LocalRegion,
+    /// Regions `0..1` — where a sibling region's definition is found.
+    pub preceding: &'a [LocalRegion],
+}
+
+impl<'a> SecondRegion<'a> {
+    /// Region 1 of `op`, or `None` when it has none.
+    pub fn of(op: &'a mut UniformRegions) -> Option<SecondRegion<'a>> {
+        let regions = op.regions_mut();
+        if regions.len() < 2 {
+            return None;
+        }
+        let (preceding, rest) = regions.split_at_mut(1);
+        Some(SecondRegion {
+            region: rest.first_mut()?,
+            preceding,
+        })
+    }
+}
+
+/// Replaces: e307_cloneValueToRegion
+///
+/// Makes a value defined in region 0 usable from region 1 by re-minting, INSIDE region 1, the
+/// `uniform.query_map` behind it over a mapping of region 1's own units.
+///
+/// ⛔ `None` MEANS THE MAPPING DOES NOT COVER REGION 1'S UNITS, and the caller (`e442`) then erases the
+/// op it was building and keeps the original (`LiveRangeReduction.cpp:1085-1088`).
+/// ⛔ THE `!query_op->isProperAncestor(region.getParentOp())` GUARD IS DEAD CODE (`:929`): a
+/// `uniform.query_map` carries no regions, so it can never be an ancestor of anything and the mapping
+/// is ALWAYS re-minted. Ported as the reference behaves, not as it reads.
+pub fn clone_value_to_region(val: Val, target: SecondRegion<'_>, vals: &mut Values) -> Option<Val> {
+    let SecondRegion { region, preceding } = target;
+    // `isa<OpResult>(val) && !getParentRegion()->isProperAncestor(&region)` — a sibling region's op.
+    let bodies: Vec<&[Op]> = preceding
+        .iter()
+        .map(|earlier| earlier.body.as_slice())
+        .collect();
+    let defs = Definitions::from_innermost(&bodies);
+    let Some(op) = defs.of(val) else {
+        return Some(val);
+    };
+    // ⛔ `DT_CHECK(isConstant<sentient::ConstantOp>(val))` (`:923`).
+    if !is_sentient_constant(val, defs) {
+        panic!(
+            "a non-constant value defined in a sibling local region cannot be cloned into region 1 \
+             (LiveRangeReduction.cpp:923)"
+        );
+    }
+    let Op::Uniform(uniform::Op::QueryMap { map, .. }) = op else {
+        return Some(val);
+    };
+    let Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) = defs.of(*map) else {
+        panic!(
+            "a uniform.query_map's $map is not defined by a uniform.def_immutable_mapping \
+             (LiveRangeReduction.cpp:925-926)"
+        );
+    };
+    // check if immutable map contains values for the region's units — `collectUnitVals(
+    // getRegionUnitList(1))`, then `getNonNullValuesFromKeys`, whose MISSES ARE DROPPED.
+    let keys = region.units.clone();
+    let values: Vec<Val> = keys
+        .iter()
+        .filter_map(|sought| {
+            pairs
+                .iter()
+                .find(|(mapped, _)| mapped == sought)
+                .map(|(_, value)| *value)
+        })
+        .collect();
+    if values.len() != keys.len() {
+        // if val is a queryOp which doesn't cover region's units, quit adding
+        return None;
+    }
+    let mapping = vals.mint();
+    let result = vals.mint();
+    // ⭐ THE BUILDER'S INSERTION POINT IS INSIDE THE REGION, so before its `uniform.yield`.
+    let at = region.body.len().saturating_sub(1);
+    region.body.insert(
+        at,
+        Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: mapping,
+            pairs: keys.into_iter().zip(values).collect(),
+        }),
+    );
+    region.body.insert(
+        at + 1,
+        Op::Uniform(uniform::Op::QueryMap {
+            result,
+            map: mapping,
+            key: region.arg,
+        }),
+    );
+    Some(result)
+}
 
 // crustify:todo: e440_addToMap
 //   authority : dcc/src/Transform/Sentient/LiveRangeReduction.cpp:241  (25 body lines, level 2)
@@ -616,5 +1181,233 @@ mod unit_tests {
             get_first_global_or_constant_ancestor(Val(5), &ops, defs),
             Some(Val(2))
         );
+    }
+    /// A `PropagationAnalysis` that answers with exactly what the fixture put in it.
+    struct Canned {
+        map: ExprInfoMap,
+        flats: BTreeMap<u32, FlattenedExpr>,
+    }
+
+    impl PropagationAnalysis for Canned {
+        fn affine_expression(&mut self, _val: Val) -> ExprInfoMap {
+            self.map.clone()
+        }
+
+        fn flattened_affine_expr(&self, map: PropagatedMap) -> FlattenedExpr {
+            self.flats[&map.id].clone()
+        }
+    }
+
+    /// One resolved bucket over `num_dims` dimensions.
+    fn bucket(id: u32, num_dims: usize, args: Vec<Val>) -> Option<PropagatedExpr> {
+        Some(PropagatedExpr {
+            propagated_map: PropagatedMap { id, num_dims },
+            propagated_args: args,
+            cannot_be_resolved: false,
+        })
+    }
+
+    /// e304 — a mapped value's block, and the two spaces the reference puts before the newline.
+    #[test]
+    fn print_ssa_map_dumps_the_const_offsets_and_the_negated_flag_per_value() {
+        let ops = vec![constant(Val(1)), constant(Val(2))];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+        let map = SsaMap {
+            classes: vec![EquivalenceClass {
+                expr_info: ExprInfo::default(),
+                values: vec![Val(1), Val(2)],
+            }],
+            const_offsets: BTreeMap::from([(Val(1), vec![4, 8])]),
+            negated: BTreeMap::from([(Val(1), true)]),
+        };
+
+        let mut out = String::new();
+        map.print_mapped_value(Val(1), defs, &mut out);
+        assert!(
+            out.ends_with("  \nconst offset: 4, 8, \nexpr negated: true\n"),
+            "{out}"
+        );
+        // ⛔ A VALUE WITH NO ENTRY IS EMPTY AND `false`, not missing.
+        let mut out = String::new();
+        map.print_mapped_value(Val(2), defs, &mut out);
+        assert!(
+            out.ends_with("  \nconst offset: \nexpr negated: false\n"),
+            "{out}"
+        );
+        // No classes, no output at all.
+        let mut out = String::new();
+        SsaMap::default().print_ssa_map(defs, &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// e305 — the sign normalisation, the popped constant, the null bucket's sentinel, and the
+    /// failure two disagreeing buckets produce.
+    #[test]
+    fn get_base_expr_normalizes_the_sign_and_refuses_disagreeing_units() {
+        let ops = vec![constant(Val(1))];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+
+        let mut agreeing = Canned {
+            // Unit 0 reads bucket 0; unit 1 reads the null bucket 1.
+            map: ExprInfoMap {
+                exprs: vec![bucket(0, 1, vec![Val(7)]), None],
+                buckets: vec![0, 1],
+            },
+            flats: BTreeMap::from([(
+                0,
+                FlattenedExpr {
+                    coeffs: vec![-2, 5],
+                    constraints: FlatAffineValueConstraints(3),
+                    num_local_vars: 0,
+                },
+            )]),
+        };
+        let base = get_base_expr(&mut agreeing, Val(1), defs).unwrap();
+        // ⭐ THE CONSTANT IS POPPED OFF THE BACK, and the remaining coefficient is sign-flipped.
+        assert_eq!(base.expr_info.expr_coeffs, vec![2]);
+        assert!(base.negated);
+        assert_eq!(base.expr_info.args, vec![Val(7)]);
+        assert_eq!(base.const_val, vec![5, i64::MAX]);
+
+        // Two resolved buckets whose coefficients differ — `LogicalResult::failure()`.
+        let mut disagreeing = Canned {
+            map: ExprInfoMap {
+                exprs: vec![bucket(0, 1, vec![Val(7)]), bucket(1, 1, vec![Val(7)])],
+                buckets: vec![0, 1],
+            },
+            flats: BTreeMap::from([
+                (
+                    0,
+                    FlattenedExpr {
+                        coeffs: vec![2, 5],
+                        constraints: FlatAffineValueConstraints(3),
+                        num_local_vars: 0,
+                    },
+                ),
+                (
+                    1,
+                    FlattenedExpr {
+                        coeffs: vec![3, 5],
+                        constraints: FlatAffineValueConstraints(3),
+                        num_local_vars: 0,
+                    },
+                ),
+            ]),
+        };
+        assert!(get_base_expr(&mut disagreeing, Val(1), defs).is_none());
+    }
+
+    /// e306 — the walk crosses the constant offset, the loop carry and the address result, and stops
+    /// dead on the data result.
+    #[test]
+    fn root_iter_arg_chains_addresses_and_stops_on_a_data_result() {
+        let ops = vec![
+            constant(Val(1)),
+            // `%3 = %1 + %2` — `$inp1` is the constant, so the walk follows `$inp2`, a block argument.
+            add(Val(1), Val(2), Val(3)),
+            extract(Val(3), (Val(4), Val(5)), 16, RegType::Lar),
+            Op::Sentient(sentient::Op::For {
+                iv: Val(60),
+                bound: Val(1),
+                carried: vec![sentient::Carried {
+                    init: Val(4),
+                    arg: Val(61),
+                    result: Val(62),
+                    reg: Reg {
+                        locale: RegType::Unknown,
+                        index: None,
+                    },
+                    program_header: false,
+                    element_size: None,
+                }],
+                dbg_name: None,
+                body: Vec::new(),
+            }),
+        ];
+        let regions: [&[Op]; 1] = [&ops];
+        let defs = Definitions::from_innermost(&regions);
+
+        assert_eq!(get_root_iter_arg(Val(4), defs), Val(2));
+        // ⛔ THE DATA RESULT CHAINS NOWHERE.
+        assert_eq!(get_root_iter_arg(Val(5), defs), Val(5));
+        // A loop result walks back to the `initArgs` entry it came from, then on down the chain.
+        assert_eq!(get_root_iter_arg(Val(62), defs), Val(2));
+    }
+
+    /// e307 — the query is re-minted inside region 1 over region 1's own units, and a mapping that
+    /// misses one of them refuses.
+    #[test]
+    fn clone_value_to_region_remints_the_query_over_the_regions_own_units() {
+        let mut vals = Values::default();
+        let unit_a = vals.mint();
+        let unit_b = vals.mint();
+        let val_a = vals.mint();
+        let val_b = vals.mint();
+        let mapping = vals.mint();
+        let query = vals.mint();
+        let r0_arg = vals.mint();
+        let r1_arg = vals.mint();
+
+        let covering = |pairs: Vec<(Val, Val)>| {
+            UniformRegions::UniformizeRegions {
+                regions: vec![
+                    LocalRegion {
+                        arg: r0_arg,
+                        units: vec![unit_a, unit_b],
+                        body: vec![
+                            constant(val_a),
+                            constant(val_b),
+                            Op::Uniform(uniform::Op::DefImmutableMapping {
+                                result: mapping,
+                                pairs,
+                            }),
+                            Op::Uniform(uniform::Op::QueryMap {
+                                result: query,
+                                map: mapping,
+                                key: r0_arg,
+                            }),
+                            Op::Uniform(uniform::Op::Yield {
+                                operands: Vec::new(),
+                            }),
+                        ],
+                    },
+                    LocalRegion {
+                        arg: r1_arg,
+                        units: vec![unit_a, unit_b],
+                        body: vec![Op::Uniform(uniform::Op::Yield {
+                            operands: Vec::new(),
+                        })],
+                    },
+                ],
+                results: Vec::new(),
+            }
+        };
+
+        let mut op = covering(vec![(unit_a, val_a), (unit_b, val_b)]);
+        let cloned =
+            clone_value_to_region(query, SecondRegion::of(&mut op).unwrap(), &mut vals).unwrap();
+        let region1 = &op.regions()[1];
+        assert_eq!(region1.body.len(), 3);
+        assert!(matches!(
+            &region1.body[0],
+            Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })
+                if *pairs == vec![(unit_a, val_a), (unit_b, val_b)]
+        ));
+        // ⭐ THE NEW QUERY READS REGION 1'S OWN ARGUMENT, which is what makes it usable there.
+        assert!(matches!(
+            &region1.body[1],
+            Op::Uniform(uniform::Op::QueryMap { result, key, .. })
+                if *result == cloned && *key == r1_arg
+        ));
+
+        // ⛔ A MAPPING THAT COVERS ONLY ONE OF THE TWO UNITS REFUSES, and nothing is inserted.
+        let mut short = covering(vec![(unit_a, val_a)]);
+        assert_eq!(
+            clone_value_to_region(query, SecondRegion::of(&mut short).unwrap(), &mut vals),
+            None
+        );
+        assert_eq!(short.regions()[1].body.len(), 1);
     }
 }
