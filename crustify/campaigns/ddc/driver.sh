@@ -127,6 +127,26 @@ prune() {
 
 # ── ONE STAGE ─────────────────────────────────────────────────────────────────────────────────
 stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
+  # A COMPLETED STAGE MUST NOT RE-RUN ON RESTART. A port stage is idempotent through its remainder
+  # (below), but a REVIEW stage is not: its schedule always names every unit of the level. On the
+  # sibling campaign a restart began re-reviewing all 256 units of sc1, already reviewed and gated
+  # green hours earlier, and this driver's own comment records the same thing happening to 142.
+  # Each stage writes a marker once it has landed and promoted; delete one to force a re-run.
+  if [ -f "$CAMPDIR/.done-$3" ]; then
+    say "STAGE $3 SKIPPED (already completed: .done-$3 present)"
+    return 0
+  fi
+  # A PORT STAGE MUST RUN THE REMAINDER, NOT THE ORIGINAL SCHEDULE. `gen_campaign.py --remainder`
+  # writes `port-remainder.json`; the stage list names `port.json`, which still holds every unit the
+  # level ever had, so the empty-schedule skip below can never fire and a restart re-ports finished
+  # work. Preferring the remainder makes every restart self-correcting.
+  if [ "$2" = "port" ]; then
+    rem="${1%/port.json}/port-remainder.json"
+    if [ -f "$CAMPDIR/$rem" ]; then
+      say "STAGE $3 using the remainder ($rem) rather than $1"
+      set -- "$rem" "$2" "$3"
+    fi
+  fi
   n=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" \
         "$CAMPDIR/$1" 2>/dev/null || echo 1)
   # ⭐ SKIP AN EMPTY SCHEDULE. The remainder is rewritten after every promote, so a finished level
@@ -163,6 +183,8 @@ stage() { # $1 schedule (relative to $CAMPDIR)  $2 objective  $3 tag
   fi
   python3 "$TOOLS/gen_campaign.py" --remainder "$ROOT" >> "$TRACE" 2>&1
   prune
+  # The stage landed work and promoted it, so a restart must not redo it.
+  touch "$CAMPDIR/.done-$3"
 }
 
 gate() { # $1 tag
