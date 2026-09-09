@@ -349,7 +349,7 @@ pub fn is_dimension_corelet_split(dsc: &DesignSpaceConfig, dim: PrimaryDim) -> b
 /// moved off the reference stage's, because a chunk owns the whole dim's padding or none of it.
 ///
 /// ⭐ `CARRY_UNNEEDED_PAD` IS `carryUnneededPadToChunk`, a file-static `bool` initialised `true` and
-/// never written (`:126`), so its zeroing arm is DEAD: as a const generic that arm leaves the build
+/// never written (`:48`), so its zeroing arm is DEAD: as a const generic that arm leaves the build
 /// instead of being tested per dim, and the reference's own TODO to flip it stays expressible.
 pub fn void_padding_if_chunking<const CARRY_UNNEEDED_PAD: bool>(
     ds: &mut FilledDims,
@@ -408,9 +408,10 @@ pub fn add_or_update_symbolic_info_in_params(
 /// HOW MANY CORES SHARE ONE LABELLED DATA STRUCTURE'S DATA — the cores of `dscs` whose work slice
 /// agrees with the group's first core on every layout dim of `lds`.
 ///
-/// ⛔ `None` IS `coreIdToWkSlice_.at(dim)` THROWING: a layout dim that no work slice states. The
-/// `!dscIndices.empty()` check, the `dscs_.at()` lookups and the `coreIdsUsed_[0]` subscript are
-/// [`DscGroup`] and `CoreIdsUsed`, discharged before this is called.
+/// ⛔ `None` IS ONE OF THREE ABORTS: `getLayoutDims(lds)` reaching no allocate node
+/// (`dsc/dsc2.cpp:4022`), `coreIdToWkSlice_.at(mainCoreId)` missing the main core, or `.at(dim)`
+/// missing a layout dim (`:204-206`). `!dscIndices.empty()`, `dscs_.at()` and `coreIdsUsed_[0]`
+/// abort too, but [`DscGroup`] and `CoreIdsUsed` discharge those three before this is called.
 #[must_use]
 pub fn labeled_ds_wk_slice_multicast_degree(
     sdsc: &SuperDsc,
@@ -484,7 +485,7 @@ pub const fn schedule_dim_type_to_string(ty: ScheduleDimType) -> &'static str {
 ///
 /// ⛔ TRAP, AND IT IS THE REFERENCE'S: the tally counts ENTRIES, not data structures, so one
 /// `layoutDimOrder_` that names a dim twice can reach the count on its own and HIDE the reuse
-/// (`:310-313`). The `int` against `size()` comparison beside it is signed/unsigned but harmless.
+/// (`:307-314`). The `int` against `size()` comparison beside it is signed/unsigned but harmless.
 #[must_use]
 pub fn has_dimension_reuse(dsc: &DesignSpaceConfig) -> bool {
     let structures = dsc.primary_ds_info.len();
@@ -685,7 +686,7 @@ mod tests_e001_e008 {
         );
     }
 
-    /// e005 — the reference's own worked example (`dsc/dims.cpp:715-727`): `abc` limited to 2048 with
+    /// e005 — the reference's own worked example (`dsc/dims.cpp:719-728`): `abc` limited to 2048 with
     /// `a` chunked away becomes `bc` limited to `min(64 * 64, 2048 / 4) = 512`.
     #[test]
     fn symbolic_volumes_prune_onto_the_dims_that_survive() {
@@ -759,8 +760,29 @@ mod tests_e001_e008 {
             labeled_ds_wk_slice_multicast_degree(&sdsc, lds, &group),
             Some(MulticastDegree(2))
         );
+        // The `getLayoutDims` arm: the DSC states no layout order for this labelled DS.
         assert_eq!(
             labeled_ds_wk_slice_multicast_degree(&sdsc, LdsIdx(1), &group),
+            None
+        );
+        // The `coreIdToWkSlice_.at(mainCoreId)` arm: no work slice for `coreIdsUsed_[0]`.
+        let no_main_slice = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::from([(core(1), slice(0))]),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            labeled_ds_wk_slice_multicast_degree(&no_main_slice, lds, &group),
+            None
+        );
+        // The `.at(dim)` arm: a group core whose slice does not state the layout dim.
+        let sparse_slice = SuperDsc::new(
+            DscList::new(dsc.clone(), vec![]),
+            BTreeMap::from([(core(0), slice(0)), (core(1), WkSlice::default())]),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            labeled_ds_wk_slice_multicast_degree(&sparse_slice, lds, &group),
             None
         );
     }
@@ -858,7 +880,7 @@ pub struct L3Allocation {
 /// entry 016 writes so the chunks' LX memory can later be allocated against it.
 ///
 /// ⛔ A DIFFERENT C++ CLASS FROM [`crate::schedule::ddc::metadata::Metadata`] even where their
-/// fields coincide: the two stages each keep their own, and `dscMetadata` (`:203`) is keyed per DSC
+/// fields coincide: the two stages each keep their own, and `dscMetadata` (`:205`) is keyed per DSC
 /// while DDC's is one per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DscMetadata {
