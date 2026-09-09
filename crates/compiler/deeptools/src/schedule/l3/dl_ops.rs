@@ -270,7 +270,7 @@
 use crate::arch::Elements;
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{Extent, PrimaryDim};
 use crate::schedule::ddc::fold::{AllocId, AllocLayout, NodeId, PadType};
-use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind};
+use crate::schedule::ddc::metadata::{DatastageId, MetaDimKind, stricter_max, stricter_min};
 use crate::schedule::ddc::transformation::{DsType, LoopId, Scale};
 use crate::schedule::ddc::transformation_util::{
     DataStage, DataStages, LoopDims, LoopNode, PaddingForm, PrimaryDimAndKind, StageDims, StageName,
@@ -284,7 +284,7 @@ use crate::schedule::l3::dsc::{
     CoreletShare, DesignSpaceConfig, DscGroup, DscIdx, FilledDims, LabeledDs, MulticastDegree,
     Pinning, SuperDsc, SymbolicDimInfo, UnneededPad,
 };
-use crate::units::Core;
+use crate::units::{Core, Corelet};
 use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 
@@ -2548,53 +2548,422 @@ mod tests_e033_e040 {
 //   original  : int L3DlOpsScheduler::constructDatastage(DesignSpaceConfig *currDsc, dsc2::DataStage &refDataStage) const
 //   extract   : crustify-ddc/cpp/l3.cpp:1845-1857
 
-// crustify:todo: e065_constructLoopNode
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7737  (18 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : dsc2::LoopNode *L3DlOpsScheduler::constructLoopNode( int numId, int denId, std::vector<PrimaryDimAndKind> dims) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1867-1886
+/// Replaces: e065_constructLoopNode
+///
+/// MINTS THE LOOP NODE for a numerator/denominator data-stage pair, named `loop_ds<num>_ds<den>`
+/// then `_<dim>` over its dims in order (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7737`).
+///
+/// ⭐ ONE IMPLEMENTATION, NOT TWO: this body is byte-identical to `Ddc::constructLoopNode`
+/// (`ddc/ddc_transformation_util.cpp:138`) less that one's never-read `baseNode`, so it IS entry
+/// 114 and delegates to it rather than spelling the naming rule a second time.
+///
+/// ⛔ *"Cannot construct loop with no dimensions"* is [`LoopDims`], and the mint is UNPARENTED —
+/// placing it in the tree is the caller's own step.
+#[must_use]
+pub fn construct_loop_node(num: DatastageId, den: DatastageId, dims: LoopDims) -> LoopNode {
+    crate::schedule::ddc::transformation_util::construct_loop_node(num, den, dims)
+}
 
-// crustify:todo: e066_addCore
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:29  (4 body lines, level 0)
-//   class     : CrossCoreReductionGroup
-//   original  : void addCore(const int coreId, const int slice)
-//   extract   : crustify-ddc/cpp/l3.cpp:1896-1900
+/// WHICH REDUCE SLICE OF A GROUP A CORE TAKES — `addCore`'s `slice`, the index into `coreIds`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:29`), which `getCrossCoreReductionGroupInfo` forms as
+/// a mixed-radix number over the REDUCED dims alone (`L3DlOpsScheduler.cpp:2760-2766`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReduceSlice(pub u32);
 
-// crustify:todo: e067_getStartCoreAtCorelet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:34  (9 body lines, level 0)
-//   class     : CrossCoreReductionGroup
-//   original  : int getStartCoreAtCorelet(int coreletId) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1910-1919
+/// WHICH COreLET AN END QUERY NAMES — `coreletId`, whose only two values are `0` and `1`; anything
+/// else is *"Unknown corelet id."* (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:34-49`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupCorelet {
+    /// `coreletId == 0`.
+    Zero,
+    /// `coreletId == 1`.
+    One,
+}
 
-// crustify:todo: e068_getEndCoreAtCorelet
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:43  (9 body lines, level 0)
-//   class     : CrossCoreReductionGroup
-//   original  : int getEndCoreAtCorelet(int coreletId) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1929-1938
+impl GroupCorelet {
+    /// The corelet an index names — TOTAL, because [`Corelet`] admits exactly two indices on every
+    /// arch in the tree, which is what the const assertion below states.
+    #[must_use]
+    pub const fn of(corelet: Corelet) -> Self {
+        if corelet.get() == 0 {
+            Self::Zero
+        } else {
+            Self::One
+        }
+    }
+}
 
-// crustify:todo: e069_updateMin
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:117  (3 body lines, level 0)
-//   class     : Constraints
-//   original  : inline void updateMin(float newVal)
-//   extract   : crustify-ddc/cpp/l3.cpp:1948-1951
+/// *"Unknown corelet id."* MADE UNSPELLABLE — the callers walk `0..numCoreletsUsed_DSC2_`
+/// (`L3DlOpsScheduler.cpp:2781`, `:5828`), and `CORELETS_PER_CORE` is `2` on both generations
+/// (`src/arch.rs:275`, `:308`). An arch that grew a third corelet would fail HERE rather than take
+/// [`GroupCorelet::of`]'s second arm for it.
+const _: () = {
+    assert!(Corelet::checked(1).is_some());
+    assert!(Corelet::checked(2).is_none());
+};
 
-// crustify:todo: e070_updateMax
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:120  (3 body lines, level 0)
-//   class     : Constraints
-//   original  : inline void updateMax(float newVal)
-//   extract   : crustify-ddc/cpp/l3.cpp:1961-1964
+/// ONE CROSS-CORE REDUCTION GROUP — `CrossCoreReductionGroup` (`L3DlOpsScheduler.h:24`): the cores
+/// of one group indexed by [`ReduceSlice`], with the reference's `-1` for a slice no core took.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrossCoreReductionGroup {
+    core_ids: Vec<Option<Core>>,
+}
 
-// crustify:todo: e071_updateValues
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:123  (3 body lines, level 0)
-//   class     : Constraints
-//   original  : inline void updateValues(std::set<float> newVals)
-//   extract   : crustify-ddc/cpp/l3.cpp:1974-1977
+impl CrossCoreReductionGroup {
+    /// Replaces: e066_addCore
+    ///
+    /// PLACES `core` AT ITS REDUCE SLICE, growing the group to fit and leaving `-1` holes behind.
+    ///
+    /// ⛔ DELIBERATE DIVERGENCE — `coreIds.resize(slice + 1, -1)` ALSO SHRINKS. A core arriving at a
+    /// lower slice than one already placed TRUNCATES the group and drops it silently, and that is
+    /// reachable: `coreIdToWkSlice_` iterates by core id (`dsc/superdsc.h:70`) while the reduce
+    /// slice counts a different set of dims, so the two orders need not agree. `back()` — the core
+    /// [`ReductionGroupCores::end_core_at_corelet`] hands a sync — would then be a truncated tail.
+    /// Growing only is the *"Use slice ids to order them"* the comment states (`:2755`).
+    pub fn add_core(&mut self, core: Core, slice: ReduceSlice) {
+        let slot = slice.0 as usize;
+        if self.core_ids.len() <= slot {
+            self.core_ids.resize(slot + 1, None);
+        }
+        if let Some(placed) = self.core_ids.get_mut(slot) {
+            *placed = Some(core);
+        }
+    }
 
-// crustify:todo: e072_getTripCount
-//   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:487  (9 body lines, level 0)
-//   class     : L3DlOpsScheduler
-//   original  : int getTripCount(const DesignSpaceConfig &dsc, const PrimaryDimTypes dim, const int dataStageNumId, const int dataStageDenId) const
-//   extract   : crustify-ddc/cpp/l3.cpp:1987-1997
+    /// `getCores()` (`:32`) WITH `isEmpty()` DISCHARGED (`:52`) — the non-empty view both end
+    /// queries need, or [`None`] for their `DT_CHECK(!coreIds.empty())`. A group is genuinely
+    /// empty when no work slice lands in it: `getCrossCoreReductionGroupInfo` default-constructs
+    /// `numGroups` of them and fills only the ones cores map to (`:2755-2767`).
+    #[must_use]
+    pub fn cores(&self) -> Option<ReductionGroupCores<'_>> {
+        (!self.core_ids.is_empty()).then_some(ReductionGroupCores(&self.core_ids))
+    }
+}
+
+/// A CROSS-CORE REDUCTION GROUP WITH A SLICE IN IT — `DT_CHECK(!coreIds.empty())`
+/// (`L3DlOpsScheduler.h:35`, `:44`) as a type, so neither end query can refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReductionGroupCores<'a>(&'a [Option<Core>]);
+
+impl ReductionGroupCores<'_> {
+    /// Replaces: e067_getStartCoreAtCorelet
+    ///
+    /// THE CORE THIS CORELET STARTS THE GROUP AT — `coreIds.front()` for corelet 0 and
+    /// `coreIds.back()` for corelet 1 (`L3DlOpsScheduler.h:34`), the two corelets walking the
+    /// group's slices in opposite directions.
+    ///
+    /// ⛔ [`None`] IS THE `-1` HOLE AND NOT AN ABORT: [`CrossCoreReductionGroup::add_core`] fills
+    /// only the slices work landed on, and the reference returns that `-1` as if it were a core.
+    #[must_use]
+    pub fn start_core_at_corelet(&self, corelet: GroupCorelet) -> Option<Core> {
+        match corelet {
+            GroupCorelet::Zero => self.front(),
+            GroupCorelet::One => self.back(),
+        }
+    }
+
+    /// Replaces: e068_getEndCoreAtCorelet
+    ///
+    /// THE CORE THIS CORELET ENDS THE GROUP AT — the OTHER end from
+    /// [`Self::start_core_at_corelet`]: `back()` for corelet 0, `front()` for corelet 1 (`:43`).
+    ///
+    /// ⛔ [`None`] IS THE `-1` HOLE, as it is for the start.
+    #[must_use]
+    pub fn end_core_at_corelet(&self, corelet: GroupCorelet) -> Option<Core> {
+        match corelet {
+            GroupCorelet::Zero => self.back(),
+            GroupCorelet::One => self.front(),
+        }
+    }
+
+    /// `coreIds.front()`, hole and all.
+    fn front(&self) -> Option<Core> {
+        self.0.first().copied().flatten()
+    }
+
+    /// `coreIds.back()`, hole and all.
+    fn back(&self) -> Option<Core> {
+        self.0.last().copied().flatten()
+    }
+}
+
+/// ONE `Metadata::Datastage::Constraints` AS THE L3 SCHEDULER DECLARES IT
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:113`).
+///
+/// ⛔ NOT DDC'S [`StoredConstraint`](crate::schedule::ddc::metadata::StoredConstraint): the L3 copy
+/// has NO `loopDimKind_` and NO `cannotBeSymbolic_` (`ddc/ddc_metadata.h:35`, `:39`), so it cannot
+/// carry a [`LoopMultiple`](crate::schedule::ddc::metadata::LoopMultiple) and the two are distinct
+/// types rather than one shared with two spellings.
+///
+/// ⚠️ TRAP: `L3DlOpsScheduler.cpp` NEVER READS THIS HALF OF ITS OWN `Metadata` — `dscMetadata` is
+/// *"only used for memory allocation"* (`:202`), and `constraints_`, `mustBeMultiple_`,
+/// `strategyMinimize_` and all three updaters occur nowhere in its 8,033 lines.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Constraints {
+    /// `mustBeMultiple_` — a multiple of the reference data stage where there is one, else of `min_`.
+    pub must_be_multiple: bool,
+    /// `min_`.
+    pub min: Option<f32>,
+    /// `max_`.
+    pub max: Option<f32>,
+    /// `values_` — absent is UNCONSTRAINED, where an ENGAGED EMPTY set admits no size at all.
+    pub values: Option<Vec<f32>>,
+}
+
+impl Constraints {
+    /// Replaces: e069_updateMin
+    ///
+    /// TIGHTENS THE LOWER BOUND — `min_ = min_ ? std::max(*min_, newVal) : newVal`
+    /// (`L3DlOpsScheduler.h:117`).
+    ///
+    /// ⛔ `max` TIGHTENS A *MIN*: the stricter of two lower bounds is the larger one.
+    pub fn update_min(&mut self, new_val: f32) {
+        self.min = Some(self.min.map_or(new_val, |min| stricter_min(min, new_val)));
+    }
+
+    /// Replaces: e070_updateMax
+    ///
+    /// TIGHTENS THE UPPER BOUND — `max_ = max_ ? std::min(*max_, newVal) : newVal` (`:120`).
+    /// ⛔ `min` TIGHTENS A *MAX*.
+    pub fn update_max(&mut self, new_val: f32) {
+        self.max = Some(self.max.map_or(new_val, |max| stricter_max(max, new_val)));
+    }
+
+    /// Replaces: e071_updateValues
+    ///
+    /// INTERSECTS THE PERMITTED VALUES — `values_ = values_ ? set_intersect(*values_, newVals) :
+    /// newVals` (`:123`, `util/utils.h:112`).
+    ///
+    /// ⛔ THE FIRST CALL ADOPTS, IT DOES NOT INTERSECT — an absent `values_` is unconstrained,
+    /// where an intersection may leave it engaged and EMPTY. Two states, and only the second is a
+    /// contradiction.
+    pub fn update_values(&mut self, new_vals: &[f32]) {
+        let mut incoming = new_vals.to_vec();
+        incoming.sort_by(f32::total_cmp);
+        incoming.dedup();
+        self.values = Some(match &self.values {
+            Some(values) => values
+                .iter()
+                .copied()
+                .filter(|value| incoming.contains(value))
+                .collect(),
+            None => incoming,
+        });
+    }
+}
+
+/// WHAT EXTENT A DATA STAGE'S DIMS STATE FOR ONE DIM — `primaryDimToVal_st(d)`
+/// (`dsc/dims.cpp:647`), which is all `getTripCount` asks of a `DataStructDims`.
+pub trait DimExtents {
+    /// The extent, or [`None`] for the `-1` an unstated dim answers.
+    fn extent(&self, dim: PrimaryDim) -> Option<Extent>;
+}
+
+/// HOW MANY TIMES A LOOP WALKS ONE DIM — `getTripCount`'s `int`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:487`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TripCount(u64);
+
+impl TripCount {
+    /// The count, for the `numRepeats *=` products the callers form (`L3DlOpsScheduler.cpp:1841`).
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Replaces: e072_getTripCount
+///
+/// THE TRIP COUNT OF LOOP `num`/`den` ON `dim` — `ceil(num/den)` over the two data stages'
+/// STEADY-STATE extents (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:487`).
+///
+/// ⛔ [`None`] IS BOTH `dataStageParam_.at()` THROWS AND EVERY STATE THE REFERENCE COMPUTES A
+/// NON-COUNT FROM. An unstated dim is `-1`, so `ceil(-1/den)` is a SILENT ZERO that the callers
+/// multiply straight into `numRepeats` (`:1841`); and `den == 0` divides by zero and then casts an
+/// infinity to `int`, which is undefined. A loop dim needs a positive extent on both sides.
+#[must_use]
+pub fn trip_count<D: DimExtents>(
+    stages: &DataStages<D>,
+    dim: PrimaryDim,
+    num: DatastageId,
+    den: DatastageId,
+) -> Option<TripCount> {
+    let positive = |id: DatastageId| -> Option<u64> {
+        let extent = stages.0.get(&id)?.ss.dims.extent(dim)?;
+        u64::try_from(extent.0).ok().filter(|extent| *extent > 0)
+    };
+    Some(TripCount(positive(num)?.div_ceil(positive(den)?)))
+}
+
+#[cfg(test)]
+mod tests_e065_e072 {
+    use super::*;
+    use crate::schedule::ddc::transformation_util::StageName;
+
+    /// A `DataStructDims` STAND-IN — the extents it states, which is every question entry 072 puts
+    /// to one.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct Extents(BTreeMap<PrimaryDim, Extent>);
+
+    impl DimExtents for Extents {
+        fn extent(&self, dim: PrimaryDim) -> Option<Extent> {
+            self.0.get(&dim).copied()
+        }
+    }
+
+    fn core(index: u32) -> Core {
+        Core::checked(index).expect("this arch has the core the test names")
+    }
+
+    fn stage(id: DatastageId, extents: &[(PrimaryDim, i64)]) -> (DatastageId, DataStage<Extents>) {
+        let dims = Extents(
+            extents
+                .iter()
+                .map(|(dim, extent)| (*dim, Extent(*extent)))
+                .collect(),
+        );
+        (
+            id,
+            DataStage {
+                ss: StageDims {
+                    name: StageName(id.0.to_string()),
+                    dims,
+                },
+                el: StageDims::default(),
+            },
+        )
+    }
+
+    /// e065 — the mint's name is the stage pair followed by its dims, in order.
+    #[test]
+    fn a_loop_node_is_named_after_its_stage_pair_and_then_its_dims() {
+        let node = construct_loop_node(
+            DatastageId(1),
+            DatastageId(0),
+            LoopDims::new(
+                PrimaryDimAndKind {
+                    dim: PrimaryDim::Y,
+                    kind: MetaDimKind::Unpadded,
+                },
+                vec![PrimaryDimAndKind {
+                    dim: PrimaryDim::Ki,
+                    kind: MetaDimKind::WindowDim,
+                }],
+            ),
+        );
+
+        assert_eq!(node.name, NodeName("loop_ds1_ds0_y_ki".to_owned()));
+        assert_eq!(node.num, DatastageId(1));
+        assert_eq!(node.den, DatastageId(0));
+    }
+
+    /// e066 — a slice is a slot: the group grows to fit, keeps its holes, and a core arriving at a
+    /// LOWER slice does not truncate what is already placed (the `resize` divergence).
+    #[test]
+    fn a_group_places_each_core_at_its_slice_and_never_shrinks() {
+        let mut group = CrossCoreReductionGroup::default();
+        group.add_core(core(7), ReduceSlice(3));
+        group.add_core(core(4), ReduceSlice(1));
+
+        let cores = group.cores().expect("two cores were placed");
+        // Slice 0 is a hole, slice 3 survived the lower arrival.
+        assert_eq!(cores.start_core_at_corelet(GroupCorelet::Zero), None);
+        assert_eq!(cores.end_core_at_corelet(GroupCorelet::Zero), Some(core(7)));
+
+        group.add_core(core(2), ReduceSlice(0));
+        let cores = group.cores().expect("three cores were placed");
+        assert_eq!(
+            cores.start_core_at_corelet(GroupCorelet::Zero),
+            Some(core(2))
+        );
+        assert_eq!(cores.end_core_at_corelet(GroupCorelet::Zero), Some(core(7)));
+    }
+
+    /// e067/e068 — the two corelets read the group from opposite ends, and an empty group yields no
+    /// view to ask at all.
+    #[test]
+    fn the_two_corelets_walk_the_group_from_opposite_ends() {
+        assert_eq!(CrossCoreReductionGroup::default().cores(), None);
+
+        let mut group = CrossCoreReductionGroup::default();
+        group.add_core(core(1), ReduceSlice(0));
+        group.add_core(core(5), ReduceSlice(1));
+        let cores = group.cores().expect("two cores were placed");
+
+        let zero = GroupCorelet::of(Corelet::checked(0).expect("corelet 0"));
+        let one = GroupCorelet::of(Corelet::checked(1).expect("corelet 1"));
+        assert_eq!(cores.start_core_at_corelet(zero), Some(core(1)));
+        assert_eq!(cores.end_core_at_corelet(zero), Some(core(5)));
+        // Corelet 1 starts where corelet 0 ends, and ends where it starts.
+        assert_eq!(cores.start_core_at_corelet(one), Some(core(5)));
+        assert_eq!(cores.end_core_at_corelet(one), Some(core(1)));
+    }
+
+    /// e069/e070/e071 — the first update ADOPTS and every later one NARROWS: `max` on the min,
+    /// `min` on the max, intersection on the values.
+    #[test]
+    fn updating_a_constraint_adopts_first_and_narrows_after() {
+        let mut constraints = Constraints::default();
+        constraints.update_min(4.0);
+        constraints.update_max(64.0);
+        constraints.update_values(&[1.0, 2.0, 4.0]);
+        assert_eq!(constraints.min, Some(4.0));
+        assert_eq!(constraints.max, Some(64.0));
+        assert_eq!(
+            constraints.values.as_deref(),
+            Some([1.0, 2.0, 4.0].as_slice())
+        );
+
+        constraints.update_min(8.0);
+        constraints.update_max(32.0);
+        constraints.update_values(&[2.0, 4.0, 8.0]);
+        assert_eq!(constraints.min, Some(8.0));
+        assert_eq!(constraints.max, Some(32.0));
+        assert_eq!(constraints.values.as_deref(), Some([2.0, 4.0].as_slice()));
+
+        // A looser bound changes nothing, and a disjoint value set leaves the set ENGAGED AND
+        // EMPTY — which no size satisfies, and is not the same state as absent.
+        constraints.update_min(2.0);
+        constraints.update_values(&[16.0]);
+        assert_eq!(constraints.min, Some(8.0));
+        assert_eq!(constraints.values.as_deref(), Some([].as_slice()));
+    }
+
+    /// e072 — the count is the CEILING of the two stages' extents, and a stage or extent the DSC
+    /// does not state has no count rather than a fabricated one.
+    #[test]
+    fn a_trip_count_is_the_ceiling_of_the_two_stages_extents() {
+        let stages = DataStages(
+            [
+                stage(DatastageId(0), &[(PrimaryDim::Y, 100), (PrimaryDim::X, 8)]),
+                stage(DatastageId(1), &[(PrimaryDim::Y, 32), (PrimaryDim::X, 0)]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        // 100 / 32 rounds UP to 4, and the pair the other way round is one trip.
+        let count = trip_count(&stages, PrimaryDim::Y, DatastageId(0), DatastageId(1));
+        assert_eq!(count.map(TripCount::get), Some(4));
+        let count = trip_count(&stages, PrimaryDim::Y, DatastageId(1), DatastageId(0));
+        assert_eq!(count.map(TripCount::get), Some(1));
+
+        // A zero denominator is the infinity cast, an unstated dim is the `-1`, and an absent stage
+        // is the `.at()` throw.
+        assert_eq!(
+            trip_count(&stages, PrimaryDim::X, DatastageId(0), DatastageId(1)),
+            None
+        );
+        assert_eq!(
+            trip_count(&stages, PrimaryDim::J, DatastageId(0), DatastageId(1)),
+            None
+        );
+        assert_eq!(
+            trip_count(&stages, PrimaryDim::Y, DatastageId(0), DatastageId(9)),
+            None
+        );
+    }
+}
 
 // crustify:todo: e197_getCoreletSplitDimensions
 //   authority : dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:88  (15 body lines, level 1)
