@@ -195,7 +195,7 @@ pub trait LdsSticks {
 }
 
 /// WHETHER ONE ALLOC USER IS A MASKED COMPUTE — `nodeType_ == COMPUTE` AND
-/// `instrAttribute_.computeMaskLoopOffsets_` non-empty (`ddc/ddcv1.cpp:1698-1704`), which is ONE
+/// `instrAttribute_.computeMaskLoopOffsets_` non-empty (`ddc/ddcv1.cpp:1696-1698`), which is ONE
 /// question about one user rather than two.
 pub trait ComputeMasks {
     /// True only for a COMPUTE node carrying mask loop offsets.
@@ -222,7 +222,7 @@ pub struct ComputeOp {
     pub format: DataFormat,
 }
 
-/// `dtGetEnv<bool>("ENABLE_LN32")` (`ddc/ddcv1.cpp:1849`) AS AN ARGUMENT.
+/// `dtGetEnv<bool>("ENABLE_LN32")` (`ddc/ddcv1.cpp:1844`) AS AN ARGUMENT.
 ///
 /// ⛔ NOT AN AMBIENT READ. A placement decision taken from the process environment can be neither
 /// reproduced nor tested, so the caller states it.
@@ -262,8 +262,9 @@ pub(crate) fn stick_divisor(
 /// WHAT AN ALLOCATION'S DATA IS CALLED — its temp-storage compute's name, else its labelled DS's,
 /// else its constant's.
 ///
-/// ⭐ [`None`] IS THE REFERENCE'S `""`, which is not a name: every caller compares the result
-/// against the empty string rather than using it.
+/// ⭐ [`None`] IS THE REFERENCE'S `""`, which is not a name: its three live callers pass the result
+/// STRAIGHT TO THE MEMORY TRACKER as a DS key (`ddc/ddcv1.cpp:280`, `:336`, `:341`) and none of them
+/// tests it, so `None` is where the reference would key the tracker on the empty string.
 #[must_use]
 pub fn get_lds_or_const_name_of_alloc_node(
     anode: &AllocateNode,
@@ -280,7 +281,7 @@ pub fn get_lds_or_const_name_of_alloc_node(
         .map(|constant| names.constant_name(constant))
 }
 
-/// A POSITION IN THE SCHEDULE TREE'S DFS ORDER — `node_to_index`'s `int` (`ddc/ddcv1.cpp:44-48`).
+/// A POSITION IN THE SCHEDULE TREE'S DFS ORDER — `node_to_index`'s `int` (`ddc/ddcv1.cpp:39-46`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DfsIndex(pub u32);
 
@@ -294,7 +295,7 @@ pub struct LiveRange {
 }
 
 impl LiveRange {
-    /// `{INT_MAX, 0}` — what a USER-LESS allocation gets (`ddc/ddcv1.cpp:52-53`).
+    /// `{INT_MAX, 0}` — what a USER-LESS allocation gets (`ddc/ddcv1.cpp:50-51`).
     ///
     /// ⭐ INVERTED ON PURPOSE, and it is load-bearing: it is false against every interval in both
     /// directions, so an allocation nothing reads always lands in a shadow group of its own.
@@ -303,7 +304,7 @@ impl LiveRange {
         end: DfsIndex(0),
     };
 
-    /// The range spanning every user (`ddc/ddcv1.cpp:54-60`).
+    /// The range spanning every user (`ddc/ddcv1.cpp:52-58`).
     #[must_use]
     pub fn of(users: &[DfsIndex]) -> Self {
         let mut range = Self::NONE;
@@ -314,7 +315,7 @@ impl LiveRange {
         range
     }
 
-    /// `overlapInterval` (`ddc/ddcv1.cpp:88-93`) — transcribed INCLUDING its asymmetry, so `self` is
+    /// `overlapInterval` (`ddc/ddcv1.cpp:80-85`) — transcribed INCLUDING its asymmetry, so `self` is
     /// the allocation being placed and `other` a group member already there.
     #[must_use]
     pub fn overlaps(self, other: Self) -> bool {
@@ -354,6 +355,9 @@ pub fn minimize_allocations(
     metadata: &mut Metadata,
 ) {
     let mut ordered: Vec<&AllocLive> = allocs.iter().collect();
+    // ⛔ STABLE WHERE THE REFERENCE'S `std::sort` IS NOT (`ddc/ddcv1.cpp:63-67`): it orders on `start`
+    // alone, so equal starts may come out in any order there and the group each joins can differ.
+    // `allocs` arrives in the reference's ALLOCATE-DFS order, so this is one permitted outcome, fixed.
     ordered.sort_by_key(|live| live.range.start);
     let mut groups: Vec<Vec<&AllocLive>> = Vec::new();
     for live in ordered {
@@ -560,6 +564,10 @@ pub fn populate_unit_time_transfers<A: Arch>(
             transfer.replication_factor = ReplicationFactor(factor);
         }
     }
+    // ⛔ ASSIGNED WHERE THE REFERENCE `push_back`s ONTO WHATEVER IS ALREADY THERE
+    // (`ddc/ddcv1.cpp:524`): it never clears the field, and a JSON-imported DSC can arrive with
+    // entries (`dsc/dsc2.cpp:1560`). Its own `[0].sizeDim_.size_ == 1` check (`:544`) only holds when
+    // the field started empty, so assigning is what that check already assumes.
     transfer.unit_time_transfer_chunk_size = chunks;
     Some(())
 }
@@ -727,6 +735,9 @@ pub fn get_pe_sfp_split_dim<A: Arch, S: Stage>(
     if !splits {
         return Some(BTreeSet::new());
     }
+    // ⭐ ONE `input_lds` FOR BOTH READS: the reference takes the stick sizes from
+    // `labeledDs_.at(0).dsType_` and the layout order from that same `inpLds.ldsIdx_`
+    // (`ddc/ddcv1.cpp:1852-1854`), and a labelled DS's position in `labeledDs_` IS its `ldsIdx_`.
     let per_dim = cumulative_stick_sizes(&sticks.stick_dims(input_lds), StickPart::Whole)?;
     let mut split = BTreeSet::new();
     for dim in dsc.layout_dims(input_lds).to_vec().into_iter().rev() {
@@ -735,7 +746,11 @@ pub fn get_pe_sfp_split_dim<A: Arch, S: Stage>(
             row: None,
             comp: None,
         };
-        let extent = u64::try_from(chunk_stage.extent(dim, at).0).ok()?;
+        // ⛔ A NEGATIVE EXTENT IS `DataStructDims`' UNSET `-1` (`dsc/dims.h:162-193`), NOT A REFUSAL:
+        // the reference's signed `extent / stickSize` is never `> 1` then, so it tries the next dim.
+        let Ok(extent) = u64::try_from(chunk_stage.extent(dim, at).0) else {
+            continue;
+        };
         let for_split = extent / stick_divisor(&per_dim, dim)?.get();
         if for_split > 1 && for_split % 2 == 0 {
             split.insert(dim);
@@ -747,8 +762,8 @@ pub fn get_pe_sfp_split_dim<A: Arch, S: Stage>(
 
 /// Replaces: e131_setPeFoldsIfPtInteraction
 ///
-/// ENGAGES THE PE'S SECOND FOLD ON EVERY COMPUTE of a SEN1P5 DSC that has any PT compute at all —
-/// the PT's presence is what makes the PE fold, not the PE's own op.
+/// GIVES EVERY PE COMPUTE of a SEN1P5 DSC THE ARCH'S PE FOLD COUNT, and only when the DSC has a PT
+/// compute at all — the PT's presence is what makes the PE fold, not the PE's own op.
 ///
 /// ⛔ [`None`] IS `senCompToGenericComp.at()` ON A COMPONENT THAT MAP HAS NO KEY FOR, which is 20 of
 /// the 107 (`sys-arch-spec/arch_enums.cpp:124-211`).
@@ -784,7 +799,7 @@ pub fn set_pe_folds_if_pt_interaction<A: Arch>(computes: &mut [ComputeNode]) -> 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// ONE `loopEleOffsets_` ENTRY — how many elements of that dim to step per trip of that loop, an
-/// `int` in `DataInfo::loopEleOffsets_` (`dsc/dsc2.h:729`).
+/// `int` in `DataInfo::loopEleOffsets_` (`dsc/dsc2.h:730-732`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoopEleOffset(pub i32);
 
@@ -872,7 +887,7 @@ pub trait LoopOffsets {
     ///
     /// ⛔ `operator[]`, SO IT INSERTS all three keys, and ⛔ `dim_loop` MAY BE ABSENT: the reference
     /// keys this map by `getOwnerLoop()` without checking it, and a null `LoopNode*` is a legitimate
-    /// key of an `unordered_map<const LoopNode*, ..>` (`ddc/ddcv1.cpp:3260-3263`).
+    /// key of an `unordered_map<const LoopNode*, ..>` (`ddc/ddcv1.cpp:3257-3261`).
     fn set_input_loop_ele_offset(
         &mut self,
         node: NodeId,
@@ -1112,7 +1127,7 @@ fn adjust_loop_offsets_for_restickify<T: LoopOffsets + ?Sized>(dsc: &mut T) {
     }
 }
 
-/// `adjustLoopOffsetsForLXLUCompute` (`ddc/ddcv1.cpp:3251-3264`) — one `in` element per trip of the
+/// `adjustLoopOffsetsForLXLUCompute` (`ddc/ddcv1.cpp:3251-3263`) — one `in` element per trip of the
 /// compute's own loop, on the input that is not the latched scale register.
 fn adjust_loop_offsets_for_lxlu_compute<T: LoopOffsets + ?Sized>(dsc: &mut T, site: LxluScaleSite) {
     let parent_loop = dsc.owner_loop(site.compute);
@@ -1135,7 +1150,7 @@ fn adjust_loop_offsets_for_lxlu_compute<T: LoopOffsets + ?Sized>(dsc: &mut T, si
 /// every LXLU `fmul` a one-element `in` step on its own loop.
 ///
 /// ⛔ IT ADJUSTS NO ADDRESSES despite the name — the body writes loop element offsets only.
-/// ⛔ THE RESTICKIFY PASS RE-RUNS ONCE PER MATCHING OP (`ddc/ddcv1.cpp:3267-3272`); its writes are
+/// ⛔ THE RESTICKIFY PASS RE-RUNS ONCE PER MATCHING OP (`ddc/ddcv1.cpp:3266-3271`); its writes are
 /// absolute, so the repeats land on the same values.
 pub fn adjust_loop_offsets_and_addresses<A, T>(dsc: &mut T)
 where
@@ -2010,6 +2025,22 @@ mod tests_e124_e131 {
                 &chunk,
                 LdsIdx(0),
                 &layout,
+                &sticks,
+                Ln32::Off
+            ),
+            Some(BTreeSet::from([PrimaryDim::Out]))
+        );
+        // A layout dim the chunk stage states no extent for is SKIPPED, not a refusal.
+        let unset = Layout(LayoutDims::new(
+            PrimaryDim::In,
+            vec![PrimaryDim::Out, PrimaryDim::Y],
+        ));
+        assert_eq!(
+            get_pe_sfp_split_dim::<Sen1p5, Chunk>(
+                &op,
+                &chunk,
+                LdsIdx(0),
+                &unset,
                 &sticks,
                 Ln32::Off
             ),
