@@ -1,0 +1,374 @@
+symbol	qualifier	authority	body_lines	rule	reason
+~DynamicPatternDescriptorBase		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:137	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getKind		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:139	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+canBeSimplified		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:140	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setCanBeSimplified		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:147	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:177	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:180	1	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+isValid		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:193	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:222	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:225	1	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+getY		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:233	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOuterLoop		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:259	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isValid		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:263	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:311	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:314	1	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+isValid		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:318	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:349	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:352	1	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+isValid		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:356	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getIterArgIndex		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:410	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOuterLoop		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:411	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:461	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:464	1	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+isValid		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:468	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getIterArgIndex		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:487	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOuterLoop		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:488	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:553	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+classof		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:556	3	llvm_rtti_hook	LLVM RTTI `classof` hook - a Rust enum discriminant match, not a function
+isValid		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:562	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getBaseAddrList		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:661	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getBaseAddrList		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:662	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOriginalBaseAddrSSA		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:663	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOriginalBaseAddrSSA		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:664	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOperation		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:666	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOperation		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:667	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getRegionOp		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:760	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getRegionNum		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:761	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getMemoryUnit		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:806	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getMemoryUnit		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:827	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSortedList		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:893	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+AbstractDataTransferUpdater		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1052	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+AddressPinningAndTogglePass		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1176	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1270	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+initialize	AddressPinningAndTogglePass	dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1575	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+createAddressPinningAndTogglePass	mlir::sentient	dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3308	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createAddressPinningAndTogglePass	mlir::sentient	dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:3315	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+opts_		dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:57	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createAddressRegisterPrecisionAssignmentPass	mlir::sentient	dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:550	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createAddressRegisterPrecisionAssignmentPass	mlir::sentient	dcc/src/Transform/Sentient/AddressRegisterPrecisionAssignment.cpp:556	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:57	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createAnnotateMacXRFWtPtrRangePass	mlir::sentient	dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:157	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createAnnotateMacXRFWtPtrRangePass	mlir::sentient	dcc/src/Transform/Sentient/AnnotateMacXRFWtRange.cpp:163	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/BurstSplitting.cpp:220	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createBurstSplittingPass	mlir::sentient	dcc/src/Transform/Sentient/BurstSplitting.cpp:228	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createBurstSplittingPass	mlir::sentient	dcc/src/Transform/Sentient/BurstSplitting.cpp:234	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createCFGDeepMergingPass	mlir::sentient	dcc/src/Transform/Sentient/CFGDeepMerging.cpp:91	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createCFGDeepMergingPass	mlir::sentient	dcc/src/Transform/Sentient/CFGDeepMerging.cpp:97	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getKind		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:282	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setKind		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:283	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLB		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:284	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setLB		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:285	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getShiftedLB		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:286	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setShiftedLB		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:287	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getStride		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:290	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setStride		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:291	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLength		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:292	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getIntervalMarker		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:307	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+setIntervalMarker		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:310	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getIndexStride		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:378	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSequences		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:379	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setPrevVal		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:384	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setHasInsertedMonotoneSeqBeforeLast		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:386	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getHasInsertedMonotoneSeqBeforeLast		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:389	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+is1DRepOfTable		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:392	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getBlock		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:479	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getTableEntryType		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:522	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getPredicateType		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:524	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSize		dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:525	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+hasFullTable	PatternSimplificationManager	dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1093	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createCFGSimplificationSentientLevelPass	mlir::sentient	dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2862	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createCFGSimplificationSentientLevelPass	mlir::sentient	dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2869	6	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dcc_ext_ctx_		dcc/src/Transform/Sentient/CanonicalizeXRFPointers.cpp:55	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/CanonicalizeXRFPointers.cpp:61	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createCanonicalizeXRFPointersPass	mlir::sentient	dcc/src/Transform/Sentient/CanonicalizeXRFPointers.cpp:208	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createCanonicalizeXRFPointersPass	mlir::sentient	dcc/src/Transform/Sentient/CanonicalizeXRFPointers.cpp:213	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+opts_		dcc/src/Transform/Sentient/Deuniform.cpp:48	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createDeuniformPass	mlir::sentient	dcc/src/Transform/Sentient/Deuniform.cpp:526	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createDeuniformPass	mlir::sentient	dcc/src/Transform/Sentient/Deuniform.cpp:531	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+clear	EnhancedDeadVariableEliminationPass	dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:56	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createEnhancedDeadVariableEliminationPass	mlir::sentient	dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:747	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createEnhancedDeadVariableEliminationPass	mlir::sentient	dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:752	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+EnhancedDeadVariableEliminationPass		dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.hpp:36	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createImplicitSyncREPass	mlir::sentient	dcc/src/Transform/Sentient/ImplicitSyncRE.cpp:90	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+isUnknownValue		dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:43	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getTileSize		dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:46	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setTileSize		dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:47	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+RedundantDefinitionEliminationTree		dcc/src/Transform/Sentient/ImplicitSyncRE.hpp:61	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+opts_		dcc/src/Transform/Sentient/LexicalOrdering.cpp:97	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createLexicalOrderingPass	mlir::sentient	dcc/src/Transform/Sentient/LexicalOrdering.cpp:217	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLexicalOrderingPass	mlir::sentient	dcc/src/Transform/Sentient/LexicalOrdering.cpp:222	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLightweightSimplificationPass	mlir::sentient	dcc/src/Transform/Sentient/LightweightSimplification.cpp:348	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/LiveRangeReduction.cpp:163	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getUnitIndex		dcc/src/Transform/Sentient/LiveRangeReduction.cpp:208	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+createLiveRangeReductionPass	mlir::sentient	dcc/src/Transform/Sentient/LiveRangeReduction.cpp:1314	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLiveRangeReductionPass	mlir::sentient	dcc/src/Transform/Sentient/LiveRangeReduction.cpp:1320	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getUnits		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:143	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOriginalRegion		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:144	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+numLocalRegions		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:170	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLocalRegion		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:171	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getOriginalOp		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:175	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+LocalRegionSplittingForValueCommoningPass		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:188	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:226	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createLocalRegionSplittingForValueCommoningPass	mlir::sentient	dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:475	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLocalRegionSplittingForValueCommoningPass	mlir::sentient	dcc/src/Transform/Sentient/LocalRegionSplittingForValueCommoning.cpp:482	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopAbsorptionPass	mlir::sentient	dcc/src/Transform/Sentient/LoopAbsorption.cpp:564	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopAbsorptionPass	mlir::sentient	dcc/src/Transform/Sentient/LoopAbsorption.cpp:570	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/LoopAbsorption.hpp:183	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/LoopCoalescing.cpp:56	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createLoopCoalescingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopCoalescing.cpp:431	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopCoalescingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopCoalescing.cpp:437	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:420	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createLoopEliminationViaRerollingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:428	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopEliminationViaRerollingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopEliminationViaRerolling.cpp:434	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+LoopMergingPass	LoopMergingPass	dcc/src/Transform/Sentient/LoopMerging.cpp:54	1	trivial_ctor_dtor	trivial ctor/dtor of LoopMergingPass (1-line body) - a Rust struct literal
+createLoopMergingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopMerging.cpp:341	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopMergingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopMerging.cpp:347	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/LoopMerging.hpp:53	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isOpInThisWindow		dcc/src/Transform/Sentient/LoopRolling.cpp:130	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSize		dcc/src/Transform/Sentient/LoopRolling.cpp:132	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getEffectiveStart		dcc/src/Transform/Sentient/LoopRolling.cpp:133	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getEnd		dcc/src/Transform/Sentient/LoopRolling.cpp:138	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getFirstRollableOp		dcc/src/Transform/Sentient/LoopRolling.cpp:139	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLastRollableOp		dcc/src/Transform/Sentient/LoopRolling.cpp:140	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getStartOp		dcc/src/Transform/Sentient/LoopRolling.cpp:180	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getEndOp		dcc/src/Transform/Sentient/LoopRolling.cpp:181	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setEndOp		dcc/src/Transform/Sentient/LoopRolling.cpp:182	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOperandDeltas		dcc/src/Transform/Sentient/LoopRolling.cpp:195	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getIterArgToResNumAndOperand		dcc/src/Transform/Sentient/LoopRolling.cpp:196	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/LoopRolling.cpp:1022	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createLoopRollingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopRolling.cpp:1035	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopRollingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopRolling.cpp:1041	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:67	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createLoopSplittingAndUnrollingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:1083	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createLoopSplittingAndUnrollingPass	mlir::sentient	dcc/src/Transform/Sentient/LoopSplittingAndUnrolling.cpp:1090	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:55	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:106	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createMultiDimLoopPeelingPass	mlir::sentient	dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:775	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createMultiDimLoopPeelingPass	mlir::sentient	dcc/src/Transform/Sentient/MultiDimLoopPeeling.cpp:781	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createMulticastCanonicalizationPass	mlir::sentient	dcc/src/Transform/Sentient/MulticastCanonicalization.cpp:398	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+NOPInsertionForBackToBackSyncsPass		dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:60	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:93	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createNOPInsertionForBackToBackSyncsPass	mlir::sentient	dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:151	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createNOPInsertionForBackToBackSyncsPass	mlir::sentient	dcc/src/Transform/Sentient/NOPInsertionForBackToBackSyncs.cpp:157	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:98	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getFinalRegInitCandidates		dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:142	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getFinalRegCoalescingCandidates		dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:151	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getEnforcedVirtualAssign		dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:155	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:673	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createOldRegisterInitializationPass	mlir::sentient	dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1317	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createOldRegisterInitializationPass	mlir::sentient	dcc/src/Transform/Sentient/OldRegisterInitialization.cpp:1324	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getLrfIndex	UnrollOperands	dcc/src/Transform/Sentient/OpRerolling.cpp:958	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getIStateIndex	UnrollOperands	dcc/src/Transform/Sentient/OpRerolling.cpp:962	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+createOpRerollingPass	mlir::sentient	dcc/src/Transform/Sentient/OpRerolling.cpp:1355	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createOpRerollingPass	mlir::sentient	dcc/src/Transform/Sentient/OpRerolling.cpp:1361	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getUnrollSize		dcc/src/Transform/Sentient/OpRerolling.hpp:136	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOpName		dcc/src/Transform/Sentient/OpRerolling.hpp:137	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getPrecisions		dcc/src/Transform/Sentient/OpRerolling.hpp:138	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isThisFieldUnrolled		dcc/src/Transform/Sentient/OpRerolling.hpp:141	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+areUnrollFieldsUpdated		dcc/src/Transform/Sentient/OpRerolling.hpp:144	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isMemoryUnit		dcc/src/Transform/Sentient/OpRerolling.hpp:145	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getXrfRdIncrVal		dcc/src/Transform/Sentient/OpRerolling.hpp:152	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getXrfWtIncrVal		dcc/src/Transform/Sentient/OpRerolling.hpp:153	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setXrfRdIncrVal		dcc/src/Transform/Sentient/OpRerolling.hpp:154	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setXrfWtIncrVal		dcc/src/Transform/Sentient/OpRerolling.hpp:155	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isXrfOp		dcc/src/Transform/Sentient/OpRerolling.hpp:158	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getmaskValue		dcc/src/Transform/Sentient/OpRerolling.hpp:159	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSplatPad		dcc/src/Transform/Sentient/OpRerolling.hpp:160	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSplatInput		dcc/src/Transform/Sentient/OpRerolling.hpp:161	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/OpRerolling.hpp:171	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/PortAssignment.cpp:56	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+performGraphColoring	PortAssignmentPass	dcc/src/Transform/Sentient/PortAssignment.cpp:735	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+createPortAssignmentPass	mlir::sentient	dcc/src/Transform/Sentient/PortAssignment.cpp:817	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createPortAssignmentPass	mlir::sentient	dcc/src/Transform/Sentient/PortAssignment.cpp:823	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getOp		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:76	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getValue		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:77	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getElementSize		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:78	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getNewRegisterIndex		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:79	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setNewRegisterIndex		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:84	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+ReadOnlyRegisterRenumberingPass		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:97	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+initialize		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:162	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:166	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createReadOnlyRegisterRenumberingPass	mlir::sentient	dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:251	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createReadOnlyRegisterRenumberingPass	mlir::sentient	dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:257	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRegisterAllocationPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterAllocation.cpp:325	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/RegisterInitialization.cpp:256	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createRegisterInitializationPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterInitialization.cpp:280	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRegisterInitializationPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterInitialization.cpp:287	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getValue		dcc/src/Transform/Sentient/RegisterPacking.cpp:72	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOldRegisterIndex		dcc/src/Transform/Sentient/RegisterPacking.cpp:73	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getNewRegisterIndex		dcc/src/Transform/Sentient/RegisterPacking.cpp:74	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isIndexUpdated		dcc/src/Transform/Sentient/RegisterPacking.cpp:79	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isHeaderPromoted		dcc/src/Transform/Sentient/RegisterPacking.cpp:80	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+hasSameValueInAllUnits		dcc/src/Transform/Sentient/RegisterPacking.cpp:81	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+reg_type_		dcc/src/Transform/Sentient/RegisterPacking.cpp:97	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getRegType		dcc/src/Transform/Sentient/RegisterPacking.cpp:101	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getRegistersList		dcc/src/Transform/Sentient/RegisterPacking.cpp:102	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+RegisterPackingPass		dcc/src/Transform/Sentient/RegisterPacking.cpp:113	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/RegisterPacking.cpp:138	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createRegisterPackingPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterPacking.cpp:427	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRegisterPackingPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterPacking.cpp:432	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:132	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLocaleAsString	RegisterTypeAssignmentPass	dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:241	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+createRegisterTypeAssignmentPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:1054	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRegisterTypeAssignmentPass	mlir::sentient	dcc/src/Transform/Sentient/RegisterTypeAssignment.cpp:1061	6	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRematerializationPass	mlir::sentient	dcc/src/Transform/Sentient/RematerializationPass.cpp:218	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRematerializationPass	mlir::sentient	dcc/src/Transform/Sentient/RematerializationPass.cpp:224	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+opts_		dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:55	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createRemoveRedundantConditionalsPass	mlir::sentient	dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:326	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createRemoveRedundantConditionalsPass	mlir::sentient	dcc/src/Transform/Sentient/RemoveRedundantConditionals.cpp:332	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+ReuseLoopIteratorArgumentsPass		dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:73	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:109	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createReuseLoopIteratorArgumentsPass	mlir::sentient	dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:489	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createReuseLoopIteratorArgumentsPass	mlir::sentient	dcc/src/Transform/Sentient/ReuseLoopIteratorArguments.cpp:495	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+ScalarCopyInsertionForSymbolsPass		dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:78	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:87	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createScalarCopyInsertionForSymbolsPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:561	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createScalarCopyInsertionForSymbolsPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarCopyInsertionForSymbols.cpp:567	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+getConstBuilder		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:216	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getQueryMapBuilder		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:217	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getDccExtContext		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:218	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getEvaluator		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:221	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLdstiImmRange		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:222	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getComp		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:225	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getScale		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:226	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOp		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:353	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getMod		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:354	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getMergingIncrement		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:355	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getReplaceWithMod		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:356	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOp		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:379	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getCost		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:380	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getSpeculativeImmutables		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:381	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+enablesMerging		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:384	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isMarkedForUnrolling		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:385	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setEnablesMerging		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:388	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+markForUnrolling		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:392	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getInputValueToBlock		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:411	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getBlockOps		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:412	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getUnrollCandidates		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:413	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getNumScalarOpsInBlock		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:416	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getRequiredIBuff		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:417	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setInputValueToBlock		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:420	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getRegion		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:467	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getBlocks		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:468	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getConstBuilder		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:472	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getQueryMapBuilder		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:473	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getDccExtContext		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:474	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getEvaluator		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:477	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLdstiImmRange		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:478	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getComp		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:481	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getScale		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:482	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getConstBuilder		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:522	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getQueryMapBuilder		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:523	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getDccExtContext		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:524	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getEvaluator		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:527	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getLdstiImmRange		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:528	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+getComp		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:531	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getScale		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:532	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2411	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createScalarOpMergingAndHoistingPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2416	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createScalarOpMergingAndHoistingPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarOpMergingAndHoisting.cpp:2423	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/ScalarOpReordering.cpp:148	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createScalarOpReorderingPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarOpReordering.cpp:535	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createScalarOpReorderingPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarOpReordering.cpp:540	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createScalarSimplificationsPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarSimplifications.cpp:927	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createScalarSimplificationsPass	mlir::sentient	dcc/src/Transform/Sentient/ScalarSimplifications.cpp:934	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/ScalarSimplifications.hpp:52	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSetActiveMaskValueREPass	mlir::sentient	dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:87	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+isOperationAUse	SetActiveMaskValueRDETree	dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:91	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+isOperationADef	SetActiveMaskValueRDETree	dcc/src/Transform/Sentient/SetActiveMaskValueRE.cpp:95	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+isUnknownValue		dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:47	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getMaskValue		dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:50	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setMaskValue		dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:51	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getAttrs		dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:52	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setAttrs		dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:53	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+RedundantDefinitionEliminationTree		dcc/src/Transform/Sentient/SetActiveMaskValueRE.hpp:77	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dcc_ext_ctx_		dcc/src/Transform/Sentient/SetMaskRE.cpp:141	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSetMaskREPass	mlir::sentient	dcc/src/Transform/Sentient/SetMaskRE.cpp:182	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSetMaskREPass	mlir::sentient	dcc/src/Transform/Sentient/SetMaskRE.cpp:186	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+isOperationADef	SetMaskRDETree	dcc/src/Transform/Sentient/SetMaskRE.cpp:199	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+isUnknownValue	SetMaskGenValue	dcc/src/Transform/Sentient/SetMaskRE.cpp:250	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isUnknownValue	IncrMaskGenValue	dcc/src/Transform/Sentient/SetMaskRE.cpp:288	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getMaskValue		dcc/src/Transform/Sentient/SetMaskRE.hpp:32	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setMaskValue		dcc/src/Transform/Sentient/SetMaskRE.hpp:33	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getIncrement		dcc/src/Transform/Sentient/SetMaskRE.hpp:55	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setIncrement		dcc/src/Transform/Sentient/SetMaskRE.hpp:56	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+RedundantDefinitionEliminationTree		dcc/src/Transform/Sentient/SetMaskRE.hpp:69	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+RedundantDefinitionEliminationTree		dcc/src/Transform/Sentient/SetMaskRE.hpp:73	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isDeadIncrMaskRemovalEnabled		dcc/src/Transform/Sentient/SetMaskRE.hpp:101	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+isIncrMaskAbsorptionEnabled		dcc/src/Transform/Sentient/SetMaskRE.hpp:104	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+dcc_ext_ctx_		dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:106	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+optimizeForLXLU		dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:176	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+optimizeForSFP		dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:179	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:208	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSetSendDestinationREPass	mlir::sentient	dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:215	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSetSendDestinationREPass	mlir::sentient	dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:220	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+isOperationADef	SetSendDstRDETree	dcc/src/Transform/Sentient/SetSendDestinationRE.cpp:231	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+value_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:40	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isInitialized		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:44	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getValue		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:47	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setValue		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:48	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+qmap_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:61	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isInitialized		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:66	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getQueryMap		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:69	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setQueryMap		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:70	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isSimple		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:105	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isComposite		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:106	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isUnknownValue		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:107	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+simple_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:116	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+composite_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:117	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isInitialized		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:134	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getCoreId		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:137	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setCoreId		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:138	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getCoreletId		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:139	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setCoreletId		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:140	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+qmap_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:154	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isInitialized		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:159	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getQueryMap		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:162	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+setQueryMap		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:163	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isSimple		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:200	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isComposite		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:201	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isUnknownValue		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:202	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+simple_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:210	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+composite_		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:211	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+optimizeForLXLU		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:234	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+optimizeForSFP		dcc/src/Transform/Sentient/SetSendDestinationRE.hpp:237	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/SimplifyUniformRegions.cpp:49	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSimplifyUniformRegionsPass	mlir::sentient	dcc/src/Transform/Sentient/SimplifyUniformRegions.cpp:109	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSimplifyUniformRegionsPass	mlir::sentient	dcc/src/Transform/Sentient/SimplifyUniformRegions.cpp:116	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+isGlobalRegion		dcc/src/Transform/Sentient/SinkScalarCopy.cpp:98	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getPointer		dcc/src/Transform/Sentient/SinkScalarCopy.cpp:106	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getRegions		dcc/src/Transform/Sentient/SinkScalarCopy.cpp:139	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+getOperation		dcc/src/Transform/Sentient/SinkScalarCopy.cpp:142	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/SinkScalarCopy.cpp:239	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSinkScalarCopyPass	mlir::sentient	dcc/src/Transform/Sentient/SinkScalarCopy.cpp:250	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSinkScalarCopyPass	mlir::sentient	dcc/src/Transform/Sentient/SinkScalarCopy.cpp:256	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:52	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSmartRegisterAllocationPass	mlir::sentient	dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:637	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSmartRegisterAllocationPass	mlir::sentient	dcc/src/Transform/Sentient/SmartRegisterAllocation.cpp:644	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+opts_		dcc/src/Transform/Sentient/SpecializedCanonicalization.cpp:55	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createSpecializedCanonicalizationPass	mlir::sentient	dcc/src/Transform/Sentient/SpecializedCanonicalization.cpp:233	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSpecializedCanonicalizationPass	mlir::sentient	dcc/src/Transform/Sentient/SpecializedCanonicalization.cpp:239	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:89	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createStoreAndForwardFusionPass	mlir::sentient	dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:582	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createStoreAndForwardFusionPass	mlir::sentient	dcc/src/Transform/Sentient/StoreAndForwardFusion.cpp:588	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:49	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+isEqualSets		dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:66	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+createSyncSendRecvFusionPass	mlir::sentient	dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:149	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createSyncSendRecvFusionPass	mlir::sentient	dcc/src/Transform/Sentient/SyncSendRecvFusion.cpp:155	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+ToggleReorderingPass		dcc/src/Transform/Sentient/ToggleReordering.cpp:143	3	field_accessor	3-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/ToggleReordering.cpp:173	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createToggleReorderingPass	mlir::sentient	dcc/src/Transform/Sentient/ToggleReordering.cpp:269	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createToggleReorderingPass	mlir::sentient	dcc/src/Transform/Sentient/ToggleReordering.cpp:275	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+dccExtContext		dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:49	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createTransformForExposedPipelinePass	mlir::sentient	dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:379	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createTransformForExposedPipelinePass	mlir::sentient	dcc/src/Transform/Sentient/TransformForExposedPipeline.cpp:386	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+UniformMapCanonicalizationPass		dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:50	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+dccExtContext		dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:65	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createUniformMapCanonicalizationPass	mlir::sentient	dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:121	5	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createUniformMapCanonicalizationPass	mlir::sentient	dcc/src/Transform/Sentient/UniformMapCanonicalization.cpp:128	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+values		dcc/src/Transform/Sentient/Utils.hpp:169	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+units		dcc/src/Transform/Sentient/Utils.hpp:170	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+opts_		dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:54	1	field_accessor	1-line field accessor - a struct field in Rust, not a function
+createVectorRegisterInitializationPass	mlir::sentient	dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:168	4	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time
+createVectorRegisterInitializationPass	mlir::sentient	dcc/src/Transform/Sentient/VectorRegisterInitialization.cpp:174	3	mlir_pass_factory	MLIR pass factory: #[forward] runs the whole pipeline at macro expansion, so no pass manager, pass instance or factory exists at run time

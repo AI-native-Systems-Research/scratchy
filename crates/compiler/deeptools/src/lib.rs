@@ -39,6 +39,9 @@ pub mod bridges;
 /// AN IR AND NOTHING ELSE — one module per IR.
 pub mod islands;
 
+/// The in-place `dcc/src/Transform/` passes: SentientIR rewritten in place.
+pub mod transform;
+
 /// HOW WIDE ONE ELEMENT OF EACH FORMAT IS — IBM's own bit-width table.
 pub mod formats;
 
