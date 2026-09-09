@@ -1026,9 +1026,9 @@ mod unit_tests {
         assert_eq!(module, vec![group, recv]);
     }
 
-    /// 🎯 296/384 — ALL FOUR PHASES OVER ONE MODULE under the vendor's own two options,
-    /// `filter-components-except=lxlu` and `filter-cores-except=0`
-    /// (`core_filtering_edge_case.mlir:2`): the `sfp` program unit goes by COMPONENT, core 1's handle
+    /// 🎯 296/384 — ALL FOUR PHASES OVER ONE MODULE under two options the vendor runs, here in one
+    /// invocation: `filter-cores-except=0` (`core_filtering_edge_case.mlir:2`) and
+    /// `filter-components-except=lxlu` (`corelet_filtering.mlir:2`) — the `sfp` unit goes by COMPONENT, core 1's handle
     /// leaves the surviving unit list, the map pair, and the `uniformize_regions` region that held
     /// only it, and then nothing reads either dead `get_unit`.
     ///
@@ -1505,7 +1505,7 @@ pub struct UnitFilteringOptions {
     ///
     /// ⭐ THE REFERENCE SPELLS A `SenComponents` BACK TO A STRING and compares it against the
     /// `get_unit`'s `type=` (`:427-437`); [`DfirUnit`] *is* that enumeration on this side
-    /// (`units.rs:287`), so the comparison is an equality between two enum values and
+    /// (`units.rs:290`), so the comparison is an equality between two enum values and
     /// `EnumsConversion::stringToSenComponents` is the parse of the option, not of the IR.
     pub components: Option<Only<DfirUnit>>,
     /// `filter_folds_except_`, `filter_cores_except_` and `filter_corelets_except_` — the triple
@@ -1521,7 +1521,7 @@ pub struct UnitFilteringOptions {
 /// component and then by core/corelet/fold, `def_immutable_mapping`s plus the data transfers to drop,
 /// `uniformize_regions`, and [`cleanup`].
 ///
-/// ⛔ THE TWO EARLY `return`s AT `:449` AND `:470` ARE LOAD-BEARING: with only a component filter the
+/// ⛔ THE TWO EARLY `return`s AT `:450-451` AND `:473` ARE LOAD-BEARING: with only a component filter the
 /// pass stops after phase 1, and with only a transfer filter after phase 2. Running phase 3 or
 /// [`cleanup`] anyway would filter nothing and yet rebuild `num_folds` on every surviving unit.
 /// ⛔ `if (DisableThisPass) return;` (`:363`) is a `dcc-opt` flag — which pass runs is a call in
@@ -1556,7 +1556,7 @@ pub fn run_on_operation(
         // components against `getUnits().front().getDefiningOp<GetUnitOp>().getType().str()`.
         //
         // ⛔ THE REFERENCE NULL-DEREFERENCES WHERE THAT OPERAND IS NOT A `get_unit` RESULT
-        // (`:428-432`, an unchecked `getDefiningOp<>()`); a component this island cannot read matches
+        // (`:428-430`, an unchecked `getDefiningOp<>()`); a component this island cannot read matches
         // no name, which is where the reference's own loop leaves `remove_unit` — set.
         let component = units
             .first()
@@ -1662,8 +1662,8 @@ pub fn run_on_operation(
     // *"NOTE: Must be done in a separate walk from 2 as we are cloning UniformizeRegionsOps and do
     // not want stale immutable ops to persist in the cloned regions."*
     //
-    // ⛔ DEEPEST-FIRST, AND THAT IS NOT AN OPTIMISATION: these ops NEST — three deep in
-    // `flatten_local_region.mlir:86-88` — and a rebuild CLONES the body the inner one sits in
+    // ⛔ DEEPEST-FIRST, AND THAT IS NOT AN OPTIMISATION: these ops NEST — one inside another's
+    // region at `flatten_local_region.mlir:90`/`:92` — and a rebuild CLONES the body the inner one is in
     // ([`remove_cores_corelets_folds_from_uniformize_region`]), so filtering the inner op first is
     // what keeps the clone from carrying a unit list this pass has already ruled out. Descending
     // order is also what keeps the remaining positions valid: only a later sibling is renumbered by a

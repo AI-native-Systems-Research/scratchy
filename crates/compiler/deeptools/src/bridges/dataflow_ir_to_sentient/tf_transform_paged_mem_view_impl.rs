@@ -5136,7 +5136,7 @@ scf.if %3 {
 
     /// 🎯 295/384 — THREE LOOPS, ONE ACCUMULATOR, AND THE COEFFICIENTS READ THE WAY `:481` READS THEM.
     /// ⚠️ `%0`, `%9` and `%16` ARE ENTRY 264'S FILL CONSTANTS, left dead by the `setOperand` that
-    /// re-initialises each added iter_arg (`:461-462`, `:468-469`) — the reference leaves them too.
+    /// re-initialises each added iter_arg (`:464-465`, `:471-472`) — the reference leaves them too.
     #[test]
     fn every_loop_of_the_nest_adds_its_own_coefficient_to_the_carried_subscript() {
         let counted = |iv: Val, hi: i64, body: Vec<DfirOp>| {
@@ -6585,7 +6585,7 @@ pub struct IterArgsForConditionals {
     pub indices: Vec<Val>,
     /// One `IRMapping` per rebuilt loop, outermost first.
     ///
-    /// ⛔ THE `mem_ops_` / `paged_mem_view_` / SIBLING-`TPMVInfo` RE-SYNCS AT `:497-514` ARE THE
+    /// ⛔ THE `mem_ops_` / `paged_mem_view_` / SIBLING-`TPMVInfo` RE-SYNCS AT `:504-520` ARE THE
     /// CALLER'S, and that is a type-level fact rather than a shortcut: they are `&'p` borrows of the
     /// very program this function rewrites, and Rust cannot hold one across the rewrite. Replaying
     /// them in this order over the new scope — [`update_tpmv_info`] per mapping — is those lines.

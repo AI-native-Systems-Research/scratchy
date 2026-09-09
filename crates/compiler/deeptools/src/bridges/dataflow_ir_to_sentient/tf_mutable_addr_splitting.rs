@@ -8768,7 +8768,7 @@ pub enum MasInitialization {
     /// [`init_mas_data`]'s answer, passed through unchanged.
     Initialized(MasDataInit),
     /// `DT_CHECK(dcc::agen::utils::hasValidL3ImmutableAddr(evaluator, mem_view_op,
-    /// num_elems_in_stick))` (`:701-702`).
+    /// num_elems_in_stick))` (`:700-701`).
     ImmutableAddrIsNotAWholeNumberOfSticks {
         /// The view's constant start address, in elements.
         start: i64,

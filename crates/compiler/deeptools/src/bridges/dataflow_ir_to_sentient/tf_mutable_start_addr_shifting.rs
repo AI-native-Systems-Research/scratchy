@@ -786,7 +786,7 @@ pub struct PartialShift {
 ///
 /// ⛔ A NEGATIVE `offset_` PRODUCES A NEGATIVE SHIFT AND HANDS BUDGET BACK, because
 /// `if (constant_shift > dim_weight.offset_) constant_shift = dim_weight.offset_` clamps DOWNWARD
-/// only (`:541-542`) — which is also the one way `DT_CHECK(total_shift >= 0)` (`:552`) can fail, and
+/// only (`:541-542`) — which is also the one way `DT_CHECK(total_shift >= 0)` (`:551`) can fail, and
 /// [`TotalShift`] is signed already.
 /// ⚠️ `dim_order` (`:511-517`) IS WRITTEN AND NEVER READ; see [`SubscriptResult`].
 #[must_use]
@@ -798,13 +798,13 @@ pub fn calculate_partial_shift(
     // reference states at `:497-503`.
     let dim_weights = calculate_dim_weights(inputs);
 
-    // *"Initialize all shifts to zero as the shifts may not be analyzed in order."* (`:521-523`).
+    // *"Initialize all shifts to zero as the shifts may not be analyzed in order."* (`:522-524`).
     let mut shifts = vec![Shift(0); inputs.subscripts_map.results.len()];
 
     let mut curr_immutable_space = immutable_space;
     for dim_weight in &dim_weights {
         // `DT_CHECK(layout_coeffs.size() > dim_weight.dim_);` — and a stride of zero is the
-        // reference's own division by zero, which buys no space either way.
+        // reference's own division by zero; skipping leaves this dim's shift 0 and its budget whole.
         let Some(&layout_coeff) = inputs.layout_coeffs.get(dim_weight.dim.index()) else {
             continue;
         };
