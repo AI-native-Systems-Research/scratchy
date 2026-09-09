@@ -175,7 +175,9 @@
 
 use crate::arch::Sticks;
 use crate::formats::DataFormat;
-use crate::schedule::dsc2::{AllocateNode, ComputeNode, DataInfo};
+use crate::schedule::ddc::fold::AllocId;
+use crate::schedule::ddc::metadata::OwnedAllocateNode;
+use crate::schedule::dsc2::{ComputeNode, DataInfo};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::hash::{Hash, Hasher};
@@ -399,8 +401,9 @@ impl AbstractLayout {
     /// ⛔ THE FORMAT IS NOT IN IT, while `operator==` compares it (`shuffle.h:101`), so two layouts
     /// differing only in format hash equal. Carried as the reference has it: a collision is legal
     /// for a hash, and adding the format would move every layout to a different bucket.
-    /// ⛔ AND IT HAS NO USER IN THIS REVISION — `layout_to_nodes` is a `std::map` and the only
-    /// unordered container in the file is keyed on [`DimSymbol`] (`shuffle.cpp:732`).
+    /// ⛔ AND IT HAS NO USER IN THIS REVISION — NOTHING in the file is keyed on a layout:
+    /// `layout_to_nodes` is a `std::map` (`shuffle.h:264`), and the file's three `unordered_map`s are
+    /// keyed on [`DimSymbol`] (`shuffle.cpp:732`) and on `PrimaryDimTypes` (`:879`, `:892`).
     #[must_use]
     pub fn fnv1a(&self) -> usize {
         /// `const uint64_t offset` (`shuffle.h:142`).
@@ -1463,7 +1466,7 @@ pub fn all_one(stick_repl: &[StickRepl]) -> bool {
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
 /// WHICH STICK EACH OPERAND OF ONE COMPUTATION IS — `do_op_codegen`'s `input_output_stick_id`, a
-/// `std::pair<std::vector<int>, int>` (`shuffle.cpp:1003`) whose ints are the keys
+/// `std::pair<std::vector<int>, int>` (`shuffle.cpp:1005`) whose ints are the keys
 /// [`StickNumberKey::key`] hands back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StickIds {
@@ -1474,7 +1477,7 @@ pub struct StickIds {
 }
 
 /// THE TWO `std::function`s THE WALK IS DRIVEN BY, WITH ITS `EdgeType` — `codegen_generic`'s last
-/// two parameters as one implementable thing (`shuffle.cpp:914-920`). [`Pseudocode`] is the
+/// two parameters as one implementable thing (`shuffle.cpp:915-919`). [`Pseudocode`] is the
 /// `std::string` instantiation; e371 `replace_assign` is the [`DataEdge`] one.
 pub trait ShuffleCodegen {
     /// `EdgeType`.
@@ -1483,7 +1486,7 @@ pub trait ShuffleCodegen {
     /// `get_edges_for_node(node)` — the edges this node's output sticks are written to.
     ///
     /// ⭐ THE LAYOUT, NOT THE NODE: both instantiations read `node->layout` and nothing else of it
-    /// (`shuffle.cpp:825`, `:1244`), so the hook does not need the node handle.
+    /// (`shuffle.cpp:829`, `:1244`), so the hook does not need the node handle.
     fn edges_for_node(&mut self, layout: &AbstractLayout) -> Vec<Self::Edge>;
 
     /// `do_op_codegen(op, inputs, output, input_output_stick_id, output_added)`.
@@ -1525,7 +1528,8 @@ pub trait CodegenGeneric {
     /// then the walk drives [`Pseudocode`], whose hooks mint each node's registers and collect each
     /// op's own line.
     ///
-    /// ⛔ ONE COUNTER FOR ALL OF IT — both lambdas capture `reg_id` BY REFERENCE, so a node's
+    /// ⛔ ONE COUNTER FOR ALL OF IT — the input loop calls `get_new_reg_name` directly and
+    /// `create_node_allocations` captures THAT LAMBDA by reference (`shuffle.cpp:1242`), so a node's
     /// registers continue the input registers' numbering instead of restarting at `r0`.
     fn codegen_psuedocode(
         &mut self,
@@ -1556,9 +1560,9 @@ impl RegNamer {
     }
 }
 
-/// `create_node_allocations` AND `do_codegen` AS ONE VALUE — they share the register counter and the
-/// line list, which is exactly why the reference captures both by reference (`shuffle.cpp:1240`,
-/// `:1254`).
+/// `create_node_allocations` AND `do_codegen` AS ONE VALUE — each captures ONE piece of
+/// `codegen_psuedocode`'s frame by reference, the counter and the line list respectively
+/// (`shuffle.cpp:1240`, `:1253`); one implementor is what gives both the frame's lifetime here.
 #[derive(Debug, Default)]
 struct Pseudocode {
     /// the shared `reg_id`.
@@ -1589,15 +1593,15 @@ impl ShuffleCodegen for Pseudocode {
         _output_added: bool,
     ) {
         // ⛔ THE STICK IDS AND `output_reg_added` ARE THE OTHER INSTANTIATION'S: `do_codegen`
-        // (`shuffle.cpp:1254`) takes both and reads neither — they carry the element offsets
-        // `replace_assign` writes into its data edges (`shuffle.cpp:869-895`).
+        // (`shuffle.cpp:1255-1260`) takes both and reads neither — they carry the element offsets
+        // `replace_assign` writes into its data edges (`shuffle.cpp:871-896`).
         self.code_lines
             .extend(op.codegen_psuedocode(inputs, output));
     }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
-// THE DATA EDGE — `DataEdge` (`shuffle.h:171`), the real codegen's `EdgeType`.
+// THE DATA EDGE — `DataEdge` (`shuffle.h:170`), the real codegen's `EdgeType`.
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
 /// WHERE A NODE SITS IN A BLOCK'S CHILD LIST — one `BlockNode::addChildNode` call's contribution to
@@ -1611,11 +1615,14 @@ impl ShuffleCodegen for Pseudocode {
 /// (`ddc/ddc_transformation.cpp:1992`) adds the packmerge before `assign` and then the allocate
 /// before the packmerge.
 /// ⭐ A COMPUTE NODE BECAUSE THAT IS THE ONLY INSERT POINT THE REFERENCE HAS: the freshly minted
-/// packmerge. A fuller `BlockNode` belongs with the tree-construction units in `schedule/dsc2.rs`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// packmerge (`ddc/ddc_transformation.cpp:1993`, the one callsite). A fuller `BlockNode` belongs with
+/// the tree-construction units in `schedule/dsc2.rs`.
+/// ⛔ NOT `Clone`: `next_` is a `vector<unique_ptr<ScheduleNode>>` (`dsc/dsc2.h:529`), so what it
+/// holds it OWNS, and a second copy of an insert point would be a second owner of those nodes.
+#[derive(Debug, PartialEq, Eq)]
 pub struct InsertPoint {
     node: ComputeNode,
-    before: Vec<AllocateNode>,
+    before: Vec<OwnedAllocateNode>,
 }
 
 impl InsertPoint {
@@ -1635,12 +1642,12 @@ impl InsertPoint {
     }
 
     /// The allocate nodes sitting immediately before it, in the order they were inserted.
-    pub fn preceding(&self) -> impl Iterator<Item = &AllocateNode> {
+    pub fn preceding(&self) -> impl Iterator<Item = &OwnedAllocateNode> {
         self.before.iter()
     }
 }
 
-/// AN EDGE BETWEEN TWO STICK COMPUTATIONS — `DataEdge` (`shuffle.h:171`): which data, on which
+/// AN EDGE BETWEEN TWO STICK COMPUTATIONS — `DataEdge` (`shuffle.h:170`): which data, on which
 /// component, and the allocate node that backs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataEdge {
@@ -1653,12 +1660,16 @@ pub struct DataEdge {
     /// ⛔ ONE `Option` FOR THE REFERENCE'S TWO LEVELS: `std::optional<AllocateNode*>` is checked as
     /// `has_value() && value() != nullptr` (`shuffle.h:177`) because "absent" and "present and null"
     /// are both spellable there. Here [`None`] is both.
-    pub allocation: Option<AllocateNode>,
+    /// ⛔ AN [`AllocId`], NOT THE NODE: the pointer NAMES a node the tree owns. `getAllocation`
+    /// hands back one already in the tree (`shuffle.cpp:820-822`), the edge is copied per stick
+    /// (`:824`), and `insert_packmerge` mutates it THROUGH the edge after insertion
+    /// (`ddc/ddc_transformation.cpp:1988`) — so a by-value copy here would fork the node.
+    pub allocation: Option<AllocId>,
     /// `alloc_added`.
     ///
     /// ⛔ NOT DERIVABLE FROM `allocation`, WHICH IS WHY IT IS A SEPARATE BIT: it means "already in
     /// the tree, possibly put there by someone else", and `replace_assign` flips it both ways from
-    /// the already-added list and `getPrev()` (`shuffle.cpp:863-868`).
+    /// the already-added list and `getPrev()` (`shuffle.cpp:862-869`).
     pub alloc_added: bool,
 }
 
@@ -1668,13 +1679,14 @@ impl DataEdge {
     /// PUTS MY ALLOCATE NODE IMMEDIATELY BEFORE `insert_point`, ONCE — `shuffle.h:175`. A no-op for
     /// an edge with no allocation, or one whose allocation is already in the tree.
     ///
-    /// ⛔ THE LATCH IS NOT A MOVE: the allocation stays readable afterwards, because
-    /// `insert_packmerge` reads it again for the next computation
-    /// (`ddc/ddc_transformation.cpp:1982`) and the edge is copied per stick (`shuffle.cpp:821`).
+    /// ⛔ THE LATCH IS NOT A MOVE OF THE EDGE'S HANDLE: `addChildNode` takes OWNERSHIP of the node
+    /// (`dsc/dsc2.cpp:2027` into a `unique_ptr` slot) while the edge keeps its aliasing pointer, so
+    /// `insert_packmerge` still reaches the same node afterwards
+    /// (`ddc/ddc_transformation.cpp:1983-1989`).
     pub fn insert_before(&mut self, insert_point: &mut InsertPoint) {
-        if let Some(allocation) = self.allocation.as_ref() {
+        if let Some(allocation) = self.allocation {
             if !self.alloc_added {
-                insert_point.before.push(allocation.clone());
+                insert_point.before.push(OwnedAllocateNode(allocation));
                 self.alloc_added = true;
             }
         }
@@ -2430,12 +2442,11 @@ mod tests_e161_e164 {
         DimSymbol, InsertPoint, ShuffleCodegen, ShuffleIndex, StickIds, StickIndex, StickNumber,
         narrow_to_usize,
     };
-    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
     use crate::formats::DataFormat;
     use crate::generated::ComputeType;
-    use crate::schedule::dsc2::{
-        AllocLayout, AllocateNode, ComputeNode, DataInfo, MaxDimSize, NodeName, StartAddress,
-    };
+    use crate::schedule::ddc::fold::AllocId;
+    use crate::schedule::ddc::metadata::OwnedAllocateNode;
+    use crate::schedule::dsc2::{ComputeNode, DataInfo, NodeName};
     use crate::units::NumFolds;
     use std::collections::BTreeSet;
     use sys_arch_spec::arch_enums::SenComponent;
@@ -2534,17 +2545,7 @@ mod tests_e161_e164 {
     /// one already in the tree — inserts nothing.
     #[test]
     fn insert_before_adds_the_allocation_once() {
-        let allocation = AllocateNode {
-            name: NodeName("alloc".to_owned()),
-            component: SenComponent::Ptrow0,
-            lds: None,
-            const_idx: None,
-            temp_storage_for_compute: None,
-            layout: AllocLayout::new((PrimaryDim::Out, MaxDimSize::Unset), Vec::new()),
-            start_address: StartAddress::default(),
-            gap_stick_spread: Default::default(),
-            alloc_users: Vec::new(),
-        };
+        let allocation = AllocId(4);
         let mut point = InsertPoint::new(ComputeNode {
             name: NodeName("packmerge".to_owned()),
             op: ComputeType::Packmerge,
@@ -2556,19 +2557,18 @@ mod tests_e161_e164 {
         let mut edge = DataEdge {
             dinfo: DataInfo::default(),
             component: SenComponent::Ptrow0,
-            allocation: Some(allocation.clone()),
+            allocation: Some(allocation),
             alloc_added: false,
         };
 
         edge.insert_before(&mut point);
         edge.insert_before(&mut point);
-        assert_eq!(point.preceding().collect::<Vec<_>>(), vec![&allocation]);
-        assert!(edge.alloc_added);
         assert_eq!(
-            edge.allocation.as_ref(),
-            Some(&allocation),
-            "still readable"
+            point.preceding().collect::<Vec<_>>(),
+            vec![&OwnedAllocateNode(allocation)]
         );
+        assert!(edge.alloc_added);
+        assert_eq!(edge.allocation, Some(allocation), "still names the node");
 
         let mut nothing_to_add = DataEdge {
             allocation: None,
