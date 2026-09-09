@@ -180,7 +180,7 @@ impl ComputePortId {
 }
 
 /// HOW MANY OP INSTANCES ONE SNAPSHOT NOW STANDS FOR — `unsigned unroll_size_ = 1`
-/// (`OpRerolling.hpp:47`); for a memory op it is the burst size instead (`:643`).
+/// (`OpRerolling.hpp:45`); for a memory op it is the burst size instead (`:643`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UnrollSize(pub(crate) u32);
 
@@ -189,7 +189,7 @@ impl UnrollSize {
     pub(crate) const ONE: Self = Self(1);
 }
 
-/// AN XRF POINTER INCREMENT — `int xrf_read_incr_` / `int xrf_write_incr_` (`OpRerolling.hpp:51-52`),
+/// AN XRF POINTER INCREMENT — `int xrf_read_incr_` / `int xrf_write_incr_` (`OpRerolling.hpp:54-55`),
 /// signed because the reference reads it through `getXrfReadIncrSigned()` (`:562`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct XrfIncr(pub(crate) i32);
@@ -199,8 +199,8 @@ impl XrfIncr {
     pub(crate) const ZERO: Self = Self(0);
 }
 
-/// WHICH OP A SNAPSHOT CAME FROM — `StringRef op_name_ = "NA"` (`OpRerolling.hpp:48`), the six kinds
-/// `e335_fill`'s `dyn_cast` chain accepts (`:519`, `:564`, `:598`, `:624`, `:640`, `:653`).
+/// WHICH OP A SNAPSHOT CAME FROM — `StringRef op_name_ = "NA"` (`OpRerolling.hpp:46`), the six kinds
+/// `e335_fill`'s `dyn_cast` chain accepts (`:519`, `:564`, `:598`, `:621`, `:640`, `:652`).
 ///
 /// ⛔ `Option`'s `None` IS THE `"NA"` SENTINEL, which the reference tests eight times over (`:189`,
 /// `:324-325`, `:338`, `:376`, `:391`, `:415`, `:732`) — an absent snapshot, and not a string.
@@ -248,11 +248,11 @@ impl UnburstedExtent {
 }
 
 /// THE ATTRIBUTES OF ONE MEMORY OP — `std::map<std::string, Attribute> memory_op_attrs`
-/// (`OpRerolling.hpp:159`), compared entry-for-entry by `e336_match` (`:795-799`).
+/// (`OpRerolling.hpp:67`), compared entry-for-entry by `e336_match` (`:795-799`).
 ///
 /// ⛔ ATTRIBUTES ONLY, NOT OPERANDS: `op->getAttrs()` does not reach a `sentient.receive_and_store`'s
 /// `$dst`, `$drop_first` or `$multicast_info`, which are SSA operands — `e336_match` compares those
-/// separately, through `src_dst` and `addr_offsets` (`:764-790`).
+/// separately, through `src_dst` and `addr_offsets` (`:764-793`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MemOpAttrs {
     /// `sentient.load_and_send`'s.
@@ -305,7 +305,7 @@ pub(crate) enum MemOpAttrs {
 ///
 /// ⛔ NO `derive(Clone)`, DELIBERATELY — see [`UnrollOperands::assign_from`].
 ///
-/// ⭐ `MLIRContext *context` (`OpRerolling.hpp:53`) IS DROPPED: it exists only to be handed to
+/// ⭐ `MLIRContext *context` (`OpRerolling.hpp:56`) IS DROPPED: it exists only to be handed to
 /// `StringAttr::get`/`SentientComputePortAttr::get`, and this island's attributes are values.
 ///
 /// ⭐ AND THE ONE-TO-THREE-LINE ACCESSORS (`getUnrollSize`, `getOpName`, `isThisFieldUnrolled`, …)
@@ -321,7 +321,7 @@ pub(crate) struct UnrollOperands {
     /// `is_field_unroll_` (`OpRerolling.hpp:59`) — whether that slot's register index advances with
     /// the unroll factor.
     pub(crate) is_field_unroll: [bool; OperandName::ALL.len()],
-    /// `forwarding_list_` (`OpRerolling.hpp:58`), in `e335_fill`'s lexicographic order (`:547-551`).
+    /// `forwarding_list_` (`OpRerolling.hpp:58`), in `e335_fill`'s lexicographic order (`:541-544`).
     pub(crate) forwarding_list: [Vec<sen::Port>; OperandName::ALL.len()],
     /// `unroll_size_`.
     pub(crate) unroll_size: UnrollSize,
@@ -360,8 +360,9 @@ pub(crate) struct UnrollOperands {
 }
 
 impl Default for UnrollOperands {
-    /// The reference's constructor (`OpRerolling.hpp:85-102`) and its member initialisers (`:47-55`,
-    /// `:158-164`): every slot `"NA"`, no forwarding, nothing field-unrolled, `unroll_size_` 1.
+    /// The reference's constructor (`OpRerolling.hpp:85-101`) and its member initialisers (`:45-47`,
+    /// `:53-55`, `:62-65`, `:75`): every slot `"NA"`, no forwarding, nothing field-unrolled,
+    /// `unroll_size_` 1.
     fn default() -> Self {
         Self {
             operand_list: [None; OperandName::ALL.len()],
@@ -441,7 +442,7 @@ impl UnrollOperands {
         self.forwarding_list[OperandName::Result.slot()].contains(&sen::Port::Xrf)
     }
 
-    /// `isXrfOp()` (`OpRerolling.hpp:160`) — excluded from the worklist as a one-liner, and written
+    /// `isXrfOp()` (`OpRerolling.hpp:158`) — excluded from the worklist as a one-liner, and written
     /// here because `e338_setUnrollFieldsInStmt` calls it.
     #[must_use]
     pub(crate) fn is_xrf_op(&self) -> bool {
@@ -629,7 +630,7 @@ impl UnrollOperands {
         true
     }
 
-    /// `xrf_write_incr_ == unroll_size_` (`:695-697`), an `int` against an `unsigned` in the
+    /// `xrf_write_incr_ == unroll_size_` (`:689-691`), an `int` against an `unsigned` in the
     /// reference and so a plain numeric comparison.
     fn xrf_write_incr_matches_unroll_size(&self) -> bool {
         i64::from(self.xrf_write_incr.0) == i64::from(self.unroll_size.0)
@@ -641,8 +642,8 @@ impl UnrollOperands {
     /// far the new unroll factor undershoots the current one, when the slot is field-unrolled (`:926`).
     ///
     /// ⛔ `None` IS THE REFERENCE'S OWN DEATH AND NOT A CHECK ADDED HERE: its caller feeds this
-    /// straight into `symbolizeSentientComputePort(...).value()` (`:1132`), which is `std::nullopt`
-    /// past `lrf31` and for the `"NA"` an unfilled slot still holds.
+    /// straight into `symbolizeSentientComputePort(...).value()` (`:1091`, `:1306-1310`), which
+    /// is `std::nullopt` past `lrf31` and for the `"NA"` an unfilled slot still holds.
     #[must_use]
     pub(crate) fn create_operand(
         &self,
@@ -683,20 +684,20 @@ impl UnrollOperands {
             .collect()
     }
 
-    /// `getLrfIndex(x) + (unroll_size_ - new_unroll_size)` (`:929`, `:948`).
+    /// `getLrfIndex(x) + (unroll_size_ - new_unroll_size)` (`:931`, `:946-947`).
     ///
     /// ⭐ WRAPPING, LIKE THE REFERENCE'S `unsigned`: `e338_setUnrollFieldsInStmt` counts the new
-    /// factor DOWN from `unroll_size_` (`:1120`), so the undershoot is never negative there, and a
-    /// wrap lands far past `lrf31` where [`lrf_at`] already says `None`.
+    /// factor DOWN from `unroll_size_` (`:1045`, `:1064`), so the undershoot is never negative
+    /// there, and a wrap lands far past `lrf31` where [`lrf_at`] already says `None`.
     const fn shifted_lrf(&self, index: sen::LrfIndex, new_unroll_size: UnrollSize) -> u32 {
         (index.get() as u32).wrapping_add(self.unroll_size.0.wrapping_sub(new_unroll_size.0))
     }
 
-    /// `UnrollOperands &operator=(const UnrollOperands &other)` (`OpRerolling.hpp:105-127`), which
+    /// `UnrollOperands &operator=(const UnrollOperands &other)` (`OpRerolling.hpp:103-125`), which
     /// carries the candidate's snapshot over the reference's (`:195`).
     ///
     /// ⛔⛔ AND THIS IS WHY THE TYPE CARRIES NO `derive(Clone)`: the reference's assignment copies
-    /// eighteen members and SKIPS `is_splat_promoted_` and `is_memory_unit`, so the destination keeps
+    /// nineteen members and SKIPS `is_splat_promoted_` and `is_memory_unit`, so the destination keeps
     /// its own two. A derived clone would copy them as well, silently.
     pub(crate) fn assign_from(&mut self, other: &Self) {
         self.op_name = other.op_name;
@@ -720,8 +721,8 @@ impl UnrollOperands {
     }
 }
 
-/// `symbolizeSentientComputePort("lrf" + std::to_string(index))` for a COMPUTED index (`:930-931`,
-/// `:949-950`).
+/// `symbolizeSentientComputePort("lrf" + std::to_string(index))` for a COMPUTED index (`:929-933`,
+/// `:946-949`).
 ///
 /// ⛔ `None` IS THE REFERENCE'S OWN DEATH, NOT A CHECK ADDED HERE — the shape
 /// `bridges::dataflow_ir_to_sentient::vc_vector_operands::register_slice` already documents: every

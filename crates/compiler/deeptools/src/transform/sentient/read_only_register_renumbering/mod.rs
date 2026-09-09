@@ -122,7 +122,7 @@ pub(crate) struct Candidate {
     /// `val_`.
     pub(crate) address: LbrAddress,
     /// `element_size_` — ⭐ NEVER THE REFERENCE'S `-1`: that value returns before the candidate is
-    /// built (`:222-224`).
+    /// built (`:236-241`).
     pub(crate) element_size: Bits,
     /// `new_register_index_` — ⛔ `None` IS THE REFERENCE'S **UNINITIALISED** FIELD. Its one mutator
     /// is called by `computeNewRegisterIndices` (e343) for every candidate, so reading it before that
@@ -130,7 +130,8 @@ pub(crate) struct Candidate {
     pub(crate) new_register_index: Option<sentient::RegIndex>,
 }
 
-/// `ReadOnlyRegisterRenumberingPass`'s OWN STATE — the two fields these four units share (`:161-166`).
+/// `ReadOnlyRegisterRenumberingPass`'s OWN STATE — the two fields these four units share
+/// (`:173`, `:177`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReadOnlyRegisterRenumbering {
     /// `unsafe_to_renumber_` — ⛔ ONCE SET IT IS NEVER CLEARED, and `cleanup()` does not touch it, so
@@ -179,7 +180,7 @@ impl ReadOnlyRegisterRenumbering {
     ///
     /// ⛔ THE WHOLE EFFECT, and it is the island's `set_value_reg_index`: of `setValueRegIndex`'s long
     /// dispatch the only arm a candidate can reach is
-    /// `copyOp.setRegIndexAttr(builder.getI32IntegerAttr(index))` (`SentientOps.cpp:2013-2018`).
+    /// `copyOp.setRegIndexAttr(builder.getI32IntegerAttr(index))` (`SentientOps.cpp:2014-2018`).
     pub(crate) fn do_renumbering(&self, body: &mut [Op]) {
         if self.unsafe_to_renumber {
             return;
@@ -233,7 +234,7 @@ impl ReadOnlyRegisterRenumbering {
         if !is_sentient_constant(*input, defs) {
             todo!(
                 "runOn: DT_CHECK_MSG(isConstant<sentient::ConstantOp>(copy_op.getInp()), \
-                 \"LBR has to be initialized from a constant\") on {input:?} (:203)"
+                 \"LBR has to be initialized from a constant\") on {input:?} (:204-205)"
             )
         }
         let address = match defs.of(*input) {
@@ -261,7 +262,7 @@ impl ReadOnlyRegisterRenumbering {
         let Some(address) = address else {
             todo!(
                 "runOn: DT_CHECK_MSG(lbr_addr >= 0, \"unable to identify the lbr address\") \
-                 on {input:?} (:216)"
+                 on {input:?} (:230)"
             )
         };
         let Some(element_size) = *element_size else {
@@ -280,6 +281,10 @@ impl ReadOnlyRegisterRenumbering {
 /// `dcc::utils::isConstant<sentient::ConstantOp>` (`Utils/Utils.cpp:423`) at this pass's one
 /// instantiation — a `sentient.scalar_constant`, or a `uniform.query_map` all of whose per-core values
 /// are one. ⛔ FALSE FOR A REGION ARGUMENT, which has no defining op.
+///
+/// ⭐ AN EMPTY MAPPING IS VACUOUSLY TRUE HERE, where the reference's
+/// `DT_CHECK(!immutable_map.getValues().empty())` (`Utils/Utils.cpp:434`) aborts — and it still
+/// refuses, one step later: [`constant_target_values`] names that same check on the empty mapping.
 fn is_sentient_constant(val: Val, defs: Definitions<'_>) -> bool {
     let is_constant_op =
         |op: Option<&Op>| matches!(op, Some(Op::Sentient(sentient::Op::ScalarConstant { .. })));

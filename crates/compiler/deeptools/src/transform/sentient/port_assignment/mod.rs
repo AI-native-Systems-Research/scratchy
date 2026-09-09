@@ -102,7 +102,7 @@ use crate::islands::sentient::dialects::sentient::{BinaryOp, Port, Precision, Te
 use crate::islands::sentient::dialects::{Op, sentient};
 use crate::units::DfirUnit;
 
-/// WHICH OF THE THREE COMPUTE PORTS — the count is fixed at `performGraphColoring(3)` (`:783`).
+/// WHICH OF THE THREE COMPUTE PORTS — the count is fixed at `performGraphColoring(3)` (`:784`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PortId {
     P0,
@@ -122,7 +122,7 @@ impl PortId {
 }
 
 /// WHICH OPERAND VALUE — `getOpADataID()` and friends, which is also a colouring node's `index_`
-/// (`getOrAddNode(getOpXDataID())`, `:495`).
+/// (`getOrAddNode(getOpXDataID())`, `:476-478`).
 ///
 /// ⛔ ABSENCE IS THE REFERENCE'S `-1`: `processDataID` returns early on `data_id < 0` (`:96`), and the
 /// island already spells it as `Operand::data_id: None`.
@@ -157,23 +157,23 @@ pub(crate) enum MacOperand {
 pub(crate) enum PortRejection {
     /// "invalid op argument in PT int" (`:259`).
     InvalidMacArgumentInPtInt,
-    /// "invalid op argument in PT fp" (`:304`).
+    /// "invalid op argument in PT fp" (`:305`).
     InvalidMacArgumentInPtFp,
-    /// "No SFP Ring in other components" (`:344`, `:411` — the two sites share one message).
+    /// "No SFP Ring in other components" (`:352`, `:418` — the two sites share one message).
     NoSfpRingInOtherComponents,
-    /// "invalid op argument in PE/SFP" (`:355`).
+    /// "invalid op argument in PE/SFP" (`:361`).
     InvalidMacArgumentInPeSfp,
-    /// "invalid compute unit for mac op" (`:362`).
+    /// "invalid compute unit for mac op" (`:367`).
     InvalidComputeUnitForMac,
-    /// "cannot have 1.0 in binaryOp except in FMUL case" (`:404`).
+    /// "cannot have 1.0 in binaryOp except in FMUL case" (`:410`).
     OneInBinaryOpOutsideFmul,
-    /// "invalid compute unit for binary op" (`:423`).
+    /// "invalid compute unit for binary op" (`:428`).
     InvalidComputeUnitForBinary,
-    /// "invalid compute unit for unary op" (`:435`).
+    /// "invalid compute unit for unary op" (`:441`).
     InvalidComputeUnitForUnary,
-    /// "invalid compute unit for ternary op" (`:459`).
+    /// "invalid compute unit for ternary op" (`:460`).
     InvalidComputeUnitForTernary,
-    /// "unsupported op" (`:464`).
+    /// "unsupported op" (`:466`).
     UnsupportedOp,
 }
 
@@ -194,7 +194,7 @@ fn ports(list: &[PortId]) -> ValidPorts {
     ValidPorts::Ports(list.to_vec())
 }
 
-/// `PortAssignmentPass`'s eight-slot state (`:45-56`), generic over the out-of-scope colouring graph.
+/// `PortAssignmentPass`'s eight-slot state (`:45-55`), generic over the out-of-scope colouring graph.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PortAssignment<G: ColoringGraph> {
     /// `port_assignment_graph_`.
@@ -222,7 +222,7 @@ impl<G: ColoringGraph> PortAssignment<G> {
     /// ⛔ NOT A RE-CONSTRUCTION: `port_assignment_graph_.clear()` deliberately leaves its
     /// `same_color_edges_` and `max_node_id_` standing (`Analyses/GraphColoring.hpp:52-60`), which is
     /// why the graph is a [`ColoringGraph`] seam rather than `G::default()`.
-    /// ⭐ THE TWO INNER LOOPS (`:81`, `:84`) ARE NO-OPS: `for (auto op_vec : ...)` takes each entry by
+    /// ⭐ THE TWO INNER LOOPS (`:82`, `:84`) ARE NO-OPS: `for (auto op_vec : ...)` takes each entry by
     /// value and clears the copy, so only the outer `.clear()` has any effect.
     pub(crate) fn clean(&mut self) {
         self.op_to_index.clear();
@@ -261,8 +261,9 @@ impl<G: ColoringGraph> PortAssignment<G> {
 /// PE/SFP it never reaches its own arm), `sfpring` contains `sfp` (so the MAC PE/SFP `sfpring` arm is
 /// DEAD), and `mxint4`/`mxfp8`/`ieee_fp16` take the `int`/`fp8`/`fp16` precision branches.
 /// ⛔ [`IsaGen`] MODELS TWO OF `IsaCoreGen`'s FIVE, so `arch >= RCUDD1A_ISA` always holds — the PT/int
-/// `lrf0..3` `{0}` arm (`:248`) is dead and `DT_CHECK_MSG(arch < RCUDD1A_ISA)` for `lrf4/5` can never
-/// hold. On SEN1P5 the binary `zero`/`one`/`sfpring` arms are dead behind the `arch == SEN1P5_ISA`
+/// `lrf0..3` `{0}` arm (`:246`) is dead and `DT_CHECK_MSG(arch < RCUDD1A_ISA)` (`:248`) for
+/// `lrf4/5` can never hold. On SEN1P5 the binary `zero`/`one`/`sfpring` arms are dead behind the
+/// `arch == SEN1P5_ISA`
 /// branch, and `abs_min` is deliberately absent from its min/max/fcmp group.
 /// ⭐ A PT MAC computing in `fp24`, `fp32` or `none` matches neither precision branch and falls out
 /// to an empty answer with no error (`:470`).
@@ -291,7 +292,7 @@ pub(crate) fn valid_ports<A: Arch>(
                             IsaGen::Sen1p5 => ports(&[PortId::P1]),
                             IsaGen::Rcudd1a => todo!(
                                 "getValidPorts: Cross PT north link only present in sen 1.5 \
-                                 (PortAssignment.cpp:236)"
+                                 (PortAssignment.cpp:233)"
                             ),
                         }
                     } else if value.contains("zero") {
@@ -304,7 +305,7 @@ pub(crate) fn valid_ports<A: Arch>(
                             4..=5 => todo!(
                                 "getValidPorts: no lrf4/5 in dd1a — DT_CHECK_MSG(arch < \
                                  RCUDD1A_ISA) holds on neither modelled generation \
-                                 (PortAssignment.cpp:250)"
+                                 (PortAssignment.cpp:248)"
                             ),
                             // Unable to assign a port.
                             _ => ports(&[]),

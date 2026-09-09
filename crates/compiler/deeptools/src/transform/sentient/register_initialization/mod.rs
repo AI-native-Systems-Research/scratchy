@@ -96,7 +96,7 @@ use crate::transform::sentient::analyses::{
 /// leader's local candidates are collected, evaluated, selected against the globals and merged.
 ///
 /// ⛔ THE ORDER IS THE PORT — the globals are merged into `result` LAST, after every local
-/// selection, because `selectLocally` may purge that list (`RegisterInitialization.cpp:150-156`).
+/// selection, because `selectLocally` may purge that list (`RegisterInitialization.cpp:149-155`).
 /// ⛔ EVERY COLLABORATOR IS OUT OF CAMPAIGN SCOPE (`RegisterInitialization/`), so what is ported is
 /// the sequence; each call lands on a seam whose only crate implementation is a `todo!`.
 pub fn run_local_analysis(

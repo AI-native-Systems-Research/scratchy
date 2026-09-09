@@ -99,7 +99,7 @@ use crate::islands::sentient::dialects::{
 };
 
 /// ONE REGISTER-RELATED SSA VALUE THE PACKER TRACKS — the pass-local `RegIndex`
-/// (`RegisterPacking.cpp:60-91`), renamed because [`ops::RegIndex`] is the island's index type.
+/// (`RegisterPacking.cpp:60-92`), renamed because [`ops::RegIndex`] is the island's index type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackedReg {
     /// `val_`.
@@ -149,7 +149,7 @@ impl TrackedReg {
     }
 }
 
-/// THE REGISTERS OF ONE REGISTER FILE — `TypedRegCollection` (`RegisterPacking.cpp:93-105`).
+/// THE REGISTERS OF ONE REGISTER FILE — `TypedRegCollection` (`RegisterPacking.cpp:94-107`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedRegCollection {
     /// `reg_type_`.
@@ -159,7 +159,7 @@ pub struct TypedRegCollection {
 }
 
 impl TypedRegCollection {
-    /// `TypedRegCollection(reg_type)` (`RegisterPacking.cpp:95`).
+    /// `TypedRegCollection(reg_type)` (`RegisterPacking.cpp:97`).
     #[must_use]
     pub const fn new(reg_type: ops::RegType) -> TypedRegCollection {
         TypedRegCollection {
@@ -194,7 +194,7 @@ impl RegisterPacking {
     /// Replaces: e133_cleanup
     ///
     /// Drops the register table — the pass runs this per `dataflow.program_unit`, before deciding
-    /// whether that unit is even packed (`RegisterPacking.cpp:415-418`).
+    /// whether that unit is even packed (`RegisterPacking.cpp:416-417`).
     pub fn cleanup(&mut self) {
         self.reg_table.clear();
     }
@@ -207,7 +207,7 @@ impl RegisterPacking {
     ///
     /// ⚠️ TRAP: `is_index_updated_` IS NOT CONSULTED. A register the packer never renumbered has
     /// `new_register_index_ == -1` and that `-1` is written back over the index it came in with
-    /// (`RegisterPacking.cpp:150-157`).
+    /// (`RegisterPacking.cpp:150-156`).
     /// ⚠️ TRAP: an index is only ever COPIED here, never minted — see [`ops::RegIndex::at`], which
     /// takes its value as a const generic. Choosing a new one is e348/e459's problem, and the island
     /// has no runtime constructor for them to use.
@@ -224,10 +224,11 @@ impl RegisterPacking {
 ///
 /// The register file and index an op holds at `position`, or `None` when it holds none there.
 ///
-/// ⭐ THE FOUR `DT_CHECK`s ARE DISCHARGED BY THE TYPE: an island [`ops::Reg`] is always a locale AND
-/// an index, so "has `regIndex` but no `regLocale`" is not constructible.
+/// ⭐ THE SIX `DT_CHECK`s (`:252`, `:255`, `:258`; `:262`, `:265`, `:268`) ARE DISCHARGED BY THE
+/// TYPE: an island [`ops::Reg`] is always a locale AND an index, so "has `regIndex` but no
+/// `regLocale`" is not constructible.
 /// ⭐ `position` IS IGNORED FOR AN OP WITH THE SINGULAR `regIndex`, exactly as the reference ignores
-/// its `idx` on that branch (`RegisterPacking.cpp:250-262`).
+/// its `idx` on that branch (`RegisterPacking.cpp:251-261`).
 #[must_use]
 pub fn reg_type_and_index(op: &Op, position: usize) -> Option<ops::Reg> {
     let Op::Sentient(inner) = op else {
@@ -256,8 +257,9 @@ pub fn reg_type_and_index(op: &Op, position: usize) -> Option<ops::Reg> {
         },
         // ⭐ THE REFERENCE'S `1 + 2n` NUMBERING, WHICH ITS OWN CALLERS COMPUTE: entry 0 is the
         // induction variable, `1..=n` the region arguments and the rest the results
-        // (`RegisterPacking.cpp:337`, `:356-357`). ⛔ POSITION 0 HAS NO FIELD IN THIS ISLAND — a
-        // `Carried` is one `Reg` per carried value and none for the bound; see [`ops::Carried`].
+        // (`RegisterPacking.cpp:337`, `:342`, `:357-358`). ⛔ POSITION 0 HAS NO FIELD IN THIS
+        // ISLAND — a `Carried` is one `Reg` per carried value and none for the bound; see
+        // [`ops::Carried`].
         ops::Op::For { carried, .. } => {
             let carried_count = carried.len();
             position
@@ -267,7 +269,7 @@ pub fn reg_type_and_index(op: &Op, position: usize) -> Option<ops::Reg> {
         }
         ops::Op::If { yielded, .. } => yielded.get(position).map(|value| value.reg),
         // ⭐ NO REGISTER ARRAYS AT ALL — the reference reaches these through neither branch, because
-        // `runOnProgramUnitOp` only visits an op that HAS `regIndex` or `regIndices` (`:439`).
+        // `runOnProgramUnitOp` only visits an op that HAS `regIndex` or `regIndices` (`:396`).
         _ => None,
     }
 }
@@ -278,7 +280,7 @@ pub fn reg_type_and_index(op: &Op, position: usize) -> Option<ops::Reg> {
 /// the same thing in every unit.
 ///
 /// ⚠️ TRAP: A PROMOTED VALUE DEFINED BY ANYTHING ELSE IS SILENTLY DROPPED. The reference's chain has
-/// no `else` (`RegisterPacking.cpp:300-330`), so a promoted register initialised by anything other
+/// no `else` (`RegisterPacking.cpp:301-325`), so a promoted register initialised by anything other
 /// than `sentient.scalar_constant`, `symbol.create_symbol` or `uniform.query_map` is added to NO
 /// collection and the packer never sees it.
 pub fn fill_typed_reg_collection(
