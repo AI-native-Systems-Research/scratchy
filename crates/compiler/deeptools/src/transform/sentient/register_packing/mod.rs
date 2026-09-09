@@ -88,26 +88,265 @@
 //! | `e522_runOnProgramUnitOp` | 522 | 3 | 21 | `dcc/src/Transform/Sentient/RegisterPacking.cpp:388` |
 //! | `e573_runOnOperation` | 573 | 4 | 11 | `dcc/src/Transform/Sentient/RegisterPacking.cpp:410` |
 
+#![allow(dead_code)]
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e573_runOnOperation` (level 4) is what calls this
+// file's driver, and every unit below is reachable only from the tests until it lands. CI runs clippy
+// with `-D warnings`. ⭐ REMOVE THIS WITH e573.
 
-// crustify:todo: e132_setNewRegisterIndex
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:75  (4 body lines, level 0)
-//   original  : void setNewRegisterIndex(int idx)
+use crate::islands::sentient::dialects::sentient as ops;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, set_value_reg_index, symbol, uniform,
+};
 
-// crustify:todo: e133_cleanup
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:135  (1 body lines, level 0)
-//   original  : void cleanup()
+/// ONE REGISTER-RELATED SSA VALUE THE PACKER TRACKS — the pass-local `RegIndex`
+/// (`RegisterPacking.cpp:60-91`), renamed because [`ops::RegIndex`] is the island's index type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedReg {
+    /// `val_`.
+    pub value: Val,
+    /// `old_register_index_` — the index the op carried on entry; `None` is the `.td`'s `-1`.
+    pub old_index: Option<ops::RegIndex>,
+    /// `new_register_index_` — the packed index, `None` until one is chosen (the reference's `-1`).
+    pub new_index: Option<ops::RegIndex>,
+    /// `is_index_updated_`.
+    pub index_updated: bool,
+    /// `has_same_value_in_all_units_`.
+    pub same_value_in_all_units: bool,
+    /// `is_header_promoted_`.
+    pub header_promoted: bool,
+}
 
-// crustify:todo: e134_doRenumbering
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:150  (7 body lines, level 0)
-//   original  : void RegisterPackingPass::doRenumbering()
+impl TrackedReg {
+    /// `RegIndex(val, reg_index)` (`RegisterPacking.cpp:62`) — the two-argument constructor.
+    #[must_use]
+    pub const fn new(value: Val, old_index: Option<ops::RegIndex>) -> TrackedReg {
+        TrackedReg {
+            value,
+            old_index,
+            new_index: None,
+            index_updated: false,
+            same_value_in_all_units: false,
+            header_promoted: false,
+        }
+    }
 
-// crustify:todo: e135_getRegTypeAndIndex
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:249  (22 body lines, level 0)
-//   original  : std::pair<SentientRegType, int> RegisterPackingPass::getRegTypeAndIndex( mlir::Operation *op, int idx)
+    /// `RegIndex(val, reg_index, is_header_promoted, has_same_value_in_all_units)`
+    /// (`RegisterPacking.cpp:64`) — every caller of it passes `is_header_promoted = true`.
+    #[must_use]
+    pub const fn promoted(
+        value: Val,
+        old_index: Option<ops::RegIndex>,
+        same_value_in_all_units: bool,
+    ) -> TrackedReg {
+        TrackedReg {
+            value,
+            old_index,
+            new_index: None,
+            index_updated: false,
+            same_value_in_all_units,
+            header_promoted: true,
+        }
+    }
+}
 
-// crustify:todo: e136_fillTypedRegCollection
-//   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:298  (31 body lines, level 0)
-//   original  : void RegisterPackingPass::fillTypedRegCollection( TypedRegCollection *typed_reg_collec, mlir::Value init_value, mlir::Value res_value, int64_t reg_index, bool is_header_promoted)
+/// THE REGISTERS OF ONE REGISTER FILE — `TypedRegCollection` (`RegisterPacking.cpp:93-105`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedRegCollection {
+    /// `reg_type_`.
+    pub reg_type: ops::RegType,
+    /// `regs_list_`.
+    pub regs: Vec<TrackedReg>,
+}
+
+impl TypedRegCollection {
+    /// `TypedRegCollection(reg_type)` (`RegisterPacking.cpp:95`).
+    #[must_use]
+    pub const fn new(reg_type: ops::RegType) -> TypedRegCollection {
+        TypedRegCollection {
+            reg_type,
+            regs: Vec::new(),
+        }
+    }
+}
+
+/// `RegisterPackingPass`'s own state — the register table it fills, packs and writes back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegisterPacking {
+    /// `reg_table`.
+    pub reg_table: Vec<TypedRegCollection>,
+}
+
+impl TrackedReg {
+    /// Replaces: e132_setNewRegisterIndex
+    ///
+    /// Records the packed index for this register and marks it renumbered.
+    ///
+    /// ⚠️ TRAP: `is_index_updated_` GOES TRUE EVEN FOR `-1`. The reference sets the flag
+    /// unconditionally (`RegisterPacking.cpp:75-78`), so a register handed an unassigned index still
+    /// counts as decided by `updateRegIndex` (e348) and by [`RegisterPacking::do_renumbering`].
+    pub fn set_new_register_index(&mut self, index: Option<ops::RegIndex>) {
+        self.new_index = index;
+        self.index_updated = true;
+    }
+}
+
+impl RegisterPacking {
+    /// Replaces: e133_cleanup
+    ///
+    /// Drops the register table — the pass runs this per `dataflow.program_unit`, before deciding
+    /// whether that unit is even packed (`RegisterPacking.cpp:415-418`).
+    pub fn cleanup(&mut self) {
+        self.reg_table.clear();
+    }
+}
+
+impl RegisterPacking {
+    /// Replaces: e134_doRenumbering
+    ///
+    /// Writes every tracked register's packed index back onto the value that holds it.
+    ///
+    /// ⚠️ TRAP: `is_index_updated_` IS NOT CONSULTED. A register the packer never renumbered has
+    /// `new_register_index_ == -1` and that `-1` is written back over the index it came in with
+    /// (`RegisterPacking.cpp:150-157`).
+    /// ⚠️ TRAP: an index is only ever COPIED here, never minted — see [`ops::RegIndex::at`], which
+    /// takes its value as a const generic. Choosing a new one is e348/e459's problem, and the island
+    /// has no runtime constructor for them to use.
+    pub fn do_renumbering(&self, unit: &mut [Op]) {
+        for collection in &self.reg_table {
+            for reg in &collection.regs {
+                set_value_reg_index(unit, reg.value, reg.new_index);
+            }
+        }
+    }
+}
+
+/// Replaces: e135_getRegTypeAndIndex
+///
+/// The register file and index an op holds at `position`, or `None` when it holds none there.
+///
+/// ⭐ THE FOUR `DT_CHECK`s ARE DISCHARGED BY THE TYPE: an island [`ops::Reg`] is always a locale AND
+/// an index, so "has `regIndex` but no `regLocale`" is not constructible.
+/// ⭐ `position` IS IGNORED FOR AN OP WITH THE SINGULAR `regIndex`, exactly as the reference ignores
+/// its `idx` on that branch (`RegisterPacking.cpp:250-262`).
+#[must_use]
+pub fn reg_type_and_index(op: &Op, position: usize) -> Option<ops::Reg> {
+    let Op::Sentient(inner) = op else {
+        return None;
+    };
+    match inner {
+        ops::Op::LoadAndSend { reg, .. }
+        | ops::Op::ReceiveAndStore { reg, .. }
+        | ops::Op::LoadComputeAndSend { reg, .. }
+        | ops::Op::ScalarCopy { reg, .. }
+        | ops::Op::ReceiveAndExtractScalar { reg, .. } => Some(*reg),
+        ops::Op::ScalarAdd { reg, .. } | ops::Op::ScalarSub { reg, .. } => *reg,
+        ops::Op::LoadAndStore {
+            src_reg, dst_reg, ..
+        } => match position {
+            0 => Some(*src_reg),
+            1 => Some(*dst_reg),
+            _ => None,
+        },
+        ops::Op::LoadAndExtractScalar {
+            addr_reg, data_reg, ..
+        } => match position {
+            0 => Some(*addr_reg),
+            1 => Some(*data_reg),
+            _ => None,
+        },
+        // ⭐ THE REFERENCE'S `1 + 2n` NUMBERING, WHICH ITS OWN CALLERS COMPUTE: entry 0 is the
+        // induction variable, `1..=n` the region arguments and the rest the results
+        // (`RegisterPacking.cpp:337`, `:356-357`). ⛔ POSITION 0 HAS NO FIELD IN THIS ISLAND — a
+        // `Carried` is one `Reg` per carried value and none for the bound; see [`ops::Carried`].
+        ops::Op::For { carried, .. } => {
+            let carried_count = carried.len();
+            position
+                .checked_sub(1)
+                .and_then(|p| carried.get(p).or_else(|| carried.get(p - carried_count)))
+                .map(|value| value.reg)
+        }
+        ops::Op::If { yielded, .. } => yielded.get(position).map(|value| value.reg),
+        // ⭐ NO REGISTER ARRAYS AT ALL — the reference reaches these through neither branch, because
+        // `runOnProgramUnitOp` only visits an op that HAS `regIndex` or `regIndices` (`:439`).
+        _ => None,
+    }
+}
+
+/// Replaces: e136_fillTypedRegCollection
+///
+/// Adds one tracked register to `collection`, deciding for a header-promoted value whether it holds
+/// the same thing in every unit.
+///
+/// ⚠️ TRAP: A PROMOTED VALUE DEFINED BY ANYTHING ELSE IS SILENTLY DROPPED. The reference's chain has
+/// no `else` (`RegisterPacking.cpp:300-330`), so a promoted register initialised by anything other
+/// than `sentient.scalar_constant`, `symbol.create_symbol` or `uniform.query_map` is added to NO
+/// collection and the packer never sees it.
+pub fn fill_typed_reg_collection(
+    collection: &mut TypedRegCollection,
+    init_value: Val,
+    res_value: Val,
+    reg_index: Option<ops::RegIndex>,
+    header_promoted: bool,
+    defs: Definitions<'_>,
+) {
+    if !header_promoted {
+        collection.regs.push(TrackedReg::new(res_value, reg_index));
+        return;
+    }
+    match defs.of(init_value) {
+        Some(
+            Op::Sentient(ops::Op::ScalarConstant { .. })
+            | Op::Symbol(symbol::Op::CreateSymbol { .. }),
+        ) => {
+            collection
+                .regs
+                .push(TrackedReg::promoted(res_value, reg_index, true));
+        }
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+            let values = constant_target_values(*map, defs);
+            // ⭐ `llvm::all_of` OVER AN EMPTY RANGE IS TRUE AND NEVER CALLS `.front()`, and empty is
+            // exactly what `getConstantTargetValues` returns when a target is not a constant — so
+            // "not all constants" reaches the same arm as "all equal".
+            let same = values
+                .first()
+                .is_none_or(|first| values.iter().all(|v| v == first));
+            collection
+                .regs
+                .push(TrackedReg::promoted(res_value, reg_index, same));
+        }
+        _ => {}
+    }
+}
+
+/// `dcc::uniform::utils::getConstantTargetValues` (`Dialect/Uniform/Utils.cpp:382`) — a query map's
+/// per-unit target constants, EMPTY when any one of them is not a `sentient.scalar_constant`.
+///
+/// ⛔ NOT AN ANCHORED UNIT — `Dialect/Uniform/Utils.cpp` is outside this campaign's file list. The
+/// reference dereferences the `getDefiningOp<DefImmutableMappingOp>()` without a check and
+/// `DT_CHECK`s the mapping non-empty, so both are a crash there and a named `todo!` here.
+fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64> {
+    let pairs = match defs.of(map) {
+        Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs.clone(),
+        other => todo!(
+            "a uniform.query_map's $map is not a uniform.def_immutable_mapping \
+             (Dialect/Uniform/Utils.cpp:385): {other:?}"
+        ),
+    };
+    if pairs.is_empty() {
+        todo!(
+            "getConstantTargetValues: DT_CHECK(!immutable_map.getValues().empty()) \
+             (Dialect/Uniform/Utils.cpp:387)"
+        );
+    }
+    let mut values: Vec<i64> = Vec::new();
+    for (_key, value) in pairs {
+        match defs.of(value) {
+            Some(Op::Sentient(ops::Op::ScalarConstant { value, .. })) => values.push(*value),
+            _ => return Vec::new(),
+        }
+    }
+    values
+}
 
 // crustify:todo: e348_updateRegIndex
 //   authority : dcc/src/Transform/Sentient/RegisterPacking.cpp:162  (16 body lines, level 1)
@@ -149,3 +388,209 @@
 //   original  : void RegisterPackingPass::runOnOperation()
 //   calls     : e133_cleanup, e522_runOnProgramUnitOp
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+
+    /// `sentient.scalar_constant` — an `init_value` the promoted branch recognises.
+    fn scalar_constant(result: Val, value: i64) -> Op {
+        Op::Sentient(ops::Op::ScalarConstant {
+            value,
+            result,
+            reg_locale: ops::RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `sentient.scalar_copy` — one op with the singular `regLocale`/`regIndex` pair.
+    fn scalar_copy(result: Val, locale: ops::RegType, index: Option<ops::RegIndex>) -> Op {
+        Op::Sentient(ops::Op::ScalarCopy {
+            input: Val(0),
+            result,
+            reg: ops::Reg { locale, index },
+            element_size: None,
+            program_header: false,
+        })
+    }
+
+    /// The `reg` a `sentient.scalar_copy` in `ops_list` now carries.
+    fn copy_reg(ops_list: &[Op]) -> ops::Reg {
+        match &ops_list[0] {
+            Op::Sentient(ops::Op::ScalarCopy { reg, .. }) => *reg,
+            other => panic!("not a scalar_copy: {other:?}"),
+        }
+    }
+
+    /// `sentient.for` carrying two values, each with its own register.
+    fn for_op(first: ops::RegType, second: ops::RegType) -> Op {
+        let carried = |init, arg, result, locale| ops::Carried {
+            init,
+            arg,
+            result,
+            reg: ops::Reg {
+                locale,
+                index: None,
+            },
+            program_header: false,
+            element_size: None,
+        };
+        Op::Sentient(ops::Op::For {
+            iv: Val(1),
+            bound: Val(2),
+            carried: vec![
+                carried(Val(3), Val(4), Val(5), first),
+                carried(Val(6), Val(7), Val(8), second),
+            ],
+            dbg_name: None,
+            body: Vec::new(),
+        })
+    }
+
+    /// e132_setNewRegisterIndex — the index lands, and the flag goes up even for an unassigned one.
+    #[test]
+    fn e132_set_new_register_index() {
+        let mut reg = TrackedReg::new(Val(9), Some(ops::RegIndex::at::<5>()));
+        reg.set_new_register_index(Some(ops::RegIndex::at::<2>()));
+        assert_eq!(reg.new_index, Some(ops::RegIndex::at::<2>()));
+        assert!(reg.index_updated);
+
+        let mut unassigned = TrackedReg::new(Val(9), None);
+        unassigned.set_new_register_index(None);
+        assert_eq!(unassigned.new_index, None);
+        assert!(unassigned.index_updated);
+    }
+
+    /// e133_cleanup — the table is empty again.
+    #[test]
+    fn e133_cleanup() {
+        let mut packing = RegisterPacking {
+            reg_table: vec![TypedRegCollection::new(ops::RegType::Lrf)],
+        };
+        packing.cleanup();
+        assert!(packing.reg_table.is_empty());
+    }
+
+    /// e134_doRenumbering — the packed index reaches the op, and an unrenumbered register writes
+    /// its `-1` over the index the op came in with.
+    #[test]
+    fn e134_do_renumbering() {
+        let mut unit = vec![scalar_copy(
+            Val(9),
+            ops::RegType::Lrf,
+            Some(ops::RegIndex::at::<7>()),
+        )];
+        let mut reg = TrackedReg::new(Val(9), Some(ops::RegIndex::at::<7>()));
+        reg.set_new_register_index(Some(ops::RegIndex::at::<1>()));
+        let packing = RegisterPacking {
+            reg_table: vec![TypedRegCollection {
+                reg_type: ops::RegType::Lrf,
+                regs: vec![reg],
+            }],
+        };
+        packing.do_renumbering(&mut unit);
+        assert_eq!(copy_reg(&unit).index, Some(ops::RegIndex::at::<1>()));
+
+        let never_packed = RegisterPacking {
+            reg_table: vec![TypedRegCollection {
+                reg_type: ops::RegType::Lrf,
+                regs: vec![TrackedReg::new(Val(9), Some(ops::RegIndex::at::<7>()))],
+            }],
+        };
+        never_packed.do_renumbering(&mut unit);
+        assert_eq!(copy_reg(&unit).index, None);
+    }
+
+    /// e135_getRegTypeAndIndex — the singular pair ignores the position, and a `sentient.for`'s
+    /// `1 + 2n` numbering reaches the region argument and the result of the same carried value.
+    #[test]
+    fn e135_reg_type_and_index() {
+        let copy = scalar_copy(Val(9), ops::RegType::Lrf, Some(ops::RegIndex::at::<4>()));
+        let expected = ops::Reg {
+            locale: ops::RegType::Lrf,
+            index: Some(ops::RegIndex::at::<4>()),
+        };
+        assert_eq!(reg_type_and_index(&copy, 0), Some(expected));
+        assert_eq!(reg_type_and_index(&copy, 3), Some(expected));
+
+        let loop_op = for_op(ops::RegType::Lar, ops::RegType::Lbr);
+        let locale = |position| reg_type_and_index(&loop_op, position).map(|reg| reg.locale);
+        // ⭐ Entry 0 is the induction variable's, which this island has no field for.
+        assert_eq!(locale(0), None);
+        assert_eq!(locale(1), Some(ops::RegType::Lar));
+        assert_eq!(locale(2), Some(ops::RegType::Lbr));
+        assert_eq!(locale(3), Some(ops::RegType::Lar));
+        assert_eq!(locale(4), Some(ops::RegType::Lbr));
+        assert_eq!(locale(5), None);
+    }
+
+    /// e136_fillTypedRegCollection — a promoted constant is the same in all units, a query map is so
+    /// only when its per-unit constants agree, and a promoted value defined by anything else is
+    /// DROPPED.
+    #[test]
+    fn e136_fill_typed_reg_collection() {
+        let query_map = |second: i64| {
+            vec![
+                scalar_constant(Val(10), 5),
+                scalar_constant(Val(11), second),
+                Op::Uniform(uniform::Op::DefImmutableMapping {
+                    result: Val(12),
+                    pairs: vec![(Val(1), Val(10)), (Val(2), Val(11))],
+                }),
+                Op::Uniform(uniform::Op::QueryMap {
+                    result: Val(13),
+                    map: Val(12),
+                    key: Val(3),
+                }),
+                scalar_copy(Val(14), ops::RegType::Lrf, None),
+            ]
+        };
+        let fill = |init: Val, promoted: bool, second: i64| {
+            let region = query_map(second);
+            let regions: [&[Op]; 1] = [&region];
+            let mut collection = TypedRegCollection::new(ops::RegType::Lrf);
+            fill_typed_reg_collection(
+                &mut collection,
+                init,
+                Val(20),
+                Some(ops::RegIndex::at::<3>()),
+                promoted,
+                Definitions::from_innermost(&regions),
+            );
+            collection.regs
+        };
+
+        assert_eq!(
+            fill(Val(10), true, 5),
+            vec![TrackedReg::promoted(
+                Val(20),
+                Some(ops::RegIndex::at::<3>()),
+                true
+            )]
+        );
+        // Every unit's target constant is 5, so the register holds one value everywhere.
+        assert_eq!(
+            fill(Val(13), true, 5),
+            vec![TrackedReg::promoted(
+                Val(20),
+                Some(ops::RegIndex::at::<3>()),
+                true
+            )]
+        );
+        assert_eq!(
+            fill(Val(13), true, 6),
+            vec![TrackedReg::promoted(
+                Val(20),
+                Some(ops::RegIndex::at::<3>()),
+                false
+            )]
+        );
+        assert_eq!(
+            fill(Val(14), false, 5),
+            vec![TrackedReg::new(Val(20), Some(ops::RegIndex::at::<3>()))]
+        );
+        // ⭐ THE SILENT DROP: promoted, but its initialiser is none of the three.
+        assert_eq!(fill(Val(14), true, 5), Vec::new());
+    }
+}

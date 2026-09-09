@@ -883,6 +883,115 @@ pub fn value_reg_locale(val: Val, defs: Definitions<'_>) -> sentient::RegType {
     }
 }
 
+/// WRITE THE REGISTER INDEX A VALUE LIVES IN — `sentient::setValueRegIndex`
+/// (`dcc/src/Dialect/Sentient/SentientOps.cpp:1982`), the write twin of [`value_reg_locale`].
+///
+/// ⛔⛔ THE REFERENCE HAS TWO SPELLINGS FOR ONE FACT AND THIS ISLAND HAS ONE. Six ops get their
+/// singular `regIndex` set by name (`:2004-2035`); everything else falls into a generic tail that
+/// CREATES an all-`-1` `regIndices` array on demand and writes `[resultIndex]` (`:2036-2059`) — and
+/// `getValueRegIndex` (`:1884`) reads that same array back, so the two spellings round-trip. A
+/// [`sentient::Reg`] is that position's whole answer, so writing it serves both.
+///
+/// ⛔ AN OP WITH NO [`sentient::Reg`] AT THAT POSITION IS A NO-OP, not a refusal — see
+/// [`erase_defining_op`]. That is where the reference attaches an array nothing subsequently reads.
+///
+/// ⭐ `None` IS THE `-1` THE REFERENCE WRITES BACK for an unassigned register.
+pub fn set_value_reg_index(scope: &mut [Op], val: Val, index: Option<sentient::RegIndex>) {
+    for op in scope {
+        if let Op::Sentient(inner) = op {
+            set_reg_index_on(inner, val, index);
+            for region in sentient::regions_mut(inner) {
+                set_value_reg_index(region, val, index);
+            }
+        }
+    }
+}
+
+/// [`set_value_reg_index`] against one `sentient` op — the value is this op's result, or one of the
+/// region arguments it binds.
+fn set_reg_index_on(op: &mut sentient::Op, val: Val, index: Option<sentient::RegIndex>) {
+    match op {
+        sentient::Op::For { iv, carried, .. } => {
+            if *iv == val {
+                todo!(
+                    "setValueRegIndex on a sentient.for induction variable writes regIndices[0] \
+                     (Dialect/Sentient/SentientOps.cpp:1992), and this island's `For` has a `Reg` \
+                     per CARRIED value and none for the bound the induction variable counts against"
+                );
+            }
+            // ⭐ ONE ENTRY FOR THE ARGUMENT AND THE RESULT, where the reference has `[i + 1]` and
+            // `[i + numRegionIterArgs + 1]` of one `1 + 2n` array — see [`sentient::Carried`].
+            for value in carried.iter_mut() {
+                if value.arg == val || value.result == val {
+                    value.reg.index = index;
+                }
+            }
+        }
+        sentient::Op::If { yielded, .. } => {
+            for value in yielded.iter_mut() {
+                if value.result == val {
+                    value.reg.index = index;
+                }
+            }
+        }
+        sentient::Op::LoadAndSend { result, reg, .. }
+        | sentient::Op::ReceiveAndStore { result, reg, .. }
+        | sentient::Op::LoadComputeAndSend { result, reg, .. }
+        | sentient::Op::ScalarCopy { result, reg, .. }
+        | sentient::Op::ReceiveAndExtractScalar { result, reg, .. } => {
+            if *result == val {
+                reg.index = index;
+            }
+        }
+        sentient::Op::LoadAndStore {
+            results,
+            src_reg,
+            dst_reg,
+            ..
+        } => {
+            if results.0 == val {
+                src_reg.index = index;
+            }
+            if results.1 == val {
+                dst_reg.index = index;
+            }
+        }
+        sentient::Op::LoadAndExtractScalar {
+            addr_result,
+            data_result,
+            addr_reg,
+            data_reg,
+            ..
+        } => {
+            if *addr_result == val {
+                addr_reg.index = index;
+            }
+            if *data_result == val {
+                data_reg.index = index;
+            }
+        }
+        // ⭐ THE REFERENCE CREATES THE ATTRIBUTE WHERE NONE STOOD (`:2004-2013`), so an absent
+        // `reg` becomes one whose locale is still unassigned.
+        sentient::Op::ScalarAdd { result, reg, .. }
+        | sentient::Op::ScalarSub { result, reg, .. } => {
+            if *result == val {
+                match reg {
+                    Some(reg) => reg.index = index,
+                    None => {
+                        *reg = Some(sentient::Reg {
+                            locale: sentient::RegType::Unknown,
+                            index,
+                        });
+                    }
+                }
+            }
+        }
+        // ⭐ NO REGISTER FIELD, SO NOTHING TO WRITE: this is exactly the set of ops whose
+        // `regIndices` the reference materialises and no reader of this island ever asks for.
+        _ => {}
+    }
+}
+
 impl<'a> Definitions<'a> {
     /// THE `sentient.for` THAT BINDS A VALUE AS A REGION ARGUMENT, and at which position — see
     /// [`parent_for_arg`].

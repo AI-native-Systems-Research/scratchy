@@ -81,10 +81,44 @@
 //! | `e458_runOn` | 458 | 2 | 68 | `dcc/src/Transform/Sentient/RegisterInitialization.cpp:182` |
 //! | `e521_runOnOperation` | 521 | 3 | 16 | `dcc/src/Transform/Sentient/RegisterInitialization.cpp:261` |
 
+#![allow(dead_code)]
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET — `e521_runOnOperation` (level 3) is what reaches
+// this file's driver, and every unit below is reachable only from the tests until it lands. CI runs
+// clippy with `-D warnings`. ⭐ REMOVE THIS WITH e521.
 
-// crustify:todo: e131_runLocalAnalysis
-//   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:136  (21 body lines, level 0)
-//   original  : void runLocalAnalysis(ListOfCandidatesRef &result)
+use crate::transform::sentient::analyses::{
+    Candidate, CandidateCollector, CandidateEvaluator, CandidateSelector, UniformGroups,
+};
+
+/// Replaces: e131_runLocalAnalysis
+///
+/// Phase 1 of the `Driver`: the global candidates are collected and evaluated, then every group
+/// leader's local candidates are collected, evaluated, selected against the globals and merged.
+///
+/// ⛔ THE ORDER IS THE PORT — the globals are merged into `result` LAST, after every local
+/// selection, because `selectLocally` may purge that list (`RegisterInitialization.cpp:150-156`).
+/// ⛔ EVERY COLLABORATOR IS OUT OF CAMPAIGN SCOPE (`RegisterInitialization/`), so what is ported is
+/// the sequence; each call lands on a seam whose only crate implementation is a `todo!`.
+pub fn run_local_analysis(
+    result: &mut Vec<Candidate>,
+    collector: &mut dyn CandidateCollector,
+    evaluator: &mut dyn CandidateEvaluator,
+    selector: &mut dyn CandidateSelector,
+    groups: &dyn UniformGroups,
+) {
+    let mut global_candidates: Vec<Candidate> = Vec::new();
+    collector.collect_global_candidates(&mut global_candidates);
+    evaluator.evaluate_locally(&mut global_candidates);
+
+    for core in groups.group_leaders() {
+        let mut local_candidates: Vec<Candidate> = Vec::new();
+        collector.collect_local_candidates(core, &mut local_candidates);
+        evaluator.evaluate_locally(&mut local_candidates);
+        selector.select_locally(&mut local_candidates, &mut global_candidates, core);
+        evaluator.merge_into(result, &local_candidates);
+    }
+    evaluator.merge_into(result, &global_candidates);
+}
 
 // crustify:todo: e345_run
 //   authority : dcc/src/Transform/Sentient/RegisterInitialization.cpp:121  (14 body lines, level 1)
@@ -111,3 +145,111 @@
 //   original  : void RegisterInitializationPass::runOnOperation()
 //   calls     : e458_runOn
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::sentient::dialects::Val;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// WHICH COLLABORATOR WAS ASKED WHAT, IN ORDER — the only observable a driver phase has.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Call {
+        CollectGlobal,
+        EvaluateLocally(Vec<Candidate>),
+        CollectLocal(Val),
+        SelectLocally(Val),
+        MergeInto(Vec<Candidate>),
+    }
+
+    /// The one log the four seams write to — the reference's four references are four distinct
+    /// objects, so each fake is its own value sharing this.
+    type Log = Rc<RefCell<Vec<Call>>>;
+
+    struct Collector(Log);
+    struct Evaluator(Log);
+    struct Selector(Log);
+    struct Groups(Vec<Val>);
+
+    impl CandidateCollector for Collector {
+        fn collect_global_candidates(&mut self, results: &mut Vec<Candidate>) {
+            self.0.borrow_mut().push(Call::CollectGlobal);
+            results.push(Candidate(100));
+        }
+
+        fn collect_local_candidates(&mut self, core: Val, results: &mut Vec<Candidate>) {
+            self.0.borrow_mut().push(Call::CollectLocal(core));
+            results.push(Candidate(core.0));
+        }
+    }
+
+    impl CandidateEvaluator for Evaluator {
+        fn evaluate_locally(&mut self, candidates: &mut Vec<Candidate>) {
+            self.0
+                .borrow_mut()
+                .push(Call::EvaluateLocally(candidates.clone()));
+        }
+
+        fn merge_into(&mut self, result: &mut Vec<Candidate>, sublist: &[Candidate]) {
+            self.0.borrow_mut().push(Call::MergeInto(sublist.to_vec()));
+            result.extend_from_slice(sublist);
+        }
+    }
+
+    impl CandidateSelector for Selector {
+        fn select_locally(
+            &mut self,
+            _local: &mut Vec<Candidate>,
+            global: &mut Vec<Candidate>,
+            core: Val,
+        ) {
+            self.0.borrow_mut().push(Call::SelectLocally(core));
+            // The purge the reference's note is about: this selector keeps no global candidate.
+            global.clear();
+        }
+    }
+
+    impl UniformGroups for Groups {
+        fn group_leaders(&self) -> Vec<Val> {
+            self.0.clone()
+        }
+    }
+
+    /// e131_runLocalAnalysis — the sequence, and the globals merged LAST and already purged.
+    #[test]
+    fn e131_run_local_analysis() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut collector = Collector(Rc::clone(&log));
+        let mut evaluator = Evaluator(Rc::clone(&log));
+        let mut selector = Selector(Rc::clone(&log));
+        let groups = Groups(vec![Val(1), Val(2)]);
+        let mut result: Vec<Candidate> = Vec::new();
+
+        run_local_analysis(
+            &mut result,
+            &mut collector,
+            &mut evaluator,
+            &mut selector,
+            &groups,
+        );
+
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                Call::CollectGlobal,
+                Call::EvaluateLocally(vec![Candidate(100)]),
+                Call::CollectLocal(Val(1)),
+                Call::EvaluateLocally(vec![Candidate(1)]),
+                Call::SelectLocally(Val(1)),
+                Call::MergeInto(vec![Candidate(1)]),
+                Call::CollectLocal(Val(2)),
+                Call::EvaluateLocally(vec![Candidate(2)]),
+                Call::SelectLocally(Val(2)),
+                Call::MergeInto(vec![Candidate(2)]),
+                // ⭐ THE POINT: the globals arrive last, and by then the selector has purged them.
+                Call::MergeInto(Vec::new()),
+            ]
+        );
+        assert_eq!(result, vec![Candidate(1), Candidate(2)]);
+    }
+}

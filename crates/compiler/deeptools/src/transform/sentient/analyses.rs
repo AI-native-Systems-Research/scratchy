@@ -175,3 +175,126 @@ impl InstructionEstimator for OutOfScopeInstructionEstimator {
         )
     }
 }
+
+/// A `Candidate` THE REGISTER-INITIALISATION PIPELINE OWNS — an identity, not a candidate.
+///
+/// ⛔ `RegisterInitialization/Candidate.{h,cpp}` IS OUT OF CAMPAIGN SCOPE. The reference's lists are
+/// `SmallVector<Candidate *>` (`Candidate.h:65`) whose entries the collector `delete`s in its own
+/// destructor (`RegisterInitialization/Collector.h:59-62`), so what a ported list holds is WHICH
+/// candidate, not the candidate — and nothing here may look inside one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Candidate(pub u32);
+
+/// THE `CollectorInterface &` THE `Driver` IS HANDED (`RegisterInitialization/Collector.h:29`).
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE, so the crate's only implementation is [`OutOfScopeCandidateCollector`].
+/// ⭐ `&mut dyn` AT THE CALL SITES BECAUSE THE REFERENCE PICKS THE IMPLEMENTATION AT RUN TIME, from
+/// `llvm::cl::opt<CollectorKind>` (`RegisterInitialization.cpp:40-52`).
+pub trait CandidateCollector {
+    /// `collectGlobalCandidates(results)` — the reference expects `results` empty on entry.
+    fn collect_global_candidates(&mut self, results: &mut Vec<Candidate>);
+
+    /// `collectLocalCandidates(core, results)` — `core` is a group leader's unit value.
+    fn collect_local_candidates(&mut self, core: Val, results: &mut Vec<Candidate>);
+}
+
+/// THE `EvaluatorInterface &` THE `Driver` IS HANDED (`RegisterInitialization/Evaluator.h:36`).
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateEvaluator`]. Only the two methods
+/// `runLocalAnalysis` calls are declared; `evaluateGlobally` lands with e346.
+pub trait CandidateEvaluator {
+    /// `evaluateLocally(candidates)` — weights, sorts and re-prioritises IN PLACE.
+    fn evaluate_locally(&mut self, candidates: &mut Vec<Candidate>);
+
+    /// `mergeInto(result, sublist)` (`Evaluator.h:66`) — inserts `sublist` keeping `result` sorted.
+    fn merge_into(&mut self, result: &mut Vec<Candidate>, sublist: &[Candidate]);
+}
+
+/// THE `SelectorInterface &` THE `Driver` IS HANDED (`RegisterInitialization/Selector.h:38`).
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeCandidateSelector`]. `selectGlobally` lands with e346.
+pub trait CandidateSelector {
+    /// `selectLocally(local, global, core)` (`Selector.h:68`) — PURGES both lists in place; neither
+    /// can grow.
+    fn select_locally(
+        &mut self,
+        local: &mut Vec<Candidate>,
+        global: &mut Vec<Candidate>,
+        core: Val,
+    );
+}
+
+/// THE `const UniformGroupAnalyzer &` THE `Driver` IS HANDED
+/// (`Analyses/UniformGroupAnalysis.h:57`).
+///
+/// ⛔ OUT OF CAMPAIGN SCOPE — see [`OutOfScopeUniformGroups`]. Only `getGroupLeaders` is declared.
+pub trait UniformGroups {
+    /// `getGroupLeaders()` (`Analyses/UniformGroupAnalysis.h:67`) — one unit value per exclusive
+    /// group.
+    fn group_leaders(&self) -> Vec<Val>;
+}
+
+/// THE ONE CRATE IMPLEMENTATION of [`CandidateCollector`]: asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeCandidateCollector;
+
+impl CandidateCollector for OutOfScopeCandidateCollector {
+    fn collect_global_candidates(&mut self, _results: &mut Vec<Candidate>) {
+        todo!(
+            "CollectorInterface::collectGlobalCandidates (RegisterInitialization/Collector.h:37) — out of campaign scope"
+        )
+    }
+
+    fn collect_local_candidates(&mut self, _core: Val, _results: &mut Vec<Candidate>) {
+        todo!(
+            "CollectorInterface::collectLocalCandidates (RegisterInitialization/Collector.h:47) — out of campaign scope"
+        )
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION of [`CandidateEvaluator`]: asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeCandidateEvaluator;
+
+impl CandidateEvaluator for OutOfScopeCandidateEvaluator {
+    fn evaluate_locally(&mut self, _candidates: &mut Vec<Candidate>) {
+        todo!(
+            "EvaluatorInterface::evaluateLocally (RegisterInitialization/Evaluator.h:48) — out of campaign scope"
+        )
+    }
+
+    fn merge_into(&mut self, _result: &mut Vec<Candidate>, _sublist: &[Candidate]) {
+        todo!(
+            "EvaluatorInterface::mergeInto (RegisterInitialization/Evaluator.h:66) — out of campaign scope"
+        )
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION of [`CandidateSelector`]: asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeCandidateSelector;
+
+impl CandidateSelector for OutOfScopeCandidateSelector {
+    fn select_locally(
+        &mut self,
+        _local: &mut Vec<Candidate>,
+        _global: &mut Vec<Candidate>,
+        _core: Val,
+    ) {
+        todo!(
+            "SelectorInterface::selectLocally (RegisterInitialization/Selector.h:68) — out of campaign scope"
+        )
+    }
+}
+
+/// THE ONE CRATE IMPLEMENTATION of [`UniformGroups`]: asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeUniformGroups;
+
+impl UniformGroups for OutOfScopeUniformGroups {
+    fn group_leaders(&self) -> Vec<Val> {
+        todo!(
+            "UniformGroupAnalyzer::getGroupLeaders (Analyses/UniformGroupAnalysis.h:67) — out of campaign scope"
+        )
+    }
+}
