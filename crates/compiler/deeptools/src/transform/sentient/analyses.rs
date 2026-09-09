@@ -346,3 +346,39 @@ impl UniformGroups for OutOfScopeUniformGroups {
         )
     }
 }
+
+/// A `LiveRange` THE PORT-ASSIGNMENT GRAPH KEEPS PER OPERAND — an identity, not the intervals.
+///
+/// ⛔ `Analyses/LiveRange.{hpp,cpp}` IS OUT OF CAMPAIGN SCOPE, so the `std::vector<LabeledRange>`
+/// behind it is deliberately absent and `overlaps`/`unionWith` are `todo!`s at the units that need
+/// them — `e572_computePortLiveRange` builds these and `e608_buildGraphEdges` reads them.
+/// `e123_clean`, which only empties the map holding them, needs the type and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveRange;
+
+/// THE `GraphColoring` A PASS OWNS — a trait, for the same reason [`ExpressionEvaluator`] is one: the
+/// analysis is not in this campaign and a test must still be able to observe what a pass asks it.
+///
+/// ⛔ `Analyses/GraphColoring.{hpp,cpp}` IS OUT OF CAMPAIGN SCOPE. Only the methods a ported unit
+/// actually calls are declared; `getOrAddNode`, `addBidirectionalEdge`, `addSameColorEdge` and
+/// `doGraphColoring` belong to `e339`, `e608` and `e382` and are added by those units.
+pub trait ColoringGraph {
+    /// `GraphColoring::clear()` (`Analyses/GraphColoring.hpp:52-60`).
+    ///
+    /// ⛔⛔ NOT A RE-DEFAULT-CONSTRUCTION, AND THE DIFFERENCE OUTLIVES A PROGRAM UNIT. It deletes and
+    /// clears `nodes_`, then clears `node_ids_` and `edges_` — and leaves `same_color_edges_` and
+    /// `max_node_id_` STANDING, so both survive into the next unit the pass visits even though the
+    /// constructor's own `clear()` ran on an empty object. Whoever gives this an interior must never
+    /// write `*self = Self::default()`.
+    fn clear(&mut self);
+}
+
+/// THE ONE CRATE IMPLEMENTATION: the analysis is not ported, so asking it anything is a `todo!`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutOfScopeColoringGraph;
+
+impl ColoringGraph for OutOfScopeColoringGraph {
+    fn clear(&mut self) {
+        todo!("GraphColoring::clear (Analyses/GraphColoring.hpp:52) — out of campaign scope")
+    }
+}

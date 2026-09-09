@@ -82,22 +82,246 @@
 //! | `e343_computeNewRegisterIndices` | 343 | 1 | 23 | `dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:117` |
 //! | `e456_runOn` | 456 | 2 | 15 | `dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:183` |
 
+// ⛔ THE PASS IS NOT WIRED INTO THE PIPELINE YET, so every item below is reachable only from this
+// file's own tests until `e456_runOn` and `e342_runOnOperation` land.
+// ⭐ REMOVE THIS WITH `e342_runOnOperation`: an unused item here is a real defect from then on.
+#![allow(dead_code)]
 
-// crustify:todo: e127_runOn
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:102  (6 body lines, level 0)
-//   original  : void runOn(ModuleOp module_op)
+use crate::arch::Arch;
+use crate::formats::Bits;
+use crate::islands::sentient::dialects::{
+    Definitions, Op, Val, sentient, set_value_reg_index, uniform,
+};
+use crate::islands::sentient::{Program, ProgramUnit};
+use crate::model::Model;
+use crate::workload::Workload;
 
-// crustify:todo: e128_doRenumbering
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:144  (15 body lines, level 0)
-//   original  : void doRenumbering()
+/// THE LBR ADDRESS A CANDIDATE WAS INITIALISED WITH — `AddrTy val_`, the constant its copy reads.
+///
+/// ⛔ NON-NEGATIVE BY CONSTRUCTION. `using AddrTy = int64_t;  // must be signed` (`:68`) is signed so
+/// that the `lbr_addr = -1` sentinel and the `DT_CHECK_MSG(lbr_addr >= 0)` that discharges it can be
+/// written at all; what a [`Candidate`] stores has already passed that check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LbrAddress(pub(crate) u64);
 
-// crustify:todo: e129_cleanup
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:163  (1 body lines, level 0)
-//   original  : void cleanup()
+impl LbrAddress {
+    /// The constant as an address — `None` is the reference's untouched `-1`.
+    fn of(value: i64) -> Option<LbrAddress> {
+        u64::try_from(value).ok().map(LbrAddress)
+    }
+}
 
-// crustify:todo: e130_runOn
-//   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:199  (46 body lines, level 0)
-//   original  : void ReadOnlyRegisterRenumberingPass::runOn(Operation *op)
+/// ONE LBR COPY THIS PASS MAY RENUMBER — `Candidate` (`:70-91`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    /// `op_`, AS THE VALUE IT BINDS — ⛔ AN IDENTITY, NOT A BORROW, for the reason
+    /// [`crate::transform::sentient::ForRef`] gives: the pass rewrites the body it collected from.
+    /// `getOp()->getResult(0)` is what both readers use, and a `sentient.scalar_copy` binds one value,
+    /// which is the `DT_CHECK_MSG(getNumResults() == 1)` of `doRenumbering` as a fact about the island.
+    pub(crate) copy: Val,
+    /// `val_`.
+    pub(crate) address: LbrAddress,
+    /// `element_size_` — ⭐ NEVER THE REFERENCE'S `-1`: that value returns before the candidate is
+    /// built (`:222-224`).
+    pub(crate) element_size: Bits,
+    /// `new_register_index_` — ⛔ `None` IS THE REFERENCE'S **UNINITIALISED** FIELD. Its one mutator
+    /// is called by `computeNewRegisterIndices` (e343) for every candidate, so reading it before that
+    /// is undefined there and a named `todo!` here; see [`ReadOnlyRegisterRenumbering::do_renumbering`].
+    pub(crate) new_register_index: Option<sentient::RegIndex>,
+}
+
+/// `ReadOnlyRegisterRenumberingPass`'s OWN STATE — the two fields these four units share (`:161-166`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReadOnlyRegisterRenumbering {
+    /// `unsafe_to_renumber_` — ⛔ ONCE SET IT IS NEVER CLEARED, and `cleanup()` does not touch it, so
+    /// the first unit that gives up disables the pass for every unit after it.
+    pub(crate) unsafe_to_renumber: bool,
+    /// `candidates_`.
+    pub(crate) candidates: Vec<Candidate>,
+}
+
+impl ReadOnlyRegisterRenumbering {
+    /// Replaces: e127_runOn
+    ///
+    /// Runs the pass over every `dataflow.program_unit` of the module.
+    ///
+    /// ⛔ NAMED FOR ITS ARGUMENT because `runOn(ModuleOp)`, `runOn(dataflow::ProgramUnitOp)` (e456)
+    /// and `runOn(Operation *)` (e130) are one overload set in C++ and cannot all be `run_on` here.
+    ///
+    /// ⭐ `WalkResult::skip()` COSTS NOTHING HERE: a program unit cannot nest inside another in this
+    /// island, so there is nothing for the walk to decline to descend into.
+    pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(
+        &mut self,
+        program: &mut Program<A, M, W>,
+    ) {
+        for unit in program.units.iter_mut() {
+            self.run_on_unit(unit);
+        }
+    }
+
+    /// `ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp)` — e127's ONE callee, and
+    /// SENPASS UNIT e456, whose anchor is still open below.
+    ///
+    /// ⛔ THE SCHEDULER RECORDED THE EDGE INVERTED: `UNITS.tsv` gives e456 `calls e127_runOn` and e127
+    /// no callees, because the two `runOn`s share a name. e127 is the caller. Isolating the delegation
+    /// in a private seam is the `2a8195231` precedent, and e456's anchor is left untouched.
+    fn run_on_unit<A: Arch>(&mut self, unit: &mut ProgramUnit<A>) {
+        todo!(
+            "ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp) — senpass e456 \
+             (ReadOnlyRegisterRenumbering.cpp:183) is not ported yet, and this {} op unit needs it",
+            unit.body.len()
+        )
+    }
+
+    /// Replaces: e128_doRenumbering
+    ///
+    /// Writes each candidate's computed index onto its `sentient.scalar_copy`.
+    ///
+    /// ⛔ THE WHOLE EFFECT, and it is the island's `set_value_reg_index`: of `setValueRegIndex`'s long
+    /// dispatch the only arm a candidate can reach is
+    /// `copyOp.setRegIndexAttr(builder.getI32IntegerAttr(index))` (`SentientOps.cpp:2013-2018`).
+    pub(crate) fn do_renumbering(&self, body: &mut [Op]) {
+        if self.unsafe_to_renumber {
+            return;
+        }
+        for candidate in &self.candidates {
+            let Some(index) = candidate.new_register_index else {
+                todo!(
+                    "doRenumbering: candidate {:?} has no new register index — \
+                     StaticPinningSchemeManager::findMatchingPinnedAddr, which \
+                     computeNewRegisterIndices (senpass e343) reads it from, is out of campaign scope",
+                    candidate.copy
+                )
+            };
+            set_value_reg_index(body, candidate.copy, Some(index));
+        }
+    }
+
+    /// Replaces: e129_cleanup
+    ///
+    /// Drops the candidate list between program units.
+    ///
+    /// ⛔ IT DOES NOT RESET `unsafe_to_renumber_`; see the field.
+    pub(crate) fn cleanup(&mut self) {
+        self.candidates.clear();
+    }
+
+    /// Replaces: e130_runOn
+    ///
+    /// Collects one LBR `sentient.scalar_copy` of a constant as a renumbering candidate — or gives up
+    /// on the whole pass.
+    ///
+    /// ⛔ TWO GIVE-UP ARMS, AND THEY ARE PERMANENT (see [`Self::cleanup`]): a `uniform.query_map` whose
+    /// per-core constants disagree, and an absent `element_size`.
+    pub(crate) fn run_on_op(&mut self, op: &Op, defs: Definitions<'_>) {
+        if self.unsafe_to_renumber {
+            return;
+        }
+        let Op::Sentient(sentient::Op::ScalarCopy {
+            input,
+            result,
+            reg,
+            element_size,
+            ..
+        }) = op
+        else {
+            return;
+        };
+        if reg.locale != sentient::RegType::Lbr {
+            return;
+        }
+        if !is_sentient_constant(*input, defs) {
+            todo!(
+                "runOn: DT_CHECK_MSG(isConstant<sentient::ConstantOp>(copy_op.getInp()), \
+                 \"LBR has to be initialized from a constant\") on {input:?} (:203)"
+            )
+        }
+        let address = match defs.of(*input) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => {
+                LbrAddress::of(*value)
+            }
+            Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => {
+                let const_values = constant_target_values(*map, defs);
+                // ⭐ `isConstant(query_op)` IS THE CHECK ABOVE RE-ASKED, so it is already true and the
+                // `&&` reduces to the `all_of`. `first() == None` is then unreachable — it would mean
+                // a non-constant target — and taking the give-up arm for it invents nothing.
+                match const_values.first() {
+                    Some(first) if const_values.iter().all(|value| value == first) => {
+                        LbrAddress::of(*first)
+                    }
+                    _ => {
+                        self.unsafe_to_renumber = true;
+                        return;
+                    }
+                }
+            }
+            // `AddrTy lbr_addr = -1;` left untouched, which the next line refuses.
+            _ => None,
+        };
+        let Some(address) = address else {
+            todo!(
+                "runOn: DT_CHECK_MSG(lbr_addr >= 0, \"unable to identify the lbr address\") \
+                 on {input:?} (:216)"
+            )
+        };
+        let Some(element_size) = *element_size else {
+            self.unsafe_to_renumber = true;
+            return;
+        };
+        self.candidates.push(Candidate {
+            copy: *result,
+            address,
+            element_size,
+            new_register_index: None,
+        });
+    }
+}
+
+/// `dcc::utils::isConstant<sentient::ConstantOp>` (`Utils/Utils.cpp:423`) at this pass's one
+/// instantiation — a `sentient.scalar_constant`, or a `uniform.query_map` all of whose per-core values
+/// are one. ⛔ FALSE FOR A REGION ARGUMENT, which has no defining op.
+fn is_sentient_constant(val: Val, defs: Definitions<'_>) -> bool {
+    let is_constant_op =
+        |op: Option<&Op>| matches!(op, Some(Op::Sentient(sentient::Op::ScalarConstant { .. })));
+    match defs.of(val) {
+        Some(Op::Uniform(uniform::Op::QueryMap { map, .. })) => match defs.of(*map) {
+            Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs
+                .iter()
+                .all(|(_key, value)| is_constant_op(defs.of(*value))),
+            _ => false,
+        },
+        op => is_constant_op(op),
+    }
+}
+
+/// `dcc::uniform::utils::getConstantTargetValues` (`Dialect/Uniform/Utils.cpp:382`) — every target
+/// value of a query map's mapping, as a number.
+///
+/// ⛔ NOT AN ANCHORED UNIT: `dcc/src/Dialect/` is outside this campaign's file list. ⭐ AN EMPTY ANSWER
+/// IS THE REFERENCE'S OWN `const_values.clear()`: not all targets are `sentient.scalar_constant`.
+fn constant_target_values(map: Val, defs: Definitions<'_>) -> Vec<i64> {
+    let pairs = match defs.of(map) {
+        Some(Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. })) => pairs.clone(),
+        other => todo!(
+            "getConstantTargetValues: a uniform.query_map's $map is not a \
+             uniform.def_immutable_mapping (Dialect/Uniform/Utils.cpp:385): {other:?}"
+        ),
+    };
+    if pairs.is_empty() {
+        todo!(
+            "getConstantTargetValues: DT_CHECK(!immutable_map.getValues().empty()) \
+             (Dialect/Uniform/Utils.cpp:387)"
+        )
+    }
+    let mut values = Vec::new();
+    for (_key, value) in pairs {
+        match defs.of(value) {
+            Some(Op::Sentient(sentient::Op::ScalarConstant { value, .. })) => values.push(*value),
+            _ => return Vec::new(),
+        }
+    }
+    values
+}
 
 // crustify:todo: e342_runOnOperation
 //   authority : dcc/src/Transform/Sentient/ReadOnlyRegisterRenumbering.cpp:109  (6 body lines, level 1)
@@ -114,3 +338,186 @@
 //   original  : void ReadOnlyRegisterRenumberingPass::runOn(dataflow::ProgramUnitOp unit)
 //   calls     : e127_runOn, e128_doRenumbering, e129_cleanup, e130_runOn, e221_initialize, e343_computeNewRegisterIndices
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::arch::Dd2;
+    use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::ty::ScalarTy;
+    use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
+    use crate::islands::sentient::ProgramUnits;
+    use crate::islands::sentient::dialects::sentient::{Reg, RegIndex, RegType};
+    use crate::units::DfirUnit;
+
+    /// A model, so a program is typed; nothing here reads it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyModel;
+    impl Model for AnyModel {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 8;
+        const HEAD_DIM: u32 = 64;
+        const HIDDEN: u32 = 2048;
+        const LAYERS: u32 = 40;
+        const FFN: u32 = 8192;
+        const VOCAB: u32 = 49152;
+    }
+
+    /// A decode rung, for the same reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AnyRung;
+    impl Workload for AnyRung {
+        const ROWS: u32 = 1;
+        const ACTIVE_CAP: u32 = 64;
+    }
+
+    /// `%r = sentient.scalar_constant {value = N : si64} : index`.
+    fn scalar_const(result: u32, value: i64) -> Op {
+        Op::Sentient(sentient::Op::ScalarConstant {
+            value,
+            result: Val(result),
+            reg_locale: RegType::Imm,
+            ty: ScalarTy::Index,
+            is_symbol: false,
+        })
+    }
+
+    /// `%r = sentient.scalar_copy %in {element_size = .., regLocale = locale}`.
+    fn copy(input: u32, result: u32, locale: RegType, element_size: Option<Bits>) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input: Val(input),
+            result: Val(result),
+            reg: Reg {
+                locale,
+                index: None,
+            },
+            program_header: false,
+            element_size,
+        })
+    }
+
+    /// e130 — the vendor's own shape: an LBR copy of a `sentient.scalar_constant` carrying an
+    /// `element_size` becomes exactly one candidate, with the constant as its address.
+    #[test]
+    fn run_on_op_collects_an_lbr_copy_of_a_constant() {
+        let body = vec![
+            scalar_const(1, 384),
+            copy(1, 2, RegType::Lbr, Some(Bits(16))),
+        ];
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut pass = ReadOnlyRegisterRenumbering::default();
+        pass.run_on_op(&body[1], defs);
+        assert_eq!(
+            pass,
+            ReadOnlyRegisterRenumbering {
+                unsafe_to_renumber: false,
+                candidates: vec![Candidate {
+                    copy: Val(2),
+                    address: LbrAddress(384),
+                    element_size: Bits(16),
+                    new_register_index: None,
+                }],
+            }
+        );
+    }
+
+    /// e130's negative — no `element_size` attribute is the reference's `-1`, which gives up on the
+    /// whole pass and collects nothing.
+    #[test]
+    fn run_on_op_gives_up_when_the_element_size_is_absent() {
+        let body = vec![scalar_const(1, 384), copy(1, 2, RegType::Lbr, None)];
+        let regions: [&[Op]; 1] = [&body];
+        let defs = Definitions::from_innermost(&regions);
+        let mut pass = ReadOnlyRegisterRenumbering::default();
+        pass.run_on_op(&body[1], defs);
+        assert_eq!(
+            pass,
+            ReadOnlyRegisterRenumbering {
+                unsafe_to_renumber: true,
+                candidates: Vec::new(),
+            }
+        );
+    }
+
+    /// e128 — the effect: the candidate's index lands on the copy's `regIndex`, and nothing else moves.
+    #[test]
+    fn do_renumbering_writes_the_new_index_onto_the_copy() {
+        let mut body = vec![
+            scalar_const(1, 384),
+            copy(1, 2, RegType::Lbr, Some(Bits(16))),
+        ];
+        let pass = ReadOnlyRegisterRenumbering {
+            unsafe_to_renumber: false,
+            candidates: vec![Candidate {
+                copy: Val(2),
+                address: LbrAddress(384),
+                element_size: Bits(16),
+                new_register_index: Some(RegIndex::at::<7>()),
+            }],
+        };
+        pass.do_renumbering(&mut body);
+        assert_eq!(
+            body,
+            vec![
+                scalar_const(1, 384),
+                Op::Sentient(sentient::Op::ScalarCopy {
+                    input: Val(1),
+                    result: Val(2),
+                    reg: Reg {
+                        locale: RegType::Lbr,
+                        index: Some(RegIndex::at::<7>()),
+                    },
+                    program_header: false,
+                    element_size: Some(Bits(16)),
+                }),
+            ]
+        );
+    }
+
+    /// e129 — the candidates go and the give-up flag STAYS, which is what poisons the next unit.
+    #[test]
+    fn cleanup_clears_the_candidates_and_leaves_the_give_up_flag() {
+        let mut pass = ReadOnlyRegisterRenumbering {
+            unsafe_to_renumber: true,
+            candidates: vec![Candidate {
+                copy: Val(2),
+                address: LbrAddress(384),
+                element_size: Bits(16),
+                new_register_index: None,
+            }],
+        };
+        pass.cleanup();
+        assert_eq!(
+            pass,
+            ReadOnlyRegisterRenumbering {
+                unsafe_to_renumber: true,
+                candidates: Vec::new(),
+            }
+        );
+    }
+
+    /// e127 — every program unit is visited, and the visit is e456's, which is not ported.
+    #[test]
+    #[should_panic(expected = "senpass e456")]
+    fn run_on_program_delegates_each_unit_to_the_unported_e456() {
+        let mut program: Program<Dd2, AnyModel, AnyRung> = Program {
+            name: ProgramName {
+                group: GroupId(0),
+                index: OpIndex(0),
+                func: OpFunc::Add,
+            },
+            preamble: Vec::new(),
+            units: ProgramUnits::of(
+                ProgramUnit {
+                    on: Units::one(DfirUnit::L3lu, Val(0)),
+                    precision: None,
+                    body: vec![scalar_const(1, 384)],
+                    arch: core::marker::PhantomData,
+                },
+                Vec::new(),
+            ),
+            bound: core::marker::PhantomData,
+        };
+        ReadOnlyRegisterRenumbering::default().run_on_program(&mut program);
+    }
+}
