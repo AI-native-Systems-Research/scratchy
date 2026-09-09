@@ -94,9 +94,23 @@
 #![allow(dead_code)]
 
 use core::num::NonZeroI64;
-use core::ops::{AddAssign, Mul};
+use core::ops::{AddAssign, Mul, Sub, SubAssign};
+
+use crate::islands::dataflow_ir::Values;
+use crate::islands::dataflow_ir::ty::ScalarTy;
+use crate::islands::sentient::dialects::{Op, Val};
 
 pub(crate) mod pattern_simplification_manager;
+
+/// `EnableNonZeroStrideSeqSimplifications` (`:76-80`) — *"Allow replacing fixed non-zero stride
+/// sequences of values yielded by conditionals with iterator arguments."*, `cl::init(false)`.
+///
+/// ⛔ A `dcc-opt` COMMAND-LINE FLAG, NOT A PROGRAM PROPERTY, and this crate has no flags — the same
+/// reading [`super::loop_splitting_and_unrolling::is_ok_to_unroll`] made of `DisableLoopUnroll`.
+/// ⭐ A NAMED `const` RATHER THAN A FOLDED LITERAL BECAUSE IT DECIDES WHICH SEQUENCE KINDS EXIST: at
+/// `false` `padTableSlice` pads to the slice's own maximum instead of 3 (`:2422-2423`) and never asks
+/// for a monotone slot (`:2437-2440`), so both branches fold away rather than going unread.
+pub(crate) const ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS: bool = false;
 
 // ── THE FILE'S VALUE VOCABULARY ─────────────────────────────────────────────────────────────────
 //
@@ -140,6 +154,14 @@ impl IntervalStride {
     pub(crate) const fn get(self) -> NonZeroI64 {
         self.0
     }
+
+    /// HOW FAR ONE ENTRY MOVES THE FREE IV, as a distance — `:2676-2678` tests whether two interval
+    /// markers are exactly one entry apart, and a stride is not an [`IntervalDelta`] until it is
+    /// multiplied by a count.
+    #[must_use]
+    pub(crate) const fn one_entry(self) -> IntervalDelta {
+        IntervalDelta(self.0.get())
+    }
 }
 
 /// A SIGNED DISTANCE ALONG THE FREE IV — `interval_stride_ * increment` (`:300`).
@@ -157,6 +179,23 @@ impl Mul<Entries> for IntervalStride {
 impl AddAssign<IntervalDelta> for IntervalMarker {
     fn add_assign(&mut self, rhs: IntervalDelta) {
         self.0 += rhs.0;
+    }
+}
+
+/// `m1 - first sequence stride * first sequence length` (`:2405-2407`) — the marker of the dead
+/// interval `padTableSlice` puts in front of the first sequence.
+impl SubAssign<IntervalDelta> for IntervalMarker {
+    fn sub_assign(&mut self, rhs: IntervalDelta) {
+        self.0 -= rhs.0;
+    }
+}
+
+/// The distance between two markers — what `:2676-2678` compares against ONE entry's stride.
+impl Sub for IntervalMarker {
+    type Output = IntervalDelta;
+
+    fn sub(self, rhs: IntervalMarker) -> IntervalDelta {
+        IntervalDelta(self.0 - rhs.0)
     }
 }
 
@@ -492,25 +531,46 @@ impl TableEntry {
 /// THE TABLE OF VALUES FOR EVERY TUPLE OF IV VALUES IN THE CURRENT NESTED CONDITIONAL —
 /// `class Table` (`:484`), as a 1-D array (`:485-487`).
 ///
-/// ⛔ `const Type predicate_type_` (`:491`) AND `Type entry_type_` (`:494`) ARE NOT DECLARED YET.
-/// They are MLIR `Type`s reached through `getPredicateType`/`getTableEntryType` (`:522-524`, both
-/// excluded field accessors) and first consumed by `e292_generateEncodingTypes`; declare them there
-/// rather than guess which of the island's type spellings they are. `evaluator_` (`:497`) is a
-/// parameter, as on [`Sequence`].
+/// ⭐ `const Type predicate_type_` (`:491`) AND `Type entry_type_` (`:494`) ARE BOTH [`ScalarTy`]:
+/// each is handed straight to a `sentient.scalar_constant` (`:2564`, `:2822`) or names a
+/// `sentient.if`'s single result type (`:2731`, `:2833`), which the island spells with its scalar
+/// type and nothing wider. `evaluator_` (`:497`) is a parameter, as on [`Sequence`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Table {
     /// `table_entries_` (`:488`) — `std::vector<TableEntry *>(table_size, nullptr)` (`:506`), owning:
     /// `~Table` deletes every element (`:508-510`), so `Drop` is the destructor.
     entries: Vec<Option<TableEntry>>,
+    /// `predicate_type_` (`:491`) — the type of the predicates in this nested conditional.
+    predicate_type: ScalarTy,
+    /// `entry_type_` (`:494`) — the type of the entries in the table.
+    entry_type: ScalarTy,
 }
 
 impl Table {
     /// `Table(table_size, predicate_type, entry_type, evaluator)` (`:500-506`) — every entry starts
     /// null.
-    pub(crate) fn new(table_size: TableSize) -> Table {
+    pub(crate) fn new(
+        table_size: TableSize,
+        predicate_type: ScalarTy,
+        entry_type: ScalarTy,
+    ) -> Table {
         Table {
             entries: vec![None; table_size.0],
+            predicate_type,
+            entry_type,
         }
+    }
+
+    /// `Type getTableEntryType() const` (`:522`) — an excluded field accessor.
+    #[must_use]
+    pub(crate) const fn table_entry_type(&self) -> ScalarTy {
+        self.entry_type
+    }
+
+    /// `Type getPredicateType() const` (`:524`) — an excluded field accessor.
+    #[must_use]
+    pub(crate) const fn predicate_type(&self) -> ScalarTy {
+        self.predicate_type
     }
 
     /// Replaces: e030_isFull
@@ -521,6 +581,68 @@ impl Table {
     pub(crate) fn is_full(&self) -> bool {
         self.entries.iter().all(Option::is_some)
     }
+}
+
+/// THE OUT-OF-SCOPE `ExpressionEvaluator` (`Analyses/ExpressionEvaluatorUtils.h:196`) AS A SEAM —
+/// the reference's `ExpressionEvaluator &evaluator_`, which every type in this file holds a
+/// back-reference to and this port takes as a parameter.
+///
+/// ⛔ NO IMPLEMENTATION SHIPS IN THIS CAMPAIGN AND NONE MAY: `Analyses/` is outside its scope
+/// (`crustify-senpass/OUTSIDE-DEPS.tsv`). The trait declares exactly the calls the ported bodies
+/// make, so the boundary is a PARAMETER THE CALLER SUPPLIES rather than a guess at what the analysis
+/// would have answered — which is why it is a trait and not the `todo!` this file's
+/// `pattern_simplification_manager::step_matches_target` uses for a question no ported body can ask a
+/// caller to answer.
+///
+/// ⛔ A SECOND SPELLING OF THE SAME SEAM: [`super::analyses::ExpressionEvaluator`] states it over
+/// [`super::analyses::EvaluatedValue`], but every evaluator-owned field in THIS file is already an
+/// [`EvaluatedValueId`] whose `==` is documented as pointer identity, so the content equality
+/// `:2676` needs has to be a method here. Converging the two means converting this file's whole
+/// handle vocabulary, which is a decision for a review pass and not for one batch.
+pub(crate) trait ExpressionEvaluator {
+    /// `const EvaluatedValue &getConstant(int64_t c)` (`ExpressionEvaluatorUtils.h:335`).
+    fn get_constant(&mut self, value: i64) -> EvaluatedValueId;
+
+    /// `const EvaluatedValue &evaluateSub(const EvaluatedValue &, const EvaluatedValue &)` (`:260`).
+    fn evaluate_sub(&mut self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> EvaluatedValueId;
+
+    /// `const EvaluatedValue &evaluateMultiplyByConst(const EvaluatedValue &, int64_t)` (`:285`) —
+    /// the factor is always a count of table entries at these call sites.
+    fn evaluate_multiply_by_const(
+        &mut self,
+        value: EvaluatedValueId,
+        factor: Entries,
+    ) -> EvaluatedValueId;
+
+    /// `EvaluatedValue::operator==` — ⛔ CONTENT EQUALITY, which [`EvaluatedValueId`]'s own `==` is
+    /// deliberately NOT (see its note).
+    fn equal(&self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> bool;
+
+    /// `Value EvaluatedValue::buildOffsetValue(const_builder, query_map_builder, loc, type)`
+    /// (`ExpressionEvaluatorUtils.cpp:148`) — materialises the value, appending whatever constants
+    /// and per-unit mappings it needs to the two blocks those builders are anchored in.
+    fn build_offset_value(
+        &mut self,
+        value: EvaluatedValueId,
+        ty: ScalarTy,
+        builders: &mut Builders<'_>,
+    ) -> Val;
+}
+
+/// THE TWO INSERTION POINTS THE MANAGER CARRIES, PLUS THE SSA MINTER — `OpBuilder &const_builder_,
+/// &query_map_builder_` (`:538`), both anchored in the block CONTAINING the program unit rather than
+/// in the block being rewritten.
+///
+/// ⛔ A PARAMETER, NOT A FIELD: a `&mut Vec<Op>` held by the manager cannot coexist with the
+/// `getDefiningOp` lookups its own methods make over the same program — the convention this module
+/// tree already states for `LoopRollingManager`.
+pub(crate) struct Builders<'a> {
+    /// Where `const_builder_` inserts.
+    pub(crate) consts: &'a mut Vec<Op>,
+    /// Where `query_map_builder_` inserts.
+    pub(crate) query_maps: &'a mut Vec<Op>,
+    /// Every created op's result comes from here.
+    pub(crate) values: &'a mut Values,
 }
 
 // crustify:todo: e286_recomputeAsDefaultVals
@@ -647,7 +769,7 @@ mod unit_tests {
     /// tests the `TableEntry *`, not its `ev_`.
     #[test]
     fn is_full_only_when_every_index_has_an_entry() {
-        let mut table = Table::new(TableSize(2));
+        let mut table = Table::new(TableSize(2), ScalarTy::Int(1), ScalarTy::Index);
         assert!(!table.is_full());
 
         table.entries[0] = Some(TableEntry::new(None));

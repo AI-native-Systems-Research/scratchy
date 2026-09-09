@@ -95,6 +95,10 @@
 //! | `e496_parseFixedDims` | 496 | 3 | 59 | `dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2021` |
 //! | `e555_findPatternsAndSimplify` | 555 | 4 | 340 | `dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1101` |
 
+use super::{
+    Builders, ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS, Entries, EvaluatedValueId,
+    ExpressionEvaluator, IntervalMarker, IntervalStride, Sequence, SequenceKind, Table, TableSlice,
+};
 use crate::islands::dataflow_ir::ty::ScalarTy;
 use crate::islands::sentient::dialects::{self as ir, Op, Val, affine, arith, sentient};
 use core::num::NonZeroI64;
@@ -335,16 +339,58 @@ pub struct Branch {
 }
 
 /// `PatternSimplificationManager` (`:537-695`) — the members the units in this file read.
-#[derive(Debug, Clone, Default)]
+///
+/// ⛔ `table_slices_are_consistent_` (`:570`) AND `cur_root_` (`:594`) ARE NOT DECLARED YET: no unit
+/// ported so far reads either, and every use of `cur_root_` is the `getLoc()` of a builder call —
+/// SentientIR carries no `Loc`, so there is nothing for the island to hold.
+#[derive(Debug, Clone)]
 pub struct PatternSimplificationManager {
     /// `lhs_to_for_op_or_null_`.
     pub lhs_to_for_op_or_null: BTreeMap<Val, LoopInfo>,
     /// `ivs_dimensions_multipliers_`.
     pub ivs_dimensions_multipliers: Vec<IvDim>,
-    /// `monotone_seq_val_step_`.
+    /// `table_` (`:553`) — `None` is the `nullptr` it starts as.
+    pub table: Option<Table>,
+    /// `template_sequences_` (`:578`) — OWNING (`std::vector<Sequence *>` deleted in the destructor),
+    /// so the template monotone sequence is named by INDEX rather than by the reference's raw pointer
+    /// into this vector.
+    pub template_sequences: Vec<Sequence>,
+    /// `table_follows_contiguous_pattern_` (`:559`) — ⭐ STARTS TRUE.
+    pub table_follows_contiguous_pattern: bool,
+    /// `table_slices_follow_montone_pattern_` (`:563`) — ⭐ STARTS TRUE, and the reference's own
+    /// spelling of "montone" is kept so that a grep for the member lands here.
+    pub table_slices_follow_montone_pattern: bool,
+    /// `abort_pattern_` (`:591`).
+    pub abort_pattern: bool,
+    /// `monotone_seq_start_val_` (`:583`).
+    pub monotone_seq_start_val: Option<Val>,
+    /// `monotone_seq_int_step_` (`:586`) — ⭐ THE ONE MEMBER THE REFERENCE LEAVES UNINITIALISED, so
+    /// `None` is a state it cannot distinguish and this one can.
+    pub monotone_seq_int_step: Option<EvaluatedValueId>,
+    /// `monotone_seq_val_step_` (`:587`).
     pub monotone_seq_val_step: Option<Val>,
     /// The pass-local op markers of `:42-50`.
     pub marks: Marks,
+}
+
+/// ⭐ TWO FLAGS START TRUE (`:559`, `:563`) — a derived `Default` would start the pass having already
+/// failed to match both patterns, and `insertSequence` only ever clears them.
+impl Default for PatternSimplificationManager {
+    fn default() -> PatternSimplificationManager {
+        PatternSimplificationManager {
+            lhs_to_for_op_or_null: BTreeMap::new(),
+            ivs_dimensions_multipliers: Vec::new(),
+            table: None,
+            template_sequences: Vec::new(),
+            table_follows_contiguous_pattern: true,
+            table_slices_follow_montone_pattern: true,
+            abort_pattern: false,
+            monotone_seq_start_val: None,
+            monotone_seq_int_step: None,
+            monotone_seq_val_step: None,
+            marks: Marks::default(),
+        }
+    }
 }
 
 /// The iter arg [`PatternSimplificationManager::find_existing_iter_arg`] is looking for.
@@ -673,6 +719,155 @@ fn find_closest_parent(root: &[Op], op: &OpPath) -> Option<OpPath> {
     None
 }
 
+// ── CODE GENERATION SUPPORT ─────────────────────────────────────────────────────────────────────
+
+/// `SentientRegType::unknown` — the `locale_attr` every conditional generated in this file carries
+/// (`:2769-2771`, `:2831-2833`), no register chosen yet.
+const UNKNOWN_LOCALE: sentient::Reg = sentient::Reg {
+    locale: sentient::RegType::Unknown,
+    index: None,
+};
+
+/// `mlir::sentient::ConstantOp::create(const_builder_, unit_op_.getLoc(), <type>, <value>)`.
+fn scalar_constant(result: Val, value: i64, ty: ScalarTy) -> Op {
+    Op::Sentient(sentient::Op::ScalarConstant {
+        value,
+        result,
+        // `ConstantOp`'s own default, which the reference never overrides at these call sites.
+        reg_locale: sentient::RegType::Imm,
+        ty,
+        is_symbol: false,
+    })
+}
+
+/// `sentient::YieldOp::create(builder, loc, results)`.
+fn yield_of(results: &[Val]) -> Op {
+    Op::Sentient(sentient::Op::Yield {
+        results: results.to_vec(),
+    })
+}
+
+/// `*it_encoding; ++it_encoding` — the encoding tuple is read strictly in order, and running off its
+/// end is the reference's read past `end()`.
+fn next_encoding(encoding_tuple: &[Val], next: &mut usize) -> Option<Val> {
+    let value = encoding_tuple.get(*next).copied();
+    *next += 1;
+    value
+}
+
+/// `new Sequence(evaluator_.getConstant(0), evaluator_.getConstant(0), 0, prev_interval_marker,
+/// interval_stride, next_expected, evaluator_)` (`:2417-2419`, `:2424-2426`) — the dummy whose
+/// predicate is always false because it repeats the previous sequence's interval marker.
+fn dummy_sequence<E: ExpressionEvaluator + ?Sized>(
+    evaluator: &mut E,
+    interval_marker: IntervalMarker,
+    interval_stride: IntervalStride,
+    kind: SequenceKind,
+) -> Sequence {
+    let lb = evaluator.get_constant(0);
+    let stride = evaluator.get_constant(0);
+    Sequence::new(
+        lb,
+        stride,
+        Entries(0),
+        interval_marker,
+        interval_stride,
+        kind,
+    )
+}
+
+/// A VALUE AND THE TYPE IT CARRIES — `Value` plus the `iv.getType()` of `:2737`, which the island
+/// keeps on the op that BINDS the value rather than on the value itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedVal {
+    /// The value.
+    pub val: Val,
+    /// Its type.
+    pub ty: ScalarTy,
+}
+
+/// WHERE A FRESHLY BUILT CONDITIONAL LANDS — the `OpBuilder builder_new_if(if_op)` of `:1180`/`:1330`,
+/// which inserts BEFORE `if_op`, as the block plus the path that op occupies.
+///
+/// ⛔ THE PATH IS NEEDED AS WELL AS THE BLOCK, because a [`Mark`] is keyed by absolute [`OpPath`]: an
+/// op built here cannot be marked without knowing where the tree will sit.
+pub struct Site<'a> {
+    /// The block the builder inserts into.
+    pub block: &'a mut Vec<Op>,
+    /// The absolute path of the insertion point.
+    pub at: OpPath,
+}
+
+impl Site<'_> {
+    /// `builder.insert(op)` — appended when the path names no position in this block.
+    fn insert(&mut self, op: Op) {
+        let index = self
+            .at
+            .path()
+            .last()
+            .map_or(self.block.len(), |&(_, index)| index as usize);
+        self.block.insert(index.min(self.block.len()), op);
+    }
+}
+
+/// ONE LEVEL OF A GENERATED `if / else if / ... / else` CHAIN.
+struct IfLevel {
+    /// `comparison` (`:2752-2758`), from the sign of the sequence's interval stride.
+    predicate: sentient::CmpPredicate,
+    /// `rhs_val` — the interval marker this level tests against.
+    rhs: Val,
+    /// What this level's `then` region yields.
+    then_result: Val,
+    /// The value this level's `sentient.if` binds.
+    result: Val,
+    /// `RESULT_TO_BE_REPLACED_BY_ITER_ARG` on the `then` yield (`:2784-2786`).
+    mark_then_result: bool,
+    /// `LHS_IN_PRED_TO_BE_REPLACED_BY_ITER_ARG` on the conditional itself (`:2775-2777`).
+    mark_lhs_in_pred: bool,
+}
+
+/// The `if (iv P m0) .. else if (iv P m1) .. else <else_result>` those levels describe, outermost
+/// first — each level's ELSE region holding the next level and a yield of its result (`:2761-2789`,
+/// `:2836-2853`).
+fn if_chain(levels: &[IfLevel], iv: Val, else_result: Val) -> Option<Op> {
+    let mut built: Option<Op> = None;
+    for (depth, level) in levels.iter().enumerate().rev() {
+        let else_body = match built.take() {
+            // `YieldOp::create(else_builder, .., sentient_ifop_tmp.getResults()[0])` (`:2772-2773`).
+            Some(inner) => {
+                let inner_result = levels
+                    .get(depth + 1)
+                    .map_or(else_result, |next| next.result);
+                vec![inner, yield_of(&[inner_result])]
+            }
+            None => vec![yield_of(&[else_result])],
+        };
+        built = Some(Op::Sentient(sentient::Op::If {
+            predicate: level.predicate,
+            lhs: iv,
+            rhs: level.rhs,
+            yielded: vec![sentient::Yielded {
+                result: level.result,
+                reg: UNKNOWN_LOCALE,
+            }],
+            dbg_name: None,
+            then_body: vec![yield_of(&[level.then_result])],
+            else_body,
+        }));
+    }
+    built
+}
+
+/// The absolute path of level `depth` of a chain built at `at` — every level below the first sits at
+/// position 0 of its parent's ELSE region, which [`sentient::regions`] numbers 1.
+fn level_path(at: &OpPath, depth: usize) -> OpPath {
+    let mut path = at.clone();
+    for _ in 0..depth {
+        path = path.child(1, 0);
+    }
+    path
+}
+
 impl PatternSimplificationManager {
     /// Replaces: e031_populateTable
     ///
@@ -956,40 +1151,494 @@ impl PatternSimplificationManager {
     }
 }
 
-// crustify:todo: e289_computeTemplateSeqAndUpdateMonotoneSeq
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2096  (75 body lines, level 1)
-//   original  : void PatternSimplificationManager::computeTemplateSeqAndUpdateMonotoneSeq( std::vector<TableSlice *> &table_slices)
-//   calls     : e026_changeToDefaultValue, e252_size
+/// The seven code-generation units of level 1 — `:2096`-`:2860`.
+///
+/// ⛔ `ExpressionEvaluator` AND THE TWO BUILDERS ARE PARAMETERS, NOT MEMBERS
+/// ([`super::ExpressionEvaluator`], [`Builders`]): the analysis is out of campaign scope, and a
+/// `&mut Vec<Op>` held by the manager could not coexist with the lookups its own methods make.
+impl PatternSimplificationManager {
+    /// Replaces: e289_computeTemplateSeqAndUpdateMonotoneSeq
+    ///
+    /// Copies the first slice's sequences into the template, shifts every monotone sequence's LB back
+    /// by the entries before it, clears whatever the other slices disagree about, and — when the
+    /// monotone step is zero and there is no third sequence — turns every monotone sequence into a
+    /// default value.
+    ///
+    /// TRAP: A MONOTONE SEQUENCE WITH NO LB OR NO STRIDE gets no shifted LB rather than the
+    /// reference's null deref (`:2109-2112`); only a TEMPLATE copy ever has its LB cleared (`:2115`).
+    pub fn compute_template_seq_and_update_monotone_seq(
+        &mut self,
+        table_slices: &mut [TableSlice],
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        // `table_slices.front()` (`:2103`) — there is nothing to template from without a slice.
+        let Some(first) = table_slices.first() else {
+            return;
+        };
+        let first_sequences = first.sequences.clone();
+        let mut entries_seen_so_far = Entries::default();
+        let mut template_monotone_seq = None;
+        for s in first_sequences {
+            let mut copy = s;
+            if s.kind == SequenceKind::MonotoneSequence {
+                template_monotone_seq = Some(self.template_sequences.len());
+                // shifted_lb = lb - stride * entries_seen_so_far (`:2109-2112`).
+                if let (Some(lb), Some(stride)) = (s.lb, s.stride) {
+                    let scaled = evaluator.evaluate_multiply_by_const(stride, entries_seen_so_far);
+                    copy.shifted_lb = Some(evaluator.evaluate_sub(lb, scaled));
+                }
+                // The shifted LB is used from here on rather than the LB (`:2115`).
+                copy.lb = None;
+            }
+            self.template_sequences.push(copy);
+            entries_seen_so_far += s.length;
+        }
+        // `:2120-2153` — mark every field the slices disagree about as inconsistent.
+        for table_slice in table_slices.iter_mut() {
+            let mut entries_seen_so_far = Entries::default();
+            // `DT_CHECK(sequences.size() == template_sequences_.size())` (`:2123-2125`) is what makes
+            // the zip total; a shorter slice simply has no template sequence to compare against.
+            for (index, cur_seq) in table_slice.sequences.iter_mut().enumerate() {
+                let Some(template_seq) = self.template_sequences.get_mut(index) else {
+                    break;
+                };
+                if !matches!((cur_seq.lb, template_seq.lb), (Some(cur), Some(template)) if evaluator.equal(cur, template))
+                {
+                    template_seq.lb = None;
+                }
+                if !matches!((cur_seq.stride, template_seq.stride), (Some(cur), Some(template)) if evaluator.equal(cur, template))
+                {
+                    template_seq.stride = None;
+                }
+                if cur_seq.interval_marker != template_seq.interval_marker {
+                    template_seq.interval_marker = None;
+                }
+                // `:2143-2151` — each slice's own monotone sequence gets its shifted LB too.
+                if cur_seq.kind == SequenceKind::MonotoneSequence
+                    && let (Some(lb), Some(stride)) = (cur_seq.lb, cur_seq.stride)
+                {
+                    let scaled = evaluator.evaluate_multiply_by_const(stride, entries_seen_so_far);
+                    let shifted_val = evaluator.evaluate_sub(lb, scaled);
+                    cur_seq.shifted_lb = Some(shifted_val);
+                    if let Some(template_shifted) = template_seq.shifted_lb
+                        && !evaluator.equal(template_shifted, shifted_val)
+                    {
+                        template_seq.shifted_lb = None;
+                    }
+                }
+                entries_seen_so_far += cur_seq.length;
+            }
+        }
+        // `:2157-2169` — a zero step with no third sequence is a default value in disguise.
+        let candidate = template_monotone_seq
+            .filter(|_| self.template_sequences.len() < 3)
+            .and_then(|index| Some((index, self.template_sequences.get(index)?.stride?)));
+        let Some((index, stride)) = candidate else {
+            return;
+        };
+        let zero = evaluator.get_constant(0);
+        if !evaluator.equal(stride, zero) {
+            return;
+        }
+        if let Some(monotone) = self
+            .template_sequences
+            .get_mut(index)
+            .and_then(Sequence::as_monotone_mut)
+        {
+            monotone.change_to_default_value();
+        }
+        for table_slice in table_slices.iter_mut() {
+            for s in &mut table_slice.sequences {
+                if let Some(monotone) = s.as_monotone_mut() {
+                    monotone.change_to_default_value();
+                }
+            }
+        }
+    }
 
-// crustify:todo: e290_insertSequence
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2360  (24 body lines, level 1)
-//   original  : void PatternSimplificationManager::insertSequence(Sequence *seq, TableSlice *table_slice)
-//   calls     : e252_size
+    /// Replaces: e290_insertSequence
+    ///
+    /// Appends `seq` to the slice and, past the cap of three sequences, records which pattern has
+    /// failed — a 1-D slice aborts the whole match, a monotone one does not, since every slice's
+    /// sequences are still needed (`:2382-2384`).
+    pub fn insert_sequence(&mut self, seq: Sequence, table_slice: &mut TableSlice) {
+        if self.abort_pattern {
+            return;
+        }
+        if table_slice
+            .sequences
+            .last()
+            .is_some_and(|last| last.kind == SequenceKind::MonotoneSequence)
+        {
+            table_slice.has_inserted_monotone_seq_before_last = true;
+        }
+        table_slice.sequences.push(seq);
+        if table_slice.sequences.len() > 3 {
+            if table_slice.is_1d_rep_of_table {
+                self.table_follows_contiguous_pattern = false;
+                self.abort_pattern = true;
+            } else {
+                self.table_slices_follow_montone_pattern = false;
+            }
+        }
+    }
 
-// crustify:todo: e291_padTableSlice
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2398  (49 body lines, level 1)
-//   original  : void PatternSimplificationManager::padTableSlice(TableSlice *table_slice, unsigned max_num_seq)
-//   calls     : e025_getIntervalStride, e252_size
+    /// Replaces: e291_padTableSlice
+    ///
+    /// Pads the slice with dummy sequences — each repeating the previous interval marker, so its
+    /// predicate is always false — until it has `max_num_seq` of them in the expected kind order.
+    ///
+    /// TRAP: WITH [`ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS`] OFF the expected kind is always
+    /// `kDefaultValue`, so a slice holding a monotone sequence cannot reach `target_count` and hits
+    /// the reference's own `DT_CHECK` (`:2445-2446`); an empty slice is its `front()` on empty.
+    pub fn pad_table_slice(
+        table_slice: &mut TableSlice,
+        max_num_seq: usize,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) {
+        let sequences = &mut table_slice.sequences;
+        let mut next_expected = SequenceKind::DefaultValue;
+        let Some(first_seq) = sequences.first() else {
+            return;
+        };
+        let interval_stride = first_seq.interval_stride();
+        // m0 = m1 - first sequence stride * first sequence length (`:2405-2407`).
+        let Some(mut prev_interval_marker) = first_seq.interval_marker else {
+            return;
+        };
+        prev_interval_marker -= interval_stride * first_seq.length;
+        let target_count = if ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS {
+            3
+        } else {
+            max_num_seq
+        };
+        let mut at = 0usize;
+        for _ in 0..target_count {
+            if at == sequences.len() {
+                // Pad after the current sequences (`:2415-2421`).
+                sequences.push(dummy_sequence(
+                    evaluator,
+                    prev_interval_marker,
+                    interval_stride,
+                    next_expected,
+                ));
+                at = sequences.len();
+            } else if sequences[at].kind == next_expected {
+                // The next sequence is of the expected kind (`:2429-2432`).
+                if let Some(marker) = sequences[at].interval_marker {
+                    prev_interval_marker = marker;
+                }
+                at += 1;
+            } else {
+                // Pad in the middle, leaving `at` on the unexpected sequence (`:2422-2428`).
+                sequences.insert(
+                    at,
+                    dummy_sequence(
+                        evaluator,
+                        prev_interval_marker,
+                        interval_stride,
+                        next_expected,
+                    ),
+                );
+                at += 1;
+            }
+            next_expected = if next_expected == SequenceKind::DefaultValue
+                && ENABLE_NON_ZERO_STRIDE_SEQ_SIMPLIFICATIONS
+            {
+                SequenceKind::MonotoneSequence
+            } else {
+                SequenceKind::DefaultValue
+            };
+        }
+    }
 
-// crustify:todo: e292_generateEncodingTypes
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2450  (26 body lines, level 1)
-//   original  : llvm::SmallVector<Type> PatternSimplificationManager::generateEncodingTypes()
-//   calls     : e252_size
+    /// Replaces: e292_generateEncodingTypes
+    ///
+    /// The type of every field the encoding has to carry: one table-entry type per field the template
+    /// does NOT fix, plus a predicate type for each interval marker that varies — the last sequence's
+    /// marker being the `else` and never encoded.
+    pub fn generate_encoding_types(&self) -> Vec<ScalarTy> {
+        let mut types = Vec::new();
+        let Some(table) = self.table.as_ref() else {
+            return types;
+        };
+        let table_entry_type = table.table_entry_type();
+        for (seq_seen_so_far, template_s) in self.template_sequences.iter().enumerate() {
+            let skip_interval_marker = seq_seen_so_far + 1 == self.template_sequences.len();
+            match template_s.kind {
+                // A monotone sequence keeps both the starting value and the step (`:2463-2467`).
+                SequenceKind::MonotoneSequence => {
+                    if template_s.shifted_lb.is_none() {
+                        types.push(table_entry_type);
+                    }
+                    if template_s.stride.is_none() {
+                        types.push(table_entry_type);
+                    }
+                }
+                SequenceKind::DefaultValue => {
+                    if template_s.lb.is_none() {
+                        types.push(table_entry_type);
+                    }
+                }
+            }
+            if !skip_interval_marker && template_s.interval_marker.is_none() {
+                types.push(table.predicate_type());
+            }
+        }
+        types
+    }
 
-// crustify:todo: e293_generateEncodingTuple
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2485  (52 body lines, level 1)
-//   original  : llvm::SmallVector<Value> PatternSimplificationManager::generateEncodingTuple( Value &iv, TableSlice *cur_table_slice, OpBuilder &builder)
-//   calls     : e252_size
+    /// Replaces: e293_generateEncodingTuple
+    ///
+    /// The values for those types, read off this slice's own sequences: a materialised offset value
+    /// per field the template leaves open, and a `sentient.scalar_constant` per varying marker.
+    ///
+    /// TRAP: `Value &iv` AND `OpBuilder &builder` ARE UNREAD IN THE REFERENCE (`:2485`) — everything is
+    /// built through `const_builder_`/`query_map_builder_`, so neither is a parameter here. A field the
+    /// template leaves open that this sequence has not got is its null deref (`:2510`).
+    pub fn generate_encoding_tuple(
+        &self,
+        cur_table_slice: &TableSlice,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> Vec<Val> {
+        let mut encoding_tuple = Vec::new();
+        let Some(table) = self.table.as_ref() else {
+            return encoding_tuple;
+        };
+        let table_entry_type = table.table_entry_type();
+        let sequences = &cur_table_slice.sequences;
+        for (seq_seen_so_far, (s, template_s)) in
+            sequences.iter().zip(&self.template_sequences).enumerate()
+        {
+            let skip_interval_marker = seq_seen_so_far + 1 == sequences.len();
+            match s.kind {
+                SequenceKind::MonotoneSequence => {
+                    if let (None, Some(shifted_lb)) = (template_s.shifted_lb, s.shifted_lb) {
+                        encoding_tuple.push(evaluator.build_offset_value(
+                            shifted_lb,
+                            table_entry_type,
+                            builders,
+                        ));
+                    }
+                    if let (None, Some(stride)) = (template_s.stride, s.stride) {
+                        encoding_tuple.push(evaluator.build_offset_value(
+                            stride,
+                            table_entry_type,
+                            builders,
+                        ));
+                    }
+                }
+                SequenceKind::DefaultValue => {
+                    if let (None, Some(lb)) = (template_s.lb, s.lb) {
+                        encoding_tuple.push(evaluator.build_offset_value(
+                            lb,
+                            table_entry_type,
+                            builders,
+                        ));
+                    }
+                }
+            }
+            if !skip_interval_marker
+                && template_s.interval_marker.is_none()
+                && let Some(interval_marker) = s.interval_marker
+            {
+                let result = builders.values.mint();
+                builders.consts.push(scalar_constant(
+                    result,
+                    interval_marker.0,
+                    table.predicate_type(),
+                ));
+                encoding_tuple.push(result);
+            }
+        }
+        encoding_tuple
+    }
 
-// crustify:todo: e294_codeGenMonotoneTableSlice
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2654  (137 body lines, level 1)
-//   original  : Value PatternSimplificationManager::codeGenMonotoneTableSlice( bool mark_new_cmp, Value &iv, llvm::SmallVector<Value> &encoding_tuple, OpBuilder &builder)
-//   calls     : e025_getIntervalStride, e252_size
+    /// `create_simple_two_branch_conditional` (`:2666-2678`) — three template sequences whose two
+    /// default values are the same known value and whose first two markers are exactly one interval
+    /// apart, so `if (iv == m1)` covers the middle sequence on its own.
+    fn two_branch_special_case(&self, evaluator: &impl ExpressionEvaluator) -> bool {
+        let [first, middle, last] = self.template_sequences.as_slice() else {
+            return false;
+        };
+        if first.kind != SequenceKind::DefaultValue || last.kind != SequenceKind::DefaultValue {
+            return false;
+        }
+        if !matches!((first.lb, last.lb), (Some(lhs), Some(rhs)) if evaluator.equal(lhs, rhs)) {
+            return false;
+        }
+        match (first.interval_marker, middle.interval_marker) {
+            (Some(m0), Some(m1)) => m1 - m0 == middle.interval_stride().one_entry(),
+            _ => false,
+        }
+    }
 
-// crustify:todo: e295_codeGenGenericTableSlice
-//   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:2802  (58 body lines, level 1)
-//   original  : Value PatternSimplificationManager::codeGenGenericTableSlice( const Value &iv, TableSlice *table_slice, OpBuilder &builder)
-//   calls     : e025_getIntervalStride, e252_size
+    /// Replaces: e294_codeGenMonotoneTableSlice
+    ///
+    /// Builds `if (iv <= m0) yield D0 else if (iv <= m1) yield a1 else yield D1` from the template and
+    /// `encoding_tuple`, records the monotone sequence's start value and step, marks the yields that
+    /// become an iterator argument and — with `mark_new_cmp` over a table that is not 1-D — each new
+    /// comparison; answers the outermost conditional's result.
+    ///
+    /// TRAP: THE 2-BRANCH SPECIAL CASE STILL BUILDS SEQUENCE 0's MARKER CONSTANT before skipping its
+    /// branch (`:2735-2746`), and an empty template is the reference's `new_if.getResults()` on null.
+    pub fn code_gen_monotone_table_slice(
+        &mut self,
+        mark_new_cmp: bool,
+        iv: TypedVal,
+        encoding_tuple: &[Val],
+        site: &mut Site<'_>,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> Option<Val> {
+        let table_entry_type = self.table.as_ref()?.table_entry_type();
+        let create_simple_two_branch_conditional = self.two_branch_special_case(evaluator);
+        let count = self.template_sequences.len();
+        let mut next = 0usize;
+        let mut levels: Vec<IfLevel> = Vec::new();
+        let mut else_result = None;
+        let mut mark_else_result = false;
+        for i in 0..count {
+            let s = *self.template_sequences.get(i)?;
+            // The value this sequence yields, from the template when every slice agrees on it and
+            // from the encoding otherwise (`:2688-2712`).
+            let result = match s.kind {
+                SequenceKind::MonotoneSequence => {
+                    let result = match s.shifted_lb {
+                        Some(shifted_lb) => {
+                            evaluator.build_offset_value(shifted_lb, table_entry_type, builders)
+                        }
+                        None => next_encoding(encoding_tuple, &mut next)?,
+                    };
+                    match s.stride {
+                        Some(stride) => self.monotone_seq_int_step = Some(stride),
+                        None => {
+                            self.monotone_seq_val_step =
+                                Some(next_encoding(encoding_tuple, &mut next)?);
+                        }
+                    }
+                    self.monotone_seq_start_val = Some(result);
+                    result
+                }
+                SequenceKind::DefaultValue => match s.lb {
+                    Some(lb) => evaluator.build_offset_value(lb, table_entry_type, builders),
+                    None => next_encoding(encoding_tuple, &mut next)?,
+                },
+            };
+            // One sequence needs no conditional at all (`:2714-2717`).
+            if count == 1 {
+                return Some(result);
+            }
+            // The last sequence corresponds to the "else", so it needs no predicate (`:2718-2730`).
+            if i + 1 == count {
+                else_result = Some(result);
+                mark_else_result = s.kind == SequenceKind::MonotoneSequence;
+                break;
+            }
+            // The interval marker, again from the template when it is common (`:2733-2743`).
+            let rhs = match s.interval_marker {
+                Some(interval_marker) => {
+                    let rhs = builders.values.mint();
+                    builders
+                        .consts
+                        .push(scalar_constant(rhs, interval_marker.0, iv.ty));
+                    rhs
+                }
+                None => next_encoding(encoding_tuple, &mut next)?,
+            };
+            // The special case has no branch for the first default value (`:2745-2746`).
+            if create_simple_two_branch_conditional && i == 0 {
+                continue;
+            }
+            let predicate = if create_simple_two_branch_conditional && i == 1 {
+                // The middle sequence is a single interval marker value (`:2755-2758`).
+                sentient::CmpPredicate::Eq
+            } else if s.interval_stride().get().get() > 0 {
+                sentient::CmpPredicate::Sle
+            } else {
+                sentient::CmpPredicate::Sge
+            };
+            levels.push(IfLevel {
+                predicate,
+                rhs,
+                then_result: result,
+                result: builders.values.mint(),
+                mark_then_result: s.kind == SequenceKind::MonotoneSequence,
+                mark_lhs_in_pred: mark_new_cmp && self.ivs_dimensions_multipliers.len() > 1,
+            });
+        }
+        site.insert(if_chain(&levels, iv.val, else_result?)?);
+        for (depth, level) in levels.iter().enumerate() {
+            let path = level_path(&site.at, depth);
+            if level.mark_lhs_in_pred {
+                self.marks
+                    .set(Mark::LhsInPredReplacedByIterArg, path.path());
+            }
+            if level.mark_then_result {
+                self.marks
+                    .set(Mark::ResultReplacedByIterArg, path.child(0, 0).path());
+            }
+        }
+        if mark_else_result {
+            let innermost = level_path(&site.at, levels.len().saturating_sub(1));
+            self.marks
+                .set(Mark::ResultReplacedByIterArg, innermost.child(1, 0).path());
+        }
+        levels.first().map(|level| level.result)
+    }
+
+    /// Replaces: e295_codeGenGenericTableSlice
+    ///
+    /// Builds `if (iv <= m0) yield D0 ... else yield Dk` over a slice of default-value sequences, the
+    /// last one falling under the innermost `else`; answers the outermost conditional's result, or the
+    /// single sequence's own value when there is nothing to branch on.
+    ///
+    /// TRAP: A SEQUENCE THAT IS NOT `kDefaultValue` is the reference's `DT_CHECK` (`:2821-2822`) and
+    /// one missing its LB or marker is its null deref (`:2823-2830`) — here either stops the build.
+    pub fn code_gen_generic_table_slice(
+        &self,
+        iv: Val,
+        table_slice: &TableSlice,
+        site: &mut Site<'_>,
+        builders: &mut Builders<'_>,
+        evaluator: &mut impl ExpressionEvaluator,
+    ) -> Option<Val> {
+        let table = self.table.as_ref()?;
+        let table_entry_type = table.table_entry_type();
+        let (last, leading) = table_slice.sequences.split_last()?;
+        // The whole slice yields the same value, so no `sentient.if` is needed (`:2808-2813`).
+        if leading.is_empty() {
+            return Some(evaluator.build_offset_value(last.lb?, table_entry_type, builders));
+        }
+        let mut levels = Vec::new();
+        for seq in leading {
+            let then_result = evaluator.build_offset_value(seq.lb?, table_entry_type, builders);
+            let rhs = builders.values.mint();
+            builders.consts.push(scalar_constant(
+                rhs,
+                seq.interval_marker?.0,
+                table.predicate_type(),
+            ));
+            levels.push(IfLevel {
+                predicate: if seq.interval_stride().get().get() > 0 {
+                    sentient::CmpPredicate::Sle
+                } else {
+                    sentient::CmpPredicate::Sge
+                },
+                rhs,
+                then_result,
+                result: builders.values.mint(),
+                mark_then_result: false,
+                mark_lhs_in_pred: false,
+            });
+        }
+        // The last sequence falls under the "else" (`:2855-2858`).
+        let else_result = evaluator.build_offset_value(last.lb?, table_entry_type, builders);
+        site.insert(if_chain(&levels, iv, else_result)?);
+        levels.first().map(|level| level.result)
+    }
+}
 
 // crustify:todo: e431_processLeaf
 //   authority : dcc/src/Transform/Sentient/CFGSimplificationSentientLevel.cpp:1023  (64 body lines, level 2)
@@ -1028,10 +1677,124 @@ impl PatternSimplificationManager {
 
 #[cfg(test)]
 mod unit_tests {
+    use super::super::{IndexStride, TableIndex, TableSize};
     use super::*;
+    use crate::islands::dataflow_ir::Values;
     use crate::islands::sentient::dialects::sentient::{
         Carried, CmpPredicate, Reg, RegType, Yielded,
     };
+
+    /// THE OUT-OF-SCOPE `ExpressionEvaluator` AS A TEST DOUBLE — an id stands for the TEXT of the
+    /// expression it names, so `getConstant` is memoised the way the analysis's arena is and `equal`
+    /// is the content equality `EvaluatedValue::operator==` provides.
+    ///
+    /// ⛔ TEST ONLY. `Analyses/ExpressionEvaluatorUtils` is outside this campaign and no
+    /// implementation of [`ExpressionEvaluator`] may ship in it.
+    #[derive(Default)]
+    struct FakeEvaluator {
+        next: u32,
+        content: Vec<(EvaluatedValueId, String)>,
+        /// Every id `build_offset_value` was asked to materialise, in order.
+        built: Vec<EvaluatedValueId>,
+    }
+
+    impl FakeEvaluator {
+        fn intern(&mut self, text: String) -> EvaluatedValueId {
+            if let Some((id, _)) = self.content.iter().find(|(_, seen)| *seen == text) {
+                return *id;
+            }
+            let id = EvaluatedValueId::new(self.next);
+            self.next += 1;
+            self.content.push((id, text));
+            id
+        }
+
+        fn text(&self, id: EvaluatedValueId) -> String {
+            self.content
+                .iter()
+                .find(|(seen, _)| *seen == id)
+                .map_or_else(String::new, |(_, text)| text.clone())
+        }
+    }
+
+    impl ExpressionEvaluator for FakeEvaluator {
+        fn get_constant(&mut self, value: i64) -> EvaluatedValueId {
+            self.intern(value.to_string())
+        }
+
+        fn evaluate_sub(
+            &mut self,
+            lhs: EvaluatedValueId,
+            rhs: EvaluatedValueId,
+        ) -> EvaluatedValueId {
+            let text = format!("({} - {})", self.text(lhs), self.text(rhs));
+            self.intern(text)
+        }
+
+        fn evaluate_multiply_by_const(
+            &mut self,
+            value: EvaluatedValueId,
+            factor: Entries,
+        ) -> EvaluatedValueId {
+            let text = format!("({} * {})", self.text(value), factor.0);
+            self.intern(text)
+        }
+
+        fn equal(&self, lhs: EvaluatedValueId, rhs: EvaluatedValueId) -> bool {
+            self.text(lhs) == self.text(rhs)
+        }
+
+        fn build_offset_value(
+            &mut self,
+            value: EvaluatedValueId,
+            ty: ScalarTy,
+            builders: &mut Builders<'_>,
+        ) -> Val {
+            self.built.push(value);
+            let result = builders.values.mint();
+            builders.query_maps.push(scalar_constant(result, 0, ty));
+            result
+        }
+    }
+
+    /// One sequence, its interval stride fixed at one entry per table entry.
+    fn sequence(
+        kind: SequenceKind,
+        lb: EvaluatedValueId,
+        stride: EvaluatedValueId,
+        length: i64,
+        marker: i64,
+    ) -> Sequence {
+        Sequence::new(
+            lb,
+            stride,
+            Entries(length),
+            IntervalMarker(marker),
+            IntervalStride::new(ONE),
+            kind,
+        )
+    }
+
+    fn table_slice(
+        zero: EvaluatedValueId,
+        sequences: Vec<Sequence>,
+        is_1d_rep_of_table: bool,
+    ) -> TableSlice {
+        let mut slice = TableSlice::new(
+            TableIndex(0),
+            IndexStride(1),
+            Entries(0),
+            zero,
+            is_1d_rep_of_table,
+        );
+        slice.sequences = sequences;
+        slice
+    }
+
+    /// A table whose entries are `index` and whose predicates are `i1`.
+    fn table() -> Table {
+        Table::new(TableSize(3), ScalarTy::Int(1), ScalarTy::Index)
+    }
 
     /// `regIndex = -1`, the locale unassigned — what every op in these fixtures carries.
     const UNASSIGNED: Reg = Reg {
@@ -1283,5 +2046,380 @@ mod unit_tests {
 
         assert!(manager.check_cascading_arg_uses(&root, &inner_path, &cur, &[outer]));
         assert!(!manager.check_cascading_arg_uses(&root, &inner_path, &cur, &[absent]));
+    }
+
+    /// The template keeps only what every slice agrees on, each monotone sequence gains its shifted
+    /// LB, and a step that is a constant zero over fewer than three sequences turns every monotone
+    /// sequence into a default value.
+    #[test]
+    fn compute_template_seq_shifts_the_monotone_lb_and_collapses_a_zero_step() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let ten = evaluator.get_constant(10);
+        let eleven = evaluator.get_constant(11);
+        let twenty = evaluator.get_constant(20);
+        let mut slices = vec![
+            table_slice(
+                zero,
+                vec![
+                    sequence(SequenceKind::DefaultValue, ten, zero, 2, 3),
+                    sequence(SequenceKind::MonotoneSequence, twenty, zero, 3, 9),
+                ],
+                false,
+            ),
+            table_slice(
+                zero,
+                vec![
+                    sequence(SequenceKind::DefaultValue, eleven, zero, 2, 3),
+                    sequence(SequenceKind::MonotoneSequence, twenty, zero, 3, 9),
+                ],
+                false,
+            ),
+        ];
+        let mut manager = PatternSimplificationManager::default();
+
+        manager.compute_template_seq_and_update_monotone_seq(&mut slices, &mut evaluator);
+
+        let scaled = evaluator.evaluate_multiply_by_const(zero, Entries(2));
+        let shifted = evaluator.evaluate_sub(twenty, scaled);
+        // The slices disagree about the first sequence's value, so the template forgets it and keeps
+        // the interval marker they share.
+        assert_eq!(manager.template_sequences[0].lb, None);
+        assert_eq!(
+            manager.template_sequences[0].interval_marker,
+            Some(IntervalMarker(3))
+        );
+        // The monotone sequence became a default value whose LB is the shifted one, in the template
+        // and in every slice.
+        assert_eq!(
+            manager.template_sequences[1].kind,
+            SequenceKind::DefaultValue
+        );
+        assert_eq!(manager.template_sequences[1].lb, Some(shifted));
+        assert_eq!(manager.template_sequences[1].shifted_lb, None);
+        assert_eq!(slices[1].sequences[1].kind, SequenceKind::DefaultValue);
+        assert_eq!(slices[1].sequences[1].lb, Some(shifted));
+    }
+
+    /// A fourth sequence fails the monotone pattern for a sliced table and the contiguous pattern for
+    /// a 1-D one; only the 1-D failure aborts, and after it nothing is inserted at all.
+    #[test]
+    fn insert_sequence_caps_each_slice_at_three_and_only_a_1d_slice_aborts() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let default = sequence(SequenceKind::DefaultValue, zero, zero, 1, 0);
+        let monotone = sequence(SequenceKind::MonotoneSequence, zero, zero, 1, 0);
+        let mut sliced = table_slice(zero, vec![default, default, monotone], false);
+        let mut one_d = table_slice(zero, vec![default, default, default], true);
+        let mut manager = PatternSimplificationManager::default();
+
+        manager.insert_sequence(default, &mut sliced);
+
+        assert!(sliced.has_inserted_monotone_seq_before_last);
+        assert!(!manager.table_slices_follow_montone_pattern);
+        assert!(manager.table_follows_contiguous_pattern);
+        assert!(!manager.abort_pattern);
+
+        manager.insert_sequence(default, &mut one_d);
+
+        assert!(!manager.table_follows_contiguous_pattern);
+        assert!(manager.abort_pattern);
+
+        manager.insert_sequence(default, &mut one_d);
+
+        assert_eq!(one_d.sequences.len(), 4);
+    }
+
+    /// The slice is padded to `max_num_seq` default-value dummies of length zero, each repeating the
+    /// last real interval marker so that its predicate is always false.
+    #[test]
+    fn pad_table_slice_appends_dummies_repeating_the_last_interval_marker() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let mut slice = table_slice(
+            zero,
+            vec![sequence(SequenceKind::DefaultValue, zero, zero, 3, 5)],
+            false,
+        );
+
+        PatternSimplificationManager::pad_table_slice(&mut slice, 3, &mut evaluator);
+
+        assert_eq!(
+            slice
+                .sequences
+                .iter()
+                .map(|s| (s.kind, s.interval_marker, s.length))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SequenceKind::DefaultValue,
+                    Some(IntervalMarker(5)),
+                    Entries(3)
+                ),
+                (
+                    SequenceKind::DefaultValue,
+                    Some(IntervalMarker(5)),
+                    Entries(0)
+                ),
+                (
+                    SequenceKind::DefaultValue,
+                    Some(IntervalMarker(5)),
+                    Entries(0)
+                ),
+            ]
+        );
+        assert_eq!(slice.sequences[1].lb, Some(zero));
+    }
+
+    /// Each field the template leaves open costs a table-entry type and each varying interval marker
+    /// a predicate type; the last sequence's marker is the `else` and is never encoded.
+    #[test]
+    fn generate_encoding_types_covers_the_open_fields_and_skips_the_last_marker() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let mut open_monotone = sequence(SequenceKind::MonotoneSequence, zero, zero, 1, 0);
+        open_monotone.stride = None;
+        open_monotone.interval_marker = None;
+        let mut open_default = sequence(SequenceKind::DefaultValue, zero, zero, 1, 7);
+        open_default.lb = None;
+        let manager = PatternSimplificationManager {
+            table: Some(table()),
+            template_sequences: vec![open_monotone, open_default],
+            ..PatternSimplificationManager::default()
+        };
+
+        assert_eq!(
+            manager.generate_encoding_types(),
+            vec![
+                ScalarTy::Index,
+                ScalarTy::Index,
+                ScalarTy::Int(1),
+                ScalarTy::Index
+            ]
+        );
+    }
+
+    /// A field the template leaves open is materialised from this slice's own sequence, and its
+    /// varying interval marker becomes a `sentient.scalar_constant` of the predicate type.
+    #[test]
+    fn generate_encoding_tuple_materialises_the_open_fields_and_the_varying_marker() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let four = evaluator.get_constant(4);
+        let nine = evaluator.get_constant(9);
+        let mut open = sequence(SequenceKind::DefaultValue, zero, zero, 1, 4);
+        open.lb = None;
+        open.interval_marker = None;
+        let manager = PatternSimplificationManager {
+            table: Some(table()),
+            template_sequences: vec![open, sequence(SequenceKind::DefaultValue, zero, zero, 1, 9)],
+            ..PatternSimplificationManager::default()
+        };
+        let slice = table_slice(
+            zero,
+            vec![
+                sequence(SequenceKind::DefaultValue, four, zero, 1, 4),
+                sequence(SequenceKind::DefaultValue, nine, zero, 1, 9),
+            ],
+            false,
+        );
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+
+        let tuple = {
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            manager.generate_encoding_tuple(&slice, &mut builders, &mut evaluator)
+        };
+
+        assert_eq!(tuple, vec![Val(0), Val(1)]);
+        assert_eq!(evaluator.built, vec![four]);
+        assert_eq!(consts, vec![scalar_constant(Val(1), 4, ScalarTy::Int(1))]);
+    }
+
+    /// The template's known value is materialised and its open ones read off the encoding in order,
+    /// the monotone sequence's start value and step are recorded, and the chain marks the monotone
+    /// yield and both new comparisons.
+    #[test]
+    fn code_gen_monotone_table_slice_builds_the_chain_and_marks_the_monotone_yield() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let ten = evaluator.get_constant(10);
+        let twenty = evaluator.get_constant(20);
+        let mut open_monotone = sequence(SequenceKind::MonotoneSequence, zero, zero, 1, 4);
+        open_monotone.stride = None;
+        let iv_dim = IvDim {
+            iv: Val(50),
+            dimension: 4,
+            multiplier: 1,
+        };
+        let mut manager = PatternSimplificationManager {
+            table: Some(table()),
+            template_sequences: vec![
+                sequence(SequenceKind::DefaultValue, ten, zero, 1, 0),
+                open_monotone,
+                sequence(SequenceKind::DefaultValue, twenty, zero, 1, 9),
+            ],
+            ivs_dimensions_multipliers: vec![iv_dim, iv_dim],
+            ..PatternSimplificationManager::default()
+        };
+        let iv = TypedVal {
+            val: Val(50),
+            ty: ScalarTy::Index,
+        };
+        let mut block = Vec::new();
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+
+        let result = {
+            let mut site = Site {
+                block: &mut block,
+                at: OpPath::at(&[(0, 0)]),
+            };
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            manager.code_gen_monotone_table_slice(
+                true,
+                iv,
+                &[Val(100), Val(101)],
+                &mut site,
+                &mut builders,
+                &mut evaluator,
+            )
+        };
+
+        let inner = Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Sle,
+            lhs: Val(50),
+            rhs: Val(3),
+            yielded: vec![Yielded {
+                result: Val(4),
+                reg: UNKNOWN_LOCALE,
+            }],
+            dbg_name: None,
+            then_body: vec![yield_op(vec![Val(100)])],
+            else_body: vec![yield_op(vec![Val(5)])],
+        });
+        let outer = Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Sle,
+            lhs: Val(50),
+            rhs: Val(1),
+            yielded: vec![Yielded {
+                result: Val(2),
+                reg: UNKNOWN_LOCALE,
+            }],
+            dbg_name: None,
+            then_body: vec![yield_op(vec![Val(0)])],
+            else_body: vec![inner, yield_op(vec![Val(4)])],
+        });
+        assert_eq!(result, Some(Val(2)));
+        assert_eq!(block, vec![outer]);
+        assert_eq!(manager.monotone_seq_start_val, Some(Val(100)));
+        assert_eq!(manager.monotone_seq_val_step, Some(Val(101)));
+        assert!(
+            manager
+                .marks
+                .has(Mark::ResultReplacedByIterArg, &[(0, 0), (1, 0), (0, 0)])
+        );
+        assert!(
+            manager
+                .marks
+                .has(Mark::LhsInPredReplacedByIterArg, &[(0, 0)])
+        );
+        assert!(
+            manager
+                .marks
+                .has(Mark::LhsInPredReplacedByIterArg, &[(0, 0), (1, 0)])
+        );
+    }
+
+    /// Every sequence but the last gets a branch testing its own interval marker, the last one
+    /// becoming the innermost `else`.
+    #[test]
+    fn code_gen_generic_table_slice_chains_one_branch_per_sequence_but_the_last() {
+        let mut evaluator = FakeEvaluator::default();
+        let zero = evaluator.get_constant(0);
+        let first = evaluator.get_constant(1);
+        let second = evaluator.get_constant(2);
+        let third = evaluator.get_constant(3);
+        let slice = table_slice(
+            zero,
+            vec![
+                sequence(SequenceKind::DefaultValue, first, zero, 1, 3),
+                sequence(SequenceKind::DefaultValue, second, zero, 1, 7),
+                sequence(SequenceKind::DefaultValue, third, zero, 1, 9),
+            ],
+            false,
+        );
+        let manager = PatternSimplificationManager {
+            table: Some(table()),
+            ..PatternSimplificationManager::default()
+        };
+        let mut block = Vec::new();
+        let mut consts = Vec::new();
+        let mut query_maps = Vec::new();
+        let mut values = Values::default();
+
+        let result = {
+            let mut site = Site {
+                block: &mut block,
+                at: OpPath::at(&[(0, 0)]),
+            };
+            let mut builders = Builders {
+                consts: &mut consts,
+                query_maps: &mut query_maps,
+                values: &mut values,
+            };
+            manager.code_gen_generic_table_slice(
+                Val(50),
+                &slice,
+                &mut site,
+                &mut builders,
+                &mut evaluator,
+            )
+        };
+
+        let inner = Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Sle,
+            lhs: Val(50),
+            rhs: Val(4),
+            yielded: vec![Yielded {
+                result: Val(5),
+                reg: UNKNOWN_LOCALE,
+            }],
+            dbg_name: None,
+            then_body: vec![yield_op(vec![Val(3)])],
+            else_body: vec![yield_op(vec![Val(6)])],
+        });
+        let outer = Op::Sentient(sentient::Op::If {
+            predicate: CmpPredicate::Sle,
+            lhs: Val(50),
+            rhs: Val(1),
+            yielded: vec![Yielded {
+                result: Val(2),
+                reg: UNKNOWN_LOCALE,
+            }],
+            dbg_name: None,
+            then_body: vec![yield_op(vec![Val(0)])],
+            else_body: vec![inner, yield_op(vec![Val(5)])],
+        });
+        assert_eq!(result, Some(Val(2)));
+        assert_eq!(block, vec![outer]);
+        assert_eq!(evaluator.built, vec![first, second, third]);
+        assert_eq!(
+            consts,
+            vec![
+                scalar_constant(Val(1), 3, ScalarTy::Int(1)),
+                scalar_constant(Val(4), 7, ScalarTy::Int(1)),
+            ]
+        );
     }
 }
