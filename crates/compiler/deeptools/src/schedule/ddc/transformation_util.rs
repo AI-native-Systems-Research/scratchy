@@ -158,11 +158,15 @@
 // ⭐ USES FOR ENTRIES 110-117. Union these into this file's top block when its other entries land.
 use std::collections::{BTreeMap, BTreeSet};
 
+use sys_arch_spec::arch_enums::SenComponent;
+
 use super::fold::{AllocId, AllocLayout, Allocations, DataOrigin, NodeId, PadType, StoredStream};
 use super::metadata::{DatastageId, DdcMemory, MetaDimKind, Metadata};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::generated::DataConnect;
-use crate::schedule::dsc2::{ComputeNode, Dsc, LdsIdx, NodeName, TransferNode, TransferSide};
+use crate::schedule::dsc2::{
+    ComputeNode, DataInfo, Dsc, LdsIdx, NodeName, OperandPos, TransferNode, TransferSide,
+};
 
 // ⭐ TYPES FOR ENTRIES 110-117. Union this section with this file's other vocabulary when its other
 // entries land; each declaration is one C++ one narrowed to what the ported entries read and write.
@@ -911,27 +915,6 @@ pub fn get_node_description(node: UtilNode<'_>) -> String {
 //   extract   : crustify-ddc/cpp/ddc.cpp:6023-6029
 //   calls     : e120_storageOrDatastreamIsExternal
 
-// crustify:todo: e255_inputRelatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1717  (11 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::inputRelatedToExternalNodes( const dsc2::ComputeNode *computeNode) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:6039-6051
-//   calls     : e120_storageOrDatastreamIsExternal
-
-// crustify:todo: e256_outputRelatedToExternalNodes
-//   authority : ddc/ddc_transformation_util.cpp:1730  (11 body lines, level 1)
-//   class     : Ddc
-//   original  : bool Ddc::outputRelatedToExternalNodes( const dsc2::ComputeNode *computeNode) const
-//   extract   : crustify-ddc/cpp/ddc.cpp:6061-6073
-//   calls     : e120_storageOrDatastreamIsExternal
-
-// crustify:todo: e257_addNewLds
-//   authority : ddc/ddc_transformation_util.cpp:1811  (107 body lines, level 1)
-//   class     : Ddc
-//   original  : int Ddc::addNewLds(LabeledDsInfo *refLds)
-//   extract   : crustify-ddc/cpp/ddc.cpp:6083-6190
-//   calls     : e104_clear
-
 // crustify:todo: e304_cloneForPeSfpWorkSplit
 //   authority : ddc/ddc_transformation_util.cpp:1538  (113 body lines, level 2)
 //   class     : Ddc
@@ -980,6 +963,250 @@ pub fn get_node_description(node: UtilNode<'_>) -> String {
 //   original  : bool Ddc::relatedToExternalNodes(const dsc2::BlockNode *root) const
 //   extract   : crustify-ddc/cpp/ddc.cpp:14282-14302
 //   calls     : e121_relatedToExternalNodes, e306_relatedToExternalNodes, e341_relatedToExternalNodes
+
+// ⭐ USES FOR ENTRIES 255-257: `DataInfo`, `OperandPos` and `SenComponent`, added to this file's top
+// block. TYPES FOR ENTRIES 255-257 follow; union them with this file's other vocabulary as its
+// remaining entries land.
+
+/// WHICH WAY A DATASTREAM FLOWS PAST ITS NODE — `storageOrDatastreamIsExternal`'s `isIncoming`
+/// (`ddc/ddc_transformation_util.cpp:1652`), which selects the data connect's `producers_` or its
+/// `consumers_` and spells itself `"Incoming"`/`"Outgoing"` in the transformation report.
+///
+/// ⭐ AN ENUM AND NOT A `bool`: a direction is a closed set, and each of entries 253-256 passes one
+/// literal, so transposing two callsites must be a type error rather than an inverted predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StreamDirection {
+    /// `isIncoming == true` — the operand READS, so the connect's `producers_` are checked.
+    Incoming,
+    /// `isIncoming == false` — the operand WRITES, so its `consumers_` are.
+    Outgoing,
+}
+
+/// WHAT ENTRIES 253-256 ASK OF ENTRY 120 — `storageOrDatastreamIsExternal(dataInfo, storage,
+/// isIncoming)` (`ddc/ddc_transformation_util.cpp:1652`): whether that datastream's allocation in
+/// `storage`, or any node on its `data_connect=`, is an `externalNodes_` member (`ddc/ddc.h:298`).
+///
+/// ⛔ ENTRY 120 IS NOT PORTED YET — its anchor is still open above and the scheduler put it in no
+/// batch of this wave, so this trait is the SEAM entries 253-256 reach it through and NOT a stand-in
+/// predicate: entry 120 is a `const` method over `currDsc`'s allocations, `metadata.dataConnects_`,
+/// `metadata.externalNodes_` and `transformationReportLevel_` at once, which is a carrier's question
+/// however it is spelled. Its port is the one implementation of this method, and entries
+/// 305/306/341/361 above will ask through it too.
+pub trait ExternalStreams {
+    /// `storageOrDatastreamIsExternal(dataInfo, storage, isIncoming)`.
+    fn storage_or_datastream_is_external(
+        &self,
+        data: DataInfo,
+        storage: SenComponent,
+        direction: StreamDirection,
+    ) -> bool;
+}
+
+/// Replaces: e255_inputRelatedToExternalNodes
+///
+/// Whether ANY input datastream of the compute is external (`:1717`).
+///
+/// ⛔ TRAP, AND IT IS THE REFERENCE'S: THE OPERAND'S COMPONENT — [`Operand::unit`], the `inputs_`
+/// entry — IS PASSED AS ENTRY 120'S `storage`, so `Operand::storage` is NOT what is asked about.
+/// ⛔ The reference bounds the loop by `inputsLdsAndLoopOffsets_.size()` while indexing
+/// `inputs_.at(i)`; [`ComputeNode::inputs`] zips the two, so that throw is unspellable.
+#[must_use]
+pub fn input_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    compute: &ComputeNode,
+) -> bool {
+    compute.inputs.iter().any(|input| {
+        streams.storage_or_datastream_is_external(input.data, input.unit, StreamDirection::Incoming)
+    })
+}
+
+/// Replaces: e256_outputRelatedToExternalNodes
+///
+/// Whether ANY output datastream of the compute is external (`:1730`) — entry 255 over `outputs_`,
+/// asked of the connect's `consumers_` instead of its `producers_`.
+///
+/// ⛔ THE SAME TRAP: `outputs_.at(i)` is the operand's component and it is passed as the `storage`.
+#[must_use]
+pub fn output_related_to_external_nodes<E: ExternalStreams + ?Sized>(
+    streams: &E,
+    compute: &ComputeNode,
+) -> bool {
+    compute.outputs.iter().any(|output| {
+        streams.storage_or_datastream_is_external(
+            output.data,
+            output.unit,
+            StreamDirection::Outgoing,
+        )
+    })
+}
+
+/// ONE `labeledDs_` ENTRY AS ENTRY 257 TOUCHES ONE — `LabeledDsInfo` (`dsc/dscdefn.h:321`), whose
+/// body is COPIED WHOLESALE and whose `ldsIdx_` is the only field read.
+///
+/// ⭐ OPAQUE ON PURPOSE. `addNewLds` clones `*refLds` and writes two indices into the clone; one of
+/// its callsites builds the source locally rather than taking it out of `labeledDs_`
+/// (`ddc/ddc_transformation.cpp:1907`), so the source cannot be narrowed to a position.
+pub trait LabeledDsEntry: Clone {
+    /// `ldsIdx_` (`dsc/dscdefn.h:323`) — the entry's OWN self-index, whose default is `183` and which
+    /// need not be the position the entry sits at.
+    fn recorded_lds_idx(&self) -> LdsIdx;
+
+    /// `ldsIdx_ = recorded`.
+    fn set_recorded_lds_idx(&mut self, recorded: LdsIdx);
+
+    /// `referenceLdsIdx_ = reference` (`:324`) — which tensor an internal one is derived from.
+    fn set_reference_lds_idx(&mut self, reference: LdsIdx);
+}
+
+/// A PLACE IN THE SCHEDULE TREE THAT NAMES A LABELLED DATA STRUCTURE — every lds index the
+/// `{ALLOCATE, TRANSFER, COMPUTE, LOOP}` walk of entry 257 reaches (`:1878-1911`).
+///
+/// ⛔ `DT_ERROR("Invalid block node.")` (`:1911`) IS UNSPELLABLE: the walk's filter admits exactly
+/// these four `nodeType_`s, so there is no fifth arm left to refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeLdsSlot {
+    /// `allocNode->ldsIdx_`.
+    Allocate(NodeId),
+    /// `computeNode->inputsLdsAndLoopOffsets_.at(i).myLdsIdx_` for [`OperandPos::Input`], and
+    /// `outputsLdsAndLoopOffsets_.at(i).myLdsIdx_` for [`OperandPos::Output`].
+    Compute(NodeId, OperandPos),
+    /// `transferNode->srcLdsAndLoopOffsets_.myLdsIdx_` for [`OperandPos::Input`] — a transfer has
+    /// exactly one source — and `dstLdsAndLoopOffsets_.at(i).myLdsIdx_` for [`OperandPos::Output`].
+    Transfer(NodeId, OperandPos),
+    /// `loopNode->parametricLdsIdx_` (`dsc/dsc2.h:618`), reached ONLY where `isParametricLoop()`
+    /// (`:599`) holds — a non-parametric loop's index is left alone.
+    ParametricLoop(NodeId),
+}
+
+/// WHAT ENTRY 257 DOES TO THE DSC AND ITS SCHEDULE TREE — the insert, the index writes and the walk
+/// that finds every slot naming a labelled data structure.
+///
+/// ⭐ EVERY MUTATION THE REFERENCE PERFORMS IS ONE METHOD HERE; the DECISION of which to call, and
+/// with what value, stays in the port.
+pub trait NewLabeledDs {
+    /// One `labeledDs_` entry as the carrier holds it.
+    type Entry: LabeledDsEntry;
+
+    /// `labeledDs_.size() - 1`, TOTAL because the list is non-empty — the reference reaches
+    /// `labeledDs_.at(labeledDs_.size() - 1)` and `.back()` unguarded (`:1817-1818`).
+    fn last_lds_pos(&self) -> LdsIdx;
+
+    /// `labeledDs_.back().ldsIdx_`, likewise total.
+    fn last_recorded_lds_idx(&self) -> LdsIdx;
+
+    /// `labeledDs_.back().ldsIdx_ = recorded`.
+    fn set_last_recorded_lds_idx(&mut self, recorded: LdsIdx);
+
+    /// `labeledDs_.insert(labeledDs_.end() - 1, std::move(entry))` — the entry lands at position
+    /// `size() - 1` and the entry that was last moves up one place.
+    ///
+    /// ⛔ REPOINTING IS THIS METHOD'S JOB, NOT THE PORT'S. The reference rebuilds every
+    /// `LabeledDsInfo*` held by `labeledDs_.dataTransfers_.myDsInfo` and by `computeOp_`'s
+    /// `inputLabeledDs`/`interimLabeledDs`/`outputLabeledDs` (`:1826-1845`) only because the vector
+    /// reallocated; positions `0 .. size()-2` keep the entries they had, so a carrier that holds
+    /// those references BY POSITION owes exactly the one shift of the entry that was last.
+    /// ⛔ NOTHING MAY POINT AT THE NEW ENTRY: its callers push it on themselves
+    /// (`ddc/ddcv1.cpp:2104-2105`).
+    fn insert_lds_before_last(&mut self, entry: Self::Entry);
+
+    /// `labeledDs_.at(pos).memOrg_.clear()` — a NO-OP past the end, which is that `.at()`'s throw.
+    fn clear_mem_org(&mut self, pos: LdsIdx);
+
+    /// The `allocateNode_`s of `labeledDs_.at(pos).memOrg_` (`dsc/dscdefn.h:314`) — EMPTY past the
+    /// end, and empty for an organisation whose allocation is still null.
+    fn mem_org_allocations(&self, pos: LdsIdx) -> Vec<AllocId>;
+
+    /// `allocNode->ldsIdx_`, absent for the reference's `-1`.
+    fn alloc_lds_idx(&self, alloc: AllocId) -> Option<LdsIdx>;
+
+    /// `allocNode->ldsIdx_ = lds`.
+    fn set_alloc_lds_idx(&mut self, alloc: AllocId, lds: LdsIdx);
+
+    /// Every slot the `{ALLOCATE, TRANSFER, COMPUTE, LOOP}` walk reaches WITH the lds index it holds,
+    /// absent for the reference's `-1`.
+    fn tree_lds_slots(&self) -> Vec<(TreeLdsSlot, Option<LdsIdx>)>;
+
+    /// That slot's `myLdsIdx_`/`ldsIdx_`/`parametricLdsIdx_` set to `lds`.
+    fn set_tree_lds(&mut self, slot: TreeLdsSlot, lds: LdsIdx);
+
+    /// The `isOpaqueOp_` computes that same walk reaches — the `metadata.opaqueOps_` keys entry 257
+    /// looks up (`:1884-1887`). ⛔ One with NO entry in that map is `opaqueOps_.at(cn)`'s throw, and
+    /// nothing to rename here.
+    fn opaque_computes(&self) -> Vec<NodeId>;
+}
+
+/// Replaces: e257_addNewLds
+///
+/// INSERTS A COPY OF `ref_lds` BEFORE THE LAST LABELLED DATA STRUCTURE (`:1811`): the copy takes the
+/// index the last one had, that one is bumped by one, and the vacated index is RENAMED wherever it is
+/// held — allocations, tree lds slots, opaque ops, `newAllocations_`, `ldsIdxAfterDdc`. Yields the new
+/// entry's POSITION (`ddc/ddcv1.cpp:2103-2104`). ⛔⛔ TRAP, AND IT IS THE REFERENCE'S: A RECORDED INDEX
+/// IS USED AS A POSITION — `labeledDs_.at(newLastLdsIdx).memOrg_` (`:1873`) indexes the vector BY the
+/// bumped recorded index, and is cleared AFTER the rename it feeds, which on a drifted list decides.
+#[must_use]
+pub fn add_new_lds<D: NewLabeledDs + ?Sized>(
+    dsc: &mut D,
+    metadata: &mut Metadata,
+    ref_lds: &D::Entry,
+) -> LdsIdx {
+    // `newLds.ldsIdx_ = currDsc->labeledDs_.size() - 1` — the POSITION the insert puts it at.
+    let new_recorded = dsc.last_lds_pos();
+    let old_last = dsc.last_recorded_lds_idx();
+    // `currDsc->labeledDs_.back().ldsIdx_++`.
+    dsc.set_last_recorded_lds_idx(LdsIdx(old_last.0 + 1));
+
+    let mut new_lds = ref_lds.clone();
+    new_lds.set_recorded_lds_idx(new_recorded);
+    new_lds.set_reference_lds_idx(ref_lds.recorded_lds_idx());
+    dsc.insert_lds_before_last(new_lds);
+
+    // `newLastLdsIdx = currDsc->labeledDs_.at(currDsc->labeledDs_.size() - 1).ldsIdx_`, read back off
+    // the entry the insert shifted up.
+    let new_last = dsc.last_recorded_lds_idx();
+
+    for alloc in dsc.mem_org_allocations(new_last) {
+        dsc.set_alloc_lds_idx(alloc, new_last);
+    }
+    dsc.clear_mem_org(new_recorded);
+
+    for (slot, held) in dsc.tree_lds_slots() {
+        if held == Some(old_last) {
+            dsc.set_tree_lds(slot, new_last);
+        }
+    }
+    for compute in dsc.opaque_computes() {
+        if let Some(opaque) = metadata.opaque_ops.get_mut(&compute) {
+            if opaque.lds_idx == Some(old_last) {
+                opaque.lds_idx = Some(new_last);
+            }
+        }
+    }
+
+    for allocated in metadata.new_allocations.values_mut() {
+        if let Some(alloc) = allocated.lds_idx_and_alloc_node.remove(&old_last) {
+            allocated.lds_idx_and_alloc_node.insert(new_last, alloc);
+        }
+        for &alloc in allocated.comp_and_alloc_node.values() {
+            if dsc.alloc_lds_idx(alloc) == Some(old_last) {
+                dsc.set_alloc_lds_idx(alloc, new_last);
+            }
+        }
+    }
+
+    // Update DDL interface: the entry KEYED by the old index takes the new one as its value, and
+    // failing that every entry whose value was the old index is remapped (`:1904-1911`).
+    if let Some(after) = metadata.lds_idx_after_ddc.get_mut(&old_last) {
+        *after = new_last;
+    } else {
+        for after in metadata.lds_idx_after_ddc.values_mut() {
+            if *after == old_last {
+                *after = new_last;
+            }
+        }
+    }
+
+    new_recorded
+}
 
 #[cfg(test)]
 mod tests_e110_e117 {
@@ -1447,5 +1674,376 @@ mod tests_e110_e117 {
 
         let name = NodeName("block0".to_string());
         assert_eq!(get_node_description(UtilNode::Other(&name)), "block0");
+    }
+}
+
+#[cfg(test)]
+mod tests_e255_e257 {
+    // ⭐ TESTS FOR ENTRIES 255-257. Union this module with this file's other test modules when they
+    // land.
+    use super::*;
+
+    use sys_arch_spec::arch_enums::SenComponent;
+
+    use super::super::metadata::{Allocation, OpaqueOp};
+    use crate::generated::ComputeType;
+    use crate::schedule::dsc2::{DataInfo, Operand, OperandPos};
+    use crate::units::NumFolds;
+
+    /// THE ONE DATASTREAM THIS STAND-IN CALLS EXTERNAL — entry 120's answer, as the seam the port
+    /// asks through. Its key is the triple entry 255/256 hands over, so a port that passed
+    /// `Operand::storage` instead of `Operand::unit` cannot match it.
+    struct External(Option<(Option<DataConnect>, SenComponent, StreamDirection)>);
+
+    impl ExternalStreams for External {
+        fn storage_or_datastream_is_external(
+            &self,
+            data: DataInfo,
+            storage: SenComponent,
+            direction: StreamDirection,
+        ) -> bool {
+            self.0 == Some((data.data_connect, storage, direction))
+        }
+    }
+
+    /// An operand whose `unit_` and its `storage_` DIFFER, which is what puts the trap under test.
+    fn operand(connect: DataConnect, unit: SenComponent) -> Operand {
+        Operand {
+            unit,
+            storage: SenComponent::Hbm,
+            data: DataInfo {
+                data_connect: Some(connect),
+                my_lds_idx: Some(LdsIdx(1)),
+                constant_id: None,
+            },
+        }
+    }
+
+    fn compute() -> ComputeNode {
+        ComputeNode {
+            name: NodeName("c0".to_string()),
+            op: ComputeType::Macc,
+            ex_unit: SenComponent::Pe,
+            inputs: vec![
+                operand(DataConnect::ArfPt, SenComponent::Lx),
+                operand(DataConnect::ArfPtsum, SenComponent::L0),
+            ],
+            outputs: vec![operand(DataConnect::OuttensorToSfp, SenComponent::Ptxrf)],
+            num_folds_engaged: NumFolds::ONE,
+        }
+    }
+
+    #[test]
+    fn a_compute_input_is_related_to_external_nodes_through_its_own_component_as_the_storage() {
+        // The SECOND input's connect, its `inputs_` component, asked as an INCOMING stream.
+        let external = External(Some((
+            Some(DataConnect::ArfPtsum),
+            SenComponent::L0,
+            StreamDirection::Incoming,
+        )));
+        assert!(input_related_to_external_nodes(&external, &compute()));
+
+        // ⛔ THE TRAP: the same stream asked about the operand's `storage` answers NO, so a port that
+        // passed `Operand::storage` would report every compute unrelated.
+        let by_storage = External(Some((
+            Some(DataConnect::ArfPtsum),
+            SenComponent::Hbm,
+            StreamDirection::Incoming,
+        )));
+        assert!(!input_related_to_external_nodes(&by_storage, &compute()));
+
+        // And an OUTGOING answer never reaches the input side.
+        let outgoing = External(Some((
+            Some(DataConnect::ArfPtsum),
+            SenComponent::L0,
+            StreamDirection::Outgoing,
+        )));
+        assert!(!input_related_to_external_nodes(&outgoing, &compute()));
+    }
+
+    #[test]
+    fn a_compute_output_is_related_to_external_nodes_only_as_an_outgoing_stream() {
+        let external = External(Some((
+            Some(DataConnect::OuttensorToSfp),
+            SenComponent::Ptxrf,
+            StreamDirection::Outgoing,
+        )));
+        assert!(output_related_to_external_nodes(&external, &compute()));
+
+        // The output's own stream asked INCOMING is the input side's question, and the outputs are
+        // not asked it.
+        let incoming = External(Some((
+            Some(DataConnect::OuttensorToSfp),
+            SenComponent::Ptxrf,
+            StreamDirection::Incoming,
+        )));
+        assert!(!output_related_to_external_nodes(&incoming, &compute()));
+        // An input's stream is not an output's.
+        let on_an_input = External(Some((
+            Some(DataConnect::ArfPt),
+            SenComponent::Lx,
+            StreamDirection::Outgoing,
+        )));
+        assert!(!output_related_to_external_nodes(&on_an_input, &compute()));
+    }
+
+    /// ONE `labeledDs_` ENTRY — its name so a shifted list can be read back, its two indices, and the
+    /// allocations its `memOrg_` names.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestLds {
+        name: &'static str,
+        recorded: LdsIdx,
+        reference: Option<LdsIdx>,
+        mem_org: Vec<AllocId>,
+    }
+
+    impl LabeledDsEntry for TestLds {
+        fn recorded_lds_idx(&self) -> LdsIdx {
+            self.recorded
+        }
+
+        fn set_recorded_lds_idx(&mut self, recorded: LdsIdx) {
+            self.recorded = recorded;
+        }
+
+        fn set_reference_lds_idx(&mut self, reference: LdsIdx) {
+            self.reference = Some(reference);
+        }
+    }
+
+    /// A DSC WHOSE `labeledDs_` REFERENCES ARE HELD BY POSITION — `held` stands for
+    /// `computeOp_.inputLabeledDs` and `dataTransfers_.myDsInfo`, so the shift the insert owes them is
+    /// observable.
+    #[derive(Debug)]
+    struct TestDsc {
+        entries: Vec<TestLds>,
+        held: Vec<LdsIdx>,
+        allocs: BTreeMap<AllocId, Option<LdsIdx>>,
+        slots: Vec<(TreeLdsSlot, Option<LdsIdx>)>,
+        opaque: Vec<NodeId>,
+    }
+
+    impl NewLabeledDs for TestDsc {
+        type Entry = TestLds;
+
+        fn last_lds_pos(&self) -> LdsIdx {
+            LdsIdx(self.entries.len() as u32 - 1)
+        }
+
+        fn last_recorded_lds_idx(&self) -> LdsIdx {
+            self.entries[self.entries.len() - 1].recorded
+        }
+
+        fn set_last_recorded_lds_idx(&mut self, recorded: LdsIdx) {
+            let last = self.entries.len() - 1;
+            self.entries[last].recorded = recorded;
+        }
+
+        fn insert_lds_before_last(&mut self, entry: Self::Entry) {
+            let was_last = LdsIdx(self.entries.len() as u32 - 1);
+            self.entries.insert(was_last.0 as usize, entry);
+            // The entry that was last moved up one place; every other position kept its entry.
+            for held in &mut self.held {
+                if *held == was_last {
+                    *held = LdsIdx(was_last.0 + 1);
+                }
+            }
+        }
+
+        fn clear_mem_org(&mut self, pos: LdsIdx) {
+            if let Some(entry) = self.entries.get_mut(pos.0 as usize) {
+                entry.mem_org.clear();
+            }
+        }
+
+        fn mem_org_allocations(&self, pos: LdsIdx) -> Vec<AllocId> {
+            self.entries
+                .get(pos.0 as usize)
+                .map(|entry| entry.mem_org.clone())
+                .unwrap_or_default()
+        }
+
+        fn alloc_lds_idx(&self, alloc: AllocId) -> Option<LdsIdx> {
+            self.allocs.get(&alloc).copied().flatten()
+        }
+
+        fn set_alloc_lds_idx(&mut self, alloc: AllocId, lds: LdsIdx) {
+            self.allocs.insert(alloc, Some(lds));
+        }
+
+        fn tree_lds_slots(&self) -> Vec<(TreeLdsSlot, Option<LdsIdx>)> {
+            self.slots.clone()
+        }
+
+        fn set_tree_lds(&mut self, slot: TreeLdsSlot, lds: LdsIdx) {
+            for held in &mut self.slots {
+                if held.0 == slot {
+                    held.1 = Some(lds);
+                }
+            }
+        }
+
+        fn opaque_computes(&self) -> Vec<NodeId> {
+            self.opaque.clone()
+        }
+    }
+
+    fn lds(name: &'static str, recorded: u32, mem_org: Vec<AllocId>) -> TestLds {
+        TestLds {
+            name,
+            recorded: LdsIdx(recorded),
+            reference: None,
+            mem_org,
+        }
+    }
+
+    /// Three entries whose recorded indices ARE their positions, the output last — the shape every
+    /// callsite hands `addNewLds`.
+    fn dsc_of_three() -> TestDsc {
+        TestDsc {
+            entries: vec![
+                lds("in", 0, vec![AllocId(10)]),
+                lds("weight", 1, vec![AllocId(11)]),
+                lds("out", 2, vec![AllocId(12)]),
+            ],
+            held: vec![LdsIdx(0), LdsIdx(2)],
+            allocs: BTreeMap::from([
+                (AllocId(10), Some(LdsIdx(0))),
+                (AllocId(11), Some(LdsIdx(1))),
+                (AllocId(12), Some(LdsIdx(2))),
+                (AllocId(13), Some(LdsIdx(2))),
+            ]),
+            slots: vec![
+                (TreeLdsSlot::Allocate(NodeId(1)), Some(LdsIdx(2))),
+                (
+                    TreeLdsSlot::Compute(NodeId(2), OperandPos::Input(0)),
+                    Some(LdsIdx(1)),
+                ),
+                (
+                    TreeLdsSlot::Compute(NodeId(2), OperandPos::Output(0)),
+                    Some(LdsIdx(2)),
+                ),
+                (TreeLdsSlot::Transfer(NodeId(3), OperandPos::Input(0)), None),
+                (
+                    TreeLdsSlot::Transfer(NodeId(3), OperandPos::Output(1)),
+                    Some(LdsIdx(2)),
+                ),
+                (TreeLdsSlot::ParametricLoop(NodeId(4)), Some(LdsIdx(2))),
+            ],
+            opaque: vec![NodeId(2), NodeId(9)],
+        }
+    }
+
+    #[test]
+    fn a_new_lds_takes_the_last_index_and_every_holder_of_it_is_renamed_to_the_shifted_one() {
+        let mut dsc = dsc_of_three();
+        let mut metadata = Metadata {
+            opaque_ops: BTreeMap::from([
+                (
+                    NodeId(2),
+                    OpaqueOp {
+                        lds_idx: Some(LdsIdx(2)),
+                        ..OpaqueOp::default()
+                    },
+                ),
+                // A key the walk does not reach keeps its index.
+                (
+                    NodeId(7),
+                    OpaqueOp {
+                        lds_idx: Some(LdsIdx(2)),
+                        ..OpaqueOp::default()
+                    },
+                ),
+            ]),
+            new_allocations: BTreeMap::from([(
+                DdcMemory::Lx,
+                Allocation {
+                    lds_idx_and_alloc_node: BTreeMap::from([
+                        (LdsIdx(1), AllocId(11)),
+                        (LdsIdx(2), AllocId(12)),
+                    ]),
+                    cons_id_and_alloc_node: BTreeMap::new(),
+                    comp_and_alloc_node: BTreeMap::from([(NodeId(2), AllocId(13))]),
+                },
+            )]),
+            // ⛔ NO KEY for the old last index, so the ELSE branch remaps the VALUE naming it.
+            lds_idx_after_ddc: BTreeMap::from([(LdsIdx(0), LdsIdx(2)), (LdsIdx(1), LdsIdx(1))]),
+            ..Metadata::default()
+        };
+
+        let source = dsc.entries[0].clone();
+        assert_eq!(add_new_lds(&mut dsc, &mut metadata, &source), LdsIdx(2));
+
+        // The copy sits at position 2, carries the index the output had, and names its source; the
+        // output moved to position 3 with its index bumped.
+        assert_eq!(
+            dsc.entries
+                .iter()
+                .map(|entry| (entry.name, entry.recorded, entry.reference))
+                .collect::<Vec<_>>(),
+            vec![
+                ("in", LdsIdx(0), None),
+                ("weight", LdsIdx(1), None),
+                ("in", LdsIdx(2), Some(LdsIdx(0))),
+                ("out", LdsIdx(3), None),
+            ]
+        );
+        // The copy's `memOrg_` was cleared, and the shifted output's allocations now name index 3.
+        assert!(dsc.entries[2].mem_org.is_empty());
+        assert_eq!(dsc.entries[3].mem_org, vec![AllocId(12)]);
+        assert_eq!(dsc.allocs[&AllocId(12)], Some(LdsIdx(3)));
+        // `compAndAllocNode`'s allocation is renamed too, while an untouched index stands.
+        assert_eq!(dsc.allocs[&AllocId(13)], Some(LdsIdx(3)));
+        assert_eq!(dsc.allocs[&AllocId(11)], Some(LdsIdx(1)));
+
+        // References held BY POSITION follow the entry that moved.
+        assert_eq!(dsc.held, vec![LdsIdx(0), LdsIdx(3)]);
+
+        // Every tree slot that named the old last index now names the new one; a `-1` stays absent.
+        assert_eq!(
+            dsc.slots.iter().map(|slot| slot.1).collect::<Vec<_>>(),
+            vec![
+                Some(LdsIdx(3)),
+                Some(LdsIdx(1)),
+                Some(LdsIdx(3)),
+                None,
+                Some(LdsIdx(3)),
+                Some(LdsIdx(3)),
+            ]
+        );
+
+        // The opaque op the walk reached is renamed; the one it did not is left alone.
+        assert_eq!(metadata.opaque_ops[&NodeId(2)].lds_idx, Some(LdsIdx(3)));
+        assert_eq!(metadata.opaque_ops[&NodeId(7)].lds_idx, Some(LdsIdx(2)));
+
+        // `newAllocations_` is re-keyed off the old index onto the new one.
+        assert_eq!(
+            metadata.new_allocations[&DdcMemory::Lx].lds_idx_and_alloc_node,
+            BTreeMap::from([(LdsIdx(1), AllocId(11)), (LdsIdx(3), AllocId(12))])
+        );
+
+        // The DDL interface's VALUE naming the old index is remapped.
+        assert_eq!(
+            metadata.lds_idx_after_ddc,
+            BTreeMap::from([(LdsIdx(0), LdsIdx(3)), (LdsIdx(1), LdsIdx(1))])
+        );
+    }
+
+    #[test]
+    fn a_ddl_interface_entry_keyed_by_the_old_index_takes_the_new_one_as_its_value() {
+        let mut dsc = dsc_of_three();
+        let mut metadata = Metadata {
+            // ⛔ THE KEY IS PRESENT, so ONLY its value moves and no other entry is remapped — even
+            // one whose value names the old index.
+            lds_idx_after_ddc: BTreeMap::from([(LdsIdx(2), LdsIdx(9)), (LdsIdx(0), LdsIdx(2))]),
+            ..Metadata::default()
+        };
+
+        let source = dsc.entries[0].clone();
+        assert_eq!(add_new_lds(&mut dsc, &mut metadata, &source), LdsIdx(2));
+        assert_eq!(
+            metadata.lds_idx_after_ddc,
+            BTreeMap::from([(LdsIdx(2), LdsIdx(3)), (LdsIdx(0), LdsIdx(2))])
+        );
     }
 }
