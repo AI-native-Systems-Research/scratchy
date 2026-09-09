@@ -99,7 +99,10 @@
 use core::fmt::Write as _;
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::islands::sentient::dialects::{self as dialects, Op, Val, sentient, symbol};
+use crate::islands::dataflow_ir::ty::GenericComp;
+use crate::islands::sentient::dialects::{
+    self as dialects, Definitions, Op, UniformRegions, Val, sentient, symbol, uniform,
+};
 use crate::islands::sentient::print;
 
 /// `InfluenceType` (`EnhancedDeadVariableElimination.hpp:42`) — what an SSA value's value decides.
@@ -209,6 +212,45 @@ pub(crate) struct InfluenceConflict {
     pub(crate) proposed: Influence,
 }
 
+/// WHICH TRANSFER OP TURNED UP IN A UNIT THAT CANNOT HOLD ONE — e301's four `emitError` arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Misplaced {
+    /// `sentient.load_and_send` outside `l0lu`/`lxlu`/`l3su`.
+    LoadAndSend,
+    /// `sentient.receive_and_store` outside `l0su`/`lxsu`/`l3lu`.
+    ReceiveAndStore,
+    /// `sentient.load_and_store` outside `l3su`/`l3lu`.
+    LoadAndStore,
+    /// `sentient.load_and_extract_scalar` outside `lxlu`.
+    LoadAndExtractScalar,
+}
+
+impl Misplaced {
+    /// The message the reference emitted (`EnhancedDeadVariableElimination.cpp:650`, `:679`, `:698`,
+    /// `:717` of the extract) — ⭐ A TABLE ON THE ENUM, as [`Influence::spelling`] is.
+    #[must_use]
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Misplaced::LoadAndSend => "Not expecting load_and_send in other units",
+            Misplaced::ReceiveAndStore => "Not expecting receive_and_store in other units",
+            Misplaced::LoadAndStore => "Not expecting load_and_store in other units",
+            Misplaced::LoadAndExtractScalar => {
+                "Not expecting load_and_extract_scalar in other units"
+            }
+        }
+    }
+}
+
+/// `op->emitError(..)` + `signalPassFailure()` AS DATA — the same shape as [`InfluenceConflict`], and
+/// for the same reason: the flag is the round, and keeping it as data says WHICH op and WHERE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MisplacedTransfer {
+    /// Which of the four ops, and so which message.
+    pub(crate) op: Misplaced,
+    /// `current_unit_type_` — the unit that cannot hold it.
+    pub(crate) unit: GenericComp,
+}
+
 /// `bool add` — whether the value also joins `worklist_`. The header's default is `true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorklistAdd {
@@ -227,6 +269,8 @@ pub(crate) struct EnhancedDeadVariableElimination {
     worklist: VecDeque<Val>,
     /// `signalPassFailure()`, as data.
     conflicts: Vec<InfluenceConflict>,
+    /// The other `signalPassFailure()` this pass makes — e301's misplaced transfers.
+    misplaced: Vec<MisplacedTransfer>,
 }
 
 impl EnhancedDeadVariableElimination {
@@ -300,6 +344,299 @@ impl EnhancedDeadVariableElimination {
     pub(crate) fn conflicts(&self) -> &[InfluenceConflict] {
         &self.conflicts
     }
+
+    /// Every transfer op found in a unit that cannot hold one — e301's other `signalPassFailure()`.
+    #[must_use]
+    pub(crate) fn misplaced(&self) -> &[MisplacedTransfer] {
+        &self.misplaced
+    }
+
+    /// [`Self::add_to_work_list_and_update_assignment`] with the value's own [`Origin`], which is
+    /// what e300 and e301 both have to supply — see [`origin_of`].
+    fn propagate(
+        &mut self,
+        val: Val,
+        influence: Influence,
+        add: WorklistAdd,
+        defs: Definitions<'_>,
+    ) {
+        if let Some(origin) = origin_of(val, defs) {
+            self.add_to_work_list_and_update_assignment(val, &origin, influence, add);
+        }
+    }
+
+    /// Replaces: e300_processWorkList
+    ///
+    /// Drains the worklist, handing each value's influence to whatever decides it: a loop iter arg to
+    /// the loop's init operand and its yield, an add/sub/copy result to its inputs, and a
+    /// region-carrying op's result to that result's position in EVERY region's yield.
+    ///
+    /// ⛔ TRAP: `DT_CHECK(val_index != -1)` is unwritable — `val` reached this arm BY having `def` as
+    /// its defining op, so [`dialects::results`] cannot fail to find it.
+    /// ⛔ TRAP: `val.getDefiningOp()` is NULL for a region argument of anything but a `sentient.for`,
+    /// and the reference's `isa<>` on it ASSERTS rather than answering false; this port records
+    /// nothing there.
+    pub(crate) fn process_work_list(&mut self, defs: Definitions<'_>) {
+        while let Some(val) = self.worklist.pop_front() {
+            let influence = self.influence_type(val);
+            // `getIndexOfLoopRegionIterArgs` (`Analyses/Utils.cpp:257-271`): position 0 is the
+            // induction variable, which is NOT an iter arg — hence the `-1` the reference returns.
+            let iter_arg = defs
+                .for_arg_of(val)
+                .and_then(|(for_op, at)| at.checked_sub(1).map(|index| (for_op, index)));
+            if let Some((Op::Sentient(sentient::Op::For { carried, body, .. }), index)) = iter_arg {
+                if let Some(init) = carried.get(index).map(|entry| entry.init) {
+                    self.propagate(init, influence, WorklistAdd::Push, defs);
+                }
+                if let Some(yielded) = terminator_operands(body).get(index).copied() {
+                    self.propagate(yielded, influence, WorklistAdd::Push, defs);
+                }
+                continue;
+            }
+            let Some(def) = defs.of(val) else { continue };
+            match def {
+                Op::Sentient(
+                    sentient::Op::ScalarAdd { lhs, rhs, .. }
+                    | sentient::Op::ScalarSub { lhs, rhs, .. },
+                ) => {
+                    let (lhs, rhs) = (*lhs, *rhs);
+                    self.propagate(lhs, influence, WorklistAdd::Push, defs);
+                    self.propagate(rhs, influence, WorklistAdd::Push, defs);
+                }
+                Op::Sentient(sentient::Op::ScalarCopy { input, .. }) => {
+                    let input = *input;
+                    self.propagate(input, influence, WorklistAdd::Push, defs);
+                }
+                // ⛔ THE RAISED SPELLING ONLY: `uniform.uniformize_regions` at THIS rung is
+                // [`Op::UniformRegions`], and the lower-rung [`Op::Uniform`] one carries a body of
+                // the rung below whose terminator is not one of this rung's values.
+                Op::Sentient(sentient::Op::For { .. } | sentient::Op::If { .. })
+                | Op::UniformRegions(UniformRegions::UniformizeRegions { .. }) => {
+                    let Some(at) = dialects::results(def)
+                        .iter()
+                        .position(|result| *result == val)
+                    else {
+                        continue;
+                    };
+                    for region in dialects::regions_ref(def) {
+                        if let Some(yielded) = terminator_operands(region).get(at).copied() {
+                            self.propagate(yielded, influence, WorklistAdd::Push, defs);
+                        }
+                    }
+                    if let Op::Sentient(sentient::Op::For { carried, .. }) = def {
+                        if let Some(arg) = carried.get(at).map(|entry| entry.arg) {
+                            self.propagate(arg, influence, WorklistAdd::Push, defs);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Replaces: e301_initializeAssignmentForAnOperation
+    ///
+    /// Seeds the worklist from one op: a compute op's mask and XRF pointers and every transfer's
+    /// address, increment and peer operands influence MEMORY, while a loop's induction variable and
+    /// non-constant bound and a `sentient.if`'s two comparands influence CONTROL FLOW.
+    ///
+    /// ⛔ TRAP: the four `emitError` + `signalPassFailure()` arms become [`MisplacedTransfer`]
+    /// records, so the port says which op sat in the wrong unit instead of refusing.
+    /// ⛔ TRAP: both `DT_CHECK`s on `current_unit_type_` — a MAC outside PT/SFP/PE, a
+    /// `load_compute_and_send` outside LXLU — record nothing and gate nothing, so this port is total
+    /// and seeds the operands regardless.
+    /// ⛔ TRAP: `sentient.vector_ternary`'s `$mask` is OPTIONAL and the reference hands it over
+    /// unguarded, where the MAC's is guarded by `if (mask)`; an absent one seeds nothing here.
+    pub(crate) fn initialize_assignment_for_an_operation(
+        &mut self,
+        op: &Op,
+        unit: GenericComp,
+        defs: Definitions<'_>,
+    ) {
+        let memory = |this: &mut Self, val: Val| {
+            this.propagate(val, Influence::Memory, WorklistAdd::Push, defs);
+        };
+        match op {
+            Op::Sentient(sentient::Op::VectorMac {
+                mask,
+                xrf_write_ptr,
+                xrf_read_ptr,
+                ..
+            }) => {
+                // ⭐ PT masking is not connected to individual MACs at SentientIR, which is why the
+                // mask is the one operand guarded here.
+                for val in mask.iter().chain(xrf_write_ptr).chain(xrf_read_ptr) {
+                    memory(self, *val);
+                }
+            }
+            Op::Sentient(
+                sentient::Op::VectorBinary { mask, .. } | sentient::Op::VectorUnary { mask, .. },
+            ) => memory(self, *mask),
+            Op::Sentient(sentient::Op::VectorTernary { mask, .. }) => {
+                if let Some(mask) = mask {
+                    memory(self, *mask);
+                }
+            }
+            Op::Sentient(sentient::Op::SetMask { mask_value, .. }) => memory(self, *mask_value),
+            Op::Sentient(sentient::Op::For { iv, bound, .. }) => {
+                // ⭐ `add = false`: the induction variable is recorded but never explored.
+                self.propagate(*iv, Influence::ControlFlow, WorklistAdd::RecordOnly, defs);
+                if !matches!(
+                    defs.of(*bound),
+                    Some(Op::Sentient(sentient::Op::ScalarConstant { .. }))
+                ) {
+                    self.propagate(*bound, Influence::ControlFlow, WorklistAdd::Push, defs);
+                }
+            }
+            Op::Sentient(sentient::Op::If { lhs, rhs, .. }) => {
+                self.propagate(*lhs, Influence::ControlFlow, WorklistAdd::Push, defs);
+                self.propagate(*rhs, Influence::ControlFlow, WorklistAdd::Push, defs);
+            }
+            Op::Sentient(sentient::Op::LoadAndSend {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                consumer,
+                ..
+            }) => {
+                if matches!(
+                    unit,
+                    GenericComp::L0lu | GenericComp::Lxlu | GenericComp::L3su
+                ) {
+                    for val in [*mutable_addr, *immutable_addr, *increment, consumer.val()] {
+                        memory(self, val);
+                    }
+                } else {
+                    self.misplaced.push(MisplacedTransfer {
+                        op: Misplaced::LoadAndSend,
+                        unit,
+                    });
+                }
+            }
+            Op::Sentient(sentient::Op::ReceiveAndStore {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                producer,
+                multicast_info,
+                ..
+            }) => {
+                if matches!(
+                    unit,
+                    GenericComp::L0su | GenericComp::Lxsu | GenericComp::L3lu
+                ) {
+                    for val in [*mutable_addr, *immutable_addr, *increment, producer.val()] {
+                        memory(self, val);
+                    }
+                    if let Some(multicast) = multicast_info {
+                        memory(self, *multicast);
+                    }
+                } else {
+                    self.misplaced.push(MisplacedTransfer {
+                        op: Misplaced::ReceiveAndStore,
+                        unit,
+                    });
+                }
+            }
+            Op::Sentient(sentient::Op::LoadAndStore {
+                src_mutable_addr,
+                src_immutable_addr,
+                src_inc,
+                dst_mutable_addr,
+                dst_immutable_addr,
+                dst_inc,
+                multicast_info,
+                ..
+            }) => {
+                if matches!(unit, GenericComp::L3su | GenericComp::L3lu) {
+                    for val in [
+                        *src_mutable_addr,
+                        *dst_mutable_addr,
+                        *src_immutable_addr,
+                        *dst_immutable_addr,
+                        *src_inc,
+                        *dst_inc,
+                    ] {
+                        memory(self, val);
+                    }
+                    if let Some(multicast) = multicast_info {
+                        memory(self, *multicast);
+                    }
+                } else {
+                    self.misplaced.push(MisplacedTransfer {
+                        op: Misplaced::LoadAndStore,
+                        unit,
+                    });
+                }
+            }
+            Op::Sentient(sentient::Op::LoadAndExtractScalar {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                consumer,
+                ..
+            }) => {
+                if matches!(unit, GenericComp::Lxlu) {
+                    for val in [*mutable_addr, *immutable_addr, *increment, consumer.val()] {
+                        memory(self, val);
+                    }
+                } else {
+                    self.misplaced.push(MisplacedTransfer {
+                        op: Misplaced::LoadAndExtractScalar,
+                        unit,
+                    });
+                }
+            }
+            Op::Sentient(sentient::Op::LoadComputeAndSend {
+                mutable_addr,
+                immutable_addr,
+                increment,
+                consumer,
+                ..
+            }) => {
+                for val in [*mutable_addr, *immutable_addr, *increment, consumer.val()] {
+                    memory(self, val);
+                }
+            }
+            Op::Sentient(sentient::Op::Splat { input, .. }) => memory(self, *input),
+            _ => {}
+        }
+    }
+}
+
+/// WHERE A VALUE COMES FROM, READ OUT OF THE CALLER'S SCOPE — the `getDefiningOp()` /
+/// `getOwner()->getParentOp()` split [`Origin`] records and e300/e301 must therefore supply.
+///
+/// ⛔ `None` WHERE THE SCOPE BINDS IT NOWHERE, including a `uniform.uniformize_regions` region
+/// argument: this island names that parent only through its unit list, and there is no op to blame.
+#[must_use]
+fn origin_of(val: Val, defs: Definitions<'_>) -> Option<Origin> {
+    if let Some(def) = defs.of(val) {
+        return Some(Origin::Defined(def.clone()));
+    }
+    if defs.program_unit_units_of(val).is_some() {
+        return Some(Origin::ProgramUnitArg);
+    }
+    defs.for_arg_of(val)
+        .map(|(for_op, _)| Origin::RegionArg(for_op.clone()))
+}
+
+/// `region.front().getTerminator()`'s OPERANDS, at either rung's spelling of a yield.
+///
+/// ⛔ EMPTY, NOT A PANIC, FOR A REGION WITH NO TERMINATOR — a `sentient.if` always has two regions
+/// and its else region is routinely EMPTY, where `front().getTerminator()` hands the reference a null
+/// `Operation *`.
+#[must_use]
+fn terminator_operands(region: &[Op]) -> Vec<Val> {
+    region
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            Op::Sentient(sentient::Op::Yield { results }) => Some(results.clone()),
+            Op::Uniform(uniform::Op::Yield { operands }) => Some(operands.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Replaces: e043_removeConstantIterArgs
@@ -436,16 +773,6 @@ fn constant_iter_arg(for_op: &Op, i: usize) -> Option<(Val, Val, Val)> {
     (*yielded.get(i)? == carried.arg).then_some((carried.arg, carried.init, carried.result))
 }
 
-// crustify:todo: e300_processWorkList
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:460  (53 body lines, level 1)
-//   original  : void EnhancedDeadVariableEliminationPass::processWorkList()
-//   calls     : e040_addToWorkListAndUpdateAssignment
-
-// crustify:todo: e301_initializeAssignmentForAnOperation
-//   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:525  (147 body lines, level 1)
-//   original  : void EnhancedDeadVariableEliminationPass::initializeAssignmentForAnOperation( Operation *op)
-//   calls     : e040_addToWorkListAndUpdateAssignment
-
 // crustify:todo: e437_initializeWorkList
 //   authority : dcc/src/Transform/Sentient/EnhancedDeadVariableElimination.cpp:685  (4 body lines, level 2)
 //   original  : void EnhancedDeadVariableEliminationPass::initializeWorkList()
@@ -494,8 +821,13 @@ fn constant_iter_arg(for_op: &Op, i: usize) -> Option<(Val, Val, Val)> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arch::Elements;
+    use crate::formats::Bits;
+    use crate::islands::dataflow_ir::link::SendEnd;
     use crate::islands::dataflow_ir::ty::ScalarTy;
-    use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegType};
+    use crate::islands::sentient::dialects::sentient::{
+        Carried, Extent, Reg, RegType, ShuffleMode,
+    };
 
     /// `%r = sentient.scalar_constant {value = <value>}`.
     fn constant(result: Val, value: i64) -> Op {
@@ -639,6 +971,118 @@ mod unit_tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[1], "influence: memory");
         assert_eq!(lines[3], "influence: controlflow");
+    }
+
+    /// e300 — a loop result carries its influence to the loop's yield operand AND to the matching
+    /// iter arg, and that arg then carries it on to the loop's init operand.
+    #[test]
+    fn the_work_list_walks_a_loop_result_back_to_its_init() {
+        let scope = vec![
+            constant(Val(10), 4),
+            nop(),
+            for_op(
+                30,
+                31,
+                vec![carried(10, 11, 12)],
+                vec![
+                    Op::Sentient(sentient::Op::ScalarAdd {
+                        lhs: Val(11),
+                        rhs: Val(10),
+                        result: Val(13),
+                        reg: None,
+                        element_size: None,
+                        ty: ScalarTy::Index,
+                    }),
+                    yield_op(vec![Val(13)]),
+                ],
+            ),
+        ];
+        let regions: Vec<&[Op]> = vec![&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let mut pass = EnhancedDeadVariableElimination::default();
+        pass.add_to_work_list_and_update_assignment(
+            Val(12),
+            &Origin::Defined(scope[2].clone()),
+            Influence::Memory,
+            WorklistAdd::Push,
+        );
+
+        pass.process_work_list(defs);
+
+        // %12 -> the yielded %13 and the iter arg %11; %13 -> its two operands %11 and %10; %11 -> the
+        // init %10. Nothing else, and no disagreement anywhere.
+        assert_eq!(
+            pass.assignments.keys().copied().collect::<Vec<Val>>(),
+            vec![Val(10), Val(11), Val(12), Val(13)]
+        );
+        assert_eq!(pass.influence_type(Val(10)), Influence::Memory);
+        assert!(pass.conflicts().is_empty());
+    }
+
+    /// e301 — a `load_and_send`'s four operands seed MEMORY where the unit can hold one, and the same
+    /// op in a store unit seeds nothing and records the misplacement instead.
+    #[test]
+    fn a_transfer_seeds_memory_only_in_a_unit_that_can_hold_it() {
+        let send = Op::Sentient(sentient::Op::LoadAndSend {
+            mutable_addr: Val(1),
+            immutable_addr: Val(2),
+            increment: Val(3),
+            consumer: SendEnd::to_self(Val(4)),
+            result: Val(5),
+            extent: Extent::of(Elements(1), Bits(32)),
+            interleaved_group: Elements(1),
+            rotate_val: None,
+            dir: None,
+            shuffle_mode: ShuffleMode::NoShuffle,
+            reg: Reg {
+                locale: RegType::Unknown,
+                index: None,
+            },
+            dbg_name: None,
+        });
+        // Every operand is defined by a `sentient.nop`, so each one has an origin to blame.
+        let scope: Vec<Op> = vec![
+            Op::Sentient(sentient::Op::ScalarCopy {
+                input: Val(0),
+                result: Val(1),
+                reg: Reg {
+                    locale: RegType::Unknown,
+                    index: None,
+                },
+                element_size: None,
+                program_header: false,
+            }),
+            constant(Val(2), 0),
+            constant(Val(3), 1),
+            constant(Val(4), 2),
+            send.clone(),
+        ];
+        let regions: Vec<&[Op]> = vec![&scope];
+        let defs = Definitions::from_innermost(&regions);
+
+        let mut lxlu = EnhancedDeadVariableElimination::default();
+        lxlu.initialize_assignment_for_an_operation(&send, GenericComp::Lxlu, defs);
+        assert_eq!(
+            lxlu.assignments.keys().copied().collect::<Vec<Val>>(),
+            vec![Val(1), Val(2), Val(3), Val(4)]
+        );
+        assert_eq!(lxlu.influence_type(Val(4)), Influence::Memory);
+        assert!(lxlu.misplaced().is_empty());
+
+        let mut lxsu = EnhancedDeadVariableElimination::default();
+        lxsu.initialize_assignment_for_an_operation(&send, GenericComp::Lxsu, defs);
+        assert!(lxsu.assignments.is_empty());
+        assert_eq!(
+            lxsu.misplaced(),
+            [MisplacedTransfer {
+                op: Misplaced::LoadAndSend,
+                unit: GenericComp::Lxsu,
+            }]
+        );
+        assert_eq!(
+            lxsu.misplaced()[0].op.message(),
+            "Not expecting load_and_send in other units"
+        );
     }
 
     #[test]

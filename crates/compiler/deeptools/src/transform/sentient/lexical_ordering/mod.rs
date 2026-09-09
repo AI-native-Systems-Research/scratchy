@@ -87,10 +87,12 @@
 
 use crate::arch::Arch;
 use crate::islands::dataflow_ir::dialects as lower;
+use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
 use crate::islands::dataflow_ir::ty::ScalarTy;
-use crate::islands::sentient::Program;
-use crate::islands::sentient::dialects::{self, Op, Val, arith, sentient};
+use crate::islands::sentient::dialects::{self, Definitions, Op, Val, arith, sentient};
+use crate::islands::sentient::{Program, Run};
 use crate::model::Model;
+use crate::units::Residency;
 use crate::workload::Workload;
 
 /// THE FUNCTION'S ENTRY BLOCK — `func.getBody().front()`, the one block a constant is hoisted INTO.
@@ -487,15 +489,101 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
     }
 }
 
-// crustify:todo: e302_matchAndRewrite
-//   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:50  (40 body lines, level 1)
-//   original  : LogicalResult matchAndRewrite(uniform::DefImmutableMappingOp op, PatternRewriter& rewriter) const override
-//   calls     : e252_size
+/// WHAT `less_than` COMPARES — one `dataflow.get_unit` key's place in the lexical order.
+///
+/// ⛔ THE `type` ATTRIBUTE IS THE FIRST TERM AND IT IS A STRING. `getType()` on a `get_unit` is the
+/// generated `$type` StrAttr accessor, not a result type — `get_unit`'s results are `Variadic<Index>`
+/// so ODS generates no result-type getter — and `StringRef::operator<` is lexicographic over exactly
+/// [`crate::units::DfirUnit::spelling`].
+/// ⛔ `getResultNumber()` IS NOT A TERM HERE: this island's `dataflow.get_unit` binds ONE `result`, so
+/// the reference's last tie-break is always `0 < 0` and the second `DT_CHECK_MSG` is unreachable once
+/// the first cast succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct UnitKey {
+    /// `unit_op.getType()`.
+    ty: &'static str,
+    /// `dcc::getCoreId` — the `core` attribute, or `-1` where the unit carries none
+    /// (`Utils/DccExtContext.cpp:78-87`).
+    core: i32,
+    /// `dcc::getCoreletId` — the `corelet` attribute, or `-1` (`:115-124`).
+    corelet: i32,
+}
 
-// crustify:todo: e303_runOn
-//   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:203  (8 body lines, level 1)
-//   original  : void runOn(ModuleOp module_op)
-//   calls     : e051_runOn
+/// ONE MAPPING KEY'S [`UnitKey`] — `None` where it is not a `dataflow.get_unit`, which is the
+/// `DT_CHECK_MSG(unit_op_a && unit_op_b, ..)` the reference makes of that case.
+#[must_use]
+fn unit_key(key: Val, defs: Definitions<'_>) -> Option<UnitKey> {
+    let Some(Op::Dataflow(dataflow::Op::GetUnit {
+        residency, unit, ..
+    })) = defs.of(key)
+    else {
+        return None;
+    };
+    // The two attributes `createGetUnitOp` writes, read back off the residency that decides them.
+    let (core, corelet) = match residency {
+        Residency::Global => (-1, -1),
+        Residency::Scratchpad { core } => (i32::try_from(core.get()).unwrap_or(-1), -1),
+        Residency::CoreWide { core } => (i32::try_from(core.get()).unwrap_or(-1), 0),
+        Residency::Corelet { core, corelet } => (
+            i32::try_from(core.get()).unwrap_or(-1),
+            i32::try_from(corelet.get()).unwrap_or(-1),
+        ),
+    };
+    Some(UnitKey {
+        ty: unit.spelling(),
+        core,
+        corelet,
+    })
+}
+
+/// WHETHER ONE RUN OF THE PATTERN APPLIED — `LogicalResult` as data, as `ToggleDuplication` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reordered {
+    /// `success()` — the keys were out of order and the op now carries them sorted.
+    Sorted,
+    /// `failure()` — already sorted, so the pattern does not apply.
+    AlreadySorted,
+}
+
+/// Replaces: e302_matchAndRewrite
+///
+/// Sorts a `uniform.def_immutable_mapping`'s key/value pairs by unit type, then core, then corelet.
+///
+/// ⛔ AN IN-PLACE REORDER WHERE THE REFERENCE CALLS `replaceOpWithNewOp`, and that is the whole
+/// difference: the rebuilt op has the same result types and the same pairs in a new order, so the
+/// rewriter's implied `replaceAllUsesWith` is an identity and the surviving `result` is this one.
+/// ⛔ THE PERMUTATION SORT IS STABLE WHERE `std::sort` IS NOT, which decides the order of two keys
+/// with the same unit, core and corelet — a case the reference's second `DT_CHECK_MSG` calls
+/// "redundant keys".
+/// ⛔ A KEY THAT IS NOT A `dataflow.get_unit` SORTS FIRST rather than asserting.
+pub(crate) fn order_mapping_keys_lexically(op: &mut Op, defs: Definitions<'_>) -> Reordered {
+    let Op::Uniform(uniform::Op::DefImmutableMapping { pairs, .. }) = op else {
+        return Reordered::AlreadySorted;
+    };
+    let keys: Vec<Option<UnitKey>> = pairs.iter().map(|(key, _)| unit_key(*key, defs)).collect();
+    // `std::is_sorted(keys.begin(), keys.end(), less_than)` — no adjacent pair out of order.
+    if keys.windows(2).all(|adjacent| adjacent[0] <= adjacent[1]) {
+        return Reordered::AlreadySorted;
+    }
+    let mut indices: Vec<usize> = (0..pairs.len()).collect();
+    indices.sort_by_key(|at| keys[*at]);
+    let ordered: Vec<(Val, Val)> = indices.iter().map(|at| pairs[*at]).collect();
+    *pairs = ordered;
+    Reordered::Sorted
+}
+
+/// Replaces: e303_runOn
+///
+/// Runs the constant hoist on every function of the module.
+///
+/// ⛔ `WalkResult::skip()` — *"no nested functions"* — IS A FACT ABOUT THE ISLAND HERE: a [`Run`] is a
+/// FLAT list of programs, one `func.func` each, so there is no nested function for a pre-order walk to
+/// reach and nothing to skip past.
+pub(crate) fn run_on_module<A: Arch, M: Model, W: Workload>(run: &mut Run<A, M, W>) {
+    for program in &mut run.programs {
+        run_on_program(program);
+    }
+}
 
 // crustify:todo: e439_runOnOperation
 //   authority : dcc/src/Transform/Sentient/LexicalOrdering.cpp:99  (12 body lines, level 2)
@@ -504,16 +592,20 @@ pub(crate) fn run_on_program<A: Arch, M: Model, W: Workload>(program: &mut Progr
 
 #[cfg(test)]
 mod unit_tests {
-    use super::run_on_program;
+    use super::{
+        Definitions, Reordered, order_mapping_keys_lexically, run_on_module, run_on_program,
+    };
     use crate::arch::Dd2;
     use crate::generated::OpFunc;
+    use crate::islands::dataflow_ir::KernelName;
     use crate::islands::dataflow_ir::dialects::arith::IntBinary;
+    use crate::islands::dataflow_ir::dialects::{dataflow, uniform};
     use crate::islands::dataflow_ir::ty::ScalarTy;
     use crate::islands::dataflow_ir::{GroupId, OpIndex, ProgramName, Units};
     use crate::islands::sentient::dialects::{Op, Val, arith, sentient};
-    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits};
+    use crate::islands::sentient::{Program, ProgramUnit, ProgramUnits, Run};
     use crate::model::Model;
-    use crate::units::DfirUnit;
+    use crate::units::{Core, Corelet, DfirUnit, Residency};
     use crate::workload::Workload;
 
     /// A model, so the program is typed; nothing here reads it.
@@ -626,5 +718,74 @@ mod unit_tests {
         run_on_program(&mut program);
 
         assert_eq!(program, before);
+    }
+
+    /// `%r = dataflow.get_unit {type, core, corelet} : index`.
+    fn get_unit(result: u32, unit: DfirUnit, residency: Residency) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency,
+            unit,
+            num_folds: None,
+        })
+    }
+
+    /// One core, and one of its corelets.
+    fn corelet(core: u32, corelet: u32) -> Residency {
+        Residency::Corelet {
+            core: Core::checked(core).unwrap_or_else(|| unreachable!("core 0 exists")),
+            corelet: Corelet::checked(corelet).unwrap_or_else(|| unreachable!("corelet 0 exists")),
+        }
+    }
+
+    /// e302 — the pairs come out ordered by unit type, then core, then corelet, values carried along;
+    /// and the same mapping a second time is already sorted.
+    #[test]
+    fn mapping_keys_are_sorted_by_unit_then_core_then_corelet() {
+        let scope = vec![
+            get_unit(1, DfirUnit::Sfp, corelet(0, 1)),
+            get_unit(2, DfirUnit::Lxlu, corelet(0, 0)),
+            get_unit(3, DfirUnit::Sfp, corelet(0, 0)),
+        ];
+        let regions: Vec<&[Op]> = vec![&scope];
+        let defs = Definitions::from_innermost(&regions);
+        let mut op = Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: Val(10),
+            pairs: vec![(Val(1), Val(20)), (Val(2), Val(21)), (Val(3), Val(22))],
+        });
+
+        assert_eq!(
+            order_mapping_keys_lexically(&mut op, defs),
+            Reordered::Sorted
+        );
+        assert_eq!(
+            op,
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(10),
+                // `lxlu` before `sfp`, then corelet 0 before corelet 1.
+                pairs: vec![(Val(2), Val(21)), (Val(3), Val(22)), (Val(1), Val(20))],
+            })
+        );
+        assert_eq!(
+            order_mapping_keys_lexically(&mut op, defs),
+            Reordered::AlreadySorted
+        );
+    }
+
+    /// e303 — every program of the run is hoisted, not just the first.
+    #[test]
+    fn the_module_walk_hoists_each_program() {
+        let mut run = Run {
+            kernel: KernelName(GroupId(0)),
+            programs: vec![
+                program_of(Vec::new(), vec![index_const(1, 5), adds(2, 1)]),
+                program_of(Vec::new(), vec![scalar_const(3, 7), adds(4, 3)]),
+            ],
+        };
+
+        run_on_module(&mut run);
+
+        assert_eq!(run.programs[0].preamble, vec![index_const(1, 5)]);
+        assert_eq!(run.programs[1].preamble, vec![scalar_const(3, 7)]);
     }
 }

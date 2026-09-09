@@ -826,13 +826,48 @@ pub fn erase_defining_op(scope: &mut Vec<Op>, val: Val) {
 #[derive(Debug, Clone, Copy)]
 pub struct Definitions<'a> {
     regions: &'a [&'a [Op]],
+    /// THE ENCLOSING `dataflow.program_unit`'S `iter_arg` AND `$units`, when the innermost region is
+    /// one's body — the third parent form [`uniform_mapping_keys`] tests for, supplied by the caller
+    /// like the rest of this type. `None` outside a program unit, where no [`Val`] can be that
+    /// argument.
+    program_unit: Option<(Val, &'a [Val])>,
 }
 
 impl<'a> Definitions<'a> {
     /// THE ENCLOSING REGIONS, INNERMOST FIRST.
     #[must_use]
     pub const fn from_innermost(regions: &'a [&'a [Op]]) -> Definitions<'a> {
-        Definitions { regions }
+        Definitions {
+            regions,
+            program_unit: None,
+        }
+    }
+
+    /// THE SAME, PLUS THE `dataflow.program_unit` WHOSE BODY THE INNERMOST REGION IS — its
+    /// `iter_arg : %arg0 -> (%l1lu0, %l1lu1)` (`Dataflow.td:103`).
+    ///
+    /// ⭐ THE ARGUMENT IS A PARAMETER BECAUSE NEITHER [`dataflow::Op::ProgramUnit`] NOR
+    /// [`crate::islands::sentient::ProgramUnit`] CARRIES ONE, and adding the field would touch every
+    /// construction site and the printed form. It is the same "mechanism supplied by the caller"
+    /// this type is built on; see [`uniform_mapping_keys`].
+    #[must_use]
+    pub const fn within_program_unit(
+        regions: &'a [&'a [Op]],
+        arg: Val,
+        units: &'a [Val],
+    ) -> Definitions<'a> {
+        Definitions {
+            regions,
+            program_unit: Some((arg, units)),
+        }
+    }
+
+    /// `prog_unit_op.getUnits()` FOR A VALUE THAT IS ITS `iter_arg` — `None` for anything else, and
+    /// always `None` when the walk was not told which program unit it is inside.
+    #[must_use]
+    pub fn program_unit_units_of(&self, val: Val) -> Option<&'a [Val]> {
+        self.program_unit
+            .and_then(|(arg, units)| (arg == val).then_some(units))
     }
 
     /// `Value::getDefiningOp()` — the first enclosing region that binds it.
@@ -1592,9 +1627,12 @@ pub fn uniform_mapping_keys(key: Val, defs: Definitions<'_>) -> Vec<Val> {
         // — ⭐ THE KEY ITSELF, not the unit list of anything (`:187-190`).
         Some(Op::Dataflow(dataflow::Op::GetUnit { .. })) => vec![key],
         Some(_) => Vec::new(),
-        // No defining op: a block argument, so the parent op's unit list for that region.
+        // No defining op: a block argument, so the parent op's unit list — a local region's
+        // (`:156-176`), or ⭐ THE ENCLOSING `dataflow.program_unit`'S `$units` (`:180-186`), which is
+        // the third parent form and the one [`Definitions::within_program_unit`] supplies.
         None => defs
             .uniform_region_units_of(key)
+            .or_else(|| defs.program_unit_units_of(key))
             .map_or_else(Vec::new, |units| collect_unit_ops(units, defs)),
     }
 }
@@ -1610,13 +1648,14 @@ pub fn uniform_mapping_keys(key: Val, defs: Definitions<'_>) -> Vec<Val> {
 /// the key list when a unit has no entry — which is why its sibling `getValuesFromKeys`, which keeps
 /// the holes as `std::nullopt`, exists separately.
 ///
-/// ⚠️ ONE ARM OF THE KEY WALK IS AN ISLAND GAP: a key bound as the region argument of a
-/// `dataflow.program_unit`, whose keys are `prog_unit_op.getUnits()` (`Utils.cpp:180-186`). This
-/// island's [`dataflow::Op::ProgramUnit`] and [`crate::islands::sentient::ProgramUnit`] carry no
-/// region argument at all — `iter_arg : %arg0 -> (%l1lu0, %l1lu1)` (`Dataflow.td:103`) is the form
-/// that binds one — so no [`Val`] can BE that argument here and the arm is unreachable rather than
-/// wrong. It answers with the empty list, which is the reference's own `key_vals` when none of the
-/// three parent forms matches (`:154-190`).
+/// ⭐ THE THIRD PARENT ARM — a key bound as the region argument of a `dataflow.program_unit`, whose
+/// keys are `prog_unit_op.getUnits()` (`Utils.cpp:180-186`) — IS THE CALLER'S TO SUPPLY, through
+/// [`Definitions::within_program_unit`]. Neither [`dataflow::Op::ProgramUnit`] nor
+/// [`crate::islands::sentient::ProgramUnit`] carries the `iter_arg : %arg0 -> (%l1lu0, %l1lu1)`
+/// (`Dataflow.td:103`) that binds it, so a walk built with [`Definitions::from_innermost`] answers
+/// the empty list — the reference's own `key_vals` when none of the three parent forms matches
+/// (`:154-190`). ⛔ IT WAS AN ISLAND GAP UNTIL e297 NEEDED IT: that unit's query-map walk asks
+/// exactly this question of the program unit's own argument.
 #[must_use]
 pub fn uniform_mapping_values(map: Val, key: Val, defs: Definitions<'_>) -> Vec<Val> {
     let keys = uniform_mapping_keys(key, defs);
@@ -1632,4 +1671,98 @@ pub fn uniform_mapping_values(map: Val, key: Val, defs: Definitions<'_>) -> Vec<
                 .map(|(_, value)| *value)
         })
         .collect()
+}
+
+/// EVERY `dataflow.create_group` IN A UNIT LIST REPLACED BY ITS MEMBERS —
+/// `dcc::uniform::utils::expandAllGroupsToUnits` (`dcc/src/Dialect/Uniform/Utils.cpp:1150-1162`).
+///
+/// ⛔ NOT [`collect_unit_ops`], THOUGH THEY READ THE SAME TWO OPS. That one STOPS at the first value
+/// that is neither (`Utils.cpp:107-114`); this one keeps a value it cannot expand, so the list keeps
+/// its length wherever no group appears in it. e297 compares the result against a program unit's own
+/// `$units` by size, so a truncating walk would decline every extraction.
+pub fn expand_all_groups_to_units(units: &mut Vec<Val>, defs: Definitions<'_>) {
+    let mut pure = Vec::with_capacity(units.len());
+    for unit in units.iter() {
+        match defs.of(*unit) {
+            Some(Op::Dataflow(dataflow::Op::CreateGroup { unit_ids, .. })) => {
+                pure.extend(unit_ids.iter().copied());
+            }
+            _ => pure.push(*unit),
+        }
+    }
+    *units = pure;
+}
+
+/// HOW MANY REGIONS A LOCAL-REGION OP HAS, AT EITHER RUNG — `local_op->getNumRegions()` for the two
+/// ops `uniform.uniformize_regions` and `uniform.equalize_pattern`, and `None` for anything else,
+/// which is the pair of failed `dyn_cast`s every caller opens with.
+#[must_use]
+pub fn local_region_count(op: &Op) -> Option<usize> {
+    match op {
+        Op::UniformRegions(regions) => Some(regions.regions().len()),
+        Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. }
+            | uniform::Op::EqualizePattern { regions },
+        ) => Some(regions.len()),
+        _ => None,
+    }
+}
+
+/// PULL A ONE-REGION LOCAL REGION'S BODY OUT INTO THE BLOCK THAT HOLDS IT —
+/// `dcc::uniform::utils::extractOpFromLocalRegion` (`dcc/src/Dialect/Uniform/Utils.cpp:1110-1147`).
+///
+/// The region's argument is rewired onto the program unit's own, the `uniform.yield` is dropped, and
+/// each of the op's results is rewired onto the value that region yielded at that position.
+///
+/// ⛔ A MOVE WHERE THE REFERENCE CLONES-THEN-ERASES, so its `op.getResult(i).replaceAllUsesWith(
+/// new_op->getResult(i))` (`:1138`) is an identity here and only the two rewires above are owed. The
+/// reference's caller erases the op afterwards (e297's `to_be_deleted`); this does it in one step,
+/// which is what makes the reference's reverse-order erase unnecessary — see e297's own note.
+///
+/// ⛔ THE REWIRES ADDRESS `block` AND THAT IS EXACT, not approximate: a region argument is visible
+/// only inside its region, whose ops are now in `block`, and the op's results are visible only in the
+/// block that held the op. ⭐ A NO-OP FOR ANYTHING BUT A ONE-REGION LOCAL REGION, which is the
+/// `DT_CHECK(uniform_op || eq_pattern_op)` and `DT_CHECK(local_op->getNumRegions() == 1)` (`:1116`,
+/// `:1119`) as a fact about what there is to extract.
+pub fn extract_op_from_local_region(block: &mut Vec<Op>, at: usize, prog_unit_arg: Val) {
+    if block.get(at).and_then(local_region_count) != Some(1) {
+        return;
+    }
+    // The region, at whichever rung its body has reached — one shape, two element types.
+    let (arg, body, results) = match &block[at] {
+        Op::UniformRegions(regions) => {
+            let region = &regions.regions()[0];
+            (region.arg, region.body.clone(), results(&block[at]))
+        }
+        Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. }
+            | uniform::Op::EqualizePattern { regions },
+        ) => {
+            let region = &regions[0];
+            let raised_body: Vec<Op> = region.body.iter().cloned().map(raised).collect();
+            (region.arg, raised_body, results(&block[at]))
+        }
+        _ => return,
+    };
+    // `yield_op->getOperand(i)` (`:1126-1131`), read before the terminator is dropped.
+    let yielded: Vec<Val> = body
+        .iter()
+        .rev()
+        .find_map(|op| match op {
+            Op::Uniform(uniform::Op::Yield { operands }) => Some(operands.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let kept: Vec<Op> = body
+        .into_iter()
+        .filter(|op| !matches!(op, Op::Uniform(uniform::Op::Yield { .. })))
+        .collect();
+    block.remove(at);
+    block.splice(at..at, kept);
+    replace_all_uses_with(block, arg, prog_unit_arg);
+    for (index, result) in results.iter().enumerate() {
+        if let Some(yielded) = yielded.get(index) {
+            replace_all_uses_with(block, *result, *yielded);
+        }
+    }
 }

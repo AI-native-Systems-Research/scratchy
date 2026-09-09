@@ -90,7 +90,8 @@
 // ⭐ REMOVE THIS WITH e621: at that point an unused item here is a real defect again.
 #![allow(dead_code)]
 
-use crate::islands::sentient::dialects::Val;
+use crate::islands::dataflow_ir::Values;
+use crate::islands::sentient::dialects::{self as dialects, Definitions, Op, Val, uniform};
 
 /// Replaces: e039_existsInCollection
 ///
@@ -103,20 +104,199 @@ pub fn exists_in_collection(unit_op: Val, collection: &[Vec<Val>]) -> bool {
     collection.iter().any(|set| set.contains(&unit_op))
 }
 
-// crustify:todo: e297_simplifyProgramUnitOp
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:155  (64 body lines, level 1)
-//   original  : void DeuniformPass::simplifyProgramUnitOp( mlir::dataflow::ProgramUnitOp prog_unit_op)
-//   calls     : e252_size
+/// Replaces: e297_simplifyProgramUnitOp
+///
+/// A deuniformed unit loses the local regions that no longer say anything: one over units this unit
+/// does not run is deleted, one over exactly this unit's units is spliced into the body, a
+/// `uniform.query_map` on the unit's own argument with a single answer becomes that answer, and a
+/// `uniform.def_immutable_mapping` nothing reads any more is dropped.
+///
+/// ⛔ TRAP: THE REFERENCE'S FIRST ERASE LOOP IS A LATENT USE-AFTER-FREE. `Operation::walk` defaults
+/// to `WalkOrder::PostOrder`, so `to_be_deleted` holds inner local regions BEFORE their parents and
+/// `for (int i = size - 1; i >= 0; i--)` (`:213`) erases a parent before the child it already freed.
+/// This port recurses into regions first and then walks each block downward, which is the same net
+/// effect on the shape the reference survives.
+///
+/// ⛔ `prog_unit_arg` AND `enclosing` ARE THE DROPPED MECHANISM: no op of this island carries a
+/// program unit's `iter_arg` or a parent pointer, and the `dataflow.get_unit`s in `units` are defined
+/// ABOVE the unit — see [`Definitions::within_program_unit`].
+pub fn simplify_program_unit_op(
+    unit_body: &mut Vec<Op>,
+    units: &[Val],
+    prog_unit_arg: Val,
+    enclosing: &[&[Op]],
+) {
+    simplify_local_regions(
+        unit_body,
+        units,
+        prog_unit_arg,
+        Definitions::from_innermost(enclosing),
+    );
 
-// crustify:todo: e298_duplicateAndUpdateEntriesOfQueryMap
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:221  (22 body lines, level 1)
-//   original  : mlir::uniform::QueryMapOp DeuniformPass::duplicateAndUpdateEntriesOfQueryMap( mlir::uniform::QueryMapOp query_map_op, std::vector<mlir::Value> new_units, mlir::OpBuilder builder)
-//   calls     : e252_size
+    // `query_op.replaceAllUsesWith(values[0])` (`:288`) — decided over an immutable body, because the
+    // mapping the query reads is IN that body.
+    let mut answered: Vec<(Val, Val)> = Vec::new();
+    {
+        let mut scope: Vec<&[Op]> = vec![unit_body.as_slice()];
+        scope.extend_from_slice(enclosing);
+        let defs = Definitions::within_program_unit(&scope, prog_unit_arg, units);
+        for op in collect_uniform(unit_body) {
+            let uniform::Op::QueryMap { result, map, key } = op else {
+                continue;
+            };
+            let values = dialects::uniform_mapping_values(map, key, defs);
+            if values.len() == 1
+                && key == prog_unit_arg
+                && dialects::uniform_mapping_keys(key, defs).len() <= units.len()
+            {
+                answered.push((result, values[0]));
+            }
+        }
+    }
+    for (result, value) in answered {
+        dialects::replace_all_uses_with(unit_body, result, value);
+        dialects::erase_defining_op(unit_body, result);
+    }
 
-// crustify:todo: e299_expandAllGroupsToUnitsAndUpdateSizes
-//   authority : dcc/src/Transform/Sentient/Deuniform.cpp:246  (35 body lines, level 1)
-//   original  : void DeuniformPass::expandAllGroupsToUnitsAndUpdateSizes( std::vector<Value> &units, mlir::ArrayAttr &list_sizes, mlir::OpBuilder builder)
-//   calls     : e252_size
+    // `if (mapping_op.use_empty())` (`:295`) — ⭐ EXACT RATHER THAN APPROXIMATE over the unit's body:
+    // a value defined inside a region has no readers outside it.
+    let unused: Vec<Val> = collect_uniform(unit_body)
+        .into_iter()
+        .filter_map(|op| match op {
+            uniform::Op::DefImmutableMapping { result, .. } => Some(result),
+            _ => None,
+        })
+        .filter(|result| dialects::use_count(*result, unit_body) == 0)
+        .collect();
+    for result in unused {
+        dialects::erase_defining_op(unit_body, result);
+    }
+}
+
+/// The first walk of e297 (`:161-212`), one block at a time: regions first, then the block's own ops
+/// downward so a removal cannot invalidate an index still to be visited.
+fn simplify_local_regions(
+    block: &mut Vec<Op>,
+    units: &[Val],
+    prog_unit_arg: Val,
+    defs: Definitions<'_>,
+) {
+    for op in block.iter_mut() {
+        for region in dialects::regions_mut(op) {
+            simplify_local_regions(region, units, prog_unit_arg, defs);
+        }
+    }
+    for at in (0..block.len()).rev() {
+        let Some(regions) = dialects::local_region_count(&block[at]) else {
+            continue;
+        };
+        let mut local_units = dialects::operands(&block[at]);
+        dialects::expand_all_groups_to_units(&mut local_units, defs);
+        if !local_units.iter().any(|unit| units.contains(unit)) {
+            block.remove(at);
+        } else if regions == 1
+            && local_units.len() == units.len()
+            && local_units.iter().all(|unit| units.contains(unit))
+        {
+            dialects::extract_op_from_local_region(block, at, prog_unit_arg);
+        }
+    }
+}
+
+/// Every `uniform.query_map` and `uniform.def_immutable_mapping` under `scope`, in walk order.
+///
+/// ⛔ A LOWER-RUNG LOCAL REGION IS NOT DESCENDED INTO, as everywhere in this island: its body holds
+/// ops of the rung below. e297's two walks only ever act on a query whose key is the program unit's
+/// own argument, and the only way one comes to be nested is
+/// [`dialects::extract_op_from_local_region`], which raises the body it splices.
+fn collect_uniform(scope: &[Op]) -> Vec<uniform::Op> {
+    let mut found = Vec::new();
+    fn walk(scope: &[Op], found: &mut Vec<uniform::Op>) {
+        for op in scope {
+            if let Op::Uniform(
+                inner @ (uniform::Op::QueryMap { .. } | uniform::Op::DefImmutableMapping { .. }),
+            ) = op
+            {
+                found.push(inner.clone());
+            }
+            for region in dialects::regions_ref(op) {
+                walk(region, found);
+            }
+        }
+    }
+    walk(scope, &mut found);
+    found
+}
+
+/// Replaces: e298_duplicateAndUpdateEntriesOfQueryMap
+///
+/// A fresh `uniform.def_immutable_mapping` holding only the pairs whose key is one of `new_units`,
+/// and a fresh `uniform.query_map` reading it with the same key — returned in creation order.
+///
+/// ⛔ TRAP: THE REFERENCE PAIRS BY THE **KEY** INDEX INTO A VALUE LIST THAT DROPPED ITS MISSES.
+/// `values[i]` (`:234`) is read at the key's position while `getListOfValueOpsFromUniformMapping`
+/// pushes only the keys the mapping holds (`Uniform.cpp:548-556`), so one absent key shifts every
+/// later pair and the last read runs off the end. Zipping reproduces the shift for the pairs that
+/// exist and stops where the reference reads out of bounds.
+pub fn duplicate_and_update_entries_of_query_map(
+    map: Val,
+    key: Val,
+    new_units: &[Val],
+    defs: Definitions<'_>,
+    values: &mut Values,
+) -> (Op, Op) {
+    let keys = dialects::uniform_mapping_keys(key, defs);
+    let pairs: Vec<(Val, Val)> = keys
+        .iter()
+        .zip(dialects::uniform_mapping_values(map, key, defs))
+        .filter(|(mapped, _)| new_units.contains(mapped))
+        .map(|(mapped, value)| (*mapped, value))
+        .collect();
+    let new_map = values.mint();
+    (
+        Op::Uniform(uniform::Op::DefImmutableMapping {
+            result: new_map,
+            pairs,
+        }),
+        Op::Uniform(uniform::Op::QueryMap {
+            result: values.mint(),
+            map: new_map,
+            key,
+        }),
+    )
+}
+
+/// Replaces: e299_expandAllGroupsToUnitsAndUpdateSizes
+///
+/// Every `dataflow.create_group` in a local region op's unit lists replaced by the group's members.
+///
+/// ⛔ TRAP: `list_sizes` CANNOT DESYNC FROM `$units` HERE, so the reference's
+/// `DT_CHECK(list_sizes[s] == 1)` (`:263`) has nothing to check: [`dialects::LocalRegion`] zips the
+/// two, and a region's size IS its unit count. A region of more than one unit holding a group — the
+/// case the check forbids — gets the generalization the zip forces, not the reference's two arrays of
+/// different lengths.
+///
+/// ⛔ TRAP: THE REFERENCE'S FIRST LOOP (`:251-258`) IS DEAD — it fills a local `units_in_groups` per
+/// iteration and drops it.
+pub fn expand_all_groups_to_units_and_update_sizes(op: &mut Op, defs: Definitions<'_>) {
+    match op {
+        Op::UniformRegions(regions) => {
+            for region in regions.regions_mut() {
+                dialects::expand_all_groups_to_units(&mut region.units, defs);
+            }
+        }
+        Op::Uniform(
+            uniform::Op::UniformizeRegions { regions, .. }
+            | uniform::Op::EqualizePattern { regions },
+        ) => {
+            for region in regions.iter_mut() {
+                dialects::expand_all_groups_to_units(&mut region.units, defs);
+            }
+        }
+        // Nothing else carries a `$units`/`$list_sizes` pair.
+        _ => {}
+    }
+}
 
 // crustify:todo: e436_duplicateAndUpdateEntriesOfQueryMapInLocalRegions
 //   authority : dcc/src/Transform/Sentient/Deuniform.cpp:139  (13 body lines, level 2)
@@ -146,6 +326,64 @@ pub fn exists_in_collection(unit_op: Val, collection: &[Vec<Val>]) -> bool {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::islands::dataflow_ir::dialects::dataflow;
+    use crate::islands::sentient::dialects::sentient::{Reg, RegType};
+    use crate::islands::sentient::dialects::{LocalRegion, UniformRegions, sentient};
+    use crate::units::{DfirUnit, Residency};
+
+    /// `%r = dataflow.get_unit {name, type} : index`.
+    fn get_unit(result: u32) -> Op {
+        Op::Dataflow(dataflow::Op::GetUnit {
+            result: Val(result),
+            residency: Residency::Global,
+            unit: DfirUnit::Lxlu,
+            num_folds: None,
+        })
+    }
+
+    /// `%r = dataflow.create_group(..) : index`.
+    fn group(result: u32, members: &[u32]) -> Op {
+        Op::Dataflow(dataflow::Op::CreateGroup {
+            result: Val(result),
+            unit_ids: members.iter().map(|m| Val(*m)).collect(),
+        })
+    }
+
+    /// `%r = sentient.scalar_copy %i` — a reader, so a rewire is observable.
+    fn copy(result: u32, input: u32) -> Op {
+        Op::Sentient(sentient::Op::ScalarCopy {
+            input: Val(input),
+            result: Val(result),
+            reg: Reg {
+                locale: RegType::Unknown,
+                index: None,
+            },
+            element_size: None,
+            program_header: false,
+        })
+    }
+
+    /// One region of a local region op — its argument, its units and its body.
+    fn region(arg: u32, units: &[u32], body: Vec<Op>) -> LocalRegion {
+        LocalRegion {
+            arg: Val(arg),
+            units: units.iter().map(|u| Val(*u)).collect(),
+            body,
+        }
+    }
+
+    /// Every `sentient.scalar_copy` in a block, as `(result, input)`.
+    fn copies(scope: &[Op]) -> Vec<(u32, u32)> {
+        scope
+            .iter()
+            .filter_map(|op| match op {
+                Op::Sentient(sentient::Op::ScalarCopy { input, result, .. }) => {
+                    Some((result.0, input.0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 
     /// A unit in the second set is found; one in no set is not.
     #[test]
@@ -154,5 +392,117 @@ mod unit_tests {
 
         assert!(exists_in_collection(Val(3), &collection));
         assert!(!exists_in_collection(Val(4), &collection));
+    }
+
+    /// All four simplifications on one body: the foreign `equalize_pattern` goes, the
+    /// `uniformize_regions` over exactly this unit's units is spliced in with both its rewires, the
+    /// query on the unit's own argument becomes the one value it can answer, and the mapping that
+    /// query was the only reader of goes with it.
+    #[test]
+    fn a_deuniformed_unit_loses_every_local_region_that_says_nothing() {
+        let func_body = vec![get_unit(1), get_unit(2), get_unit(3), group(4, &[1, 2])];
+        let units = vec![Val(1), Val(2)];
+        let foreign = Op::UniformRegions(UniformRegions::EqualizePattern {
+            regions: vec![region(
+                11,
+                &[3],
+                vec![Op::Uniform(uniform::Op::Yield {
+                    operands: Vec::new(),
+                })],
+            )],
+        });
+        let whole = Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions: vec![region(
+                10,
+                &[4],
+                vec![
+                    copy(20, 10),
+                    Op::Uniform(uniform::Op::Yield {
+                        operands: vec![Val(20)],
+                    }),
+                ],
+            )],
+            results: vec![Val(30)],
+        });
+        let mut unit_body = vec![
+            foreign,
+            whole,
+            copy(31, 30),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(40),
+                pairs: vec![(Val(1), Val(50))],
+            }),
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(41),
+                map: Val(40),
+                key: Val(9),
+            }),
+            copy(42, 41),
+        ];
+
+        simplify_program_unit_op(&mut unit_body, &units, Val(9), &[&func_body]);
+
+        assert_eq!(unit_body.len(), 3);
+        // `%20` now reads the program unit's own argument, `%31` the value the region yielded, and
+        // `%42` the mapping's one answer.
+        assert_eq!(copies(&unit_body), vec![(20, 9), (31, 20), (42, 50)]);
+    }
+
+    /// The duplicate keeps only the pairs whose key is one of the new units, and the fresh query
+    /// reads the fresh mapping.
+    #[test]
+    fn a_duplicated_query_map_drops_the_units_it_no_longer_covers() {
+        let scope = vec![
+            get_unit(1),
+            get_unit(2),
+            Op::Uniform(uniform::Op::DefImmutableMapping {
+                result: Val(10),
+                pairs: vec![(Val(1), Val(20)), (Val(2), Val(21))],
+            }),
+        ];
+        let regions: Vec<&[Op]> = vec![&scope];
+        let defs = Definitions::within_program_unit(&regions, Val(9), &[Val(1), Val(2)]);
+        let mut values = Values::default();
+
+        let (map, query) = duplicate_and_update_entries_of_query_map(
+            Val(10),
+            Val(9),
+            &[Val(2)],
+            defs,
+            &mut values,
+        );
+
+        let Op::Uniform(uniform::Op::DefImmutableMapping { result, pairs }) = &map else {
+            panic!("expected a def_immutable_mapping, got {map:?}");
+        };
+        assert_eq!(*pairs, vec![(Val(2), Val(21))]);
+        assert_eq!(
+            query,
+            Op::Uniform(uniform::Op::QueryMap {
+                result: Val(1),
+                map: *result,
+                key: Val(9),
+            })
+        );
+    }
+
+    /// The grouped region's units become the group's members; the region that names a unit outright
+    /// is untouched.
+    #[test]
+    fn expanding_groups_rewrites_only_the_regions_that_hold_one() {
+        let func_body = vec![get_unit(1), get_unit(2), get_unit(3), group(4, &[1, 2])];
+        let regions: Vec<&[Op]> = vec![&func_body];
+        let mut op = Op::UniformRegions(UniformRegions::UniformizeRegions {
+            regions: vec![region(10, &[4], Vec::new()), region(11, &[3], Vec::new())],
+            results: Vec::new(),
+        });
+
+        expand_all_groups_to_units_and_update_sizes(&mut op, Definitions::from_innermost(&regions));
+
+        let Op::UniformRegions(rewritten) = &op else {
+            panic!("expected a uniformize_regions, got {op:?}");
+        };
+        assert_eq!(rewritten.regions()[0].units, vec![Val(1), Val(2)]);
+        assert_eq!(rewritten.regions()[1].units, vec![Val(3)]);
     }
 }
