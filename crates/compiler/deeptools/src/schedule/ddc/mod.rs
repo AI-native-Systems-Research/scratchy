@@ -139,27 +139,6 @@ pub mod transformation;
 pub(crate) mod transformation_util;
 pub mod v1;
 
-// crustify:todo: e230_addPropInfo
-//   authority : ddc/ddc.h:430  (4 body lines, level 1)
-//   class     : CoordPropTracker
-//   original  : void addPropInfo(const dsc2::CoordPropInfoType& rhs, const std::vector<PrimaryDimTypes> dims)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3158-3163
-//   calls     : e073_addPropInfo
-
-// crustify:todo: e231_rollbackToPos
-//   authority : ddc/ddc.h:474  (36 body lines, level 1)
-//   class     : CoordPropTracker
-//   original  : void rollbackToPos(int newPos)
-//   extract   : crustify-ddc/cpp/ddc.cpp:3173-3209
-//   calls     : e104_clear
-
-// crustify:todo: e232_reset
-//   authority : ddc/ddc.h:528  (5 body lines, level 1)
-//   class     : CoordPropTracker
-//   original  : void reset()
-//   extract   : crustify-ddc/cpp/ddc.cpp:3219-3224
-//   calls     : e104_clear
-
 // crustify:todo: e296_rollBackNodesInBlock
 //   authority : ddc/ddc.h:511  (15 body lines, level 2)
 //   class     : CoordPropTracker
@@ -167,11 +146,14 @@ pub mod v1;
 //   extract   : crustify-ddc/cpp/ddc.cpp:8113-8129
 //   calls     : e231_rollbackToPos
 
-// ⭐ USES FOR ENTRIES 073-077. Union these into this file's top block when its other entries land.
+// ⭐ USES FOR ENTRIES 073-077 AND 230-232. Union these into this file's top block when its other
+// entries land.
 use core::fmt::Write as _;
 use std::collections::BTreeMap;
 
-use self::fold::{Beta, BlockId, CoordPropInfo, FoldLabel, FoldParamInfo, NodeId};
+use self::fold::{
+    Beta, BlockId, CoordPropInfo, FoldLabel, FoldParamInfo, NodeId, NodeKind, ScheduleTree,
+};
 use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
 use crate::units::Row;
 
@@ -189,6 +171,19 @@ use crate::units::Row;
 pub trait NodeNames {
     /// The node's name.
     fn name(&self, node: NodeId) -> &str;
+}
+
+/// THE COORDINATE STORES A ROLLBACK EMPTIES — one method per `nodeType_` arm of `rollbackToPos`
+/// (`ddc/ddc.h:487-506`), so no arm can clear a store belonging to another kind of node. Which arm a
+/// node takes is [`ScheduleTree::kind`], and the reference clears nothing for the other five kinds.
+pub trait NodeCoordinates {
+    /// `AllocateNode::allocateCoordinates_.clear()` AND `sliceViewCoordinates_.clear()` — both
+    /// (`:491-492`).
+    fn clear_allocate_coordinates(&mut self, node: NodeId);
+    /// `TransferNode::transferCoordinates_.clear()` (`:497`).
+    fn clear_transfer_coordinates(&mut self, node: NodeId);
+    /// `ComputeNode::outputCoordinate_.clear()` AND EVERY `inputCoordinates_` entry (`:502-505`).
+    fn clear_compute_coordinates(&mut self, node: NodeId);
 }
 
 /// WHICH SIDE OF THE DATAFLOW THE REFERENCE NODE SITS ON — `CoordPropInfoType::refIsProducer`
@@ -416,6 +411,72 @@ impl CoordPropTracker {
         let item = self.items.get_mut(next.0)?;
         item.state = PropState::Complete;
         Some(item.clone())
+    }
+
+    /// Replaces: e230_addPropInfo
+    ///
+    /// Queues a step read off a record already in hand, for the CALLER'S dims.
+    ///
+    /// ⛔ THE RECORD'S OWN `dimsToPropagate` AND `propState` ARE DROPPED (`ddc/ddc.h:430-434`): the
+    /// five fixed fields are forwarded and `dims` alone decides what gets propagated.
+    /// ⭐ THE RECORD NEED NOT BE QUEUED — the reference's callers build one on the stack and mutate
+    /// `nodeToFold` and `scaleDown` between two calls (`ddc/ddc_fold.cpp:1717-1750`).
+    pub fn add_prop_info_from(&mut self, item: &QueuedProp, dims: &[PrimaryDim]) {
+        self.add_prop_info(item.prop, dims);
+    }
+
+    /// Replaces: e231_rollbackToPos
+    ///
+    /// Rewinds the queue to `new_pos`, marking every entry from there through the cursor ROLLED_BACK
+    /// and emptying the coordinates their fold nodes had computed.
+    ///
+    /// ⛔ A NO-OP UNTIL THE CURSOR REACHES `new_pos` (`ddc/ddc.h:475-477`), and it leaves the cursor
+    /// one BEFORE `new_pos`, so the entry at `new_pos` is handed out again.
+    /// ⛔ BOTH CONDITIONS OF THE `DT_ERROR` (`:478-482`) ARE UNREACHABLE: [`QueuePos`] cannot spell a
+    /// negative position, and `newPos > currItemToProcess_` is what the guard above already returns on.
+    /// ⚠️ DIVERGENCE, AND IT IS A REFERENCE DEFECT: `:485` stamps `at(currItemToProcess_)` inside a
+    /// loop that clears `[i]`, so only the LAST entry is marked, once per step — and `at()` throws
+    /// outright when [`Self::next_item`] has already run off the end. `i` is stamped here, over the
+    /// entries that exist. `propState` is written and never read anywhere in the reference tree.
+    pub fn rollback_to_pos<T: ScheduleTree + NodeCoordinates + ?Sized>(
+        &mut self,
+        nodes: &mut T,
+        new_pos: QueuePos,
+    ) {
+        let Some(curr) = self.curr else {
+            return;
+        };
+        if curr < new_pos {
+            return;
+        }
+        // Clear the computed coordinates up to the rollback position.
+        for item in self.items.iter_mut().take(curr.0 + 1).skip(new_pos.0) {
+            item.state = PropState::RolledBack;
+            let node = item.prop.node_to_fold;
+            match nodes.kind(node) {
+                NodeKind::Allocate => nodes.clear_allocate_coordinates(node),
+                NodeKind::Transfer => nodes.clear_transfer_coordinates(node),
+                NodeKind::Compute => nodes.clear_compute_coordinates(node),
+                NodeKind::Block
+                | NodeKind::Loop
+                | NodeKind::Sync
+                | NodeKind::Condition
+                | NodeKind::StickMask => {}
+            }
+        }
+        self.curr = new_pos.0.checked_sub(1).map(QueuePos);
+    }
+
+    /// Replaces: e232_reset
+    ///
+    /// Drops the queue and the retry ledger and puts the cursor back before the first entry.
+    ///
+    /// ⭐ THE LEDGER GOES TOO, so a propagation dropped here may be queued again — that is what
+    /// makes `reset` different from rolling back to position 0.
+    pub fn reset(&mut self) {
+        self.items.clear();
+        self.refs_added.clear();
+        self.curr = None;
     }
 }
 
@@ -722,5 +783,172 @@ mod tests_e073_e077 {
             print_fold_params(&params),
             "(64, 0, 32, core_workslice_fold_dim) (-8, 4, 2, ) "
         );
+    }
+}
+
+// ⭐ TESTS FOR ENTRIES 230-232. Union this module with this file's other test modules when they land.
+#[cfg(test)]
+mod tests_e230_e232 {
+    use super::fold::{BlockId, CoordPropInfo, NodeId, NodeKind, PropEnd, ScheduleTree};
+    use super::{
+        CoordPropTracker, NodeCoordinates, PropState, Propagation, QueuePos, QueuedProp, RefRole,
+        ScaleDown,
+    };
+    use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::PrimaryDim;
+
+    /// A step between two nodes, keyed on identity alone — the ends' own kinds are the TREE's answer
+    /// and not this record's, since [`PropEnd`] has no `TRANSFER` arm to carry one.
+    fn step(ref_node: u32, node_to_fold: u32) -> Propagation {
+        Propagation {
+            ends: CoordPropInfo {
+                data_connect: None,
+                ref_node: PropEnd::Other,
+                node_to_fold: PropEnd::Other,
+            },
+            ref_node: NodeId(ref_node),
+            node_to_fold: NodeId(node_to_fold),
+            ref_role: RefRole::Producer,
+            scale_down: ScaleDown::Yes,
+        }
+    }
+
+    /// A TREE OF KINDS, RECORDING WHICH STORE WAS EMPTIED FOR WHICH NODE — the stores themselves are
+    /// `dsc2` node fields and the mechanism for reaching them is not this unit's.
+    struct Nodes {
+        kinds: Vec<NodeKind>,
+        cleared: Vec<(NodeId, NodeKind)>,
+    }
+
+    impl ScheduleTree for Nodes {
+        fn kind(&self, node: NodeId) -> NodeKind {
+            self.kinds[node.0 as usize]
+        }
+        fn parent(&self, _node: NodeId) -> Option<NodeId> {
+            None
+        }
+        fn children(&self, _block: BlockId) -> Vec<NodeId> {
+            Vec::new()
+        }
+    }
+
+    impl NodeCoordinates for Nodes {
+        fn clear_allocate_coordinates(&mut self, node: NodeId) {
+            self.cleared.push((node, NodeKind::Allocate));
+        }
+        fn clear_transfer_coordinates(&mut self, node: NodeId) {
+            self.cleared.push((node, NodeKind::Transfer));
+        }
+        fn clear_compute_coordinates(&mut self, node: NodeId) {
+            self.cleared.push((node, NodeKind::Compute));
+        }
+    }
+
+    /// e230: the record's own dims and state are dropped, and the caller's dims are what reaches the
+    /// queue and the ledger.
+    #[test]
+    fn a_step_taken_from_a_record_carries_the_callers_dims_and_not_the_records() {
+        let mut tracker = CoordPropTracker::default();
+        let record = QueuedProp {
+            prop: step(0, 1),
+            state: PropState::Complete,
+            dims: vec![PrimaryDim::Y],
+        };
+
+        tracker.add_prop_info_from(&record, &[PrimaryDim::In, PrimaryDim::Mb]);
+
+        assert_eq!(tracker.items.len(), 1);
+        assert_eq!(tracker.items[0].dims, vec![PrimaryDim::In, PrimaryDim::Mb]);
+        assert_eq!(tracker.items[0].state, PropState::NotProcessed);
+        // The record's `scaleDown` survives; this overload forwards it, unlike `retry`.
+        assert_eq!(tracker.items[0].prop.scale_down, ScaleDown::Yes);
+        // `Y` was never seen, so the record's own dim list left no trace in the ledger.
+        assert!(!tracker.refs_added[&NodeId(1)][&NodeId(0)].contains_key(&PrimaryDim::Y));
+    }
+
+    /// e231: every entry from the rollback position through the cursor is marked and has its fold
+    /// node's own coordinate store emptied, and the cursor lands one BEFORE the position.
+    #[test]
+    fn a_rollback_marks_and_clears_from_the_position_through_the_cursor() {
+        let mut nodes = Nodes {
+            //          0 alloc     1 transfer      2 compute        3 loop
+            kinds: vec![
+                NodeKind::Allocate,
+                NodeKind::Transfer,
+                NodeKind::Compute,
+                NodeKind::Loop,
+            ],
+            cleared: Vec::new(),
+        };
+        let mut tracker = CoordPropTracker::default();
+        for fold_node in 0..4 {
+            tracker.add_prop_info(step(4 + fold_node, fold_node), &[PrimaryDim::In]);
+        }
+        // Walk to the last entry, so the whole queue is behind the cursor.
+        for _ in 0..4 {
+            let _ = tracker.next_item();
+        }
+
+        tracker.rollback_to_pos(&mut nodes, QueuePos(1));
+
+        // The `LOOP` fold node owns no coordinate store, so nothing is cleared for it.
+        assert_eq!(
+            nodes.cleared,
+            vec![
+                (NodeId(1), NodeKind::Transfer),
+                (NodeId(2), NodeKind::Compute),
+            ]
+        );
+        assert_eq!(tracker.items[0].state, PropState::Complete);
+        assert_eq!(tracker.items[1].state, PropState::RolledBack);
+        assert_eq!(tracker.items[3].state, PropState::RolledBack);
+        // One before the rollback position, so entry 1 is handed out again.
+        assert_eq!(tracker.curr, Some(QueuePos(0)));
+        assert_eq!(
+            tracker.next_item().map(|item| item.dims),
+            Some(vec![PrimaryDim::In])
+        );
+    }
+
+    /// e231, the negative: a position the cursor has not reached yet is a no-op, and so is any
+    /// rollback before the first fetch — including one to position 0.
+    #[test]
+    fn a_rollback_past_the_cursor_or_before_the_first_fetch_changes_nothing() {
+        let mut nodes = Nodes {
+            kinds: vec![NodeKind::Allocate, NodeKind::Allocate],
+            cleared: Vec::new(),
+        };
+        let mut tracker = CoordPropTracker::default();
+        tracker.add_prop_info(step(0, 0), &[PrimaryDim::In]);
+        tracker.add_prop_info(step(1, 1), &[PrimaryDim::In]);
+
+        // Cursor is still before the first entry: `currItemToProcess_ < 0`.
+        tracker.rollback_to_pos(&mut nodes, QueuePos(0));
+        assert_eq!(tracker.curr, None);
+
+        let _ = tracker.next_item();
+        // Cursor is at 0, so position 1 is ahead of it.
+        tracker.rollback_to_pos(&mut nodes, QueuePos(1));
+
+        assert!(nodes.cleared.is_empty());
+        assert_eq!(tracker.curr, Some(QueuePos(0)));
+        assert_eq!(tracker.items[0].state, PropState::Complete);
+    }
+
+    /// e232: the queue, the ledger and the cursor all go, so a propagation already walked can be
+    /// queued a second time — which a rollback to 0 would not allow.
+    #[test]
+    fn a_reset_drops_the_ledger_so_a_walked_propagation_queues_again() {
+        let mut tracker = CoordPropTracker::default();
+        tracker.add_prop_info(step(0, 1), &[PrimaryDim::In]);
+        let _ = tracker.next_item();
+
+        tracker.reset();
+
+        assert!(tracker.items.is_empty());
+        assert!(tracker.refs_added.is_empty());
+        assert_eq!(tracker.curr, None);
+
+        tracker.add_prop_info(step(0, 1), &[PrimaryDim::In]);
+        assert_eq!(tracker.items.len(), 1);
     }
 }
