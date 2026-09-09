@@ -82,3 +82,16 @@
 //   original  : void SimpleConstantDescriptor::dump() const
 //   calls     : e278_isValid
 
+
+use crate::transform::sentient::analyses::EvaluatedValue;
+
+/// A BASE ADDRESS THAT IS ONE CONSTANT — `class SimpleConstantDescriptor`
+/// (`AddressPinningAndToggle.cpp:161-198`), matched on a `ConstantOp` or a constant `QueryMapOp`.
+///
+/// ⭐ NO INVALID STATE: "Descriptor is always valid once constructed" (`:191`), so there is no
+/// `invalidate()` and no `Option` here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimpleConstantDescriptor {
+    /// `ev_` — the constant this address is.
+    pub ev: EvaluatedValue,
+}

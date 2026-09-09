@@ -100,3 +100,30 @@
 //   original  : void DataTransferDescriptor::initializeDescriptor()
 //   calls     : e002_getAllConstants, e015_getInit, e016_ConditionalConstantDescriptor, e252_size, e278_isValid, e279_canBeSimplified, e280_IntegerSequenceDescriptor, e281_DiscreteIntegerSetDescriptor, e282_LoopingChainMutableAddrDescriptor, e407_getInit, e408_getAllConstants, e411_getInit, e414_getInit, e485_getX …
 
+
+use super::{BaseAddrList, PatternDescriptor};
+
+/// ONE DATA TRANSFER'S BASE-ADDRESS STORY — `class DataTransferDescriptor`
+/// (`AddressPinningAndToggle.cpp:632-786`), one per `load_and_send`/`receive_and_store`/
+/// `load_and_store` per address role (the HBM `load_and_store` case makes TWO, `:1410-1431`).
+///
+/// ⛔ NOT `evaluator_`: the reference stores `ExpressionEvaluator &`, one global the pass threads
+/// through. A shared borrow in a field would make the descriptor unstorable while the pass rewrites
+/// the IR, so the ported methods take the evaluator as an argument instead.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DataTransferDescriptor {
+    /// Replaces: e006_dtor_DataTransferDescriptor
+    ///
+    /// `pattern_desc_` — which recognised pattern this transfer follows, `None` for the reference's
+    /// `nullptr` (every `is*()` tests it, `:670-696`).
+    ///
+    /// ⭐ THIS FIELD *IS* THE PORT OF `~DataTransferDescriptor()` (`:647`, whose whole body is
+    /// `if (pattern_desc_) delete pattern_desc_;`): the destructor exists only because the reference
+    /// holds `DynamicPatternDescriptorBase *` from a `new` in `initializeDescriptor`. An owned
+    /// `Option` frees exactly that, at exactly that point, so ⛔ there is no `impl Drop` to write —
+    /// a hand-written one restating the field's own drop would free nothing extra.
+    pub pattern_desc: Option<PatternDescriptor>,
+    /// `base_addrs_` — the possible constant values `base_addr_` can take (one, or two for a
+    /// toggle); the list [`super::ConditionalConstantDescriptor::get_all_constants`] appends into.
+    pub base_addrs: BaseAddrList,
+}

@@ -94,3 +94,83 @@
 //   original  : void DataTransferDescriptorContainer::computeChainingInfo()
 //   calls     : e007_isPartOfSomeChain, e008_setChainingInfo, e252_size, e273_isHeadOfChain, e278_isValid, e417_isHeadOfLoopingChain, e423_lookup
 
+
+use std::collections::BTreeMap;
+
+use super::DataTransferDescriptor;
+
+/// WHICH DESCRIPTOR — a position in [`DataTransferDescriptorContainer::descriptors`].
+///
+/// ⛔ THE REFERENCE KEYS ON THE ADDRESS OF THE DESCRIPTOR (`std::map<const DataTransferDescriptor *,
+/// unsigned char> chaining_info_`, `:955`). A pointer key is not portable to Rust while the
+/// container owns the same objects, and the index is stable because the container only ever grows by
+/// `insert` and is cleared wholesale by `clear_all` (`:888`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DescriptorId(pub u32);
+
+/// ONE CHAINING BIT — `enum Flags : unsigned char` (`:944-948`), the argument
+/// [`DataTransferDescriptorContainer::set_chaining_info`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChainFlag {
+    /// `kPartOfChain = 0x01`.
+    PartOfChain,
+    /// `kHeadOfChain = 0x02`.
+    HeadOfChain,
+    /// `kHeadOfLoopingChain = 0x04`.
+    HeadOfLoopingChain,
+}
+
+/// WHAT `chaining_info_` HOLDS FOR ONE DESCRIPTOR — the three `Flags` bits, named.
+///
+/// ⛔ AN ABSENT ENTRY IS NOT `Default`: `setChainingInfo(desc, flag, false)` on a descriptor with no
+/// entry inserts NOTHING (`:949-958`), so [`DataTransferDescriptorContainer::chaining_info`] must
+/// keep "no entry" distinct from "all three clear".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChainFlags {
+    /// `kPartOfChain` — this transfer is part of some SSA chain.
+    pub part_of_chain: bool,
+    /// `kHeadOfChain` — and it is that chain's head.
+    pub head_of_chain: bool,
+    /// `kHeadOfLoopingChain` — and the chain's last link reaches back to it.
+    pub head_of_looping_chain: bool,
+}
+
+impl ChainFlags {
+    /// Reads one bit — `it->second & flag`.
+    #[must_use]
+    pub fn get(self, flag: ChainFlag) -> bool {
+        match flag {
+            ChainFlag::PartOfChain => self.part_of_chain,
+            ChainFlag::HeadOfChain => self.head_of_chain,
+            ChainFlag::HeadOfLoopingChain => self.head_of_looping_chain,
+        }
+    }
+
+    /// Writes one bit — `|= flag` for `true`, `&= ~flag` for `false`.
+    pub fn set(&mut self, flag: ChainFlag, val: bool) {
+        match flag {
+            ChainFlag::PartOfChain => self.part_of_chain = val,
+            ChainFlag::HeadOfChain => self.head_of_chain = val,
+            ChainFlag::HeadOfLoopingChain => self.head_of_looping_chain = val,
+        }
+    }
+}
+
+/// THE PASS'S DESCRIPTORS FOR ONE ADDRESS ROLE — `class DataTransferDescriptorContainer`
+/// (`AddressPinningAndToggle.cpp:872-956`): stable syntactic-order iteration plus the chaining
+/// relationships between its elements.
+///
+/// ⭐ IT OWNS THEM. The reference is a `std::vector<DataTransferDescriptor *>` whose `clear_all`
+/// does not delete, because the pass's `cleanup()` (`:1657-1663`) deletes every element and then
+/// clears — so each descriptor is reached, and freed, through exactly one container. Owning `Vec` is
+/// that, minus the delete loop.
+///
+/// ⛔ NO `sorted_list_`: it is a lookup memoisation (`:934`), which the campaign lets a port drop —
+/// `lookup` (`e423`) is scheduled separately and owns that decision.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DataTransferDescriptorContainer {
+    /// The descriptors, in the syntactic order `insert` saw them.
+    pub descriptors: Vec<DataTransferDescriptor>,
+    /// `chaining_info_` — only the descriptors some chain has touched. See [`ChainFlags`].
+    pub chaining_info: BTreeMap<DescriptorId, ChainFlags>,
+}

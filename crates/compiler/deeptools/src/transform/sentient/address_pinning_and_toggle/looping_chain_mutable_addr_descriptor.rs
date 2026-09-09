@@ -93,3 +93,29 @@
 //   original  : void LoopingChainMutableAddrDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified
 
+
+use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::{ForRef, IterArgIndex};
+
+/// HOW LONG A LOOPING CHAIN IS — `unsigned size_`, where `isValid()` requires `>= 1` (`:559`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChainSize(pub u32);
+
+/// THE HEAD OF A LOOPING CHAIN OF MEMORY OPS — `class LoopingChainMutableAddrDescriptor`
+/// (`AddressPinningAndToggle.cpp:530-628`). Applies to a MUTABLE address only, and carries the
+/// chain's total increment so the rest of the chain's transfers can be ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoopingChainMutableAddrDescriptor {
+    /// `is_head_of_chain_` — set once the pattern is analysed.
+    pub is_head_of_chain: bool,
+    /// `outer_loop_` — the outermost loop where `%argN` is initialised.
+    pub outer_loop: Option<ForRef>,
+    /// `iter_arg_index_` — which iter arg of `outer_loop` starts the chain.
+    pub iter_arg_index: Option<IterArgIndex>,
+    /// `size_` — the size of the looping chain.
+    pub size: ChainSize,
+    /// `init_` — the initial value of the mutable addresses in the chain.
+    pub init: Option<EvaluatedValue>,
+    /// `increment_` — the chain's total increment.
+    pub increment: Option<EvaluatedValue>,
+}

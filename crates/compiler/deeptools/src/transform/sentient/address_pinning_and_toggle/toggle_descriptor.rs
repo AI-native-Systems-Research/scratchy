@@ -93,3 +93,22 @@
 //   original  : void ToggleDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified, e401_getC1, e485_getX
 
+
+use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::{ForRef, IterArgIndex};
+
+/// A BASE ADDRESS TOGGLING BETWEEN TWO CONSTANTS — `class ToggleDescriptor`
+/// (`AddressPinningAndToggle.cpp:210-281`), matched as `X = c1 - Y` around a loop's iter arg.
+///
+/// ⛔ THE THREE FIELDS ARE EXACTLY WHAT `isValid()` READS (`:257`:
+/// `c1_ && iter_arg_index_ >= 0 && outer_loop_`), which is why [`ToggleDescriptor::invalidate`]
+/// clears these three and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToggleDescriptor {
+    /// `outer_loop_` — the outermost loop where `%argN` is initialised.
+    pub outer_loop: Option<ForRef>,
+    /// `iter_arg_index_` — which iter arg of `outer_loop` carries the toggle.
+    pub iter_arg_index: Option<IterArgIndex>,
+    /// `c1_` — the constant term in `X = c1 - Y`.
+    pub c1: Option<EvaluatedValue>,
+}

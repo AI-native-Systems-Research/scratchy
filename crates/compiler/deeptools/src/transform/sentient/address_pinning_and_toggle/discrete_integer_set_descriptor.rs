@@ -93,3 +93,25 @@
 //   original  : void DiscreteIntegerSetDescriptor::dump() const
 //   calls     : e278_isValid, e279_canBeSimplified
 
+
+use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::{ForRef, IterArgIndex};
+
+/// A SET OF ADDRESSES REACHED BY SEVERAL INDEPENDENT INCREMENTS —
+/// `class DiscreteIntegerSetDescriptor` (`AddressPinningAndToggle.cpp:466-528`). Unlike
+/// [`super::integer_sequence_descriptor::IntegerSequenceDescriptor`] the increments come from a
+/// chain of iter args across nested loops, each with its own stride, so the pattern keeps only the
+/// initial value and the totals it can move by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiscreteIntegerSetDescriptor {
+    /// `outer_loop_` — the outermost loop where `%argN` is initialised.
+    pub outer_loop: Option<ForRef>,
+    /// `iter_arg_index_` — which iter arg of `outer_loop` starts the chain.
+    pub iter_arg_index: Option<IterArgIndex>,
+    /// `init_` — the initial value.
+    pub init: Option<EvaluatedValue>,
+    /// `total_positive_delta_` — the sum of `(bound-1) * stride` over the chain's positive strides.
+    pub total_positive_delta: Option<EvaluatedValue>,
+    /// `total_negative_delta_` — the same sum over its negative strides.
+    pub total_negative_delta: Option<EvaluatedValue>,
+}

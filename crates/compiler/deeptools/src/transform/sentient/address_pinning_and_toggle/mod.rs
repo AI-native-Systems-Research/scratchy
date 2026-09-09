@@ -169,38 +169,162 @@ pub(crate) mod simple_constant_descriptor;
 pub(crate) mod toggle_data_transfer_updater;
 pub(crate) mod toggle_descriptor;
 
+use crate::transform::sentient::analyses::EvaluatedValue;
 
-// crustify:todo: e001_invalidate
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:271  (5 body lines, level 0)
-//   original  : void invalidate()
+pub use conditional_constant_descriptor::ConditionalConstantDescriptor;
+pub use data_transfer_descriptor::DataTransferDescriptor;
+pub use data_transfer_descriptor_container::{
+    ChainFlag, ChainFlags, DataTransferDescriptorContainer, DescriptorId,
+};
+pub use discrete_integer_set_descriptor::DiscreteIntegerSetDescriptor;
+pub use integer_sequence_descriptor::{IntegerSequenceDescriptor, SequenceSize};
+pub use looping_chain_mutable_addr_descriptor::{ChainSize, LoopingChainMutableAddrDescriptor};
+pub use simple_constant_descriptor::SimpleConstantDescriptor;
+pub use toggle_descriptor::ToggleDescriptor;
 
-// crustify:todo: e002_getAllConstants
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:330  (4 body lines, level 0)
-//   original  : void getAllConstants(BaseAddrListTy &output) const
+/// THE CONSTANT BASE ADDRESSES ONE TRANSFER CAN USE — `using BaseAddrListTy =
+/// llvm::SmallVector<const EvaluatedValue *, 2>` (`AddressPinningAndToggle.cpp:157`).
+pub type BaseAddrList = Vec<EvaluatedValue>;
 
-// crustify:todo: e003_invalidate
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:416  (6 body lines, level 0)
-//   original  : void invalidate()
+/// WHICH PATTERN A BASE ADDRESS FOLLOWS — the `DynamicPatternDescriptorBase *pattern_desc_`
+/// hierarchy (`AddressPinningAndToggle.cpp:100-628`), whose six subclasses the reference
+/// discriminates with `isa<>` and its `PatternKind` tag.
+///
+/// ⭐ AN ENUM BECAUSE THE SET IS CLOSED AND MUTUALLY EXCLUSIVE — the reference says so at `:855`
+/// ("the descriptor types should be mutually exclusive"), which is why a non-looping chain gets no
+/// arm here and lives on `HBMDataTransferDescriptor::total_chain_increment_` instead.
+///
+/// ⛔ NO `kUnknown` ARM: `PatternKind::kUnknown` (`:104`) is the base class's default tag and no
+/// subclass constructs it — an unmatched transfer leaves `pattern_desc_` NULL, which is
+/// [`DataTransferDescriptor::pattern_desc`]`== None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternDescriptor {
+    /// `kSimpleConstant` — one constant.
+    SimpleConstant(SimpleConstantDescriptor),
+    /// `kToggle` — two constants alternating around a loop's iter arg.
+    Toggle(ToggleDescriptor),
+    /// `kConditionalConstant` — one of several constants, chosen by nested `sentient.if`s.
+    ConditionalConstant(ConditionalConstantDescriptor),
+    /// `kIntegerSequence` — `init + stride * i`.
+    IntegerSequence(IntegerSequenceDescriptor),
+    /// `kDiscreteIntegerSet` — independent increments from a chain of iter args.
+    DiscreteIntegerSet(DiscreteIntegerSetDescriptor),
+    /// `kLoopingChainMutableAddr` — the head of a looping chain of transfers.
+    LoopingChainMutableAddr(LoopingChainMutableAddrDescriptor),
+}
 
-// crustify:todo: e004_invalidate
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:507  (5 body lines, level 0)
-//   original  : void invalidate()
+impl ToggleDescriptor {
+    /// Replaces: e001_invalidate
+    ///
+    /// Clears exactly the three fields `ToggleDescriptor::isValid()` reads
+    /// (`AddressPinningAndToggle.cpp:257`), so the toggle reads as unmatched.
+    pub fn invalidate(&mut self) {
+        self.outer_loop = None;
+        self.iter_arg_index = None;
+        self.c1 = None;
+    }
+}
 
-// crustify:todo: e005_invalidate
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:600  (4 body lines, level 0)
-//   original  : void invalidate()
+impl ConditionalConstantDescriptor {
+    /// Replaces: e002_getAllConstants
+    ///
+    /// APPENDS every constant this conditional can yield to `output`, in match order.
+    ///
+    /// ⛔ IT DOES NOT CLEAR `output` — the reference is `for_each(..., push_back)`, and its caller
+    /// `initializeDescriptor` (`:2316`) owns whatever `base_addrs_` already holds.
+    pub fn get_all_constants(&self, output: &mut BaseAddrList) {
+        output.extend_from_slice(&self.yielded_constants);
+    }
+}
 
-// crustify:todo: e006_dtor_DataTransferDescriptor
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:645  (3 body lines, level 0)
-//   original  : virtual ~DataTransferDescriptor()
+impl IntegerSequenceDescriptor {
+    /// Replaces: e003_invalidate
+    ///
+    /// Clears everything `IntegerSequenceDescriptor::isValid()` reads (`:392`).
+    ///
+    /// ⛔ THE SIZE GOES TO [`SequenceSize::Cleared`], the reference's `size_ = 0` — NOT to
+    /// [`SequenceSize::Symbolic`], which is the different `-1` meaning "length not known statically".
+    pub fn invalidate(&mut self) {
+        self.outer_loop = None;
+        self.iter_arg_index = None;
+        self.init = None;
+        self.stride = None;
+        self.size = SequenceSize::Cleared;
+    }
+}
 
-// crustify:todo: e007_isPartOfSomeChain
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:901  (5 body lines, level 0)
-//   original  : bool isPartOfSomeChain(const DataTransferDescriptor &desc) const
+impl DiscreteIntegerSetDescriptor {
+    /// Replaces: e004_invalidate
+    ///
+    /// Clears all five fields, including BOTH delta totals — the reference's chained
+    /// `init_ = total_positive_delta_ = total_negative_delta_ = nullptr`.
+    pub fn invalidate(&mut self) {
+        self.outer_loop = None;
+        self.iter_arg_index = None;
+        self.init = None;
+        self.total_positive_delta = None;
+        self.total_negative_delta = None;
+    }
+}
 
-// crustify:todo: e008_setChainingInfo
-//   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:945  (10 body lines, level 0)
-//   original  : void setChainingInfo(const DataTransferDescriptor &desc, Flags flag, bool val)
+impl LoopingChainMutableAddrDescriptor {
+    /// Replaces: e005_invalidate
+    ///
+    /// Clears the head flag and the outer loop, which is all `isValid()` (`:562`,
+    /// `is_head_of_chain_ && size_ >= 1 && outer_loop_`) needs to go false.
+    ///
+    /// ⛔ DELIBERATELY LEAVES `size`, `iter_arg_index`, `init` AND `increment` AS IT FOUND THEM —
+    /// unlike its four sibling `invalidate()`s. Restoring them would not change any observable
+    /// result and is not what the reference does.
+    pub fn invalidate(&mut self) {
+        self.is_head_of_chain = false;
+        self.outer_loop = None;
+    }
+}
+
+// e006_dtor_DataTransferDescriptor IS PORTED AS THE OWNERSHIP OF THE FIELD IT FREES, and the filled
+// anchor sits at that field: see `/// Replaces: e006_dtor_DataTransferDescriptor` on
+// [`data_transfer_descriptor::DataTransferDescriptor::pattern_desc`]. Its whole body is
+// `if (pattern_desc_) delete pattern_desc_;`, which an owned `Option<PatternDescriptor>` performs
+// exactly and at the same point, so there is ⛔ no `impl Drop` here to write.
+
+impl DataTransferDescriptorContainer {
+    /// Replaces: e007_isPartOfSomeChain
+    ///
+    /// Whether `desc` belongs to some SSA chain — `kPartOfChain`, or false when it has no
+    /// `chaining_info` entry at all.
+    ///
+    /// ⛔ THE KEY IS A [`DescriptorId`], not a borrow: the reference keys `chaining_info_` on the
+    /// descriptor's ADDRESS (`:955`), which is not expressible while this container owns them.
+    #[must_use]
+    pub fn is_part_of_some_chain(&self, desc: DescriptorId) -> bool {
+        self.chaining_info
+            .get(&desc)
+            .is_some_and(|flags| flags.get(ChainFlag::PartOfChain))
+    }
+}
+
+impl DataTransferDescriptorContainer {
+    /// Replaces: e008_setChainingInfo
+    ///
+    /// Sets or clears ONE chaining bit for `desc`, creating its entry only when setting.
+    ///
+    /// ⛔ CLEARING A BIT ON A DESCRIPTOR WITH NO ENTRY INSERTS NOTHING — the reference's `else if
+    /// (it != chaining_info_.end())` guard. An unconditional `entry().or_default()` would make an
+    /// absent descriptor indistinguishable from an all-clear one to `computeChainingInfo` (`:2192`).
+    pub fn set_chaining_info(&mut self, desc: DescriptorId, flag: ChainFlag, val: bool) {
+        match self.chaining_info.get_mut(&desc) {
+            Some(flags) => flags.set(flag, val),
+            None => {
+                if val {
+                    let mut flags = ChainFlags::default();
+                    flags.set(flag, true);
+                    self.chaining_info.insert(desc, flags);
+                }
+            }
+        }
+    }
+}
 
 // crustify:todo: e009_createOffsetValue
 //   authority : dcc/src/Transform/Sentient/AddressPinningAndToggle.cpp:1017  (14 body lines, level 0)
@@ -546,3 +670,126 @@ pub(crate) mod toggle_descriptor;
 //   original  : void AddressPinningAndTogglePass::runOn(dataflow::ProgramUnitOp unit)
 //   calls     : e014_dump, e221_initialize, e252_size, e419_turnHBMConstantOpAddrsToQueryMapsInUniformRegions, e488_computeOrGetNumberOfStreams, e489_cleanup, e491_computeChainingInfo, e614_computeAddressInfoList, e647_CollectDataTransfersAndComputeMaxStreams, e655_processDataTransfers
 
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::islands::sentient::dialects::Val;
+    use crate::transform::sentient::{ForRef, IterArgIndex};
+
+    /// A matched-looking descriptor field set, so an `invalidate()` has something to clear.
+    fn loop_and_arg() -> (Option<ForRef>, Option<IterArgIndex>) {
+        (Some(ForRef(Val(7))), Some(IterArgIndex(1)))
+    }
+
+    #[test]
+    fn toggle_invalidate_clears_all_three_validity_fields() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let mut desc = ToggleDescriptor {
+            outer_loop,
+            iter_arg_index,
+            c1: Some(EvaluatedValue(3)),
+        };
+        desc.invalidate();
+        assert_eq!(desc, ToggleDescriptor::default());
+    }
+
+    #[test]
+    fn get_all_constants_appends_in_order_without_clearing() {
+        let desc = ConditionalConstantDescriptor {
+            yielded_constants: vec![EvaluatedValue(11), EvaluatedValue(22)],
+        };
+        let mut output: BaseAddrList = vec![EvaluatedValue(99)];
+        desc.get_all_constants(&mut output);
+        assert_eq!(
+            output,
+            vec![EvaluatedValue(99), EvaluatedValue(11), EvaluatedValue(22)]
+        );
+    }
+
+    #[test]
+    fn integer_sequence_invalidate_clears_size_to_zero_not_symbolic() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let mut desc = IntegerSequenceDescriptor {
+            outer_loop,
+            iter_arg_index,
+            init: Some(EvaluatedValue(4)),
+            stride: Some(EvaluatedValue(8)),
+            size: SequenceSize::Terms(6),
+        };
+        desc.invalidate();
+        assert_eq!(desc, IntegerSequenceDescriptor::default());
+        assert_eq!(desc.size, SequenceSize::Cleared);
+        assert_ne!(desc.size, SequenceSize::Symbolic);
+    }
+
+    #[test]
+    fn discrete_integer_set_invalidate_clears_both_delta_totals() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let mut desc = DiscreteIntegerSetDescriptor {
+            outer_loop,
+            iter_arg_index,
+            init: Some(EvaluatedValue(4)),
+            total_positive_delta: Some(EvaluatedValue(64)),
+            total_negative_delta: Some(EvaluatedValue(32)),
+        };
+        desc.invalidate();
+        assert_eq!(desc, DiscreteIntegerSetDescriptor::default());
+    }
+
+    #[test]
+    fn looping_chain_invalidate_leaves_the_chain_measurements_alone() {
+        let (outer_loop, iter_arg_index) = loop_and_arg();
+        let mut desc = LoopingChainMutableAddrDescriptor {
+            is_head_of_chain: true,
+            outer_loop,
+            iter_arg_index,
+            size: ChainSize(3),
+            init: Some(EvaluatedValue(4)),
+            increment: Some(EvaluatedValue(8)),
+        };
+        desc.invalidate();
+        assert!(!desc.is_head_of_chain);
+        assert_eq!(desc.outer_loop, None);
+        // The reference clears only those two: everything else survives.
+        assert_eq!(desc.iter_arg_index, iter_arg_index);
+        assert_eq!(desc.size, ChainSize(3));
+        assert_eq!(desc.init, Some(EvaluatedValue(4)));
+        assert_eq!(desc.increment, Some(EvaluatedValue(8)));
+    }
+
+    #[test]
+    fn part_of_some_chain_is_false_without_an_entry_and_true_once_set() {
+        let mut container = DataTransferDescriptorContainer::default();
+        container
+            .descriptors
+            .push(DataTransferDescriptor::default());
+        let desc = DescriptorId(0);
+        assert!(!container.is_part_of_some_chain(desc));
+        container.set_chaining_info(desc, ChainFlag::PartOfChain, true);
+        assert!(container.is_part_of_some_chain(desc));
+    }
+
+    #[test]
+    fn set_chaining_info_ors_into_an_existing_entry() {
+        let mut container = DataTransferDescriptorContainer::default();
+        let desc = DescriptorId(0);
+        container.set_chaining_info(desc, ChainFlag::PartOfChain, true);
+        container.set_chaining_info(desc, ChainFlag::HeadOfChain, true);
+        container.set_chaining_info(desc, ChainFlag::PartOfChain, false);
+        assert_eq!(
+            container.chaining_info.get(&desc),
+            Some(&ChainFlags {
+                part_of_chain: false,
+                head_of_chain: true,
+                head_of_looping_chain: false,
+            })
+        );
+    }
+
+    #[test]
+    fn clearing_a_flag_on_an_absent_descriptor_inserts_nothing() {
+        let mut container = DataTransferDescriptorContainer::default();
+        container.set_chaining_info(DescriptorId(0), ChainFlag::PartOfChain, false);
+        assert!(container.chaining_info.is_empty());
+    }
+}

@@ -87,3 +87,17 @@
 //   original  : void ConditionalConstantDescriptor::dump() const
 //   calls     : e252_size, e278_isValid, e279_canBeSimplified
 
+
+use crate::transform::sentient::analyses::EvaluatedValue;
+
+/// A BASE ADDRESS CHOSEN BY NESTED `sentient.if`s FROM TWO OR MORE CONSTANTS —
+/// `class ConditionalConstantDescriptor` (`AddressPinningAndToggle.cpp:283-343`).
+///
+/// ⛔ EMPTY IS THE INVALID STATE: `isValid()` is `!yielded_constants_.empty()` (`:308`), so this
+/// pattern has no `invalidate()` of its own — the ctor either fills the list or leaves it empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConditionalConstantDescriptor {
+    /// `yielded_constants_` — the possible constants yielded from the conditional, in the order the
+    /// match walked them.
+    pub yielded_constants: Vec<EvaluatedValue>,
+}

@@ -77,8 +77,9 @@
 //! at :271 and `createSentientToProgIRPass` at :755) is added UNCONDITIONALLY — none is
 //! behind a flag or an option, so there is no "just the required ones" subset.
 
-pub(crate) mod address_pinning_and_toggle;
+pub mod address_pinning_and_toggle;
 pub(crate) mod address_register_precision_assignment;
+pub mod analyses;
 pub(crate) mod annotate_mac_xrf_wt_range;
 pub(crate) mod burst_splitting;
 pub(crate) mod canonicalize_xrf_pointers;
@@ -130,3 +131,24 @@ pub(crate) mod uniform_map_canonicalization;
 pub(crate) mod utils;
 pub(crate) mod vector_register_initialization;
 
+use crate::islands::sentient::dialects::Val;
+
+/// THE `sentient.for` A DESCRIPTOR OR AN ANALYSIS POINTS AT — `sentient::ForOp`, named by its
+/// induction variable.
+///
+/// ⛔⛔ AN IDENTITY, NOT A BORROW. These passes rewrite SentientIR IN PLACE, so a field holding
+/// `&Op` into the tree being rewritten is unusable; `Op::For::iv` is minted once and names exactly
+/// one loop ([`crate::islands::sentient::dialects::sentient::Op::For`] — the region's first
+/// argument, and the first thing the op prints), so the handle outlives the rewrite.
+///
+/// ⛔ `None` AT A FIELD IS THE REFERENCE'S `nullptr`, which is what every `invalidate()` writes and
+/// every `isValid()` tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ForRef(pub Val);
+
+/// WHICH VALUE A LOOP CARRIES — an index into `Op::For::carried`.
+///
+/// ⛔ `Option<IterArgIndex>` IS THE REFERENCE'S `int iter_arg_index_ = -1`: absence, never a
+/// negative index. `iter_arg_index_ >= 0` is half of four descriptors' `isValid()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IterArgIndex(pub u32);

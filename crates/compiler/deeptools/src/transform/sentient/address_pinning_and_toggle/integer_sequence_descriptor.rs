@@ -88,3 +88,41 @@
 //   original  : void IntegerSequenceDescriptor::dump() const
 //   calls     : e002_getAllConstants, e252_size, e278_isValid, e279_canBeSimplified, e408_getAllConstants
 
+
+use crate::transform::sentient::analyses::EvaluatedValue;
+use crate::transform::sentient::{ForRef, IterArgIndex};
+
+/// HOW MANY TERMS AN INTEGER SEQUENCE HAS — `int size_`, which is TRI-STATE in the reference.
+///
+/// ⛔ `-1` IS NOT A COUNT AND `0` IS NOT ONE EITHER. `size_` is documented as "can be -1 if its part
+/// of a symbolic loop" (`AddressPinningAndToggle.cpp:461`) and `isValid()` requires `size_ > 0`
+/// (`:392`), so both non-positive values mean "no sequence" for different reasons — an enum states
+/// that where a signed count would leave `-1` to arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SequenceSize {
+    /// `size_ == 0` — never matched, or cleared by [`IntegerSequenceDescriptor::invalidate`].
+    #[default]
+    Cleared,
+    /// `size_ == -1` — the sequence sits in a symbolic loop, so its length is not a compile-time
+    /// number. ⛔ Still invalid: `isValid()` reads `size_ > 0`.
+    Symbolic,
+    /// `size_ > 0` — the number of terms.
+    Terms(u32),
+}
+
+/// A CONSTANT INTEGER SEQUENCE FORMED BY A STATIC LOOP'S ITER ARG —
+/// `class IntegerSequenceDescriptor` (`AddressPinningAndToggle.cpp:345-464`): `init_ + stride_ * i`
+/// for `i` in `0..size_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IntegerSequenceDescriptor {
+    /// `outer_loop_` — the outermost loop where `%argN` is initialised.
+    pub outer_loop: Option<ForRef>,
+    /// `iter_arg_index_` — which iter arg of `outer_loop` walks the sequence.
+    pub iter_arg_index: Option<IterArgIndex>,
+    /// `init_` — the first term.
+    pub init: Option<EvaluatedValue>,
+    /// `stride_` — the step between terms.
+    pub stride: Option<EvaluatedValue>,
+    /// `size_` — how many terms. See [`SequenceSize`].
+    pub size: SequenceSize,
+}
