@@ -214,6 +214,23 @@ pub trait Arch {
     /// *"NO LBR for sentient1.5"*.
     const L3_EBR_BITS: Bounded<53>;
 
+    /// HOW WIDE AN **LX** LRF IS — `regInfoPerUnit[LXLU|LXSU][RegType::LRF].bitSize`, 21 on every
+    /// arch and the same for load and store (`sysdef.cpp:359-360`, `:369-370`).
+    ///
+    /// ⛔ THE WINDOW IT BOUNDS IS ASYMMETRIC AND ONE BIT TOO WIDE: `doesValueExceedLRFRange` builds
+    /// `-(0x1 << bitSize) ..= (0x1 << bitSize) - 1` (`ScalarOpMergingAndHoisting.cpp:174-176`), which
+    /// is twice a signed field of this width — do not read it as `2^(bitSize-1)`.
+    ///
+    /// ⛔ BOUNDED AT 31 SO THAT SHIFT CANNOT OVERFLOW the reference's own `int`.
+    const LX_LRF_BITS: Bounded<31>;
+
+    /// HOW WIDE AN **L0** LRF IS — `regInfoPerUnit[L0LU|L0SU][RegType::LRF].bitSize`.
+    ///
+    /// ⛔⛔ ARCH-DEPENDENT WHERE THE LX ONE IS NOT: 10 bits on `coreArch <= RCUDD1A_ISA` and 12 from
+    /// SEN1P5 (`sysdef.cpp:377-382` for the load half, `:388-393` for the store half). Reading one
+    /// arch's number on the other rejects four times too much, or accepts four times too much.
+    const L0_LRF_BITS: Bounded<31>;
+
     /// A COUNT OF STICKS IN BYTES. On the arch and not a `From`, because the factor is
     /// [`Arch::BYTES_PER_STICK`] and a free conversion would be one that had to assume it.
     #[must_use]
@@ -259,6 +276,8 @@ impl Arch for Dd2 {
     const RESERVED_PROG_LX_ADDR: Sticks = Sticks(0x3f00);
     const L3_EAR_BITS: Bounded<53> = Bounded::at::<21>();
     const L3_EBR_BITS: Bounded<53> = Bounded::at::<30>();
+    const LX_LRF_BITS: Bounded<31> = Bounded::at::<21>();
+    const L0_LRF_BITS: Bounded<31> = Bounded::at::<10>();
 }
 
 /// THE SEN1P5 GENERATION — `SEN1P5_ISA`.
@@ -292,6 +311,8 @@ impl Arch for Sen1p5 {
     const RESERVED_PROG_LX_ADDR: Sticks = Sticks(0x3f00);
     const L3_EAR_BITS: Bounded<53> = Bounded::at::<21>();
     const L3_EBR_BITS: Bounded<53> = Bounded::at::<32>();
+    const LX_LRF_BITS: Bounded<31> = Bounded::at::<21>();
+    const L0_LRF_BITS: Bounded<31> = Bounded::at::<12>();
 }
 
 /// 🛑 EXACTLY ONE ARCH FEATURE. Both is a compiler built for one machine against another's tables;

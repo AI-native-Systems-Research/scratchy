@@ -211,7 +211,7 @@ pub(crate) fn add_or_sub_with_zero_simplification<E: ExpressionEvaluator>(
         if !evaluated.known_absolute {
             continue;
         }
-        if evaluated.all_unit_offset != Some(ScalarOffset(0)) {
+        if evaluated.all_unit_offset() != Some(ScalarOffset(0)) {
             continue;
         }
         replace_all_uses_with(block, arith.result, operands[1 - i]);
@@ -415,7 +415,7 @@ mod unit_tests {
     use super::*;
     use crate::islands::dataflow_ir::Values;
     use crate::islands::sentient::dialects::sentient::{Carried, Reg, RegIndex, RegType};
-    use crate::transform::sentient::analyses::{BaseValue, Evaluation};
+    use crate::transform::sentient::analyses::{BaseValue, Evaluation, Offsets};
 
     /// AN EVALUATOR THAT ANSWERS WHAT THE TEST SAYS. ⛔ The analysis behind
     /// [`ExpressionEvaluator`] is out of campaign scope, so a test STATES its answers rather than
@@ -431,7 +431,7 @@ mod unit_tests {
                 Evaluation {
                     known_absolute: false,
                     base: None,
-                    all_unit_offset: None,
+                    offsets: Offsets::PerUnit(Vec::new()),
                 },
                 |(_, evaluated)| evaluated.clone(),
             )
@@ -473,7 +473,7 @@ mod unit_tests {
         Evaluation {
             known_absolute: true,
             base: None,
-            all_unit_offset: Some(offset),
+            offsets: Offsets::AllUnit(offset),
         }
     }
 
@@ -522,7 +522,7 @@ mod unit_tests {
                 Evaluation {
                     known_absolute: true,
                     base: None,
-                    all_unit_offset: None,
+                    offsets: Offsets::PerUnit(vec![(Val(0), ScalarOffset(0))]),
                 },
             )],
             offset: Val(9),
@@ -594,7 +594,7 @@ mod unit_tests {
                         value: Val(5),
                         negated: true,
                     }),
-                    all_unit_offset: None,
+                    offsets: Offsets::PerUnit(Vec::new()),
                 },
             )],
             offset: Val(9),

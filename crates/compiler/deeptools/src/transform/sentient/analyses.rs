@@ -41,15 +41,15 @@ pub struct BaseValue {
     pub negated: bool,
 }
 
-/// WHAT ONE `evaluateValue` ANSWER TELLS A PORTED PASS — the three queries, and nothing else.
+/// WHAT ONE `evaluateValue` ANSWER TELLS A PORTED PASS — the four queries, and nothing else.
 ///
-/// ⛔⛔ THE THREE FIELDS ARE THE THREE CALLS, NOT A MODEL OF `EvaluatedValue`. The class hierarchy
-/// (`AllUnitEvaluatedValue` / the per-unit `offset_vals_` map, `:103-205`) is out of campaign scope,
-/// so what is spelled here is exactly `isKnownAbsolute()`, `baseValue()` and
-/// `dyn_cast<AllUnitEvaluatedValue>(&v)->offsetValue()` — the only three things
-/// `LightweightSimplification.cpp` asks. ⛔ Do not add a per-unit payload by guessing its keys.
+/// ⛔⛔ THE FIELDS ARE THE CALLS, NOT A MODEL OF `EvaluatedValue`. The arithmetic and predicates on
+/// the class hierarchy (`isAnyValLessThan`, `isDivisibleBy`, `retrieveAllValues`, `:63-205`) are out
+/// of campaign scope, so what is spelled here is exactly `isKnownAbsolute()`, `baseValue()`,
+/// `AllUnitEvaluatedValue::offsetValue()` and `PerUnitEvaluatedValue::offsetValuesPerUnit()` — every
+/// query `LightweightSimplification.cpp` and `ScalarOpMergingAndHoisting.cpp` ask.
 ///
-/// ⭐ `all_unit_offset: None` IS THE FAILED `dyn_cast`, and the distinction is load-bearing:
+/// ⭐ A PER-UNIT KIND IS THE FAILED `dyn_cast`, and the distinction is load-bearing:
 /// `addOrSubWithZeroSimplification` declines a per-unit value even when it is known absolute
 /// (`:58-59`). See [`EvaluatedValue`] for the identity the memoising passes store instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +58,56 @@ pub struct Evaluation {
     pub known_absolute: bool,
     /// `baseValue()` (`:104`) — `None` when the expression has no base.
     pub base: Option<BaseValue>,
-    /// `offsetValue()` (`:163`), and `None` when the value is NOT an `AllUnitEvaluatedValue`.
-    pub all_unit_offset: Option<ScalarOffset>,
+    /// Which of the two `EvaluatedValueKind`s this is, and the offset(s) it carries.
+    pub offsets: Offsets,
+}
+
+/// WHICH OF THE TWO `EvaluatedValue` KINDS THIS IS, WITH ITS OFFSETS — `enum EvaluatedValueKind
+/// { EVK_AllUnit, EVK_PerUnit }` (`Analyses/ExpressionEvaluatorUtils.h:59`).
+///
+/// ⛔ THE `dyn_cast` PAIR IS THIS MATCH, AND IT IS CLOSED AT TWO. `doesImmutableImmExceedRange`
+/// casts to each kind in turn and falls through to `false` for neither
+/// (`ScalarOpMergingAndHoisting.cpp:149-164`); with the kind an enum that fall-through is an arm
+/// nothing can reach, so the port has none to get wrong.
+///
+/// ⛔ THE PER-UNIT KEY IS A `Value`, NOT A UNIT INDEX: `typedef llvm::DenseMap<Value, ScalarValue>
+/// PerUnitValuesMap` (`:176`), keyed by the `unitKey()` the evaluator built the map against — so
+/// the key is stated here from the header's own declaration and not guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offsets {
+    /// `AllUnitEvaluatedValue::offsetValue()` (`:163`) — one offset every unit shares.
+    AllUnit(ScalarOffset),
+    /// `PerUnitEvaluatedValue::offsetValuesPerUnit()` (`:194`) — one offset per unit.
+    PerUnit(Vec<(Val, ScalarOffset)>),
+}
+
+impl Evaluation {
+    /// `dyn_cast<AllUnitEvaluatedValue>(&v)->offsetValue()`, and `None` for the per-unit kind —
+    /// the failed cast `addOrSubWithZeroSimplification` turns on
+    /// (`LightweightSimplification.cpp:58-59`).
+    #[must_use]
+    pub fn all_unit_offset(&self) -> Option<ScalarOffset> {
+        match &self.offsets {
+            Offsets::AllUnit(offset) => Some(*offset),
+            Offsets::PerUnit(_) => None,
+        }
+    }
+
+    /// EVERY OFFSET THIS VALUE CARRIES — the single one of the all-unit kind, or one per unit.
+    ///
+    /// ⭐ THE TWO `dyn_cast` ARMS OF `doesImmutableImmExceedRange` DIFFER ONLY IN HOW THEY REACH THE
+    /// OFFSETS (`ScalarOpMergingAndHoisting.cpp:149-163`): both apply the same range test to every
+    /// offset they can see and return on the first failure, so one iterator serves both.
+    pub fn offset_values(&self) -> impl Iterator<Item = ScalarOffset> + '_ {
+        let (all_unit, per_unit): (Option<ScalarOffset>, &[(Val, ScalarOffset)]) =
+            match &self.offsets {
+                Offsets::AllUnit(offset) => (Some(*offset), &[]),
+                Offsets::PerUnit(offsets) => (None, offsets.as_slice()),
+            };
+        all_unit
+            .into_iter()
+            .chain(per_unit.iter().map(|&(_, offset)| offset))
+    }
 }
 
 /// WHERE `buildOffsetValue` PUTS THE OPS IT CREATES — the two `OpBuilder`s, as blocks.
